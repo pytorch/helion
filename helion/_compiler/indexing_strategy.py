@@ -16,6 +16,7 @@ from .._compat import get_tensor_descriptor_fn_name
 from .._utils import next_power_of_2
 from .ast_extension import expr_from_string
 from .compile_environment import CompileEnvironment
+from .compile_environment import _symint_expr
 from .device_function import DeviceFunction
 from .dtype_utils import cast_ast
 from .host_function import HostFunction
@@ -236,7 +237,7 @@ class PointerIndexingStrategy(IndexingStrategy):
                 k_index += 1
             elif isinstance(k, torch.SymInt):
                 # SymInt can be block index (with BlockSizeOrigin) or scalar
-                symbol = k._sympy_()
+                symbol = _symint_expr(k)
                 origin = None
                 if isinstance(symbol, sympy.Symbol):
                     origin = HostFunction.current().expr_to_origin.get(symbol)
@@ -745,7 +746,7 @@ class SubscriptIndexing(NamedTuple):
                 output_size.append(tile_info.resolved_block_size_var(env))
             elif isinstance(k, torch.SymInt):
                 input_size.popleft()
-                symbol = k._sympy_()
+                symbol = _symint_expr(k)
                 if isinstance(symbol, sympy.Symbol):
                     origin = HostFunction.current().expr_to_origin.get(symbol)
                     if origin and isinstance(origin.origin, BlockSizeOrigin):
@@ -972,7 +973,7 @@ class SubscriptIndexing(NamedTuple):
                     size1_broadcast_dims.append((output_idx, output_size[output_idx]))
                 output_idx += 1
             elif isinstance(k, torch.SymInt):
-                symbol = k._sympy_()
+                symbol = _symint_expr(k)
                 origin = None
                 if isinstance(symbol, sympy.Symbol):
                     origin = HostFunction.current().expr_to_origin.get(symbol)
@@ -1272,7 +1273,7 @@ class BlockedSubscriptIndexing:
                         if "masked_value" in state.fx_node.meta:
                             return False
             elif isinstance(k, torch.SymInt):
-                symbol = k._sympy_()
+                symbol = _symint_expr(k)
                 origin = None
                 if isinstance(symbol, sympy.Symbol):
                     origin = HostFunction.current().expr_to_origin.get(symbol)
@@ -1341,7 +1342,8 @@ class BlockedSubscriptIndexing:
                     res.offsets.append("0")
                     res.block_shape.append(1)
             elif isinstance(k, torch.SymInt):
-                symbol = k._sympy_()
+                symbol = _symint_expr(k)
+                # pyrefly: ignore[no-matching-overload]
                 origin = HostFunction.current().expr_to_origin.get(symbol)
                 if origin and isinstance(origin.origin, BlockSizeOrigin):
                     if fake_value.size(len(res.offsets)) != 1:
