@@ -632,6 +632,16 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
     ) -> Callable[..., object]:
         return self.compile_config(config, allow_print=allow_print)
 
+    def extra_cache_key(self) -> str:
+        """Return extra data folded into the disk-cache key.
+
+        Returns ``""`` by default, leaving the cache key unchanged.
+        """
+        return ""
+
+    def is_cacheable(self) -> bool:
+        return True
+
     def get_cached_path(self, config: ConfigLike | None = None) -> str | None:
         """
         Get the file path of the generated Triton code for a specific configuration.
