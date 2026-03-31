@@ -4566,7 +4566,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
 
     # --- Autotune-with-fusion tests ---
 
-    @unittest.skip("Requires fusion-aware autotuning infra")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     @parametrize("autotune_with_fusion", (True, False))
     def test_autotune_fusion_aware_vs_default(self, autotune_with_fusion):
@@ -4631,7 +4630,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         result_direct = kernel(x.clone(), y.clone())
         torch.testing.assert_close(result_direct, x + y)
 
-    @unittest.skip("Requires fusion-aware autotuning infra")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_autotune_fusion_recompile(self):
         """Recompile with shared BoundKernel still produces fused code."""
@@ -4676,7 +4674,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         self.assertIn(pp, code, "Must have prologue fusion")
         self.assertEqual(code.count("@triton.jit"), 1, "Single fused kernel")
 
-    @unittest.skip("Requires fusion-aware autotuning infra")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_autotune_different_epilogues(self):
         """Different epilogues (relu vs sigmoid) trigger separate autotuning."""
@@ -4738,7 +4735,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
         self.assertEqual(len(captured_codes), 0, "Re-run must reuse cached kernels")
 
-    @unittest.skip("Requires fusion-aware autotuning infra")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_autotune_different_shapes(self):
         """Different input shapes trigger re-autotuning with fused kernels."""
@@ -4794,7 +4790,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             second_fused_count, 0, "New shape must trigger new fused compilations"
         )
 
-    @unittest.skip("Requires fusion-aware autotuning infra")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_autotune_same_epilogue_cache(self):
         """Same kernel + same epilogue called twice → second hits fusion cache."""
@@ -4867,7 +4862,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             f"(got {double_call_fused_count} new fused compilations)",
         )
 
-    @unittest.skip("Requires fusion-aware autotuning infra")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_standalone_call_after_fusion_triggers_autotuning(self):
         """Standalone call after torch.compile with fusion must trigger its own autotuning.
@@ -4936,7 +4930,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             "Fusion config cache should have entries from the torch.compile call",
         )
 
-    @unittest.skip("Requires fusion-aware autotuning infra")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_autotune_fused_vs_unfused_config_stored_separately(self):
         """Unfused config (bk._config) and fused config (_fusion_config_cache) are independent."""
@@ -4994,7 +4987,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
                 f"Fusion cache entry {fusion_key!r} must be a Config",
             )
 
-    @unittest.skip("Requires fusion-aware autotuning infra")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_autotune_epilogue_only_fusion(self):
         """Fusion-aware autotuning works with epilogue only (no prologue)."""
@@ -5029,7 +5021,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         for code in fused:
             self.assertNotIn(pp, code, "Must NOT have prologue in epilogue-only test")
 
-    @unittest.skip("Requires fusion-aware autotuning infra")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_autotune_prologue_only_fusion(self):
         """Fusion-aware autotuning works with prologue only (no epilogue)."""
@@ -5066,7 +5057,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         for code in fused:
             self.assertNotIn(ep, code, "Must NOT have epilogue in prologue-only test")
 
-    @unittest.skip("Requires fusion-aware autotuning infra")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_autotune_bare_kernel_no_prologue_epilogue(self):
         """Fusion-aware autotuning does not break when Inductor has no prologue or epilogue to fuse."""
@@ -5094,7 +5084,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         result_direct = kernel(x.clone(), y.clone())
         torch.testing.assert_close(result_direct, x + y, rtol=1e-4, atol=1e-4)
 
-    @unittest.skip("Requires fusion-aware autotuning infra")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_autotune_no_configs_uses_fusion_context(self):
         """Without explicit configs, fusion autotuning must benchmark the fused kernel.
