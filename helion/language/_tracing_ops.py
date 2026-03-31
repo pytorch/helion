@@ -17,7 +17,6 @@ from .._compiler.ast_extension import statement_from_string
 from .._compiler.compile_environment import CompileEnvironment
 from .._compiler.dtype_utils import cast_ast
 from .._compiler.host_function import HostFunction
-from .._compiler.variable_origin import BlockSizeOrigin
 from ..exc import BackendUnsupported
 from ..exc import NotInsideKernel
 from . import _decorators
@@ -60,12 +59,8 @@ def _(state: CodegenState) -> ast.AST:
     sym_expr = getattr(getattr(val, "node", None), "_expr", None)
     if not isinstance(sym_expr, sympy.Expr):
         sym_expr = val._sympy_()
-    origin_info = HostFunction.current().expr_to_origin.get(sym_expr)
-
-    if origin_info is not None and isinstance(origin_info.origin, BlockSizeOrigin):
-        block_size_var = state.device_function.block_size_var(
-            origin_info.origin.block_id
-        )
+    if (origin := HostFunction.current().get_block_size_origin(sym_expr)) is not None:
+        block_size_var = state.device_function.block_size_var(origin.block_id)
         if block_size_var is None:
             return expr_from_string("1")
         return expr_from_string(block_size_var)
@@ -88,11 +83,8 @@ def _(state: CodegenState) -> ast.AST:
     sym_expr = getattr(getattr(val, "node", None), "_expr", None)
     if not isinstance(sym_expr, sympy.Expr):
         sym_expr = val._sympy_()
-    origin_info = HostFunction.current().expr_to_origin.get(sym_expr)
-    if origin_info is not None and isinstance(origin_info.origin, BlockSizeOrigin):
-        block_size_var = state.device_function.block_size_var(
-            origin_info.origin.block_id
-        )
+    if (origin := HostFunction.current().get_block_size_origin(sym_expr)) is not None:
+        block_size_var = state.device_function.block_size_var(origin.block_id)
         if block_size_var is None:
             return expr_from_string("1")
         return expr_from_string(block_size_var)

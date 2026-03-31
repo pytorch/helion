@@ -77,19 +77,17 @@ def find_block_size_symbols(
     if not isinstance(expr, sympy.Expr):
         return {}, set()
 
-    hf = HostFunction.current()
     block_sizes = {}
     non_block_size_symbols = set()
+    hf = HostFunction.current()
 
     for symbol in expr.free_symbols:
-        # pyrefly: ignore [no-matching-overload]
-        origin_info = hf.expr_to_origin.get(symbol)
-        if origin_info is None or not isinstance(origin_info.origin, BlockSizeOrigin):
+        if (origin := hf.get_block_size_origin(symbol)) is None:
             # pyrefly: ignore [bad-argument-type]
             non_block_size_symbols.add(symbol)
         else:
             # pyrefly: ignore [unsupported-operation]
-            block_sizes[symbol] = origin_info.origin.block_id
+            block_sizes[symbol] = origin.block_id
 
     # pyrefly: ignore[bad-return]
     return block_sizes, non_block_size_symbols
