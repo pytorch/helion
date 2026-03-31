@@ -986,3 +986,16 @@ class HelionCutePrinter(HelionTritonPrinter):
 
 def cute_texpr(expr: sympy.Expr) -> str:
     return HelionCutePrinter().doprint(expr)
+
+
+class HelionPallasPrinter(HelionTritonPrinter):
+    """Pallas printer that emits plain Python operators instead of Triton runtime helpers."""
+
+    def _print_FloorDiv(self, expr: sympy.Expr) -> str:
+        lhs, rhs = expr.args
+        # pyrefly: ignore [missing-attribute]
+        return f"({self._print(lhs)} // {self._print(rhs)})"
+
+
+def pallas_texpr(expr: sympy.Expr) -> str:
+    return HelionPallasPrinter().doprint(expr)
