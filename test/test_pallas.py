@@ -461,6 +461,25 @@ class TestPallas(TestCase):
         ).to(device=DEVICE)
         torch.testing.assert_close(result, ref, rtol=1e-2, atol=1e-2)
 
+    def test_attention_fori_loop_correctness(self) -> None:
+        """Test fori_loop attention with loop-carried state."""
+        query = torch.randn(2, 2, 128, 128, dtype=torch.float32, device=DEVICE)
+        key = torch.randn(2, 2, 128, 128, dtype=torch.float32, device=DEVICE)
+        val = torch.randn(2, 2, 128, 128, dtype=torch.float32, device=DEVICE)
+        args = (query, key, val)
+        code, result = code_and_output(
+            pallas_attention,
+            args,
+            block_sizes=[4, 128, 128],
+            pallas_loop_type="fori_loop",
+        )
+        self.assertIn("jax.lax.fori_loop", code)
+        self.assertIn("pltpu.make_async_copy", code)
+        ref = torch.nn.functional.scaled_dot_product_attention(
+            query.float().cpu(), key.float().cpu(), val.float().cpu()
+        ).to(device=DEVICE)
+        torch.testing.assert_close(result, ref, rtol=1e-2, atol=1e-2)
+
     def test_attention_emit_pipeline_non_divisible(self) -> None:
         """Test emit_pipeline with seq_kv not divisible by block_k.
 

@@ -715,10 +715,20 @@ def default_pallas_fori_launcher(
                     pltpu.VMEM(shape, jnp_dtype)  # pyrefly: ignore[bad-argument-type]
                 )
 
-        # Build in_specs/out_specs with memory_space=pl.ANY (HBM refs)
-        in_specs_list = [pl.BlockSpec(memory_space=pl.ANY) for _ in tensor_arg_indices]
-        out_specs_list = [pl.BlockSpec(memory_space=pl.ANY) for _ in _output_indices]
-        out_specs = out_specs_list if len(out_specs_list) > 1 else out_specs_list[0]
+        # Build in_specs/out_specs: proper BlockSpecs for outer grid dims,
+        # HBM refs for tensors used in the fori_loop body (DMA handles tiling).
+        _fori_pipeline_indices = kwargs.get("_pipeline_arg_indices")
+        in_specs_list, out_specs = _pallas_build_pipeline_specs(
+            pl,
+            jnp,
+            pltpu,
+            grid,
+            args,
+            tensor_arg_indices,
+            _output_indices,
+            _block_spec_info,
+            _fori_pipeline_indices,  # type: ignore[arg-type]
+        )
 
         reordered_kernel = _pallas_make_reordered_kernel(
             pallas_kernel,
