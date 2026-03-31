@@ -8,6 +8,7 @@ from typing import cast
 
 import sympy
 import torch
+from torch._dynamo.utils import ExactWeakKeyDictionary
 from torch._inductor.ir import Buffer
 from torch._inductor.ir import IRNode
 from torch._inductor.ir import Layout
@@ -78,6 +79,8 @@ class _FusionMetadata:
 
 class HelionTemplateBuffer(TemplateBuffer):
     """Inductor template buffer for Helion kernel."""
+
+    _fusion_config_cache: ExactWeakKeyDictionary = ExactWeakKeyDictionary()
 
     def __init__(
         self,
