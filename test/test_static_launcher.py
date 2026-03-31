@@ -62,6 +62,9 @@ class TestStaticLauncher(TestCase):
             return launcher
 
         with mock.patch(
+            "helion.runtime.static_launcher._STATIC_LAUNCHER_ATTR",
+            "_helion_static_launcher_test",
+        ), mock.patch(
             "torch._inductor.runtime.static_triton_launcher.statically_launched_kernel_by_device",
             side_effect=tracking_factory,
         ):
