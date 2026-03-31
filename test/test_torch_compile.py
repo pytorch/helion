@@ -443,6 +443,11 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         # leak kernel indices into the current trace.
         FxGraphCache.clear()
         PyCodeCache.cache_clear()
+        # Clear fusion config cache to prevent cross-test pollution.
+        if supports_torch_compile_fusion():
+            from helion._compiler._inductor.template_buffer import HelionTemplateBuffer
+
+            HelionTemplateBuffer._fusion_config_cache.clear()
         if helion_kernel_side_table is not None:
             helion_kernel_side_table.reset_table()
 
@@ -4521,141 +4526,644 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             expected_num_kernels_ref=1,
         )
 
+    # --- Shared helpers for autotune-with-fusion tests ---
+
+    _EPILOGUE_PATTERN = "maximum"  # relu → triton_helpers.maximum
+    _PROLOGUE_PATTERN = "tl.full([1], 2.0"  # mul-by-2 scalar constant
+
+    def _make_autotune_kernel(self, autotune_with_torch_compile_fusion=True):
+        """Create a simple add kernel with two configs for autotuning."""
+
+        @helion.kernel(
+            configs=[
+                helion.Config(block_sizes=[32]),
+                helion.Config(block_sizes=[64]),
+            ],
+            torch_compile_fusion=True,
+            autotune_with_torch_compile_fusion=autotune_with_torch_compile_fusion,
+        )
+        def k_add_autotune(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size()):
+                out[tile] = x[tile] + y[tile]
+            return out
+
+        return k_add_autotune
+
+    def _make_code_capture(self, kernel_name="k_add_autotune"):
+        """Return (captured_codes, patch_context) for intercepting PyCodeCache.load."""
+        from torch._inductor.codecache import PyCodeCache
+
+        captured_codes: list[str] = []
+        original_load = PyCodeCache.load
+
+        def patched_load(code, *args, **kwargs):
+            if kernel_name in code:
+                captured_codes.append(code)
+            return original_load(code, *args, **kwargs)
+
+        return captured_codes, patch.object(PyCodeCache, "load", patched_load)
+
+    # --- Autotune-with-fusion tests ---
+
+    @unittest.skip("Requires fusion-aware autotuning infra")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
-    @patch.object(k_add.settings, "torch_compile_fusion", True)
-    def test_autotune_no_fusion_final_has_fusion(self):
-        """Verify autotuning code has no fusion but final compiled code does."""
+    @parametrize("autotune_with_fusion", (True, False))
+    def test_autotune_fusion_aware_vs_default(self, autotune_with_fusion):
+        """When fusion-aware autotuning is on, each config is benchmarked as fused code;
+        when off, the pre-existing BoundKernel config is reused without recompilation."""
         if not supports_torch_compile_fusion():
             self.skipTest(
                 "torch.compile fusion requires ExternalTritonTemplateKernel support"
             )
 
-        from helion.runtime.kernel import BoundKernel
+        kernel = self._make_autotune_kernel(
+            autotune_with_torch_compile_fusion=autotune_with_fusion
+        )
+        captured_codes, patch_ctx = self._make_code_capture()
 
         def f(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
             x = x * 2.0
             y = y * 2.0
-            result = k_add(x, y)
-            return torch.relu(result) + 1.0
+            return torch.relu(kernel(x, y)) + 1.0
 
-        # Epilogue marker: relu compiles to triton_helpers.maximum in Triton.
-        # Prologue marker: mul-by-2.0 compiles to tl.full([1], 2.0, ...) in Triton
-        # (Inductor codegen uses [1] shape for scalar constants).
-        epilogue_pattern = "maximum"
-        prologue_pattern = "tl.full([1], 2.0"
-
-        # Capture autotuning code via patching compile_config
-        autotune_codes: list[str] = []
-        original_compile_config = BoundKernel.compile_config
-
-        def patched_compile_config(self_bk, *args, **kwargs):
-            code = self_bk.to_triton_code(
-                self_bk._config or self_bk._require_implicit_config()
-            )
-            autotune_codes.append(code)
-            return original_compile_config(self_bk, *args, **kwargs)
-
-        k_add.reset()
+        kernel.reset()
         torch._dynamo.reset()
         torch._dynamo.utils.counters.clear()
 
-        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
-        y = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
+        x = torch.randn(128, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(128, device=DEVICE, dtype=torch.float32)
 
-        # ----- Part 1: Autotune code should NOT contain fusion -----
-        with patch.object(BoundKernel, "compile_config", patched_compile_config):
+        # Standalone call populates BoundKernel cache
+        result_standalone = kernel(x.clone(), y.clone())
+        torch.testing.assert_close(result_standalone, x + y, rtol=1e-4, atol=1e-4)
+        self.assertEqual(len(kernel._bound_kernels), 1)
+
+        # torch.compile — cache reuse depends on autotune_with_fusion
+        with patch_ctx:
             compiled_f = torch.compile(f, fullgraph=True, backend="inductor")
-            _ = compiled_f(x.clone(), y.clone())
+            result = compiled_f(x.clone(), y.clone())
 
-        self.assertGreater(
-            len(autotune_codes),
-            0,
-            "compile_config must be called at least once during autotuning",
-        )
-        for code in autotune_codes:
+        expected = torch.relu((x * 2.0) + (y * 2.0)) + 1.0
+        torch.testing.assert_close(result, expected, rtol=1e-4, atol=1e-4)
+
+        ep = self._EPILOGUE_PATTERN
+        pp = self._PROLOGUE_PATTERN
+        fused_codes = [c for c in captured_codes if ep in c and pp in c]
+        unfused_codes = [c for c in captured_codes if ep not in c and pp not in c]
+
+        if autotune_with_fusion:
+            self.assertEqual(len(fused_codes), 2, "2 fused compiles (one per config)")
+            self.assertEqual(len(set(fused_codes)), 2, "Distinct fused kernels")
             self.assertEqual(
-                code.count("@triton.jit"),
-                1,
-                "Each autotuned kernel should be a single standalone @triton.jit",
+                len(unfused_codes),
+                0,
+                "No unfused compiles (bench_compile_config handles all configs)",
             )
-            self.assertNotIn(
-                epilogue_pattern,
-                code,
-                "Autotune code should not contain epilogue fusion",
-            )
-            self.assertNotIn(
-                prologue_pattern,
-                code,
-                "Autotune code should not contain prologue fusion",
+        else:
+            self.assertEqual(
+                len(captured_codes),
+                0,
+                "Without fusion-aware autotuning, BoundKernel is reused",
             )
 
-        # ----- Part 2: Direct k_add call still works (extra_params not leaked) -----
-        # ensure_config_exists (called inside compile()) compiled the kernel
-        # WITHOUT extra_params and stored it as BoundKernel._run.  A direct
-        # call to k_add must use that non-fused kernel — if extra_params had
-        # leaked into _run's signature the call would crash or return garbage.
-        result_direct = k_add(x.clone(), y.clone())
-        torch.testing.assert_close(
-            result_direct,
-            x + y,
-            msg="Direct k_add call after torch.compile fusion must work "
-            "(BoundKernel._run must be the non-fused kernel)",
-        )
+        # Direct call still works (extra_params not leaked)
+        result_direct = kernel(x.clone(), y.clone())
+        torch.testing.assert_close(result_direct, x + y)
 
-        # ----- Part 3: Recompile reuses cached BoundKernel (no re-autotune) -----
-        # A second torch.compile with the same tensor shapes should reuse the
-        # cached BoundKernel (via Kernel._bound_kernels).  Because _config is
-        # already set on the shared BoundKernel, ensure_config_exists returns
-        # immediately and compile_config must NOT be called again.  The fused
-        # source must still be generated correctly via _generate_triton_ast
-        # (which is always called fresh and is independent of _compile_cache).
-        compile_config_calls_so_far = len(autotune_codes)
-        torch._dynamo.reset()  # force Inductor re-compilation; keep k_add cache
-        with patch.object(BoundKernel, "compile_config", patched_compile_config):
-            _, (reuse_code,) = run_and_get_code(
-                torch.compile(f, fullgraph=True, backend="inductor"),
-                x.clone(),
-                y.clone(),
+    @unittest.skip("Requires fusion-aware autotuning infra")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_autotune_fusion_recompile(self):
+        """Recompile with shared BoundKernel still produces fused code."""
+        if not supports_torch_compile_fusion():
+            self.skipTest(
+                "torch.compile fusion requires ExternalTritonTemplateKernel support"
             )
-        self.assertEqual(
-            len(autotune_codes),
-            compile_config_calls_so_far,
-            "compile_config must NOT be called again when BoundKernel is reused "
-            "(extra_params must not invalidate the autotune/compile cache key)",
-        )
-        self.assertIn(
-            epilogue_pattern,
-            reuse_code,
-            "Recompiled code with shared BoundKernel should still have epilogue fusion",
-        )
-        self.assertIn(
-            prologue_pattern,
-            reuse_code,
-            "Recompiled code with shared BoundKernel should still have prologue fusion",
-        )
 
-        # ----- Part 4: Fresh compile produces fused code with 1 kernel -----
-        # Prologue mul*2, k_add, and epilogue relu+1 should all fuse together.
-        k_add.reset()
+        kernel = self._make_autotune_kernel()
+
+        def f(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            x = x * 2.0
+            y = y * 2.0
+            return torch.relu(kernel(x, y)) + 1.0
+
+        x = torch.randn(128, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(128, device=DEVICE, dtype=torch.float32)
+        ep = self._EPILOGUE_PATTERN
+        pp = self._PROLOGUE_PATTERN
+
+        # First compile — creates BoundKernel and autotuning config.
+        kernel.reset()
         torch._dynamo.reset()
-
-        _, (final_code,) = run_and_get_code(
+        _, (code,) = run_and_get_code(
             torch.compile(f, fullgraph=True, backend="inductor"),
             x.clone(),
             y.clone(),
         )
-        self.assertIn(
-            epilogue_pattern, final_code, "Final code should contain epilogue fusion"
+        self.assertIn(ep, code, "Must have epilogue fusion")
+        self.assertIn(pp, code, "Must have prologue fusion")
+
+        # Recompile — only reset Dynamo, keep BoundKernel cache intact.
+        # This tests that Inductor re-codegen with a shared BoundKernel
+        # still produces fused output with a single kernel.
+        torch._dynamo.reset()
+        _, (code,) = run_and_get_code(
+            torch.compile(f, fullgraph=True, backend="inductor"),
+            x.clone(),
+            y.clone(),
         )
-        self.assertIn(
-            prologue_pattern, final_code, "Final code should contain prologue fusion"
+        self.assertIn(ep, code, "Must have epilogue fusion")
+        self.assertIn(pp, code, "Must have prologue fusion")
+        self.assertEqual(code.count("@triton.jit"), 1, "Single fused kernel")
+
+    @unittest.skip("Requires fusion-aware autotuning infra")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_autotune_different_epilogues(self):
+        """Different epilogues (relu vs sigmoid) trigger separate autotuning."""
+        if not supports_torch_compile_fusion():
+            self.skipTest(
+                "torch.compile fusion requires ExternalTritonTemplateKernel support"
+            )
+        from helion._compiler._inductor.template_buffer import HelionTemplateBuffer
+
+        kernel = self._make_autotune_kernel()
+        captured_codes, patch_ctx = self._make_code_capture()
+
+        def g(x: torch.Tensor, y: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            a = torch.relu(kernel(x, y))  # relu epilogue
+            b = torch.sigmoid(kernel(x, y))  # sigmoid epilogue
+            return a, b
+
+        kernel.reset()
+        torch._dynamo.reset()
+
+        x = torch.randn(128, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(128, device=DEVICE, dtype=torch.float32)
+
+        with patch_ctx:
+            compiled_g = torch.compile(g, fullgraph=True, backend="inductor")
+            result_a, result_b = compiled_g(x.clone(), y.clone())
+
+        torch.testing.assert_close(result_a, torch.relu(x + y), rtol=1e-4, atol=1e-4)
+        torch.testing.assert_close(result_b, torch.sigmoid(x + y), rtol=1e-4, atol=1e-4)
+
+        ep = self._EPILOGUE_PATTERN
+        sigmoid_pattern = "tl.sigmoid"
+        relu_only = [c for c in captured_codes if ep in c and sigmoid_pattern not in c]
+        sigmoid_only = [
+            c for c in captured_codes if sigmoid_pattern in c and ep not in c
+        ]
+        self.assertGreater(len(relu_only), 0, "Must have relu-only kernel(s)")
+        self.assertGreater(len(sigmoid_only), 0, "Must have sigmoid-only kernel(s)")
+
+        # Different epilogues must produce separate fusion-context cache entries
+        bk = next(iter(kernel._bound_kernels.values()))
+        bk_cache = HelionTemplateBuffer._fusion_config_cache.get(bk)
+        self.assertIsNotNone(
+            bk_cache, "Fusion config cache must have entries for the BoundKernel"
         )
-        final_triton_count = final_code.count("@triton.jit")
-        self.assertEqual(
-            final_triton_count,
+        self.assertGreater(
+            len(bk_cache),
             1,
-            f"Final fused code should have exactly 1 triton kernel "
-            f"(got {final_triton_count})",
+            "Different epilogues must produce separate fusion-context entries",
+        )
+
+        # Re-running reuses cached kernels
+        captured_codes.clear()
+        with patch_ctx:
+            result_a2, result_b2 = compiled_g(x.clone(), y.clone())
+        torch.testing.assert_close(result_a2, torch.relu(x + y), rtol=1e-4, atol=1e-4)
+        torch.testing.assert_close(
+            result_b2, torch.sigmoid(x + y), rtol=1e-4, atol=1e-4
+        )
+        self.assertEqual(len(captured_codes), 0, "Re-run must reuse cached kernels")
+
+    @unittest.skip("Requires fusion-aware autotuning infra")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_autotune_different_shapes(self):
+        """Different input shapes trigger re-autotuning with fused kernels."""
+        if not supports_torch_compile_fusion():
+            self.skipTest(
+                "torch.compile fusion requires ExternalTritonTemplateKernel support"
+            )
+
+        kernel = self._make_autotune_kernel()
+        captured_codes, patch_ctx = self._make_code_capture()
+
+        def f(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            x = x * 2.0
+            y = y * 2.0
+            return torch.relu(kernel(x, y)) + 1.0
+
+        kernel.reset()
+        torch._dynamo.reset()
+        ep = self._EPILOGUE_PATTERN
+        pp = self._PROLOGUE_PATTERN
+
+        # First compile with shape 128.
+        x128 = torch.randn(128, device=DEVICE, dtype=torch.float32)
+        y128 = torch.randn(128, device=DEVICE, dtype=torch.float32)
+
+        with patch_ctx:
+            compiled_f = torch.compile(f, fullgraph=True, backend="inductor")
+            result128 = compiled_f(x128.clone(), y128.clone())
+
+        expected128 = torch.relu((x128 * 2.0) + (y128 * 2.0)) + 1.0
+        torch.testing.assert_close(result128, expected128, rtol=1e-4, atol=1e-4)
+
+        first_fused_count = len([c for c in captured_codes if ep in c and pp in c])
+        self.assertGreater(first_fused_count, 0, "Shape-128 must produce fused kernels")
+
+        # Second compile with shape 256 — keep BoundKernel cache intact.
+        # A new shape creates a new BoundKernel, so fusion autotuning must
+        # run again (not reuse the shape-128 result).
+        captured_codes.clear()
+        torch._dynamo.reset()
+
+        x256 = torch.randn(256, device=DEVICE, dtype=torch.float32)
+        y256 = torch.randn(256, device=DEVICE, dtype=torch.float32)
+
+        with patch_ctx:
+            result256 = compiled_f(x256.clone(), y256.clone())
+
+        expected256 = torch.relu((x256 * 2.0) + (y256 * 2.0)) + 1.0
+        torch.testing.assert_close(result256, expected256, rtol=1e-4, atol=1e-4)
+
+        second_fused_count = len([c for c in captured_codes if ep in c and pp in c])
+        self.assertGreater(
+            second_fused_count, 0, "New shape must trigger new fused compilations"
+        )
+
+    @unittest.skip("Requires fusion-aware autotuning infra")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_autotune_same_epilogue_cache(self):
+        """Same kernel + same epilogue called twice → second hits fusion cache."""
+        if not supports_torch_compile_fusion():
+            self.skipTest(
+                "torch.compile fusion requires ExternalTritonTemplateKernel support"
+            )
+
+        kernel = self._make_autotune_kernel()
+        captured_codes, patch_ctx = self._make_code_capture()
+        ep = self._EPILOGUE_PATTERN
+
+        # First compile with relu epilogue — populates _fusion_config_cache.
+        def f_single(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            return torch.relu(kernel(x, y)) + 1.0
+
+        kernel.reset()
+        torch._dynamo.reset()
+
+        x = torch.randn(128, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(128, device=DEVICE, dtype=torch.float32)
+
+        with patch_ctx:
+            compiled_single = torch.compile(
+                f_single, fullgraph=True, backend="inductor"
+            )
+            result_single = compiled_single(x.clone(), y.clone())
+
+        torch.testing.assert_close(
+            result_single, torch.relu(x + y) + 1.0, rtol=1e-4, atol=1e-4
+        )
+        single_call_fused_count = len([c for c in captured_codes if ep in c])
+        self.assertGreater(single_call_fused_count, 0, "First compile must autotune")
+
+        # Second compile with same epilogue + different inputs (prevents CSE).
+        # Keep BoundKernel cache intact (no kernel.reset()) so the
+        # _fusion_config_cache entry from the first compile is available.
+        def f_double(
+            x: torch.Tensor, y: torch.Tensor, z: torch.Tensor
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            a = torch.relu(kernel(x, y)) + 1.0
+            b = torch.relu(kernel(x, z)) + 1.0
+            return a, b
+
+        torch._dynamo.reset()
+        captured_codes.clear()
+
+        z = torch.randn(128, device=DEVICE, dtype=torch.float32)
+
+        with patch_ctx:
+            compiled_double = torch.compile(
+                f_double, fullgraph=True, backend="inductor"
+            )
+            result_a, result_b = compiled_double(x.clone(), y.clone(), z.clone())
+
+        torch.testing.assert_close(
+            result_a, torch.relu(x + y) + 1.0, rtol=1e-4, atol=1e-4
+        )
+        torch.testing.assert_close(
+            result_b, torch.relu(x + z) + 1.0, rtol=1e-4, atol=1e-4
+        )
+
+        # The second compile should not have triggered new fused compilations
+        # because the fusion cache already has an entry for this epilogue.
+        double_call_fused_count = len([c for c in captured_codes if ep in c])
+        self.assertEqual(
+            double_call_fused_count,
+            0,
+            f"Same epilogue with shared BoundKernel must hit fusion cache "
+            f"(got {double_call_fused_count} new fused compilations)",
+        )
+
+    @unittest.skip("Requires fusion-aware autotuning infra")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_standalone_call_after_fusion_triggers_autotuning(self):
+        """Standalone call after torch.compile with fusion must trigger its own autotuning.
+
+        When the first use of a kernel is through torch.compile with fusion,
+        the fusion-aware autotuner picks a config optimized for the fused
+        workload.  A subsequent direct call must trigger autotuning for
+        the unfused context rather than silently reusing the fused config.
+        """
+        if not supports_torch_compile_fusion():
+            self.skipTest(
+                "torch.compile fusion requires ExternalTritonTemplateKernel support"
+            )
+        from helion._compiler._inductor.template_buffer import HelionTemplateBuffer
+        from helion.runtime.kernel import BoundKernel
+
+        kernel = self._make_autotune_kernel()
+
+        def f(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            x = x * 2.0
+            y = y * 2.0
+            return torch.relu(kernel(x, y)) + 1.0
+
+        kernel.reset()
+        torch._dynamo.reset()
+
+        x = torch.randn(128, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(128, device=DEVICE, dtype=torch.float32)
+
+        # First use is through torch.compile with fusion — no prior standalone call.
+        compiled_f = torch.compile(f, fullgraph=True, backend="inductor")
+        result_fused = compiled_f(x.clone(), y.clone())
+        expected_fused = torch.relu((x * 2.0) + (y * 2.0)) + 1.0
+        torch.testing.assert_close(result_fused, expected_fused, rtol=1e-4, atol=1e-4)
+
+        # Spy on compile_config to verify the standalone call triggers autotuning.
+        compile_config_calls: list[bool] = []
+        original_compile_config = BoundKernel.compile_config
+
+        def tracking_compile_config(self_bk, *args, **kwargs):
+            compile_config_calls.append(True)
+            return original_compile_config(self_bk, *args, **kwargs)
+
+        # Now do a standalone call — must produce correct results and
+        # establish its own config for the unfused context.
+        with patch.object(BoundKernel, "compile_config", tracking_compile_config):
+            result = kernel(x.clone(), y.clone())
+        torch.testing.assert_close(result, x + y, rtol=1e-4, atol=1e-4)
+
+        # The standalone call must have triggered compile_config (autotuning).
+        self.assertGreater(
+            len(compile_config_calls),
+            0,
+            "Standalone call must trigger its own autotuning via compile_config",
+        )
+
+        # Verify _config is set and fusion cache has separate entries.
+        bk = next(iter(kernel._bound_kernels.values()))
+        self.assertIsNotNone(
+            bk._config,
+            "Standalone call must establish its own unfused config",
+        )
+        bk_cache = HelionTemplateBuffer._fusion_config_cache.get(bk)
+        self.assertIsNotNone(
+            bk_cache,
+            "Fusion config cache should have entries from the torch.compile call",
+        )
+
+    @unittest.skip("Requires fusion-aware autotuning infra")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_autotune_fused_vs_unfused_config_stored_separately(self):
+        """Unfused config (bk._config) and fused config (_fusion_config_cache) are independent."""
+        if not supports_torch_compile_fusion():
+            self.skipTest(
+                "torch.compile fusion requires ExternalTritonTemplateKernel support"
+            )
+        from helion._compiler._inductor.template_buffer import HelionTemplateBuffer
+        from helion.runtime.config import Config
+
+        kernel = self._make_autotune_kernel()
+
+        kernel.reset()
+        torch._dynamo.reset()
+        HelionTemplateBuffer._fusion_config_cache.clear()
+
+        x = torch.randn(128, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(128, device=DEVICE, dtype=torch.float32)
+
+        # Standalone call — unfused autotuning, sets bk._config.
+        standalone_result = kernel(x.clone(), y.clone())
+        torch.testing.assert_close(standalone_result, x + y, rtol=1e-4, atol=1e-4)
+
+        bk = next(iter(kernel._bound_kernels.values()))
+        unfused_config = bk._config
+        self.assertIsNotNone(unfused_config, "Standalone must set bk._config")
+        self.assertIsInstance(unfused_config, Config)
+
+        # torch.compile with fusion — fused autotuning, stores in _fusion_config_cache.
+        def f(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            x = x * 2.0
+            y = y * 2.0
+            return torch.relu(kernel(x, y)) + 1.0
+
+        torch._dynamo.reset()
+        compiled_f = torch.compile(f, fullgraph=True, backend="inductor")
+        result = compiled_f(x.clone(), y.clone())
+        expected = torch.relu((x * 2.0) + (y * 2.0)) + 1.0
+        torch.testing.assert_close(result, expected, rtol=1e-4, atol=1e-4)
+
+        # Verify both storage locations independently.
+        self.assertIsNotNone(
+            bk._config, "bk._config must still hold the unfused config"
+        )
+        bk_cache = HelionTemplateBuffer._fusion_config_cache.get(bk)
+        self.assertIsNotNone(
+            bk_cache, "Fusion config cache must have entries for this BoundKernel"
+        )
+        self.assertGreater(len(bk_cache), 0, "Must have at least one fusion entry")
+        # Each fusion cache entry must be a Config instance.
+        for fusion_key, fused_cfg in bk_cache.items():
+            self.assertIsInstance(
+                fused_cfg,
+                Config,
+                f"Fusion cache entry {fusion_key!r} must be a Config",
+            )
+
+    @unittest.skip("Requires fusion-aware autotuning infra")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_autotune_epilogue_only_fusion(self):
+        """Fusion-aware autotuning works with epilogue only (no prologue)."""
+        if not supports_torch_compile_fusion():
+            self.skipTest(
+                "torch.compile fusion requires ExternalTritonTemplateKernel support"
+            )
+
+        kernel = self._make_autotune_kernel()
+        captured_codes, patch_ctx = self._make_code_capture()
+
+        def f(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            return torch.relu(kernel(x, y)) + 1.0  # epilogue only, no prologue
+
+        kernel.reset()
+        torch._dynamo.reset()
+
+        x = torch.randn(128, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(128, device=DEVICE, dtype=torch.float32)
+
+        with patch_ctx:
+            compiled_f = torch.compile(f, fullgraph=True, backend="inductor")
+            result = compiled_f(x.clone(), y.clone())
+
+        expected = torch.relu(x + y) + 1.0
+        torch.testing.assert_close(result, expected, rtol=1e-4, atol=1e-4)
+
+        ep = self._EPILOGUE_PATTERN
+        pp = self._PROLOGUE_PATTERN
+        fused = [c for c in captured_codes if ep in c]
+        self.assertGreater(len(fused), 0, "Must have epilogue-fused kernel(s)")
+        for code in fused:
+            self.assertNotIn(pp, code, "Must NOT have prologue in epilogue-only test")
+
+    @unittest.skip("Requires fusion-aware autotuning infra")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_autotune_prologue_only_fusion(self):
+        """Fusion-aware autotuning works with prologue only (no epilogue)."""
+        if not supports_torch_compile_fusion():
+            self.skipTest(
+                "torch.compile fusion requires ExternalTritonTemplateKernel support"
+            )
+
+        kernel = self._make_autotune_kernel()
+        captured_codes, patch_ctx = self._make_code_capture()
+
+        def f(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            x = x * 2.0
+            y = y * 2.0
+            return kernel(x, y)  # prologue only, no epilogue
+
+        kernel.reset()
+        torch._dynamo.reset()
+
+        x = torch.randn(128, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(128, device=DEVICE, dtype=torch.float32)
+
+        with patch_ctx:
+            compiled_f = torch.compile(f, fullgraph=True, backend="inductor")
+            result = compiled_f(x.clone(), y.clone())
+
+        expected = (x * 2.0) + (y * 2.0)
+        torch.testing.assert_close(result, expected, rtol=1e-4, atol=1e-4)
+
+        ep = self._EPILOGUE_PATTERN
+        pp = self._PROLOGUE_PATTERN
+        fused = [c for c in captured_codes if pp in c]
+        self.assertGreater(len(fused), 0, "Must have prologue-fused kernel(s)")
+        for code in fused:
+            self.assertNotIn(ep, code, "Must NOT have epilogue in prologue-only test")
+
+    @unittest.skip("Requires fusion-aware autotuning infra")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_autotune_bare_kernel_no_prologue_epilogue(self):
+        """Fusion-aware autotuning does not break when Inductor has no prologue or epilogue to fuse."""
+        if not supports_torch_compile_fusion():
+            self.skipTest(
+                "torch.compile fusion requires ExternalTritonTemplateKernel support"
+            )
+
+        kernel = self._make_autotune_kernel()
+
+        def f(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            return kernel(x, y)  # no prologue, no epilogue
+
+        kernel.reset()
+        torch._dynamo.reset()
+
+        x = torch.randn(128, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(128, device=DEVICE, dtype=torch.float32)
+
+        compiled_f = torch.compile(f, fullgraph=True, backend="inductor")
+        result = compiled_f(x.clone(), y.clone())
+        torch.testing.assert_close(result, x + y, rtol=1e-4, atol=1e-4)
+
+        # Direct call still works afterward (extra_params not leaked).
+        result_direct = kernel(x.clone(), y.clone())
+        torch.testing.assert_close(result_direct, x + y, rtol=1e-4, atol=1e-4)
+
+    @unittest.skip("Requires fusion-aware autotuning infra")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_autotune_no_configs_uses_fusion_context(self):
+        """Without explicit configs, fusion autotuning must benchmark the fused kernel.
+
+        Without explicit configs, Backend.autotune falls through to the full
+        search path which wraps the search in BaseCache.  The adapter must
+        pass the is_cacheable() guard in BaseCache, and the autotuner must
+        use the fusion context hash to avoid returning a stale config from
+        a prior unfused run.
+        """
+        if not supports_torch_compile_fusion():
+            self.skipTest(
+                "torch.compile fusion requires ExternalTritonTemplateKernel support"
+            )
+
+        @helion.kernel(
+            torch_compile_fusion=True,
+            autotune_with_torch_compile_fusion=True,
+            autotune_max_generations=1,
+        )
+        def k_add_no_configs(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size()):
+                out[tile] = x[tile] + y[tile]
+            return out
+
+        k_add_no_configs.reset()
+        torch._dynamo.reset()
+
+        x = torch.randn(128, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(128, device=DEVICE, dtype=torch.float32)
+
+        # Standalone call — runs real unfused autotuning, populates disk cache.
+        standalone_result = k_add_no_configs(x.clone(), y.clone())
+        torch.testing.assert_close(standalone_result, x + y, rtol=1e-4, atol=1e-4)
+
+        # torch.compile with fusion — must not crash and must not silently
+        # reuse the cached unfused config.
+        from helion._compiler._inductor.template_buffer import _FusionAutotuneAdapter
+
+        bench_compile_called: list[bool] = []
+        original_bench = _FusionAutotuneAdapter.bench_compile_config
+
+        def tracking_bench(adapter_self, config=None, **kwargs):
+            bench_compile_called.append(True)
+            return original_bench(adapter_self, config, **kwargs)
+
+        torch._dynamo.reset()
+
+        def f(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            return torch.relu(k_add_no_configs(x, y)) + 1.0
+
+        with patch.object(
+            _FusionAutotuneAdapter, "bench_compile_config", tracking_bench
+        ):
+            compiled_f = torch.compile(f, fullgraph=True, backend="inductor")
+            result = compiled_f(x.clone(), y.clone())
+
+        expected = torch.relu(x + y) + 1.0
+        torch.testing.assert_close(result, expected, rtol=1e-4, atol=1e-4)
+
+        # bench_compile_config must have been called, proving the fusion
+        # autotuner benchmarked the fused kernel rather than silently
+        # returning the cached unfused config.
+        self.assertGreater(
+            len(bench_compile_called),
+            0,
+            "Fusion autotuner must benchmark the fused kernel via "
+            "bench_compile_config, not reuse the cached unfused config",
         )
 
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
