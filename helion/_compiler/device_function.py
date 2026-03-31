@@ -881,6 +881,13 @@ class DeviceFunction:
         self._scratch_args.append(ScratchArg(name, shape, dtype, scratch_type))
         return name
 
+    def scratch_read_slice(self, name: str) -> str | None:
+        """Return the index expression for reading logical data from a padded scratch.
+
+        Returns None if no padding was applied.
+        """
+        return None
+
     def register_dma_semaphore(self, name_hint: str = "sem") -> str:
         """Register a DMA semaphore scratch buffer and return its variable name."""
         return self.register_scratch(

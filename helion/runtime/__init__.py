@@ -260,6 +260,42 @@ def _pallas_build_block_specs(
     return in_specs, out_specs
 
 
+def _pallas_build_pipeline_specs(
+    pl: object,
+    jnp: object,
+    pltpu: object,
+    grid: tuple[int, ...],
+    args: tuple[object, ...],
+    tensor_arg_indices: list[int],
+    output_indices: list[int],
+    block_spec_info: _BlockSpecInfo | None,
+    pipeline_arg_indices: list[int] | None,
+) -> tuple[list[object], object]:
+    """Build in/out specs for pipeline launchers.
+
+    Pipeline-body tensors (listed in *pipeline_arg_indices*) get HBM refs.
+    All other tensors get proper BlockSpecs for automatic VMEM prefetch.
+    """
+    pipeline_set = set(pipeline_arg_indices or [])
+    arg_to_tpos = {orig: tpos for tpos, orig in enumerate(tensor_arg_indices)}
+
+    def _spec_for(idx: int) -> object:
+        if idx in pipeline_set:
+            return pl.BlockSpec(memory_space=pltpu.HBM)  # type: ignore[union-attr]
+        if block_spec_info is not None:
+            t = args[idx]
+            assert isinstance(t, torch.Tensor)
+            return _pallas_make_block_spec(
+                pl, jnp, t, block_spec_info[arg_to_tpos[idx]]
+            )
+        return pl.BlockSpec(memory_space=pl.ANY)  # type: ignore[union-attr]
+
+    in_specs = [_spec_for(idx) for idx in tensor_arg_indices]
+    out_specs_list = [_spec_for(idx) for idx in output_indices]
+    out_specs = out_specs_list if len(out_specs_list) > 1 else out_specs_list[0]
+    return in_specs, out_specs
+
+
 def _pallas_prepare_args(
     args: tuple[object, ...],
     _output_indices: list[int],
@@ -490,14 +526,14 @@ def default_pallas_pipeline_launcher(
     _output_indices: list[int] | None = None,
     _block_spec_info: _BlockSpecInfo | None = None,
     _scratch_shapes: list[tuple[tuple[int, ...], str]] | None = None,
+    _pipeline_arg_indices: list[int] | None = None,
     **kwargs: object,
 ) -> None:
     """Launcher for Pallas kernels using PrefetchScalarGridSpec with scratch memory.
 
-    Used when ``pallas_loop_type='emit_pipeline'``.  Passes all tensors as
-    ``memory_space=pl.ANY`` (HBM refs) and adds scratch buffers as
-    ``pltpu.VMEM`` shapes.  The kernel uses ``pltpu.emit_pipeline``
-    internally for DMA pipelining.
+    Used when ``pallas_loop_type='emit_pipeline'``.  Pipeline-body tensors
+    (listed in ``_pipeline_arg_indices``) use HBM refs; all other tensors
+    get proper BlockSpecs for automatic VMEM prefetch.
     """
     if _output_indices is None:
         _output_indices = []
@@ -549,10 +585,17 @@ def default_pallas_pipeline_launcher(
                     pltpu.VMEM(shape, jnp_dtype)  # pyrefly: ignore[bad-argument-type]
                 )
 
-        # Build in_specs/out_specs with memory_space=pl.ANY (HBM refs)
-        in_specs_list = [pl.BlockSpec(memory_space=pl.ANY) for _ in tensor_arg_indices]
-        out_specs_list = [pl.BlockSpec(memory_space=pl.ANY) for _ in _output_indices]
-        out_specs = out_specs_list if len(out_specs_list) > 1 else out_specs_list[0]
+        in_specs_list, out_specs = _pallas_build_pipeline_specs(
+            pl,
+            jnp,
+            pltpu,
+            grid,
+            args,
+            tensor_arg_indices,
+            _output_indices,
+            _block_spec_info,
+            _pipeline_arg_indices,
+        )
 
         reordered_kernel = _pallas_make_reordered_kernel(
             pallas_kernel,
