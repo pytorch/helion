@@ -1785,7 +1785,6 @@ class TestExamples(RefEagerTestBase, TestCase):
             atol=0.3,
         )
 
-    @xfailIfPallas("InductorLoweringError")
     def test_grpo_loss_fwd(self):
         """Test forward pass for GRPO loss."""
         B, L, V = 4, 512, 2048

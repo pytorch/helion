@@ -801,19 +801,24 @@ def _(state: CodegenState) -> None:
 
 @has_side_effect
 @_decorators.api()
-def _if(test: object, graph_id: int, args: list[object]) -> list[object]:
+def _if(
+    test: object,
+    graph_id: int,
+    args: list[object],
+    arg_names: list[str],
+    output_names: list[str],
+) -> list[object]:
     """`for` loops are mapped to this op since FX does not support control flow."""
     raise AssertionError("this should never be called")
 
 
 @_decorators.codegen(_if, "common")
-def _(state: CodegenState) -> None:
-    # pyrefly: ignore[bad-return]
+def _(state: CodegenState) -> list[object]:
     return state.get_graph(state.proxy_arg(1)).codegen(state)
 
 
 @_decorators.codegen(_if, "pallas")
-def _(state: CodegenState) -> None:
+def _(state: CodegenState) -> list[object]:
     """Emit dynamic if-conditions for Pallas/TPU using ``lax.cond``.
 
     JAX's tracing model does not support Python ``if`` on traced values.
@@ -850,19 +855,76 @@ def _(state: CodegenState) -> None:
 
     body_stmts: list[ast.AST] = []
     with state.codegen.set_statements(body_stmts):
-        codegen_call_with_graph(state.codegen, graph_info.graph, [*args])
-
-    fn_def = statement_from_string(f"def {branch_fn_name}(): pass")
-    assert isinstance(fn_def, ast.FunctionDef)
-    fn_def.body = body_stmts or [ast.Pass()]  # pyrefly: ignore[bad-assignment]
-    state.add_statement(fn_def)
-
-    state.add_statement(
-        statement_from_string(
-            f"lax.cond({{test}}, {branch_fn_name}, lambda: None)",
-            test=test,
+        branch_outputs = codegen_call_with_graph(
+            state.codegen, graph_info.graph, [*args]
         )
-    )
+
+    arg_node_names = state.proxy_arg(3)
+    outputs_node_names = state.proxy_arg(4)
+    assert isinstance(arg_node_names, list)
+    assert isinstance(outputs_node_names, list)
+    arg_node_name_to_ast_name = {arg_node_names[i]: args[i] for i in range(len(args))}
+    written_arg_ast_names = [
+        arg_node_name_to_ast_name[name]
+        for name in outputs_node_names
+        if name in arg_node_name_to_ast_name
+    ]
+
+    if len(written_arg_ast_names) > 0:
+        # The side effects of the branch includes writing to some of the input args. e.g.:
+        #   delta = torch.zeros_like(x[tile])
+        #   if 3 < v < 7:
+        #       delta += 1.0
+        #       out[tile] = torch.sigmoid(x[tile])
+        #   out[tile] = out[tile] + delta
+        # For this situation, we need to return the written args as a return value,
+        # and assign the return value to the original args after the lax.cond call. e.g.:
+        #   cond = 3 < v < 7
+        #   def _cond_branch(delta=delta):
+        #       delta = delta + 1.0
+        #       out[:, :] = ...
+        #       return delta
+        #   def _else_noop(delta=delta):
+        #       return delta
+        #   delta = lax.cond(_and, _cond_branch, _else_noop)
+        #   out[tile] = out[tile] + delta
+        # We need this arg-return pattern because JAX doesn't allow `nonlocal`
+        arg_list_with_defaults = ", ".join(f"{n.id}={n.id}" for n in args)
+        output_list = ", ".join(n.id for n in written_arg_ast_names)
+
+        body_stmts.append(statement_from_string(f"return {output_list}"))
+        fn_def = statement_from_string(
+            f"def {branch_fn_name}({arg_list_with_defaults}): pass"
+        )
+        assert isinstance(fn_def, ast.FunctionDef)
+        fn_def.body = body_stmts or [ast.Pass()]  # pyrefly: ignore[bad-assignment]
+
+        else_noop_fn_name = state.device_function.new_var("_else_noop")
+        else_noop_fn_def = statement_from_string(
+            f"def {else_noop_fn_name}({arg_list_with_defaults}): return {output_list}"
+        )
+        state.add_statement(fn_def)
+        state.add_statement(else_noop_fn_def)
+
+        state.add_statement(
+            statement_from_string(
+                f"{output_list} = lax.cond({{test}}, {branch_fn_name}, {else_noop_fn_name})",
+                test=test,
+            )
+        )
+    else:
+        fn_def = statement_from_string(f"def {branch_fn_name}(): pass")
+        assert isinstance(fn_def, ast.FunctionDef)
+        fn_def.body = body_stmts or [ast.Pass()]  # pyrefly: ignore[bad-assignment]
+        state.add_statement(fn_def)
+
+        state.add_statement(
+            statement_from_string(
+                f"lax.cond({{test}}, {branch_fn_name}, lambda: None)",
+                test=test,
+            )
+        )
+    return branch_outputs
 
 
 # Note we can't DCE phi nodes because there may be a loop carry dependency not captured in the outer graph
