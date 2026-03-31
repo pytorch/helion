@@ -10,6 +10,7 @@ from helion._testing import DEVICE
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
+from helion._testing import skipIfRefEager
 from helion.autotuner.config_fragment import EnumFragment
 import helion.language as hl
 
@@ -68,6 +69,7 @@ def matmul_with_cast(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 
 @onlyBackends(["triton"])
 class TestEpilogueSubtiling(TestCase):
+    @skipIfRefEager("test checks generated Triton code")
     def test_codegen_s2(self):
         """S=2 produces tl.split and 2 stores for both bias-add and cast epilogues."""
         bias_args = (
@@ -101,6 +103,7 @@ class TestEpilogueSubtiling(TestCase):
         self.assertIn("tl.split", code)
         self.assertEqual(code.count("tl.store("), 2)
 
+    @skipIfRefEager("test checks generated Triton code")
     def test_codegen_s4(self):
         """S=4 produces multiple tl.split calls and 4 stores."""
         bias_args = (
@@ -143,6 +146,7 @@ class TestEpilogueSubtiling(TestCase):
         torch.testing.assert_close(output, args[0] @ args[1], atol=1e-1, rtol=1e-2)
         self.assertNotIn("tl.split", code)
 
+    @skipIfRefEager("test checks generated Triton code")
     def test_bool_true_normalizes_to_s2(self):
         args = (
             torch.randn([128, 128], device=DEVICE, dtype=torch.float32),
