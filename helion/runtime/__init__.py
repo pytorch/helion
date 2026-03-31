@@ -16,6 +16,9 @@ from .._utils import triton_is_available
 from .config import Config as Config
 from .kernel import Kernel as Kernel
 from .kernel import kernel as kernel
+from .static_launcher import _STATIC_LAUNCHER_DEVICES
+from .static_launcher import _check_static_launcher_available
+from .static_launcher import _static_launch
 
 _CUTLASS_SHUTDOWN_PATCHED = False
 
@@ -151,7 +154,25 @@ def default_launcher(
     **kwargs: dict,
 ) -> object:
     """Default launcher function that executes the kernel immediately."""
-    # For both CUDA and MTIA, use the same kernel execution
+    device_type = next(
+        (a.device.type for a in args if isinstance(a, torch.Tensor)), None
+    )
+    # Use static launcher when available (bypasses per-kernel C++ compilation)
+    if (
+        not launch_cooperative_grid
+        and device_type in _STATIC_LAUNCHER_DEVICES
+        and _check_static_launcher_available()
+    ):
+        assert device_type is not None
+        return _static_launch(
+            triton_kernel,
+            grid,
+            args,
+            device_type,
+            num_warps=num_warps,
+            num_stages=num_stages,
+        )
+    # Standard path for other backends, cooperative grid, or when static launcher unavailable
     run_kwargs: dict = {
         "grid": grid,
         "warmup": False,
