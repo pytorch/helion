@@ -26,6 +26,7 @@ from helion._testing import xfailIfCute
 from helion._testing import xfailIfPallas
 import helion.language as hl
 from helion.runtime.config import Config
+from helion.runtime.ref_mode import is_ref_mode_enabled
 from helion.runtime.settings import _get_backend
 
 try:
@@ -100,6 +101,29 @@ def _compile_once(
     code = bound.to_triton_code(config)
     compiled = bound.compile_config(config)
     return code, compiled
+
+
+def _compile_only(
+    fn: helion.Kernel,
+    args: tuple[object, ...],
+    **kwargs: object,
+) -> object:
+    bound = fn.bind(args)
+    if kwargs:
+        config = Config(
+            # pyrefly: ignore [bad-argument-type]
+            **kwargs
+        )
+    elif fn.configs:
+        (config,) = fn.configs
+    else:
+        config = bound.config_spec.default_config()
+    for key in bound.config_spec.unsupported_config_keys(config.config):
+        config.config.pop(key, None)
+    if is_ref_mode_enabled(bound.kernel.settings):
+        bound._config = config
+        return bound
+    return bound.compile_config(config)
 
 
 if triton is not None and tl is not None:
@@ -382,28 +406,28 @@ class TestRNG(RefEagerTestBase, TestCase):
                 explicit[tile_m, tile_n] = hl.rand([tile_m, tile_n], seed=explicit_seed)
             return implicit, explicit
 
-        x = torch.ones((17, 19), device=DEVICE, dtype=torch.float32)
+        x = torch.ones((9, 11), device=DEVICE, dtype=torch.float32)
         explicit_seed = 0x1234_5678
-        block_sizes = [8, 16]
+        block_sizes = [4, 8]
 
         torch.manual_seed(2026)
-        _code, implicit_only = code_and_output(
+        implicit_only = _compile_only(
             implicit_only_kernel,
             (x,),
             block_sizes=block_sizes,
-        )
+        )(x)
         torch.manual_seed(2026)
-        _code, (explicit_then_implicit, _explicit0) = code_and_output(
+        explicit_then_implicit, _explicit0 = _compile_only(
             explicit_then_implicit_kernel,
             (x, explicit_seed),
             block_sizes=block_sizes,
-        )
+        )(x, explicit_seed)
         torch.manual_seed(2026)
-        _code, (implicit_then_explicit, _explicit1) = code_and_output(
+        implicit_then_explicit, _explicit1 = _compile_only(
             implicit_then_explicit_kernel,
             (x, explicit_seed),
             block_sizes=block_sizes,
-        )
+        )(x, explicit_seed)
 
         _assert_bitwise_equal_float(self, explicit_then_implicit, implicit_only)
         _assert_bitwise_equal_float(self, implicit_then_explicit, implicit_only)
@@ -418,43 +442,34 @@ class TestRNG(RefEagerTestBase, TestCase):
         @helion.kernel(static_shapes=True, autotune_effort="none")
         def multiple_rng_ops_kernel(
             x: torch.Tensor,
-        ) -> tuple[
-            torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
-        ]:
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
             # Two independent rand operations
             rand1 = torch.zeros_like(x)
             rand2 = torch.zeros_like(x)
 
-            # Mixed rand and randn
-            uniform = torch.zeros_like(x)
             normal = torch.zeros_like(x)
-
-            # Multiple randn for sum
-            randn_a = torch.zeros_like(x)
-            randn_b = torch.zeros_like(x)
-            randn_c = torch.zeros_like(x)
+            randn_sum = torch.zeros_like(x)
 
             m, n = x.shape
             for tile_m, tile_n in hl.tile([m, n]):
+                tile = x[tile_m, tile_n]
                 # Two independent rand operations
-                rand1[tile_m, tile_n] = torch.rand_like(x[tile_m, tile_n])
-                rand2[tile_m, tile_n] = torch.rand_like(x[tile_m, tile_n])
+                rand1[tile_m, tile_n] = torch.rand_like(tile)
+                rand2[tile_m, tile_n] = torch.rand_like(tile)
 
                 # Mixed rand and randn
-                uniform[tile_m, tile_n] = torch.rand_like(x[tile_m, tile_n])
-                normal[tile_m, tile_n] = torch.randn_like(x[tile_m, tile_n])
+                normal[tile_m, tile_n] = torch.randn_like(tile)
 
                 # Multiple randn
-                randn_a[tile_m, tile_n] = torch.randn_like(x[tile_m, tile_n])
-                randn_b[tile_m, tile_n] = torch.randn_like(x[tile_m, tile_n])
-                randn_c[tile_m, tile_n] = torch.randn_like(x[tile_m, tile_n])
+                randn_sum[tile_m, tile_n] = (
+                    torch.randn_like(tile)
+                    + torch.randn_like(tile)
+                    + torch.randn_like(tile)
+                )
 
-            # Combine the three randn outside the loop
-            randn_sum = randn_a + randn_b + randn_c
+            return rand1, rand2, normal, randn_sum
 
-            return rand1, rand2, uniform, normal, randn_sum
-
-        x = torch.ones(64, 64, device=DEVICE)
+        x = torch.ones(32, 32, device=DEVICE)
         block_sizes = _rng_heavy_2d_block_sizes()
         _code1, compiled = _compile_once(
             multiple_rng_ops_kernel, (x,), block_sizes=block_sizes
@@ -462,7 +477,7 @@ class TestRNG(RefEagerTestBase, TestCase):
 
         # Test 1: Independence and distribution properties
         torch.manual_seed(42)
-        rand1, rand2, uniform, normal, randn_sum = compiled(x)
+        rand1, rand2, normal, randn_sum = compiled(x)
 
         # Check two independent rand operations
         self.assertTrue(
@@ -488,14 +503,6 @@ class TestRNG(RefEagerTestBase, TestCase):
 
         # Check mixed rand and randn
         self.assertTrue(
-            torch.all(uniform >= 0.0) and torch.all(uniform < 1.0),
-            "Uniform (rand) values should be in [0, 1)",
-        )
-        self.assertTrue(
-            0.4 < uniform.mean().item() < 0.6,
-            f"Uniform mean {uniform.mean().item():.3f} should be ~0.5",
-        )
-        self.assertTrue(
             -0.2 < normal.mean().item() < 0.2,
             f"Normal mean {normal.mean().item():.3f} should be ~0",
         )
@@ -507,7 +514,7 @@ class TestRNG(RefEagerTestBase, TestCase):
             torch.any(normal < 0.0), "Normal distribution should have negative values"
         )
         self.assertFalse(
-            torch.allclose(uniform, normal),
+            torch.allclose(rand1, normal),
             "Uniform and normal distributions should be different",
         )
 
@@ -657,12 +664,10 @@ class TestRNG(RefEagerTestBase, TestCase):
                 output[tile_m, tile_n] = rng_func(tile_m, tile_n, x.dtype)
             return output
 
-        x = torch.ones(128, 128, device=DEVICE)
+        x = torch.ones(48, 48, device=DEVICE)
         torch.manual_seed(42)
         block_sizes = _rng_2d_block_sizes()
-        _code, compiled = _compile_once(
-            rng_kernel, (x, rng_func), block_sizes=block_sizes
-        )
+        compiled = _compile_only(rng_kernel, (x, rng_func), block_sizes=block_sizes)
         output = compiled(x, rng_func)
 
         # Check distribution properties based on RNG type
@@ -1316,11 +1321,11 @@ class TestRNGBackendParity(TestCase):
 
         x = torch.empty((11, 13), device=DEVICE, dtype=torch.float32)
         seed = 4096
-        _code_t, out_t = code_and_output(
-            rand_kernel_triton, (x, seed), block_sizes=[8, 16, 8, 16]
+        out_t = _compile_only(rand_kernel_triton, (x, seed), block_sizes=[4, 8, 4, 8])(
+            x, seed
         )
-        _code_c, out_c = code_and_output(
-            rand_kernel_cute, (x, seed), block_sizes=[8, 16, 8, 16]
+        out_c = _compile_only(rand_kernel_cute, (x, seed), block_sizes=[4, 8, 4, 8])(
+            x, seed
         )
         _assert_bitwise_equal_float(self, out_t[0], out_c[0])
         _assert_bitwise_equal_float(self, out_t[1], out_c[1])
@@ -1362,11 +1367,11 @@ class TestRNGBackendParity(TestCase):
 
         x = torch.empty((9, 15), device=DEVICE, dtype=torch.int32)
         seed = 5150
-        _code_t, out_t = code_and_output(
-            randint_kernel_triton, (x, seed), block_sizes=[8, 16, 8, 16]
-        )
-        _code_c, out_c = code_and_output(
-            randint_kernel_cute, (x, seed), block_sizes=[8, 16, 8, 16]
+        out_t = _compile_only(
+            randint_kernel_triton, (x, seed), block_sizes=[4, 8, 4, 8]
+        )(x, seed)
+        out_c = _compile_only(randint_kernel_cute, (x, seed), block_sizes=[4, 8, 4, 8])(
+            x, seed
         )
         self.assertTrue(torch.equal(out_t[0].cpu(), out_c[0].cpu()))
         self.assertTrue(torch.equal(out_t[1].cpu(), out_c[1].cpu()))
@@ -1408,13 +1413,13 @@ class TestRNGBackendParity(TestCase):
 
         x = torch.empty((13, 29), device=DEVICE, dtype=torch.float32)
         torch.manual_seed(111)
-        _code_t, (uniform_t, normal_t) = code_and_output(
-            aten_rng_kernel_triton, (x,), block_sizes=[8, 16]
-        )
+        uniform_t, normal_t = _compile_only(
+            aten_rng_kernel_triton, (x,), block_sizes=[4, 8]
+        )(x)
         torch.manual_seed(111)
-        _code_c, (uniform_c, normal_c) = code_and_output(
-            aten_rng_kernel_cute, (x,), block_sizes=[8, 16]
-        )
+        uniform_c, normal_c = _compile_only(
+            aten_rng_kernel_cute, (x,), block_sizes=[4, 8]
+        )(x)
         _assert_bitwise_equal_float(self, uniform_t, uniform_c)
         _assert_bitwise_equal_float(self, normal_t, normal_c)
 

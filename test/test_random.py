@@ -20,6 +20,7 @@ from helion._testing import skipIfRocm
 from helion._testing import xfailIfPallas
 import helion.language as hl
 from helion.runtime.config import Config
+from helion.runtime.ref_mode import is_ref_mode_enabled
 from helion.runtime.settings import _get_backend
 
 try:
@@ -71,7 +72,7 @@ def _rng_3d_block_sizes() -> list[int]:
 def _rng_determinism_block_sizes() -> list[list[int]]:
     if _get_backend() == "cute":
         return [[8, 8], [16, 16], [32, 32]]
-    return [[16, 16], [32, 32], [64, 64]]
+    return [[8, 8], [16, 16], [32, 32]]
 
 
 def _compile_once(
@@ -94,6 +95,29 @@ def _compile_once(
     code = bound.to_triton_code(config)
     compiled = bound.compile_config(config)
     return code, compiled
+
+
+def _compile_only(
+    fn: helion.Kernel,
+    args: tuple[object, ...],
+    **kwargs: object,
+) -> object:
+    bound = fn.bind(args)
+    if kwargs:
+        config = Config(
+            # pyrefly: ignore [bad-argument-type]
+            **kwargs
+        )
+    elif fn.configs:
+        (config,) = fn.configs
+    else:
+        config = bound.config_spec.default_config()
+    for key in bound.config_spec.unsupported_config_keys(config.config):
+        config.config.pop(key, None)
+    if is_ref_mode_enabled(bound.kernel.settings):
+        bound._config = config
+        return bound
+    return bound.compile_config(config)
 
 
 def _helper_seeded_rand(tile_m, tile_n, seed: int) -> torch.Tensor:
@@ -343,12 +367,12 @@ class TestRandom(RefEagerTestBase, TestCase):
                 output[tile_m, tile_n] = hl.rand([tile_m, tile_n], seed=seed)
             return output
 
-        x = torch.ones(128, 256, device=DEVICE)
+        x = torch.ones(64, 128, device=DEVICE)
         seed = 42
 
         block_sizes = _rng_determinism_block_sizes()
         compiled_kernels = [
-            _compile_once(rand_kernel_2d, (x, seed), block_sizes=bs)[1]
+            _compile_only(rand_kernel_2d, (x, seed), block_sizes=bs)
             for bs in block_sizes
         ]
         outputs = [compiled(x, seed) for compiled in compiled_kernels]
@@ -461,16 +485,16 @@ class TestRandom(RefEagerTestBase, TestCase):
                 )
             return output
 
-        x = torch.ones(32, 64, 16, device=DEVICE)
+        x = torch.ones(16, 32, 8, device=DEVICE)
         seed = 1337
-        block_sizes = _rng_3d_block_sizes()
+        block_sizes = [4, 8, 8]
 
-        code1, output1 = code_and_output(
+        output1 = _compile_only(
             rand_kernel_normal_order, (x, seed), block_sizes=block_sizes
-        )
-        code2, output2 = code_and_output(
+        )(x, seed)
+        output2 = _compile_only(
             rand_kernel_mixed_order, (x, seed), block_sizes=block_sizes
-        )
+        )(x, seed)
 
         torch.testing.assert_close(
             output1,

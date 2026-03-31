@@ -52,6 +52,7 @@ from .runtime.settings import RefMode
 if TYPE_CHECKING:
     import types
 
+    from .runtime.kernel import BoundKernel
     from .runtime.kernel import Kernel
 
 
@@ -894,14 +895,67 @@ def import_path(filename: Path) -> types.ModuleType:
     return sys.modules[module_name]
 
 
+def _bound_test_config(bound: BoundKernel, **kwargs: object) -> Config:
+    if kwargs:
+        config = Config(
+            # pyrefly: ignore [bad-argument-type]
+            **kwargs
+        )
+    elif bound.kernel.configs:
+        (config,) = bound.kernel.configs
+    else:
+        config = bound.config_spec.default_config()
+    # Strip config keys not supported by the current backend so that
+    # tests with Triton-specific keys (num_warps, num_stages, indexing, etc.)
+    # can run on other backends like Pallas/TPU.
+    config_spec = bound.config_spec
+    for key in config_spec.unsupported_config_keys(config.config):
+        config.config.pop(key, None)
+    return config
+
+
+def _run_bound_kernel(
+    bound: BoundKernel,
+    args: tuple[object, ...],
+    config: Config,
+    *,
+    emit_code: bool,
+) -> tuple[str | None, object]:
+    has_device_tensor = any(
+        isinstance(value, torch.Tensor) and value.device.type != "cpu" for value in args
+    )
+    code = bound.to_triton_code(config) if emit_code else None
+    compiled_kernel = bound.compile_config(config)
+    try:
+        result = compiled_kernel(*args)
+        if has_device_tensor or (
+            isinstance(result, torch.Tensor) and result.device.type != "cpu"
+        ):
+            torch.accelerator.synchronize()
+    except Exception as exc:
+        if code is None:
+            try:
+                code = bound.to_triton_code(config)
+            except Exception:
+                code = None
+        if code is not None:
+            sys.stderr.write(f"Failed to run kernel:\n{code}\n")
+        else:
+            sys.stderr.write("Failed to run kernel.\n")
+        if has_device_tensor:
+            try:
+                torch.accelerator.synchronize()
+            except Exception as sync_error:
+                raise exc from sync_error
+        raise
+    return code, result
+
+
 def code_and_output(
     fn: Kernel,
     args: tuple[object, ...],
     **kwargs: object,
 ) -> tuple[str, object]:
-    has_device_tensor = any(
-        isinstance(value, torch.Tensor) and value.device.type != "cpu" for value in args
-    )
     bound = fn.bind(args)
     if is_ref_mode_enabled(bound.kernel.settings):
         if kwargs:
@@ -913,38 +967,29 @@ def code_and_output(
         code = inspect.getsource(fn.fn)
         return code, result
 
-    if kwargs:
-        config = Config(
-            # pyrefly: ignore [bad-argument-type]
-            **kwargs
-        )
-    elif fn.configs:
-        (config,) = fn.configs
-    else:
-        config = fn.bind(args).config_spec.default_config()
-    # Strip config keys not supported by the current backend so that
-    # tests with Triton-specific keys (num_warps, num_stages, indexing, etc.)
-    # can run on other backends like Pallas/TPU.
-    config_spec = fn.bind(args).config_spec
-    for key in config_spec.unsupported_config_keys(config.config):
-        config.config.pop(key, None)
-    code = fn.bind(args).to_triton_code(config)
-    compiled_kernel = fn.bind(args).compile_config(config)
-    try:
-        result = compiled_kernel(*args)
-        if has_device_tensor or (
-            isinstance(result, torch.Tensor) and result.device.type != "cpu"
-        ):
-            torch.accelerator.synchronize()
-    except Exception as exc:
-        sys.stderr.write(f"Failed to run kernel:\n{code}\n")
-        if has_device_tensor:
-            try:
-                torch.accelerator.synchronize()
-            except Exception as sync_error:
-                raise exc from sync_error
-        raise
+    config = _bound_test_config(bound, **kwargs)
+    code, result = _run_bound_kernel(bound, args, config, emit_code=True)
+    assert code is not None
     return code, result
+
+
+def output_only(
+    fn: Kernel,
+    args: tuple[object, ...],
+    **kwargs: object,
+) -> object:
+    """Run a kernel for correctness checks without eagerly materializing code text."""
+    bound = fn.bind(args)
+    if is_ref_mode_enabled(bound.kernel.settings):
+        if kwargs:
+            # pyrefly: ignore [bad-argument-type]
+            config = Config(**kwargs)
+            bound._config = config
+        return fn(*args)
+
+    config = _bound_test_config(bound, **kwargs)
+    _code, result = _run_bound_kernel(bound, args, config, emit_code=False)
+    return result
 
 
 def run_example(
@@ -1130,6 +1175,50 @@ def run_example(
         print(f"{'=' * 65}\n", file=sys.stderr)
 
 
+def _assert_example_result_close(
+    result: object,
+    expected: object,
+    *,
+    skip_accuracy: bool,
+    atol: float,
+    rtol: float,
+) -> None:
+    if skip_accuracy:
+        return
+
+    # Use tree_map to apply assert_close to all tensor pairs
+    def assert_close_fn(got: object, exp: object) -> None:
+        # Skip if expected is None (i.e. we don't care what the actual value is)
+        if exp is None:
+            return
+        # Both None is OK
+        if got is None and exp is None:
+            return
+        assert isinstance(got, torch.Tensor) and isinstance(exp, torch.Tensor), (
+            f"Type mismatch: got {type(got)}, expected {type(exp)}"
+        )
+        torch.testing.assert_close(
+            got.to(torch.float32),
+            exp.to(torch.float32),
+            atol=atol,
+            rtol=rtol,
+        )
+
+    tree_map(assert_close_fn, result, expected)
+
+
+def _example_kernel(
+    name: str,
+    fn_name: str | None = None,
+    static_shapes: bool | None = None,
+) -> Kernel:
+    kernel_fn = getattr(import_path(EXAMPLES_DIR / f"{name}.py"), fn_name or name)
+    if static_shapes is not None:
+        assert static_shapes in (True, False)
+        kernel_fn.settings.static_shapes = static_shapes
+    return kernel_fn
+
+
 def check_example(
     name: str,
     args: tuple[torch.Tensor, ...],
@@ -1139,40 +1228,28 @@ def check_example(
     static_shapes: bool | None = None,
     atol: float = 1e-1,
     rtol: float = 1e-2,
+    emit_code: bool = True,
     **kwargs: object,
 ) -> str:
     """Helper used in unit tests to run a single example kernel and check its output."""
-    kernel_fn = getattr(import_path(EXAMPLES_DIR / f"{name}.py"), fn_name or name)
-    if static_shapes is not None:
-        assert static_shapes in (True, False)
-        kernel_fn.settings.static_shapes = static_shapes
+    kernel_fn = _example_kernel(name, fn_name=fn_name, static_shapes=static_shapes)
 
-    code, result = code_and_output(
-        kernel_fn,
-        args,
-        **kwargs,
+    if emit_code:
+        code, result = code_and_output(
+            kernel_fn,
+            args,
+            **kwargs,
+        )
+    else:
+        code = ""
+        result = output_only(
+            kernel_fn,
+            args,
+            **kwargs,
+        )
+    _assert_example_result_close(
+        result, expected, skip_accuracy=skip_accuracy, atol=atol, rtol=rtol
     )
-
-    if not skip_accuracy:
-        # Use tree_map to apply assert_close to all tensor pairs
-        def assert_close_fn(got: object, exp: object) -> None:
-            # Skip if expected is None (i.e. we don't care what the actual value is)
-            if exp is None:
-                return
-            # Both None is OK
-            if got is None and exp is None:
-                return
-            assert isinstance(got, torch.Tensor) and isinstance(exp, torch.Tensor), (
-                f"Type mismatch: got {type(got)}, expected {type(exp)}"
-            )
-            torch.testing.assert_close(
-                got.to(torch.float32),
-                exp.to(torch.float32),
-                atol=atol,
-                rtol=rtol,
-            )
-
-        tree_map(assert_close_fn, result, expected)
     return code
 
 

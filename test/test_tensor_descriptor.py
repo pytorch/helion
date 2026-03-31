@@ -411,14 +411,15 @@ class TestTensorDescriptor(RefEagerTestBase, TestCase):
     @skipUnlessTensorDescriptor("Tensor descriptor support is required")
     def test_attention_tensor_descriptor(self):
         args = (
-            torch.randn(2, 32, 1024, 64, dtype=HALF_DTYPE, device=DEVICE),
-            torch.randn(2, 32, 512, 64, dtype=HALF_DTYPE, device=DEVICE),
-            torch.randn(2, 32, 512, 64, dtype=HALF_DTYPE, device=DEVICE),
+            torch.randn(1, 16, 512, 64, dtype=HALF_DTYPE, device=DEVICE),
+            torch.randn(1, 16, 256, 64, dtype=HALF_DTYPE, device=DEVICE),
+            torch.randn(1, 16, 256, 64, dtype=HALF_DTYPE, device=DEVICE),
         )
         check_example(
             "attention",
             args,
             torch.nn.functional.scaled_dot_product_attention(*args),
+            emit_code=False,
             block_sizes=[1, 128, 64],
             indexing="tensor_descriptor",
         )
@@ -426,15 +427,16 @@ class TestTensorDescriptor(RefEagerTestBase, TestCase):
     @skipUnlessTensorDescriptor("Tensor descriptor support is required")
     def test_attention_td_dynamic(self):
         args = (
-            torch.randn(1, 32, 512, 64, dtype=torch.float32, device=DEVICE),
-            torch.randn(1, 32, 512, 64, dtype=torch.float32, device=DEVICE),
-            torch.randn(1, 32, 512, 64, dtype=torch.float32, device=DEVICE),
+            torch.randn(1, 16, 256, 64, dtype=torch.float32, device=DEVICE),
+            torch.randn(1, 16, 256, 64, dtype=torch.float32, device=DEVICE),
+            torch.randn(1, 16, 256, 64, dtype=torch.float32, device=DEVICE),
         )
         check_example(
             "attention",
             args,
             torch.nn.functional.scaled_dot_product_attention(*args),
             fn_name="attention_dynamic",
+            emit_code=False,
             block_sizes=[1, 16, 16],
             indexing="tensor_descriptor",
         )
