@@ -678,7 +678,6 @@ class TestExamples(RefEagerTestBase, TestCase):
     @xfailIfCute(
         "CuTe attention block-pointer example still exceeds thread-block limits"
     )
-    @xfailIfCute("CuTe persistent attention example still exceeds thread-block limits")
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfXPU("failure on XPU")
     @skipIfTileIR("TileIR does not support block_ptr indexing")

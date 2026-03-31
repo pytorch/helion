@@ -1363,10 +1363,12 @@ class PallasBackend(Backend):
             mutated_params = set(ReadWrites.from_list(host_fn.body).inplace_writes) & {
                 a.arg for a in host_fn.args.args
             }
+            input_storages = {id(t.untyped_storage()) for t in env.input_sources}
+
             for i, arg in enumerate(sorted_args):
                 if not isinstance(arg, TensorArg):
                     continue
-                if arg.fake_value not in env.input_sources:
+                if id(arg.fake_value.untyped_storage()) not in input_storages:
                     # Tensor created inside the function body (output)
                     output_indices.append(i)
                 elif arg.host_str() in mutated_params:
@@ -1400,6 +1402,19 @@ class PallasBackend(Backend):
             ]
             if scratch_shapes:
                 launcher_args.append(f"_scratch_shapes={scratch_shapes!r}")
+
+            # Identify which launcher arg positions correspond to pipeline-body
+            # tensors (need HBM refs); all others get proper BlockSpecs.
+            from .device_function import TensorArg
+
+            pipeline_ids = device_fn.pallas_pipeline_tensor_ids
+            if pipeline_ids and sorted_args is not None:
+                pipeline_arg_indices = [
+                    i
+                    for i, arg in enumerate(sorted_args)
+                    if isinstance(arg, TensorArg) and id(arg.fake_value) in pipeline_ids
+                ]
+                launcher_args.append(f"_pipeline_arg_indices={pipeline_arg_indices!r}")
 
         return launcher_args
 
