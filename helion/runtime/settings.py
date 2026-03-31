@@ -508,6 +508,11 @@ class _Settings:
             _env_get_bool, "HELION_TORCH_COMPILE_FUSION", False
         )
     )
+    autotune_with_torch_compile_fusion: bool = dataclasses.field(
+        default_factory=functools.partial(
+            _env_get_bool, "HELION_AUTOTUNE_WITH_TORCH_COMPILE_FUSION", False
+        )
+    )
 
 
 class Settings(_Settings):
@@ -653,6 +658,12 @@ class Settings(_Settings):
             "If True, allow torch.compile to fuse this Helion kernel with surrounding Inductor ops "
             "(prologue/epilogue) when used inside torch.compile. Default False. "
             "Set HELION_TORCH_COMPILE_FUSION=1 to enable globally."
+        ),
+        "autotune_with_torch_compile_fusion": (
+            "If True, autotuning benchmarks the fused kernel (with epilogue/prologue) "
+            "to pick configs optimal for the actual fused workload. Default False. "
+            "Has no effect unless torch_compile_fusion is also True. "
+            "Set HELION_AUTOTUNE_WITH_TORCH_COMPILE_FUSION=1 to enable globally."
         ),
     }
 
