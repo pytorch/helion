@@ -575,7 +575,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                 )
                 triton_dir = helion_triton_cache_dir(device_index)
                 os.environ["TRITON_CACHE_DIR"] = triton_dir
-                log.debug("Set TRITON_CACHE_DIR=%s", triton_dir)
+                print("Set TRITON_CACHE_DIR=%s", triton_dir)
             try:
                 triton_code = self.to_triton_code(
                     config, emit_repro_caller=self.settings.print_output_code
