@@ -10,10 +10,14 @@ and chunked reference backward, plus a benchmark suite comparing against FLA.
 
 from __future__ import annotations
 
+import math
+
 import torch
+import torch.nn.functional as F
 from triton.testing import do_bench
 
 from .linear_attention_engine import chunked_linear_attn
+from .linear_attention_engine import recurrent_step
 from .linear_attention_utils import chunked_linear_attn_reference
 from .linear_attention_utils import make_gated_delta_rule_inputs
 from .linear_attention_utils import naive_recurrent_reference
@@ -110,6 +114,38 @@ def test() -> None:
         print(f"  bwd dv vs FLA:    {dv_err:.4e} (info)")
     except Exception as e:
         print(f"  bwd dq vs FLA:    SKIP (FLA crash: {type(e).__name__})")
+
+    # === Recurrent step: compare step-by-step vs chunked ===
+    torch.manual_seed(42)
+    q_rec = torch.randn(B, H, T, D, device=DEVICE, dtype=DTYPE)
+    k_rec = F.normalize(torch.randn(B, H, T, D, device=DEVICE, dtype=DTYPE), dim=-1)
+    v_rec = torch.randn(B, H, T, DV, device=DEVICE, dtype=DTYPE)
+    g_rec = F.logsigmoid(torch.randn(B, H, T, device=DEVICE, dtype=DTYPE))
+    beta_rec = torch.sigmoid(torch.randn(B, H, T, device=DEVICE, dtype=DTYPE))
+    scale_rec = 1.0 / math.sqrt(D)
+
+    o_chunked = chunked_linear_attn(
+        q_rec * scale_rec, k_rec, v_rec, g_rec, beta=beta_rec, C=C
+    )
+
+    state = torch.zeros(B, H, D, DV, device=DEVICE, dtype=torch.float32)
+    o_steps = []
+    for t in range(T):
+        alpha = torch.exp(g_rec[:, :, t : t + 1])  # [B,H,1]
+        o_t, state = recurrent_step(
+            q_rec[:, :, t : t + 1] * scale_rec,
+            k_rec[:, :, t : t + 1],
+            v_rec[:, :, t : t + 1],
+            state,
+            alpha=alpha,
+            beta_val=beta_rec[:, :, t : t + 1],
+        )
+        o_steps.append(o_t)
+    o_recurrent = torch.cat(o_steps, dim=2)
+
+    rec_err = _rel_error(o_chunked, o_recurrent)
+    assert rec_err < 0.02, f"Recurrent vs chunked error: {rec_err}"
+    print(f"  recurrent step:   {rec_err:.4e} PASS")
 
     print("All tests passed.")
 

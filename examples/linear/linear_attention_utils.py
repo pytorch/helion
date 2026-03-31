@@ -13,12 +13,9 @@ Utility functions for the linear attention engine:
 from __future__ import annotations
 
 import math
-import os
 
 import torch
 import torch.nn.functional as F
-
-import helion
 
 # ════════════════════════════════════════════════════════════════════════════════
 # Reference implementation (pure PyTorch, for validation only)
@@ -328,106 +325,6 @@ def recurrent_step(
 
     o = torch.einsum("bhd,bhdv->bhv", q_sq, state)
     return o.unsqueeze(2), state
-
-
-# ════════════════════════════════════════════════════════════════════════════════
-# Kernel config / caching infrastructure
-# ════════════════════════════════════════════════════════════════════════════════
-
-
-def clamp_po2(desired: int, actual: int) -> int:
-    """Pick the largest power-of-2 <= min(desired, actual)."""
-    v = min(desired, actual)
-    if v <= 0:
-        return 1
-    p = 1
-    while p * 2 <= v:
-        p *= 2
-    return p
-
-
-def get_safe_block_sizes(name: str, args: tuple[object, ...]) -> list[int] | None:
-    """Return safe block sizes for a kernel given its args, or None if unknown."""
-    if name == "chunk_fwd_o_helion":
-        return [1, clamp_po2(32, args[2].shape[2]), clamp_po2(32, args[0].shape[2])]
-    if name == "chunk_bwd_dv_helion":
-        return [1, clamp_po2(32, args[4].shape[2]), clamp_po2(32, args[0].shape[2])]
-    if name == "chunk_bwd_dqkg_helion":
-        return [1, clamp_po2(32, args[0].shape[2]), clamp_po2(32, args[2].shape[2])]
-    if name == "chunk_bwd_dqkg_diag_helion":
-        return [
-            1,
-            clamp_po2(32, args[0].shape[2]),
-            clamp_po2(32, args[3].shape[2]),
-        ]
-    if name == "chunk_bwd_dg_scalar_helion":
-        D, DV = args[0].shape[2], args[2].shape[2]
-        d, dv = clamp_po2(32, D), clamp_po2(32, DV)
-        return [1, d, dv, dv, d, d, dv]
-    if name in ("chunk_fwd_correction_helion", "chunk_bwd_correction_helion"):
-        return [clamp_po2(16, args[5].shape[2])]
-    if name == "chunk_fwd_prescale_diag":
-        D = args[0].shape[2]
-        return [1, clamp_po2(64, D)]
-    if name == "chunk_bwd_dg_diag_helion":
-        D = args[0].shape[2]
-        DV = args[6].shape[2]
-        return [1, clamp_po2(64, D), clamp_po2(32, DV)]
-    if name == "chunk_fwd_h_diag_fused" or name == "chunk_bwd_dh_diag_fused":
-        DV = args[1].shape[-1]
-        return [clamp_po2(8, DV)]
-    if name == "chunk_fwd_wy_diag_helion":
-        return [clamp_po2(128, args[1].shape[2])]
-    if name == "chunk_fwd_phase1_diag_fused":
-        DV = args[1].shape[-1]
-        return [clamp_po2(8, DV)]
-    if name == "chunk_bwd_dh_correction_diag_fused":
-        DV = args[3].shape[-1]
-        return [clamp_po2(32, DV)]
-    return None
-
-
-_compiled_kernels: dict[tuple, object] = {}
-
-# When AOT mode is active, bypass manual config caching so the AOT
-# framework's AOTAutotuneCache can collect / measure / evaluate configs.
-_aot_mode: str = os.environ.get("HELION_AOT_MODE", "")
-
-
-def call_helion(kernel: object, *args: object) -> object:
-    """Call a Helion kernel with safe config and cached compilation.
-
-    In AOT mode (collect/measure/evaluate), delegates directly to
-    ``kernel(*args)`` so the AOTAutotuneCache can handle config selection.
-    Otherwise, seeds a known-good config and caches the compiled BoundKernel
-    for fast repeated calls.
-    """
-    args = tuple(a.contiguous() if isinstance(a, torch.Tensor) else a for a in args)
-
-    # In AOT mode, let the framework handle config selection
-    if _aot_mode:
-        return kernel(*args)
-
-    shape_key = (
-        kernel.name,
-        tuple(a.shape for a in args if isinstance(a, torch.Tensor)),
-    )
-
-    bk = _compiled_kernels.get(shape_key)
-    if bk is not None:
-        return bk(*args)
-
-    bs = get_safe_block_sizes(kernel.name, args)
-    if bs is not None:
-        try:
-            bk = kernel.bind(args)
-            bk.set_config(helion.Config(block_sizes=bs))
-            _compiled_kernels[shape_key] = bk
-            return bk(*args)
-        except Exception:
-            pass
-
-    return kernel(*args)
 
 
 # ════════════════════════════════════════════════════════════════════════════════

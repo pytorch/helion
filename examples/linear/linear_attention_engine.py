@@ -19,8 +19,6 @@ from typing import Callable
 
 import torch
 
-from .linear_attention_utils import call_helion
-from .linear_attention_utils import chunked_linear_attn_reference
 from .linear_attention_utils import prepare_wy_repr_bwd
 from .linear_attention_utils import solve_tril_inv
 import helion.experimental
@@ -266,14 +264,21 @@ def recurrent_step(
     if beta_val is not None:
         b_f = beta_val.squeeze(2).reshape(BH)
         a_f = a_val.squeeze(2).reshape(BH, D) if a_val is not None else k_f
-        o_f = call_helion(
-            recurrent_step_correction_fused,
-            q_f, a_f, v_f, state_f, alpha_f, b_f,
+        o_f = recurrent_step_correction_fused(
+            q_f,
+            a_f,
+            v_f,
+            state_f,
+            alpha_f,
+            b_f,
         )
     else:
-        o_f = call_helion(
-            recurrent_step_fused,
-            q_f, k_f, v_f, state_f, alpha_f,
+        o_f = recurrent_step_fused(
+            q_f,
+            k_f,
+            v_f,
+            state_f,
+            alpha_f,
         )
 
     return o_f.reshape(B, H, 1, DV), state.reshape(B, H, D, DV)
@@ -941,8 +946,7 @@ class ChunkedLinearAttnFn(torch.autograd.Function):
                 if g_corr.dim() == 3:
                     g_corr = g_corr.unsqueeze(-1).expand(-1, -1, -1, D).contiguous()
                 gc_last = g_corr.reshape(BH, N, C, D)[:, -1]
-                _, h_new = call_helion(
-                    chunk_fwd_correction_helion,
+                _, h_new = chunk_fwd_correction_helion(
                     q.float().reshape(BH, N, C, D)[:, -1],
                     a_use.float().reshape(BH, N, C, D)[:, -1],
                     v.float().reshape(BH, N, C, DV)[:, -1],
@@ -1040,22 +1044,20 @@ def _helion_chunked_fwd(q, k, v, g, C, initial_state=None, return_final_state=Fa
     kf = k.reshape(BHN, C, D)
     gf = g.reshape(BHN, C, D)
 
-    q_scaled, k_intra, k_state, g_last_flat = call_helion(
-        chunk_fwd_prescale_diag, qf, kf, gf
-    )
+    q_scaled, k_intra, k_state, g_last_flat = chunk_fwd_prescale_diag(qf, kf, gf)
 
     v_flat = v.reshape(BH, N, C, DV).float()
     k_state_4d = k_state.reshape(BH, N, C, D)
     g_last_4d = g_last_flat.reshape(BH, N, D)
 
     state = _init_state(initial_state, BH, D, DV, q)
-    h_all = call_helion(chunk_fwd_h_diag_fused, k_state_4d, v_flat, g_last_4d, state)
+    h_all = chunk_fwd_h_diag_fused(k_state_4d, v_flat, g_last_4d, state)
 
     vf2 = v_flat.reshape(BHN, C, DV)
     zero_g_cs = q.new_zeros(BHN, C, dtype=torch.float32)
     hf2 = h_all.reshape(BHN, D, DV)
 
-    o = call_helion(chunk_fwd_o_helion, q_scaled, k_intra, vf2, zero_g_cs, hf2)
+    o = chunk_fwd_o_helion(q_scaled, k_intra, vf2, zero_g_cs, hf2)
 
     final_state = None
     if return_final_state:
@@ -1101,9 +1103,7 @@ def _helion_chunked_fwd_correction(q, k, v, g, beta, a, C, initial_state=None):
     g_cs_d_flat = g_cs_d.reshape(BHN, C, D)
     bc_flat = bc.reshape(BHN, C)
 
-    w, u, A_buf = call_helion(
-        chunk_fwd_wy_diag_helion, ac_flat, vc_flat, bc_flat, g_cs_d_flat
-    )
+    w, u, A_buf = chunk_fwd_wy_diag_helion(ac_flat, vc_flat, bc_flat, g_cs_d_flat)
     A_inv = None
     w = w.reshape(BH, N, C, D)
     u = u.reshape(BH, N, C, DV)
@@ -1111,9 +1111,7 @@ def _helion_chunked_fwd_correction(q, k, v, g, beta, a, C, initial_state=None):
     a_scaled_4d = ac * torch.exp(g_last_d[:, :, None, :] - g_cs_d)
 
     state = _init_state(initial_state, BH, D, DV, q)
-    h_all, v_new_all = call_helion(
-        chunk_fwd_phase1_diag_fused, w, u, a_scaled_4d, g_last_d, state
-    )
+    h_all, v_new_all = chunk_fwd_phase1_diag_fused(w, u, a_scaled_4d, g_last_d, state)
 
     if diagonal_decay:
         qf2 = (qc * torch.exp(g_cs_d)).reshape(BHN, C, D)
@@ -1124,8 +1122,7 @@ def _helion_chunked_fwd_correction(q, k, v, g, beta, a, C, initial_state=None):
         af2 = ac.reshape(BHN, C, D)
         g_cs_for_output = g_scalar.cumsum(-1).reshape(BHN, C)
 
-    o = call_helion(
-        chunk_fwd_o_helion,
+    o = chunk_fwd_o_helion(
         qf2,
         af2,
         v_new_all.reshape(BHN, C, DV),
@@ -1154,9 +1151,7 @@ def _helion_chunked_bwd(q, k, v, g, grad_output, C, h_all=None):
     qf = q.reshape(BHN, C, D)
     kf = k.reshape(BHN, C, D)
     gf = g_diag.reshape(BHN, C, D)
-    q_scaled, k_intra, k_state, g_last_flat = call_helion(
-        chunk_fwd_prescale_diag, qf, kf, gf
-    )
+    q_scaled, k_intra, k_state, g_last_flat = chunk_fwd_prescale_diag(qf, kf, gf)
 
     vf = v.reshape(BH, N, C, DV).float()
     k_state_4d = k_state.reshape(BH, N, C, D)
@@ -1164,14 +1159,12 @@ def _helion_chunked_bwd(q, k, v, g, grad_output, C, h_all=None):
 
     if h_all is None:
         state = q.new_zeros(BH, D, DV, dtype=torch.float32)
-        h_all = call_helion(chunk_fwd_h_diag_fused, k_state_4d, vf, g_last_4d, state)
+        h_all = chunk_fwd_h_diag_fused(k_state_4d, vf, g_last_4d, state)
 
     q_scaled_4d = q_scaled.reshape(BH, N, C, D)
     do_flat = grad_output.reshape(BH, N, C, DV).float()
     dstate = q.new_zeros(BH, D, DV, dtype=torch.float32)
-    dh_all = call_helion(
-        chunk_bwd_dh_diag_fused, q_scaled_4d, do_flat, g_last_4d, dstate
-    )
+    dh_all = chunk_bwd_dh_diag_fused(q_scaled_4d, do_flat, g_last_4d, dstate)
 
     if diagonal_decay:
         ki_f2 = k_intra.reshape(BHN, C, D)
@@ -1182,18 +1175,15 @@ def _helion_chunked_bwd(q, k, v, g, grad_output, C, h_all=None):
         dof2 = do_flat.reshape(BHN, C, DV)
         qf2 = q_scaled.reshape(BHN, C, D)
 
-        dq_raw, dk_intra_raw, dk_state_raw = call_helion(
-            chunk_bwd_dqkg_diag_helion, qf2, ki_f2, ks_f2, vf2, hf2, dof2, dhf2
+        dq_raw, dk_intra_raw, dk_state_raw = chunk_bwd_dqkg_diag_helion(
+            qf2, ki_f2, ks_f2, vf2, hf2, dof2, dhf2
         )
 
         zero_g_cs = q.new_zeros(BHN, C, dtype=torch.float32)
-        dv_raw = call_helion(
-            chunk_bwd_dv_helion, qf2, ki_f2, ks_f2, zero_g_cs, dof2, dhf2
-        )
+        dv_raw = chunk_bwd_dv_helion(qf2, ki_f2, ks_f2, zero_g_cs, dof2, dhf2)
         dv = dv_raw.reshape(B, H, T, DV).to(v.dtype)
 
-        dq, dk, dg_f32 = call_helion(
-            chunk_bwd_dg_diag_helion,
+        dq, dk, dg_f32 = chunk_bwd_dg_diag_helion(
             qf,
             kf,
             gf,
@@ -1222,15 +1212,15 @@ def _helion_chunked_bwd(q, k, v, g, grad_output, C, h_all=None):
     dhf2 = dh_all.reshape(BHN, D, DV)
     dof2 = do_flat.reshape(BHN, C, DV)
 
-    dq_raw, dk_raw, _ = call_helion(
-        chunk_bwd_dqkg_helion, qf2, kf2, vf2, g_csf2, g_lastf2, hf2, dof2, dhf2
+    dq_raw, dk_raw, _ = chunk_bwd_dqkg_helion(
+        qf2, kf2, vf2, g_csf2, g_lastf2, hf2, dof2, dhf2
     )
 
     kf2_scaled = kf2 * torch.exp(g_lastf2[:, None, None] - g_csf2.unsqueeze(-1))
-    dv_raw = call_helion(chunk_bwd_dv_helion, qf2, kf2, kf2_scaled, g_csf2, dof2, dhf2)
+    dv_raw = chunk_bwd_dv_helion(qf2, kf2, kf2_scaled, g_csf2, dof2, dhf2)
 
-    dg_final = call_helion(
-        chunk_bwd_dg_scalar_helion, qf2, kf2, vf2, g_csf2, g_lastf2, hf2, dof2, dhf2
+    dg_final = chunk_bwd_dg_scalar_helion(
+        qf2, kf2, vf2, g_csf2, g_lastf2, hf2, dof2, dhf2
     )
     dg = dg_final.reshape(B, H, T).to(g.dtype)
 
@@ -1243,8 +1233,8 @@ def _helion_chunked_bwd(q, k, v, g, grad_output, C, h_all=None):
 
 
 def _recompute_wy(ac_flat, vc_flat, bc_flat, g_cs_d_flat, BH, N, C, D, DV, A_inv, w_wy):
-    w_recomp, u_recomp, A_buf = call_helion(
-        chunk_fwd_wy_diag_helion, ac_flat, vc_flat, bc_flat, g_cs_d_flat
+    w_recomp, u_recomp, A_buf = chunk_fwd_wy_diag_helion(
+        ac_flat, vc_flat, bc_flat, g_cs_d_flat
     )
     if A_inv is None:
         idx_C = torch.arange(C, device=ac_flat.device)
@@ -1316,8 +1306,7 @@ def _helion_chunked_bwd_correction(
 
     if h_all is None or v_new_all is None:
         a_scaled_4d = ac * torch.exp(g_last_d[:, :, None, :] - g_cs_d)
-        h_all, v_new_all = call_helion(
-            chunk_fwd_phase1_diag_fused,
+        h_all, v_new_all = chunk_fwd_phase1_diag_fused(
             w,
             u_val,
             a_scaled_4d,
@@ -1342,14 +1331,13 @@ def _helion_chunked_bwd_correction(
     dof = doc.reshape(BHN, C, DV)
 
     zero_dh = q.new_zeros(BHN, D, DV, dtype=torch.float32)
-    dv_new_intra_flat = call_helion(
-        chunk_bwd_dv_helion, qf, af_intra, a_scaled_f, zero_g_cs, dof, zero_dh
+    dv_new_intra_flat = chunk_bwd_dv_helion(
+        qf, af_intra, a_scaled_f, zero_g_cs, dof, zero_dh
     )
     dv_new_intra_c = dv_new_intra_flat.reshape(BH, N, C, DV)
 
     dstate = q.new_zeros(BH, D, DV, dtype=torch.float32)
-    dh_all, dv_new_bwd = call_helion(
-        chunk_bwd_dh_correction_diag_fused,
+    dh_all, dv_new_bwd = chunk_bwd_dh_correction_diag_fused(
         w,
         a_scaled_c,
         q_scaled,
@@ -1370,8 +1358,7 @@ def _helion_chunked_bwd_correction(
     )
 
     if diagonal_decay:
-        dq_raw, da_intra_raw, da_state_raw = call_helion(
-            chunk_bwd_dqkg_diag_helion,
+        dq_raw, da_intra_raw, da_state_raw = chunk_bwd_dqkg_diag_helion(
             qf,
             af_intra,
             a_scaled_f,
@@ -1421,8 +1408,7 @@ def _helion_chunked_bwd_correction(
         qf_raw = qc.reshape(BHN, C, D)
         af_raw = ac_flat
 
-        dq_raw, da_par, _ = call_helion(
-            chunk_bwd_dqkg_helion,
+        dq_raw, da_par, _ = chunk_bwd_dqkg_helion(
             qf_raw,
             af_raw,
             v_new_fwd_f,
@@ -1433,8 +1419,7 @@ def _helion_chunked_bwd_correction(
             dhf,
         )
 
-        dg_attn_state = call_helion(
-            chunk_bwd_dg_scalar_helion,
+        dg_attn_state = chunk_bwd_dg_scalar_helion(
             qf_raw,
             af_raw,
             v_new_fwd_f,
@@ -1536,20 +1521,6 @@ def chunked_linear_attn(
                 beta = torch.nn.functional.pad(beta, (0, pad))
         if a is not None:
             a = torch.nn.functional.pad(a, (0, 0, 0, pad))
-
-    # Route diagonal+correction to reference (Triton sm_100 limitation)
-    diagonal_decay = g.dim() == 4
-    if diagonal_decay and beta is not None:
-        o = chunked_linear_attn_reference(
-            q, k, v, g, beta=beta, a=a, C=C, initial_state=initial_state
-        )
-        if pad > 0:
-            o = o[:, :, :T_cur]
-        if not head_first:
-            o = o.transpose(1, 2).contiguous()
-        if return_final_state:
-            return o, None
-        return o
 
     o, final_state = ChunkedLinearAttnFn.apply(
         q, k, v, g, beta, a, C, initial_state, return_final_state

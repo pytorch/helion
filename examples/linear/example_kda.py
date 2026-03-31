@@ -18,14 +18,12 @@ import torch
 import torch.nn.functional as F
 from triton.testing import do_bench
 
-from helion._testing import DEVICE
-
 from .linear_attention_engine import LinearAttentionEngine
 from .linear_attention_engine import chunked_linear_attn
-from .linear_attention_utils import (
-    chunked_linear_attn_reference,
-    naive_recurrent_reference,
-)
+from .linear_attention_engine import recurrent_step
+from .linear_attention_utils import chunked_linear_attn_reference
+from .linear_attention_utils import naive_recurrent_reference
+from helion._testing import DEVICE
 
 B, H, T, D, DV = 2, 4, 128, 32, 32
 C = 32
@@ -50,14 +48,10 @@ def test() -> None:
     scale = 1.0 / math.sqrt(D)
 
     q = torch.randn(B, H, T, D, device=DEVICE, dtype=DTYPE)
-    k = F.normalize(
-        torch.randn(B, H, T, D, device=DEVICE, dtype=DTYPE), dim=-1
-    )
+    k = F.normalize(torch.randn(B, H, T, D, device=DEVICE, dtype=DTYPE), dim=-1)
     v = torch.randn(B, H, T, DV, device=DEVICE, dtype=DTYPE)
     g = -torch.rand(B, H, T, D, device=DEVICE, dtype=DTYPE).abs() * 0.1
-    beta = torch.sigmoid(
-        torch.randn(B, H, T, device=DEVICE, dtype=DTYPE)
-    )
+    beta = torch.sigmoid(torch.randn(B, H, T, device=DEVICE, dtype=DTYPE))
 
     # Forward via engine (uses LinearAttentionEngine interface)
     engine = LinearAttentionEngine(
@@ -68,9 +62,7 @@ def test() -> None:
     out = engine(q, k, v, g, beta=beta)
 
     # Forward vs recurrent reference
-    ref = naive_recurrent_reference(
-        q * scale, k, v, g, beta=beta
-    )
+    ref = naive_recurrent_reference(q * scale, k, v, g, beta=beta)
     fwd_err = _rel_error(out.detach(), ref)
     assert fwd_err < 0.02, f"Forward error: {fwd_err}"
     print(f"  fwd vs recurrent: {fwd_err:.4e} PASS")
@@ -102,7 +94,7 @@ def test() -> None:
     o1.sum().backward()
     assert q1.grad is not None, "q.grad is None"
     assert v1.grad is not None, "v.grad is None"
-    print(f"  bwd grads exist:  PASS")
+    print("  bwd grads exist:  PASS")
 
     # Backward vs chunked reference
     grad_out = torch.randn(B, H, T, DV, device=DEVICE, dtype=DTYPE)
@@ -114,15 +106,45 @@ def test() -> None:
 
     q3 = q.clone().requires_grad_(True)
     v3 = v.clone().requires_grad_(True)
-    o3 = chunked_linear_attn_reference(
-        q3 * scale, k, v3, g, beta=beta, C=C
-    )
+    o3 = chunked_linear_attn_reference(q3 * scale, k, v3, g, beta=beta, C=C)
     o3.backward(grad_out)
 
     for name, g1, g2 in [("dq", q2.grad, q3.grad), ("dv", v2.grad, v3.grad)]:
         err = _rel_error(g1, g2)
         assert err < 0.05, f"Backward {name} error: {err}"
         print(f"  bwd {name} vs ref: {err:.4e} PASS")
+
+    # === Recurrent step: compare step-by-step vs chunked ===
+    torch.manual_seed(42)
+    q_rec = torch.randn(B, H, T, D, device=DEVICE, dtype=DTYPE)
+    k_rec = F.normalize(torch.randn(B, H, T, D, device=DEVICE, dtype=DTYPE), dim=-1)
+    v_rec = torch.randn(B, H, T, DV, device=DEVICE, dtype=DTYPE)
+    g_rec = -torch.rand(B, H, T, D, device=DEVICE, dtype=DTYPE).abs() * 0.1
+    beta_rec = torch.sigmoid(torch.randn(B, H, T, device=DEVICE, dtype=DTYPE))
+    scale_rec = 1.0 / math.sqrt(D)
+
+    o_chunked = chunked_linear_attn(
+        q_rec * scale_rec, k_rec, v_rec, g_rec, beta=beta_rec, C=C
+    )
+
+    state = torch.zeros(B, H, D, DV, device=DEVICE, dtype=torch.float32)
+    o_steps = []
+    for t in range(T):
+        alpha = torch.exp(g_rec[:, :, t : t + 1])  # [B,H,1,D]
+        o_t, state = recurrent_step(
+            q_rec[:, :, t : t + 1] * scale_rec,
+            k_rec[:, :, t : t + 1],
+            v_rec[:, :, t : t + 1],
+            state,
+            alpha=alpha,
+            beta_val=beta_rec[:, :, t : t + 1],
+        )
+        o_steps.append(o_t)
+    o_recurrent = torch.cat(o_steps, dim=2)
+
+    rec_err = _rel_error(o_chunked, o_recurrent)
+    assert rec_err < 0.02, f"Recurrent vs chunked error: {rec_err}"
+    print(f"  recurrent step:   {rec_err:.4e} PASS")
 
     print("All tests passed.")
 
@@ -140,19 +162,15 @@ def benchmark() -> None:
     print("-" * 72)
 
     for bi, hi, ti, di, dvi in BENCH_CONFIGS:
-        q = torch.randn(
-            bi, hi, ti, di, device=DEVICE, dtype=DTYPE, requires_grad=True
+        q = torch.randn(bi, hi, ti, di, device=DEVICE, dtype=DTYPE, requires_grad=True)
+        k = (
+            F.normalize(torch.randn(bi, hi, ti, di, device=DEVICE, dtype=DTYPE), dim=-1)
+            .detach()
+            .requires_grad_(True)
         )
-        k = F.normalize(
-            torch.randn(bi, hi, ti, di, device=DEVICE, dtype=DTYPE), dim=-1
-        ).detach().requires_grad_(True)
-        v = torch.randn(
-            bi, hi, ti, dvi, device=DEVICE, dtype=DTYPE, requires_grad=True
-        )
+        v = torch.randn(bi, hi, ti, dvi, device=DEVICE, dtype=DTYPE, requires_grad=True)
         g = -torch.rand(bi, hi, ti, di, device=DEVICE, dtype=DTYPE).abs() * 0.1
-        beta = torch.sigmoid(
-            torch.randn(bi, hi, ti, device=DEVICE, dtype=DTYPE)
-        )
+        beta = torch.sigmoid(torch.randn(bi, hi, ti, device=DEVICE, dtype=DTYPE))
         grad_out = torch.randn(bi, hi, ti, dvi, device=DEVICE, dtype=DTYPE)
 
         qt = _htf(q.detach())
@@ -173,9 +191,7 @@ def benchmark() -> None:
             )
         )
 
-        def helion_fb(
-            q=q, k=k, v=v, g=g, beta=beta, go=grad_out, sc=scale
-        ):
+        def helion_fb(q=q, k=k, v=v, g=g, beta=beta, go=grad_out, sc=scale):
             o = chunked_linear_attn(q * sc, k, v, g, beta=beta, C=BENCH_C)
             o.backward(go)
             q.grad = k.grad = v.grad = None

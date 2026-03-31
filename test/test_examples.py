@@ -2180,7 +2180,6 @@ class TestExamples(RefEagerTestBase, TestCase):
             rtol=0.1,
         )
 
-
     # ══════════════════════════════════════════════════════════════════════
     # Linear attention examples (examples/linear/)
     # ══════════════════════════════════════════════════════════════════════
@@ -2222,12 +2221,20 @@ class TestExamples(RefEagerTestBase, TestCase):
 
     def test_linear_monkeypatch_gla(self):
         """Monkey-patch FLA's GatedLinearAttention to use our engine, verify fwd+bwd."""
+        from examples.linear.linear_attention_engine import chunked_linear_attn
         import fla.layers.gla as _fla_gla_mod
         from fla.layers.gla import GatedLinearAttention
-        from examples.linear.linear_attention_engine import chunked_linear_attn
 
-        def _our_chunk_gla(q, k, v, g, scale=None, initial_state=None,
-                           output_final_state=False, **kwargs):
+        def _our_chunk_gla(
+            q,
+            k,
+            v,
+            g,
+            scale=None,
+            initial_state=None,
+            output_final_state=False,
+            **kwargs,
+        ):
             if scale is None:
                 scale = q.shape[-1] ** -0.5
             q_hf = q.transpose(1, 2).contiguous()
@@ -2238,10 +2245,19 @@ class TestExamples(RefEagerTestBase, TestCase):
             return o_hf.transpose(1, 2).contiguous(), None
 
         torch.manual_seed(42)
-        layer = GatedLinearAttention(
-            hidden_size=256, num_heads=4, expand_k=0.5, expand_v=1.0,
-            use_short_conv=False, use_output_gate=True, fuse_norm=True,
-        ).cuda().to(torch.bfloat16)
+        layer = (
+            GatedLinearAttention(
+                hidden_size=256,
+                num_heads=4,
+                expand_k=0.5,
+                expand_v=1.0,
+                use_short_conv=False,
+                use_output_gate=True,
+                fuse_norm=True,
+            )
+            .cuda()
+            .to(torch.bfloat16)
+        )
 
         hidden = torch.randn(2, 128, 256, device=DEVICE, dtype=torch.bfloat16)
 
@@ -2262,20 +2278,32 @@ class TestExamples(RefEagerTestBase, TestCase):
         finally:
             _fla_gla_mod.chunk_gla = orig
 
-        fwd_err = (out_ours.float() - out_ref.float()).norm() / out_ref.float().norm().clamp(min=1e-8)
-        bwd_err = (grad_ours.float() - grad_ref.float()).norm() / grad_ref.float().norm().clamp(min=1e-8)
+        fwd_err = (
+            out_ours.float() - out_ref.float()
+        ).norm() / out_ref.float().norm().clamp(min=1e-8)
+        bwd_err = (
+            grad_ours.float() - grad_ref.float()
+        ).norm() / grad_ref.float().norm().clamp(min=1e-8)
         self.assertLess(fwd_err.item(), 0.05, f"GLA monkeypatch fwd error: {fwd_err}")
         self.assertLess(bwd_err.item(), 0.10, f"GLA monkeypatch bwd error: {bwd_err}")
 
     def test_linear_monkeypatch_delta_rule(self):
         """Monkey-patch FLA's DeltaNet to use our engine, verify fwd+bwd."""
+        from examples.linear.linear_attention_engine import chunked_linear_attn
         import fla.layers.delta_net as _fla_dn_mod
         from fla.layers.delta_net import DeltaNet
-        from examples.linear.linear_attention_engine import chunked_linear_attn
 
-        def _our_chunk_delta_rule(q, k, v, beta, scale=None,
-                                  initial_state=None, output_final_state=False,
-                                  use_qk_l2norm_in_kernel=False, **kwargs):
+        def _our_chunk_delta_rule(
+            q,
+            k,
+            v,
+            beta,
+            scale=None,
+            initial_state=None,
+            output_final_state=False,
+            use_qk_l2norm_in_kernel=False,
+            **kwargs,
+        ):
             if scale is None:
                 scale = q.shape[-1] ** -0.5
             if use_qk_l2norm_in_kernel:
@@ -2291,10 +2319,20 @@ class TestExamples(RefEagerTestBase, TestCase):
             return o_hf.transpose(1, 2).contiguous(), None
 
         torch.manual_seed(42)
-        layer = DeltaNet(
-            hidden_size=256, num_heads=4, expand_k=1.0, expand_v=1.0,
-            use_short_conv=True, qk_norm="l2", use_gate=False, use_beta=True,
-        ).cuda().to(torch.bfloat16)
+        layer = (
+            DeltaNet(
+                hidden_size=256,
+                num_heads=4,
+                expand_k=1.0,
+                expand_v=1.0,
+                use_short_conv=True,
+                qk_norm="l2",
+                use_gate=False,
+                use_beta=True,
+            )
+            .cuda()
+            .to(torch.bfloat16)
+        )
 
         hidden = torch.randn(2, 128, 256, device=DEVICE, dtype=torch.bfloat16)
 
@@ -2313,20 +2351,37 @@ class TestExamples(RefEagerTestBase, TestCase):
         finally:
             _fla_dn_mod.chunk_delta_rule = orig
 
-        fwd_err = (out_ours.float() - out_ref.float()).norm() / out_ref.float().norm().clamp(min=1e-8)
-        bwd_err = (grad_ours.float() - grad_ref.float()).norm() / grad_ref.float().norm().clamp(min=1e-8)
-        self.assertLess(fwd_err.item(), 0.05, f"DeltaNet monkeypatch fwd error: {fwd_err}")
-        self.assertLess(bwd_err.item(), 0.10, f"DeltaNet monkeypatch bwd error: {bwd_err}")
+        fwd_err = (
+            out_ours.float() - out_ref.float()
+        ).norm() / out_ref.float().norm().clamp(min=1e-8)
+        bwd_err = (
+            grad_ours.float() - grad_ref.float()
+        ).norm() / grad_ref.float().norm().clamp(min=1e-8)
+        self.assertLess(
+            fwd_err.item(), 0.05, f"DeltaNet monkeypatch fwd error: {fwd_err}"
+        )
+        self.assertLess(
+            bwd_err.item(), 0.10, f"DeltaNet monkeypatch bwd error: {bwd_err}"
+        )
 
     def test_linear_monkeypatch_gated_delta_rule(self):
         """Monkey-patch FLA's GatedDeltaNet to use our engine, verify fwd+bwd."""
+        from examples.linear.linear_attention_engine import chunked_linear_attn
         import fla.layers.gated_deltanet as _fla_gdn_mod
         from fla.layers.gated_deltanet import GatedDeltaNet
-        from examples.linear.linear_attention_engine import chunked_linear_attn
 
-        def _our_chunk_gated_delta_rule(q, k, v, g, beta, scale=None,
-                                        initial_state=None, output_final_state=False,
-                                        use_qk_l2norm_in_kernel=False, **kwargs):
+        def _our_chunk_gated_delta_rule(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            scale=None,
+            initial_state=None,
+            output_final_state=False,
+            use_qk_l2norm_in_kernel=False,
+            **kwargs,
+        ):
             if scale is None:
                 scale = q.shape[-1] ** -0.5
             if use_qk_l2norm_in_kernel:
@@ -2337,14 +2392,26 @@ class TestExamples(RefEagerTestBase, TestCase):
             v_hf = v.transpose(1, 2).contiguous()
             g_hf = g.transpose(1, 2).contiguous()
             beta_hf = beta.transpose(1, 2).contiguous()
-            o_hf = chunked_linear_attn(q_hf * scale, k_hf, v_hf, g_hf, beta=beta_hf, C=64)
+            o_hf = chunked_linear_attn(
+                q_hf * scale, k_hf, v_hf, g_hf, beta=beta_hf, C=64
+            )
             return o_hf.transpose(1, 2).contiguous(), None
 
         torch.manual_seed(42)
-        layer = GatedDeltaNet(
-            hidden_size=256, num_heads=4, expand_k=1.0, expand_v=1.0,
-            use_short_conv=True, qk_norm="l2", use_gate=False, use_beta=True,
-        ).cuda().to(torch.bfloat16)
+        layer = (
+            GatedDeltaNet(
+                hidden_size=256,
+                num_heads=4,
+                expand_k=1.0,
+                expand_v=1.0,
+                use_short_conv=True,
+                qk_norm="l2",
+                use_gate=False,
+                use_beta=True,
+            )
+            .cuda()
+            .to(torch.bfloat16)
+        )
 
         hidden = torch.randn(2, 128, 256, device=DEVICE, dtype=torch.bfloat16)
 
@@ -2363,19 +2430,35 @@ class TestExamples(RefEagerTestBase, TestCase):
         finally:
             _fla_gdn_mod.chunk_gated_delta_rule = orig
 
-        fwd_err = (out_ours.float() - out_ref.float()).norm() / out_ref.float().norm().clamp(min=1e-8)
-        bwd_err = (grad_ours.float() - grad_ref.float()).norm() / grad_ref.float().norm().clamp(min=1e-8)
-        self.assertLess(fwd_err.item(), 0.05, f"GatedDeltaNet monkeypatch fwd error: {fwd_err}")
-        self.assertLess(bwd_err.item(), 0.10, f"GatedDeltaNet monkeypatch bwd error: {bwd_err}")
+        fwd_err = (
+            out_ours.float() - out_ref.float()
+        ).norm() / out_ref.float().norm().clamp(min=1e-8)
+        bwd_err = (
+            grad_ours.float() - grad_ref.float()
+        ).norm() / grad_ref.float().norm().clamp(min=1e-8)
+        self.assertLess(
+            fwd_err.item(), 0.05, f"GatedDeltaNet monkeypatch fwd error: {fwd_err}"
+        )
+        self.assertLess(
+            bwd_err.item(), 0.10, f"GatedDeltaNet monkeypatch bwd error: {bwd_err}"
+        )
 
     def test_linear_monkeypatch_simple_gla(self):
         """Monkey-patch FLA's SimpleGatedLinearAttention to use our engine."""
+        from examples.linear.linear_attention_engine import chunked_linear_attn
         import fla.layers.simple_gla as _fla_sgla_mod
         from fla.layers.simple_gla import SimpleGatedLinearAttention
-        from examples.linear.linear_attention_engine import chunked_linear_attn
 
-        def _our_chunk_simple_gla(q, k, v, g, scale=None,
-                                  initial_state=None, output_final_state=False, **kwargs):
+        def _our_chunk_simple_gla(
+            q,
+            k,
+            v,
+            g,
+            scale=None,
+            initial_state=None,
+            output_final_state=False,
+            **kwargs,
+        ):
             if scale is None:
                 scale = q.shape[-1] ** -0.5
             q_hf = q.transpose(1, 2).contiguous()
@@ -2386,10 +2469,18 @@ class TestExamples(RefEagerTestBase, TestCase):
             return o_hf.transpose(1, 2).contiguous(), None
 
         torch.manual_seed(42)
-        layer = SimpleGatedLinearAttention(
-            hidden_size=256, num_heads=4, expand_k=1.0, expand_v=1.0,
-            use_short_conv=False, fuse_norm=True,
-        ).cuda().to(torch.bfloat16)
+        layer = (
+            SimpleGatedLinearAttention(
+                hidden_size=256,
+                num_heads=4,
+                expand_k=1.0,
+                expand_v=1.0,
+                use_short_conv=False,
+                fuse_norm=True,
+            )
+            .cuda()
+            .to(torch.bfloat16)
+        )
 
         hidden = torch.randn(2, 64, 256, device=DEVICE, dtype=torch.bfloat16)
 
@@ -2408,10 +2499,18 @@ class TestExamples(RefEagerTestBase, TestCase):
         finally:
             _fla_sgla_mod.chunk_simple_gla = orig
 
-        fwd_err = (out_ours.float() - out_ref.float()).norm() / out_ref.float().norm().clamp(min=1e-8)
-        bwd_err = (grad_ours.float() - grad_ref.float()).norm() / grad_ref.float().norm().clamp(min=1e-8)
-        self.assertLess(fwd_err.item(), 0.05, f"SimpleGLA monkeypatch fwd error: {fwd_err}")
-        self.assertLess(bwd_err.item(), 0.10, f"SimpleGLA monkeypatch bwd error: {bwd_err}")
+        fwd_err = (
+            out_ours.float() - out_ref.float()
+        ).norm() / out_ref.float().norm().clamp(min=1e-8)
+        bwd_err = (
+            grad_ours.float() - grad_ref.float()
+        ).norm() / grad_ref.float().norm().clamp(min=1e-8)
+        self.assertLess(
+            fwd_err.item(), 0.05, f"SimpleGLA monkeypatch fwd error: {fwd_err}"
+        )
+        self.assertLess(
+            bwd_err.item(), 0.10, f"SimpleGLA monkeypatch bwd error: {bwd_err}"
+        )
 
 
 if __name__ == "__main__":

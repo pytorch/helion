@@ -19,6 +19,7 @@ import torch.nn.functional as F
 from triton.testing import do_bench
 
 from .linear_attention_engine import chunked_linear_attn
+from .linear_attention_engine import recurrent_step
 from .linear_attention_utils import chunked_linear_attn_reference
 from .linear_attention_utils import make_mamba2_inputs
 from .linear_attention_utils import naive_recurrent_reference
@@ -150,6 +151,32 @@ def test() -> None:
     print(f"  bwd dq vs mamba:  {dq_err:.4e} {'PASS' if dq_err < 0.05 else 'FAIL'}")
     dk_err = _rel_error(k3.grad, B2.grad.transpose(1, 2).contiguous())
     print(f"  bwd dk vs mamba:  {dk_err:.4e} (info)")
+
+    # === Recurrent step: compare step-by-step vs chunked ===
+    torch.manual_seed(42)
+    q_rec, k_rec, v_rec, g_rec, _ = make_mamba2_inputs(
+        B, H, T, D, DV, dtype=DTYPE, device=DEVICE
+    )
+
+    o_chunked = chunked_linear_attn(q_rec, k_rec, v_rec, g_rec, C=C)
+
+    state = torch.zeros(B, H, D, DV, device=DEVICE, dtype=torch.float32)
+    o_steps = []
+    for t in range(T):
+        alpha = torch.exp(g_rec[:, :, t : t + 1])  # [B,H,1]
+        o_t, state = recurrent_step(
+            q_rec[:, :, t : t + 1],
+            k_rec[:, :, t : t + 1],
+            v_rec[:, :, t : t + 1],
+            state,
+            alpha=alpha,
+        )
+        o_steps.append(o_t)
+    o_recurrent = torch.cat(o_steps, dim=2)
+
+    rec_err = _rel_error(o_chunked, o_recurrent)
+    assert rec_err < 0.02, f"Recurrent vs chunked error: {rec_err}"
+    print(f"  recurrent step:   {rec_err:.4e} PASS")
 
     print("All tests passed.")
 

@@ -9,20 +9,15 @@ Uses the LinearAttentionEngine with output_mod.
 
 from __future__ import annotations
 
-import math
-
 import torch
-import torch.nn.functional as F
 from triton.testing import do_bench
-
-from helion._testing import DEVICE
 
 from .linear_attention_engine import LinearAttentionEngine
 from .linear_attention_engine import chunked_linear_attn
-from .linear_attention_utils import (
-    chunked_linear_attn_reference,
-    naive_recurrent_reference,
-)
+from .linear_attention_engine import recurrent_step
+from .linear_attention_utils import chunked_linear_attn_reference
+from .linear_attention_utils import naive_recurrent_reference
+from helion._testing import DEVICE
 
 B, H, T, D, DV = 2, 4, 128, 32, 16
 C = 32
@@ -49,9 +44,7 @@ def test() -> None:
     k = torch.randn(B, H, T, D, device=DEVICE, dtype=DTYPE)
     v = torch.randn(B, H, T, DV, device=DEVICE, dtype=DTYPE)
     g = -torch.rand(B, H, T, D, device=DEVICE, dtype=DTYPE).abs() * 0.1
-    gate = torch.sigmoid(
-        torch.randn(B, H, T, DV, device=DEVICE, dtype=DTYPE)
-    )
+    gate = torch.sigmoid(torch.randn(B, H, T, DV, device=DEVICE, dtype=DTYPE))
 
     engine = LinearAttentionEngine(
         output_mod=lambda o, cio: o * cio["gate"],
@@ -109,6 +102,34 @@ def test() -> None:
         assert err < 0.05, f"Backward {name} error: {err}"
         print(f"  bwd {name} vs ref: {err:.4e} PASS")
 
+    # === Recurrent step: compare step-by-step vs chunked ===
+    torch.manual_seed(42)
+    q_rec = torch.randn(B, H, T, D, device=DEVICE, dtype=DTYPE)
+    k_rec = torch.randn(B, H, T, D, device=DEVICE, dtype=DTYPE)
+    v_rec = torch.randn(B, H, T, DV, device=DEVICE, dtype=DTYPE)
+    g_rec = -torch.rand(B, H, T, D, device=DEVICE, dtype=DTYPE).abs() * 0.1
+    scale_rec = 1.0
+
+    o_chunked = chunked_linear_attn(q_rec * scale_rec, k_rec, v_rec, g_rec, C=C)
+
+    state = torch.zeros(B, H, D, DV, device=DEVICE, dtype=torch.float32)
+    o_steps = []
+    for t in range(T):
+        alpha = torch.exp(g_rec[:, :, t : t + 1])  # [B,H,1,D]
+        o_t, state = recurrent_step(
+            q_rec[:, :, t : t + 1] * scale_rec,
+            k_rec[:, :, t : t + 1],
+            v_rec[:, :, t : t + 1],
+            state,
+            alpha=alpha,
+        )
+        o_steps.append(o_t)
+    o_recurrent = torch.cat(o_steps, dim=2)
+
+    rec_err = _rel_error(o_chunked, o_recurrent)
+    assert rec_err < 0.02, f"Recurrent vs chunked error: {rec_err}"
+    print(f"  recurrent step:   {rec_err:.4e} PASS")
+
     print("All tests passed.")
 
 
@@ -123,19 +144,11 @@ def benchmark() -> None:
     print("-" * 72)
 
     for bi, hi, ti, di, dvi in BENCH_CONFIGS:
-        q = torch.randn(
-            bi, hi, ti, di, device=DEVICE, dtype=DTYPE, requires_grad=True
-        )
-        k = torch.randn(
-            bi, hi, ti, di, device=DEVICE, dtype=DTYPE, requires_grad=True
-        )
-        v = torch.randn(
-            bi, hi, ti, dvi, device=DEVICE, dtype=DTYPE, requires_grad=True
-        )
+        q = torch.randn(bi, hi, ti, di, device=DEVICE, dtype=DTYPE, requires_grad=True)
+        k = torch.randn(bi, hi, ti, di, device=DEVICE, dtype=DTYPE, requires_grad=True)
+        v = torch.randn(bi, hi, ti, dvi, device=DEVICE, dtype=DTYPE, requires_grad=True)
         g = -torch.rand(bi, hi, ti, di, device=DEVICE, dtype=DTYPE).abs() * 0.1
-        gate = torch.sigmoid(
-            torch.randn(bi, hi, ti, dvi, device=DEVICE, dtype=DTYPE)
-        )
+        gate = torch.sigmoid(torch.randn(bi, hi, ti, dvi, device=DEVICE, dtype=DTYPE))
         grad_out = torch.randn(bi, hi, ti, dvi, device=DEVICE, dtype=DTYPE)
         u_zeros = torch.zeros(hi, di, device=DEVICE, dtype=DTYPE)
 
