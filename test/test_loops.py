@@ -28,6 +28,7 @@ from helion._testing import skipIfNotTriton
 from helion._testing import skipIfPallas
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfTileIR
+from helion._testing import skipIfXPU
 from helion._testing import xfailIfPallas
 import helion.language as hl
 
@@ -1391,6 +1392,7 @@ class TestLoops(RefEagerTestBase, TestCase):
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfTileIR("tileir backend will ignore `range_unroll_factors` hint")
     @skipIfNotTriton("range loop hints are Triton-specific")
+    @skipIfXPU("Accuracy issue on XPU backend")
     def test_unroll_with_pipelining(self):
         @helion.kernel(static_shapes=True)
         def matmul(
