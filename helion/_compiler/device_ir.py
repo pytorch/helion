@@ -1219,10 +1219,23 @@ class WalkDeviceAST(NodeVisitor):
             predicate_is_tensor=predicate_is_tensor,
             if_branch=if_branch,
         )
+
+        input_tensor_arg_values = inputs.get_tensor_args()
+
+        def is_tensor_arg_value(v: object) -> bool:
+            return any(v is t for t in input_tensor_arg_values)
+
+        input_tensor_node_names = [
+            k for k, v in inputs.values.items() if is_tensor_arg_value(v)
+        ]
+        output_names = list(outputs.values)
+
         args = (
             test_proxy,
             graph_idx,
-            inputs.get_tensor_args(),
+            input_tensor_arg_values,
+            input_tensor_node_names,
+            output_names,
         )
         mode = proxy_tensor.get_proxy_mode()
         assert isinstance(mode, proxy_tensor.ProxyTorchDispatchMode)
@@ -1552,11 +1565,13 @@ class WalkDeviceAST(NodeVisitor):
 
 
 class LiftTensorArgs:
+    values: dict[str, object]
     flat_values: list[object]
     spec: pytree.TreeSpec
     tensor_indices: list[int]
 
     def __init__(self, values: dict[str, object]) -> None:
+        self.values = values
         self.flat_values, self.spec = pytree.tree_flatten(values)
         self.tensor_indices = [
             i
