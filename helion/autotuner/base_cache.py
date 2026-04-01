@@ -123,6 +123,9 @@ class LooseAutotuneCacheKey(BoundKernelInMemoryCacheKey):
     kernel_source_hash: Hash of source code of input Helion kernel
     hardware: Hardware of the input device
     runtime_name: Version of the cuda/rocm arch
+    backend: Kernel backend (e.g. triton, pallas)
+    config_spec_hash: Hash of the config spec (available knobs and their ranges)
+    extra_cache_key: Optional extra cache key from the kernel (e.g. fusion context hash)
     """
 
     kernel_source_hash: str
@@ -130,6 +133,7 @@ class LooseAutotuneCacheKey(BoundKernelInMemoryCacheKey):
     runtime_name: str
     backend: str
     config_spec_hash: str = ""
+    extra_cache_key: str = ""
 
     def stable_hash(self) -> str:
         return hashlib.sha256(repr(self).encode("utf-8")).hexdigest()
