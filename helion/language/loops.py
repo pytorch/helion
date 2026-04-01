@@ -338,6 +338,7 @@ def _(
 
     results = []
     has_data_dependent_bounds = False
+    has_symbolic_bounds = False
     for begin_part, end_part, bs in zip(
         begin_list,
         end_list,
@@ -352,6 +353,8 @@ def _(
         if isinstance(size, torch.Tensor):
             size = None  # data dependent size
             has_data_dependent_bounds = True
+        if isinstance(begin_part, torch.SymInt) or isinstance(end_part, torch.SymInt):
+            has_symbolic_bounds = True
         if bs is None:
             results.append(TileIndexType.allocate(size, origin))
         elif isinstance(bs, int):
@@ -376,6 +379,7 @@ def _(
             )
         ],
         has_data_dependent_bounds=has_data_dependent_bounds,
+        has_symbolic_bounds=has_symbolic_bounds,
     )
     # pyrefly: ignore [unbound-name]
     if unpack:
@@ -392,6 +396,7 @@ def _add_config_choices(
     has_begin: bool = False,
     allow_static_ranges: list[bool] | None = None,
     has_data_dependent_bounds: bool = False,
+    has_symbolic_bounds: bool = False,
 ) -> None:
     config_spec = CompileEnvironment.current().config_spec
 
@@ -427,6 +432,29 @@ def _add_config_choices(
             block_ids, allow_static_ranges, strict=True
         ):
             _add_config_range_choice([block_id], allow_static_range=allow_static_range)
+
+        if has_symbolic_bounds and config_spec.backend_name == "pallas":
+            # Restrict pallas_loop_type to disallow "default" when has_symbolic_bounds
+            from ..autotuner.config_fragment import EnumFragment
+
+            current_pallas_fragment = config_spec.backend_tunable_fragments.get(
+                "pallas_loop_type"
+            )
+            assert isinstance(current_pallas_fragment, EnumFragment)
+            if current_pallas_fragment and "default" in current_pallas_fragment.choices:
+                new_choices = tuple(
+                    choice
+                    for choice in current_pallas_fragment.choices
+                    if choice != "default"
+                )
+
+                # If no choices left, add "fori_loop" as fallback
+                if not new_choices:
+                    new_choices = ("fori_loop",)
+
+                config_spec.backend_tunable_fragments["pallas_loop_type"] = (
+                    EnumFragment(choices=new_choices)
+                )
 
 
 def _add_config_range_choice(
