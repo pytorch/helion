@@ -469,14 +469,13 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                     fn = fn_node._type_info.proxy()
                     assert is_api_func(fn)
                     env = CompileEnvironment.current()
-                    codegen_fn = fn._codegen.get(env.codegen_name)
-                    if codegen_fn is None:
-                        codegen_fn = fn._codegen.get("common")
-                    if codegen_fn is None:
+                    try:
+                        codegen_fn = fn._codegen[env.codegen_name]
+                    except KeyError:
                         raise exc.BackendImplementationMissing(
                             env.backend_name,
                             f"codegen for API function {fn.__qualname__}",
-                        )
+                        ) from None
                     bound = fn._signature.bind(*args, **kwargs)
                     bound.apply_defaults()
 
@@ -605,14 +604,13 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         elif isinstance(fn_type_info := func_node._type_info, CallableType) and (
             is_api_func(api := fn_type_info.value)
         ):
-            codegen_fn = api._codegen.get(env.codegen_name)
-            if codegen_fn is None:
-                codegen_fn = api._codegen.get("common")
-            if codegen_fn is None:
+            try:
+                codegen_fn = api._codegen[env.codegen_name]
+            except KeyError:
                 raise exc.BackendImplementationMissing(
                     env.backend_name,
                     f"codegen for API function {api.__qualname__}",
-                )
+                ) from None
             ast_args = []
             ast_kwargs = {}
             proxy_args = []
