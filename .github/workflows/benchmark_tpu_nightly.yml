@@ -15,6 +15,9 @@ on:
         #   low_mem_dropout: ~37% element accuracy mismatch on all configs except block_sizes=[128]
         default: "exp,add,softmax_two_pass,welford,layer_norm"
 
+permissions:
+  contents: read
+
 jobs:
   benchmark-tpu:
     uses: ./.github/workflows/benchmark_tpu.yml
