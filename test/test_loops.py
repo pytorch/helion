@@ -22,6 +22,7 @@ from helion._testing import code_and_output
 from helion._testing import import_path
 from helion._testing import onlyBackends
 from helion._testing import skipIfCudaCapabilityLessThan
+from helion._testing import skipIfCudaSharedMemoryLessThan
 from helion._testing import skipIfFn
 from helion._testing import skipIfLowVRAM
 from helion._testing import skipIfNotCUDA
@@ -1455,6 +1456,9 @@ class TestLoops(RefEagerTestBase, TestCase):
         x = torch.randn(128, 1024, dtype=torch.float32, device=DEVICE)
         torch.testing.assert_close(fn(x), x)
 
+    @skipIfCudaSharedMemoryLessThan(
+        131072, reason="block sizes exceed device shared memory limit"
+    )
     def test_sequential_loops_global_memory_barrier(self):
         """Test that sequential device loops with a store-then-load of the same
         global buffer produce correct results. On AMD ROCm with num_warps >= 4,
