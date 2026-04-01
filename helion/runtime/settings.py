@@ -492,6 +492,11 @@ class _Settings:
     autotune_baseline_rtol: float | None = None
     autotune_baseline_accuracy_check_fn: Callable[[object, object], None] | None = None
     autotune_benchmark_fn: Callable[..., list[float]] | None = None
+    autotune_checkpoint_dir: str | None = dataclasses.field(
+        default_factory=functools.partial(
+            os.environ.get, "HELION_AUTOTUNE_CHECKPOINT_DIR"
+        )
+    )
     autotune_best_available_max_configs: int = dataclasses.field(
         default_factory=functools.partial(
             _env_get_int, "HELION_BEST_AVAILABLE_MAX_CONFIGS", 20
@@ -639,6 +644,13 @@ class Settings(_Settings):
             "Should have the following signature: "
             "(fns: list[Callable[[], object]], *, repeat: int, desc: str | None = None) -> list[float]. "
             "If None (default), uses the built-in benchmark function."
+        ),
+        "autotune_checkpoint_dir": (
+            "Directory path for saving and resuming autotuning checkpoints. "
+            "When set, the autotuner saves in-progress state to this directory using the "
+            "kernel's stable hash as the filename, and auto-discovers matching checkpoints "
+            "on subsequent runs. The checkpoint file is deleted on successful completion. "
+            "When unset (default), no checkpoints are saved or loaded."
         ),
         "autotune_best_available_max_configs": (
             "Maximum number of cached configs to use for FROM_BEST_AVAILABLE initial population strategy. "

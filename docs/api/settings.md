@@ -209,6 +209,14 @@ def my_kernel(x: torch.Tensor) -> torch.Tensor:
    Each preset also sets a default initial population strategy (see :doc:`../deployment_autotuning` for details).
    Users can still override individual ``autotune_*`` settings; explicit values win over the preset. Controlled by ``HELION_AUTOTUNE_EFFORT``.
 
+.. autoattribute:: Settings.autotune_checkpoint_dir
+
+   Directory path for saving and resuming autotuning checkpoints. When set, the autotuner
+   saves in-progress state to ``{dir}/{stable_hash}.pt`` and auto-discovers matching
+   checkpoints on subsequent runs. The checkpoint file is deleted on successful completion.
+   When unset (default), no checkpoints are saved or loaded (opt-in).
+   Controlled by ``HELION_AUTOTUNE_CHECKPOINT_DIR``.
+
 .. autoattribute:: Settings.autotune_best_available_max_configs
 
    Maximum number of cached configs to use when seeding the initial population with the ``from_best_available`` strategy.
@@ -323,6 +331,7 @@ Built-in values for ``HELION_AUTOTUNER`` include ``"LFBOTreeSearch"`` (default),
 | ``HELION_AUTOTUNE_PROGRESS_BAR`` | ``autotune_progress_bar`` | Enable or disable the progress bar UI during autotuning. |
 | ``HELION_AUTOTUNE_IGNORE_ERRORS`` | ``autotune_ignore_errors`` | Continue autotuning even when recoverable runtime errors occur. |
 | ``HELION_AUTOTUNE_CONFIG_OVERRIDES`` | ``autotune_config_overrides`` | Supply JSON forcing particular autotuner config key/value pairs. |
+| ``HELION_AUTOTUNE_CHECKPOINT_DIR`` | ``autotune_checkpoint_dir`` | Directory path for saving/resuming autotuning checkpoints (opt-in). |
 | ``TRITON_STORE_BINARY_ONLY`` | Triton (autotuning) | Set to ``1`` during autotuning to skip Triton intermediate IRs, reducing cache size ~40%. Set to ``0`` to retain IRs for debugging. |
 | ``HELION_CACHE_DIR`` | ``LocalAutotuneCache`` | Override the on-disk directory used for cached autotuning artifacts. |
 | ``HELION_SKIP_CACHE`` | ``LocalAutotuneCache`` | When set to ``1``, skip both reading and writing the autotuning cache entirely. |
