@@ -1836,6 +1836,7 @@ def _register_load_store_tunables(
             EnumFragment(choices=env.config_spec.valid_indexing_types()),
             length=total_count,
         )
+        env.config_spec.store_indexing_start = total_load_count
 
 
 def lower_to_device_ir(func: HostFunction) -> DeviceIR:

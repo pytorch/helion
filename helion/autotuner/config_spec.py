@@ -184,6 +184,7 @@ class ConfigSpec:
         self.epilogue_subtile_k_hint: int = 0
         self.has_pallas_inner_loops: bool = False
         self.has_pallas_symbolic_bounds: bool = False
+        self.store_indexing_start: int = 0
         self.backend_tunable_fragments = self.backend.tunable_fragments()
         unknown_tunables = set(self.backend_tunable_fragments) - BACKEND_TUNABLE_KEYS
         if unknown_tunables:
@@ -191,30 +192,22 @@ class ConfigSpec:
                 f"Backend {self.backend_name!r} returned unknown tunables: {sorted(unknown_tunables)!r}"
             )
 
-    @staticmethod
-    def _uses_tensor_descriptor_indexing(indexing: object) -> bool:
-        if indexing == "tensor_descriptor":
-            return True
-        if isinstance(indexing, list) and indexing:
-            return all(value == "tensor_descriptor" for value in indexing)
-        return False
-
-    def _should_keep_epilogue_subtile_for_autotune(
-        self, config: Mapping[str, object]
-    ) -> bool:
+    def _should_keep_epilogue_subtile_for_autotune(self) -> bool:
         if self.epilogue_subtile_autotune_choices is None:
             return False
-        arch = _epilogue_subtile_autotune_arch()
-        if arch is None:
-            return False
-        if arch >= (10, 0):
-            if config.get("pid_type") not in (
-                "persistent_blocked",
-                "persistent_interleaved",
-            ):
-                return False
-            return self._uses_tensor_descriptor_indexing(config.get("indexing"))
-        return False
+        return supports_tensor_descriptor()
+
+    def fix_epilogue_subtile_store_indexing(self, config: dict[str, object]) -> None:
+        """Force subtiled store indexing to tensor_descriptor for correctness."""
+        if (
+            not self.epilogue_subtile_candidate_enabled
+            or "epilogue_subtile" not in config
+        ):
+            return
+        indexing = config.get("indexing")
+        if isinstance(indexing, list) and self.store_indexing_start < len(indexing):
+            for i in range(self.store_indexing_start, len(indexing)):
+                indexing[i] = "tensor_descriptor"
 
     @staticmethod
     def _infer_epilogue_subtile_k_hint(args: Sequence[object]) -> int:
@@ -606,9 +599,7 @@ class ConfigSpec:
                 raise InvalidConfig(
                     f"epilogue_subtile must be one of {EPILOGUE_SUBTILE_EXTENDED_CHOICES!r}, got {val!r}"
                 )
-            elif _fix_invalid and not self._should_keep_epilogue_subtile_for_autotune(
-                config
-            ):
+            elif _fix_invalid and not self._should_keep_epilogue_subtile_for_autotune():
                 config.pop("epilogue_subtile", None)
 
         # Set default values for grid indices when pid_type is not persistent
