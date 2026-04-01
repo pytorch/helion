@@ -869,6 +869,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
                 EnumFragment(("a", "b")),
             ],
             block_size_indices=[0, 1],
+            overridden_flat_indices=set(),
         )
         search.num_neighbors_cap = -1
 
@@ -893,6 +894,99 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         ]
         self.assertEqual(sorted(pair_neighbors), sorted(expected))
 
+    def test_pattern_search_skips_overridden_indices(self):
+        """Neighbors are not generated along overridden (frozen) indices."""
+        search = PatternSearch.__new__(PatternSearch)
+        search._visited = set()
+        search.config_gen = SimpleNamespace(
+            flat_spec=[
+                PowerOfTwoFragment(16, 128, 32),  # block_size[0] — index 0
+                PowerOfTwoFragment(16, 128, 64),  # block_size[1] — index 1
+                EnumFragment(("a", "b")),  # some enum — index 2
+            ],
+            block_size_indices=[0, 1],
+            overridden_flat_indices={1},  # freeze block_size[1]
+        )
+        search.num_neighbors_cap = -1
+
+        base = [32, 64, "a"]
+        neighbors = search._generate_neighbors(base)
+
+        # No neighbor should change index 1 (frozen)
+        for flat in neighbors:
+            self.assertEqual(flat[1], 64)
+
+        # Neighbors should still vary indices 0 and 2
+        changed_indices = set()
+        for flat in neighbors:
+            for i, (v, b) in enumerate(zip(flat, base, strict=False)):
+                if v != b:
+                    changed_indices.add(i)
+        self.assertIn(0, changed_indices)
+        self.assertIn(2, changed_indices)
+        self.assertNotIn(1, changed_indices)
+
+        # No block-size pair neighbors should be generated (only 1 non-frozen block index)
+        pair_neighbors = [
+            flat
+            for flat in neighbors
+            if sum(1 for v, b in zip(flat, base, strict=False) if v != b) == 2
+        ]
+        self.assertEqual(pair_neighbors, [])
+
+    def test_differential_mutation_skips_overridden_indices(self):
+        """Differential mutation does not mutate overridden indices."""
+        random.seed(42)
+        args = (
+            torch.randn([8, 512, 512], device=DEVICE),
+            torch.randn([8, 512, 512], device=DEVICE),
+        )
+        spec = basic_kernels.add.bind(args).config_spec
+        overrides = {"num_warps": 8}
+        gen = ConfigGeneration(spec, overrides=overrides)
+
+        # Find the num_warps flat index
+        warp_idx = gen.num_warps_index
+        self.assertIn(warp_idx, gen.overridden_flat_indices)
+
+        base = gen.default_flat()
+        a = gen.random_flat()
+        b = gen.random_flat()
+        c = gen.random_flat()
+
+        # Run many mutations — overridden index should never change
+        for _ in range(50):
+            result = gen.differential_mutation(base, a, b, c, crossover_rate=0.9)
+            self.assertEqual(result[warp_idx], base[warp_idx])
+
+    def test_lfbo_pattern_search_skips_overridden_indices(self):
+        """LFBOPatternSearch._generate_neighbors skips overridden indices."""
+        random.seed(123)
+        search = LFBOPatternSearch.__new__(LFBOPatternSearch)
+        search.num_neighbors = 50
+        search.radius = 2
+        search.config_gen = SimpleNamespace(
+            flat_spec=[
+                PowerOfTwoFragment(16, 128, 32),  # block_size[0]
+                PowerOfTwoFragment(16, 128, 64),  # block_size[1]
+                PowerOfTwoFragment(2, 16, 4),  # num_warps
+                EnumFragment(("a", "b", "c")),  # some enum
+                BooleanFragment(),  # some boolean
+            ],
+            block_size_indices=[0, 1],
+            num_warps_index=2,
+            overridden_flat_indices={1, 2},  # freeze block_size[1] and num_warps
+        )
+        search.num_neighbors_cap = -1
+
+        base = [32, 64, 4, "b", True]
+        neighbors = search._generate_neighbors(base)
+
+        # No neighbor should change indices 1 or 2
+        for flat in neighbors:
+            self.assertEqual(flat[1], 64)
+            self.assertEqual(flat[2], 4)
+
     def test_lfbo_pattern_search_generate_neighbors(self):
         """Test LFBOPatternSearch._generate_neighbors method."""
         random.seed(123)
@@ -909,6 +1003,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             ],
             block_size_indices=[0, 1],
             num_warps_index=2,
+            overridden_flat_indices=set(),
         )
         search.num_neighbors_cap = -1
 
