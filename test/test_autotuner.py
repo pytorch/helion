@@ -2099,23 +2099,35 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
 
         for cfg in bad_configs:
             with self.subTest(config=cfg):
-                for skip in (True, False):
-                    result = self._run_config_in_subprocess(
-                        worker_script, cfg, skip_normalize=skip
-                    )
-                    self.assertNotEqual(
-                        result.returncode,
-                        0,
-                        f"Config should fail (skip={skip}): "
-                        f"{cfg}\nstderr:\n{result.stderr}",
-                    )
+                # Without normalization: must fail (IMA or NaN/Inf)
+                result_skip = self._run_config_in_subprocess(
+                    worker_script, cfg, skip_normalize=True
+                )
+                self.assertNotEqual(
+                    result_skip.returncode,
+                    0,
+                    f"Should fail without normalization: "
+                    f"{cfg}\nstderr:\n{result_skip.stderr}",
+                )
+
+                # With normalization: must pass (fix caps dangerous params)
+                result_norm = self._run_config_in_subprocess(
+                    worker_script, cfg, skip_normalize=False
+                )
+                self.assertEqual(
+                    result_norm.returncode,
+                    0,
+                    f"Should pass with normalization: "
+                    f"{cfg}\nstderr:\n{result_norm.stderr}",
+                )
 
     @skipIfTileIR("tileir backend will ignore `range_unroll_factors` hint")
     @skipIfNotTriton("range loop hints are Triton-specific")
     def test_normalize_caps_ima_configs_with_d_sliced(self):
         """Full transposed_matmul_bwd kernel (d_sliced + d_remainder variant)
         with per-loop rns/uf configs that cause IMA/NaN both with and
-        without normalization.  Each config runs in its own subprocess."""
+        without normalization (separate codegen bug with these block sizes
+        on the d_sliced kernel).  Each config runs in its own subprocess."""
 
         worker_script = datadir / "ima_worker_d_sliced_bwd.py"
 
@@ -2150,23 +2162,37 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
 
         for cfg in bad_configs:
             with self.subTest(config=cfg):
-                for skip in (True, False):
-                    result = self._run_config_in_subprocess(
-                        worker_script, cfg, skip_normalize=skip
-                    )
-                    self.assertNotEqual(
-                        result.returncode,
-                        0,
-                        f"Config should fail (skip={skip}): "
-                        f"{cfg}\nstderr:\n{result.stderr}",
-                    )
+                # Without normalization: must fail (IMA or NaN/Inf)
+                result_skip = self._run_config_in_subprocess(
+                    worker_script, cfg, skip_normalize=True
+                )
+                self.assertNotEqual(
+                    result_skip.returncode,
+                    0,
+                    f"Should fail without normalization: "
+                    f"{cfg}\nstderr:\n{result_skip.stderr}",
+                )
+
+                # With normalization: still fails (separate d_sliced
+                # codegen bug with bs=[64,32,128,...])
+                result_norm = self._run_config_in_subprocess(
+                    worker_script, cfg, skip_normalize=False
+                )
+                self.assertNotEqual(
+                    result_norm.returncode,
+                    0,
+                    f"Should still fail with normalization "
+                    f"(d_sliced codegen bug): "
+                    f"{cfg}\nstderr:\n{result_norm.stderr}",
+                )
 
     @skipIfTileIR("tileir backend will ignore `range_unroll_factors` hint")
     @skipIfNotTriton("range loop hints are Triton-specific")
     def test_normalize_caps_explicit_num_stages_1(self):
         """d_sliced kernel with constexpr branches (transpose_C only).
         Per-loop rns/uf configs cause IMA/NaN both with and without
-        normalization.  Each config runs in its own subprocess."""
+        normalization (separate codegen bug).  Each config runs in its
+        own subprocess."""
 
         worker_script = datadir / "ima_worker_d_sliced_bwd_transpose_c.py"
 
@@ -2201,16 +2227,29 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
 
         for cfg in bad_configs:
             with self.subTest(config=cfg):
-                for skip in (True, False):
-                    result = self._run_config_in_subprocess(
-                        worker_script, cfg, skip_normalize=skip
-                    )
-                    self.assertNotEqual(
-                        result.returncode,
-                        0,
-                        f"Config should fail (skip={skip}): "
-                        f"{cfg}\nstderr:\n{result.stderr}",
-                    )
+                # Without normalization: must fail (IMA or NaN/Inf)
+                result_skip = self._run_config_in_subprocess(
+                    worker_script, cfg, skip_normalize=True
+                )
+                self.assertNotEqual(
+                    result_skip.returncode,
+                    0,
+                    f"Should fail without normalization: "
+                    f"{cfg}\nstderr:\n{result_skip.stderr}",
+                )
+
+                # With normalization: still fails (separate d_sliced
+                # codegen bug with bs=[64,32,128,...])
+                result_norm = self._run_config_in_subprocess(
+                    worker_script, cfg, skip_normalize=False
+                )
+                self.assertNotEqual(
+                    result_norm.returncode,
+                    0,
+                    f"Should still fail with normalization "
+                    f"(d_sliced codegen bug): "
+                    f"{cfg}\nstderr:\n{result_norm.stderr}",
+                )
 
 
 @onlyBackends(["triton"])

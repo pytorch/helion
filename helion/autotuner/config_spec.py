@@ -614,12 +614,305 @@ class ConfigSpec:
 
         if self.supports_config_key("range_warp_specializes"):
             config["range_warp_specializes"] = range_warp_specializes
+
+        self._normalize_range_unroll_and_pipeline(config)
+
         # Allow tunable parameter keys in addition to backend-supported keys.
         allowed_keys = self.supported_config_keys() | {
             *self.user_defined_tunables.keys()
         }
         if invalid_keys := ({*config} - allowed_keys):
             raise InvalidConfig(f"Invalid config keys {sorted(invalid_keys)!r}")
+
+    def _normalize_num_warps(self, config: dict[str, object]) -> None:
+        """Cap num_warps so threads do not exceed the grid tile element count.
+
+        When ``num_warps * warp_size`` exceeds the product of grid (non-reduction)
+        block sizes, the extra threads have no output elements to work on.
+        The cap never goes below ``DEFAULT_NUM_WARPS`` to avoid breaking
+        kernels whose reductions depend on a minimum thread count.
+        """
+        num_warps = config.get("num_warps")
+        if not isinstance(num_warps, int) or num_warps <= 0:
+            return
+        block_sizes = config.get("block_sizes")
+        if not isinstance(block_sizes, list) or not self.grid_block_ids:
+            return
+
+        grid_numel = 1
+        for grid_bid in self.grid_block_ids:
+            try:
+                idx = self.block_sizes.block_id_to_index(grid_bid)
+            except KeyError:
+                return
+            if idx >= len(block_sizes):
+                return
+            val = block_sizes[idx]
+            if not isinstance(val, int) or val <= 0:
+                return
+            grid_numel *= val
+
+        warp_size = warps_to_threads(1)
+        max_warps = max(DEFAULT_NUM_WARPS, grid_numel // warp_size)
+        if max_warps >= num_warps:
+            return
+        # Round down to the largest power-of-two that fits
+        max_warps = 1 << (max_warps.bit_length() - 1)
+        config["num_warps"] = max(DEFAULT_NUM_WARPS, max_warps)
+
+    def _normalize_range_unroll_and_pipeline(self, config: dict[str, object]) -> None:
+        """Cap range_unroll_factors and range_num_stages to prevent CUDA IMA.
+
+        Moved from TileStrategy.get_tl_range_kwargs() so that configs are fixed
+        *before* autotuner benchmarking rather than silently at codegen time.
+
+        Six protection paths:
+        1. tensor_descriptor + pipeline/unroll → kill
+        2. unroll > 1 → cap to trip count, cap pipeline depth
+        3. block_ptr + unroll + pipeline → kill pipeline
+        4. pipeline depth >= trip count (without unroll) → cap global num_stages
+        4b. per-loop range_num_stages >= trip count → cap per-loop
+        5. redundant range_num_stages=1 → strip to avoid Triton bug
+        """
+        range_unroll_factors = config.get("range_unroll_factors")
+        if not isinstance(range_unroll_factors, list):
+            range_unroll_factors = []
+        range_num_stages = config.get("range_num_stages")
+        if not isinstance(range_num_stages, list):
+            range_num_stages = []
+        block_sizes = config.get("block_sizes")
+        if not isinstance(block_sizes, list):
+            block_sizes = []
+
+        num_stages = config.get("num_stages", 1)
+        if not isinstance(num_stages, int):
+            num_stages = 1
+        indexing = config.get("indexing")
+
+        # Path 1: tensor_descriptor + pipeline/unroll → kill
+        if indexing == "tensor_descriptor":
+            changed = False
+            for i in range(min(len(range_num_stages), len(self.range_num_stages))):
+                if isinstance(range_num_stages[i], int) and range_num_stages[i] > 0:
+                    range_num_stages[i] = 0
+                    changed = True
+            if num_stages > 1:
+                for i in range(
+                    min(len(range_unroll_factors), len(self.range_unroll_factors))
+                ):
+                    if (
+                        isinstance(range_unroll_factors[i], int)
+                        and range_unroll_factors[i] > 0
+                    ):
+                        range_unroll_factors[i] = 0
+                        changed = True
+            if changed:
+                config["range_unroll_factors"] = range_unroll_factors
+                config["range_num_stages"] = range_num_stages
+            return
+
+        # Try to access CompileEnvironment for trip count computation
+        try:
+            from helion._compiler.compile_environment import CompileEnvironment
+
+            env = CompileEnvironment.current()
+        except Exception:
+            env = None
+
+        has_block_ptr = indexing == "block_ptr" or (
+            isinstance(indexing, list) and "block_ptr" in indexing
+        )
+
+        changed_uf = False
+        changed_rns = False
+
+        for i, spec in enumerate(self.range_unroll_factors):
+            if i >= len(range_unroll_factors):
+                break
+            uf = range_unroll_factors[i]
+            if not isinstance(uf, int) or uf <= 1:
+                continue
+
+            block_ids = spec.block_ids
+            if env is not None and uf > 1:
+                import sympy
+
+                sizes_known = all(
+                    bid < len(env.block_sizes) and env.block_sizes[bid].size
+                    for bid in block_ids
+                )
+                if sizes_known:
+                    trip_count = 1
+                    for bid in block_ids:
+                        # Fix #C: use exact numel when concrete
+                        numel_expr = env.block_sizes[bid].numel
+                        if isinstance(numel_expr, (int, sympy.Integer)):
+                            n = int(numel_expr)
+                        else:
+                            n = env.block_sizes[bid].size_hint()
+                        bs_idx = self.block_sizes._block_id_to_index.get(bid)
+                        if bs_idx is not None and bs_idx < len(block_sizes):
+                            bs = block_sizes[bs_idx]
+                            if isinstance(bs, int) and bs > 0:
+                                trip_count *= (n + bs - 1) // bs
+                            else:
+                                break
+                        else:
+                            break
+                    else:
+                        # Only cap unroll if it exceeds trip count (pointless
+                        # to unroll more iterations than exist).  Triton
+                        # handles non-divisible unroll factors natively via
+                        # remainder loops, so we do NOT require divisibility.
+                        if uf > trip_count and trip_count > 0:
+                            uf = max(1, 1 << (trip_count.bit_length() - 1))
+
+                        # Path 2c: cap pipeline depth
+                        if i < len(range_num_stages) and isinstance(
+                            range_num_stages[i], int
+                        ):
+                            rns = range_num_stages[i]
+                            eff = max(1, rns if rns > 0 else num_stages)
+                            if eff > 1 and uf >= 1:
+                                unrolled_iters = (
+                                    (trip_count + uf - 1) // uf
+                                    if uf > 0
+                                    else trip_count
+                                )
+                                if unrolled_iters <= eff:
+                                    new_rns = max(1, unrolled_iters - 1)
+                                    if new_rns != rns:
+                                        range_num_stages[i] = new_rns
+                                        changed_rns = True
+
+            if uf != range_unroll_factors[i]:
+                range_unroll_factors[i] = uf
+                changed_uf = True
+
+            # Path 3: block_ptr + unroll + pipeline → kill pipeline
+            if has_block_ptr and uf > 1 and i < len(range_num_stages):
+                rns = range_num_stages[i]
+                if isinstance(rns, int):
+                    eff = max(1, rns if rns > 0 else num_stages)
+                    if eff > 1:
+                        range_num_stages[i] = 1
+                        changed_rns = True
+
+        # Path 4: Cap global num_stages based on minimum trip count.
+        # The loop above only caps when unroll > 1.  When global
+        # num_stages >= the minimum trip count across all range loops,
+        # Triton's pipeliner generates OOB prefetches → NaN/IMA.
+        # Cap the global value directly so the compiled kernel is safe.
+        if env is not None and num_stages > 1:
+            import sympy
+
+            min_trip: int | float = float("inf")
+            for spec in self.range_unroll_factors:
+                block_ids = spec.block_ids
+                if not all(
+                    bid < len(env.block_sizes)
+                    and env.block_sizes[bid].size
+                    for bid in block_ids
+                ):
+                    continue
+
+                trip_count = 1
+                for bid in block_ids:
+                    numel_expr = env.block_sizes[bid].numel
+                    if isinstance(numel_expr, (int, sympy.Integer)):
+                        n = int(numel_expr)
+                    else:
+                        n = env.block_sizes[bid].size_hint()
+                    bs_idx = self.block_sizes._block_id_to_index.get(bid)
+                    if bs_idx is not None and bs_idx < len(block_sizes):
+                        bs = block_sizes[bs_idx]
+                        if isinstance(bs, int) and bs > 0:
+                            trip_count *= (n + bs - 1) // bs
+                        else:
+                            break
+                    else:
+                        break
+                else:
+                    if trip_count > 0:
+                        min_trip = min(min_trip, trip_count)
+
+            if isinstance(min_trip, int) and num_stages >= min_trip:
+                config["num_stages"] = max(1, min_trip - 1)
+                num_stages = config["num_stages"]
+
+        # Path 4b: Cap per-loop range_num_stages based on per-loop trip count.
+        # The main loop above (Path 2c) only caps range_num_stages when
+        # range_unroll_factors > 1.  When a per-loop range_num_stages[i] is
+        # explicitly set > 1 and >= the (unrolled) trip count for that loop,
+        # Triton's pipeliner generates OOB prefetches regardless of the
+        # unroll factor.
+        if env is not None:
+            import sympy
+
+            for i, spec in enumerate(self.range_unroll_factors):
+                if i >= len(range_num_stages):
+                    break
+                rns = range_num_stages[i]
+                if not isinstance(rns, int) or rns <= 1:
+                    continue
+
+                block_ids = spec.block_ids
+                if not all(
+                    bid < len(env.block_sizes) and env.block_sizes[bid].size
+                    for bid in block_ids
+                ):
+                    continue
+
+                trip_count = 1
+                for bid in block_ids:
+                    numel_expr = env.block_sizes[bid].numel
+                    if isinstance(numel_expr, (int, sympy.Integer)):
+                        n = int(numel_expr)
+                    else:
+                        n = env.block_sizes[bid].size_hint()
+                    bs_idx = self.block_sizes._block_id_to_index.get(bid)
+                    if bs_idx is not None and bs_idx < len(block_sizes):
+                        bs = block_sizes[bs_idx]
+                        if isinstance(bs, int) and bs > 0:
+                            trip_count *= (n + bs - 1) // bs
+                        else:
+                            break
+                    else:
+                        break
+                else:
+                    uf = 1
+                    if i < len(range_unroll_factors) and isinstance(
+                        range_unroll_factors[i], int
+                    ):
+                        uf = max(1, range_unroll_factors[i])
+                    unrolled_iters = (
+                        (trip_count + uf - 1) // uf if uf > 1 else trip_count
+                    )
+                    if rns >= unrolled_iters:
+                        new_rns = max(1, unrolled_iters - 1)
+                        if new_rns != rns:
+                            range_num_stages[i] = new_rns
+                            changed_rns = True
+
+        # Path 5: Strip redundant range_num_stages=1.  Explicitly passing
+        # num_stages=1 to tl.range triggers a Triton codegen bug on loops
+        # with nested conditional loads.  When global num_stages <= 1,
+        # range_num_stages=1 is equivalent to 0, so strip it.
+        if num_stages <= 1:
+            for i in range(
+                min(len(range_num_stages), len(self.range_num_stages))
+            ):
+                if (
+                    isinstance(range_num_stages[i], int)
+                    and range_num_stages[i] == 1
+                ):
+                    range_num_stages[i] = 0
+                    changed_rns = True
+
+        if changed_uf:
+            config["range_unroll_factors"] = range_unroll_factors
+        if changed_rns:
+            config["range_num_stages"] = range_num_stages
 
     def raise_grid_block_minimums(self) -> None:
         """Raise min_size for grid block dimensions based on problem size.
