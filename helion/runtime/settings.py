@@ -403,6 +403,11 @@ class _Settings:
             "HELION_AUTOTUNE_PRECOMPILE_JOBS",
         )
     )
+    autotune_precompile_reps: int = dataclasses.field(
+        default_factory=functools.partial(
+            _env_get_int, "HELION_AUTOTUNE_PRECOMPILE_REPS", 1
+        )
+    )
     autotune_random_seed: int = dataclasses.field(
         default_factory=_get_autotune_random_seed
     )
