@@ -278,7 +278,7 @@ class Kernel(Generic[_R]):
         base = self._base_specialization_key(args)
         extra_fns = self._specialize_extra.get(base)
         if extra_fns is not None:
-            return base + tuple(s(args) for s in extra_fns)
+            return base + tuple([s(args) for s in extra_fns])
         return base
 
     def _specialization_key(self, obj: object) -> Hashable:
