@@ -17,13 +17,13 @@ from torch._inductor.codecache import torch_key
 
 from .. import exc
 from .._utils import counters
-from ..runtime.kernel import BoundKernel
 from .base_search import BaseAutotuner
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
     from ..runtime.config import Config
+    from ..runtime.kernel import BoundKernel
     from .base_search import BaseSearch
 
 log: logging.Logger = logging.getLogger(__name__)
@@ -54,9 +54,11 @@ class AutotuneCacheMeta(abc.ABCMeta):
         """
 
         def factory(kernel: BoundKernel, args: Sequence[Any]) -> BaseAutotuner:
-            if not isinstance(kernel, BoundKernel):
+            if not kernel.is_cacheable():
                 raise TypeError(
-                    "Autotune caches require a BoundKernel; external kernels are not cacheable"
+                    f"Autotune caches require a cacheable kernel "
+                    f"(e.g. BoundKernel); got {type(kernel).__name__}. "
+                    f"External kernels are not cacheable."
                 )
             return cls(search_cls(kernel, args))  # type: ignore[misc]
 
@@ -160,13 +162,14 @@ class AutotuneCacheBase(BaseAutotuner, abc.ABC, metaclass=AutotuneCacheMeta):
 
     def __init__(self, autotuner: BaseSearch) -> None:
         self.autotuner = autotuner
-        if not isinstance(self.autotuner.kernel, BoundKernel):
+        kernel = self.autotuner.kernel
+        if not kernel.is_cacheable():
             raise TypeError(
-                f"Autotune caches require a BoundKernel; got"
-                f" {type(self.autotuner.kernel).__name__}."
-                " External kernels are not cacheable."
+                f"Autotune caches require a cacheable kernel "
+                f"(e.g. BoundKernel); got {type(kernel).__name__}. "
+                f"External kernels are not cacheable."
             )
-        self.kernel: BoundKernel = self.autotuner.kernel
+        self.kernel: BoundKernel = kernel  # type: ignore[assignment]
         self.args = self.autotuner.args
 
     @abc.abstractmethod
