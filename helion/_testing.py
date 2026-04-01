@@ -947,6 +947,14 @@ def code_and_output(
     return code, result
 
 
+def _as_tensors(result: object) -> list[torch.Tensor]:
+    """Normalize a single tensor or tuple of tensors to a flat list."""
+    if isinstance(result, tuple):
+        return [t.clone() for t in result]
+    assert isinstance(result, torch.Tensor)
+    return [result.clone()]
+
+
 def run_example(
     kernel_fn: Callable[..., torch.Tensor] | Kernel | dict[str, Kernel],
     baseline_fn: Callable[..., torch.Tensor] | dict[str, Callable[..., torch.Tensor]],
@@ -985,20 +993,21 @@ def run_example(
 
     # Check correctness against first baseline
     first_baseline_name, first_baseline_func = next(iter(baselines.items()))
-    expected = first_baseline_func(*args).clone()
+    expected = _as_tensors(first_baseline_func(*args))
 
     for name, func in {**kernels, **baselines}.items():
         if name != first_baseline_name:
             print(f"Testing {name} correctness...", file=sys.stderr)
-            # Clone args to avoid buffer donation issues (e.g., Pallas/TPU)
             cloned_args = _clone_args(args)
-            result = func(*cloned_args).clone()
-            torch.testing.assert_close(
-                result.to(torch.float32),
-                expected.to(torch.float32),
-                rtol=rtol,
-                atol=atol,
-            )
+            result = _as_tensors(func(*cloned_args))
+            assert len(result) == len(expected)
+            for r, e in zip(result, expected, strict=True):
+                torch.testing.assert_close(
+                    r.to(torch.float32),
+                    e.to(torch.float32),
+                    rtol=rtol,
+                    atol=atol,
+                )
 
     # Test backward pass
     if bwd:
