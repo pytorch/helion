@@ -119,9 +119,7 @@ class LocalAutotuneCache(AutotuneCacheBase):
             self.kernel.kernel.specialization_key(self.args),
         )
         kernel_source = textwrap.dedent(inspect.getsource(self.kernel.kernel.fn))
-        extra = self.kernel.extra_cache_key()
-        hash_input = kernel_source if not extra else kernel_source + "\x00" + extra
-        kernel_source_hash = hashlib.sha256(hash_input.encode("utf-8")).hexdigest()
+        kernel_source_hash = hashlib.sha256(kernel_source.encode("utf-8")).hexdigest()
 
         dev = extract_device(self.args)
         assert dev is not None
@@ -162,6 +160,7 @@ class LocalAutotuneCache(AutotuneCacheBase):
             runtime_name=runtime_name,
             backend=self.kernel.env.backend.name,
             config_spec_hash=config_spec_hash,
+            extra_cache_key=self.kernel.extra_cache_key(),
         )
 
     def _get_local_cache_path(self) -> Path:
