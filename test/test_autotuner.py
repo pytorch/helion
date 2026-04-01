@@ -4,6 +4,7 @@ from contextlib import contextmanager
 from contextlib import nullcontext
 import csv
 from itertools import count
+import json
 import logging
 import math
 import multiprocessing as mp
@@ -12,6 +13,8 @@ import os
 from pathlib import Path
 import pickle
 import random
+import subprocess
+import sys
 import tempfile
 from types import SimpleNamespace
 from typing import Callable
@@ -32,7 +35,9 @@ from helion._testing import TestCase
 from helion._testing import assert_close_with_mismatch_tolerance
 from helion._testing import import_path
 from helion._testing import onlyBackends
+from helion._testing import PROJECT_ROOT
 from helion._testing import skipIfCudaCapabilityLessThan
+from helion._testing import skipIfNotTriton
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfRocm
 from helion._testing import skipIfTileIR
@@ -2000,6 +2005,212 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         self.assertEqual(
             search._autotune_metrics.num_accuracy_failures, len(search.configs)
         )
+
+    def _run_config_in_subprocess(
+        self, worker_script: Path, config_dict: dict, skip_normalize: bool
+    ) -> subprocess.CompletedProcess:
+        """Run a single config in a subprocess with a fresh triton cache.
+
+        Every cache layer is redirected to a fresh temp directory so that
+        no state leaks between configs:
+        - TRITON_CACHE_DIR  → Triton on-disk kernel cache
+        - TORCHINDUCTOR_CACHE_DIR → PyCodeCache / inductor disk cache
+        - HELION_CACHE_DIR  → helion's own cache root
+
+        The subprocess is a new process, so in-memory caches
+        (_compile_cache, PyCodeCache in-proc, Triton JIT device_caches)
+        are inherently clean.
+
+        Args:
+            worker_script: Path to a worker .py file in test/data/.
+            config_dict: Config dict to pass as JSON via argv.
+            skip_normalize: If True, patches normalize() to be a no-op.
+
+        Returns:
+            CompletedProcess with returncode, stdout, stderr.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env = {
+                **os.environ,
+                "PYTHONPATH": (
+                    f"{PROJECT_ROOT}{os.pathsep}"
+                    f"{os.environ.get('PYTHONPATH', '')}"
+                ),
+                "TRITON_CACHE_DIR": str(Path(tmpdir) / "triton_cache"),
+                "TORCHINDUCTOR_CACHE_DIR": str(
+                    Path(tmpdir) / "inductor_cache"
+                ),
+                "HELION_CACHE_DIR": str(Path(tmpdir) / "helion_cache"),
+            }
+            return subprocess.run(
+                [
+                    sys.executable,
+                    str(worker_script),
+                    json.dumps(config_dict),
+                    "skip" if skip_normalize else "normalize",
+                ],
+                capture_output=True,
+                text=True,
+                cwd=PROJECT_ROOT,
+                env=env,
+                timeout=120,
+            )
+
+    @skipIfTileIR("tileir backend will ignore `range_unroll_factors` hint")
+    @skipIfNotTriton("range loop hints are Triton-specific")
+    def test_normalize_caps_ima_configs(self):
+        """Per-loop range_num_stages configs on short-trip loops cause
+        IMA / NaN both with and without normalization (fix not yet
+        landed).  Each config runs in its own subprocess to avoid Triton
+        JIT cross-contamination and to safely catch CUDA IMA crashes."""
+
+        worker_script = datadir / "ima_worker_simple_bwd.py"
+
+        bad_configs = [
+            dict(
+                block_sizes=[64, 32, 64, 64, 32, 64],
+                indexing="pointer",
+                num_stages=1,
+                num_warps=4,
+                range_num_stages=[0, 0, 2, 0, 0, 0, 2],
+            ),
+            dict(
+                block_sizes=[64, 32, 64, 64, 32, 64],
+                indexing="pointer",
+                num_stages=1,
+                num_warps=4,
+                range_num_stages=[2, 2, 2, 2, 2, 2, 2],
+            ),
+            dict(
+                block_sizes=[64, 16, 64, 64, 16, 64],
+                indexing="pointer",
+                num_stages=1,
+                num_warps=4,
+                range_num_stages=[0, 0, 2, 0, 0, 0, 2],
+            ),
+            dict(
+                block_sizes=[64, 16, 64, 64, 16, 64],
+                indexing="pointer",
+                num_stages=1,
+                num_warps=4,
+                range_num_stages=[2, 2, 2, 2, 2, 2, 2],
+            ),
+        ]
+
+        for cfg in bad_configs:
+            with self.subTest(config=cfg):
+                for skip in (True, False):
+                    result = self._run_config_in_subprocess(
+                        worker_script, cfg, skip_normalize=skip
+                    )
+                    self.assertNotEqual(
+                        result.returncode,
+                        0,
+                        f"Config should fail (skip={skip}): "
+                        f"{cfg}\nstderr:\n{result.stderr}",
+                    )
+
+    @skipIfTileIR("tileir backend will ignore `range_unroll_factors` hint")
+    @skipIfNotTriton("range loop hints are Triton-specific")
+    def test_normalize_caps_ima_configs_with_d_sliced(self):
+        """Full transposed_matmul_bwd kernel (d_sliced + d_remainder variant)
+        with per-loop rns/uf configs that cause IMA/NaN both with and
+        without normalization.  Each config runs in its own subprocess."""
+
+        worker_script = datadir / "ima_worker_d_sliced_bwd.py"
+
+        bad_configs = [
+            dict(
+                block_sizes=[64, 32, 128, 128, 32, 64],
+                indexing="pointer",
+                num_stages=1,
+                num_warps=4,
+                pid_type="flat",
+                range_num_stages=[0, 0, 3, 0, 0, 3, 0],
+                range_unroll_factors=[0, 0, 2, 0, 0, 2, 0],
+            ),
+            dict(
+                block_sizes=[64, 32, 128, 128, 32, 64],
+                indexing="pointer",
+                num_stages=1,
+                num_warps=4,
+                pid_type="flat",
+                range_num_stages=[3, 3, 3, 3, 3, 3, 3],
+                range_unroll_factors=[2, 2, 2, 2, 2, 2, 2],
+            ),
+            dict(
+                block_sizes=[64, 32, 128, 128, 32, 64],
+                indexing="pointer",
+                num_stages=5,
+                num_warps=4,
+                pid_type="flat",
+                range_unroll_factors=[0, 0, 2, 0, 0, 2, 0],
+            ),
+        ]
+
+        for cfg in bad_configs:
+            with self.subTest(config=cfg):
+                for skip in (True, False):
+                    result = self._run_config_in_subprocess(
+                        worker_script, cfg, skip_normalize=skip
+                    )
+                    self.assertNotEqual(
+                        result.returncode,
+                        0,
+                        f"Config should fail (skip={skip}): "
+                        f"{cfg}\nstderr:\n{result.stderr}",
+                    )
+
+    @skipIfTileIR("tileir backend will ignore `range_unroll_factors` hint")
+    @skipIfNotTriton("range loop hints are Triton-specific")
+    def test_normalize_caps_explicit_num_stages_1(self):
+        """d_sliced kernel with constexpr branches (transpose_C only).
+        Per-loop rns/uf configs cause IMA/NaN both with and without
+        normalization.  Each config runs in its own subprocess."""
+
+        worker_script = datadir / "ima_worker_d_sliced_bwd_transpose_c.py"
+
+        bad_configs = [
+            dict(
+                block_sizes=[64, 32, 128, 128, 32, 64],
+                indexing="pointer",
+                num_stages=1,
+                num_warps=4,
+                pid_type="flat",
+                range_num_stages=[0, 0, 3, 0, 0, 3, 0],
+                range_unroll_factors=[0, 0, 2, 0, 0, 2, 0],
+            ),
+            dict(
+                block_sizes=[64, 32, 128, 128, 32, 64],
+                indexing="pointer",
+                num_stages=1,
+                num_warps=4,
+                pid_type="flat",
+                range_num_stages=[3, 3, 3, 3, 3, 3, 3],
+                range_unroll_factors=[2, 2, 2, 2, 2, 2, 2],
+            ),
+            dict(
+                block_sizes=[64, 32, 128, 128, 32, 64],
+                indexing="pointer",
+                num_stages=5,
+                num_warps=4,
+                pid_type="flat",
+                range_unroll_factors=[0, 0, 2, 0, 0, 2, 0],
+            ),
+        ]
+
+        for cfg in bad_configs:
+            with self.subTest(config=cfg):
+                for skip in (True, False):
+                    result = self._run_config_in_subprocess(
+                        worker_script, cfg, skip_normalize=skip
+                    )
+                    self.assertNotEqual(
+                        result.returncode,
+                        0,
+                        f"Config should fail (skip={skip}): "
+                        f"{cfg}\nstderr:\n{result.stderr}",
+                    )
 
 
 @onlyBackends(["triton"])
