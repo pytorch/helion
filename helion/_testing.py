@@ -33,6 +33,7 @@ from ._dist_utils import is_master_rank
 from ._utils import counters
 from .autotuner.benchmarking import sync_object as sync_object
 from .runtime.settings import _get_backend
+from .runtime.settings import is_pallas_interpret
 from helion.autotuner.base_search import _clone_args
 
 if _get_backend() == "pallas":
@@ -227,7 +228,9 @@ def _init_tpu_device() -> bool:
 
 
 # Determine DEVICE without calling functions that initialize CUDA.
-if _get_backend() == "pallas":
+if _get_backend() == "pallas" and is_pallas_interpret():
+    DEVICE = torch.device("cpu")
+elif _get_backend() == "pallas":
     _init_tpu_device()
     DEVICE = torch.device("tpu")
 elif torch.xpu.is_available():
@@ -391,9 +394,16 @@ def skipIfXPU(reason: str) -> Callable[[Callable], Callable]:
 
 
 def skipUnlessPallas(reason: str) -> Callable[[Callable], Callable]:
-    """Skip test unless JAX Pallas TPU backend is available."""
+    """Skip test unless JAX Pallas TPU backend or interpret mode is available."""
 
     def _has_tpu_pallas() -> bool:
+        if is_pallas_interpret():
+            try:
+                from jax.experimental import pallas
+
+                return True
+            except Exception:
+                return False
         try:
             from jax.experimental import pallas  # noqa: F401
             import torch_tpu.api  # type: ignore[import-not-found]

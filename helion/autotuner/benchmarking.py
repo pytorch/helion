@@ -11,6 +11,7 @@ from typing import TypeVar
 import torch
 import torch.distributed as dist
 
+from ..runtime.settings import is_pallas_interpret
 from .progress_bar import iter_with_progress
 
 T = TypeVar("T")
@@ -38,7 +39,8 @@ def _synchronize(result: object) -> None:
                 "Install torch_tpu or torch.accelerator.synchronize() will return "
                 "before device computation finishes, producing incorrect benchmarks."
             ) from None
-    torch.accelerator.synchronize()
+    if not is_pallas_interpret() and torch.accelerator.is_available():
+        torch.accelerator.synchronize()
 
 
 def compute_repeat(

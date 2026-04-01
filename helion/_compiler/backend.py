@@ -979,9 +979,14 @@ class PallasBackend(Backend):
         from .device_function import TensorStrideArg
 
         if isinstance(arg, (SymbolArgument, TensorSizeArg, TensorStrideArg)):
-            device_expr = (
-                f"{tensor_host_args[0]}.device" if tensor_host_args else "'tpu'"
-            )
+            from ..runtime.settings import is_pallas_interpret
+
+            if tensor_host_args:
+                device_expr = f"{tensor_host_args[0]}.device"
+            elif is_pallas_interpret():
+                device_expr = "'cpu'"
+            else:
+                device_expr = "'tpu'"
             # Scalars are passed as 1-dim tensors (shape [1]) rather than
             # 0-dim tensors (shape []) because TPU Pallas Mosaic lowering
             # requires rank >= 1 for all block specs.  A 0-dim input causes:
