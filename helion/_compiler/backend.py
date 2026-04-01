@@ -953,6 +953,11 @@ class PallasBackend(Backend):
     ) -> str:
         return f"{offsets_var} = {lid} * {block_size_var} + jnp.arange(0, {block_size_var}, dtype={dtype})"
 
+    def sympy_printer_expr(self, expr: sympy.Expr) -> str:
+        from .device_function import pallas_texpr
+
+        return pallas_texpr(expr)
+
     def inductor_op_overrides(self) -> InductorOpOverrides:
         from torch._inductor.codegen.pallas import PallasKernelOverrides
 

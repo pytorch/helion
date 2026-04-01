@@ -506,7 +506,7 @@ class TestExamples(RefEagerTestBase, TestCase):
         check_example("low_mem_dropout", (p, grad_y, seed), grad_x, block_sizes=[8192])
 
     @xfailIfCute("CuTe bf16 x int16 example still returns incorrect results")
-    @xfailIfPallas("missing dot implementation")
+    @xfailIfPallas("precision differences with bf16xint16 operations on pallas")
     @skipIfTileIR("precision differences with bf16xint16 operations on tileir")
     @skipIfRocm("precision differences with bf16xint16 operations on rocm")
     @skipIfXPU("precision differences with bf16xint16 operations on xpu")
