@@ -622,6 +622,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             block_size=[32, 1],
             num_warps=4,
             num_stages=3,
+            pallas_loop_type="fori_loop",
             rtol=1e-2,
             atol=1e-2,
         )
