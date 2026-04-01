@@ -900,8 +900,11 @@ class BlockSizeSpec(_PowerOfTwoBlockIdItem):
 
     def _normalize(self, name: str, value: object) -> int | None:
         result = super()._normalize(name, value)
-        if isinstance(result, int) and result < self.min_size:
-            result = self.min_size
+        if isinstance(result, int):
+            if result < self.min_size:
+                result = self.min_size
+            elif result > self.max_size:
+                result = self.max_size
         return result
 
     def update_min(self, value: int) -> None:

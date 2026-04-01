@@ -160,6 +160,7 @@ class CompileEnvironment:
         self.jagged_tile_parent_id: dict[int, int] = {}
         self.jagged_tile_mask_shapes: dict[int, list[torch.SymInt]] = {}
         self._symint_cache: dict[object, torch.SymInt] = {}
+        self._dot_k_block_ids: list[int] = []
         self._foreign_symint_cache: dict[tuple[int, sympy.Expr], torch.SymInt] = {}
         self.device_load_count = (
             0  # Track number of loads in all device code for eviction policy tuning
