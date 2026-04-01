@@ -609,16 +609,17 @@ class DeviceIR:
             graphs_with_rolled_rdim |= used_graphs
 
     def build_codegen_graphs(self, config: Config) -> list[GraphInfo]:
-        """Build and return graph copies with reduction rolling applied.
+        """Build and return graph copies with reduction rolling and epilogue subtiling applied.
 
         Creates a temporary DeviceIR with copied graphs, applies reduction
-        rolling based on the config, and returns the resulting graphs.
-        The original graphs are never modified.
+        rolling and epilogue subtiling based on the config, and returns the
+        resulting graphs. The original graphs are never modified.
         """
 
         temp = copy.copy(self)
         temp.graphs = [g.copy() for g in self.graphs]
         temp._apply_rolling(config)
+        temp._apply_epilogue_subtiling(config)
         return temp.graphs
 
     def _apply_rolling(self, config: Config) -> None:
@@ -664,6 +665,29 @@ class DeviceIR:
                 # Replace only the graph payload to preserve root metadata
                 # (e.g., phase_index used for barrier phase splitting).
                 graph_info.graph = self.graphs[new_graph_id].graph
+
+    def _apply_epilogue_subtiling(self, config: Config) -> None:
+        """Apply epilogue subtiling on the graph copies if enabled."""
+        split_factor = config.epilogue_subtile
+        if not split_factor:
+            return
+
+        from .epilogue_subtiling import apply_epilogue_subtiling
+
+        env = CompileEnvironment.current()
+        configured_block_sizes = {
+            info.block_id: info.from_config_assert(config)
+            for info in env.block_sizes
+            if not info.reduction
+        }
+
+        for graph_info in self.graphs:
+            if isinstance(graph_info, RootGraphInfo):
+                apply_epilogue_subtiling(
+                    graph_info.graph,
+                    split_factor,
+                    configured_block_sizes,
+                )
 
     def __enter__(self) -> None:
         try:
@@ -1757,6 +1781,21 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
             add_tile_with_offset_metadata(graph)
             remove_unnecessary_tile_index(graph.graph)
             remove_unnecessary_masking(graph.graph)
+
+        from .epilogue_subtiling import has_epilogue_subtiling_candidate
+
+        has_epilogue_subtile_candidate = False
+        for graph_info in device_ir.graphs:
+            if not isinstance(graph_info, RootGraphInfo):
+                continue
+            if has_epilogue_subtiling_candidate(graph_info.graph):
+                has_epilogue_subtile_candidate = True
+                break
+        config_spec = CompileEnvironment.current().config_spec
+        config_spec.epilogue_subtile_candidate_enabled = has_epilogue_subtile_candidate
+        config_spec.epilogue_subtile_k_hint = 0
+        config_spec.epilogue_subtile_autotune_choices = None
+
         device_ir.register_rollable_reductions()
         CompileEnvironment.current().config_spec.raise_grid_block_minimums()
         if len(device_ir.root_ids) > 1:

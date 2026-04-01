@@ -43,6 +43,7 @@ class Config(Mapping[str, object]):
         maxnreg: MaxnregLiteral | None = None,
         indexing: IndexingLiteral | list[IndexingLiteral] | None = None,
         advanced_controls_file: str | None = None,
+        epilogue_subtile: int | None = None,
         # For user-defined properties
         **kwargs: object,
     ) -> None:
@@ -78,6 +79,8 @@ class Config(Mapping[str, object]):
                 - Empty/omitted (all loads/stores default to "pointer")
                 Valid strategies: "pointer", "tensor_descriptor", "block_ptr"
             advanced_controls_file: Path to a PTXAS control file applied during compilation, or empty string for none.
+            epilogue_subtile: Split factor for the epilogue (post-matmul pointwise + store) along
+                the N dimension. None = disabled (default), valid values are 2 or 4.
             **kwargs: Additional user-defined configuration parameters.
         """
         self.config = {}
@@ -102,6 +105,7 @@ class Config(Mapping[str, object]):
             "num_sm_multiplier": num_sm_multiplier,
             "maxnreg": maxnreg,
             "advanced_controls_file": advanced_controls_file,
+            "epilogue_subtile": epilogue_subtile,
         }
         for key, value in core_props.items():
             if value is not None:
@@ -297,6 +301,10 @@ class Config(Mapping[str, object]):
         return cast(
             "IndexingLiteral | list[IndexingLiteral]", self.config.get("indexing", [])
         )
+
+    @property
+    def epilogue_subtile(self) -> int | None:
+        return cast("int | None", self.config.get("epilogue_subtile", None))
 
 
 def _to_hashable(x: object) -> object:

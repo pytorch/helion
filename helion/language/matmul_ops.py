@@ -222,7 +222,8 @@ def enforce_dot_requirements(lhs: torch.Tensor, rhs: torch.Tensor) -> None:
     # Triton only supports 2D dot operations.  When the operands are 3D
     # (batched matmul), constrain the batch dimension block size to 1 so
     # the codegen can squeeze it away before emitting tl.dot.
-    if len(lshape) == 3:
+    # Pallas uses jnp.matmul which handles batched matmul natively.
+    if len(lshape) == 3 and env.backend_name != "pallas":
         for batch_dim in (lshape[0], rshape[0]):
             block_idx = env.get_block_id(batch_dim)
             if block_idx is not None:

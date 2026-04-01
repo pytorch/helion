@@ -1178,7 +1178,8 @@ class PallasBackend(Backend):
                 dim_size = next_power_of_2(max(spec.size_hint, 1))
                 spec.update_min(min(alignment, dim_size))
             elif dfe == 1:
-                spec.update_min(8)
+                dim_size = next_power_of_2(max(spec.size_hint, 1))
+                spec.update_min(min(8, dim_size))
 
     def tunable_fragments(self) -> dict[str, ConfigSpecFragment]:
         from ..autotuner.config_fragment import EnumFragment
@@ -1362,10 +1363,12 @@ class PallasBackend(Backend):
             mutated_params = set(ReadWrites.from_list(host_fn.body).inplace_writes) & {
                 a.arg for a in host_fn.args.args
             }
+            input_storages = {id(t.untyped_storage()) for t in env.input_sources}
+
             for i, arg in enumerate(sorted_args):
                 if not isinstance(arg, TensorArg):
                     continue
-                if arg.fake_value not in env.input_sources:
+                if id(arg.fake_value.untyped_storage()) not in input_storages:
                     # Tensor created inside the function body (output)
                     output_indices.append(i)
                 elif arg.host_str() in mutated_params:
@@ -1399,6 +1402,19 @@ class PallasBackend(Backend):
             ]
             if scratch_shapes:
                 launcher_args.append(f"_scratch_shapes={scratch_shapes!r}")
+
+            # Identify which launcher arg positions correspond to pipeline-body
+            # tensors (need HBM refs); all others get proper BlockSpecs.
+            from .device_function import TensorArg
+
+            pipeline_ids = device_fn.pallas_pipeline_tensor_ids
+            if pipeline_ids and sorted_args is not None:
+                pipeline_arg_indices = [
+                    i
+                    for i, arg in enumerate(sorted_args)
+                    if isinstance(arg, TensorArg) and id(arg.fake_value) in pipeline_ids
+                ]
+                launcher_args.append(f"_pipeline_arg_indices={pipeline_arg_indices!r}")
 
         return launcher_args
 
@@ -2637,11 +2653,85 @@ class MetalBackend(Backend):
             ),
         }
 
+    def index_type_str(self, index_dtype: torch.dtype) -> str:
+        return "uint"
+
+    def inline_constexpr(self, name: str, value: str) -> str:
+        return f"{name} = {value}"
+
     def cast_expr(self, expr_str: str, dtype_str: str) -> str:
         return f"static_cast<{dtype_str}>({expr_str})"
+
+    def program_id_expr(self, dim: int, *, index_dtype: str) -> str:
+        return f"tgid[{dim}]"
+
+    def grid_index_expr(
+        self, offset_var: str, block_size_var: str, dtype: str, *, axis: int
+    ) -> str:
+        return f"{offset_var} + tid[{axis}]"
 
     def force_tile_mask(self) -> bool:
         return True
 
+    def full_expr(
+        self, shape_dims: list[str], value_expr: str, dtype: torch.dtype
+    ) -> str:
+        metal_type = self.dtype_str(dtype)
+        return f"{metal_type}({value_expr})"
+
+    def reshape_expr(self, expr: str, shape: str) -> str:
+        return expr
+
+    def broadcast_to_expr(self, expr: str, shape: str) -> str:
+        return expr
+
+    def zeros_expr(self, shape: str, dtype: str) -> str:
+        return "0"
+
+    def where_expr(self, mask: str, true_val: str, false_val: str) -> str:
+        return f"({mask} ? {true_val} : {false_val})"
+
+    def minimum_expr(self, a: str, b: str) -> str:
+        return f"min({a}, {b})"
+
     def supports_config_key(self, key: str) -> bool:
         return key in self._SUPPORTED_CONFIG_KEYS
+
+    def supports_precompile(self) -> bool:
+        return False
+
+    def autotune(
+        self,
+        bound_kernel: BoundKernel[Any],
+        args: Sequence[object],
+        *,
+        force: bool = True,
+        **kwargs: object,
+    ) -> Config:
+        return bound_kernel.config_spec.default_config()
+
+    def transform_host_arg(
+        self,
+        arg: Argument,
+        host_str: str,
+        tensor_host_args: list[str],
+    ) -> str:
+        """Wrap scalar SymbolArguments as 1-element tensors for buffer passing."""
+        from .device_function import SymbolArgument
+
+        if isinstance(arg, SymbolArgument):
+            device_expr = (
+                f"{tensor_host_args[0]}.device" if tensor_host_args else "'mps'"
+            )
+            return (
+                f"torch.scalar_tensor(float({host_str}), "
+                f"dtype=torch.float32, "
+                f"device={device_expr})"
+            )
+        return host_str
+
+    def launcher_keyword_args(self, config: Config, *, has_barrier: bool) -> list[str]:
+        from .device_function import DeviceFunction
+
+        dims = tuple(DeviceFunction.current().codegen.max_thread_block_dims)
+        return [f"_block_dims=({dims[0]}, {dims[1]}, {dims[2]})"]

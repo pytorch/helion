@@ -310,10 +310,20 @@ class DeviceFunction:
         self.device_store_index = 0
         # Single counter for both loads and stores for indexing assignment
         self.device_memory_op_index = 0
+        self.epilogue_subtile_store_indices: dict[str, int] = {}
         self.rng_seed_buffer_param_name = None
 
         # Pallas: id(fake_tensor) → {dim: block_id}, recorded during codegen
         self.pallas_tensor_dim_block_ids: dict[int, dict[int, int]] = {}
+        # Pallas: set of id(fake_tensor) for tensors accessed in pipeline body
+        self.pallas_pipeline_tensor_ids: set[int] = set()
+
+    def allocate_store_index(self) -> int:
+        """Bump store counters and return the indexing strategy slot."""
+        self.device_store_index += 1
+        idx = self.device_memory_op_index
+        self.device_memory_op_index += 1
+        return idx
 
     def get_indexing_strategy(self, index: int) -> IndexingStrategy:
         from .indexing_strategy import IndexingStrategy
@@ -870,6 +880,13 @@ class DeviceFunction:
         name = self.new_var(name_hint)
         self._scratch_args.append(ScratchArg(name, shape, dtype, scratch_type))
         return name
+
+    def scratch_read_slice(self, name: str) -> str | None:
+        """Return the index expression for reading logical data from a padded scratch.
+
+        Returns None if no padding was applied.
+        """
+        return None
 
     def register_dma_semaphore(self, name_hint: str = "sem") -> str:
         """Register a DMA semaphore scratch buffer and return its variable name."""

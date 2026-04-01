@@ -261,8 +261,9 @@ class PatternSearch(PopulationBasedSearch):
         """
         Generate neighboring configurations by changing one or two parameters at a time.
         """
+        overridden = self.config_gen.overridden_flat_indices
         candidates_by_index = [
-            spec.pattern_neighbors(base[index])
+            spec.pattern_neighbors(base[index]) if index not in overridden else []
             for index, spec in enumerate(self.config_gen.flat_spec)
         ]
         assert len(candidates_by_index) == len(base)
@@ -276,7 +277,9 @@ class PatternSearch(PopulationBasedSearch):
                 neighbors.append(new_flat)
 
         # Block sizes are important enough to try pairs of changes at a time
-        block_indices = self.config_gen.block_size_indices
+        block_indices = [
+            i for i in self.config_gen.block_size_indices if i not in overridden
+        ]
         for i_pos, first in enumerate(block_indices):
             first_candidates = candidates_by_index[first]
             if not first_candidates:

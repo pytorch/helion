@@ -167,7 +167,18 @@ def _full_codegen_pallas(state: CodegenState) -> ast.AST:
     if pallas_loop_type in ("emit_pipeline", "fori_loop"):
         fake_value = state.fake_value
         assert isinstance(fake_value, torch.Tensor)
-        shape = tuple(int(s) for s in fake_value.size())
+        env = CompileEnvironment.current()
+        # Resolve symbolic tile sizes to concrete block sizes from config
+        resolved_shape: list[int] = []
+        for s in fake_value.size():
+            bid = env.resolve_block_id(s)
+            if bid is not None:
+                bs = env.block_sizes[bid].from_config(config)
+                assert isinstance(bs, int)
+                resolved_shape.append(bs)
+            else:
+                resolved_shape.append(int(s))
+        shape = tuple(resolved_shape)
         dtype = fake_value.dtype
 
         # Register as scratch memory

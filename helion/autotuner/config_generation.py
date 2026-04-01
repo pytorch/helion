@@ -77,6 +77,18 @@ class ConfigGeneration:
         )
 
     @functools.cached_property
+    def overridden_flat_indices(self) -> set[int]:
+        """Return flat_spec indices that are frozen by config overrides."""
+        if not self._override_values:
+            return set()
+        result: set[int] = set()
+        for key in self._override_values:
+            if key in self._key_to_flat_indices:
+                indices, _ = self._key_to_flat_indices[key]
+                result.update(indices)
+        return result
+
+    @functools.cached_property
     def _key_to_flat_indices(self) -> dict[str, tuple[list[int], bool]]:
         """Build mapping from config key names to (flat_spec indices, is_sequence).
 
@@ -219,11 +231,17 @@ class ConfigGeneration:
         """
         The main op in differential evolution, randomly combine `x` with `a + (b - c)`.
         """
-        crossover_mask = [random.random() < crossover_rate for _ in self.flat_spec]
-        crossover_mask[random.randrange(len(crossover_mask))] = True
+        overridden = self.overridden_flat_indices
         result = [*x]
-        for i, crossover in enumerate(crossover_mask):
-            if crossover:
+        mutated = False
+        for i, spec in enumerate(self.flat_spec):
+            if i not in overridden and random.random() < crossover_rate:
+                result[i] = spec.differential_mutation(a[i], b[i], c[i])
+                mutated = True
+        if not mutated:
+            eligible = [i for i in range(len(self.flat_spec)) if i not in overridden]
+            if eligible:
+                i = random.choice(eligible)
                 result[i] = self.flat_spec[i].differential_mutation(a[i], b[i], c[i])
         # TODO(jansel): can this be larger? (too large and Triton compile times blow up)
         self.shrink_config(result, 8192)

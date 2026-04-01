@@ -308,7 +308,6 @@ class TestLoops(RefEagerTestBase, TestCase):
             result, functools.reduce(torch.matmul, args), atol=1e-1, rtol=1e-2
         )
 
-    @xfailIfPallas("hl.load/hl.store with extra_mask not supported on pallas")
     def test_use_block_size_var_without_hl_tile(self):
         """Test that block size var can be used without hl.tile()."""
 
@@ -334,8 +333,9 @@ class TestLoops(RefEagerTestBase, TestCase):
 
         code, result = code_and_output(copy_blockwise, (x,), block_sizes=[16])
         torch.testing.assert_close(result, x)
-        self.assertIn("_BLOCK_SIZE_0 = tl.constexpr(", code)
-        self.assertIn("tl.arange(0, _BLOCK_SIZE_0)", code)
+        if _get_backend() == "triton":
+            self.assertIn("_BLOCK_SIZE_0 = tl.constexpr(", code)
+            self.assertIn("tl.arange(0, _BLOCK_SIZE_0)", code)
 
     @skipIfRefEager(
         "Test is block size dependent which is not supported in ref eager mode"
@@ -757,7 +757,6 @@ class TestLoops(RefEagerTestBase, TestCase):
         code, output = code_and_output(fn, (x,))
         torch.testing.assert_close(output, x + 6)
 
-    @xfailIfPallas("shape broadcasting mismatch in nested loop phi-node patterns")
     def test_variable_assignment_phi_nodes(self):
         """Test for phi node issue with variable assignments like U1 = two_x.
 
@@ -1262,7 +1261,6 @@ class TestLoops(RefEagerTestBase, TestCase):
         )  # Original dim 1 = second fastest varying
         self.assertIn("offset_0 = pid_2", code)  # Original dim 0 = slowest varying
 
-    @xfailIfPallas("BlockSpec shape mismatch with hl.full dynamic fill")
     def test_full_with_dynamic_fill_value(self):
         """Test hl.full with dynamic fill value from scalar tensor."""
 

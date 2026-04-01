@@ -457,6 +457,8 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                     self.maybe_log_repro(log.warning, args, config=config)
                     raise
 
+                self.env.config_spec.configure_epilogue_subtile_autotune(args)
+
     def _apply_mark_static(self, args: tuple[object, ...]) -> None:
         """
         Apply torch._dynamo.mark_static() markings from input tensors.
@@ -644,6 +646,16 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         allow_print: bool = True,
     ) -> Callable[..., object]:
         return self.compile_config(config, allow_print=allow_print)
+
+    def extra_cache_key(self) -> str:
+        """Return extra data folded into the disk-cache key.
+
+        Returns ``""`` by default, leaving the cache key unchanged.
+        """
+        return ""
+
+    def is_cacheable(self) -> bool:
+        return True
 
     def get_cached_path(self, config: ConfigLike | None = None) -> str | None:
         """

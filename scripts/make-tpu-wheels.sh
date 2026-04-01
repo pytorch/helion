@@ -28,7 +28,7 @@ uv pip install "$DIST_DIR"/torch-*.whl
 
 TORCH_TPU_COMMIT=$(cat "$REPO_DIR/.github/ci_commit_pins/torch_tpu.txt")
 if [ ! -d torch_tpu ]; then
-    git clone git@github.com:google-ml-infra/torch_tpu.git torch_tpu
+    git clone git@github.com:google-pytorch/torch_tpu.git torch_tpu
 fi
 pushd torch_tpu
 git fetch origin

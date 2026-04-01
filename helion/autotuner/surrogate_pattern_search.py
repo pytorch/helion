@@ -479,13 +479,19 @@ class LFBOPatternSearch(PatternSearch):
         neighbors: list[FlatConfig] = []
 
         # Generate num_neighbors random neighbors
+        overridden = self.config_gen.overridden_flat_indices
+        eligible_block = [
+            i for i in self.config_gen.block_size_indices if i not in overridden
+        ]
+        warp_idx = self.config_gen.num_warps_index
+        tune_warps = warp_idx >= 0 and warp_idx not in overridden
         for _ in range(self.num_neighbors):
             new_flat = [*base]  # Copy the base configuration
             modified_indices = set()
 
             # 1. Sample a block size index and change it
-            if self.config_gen.block_size_indices:
-                block_idx = random.choice(self.config_gen.block_size_indices)
+            if eligible_block:
+                block_idx = random.choice(eligible_block)
                 modified_indices.add(block_idx)
 
                 block_spec = self.config_gen.flat_spec[block_idx]
@@ -496,8 +502,7 @@ class LFBOPatternSearch(PatternSearch):
                     new_flat[block_idx] = random.choice(block_neighbors)
 
             # 2. Sample the num_warps index and change it
-            if self.config_gen.num_warps_index >= 0:
-                warp_idx = self.config_gen.num_warps_index
+            if tune_warps:
                 modified_indices.add(warp_idx)
 
                 warp_spec = self.config_gen.flat_spec[warp_idx]
@@ -513,7 +518,7 @@ class LFBOPatternSearch(PatternSearch):
             # Collect available pattern neighbors for remaining indices
             remaining_pattern_neighbors = []
             for index, spec in enumerate(self.config_gen.flat_spec):
-                if index not in modified_indices:
+                if index not in modified_indices and index not in overridden:
                     pattern_neighbors = spec.pattern_neighbors(base[index])
                     if pattern_neighbors:
                         remaining_pattern_neighbors.append((index, pattern_neighbors))
@@ -754,6 +759,12 @@ class LFBOTreeSearch(LFBOPatternSearch):
         n_trees = len(surrogate.estimators_)
         base_list = list(base)
         base_encoded = np.array(config_gen.encode_config(base), dtype=np.float64)
+        overridden = config_gen.overridden_flat_indices
+        eligible_block = [
+            i for i in config_gen.block_size_indices if i not in overridden
+        ]
+        warp_idx = config_gen.num_warps_index
+        tune_warps = warp_idx >= 0 and warp_idx not in overridden
 
         all_results: list[FlatConfig] = []
 
@@ -768,7 +779,7 @@ class LFBOTreeSearch(LFBOPatternSearch):
             path_node_indices = decision_path.indices.tolist()  # type: ignore[union-attr]
 
             # 3. Extract flat_spec indices (deduplicated, order-preserving)
-            seen: set[int] = set()
+            seen: set[int] = set(overridden)
             path_flat_indices: list[int] = []
             for node_id in path_node_indices:
                 feat = tree.feature[node_id]  # pyrefly: ignore [missing-attribute]
@@ -779,17 +790,14 @@ class LFBOTreeSearch(LFBOPatternSearch):
                         path_flat_indices.append(flat_idx)
 
             # 4. Augment with block_size and num_warps indices
-            if config_gen.block_size_indices:
-                bs_idx = random.choice(config_gen.block_size_indices)
+            if eligible_block:
+                bs_idx = random.choice(eligible_block)
                 if bs_idx not in seen:
                     seen.add(bs_idx)
                     path_flat_indices.append(bs_idx)
-            if (
-                config_gen.num_warps_index >= 0
-                and config_gen.num_warps_index not in seen
-            ):
-                seen.add(config_gen.num_warps_index)
-                path_flat_indices.append(config_gen.num_warps_index)
+            if tune_warps and warp_idx not in seen:
+                seen.add(warp_idx)
+                path_flat_indices.append(warp_idx)
 
             # 5. Greedy traversal with incremental encoding
             current_flat: FlatConfig = list(base)

@@ -173,6 +173,12 @@ class _ExternalKernelAdapter(_AutotunableKernel):
     ) -> None:
         pass
 
+    def extra_cache_key(self) -> str:
+        return ""
+
+    def is_cacheable(self) -> bool:
+        return False
+
 
 SETTINGS_KWARGS = {
     f.name for f in dataclasses.fields(Settings) if f.name.startswith("autotune_")

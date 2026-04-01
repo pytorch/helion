@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import unittest
 
 import torch
@@ -167,6 +168,46 @@ def pallas_inner_loop_add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
         for tile_n in hl.tile(n):
             out[tile_m, tile_n] = x[tile_m, tile_n] + y[tile_m, tile_n]
     return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
+def pallas_attention(
+    q_in: torch.Tensor, k_in: torch.Tensor, v_in: torch.Tensor
+) -> torch.Tensor:
+    m_dim = q_in.size(-2)
+    n_dim = k_in.size(-2)
+    assert n_dim == v_in.size(-2)
+    head_dim = hl.specialize(q_in.size(-1))
+    assert head_dim == k_in.size(-1) == v_in.size(-1)
+    q_view = q_in.reshape([-1, m_dim, head_dim])
+    k_view = k_in.reshape([-1, n_dim, head_dim]).transpose(1, 2)
+    v_view = v_in.reshape([-1, n_dim, head_dim])
+    out = torch.empty_like(q_view)
+    sm_scale = 1.0 / math.sqrt(head_dim)
+    qk_scale = sm_scale * 1.44269504
+    for tile_b, tile_m in hl.tile([q_view.size(0), m_dim]):
+        m_i = hl.full([tile_b, tile_m], float("-inf"), dtype=torch.float32)
+        l_i = torch.full_like(m_i, 1.0)
+        acc = hl.zeros([tile_b, tile_m, head_dim], dtype=torch.float32)
+        q = q_view[tile_b, tile_m, :]
+        for tile_n in hl.tile(v_view.size(1)):
+            k = k_view[tile_b, :, tile_n]
+            qk = torch.bmm(q, k)
+            m_ij = torch.maximum(m_i, torch.amax(qk, -1) * qk_scale)
+            qk = qk * qk_scale - m_ij[:, :, None]
+            p = torch.exp2(qk)
+            l_ij = torch.sum(p, -1)
+            alpha = torch.exp2(m_i - m_ij)
+            l_i = l_i * alpha + l_ij
+            acc = acc * alpha[:, :, None]
+            v = v_view[tile_b, tile_n, :]
+            p = p.to(v.dtype)
+            acc = torch.baddbmm(acc, p, v)
+            m_i = m_ij
+        m_i += torch.log2(l_i)
+        acc = acc / l_i[:, :, None]
+        out[tile_b, tile_m, :] = acc.to(out.dtype)
+    return out.view(q_in.size())
 
 
 @onlyBackends(["triton", "pallas"])
@@ -391,6 +432,75 @@ class TestPallas(TestCase):
         self.assertIn("pltpu.make_async_copy", code)
         self.assertNotIn("pltpu.emit_pipeline", code)
         torch.testing.assert_close(result, args[0] + args[1])
+
+    def test_attention_default_fp32(self) -> None:
+        """Test attention with default (for-loop) inner loop."""
+        query = torch.randn(1, 4, 32, 64, dtype=torch.float32, device=DEVICE)
+        key = torch.randn(1, 4, 32, 64, dtype=torch.float32, device=DEVICE)
+        val = torch.randn(1, 4, 32, 64, dtype=torch.float32, device=DEVICE)
+        args = (query, key, val)
+        _code, result = code_and_output(pallas_attention, args, block_sizes=[1, 32, 32])
+        ref = torch.nn.functional.scaled_dot_product_attention(
+            query.float().cpu(), key.float().cpu(), val.float().cpu()
+        ).to(device=DEVICE)
+        torch.testing.assert_close(result, ref, rtol=1e-2, atol=1e-2)
+
+    def test_attention_emit_pipeline_correctness(self) -> None:
+        """Test emit_pipeline attention with loop-carried state."""
+        query = torch.randn(2, 2, 128, 128, dtype=torch.float32, device=DEVICE)
+        key = torch.randn(2, 2, 128, 128, dtype=torch.float32, device=DEVICE)
+        val = torch.randn(2, 2, 128, 128, dtype=torch.float32, device=DEVICE)
+        _code, result = code_and_output(
+            pallas_attention,
+            (query, key, val),
+            block_sizes=[4, 128, 128],
+            pallas_loop_type="emit_pipeline",
+        )
+        ref = torch.nn.functional.scaled_dot_product_attention(
+            query.float().cpu(), key.float().cpu(), val.float().cpu()
+        ).to(device=DEVICE)
+        torch.testing.assert_close(result, ref, rtol=1e-2, atol=1e-2)
+
+    def test_attention_fori_loop_correctness(self) -> None:
+        """Test fori_loop attention with loop-carried state."""
+        query = torch.randn(2, 2, 128, 128, dtype=torch.float32, device=DEVICE)
+        key = torch.randn(2, 2, 128, 128, dtype=torch.float32, device=DEVICE)
+        val = torch.randn(2, 2, 128, 128, dtype=torch.float32, device=DEVICE)
+        args = (query, key, val)
+        code, result = code_and_output(
+            pallas_attention,
+            args,
+            block_sizes=[4, 128, 128],
+            pallas_loop_type="fori_loop",
+        )
+        self.assertIn("jax.lax.fori_loop", code)
+        self.assertIn("pltpu.make_async_copy", code)
+        ref = torch.nn.functional.scaled_dot_product_attention(
+            query.float().cpu(), key.float().cpu(), val.float().cpu()
+        ).to(device=DEVICE)
+        torch.testing.assert_close(result, ref, rtol=1e-2, atol=1e-2)
+
+    def test_attention_emit_pipeline_non_divisible(self) -> None:
+        """Test emit_pipeline with seq_kv not divisible by block_k.
+
+        Uses _explicit_indices to pass iteration index into body for
+        proper mask computation on partial tiles.
+        """
+        # seq=384, block_k=256 -> 2 tiles, last is partial (128/256)
+        query = torch.randn(1, 2, 128, 128, dtype=torch.float32, device=DEVICE)
+        key = torch.randn(1, 2, 384, 128, dtype=torch.float32, device=DEVICE)
+        val = torch.randn(1, 2, 384, 128, dtype=torch.float32, device=DEVICE)
+        _code, result = code_and_output(
+            pallas_attention,
+            (query, key, val),
+            block_sizes=[2, 128, 256],
+            pallas_loop_type="emit_pipeline",
+        )
+        self.assertIn("_explicit_indices=True", _code)
+        ref = torch.nn.functional.scaled_dot_product_attention(
+            query.float().cpu(), key.float().cpu(), val.float().cpu()
+        ).to(device=DEVICE)
+        torch.testing.assert_close(result, ref, rtol=1e-2, atol=1e-2)
 
 
 if __name__ == "__main__":
