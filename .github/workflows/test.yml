@@ -260,7 +260,7 @@ jobs:
           export HELION_BACKEND=${{ matrix.backend }}
           # -rf: print failed tests
           # --timeout: max allowed time for each test
-          PARALLEL=""
+          PARALLEL="-n4"
           if [[ "${{ contains(matrix.alias, 'distributed') }}" == "true" ]]; then
             TEST_PATH="test/test_examples_dist.py"
             EXTRA_FLAGS="-rs"
@@ -280,6 +280,7 @@ jobs:
             TIMEOUT=360
             export TRITON_XPU_GEN_NATIVE_CODE=1
             export HELION_DELETE_CACHE_AFTER_TEST=0
+            export HELION_STATIC_LAUNCHER=1
           fi
           pytest $PARALLEL -rf --timeout=$TIMEOUT $EXTRA_FLAGS $TEST_PATH | tee >(eval $SKIP_CHECK)
 
