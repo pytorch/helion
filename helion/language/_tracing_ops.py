@@ -239,7 +239,9 @@ def _(state: CodegenState) -> object:
         return _codegen_emit_pipeline(state)
     if pallas_loop_type == "fori_loop":
         return _codegen_fori_loop(state)
-    # default: fall through to common codegen path
+    # default: fall through to common codegen path unless bounds are traced
+    if _has_traced_loop_bounds(state):
+        return _codegen_fori_loop(state)
     # pyrefly: ignore[bad-return]
     return state.get_graph(state.proxy_arg(0)).codegen(state)
 
@@ -255,8 +257,25 @@ def _(state: CodegenState) -> None:
     if pallas_loop_type == "fori_loop":
         _codegen_fori_loop(state)
         return None
+    # default: fall through unless bounds are traced
+    if _has_traced_loop_bounds(state):
+        _codegen_fori_loop(state)
+        return None
     # pyrefly: ignore[bad-return]
     return state.get_graph(state.proxy_arg(0)).codegen(state)
+
+
+def _has_traced_loop_bounds(state: CodegenState) -> bool:
+    """Return True if the loop begin values contain traced (non-static) bounds.
+
+    This happens for nested tiles like ``for mb in hl.tile(outer.begin, outer.end)``
+    where begin/end are SymInts from an outer grid-level tile.  Python ``range()``
+    cannot handle traced values, so we must route to ``lax.fori_loop``.
+    """
+    begins = state.proxy_arg(1)
+    if not isinstance(begins, (list, tuple)):
+        begins = [begins]
+    return any(not isinstance(b, int) for b in begins)
 
 
 def _classify_loop_tensors(
@@ -914,6 +933,21 @@ def _codegen_fori_loop(state: CodegenState) -> object:
     begin_exprs, iter_step_exprs, slice_size_exprs = _pallas_loop_begin_and_step_exprs(
         state, block_ids, block_size_vars
     )
+
+    # Override grid_parts when loop bounds are traced (dynamic).
+    # For nested tiles like ``for mb in hl.tile(outer.begin, outer.end)``,
+    # n_tiles = cdiv(end - begin, block_size) instead of cdiv(numel, block_size).
+    if _has_traced_loop_bounds(state):
+        ends_proxy = state.proxy_arg(2)
+        if not isinstance(ends_proxy, (list, tuple)):
+            ends_proxy = [ends_proxy]
+        grid_parts = []
+        for i in range(len(block_ids)):
+            end_expr = state.sympy_expr(sympy.sympify(ends_proxy[i]))
+            range_expr = f"({end_expr}) - ({begin_exprs[i]})"
+            grid_parts.append(
+                env.backend.cdiv_expr(range_expr, block_size_vars[i], is_device=True)
+            )
 
     # --- Handle loop-carried state as scratch VMEM buffers ---
     scratch_names: list[str] = []
