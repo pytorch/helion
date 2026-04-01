@@ -29,6 +29,7 @@ import operator
 import random
 from typing import TYPE_CHECKING
 from typing import Any
+from typing import ClassVar
 
 from .differential_evolution import DifferentialEvolutionSearch
 from .effort_profile import DIFFERENTIAL_EVOLUTION_DEFAULTS
@@ -83,6 +84,21 @@ class DESurrogateHybrid(DifferentialEvolutionSearch):
             If not set via env var and None is passed, defaults to FROM_RANDOM.
     """
 
+    # Keys that this class contributes to state_dict for checkpointing.
+    _checkpoint_state_dict_keys: ClassVar[set[str]] = {
+        "surrogate_threshold",
+        "candidate_ratio",
+        "refit_frequency",
+        "n_estimators",
+        "all_observations",
+    }
+
+    # Instance attributes that are intentionally NOT checkpointed.
+    # Surrogate model is refit on load from all_observations.
+    _checkpoint_excluded_attrs: ClassVar[set[str]] = {
+        "surrogate",
+    }
+
     def __init__(
         self,
         kernel: _AutotunableKernel,
@@ -135,12 +151,9 @@ class DESurrogateHybrid(DifferentialEvolutionSearch):
         # Track all evaluations for surrogate training
         self.all_observations: list[tuple[FlatConfig, float]] = []
 
-    def _autotune(self) -> Config:
+    def _init_search(self) -> None:
         """
-        Run DE with surrogate-assisted selection.
-
-        Returns:
-            Best configuration found
+        Initialize DE with surrogate-assisted selection.
         """
         self.log("=" * 70)
         self.log("Differential Evolution with Surrogate-Assisted Selection")
@@ -174,8 +187,17 @@ class DESurrogateHybrid(DifferentialEvolutionSearch):
         self.best_perf_history = [self.best.perf]
         self.generations_without_improvement = 0
 
+        self.set_generation(2)
+
+    def _autotune(self) -> Config:
+        """
+        Run DE with surrogate-assisted selection.
+
+        Returns:
+            Best configuration found
+        """
         # Evolution loop
-        for gen in range(2, self.max_generations + 1):
+        for gen in range(self._current_generation, self.max_generations + 1):
             self.set_generation(gen)
             self._evolve_generation(gen)
 
@@ -339,3 +361,31 @@ class DESurrogateHybrid(DifferentialEvolutionSearch):
             f"cr={self.crossover_rate}, "
             f"surrogate_threshold={self.surrogate_threshold})"
         )
+
+    def state_dict(self) -> dict[str, Any]:
+        """Return checkpoint state including DESurrogateHybrid-specific fields."""
+        state = super().state_dict()
+        state.update(
+            {
+                "surrogate_threshold": self.surrogate_threshold,
+                "candidate_ratio": self.candidate_ratio,
+                "refit_frequency": self.refit_frequency,
+                "n_estimators": self.n_estimators,
+                "all_observations": self.all_observations,
+            }
+        )
+        return state
+
+    def load_state_dict(self, state: dict[str, Any]) -> None:
+        """Restore DESurrogateHybrid-specific state."""
+        super().load_state_dict(state)
+
+        self.surrogate_threshold = state["surrogate_threshold"]
+        self.candidate_ratio = state["candidate_ratio"]
+        self.refit_frequency = state["refit_frequency"]
+        self.n_estimators = state["n_estimators"]
+        self.all_observations = state["all_observations"]
+
+        # Refit surrogate from loaded observations
+        if len(self.all_observations) >= self.surrogate_threshold:
+            self._fit_surrogate()

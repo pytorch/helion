@@ -183,6 +183,29 @@ Related settings for `from_best_available` (see {doc}`api/settings`):
 | `autotune_best_available_max_configs` | `HELION_BEST_AVAILABLE_MAX_CONFIGS` | 20 | Maximum cached configs to seed |
 | `autotune_best_available_max_cache_scan` | `HELION_BEST_AVAILABLE_MAX_CACHE_SCAN` | 500 | Maximum cache files to scan |
 
+### Checkpointing Long-Running Autotuning
+
+For very long autotuning sessions, you can save and resume state using
+checkpoints. This is useful when tuning might be interrupted (e.g., preemptible
+instances) or when you want to continue tuning from a previous unfinished run.
+
+Set the `HELION_AUTOTUNE_CHECKPOINT_DIR` environment variable to a directory
+path. The autotuner will periodically save checkpoints there, keyed by the
+kernel's stable hash. If interrupted, re-run with the same directory to resume
+automatically. On successful completion, the checkpoint file is cleaned up.
+
+```bash
+# Enable checkpointing to a directory:
+HELION_AUTOTUNE_CHECKPOINT_DIR=/tmp/helion_checkpoints python run_kernel.py
+
+# If interrupted, just re-run with the same directory to resume:
+HELION_AUTOTUNE_CHECKPOINT_DIR=/tmp/helion_checkpoints python run_kernel.py
+```
+
+Without `HELION_AUTOTUNE_CHECKPOINT_DIR`, no checkpoints are saved (opt-in).
+Multiple kernels can safely use the same directory — each kernel writes to a
+file named by its unique stable hash.
+
 ## Deploy a Single Config
 
 If one configuration wins for every production call, bake it into the decorator:

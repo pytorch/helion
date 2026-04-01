@@ -32,6 +32,13 @@ class FiniteSearch(BaseSearch):
         if len(self.configs) < 2:
             raise exc.NotEnoughConfigs(len(self.configs))
 
+    def _init_search(self) -> None:
+        """Initialize FiniteSearch state for a fresh run.
+
+        FiniteSearch has no state to initialize since it simply iterates
+        through the provided configs list.
+        """
+
     def _autotune(self) -> Config:
         best_config = None
         best_time = float("inf")
