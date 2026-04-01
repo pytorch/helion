@@ -1444,11 +1444,11 @@ class TestCase(unittest.TestCase):
 
         from torch._inductor.utils import fresh_cache
 
-        self._test_stack.enter_context(
-            fresh_cache(
-                delete=os.getenv("HELION_DELETE_CACHE_AFTER_TEST", "1") == "1",
-            )
-        )
+        # self._test_stack.enter_context(
+        #     fresh_cache(
+        #         delete=os.getenv("HELION_DELETE_CACHE_AFTER_TEST", "1") == "1",
+        #     )
+        # )
 
         counters.clear()
 
