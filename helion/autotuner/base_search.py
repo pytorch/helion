@@ -1063,7 +1063,12 @@ class BaseSearch(BaseAutotuner):
             # metadata are needed for execution.
             env_overrides = {"TRITON_LOCAL_BUILD": "1"}
             if "TRITON_STORE_BINARY_ONLY" not in os.environ:
-                env_overrides["TRITON_STORE_BINARY_ONLY"] = "1"
+                from .._compat import supports_mtia_tunables
+
+                # TRITON_STORE_BINARY_ONLY is incompatible with the MTIA
+                # Triton backend which raises KeyError("Unknown key: 'bin'").
+                if not supports_mtia_tunables():
+                    env_overrides["TRITON_STORE_BINARY_ONLY"] = "1"
             exit_stack.enter_context(patch.dict(os.environ, env_overrides, clear=False))
             assert self._precompile_tmpdir is None
             tempdir = tempfile.TemporaryDirectory()
