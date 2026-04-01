@@ -1456,6 +1456,7 @@ class TestLoops(RefEagerTestBase, TestCase):
         x = torch.randn(128, 1024, dtype=torch.float32, device=DEVICE)
         torch.testing.assert_close(fn(x), x)
 
+    @unittest.skipIf(torch.version.hip is None, "ROCm-specific barrier test")
     @skipIfCudaSharedMemoryLessThan(
         131072, reason="block sizes exceed device shared memory limit"
     )
@@ -1500,20 +1501,18 @@ class TestLoops(RefEagerTestBase, TestCase):
         )
 
         torch.testing.assert_close(result, expected, atol=0.15, rtol=0.01)
+        self.assertIn("tl.debug_barrier()", code)
 
-        if _compat.is_hip():
-            self.assertIn("tl.debug_barrier()", code)
-
-            # With num_warps=2, no barrier needed
-            code2, result2 = code_and_output(
-                two_phase_kernel,
-                (x, a, b),
-                block_sizes=[128, 128, 128, 128],
-                num_warps=2,
-                num_stages=2,
-            )
-            self.assertNotIn("tl.debug_barrier()", code2)
-            torch.testing.assert_close(result2, expected, atol=0.15, rtol=0.01)
+        # With num_warps=2, no barrier needed
+        code2, result2 = code_and_output(
+            two_phase_kernel,
+            (x, a, b),
+            block_sizes=[128, 128, 128, 128],
+            num_warps=2,
+            num_stages=2,
+        )
+        self.assertNotIn("tl.debug_barrier()", code2)
+        torch.testing.assert_close(result2, expected, atol=0.15, rtol=0.01)
 
 
 if __name__ == "__main__":
