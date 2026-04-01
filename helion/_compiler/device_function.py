@@ -325,13 +325,6 @@ class DeviceFunction:
         self.device_memory_op_index += 1
         return idx
 
-    def allocate_store_index(self) -> int:
-        """Bump store counters and return the indexing strategy slot."""
-        self.device_store_index += 1
-        idx = self.device_memory_op_index
-        self.device_memory_op_index += 1
-        return idx
-
     def get_indexing_strategy(self, index: int) -> IndexingStrategy:
         from .indexing_strategy import IndexingStrategy
         from .indexing_strategy import PointerIndexingStrategy
