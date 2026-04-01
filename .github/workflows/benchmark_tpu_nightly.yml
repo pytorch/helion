@@ -1,6 +1,9 @@
 name: Benchmark TPU Nightly
 
 on:
+  push:  # TODO: remove before merging — temporary trigger for CI testing
+    branches:
+      - yifeixu/tpu-nightly-benchmark
   schedule:
     - cron: '0 10 * * *'  # Runs at 2 AM PST (10 AM UTC)
   workflow_dispatch:
