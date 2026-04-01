@@ -65,7 +65,7 @@ jobs:
             --extra-index-url https://us-python.pkg.dev/ml-oss-artifacts-published/jax/simple/ \
             --find-links https://storage.googleapis.com/jax-releases/libtpu_releases.html \
             --pre \
-            'jax==0.9.1' 'jaxlib==0.9.1' 'libtpu==0.0.37' 'tpu-info==0.7.1' 'jaxtyping' 'frozendict'
+            'jax==0.9.2' 'jaxlib==0.9.2' 'libtpu==0.0.37' 'tpu-info==0.7.1' 'jaxtyping' 'frozendict'
           # Install Bazel
           if ! command -v bazel &> /dev/null; then
             sudo curl -L https://github.com/bazelbuild/bazelisk/releases/download/v1.27.0/bazelisk-linux-amd64 -o /usr/local/bin/bazel
@@ -73,21 +73,21 @@ jobs:
           fi
           # Install gcloud CLI if not present (needed for Secret Manager)
           if ! command -v gcloud &> /dev/null; then
-            sudo apt-get install -y apt-transport-https ca-certificates gnupg curl
+            sudo apt-get install -y apt-transport-https ca-certificates gpg curl
             curl https://packages.cloud.google.com/apt/doc/apt-key.gpg | sudo gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg
             echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt cloud-sdk main" | sudo tee /etc/apt/sources.list.d/google-cloud-sdk.list
             sudo apt-get update && sudo apt-get install -y google-cloud-cli
           fi
-          # Clone torch_tpu via GCP Secret Manager SSH key
+          # Clone torch_tpu via GCP Secret Manager SSH key (same as pytorch CI)
           TORCH_TPU_COMMIT=$(cat .github/ci_commit_pins/torch_tpu.txt)
           set +x
           gcloud secrets versions access latest \
-            --secret="torchtpu-readonly-key" \
+            --secret="torchtpu-read-key" \
             --project="ml-velocity-actions-testing" > /tmp/torch_tpu_ssh_key
           set -x
           chmod 600 /tmp/torch_tpu_ssh_key
           GIT_SSH_COMMAND="ssh -i /tmp/torch_tpu_ssh_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=no" \
-            git clone git@github.com:google-ml-infra/torch_tpu.git /tmp/torch_tpu
+            git clone git@github.com:google-pytorch/torch_tpu.git /tmp/torch_tpu
           rm -f /tmp/torch_tpu_ssh_key
           cd /tmp/torch_tpu
           git checkout "${TORCH_TPU_COMMIT}"
