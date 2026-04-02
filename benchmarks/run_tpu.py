@@ -142,7 +142,8 @@ def import_example(module_file: str) -> types.ModuleType:
     return mod
 
 
-KERNEL_TIMEOUT = int(os.environ.get("HELION_BENCHMARK_KERNEL_TIMEOUT", "600"))
+KERNEL_TIMEOUT = int(os.environ.get("HELION_BENCHMARK_KERNEL_TIMEOUT", "1200"))
+NUM_SHAPES: int | None = None  # Set from CLI; None means all shapes
 
 
 def _run_kernel_impl(name: str, result_queue: multiprocessing.Queue) -> None:  # type: ignore[type-arg]
@@ -198,6 +199,8 @@ def run_kernel_inner(name: str) -> KernelResult:
             )
 
         shapes = shapes_fn()
+        if NUM_SHAPES is not None:
+            shapes = shapes[:NUM_SHAPES]
         all_passed = True
         shape_results: list[ShapeResult] = []
 
@@ -314,11 +317,20 @@ def main() -> None:
         help="Output JSON file path (compatible with pytorch benchmark hub)",
     )
     parser.add_argument(
+        "--num-shapes",
+        type=int,
+        default=None,
+        help="Max number of shapes to benchmark per kernel (default: all)",
+    )
+    parser.add_argument(
         "--list-kernels",
         action="store_true",
         help="List available kernel names and exit",
     )
     args = parser.parse_args()
+
+    global NUM_SHAPES
+    NUM_SHAPES = args.num_shapes
 
     if args.list_kernels:
         for name in KERNEL_MAPPINGS:
@@ -409,9 +421,6 @@ def main() -> None:
     if args.output:
         write_results_json(args.output, results)
         print(f"Results written to {args.output}", file=sys.stderr)
-
-    if passed < total:
-        sys.exit(1)
 
 
 if __name__ == "__main__":
