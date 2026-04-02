@@ -25,9 +25,9 @@ from dataclasses import field
 import functools
 import importlib.util
 import json
-import multiprocessing
 import os
 from pathlib import Path
+import signal
 import sys
 import time
 from typing import TYPE_CHECKING
@@ -146,33 +146,35 @@ KERNEL_TIMEOUT = int(os.environ.get("HELION_BENCHMARK_KERNEL_TIMEOUT", "1200"))
 NUM_SHAPES: int | None = None  # Set from CLI; None means all shapes
 
 
-def _run_kernel_impl(name: str, result_queue: multiprocessing.Queue) -> None:  # type: ignore[type-arg]
-    """Run a single kernel in a subprocess (target for multiprocessing)."""
-    try:
-        result_queue.put(run_kernel_inner(name))
-    except Exception as e:
-        result_queue.put(KernelResult(name=name, passed=False, error=str(e)))
+class _KernelTimeout(Exception):
+    """Raised by SIGALRM when a kernel exceeds its timeout."""
+
+
+def _alarm_handler(signum: int, frame: object) -> None:
+    raise _KernelTimeout
 
 
 def run_kernel(name: str) -> KernelResult:
-    """Run a single kernel benchmark with a timeout."""
-    queue: multiprocessing.Queue = multiprocessing.Queue()  # type: ignore[type-arg]
-    proc = multiprocessing.Process(target=_run_kernel_impl, args=(name, queue))
-    proc.start()
-    proc.join(timeout=KERNEL_TIMEOUT)
-    if proc.is_alive():
-        proc.kill()
-        proc.join()
+    """Run a single kernel benchmark with a signal-based timeout.
+
+    Uses SIGALRM instead of multiprocessing to avoid fork-after-TPU-init
+    deadlocks on Linux.
+    """
+    old_handler = signal.signal(signal.SIGALRM, _alarm_handler)
+    signal.alarm(KERNEL_TIMEOUT)
+    try:
+        return run_kernel_inner(name)
+    except _KernelTimeout:
         return KernelResult(
             name=name,
             passed=False,
             error=f"Timed out after {KERNEL_TIMEOUT}s",
         )
-    if not queue.empty():
-        return queue.get()
-    return KernelResult(
-        name=name, passed=False, error="Kernel process exited unexpectedly"
-    )
+    except Exception as e:
+        return KernelResult(name=name, passed=False, error=str(e))
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, old_handler)
 
 
 def run_kernel_inner(name: str) -> KernelResult:
