@@ -25,6 +25,7 @@ from dataclasses import field
 import functools
 import importlib.util
 import json
+import multiprocessing
 import os
 from pathlib import Path
 import sys
@@ -141,7 +142,39 @@ def import_example(module_file: str) -> types.ModuleType:
     return mod
 
 
+KERNEL_TIMEOUT = int(os.environ.get("HELION_BENCHMARK_KERNEL_TIMEOUT", "600"))
+
+
+def _run_kernel_impl(name: str, result_queue: multiprocessing.Queue) -> None:  # type: ignore[type-arg]
+    """Run a single kernel in a subprocess (target for multiprocessing)."""
+    try:
+        result_queue.put(run_kernel_inner(name))
+    except Exception as e:
+        result_queue.put(KernelResult(name=name, passed=False, error=str(e)))
+
+
 def run_kernel(name: str) -> KernelResult:
+    """Run a single kernel benchmark with a timeout."""
+    queue: multiprocessing.Queue = multiprocessing.Queue()  # type: ignore[type-arg]
+    proc = multiprocessing.Process(target=_run_kernel_impl, args=(name, queue))
+    proc.start()
+    proc.join(timeout=KERNEL_TIMEOUT)
+    if proc.is_alive():
+        proc.kill()
+        proc.join()
+        return KernelResult(
+            name=name,
+            passed=False,
+            error=f"Timed out after {KERNEL_TIMEOUT}s",
+        )
+    if not queue.empty():
+        return queue.get()
+    return KernelResult(
+        name=name, passed=False, error="Kernel process exited unexpectedly"
+    )
+
+
+def run_kernel_inner(name: str) -> KernelResult:
     """Run a single kernel benchmark: accuracy check + timing vs baseline."""
     if name not in KERNEL_MAPPINGS:
         return KernelResult(name=name, passed=False, error=f"Unknown kernel: {name}")
