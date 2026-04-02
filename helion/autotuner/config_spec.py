@@ -209,6 +209,12 @@ class ConfigSpec:
                 "persistent_interleaved",
             ):
                 return False
+            # Epilogue subtiling is incompatible with flatten_loops because
+            # FlattenedTileStrategy does not support offset_var needed by
+            # the epilogue store codegen path.
+            flatten_loops = config.get("flatten_loops")
+            if isinstance(flatten_loops, list) and any(flatten_loops):
+                return False
             return self._uses_tensor_descriptor_indexing(config.get("indexing"))
         return False
 
