@@ -308,9 +308,7 @@ class TestControlFlow(RefEagerTestBase, TestCase):
             rtol=1e-4,
         )
 
-    @skipIfPallas(
-        "Pallas lowering fails on getitem for host-bool-gated static_range if branches"
-    )
+
     def test_if_new_variable_in_static_range(self):
         """Test that variables defined inside if/else within static_range work correctly.
 

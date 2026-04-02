@@ -323,21 +323,24 @@ class ReductionLoopGraphInfo(ForLoopGraphInfo):
 @dataclasses.dataclass
 class IfGraphInfo(NodeArgsGraphInfo):
     predicate_is_tensor: bool = False
-    if_branch: IfGraphInfo | None = None
-    arg_names: list[str] | None = None
-    output_names: list[str] | None = None
+    else_branch: ElseGraphInfo | None = None
+
+    # subset of the outputs in the if-branche that is also output by else-branch
+    if_output_indices: list[int] | None = None
+    # subset of the outputs in the else-branche that is also output by if-branch
+    else_output_indices: list[int] | None = None
 
     @property
     def name(self) -> str:
-        return f"if_else_graph_{self.graph_id}"
+        return f"if_graph_{self.graph_id}"
 
     def kwargs(self) -> dict[str, object]:
         return {
             **super().kwargs(),
             "predicate_is_tensor": self.predicate_is_tensor,
-            "if_branch": self.if_branch,
-            "arg_names": self.arg_names,
-            "output_names": self.output_names,
+            "else_branch": self.else_branch,
+            "if_output_indices": self.if_output_indices,
+            "else_output_indices": self.else_output_indices,
         }
 
     def codegen(self, state: CodegenState) -> list[object]:
@@ -347,21 +350,40 @@ class IfGraphInfo(NodeArgsGraphInfo):
         assert isinstance(args, list)
         assert all(isinstance(x, ast.AST) for x in args)
         assert isinstance(state.codegen, GenerateAST)
-        if_branch = self.if_branch
-        if if_branch is not None and if_branch.graph_id in state.codegen.if_ast_nodes:
-            # This is an else-branch: attach to the if-branch's ast.If orelse
-            if_ast = state.codegen.if_ast_nodes[if_branch.graph_id]
-            stmts: list[ast.AST] = []
-            if_ast.orelse = stmts  # pyrefly: ignore[bad-assignment]
-        else:
-            # This is an if-branch (or standalone): create a new ast.If
-            test = state.ast_arg(0)
-            if_ast_node = create(ast.If, test=test, body=(stmts := []), orelse=[])
-            state.add_statement(if_ast_node)
-            state.codegen.if_ast_nodes[self.graph_id] = if_ast_node
-        with state.codegen.set_statements(stmts):
-            return codegen_call_with_graph(state.codegen, self.graph, args)
 
+
+        test = state.ast_arg(0)
+        body_stmts: list[ast.AST] = []
+        orelse_stmts: list[ast.AST] = []
+        if_ast_node = create(ast.If, test=test, body=body_stmts, orelse=orelse_stmts)
+        state.add_statement(if_ast_node)
+
+        with state.codegen.set_statements(body_stmts):
+            if_outputs = codegen_call_with_graph(state.codegen, self.graph, args)
+
+        if self.else_branch is not None:
+            else_graph = state.get_graph(self.else_branch)
+            assert isinstance(else_graph, ElseGraphInfo)
+            with state.codegen.set_statements(orelse_stmts):
+                else_outputs = codegen_call_with_graph(state.codegen, else_graph.graph, args)
+
+        if len(body_stmts) == 0:
+            body_stmts.append(ast.Pass())
+        if len(orelse_stmts) == 0:
+            orelse_stmts.append(ast.Pass())
+        return if_outputs + else_outputs
+
+@dataclasses.dataclass
+class ElseGraphInfo(NodeArgsGraphInfo):
+
+    @property
+    def name(self) -> str:
+        return f"else_graph_{self.graph_id}"
+
+    def codegen(self, state: CodegenState) -> list[object]:
+        raise exc.InternalError(
+            RuntimeError("ElseGraphInfo should not be codegenned directly")
+        )
 
 @dataclasses.dataclass
 class WhileConditionGraphInfo(NodeArgsGraphInfo):
@@ -1199,72 +1221,55 @@ class WalkDeviceAST(NodeVisitor):
             if body:
                 self._body(body)
             return
-        if_graph_id = self._create_if_subgraph(test_proxy, node.body)
-        if node.orelse:
-            self._create_if_subgraph(
-                _tracing_ops._not(test_proxy),
-                node.orelse,
-                orig_predicate=test_proxy,
-                if_branch_graph_id=if_graph_id,
-            )
+        self._create_if_subgraph(test_proxy, node.body, node.orelse)
+
 
     def _create_if_subgraph(
         self,
         test_proxy: object,
         body: list[ast.stmt],
-        orig_predicate: object | None = None,
-        if_branch_graph_id: int | None = None,
+        orelse: list[ast.stmt],
     ) -> int:
         # Track whether the predicate is tensor-derived (vs truly scalar).
-        # Must check orig_predicate when provided because _not() converts
-        # tensors to SymBool before this method sees the else-branch predicate.
-        predicate_is_tensor = isinstance(
-            orig_predicate if orig_predicate is not None else test_proxy,
-            torch.Tensor,
-        )
-        rw: ReadWrites = ReadWrites.from_list(body)
-        inputs = self._lift_inputs(self._rw_names(rw))
+        predicate_is_tensor = isinstance(test_proxy, torch.Tensor)
+
+        if_branch_rw: ReadWrites = ReadWrites.from_list(body)
+        else_branch_rw: ReadWrites = ReadWrites.from_list(orelse)
+
+        if_branch_inputs = self._lift_inputs(self._rw_names(if_branch_rw))
+        else_branch_inputs = self._lift_inputs(self._rw_names(else_branch_rw))
 
         def build_body(
             subgraph_walker: WalkDeviceAST,
+            stmts: list[ast.stmt],
+            rw: ReadWrites,
         ) -> tuple[list[object], LiftTensorArgs]:
-            subgraph_walker._body(body)
+            subgraph_walker._body(stmts)
             outputs_local = self._collect_outputs(
                 subgraph_walker.scope, rw.writes, include_new=True
             )
             return outputs_local.get_tensor_args(), outputs_local
 
-        if_branch: IfGraphInfo | None = None
-        if if_branch_graph_id is not None:
-            graph_info = self.device_ir.graphs[if_branch_graph_id]
-            assert isinstance(graph_info, IfGraphInfo)
-            if_branch = graph_info
+        else_graph_idx, else_outputs = self._trace_graph(
+            else_branch_inputs,
+            functools.partial(build_body, stmts=orelse, rw=else_branch_rw),
+            graph_info_cls=ElseGraphInfo,
+        )        
 
-        graph_idx, outputs = self._trace_graph(
-            inputs,
-            build_body,
+        if_graph_idx, if_outputs = self._trace_graph(
+            if_branch_inputs,
+            functools.partial(build_body, stmts=body, rw=if_branch_rw),
             graph_info_cls=IfGraphInfo,
             predicate_is_tensor=predicate_is_tensor,
-            if_branch=if_branch,
+            else_branch = else_graph_idx,
         )
-
-        input_tensor_arg_values = inputs.get_tensor_args()
-
-        if_branch = cast("IfGraphInfo", self.device_ir.graphs[graph_idx])
-
-        def is_tensor_arg_value(v: object) -> bool:
-            return any(v is t for t in input_tensor_arg_values)
-
-        input_tensor_node_names = [
-            k for k, v in inputs.values.items() if is_tensor_arg_value(v)
-        ]
-        if_branch.arg_names = input_tensor_node_names
-        if_branch.output_names = list(outputs.values)
+        if_graph = cast("IfGraphInfo", self.device_ir.graphs[if_graph_idx])
 
         args = (
             test_proxy,
-            graph_idx,
-            input_tensor_arg_values,
+            if_graph_idx,
+            if_branch_inputs.get_tensor_args(),
+            else_branch_inputs.get_tensor_args()
         )
         mode = proxy_tensor.get_proxy_mode()
         assert isinstance(mode, proxy_tensor.ProxyTorchDispatchMode)
@@ -1276,22 +1281,30 @@ class WalkDeviceAST(NodeVisitor):
             *args_to_proxies(tracer, args),
         )
         proxy_tensor.track_tensor_tree(
-            outputs.get_tensor_args(),
+            if_outputs.get_tensor_args() + else_outputs.get_tensor_args(),
             proxy_out,
             constant=None,
             tracer=tracer,
         )
-        for name, value in outputs.unflatten().items():
-            if name in self.scope:
-                try:
-                    self.scope[name] = _tracing_ops._phi(self.scope[name], value)
-                except Exception as e:
-                    raise exc.CantCombineTypesInControlFlow(
-                        name, self.scope[name], value
-                    ) from e
-            else:
-                self.scope[name] = value
-        return graph_idx
+
+        if_output_values = if_outputs.unflatten()
+        else_output_values = else_outputs.unflatten()
+        common_output_names = [n for n in if_output_values if n in else_output_values]
+        for name in common_output_names:
+            if_value = if_output_values[name]
+            else_value = else_output_values[name]
+            try:
+                self.scope[name] = _tracing_ops._phi(if_value, else_value)
+                pass
+            except Exception as e:
+                raise exc.CantCombineTypesInControlFlow(
+                    name, if_value, else_value
+                ) from e
+        
+        if_graph.if_output_indices = [i for i,name in enumerate(if_outputs.unflatten()) if name in common_output_names]
+        if_graph.else_output_indices = [i for i,name in enumerate(else_outputs.unflatten()) if name in common_output_names]
+
+        return if_graph_idx
 
     def visit_Name(self, node: ast.Name) -> object:
         if node.id in self.scope:
