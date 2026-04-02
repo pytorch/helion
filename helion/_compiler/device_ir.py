@@ -334,6 +334,7 @@ class IfGraphInfo(NodeArgsGraphInfo):
     # where each output is represented either as an index into the graph output,
     # or as a name of a non-local variable that is written to
     branches_outputs: list[tuple[int | str, ...]] | None = None
+    has_inplace_writes: bool | None = False
 
     @property
     def name(self) -> str:
@@ -347,6 +348,7 @@ class IfGraphInfo(NodeArgsGraphInfo):
             "if_arg_names": self.if_arg_names,
             "else_arg_names": self.else_arg_names,
             "branches_outputs": self.branches_outputs,
+            "has_inplace_writes": self.has_inplace_writes,
         }
 
     def codegen(self, state: CodegenState) -> list[object]:
@@ -1356,6 +1358,11 @@ class WalkDeviceAST(NodeVisitor):
                 )
                 else_output_index = get_output_idx(name, else_output_values)
                 if_graph.branches_outputs.append((else_output_index, name))
+
+        if_graph.has_inplace_writes = (
+            len(if_branch_rw.inplace_writes) > 0
+            or len(else_branch_rw.inplace_writes) > 0
+        )
 
         return if_graph_idx
 

@@ -1196,14 +1196,18 @@ def _(state: CodegenState) -> list[object]:
 
     assert isinstance(state.codegen, GenerateAST)
 
+    use_where_instead_of_cond = False
     if graph_info.predicate_is_tensor:
-        raise BackendUnsupported(
-            "pallas",
-            "if-statements with tensor-derived predicates. "
-            "lax.cond requires a scalar predicate, but tensor loads produce "
-            "vectors on TPU due to hardware tiling constraints. "
-            "Use a scalar kernel argument for the condition instead.",
-        )
+        if graph_info.has_inplace_writes:
+            raise BackendUnsupported(
+                "pallas",
+                "if-statements with tensor-derived predicates and branches has in-place tensor writes. "
+                "lax.cond requires a scalar predicate, but tensor loads produce "
+                "vectors on TPU due to hardware tiling constraints. "
+                "Use a scalar kernel argument for the condition instead,"
+                "or remove inplace tensor writes in the branches.",
+            )
+        use_where_instead_of_cond = True
 
     if_body_stmts: list[ast.AST] = []
     with state.codegen.set_statements(if_body_stmts):
@@ -1275,15 +1279,21 @@ def _(state: CodegenState) -> list[object]:
     state.add_statement(if_fn_def)
     state.add_statement(else_fn_def)
 
-    if (
-        if_return_names
-    ):  # can also use else_return_names, they will by phi-ed so they will be the same
-        state.add_statement(
-            statement_from_string(
-                f"{if_return_names_str} = lax.cond({{test}}, {if_fn_name}, {else_fn_name})",
-                test=test,
+    if if_return_names:  # can also use else_return_names, they will by phi-ed so they will have the same name
+        if use_where_instead_of_cond:
+            state.add_statement(
+                statement_from_string(
+                    f"{if_return_names_str} = jnp.where({{test}}, {if_fn_name}(), {else_fn_name}())",
+                    test=test,
+                )
             )
-        )
+        else:
+            state.add_statement(
+                statement_from_string(
+                    f"{if_return_names_str} = lax.cond({{test}}, {if_fn_name}, {else_fn_name})",
+                    test=test,
+                )
+            )
     else:
         state.add_statement(
             statement_from_string(

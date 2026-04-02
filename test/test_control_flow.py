@@ -98,6 +98,30 @@ class TestControlFlow(RefEagerTestBase, TestCase):
         )
         torch.testing.assert_close(result, expected)
 
+    def test_if_arg_indexed_scalar_no_write_in_branch(self):
+        @helion.kernel
+        def fn(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            output = torch.zeros_like(x)
+
+            for idx in hl.grid(x.shape[0]):
+                # Since `y[idx]` is a scalar, comparing it against 0 will also create a scalar.
+                if y[idx] != 0:
+                    tmp = x[idx] * 2
+                else:
+                    tmp = x[idx]
+                output[idx] = tmp
+
+            return output
+
+        x = torch.tensor([1.0, 2.0, 3.0, 4.0], device=DEVICE)
+        y = torch.tensor([0, 1, 0, 1], device=DEVICE, dtype=torch.int32)
+        expected = torch.tensor([1.0, 4.0, 3.0, 8.0], device=DEVICE)
+        code, result = code_and_output(
+            fn,
+            (x, y),
+        )
+        torch.testing.assert_close(result, expected)
+
     @skipIfPallas("requires per-element tiling unavailable for small 1D tensors on TPU")
     @skipIfRefEager(
         "Test is block size dependent which is not supported in ref eager mode"
