@@ -502,6 +502,55 @@ class TestPallas(TestCase):
         ).to(device=DEVICE)
         torch.testing.assert_close(result, ref, rtol=1e-2, atol=1e-2)
 
+    @skipUnlessPallas
+    @unittest.expectedFailure
+    def test_dynamic_shapes_alignment(self) -> None:
+        """Block size alignment must hold for runtime shapes, not just hints.
+
+        When static_shapes=False, the compile-time size_hint may be
+        smaller than the actual runtime dimension.  If the block size
+        minimum is capped to min(alignment, p2(hint)), the autotuner
+        may pick a block size that isn't lane-aligned for the larger
+        runtime dim.  For example, with a 2D tensor and hint=32 for
+        the last dim (lane position), the cap gives
+        min(128, p2(32))=32, so block_size=32 is allowed.  But at
+        runtime with last dim=256, each 32-element tile violates the
+        128-lane alignment requirement.
+
+        This test compiles with a tensor whose last dim is 32 (small
+        hint) then calls with last dim=256 (needs lane alignment).
+        """
+
+        @helion.kernel(backend="pallas", static_shapes=False)
+        def add_2d_dynamic(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile_m, tile_n in hl.tile(out.size()):
+                out[tile_m, tile_n] = x[tile_m, tile_n] + y[tile_m, tile_n]
+            return out
+
+        # Compile with small last dim (hint=32 for lane position).
+        # block_sizes=[8, 32]: the lane-dim block of 32 passes the
+        # capped check min(128, p2(32))=32 but is NOT a multiple of
+        # 128.
+        small = (
+            torch.randn(8, 32, device=DEVICE),
+            torch.randn(8, 32, device=DEVICE),
+        )
+        _code, result_small = code_and_output(
+            add_2d_dynamic, small, block_sizes=[8, 32]
+        )
+        torch.testing.assert_close(result_small, small[0] + small[1])
+
+        # Now call with a larger last dim — the compiled kernel's
+        # block_size=32 on the lane dim is not a multiple of 128,
+        # so Pallas should reject it (or produce wrong results).
+        large = (
+            torch.randn(8, 256, device=DEVICE),
+            torch.randn(8, 256, device=DEVICE),
+        )
+        result_large = add_2d_dynamic(*large)
+        torch.testing.assert_close(result_large, large[0] + large[1])
+
 
 if __name__ == "__main__":
     unittest.main()
