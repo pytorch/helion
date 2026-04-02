@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 from typing import TYPE_CHECKING
 from typing import TypeVar
+from typing import cast
 
 import sympy
 import torch
@@ -1150,7 +1151,13 @@ def _(state: CodegenState) -> None:
 
 @has_side_effect
 @_decorators.api()
-def _if(test: object, graph_id: int, args: list[object]) -> list[object]:
+def _if(
+    test: object,
+    if_graph_id: int,
+    else_graph_id: int,
+    if_args: list[object],
+    else_args: list[object],
+) -> list[object]:
     """`for` loops are mapped to this op since FX does not support control flow."""
     raise AssertionError("this should never be called")
 
@@ -1170,6 +1177,7 @@ def _(state: CodegenState) -> list[object]:
     because TPU block shapes make them vectors at runtime.
     """
     from .._compiler.ast_extension import statement_from_string
+    from .._compiler.device_ir import ElseGraphInfo
     from .._compiler.device_ir import IfGraphInfo
     from .._compiler.inductor_lowering import codegen_call_with_graph
 
@@ -1177,9 +1185,12 @@ def _(state: CodegenState) -> list[object]:
     assert isinstance(graph_info, IfGraphInfo)
 
     test = state.ast_arg(0)
-    args = state.ast_args[2]
-    assert isinstance(args, list)
-    assert all(isinstance(x, ast.AST) for x in args)
+    if_args = state.ast_args[3]
+    else_args = state.ast_args[4]
+    assert isinstance(if_args, list)
+    assert isinstance(else_args, list)
+    assert all(isinstance(x, ast.AST) for x in if_args)
+    assert all(isinstance(x, ast.AST) for x in else_args)
 
     from .._compiler.generate_ast import GenerateAST
 
@@ -1194,80 +1205,95 @@ def _(state: CodegenState) -> list[object]:
             "Use a scalar kernel argument for the condition instead.",
         )
 
-    branch_fn_name = state.device_function.new_var("_cond_branch")
-
-    body_stmts: list[ast.AST] = []
-    with state.codegen.set_statements(body_stmts):
-        branch_outputs = codegen_call_with_graph(
-            state.codegen, graph_info.graph, [*args]
+    if_body_stmts: list[ast.AST] = []
+    with state.codegen.set_statements(if_body_stmts):
+        if_outputs = codegen_call_with_graph(
+            state.codegen, graph_info.graph, [*if_args]
         )
 
-    assert graph_info.arg_names is not None
-    assert graph_info.output_names is not None
+    assert graph_info.else_branch is not None
+    else_graph = state.get_graph(graph_info.else_branch)
+    assert isinstance(else_graph, ElseGraphInfo)
+    else_body_stmts: list[ast.AST] = []
+    with state.codegen.set_statements(else_body_stmts):
+        else_outputs = codegen_call_with_graph(
+            state.codegen, else_graph.graph, [*else_args]
+        )
+
+    assert graph_info.if_arg_names is not None
+    assert graph_info.else_arg_names is not None
+    assert graph_info.branches_outputs is not None
+
     arg_node_name_to_ast_name = {
-        graph_info.arg_names[i]: args[i] for i in range(len(args))
-    }
-    written_arg_ast_names = [
-        arg_node_name_to_ast_name[name]
-        for name in graph_info.output_names
-        if name in arg_node_name_to_ast_name
+        graph_info.if_arg_names[i]: if_args[i].id for i in range(len(if_args))
+    } | {graph_info.else_arg_names[i]: else_args[i].id for i in range(len(else_args))}
+
+    if_return_names = [
+        cast("ast.Name", if_outputs[o]).id
+        if isinstance(o, int)
+        else arg_node_name_to_ast_name[o]
+        for (o, _) in graph_info.branches_outputs
+    ]
+    else_return_names = [
+        cast("ast.Name", else_outputs[o]).id
+        if isinstance(o, int)
+        else arg_node_name_to_ast_name[o]
+        for (_, o) in graph_info.branches_outputs
     ]
 
-    if len(written_arg_ast_names) > 0:
-        # The side effects of the branch includes writing to some of the input args. e.g.:
-        #   delta = torch.zeros_like(x[tile])
-        #   if 3 < v < 7:
-        #       delta += 1.0
-        #       out[tile] = torch.sigmoid(x[tile])
-        #   out[tile] = out[tile] + delta
-        # For this situation, we need to return the written args as a return value,
-        # and assign the return value to the original args after the lax.cond call. e.g.:
-        #   cond = 3 < v < 7
-        #   def _cond_branch(delta=delta):
-        #       delta = delta + 1.0
-        #       out[:, :] = ...
-        #       return delta
-        #   def _else_noop(delta=delta):
-        #       return delta
-        #   delta = lax.cond(cond, _cond_branch, _else_noop)
-        #   out[tile] = out[tile] + delta
-        # We need this arg-return pattern because JAX doesn't allow `nonlocal`
-        arg_list_with_defaults = ", ".join(f"{n.id}={n.id}" for n in args)
-        output_list = ", ".join(n.id for n in written_arg_ast_names)
+    if_arg_ids = {arg.id for arg in if_args}
+    union_args = if_args + [a for a in else_args if a.id not in if_arg_ids]
+    arg_list_with_defaults = ", ".join(f"{n.id}={n.id}" for n in union_args)
 
-        body_stmts.append(statement_from_string(f"return {output_list}"))
-        fn_def = statement_from_string(
-            f"def {branch_fn_name}({arg_list_with_defaults}): pass"
-        )
-        assert isinstance(fn_def, ast.FunctionDef)
-        fn_def.body = body_stmts or [ast.Pass()]  # pyrefly: ignore[bad-assignment]
+    if if_return_names:
+        if_return_names_str = ", ".join(if_return_names)
+        if_return_stmt = statement_from_string(f"return {if_return_names_str}")
+        if_body_stmts.append(if_return_stmt)
 
-        else_noop_fn_name = state.device_function.new_var("_else_noop")
-        else_noop_fn_def = statement_from_string(
-            f"def {else_noop_fn_name}({arg_list_with_defaults}): return {output_list}"
-        )
-        state.add_statement(fn_def)
-        state.add_statement(else_noop_fn_def)
+    if else_return_names:
+        else_return_names_str = ", ".join(else_return_names)
+        else_return_stmt = statement_from_string(f"return {else_return_names_str}")
+        else_body_stmts.append(else_return_stmt)
 
+    if_fn_name = state.device_function.new_var("_if_branch")
+    else_fn_name = state.device_function.new_var("_else_branch")
+
+    if_fn_def = statement_from_string(
+        f"def {if_fn_name}({arg_list_with_defaults}): pass"
+    )
+    assert isinstance(if_fn_def, ast.FunctionDef)
+    if_fn_def.body = if_body_stmts or [ast.Pass()]  # pyrefly: ignore[bad-assignment]
+
+    else_fn_def = statement_from_string(
+        f"def {else_fn_name}({arg_list_with_defaults}): pass"
+    )
+    assert isinstance(else_fn_def, ast.FunctionDef)
+    else_fn_def.body = else_body_stmts or [  # pyrefly: ignore[bad-assignment]
+        ast.Pass()
+    ]
+
+    state.add_statement(if_fn_def)
+    state.add_statement(else_fn_def)
+
+    if (
+        if_return_names
+    ):  # can also use else_return_names, they will by phi-ed so they will be the same
         state.add_statement(
             statement_from_string(
-                f"{output_list} = lax.cond({{test}}, {branch_fn_name}, {else_noop_fn_name})",
+                f"{if_return_names_str} = lax.cond({{test}}, {if_fn_name}, {else_fn_name})",
                 test=test,
             )
         )
     else:
-        fn_def = statement_from_string(f"def {branch_fn_name}(): pass")
-        assert isinstance(fn_def, ast.FunctionDef)
-        fn_def.body = body_stmts or [ast.Pass()]  # pyrefly: ignore[bad-assignment]
-        state.add_statement(fn_def)
-
         state.add_statement(
             statement_from_string(
-                f"lax.cond({{test}}, {branch_fn_name}, lambda: None)",
-                test=test,
+                f"lax.cond({{test}}, {if_fn_name}, {else_fn_name})", test=test
             )
         )
-    return branch_outputs
+
+    return [expr_from_string(n) for n in if_return_names] + [
+        expr_from_string(n) for n in else_return_names
+    ]
 
 
 # Note we can't DCE phi nodes because there may be a loop carry dependency not captured in the outer graph
