@@ -18,6 +18,7 @@ from .._compat import num_compute_units
 from .._compat import supports_amd_cdna_tunables
 from .._compat import supports_maxnreg
 from .._compat import supports_tensor_descriptor
+from .._compat import warps_to_threads
 from ..exc import InvalidConfig
 from .block_id_sequence import BlockIdSequence
 from .block_id_sequence import _BlockIdItem
@@ -512,13 +513,14 @@ class ConfigSpec:
             else:
                 config["maxnreg"] = VALID_MAXNREG[0]
 
-            # Cap maxnreg so that maxnreg * num_warps * 32 doesn't exceed the
-            # register file.  On sm100+ ptxas honours .maxnreg over .reqntid,
-            # so an uncapped value causes "out of resource: threads" at load.
+            # Cap maxnreg so that maxnreg * threads_per_block doesn't exceed
+            # the register file.  On sm100+ ptxas honours .maxnreg over
+            # .reqntid, so an uncapped value causes "out of resource: threads"
+            # at load.
             maxnreg = cast("int | None", config.get("maxnreg"))
             num_warps = config.get("num_warps", DEFAULT_NUM_WARPS)
             if maxnreg is not None and isinstance(num_warps, int):
-                limit = _regs_per_block() // (num_warps * 32)
+                limit = _regs_per_block() // warps_to_threads(num_warps)
                 if maxnreg > limit:
                     if _fix_invalid:
                         valid = [
