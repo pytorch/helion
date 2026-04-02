@@ -56,6 +56,7 @@ from .logger import match_unrecoverable_runtime_error
 from .logger import maybe_dump_triton_failure
 from .metrics import AutotuneMetrics
 from .metrics import _run_post_autotune_hooks
+from .precompile_future import PrecompileContext
 from .precompile_future import PrecompileFuture as PrecompileFuture
 from .precompile_future import _ExtractedLaunchArgs
 from .progress_bar import iter_with_progress
@@ -329,7 +330,7 @@ class BaseSearch(BaseAutotuner):
     _baseline_output: object
     _mutated_arg_indices: Sequence[int] = []
     _baseline_post_args: Sequence[object] | None
-    _jobs: int
+    _jobs: int = 1
     _precompile_result_counter: count[int]
     _effective_atol: float
     _effective_rtol: float
@@ -860,6 +861,16 @@ class BaseSearch(BaseAutotuner):
             f"bounds=[{min_seconds}s, {original_timeout}s])"
         )
 
+    def _precompile_context(self) -> PrecompileContext:
+        """Build the narrow context that PrecompileFuture needs."""
+        return PrecompileContext(
+            settings=self.settings,
+            log=self.log,
+            kernel=self.kernel,
+            args=self.args,
+            jobs=self._jobs,
+        )
+
     def create_precompile_future(
         self, config: Config, fn: CompiledConfig
     ) -> PrecompileFuture:
@@ -876,8 +887,9 @@ class BaseSearch(BaseAutotuner):
             A ``PrecompileFuture`` that resolves to True on success or False on
             failure/timeout when called.
         """
+        ctx = self._precompile_context()
         if not self.settings.autotune_precompile:
-            return PrecompileFuture.skip(self, config, True)
+            return PrecompileFuture.skip(ctx, config, True)
         mode = self.settings.autotune_precompile
         if mode not in {"fork", "spawn"}:
             raise exc.InvalidAPIUsage("autotune_precompile must be 'fork' or 'spawn'")
@@ -891,7 +903,7 @@ class BaseSearch(BaseAutotuner):
             args = self.args
 
         return PrecompileFuture.create(
-            search=self,
+            ctx=ctx,
             config=config,
             fn=fn,
             args=args,

@@ -1091,7 +1091,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
                         "create_precompile_future",
                         side_effect=lambda config, fn: (
                             base_search_module.PrecompileFuture.skip(
-                                search, config, True
+                                search._precompile_context(), config, True
                             )
                         ),
                     )
@@ -1173,7 +1173,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
                         "create_precompile_future",
                         side_effect=lambda config, fn: (
                             base_search_module.PrecompileFuture.skip(
-                                search, config, True
+                                search._precompile_context(), config, True
                             )
                         ),
                     )
@@ -1298,7 +1298,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
                 search,
                 "create_precompile_future",
                 side_effect=lambda config, fn: base_search_module.PrecompileFuture.skip(
-                    search, config, True
+                    search._precompile_context(), config, True
                 ),
             ):
                 # Bad config should be filtered out by accuracy check
@@ -2026,7 +2026,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
                 search,
                 "create_precompile_future",
                 side_effect=lambda config, fn: base_search_module.PrecompileFuture.skip(
-                    search, config, True
+                    search._precompile_context(), config, True
                 ),
             ):
                 # bad_config has a few large diffs — custom check should accept it
