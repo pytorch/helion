@@ -11,6 +11,7 @@ from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
 from helion._testing import skipUnlessPallas
+from helion._testing import xfailIfPallasInterpret
 import helion.language as hl
 
 
@@ -480,6 +481,9 @@ class TestPallas(TestCase):
         ).to(device=DEVICE)
         torch.testing.assert_close(result, ref, rtol=1e-2, atol=1e-2)
 
+    @xfailIfPallasInterpret(
+        "JAX interpret mode cannot discharge dynamic_slice with traced sizes",
+    )
     def test_attention_emit_pipeline_non_divisible(self) -> None:
         """Test emit_pipeline with seq_kv not divisible by block_k.
 

@@ -32,6 +32,7 @@ from helion._testing import skipIfTileIR
 from helion._testing import skipIfXPU
 from helion._testing import xfailIfCute
 from helion._testing import xfailIfPallas
+from helion._testing import xfailIfPallasTpu
 
 _orig_matmul_fp32_precision: str = "none"
 _orig_cudnn_fp32_precision: str = "none"
@@ -1372,7 +1373,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             num_stages=3,
         )
 
-    @xfailIfPallas("operation not supported on TPU")
+    @xfailIfPallasTpu("operation not supported on TPU")
     def test_kl_div(self):
         if _get_backend() == "cute" and "B200" in get_nvidia_gpu_model():
             pytest.xfail("CuTe KL-div example still launches out of resources on B200")

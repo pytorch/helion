@@ -19,7 +19,7 @@ from helion._testing import skipIfRefEager
 from helion._testing import skipIfTileIR
 from helion._testing import skipUnlessTensorDescriptor
 from helion._testing import xfailIfCute
-from helion._testing import xfailIfPallas
+from helion._testing import xfailIfPallasTpu
 import helion.language as hl
 
 if TYPE_CHECKING:
@@ -434,7 +434,7 @@ class TestReductions(RefEagerTestBase, TestCase):
         )
         torch.testing.assert_close(result1, result2, rtol=1e-3, atol=1e-3)
 
-    @xfailIfPallas("fp16/bf16 1D tensors hit TPU Mosaic sublane alignment error")
+    @xfailIfPallasTpu("fp16/bf16 1D tensors hit TPU Mosaic sublane alignment error")
     @skipIfTileIR("TileIR does not support log1p")
     def test_fp16_math_ops_fp32_fallback(self):
         """Test that mathematical ops with fp16/bfloat16 inputs now work via fp32 fallback."""

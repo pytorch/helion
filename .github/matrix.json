@@ -122,6 +122,17 @@
       "pytorch-version": "pytorch-nightly",
       "alias": "b200",
       "backend": "cute"
+    },
+    {
+      "runner": "linux.2xlarge",
+      "python-version": "3.12",
+      "ref-eager": false,
+      "image": "",
+      "runtime-version": "cpu",
+      "container-options": "",
+      "pytorch-version": "pytorch-nightly",
+      "alias": "pallas-interpret",
+      "backend": "pallas"
     }
   ]
 }

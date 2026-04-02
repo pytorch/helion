@@ -29,6 +29,7 @@ from helion._testing import skipIfPallas
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfTileIR
 from helion._testing import xfailIfPallas
+from helion._testing import xfailIfPallasTpu
 import helion.language as hl
 
 datadir = Path(__file__).parent / "data"
@@ -163,7 +164,7 @@ class TestLoops(RefEagerTestBase, TestCase):
         with self.assertRaises(helion.exc.StatementNotSupported):
             kernel.bind((x,))
 
-    @xfailIfPallas("large 4D tensors may exceed TPU VMEM")
+    @xfailIfPallasTpu("large 4D tensors may exceed TPU VMEM")
     @skipIfLowVRAM("Test requires high VRAM for [128, 128, 128, 128] tensors")
     def test_3d_device_loop0(self):
         args = (torch.randn([128, 128, 128, 128], device=DEVICE),)
@@ -174,7 +175,7 @@ class TestLoops(RefEagerTestBase, TestCase):
         )
         torch.testing.assert_close(result, torch.sin(args[0]))
 
-    @xfailIfPallas("large 4D tensors may exceed TPU VMEM")
+    @xfailIfPallasTpu("large 4D tensors may exceed TPU VMEM")
     @skipIfLowVRAM("Test requires high VRAM for [128, 128, 128, 128] tensors")
     def test_3d_device_loop1(self):
         args = (torch.randn([128, 128, 128, 128], device=DEVICE),)
@@ -199,7 +200,7 @@ class TestLoops(RefEagerTestBase, TestCase):
         )
         torch.testing.assert_close(result, torch.sin(args[0]))
 
-    @xfailIfPallas("large 4D tensors may exceed TPU VMEM")
+    @xfailIfPallasTpu("large 4D tensors may exceed TPU VMEM")
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfLowVRAM("Test requires high VRAM for [128, 128, 128, 128] tensors")
     @skipIfTileIR("TileIR does not support block_ptr indexing")
@@ -923,7 +924,7 @@ class TestLoops(RefEagerTestBase, TestCase):
             code3,
         )
 
-    @xfailIfPallas("range_num_stages is Triton-specific")
+    @xfailIfPallasTpu("range_num_stages is Triton-specific")
     @skipIfTileIR("tileir backend will ignore `range_num_stages` hint")
     @skipIfRefEager("not supported in ref eager mode")
     def test_range_num_stages_preserved_without_aliasing(self):

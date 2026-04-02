@@ -197,6 +197,8 @@ class _OutputCapture:
 
 def is_cuda() -> bool:
     """Return True if running on CUDA (NVIDIA GPU)."""
+    if _get_backend() == "pallas":
+        return False
     return _get_triton_backend() == "cuda" and torch.cuda.is_available()
 
 
@@ -292,6 +294,20 @@ def xfailIfPallas(reason: str) -> Callable[[Callable], Callable]:
     return xfailIfFn(lambda: _get_backend() == "pallas", reason)
 
 
+def xfailIfPallasTpu(reason: str) -> Callable[[Callable], Callable]:
+    """Mark test as expected failure if running with pallas on real TPU (not interpret mode)"""
+    return xfailIfFn(
+        lambda: _get_backend() == "pallas" and not is_pallas_interpret(), reason
+    )
+
+
+def xfailIfPallasInterpret(reason: str) -> Callable[[Callable], Callable]:
+    """Mark test as expected failure if running with pallas in interpret mode"""
+    return xfailIfFn(
+        lambda: _get_backend() == "pallas" and is_pallas_interpret(), reason
+    )
+
+
 def skipUnlessAMDCDNA(reason: str) -> Callable[[Callable], Callable]:
     """Skip test unless running on AMD CDNA architecture."""
     from helion._compat import supports_amd_cdna_tunables
@@ -355,7 +371,7 @@ def onlyBackends(
 def skipUnlessTensorDescriptor(reason: str) -> Callable[[Callable], Callable]:
     """Skip test unless tensor descriptors are supported."""
     # Defers check to test execution time to avoid CUDA init during pytest-xdist collection.
-    return skipIfFn(lambda: not supports_tensor_descriptor(), reason)
+    return skipIfFn(lambda: not is_cuda() or not supports_tensor_descriptor(), reason)
 
 
 def skipUnlessTf32Supported(

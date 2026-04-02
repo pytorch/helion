@@ -212,6 +212,12 @@ jobs:
           # Verify
           python -c "from torch_tpu import api; print(f'TPU device: {api.tpu_device()}')"
 
+      - name: Install Pallas interpret dependencies
+        if: matrix.alias == 'pallas-interpret'
+        run: |
+          source .venv/bin/activate
+          uv pip install 'jax==0.9.2' 'jaxlib==0.9.2' 'absl-py'
+
       - name: Install CUTLASS CuTe DSL
         if: matrix.backend == 'cute'
         run: |
@@ -249,6 +255,7 @@ jobs:
           if [[ "${{ matrix.expecttest-accept }}" == "true" ]]; then export EXPECTTEST_ACCEPT=1; fi
           if [[ "${{ matrix.ref-eager }}" == "true" ]]; then export HELION_INTERPRET=1; fi
           if [[ "${{ matrix.backend }}" == "tileir" ]]; then export ENABLE_TILE=1; fi
+          if [[ "${{ matrix.alias }}" == "pallas-interpret" ]]; then export HELION_PALLAS_INTERPRET=1; fi
           export HELION_BACKEND=${{ matrix.backend }}
           # -rf: print failed tests
           # --timeout: max allowed time for each test
@@ -256,7 +263,7 @@ jobs:
           if [[ "${{ contains(matrix.alias, 'distributed') }}" == "true" ]]; then
             TEST_PATH="test/test_examples_dist.py"
             EXTRA_FLAGS="-rs"
-          elif [[ "${{ matrix.alias }}" == "tpu" ]]; then
+          elif [[ "${{ matrix.alias }}" == "tpu" || "${{ matrix.alias }}" == "pallas-interpret" ]]; then
             TEST_PATH="."
             EXTRA_FLAGS="--ignore=test/test_examples_dist.py"
             PARALLEL=""

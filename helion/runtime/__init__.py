@@ -897,20 +897,17 @@ def default_pallas_fori_launcher(
 
 
 def _torch_to_jax(t: torch.Tensor) -> object:
-    """Convert a torch.Tensor to a JAX array via numpy (for interpret mode on CPU)."""
+    """Convert a torch.Tensor to a JAX array via DLPack (for interpret mode on CPU)."""
     import jax.numpy as jnp
-    import numpy as np
 
-    return jnp.array(np.asarray(t.detach().cpu()))
+    return jnp.from_dlpack(t.detach().cpu())
 
 
 def _jax_to_torch(
     arr: object, *, device: torch.device, dtype: torch.dtype
 ) -> torch.Tensor:
-    """Convert a JAX array back to a torch.Tensor via numpy (for interpret mode on CPU)."""
-    import numpy as np
-
-    return torch.from_numpy(np.asarray(arr)).to(dtype=dtype, device=device)
+    """Convert a JAX array back to a torch.Tensor via DLPack (for interpret mode on CPU)."""
+    return torch.from_dlpack(arr).to(dtype=dtype, device=device)
 
 
 def _torch_dtype_to_cutlass(dtype: torch.dtype) -> object:
