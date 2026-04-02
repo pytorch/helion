@@ -124,6 +124,7 @@ class TestAutotuneIgnoreErrors(TestCase):
         search._precompile_result_counter = count()
         search._prepared = True
         search.counters = collections.Counter()
+        search._crashed_config_strs = set()
         return search
 
     def test_settings_flag_from_env(self):

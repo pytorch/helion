@@ -196,10 +196,10 @@ automatically. On successful completion, the checkpoint file is cleaned up.
 
 ```bash
 # Enable checkpointing to a directory:
-HELION_AUTOTUNE_CHECKPOINT_DIR=/tmp/helion_checkpoints python run_kernel.py
+HELION_AUTOTUNE_CHECKPOINT_DIR=/tmp/$USER/helion_checkpoints python run_kernel.py
 
 # If interrupted, just re-run with the same directory to resume:
-HELION_AUTOTUNE_CHECKPOINT_DIR=/tmp/helion_checkpoints python run_kernel.py
+HELION_AUTOTUNE_CHECKPOINT_DIR=/tmp/$USER/helion_checkpoints python run_kernel.py
 ```
 
 Without `HELION_AUTOTUNE_CHECKPOINT_DIR`, no checkpoints are saved (opt-in).
