@@ -49,6 +49,22 @@ import helion.language as hl
 from helion.runtime.dist_utils import symm_mem_sync
 
 
+def _no_tensor_descriptor(config: helion.Config) -> bool:
+    """
+    Reject configs that use tensor_descriptor indexing.
+
+    TMA (cp.async.bulk.tensor) cannot access symmetric-memory virtual address
+    ranges, so any config with tensor_descriptor indexing will fault with
+    'misaligned address' at runtime.
+
+    Work around https://github.com/pytorch/helion/issues/1846
+    """
+    indexing = config.get("indexing")
+    if isinstance(indexing, list):
+        return "tensor_descriptor" not in indexing
+    return indexing != "tensor_descriptor"
+
+
 @helion.kernel(
     config=helion.Config(
         block_sizes=[64, 64, 32],
@@ -58,6 +74,7 @@ from helion.runtime.dist_utils import symm_mem_sync
     ),
     static_shapes=True,
     ignore_warnings=[helion.exc.TensorOperationInWrapper],
+    config_filter=_no_tensor_descriptor,
 )
 def two_dim_parallel_matmul_kernel(
     a_local: torch.Tensor,  # [M/SP, K/TP]
