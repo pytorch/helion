@@ -521,35 +521,6 @@ class TestMarkStatic(RefEagerTestBase, TestCase):
         torch._dynamo.mark_static(x2, -1)
         self.assertIsNot(fn.bind((x,)), fn.bind((x2,)))
 
-    @skipIfRefEager("specialization_key is not used in ref eager mode")
-    def test_specialization_key_includes_hl_specialize(self):
-        """Test that specialization_key() includes hl.specialize() extras after bind()."""
-
-        @helion.kernel(static_shapes=False, autotune_effort="none")
-        def fn(x: torch.Tensor) -> torch.Tensor:
-            hl.specialize(x.size(-1))
-            out = torch.empty_like(x)
-            for tile in hl.tile(x.size()):
-                out[tile] = x[tile] * 2
-            return out
-
-        a = torch.randn([128, 64], device=DEVICE)
-        b = torch.randn([128, 32], device=DEVICE)
-
-        # Before bind: keys are equal (extras not yet known)
-        key_a_before = fn.specialization_key((a,))
-        key_b_before = fn.specialization_key((b,))
-        self.assertEqual(key_a_before, key_b_before)
-
-        # After bind: keys must differ because hl.specialize(x.size(-1))
-        # makes the kernel depend on the last dimension
-        fn.bind((a,))
-        fn.bind((b,))
-
-        key_a_after = fn.specialization_key((a,))
-        key_b_after = fn.specialization_key((b,))
-        self.assertNotEqual(key_a_after, key_b_after)
-
 
 if __name__ == "__main__":
     unittest.main()

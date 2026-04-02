@@ -1169,9 +1169,12 @@ def _(state: CodegenState) -> list[object]:
     predicate. Tensor-derived predicates (from tensor loads) are unsupported
     because TPU block shapes make them vectors at runtime.
     """
-    from .._compiler.ast_extension import statement_from_string
+    from .._compiler.ast_extension import statement_from_string, expr_from_string
     from .._compiler.device_ir import IfGraphInfo
     from .._compiler.inductor_lowering import codegen_call_with_graph
+    import torch
+    import ast
+    from ._tracing_ops import create
 
     graph_info = state.get_graph(state.proxy_arg(1))
     assert isinstance(graph_info, IfGraphInfo)
@@ -1194,80 +1197,83 @@ def _(state: CodegenState) -> list[object]:
             "Use a scalar kernel argument for the condition instead.",
         )
 
-    branch_fn_name = state.device_function.new_var("_cond_branch")
+    # 1. Bind outer args to function parameters
+    arg_names = []
+    arg_nodes = []
+    for i, a in enumerate(args):
+        if isinstance(a, ast.Name):
+            arg_names.append(a.id)
+            arg_nodes.append(a)
+        else:
+            name = state.device_function.new_var(f"_cond_arg_{i}")
+            state.add_statement(statement_from_string(f"{name} = {{val}}", val=a))
+            arg_names.append(name)
+            arg_nodes.append(create(ast.Name, id=name, ctx=ast.Load()))
 
+    # 2. Evaluate true branch
     body_stmts: list[ast.AST] = []
     with state.codegen.set_statements(body_stmts):
-        branch_outputs = codegen_call_with_graph(
-            state.codegen, graph_info.graph, [*args]
-        )
+        result = codegen_call_with_graph(state.codegen, graph_info.graph, arg_nodes, copy_named_args=True)
 
-    assert graph_info.arg_names is not None
-    assert graph_info.output_names is not None
-    arg_node_name_to_ast_name = {
-        graph_info.arg_names[i]: args[i] for i in range(len(args))
-    }
-    written_arg_ast_names = [
-        arg_node_name_to_ast_name[name]
-        for name in graph_info.output_names
-        if name in arg_node_name_to_ast_name
-    ]
+    output_node = next(n for n in graph_info.graph.nodes if n.op == "output")
+    output_args = output_node.args[0] if len(output_node.args) == 1 and isinstance(output_node.args[0], (list, tuple)) else output_node.args
+    if not isinstance(output_args, (list, tuple)):
+        output_args = [output_args]
 
-    if len(written_arg_ast_names) > 0:
-        # The side effects of the branch includes writing to some of the input args. e.g.:
-        #   delta = torch.zeros_like(x[tile])
-        #   if 3 < v < 7:
-        #       delta += 1.0
-        #       out[tile] = torch.sigmoid(x[tile])
-        #   out[tile] = out[tile] + delta
-        # For this situation, we need to return the written args as a return value,
-        # and assign the return value to the original args after the lax.cond call. e.g.:
-        #   cond = 3 < v < 7
-        #   def _cond_branch(delta=delta):
-        #       delta = delta + 1.0
-        #       out[:, :] = ...
-        #       return delta
-        #   def _else_noop(delta=delta):
-        #       return delta
-        #   delta = lax.cond(cond, _cond_branch, _else_noop)
-        #   out[tile] = out[tile] + delta
-        # We need this arg-return pattern because JAX doesn't allow `nonlocal`
-        arg_list_with_defaults = ", ".join(f"{n.id}={n.id}" for n in args)
-        output_list = ", ".join(n.id for n in written_arg_ast_names)
+    ret_exprs = []
+    for r in result:
+        if isinstance(r, ast.AST):
+            ret_exprs.append(r)
+        else:
+            ret_exprs.append(expr_from_string(repr(r)))
 
-        body_stmts.append(statement_from_string(f"return {output_list}"))
-        fn_def = statement_from_string(
-            f"def {branch_fn_name}({arg_list_with_defaults}): pass"
-        )
-        assert isinstance(fn_def, ast.FunctionDef)
-        fn_def.body = body_stmts or [ast.Pass()]  # pyrefly: ignore[bad-assignment]
+    branch_fn_name = state.device_function.new_var("_cond_branch")
+    fn_def = statement_from_string(f"def {branch_fn_name}({', '.join(arg_names)}): pass")
+    assert isinstance(fn_def, ast.FunctionDef)
+    fn_def.body = body_stmts or [ast.Pass()]
+    fn_def.body.append(ast.Return(value=ast.Tuple(elts=ret_exprs, ctx=ast.Load())))
+    state.add_statement(fn_def)
 
-        else_noop_fn_name = state.device_function.new_var("_else_noop")
-        else_noop_fn_def = statement_from_string(
-            f"def {else_noop_fn_name}({arg_list_with_defaults}): return {output_list}"
-        )
-        state.add_statement(fn_def)
-        state.add_statement(else_noop_fn_def)
+    # 3. Evaluate false branch
+    false_ret_exprs = []
+    for i, out_node in enumerate(output_args):
+        if i < len(arg_nodes):
+            false_ret_exprs.append(arg_nodes[i])
+        else:
+            val = out_node.meta.get("val")
+            if isinstance(val, torch.Tensor):
+                shape_strs = []
+                for s in val.shape:
+                    if isinstance(s, torch.SymInt):
+                        expr = state.device_function.user_sympy_expr(s.node.expr)
+                        shape_strs.append(expr)
+                    else:
+                        shape_strs.append(str(s))
+                shape_str = f"({', '.join(shape_strs)},)"
+                dtype_str = f"jnp.{str(val.dtype).split('.')[-1]}"
+                false_ret_exprs.append(expr_from_string(f"jnp.zeros({shape_str}, dtype={dtype_str})"))
+            else:
+                false_ret_exprs.append(expr_from_string("0"))
 
-        state.add_statement(
-            statement_from_string(
-                f"{output_list} = lax.cond({{test}}, {branch_fn_name}, {else_noop_fn_name})",
-                test=test,
-            )
-        )
-    else:
-        fn_def = statement_from_string(f"def {branch_fn_name}(): pass")
-        assert isinstance(fn_def, ast.FunctionDef)
-        fn_def.body = body_stmts or [ast.Pass()]  # pyrefly: ignore[bad-assignment]
-        state.add_statement(fn_def)
+    false_branch_fn_name = state.device_function.new_var("_cond_branch_false")
+    false_fn_def = statement_from_string(f"def {false_branch_fn_name}({', '.join(arg_names)}): pass")
+    false_fn_def.body = [ast.Return(value=ast.Tuple(elts=false_ret_exprs, ctx=ast.Load()))]
+    state.add_statement(false_fn_def)
 
-        state.add_statement(
-            statement_from_string(
-                f"lax.cond({{test}}, {branch_fn_name}, lambda: None)",
-                test=test,
-            )
-        )
-    return branch_outputs
+    # 4. Construct lax.cond call
+    cond_res_var = state.device_function.new_var("_cond_res")
+    cond_call = f"{cond_res_var} = lax.cond({{test}}, {branch_fn_name}, {false_branch_fn_name}"
+    if arg_names:
+        cond_call += ", " + ", ".join(arg_names)
+    cond_call += ")"
+    
+    state.add_statement(statement_from_string(cond_call, test=test))
+
+    return [create(ast.Subscript, 
+                   value=create(ast.Name, id=cond_res_var, ctx=ast.Load()), 
+                   slice=create(ast.Index, value=create(ast.Constant, value=i)), 
+                   ctx=ast.Load()) 
+            for i in range(len(result))]
 
 
 # Note we can't DCE phi nodes because there may be a loop carry dependency not captured in the outer graph
