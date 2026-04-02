@@ -350,6 +350,7 @@ class BaseSearch(BaseAutotuner):
         self._precompile_tmpdir: tempfile.TemporaryDirectory[str] | None = None
         self._precompile_args_path: str | None = None
         self._precompile_result_counter = count()
+        self._crashed_config_strs: set[str] = set()
 
     def _prepare(self) -> None:
         """Some initialization deferred until autotuning actually runs.
@@ -739,6 +740,12 @@ class BaseSearch(BaseAutotuner):
         Returns:
             The performance of the configuration in ms.
         """
+        # Skip configs that previously crashed the subprocess
+        config_str = str(config)
+        if config_str in self._crashed_config_strs:
+            self.log.warning(f"Skipping known-crashed config: {config}")
+            return inf
+
         self._autotune_metrics.num_configs_tested += 1
         self.log.debug(lambda: f"Running benchmark for {config!r}")
         _captured_output: list[str] = [""]
@@ -1018,13 +1025,36 @@ class BaseSearch(BaseAutotuner):
             A list of BenchmarkResult entries containing the configuration, compiled
             callable, measured performance, status, and compilation time.
         """
+        # Filter out known-crashed configs before compilation
+        if self._crashed_config_strs:
+            original_len = len(configs)
+            configs = [c for c in configs if str(c) not in self._crashed_config_strs]
+            skipped = original_len - len(configs)
+            if skipped:
+                self.log.warning(
+                    f"Skipped {skipped} known-crashed config(s) before compilation"
+                )
+            if not configs:
+                return []
+
         fns: list[Callable[..., object]] = []
         valid_configs: list[Config] = []
         futures: list[PrecompileFuture] | None = None
+        pending_path = self._get_pending_config_path()
         for i, config in enumerate(configs):
+            # Write sentinel before compile so a hard crash (SIGKILL /
+            # CUDA IMA) leaves a trace the crash recovery script can find.
+            if pending_path is not None:
+                pending_path.write_text(str(config))
             try:
                 fn = self.kernel.compile_config(config, allow_print=False)
-            except Exception:
+            except Exception as e:
+                if match_unrecoverable_runtime_error(e):
+                    # Leave sentinel for crash recovery — CUDA context is
+                    # corrupted and the process cannot continue.
+                    raise
+                if pending_path is not None:
+                    pending_path.unlink(missing_ok=True)
                 # If all configs failed, raise error
                 if not valid_configs and i == len(configs) - 1:
                     raise
@@ -1034,9 +1064,14 @@ class BaseSearch(BaseAutotuner):
                     exc_info=True,
                 )
                 continue
+            if pending_path is not None:
+                pending_path.unlink(missing_ok=True)
             fns.append(fn)
             valid_configs.append(config)
         configs = valid_configs
+        # NOTE: precompile runs in separate subprocesses with isolated CUDA
+        # contexts; crashes there are caught via is_working checks, not
+        # sentinels.
         if self.settings.autotune_precompile:
             futures = list(
                 starmap(
@@ -1098,7 +1133,14 @@ class BaseSearch(BaseAutotuner):
                     )
                 )
                 # benchmark one-by-one to avoid noisy results
+                # Write pending-config sentinel; cleared after benchmark.
+                # On crash the file stays so the crash recovery script can
+                # detect which config caused the failure.
+                if pending_path is not None:
+                    pending_path.write_text(str(config))
                 perf = self.benchmark_function(config, fn)
+                if pending_path is not None:
+                    pending_path.unlink(missing_ok=True)
                 status = "ok" if math.isfinite(perf) else "error"
                 # Log completion after benchmarking
                 self.log.record_autotune_entry(
@@ -1204,6 +1246,7 @@ class BaseSearch(BaseAutotuner):
             checkpoint_enabled = self.settings.autotune_checkpoint_dir is not None
             if not (checkpoint_enabled and self._try_load_checkpoint()):
                 self._init_search()
+            self._load_crashed_configs()
             try:
                 best = self._autotune()
                 if checkpoint_enabled:
