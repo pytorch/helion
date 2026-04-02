@@ -435,6 +435,7 @@ class BaseSearch(BaseAutotuner):
         self._precompile_tmpdir: tempfile.TemporaryDirectory[str] | None = None
         self._precompile_args_path: str | None = None
         self._precompile_result_counter = count()
+        self._bad_config_strs: set[str] = set()
 
     def _prepare(self) -> None:
         """Some initialization deferred until autotuning actually runs.
@@ -531,8 +532,43 @@ class BaseSearch(BaseAutotuner):
         # load_state_dict validates required keys and raises CheckpointError for issues
         self.load_state_dict(state)
 
+        # Load bad configs (from subprocess crash recovery)
+        self._load_bad_configs()
+
         self.log(f"Resumed at generation {self._current_generation}")
         return True
+
+    def _load_bad_configs(self) -> None:
+        """Load bad configs from _bad_configs.txt file."""
+        from .subprocess_runner import load_bad_configs
+
+        checkpoint_dir_str = self.settings.autotune_checkpoint_dir
+        if checkpoint_dir_str is not None:
+            bad_configs_path = os.path.join(checkpoint_dir_str, "_bad_configs.txt")
+            self._bad_config_strs |= load_bad_configs(bad_configs_path)
+
+        if self._bad_config_strs:
+            self.log(
+                f"Loaded {len(self._bad_config_strs)} bad config(s) to skip",
+            )
+
+    def _write_pending_config(self, config_str: str) -> None:
+        """Write the config being benchmarked to the pending file."""
+        from .subprocess_runner import write_pending
+
+        checkpoint_dir_str = self.settings.autotune_checkpoint_dir
+        if checkpoint_dir_str is None:
+            return
+        write_pending(checkpoint_dir_str, config_str)
+
+    def _clear_pending_config(self) -> None:
+        """Remove the pending file after benchmark completes."""
+        from .subprocess_runner import clear_pending
+
+        checkpoint_dir_str = self.settings.autotune_checkpoint_dir
+        if checkpoint_dir_str is None:
+            return
+        clear_pending(checkpoint_dir_str)
 
     def _compute_baseline(
         self,
@@ -752,9 +788,16 @@ class BaseSearch(BaseAutotuner):
         Returns:
             The performance of the configuration in ms.
         """
+        # Skip configs that previously crashed the subprocess
+        config_str = str(config)
+        if config_str in self._bad_config_strs:
+            self.log.warning(f"Skipping known-bad config: {config}")
+            return inf
+
         self._autotune_metrics.num_configs_tested += 1
         self.counters["benchmark"] += 1
         self.log.debug(lambda: f"Running benchmark for {config!r}")
+        self._write_pending_config(config_str)
         _captured_output: list[str] = [""]
         _capture_ctx = (
             capture_output()
@@ -794,6 +837,7 @@ class BaseSearch(BaseAutotuner):
             if not compile_success_all:
                 return inf
 
+        _is_unrecoverable = False
         try:
             # TODO(jansel): early exit with fewer trials if early runs are slow
             self.log.debug(lambda: f"Running {config} at {datetime.datetime.now()}")
@@ -855,6 +899,7 @@ class BaseSearch(BaseAutotuner):
                 captured_output=_captured_output[0] or None,
             )
             if match_unrecoverable_runtime_error(e):
+                _is_unrecoverable = True
                 self.kernel.maybe_log_repro(self.log.error, self.args, config)
                 raise exc.TritonUnrecoverableRuntimeError(
                     reason=str(e),
@@ -908,6 +953,9 @@ class BaseSearch(BaseAutotuner):
 
             self._autotune_metrics.num_compile_failures += 1
             return inf
+        finally:
+            if not _is_unrecoverable:
+                self._clear_pending_config()
 
     def set_adaptive_compile_timeout(
         self,
@@ -1193,6 +1241,8 @@ class BaseSearch(BaseAutotuner):
             exit_stack.callback(self.cleanup)
 
             if not self._try_load_checkpoint():
+                # Load bad configs even on fresh starts (subprocess recovery)
+                self._load_bad_configs()
                 self._init_search()
             try:
                 best = self._autotune()
@@ -1295,6 +1345,11 @@ class BaseSearch(BaseAutotuner):
         if checkpoint_file.exists():
             checkpoint_file.unlink()
             self.log(f"Checkpoint cleaned up: {checkpoint_file}")
+
+        # Clean up subprocess recovery artifacts
+        from .subprocess_runner import cleanup_subprocess_artifacts
+
+        cleanup_subprocess_artifacts(checkpoint_dir_str)
 
     @staticmethod
     def _serialize_numpy_rng_state(
