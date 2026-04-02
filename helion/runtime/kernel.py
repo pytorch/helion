@@ -222,18 +222,17 @@ class Kernel(Generic[_R]):
                 raise TypeError(
                     f"Too many arguments passed to the kernel, expected: {self._num_params} got: {len(args)}."
                 )
+            # Normalize first so all downstream code (specialization_key,
+            # cache key extractors, BoundKernel) sees full-length args
+            # with defaults applied.
+            args = self.normalize_args(*args)
             signature = self.specialization_key(args)
             cache_key = self._get_bound_kernel_cache_key(args, signature)
             bound_kernel = (
                 None if cache_key is None else self._bound_kernels.get(cache_key, None)
             )
             if bound_kernel is None:
-                normalized_args: tuple[object, ...] = self.normalize_args(*args)
-                if len(normalized_args) != len(args):
-                    # we had default args that needed to be applied
-                    bound_kernel = self.bind(normalized_args)
-                else:
-                    bound_kernel = BoundKernel(self, args)
+                bound_kernel = BoundKernel(self, args)
                 if cache_key is None:
                     cache_key = self._create_bound_kernel_cache_key(
                         bound_kernel, args, signature
