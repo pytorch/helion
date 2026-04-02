@@ -13,6 +13,7 @@ import torch
 from torch._inductor.runtime.runtime_utils import next_power_of_2
 import torch.distributed as dist
 
+from .._compat import _regs_per_block
 from .._compat import num_compute_units
 from .._compat import supports_amd_cdna_tunables
 from .._compat import supports_maxnreg
@@ -510,6 +511,28 @@ class ConfigSpec:
                     )
             else:
                 config["maxnreg"] = VALID_MAXNREG[0]
+
+            # Cap maxnreg so that maxnreg * num_warps * 32 doesn't exceed the
+            # register file.  On sm100+ ptxas honours .maxnreg over .reqntid,
+            # so an uncapped value causes "out of resource: threads" at load.
+            maxnreg = cast("int | None", config.get("maxnreg"))
+            num_warps = config.get("num_warps", DEFAULT_NUM_WARPS)
+            if maxnreg is not None and isinstance(num_warps, int):
+                limit = _regs_per_block() // (num_warps * 32)
+                if maxnreg > limit:
+                    if _fix_invalid:
+                        valid = [
+                            v for v in VALID_MAXNREG if v is not None and v <= limit
+                        ]
+                        if valid:
+                            config["maxnreg"] = max(valid)
+                        else:
+                            config.pop("maxnreg", None)
+                    else:
+                        raise InvalidConfig(
+                            f"maxnreg={maxnreg} exceeds register budget for "
+                            f"num_warps={num_warps} (max {limit})"
+                        )
         else:
             # Remove maxnreg if not supported
             config.pop("maxnreg", None)
