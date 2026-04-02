@@ -70,6 +70,7 @@ def create_user_config_spec(
 @dataclasses.dataclass
 class _FakeEnv:
     device: torch.device
+    process_group_name: str | None = None
 
 
 class _ExternalKernelAdapter(_AutotunableKernel):

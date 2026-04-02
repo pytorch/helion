@@ -9,10 +9,10 @@ from typing import Callable
 from typing import TypeVar
 
 import torch
-import torch.distributed as dist
 
 from ..runtime.settings import is_pallas_interpret
 from .progress_bar import iter_with_progress
+from helion._dist_utils import sync_object
 
 T = TypeVar("T")
 
@@ -205,19 +205,6 @@ def interleaved_bench_generic(
     return [statistics.median(times) for times in all_times]
 
 
-def sync_object(obj: T) -> T:
-    r"""
-    Synchronize the number of repeations across all ranks.
-    """
-    if not dist.is_initialized():
-        return obj
-
-    object_list = [obj]
-    # use the value from rank 0
-    dist.broadcast_object_list(object_list, 0)
-    return object_list[0]
-
-
 def _summarize_statistics_fallback(
     times: list[float],
     quantiles: list[float] | None,
@@ -254,6 +241,7 @@ def do_bench(
     grad_to_none: torch.Tensor | None = None,
     quantiles: list[float] | None = None,
     return_mode: str = "mean",
+    process_group_name: str | None = None,
 ) -> float | tuple[float, ...]:
     """
     Benchmark the runtime of the provided function. By default, return the median runtime of :code:`fn` along with
@@ -293,7 +281,9 @@ def do_bench(
         fn()
     end_event.record()
     di.synchronize()
-    estimate_ms = sync_object(start_event.elapsed_time(end_event) / 5)
+    estimate_ms = sync_object(
+        start_event.elapsed_time(end_event) / 5, process_group_name=process_group_name
+    )
 
     # compute number of warmup and repeat
     n_warmup = max(1, int(warmup / estimate_ms))
@@ -330,6 +320,7 @@ def do_bench_generic(
     grad_to_none: torch.Tensor | None = None,
     quantiles: list[float] | None = None,
     return_mode: str = "mean",
+    process_group_name: str | None = None,
 ) -> float | tuple[float, ...]:
     """
     Benchmark using wall-clock timing for backends without Triton event timing.
@@ -346,7 +337,9 @@ def do_bench_generic(
         out = fn()
     _synchronize(out)
     end = time.perf_counter()
-    estimate_ms = sync_object((end - start) * 1000 / 5)
+    estimate_ms = sync_object(
+        (end - start) * 1000 / 5, process_group_name=process_group_name
+    )
 
     # compute number of warmup and repeat
     n_warmup = max(1, int(warmup / estimate_ms))

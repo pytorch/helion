@@ -33,6 +33,7 @@ class ConfigGeneration:
         *,
         overrides: Mapping[str, object] | None = None,
         advanced_controls_files: list[str] | None = None,
+        process_group_name: str | None = None,
     ) -> None:
         def _collect_spec(spec: ConfigSpecFragment) -> object:
             """
@@ -49,6 +50,7 @@ class ConfigGeneration:
 
         super().__init__()
         self.config_spec = config_spec
+        self.process_group_name = process_group_name
         self._advanced_controls_files = advanced_controls_files
         self.flat_spec: list[ConfigSpecFragment] = []
         config_spec.flat_config(
@@ -206,7 +208,8 @@ class ConfigGeneration:
         Returns:
             A random flat configuration.
         """
-        with sync_seed():
+
+        with sync_seed(process_group_name=self.process_group_name):
             config = [spec.random() for spec in self.flat_spec]
             self.shrink_config(config, PowerOfTwoFragment(1, 2048, 32).random())
             return config

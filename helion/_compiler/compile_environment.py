@@ -124,6 +124,7 @@ class CompileEnvironment:
         self.index_dtype: torch.dtype = (
             index_dtype or settings.index_dtype or torch.int32
         )
+        self.process_group_name = None
         backend_factory: dict[str, type[Backend]] = {
             "triton": TritonBackend,
             "pallas": PallasBackend,

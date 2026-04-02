@@ -31,7 +31,6 @@ from unittest.mock import patch
 
 import torch
 import torch.distributed as dist
-import torch.distributed._symmetric_memory as symm_mem
 from torch.utils._pytree import tree_flatten
 from torch.utils._pytree import tree_map_only
 from torch.utils._pytree import tree_unflatten
@@ -45,7 +44,6 @@ from ..runtime.precompile_shim import make_precompiler
 from ..runtime.settings import is_pallas_interpret
 from .benchmarking import do_bench
 from .benchmarking import interleaved_bench
-from .benchmarking import sync_object
 from .logger import SUPPRESSED_TRITON_CODE_MSG
 from .logger import AutotuneLogEntry
 from .logger import AutotuningLogger
@@ -61,10 +59,12 @@ from .metrics import _run_post_autotune_hooks
 from .precompile_future import PrecompileFuture as PrecompileFuture
 from .precompile_future import _ExtractedLaunchArgs
 from .progress_bar import iter_with_progress
+from helion._dist_utils import _clone_symm_mem_tensor
 from helion._dist_utils import all_gather_object
 from helion._dist_utils import get_signal_pad_ptrs_dev
 from helion._dist_utils import is_master_rank
 from helion._dist_utils import is_symm_mem_tensor
+from helion._dist_utils import sync_object
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -86,8 +86,9 @@ def _synchronize_device() -> None:
         torch.accelerator.synchronize()
 
 
-class _HasDevice(Protocol):
+class _HasDeviceAndProcessGroupName(Protocol):
     device: torch.device
+    process_group_name: str | None
 
 
 class _AutotunableKernel(Protocol):
@@ -98,7 +99,7 @@ class _AutotunableKernel(Protocol):
     def settings(self) -> Settings: ...
 
     @property  # pyrefly: ignore[bad-return]
-    def env(self) -> _HasDevice: ...
+    def env(self) -> _HasDeviceAndProcessGroupName: ...
 
     @property
     def configs(self) -> Sequence[Config]: ...
@@ -209,20 +210,6 @@ class BenchmarkResult(NamedTuple):
     compile_time: float | None
 
 
-def _clone_symm_mem_tensor(t: torch.Tensor) -> torch.Tensor:
-    assert t.is_contiguous(), "Only support cloning contiguous symm mem tensor for now"
-    new_tensor = symm_mem.empty(
-        *t.shape,
-        dtype=t.dtype,
-        device=t.device,
-    )
-    new_tensor.copy_(t)
-    # rendezvous so we don't count the time in benchmarking
-    assert dist.group.WORLD is not None
-    symm_mem.rendezvous(new_tensor, dist.group.WORLD.group_name)
-    return new_tensor
-
-
 _FP8_DTYPES = {
     torch.float8_e4m3fn,
     torch.float8_e5m2,
@@ -290,6 +277,7 @@ def _chunked_assert_close(
 
 def _clone_args(
     args: Sequence[object],
+    process_group_name: str | None,
     idx_to_clone: Sequence[int] | None = None,
 ) -> Sequence[object]:
     """
@@ -304,10 +292,10 @@ def _clone_args(
     old_arg_to_new_arg = {}
 
     for i, arg in enumerate(args_flat):
-        if _should_clone(i) and is_symm_mem_tensor(arg):
-            new_arg = _clone_symm_mem_tensor(arg)
-            old_arg_to_new_arg[get_signal_pad_ptrs_dev(arg)] = get_signal_pad_ptrs_dev(
-                new_arg
+        if _should_clone(i) and is_symm_mem_tensor(arg, process_group_name):
+            new_arg = _clone_symm_mem_tensor(arg, process_group_name)
+            old_arg_to_new_arg[get_signal_pad_ptrs_dev(arg, process_group_name)] = (
+                get_signal_pad_ptrs_dev(new_arg, process_group_name)
             )
             old_arg_to_new_arg[arg] = new_arg  # pyrefly: ignore[unsupported-operation]
 
@@ -435,7 +423,7 @@ class BaseSearch(BaseAutotuner):
         - If settings.autotune_baseline_fn is provided, use that custom function
         - Otherwise, run the kernel with the default config
         """
-        new_args = _clone_args(self.args)
+        new_args = _clone_args(self.args, self.kernel.env.process_group_name)
 
         # Use custom baseline function if provided
         if self.settings.autotune_baseline_fn is not None:
@@ -492,7 +480,11 @@ class BaseSearch(BaseAutotuner):
             if not equal:
                 mutated_tensor_idxs.append(tensor_idx)
             tensor_idx += 1
-        baseline_post_args = _clone_args(new_args, idx_to_clone=mutated_tensor_idxs)
+        baseline_post_args = _clone_args(
+            new_args,
+            self.kernel.env.process_group_name,
+            idx_to_clone=mutated_tensor_idxs,
+        )
         return baseline_output, mutated_tensor_idxs, baseline_post_args
 
     def _compute_effective_tolerances(self) -> tuple[float, float]:
@@ -653,7 +645,9 @@ class BaseSearch(BaseAutotuner):
 
         if len(self._mutated_arg_indices) > 0:
             working_args = _clone_args(
-                self.args, idx_to_clone=self._mutated_arg_indices
+                self.args,
+                self.kernel.env.process_group_name,
+                idx_to_clone=self._mutated_arg_indices,
             )
         else:
             working_args = self.args
@@ -678,7 +672,12 @@ class BaseSearch(BaseAutotuner):
         if dist.is_initialized():
             # Trigger Triton JIT compilation before running the kernel
             compile_success = _triton_compile(fn, working_args, config, self.kernel)
-            compile_success_all = all(all_gather_object(compile_success))
+            compile_success_all = all(
+                all_gather_object(
+                    compile_success,
+                    process_group_name=self.kernel.env.process_group_name,
+                )
+            )
 
             if not compile_success_all:
                 return inf
@@ -700,7 +699,12 @@ class BaseSearch(BaseAutotuner):
             )
             if not pass_accuracy_check:
                 self._autotune_metrics.num_accuracy_failures += 1
-            if not all(all_gather_object(pass_accuracy_check)):
+            if not all(
+                all_gather_object(
+                    pass_accuracy_check,
+                    process_group_name=self.kernel.env.process_group_name,
+                )
+            ):
                 # for distributed kernels like matmul-reduce-scatter, different ranks compute
                 # a different chunk. It's possible that some ranks pass the accuracy check while
                 # others don't. Skip the config if any rank fails the accuracy check.
@@ -721,8 +725,11 @@ class BaseSearch(BaseAutotuner):
                 return_mode="median",
                 warmup=1,  # we are already warmed up above
                 rep=50,
+                process_group_name=self.kernel.env.process_group_name,
             )
-            res = sync_object(res)
+            res = sync_object(
+                res, process_group_name=self.kernel.env.process_group_name
+            )
             t2 = time.perf_counter()
             assert isinstance(res, float)
 
@@ -875,7 +882,11 @@ class BaseSearch(BaseAutotuner):
         if mode not in {"fork", "spawn"}:
             raise exc.InvalidAPIUsage("autotune_precompile must be 'fork' or 'spawn'")
         if len(self._mutated_arg_indices) > 0:
-            args = _clone_args(self.args, idx_to_clone=self._mutated_arg_indices)
+            args = _clone_args(
+                self.args,
+                self.kernel.env.process_group_name,
+                idx_to_clone=self._mutated_arg_indices,
+            )
         else:
             args = self.args
 
@@ -966,7 +977,11 @@ class BaseSearch(BaseAutotuner):
             else:
                 compile_time = None
             status: Literal["ok", "error", "timeout", "peer_compilation_fail"]
-            if all(all_gather_object(is_working)):
+            if all(
+                all_gather_object(
+                    is_working, process_group_name=self.kernel.env.process_group_name
+                )
+            ):
                 # Log started before benchmarking to help identify hangs
                 self.log.record_autotune_entry(
                     AutotuneLogEntry(
@@ -1125,13 +1140,18 @@ class BaseSearch(BaseAutotuner):
         _run_post_autotune_hooks(self._autotune_metrics)
 
 
-def check_population_consistency(population: Sequence[PopulationMember]) -> None:
+def check_population_consistency(
+    population: Sequence[PopulationMember],
+    process_group_name: str | None = None,
+) -> None:
     if os.getenv("HELION_DEBUG_DISTRIBUTED") != "1" or not dist.is_initialized():
         return
 
     # remove unpickled fields
     sanitized_population = tuple((p.config, p.perfs) for p in population)
-    all_sanitized_population = all_gather_object(sanitized_population)
+    all_sanitized_population = all_gather_object(
+        sanitized_population, process_group_name=process_group_name
+    )
     if all_sanitized_population != all_sanitized_population[:1] * len(
         all_sanitized_population
     ):
@@ -1232,6 +1252,7 @@ class PopulationBasedSearch(BaseSearch):
         self.config_gen: ConfigGeneration = self.config_spec.create_config_generation(
             overrides=self.settings.autotune_config_overrides or None,
             advanced_controls_files=self.settings.autotune_search_acf or None,
+            process_group_name=kernel.env.process_group_name,
         )
 
     @classmethod
@@ -1511,7 +1532,11 @@ class PopulationBasedSearch(BaseSearch):
         if (capstr := os.getenv("HELION_CAP_REBENCHMARK_REPEAT")) is not None:
             repeat = min(repeat, int(capstr))
         if len(self._mutated_arg_indices) > 0:
-            bench_args = _clone_args(self.args, idx_to_clone=self._mutated_arg_indices)
+            bench_args = _clone_args(
+                self.args,
+                self.kernel.env.process_group_name,
+                idx_to_clone=self._mutated_arg_indices,
+            )
         else:
             bench_args = self.args
         iterator = [functools.partial(m.fn, *bench_args) for m in members]
@@ -1526,7 +1551,9 @@ class PopulationBasedSearch(BaseSearch):
             new_timings = bench_fn(iterator, repeat=repeat, desc=desc)
         else:
             new_timings = bench_fn(iterator, repeat=repeat)
-        new_timings = sync_object(new_timings)
+        new_timings = sync_object(
+            new_timings, process_group_name=self.kernel.env.process_group_name
+        )
         for m, t in zip(members, new_timings, strict=True):
             m.perfs.append(t)
             if t < self.best_perf_so_far:

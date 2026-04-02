@@ -14,6 +14,7 @@ from helion._testing import onlyBackends
 from helion.autotuner.base_search import PopulationBasedSearch
 from helion.autotuner.base_search import PopulationMember
 from helion.autotuner.differential_evolution import DifferentialEvolutionSearch
+from helion.autotuner.external import _FakeEnv
 import helion.language as hl
 
 
@@ -65,6 +66,10 @@ class TestErrors(RefEagerTestDisabled, TestCase):
                 output_origin_lines: bool | None = None,
             ) -> str:
                 return ""
+
+            @property
+            def env(self):
+                return _FakeEnv(device=DEVICE)
 
         fake_kernel = FakeKernel()
         search = DifferentialEvolutionSearch(fake_kernel, args=())
