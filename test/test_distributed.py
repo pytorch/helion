@@ -429,6 +429,54 @@ class TestDistributed(TestCase, MultiProcessTestCase):
     @skipIfRocm("Distributed example requires CUDA/NCCL")
     @skipIfXPU("Distributed operations require CCL, not yet fully integrated")
     @skip_if_lt_x_gpu(4)
+    def test_fp8_matmul_reduce_scatter(self):
+        if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 9:
+            self.skipTest("FP8 requires CUDA compute capability >= 9.0")
+        self._init_process()
+
+        mod = import_path(EXAMPLES_DIR / "distributed" / "fp8_matmul_reduce_scatter.py")
+
+        _SymmetricMemory.signal_pad_size = 1024 * 1024 * 16
+        M, N, K = 512, 768, 1024
+
+        torch.manual_seed(42 + self.rank)
+        a = torch.randn(M, K, device=self.device).to(torch.float8_e4m3fn)
+
+        torch.manual_seed(42)
+        b = (
+            torch.randn(K, N, device=self.device)
+            .to(torch.float8_e4m3fn)
+            .t()
+            .contiguous()
+            .t()
+        )
+
+        scale_a = torch.rand(M, 1, device=self.device)
+        scale_b = torch.rand(1, N, device=self.device)
+
+        symm_mem_buffer = symm_mem.empty(M, N, dtype=torch.bfloat16, device=self.device)
+        symm_mem_hdl = symm_mem.rendezvous(symm_mem_buffer, dist.group.WORLD.group_name)
+
+        result = mod.fp8_matmul_reduce_scatter_kernel(
+            a,
+            b,
+            scale_a,
+            scale_b,
+            symm_mem_buffer,
+            symm_mem_hdl.signal_pad_ptrs_dev,
+            RANK=symm_mem_hdl.rank,
+            WORLD_SIZE=symm_mem_hdl.world_size,
+            GROUP_NAME=dist.group.WORLD.group_name,
+        )
+
+        expected = mod.reference_fp8_matmul_reduce_scatter(a, b, scale_a, scale_b)
+
+        torch.testing.assert_close(result, expected, rtol=8e-1, atol=8e-1)
+        self._cleanup_process()
+
+    @skipIfRocm("Distributed example requires CUDA/NCCL")
+    @skipIfXPU("Distributed operations require CCL, not yet fully integrated")
+    @skip_if_lt_x_gpu(4)
     def test_two_dim_parallel_matmul(self):
         self._init_process()
         mod = import_path(EXAMPLES_DIR / "distributed" / "two_dim_parallel_matmul.py")
