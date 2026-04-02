@@ -519,6 +519,13 @@ def _supports_maxnreg() -> bool:
 
 
 @functools.cache
+def _regs_per_block() -> int:
+    """Max 32-bit registers per block on the current CUDA device."""
+    props = torch.cuda.get_device_properties(torch.cuda.current_device())
+    return props.regs_per_multiprocessor  # pyrefly: ignore[missing-attribute]
+
+
+@functools.cache
 def requires_torch_version(min_version: str) -> bool:
     """Check if PyTorch version meets the minimum requirement.
 
