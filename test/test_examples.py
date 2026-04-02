@@ -691,6 +691,43 @@ class TestExamples(RefEagerTestBase, TestCase):
             pid_type="xyz",
         )
 
+    def test_epilogue_subtiling_residual_gelu(self):
+        m, k, n = 8192, 8192, 8192
+        x = torch.randn([m, k], device=DEVICE, dtype=HALF_DTYPE)
+        w = torch.randn([k, n], device=DEVICE, dtype=HALF_DTYPE)
+        bias = torch.randn([n], device=DEVICE, dtype=HALF_DTYPE)
+        residual = torch.randn([m, n], device=DEVICE, dtype=HALF_DTYPE)
+        acc = x.float() @ w.float()
+        expected = torch.nn.functional.gelu(
+            acc * 1.25 + residual.float() * 0.5 + bias.float()
+        ).half()
+        check_example(
+            "epilogue_subtiling",
+            (x, w, bias, residual),
+            expected,
+            fn_name="matmul_bias_residual_gelu_cast",
+            block_sizes=[64, 64, 64],
+        )
+
+    def test_epilogue_subtiling_gelu_aux(self):
+        m, k, n = 8192, 8192, 8192
+        x = torch.randn([m, k], device=DEVICE, dtype=HALF_DTYPE)
+        w = torch.randn([k, n], device=DEVICE, dtype=HALF_DTYPE)
+        bias = torch.randn([n], device=DEVICE, dtype=HALF_DTYPE)
+        acc = x.float() @ w.float()
+        pre = acc * 1.25 + bias.float()
+        expected = (
+            torch.nn.functional.gelu(pre).half(),
+            pre.half(),
+        )
+        check_example(
+            "epilogue_subtiling",
+            (x, w, bias),
+            expected,
+            fn_name="matmul_bias_gelu_aux",
+            block_sizes=[64, 64, 64],
+        )
+
     @skipIfFn(
         lambda: _get_backend() == "cute",
         "CuTe attention pointer destabilizes later cute tests when it fails in-process",
