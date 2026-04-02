@@ -3,8 +3,8 @@ Run all linear attention examples (test + benchmark).
 
 Usage::
 
-    python -m examples.linear.examples_all
-    HELION_USE_DEFAULT_CONFIG=1 python -m examples.linear.examples_all
+    python -m examples.linear.all
+    HELION_USE_DEFAULT_CONFIG=1 python -m examples.linear.all
 """
 
 from __future__ import annotations

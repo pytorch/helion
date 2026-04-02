@@ -13,6 +13,7 @@ the pure PyTorch reference for this combination.
 from __future__ import annotations
 
 import math
+import warnings
 
 import torch
 import torch.nn.functional as F
@@ -22,7 +23,9 @@ from .linear_attention_engine import LinearAttentionEngine
 from .linear_attention_engine import chunked_linear_attn
 from .linear_attention_engine import recurrent_step
 from .linear_attention_utils import chunked_linear_attn_reference
+from .linear_attention_utils import head_to_time_first as _htf
 from .linear_attention_utils import naive_recurrent_reference
+from .linear_attention_utils import rel_error as _rel_error
 from helion._testing import DEVICE
 
 B, H, T, D, DV = 2, 4, 128, 32, 32
@@ -30,16 +33,6 @@ C = 32
 DTYPE = torch.bfloat16
 BENCH_CONFIGS = [(1, 32, 2048, 128, 128), (1, 32, 4096, 128, 128)]
 BENCH_C = 64
-
-
-def _rel_error(a: torch.Tensor, b: torch.Tensor) -> float:
-    return (a.float() - b.float()).norm().item() / b.float().norm().clamp(
-        min=1e-8
-    ).item()
-
-
-def _htf(x: torch.Tensor) -> torch.Tensor:
-    return x.transpose(1, 2).contiguous()
 
 
 def test() -> None:
@@ -151,7 +144,11 @@ def test() -> None:
 
 def benchmark() -> None:
     """Benchmark KDA forward+backward, comparing against FLA."""
-    from fla.ops.kda import chunk_kda
+    try:
+        from fla.ops.kda import chunk_kda
+    except ImportError:
+        warnings.warn("fla not installed, skipping benchmark", stacklevel=1)
+        return
 
     scale = 1.0 / math.sqrt(128)
 
@@ -178,7 +175,6 @@ def benchmark() -> None:
         vt = _htf(v.detach())
         gt = _htf(g)
         bt = _htf(beta)
-        go_t = _htf(grad_out)
 
         fwd_ms = do_bench(
             lambda q=q, k=k, v=v, g=g, beta=beta: chunked_linear_attn(

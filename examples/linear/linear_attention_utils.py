@@ -17,6 +17,24 @@ import math
 import torch
 import torch.nn.functional as F
 
+
+# ════════════════════════════════════════════════════════════════════════════════
+# Shared test helpers
+# ════════════════════════════════════════════════════════════════════════════════
+
+
+def rel_error(a: torch.Tensor, b: torch.Tensor) -> float:
+    """Relative L2 error between two tensors."""
+    return (a.float() - b.float()).norm().item() / b.float().norm().clamp(
+        min=1e-8
+    ).item()
+
+
+def head_to_time_first(x: torch.Tensor) -> torch.Tensor:
+    """Head-first [B,H,T,...] -> time-first [B,T,H,...] for FLA."""
+    return x.transpose(1, 2).contiguous()
+
+
 # ════════════════════════════════════════════════════════════════════════════════
 # Reference implementation (pure PyTorch, for validation only)
 # ════════════════════════════════════════════════════════════════════════════════
@@ -280,7 +298,7 @@ def prepare_wy_repr_bwd(
 # ════════════════════════════════════════════════════════════════════════════════
 
 
-def recurrent_step(
+def recurrent_step_reference(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -289,7 +307,10 @@ def recurrent_step(
     beta_val: torch.Tensor | None = None,
     a_val: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Single-step recurrent update. Returns (output, new_state)."""
+    """Single-step recurrent update (pure PyTorch reference).
+
+    Returns (output, new_state).
+    """
     k_sq = k.squeeze(2)
     v_sq = v.squeeze(2)
     q_sq = q.squeeze(2)

@@ -2221,6 +2221,10 @@ class TestExamples(RefEagerTestBase, TestCase):
 
     def test_linear_monkeypatch_gla(self):
         """Monkey-patch FLA's GatedLinearAttention to use our engine, verify fwd+bwd."""
+        try:
+            import fla  # noqa: F401
+        except ImportError:
+            self.skipTest("fla not installed")
         from examples.linear.linear_attention_engine import chunked_linear_attn
         import fla.layers.gla as _fla_gla_mod
         from fla.layers.gla import GatedLinearAttention
@@ -2289,6 +2293,10 @@ class TestExamples(RefEagerTestBase, TestCase):
 
     def test_linear_monkeypatch_delta_rule(self):
         """Monkey-patch FLA's DeltaNet to use our engine, verify fwd+bwd."""
+        try:
+            import fla  # noqa: F401
+        except ImportError:
+            self.skipTest("fla not installed")
         from examples.linear.linear_attention_engine import chunked_linear_attn
         import fla.layers.delta_net as _fla_dn_mod
         from fla.layers.delta_net import DeltaNet
@@ -2366,6 +2374,10 @@ class TestExamples(RefEagerTestBase, TestCase):
 
     def test_linear_monkeypatch_gated_delta_rule(self):
         """Monkey-patch FLA's GatedDeltaNet to use our engine, verify fwd+bwd."""
+        try:
+            import fla  # noqa: F401
+        except ImportError:
+            self.skipTest("fla not installed")
         from examples.linear.linear_attention_engine import chunked_linear_attn
         import fla.layers.gated_deltanet as _fla_gdn_mod
         from fla.layers.gated_deltanet import GatedDeltaNet
@@ -2445,6 +2457,10 @@ class TestExamples(RefEagerTestBase, TestCase):
 
     def test_linear_monkeypatch_simple_gla(self):
         """Monkey-patch FLA's SimpleGatedLinearAttention to use our engine."""
+        try:
+            import fla  # noqa: F401
+        except ImportError:
+            self.skipTest("fla not installed")
         from examples.linear.linear_attention_engine import chunked_linear_attn
         import fla.layers.simple_gla as _fla_sgla_mod
         from fla.layers.simple_gla import SimpleGatedLinearAttention

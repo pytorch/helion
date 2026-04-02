@@ -19,10 +19,12 @@ from typing import Callable
 
 import torch
 
-from .linear_attention_utils import prepare_wy_repr_bwd
-from .linear_attention_utils import solve_tril_inv
+import helion  # noqa: F401
 import helion.experimental
 import helion.language as hl
+
+from .linear_attention_utils import prepare_wy_repr_bwd
+from .linear_attention_utils import solve_tril_inv
 
 # ════════════════════════════════════════════════════════════════════════════════
 # Interface
@@ -245,10 +247,10 @@ def recurrent_step(
     DV = v.shape[-1]
     BH = B * H
 
-    q_f = q.squeeze(2).reshape(BH, D)
-    k_f = k.squeeze(2).reshape(BH, D)
-    v_f = v.squeeze(2).reshape(BH, DV)
-    state_f = state.reshape(BH, D, DV)
+    q_f = q.squeeze(2).contiguous().reshape(BH, D)
+    k_f = k.squeeze(2).contiguous().reshape(BH, D)
+    v_f = v.squeeze(2).contiguous().reshape(BH, DV)
+    state_f = state.contiguous().reshape(BH, D, DV)
 
     if isinstance(alpha, torch.Tensor):
         alpha_sq = alpha.squeeze(2)

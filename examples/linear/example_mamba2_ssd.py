@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import sys
 import types
+import warnings
 from typing import TYPE_CHECKING
 
 import torch
@@ -21,8 +22,10 @@ from triton.testing import do_bench
 from .linear_attention_engine import chunked_linear_attn
 from .linear_attention_engine import recurrent_step
 from .linear_attention_utils import chunked_linear_attn_reference
+from .linear_attention_utils import head_to_time_first as _htf
 from .linear_attention_utils import make_mamba2_inputs
 from .linear_attention_utils import naive_recurrent_reference
+from .linear_attention_utils import rel_error as _rel_error
 from helion._testing import DEVICE
 
 if TYPE_CHECKING:
@@ -36,23 +39,18 @@ BENCH_CONFIGS = [(1, 32, 2048, 128, 128), (1, 32, 4096, 128, 128)]
 BENCH_C = 64
 
 
-def _rel_error(a: torch.Tensor, b: torch.Tensor) -> float:
-    return (a.float() - b.float()).norm().item() / b.float().norm().clamp(
-        min=1e-8
-    ).item()
-
-
-def _htf(x: torch.Tensor) -> torch.Tensor:
-    """Head-first [B,H,T,...] -> time-first [B,T,H,...] for FLA."""
-    return x.transpose(1, 2).contiguous()
-
-
-def _import_mamba() -> Callable[..., torch.Tensor]:
+def _import_mamba() -> Callable[..., torch.Tensor] | None:
     """Import mamba_chunk_scan_combined with shims for missing CUDA extensions."""
     for m in ["selective_scan_cuda", "causal_conv1d_cuda", "causal_conv1d"]:
         if m not in sys.modules:
             sys.modules[m] = types.ModuleType(m)
-    from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined
+    try:
+        from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined
+    except ImportError:
+        warnings.warn(
+            "mamba_ssm not installed, skipping mamba comparisons", stacklevel=2
+        )
+        return None
 
     return mamba_chunk_scan_combined
 
@@ -79,6 +77,7 @@ def test() -> None:
     """Forward + backward correctness vs reference and mamba_ssm."""
     torch.manual_seed(42)
     mamba_chunk_scan_combined = _import_mamba()
+    _has_mamba = mamba_chunk_scan_combined is not None
 
     # === Make inputs ===
     q, k, v, g, scale = make_mamba2_inputs(B, H, T, D, DV, dtype=DTYPE, device=DEVICE)
@@ -91,21 +90,26 @@ def test() -> None:
     print(f"  fwd vs recurrent: {fwd_err:.4e} PASS")
 
     # === Forward: vs mamba_ssm ===
-    # Build mamba-native inputs matching the same data
-    x, dt, A, B_mat, C_mat = _make_mamba_native_inputs(B, H, T, D, DV, DTYPE, DEVICE)
-    # Recompute q/k/v/g from mamba inputs for a fair comparison
-    q_m = C_mat.transpose(1, 2).contiguous()
-    k_m = B_mat.transpose(1, 2).contiguous()
-    v_m = (x * dt.unsqueeze(-1)).transpose(1, 2).contiguous()
-    g_m = (A[None, None, :] * dt).transpose(1, 2).contiguous()
+    if _has_mamba:
+        # Build mamba-native inputs matching the same data
+        x, dt, A, B_mat, C_mat = _make_mamba_native_inputs(
+            B, H, T, D, DV, DTYPE, DEVICE
+        )
+        # Recompute q/k/v/g from mamba inputs for a fair comparison
+        q_m = C_mat.transpose(1, 2).contiguous()
+        k_m = B_mat.transpose(1, 2).contiguous()
+        v_m = (x * dt.unsqueeze(-1)).transpose(1, 2).contiguous()
+        g_m = (A[None, None, :] * dt).transpose(1, 2).contiguous()
 
-    out_m = chunked_linear_attn(q_m, k_m, v_m, g_m, C=C)
-    o_mamba = mamba_chunk_scan_combined(
-        x, dt, A, B_mat, C_mat, chunk_size=C, D=None, dt_softplus=False
-    )
-    o_mamba_hf = o_mamba.transpose(1, 2).contiguous()
-    fla_err = _rel_error(out_m, o_mamba_hf)
-    print(f"  fwd vs mamba_ssm: {fla_err:.4e} {'PASS' if fla_err < 0.02 else 'FAIL'}")
+        out_m = chunked_linear_attn(q_m, k_m, v_m, g_m, C=C)
+        o_mamba = mamba_chunk_scan_combined(
+            x, dt, A, B_mat, C_mat, chunk_size=C, D=None, dt_softplus=False
+        )
+        o_mamba_hf = o_mamba.transpose(1, 2).contiguous()
+        fla_err = _rel_error(out_m, o_mamba_hf)
+        print(
+            f"  fwd vs mamba_ssm: {fla_err:.4e} {'PASS' if fla_err < 0.02 else 'FAIL'}"
+        )
 
     # === Backward: vs chunked reference ===
     grad_out = torch.randn(B, H, T, DV, device=DEVICE, dtype=DTYPE)
@@ -131,26 +135,27 @@ def test() -> None:
         print(f"  bwd {name} vs ref: {err:.4e} PASS")
 
     # === Backward: vs mamba_ssm (dq/dC comparison) ===
-    q3 = q_m.clone().requires_grad_(True)
-    k3 = k_m.clone().requires_grad_(True)
-    v3 = v_m.clone().requires_grad_(True)
-    o3 = chunked_linear_attn(q3, k3, v3, g_m, C=C)
-    grad_out_m = torch.randn(B, H, T, DV, device=DEVICE, dtype=DTYPE)
-    o3.backward(grad_out_m)
+    if _has_mamba:
+        q3 = q_m.clone().requires_grad_(True)
+        k3 = k_m.clone().requires_grad_(True)
+        v3 = v_m.clone().requires_grad_(True)
+        o3 = chunked_linear_attn(q3, k3, v3, g_m, C=C)
+        grad_out_m = torch.randn(B, H, T, DV, device=DEVICE, dtype=DTYPE)
+        o3.backward(grad_out_m)
 
-    C2 = C_mat.clone().requires_grad_(True)
-    B2 = B_mat.clone().requires_grad_(True)
-    x2 = x.clone().requires_grad_(True)
-    dt2 = dt.clone().requires_grad_(True)
-    o4 = mamba_chunk_scan_combined(
-        x2, dt2, A, B2, C2, chunk_size=C, D=None, dt_softplus=False
-    )
-    o4.backward(_htf(grad_out_m))
+        C2 = C_mat.clone().requires_grad_(True)
+        B2 = B_mat.clone().requires_grad_(True)
+        x2 = x.clone().requires_grad_(True)
+        dt2 = dt.clone().requires_grad_(True)
+        o4 = mamba_chunk_scan_combined(
+            x2, dt2, A, B2, C2, chunk_size=C, D=None, dt_softplus=False
+        )
+        o4.backward(_htf(grad_out_m))
 
-    dq_err = _rel_error(q3.grad, C2.grad.transpose(1, 2).contiguous())
-    print(f"  bwd dq vs mamba:  {dq_err:.4e} {'PASS' if dq_err < 0.05 else 'FAIL'}")
-    dk_err = _rel_error(k3.grad, B2.grad.transpose(1, 2).contiguous())
-    print(f"  bwd dk vs mamba:  {dk_err:.4e} (info)")
+        dq_err = _rel_error(q3.grad, C2.grad.transpose(1, 2).contiguous())
+        print(f"  bwd dq vs mamba:  {dq_err:.4e} {'PASS' if dq_err < 0.05 else 'FAIL'}")
+        dk_err = _rel_error(k3.grad, B2.grad.transpose(1, 2).contiguous())
+        print(f"  bwd dk vs mamba:  {dk_err:.4e} (info)")
 
     # === Recurrent step: compare step-by-step vs chunked ===
     torch.manual_seed(42)
@@ -184,6 +189,9 @@ def test() -> None:
 def benchmark() -> None:
     """Benchmark forward and fwd+bwd, comparing against mamba_ssm."""
     mamba_chunk_scan_combined = _import_mamba()
+    if mamba_chunk_scan_combined is None:
+        warnings.warn("mamba_ssm not installed, skipping benchmark", stacklevel=1)
+        return
 
     print(
         f"{'Config':<24} {'Helion fwd':>10} {'Mamba fwd':>10}"

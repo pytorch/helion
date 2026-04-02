@@ -10,6 +10,7 @@ reference backward, plus a benchmark suite comparing against FLA.
 from __future__ import annotations
 
 import math
+import warnings
 
 import torch
 import torch.nn.functional as F
@@ -18,8 +19,10 @@ from triton.testing import do_bench
 from .linear_attention_engine import chunked_linear_attn
 from .linear_attention_engine import recurrent_step
 from .linear_attention_utils import chunked_linear_attn_reference
+from .linear_attention_utils import head_to_time_first as _htf
 from .linear_attention_utils import make_full_gla_inputs
 from .linear_attention_utils import naive_recurrent_reference
+from .linear_attention_utils import rel_error as _rel_error
 from helion._testing import DEVICE
 
 # Test/benchmark config
@@ -28,17 +31,6 @@ C = 32
 DTYPE = torch.bfloat16
 BENCH_CONFIGS = [(1, 32, 2048, 128, 128), (1, 32, 4096, 128, 128)]
 BENCH_C = 64
-
-
-def _rel_error(a: torch.Tensor, b: torch.Tensor) -> float:
-    return (a.float() - b.float()).norm().item() / b.float().norm().clamp(
-        min=1e-8
-    ).item()
-
-
-def _htf(x: torch.Tensor) -> torch.Tensor:
-    """Head-first [B,H,T,...] -> time-first [B,T,H,...] for FLA."""
-    return x.transpose(1, 2).contiguous()
 
 
 def test() -> None:
@@ -56,12 +48,19 @@ def test() -> None:
     print(f"  fwd vs recurrent: {fwd_err:.4e} PASS")
 
     # === Forward: vs FLA ===
-    from fla.ops.gla import chunk_gla
+    try:
+        from fla.ops.gla import chunk_gla
 
-    o_fla, _ = chunk_gla(_htf(q), _htf(k), _htf(v), _htf(g), scale=scale)
-    o_fla_hf = o_fla.transpose(1, 2).contiguous()
-    fla_err = _rel_error(out, o_fla_hf)
-    print(f"  fwd vs FLA:       {fla_err:.4e} {'PASS' if fla_err < 0.02 else 'FAIL'}")
+        o_fla, _ = chunk_gla(_htf(q), _htf(k), _htf(v), _htf(g), scale=scale)
+        o_fla_hf = o_fla.transpose(1, 2).contiguous()
+        fla_err = _rel_error(out, o_fla_hf)
+        print(
+            f"  fwd vs FLA:       {fla_err:.4e} {'PASS' if fla_err < 0.02 else 'FAIL'}"
+        )
+        _has_fla = True
+    except ImportError:
+        warnings.warn("fla not installed, skipping FLA comparisons", stacklevel=1)
+        _has_fla = False
 
     # === Backward: vs chunked reference ===
     grad_out = torch.randn(B, H, T, DV, device=DEVICE, dtype=DTYPE)
@@ -87,24 +86,27 @@ def test() -> None:
         print(f"  bwd {name} vs ref: {err:.4e} PASS")
 
     # === Backward: vs FLA (dq comparison) ===
-    q3 = q.clone().requires_grad_(True)
-    k3 = k.clone().requires_grad_(True)
-    v3 = v.clone().requires_grad_(True)
-    o3 = chunked_linear_attn(q3 * scale, k3, v3, g, C=C)
-    o3.backward(grad_out)
+    if _has_fla:
+        from fla.ops.gla import chunk_gla
 
-    q4 = _htf(q).clone().requires_grad_(True)
-    k4 = _htf(k).clone().requires_grad_(True)
-    v4 = _htf(v).clone().requires_grad_(True)
-    o4, _ = chunk_gla(q4, k4, v4, _htf(g), scale=scale)
-    o4.backward(_htf(grad_out))
+        q3 = q.clone().requires_grad_(True)
+        k3 = k.clone().requires_grad_(True)
+        v3 = v.clone().requires_grad_(True)
+        o3 = chunked_linear_attn(q3 * scale, k3, v3, g, C=C)
+        o3.backward(grad_out)
 
-    dq_err = _rel_error(q3.grad, q4.grad.transpose(1, 2).contiguous())
-    print(f"  bwd dq vs FLA:    {dq_err:.4e} {'PASS' if dq_err < 0.05 else 'FAIL'}")
-    dk_err = _rel_error(k3.grad, k4.grad.transpose(1, 2).contiguous())
-    dv_err = _rel_error(v3.grad, v4.grad.transpose(1, 2).contiguous())
-    print(f"  bwd dk vs FLA:    {dk_err:.4e} (info)")
-    print(f"  bwd dv vs FLA:    {dv_err:.4e} (info)")
+        q4 = _htf(q).clone().requires_grad_(True)
+        k4 = _htf(k).clone().requires_grad_(True)
+        v4 = _htf(v).clone().requires_grad_(True)
+        o4, _ = chunk_gla(q4, k4, v4, _htf(g), scale=scale)
+        o4.backward(_htf(grad_out))
+
+        dq_err = _rel_error(q3.grad, q4.grad.transpose(1, 2).contiguous())
+        print(f"  bwd dq vs FLA:    {dq_err:.4e} {'PASS' if dq_err < 0.05 else 'FAIL'}")
+        dk_err = _rel_error(k3.grad, k4.grad.transpose(1, 2).contiguous())
+        dv_err = _rel_error(v3.grad, v4.grad.transpose(1, 2).contiguous())
+        print(f"  bwd dk vs FLA:    {dk_err:.4e} (info)")
+        print(f"  bwd dv vs FLA:    {dv_err:.4e} (info)")
 
     # === Recurrent step: compare step-by-step vs chunked ===
     torch.manual_seed(42)
@@ -139,7 +141,11 @@ def test() -> None:
 
 def benchmark() -> None:
     """Benchmark forward and fwd+bwd, comparing against FLA."""
-    from fla.ops.gla import chunk_gla
+    try:
+        from fla.ops.gla import chunk_gla
+    except ImportError:
+        warnings.warn("fla not installed, skipping benchmark", stacklevel=1)
+        return
 
     print(
         f"{'Config':<24} {'Helion fwd':>10} {'FLA fwd':>10}"

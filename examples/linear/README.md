@@ -10,6 +10,23 @@ comparing Helion kernel performance against those libraries.
 This work builds on ideas from the
 [Attention Engine](https://github.com/fla-org/attention-engine) project.
 
+## Dependencies
+
+The examples require the following optional packages for reference comparisons
+and benchmarks:
+
+```bash
+# flash-linear-attention (FLA) — reference for most variants
+pip install fla
+
+# mamba — reference for Mamba-2 SSD only
+pip install mamba_ssm
+```
+
+If these are not installed, the examples will still run their core correctness
+tests against the pure-PyTorch reference, but FLA/mamba comparisons and
+benchmarks will be skipped with a warning.
+
 ## Variants
 
 | Example | Decay | Correction | FLA baseline |
@@ -53,7 +70,12 @@ pytest test/test_examples.py -k "monkeypatch" -v
 ## AOT autotuning
 
 The kernels use `@helion.experimental.aot_kernel()` and are ready for
-ahead-of-time autotuning:
+ahead-of-time autotuning.
+
+**Note:** `HELION_AUTOTUNE_IGNORE_ERRORS=1` is required because certain
+autotuner-generated configs (specifically `flatten_loops=True` for kernels
+using `.sum()` reductions) trigger a Helion codegen bug. These configs are
+automatically skipped when ignore-errors is enabled.
 
 ```bash
 # Quick tuning of all examples:
@@ -68,8 +90,6 @@ HELION_AUTOTUNE_IGNORE_ERRORS=1 \
 python -m helion.experimental.aot_runner --phase all \
   -- python -m examples.linear.all
 
-# Multi-GPU tuning:
-./examples/linear/run_aot_tuning.sh
 ```
 
 ## Acknowledgements
