@@ -25,7 +25,6 @@ jobs:
   benchmark-tpu:
     uses: ./.github/workflows/benchmark_tpu.yml
     permissions:
-      id-token: write
       contents: read
     with:
       kernels: ${{ github.event.inputs.kernels || 'exp,add,softmax_two_pass,welford,layer_norm' }}
