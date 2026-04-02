@@ -24,6 +24,9 @@ import helion
 from helion._testing import DEVICE
 from helion._testing import assert_close_with_mismatch_tolerance
 from helion._testing import run_example
+from helion.autotuner.base_search import (
+    _assert_close as assert_close_with_mismatch_tolerance,
+)
 import helion.language as hl
 from helion.runtime.dist_utils import symm_mem_sync
 
@@ -33,13 +36,17 @@ tolerance = {
     "max_mismatch_pct": 1e-3,
 }
 
+config = helion.Config(
+    block_sizes=[64, 64, 32],  # M, N, K
+    num_warps=8,
+    num_stages=3,
+)
+
+# config = helion.Config(block_sizes=[64, 128, 128], indexing=['pointer', 'pointer', 'pointer', 'tensor_descriptor', 'pointer', 'pointer', 'pointer', 'pointer', 'tensor_descriptor', 'pointer', 'pointer', 'pointer', 'tensor_descriptor', 'pointer'], l2_groupings=[1], load_eviction_policies=['last', '', '', '', '', 'first', '', '', '', '', '', 'last'], loop_orders=[[0, 1]], num_sm_multiplier=2, num_stages=1, num_warps=8, pid_type='persistent_blocked', range_flattens=[None, None], range_multi_buffers=[True, None], range_unroll_factors=[3, 0], range_warp_specializes=[])
+
 
 @helion.kernel(
-    config=helion.Config(
-        block_sizes=[64, 64, 32],  # M, N, K
-        num_warps=8,
-        num_stages=3,
-    ),
+    config=config,
     static_shapes=True,
     ignore_warnings=[helion.exc.TensorOperationInWrapper],
     autotune_baseline_accuracy_check_fn=functools.partial(

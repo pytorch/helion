@@ -635,8 +635,9 @@ class BaseSearch(BaseAutotuner):
             custom_check = self.settings.autotune_baseline_accuracy_check_fn
             if custom_check is not None:
                 custom_check(output, self._baseline_output)
-                if len(self._mutated_arg_indices) > 0:
-                    custom_check(args, self._baseline_post_args)
+                if os.getenv("CHECK_INPUT_ACCURACY", "1") == "1":
+                    if len(self._mutated_arg_indices) > 0:
+                        custom_check(args, self._baseline_post_args)
             else:
                 _assert_close(
                     output,

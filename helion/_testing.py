@@ -34,8 +34,10 @@ from ._dist_utils import sync_object as sync_object
 from ._utils import counters
 from .runtime.settings import _get_backend
 from .runtime.settings import is_pallas_interpret
+from helion.autotuner.base_search import (
+    _assert_close as assert_close_with_mismatch_tolerance,
+)
 from helion.autotuner.base_search import _clone_args
-from helion.autotuner.base_search import _assert_close as assert_close_with_mismatch_tolerance
 
 if _get_backend() == "pallas":
     from .autotuner.benchmarking import compute_repeat_generic as compute_repeat
@@ -1541,4 +1543,3 @@ class TestCase(unittest.TestCase):
             yield capture
         finally:
             sys.stdout, sys.stderr = old_stdout, old_stderr
-
