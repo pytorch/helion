@@ -19,6 +19,7 @@ from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
 from helion._testing import skipIfRefEager
+from helion._testing import skipIfRocm
 from helion._testing import skipIfXPU
 from helion._testing import skipUnlessCuteAvailable
 from helion._testing import xfailIfCute
@@ -866,6 +867,7 @@ class TestRNG(RefEagerTestBase, TestCase):
         "CuTe matmul plus specialized-dimension rand_like still returns unstable NaNs"
     )
     @skipIfRefEager("compiled codegen inspection is not applicable in ref eager mode")
+    @skipIfRocm("ROCm Triton worker crashes on specialized-dimension rand_like")
     def test_rand_like_with_specialized_dimension(self):
         """Test torch.rand_like with specialized (constant) dimensions."""
 

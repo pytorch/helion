@@ -11,12 +11,20 @@ from .. import exc
 from .._compiler.ast_extension import expr_from_string
 from .._compiler.ast_extension import statement_from_string
 from .._compiler.compile_environment import CompileEnvironment
+from .._compiler.compile_environment import _symint_expr
+from .._compiler.host_function import HostFunction
 from .._compiler.indexing_strategy import SubscriptIndexing
+from .._compiler.variable_origin import GridOrigin
+from .._compiler.variable_origin import TileBeginOrigin
+from .._compiler.variable_origin import TileCountOrigin
+from .._compiler.variable_origin import TileEndOrigin
+from .._compiler.variable_origin import TileIdOrigin
 from . import _decorators
 from .stack_tensor import StackTensor
 
 if TYPE_CHECKING:
     from .._compiler.inductor_lowering import CodegenState
+    from .._compiler.tile_strategy import LoopDimInfo
 
 __all__ = ["load", "store"]
 
@@ -536,6 +544,91 @@ def _cute_index_exprs(
 ) -> list[str]:
     env = CompileEnvironment.current()
 
+    def symint_index_expr(idx: torch.SymInt, used_block_ids: set[int]) -> str:
+        expr = _symint_expr(idx)
+        if expr is not None:
+            origin_info = HostFunction.current().expr_to_origin.get(expr)
+            if origin_info is not None and isinstance(origin_info.origin, GridOrigin):
+                if type(origin_info.origin) is not GridOrigin:
+                    block_id = origin_info.origin.block_id
+                    loop_info = active_loop_info(block_id)
+                    begin_var = tile_begin_expr(block_id, loop_info)
+                    block_size_var = (
+                        state.device_function.block_size_var(block_id) or "1"
+                    )
+                    if isinstance(origin_info.origin, TileBeginOrigin):
+                        return begin_var
+                    if isinstance(origin_info.origin, TileEndOrigin):
+                        if loop_info is not None and loop_info.end_var_name is not None:
+                            return loop_info.end_var_name
+                        return f"({begin_var}) + ({block_size_var})"
+                    if isinstance(origin_info.origin, TileCountOrigin):
+                        end_var = (
+                            loop_info.end_var_name
+                            if loop_info is not None
+                            and loop_info.end_var_name is not None
+                            else f"({begin_var}) + ({block_size_var})"
+                        )
+                        extent = f"({end_var}) - ({begin_var})"
+                        return env.backend.cdiv_expr(
+                            extent, block_size_var, is_device=True
+                        )
+                    if isinstance(origin_info.origin, TileIdOrigin):
+                        if block_size_var == "1":
+                            return begin_var
+                        return f"({begin_var}) // ({block_size_var})"
+                    return state.sympy_expr(expr)
+        block_id = env.get_block_id(idx)
+        if block_id is not None:
+            used_block_ids.add(block_id)
+            return index_var_for_block_id(block_id, idx)
+        if expr is not None:
+            return state.sympy_expr(expr)
+        raise exc.BackendUnsupported("cute", f"unlowerable symbolic index: {idx}")
+
+    def active_loop_info(block_id: int) -> LoopDimInfo | None:
+        loops = state.codegen.active_device_loops.get(block_id)
+        if loops:
+            return loops[-1].block_id_to_info.get(block_id)
+        grid_state = state.codegen.current_grid_state
+        if grid_state is not None:
+            return grid_state.block_id_to_info.get(block_id)
+        return None
+
+    def active_local_coord(block_id: int) -> str | None:
+        from .._compiler.cute.cute_reshape import _grid_local_coord_expr
+
+        loops = state.codegen.active_device_loops.get(block_id)
+        if loops:
+            thread_axis = loops[-1].block_thread_axes.get(block_id)
+            if thread_axis is not None:
+                return _grid_local_coord_expr(state.codegen, block_id, thread_axis)
+        grid_state = state.codegen.current_grid_state
+        if grid_state is not None:
+            thread_axis = grid_state.block_thread_axes.get(block_id)
+            if thread_axis is not None:
+                return _grid_local_coord_expr(state.codegen, block_id, thread_axis)
+        return None
+
+    def tile_begin_expr(block_id: int, loop_info: LoopDimInfo | None) -> str:
+        loops = state.codegen.active_device_loops.get(block_id)
+        if loops:
+            return state.codegen.offset_var(block_id)
+        begin_var = "0"
+        if loop_info is not None and loop_info.begin_var_name is not None:
+            begin_var = loop_info.begin_var_name
+        global_index = active_index_var(block_id)
+        local_coord = active_local_coord(block_id)
+        if global_index is not None and local_coord is not None:
+            return state.codegen.lift(
+                expr_from_string(f"({global_index}) - ({local_coord})"),
+                dce=True,
+                prefix="tile_begin",
+            ).id
+        if global_index is not None:
+            return global_index
+        return begin_var
+
     def active_index_var(block_id: int) -> str | None:
         loops = state.codegen.active_device_loops.get(block_id)
         if loops:
@@ -607,12 +700,7 @@ def _cute_index_exprs(
         if idx is None:
             continue
         if isinstance(idx, torch.SymInt):
-            block_id = env.get_block_id(idx)
-            if block_id is not None:
-                used_block_ids.add(block_id)
-                result.append(index_var_for_block_id(block_id, idx))
-            else:
-                result.append(state.sympy_expr(idx._sympy_()))
+            result.append(symint_index_expr(idx, used_block_ids))
             tensor_dim += 1
         elif isinstance(idx, int):
             result.append(str(idx))
@@ -630,7 +718,8 @@ def _cute_index_exprs(
                     "cute", f"tensor index without AST at position {pos}"
                 )
             lifted = state.codegen.lift(ast_idx, dce=True, prefix="index")
-            result.append(lifted.id)
+            index_dtype = env.backend.dtype_str(env.index_dtype)
+            result.append(f"{index_dtype}({lifted.id})")
             tensor_dim += 1
         elif isinstance(idx, slice) and idx == slice(None):
             if tensor is None:
@@ -952,6 +1041,12 @@ def _(state: CodegenState) -> ast.AST:
     _log_cute_layout(state, "store")
 
     tensor_name = state.device_function.tensor_arg(tensor).name
+    backend = CompileEnvironment.current().backend
+    target_dtype = backend.dtype_str(tensor.dtype)
+    value = expr_from_string(
+        backend.ast_to_dtype_expr("{value}", target_dtype),
+        value=value,
+    )
     index_exprs = _cute_index_exprs(
         state,
         subscript,

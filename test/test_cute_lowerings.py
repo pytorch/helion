@@ -51,7 +51,10 @@ from helion._compiler.cute.indexing import match_cute_affine_range_iota
 from helion._compiler.cute.indexing import match_cute_duplicate_stack_reshape_rhs
 from helion._compiler.cute.indexing import match_cute_stack_reshape_rhs
 from helion._compiler.cute.matmul_fallback import _emit_cute_grouped_sum_reduction
+from helion._compiler.cute.matmul_utils import cute_resolve_active_block_id
+from helion._compiler.cute.matmul_utils import cute_resolve_active_matmul_k_block_id
 from helion._compiler.cute.matmul_utils import cute_static_k_invariant_extent
+from helion._compiler.cute.matmul_utils import cute_supports_scalar_matmul_fallback
 from helion._compiler.device_ir import ForLoopGraphInfo
 from helion._compiler.device_ir import RootGraphInfo
 from helion._compiler.host_function import HostFunction
@@ -228,6 +231,7 @@ def _fake_env(
     return SimpleNamespace(
         backend=backend,
         block_sizes=block_sizes,
+        canonical_block_id=lambda block_id: block_id,
         get_block_id=lambda size: block_ids_by_size.get(int(size)),
         known_equal=lambda lhs, rhs: int(lhs) == int(rhs),
         resolve_block_id=lambda size: block_ids_by_size.get(int(size)),
@@ -571,7 +575,10 @@ class TestCuteLowerings(unittest.TestCase):
         mm.meta["val"] = torch.empty(4, 4)
 
         ctx = SimpleNamespace(
-            cg=object(),
+            cg=SimpleNamespace(
+                current_grid_state=SimpleNamespace(block_ids=[7]),
+                active_device_loops={},
+            ),
             env={
                 lhs: ast.Name(id="lhs_tile", ctx=ast.Load()),
                 rhs: ast.Name(id="rhs_tile", ctx=ast.Load()),
@@ -613,7 +620,7 @@ class TestCuteLowerings(unittest.TestCase):
         mm.meta["val"] = torch.empty(4, 4)
 
         ctx = SimpleNamespace(
-            cg=object(),
+            cg=SimpleNamespace(current_grid_state=None, active_device_loops={}),
             env={
                 lhs: ast.Name(id="lhs_tile", ctx=ast.Load()),
                 lo: ast.Name(id="lo_tile", ctx=ast.Load()),
@@ -627,6 +634,10 @@ class TestCuteLowerings(unittest.TestCase):
 
         with (
             patch.object(CompileEnvironment, "current", return_value=env),
+            patch(
+                "helion._compiler.aten_lowering.cute_static_k_invariant_extent",
+                return_value=16,
+            ),
             patch(
                 "helion._compiler.aten_lowering._emit_cute_matmul",
                 return_value=ast.Name(id="mm_result", ctx=ast.Load()),
@@ -655,7 +666,10 @@ class TestCuteLowerings(unittest.TestCase):
         mm.meta["val"] = torch.empty(4, 4)
 
         ctx = SimpleNamespace(
-            cg=object(),
+            cg=SimpleNamespace(
+                current_grid_state=SimpleNamespace(block_ids=[11]),
+                active_device_loops={},
+            ),
             env={
                 lhs: CutePackedAffineLoad(
                     (
@@ -700,7 +714,7 @@ class TestCuteLowerings(unittest.TestCase):
         add.meta["val"] = torch.empty(4, 4, dtype=torch.float32)
 
         ctx = SimpleNamespace(
-            cg=object(),
+            cg=SimpleNamespace(current_grid_state=None, active_device_loops={}),
             env={
                 lhs: ast.Name(id="lhs_tile", ctx=ast.Load()),
                 rhs: ast.Name(id="rhs_tile", ctx=ast.Load()),
@@ -710,6 +724,10 @@ class TestCuteLowerings(unittest.TestCase):
 
         with (
             patch.object(CompileEnvironment, "current", return_value=env),
+            patch(
+                "helion._compiler.aten_lowering.cute_static_k_invariant_extent",
+                return_value=8,
+            ),
             patch(
                 "helion._compiler.aten_lowering._emit_cute_matmul",
                 return_value=ast.Name(id="mm_result", ctx=ast.Load()),
@@ -735,7 +753,7 @@ class TestCuteLowerings(unittest.TestCase):
         add.meta["val"] = torch.empty(4, 4, dtype=torch.float16)
 
         ctx = SimpleNamespace(
-            cg=object(),
+            cg=SimpleNamespace(current_grid_state=None, active_device_loops={}),
             env={
                 lhs: ast.Name(id="lhs_tile", ctx=ast.Load()),
                 rhs: ast.Name(id="rhs_tile", ctx=ast.Load()),
@@ -745,6 +763,10 @@ class TestCuteLowerings(unittest.TestCase):
 
         with (
             patch.object(CompileEnvironment, "current", return_value=env),
+            patch(
+                "helion._compiler.aten_lowering.cute_static_k_invariant_extent",
+                return_value=8,
+            ),
             patch(
                 "helion._compiler.aten_lowering._emit_cute_matmul",
                 return_value=ast.Name(id="mm_result", ctx=ast.Load()),
@@ -789,13 +811,17 @@ class TestCuteLowerings(unittest.TestCase):
                 else ast.Constant(value=None)
             ),
             fx_node=dot_node,
-            codegen=object(),
+            codegen=SimpleNamespace(current_grid_state=None, active_device_loops={}),
             env={},
         )
         env = SimpleNamespace(resolve_block_id=lambda size: None)
 
         with (
             patch.object(CompileEnvironment, "current", return_value=env),
+            patch(
+                "helion.language.matmul_ops.cute_static_k_invariant_extent",
+                return_value=8,
+            ),
             patch(
                 "helion.language.matmul_ops._cute_mma_matches_dot_semantics",
                 return_value=False,
@@ -843,13 +869,17 @@ class TestCuteLowerings(unittest.TestCase):
                 else ast.Constant(value=None)
             ),
             fx_node=dot_node,
-            codegen=object(),
+            codegen=SimpleNamespace(current_grid_state=None, active_device_loops={}),
             env={},
         )
         env = SimpleNamespace(resolve_block_id=lambda size: None)
 
         with (
             patch.object(CompileEnvironment, "current", return_value=env),
+            patch(
+                "helion.language.matmul_ops.cute_static_k_invariant_extent",
+                return_value=8,
+            ),
             patch(
                 "helion.language.matmul_ops._cute_mma_matches_dot_semantics",
                 return_value=False,
@@ -900,7 +930,7 @@ class TestCuteLowerings(unittest.TestCase):
                 else ast.Constant(value=None)
             ),
             fx_node=dot_node,
-            codegen=object(),
+            codegen=SimpleNamespace(current_grid_state=None, active_device_loops={}),
             env={
                 lo: ast.Name(id="lo_tile", ctx=ast.Load()),
                 hi: ast.Name(id="hi_tile", ctx=ast.Load()),
@@ -913,6 +943,10 @@ class TestCuteLowerings(unittest.TestCase):
 
         with (
             patch.object(CompileEnvironment, "current", return_value=env),
+            patch(
+                "helion.language.matmul_ops.cute_static_k_invariant_extent",
+                return_value=16,
+            ),
             patch(
                 "helion.language.matmul_ops._cute_mma_matches_dot_semantics",
                 return_value=False,
@@ -966,7 +1000,10 @@ class TestCuteLowerings(unittest.TestCase):
                 None,
             ],
             fx_node=dot_node,
-            codegen=object(),
+            codegen=SimpleNamespace(
+                current_grid_state=SimpleNamespace(block_ids=[11]),
+                active_device_loops={},
+            ),
             env={
                 lo: ast.Name(id="lo_tile", ctx=ast.Load()),
                 hi: ast.Name(id="hi_tile", ctx=ast.Load()),
@@ -1817,6 +1854,63 @@ class TestCuteLowerings(unittest.TestCase):
 
         self.assertIsNone(cute_static_k_invariant_extent(lhs, rhs))
 
+    def test_cute_scalar_matmul_fallback_rejects_thread_carried_n(self):
+        cg = SimpleNamespace(
+            current_grid_state=SimpleNamespace(
+                block_ids=[0],
+                thread_axis_sizes={0: 32, 1: 4},
+            )
+        )
+        lhs = torch.empty(32, 128, dtype=torch.bfloat16)
+        rhs = torch.empty(128, 128, dtype=torch.bfloat16)
+        out = torch.empty(32, 128, dtype=torch.bfloat16)
+        env = SimpleNamespace(resolve_block_id=lambda size: None)
+
+        with patch.object(CompileEnvironment, "current", return_value=env):
+            self.assertFalse(
+                cute_supports_scalar_matmul_fallback(
+                    cg,
+                    lhs,
+                    rhs,
+                    out,
+                    k_block_id=None,
+                )
+            )
+
+    def test_cute_resolve_active_block_id_ignores_inactive_size_match(self):
+        cg = SimpleNamespace(
+            current_grid_state=SimpleNamespace(block_ids=[3]),
+            active_device_loops={},
+        )
+        env = _fake_env({128: 7, 32: 3})
+
+        with patch.object(CompileEnvironment, "current", return_value=env):
+            self.assertIsNone(cute_resolve_active_block_id(cg, 128))
+            self.assertEqual(cute_resolve_active_block_id(cg, 32), 3)
+
+    def test_cute_resolve_active_matmul_k_block_id_rejects_n_alias(self):
+        cg = SimpleNamespace(
+            current_grid_state=SimpleNamespace(block_ids=[7]),
+            active_device_loops={},
+        )
+        env = _fake_env({128: 7})
+
+        with patch.object(CompileEnvironment, "current", return_value=env):
+            self.assertIsNone(cute_resolve_active_matmul_k_block_id(cg, 128, 128, 128))
+
+    def test_cute_resolve_active_block_id_rejects_ambiguous_aliases(self):
+        cg = SimpleNamespace(
+            current_grid_state=SimpleNamespace(block_ids=[3, 5]),
+            active_device_loops={},
+        )
+        env = _fake_env({64: 7})
+        env.canonical_block_id = lambda block_id: {3: 11, 5: 11, 7: 11}.get(
+            block_id, block_id
+        )
+
+        with patch.object(CompileEnvironment, "current", return_value=env):
+            self.assertIsNone(cute_resolve_active_block_id(cg, 64))
+
     def test_resolve_block_id_requires_symbolic_origin(self) -> None:
         fake_env = SimpleNamespace(
             specialize_expr=lambda expr: expr,
@@ -2004,6 +2098,7 @@ class TestCuteLowerings(unittest.TestCase):
                 0: _FakeBlockSize(64),
                 1: _FakeBlockSize(64),
             },
+            get_block_id=lambda size: 1 if int(size) == 64 else None,
             resolve_block_id=lambda size: 0 if size is block_size else None,
             resolve_codegen_block_id=lambda block_id, cg, graph=None: (
                 1 if block_id == 0 else block_id
@@ -2017,7 +2112,57 @@ class TestCuteLowerings(unittest.TestCase):
         ):
             result = codegen_iota_cute(ctx, iota)
 
-        self.assertEqual(ast.unparse(result), "idx_1")
+        self.assertEqual(ast.unparse(result), "indices_1 - offset_1")
+
+    def test_codegen_iota_cute_shared_atomic_user_does_not_collapse_to_zero(self):
+        graph = Graph()
+        length = graph.placeholder("length")
+        out = graph.placeholder("out")
+        val = graph.placeholder("val")
+        iota = graph.call_function(
+            torch.ops.prims.iota.default,
+            args=(length,),
+            kwargs={
+                "start": 0,
+                "step": 1,
+                "dtype": torch.int32,
+                "device": torch.device("cuda"),
+                "requires_grad": False,
+            },
+        )
+        graph.call_function(hl.atomic_add, args=(out, [iota], val))
+        ordinary_use = graph.call_function(operator.add, args=(iota, 1))
+        graph.output(ordinary_use)
+        iota.meta["val"] = torch.empty(64, dtype=torch.int32)
+
+        cg = _FakeGenerateAST(set())
+        cg.active_device_loops = {}
+        cg.current_grid_state = None
+        cg.codegen_graphs = []
+        ctx = SimpleNamespace(
+            cg=cg,
+            to_ast=lambda value: ast.Constant(value=value),
+        )
+        env = SimpleNamespace(
+            index_dtype=torch.int32,
+            backend=SimpleNamespace(dtype_str=lambda dtype: "cutlass.Int32"),
+            block_sizes={},
+            get_block_id=lambda size: None,
+            resolve_block_id=lambda size: None,
+            resolve_codegen_block_id=lambda block_id, cg, graph=None: block_id,
+            size_hint=lambda size: 64 if size is length else 1,
+        )
+
+        with (
+            patch.object(CompileEnvironment, "current", return_value=env),
+            patch("helion._compiler.generate_ast.GenerateAST", _FakeGenerateAST),
+            patch(
+                "helion._compiler.cute.cute_reshape._get_dim_local_coord",
+                return_value="cutlass.Int32(0)",
+            ),
+            self.assertRaises(exc.BackendUnsupported),
+        ):
+            codegen_iota_cute(ctx, iota)
 
     def test_can_codegen_cute_mma_aten_requires_exclusive_loop_body(self) -> None:
         graph = Graph()
