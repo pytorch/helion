@@ -153,6 +153,8 @@ def test(
         "flex": flex_compiled,
         "ref": ref_attention,
     }
+    if DEVICE.type == "tpu":
+        del baselines["flex"]
 
     run_example(attention, baselines, (q, k, v))
 
