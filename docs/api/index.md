@@ -86,6 +86,8 @@ runtime
    zeros
    full
    arange
+   rand
+   randint
    subscript
    split
    join

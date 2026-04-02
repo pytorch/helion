@@ -162,10 +162,16 @@ def default_launcher(
     }
     if ptx_options is not None:
         run_kwargs["ptx_options"] = ptx_options
-    return triton_kernel.run(  # type: ignore[union-attr]
-        *args,
-        **run_kwargs,
-    )
+    try:
+        return triton_kernel.run(  # type: ignore[union-attr]
+            *args,
+            **run_kwargs,
+        )
+    except Exception as error:
+        message = str(error)
+        if "Cannot make_shape_compatible: incompatible dimensions" in message:
+            raise exc.ShapeMismatch("kernel operands", message) from error
+        raise
 
 
 def _pallas_make_block_spec(

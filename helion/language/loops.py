@@ -544,7 +544,7 @@ def _(
             bs_list = bs_list * len(begin_list)
 
     # Build tile ranges for each dimension
-    dim_ranges: list[list[tuple[int, int, int]]] = []
+    dim_ranges: list[list[tuple[int, int, int, int, int]]] = []
     for b, e, bs in zip(begin_list, end_list, bs_list, strict=True):
         b_int, e_int = _to_int(b), _to_int(e)
         assert b_int is not None and e_int is not None
@@ -553,7 +553,10 @@ def _(
         bs_int = _to_int(bs) if bs is not None else (e_int - b_int)
         assert bs_int is not None
         dim_ranges.append(
-            [(s, min(s + bs_int, e_int), bs_int) for s in range(b_int, e_int, bs_int)]
+            [
+                (s, min(s + bs_int, e_int), bs_int, b_int, e_int)
+                for s in range(b_int, e_int, bs_int)
+            ]
         )
 
     if not dim_ranges:

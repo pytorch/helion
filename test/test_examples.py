@@ -458,7 +458,10 @@ class TestExamples(RefEagerTestBase, TestCase):
             ),
         )
 
-    @xfailIfCute("CuTe low-memory dropout example is not supported yet")
+    @skipIfFn(
+        lambda: _get_backend() == "cute",
+        "CuTe low-memory dropout example is flaky and currently skipped",
+    )
     def test_low_mem_dropout(self):
         from examples.low_mem_dropout import low_mem_dropout
         from examples.low_mem_dropout import low_mem_dropout_bwd

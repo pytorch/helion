@@ -358,21 +358,13 @@ class DeviceFunction:
         """Check if this kernel uses any RNG operations."""
         return self.rng_seed_count > 0 and self.rng_seed_buffer_param_name is not None
 
-    def allocate_rng_seed(self) -> int:
-        """Allocate a new RNG seed index and ensure buffer argument exists.
-
-        Returns:
-            The seed index for this RNG operation.
-        """
-        seed_index = self.rng_seed_count
-        self.rng_seed_count += 1
-
-        # Ensure seed buffer parameter name exists
+    def reserve_rng_seed(self, seed_index: int) -> None:
+        """Ensure the RNG seed buffer is available up to a specific index."""
+        assert seed_index >= 0
+        self.rng_seed_count = max(self.rng_seed_count, seed_index + 1)
         if self.rng_seed_buffer_param_name is None:
             # pyrefly: ignore [bad-assignment]
             self.rng_seed_buffer_param_name = self.new_var("rng_seed_buffer")
-
-        return seed_index
 
     def block_size_var(self, block_id: int) -> str | None:
         key = (block_id,)

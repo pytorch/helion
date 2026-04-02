@@ -124,6 +124,27 @@ def _resolve_codegen_block_id(state: CodegenState, block_id: int) -> int:
     return env.resolve_codegen_block_id(block_id, state.codegen, graph)
 
 
+def _has_active_codegen_block(state: CodegenState, block_idx: int) -> bool:
+    loops = state.codegen.active_device_loops.get(block_idx)
+    return bool(loops)
+
+
+def _inactive_slice_index_expr(
+    state: CodegenState,
+    block_idx: int,
+    size: int | torch.SymInt,
+    dtype: str,
+) -> tuple[str, str | None]:
+    env = CompileEnvironment.current()
+    block_size = env.block_sizes[env.canonical_block_id(block_idx)].from_config_assert(
+        state.device_function.config
+    )
+    block_size_expr = state.device_function.literal_expr(block_size)
+    index_expr = env.backend.arange_index_expr(block_size_expr, dtype)
+    size_expr = state.device_function.literal_expr(size)
+    return index_expr, f"({index_expr} < {size_expr})"
+
+
 class IndexingStrategy:
     def codegen_load(
         self,
@@ -1024,13 +1045,19 @@ class SubscriptIndexing(NamedTuple):
                     if slice_size != 1:
                         rdim = env.allocate_reduction_dimension(slice_size)
                         block_idx = rdim.block_id
-                        index_var = state.codegen.index_var(block_idx)
+                        if _has_active_codegen_block(state, block_idx):
+                            base_index_expr = state.codegen.index_var(block_idx)
+                            mask_expr = state.codegen.mask_var(block_idx)
+                        else:
+                            base_index_expr, mask_expr = _inactive_slice_index_expr(
+                                state, block_idx, slice_size, dtype
+                            )
                         # Generate strided index: start + index * step
                         index_values.append(
-                            f"({start} + ({index_var}) * {step}){expand}"
+                            f"({start} + ({base_index_expr}) * {step}){expand}"
                         )
-                        if mask := state.codegen.mask_var(block_idx):
-                            mask_values.setdefault(f"({mask}){expand}")
+                        if mask_expr is not None:
+                            mask_values.setdefault(f"({mask_expr}){expand}")
                     else:
                         index_values.append(f"{start}{expand}")
                 else:
@@ -1038,10 +1065,16 @@ class SubscriptIndexing(NamedTuple):
                     if not _is_size_one(size):
                         rdim = env.allocate_reduction_dimension(size)
                         block_idx = rdim.block_id
-                        index_var = state.codegen.index_var(block_idx)
+                        if _has_active_codegen_block(state, block_idx):
+                            index_var = state.codegen.index_var(block_idx)
+                            mask_expr = state.codegen.mask_var(block_idx)
+                        else:
+                            index_var, mask_expr = _inactive_slice_index_expr(
+                                state, block_idx, size, dtype
+                            )
                         index_values.append(f"({index_var}){expand}")
-                        if mask := state.codegen.mask_var(block_idx):
-                            mask_values.setdefault(f"({mask}){expand}")
+                        if mask_expr is not None:
+                            mask_values.setdefault(f"({mask_expr}){expand}")
                     else:
                         index_values.append(
                             f"{env.backend.zeros_expr('[1]', dtype)}{expand}"
@@ -1377,7 +1410,10 @@ class BlockedSubscriptIndexing:
                 # Full slice or slice without step
                 if size != 1:
                     rdim = env.allocate_reduction_dimension(size)
-                    res.offsets.append(state.codegen.offset_var(rdim.block_id))
+                    if _has_active_codegen_block(state, rdim.block_id):
+                        res.offsets.append(state.codegen.offset_var(rdim.block_id))
+                    else:
+                        res.offsets.append("0")
                     res.block_shape.append(rdim.var)
                 else:
                     res.offsets.append("0")
