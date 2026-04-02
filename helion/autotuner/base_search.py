@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import abc
 import collections
+from collections.abc import Iterator
 import contextlib
 import dataclasses
 import datetime
@@ -435,6 +436,7 @@ class BaseSearch(BaseAutotuner):
         self._precompile_tmpdir: tempfile.TemporaryDirectory[str] | None = None
         self._precompile_args_path: str | None = None
         self._precompile_result_counter = count()
+        self._bad_config_strs: set[str] = set()
 
     def _prepare(self) -> None:
         """Some initialization deferred until autotuning actually runs.
@@ -531,8 +533,49 @@ class BaseSearch(BaseAutotuner):
         # load_state_dict validates required keys and raises CheckpointError for issues
         self.load_state_dict(state)
 
+        # Load bad configs (from subprocess crash recovery)
+        self._load_bad_configs()
+
         self.log(f"Resumed at generation {self._current_generation}")
         return True
+
+    def _load_bad_configs(self) -> None:
+        """Load bad configs from _bad_configs.txt file."""
+        from .subprocess_runner import load_bad_configs
+
+        checkpoint_dir_str = self.settings.autotune_checkpoint_dir
+        if checkpoint_dir_str is not None:
+            bad_configs_path = os.path.join(checkpoint_dir_str, "_bad_configs.txt")
+            self._bad_config_strs |= load_bad_configs(bad_configs_path)
+
+        if self._bad_config_strs:
+            self.log(
+                f"Loaded {len(self._bad_config_strs)} bad config(s) to skip",
+            )
+
+    @contextlib.contextmanager
+    def _pending_config(self, config: Config) -> Iterator[None]:
+        """Context manager that writes the pending-config breadcrumb on entry
+        and removes it on exit.
+
+        If the body raises TritonUnrecoverableRuntimeError the pending file
+        is intentionally *not* cleared so the external crash-recovery script
+        can detect it.
+        """
+        from .subprocess_runner import clear_pending, write_pending
+
+        checkpoint_dir_str = self.settings.autotune_checkpoint_dir
+        if checkpoint_dir_str is None:
+            yield
+            return
+        write_pending(checkpoint_dir_str, str(config))
+        try:
+            yield
+        except exc.TritonUnrecoverableRuntimeError:
+            # Let the pending file survive for the bash crash-recovery script
+            raise
+        else:
+            clear_pending(checkpoint_dir_str)
 
     def _compute_baseline(
         self,
@@ -752,6 +795,12 @@ class BaseSearch(BaseAutotuner):
         Returns:
             The performance of the configuration in ms.
         """
+        # Skip configs that previously crashed the subprocess
+        config_str = str(config)
+        if config_str in self._bad_config_strs:
+            self.log.warning(f"Skipping known-bad config: {config}")
+            return inf
+
         self._autotune_metrics.num_configs_tested += 1
         self.counters["benchmark"] += 1
         self.log.debug(lambda: f"Running benchmark for {config!r}")
@@ -1089,7 +1138,8 @@ class BaseSearch(BaseAutotuner):
                     )
                 )
                 # benchmark one-by-one to avoid noisy results
-                perf = self.benchmark_function(config, fn)
+                with self._pending_config(config):
+                    perf = self.benchmark_function(config, fn)
                 status = "ok" if math.isfinite(perf) else "error"
                 # Log completion after benchmarking
                 self.log.record_autotune_entry(
@@ -1193,6 +1243,8 @@ class BaseSearch(BaseAutotuner):
             exit_stack.callback(self.cleanup)
 
             if not self._try_load_checkpoint():
+                # Load bad configs even on fresh starts (subprocess recovery)
+                self._load_bad_configs()
                 self._init_search()
             try:
                 best = self._autotune()
@@ -1295,6 +1347,11 @@ class BaseSearch(BaseAutotuner):
         if checkpoint_file.exists():
             checkpoint_file.unlink()
             self.log(f"Checkpoint cleaned up: {checkpoint_file}")
+
+        # Clean up subprocess recovery artifacts
+        from .subprocess_runner import cleanup_subprocess_artifacts
+
+        cleanup_subprocess_artifacts(checkpoint_dir_str)
 
     @staticmethod
     def _serialize_numpy_rng_state(
