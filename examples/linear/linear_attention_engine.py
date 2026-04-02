@@ -19,12 +19,11 @@ from typing import Callable
 
 import torch
 
+from .linear_attention_utils import prepare_wy_repr_bwd
+from .linear_attention_utils import solve_tril_inv
 import helion  # noqa: F401
 import helion.experimental
 import helion.language as hl
-
-from .linear_attention_utils import prepare_wy_repr_bwd
-from .linear_attention_utils import solve_tril_inv
 
 # ════════════════════════════════════════════════════════════════════════════════
 # Interface
@@ -1003,7 +1002,13 @@ class ChunkedLinearAttnFn(torch.autograd.Function):
 
         if not ctx.has_beta:
             dq, dk, dv, dg = _helion_chunked_bwd(
-                q, k, v, g, grad_output, C, h_all=h_all
+                q,
+                k,
+                v,
+                g,
+                grad_output,
+                C,
+                h_all=h_all,
             )
             return dq, dk, dv, dg, None, None, None, None, None
 
@@ -1058,16 +1063,14 @@ def _helion_chunked_fwd(q, k, v, g, C, initial_state=None, return_final_state=Fa
     scalar_decay = g.dim() == 3
 
     if scalar_decay:
-        # Scalar decay path: use PyTorch cumsum instead of the prescale kernel
-        # to avoid expanding g from [B,H,T] to [B,H,T,D].
-        g_scalar = g.float()
-        gc = g_scalar.reshape(BH, N, C)
+        # Scalar decay path: use PyTorch cumsum + pre-compute k_state.
+        gc = g.float().reshape(BH, N, C)
         g_cs = gc.cumsum(-1)  # [BH, N, C]
         g_last = g_cs[:, :, -1]  # [BH, N]
 
         # Compute k_state = k * exp(g_last - g_cs) for state accumulation
-        k_f = k.float().reshape(BH, N, C, D)
-        k_state_4d = k_f * torch.exp(g_last[:, :, None, None] - g_cs[:, :, :, None])
+        k_4d = k.reshape(BH, N, C, D).float()
+        k_state_4d = k_4d * torch.exp(g_last[:, :, None, None] - g_cs[:, :, :, None])
         g_last_4d = g_last.unsqueeze(-1).expand(-1, -1, D)
 
         v_flat = v.reshape(BH, N, C, DV).float()
@@ -1075,13 +1078,19 @@ def _helion_chunked_fwd(q, k, v, g, C, initial_state=None, return_final_state=Fa
         h_all = chunk_fwd_h_diag_fused(k_state_4d, v_flat, g_last_4d, state)
 
         # Output kernel: pass raw q, k with g_cs for decay
-        qf = q.float().reshape(BHN, C, D)
-        kf = k.float().reshape(BHN, C, D)
+        qf = q.reshape(BHN, C, D).float()
+        kf = k.reshape(BHN, C, D).float()
         vf2 = v_flat.reshape(BHN, C, DV)
         g_csf = g_cs.reshape(BHN, C)
         hf2 = h_all.reshape(BHN, D, DV)
 
         o = chunk_fwd_o_helion(qf, kf, vf2, g_csf, hf2)
+
+        # Precompute q_scaled for backward
+        exp_g_cs = torch.exp(g_cs[:, :, :, None])
+        q_scaled_4d = qf.reshape(BH, N, C, D) * exp_g_cs
+        # Attach cached data to h_all for the backward to use
+        h_all._scalar_bwd_cache = (g_cs, g_last, g_last_4d, q_scaled_4d)
 
         final_state = None
         if return_final_state:
@@ -1192,25 +1201,28 @@ def _helion_chunked_bwd(q, k, v, g, grad_output, C, h_all=None):
     BH = B * H
     BHN = BH * N
 
-    # Upcast to float32 for numerical stability
-    q, k, v = q.float(), k.float(), v.float()
-    g = g.float()
-    grad_output = grad_output.float()
-
+    grad_output_f = grad_output.float()
     diagonal_decay = g.dim() == 4
-    vf = v.reshape(BH, N, C, DV).float()
-    do_flat = grad_output.reshape(BH, N, C, DV).float()
 
     if not diagonal_decay:
-        # Scalar decay: compute prescale with PyTorch ops (avoids expanding
-        # g to [B,H,T,D] and launching the prescale kernel).
-        gc = g.reshape(BH, N, C)
-        g_cs = gc.cumsum(-1)
-        g_last_scalar = g_cs[:, :, -1]  # [BH, N]
-        g_last_4d = g_last_scalar.unsqueeze(-1).expand(-1, -1, D)
+        # Scalar decay path — use cached data from forward when available,
+        # and defer float conversion to the kernels that need it.
+        vf = v.float().reshape(BH, N, C, DV)
+        do_flat = grad_output_f.reshape(BH, N, C, DV)
 
-        # q_scaled = q * exp(cumsum(g)), needed by dh kernel
-        q_scaled_4d = q.reshape(BH, N, C, D) * torch.exp(g_cs[:, :, :, None])
+        bwd_cache = (
+            getattr(h_all, "_scalar_bwd_cache", None) if h_all is not None else None
+        )
+        if bwd_cache is not None:
+            g_cs, g_last_scalar, g_last_4d, q_scaled_4d = bwd_cache
+        else:
+            gc = g.float().reshape(BH, N, C)
+            g_cs = gc.cumsum(-1)
+            g_last_scalar = g_cs[:, :, -1]
+            g_last_4d = g_last_scalar.unsqueeze(-1).expand(-1, -1, D)
+            q_scaled_4d = q.float().reshape(BH, N, C, D) * torch.exp(
+                g_cs[:, :, :, None]
+            )
 
         if h_all is None:
             k_state_4d = k.float().reshape(BH, N, C, D) * torch.exp(
@@ -1222,8 +1234,8 @@ def _helion_chunked_bwd(q, k, v, g, grad_output, C, h_all=None):
         dstate = q.new_zeros(BH, D, DV, dtype=torch.float32)
         dh_all = chunk_bwd_dh_diag_fused(q_scaled_4d, do_flat, g_last_4d, dstate)
 
-        qf2 = q.reshape(BHN, C, D)
-        kf2 = k.reshape(BHN, C, D)
+        qf2 = q.float().reshape(BHN, C, D)
+        kf2 = k.float().reshape(BHN, C, D)
         vf2 = vf.reshape(BHN, C, DV)
         g_csf2 = g_cs.reshape(BHN, C)
         g_lastf2 = g_last_scalar.reshape(BHN)
@@ -1250,11 +1262,14 @@ def _helion_chunked_bwd(q, k, v, g, grad_output, C, h_all=None):
             dg,
         )
 
-    # Diagonal decay path: use prescale kernel
-    g_diag = g
-    qf = q.reshape(BHN, C, D)
-    kf = k.reshape(BHN, C, D)
-    gf = g_diag.reshape(BHN, C, D)
+    # Diagonal decay path: need float32 for prescale kernel
+    q_f, k_f, v_f, g_f = q.float(), k.float(), v.float(), g.float()
+    vf = v_f.reshape(BH, N, C, DV)
+    do_flat = grad_output_f.reshape(BH, N, C, DV)
+
+    qf = q_f.reshape(BHN, C, D)
+    kf = k_f.reshape(BHN, C, D)
+    gf = g_f.reshape(BHN, C, D)
     q_scaled, k_intra, k_state, g_last_flat = chunk_fwd_prescale_diag(qf, kf, gf)
 
     k_state_4d = k_state.reshape(BH, N, C, D)
