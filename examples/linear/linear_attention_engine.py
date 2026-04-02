@@ -333,7 +333,11 @@ def chunk_fwd_h_diag_fused(
     g_last: torch.Tensor,
     h0: torch.Tensor,
 ) -> torch.Tensor:
-    """Fused state accumulation over N chunks (diagonal decay)."""
+    """Fused state accumulation over N chunks (diagonal decay).
+
+    Tiles [BH, D, DV] to parallelize over both key and value dimensions,
+    matching FLA's grid=(K_blocks, V_blocks, BH) strategy.
+    """
     BH = k_state.size(0)
     N = k_state.size(1)
     D = k_state.size(3)
@@ -341,17 +345,17 @@ def chunk_fwd_h_diag_fused(
 
     h_all = torch.empty([BH, N, D, DV], dtype=h0.dtype, device=h0.device)
 
-    for tile_bh, tile_dv in hl.tile([BH, DV], block_size=[1, None]):
+    for tile_bh, tile_d, tile_dv in hl.tile([BH, D, DV], block_size=[1, None, None]):
         idx = tile_bh.id
-        h_acc = h0[idx, :, tile_dv].float()
+        h_acc = h0[idx, tile_d, tile_dv].float()
 
         for i_t in hl.grid(N):
-            h_all[idx, i_t, :, tile_dv] = h_acc.to(h_all.dtype)
-            gl_d = g_last[idx, i_t, :]
+            h_all[idx, i_t, tile_d, tile_dv] = h_acc.to(h_all.dtype)
+            gl_d = g_last[idx, i_t, tile_d]
             h_acc = h_acc * torch.exp(gl_d)[:, None]
-            k_i = k_state[idx, i_t, :, :]
+            k_i = k_state[idx, i_t, :, tile_d]
             v_i = v[idx, i_t, :, tile_dv]
-            h_acc = h_acc + torch.mm(k_i.T, v_i.float())
+            h_acc = h_acc + torch.mm(k_i.transpose(-2, -1), v_i.float())
 
     return h_all
 
@@ -487,7 +491,10 @@ def chunk_bwd_dh_diag_fused(
     g_last: torch.Tensor,
     dh_init: torch.Tensor,
 ) -> torch.Tensor:
-    """Fused state gradient propagation over N chunks in reverse (diagonal decay)."""
+    """Fused state gradient propagation over N chunks in reverse (diagonal decay).
+
+    Tiles [BH, D, DV] to parallelize over both key and value dimensions.
+    """
     BH = q_scaled.size(0)
     N = q_scaled.size(1)
     D = q_scaled.size(3)
@@ -495,18 +502,18 @@ def chunk_bwd_dh_diag_fused(
 
     dh_all = torch.empty([BH, N, D, DV], dtype=dh_init.dtype, device=dh_init.device)
 
-    for tile_bh, tile_dv in hl.tile([BH, DV], block_size=[1, None]):
+    for tile_bh, tile_d, tile_dv in hl.tile([BH, D, DV], block_size=[1, None, None]):
         idx = tile_bh.id
-        dh_acc = dh_init[idx, :, tile_dv].float()
+        dh_acc = dh_init[idx, tile_d, tile_dv].float()
 
         for i_t in hl.grid(N):
             i = N - 1 - i_t
-            dh_all[idx, i, :, tile_dv] = dh_acc.to(dh_all.dtype)
-            gl_d = g_last[idx, i, :]
+            dh_all[idx, i, tile_d, tile_dv] = dh_acc.to(dh_all.dtype)
+            gl_d = g_last[idx, i, tile_d]
             dh_acc = dh_acc * torch.exp(gl_d)[:, None]
-            q_i = q_scaled[idx, i, :, :]
+            q_i = q_scaled[idx, i, :, tile_d]
             do_i = do[idx, i, :, tile_dv]
-            dh_acc = dh_acc + torch.mm(q_i.T, do_i.float())
+            dh_acc = dh_acc + torch.mm(q_i.transpose(-2, -1), do_i.float())
 
     return dh_all
 
@@ -688,31 +695,31 @@ def chunk_bwd_dqkg_diag_helion(
     dk_state_out = torch.empty([BHN, C, D], dtype=q.dtype, device=q.device)
 
     for tile_bhn, tile_d in hl.tile([BHN, D]):
-        dq_acc = hl.zeros([tile_bhn, C, tile_d], dtype=torch.float32)
-        dk_intra_acc = hl.zeros([tile_bhn, C, tile_d], dtype=torch.float32)
+        # Accumulate DV-dependent work first
+        dA_raw = hl.zeros([tile_bhn, C, C], dtype=torch.float32)
+        dq_cross_acc = hl.zeros([tile_bhn, C, tile_d], dtype=torch.float32)
         dk_state_acc = hl.zeros([tile_bhn, C, tile_d], dtype=torch.float32)
-
-        # Precompute causal mask once
-        idx = hl.arange(C)
-        causal = (idx[:, None] >= idx[None, :]).float()
 
         for tile_dv in hl.tile(DV):
             dot = do[tile_bhn, :, tile_dv]
             vt = v[tile_bhn, :, tile_dv]
             ht = h[tile_bhn, tile_d, tile_dv]
             dht = dh[tile_bhn, tile_d, tile_dv]
-            qt = q[tile_bhn, :, tile_d]
-            kit = k_intra[tile_bhn, :, tile_d]
 
-            dA = torch.bmm(dot, vt.transpose(-2, -1))
-            dA = dA * causal
+            dA_raw = torch.baddbmm(dA_raw, dot, vt.transpose(-2, -1))
+            dq_cross_acc = torch.baddbmm(dq_cross_acc, dot, ht.transpose(-2, -1))
+            dk_state_acc = torch.baddbmm(dk_state_acc, vt, dht.transpose(-2, -1))
 
-            dq_acc = torch.baddbmm(dq_acc, dA, kit)
-            dk_intra_acc = torch.baddbmm(dk_intra_acc, dA.transpose(-2, -1), qt)
-            dq_cross = torch.bmm(dot, ht.transpose(-2, -1))
-            dq_acc = dq_acc + dq_cross
-            dk_state = torch.bmm(vt, dht.transpose(-2, -1))
-            dk_state_acc = dk_state_acc + dk_state
+        # Apply causal mask once after accumulation
+        idx = hl.arange(C)
+        causal = (idx[:, None] >= idx[None, :]).float()
+        dA = dA_raw * causal
+
+        # Compute dq and dk from accumulated terms
+        qt = q[tile_bhn, :, tile_d]
+        kit = k_intra[tile_bhn, :, tile_d]
+        dq_acc = torch.bmm(dA, kit) + dq_cross_acc
+        dk_intra_acc = torch.bmm(dA.transpose(-2, -1), qt)
 
         dq_out[tile_bhn, :, tile_d] = dq_acc.to(q.dtype)
         dk_intra_out[tile_bhn, :, tile_d] = dk_intra_acc.to(q.dtype)
