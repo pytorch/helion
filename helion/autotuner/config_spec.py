@@ -569,6 +569,18 @@ class ConfigSpec:
                 )
             elif _fix_invalid and not self._should_keep_epilogue_subtile_for_autotune():
                 config.pop("epilogue_subtile", None)
+            # Epilogue subtiling is incompatible with flatten_loops because
+            # FlattenedTileStrategy does not support offset_var needed by
+            # the epilogue store codegen path.
+            if "epilogue_subtile" in config and any(
+                config.get("flatten_loops", ())
+            ):
+                if _fix_invalid:
+                    config.pop("epilogue_subtile", None)
+                else:
+                    raise InvalidConfig(
+                        "epilogue_subtile is incompatible with flatten_loops=True"
+                    )
 
         # Set default values for grid indices when pid_type is not persistent
         if pid_type in ("flat", "xyz") and self.grid_block_ids:
