@@ -109,7 +109,7 @@ jobs:
           source .venv/bin/activate
           if [[ "${{ matrix.pytorch-version }}" == "pytorch-2.9" ]]; then
             # Install stable 2.9 from test channel
-            uv pip install -U "torch==2.9.*" --index-url https://download.pytorch.org/whl/${{ matrix.runtime-version }}
+            uv pip install -U "torch==2.11.*" --index-url https://download.pytorch.org/whl/${{ matrix.runtime-version }}
           elif [[ "${{ matrix.runtime-version }}" == "tpu" ]]; then
             # TPU: install CPU-only PyTorch nightly (torch_tpu provides TPU backend)
             uv pip install -U --pre torch --index-url https://download.pytorch.org/whl/nightly/cpu
