@@ -13,6 +13,7 @@ the pure PyTorch reference for this combination.
 from __future__ import annotations
 
 import math
+from typing import Any
 import warnings
 
 import torch
@@ -56,13 +57,16 @@ def test() -> None:
 
     # Forward vs recurrent reference
     ref = naive_recurrent_reference(q * scale, k, v, g, beta=beta)
+    assert isinstance(out, torch.Tensor)
     fwd_err = _rel_error(out.detach(), ref)
     assert fwd_err < 0.02, f"Forward error: {fwd_err}"
     print(f"  fwd vs recurrent: {fwd_err:.4e} PASS")
 
     # Forward vs FLA KDA
     try:
-        from fla.ops.kda import chunk_kda  # pyrefly: ignore
+        from fla.ops.kda import chunk_kda as _fn  # pyrefly: ignore
+
+        chunk_kda: Any = _fn
 
         o_fla, _ = chunk_kda(
             _htf(q),
@@ -145,7 +149,9 @@ def test() -> None:
 def benchmark() -> None:
     """Benchmark KDA forward+backward, comparing against FLA."""
     try:
-        from fla.ops.kda import chunk_kda  # pyrefly: ignore
+        from fla.ops.kda import chunk_kda as _fn  # pyrefly: ignore
+
+        chunk_kda: Any = _fn
     except ImportError:
         warnings.warn("fla not installed, skipping benchmark", stacklevel=1)
         return
@@ -183,7 +189,12 @@ def benchmark() -> None:
         )
         fla_fwd_ms = do_bench(
             lambda qt=qt, kt=kt, vt=vt, gt=gt, bt=bt: chunk_kda(
-                qt, kt, vt, gt, bt, scale=scale
+                qt,
+                kt,
+                vt,
+                gt,
+                bt,
+                scale=scale,
             )
         )
 

@@ -62,7 +62,7 @@ def _make_mamba_native_inputs(
     di: int,
     dvi: int,
     dtype: torch.dtype,
-    device: str,
+    device: str | torch.device,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Create mamba-style native inputs (time-first layout)."""
     dt = F.softplus(torch.randn(bi, ti, hi, device=device, dtype=dtype))
@@ -152,6 +152,7 @@ def test() -> None:
         )
         o4.backward(_htf(grad_out_m))
 
+        assert C2.grad is not None and B2.grad is not None
         dq_err = _rel_error(q3.grad, C2.grad.transpose(1, 2).contiguous())
         print(f"  bwd dq vs mamba:  {dq_err:.4e} {'PASS' if dq_err < 0.05 else 'FAIL'}")
         dk_err = _rel_error(k3.grad, B2.grad.transpose(1, 2).contiguous())

@@ -10,6 +10,7 @@ reference backward, plus a benchmark suite comparing against FLA.
 from __future__ import annotations
 
 import math
+from typing import Any
 import warnings
 
 import torch
@@ -49,11 +50,11 @@ def test() -> None:
 
     # === Forward: vs FLA ===
     try:
-        from fla.ops.gla import chunk_gla  # pyrefly: ignore
+        from fla.ops.gla import chunk_gla as _chunk_gla  # pyrefly: ignore
 
-        o_fla, _ = chunk_gla(
-            _htf(q), _htf(k), _htf(v), _htf(g), scale=scale
-        )  # pyrefly: ignore
+        chunk_gla: Any = _chunk_gla
+
+        o_fla, _ = chunk_gla(_htf(q), _htf(k), _htf(v), _htf(g), scale=scale)
         o_fla_hf = o_fla.transpose(1, 2).contiguous()
         fla_err = _rel_error(out, o_fla_hf)
         print(
@@ -89,7 +90,9 @@ def test() -> None:
 
     # === Backward: vs FLA (dq comparison) ===
     if _has_fla:
-        from fla.ops.gla import chunk_gla  # pyrefly: ignore
+        from fla.ops.gla import chunk_gla as _chunk_gla  # pyrefly: ignore
+
+        chunk_gla: Any = _chunk_gla
 
         q3 = q.clone().requires_grad_(True)
         k3 = k.clone().requires_grad_(True)
@@ -100,9 +103,10 @@ def test() -> None:
         q4 = _htf(q).clone().requires_grad_(True)
         k4 = _htf(k).clone().requires_grad_(True)
         v4 = _htf(v).clone().requires_grad_(True)
-        o4, _ = chunk_gla(q4, k4, v4, _htf(g), scale=scale)  # pyrefly: ignore
+        o4, _ = chunk_gla(q4, k4, v4, _htf(g), scale=scale)
         o4.backward(_htf(grad_out))
 
+        assert q4.grad is not None and k4.grad is not None and v4.grad is not None
         dq_err = _rel_error(q3.grad, q4.grad.transpose(1, 2).contiguous())
         print(f"  bwd dq vs FLA:    {dq_err:.4e} {'PASS' if dq_err < 0.05 else 'FAIL'}")
         dk_err = _rel_error(k3.grad, k4.grad.transpose(1, 2).contiguous())
@@ -144,7 +148,9 @@ def test() -> None:
 def benchmark() -> None:
     """Benchmark forward and fwd+bwd, comparing against FLA."""
     try:
-        from fla.ops.gla import chunk_gla  # pyrefly: ignore
+        from fla.ops.gla import chunk_gla as _chunk_gla  # pyrefly: ignore
+
+        chunk_gla: Any = _chunk_gla
     except ImportError:
         warnings.warn("fla not installed, skipping benchmark", stacklevel=1)
         return
@@ -184,7 +190,7 @@ def benchmark() -> None:
             gt: torch.Tensor = gt,
             sc: float = scale,
         ) -> torch.Tensor:
-            o, _ = chunk_gla(qt, kt, vt, gt, scale=sc)  # pyrefly: ignore
+            o, _ = chunk_gla(qt, kt, vt, gt, scale=sc)
             return o
 
         fla_fwd_ms = do_bench(fla_fwd)
@@ -211,7 +217,7 @@ def benchmark() -> None:
             go: torch.Tensor = go_t,
             sc: float = scale,
         ) -> None:
-            o, _ = chunk_gla(qt, kt, vt, gt, scale=sc)  # pyrefly: ignore
+            o, _ = chunk_gla(qt, kt, vt, gt, scale=sc)
             o.backward(go)
             qt.grad = kt.grad = vt.grad = None
 

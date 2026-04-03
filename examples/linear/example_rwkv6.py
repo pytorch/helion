@@ -9,6 +9,7 @@ Uses the LinearAttentionEngine with output_mod.
 
 from __future__ import annotations
 
+from typing import Any
 import warnings
 
 import torch
@@ -47,6 +48,7 @@ def test() -> None:
 
     # Forward vs recurrent reference
     out = engine(q, k, v, g, gate=gate)
+    assert isinstance(out, torch.Tensor)
     ref = naive_recurrent_reference(q, k, v, g)
     ref = ref * gate.detach()
     fwd_err = _rel_error(out.detach(), ref)
@@ -55,12 +57,19 @@ def test() -> None:
 
     # Forward vs FLA chunk_rwkv6 (with u=zeros to match our engine)
     try:
-        from fla.ops.rwkv6 import chunk_rwkv6  # pyrefly: ignore
+        from fla.ops.rwkv6 import chunk_rwkv6 as _fn  # pyrefly: ignore
+
+        chunk_rwkv6: Any = _fn
 
         out_no_gate = chunked_linear_attn(q, k, v, g, C=C)
         u_zeros = torch.zeros(H, D, device=DEVICE, dtype=DTYPE)
         o_fla, _ = chunk_rwkv6(
-            r=_htf(q), k=_htf(k), v=_htf(v), w=_htf(g), u=u_zeros, scale=1.0
+            r=_htf(q),
+            k=_htf(k),
+            v=_htf(v),
+            w=_htf(g),
+            u=u_zeros,
+            scale=1.0,
         )
         o_fla_hf = _htf(o_fla)
         fla_err = _rel_error(out_no_gate.detach(), o_fla_hf)
@@ -130,7 +139,9 @@ def test() -> None:
 def benchmark() -> None:
     """Benchmark RWKV-6 forward+backward, comparing against FLA chunk_rwkv6."""
     try:
-        from fla.ops.rwkv6 import chunk_rwkv6  # pyrefly: ignore
+        from fla.ops.rwkv6 import chunk_rwkv6 as _fn  # pyrefly: ignore
+
+        chunk_rwkv6: Any = _fn
     except ImportError:
         warnings.warn("fla not installed, skipping benchmark", stacklevel=1)
         return
@@ -167,7 +178,12 @@ def benchmark() -> None:
         wt = _htf(g)
         fla_fwd_ms = do_bench(
             lambda qt=qt, kt=kt, vt=vt, wt=wt, u=u_zeros: chunk_rwkv6(
-                r=qt, k=kt, v=vt, w=wt, u=u, scale=1.0
+                r=qt,
+                k=kt,
+                v=vt,
+                w=wt,
+                u=u,
+                scale=1.0,
             )
         )
 
@@ -182,6 +198,7 @@ def benchmark() -> None:
             go: torch.Tensor = grad_out,
         ) -> None:
             o = eng(q, k, v, g, gate=gate)
+            assert isinstance(o, torch.Tensor)
             o.backward(go)
             q.grad = k.grad = v.grad = None
 
@@ -201,7 +218,14 @@ def benchmark() -> None:
             u: torch.Tensor = u_zeros,
             go: torch.Tensor = go_t,
         ) -> None:
-            o, _ = chunk_rwkv6(r=qt, k=kt, v=vt, w=wt, u=u, scale=1.0)
+            o, _ = chunk_rwkv6(
+                r=qt,
+                k=kt,
+                v=vt,
+                w=wt,
+                u=u,
+                scale=1.0,
+            )
             o.backward(go)
             qt.grad = kt.grad = vt.grad = None
 

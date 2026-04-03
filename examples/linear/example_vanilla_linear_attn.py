@@ -10,6 +10,7 @@ chunked reference backward, plus a benchmark suite comparing against FLA.
 from __future__ import annotations
 
 import math
+from typing import Any
 import warnings
 
 import torch
@@ -50,12 +51,16 @@ def test() -> None:
 
     # === Forward: vs FLA ===
     try:
-        from fla.ops.linear_attn import (
-            chunk_linear_attn as fla_chunk_linear_attn,  # pyrefly: ignore
-        )
+        from fla.ops.linear_attn import chunk_linear_attn as _fla_fn  # pyrefly: ignore
+
+        fla_chunk_linear_attn: Any = _fla_fn
 
         o_fla = fla_chunk_linear_attn(
-            _htf(q), _htf(k), _htf(v), scale=scale, normalize=False
+            _htf(q),
+            _htf(k),
+            _htf(v),
+            scale=scale,
+            normalize=False,
         )
         if isinstance(o_fla, tuple):
             o_fla = o_fla[0]
@@ -94,9 +99,9 @@ def test() -> None:
 
     # === Backward: vs FLA (dq comparison) ===
     if _has_fla:
-        from fla.ops.linear_attn import (
-            chunk_linear_attn as fla_chunk_linear_attn,  # pyrefly: ignore
-        )
+        from fla.ops.linear_attn import chunk_linear_attn as _fla_fn  # pyrefly: ignore
+
+        fla_chunk_linear_attn: Any = _fla_fn
 
         q3 = q.clone().requires_grad_(True)
         k3 = k.clone().requires_grad_(True)
@@ -107,11 +112,18 @@ def test() -> None:
         q4 = _htf(q).clone().requires_grad_(True)
         k4 = _htf(k).clone().requires_grad_(True)
         v4 = _htf(v).clone().requires_grad_(True)
-        o4 = fla_chunk_linear_attn(q4, k4, v4, scale=scale, normalize=False)
+        o4 = fla_chunk_linear_attn(
+            q4,
+            k4,
+            v4,
+            scale=scale,
+            normalize=False,
+        )
         if isinstance(o4, tuple):
             o4 = o4[0]
         o4.backward(_htf(grad_out))
 
+        assert q4.grad is not None and k4.grad is not None and v4.grad is not None
         dq_err = _rel_error(q3.grad, q4.grad.transpose(1, 2).contiguous())
         print(f"  bwd dq vs FLA:    {dq_err:.4e} {'PASS' if dq_err < 0.05 else 'FAIL'}")
         dk_err = _rel_error(k3.grad, k4.grad.transpose(1, 2).contiguous())
@@ -153,9 +165,9 @@ def test() -> None:
 def benchmark() -> None:
     """Benchmark forward and fwd+bwd, comparing against FLA."""
     try:
-        from fla.ops.linear_attn import (
-            chunk_linear_attn as fla_chunk_linear_attn,  # pyrefly: ignore
-        )
+        from fla.ops.linear_attn import chunk_linear_attn as _fla_fn  # pyrefly: ignore
+
+        fla_chunk_linear_attn: Any = _fla_fn
     except ImportError:
         warnings.warn("fla not installed, skipping benchmark", stacklevel=1)
         return
@@ -193,7 +205,13 @@ def benchmark() -> None:
             vt: torch.Tensor = vt,
             sc: float = scale,
         ) -> torch.Tensor:
-            o = fla_chunk_linear_attn(qt, kt, vt, scale=sc, normalize=False)
+            o = fla_chunk_linear_attn(
+                qt,
+                kt,
+                vt,
+                scale=sc,
+                normalize=False,
+            )
             if isinstance(o, tuple):
                 o = o[0]
             return o
@@ -221,7 +239,13 @@ def benchmark() -> None:
             go: torch.Tensor = go_t,
             sc: float = scale,
         ) -> None:
-            o = fla_chunk_linear_attn(qt, kt, vt, scale=sc, normalize=False)
+            o = fla_chunk_linear_attn(
+                qt,
+                kt,
+                vt,
+                scale=sc,
+                normalize=False,
+            )
             if isinstance(o, tuple):
                 o = o[0]
             o.backward(go)

@@ -79,7 +79,7 @@ class LinearAttentionEngine:
         b = self.beta_mod(beta, cio) if self.beta_mod and beta is not None else beta
         a_p = self.a_mod(a, cio) if self.a_mod and a is not None else a
 
-        result = chunked_linear_attn(
+        result = chunked_linear_attn(  # pyrefly: ignore
             q_p,
             k_p,
             v_p,
@@ -101,7 +101,7 @@ class LinearAttentionEngine:
             o = self.output_mod(o, cio)
 
         if return_final_state:
-            return o, final_state
+            return o, final_state  # pyrefly: ignore
         return o
 
 
@@ -935,7 +935,7 @@ def chunk_fwd_correction_helion(
 class ChunkedLinearAttnFn(torch.autograd.Function):
     @staticmethod
     def forward(  # type: ignore[override]
-        ctx: Any,
+        ctx: Any,  # noqa: ANN401
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
@@ -1001,8 +1001,10 @@ class ChunkedLinearAttnFn(torch.autograd.Function):
         return o.to(input_dtype), final_state
 
     @staticmethod
-    def backward(
-        ctx: Any, grad_output: torch.Tensor, _grad_final_state: object
+    def backward(  # pyrefly: ignore[bad-override]
+        ctx: Any,  # noqa: ANN401
+        grad_output: torch.Tensor,
+        _grad_final_state: object,
     ) -> tuple[  # type: ignore[override]
         torch.Tensor,
         torch.Tensor | None,
@@ -1039,12 +1041,12 @@ class ChunkedLinearAttnFn(torch.autograd.Function):
 
         A_inv = ctx.A_inv
         w_wy = ctx.w_wy
-        dq, dk, dv, dg, dbeta, da = _helion_chunked_bwd_correction(
+        dq, dk, dv, dg, dbeta, da = _helion_chunked_bwd_correction(  # pyrefly: ignore
             q,
             k,
             v,
             g,
-            beta,
+            beta,  # pyrefly: ignore
             a,
             grad_output,
             C,
@@ -1136,12 +1138,12 @@ def _helion_chunked_fwd(
         exp_g_cs = torch.exp(g_cs[:, :, :, None])
         q_scaled_4d = qf.reshape(BH, N, C, D) * exp_g_cs
         # Attach cached data to h_all for the backward to use
-        h_all._scalar_bwd_cache = (
+        h_all._scalar_bwd_cache = (  # pyrefly: ignore
             g_cs,
             g_last,
             g_last_4d,
             q_scaled_4d,
-        )  # pyrefly: ignore
+        )
 
         final_state = None
         if return_final_state:

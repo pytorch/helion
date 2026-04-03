@@ -11,6 +11,7 @@ and chunked reference backward, plus a benchmark suite comparing against FLA.
 from __future__ import annotations
 
 import math
+from typing import Any
 import warnings
 
 import torch
@@ -52,11 +53,20 @@ def test() -> None:
 
     # === Forward: vs FLA ===
     try:
-        from fla.ops.gated_delta_rule import chunk_gated_delta_rule  # pyrefly: ignore
+        from fla.ops.gated_delta_rule import (
+            chunk_gated_delta_rule as _fn,
+        )  # pyrefly: ignore
+
+        chunk_gated_delta_rule: Any = _fn
 
         # Note: FLA arg order is q, k, v, g, beta (g BEFORE beta)
-        o_fla, _ = chunk_gated_delta_rule(  # pyrefly: ignore
-            _htf(q), _htf(k), _htf(v), _htf(g), _htf(beta), scale=scale
+        o_fla, _ = chunk_gated_delta_rule(
+            _htf(q),
+            _htf(k),
+            _htf(v),
+            _htf(g),
+            _htf(beta),
+            scale=scale,
         )
         o_fla_hf = o_fla.transpose(1, 2).contiguous()
         fla_err = _rel_error(out, o_fla_hf)
@@ -103,9 +113,17 @@ def test() -> None:
             q4 = _htf(q).clone().requires_grad_(True)
             k4 = _htf(k).clone().detach().requires_grad_(True)
             v4 = _htf(v).clone().requires_grad_(True)
-            o4, _ = chunk_gated_delta_rule(q4, k4, v4, _htf(g), _htf(beta), scale=scale)  # pyrefly: ignore
+            o4, _ = chunk_gated_delta_rule(  # pyrefly: ignore[unbound-name]
+                q4,
+                k4,
+                v4,
+                _htf(g),
+                _htf(beta),
+                scale=scale,
+            )
             o4.backward(_htf(grad_out))
 
+            assert q4.grad is not None and k4.grad is not None and v4.grad is not None
             dq_err = _rel_error(q3.grad, q4.grad.transpose(1, 2).contiguous())
             status = "PASS" if dq_err < 0.05 else "FAIL"
             print(f"  bwd dq vs FLA:    {dq_err:.4e} {status}")
@@ -154,7 +172,11 @@ def test() -> None:
 def benchmark() -> None:
     """Benchmark forward and fwd+bwd, comparing against FLA."""
     try:
-        from fla.ops.gated_delta_rule import chunk_gated_delta_rule  # pyrefly: ignore
+        from fla.ops.gated_delta_rule import (
+            chunk_gated_delta_rule as _fn,
+        )  # pyrefly: ignore
+
+        chunk_gated_delta_rule: Any = _fn
     except ImportError:
         warnings.warn("fla not installed, skipping benchmark", stacklevel=1)
         return
@@ -198,7 +220,14 @@ def benchmark() -> None:
             bt: torch.Tensor = bt,
             sc: float = scale,
         ) -> torch.Tensor:
-            o, _ = chunk_gated_delta_rule(qt, kt, vt, gt, bt, scale=sc)
+            o, _ = chunk_gated_delta_rule(
+                qt,
+                kt,
+                vt,
+                gt,
+                bt,
+                scale=sc,
+            )
             return o
 
         fla_fwd_ms = do_bench(fla_fwd)
@@ -227,7 +256,14 @@ def benchmark() -> None:
             go: torch.Tensor = go_t,
             sc: float = scale,
         ) -> None:
-            o, _ = chunk_gated_delta_rule(qt, kt, vt, gt, bt, scale=sc)
+            o, _ = chunk_gated_delta_rule(
+                qt,
+                kt,
+                vt,
+                gt,
+                bt,
+                scale=sc,
+            )
             o.backward(go)
             qt.grad = kt.grad = vt.grad = None
 

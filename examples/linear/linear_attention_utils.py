@@ -219,8 +219,8 @@ def naive_recurrent_reference(
         else:
             S = S + torch.einsum("bhd,bhv->bhdv", kt, vt)
 
-        ot = torch.einsum("bhd,bhdv->bhv", qt, S)
-        outputs.append(ot)
+        out_t = torch.einsum("bhd,bhdv->bhv", qt, S)
+        outputs.append(out_t)
 
     return torch.stack(outputs, dim=2)
 

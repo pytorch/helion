@@ -25,7 +25,10 @@ def main() -> int:
         if not filename.startswith("examples/") or not filename.endswith(".py"):
             continue
         name = Path(filename).name
-        if name in ["__init__.py", "utils.py"] or name.startswith("_helion_aot"):
+        if name in ["__init__.py", "utils.py"] or name.startswith("_"):
+            continue
+        # Skip library modules that are not standalone examples
+        if "utils" in name or "engine" in name:
             continue
         if not has_main_function(filename):
             print(f"{filename} is missing a main() function.")
