@@ -15,6 +15,7 @@ import random
 import tempfile
 from types import SimpleNamespace
 from typing import Callable
+from typing import ClassVar
 from typing import Sequence
 import unittest
 from unittest import skip
@@ -27,6 +28,7 @@ import torch
 import helion
 from helion import _compat
 from helion import exc
+from helion._compiler.tile_dispatch import TileStrategyDispatch
 from helion._testing import DEVICE
 from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
@@ -60,7 +62,6 @@ from helion.autotuner.logger import AutotuneLogEntry
 from helion.autotuner.logger import AutotuningLogger
 from helion.autotuner.metrics import AutotuneMetrics
 from helion.autotuner.random_search import RandomSearch
-from helion._compiler.tile_dispatch import TileStrategyDispatch
 import helion.language as hl
 from helion.language import loops
 from helion.runtime.settings import Settings
@@ -999,7 +1000,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
 
             ranked = sorted(
                 zip(candidates, scores, strict=True),
-                key=lambda item: item[1],
+                key=operator.itemgetter(1),
             )[:n_sorted]
             return [member for member, _ in ranked]
 
@@ -1025,9 +1026,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
                 5: [12, 22, 33, 43],
             },
         )
-        candidates = [
-            SimpleNamespace(name=f"c{i}", flat_values=[i]) for i in range(6)
-        ]
+        candidates = [SimpleNamespace(name=f"c{i}", flat_values=[i]) for i in range(6)]
 
         expected = legacy_select(search, candidates, 3)
 
@@ -1044,7 +1043,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         """Fallback block-id lookups should reuse the precomputed strategy cache."""
 
         class DummyStrategy:
-            block_ids = [3, 4]
+            block_ids: ClassVar[list[int]] = [3, 4]
 
             def block_size_var(self, block_idx: int) -> str:
                 return f"_BLOCK_{block_idx}"

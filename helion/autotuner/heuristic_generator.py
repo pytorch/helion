@@ -709,8 +709,7 @@ def _select_config_subset_single(
             scores = np.sum(slowdowns <= target.threshold, axis=0)
         elif target.goal_type == "geomean_slowdown":
             scores = (
-                np.exp(np.mean(np.log(slowdowns + 1e-10), axis=0))
-                <= target.threshold
+                np.exp(np.mean(np.log(slowdowns + 1e-10), axis=0)) <= target.threshold
             ).astype(np.int64)
         else:  # avg_slowdown
             scores = (np.mean(slowdowns, axis=0) <= target.threshold).astype(np.int64)

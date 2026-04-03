@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import operator
 import random
 from typing import TYPE_CHECKING
 
@@ -306,7 +307,7 @@ class LFBOPatternSearch(PatternSearch):
                 scores = [random.random() for _ in range(n_samples)]
             candidates_sorted = sorted(
                 zip(candidates, scores, strict=True),
-                key=lambda item: item[1],
+                key=operator.itemgetter(1),
             )[:n_selected]
             candidates_sorted = [member for member, _ in candidates_sorted]
         else:
@@ -323,8 +324,8 @@ class LFBOPatternSearch(PatternSearch):
 
             for _rank in range(n_selected):
                 if selected_indices:
-                    mean_similarities = (
-                        similarity_sums[remaining_indices] / len(selected_indices)
+                    mean_similarities = similarity_sums[remaining_indices] / len(
+                        selected_indices
                     )
                     proba_minus_similarity = (
                         proba[remaining_indices]

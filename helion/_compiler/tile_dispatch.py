@@ -59,9 +59,7 @@ class TileStrategyDispatch:
         strategy = env.backend.create_loop_strategy(fn, block_ids, config)
         self._register_strategy(block_ids, strategy)
 
-    def _register_strategy(
-        self, block_ids: list[int], strategy: TileStrategy
-    ) -> None:
+    def _register_strategy(self, block_ids: list[int], strategy: TileStrategy) -> None:
         self.strategies.append(strategy)
         self.block_id_to_strategy[tuple(block_ids)] = strategy
         for block_id in block_ids:
