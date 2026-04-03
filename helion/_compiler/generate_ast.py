@@ -85,7 +85,6 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         self.root_thread_block_dims = [1, 1, 1]
         self.referenced_thread_block_dims = [1, 1, 1]
         self.next_else_block: list[ast.AST] | None = None
-        self.if_ast_nodes: dict[int, ast.If] = {}
         self.store_transform = store_transform
         self.load_transform = load_transform
 
