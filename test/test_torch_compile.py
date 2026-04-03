@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import functools
 import math
 import operator
@@ -28,6 +29,26 @@ from helion._testing import onlyBackends
 from helion._testing import skipIfRocm
 from helion._testing import skipIfTileIR
 import helion.language as hl
+
+
+def requires_fusion_support(test_fn):
+    """Decorator: when fusion is unsupported, assert the upgrade error instead of running."""
+
+    @functools.wraps(test_fn)
+    def wrapper(self, *args, **kwargs):
+        ctx = (
+            contextlib.nullcontext()
+            if supports_torch_compile_fusion()
+            else self.assertRaisesRegex(
+                RuntimeError,
+                "torch_compile_fusion=True requires PyTorch nightly build",
+            )
+        )
+        with ctx:
+            test_fn(self, *args, **kwargs)
+
+    return wrapper
+
 
 # -----------------------------------------------------------------------------
 # Basic Operations (no mutation, return new tensor)
@@ -494,11 +515,11 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         expected_num_kernels_ref: int | None = None,
     ):
         """Run torch.compile test comparing eager vs compiled execution."""
-        if allow_torch_compile_fusion:
-            if not supports_torch_compile_fusion():
-                self.skipTest(
-                    "torch.compile fusion requires ExternalTritonTemplateKernel support"
-                )
+        if allow_torch_compile_fusion and not supports_torch_compile_fusion():
+            expected_error = (
+                RuntimeError,
+                "torch_compile_fusion=True requires PyTorch nightly build",
+            )
 
         # Reset specific kernels and configure fusion setting
         for kernel in kernels:
@@ -2764,11 +2785,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         sizes, producing wrong results at runtime.  We now raise a clear
         error instead.
         """
-        if not supports_torch_compile_fusion():
-            self.skipTest(
-                "static_shapes check requires HOP lowering path "
-                "(ExternalTritonTemplateKernel support)"
-            )
 
         def f(x: torch.Tensor, y: torch.Tensor, *, _kernels=(k_add,)) -> torch.Tensor:
             return _kernels[0](x, y)
@@ -2781,7 +2797,9 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             kernels=[k_add],
             dynamic=True,
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_error=(RuntimeError, "static_shapes=True.*dynamic=True"),
+            expected_error=(RuntimeError, "static_shapes=True.*dynamic=True")
+            if supports_torch_compile_fusion()
+            else None,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -4137,16 +4155,13 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             expected_num_kernels_ref=1,
         )
 
+    @requires_fusion_support
     @parametrize("allow_torch_compile_fusion", (True, False))
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_symint_return_from_tensor_shape(self, allow_torch_compile_fusion):
         """Test: kernel returning SymInt (tensor shape) with dynamic shapes."""
         if not allow_torch_compile_fusion:
             self.skipTest("Only testing with torch.compile fusion enabled")
-        if not supports_torch_compile_fusion():
-            self.skipTest(
-                "torch.compile fusion requires ExternalTritonTemplateKernel support"
-            )
 
         @helion.kernel(
             autotune_effort="none", static_shapes=False, torch_compile_fusion=True
@@ -4568,15 +4583,12 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
 
     # --- Autotune-with-fusion tests ---
 
+    @requires_fusion_support
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     @parametrize("autotune_with_fusion", (True, False))
     def test_autotune_fusion_aware_vs_default(self, autotune_with_fusion):
         """When fusion-aware autotuning is on, each config is benchmarked as fused code;
         when off, the pre-existing BoundKernel config is reused without recompilation."""
-        if not supports_torch_compile_fusion():
-            self.skipTest(
-                "torch.compile fusion requires ExternalTritonTemplateKernel support"
-            )
 
         kernel = self._make_autotune_kernel(
             autotune_with_torch_compile_fusion=autotune_with_fusion
@@ -4632,13 +4644,10 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         result_direct = kernel(x.clone(), y.clone())
         torch.testing.assert_close(result_direct, x + y)
 
+    @requires_fusion_support
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_autotune_fusion_recompile(self):
         """Recompile with shared BoundKernel still produces fused code."""
-        if not supports_torch_compile_fusion():
-            self.skipTest(
-                "torch.compile fusion requires ExternalTritonTemplateKernel support"
-            )
 
         kernel = self._make_autotune_kernel()
 
@@ -4676,15 +4685,10 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         self.assertIn(pp, code, "Must have prologue fusion")
         self.assertEqual(code.count("@triton.jit"), 1, "Single fused kernel")
 
+    @requires_fusion_support
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_autotune_different_epilogues(self):
         """Different epilogues (relu vs sigmoid) trigger separate autotuning."""
-        if not supports_torch_compile_fusion():
-            self.skipTest(
-                "torch.compile fusion requires ExternalTritonTemplateKernel support"
-            )
-        from helion._compiler._inductor.template_buffer import HelionTemplateBuffer
-
         kernel = self._make_autotune_kernel()
         captured_codes, patch_ctx = self._make_code_capture()
 
@@ -4716,6 +4720,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         self.assertGreater(len(sigmoid_only), 0, "Must have sigmoid-only kernel(s)")
 
         # Different epilogues must produce separate fusion-context cache entries
+        from helion._compiler._inductor.template_buffer import HelionTemplateBuffer
+
         bk = next(iter(kernel._bound_kernels.values()))
         bk_cache = HelionTemplateBuffer._fusion_config_cache.get(bk)
         self.assertIsNotNone(
@@ -4737,13 +4743,10 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
         self.assertEqual(len(captured_codes), 0, "Re-run must reuse cached kernels")
 
+    @requires_fusion_support
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_autotune_different_shapes(self):
         """Different input shapes trigger re-autotuning with fused kernels."""
-        if not supports_torch_compile_fusion():
-            self.skipTest(
-                "torch.compile fusion requires ExternalTritonTemplateKernel support"
-            )
 
         kernel = self._make_autotune_kernel()
         captured_codes, patch_ctx = self._make_code_capture()
@@ -4792,13 +4795,10 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             second_fused_count, 0, "New shape must trigger new fused compilations"
         )
 
+    @requires_fusion_support
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_autotune_same_epilogue_cache(self):
         """Same kernel + same epilogue called twice → second hits fusion cache."""
-        if not supports_torch_compile_fusion():
-            self.skipTest(
-                "torch.compile fusion requires ExternalTritonTemplateKernel support"
-            )
 
         kernel = self._make_autotune_kernel()
         captured_codes, patch_ctx = self._make_code_capture()
@@ -4864,6 +4864,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             f"(got {double_call_fused_count} new fused compilations)",
         )
 
+    @requires_fusion_support
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_standalone_call_after_fusion_triggers_autotuning(self):
         """Standalone call after torch.compile with fusion must trigger its own autotuning.
@@ -4873,12 +4874,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         workload.  A subsequent direct call must trigger autotuning for
         the unfused context rather than silently reusing the fused config.
         """
-        if not supports_torch_compile_fusion():
-            self.skipTest(
-                "torch.compile fusion requires ExternalTritonTemplateKernel support"
-            )
-        from helion._compiler._inductor.template_buffer import HelionTemplateBuffer
-        from helion.runtime.kernel import BoundKernel
 
         kernel = self._make_autotune_kernel()
 
@@ -4900,6 +4895,9 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         torch.testing.assert_close(result_fused, expected_fused, rtol=1e-4, atol=1e-4)
 
         # Spy on compile_config to verify the standalone call triggers autotuning.
+        from helion._compiler._inductor.template_buffer import HelionTemplateBuffer
+        from helion.runtime.kernel import BoundKernel
+
         compile_config_calls: list[bool] = []
         original_compile_config = BoundKernel.compile_config
 
@@ -4932,21 +4930,21 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             "Fusion config cache should have entries from the torch.compile call",
         )
 
+    @requires_fusion_support
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_autotune_fused_vs_unfused_config_stored_separately(self):
         """Unfused config (bk._config) and fused config (_fusion_config_cache) are independent."""
-        if not supports_torch_compile_fusion():
-            self.skipTest(
-                "torch.compile fusion requires ExternalTritonTemplateKernel support"
-            )
-        from helion._compiler._inductor.template_buffer import HelionTemplateBuffer
         from helion.runtime.config import Config
 
         kernel = self._make_autotune_kernel()
 
         kernel.reset()
         torch._dynamo.reset()
-        HelionTemplateBuffer._fusion_config_cache.clear()
+
+        if supports_torch_compile_fusion():
+            from helion._compiler._inductor.template_buffer import HelionTemplateBuffer
+
+            HelionTemplateBuffer._fusion_config_cache.clear()
 
         x = torch.randn(128, device=DEVICE, dtype=torch.float32)
         y = torch.randn(128, device=DEVICE, dtype=torch.float32)
@@ -4989,13 +4987,10 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
                 f"Fusion cache entry {fusion_key!r} must be a Config",
             )
 
+    @requires_fusion_support
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_autotune_epilogue_only_fusion(self):
         """Fusion-aware autotuning works with epilogue only (no prologue)."""
-        if not supports_torch_compile_fusion():
-            self.skipTest(
-                "torch.compile fusion requires ExternalTritonTemplateKernel support"
-            )
 
         kernel = self._make_autotune_kernel()
         captured_codes, patch_ctx = self._make_code_capture()
@@ -5023,13 +5018,10 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         for code in fused:
             self.assertNotIn(pp, code, "Must NOT have prologue in epilogue-only test")
 
+    @requires_fusion_support
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_autotune_prologue_only_fusion(self):
         """Fusion-aware autotuning works with prologue only (no epilogue)."""
-        if not supports_torch_compile_fusion():
-            self.skipTest(
-                "torch.compile fusion requires ExternalTritonTemplateKernel support"
-            )
 
         kernel = self._make_autotune_kernel()
         captured_codes, patch_ctx = self._make_code_capture()
@@ -5059,13 +5051,10 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         for code in fused:
             self.assertNotIn(ep, code, "Must NOT have epilogue in prologue-only test")
 
+    @requires_fusion_support
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_autotune_bare_kernel_no_prologue_epilogue(self):
         """Fusion-aware autotuning does not break when Inductor has no prologue or epilogue to fuse."""
-        if not supports_torch_compile_fusion():
-            self.skipTest(
-                "torch.compile fusion requires ExternalTritonTemplateKernel support"
-            )
 
         kernel = self._make_autotune_kernel()
 
@@ -5125,6 +5114,11 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
 
         # torch.compile with fusion — must not crash and must not silently
         # reuse the cached unfused config.
+        torch._dynamo.reset()
+
+        def f(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            return torch.relu(k_add_no_configs(x, y)) + 1.0
+
         from helion._compiler._inductor.template_buffer import _FusionAutotuneAdapter
 
         bench_compile_called: list[bool] = []
@@ -5133,11 +5127,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         def tracking_bench(adapter_self, config=None, **kwargs):
             bench_compile_called.append(True)
             return original_bench(adapter_self, config, **kwargs)
-
-        torch._dynamo.reset()
-
-        def f(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-            return torch.relu(k_add_no_configs(x, y)) + 1.0
 
         with patch.object(
             _FusionAutotuneAdapter, "bench_compile_config", tracking_bench
@@ -5158,14 +5147,11 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             "bench_compile_config, not reuse the cached unfused config",
         )
 
+    @requires_fusion_support
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     @patch.object(k_rms_norm.settings, "torch_compile_fusion", True)
     def test_inductor_output_code_has_helion_generated_triton_kernel(self):
         """Verify Helion-specific patterns appear in inductor output code."""
-        if not supports_torch_compile_fusion():
-            self.skipTest(
-                "torch.compile fusion requires ExternalTritonTemplateKernel support"
-            )
 
         def f(x, weight, out_bias, res_bias):
             x_processed = torch.relu(x) + 0.5
