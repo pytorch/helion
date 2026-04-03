@@ -18,6 +18,7 @@ from typing import NamedTuple
 from typing import Protocol
 from typing import cast
 from unittest.mock import patch
+import math
 
 import torch
 from torch._dynamo.convert_frame import compile_lock
@@ -1245,7 +1246,7 @@ class WalkDeviceAST(NodeVisitor):
         orelse: list[ast.stmt],
     ) -> int:
         # Track whether the predicate is tensor-derived (vs truly scalar).
-        predicate_is_tensor = isinstance(test_proxy, torch.Tensor)
+        predicate_is_tensor = isinstance(test_proxy, torch.Tensor) and math.prod(test_proxy.shape) > 1
 
         if_branch_rw: ReadWrites = ReadWrites.from_list(body)
         else_branch_rw: ReadWrites = ReadWrites.from_list(orelse)

@@ -1290,14 +1290,14 @@ def _(state: CodegenState) -> list[object]:
         else:
             state.add_statement(
                 statement_from_string(
-                    f"{if_return_names_str} = lax.cond({{test}}, {if_fn_name}, {else_fn_name})",
+                    f"{if_return_names_str} = lax.cond({{test}}.reshape(()), {if_fn_name}, {else_fn_name})",
                     test=test,
                 )
             )
     else:
         state.add_statement(
             statement_from_string(
-                f"lax.cond({{test}}, {if_fn_name}, {else_fn_name})", test=test
+                f"lax.cond({{test}}.reshape(()), {if_fn_name}, {else_fn_name})", test=test
             )
         )
 
