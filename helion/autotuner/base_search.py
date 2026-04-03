@@ -379,15 +379,17 @@ class BaseSearch(BaseAutotuner):
             A list of BenchmarkResult entries containing the configuration, compiled
             callable, measured performance, status, and compilation time.
         """
+        all_configs = configs
         fns: list[Callable[..., object]] = []
         valid_configs: list[Config] = []
+        valid_indices: list[int] = []
         futures: list[PrecompileFuture] | None = None
-        for i, config in enumerate(configs):
+        for i, config in enumerate(all_configs):
             try:
                 fn = self.kernel.compile_config(config, allow_print=False)
             except Exception:
                 # If all configs failed, raise error
-                if not valid_configs and i == len(configs) - 1:
+                if not valid_configs and i == len(all_configs) - 1:
                     raise
                 self.log.warning(
                     "Skipping config that failed to compile: %s",
@@ -397,6 +399,7 @@ class BaseSearch(BaseAutotuner):
                 continue
             fns.append(fn)
             valid_configs.append(config)
+            valid_indices.append(i)
         configs = valid_configs
         if self.settings.autotune_precompile:
             futures = list(
@@ -495,7 +498,25 @@ class BaseSearch(BaseAutotuner):
                         compile_time=compile_time,
                     )
                 )
-        return results
+        if len(valid_indices) == len(all_configs):
+            return results
+        full_results: list[BenchmarkResult] = []
+        valid_iter = iter(results)
+        valid_set = set(valid_indices)
+        for i, config in enumerate(all_configs):
+            if i in valid_set:
+                full_results.append(next(valid_iter))
+            else:
+                full_results.append(
+                    BenchmarkResult(
+                        config=config,
+                        fn=_unset_fn,
+                        perf=inf,
+                        status="error",
+                        compile_time=None,
+                    )
+                )
+        return full_results
 
     def benchmark_batch(
         self, configs: list[Config], *, desc: str = "Benchmarking"
