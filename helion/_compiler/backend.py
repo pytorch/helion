@@ -1198,10 +1198,7 @@ class PallasBackend(Backend):
                 spec.update_min(min(8, dim_size))
 
     def tunable_fragments(self) -> dict[str, ConfigSpecFragment]:
-        from ..autotuner.config_fragment import EnumFragment
-        from ..autotuner.config_spec import VALID_PALLAS_LOOP_TYPES
-
-        return {"pallas_loop_type": EnumFragment(choices=VALID_PALLAS_LOOP_TYPES)}
+        return {}
 
     def get_do_bench(self) -> Callable[..., float | tuple[float, ...]]:
         from ..autotuner.benchmarking import do_bench_generic
