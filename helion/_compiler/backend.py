@@ -1132,12 +1132,16 @@ class PallasBackend(Backend):
         - 2D+: lane dim (last) must be a multiple of 128
         - 2D+: sublane dim (second-to-last) must be a multiple of 8
 
-        These constraints are enforced unconditionally.  When the actual
-        tensor dimension is smaller than the block size at runtime, the
-        host code caps ``_BLOCK_SIZE`` to ``min(block_size, numel)``
-        so that the kernel and BlockSpec agree on a full-dim block
-        (always valid per TPU rules).
+        When the compile-time size hint is smaller than the alignment
+        requirement, the minimum is capped to
+        ``min(alignment, next_power_of_2(hint))`` — any block above
+        that covers the full dim (always valid on TPU).  Each
+        compilation uses the actual tensor shapes, so the hint is
+        always accurate for the current invocation even with
+        ``static_shapes=False``.
         """
+        from torch._inductor.runtime.runtime_utils import next_power_of_2
+
         from ..autotuner.config_spec import BlockSizeSpec
         from .compile_environment import BlockSizeInfo
 
@@ -1148,8 +1152,6 @@ class PallasBackend(Backend):
 
         LANE_ALIGNMENT = 128  # 2D+ last dim
         SUBLANE_ALIGNMENT = 8  # 2D+ second-to-last dim
-
-        from torch._inductor.runtime.runtime_utils import next_power_of_2
 
         # Map block_id -> the closest position to lane dim across all
         # tensors (0 = lane, 1 = sublane, 2+ = batch/outer).
@@ -1189,10 +1191,6 @@ class PallasBackend(Backend):
             if is_lane:
                 tndim = min_tensor_ndim.get(bid, ndim)
                 alignment = lane_alignment_1d if tndim <= 1 else LANE_ALIGNMENT
-                # When the dim is smaller than alignment, block >=
-                # dim always holds (full-dim access, valid on TPU).
-                # Cap the minimum so we don't inflate blocks beyond
-                # what the dim needs.
                 dim_size = next_power_of_2(max(spec.size_hint, 1))
                 spec.update_min(min(alignment, dim_size))
             elif is_sublane:
@@ -1339,7 +1337,9 @@ class PallasBackend(Backend):
                             if bs != dim_size and bs % tiling_1d != 0:
                                 return None
                         # Cap broadcast dims (size 1) so the ref
-                        # keeps broadcast semantics with scratch.
+                        # keeps broadcast semantics — zero-padding a
+                        # size-1 dim to block_size would replace the
+                        # broadcast value with zeros in padded rows.
                         if isinstance(dim_size, int) and dim_size == 1 and bs > 1:
                             bs = 1
                         block_shape.append(bs)

@@ -188,7 +188,14 @@ def _pallas_make_block_spec(
 
     block_shape_template, grid_dims = entry
     block_shape = tuple(
-        min(bs, tensor.shape[d]) if bs is not None else tensor.shape[d]
+        # TPU-aligned blocks (multiple of 128) are kept uncapped so
+        # the ref matches _BLOCK_SIZE and scratch/accumulator shapes
+        # agree — Pallas zero-pads when block > dim.  Non-aligned
+        # blocks are capped to the tensor dim (== dim always satisfies
+        # Pallas alignment rules).
+        (bs if bs % 128 == 0 else min(bs, tensor.shape[d]))
+        if bs is not None
+        else tensor.shape[d]
         for d, bs in enumerate(block_shape_template)
     )
 
