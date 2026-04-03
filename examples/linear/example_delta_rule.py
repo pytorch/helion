@@ -52,9 +52,9 @@ def test() -> None:
 
     # === Forward: vs FLA ===
     try:
-        from fla.ops.delta_rule import chunk_delta_rule
+        from fla.ops.delta_rule import chunk_delta_rule  # pyrefly: ignore
 
-        o_fla, _ = chunk_delta_rule(_htf(q), _htf(k), _htf(v), _htf(beta), scale=scale)
+        o_fla, _ = chunk_delta_rule(_htf(q), _htf(k), _htf(v), _htf(beta), scale=scale)  # pyrefly: ignore
         o_fla_hf = o_fla.transpose(1, 2).contiguous()
         fla_err = _rel_error(out, o_fla_hf)
         print(
@@ -90,7 +90,7 @@ def test() -> None:
 
     # === Backward: vs FLA (dq comparison) ===
     if _has_fla:
-        from fla.ops.delta_rule import chunk_delta_rule
+        from fla.ops.delta_rule import chunk_delta_rule  # pyrefly: ignore
 
         q3 = q.clone().requires_grad_(True)
         k3 = k.clone().detach().requires_grad_(True)
@@ -101,7 +101,7 @@ def test() -> None:
         q4 = _htf(q).clone().requires_grad_(True)
         k4 = _htf(k).clone().detach().requires_grad_(True)
         v4 = _htf(v).clone().requires_grad_(True)
-        o4, _ = chunk_delta_rule(q4, k4, v4, _htf(beta), scale=scale)
+        o4, _ = chunk_delta_rule(q4, k4, v4, _htf(beta), scale=scale)  # pyrefly: ignore
         o4.backward(_htf(grad_out))
 
         dq_err = _rel_error(q3.grad, q4.grad.transpose(1, 2).contiguous())
@@ -149,7 +149,7 @@ def test() -> None:
 def benchmark() -> None:
     """Benchmark forward and fwd+bwd, comparing against FLA."""
     try:
-        from fla.ops.delta_rule import chunk_delta_rule
+        from fla.ops.delta_rule import chunk_delta_rule  # pyrefly: ignore
     except ImportError:
         warnings.warn("fla not installed, skipping benchmark", stacklevel=1)
         return
@@ -190,7 +190,7 @@ def benchmark() -> None:
             bt: torch.Tensor = bt,
             sc: float = scale,
         ) -> torch.Tensor:
-            o, _ = chunk_delta_rule(qt, kt, vt, bt, scale=sc)
+            o, _ = chunk_delta_rule(qt, kt, vt, bt, scale=sc)  # pyrefly: ignore
             return o
 
         fla_fwd_ms = do_bench(fla_fwd)
@@ -218,7 +218,7 @@ def benchmark() -> None:
             go: torch.Tensor = go_t,
             sc: float = scale,
         ) -> None:
-            o, _ = chunk_delta_rule(qt, kt, vt, bt, scale=sc)
+            o, _ = chunk_delta_rule(qt, kt, vt, bt, scale=sc)  # pyrefly: ignore
             o.backward(go)
             qt.grad = kt.grad = vt.grad = None
 

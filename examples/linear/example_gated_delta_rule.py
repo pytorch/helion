@@ -52,7 +52,7 @@ def test() -> None:
 
     # === Forward: vs FLA ===
     try:
-        from fla.ops.gated_delta_rule import chunk_gated_delta_rule
+        from fla.ops.gated_delta_rule import chunk_gated_delta_rule  # pyrefly: ignore
 
         # Note: FLA arg order is q, k, v, g, beta (g BEFORE beta)
         o_fla, _ = chunk_gated_delta_rule(
@@ -154,7 +154,7 @@ def test() -> None:
 def benchmark() -> None:
     """Benchmark forward and fwd+bwd, comparing against FLA."""
     try:
-        from fla.ops.gated_delta_rule import chunk_gated_delta_rule
+        from fla.ops.gated_delta_rule import chunk_gated_delta_rule  # pyrefly: ignore
     except ImportError:
         warnings.warn("fla not installed, skipping benchmark", stacklevel=1)
         return

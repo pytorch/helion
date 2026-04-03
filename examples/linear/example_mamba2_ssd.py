@@ -12,8 +12,8 @@ from __future__ import annotations
 
 import sys
 import types
-import warnings
 from typing import TYPE_CHECKING
+import warnings
 
 import torch
 import torch.nn.functional as F

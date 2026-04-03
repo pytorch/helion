@@ -62,7 +62,7 @@ def test() -> None:
 
     # Forward vs FLA KDA
     try:
-        from fla.ops.kda import chunk_kda
+        from fla.ops.kda import chunk_kda  # pyrefly: ignore
 
         o_fla, _ = chunk_kda(
             _htf(q),
@@ -145,7 +145,7 @@ def test() -> None:
 def benchmark() -> None:
     """Benchmark KDA forward+backward, comparing against FLA."""
     try:
-        from fla.ops.kda import chunk_kda
+        from fla.ops.kda import chunk_kda  # pyrefly: ignore
     except ImportError:
         warnings.warn("fla not installed, skipping benchmark", stacklevel=1)
         return
@@ -187,7 +187,15 @@ def benchmark() -> None:
             )
         )
 
-        def helion_fb(q=q, k=k, v=v, g=g, beta=beta, go=grad_out, sc=scale):
+        def helion_fb(
+            q: torch.Tensor = q,
+            k: torch.Tensor = k,
+            v: torch.Tensor = v,
+            g: torch.Tensor = g,
+            beta: torch.Tensor = beta,
+            go: torch.Tensor = grad_out,
+            sc: float = scale,
+        ) -> None:
             o = chunked_linear_attn(q * sc, k, v, g, beta=beta, C=BENCH_C)
             o.backward(go)
             q.grad = k.grad = v.grad = None

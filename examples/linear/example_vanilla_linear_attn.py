@@ -50,7 +50,7 @@ def test() -> None:
 
     # === Forward: vs FLA ===
     try:
-        from fla.ops.linear_attn import chunk_linear_attn as fla_chunk_linear_attn
+        from fla.ops.linear_attn import chunk_linear_attn as fla_chunk_linear_attn  # pyrefly: ignore
 
         o_fla = fla_chunk_linear_attn(
             _htf(q), _htf(k), _htf(v), scale=scale, normalize=False
@@ -92,7 +92,7 @@ def test() -> None:
 
     # === Backward: vs FLA (dq comparison) ===
     if _has_fla:
-        from fla.ops.linear_attn import chunk_linear_attn as fla_chunk_linear_attn
+        from fla.ops.linear_attn import chunk_linear_attn as fla_chunk_linear_attn  # pyrefly: ignore
 
         q3 = q.clone().requires_grad_(True)
         k3 = k.clone().requires_grad_(True)
@@ -149,7 +149,7 @@ def test() -> None:
 def benchmark() -> None:
     """Benchmark forward and fwd+bwd, comparing against FLA."""
     try:
-        from fla.ops.linear_attn import chunk_linear_attn as fla_chunk_linear_attn
+        from fla.ops.linear_attn import chunk_linear_attn as fla_chunk_linear_attn  # pyrefly: ignore
     except ImportError:
         warnings.warn("fla not installed, skipping benchmark", stacklevel=1)
         return

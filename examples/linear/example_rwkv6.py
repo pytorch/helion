@@ -55,7 +55,7 @@ def test() -> None:
 
     # Forward vs FLA chunk_rwkv6 (with u=zeros to match our engine)
     try:
-        from fla.ops.rwkv6 import chunk_rwkv6
+        from fla.ops.rwkv6 import chunk_rwkv6  # pyrefly: ignore
 
         out_no_gate = chunked_linear_attn(q, k, v, g, C=C)
         u_zeros = torch.zeros(H, D, device=DEVICE, dtype=DTYPE)
@@ -130,7 +130,7 @@ def test() -> None:
 def benchmark() -> None:
     """Benchmark RWKV-6 forward+backward, comparing against FLA chunk_rwkv6."""
     try:
-        from fla.ops.rwkv6 import chunk_rwkv6
+        from fla.ops.rwkv6 import chunk_rwkv6  # pyrefly: ignore
     except ImportError:
         warnings.warn("fla not installed, skipping benchmark", stacklevel=1)
         return
@@ -156,7 +156,9 @@ def benchmark() -> None:
         )
 
         # Helion fwd (includes output gate)
-        fwd_ms = do_bench(lambda: engine(q, k, v, g, gate=gate))
+        fwd_ms = do_bench(
+            lambda eng=engine, q=q, k=k, v=v, g=g, gate=gate: eng(q, k, v, g, gate=gate)
+        )
 
         # FLA fwd (no output gate — just the recurrence)
         qt = _htf(q.detach())
@@ -170,8 +172,16 @@ def benchmark() -> None:
         )
 
         # Helion fwd+bwd
-        def helion_fb(q=q, k=k, v=v, go=grad_out):
-            o = engine(q, k, v, g, gate=gate)
+        def helion_fb(
+            eng: LinearAttentionEngine = engine,
+            q: torch.Tensor = q,
+            k: torch.Tensor = k,
+            v: torch.Tensor = v,
+            g: torch.Tensor = g,
+            gate: torch.Tensor = gate,
+            go: torch.Tensor = grad_out,
+        ) -> None:
+            o = eng(q, k, v, g, gate=gate)
             o.backward(go)
             q.grad = k.grad = v.grad = None
 
@@ -183,7 +193,14 @@ def benchmark() -> None:
         vt_b = vt.clone().requires_grad_(True)
         go_t = _htf(grad_out)
 
-        def fla_fb(qt=qt_b, kt=kt_b, vt=vt_b, wt=wt, u=u_zeros, go=go_t):
+        def fla_fb(
+            qt: torch.Tensor = qt_b,
+            kt: torch.Tensor = kt_b,
+            vt: torch.Tensor = vt_b,
+            wt: torch.Tensor = wt,
+            u: torch.Tensor = u_zeros,
+            go: torch.Tensor = go_t,
+        ) -> None:
             o, _ = chunk_rwkv6(r=qt, k=kt, v=vt, w=wt, u=u, scale=1.0)
             o.backward(go)
             qt.grad = kt.grad = vt.grad = None

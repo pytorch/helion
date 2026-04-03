@@ -15,7 +15,10 @@ Parameterized by:
 
 from __future__ import annotations
 
+from typing import Any
 from typing import Callable
+from typing import Literal
+from typing import overload
 
 import torch
 
@@ -47,7 +50,7 @@ class LinearAttentionEngine:
         a_mod: Callable | None = None,
         output_mod: Callable | None = None,
         chunk_size: int = 64,
-    ):
+    ) -> None:
         self.q_mod = q_mod
         self.k_mod = k_mod
         self.v_mod = v_mod
@@ -88,6 +91,7 @@ class LinearAttentionEngine:
             return_final_state=return_final_state,
         )
 
+        final_state = None
         if return_final_state:
             o, final_state = result
         else:
@@ -129,7 +133,6 @@ def recurrent_step_fused(
     state is updated in-place.
     """
     BH = q.size(0)
-    D = q.size(1)
     DV = v.size(1)
     diagonal = alpha.dim() == 2
 
@@ -186,7 +189,6 @@ def recurrent_step_correction_fused(
     state is updated in-place.
     """
     BH = q.size(0)
-    D = q.size(1)
     DV = v.size(1)
     diagonal = alpha.dim() == 2
 
@@ -454,7 +456,7 @@ def chunk_fwd_o_helion(
     C = hl.specialize(q.size(1))
     D = q.size(2)
     DV = v.size(2)
-    head_dim = hl.specialize(D)
+    hl.specialize(D)
 
     out = torch.empty([BHN, C, DV], dtype=q.dtype, device=q.device)
 
@@ -932,7 +934,18 @@ def chunk_fwd_correction_helion(
 
 class ChunkedLinearAttnFn(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, q, k, v, g, beta, a, C, initial_state, return_final_state):
+    def forward(  # type: ignore[override]
+        ctx: Any,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor | None,
+        a: torch.Tensor | None,
+        C: int,
+        initial_state: torch.Tensor | None,
+        return_final_state: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         tensors = [q, k, v, g]
         ctx.has_beta = beta is not None
         ctx.has_a = a is not None
@@ -988,7 +1001,19 @@ class ChunkedLinearAttnFn(torch.autograd.Function):
         return o.to(input_dtype), final_state
 
     @staticmethod
-    def backward(ctx, grad_output, _grad_final_state):
+    def backward(
+        ctx: Any, grad_output: torch.Tensor, _grad_final_state: object
+    ) -> tuple[  # type: ignore[override]
+        torch.Tensor,
+        torch.Tensor | None,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor | None,
+        torch.Tensor | None,
+        None,
+        None,
+        None,
+    ]:
         tensors = ctx.saved_tensors
         q, k, v, g = tensors[:4]
         idx = 4
@@ -1036,13 +1061,26 @@ class ChunkedLinearAttnFn(torch.autograd.Function):
 # ════════════════════════════════════════════════════════════════════════════════
 
 
-def _init_state(initial_state, BH, D, DV, ref_tensor):
+def _init_state(
+    initial_state: torch.Tensor | None,
+    BH: int,
+    D: int,
+    DV: int,
+    ref_tensor: torch.Tensor,
+) -> torch.Tensor:
     if initial_state is not None:
         return initial_state.reshape(BH, D, DV).float().contiguous()
     return ref_tensor.new_zeros(BH, D, DV, dtype=torch.float32)
 
 
-def _final_state_from_h_all(h_all, k_state_4d, v_flat, g_last_4d, B, H):
+def _final_state_from_h_all(
+    h_all: torch.Tensor,
+    k_state_4d: torch.Tensor,
+    v_flat: torch.Tensor,
+    g_last_4d: torch.Tensor,
+    B: int,
+    H: int,
+) -> torch.Tensor:
     h_last = h_all[:, -1].float()
     gl = g_last_4d[:, -1]
     h_final = h_last * torch.exp(gl).unsqueeze(-1)
@@ -1053,7 +1091,15 @@ def _final_state_from_h_all(h_all, k_state_4d, v_flat, g_last_4d, B, H):
     return h_final.reshape(B, H, h_final.shape[1], h_final.shape[2])
 
 
-def _helion_chunked_fwd(q, k, v, g, C, initial_state=None, return_final_state=False):
+def _helion_chunked_fwd(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    C: int,
+    initial_state: torch.Tensor | None = None,
+    return_final_state: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     B, H, T, D = q.shape
     DV = v.shape[-1]
     N = T // C
@@ -1090,7 +1136,7 @@ def _helion_chunked_fwd(q, k, v, g, C, initial_state=None, return_final_state=Fa
         exp_g_cs = torch.exp(g_cs[:, :, :, None])
         q_scaled_4d = qf.reshape(BH, N, C, D) * exp_g_cs
         # Attach cached data to h_all for the backward to use
-        h_all._scalar_bwd_cache = (g_cs, g_last, g_last_4d, q_scaled_4d)
+        h_all._scalar_bwd_cache = (g_cs, g_last, g_last_4d, q_scaled_4d)  # pyrefly: ignore
 
         final_state = None
         if return_final_state:
@@ -1129,7 +1175,16 @@ def _helion_chunked_fwd(q, k, v, g, C, initial_state=None, return_final_state=Fa
     return o.reshape(B, H, T, DV), h_all, final_state
 
 
-def _helion_chunked_fwd_correction(q, k, v, g, beta, a, C, initial_state=None):
+def _helion_chunked_fwd_correction(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    a: torch.Tensor | None,
+    C: int,
+    initial_state: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor]:
     B, H, T, D = q.shape
     DV = v.shape[-1]
     N = T // C
@@ -1146,6 +1201,7 @@ def _helion_chunked_fwd_correction(q, k, v, g, beta, a, C, initial_state=None):
 
     diagonal_decay = g.dim() == 4
 
+    g_scalar: torch.Tensor | None = None
     if not diagonal_decay:
         g_scalar = g.reshape(BH, N, C)
         g = g.unsqueeze(-1).expand(-1, -1, -1, D).contiguous()
@@ -1181,6 +1237,7 @@ def _helion_chunked_fwd_correction(q, k, v, g, beta, a, C, initial_state=None):
     else:
         qf2 = qc.reshape(BHN, C, D)
         af2 = ac.reshape(BHN, C, D)
+        assert g_scalar is not None
         g_cs_for_output = g_scalar.cumsum(-1).reshape(BHN, C)
 
     o = chunk_fwd_o_helion(
@@ -1194,7 +1251,15 @@ def _helion_chunked_fwd_correction(q, k, v, g, beta, a, C, initial_state=None):
     return o.reshape(B, H, T, DV), h_all, v_new_all, A_inv, w
 
 
-def _helion_chunked_bwd(q, k, v, g, grad_output, C, h_all=None):
+def _helion_chunked_bwd(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    grad_output: torch.Tensor,
+    C: int,
+    h_all: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     B, H, T, D = q.shape
     DV = v.shape[-1]
     N = T // C
@@ -1318,7 +1383,19 @@ def _helion_chunked_bwd(q, k, v, g, grad_output, C, h_all=None):
     return dq, dk, dv, dg
 
 
-def _recompute_wy(ac_flat, vc_flat, bc_flat, g_cs_d_flat, BH, N, C, D, DV, A_inv, w_wy):
+def _recompute_wy(
+    ac_flat: torch.Tensor,
+    vc_flat: torch.Tensor,
+    bc_flat: torch.Tensor,
+    g_cs_d_flat: torch.Tensor,
+    BH: int,
+    N: int,
+    C: int,
+    D: int,
+    DV: int,
+    A_inv: torch.Tensor | None,
+    w_wy: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     w_recomp, u_recomp, A_buf = chunk_fwd_wy_diag_helion(
         ac_flat, vc_flat, bc_flat, g_cs_d_flat
     )
@@ -1336,19 +1413,26 @@ def _recompute_wy(ac_flat, vc_flat, bc_flat, g_cs_d_flat, BH, N, C, D, DV, A_inv
 
 
 def _helion_chunked_bwd_correction(
-    q,
-    k,
-    v,
-    g,
-    beta,
-    a,
-    grad_output,
-    C,
-    h_all=None,
-    v_new_all=None,
-    A_inv=None,
-    w_wy=None,
-):
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    a: torch.Tensor | None,
+    grad_output: torch.Tensor,
+    C: int,
+    h_all: torch.Tensor | None = None,
+    v_new_all: torch.Tensor | None = None,
+    A_inv: torch.Tensor | None = None,
+    w_wy: torch.Tensor | None = None,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor | None,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor | None,
+]:
     B, H, T, D = q.shape
     DV = v.shape[-1]
     N = T // C
@@ -1365,6 +1449,8 @@ def _helion_chunked_bwd_correction(
 
     diagonal_decay = g.dim() == 4
 
+    g_cs_scalar: torch.Tensor | None = None
+    g_last_scalar: torch.Tensor | None = None
     if not diagonal_decay:
         g_scalar = g.reshape(BH, N, C)
         g_cs_scalar = g_scalar.cumsum(-1)
@@ -1489,6 +1575,8 @@ def _helion_chunked_bwd_correction(
         da_total_flat = da_par + da_wy
         dg_out = dg_per_step.reshape(B, H, T, D).float()
     else:
+        assert g_cs_scalar is not None
+        assert g_last_scalar is not None
         g_csf = g_cs_scalar.reshape(BHN, C)
         g_lastf = g_last_scalar.reshape(BHN)
         qf_raw = qc.reshape(BHN, C, D)
@@ -1558,6 +1646,36 @@ def _helion_chunked_bwd_correction(
 # ════════════════════════════════════════════════════════════════════════════════
 
 
+@overload
+def chunked_linear_attn(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor | None = ...,
+    a: torch.Tensor | None = ...,
+    C: int = ...,
+    initial_state: torch.Tensor | None = ...,
+    return_final_state: Literal[False] = ...,
+    head_first: bool = ...,
+) -> torch.Tensor: ...
+
+
+@overload
+def chunked_linear_attn(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor | None = ...,
+    a: torch.Tensor | None = ...,
+    C: int = ...,
+    initial_state: torch.Tensor | None = ...,
+    return_final_state: Literal[True] = ...,
+    head_first: bool = ...,
+) -> tuple[torch.Tensor, torch.Tensor]: ...
+
+
 def chunked_linear_attn(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -1593,20 +1711,20 @@ def chunked_linear_attn(
     T_cur = q.shape[2]
     pad = (C - T_cur % C) % C
     if pad > 0:
-        q = torch.nn.functional.pad(q, (0, 0, 0, pad))
-        k = torch.nn.functional.pad(k, (0, 0, 0, pad))
-        v = torch.nn.functional.pad(v, (0, 0, 0, pad))
+        q = torch.nn.functional.pad(q, [0, 0, 0, pad])
+        k = torch.nn.functional.pad(k, [0, 0, 0, pad])
+        v = torch.nn.functional.pad(v, [0, 0, 0, pad])
         if g.dim() == 3:
-            g = torch.nn.functional.pad(g, (0, pad))
+            g = torch.nn.functional.pad(g, [0, pad])
         else:
-            g = torch.nn.functional.pad(g, (0, 0, 0, pad))
+            g = torch.nn.functional.pad(g, [0, 0, 0, pad])
         if beta is not None:
             if beta.dim() == 3:
-                beta = torch.nn.functional.pad(beta, (0, pad))
+                beta = torch.nn.functional.pad(beta, [0, pad])
             else:
-                beta = torch.nn.functional.pad(beta, (0, pad))
+                beta = torch.nn.functional.pad(beta, [0, pad])
         if a is not None:
-            a = torch.nn.functional.pad(a, (0, 0, 0, pad))
+            a = torch.nn.functional.pad(a, [0, 0, 0, pad])
 
     o, final_state = ChunkedLinearAttnFn.apply(
         q, k, v, g, beta, a, C, initial_state, return_final_state

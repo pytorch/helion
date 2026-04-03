@@ -17,14 +17,14 @@ import math
 import torch
 import torch.nn.functional as F
 
-
 # ════════════════════════════════════════════════════════════════════════════════
 # Shared test helpers
 # ════════════════════════════════════════════════════════════════════════════════
 
 
-def rel_error(a: torch.Tensor, b: torch.Tensor) -> float:
+def rel_error(a: torch.Tensor | None, b: torch.Tensor | None) -> float:
     """Relative L2 error between two tensors."""
+    assert a is not None and b is not None
     return (a.float() - b.float()).norm().item() / b.float().norm().clamp(
         min=1e-8
     ).item()
@@ -233,8 +233,8 @@ def naive_recurrent_reference(
 def solve_tril_inv(A: torch.Tensor) -> torch.Tensor:
     """Compute (I + A)^{-1} where A is strictly lower triangular."""
     BHN, C, _ = A.shape
-    I = torch.eye(C, device=A.device, dtype=A.dtype).unsqueeze(0).expand(BHN, -1, -1)
-    return torch.linalg.solve_triangular(I + A, I, upper=False, unitriangular=True)
+    eye = torch.eye(C, device=A.device, dtype=A.dtype).unsqueeze(0).expand(BHN, -1, -1)
+    return torch.linalg.solve_triangular(eye + A, eye, upper=False, unitriangular=True)
 
 
 def prepare_wy_repr_bwd(
@@ -360,7 +360,7 @@ def make_simple_gla_inputs(
     D: int,
     DV: int,
     dtype: torch.dtype = torch.bfloat16,
-    device: str = "cuda",
+    device: str | torch.device = "cuda",
     requires_grad: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, float]:
     """Create inputs for simple GLA (scalar decay)."""
@@ -381,7 +381,7 @@ def make_full_gla_inputs(
     D: int,
     DV: int,
     dtype: torch.dtype = torch.bfloat16,
-    device: str = "cuda",
+    device: str | torch.device = "cuda",
     requires_grad: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, float]:
     """Create inputs for full GLA (diagonal decay)."""
@@ -402,7 +402,7 @@ def make_delta_rule_inputs(
     D: int,
     DV: int,
     dtype: torch.dtype = torch.bfloat16,
-    device: str = "cuda",
+    device: str | torch.device = "cuda",
     requires_grad: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, float]:
     """Create inputs for DeltaNet (correction, no decay)."""
@@ -426,7 +426,7 @@ def make_gated_delta_rule_inputs(
     D: int,
     DV: int,
     dtype: torch.dtype = torch.bfloat16,
-    device: str = "cuda",
+    device: str | torch.device = "cuda",
     requires_grad: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, float]:
     """Create inputs for Gated DeltaNet (correction + scalar decay)."""
@@ -450,7 +450,7 @@ def make_vanilla_linear_attn_inputs(
     D: int,
     DV: int,
     dtype: torch.dtype = torch.bfloat16,
-    device: str = "cuda",
+    device: str | torch.device = "cuda",
     requires_grad: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, float]:
     """Create inputs for vanilla linear attention (no decay)."""
@@ -471,7 +471,7 @@ def make_retention_inputs(
     D: int,
     DV: int,
     dtype: torch.dtype = torch.bfloat16,
-    device: str = "cuda",
+    device: str | torch.device = "cuda",
     requires_grad: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, float]:
     """Create inputs for RetNet (fixed per-head decay)."""
@@ -495,7 +495,7 @@ def make_mamba2_inputs(
     D: int,
     DV: int,
     dtype: torch.dtype = torch.bfloat16,
-    device: str = "cuda",
+    device: str | torch.device = "cuda",
     requires_grad: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, float]:
     """Create inputs for Mamba-2 SSD (scalar decay, no correction)."""
