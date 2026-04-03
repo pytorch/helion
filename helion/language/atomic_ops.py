@@ -20,6 +20,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "atomic_add",
+    "descriptor_atomic_add",
     "atomic_and",
     "atomic_cas",
     "atomic_max",
@@ -85,6 +86,188 @@ def _codegen_common(
         sem=sem,
         **placeholders,
     )
+
+
+def _codegen_descriptor_atomic_add(state: CodegenState, value_expr: ast.AST) -> ast.AST:
+    from .._compiler.indexing_strategy import BlockedSubscriptIndexing
+    from .._compiler.indexing_strategy import TensorDescriptorIndexingStrategy
+    from .memory_ops import _EVICTION_POLICY_MAP  # keep import locality pattern
+
+    del _EVICTION_POLICY_MAP  # unused; avoids lint noise in this narrow helper
+
+    target = state.proxy_arg(0)
+    index = state.proxy_arg(1)
+
+    assert isinstance(target, torch.Tensor)
+    assert isinstance(index, list)
+
+    host_function = HostFunction.current()
+    if target not in host_function.tensor_to_origin:
+        raise exc.AtomicOnDeviceTensor("descriptor_atomic_add")
+
+    if not TensorDescriptorIndexingStrategy.is_supported(state, target, index):
+        raise exc.InvalidIndexingType(
+            "hl.descriptor_atomic_add() requires tensor_descriptor-compatible indexing"
+        )
+
+    indexing = BlockedSubscriptIndexing.create(state, target, index)
+    desc_arg = indexing.tensor_descriptor_arg(state)
+    atomic_value = indexing.reshape_store(state, value_expr)
+
+    if desc_arg.permutation is not None:
+        atomic_value = expr_from_string(
+            f"tl.permute({{value}}, {desc_arg.permutation!r})",
+            value=atomic_value,
+        )
+
+    return expr_from_string(
+        f"{indexing.tensor_descriptor(state)}.atomic_add({indexing.offsets_str_permuted(state)}, {{value}})",
+        value=atomic_value,
+    )
+
+
+def _codegen_descriptor_atomic_add_subtiled(
+    state: CodegenState, value_expr: ast.AST, subtile: int
+) -> ast.AST:
+    """Codegen for descriptor_atomic_add with subtile > 1.
+
+    Splits the value into ``subtile`` contiguous chunks using recursive
+    binary reshape+permute+split, then creates a 3D tensor descriptor
+    for the target and emits a separate desc.atomic_add() for each chunk.
+    """
+    import math
+
+    from .._compat import get_tensor_descriptor_fn_name
+    from .._compiler.indexing_strategy import BlockedSubscriptIndexing
+    from .._compiler.indexing_strategy import TensorDescriptorIndexingStrategy
+
+    levels = int(math.log2(subtile))
+    assert 2**levels == subtile
+
+    target = state.proxy_arg(0)
+    index = state.proxy_arg(1)
+
+    assert isinstance(target, torch.Tensor)
+    assert isinstance(index, list)
+
+    host_function = HostFunction.current()
+    if target not in host_function.tensor_to_origin:
+        raise exc.AtomicOnDeviceTensor("descriptor_atomic_add")
+
+    if not TensorDescriptorIndexingStrategy.is_supported(state, target, index):
+        raise exc.InvalidIndexingType(
+            "hl.descriptor_atomic_add() requires tensor_descriptor-compatible indexing"
+        )
+
+    # Build 2D indexing to get the row offset and block_m
+    indexing_2d = BlockedSubscriptIndexing.create(state, target, index)
+    fn = state.device_function
+    tile_strategy = state.tile_strategy
+
+    D = int(target.shape[-1])
+    chunk_d = D // subtile
+    block_m = indexing_2d.block_shape[0]
+
+    # --- Create a 3D tensor descriptor for [*leading, subtile, chunk_d] ---
+    tensor_arg = fn.tensor_arg(target)
+    desc_name = fn.new_var(tensor_arg.name + "_subtiled_desc")
+
+    # Sizes: leading dims from original, plus subtile and chunk_d
+    size_parts = [
+        fn.tensor_size(target, i).name for i in range(target.ndim - 1)
+    ]
+    size_parts += [str(subtile), str(chunk_d)]
+
+    # Strides: leading strides from original, plus chunk_d and 1
+    stride_parts = [
+        fn.tensor_stride(target, i).name for i in range(target.ndim - 1)
+    ]
+    stride_parts += [str(chunk_d), "1"]
+
+    # Block shape: [block_m, ..., 1, chunk_d]
+    block_dims = tile_strategy.shape_dims([block_m])
+    block_parts = block_dims + ["1", str(chunk_d)]
+
+    from .._compiler.ast_extension import statement_from_string
+
+    tensor_descriptor_fn_name = get_tensor_descriptor_fn_name()
+    fn.preamble.append(
+        statement_from_string(
+            f"{desc_name} = {tensor_descriptor_fn_name}("
+            f"{tensor_arg.name}, "
+            f"[{', '.join(size_parts)}], "
+            f"[{', '.join(stride_parts)}], "
+            f"[{', '.join(block_parts)}])"
+        )
+    )
+
+    # --- Recursively binary-split the value into contiguous chunks ---
+    val_var = state.codegen.lift(value_expr, prefix="subtile_v")
+
+    def gen_split(
+        expr: ast.AST, current_d: int, num_splits: int
+    ) -> list[ast.AST]:
+        if num_splits == 1:
+            return [expr]
+        half_d = current_d // 2
+        reshape_shape = tile_strategy.shape_str([block_m, 2, half_d])
+        reshaped = state.codegen.lift(
+            expr_from_string(
+                f"tl.reshape({{val}}, {reshape_shape})", val=expr
+            ),
+            prefix="st_r",
+        )
+        permuted = state.codegen.lift(
+            expr_from_string(
+                "tl.permute({val}, [0, 2, 1])", val=reshaped
+            ),
+            prefix="st_p",
+        )
+        split_var = state.codegen.lift(
+            expr_from_string("tl.split({val})", val=permuted),
+            prefix="st_s",
+        )
+        h0 = state.codegen.lift(
+            expr_from_string("{s}[0]", s=split_var), prefix="st_h"
+        )
+        h1 = state.codegen.lift(
+            expr_from_string("{s}[1]", s=split_var), prefix="st_h"
+        )
+        return gen_split(h0, half_d, num_splits // 2) + gen_split(
+            h1, half_d, num_splits // 2
+        )
+
+    chunks = gen_split(val_var, D, subtile)
+
+    # --- Emit an atomic_add for each chunk ---
+    last_expr: ast.AST | None = None
+    for i, chunk_expr in enumerate(chunks):
+        # Offsets: [leading_offsets..., subtile_idx, 0]
+        offsets_parts = list(indexing_2d.offsets[:-1])
+        offsets_parts.append(str(i))
+        offsets_parts.append("0")
+        offsets_str = f"[{', '.join(offsets_parts)}]"
+
+        # Reshape chunk [block_m, chunk_d] → [block_m, 1, chunk_d]
+        reshape_shape = tile_strategy.shape_str([block_m, 1, chunk_d])
+        reshaped_chunk = expr_from_string(
+            f"tl.reshape({{val}}, {reshape_shape})", val=chunk_expr
+        )
+
+        atomic_expr = expr_from_string(
+            f"{desc_name}.atomic_add({offsets_str}, {{value}})",
+            value=reshaped_chunk,
+        )
+
+        if i < len(chunks) - 1:
+            state.codegen.add_statement(
+                ast.Expr(value=atomic_expr)
+            )
+        else:
+            last_expr = atomic_expr
+
+    assert last_expr is not None
+    return last_expr
 
 
 def _cute_pointer_expr(
@@ -309,6 +492,29 @@ def atomic_add(
     raise exc.NotInsideKernel
 
 
+@has_side_effect
+@_decorators.api(allow_host_tensor=True, tiles_as_sizes=True)
+def descriptor_atomic_add(
+    target: torch.Tensor,
+    index: list[object],
+    value: torch.Tensor | float,
+    subtile: int = 1,
+) -> torch.Tensor:
+    """
+    Atomically add a tile to a tensor using Triton tensor descriptor atomics.
+
+    Args:
+        target: Tensor to update.
+        index: Indices selecting elements to update. Can include tiles.
+        value: Value(s) to add (tensor or scalar).
+        subtile: Split the last dimension into this many interleaved subtiles
+            and emit separate descriptor atomic adds for each. Must be a power
+            of 2. This reduces TMEM bank conflicts on Blackwell. Default is 1
+            (no subtiling).
+    """
+    raise exc.NotInsideKernel
+
+
 @_decorators.prepare_args(atomic_add)
 def _(
     target: torch.Tensor,
@@ -386,10 +592,83 @@ def _(
     return prev
 
 
+@_decorators.prepare_args(descriptor_atomic_add)
+def _(
+    target: torch.Tensor,
+    index: list[object],
+    value: torch.Tensor | float,
+    subtile: int = 1,
+) -> tuple[torch.Tensor, object, torch.Tensor | float | int, int]:
+    from .tile_proxy import Tile
+
+    index = Tile._prepare_index(index)
+    index = Tile._tiles_to_sizes_for_index(index)
+    if subtile > 1:
+        assert subtile & (subtile - 1) == 0, "subtile must be a power of 2"
+        D = target.shape[-1]
+        assert isinstance(D, int) and D % subtile == 0
+    return (target, index, value, subtile)
+
+
+@_decorators.register_fake(descriptor_atomic_add)
+def _(
+    target: torch.Tensor,
+    index: list[object],
+    value: torch.Tensor | float,
+    subtile: int = 1,
+) -> torch.Tensor:
+    target_shape = SubscriptIndexing.compute_shape(target, index)
+    return target.new_empty(target_shape)
+
+
+@_decorators.ref(descriptor_atomic_add)
+def _(
+    target: torch.Tensor,
+    index: list[object],
+    value: torch.Tensor | float,
+    subtile: int = 1,
+) -> torch.Tensor:
+    from .ref_tile import RefTile
+
+    processed_index: list[object] = []
+    for idx in index:
+        if isinstance(idx, RefTile):
+            processed_index.append(idx._slice)
+        elif isinstance(idx, torch.Tensor) and idx.numel() == 1:
+            processed_index.append(int(idx.item()))
+        else:
+            processed_index.append(idx)
+
+    def _convert_value_to_target_dtype(val: object) -> torch.Tensor:
+        if isinstance(val, torch.Tensor):
+            vt = val.to(device=target.device)
+            if vt.dtype != target.dtype:
+                vt = vt.to(dtype=target.dtype)
+            return vt
+        return torch.as_tensor(val, dtype=target.dtype, device=target.device)
+
+    idx_tuple = tuple(processed_index)
+    prev = target[idx_tuple].clone()
+    val_tensor = _convert_value_to_target_dtype(value)
+    # subtile > 1 is handled identically — the split+recombine in codegen
+    # produces the same contiguous result as a plain add on the 2D target
+    target[idx_tuple] = target[idx_tuple] + val_tensor
+    return prev
+
+
 @_decorators.codegen(atomic_add, "triton")
 def _(state: CodegenState) -> ast.AST:
     value_expr = state.ast_args[2]
     return _codegen_common("atomic_add", state, _to_ast_values([value_expr]))
+
+
+@_decorators.codegen(descriptor_atomic_add, "triton")
+def _(state: CodegenState) -> ast.AST:
+    value_expr = _to_ast_values([state.ast_args[2]])[0]
+    subtile = int(state.proxy_arg(3))
+    if subtile > 1:
+        return _codegen_descriptor_atomic_add_subtiled(state, value_expr, subtile)
+    return _codegen_descriptor_atomic_add(state, value_expr)
 
 
 @_decorators.codegen(atomic_add, "cute")

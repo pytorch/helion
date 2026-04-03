@@ -1713,6 +1713,31 @@ class TestIndexing(RefEagerTestBase, TestCase):
         )
         torch.testing.assert_close(result, x[10:, :])
 
+    @skipUnlessTensorDescriptor("TensorDescriptor not supported")
+    def test_affine_arange_tensor_descriptor(self):
+        @helion.kernel(autotune_effort="none", static_shapes=True)
+        def affine_range_copy(x: torch.Tensor) -> torch.Tensor:
+            m, n = x.shape
+            n = hl.specialize(n)
+            out = torch.empty_like(x)
+            block_m = hl.register_block_size(m)
+            for tile_m in hl.tile(m, block_size=block_m):
+                row_idx = tile_m.begin + hl.arange(block_m, dtype=torch.int32)
+                col_idx = hl.arange(n, dtype=torch.int32)
+                values = hl.load(x, [row_idx, col_idx])
+                hl.store(out, [row_idx, col_idx], values)
+            return out
+
+        x = torch.randn([128, 64], device=DEVICE, dtype=HALF_DTYPE)
+        code, result = code_and_output(
+            affine_range_copy,
+            (x,),
+            indexing="tensor_descriptor",
+            block_size=32,
+        )
+        torch.testing.assert_close(result, x)
+        self.assertIn(get_tensor_descriptor_fn_name(), code)
+
     @skipIfRefEager(
         "Test is block size dependent which is not supported in ref eager mode"
     )

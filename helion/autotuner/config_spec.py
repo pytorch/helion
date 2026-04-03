@@ -84,6 +84,11 @@ VALID_KEYS: frozenset[str] = frozenset(
         "range_unroll_factors",
         "range_warp_specializes",
         "range_num_stages",
+        "range_merge_epilogues",
+        "range_data_partition_factors",
+        "range_tmem_alloc_algos",
+        "range_smem_alloc_algos",
+        "range_smem_budgets",
         "range_multi_buffers",
         "range_flattens",
         "static_ranges",
@@ -94,6 +99,9 @@ VALID_KEYS: frozenset[str] = frozenset(
         "maxnreg",
         "indexing",
         "load_eviction_policies",
+        "dot_stages",
+        "dot_orders",
+        "dot_channels",
         "pallas_loop_type",
         *BACKEND_TUNABLE_KEYS,
         "advanced_controls_file",
@@ -147,6 +155,21 @@ class ConfigSpec:
             BlockIdSequence()
         )
         self.range_num_stages: BlockIdSequence[RangeNumStagesSpec] = BlockIdSequence()
+        self.range_merge_epilogues: BlockIdSequence[RangeMergeEpilogueSpec] = (
+            BlockIdSequence()
+        )
+        self.range_data_partition_factors: BlockIdSequence[
+            RangeDataPartitionFactorSpec
+        ] = BlockIdSequence()
+        self.range_tmem_alloc_algos: BlockIdSequence[RangeTmemAllocAlgoSpec] = (
+            BlockIdSequence()
+        )
+        self.range_smem_alloc_algos: BlockIdSequence[RangeSmemAllocAlgoSpec] = (
+            BlockIdSequence()
+        )
+        self.range_smem_budgets: BlockIdSequence[RangeSmemBudgetSpec] = (
+            BlockIdSequence()
+        )
         self.range_multi_buffers: BlockIdSequence[RangeMultiBufferSpec] = (
             BlockIdSequence()
         )
@@ -162,6 +185,14 @@ class ConfigSpec:
         )
         self.indexing = ListOf(
             EnumFragment(choices=self.valid_indexing_types()),
+            length=0,
+        )
+        self.dot_stages = ListOf(
+            IntegerFragment(0, 3, 0),
+            length=0,
+        )
+        self.dot_orders = ListOf(
+            IntegerFragment(0, 3, 0),
             length=0,
         )
         self.backend_tunable_fragments = self.backend.tunable_fragments()
@@ -186,6 +217,11 @@ class ConfigSpec:
         self.range_unroll_factors._remove_duplicates()
         self.range_warp_specialize._remove_duplicates()
         self.range_num_stages._remove_duplicates()
+        self.range_merge_epilogues._remove_duplicates()
+        self.range_data_partition_factors._remove_duplicates()
+        self.range_tmem_alloc_algos._remove_duplicates()
+        self.range_smem_alloc_algos._remove_duplicates()
+        self.range_smem_budgets._remove_duplicates()
         self.range_multi_buffers._remove_duplicates()
         self.range_flattens._remove_duplicates()
         self.static_ranges._remove_duplicates()
@@ -237,6 +273,11 @@ class ConfigSpec:
             "range_unroll_factor",
             "range_warp_specialize",
             "range_num_stage",
+            "range_merge_epilogue",
+            "range_data_partition_factor",
+            "range_tmem_alloc_algo",
+            "range_smem_alloc_algo",
+            "range_smem_budget",
             "range_multi_buffer",
             "range_flatten",
             "static_range",
@@ -282,6 +323,11 @@ class ConfigSpec:
             ("range_unroll_factors", self.range_unroll_factors, True),
             ("range_warp_specializes", self.range_warp_specialize, True),
             ("range_num_stages", self.range_num_stages, True),
+            ("range_merge_epilogues", self.range_merge_epilogues, True),
+            ("range_data_partition_factors", self.range_data_partition_factors, True),
+            ("range_tmem_alloc_algos", self.range_tmem_alloc_algos, True),
+            ("range_smem_alloc_algos", self.range_smem_alloc_algos, True),
+            ("range_smem_budgets", self.range_smem_budgets, True),
             ("range_multi_buffers", self.range_multi_buffers, True),
             ("range_flattens", self.range_flattens, True),
             ("static_ranges", self.static_ranges, True),
@@ -335,6 +381,11 @@ class ConfigSpec:
                 ("range_unroll_factors", self.range_unroll_factors),
                 ("range_warp_specializes", self.range_warp_specialize),
                 ("range_num_stages", self.range_num_stages),
+                ("range_merge_epilogues", self.range_merge_epilogues),
+                ("range_data_partition_factors", self.range_data_partition_factors),
+                ("range_tmem_alloc_algos", self.range_tmem_alloc_algos),
+                ("range_smem_alloc_algos", self.range_smem_alloc_algos),
+                ("range_smem_budgets", self.range_smem_budgets),
                 ("range_multi_buffers", self.range_multi_buffers),
                 ("range_flattens", self.range_flattens),
             ):
@@ -350,13 +401,37 @@ class ConfigSpec:
             "range_unroll_factors",
             "range_warp_specializes",
             "range_num_stages",
+            "range_merge_epilogues",
+            "range_data_partition_factors",
+            "range_tmem_alloc_algos",
+            "range_smem_alloc_algos",
+            "range_smem_budgets",
             "range_multi_buffers",
             "range_flattens",
             "static_ranges",
             "load_eviction_policies",
             "indexing",
+            "dot_stages",
+            "dot_orders",
+            "dot_channels",
         ):
             if not config.get(name):
+                config.pop(name, None)
+
+        if all(
+            value is None
+            for value in cast(
+                "list[bool | None]", config.get("range_merge_epilogues", [])
+            )
+        ):
+            config.pop("range_merge_epilogues", None)
+        for name in (
+            "range_data_partition_factors",
+            "range_tmem_alloc_algos",
+            "range_smem_alloc_algos",
+            "range_smem_budgets",
+        ):
+            if all(value == 0 for value in cast("list[int]", config.get(name, []))):
                 config.pop(name, None)
 
         # Remove unsupported keys before setting defaults
@@ -478,6 +553,11 @@ class ConfigSpec:
                 ("range_unroll_factors", self.range_unroll_factors),
                 ("range_warp_specializes", self.range_warp_specialize),
                 ("range_num_stages", self.range_num_stages),
+                ("range_merge_epilogues", self.range_merge_epilogues),
+                ("range_data_partition_factors", self.range_data_partition_factors),
+                ("range_tmem_alloc_algos", self.range_tmem_alloc_algos),
+                ("range_smem_alloc_algos", self.range_smem_alloc_algos),
+                ("range_smem_budgets", self.range_smem_budgets),
                 ("range_multi_buffers", self.range_multi_buffers),
                 ("range_flattens", self.range_flattens),
             ):
@@ -589,6 +669,14 @@ class ConfigSpec:
                     ("range_unroll_factors", self.range_unroll_factors),
                     ("range_warp_specializes", self.range_warp_specialize),
                     ("range_num_stages", self.range_num_stages),
+                    ("range_merge_epilogues", self.range_merge_epilogues),
+                    (
+                        "range_data_partition_factors",
+                        self.range_data_partition_factors,
+                    ),
+                    ("range_tmem_alloc_algos", self.range_tmem_alloc_algos),
+                    ("range_smem_alloc_algos", self.range_smem_alloc_algos),
+                    ("range_smem_budgets", self.range_smem_budgets),
                     ("range_multi_buffers", self.range_multi_buffers),
                     ("range_flattens", self.range_flattens),
                     ("static_ranges", self.static_ranges),
@@ -632,6 +720,10 @@ class ConfigSpec:
             )
         if self.supports_config_key("load_eviction_policies"):
             fields["load_eviction_policies"] = self.load_eviction_policies
+        if self.supports_config_key("dot_stages") and self.dot_stages.length > 0:
+            fields["dot_stages"] = self.dot_stages
+        if self.supports_config_key("dot_orders") and self.dot_orders.length > 0:
+            fields["dot_orders"] = self.dot_orders
         # num_threads is backend-specific (only CuteBackend).
         # Not included in the autotuner search space because num_threads
         # values must divide block_sizes (which are also tuned), making
@@ -697,11 +789,19 @@ class ConfigSpec:
             "range_unroll_factors",
             "range_warp_specializes",
             "range_num_stages",
+            "range_merge_epilogues",
+            "range_data_partition_factors",
+            "range_tmem_alloc_algos",
+            "range_smem_alloc_algos",
+            "range_smem_budgets",
             "range_multi_buffers",
             "range_flattens",
             "static_ranges",
             "load_eviction_policies",
             "indexing",
+            "dot_stages",
+            "dot_orders",
+            "dot_channels",
         ):
             if not config.get(name):
                 config.pop(name, None)
@@ -944,6 +1044,30 @@ class RangeWarpSpecializeSpec(_OptionalBoolSpec):
 class RangeNumStagesSpec(_OptionalIntSpec):
     def _fragment(self, base: ConfigSpec) -> IntegerFragment:
         return IntegerFragment(0, 4, 0)
+
+
+class RangeMergeEpilogueSpec(_OptionalBoolSpec):
+    pass
+
+
+class RangeDataPartitionFactorSpec(_OptionalIntSpec):
+    def _fragment(self, base: ConfigSpec) -> IntegerFragment:
+        return IntegerFragment(0, 8, 0)
+
+
+class RangeTmemAllocAlgoSpec(_OptionalIntSpec):
+    def _fragment(self, base: ConfigSpec) -> IntegerFragment:
+        return IntegerFragment(0, 2, 0)
+
+
+class RangeSmemAllocAlgoSpec(_OptionalIntSpec):
+    def _fragment(self, base: ConfigSpec) -> IntegerFragment:
+        return IntegerFragment(0, 1, 0)
+
+
+class RangeSmemBudgetSpec(_OptionalIntSpec):
+    def _fragment(self, base: ConfigSpec) -> EnumFragment:
+        return EnumFragment((0, 200000, 232448))
 
 
 class RangeMultiBufferSpec(_OptionalBoolSpec):

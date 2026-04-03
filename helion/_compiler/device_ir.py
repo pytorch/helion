@@ -1692,6 +1692,47 @@ def _count_device_loads_and_stores(device_ir: DeviceIR) -> tuple[int, int, int]:
     return total_load_count, loads_without_eviction_policy, store_count
 
 
+def _count_device_dots(device_ir: DeviceIR) -> int:
+    """Count the number of dot/matmul operations in device code for autotuning."""
+    import torch
+
+    from ..language import matmul_ops
+
+    dot_targets = {
+        matmul_ops.dot,
+        matmul_ops.dot_scaled,
+        torch.ops.aten.mm.default,
+        torch.ops.aten.bmm.default,
+        torch.ops.aten.addmm.default,
+        torch.ops.aten.baddbmm.default,
+    }
+    dot_count = 0
+    for graph_info in device_ir.graphs:
+        for node in graph_info.graph.nodes:
+            if node.op == "call_function" and node.target in dot_targets:
+                dot_count += 1
+    return dot_count
+
+
+def _register_dot_tunables(dot_count: int) -> None:
+    """Register dot_stages and dot_orders tunables for all dot operations."""
+    if dot_count == 0:
+        return
+
+    from ..autotuner.config_fragment import IntegerFragment
+    from ..autotuner.config_fragment import ListOf
+
+    env = CompileEnvironment.current()
+    env.config_spec.dot_stages = ListOf(
+        IntegerFragment(0, 3, 0),
+        length=dot_count,
+    )
+    env.config_spec.dot_orders = ListOf(
+        IntegerFragment(0, 3, 0),
+        length=dot_count,
+    )
+
+
 def _register_load_store_tunables(
     total_load_count: int, loads_without_eviction_policy: int, store_count: int
 ) -> None:
@@ -1770,6 +1811,10 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
         _register_load_store_tunables(
             total_load_count, loads_without_eviction_policy, store_count
         )
+
+        # Count dot operations and register dot scheduling tunables
+        dot_count = _count_device_dots(device_ir)
+        _register_dot_tunables(dot_count)
 
         return device_ir
 

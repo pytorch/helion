@@ -37,9 +37,14 @@ from ..autotuner.config_spec import ConfigSpec
 from ..autotuner.config_spec import FlattenLoopSpec
 from ..autotuner.config_spec import L2GroupingSpec
 from ..autotuner.config_spec import LoopOrderSpec
+from ..autotuner.config_spec import RangeDataPartitionFactorSpec
 from ..autotuner.config_spec import RangeFlattenSpec
+from ..autotuner.config_spec import RangeMergeEpilogueSpec
 from ..autotuner.config_spec import RangeMultiBufferSpec
 from ..autotuner.config_spec import RangeNumStagesSpec
+from ..autotuner.config_spec import RangeSmemAllocAlgoSpec
+from ..autotuner.config_spec import RangeSmemBudgetSpec
+from ..autotuner.config_spec import RangeTmemAllocAlgoSpec
 from ..autotuner.config_spec import RangeUnrollFactorSpec
 from ..autotuner.config_spec import RangeWarpSpecializeSpec
 from ..autotuner.config_spec import StaticRangeSpec
@@ -452,6 +457,18 @@ def _add_config_range_choice(
         config_spec.range_warp_specialize.append(RangeWarpSpecializeSpec(block_ids))
     if "num_stages" in params:
         config_spec.range_num_stages.append(RangeNumStagesSpec(block_ids))
+    if "merge_epilogue" in params:
+        config_spec.range_merge_epilogues.append(RangeMergeEpilogueSpec(block_ids))
+    if "data_partition_factor" in params:
+        config_spec.range_data_partition_factors.append(
+            RangeDataPartitionFactorSpec(block_ids)
+        )
+    if "tmem_alloc_algo" in params:
+        config_spec.range_tmem_alloc_algos.append(RangeTmemAllocAlgoSpec(block_ids))
+    if "smem_alloc_algo" in params:
+        config_spec.range_smem_alloc_algos.append(RangeSmemAllocAlgoSpec(block_ids))
+    if "smem_budget" in params:
+        config_spec.range_smem_budgets.append(RangeSmemBudgetSpec(block_ids))
     if "disallow_acc_multi_buffer" in params:
         config_spec.range_multi_buffers.append(RangeMultiBufferSpec(block_ids))
     if "flatten" in params:

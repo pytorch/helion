@@ -8,6 +8,7 @@ from .atomic_ops import atomic_min as atomic_min
 from .atomic_ops import atomic_or as atomic_or
 from .atomic_ops import atomic_xchg as atomic_xchg
 from .atomic_ops import atomic_xor as atomic_xor
+from .atomic_ops import descriptor_atomic_add as descriptor_atomic_add
 from .barrier import barrier as barrier
 from .builtin_ops import _builtin_max as _builtin_max
 from .builtin_ops import _builtin_min as _builtin_min
@@ -53,6 +54,7 @@ _MEMORY_OPS = (
     store,
     load,
     atomic_add,
+    descriptor_atomic_add,
     atomic_and,
     atomic_cas,
     atomic_max,

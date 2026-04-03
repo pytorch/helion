@@ -311,6 +311,8 @@ class DeviceFunction:
         # Single counter for both loads and stores for indexing assignment
         self.device_memory_op_index = 0
         self.rng_seed_buffer_param_name = None
+        # Counter for dot operations, used to map dot_stages/dot_orders config
+        self.dot_op_index = 0
 
         # Pallas: id(fake_tensor) → {dim: block_id}, recorded during codegen
         self.pallas_tensor_dim_block_ids: dict[int, dict[int, int]] = {}
@@ -343,6 +345,27 @@ class DeviceFunction:
             self.indexing_strategies.append(strategy)
 
         return self.indexing_strategies[index]
+
+    def next_dot_attrs(self) -> dict[str, str | list[str]] | None:
+        """Return the autows attrs dict for the current dot and advance the counter."""
+        config = self.config
+        dot_stages = config.dot_stages
+        dot_orders = config.dot_orders
+        if not dot_stages or not dot_orders:
+            self.dot_op_index += 1
+            return None
+        idx = self.dot_op_index
+        self.dot_op_index += 1
+        if idx >= len(dot_stages):
+            return None
+        result: dict[str, str | list[str]] = {
+            "stage": str(dot_stages[idx]),
+            "order": str(dot_orders[idx]),
+        }
+        dot_channels = config.dot_channels
+        if dot_channels and idx < len(dot_channels):
+            result["channels"] = dot_channels[idx]
+        return result
 
     def has_rng_ops(self) -> bool:
         """Check if this kernel uses any RNG operations."""

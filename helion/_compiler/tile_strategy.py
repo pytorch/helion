@@ -300,6 +300,38 @@ class TileStrategy:
         if range_num_stages > 0:
             kwargs.append(f"num_stages={range_num_stages}")
 
+        range_merge_epilogue = env.config_spec.range_merge_epilogues.config_get(
+            config.range_merge_epilogues, block_idx, None
+        )
+        if range_merge_epilogue is not None:
+            kwargs.append(f"merge_epilogue={range_merge_epilogue}")
+
+        range_data_partition_factor = (
+            env.config_spec.range_data_partition_factors.config_get(
+                config.range_data_partition_factors, block_idx, 0
+            )
+        )
+        if range_data_partition_factor > 0:
+            kwargs.append(f"data_partition_factor={range_data_partition_factor}")
+
+        range_tmem_alloc_algo = env.config_spec.range_tmem_alloc_algos.config_get(
+            config.range_tmem_alloc_algos, block_idx, 0
+        )
+        if range_tmem_alloc_algo > 0:
+            kwargs.append(f"tmem_alloc_algo={range_tmem_alloc_algo}")
+
+        range_smem_alloc_algo = env.config_spec.range_smem_alloc_algos.config_get(
+            config.range_smem_alloc_algos, block_idx, 0
+        )
+        if range_smem_alloc_algo > 0:
+            kwargs.append(f"smem_alloc_algo={range_smem_alloc_algo}")
+
+        range_smem_budget = env.config_spec.range_smem_budgets.config_get(
+            config.range_smem_budgets, block_idx, 0
+        )
+        if range_smem_budget > 0:
+            kwargs.append(f"smem_budget={range_smem_budget}")
+
         range_multi_buffer = env.config_spec.range_multi_buffers.config_get(
             config.range_multi_buffers, block_idx, None
         )
@@ -315,7 +347,12 @@ class TileStrategy:
         dpf_range = config.get("_triton_range_id_data_partition_factor", None)
         dpf_value = config.get("_triton_range_value_data_partition_factor", None)
 
-        if dpf_range is not None and dpf_value is not None and dpf_range == block_idx:
+        if (
+            range_data_partition_factor <= 0
+            and dpf_range is not None
+            and dpf_value is not None
+            and dpf_range == block_idx
+        ):
             kwargs.append(f"data_partition_factor={dpf_value}")
 
         return kwargs

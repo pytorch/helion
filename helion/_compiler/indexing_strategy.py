@@ -369,6 +369,11 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
                 if hint == 1:
                     stride_one_count += 1
                     continue
+                # When static_shapes is True, the hint is reliable because
+                # each shape combination gets its own BoundKernel.
+                byte_stride = hint * element_size
+                if byte_stride % 16 == 0:
+                    continue
                 return False
             if stride == 1:
                 stride_one_count += 1

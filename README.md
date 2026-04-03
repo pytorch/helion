@@ -227,6 +227,28 @@ Contains one entry per loop dimension, specifying the unroll factor for
 Contains one entry per loop dimension, specifying the number of stages for
 `tl.range()` calls. Values less than 1 omit the `num_stages` parameter.
 
+* **range\_merge\_epilogues** (`list[bool | None]`):
+Contains one entry per loop dimension, controlling the `merge_epilogue`
+parameter for `tl.range()` calls. `True` sets `merge_epilogue=True`,
+`False` sets `merge_epilogue=False`, and `None` omits the parameter.
+
+* **range\_data\_partition\_factors** (`list[int]`):
+Contains one entry per loop dimension, controlling the
+`data_partition_factor` parameter for `tl.range()` calls. Values less
+than 1 omit the parameter.
+
+* **range\_tmem\_alloc\_algos** (`list[int]`):
+Contains one entry per loop dimension, controlling the `tmem_alloc_algo`
+parameter for `tl.range()` calls. Values less than 1 omit the parameter.
+
+* **range\_smem\_alloc\_algos** (`list[int]`):
+Contains one entry per loop dimension, controlling the `smem_alloc_algo`
+parameter for `tl.range()` calls. Values less than 1 omit the parameter.
+
+* **range\_smem\_budgets** (`list[int]`):
+Contains one entry per loop dimension, controlling the `smem_budget`
+parameter for `tl.range()` calls. Values less than 1 omit the parameter.
+
 * **range\_multi\_buffers** (`list[bool | None]`):
 Contains one entry per loop dimension, controlling the `disallow_acc_multi_buffer`
 parameter for `tl.range()` calls. `True` allows multi-buffer (sets `disallow_acc_multi_buffer=False`),

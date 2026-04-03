@@ -78,6 +78,26 @@ Configs are typically discovered automatically through autotuning, but can also 
 
    Number of pipeline stages for ``tl.range`` loops.
 
+.. autoattribute:: Config.range_merge_epilogues
+
+   Controls ``merge_epilogue`` parameter for ``tl.range`` loops.
+
+.. autoattribute:: Config.range_data_partition_factors
+
+   Controls ``data_partition_factor`` parameter for ``tl.range`` loops.
+
+.. autoattribute:: Config.range_tmem_alloc_algos
+
+   Controls ``tmem_alloc_algo`` parameter for ``tl.range`` loops.
+
+.. autoattribute:: Config.range_smem_alloc_algos
+
+   Controls ``smem_alloc_algo`` parameter for ``tl.range`` loops.
+
+.. autoattribute:: Config.range_smem_budgets
+
+   Controls ``smem_budget`` parameter for ``tl.range`` loops.
+
 .. autoattribute:: Config.range_multi_buffers
 
    Controls ``disallow_acc_multi_buffer`` parameter for ``tl.range`` loops.

@@ -48,8 +48,9 @@ def _emit_tl_dot(
     input_precision: str | None = None,
     acc: ast.AST | None = None,
     out_dtype: torch.dtype | None = None,
+    attrs: dict[str, str] | None = None,
 ) -> ast.AST:
-    """Build a tl.dot AST with optional acc/input_precision/out_dtype.
+    """Build a tl.dot AST with optional acc/input_precision/out_dtype/attrs.
 
     The caller is responsible for ensuring compatible operand/accumulator
     dtypes for fused accumulation when providing `acc`.
@@ -65,6 +66,8 @@ def _emit_tl_dot(
         parts.append(
             f", out_dtype={CompileEnvironment.current().backend.dtype_str(out_dtype)}"
         )
+    if attrs:
+        parts.append(f", attrs={attrs!r}")
     parts.append(")")
     return expr_from_string("".join(parts), **kwargs)
 
@@ -337,6 +340,9 @@ def emit_tl_dot_with_padding(
                 x=acc_for_dot,
             )
 
+    # Get dot attrs (stage/order) from config for this dot operation
+    dot_attrs = device_fn.next_dot_attrs()
+
     min_m, min_n, min_k = min_dot_size(env.device, lhs_dtype, rhs_dtype)
     dims = {
         d: v if isinstance(v, int) else None
@@ -356,6 +362,7 @@ def emit_tl_dot_with_padding(
             acc=acc_for_dot,
             input_precision=input_precision,
             out_dtype=dot_out_dtype,
+            attrs=dot_attrs,
         )
     else:
         lhs_pad, rhs_pad, acc_pad = lhs_cast, rhs_cast, acc_for_dot
@@ -390,6 +397,7 @@ def emit_tl_dot_with_padding(
             acc=acc_pad,
             input_precision=input_precision,
             out_dtype=dot_out_dtype,
+            attrs=dot_attrs,
         )
 
         unpad_specs = [

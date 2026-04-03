@@ -215,6 +215,15 @@ KERNEL_MAPPINGS: dict[str, tuple[str, ...]] = {
             "num_inputs": 6,  # flash_attention takes long time on Benchmark CI, so use fewer inputs instead.
         },
     ),
+    "flash_attention-bwd": (
+        "tritonbench.operators.flash_attention.operator",
+        "examples.attention",
+        "attention",
+        {
+            "d_head": 128,  # Set default head dimension to 128 for TLX attention compatibility
+            "num_inputs": 6,  # flash_attention takes long time on Benchmark CI, so use fewer inputs instead.
+        },
+    ),
     "cross_entropy": (
         "tritonbench.operators.cross_entropy.operator",
         "examples.cross_entropy",
@@ -324,6 +333,16 @@ KERNEL_MAPPINGS: dict[str, tuple[str, ...]] = {
         "bf16xint16_gemm_tritonbench",
     ),
     "blackwell_attentions": (
+        "tritonbench.operators.blackwell_attentions.operator",
+        "examples.blackwell_attention",
+        "blackwell_attention_tritonbench",
+        {
+            "d_head": 128,  # Set default head dimension to 128 for TLX attention compatibility
+            "num_inputs": 6,  # flash_attention takes long time on Benchmark CI, so use fewer inputs instead.
+            "input_id": 1,
+        },
+    ),
+    "blackwell_attentions-bwd": (
         "tritonbench.operators.blackwell_attentions.operator",
         "examples.blackwell_attention",
         "blackwell_attention_tritonbench",
@@ -595,6 +614,15 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "helion_attention-speedup": "helion_speedup",
         "helion_attention-accuracy": "helion_accuracy",
     },
+    "flash_attention-bwd": {
+        "aten": "baseline",
+        "triton_tutorial_flash_v2_tma_ws_persistent-speedup": "triton_speedup",
+        "triton_tutorial_flash_v2_tma_ws_persistent-accuracy": "triton_accuracy",
+        "flex_attention-speedup": "torch_compile_speedup",
+        "flex_attention-accuracy": "torch_compile_accuracy",
+        "helion_attention-speedup": "helion_speedup",
+        "helion_attention-accuracy": "helion_accuracy",
+    },
     "fp8_attention": {
         "triton_flash_v2": "baseline",
         "triton_flash_v2_ws-speedup": "triton_speedup",
@@ -665,6 +693,15 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "helion_bf16xint16_gemm_tritonbench-accuracy": "helion_accuracy",
     },
     "blackwell_attentions": {
+        "aten": "baseline",
+        "triton_tutorial_flash_v2_tma_ws_persistent-speedup": "triton_speedup",
+        "triton_tutorial_flash_v2_tma_ws_persistent-accuracy": "triton_accuracy",
+        "flex_attention-speedup": "torch_compile_speedup",
+        "flex_attention-accuracy": "torch_compile_accuracy",
+        "helion_blackwell_attention_tritonbench-speedup": "helion_speedup",
+        "helion_blackwell_attention_tritonbench-accuracy": "helion_accuracy",
+    },
+    "blackwell_attentions-bwd": {
         "aten": "baseline",
         "triton_tutorial_flash_v2_tma_ws_persistent-speedup": "triton_speedup",
         "triton_tutorial_flash_v2_tma_ws_persistent-accuracy": "triton_accuracy",

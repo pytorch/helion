@@ -208,7 +208,7 @@ class TypeInfo:
             return SymIntType(origin, value)
         if isinstance(value, torch.SymFloat):
             return SymFloatType(origin, value)
-        if type(value) in (int, float, bool, type(None), range):
+        if type(value) in (int, float, bool, type(None), range, slice):
             return LiteralType(origin, value)
         if type(value) in (str, torch.dtype, torch.device):
             # TODO(jansel): track specializations

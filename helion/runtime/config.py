@@ -32,10 +32,18 @@ class Config(Mapping[str, object]):
         range_unroll_factors: list[int] | None = None,
         range_warp_specializes: list[bool | None] | None = None,
         range_num_stages: list[int] | None = None,
+        range_merge_epilogues: list[bool | None] | None = None,
+        range_data_partition_factors: list[int] | None = None,
+        range_tmem_alloc_algos: list[int] | None = None,
+        range_smem_alloc_algos: list[int] | None = None,
+        range_smem_budgets: list[int] | None = None,
         range_multi_buffers: list[bool | None] | None = None,
         range_flattens: list[bool | None] | None = None,
         static_ranges: list[bool] | None = None,
         load_eviction_policies: list[EvictionPolicyLiteral] | None = None,
+        dot_stages: list[int] | None = None,
+        dot_orders: list[int] | None = None,
+        dot_channels: list[list[str]] | None = None,
         num_warps: int | None = None,
         num_stages: int | None = None,
         pid_type: PidTypeLiteral | None = None,
@@ -58,10 +66,22 @@ class Config(Mapping[str, object]):
             range_unroll_factors: Loop unroll factors for tl.range calls.
             range_warp_specializes: Warp specialization for tl.range calls.
             range_num_stages: Number of stages for tl.range calls.
+            range_merge_epilogues: Controls merge_epilogue for tl.range calls.
+            range_data_partition_factors: Controls data_partition_factor for tl.range calls.
+            range_tmem_alloc_algos: Controls tmem_alloc_algo for tl.range calls.
+            range_smem_alloc_algos: Controls smem_alloc_algo for tl.range calls.
+            range_smem_budgets: Controls smem_budget for tl.range calls.
             range_multi_buffers: Controls disallow_acc_multi_buffer for tl.range calls.
             range_flattens: Controls flatten parameter for tl.range calls.
             static_ranges: Whether to use tl.static_range instead tl.range.
             load_eviction_policies: Eviction policies for load operations ("", "first", "last").
+            dot_stages: Stage assignments for tl.dot operations (one per dot in order of appearance).
+                Used to guide Triton's NVGPUWarpSpecialization pass scheduling.
+            dot_orders: Order assignments for tl.dot operations (one per dot in order of appearance).
+                Used to guide Triton's NVGPUWarpSpecialization pass scheduling.
+            dot_channels: Channel specifications for tl.dot operations (one list per dot).
+                Each entry is a list of strings like ["opndA,smem,1,0", "opndB,smem,2,1", "opndD,tmem,1,2"].
+                Used to guide Triton's NVGPUWarpSpecialization pass memory allocation.
             num_warps: Number of warps per block.
             num_stages: Number of stages for software pipelining.
             pid_type: Program ID type strategy ("flat", "xyz", "persistent_blocked", "persistent_interleaved").
@@ -91,10 +111,18 @@ class Config(Mapping[str, object]):
             "range_unroll_factors": range_unroll_factors,
             "range_warp_specializes": range_warp_specializes,
             "range_num_stages": range_num_stages,
+            "range_merge_epilogues": range_merge_epilogues,
+            "range_data_partition_factors": range_data_partition_factors,
+            "range_tmem_alloc_algos": range_tmem_alloc_algos,
+            "range_smem_alloc_algos": range_smem_alloc_algos,
+            "range_smem_budgets": range_smem_budgets,
             "range_multi_buffers": range_multi_buffers,
             "range_flattens": range_flattens,
             "static_ranges": static_ranges,
             "load_eviction_policies": load_eviction_policies,
+            "dot_stages": dot_stages,
+            "dot_orders": dot_orders,
+            "dot_channels": dot_channels,
             "num_warps": num_warps,
             "num_stages": num_stages,
             "indexing": indexing,
@@ -275,6 +303,28 @@ class Config(Mapping[str, object]):
         return cast("list[int]", self.config.get("range_num_stages", []))
 
     @property
+    def range_merge_epilogues(self) -> list[bool | None]:
+        return cast("list[bool | None]", self.config.get("range_merge_epilogues", []))
+
+    @property
+    def range_data_partition_factors(self) -> list[int]:
+        return cast(
+            "list[int]", self.config.get("range_data_partition_factors", [])
+        )
+
+    @property
+    def range_tmem_alloc_algos(self) -> list[int]:
+        return cast("list[int]", self.config.get("range_tmem_alloc_algos", []))
+
+    @property
+    def range_smem_alloc_algos(self) -> list[int]:
+        return cast("list[int]", self.config.get("range_smem_alloc_algos", []))
+
+    @property
+    def range_smem_budgets(self) -> list[int]:
+        return cast("list[int]", self.config.get("range_smem_budgets", []))
+
+    @property
     def range_multi_buffers(self) -> list[bool | None]:
         return cast("list[bool | None]", self.config.get("range_multi_buffers", []))
 
@@ -291,6 +341,18 @@ class Config(Mapping[str, object]):
         return cast(
             "list[EvictionPolicyLiteral]", self.config.get("load_eviction_policies", [])
         )
+
+    @property
+    def dot_stages(self) -> list[int]:
+        return cast("list[int]", self.config.get("dot_stages", []))
+
+    @property
+    def dot_orders(self) -> list[int]:
+        return cast("list[int]", self.config.get("dot_orders", []))
+
+    @property
+    def dot_channels(self) -> list[list[str]]:
+        return cast("list[list[str]]", self.config.get("dot_channels", []))
 
     @property
     def indexing(self) -> IndexingLiteral | list[IndexingLiteral]:

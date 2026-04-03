@@ -923,6 +923,129 @@ class TestLoops(RefEagerTestBase, TestCase):
             code3,
         )
 
+    @skipIfTileIR("tileir backend will ignore `range_merge_epilogues` hint")
+    @skipIfNotTriton("range loop hints are Triton-specific")
+    def test_range_merge_epilogues(self):
+        args = (torch.randn([64, 32], device=DEVICE),)
+
+        code_none, result_none = code_and_output(
+            nested_loop_kernel,
+            args,
+            block_sizes=[32, 16],
+            range_merge_epilogues=[None, None],
+        )
+        code_true, result_true = code_and_output(
+            nested_loop_kernel,
+            args,
+            block_sizes=[32, 16],
+            range_merge_epilogues=[None, True],
+        )
+        code_false, result_false = code_and_output(
+            nested_loop_kernel,
+            args,
+            block_sizes=[32, 16],
+            range_merge_epilogues=[None, False],
+        )
+
+        torch.testing.assert_close(result_none, result_true)
+        torch.testing.assert_close(result_none, result_false)
+        torch.testing.assert_close(result_none, args[0] + 1)
+        self.assertNotIn("merge_epilogue", code_none)
+        self.assertIn("merge_epilogue=True", code_true)
+        self.assertIn("merge_epilogue=False", code_false)
+
+    @skipIfTileIR("tileir backend will ignore `range_data_partition_factors` hint")
+    @skipIfNotTriton("range loop hints are Triton-specific")
+    def test_range_data_partition_factors(self):
+        args = (torch.randn([64, 32], device=DEVICE),)
+
+        code0, result0 = code_and_output(
+            nested_loop_kernel,
+            args,
+            block_sizes=[32, 16],
+            range_data_partition_factors=[0, 0],
+        )
+        code2, result2 = code_and_output(
+            nested_loop_kernel,
+            args,
+            block_sizes=[32, 16],
+            range_data_partition_factors=[0, 2],
+        )
+
+        torch.testing.assert_close(result0, result2)
+        torch.testing.assert_close(result0, args[0] + 1)
+        self.assertNotIn("data_partition_factor", code0)
+        self.assertIn("data_partition_factor=2", code2)
+
+    @skipIfTileIR("tileir backend will ignore `range_tmem_alloc_algos` hint")
+    @skipIfNotTriton("range loop hints are Triton-specific")
+    def test_range_tmem_alloc_algos(self):
+        args = (torch.randn([64, 32], device=DEVICE),)
+
+        code0, result0 = code_and_output(
+            nested_loop_kernel,
+            args,
+            block_sizes=[32, 16],
+            range_tmem_alloc_algos=[0, 0],
+        )
+        code2, result2 = code_and_output(
+            nested_loop_kernel,
+            args,
+            block_sizes=[32, 16],
+            range_tmem_alloc_algos=[0, 2],
+        )
+
+        torch.testing.assert_close(result0, result2)
+        torch.testing.assert_close(result0, args[0] + 1)
+        self.assertNotIn("tmem_alloc_algo", code0)
+        self.assertIn("tmem_alloc_algo=2", code2)
+
+    @skipIfTileIR("tileir backend will ignore `range_smem_alloc_algos` hint")
+    @skipIfNotTriton("range loop hints are Triton-specific")
+    def test_range_smem_alloc_algos(self):
+        args = (torch.randn([64, 32], device=DEVICE),)
+
+        code0, result0 = code_and_output(
+            nested_loop_kernel,
+            args,
+            block_sizes=[32, 16],
+            range_smem_alloc_algos=[0, 0],
+        )
+        code1, result1 = code_and_output(
+            nested_loop_kernel,
+            args,
+            block_sizes=[32, 16],
+            range_smem_alloc_algos=[0, 1],
+        )
+
+        torch.testing.assert_close(result0, result1)
+        torch.testing.assert_close(result0, args[0] + 1)
+        self.assertNotIn("smem_alloc_algo", code0)
+        self.assertIn("smem_alloc_algo=1", code1)
+
+    @skipIfTileIR("tileir backend will ignore `range_smem_budgets` hint")
+    @skipIfNotTriton("range loop hints are Triton-specific")
+    def test_range_smem_budgets(self):
+        args = (torch.randn([64, 32], device=DEVICE),)
+
+        code0, result0 = code_and_output(
+            nested_loop_kernel,
+            args,
+            block_sizes=[32, 16],
+            range_smem_budgets=[0, 0],
+        )
+        code_budget, result_budget = code_and_output(
+            nested_loop_kernel,
+            args,
+            block_sizes=[32, 16],
+            range_smem_budgets=[0, 200000],
+        )
+
+        torch.testing.assert_close(result0, result_budget)
+        torch.testing.assert_close(result0, args[0] + 1)
+        self.assertNotIn("smem_budget", code0)
+        self.assertIn("smem_budget=200000", code_budget)
+
     @xfailIfPallas("range_num_stages is Triton-specific")
     @skipIfTileIR("tileir backend will ignore `range_num_stages` hint")
     @skipIfRefEager("not supported in ref eager mode")
@@ -1072,6 +1195,11 @@ class TestLoops(RefEagerTestBase, TestCase):
             static_ranges=[True],
             range_unroll_factors=[2],
             range_num_stages=[3],
+            range_merge_epilogues=[True],
+            range_data_partition_factors=[2],
+            range_tmem_alloc_algos=[2],
+            range_smem_alloc_algos=[1],
+            range_smem_budgets=[200000],
             range_multi_buffers=[True],
             range_flattens=[True],
         )

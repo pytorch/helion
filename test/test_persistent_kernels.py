@@ -1027,6 +1027,56 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result_stages, expected)
         self.assertIn("num_stages=3", code_stages)
 
+        # Test with persistent_blocked + range_merge_epilogues
+        code_merge, result_merge = code_and_output(
+            test_kernel,
+            args,
+            pid_type="persistent_blocked",
+            range_merge_epilogues=[True],
+        )
+        torch.testing.assert_close(result_merge, expected)
+        self.assertIn("merge_epilogue=True", code_merge)
+
+        # Test with persistent_interleaved + range_data_partition_factors
+        code_partition, result_partition = code_and_output(
+            test_kernel,
+            args,
+            pid_type="persistent_interleaved",
+            range_data_partition_factors=[2],
+        )
+        torch.testing.assert_close(result_partition, expected)
+        self.assertIn("data_partition_factor=2", code_partition)
+
+        # Test with persistent_interleaved + range_tmem_alloc_algos
+        code_tmem, result_tmem = code_and_output(
+            test_kernel,
+            args,
+            pid_type="persistent_interleaved",
+            range_tmem_alloc_algos=[2],
+        )
+        torch.testing.assert_close(result_tmem, expected)
+        self.assertIn("tmem_alloc_algo=2", code_tmem)
+
+        # Test with persistent_blocked + range_smem_alloc_algos
+        code_smem_algo, result_smem_algo = code_and_output(
+            test_kernel,
+            args,
+            pid_type="persistent_blocked",
+            range_smem_alloc_algos=[1],
+        )
+        torch.testing.assert_close(result_smem_algo, expected)
+        self.assertIn("smem_alloc_algo=1", code_smem_algo)
+
+        # Test with persistent_interleaved + range_smem_budgets
+        code_smem_budget, result_smem_budget = code_and_output(
+            test_kernel,
+            args,
+            pid_type="persistent_interleaved",
+            range_smem_budgets=[200000],
+        )
+        torch.testing.assert_close(result_smem_budget, expected)
+        self.assertIn("smem_budget=200000", code_smem_budget)
+
         # Test with persistent_blocked + range_multi_buffers
         code_buffer, result_buffer = code_and_output(
             test_kernel,
@@ -1051,6 +1101,11 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
             pid_type="persistent_blocked",
             range_unroll_factors=[2],
             range_num_stages=[3],
+            range_merge_epilogues=[True],
+            range_data_partition_factors=[2],
+            range_tmem_alloc_algos=[2],
+            range_smem_alloc_algos=[1],
+            range_smem_budgets=[200000],
             range_multi_buffers=[True],
             range_flattens=[False],
         )
@@ -1059,6 +1114,11 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
         # Verify all options are present in the generated code
         self.assertIn("loop_unroll_factor=2", code_combined)
         self.assertIn("num_stages=3", code_combined)
+        self.assertIn("merge_epilogue=True", code_combined)
+        self.assertIn("data_partition_factor=2", code_combined)
+        self.assertIn("tmem_alloc_algo=2", code_combined)
+        self.assertIn("smem_alloc_algo=1", code_combined)
+        self.assertIn("smem_budget=200000", code_combined)
         self.assertIn("disallow_acc_multi_buffer=False", code_combined)
         self.assertIn("flatten=False", code_combined)
 
