@@ -382,7 +382,7 @@ class BaseSearch(BaseAutotuner):
         all_configs = configs
         fns: list[Callable[..., object]] = []
         valid_configs: list[Config] = []
-        valid_indices: list[int] = []
+        valid_indices: set[int] = set()
         futures: list[PrecompileFuture] | None = None
         for i, config in enumerate(all_configs):
             try:
@@ -399,7 +399,7 @@ class BaseSearch(BaseAutotuner):
                 continue
             fns.append(fn)
             valid_configs.append(config)
-            valid_indices.append(i)
+            valid_indices.add(i)
         configs = valid_configs
         if self.settings.autotune_precompile:
             futures = list(
@@ -502,9 +502,8 @@ class BaseSearch(BaseAutotuner):
             return results
         full_results: list[BenchmarkResult] = []
         valid_iter = iter(results)
-        valid_set = set(valid_indices)
         for i, config in enumerate(all_configs):
-            if i in valid_set:
+            if i in valid_indices:
                 full_results.append(next(valid_iter))
             else:
                 full_results.append(
