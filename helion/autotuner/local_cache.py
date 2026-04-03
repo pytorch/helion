@@ -116,7 +116,7 @@ class LocalAutotuneCache(AutotuneCacheBase):
         in_memory_cache_key = self.kernel.kernel._create_bound_kernel_cache_key(
             self.kernel,
             tuple(self.args),
-            self.kernel.kernel.specialization_key(self.args),
+            self.kernel.kernel._base_specialization_key(self.args),
         )
         kernel_source = textwrap.dedent(inspect.getsource(self.kernel.kernel.fn))
         kernel_source_hash = hashlib.sha256(kernel_source.encode("utf-8")).hexdigest()
