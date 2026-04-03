@@ -297,7 +297,7 @@ class PrecompileFuture:
     Wraps a child process where we are precompiling a kernel.
 
     Attributes:
-        search (BaseSearch): The search object that initiated the precompilation.
+        ctx (PrecompileContext): The context needed to drive the precompilation.
         config (Config): The configuration to be precompiled.
         process (mp.Process | None): The process running the precompilation.
         timeout (float): The timeout for the precompilation.
