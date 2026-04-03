@@ -393,18 +393,6 @@ class BlockPtrIndexingStrategy(IndexingStrategy):
             value=store_value,
         )
 
-    def codegen_atomic_add(
-        self,
-        state: CodegenState,
-        fake_tensor: torch.Tensor,
-        subscript: list[object],
-        value: ast.AST,
-        sem: ast.AST,
-    ) -> ast.AST:
-        # block_ptr does not support atomics, fall back to pointer
-        return PointerIndexingStrategy().codegen_atomic_add(
-            state, fake_tensor, subscript, value, sem
-        )
 
 
 class TensorDescriptorIndexingStrategy(IndexingStrategy):
