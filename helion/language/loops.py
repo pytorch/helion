@@ -426,6 +426,8 @@ def _add_config_choices(
         # just one set of choices for when we have persistent kernel loop
         _add_config_range_choice(block_ids)
     else:
+        if config_spec.backend_name == "pallas":
+            config_spec.has_pallas_inner_loops = True
         if allow_static_ranges is None:
             allow_static_ranges = [False] * len(block_ids)
         for block_id, allow_static_range in zip(
@@ -434,22 +436,7 @@ def _add_config_choices(
             _add_config_range_choice([block_id], allow_static_range=allow_static_range)
 
         if has_symbolic_bounds and config_spec.backend_name == "pallas":
-            # Restrict pallas_loop_type to disallow "default" when has_symbolic_bounds
-            from ..autotuner.config_fragment import EnumFragment
-
-            current_pallas_fragment = config_spec.backend_tunable_fragments.get(
-                "pallas_loop_type"
-            )
-            assert isinstance(current_pallas_fragment, EnumFragment)
-            if current_pallas_fragment and "default" in current_pallas_fragment.choices:
-                new_choices = tuple(
-                    choice
-                    for choice in current_pallas_fragment.choices
-                    if choice != "default"
-                )
-                config_spec.backend_tunable_fragments["pallas_loop_type"] = (
-                    EnumFragment(choices=new_choices)
-                )
+            config_spec.has_pallas_symbolic_bounds = True
 
 
 def _add_config_range_choice(
