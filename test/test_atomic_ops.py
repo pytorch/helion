@@ -499,6 +499,43 @@ class TestAtomicOperations(RefEagerTestBase, TestCase):
         self.assertIn("tl.atomic_add", code3)
         self.assertNotIn("desc.atomic_add(", code3)
 
+    @onlyBackends("triton")
+    @skipIfRocm("Tensor descriptor not supported on ROCm")
+    def test_atomic_add_per_op_indexing(self):
+        """Test per-op atomic_indexing list: first op pointer, second op tensor_descriptor."""
+
+        @helion.kernel(
+            config=helion.Config(
+                block_sizes=[64, 64],
+                indexing="tensor_descriptor",
+                atomic_indexing=["pointer", "tensor_descriptor"],
+            ),
+            static_shapes=True,
+        )
+        def two_atomic_adds(
+            out1: torch.Tensor, out2: torch.Tensor, val: torch.Tensor
+        ) -> torch.Tensor:
+            for i, j in hl.tile([out1.size(0), out1.size(1)]):
+                hl.atomic_add(out1, [i, j], val[i, j])  # pointer
+                hl.atomic_add(out2, [i, j], val[i, j])  # tensor_descriptor
+            return out1
+
+        M, N = 128, 64
+        out1 = torch.zeros(M, N, device=DEVICE, dtype=torch.float32)
+        out2 = torch.zeros(M, N, device=DEVICE, dtype=torch.float32)
+        val = torch.ones(M, N, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(two_atomic_adds, (out1, out2, val))
+        expected = torch.ones(M, N, device=DEVICE, dtype=torch.float32)
+        torch.testing.assert_close(result, expected)
+        torch.testing.assert_close(out2, expected)
+        # out1 uses pointer: tl.atomic_add(out1 + ...)
+        self.assertIn("tl.atomic_add(out1", code)
+        # out2 uses tensor_descriptor: out2_desc.atomic_add(...)
+        self.assertIn("out2_desc.atomic_add(", code)
+        # out1 should NOT use descriptor, out2 should NOT use pointer
+        self.assertNotIn("out1_desc", code)
+        self.assertNotIn("tl.atomic_add(out2", code)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1700,25 +1700,20 @@ class WalkHostAST(NodeVisitor):
             self.current_phase_roots = []
 
 
-def _count_device_loads_and_stores(
-    device_ir: DeviceIR,
-) -> tuple[int, int, int, int]:
-    """Count the number of load, store, and atomic operations in device code for autotuning.
+def _count_device_loads_and_stores(device_ir: DeviceIR) -> tuple[int, int, int]:
+    """Count the number of load and store operations in device code for autotuning.
 
     Returns:
-        tuple[int, int, int, int]: (total_load_count, loads_without_eviction_policy, store_count, atomic_count)
+        tuple[int, int, int]: (total_load_count, loads_without_eviction_policy, store_count)
             - total_load_count: all loads (for indexing tunable)
             - loads_without_eviction_policy: loads that need eviction policy tuning
             - store_count: all stores (for indexing tunable)
-            - atomic_count: all atomic ops (for atomic_indexing tunable)
     """
-    from ..language import atomic_ops
     from ..language import memory_ops
 
     total_load_count = 0
     loads_without_eviction_policy = 0
     store_count = 0
-    atomic_count = 0
 
     for graph_info in device_ir.graphs:
         for node in graph_info.graph.nodes:
@@ -1738,28 +1733,33 @@ def _count_device_loads_and_stores(
                 # Check if this is a store operation
                 elif node.target is memory_ops.store:
                     store_count += 1
-                # Check if this is an atomic operation
-                elif node.target is atomic_ops.atomic_add:
-                    atomic_count += 1
 
-    return total_load_count, loads_without_eviction_policy, store_count, atomic_count
+    return total_load_count, loads_without_eviction_policy, store_count
+
+
+def _count_device_atomics(device_ir: DeviceIR) -> int:
+    """Count the number of atomic operations in device code for autotuning."""
+    from ..language import atomic_ops
+
+    atomic_count = 0
+    for graph_info in device_ir.graphs:
+        for node in graph_info.graph.nodes:
+            if node.op == "call_function" and node.target is atomic_ops.atomic_add:
+                atomic_count += 1
+    return atomic_count
 
 
 def _register_load_store_tunables(
-    total_load_count: int,
-    loads_without_eviction_policy: int,
-    store_count: int,
-    atomic_count: int = 0,
+    total_load_count: int, loads_without_eviction_policy: int, store_count: int
 ) -> None:
-    """Register list-based tunables (indexing, eviction policies) for all device loads, stores, and atomics.
+    """Register list-based tunables (indexing, eviction policies) for all device loads and stores.
 
     Args:
         total_load_count: Total number of loads (for indexing tunable)
         loads_without_eviction_policy: Number of loads that need eviction policy tuning
         store_count: Total number of stores (for indexing tunable)
-        atomic_count: Total number of atomic ops (for atomic_indexing tunable)
     """
-    if total_load_count == 0 and store_count == 0 and atomic_count == 0:
+    if total_load_count == 0 and store_count == 0:
         return
 
     from ..autotuner.config_fragment import EnumFragment
@@ -1784,12 +1784,20 @@ def _register_load_store_tunables(
             length=total_count,
         )
 
-    # Atomic indexing applies to all atomic ops
-    if atomic_count > 0:
-        env.config_spec.atomic_indexing = ListOf(
-            EnumFragment(choices=env.config_spec.valid_indexing_types()),
-            length=atomic_count,
-        )
+
+def _register_atomic_tunables(atomic_count: int) -> None:
+    """Register atomic_indexing tunable for all atomic operations."""
+    if atomic_count == 0:
+        return
+
+    from ..autotuner.config_fragment import EnumFragment
+    from ..autotuner.config_fragment import ListOf
+
+    env = CompileEnvironment.current()
+    env.config_spec.atomic_indexing = ListOf(
+        EnumFragment(choices=env.config_spec.valid_atomic_indexing_types()),
+        length=atomic_count,
+    )
 
 
 def lower_to_device_ir(func: HostFunction) -> DeviceIR:
@@ -1846,13 +1854,14 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
             # xyz not supported with shared program IDs, but persistent kernels are allowed
             CompileEnvironment.current().config_spec.disallow_pid_type("xyz")
 
-        # Count all device loads, stores, and atomics, and register tunables
-        total_load_count, loads_without_eviction_policy, store_count, atomic_count = (
+        # Count all device loads and stores and register tunables
+        total_load_count, loads_without_eviction_policy, store_count = (
             _count_device_loads_and_stores(device_ir)
         )
         _register_load_store_tunables(
-            total_load_count, loads_without_eviction_policy, store_count, atomic_count
+            total_load_count, loads_without_eviction_policy, store_count
         )
+        _register_atomic_tunables(_count_device_atomics(device_ir))
 
         return device_ir
 

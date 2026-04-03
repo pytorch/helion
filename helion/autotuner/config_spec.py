@@ -181,7 +181,7 @@ class ConfigSpec:
             length=0,
         )
         self.atomic_indexing = ListOf(
-            EnumFragment(choices=self.valid_indexing_types()),
+            EnumFragment(choices=self.valid_atomic_indexing_types()),
             length=0,
         )
         self.epilogue_subtile_candidate_enabled: bool = False
@@ -275,6 +275,12 @@ class ConfigSpec:
         if not self.backend.supports_block_ptr_indexing():
             return ("pointer",)
         return ("pointer", "block_ptr")
+
+    def valid_atomic_indexing_types(self) -> tuple[IndexingLiteral, ...]:
+        """Atomic ops only support pointer and tensor_descriptor (no block_ptr)."""
+        if supports_tensor_descriptor():
+            return ("pointer", "tensor_descriptor")
+        return ("pointer",)
 
     def _remove_duplicates(self) -> None:
         self.num_threads._remove_duplicates()
