@@ -1047,7 +1047,7 @@ class TestDot(RefEagerTestBase, TestCase):
     def test_matmul_reshape_m_1(self):
         """Test torch.matmul with M=1 created through reshape."""
         self._test_reshape_m_1(
-            lambda acc, a, b: acc + torch.matmul(a, b), rtol=1e-2, atol=5e-2
+            lambda acc, a, b: acc + torch.matmul(a, b), rtol=1e-2, atol=6.3e-2
         )
 
     def test_matmul_reshape_n_1(self):

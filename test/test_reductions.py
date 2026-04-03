@@ -16,6 +16,7 @@ from helion._testing import onlyBackends
 from helion._testing import skipIfNotTriton
 from helion._testing import skipIfPallas
 from helion._testing import skipIfRefEager
+from helion._testing import skipIfRocm
 from helion._testing import skipIfTileIR
 from helion._testing import skipUnlessTensorDescriptor
 from helion._testing import xfailIfCute
@@ -342,6 +343,7 @@ class TestReductions(RefEagerTestBase, TestCase):
             )
             torch.testing.assert_close(output, args[1](args[0], dim=-1))
 
+    @skipIfRocm("ROCm Triton worker crashes while compiling this reduction kernel")
     def test_reduction_loops_integer_values(self):
         """Test that reduction_loops with integer values works (issue #345 fix)."""
 

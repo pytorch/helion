@@ -1431,6 +1431,23 @@ class TestLoops(RefEagerTestBase, TestCase):
         # change num_stages=1
         self.assertIn("num_stages=1", code)
 
+    def test_loop_with_symbolic_bounds(self):
+        @helion.kernel(
+            config=helion.Config(
+                block_sizes=[128, 128, 1],
+            )
+        )
+        def fn(x) -> torch.Tensor:
+            m, n = x.shape
+            out = torch.zeros([m, n], dtype=torch.float32, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                for inner_n in hl.tile(tile_n.begin, tile_n.end):
+                    out[tile_m, inner_n] = x[tile_m, inner_n]
+            return out
+
+        x = torch.randn(128, 1024, dtype=torch.float32, device=DEVICE)
+        torch.testing.assert_close(fn(x), x)
+
 
 if __name__ == "__main__":
     unittest.main()

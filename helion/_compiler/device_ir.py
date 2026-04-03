@@ -184,6 +184,7 @@ def _make_fx(fn: Callable[..., object], *args: object) -> torch.fx.Graph:
         return get_proxy_slot(obj, tracer, default, transform)
 
     get_proxy_slot: Callable[..., object] = proxy_tensor.get_proxy_slot
+
     with (
         preserve_node_meta(),
         patch.object(proxy_tensor, "get_proxy_slot", _get_proxy_slot),
@@ -1794,6 +1795,10 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
         # Raise a friendly error instead of emitting an empty Triton function body.
         if len(device_ir.root_ids) == 0:
             raise exc.NoDeviceLoopsInKernel
+        from ..language.random_ops import rewrite_implicit_random_ops
+
+        for graph in device_ir.graphs:
+            rewrite_implicit_random_ops(graph.graph)
         for graph in device_ir.graphs:
             prepare_graph_lowerings(graph.graph)
         for graph in device_ir.graphs:

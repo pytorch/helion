@@ -18,6 +18,8 @@ from .._compiler.cute.matmul_utils import cute_lower_rhs_for_matmul
 from .._compiler.cute.matmul_utils import cute_outer_accumulates_result
 from .._compiler.cute.matmul_utils import cute_outer_accumulator_dtype
 from .._compiler.cute.matmul_utils import cute_outer_accumulator_out_dtype
+from .._compiler.cute.matmul_utils import cute_resolve_active_block_id
+from .._compiler.cute.matmul_utils import cute_resolve_active_matmul_k_block_id
 from .._compiler.cute.matmul_utils import cute_static_k_invariant_extent
 from .._compiler.matmul_utils import _compute_out_dtype
 from .._compiler.matmul_utils import _emit_pallas_matmul
@@ -363,7 +365,12 @@ def _(state: CodegenState) -> object:
         resolved_out_dtype,
         outer_acc_dtype,
     )
-    k_block_id = CompileEnvironment.current().resolve_block_id(lhs_proxy.shape[-1])
+    k_block_id = cute_resolve_active_matmul_k_block_id(
+        state.codegen,
+        lhs_proxy.shape[-1],
+        rhs_proxy.shape[-2],
+        rhs_proxy.shape[-1],
+    )
     packed_rhs = None
     if (
         k_block_id is None
@@ -380,8 +387,8 @@ def _(state: CodegenState) -> object:
     if k_block_id is None and packed_rhs is not None:
         packed_nodes, _ = packed_rhs
         packed_node = packed_nodes[0]
-        k_block_id = CompileEnvironment.current().resolve_block_id(
-            packed_node.meta["val"].shape[0]
+        k_block_id = cute_resolve_active_block_id(
+            state.codegen, packed_node.meta["val"].shape[0]
         )
     assert isinstance(rhs_ast, (ast.AST, CutePackedTerms))
     static_k_extent = None
@@ -390,6 +397,22 @@ def _(state: CodegenState) -> object:
         rhs_node = state.fx_node.args[1] if len(state.fx_node.args) > 1 else None
         if isinstance(lhs_node, torch.fx.Node) and isinstance(rhs_node, torch.fx.Node):
             static_k_extent = cute_static_k_invariant_extent(lhs_node, rhs_node)
+    env = CompileEnvironment.current()
+    size_hint = getattr(env, "size_hint", None)
+
+    def hinted(size: int | torch.SymInt) -> int:
+        if callable(size_hint):
+            hinted_size = size_hint(size)
+            assert isinstance(hinted_size, int)
+            return hinted_size
+        return int(size)
+
+    k_is_one = hinted(lhs_proxy.shape[-1]) == 1 and hinted(rhs_proxy.shape[-2]) == 1
+    if static_k_extent is None and k_block_id is None and not k_is_one:
+        raise exc.BackendUnsupported(
+            "cute",
+            "CuTe scalar matmul fallback requires an active K tile or a K-invariant static shortcut",
+        )
     return _emit_cute_matmul(
         state.codegen,
         lhs_ast,

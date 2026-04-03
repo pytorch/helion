@@ -133,7 +133,7 @@ class Backend(abc.ABC):
         """Generate backend-specific device-loop index expression from an offset."""
         raise exc.BackendUnsupported(self.name, "loop index")
 
-    def scalar_load_expr(self, tensor_name: str) -> str:
+    def scalar_load_expr(self, tensor_name: str, index_expr: str | None = None) -> str:
         """Load scalar value from a tensor argument."""
         raise exc.BackendUnsupported(self.name, "scalar load")
 
@@ -608,8 +608,10 @@ class TritonBackend(Backend):
     ) -> str:
         return f"{offset_var} + tl.arange(0, ({block_size_var})).to({dtype})"
 
-    def scalar_load_expr(self, tensor_name: str) -> str:
-        return f"tl.load({tensor_name})"
+    def scalar_load_expr(self, tensor_name: str, index_expr: str | None = None) -> str:
+        if index_expr is None:
+            return f"tl.load({tensor_name})"
+        return f"tl.load({tensor_name} + {index_expr})"
 
     def where_expr(self, mask: str, true_val: str, false_val: str) -> str:
         return f"tl.where({mask}, {true_val}, {false_val})"
@@ -848,6 +850,8 @@ _TORCH_TO_JAX_DTYPE: dict[str, str] = {
     "torch.int32": "jnp.int32",
     "torch.int64": "jnp.int64",
     "torch.uint8": "jnp.uint8",
+    "torch.uint32": "jnp.uint32",
+    "torch.uint64": "jnp.uint64",
     "torch.bool": "jnp.bool_",
     "torch.complex64": "jnp.complex64",
     "torch.complex128": "jnp.complex128",
@@ -1023,8 +1027,10 @@ class PallasBackend(Backend):
     ) -> str:
         return f"{offset_var} + jnp.arange(0, ({block_size_var}), dtype={dtype})"
 
-    def scalar_load_expr(self, tensor_name: str) -> str:
-        return f"{tensor_name}[0]"
+    def scalar_load_expr(self, tensor_name: str, index_expr: str | None = None) -> str:
+        if index_expr is None:
+            index_expr = "0"
+        return f"({tensor_name})[{index_expr}]"
 
     def full_expr(
         self, shape_dims: list[str], value_expr: str, dtype: torch.dtype
@@ -1220,10 +1226,9 @@ class PallasBackend(Backend):
         return None
 
     def rng_seed_buffer_expr(self, count: int) -> str:
-        # inductor_prims.seeds uses torch.randint with int64 which is not
-        # supported on XLA/TPU.  Generate on CPU then cast to int32 (required
-        # by Mosaic lowering) and move to the accelerator device.
-        return f"inductor_prims.seeds({count}, torch.device('cpu')).to(torch.int32).to(torch.accelerator.current_accelerator())"
+        # Generate on CPU, then move to the accelerator so the full 64-bit
+        # Philox seed survives backend handoff.
+        return f"inductor_prims.seeds({count}, torch.device('cpu')).to(torch.accelerator.current_accelerator())"
 
     def _compute_block_spec_info(
         self,
@@ -1993,8 +1998,10 @@ class CuteBackend(Backend):
     ) -> str:
         return self.grid_index_expr(offset_var, block_size_var, dtype, axis=axis)
 
-    def scalar_load_expr(self, tensor_name: str) -> str:
-        return f"{tensor_name}[0]"
+    def scalar_load_expr(self, tensor_name: str, index_expr: str | None = None) -> str:
+        if index_expr is None:
+            index_expr = "0"
+        return f"({tensor_name})[{index_expr}]"
 
     def max_reduction_threads(self) -> int | None:
         return 32
@@ -2357,11 +2364,13 @@ class CuteBackend(Backend):
         has_barrier: bool,
         sorted_args: list[Argument] | None = None,
     ) -> list[str]:
-        if has_rng_ops:
-            raise exc.BackendUnsupported(self.name, "RNG ops")
         if not tensor_host_args:
             raise exc.BackendUnsupported(self.name, "kernel launch without tensor args")
-        return [*args, *self.launcher_keyword_args(config, has_barrier=has_barrier)]
+        out = [*args]
+        if has_rng_ops:
+            out.append("_rng_seed_buffer")
+        out.extend(self.launcher_keyword_args(config, has_barrier=has_barrier))
+        return out
 
     def create_loop_strategy(
         self, fn: DeviceFunction, block_ids: list[int], config: Config
