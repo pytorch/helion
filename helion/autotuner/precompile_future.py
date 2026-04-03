@@ -145,6 +145,7 @@ def _run_kernel_in_subprocess_spawn(
     args_path: str,
     result_path: str,
     decorator: str,
+    num_reps: int = 1,
 ) -> None:
     status = 0
     _cap: list[str] = [""]
@@ -154,7 +155,8 @@ def _run_kernel_in_subprocess_spawn(
         assert isinstance(args, (tuple, list))
         torch.accelerator.synchronize()
         with capture_output() as _cap:
-            fn(*args)
+            for _ in range(num_reps):
+                fn(*args)
         torch.accelerator.synchronize()
         _write_result_file(result_path, {"status": "ok"})
     except Exception as exc:
@@ -382,11 +384,12 @@ class PrecompileFuture:
                     "Failed to serialize compiled kernel for spawn precompile."
                     ' Set HELION_AUTOTUNE_PRECOMPILE="fork" to fall back to fork mode.'
                 ) from err
+            num_reps = search.settings.autotune_precompile_reps
             process = cast(
                 "mp.Process",
                 ctx.Process(
                     target=_run_kernel_in_subprocess_spawn,
-                    args=(fn_spec, args_path, result_path, decorator),
+                    args=(fn_spec, args_path, result_path, decorator, num_reps),
                 ),
             )
             process.daemon = True
