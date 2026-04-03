@@ -502,6 +502,26 @@ class TestPallas(TestCase):
         ).to(device=DEVICE)
         torch.testing.assert_close(result, ref, rtol=1e-2, atol=1e-2)
 
+    def test_emit_pipeline_loop_order(self) -> None:
+        """Test emit_pipeline with loop_order reordering.
+
+        Without the fix, program_id mapping uses logical grid_block_ids
+        order instead of pid_info order (which reflects loop_order),
+        producing wrong results.
+        """
+        x = torch.randn(256, 256, device=DEVICE, dtype=torch.bfloat16)
+        y = torch.randn(256, 256, device=DEVICE, dtype=torch.bfloat16)
+        bias = torch.randn(1, 256, device=DEVICE, dtype=torch.bfloat16)
+        code, result = code_and_output(
+            pallas_matmul_broadcast_bias,
+            (x, y, bias),
+            block_sizes=[16, 128, 64],
+            loop_orders=[[1, 0]],
+            pallas_loop_type="emit_pipeline",
+        )
+        expected = (x.float() @ y.float() + bias.float()).to(torch.bfloat16)
+        torch.testing.assert_close(result, expected, rtol=1e-2, atol=1e-2)
+
 
 if __name__ == "__main__":
     unittest.main()

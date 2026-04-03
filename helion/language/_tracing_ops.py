@@ -642,16 +642,20 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
     # Map outer grid block_ids to program_id variable names.
     # Compute program_ids before emit_pipeline so the BlockSpec lambda
     # captures them as closure variables (like the reference pattern).
-    from .._compiler.host_function import HostFunction as _HF
+    # Use pid_info ordering (which reflects loop_order) rather than
+    # grid_block_ids (which is logical order), so that program_id(g)
+    # correctly maps to the block_id at grid dimension g.
+    from .._compiler.device_function import DeviceFunction as _DF
 
-    _outer_grid_bids: list[int] = []
-    for _gbids in _HF.current().device_ir.grid_block_ids:
-        _outer_grid_bids.extend(_gbids)
     _bid_to_pid_var: dict[int, str] = {}
-    for g, bid in enumerate(_outer_grid_bids):
-        pid_var = f"_outer_pid_{g}"
-        state.add_statement(statement_from_string(f"{pid_var} = pl.program_id({g})"))
-        _bid_to_pid_var[bid] = pid_var
+    device_fn = _DF.current()
+    if device_fn.pid is not None:
+        for g, pid in enumerate(device_fn.pid.pid_info):
+            pid_var = f"_outer_pid_{g}"
+            state.add_statement(
+                statement_from_string(f"{pid_var} = pl.program_id({g})")
+            )
+            _bid_to_pid_var[pid.block_id] = pid_var
 
     def _make_block_spec(fake: torch.Tensor, subscript_meta: list[object]) -> str:
         """Build a BlockSpec string for a tensor accessed in the pipeline body.
