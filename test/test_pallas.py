@@ -502,6 +502,61 @@ class TestPallas(TestCase):
         ).to(device=DEVICE)
         torch.testing.assert_close(result, ref, rtol=1e-2, atol=1e-2)
 
+    @skipUnlessPallas
+    def test_non_pow2_shapes(self) -> None:
+        """Non-power-of-2 tensor dims with block > dim must work.
+
+        When block_size > tensor_dim, the runtime caps the BlockSpec
+        to min(block, dim) for non-aligned blocks, or keeps block
+        (Pallas zero-pads) for aligned blocks.  Either way the kernel
+        must produce correct results.
+        """
+        # 1D: size 300 with block 128 → partial last tile
+        x = torch.randn(300, device=DEVICE)
+        y = torch.randn(300, device=DEVICE)
+        _code, result = code_and_output(add_kernel, (x, y), block_size=128)
+        torch.testing.assert_close(result, x + y)
+
+        # 2D: non-pow2 both dims, block > m (sublane)
+        x = torch.randn(13, 200, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(13, 200, device=DEVICE, dtype=torch.float32)
+        _code, result = code_and_output(pallas_add_2d, (x, y), block_sizes=[8, 128])
+        torch.testing.assert_close(result, x + y)
+
+    @skipUnlessPallas
+    def test_broadcast_bias_block_gt_dim(self) -> None:
+        """Broadcast bias [1, N] with block_size > 1 on the broadcast dim.
+
+        The broadcast dim must be capped to 1 in the BlockSpec so
+        Pallas doesn't zero-pad it (which would replace the broadcast
+        value with zeros in padded rows).  The accumulator at
+        _BLOCK_SIZE shape must still work with the (1, N) bias ref
+        via broadcasting.
+        """
+        x = torch.randn(1024, 1024, device=DEVICE, dtype=torch.bfloat16)
+        y = torch.randn(1024, 1024, device=DEVICE, dtype=torch.bfloat16)
+        bias = torch.randn(1, 1024, device=DEVICE, dtype=torch.bfloat16)
+        _code, result = code_and_output(
+            pallas_matmul_broadcast_bias,
+            (x, y, bias),
+            block_sizes=[64, 128, 128],
+        )
+        expected = (x.float() @ y.float() + bias.float()).to(torch.bfloat16)
+        torch.testing.assert_close(result, expected, rtol=1e-2, atol=1e-2)
+
+        # Non-pow2 M where M is divisible by block — verifies the
+        # accumulator and bias shapes agree through the full matmul.
+        x = torch.randn(300, 256, device=DEVICE, dtype=torch.bfloat16)
+        y = torch.randn(256, 512, device=DEVICE, dtype=torch.bfloat16)
+        bias = torch.randn(1, 512, device=DEVICE, dtype=torch.bfloat16)
+        _code, result = code_and_output(
+            pallas_matmul_broadcast_bias,
+            (x, y, bias),
+            block_sizes=[64, 128, 128],
+        )
+        expected = (x.float() @ y.float() + bias.float()).to(torch.bfloat16)
+        torch.testing.assert_close(result, expected, rtol=1e-2, atol=1e-2)
+
 
 if __name__ == "__main__":
     unittest.main()

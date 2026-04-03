@@ -1129,31 +1129,39 @@ class PallasBackend(Backend):
         kernel_tensor_sizes: dict[tuple[object, ...], int] | None = None,
         min_element_bits: int = 32,
     ) -> None:
-        """Enforce TPU alignment on block sizes.
+        """Enforce TPU lane/sublane alignment on block sizes.
 
-        TPU Pallas requires:
-        - 1D last dim: multiple of ``128 * (32 // dtype_bits)``
-          (128 for f32, 256 for bf16)
-        - 2D+ last dim: multiple of 128
-        - 2D+ second-to-last dim: multiple of 8
+        TPU vreg layout has 128 lanes (last dim) and 8 sublanes
+        (second-to-last dim).  Pallas requires block shapes to respect
+        these alignments:
+        - 1D: lane dim must be a multiple of ``128 * (32 // dtype_bits)``
+        - 2D+: lane dim (last) must be a multiple of 128
+        - 2D+: sublane dim (second-to-last) must be a multiple of 8
 
-        When the tensor dimension is smaller than the alignment requirement,
-        we set the minimum block size to ``next_power_of_2(tensor_dim)``
-        instead.  At runtime the block shape is capped to
-        ``min(block_size, tensor_dim)`` which equals the full array
-        dimension -- always valid per TPU rules.
+        When the compile-time size hint is smaller than the alignment
+        requirement, the minimum is capped to
+        ``min(alignment, next_power_of_2(hint))`` — any block above
+        that covers the full dim (always valid on TPU).  Each
+        compilation uses the actual tensor shapes, so the hint is
+        always accurate for the current invocation even with
+        ``static_shapes=False``.
         """
         from torch._inductor.runtime.runtime_utils import next_power_of_2
 
         from ..autotuner.config_spec import BlockSizeSpec
         from .compile_environment import BlockSizeInfo
 
-        # Tiling size for 1D arrays.  Mosaic lowering enforces that rank-1
-        # BlockSpec block shapes are a multiple of 128 * (32 // bitwidth).
-        tiling_1d = 128 * (32 // min_element_bits)
+        # Lane alignment for 1D arrays.  Mosaic lowering enforces that
+        # rank-1 BlockSpec block shapes are a multiple of
+        # 128 * (32 // bitwidth).
+        lane_alignment_1d = 128 * (32 // min_element_bits)
 
-        # Map block_id -> minimum dim_from_end across all tensors
-        min_dim_from_end: dict[int, int] = {}
+        LANE_ALIGNMENT = 128  # 2D+ last dim
+        SUBLANE_ALIGNMENT = 8  # 2D+ second-to-last dim
+
+        # Map block_id -> the closest position to lane dim across all
+        # tensors (0 = lane, 1 = sublane, 2+ = batch/outer).
+        min_dim_from_lane: dict[int, int] = {}
         min_tensor_ndim: dict[int, int] = {}
         if block_sizes is not None and kernel_tensor_sizes is not None:
             for shape in kernel_tensor_sizes:
@@ -1165,13 +1173,14 @@ class PallasBackend(Backend):
                         if info.dim_matches(
                             dim_expr  # pyrefly: ignore[bad-argument-type]
                         ):
-                            dfe = tensor_ndim - 1 - d
-                            if info.block_id not in min_dim_from_end:
-                                min_dim_from_end[info.block_id] = dfe
+                            dist_from_lane = tensor_ndim - 1 - d
+                            if info.block_id not in min_dim_from_lane:
+                                min_dim_from_lane[info.block_id] = dist_from_lane
                                 min_tensor_ndim[info.block_id] = tensor_ndim
                             else:
-                                min_dim_from_end[info.block_id] = min(
-                                    min_dim_from_end[info.block_id], dfe
+                                min_dim_from_lane[info.block_id] = min(
+                                    min_dim_from_lane[info.block_id],
+                                    dist_from_lane,
                                 )
                                 min_tensor_ndim[info.block_id] = min(
                                     min_tensor_ndim[info.block_id],
@@ -1182,20 +1191,17 @@ class PallasBackend(Backend):
             if not isinstance(spec, BlockSizeSpec):
                 continue
             bid = spec.block_ids[0]
-            dfe = min_dim_from_end.get(bid, ndim - 1 - i)
-            if dfe == 0:
+            dist_from_lane = min_dim_from_lane.get(bid, ndim - 1 - i)
+            is_lane = dist_from_lane == 0
+            is_sublane = dist_from_lane == 1
+            if is_lane:
                 tndim = min_tensor_ndim.get(bid, ndim)
-                alignment = tiling_1d if tndim <= 1 else 128
-                # When the tensor dim is smaller than the alignment, any
-                # block_size >= tensor_dim will be capped to tensor_dim at
-                # runtime (full-dim access, always valid).  Use the
-                # tensor dim as the minimum so smaller but still-valid
-                # block sizes are not unnecessarily excluded.
+                alignment = lane_alignment_1d if tndim <= 1 else LANE_ALIGNMENT
                 dim_size = next_power_of_2(max(spec.size_hint, 1))
                 spec.update_min(min(alignment, dim_size))
-            elif dfe == 1:
+            elif is_sublane:
                 dim_size = next_power_of_2(max(spec.size_hint, 1))
-                spec.update_min(min(8, dim_size))
+                spec.update_min(min(SUBLANE_ALIGNMENT, dim_size))
 
     def tunable_fragments(self) -> dict[str, ConfigSpecFragment]:
         from ..autotuner.config_fragment import EnumFragment
@@ -1335,6 +1341,12 @@ class PallasBackend(Backend):
                             tiling_1d = 128 * (32 // bitwidth)
                             if bs != dim_size and bs % tiling_1d != 0:
                                 return None
+                        # Cap broadcast dims (size 1) so the ref
+                        # keeps broadcast semantics — zero-padding a
+                        # size-1 dim to block_size would replace the
+                        # broadcast value with zeros in padded rows.
+                        if isinstance(dim_size, int) and dim_size == 1 and bs > 1:
+                            bs = 1
                         block_shape.append(bs)
                         # When the block covers the entire tensor
                         # dimension there is only one tile, so the grid
