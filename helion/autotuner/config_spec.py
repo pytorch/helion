@@ -97,6 +97,7 @@ VALID_KEYS: frozenset[str] = frozenset(
         "num_sm_multiplier",
         "maxnreg",
         "indexing",
+        "atomic_indexing",
         "load_eviction_policies",
         "pallas_loop_type",
         *BACKEND_TUNABLE_KEYS,
@@ -176,6 +177,10 @@ class ConfigSpec:
             length=0,
         )
         self.indexing = ListOf(
+            EnumFragment(choices=self.valid_indexing_types()),
+            length=0,
+        )
+        self.atomic_indexing = ListOf(
             EnumFragment(choices=self.valid_indexing_types()),
             length=0,
         )
@@ -448,6 +453,7 @@ class ConfigSpec:
             "static_ranges",
             "load_eviction_policies",
             "indexing",
+            "atomic_indexing",
         ):
             if not config.get(name):
                 config.pop(name, None)
@@ -458,6 +464,7 @@ class ConfigSpec:
             "num_stages",
             "load_eviction_policies",
             "indexing",
+            "atomic_indexing",
             "pid_type",
             "num_sm_multiplier",
             "maxnreg",
@@ -475,6 +482,8 @@ class ConfigSpec:
             )
         if self.supports_config_key("indexing"):
             config.setdefault("indexing", self.indexing.default())
+        if self.supports_config_key("atomic_indexing"):
+            config.setdefault("atomic_indexing", self.atomic_indexing.default())
         for key, fragment in self.backend_tunable_fragments.items():
             config.setdefault(key, fragment.default())
 
@@ -756,6 +765,8 @@ class ConfigSpec:
             fields["num_stages"] = num_stages_fragment
         if self.supports_config_key("indexing"):
             fields["indexing"] = self.indexing
+        if self.supports_config_key("atomic_indexing"):
+            fields["atomic_indexing"] = self.atomic_indexing
         if self.supports_config_key("pid_type"):
             fields["pid_type"] = EnumFragment(self.allowed_pid_types)
         if self.supports_config_key("num_sm_multiplier"):
@@ -840,6 +851,7 @@ class ConfigSpec:
             "static_ranges",
             "load_eviction_policies",
             "indexing",
+            "atomic_indexing",
         ):
             if not config.get(name):
                 config.pop(name, None)

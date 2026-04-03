@@ -423,6 +423,82 @@ class TestAtomicOperations(RefEagerTestBase, TestCase):
         if _get_backend() == "triton":
             self.assertIn("tl.atomic_cas", code)
 
+    @onlyBackends("triton")
+    @skipIfRocm("Tensor descriptor not supported on ROCm")
+    def test_atomic_add_tensor_descriptor(self):
+        """Test that atomic_add with tensor_descriptor indexing generates desc.atomic_add."""
+
+        @helion.kernel(
+            config=helion.Config(
+                block_sizes=[64, 64],
+                indexing="tensor_descriptor",
+                atomic_indexing="tensor_descriptor",
+            ),
+            static_shapes=True,
+        )
+        def atomic_add_td_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            for i, j in hl.tile([x.size(0), x.size(1)]):
+                hl.atomic_add(x, [i, j], y[i, j])
+            return x
+
+        M, N = 128, 64
+        x = torch.zeros(M, N, device=DEVICE, dtype=torch.float32)
+        y = torch.ones(M, N, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(atomic_add_td_kernel, (x, y))
+        expected = torch.ones(M, N, device=DEVICE, dtype=torch.float32)
+        torch.testing.assert_close(result, expected)
+        self.assertIn("desc.atomic_add(", code)
+        self.assertNotIn("tl.atomic_add", code)
+
+        # Return value consumed: should fall back to pointer
+        @helion.kernel(
+            config=helion.Config(
+                block_sizes=[64, 64],
+                indexing="tensor_descriptor",
+                atomic_indexing="tensor_descriptor",
+            ),
+            static_shapes=True,
+        )
+        def atomic_add_td_prev_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            out = torch.zeros_like(x)
+            for i, j in hl.tile([x.size(0), x.size(1)]):
+                prev = hl.atomic_add(x, [i, j], y[i, j])
+                out[i, j] = prev
+            return out
+
+        x2 = torch.zeros(M, N, device=DEVICE, dtype=torch.float32)
+        y2 = torch.ones(M, N, device=DEVICE, dtype=torch.float32)
+        code2, result2 = code_and_output(atomic_add_td_prev_kernel, (x2, y2))
+        # prev should be zeros (the old values before adding ones)
+        expected2 = torch.zeros(M, N, device=DEVICE, dtype=torch.float32)
+        torch.testing.assert_close(result2, expected2)
+        self.assertIn("tl.atomic_add", code2)
+        self.assertNotIn("desc.atomic_add(", code2)
+
+        # Non-relaxed sem: should fall back to pointer
+        @helion.kernel(
+            config=helion.Config(
+                block_sizes=[64, 64],
+                indexing="tensor_descriptor",
+                atomic_indexing="tensor_descriptor",
+            ),
+            static_shapes=True,
+        )
+        def atomic_add_td_release_kernel(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> torch.Tensor:
+            for i, j in hl.tile([x.size(0), x.size(1)]):
+                hl.atomic_add(x, [i, j], y[i, j], sem="release")
+            return x
+
+        x3 = torch.zeros(M, N, device=DEVICE, dtype=torch.float32)
+        y3 = torch.ones(M, N, device=DEVICE, dtype=torch.float32)
+        code3, result3 = code_and_output(atomic_add_td_release_kernel, (x3, y3))
+        expected3 = torch.ones(M, N, device=DEVICE, dtype=torch.float32)
+        torch.testing.assert_close(result3, expected3)
+        self.assertIn("tl.atomic_add", code3)
+        self.assertNotIn("desc.atomic_add(", code3)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -590,8 +590,23 @@ def _(
 
 @_decorators.codegen(atomic_add, "triton")
 def _(state: CodegenState) -> ast.AST:
-    value_expr = state.ast_args[2]
-    return _codegen_common("atomic_add", state, _to_ast_values([value_expr]))
+    target = state.proxy_arg(0)
+    index = state.proxy_arg(1)
+    value_expr = _to_ast_values([state.ast_args[2]])[0]
+    sem = expr_from_string(repr(state.proxy_arg(len(state.ast_args) - 1)))
+
+    assert isinstance(target, torch.Tensor)
+    assert isinstance(index, list)
+
+    host_function = HostFunction.current()
+    if target not in host_function.tensor_to_origin:
+        raise exc.AtomicOnDeviceTensor("atomic_add")
+
+    device_fn = state.device_function
+    indexing_idx = device_fn.atomic_op_index
+    device_fn.atomic_op_index += 1
+    strategy = device_fn.get_atomic_indexing_strategy(indexing_idx)
+    return strategy.codegen_atomic_add(state, target, index, value_expr, sem)
 
 
 @_decorators.codegen(atomic_add, "cute")

@@ -166,6 +166,16 @@ class IndexingStrategy:
     ) -> ast.AST:
         raise NotImplementedError
 
+    def codegen_atomic_add(
+        self,
+        state: CodegenState,
+        fake_tensor: torch.Tensor,
+        subscript: list[object],
+        value: ast.AST,
+        sem: ast.AST,
+    ) -> ast.AST:
+        raise NotImplementedError
+
     @staticmethod
     def select(indexing_literal: IndexingLiteral) -> IndexingStrategy:
         if indexing_literal == "pointer":
@@ -305,6 +315,24 @@ class PointerIndexingStrategy(IndexingStrategy):
             mask=indexing.mask_expr,
         )
 
+    def codegen_atomic_add(
+        self,
+        state: CodegenState,
+        fake_tensor: torch.Tensor,
+        subscript: list[object],
+        value: ast.AST,
+        sem: ast.AST,
+    ) -> ast.AST:
+        indexing = SubscriptIndexing.create(state, fake_tensor, subscript)
+        name = state.device_function.tensor_arg(fake_tensor).name
+        return expr_from_string(
+            f"tl.atomic_add({name} + {{offset}}, {{value}}, mask={{mask}}, sem={{sem}})",
+            offset=indexing.index_expr,
+            value=value,
+            mask=indexing.mask_expr,
+            sem=sem,
+        )
+
 
 class BlockPtrIndexingStrategy(IndexingStrategy):
     """Use block_ptr to load/store from tensors"""
@@ -363,6 +391,19 @@ class BlockPtrIndexingStrategy(IndexingStrategy):
             f"tl.store({{block_ptr}}, {{value}}, boundary_check={indexing.boundary_check(state)})",
             block_ptr=indexing.make_block_ptr(state),
             value=store_value,
+        )
+
+    def codegen_atomic_add(
+        self,
+        state: CodegenState,
+        fake_tensor: torch.Tensor,
+        subscript: list[object],
+        value: ast.AST,
+        sem: ast.AST,
+    ) -> ast.AST:
+        # block_ptr does not support atomics, fall back to pointer
+        return PointerIndexingStrategy().codegen_atomic_add(
+            state, fake_tensor, subscript, value, sem
         )
 
 
@@ -542,6 +583,38 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
         return expr_from_string(
             f"{indexing.tensor_descriptor(state)}.store({indexing.offsets_str_permuted(state)}, {{value}})",
             value=store_value,
+        )
+
+    def codegen_atomic_add(
+        self,
+        state: CodegenState,
+        fake_tensor: torch.Tensor,
+        subscript: list[object],
+        value: ast.AST,
+        sem: ast.AST,
+    ) -> ast.AST:
+        fallback = PointerIndexingStrategy().codegen_atomic_add
+        # Descriptor atomic_add returns void; fall back if the return value is used
+        if state.fx_node is not None and len(state.fx_node.users) > 0:
+            return fallback(state, fake_tensor, subscript, value, sem)
+        # Descriptor atomic_add has no sem parameter; fall back for non-relaxed
+        if isinstance(sem, ast.Constant) and sem.value != "relaxed":
+            return fallback(state, fake_tensor, subscript, value, sem)
+        if not self.is_supported(state, fake_tensor, subscript):
+            return fallback(state, fake_tensor, subscript, value, sem)
+        indexing = BlockedSubscriptIndexing.create(state, fake_tensor, subscript)
+        desc_arg = indexing.tensor_descriptor_arg(state)
+        atomic_value = indexing.reshape_store(state, value)
+
+        if desc_arg.permutation is not None:
+            atomic_value = expr_from_string(
+                f"tl.permute({{value}}, {desc_arg.permutation!r})",
+                value=atomic_value,
+            )
+
+        return expr_from_string(
+            f"{indexing.tensor_descriptor(state)}.atomic_add({indexing.offsets_str_permuted(state)}, {{value}})",
+            value=atomic_value,
         )
 
 

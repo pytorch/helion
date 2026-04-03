@@ -305,6 +305,11 @@ class DeviceFunction:
         self._indexing_config = config.indexing
         self.indexing_strategies: list[IndexingStrategy] = []
 
+        # Atomic indexing config (separate from load/store indexing)
+        self._atomic_indexing_config = config.atomic_indexing
+        self.atomic_indexing_strategies: list[IndexingStrategy] = []
+        self.atomic_op_index = 0
+
         self.rng_seed_count = 0
         self.device_load_index = 0
         self.device_store_index = 0
@@ -353,6 +358,34 @@ class DeviceFunction:
             self.indexing_strategies.append(strategy)
 
         return self.indexing_strategies[index]
+
+    def get_atomic_indexing_strategy(self, index: int) -> IndexingStrategy:
+        from .indexing_strategy import IndexingStrategy
+        from .indexing_strategy import PointerIndexingStrategy
+
+        while len(self.atomic_indexing_strategies) <= index:
+            idx = len(self.atomic_indexing_strategies)
+
+            if isinstance(self._atomic_indexing_config, str):
+                if not self.atomic_indexing_strategies:
+                    strategy = IndexingStrategy.select(self._atomic_indexing_config)
+                else:
+                    strategy = self.atomic_indexing_strategies[0]
+            elif (
+                isinstance(self._atomic_indexing_config, list)
+                and self._atomic_indexing_config
+            ):
+                assert idx < len(self._atomic_indexing_config), (
+                    f"Atomic operation {idx} exceeds atomic_indexing config length "
+                    f"{len(self._atomic_indexing_config)}. Please specify atomic_indexing for all atomic ops."
+                )
+                strategy = IndexingStrategy.select(self._atomic_indexing_config[idx])
+            else:
+                strategy = PointerIndexingStrategy()
+
+            self.atomic_indexing_strategies.append(strategy)
+
+        return self.atomic_indexing_strategies[index]
 
     def has_rng_ops(self) -> bool:
         """Check if this kernel uses any RNG operations."""
