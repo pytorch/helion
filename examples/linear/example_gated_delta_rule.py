@@ -55,7 +55,7 @@ def test() -> None:
         from fla.ops.gated_delta_rule import chunk_gated_delta_rule  # pyrefly: ignore
 
         # Note: FLA arg order is q, k, v, g, beta (g BEFORE beta)
-        o_fla, _ = chunk_gated_delta_rule(
+        o_fla, _ = chunk_gated_delta_rule(  # pyrefly: ignore
             _htf(q), _htf(k), _htf(v), _htf(g), _htf(beta), scale=scale
         )
         o_fla_hf = o_fla.transpose(1, 2).contiguous()
@@ -103,7 +103,7 @@ def test() -> None:
             q4 = _htf(q).clone().requires_grad_(True)
             k4 = _htf(k).clone().detach().requires_grad_(True)
             v4 = _htf(v).clone().requires_grad_(True)
-            o4, _ = chunk_gated_delta_rule(q4, k4, v4, _htf(g), _htf(beta), scale=scale)
+            o4, _ = chunk_gated_delta_rule(q4, k4, v4, _htf(g), _htf(beta), scale=scale)  # pyrefly: ignore
             o4.backward(_htf(grad_out))
 
             dq_err = _rel_error(q3.grad, q4.grad.transpose(1, 2).contiguous())

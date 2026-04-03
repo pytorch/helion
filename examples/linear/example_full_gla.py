@@ -51,7 +51,9 @@ def test() -> None:
     try:
         from fla.ops.gla import chunk_gla  # pyrefly: ignore
 
-        o_fla, _ = chunk_gla(_htf(q), _htf(k), _htf(v), _htf(g), scale=scale)  # pyrefly: ignore
+        o_fla, _ = chunk_gla(
+            _htf(q), _htf(k), _htf(v), _htf(g), scale=scale
+        )  # pyrefly: ignore
         o_fla_hf = o_fla.transpose(1, 2).contiguous()
         fla_err = _rel_error(out, o_fla_hf)
         print(

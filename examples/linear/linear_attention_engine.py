@@ -1136,7 +1136,12 @@ def _helion_chunked_fwd(
         exp_g_cs = torch.exp(g_cs[:, :, :, None])
         q_scaled_4d = qf.reshape(BH, N, C, D) * exp_g_cs
         # Attach cached data to h_all for the backward to use
-        h_all._scalar_bwd_cache = (g_cs, g_last, g_last_4d, q_scaled_4d)  # pyrefly: ignore
+        h_all._scalar_bwd_cache = (
+            g_cs,
+            g_last,
+            g_last_4d,
+            q_scaled_4d,
+        )  # pyrefly: ignore
 
         final_state = None
         if return_final_state:
