@@ -1041,6 +1041,31 @@ class TestExamples(RefEagerTestBase, TestCase):
             num_stages=3,
         )
 
+    @xfailIfPallas(
+        "Out-of-bounds slice when reduction_loops doesn't evenly divide the "
+        "reduction dimension (e.g. reduction_loops=32 on dim=48 generates "
+        "pl.ds(32, 32) which exceeds bounds)"
+    )
+    def test_layernorm_reduction_not_divisible(self):
+        """Reduction loop OOB when reduction_loops doesn't divide the reduction dim."""
+        batch_size = 4
+        dim = 48  # not divisible by reduction_loops=32
+        x = torch.randn([batch_size, dim], device=DEVICE, dtype=HALF_DTYPE)
+        weight = torch.randn([dim], device=DEVICE, dtype=HALF_DTYPE)
+        bias = torch.randn([dim], device=DEVICE, dtype=HALF_DTYPE)
+
+        args = (x, [dim], weight, bias, 1e-5)
+        expected_out = torch.nn.functional.layer_norm(*args)
+
+        check_example(
+            "layer_norm",
+            args,
+            (expected_out, None, None),
+            fn_name="layer_norm_fwd",
+            block_size=1,
+            reduction_loops=32,
+        )
+
     @xfailIfCute("CuTe LayerNorm backward example still returns incorrect results")
     @xfailIfPallas("InductorLoweringError")
     @skipIfA10G("accuracy check fails on A10G GPUs")
