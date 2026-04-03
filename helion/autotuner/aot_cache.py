@@ -1013,7 +1013,7 @@ class AOTAutotuneCache(AutotuneCacheBase):
         return self.kernel.kernel._create_bound_kernel_cache_key(
             self.kernel,
             tuple(self.args),
-            self.kernel.kernel.specialization_key(self.args),
+            self.kernel.kernel._base_specialization_key(self.args),
         )
 
     def _list_cache_entries(self) -> Sequence[tuple[str, LooseAutotuneCacheKey]]:
