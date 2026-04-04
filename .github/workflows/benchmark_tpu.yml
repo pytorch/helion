@@ -17,8 +17,6 @@ jobs:
     env:
       HELION_BACKEND: pallas
       HELION_AUTOTUNE_LOG_LEVEL: INFO
-      HELION_AUTOTUNE_EFFORT: quick
-      HELION_AUTOTUNE_MAX_GENERATIONS: 2
 
     runs-on: linux.google.tpuv7x.1
 
