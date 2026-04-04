@@ -107,6 +107,13 @@ KERNEL_MAPPINGS: dict[str, KernelMapping] = {
         _softmax_shapes,
     ),
     "welford": ("welford", "welford", None, None),
+    "attention": ("attention", "attention", None, None),
+    "bmm": ("bmm", "bmm", None, None),
+    "geglu": ("geglu", "geglu", None, None),
+    "grpo_loss": ("grpo_loss", "grpo_loss_forward", None, None),
+    "jagged_hstu_attn": ("jagged_hstu_attn", "jagged_hstu_attn", None, None),
+    "low_mem_dropout": ("low_mem_dropout", "low_mem_dropout", None, None),
+    "swiglu": ("swiglu", "swiglu_fwd", None, None),
 }
 
 
