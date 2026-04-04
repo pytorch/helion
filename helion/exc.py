@@ -310,6 +310,14 @@ class IncompatibleInterpretModes(BaseError):
     message = "TRITON_INTERPRET=1 and HELION_INTERPRET=1 cannot be used together. Please use only one of these debug modes at a time."
 
 
+class FusionAutotuneRequiresTorchCompileFusion(BaseError):
+    location_suffix = ""
+    message = (
+        "autotune_with_torch_compile_fusion=True requires torch_compile_fusion=True. "
+        "Either enable torch_compile_fusion or disable autotune_with_torch_compile_fusion."
+    )
+
+
 class MissingEnableTile(BaseError):
     message = (
         "HELION_BACKEND=tileir requires the Triton TileIR driver to be active. "

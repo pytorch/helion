@@ -681,6 +681,9 @@ class Settings(_Settings):
         if self.backend == "tileir" and os.environ.get("ENABLE_TILE", "0") != "1":
             raise exc.MissingEnableTile
 
+        if self.autotune_with_torch_compile_fusion and not self.torch_compile_fusion:
+            raise exc.FusionAutotuneRequiresTorchCompileFusion
+
         self._check_ref_eager_mode_before_print_output_code()
 
     def to_dict(self) -> dict[str, object]:
