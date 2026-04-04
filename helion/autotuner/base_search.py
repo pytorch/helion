@@ -343,6 +343,7 @@ class BaseSearch(BaseAutotuner):
         self.args: Sequence[object] = args
         self.log = AutotuningLogger(self.settings)
         self.best_perf_so_far = inf
+        self._current_generation = 0
         self._prepared = False
         self._precompile_tmpdir: tempfile.TemporaryDirectory[str] | None = None
         self._precompile_args_path: str | None = None
@@ -1089,6 +1090,8 @@ class BaseSearch(BaseAutotuner):
                 torch.save(self.args, args_path)
                 self._precompile_args_path = args_path
             exit_stack.callback(self.cleanup)
+
+            self._init_search()
             try:
                 best = self._autotune()
             finally:
@@ -1111,6 +1114,15 @@ class BaseSearch(BaseAutotuner):
             if triton_code is not None:
                 print(triton_code, file=sys.stderr)
         return best
+
+    def _init_search(self) -> None:
+        """
+        Initialize the search state for a fresh autotuning run.
+
+        Subclasses should override this to set up initial population and state.
+        After this method, _current_generation should be set to the generation
+        that _autotune() should start its loop from.
+        """
 
     def _autotune(self) -> Config:
         """
@@ -1569,6 +1581,12 @@ class PopulationBasedSearch(BaseSearch):
         if members is None:
             members = self.population
         self.rebenchmark([p for p in members if self.should_rebenchmark(p)], desc=desc)
+
+    def set_generation(self, generation: int) -> None:
+        if generation == self._current_generation:
+            return
+        self._current_generation = generation
+        super().set_generation(generation)
 
     def statistics(self) -> str:
         """

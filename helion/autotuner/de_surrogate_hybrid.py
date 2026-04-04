@@ -135,12 +135,9 @@ class DESurrogateHybrid(DifferentialEvolutionSearch):
         # Track all evaluations for surrogate training
         self.all_observations: list[tuple[FlatConfig, float]] = []
 
-    def _autotune(self) -> Config:
+    def _init_search(self) -> None:
         """
-        Run DE with surrogate-assisted selection.
-
-        Returns:
-            Best configuration found
+        Initialize DE with surrogate-assisted selection.
         """
         self.log("=" * 70)
         self.log("Differential Evolution with Surrogate-Assisted Selection")
@@ -174,8 +171,17 @@ class DESurrogateHybrid(DifferentialEvolutionSearch):
         self.best_perf_history = [self.best.perf]
         self.generations_without_improvement = 0
 
+        self.set_generation(2)
+
+    def _autotune(self) -> Config:
+        """
+        Run DE with surrogate-assisted selection.
+
+        Returns:
+            Best configuration found
+        """
         # Evolution loop
-        for gen in range(2, self.max_generations + 1):
+        for gen in range(self._current_generation, self.max_generations + 1):
             self.set_generation(gen)
             self._evolve_generation(gen)
 
