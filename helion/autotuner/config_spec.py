@@ -240,7 +240,7 @@ class ConfigSpec:
         self.epilogue_subtile_k_hint: int = 0
         self.has_pallas_inner_loops: bool = False
         self.has_pallas_symbolic_bounds: bool = False
-        self.store_indexing_start: int = 0
+        self.store_indices: list[int] = []
         self.backend_tunable_fragments = self.backend.tunable_fragments()
         unknown_tunables = set(self.backend_tunable_fragments) - BACKEND_TUNABLE_KEYS
         if unknown_tunables:
@@ -261,8 +261,8 @@ class ConfigSpec:
         ):
             return
         indexing = config.get("indexing")
-        if isinstance(indexing, list) and self.store_indexing_start < len(indexing):
-            for i in range(self.store_indexing_start, len(indexing)):
+        if isinstance(indexing, list):
+            for i in self.store_indices:
                 indexing[i] = "tensor_descriptor"
 
     @staticmethod
