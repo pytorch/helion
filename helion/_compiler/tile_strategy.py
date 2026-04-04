@@ -269,7 +269,7 @@ class TileStrategy:
         )
         num_stages = config.num_stages
 
-        if config.indexing == "tensor_descriptor":
+        if "tensor_descriptor" in config.indexing:
             # Tensor descriptor + multi-stage pipelines in addition to unrolling tend to cause
             # CUDA "misaligned address" or "unspecified launch failure" errors.
             if range_num_stages > 0:

@@ -1765,20 +1765,27 @@ class WalkHostAST(NodeVisitor):
             self.current_phase_roots = []
 
 
-def _count_device_loads_and_stores(device_ir: DeviceIR) -> tuple[int, int, int]:
+def _count_device_loads_and_stores(
+    device_ir: DeviceIR,
+) -> tuple[int, int, list[int]]:
     """Count the number of load and store operations in device code for autotuning.
 
     Returns:
-        tuple[int, int, int]: (total_load_count, loads_without_eviction_policy, store_count)
+        tuple[int, int, list[int]]: (
+            total_load_count,
+            loads_without_eviction_policy,
+            store_indices,
+        )
             - total_load_count: all loads (for indexing tunable)
             - loads_without_eviction_policy: loads that need eviction policy tuning
-            - store_count: all stores (for indexing tunable)
+            - store_indices: positions of store ops in the combined indexing list
     """
     from ..language import memory_ops
 
     total_load_count = 0
     loads_without_eviction_policy = 0
-    store_count = 0
+    memory_op_index = 0
+    store_indices: list[int] = []
 
     for graph_info in device_ir.graphs:
         for node in graph_info.graph.nodes:
@@ -1786,6 +1793,7 @@ def _count_device_loads_and_stores(device_ir: DeviceIR) -> tuple[int, int, int]:
                 # Check if this is a load operation
                 if node.target is memory_ops.load:
                     total_load_count += 1
+                    memory_op_index += 1
                     # Check if this load needs eviction policy tuning
                     # (user can still specify eviction_policy to override tuning)
                     eviction_policy_arg = node.kwargs.get("eviction_policy")
@@ -1797,29 +1805,37 @@ def _count_device_loads_and_stores(device_ir: DeviceIR) -> tuple[int, int, int]:
                             loads_without_eviction_policy += 1
                 # Check if this is a store operation
                 elif node.target is memory_ops.store:
-                    store_count += 1
+                    store_indices.append(memory_op_index)
+                    memory_op_index += 1
 
-    return total_load_count, loads_without_eviction_policy, store_count
+    return (
+        total_load_count,
+        loads_without_eviction_policy,
+        store_indices,
+    )
 
 
 def _register_load_store_tunables(
-    total_load_count: int, loads_without_eviction_policy: int, store_count: int
+    total_load_count: int,
+    loads_without_eviction_policy: int,
+    store_indices: list[int],
 ) -> None:
     """Register list-based tunables (indexing, eviction policies) for all device loads and stores.
 
     Args:
         total_load_count: Total number of loads (for indexing tunable)
         loads_without_eviction_policy: Number of loads that need eviction policy tuning
-        store_count: Total number of stores (for indexing tunable)
+        store_indices: Positions of store ops in the combined indexing list
     """
+    store_count = len(store_indices)
+    env = CompileEnvironment.current()
+    env.config_spec.store_indices = store_indices
     if total_load_count == 0 and store_count == 0:
         return
 
     from ..autotuner.config_fragment import EnumFragment
     from ..autotuner.config_fragment import ListOf
     from ..autotuner.config_spec import get_valid_eviction_policies
-
-    env = CompileEnvironment.current()
 
     # Register eviction policies only for loads without explicit eviction_policy
     if loads_without_eviction_policy > 0:
@@ -1836,7 +1852,6 @@ def _register_load_store_tunables(
             EnumFragment(choices=env.config_spec.valid_indexing_types()),
             length=total_count,
         )
-        env.config_spec.store_indexing_start = total_load_count
 
 
 def lower_to_device_ir(func: HostFunction) -> DeviceIR:
@@ -1894,11 +1909,15 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
             CompileEnvironment.current().config_spec.disallow_pid_type("xyz")
 
         # Count all device loads and stores and register tunables
-        total_load_count, loads_without_eviction_policy, store_count = (
-            _count_device_loads_and_stores(device_ir)
-        )
+        (
+            total_load_count,
+            loads_without_eviction_policy,
+            store_indices,
+        ) = _count_device_loads_and_stores(device_ir)
         _register_load_store_tunables(
-            total_load_count, loads_without_eviction_policy, store_count
+            total_load_count,
+            loads_without_eviction_policy,
+            store_indices,
         )
 
         return device_ir
