@@ -236,7 +236,7 @@ class DifferentialEvolutionSearch(PopulationBasedSearch):
         self.generations_without_improvement = 0
         return False
 
-    def _autotune(self) -> Config:
+    def _init_search(self) -> None:
         early_stopping_enabled = (
             self.min_improvement_delta is not None and self.patience is not None
         )
@@ -265,7 +265,14 @@ class DifferentialEvolutionSearch(PopulationBasedSearch):
             self.best_perf_history = [self.best.perf]
             self.generations_without_improvement = 0
 
-        for i in range(2, self.max_generations):
+        self.set_generation(2)
+
+    def _autotune(self) -> Config:
+        early_stopping_enabled = (
+            self.min_improvement_delta is not None and self.patience is not None
+        )
+
+        for i in range(self._current_generation, self.max_generations):
             self.set_generation(i)
             self.log(f"Generation {i} starting")
             replaced = self.evolve_population()

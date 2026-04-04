@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import enum
 import math
 from typing import TYPE_CHECKING
@@ -11,7 +12,6 @@ from .base_search import performance
 from .effort_profile import PATTERN_SEARCH_DEFAULTS
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
     from collections.abc import Sequence
 
     from ..autotuner.effort_profile import AutotuneEffortProfile
@@ -29,6 +29,26 @@ class InitialPopulationStrategy(enum.Enum):
 
     FROM_BEST_AVAILABLE = "from_best_available"
     """Start from default config plus up to 20 best matching cached configs from previous runs."""
+
+
+@dataclasses.dataclass
+class PatternSearchCopy:
+    """
+    Represents one copy of the pattern search.
+
+    Each copy explores from a different starting point. The `copies` parameter
+    controls how many of these run in parallel.
+    """
+
+    # The current best member for this search copy.
+    current: PopulationMember
+
+    # Whether this search copy has stopped (no more candidates or early stopping).
+    stopped: bool = False
+
+    # Remaining patience for early stopping (decremented when no improvement).
+    # None means no patience tracking (stop immediately on no improvement).
+    patience_remaining: int | None = None
 
 
 class PatternSearch(PopulationBasedSearch):
@@ -87,6 +107,8 @@ class PatternSearch(PopulationBasedSearch):
         self.num_neighbors_cap = num_neighbors_cap
         self.compile_timeout_lower_bound = compile_timeout_lower_bound
         self.compile_timeout_quantile = compile_timeout_quantile
+        self.visited: set[Config] = set()
+        self.search_copies: list[PatternSearchCopy] = []
 
     @classmethod
     def get_kwargs_from_profile(
@@ -128,17 +150,18 @@ class PatternSearch(PopulationBasedSearch):
             return pop
         return self.config_gen.random_population_flat(self.initial_population)
 
-    def _autotune(self) -> Config:
-        initial_population_name = self.initial_population_strategy.name
+    def _init_search(self) -> None:
         self.log(
-            f"Starting PatternSearch with initial_population={initial_population_name}, copies={self.copies}, max_generations={self.max_generations}"
+            f"Starting {type(self).__name__} with initial_population={self.initial_population_strategy.name},"
+            f" copies={self.copies},"
+            f" max_generations={self.max_generations}"
         )
-        visited: set[Config] = set()
+        self.visited.clear()
         self.population = []
         for flat_config in self._generate_initial_population_flat():
             member = self.make_unbenchmarked(flat_config)
-            if member.config not in visited:
-                visited.add(member.config)
+            if member.config not in self.visited:
+                self.visited.add(member.config)
                 self.population.append(member)
         self.parallel_benchmark_population(self.population, desc="Initial population")
 
@@ -163,20 +186,36 @@ class PatternSearch(PopulationBasedSearch):
         if not starting_points:
             raise exc.NoConfigFound
 
-        search_copies = [self._pattern_search_from(m, visited) for m in starting_points]
-        for generation in range(1, self.max_generations + 1):
+        self.search_copies = [PatternSearchCopy(current=m) for m in starting_points]
+        self.set_generation(1)
+
+    def _autotune(self) -> Config:
+        for generation in range(self._current_generation, self.max_generations + 1):
+            self.set_generation(generation)
             prior_best = self.best
             new_population = {id(prior_best): prior_best}
             num_neighbors = 0
             num_active = 0
-            for search_copy in search_copies:
-                added = next(search_copy, ())
-                if added:
-                    assert len(added) > 1
-                    num_active += 1
-                    num_neighbors += len(added) - 1
-                    for member in added:
-                        new_population[id(member)] = member
+            active_copies: list[tuple[PatternSearchCopy, list[PopulationMember]]] = []
+            for search_copy in self.search_copies:
+                if search_copy.stopped:
+                    continue
+                candidates = [search_copy.current]
+                for flat_config in self._generate_neighbors(
+                    search_copy.current.flat_values
+                ):
+                    new_member = self.make_unbenchmarked(flat_config)
+                    if new_member.config not in self.visited:
+                        self.visited.add(new_member.config)
+                        candidates.append(new_member)
+                if len(candidates) <= 1:
+                    search_copy.stopped = True
+                    continue
+                num_active += 1
+                num_neighbors += len(candidates) - 1
+                for member in candidates:
+                    new_population[id(member)] = member
+                active_copies.append((search_copy, candidates))
             if num_active == 0:
                 break
 
@@ -189,7 +228,6 @@ class PatternSearch(PopulationBasedSearch):
             # compile any unbenchmarked members in parallel
             unbenchmarked = [m for m in self.population if len(m.perfs) == 0]
             if unbenchmarked:
-                self.set_generation(generation)
                 self.parallel_benchmark_population(
                     unbenchmarked, desc=f"Generation {generation}:"
                 )
@@ -197,37 +235,27 @@ class PatternSearch(PopulationBasedSearch):
             self.rebenchmark_population(
                 self.population, desc=f"Generation {generation}: verifying top configs"
             )
+
+            # Update each search copy after rebenchmarking (uses refined perf values)
+            for search_copy, candidates in active_copies:
+                best = min(candidates, key=performance)
+                if self._check_early_stopping(best, search_copy.current):
+                    if (
+                        search_copy.patience_remaining is not None
+                        and search_copy.patience_remaining > 0
+                    ):
+                        search_copy.patience_remaining -= 1
+                    else:
+                        search_copy.stopped = True
+                if not search_copy.stopped:
+                    search_copy.current = best
+
             # Log final statistics for this generation
             self.log(f"Generation {generation} complete:", self.statistics)
 
         # Run finishing phase to simplify the best configuration
         best = self.run_finishing_phase(self.best, self.finishing_rounds)
         return best.config
-
-    def _pattern_search_from(
-        self, current: PopulationMember, visited: set[Config]
-    ) -> Iterator[list[PopulationMember]]:
-        """
-        Run a single copy of pattern search from the given starting point.
-
-        We use a generator and yield the new population at each generation so that we can
-        run multiple copies of pattern search in parallel.
-        """
-        for _ in range(self.max_generations):
-            candidates = [current]
-            for flat_config in self._generate_neighbors(current.flat_values):
-                new_member = self.make_unbenchmarked(flat_config)
-                if new_member.config not in visited:
-                    visited.add(new_member.config)
-                    candidates.append(new_member)
-            if len(candidates) <= 1:
-                return  # no new candidates, stop searching
-            yield candidates  # yield new population to benchmark in parallel
-            # update search copy and check early stopping criteria
-            best = min(candidates, key=performance)
-            if self._check_early_stopping(best, current):
-                return
-            current = best
 
     def _check_early_stopping(
         self, best: PopulationMember, current: PopulationMember
