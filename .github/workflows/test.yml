@@ -107,9 +107,9 @@ jobs:
       - name: Install PyTorch
         run: |
           source .venv/bin/activate
-          if [[ "${{ matrix.pytorch-version }}" == "pytorch-2.9" ]]; then
-            # Install stable 2.9 from test channel
-            uv pip install -U "torch==2.9.*" --index-url https://download.pytorch.org/whl/${{ matrix.runtime-version }}
+          if [[ "${{ matrix.pytorch-version }}" == "pytorch-2.11" ]]; then
+            # Install stable 2.11 release
+            uv pip install -U "torch==2.11.*" --index-url https://download.pytorch.org/whl/${{ matrix.runtime-version }}
           elif [[ "${{ matrix.runtime-version }}" == "tpu" ]]; then
             # TPU: install CPU-only PyTorch nightly (torch_tpu provides TPU backend)
             uv pip install -U --pre torch --index-url https://download.pytorch.org/whl/nightly/cpu
@@ -123,7 +123,7 @@ jobs:
           fi
 
       - name: Install Triton
-        if: matrix.backend == 'tileir' || (matrix.backend == 'triton' && steps.cache.outputs.cache-hit != 'true' && matrix.pytorch-version != 'pytorch-2.9')
+        if: matrix.backend == 'tileir' || (matrix.backend == 'triton' && steps.cache.outputs.cache-hit != 'true' && matrix.pytorch-version != 'pytorch-2.11')
         run: |
           set -x
           source .venv/bin/activate
@@ -269,7 +269,7 @@ jobs:
           pytest $PARALLEL -rf --timeout=60 $EXTRA_FLAGS $TEST_PATH | tee >(eval $SKIP_CHECK)
 
   test-notebooks:
-    name: test-notebooks-cu128-py3.12-pytorch-2.9-a10g
+    name: test-notebooks-cu128-py3.12-pytorch-2.11-a10g
 
     container:
       image: nvidia/cuda:12.8.1-devel-ubuntu24.04

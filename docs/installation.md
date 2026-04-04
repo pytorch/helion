@@ -13,8 +13,8 @@ Helion currently targets Linux systems and requires a recent Python and PyTorch 
 - We recommend using [uv](https://docs.astral.sh/uv/) for lightweight, fast virtual environments
 
 ### Dependencies
-- **[PyTorch](https://github.com/pytorch/pytorch) 2.9 or later**
-- **[Triton](https://github.com/triton-lang/triton) 3.5 or later**
+- **[PyTorch](https://github.com/pytorch/pytorch) 2.11 or later**
+- **[Triton](https://github.com/triton-lang/triton) 3.6 or later**
 
   *Note: Older versions may work, but will lack support for features like TMA on Hopper/Blackwell GPUs and may exhibit lower performance.*
 
@@ -61,26 +61,26 @@ source .venv/bin/activate
 
 ### 2. Install PyTorch
 
-Install PyTorch 2.9 or later:
+Install PyTorch 2.11 or later:
 
 ```bash
 # CUDA 12.8
-pip install "torch==2.9.*" --index-url https://download.pytorch.org/whl/cu128
+pip install "torch==2.11.*" --index-url https://download.pytorch.org/whl/cu128
 
 # ROCm 7.0
-pip install "torch==2.9.*" --index-url https://download.pytorch.org/whl/rocm7.0
+pip install "torch==2.11.*" --index-url https://download.pytorch.org/whl/rocm7.0
 ```
 see [PyTorch installation instructions](https://pytorch.org/get-started/locally/) for other options.
 
 ### 3. Install Triton
 
-Install Triton 3.5 or later using one of the options below.
+Install Triton 3.6 or later using one of the options below.
 
 #### Option A: Prebuilt wheel (recommended)
 
 ```bash
 # Install Triton from PyPI (will pick the right wheel for your platform if available)
-pip install "triton>=3.5"
+pip install "triton>=3.6"
 
 # Verify
 python -c "import triton; print('Triton version:', triton.__version__)"

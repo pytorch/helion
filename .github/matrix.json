@@ -7,7 +7,7 @@
       "image": "nvidia/cuda:12.8.1-devel-ubuntu24.04",
       "runtime-version": "cu128",
       "container-options": "--gpus all",
-      "pytorch-version": "pytorch-2.9",
+      "pytorch-version": "pytorch-2.11",
       "alias": "a10g",
       "backend": "triton"
     },
@@ -29,7 +29,7 @@
       "image": "nvidia/cuda:12.8.1-devel-ubuntu24.04",
       "runtime-version": "cu128",
       "container-options": "--gpus all",
-      "pytorch-version": "pytorch-2.9",
+      "pytorch-version": "pytorch-2.11",
       "alias": "a10g-dtype-asserts",
       "dtype-asserts": true,
       "expecttest-accept": true,
@@ -75,7 +75,7 @@
       "image": "nvidia/cuda:13.1.0-devel-ubuntu24.04",
       "runtime-version": "cu130",
       "container-options": "--gpus all",
-      "pytorch-version": "pytorch-2.9",
+      "pytorch-version": "pytorch-2.11",
       "alias": "b200",
       "backend": "triton"
     },
@@ -86,7 +86,7 @@
       "image": "nvidia/cuda:13.1.0-devel-ubuntu24.04",
       "runtime-version": "cu130",
       "container-options": "--gpus all",
-      "pytorch-version": "pytorch-2.9",
+      "pytorch-version": "pytorch-2.11",
       "alias": "b200",
       "backend": "tileir"
     },
