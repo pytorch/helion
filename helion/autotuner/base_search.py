@@ -12,6 +12,8 @@ import logging
 import math
 from math import inf
 import os
+from pathlib import Path
+import pickle
 import pprint
 import random
 import re
@@ -406,6 +408,114 @@ class BaseSearch(BaseAutotuner):
             self._precompile_tmpdir = None
         self._precompile_args_path = None
         self._precompile_result_counter = count()
+
+    # Fields excluded from pickle checkpoints: unpicklable infrastructure,
+    # fields recomputed by _prepare(), and fields loaded separately.
+    _CHECKPOINT_EXCLUDE = frozenset(
+        {
+            # Unpicklable infrastructure
+            "kernel",
+            "args",
+            "log",
+            "settings",
+            "config_spec",
+            "_precompile_tmpdir",
+            "_precompile_args_path",
+            "_precompile_result_counter",
+            # Recomputed by _prepare() before checkpoint load
+            "_baseline_output",
+            "_baseline_post_args",
+            "_mutated_arg_indices",
+            "_effective_atol",
+            "_effective_rtol",
+            "_jobs",
+            "_autotune_metrics",
+            "_prepared",
+            "_skip_cache",
+            # Loaded separately via _load_crashed_configs()
+            "_crashed_config_strs",
+        }
+    )
+
+    def __getstate__(self) -> dict[str, Any]:
+        return {
+            k: v for k, v in self.__dict__.items() if k not in self._CHECKPOINT_EXCLUDE
+        }
+
+    _stable_hash: str | None = None
+
+    def _get_stable_hash(self) -> str:
+        """Get the full stable hash for this kernel's cache key (cached)."""
+        if self._stable_hash is None:
+            from .local_cache import LocalAutotuneCache
+
+            self._stable_hash = LocalAutotuneCache(self)._generate_key().stable_hash()
+        return self._stable_hash
+
+    def _try_load_checkpoint(self) -> bool:
+        """Attempt to load checkpoint from checkpoint dir. Returns True if successful."""
+        checkpoint_dir_str = self.settings.autotune_checkpoint_dir
+        if checkpoint_dir_str is None:
+            return False
+
+        checkpoint_dir = Path(checkpoint_dir_str)
+        stable_hash = self._get_stable_hash()
+        checkpoint_file = checkpoint_dir / f"{stable_hash}.pt"
+
+        if not checkpoint_file.exists():
+            return False  # No matching checkpoint; start fresh
+
+        # Matching file exists, attempt to load
+        self.log(f"Resuming from checkpoint: {checkpoint_file}")
+        try:
+            with open(checkpoint_file, "rb") as f:
+                loaded = pickle.load(f)
+        except Exception as e:
+            raise exc.CheckpointError(
+                f"Failed to load checkpoint file '{checkpoint_file}': {e}\n"
+                f"The file may be corrupted. Delete it to start fresh."
+            ) from e
+
+        # Validate stable hash matches (guards against renamed/copied files)
+        loaded_hash = getattr(loaded, "_stable_hash", None)
+        if loaded_hash is not None and loaded_hash != self._get_stable_hash():
+            raise exc.CheckpointError(
+                "Checkpoint is incompatible: kernel, hardware, or input shapes "
+                "may have changed."
+            )
+
+        # Copy loaded search state into self (self already has kernel, args,
+        # log, etc. from __init__ and _prepare())
+        self.__dict__.update(loaded.__dict__)
+
+        self.log(f"Resumed at generation {self._current_generation}")
+        return True
+
+    def _load_crashed_configs(self) -> None:
+        """Load crashed configs from {hash}.crashed_configs (written by crash-recovery script)."""
+        checkpoint_dir_str = self.settings.autotune_checkpoint_dir
+        if checkpoint_dir_str is None:
+            return
+        crashed_configs_path = (
+            Path(checkpoint_dir_str) / f"{self._get_stable_hash()}.crashed_configs"
+        )
+        if crashed_configs_path.exists():
+            self._crashed_config_strs |= {
+                line.strip()
+                for line in crashed_configs_path.read_text().splitlines()
+                if line.strip()
+            }
+        if self._crashed_config_strs:
+            self.log(
+                f"Loaded {len(self._crashed_config_strs)} crashed config(s) to skip"
+            )
+
+    def _get_pending_config_path(self) -> Path | None:
+        """Get path for pending-config sentinel, or None if checkpointing disabled."""
+        checkpoint_dir_str = self.settings.autotune_checkpoint_dir
+        if checkpoint_dir_str is None:
+            return None
+        return Path(checkpoint_dir_str) / f"{self._get_stable_hash()}.pending_config"
 
     def _compute_baseline(
         self,
@@ -1091,9 +1201,13 @@ class BaseSearch(BaseAutotuner):
                 self._precompile_args_path = args_path
             exit_stack.callback(self.cleanup)
 
-            self._init_search()
+            checkpoint_enabled = self.settings.autotune_checkpoint_dir is not None
+            if not (checkpoint_enabled and self._try_load_checkpoint()):
+                self._init_search()
             try:
                 best = self._autotune()
+                if checkpoint_enabled:
+                    self._cleanup_checkpoint()
             finally:
                 self._finalize_autotune_metrics()
         end = time.perf_counter()
@@ -1119,6 +1233,7 @@ class BaseSearch(BaseAutotuner):
         """
         Initialize the search state for a fresh autotuning run.
 
+        This method is called when starting autotuning without a checkpoint.
         Subclasses should override this to set up initial population and state.
         After this method, _current_generation should be set to the generation
         that _autotune() should start its loop from.
@@ -1134,6 +1249,68 @@ class BaseSearch(BaseAutotuner):
             NotImplementedError: If the method is not implemented.
         """
         raise NotImplementedError
+
+    def save_checkpoint(self) -> Path | None:
+        """
+        Save current autotuner state to checkpoint file.
+
+        Only saves when autotune_checkpoint_dir is set (opt-in).
+        Overwrites the same file each generation (keyed by stable hash).
+        Uses pickle to serialize the entire autotuner object (minus unpicklable
+        fields excluded by __getstate__).
+
+        Returns:
+            Path to saved checkpoint file, or None if not saved
+        """
+        from ..runtime.kernel import BoundKernel
+
+        # External kernels don't support caching/checkpointing
+        if not isinstance(self.kernel, BoundKernel):
+            return None
+
+        if not self.kernel.is_cacheable():
+            return None
+
+        checkpoint_dir_str = self.settings.autotune_checkpoint_dir
+        if checkpoint_dir_str is None:
+            return None  # Opt-in: no dir set, no saving
+
+        stable_hash = self._get_stable_hash()
+        checkpoint_dir = Path(checkpoint_dir_str)
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        checkpoint_path = checkpoint_dir / f"{stable_hash}.pt"
+
+        # Atomic write using temp file + rename
+        tmp = checkpoint_dir / f".tmp.{stable_hash}.{os.getpid()}"
+        with open(tmp, "wb") as f:
+            pickle.dump(self, f)
+        os.replace(tmp, checkpoint_path)
+
+        self.log(f"Checkpoint saved: {checkpoint_path}")
+        return checkpoint_path
+
+    def _cleanup_checkpoint(self) -> None:
+        """Delete checkpoint file on successful autotune completion.
+
+        Checkpoints are ephemeral in-progress state. Once autotuning
+        completes successfully, the result is cached normally and the
+        checkpoint is no longer needed.
+        """
+        checkpoint_dir_str = self.settings.autotune_checkpoint_dir
+        if checkpoint_dir_str is None:
+            return
+
+        stable_hash = self._get_stable_hash()
+        checkpoint_file = Path(checkpoint_dir_str) / f"{stable_hash}.pt"
+        if checkpoint_file.exists():
+            checkpoint_file.unlink()
+            self.log(f"Checkpoint cleaned up: {checkpoint_file}")
+
+        # Clean up crash-recovery artifacts
+        for suffix in (".pending_config", ".crashed_configs"):
+            artifact = Path(checkpoint_dir_str) / f"{stable_hash}{suffix}"
+            if artifact.exists():
+                artifact.unlink()
 
     def set_generation(self, generation: int) -> None:
         self._autotune_metrics.num_generations = generation
@@ -1188,6 +1365,15 @@ class PopulationMember:
     @property
     def perf(self) -> float:
         return self.perfs[-1]
+
+    def __getstate__(self) -> dict[str, Any]:
+        state = self.__dict__.copy()
+        state["fn"] = None  # compiled functions are not picklable
+        return state
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        self.__dict__.update(state)
+        self.fn = _unset_fn
 
 
 def performance(member: PopulationMember) -> float:
@@ -1589,6 +1775,8 @@ class PopulationBasedSearch(BaseSearch):
             return
         self._current_generation = generation
         super().set_generation(generation)
+        if generation > 0 and self.settings.autotune_checkpoint_dir is not None:
+            self.save_checkpoint()
 
     def statistics(self) -> str:
         """
@@ -1598,6 +1786,30 @@ class PopulationBasedSearch(BaseSearch):
             A string summarizing the population performance.
         """
         return population_statistics(self.population)
+
+    def _try_load_checkpoint(self) -> bool:
+        if not super()._try_load_checkpoint():
+            return False
+        # Recompile kernel functions for population members after checkpoint load
+        recompile_failures: list[tuple[PopulationMember, str]] = []
+        for member in self.population:
+            if member.fn is _unset_fn and member.status == "ok":
+                try:
+                    member.fn = self.kernel.compile_config(
+                        member.config, allow_print=False
+                    )
+                except Exception as e:
+                    member.fn = _unset_fn
+                    member.status = "error"
+                    member.perfs.append(inf)  # Ensure member won't be selected as best
+                    recompile_failures.append((member, str(e)))
+
+        if recompile_failures:
+            self.log(
+                f"Warning: {len(recompile_failures)} config(s) failed to recompile "
+                f"and will be skipped. First failure: {recompile_failures[0][1]}"
+            )
+        return True
 
     def run_finishing_phase(
         self, best: PopulationMember, rounds: int
