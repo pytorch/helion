@@ -313,8 +313,7 @@ class IncompatibleInterpretModes(BaseError):
 class FusionAutotuneRequiresTorchCompileFusion(BaseError):
     location_suffix = ""
     message = (
-        "autotune_with_torch_compile_fusion=True requires torch_compile_fusion=True. "
-        "Either enable torch_compile_fusion or disable autotune_with_torch_compile_fusion."
+        "autotune_with_torch_compile_fusion=True requires torch_compile_fusion=True."
     )
 
 
