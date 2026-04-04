@@ -16,7 +16,8 @@ on:
         #   rms_norm: InductorLoweringError in torch.mean reduction codegen for fori_loop/emit_pipeline
         #   geglu/swiglu: autotuning takes >15min per kernel (large shape 8x2048x4096), many configs fail to compile
         #   low_mem_dropout: ~37% element accuracy mismatch on all configs except block_sizes=[128]
-        default: "exp,add,softmax_two_pass,welford,layer_norm"
+        #   layer_norm: OOB slice when reduction_loops doesn't evenly divide the reduction dim (gh#1937)
+        default: "exp,add,softmax_two_pass,welford"
 
 permissions:
   contents: read
@@ -27,4 +28,4 @@ jobs:
     permissions:
       contents: read
     with:
-      kernels: ${{ github.event.inputs.kernels || 'exp,add,softmax_two_pass,welford,layer_norm' }}
+      kernels: ${{ github.event.inputs.kernels || 'exp,add,softmax_two_pass,welford' }}

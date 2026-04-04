@@ -107,7 +107,6 @@ KERNEL_MAPPINGS: dict[str, KernelMapping] = {
         _softmax_shapes,
     ),
     "welford": ("welford", "welford", None, None),
-    "layer_norm": ("layer_norm", "layer_norm", None, None),
 }
 
 
