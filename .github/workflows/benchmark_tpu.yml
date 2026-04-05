@@ -16,7 +16,7 @@ jobs:
 
     env:
       HELION_BACKEND: pallas
-      HELION_AUTOTUNE_LOG_LEVEL: DEBUG
+      HELION_AUTOTUNE_LOG_LEVEL: INFO
 
     runs-on: linux.google.tpuv7x.1
 
