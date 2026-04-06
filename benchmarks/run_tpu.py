@@ -35,6 +35,7 @@ from typing import Any
 from typing import Callable
 
 import torch
+from torch import nn
 
 from helion._testing import DEVICE
 from helion._testing import run_example
@@ -83,6 +84,98 @@ def _softmax_shapes() -> list[tuple[str, tuple[Any, ...]]]:
     ]
 
 
+def _welford_shapes() -> list[tuple[str, tuple[Any, ...]]]:
+    configs = [(262144, 1024), (262144, 1536), (262144, 2048)]
+    return [
+        (
+            f"[{s},{d}]",
+            (
+                torch.rand(d, device=DEVICE, dtype=torch.float32),
+                torch.rand(d, device=DEVICE, dtype=torch.float32),
+                torch.rand(s, d, device=DEVICE, dtype=torch.float32),
+            ),
+        )
+        for s, d in configs
+    ]
+
+
+def _welford_baseline(
+    weight: torch.Tensor, bias: torch.Tensor, x: torch.Tensor, eps: float = 1e-05
+) -> torch.Tensor:
+    return torch.nn.functional.layer_norm(
+        x, normalized_shape=[x.shape[-1]], weight=weight, bias=bias, eps=eps
+    )
+
+
+def _attention_shapes() -> list[tuple[str, tuple[Any, ...]]]:
+    configs = [
+        (1, 4, 256, 64),
+        (1, 4, 512, 64),
+        (1, 4, 1024, 64),
+        (2, 8, 512, 64),
+    ]
+    return [
+        (
+            f"[{z},{h},{n},{d}]",
+            tuple(
+                torch.randn(z, h, n, d, device=DEVICE, dtype=torch.float32)
+                for _ in range(3)
+            ),
+        )
+        for z, h, n, d in configs
+    ]
+
+
+def _bmm_shapes() -> list[tuple[str, tuple[Any, ...]]]:
+    configs = [(16, 512, 768, 1024), (8, 256, 512, 256), (4, 1024, 512, 512)]
+    return [
+        (
+            f"[{b},{m},{k},{n}]",
+            (
+                torch.randn(b, m, k, device=DEVICE, dtype=torch.bfloat16),
+                torch.randn(b, k, n, device=DEVICE, dtype=torch.bfloat16),
+            ),
+        )
+        for b, m, k, n in configs
+    ]
+
+
+def _geglu_shapes() -> list[tuple[str, tuple[Any, ...]]]:
+    shapes = [(1024, 512), (2048, 1024), (4096, 2048)]
+    return [
+        (
+            f"[{m},{n}]",
+            (
+                torch.randn(m, n, device=DEVICE, dtype=torch.bfloat16),
+                torch.randn(m, n, device=DEVICE, dtype=torch.bfloat16),
+            ),
+        )
+        for m, n in shapes
+    ]
+
+
+def _geglu_baseline(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    return nn.functional.gelu(a, approximate="tanh").to(b.dtype) * b
+
+
+def _swiglu_shapes() -> list[tuple[str, tuple[Any, ...]]]:
+    shapes = [(1024, 512), (2048, 1024), (4096, 2048)]
+    return [
+        (
+            f"[{m},{n}]",
+            (
+                torch.randn(m, n, device=DEVICE, dtype=torch.bfloat16),
+                torch.randn(m, n, device=DEVICE, dtype=torch.bfloat16),
+            ),
+        )
+        for m, n in shapes
+    ]
+
+
+def _swiglu_baseline(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    return nn.functional.silu(a).to(b.dtype) * b
+
+
 # Kernel mappings for TPU/Pallas benchmarks.
 # Format: kernel_name -> (module_file, kernel_fn_name, baseline_fn, shapes_fn)
 #   module_file: filename in examples/ (without .py)
@@ -106,20 +199,24 @@ KERNEL_MAPPINGS: dict[str, KernelMapping] = {
         functools.partial(torch.softmax, dim=-1),
         _softmax_shapes,
     ),
-    "welford": ("welford", "welford", None, None),
-    "attention": ("attention", "attention", None, None),
-    "bmm": ("bmm", "bmm", None, None),
-    "geglu": ("geglu", "geglu", None, None),
-    "grpo_loss": ("grpo_loss", "grpo_loss_forward", None, None),
-    "jagged_hstu_attn": (
-        "jagged_hstu_attn",
-        "_helion_jagged_attention_kernel",
-        None,
-        None,
+    "welford": ("welford", "welford", _welford_baseline, _welford_shapes),
+    "attention": (
+        "attention",
+        "attention",
+        torch.nn.functional.scaled_dot_product_attention,
+        _attention_shapes,
     ),
+    "bmm": ("bmm", "bmm", torch.bmm, _bmm_shapes),
+    "geglu": ("geglu", "geglu", _geglu_baseline, _geglu_shapes),
+    # low_mem_dropout uses a seed-based API (p, x, seed) with no direct torch
+    # equivalent, so we fall back to calling its main() function.
     "low_mem_dropout": ("low_mem_dropout", "low_mem_dropout", None, None),
-    "swiglu": ("swiglu", "swiglu_fwd", None, None),
+    "swiglu": ("swiglu", "swiglu_fwd", _swiglu_baseline, _swiglu_shapes),
 }
+
+# Kernels removed from the benchmark:
+# - grpo_loss: autotuning finds no working config on CI (all configs fail)
+# - jagged_hstu_attn: default config fails while computing baseline on CI
 
 
 @dataclass
