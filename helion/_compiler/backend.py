@@ -1178,11 +1178,18 @@ class PallasBackend(Backend):
                                     tensor_ndim,
                                 )
 
-        for i, spec in enumerate(block_specs):
+        for spec in block_specs:
             if not isinstance(spec, BlockSizeSpec):
                 continue
             bid = spec.block_ids[0]
-            dfe = min_dim_from_end.get(bid, ndim - 1 - i)
+            dfe = min_dim_from_end.get(bid)
+            if dfe is None:
+                # No tensor dim mapping found — skip alignment
+                # constraints.  The fallback (ndim - 1 - i) assumes
+                # spec ordering matches tensor dim ordering which is
+                # not always true (e.g. hl.tile([M, N, B]) where B
+                # is the first tensor dim but last spec).
+                continue
             if dfe == 0:
                 tndim = min_tensor_ndim.get(bid, ndim)
                 alignment = tiling_1d if tndim <= 1 else 128

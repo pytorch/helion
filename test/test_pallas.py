@@ -548,6 +548,65 @@ class TestPallas(TestCase):
         expected = torch.nn.functional.softmax(x, dim=-1)
         torch.testing.assert_close(result, expected, rtol=1e-4, atol=1e-4)
 
+    def test_scalar_index_transpose(self) -> None:
+        """Scalar .begin index should collapse the dimension.
+
+        In Triton, a scalar SymInt index (like tile.begin) eliminates
+        the dimension from the result. In Pallas, _pallas_index_str
+        emits ':' instead, keeping all dimensions. This causes .T to
+        fail because it gets a 3D tensor when the IR expects 2D.
+        """
+
+        @helion.kernel(
+            backend="pallas",
+            static_shapes=True,
+            config=helion.Config(block_sizes=[32, 32, 1]),
+        )
+        def scalar_index_transpose(x: torch.Tensor) -> torch.Tensor:
+            B, M, N = x.shape
+            out = torch.empty([B, N, M], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n, tile_b in hl.tile([M, N, B]):
+                # tile_b has block_size=1, so .begin is used as a scalar index
+                out[tile_b.begin, tile_n, tile_m] = x[tile_b.begin, tile_m, tile_n].T
+            return out
+
+        x = torch.randn(4, 64, 64, device=DEVICE, dtype=torch.float32)
+        _code, result = code_and_output(scalar_index_transpose, (x,))
+        expected = x.permute(0, 2, 1)
+        torch.testing.assert_close(result, expected)
+
+    def test_scalar_index_with_none(self) -> None:
+        """Scalar .begin + None indexing: out_pos must not count collapsed dims.
+
+        When .begin collapses a dim and None appears later in the same
+        subscript, the None position in the output must account for the
+        collapsed dim.  Without the fix, jnp.expand_dims uses the wrong
+        axis.
+        """
+
+        @helion.kernel(
+            backend="pallas",
+            static_shapes=True,
+            config=helion.Config(block_sizes=[32, 32, 1]),
+        )
+        def scalar_index_with_none(
+            x: torch.Tensor, scale: torch.Tensor
+        ) -> torch.Tensor:
+            B, M, N = x.shape
+            out = torch.empty([B, M, N], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n, tile_b in hl.tile([M, N, B]):
+                # .begin collapses B dim, then scale[None, :] broadcasts
+                out[tile_b.begin, tile_m, tile_n] = (
+                    x[tile_b.begin, tile_m, tile_n] * scale[None, tile_n]
+                )
+            return out
+
+        x = torch.randn(4, 64, 64, device=DEVICE, dtype=torch.float32)
+        scale = torch.randn(64, device=DEVICE, dtype=torch.float32)
+        _code, result = code_and_output(scalar_index_with_none, (x, scale))
+        expected = x * scale[None, None, :]
+        torch.testing.assert_close(result, expected)
+
 
 if __name__ == "__main__":
     unittest.main()

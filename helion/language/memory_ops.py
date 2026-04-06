@@ -207,6 +207,18 @@ def _pallas_index_str(
             out_pos += 1
             continue
         block_id = _resolve_block_id(env, idx, tensor, tensor_dim)
+        if block_id is not None and _is_scalar_tile_offset(idx):
+            # Scalar .begin index — emit literal 0 to collapse this
+            # dimension, mirroring Triton's scalar SymInt handling
+            # (indexing_strategy.py:1024-1033).  Record in dim_map so
+            # the BlockSpec tiles this dim (typically to size 1); the
+            # kernel receives a size-1 slice and index 0 eliminates it.
+            # Don't increment out_pos — the dim is collapsed from the
+            # output, so subsequent None positions stay correct.
+            parts.append("0")
+            dim_map.setdefault(tensor_dim, block_id)
+            tensor_dim += 1
+            continue
         if block_id is not None:
             is_device_loop = False
             if in_pipeline and block_id in pipeline_block_ids:
@@ -241,6 +253,24 @@ def _resolve_block_id(
     if isinstance(idx, slice) and idx == slice(None):
         return env.resolve_block_id(tensor.shape[pos])
     return None
+
+
+def _is_scalar_tile_offset(idx: object) -> bool:
+    """Return True if *idx* is a tile.begin scalar offset.
+
+    In Triton, scalar SymInts without BlockSizeOrigin eliminate the
+    dimension from the result.  Pallas needs the same behavior: emit
+    a scalar index to collapse the dim.
+    """
+    if not isinstance(idx, torch.SymInt):
+        return False
+    import sympy
+
+    expr = _symint_expr(idx)
+    if not isinstance(expr, sympy.Symbol):
+        return False
+    origin_info = HostFunction.current().expr_to_origin.get(expr)
+    return origin_info is not None and isinstance(origin_info.origin, TileBeginOrigin)
 
 
 def _pallas_ds_expr(state: CodegenState, block_id: int) -> str:

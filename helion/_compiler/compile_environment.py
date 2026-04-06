@@ -46,6 +46,7 @@ from .variable_origin import BlockSizeOrigin
 from .variable_origin import GridOrigin
 from .variable_origin import Origin
 from .variable_origin import TensorSizeOrigin
+from .variable_origin import TileBeginOrigin
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -813,8 +814,11 @@ class CompileEnvironment:
                 BlockSizeOrigin,
             ):
                 return origin_info.origin.block_id
-            if origin_info is not None and type(origin_info.origin) is GridOrigin:
-                return origin_info.origin.block_id
+            if origin_info is not None and type(origin_info.origin) in (
+                GridOrigin,
+                TileBeginOrigin,
+            ):
+                return origin_info.origin.block_id  # pyrefly: ignore[missing-attribute]
         return None
 
     def resolve_block_id(self, size: object) -> int | None:
