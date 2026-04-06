@@ -223,12 +223,11 @@ KERNEL_MAPPINGS: dict[str, KernelMapping] = {
     ),
     "bmm": ("bmm", "bmm", torch.bmm, _bmm_shapes),
     "geglu": ("geglu", "geglu", _geglu_baseline, _geglu_shapes),
-    "low_mem_dropout": (
-        "low_mem_dropout",
-        "low_mem_dropout",
-        _low_mem_dropout_baseline,
-        _low_mem_dropout_shapes,
-    ),
+    # low_mem_dropout: correctness can't be checked via run_example because the
+    # helion kernel uses a deterministic seed-based mask while torch.nn.functional.dropout
+    # uses a random mask — outputs always differ.  Fall back to main() which
+    # verifies forward/backward mask consistency instead.
+    "low_mem_dropout": ("low_mem_dropout", "low_mem_dropout", None, None),
     "swiglu": ("swiglu", "swiglu_fwd", _swiglu_baseline, _swiglu_shapes),
 }
 
