@@ -665,7 +665,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x, y, z),
             kernels=[k_add],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=2 if allow_torch_compile_fusion else None,
+            expected_num_kernels=1 if allow_torch_compile_fusion else None,
             kernels_ref=[k_add_ref],
             expected_num_kernels_ref=1,
         )
@@ -698,7 +698,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x, y, scale),
             kernels=[k_add_inplace],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=4 if allow_torch_compile_fusion else None,
+            expected_num_kernels=3 if allow_torch_compile_fusion else None,
             kernels_ref=[k_add_inplace_ref],
             expected_num_kernels_ref=1,
         )
@@ -752,7 +752,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x, y, z),
             kernels=[k_add],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=2 if allow_torch_compile_fusion else None,
+            expected_num_kernels=1 if allow_torch_compile_fusion else None,
             kernels_ref=[k_add_ref],
             expected_num_kernels_ref=1,
         )
@@ -777,7 +777,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x, y, z),
             kernels=[k_add],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=2 if allow_torch_compile_fusion else None,
+            expected_num_kernels=1 if allow_torch_compile_fusion else None,
             kernels_ref=[k_add_ref],
             expected_num_kernels_ref=1,
         )
@@ -823,7 +823,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             rtol=1e-3,
             atol=1e-3,
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=2 if allow_torch_compile_fusion else None,
+            expected_num_kernels=1 if allow_torch_compile_fusion else None,
             kernels_ref=[k_add_ref],
             expected_num_kernels_ref=1,
         )
@@ -836,7 +836,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             rtol=1e-3,
             atol=1e-3,
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=2 if allow_torch_compile_fusion else None,
+            expected_num_kernels=1 if allow_torch_compile_fusion else None,
             kernels_ref=[k_add_ref],
             expected_num_kernels_ref=1,
         )
@@ -895,7 +895,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x, y, scale),
             kernels=[k_add],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=3 if allow_torch_compile_fusion else None,
+            expected_num_kernels=2 if allow_torch_compile_fusion else None,
             kernels_ref=[k_add_ref],
             expected_num_kernels_ref=1,
         )
@@ -932,7 +932,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x, y, z, scale),
             kernels=[k_add],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=3 if allow_torch_compile_fusion else None,
+            expected_num_kernels=2 if allow_torch_compile_fusion else None,
             kernels_ref=[k_add_ref],
             expected_num_kernels_ref=1,
         )
@@ -961,7 +961,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             rtol=1e-2,
             atol=1e-2,
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=3 if allow_torch_compile_fusion else None,
+            expected_num_kernels=2 if allow_torch_compile_fusion else None,
             kernels_ref=[k_add_ref],
             expected_num_kernels_ref=1,
         )
@@ -1092,7 +1092,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             rtol=1e-3,
             atol=1e-3,
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=3 if allow_torch_compile_fusion else None,
+            expected_num_kernels=2 if allow_torch_compile_fusion else None,
             kernels_ref=[k_sum_rows_ref],
             expected_num_kernels_ref=2,
         )
@@ -1213,7 +1213,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x, y, scale),
             kernels=[k_mutate_permuted],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=4 if allow_torch_compile_fusion else None,
+            expected_num_kernels=3 if allow_torch_compile_fusion else None,
             kernels_ref=[k_mutate_permuted_ref],
             expected_num_kernels_ref=1,
         )
@@ -1375,7 +1375,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (module, x),
             kernels=[k_add],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=2 if allow_torch_compile_fusion else None,
+            expected_num_kernels=1 if allow_torch_compile_fusion else None,
             kernels_ref=[k_add_ref],
             expected_num_kernels_ref=1,
         )
@@ -1585,7 +1585,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x, y, scale),
             kernels=[k_create_return_view],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=3 if allow_torch_compile_fusion else None,
+            expected_num_kernels=2 if allow_torch_compile_fusion else None,
             kernels_ref=[k_create_return_view_ref],
             expected_num_kernels_ref=1,
         )
