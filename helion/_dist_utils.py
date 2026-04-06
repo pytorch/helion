@@ -78,6 +78,9 @@ def is_symm_mem_tensor(t: Tensor, process_group_name: str | None = None) -> bool
     if not isinstance(t, Tensor) or not dist.is_initialized():
         return False
 
+    if hasattr(symm_mem, "is_symm_mem_tensor"):
+        return symm_mem.is_symm_mem_tensor(t)
+
     assert process_group_name is not None
     try:
         hdl = symm_mem.rendezvous(
