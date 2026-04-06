@@ -138,7 +138,7 @@ jobs:
       id-token: write
       contents: read
     with:
-      runner: linux.rocm.gpu.gfx950.1
+      runner: linux.rocm.gpu.ecosystem.gfx950.1.test
       python-version: "3.12"
       image: rocm/dev-ubuntu-24.04:7.1.1-complete
       runtime-version: rocm7.1
