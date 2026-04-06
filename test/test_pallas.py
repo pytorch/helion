@@ -540,7 +540,6 @@ class TestPallas(TestCase):
         expected = (x.float() @ y.float() + bias.float()).to(torch.bfloat16)
         torch.testing.assert_close(result, expected, rtol=1e-2, atol=1e-2)
 
-    @xfailIfPallas("RDIM_SIZE rounded to next power of 2 causes shape mismatch")
     def test_reduce_non_pow2(self) -> None:
         """Reduction over non-power-of-2 dim should use exact size, not rounded."""
         x = torch.randn(128, 1000, device=DEVICE, dtype=torch.float32)

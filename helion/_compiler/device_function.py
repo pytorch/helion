@@ -855,7 +855,7 @@ class DeviceFunction:
         for var_name, expr in self.deferred_rdim_defs:
             expr_str = HostFunction.current().sympy_expr(expr)
             stmt = statement_from_string(
-                f"{var_name} = {backend.next_power_of_2_host_expr(expr_str)}"
+                f"{var_name} = {backend.dynamic_rdim_size_expr(expr_str)}"
             )
             codegen.host_statements.append(stmt)
         self.deferred_rdim_defs.clear()
