@@ -172,6 +172,21 @@ def _swiglu_shapes() -> list[tuple[str, tuple[Any, ...]]]:
     ]
 
 
+def _low_mem_dropout_shapes() -> list[tuple[str, tuple[Any, ...]]]:
+    sizes = [4096, 16384, 65536, 262144]
+    return [
+        (
+            f"[{n}]",
+            (0.25, torch.randn(n, device=DEVICE, dtype=torch.float32), 123),
+        )
+        for n in sizes
+    ]
+
+
+def _low_mem_dropout_baseline(p: float, x: torch.Tensor, seed: int) -> torch.Tensor:
+    return nn.functional.dropout(x, p=p, training=True)
+
+
 def _swiglu_baseline(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     return nn.functional.silu(a).to(b.dtype) * b
 
@@ -208,9 +223,12 @@ KERNEL_MAPPINGS: dict[str, KernelMapping] = {
     ),
     "bmm": ("bmm", "bmm", torch.bmm, _bmm_shapes),
     "geglu": ("geglu", "geglu", _geglu_baseline, _geglu_shapes),
-    # low_mem_dropout uses a seed-based API (p, x, seed) with no direct torch
-    # equivalent, so we fall back to calling its main() function.
-    "low_mem_dropout": ("low_mem_dropout", "low_mem_dropout", None, None),
+    "low_mem_dropout": (
+        "low_mem_dropout",
+        "low_mem_dropout",
+        _low_mem_dropout_baseline,
+        _low_mem_dropout_shapes,
+    ),
     "swiglu": ("swiglu", "swiglu_fwd", _swiglu_baseline, _swiglu_shapes),
 }
 
