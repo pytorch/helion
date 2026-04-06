@@ -214,10 +214,6 @@ KERNEL_MAPPINGS: dict[str, KernelMapping] = {
     "swiglu": ("swiglu", "swiglu_fwd", _swiglu_baseline, _swiglu_shapes),
 }
 
-# Kernels removed from the benchmark:
-# - grpo_loss: autotuning finds no working config on CI (all configs fail)
-# - jagged_hstu_attn: default config fails while computing baseline on CI
-
 
 @dataclass
 class ShapeResult:
