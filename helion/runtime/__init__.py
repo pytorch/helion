@@ -177,11 +177,19 @@ def default_launcher(
 def _pallas_make_block_spec(
     pl: object,
     jnp: object,
+    pltpu: object,
     tensor: torch.Tensor,
     entry: tuple[tuple[int | None, ...], tuple[int | tuple[int, int, int] | None, ...]]
     | None,
+    should_use_smem: bool = False,
 ) -> object:
     """Build one ``pl.BlockSpec`` from compile-time ``(block_shape, grid_dims)``."""
+
+    memory_space = None  # default value (pallas will default to VMEM)
+    if should_use_smem:
+        # pyrefly: ignore[missing-attribute]
+        memory_space = pltpu.SMEM
+
     if entry is None:
         ndim = tensor.ndim
         full_shape = tuple(tensor.shape)
@@ -190,7 +198,7 @@ def _pallas_make_block_spec(
             # pyrefly: ignore[missing-attribute]
             return tuple(jnp.int32(0) for _ in range(_nd))
 
-        return pl.BlockSpec(full_shape, index_map_full)  # type: ignore[union-attr]
+        return pl.BlockSpec(full_shape, index_map_full, memory_space=memory_space)  # type: ignore[union-attr]
 
     block_shape_template, grid_dims = entry
     block_shape = tuple(
@@ -221,7 +229,7 @@ def _pallas_make_block_spec(
     ) -> tuple[object, ...]:
         return tuple(_index_for_dim(grid_args, g) for g in _grid_dims)
 
-    return pl.BlockSpec(block_shape, index_map)  # type: ignore[union-attr]
+    return pl.BlockSpec(block_shape, index_map, memory_space=memory_space)  # type: ignore[union-attr]
 
 
 # Per-tensor block spec info: see ``_pallas_make_block_spec``.
@@ -235,11 +243,13 @@ _BlockSpecInfo = list[
 def _pallas_build_block_specs(
     pl: object,
     jnp: object,
+    pltpu: object,
     grid: tuple[int, ...],
     args: tuple[object, ...],
     tensor_arg_indices: list[int],
     output_indices: list[int],
     block_spec_info: _BlockSpecInfo | None = None,
+    _smem_arg_indices: list[int] | None = None,
 ) -> tuple[list[object] | None, object | None]:
     """Build ``in_specs`` and ``out_specs`` for ``pl.pallas_call``."""
     if block_spec_info is None or len(grid) == 0:
@@ -249,8 +259,11 @@ def _pallas_build_block_specs(
     for tensor_pos, idx in enumerate(tensor_arg_indices):
         t = args[idx]
         assert isinstance(t, torch.Tensor)
+        should_use_smem = tensor_pos in (_smem_arg_indices or [])
         in_specs.append(
-            _pallas_make_block_spec(pl, jnp, t, block_spec_info[tensor_pos])
+            _pallas_make_block_spec(
+                pl, jnp, pltpu, t, block_spec_info[tensor_pos], should_use_smem
+            )
         )
 
     arg_to_tensor_pos = {orig: tpos for tpos, orig in enumerate(tensor_arg_indices)}
@@ -258,8 +271,16 @@ def _pallas_build_block_specs(
     for idx in output_indices:
         t = args[idx]
         assert isinstance(t, torch.Tensor)
+        should_use_smem = arg_to_tensor_pos[idx] in (_smem_arg_indices or [])
         out_specs_list.append(
-            _pallas_make_block_spec(pl, jnp, t, block_spec_info[arg_to_tensor_pos[idx]])
+            _pallas_make_block_spec(
+                pl,
+                jnp,
+                pltpu,
+                t,
+                block_spec_info[arg_to_tensor_pos[idx]],
+                should_use_smem,
+            )
         )
 
     out_specs = out_specs_list if len(out_specs_list) > 1 else out_specs_list[0]
@@ -292,7 +313,7 @@ def _pallas_build_pipeline_specs(
             t = args[idx]
             assert isinstance(t, torch.Tensor)
             return _pallas_make_block_spec(
-                pl, jnp, t, block_spec_info[arg_to_tpos[idx]]
+                pl, jnp, pltpu, t, block_spec_info[arg_to_tpos[idx]]
             )
         return pl.BlockSpec(memory_space=pl.ANY)  # type: ignore[union-attr]
 
@@ -387,6 +408,7 @@ def _pallas_make_reordered_kernel(
     arg_to_tensor_pos: dict[int, int],
     n_extra_refs: int = 0,
     skip_inplace_copy: bool = False,
+    _smem_arg_indices: list[int] | None = None,
 ) -> object:
     """Create a wrapper kernel that reorders pallas_call refs to the original arg order.
 
@@ -412,7 +434,12 @@ def _pallas_make_reordered_kernel(
             out_ref = refs[n_tensor_inputs + out_idx]
             if orig_pos in inplace_positions and not skip_inplace_copy:
                 in_ref = refs[arg_to_tensor_pos[orig_pos]]
-                out_ref[...] = in_ref[...]  # type: ignore[index]
+                if _smem_arg_indices is not None and orig_pos in _smem_arg_indices:
+                    # [...] cannot be used for SMEMs,
+                    # TODO(dunfanlu): handle in-place copy for SMEM refs
+                    pass
+                else:
+                    out_ref[...] = in_ref[...]  # type: ignore[index]
             original_order[orig_pos] = out_ref
         extra_refs = refs[n_tensor_inputs + len(_output_indices) :]
         pallas_kernel(*original_order, *extra_refs)  # type: ignore[operator]
@@ -533,6 +560,7 @@ def default_pallas_launcher(
     *args: object,
     _output_indices: list[int] | None = None,
     _block_spec_info: _BlockSpecInfo | None = None,
+    _smem_arg_indices: list[int] | None = None,
     **kwargs: object,
 ) -> None:
     """Default launcher for Pallas kernels on TPU (or CPU with interpret=True).
@@ -551,6 +579,7 @@ def default_pallas_launcher(
         _, jax_callable, tensor_arg_indices = cache
     else:
         from jax.experimental import pallas as pl
+        from jax.experimental.pallas import tpu as pltpu
         import jax.numpy as jnp
 
         (
@@ -567,11 +596,13 @@ def default_pallas_launcher(
         in_specs, out_specs = _pallas_build_block_specs(
             pl,
             jnp,
+            pltpu,
             grid,
             args,
             tensor_arg_indices,
             _output_indices,
             _block_spec_info,
+            _smem_arg_indices,
         )
 
         reordered_kernel = _pallas_make_reordered_kernel(
@@ -583,6 +614,7 @@ def default_pallas_launcher(
             _output_indices,
             inplace_positions,
             arg_to_tensor_pos,
+            _smem_arg_indices=_smem_arg_indices,
         )
 
         out_shape_arg = out_shapes if len(out_shapes) > 1 else out_shapes[0]

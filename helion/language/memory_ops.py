@@ -226,6 +226,10 @@ def _pallas_index_str(
         out_pos += 1
         tensor_dim += 1
 
+    requries_smem_access = all(":" not in p and "pl.ds" not in p for p in parts)
+    if requries_smem_access:
+        state.codegen.device_function.pallas_smem_tensor_ids.add(id(tensor))
+
     return ", ".join(parts), none_dims
 
 
