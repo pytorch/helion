@@ -111,7 +111,12 @@ KERNEL_MAPPINGS: dict[str, KernelMapping] = {
     "bmm": ("bmm", "bmm", None, None),
     "geglu": ("geglu", "geglu", None, None),
     "grpo_loss": ("grpo_loss", "grpo_loss_forward", None, None),
-    "jagged_hstu_attn": ("jagged_hstu_attn", "_helion_jagged_attention_kernel", None, None),
+    "jagged_hstu_attn": (
+        "jagged_hstu_attn",
+        "_helion_jagged_attention_kernel",
+        None,
+        None,
+    ),
     "low_mem_dropout": ("low_mem_dropout", "low_mem_dropout", None, None),
     "swiglu": ("swiglu", "swiglu_fwd", None, None),
 }
