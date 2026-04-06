@@ -4,6 +4,7 @@ import ast
 import collections
 import dataclasses
 from typing import TYPE_CHECKING
+from typing import ClassVar
 from typing import NamedTuple
 
 import sympy
@@ -166,8 +167,9 @@ class IndexingStrategy:
     ) -> ast.AST:
         raise NotImplementedError
 
-    def codegen_atomic_add(
+    def codegen_atomic(
         self,
+        op: str,
         state: CodegenState,
         fake_tensor: torch.Tensor,
         subscript: list[object],
@@ -315,8 +317,9 @@ class PointerIndexingStrategy(IndexingStrategy):
             mask=indexing.mask_expr,
         )
 
-    def codegen_atomic_add(
+    def codegen_atomic(
         self,
+        op: str,
         state: CodegenState,
         fake_tensor: torch.Tensor,
         subscript: list[object],
@@ -326,7 +329,7 @@ class PointerIndexingStrategy(IndexingStrategy):
         indexing = SubscriptIndexing.create(state, fake_tensor, subscript)
         name = state.device_function.tensor_arg(fake_tensor).name
         return expr_from_string(
-            f"tl.atomic_add({name} + {{offset}}, {{value}}, mask={{mask}}, sem={{sem}})",
+            f"tl.{op}({name} + {{offset}}, {{value}}, mask={{mask}}, sem={{sem}})",
             offset=indexing.index_expr,
             value=value,
             mask=indexing.mask_expr,
@@ -392,7 +395,6 @@ class BlockPtrIndexingStrategy(IndexingStrategy):
             block_ptr=indexing.make_block_ptr(state),
             value=store_value,
         )
-
 
 
 class TensorDescriptorIndexingStrategy(IndexingStrategy):
@@ -573,23 +575,37 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
             value=store_value,
         )
 
-    def codegen_atomic_add(
+    # Ops supported by TMA cp.reduce.async.bulk.tensor via Triton descriptor API
+    _TMA_ATOMIC_OPS: ClassVar[set[str]] = {
+        "atomic_add",
+        "atomic_and",
+        "atomic_max",
+        "atomic_min",
+        "atomic_or",
+        "atomic_xor",
+    }
+
+    def codegen_atomic(
         self,
+        op: str,
         state: CodegenState,
         fake_tensor: torch.Tensor,
         subscript: list[object],
         value: ast.AST,
         sem: ast.AST,
     ) -> ast.AST:
-        fallback = PointerIndexingStrategy().codegen_atomic_add
-        # Descriptor atomic_add returns void; fall back if the return value is used
+        fallback = PointerIndexingStrategy().codegen_atomic
+        # Only certain ops are supported by TMA reduce
+        if op not in self._TMA_ATOMIC_OPS:
+            return fallback(op, state, fake_tensor, subscript, value, sem)
+        # Descriptor atomics return void; fall back if the return value is used
         if state.fx_node is not None and len(state.fx_node.users) > 0:
-            return fallback(state, fake_tensor, subscript, value, sem)
-        # Descriptor atomic_add has no sem parameter; fall back for non-relaxed
+            return fallback(op, state, fake_tensor, subscript, value, sem)
+        # Descriptor atomics have no sem parameter; fall back for non-relaxed
         if isinstance(sem, ast.Constant) and sem.value != "relaxed":
-            return fallback(state, fake_tensor, subscript, value, sem)
+            return fallback(op, state, fake_tensor, subscript, value, sem)
         if not self.is_supported(state, fake_tensor, subscript):
-            return fallback(state, fake_tensor, subscript, value, sem)
+            return fallback(op, state, fake_tensor, subscript, value, sem)
         indexing = BlockedSubscriptIndexing.create(state, fake_tensor, subscript)
         desc_arg = indexing.tensor_descriptor_arg(state)
         atomic_value = indexing.reshape_store(state, value)
@@ -601,7 +617,7 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
             )
 
         return expr_from_string(
-            f"{indexing.tensor_descriptor(state)}.atomic_add({indexing.offsets_str_permuted(state)}, {{value}})",
+            f"{indexing.tensor_descriptor(state)}.{op}({indexing.offsets_str_permuted(state)}, {{value}})",
             value=atomic_value,
         )
 

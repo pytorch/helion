@@ -1744,7 +1744,7 @@ def _count_device_atomics(device_ir: DeviceIR) -> int:
     atomic_count = 0
     for graph_info in device_ir.graphs:
         for node in graph_info.graph.nodes:
-            if node.op == "call_function" and node.target is atomic_ops.atomic_add:
+            if node.op == "call_function" and node.target in vars(atomic_ops).values():
                 atomic_count += 1
     return atomic_count
 

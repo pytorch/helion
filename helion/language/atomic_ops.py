@@ -59,8 +59,9 @@ def _prepare_mem_args(
 
 
 def _codegen_common(
-    tl_func: str, state: CodegenState, value_exprs: list[ast.AST]
+    op: str, state: CodegenState, value_exprs: list[ast.AST]
 ) -> ast.AST:
+    """Route any single-value atomic op through the atomic_indexing strategy."""
     target = state.proxy_arg(0)
     index = state.proxy_arg(1)
     sem = expr_from_string(repr(state.proxy_arg(len(state.ast_args) - 1)))
@@ -70,23 +71,13 @@ def _codegen_common(
 
     host_function = HostFunction.current()
     if target not in host_function.tensor_to_origin:
-        raise exc.AtomicOnDeviceTensor(tl_func)
+        raise exc.AtomicOnDeviceTensor(op)
 
-    indices = SubscriptIndexing.create(state, target, index)
-    name = state.device_function.tensor_arg(target).name
-
-    placeholder_names = [f"v{i}" for i in range(len(value_exprs))]
-    values_section = (
-        ", " + ", ".join([f"{{{n}}}" for n in placeholder_names]) if value_exprs else ""
-    )
-    placeholders = dict(zip(placeholder_names, value_exprs, strict=False))
-    return expr_from_string(
-        f"tl.{tl_func}({name} + {{offset}}{values_section}, mask={{mask}}, sem={{sem}})",
-        offset=indices.index_expr,
-        mask=indices.mask_expr,
-        sem=sem,
-        **placeholders,
-    )
+    device_fn = state.device_function
+    indexing_idx = device_fn.atomic_op_index
+    device_fn.atomic_op_index += 1
+    strategy = device_fn.get_atomic_indexing_strategy(indexing_idx)
+    return strategy.codegen_atomic(op, state, target, index, value_exprs[0], sem)
 
 
 def _cute_pointer_expr(
@@ -590,23 +581,8 @@ def _(
 
 @_decorators.codegen(atomic_add, "triton")
 def _(state: CodegenState) -> ast.AST:
-    target = state.proxy_arg(0)
-    index = state.proxy_arg(1)
-    value_expr = _to_ast_values([state.ast_args[2]])[0]
-    sem = expr_from_string(repr(state.proxy_arg(len(state.ast_args) - 1)))
-
-    assert isinstance(target, torch.Tensor)
-    assert isinstance(index, list)
-
-    host_function = HostFunction.current()
-    if target not in host_function.tensor_to_origin:
-        raise exc.AtomicOnDeviceTensor("atomic_add")
-
-    device_fn = state.device_function
-    indexing_idx = device_fn.atomic_op_index
-    device_fn.atomic_op_index += 1
-    strategy = device_fn.get_atomic_indexing_strategy(indexing_idx)
-    return strategy.codegen_atomic_add(state, target, index, value_expr, sem)
+    value_expr = state.ast_args[2]
+    return _codegen_common("atomic_add", state, _to_ast_values([value_expr]))
 
 
 @_decorators.codegen(atomic_add, "cute")
@@ -1242,6 +1218,11 @@ def _(state: CodegenState) -> ast.AST:
 
     assert isinstance(target, torch.Tensor)
     assert isinstance(index, list)
+
+    # CAS always uses pointer (not a TMA reduction op, two values),
+    # but increment the counter to keep per-op atomic_indexing aligned.
+    device_fn = state.device_function
+    device_fn.atomic_op_index += 1
 
     indices = SubscriptIndexing.create(state, target, index)
     name = state.device_function.tensor_arg(target).name
