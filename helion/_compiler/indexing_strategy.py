@@ -595,6 +595,9 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
         sem: ast.AST,
     ) -> ast.AST:
         fallback = PointerIndexingStrategy().codegen_atomic
+        # TileIR doesn't support tt.descriptor_reduce yet
+        if CompileEnvironment.current().backend_name == "tileir":
+            return fallback(op, state, fake_tensor, subscript, value, sem)
         # Only certain ops are supported by TMA reduce
         if op not in self._TMA_ATOMIC_OPS:
             return fallback(op, state, fake_tensor, subscript, value, sem)
