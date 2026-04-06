@@ -634,6 +634,8 @@ class TestReduce(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, pytorch_result)
 
 
+# TODO(hinriksnaer): expand lambda reduce tests to pallas backend
+@onlyBackends(["triton", "cute"])
 class TestReduceLambda(RefEagerTestBase, TestCase):
     """Test lambda support as combine_fn in hl.reduce."""
 
