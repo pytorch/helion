@@ -192,11 +192,13 @@ def _swiglu_baseline(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
 
 
 # Kernel mappings for TPU/Pallas benchmarks.
-# Format: kernel_name -> (module_file, kernel_fn_name, baseline_fn, shapes_fn)
+# Format: kernel_name -> (module_file, kernel_fn_name, baseline_fn, shapes_fn,
+#                         max_mismatch_pct)
 #   module_file: filename in examples/ (without .py)
 #   kernel_fn_name: attribute name of the helion kernel in the module
 #   baseline_fn: callable that produces reference output (None = call main())
 #   shapes_fn: callable returning list of (label, args) pairs (None = call main())
+#   max_mismatch_pct: fraction of elements allowed to mismatch (default None = strict)
 #
 # This list contains only kernels that reliably pass on Pallas/TPU.
 KernelMapping = tuple[
@@ -204,31 +206,39 @@ KernelMapping = tuple[
     str,
     Callable[..., Any] | None,
     Callable[[], list[tuple[str, tuple[Any, ...]]]] | None,
+    float | None,
 ]
 KERNEL_MAPPINGS: dict[str, KernelMapping] = {
-    "exp": ("exp", "exp", torch.exp, _exp_shapes),
-    "add": ("add", "add", torch.add, _add_shapes),
+    "exp": ("exp", "exp", torch.exp, _exp_shapes, None),
+    "add": ("add", "add", torch.add, _add_shapes, None),
     "softmax_two_pass": (
         "softmax",
         "softmax_two_pass",
         functools.partial(torch.softmax, dim=-1),
         _softmax_shapes,
+        None,
     ),
-    "welford": ("welford", "welford", _welford_baseline, _welford_shapes),
+    "welford": ("welford", "welford", _welford_baseline, _welford_shapes, None),
     "attention": (
         "attention",
         "attention",
         torch.nn.functional.scaled_dot_product_attention,
         _attention_shapes,
+        None,
     ),
-    "bmm": ("bmm", "bmm", torch.bmm, _bmm_shapes),
-    "geglu": ("geglu", "geglu", _geglu_baseline, _geglu_shapes),
-    # low_mem_dropout: correctness can't be checked via run_example because the
-    # helion kernel uses a deterministic seed-based mask while torch.nn.functional.dropout
-    # uses a random mask — outputs always differ.  Fall back to main() which
-    # verifies forward/backward mask consistency instead.
-    "low_mem_dropout": ("low_mem_dropout", "low_mem_dropout", None, None),
-    "swiglu": ("swiglu", "swiglu_fwd", _swiglu_baseline, _swiglu_shapes),
+    "bmm": ("bmm", "bmm", torch.bmm, _bmm_shapes, None),
+    "geglu": ("geglu", "geglu", _geglu_baseline, _geglu_shapes, None),
+    # low_mem_dropout: helion uses a deterministic seed-based mask while
+    # torch.nn.functional.dropout uses a random mask, so outputs always differ.
+    # Allow 100% mismatch to skip correctness but still benchmark both.
+    "low_mem_dropout": (
+        "low_mem_dropout",
+        "low_mem_dropout",
+        _low_mem_dropout_baseline,
+        _low_mem_dropout_shapes,
+        1.0,
+    ),
+    "swiglu": ("swiglu", "swiglu_fwd", _swiglu_baseline, _swiglu_shapes, None),
 }
 
 
@@ -303,7 +313,9 @@ def run_kernel_inner(name: str) -> KernelResult:
     if name not in KERNEL_MAPPINGS:
         return KernelResult(name=name, passed=False, error=f"Unknown kernel: {name}")
 
-    module_file, kernel_fn_name, baseline_fn, shapes_fn = KERNEL_MAPPINGS[name]
+    module_file, kernel_fn_name, baseline_fn, shapes_fn, max_mismatch_pct = (
+        KERNEL_MAPPINGS[name]
+    )
 
     try:
         mod = import_example(module_file)
@@ -330,7 +342,9 @@ def run_kernel_inner(name: str) -> KernelResult:
         for label, args in shapes:
             print(f"  Shape {label}:", file=sys.stderr)
             try:
-                timings = run_example(kernel_fn, baseline_fn, args)
+                timings = run_example(
+                    kernel_fn, baseline_fn, args, max_mismatch_pct=max_mismatch_pct
+                )
                 kernel_ms = timings.get("helion", 0.0)
                 baseline_ms = timings.get("torch", 0.0)
                 speedup = baseline_ms / kernel_ms if kernel_ms > 0 else 0.0
