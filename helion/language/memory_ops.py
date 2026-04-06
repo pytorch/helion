@@ -216,7 +216,11 @@ def _pallas_index_str(
                 if loops and any(isinstance(loop, DeviceLoopState) for loop in loops):
                     parts.append(_pallas_ds_expr(state, block_id))
                 else:
-                    parts.append(":")
+                    maybe_grid_axis_idx = _maybe_get_hl_grid_axis_idx(idx)
+                    if maybe_grid_axis_idx is not None:
+                        parts.append(f"pl.program_id({maybe_grid_axis_idx})")
+                    else:
+                        parts.append(":")
             if not is_device_loop and isinstance(idx, torch.SymInt):
                 dim_map.setdefault(tensor_dim, block_id)
         elif isinstance(idx, int):
@@ -231,6 +235,21 @@ def _pallas_index_str(
         state.codegen.device_function.pallas_smem_tensor_ids.add(id(tensor))
 
     return ", ".join(parts), none_dims
+
+
+# if an idx (used in a index_expr) comes from a hl.grid
+def _maybe_get_hl_grid_axis_idx(idx: object) -> int | None:
+    if not isinstance(idx, torch.SymInt):
+        return None
+    expr = _symint_expr(idx)
+    if expr is None:
+        return None
+    origin_info = HostFunction.current().expr_to_origin.get(expr)
+    if origin_info is None:
+        return None
+    if not isinstance(origin_info.origin, GridOrigin):
+        return None
+    return origin_info.origin.block_id
 
 
 def _resolve_block_id(

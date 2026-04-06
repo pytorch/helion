@@ -602,8 +602,53 @@ class TestPallas(TestCase):
             return out
 
         x = torch.randn(4, 64, 64, device=DEVICE, dtype=torch.float32)
-        _code, result = code_and_output(scalar_index_transpose, (x,))
+        _, result = code_and_output(scalar_index_transpose, (x,))
         expected = x.permute(0, 2, 1)
+        torch.testing.assert_close(result, expected)
+
+    def test_scalar_access_hl_grid(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True, config=helion.Config())
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            (n,) = x.size()
+            out = torch.zeros_like(x)
+            for i in hl.grid(n):
+                out[i] = x[i] + 0.5
+            return out
+
+        x = torch.randn(128, device=DEVICE, dtype=torch.float32)
+        result = fn(x)
+        expected = x + 0.5
+        torch.testing.assert_close(result, expected)
+
+    @xfailIfPallas("Incorrectly uses block_size=1 for -2th dimension")
+    def test_scalar_access_hl_grid_2d(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True, config=helion.Config())
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            (n, m) = x.size()
+            out = torch.zeros_like(x)
+            for i, j in hl.grid([n, m]):
+                out[i, j] = x[i, j] + 0.5
+            return out
+
+        x = torch.randn((128, 128), device=DEVICE, dtype=torch.float32)
+        result = fn(x)
+        expected = x + 0.5
+        torch.testing.assert_close(result, expected)
+
+    @xfailIfPallas("Incorrectly uses block_size=1 for -2th dimension")
+    def test_scalar_access_hl_grid_2d_nested(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True, config=helion.Config())
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            (n, m) = x.size()
+            out = torch.zeros_like(x)
+            for i in hl.grid(n):
+                for j in hl.grid(m):
+                    out[i, j] = x[i, j] + 0.5
+            return out
+
+        x = torch.randn((128, 128), device=DEVICE, dtype=torch.float32)
+        result = fn(x)
+        expected = x + 0.5
         torch.testing.assert_close(result, expected)
 
 
