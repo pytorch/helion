@@ -2347,9 +2347,14 @@ class TypePropagation(ast.NodeVisitor):
         # Global statements don't need child visiting since they only declare names
         return NoType(origin=self.origin())
 
-    # TODO(jansel): support lambda
-    # pyrefly: ignore [bad-assignment, bad-param-name-override]
-    visit_Lambda: _VisitMethod = generic_visit
+    def visit_Lambda(self, node: ast.Lambda) -> TypeInfo:
+        assert isinstance(node, ExtendedAST)
+        if isinstance(node._type_info, CallableType):
+            return node._type_info
+        source = f"lambda {ast.unparse(node.args)}: {ast.unparse(node.body)}"
+        code = compile(source, filename=node._location.filename, mode="eval")
+        func = eval(code, self.func.fn.__globals__)
+        return CallableType(self.origin(), func)
 
     ################################################################
     # Control flow

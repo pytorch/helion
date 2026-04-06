@@ -1658,6 +1658,11 @@ class WalkDeviceAST(NodeVisitor):
     def visit_Constant(self, node: ast.Constant) -> object:
         return node.value
 
+    def visit_Lambda(self, node: ast.Lambda) -> object:
+        assert isinstance(node, ExtendedAST)
+        assert isinstance(node._type_info, CallableType)
+        return node._type_info.proxy()
+
 
 class LiftTensorArgs:
     values: dict[str, object]
