@@ -649,6 +649,20 @@ class TestPallas(TestCase):
         result = fn(x)
         expected = x + 0.5
         torch.testing.assert_close(result, expected)
+        
+    def test_tensor_access_tile_index_offset(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            (n,) = x.size()
+            out = torch.zeros(n, device=DEVICE, dtype=torch.float32)
+            for tile in hl.tile(n // 2):
+                out[tile] = x[tile]
+                out[tile.index + n // 2] = x[tile.index + n // 2]
+            return out
+
+        x = torch.randn(128, device=DEVICE, dtype=torch.float32)
+        result = fn(x)
+        torch.testing.assert_close(result, x)
 
 
 if __name__ == "__main__":
