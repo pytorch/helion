@@ -91,6 +91,8 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         self.store_transform = store_transform
         self.load_transform = load_transform
         self._last_emitted_device_loop = False
+        self._inter_loop_prev_global_writes: set[str] = set()
+        self._inter_loop_prev_unknown: bool = False
 
         # Now create device function and initialize CodegenInterface
         self.device_function = DeviceFunction(
@@ -117,6 +119,39 @@ class GenerateAST(NodeVisitor, CodegenInterface):
     def _phase_checker(self, root_id: int) -> LoopDependencyChecker:
         phase_idx = self.host_function.device_ir.phase_for_root(root_id)
         return self.host_function.device_ir.phases[phase_idx].loop_dependency_checker
+
+    def reset_inter_loop_barrier_state(self) -> None:
+        """Clear sequential device-loop barrier tracking (new grid root or if/else arm)."""
+        self._last_emitted_device_loop = False
+        self._inter_loop_prev_global_writes.clear()
+        self._inter_loop_prev_unknown = False
+
+    def _global_barrier_tensor_names(self, names: frozenset[str]) -> set[str]:
+        """Names that may participate in cross-wavefront global (HBM) coherence."""
+        from .type_propagation import StackTensorType
+        from .type_propagation import TensorType
+
+        out: set[str] = set()
+        scratch_names = {s.name for s in self.device_function._scratch_args}
+        local_types = self.host_function.local_types
+        smem_ids = self.device_function.pallas_smem_tensor_ids
+        for name in names:
+            if name in scratch_names:
+                continue
+            if local_types is None:
+                out.add(name)
+                continue
+            ti = local_types.get(name)
+            if ti is None:
+                out.add(name)
+                continue
+            if isinstance(ti, TensorType):
+                if id(ti.fake_value) in smem_ids:
+                    continue
+                out.add(name)
+            elif isinstance(ti, StackTensorType):
+                out.add(name)
+        return out
 
     def add_statement(self, stmt: ast.AST | str | None) -> None:
         if stmt is None:
@@ -301,7 +336,26 @@ class GenerateAST(NodeVisitor, CodegenInterface):
             self.host_statements = prior
 
     @contextlib.contextmanager
-    def add_device_loop(self, device_loop: DeviceLoopState) -> Iterator[None]:
+    def add_device_loop(
+        self,
+        device_loop: DeviceLoopState,
+        *,
+        host_loop_reads: frozenset[str] = frozenset(),
+        host_loop_writes: frozenset[str] = frozenset(),
+        inter_loop_dep_metadata_unknown: bool = False,
+    ) -> Iterator[None]:
+        env = CompileEnvironment.current()
+        use_triton_barrier = env.codegen_name == "triton"
+        need_barrier = False
+        if use_triton_barrier and self._last_emitted_device_loop:
+            if self._inter_loop_prev_unknown:
+                need_barrier = True
+            else:
+                cur_global_reads = self._global_barrier_tensor_names(host_loop_reads)
+                need_barrier = bool(
+                    self._inter_loop_prev_global_writes & cur_global_reads
+                )
+
         with self.set_statements(device_loop.inner_statements):
             for idx in device_loop.block_ids:
                 active_loops = self.active_device_loops[idx]
@@ -315,12 +369,19 @@ class GenerateAST(NodeVisitor, CodegenInterface):
             finally:
                 for idx in device_loop.block_ids:
                     self.active_device_loops[idx].pop()
-        if self._last_emitted_device_loop and self._needs_inter_loop_barrier():
+        if need_barrier:
             self.add_statement(statement_from_string("tl.debug_barrier()"))
         self.statements_stack[-1].extend(device_loop.outer_prefix)
         self.add_statement(device_loop.for_node)
         self.statements_stack[-1].extend(device_loop.outer_suffix)
         self._last_emitted_device_loop = True
+        if inter_loop_dep_metadata_unknown:
+            self._inter_loop_prev_unknown = True
+        else:
+            self._inter_loop_prev_unknown = False
+            self._inter_loop_prev_global_writes = self._global_barrier_tensor_names(
+                host_loop_writes
+            )
 
     @contextlib.contextmanager
     def add_emit_pipeline_loop(
@@ -365,16 +426,6 @@ class GenerateAST(NodeVisitor, CodegenInterface):
             finally:
                 for idx in fori_state.block_ids:
                     self.active_device_loops[idx].pop()
-
-    def _needs_inter_loop_barrier(self) -> bool:
-        """On AMD ROCm with num_warps >= 4, sequential device loops need an
-        explicit workgroup barrier so that global memory stores from all
-        wavefronts in the first loop are visible to loads in the second loop."""
-        from .._compat import is_hip
-
-        if not is_hip():
-            return False
-        return self.device_function.config.num_warps >= 4
 
     def set_active_loops(self, device_grid: DeviceLoopOrGridState) -> None:
         if isinstance(device_grid, DeviceGridState):
@@ -454,6 +505,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                 self.set_on_device(),
                 self.set_statements(body),
             ):
+                self.reset_inter_loop_barrier_state()
                 assert node._root_id is not None
                 root_graph_info = self.get_graph(
                     self.host_function.device_ir.root_ids[node._root_id],

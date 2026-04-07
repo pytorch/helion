@@ -12,11 +12,13 @@ import helion
 from helion import _compat
 from helion import exc
 from helion._compat import use_tileir_tunables
+from helion._compiler.device_ir import ReductionLoopGraphInfo
 from helion._compiler.static_loop_unroller import StaticLoopUnroller
 from helion._testing import DEVICE
 from helion._testing import HALF_DTYPE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
+from helion._testing import _bound_test_config
 from helion._testing import _get_backend
 from helion._testing import code_and_output
 from helion._testing import import_path
@@ -33,6 +35,7 @@ from helion._testing import skipIfTileIR
 from helion._testing import skipIfXPU
 from helion._testing import xfailIfPallas
 import helion.language as hl
+from helion.runtime.config import Config
 
 datadir = Path(__file__).parent / "data"
 basic_kernels = import_path(datadir / "basic_kernels.py")
@@ -1456,15 +1459,13 @@ class TestLoops(RefEagerTestBase, TestCase):
         x = torch.randn(128, 1024, dtype=torch.float32, device=DEVICE)
         torch.testing.assert_close(fn(x), x)
 
-    @unittest.skipIf(torch.version.hip is None, "ROCm-specific barrier test")
     @skipIfCudaSharedMemoryLessThan(
         131072, reason="block sizes exceed device shared memory limit"
     )
     def test_sequential_loops_global_memory_barrier(self):
-        """Test that sequential device loops with a store-then-load of the same
-        global buffer produce correct results. On AMD ROCm with num_warps >= 4,
-        a tl.debug_barrier() must be inserted between the loops to ensure
-        cross-wavefront store visibility."""
+        """Sequential device loops that store then load the same global buffer
+        need tl.debug_barrier() between the sibling loops so all warps see
+        prior stores (portable; not gated on ROCm or num_warps)."""
 
         @helion.kernel(autotune_effort="none")
         def two_phase_kernel(
@@ -1492,27 +1493,78 @@ class TestLoops(RefEagerTestBase, TestCase):
 
         expected = torch.relu(x @ a) @ b
 
+        for num_warps in (2, 4):
+            code, result = code_and_output(
+                two_phase_kernel,
+                (x, a, b),
+                block_sizes=[128, 128, 128, 128],
+                num_warps=num_warps,
+                num_stages=2,
+            )
+            torch.testing.assert_close(result, expected, atol=0.15, rtol=0.01)
+            self.assertIn("tl.debug_barrier()", code)
+
+    @skipIfNotTriton(
+        "rolled reduction loops (ReductionLoopGraphInfo) are Triton codegen-specific"
+    )
+    def test_reduction_loop_rolling_emits_reduction_loop_graph_info(self):
+        """With ``reduction_loop`` set, the K reduction can roll into a subgraph
+        represented as ``ReductionLoopGraphInfo`` (see ``build_codegen_graphs``).
+
+        Uses ``sum_kernel`` from ``test_reductions`` because its config spec
+        registers reduction-loop tunables (unlike the two-phase matmul example,
+        which currently exposes no ``reduction_loops`` slots for ``normalize``).
+        """
+        from test.test_reductions import sum_kernel
+
+        x = torch.randn(64, 128, device=DEVICE, dtype=torch.float32)
+        bound = sum_kernel.bind((x,))
+        self.assertGreater(
+            len(bound.config_spec.reduction_loops),
+            0,
+            msg="sum_kernel should expose at least one reduction_loop spec",
+        )
+        cfg_kwargs: dict[str, object] = {"block_size": 8, "reduction_loop": 32}
+        base_cfg = _bound_test_config(bound, **cfg_kwargs)
+        with bound.env, bound.host_function:
+            norm_cfg = Config(**base_cfg.config)
+            bound.env.config_spec.normalize(norm_cfg)
+            graphs = bound.host_function.device_ir.build_codegen_graphs(norm_cfg)
+        self.assertTrue(
+            any(isinstance(g, ReductionLoopGraphInfo) for g in graphs),
+            msg="expected reduction_loop=32 to produce ReductionLoopGraphInfo",
+        )
+        _code, result = code_and_output(sum_kernel, (x,), **cfg_kwargs)
+        torch.testing.assert_close(result, x.sum(-1), rtol=1e-4, atol=1e-4)
+
+    @skipIfCudaSharedMemoryLessThan(
+        65536, reason="block sizes exceed device shared memory limit"
+    )
+    def test_sequential_loops_no_barrier_without_cross_loop_raw(self):
+        """Independent sequential device loops should not get an inter-loop barrier."""
+
+        @helion.kernel(autotune_effort="none")
+        def independent_loops(x: torch.Tensor) -> torch.Tensor:
+            m, n = x.shape
+            out1 = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            out2 = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m in hl.tile(m):
+                for tile_n in hl.tile(n):
+                    out1[tile_m, tile_n] = x[tile_m, tile_n] * 2
+                for tile_n in hl.tile(n):
+                    out2[tile_m, tile_n] = x[tile_m, tile_n] + 1
+            return out2
+
+        x = torch.randn(64, 64, dtype=torch.float32, device=DEVICE)
         code, result = code_and_output(
-            two_phase_kernel,
-            (x, a, b),
-            block_sizes=[128, 128, 128, 128],
+            independent_loops,
+            (x,),
+            block_sizes=[64, 64, 64],
             num_warps=4,
-            num_stages=2,
+            num_stages=1,
         )
-
-        torch.testing.assert_close(result, expected, atol=0.15, rtol=0.01)
-        self.assertIn("tl.debug_barrier()", code)
-
-        # With num_warps=2, no barrier needed
-        code2, result2 = code_and_output(
-            two_phase_kernel,
-            (x, a, b),
-            block_sizes=[128, 128, 128, 128],
-            num_warps=2,
-            num_stages=2,
-        )
-        self.assertNotIn("tl.debug_barrier()", code2)
-        torch.testing.assert_close(result2, expected, atol=0.15, rtol=0.01)
+        torch.testing.assert_close(result, x + 1)
+        self.assertNotIn("tl.debug_barrier()", code)
 
 
 if __name__ == "__main__":
