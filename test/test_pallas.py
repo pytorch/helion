@@ -579,6 +579,33 @@ class TestPallas(TestCase):
         expected[42, 79] = x[42, 79]
         torch.testing.assert_close(result, expected)
 
+    @xfailIfPallas("scalar .begin index not collapsed — BlockSpec keeps full rank")
+    def test_scalar_index_transpose(self) -> None:
+        """Scalar .begin index should collapse the dimension.
+
+        When .begin is used as a scalar subscript, the indexed
+        dimension should be eliminated from the result so that
+        .T produces a correct 2D permutation.
+        """
+
+        @helion.kernel(
+            backend="pallas",
+            static_shapes=True,
+            config=helion.Config(block_sizes=[32, 32, 1]),
+        )
+        def scalar_index_transpose(x: torch.Tensor) -> torch.Tensor:
+            B, M, N = x.shape
+            out = torch.empty([B, N, M], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n, tile_b in hl.tile([M, N, B]):
+                # tile_b has block_size=1, so .begin is used as a scalar index
+                out[tile_b.begin, tile_n, tile_m] = x[tile_b.begin, tile_m, tile_n].T
+            return out
+
+        x = torch.randn(4, 64, 64, device=DEVICE, dtype=torch.float32)
+        _code, result = code_and_output(scalar_index_transpose, (x,))
+        expected = x.permute(0, 2, 1)
+        torch.testing.assert_close(result, expected)
+
 
 if __name__ == "__main__":
     unittest.main()
