@@ -211,6 +211,19 @@ def _pallas_index_str(
         tile_with_offset_info = _get_tile_with_offset_info(idx, state, i)
         if tile_with_offset_info is not None:
             block_id = tile_with_offset_info.block_id
+        scalar_block_id = _scalar_begin_block_id(idx, state)
+        if scalar_block_id is not None:
+            # Scalar .begin index with block_size=1 — emit literal 0 to
+            # collapse this dimension, mirroring Triton's scalar SymInt
+            # handling (indexing_strategy.py:1024-1033).  Record in
+            # dim_map so the BlockSpec tiles this dim; the kernel
+            # receives a size-1 slice and index 0 eliminates it.
+            # Don't increment out_pos — the dim is collapsed from the
+            # output, so subsequent None positions stay correct.
+            parts.append("0")
+            dim_map.setdefault(tensor_dim, scalar_block_id)
+            tensor_dim += 1
+            continue
         if block_id is not None:
             offset_expr = ""
             if tile_with_offset_info is not None:
@@ -291,6 +304,30 @@ def _resolve_block_id(
     if isinstance(idx, slice) and idx == slice(None):
         return env.resolve_block_id(tensor.shape[pos])
     return None
+
+
+def _scalar_begin_block_id(idx: object, state: CodegenState) -> int | None:
+    """Return block_id if *idx* is a tile.begin with block_size=1.
+
+    When block_size=1, tile.begin is a scalar subscript that should
+    collapse the dimension (like Triton's scalar SymInt handling).
+    Returns None for non-.begin indices or when block_size > 1.
+    """
+    if not isinstance(idx, torch.SymInt):
+        return None
+    import sympy
+
+    expr = _symint_expr(idx)
+    if not isinstance(expr, sympy.Symbol):
+        return None
+    origin_info = HostFunction.current().expr_to_origin.get(expr)
+    if origin_info is None or not isinstance(origin_info.origin, TileBeginOrigin):
+        return None
+    block_id = origin_info.origin.block_id
+    env = CompileEnvironment.current()
+    if env.block_sizes[block_id].from_config(state.device_function.config) != 1:
+        return None
+    return block_id
 
 
 def _pallas_ds_expr(state: CodegenState, block_id: int, tile_offset: str) -> str:
