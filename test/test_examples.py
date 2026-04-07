@@ -347,13 +347,15 @@ class TestExamples(RefEagerTestBase, TestCase):
 
         # Convert to FP8 format
         x_fp8 = x.to(torch.float8_e4m3fn)
-        y_fp8 = y.to(torch.float8_e4m3fn)
+        y_fp8 = y.to(torch.float8_e4m3fn).T.contiguous().T
 
         args = (x_fp8, y_fp8)
 
         # Import the reference implementation
         mod = import_path(EXAMPLES_DIR / "fp8_gemm.py")
-        expected = mod.reference_fp8_gemm_pytorch(x_fp8, y_fp8)
+        scale_a = torch.tensor(1.0, device=DEVICE)
+        scale_b = torch.tensor(1.0, device=DEVICE)
+        expected = mod.reference_fp8_gemm_pytorch(x_fp8, y_fp8, scale_a, scale_b)
 
         check_example(
             "fp8_gemm",
