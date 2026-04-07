@@ -889,8 +889,70 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
     return None
 
 
+def _check_dma_alignment(vmem_shapes: list[tuple[int, ...]]) -> bool:
+    """Check if all VMEM buffer shapes satisfy TPU DMA alignment.
+
+    DMA requires last dim % 128 == 0 and second-to-last dim % 8 == 0
+    for 2D+ tensors.  Unlike outer BlockSpecs, emit_pipeline/fori_loop
+    inner DMA does NOT have a ``block == tensor_dim`` exception.
+    """
+    for shape in vmem_shapes:
+        if len(shape) >= 2:
+            if shape[-1] % 128 != 0:
+                return False
+            if shape[-2] % 8 != 0:
+                return False
+        elif len(shape) == 1:
+            if shape[0] % 128 != 0:
+                return False
+    return True
+
+
+def _compute_vmem_shapes(
+    all_tensor_info: list[tuple[torch.Tensor, list[object], str]],
+    block_ids: list[int],
+    slice_size_exprs: list[str],
+    env: CompileEnvironment,
+    state: CodegenState,
+) -> list[tuple[int, ...]]:
+    """Compute VMEM buffer shapes for each tensor in the fori_loop body."""
+    vmem_shapes: list[tuple[int, ...]] = []
+    for fake, sub_meta, _direction in all_tensor_info:
+        dim_to_bid = _get_dim_block_ids(sub_meta, env)
+        parts: list[int] = []
+        for dim_idx in range(len(fake.shape)):
+            bid = dim_to_bid.get(dim_idx)
+            if bid is not None and bid in block_ids:
+                bid_idx = block_ids.index(bid)
+                block_value_sym = sympy.sympify(slice_size_exprs[bid_idx])
+                if isinstance(block_value_sym, sympy.Integer):
+                    parts.append(int(block_value_sym))
+                else:
+                    block_value = env.block_sizes[block_ids[bid_idx]].from_config(
+                        state.config
+                    )
+                    assert isinstance(block_value, int)
+                    parts.append(block_value)
+            elif bid is not None:
+                outer_block_value = env.block_sizes[bid].from_config(state.config)
+                if isinstance(outer_block_value, int):
+                    parts.append(outer_block_value)
+                else:
+                    parts.append(int(fake.shape[dim_idx]))
+            else:
+                parts.append(int(fake.shape[dim_idx]))
+        vmem_shapes.append(tuple(parts))
+    return vmem_shapes
+
+
 def _codegen_fori_loop(state: CodegenState) -> object:
-    """Emit inner device loops using jax.lax.fori_loop + pltpu.make_async_copy."""
+    """Emit inner device loops using jax.lax.fori_loop.
+
+    When inner block shapes satisfy TPU DMA alignment, uses
+    ``pltpu.make_async_copy`` for double-buffered DMA pipelining.
+    Otherwise, falls back to direct ``pl.ds`` slicing on HBM refs
+    (no DMA, no alignment requirement).
+    """
     from .._compiler.device_ir import ForLoopGraphInfo
     from .._compiler.generate_ast import GenerateAST
     from .._compiler.inductor_lowering import codegen_call_with_graph
@@ -928,16 +990,6 @@ def _codegen_fori_loop(state: CodegenState) -> object:
             state, args, proxy_args, env
         )
 
-    # Record which tensors are in the fori_loop body (need HBM refs)
-    for fake, _tensor_node, _sub_meta in loaded_tensors.values():
-        state.device_function.pallas_pipeline_tensor_ids.add(id(fake))
-    for fake, _tensor_node, _sub_meta in stored_tensors.values():
-        state.device_function.pallas_pipeline_tensor_ids.add(id(fake))
-
-    # For each tensor, register VMEM scratch buffer + DMA semaphore
-    tensor_to_vmem: dict[str, str] = {}
-    tensor_to_sem: dict[str, str] = {}
-
     # Collect all tensors: load-only first, then stored (which may also be read)
     all_tensor_info: list[tuple[torch.Tensor, list[object], str]] = []
     for key, (fake, _tensor_node, sub_meta) in loaded_tensors.items():
@@ -946,46 +998,39 @@ def _codegen_fori_loop(state: CodegenState) -> object:
     for fake, _tensor_node, sub_meta in stored_tensors.values():
         all_tensor_info.append((fake, sub_meta, "store"))
 
-    for fake, sub_meta, _direction in all_tensor_info:
-        hbm_name = state.device_function.tensor_arg(fake).name
-        # Compute VMEM buffer shape (block-sized for pipeline dims, full for others)
-        dim_to_bid = _get_dim_block_ids(sub_meta, env)
-        vmem_shape_parts: list[int] = []
-        for dim_idx in range(len(fake.shape)):
-            bid = dim_to_bid.get(dim_idx)
-            if bid is not None and bid in block_ids:
-                bid_idx = block_ids.index(bid)
-                block_value_expr = slice_size_exprs[bid_idx]
-                block_value_sym = sympy.sympify(block_value_expr)
-                if isinstance(block_value_sym, sympy.Integer):
-                    vmem_shape_parts.append(int(block_value_sym))
-                else:
-                    block_value = env.block_sizes[block_ids[bid_idx]].from_config(
-                        state.config
-                    )
-                    assert isinstance(block_value, int), (
-                        f"Block size for block_id {bid} must be a concrete int"
-                    )
-                    vmem_shape_parts.append(block_value)
-            elif bid is not None:
-                outer_block_value = env.block_sizes[bid].from_config(state.config)
-                if isinstance(outer_block_value, int):
-                    vmem_shape_parts.append(outer_block_value)
-                else:
-                    vmem_shape_parts.append(int(fake.shape[dim_idx]))
-            else:
-                vmem_shape_parts.append(int(fake.shape[dim_idx]))
+    # Compute VMEM shapes and check DMA alignment
+    vmem_shapes = _compute_vmem_shapes(
+        all_tensor_info, block_ids, slice_size_exprs, env, state
+    )
+    use_dma = _check_dma_alignment(vmem_shapes)
 
-        vmem_name = state.device_function.register_scratch(
-            tuple(vmem_shape_parts),
-            fake.dtype,
-            name_hint=hbm_name.replace("_hbm", "") + "_buf",
-        )
-        sem_name = state.device_function.register_dma_semaphore(
-            name_hint=hbm_name.replace("_hbm", "") + "_sem",
-        )
-        tensor_to_vmem[hbm_name] = vmem_name
-        tensor_to_sem[hbm_name] = sem_name
+    # With DMA: tensors need HBM refs (no outer BlockSpec) because DMA
+    # handles all slicing.  Without DMA: outer BlockSpecs handle outer
+    # dims; inner dims use pl.ds() — so don't suppress BlockSpecs.
+    if use_dma:
+        for fake, _tensor_node, _sub_meta in loaded_tensors.values():
+            state.device_function.pallas_pipeline_tensor_ids.add(id(fake))
+        for fake, _tensor_node, _sub_meta in stored_tensors.values():
+            state.device_function.pallas_pipeline_tensor_ids.add(id(fake))
+
+    # When using DMA: register VMEM scratch buffers + DMA semaphores
+    tensor_to_vmem: dict[str, str] = {}
+    tensor_to_sem: dict[str, str] = {}
+    if use_dma:
+        for (fake, _sub_meta, _direction), vmem_shape in zip(
+            all_tensor_info, vmem_shapes, strict=True
+        ):
+            hbm_name = state.device_function.tensor_arg(fake).name
+            vmem_name = state.device_function.register_scratch(
+                vmem_shape,
+                fake.dtype,
+                name_hint=hbm_name.replace("_hbm", "") + "_buf",
+            )
+            sem_name = state.device_function.register_dma_semaphore(
+                name_hint=hbm_name.replace("_hbm", "") + "_sem",
+            )
+            tensor_to_vmem[hbm_name] = vmem_name
+            tensor_to_sem[hbm_name] = sem_name
 
     # Build the body function
     body_fn_name = state.device_function.new_var("_fori_body")
@@ -1018,6 +1063,7 @@ def _codegen_fori_loop(state: CodegenState) -> object:
         block_id_to_info=block_id_to_info,
         body_fn_name=body_fn_name,
         loop_var_name=loop_var,
+        use_dma=use_dma,
         inner_statements=body_stmts,
         _tensor_to_vmem=tensor_to_vmem,
         _tensor_to_sem=tensor_to_sem,
@@ -1070,22 +1116,35 @@ def _codegen_fori_loop(state: CodegenState) -> object:
 
     # Generate body code within the fori_loop context
     with state.codegen.add_fori_loop(fori_state):
-        # Emit DMA read copies at start of body
-        for fake, _tensor_node, sub_meta in loaded_tensors.values():
-            hbm_name = state.device_function.tensor_arg(fake).name
-            vmem_name = tensor_to_vmem[hbm_name]
-            sem_name = tensor_to_sem[hbm_name]
-            src_slice = _build_hbm_dma_slice(fake, hbm_name, sub_meta)
-            copy_var = state.device_function.new_var("_copy")
-            state.codegen.add_statement(
-                statement_from_string(
-                    f"{copy_var} = pltpu.make_async_copy({src_slice}, {vmem_name}, {sem_name})"
+        if use_dma:
+            # Emit DMA read copies at start of body
+            for fake, _tensor_node, sub_meta in loaded_tensors.values():
+                hbm_name = state.device_function.tensor_arg(fake).name
+                vmem_name = tensor_to_vmem[hbm_name]
+                sem_name = tensor_to_sem[hbm_name]
+                src_slice = _build_hbm_dma_slice(fake, hbm_name, sub_meta)
+                copy_var = state.device_function.new_var("_copy")
+                state.codegen.add_statement(
+                    statement_from_string(
+                        f"{copy_var} = pltpu.make_async_copy({src_slice}, {vmem_name}, {sem_name})"
+                    )
                 )
-            )
-            state.codegen.add_statement(statement_from_string(f"{copy_var}.start()"))
-            state.codegen.add_statement(statement_from_string(f"{copy_var}.wait()"))
+                state.codegen.add_statement(
+                    statement_from_string(f"{copy_var}.start()")
+                )
+                state.codegen.add_statement(statement_from_string(f"{copy_var}.wait()"))
+        else:
+            # No DMA: emit offset assignments so pl.ds() indexing works
+            for i, bid in enumerate(block_ids):
+                offset_name = strategy.offset_var(bid)
+                state.codegen.add_statement(
+                    statement_from_string(
+                        f"{offset_name} = ({begin_exprs[i]}) + ({loop_var}) * ({iter_step_exprs[i]})"
+                    )
+                )
 
-        # Codegen the user's body (loads/stores remapped via _tensor_to_vmem)
+        # Codegen the user's body (loads/stores remapped via _tensor_to_vmem
+        # when using DMA, or accessing HBM refs directly when not)
         graph_results = codegen_call_with_graph(
             state.codegen, graph_info.graph, body_args
         )
@@ -1094,22 +1153,25 @@ def _codegen_fori_loop(state: CodegenState) -> object:
         if has_loop_state:
             _write_back_loop_carried(state, scratch_names, carried, graph_results)
 
-        # Emit DMA write copies at end of body for stored tensors
-        for fake, _tensor_node, sub_meta in stored_tensors.values():
-            hbm_name = state.device_function.tensor_arg(fake).name
-            vmem_name = tensor_to_vmem[hbm_name]
-            sem_name = tensor_to_sem[hbm_name]
-            dst_slice = _build_hbm_dma_slice(fake, hbm_name, sub_meta)
-            copy_out_var = state.device_function.new_var("_copy_out")
-            state.codegen.add_statement(
-                statement_from_string(
-                    f"{copy_out_var} = pltpu.make_async_copy({vmem_name}, {dst_slice}, {sem_name})"
+        if use_dma:
+            # Emit DMA write copies at end of body for stored tensors
+            for fake, _tensor_node, sub_meta in stored_tensors.values():
+                hbm_name = state.device_function.tensor_arg(fake).name
+                vmem_name = tensor_to_vmem[hbm_name]
+                sem_name = tensor_to_sem[hbm_name]
+                dst_slice = _build_hbm_dma_slice(fake, hbm_name, sub_meta)
+                copy_out_var = state.device_function.new_var("_copy_out")
+                state.codegen.add_statement(
+                    statement_from_string(
+                        f"{copy_out_var} = pltpu.make_async_copy({vmem_name}, {dst_slice}, {sem_name})"
+                    )
                 )
-            )
-            state.codegen.add_statement(
-                statement_from_string(f"{copy_out_var}.start()")
-            )
-            state.codegen.add_statement(statement_from_string(f"{copy_out_var}.wait()"))
+                state.codegen.add_statement(
+                    statement_from_string(f"{copy_out_var}.start()")
+                )
+                state.codegen.add_statement(
+                    statement_from_string(f"{copy_out_var}.wait()")
+                )
 
     # Emit the function def and fori_loop call
     fn_def = statement_from_string(f"def {body_fn_name}({loop_var}, _): pass")
