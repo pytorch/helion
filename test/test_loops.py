@@ -1507,6 +1507,9 @@ class TestLoops(RefEagerTestBase, TestCase):
             torch.testing.assert_close(result, expected, atol=0.15, rtol=0.01)
             self.assertIn("tl.debug_barrier()", code)
 
+    @skipIfRefEager(
+        "compiled HostFunction and config_spec.reduction_loops are not built in interpret mode"
+    )
     @skipIfNotTriton(
         "rolled reduction loops (ReductionLoopGraphInfo) are Triton codegen-specific"
     )
@@ -1514,18 +1517,30 @@ class TestLoops(RefEagerTestBase, TestCase):
         """With ``reduction_loop`` set, the K reduction can roll into a subgraph
         represented as ``ReductionLoopGraphInfo`` (see ``build_codegen_graphs``).
 
-        Uses ``sum_kernel`` from ``test_reductions`` because its config spec
-        registers reduction-loop tunables (unlike the two-phase matmul example,
-        which currently exposes no ``reduction_loops`` slots for ``normalize``).
+        Inline kernel (same pattern as ``test_reductions.sum_kernel``): avoids
+        sharing ``Kernel._bound_kernels`` with other tests and matches a kernel
+        that registers ``reduction_loops`` tunables (unlike the two-phase matmul
+        example, which currently exposes no ``reduction_loops`` slots).
         """
-        from test.test_reductions import sum_kernel
+
+        @helion.kernel(autotune_effort="none")
+        def reduction_roll_kernel(x: torch.Tensor) -> torch.Tensor:
+            n, _m = x.size()
+            out = torch.empty(
+                [n],
+                dtype=x.dtype,
+                device=x.device,
+            )
+            for tile_n in hl.tile(n):
+                out[tile_n] = x[tile_n, :].sum(-1)
+            return out
 
         x = torch.randn(64, 128, device=DEVICE, dtype=torch.float32)
-        bound = sum_kernel.bind((x,))
+        bound = reduction_roll_kernel.bind((x,))
         self.assertGreater(
             len(bound.config_spec.reduction_loops),
             0,
-            msg="sum_kernel should expose at least one reduction_loop spec",
+            msg="kernel should expose at least one reduction_loop spec",
         )
         cfg_kwargs: dict[str, object] = {"block_size": 8, "reduction_loop": 32}
         base_cfg = _bound_test_config(bound, **cfg_kwargs)
@@ -1537,7 +1552,7 @@ class TestLoops(RefEagerTestBase, TestCase):
             any(isinstance(g, ReductionLoopGraphInfo) for g in graphs),
             msg="expected reduction_loop=32 to produce ReductionLoopGraphInfo",
         )
-        _code, result = code_and_output(sum_kernel, (x,), **cfg_kwargs)
+        _code, result = code_and_output(reduction_roll_kernel, (x,), **cfg_kwargs)
         torch.testing.assert_close(result, x.sum(-1), rtol=1e-4, atol=1e-4)
 
     @skipIfCudaSharedMemoryLessThan(
