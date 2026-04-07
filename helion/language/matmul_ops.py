@@ -216,6 +216,7 @@ def enforce_dot_requirements(lhs: torch.Tensor, rhs: torch.Tensor) -> None:
 
     a, b, c = min_dot_size(lhs.device, lhs.dtype, rhs.dtype)
     env = CompileEnvironment.current()
+    env.config_spec.has_dot = True
     for shape, min_size in ((m, a), (n, b), (k, c)):
         block_idx = env.get_block_id(shape)
         if block_idx is not None:

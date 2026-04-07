@@ -125,6 +125,13 @@ def _epilogue_subtile_autotune_arch() -> tuple[int, int] | None:
     return torch.cuda.get_device_capability(torch.cuda.current_device())
 
 
+@functools.cache
+def _is_sm100_or_newer() -> bool:
+    """Check if the current CUDA device is Blackwell (sm100) or newer."""
+    arch = _epilogue_subtile_autotune_arch()
+    return arch is not None and arch >= (10, 0)
+
+
 # For tileir backend or AMD ROCM, eviction policies are not supported.
 # Keep this uncached: some tests patch the AMD capability helper, and caching
 # only on backend name can poison later Triton ConfigSpec construction inside
@@ -179,6 +186,7 @@ class ConfigSpec:
             EnumFragment(choices=self.valid_indexing_types()),
             length=0,
         )
+        self.has_dot: bool = False
         self.epilogue_subtile_candidate_enabled: bool = False
         self.epilogue_subtile_autotune_choices: tuple[int | None, ...] | None = None
         self.epilogue_subtile_k_hint: int = 0
@@ -624,6 +632,21 @@ class ConfigSpec:
                     name, config.get(name, ()), block_ids=self.grid_block_ids
                 )
 
+        # Warp specialize on the persistent grid loop crashes Triton's
+        # NVWSInsertAref pass on sm100+; reset to default for grid indices.
+        if (
+            pid_type in ("persistent_blocked", "persistent_interleaved")
+            and self.grid_block_ids
+            and _is_sm100_or_newer()
+        ):
+            config["range_warp_specializes"] = (
+                self.range_warp_specialize._reset_config_to_default(
+                    "range_warp_specializes",
+                    config.get("range_warp_specializes", ()),
+                    block_ids=self.grid_block_ids,
+                )
+            )
+
         range_warp_specializes = cast(
             "list[bool | None]", config.get("range_warp_specializes", [])
         )
@@ -755,16 +778,35 @@ class ConfigSpec:
             num_stages_fragment = IntegerFragment(1, 1, 1)
         else:
             num_warps_fragment = NumWarpsFragment(1, 32, DEFAULT_NUM_WARPS)
-            num_stages_fragment = IntegerFragment(1, 8, DEFAULT_NUM_STAGES)
+            # Blackwell dot kernels benefit from deeper pipelines for latency scheduling.
+            default_stages = (
+                3 if _is_sm100_or_newer() and self.has_dot else DEFAULT_NUM_STAGES
+            )
+            num_stages_fragment = IntegerFragment(1, 8, default_stages)
 
         if self.supports_config_key("num_warps"):
             fields["num_warps"] = num_warps_fragment
         if self.supports_config_key("num_stages"):
             fields["num_stages"] = num_stages_fragment
+        # On Blackwell dot kernels, prefer persistent + tensor_descriptor.
+        _blackwell_dot = _is_sm100_or_newer() and self.has_dot
         if self.supports_config_key("indexing"):
-            fields["indexing"] = self.indexing
+            if _blackwell_dot and supports_tensor_descriptor():
+                fields["indexing"] = ListOf(
+                    EnumFragment(choices=("tensor_descriptor", "pointer")),
+                    length=self.indexing.length,
+                )
+            else:
+                fields["indexing"] = self.indexing
         if self.supports_config_key("pid_type"):
-            fields["pid_type"] = EnumFragment(self.allowed_pid_types)
+            pid_choices = self.allowed_pid_types
+            if _blackwell_dot:
+                persistent = ("persistent_interleaved", "persistent_blocked")
+                pid_choices = (
+                    *persistent,
+                    *(p for p in pid_choices if p not in persistent),
+                )
+            fields["pid_type"] = EnumFragment(pid_choices)
         if self.supports_config_key("num_sm_multiplier"):
             fields["num_sm_multiplier"] = PowerOfTwoFragment(
                 MIN_NUM_SM_MULTIPLIER,
@@ -1088,7 +1130,11 @@ class RangeUnrollFactorSpec(_OptionalIntSpec):
 
 
 class RangeWarpSpecializeSpec(_OptionalBoolSpec):
-    pass
+    def _fragment(self, base: ConfigSpec) -> EnumFragment:
+        if _is_sm100_or_newer() and base.has_dot:
+            # Put True second so pattern-search discovers it in one step.
+            return EnumFragment((None, True, False))
+        return EnumFragment((None, False, True))
 
 
 class RangeNumStagesSpec(_OptionalIntSpec):
