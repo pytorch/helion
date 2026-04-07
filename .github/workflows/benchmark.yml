@@ -194,6 +194,7 @@ jobs:
             ${{ inputs.env-vars }} HELION_PRINT_OUTPUT_CODE=1 HELION_ASSERT_CACHE_HIT=1 python benchmarks/run.py \
                 --op $kernel \
                 --metrics speedup,accuracy \
+                --measure-compile-time \
                 --latency-measure-mode triton_do_bench \
                 --cudagraph \
                 --only $IMPLS \

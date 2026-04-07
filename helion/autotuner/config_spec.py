@@ -182,6 +182,8 @@ class ConfigSpec:
         self.epilogue_subtile_candidate_enabled: bool = False
         self.epilogue_subtile_autotune_choices: tuple[int | None, ...] | None = None
         self.epilogue_subtile_k_hint: int = 0
+        self.has_pallas_inner_loops: bool = False
+        self.has_pallas_symbolic_bounds: bool = False
         self.backend_tunable_fragments = self.backend.tunable_fragments()
         unknown_tunables = set(self.backend_tunable_fragments) - BACKEND_TUNABLE_KEYS
         if unknown_tunables:
@@ -477,6 +479,11 @@ class ConfigSpec:
             config.setdefault("indexing", self.indexing.default())
         for key, fragment in self.backend_tunable_fragments.items():
             config.setdefault(key, fragment.default())
+        if self.has_pallas_inner_loops:
+            choices = VALID_PALLAS_LOOP_TYPES
+            if self.has_pallas_symbolic_bounds:
+                choices = tuple(c for c in choices if c != "default")
+            config.setdefault("pallas_loop_type", choices[0])
 
         if self.supports_config_key("pid_type"):
             if "pid_type" in config:
@@ -777,6 +784,11 @@ class ConfigSpec:
             fields["occupancy"] = self.backend_tunable_fragments["occupancy"]
         else:
             fields.update(self.backend_tunable_fragments)
+        if self.has_pallas_inner_loops:
+            choices = VALID_PALLAS_LOOP_TYPES
+            if self.has_pallas_symbolic_bounds:
+                choices = tuple(c for c in choices if c != "default")
+            fields["pallas_loop_type"] = EnumFragment(choices=choices)
         # Only include maxnreg on CUDA devices (not supported on AMD and Intel GPU)
         if self.supports_config_key("maxnreg") and supports_maxnreg():
             fields["maxnreg"] = EnumFragment(VALID_MAXNREG)

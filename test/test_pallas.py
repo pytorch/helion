@@ -11,6 +11,7 @@ from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
 from helion._testing import skipUnlessPallas
+from helion._testing import xfailIfPallas
 import helion.language as hl
 
 
@@ -208,6 +209,23 @@ def pallas_attention(
         acc = acc / l_i[:, :, None]
         out[tile_b, tile_m, :] = acc.to(out.dtype)
     return out.view(q_in.size())
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
+def pallas_reduce_non_pow2(x: torch.Tensor) -> torch.Tensor:
+    """Softmax over a non-power-of-2 reduction dim.
+
+    Uses amax + exp + sum which forces explicit index/mask generation,
+    exercising the RDIM_SIZE code path.
+    """
+    n, _m = x.size()
+    out = torch.empty_like(x)
+    for tile_n in hl.tile(n):
+        row = x[tile_n, :]
+        max_val = torch.amax(row, dim=-1, keepdim=True)
+        exp_val = torch.exp(row - max_val)
+        out[tile_n, :] = exp_val / torch.sum(exp_val, dim=-1, keepdim=True)
+    return out
 
 
 @onlyBackends(["triton", "pallas"])
@@ -501,6 +519,34 @@ class TestPallas(TestCase):
             query.float().cpu(), key.float().cpu(), val.float().cpu()
         ).to(device=DEVICE)
         torch.testing.assert_close(result, ref, rtol=1e-2, atol=1e-2)
+
+    def test_emit_pipeline_loop_order(self) -> None:
+        """Test emit_pipeline with loop_order reordering.
+
+        Without the fix, program_id mapping uses logical grid_block_ids
+        order instead of pid_info order (which reflects loop_order),
+        producing wrong results.
+        """
+        x = torch.randn(256, 256, device=DEVICE, dtype=torch.bfloat16)
+        y = torch.randn(256, 256, device=DEVICE, dtype=torch.bfloat16)
+        bias = torch.randn(1, 256, device=DEVICE, dtype=torch.bfloat16)
+        code, result = code_and_output(
+            pallas_matmul_broadcast_bias,
+            (x, y, bias),
+            block_sizes=[16, 128, 64],
+            loop_orders=[[1, 0]],
+            pallas_loop_type="emit_pipeline",
+        )
+        expected = (x.float() @ y.float() + bias.float()).to(torch.bfloat16)
+        torch.testing.assert_close(result, expected, rtol=1e-2, atol=1e-2)
+
+    @xfailIfPallas("RDIM_SIZE rounded to next power of 2 causes shape mismatch")
+    def test_reduce_non_pow2(self) -> None:
+        """Reduction over non-power-of-2 dim should use exact size, not rounded."""
+        x = torch.randn(128, 1000, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(pallas_reduce_non_pow2, (x,), block_size=128)
+        expected = torch.nn.functional.softmax(x, dim=-1)
+        torch.testing.assert_close(result, expected, rtol=1e-4, atol=1e-4)
 
 
 if __name__ == "__main__":
