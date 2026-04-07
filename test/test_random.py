@@ -463,6 +463,7 @@ class TestRandom(RefEagerTestBase, TestCase):
         )
         torch.testing.assert_close(output, output2, msg="it should deterministic")
 
+    @skipIfMTIA("Skip on MTIA due to unaligned address crash")
     @xfailIfPallas("reordered tile dims cause BlockSpec axis mismatch")
     def test_hl_rand_mixed_argument_order(self):
         @helion.kernel(static_shapes=False)
