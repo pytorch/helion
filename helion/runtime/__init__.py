@@ -407,7 +407,7 @@ def _pallas_make_reordered_kernel(
     inplace_positions: set[int],
     arg_to_tensor_pos: dict[int, int],
     n_extra_refs: int = 0,
-    skip_inplace_copy: bool = False,
+    skip_inplace_copy: set[int] | None = None,
     _smem_arg_indices: list[int] | None = None,
 ) -> object:
     """Create a wrapper kernel that reorders pallas_call refs to the original arg order.
@@ -417,11 +417,13 @@ def _pallas_make_reordered_kernel(
     (e.g. scratch buffers), those trailing refs are appended after the
     reordered args.
 
-    When *skip_inplace_copy* is True, the initial ``out_ref[...] = in_ref[...]``
-    copy for inplace positions is skipped.  This is needed for the pipeline
-    launcher where refs are in HBM (``pl.ANY``) and direct load/store is not
-    allowed -- ``input_output_aliases`` already handles the aliasing.
+    *skip_inplace_copy* is a set of original-arg positions for which the
+    initial ``out_ref[...] = in_ref[...]`` copy should be skipped.  This is
+    needed for outputs backed by HBM refs (``pl.ANY``) where direct
+    load/store is not allowed.  Outputs with VMEM BlockSpecs still get the
+    copy so that ``input_output_aliases`` correctly preloads their contents.
     """
+    _skip_copy = skip_inplace_copy or set()
 
     def reordered_kernel(*refs: object) -> None:
         n_kernel_params = len(args)
@@ -432,7 +434,7 @@ def _pallas_make_reordered_kernel(
             original_order[orig_pos] = value
         for out_idx, orig_pos in enumerate(_output_indices):
             out_ref = refs[n_tensor_inputs + out_idx]
-            if orig_pos in inplace_positions and not skip_inplace_copy:
+            if orig_pos in inplace_positions and orig_pos not in _skip_copy:
                 in_ref = refs[arg_to_tensor_pos[orig_pos]]
                 if _smem_arg_indices is not None and orig_pos in _smem_arg_indices:
                     # [...] cannot be used for SMEMs,
@@ -734,6 +736,7 @@ def default_pallas_pipeline_launcher(
             _pipeline_arg_indices,
         )
 
+        _pipeline_set = set(_pipeline_arg_indices or [])
         reordered_kernel = _pallas_make_reordered_kernel(
             pallas_kernel,
             args,
@@ -744,7 +747,7 @@ def default_pallas_pipeline_launcher(
             inplace_positions,
             arg_to_tensor_pos,
             n_extra_refs=len(scratch_shapes),
-            skip_inplace_copy=True,
+            skip_inplace_copy=_pipeline_set,
         )
 
         out_shape_arg = out_shapes if len(out_shapes) > 1 else out_shapes[0]
@@ -873,6 +876,7 @@ def default_pallas_fori_launcher(
             _fori_pipeline_indices,  # type: ignore[arg-type]
         )
 
+        _fori_pipeline_set = set(_fori_pipeline_indices or [])  # type: ignore[arg-type]
         reordered_kernel = _pallas_make_reordered_kernel(
             pallas_kernel,
             args,
@@ -883,7 +887,7 @@ def default_pallas_fori_launcher(
             inplace_positions,
             arg_to_tensor_pos,
             n_extra_refs=len(scratch_shapes),
-            skip_inplace_copy=True,
+            skip_inplace_copy=_fori_pipeline_set,
         )
 
         out_shape_arg = out_shapes if len(out_shapes) > 1 else out_shapes[0]

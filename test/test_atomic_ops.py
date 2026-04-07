@@ -55,6 +55,24 @@ def atomic_add_float_kernel(x: torch.Tensor, indices: torch.Tensor) -> torch.Ten
 
 
 @helion.kernel()
+def atomic_add_f32_into_bf16_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """Test atomic_add where value dtype (float32) differs from output (bfloat16).
+
+    Without a dtype cast in the Pallas codegen, the store into the
+    bfloat16 output ref fails with:
+        ValueError: Invalid dtype for `swap`. Ref dtype: bfloat16. Value dtype: float32.
+    """
+    m, n = x.size()
+    out = torch.zeros([m, n], dtype=x.dtype, device=x.device)
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        acc = acc + x[tile_m, tile_n].to(torch.float32)
+        acc = acc + y[tile_m, tile_n].to(torch.float32)
+        hl.atomic_add(out, [tile_m, tile_n], acc)
+    return out
+
+
+@helion.kernel()
 def atomic_add_w_tile_attr(x: torch.Tensor) -> torch.Tensor:
     """Test atomic_add where the index is a symbolic int"""
     y = torch.zeros_like(x, device=x.device, dtype=torch.int32)
@@ -245,6 +263,27 @@ class TestAtomicOperations(RefEagerTestBase, TestCase):
         )
 
         expected = torch.ones(3, 4, device=DEVICE)
+        torch.testing.assert_close(result, expected)
+
+    @onlyBackends(["pallas"])
+    def test_atomic_add_f32_into_bf16(self):
+        """atomic_add of a float32 value into a bfloat16 output tensor.
+
+        Without a dtype cast in the Pallas atomic_add codegen this fails:
+            ValueError: Invalid dtype for `swap`.
+                Ref dtype: bfloat16. Value dtype: float32.
+        """
+        x = torch.ones(64, 128, device=DEVICE, dtype=torch.bfloat16)
+        y = torch.ones(64, 128, device=DEVICE, dtype=torch.bfloat16)
+        args = (x, y)
+
+        code, result = code_and_output(
+            atomic_add_f32_into_bf16_kernel,
+            args,
+            block_sizes=[64, 128],
+        )
+
+        expected = (x.float() + y.float()).to(torch.bfloat16)
         torch.testing.assert_close(result, expected)
 
     def test_atomic_add_code_generation(self):
