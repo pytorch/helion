@@ -464,6 +464,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         super().setUp()
         random.seed(112)
 
+    @patch("helion.autotuner.config_spec._is_sm100_or_newer", lambda: True)
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: True)
     @patch.object(_compat, "_min_dot_size", lambda *args: (16, 16, 16))
     @patch.object(_compat, "_supports_maxnreg", lambda: True)
