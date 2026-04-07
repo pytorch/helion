@@ -12,6 +12,7 @@ from helion._testing import code_and_output
 from helion._testing import onlyBackends
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfRocm
+from helion._testing import skipIfTileIR
 from helion._testing import xfailIfCute
 from helion._testing import xfailIfPallas
 import helion.language as hl
@@ -477,6 +478,7 @@ class TestAtomicOperations(RefEagerTestBase, TestCase):
 
     @onlyBackends("triton")
     @skipIfRocm("Tensor descriptor not supported on ROCm")
+    @skipIfTileIR("TileIR does not support descriptor atomics")
     def test_atomic_td_fallbacks(self):
         """Test that tensor_descriptor atomics fall back to pointer when needed."""
 
@@ -531,6 +533,7 @@ class TestAtomicOperations(RefEagerTestBase, TestCase):
 
     @onlyBackends("triton")
     @skipIfRocm("Tensor descriptor not supported on ROCm")
+    @skipIfTileIR("TileIR does not support descriptor atomics")
     def test_atomic_add_per_op_indexing(self):
         """Test per-op atomic_indexing list: first op pointer, second op tensor_descriptor."""
 
@@ -568,6 +571,7 @@ class TestAtomicOperations(RefEagerTestBase, TestCase):
 
     @onlyBackends("triton")
     @skipIfRocm("Tensor descriptor not supported on ROCm")
+    @skipIfTileIR("TileIR does not support descriptor atomics")
     def test_atomic_ops_tensor_descriptor(self):
         """Test all TMA-supported atomic ops generate desc.atomic_{op} codegen."""
         M, N = 128, 64
