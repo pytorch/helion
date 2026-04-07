@@ -1339,9 +1339,11 @@ class PopulationBasedSearch(BaseSearch):
         hardware = get_device_name(extract_device(self.args))
 
         inner_kernel = getattr(self.kernel, "kernel", None)
-        if inner_kernel is None or not hasattr(inner_kernel, "specialization_key"):
+        if inner_kernel is None or not hasattr(
+            inner_kernel, "_base_specialization_key"
+        ):
             return hardware, None
-        spec_key = inner_kernel.specialization_key(self.args)
+        spec_key = inner_kernel._base_specialization_key(self.args)
         specialization_key = str(_normalize_spec_key(spec_key))
 
         return hardware, specialization_key
