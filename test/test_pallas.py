@@ -579,7 +579,7 @@ class TestPallas(TestCase):
         expected[42, 79] = x[42, 79]
         torch.testing.assert_close(result, expected)
 
-    @xfailIfPallas("scalar .begin index not collapsed — BlockSpec keeps full rank")
+    @xfailIfPallas("Result mismatch due to incorrect tiling")
     def test_scalar_index_transpose(self) -> None:
         """Scalar .begin index should collapse the dimension.
 
@@ -604,7 +604,8 @@ class TestPallas(TestCase):
         x = torch.randn(4, 64, 64, device=DEVICE, dtype=torch.float32)
         _code, result = code_and_output(scalar_index_transpose, (x,))
         expected = x.permute(0, 2, 1)
-        
+        torch.testing.assert_close(result, expected)
+
     def test_scalar_access_hl_grid(self) -> None:
         @helion.kernel(backend="pallas", static_shapes=True, config=helion.Config())
         def fn(x: torch.Tensor) -> torch.Tensor:
@@ -663,6 +664,34 @@ class TestPallas(TestCase):
         x = torch.randn(128, device=DEVICE, dtype=torch.float32)
         result = fn(x)
         torch.testing.assert_close(result, x)
+
+    def test_tensor_access_tile_id(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True, config=helion.Config())
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            out = torch.zeros(x.shape[0] // 2, device=DEVICE, dtype=torch.float32)
+            for t in hl.tile(x.shape[0], block_size=2):
+                out[t.id] = x[t.id]
+            return out
+
+        x = torch.randn(128, device=DEVICE, dtype=torch.float32)
+        result = fn(x)
+        torch.testing.assert_close(result, x[: x.shape[0] // 2])
+
+    def test_tensor_access_tile_begin_end(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True, config=helion.Config())
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            out = torch.zeros(x.shape[0], device=DEVICE, dtype=torch.float32)
+            for t in hl.tile(x.shape[0], block_size=2):
+                out[t.begin] = x[t.id]
+                out[t.end - 1] = x[t.id]
+            return out
+
+        x = torch.tensor([0, 1, 2, 3, 4, 5, 6, 7], device=DEVICE, dtype=torch.float32)
+        result = fn(x)
+        expected = torch.tensor(
+            [0, 0, 1, 1, 2, 2, 3, 3], device=DEVICE, dtype=torch.float32
+        )
+        torch.testing.assert_close(result, expected)
 
 
 if __name__ == "__main__":

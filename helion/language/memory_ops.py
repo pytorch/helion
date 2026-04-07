@@ -237,6 +237,13 @@ def _pallas_index_str(
                 dim_map.setdefault(tensor_dim, block_id)
         elif isinstance(idx, int):
             parts.append(str(idx))
+        elif isinstance(idx, torch.SymInt):
+            ast_subscripts = state.ast_args[1]
+            assert isinstance(ast_subscripts, list)
+            ast_idx = ast_subscripts[i]
+            assert isinstance(ast_idx, ast.AST)
+            name = state.codegen.lift(ast_idx, dce=True, prefix="index")
+            parts.append(name.id)
         else:
             parts.append(":")
         out_pos += 1
