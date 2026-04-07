@@ -1459,13 +1459,16 @@ class TestLoops(RefEagerTestBase, TestCase):
         x = torch.randn(128, 1024, dtype=torch.float32, device=DEVICE)
         torch.testing.assert_close(fn(x), x)
 
+    @skipIfNotTriton(
+        "tl.debug_barrier() is only emitted in Triton device codegen (not Pallas/JAX)"
+    )
     @skipIfCudaSharedMemoryLessThan(
         131072, reason="block sizes exceed device shared memory limit"
     )
     def test_sequential_loops_global_memory_barrier(self):
         """Sequential device loops that store then load the same global buffer
         need tl.debug_barrier() between the sibling loops so all warps see
-        prior stores (portable; not gated on ROCm or num_warps)."""
+        prior stores (Triton; portable across ROCm and num_warps)."""
 
         @helion.kernel(autotune_effort="none")
         def two_phase_kernel(
