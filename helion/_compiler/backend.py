@@ -25,6 +25,8 @@ if TYPE_CHECKING:
     from ..runtime.kernel import BoundKernel
     from .device_function import Argument
     from .device_function import DeviceFunction
+    from .device_ir import GraphInfo
+    from .tile_dispatch import TileStrategyDispatch
     from .tile_strategy import TileStrategy
 
     InductorOpOverrides = OpsHandler[Any]
@@ -413,6 +415,18 @@ class Backend(abc.ABC):
 
     def launcher_keyword_args(self, config: Config, *, has_barrier: bool) -> list[str]:
         return []
+
+    def pre_codegen(
+        self,
+        graphs: list[GraphInfo],
+        config: Config,
+        tile_strategy: TileStrategyDispatch,
+    ) -> None:
+        """Run backend-specific passes after tiling is finalized, before codegen.
+
+        Backends can override this to analyze or transform the graphs.
+        """
+        return None
 
     def transform_host_arg(
         self,
@@ -1862,6 +1876,16 @@ class CuteBackend(Backend):
     @property
     def name(self) -> str:
         return "cute"
+
+    def pre_codegen(
+        self,
+        graphs: list[GraphInfo],
+        config: Config,
+        tile_strategy: TileStrategyDispatch,
+    ) -> None:
+        from .cute.layout_propagation import plan_layouts
+
+        plan_layouts(graphs, config, tile_strategy)
 
     def supports_config_key(self, key: str) -> bool:
         if key == "num_threads":
