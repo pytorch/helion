@@ -515,7 +515,11 @@ def supports_maxnreg() -> bool:
 
 @functools.cache
 def _supports_maxnreg() -> bool:
-    return torch.version.hip is None and torch.version.xpu is None
+    return (
+        torch.version.hip is None
+        and torch.version.xpu is None
+        and torch.cuda.is_available()
+    )
 
 
 @functools.cache
