@@ -41,9 +41,9 @@ from .._compat import get_device_name
 from ..runtime.precompile_shim import already_compiled
 from ..runtime.precompile_shim import already_compiled_fail
 from ..runtime.precompile_shim import make_precompiler
-from ..runtime.settings import is_pallas_interpret
 from .benchmarking import do_bench
 from .benchmarking import interleaved_bench
+from .benchmarking import synchronize_device
 from .logger import SUPPRESSED_TRITON_CODE_MSG
 from .logger import AutotuneLogEntry
 from .logger import AutotuningLogger
@@ -78,12 +78,6 @@ if TYPE_CHECKING:
     from .config_generation import FlatConfig
     from .local_cache import SavedBestConfig
     from helion.autotuner.effort_profile import AutotuneEffortProfile
-
-
-def _synchronize_device() -> None:
-    """Synchronize the accelerator unless running in Pallas interpret mode on CPU."""
-    if not is_pallas_interpret() or torch.accelerator.is_available():
-        torch.accelerator.synchronize()
 
 
 class _HasDeviceAndProcessGroupName(Protocol):
@@ -429,7 +423,7 @@ class BaseSearch(BaseAutotuner):
         if self.settings.autotune_baseline_fn is not None:
             try:
                 baseline_output = self.settings.autotune_baseline_fn(*new_args)
-                _synchronize_device()
+                synchronize_device(baseline_output)
             except Exception as e:
                 raise exc.AutotuneError(
                     "Custom baseline function failed while computing baseline.\n"
@@ -442,7 +436,7 @@ class BaseSearch(BaseAutotuner):
                 baseline_output = self.kernel.compile_config(
                     baseline_config, allow_print=False
                 )(*new_args)
-                _synchronize_device()
+                synchronize_device(baseline_output)
             except Exception as e:
                 decorator = self.kernel.format_kernel_decorator(
                     baseline_config, self.settings
@@ -686,12 +680,12 @@ class BaseSearch(BaseAutotuner):
             # TODO(jansel): early exit with fewer trials if early runs are slow
             self.log.debug(lambda: f"Running {config} at {datetime.datetime.now()}")
             t0 = time.perf_counter()
-            _synchronize_device()
+            synchronize_device()
 
             with _capture_ctx as _captured_output:
                 output = fn(*working_args)  # make sure the kernel is compiled
 
-            _synchronize_device()
+            synchronize_device(output)
 
             pass_accuracy_check = (
                 not self.settings.autotune_accuracy_check
@@ -1345,9 +1339,11 @@ class PopulationBasedSearch(BaseSearch):
         hardware = get_device_name(extract_device(self.args))
 
         inner_kernel = getattr(self.kernel, "kernel", None)
-        if inner_kernel is None or not hasattr(inner_kernel, "specialization_key"):
+        if inner_kernel is None or not hasattr(
+            inner_kernel, "_base_specialization_key"
+        ):
             return hardware, None
-        spec_key = inner_kernel.specialization_key(self.args)
+        spec_key = inner_kernel._base_specialization_key(self.args)
         specialization_key = str(_normalize_spec_key(spec_key))
 
         return hardware, specialization_key

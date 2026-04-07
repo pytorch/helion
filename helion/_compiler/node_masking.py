@@ -3,6 +3,7 @@ from __future__ import annotations
 import functools
 from typing import TYPE_CHECKING
 from typing import Any
+from typing import cast
 from typing_extensions import Never
 
 import sympy
@@ -14,6 +15,7 @@ from torch._inductor.virtualized import V
 import torch.fx
 from torch.fx import map_arg
 from torch.fx.experimental import proxy_tensor
+from torch.utils import _pytree as pytree
 from torch.utils._sympy.value_ranges import ValueRanges
 
 from ..language._tracing_ops import _if
@@ -196,15 +198,19 @@ def getitem_masked_value(
     assert isinstance(node, torch.fx.Node)
     assert isinstance(index, int)
     if is_for_loop_target(node.target):
-        graph_id = node.args[0]
+        graph_ids = [node.args[0]]
     elif node.target is _if:
-        graph_id = node.args[1]
+        graph_ids = [node.args[1], node.args[2]]
     else:
         return None
-    assert isinstance(graph_id, int)
-    graph = DeviceIR.current().graphs[graph_id].graph
-    (output_node,) = graph.find_nodes(op="output")
-    (outputs,) = output_node.args
+    assert isinstance(graph_ids, list)
+    assert all(isinstance(graph_id, int) for graph_id in graph_ids)
+    graphs = [
+        DeviceIR.current().graphs[cast("int", graph_id)].graph for graph_id in graph_ids
+    ]
+    output_nodes = [graph.find_nodes(op="output") for graph in graphs]
+    outputs_all = [output[0].args for output in output_nodes]
+    outputs, _ = pytree.tree_flatten(outputs_all)
     assert isinstance(outputs, (list, tuple))
     output = outputs[index]
     if isinstance(output, torch.fx.Node):
