@@ -21,6 +21,7 @@ from torch._environment import is_fbcode
 from .. import exc
 from .._compat import is_hip
 from .._compat import supports_tf32_precision_on_amd
+from .._compiler.backend_registry import list_backends
 from ..autotuner.effort_profile import AutotuneEffort
 from ..autotuner.effort_profile import InitialPopulation
 from ..autotuner.effort_profile import get_effort_profile
@@ -331,13 +332,7 @@ def _get_backend() -> BackendLiteral:
     return _env_get_literal(
         "HELION_BACKEND",
         cast("BackendLiteral", "triton"),
-        mapping={
-            "triton": "triton",
-            "pallas": "pallas",
-            "cute": "cute",
-            "tileir": "tileir",
-            "metal": "metal",
-        },
+        mapping={name: name for name in list_backends()},
     )
 
 

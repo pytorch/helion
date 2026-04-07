@@ -46,6 +46,11 @@ class Backend(abc.ABC):
         ...
 
     @property
+    def experimental(self) -> bool:
+        """Whether this backend is experimental and should emit a warning."""
+        return False
+
+    @property
     def codegen_name(self) -> str:
         """Backend name used to look up registered codegen functions."""
         return self.name
@@ -864,6 +869,10 @@ class PallasBackend(Backend):
     @property
     def name(self) -> str:
         return "pallas"
+
+    @property
+    def experimental(self) -> bool:
+        return True
 
     def dtype_str(self, dtype: torch.dtype) -> str:
         key = str(dtype)
@@ -1863,6 +1872,10 @@ class CuteBackend(Backend):
     def name(self) -> str:
         return "cute"
 
+    @property
+    def experimental(self) -> bool:
+        return True
+
     def supports_config_key(self, key: str) -> bool:
         if key == "num_threads":
             return True
@@ -2603,6 +2616,10 @@ class CuteBackend(Backend):
 
 class MetalBackend(Backend):
     """Metal Shading Language (MSL) code generation backend for macOS."""
+
+    @property
+    def experimental(self) -> bool:
+        return True
 
     @staticmethod
     def _get_dtype_to_metal() -> dict[torch.dtype, str]:
