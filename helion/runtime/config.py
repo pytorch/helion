@@ -44,6 +44,7 @@ class Config(Mapping[str, object]):
         indexing: IndexingLiteral | list[IndexingLiteral] | None = None,
         advanced_controls_file: str | None = None,
         epilogue_subtile: int | None = None,
+        num_reduction_ctas: int | None = None,
         # For user-defined properties
         **kwargs: object,
     ) -> None:
@@ -81,6 +82,10 @@ class Config(Mapping[str, object]):
             advanced_controls_file: Path to a PTXAS control file applied during compilation, or empty string for none.
             epilogue_subtile: Split factor for the epilogue (post-matmul pointwise + store) along
                 the N dimension. None = disabled (default), valid values are 2 or 4.
+            num_reduction_ctas: Number of CTAs in a cluster for cross-CTA reduction via
+                TLX Distributed Shared Memory. Must be a power of 2. When > 1, persistent
+                and looped reductions are automatically lowered to use TLX DSM communication
+                across CTAs. Requires SM90+ (Hopper/Blackwell). Default: 1 (single CTA).
             **kwargs: Additional user-defined configuration parameters.
         """
         self.config = {}
@@ -106,6 +111,7 @@ class Config(Mapping[str, object]):
             "maxnreg": maxnreg,
             "advanced_controls_file": advanced_controls_file,
             "epilogue_subtile": epilogue_subtile,
+            "num_reduction_ctas": num_reduction_ctas,
         }
         for key, value in core_props.items():
             if value is not None:
@@ -305,6 +311,10 @@ class Config(Mapping[str, object]):
     @property
     def epilogue_subtile(self) -> int | None:
         return cast("int | None", self.config.get("epilogue_subtile", None))
+
+    @property
+    def num_reduction_ctas(self) -> int:
+        return cast("int", self.config.get("num_reduction_ctas", 1))
 
 
 def _to_hashable(x: object) -> object:

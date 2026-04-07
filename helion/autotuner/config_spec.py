@@ -54,6 +54,7 @@ _BASE_BACKEND_TUNABLE_KEYS: frozenset[str] = frozenset(
         "num_ctas",
         "occupancy",
         "pallas_loop_type",
+        "num_reduction_ctas",
     }
 )
 

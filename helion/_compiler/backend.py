@@ -557,6 +557,8 @@ class TritonBackend(Backend):
 
         if key in get_mtia_tunable_fragments():
             return supports_mtia_tunables()
+        if key == "num_reduction_ctas":
+            return True
         return super().supports_config_key(key)
 
     def tunable_fragments(self) -> dict[str, ConfigSpecFragment]:
@@ -576,6 +578,10 @@ class TritonBackend(Backend):
 
         if supports_mtia_tunables():
             fragments.update(get_mtia_tunable_fragments())
+
+        from ..autotuner.config_fragment import PowerOfTwoFragment
+
+        fragments["num_reduction_ctas"] = PowerOfTwoFragment(1, 8, 1)
 
         return fragments
 
@@ -773,8 +779,10 @@ class TritonBackend(Backend):
 
         from ..autotuner.config_spec import _get_backend_tunable_keys
 
+        # Keys consumed by Helion (not forwarded to Triton launcher)
+        _helion_only_keys = {"num_reduction_ctas"}
         for key in _get_backend_tunable_keys():
-            if key in config:
+            if key in config and key not in _helion_only_keys:
                 args.append(f"{key}={config[key]!r}")
 
         if "maxnreg" in config and config["maxnreg"] is not None and supports_maxnreg():
@@ -784,6 +792,10 @@ class TritonBackend(Backend):
         if advanced_controls_file:
             ptx_option = f"--apply-controls {advanced_controls_file}"
             args.append(f"ptx_options={ptx_option!r}")
+
+        num_reduction_ctas = config.get("num_reduction_ctas", 1)
+        if isinstance(num_reduction_ctas, int) and num_reduction_ctas > 1:
+            args.append(f"ctas_per_cga=(1, {num_reduction_ctas}, 1)")
 
         return args
 

@@ -676,6 +676,220 @@ class LoopedReductionStrategy(ReductionStrategy):
             return expr_from_string(result)
 
 
+class MultiCTAPersistentReductionStrategy(PersistentReductionStrategy):
+    """Persistent reduction split across CTAs via TLX Distributed Shared Memory.
+
+    Each CTA in the cluster loads a partition of the reduction dimension,
+    performs a local reduction, then aggregates across CTAs using DSM.
+    """
+
+    def __init__(
+        self,
+        fn: DeviceFunction,
+        block_index: int,
+        num_reduction_ctas: int,
+    ) -> None:
+        super().__init__(fn, block_index)
+        self.num_reduction_ctas = num_reduction_ctas
+        self._barrier_index = fn.allocate_dsm_barrier()
+
+    def codegen_preamble(self, state: CodegenState) -> None:
+        super().codegen_preamble(state)
+
+        env = CompileEnvironment.current()
+        numel = env.block_sizes[self.block_index].numel
+        cta_rank = state.device_function.cta_rank_var()
+        numel_expr = self.fn.sympy_expr(numel)
+        index_var = self.index_var(self.block_index)
+        num_ctas = self.num_reduction_ctas
+        per_cta = f"({numel_expr} // {num_ctas})"
+
+        state.add_statement(
+            f"{index_var} = {cta_rank} * {per_cta} + {index_var} % {per_cta}"
+        )
+        if self._mask_var is not None:
+            state.add_statement(
+                f"{self._mask_var} = {index_var} < {numel_expr}"
+            )
+
+    def codegen_reduction(
+        self,
+        state: CodegenState,
+        input_name: str,
+        reduction_type: str,
+        dim: int,
+        fake_input: torch.Tensor,
+        fake_output: torch.Tensor,
+    ) -> ast.AST:
+        local_result_ast = super().codegen_reduction(
+            state, input_name, reduction_type, dim, fake_input, fake_output
+        )
+
+        local_var = self.fn.new_var("dsm_local")
+        state.add_statement(f"{local_var} = {ast.unparse(local_result_ast)}")
+
+        cta_rank = state.device_function.cta_rank_var()
+        barrier_idx = self._barrier_index
+        num_ctas = self.num_reduction_ctas
+
+        output_shape = [*fake_output.size()]
+        shape_dims = self.fn.tile_strategy.shape_dims(output_shape)
+        shape_str = ", ".join(shape_dims)
+
+        env = CompileEnvironment.current()
+        dtype_str = env.backend.dtype_str(fake_output.dtype)
+
+        dsm_buf = self.fn.new_var("dsm_buf")
+        state.add_statement(
+            f"{dsm_buf} = tlx.local_alloc(({shape_str},), {dtype_str}, {num_ctas})"
+        )
+        state.add_statement(
+            f"tlx.local_store({dsm_buf}[{cta_rank}], {local_var})"
+        )
+
+        dsm_i = self.fn.new_var("dsm_i")
+        state.add_statement(
+            f"for {dsm_i} in tl.static_range({num_ctas}):\n"
+            f"    if {cta_rank} != {dsm_i}:\n"
+            f"        tlx.async_remote_shmem_store("
+            f"{dsm_buf}[{cta_rank}], {local_var}, {dsm_i}, barriers[{barrier_idx}])"
+        )
+
+        state.add_statement(
+            f"tlx.barrier_wait(barriers[{barrier_idx}], phase=0)"
+        )
+
+        global_var = self.fn.new_var("dsm_global")
+        state.add_statement(
+            f"{global_var} = tl.zeros(({shape_str},), dtype={dtype_str})"
+        )
+        acc_i = self.fn.new_var("dsm_acc_i")
+        state.add_statement(
+            f"for {acc_i} in tl.static_range({num_ctas}):\n"
+            f"    {global_var} += tlx.local_load(tlx.local_view({dsm_buf}, {acc_i}))"
+        )
+
+        return expr_from_string(global_var)
+
+
+class MultiCTALoopedReductionStrategy(LoopedReductionStrategy):
+    """Looped reduction with double-buffered DSM cross-CTA aggregation."""
+
+    def __init__(
+        self,
+        fn: DeviceFunction,
+        block_index: int,
+        block_size: int,
+        num_reduction_ctas: int,
+    ) -> None:
+        super().__init__(fn, block_index, block_size)
+        self.num_reduction_ctas = num_reduction_ctas
+        self._producer_barrier_base = fn.allocate_dsm_barrier(count=2)
+        self._consumer_barrier_base = fn.allocate_dsm_barrier(count=2)
+
+    def codegen_device_loop(self, state: CodegenState) -> DeviceLoopState:
+        loop_state = super().codegen_device_loop(state)
+
+        env = CompileEnvironment.current()
+        numel = env.block_sizes[self.block_index].numel
+        cta_rank = state.device_function.cta_rank_var()
+        numel_expr = state.sympy_expr(numel)
+        num_ctas = self.num_reduction_ctas
+        per_cta = f"({numel_expr} // {num_ctas})"
+        offset_var = self.offset_var(self.block_index)
+
+        loop_state.inner_statements.insert(
+            0,
+            statement_from_string(
+                f"{offset_var} = {offset_var} + {cta_rank} * {per_cta}"
+            ),
+        )
+        return loop_state
+
+    def codegen_reduction(
+        self,
+        state: CodegenState,
+        input_name: str,
+        reduction_type: str,
+        dim: int,
+        fake_input: torch.Tensor,
+        fake_output: torch.Tensor,
+    ) -> ast.AST:
+        local_result_ast = super().codegen_reduction(
+            state, input_name, reduction_type, dim, fake_input, fake_output
+        )
+
+        local_var = self.fn.new_var("dsm_local")
+        device_loop = state.codegen.active_device_loops[self.block_index][-1]
+        assert isinstance(device_loop, DeviceLoopState)
+
+        cta_rank = state.device_function.cta_rank_var()
+        prod_bar = self._producer_barrier_base
+        num_ctas = self.num_reduction_ctas
+
+        output_shape = [*fake_output.size()]
+        shape_dims = self.fn.tile_strategy.shape_dims(output_shape)
+        shape_str = ", ".join(shape_dims)
+        env = CompileEnvironment.current()
+        dtype_str = env.backend.dtype_str(fake_output.dtype)
+
+        dsm_buf = self.fn.new_var("dsm_buf")
+        global_var = self.fn.new_var("dsm_global")
+
+        device_loop.outer_suffix.append(
+            statement_from_string(f"{local_var} = {ast.unparse(local_result_ast)}")
+        )
+        device_loop.outer_suffix.append(
+            statement_from_string(
+                f"{dsm_buf} = tlx.local_alloc(({shape_str},), {dtype_str}, {num_ctas})"
+            )
+        )
+        device_loop.outer_suffix.append(
+            statement_from_string(
+                f"tlx.local_store({dsm_buf}[{cta_rank}], {local_var})"
+            )
+        )
+
+        dsm_i = self.fn.new_var("dsm_i")
+        device_loop.outer_suffix.append(
+            statement_from_string(
+                f"for {dsm_i} in tl.static_range({num_ctas}):\n"
+                f"    if {cta_rank} != {dsm_i}:\n"
+                f"        tlx.async_remote_shmem_store("
+                f"{dsm_buf}[{cta_rank}], {local_var}, {dsm_i}, barriers[{prod_bar}])"
+            )
+        )
+        device_loop.outer_suffix.append(
+            statement_from_string(
+                f"tlx.barrier_wait(barriers[{prod_bar}], phase=0)"
+            )
+        )
+        device_loop.outer_suffix.append(
+            statement_from_string(
+                f"{global_var} = tl.zeros(({shape_str},), dtype={dtype_str})"
+            )
+        )
+        acc_i = self.fn.new_var("dsm_acc_i")
+        device_loop.outer_suffix.append(
+            statement_from_string(
+                f"for {acc_i} in tl.static_range({num_ctas}):\n"
+                f"    {global_var} += tlx.local_load(tlx.local_view({dsm_buf}, {acc_i}))"
+            )
+        )
+
+        arrive_i = self.fn.new_var("dsm_arrive_i")
+        device_loop.outer_suffix.append(
+            statement_from_string(
+                f"for {arrive_i} in tl.static_range({num_ctas}):\n"
+                f"    if {arrive_i} != {cta_rank}:\n"
+                f"        tlx.barrier_arrive("
+                f"barriers[{self._consumer_barrier_base}], 1, remote_cta_rank={arrive_i})"
+            )
+        )
+
+        return expr_from_string(global_var)
+
+
 class BlockReductionStrategy(ReductionStrategy):
     """This is used when we are reducing over a tile rather than an entire tensor."""
 

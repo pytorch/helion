@@ -106,6 +106,45 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                 self.codegen_graphs, config, self.device_function.tile_strategy
             )
 
+        # Inject TLX DSM prologue if multi-CTA reductions are used
+        if self.device_function.has_dsm:
+            self._inject_dsm_prologue(config)
+
+    def _inject_dsm_prologue(self, config: Config) -> None:
+        """Inject TLX DSM prologue into the device function preamble."""
+        df = self.device_function
+        num_ctas = config.num_reduction_ctas
+        barrier_count = df.dsm_barrier_count
+
+        # Add TLX import to module-level statements
+        self.module_statements.append(
+            statement_from_string("import triton.language.extra.tlx as tlx")
+        )
+
+        # Inject prologue: CTA rank, barrier allocation, cluster sync
+        cta_rank = df.cta_rank_var()
+        df.preamble.append(
+            statement_from_string(f"{cta_rank} = tlx.cluster_cta_rank()")
+        )
+        df.preamble.append(
+            statement_from_string(
+                f"barriers = tlx.alloc_barriers(num_barriers={barrier_count})"
+            )
+        )
+        # Set expected bytes for each barrier (conservative estimate)
+        # The actual size depends on the reduction output shape, but we use
+        # a placeholder that will be refined by the reduction strategy
+        for i in range(barrier_count):
+            df.preamble.append(
+                statement_from_string(
+                    f"tlx.barrier_expect_bytes(barriers[{i}], "
+                    f"size=128 * 4 * ({num_ctas} - 1))"
+                )
+            )
+        df.preamble.append(
+            statement_from_string("tlx.cluster_barrier()")
+        )
+
     def get_graph(self, graph_id: int) -> GraphInfo:
         return self.codegen_graphs[graph_id]
 

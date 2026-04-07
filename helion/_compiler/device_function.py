@@ -297,6 +297,13 @@ class DeviceFunction:
 
         self.helper_manager = HelperFunctionManager()
 
+        # Multi-CTA DSM state tracking (must be before TileStrategyDispatch
+        # since reduction strategies may allocate barriers during __init__)
+        self.dsm_barrier_count: int = 0
+        self.dsm_consumer_barrier_count: int = 0
+        self._cta_rank_var: str | None = None
+        self._has_dsm: bool = False
+
         from .tile_dispatch import TileStrategyDispatch
 
         self.tile_strategy: TileStrategyDispatch = TileStrategyDispatch(self, config)
@@ -317,6 +324,24 @@ class DeviceFunction:
         self.pallas_tensor_dim_block_ids: dict[int, dict[int, int]] = {}
         # Pallas: set of id(fake_tensor) for tensors accessed in pipeline body
         self.pallas_pipeline_tensor_ids: set[int] = set()
+
+    def allocate_dsm_barrier(self, count: int = 1) -> int:
+        """Allocate barrier slot(s) for DSM cross-CTA reduction. Returns base index."""
+        base = self.dsm_barrier_count
+        self.dsm_barrier_count += count
+        self._has_dsm = True
+        return base
+
+    def cta_rank_var(self) -> str:
+        """Get or create the variable name for the CTA rank within the cluster."""
+        if self._cta_rank_var is None:
+            self._cta_rank_var = self.new_var("cta_rank")
+        return self._cta_rank_var
+
+    @property
+    def has_dsm(self) -> bool:
+        """Whether this kernel uses DSM cross-CTA communication."""
+        return self._has_dsm
 
     def allocate_store_index(self) -> int:
         """Bump store counters and return the indexing strategy slot."""

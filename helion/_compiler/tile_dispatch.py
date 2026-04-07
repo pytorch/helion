@@ -12,6 +12,8 @@ from .device_ir import ForLoopGraphInfo
 from .device_ir import ReductionLoopGraphInfo
 from .host_function import HostFunction
 from .reduction_strategy import LoopedReductionStrategy
+from .reduction_strategy import MultiCTALoopedReductionStrategy
+from .reduction_strategy import MultiCTAPersistentReductionStrategy
 from .reduction_strategy import PersistentReductionStrategy
 from .reduction_strategy import ReductionStrategy
 from .tile_strategy import CompactedShape
@@ -87,8 +89,18 @@ class TileStrategyDispatch:
                         reduction_loop = max_threads
                 elif reduction_loop > max_threads:
                     reduction_loop = max_threads
-            if reduction_loop is None:
-                strategy: TileStrategy = PersistentReductionStrategy(fn, block_id)
+            num_reduction_ctas = config.num_reduction_ctas
+            if num_reduction_ctas > 1:
+                if reduction_loop is None:
+                    strategy: TileStrategy = MultiCTAPersistentReductionStrategy(
+                        fn, block_id, num_reduction_ctas
+                    )
+                else:
+                    strategy = MultiCTALoopedReductionStrategy(
+                        fn, block_id, reduction_loop, num_reduction_ctas
+                    )
+            elif reduction_loop is None:
+                strategy = PersistentReductionStrategy(fn, block_id)
             else:
                 strategy = LoopedReductionStrategy(fn, block_id, reduction_loop)
             self.strategies.append(strategy)
