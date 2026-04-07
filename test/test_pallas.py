@@ -548,6 +548,37 @@ class TestPallas(TestCase):
         expected = torch.nn.functional.softmax(x, dim=-1)
         torch.testing.assert_close(result, expected, rtol=1e-4, atol=1e-4)
 
+    def test_scalar_access_1D_constexpr(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True, config=helion.Config())
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            (n,) = x.size()
+            out = torch.zeros_like(x)
+            for _ in hl.tile(n, block_size=4):
+                out[0] = x[0]
+                out[1] = x[1]
+                out[2] = x[2]
+                out[3] = x[3]
+            return out
+
+        x = torch.tensor([1, 2, 3, 4], device=DEVICE, dtype=torch.float32)
+        result = fn(x)
+        torch.testing.assert_close(result, x)
+
+    def test_scalar_access_2D_constexpr(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True, config=helion.Config())
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            n, m = x.size()
+            out = torch.zeros_like(x)
+            for _ in hl.tile([n, m], block_size=[128, 128]):
+                out[42, 79] = x[42, 79]
+            return out
+
+        x = torch.ones((128, 128), device=DEVICE, dtype=torch.float32)
+        result = fn(x)
+        expected = torch.zeros((128, 128), device=DEVICE, dtype=torch.float32)
+        expected[42, 79] = x[42, 79]
+        torch.testing.assert_close(result, expected)
+
 
 if __name__ == "__main__":
     unittest.main()
