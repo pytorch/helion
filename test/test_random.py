@@ -702,6 +702,9 @@ class TestRandom(RefEagerTestBase, TestCase):
 
 @onlyBackends(["triton", "cute"])
 @skipIfRefEager("compiled RNG parity checks are not applicable in ref eager mode")
+@skipIfMTIA(
+    "Skip due to unaligned/unpadded tensor inputs that don't meet MTIA HW requirements"
+)
 class TestRandomPhiloxParity(TestCase):
     def test_reference_matches_triton(self):
         seed = 42
