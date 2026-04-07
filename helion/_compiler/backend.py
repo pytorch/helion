@@ -21,6 +21,7 @@ if TYPE_CHECKING:
     from torch._inductor.ops_handler import OpsHandler
 
     from ..autotuner.config_fragment import ConfigSpecFragment
+    from ..runtime import _BlockSpecInfo
     from ..runtime.config import Config
     from ..runtime.kernel import BoundKernel
     from .device_function import Argument
@@ -1321,6 +1322,7 @@ class PallasBackend(Backend):
             tuple[tuple[int | None, ...], tuple[int | tuple[int, int, int] | None, ...]]
             | None
         ] = []
+
         for arg in sorted_args:
             if isinstance(arg, (SymbolArgument, TensorSizeArg, TensorStrideArg)):
                 result.append(None)  # scalars wrapped as 1-D tensors
@@ -1339,13 +1341,13 @@ class PallasBackend(Backend):
                         # For 1D tensors, the block size must be a
                         # multiple of the 1D tiling factor or equal to
                         # the full dimension.  If neither holds, fall
-                        # back to no BlockSpecs for the entire kernel.
+                        # back to no tiling for the entire kernel.
                         dim_size = tensor.shape[d]
                         if tensor.ndim == 1 and isinstance(dim_size, int):
                             bitwidth = tensor.dtype.itemsize * 8
                             tiling_1d = 128 * (32 // bitwidth)
                             if bs != dim_size and bs % tiling_1d != 0:
-                                return None
+                                return self._no_tiling_block_spec_info(sorted_args)
                         block_shape.append(bs)
                         # When the block covers the entire tensor
                         # dimension there is only one tile, so the grid
@@ -1362,6 +1364,27 @@ class PallasBackend(Backend):
                 block_shape.append(None)
                 grid_dims.append(None)
             result.append((tuple(block_shape), tuple(grid_dims)))
+        return result
+
+    def _no_tiling_block_spec_info(
+        self,
+        sorted_args: list[Argument],
+    ) -> _BlockSpecInfo:
+        result: _BlockSpecInfo = []
+
+        from .device_function import SymbolArgument
+        from .device_function import TensorArg
+        from .device_function import TensorSizeArg
+        from .device_function import TensorStrideArg
+
+        for arg in sorted_args:
+            if isinstance(arg, (SymbolArgument, TensorSizeArg, TensorStrideArg)):
+                result.append(None)  # scalars wrapped as 1-D tensors
+                continue
+            if not isinstance(arg, TensorArg) or arg.fake_value.ndim == 0:
+                continue
+            tensor = arg.fake_value
+            result.append((((None,) * tensor.ndim), ((None,) * tensor.ndim)))
         return result
 
     def build_launcher_args(
@@ -1412,12 +1435,21 @@ class PallasBackend(Backend):
                 block_spec_info.append(None)  # RNG seed buffer is untiled
             launcher_args.append(f"_block_spec_info={block_spec_info!r}")
 
+        from .device_function import DeviceFunction
+
+        device_fn = DeviceFunction.current()
+        smem_ids = device_fn.pallas_smem_tensor_ids
+        if smem_ids and sorted_args is not None:
+            smem_arg_indices = [
+                i
+                for i, arg in enumerate(sorted_args)
+                if isinstance(arg, TensorArg) and id(arg.fake_value) in smem_ids
+            ]
+            launcher_args.append(f"_smem_arg_indices={smem_arg_indices!r}")
+
         # Pass scratch shapes for pipeline/fori_loop launcher
         pallas_loop_type = config.get("pallas_loop_type", "default")
         if pallas_loop_type in ("emit_pipeline", "fori_loop"):
-            from .device_function import DeviceFunction
-
-            device_fn = DeviceFunction.current()
             scratch_shapes = [
                 (
                     s.shape,
