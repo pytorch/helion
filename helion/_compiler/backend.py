@@ -436,6 +436,7 @@ class Backend(abc.ABC):
     def launcher_keyword_args(self, config: Config, *, has_barrier: bool) -> list[str]:
         return []
 
+<<<<<<< HEAD
     def pre_codegen(
         self,
         graphs: list[GraphInfo],
@@ -447,6 +448,18 @@ class Backend(abc.ABC):
         Backends can override this to analyze or transform the graphs.
         """
         return None
+=======
+    @staticmethod
+    def reserved_launch_param_names() -> list[str]:
+        """Names reserved by this backend's kernel launch mechanism.
+
+        These names cannot be used as kernel variables because they
+        collide with parameters of the backend's kernel launch API
+        (e.g., Triton's ``run()`` method uses ``grid``, ``num_warps``,
+        ``num_stages``, etc.).
+        """
+        return []
+>>>>>>> 16b8a939 (moved backend specific reserved names to backend)
 
     def transform_host_arg(
         self,
@@ -846,6 +859,10 @@ class TritonBackend(Backend):
         out.extend(self.launcher_keyword_args(config, has_barrier=has_barrier))
         return out
 
+    @staticmethod
+    def reserved_launch_param_names() -> list[str]:
+        return ["grid", "warmup", "num_warps", "num_stages"]
+
 
 class TileIRBackend(TritonBackend):
     """TileIR code generation backend (extends Triton)."""
@@ -875,6 +892,10 @@ class TileIRBackend(TritonBackend):
             "num_ctas": PowerOfTwoFragment(1, 2, 1),
             "occupancy": PowerOfTwoFragment(1, 8, 1),
         }
+
+    @staticmethod
+    def reserved_launch_param_names() -> list[str]:
+        return ["grid", "warmup", "num_warps", "num_stages", "num_ctas", "occupancy"]
 
 
 # Mapping from torch dtype to JAX dtype string (e.g., "jnp.float32")

@@ -30,6 +30,7 @@ from .ast_extension import statement_from_string
 from .ast_read_writes import ReadWrites
 from .ast_read_writes import ast_rename
 from .ast_read_writes import dead_assignment_elimination
+from .backend_registry import all_reserved_launch_param_names
 from .compile_environment import CompileEnvironment
 from .host_function import HostFunction
 from .host_function import NoCurrentFunction
@@ -261,19 +262,9 @@ class DeviceFunction:
         self.pid: ProgramIDs | None = None
         self.namespace: _Namespace = _Namespace()
         self.namespace._used_names.update(reserved_names())
+
         self.namespace._used_names.update(
-            # used by triton run() method
-            [
-                "grid",
-                "warmup",
-                "num_warps",
-                "num_stages",
-            ]
-            + (
-                ["num_ctas", "occupancy"]
-                if CompileEnvironment.current().backend_name == "tileir"
-                else []
-            )
+            all_reserved_launch_param_names()
             + [
                 x.removeprefix("_triton_config_")
                 for x in config
