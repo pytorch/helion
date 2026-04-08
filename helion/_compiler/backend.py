@@ -1430,12 +1430,21 @@ class PallasBackend(Backend):
                 block_spec_info.append(None)  # RNG seed buffer is untiled
             launcher_args.append(f"_block_spec_info={block_spec_info!r}")
 
+        from .device_function import DeviceFunction
+
+        device_fn = DeviceFunction.current()
+        smem_ids = device_fn.pallas_smem_tensor_ids
+        if smem_ids and sorted_args is not None:
+            smem_arg_indices = [
+                i
+                for i, arg in enumerate(sorted_args)
+                if isinstance(arg, TensorArg) and id(arg.fake_value) in smem_ids
+            ]
+            launcher_args.append(f"_smem_arg_indices={smem_arg_indices!r}")
+
         # Pass scratch shapes for pipeline/fori_loop launcher
         pallas_loop_type = config.get("pallas_loop_type", "default")
         if pallas_loop_type in ("emit_pipeline", "fori_loop"):
-            from .device_function import DeviceFunction
-
-            device_fn = DeviceFunction.current()
             scratch_shapes = [
                 (
                     s.shape,

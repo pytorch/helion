@@ -548,6 +548,109 @@ class TestPallas(TestCase):
         expected = torch.nn.functional.softmax(x, dim=-1)
         torch.testing.assert_close(result, expected, rtol=1e-4, atol=1e-4)
 
+    def test_scalar_access_1D_constexpr(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True, config=helion.Config())
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            (n,) = x.size()
+            out = torch.zeros_like(x)
+            for _ in hl.tile(n, block_size=4):
+                out[0] = x[0]
+                out[1] = x[1]
+                out[2] = x[2]
+                out[3] = x[3]
+            return out
+
+        x = torch.tensor([1, 2, 3, 4], device=DEVICE, dtype=torch.float32)
+        result = fn(x)
+        torch.testing.assert_close(result, x)
+
+    def test_scalar_access_2D_constexpr(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True, config=helion.Config())
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            n, m = x.size()
+            out = torch.zeros_like(x)
+            for _ in hl.tile([n, m], block_size=[128, 128]):
+                out[42, 79] = x[42, 79]
+            return out
+
+        x = torch.ones((128, 128), device=DEVICE, dtype=torch.float32)
+        result = fn(x)
+        expected = torch.zeros((128, 128), device=DEVICE, dtype=torch.float32)
+        expected[42, 79] = x[42, 79]
+        torch.testing.assert_close(result, expected)
+
+    @xfailIfPallas("scalar .begin index not collapsed — BlockSpec keeps full rank")
+    def test_scalar_index_transpose(self) -> None:
+        """Scalar .begin index should collapse the dimension.
+
+        When .begin is used as a scalar subscript, the indexed
+        dimension should be eliminated from the result so that
+        .T produces a correct 2D permutation.
+        """
+
+        @helion.kernel(
+            backend="pallas",
+            static_shapes=True,
+            config=helion.Config(block_sizes=[32, 32, 1]),
+        )
+        def scalar_index_transpose(x: torch.Tensor) -> torch.Tensor:
+            B, M, N = x.shape
+            out = torch.empty([B, N, M], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n, tile_b in hl.tile([M, N, B]):
+                # tile_b has block_size=1, so .begin is used as a scalar index
+                out[tile_b.begin, tile_n, tile_m] = x[tile_b.begin, tile_m, tile_n].T
+            return out
+
+        x = torch.randn(4, 64, 64, device=DEVICE, dtype=torch.float32)
+        _, result = code_and_output(scalar_index_transpose, (x,))
+        expected = x.permute(0, 2, 1)
+        torch.testing.assert_close(result, expected)
+
+    def test_scalar_access_hl_grid(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True, config=helion.Config())
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            (n,) = x.size()
+            out = torch.zeros_like(x)
+            for i in hl.grid(n):
+                out[i] = x[i] + 0.5
+            return out
+
+        x = torch.randn(128, device=DEVICE, dtype=torch.float32)
+        result = fn(x)
+        expected = x + 0.5
+        torch.testing.assert_close(result, expected)
+
+    @xfailIfPallas("Incorrectly uses block_size=1 for -2th dimension")
+    def test_scalar_access_hl_grid_2d(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True, config=helion.Config())
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            (n, m) = x.size()
+            out = torch.zeros_like(x)
+            for i, j in hl.grid([n, m]):
+                out[i, j] = x[i, j] + 0.5
+            return out
+
+        x = torch.randn((128, 128), device=DEVICE, dtype=torch.float32)
+        result = fn(x)
+        expected = x + 0.5
+        torch.testing.assert_close(result, expected)
+
+    @xfailIfPallas("Incorrectly uses block_size=1 for -2th dimension")
+    def test_scalar_access_hl_grid_2d_nested(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True, config=helion.Config())
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            (n, m) = x.size()
+            out = torch.zeros_like(x)
+            for i in hl.grid(n):
+                for j in hl.grid(m):
+                    out[i, j] = x[i, j] + 0.5
+            return out
+
+        x = torch.randn((128, 128), device=DEVICE, dtype=torch.float32)
+        result = fn(x)
+        expected = x + 0.5
+        torch.testing.assert_close(result, expected)
+
 
 if __name__ == "__main__":
     unittest.main()
