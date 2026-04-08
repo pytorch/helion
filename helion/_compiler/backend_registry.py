@@ -16,27 +16,27 @@ from .backend import TritonBackend
 if TYPE_CHECKING:
     from .backend import Backend
 
-_BUILTIN_BACKENDS: list[tuple[str, type[Backend]]] = [
-    ("triton", TritonBackend),
-    ("pallas", PallasBackend),
-    ("cute", CuteBackend),
-    ("tileir", TileIRBackend),
-    ("metal", MetalBackend),
+_BUILTIN_BACKENDS: list[type[Backend]] = [
+    TritonBackend,
+    PallasBackend,
+    CuteBackend,
+    TileIRBackend,
+    MetalBackend,
 ]
 
 _REGISTRY: dict[str, type[Backend]] = {}
 
 
-def register_backend(name: str, backend_class: type[Backend]) -> None:
-    """Register a codegen backend by name.
+def register_compiler_backend(backend_class: type[Backend]) -> None:
+    """Register a compiler backend.
 
+    The backend's ``name`` property is used as the registry key.
     Built-in backends are registered at module load time below.
 
     Args:
-        name: Short name used to select this backend (e.g. ``"triton"``).
         backend_class: A :class:`Backend` subclass.
     """
-    _REGISTRY[name] = backend_class
+    _REGISTRY[backend_class().name] = backend_class
 
 
 def get_backend_class(name: str) -> type[Backend]:
@@ -54,5 +54,5 @@ def list_backends() -> list[str]:
 
 
 # register built-in backends
-for _name, _cls in _BUILTIN_BACKENDS:
-    register_backend(_name, _cls)
+for _cls in _BUILTIN_BACKENDS:
+    register_compiler_backend(_cls)

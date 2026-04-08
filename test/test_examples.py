@@ -14,6 +14,7 @@ from helion import _compat
 from helion._testing import DEVICE
 from helion._testing import EXAMPLES_DIR
 from helion._testing import HALF_DTYPE
+from helion._testing import LONG_INT_TYPE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import _get_backend
@@ -106,6 +107,18 @@ class TestExamples(RefEagerTestBase, TestCase):
             args,
             args[0] @ args[1],
             block_sizes=[128, 128, 128],
+        )
+
+    def test_matmul_default(self):
+        """Matmul without explicit block_sizes to exercise autotuner defaults."""
+        args = (
+            torch.randn([1024, 1024], device=DEVICE, dtype=torch.float32),
+            torch.randn([1024, 1024], device=DEVICE, dtype=torch.float32),
+        )
+        check_example(
+            "matmul",
+            args,
+            args[0] @ args[1],
         )
 
     @xfailIfCute("CuTe barrier-based split-K example is still unsupported")
@@ -459,17 +472,17 @@ class TestExamples(RefEagerTestBase, TestCase):
             indexing="block_ptr",
         )
 
-    @xfailIfPallas("BlockSpec tiling failure")
+    @xfailIfPallas("missing BlockSpec for hl.load with computed indices")
     def test_cross_entropy(self):
         n, v = 128, 1000
-        args = (
-            torch.randn(n, v, device=DEVICE, dtype=torch.float32),
-            torch.randint(0, v, (n,), device=DEVICE, dtype=torch.long),
-        )
+        logits = torch.randn(n, v, device=DEVICE, dtype=torch.float32)
+        labels = torch.randint(0, v, (n,), device=DEVICE, dtype=LONG_INT_TYPE)
+        # PyTorch cross_entropy requires Long labels for the reference
+        expected = torch.nn.functional.cross_entropy(logits, labels.long())
         check_example(
             "cross_entropy",
-            args,
-            torch.nn.functional.cross_entropy(*args),
+            (logits, labels),
+            expected,
         )
 
     @xfailIfCute("CuTe Welford example still returns incorrect results")
@@ -616,7 +629,7 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
 
     @xfailIfCute("CuTe RMSNorm backward example still returns incorrect results")
-    @xfailIfPallas("InductorLoweringError")
+    @skipIfPallas("Generated Pallas code causes Mosaic internal SegFault")
     def test_rms_norm_bwd(self):
         """Test backward pass for rms norm weight gradient."""
         batch_size, dim = 32, 64
@@ -689,6 +702,47 @@ class TestExamples(RefEagerTestBase, TestCase):
             block_sizes=[8, 64],
             indexing="block_ptr",
             pid_type="xyz",
+        )
+
+    @skipIfTileIR("PassManager::run failed")
+    @skipIfPallas("JAX erf lowering incompatibility with gelu")
+    def test_epilogue_subtiling_residual_gelu(self):
+        m, k, n = 8192, 8192, 8192
+        x = torch.randn([m, k], device=DEVICE, dtype=HALF_DTYPE)
+        w = torch.randn([k, n], device=DEVICE, dtype=HALF_DTYPE)
+        bias = torch.randn([n], device=DEVICE, dtype=HALF_DTYPE)
+        residual = torch.randn([m, n], device=DEVICE, dtype=HALF_DTYPE)
+        acc = x.float() @ w.float()
+        expected = torch.nn.functional.gelu(
+            acc * 1.25 + residual.float() * 0.5 + bias.float()
+        ).half()
+        check_example(
+            "epilogue_subtiling",
+            (x, w, bias, residual),
+            expected,
+            fn_name="matmul_bias_residual_gelu_cast",
+            block_sizes=[64, 64, 64],
+        )
+
+    @skipIfTileIR("PassManager::run failed")
+    @skipIfPallas("JAX erf lowering incompatibility with gelu")
+    def test_epilogue_subtiling_gelu_aux(self):
+        m, k, n = 8192, 8192, 8192
+        x = torch.randn([m, k], device=DEVICE, dtype=HALF_DTYPE)
+        w = torch.randn([k, n], device=DEVICE, dtype=HALF_DTYPE)
+        bias = torch.randn([n], device=DEVICE, dtype=HALF_DTYPE)
+        acc = x.float() @ w.float()
+        pre = acc * 1.25 + bias.float()
+        expected = (
+            torch.nn.functional.gelu(pre).half(),
+            pre.half(),
+        )
+        check_example(
+            "epilogue_subtiling",
+            (x, w, bias),
+            expected,
+            fn_name="matmul_bias_gelu_aux",
+            block_sizes=[64, 64, 64],
         )
 
     @skipIfFn(

@@ -59,8 +59,9 @@ def _prepare_mem_args(
 
 
 def _codegen_common(
-    tl_func: str, state: CodegenState, value_exprs: list[ast.AST]
+    op: str, state: CodegenState, value_exprs: list[ast.AST]
 ) -> ast.AST:
+    """Route any single-value atomic op through the atomic_indexing strategy."""
     target = state.proxy_arg(0)
     index = state.proxy_arg(1)
     sem = expr_from_string(repr(state.proxy_arg(len(state.ast_args) - 1)))
@@ -70,23 +71,13 @@ def _codegen_common(
 
     host_function = HostFunction.current()
     if target not in host_function.tensor_to_origin:
-        raise exc.AtomicOnDeviceTensor(tl_func)
+        raise exc.AtomicOnDeviceTensor(op)
 
-    indices = SubscriptIndexing.create(state, target, index)
-    name = state.device_function.tensor_arg(target).name
-
-    placeholder_names = [f"v{i}" for i in range(len(value_exprs))]
-    values_section = (
-        ", " + ", ".join([f"{{{n}}}" for n in placeholder_names]) if value_exprs else ""
-    )
-    placeholders = dict(zip(placeholder_names, value_exprs, strict=False))
-    return expr_from_string(
-        f"tl.{tl_func}({name} + {{offset}}{values_section}, mask={{mask}}, sem={{sem}})",
-        offset=indices.index_expr,
-        mask=indices.mask_expr,
-        sem=sem,
-        **placeholders,
-    )
+    device_fn = state.device_function
+    indexing_idx = device_fn.atomic_op_index
+    device_fn.atomic_op_index += 1
+    strategy = device_fn.get_atomic_indexing_strategy(indexing_idx)
+    return strategy.codegen_atomic(op, state, target, index, value_exprs[0], sem)
 
 
 def _cute_pointer_expr(
@@ -608,13 +599,19 @@ def _(state: CodegenState) -> ast.AST:
 @_decorators.codegen(atomic_add, "pallas")
 def _(state: CodegenState) -> ast.AST:
     from .._compiler.ast_extension import statement_from_string
+    from .._compiler.compile_environment import CompileEnvironment
 
     name, index_str, prev_var = _pallas_atomic_load_prev(state)
     value_ast = _to_ast_values([state.ast_args[2]])[0]
+    target = state.proxy_arg(0)
+    assert isinstance(target, torch.Tensor)
+    backend = CompileEnvironment.current().backend
+    target_dtype = backend.dtype_str(target.dtype)
+    # Cast the sum to the target dtype so the store doesn't fail when
+    # the value dtype differs (e.g. float32 accumulator into bfloat16 ref).
+    cast = backend.cast_expr(f"{prev_var} + {{value}}", target_dtype)
     state.codegen.add_statement(
-        statement_from_string(
-            f"{name}[{index_str}] = {prev_var} + {{value}}", value=value_ast
-        )
+        statement_from_string(f"{name}[{index_str}] = {cast}", value=value_ast)
     )
     return expr_from_string(prev_var)
 
@@ -1227,6 +1224,11 @@ def _(state: CodegenState) -> ast.AST:
 
     assert isinstance(target, torch.Tensor)
     assert isinstance(index, list)
+
+    # CAS always uses pointer (not a TMA reduction op, two values),
+    # but increment the counter to keep per-op atomic_indexing aligned.
+    device_fn = state.device_function
+    device_fn.atomic_op_index += 1
 
     indices = SubscriptIndexing.create(state, target, index)
     name = state.device_function.tensor_arg(target).name

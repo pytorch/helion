@@ -988,9 +988,23 @@ def _codegen_fori_loop(state: CodegenState) -> object:
         tensor_to_sem[hbm_name] = sem_name
 
     # Build the body function
-    body_fn_name = state.device_function.new_var("_fori_body")
-    loop_var = state.device_function.new_var("_j")
     body_stmts: list[ast.AST] = []
+
+    strategy = _find_strategy(state, block_ids)
+
+    # NOTE: FlattenedTileStrategy with multi-dim inner loops is not handled
+    # yet.  The nested fori_loop emission assumes NDTileStrategy where each
+    # dimension has its own block size and grid extent.
+
+    # Create one loop variable per dimension for nested fori_loops.
+    # Each dimension gets its own fori_loop; the innermost wraps body_stmts.
+    if len(block_ids) == 1:
+        loop_vars = [state.device_function.new_var("_j")]
+    else:
+        loop_vars = [
+            state.device_function.new_var(f"_j{i}") for i in range(len(block_ids))
+        ]
+    dim_idx_exprs: list[str] = loop_vars
 
     # Build block_id_to_info
     block_id_to_info: dict[int, LoopDimInfo] = {}
@@ -1000,7 +1014,6 @@ def _codegen_fori_loop(state: CodegenState) -> object:
             end_expr=env.block_sizes[block_id].numel,
         )
 
-    strategy = _find_strategy(state, block_ids)
     # Set up mask variables for inner-loop block_ids
     _setup_inner_loop_masks(
         state,
@@ -1010,14 +1023,16 @@ def _codegen_fori_loop(state: CodegenState) -> object:
         env,
         body_stmts,
         # fori_loop has direct access to the loop variable
-        offset_expr_fn=lambda i, bs: f"{loop_var} * {bs} + jnp.arange({bs})",
+        offset_expr_fn=lambda i, bs: f"{dim_idx_exprs[i]} * {bs} + jnp.arange({bs})",
     )
-    # Create ForiLoopState
+
+    # Create ForiLoopState (body_fn_name and loop_var_name are currently
+    # unused by consumers but stored for debugging; use outermost values)
     fori_state = ForiLoopState(
         strategy=strategy,  # pyrefly: ignore[bad-argument-type]
         block_id_to_info=block_id_to_info,
-        body_fn_name=body_fn_name,
-        loop_var_name=loop_var,
+        body_fn_name="_fori_body_0",
+        loop_var_name=loop_vars[0],
         inner_statements=body_stmts,
         _tensor_to_vmem=tensor_to_vmem,
         _tensor_to_sem=tensor_to_sem,
@@ -1038,8 +1053,9 @@ def _codegen_fori_loop(state: CodegenState) -> object:
                 begin_expr = begin_exprs[bid_idx]
                 iter_step_expr = iter_step_exprs[bid_idx]
                 slice_size_expr = slice_size_exprs[bid_idx]
+                dim_idx_expr = dim_idx_exprs[bid_idx]
                 parts.append(
-                    f"pl.ds(({begin_expr}) + ({loop_var}) * ({iter_step_expr}), {slice_size_expr})"
+                    f"pl.ds(({begin_expr}) + ({dim_idx_expr}) * ({iter_step_expr}), {slice_size_expr})"
                 )
                 needs_slice = True
             elif bid is not None and bid not in block_ids:
@@ -1111,23 +1127,30 @@ def _codegen_fori_loop(state: CodegenState) -> object:
             )
             state.codegen.add_statement(statement_from_string(f"{copy_out_var}.wait()"))
 
-    # Emit the function def and fori_loop call
-    fn_def = statement_from_string(f"def {body_fn_name}({loop_var}, _): pass")
-    assert isinstance(fn_def, ast.FunctionDef)
-    fn_def.body = body_stmts or [ast.Pass()]  # pyrefly: ignore[bad-assignment]
-
-    # Compute n_tiles
-    if len(grid_parts) == 1:
-        n_tiles_expr = grid_parts[0]
-    else:
-        n_tiles_expr = " * ".join(f"({p})" for p in grid_parts)
-
-    state.add_statement(fn_def)
-    state.add_statement(
-        statement_from_string(
-            f"jax.lax.fori_loop(0, {n_tiles_expr}, {body_fn_name}, None)"
+    # Emit nested fori_loop calls — one per dimension.
+    # Build inside-out: innermost function wraps body_stmts, each outer
+    # function wraps the inner fori_loop call.
+    # Note: loops are emitted in block_ids order (not loop_order).
+    # loop_order is a config knob for the outer grid strategy (NDTileStrategy),
+    # not for inner device loops.  For element-wise ops iteration order does
+    # not affect correctness; for loop-carried state the user's source order
+    # (block_ids order) is the correct semantic order.
+    current_body = body_stmts or [ast.Pass()]  # pyrefly: ignore[bad-assignment]
+    for dim in reversed(range(len(loop_vars))):
+        fn_name = state.device_function.new_var(f"_fori_body_{dim}")
+        fn_def = statement_from_string(f"def {fn_name}({loop_vars[dim]}, _): pass")
+        assert isinstance(fn_def, ast.FunctionDef)
+        fn_def.body = current_body  # pyrefly: ignore[bad-assignment]
+        fori_call = statement_from_string(
+            f"jax.lax.fori_loop(0, {grid_parts[dim]}, {fn_name}, None)"
         )
-    )
+        if dim == 0:
+            # Outermost: emit function def and fori_loop call into the kernel
+            state.add_statement(fn_def)
+            state.add_statement(fori_call)
+        else:
+            # Inner: wrap in the next outer function's body
+            current_body = [fn_def, fori_call]
 
     # After fori_loop: read final loop-carried state from scratch
     if has_loop_state:
@@ -1569,6 +1592,36 @@ def _(state: CodegenState) -> ast.AST:
     return expr_from_string(
         backend.where_expr(mask_expr, "{expr}", "{other}"),
         expr=state.ast_arg(0),
+        other=other_typed,
+    )
+
+
+@_decorators.codegen(_mask_to, "metal")
+def _(state: CodegenState) -> ast.AST:
+    tensor = state.proxy_arg(0)
+    assert isinstance(tensor, torch.Tensor)
+    other = state.proxy_arg(1)
+    assert isinstance(other, (int, float, bool))
+    mask_exprs: list[str] = []
+    input_sizes = [*tensor.size()]
+    for size in input_sizes:
+        if (
+            index := CompileEnvironment.current().resolve_block_id(size)
+        ) is not None and (mask_var := state.codegen.mask_var(index)) is not None:
+            if mask_var not in mask_exprs:
+                mask_exprs.append(mask_var)
+    if not mask_exprs:
+        return state.ast_arg(0)
+    mask_expr = " and ".join(mask_exprs)
+    input_dtype = tensor.dtype
+    other_typed = CompileEnvironment.current().backend.cast_ast(
+        expr_from_string(constant_repr(other)),
+        input_dtype,
+    )
+    return expr_from_string(
+        "({expr} if {mask} else {other})",
+        expr=state.ast_arg(0),
+        mask=expr_from_string(mask_expr),
         other=other_typed,
     )
 

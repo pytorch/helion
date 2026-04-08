@@ -35,7 +35,7 @@ from ._utils import counters
 from .autotuner.benchmarking import synchronize_device
 from .runtime.settings import _get_backend
 from .runtime.settings import is_pallas_interpret
-from helion.autotuner.base_search import _clone_args
+from helion.autotuner.benchmark_provider import _clone_args
 
 if _get_backend() == "pallas":
     from .autotuner.benchmarking import compute_repeat_generic as compute_repeat
@@ -247,6 +247,12 @@ if _get_backend() == "pallas":
     HALF_DTYPE = torch.bfloat16
 else:
     HALF_DTYPE = torch.float16
+
+# Long integer dtype: int32 on TPU (64-bit types not supported), int64 elsewhere
+if _get_backend() == "pallas":
+    LONG_INT_TYPE = torch.int32
+else:
+    LONG_INT_TYPE = torch.int64
 
 
 def get_nvidia_gpu_model() -> str:
@@ -993,6 +999,14 @@ def output_only(
     return result
 
 
+def _as_tensors(result: object) -> list[torch.Tensor]:
+    """Normalize a single tensor or tuple of tensors to a flat list."""
+    if isinstance(result, tuple):
+        return [t.clone() for t in result]
+    assert isinstance(result, torch.Tensor)
+    return [result.clone()]
+
+
 def run_example(
     kernel_fn: Callable[..., torch.Tensor] | Kernel | dict[str, Kernel],
     baseline_fn: Callable[..., torch.Tensor] | dict[str, Callable[..., torch.Tensor]],
@@ -1039,29 +1053,31 @@ def run_example(
 
     # Check correctness against first baseline
     first_baseline_name, first_baseline_func = next(iter(baselines.items()))
-    expected = first_baseline_func(*args).clone()
+    expected = _as_tensors(first_baseline_func(*args))
 
     for name, func in {**kernels, **baselines}.items():
         if name != first_baseline_name:
             print(f"Testing {name} correctness...", file=sys.stderr)
             # Clone args to avoid buffer donation issues (e.g., Pallas/TPU)
             cloned_args = _clone_args(args, process_group_name=process_group_name)
-            result = func(*cloned_args).clone()
-            if max_mismatch_pct is not None:
-                assert_close_with_mismatch_tolerance(
-                    result.to(torch.float32),
-                    expected.to(torch.float32),
-                    atol=atol,
-                    rtol=rtol,
-                    max_mismatch_pct=max_mismatch_pct,
-                )
-            else:
-                torch.testing.assert_close(
-                    result.to(torch.float32),
-                    expected.to(torch.float32),
-                    rtol=rtol,
-                    atol=atol,
-                )
+            result = _as_tensors(func(*cloned_args))
+            assert len(result) == len(expected)
+            for r, e in zip(result, expected, strict=True):
+                if max_mismatch_pct is not None:
+                    assert_close_with_mismatch_tolerance(
+                        r.to(torch.float32),
+                        e.to(torch.float32),
+                        atol=atol,
+                        rtol=rtol,
+                        max_mismatch_pct=max_mismatch_pct,
+                    )
+                else:
+                    torch.testing.assert_close(
+                        r.to(torch.float32),
+                        e.to(torch.float32),
+                        rtol=rtol,
+                        atol=atol,
+                    )
 
     # Test backward pass
     if bwd:

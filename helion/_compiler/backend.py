@@ -26,6 +26,8 @@ if TYPE_CHECKING:
     from ..runtime.kernel import BoundKernel
     from .device_function import Argument
     from .device_function import DeviceFunction
+    from .device_ir import GraphInfo
+    from .tile_dispatch import TileStrategyDispatch
     from .tile_strategy import TileStrategy
 
     InductorOpOverrides = OpsHandler[Any]
@@ -49,7 +51,7 @@ class Backend(abc.ABC):
     @property
     def experimental(self) -> bool:
         """Whether this backend is experimental and should emit a warning."""
-        return False
+        return True
 
     @property
     def codegen_name(self) -> str:
@@ -290,6 +292,20 @@ class Backend(abc.ABC):
         """Generate a host-side next-power-of-2 expression."""
         raise exc.BackendUnsupported(self.name, "next_power_of_2")
 
+    def static_rdim_size(self, numel: int) -> int:
+        """Return the RDIM block size for a statically known reduction dimension."""
+        from torch._inductor.runtime.runtime_utils import next_power_of_2
+
+        return next_power_of_2(numel)
+
+    def dynamic_rdim_size_expr(self, expr: str) -> str:
+        """Generate a host-side expression for RDIM size from a dynamic dimension.
+
+        By default delegates to next_power_of_2_host_expr. Backends like Pallas
+        that need exact sizes can override to return the expression unchanged.
+        """
+        return self.next_power_of_2_host_expr(expr)
+
     def reduction_combine_expr(
         self,
         reduction_type: str,
@@ -420,6 +436,18 @@ class Backend(abc.ABC):
     def launcher_keyword_args(self, config: Config, *, has_barrier: bool) -> list[str]:
         return []
 
+    def pre_codegen(
+        self,
+        graphs: list[GraphInfo],
+        config: Config,
+        tile_strategy: TileStrategyDispatch,
+    ) -> None:
+        """Run backend-specific passes after tiling is finalized, before codegen.
+
+        Backends can override this to analyze or transform the graphs.
+        """
+        return None
+
     def transform_host_arg(
         self,
         arg: Argument,
@@ -547,6 +575,10 @@ class TritonBackend(Backend):
     @property
     def name(self) -> str:
         return "triton"
+
+    @property
+    def experimental(self) -> bool:
+        return False
 
     def supports_config_key(self, key: str) -> bool:
         if key == "waves_per_eu":
@@ -864,6 +896,10 @@ _TORCH_TO_JAX_DTYPE: dict[str, str] = {
 }
 
 
+# TPU does not natively support 64-bit element types.
+_PALLAS_UNSUPPORTED_DTYPES = frozenset({torch.int64, torch.uint64, torch.float64})
+
+
 class PallasBackend(Backend):
     """Pallas (JAX) code generation backend for TPU."""
 
@@ -1131,6 +1167,36 @@ class PallasBackend(Backend):
     def reduction_index_zero_expr(self, dtype: str) -> str:
         return f"jnp.zeros([0], dtype={dtype})"
 
+    def static_rdim_size(self, numel: int) -> int:
+        # Pallas block refs use exact tensor dimensions, so RDIM_SIZE must
+        # match (no power-of-2 rounding that would exceed the block ref).
+        return numel
+
+    def dynamic_rdim_size_expr(self, expr: str) -> str:
+        return expr
+
+    def _get_pallas_required_alignment(
+        self, dim_from_end: int, tensor_ndim: int, bitwidth: int
+    ) -> int:
+        """Requirements documented in https://docs.jax.dev/en/latest/pallas/grid_blockspec.html
+
+        Args:
+            dim_from_end (int): The dimension being queried for alignment requirements, indexed from the end. i.e. [... ,2, 1, 0]
+            tensor_ndim (int): Amount of dimensions for the tensor.
+            bitwidth (int): Bitwidth of tensor elements
+        """
+        # Cap to 32: wider dtypes (e.g. float64, int64) would cause
+        # ZeroDivisionError in 32 // bitwidth.  64-bit types are rejected
+        # at runtime, so block spec computation uses 32-bit alignment.
+        bitwidth = min(bitwidth, 32)
+        if dim_from_end == 0:  # Last dimension
+            if tensor_ndim <= 1:
+                return 128 * (32 // bitwidth)
+            return 128
+        if dim_from_end == 1:  # Second to last dimension
+            return 8
+        return 1  # No requirements for other dimensions
+
     def adjust_block_size_constraints(
         self,
         block_specs: list[object],
@@ -1157,10 +1223,6 @@ class PallasBackend(Backend):
 
         from ..autotuner.config_spec import BlockSizeSpec
         from .compile_environment import BlockSizeInfo
-
-        # Tiling size for 1D arrays.  Mosaic lowering enforces that rank-1
-        # BlockSpec block shapes are a multiple of 128 * (32 // bitwidth).
-        tiling_1d = 128 * (32 // min_element_bits)
 
         # Map block_id -> minimum dim_from_end across all tensors
         min_dim_from_end: dict[int, int] = {}
@@ -1192,20 +1254,20 @@ class PallasBackend(Backend):
             if not isinstance(spec, BlockSizeSpec):
                 continue
             bid = spec.block_ids[0]
-            dfe = min_dim_from_end.get(bid, ndim - 1 - i)
-            if dfe == 0:
-                tndim = min_tensor_ndim.get(bid, ndim)
-                alignment = tiling_1d if tndim <= 1 else 128
-                # When the tensor dim is smaller than the alignment, any
-                # block_size >= tensor_dim will be capped to tensor_dim at
-                # runtime (full-dim access, always valid).  Use the
-                # tensor dim as the minimum so smaller but still-valid
-                # block sizes are not unnecessarily excluded.
-                dim_size = next_power_of_2(max(spec.size_hint, 1))
-                spec.update_min(min(alignment, dim_size))
-            elif dfe == 1:
-                dim_size = next_power_of_2(max(spec.size_hint, 1))
-                spec.update_min(min(8, dim_size))
+            dim_from_end = min_dim_from_end.get(bid, ndim - 1 - i)
+            tensor_ndim = min_tensor_ndim.get(bid, ndim)
+            requirement_alignment = self._get_pallas_required_alignment(
+                dim_from_end, tensor_ndim, min_element_bits
+            )
+
+            # When the tensor dim is smaller than the alignment, any
+            # block_size >= tensor_dim will be capped to tensor_dim at
+            # runtime (full-dim access, always valid).  Use the
+            # tensor dim as the minimum so smaller but still-valid
+            # block sizes are not unnecessarily excluded.
+            dim_size = next_power_of_2(max(spec.size_hint, 1))
+
+            spec.update_min(min(requirement_alignment, dim_size))
 
     def tunable_fragments(self) -> dict[str, ConfigSpecFragment]:
         return {}
@@ -1253,8 +1315,8 @@ class PallasBackend(Backend):
     ):
         """Compute per-tensor ``(block_shape, grid_dims)`` from codegen tiling info.
 
-        Uses ``DeviceFunction.pallas_tensor_dim_block_ids`` (recorded during
-        load/store codegen from SymInt subscripts) for an unambiguous
+        Uses ``DeviceFunction.pallas_tensor_dim_tilings`` (recorded during
+        ``plan_tiling`` from SymInt subscripts) for an unambiguous
         dim → block_id mapping.
         """
         if sorted_args is None:
@@ -1325,24 +1387,35 @@ class PallasBackend(Backend):
             if not isinstance(arg, TensorArg) or arg.fake_value.ndim == 0:
                 continue
             tensor = arg.fake_value
-            dim_block_ids = device_fn.pallas_tensor_dim_block_ids.get(id(tensor), {})
+            dim_tilings = device_fn.pallas_tensor_dim_tilings.get(id(tensor))
+            if dim_tilings is None:
+                # this means this tensor isn't accessed at all in the kernel
+                result.append(None)
+                return None
             block_shape: list[int | None] = []
             grid_dims: list[int | tuple[int, int, int] | None] = []
             for d in range(tensor.ndim):
-                bid = dim_block_ids.get(d)
+                dim_tiling = dim_tilings[d]
+                if not dim_tiling.can_tile or len(dim_tiling.block_ids) == 0:
+                    block_shape.append(None)
+                    grid_dims.append(None)
+                    continue
+                assert len(dim_tiling.block_ids) == 1
+                bid = dim_tiling.block_ids[0]
                 if bid is not None and bid in known_block_ids:
                     bs = env.block_sizes[bid].from_config(config)
                     if isinstance(bs, int):
-                        # For 1D tensors, the block size must be a
-                        # multiple of the 1D tiling factor or equal to
-                        # the full dimension.  If neither holds, fall
-                        # back to no tiling for the entire kernel.
+                        # Check that the block size meets Pallas requirements:
+                        # https://docs.jax.dev/en/latest/pallas/grid_blockspec.html
+                        # If not, fall-back to no tiling for the entire kernel
                         dim_size = tensor.shape[d]
-                        if tensor.ndim == 1 and isinstance(dim_size, int):
-                            bitwidth = tensor.dtype.itemsize * 8
-                            tiling_1d = 128 * (32 // bitwidth)
-                            if bs != dim_size and bs % tiling_1d != 0:
-                                return self._no_tiling_block_spec_info(sorted_args)
+                        dim_from_end = tensor.ndim - 1 - d
+                        bitwidth = tensor.dtype.itemsize * 8
+                        required_alignment = self._get_pallas_required_alignment(
+                            dim_from_end, tensor.ndim, bitwidth
+                        )
+                        if bs != dim_size and bs % required_alignment != 0:
+                            return self._no_tiling_block_spec_info(sorted_args)
                         block_shape.append(bs)
                         # When the block covers the entire tensor
                         # dimension there is only one tile, so the grid
@@ -1400,7 +1473,32 @@ class PallasBackend(Backend):
         from .device_function import TensorArg
         from .host_function import HostFunction
 
+        def _empty_allocated_vars(body: list[ast.stmt]) -> set[str]:
+            """Return names of variables allocated with torch.empty/empty_like/new_empty.
+
+            Only checks top-level assignments; allocations nested inside
+            if/with/try are conservatively missed (treated as needing input,
+            which is correct but suboptimal).
+            """
+            result: set[str] = set()
+            for stmt in body:
+                if (
+                    isinstance(stmt, ast.Assign)
+                    and len(stmt.targets) == 1
+                    and isinstance(stmt.targets[0], ast.Name)
+                    and isinstance(stmt.value, ast.Call)
+                    and isinstance(stmt.value.func, ast.Attribute)
+                    and stmt.value.func.attr in ("empty", "empty_like", "new_empty")
+                ):
+                    result.add(stmt.targets[0].id)
+            return result
+
         output_indices: list[int] = []
+        # Indices of output tensors that are also read by the kernel
+        # (inplace-mutated params or body-created tensors the kernel reads).
+        # These must use VMEM BlockSpecs. Output-only tensors (written but
+        # never read) get HBM in_specs to avoid VMEM pressure.
+        inplace_indices: list[int] = []
         if sorted_args is not None:
             env = CompileEnvironment.current()
             host_fn = HostFunction.current()
@@ -1408,18 +1506,43 @@ class PallasBackend(Backend):
                 a.arg for a in host_fn.args.args
             }
             input_storages = {id(t.untyped_storage()) for t in env.input_sources}
-
+            # Collect reads from for-loop bodies only (kernel code), excluding
+            # host-level reads like ``return out``.
+            # Note: Python AST counts ``out[tile] = val`` as a Load of ``out``
+            # (the object must be loaded to index into it), but from Pallas's
+            # perspective this is a pure write — the tensor data is not read.
+            # Subtract such "false reads" by checking inplace_writes counts.
+            #
+            # Only tensors allocated with torch.empty/empty_like/new_empty can be
+            # output-only — their initial values are undefined, so it's safe
+            # to use HBM BlockSpecs.  Tensors allocated with torch.zeros_like,
+            # torch.full, etc. have meaningful initial values that must be
+            # preserved via VMEM BlockSpecs.
+            empty_vars = _empty_allocated_vars(host_fn.body)
+            kernel_reads: set[str] = set()
+            for stmt in host_fn.body:
+                if isinstance(stmt, ast.For):
+                    body_rw = ReadWrites.from_list(stmt.body)
+                    for name, read_count in body_rw.reads.items():
+                        iw_count = body_rw.inplace_writes.get(name, 0)
+                        if read_count > iw_count or name not in empty_vars:
+                            kernel_reads.add(name)
             for i, arg in enumerate(sorted_args):
                 if not isinstance(arg, TensorArg):
                     continue
                 if id(arg.fake_value.untyped_storage()) not in input_storages:
                     # Tensor created inside the function body (output)
                     output_indices.append(i)
+                    if arg.host_str() in kernel_reads:
+                        # Also read by the kernel (e.g. broadcast result)
+                        inplace_indices.append(i)
                 elif arg.host_str() in mutated_params:
                     # Input tensor mutated in-place
                     output_indices.append(i)
+                    inplace_indices.append(i)
 
         launcher_args = [*args, f"_output_indices={output_indices}"]
+        launcher_args.append(f"_inplace_indices={inplace_indices}")
 
         if has_rng_ops:
             launcher_args.insert(-1, "_rng_seed_buffer")
@@ -1490,6 +1613,16 @@ class PallasBackend(Backend):
             return self.build_launcher_name(config)
         except Exception:
             return self.default_launcher_name
+
+    def pre_codegen(
+        self,
+        graphs: list[GraphInfo],
+        config: Config,
+        tile_strategy: TileStrategyDispatch,
+    ) -> None:
+        from .pallas.plan_tiling import plan_tiling
+
+        plan_tiling(graphs, config, tile_strategy)
 
 
 def _detect_mma_loop(
@@ -1904,9 +2037,15 @@ class CuteBackend(Backend):
     def name(self) -> str:
         return "cute"
 
-    @property
-    def experimental(self) -> bool:
-        return True
+    def pre_codegen(
+        self,
+        graphs: list[GraphInfo],
+        config: Config,
+        tile_strategy: TileStrategyDispatch,
+    ) -> None:
+        from .cute.layout_propagation import plan_layouts
+
+        plan_layouts(graphs, config, tile_strategy)
 
     def supports_config_key(self, key: str) -> bool:
         if key == "num_threads":
@@ -2695,7 +2834,7 @@ class MetalBackend(Backend):
 
     @property
     def function_decorator(self) -> str:
-        return ""
+        return "metal_jit"
 
     @property
     def constexpr_type(self) -> str:
@@ -2716,6 +2855,7 @@ class MetalBackend(Backend):
                 "from helion.runtime import default_metal_launcher"
                 " as _default_metal_launcher"
             ),
+            "metal_jit": ("from helion._compiler.metal.metal_jit import metal_jit"),
         }
 
     def index_type_str(self, index_dtype: torch.dtype) -> str:
@@ -2738,6 +2878,11 @@ class MetalBackend(Backend):
     def force_tile_mask(self) -> bool:
         return True
 
+    def inductor_op_overrides(self) -> InductorOpOverrides:
+        from .metal.metal_overrides import MetalOverrides
+
+        return MetalOverrides()
+
     def full_expr(
         self, shape_dims: list[str], value_expr: str, dtype: torch.dtype
     ) -> str:
@@ -2754,7 +2899,8 @@ class MetalBackend(Backend):
         return "0"
 
     def where_expr(self, mask: str, true_val: str, false_val: str) -> str:
-        return f"({mask} ? {true_val} : {false_val})"
+        # Must be valid Python for expr_from_string; walker converts to C++ ternary
+        return f"({true_val} if {mask} else {false_val})"
 
     def minimum_expr(self, a: str, b: str) -> str:
         return f"min({a}, {b})"

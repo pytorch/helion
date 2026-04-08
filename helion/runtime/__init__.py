@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from contextlib import suppress
 import contextvars
-import hashlib
 import linecache
 import sys
 from typing import Any
@@ -250,27 +249,39 @@ def _pallas_build_block_specs(
     output_indices: list[int],
     block_spec_info: _BlockSpecInfo | None = None,
     _smem_arg_indices: list[int] | None = None,
+    _output_only_set: set[int] | None = None,
 ) -> tuple[list[object] | None, object | None]:
-    """Build ``in_specs`` and ``out_specs`` for ``pl.pallas_call``."""
+    """Build ``in_specs`` and ``out_specs`` for ``pl.pallas_call``.
+
+    Output-only tensors (in ``_output_only_set``) get HBM in_specs
+    to avoid VMEM pressure while keeping VMEM out_specs for writes.
+    """
     if block_spec_info is None or len(grid) == 0:
         return None, None
+
+    output_only_set = _output_only_set or set()
 
     in_specs = []
     for tensor_pos, idx in enumerate(tensor_arg_indices):
         t = args[idx]
         assert isinstance(t, torch.Tensor)
-        should_use_smem = tensor_pos in (_smem_arg_indices or [])
-        in_specs.append(
-            _pallas_make_block_spec(
-                pl, jnp, pltpu, t, block_spec_info[tensor_pos], should_use_smem
+        if idx in output_only_set:
+            in_specs.append(pl.BlockSpec(memory_space=pl.ANY))  # type: ignore[union-attr]
+        else:
+            should_use_smem = tensor_pos in (_smem_arg_indices or [])
+            in_specs.append(
+                _pallas_make_block_spec(
+                    pl, jnp, pltpu, t, block_spec_info[tensor_pos], should_use_smem
+                )
             )
-        )
 
     arg_to_tensor_pos = {orig: tpos for tpos, orig in enumerate(tensor_arg_indices)}
     out_specs_list = []
     for idx in output_indices:
         t = args[idx]
         assert isinstance(t, torch.Tensor)
+        # Output-only tensors keep VMEM out_specs so the kernel can write
+        # to them; only their in_specs use HBM to avoid VMEM pressure.
         should_use_smem = arg_to_tensor_pos[idx] in (_smem_arg_indices or [])
         out_specs_list.append(
             _pallas_make_block_spec(
@@ -334,6 +345,33 @@ def _jax_placeholder_for_tensor(t: torch.Tensor) -> object:
 
     jax_dtype = torch_dtype_to_jax_runtime(t.dtype)
     return jax.ShapeDtypeStruct(tuple(t.shape), jax_dtype)
+
+
+def _pallas_jnp_dtype_map() -> dict[str, object]:
+    import jax.numpy as jnp
+
+    return {
+        "jnp.float32": jnp.float32,
+        "jnp.float16": jnp.float16,
+        "jnp.bfloat16": jnp.bfloat16,
+        "jnp.int32": jnp.int32,
+        "jnp.int16": jnp.int16,
+        "jnp.int8": jnp.int8,
+        "jnp.uint8": jnp.uint8,
+        "jnp.bool_": jnp.bool_,
+    }
+
+
+def _pallas_check_dtypes(args: tuple[object, ...]) -> None:
+    """Raise if any tensor arg uses a dtype unsupported on TPU."""
+    from .._compiler.backend import _PALLAS_UNSUPPORTED_DTYPES
+
+    for a in args:
+        if isinstance(a, torch.Tensor) and a.dtype in _PALLAS_UNSUPPORTED_DTYPES:
+            raise TypeError(
+                f"Pallas/TPU does not support {a.dtype} tensors. "
+                f"Cast to a 32-bit type before calling the kernel."
+            )
 
 
 def _pallas_prepare_args(
@@ -407,7 +445,7 @@ def _pallas_make_reordered_kernel(
     inplace_positions: set[int],
     arg_to_tensor_pos: dict[int, int],
     n_extra_refs: int = 0,
-    skip_inplace_copy: bool = False,
+    skip_inplace_copy: set[int] | None = None,
     _smem_arg_indices: list[int] | None = None,
 ) -> object:
     """Create a wrapper kernel that reorders pallas_call refs to the original arg order.
@@ -417,11 +455,13 @@ def _pallas_make_reordered_kernel(
     (e.g. scratch buffers), those trailing refs are appended after the
     reordered args.
 
-    When *skip_inplace_copy* is True, the initial ``out_ref[...] = in_ref[...]``
-    copy for inplace positions is skipped.  This is needed for the pipeline
-    launcher where refs are in HBM (``pl.ANY``) and direct load/store is not
-    allowed -- ``input_output_aliases`` already handles the aliasing.
+    *skip_inplace_copy* is a set of original-arg positions for which the
+    initial ``out_ref[...] = in_ref[...]`` copy should be skipped.  This is
+    needed for outputs backed by HBM refs (``pl.ANY``) where direct
+    load/store is not allowed.  Outputs with VMEM BlockSpecs still get the
+    copy so that ``input_output_aliases`` correctly preloads their contents.
     """
+    _skip_copy = skip_inplace_copy or set()
 
     def reordered_kernel(*refs: object) -> None:
         n_kernel_params = len(args)
@@ -432,7 +472,7 @@ def _pallas_make_reordered_kernel(
             original_order[orig_pos] = value
         for out_idx, orig_pos in enumerate(_output_indices):
             out_ref = refs[n_tensor_inputs + out_idx]
-            if orig_pos in inplace_positions and not skip_inplace_copy:
+            if orig_pos in inplace_positions and orig_pos not in _skip_copy:
                 in_ref = refs[arg_to_tensor_pos[orig_pos]]
                 if _smem_arg_indices is not None and orig_pos in _smem_arg_indices:
                     # [...] cannot be used for SMEMs,
@@ -559,6 +599,7 @@ def default_pallas_launcher(
     grid: tuple[int, ...],
     *args: object,
     _output_indices: list[int] | None = None,
+    _inplace_indices: list[int] | None = None,
     _block_spec_info: _BlockSpecInfo | None = None,
     _smem_arg_indices: list[int] | None = None,
     **kwargs: object,
@@ -570,9 +611,14 @@ def default_pallas_launcher(
     falls back to direct torch<->JAX conversion.  Output tensors are donated
     via ``input_output_aliases`` so the kernel writes directly into their
     buffers (zero-copy on TPU).
+
+    Output-only tensors (in ``_output_indices`` but not in ``_inplace_indices``)
+    get HBM in_specs to avoid VMEM pressure while still being donated.
     """
     if _output_indices is None:
         _output_indices = []
+
+    _pallas_check_dtypes(args)
 
     cache = getattr(pallas_kernel, "_pallas_cache", None)
     if cache is not None and cache[0] == grid:
@@ -593,6 +639,14 @@ def default_pallas_launcher(
             out_shapes,
         ) = _pallas_prepare_args(args, _output_indices)
 
+        # Derive output-only set: outputs not in _inplace_indices.
+        inplace_set = (
+            set(_inplace_indices)
+            if _inplace_indices is not None
+            else set(_output_indices)
+        )
+        output_only_set = set(_output_indices) - inplace_set
+
         in_specs, out_specs = _pallas_build_block_specs(
             pl,
             jnp,
@@ -603,6 +657,7 @@ def default_pallas_launcher(
             _output_indices,
             _block_spec_info,
             _smem_arg_indices,
+            output_only_set,
         )
 
         reordered_kernel = _pallas_make_reordered_kernel(
@@ -615,6 +670,7 @@ def default_pallas_launcher(
             inplace_positions,
             arg_to_tensor_pos,
             _smem_arg_indices=_smem_arg_indices,
+            skip_inplace_copy=output_only_set,
         )
 
         out_shape_arg = out_shapes if len(out_shapes) > 1 else out_shapes[0]
@@ -677,6 +733,8 @@ def default_pallas_pipeline_launcher(
     if _scratch_shapes is None:
         _scratch_shapes = []
 
+    _pallas_check_dtypes(args)
+
     cache = getattr(pallas_kernel, "_pallas_pipeline_cache", None)
     if cache is not None and cache[0] == grid:
         _, jax_callable, tensor_arg_indices = cache
@@ -697,16 +755,7 @@ def default_pallas_pipeline_launcher(
         ) = _pallas_prepare_args(args, _output_indices)
 
         # Build scratch shapes for VMEM
-        _jnp_dtype_map: dict[str, object] = {
-            "jnp.float32": jnp.float32,
-            "jnp.float16": jnp.float16,
-            "jnp.bfloat16": jnp.bfloat16,
-            "jnp.int32": jnp.int32,
-            "jnp.int16": jnp.int16,
-            "jnp.int8": jnp.int8,
-            "jnp.uint8": jnp.uint8,
-            "jnp.bool_": jnp.bool_,
-        }
+        _jnp_dtype_map = _pallas_jnp_dtype_map()
         scratch_shapes = []
         for scratch_entry in _scratch_shapes:
             if len(scratch_entry) == 3:
@@ -734,6 +783,7 @@ def default_pallas_pipeline_launcher(
             _pipeline_arg_indices,
         )
 
+        _pipeline_set = set(_pipeline_arg_indices or [])
         reordered_kernel = _pallas_make_reordered_kernel(
             pallas_kernel,
             args,
@@ -744,7 +794,7 @@ def default_pallas_pipeline_launcher(
             inplace_positions,
             arg_to_tensor_pos,
             n_extra_refs=len(scratch_shapes),
-            skip_inplace_copy=True,
+            skip_inplace_copy=_pipeline_set,
         )
 
         out_shape_arg = out_shapes if len(out_shapes) > 1 else out_shapes[0]
@@ -817,6 +867,8 @@ def default_pallas_fori_launcher(
     if _scratch_shapes is None:
         _scratch_shapes = []
 
+    _pallas_check_dtypes(args)
+
     cache = getattr(pallas_kernel, "_pallas_fori_cache", None)
     if cache is not None and cache[0] == grid:
         _, jax_callable, tensor_arg_indices = cache
@@ -837,16 +889,7 @@ def default_pallas_fori_launcher(
         ) = _pallas_prepare_args(args, _output_indices)
 
         # Build scratch shapes: VMEM buffers + DMA semaphores
-        _jnp_dtype_map: dict[str, object] = {
-            "jnp.float32": jnp.float32,
-            "jnp.float16": jnp.float16,
-            "jnp.bfloat16": jnp.bfloat16,
-            "jnp.int32": jnp.int32,
-            "jnp.int16": jnp.int16,
-            "jnp.int8": jnp.int8,
-            "jnp.uint8": jnp.uint8,
-            "jnp.bool_": jnp.bool_,
-        }
+        _jnp_dtype_map = _pallas_jnp_dtype_map()
         scratch_shapes = []
         for shape, dtype_str, scratch_type in _scratch_shapes:
             if scratch_type == "dma_semaphore":
@@ -873,6 +916,7 @@ def default_pallas_fori_launcher(
             _fori_pipeline_indices,  # type: ignore[arg-type]
         )
 
+        _fori_pipeline_set = set(_fori_pipeline_indices or [])  # type: ignore[arg-type]
         reordered_kernel = _pallas_make_reordered_kernel(
             pallas_kernel,
             args,
@@ -883,7 +927,7 @@ def default_pallas_fori_launcher(
             inplace_positions,
             arg_to_tensor_pos,
             n_extra_refs=len(scratch_shapes),
-            skip_inplace_copy=True,
+            skip_inplace_copy=_fori_pipeline_set,
         )
 
         out_shape_arg = out_shapes if len(out_shapes) > 1 else out_shapes[0]
@@ -1178,16 +1222,20 @@ def default_metal_launcher(
     metal_kernel: object,
     grid: tuple[int, ...],
     *args: object,
-    _block_size: int = 256,
+    _block_dims: tuple[int, int, int] = (256, 1, 1),
     **kwargs: object,
 ) -> None:
     """Default launcher for Metal kernels on Apple MPS devices.
 
-    Compiles MSL source via ``torch.mps.compile_shader()`` and dispatches
-    using the compiled library.  Caches the compiled library on the kernel
-    object to avoid recompilation on subsequent calls.
+    The ``metal_kernel`` is a ``@metal_jit`` decorated function that
+    translates its Python AST body to MSL and compiles it via
+    ``torch.mps.compile_shader`` on each call.
+    This launcher dispatches the compiled kernel with the given grid and
+    threadgroup dimensions.
 
-    Only 1D grids are currently supported.
+    Uses a 3D threadgroup dispatch model: ``_block_dims`` specifies the
+    threadgroup size as ``(x, y, z)``.  The grid specifies the number of
+    threadgroups per dimension.
     """
     kwargs.pop("num_warps", None)
     kwargs.pop("num_stages", None)
@@ -1196,20 +1244,15 @@ def default_metal_launcher(
             "metal", f"unexpected launcher kwargs: {sorted(kwargs)}"
         )
 
-    assert len(grid) == 1, (
-        f"Metal launcher only supports 1D grids, got {len(grid)}D: {grid}"
-    )
-
-    msl_source, kernel_name = metal_kernel()  # type: ignore[operator]
-    source_hash = hashlib.sha256(msl_source.encode()).digest()
-    cache = getattr(metal_kernel, "_metal_cache", None)
-    if cache is not None and cache[0] == source_hash:
-        lib = cache[1]
-    else:
-        lib = torch.mps.compile_shader(msl_source)  # type: ignore[attr-defined]
-        metal_kernel._metal_cache = (source_hash, lib)  # type: ignore[attr-defined]
+    lib, kernel_name = metal_kernel(*args)  # type: ignore[operator]
 
     tensor_args = [a for a in args if isinstance(a, torch.Tensor)]
     dispatch_fn = getattr(lib, kernel_name)
-    total_threads = grid[0] * _block_size
-    dispatch_fn(*tensor_args, threads=total_threads, group_size=_block_size)
+    bx, by, bz = _block_dims
+    # Pad grid to 3D
+    gx = grid[0] if len(grid) > 0 else 1
+    gy = grid[1] if len(grid) > 1 else 1
+    gz = grid[2] if len(grid) > 2 else 1
+    total_threads = (gx * bx, gy * by, gz * bz)
+    group_size = (bx, by, bz)
+    dispatch_fn(*tensor_args, threads=total_threads, group_size=group_size)

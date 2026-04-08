@@ -163,7 +163,6 @@ class TestLoops(RefEagerTestBase, TestCase):
         with self.assertRaises(helion.exc.StatementNotSupported):
             kernel.bind((x,))
 
-    @xfailIfPallas("large 4D tensors may exceed TPU VMEM")
     @skipIfLowVRAM("Test requires high VRAM for [128, 128, 128, 128] tensors")
     def test_3d_device_loop0(self):
         args = (torch.randn([128, 128, 128, 128], device=DEVICE),)
@@ -308,6 +307,7 @@ class TestLoops(RefEagerTestBase, TestCase):
             result, functools.reduce(torch.matmul, args), atol=1e-1, rtol=1e-2
         )
 
+    @skipIfPallas("Requires int indexing which is unavailable on TPUs")
     def test_use_block_size_var_without_hl_tile(self):
         """Test that block size var can be used without hl.tile()."""
 
@@ -493,7 +493,6 @@ class TestLoops(RefEagerTestBase, TestCase):
         self.assertEqual(spec.min_size, 32)
         self.assertEqual(spec.max_size, 256)
 
-    @xfailIfPallas("complex reduction with atomic_add not supported on pallas")
     @skipIfTileIR("Result mismatch with tileir backend")
     @skipIfFn(
         lambda: _get_backend() == "cute",

@@ -46,6 +46,7 @@ if TYPE_CHECKING:
     from .generate_ast import GenerateAST
     from .indexing_strategy import IndexingStrategy
     from .program_id import ProgramIDs
+    from helion._compiler.pallas.plan_tiling import DimensionTiling
 
     _P = TypeVar("_P", bound="TensorPropertyArg")
 
@@ -305,6 +306,11 @@ class DeviceFunction:
         self._indexing_config = config.indexing
         self.indexing_strategies: list[IndexingStrategy] = []
 
+        # Atomic indexing config (separate from load/store indexing)
+        self._atomic_indexing_config = config.atomic_indexing
+        self.atomic_indexing_strategies: list[IndexingStrategy] = []
+        self.atomic_op_index = 0
+
         self.rng_seed_count = 0
         self.device_load_index = 0
         self.device_store_index = 0
@@ -313,8 +319,8 @@ class DeviceFunction:
         self.epilogue_subtile_store_indices: dict[str, int] = {}
         self.rng_seed_buffer_param_name = None
 
-        # Pallas: id(fake_tensor) → {dim: block_id}, recorded during codegen
-        self.pallas_tensor_dim_block_ids: dict[int, dict[int, int]] = {}
+        # Pallas: id(fake_tensor) → [DimensionTiling], recorded during `plan_tiling`
+        self.pallas_tensor_dim_tilings: dict[int, list[DimensionTiling]] = {}
         # Pallas: set of id(fake_tensor) for tensors accessed in pipeline body
         self.pallas_pipeline_tensor_ids: set[int] = set()
         # TODO(dunfanlu): consider duplicating and aliasing arguments if a tensor needs to be accessed via both VMEM and SMEM?
@@ -356,6 +362,34 @@ class DeviceFunction:
             self.indexing_strategies.append(strategy)
 
         return self.indexing_strategies[index]
+
+    def get_atomic_indexing_strategy(self, index: int) -> IndexingStrategy:
+        from .indexing_strategy import IndexingStrategy
+        from .indexing_strategy import PointerIndexingStrategy
+
+        while len(self.atomic_indexing_strategies) <= index:
+            idx = len(self.atomic_indexing_strategies)
+
+            if isinstance(self._atomic_indexing_config, str):
+                if not self.atomic_indexing_strategies:
+                    strategy = IndexingStrategy.select(self._atomic_indexing_config)
+                else:
+                    strategy = self.atomic_indexing_strategies[0]
+            elif (
+                isinstance(self._atomic_indexing_config, list)
+                and self._atomic_indexing_config
+            ):
+                assert idx < len(self._atomic_indexing_config), (
+                    f"Atomic operation {idx} exceeds atomic_indexing config length "
+                    f"{len(self._atomic_indexing_config)}. Please specify atomic_indexing for all atomic ops."
+                )
+                strategy = IndexingStrategy.select(self._atomic_indexing_config[idx])
+            else:
+                strategy = PointerIndexingStrategy()
+
+            self.atomic_indexing_strategies.append(strategy)
+
+        return self.atomic_indexing_strategies[index]
 
     def has_rng_ops(self) -> bool:
         """Check if this kernel uses any RNG operations."""
@@ -855,7 +889,7 @@ class DeviceFunction:
         for var_name, expr in self.deferred_rdim_defs:
             expr_str = HostFunction.current().sympy_expr(expr)
             stmt = statement_from_string(
-                f"{var_name} = {backend.next_power_of_2_host_expr(expr_str)}"
+                f"{var_name} = {backend.dynamic_rdim_size_expr(expr_str)}"
             )
             codegen.host_statements.append(stmt)
         self.deferred_rdim_defs.clear()

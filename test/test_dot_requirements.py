@@ -17,6 +17,20 @@ from helion._testing import skipIfMTIA
 import helion.language as hl
 
 
+@helion.kernel
+def _matmul_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    m, k = x.size()
+    k2, n = y.size()
+    assert k == k2
+    out = torch.empty([m, n], dtype=torch.float32, device=x.device)
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc += torch.matmul(x[tile_m, tile_k], y[tile_k, tile_n])
+        out[tile_m, tile_n] = acc
+    return out
+
+
 @onlyBackends(["triton", "cute"])
 class TestDotRequirements(RefEagerTestDisabled, TestCase):
     @patch.object(_compat, "_min_dot_size", lambda *args: (2, 8, 16))
@@ -44,26 +58,28 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
 
     @patch.object(_compat, "_min_dot_size", lambda *args: (2, 8, 16))
     def test_matmul_sets_min_size(self) -> None:
-        @helion.kernel
-        def k_small(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-            m, k = x.size()
-            k2, n = y.size()
-            assert k == k2
-            out = torch.empty([m, n], dtype=torch.float32, device=x.device)
-            for tile_m, tile_n in hl.tile([m, n]):
-                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
-                for tile_k in hl.tile(k):
-                    acc += torch.matmul(x[tile_m, tile_k], y[tile_k, tile_n])
-                out[tile_m, tile_n] = acc
-            return out
-
         m, k, n = 32, 4, 16
         args = (
             torch.randn([m, k], device=DEVICE, dtype=HALF_DTYPE),
             torch.randn([k, n], device=DEVICE, dtype=HALF_DTYPE),
         )
-        spec = k_small.bind(args).config_spec
+        spec = _matmul_kernel.bind(args).config_spec
         self.assertEqual([x.min_size for x in spec.block_sizes], [2, 8, 16])
+
+    def test_matmul_smaller_than_min_dot_size(self) -> None:
+        """Test matmul where K and N are smaller than min_dot_size (16 on CUDA).
+
+        If update_min_block() promotes block sizes beyond the tensor dimensions,
+        this will fail with shape mismatches.
+        """
+        m, k, n = 32, 8, 8
+        args = (
+            torch.randn([m, k], device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn([k, n], device=DEVICE, dtype=HALF_DTYPE),
+        )
+        _, result = code_and_output(_matmul_kernel, args, block_sizes=[32, 8, 8])
+        ref = args[0].float() @ args[1].float()
+        torch.testing.assert_close(result, ref, atol=1e-1, rtol=1e-2)
 
     @skipIfMTIA("MTIA backend does not support 3D dot reshape patterns")
     def test_bmm_constrains_batch_block_to_one(self) -> None:
@@ -121,6 +137,18 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         )
         expected = torch.bmm(args[0], args[1])
         torch.testing.assert_close(result, expected, atol=1e-1, rtol=1e-2)
+
+
+@onlyBackends(["pallas"])
+class TestDotRequirementsPallas(RefEagerTestDisabled, TestCase):
+    def test_tpu_min_dot_size_constrains_matmul(self) -> None:
+        """Verify that TPU min_dot_size (8, 128, 128) is applied to matmul block sizes."""
+        args = (
+            torch.randn([1024, 1024], device=DEVICE, dtype=torch.float32),
+            torch.randn([1024, 1024], device=DEVICE, dtype=torch.float32),
+        )
+        spec = _matmul_kernel.bind(args).config_spec
+        self.assertEqual([x.min_size for x in spec.block_sizes], [8, 128, 128])
 
 
 if __name__ == "__main__":

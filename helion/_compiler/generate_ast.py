@@ -96,15 +96,6 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         )
         CodegenInterface.__init__(self, self.device_function)
 
-        # Run CuTe layout planning after tile strategies are created, so
-        # layout rules can query actual thread counts from strategies.
-        if CompileEnvironment.current().backend.name == "cute":
-            from .cute.layout_propagation import plan_layouts
-
-            plan_layouts(
-                self.codegen_graphs, config, self.device_function.tile_strategy
-            )
-
     def get_graph(self, graph_id: int) -> GraphInfo:
         return self.codegen_graphs[graph_id]
 
@@ -720,6 +711,12 @@ def generate_ast(
             extra_params=extra_params,
         )
         with codegen.device_function:
+            CompileEnvironment.current().backend.pre_codegen(
+                graphs=codegen.codegen_graphs,
+                config=config,
+                tile_strategy=codegen.device_function.tile_strategy,
+            )
+
             for stmt in func.body:
                 codegen.add_statement(codegen.visit(stmt))
             kernel_def = codegen.device_function.codegen_function_def()
