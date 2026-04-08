@@ -190,10 +190,8 @@ def _pallas_index_str(
     pipeline_block_ids: set[int] = set()
     for loops in state.codegen.active_device_loops.values():
         for loop in loops:
-            if (
-                isinstance(loop, EmitPipelineLoopState)
-                or isinstance(loop, ForiLoopState)
-                and loop.use_dma
+            if isinstance(loop, EmitPipelineLoopState) or (
+                isinstance(loop, ForiLoopState) and loop.use_dma
             ):
                 in_pipeline = True
                 pipeline_block_ids.update(loop.block_ids)
@@ -228,7 +226,7 @@ def _pallas_index_str(
                     if symbol_origin and isinstance(symbol_origin.origin, GridOrigin):
                         parts.append(state.codegen.offset_var(block_id))
                     else:
-                        parts.append(_pallas_ds_expr(state, block_id, offset_expr))
+                        parts.append(_pallas_ds_expr(state, block_id))
                 else:
                     maybe_grid_axis_idx = _maybe_get_hl_grid_axis_pid(idx)
                     if maybe_grid_axis_idx is not None:
