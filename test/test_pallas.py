@@ -650,7 +650,7 @@ class TestPallas(TestCase):
         expected = x + 0.5
         torch.testing.assert_close(result, expected)
 
-    def test_closure_bias_constrains_rank1_block_size(self) -> None:
+    def _make_matmul_epilogue_kernel(self):
         @helion.kernel(backend="pallas", static_shapes=True)
         def matmul_epilogue(
             x: torch.Tensor,
@@ -670,6 +670,10 @@ class TestPallas(TestCase):
                 out[tile_m, tile_n] = epilogue(acc, (tile_m, tile_n))
             return out
 
+        return matmul_epilogue
+
+    def test_closure_bias_constrains_rank1_block_size(self) -> None:
+        matmul_epilogue = self._make_matmul_epilogue_kernel()
         m, k, n = 16, 64, 1024
         x = torch.randn(m, k, device=DEVICE, dtype=torch.bfloat16)
         y = torch.randn(k, n, device=DEVICE, dtype=torch.bfloat16)
@@ -679,25 +683,7 @@ class TestPallas(TestCase):
         self.assertGreaterEqual(bound.config_spec.block_sizes[1].min_size, 256)
 
     def test_closure_bias_invalid_rank1_block_size_normalized(self) -> None:
-        @helion.kernel(backend="pallas", static_shapes=True)
-        def matmul_epilogue(
-            x: torch.Tensor,
-            y: torch.Tensor,
-            epilogue=lambda acc, tile: acc,
-        ) -> torch.Tensor:
-            m, k = x.size()
-            k2, n = y.size()
-            assert k == k2
-            out = torch.empty(
-                [m, n], dtype=torch.promote_types(x.dtype, y.dtype), device=x.device
-            )
-            for tile_m, tile_n in hl.tile([m, n]):
-                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
-                for tile_k in hl.tile(k):
-                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
-                out[tile_m, tile_n] = epilogue(acc, (tile_m, tile_n))
-            return out
-
+        matmul_epilogue = self._make_matmul_epilogue_kernel()
         m, k, n = 16, 64, 1024
         x = torch.randn(m, k, device=DEVICE, dtype=torch.bfloat16)
         y = torch.randn(k, n, device=DEVICE, dtype=torch.bfloat16)

@@ -282,14 +282,9 @@ class CompileEnvironment:
             if not origin.is_host() or tensor.ndim == 0:
                 continue
             tensor_sizes[(*map(_to_sympy, tensor.size()),)] += 1
-            if tensor.dtype.is_floating_point:
-                bits = {
-                    torch.float64: 64,
-                    torch.float32: 32,
-                    torch.bfloat16: 16,
-                    torch.float16: 16,
-                }.get(tensor.dtype, 32)
-                min_element_bits = min(min_element_bits, bits)
+            # Cap at 32 so the tiling formula 128*(32//bits) stays positive
+            bits = min(tensor.dtype.itemsize * 8, 32)
+            min_element_bits = min(min_element_bits, bits)
 
         return tensor_sizes, min_element_bits
 

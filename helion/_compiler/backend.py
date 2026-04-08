@@ -21,7 +21,6 @@ if TYPE_CHECKING:
     from torch._inductor.ops_handler import OpsHandler
 
     from ..autotuner.config_fragment import ConfigSpecFragment
-    from ..runtime import _BlockSpecInfo
     from ..runtime.config import Config
     from ..runtime.kernel import BoundKernel
     from .device_function import Argument
@@ -1357,27 +1356,6 @@ class PallasBackend(Backend):
                 block_shape.append(None)
                 grid_dims.append(None)
             result.append((tuple(block_shape), tuple(grid_dims)))
-        return result
-
-    def _no_tiling_block_spec_info(
-        self,
-        sorted_args: list[Argument],
-    ) -> _BlockSpecInfo:
-        result: _BlockSpecInfo = []
-
-        from .device_function import SymbolArgument
-        from .device_function import TensorArg
-        from .device_function import TensorSizeArg
-        from .device_function import TensorStrideArg
-
-        for arg in sorted_args:
-            if isinstance(arg, (SymbolArgument, TensorSizeArg, TensorStrideArg)):
-                result.append(None)  # scalars wrapped as 1-D tensors
-                continue
-            if not isinstance(arg, TensorArg) or arg.fake_value.ndim == 0:
-                continue
-            tensor = arg.fake_value
-            result.append((((None,) * tensor.ndim), ((None,) * tensor.ndim)))
         return result
 
     def build_launcher_args(
