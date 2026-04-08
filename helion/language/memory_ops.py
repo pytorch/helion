@@ -221,7 +221,12 @@ def _pallas_index_str(
                         parts.append(f"pl.program_id({maybe_grid_axis_idx})")
                     else:
                         parts.append(":")
-            if not is_device_loop and isinstance(idx, torch.SymInt):
+            # Scalar hl.grid indices lower to pl.program_id(), not BlockSpecs.
+            if (
+                not is_device_loop
+                and isinstance(idx, torch.SymInt)
+                and _maybe_get_hl_grid_axis_idx(idx) is None
+            ):
                 dim_map.setdefault(tensor_dim, block_id)
         elif isinstance(idx, int):
             parts.append(str(idx))
