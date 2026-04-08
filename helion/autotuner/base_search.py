@@ -636,7 +636,22 @@ class BaseSearch(BaseAutotuner):
             if os.getenv("CHECK_INPUT_ACCURACY", "1") == "1":
                 if len(self._mutated_arg_indices) > 0:
                     assert self._baseline_post_args is not None
-                    check_fn(args, self._baseline_post_args)
+                    args_flat, _ = tree_flatten(args)
+                    baseline_flat, _ = tree_flatten(self._baseline_post_args)
+                    mutated_idx_set = set(self._mutated_arg_indices)
+                    mutated_actual = []
+                    mutated_expected = []
+                    tensor_idx = 0
+                    for actual_elem, expected_elem in zip(
+                        args_flat, baseline_flat, strict=True
+                    ):
+                        if not isinstance(actual_elem, torch.Tensor):
+                            continue
+                        if tensor_idx in mutated_idx_set:
+                            mutated_actual.append(actual_elem)
+                            mutated_expected.append(expected_elem)
+                        tensor_idx += 1
+                    check_fn(mutated_actual, mutated_expected)
         except AssertionError as e:
             if not self.settings.autotune_ignore_errors:
                 self.log.warning(

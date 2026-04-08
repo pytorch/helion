@@ -1208,6 +1208,36 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         run_mode("fork", expect_error=False)
         run_mode("spawn", expect_error=True)
 
+    def test_validate_against_baseline_only_checks_mutated_args(self) -> None:
+        """_validate_against_baseline should only compare tensors at _mutated_arg_indices."""
+        settings = Settings(
+            autotune_ignore_errors=False,
+            autotune_log_level=logging.CRITICAL,
+        )
+        search = BaseSearch.__new__(BaseSearch)
+        search.settings = settings
+        search.log = AutotuningLogger(settings)
+        baseline_out = torch.zeros(2, device=DEVICE)
+        search._baseline_output = baseline_out
+        search._effective_atol = 1e-2
+        search._effective_rtol = 1e-2
+
+        a = torch.tensor([1.0, 2.0], device=DEVICE)
+        b = torch.tensor([3.0, 4.0], device=DEVICE)
+        # tensor index 1 (b) is mutated; baseline expects b == [3.0, 4.0]
+        search._mutated_arg_indices = [1]
+        search._baseline_post_args = (a.clone(), b.clone())
+
+        # Wrong value on mutated arg b → should fail accuracy check
+        wrong_b = torch.full_like(b, 9.0)
+        result = search._validate_against_baseline("cfg", baseline_out, (a, wrong_b))
+        self.assertFalse(result)
+
+        # Wrong value on non-mutated arg a → should still pass (a is not checked)
+        wrong_a = torch.full_like(a, 9.0)
+        result = search._validate_against_baseline("cfg", baseline_out, (wrong_a, b))
+        self.assertTrue(result)
+
     def test_autotune_baseline_fn(self) -> None:
         """Test that custom baseline function is used for accuracy checking."""
         config1 = helion.Config(block_sizes=[32], num_warps=4)
