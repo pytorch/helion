@@ -608,13 +608,19 @@ def _(state: CodegenState) -> ast.AST:
 @_decorators.codegen(atomic_add, "pallas")
 def _(state: CodegenState) -> ast.AST:
     from .._compiler.ast_extension import statement_from_string
+    from .._compiler.compile_environment import CompileEnvironment
 
     name, index_str, prev_var = _pallas_atomic_load_prev(state)
     value_ast = _to_ast_values([state.ast_args[2]])[0]
+    target = state.proxy_arg(0)
+    assert isinstance(target, torch.Tensor)
+    backend = CompileEnvironment.current().backend
+    target_dtype = backend.dtype_str(target.dtype)
+    # Cast the sum to the target dtype so the store doesn't fail when
+    # the value dtype differs (e.g. float32 accumulator into bfloat16 ref).
+    cast = backend.cast_expr(f"{prev_var} + {{value}}", target_dtype)
     state.codegen.add_statement(
-        statement_from_string(
-            f"{name}[{index_str}] = {prev_var} + {{value}}", value=value_ast
-        )
+        statement_from_string(f"{name}[{index_str}] = {cast}", value=value_ast)
     )
     return expr_from_string(prev_var)
 
