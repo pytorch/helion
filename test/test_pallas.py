@@ -650,6 +650,29 @@ class TestPallas(TestCase):
         expected = x + 0.5
         torch.testing.assert_close(result, expected)
 
+    def test_block_size_constraint_tile_order(self) -> None:
+        """Tile order != tensor dim order should not cause wrong alignment.
+
+        When hl.tile([N, B]) is used on tensor[B, N] with small B (4),
+        B is the last spec (i=1) but maps to the first tensor dim.
+        Without the fix, the fallback computes dfe = ndim-1-i = 0,
+        incorrectly applying 128-alignment to B and forcing
+        block_size >= 128 when B=4.
+        """
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            B, N = x.shape
+            out = torch.empty_like(x)
+            for tile_n, tile_b in hl.tile([N, B]):
+                out[tile_b, tile_n] = x[tile_b, tile_n] * 2.0
+            return out
+
+        x = torch.randn(4, 256, device=DEVICE, dtype=torch.float32)
+        result = fn(x)
+        expected = x * 2.0
+        torch.testing.assert_close(result, expected)
+
 
 if __name__ == "__main__":
     unittest.main()
