@@ -1165,6 +1165,8 @@ class PallasBackend(Backend):
                             continue
                         if info.dim_matches(
                             dim_expr  # pyrefly: ignore[bad-argument-type]
+                        ) or info.size_matches(
+                            dim_expr  # pyrefly: ignore[bad-argument-type]
                         ):
                             dfe = tensor_ndim - 1 - d
                             if info.block_id not in min_dim_from_end:
@@ -1326,14 +1328,19 @@ class PallasBackend(Backend):
                     if isinstance(bs, int):
                         # For 1D tensors, the block size must be a
                         # multiple of the 1D tiling factor or equal to
-                        # the full dimension.  If neither holds, fall
-                        # back to no tiling for the entire kernel.
+                        # the full dimension.  Reject configs that violate
+                        # this so autotuning can skip them before launch.
                         dim_size = tensor.shape[d]
                         if tensor.ndim == 1 and isinstance(dim_size, int):
                             bitwidth = tensor.dtype.itemsize * 8
                             tiling_1d = 128 * (32 // bitwidth)
                             if bs != dim_size and bs % tiling_1d != 0:
-                                return self._no_tiling_block_spec_info(sorted_args)
+                                raise exc.InvalidConfig(
+                                    "Pallas rank-1 tensor tiling requires "
+                                    f"block_size {tiling_1d} alignment or full-dim "
+                                    f"access, got block_size={bs} for shape "
+                                    f"{tuple(tensor.shape)}"
+                                )
                         block_shape.append(bs)
                         # When the block covers the entire tensor
                         # dimension there is only one tile, so the grid

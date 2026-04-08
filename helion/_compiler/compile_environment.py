@@ -252,13 +252,46 @@ class CompileEnvironment:
             FlattenedTileStrategy.update_allow_flattened(shape)
         self._disable_range_num_stages_for_aliasing()
         self.config_spec._remove_duplicates()
+        constraint_tensor_sizes, min_element_bits = (
+            self._block_constraint_tensor_sizes()
+        )
         self.backend.adjust_block_size_constraints(
             list(self.config_spec.block_sizes),
             len(self.config_spec.block_sizes),
             block_sizes=self.block_sizes,  # pyrefly: ignore[bad-argument-type]
-            kernel_tensor_sizes=self.kernel_tensor_sizes,  # pyrefly: ignore[bad-argument-type]
-            min_element_bits=self.kernel_min_element_bits,
+            kernel_tensor_sizes=constraint_tensor_sizes,  # pyrefly: ignore[bad-argument-type]
+            min_element_bits=min_element_bits,
         )
+
+    def _block_constraint_tensor_sizes(
+        self,
+    ) -> tuple[dict[tuple[sympy.Expr, ...], int], int]:
+        """Return tensor shapes that should influence block-size constraints.
+
+        ``kernel_tensor_sizes`` already tracks device-created tensors and
+        explicit tensor factory calls.  For Pallas we must also include
+        host-origin tensors that become kernel operands, such as input
+        parameters and closure-captured epilogue tensors.
+        """
+        from .host_function import HostFunction
+
+        tensor_sizes = collections.Counter(self.kernel_tensor_sizes)
+        min_element_bits = self.kernel_min_element_bits
+
+        for tensor, origin in HostFunction.current().tensor_to_origin.items():
+            if not origin.is_host() or tensor.ndim == 0:
+                continue
+            tensor_sizes[(*map(_to_sympy, tensor.size()),)] += 1
+            if tensor.dtype.is_floating_point:
+                bits = {
+                    torch.float64: 64,
+                    torch.float32: 32,
+                    torch.bfloat16: 16,
+                    torch.float16: 16,
+                }.get(tensor.dtype, 32)
+                min_element_bits = min(min_element_bits, bits)
+
+        return tensor_sizes, min_element_bits
 
     def _disable_range_num_stages_for_aliasing(self) -> None:
         """
