@@ -28,6 +28,7 @@ import torch
 import helion
 from helion import _compat
 from helion import exc
+from helion._compiler.tile_dispatch import BlockIDStrategyMapping
 from helion._compiler.tile_dispatch import TileStrategyDispatch
 from helion._testing import DEVICE
 from helion._testing import RefEagerTestDisabled
@@ -1053,8 +1054,8 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
 
         dispatch = TileStrategyDispatch.__new__(TileStrategyDispatch)
         dispatch.strategies = [DummyStrategy()]
-        dispatch.block_id_to_strategy = {}
-        dispatch._block_id_to_any_strategy = {3: dispatch.strategies[0]}
+        dispatch.block_id_to_strategy = BlockIDStrategyMapping()
+        dispatch.block_id_to_strategy[(3, 4)] = dispatch.strategies[0]
 
         with patch(
             "helion._compiler.tile_dispatch.CompileEnvironment.current",
