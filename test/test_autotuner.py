@@ -1238,6 +1238,20 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         result = search._validate_against_baseline("cfg", baseline_out, (wrong_a, b))
         self.assertTrue(result)
 
+        # With a leading non-tensor scalar: flat index 1 == tensor_b, but tensor index 1
+        # is still tensor_b (tensor index 0 is tensor_a). Verify tensor-index counting
+        # is used, not flat-index counting.
+        search._baseline_post_args = (42, a.clone(), b.clone())
+        # mutated tensor index 1 is still b (the second tensor)
+        result = search._validate_against_baseline(
+            "cfg", baseline_out, (42, a, wrong_b)
+        )
+        self.assertFalse(result)
+        result = search._validate_against_baseline(
+            "cfg", baseline_out, (42, wrong_a, b)
+        )
+        self.assertTrue(result)
+
     def test_autotune_baseline_fn(self) -> None:
         """Test that custom baseline function is used for accuracy checking."""
         config1 = helion.Config(block_sizes=[32], num_warps=4)

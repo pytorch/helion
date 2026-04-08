@@ -321,30 +321,37 @@ def _clone_args(
       idx_to_clone. If idx_to_clone is None, clone all tensors.
     """
 
-    def _should_clone(idx: int) -> bool:
-        return idx_to_clone is None or idx in idx_to_clone
+    idx_to_clone_set = set(idx_to_clone) if idx_to_clone is not None else None
+
+    def _should_clone(tensor_idx: int) -> bool:
+        return idx_to_clone_set is None or tensor_idx in idx_to_clone_set
 
     args_flat, tree_spec = tree_flatten(args)
     old_arg_to_new_arg = {}
 
-    for i, arg in enumerate(args_flat):
-        if _should_clone(i) and is_symm_mem_tensor(arg, process_group_name):
+    tensor_idx = 0
+    for arg in args_flat:
+        if not isinstance(arg, torch.Tensor):
+            continue
+        if _should_clone(tensor_idx) and is_symm_mem_tensor(arg, process_group_name):
             new_arg = _clone_symm_mem_tensor(arg, process_group_name)
             old_arg_to_new_arg[get_signal_pad_ptrs_dev(arg, process_group_name)] = (
                 get_signal_pad_ptrs_dev(new_arg, process_group_name)
             )
             old_arg_to_new_arg[arg] = new_arg  # pyrefly: ignore[unsupported-operation]
+        tensor_idx += 1
 
+    tensor_idx = 0
     for i, arg in enumerate(args_flat):
-        if arg in old_arg_to_new_arg:
-            args_flat[i] = old_arg_to_new_arg[arg]
-            continue
         if not isinstance(arg, torch.Tensor):
             continue
-        if _should_clone(i):
+        if arg in old_arg_to_new_arg:
+            args_flat[i] = old_arg_to_new_arg[arg]  # pyrefly: ignore[bad-index]
+        elif _should_clone(tensor_idx):
             clone = arg.detach().clone()
             clone.requires_grad_(arg.requires_grad)
             args_flat[i] = clone
+        tensor_idx += 1
 
     return tree_unflatten(args_flat, tree_spec)
 
