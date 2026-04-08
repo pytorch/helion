@@ -724,6 +724,67 @@ class TestPallas(TestCase):
         )
         torch.testing.assert_close(result, expected)
 
+    def test_output_only_not_inplace(self) -> None:
+        """Output-only tensors should not appear in _inplace_indices."""
+        x = torch.randn(1024, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(pallas_relu, (x,), block_sizes=[1024])
+        torch.testing.assert_close(result, torch.relu(x))
+        self.assertIn("_inplace_indices=[]", code)
+
+    def test_new_empty_output_only(self) -> None:
+        """new_empty allocations should also be recognized as output-only."""
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def new_empty_relu(x: torch.Tensor) -> torch.Tensor:
+            out = x.new_empty(x.shape)
+            for tile in hl.tile(out.size()):
+                out[tile] = torch.relu(x[tile])
+            return out
+
+        x = torch.randn(1024, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(new_empty_relu, (x,), block_sizes=[1024])
+        torch.testing.assert_close(result, torch.relu(x))
+        self.assertIn("_inplace_indices=[]", code)
+
+    def test_mixed_inplace_and_output_only(self) -> None:
+        """Kernel with both an inplace-mutated input and an output-only tensor.
+
+        Verifies that _inplace_indices contains only the inplace-mutated
+        input (index 0), not the output-only tensor.
+        """
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def inplace_and_output(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size()):
+                x[tile] = x[tile] + 1.0
+                out[tile] = x[tile] * 2.0
+            return out
+
+        x = torch.randn(1024, device=DEVICE, dtype=torch.float32)
+        expected_out = (x + 1.0) * 2.0
+        code, result = code_and_output(inplace_and_output, (x,), block_sizes=[1024])
+        torch.testing.assert_close(result, expected_out)
+        # x is inplace-mutated (index 0), out is output-only (not in inplace)
+        self.assertIn("_inplace_indices=[0]", code)
+
+    def test_empty_like_read_stays_inplace(self) -> None:
+        """An empty_like output that is also read should stay in _inplace_indices."""
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def read_write_kernel(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(out.size()):
+                out[tile] = x[tile]
+                out[tile] = out[tile] + 1.0
+            return out
+
+        x = torch.randn(1024, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(read_write_kernel, (x,), block_sizes=[1024])
+        torch.testing.assert_close(result, x + 1.0)
+        # out is read after write, so it must be in _inplace_indices
+        self.assertIn("_inplace_indices=[1]", code)
+
 
 if __name__ == "__main__":
     unittest.main()

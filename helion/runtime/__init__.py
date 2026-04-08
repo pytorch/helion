@@ -250,27 +250,39 @@ def _pallas_build_block_specs(
     output_indices: list[int],
     block_spec_info: _BlockSpecInfo | None = None,
     _smem_arg_indices: list[int] | None = None,
+    _output_only_set: set[int] | None = None,
 ) -> tuple[list[object] | None, object | None]:
-    """Build ``in_specs`` and ``out_specs`` for ``pl.pallas_call``."""
+    """Build ``in_specs`` and ``out_specs`` for ``pl.pallas_call``.
+
+    Output-only tensors (in ``_output_only_set``) get HBM in_specs
+    to avoid VMEM pressure while keeping VMEM out_specs for writes.
+    """
     if block_spec_info is None or len(grid) == 0:
         return None, None
+
+    output_only_set = _output_only_set or set()
 
     in_specs = []
     for tensor_pos, idx in enumerate(tensor_arg_indices):
         t = args[idx]
         assert isinstance(t, torch.Tensor)
-        should_use_smem = tensor_pos in (_smem_arg_indices or [])
-        in_specs.append(
-            _pallas_make_block_spec(
-                pl, jnp, pltpu, t, block_spec_info[tensor_pos], should_use_smem
+        if idx in output_only_set:
+            in_specs.append(pl.BlockSpec(memory_space=pl.ANY))  # type: ignore[union-attr]
+        else:
+            should_use_smem = tensor_pos in (_smem_arg_indices or [])
+            in_specs.append(
+                _pallas_make_block_spec(
+                    pl, jnp, pltpu, t, block_spec_info[tensor_pos], should_use_smem
+                )
             )
-        )
 
     arg_to_tensor_pos = {orig: tpos for tpos, orig in enumerate(tensor_arg_indices)}
     out_specs_list = []
     for idx in output_indices:
         t = args[idx]
         assert isinstance(t, torch.Tensor)
+        # Output-only tensors keep VMEM out_specs so the kernel can write
+        # to them; only their in_specs use HBM to avoid VMEM pressure.
         should_use_smem = arg_to_tensor_pos[idx] in (_smem_arg_indices or [])
         out_specs_list.append(
             _pallas_make_block_spec(
@@ -561,6 +573,7 @@ def default_pallas_launcher(
     grid: tuple[int, ...],
     *args: object,
     _output_indices: list[int] | None = None,
+    _inplace_indices: list[int] | None = None,
     _block_spec_info: _BlockSpecInfo | None = None,
     _smem_arg_indices: list[int] | None = None,
     **kwargs: object,
@@ -572,6 +585,9 @@ def default_pallas_launcher(
     falls back to direct torch<->JAX conversion.  Output tensors are donated
     via ``input_output_aliases`` so the kernel writes directly into their
     buffers (zero-copy on TPU).
+
+    Output-only tensors (in ``_output_indices`` but not in ``_inplace_indices``)
+    get HBM in_specs to avoid VMEM pressure while still being donated.
     """
     if _output_indices is None:
         _output_indices = []
@@ -595,6 +611,14 @@ def default_pallas_launcher(
             out_shapes,
         ) = _pallas_prepare_args(args, _output_indices)
 
+        # Derive output-only set: outputs not in _inplace_indices.
+        inplace_set = (
+            set(_inplace_indices)
+            if _inplace_indices is not None
+            else set(_output_indices)
+        )
+        output_only_set = set(_output_indices) - inplace_set
+
         in_specs, out_specs = _pallas_build_block_specs(
             pl,
             jnp,
@@ -605,6 +629,7 @@ def default_pallas_launcher(
             _output_indices,
             _block_spec_info,
             _smem_arg_indices,
+            output_only_set,
         )
 
         reordered_kernel = _pallas_make_reordered_kernel(
@@ -617,6 +642,7 @@ def default_pallas_launcher(
             inplace_positions,
             arg_to_tensor_pos,
             _smem_arg_indices=_smem_arg_indices,
+            skip_inplace_copy=output_only_set,
         )
 
         out_shape_arg = out_shapes if len(out_shapes) > 1 else out_shapes[0]
