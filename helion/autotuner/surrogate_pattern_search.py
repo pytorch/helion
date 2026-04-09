@@ -13,10 +13,10 @@ from .base_search import performance
 from .effort_profile import PATTERN_SEARCH_DEFAULTS
 from .pattern_search import InitialPopulationStrategy
 from .pattern_search import PatternSearch
+from .pattern_search import PatternSearchCopy
 from helion._dist_utils import sync_seed
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
     from collections.abc import Sequence
 
     from ..autotuner.effort_profile import AutotuneEffortProfile
@@ -176,6 +176,155 @@ class LFBOPatternSearch(PatternSearch):
             "best_available_pad_random": profile.lfbo_pattern_search.best_available_pad_random,
             **PopulationBasedSearch.get_kwargs_from_profile(profile, settings),
         }
+
+    def _init_search(self) -> None:
+        self.log(
+            f"Starting {type(self).__name__} with initial_population={self.initial_population_strategy.name},"
+            f" copies={self.copies},"
+            f" max_generations={self.max_generations},"
+            f" similarity_penalty={self.similarity_penalty}"
+        )
+        self.visited.clear()
+        self.population = []
+        for flat_config in self._generate_initial_population_flat():
+            member = self.make_unbenchmarked(flat_config)
+            if member.config not in self.visited:
+                self.visited.add(member.config)
+                self.population.append(member)
+        self.set_generation(0)
+        self.parallel_benchmark_population(self.population, desc="Initial population")
+
+        # Compute adaptive compile timeout based on initial population compile times
+        self.set_adaptive_compile_timeout(
+            self.population,
+            min_seconds=self.compile_timeout_lower_bound,
+            quantile=self.compile_timeout_quantile,
+        )
+
+        # again with higher accuracy
+        self.rebenchmark_population(self.population, desc="Verifying initial results")
+        check_population_consistency(
+            self.population, process_group_name=self.kernel.env.process_group_name
+        )
+        self.population.sort(key=performance)
+        starting_points = []
+        for member in self.population[: self.copies]:
+            if math.isfinite(member.perf):  # filter failed compiles
+                starting_points.append(member)
+        self.log(
+            f"Initial random population of {len(self.population)}, {len(starting_points)} starting points:",
+            self.statistics,
+        )
+        if not starting_points:
+            raise exc.NoConfigFound
+
+        # Save to training data
+        for member in self.population:
+            self.train_x.append(self.config_gen.encode_config(member.flat_values))
+            self.train_y.append(member.perf)
+        # Fit model
+        self._fit_surrogate()
+
+        self.search_copies = [
+            PatternSearchCopy(current=m, patience_remaining=self.patience)
+            for m in starting_points
+        ]
+        self.set_generation(1)
+
+    def _autotune(self) -> Config:
+        for generation in range(self._current_generation, self.max_generations + 1):
+            self.set_generation(generation)
+            prior_best = self.best
+            new_population = {id(prior_best): prior_best}
+            num_neighbors = 0
+            num_active = 0
+            active_copies: list[
+                tuple[int, PatternSearchCopy, list[PopulationMember]]
+            ] = []
+            for copy_idx, search_copy in enumerate(self.search_copies):
+                if search_copy.stopped:
+                    continue
+
+                candidates: list[PopulationMember] = [search_copy.current]
+                with sync_seed(process_group_name=self.kernel.env.process_group_name):
+                    all_neighbors = self._generate_neighbors(
+                        search_copy.current.flat_values
+                    )
+                for flat_config in all_neighbors:
+                    new_member = self.make_unbenchmarked(flat_config)
+                    if new_member.config not in self.visited:
+                        candidates.append(new_member)
+                        self.visited.add(new_member.config)
+
+                # Score candidates using surrogate model
+                n_sorted = int(len(candidates) * self.frac_selected)
+                candidates = self._surrogate_select(candidates, n_sorted)
+
+                if len(candidates) <= 1:
+                    self.log(f"Copy {copy_idx} finish because of no candidates")
+                    search_copy.stopped = True
+                    continue
+
+                num_active += 1
+                num_neighbors += len(candidates) - 1
+                for member in candidates:
+                    new_population[id(member)] = member
+                active_copies.append((copy_idx, search_copy, candidates))
+            if num_active == 0:
+                self.log(
+                    f"Autotuning stop at generation {generation} because of no active search path"
+                )
+                break
+
+            # Log generation header before compiling/benchmarking
+            self.log(
+                f"Generation {generation} starting: {num_neighbors} neighbors, {num_active} active search path(s)"
+            )
+
+            self.population = [*new_population.values()]
+            # compile any unbenchmarked members in parallel
+            unbenchmarked = [m for m in self.population if len(m.perfs) == 0]
+            if unbenchmarked:
+                self.parallel_benchmark_population(
+                    unbenchmarked, desc=f"Generation {generation}:"
+                )
+            # higher-accuracy rebenchmark
+            self.rebenchmark_population(
+                self.population, desc=f"Generation {generation}: verifying top configs"
+            )
+
+            # Update each search copy after rebenchmarking (uses refined perf values)
+            for copy_idx, search_copy, candidates in active_copies:
+                best = min(candidates, key=performance)
+                if self._check_early_stopping(best, search_copy.current):
+                    if (
+                        search_copy.patience_remaining is not None
+                        and search_copy.patience_remaining > 0
+                    ):
+                        search_copy.patience_remaining -= 1
+                    else:
+                        self.log(f"Copy {copy_idx} finish because of no improvement")
+                        search_copy.stopped = True
+                if not search_copy.stopped:
+                    search_copy.current = best
+
+            # Log final statistics for this generation
+            self.log(f"Generation {generation} complete:", self.statistics)
+
+            # Retrain surrogate (no need for the last generation)
+            if generation != self.max_generations:
+                # Update training data with newly benchmarked members only
+                for member in unbenchmarked:
+                    self.train_x.append(
+                        self.config_gen.encode_config(member.flat_values)
+                    )
+                    self.train_y.append(member.perf)
+                # Fit model
+                self._fit_surrogate()
+
+        # Run finishing phase to simplify the best configuration
+        best = self.run_finishing_phase(self.best, self.finishing_rounds)
+        return best.config
 
     def _fit_surrogate(self) -> None:
         train_x = np.array(self.train_x)
@@ -354,115 +503,6 @@ class LFBOPatternSearch(PatternSearch):
 
         return [member for member, score in candidates_sorted]
 
-    def _autotune(self) -> Config:
-        initial_population_name = self.initial_population_strategy.name
-        self.log(
-            f"Starting {self.__class__.__name__} with initial_population={initial_population_name},"
-            f" copies={self.copies},"
-            f" max_generations={self.max_generations},"
-            f" similarity_penalty={self.similarity_penalty}"
-        )
-        visited: set[Config] = set()
-        self.population = []
-        for flat_config in self._generate_initial_population_flat():
-            member = self.make_unbenchmarked(flat_config)
-            if member.config not in visited:
-                visited.add(member.config)
-                self.population.append(member)
-        self.set_generation(0)
-        self.parallel_benchmark_population(self.population, desc="Initial population")
-
-        # Compute adaptive compile timeout based on initial population compile times
-        self.set_adaptive_compile_timeout(
-            self.population,
-            min_seconds=self.compile_timeout_lower_bound,
-            quantile=self.compile_timeout_quantile,
-        )
-
-        # again with higher accuracy
-        self.rebenchmark_population(self.population, desc="Verifying initial results")
-        check_population_consistency(
-            self.population, process_group_name=self.kernel.env.process_group_name
-        )
-        self.population.sort(key=performance)
-        starting_points = []
-        for member in self.population[: self.copies]:
-            if math.isfinite(member.perf):  # filter failed compiles
-                starting_points.append(member)
-        self.log(
-            f"Initial random population of {len(self.population)}, {len(starting_points)} starting points:",
-            self.statistics,
-        )
-        if not starting_points:
-            raise exc.NoConfigFound
-
-        # Save to training data
-        for member in self.population:
-            self.train_x.append(self.config_gen.encode_config(member.flat_values))
-            self.train_y.append(member.perf)
-
-        # Fit model
-        self._fit_surrogate()
-
-        search_copies = [
-            self._pruned_pattern_search_from(idx, m, visited)
-            for idx, m in enumerate(starting_points)
-        ]
-
-        for generation in range(1, self.max_generations + 1):
-            prior_best = self.best
-            new_population = {id(prior_best): prior_best}
-            num_neighbors = 0
-            num_active = 0
-            for search_copy in search_copies:
-                added = next(search_copy, ())
-                if added:
-                    assert len(added) > 1
-                    num_active += 1
-                    num_neighbors += len(added) - 1
-                    for member in added:
-                        new_population[id(member)] = member
-            if num_active == 0:
-                self.log(
-                    f"Autotuning stop at generation {generation} because of no active search path"
-                )
-                break
-
-            # Log generation header before compiling/benchmarking
-            self.log(
-                f"Generation {generation} starting: {num_neighbors} neighbors, {num_active} active search path(s)"
-            )
-
-            self.population = [*new_population.values()]
-            # compile any unbenchmarked members in parallel
-            unbenchmarked = [m for m in self.population if len(m.perfs) == 0]
-            if unbenchmarked:
-                self.set_generation(generation)
-                self.parallel_benchmark_population(
-                    unbenchmarked, desc=f"Generation {generation}:"
-                )
-            # higher-accuracy rebenchmark
-            self.rebenchmark_population(
-                self.population, desc=f"Generation {generation}: verifying top configs"
-            )
-            # Log final statistics for this generation
-            self.log(f"Generation {generation} complete:", self.statistics)
-
-            # no need to retrain the model for the last generation
-            if generation != self.max_generations:
-                # Update training data with newly benchmarked members only
-                for member in unbenchmarked:
-                    self.train_x.append(
-                        self.config_gen.encode_config(member.flat_values)
-                    )
-                    self.train_y.append(member.perf)
-                # Fit model
-                self._fit_surrogate()
-
-        # Run finishing phase to simplify the best configuration
-        best = self.run_finishing_phase(self.best, self.finishing_rounds)
-        return best.config
-
     def _generate_neighbors(self, base: FlatConfig) -> list[FlatConfig]:
         """
         Generate neighboring configurations randomly within a specified radius.
@@ -542,56 +582,6 @@ class LFBOPatternSearch(PatternSearch):
                 neighbors.append(new_flat)
 
         return self.shrink_neighbors(neighbors)
-
-    def _pruned_pattern_search_from(
-        self,
-        copy_idx: int,
-        current: PopulationMember,
-        visited: set[Config],
-    ) -> Iterator[list[PopulationMember]]:
-        """
-        Run a single copy of pattern search from the given starting point.
-
-        We use a generator and yield the new population at each generation so that we can
-        run multiple copies of pattern search in parallel.
-
-        Only keep self.frac_selected of the neighbors generated from the current
-        search_copy using _surrogate_select.
-
-        Args:
-            current: The current best configuration.
-            visited: A set of visited configurations.
-
-        Returns:
-            A generator that yields the new population at each generation.
-        """
-        patience = self.patience
-        for _ in range(self.max_generations):
-            candidates: list[PopulationMember] = [current]
-            with sync_seed(process_group_name=self.kernel.env.process_group_name):
-                all_neighbors = self._generate_neighbors(current.flat_values)
-            for flat_config in all_neighbors:
-                new_member = self.make_unbenchmarked(flat_config)
-                if new_member.config not in visited:
-                    candidates.append(new_member)
-                    visited.add(new_member.config)
-
-            # score candidates
-            n_sorted = int(len(candidates) * self.frac_selected)
-            candidates = self._surrogate_select(candidates, n_sorted)
-
-            if len(candidates) <= 1:
-                self.log(f"Copy {copy_idx} finish because of no candidates")
-                return  # no new candidates, stop searching
-            yield candidates  # yield new population to benchmark in parallel
-            best = min(candidates, key=performance)
-            if self._check_early_stopping(best, current):
-                if patience > 0:
-                    patience -= 1
-                else:
-                    self.log(f"Copy {copy_idx} finish because of no improvement")
-                    return
-            current = best
 
 
 class LFBOTreeSearch(LFBOPatternSearch):
