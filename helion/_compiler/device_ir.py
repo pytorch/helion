@@ -299,7 +299,7 @@ class ForLoopGraphInfo(NodeArgsGraphInfo):
     host_loop_reads: frozenset[str] = dataclasses.field(default_factory=frozenset)
     host_loop_writes: frozenset[str] = dataclasses.field(default_factory=frozenset)
     # True when FX analysis could not map every load/store/atomic buffer to a host
-    # name (see _reduction_fx_inter_loop_rw_names). Only set on ReductionLoopGraphInfo.
+    # name (see _reduction_fx_inter_loop_rw_names / Origin.root_rw_name).
     reduction_barrier_unknown: bool = False
 
     @property
@@ -540,23 +540,11 @@ class KernelPhase:
     )
 
 
-def _origin_root_rw_name(origin: object) -> str | None:
-    from .variable_origin import NameOrigin
-    from .variable_origin import WrappedOrigin
-
-    cur: object | None = origin
-    while isinstance(cur, WrappedOrigin):
-        cur = cur.value
-    if isinstance(cur, NameOrigin):
-        return cur.name
-    return None
-
-
 def _tensor_to_inter_loop_rw_name(host: HostFunction, t: torch.Tensor) -> str | None:
     o = host.tensor_to_origin.get(t)
     if o is None:
         return None
-    return _origin_root_rw_name(o)
+    return o.root_rw_name()
 
 
 def _fx_trace_tensor_arg_rw_names(
