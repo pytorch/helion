@@ -217,7 +217,6 @@ def _pallas_index_str(
                 offset_expr = state.device_function.literal_expr(
                     tile_with_offset_info.offset
                 )
-            is_device_loop = False
             if in_pipeline and block_id in pipeline_block_ids:
                 parts.append(f"{offset_expr}:")
             else:
@@ -233,7 +232,7 @@ def _pallas_index_str(
                         parts.append(expr)
                     else:
                         parts.append(f"{offset_expr}:")
-            if not is_device_loop and isinstance(idx, torch.SymInt):
+            if isinstance(idx, torch.SymInt):
                 dim_map.setdefault(tensor_dim, block_id)
         elif isinstance(idx, int):
             parts.append(str(idx))
