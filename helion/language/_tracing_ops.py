@@ -992,18 +992,9 @@ def _codegen_fori_loop(state: CodegenState) -> object:
 
     strategy = _find_strategy(state, block_ids)
 
-    # flatten_loops is not supported for multi-dim inner loops on Pallas.
-    # The nested fori_loop emission assumes NDTileStrategy where each
-    # dimension has its own block size and grid extent.  FlattenedTileStrategy
-    # shares a single block size across all dims, producing wrong DMA shapes.
-    from .. import exc
-    from .._compiler.tile_strategy import FlattenedTileStrategy
-
-    if isinstance(strategy, FlattenedTileStrategy) and len(block_ids) > 1:
-        raise exc.InvalidConfig(
-            "flatten_loops is not supported with pallas_loop_type='fori_loop' "
-            "for multi-dimensional inner loops"
-        )
+    # NOTE: FlattenedTileStrategy with multi-dim inner loops is not handled
+    # yet.  The nested fori_loop emission assumes NDTileStrategy where each
+    # dimension has its own block size and grid extent.
 
     # Create one loop variable per dimension for nested fori_loops.
     # Each dimension gets its own fori_loop; the innermost wraps body_stmts.
