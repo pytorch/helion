@@ -746,7 +746,9 @@ class DeviceFunction:
                         *self.preamble,
                         *self.body,
                     ],
-                    decorator_list=[expr_from_string(backend.function_decorator)]
+                    decorator_list=[
+                        expr_from_string(backend.function_decorator_expr(self))
+                    ]
                     if backend.function_decorator
                     else [],
                     type_params=[],

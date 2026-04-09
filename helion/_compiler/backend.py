@@ -386,6 +386,14 @@ class Backend(abc.ABC):
         """
         ...
 
+    def function_decorator_expr(self, device_fn: DeviceFunction) -> str:
+        """Return the decorator expression string, optionally using device_fn metadata.
+
+        The default returns ``function_decorator`` unchanged.  Backends can
+        override to embed metadata (e.g. arg dtypes) in the decorator call.
+        """
+        return self.function_decorator
+
     @property
     @abc.abstractmethod
     def constexpr_type(self) -> str:
@@ -2700,7 +2708,7 @@ class MetalBackend(Backend):
 
     @property
     def function_decorator(self) -> str:
-        return ""
+        return "metal_jit"
 
     @property
     def constexpr_type(self) -> str:
@@ -2721,6 +2729,7 @@ class MetalBackend(Backend):
                 "from helion.runtime import default_metal_launcher"
                 " as _default_metal_launcher"
             ),
+            "metal_jit": ("from helion._compiler.metal.metal_kernel import metal_jit"),
         }
 
     def index_type_str(self, index_dtype: torch.dtype) -> str:
@@ -2811,3 +2820,28 @@ class MetalBackend(Backend):
 
         dims = tuple(DeviceFunction.current().codegen.max_thread_block_dims)
         return [f"_block_dims=({dims[0]}, {dims[1]}, {dims[2]})"]
+
+    def function_decorator_expr(self, device_fn: DeviceFunction) -> str:
+        """Return ``metal_jit(args=[...], block_sizes=[...])``."""
+        from .device_function import SymbolArgument
+        from .device_function import TensorArg
+
+        args_metadata: list[dict[str, object]] = []
+        for arg in device_fn.sorted_args():
+            if isinstance(arg, TensorArg):
+                dtype_map = self._get_dtype_to_metal()
+                dtype = arg.fake_value.dtype
+                if dtype not in dtype_map:
+                    raise exc.BackendUnsupported("metal", f"tensor dtype {dtype}")
+                args_metadata.append(
+                    {
+                        "kind": "tensor",
+                        "name": arg.name,
+                        "metal_dtype": dtype_map[dtype],
+                    }
+                )
+            elif isinstance(arg, SymbolArgument):
+                args_metadata.append({"kind": "symbol", "name": arg.name})
+
+        block_sizes = list(device_fn.config.block_sizes)
+        return f"metal_jit(args={args_metadata!r}, block_sizes={block_sizes!r})"

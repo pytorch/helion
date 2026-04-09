@@ -1,0 +1,576 @@
+from __future__ import annotations
+
+import sys
+import unittest
+
+if sys.platform != "darwin":
+    raise unittest.SkipTest("Metal tests require macOS")
+
+import torch
+
+import helion
+import helion.language as hl
+
+DEVICE = "mps"
+
+_DEFAULT_CONFIG = [helion.Config(block_sizes=[256], num_warps=4)]
+
+
+def _get_msl(kernel: helion.Kernel, args: tuple[object, ...]) -> str:
+    """Compile a kernel and return the generated MSL source string.
+
+    Parses the generated Python source to find the @metal_jit decorated
+    function, extracts its metadata and body, and runs AST→MSL translation
+    directly (without exec).
+    """
+    import ast
+
+    from helion._compiler.metal.metal_kernel import _generate_msl
+
+    code = kernel.bind(args).to_triton_code()
+    tree = ast.parse(code)
+
+    # Find the @metal_jit(...) decorated function and extract metadata
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.FunctionDef) or not node.decorator_list:
+            continue
+        dec = node.decorator_list[0]
+        if not (isinstance(dec, ast.Call) and isinstance(dec.func, ast.Name)):
+            continue
+        if dec.func.id != "metal_jit":
+            continue
+        # Extract args and block_sizes from decorator kwargs
+        kwargs = {kw.arg: ast.literal_eval(kw.value) for kw in dec.keywords}
+        return _generate_msl(
+            kernel_name=node.name,
+            body_stmts=node.body,
+            args_metadata=kwargs["args"],
+            block_sizes=kwargs["block_sizes"],
+        )
+    raise RuntimeError("No @metal_jit kernel found in generated code")
+
+
+# ---------------------------------------------------------------------------
+# Kernel definitions – copy
+# ---------------------------------------------------------------------------
+
+
+@helion.kernel(backend="metal", configs=_DEFAULT_CONFIG)
+def copy_kernel(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.size(0)):
+        out[tile] = x[tile]
+    return out
+
+
+@helion.kernel(backend="metal", configs=_DEFAULT_CONFIG)
+def copy_into(x: torch.Tensor, out: torch.Tensor) -> None:
+    for tile in hl.tile(x.size(0)):
+        out[tile] = x[tile]
+
+
+@helion.kernel(backend="metal", configs=_DEFAULT_CONFIG)
+def masked_copy(x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    out = torch.zeros_like(x)
+    for tile in hl.tile(x.size(0)):
+        out[tile] = torch.where(mask[tile], x[tile], 0.0)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Kernel definitions – arithmetic
+# ---------------------------------------------------------------------------
+
+
+@helion.kernel(backend="metal", configs=_DEFAULT_CONFIG)
+def vector_add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.size(0)):
+        out[tile] = x[tile] + y[tile]
+    return out
+
+
+@helion.kernel(backend="metal", configs=_DEFAULT_CONFIG)
+def vector_sub(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.size(0)):
+        out[tile] = x[tile] - y[tile]
+    return out
+
+
+@helion.kernel(backend="metal", configs=_DEFAULT_CONFIG)
+def vector_mul(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.size(0)):
+        out[tile] = x[tile] * y[tile]
+    return out
+
+
+@helion.kernel(backend="metal", configs=_DEFAULT_CONFIG)
+def vector_div(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.size(0)):
+        out[tile] = x[tile] / y[tile]
+    return out
+
+
+@helion.kernel(backend="metal", configs=_DEFAULT_CONFIG)
+def vector_neg(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.size(0)):
+        out[tile] = -x[tile]
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Kernel definitions – scalar args
+# ---------------------------------------------------------------------------
+
+
+@helion.kernel(backend="metal", configs=_DEFAULT_CONFIG)
+def saxpy(x: torch.Tensor, y: torch.Tensor, a: float, b: float) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.size(0)):
+        out[tile] = a * x[tile] + b * y[tile]
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Kernel definitions – activations
+# ---------------------------------------------------------------------------
+
+
+@helion.kernel(backend="metal", configs=_DEFAULT_CONFIG)
+def relu(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.size(0)):
+        out[tile] = torch.where(x[tile] > 0, x[tile], 0.0)
+    return out
+
+
+@helion.kernel(backend="metal", configs=_DEFAULT_CONFIG)
+def silu(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.size(0)):
+        out[tile] = x[tile] * torch.sigmoid(x[tile])
+    return out
+
+
+@helion.kernel(backend="metal", configs=_DEFAULT_CONFIG)
+def gelu_approx(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.size(0)):
+        out[tile] = (
+            0.5
+            * x[tile]
+            * (1.0 + torch.tanh(0.7978845608 * (x[tile] + 0.044715 * x[tile] ** 3)))
+        )
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Kernel definitions – math ops
+# ---------------------------------------------------------------------------
+
+
+@helion.kernel(backend="metal", configs=_DEFAULT_CONFIG)
+def exp_kernel(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.size(0)):
+        out[tile] = torch.exp(x[tile])
+    return out
+
+
+@helion.kernel(backend="metal", configs=_DEFAULT_CONFIG)
+def log_kernel(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.size(0)):
+        out[tile] = torch.log(x[tile])
+    return out
+
+
+@helion.kernel(backend="metal", configs=_DEFAULT_CONFIG)
+def sqrt_kernel(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.size(0)):
+        out[tile] = torch.sqrt(x[tile])
+    return out
+
+
+@helion.kernel(backend="metal", configs=_DEFAULT_CONFIG)
+def abs_kernel(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.size(0)):
+        out[tile] = torch.abs(x[tile])
+    return out
+
+
+@helion.kernel(backend="metal", configs=_DEFAULT_CONFIG)
+def sincos_kernel(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.size(0)):
+        out[tile] = torch.sin(x[tile]) + torch.cos(x[tile])
+    return out
+
+
+@helion.kernel(backend="metal", configs=_DEFAULT_CONFIG)
+def clamp_kernel(x: torch.Tensor, lo: float, hi: float) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.size(0)):
+        out[tile] = torch.clamp(x[tile], lo, hi)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Kernel definitions – multi-dimensional
+# ---------------------------------------------------------------------------
+
+
+@helion.kernel(
+    backend="metal", configs=[helion.Config(block_sizes=[64, 64], num_warps=4)]
+)
+def elementwise_2d(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile_m, tile_n in hl.tile([x.size(0), x.size(1)]):
+        out[tile_m, tile_n] = x[tile_m, tile_n] + y[tile_m, tile_n]
+    return out
+
+
+@helion.kernel(
+    backend="metal",
+    configs=[helion.Config(block_sizes=[16, 16, 16], num_warps=4)],
+)
+def elementwise_3d(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile_0, tile_1, tile_2 in hl.tile([x.size(0), x.size(1), x.size(2)]):
+        out[tile_0, tile_1, tile_2] = (
+            x[tile_0, tile_1, tile_2] + y[tile_0, tile_1, tile_2]
+        )
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Kernel definitions – large block (1D, block_size > 1024)
+# ---------------------------------------------------------------------------
+
+
+@helion.kernel(
+    backend="metal", configs=[helion.Config(block_sizes=[2048], num_warps=4)]
+)
+def large_block_add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.size(0)):
+        out[tile] = x[tile] + y[tile]
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Tests – copy
+# ---------------------------------------------------------------------------
+
+
+class TestMetalCopy(unittest.TestCase):
+    """Copy kernels that test load/store + masking."""
+
+    def test_copy(self) -> None:
+        """Aligned size: out[tile] = x[tile] with size 1024."""
+        x = torch.randn(1024, device=DEVICE)
+        torch.testing.assert_close(copy_kernel(x), x)
+
+    def test_copy_non_aligned(self) -> None:
+        """Non-aligned size: mask must be active for correctness."""
+        x = torch.randn(1000, device=DEVICE)
+        torch.testing.assert_close(copy_kernel(x), x)
+
+    def test_masked_copy(self) -> None:
+        """torch.where with a boolean mask exercises _mask_to lowering."""
+        x = torch.randn(1024, device=DEVICE)
+        mask = torch.randint(0, 2, (1024,), device=DEVICE, dtype=torch.bool)
+        result = masked_copy(x, mask)
+        expected = torch.where(mask, x, torch.zeros_like(x))
+        torch.testing.assert_close(result, expected)
+
+    def test_masked_copy_non_aligned(self) -> None:
+        """Masked copy with non-aligned size: both tile mask and user mask active."""
+        x = torch.randn(1000, device=DEVICE)
+        mask = torch.randint(0, 2, (1000,), device=DEVICE, dtype=torch.bool)
+        result = masked_copy(x, mask)
+        expected = torch.where(mask, x, torch.zeros_like(x))
+        torch.testing.assert_close(result, expected)
+
+
+# ---------------------------------------------------------------------------
+# Tests – bounds masking
+# ---------------------------------------------------------------------------
+
+
+class TestMetalBoundsMasking(unittest.TestCase):
+    """Bounds masking tests using vector_add for both load and store paths."""
+
+    def test_store_no_oob_write(self) -> None:
+        """Sentinel buffer detects OOB store writes."""
+        n = 999
+        pad = 256
+        sentinel = 42.0
+        buf = torch.full((n + pad,), sentinel, device=DEVICE)
+        x = torch.randn(n, device=DEVICE)
+        out = buf[:n]
+        copy_into(x, out)
+        torch.mps.synchronize()
+        torch.testing.assert_close(buf[:n], x)
+        self.assertTrue(
+            (buf[n:] == sentinel).all(),
+            "OOB store detected: sentinel region was modified by padding threads",
+        )
+
+    def test_store_no_oob_write_size_1(self) -> None:
+        """Extreme case: N=1 with block_size=256 → 255 OOB threads."""
+        n = 1
+        pad = 256
+        sentinel = 42.0
+        buf = torch.full((n + pad,), sentinel, device=DEVICE)
+        x = torch.randn(n, device=DEVICE)
+        out = buf[:n]
+        copy_into(x, out)
+        torch.mps.synchronize()
+        torch.testing.assert_close(buf[:n], x)
+        self.assertTrue(
+            (buf[n:] == sentinel).all(),
+            "OOB store detected: sentinel region was modified by padding threads",
+        )
+
+    def test_codegen_has_mask(self) -> None:
+        """Generated MSL must contain bounds checks for non-aligned sizes."""
+        x = torch.randn(999, device=DEVICE)
+        msl = _get_msl(copy_kernel, (x,))
+        self.assertIn("mask_0", msl, "mask variable not found in generated MSL")
+        self.assertIn("if (mask_0)", msl, "store guard not found in generated MSL")
+        self.assertIn("?", msl, "load ternary not found in generated MSL")
+
+    def test_codegen_always_has_mask(self) -> None:
+        """Metal always generates masks (force_tile_mask=True) because the
+        launcher's threadgroup size can differ from the tile block_size."""
+        x = torch.randn(1024, device=DEVICE)
+        msl = _get_msl(copy_kernel, (x,))
+        self.assertIn("mask_0", msl, "mask variable expected even for aligned size")
+
+    def test_vector_add_non_aligned(self) -> None:
+        """vector_add with non-aligned size exercises mask on both load and store."""
+        x = torch.randn(1000, device=DEVICE)
+        y = torch.randn(1000, device=DEVICE)
+        torch.testing.assert_close(vector_add(x, y), x + y)
+
+    def test_vector_add_oob_store(self) -> None:
+        """Sentinel buffer detects OOB stores from vector_add."""
+        n = 999
+        pad = 256
+        sentinel = 42.0
+        buf_out = torch.full((n + pad,), sentinel, device=DEVICE)
+        x = torch.randn(n, device=DEVICE)
+        y = torch.randn(n, device=DEVICE)
+        # Use copy_into as a proxy: compute add manually then copy
+        expected = x + y
+        copy_into(expected, buf_out[:n])
+        torch.mps.synchronize()
+        torch.testing.assert_close(buf_out[:n], expected)
+        self.assertTrue(
+            (buf_out[n:] == sentinel).all(),
+            "OOB store detected in vector_add sentinel region",
+        )
+
+
+# ---------------------------------------------------------------------------
+# Tests – arithmetic
+# ---------------------------------------------------------------------------
+
+
+class TestMetalArithmetic(unittest.TestCase):
+    """Basic arithmetic elementwise kernels."""
+
+    def test_vector_add(self) -> None:
+        x = torch.randn(1024, device=DEVICE)
+        y = torch.randn(1024, device=DEVICE)
+        torch.testing.assert_close(vector_add(x, y), x + y)
+
+    def test_vector_sub(self) -> None:
+        x = torch.randn(1024, device=DEVICE)
+        y = torch.randn(1024, device=DEVICE)
+        torch.testing.assert_close(vector_sub(x, y), x - y)
+
+    def test_vector_mul(self) -> None:
+        x = torch.randn(1024, device=DEVICE)
+        y = torch.randn(1024, device=DEVICE)
+        torch.testing.assert_close(vector_mul(x, y), x * y)
+
+    def test_vector_div(self) -> None:
+        x = torch.randn(1024, device=DEVICE)
+        y = torch.randn(1024, device=DEVICE).abs() + 0.1
+        torch.testing.assert_close(vector_div(x, y), x / y)
+
+    def test_vector_neg(self) -> None:
+        x = torch.randn(1024, device=DEVICE)
+        torch.testing.assert_close(vector_neg(x), -x)
+
+
+# ---------------------------------------------------------------------------
+# Tests – scalar args
+# ---------------------------------------------------------------------------
+
+
+class TestMetalScalarArgs(unittest.TestCase):
+    """Kernels that accept scalar (SymbolArgument) parameters."""
+
+    def test_saxpy(self) -> None:
+        x = torch.randn(1024, device=DEVICE)
+        y = torch.randn(1024, device=DEVICE)
+        a, b = 2.5, -1.0
+        torch.testing.assert_close(saxpy(x, y, a, b), a * x + b * y)
+
+
+# ---------------------------------------------------------------------------
+# Tests – activations
+# ---------------------------------------------------------------------------
+
+
+class TestMetalActivations(unittest.TestCase):
+    """Activation function kernels."""
+
+    def test_relu(self) -> None:
+        x = torch.randn(1024, device=DEVICE)
+        torch.testing.assert_close(relu(x), torch.relu(x))
+
+    def test_silu(self) -> None:
+        x = torch.randn(1024, device=DEVICE)
+        torch.testing.assert_close(
+            silu(x), torch.nn.functional.silu(x), atol=1e-5, rtol=1e-5
+        )
+
+    def test_gelu_approx(self) -> None:
+        x = torch.randn(1024, device=DEVICE)
+        expected = torch.nn.functional.gelu(x, approximate="tanh")
+        torch.testing.assert_close(gelu_approx(x), expected, atol=1e-4, rtol=1e-4)
+
+
+# ---------------------------------------------------------------------------
+# Tests – math ops
+# ---------------------------------------------------------------------------
+
+
+class TestMetalMathOps(unittest.TestCase):
+    """Math function kernels."""
+
+    def test_exp(self) -> None:
+        x = torch.randn(1024, device=DEVICE)
+        torch.testing.assert_close(exp_kernel(x), torch.exp(x), atol=1e-5, rtol=1e-5)
+
+    def test_log(self) -> None:
+        x = torch.rand(1024, device=DEVICE) + 0.1
+        torch.testing.assert_close(log_kernel(x), torch.log(x), atol=1e-5, rtol=1e-5)
+
+    def test_sqrt(self) -> None:
+        x = torch.rand(1024, device=DEVICE) + 0.1
+        torch.testing.assert_close(sqrt_kernel(x), torch.sqrt(x))
+
+    def test_abs(self) -> None:
+        x = torch.randn(1024, device=DEVICE)
+        torch.testing.assert_close(abs_kernel(x), torch.abs(x))
+
+    def test_sincos(self) -> None:
+        x = torch.randn(1024, device=DEVICE)
+        expected = torch.sin(x) + torch.cos(x)
+        torch.testing.assert_close(sincos_kernel(x), expected, atol=1e-5, rtol=1e-5)
+
+    def test_clamp(self) -> None:
+        x = torch.randn(1024, device=DEVICE)
+        torch.testing.assert_close(
+            clamp_kernel(x, -0.5, 0.5), torch.clamp(x, -0.5, 0.5)
+        )
+
+
+# ---------------------------------------------------------------------------
+# Tests – dtypes
+# ---------------------------------------------------------------------------
+
+
+class TestMetalDtypes(unittest.TestCase):
+    """Elementwise ops across different dtypes."""
+
+    def test_float16_add(self) -> None:
+        x = torch.randn(1024, device=DEVICE, dtype=torch.float16)
+        y = torch.randn(1024, device=DEVICE, dtype=torch.float16)
+        torch.testing.assert_close(vector_add(x, y), x + y)
+
+    def test_bfloat16_add(self) -> None:
+        x = torch.randn(1024, device=DEVICE, dtype=torch.bfloat16)
+        y = torch.randn(1024, device=DEVICE, dtype=torch.bfloat16)
+        torch.testing.assert_close(vector_add(x, y), x + y)
+
+    def test_int32_add(self) -> None:
+        x = torch.randint(-100, 100, (1024,), device=DEVICE, dtype=torch.int32)
+        y = torch.randint(-100, 100, (1024,), device=DEVICE, dtype=torch.int32)
+        torch.testing.assert_close(vector_add(x, y), x + y)
+
+    def test_float16_neg(self) -> None:
+        x = torch.randn(1024, device=DEVICE, dtype=torch.float16)
+        torch.testing.assert_close(vector_neg(x), -x)
+
+    def test_bfloat16_mul(self) -> None:
+        x = torch.randn(1024, device=DEVICE, dtype=torch.bfloat16)
+        y = torch.randn(1024, device=DEVICE, dtype=torch.bfloat16)
+        torch.testing.assert_close(vector_mul(x, y), x * y)
+
+
+# ---------------------------------------------------------------------------
+# Tests – multi-dimensional
+# ---------------------------------------------------------------------------
+
+
+class TestMetalMultiDim(unittest.TestCase):
+    """Multi-dimensional elementwise kernels."""
+
+    def test_elementwise_2d(self) -> None:
+        x = torch.randn(128, 128, device=DEVICE)
+        y = torch.randn(128, 128, device=DEVICE)
+        torch.testing.assert_close(elementwise_2d(x, y), x + y)
+
+    def test_elementwise_2d_non_aligned(self) -> None:
+        x = torch.randn(100, 100, device=DEVICE)
+        y = torch.randn(100, 100, device=DEVICE)
+        torch.testing.assert_close(elementwise_2d(x, y), x + y)
+
+    def test_elementwise_3d(self) -> None:
+        x = torch.randn(16, 16, 16, device=DEVICE)
+        y = torch.randn(16, 16, 16, device=DEVICE)
+        torch.testing.assert_close(elementwise_3d(x, y), x + y)
+
+
+# ---------------------------------------------------------------------------
+# Tests – large block / auto-capping
+# ---------------------------------------------------------------------------
+
+
+class TestMetalLargeBlock(unittest.TestCase):
+    """Tests for threadgroup auto-capping when block_size > 1024."""
+
+    def test_large_block_1d(self) -> None:
+        """1D kernel with block_size=2048 auto-caps to 1024 threads."""
+        x = torch.randn(4096, device=DEVICE)
+        y = torch.randn(4096, device=DEVICE)
+        torch.testing.assert_close(large_block_add(x, y), x + y)
+
+    def test_large_block_1d_non_aligned(self) -> None:
+        """Non-aligned size with large block still works correctly."""
+        x = torch.randn(3000, device=DEVICE)
+        y = torch.randn(3000, device=DEVICE)
+        torch.testing.assert_close(large_block_add(x, y), x + y)
+
+    def test_codegen_lane_loop(self) -> None:
+        """Generated MSL must contain a for loop when block_size > 1024."""
+        x = torch.randn(4096, device=DEVICE)
+        y = torch.randn(4096, device=DEVICE)
+        msl = _get_msl(large_block_add, (x, y))
+        self.assertIn("for (int", msl, "lane loop not found in generated MSL")
+
+
+if __name__ == "__main__":
+    unittest.main()
