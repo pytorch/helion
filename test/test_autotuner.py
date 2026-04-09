@@ -692,6 +692,50 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         # should allow autotuning to succeed.
         torch.testing.assert_close(add(*args), sum(args))
 
+    def test_benchmark_results_aligned_when_compile_fails(self):
+        """_benchmark must return one result per input config even when some
+        fail to compile, otherwise parallel_benchmark_population crashes
+        with an assertion on result/member alignment."""
+
+        @helion.kernel(static_shapes=True)
+        def add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(out.size()):
+                out[tile] = x[tile] + y[tile]
+            return out
+
+        a = torch.randn([64, 64], device=DEVICE)
+        b = torch.randn([64, 64], device=DEVICE)
+        bound = add.bind((a, b))
+        good_config = bound.config_spec.default_config()
+
+        call_count = 0
+        original_compile = bound.compile_config
+
+        def fail_second(config, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 2:
+                raise RuntimeError("simulated compile failure")
+            return original_compile(config, **kwargs)
+
+        search = FiniteSearch(
+            bound, (a, b), configs=[good_config, good_config, good_config]
+        )
+        search.settings.autotune_precompile = None
+        search._prepare()
+
+        with patch.object(bound, "compile_config", side_effect=fail_second):
+            results = search._benchmark(
+                [good_config, good_config, good_config], desc="test"
+            )
+
+        self.assertEqual(len(results), 3)
+        self.assertTrue(math.isfinite(results[0].perf))
+        self.assertEqual(results[1].perf, float("inf"))
+        self.assertEqual(results[1].status, "error")
+        self.assertTrue(math.isfinite(results[2].perf))
+
     @skipIfXPU("maxnreg parameter not supported on XPU backend")
     def test_random_search(self):
         args = (
