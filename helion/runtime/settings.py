@@ -40,7 +40,6 @@ if TYPE_CHECKING:
         ) -> BaseAutotuner: ...
 
 
-BackendLiteral = Literal["triton", "pallas", "cute", "tileir", "metal"]
 DotPrecision = Literal["tf32", "tf32x3", "ieee"]
 PrecompileMode = Literal["spawn", "fork"] | None
 _TRUE_LITERALS = frozenset({"1", "true", "yes", "on"})
@@ -328,10 +327,10 @@ def _get_dot_precision() -> DotPrecision:
     )
 
 
-def _get_backend() -> BackendLiteral:
+def _get_backend() -> str:
     return _env_get_literal(
         "HELION_BACKEND",
-        cast("BackendLiteral", "triton"),
+        "triton",
         mapping={name: name for name in list_backends()},
     )
 
@@ -344,7 +343,7 @@ def is_pallas_interpret() -> bool:
 @dataclasses.dataclass
 class _Settings:
     # see __slots__ below for the doc strings that show up in help(Settings)
-    backend: BackendLiteral = dataclasses.field(default_factory=_get_backend)
+    backend: str = dataclasses.field(default_factory=_get_backend)
     ignore_warnings: list[type[exc.BaseWarning]] = dataclasses.field(
         default_factory=_get_ignore_warnings
     )
