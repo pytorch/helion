@@ -302,7 +302,6 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         self.args = args
         self.log = log
         self._autotune_metrics = autotune_metrics
-        self.best_perf_so_far: float = inf
         self._precompile_tmpdir: tempfile.TemporaryDirectory[str] | None = None
         self._precompile_args_path: str | None = None
         self._precompile_result_counter: count[int] = count()
@@ -672,8 +671,6 @@ class LocalBenchmarkProvider(BenchmarkProvider):
             self.log.debug(
                 lambda: f"result: {res:.4f}ms (took {t1 - t0:.1f}s + {t2 - t1:.1f}s)",
             )
-            if res < self.best_perf_so_far:
-                self.best_perf_so_far = res
             return res
         except Exception as e:
             # e.__traceback__ holds references to all local variables in the call stack frames.
