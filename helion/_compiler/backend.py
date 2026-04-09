@@ -21,6 +21,7 @@ if TYPE_CHECKING:
     from torch._inductor.ops_handler import OpsHandler
 
     from ..autotuner.config_fragment import ConfigSpecFragment
+    from ..runtime import _BlockSpecInfo
     from ..runtime.config import Config
     from ..runtime.kernel import BoundKernel
     from .device_function import Argument
@@ -283,6 +284,20 @@ class Backend(abc.ABC):
     def next_power_of_2_host_expr(self, expr: str) -> str:
         """Generate a host-side next-power-of-2 expression."""
         raise exc.BackendUnsupported(self.name, "next_power_of_2")
+
+    def static_rdim_size(self, numel: int) -> int:
+        """Return the RDIM block size for a statically known reduction dimension."""
+        from torch._inductor.runtime.runtime_utils import next_power_of_2
+
+        return next_power_of_2(numel)
+
+    def dynamic_rdim_size_expr(self, expr: str) -> str:
+        """Generate a host-side expression for RDIM size from a dynamic dimension.
+
+        By default delegates to next_power_of_2_host_expr. Backends like Pallas
+        that need exact sizes can override to return the expression unchanged.
+        """
+        return self.next_power_of_2_host_expr(expr)
 
     def reduction_combine_expr(
         self,
@@ -1121,6 +1136,14 @@ class PallasBackend(Backend):
     def reduction_index_zero_expr(self, dtype: str) -> str:
         return f"jnp.zeros([0], dtype={dtype})"
 
+    def static_rdim_size(self, numel: int) -> int:
+        # Pallas block refs use exact tensor dimensions, so RDIM_SIZE must
+        # match (no power-of-2 rounding that would exceed the block ref).
+        return numel
+
+    def dynamic_rdim_size_expr(self, expr: str) -> str:
+        return expr
+
     def adjust_block_size_constraints(
         self,
         block_specs: list[object],
@@ -1198,10 +1221,7 @@ class PallasBackend(Backend):
                 spec.update_min(min(8, dim_size))
 
     def tunable_fragments(self) -> dict[str, ConfigSpecFragment]:
-        from ..autotuner.config_fragment import EnumFragment
-        from ..autotuner.config_spec import VALID_PALLAS_LOOP_TYPES
-
-        return {"pallas_loop_type": EnumFragment(choices=VALID_PALLAS_LOOP_TYPES)}
+        return {}
 
     def get_do_bench(self) -> Callable[..., float | tuple[float, ...]]:
         from ..autotuner.benchmarking import do_bench_generic
@@ -1310,6 +1330,7 @@ class PallasBackend(Backend):
             tuple[tuple[int | None, ...], tuple[int | tuple[int, int, int] | None, ...]]
             | None
         ] = []
+
         for arg in sorted_args:
             if isinstance(arg, (SymbolArgument, TensorSizeArg, TensorStrideArg)):
                 result.append(None)  # scalars wrapped as 1-D tensors
@@ -1328,13 +1349,13 @@ class PallasBackend(Backend):
                         # For 1D tensors, the block size must be a
                         # multiple of the 1D tiling factor or equal to
                         # the full dimension.  If neither holds, fall
-                        # back to no BlockSpecs for the entire kernel.
+                        # back to no tiling for the entire kernel.
                         dim_size = tensor.shape[d]
                         if tensor.ndim == 1 and isinstance(dim_size, int):
                             bitwidth = tensor.dtype.itemsize * 8
                             tiling_1d = 128 * (32 // bitwidth)
                             if bs != dim_size and bs % tiling_1d != 0:
-                                return None
+                                return self._no_tiling_block_spec_info(sorted_args)
                         block_shape.append(bs)
                         # When the block covers the entire tensor
                         # dimension there is only one tile, so the grid
@@ -1351,6 +1372,27 @@ class PallasBackend(Backend):
                 block_shape.append(None)
                 grid_dims.append(None)
             result.append((tuple(block_shape), tuple(grid_dims)))
+        return result
+
+    def _no_tiling_block_spec_info(
+        self,
+        sorted_args: list[Argument],
+    ) -> _BlockSpecInfo:
+        result: _BlockSpecInfo = []
+
+        from .device_function import SymbolArgument
+        from .device_function import TensorArg
+        from .device_function import TensorSizeArg
+        from .device_function import TensorStrideArg
+
+        for arg in sorted_args:
+            if isinstance(arg, (SymbolArgument, TensorSizeArg, TensorStrideArg)):
+                result.append(None)  # scalars wrapped as 1-D tensors
+                continue
+            if not isinstance(arg, TensorArg) or arg.fake_value.ndim == 0:
+                continue
+            tensor = arg.fake_value
+            result.append((((None,) * tensor.ndim), ((None,) * tensor.ndim)))
         return result
 
     def build_launcher_args(
@@ -1401,12 +1443,21 @@ class PallasBackend(Backend):
                 block_spec_info.append(None)  # RNG seed buffer is untiled
             launcher_args.append(f"_block_spec_info={block_spec_info!r}")
 
+        from .device_function import DeviceFunction
+
+        device_fn = DeviceFunction.current()
+        smem_ids = device_fn.pallas_smem_tensor_ids
+        if smem_ids and sorted_args is not None:
+            smem_arg_indices = [
+                i
+                for i, arg in enumerate(sorted_args)
+                if isinstance(arg, TensorArg) and id(arg.fake_value) in smem_ids
+            ]
+            launcher_args.append(f"_smem_arg_indices={smem_arg_indices!r}")
+
         # Pass scratch shapes for pipeline/fori_loop launcher
         pallas_loop_type = config.get("pallas_loop_type", "default")
         if pallas_loop_type in ("emit_pipeline", "fori_loop"):
-            from .device_function import DeviceFunction
-
-            device_fn = DeviceFunction.current()
             scratch_shapes = [
                 (
                     s.shape,
@@ -2692,6 +2743,11 @@ class MetalBackend(Backend):
     def force_tile_mask(self) -> bool:
         return True
 
+    def inductor_op_overrides(self) -> InductorOpOverrides:
+        from .metal.metal_overrides import MetalOverrides
+
+        return MetalOverrides()
+
     def full_expr(
         self, shape_dims: list[str], value_expr: str, dtype: torch.dtype
     ) -> str:
@@ -2708,7 +2764,8 @@ class MetalBackend(Backend):
         return "0"
 
     def where_expr(self, mask: str, true_val: str, false_val: str) -> str:
-        return f"({mask} ? {true_val} : {false_val})"
+        # Must be valid Python for expr_from_string; walker converts to C++ ternary
+        return f"({true_val} if {mask} else {false_val})"
 
     def minimum_expr(self, a: str, b: str) -> str:
         return f"min({a}, {b})"

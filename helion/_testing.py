@@ -32,6 +32,7 @@ from ._compat import supports_tensor_descriptor
 from ._dist_utils import is_master_rank
 from ._dist_utils import sync_object as sync_object
 from ._utils import counters
+from .autotuner.benchmarking import synchronize_device
 from .runtime.settings import _get_backend
 from .runtime.settings import is_pallas_interpret
 from helion.autotuner.base_search import _clone_args
@@ -931,7 +932,7 @@ def _run_bound_kernel(
         if has_device_tensor or (
             isinstance(result, torch.Tensor) and result.device.type != "cpu"
         ):
-            torch.accelerator.synchronize()
+            synchronize_device(result)
     except Exception as exc:
         if code is None:
             try:
@@ -944,7 +945,7 @@ def _run_bound_kernel(
             sys.stderr.write("Failed to run kernel.\n")
         if has_device_tensor:
             try:
-                torch.accelerator.synchronize()
+                synchronize_device(None)
             except Exception as sync_error:
                 raise exc from sync_error
         raise

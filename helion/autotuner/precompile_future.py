@@ -27,6 +27,7 @@ import torch
 from .. import exc
 from ..runtime.precompile_shim import already_compiled
 from ..runtime.precompile_shim import make_precompiler
+from .benchmarking import synchronize_device
 from .logger import SUPPRESSED_TRITON_CODE_MSG
 from .logger import capture_output
 from .logger import classify_triton_exception
@@ -152,10 +153,10 @@ def _run_kernel_in_subprocess_spawn(
         fn = _load_compiled_fn(fn_spec)
         args = torch.load(args_path)
         assert isinstance(args, (tuple, list))
-        torch.accelerator.synchronize()
+        synchronize_device(None)
         with capture_output() as _cap:
-            fn(*args)
-        torch.accelerator.synchronize()
+            result = fn(*args)
+        synchronize_device(result)
         _write_result_file(result_path, {"status": "ok"})
     except Exception as exc:
         status = 1

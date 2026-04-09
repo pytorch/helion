@@ -493,7 +493,6 @@ class TestLoops(RefEagerTestBase, TestCase):
         self.assertEqual(spec.min_size, 32)
         self.assertEqual(spec.max_size, 256)
 
-    @xfailIfPallas("complex reduction with atomic_add not supported on pallas")
     @skipIfTileIR("Result mismatch with tileir backend")
     @skipIfFn(
         lambda: _get_backend() == "cute",
@@ -1430,6 +1429,23 @@ class TestLoops(RefEagerTestBase, TestCase):
         # Logic for modifying num_stages and loop unrolling factors should
         # change num_stages=1
         self.assertIn("num_stages=1", code)
+
+    def test_loop_with_symbolic_bounds(self):
+        @helion.kernel(
+            config=helion.Config(
+                block_sizes=[128, 128, 1],
+            )
+        )
+        def fn(x) -> torch.Tensor:
+            m, n = x.shape
+            out = torch.zeros([m, n], dtype=torch.float32, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                for inner_n in hl.tile(tile_n.begin, tile_n.end):
+                    out[tile_m, inner_n] = x[tile_m, inner_n]
+            return out
+
+        x = torch.randn(128, 1024, dtype=torch.float32, device=DEVICE)
+        torch.testing.assert_close(fn(x), x)
 
 
 if __name__ == "__main__":

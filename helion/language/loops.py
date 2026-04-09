@@ -338,6 +338,7 @@ def _(
 
     results = []
     has_data_dependent_bounds = False
+    has_symbolic_bounds = False
     for begin_part, end_part, bs in zip(
         begin_list,
         end_list,
@@ -352,6 +353,8 @@ def _(
         if isinstance(size, torch.Tensor):
             size = None  # data dependent size
             has_data_dependent_bounds = True
+        if isinstance(begin_part, torch.SymInt) or isinstance(end_part, torch.SymInt):
+            has_symbolic_bounds = True
         if bs is None:
             results.append(TileIndexType.allocate(size, origin))
         elif isinstance(bs, int):
@@ -376,6 +379,7 @@ def _(
             )
         ],
         has_data_dependent_bounds=has_data_dependent_bounds,
+        has_symbolic_bounds=has_symbolic_bounds,
     )
     # pyrefly: ignore [unbound-name]
     if unpack:
@@ -392,6 +396,7 @@ def _add_config_choices(
     has_begin: bool = False,
     allow_static_ranges: list[bool] | None = None,
     has_data_dependent_bounds: bool = False,
+    has_symbolic_bounds: bool = False,
 ) -> None:
     config_spec = CompileEnvironment.current().config_spec
 
@@ -421,12 +426,17 @@ def _add_config_choices(
         # just one set of choices for when we have persistent kernel loop
         _add_config_range_choice(block_ids)
     else:
+        if config_spec.backend_name == "pallas":
+            config_spec.has_pallas_inner_loops = True
         if allow_static_ranges is None:
             allow_static_ranges = [False] * len(block_ids)
         for block_id, allow_static_range in zip(
             block_ids, allow_static_ranges, strict=True
         ):
             _add_config_range_choice([block_id], allow_static_range=allow_static_range)
+
+        if has_symbolic_bounds and config_spec.backend_name == "pallas":
+            config_spec.has_pallas_symbolic_bounds = True
 
 
 def _add_config_range_choice(

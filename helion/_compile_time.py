@@ -207,6 +207,10 @@ class CompileTimeTracker:
             file=sys.stderr,
         )
 
+    def get_total_time(self) -> float:
+        """Get total top-level compile time in seconds."""
+        return sum(self._timings.get(name, 0.0) for name in self._TOP_LEVEL)
+
     def reset(self) -> None:
         """Reset all timing data."""
         with self._timer_lock:
@@ -298,3 +302,8 @@ def print_report() -> None:
 def reset() -> None:
     """Reset all timing data."""
     get_tracker().reset()
+
+
+def get_total_time() -> float:
+    """Get total top-level compile time from the global tracker."""
+    return get_tracker().get_total_time()

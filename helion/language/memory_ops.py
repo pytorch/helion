@@ -14,6 +14,7 @@ from .._compiler.compile_environment import CompileEnvironment
 from .._compiler.compile_environment import _symint_expr
 from .._compiler.host_function import HostFunction
 from .._compiler.indexing_strategy import SubscriptIndexing
+from .._compiler.indexing_strategy import _get_tile_with_offset_info
 from .._compiler.variable_origin import GridOrigin
 from .._compiler.variable_origin import TileBeginOrigin
 from .._compiler.variable_origin import TileCountOrigin
@@ -201,32 +202,81 @@ def _pallas_index_str(
     none_dims: list[int] = []
     out_pos = 0
     tensor_dim = 0  # tracks which tensor dimension we're at (skips None)
-    for idx in subscript:
+    for i, idx in enumerate(subscript):
         if idx is None:
             none_dims.append(out_pos)
             out_pos += 1
             continue
         block_id = _resolve_block_id(env, idx, tensor, tensor_dim)
+        tile_with_offset_info = _get_tile_with_offset_info(idx, state, i)
+        if tile_with_offset_info is not None:
+            block_id = tile_with_offset_info.block_id
         if block_id is not None:
+            offset_expr = ""
+            if tile_with_offset_info is not None:
+                offset_expr = state.device_function.literal_expr(
+                    tile_with_offset_info.offset
+                )
             is_device_loop = False
             if in_pipeline and block_id in pipeline_block_ids:
-                parts.append(":")
+                parts.append(f"{offset_expr}:")
             else:
                 loops = state.codegen.active_device_loops.get(block_id)
                 if loops and any(isinstance(loop, DeviceLoopState) for loop in loops):
-                    parts.append(_pallas_ds_expr(state, block_id))
+                    parts.append(_pallas_ds_expr(state, block_id, offset_expr))
                 else:
-                    parts.append(":")
+                    maybe_grid_axis_idx = _maybe_get_hl_grid_axis_pid(idx)
+                    if maybe_grid_axis_idx is not None:
+                        expr = f"pl.program_id({maybe_grid_axis_idx})"
+                        if offset_expr:
+                            expr = f"{expr} + {offset_expr}"
+                        parts.append(expr)
+                    else:
+                        parts.append(f"{offset_expr}:")
             if not is_device_loop and isinstance(idx, torch.SymInt):
                 dim_map.setdefault(tensor_dim, block_id)
         elif isinstance(idx, int):
             parts.append(str(idx))
+        elif isinstance(idx, torch.SymInt):
+            ast_subscripts = state.ast_args[1]
+            assert isinstance(ast_subscripts, list)
+            ast_idx = ast_subscripts[i]
+            assert isinstance(ast_idx, ast.AST)
+            name = state.codegen.lift(ast_idx, dce=True, prefix="index")
+            parts.append(name.id)
         else:
             parts.append(":")
         out_pos += 1
         tensor_dim += 1
 
+    requries_smem_access = all(":" not in p and "pl.ds" not in p for p in parts)
+    if requries_smem_access:
+        state.codegen.device_function.pallas_smem_tensor_ids.add(id(tensor))
+
     return ", ".join(parts), none_dims
+
+
+# returns pid for an idx (used in a index_expr) that comes from a hl.grid
+def _maybe_get_hl_grid_axis_pid(idx: object) -> int | None:
+    if not isinstance(idx, torch.SymInt):
+        return None
+    expr = _symint_expr(idx)
+    if expr is None:
+        return None
+    origin_info = HostFunction.current().expr_to_origin.get(expr)
+    if origin_info is None:
+        return None
+    if not isinstance(origin_info.origin, GridOrigin):
+        return None
+    block_id = origin_info.origin.block_id
+    from .._compiler.device_function import DeviceFunction
+
+    device_fn = DeviceFunction.current()
+    if device_fn.pid is not None:
+        for i, pid in enumerate(device_fn.pid.pid_info):
+            if pid.block_id == block_id:
+                return i
+    return None
 
 
 def _resolve_block_id(
@@ -243,9 +293,11 @@ def _resolve_block_id(
     return None
 
 
-def _pallas_ds_expr(state: CodegenState, block_id: int) -> str:
-    """Return a ``pl.ds(offset, block_size)`` expression for *block_id*."""
+def _pallas_ds_expr(state: CodegenState, block_id: int, tile_offset: str) -> str:
+    """Return a ``pl.ds(offset, block_size)`` expression for *block_id*, offset by *tile_offset*"""
     offset = state.codegen.offset_var(block_id)
+    if tile_offset:
+        offset = f"{offset} + {tile_offset}"
     block_size = state.device_function.block_size_var(block_id)
     if block_size is None:
         return ":"
@@ -1001,6 +1053,28 @@ def _codegen_cute_store_permute_lane_loops(
     )
 
 
+@_decorators.codegen(store, "metal")
+def _(state: CodegenState) -> ast.AST:
+    # Metal delegates to the same PointerIndexingStrategy as Triton.
+    # This produces tl.store(ptr + offset, val, mask) in the AST;
+    # the MSL walker translates it to Metal.
+    tensor = state.proxy_arg(0)
+    subscript = state.proxy_arg(1)
+    assert isinstance(subscript, (list, tuple))
+    value = state.ast_arg(2)
+    extra_mask = state.ast_args[3]
+    assert isinstance(extra_mask, (type(None), ast.AST))
+
+    if isinstance(tensor, torch.Tensor):
+        device_fn = state.device_function
+        device_fn.device_store_index += 1
+        indexing_idx = device_fn.device_memory_op_index
+        device_fn.device_memory_op_index += 1
+        strategy = device_fn.get_indexing_strategy(indexing_idx)
+        return strategy.codegen_store(state, tensor, [*subscript], value, extra_mask)
+    raise exc.BackendUnsupported("metal", f"store target type: {type(tensor)}")
+
+
 @_decorators.codegen(store, "cute")
 def _(state: CodegenState) -> ast.AST:
     tensor = state.proxy_arg(0)
@@ -1323,6 +1397,33 @@ def _(state: CodegenState) -> ast.AST:
             f"jnp.expand_dims({{result}}, axis={dim})", result=result
         )
     return result
+
+
+@_decorators.codegen(load, "metal")
+def _(state: CodegenState) -> ast.AST:
+    # Metal delegates to the same PointerIndexingStrategy as Triton.
+    # This produces tl.load(ptr + offset, mask, other=0) in the AST;
+    # the MSL walker translates it to Metal.
+    tensor = state.proxy_arg(0)
+    subscript = state.proxy_arg(1)
+    assert isinstance(subscript, (list, tuple))
+    ast_subscript = state.ast_args[1]
+    assert isinstance(ast_subscript, (list, tuple))
+    extra_mask = state.ast_args[2]
+    assert isinstance(extra_mask, (type(None), ast.AST))
+    eviction_policy = state.ast_args[3] if len(state.ast_args) > 3 else None
+    assert isinstance(eviction_policy, (type(None), ast.AST))
+
+    if isinstance(tensor, torch.Tensor):
+        device_fn = state.device_function
+        device_fn.device_load_index += 1
+        indexing_idx = device_fn.device_memory_op_index
+        device_fn.device_memory_op_index += 1
+        strategy = device_fn.get_indexing_strategy(indexing_idx)
+        return strategy.codegen_load(
+            state, tensor, [*subscript], extra_mask, eviction_policy
+        )
+    raise exc.BackendUnsupported("metal", f"load tensor type: {type(tensor)}")
 
 
 @_decorators.codegen(load, "cute")
