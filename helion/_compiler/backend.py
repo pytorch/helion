@@ -1422,7 +1422,32 @@ class PallasBackend(Backend):
         from .device_function import TensorArg
         from .host_function import HostFunction
 
+        def _empty_allocated_vars(body: list[ast.stmt]) -> set[str]:
+            """Return names of variables allocated with torch.empty/empty_like/new_empty.
+
+            Only checks top-level assignments; allocations nested inside
+            if/with/try are conservatively missed (treated as needing input,
+            which is correct but suboptimal).
+            """
+            result: set[str] = set()
+            for stmt in body:
+                if (
+                    isinstance(stmt, ast.Assign)
+                    and len(stmt.targets) == 1
+                    and isinstance(stmt.targets[0], ast.Name)
+                    and isinstance(stmt.value, ast.Call)
+                    and isinstance(stmt.value.func, ast.Attribute)
+                    and stmt.value.func.attr in ("empty", "empty_like", "new_empty")
+                ):
+                    result.add(stmt.targets[0].id)
+            return result
+
         output_indices: list[int] = []
+        # Indices of output tensors that are also read by the kernel
+        # (inplace-mutated params or body-created tensors the kernel reads).
+        # These must use VMEM BlockSpecs. Output-only tensors (written but
+        # never read) get HBM in_specs to avoid VMEM pressure.
+        inplace_indices: list[int] = []
         if sorted_args is not None:
             env = CompileEnvironment.current()
             host_fn = HostFunction.current()
@@ -1430,18 +1455,43 @@ class PallasBackend(Backend):
                 a.arg for a in host_fn.args.args
             }
             input_storages = {id(t.untyped_storage()) for t in env.input_sources}
-
+            # Collect reads from for-loop bodies only (kernel code), excluding
+            # host-level reads like ``return out``.
+            # Note: Python AST counts ``out[tile] = val`` as a Load of ``out``
+            # (the object must be loaded to index into it), but from Pallas's
+            # perspective this is a pure write — the tensor data is not read.
+            # Subtract such "false reads" by checking inplace_writes counts.
+            #
+            # Only tensors allocated with torch.empty/empty_like/new_empty can be
+            # output-only — their initial values are undefined, so it's safe
+            # to use HBM BlockSpecs.  Tensors allocated with torch.zeros_like,
+            # torch.full, etc. have meaningful initial values that must be
+            # preserved via VMEM BlockSpecs.
+            empty_vars = _empty_allocated_vars(host_fn.body)
+            kernel_reads: set[str] = set()
+            for stmt in host_fn.body:
+                if isinstance(stmt, ast.For):
+                    body_rw = ReadWrites.from_list(stmt.body)
+                    for name, read_count in body_rw.reads.items():
+                        iw_count = body_rw.inplace_writes.get(name, 0)
+                        if read_count > iw_count or name not in empty_vars:
+                            kernel_reads.add(name)
             for i, arg in enumerate(sorted_args):
                 if not isinstance(arg, TensorArg):
                     continue
                 if id(arg.fake_value.untyped_storage()) not in input_storages:
                     # Tensor created inside the function body (output)
                     output_indices.append(i)
+                    if arg.host_str() in kernel_reads:
+                        # Also read by the kernel (e.g. broadcast result)
+                        inplace_indices.append(i)
                 elif arg.host_str() in mutated_params:
                     # Input tensor mutated in-place
                     output_indices.append(i)
+                    inplace_indices.append(i)
 
         launcher_args = [*args, f"_output_indices={output_indices}"]
+        launcher_args.append(f"_inplace_indices={inplace_indices}")
 
         if has_rng_ops:
             launcher_args.insert(-1, "_rng_seed_buffer")
