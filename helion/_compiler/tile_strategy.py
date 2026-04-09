@@ -135,11 +135,13 @@ class ForiLoopState(DeviceLoopOrGridState):
 
     body_fn_name: str
     loop_var_name: str  # The fori_loop index variable (e.g., "_j")
+    slot_var_name: str | None = None  # Double-buffer slot variable (e.g., "_slot")
     inner_statements: list[ast.AST] = dataclasses.field(default_factory=list)
     outer_prefix: list[ast.AST] = dataclasses.field(default_factory=list)
     outer_suffix: list[ast.AST] = dataclasses.field(default_factory=list)
     _tensor_to_vmem: dict[str, str] = dataclasses.field(default_factory=dict)
-    _tensor_to_sem: dict[str, str] = dataclasses.field(default_factory=dict)
+    _tensor_to_load_sem: dict[str, str] = dataclasses.field(default_factory=dict)
+    _tensor_to_store_sem: dict[str, str] = dataclasses.field(default_factory=dict)
 
 
 @dataclasses.dataclass

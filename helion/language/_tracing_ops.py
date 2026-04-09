@@ -934,9 +934,12 @@ def _codegen_fori_loop(state: CodegenState) -> object:
     for fake, _tensor_node, _sub_meta in stored_tensors.values():
         state.device_function.pallas_pipeline_tensor_ids.add(id(fake))
 
-    # For each tensor, register VMEM scratch buffer + DMA semaphore
+    # For each tensor, register VMEM scratch buffer + DMA semaphores.
+    # Load and store use separate semaphores to avoid counting-semaphore
+    # hazards when a tensor is both loaded and stored (read-modify-write).
     tensor_to_vmem: dict[str, str] = {}
-    tensor_to_sem: dict[str, str] = {}
+    tensor_to_load_sem: dict[str, str] = {}
+    tensor_to_store_sem: dict[str, str] = {}
 
     # Collect all tensors: load-only first, then stored (which may also be read)
     all_tensor_info: list[tuple[torch.Tensor, list[object], str]] = []
@@ -946,7 +949,7 @@ def _codegen_fori_loop(state: CodegenState) -> object:
     for fake, _tensor_node, sub_meta in stored_tensors.values():
         all_tensor_info.append((fake, sub_meta, "store"))
 
-    for fake, sub_meta, _direction in all_tensor_info:
+    for fake, sub_meta, direction in all_tensor_info:
         hbm_name = state.device_function.tensor_arg(fake).name
         # Compute VMEM buffer shape (block-sized for pipeline dims, full for others)
         dim_to_bid = _get_dim_block_ids(sub_meta, env)
@@ -977,15 +980,26 @@ def _codegen_fori_loop(state: CodegenState) -> object:
                 vmem_shape_parts.append(int(fake.shape[dim_idx]))
 
         vmem_name = state.device_function.register_scratch(
-            tuple(vmem_shape_parts),
+            (2, *vmem_shape_parts),
             fake.dtype,
             name_hint=hbm_name.replace("_hbm", "") + "_buf",
         )
-        sem_name = state.device_function.register_dma_semaphore(
-            name_hint=hbm_name.replace("_hbm", "") + "_sem",
-        )
         tensor_to_vmem[hbm_name] = vmem_name
-        tensor_to_sem[hbm_name] = sem_name
+
+        base = hbm_name.replace("_hbm", "")
+        if direction == "load" or hbm_name in {
+            state.device_function.tensor_arg(f).name
+            for f, _, _ in loaded_tensors.values()
+        }:
+            load_sem = state.device_function.register_dma_semaphore(
+                name_hint=base + "_load_sem",
+            )
+            tensor_to_load_sem[hbm_name] = load_sem
+        if direction == "store":
+            store_sem = state.device_function.register_dma_semaphore(
+                name_hint=base + "_store_sem",
+            )
+            tensor_to_store_sem[hbm_name] = store_sem
 
     # Build the body function
     body_fn_name = state.device_function.new_var("_fori_body")
@@ -1012,21 +1026,36 @@ def _codegen_fori_loop(state: CodegenState) -> object:
         # fori_loop has direct access to the loop variable
         offset_expr_fn=lambda i, bs: f"{loop_var} * {bs} + jnp.arange({bs})",
     )
+    # Double-buffer slot variables
+    slot_var = state.device_function.new_var("_slot")
+    next_slot_var = state.device_function.new_var("_next_slot")
+
     # Create ForiLoopState
     fori_state = ForiLoopState(
         strategy=strategy,  # pyrefly: ignore[bad-argument-type]
         block_id_to_info=block_id_to_info,
         body_fn_name=body_fn_name,
         loop_var_name=loop_var,
+        slot_var_name=slot_var,
         inner_statements=body_stmts,
         _tensor_to_vmem=tensor_to_vmem,
-        _tensor_to_sem=tensor_to_sem,
+        _tensor_to_load_sem=tensor_to_load_sem,
+        _tensor_to_store_sem=tensor_to_store_sem,
     )
 
     def _build_hbm_dma_slice(
-        fake: torch.Tensor, hbm_name: str, subscript_meta: list[object]
+        fake: torch.Tensor,
+        hbm_name: str,
+        subscript_meta: list[object],
+        loop_index: str | None = None,
     ) -> str:
-        """Build an HBM ref slicing expression for DMA with loop variable."""
+        """Build an HBM ref slicing expression for DMA with loop variable.
+
+        Args:
+            loop_index: Override for the loop variable (e.g., "_j + 1" for
+                next-iteration prefetch). Defaults to the fori_loop index var.
+        """
+        idx = loop_index if loop_index is not None else loop_var
         dim_to_bid = _get_dim_block_ids(subscript_meta, env)
         shape = fake.shape
         parts: list[str] = []
@@ -1039,7 +1068,7 @@ def _codegen_fori_loop(state: CodegenState) -> object:
                 iter_step_expr = iter_step_exprs[bid_idx]
                 slice_size_expr = slice_size_exprs[bid_idx]
                 parts.append(
-                    f"pl.ds(({begin_expr}) + ({loop_var}) * ({iter_step_expr}), {slice_size_expr})"
+                    f"pl.ds(({begin_expr}) + ({idx}) * ({iter_step_expr}), {slice_size_expr})"
                 )
                 needs_slice = True
             elif bid is not None and bid not in block_ids:
@@ -1061,6 +1090,13 @@ def _codegen_fori_loop(state: CodegenState) -> object:
             return hbm_name
         return f"{hbm_name}.at[{', '.join(parts)}]"
 
+    # Compute n_tiles expression
+    if len(grid_parts) == 1:
+        n_tiles_expr = grid_parts[0]
+    else:
+        n_tiles_expr = " * ".join(f"({p})" for p in grid_parts)
+    n_tiles_var = state.device_function.new_var("_n_tiles")
+
     # For loop-carried state, remap args to scratch reads inside the body
     body_args = (
         _remap_args_to_scratch(args, scratch_names, state)
@@ -1068,22 +1104,67 @@ def _codegen_fori_loop(state: CodegenState) -> object:
         else [*args]
     )
 
+    # --- Prologue: prefetch first tile into slot 0 before the loop ---
+    for fake, _tensor_node, sub_meta in loaded_tensors.values():
+        hbm_name = state.device_function.tensor_arg(fake).name
+        vmem_name = tensor_to_vmem[hbm_name]
+        sem_name = tensor_to_load_sem[hbm_name]
+        src_slice_0 = _build_hbm_dma_slice(fake, hbm_name, sub_meta, loop_index="0")
+        init_copy_var = state.device_function.new_var("_copy_init")
+        state.add_statement(
+            statement_from_string(
+                f"{init_copy_var} = pltpu.make_async_copy({src_slice_0}, {vmem_name}.at[0], {sem_name})"
+            )
+        )
+        state.add_statement(statement_from_string(f"{init_copy_var}.start()"))
+
     # Generate body code within the fori_loop context
     with state.codegen.add_fori_loop(fori_state):
-        # Emit DMA read copies at start of body
+        # Emit double-buffer slot computation
+        state.codegen.add_statement(
+            statement_from_string(f"{slot_var} = jax.lax.rem({loop_var}, 2)")
+        )
+        state.codegen.add_statement(
+            statement_from_string(f"{next_slot_var} = 1 - {slot_var}")
+        )
+
+        # Wait for current slot's prefetch (started by prologue or previous iter)
+        # and prefetch next iteration into the other slot
         for fake, _tensor_node, sub_meta in loaded_tensors.values():
             hbm_name = state.device_function.tensor_arg(fake).name
             vmem_name = tensor_to_vmem[hbm_name]
-            sem_name = tensor_to_sem[hbm_name]
-            src_slice = _build_hbm_dma_slice(fake, hbm_name, sub_meta)
-            copy_var = state.device_function.new_var("_copy")
+            sem_name = tensor_to_load_sem[hbm_name]
+
+            # Wait: create async copy descriptor for current slot and call .wait()
+            # (.wait() waits on the semaphore from the previous .start())
+            cur_src_slice = _build_hbm_dma_slice(fake, hbm_name, sub_meta)
+            wait_var = state.device_function.new_var("_copy_wait")
             state.codegen.add_statement(
                 statement_from_string(
-                    f"{copy_var} = pltpu.make_async_copy({src_slice}, {vmem_name}, {sem_name})"
+                    f"{wait_var} = pltpu.make_async_copy({cur_src_slice}, {vmem_name}.at[{slot_var}], {sem_name})"
                 )
             )
-            state.codegen.add_statement(statement_from_string(f"{copy_var}.start()"))
-            state.codegen.add_statement(statement_from_string(f"{copy_var}.wait()"))
+            state.codegen.add_statement(statement_from_string(f"{wait_var}.wait()"))
+
+            # Prefetch next iteration into the other slot (guarded by bounds check)
+            next_src_slice = _build_hbm_dma_slice(
+                fake, hbm_name, sub_meta, loop_index=f"{loop_var} + 1"
+            )
+            prefetch_var = state.device_function.new_var("_copy_next")
+            prefetch_fn_name = f"_prefetch_{hbm_name.replace('_hbm', '')}"
+            prefetch_body = [
+                statement_from_string(
+                    f"{prefetch_var} = pltpu.make_async_copy({next_src_slice}, {vmem_name}.at[{next_slot_var}], {sem_name})"
+                ),
+                statement_from_string(f"{prefetch_var}.start()"),
+            ]
+            fn_def_node = statement_from_string(f"def {prefetch_fn_name}(): pass")
+            assert isinstance(fn_def_node, ast.FunctionDef)
+            fn_def_node.body = prefetch_body  # pyrefly: ignore[bad-assignment]
+            fn_def_node.decorator_list = [  # pyrefly: ignore[bad-assignment]
+                expr_from_string(f"pl.when({loop_var} + 1 < {n_tiles_var})")
+            ]
+            state.codegen.add_statement(fn_def_node)
 
         # Codegen the user's body (loads/stores remapped via _tensor_to_vmem)
         graph_results = codegen_call_with_graph(
@@ -1098,12 +1179,12 @@ def _codegen_fori_loop(state: CodegenState) -> object:
         for fake, _tensor_node, sub_meta in stored_tensors.values():
             hbm_name = state.device_function.tensor_arg(fake).name
             vmem_name = tensor_to_vmem[hbm_name]
-            sem_name = tensor_to_sem[hbm_name]
+            sem_name = tensor_to_store_sem[hbm_name]
             dst_slice = _build_hbm_dma_slice(fake, hbm_name, sub_meta)
             copy_out_var = state.device_function.new_var("_copy_out")
             state.codegen.add_statement(
                 statement_from_string(
-                    f"{copy_out_var} = pltpu.make_async_copy({vmem_name}, {dst_slice}, {sem_name})"
+                    f"{copy_out_var} = pltpu.make_async_copy({vmem_name}.at[{slot_var}], {dst_slice}, {sem_name})"
                 )
             )
             state.codegen.add_statement(
@@ -1116,16 +1197,11 @@ def _codegen_fori_loop(state: CodegenState) -> object:
     assert isinstance(fn_def, ast.FunctionDef)
     fn_def.body = body_stmts or [ast.Pass()]  # pyrefly: ignore[bad-assignment]
 
-    # Compute n_tiles
-    if len(grid_parts) == 1:
-        n_tiles_expr = grid_parts[0]
-    else:
-        n_tiles_expr = " * ".join(f"({p})" for p in grid_parts)
-
+    state.add_statement(statement_from_string(f"{n_tiles_var} = {n_tiles_expr}"))
     state.add_statement(fn_def)
     state.add_statement(
         statement_from_string(
-            f"jax.lax.fori_loop(0, {n_tiles_expr}, {body_fn_name}, None)"
+            f"jax.lax.fori_loop(0, {n_tiles_var}, {body_fn_name}, None)"
         )
     )
 

@@ -435,7 +435,7 @@ class TestPallas(TestCase):
         torch.testing.assert_close(result, args[0] + args[1])
 
     def test_fori_loop_codegen(self) -> None:
-        """Test that pallas_loop_type='fori_loop' generates correct fori_loop code."""
+        """Test that pallas_loop_type='fori_loop' generates double-buffered code."""
         args = (
             torch.randn(64, 128, device=DEVICE, dtype=torch.float32),
             torch.randn(64, 128, device=DEVICE, dtype=torch.float32),
@@ -449,6 +449,16 @@ class TestPallas(TestCase):
         self.assertIn("jax.lax.fori_loop", code)
         self.assertIn("pltpu.make_async_copy", code)
         self.assertNotIn("pltpu.emit_pipeline", code)
+        # Double-buffering: slot computation, wait/prefetch pattern
+        self.assertIn("jax.lax.rem(_j, 2)", code)
+        self.assertIn(".wait()", code)
+        self.assertIn("@pl.when(", code)
+        # Prologue prefetch into slot 0 before the fori_loop
+        fori_pos = code.index("jax.lax.fori_loop")
+        self.assertIn(".at[0]", code[:fori_pos])
+        # Separate load and store semaphores
+        self.assertIn("_load_sem", code)
+        self.assertIn("_store_sem", code)
         torch.testing.assert_close(result, args[0] + args[1])
 
     def test_attention_default_fp32(self) -> None:

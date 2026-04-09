@@ -314,7 +314,14 @@ def _pallas_vmem_name(state: CodegenState, name: str) -> str:
             if isinstance(loop, (EmitPipelineLoopState, ForiLoopState)):
                 mapping = getattr(loop, "_tensor_to_vmem", None)
                 if mapping and name in mapping:
-                    return mapping[name]
+                    vmem = mapping[name]
+                    # For fori_loop with double-buffering, index into current slot
+                    if (
+                        isinstance(loop, ForiLoopState)
+                        and loop.slot_var_name is not None
+                    ):
+                        return f"{vmem}.at[{loop.slot_var_name}]"
+                    return vmem
     return name
 
 
