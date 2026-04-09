@@ -172,6 +172,20 @@ def pallas_inner_loop_add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 
 
 @helion.kernel(backend="pallas", static_shapes=True)
+def pallas_2d_inner_loop_add(
+    x: torch.Tensor, y: torch.Tensor, out: torch.Tensor
+) -> torch.Tensor:
+    """Outer grid on batch, inner 2D fori_loop on (rows, cols)."""
+    batch, rows, cols = x.shape
+    for tile_b in hl.tile(batch):
+        for tile_r, tile_c in hl.tile([rows, cols]):
+            out[tile_b, tile_r, tile_c] = (
+                x[tile_b, tile_r, tile_c] + y[tile_b, tile_r, tile_c]
+            )
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
 def pallas_attention(
     q_in: torch.Tensor, k_in: torch.Tensor, v_in: torch.Tensor
 ) -> torch.Tensor:
@@ -450,6 +464,38 @@ class TestPallas(TestCase):
         self.assertIn("pltpu.make_async_copy", code)
         self.assertNotIn("pltpu.emit_pipeline", code)
         torch.testing.assert_close(result, args[0] + args[1])
+
+    def test_fori_loop_2d_inner(self) -> None:
+        """Test fori_loop with 2D inner loop correctly unflattens loop index."""
+        B, M, N = 2, 256, 256
+        x = torch.randn(B, M, N, device=DEVICE, dtype=torch.bfloat16)
+        y = torch.randn(B, M, N, device=DEVICE, dtype=torch.bfloat16)
+        out = torch.empty_like(x)
+        code, result = code_and_output(
+            pallas_2d_inner_loop_add,
+            (x, y, out),
+            block_sizes=[1, 128, 128],
+            pallas_loop_type="fori_loop",
+        )
+        self.assertIn("jax.lax.fori_loop", code)
+        # Per-dim index vars from divmod decomposition
+        self.assertIn("_j_0", code)
+        self.assertIn("_j_1", code)
+        torch.testing.assert_close(result, x + y, rtol=1e-2, atol=1e-2)
+
+    def test_fori_loop_2d_inner_asymmetric(self) -> None:
+        """Test fori_loop with asymmetric 2D inner loop (3x2 tiles)."""
+        B, M, N = 2, 384, 256
+        x = torch.randn(B, M, N, device=DEVICE, dtype=torch.bfloat16)
+        y = torch.randn(B, M, N, device=DEVICE, dtype=torch.bfloat16)
+        out = torch.empty_like(x)
+        _code, result = code_and_output(
+            pallas_2d_inner_loop_add,
+            (x, y, out),
+            block_sizes=[1, 128, 128],
+            pallas_loop_type="fori_loop",
+        )
+        torch.testing.assert_close(result, x + y, rtol=1e-2, atol=1e-2)
 
     def test_attention_default_fp32(self) -> None:
         """Test attention with default (for-loop) inner loop."""
