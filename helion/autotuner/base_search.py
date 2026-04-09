@@ -213,8 +213,22 @@ _FP8_DTYPES = {
 }
 
 
-def _assert_close(actual: object, expected: object, atol: float, rtol: float) -> None:
-    """Like torch.testing.assert_close but handles fp8 and uses chunked comparison for large tensors."""
+def _assert_close(
+    actual: object,
+    expected: object,
+    *,
+    atol: float = 1e-4,
+    rtol: float = 1e-4,
+    max_mismatch_pct: float | None = None,
+    max_abs_diff: float | None = None,
+    max_rel_diff: float | None = None,
+) -> None:
+    """Like torch.testing.assert_close but handles fp8, pytree structures, and strings.
+
+    For tensors, uses chunked comparison for large tensors.  When
+    *max_mismatch_pct* is set, falls back to a relaxed mismatch-fraction check
+    instead of raising immediately on the first out-of-tolerance element.
+    """
 
     def convert(t: torch.Tensor) -> torch.Tensor:
         return t.view(torch.uint8) if t.dtype in _FP8_DTYPES else t
@@ -235,7 +249,35 @@ def _assert_close(actual: object, expected: object, atol: float, rtol: float) ->
 
     for a, e in zip(actual_flat, expected_flat, strict=True):
         if isinstance(a, torch.Tensor):
-            _chunked_assert_close(a, e, atol=atol, rtol=rtol)
+            if max_mismatch_pct is not None:
+                try:
+                    _chunked_assert_close(a, e, atol=atol, rtol=rtol)
+                    continue
+                except AssertionError:
+                    pass
+                abs_diff = (a - e).abs()
+                total = a.numel()
+                mismatched = (abs_diff > atol + rtol * e.abs()).sum().item()
+                mismatch_pct = mismatched / total if total > 0 else 0.0
+                if mismatch_pct > max_mismatch_pct:
+                    raise AssertionError(
+                        f"Too many mismatches: {mismatch_pct:.4%} > {max_mismatch_pct:.4%}"
+                    )
+                if max_abs_diff is not None:
+                    worst_abs = abs_diff.max().item()
+                    if worst_abs > max_abs_diff:
+                        raise AssertionError(
+                            f"Absolute diff too large: {worst_abs} > {max_abs_diff}"
+                        )
+                if max_rel_diff is not None:
+                    rel_diff = abs_diff / e.abs().clamp(min=1e-6)
+                    worst_rel = rel_diff.max().item()
+                    if worst_rel > max_rel_diff:
+                        raise AssertionError(
+                            f"Relative diff too large: {worst_rel:.2f} > {max_rel_diff}"
+                        )
+            else:
+                _chunked_assert_close(a, e, atol=atol, rtol=rtol)
         elif isinstance(a, str):
             if not isinstance(e, str):
                 raise AssertionError(f"Type mismatch {a} vs {e}")
@@ -584,30 +626,17 @@ class BaseSearch(BaseAutotuner):
         self, config: Config, output: object, args: Sequence[object]
     ) -> bool:
         try:
-            custom_check = self.settings.autotune_baseline_accuracy_check_fn
-            if custom_check is not None:
-                custom_check(output, self._baseline_output)
-                if len(self._mutated_arg_indices) > 0:
-                    custom_check(args, self._baseline_post_args)
-            else:
-                _assert_close(
-                    output,
-                    self._baseline_output,
-                    atol=self._effective_atol,
-                    rtol=self._effective_rtol,
+            check_fn = (
+                self.settings.autotune_baseline_accuracy_check_fn
+                or functools.partial(
+                    _assert_close, atol=self._effective_atol, rtol=self._effective_rtol
                 )
-                if os.getenv("CHECK_INPUT_ACCURACY", "1") == "1":
-                    if len(self._mutated_arg_indices) > 0:
-                        # For distributed kernel, group_name may also be a argument.
-                        # torch.testing.assert_close does not handle str argument.
-                        # Filter needed.
-                        assert self._baseline_post_args is not None
-                        _assert_close(
-                            args,
-                            self._baseline_post_args,
-                            atol=self._effective_atol,
-                            rtol=self._effective_rtol,
-                        )
+            )
+            check_fn(output, self._baseline_output)
+            if os.getenv("CHECK_INPUT_ACCURACY", "1") == "1":
+                if len(self._mutated_arg_indices) > 0:
+                    assert self._baseline_post_args is not None
+                    check_fn(args, self._baseline_post_args)
         except AssertionError as e:
             if not self.settings.autotune_ignore_errors:
                 self.log.warning(
