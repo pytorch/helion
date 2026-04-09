@@ -407,7 +407,7 @@ class PersistentReductionStrategy(ReductionStrategy):
             if isinstance(numel, sympy.Integer):
                 # Static size - issue statement immediately
                 stmt = statement_from_string(
-                    f"{block_size_var} = {next_power_of_2(int(numel))}"
+                    f"{block_size_var} = {backend.static_rdim_size(int(numel))}"
                 )
                 state.codegen.host_statements.append(stmt)
             else:
@@ -422,7 +422,7 @@ class PersistentReductionStrategy(ReductionStrategy):
                     # No dependencies - issue statement immediately
                     expr_str = HostFunction.current().sympy_expr(numel)
                     stmt = statement_from_string(
-                        f"{block_size_var} = {backend.next_power_of_2_host_expr(expr_str)}"
+                        f"{block_size_var} = {backend.dynamic_rdim_size_expr(expr_str)}"
                     )
                     state.codegen.host_statements.append(stmt)
         current_grid = state.codegen.current_grid_state

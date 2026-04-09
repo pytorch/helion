@@ -290,6 +290,20 @@ class Backend(abc.ABC):
         """Generate a host-side next-power-of-2 expression."""
         raise exc.BackendUnsupported(self.name, "next_power_of_2")
 
+    def static_rdim_size(self, numel: int) -> int:
+        """Return the RDIM block size for a statically known reduction dimension."""
+        from torch._inductor.runtime.runtime_utils import next_power_of_2
+
+        return next_power_of_2(numel)
+
+    def dynamic_rdim_size_expr(self, expr: str) -> str:
+        """Generate a host-side expression for RDIM size from a dynamic dimension.
+
+        By default delegates to next_power_of_2_host_expr. Backends like Pallas
+        that need exact sizes can override to return the expression unchanged.
+        """
+        return self.next_power_of_2_host_expr(expr)
+
     def reduction_combine_expr(
         self,
         reduction_type: str,
@@ -1130,6 +1144,14 @@ class PallasBackend(Backend):
 
     def reduction_index_zero_expr(self, dtype: str) -> str:
         return f"jnp.zeros([0], dtype={dtype})"
+
+    def static_rdim_size(self, numel: int) -> int:
+        # Pallas block refs use exact tensor dimensions, so RDIM_SIZE must
+        # match (no power-of-2 rounding that would exceed the block ref).
+        return numel
+
+    def dynamic_rdim_size_expr(self, expr: str) -> str:
+        return expr
 
     def adjust_block_size_constraints(
         self,
@@ -2738,6 +2760,11 @@ class MetalBackend(Backend):
     def force_tile_mask(self) -> bool:
         return True
 
+    def inductor_op_overrides(self) -> InductorOpOverrides:
+        from .metal.metal_overrides import MetalOverrides
+
+        return MetalOverrides()
+
     def full_expr(
         self, shape_dims: list[str], value_expr: str, dtype: torch.dtype
     ) -> str:
@@ -2754,7 +2781,8 @@ class MetalBackend(Backend):
         return "0"
 
     def where_expr(self, mask: str, true_val: str, false_val: str) -> str:
-        return f"({mask} ? {true_val} : {false_val})"
+        # Must be valid Python for expr_from_string; walker converts to C++ ternary
+        return f"({true_val} if {mask} else {false_val})"
 
     def minimum_expr(self, a: str, b: str) -> str:
         return f"min({a}, {b})"

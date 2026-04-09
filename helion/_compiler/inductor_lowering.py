@@ -1021,6 +1021,10 @@ class GenerateASTFromInductor(DefaultHandler):
         result_str = _unpack_opsvalue(
             getattr(self.parent_handler, name)(*args, **kwargs)
         )
+        # C++ namespace syntax (::) is not valid Python.  Replace with dot
+        # notation so expr_from_string can parse it as attribute access.
+        if CompileEnvironment.current().backend_name == "metal" and "::" in result_str:
+            result_str = result_str.replace("::", ".")
         return self._lift(expr_from_string(result_str))
 
     def to_dtype(

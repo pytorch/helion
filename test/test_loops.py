@@ -493,7 +493,6 @@ class TestLoops(RefEagerTestBase, TestCase):
         self.assertEqual(spec.min_size, 32)
         self.assertEqual(spec.max_size, 256)
 
-    @xfailIfPallas("complex reduction with atomic_add not supported on pallas")
     @skipIfTileIR("Result mismatch with tileir backend")
     @skipIfFn(
         lambda: _get_backend() == "cute",
