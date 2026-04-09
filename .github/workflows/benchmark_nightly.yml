@@ -26,6 +26,6 @@ jobs:
                 run_h100: 'true',
                 run_b200: 'true',
                 run_mi325x: 'true',
-                run_mi350x: 'false'
+                run_mi350x: 'true'
               }
             })
