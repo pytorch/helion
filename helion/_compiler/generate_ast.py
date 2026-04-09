@@ -345,7 +345,12 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         inter_loop_dep_metadata_unknown: bool = False,
     ) -> Iterator[None]:
         env = CompileEnvironment.current()
-        use_triton_barrier = env.codegen_name == "triton"
+        # TileIR reuses Triton surface syntax but ``tl.debug_barrier()`` lowers to
+        # ``ttg.barrier``, which the TileIR pass pipeline does not legalize
+        # (``PassManager::run failed`` / failed to legalize ttg.barrier).
+        use_triton_barrier = (
+            env.codegen_name == "triton" and env.backend.name != "tileir"
+        )
         need_barrier = False
         if use_triton_barrier and self._last_emitted_device_loop:
             if self._inter_loop_prev_unknown:

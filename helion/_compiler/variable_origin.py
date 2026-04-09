@@ -123,6 +123,14 @@ class Origin:
         """Convert to a PyTorch source object."""
         raise NotImplementedError(type(self).__name__)
 
+    def root_rw_name(self) -> str | None:
+        """Host buffer name for inter-loop RAW tracking, after unwrapping wrappers.
+
+        Returns ``None`` when this origin is not rooted in a named host binding
+        (e.g. device temporaries, block sizes).
+        """
+        return None
+
 
 @dataclasses.dataclass
 class HostOrigin(Origin):
@@ -143,6 +151,9 @@ class NameOrigin(HostOrigin):
         return self.name
 
     def suggest_var_name(self) -> str:
+        return self.name
+
+    def root_rw_name(self) -> str | None:
         return self.name
 
 
@@ -175,6 +186,9 @@ class WrappedOrigin(Origin):
 
     def depth(self) -> int:
         return 1 + self.value.depth()
+
+    def root_rw_name(self) -> str | None:
+        return self.value.root_rw_name()
 
 
 @dataclasses.dataclass
