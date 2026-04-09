@@ -76,6 +76,14 @@ lets Helion apply the masking implicitly for indices beyond each lane's true len
 
 `static_range()` behaves like a compile-time unrolled range for small loops. It hints the compiler to fully unroll the loop body where profitable.
 
+### barrier()
+
+```{eval-rst}
+.. autofunction:: barrier
+```
+
+`barrier()` inserts a grid-wide synchronization point between top-level `hl.tile` or `hl.grid` loops. It forces persistent kernel execution so that all blocks complete one phase before the next begins.
+
 ## Memory Operations
 
 ### load()
@@ -203,6 +211,18 @@ def k(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 ### arange()
 
 See {func}`~helion.language.arange` for details.
+
+### rand()
+
+```{eval-rst}
+.. autofunction:: rand
+```
+
+### randint()
+
+```{eval-rst}
+.. autofunction:: randint
+```
 
 ## Tunable Parameters
 
@@ -336,3 +356,11 @@ See {func}`~helion.language.specialize` for details.
 ### dot()
 
 See {func}`~helion.language.dot` for details.
+
+### dot_scaled()
+
+```{eval-rst}
+.. autofunction:: dot_scaled
+```
+
+`dot_scaled()` performs block-scaled matrix multiplication using low-precision formats (e.g., `e2m1`, `e4m3`, `e5m2`). Each input matrix has an associated per-block scale tensor and format string. This maps to Triton's `tl.dot_scaled` for hardware-accelerated scaled dot products on supported architectures.

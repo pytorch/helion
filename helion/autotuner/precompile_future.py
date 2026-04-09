@@ -42,9 +42,29 @@ if TYPE_CHECKING:
     from ..runtime.config import Config
     from ..runtime.kernel import BoundKernel
     from ..runtime.kernel import CompiledConfig
-    from .base_search import BaseSearch
+    from ..runtime.settings import Settings
     from .base_search import _AutotunableKernel
     from .logger import AutotuningLogger
+
+
+@dataclasses.dataclass
+class PrecompileContext:
+    """Narrow context that PrecompileFuture uses instead of a back-reference
+    to the full search object.
+
+    Attributes:
+        settings: Autotuning settings (compile timeout, ignore_errors, etc.).
+        log: Logger for warnings/debug messages.
+        kernel: The kernel being autotuned (used for error reporting).
+        args: The kernel arguments (used for repro logging on failure).
+        jobs: Maximum number of concurrent precompile processes.
+    """
+
+    settings: Settings
+    log: AutotuningLogger
+    kernel: _AutotunableKernel
+    args: Sequence[object]
+    jobs: int
 
 
 def _write_result_file(result_path: str, message: dict[str, object]) -> None:
@@ -287,7 +307,7 @@ class PrecompileFuture:
         ok (bool | None): The result of the precompilation (True if successful, False otherwise).
     """
 
-    search: BaseSearch
+    ctx: PrecompileContext
     config: Config
     process: mp.Process | None
     timeout: float
@@ -337,11 +357,11 @@ class PrecompileFuture:
         self.process.start()
 
     @staticmethod
-    def skip(search: BaseSearch, config: Config, ok: bool) -> PrecompileFuture:
+    def skip(ctx: PrecompileContext, config: Config, ok: bool) -> PrecompileFuture:
         """Dummy precompile future that is already done."""
         ts = time.time()
         return PrecompileFuture(
-            search=search,
+            ctx=ctx,
             config=config,
             process=None,
             timeout=0,
@@ -357,7 +377,7 @@ class PrecompileFuture:
 
     @staticmethod
     def create(
-        search: BaseSearch,
+        ctx: PrecompileContext,
         config: Config,
         fn: CompiledConfig,
         args: Sequence[object],
@@ -370,11 +390,11 @@ class PrecompileFuture:
         construction.  Returns a ``skip`` future when the kernel is already
         compiled (fork mode only).
         """
-        mode = search.settings.autotune_precompile
-        decorator = search.kernel.format_kernel_decorator(config, search.settings)
+        mode = ctx.settings.autotune_precompile
+        decorator = ctx.kernel.format_kernel_decorator(config, ctx.settings)
 
         if mode == "spawn":
-            ctx = mp.get_context("spawn")
+            mp_ctx = mp.get_context("spawn")
             assert args_path is not None
             try:
                 fn_spec = _serialize_compiled_fn(fn)
@@ -385,7 +405,7 @@ class PrecompileFuture:
                 ) from err
             process = cast(
                 "mp.Process",
-                ctx.Process(
+                mp_ctx.Process(
                     target=_run_kernel_in_subprocess_spawn,
                     args=(fn_spec, args_path, result_path, decorator),
                 ),
@@ -393,24 +413,24 @@ class PrecompileFuture:
             process.daemon = True
         else:
             precompiler = _prepare_precompiler_for_fork(
-                fn, args, config, search.kernel, decorator, search.log
+                fn, args, config, ctx.kernel, decorator, ctx.log
             )
             if precompiler is None:
-                return PrecompileFuture.skip(search, config, True)
-            ctx = mp.get_context("fork")
+                return PrecompileFuture.skip(ctx, config, True)
+            mp_ctx = mp.get_context("fork")
             process = cast(
                 "mp.Process",
-                ctx.Process(
+                mp_ctx.Process(
                     target=_run_kernel_in_subprocess_fork,
-                    args=(precompiler, config, search.kernel, result_path, decorator),
+                    args=(precompiler, config, ctx.kernel, result_path, decorator),
                 ),
             )
             process.daemon = True
         return PrecompileFuture(
-            search=search,
+            ctx=ctx,
             config=config,
             process=process,
-            timeout=search.settings.autotune_compile_timeout,
+            timeout=ctx.settings.autotune_compile_timeout,
             result_path=result_path,
         )
 
@@ -477,7 +497,7 @@ class PrecompileFuture:
         futures: list[PrecompileFuture],
     ) -> list[PrecompileFuture]:
         """Start up to the concurrency cap, wait for progress, and return remaining futures."""
-        cap = futures[0].search._jobs if futures else 1
+        cap = futures[0].ctx.jobs if futures else 1
         running = [f for f in futures if f.started and f.ok is None and f.is_alive()]
 
         # Start queued futures up to the cap
@@ -566,16 +586,16 @@ class PrecompileFuture:
         process.join(10)
         msg = f"Timeout after {self.elapsed:.0f}s compiling {self.config}"
         if process.is_alive():
-            if not self.search.settings.autotune_ignore_errors:
-                self.search.log.warning(
+            if not self.ctx.settings.autotune_ignore_errors:
+                self.ctx.log.warning(
                     msg,
                     "(SIGKILL required)",
                 )
             process.kill()
             process.join()
         else:
-            if not self.search.settings.autotune_ignore_errors:
-                self.search.log.warning(msg)
+            if not self.ctx.settings.autotune_ignore_errors:
+                self.ctx.log.warning(msg)
 
         self.ok = False
         self.failure_reason = "timeout"
@@ -644,30 +664,30 @@ class PrecompileFuture:
             return
         exc_obj = error.to_exception()
         maybe_dump_triton_failure(
-            self.search.kernel,
+            self.ctx.kernel,
             self.config,
             exc_obj,
             remote_traceback=error.traceback,
             captured_output=error.captured_output,
         )
         classification = error.classification or classify_triton_exception(exc_obj)
-        ignore_errors = self.search.settings.autotune_ignore_errors
+        ignore_errors = self.ctx.settings.autotune_ignore_errors
         if ignore_errors:
             classification = "debug"
         if classification == "raise":
             if raise_on_raise:
                 self._remote_error_handled = True
-                decorator = self.search.kernel.format_kernel_decorator(
-                    self.config, self.search.settings
+                decorator = self.ctx.kernel.format_kernel_decorator(
+                    self.config, self.ctx.settings
                 )
                 log_generated_triton_code_debug(
-                    self.search.log,
-                    self.search.kernel,
+                    self.ctx.log,
+                    self.ctx.kernel,
                     self.config,
                     prefix=f"Generated Triton code for {decorator}:",
                 )
-                self.search.kernel.maybe_log_repro(
-                    self.search.log.error, self.search.args, self.config
+                self.ctx.kernel.maybe_log_repro(
+                    self.ctx.log.error, self.ctx.args, self.config
                 )
                 raise exc.TritonError(
                     error=f"{type(exc_obj).__qualname__}: {exc_obj}",
@@ -676,30 +696,28 @@ class PrecompileFuture:
                 ) from exc_obj
             return
 
-        decorator = self.search.kernel.format_kernel_decorator(
-            self.config, self.search.settings
+        decorator = self.ctx.kernel.format_kernel_decorator(
+            self.config, self.ctx.settings
         )
         log_generated_triton_code_debug(
-            self.search.log,
-            self.search.kernel,
+            self.ctx.log,
+            self.ctx.kernel,
             self.config,
             prefix=f"Generated Triton code for {decorator}:",
         )
-        formatted = format_triton_compile_failure(
-            self.config, exc_obj, self.search.kernel
-        )
+        formatted = format_triton_compile_failure(self.config, exc_obj, self.ctx.kernel)
         if error.traceback:
             formatted = (
                 f"{formatted}\nRemote traceback (spawned process):\n{error.traceback}"
             )
         if classification == "warn":
-            self.search.log.warning(formatted)
-            self.search.kernel.maybe_log_repro(
-                self.search.log.warning, self.search.args, self.config
+            self.ctx.log.warning(formatted)
+            self.ctx.kernel.maybe_log_repro(
+                self.ctx.log.warning, self.ctx.args, self.config
             )
         elif not ignore_errors:
-            self.search.log.debug(formatted)
-            self.search.kernel.maybe_log_repro(
-                self.search.log.debug, self.search.args, self.config
+            self.ctx.log.debug(formatted)
+            self.ctx.kernel.maybe_log_repro(
+                self.ctx.log.debug, self.ctx.args, self.config
             )
         self._remote_error_handled = True

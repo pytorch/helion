@@ -35,7 +35,7 @@ from ._utils import counters
 from .autotuner.benchmarking import synchronize_device
 from .runtime.settings import _get_backend
 from .runtime.settings import is_pallas_interpret
-from helion.autotuner.base_search import _clone_args
+from helion.autotuner.benchmark_provider import _clone_args
 
 if _get_backend() == "pallas":
     from .autotuner.benchmarking import compute_repeat_generic as compute_repeat
