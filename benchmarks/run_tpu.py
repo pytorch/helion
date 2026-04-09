@@ -140,6 +140,20 @@ def _bmm_shapes() -> list[tuple[str, tuple[Any, ...]]]:
     ]
 
 
+def _broadcast_matmul_shapes() -> list[tuple[str, tuple[Any, ...]]]:
+    configs = [(16, 512, 768, 1024), (8, 256, 512, 256), (4, 1024, 512, 512)]
+    return [
+        (
+            f"[{b},{m},{k},{n}]",
+            (
+                torch.randn(b, m, k, device=DEVICE, dtype=torch.bfloat16),
+                torch.randn(k, n, device=DEVICE, dtype=torch.bfloat16),
+            ),
+        )
+        for b, m, k, n in configs
+    ]
+
+
 def _geglu_shapes() -> list[tuple[str, tuple[Any, ...]]]:
     shapes = [(1024, 512), (2048, 1024), (4096, 2048)]
     return [
@@ -227,6 +241,13 @@ KERNEL_MAPPINGS: dict[str, KernelMapping] = {
         None,
     ),
     "bmm": ("bmm", "bmm", torch.bmm, _bmm_shapes, None),
+    "broadcast_matmul": (
+        "broadcast_matmul",
+        "broadcast_matmul",
+        torch.matmul,
+        _broadcast_matmul_shapes,
+        None,
+    ),
     "geglu": ("geglu", "geglu", _geglu_baseline, _geglu_shapes, None),
     # low_mem_dropout: helion uses a deterministic seed-based mask while
     # torch.nn.functional.dropout uses a random mask, so outputs always differ.
