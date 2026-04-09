@@ -7,6 +7,7 @@ import contextlib
 import copy
 import dataclasses
 import functools
+import math
 import operator
 import re
 import textwrap
@@ -1242,8 +1243,10 @@ class WalkDeviceAST(NodeVisitor):
         body: list[ast.stmt],
         orelse: list[ast.stmt],
     ) -> int:
-        # Track whether the predicate is tensor-derived (vs truly scalar).
-        predicate_is_tensor = isinstance(test_proxy, torch.Tensor)
+        # Track whether the predicate is a tensor with numel > 1
+        predicate_is_tensor = (
+            isinstance(test_proxy, torch.Tensor) and math.prod(test_proxy.shape) > 1
+        )
 
         if_branch_rw: ReadWrites = ReadWrites.from_list(body)
         else_branch_rw: ReadWrites = ReadWrites.from_list(orelse)

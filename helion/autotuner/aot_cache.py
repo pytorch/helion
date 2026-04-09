@@ -31,7 +31,6 @@ import operator
 import os
 from pathlib import Path
 import sys
-import tempfile
 import traceback
 from typing import TYPE_CHECKING
 from typing import Any
@@ -757,11 +756,9 @@ class AOTAutotuneCache(AutotuneCacheBase):
         old_precompile = self.autotuner.settings.autotune_precompile
         self.autotuner.settings.autotune_precompile = None
 
-        # Set up tmpdir if needed (normally done inside autotune())
-        tmpdir_created = False
-        if self.autotuner._precompile_tmpdir is None:
-            self.autotuner._precompile_tmpdir = tempfile.TemporaryDirectory()
-            tmpdir_created = True
+        # Set up provider resources if needed (normally done inside autotune())
+        benchmark_provider = self.autotuner.benchmark_provider
+        benchmark_provider.setup()
 
         try:
             for i, config in enumerate(all_configs):
@@ -805,9 +802,7 @@ class AOTAutotuneCache(AutotuneCacheBase):
         finally:
             # Restore settings
             self.autotuner.settings.autotune_precompile = old_precompile
-            if tmpdir_created and self.autotuner._precompile_tmpdir is not None:
-                self.autotuner._precompile_tmpdir.cleanup()
-                self.autotuner._precompile_tmpdir = None
+            benchmark_provider.cleanup()
 
         print(
             f"[AOT measure] Completed: {len(results)}/{len(all_configs)} configs succeeded",

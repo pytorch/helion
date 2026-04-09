@@ -15,7 +15,6 @@ from helion._testing import onlyBackends
 from helion._testing import skipIfPallas
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfTileIR
-from helion._testing import xfailIfPallas
 import helion.language as hl
 
 
@@ -74,7 +73,6 @@ class TestControlFlow(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, torch.sin(x) + 2.0)
         self.assertEqual(code0, code1)
 
-    @xfailIfPallas("tensor-derived predicates unsupported on Pallas")
     def test_if_arg_indexed_scalar(self):
         @helion.kernel
         def fn(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:

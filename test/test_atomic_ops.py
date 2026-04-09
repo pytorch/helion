@@ -54,6 +54,33 @@ def atomic_add_float_kernel(x: torch.Tensor, indices: torch.Tensor) -> torch.Ten
     return x
 
 
+@helion.kernel(static_shapes=True)
+def split_k_atomic_add_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """Split-K matmul with atomic_add into a non-zero output."""
+    m, k = x.size()
+    k2, n = y.size()
+    out = torch.ones([m, n], dtype=x.dtype, device=x.device)
+    for tile_m, tile_n, tile_k in hl.tile([m, n, k]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for inner_k in hl.tile(tile_k.begin, tile_k.end):
+            acc = torch.addmm(acc, x[tile_m, inner_k], y[inner_k, tile_n])
+        hl.atomic_add(out, [tile_m, tile_n], acc.to(x.dtype))
+    return out
+
+
+@helion.kernel()
+def atomic_add_f32_into_bf16_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """Test atomic_add where value dtype (float32) differs from output (bfloat16)."""
+    m, n = x.size()
+    out = torch.zeros([m, n], dtype=x.dtype, device=x.device)
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        acc = acc + x[tile_m, tile_n].to(torch.float32)
+        acc = acc + y[tile_m, tile_n].to(torch.float32)
+        hl.atomic_add(out, [tile_m, tile_n], acc)
+    return out
+
+
 @helion.kernel()
 def atomic_add_w_tile_attr(x: torch.Tensor) -> torch.Tensor:
     """Test atomic_add where the index is a symbolic int"""
@@ -246,6 +273,43 @@ class TestAtomicOperations(RefEagerTestBase, TestCase):
 
         expected = torch.ones(3, 4, device=DEVICE)
         torch.testing.assert_close(result, expected)
+
+    @onlyBackends(["pallas"])
+    def test_atomic_add_f32_into_bf16(self):
+        """atomic_add of a float32 value into a bfloat16 output tensor."""
+        x = torch.ones(64, 128, device=DEVICE, dtype=torch.bfloat16)
+        y = torch.ones(64, 128, device=DEVICE, dtype=torch.bfloat16)
+        args = (x, y)
+
+        code, result = code_and_output(
+            atomic_add_f32_into_bf16_kernel,
+            args,
+            block_sizes=[64, 128],
+        )
+
+        expected = (x.float() + y.float()).to(torch.bfloat16)
+        torch.testing.assert_close(result, expected)
+
+    @onlyBackends(["pallas"])
+    def test_split_k_atomic_add_vmem_preload(self):
+        """Split-K matmul where output is initialised to ones (not zeros)."""
+        m, k, n = 128, 1024, 128
+        x = torch.randn(m, k, device=DEVICE, dtype=torch.bfloat16)
+        y = torch.randn(k, n, device=DEVICE, dtype=torch.bfloat16)
+        args = (x, y)
+
+        code, result = code_and_output(
+            split_k_atomic_add_kernel,
+            args,
+            block_sizes=[128, 128, 1024, 128],
+            pallas_loop_type="fori_loop",
+        )
+
+        # expected = 1 + x @ y  (ones init + matmul via atomic_add)
+        expected = torch.ones(m, n, device=DEVICE, dtype=torch.bfloat16) + (x @ y).to(
+            torch.bfloat16
+        )
+        torch.testing.assert_close(result, expected, atol=0.1, rtol=0.05)
 
     def test_atomic_add_code_generation(self):
         """Test that the generated code contains atomic_add."""
