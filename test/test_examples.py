@@ -109,6 +109,7 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
 
     def test_matmul_default(self):
+        """Matmul without explicit block_sizes to exercise autotuner defaults."""
         args = (
             torch.randn([1024, 1024], device=DEVICE, dtype=torch.float32),
             torch.randn([1024, 1024], device=DEVICE, dtype=torch.float32),
