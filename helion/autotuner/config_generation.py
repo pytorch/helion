@@ -12,6 +12,7 @@ from .._compat import warps_to_threads
 from .config_fragment import Category
 from .config_fragment import ConfigSpecFragment
 from .config_fragment import PowerOfTwoFragment
+from .config_spec import TensorNumelConstraint
 from .config_spec import shrink_block_sizes_for_numel_constraints
 from helion._dist_utils import sync_seed
 
@@ -178,38 +179,34 @@ class ConfigGeneration:
         if not self.block_size_indices:
             return
 
-        # Global block-numel budget
+        all_constraints = list(self.config_spec.tensor_numel_constraints)
         if self.num_warps_index >= 0:
             num_threads = warps_to_threads(
                 cast("int", flat_config[self.num_warps_index])
             )
-            triton_limit = TRITON_MAX_TENSOR_NUMEL
-            theoretical_max_elements = max_elements_per_thread * num_threads
-            max_elements = min(theoretical_max_elements, triton_limit)
-            while self.block_numel(flat_config) > max_elements:
-                changes = 0
-                for i in self.block_size_indices:
-                    val = flat_config[i]
-                    assert isinstance(val, int)
-                    threshold = max(
-                        self.flat_spec[i].get_minimum(), self.min_block_size
-                    )
-                    if val // 2 >= threshold:
-                        flat_config[i] = val // 2
-                        changes += 1
-                if changes == 0:
-                    break
+            max_elements = min(
+                max_elements_per_thread * num_threads, TRITON_MAX_TENSOR_NUMEL
+            )
+            all_block_indices = tuple(range(len(self.block_size_indices)))
+            all_constraints.insert(
+                0,
+                TensorNumelConstraint(
+                    check_fn=lambda *args, _m=max_elements: (
+                        functools.reduce(operator.mul, args, 1) <= _m
+                    ),
+                    block_indices=all_block_indices,
+                    expr_str=f"block_numel <= {max_elements}",
+                ),
+            )
 
-        # Per-tensor numel constraints (halve-largest-first for balanced tiles)
-        constraints = self.config_spec.tensor_numel_constraints
-        if constraints:
+        if all_constraints:
             block_sizes = [cast("int", flat_config[i]) for i in self.block_size_indices]
             min_sizes = [
                 max(self.flat_spec[i].get_minimum(), self.min_block_size)
                 for i in self.block_size_indices
             ]
             shrink_block_sizes_for_numel_constraints(
-                constraints, block_sizes, min_sizes
+                all_constraints, block_sizes, min_sizes
             )
             for idx, fi in enumerate(self.block_size_indices):
                 flat_config[fi] = block_sizes[idx]
