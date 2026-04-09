@@ -239,7 +239,7 @@ class TestAutotuneIgnoreErrors(TestCase):
 
     def test_benchmark_results_aligned_when_compile_fails(self):
         """_benchmark must return one result per input config even when some
-        fail to compile (regression test for #1673 misalignment)."""
+        fail to compile."""
         settings = Settings(
             autotune_precompile=None,
             autotune_log_level=logging.CRITICAL,
