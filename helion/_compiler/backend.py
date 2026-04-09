@@ -858,15 +858,18 @@ class TileIRBackend(TritonBackend):
 _TORCH_TO_JAX_DTYPE: dict[str, str] = {
     "torch.float16": "jnp.float16",
     "torch.float32": "jnp.float32",
-    "torch.float64": "jnp.float64",
+    "torch.float64": "jnp.float32",
     "torch.bfloat16": "jnp.bfloat16",
+    "torch.float8_e4m3fn": "jnp.float8_e4m3fn",
+    "torch.float8_e5m2": "jnp.float8_e5m2",
     "torch.int8": "jnp.int8",
     "torch.int16": "jnp.int16",
     "torch.int32": "jnp.int32",
-    "torch.int64": "jnp.int64",
+    "torch.int64": "jnp.int32",
+    "torch.long": "jnp.int32",
     "torch.uint8": "jnp.uint8",
     "torch.uint32": "jnp.uint32",
-    "torch.uint64": "jnp.uint64",
+    "torch.uint64": "jnp.uint32",
     "torch.bool": "jnp.bool_",
     "torch.complex64": "jnp.complex64",
     "torch.complex128": "jnp.complex128",
@@ -1173,6 +1176,7 @@ class PallasBackend(Backend):
 
         # Tiling size for 1D arrays.  Mosaic lowering enforces that rank-1
         # BlockSpec block shapes are a multiple of 128 * (32 // bitwidth).
+        min_element_bits = min(min_element_bits, 32)
         tiling_1d = 128 * (32 // min_element_bits)
 
         # Map block_id -> minimum dim_from_end across all tensors
@@ -1352,7 +1356,7 @@ class PallasBackend(Backend):
                         # back to no tiling for the entire kernel.
                         dim_size = tensor.shape[d]
                         if tensor.ndim == 1 and isinstance(dim_size, int):
-                            bitwidth = tensor.dtype.itemsize * 8
+                            bitwidth = min(tensor.dtype.itemsize * 8, 32)
                             tiling_1d = 128 * (32 // bitwidth)
                             if bs != dim_size and bs % tiling_1d != 0:
                                 return self._no_tiling_block_spec_info(sorted_args)
