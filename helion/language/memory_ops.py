@@ -14,7 +14,6 @@ from .._compiler.compile_environment import CompileEnvironment
 from .._compiler.compile_environment import _symint_expr
 from .._compiler.host_function import HostFunction
 from .._compiler.indexing_strategy import SubscriptIndexing
-from .._compiler.indexing_strategy import _get_tile_with_offset_info
 from .._compiler.variable_origin import GridOrigin
 from .._compiler.variable_origin import TileBeginOrigin
 from .._compiler.variable_origin import TileCountOrigin
@@ -26,6 +25,7 @@ from .stack_tensor import StackTensor
 if TYPE_CHECKING:
     from .._compiler.inductor_lowering import CodegenState
     from .._compiler.tile_strategy import LoopDimInfo
+    from helion._compiler.type_propagation import SymbolOrigin
 
 __all__ = ["load", "store"]
 
@@ -208,32 +208,25 @@ def _pallas_index_str(
             out_pos += 1
             continue
         block_id = _resolve_block_id(env, idx, tensor, tensor_dim)
-        tile_with_offset_info = _get_tile_with_offset_info(idx, state, i)
-        if tile_with_offset_info is not None:
-            block_id = tile_with_offset_info.block_id
         if block_id is not None:
-            offset_expr = ""
-            if tile_with_offset_info is not None:
-                offset_expr = state.device_function.literal_expr(
-                    tile_with_offset_info.offset
-                )
-            is_device_loop = False
             if in_pipeline and block_id in pipeline_block_ids:
-                parts.append(f"{offset_expr}:")
+                parts.append(":")
             else:
                 loops = state.codegen.active_device_loops.get(block_id)
                 if loops and any(isinstance(loop, DeviceLoopState) for loop in loops):
-                    parts.append(_pallas_ds_expr(state, block_id, offset_expr))
+                    symbol_origin = _maybe_get_symbol_origin(idx)
+                    if symbol_origin and isinstance(symbol_origin.origin, GridOrigin):
+                        parts.append(state.codegen.offset_var(block_id))
+                    else:
+                        parts.append(_pallas_ds_expr(state, block_id))
                 else:
                     maybe_grid_axis_idx = _maybe_get_hl_grid_axis_pid(idx)
                     if maybe_grid_axis_idx is not None:
                         expr = f"pl.program_id({maybe_grid_axis_idx})"
-                        if offset_expr:
-                            expr = f"{expr} + {offset_expr}"
                         parts.append(expr)
                     else:
-                        parts.append(f"{offset_expr}:")
-            if not is_device_loop and isinstance(idx, torch.SymInt):
+                        parts.append(":")
+            if isinstance(idx, torch.SymInt):
                 dim_map.setdefault(tensor_dim, block_id)
         elif isinstance(idx, int):
             parts.append(str(idx))
@@ -256,19 +249,23 @@ def _pallas_index_str(
     return ", ".join(parts), none_dims
 
 
-# returns pid for an idx (used in a index_expr) that comes from a hl.grid
-def _maybe_get_hl_grid_axis_pid(idx: object) -> int | None:
+def _maybe_get_symbol_origin(idx: object) -> SymbolOrigin | None:
     if not isinstance(idx, torch.SymInt):
         return None
     expr = _symint_expr(idx)
     if expr is None:
         return None
-    origin_info = HostFunction.current().expr_to_origin.get(expr)
-    if origin_info is None:
+    return HostFunction.current().expr_to_origin.get(expr)
+
+
+# returns pid for an idx (used in a index_expr) that comes from a hl.grid
+def _maybe_get_hl_grid_axis_pid(idx: object) -> int | None:
+    symbol_origin = _maybe_get_symbol_origin(idx)
+    if symbol_origin is None:
         return None
-    if not isinstance(origin_info.origin, GridOrigin):
+    if not isinstance(symbol_origin.origin, GridOrigin):
         return None
-    block_id = origin_info.origin.block_id
+    block_id = symbol_origin.origin.block_id
     from .._compiler.device_function import DeviceFunction
 
     device_fn = DeviceFunction.current()
@@ -293,7 +290,7 @@ def _resolve_block_id(
     return None
 
 
-def _pallas_ds_expr(state: CodegenState, block_id: int, tile_offset: str) -> str:
+def _pallas_ds_expr(state: CodegenState, block_id: int, tile_offset: str = "") -> str:
     """Return a ``pl.ds(offset, block_size)`` expression for *block_id*, offset by *tile_offset*"""
     offset = state.codegen.offset_var(block_id)
     if tile_offset:
