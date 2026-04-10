@@ -633,7 +633,6 @@ class TestPallas(TestCase):
         expected = x[x.shape[0] // 2 :] + 0.5
         torch.testing.assert_close(result, expected)
 
-    @xfailIfPallas("Incorrectly uses block_size=1 for -2th dimension")
     def test_scalar_access_hl_grid_2d(self) -> None:
         @helion.kernel(backend="pallas", static_shapes=True, config=helion.Config())
         def fn(x: torch.Tensor) -> torch.Tensor:
@@ -644,8 +643,12 @@ class TestPallas(TestCase):
             return out
 
         x = torch.randn((128, 128), device=DEVICE, dtype=torch.float32)
-        result = fn(x)
         expected = x + 0.5
+
+        _, result = code_and_output(fn, (x,), loop_order=[0, 1])
+        torch.testing.assert_close(result, expected)
+
+        _, result = code_and_output(fn, (x,), loop_order=[1, 0])
         torch.testing.assert_close(result, expected)
 
     @xfailIfPallas("Incorrectly uses block_size=1 for -2th dimension")
