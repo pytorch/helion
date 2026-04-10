@@ -241,16 +241,12 @@ def _rms_norm_shapes() -> list[tuple[str, tuple[Any, ...]]]:
     ]
 
 
-def _rms_norm_baseline(
-    x: torch.Tensor, weight: torch.Tensor
-) -> tuple[torch.Tensor, torch.Tensor]:
+def _rms_norm_baseline(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     input_dtype = x.dtype
     hidden_states = x.to(torch.float32)
     variance = hidden_states.pow(2).mean(-1, keepdim=True)
-    inv_rms = torch.rsqrt(variance + 1e-5)
-    hidden_states = hidden_states * inv_rms
-    output = weight * hidden_states.to(input_dtype)
-    return output, inv_rms.squeeze(-1).to(input_dtype).reshape(-1, 1)
+    hidden_states = hidden_states * torch.rsqrt(variance + 1e-5)
+    return weight * hidden_states.to(input_dtype)
 
 
 def _sum_shapes() -> list[tuple[str, tuple[Any, ...]]]:
@@ -333,13 +329,9 @@ KERNEL_MAPPINGS: dict[str, KernelMapping] = {
         _softmax_shapes_basic,
         None,
     ),
-    "rms_norm": (
-        "rms_norm",
-        "rms_norm_fwd",
-        _rms_norm_baseline,
-        _rms_norm_shapes,
-        None,
-    ),
+    # rms_norm_fwd returns (output, inv_rms) tuple; run_example expects a single
+    # tensor, so we fall back to calling main() which handles the tuple internally.
+    "rms_norm": ("rms_norm", "rms_norm_fwd", None, None, None),
     "sum": (
         "sum",
         "sum_kernel",
