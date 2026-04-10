@@ -403,6 +403,15 @@ class TestExamples(RefEagerTestBase, TestCase):
             indexing="block_ptr",
         )
 
+    def test_softmax_default(self):
+        """Softmax without explicit config to exercise autotuner defaults."""
+        args = (torch.randn([4096, 2560], device=DEVICE, dtype=torch.float32),)
+        check_example(
+            "softmax",
+            args,
+            torch.nn.functional.softmax(*args, dim=1),
+        )
+
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfTileIR("TileIR does not support block_ptr indexing")
     def test_softmax_looped(self):
@@ -858,6 +867,16 @@ class TestExamples(RefEagerTestBase, TestCase):
             torch.sum(args[0], dim=-1),
             fn_name="sum_kernel",
             block_sizes=[8],
+        )
+
+    def test_sum_default(self):
+        """Sum without explicit config to exercise autotuner defaults."""
+        args = (torch.randn([5120, 2560], device=DEVICE, dtype=torch.float32),)
+        check_example(
+            "sum",
+            args,
+            torch.sum(args[0], dim=-1),
+            fn_name="sum_kernel",
         )
 
     def test_long_sum_manual(self):
@@ -2027,6 +2046,15 @@ class TestExamples(RefEagerTestBase, TestCase):
             args,
             torch.nn.functional.softmax(args[0], dim=-1),
             block_sizes=[8],
+        )
+
+    def test_batch_softmax_default(self):
+        """Batch softmax without explicit config to exercise autotuner defaults."""
+        args = (torch.randn([16, 512, 1024], device=DEVICE, dtype=torch.bfloat16),)
+        check_example(
+            "batch_softmax",
+            args,
+            torch.nn.functional.softmax(args[0], dim=-1),
         )
 
     @xfailIfCute(
