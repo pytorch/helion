@@ -53,25 +53,27 @@ def cross_entropy(
 
         logits_at_target = hl.zeros([tile_n], dtype=logits.dtype)
         max_logits_acc = hl.full([tile_n], float("-inf"), dtype=logits.dtype)
-        
+
         # First pass: find max and target logits
         for v_chunk in hl.tile(v):
             chunk_logits = logits[tile_n, v_chunk]
-            
+
             # Extract target using a chunked mask
             mask = (v_chunk.index[None, :] == labels_tile[:, None]).to(logits.dtype)
             logits_at_target += torch.sum(chunk_logits * mask, dim=-1)
-            
+
             # Update max
-            max_logits_acc = torch.maximum(max_logits_acc, torch.amax(chunk_logits, dim=-1))
-            
+            max_logits_acc = torch.maximum(
+                max_logits_acc, torch.amax(chunk_logits, dim=-1)
+            )
+
         # Second pass: sum exp
         sum_exp_acc = hl.zeros([tile_n], dtype=logits.dtype)
         for v_chunk in hl.tile(v):
             chunk_logits = logits[tile_n, v_chunk]
             shifted = chunk_logits - max_logits_acc[:, None]
             sum_exp_acc += torch.sum(torch.exp(shifted), dim=-1)
-            
+
         log_sum_exp = max_logits_acc + torch.log(sum_exp_acc)
 
         # Cross entropy loss: log_sum_exp - logit_at_target
@@ -95,7 +97,7 @@ def main() -> None:
     logits = torch.randn(n, vocab_size, device=DEVICE, dtype=torch.float32)
     labels = torch.randint(0, vocab_size, (n,), device=DEVICE, dtype=torch.int32)
 
-    def baseline_ce(logits, labels):
+    def baseline_ce(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
         return torch.nn.functional.cross_entropy(logits, labels.long())
 
     run_example(
