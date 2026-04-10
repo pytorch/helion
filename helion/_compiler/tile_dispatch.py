@@ -19,6 +19,7 @@ from .tile_strategy import DeviceLoopState
 from .tile_strategy import TileStrategy
 
 if TYPE_CHECKING:
+    from collections.abc import ItemsView
     from collections.abc import Sequence
 
     from .. import Config
@@ -26,6 +27,38 @@ if TYPE_CHECKING:
 
     SymIntLike = torch.SymInt | int
     ShapeLike = Sequence[SymIntLike]
+
+
+class BlockIDStrategyMapping:
+    def __init__(self) -> None:
+        self._block_id_to_strategy: dict[tuple[int, ...], TileStrategy] = {}
+        self._block_id_to_any_strategy: dict[int, TileStrategy] = {}
+
+    def __setitem__(self, block_ids: tuple[int, ...], strategy: TileStrategy) -> None:
+        self._block_id_to_strategy[block_ids] = strategy
+        for block_id in block_ids:
+            self._block_id_to_any_strategy.setdefault(block_id, strategy)
+
+    def __getitem__(self, block_ids: tuple[int, ...]) -> TileStrategy:
+        return self._block_id_to_strategy[block_ids]
+
+    def get(
+        self, block_ids: tuple[int, ...], default: TileStrategy | None = None
+    ) -> TileStrategy | None:
+        return self._block_id_to_strategy.get(block_ids, default)
+
+    def get_any(self, block_id: int) -> TileStrategy | None:
+        strategy = self._block_id_to_strategy.get((block_id,))
+        if strategy is None:
+            strategy = self._block_id_to_any_strategy.get(block_id)
+        return strategy
+
+    def items(self) -> ItemsView[tuple[int, ...], TileStrategy]:
+        return self._block_id_to_strategy.items()
+
+    def clear(self) -> None:
+        self._block_id_to_strategy.clear()
+        self._block_id_to_any_strategy.clear()
 
 
 class TileStrategyDispatch:
@@ -36,7 +69,7 @@ class TileStrategyDispatch:
     ) -> None:
         super().__init__()
         self.strategies: list[TileStrategy] = []
-        self.block_id_to_strategy: dict[tuple[int, ...], TileStrategy] = {}
+        self.block_id_to_strategy = BlockIDStrategyMapping()
         self._add_loop_strategies(fn, config)
         self._add_reduction_strategies(fn, config)
 
@@ -56,6 +89,9 @@ class TileStrategyDispatch:
     ) -> None:
         env = CompileEnvironment.current()
         strategy = env.backend.create_loop_strategy(fn, block_ids, config)
+        self._register_strategy(block_ids, strategy)
+
+    def _register_strategy(self, block_ids: list[int], strategy: TileStrategy) -> None:
         self.strategies.append(strategy)
         self.block_id_to_strategy[tuple(block_ids)] = strategy
 
@@ -91,8 +127,7 @@ class TileStrategyDispatch:
                 strategy: TileStrategy = PersistentReductionStrategy(fn, block_id)
             else:
                 strategy = LoopedReductionStrategy(fn, block_id, reduction_loop)
-            self.strategies.append(strategy)
-            self.block_id_to_strategy[(block_id,)] = strategy
+            self._register_strategy([block_id], strategy)
 
     def codegen_grid(self, state: CodegenState, block_ids: list[int]) -> None:
         strategy = self.block_id_to_strategy[tuple(block_ids)]
@@ -120,10 +155,7 @@ class TileStrategyDispatch:
             else:
                 strategy = self.block_id_to_strategy.get((block_idx,))
                 if strategy is None:
-                    for candidate in self.strategies:
-                        if block_idx in candidate.block_ids:
-                            strategy = candidate
-                            break
+                    strategy = self.block_id_to_strategy.get_any(block_idx)
                 if strategy is not None:
                     block_size = strategy.block_size_var(block_idx)
                 else:
