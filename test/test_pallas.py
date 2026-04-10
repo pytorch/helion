@@ -615,9 +615,26 @@ class TestPallas(TestCase):
             return out
 
         x = torch.randn(128, device=DEVICE, dtype=torch.float32)
-        result = fn(x)
+        # Patch _no_tiling_block_spec_info to detect if the fallback is
+        # triggered.  hl.grid() dims use pl.program_id() and must NOT
+        # record a block_id in pallas_tensor_dim_block_ids — otherwise
+        # _compute_block_spec_info attempts tiling with bs=1, fails TPU
+        # alignment, and falls back here.
+        from unittest.mock import patch
+
+        from helion._compiler.backend import PallasBackend
+
+        with patch.object(
+            PallasBackend,
+            "_no_tiling_block_spec_info",
+            side_effect=AssertionError(
+                "hl.grid dims should not trigger _no_tiling_block_spec_info"
+            ),
+        ):
+            code, result = code_and_output(fn, (x,))
         expected = x + 0.5
         torch.testing.assert_close(result, expected)
+        self.assertIn("pl.program_id", code)
 
     def test_scalar_access_hl_grid_offset(self) -> None:
         @helion.kernel(backend="pallas", static_shapes=True, config=helion.Config())
