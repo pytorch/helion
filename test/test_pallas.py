@@ -433,6 +433,8 @@ class TestPallas(TestCase):
         self.assertIn("pltpu.emit_pipeline", code)
         self.assertIn("pl.BlockSpec", code)
         torch.testing.assert_close(result, args[0] + args[1])
+        # out is output-only, excluded from pallas_call inputs
+        self.assertIn("_inplace_indices=[]", code)
 
     def test_fori_loop_codegen(self) -> None:
         """Test that pallas_loop_type='fori_loop' generates correct fori_loop code."""
@@ -450,6 +452,8 @@ class TestPallas(TestCase):
         self.assertIn("pltpu.make_async_copy", code)
         self.assertNotIn("pltpu.emit_pipeline", code)
         torch.testing.assert_close(result, args[0] + args[1])
+        # out is output-only, excluded from pallas_call inputs
+        self.assertIn("_inplace_indices=[]", code)
 
     def test_attention_default_fp32(self) -> None:
         """Test attention with default (for-loop) inner loop."""
@@ -727,10 +731,19 @@ class TestPallas(TestCase):
         torch.testing.assert_close(result, expected)
 
     def test_output_only_not_inplace(self) -> None:
-        """Output-only tensors should not appear in _inplace_indices."""
+        """Output-only tensors should not appear in _inplace_indices.
+
+        When _output_indices has more entries than _inplace_indices, the
+        extra outputs are excluded from pallas_call inputs and
+        input_output_aliases, eliminating the OpSplitMode::kSplitBoth
+        graph split in torch_tpu.
+        """
         x = torch.randn(1024, device=DEVICE, dtype=torch.float32)
         code, result = code_and_output(pallas_relu, (x,), block_sizes=[1024])
         torch.testing.assert_close(result, torch.relu(x))
+        # out is in _output_indices but not _inplace_indices, so it's
+        # excluded from pallas_call inputs (no donation, no graph split).
+        self.assertIn("_output_indices=[1]", code)
         self.assertIn("_inplace_indices=[]", code)
 
     def test_new_empty_output_only(self) -> None:
@@ -767,7 +780,9 @@ class TestPallas(TestCase):
         expected_out = (x + 1.0) * 2.0
         code, result = code_and_output(inplace_and_output, (x,), block_sizes=[1024])
         torch.testing.assert_close(result, expected_out)
-        # x is inplace-mutated (index 0), out is output-only (not in inplace)
+        # 2 outputs (x and out), but only x is aliased (inplace).
+        # out is excluded from pallas_call inputs.
+        self.assertIn("_output_indices=[0, 1]", code)
         self.assertIn("_inplace_indices=[0]", code)
 
     def test_empty_like_read_stays_inplace(self) -> None:
@@ -786,6 +801,28 @@ class TestPallas(TestCase):
         torch.testing.assert_close(result, x + 1.0)
         # out is read after write, so it must be in _inplace_indices
         self.assertIn("_inplace_indices=[1]", code)
+
+    def test_multiple_output_only(self) -> None:
+        """Kernel returning two output-only tensors."""
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def two_outputs(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            out1 = torch.empty_like(x)
+            out2 = torch.empty_like(x)
+            for tile in hl.tile(x.size()):
+                out1[tile] = x[tile] + 1.0
+                out2[tile] = x[tile] * 2.0
+            return out1, out2
+
+        x = torch.randn(1024, device=DEVICE, dtype=torch.float32)
+        code, (result1, result2) = code_and_output(
+            two_outputs, (x,), block_sizes=[1024]
+        )
+        torch.testing.assert_close(result1, x + 1.0)
+        torch.testing.assert_close(result2, x * 2.0)
+        # Both outputs are output-only: 2 outputs, 0 aliases
+        self.assertIn("_output_indices=[1, 2]", code)
+        self.assertIn("_inplace_indices=[]", code)
 
 
 if __name__ == "__main__":
