@@ -298,5 +298,5 @@ def autotune(
             **settings_kw,
         ),
         args,
-        **search_kw,
+        **search_kw,  # pyrefly: ignore[bad-argument-type]
     ).autotune()

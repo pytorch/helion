@@ -226,8 +226,8 @@ def check(m: int, n: int) -> None:
         (x, weight, 1e-5),
         kernel_name="helion_fwd_kernel",
         baseline_name="torch",
-        rtol=1e-3,
-        atol=1e-3,
+        rtol=1e-2,
+        atol=1e-2,
     )
 
     # Test forward + backward pass

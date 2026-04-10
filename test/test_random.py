@@ -463,6 +463,7 @@ class TestRandom(RefEagerTestBase, TestCase):
         )
         torch.testing.assert_close(output, output2, msg="it should deterministic")
 
+    @skipIfMTIA("Skip on MTIA due to unaligned address crash")
     @xfailIfPallas("reordered tile dims cause BlockSpec axis mismatch")
     def test_hl_rand_mixed_argument_order(self):
         @helion.kernel(static_shapes=False)
@@ -701,6 +702,9 @@ class TestRandom(RefEagerTestBase, TestCase):
 
 @onlyBackends(["triton", "cute"])
 @skipIfRefEager("compiled RNG parity checks are not applicable in ref eager mode")
+@skipIfMTIA(
+    "Skip due to unaligned/unpadded tensor inputs that don't meet MTIA HW requirements"
+)
 class TestRandomPhiloxParity(TestCase):
     def test_reference_matches_triton(self):
         seed = 42

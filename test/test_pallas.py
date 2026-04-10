@@ -540,13 +540,252 @@ class TestPallas(TestCase):
         expected = (x.float() @ y.float() + bias.float()).to(torch.bfloat16)
         torch.testing.assert_close(result, expected, rtol=1e-2, atol=1e-2)
 
-    @xfailIfPallas("RDIM_SIZE rounded to next power of 2 causes shape mismatch")
     def test_reduce_non_pow2(self) -> None:
         """Reduction over non-power-of-2 dim should use exact size, not rounded."""
         x = torch.randn(128, 1000, device=DEVICE, dtype=torch.float32)
         code, result = code_and_output(pallas_reduce_non_pow2, (x,), block_size=128)
         expected = torch.nn.functional.softmax(x, dim=-1)
         torch.testing.assert_close(result, expected, rtol=1e-4, atol=1e-4)
+
+    def test_scalar_access_1D_constexpr(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True, config=helion.Config())
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            (n,) = x.size()
+            out = torch.zeros_like(x)
+            for _ in hl.tile(n, block_size=4):
+                out[0] = x[0]
+                out[1] = x[1]
+                out[2] = x[2]
+                out[3] = x[3]
+            return out
+
+        x = torch.tensor([1, 2, 3, 4], device=DEVICE, dtype=torch.float32)
+        result = fn(x)
+        torch.testing.assert_close(result, x)
+
+    def test_scalar_access_2D_constexpr(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True, config=helion.Config())
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            n, m = x.size()
+            out = torch.zeros_like(x)
+            for _ in hl.tile([n, m], block_size=[128, 128]):
+                out[42, 79] = x[42, 79]
+            return out
+
+        x = torch.ones((128, 128), device=DEVICE, dtype=torch.float32)
+        result = fn(x)
+        expected = torch.zeros((128, 128), device=DEVICE, dtype=torch.float32)
+        expected[42, 79] = x[42, 79]
+        torch.testing.assert_close(result, expected)
+
+    @xfailIfPallas("Result mismatch due to incorrect tiling")
+    def test_scalar_index_transpose(self) -> None:
+        """Scalar .begin index should collapse the dimension.
+
+        When .begin is used as a scalar subscript, the indexed
+        dimension should be eliminated from the result so that
+        .T produces a correct 2D permutation.
+        """
+
+        @helion.kernel(
+            backend="pallas",
+            static_shapes=True,
+            config=helion.Config(block_sizes=[32, 32, 1]),
+        )
+        def scalar_index_transpose(x: torch.Tensor) -> torch.Tensor:
+            B, M, N = x.shape
+            out = torch.empty([B, N, M], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n, tile_b in hl.tile([M, N, B]):
+                # tile_b has block_size=1, so .begin is used as a scalar index
+                out[tile_b.begin, tile_n, tile_m] = x[tile_b.begin, tile_m, tile_n].T
+            return out
+
+        x = torch.randn(4, 64, 64, device=DEVICE, dtype=torch.float32)
+        _, result = code_and_output(scalar_index_transpose, (x,))
+        expected = x.permute(0, 2, 1)
+        torch.testing.assert_close(result, expected)
+
+    def test_scalar_access_hl_grid(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True, config=helion.Config())
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            (n,) = x.size()
+            out = torch.zeros_like(x)
+            for i in hl.grid(n):
+                out[i] = x[i] + 0.5
+            return out
+
+        x = torch.randn(128, device=DEVICE, dtype=torch.float32)
+        result = fn(x)
+        expected = x + 0.5
+        torch.testing.assert_close(result, expected)
+
+    def test_scalar_access_hl_grid_offset(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True, config=helion.Config())
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            (n,) = x.size()
+            out = torch.empty(n // 2, device=DEVICE, dtype=torch.float32)
+            for i in hl.grid(n // 2):
+                out[i] = x[i + n // 2] + 0.5
+            return out
+
+        x = torch.randn(256, device=DEVICE, dtype=torch.float32)
+        result = fn(x)
+        expected = x[x.shape[0] // 2 :] + 0.5
+        torch.testing.assert_close(result, expected)
+
+    def test_scalar_access_hl_grid_2d(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True, config=helion.Config())
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            (n, m) = x.size()
+            out = torch.zeros_like(x)
+            for i, j in hl.grid([n, m]):
+                out[i, j] = x[i, j] + 0.5
+            return out
+
+        x = torch.randn((128, 128), device=DEVICE, dtype=torch.float32)
+        expected = x + 0.5
+
+        _, result = code_and_output(fn, (x,), loop_order=[0, 1])
+        torch.testing.assert_close(result, expected)
+
+        _, result = code_and_output(fn, (x,), loop_order=[1, 0])
+        torch.testing.assert_close(result, expected)
+
+    def test_scalar_access_hl_grid_2d_nested(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True, config=helion.Config())
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            (n, m) = x.size()
+            out = torch.zeros_like(x)
+            for i in hl.grid(n):
+                for j in hl.grid(m):
+                    out[i, j] = x[i, j] + 0.5
+            return out
+
+        x = torch.randn((128, 128), device=DEVICE, dtype=torch.float32)
+        result = fn(x)
+        expected = x + 0.5
+        torch.testing.assert_close(result, expected)
+
+    def test_tensor_access_tile_index_offset(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            (n,) = x.size()
+            out = torch.zeros(n, device=DEVICE, dtype=torch.float32)
+            for tile in hl.tile(n // 2):
+                out[tile] = x[tile]
+                out[tile.index + n // 2] = x[tile.index + n // 2]
+            return out
+
+        x = torch.randn(128, device=DEVICE, dtype=torch.float32)
+        result = fn(x)
+        torch.testing.assert_close(result, x)
+
+    def test_tensor_access_tile_index_offset_2d(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            (n, m) = x.size()
+            out = torch.zeros(x.size(), device=DEVICE, dtype=torch.float32)
+            for tile1, tile2 in hl.tile([n // 2, m // 2]):
+                out[tile1, tile2] = x[tile1, tile2]
+                out[tile1.index + n // 2, tile2] = x[tile1.index + n // 2, tile2]
+                out[tile1, tile2 + m // 2] = x[tile1, tile2 + m // 2]
+                out[tile1.index + n // 2, tile2 + m // 2] = x[
+                    tile1.index + n // 2, tile2 + m // 2
+                ]
+            return out
+
+        x = torch.randn(128, 128, device=DEVICE, dtype=torch.float32)
+        _, result = code_and_output(fn, (x,), block_size=[128, 128])
+        torch.testing.assert_close(result, x)
+
+    def test_tensor_access_tile_id(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True, config=helion.Config())
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            out = torch.zeros(x.shape[0] // 2, device=DEVICE, dtype=torch.float32)
+            for t in hl.tile(x.shape[0], block_size=2):
+                out[t.id] = x[t.id]
+            return out
+
+        x = torch.randn(128, device=DEVICE, dtype=torch.float32)
+        result = fn(x)
+        torch.testing.assert_close(result, x[: x.shape[0] // 2])
+
+    def test_tensor_access_tile_begin_end(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True, config=helion.Config())
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            out = torch.zeros(x.shape[0], device=DEVICE, dtype=torch.float32)
+            for t in hl.tile(x.shape[0], block_size=2):
+                out[t.begin] = x[t.id]
+                out[t.end - 1] = x[t.id]
+            return out
+
+        x = torch.tensor([0, 1, 2, 3, 4, 5, 6, 7], device=DEVICE, dtype=torch.float32)
+        result = fn(x)
+        expected = torch.tensor(
+            [0, 0, 1, 1, 2, 2, 3, 3], device=DEVICE, dtype=torch.float32
+        )
+        torch.testing.assert_close(result, expected)
+
+    def test_output_only_not_inplace(self) -> None:
+        """Output-only tensors should not appear in _inplace_indices."""
+        x = torch.randn(1024, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(pallas_relu, (x,), block_sizes=[1024])
+        torch.testing.assert_close(result, torch.relu(x))
+        self.assertIn("_inplace_indices=[]", code)
+
+    def test_new_empty_output_only(self) -> None:
+        """new_empty allocations should also be recognized as output-only."""
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def new_empty_relu(x: torch.Tensor) -> torch.Tensor:
+            out = x.new_empty(x.shape)
+            for tile in hl.tile(out.size()):
+                out[tile] = torch.relu(x[tile])
+            return out
+
+        x = torch.randn(1024, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(new_empty_relu, (x,), block_sizes=[1024])
+        torch.testing.assert_close(result, torch.relu(x))
+        self.assertIn("_inplace_indices=[]", code)
+
+    def test_mixed_inplace_and_output_only(self) -> None:
+        """Kernel with both an inplace-mutated input and an output-only tensor.
+
+        Verifies that _inplace_indices contains only the inplace-mutated
+        input (index 0), not the output-only tensor.
+        """
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def inplace_and_output(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size()):
+                x[tile] = x[tile] + 1.0
+                out[tile] = x[tile] * 2.0
+            return out
+
+        x = torch.randn(1024, device=DEVICE, dtype=torch.float32)
+        expected_out = (x + 1.0) * 2.0
+        code, result = code_and_output(inplace_and_output, (x,), block_sizes=[1024])
+        torch.testing.assert_close(result, expected_out)
+        # x is inplace-mutated (index 0), out is output-only (not in inplace)
+        self.assertIn("_inplace_indices=[0]", code)
+
+    def test_empty_like_read_stays_inplace(self) -> None:
+        """An empty_like output that is also read should stay in _inplace_indices."""
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def read_write_kernel(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(out.size()):
+                out[tile] = x[tile]
+                out[tile] = out[tile] + 1.0
+            return out
+
+        x = torch.randn(1024, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(read_write_kernel, (x,), block_sizes=[1024])
+        torch.testing.assert_close(result, x + 1.0)
+        # out is read after write, so it must be in _inplace_indices
+        self.assertIn("_inplace_indices=[1]", code)
 
 
 if __name__ == "__main__":
