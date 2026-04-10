@@ -26,6 +26,8 @@ if TYPE_CHECKING:
     from ..runtime.kernel import BoundKernel
     from .device_function import Argument
     from .device_function import DeviceFunction
+    from .device_ir import GraphInfo
+    from .tile_dispatch import TileStrategyDispatch
     from .tile_strategy import TileStrategy
 
     InductorOpOverrides = OpsHandler[Any]
@@ -433,6 +435,18 @@ class Backend(abc.ABC):
 
     def launcher_keyword_args(self, config: Config, *, has_barrier: bool) -> list[str]:
         return []
+
+    def pre_codegen(
+        self,
+        graphs: list[GraphInfo],
+        config: Config,
+        tile_strategy: TileStrategyDispatch,
+    ) -> None:
+        """Run backend-specific passes after tiling is finalized, before codegen.
+
+        Backends can override this to analyze or transform the graphs.
+        """
+        return None
 
     def transform_host_arg(
         self,
@@ -1153,6 +1167,24 @@ class PallasBackend(Backend):
     def dynamic_rdim_size_expr(self, expr: str) -> str:
         return expr
 
+    def _get_pallas_required_alignment(
+        self, dim_from_end: int, tensor_ndim: int, bitwidth: int
+    ) -> int:
+        """Requirements documented in https://docs.jax.dev/en/latest/pallas/grid_blockspec.html
+
+        Args:
+            dim_from_end (int): The dimension being queried for alignment requirements, indexed from the end. i.e. [... ,2, 1, 0]
+            tensor_ndim (int): Amount of dimensions for the tensor.
+            bitwidth (int): Bitwidth of tensor elements
+        """
+        if dim_from_end == 0:  # Last dimension
+            if tensor_ndim <= 1:
+                return 128 * (32 // bitwidth)
+            return 128
+        if dim_from_end == 1:  # Second to last dimension
+            return 8
+        return 1  # No requirements for other dimensions
+
     def adjust_block_size_constraints(
         self,
         block_specs: list[object],
@@ -1179,10 +1211,6 @@ class PallasBackend(Backend):
 
         from ..autotuner.config_spec import BlockSizeSpec
         from .compile_environment import BlockSizeInfo
-
-        # Tiling size for 1D arrays.  Mosaic lowering enforces that rank-1
-        # BlockSpec block shapes are a multiple of 128 * (32 // bitwidth).
-        tiling_1d = 128 * (32 // min_element_bits)
 
         # Map block_id -> minimum dim_from_end across all tensors
         min_dim_from_end: dict[int, int] = {}
@@ -1214,20 +1242,20 @@ class PallasBackend(Backend):
             if not isinstance(spec, BlockSizeSpec):
                 continue
             bid = spec.block_ids[0]
-            dfe = min_dim_from_end.get(bid, ndim - 1 - i)
-            if dfe == 0:
-                tndim = min_tensor_ndim.get(bid, ndim)
-                alignment = tiling_1d if tndim <= 1 else 128
-                # When the tensor dim is smaller than the alignment, any
-                # block_size >= tensor_dim will be capped to tensor_dim at
-                # runtime (full-dim access, always valid).  Use the
-                # tensor dim as the minimum so smaller but still-valid
-                # block sizes are not unnecessarily excluded.
-                dim_size = next_power_of_2(max(spec.size_hint, 1))
-                spec.update_min(min(alignment, dim_size))
-            elif dfe == 1:
-                dim_size = next_power_of_2(max(spec.size_hint, 1))
-                spec.update_min(min(8, dim_size))
+            dim_from_end = min_dim_from_end.get(bid, ndim - 1 - i)
+            tensor_ndim = min_tensor_ndim.get(bid, ndim)
+            requirement_alignment = self._get_pallas_required_alignment(
+                dim_from_end, tensor_ndim, min_element_bits
+            )
+
+            # When the tensor dim is smaller than the alignment, any
+            # block_size >= tensor_dim will be capped to tensor_dim at
+            # runtime (full-dim access, always valid).  Use the
+            # tensor dim as the minimum so smaller but still-valid
+            # block sizes are not unnecessarily excluded.
+            dim_size = next_power_of_2(max(spec.size_hint, 1))
+
+            spec.update_min(min(requirement_alignment, dim_size))
 
     def tunable_fragments(self) -> dict[str, ConfigSpecFragment]:
         return {}
@@ -1355,16 +1383,17 @@ class PallasBackend(Backend):
                 if bid is not None and bid in known_block_ids:
                     bs = env.block_sizes[bid].from_config(config)
                     if isinstance(bs, int):
-                        # For 1D tensors, the block size must be a
-                        # multiple of the 1D tiling factor or equal to
-                        # the full dimension.  If neither holds, fall
-                        # back to no tiling for the entire kernel.
+                        # Check that the block size meets Pallas requirements:
+                        # https://docs.jax.dev/en/latest/pallas/grid_blockspec.html
+                        # If not, fall-back to no tiling for the entire kernel
                         dim_size = tensor.shape[d]
-                        if tensor.ndim == 1 and isinstance(dim_size, int):
-                            bitwidth = tensor.dtype.itemsize * 8
-                            tiling_1d = 128 * (32 // bitwidth)
-                            if bs != dim_size and bs % tiling_1d != 0:
-                                return self._no_tiling_block_spec_info(sorted_args)
+                        dim_from_end = tensor.ndim - 1 - d
+                        bitwidth = tensor.dtype.itemsize * 8
+                        required_alignment = self._get_pallas_required_alignment(
+                            dim_from_end, tensor.ndim, bitwidth
+                        )
+                        if bs != dim_size and bs % required_alignment != 0:
+                            return self._no_tiling_block_spec_info(sorted_args)
                         block_shape.append(bs)
                         # When the block covers the entire tensor
                         # dimension there is only one tile, so the grid
@@ -1975,6 +2004,16 @@ class CuteBackend(Backend):
     @property
     def name(self) -> str:
         return "cute"
+
+    def pre_codegen(
+        self,
+        graphs: list[GraphInfo],
+        config: Config,
+        tile_strategy: TileStrategyDispatch,
+    ) -> None:
+        from .cute.layout_propagation import plan_layouts
+
+        plan_layouts(graphs, config, tile_strategy)
 
     def supports_config_key(self, key: str) -> bool:
         if key == "num_threads":

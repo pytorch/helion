@@ -570,6 +570,18 @@ class BaseSearch(BaseAutotuner):
             f"    {kernel_decorator}\n",
             level=logging.INFO + 5,
         )
+        if self._autotune_metrics.num_accuracy_failures:
+            self.log.warning(
+                f"{self._autotune_metrics.num_accuracy_failures} of "
+                f"{self._autotune_metrics.num_configs_tested} configs failed due "
+                "to accuracy checks."
+            )
+        if self._autotune_metrics.num_compile_failures:
+            self.log.warning(
+                f"{self._autotune_metrics.num_compile_failures} of "
+                f"{self._autotune_metrics.num_configs_tested} configs failed due "
+                "to compile failures."
+            )
         cached_path = self.kernel.get_cached_path(best)
         if cached_path is not None and is_master_rank():
             self.log(f"Code of selected kernel: {cached_path}")
