@@ -651,7 +651,6 @@ class TestPallas(TestCase):
         _, result = code_and_output(fn, (x,), loop_order=[1, 0])
         torch.testing.assert_close(result, expected)
 
-    @xfailIfPallas("Incorrectly uses block_size=1 for -2th dimension")
     def test_scalar_access_hl_grid_2d_nested(self) -> None:
         @helion.kernel(backend="pallas", static_shapes=True, config=helion.Config())
         def fn(x: torch.Tensor) -> torch.Tensor:
