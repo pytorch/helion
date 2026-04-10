@@ -1012,10 +1012,11 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
             ):
                 pids = XYZProgramIDs()
         else:
-            # All dims fully fissioned — use a trivial grid of (1,)
-            pids = FlatProgramIDs()
-            dummy_pid = state.device_function.new_var("pid_unused", dce=True)
-            pids.append(PIDInfo(dummy_pid, "1", sympy.Integer(1), block_ids[0]))
+            # All dims fully fissioned — grid would collapse to a single SM
+            # which is not a useful configuration; reject it.
+            raise exc.InvalidConfig(
+                "Grid fission collapsed all dimensions, resulting in a single-SM grid"
+            )
 
         assert state.ast_args is None
         assert len(state.proxy_args) == 3
