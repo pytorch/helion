@@ -286,6 +286,61 @@ def check(m: int, k: int, n: int) -> None:
 
 
 # %%
+# Grid Fission Demonstration
+# --------------------------
+# Grid fission moves tile dimensions from the launch grid into inner loops,
+# trading parallelism for L2 cache reuse.  E.g. with M=N=8192 and block=128,
+# no fission launches 64x64=4096 blocks; partial fission on M (factor=4)
+# launches 1024 blocks that each loop over 4 M-tiles, reusing y columns in L2.
+#
+# ``grid_fissions`` per-dimension values: 0 = no fission, -1 = full, k = partial.
+# The kernel is identical -- only the Config changes.
+
+GRID_FISSION_CONFIGS = {
+    "no_fission [0,0]": helion.Config(
+        block_sizes=[128, 128, 32],
+        grid_fissions=[[0, 0]],
+        num_warps=8,
+        num_stages=3,
+    ),
+    "partial_M=2 [2,0]": helion.Config(
+        block_sizes=[128, 128, 32],
+        grid_fissions=[[2, 0]],
+        num_warps=8,
+        num_stages=3,
+    ),
+    "partial_M=4 [4,0]": helion.Config(
+        block_sizes=[128, 128, 32],
+        grid_fissions=[[4, 0]],
+        num_warps=8,
+        num_stages=3,
+    ),
+    "full_N [0,-1]": helion.Config(
+        block_sizes=[128, 128, 32],
+        grid_fissions=[[0, -1]],
+        num_warps=8,
+        num_stages=3,
+    ),
+}
+
+
+# %%
+def check_grid_fission(m: int, k: int, n: int) -> None:
+    """
+    Demonstrates grid fission by compiling the same matmul kernel with
+    different fission configs and benchmarking them against torch.matmul.
+    """
+    x = torch.randn([m, k], device=DEVICE, dtype=HALF_DTYPE)
+    y = torch.randn([k, n], device=DEVICE, dtype=HALF_DTYPE)
+
+    bound = matmul.bind((x, y))
+    kernels = {
+        name: bound.compile_config(cfg) for name, cfg in GRID_FISSION_CONFIGS.items()
+    }
+    run_example(kernels, torch.matmul, (x, y))  # pyrefly: ignore[bad-argument-type]
+
+
+# %%
 def matmul_tritonbench(
     tb_op: object, a: torch.Tensor, b: torch.Tensor, bias: torch.Tensor | None
 ) -> Callable:
@@ -328,6 +383,7 @@ def main() -> None:
     """
     # autotune(1024, 1024, 1024)
     check(1024, 1024, 1024)
+    check_grid_fission(8192, 2048, 8192)
 
 
 # %%
