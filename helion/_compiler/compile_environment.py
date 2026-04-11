@@ -334,11 +334,10 @@ class CompileEnvironment:
         if isinstance(size, torch.SymInt):
             from .host_function import HostFunction
 
-            expr = size._sympy_()
-            origin_info = HostFunction.current().expr_to_origin.get(expr)
-            if origin_info and isinstance(origin_info.origin, BlockSizeOrigin):
-                block_idx = origin_info.origin.block_id
-                existing_block = self.block_sizes[block_idx]
+            if (
+                origin := HostFunction.current().get_block_size_origin(size)
+            ) is not None:
+                existing_block = self.block_sizes[origin.block_id]
 
         def _is_unbacked_symint(x: int | torch.SymInt) -> bool:
             if not isinstance(x, torch.SymInt):
@@ -807,12 +806,11 @@ class CompileEnvironment:
         if isinstance(size, sympy.Symbol):
             from .host_function import HostFunction
 
+            if (
+                origin := HostFunction.current().get_block_size_origin(size)
+            ) is not None:
+                return origin.block_id
             origin_info = HostFunction.current().expr_to_origin.get(size)
-            if origin_info is not None and isinstance(
-                origin_info.origin,
-                BlockSizeOrigin,
-            ):
-                return origin_info.origin.block_id
             if origin_info is not None and type(origin_info.origin) is GridOrigin:
                 return origin_info.origin.block_id
         return None
@@ -950,6 +948,15 @@ class CompileEnvironment:
         ) is not None:
             return candidate
         return block_id
+
+    def resolve_codegen_block_id_for_size(
+        self, size: object, codegen: object, graph: object | None = None
+    ) -> int | None:
+        from .host_function import HostFunction
+
+        if (origin := HostFunction.current().get_block_size_origin(size)) is None:
+            return None
+        return self.resolve_codegen_block_id(origin.block_id, codegen, graph)
 
     def register_jagged_tile(self, block_id: int, parent_id: int) -> None:
         self.jagged_tile_parent_id[block_id] = parent_id

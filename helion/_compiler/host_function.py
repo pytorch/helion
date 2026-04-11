@@ -29,6 +29,7 @@ from .source_location import UnknownLocation
 from .tensor_utils import patch_tensor_factories
 from .type_printer import print_ast
 from .variable_origin import AttributeOrigin
+from .variable_origin import BlockSizeOrigin
 from .variable_origin import GlobalOrigin
 from .variable_origin import NameOrigin
 from .variable_origin import Origin
@@ -259,6 +260,20 @@ class HostFunction:
         if isinstance(expr, tuple):
             return "(" + ", ".join(self.literal_expr(x) for x in expr) + ", )"
         return repr(expr)
+
+    def get_block_size_origin(self, size: object) -> BlockSizeOrigin | None:
+        expr = size
+        if isinstance(size, torch.SymInt):
+            expr = getattr(getattr(size, "node", None), "_expr", None)
+            if not isinstance(expr, sympy.Expr):
+                with contextlib.suppress(Exception):
+                    expr = size._sympy_()
+        if not isinstance(expr, sympy.Symbol):
+            return None
+        origin_info = self.expr_to_origin.get(expr)
+        if origin_info is None or not isinstance(origin_info.origin, BlockSizeOrigin):
+            return None
+        return origin_info.origin
 
     def debug_str(self) -> str:
         result = [
