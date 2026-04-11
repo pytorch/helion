@@ -46,6 +46,7 @@ if TYPE_CHECKING:
     from .generate_ast import GenerateAST
     from .indexing_strategy import IndexingStrategy
     from .program_id import ProgramIDs
+    from helion._compiler.pallas.plan_tiling import DimensionTiling
 
     _P = TypeVar("_P", bound="TensorPropertyArg")
 
@@ -318,8 +319,8 @@ class DeviceFunction:
         self.epilogue_subtile_store_indices: dict[str, int] = {}
         self.rng_seed_buffer_param_name = None
 
-        # Pallas: id(fake_tensor) → {dim: block_id}, recorded during codegen
-        self.pallas_tensor_dim_block_ids: dict[int, dict[int, int]] = {}
+        # Pallas: id(fake_tensor) → [DimensionTiling], recorded during `plan_tiling`
+        self.pallas_tensor_dim_tilings: dict[int, list[DimensionTiling]] = {}
         # Pallas: set of id(fake_tensor) for tensors accessed in pipeline body
         self.pallas_pipeline_tensor_ids: set[int] = set()
         # TODO(dunfanlu): consider duplicating and aliasing arguments if a tensor needs to be accessed via both VMEM and SMEM?

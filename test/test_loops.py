@@ -307,6 +307,7 @@ class TestLoops(RefEagerTestBase, TestCase):
             result, functools.reduce(torch.matmul, args), atol=1e-1, rtol=1e-2
         )
 
+    @skipIfPallas("Requires int indexing which is unavailable on TPUs")
     def test_use_block_size_var_without_hl_tile(self):
         """Test that block size var can be used without hl.tile()."""
 

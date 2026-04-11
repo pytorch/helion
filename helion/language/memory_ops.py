@@ -25,7 +25,10 @@ from .stack_tensor import StackTensor
 if TYPE_CHECKING:
     from .._compiler.inductor_lowering import CodegenState
     from .._compiler.tile_strategy import LoopDimInfo
-    from helion._compiler.type_propagation import SymbolOrigin
+
+from .._compiler.host_function import SymbolOrigin
+
+# TileBeginWithOffset removed - using TileBeginWithOffsetPattern instead
 
 __all__ = ["load", "store"]
 
@@ -155,6 +158,23 @@ def _(state: CodegenState) -> ast.AST:
     raise NotImplementedError(f"Cannot store to type: {type(tensor)}")
 
 
+def _can_tile_dimension(state: CodegenState, tensor_dim: int) -> bool:
+    assert state.fx_node is not None
+    tensor_arg_node = state.fx_node.args[0]  # 0th argument to load/store is the tensor
+    assert isinstance(tensor_arg_node, torch.fx.Node)
+
+    tensor_val = tensor_arg_node.meta.get("val")
+    assert isinstance(tensor_val, torch.Tensor)
+
+    dim_tilings = state.device_function.pallas_tensor_dim_tilings.get(id(tensor_val))
+    assert isinstance(dim_tilings, list)
+    assert tensor_dim < len(dim_tilings)
+    from helion._compiler.pallas.plan_tiling import DimensionTiling
+
+    assert isinstance(dim_tilings[tensor_dim], DimensionTiling)
+    return dim_tilings[tensor_dim].can_tile
+
+
 def _pallas_index_str(
     state: CodegenState,
     subscript: list[object] | tuple[object, ...],
@@ -174,11 +194,8 @@ def _pallas_index_str(
     Also returns positions of ``None`` indices so the caller can apply
     ``jnp.expand_dims`` after loading.
     """
-    from .._compiler.tile_strategy import DeviceLoopState
     from .._compiler.tile_strategy import EmitPipelineLoopState
     from .._compiler.tile_strategy import ForiLoopState
-
-    env = CompileEnvironment.current()
 
     if not subscript:
         return "...", []
@@ -192,53 +209,27 @@ def _pallas_index_str(
                 in_pipeline = True
                 pipeline_block_ids.update(loop.block_ids)
 
-    # Record grid-level dim→block_id for block spec generation.
-    dim_map = state.device_function.pallas_tensor_dim_block_ids.setdefault(
-        id(tensor), {}
-    )
+    # Use pre-computed indexing patterns from plan_tiling analysis
+    indexing_patterns = _pallas_get_indexing_patterns(state, tensor)
 
-    # Build parts, using pl.ds() only for looped reduction dims.
+    # Build parts using the pre-computed patterns
     parts: list[str] = []
     none_dims: list[int] = []
     out_pos = 0
-    tensor_dim = 0  # tracks which tensor dimension we're at (skips None)
-    for i, idx in enumerate(subscript):
+    tensor_dim = 0
+
+    for i, (idx, pattern) in enumerate(zip(subscript, indexing_patterns, strict=True)):
         if idx is None:
             none_dims.append(out_pos)
             out_pos += 1
             continue
-        block_id = _resolve_block_id(env, idx, tensor, tensor_dim)
-        if block_id is not None:
-            if in_pipeline and block_id in pipeline_block_ids:
-                parts.append(":")
-            else:
-                loops = state.codegen.active_device_loops.get(block_id)
-                if loops and any(isinstance(loop, DeviceLoopState) for loop in loops):
-                    symbol_origin = _maybe_get_symbol_origin(idx)
-                    if symbol_origin and isinstance(symbol_origin.origin, GridOrigin):
-                        parts.append(state.codegen.offset_var(block_id))
-                    else:
-                        parts.append(_pallas_ds_expr(state, block_id))
-                else:
-                    maybe_grid_axis_idx = _maybe_get_hl_grid_axis_pid(idx)
-                    if maybe_grid_axis_idx is not None:
-                        expr = f"pl.program_id({maybe_grid_axis_idx})"
-                        parts.append(expr)
-                    else:
-                        parts.append(":")
-            if isinstance(idx, torch.SymInt):
-                dim_map.setdefault(tensor_dim, block_id)
-        elif isinstance(idx, int):
-            parts.append(str(idx))
-        elif isinstance(idx, torch.SymInt):
-            ast_subscripts = state.ast_args[1]
-            assert isinstance(ast_subscripts, list)
-            ast_idx = ast_subscripts[i]
-            assert isinstance(ast_idx, ast.AST)
-            name = state.codegen.lift(ast_idx, dce=True, prefix="index")
-            parts.append(name.id)
-        else:
-            parts.append(":")
+
+        # Generate code based on the pattern type
+        index_code = _pallas_generated_index_code(
+            pattern, idx, state, tensor, i, tensor_dim, in_pipeline, pipeline_block_ids
+        )
+        parts.append(index_code)
+
         out_pos += 1
         tensor_dim += 1
 
@@ -258,36 +249,165 @@ def _maybe_get_symbol_origin(idx: object) -> SymbolOrigin | None:
     return HostFunction.current().expr_to_origin.get(expr)
 
 
-# returns pid for an idx (used in a index_expr) that comes from a hl.grid
-def _maybe_get_hl_grid_axis_pid(idx: object) -> int | None:
-    symbol_origin = _maybe_get_symbol_origin(idx)
-    if symbol_origin is None:
-        return None
-    if not isinstance(symbol_origin.origin, GridOrigin):
-        return None
-    block_id = symbol_origin.origin.block_id
-    from .._compiler.device_function import DeviceFunction
-
-    device_fn = DeviceFunction.current()
-    if device_fn.pid is not None:
-        for i, pid in enumerate(device_fn.pid.pid_info):
-            if pid.block_id == block_id:
-                return i
-    return None
+def _pallas_get_indexing_patterns(
+    state: CodegenState, tensor: torch.Tensor
+) -> list[object]:
+    assert state.fx_node is not None
+    assert hasattr(state.fx_node, "meta")
+    patterns = state.fx_node.meta.get("indexing_patterns")
+    assert patterns is not None, f"No indexing patterns found for node {state.fx_node}"
+    return patterns
 
 
-def _resolve_block_id(
-    env: CompileEnvironment,
+def _pallas_generated_index_code(
+    pattern: object,
     idx: object,
+    state: CodegenState,
     tensor: torch.Tensor,
-    pos: int,
-) -> int | None:
-    """Resolve a subscript element to its block_id, if any."""
-    if isinstance(idx, torch.SymInt):
-        return env.get_block_id(idx)
-    if isinstance(idx, slice) and idx == slice(None):
-        return env.resolve_block_id(tensor.shape[pos])
-    return None
+    subscript_index: int,
+    tensor_dim: int,
+    in_pipeline: bool,
+    pipeline_block_ids: set[int],
+) -> str:
+    """Generate index code based on the indexing pattern."""
+    from .._compiler.pallas.plan_tiling import ArbitraryIndexPattern
+    from .._compiler.pallas.plan_tiling import ArbitrarySlicePattern
+    from .._compiler.pallas.plan_tiling import TileBeginWithOffsetPattern
+    from .._compiler.pallas.plan_tiling import TileIndexWithOffsetPattern
+    from .._compiler.pallas.plan_tiling import TilePattern
+
+    if isinstance(pattern, TilePattern):
+        return _pallas_tile_pattern_code(
+            pattern, idx, state, tensor_dim, in_pipeline, pipeline_block_ids
+        )
+
+    if isinstance(pattern, TileIndexWithOffsetPattern):
+        return _pallas_tile_index_with_offset_pattern_code(pattern, state)
+
+    if isinstance(pattern, TileBeginWithOffsetPattern):
+        return _pallas_tile_begin_with_offset_pattern_code(
+            pattern, state, subscript_index, tensor_dim
+        )
+
+    if isinstance(pattern, ArbitrarySlicePattern):
+        return _pallas_slice_code(idx, pattern, state, tensor, subscript_index)
+
+    if isinstance(pattern, ArbitraryIndexPattern):
+        if isinstance(idx, int):
+            return str(idx)
+        return _pallas_index_expr_from_ast(state, subscript_index)
+
+    raise RuntimeError(
+        f"Unhandled indexing pattern type: {type(pattern).__name__}. "
+        f"Pattern: {pattern}, idx: {idx}, subscript_index: {subscript_index}. "
+        f"All indexing patterns should be handled by the tiling analysis system."
+    )
+
+
+def _pallas_tile_pattern_code(
+    pattern: object,
+    idx: object,
+    state: CodegenState,
+    tensor_dim: int,
+    in_pipeline: bool,
+    pipeline_block_ids: set[int],
+) -> str:
+    from .._compiler.pallas.plan_tiling import TilePattern
+    from .._compiler.tile_strategy import DeviceLoopState
+
+    assert isinstance(pattern, TilePattern)
+
+    block_id = pattern.block_id
+
+    can_tile = _can_tile_dimension(state, tensor_dim)
+    if not can_tile:
+        return _pallas_ds_expr(state, block_id)
+
+    if in_pipeline and block_id in pipeline_block_ids:
+        return ":"
+
+    loops = state.codegen.active_device_loops.get(block_id)
+    if loops and any(isinstance(loop, DeviceLoopState) for loop in loops):
+        return _pallas_ds_expr(state, block_id)
+    return ":"
+
+
+def _pallas_tile_index_with_offset_pattern_code(
+    pattern: object,
+    state: CodegenState,
+) -> str:
+    from .._compiler.pallas.plan_tiling import TileIndexWithOffsetPattern
+
+    assert isinstance(pattern, TileIndexWithOffsetPattern)
+
+    block_id = pattern.block_id
+    offset_str = f"{pattern.offset}"
+    return _pallas_ds_expr(state, block_id, offset_str)
+
+
+def _pallas_tile_begin_with_offset_pattern_code(
+    pattern: object,
+    state: CodegenState,
+    subscript_index: int,
+    tensor_dim: int,
+) -> str:
+    from .._compiler.pallas.plan_tiling import TileBeginWithOffsetPattern
+    from .._compiler.tile_strategy import DeviceLoopState
+
+    assert isinstance(pattern, TileBeginWithOffsetPattern)
+
+    can_tile = _can_tile_dimension(state, tensor_dim)
+
+    if not can_tile:
+        return _pallas_index_expr_from_ast(state, subscript_index)
+
+    assert isinstance(pattern.offset, int)
+
+    loops = state.codegen.active_device_loops.get(pattern.block_id)
+    if loops and any(isinstance(loop, DeviceLoopState) for loop in loops):
+        offset = state.codegen.offset_var(pattern.block_id)
+        if pattern.offset != 0:
+            offset = f"{offset} + {pattern.offset}"
+        return offset
+
+    return f"{pattern.offset}"
+
+
+def _pallas_index_expr_from_ast(state: CodegenState, subscript_index: int) -> str:
+    ast_subscripts = state.ast_args[1]
+    assert isinstance(ast_subscripts, list)
+    ast_idx = ast_subscripts[subscript_index]
+    assert isinstance(ast_idx, ast.AST)
+    name = state.codegen.lift(ast_idx, dce=True, prefix="index")
+    return name.id
+
+
+def _pallas_slice_code(
+    idx: object,
+    pattern: object,
+    state: CodegenState,
+    tensor: torch.Tensor,
+    subscript_index: int,
+) -> str:
+    from .._compiler.pallas.plan_tiling import ArbitrarySlicePattern
+    from .._compiler.tile_strategy import DeviceLoopState
+
+    assert isinstance(pattern, ArbitrarySlicePattern)
+
+    if idx != slice(None):
+        raise AssertionError(
+            f"Arbitrary slice expr {slice} not supported in Pallas backend yet"
+        )
+
+    env = CompileEnvironment.current()
+    block_id = env.resolve_block_id(tensor.shape[subscript_index])
+    if block_id is not None:
+        loops = state.codegen.active_device_loops.get(block_id)
+        if loops and any(isinstance(loop, DeviceLoopState) for loop in loops):
+            if block_id is not None:
+                return _pallas_ds_expr(state, block_id)
+
+    return ":"
 
 
 def _pallas_ds_expr(state: CodegenState, block_id: int, tile_offset: str = "") -> str:
