@@ -46,6 +46,17 @@ class _BlockIdItem:
     ) -> object:
         return fn(self._fragment(base))
 
+    def _encode_flat_value(self, base: ConfigSpec, value: object) -> object:
+        """Encode a normalized Config value into its flat-slot representation.
+
+        Most specs store the same value in Config and FlatConfig, so the
+        default implementation is the identity. ReductionLoopSpec is the
+        only override today: it normalizes persistent reductions to None in
+        Config, but FlatConfig stores that choice as an integer sentinel.
+        """
+        del base
+        return value
+
 
 _BlockIdItemT = TypeVar("_BlockIdItemT", bound=_BlockIdItem)
 
