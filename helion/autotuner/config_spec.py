@@ -1123,9 +1123,10 @@ class ReductionLoopSpec(_PowerOfTwoBlockIdItem):
         super().__init__([block_id])
         self.size_hint = size_hint
 
-    def _flat_config(
-        self, base: ConfigSpec, fn: Callable[[ConfigSpecFragment], object]
-    ) -> int | None:
+    def _flat_fragment(self, base: ConfigSpec) -> BlockSizeFragment:
+        # Shared by both directions:
+        # - unflatten: flat integer -> Config value via _flat_config()
+        # - flatten: Config value -> flat integer via _encode_flat_value()
         low = 8  # TODO(jansel): is smaller needed?
         high = next_power_of_2(max(low, self.size_hint))
         default = min(high, 4096)
@@ -1134,14 +1135,31 @@ class ReductionLoopSpec(_PowerOfTwoBlockIdItem):
         if base.max_reduction_threads is not None:
             if self.size_hint > base.max_reduction_threads:
                 default = min(default, base.max_reduction_threads)
-        value = fn(BlockSizeFragment(low, high, default))
+        return BlockSizeFragment(low, high, default)
+
+    def _flat_config(
+        self, base: ConfigSpec, fn: Callable[[ConfigSpecFragment], object]
+    ) -> int | None:
+        fragment = self._flat_fragment(base)
+        value = fn(fragment)
         assert isinstance(value, int)
-        if not (low <= value <= high):
+        if not (fragment.low <= value <= fragment.high):
             raise InvalidConfig(
-                f"Invalid value for reduction loop {low} <= {value} <= {high}"
+                "Invalid value for reduction loop "
+                f"{fragment.low} <= {value} <= {fragment.high}"
             )
         if value >= self.size_hint:
             return None  # max size becomes persistent reduction
+        return value
+
+    def _encode_flat_value(self, base: ConfigSpec, value: object) -> object:
+        # None means "persistent reduction" in the normalized Config. In the
+        # flat search space that same choice is represented by an integer
+        # sentinel, typically the fragment default such as 1024 for a 1024-wide
+        # reduction. This is the one non-identity Config <-> FlatConfig
+        # mapping today.
+        if value is None:
+            return self._flat_fragment(base).default()
         return value
 
     def _normalize(self, name: str, value: object) -> int | None:

@@ -739,6 +739,7 @@ class PopulationBasedSearch(BaseSearch):
         super().__init__(kernel, args)
         self.finishing_rounds = finishing_rounds
         self.population: list[PopulationMember] = []
+        self._best_available_seed_configs: list[Config] = []
         self.config_gen: ConfigGeneration = self.config_spec.create_config_generation(
             overrides=self.settings.autotune_config_overrides or None,
             advanced_controls_files=self.settings.autotune_search_acf or None,
@@ -897,15 +898,20 @@ class PopulationBasedSearch(BaseSearch):
 
     def _generate_best_available_population_flat(self) -> list[FlatConfig]:
         """
-        Generate initial population using default config plus cached configs.
+        Generate initial population using default config, explicit seed configs,
+        and cached configs.
 
         Always starts with the default configuration, then adds up to
         MAX_BEST_AVAILABLE_CONFIGS matching cached configs from previous runs.
-        No random configs are added.  Duplicate configs are discarded.
+        Explicit seed configs provided by the caller are added ahead of cached
+        configs and are not suppressed by cache-skip settings. No random configs
+        are added. Duplicate configs are discarded.
 
         Returns:
             A list of unique FlatConfig values for the initial population.
-            Minimum size is 1 (just default), maximum is 1 + autotune_best_available_max_configs setting.
+            Minimum size is 1 (just default), plus any valid unique explicit
+            seed configs and up to autotune_best_available_max_configs cached
+            configs.
         """
         # Always start with the default config
         default_flat = self.config_gen.default_flat()
@@ -913,6 +919,16 @@ class PopulationBasedSearch(BaseSearch):
         seen: set[Config] = {default_config}
         result: list[FlatConfig] = [default_flat]
         self.log("Starting with default config")
+
+        for config in self._best_available_seed_configs:
+            try:
+                flat = self.config_gen.flatten(config)
+                transferred_config = self.config_gen.unflatten(flat)
+                if transferred_config not in seen:
+                    seen.add(transferred_config)
+                    result.append(flat)
+            except (ValueError, TypeError, KeyError, AssertionError) as e:
+                self.log(f"Failed to transfer explicit seed config: {e}")
 
         max_configs = self.settings.autotune_best_available_max_configs
         cached_entries = self._find_similar_cached_configs(max_configs)
@@ -946,11 +962,15 @@ class PopulationBasedSearch(BaseSearch):
         if duplicates > 0:
             self.log.debug(f"Discarded {duplicates} duplicate config(s)")
 
-        self.log(
-            f"Initial population: 1 default + {len(result) - 1} unique cached = {len(result)} total"
-        )
+        self.log(f"Initial population: {len(result)} total")
 
         return result
+
+    def set_best_available_seed_configs(
+        self,
+        configs: Sequence[Config],
+    ) -> None:
+        self._best_available_seed_configs = list(configs)
 
     def parallel_benchmark_population(
         self, members: list[PopulationMember], *, desc: str = "Benchmarking"

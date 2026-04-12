@@ -61,6 +61,7 @@ from helion.autotuner.local_cache import LocalAutotuneCache
 from helion.autotuner.local_cache import StrictLocalAutotuneCache
 from helion.autotuner.logger import AutotuneLogEntry
 from helion.autotuner.logger import AutotuningLogger
+from helion.autotuner.metrics import AutotuneMetrics
 from helion.autotuner.random_search import RandomSearch
 import helion.language as hl
 from helion.language import loops
@@ -3115,6 +3116,240 @@ class TestLLMTransport(TestCase):
                 self.assertEqual(captured["url"], case["expected_url"])
                 self.assertEqual(captured["request_timeout_s"], 120.0)
                 case["request_assertions"](captured)
+
+
+class TestLLMSeededLFBOTreeSearch(TestCase):
+    """Tests for the two-stage LLM-seeded hybrid autotuner."""
+
+    def test_profile_kwargs_and_env_overrides(self):
+        """Hybrid profile wiring forwards shared LLM settings and hybrid env overrides."""
+        from helion.autotuner import LLMSeededLFBOTreeSearch
+        from helion.autotuner import LLMSeededSearch
+
+        kwargs = LLMSeededLFBOTreeSearch.get_kwargs_from_profile(
+            get_effort_profile("full"), Settings()
+        )
+        self.assertEqual(kwargs["llm_model"], "gpt-5-2")
+        self.assertEqual(kwargs["llm_configs_per_round"], 15)
+        self.assertEqual(kwargs["llm_max_rounds"], 1)
+        self.assertEqual(kwargs["llm_initial_random_configs"], 10)
+        self.assertNotIn("llm_compile_timeout_s", kwargs)
+        self.assertFalse(kwargs["best_available_pad_random"])
+
+        with patch.dict(
+            os.environ,
+            {"HELION_HYBRID_SECOND_STAGE_ALGORITHM": "PatternSearch"},
+            clear=False,
+        ):
+            generic_kwargs = LLMSeededSearch.get_kwargs_from_profile(
+                get_effort_profile("full"), Settings()
+            )
+        self.assertEqual(generic_kwargs["second_stage_algorithm"], "PatternSearch")
+        self.assertIn("max_generations", generic_kwargs["second_stage_kwargs"])
+
+        kernel = SimpleNamespace(
+            settings=Settings(),
+            config_spec=SimpleNamespace(),
+        )
+        with patch.dict(
+            os.environ,
+            {
+                "HELION_HYBRID_LLM_MAX_ROUNDS": "2",
+                "HELION_LLM_PROVIDER": "openai",
+            },
+            clear=False,
+        ):
+            kwargs = LLMSeededLFBOTreeSearch.get_kwargs_from_profile(
+                get_effort_profile("full"), Settings()
+            )
+        self.assertEqual(kwargs["llm_max_rounds"], 2)
+        self.assertEqual(kwargs["llm_provider"], "openai")
+
+        search = LLMSeededLFBOTreeSearch(kernel, (), **kwargs)
+        self.assertEqual(search.llm_provider, "openai")
+
+    def test_selected_by_env(self):
+        """HELION_AUTOTUNER selects the hybrid autotuner and applies profile defaults."""
+        from helion.autotuner import LLMSeededLFBOTreeSearch
+
+        args = (
+            torch.randn([8, 32], device=DEVICE),
+            torch.randn([8, 32], device=DEVICE),
+        )
+
+        with patch.dict(os.environ, {"HELION_AUTOTUNER": "LLMSeededLFBOTreeSearch"}):
+
+            @helion.kernel(autotune_effort="full")
+            def add(a, b):
+                out = torch.empty_like(a)
+                for tile in hl.tile(out.size()):
+                    out[tile] = a[tile] + b[tile]
+                return out
+
+            bound = add.bind(args)
+            autotuner = bound.settings.autotuner_fn(bound, args)
+            self.assertIsInstance(autotuner.autotuner, LLMSeededLFBOTreeSearch)
+            self.assertEqual(autotuner.autotuner.llm_max_rounds, 1)
+            self.assertFalse(autotuner.autotuner.best_available_pad_random)
+
+    def test_handoff_runs_llm_then_lfbo(self):
+        """The hybrid flow runs LLM seeding first, then injects that seed into LFBO."""
+        from helion.autotuner import InitialPopulationStrategy
+        from helion.autotuner import LLMSeededLFBOTreeSearch
+        from helion.runtime.config import Config
+
+        llm_instances = []
+        lfbo_instances = []
+
+        class FakeBenchmarkProvider:
+            def __init__(self, **kwargs) -> None:
+                self.kwargs = kwargs
+
+        class FakeLLMSearch:
+            def __init__(self, kernel, args, **kwargs) -> None:
+                self.kernel = kernel
+                self.args = args
+                self.kwargs = kwargs
+                self.best_perf_so_far = 0.9
+                self._autotune_metrics = AutotuneMetrics(
+                    num_configs_tested=7,
+                    num_compile_failures=1,
+                    num_accuracy_failures=2,
+                    num_generations=3,
+                )
+                llm_instances.append(self)
+
+            def autotune(self, *, skip_cache=False):
+                self.skip_cache = skip_cache
+                return Config(num_warps=4)
+
+        class FakeLFBOSearch:
+            def __init__(
+                self,
+                kernel,
+                args,
+                *,
+                initial_population_strategy=None,
+                best_available_pad_random=True,
+                **kwargs,
+            ) -> None:
+                self.kernel = kernel
+                self.args = args
+                self.kwargs = {
+                    **kwargs,
+                    "initial_population_strategy": initial_population_strategy,
+                    "best_available_pad_random": best_available_pad_random,
+                }
+                self.best_perf_so_far = 0.5
+                self._autotune_metrics = AutotuneMetrics(
+                    num_configs_tested=11,
+                    num_compile_failures=3,
+                    num_accuracy_failures=5,
+                    num_generations=6,
+                )
+                self.seed_configs = None
+                lfbo_instances.append(self)
+
+            def set_best_available_seed_configs(self, configs):
+                self.seed_configs = list(configs)
+
+            def autotune(self):
+                return Config(num_warps=8)
+
+        kernel = SimpleNamespace(
+            settings=Settings(),
+            config_spec=SimpleNamespace(),
+            env=SimpleNamespace(device=DEVICE, process_group_name=None),
+        )
+        args = (torch.randn([8], device=DEVICE),)
+        search = LLMSeededLFBOTreeSearch(kernel, args, llm_max_rounds=2)
+        search._benchmark_provider_cls = FakeBenchmarkProvider
+        search._prepare()
+        self.assertIsInstance(search.benchmark_provider, FakeBenchmarkProvider)
+
+        with (
+            patch("helion.autotuner.llm_seeded_lfbo.LLMGuidedSearch", FakeLLMSearch),
+            patch(
+                "helion.autotuner.llm_seeded_lfbo._resolve_second_stage_algorithm",
+                return_value=FakeLFBOSearch,
+            ),
+        ):
+            best = search._autotune()
+
+        self.assertEqual(best["num_warps"], 8)
+        self.assertEqual(llm_instances[0].kwargs["max_rounds"], 2)
+        self.assertTrue(llm_instances[0].skip_cache)
+        self.assertEqual(
+            lfbo_instances[0].kwargs["initial_population_strategy"],
+            InitialPopulationStrategy.FROM_BEST_AVAILABLE,
+        )
+        self.assertEqual(lfbo_instances[0].seed_configs, [Config(num_warps=4)])
+        self.assertEqual(search._autotune_metrics.num_configs_tested, 18)
+        self.assertEqual(search._autotune_metrics.num_compile_failures, 4)
+        self.assertEqual(search._autotune_metrics.num_accuracy_failures, 7)
+        self.assertEqual(search._autotune_metrics.num_generations, 9)
+        self.assertEqual(search.hybrid_stage_breakdown["llm_seed_configs_tested"], 7)
+        self.assertEqual(search.hybrid_stage_breakdown["lfbo_stage_configs_tested"], 11)
+
+    def test_zero_llm_rounds_falls_back_to_lfbo_strategy(self):
+        """Disabling LLM rounds skips stage 1 and leaves the second-stage strategy unchanged."""
+        from helion.autotuner import InitialPopulationStrategy
+        from helion.autotuner import LLMSeededLFBOTreeSearch
+        from helion.runtime.config import Config
+
+        lfbo_instances = []
+
+        class FakeBenchmarkProvider:
+            def __init__(self, **kwargs) -> None:
+                self.kwargs = kwargs
+
+        class FailIfLLMConstructed:
+            def __init__(self, *args, **kwargs) -> None:
+                raise AssertionError("LLM seed stage should be skipped")
+
+        class FakeLFBOSearch:
+            def __init__(self, kernel, args, **kwargs) -> None:
+                self.kwargs = kwargs
+                self.best_perf_so_far = 0.4
+                self._autotune_metrics = AutotuneMetrics(num_configs_tested=3)
+                lfbo_instances.append(self)
+
+            def autotune(self):
+                return Config(num_warps=16)
+
+        kernel = SimpleNamespace(
+            settings=Settings(),
+            config_spec=SimpleNamespace(),
+            env=SimpleNamespace(device=DEVICE, process_group_name=None),
+        )
+        args = (torch.randn([8], device=DEVICE),)
+        search = LLMSeededLFBOTreeSearch(
+            kernel,
+            args,
+            llm_max_rounds=0,
+            initial_population_strategy=InitialPopulationStrategy.FROM_RANDOM,
+        )
+        search._benchmark_provider_cls = FakeBenchmarkProvider
+        search._prepare()
+
+        with (
+            patch(
+                "helion.autotuner.llm_seeded_lfbo.LLMGuidedSearch",
+                FailIfLLMConstructed,
+            ),
+            patch(
+                "helion.autotuner.llm_seeded_lfbo._resolve_second_stage_algorithm",
+                return_value=FakeLFBOSearch,
+            ),
+        ):
+            best = search._autotune()
+
+        self.assertEqual(best["num_warps"], 16)
+        self.assertEqual(
+            lfbo_instances[0].kwargs["initial_population_strategy"],
+            InitialPopulationStrategy.FROM_RANDOM,
+        )
+        self.assertFalse(search.hybrid_stage_breakdown["used_llm_seed"])
 
 
 if __name__ == "__main__":
