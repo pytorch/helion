@@ -353,7 +353,7 @@ class TestPallas(TestCase):
         from helion.runtime.config import Config
 
         bound = pallas_tile_begin_end.bind((x,))
-        code = bound.to_triton_code(Config(block_size=256))
+        code = bound.to_code(Config(block_size=256))
         self.assertIn("pl.program_id", code)
 
     def test_dynamic_scalar_no_recompile(self) -> None:

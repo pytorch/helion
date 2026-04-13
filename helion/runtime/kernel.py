@@ -520,7 +520,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             parts.append(f"index_dtype={settings.index_dtype}")
         return f"@helion.kernel({', '.join(parts)})"
 
-    def to_triton_code(
+    def to_code(
         self,
         config: ConfigLike | None = None,
         *,
@@ -528,18 +528,18 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         output_origin_lines: bool | None = None,
     ) -> str:
         """
-        Generate Triton code for the kernel based on the given configuration.
+        Generate backend-specific code for the kernel based on the given configuration.
 
         Args:
             config: The configuration to use for code generation.
-            emit_repro_caller: Emits a main function to call the triton kernel with example inputs.
+            emit_repro_caller: Emits a main function to call the kernel with example inputs.
 
         Returns:
-            str: The generated Triton code as a string.
+            str: The generated code as a string.
         """
         if config is None:
             config = self._require_implicit_config()
-        with self.env, measure("BoundKernel.to_triton_code"):
+        with self.env, measure("BoundKernel.to_code"):
             if not isinstance(config, Config):
                 # pyrefly: ignore [bad-argument-type]
                 config = Config(**config)
@@ -577,6 +577,20 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                 if imports:
                     return f"from __future__ import annotations\n\n{imports}\n\n{body}"
                 return f"from __future__ import annotations\n\n{body}"
+
+    def to_triton_code(
+        self,
+        config: ConfigLike | None = None,
+        *,
+        emit_repro_caller: bool = False,
+        output_origin_lines: bool | None = None,
+    ) -> str:
+        """Backward-compatible alias for :meth:`to_code`."""
+        return self.to_code(
+            config,
+            emit_repro_caller=emit_repro_caller,
+            output_origin_lines=output_origin_lines,
+        )
 
     def compile_config(
         self, config: ConfigLike | None = None, *, allow_print: bool = True

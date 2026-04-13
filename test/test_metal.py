@@ -27,7 +27,7 @@ def _get_msl(kernel: helion.Kernel, args: tuple[object, ...]) -> str:
     """
     from torch._inductor.codecache import PyCodeCache
 
-    code = kernel.bind(args).to_triton_code()
+    code = kernel.bind(args).to_code()
     module = PyCodeCache.load(code)
     # Call the host function by name
     host_fn = getattr(module, kernel.fn.__name__)
