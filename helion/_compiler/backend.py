@@ -49,6 +49,11 @@ class Backend(abc.ABC):
         ...
 
     @property
+    def experimental(self) -> bool:
+        """Whether this backend is experimental and should emit a warning."""
+        return True
+
+    @property
     def codegen_name(self) -> str:
         """Backend name used to look up registered codegen functions."""
         return self.name
@@ -570,6 +575,10 @@ class TritonBackend(Backend):
     @property
     def name(self) -> str:
         return "triton"
+
+    @property
+    def experimental(self) -> bool:
+        return False
 
     def supports_config_key(self, key: str) -> bool:
         if key == "waves_per_eu":
