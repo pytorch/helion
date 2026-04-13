@@ -1968,7 +1968,6 @@ class TypePropagation(ast.NodeVisitor):
             # pyrefly: ignore [not-iterable]
             for elt in lhs:
                 if isinstance(elt, ast.Starred):
-                    # TODO(jansel): need to test this
                     assert not used_star, "multiple `*` in assignment"
                     used_star = True
                     # pyrefly: ignore [bad-argument-type]
@@ -2179,7 +2178,6 @@ class TypePropagation(ast.NodeVisitor):
         return result
 
     def visit_Call(self, node: ast.Call) -> TypeInfo:
-        # TODO(jansel): test handling if *args and **kwargs
         func = self.visit(node.func)
 
         # Check for calling a Helion kernel from within another Helion kernel

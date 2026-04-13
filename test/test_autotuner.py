@@ -241,6 +241,43 @@ class TestAutotuneIgnoreErrors(TestCase):
         # Verify we can still get the error type and message
         assert type(err.value.__cause__).__name__ == "RuntimeError"
 
+    def test_benchmark_results_aligned_when_compile_fails(self):
+        """_benchmark must return one result per input config even when some
+        fail to compile."""
+        settings = Settings(
+            autotune_precompile=None,
+            autotune_log_level=logging.CRITICAL,
+        )
+        search = self._make_search(settings)
+
+        call_count = 0
+
+        def fail_second(config, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 2:
+                raise RuntimeError("simulated compile failure")
+            return lambda *a, **kw: None
+
+        search.kernel.compile_config = None
+        search.kernel.env = SimpleNamespace(process_group_name=None)
+        configs = ["cfg_a", "cfg_b", "cfg_c"]
+        with (
+            patch.object(search.kernel, "compile_config", side_effect=fail_second),
+            patch.object(
+                search.benchmark_provider,
+                "benchmark_function",
+                return_value=1.0,
+            ),
+        ):
+            results = search._benchmark(configs, desc="test")
+
+        self.assertEqual(len(results), 3)
+        self.assertEqual(results[0].perf, 1.0)
+        self.assertEqual(results[1].perf, float("inf"))
+        self.assertEqual(results[1].status, "error")
+        self.assertEqual(results[2].perf, 1.0)
+
     def test_autotune_log_sink_writes_csv_and_log(self):
         tmpdir = tempfile.TemporaryDirectory()
         self.addCleanup(tmpdir.cleanup)
@@ -874,6 +911,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             ],
             block_size_indices=[0, 1],
             overridden_flat_indices=set(),
+            config_spec=SimpleNamespace(tensor_numel_constraints=[]),
         )
         search.num_neighbors_cap = -1
 
@@ -1008,6 +1046,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             block_size_indices=[0, 1],
             num_warps_index=2,
             overridden_flat_indices=set(),
+            config_spec=SimpleNamespace(tensor_numel_constraints=[]),
         )
         search.num_neighbors_cap = -1
 

@@ -142,6 +142,35 @@ Configs are typically discovered automatically through autotuning, but can also 
       ``[load1, load2, ..., loadN, store1, store2, ..., storeM]``
 ```
 
+### Epilogue Optimization
+
+```{eval-rst}
+.. autoattribute:: Config.epilogue_subtile
+
+   Split factor for the epilogue (pointwise ops + store) along a tile dimension.
+   Splits the store from ``[BLOCK_M, BLOCK_N]`` into
+   ``SUBTILE_FACTOR × [BLOCK_M, BLOCK_N / SUBTILE_FACTOR]``, reducing the accumulator
+   shared-memory footprint and enabling extra pipeline stages.
+
+   **Valid values:**
+
+   - ``None``: Disabled (default)
+   - ``2``: Split epilogue into 2 sub-tiles
+   - ``4``: Split epilogue into 4 sub-tiles (when K ≥ 16384)
+
+   **Requirements:**
+
+   - Blackwell (sm_100+) GPU with tensor descriptor support
+   - Automatically discovered by the autotuner when the K dimension is ≥ 1024
+
+   **Interactions:**
+
+   - Incompatible with ``flatten_loops=True``
+   - Forces store indexing to ``"tensor_descriptor"``
+
+   See the :doc:`epilogue subtiling example </examples/epilogue_subtiling>` for usage patterns.
+```
+
 ### Memory and Caching
 
 ```{eval-rst}

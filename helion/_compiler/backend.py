@@ -49,6 +49,11 @@ class Backend(abc.ABC):
         ...
 
     @property
+    def experimental(self) -> bool:
+        """Whether this backend is experimental and should emit a warning."""
+        return True
+
+    @property
     def codegen_name(self) -> str:
         """Backend name used to look up registered codegen functions."""
         return self.name
@@ -570,6 +575,10 @@ class TritonBackend(Backend):
     @property
     def name(self) -> str:
         return "triton"
+
+    @property
+    def experimental(self) -> bool:
+        return False
 
     def supports_config_key(self, key: str) -> bool:
         if key == "waves_per_eu":
@@ -2793,7 +2802,7 @@ class MetalBackend(Backend):
 
     @property
     def function_decorator(self) -> str:
-        return ""
+        return "metal_jit"
 
     @property
     def constexpr_type(self) -> str:
@@ -2814,6 +2823,7 @@ class MetalBackend(Backend):
                 "from helion.runtime import default_metal_launcher"
                 " as _default_metal_launcher"
             ),
+            "metal_jit": ("from helion._compiler.metal.metal_jit import metal_jit"),
         }
 
     def index_type_str(self, index_dtype: torch.dtype) -> str:
