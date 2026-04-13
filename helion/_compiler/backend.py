@@ -1190,6 +1190,9 @@ class PallasBackend(Backend):
             tensor_ndim (int): Amount of dimensions for the tensor.
             bitwidth (int): Bitwidth of tensor elements
         """
+        # Cap to 32: wider dtypes (e.g. float64, int64) are narrowed to
+        # 32-bit at runtime since TPU does not natively support 64-bit types.
+        bitwidth = min(bitwidth, 32)
         if dim_from_end == 0:  # Last dimension
             if tensor_ndim <= 1:
                 return 128 * (32 // bitwidth)

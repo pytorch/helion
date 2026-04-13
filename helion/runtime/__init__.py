@@ -347,6 +347,64 @@ def _jax_placeholder_for_tensor(t: torch.Tensor) -> object:
     return jax.ShapeDtypeStruct(tuple(t.shape), jax_dtype)
 
 
+def _pallas_cast_unsupported_dtypes(
+    args: tuple[object, ...],
+    _output_indices: list[int],
+) -> tuple[tuple[object, ...], dict[int, torch.Tensor]]:
+    """Narrow 64-bit tensors to 32-bit for TPU/XLA compatibility.
+
+    TPU does not natively support 64-bit element types.  This function
+    narrows int64→int32 and float64→float32 before tracing so that
+    placeholders, block specs, and input tensors are all 32-bit.
+    This is a lossy operation: int64 values outside the int32 range will
+    overflow, and float64 values lose precision.
+
+    Returns the (possibly modified) args tuple and a mapping from output
+    arg index to the *original* output tensor.  After the kernel finishes,
+    callers must copy results back from the narrowed tensor to the original
+    via ``_pallas_copy_back_outputs``.
+    """
+    import warnings
+
+    from .._compiler.backend import pallas_narrow_dtype
+
+    need_cast = any(
+        isinstance(a, torch.Tensor) and pallas_narrow_dtype(a.dtype) != a.dtype
+        for a in args
+    )
+
+    if not need_cast:
+        return args, {}
+
+    new_args = list(args)
+    output_originals: dict[int, torch.Tensor] = {}
+    output_set = set(_output_indices)
+    for i, a in enumerate(new_args):
+        if isinstance(a, torch.Tensor):
+            narrow = pallas_narrow_dtype(a.dtype)
+            if narrow != a.dtype:
+                warnings.warn(
+                    f"Pallas/TPU: narrowing {a.dtype} tensors to {narrow} "
+                    f"because TPU does not natively support 64-bit types. "
+                    f"This may cause overflow or precision loss.",
+                    stacklevel=3,
+                )
+                if i in output_set:
+                    output_originals[i] = a
+                new_args[i] = a.to(narrow)
+    return tuple(new_args), output_originals
+
+
+def _pallas_copy_back_outputs(
+    output_originals: dict[int, torch.Tensor],
+    args: tuple[object, ...],
+) -> None:
+    """Copy narrowed output tensors back to the original wide-dtype tensors."""
+    for i, orig in output_originals.items():
+        narrowed = cast("torch.Tensor", args[i])
+        orig.copy_(narrowed)
+
+
 def _pallas_prepare_args(
     args: tuple[object, ...],
     _output_indices: list[int],
@@ -591,6 +649,8 @@ def default_pallas_launcher(
     if _output_indices is None:
         _output_indices = []
 
+    args, output_originals = _pallas_cast_unsupported_dtypes(args, _output_indices)
+
     cache = getattr(pallas_kernel, "_pallas_cache", None)
     if cache is not None and cache[0] == grid:
         _, jax_callable, tensor_arg_indices = cache
@@ -681,6 +741,7 @@ def default_pallas_launcher(
         cast("torch.Tensor", args[i]).contiguous() for i in tensor_arg_indices
     ]
     jax_callable(*input_tensors)  # type: ignore[operator]
+    _pallas_copy_back_outputs(output_originals, args)
 
 
 def default_pallas_pipeline_launcher(
@@ -703,6 +764,8 @@ def default_pallas_pipeline_launcher(
         _output_indices = []
     if _scratch_shapes is None:
         _scratch_shapes = []
+
+    args, output_originals = _pallas_cast_unsupported_dtypes(args, _output_indices)
 
     cache = getattr(pallas_kernel, "_pallas_pipeline_cache", None)
     if cache is not None and cache[0] == grid:
@@ -821,6 +884,7 @@ def default_pallas_pipeline_launcher(
         cast("torch.Tensor", args[i]).contiguous() for i in tensor_arg_indices
     ]
     jax_callable(*input_tensors)  # type: ignore[operator]
+    _pallas_copy_back_outputs(output_originals, args)
 
 
 def default_pallas_fori_launcher(
@@ -844,6 +908,8 @@ def default_pallas_fori_launcher(
         _output_indices = []
     if _scratch_shapes is None:
         _scratch_shapes = []
+
+    args, output_originals = _pallas_cast_unsupported_dtypes(args, _output_indices)
 
     cache = getattr(pallas_kernel, "_pallas_fori_cache", None)
     if cache is not None and cache[0] == grid:
@@ -961,6 +1027,7 @@ def default_pallas_fori_launcher(
         cast("torch.Tensor", args[i]).contiguous() for i in tensor_arg_indices
     ]
     jax_callable(*input_tensors)  # type: ignore[operator]
+    _pallas_copy_back_outputs(output_originals, args)
 
 
 def _torch_to_jax(t: torch.Tensor) -> object:

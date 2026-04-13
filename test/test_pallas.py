@@ -792,15 +792,41 @@ class TestPallas(TestCase):
 
         Uses a reduction kernel so the generated code includes
         convert_element_type and jnp.full with dtype arguments.
-        Only checks codegen, does not execute the kernel.
         """
-        from helion.runtime.config import Config
-
         x = torch.randint(0, 100, [32, 64], device=DEVICE, dtype=torch.int64)
-        bound = pallas_sum_reduction.bind((x,))
-        config = Config(block_sizes=[16])
-        code = bound.to_triton_code(config)
+        code, result = code_and_output(pallas_sum_reduction, (x,), block_size=16)
         self.assertNotIn("jnp.int64", code)
+        expected = x.sum(-1)
+        torch.testing.assert_close(result, expected)
+
+    def test_int64_1d_tensor(self) -> None:
+        """int64 tensors are narrowed to int32 before tracing/execution."""
+        x = torch.arange(256, device=DEVICE, dtype=torch.int64)
+        y = torch.arange(256, device=DEVICE, dtype=torch.int64)
+        code, result = code_and_output(add_kernel, (x, y), block_size=64)
+        expected = x + y
+        torch.testing.assert_close(result, expected)
+
+    def test_float64_1d_tensor(self) -> None:
+        """float64 tensors are narrowed to float32 before tracing/execution."""
+        x = torch.randn(256, device=DEVICE, dtype=torch.float64)
+        y = torch.randn(256, device=DEVICE, dtype=torch.float64)
+        code, result = code_and_output(add_kernel, (x, y), block_size=128)
+        expected = x + y
+        torch.testing.assert_close(result, expected, rtol=1e-5, atol=1e-5)
+
+    def test_int64_inplace(self) -> None:
+        """Inplace mutation of int64 tensors must work with dtype narrowing.
+
+        The tensor is both input and output, so the cast creates an int32
+        copy, the kernel mutates it, and the copy-back restores the original.
+        """
+        x = torch.arange(256, device=DEVICE, dtype=torch.int64)
+        y = torch.ones(256, device=DEVICE, dtype=torch.int64)
+        expected = x + y
+        code, result = code_and_output(pallas_inplace_add, (x, y), block_size=256)
+        # x should be mutated in place with correct dtype
+        torch.testing.assert_close(x, expected)
 
 
 if __name__ == "__main__":
