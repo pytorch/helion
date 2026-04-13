@@ -541,7 +541,7 @@ class LFBOPatternSearch(PatternSearch):
             if new_flat != base:
                 neighbors.append(new_flat)
 
-        return self.shrink_neighbors(neighbors)
+        return self.shrink_neighbors(self._apply_numel_constraints(neighbors))
 
     def _pruned_pattern_search_from(
         self,
@@ -838,4 +838,4 @@ class LFBOTreeSearch(LFBOPatternSearch):
             if current_flat != base_list:
                 all_results.append(list(current_flat))
 
-        return all_results
+        return self._apply_numel_constraints(all_results)
