@@ -1271,6 +1271,7 @@ def _(state: CodegenState) -> list[object]:
     if_arg_ids = {arg.id for arg in if_args}
     union_args = if_args + [a for a in else_args if a.id not in if_arg_ids]
     arg_list_with_defaults = ", ".join(f"{n.id}={n.id}" for n in union_args)
+    if_return_names_str = ""
 
     if if_return_names:
         if_return_names_str = ", ".join(if_return_names)
@@ -1318,9 +1319,11 @@ def _(state: CodegenState) -> list[object]:
             )
         )
 
-    return [expr_from_string(n) for n in if_return_names] + [
-        expr_from_string(n) for n in else_return_names
-    ]
+    return cast(
+        "list[object]",
+        [expr_from_string(n) for n in if_return_names]
+        + [expr_from_string(n) for n in else_return_names],
+    )
 
 
 # Note we can't DCE phi nodes because there may be a loop carry dependency not captured in the outer graph

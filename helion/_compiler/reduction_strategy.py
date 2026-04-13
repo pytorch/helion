@@ -1236,27 +1236,11 @@ class BlockReductionStrategy(ReductionStrategy):
                 group_count=group_count,
             )
 
-        lane_in_group = f"(({lane_expr}) % {group_span})"
-        lane_mod_pre = f"(({lane_in_group}) % {pre})"
-        reduced_terms: list[str] = []
-        for p in range(pre):
-            masked_input_var = self.fn.new_var(f"strided_masked_input_{p}", dce=True)
-            reduced_var = self.fn.new_var(f"strided_reduced_{p}", dce=True)
-            state.add_statement(
-                f"{masked_input_var} = ({input_name}) if ({lane_mod_pre}) == {p} else ({identity_expr})"
-            )
-            # dim=0: reducing scalar per-thread values across warp lanes
-            reduction = backend.reduction_expr(
-                masked_input_var, reduction_type, 0, threads_in_group=group_span
-            )
-            state.add_statement(f"{reduced_var} = {reduction}")
-            reduced_terms.append(reduced_var)
-        selected_result = reduced_terms[0]
-        for p, reduced in enumerate(reduced_terms[1:], start=1):
-            selected_result = (
-                f"({reduced}) if ({lane_mod_pre}) == {p} else ({selected_result})"
-            )
-        return selected_result
+        return (
+            "_cute_grouped_reduce_warp("
+            f"{input_name}, {reduction_type!r}, {identity_expr}, {lane_expr}, "
+            f"pre={pre}, group_span={group_span})"
+        )
 
     def _strided_thread_reduction_expr_shared_two_stage(
         self,
@@ -1273,72 +1257,12 @@ class BlockReductionStrategy(ReductionStrategy):
         group_span: int,
         group_count: int,
     ) -> str:
-        backend = CompileEnvironment.current().backend
-        dtype = _dtype_str(fake_input.dtype)
-        warps_per_group = group_span // 32
-        partials_size = group_count * pre * warps_per_group
-        results_size = group_count * pre
-        smem_size = partials_size + results_size
-        smem_ptr_var = self.fn.new_var("strided_reduce_smem_ptr", dce=True)
-        smem_var = self.fn.new_var("strided_reduce_smem", dce=True)
-        group_id_var = self.fn.new_var("strided_group_id", dce=True)
-        lane_in_warp_var = self.fn.new_var("strided_lane_in_warp", dce=True)
-        warp_in_group_var = self.fn.new_var("strided_warp_in_group", dce=True)
-        partials_base_var = self.fn.new_var("strided_partials_base", dce=True)
-        results_base_var = self.fn.new_var("strided_results_base", dce=True)
-        state.add_statement(
-            f"{smem_ptr_var} = cute.arch.alloc_smem({dtype}, {smem_size})"
-        )
-        state.add_statement(
-            f"{smem_var} = cute.make_tensor({smem_ptr_var}, ({smem_size},))"
-        )
-        state.add_statement(f"{group_id_var} = ({lane_var}) // {group_span}")
-        state.add_statement(f"{lane_in_warp_var} = ({lane_var}) % 32")
-        state.add_statement(f"{warp_in_group_var} = ({lane_in_group_var}) // 32")
-        state.add_statement(
-            f"{partials_base_var} = ({group_id_var}) * {pre * warps_per_group}"
-        )
-        state.add_statement(
-            f"{results_base_var} = {partials_size} + ({group_id_var}) * {pre}"
-        )
-
-        for p in range(pre):
-            masked_input_var = self.fn.new_var(f"strided_masked_input_{p}", dce=True)
-            warp_partial_var = self.fn.new_var(f"strided_warp_partial_{p}", dce=True)
-            partial_idx_var = self.fn.new_var(f"strided_partial_idx_{p}", dce=True)
-            stage2_input_var = self.fn.new_var(f"strided_stage2_input_{p}", dce=True)
-            group_result_var = self.fn.new_var(f"strided_group_result_{p}", dce=True)
-            state.add_statement(
-                f"{masked_input_var} = ({input_name}) if ({lane_mod_pre_var}) == {p} else ({identity_expr})"
-            )
-            state.add_statement(
-                f"{warp_partial_var} = {backend.reduction_expr(masked_input_var, reduction_type, 0, threads_in_group=32)}"
-            )
-            state.add_statement(
-                f"{partial_idx_var} = ({partials_base_var}) + {p * warps_per_group} + ({warp_in_group_var})"
-            )
-            state.add_statement(
-                statement_from_string(
-                    f"""if ({lane_in_warp_var}) == 0:
-    {smem_var}[{partial_idx_var}] = {warp_partial_var}"""
-                )
-            )
-            state.add_statement("cute.arch.sync_threads()")
-
-            state.add_statement(
-                statement_from_string(
-                    f"""if ({warp_in_group_var}) == 0:
-    {stage2_input_var} = {smem_var}[({partials_base_var}) + {p * warps_per_group} + ({lane_in_warp_var})] if ({lane_in_warp_var}) < {warps_per_group} else ({identity_expr})
-    {group_result_var} = {backend.reduction_expr(stage2_input_var, reduction_type, 0, threads_in_group=32)}
-    if ({lane_in_warp_var}) == 0:
-        {smem_var}[({results_base_var}) + {p}] = {group_result_var}"""
-                )
-            )
-            state.add_statement("cute.arch.sync_threads()")
-
         result_var = self.fn.new_var("strided_reduce_result", dce=True)
         state.add_statement(
-            f"{result_var} = {smem_var}[({results_base_var}) + ({lane_mod_pre_var})]"
+            f"{result_var} = _cute_grouped_reduce_shared_two_stage("
+            f"{input_name}, {reduction_type!r}, {identity_expr}, "
+            f"{lane_var}, {lane_in_group_var}, {lane_mod_pre_var}, "
+            f"pre={pre}, group_span={group_span}, group_count={group_count})"
         )
         return result_var
 
@@ -1358,66 +1282,13 @@ class BlockReductionStrategy(ReductionStrategy):
         num_threads: int,
         group_count: int,
     ) -> str:
-        backend = CompileEnvironment.current().backend
-        dtype = _dtype_str(fake_input.dtype)
-        smem_size = num_threads + group_count * pre
-        smem_ptr_var = self.fn.new_var("strided_reduce_smem_ptr", dce=True)
-        smem_var = self.fn.new_var("strided_reduce_smem", dce=True)
-        group_base_var = self.fn.new_var("strided_group_base", dce=True)
-        group_id_var = self.fn.new_var("strided_group_id", dce=True)
-        result_base_var = self.fn.new_var("strided_result_base", dce=True)
-        state.add_statement(
-            f"{smem_ptr_var} = cute.arch.alloc_smem({dtype}, {smem_size})"
-        )
-        state.add_statement(
-            f"{smem_var} = cute.make_tensor({smem_ptr_var}, ({smem_size},))"
-        )
-        state.add_statement(f"{group_base_var} = ({lane_var}) - ({lane_in_group_var})")
-        state.add_statement(f"{group_id_var} = ({lane_var}) // {group_span}")
-        state.add_statement(
-            f"{result_base_var} = {num_threads} + ({group_id_var}) * {pre}"
-        )
-
-        for p in range(pre):
-            masked_input_var = self.fn.new_var(f"strided_masked_input_{p}", dce=True)
-            state.add_statement(
-                f"{masked_input_var} = ({input_name}) if ({lane_mod_pre_var}) == {p} else ({identity_expr})"
-            )
-            state.add_statement(f"{smem_var}[{lane_var}] = {masked_input_var}")
-            state.add_statement("cute.arch.sync_threads()")
-            stride = 1
-            while stride < group_span:
-                cond = (
-                    f"(({lane_in_group_var}) % {stride * 2}) == 0"
-                    f" and ({lane_in_group_var}) + {stride} < {group_span}"
-                )
-                lhs = f"{smem_var}[{lane_var}]"
-                rhs = (
-                    f"{smem_var}[({group_base_var}) + ({lane_in_group_var}) + {stride}]"
-                )
-                combined = backend.reduction_combine_expr(
-                    reduction_type, lhs, rhs, fake_input.dtype
-                )
-                state.add_statement(
-                    statement_from_string(
-                        f"""if {cond}:
-    {smem_var}[{lane_var}] = {combined}"""
-                    )
-                )
-                state.add_statement("cute.arch.sync_threads()")
-                stride *= 2
-
-            state.add_statement(
-                statement_from_string(
-                    f"""if ({lane_in_group_var}) == 0:
-    {smem_var}[({result_base_var}) + {p}] = {smem_var}[{lane_var}]"""
-                )
-            )
-            state.add_statement("cute.arch.sync_threads()")
-
         result_var = self.fn.new_var("strided_reduce_result", dce=True)
         state.add_statement(
-            f"{result_var} = {smem_var}[({result_base_var}) + ({lane_mod_pre_var})]"
+            f"{result_var} = _cute_grouped_reduce_shared_tree("
+            f"{input_name}, {reduction_type!r}, {identity_expr}, "
+            f"{lane_var}, {lane_in_group_var}, {lane_mod_pre_var}, "
+            f"pre={pre}, group_span={group_span}, "
+            f"num_threads={num_threads}, group_count={group_count})"
         )
         return result_var
 
