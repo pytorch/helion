@@ -2798,7 +2798,7 @@ class MetalBackend(Backend):
 
     @property
     def function_decorator(self) -> str:
-        return ""
+        return "metal_jit"
 
     @property
     def constexpr_type(self) -> str:
@@ -2819,6 +2819,7 @@ class MetalBackend(Backend):
                 "from helion.runtime import default_metal_launcher"
                 " as _default_metal_launcher"
             ),
+            "metal_jit": ("from helion._compiler.metal.metal_jit import metal_jit"),
         }
 
     def index_type_str(self, index_dtype: torch.dtype) -> str:
