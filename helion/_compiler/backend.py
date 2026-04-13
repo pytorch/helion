@@ -896,6 +896,18 @@ _TORCH_TO_JAX_DTYPE: dict[str, str] = {
 }
 
 
+# TPU does not natively support 64-bit element types; narrow to 32-bit.
+_PALLAS_DTYPE_NARROW: dict[torch.dtype, torch.dtype] = {
+    torch.int64: torch.int32,
+    torch.float64: torch.float32,
+}
+
+
+def pallas_narrow_dtype(dtype: torch.dtype) -> torch.dtype:
+    """Narrow 64-bit dtypes to 32-bit for TPU compatibility."""
+    return _PALLAS_DTYPE_NARROW.get(dtype, dtype)
+
+
 class PallasBackend(Backend):
     """Pallas (JAX) code generation backend for TPU."""
 
@@ -904,6 +916,7 @@ class PallasBackend(Backend):
         return "pallas"
 
     def dtype_str(self, dtype: torch.dtype) -> str:
+        dtype = pallas_narrow_dtype(dtype)
         key = str(dtype)
         if key not in _TORCH_TO_JAX_DTYPE:
             raise ValueError(f"Unsupported dtype for Pallas backend: {dtype}")

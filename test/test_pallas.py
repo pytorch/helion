@@ -787,6 +787,21 @@ class TestPallas(TestCase):
         # out is read after write, so it must be in _inplace_indices
         self.assertIn("_inplace_indices=[1]", code)
 
+    def test_int64_codegen_no_64bit_types(self) -> None:
+        """Codegen must not emit 64-bit JAX types (TPU rejects them).
+
+        Uses a reduction kernel so the generated code includes
+        convert_element_type and jnp.full with dtype arguments.
+        Only checks codegen, does not execute the kernel.
+        """
+        from helion.runtime.config import Config
+
+        x = torch.randint(0, 100, [32, 64], device=DEVICE, dtype=torch.int64)
+        bound = pallas_sum_reduction.bind((x,))
+        config = Config(block_sizes=[16])
+        code = bound.to_triton_code(config)
+        self.assertNotIn("jnp.int64", code)
+
 
 if __name__ == "__main__":
     unittest.main()
