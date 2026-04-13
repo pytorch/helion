@@ -3,10 +3,13 @@ from __future__ import annotations
 import functools
 import hashlib
 import itertools
+import logging
 import math
 import operator
 from typing import TYPE_CHECKING
 from typing import Any
+from typing import Callable
+from typing import NamedTuple
 from typing import cast
 
 import torch
@@ -44,6 +47,53 @@ if TYPE_CHECKING:
     from ..runtime.config import IndexingLiteral
     from ..runtime.config import PidTypeLiteral
     from .config_generation import ConfigGeneration
+
+log = logging.getLogger(__name__)
+
+
+class TensorNumelConstraint(NamedTuple):
+    """Tensor element count must stay within Triton's max numel limit."""
+
+    check_fn: Callable[..., bool]
+    block_indices: tuple[int, ...]
+    expr_str: str
+
+
+def shrink_block_sizes_for_numel_constraints(
+    constraints: list[TensorNumelConstraint],
+    block_sizes: list[int],
+    min_sizes: list[int],
+) -> None:
+    """Shrink *block_sizes* in-place so every *constraint* is satisfied.
+
+    Halves the largest involved block size first for balanced tiles.
+    Fixed-point loop handles cross-constraint interactions.
+    """
+    prev = list(block_sizes)
+    while True:
+        for constraint in constraints:
+            while not constraint.check_fn(
+                *(block_sizes[i] for i in constraint.block_indices)
+            ):
+                best_idx: int | None = None
+                best_val = -1
+                for i in constraint.block_indices:
+                    can_halve = block_sizes[i] // 2 >= min_sizes[i]
+                    if can_halve and block_sizes[i] > best_val:
+                        best_val = block_sizes[i]
+                        best_idx = i
+                if best_idx is None:
+                    log.warning(
+                        "tensor numel constraint unsatisfiable at minimum "
+                        "block sizes: %s",
+                        constraint.expr_str,
+                    )
+                    break
+                block_sizes[best_idx] //= 2
+        if block_sizes == prev:
+            break
+        prev = list(block_sizes)
+
 
 DEFAULT_NUM_WARPS = 4
 DEFAULT_NUM_STAGES = 1
@@ -171,6 +221,7 @@ class ConfigSpec:
         self.allowed_pid_types: tuple[PidTypeLiteral, ...] = tuple(VALID_PID_TYPES)
         self.max_num_sm_multiplier: int = MAX_NUM_SM_MULTIPLIER
         self.grid_block_ids: list[int] = []
+        self.tensor_numel_constraints: list[TensorNumelConstraint] = []
         self.load_eviction_policies = ListOf(
             EnumFragment(choices=get_valid_eviction_policies(self.backend_name)),
             length=0,
@@ -646,6 +697,7 @@ class ConfigSpec:
 
         if self.supports_config_key("range_warp_specializes"):
             config["range_warp_specializes"] = range_warp_specializes
+
         # Allow tunable parameter keys in addition to backend-supported keys.
         allowed_keys = self.supported_config_keys() | {
             *self.user_defined_tunables.keys()
@@ -705,7 +757,27 @@ class ConfigSpec:
         )
 
     def default_config(self) -> helion.Config:
-        return self.flat_config(lambda x: x.default())
+        config = self.flat_config(lambda x: x.default())
+        self._shrink_for_numel_constraints(config)
+        return config
+
+    def _shrink_for_numel_constraints(self, config: helion.Config) -> None:
+        """Shrink block_sizes in *config* in-place so every tensor numel
+        constraint is satisfied.
+        """
+        block_sizes = config.config.get("block_sizes")
+        if (
+            not isinstance(block_sizes, list)
+            or not block_sizes
+            or not self.tensor_numel_constraints
+        ):
+            return
+        min_sizes = [
+            max(self.block_sizes[i].min_size, 1) for i in range(len(block_sizes))
+        ]
+        shrink_block_sizes_for_numel_constraints(
+            self.tensor_numel_constraints, block_sizes, min_sizes
+        )
 
     def _flat_fields(
         self,

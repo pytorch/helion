@@ -12,6 +12,7 @@ from .._compat import warps_to_threads
 from .config_fragment import Category
 from .config_fragment import ConfigSpecFragment
 from .config_fragment import PowerOfTwoFragment
+from .config_spec import shrink_block_sizes_for_numel_constraints
 from helion._dist_utils import sync_seed
 
 if TYPE_CHECKING:
@@ -162,6 +163,20 @@ class ConfigGeneration:
             1,
         )
 
+    def _shrink_for_numel_constraints(self, flat_config: FlatConfig) -> None:
+        """Shrink block sizes in flat_config to satisfy numel constraints."""
+        constraints = self.config_spec.tensor_numel_constraints
+        if not constraints:
+            return
+        block_sizes = [cast("int", flat_config[i]) for i in self.block_size_indices]
+        min_sizes = [
+            max(self.flat_spec[i].get_minimum(), self.min_block_size)
+            for i in self.block_size_indices
+        ]
+        shrink_block_sizes_for_numel_constraints(constraints, block_sizes, min_sizes)
+        for idx, fi in enumerate(self.block_size_indices):
+            flat_config[fi] = block_sizes[idx]
+
     def shrink_config(
         self, flat_config: FlatConfig, max_elements_per_thread: int
     ) -> None:
@@ -191,6 +206,7 @@ class ConfigGeneration:
                     changes += 1
             if changes == 0:
                 break
+        self._shrink_for_numel_constraints(flat_config)
 
     def default_flat(self) -> FlatConfig:
         """
@@ -199,7 +215,9 @@ class ConfigGeneration:
         Returns:
             The default flat configuration values.
         """
-        return [spec.default() for spec in self.flat_spec]
+        config = [spec.default() for spec in self.flat_spec]
+        self._shrink_for_numel_constraints(config)
+        return config
 
     def random_flat(self) -> FlatConfig:
         """
