@@ -2959,6 +2959,7 @@ class MetalBackend(Backend):
     _SUPPORTED_CONFIG_KEYS: frozenset[str] = frozenset(
         {
             "block_sizes",
+            "num_threads",
             "num_warps",
         }
     )
@@ -3013,13 +3014,46 @@ class MetalBackend(Backend):
     def cast_expr(self, expr_str: str, dtype_str: str) -> str:
         return f"static_cast<{dtype_str}>({expr_str})"
 
+    def lane_index_expr(
+        self, offset_var: str, elements_per_thread: int, *, axis: int
+    ) -> str:
+        return f"{offset_var} + tid[{axis}] * {elements_per_thread}"
+
+    def lane_offset_expr(self, lane_var: str) -> str:
+        return lane_var
+
     def program_id_expr(self, dim: int, *, index_dtype: str) -> str:
         return f"tgid[{dim}]"
 
     def grid_index_expr(
         self, offset_var: str, block_size_var: str, dtype: str, *, axis: int
     ) -> str:
+        if block_size_var == "1":
+            return offset_var
         return f"{offset_var} + tid[{axis}]"
+
+    def loop_index_expr(
+        self, offset_var: str, block_size_var: str, dtype: str, *, axis: int
+    ) -> str:
+        if block_size_var == "1":
+            return offset_var
+        return f"{offset_var} + tid[{axis}]"
+
+    def arange_expr(
+        self,
+        offsets_var: str,
+        lid: str,
+        block_size_var: str,
+        dtype: str,
+        *,
+        axis: int = 0,
+    ) -> str:
+        return f"{offsets_var} = ({lid}) * ({block_size_var}) + tid[{axis}]"
+
+    def thread_in_tile_mask_expr(
+        self, block_size_var: str, *, axis: int = 0
+    ) -> str | None:
+        return f"tid[{axis}] < ({block_size_var})"
 
     def force_tile_mask(self) -> bool:
         return True
@@ -3092,3 +3126,38 @@ class MetalBackend(Backend):
 
         dims = tuple(DeviceFunction.current().codegen.max_thread_block_dims)
         return [f"_block_dims=({dims[0]}, {dims[1]}, {dims[2]})"]
+
+    def build_launcher_args(
+        self,
+        args: list[str],
+        *,
+        tensor_host_args: list[str],
+        has_rng_ops: bool,
+        config: Config,
+        has_barrier: bool,
+        sorted_args: list[Argument] | None = None,
+    ) -> list[str]:
+        if has_rng_ops:
+            raise exc.BackendUnsupported(self.name, "RNG ops")
+        return [*args, *self.launcher_keyword_args(config, has_barrier=has_barrier)]
+
+    def create_loop_strategy(
+        self, fn: DeviceFunction, block_ids: list[int], config: Config
+    ) -> TileStrategy:
+        """Metal loop strategy: delegate to CuTe.
+
+        Metal and CuTe share the same scalar-thread execution model
+        (one element per thread, cooperative hardware primitives for
+        matmul), so they use the same CuteND/CuteFlattenedTileStrategy
+        with the same thread budget management, inactive block ID
+        filtering, and auto-capping logic.
+
+        Note: CuTe's flattened path raises ``BackendUnsupported("thread
+        block too large")`` when ``block_size * num_threads > 1024``
+        (the ND path auto-caps via ``_shrink_auto_thread_counts`` —
+        this asymmetry is a CuTe bug to be fixed in a follow-up).
+        Metal inherits this behavior for now; users hitting the error
+        should pick a smaller ``block_sizes`` value.
+        """
+        # pyrefly: ignore[bad-argument-type]
+        return CuteBackend.create_loop_strategy(self, fn, block_ids, config)
