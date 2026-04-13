@@ -1805,6 +1805,18 @@ def _count_device_loads_and_stores(device_ir: DeviceIR) -> tuple[int, int, int]:
     return total_load_count, loads_without_eviction_policy, store_count
 
 
+def _count_device_atomics(device_ir: DeviceIR) -> int:
+    """Count the number of atomic operations in device code for autotuning."""
+    from ..language import atomic_ops
+
+    atomic_count = 0
+    for graph_info in device_ir.graphs:
+        for node in graph_info.graph.nodes:
+            if node.op == "call_function" and node.target in vars(atomic_ops).values():
+                atomic_count += 1
+    return atomic_count
+
+
 def _register_load_store_tunables(
     total_load_count: int, loads_without_eviction_policy: int, store_count: int
 ) -> None:
@@ -1839,6 +1851,21 @@ def _register_load_store_tunables(
             EnumFragment(choices=env.config_spec.valid_indexing_types()),
             length=total_count,
         )
+
+
+def _register_atomic_tunables(atomic_count: int) -> None:
+    """Register atomic_indexing tunable for all atomic operations."""
+    if atomic_count == 0:
+        return
+
+    from ..autotuner.config_fragment import EnumFragment
+    from ..autotuner.config_fragment import ListOf
+
+    env = CompileEnvironment.current()
+    env.config_spec.atomic_indexing = ListOf(
+        EnumFragment(choices=env.config_spec.valid_atomic_indexing_types()),
+        length=atomic_count,
+    )
 
 
 def lower_to_device_ir(func: HostFunction) -> DeviceIR:
@@ -1902,6 +1929,7 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
         _register_load_store_tunables(
             total_load_count, loads_without_eviction_policy, store_count
         )
+        _register_atomic_tunables(_count_device_atomics(device_ir))
 
         return device_ir
 

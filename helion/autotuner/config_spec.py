@@ -147,6 +147,7 @@ VALID_KEYS: frozenset[str] = frozenset(
         "num_sm_multiplier",
         "maxnreg",
         "indexing",
+        "atomic_indexing",
         "load_eviction_policies",
         "pallas_loop_type",
         *BACKEND_TUNABLE_KEYS,
@@ -228,6 +229,10 @@ class ConfigSpec:
         )
         self.indexing = ListOf(
             EnumFragment(choices=self.valid_indexing_types()),
+            length=0,
+        )
+        self.atomic_indexing = ListOf(
+            EnumFragment(choices=self.valid_atomic_indexing_types()),
             length=0,
         )
         self.epilogue_subtile_candidate_enabled: bool = False
@@ -323,6 +328,12 @@ class ConfigSpec:
         if not self.backend.supports_block_ptr_indexing():
             return ("pointer",)
         return ("pointer", "block_ptr")
+
+    def valid_atomic_indexing_types(self) -> tuple[IndexingLiteral, ...]:
+        """Atomic ops only support pointer and tensor_descriptor (no block_ptr)."""
+        if supports_tensor_descriptor():
+            return ("pointer", "tensor_descriptor")
+        return ("pointer",)
 
     def _remove_duplicates(self) -> None:
         self.num_threads._remove_duplicates()
@@ -501,6 +512,7 @@ class ConfigSpec:
             "static_ranges",
             "load_eviction_policies",
             "indexing",
+            "atomic_indexing",
         ):
             if not config.get(name):
                 config.pop(name, None)
@@ -511,6 +523,7 @@ class ConfigSpec:
             "num_stages",
             "load_eviction_policies",
             "indexing",
+            "atomic_indexing",
             "pid_type",
             "num_sm_multiplier",
             "maxnreg",
@@ -528,6 +541,8 @@ class ConfigSpec:
             )
         if self.supports_config_key("indexing"):
             config.setdefault("indexing", self.indexing.default())
+        if self.supports_config_key("atomic_indexing"):
+            config.setdefault("atomic_indexing", self.atomic_indexing.default())
         for key, fragment in self.backend_tunable_fragments.items():
             config.setdefault(key, fragment.default())
         if self.has_pallas_inner_loops:
@@ -835,6 +850,8 @@ class ConfigSpec:
             fields["num_stages"] = num_stages_fragment
         if self.supports_config_key("indexing"):
             fields["indexing"] = self.indexing
+        if self.supports_config_key("atomic_indexing"):
+            fields["atomic_indexing"] = self.atomic_indexing
         if self.supports_config_key("pid_type"):
             fields["pid_type"] = EnumFragment(self.allowed_pid_types)
         if self.supports_config_key("num_sm_multiplier"):
@@ -924,6 +941,7 @@ class ConfigSpec:
             "static_ranges",
             "load_eviction_policies",
             "indexing",
+            "atomic_indexing",
         ):
             if not config.get(name):
                 config.pop(name, None)
