@@ -78,6 +78,17 @@ class ReadWrites(typing.NamedTuple):
             visitor.visit(node)
         return visitor.rw
 
+    def read_and_write_name_frozensets(self) -> tuple[frozenset[str], frozenset[str]]:
+        """Pair of (read names, write names) for inter-loop / barrier metadata.
+
+        Writes include both assignment targets and in-place / atomic updates
+        (``inplace_writes``), matching :meth:`ReadWrites.from_ast` on a device
+        ``for`` node.
+        """
+        reads = frozenset(self.reads.keys())
+        writes = frozenset({*self.writes.keys(), *self.inplace_writes.keys()})
+        return reads, writes
+
     @staticmethod
     def from_ast(node: ast.AST) -> ReadWrites:
         """
