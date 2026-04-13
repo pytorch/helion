@@ -896,6 +896,10 @@ _TORCH_TO_JAX_DTYPE: dict[str, str] = {
 }
 
 
+# TPU does not natively support 64-bit element types.
+_PALLAS_UNSUPPORTED_DTYPES = frozenset({torch.int64, torch.uint64, torch.float64})
+
+
 class PallasBackend(Backend):
     """Pallas (JAX) code generation backend for TPU."""
 
@@ -1177,6 +1181,10 @@ class PallasBackend(Backend):
             tensor_ndim (int): Amount of dimensions for the tensor.
             bitwidth (int): Bitwidth of tensor elements
         """
+        # Cap to 32: wider dtypes (e.g. float64, int64) would cause
+        # ZeroDivisionError in 32 // bitwidth.  64-bit types are rejected
+        # at runtime, so block spec computation uses 32-bit alignment.
+        bitwidth = min(bitwidth, 32)
         if dim_from_end == 0:  # Last dimension
             if tensor_ndim <= 1:
                 return 128 * (32 // bitwidth)

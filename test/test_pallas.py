@@ -787,6 +787,13 @@ class TestPallas(TestCase):
         # out is read after write, so it must be in _inplace_indices
         self.assertIn("_inplace_indices=[1]", code)
 
+    def test_int64_tensor_raises(self) -> None:
+        """Passing int64 tensors to a Pallas kernel should raise TypeError."""
+        x = torch.arange(256, device=DEVICE, dtype=torch.int64)
+        y = torch.arange(256, device=DEVICE, dtype=torch.int64)
+        with self.assertRaises(TypeError, msg="does not support"):
+            code_and_output(add_kernel, (x, y), block_size=128)
+
 
 if __name__ == "__main__":
     unittest.main()
