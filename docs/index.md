@@ -66,6 +66,7 @@ portable between different hardware. Helion automates and autotunes over:
     * PID swizzling for improved L2 cache reuse.
     * Loop reordering.
     * Persistent kernel strategies.
+    * Epilogue subtiling for matmul-heavy kernels (Blackwell GPUs).
     * Warp specialization choices, unrolling, and more.
 
 ## Try Helion Now
