@@ -154,7 +154,10 @@ class ConfigGeneration:
             advanced_controls_files=self._advanced_controls_files,
         )
         assert next(count) == len(flat_values)
-        return self._apply_overrides(config)
+        config = self._apply_overrides(config)
+        # Overrides may reintroduce pointer stores that break subtiled outputs
+        self.config_spec.fix_epilogue_subtile_store_indexing(config.config)
+        return config
 
     def block_numel(self, flat_config: FlatConfig) -> int:
         return functools.reduce(
