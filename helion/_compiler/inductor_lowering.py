@@ -1398,4 +1398,4 @@ class CodegenState(NamedTuple):
         constraint = self.fx_node.meta.get(META_KEY)
         if constraint is None:
             return None
-        return constraint.layout  # type: ignore[return-value]
+        return constraint.primary_layout()  # type: ignore[return-value]

@@ -1,10 +1,15 @@
-"""Layout propagation pass for the CuTe backend.
+"""Layout planning pass for the CuTe backend.
 
 Walks the Device IR graphs and:
-  1. Seeds constrained nodes (loads, stores, reductions) with preferred layouts.
-  2. Propagates layouts forward through unconstrained (pointwise) nodes.
-  3. Propagates layouts backward so producers adopt consumers' layouts.
-  4. Detects remaining conflicts and inserts ``_cute_layout_change`` nodes.
+  1. Seeds constrained nodes (loads, stores, reductions) with preferred input
+     and/or output layouts.
+  2. Propagates passthrough layouts forward through unconstrained pointwise
+     nodes.
+  3. Propagates consumer input layouts backward so flexible producers adopt
+     them.
+  4. Resolves authoritative input/output layouts.
+  5. Detects remaining conflicts and inserts ``_cute_layout_change`` nodes.
+  6. Rejects unresolved producer-output -> consumer-input mismatches early.
 """
 
 from __future__ import annotations
@@ -14,6 +19,10 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from ... import exc
+from ...language import _tracing_ops
+from ...language import memory_ops
+from ...language import reduce_ops
 from .layout import LayoutConstraint
 from .layout import LayoutTag
 from .layout import ThreadLayout
@@ -43,7 +52,8 @@ def plan_layouts(
 
     This annotates every relevant node with a ``LayoutConstraint`` in
     ``node.meta["cute_layout_constraint"]`` and inserts
-    ``_cute_layout_change`` nodes where needed.
+    ``_cute_layout_change`` nodes where needed. Any remaining mismatch on a
+    producer-output -> consumer-input edge is rejected before lowering.
 
     Args:
         graphs: Codegen graph copies to annotate.
@@ -57,6 +67,7 @@ def plan_layouts(
         _backward_propagate(graph_info)
         _resolve_layouts(graph_info)
         _insert_layout_changes(graph_info)
+        _validate_layout_contracts(graph_info)
 
     _validate_thread_budget_graphs(graphs)
 
@@ -83,24 +94,22 @@ def _seed_constraints(
 
 
 def _forward_propagate(graph_info: GraphInfo) -> None:
-    """Unconstrained nodes inherit layout from their first tensor input."""
+    """Passthrough tensor ops inherit layout from their first tensor input."""
     for node in graph_info.graph.nodes:
-        if node.op != "call_function":
+        if not _is_passthrough_layout_node(node):
             continue
-        if META_KEY in node.meta:
-            continue  # already has a constraint
-
-        # Check if this node produces a tensor
         val = node.meta.get("val")
         if not isinstance(val, torch.Tensor):
             continue
+        constraint = _constraint_for_node(node)
+        if constraint.preferred_output is not None:
+            continue
 
-        # Try to inherit from the first input that has a layout
         layout = _first_input_layout(node)
         if layout is not None:
-            node.meta[META_KEY] = LayoutConstraint(
-                preferred=layout.with_tag(LayoutTag.INHERITED),
-            )
+            inherited = layout.with_tag(LayoutTag.INHERITED)
+            constraint.preferred_input = inherited
+            constraint.preferred_output = inherited
 
 
 # ---------------------------------------------------------------------------
@@ -117,22 +126,28 @@ def _backward_propagate(graph_info: GraphInfo) -> None:
     pointwise) adopt backward-propagated layouts.
     """
     for node in reversed(list(graph_info.graph.nodes)):
-        if node.op != "call_function":
+        if not _is_output_flexible_layout_node(node):
             continue
-        constraint = node.meta.get(META_KEY)
-        if constraint is not None and constraint.required:
+        val = node.meta.get("val")
+        if not isinstance(val, torch.Tensor):
+            continue
+        constraint = _constraint_for_node(node)
+        if constraint.required:
             continue  # non-negotiable
 
         # Don't backward-propagate through nodes with semantic preferences
         # (reductions need threads along the reduction axis).
-        if constraint is not None and constraint.preferred is not None:
-            if constraint.preferred.tag in (
+        if (
+            constraint.preferred_output is not None
+            and constraint.preferred_output.tag
+            in (
                 LayoutTag.REDUCTION,
                 LayoutTag.MMA_OPERAND_A,
                 LayoutTag.MMA_OPERAND_B,
                 LayoutTag.MMA_ACCUMULATOR,
-            ):
-                continue
+            )
+        ):
+            continue
 
         user_layouts = _collect_user_layouts(node)
         if not user_layouts:
@@ -141,12 +156,10 @@ def _backward_propagate(graph_info: GraphInfo) -> None:
         # All users agree on the same layout?
         first = user_layouts[0]
         if all(first.is_compatible(ul) for ul in user_layouts[1:]):
-            # Adopt the users' layout if we don't have a semantic constraint
             inherited = first.with_tag(LayoutTag.INHERITED)
-            if constraint is None:
-                node.meta[META_KEY] = LayoutConstraint(preferred=inherited)
-            else:
-                constraint.preferred = inherited
+            if _is_passthrough_layout_node(node):
+                constraint.preferred_input = inherited
+            constraint.preferred_output = inherited
 
 
 # ---------------------------------------------------------------------------
@@ -155,11 +168,15 @@ def _backward_propagate(graph_info: GraphInfo) -> None:
 
 
 def _resolve_layouts(graph_info: GraphInfo) -> None:
-    """Copy ``preferred`` into ``layout`` for every annotated node."""
+    """Resolve authoritative input/output layouts for every annotated node."""
     for node in graph_info.graph.nodes:
         constraint = node.meta.get(META_KEY)
-        if constraint is not None and constraint.preferred is not None:
-            constraint.layout = constraint.preferred
+        if constraint is None:
+            continue
+        if constraint.preferred_input is not None:
+            constraint.input_layout = constraint.preferred_input
+        if constraint.preferred_output is not None:
+            constraint.output_layout = constraint.preferred_output
 
 
 # ---------------------------------------------------------------------------
@@ -174,15 +191,15 @@ def _insert_layout_changes(graph_info: GraphInfo) -> None:
     nodes = list(graph_info.graph.nodes)  # snapshot — we mutate the graph
     for node in nodes:
         producer_lc = node.meta.get(META_KEY)
-        if producer_lc is None or producer_lc.layout is None:
+        if producer_lc is None or producer_lc.output_layout is None:
             continue
-        producer_layout = producer_lc.layout
+        producer_layout = producer_lc.output_layout
 
         for user in list(node.users):
             user_lc = user.meta.get(META_KEY)
-            if user_lc is None or user_lc.layout is None:
+            if user_lc is None or user_lc.input_layout is None:
                 continue
-            consumer_layout = user_lc.layout
+            consumer_layout = user_lc.input_layout
 
             if producer_layout.is_compatible(consumer_layout):
                 continue
@@ -221,8 +238,10 @@ def _insert_layout_changes(graph_info: GraphInfo) -> None:
                 if "location" in node.meta:
                     change_node.meta["location"] = node.meta["location"]
                 change_node.meta[META_KEY] = LayoutConstraint(
-                    preferred=consumer_layout,
-                    layout=consumer_layout,
+                    preferred_input=producer_layout,
+                    preferred_output=consumer_layout,
+                    input_layout=producer_layout,
+                    output_layout=consumer_layout,
                 )
                 change_node.meta["cute_layout_change_src"] = producer_layout
 
@@ -241,6 +260,34 @@ def _insert_layout_changes(graph_info: GraphInfo) -> None:
                     consumer_layout.tag.value,
                     user.name,
                 )
+
+
+def _validate_layout_contracts(graph_info: GraphInfo) -> None:
+    """Reject unresolved producer-output -> consumer-input mismatches."""
+    for node in graph_info.graph.nodes:
+        producer_lc = node.meta.get(META_KEY)
+        if producer_lc is None or producer_lc.output_layout is None:
+            continue
+        producer_layout = producer_lc.output_layout
+        for user in node.users:
+            user_lc = user.meta.get(META_KEY)
+            if user_lc is None or user_lc.input_layout is None:
+                continue
+            if user.target is reduce_ops._reduce:
+                # Reduction lowering still has custom fallbacks for arbitrary
+                # producer layouts, so a missed relayout here is not fatal.
+                continue
+            consumer_layout = user_lc.input_layout
+            if producer_layout.is_compatible(consumer_layout):
+                continue
+            raise exc.BackendUnsupported(
+                "cute",
+                (
+                    "unresolved CuTe layout mismatch between "
+                    f"{node.name} ({producer_layout.tag.value}) and "
+                    f"{user.name} ({consumer_layout.tag.value})"
+                ),
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -268,24 +315,54 @@ def _validate_thread_budget_graphs(graphs: list[GraphInfo]) -> None:
 
 
 def _first_input_layout(node: torch.fx.Node) -> ThreadLayout | None:
-    """Return the resolved (or preferred) layout of node's first annotated input."""
+    """Return the preferred/resolved output layout of the first input."""
     for inp in node.all_input_nodes:
         lc = inp.meta.get(META_KEY)
-        if lc is not None:
-            return lc.layout or lc.preferred
+        if lc is None:
+            continue
+        layout = lc.output_layout or lc.preferred_output
+        if layout is not None:
+            return layout
     return None
 
 
 def _collect_user_layouts(node: torch.fx.Node) -> list[ThreadLayout]:
-    """Collect resolved/preferred layouts from all users of *node*."""
+    """Collect preferred/resolved consumer input layouts from all users."""
     layouts: list[ThreadLayout] = []
     for user in node.users:
         lc = user.meta.get(META_KEY)
-        if lc is not None:
-            layout = lc.layout or lc.preferred
-            if layout is not None:
-                layouts.append(layout)
+        if lc is None:
+            continue
+        layout = lc.input_layout or lc.preferred_input
+        if layout is not None:
+            layouts.append(layout)
     return layouts
+
+
+def _constraint_for_node(node: torch.fx.Node) -> LayoutConstraint:
+    constraint = node.meta.get(META_KEY)
+    if constraint is None:
+        constraint = LayoutConstraint()
+        node.meta[META_KEY] = constraint
+    return constraint
+
+
+def _is_passthrough_layout_node(node: torch.fx.Node) -> bool:
+    if node.op != "call_function":
+        return False
+    if node.target is memory_ops.load or node.target is memory_ops.store:
+        return False
+    if node.target is reduce_ops._reduce:
+        return False
+    return not _tracing_ops.is_for_loop_target(node.target)
+
+
+def _is_output_flexible_layout_node(node: torch.fx.Node) -> bool:
+    if node.op != "call_function":
+        return False
+    if node.target is memory_ops.store or node.target is reduce_ops._reduce:
+        return False
+    return not _tracing_ops.is_for_loop_target(node.target)
 
 
 def _tile_numels_match(a: ThreadLayout, b: ThreadLayout) -> bool:

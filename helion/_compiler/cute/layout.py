@@ -172,11 +172,29 @@ class ThreadLayout:
 class LayoutConstraint:
     """Attached to a node via ``node.meta["cute_layout_constraint"]``.
 
-    * *preferred* -- the layout this node ideally wants (set by rules).
-    * *layout*    -- the resolved layout (set by the planner after propagation).
-    * *required*  -- if True the layout is non-negotiable (e.g. MMA atoms).
+    Layouts are tracked per edge direction:
+
+    * *preferred_input* / *input_layout* describe how this node consumes tensor
+      inputs.
+    * *preferred_output* / *output_layout* describe how this node produces its
+      tensor output.
+    * *required* marks the constraint as non-negotiable for propagation.
+
+    Pointwise / passthrough ops typically resolve both sides to the same
+    layout. Ops like ``load`` only have an output layout, while ``store`` and
+    ``reduce`` only have an input layout.
     """
 
-    preferred: ThreadLayout | None = None
-    layout: ThreadLayout | None = None
+    preferred_input: ThreadLayout | None = None
+    preferred_output: ThreadLayout | None = None
+    input_layout: ThreadLayout | None = None
+    output_layout: ThreadLayout | None = None
     required: bool = False
+
+    def primary_layout(self) -> ThreadLayout | None:
+        """Return the node's main resolved layout for logging/debugging."""
+        return self.input_layout or self.output_layout
+
+    def primary_preferred_layout(self) -> ThreadLayout | None:
+        """Return the node's main preferred layout for logging/debugging."""
+        return self.preferred_input or self.preferred_output
