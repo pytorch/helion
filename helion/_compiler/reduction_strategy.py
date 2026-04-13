@@ -13,7 +13,6 @@ from torch._inductor.runtime.runtime_utils import next_power_of_2
 from torch._prims_common import get_computation_dtype
 
 from .._compat import shape_env_size_hint
-from ..autotuner.config_fragment import integer_power_of_two
 from .ast_extension import create
 from .ast_extension import expr_from_string
 from .ast_extension import statement_from_string
@@ -339,10 +338,18 @@ class PersistentReductionStrategy(ReductionStrategy):
 
         env = CompileEnvironment.current()
         numel = env.block_sizes[block_index].numel
-        if isinstance(numel, (int, sympy.Integer)) and integer_power_of_two(int(numel)):
-            mask_var: str | None = None
-        else:
-            mask_var = fn.new_var(f"mask_{block_index}", dce=True)
+        # Skip the mask when RDIM_SIZE == numel (no padding needed).
+        # This is true when numel is a power of 2 (Triton doesn't round),
+        # or when the backend uses exact RDIM sizes (e.g., Pallas).
+        needs_mask = True
+        # Guard numel > 0: on PyTorch 2.9, next_power_of_2(0) returns 0
+        # (the n <= 0 guard was added later), so static_rdim_size(0) == 0
+        # would incorrectly skip the mask for zero-size reductions.
+        if isinstance(numel, (int, sympy.Integer)) and int(numel) > 0:
+            needs_mask = env.backend.static_rdim_size(int(numel)) != int(numel)
+        mask_var: str | None = (
+            fn.new_var(f"mask_{block_index}", dce=True) if needs_mask else None
+        )
         super().__init__(
             fn=fn,
             block_index=block_index,
