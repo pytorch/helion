@@ -31,6 +31,7 @@ from .helper_function import CodegenInterface
 from .inductor_lowering import CodegenState
 from .inductor_lowering import codegen_call_with_graph
 from .loop_dependency_checker import LoopDependencyChecker
+from .loop_dependency_checker import needs_inter_loop_debug_barrier_for_global_raw
 from .output_header import get_needed_import_lines
 from .program_id import ForEachProgramID
 from .tile_strategy import DeviceGridState
@@ -353,13 +354,12 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         )
         need_barrier = False
         if use_triton_barrier and self._last_emitted_device_loop:
-            if self._inter_loop_prev_unknown:
-                need_barrier = True
-            else:
-                cur_global_reads = self._global_barrier_tensor_names(host_loop_reads)
-                need_barrier = bool(
-                    self._inter_loop_prev_global_writes & cur_global_reads
-                )
+            need_barrier = needs_inter_loop_debug_barrier_for_global_raw(
+                self._inter_loop_prev_global_writes,
+                host_loop_reads,
+                global_barrier_tensor_names=self._global_barrier_tensor_names,
+                prev_metadata_unknown=self._inter_loop_prev_unknown,
+            )
 
         with self.set_statements(device_loop.inner_statements):
             for idx in device_loop.block_ids:

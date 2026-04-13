@@ -1242,8 +1242,7 @@ class WalkDeviceAST(NodeVisitor):
                 assert isinstance(var, (TileIndexType, GridIndexType))
                 block_ids.append(var.block_id)
 
-            host_reads = frozenset(rw.reads.keys())
-            host_writes = frozenset({*rw.writes.keys(), *rw.inplace_writes.keys()})
+            host_reads, host_writes = rw.read_and_write_name_frozensets()
             graph_idx, outputs = self._trace_graph(
                 inputs,
                 build_subgraph,

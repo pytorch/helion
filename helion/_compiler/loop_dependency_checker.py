@@ -8,6 +8,24 @@ from .ast_read_writes import ReadWrites
 
 if TYPE_CHECKING:
     import ast
+    from collections.abc import Callable
+
+
+def needs_inter_loop_debug_barrier_for_global_raw(
+    prev_global_writes: set[str],
+    host_loop_reads: frozenset[str],
+    *,
+    global_barrier_tensor_names: Callable[[frozenset[str]], set[str]],
+    prev_metadata_unknown: bool,
+) -> bool:
+    """Whether to emit ``tl.debug_barrier()`` before the next sequential device loop.
+    When the previous loop's write set could not be classified, or reduction
+    metadata is unknown, we conservatively insert a barrier.
+    """
+    if prev_metadata_unknown:
+        return True
+    cur_global_reads = global_barrier_tensor_names(host_loop_reads)
+    return bool(prev_global_writes & cur_global_reads)
 
 
 class LoopDependencyChecker:
