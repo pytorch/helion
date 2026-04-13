@@ -12,6 +12,7 @@ from helion._testing import HALF_DTYPE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
+from helion._testing import skipIfMetal
 from helion._testing import skipUnlessTensorDescriptor
 from helion._testing import xfailIfPallas
 import helion.language as hl
@@ -120,6 +121,7 @@ class TestGrid(RefEagerTestBase, TestCase):
         )
         torch.testing.assert_close(result, grid_2d_pytorch(args[0], args[1]))
 
+    @skipIfMetal("aten.addmm not yet registered for Metal backend")
     def test_grid_2d_idx_nested(self):
         @helion.kernel(static_shapes=True)
         def grid_2d_idx_nested(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -281,6 +283,7 @@ class TestGrid(RefEagerTestBase, TestCase):
         code, result = code_and_output(tile_begin_end, (x,), block_size=4)
         torch.testing.assert_close(result, tile_begin_end_pytorch(x))
 
+    @skipIfMetal("Metal does not support loop_index_expr for grid loops")
     def test_range_as_grid_basic(self):
         """Test that range() works as an alias for hl.grid() in device code."""
 
@@ -301,6 +304,7 @@ class TestGrid(RefEagerTestBase, TestCase):
         code, result = code_and_output(range_kernel, (x,))
         torch.testing.assert_close(result, expected)
 
+    @skipIfMetal("Metal does not support loop_index_expr for grid loops")
     def test_range_with_begin_end(self):
         """Test that range(begin, end) works as alias for hl.grid(begin, end)."""
 
@@ -321,6 +325,7 @@ class TestGrid(RefEagerTestBase, TestCase):
         code, result = code_and_output(range_begin_end_kernel, (x,))
         torch.testing.assert_close(result, expected)
 
+    @skipIfMetal("Metal does not support loop_index_expr for grid loops")
     def test_range_with_step(self):
         """Test that range(begin, end, step) works as alias for hl.grid(begin, end, step)."""
 
@@ -343,6 +348,7 @@ class TestGrid(RefEagerTestBase, TestCase):
         code, result = code_and_output(range_step_kernel, (x,))
         torch.testing.assert_close(result, expected)
 
+    @skipIfMetal("Metal does not support loop_index_expr for grid loops")
     def test_range_with_tensor_size(self):
         """Test that range(tensor.size(dim)) works with dynamic tensor dimensions."""
 

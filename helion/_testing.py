@@ -239,6 +239,8 @@ elif torch.xpu.is_available():
     DEVICE = torch.device("xpu")
 elif _has_mtia_runtime():
     DEVICE = torch.device("mtia")
+elif _get_backend() == "metal" and torch.backends.mps.is_available():
+    DEVICE = torch.device("mps")
 else:
     DEVICE = torch.device("cuda")
 
@@ -287,6 +289,11 @@ def skipIfTileIR(reason: str) -> Callable[[Callable], Callable]:
     """Skip test if running with tileir"""
     # Defers check to test execution time to avoid CUDA init during pytest-xdist collection.
     return skipIfFn(lambda: _get_backend() == "tileir", reason)
+
+
+def skipIfMetal(reason: str) -> Callable[[Callable], Callable]:
+    """Skip test if running with metal"""
+    return skipIfFn(lambda: _get_backend() == "metal", reason)
 
 
 def skipIfPallas(reason: str) -> Callable[[Callable], Callable]:
