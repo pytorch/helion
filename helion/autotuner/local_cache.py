@@ -152,6 +152,12 @@ class LocalAutotuneCache(AutotuneCacheBase):
         elif dev.type == "cpu" and self.kernel.kernel.settings.backend == "pallas":
             hardware = "pallas_interpret"
             runtime_name = "interpret"
+        elif dev.type == "mtia":
+            hardware = hardware or "mtia"
+            try:
+                runtime_name = str(torch.mtia.get_device_properties(dev))
+            except Exception:
+                runtime_name = "unknown"
 
         assert hardware is not None and runtime_name is not None
         config_spec_hash = self.kernel.config_spec.structural_fingerprint_hash()
