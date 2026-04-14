@@ -214,6 +214,145 @@ class TestGridFission(TestCase):
         )
         torch.testing.assert_close(result, x + y)
 
+    def test_all_dims_fissioned_rejects(self):
+        """Fissioning ALL dims collapses the grid to 1 → InvalidConfig."""
+        from helion.exc import InvalidConfig
+
+        x = torch.randn(64, 64, device=DEVICE)
+        y = torch.randn(64, 64, device=DEVICE)
+        with self.assertRaises(InvalidConfig):
+            code_and_output(
+                add_2d_kernel,
+                (x, y),
+                block_sizes=[32, 32],
+                grid_fissions=[[-1, -1]],
+            )
+
+
+class TestGridFissionGridSize(TestCase):
+    """Verify that grid fission actually reduces the GPU launch grid."""
+
+    @staticmethod
+    def _extract_grid_size(code: str) -> int:
+        """Evaluate the grid tuple from the generated launcher call.
+
+        Parses ``_launcher(_kernel, (expr,), ...)`` and evaluates the
+        grid expression using the ``_BLOCK_SIZE_*`` constants defined
+        in the host wrapper.
+        """
+        import re
+
+        # Collect _BLOCK_SIZE_* = <int> definitions from the host wrapper
+        block_sizes: dict[str, int] = {}
+        for m in re.finditer(r"(_BLOCK_SIZE_\d+)\s*=\s*(\d+)", code):
+            block_sizes[m.group(1)] = int(m.group(2))
+
+        # Find the grid tuple by matching balanced parentheses after _launcher
+        launcher_idx = code.find("_launcher(")
+        assert launcher_idx >= 0, "Could not find _launcher call"
+        # Skip to the grid tuple: _launcher(_kernel, (<grid>,), ...)
+        # Find the second '(' which starts the grid tuple
+        first_paren = code.index("(", launcher_idx)
+        comma = code.index(",", first_paren)
+        grid_start = code.index("(", comma)
+        # Match balanced parens to find the grid tuple end
+        depth = 0
+        for i in range(grid_start, len(code)):
+            if code[i] == "(":
+                depth += 1
+            elif code[i] == ")":
+                depth -= 1
+                if depth == 0:
+                    grid_tuple_str = code[grid_start : i + 1]
+                    break
+        else:
+            raise AssertionError("Unbalanced parentheses in grid tuple")
+
+        # Evaluate the tuple to get the grid size (product of all elements)
+        import math
+
+        import triton
+
+        grid_tuple = eval(grid_tuple_str, {"triton": triton, **block_sizes})
+        return math.prod(grid_tuple)
+
+    def test_full_fission_reduces_grid(self):
+        """Full fission [0,-1] should halve the grid vs [0,0] for a 2D tile."""
+        x = torch.randn(128, 128, device=DEVICE)
+        y = torch.randn(128, 128, device=DEVICE)
+        code_nf, _ = code_and_output(
+            add_2d_kernel, (x, y), block_sizes=[32, 32], grid_fissions=[[0, 0]]
+        )
+        code_ff, _ = code_and_output(
+            add_2d_kernel, (x, y), block_sizes=[32, 32], grid_fissions=[[0, -1]]
+        )
+        grid_nf = self._extract_grid_size(code_nf)
+        grid_ff = self._extract_grid_size(code_ff)
+        # 128/32=4 blocks per dim. No fission: 4*4=16. Full fission on N: 4.
+        self.assertEqual(grid_nf, 16)
+        self.assertEqual(grid_ff, 4)
+
+    def test_partial_fission_reduces_grid(self):
+        """Partial fission [2,0] should shrink M grid by factor 2."""
+        x = torch.randn(128, 128, device=DEVICE)
+        y = torch.randn(128, 128, device=DEVICE)
+        code_nf, _ = code_and_output(
+            add_2d_kernel, (x, y), block_sizes=[32, 32], grid_fissions=[[0, 0]]
+        )
+        code_pf, _ = code_and_output(
+            add_2d_kernel, (x, y), block_sizes=[32, 32], grid_fissions=[[2, 0]]
+        )
+        grid_nf = self._extract_grid_size(code_nf)
+        grid_pf = self._extract_grid_size(code_pf)
+        # No fission: 4*4=16. Partial M=2: (4/2)*4=8.
+        self.assertEqual(grid_nf, 16)
+        self.assertEqual(grid_pf, 8)
+
+    def test_3d_full_fission_reduces_grid(self):
+        """Full fission on last dim of 3D tile reduces grid proportionally."""
+        x = torch.randn(8, 16, 64, device=DEVICE)
+        y = torch.randn(8, 16, 64, device=DEVICE)
+        code_nf, _ = code_and_output(
+            add_3d_kernel,
+            (x, y),
+            block_sizes=[8, 16, 32],
+            grid_fissions=[[0, 0, 0]],
+        )
+        code_ff, _ = code_and_output(
+            add_3d_kernel,
+            (x, y),
+            block_sizes=[8, 16, 32],
+            grid_fissions=[[0, 0, -1]],
+        )
+        grid_nf = self._extract_grid_size(code_nf)
+        grid_ff = self._extract_grid_size(code_ff)
+        # 8/8=1, 16/16=1, 64/32=2. No fission: 1*1*2=2. Full on C: 1*1=1.
+        self.assertEqual(grid_nf, 2)
+        self.assertEqual(grid_ff, 1)
+
+    def test_mixed_fission_reduces_grid(self):
+        """Mixed partial+full fission compounds the grid reduction."""
+        x = torch.randn(8, 64, 128, device=DEVICE)
+        y = torch.randn(8, 64, 128, device=DEVICE)
+        code_nf, _ = code_and_output(
+            add_3d_kernel,
+            (x, y),
+            block_sizes=[8, 16, 32],
+            grid_fissions=[[0, 0, 0]],
+        )
+        code_mf, _ = code_and_output(
+            add_3d_kernel,
+            (x, y),
+            block_sizes=[8, 16, 32],
+            grid_fissions=[[0, 2, -1]],
+        )
+        grid_nf = self._extract_grid_size(code_nf)
+        grid_mf = self._extract_grid_size(code_mf)
+        # 8/8=1, 64/16=4, 128/32=4. No fission: 1*4*4=16.
+        # Partial B=2, full C: 1*(4/2)=2.
+        self.assertEqual(grid_nf, 16)
+        self.assertEqual(grid_mf, 2)
+
 
 if __name__ == "__main__":
     unittest.main()

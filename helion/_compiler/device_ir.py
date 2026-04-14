@@ -621,13 +621,15 @@ class DeviceIR:
         For each fully-fissioned grid dimension, wraps the root graph body
         in a ForLoopGraphInfo so that the standard codegen_device_loop path
         handles the loop generation.
-        """
-        import sympy
 
+        Degenerate partial fission (factor >= num_blocks) is normalized to
+        -1 by ConfigSpec.normalize() before reaching here. The codegen_grid()
+        normalization in tile_strategy.py serves as a runtime fallback for
+        dynamic shapes where normalize() can't evaluate the check.
+        """
         from .grid_fission import GridFissionTransformer
 
         env = CompileEnvironment.current()
-        block_sizes = config.block_sizes
         for i, block_ids in enumerate(self.grid_block_ids):
             fission_factors = env.config_spec.grid_fissions.config_get(
                 config.grid_fissions, block_ids[0], None
@@ -636,21 +638,6 @@ class DeviceIR:
                 continue
             root_graph_id = self.root_ids[i]
             for block_id, factor in zip(block_ids, fission_factors, strict=True):
-                if factor == 0:
-                    continue
-                # Normalize: partial fission factor >= num_blocks → full fission.
-                # This mirrors the normalization in codegen_grid.
-                if factor > 0:
-                    bs_info = env.block_sizes[block_id]
-                    bs = env.config_spec.block_sizes.config_get(block_sizes, block_id)
-                    if bs_info.size is not None and bs is not None:
-                        numel_val = bs_info.numel
-                        if isinstance(numel_val, (int, sympy.Integer)):
-                            num_blocks = int(
-                                sympy.ceiling(sympy.Rational(int(numel_val), bs))
-                            )
-                            if factor >= num_blocks:
-                                factor = -1
                 if factor != -1:
                     continue
                 numel = env.block_sizes[block_id].numel

@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 from typing import Any
 from typing import cast
 
+import sympy
 from torch._inductor.runtime.runtime_utils import next_power_of_2
 import torch.distributed as dist
 
@@ -27,6 +28,7 @@ from .config_fragment import EnumFragment
 from .config_fragment import IntegerFragment
 from .config_fragment import ListOf
 from .config_fragment import NumWarpsFragment
+from .config_fragment import PerDimListOf
 from .config_fragment import PermutationFragment
 from .config_fragment import PowerOfTwoFragment
 from .config_fragment import assert_integer_power_of_two
@@ -480,6 +482,65 @@ class ConfigSpec:
                     f"advanced_controls_file must be a string path, got {value!r}"
                 )
             config["advanced_controls_file"] = value
+
+        # Per-dim degenerate factor rejection: factor >= num_blocks means
+        # the grid collapses to 1 cell for that dim — equivalent to full
+        # fission.  Reject (or normalize to -1) to shrink the search space.
+        # Only works for static shapes; skipped when numel is symbolic.
+        grid_fissions_list = cast("list[list[int]]", config.get("grid_fissions", []))
+        block_sizes_list = cast("list[int]", config.get("block_sizes", []))
+        from .._compiler.compile_environment import CompileEnvironment
+        from .._compiler.compile_environment import NoCurrentEnvironment
+
+        try:
+            env: CompileEnvironment | None = CompileEnvironment.current()
+        except NoCurrentEnvironment:
+            env = None
+        if env is not None:
+            for spec_idx, spec in enumerate(self.grid_fissions):
+                if spec_idx >= len(grid_fissions_list):
+                    continue
+                factors = grid_fissions_list[spec_idx]
+                for dim_idx, (block_id, factor) in enumerate(
+                    zip(spec.block_ids, factors, strict=True)
+                ):
+                    if factor <= 0:
+                        continue
+                    bs_info = env.block_sizes[block_id]
+                    bs = self.block_sizes.config_get(block_sizes_list, block_id)
+                    if bs_info.size is None or bs is None:
+                        continue
+                    numel_val = bs_info.numel
+                    if not isinstance(numel_val, (int, sympy.Integer)):
+                        continue
+                    num_blocks = int(
+                        sympy.ceiling(sympy.Rational(int(numel_val), int(bs)))
+                    )
+                    if factor >= num_blocks:
+                        # Always normalize — a degenerate partial factor
+                        # has an unambiguous meaning (equivalent to -1).
+                        # Unlike all-dims-fissioned which has no valid grid,
+                        # this is not truly invalid.  The search space
+                        # reduction comes from the fragment filter in
+                        # GridFissionSpec._fragment(), not from rejection here.
+                        factors[dim_idx] = -1
+
+        # Reject grid_fissions that fission ALL dims — the grid would
+        # collapse to a single SM, which is never useful.
+        for factors in grid_fissions_list:
+            if factors and all(f != 0 for f in factors):
+                if _fix_invalid:
+                    # Reset the last non-zero factor to 0 so at least one
+                    # dim stays in the grid.
+                    for i in reversed(range(len(factors))):
+                        if factors[i] != 0:
+                            factors[i] = 0
+                            break
+                else:
+                    raise InvalidConfig(
+                        "grid_fissions cannot fission all dimensions "
+                        "(grid would collapse to a single SM)"
+                    )
 
         # Force grid_fissions to all-zeros for persistent pid_types
         if pid_type in ("persistent_blocked", "persistent_interleaved"):
@@ -946,11 +1007,47 @@ class GridFissionSpec(_BlockIdItem):
     # Valid fission factor choices (order matters for EnumFragment default)
     VALID_FACTORS: tuple[int, ...] = (0, -1, 2, 4, 8, 16, 32, 64)
 
-    def _fragment(self, base: ConfigSpec) -> ListOf:
-        return ListOf(
-            EnumFragment(choices=self.VALID_FACTORS),
-            length=len(self.block_ids),
-        )
+    def _fragment(self, base: ConfigSpec) -> PerDimListOf | ListOf:
+        from .._compiler.compile_environment import CompileEnvironment
+        from .._compiler.compile_environment import NoCurrentEnvironment
+
+        try:
+            env = CompileEnvironment.current()
+        except NoCurrentEnvironment:
+            # Outside compilation (e.g. tests that enumerate fragments
+            # without binding a kernel) — use unfiltered choices.
+            return ListOf(
+                EnumFragment(choices=self.VALID_FACTORS),
+                length=len(self.block_ids),
+            )
+        fragments: list[ConfigSpecFragment] = []
+        for block_id in self.block_ids:
+            bs_info = env.block_sizes[block_id]
+            bs_spec = base.block_sizes.block_id_lookup(block_id)
+            # Compute max useful partial fission factor for this dim.
+            # factor >= num_blocks is degenerate (grid collapses to 1 cell),
+            # so exclude those from the search space.
+            max_factor: int | None = None
+            if bs_info.size is not None:
+                numel_val = bs_info.numel
+                if isinstance(numel_val, (int, sympy.Integer)):
+                    min_bs = bs_spec.autotuner_min or bs_spec.min_size
+                    # Use the smallest possible block_size to get the largest
+                    # num_blocks — factors below that are always valid.
+                    num_blocks = int(
+                        sympy.ceiling(
+                            sympy.Rational(int(numel_val), max(int(min_bs), 1))
+                        )
+                    )
+                    max_factor = num_blocks - 1
+            if max_factor is not None:
+                choices = tuple(
+                    f for f in self.VALID_FACTORS if f <= 0 or f <= max_factor
+                )
+            else:
+                choices = self.VALID_FACTORS
+            fragments.append(EnumFragment(choices=choices))
+        return PerDimListOf(fragments=fragments)
 
     def _normalize(self, name: str, value: object) -> list[int]:
         if type(value) is not list:
