@@ -230,7 +230,7 @@ def _pallas_index_str(
                 dim_map.setdefault(tensor_dim, block_id)
         elif isinstance(idx, int):
             parts.append(str(idx))
-        elif isinstance(idx, torch.SymInt):
+        elif isinstance(idx, (torch.SymInt, torch.Tensor)):
             ast_subscripts = state.ast_args[1]
             assert isinstance(ast_subscripts, list)
             ast_idx = ast_subscripts[i]
