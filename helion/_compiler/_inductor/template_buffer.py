@@ -478,13 +478,11 @@ class HelionTemplateBuffer(TemplateBuffer):
         if not any(isinstance(leaf, torch.Tensor) for leaf in flat):
             return buf, ()
 
-        result = (
-            TemplateBuffer.build_multi_outputs(  # pyrefly: ignore[missing-attribute]
-                buf,
-                structured_outputs,
-                direct_alias_at_leaf=direct_aliases,
-                on_tensor_leaf=on_tensor_leaf,
-            )
+        result = TemplateBuffer.build_multi_outputs(  # pyrefly: ignore[missing-attribute]
+            buf,
+            structured_outputs,
+            direct_alias_at_leaf=direct_aliases,
+            on_tensor_leaf=on_tensor_leaf,
         )
         return buf, result
 
