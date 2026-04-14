@@ -1206,6 +1206,102 @@ class TestCuteBackend(TestCase):
         torch.testing.assert_close(out, expected, atol=1e-1, rtol=1e-2)
         self.assertNotIn("cute.gemm", code)
 
+    def test_matmul_direct_grouped_n_uses_mma(self) -> None:
+        @helion.kernel(
+            backend="cute",
+            config=helion.Config(block_sizes=[32], indexing="block_ptr"),
+            static_shapes=True,
+        )
+        def grouped_n_matmul(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, _n = x.size()
+            out = torch.empty([m, y.size(1)], dtype=x.dtype, device=x.device)
+            for tile_m in hl.tile(m):
+                out[tile_m, :] = x[tile_m, :] @ y[:, :]
+            return out
+
+        args = (
+            torch.randn(256, 128, device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn(128, 128, device=DEVICE, dtype=HALF_DTYPE),
+        )
+        code, out = code_and_output(grouped_n_matmul, args)
+        expected = args[0].float() @ args[1].float()
+        torch.testing.assert_close(out, expected.to(out.dtype), atol=1e-1, rtol=1e-2)
+        self.assertIn("cute.gemm", code)
+        self.assertIn("cute.nvgpu.warp.MmaF16BF16Op", code)
+        self.assertNotIn("dot_serial_result", code)
+
+    def test_matmul_direct_grouped_n_slice_operands_reject_cleanly(self) -> None:
+        @helion.kernel(
+            backend="cute",
+            config=helion.Config(block_sizes=[32], indexing="block_ptr"),
+            static_shapes=True,
+        )
+        def grouped_n_matmul(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, _n = x.size()
+            out = torch.empty([m, 128], dtype=x.dtype, device=x.device)
+            for tile_m in hl.tile(m):
+                out[tile_m, :] = x[tile_m, 16:144] @ y[16:144, :]
+            return out
+
+        args = (
+            torch.randn(256, 160, device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn(160, 128, device=DEVICE, dtype=HALF_DTYPE),
+        )
+        with self.assertRaisesRegex(
+            helion.exc.BackendUnsupported,
+            "direct mm without an active K tile only supports contiguous direct-load operands",
+        ):
+            code_and_output(grouped_n_matmul, args)
+
+    def test_matmul_direct_grouped_n_respects_mma_override(self) -> None:
+        @helion.kernel(
+            backend="cute",
+            config=helion.Config(block_sizes=[32], indexing="block_ptr"),
+            static_shapes=True,
+        )
+        def grouped_n_matmul(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, _n = x.size()
+            out = torch.empty([m, y.size(1)], dtype=x.dtype, device=x.device)
+            for tile_m in hl.tile(m):
+                out[tile_m, :] = x[tile_m, :] @ y[:, :]
+            return out
+
+        args = (
+            torch.randn(256, 128, device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn(128, 128, device=DEVICE, dtype=HALF_DTYPE),
+        )
+        with patch.dict(os.environ, {"HELION_CUTE_MMA_IMPL": "universal"}, clear=False):
+            code, out = code_and_output(grouped_n_matmul, args)
+        expected = args[0].float() @ args[1].float()
+        torch.testing.assert_close(out, expected.to(out.dtype), atol=1e-1, rtol=1e-2)
+        self.assertNotIn("cute.gemm", code)
+
+    def test_matmul_direct_grouped_n_mismatched_threads_falls_back(self) -> None:
+        @helion.kernel(
+            backend="cute",
+            config=helion.Config(
+                block_sizes=[64],
+                num_threads=[32],
+                indexing="block_ptr",
+            ),
+            static_shapes=True,
+        )
+        def grouped_n_matmul(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, _n = x.size()
+            out = torch.empty([m, y.size(1)], dtype=x.dtype, device=x.device)
+            for tile_m in hl.tile(m):
+                out[tile_m, :] = x[tile_m, :] @ y[:, :]
+            return out
+
+        args = (
+            torch.randn(256, 128, device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn(128, 128, device=DEVICE, dtype=HALF_DTYPE),
+        )
+        code, out = code_and_output(grouped_n_matmul, args)
+        expected = args[0].float() @ args[1].float()
+        torch.testing.assert_close(out, expected.to(out.dtype), atol=1e-1, rtol=1e-2)
+        self.assertNotIn("cute.gemm", code)
+
     def test_dot_acc_dynamic_shape_uses_mma(self) -> None:
         args = (
             torch.randn(64, 64, device=DEVICE, dtype=torch.bfloat16),

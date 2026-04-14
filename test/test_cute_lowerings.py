@@ -2405,7 +2405,7 @@ class TestCuteLowerings(unittest.TestCase):
                 "os.environ", {"HELION_CUTE_MMA_IMPL": "warp"}, clear=False
             ):
                 self.assertEqual(
-                    _choose_mma_impl(torch.float16, bm=64, bn=8, bk=16),
+                    _choose_mma_impl(torch.float16, bm=64, bn=16, bk=16),
                     "universal",
                 )
                 self.assertEqual(

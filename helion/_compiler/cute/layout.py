@@ -31,6 +31,52 @@ class LayoutTag(enum.Enum):
     IDENTITY = "identity"
 
 
+class MatmulAxisRole(enum.Enum):
+    """Semantic role of a logical matmul axis."""
+
+    M = "m"
+    N = "n"
+    K = "k"
+
+
+class MatmulExecutionKind(enum.Enum):
+    """Planner-selected CuTe execution scheme for a matmul node."""
+
+    DIRECT_GROUPED_N = "direct_grouped_n"
+
+
+@dataclass(frozen=True)
+class MatmulOperandAxes:
+    """Logical matmul-axis assignment for one operand/output tensor."""
+
+    m_dim: int | None = None
+    n_dim: int | None = None
+    k_dim: int | None = None
+
+
+@dataclass(frozen=True)
+class MatmulAxisModel:
+    """Planner-owned mapping from tensor dims to matmul M/N/K roles."""
+
+    lhs: MatmulOperandAxes
+    rhs: MatmulOperandAxes
+    out: MatmulOperandAxes
+
+
+@dataclass(frozen=True)
+class MatmulExecutionPlan:
+    """Planner-owned execution layout for a CuTe matmul node."""
+
+    kind: MatmulExecutionKind
+    m_block_id: int
+    scalar_block_id: int
+    bm: int
+    bn: int
+    bk: int
+    groups_per_lane: int
+    lane_extent: int
+
+
 def _checked_div(a: SymIntLike, b: SymIntLike) -> SymIntLike:
     """Floor-divide *a* by *b*, asserting exact divisibility for concrete values."""
     if isinstance(a, int) and isinstance(b, int):
@@ -189,6 +235,8 @@ class LayoutConstraint:
     preferred_output: ThreadLayout | None = None
     input_layout: ThreadLayout | None = None
     output_layout: ThreadLayout | None = None
+    matmul_axes: MatmulAxisModel | None = None
+    matmul_plan: MatmulExecutionPlan | None = None
     required: bool = False
 
     def primary_layout(self) -> ThreadLayout | None:

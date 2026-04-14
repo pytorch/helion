@@ -35,6 +35,8 @@ from ..ast_extension import statement_from_string
 from ..dtype_utils import cast_ast
 from ..matmul_utils import _needs_f32_accumulator
 from ..tile_strategy import DeviceLoopState
+from .layout import MatmulExecutionKind
+from .layout import MatmulExecutionPlan
 from .mma_support import get_cute_mma_support
 
 if TYPE_CHECKING:
@@ -124,13 +126,8 @@ def _mma_loop_is_exclusive(node: Node) -> bool:
     return True
 
 
-def _trace_to_load_tensor(node: Node) -> tuple[str, torch.Tensor] | None:
-    """Trace through casts/permutes to find the underlying load tensor.
-
-    Only traces through data-preserving ops (type casts, permute).
-    Does NOT trace through arithmetic (add, mul, etc.) because the MMA
-    pipeline reads raw tensor data and those ops would be skipped.
-    """
+def _trace_to_load(node: Node) -> Node | None:
+    """Trace through casts/permutes to the underlying load node."""
     from ...language import memory_ops
 
     cur = node
@@ -144,13 +141,50 @@ def _trace_to_load_tensor(node: Node) -> tuple[str, torch.Tensor] | None:
 
     if cur.op != "call_function" or cur.target is not memory_ops.load:
         return None
-    tensor_node = cur.args[0]
+    return cur
+
+
+def _trace_to_load_tensor(node: Node) -> tuple[Node, str, torch.Tensor] | None:
+    """Trace through casts/permutes to find the underlying load tensor.
+
+    Only traces through data-preserving ops (type casts, permute).
+    Does NOT trace through arithmetic (add, mul, etc.) because the MMA
+    pipeline reads raw tensor data and those ops would be skipped.
+    """
+    load_node = _trace_to_load(node)
+    if load_node is None:
+        return None
+    tensor_node = load_node.args[0]
     if not isinstance(tensor_node, Node):
         return None
     fake = tensor_node.meta.get("val")
     if not isinstance(fake, torch.Tensor):
         return None
-    return tensor_node.name, fake
+    return load_node, tensor_node.name, fake
+
+
+def _supports_direct_grouped_n_loads(lhs_load: Node, rhs_load: Node) -> bool:
+    def is_full_slice(index: object) -> bool:
+        return (
+            isinstance(index, slice)
+            and index.start is None
+            and index.stop is None
+            and index.step is None
+        )
+
+    if len(lhs_load.args) < 2 or len(rhs_load.args) < 2:
+        return False
+    lhs_index = lhs_load.args[1]
+    rhs_index = rhs_load.args[1]
+    if not isinstance(lhs_index, list) or not isinstance(rhs_index, list):
+        return False
+    if len(lhs_index) != 2 or len(rhs_index) != 2:
+        return False
+    return (
+        is_full_slice(lhs_index[1])
+        and is_full_slice(rhs_index[0])
+        and is_full_slice(rhs_index[1])
+    )
 
 
 def _has_mma_operands(lhs_node: Node, rhs_node: Node) -> bool:
@@ -159,8 +193,8 @@ def _has_mma_operands(lhs_node: Node, rhs_node: Node) -> bool:
     rhs_info = _trace_to_load_tensor(rhs_node)
     if lhs_info is None or rhs_info is None:
         return False
-    _, lhs_fake = lhs_info
-    _, rhs_fake = rhs_info
+    _, _, lhs_fake = lhs_info
+    _, _, rhs_fake = rhs_info
     supported = {torch.float16, torch.bfloat16, torch.float32}
     return (
         lhs_fake.dtype in supported
@@ -532,8 +566,8 @@ def _emit_mma_pipeline(
     rhs_info = _trace_to_load_tensor(rhs_node)
     if lhs_info is None or rhs_info is None:
         return None
-    _, lhs_fake = lhs_info
-    _, rhs_fake = rhs_info
+    _, _, lhs_fake = lhs_info
+    _, _, rhs_fake = rhs_info
     if lhs_fake.ndim != 2 or rhs_fake.ndim != 2:
         return None
 
@@ -622,6 +656,7 @@ def _emit_mma_pipeline(
 
     # === outer_prefix: MMA setup + shared memory alloc + accumulator init ===
     prefix = device_loop.outer_prefix
+    suffix = device_loop.outer_suffix
 
     mma_thread_linear: str | None = None
     mma_active: str | None = None
@@ -1139,7 +1174,6 @@ def _emit_mma_pipeline(
             f"{smem_c_ptr}, cute.make_layout(({bm}, {bn}), stride=({bn}, 1)))"
         )
     )
-    suffix = device_loop.outer_suffix
     if mma_impl == "universal":
         suffix.append(
             statement_from_string(f"{tCsC} = {thr_mma}.partition_C({smem_c})")
@@ -1370,7 +1404,7 @@ def _mma_impl_matches_problem_shape(
     if input_dtype not in (torch.float16, torch.bfloat16) or bk != 16 or bn != 8:
         return False
     if mma_impl == "warp":
-        return bm == 16
+        return bm >= 16 and bm % 16 == 0
     if mma_impl == "tcgen05":
         return bm in (64, 128)
     return False
@@ -1442,7 +1476,7 @@ def _make_tiled_mma_setup(
             "cute.make_tiled_mma("
             "cute.make_mma_atom("
             f"cute.nvgpu.warp.MmaF16BF16Op({input_dtype_str}, {acc_dtype_str}, (16, 8, 16))"
-            "), atom_layout_mnk=(1, 1, 1))"
+            f"), atom_layout_mnk=({bm // 16}, 1, 1))"
         )
     elif mma_impl == "tcgen05":
         tiled_mma_expr = _tcgen05_tiled_mma_expr(input_dtype_str, acc_dtype_str, bm, bn)
@@ -1632,6 +1666,223 @@ def codegen_cute_mma(
         acc_expr=acc_expr,
         fx_node=node,
     )
+
+
+def codegen_cute_mma_direct_mm(
+    ctx: LoweringContext,
+    node: Node,
+    *,
+    serial_k_extent: int | None,
+) -> ast.AST | None:
+    from ..generate_ast import GenerateAST
+
+    if not isinstance(ctx.cg, GenerateAST):
+        return None
+    plan = getattr(ctx, "cute_matmul_plan", None)
+    if not isinstance(plan, MatmulExecutionPlan):
+        return None
+    if plan.kind is not MatmulExecutionKind.DIRECT_GROUPED_N:
+        return None
+    if serial_k_extent is None or serial_k_extent <= 0:
+        return None
+    if node.target is not torch.ops.aten.mm.default:
+        return None
+
+    lhs_node = node.args[0]
+    rhs_node = node.args[1]
+    if not isinstance(lhs_node, Node) or not isinstance(rhs_node, Node):
+        return None
+    lhs_info = _trace_to_load_tensor(lhs_node)
+    rhs_info = _trace_to_load_tensor(rhs_node)
+    if lhs_info is None or rhs_info is None:
+        return None
+    lhs_load, _, lhs_fake = lhs_info
+    rhs_load, _, rhs_fake = rhs_info
+    if lhs_fake.ndim != 2 or rhs_fake.ndim != 2:
+        return None
+    if lhs_fake.dtype not in (torch.float16, torch.bfloat16):
+        return None
+    if not _supports_direct_grouped_n_loads(lhs_load, rhs_load):
+        return None
+
+    mma_impl = _choose_mma_impl(lhs_fake.dtype, bm=plan.bm, bn=plan.bn, bk=plan.bk)
+    if mma_impl != "warp":
+        return None
+
+    cg = ctx.cg
+    grid_state = cg.current_grid_state
+    if grid_state is None:
+        return None
+    prefix = grid_state.outer_prefix
+    scalar_axis = grid_state.block_thread_axes.get(plan.scalar_block_id)
+    if scalar_axis is None:
+        return None
+    scalar_strategy = cg.device_function.tile_strategy.block_id_to_strategy.get(
+        (plan.scalar_block_id,)
+    )
+    lane_var = getattr(scalar_strategy, "_synthetic_cute_lane_var", None)
+    if plan.lane_extent > 1 and not isinstance(lane_var, str):
+        return None
+
+    m_index_var = grid_state.strategy.index_var(plan.m_block_id)
+    m_local = _local_mma_coord_expr(cg, plan.m_block_id)
+    m_tile_origin = f"cutlass.Int32({m_index_var}) - ({m_local})"
+    scalar_thread = f"cutlass.Int32(cute.arch.thread_idx()[{scalar_axis}])"
+    lane_group_base = (
+        "cutlass.Int32(0)"
+        if not isinstance(lane_var, str)
+        else f"cutlass.Int32({lane_var}) * cutlass.Int32({plan.groups_per_lane})"
+    )
+    tile_group = f"({scalar_thread}) // cutlass.Int32({plan.bn})"
+    tile_n_local = f"({scalar_thread}) % cutlass.Int32({plan.bn})"
+    mma_active = f"({tile_n_local}) < cutlass.Int32({_mma_active_n_threads(mma_impl)})"
+    mma_thread_linear = f"{m_local} + ({tile_n_local}) * cutlass.Int32({plan.bm})"
+    m_size = int(lhs_fake.shape[0])
+    n_size = int(rhs_fake.shape[1])
+    k_size = serial_k_extent
+
+    df = cg.device_function
+    input_dtype_str = (
+        "cutlass.Float16" if lhs_fake.dtype is torch.float16 else "cutlass.BFloat16"
+    )
+    acc_dtype_str = "cutlass.Float32"
+    lhs_arg_name = df.tensor_arg(lhs_fake).name
+    rhs_arg_name = df.tensor_arg(rhs_fake).name
+
+    tiled_mma = df.new_var("direct_tiled_mma")
+    thr_mma = df.new_var("direct_thr_mma")
+    acc_frag = df.new_var("direct_acc_frag")
+    smem_a_ptr = df.new_var("direct_smem_a")
+    smem_a = df.new_var("direct_sA")
+    smem_b_ptr = df.new_var("direct_smem_b")
+    smem_b = df.new_var("direct_sB")
+    smem_c_ptr = df.new_var("direct_smem_c")
+    smem_c = df.new_var("direct_sC")
+    tAsA = df.new_var("direct_tAsA")
+    tBsB = df.new_var("direct_tBsB")
+    tCsC = df.new_var("direct_tCsC")
+    rA = df.new_var("direct_rA")
+    rB = df.new_var("direct_rB")
+    k_offset_var = df.new_var("direct_k_offset")
+    result_var = df.new_var("direct_mma_result")
+
+    for stmt in _make_tiled_mma_setup(
+        mma_impl,
+        tiled_mma,
+        thr_mma,
+        mma_thread_linear,
+        input_dtype_str,
+        acc_dtype_str,
+        plan.bm,
+        plan.bn,
+    ):
+        prefix.append(stmt)
+    prefix.append(
+        statement_from_string(
+            f"{acc_frag} = cute.make_fragment("
+            f"{tiled_mma}.partition_shape_C(({plan.bm}, {plan.bn})), {acc_dtype_str})"
+        )
+    )
+    prefix.append(
+        statement_from_string(
+            f"{smem_a_ptr} = cute.arch.alloc_smem({input_dtype_str}, {plan.bm * plan.bk})"
+        )
+    )
+    prefix.append(
+        statement_from_string(
+            f"{smem_a} = cute.make_tensor("
+            f"{smem_a_ptr}, cute.make_layout(({plan.bm}, {plan.bk}), stride=({plan.bk}, 1)))"
+        )
+    )
+    prefix.append(
+        statement_from_string(
+            f"{smem_b_ptr} = cute.arch.alloc_smem({input_dtype_str}, {plan.bn * plan.bk})"
+        )
+    )
+    prefix.append(
+        statement_from_string(
+            f"{smem_b} = cute.make_tensor("
+            f"{smem_b_ptr}, "
+            f"cute.make_layout(({plan.bn}, {plan.bk}), stride=({plan.bk}, 1)))"
+        )
+    )
+    prefix.append(
+        statement_from_string(
+            f"{smem_c_ptr} = cute.arch.alloc_smem({acc_dtype_str}, {plan.bm * plan.bn}, alignment=128)"
+        )
+    )
+    prefix.append(
+        statement_from_string(
+            f"{smem_c} = cute.make_tensor("
+            f"{smem_c_ptr}, "
+            f"cute.make_layout(({plan.bm}, {plan.bn}), stride=({plan.bn}, 1)))"
+        )
+    )
+    cg.add_statement(statement_from_string(f"{result_var} = {acc_dtype_str}(0.0)"))
+    cg.add_statement(
+        statement_from_string(
+            f"if {mma_active}:\n"
+            f"    for _mma_i in range(cute.size({acc_frag})):\n"
+            f"        {acc_frag}[_mma_i] = {acc_dtype_str}(0.0)"
+        )
+    )
+    cg.add_statement(
+        statement_from_string(
+            f"for {k_offset_var} in range(0, {k_size}, {plan.bk}):\n"
+            f"    if {mma_active} and ({tile_group}) == cutlass.Int32(0):\n"
+            f"        for _load_i in range(({plan.bm * plan.bk} + {plan.bm * 2} - 1) // {plan.bm * 2}):\n"
+            f"            _flat = {mma_thread_linear} + cutlass.Int32(_load_i) * cutlass.Int32({plan.bm * 2})\n"
+            f"            if _flat < cutlass.Int32({plan.bm * plan.bk}):\n"
+            f"                _row = _flat // cutlass.Int32({plan.bk})\n"
+            f"                _col = _flat % cutlass.Int32({plan.bk})\n"
+            f"                _gm = {m_tile_origin} + _row\n"
+            f"                _gk = cutlass.Int32({k_offset_var}) + _col\n"
+            f"                {smem_a}[_row, _col] = ("
+            f"{lhs_arg_name}[_gm, _gk] "
+            f"if _gm < cutlass.Int32({m_size}) and _gk < cutlass.Int32({k_size}) "
+            f"else {input_dtype_str}(0.0))\n"
+            f"    cute.arch.sync_threads()\n"
+            f"    for _n_group in range({plan.groups_per_lane}):\n"
+            f"        if {mma_active} and ({tile_group}) == cutlass.Int32(_n_group):\n"
+            f"            for _load_i in range(({plan.bn * plan.bk} + {plan.bm * 2} - 1) // {plan.bm * 2}):\n"
+            f"                _flat = {mma_thread_linear} + cutlass.Int32(_load_i) * cutlass.Int32({plan.bm * 2})\n"
+            f"                if _flat < cutlass.Int32({plan.bn * plan.bk}):\n"
+            f"                    _row = _flat // cutlass.Int32({plan.bk})\n"
+            f"                    _col = _flat % cutlass.Int32({plan.bk})\n"
+            f"                    _gn = ({lane_group_base} + cutlass.Int32(_n_group)) * cutlass.Int32({plan.bn}) + _row\n"
+            f"                    _gk = cutlass.Int32({k_offset_var}) + _col\n"
+            f"                    {smem_b}[_row, _col] = ("
+            f"{rhs_arg_name}[_gk, _gn] "
+            f"if _gn < cutlass.Int32({n_size}) and _gk < cutlass.Int32({k_size}) "
+            f"else {input_dtype_str}(0.0))\n"
+            f"        cute.arch.sync_threads()\n"
+            f"        if {mma_active} and ({tile_group}) == cutlass.Int32(_n_group):\n"
+            f"            {tAsA} = {thr_mma}.partition_A({smem_a})\n"
+            f"            {tBsB} = {thr_mma}.partition_B({smem_b})\n"
+            f"            {rA} = cute.make_fragment_like({tAsA}, {input_dtype_str})\n"
+            f"            {rB} = cute.make_fragment_like({tBsB}, {input_dtype_str})\n"
+            f"            for _mma_i in range(cute.size({rA})):\n"
+            f"                {rA}[_mma_i] = {tAsA}[_mma_i]\n"
+            f"            for _mma_i in range(cute.size({rB})):\n"
+            f"                {rB}[_mma_i] = {tBsB}[_mma_i]\n"
+            f"            cute.gemm({tiled_mma}, {acc_frag}, {rA}, {rB}, {acc_frag})\n"
+            f"        cute.arch.sync_threads()"
+        )
+    )
+    cg.add_statement(
+        statement_from_string(
+            f"for _n_group in range({plan.groups_per_lane}):\n"
+            f"    if {mma_active} and ({tile_group}) == cutlass.Int32(_n_group):\n"
+            f"        {tCsC} = {thr_mma}.partition_C({smem_c})\n"
+            f"        for _mma_i in range(cute.size({tCsC})):\n"
+            f"            {tCsC}[_mma_i] = {acc_frag}[_mma_i]\n"
+            f"    cute.arch.sync_threads()\n"
+            f"    if ({tile_group}) == cutlass.Int32(_n_group):\n"
+            f"        {result_var} = {smem_c}[{m_local}, {tile_n_local}]\n"
+            f"    cute.arch.sync_threads()"
+        )
+    )
+    return expr_from_string(result_var)
 
 
 # ---- hl.dot entry point ----

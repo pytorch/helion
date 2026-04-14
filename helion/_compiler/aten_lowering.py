@@ -22,6 +22,7 @@ from .ast_extension import expr_from_string
 from .ast_extension import statement_from_string
 from .compile_environment import CompileEnvironment
 from .cute.argreduce import codegen_cute_tile_argreduce
+from .cute.cute_mma import codegen_cute_mma_direct_mm
 from .cute.indexing import CutePackedAffineLoad
 from .cute.indexing import CuteShapeChainView
 from .cute.indexing import is_cute_shape_chain_target
@@ -34,6 +35,8 @@ from .cute.matmul_utils import cute_outer_accumulator_out_dtype
 from .cute.matmul_utils import cute_resolve_active_block_id
 from .cute.matmul_utils import cute_resolve_active_matmul_k_block_id
 from .cute.matmul_utils import cute_static_k_invariant_extent
+from .cute.matmul_utils import cute_static_serial_matmul_k_extent
+from .cute.matmul_utils import emit_cute_serial_scalar_mm_from_loads
 from .matmul_utils import _emit_pallas_matmul
 from .matmul_utils import _needs_f32_accumulator
 from .matmul_utils import emit_tl_dot_with_padding
@@ -987,6 +990,11 @@ def codegen_mm_cute(ctx: LoweringContext, node: Node) -> ast.AST:
         if k_block_id is not None
         else cute_static_k_invariant_extent(lhs_node, rhs_node)
     )
+    serial_k_extent = (
+        None
+        if k_block_id is not None or static_k_extent is not None
+        else cute_static_serial_matmul_k_extent(lhs_node, rhs_node)
+    )
     env = CompileEnvironment.current()
     size_hint = getattr(env, "size_hint", None)
 
@@ -1001,7 +1009,12 @@ def codegen_mm_cute(ctx: LoweringContext, node: Node) -> ast.AST:
         hinted(lhs_node.meta["val"].shape[-1]) == 1
         and hinted(rhs_node.meta["val"].shape[-2]) == 1
     )
-    if static_k_extent is None and k_block_id is None and not k_is_one:
+    if (
+        static_k_extent is None
+        and serial_k_extent is None
+        and k_block_id is None
+        and not k_is_one
+    ):
         raise exc.BackendUnsupported(
             "cute",
             "CuTe scalar matmul fallback requires an active K tile or a K-invariant static shortcut",
@@ -1013,6 +1026,27 @@ def codegen_mm_cute(ctx: LoweringContext, node: Node) -> ast.AST:
         if out_dtype is not None
         else None
     )
+    direct_mma_result = codegen_cute_mma_direct_mm(
+        ctx,
+        node,
+        serial_k_extent=serial_k_extent,
+    )
+    if direct_mma_result is not None:
+        return direct_mma_result
+    serial_result = emit_cute_serial_scalar_mm_from_loads(
+        ctx,
+        lhs_node,
+        rhs_node,
+        k_extent=serial_k_extent,
+        out_dtype=effective_out_dtype,
+    )
+    if serial_result is not None:
+        return serial_result
+    if serial_k_extent is not None:
+        raise exc.BackendUnsupported(
+            "cute",
+            "CuTe direct mm without an active K tile only supports contiguous direct-load operands",
+        )
     return _emit_cute_matmul(
         ctx.cg,
         lhs,
