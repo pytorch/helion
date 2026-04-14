@@ -467,7 +467,6 @@ def _pallas_make_reordered_kernel(
                     out_ref[...] = in_ref[...]  # type: ignore[index]
             original_order[orig_pos] = out_ref
         extra_refs = refs[n_tensor_inputs + len(_output_indices) :]
-
         pallas_kernel(*original_order, *extra_refs)  # type: ignore[operator]
 
     return reordered_kernel
@@ -744,15 +743,11 @@ def default_pallas_pipeline_launcher(
         _jnp_dtype_map: dict[str, object] = {
             "jnp.float32": jnp.float32,
             "jnp.float16": jnp.float16,
-            "jnp.float64": jnp.float64,
             "jnp.bfloat16": jnp.bfloat16,
             "jnp.int32": jnp.int32,
             "jnp.int16": jnp.int16,
             "jnp.int8": jnp.int8,
-            "jnp.int64": jnp.int64,
             "jnp.uint8": jnp.uint8,
-            "jnp.uint16": jnp.uint16,
-            "jnp.uint32": jnp.uint32,
             "jnp.bool_": jnp.bool_,
         }
         scratch_shapes = []
@@ -891,17 +886,11 @@ def default_pallas_fori_launcher(
         _jnp_dtype_map: dict[str, object] = {
             "jnp.float32": jnp.float32,
             "jnp.float16": jnp.float16,
-            "jnp.float64": jnp.float64,
             "jnp.bfloat16": jnp.bfloat16,
-            "jnp.float8_e4m3fn": getattr(jnp, "float8_e4m3fn", jnp.float32),
-            "jnp.float8_e5m2": getattr(jnp, "float8_e5m2", jnp.float32),
             "jnp.int32": jnp.int32,
             "jnp.int16": jnp.int16,
             "jnp.int8": jnp.int8,
-            "jnp.int64": jnp.int64,
             "jnp.uint8": jnp.uint8,
-            "jnp.uint16": jnp.uint16,
-            "jnp.uint32": jnp.uint32,
             "jnp.bool_": jnp.bool_,
         }
         scratch_shapes = []
