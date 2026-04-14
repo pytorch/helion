@@ -109,15 +109,15 @@ class CompileTimeTracker:
             "HostFunction.lower_to_device_ir",
         ],
         "BoundKernel.set_config": [
-            "BoundKernel.to_triton_code",
+            "BoundKernel.to_code",
             "BoundKernel.PyCodeCache.load",
         ],
-        "BoundKernel.to_triton_code": [
+        "BoundKernel.to_code": [
             "BoundKernel.generate_ast",
             "BoundKernel.unparse",
         ],
         "BoundKernel.autotune": [
-            "BoundKernel.to_triton_code",
+            "BoundKernel.to_code",
             "BoundKernel.PyCodeCache.load",
         ],
     }
