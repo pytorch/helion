@@ -4,6 +4,7 @@ import ast
 import collections
 import dataclasses
 from typing import TYPE_CHECKING
+from typing import ClassVar
 from typing import NamedTuple
 
 import sympy
@@ -77,7 +78,7 @@ def _get_padded_iota_original_length(
 
 
 def _get_tile_with_offset_info(
-    k: object, state: CodegenState, k_index: int
+    k: object, fx_node: torch.fx.Node | None, k_index: int
 ) -> TileWithOffsetInfo | None:
     """Check if the subscript at k_index has tile_with_offset metadata.
 
@@ -86,15 +87,15 @@ def _get_tile_with_offset_info(
         state: The codegen state containing the FX node
         k_index: The index of k in the subscript list
     """
-    if state.fx_node is None:
+    if fx_node is None:
         return None
 
     # Get the subscript list from the FX node's arguments
     # args[0] is the tensor, args[1] is the subscript list
-    if len(state.fx_node.args) < 2:
+    if len(fx_node.args) < 2:
         return None
 
-    subscript_arg = state.fx_node.args[1]
+    subscript_arg = fx_node.args[1]
     if not isinstance(subscript_arg, (list, tuple)):
         return None
 
@@ -163,6 +164,17 @@ class IndexingStrategy:
         subscript: list[object],
         value: ast.AST,
         extra_mask: ast.AST | None,
+    ) -> ast.AST:
+        raise NotImplementedError
+
+    def codegen_atomic(
+        self,
+        op: str,
+        state: CodegenState,
+        fake_tensor: torch.Tensor,
+        subscript: list[object],
+        value: ast.AST,
+        sem: ast.AST,
     ) -> ast.AST:
         raise NotImplementedError
 
@@ -249,7 +261,7 @@ class PointerIndexingStrategy(IndexingStrategy):
                 # Scalar int index - consumes tensor dim but adds scalar to pointer
                 tensor_dim += 1
             elif _get_tile_with_offset_info(
-                k, state, k_index
+                k, state.fx_node, k_index
             ) is not None or isinstance(k, torch.Tensor):
                 # Tensor index (tile.index + offset or regular tensor) - block index
                 if not env.known_equal(fake_tensor.size(tensor_dim), 1):
@@ -303,6 +315,25 @@ class PointerIndexingStrategy(IndexingStrategy):
             value=value,
             offset=offset_expr,
             mask=indexing.mask_expr,
+        )
+
+    def codegen_atomic(
+        self,
+        op: str,
+        state: CodegenState,
+        fake_tensor: torch.Tensor,
+        subscript: list[object],
+        value: ast.AST,
+        sem: ast.AST,
+    ) -> ast.AST:
+        indexing = SubscriptIndexing.create(state, fake_tensor, subscript)
+        name = state.device_function.tensor_arg(fake_tensor).name
+        return expr_from_string(
+            f"tl.{op}({name} + {{offset}}, {{value}}, mask={{mask}}, sem={{sem}})",
+            offset=indexing.index_expr,
+            value=value,
+            mask=indexing.mask_expr,
+            sem=sem,
         )
 
 
@@ -454,7 +485,9 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
                 block_size = env.allocate_reduction_dimension(size).from_config(config)
                 if not valid_block_size(block_size, stride, i):
                     return False
-            elif (tile_info := _get_tile_with_offset_info(k, state, i)) is not None:
+            elif (
+                tile_info := _get_tile_with_offset_info(k, state.fx_node, i)
+            ) is not None:
                 # Tensor marked as tile.index + offset
                 block_size = (
                     tile_info.block_size
@@ -542,6 +575,55 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
         return expr_from_string(
             f"{indexing.tensor_descriptor(state)}.store({indexing.offsets_str_permuted(state)}, {{value}})",
             value=store_value,
+        )
+
+    # Ops supported by TMA cp.reduce.async.bulk.tensor via Triton descriptor API
+    _TMA_ATOMIC_OPS: ClassVar[set[str]] = {
+        "atomic_add",
+        "atomic_and",
+        "atomic_max",
+        "atomic_min",
+        "atomic_or",
+        "atomic_xor",
+    }
+
+    def codegen_atomic(
+        self,
+        op: str,
+        state: CodegenState,
+        fake_tensor: torch.Tensor,
+        subscript: list[object],
+        value: ast.AST,
+        sem: ast.AST,
+    ) -> ast.AST:
+        fallback = PointerIndexingStrategy().codegen_atomic
+        # TileIR doesn't support tt.descriptor_reduce yet
+        if CompileEnvironment.current().backend_name == "tileir":
+            return fallback(op, state, fake_tensor, subscript, value, sem)
+        # Only certain ops are supported by TMA reduce
+        if op not in self._TMA_ATOMIC_OPS:
+            return fallback(op, state, fake_tensor, subscript, value, sem)
+        # Descriptor atomics return void; fall back if the return value is used
+        if state.fx_node is not None and len(state.fx_node.users) > 0:
+            return fallback(op, state, fake_tensor, subscript, value, sem)
+        # Descriptor atomics have no sem parameter; fall back for non-relaxed
+        if isinstance(sem, ast.Constant) and sem.value != "relaxed":
+            return fallback(op, state, fake_tensor, subscript, value, sem)
+        if not self.is_supported(state, fake_tensor, subscript):
+            return fallback(op, state, fake_tensor, subscript, value, sem)
+        indexing = BlockedSubscriptIndexing.create(state, fake_tensor, subscript)
+        desc_arg = indexing.tensor_descriptor_arg(state)
+        atomic_value = indexing.reshape_store(state, value)
+
+        if desc_arg.permutation is not None:
+            atomic_value = expr_from_string(
+                f"tl.permute({{value}}, {desc_arg.permutation!r})",
+                value=atomic_value,
+            )
+
+        return expr_from_string(
+            f"{indexing.tensor_descriptor(state)}.{op}({indexing.offsets_str_permuted(state)}, {{value}})",
+            value=atomic_value,
         )
 
 
@@ -757,7 +839,9 @@ class SubscriptIndexing(NamedTuple):
                 input_size.popleft()
             elif (
                 state is not None
-                and (tile_info := _get_tile_with_offset_info(k, state, position))
+                and (
+                    tile_info := _get_tile_with_offset_info(k, state.fx_node, position)
+                )
                 is not None
             ):
                 # Tensor marked as tile.index + offset
@@ -956,7 +1040,9 @@ class SubscriptIndexing(NamedTuple):
                 output_idx += 1
             elif isinstance(k, int):
                 index_values.append(repr(k))
-            elif (tile_info := _get_tile_with_offset_info(k, state, n)) is not None:
+            elif (
+                tile_info := _get_tile_with_offset_info(k, state.fx_node, n)
+            ) is not None:
                 # Tensor marked as tile.index + offset
                 block_id = _resolve_codegen_block_id(state, tile_info.block_id)
                 full_block_size = env.block_sizes[env.canonical_block_id(block_id)].var
@@ -1289,7 +1375,7 @@ class BlockedSubscriptIndexing:
             input_size = 1 if k is None else input_sizes.popleft()
             # Check for tile+offset tensor first before other checks
             if (
-                tile_info := _get_tile_with_offset_info(k, state, position)
+                tile_info := _get_tile_with_offset_info(k, state.fx_node, position)
             ) is not None:
                 # Tensor marked as tile.index + offset - treat like TileWithOffset
                 block_index = _resolve_codegen_block_id(state, tile_info.block_id)
@@ -1363,7 +1449,9 @@ class BlockedSubscriptIndexing:
             elif isinstance(k, int):
                 res.offsets.append(repr(k))
                 res.block_shape.append(1)
-            elif (tile_info := _get_tile_with_offset_info(k, state, n)) is not None:
+            elif (
+                tile_info := _get_tile_with_offset_info(k, state.fx_node, n)
+            ) is not None:
                 # Tensor marked as tile.index + offset
                 if fake_value.size(len(res.offsets)) != 1:
                     block_id = _resolve_codegen_block_id(state, tile_info.block_id)

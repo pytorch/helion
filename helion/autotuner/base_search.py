@@ -379,25 +379,24 @@ class BaseSearch(BaseAutotuner):
             A list of BenchmarkResult entries containing the configuration, compiled
             callable, measured performance, status, and compilation time.
         """
-        fns: list[Callable[..., object]] = []
-        valid_configs: list[Config] = []
+        all_configs = configs
+        compiled: dict[int, Callable[..., object]] = {}
         futures: list[PrecompileFuture] | None = None
-        for i, config in enumerate(configs):
+        for i, config in enumerate(all_configs):
             try:
-                fn = self.kernel.compile_config(config, allow_print=False)
+                compiled[i] = self.kernel.compile_config(config, allow_print=False)
             except Exception:
                 # If all configs failed, raise error
-                if not valid_configs and i == len(configs) - 1:
+                if not compiled and i == len(all_configs) - 1:
                     raise
                 self.log.warning(
                     "Skipping config that failed to compile: %s",
                     self.kernel.format_kernel_decorator(config, self.settings),
                     exc_info=True,
                 )
-                continue
-            fns.append(fn)
-            valid_configs.append(config)
-        configs = valid_configs
+        fns = list(compiled.values())
+        valid_indices = list(compiled.keys())
+        configs = [all_configs[i] for i in valid_indices]
         if self.settings.autotune_precompile:
             futures = list(
                 starmap(
@@ -422,7 +421,12 @@ class BaseSearch(BaseAutotuner):
             is_workings = [True] * len(configs)
             precompile_status = ["ok"] * len(configs)
 
-        results: list[BenchmarkResult] = []
+        results: list[BenchmarkResult] = [
+            BenchmarkResult(
+                config=c, fn=_unset_fn, perf=inf, status="error", compile_time=None
+            )
+            for c in all_configs
+        ]
 
         # Render a progress bar only when the user requested it.
         iterator = iter_with_progress(
@@ -473,27 +477,23 @@ class BaseSearch(BaseAutotuner):
                         config=config,
                     )
                 )
-                results.append(
-                    BenchmarkResult(
-                        config=config,
-                        fn=fn,
-                        perf=perf,
-                        status=status,
-                        compile_time=compile_time,
-                    )
+                results[valid_indices[index]] = BenchmarkResult(
+                    config=config,
+                    fn=fn,
+                    perf=perf,
+                    status=status,
+                    compile_time=compile_time,
                 )
             else:
                 status = "timeout" if reason == "timeout" else "error"
                 if is_working:
                     status = "peer_compilation_fail"
-                results.append(
-                    BenchmarkResult(
-                        config=config,
-                        fn=fn,
-                        perf=inf,
-                        status=status,
-                        compile_time=compile_time,
-                    )
+                results[valid_indices[index]] = BenchmarkResult(
+                    config=config,
+                    fn=fn,
+                    perf=inf,
+                    status=status,
+                    compile_time=compile_time,
                 )
         return results
 
@@ -570,6 +570,18 @@ class BaseSearch(BaseAutotuner):
             f"    {kernel_decorator}\n",
             level=logging.INFO + 5,
         )
+        if self._autotune_metrics.num_accuracy_failures:
+            self.log.warning(
+                f"{self._autotune_metrics.num_accuracy_failures} of "
+                f"{self._autotune_metrics.num_configs_tested} configs failed due "
+                "to accuracy checks."
+            )
+        if self._autotune_metrics.num_compile_failures:
+            self.log.warning(
+                f"{self._autotune_metrics.num_compile_failures} of "
+                f"{self._autotune_metrics.num_configs_tested} configs failed due "
+                "to compile failures."
+            )
         cached_path = self.kernel.get_cached_path(best)
         if cached_path is not None and is_master_rank():
             self.log(f"Code of selected kernel: {cached_path}")

@@ -246,6 +246,23 @@ class TestConfigAPI(TestCase):
         reread = helion.Config.from_json(rejson)
         self.assertEqual(dict(reread), expected)
 
+    def test_epilogue_subtile_rewrites_only_store_slots(self) -> None:
+        env = CompileEnvironment(torch.device("cpu"), helion.Settings(backend="triton"))
+        spec = env.config_spec
+        spec.epilogue_subtile_candidate_enabled = True
+        spec.store_indices = [1, 3]
+        config = {
+            "epilogue_subtile": 2,
+            "indexing": ["pointer", "block_ptr", "pointer", "block_ptr"],
+        }
+
+        spec.fix_epilogue_subtile_store_indexing(config)
+
+        self.assertEqual(
+            config["indexing"],
+            ["pointer", "tensor_descriptor", "pointer", "tensor_descriptor"],
+        )
+
 
 @onlyBackends(["triton", "cute"])
 class TestSettingsEnv(TestCase):

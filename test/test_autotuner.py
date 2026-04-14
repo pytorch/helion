@@ -14,17 +14,21 @@ import random
 import tempfile
 from types import SimpleNamespace
 from typing import Callable
+from typing import ClassVar
 from typing import Sequence
 import unittest
 from unittest import skip
 from unittest.mock import patch
 
+import numpy as np
 import pytest
 import torch
 
 import helion
 from helion import _compat
 from helion import exc
+from helion._compiler.tile_dispatch import BlockIDStrategyMapping
+from helion._compiler.tile_dispatch import TileStrategyDispatch
 from helion._testing import DEVICE
 from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
@@ -236,6 +240,43 @@ class TestAutotuneIgnoreErrors(TestCase):
         assert str(original_exception) == "original error in except block"
         # Verify we can still get the error type and message
         assert type(err.value.__cause__).__name__ == "RuntimeError"
+
+    def test_benchmark_results_aligned_when_compile_fails(self):
+        """_benchmark must return one result per input config even when some
+        fail to compile."""
+        settings = Settings(
+            autotune_precompile=None,
+            autotune_log_level=logging.CRITICAL,
+        )
+        search = self._make_search(settings)
+
+        call_count = 0
+
+        def fail_second(config, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 2:
+                raise RuntimeError("simulated compile failure")
+            return lambda *a, **kw: None
+
+        search.kernel.compile_config = None
+        search.kernel.env = SimpleNamespace(process_group_name=None)
+        configs = ["cfg_a", "cfg_b", "cfg_c"]
+        with (
+            patch.object(search.kernel, "compile_config", side_effect=fail_second),
+            patch.object(
+                search.benchmark_provider,
+                "benchmark_function",
+                return_value=1.0,
+            ),
+        ):
+            results = search._benchmark(configs, desc="test")
+
+        self.assertEqual(len(results), 3)
+        self.assertEqual(results[0].perf, 1.0)
+        self.assertEqual(results[1].perf, float("inf"))
+        self.assertEqual(results[1].status, "error")
+        self.assertEqual(results[2].perf, 1.0)
 
     def test_autotune_log_sink_writes_csv_and_log(self):
         tmpdir = tempfile.TemporaryDirectory()
@@ -870,6 +911,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             ],
             block_size_indices=[0, 1],
             overridden_flat_indices=set(),
+            config_spec=SimpleNamespace(tensor_numel_constraints=[]),
         )
         search.num_neighbors_cap = -1
 
@@ -1004,6 +1046,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             block_size_indices=[0, 1],
             num_warps_index=2,
             overridden_flat_indices=set(),
+            config_spec=SimpleNamespace(tensor_numel_constraints=[]),
         )
         search.num_neighbors_cap = -1
 
@@ -1029,6 +1072,137 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             self.assertIn(neighbor[3], ["a", "b", "c"])
             # Check boolean
             self.assertIn(neighbor[4], [True, False])
+
+    def test_lfbo_pattern_search_surrogate_select_matches_legacy_prefix(self):
+        """Top-k LFBO selection should match the legacy full-ranking implementation."""
+
+        class MockSurrogate:
+            def __init__(
+                self, proba_by_id: dict[int, float], leaf_by_id: dict[int, list[int]]
+            ) -> None:
+                self.proba_by_id = proba_by_id
+                self.leaf_by_id = leaf_by_id
+
+            def predict_proba(self, X):
+                ids = np.asarray(X)[:, 0].astype(int)
+                return np.array(
+                    [[1.0 - self.proba_by_id[i], self.proba_by_id[i]] for i in ids]
+                )
+
+            def apply(self, X):
+                ids = np.asarray(X)[:, 0].astype(int)
+                return np.array([self.leaf_by_id[i] for i in ids], dtype=int)
+
+        def legacy_select(
+            search: LFBOPatternSearch,
+            candidates: list[SimpleNamespace],
+            n_sorted: int,
+        ) -> list[SimpleNamespace]:
+            candidate_X = np.array(
+                [
+                    search.config_gen.encode_config(member.flat_values)
+                    for member in candidates
+                ]
+            )
+            proba = np.asarray(search.surrogate.predict_proba(candidate_X))[:, 1]
+            similarity_matrix = search.compute_leaf_similarity(
+                search.surrogate, candidate_X
+            )
+            selected_indices = []
+            remaining_indices = list(range(len(candidate_X)))
+            scores = np.zeros(len(candidate_X))
+
+            for rank in range(len(candidate_X)):
+                if selected_indices:
+                    mean_similarities = np.zeros(len(remaining_indices))
+                    for i, idx in enumerate(remaining_indices):
+                        similarities_to_selected = similarity_matrix[
+                            idx, selected_indices
+                        ]
+                        mean_similarities[i] = np.mean(similarities_to_selected)
+                    ranked_scores = (
+                        proba[remaining_indices]
+                        - search.similarity_penalty * mean_similarities
+                    )
+                else:
+                    ranked_scores = proba[remaining_indices]
+
+                best_local_idx = int(np.argmax(ranked_scores))
+                best_global_idx = remaining_indices[best_local_idx]
+                scores[best_global_idx] = rank
+                selected_indices.append(best_global_idx)
+                remaining_indices.remove(best_global_idx)
+
+            ranked = sorted(
+                zip(candidates, scores, strict=True),
+                key=operator.itemgetter(1),
+            )[:n_sorted]
+            return [member for member, _ in ranked]
+
+        search = LFBOPatternSearch.__new__(LFBOPatternSearch)
+        search.config_gen = SimpleNamespace(encode_config=lambda flat: [flat[0]])
+        search.similarity_penalty = 0.35
+        search.log = SimpleNamespace(debug=lambda *_args, **_kwargs: None)
+        search.surrogate = MockSurrogate(
+            proba_by_id={
+                0: 0.95,
+                1: 0.92,
+                2: 0.90,
+                3: 0.86,
+                4: 0.84,
+                5: 0.83,
+            },
+            leaf_by_id={
+                0: [10, 20, 30, 40],
+                1: [10, 20, 31, 41],
+                2: [11, 21, 32, 42],
+                3: [50, 60, 70, 80],
+                4: [50, 61, 71, 81],
+                5: [12, 22, 33, 43],
+            },
+        )
+        candidates = [SimpleNamespace(name=f"c{i}", flat_values=[i]) for i in range(6)]
+
+        expected = legacy_select(search, candidates, 3)
+
+        with patch.object(
+            search,
+            "compute_leaf_similarity",
+            side_effect=AssertionError("dense similarity matrix should not be built"),
+        ):
+            actual = search._surrogate_select(candidates, 3)
+
+        self.assertEqual([c.name for c in actual], [c.name for c in expected])
+
+    def test_tile_strategy_dispatch_compact_shape_uses_cached_block_lookup(self):
+        """Fallback block-id lookups should reuse the precomputed strategy cache."""
+
+        class DummyStrategy:
+            block_ids: ClassVar[list[int]] = [3, 4]
+
+            def block_size_var(self, block_idx: int) -> str:
+                return f"_BLOCK_{block_idx}"
+
+            def compact_shape(self, shapes):
+                return shapes
+
+        dispatch = TileStrategyDispatch.__new__(TileStrategyDispatch)
+        dispatch.strategies = [DummyStrategy()]
+        dispatch.block_id_to_strategy = BlockIDStrategyMapping()
+        dispatch.block_id_to_strategy[(3, 4)] = dispatch.strategies[0]
+
+        with patch(
+            "helion._compiler.tile_dispatch.CompileEnvironment.current",
+            return_value=SimpleNamespace(
+                get_block_id=lambda _shape: 3,
+                resolve_block_id=lambda _shape: 3,
+            ),
+        ):
+            compacted = dispatch._compact_shape([object()])
+
+        self.assertEqual(len(compacted), 1)
+        self.assertEqual(compacted[0].size_str, "_BLOCK_3")
+        self.assertEqual(compacted[0].block_ids, [3])
 
     @skip("too slow")
     def test_lfbo_pattern_search(self):

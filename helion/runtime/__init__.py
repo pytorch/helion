@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from contextlib import suppress
 import contextvars
-import hashlib
 import linecache
 import sys
 from typing import Any
@@ -1208,16 +1207,20 @@ def default_metal_launcher(
     metal_kernel: object,
     grid: tuple[int, ...],
     *args: object,
-    _block_size: int = 256,
+    _block_dims: tuple[int, int, int] = (256, 1, 1),
     **kwargs: object,
 ) -> None:
     """Default launcher for Metal kernels on Apple MPS devices.
 
-    Compiles MSL source via ``torch.mps.compile_shader()`` and dispatches
-    using the compiled library.  Caches the compiled library on the kernel
-    object to avoid recompilation on subsequent calls.
+    The ``metal_kernel`` is a ``@metal_jit`` decorated function that
+    translates its Python AST body to MSL and compiles it via
+    ``torch.mps.compile_shader`` on each call.
+    This launcher dispatches the compiled kernel with the given grid and
+    threadgroup dimensions.
 
-    Only 1D grids are currently supported.
+    Uses a 3D threadgroup dispatch model: ``_block_dims`` specifies the
+    threadgroup size as ``(x, y, z)``.  The grid specifies the number of
+    threadgroups per dimension.
     """
     kwargs.pop("num_warps", None)
     kwargs.pop("num_stages", None)
@@ -1226,20 +1229,15 @@ def default_metal_launcher(
             "metal", f"unexpected launcher kwargs: {sorted(kwargs)}"
         )
 
-    assert len(grid) == 1, (
-        f"Metal launcher only supports 1D grids, got {len(grid)}D: {grid}"
-    )
-
-    msl_source, kernel_name = metal_kernel()  # type: ignore[operator]
-    source_hash = hashlib.sha256(msl_source.encode()).digest()
-    cache = getattr(metal_kernel, "_metal_cache", None)
-    if cache is not None and cache[0] == source_hash:
-        lib = cache[1]
-    else:
-        lib = torch.mps.compile_shader(msl_source)  # type: ignore[attr-defined]
-        metal_kernel._metal_cache = (source_hash, lib)  # type: ignore[attr-defined]
+    lib, kernel_name = metal_kernel(*args)  # type: ignore[operator]
 
     tensor_args = [a for a in args if isinstance(a, torch.Tensor)]
     dispatch_fn = getattr(lib, kernel_name)
-    total_threads = grid[0] * _block_size
-    dispatch_fn(*tensor_args, threads=total_threads, group_size=_block_size)
+    bx, by, bz = _block_dims
+    # Pad grid to 3D
+    gx = grid[0] if len(grid) > 0 else 1
+    gy = grid[1] if len(grid) > 1 else 1
+    gz = grid[2] if len(grid) > 2 else 1
+    total_threads = (gx * bx, gy * by, gz * bz)
+    group_size = (bx, by, bz)
+    dispatch_fn(*tensor_args, threads=total_threads, group_size=group_size)

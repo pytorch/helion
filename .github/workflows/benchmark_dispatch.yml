@@ -18,6 +18,11 @@ on:
         required: false
         type: boolean
         default: false
+      run_mi350x:
+        description: 'Run benchmark on MI350X'
+        required: false
+        type: boolean
+        default: false
       kernels:
         description: 'Comma-separated list of kernels to benchmark'
         required: false
@@ -112,6 +117,33 @@ jobs:
       runtime-version: rocm7.1
       container-options: --device=/dev/kfd --device=/dev/dri
       alias: mi325x
+      kernels: ${{ matrix.kernels }}
+      env-vars: ${{ github.event.inputs.env_vars }}
+      custom-args: ${{ github.event.inputs.custom_args }}
+
+  gen-matrix-mi350x:
+    uses: ./.github/workflows/compute-benchmark-matrix.yml
+    if: ${{ github.event.inputs.run_mi350x == 'true' }}
+    with:
+      max-runners: 13
+      kernels: ${{ github.event.inputs.kernels }}
+
+  run-mi350x:
+    needs: gen-matrix-mi350x
+    uses: ./.github/workflows/benchmark.yml
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.gen-matrix-mi350x.outputs.matrix) }}
+    permissions:
+      id-token: write
+      contents: read
+    with:
+      runner: linux.rocm.gpu.ecosystem.gfx950.1
+      python-version: "3.12"
+      image: rocm/dev-ubuntu-24.04:7.1.1-complete
+      runtime-version: rocm7.1
+      container-options: --device=/dev/kfd --device=/dev/dri
+      alias: mi350x
       kernels: ${{ matrix.kernels }}
       env-vars: ${{ github.event.inputs.env_vars }}
       custom-args: ${{ github.event.inputs.custom_args }}

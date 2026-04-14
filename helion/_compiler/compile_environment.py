@@ -3,6 +3,7 @@ from __future__ import annotations
 import collections
 import contextlib
 import dataclasses
+import logging
 import sys
 import threading
 import types
@@ -34,18 +35,27 @@ from .. import exc
 from .._compat import shape_env_size_hint
 from .._utils import triton_is_available
 from ..language.constexpr import ConstExpr
-from .backend import Backend
-from .backend import CuteBackend
-from .backend import MetalBackend
-from .backend import PallasBackend
-from .backend import TileIRBackend
-from .backend import TritonBackend
+from .backend_registry import get_backend_class
 from .source_location import SourceLocation
 from .source_location import current_location
 from .variable_origin import BlockSizeOrigin
 from .variable_origin import GridOrigin
 from .variable_origin import Origin
 from .variable_origin import TensorSizeOrigin
+
+log = logging.getLogger(__name__)
+
+
+def _make_numel_check(
+    symbols: list[sympy.Basic], expr: sympy.Basic
+) -> typing.Callable[..., bool]:
+    """Evaluate a sympy constraint with concrete block-size values."""
+
+    def check(*args: int) -> bool:
+        return bool(expr.subs(list(zip(symbols, args, strict=True))))
+
+    return check
+
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -56,6 +66,7 @@ if TYPE_CHECKING:
 
     from .. import Config
     from ..runtime.settings import Settings
+    from .backend import Backend
 
     class _TLS(Protocol):
         env: CompileEnvironment | None
@@ -126,19 +137,12 @@ class CompileEnvironment:
             index_dtype or settings.index_dtype or torch.int32
         )
         self.process_group_name = None
-        backend_factory: dict[str, type[Backend]] = {
-            "triton": TritonBackend,
-            "pallas": PallasBackend,
-            "cute": CuteBackend,
-            "tileir": TileIRBackend,
-            "metal": MetalBackend,
-        }
-        self._backend = backend_factory[settings.backend]()
-        if settings.backend in ("pallas", "cute", "metal"):
+        self._backend = get_backend_class(settings.backend)()
+        if self._backend.experimental:
             from torch._dynamo.utils import warn_once
 
             warn_once(
-                f"The '{settings.backend}' backend is experimental and may have limited functionality.",
+                f"The '{self._backend.name}' backend is experimental and may have limited functionality.",
             )
         self.shape_env = ShapeEnv(
             specialize_zero_one=True,
@@ -259,6 +263,71 @@ class CompileEnvironment:
             kernel_tensor_sizes=self.kernel_tensor_sizes,  # pyrefly: ignore[bad-argument-type]
             min_element_bits=self.kernel_min_element_bits,
         )
+        self._extract_tensor_numel_constraints()
+
+    def _extract_tensor_numel_constraints(self) -> None:
+        """Compile per-tensor numel constraints from kernel_tensor_sizes."""
+        from ..autotuner.config_generation import TRITON_MAX_TENSOR_NUMEL
+        from ..autotuner.config_spec import TensorNumelConstraint
+
+        block_sym_to_id: dict[sympy.Symbol, int] = {}
+        for bs in self.block_sizes:
+            block_sym_to_id[bs.symbol()] = bs.block_id
+
+        seen_exprs: set[str] = set()
+        cs_block_sizes = self.config_spec.block_sizes
+        for shape in self.kernel_tensor_sizes:
+            if not shape:
+                continue
+            numel_expr = sympy.Mul(*shape) if len(shape) > 1 else shape[0]
+            all_free = numel_expr.free_symbols
+            involved_syms = all_free & block_sym_to_id.keys()
+            if not involved_syms:
+                continue
+            # Skip expressions with non-block-size free symbols (e.g.,
+            # runtime tensor dimensions) — they can't be evaluated at
+            # config generation time.
+            if all_free - block_sym_to_id.keys():
+                log.debug(
+                    "skipping numel constraint for shape %s: expression has "
+                    "non-block-size free symbols %s",
+                    shape,
+                    all_free - block_sym_to_id.keys(),
+                )
+                continue
+            try:
+                sym_to_cs_idx = {
+                    # pyrefly: ignore[bad-index]
+                    s: cs_block_sizes.block_id_to_index(block_sym_to_id[s])
+                    for s in involved_syms
+                }
+            except KeyError:
+                log.debug(
+                    "skipping numel constraint for shape %s: block_id removed "
+                    "during dedup",
+                    shape,
+                )
+                continue
+            ordered = sorted(involved_syms, key=lambda s: sym_to_cs_idx[s])
+            indices = tuple(sym_to_cs_idx[s] for s in ordered)
+            # pyrefly: ignore[unsupported-operation]
+            constraint_expr = numel_expr <= TRITON_MAX_TENSOR_NUMEL
+            # srepr is more canonical than str() for dedup; a false
+            # negative only causes a harmless duplicate, not a missed one.
+            dedup_key = sympy.srepr(constraint_expr)
+            if dedup_key in seen_exprs:
+                continue
+            seen_exprs.add(dedup_key)
+            expr_str = str(constraint_expr)
+            # pyrefly: ignore[bad-argument-type]
+            check_fn = _make_numel_check(ordered, constraint_expr)
+            self.config_spec.tensor_numel_constraints.append(
+                TensorNumelConstraint(
+                    check_fn=check_fn,
+                    block_indices=indices,
+                    expr_str=expr_str,
+                )
+            )
 
     def _disable_range_num_stages_for_aliasing(self) -> None:
         """

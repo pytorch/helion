@@ -3,10 +3,13 @@ from __future__ import annotations
 import functools
 import hashlib
 import itertools
+import logging
 import math
 import operator
 from typing import TYPE_CHECKING
 from typing import Any
+from typing import Callable
+from typing import NamedTuple
 from typing import cast
 
 import torch
@@ -44,6 +47,53 @@ if TYPE_CHECKING:
     from ..runtime.config import IndexingLiteral
     from ..runtime.config import PidTypeLiteral
     from .config_generation import ConfigGeneration
+
+log = logging.getLogger(__name__)
+
+
+class TensorNumelConstraint(NamedTuple):
+    """Tensor element count must stay within Triton's max numel limit."""
+
+    check_fn: Callable[..., bool]
+    block_indices: tuple[int, ...]
+    expr_str: str
+
+
+def shrink_block_sizes_for_numel_constraints(
+    constraints: list[TensorNumelConstraint],
+    block_sizes: list[int],
+    min_sizes: list[int],
+) -> None:
+    """Shrink *block_sizes* in-place so every *constraint* is satisfied.
+
+    Halves the largest involved block size first for balanced tiles.
+    Fixed-point loop handles cross-constraint interactions.
+    """
+    prev = list(block_sizes)
+    while True:
+        for constraint in constraints:
+            while not constraint.check_fn(
+                *(block_sizes[i] for i in constraint.block_indices)
+            ):
+                best_idx: int | None = None
+                best_val = -1
+                for i in constraint.block_indices:
+                    can_halve = block_sizes[i] // 2 >= min_sizes[i]
+                    if can_halve and block_sizes[i] > best_val:
+                        best_val = block_sizes[i]
+                        best_idx = i
+                if best_idx is None:
+                    log.warning(
+                        "tensor numel constraint unsatisfiable at minimum "
+                        "block sizes: %s",
+                        constraint.expr_str,
+                    )
+                    break
+                block_sizes[best_idx] //= 2
+        if block_sizes == prev:
+            break
+        prev = list(block_sizes)
+
 
 DEFAULT_NUM_WARPS = 4
 DEFAULT_NUM_STAGES = 1
@@ -97,6 +147,7 @@ VALID_KEYS: frozenset[str] = frozenset(
         "num_sm_multiplier",
         "maxnreg",
         "indexing",
+        "atomic_indexing",
         "load_eviction_policies",
         "pallas_loop_type",
         *BACKEND_TUNABLE_KEYS,
@@ -171,6 +222,7 @@ class ConfigSpec:
         self.allowed_pid_types: tuple[PidTypeLiteral, ...] = tuple(VALID_PID_TYPES)
         self.max_num_sm_multiplier: int = MAX_NUM_SM_MULTIPLIER
         self.grid_block_ids: list[int] = []
+        self.tensor_numel_constraints: list[TensorNumelConstraint] = []
         self.load_eviction_policies = ListOf(
             EnumFragment(choices=get_valid_eviction_policies(self.backend_name)),
             length=0,
@@ -179,11 +231,16 @@ class ConfigSpec:
             EnumFragment(choices=self.valid_indexing_types()),
             length=0,
         )
+        self.atomic_indexing = ListOf(
+            EnumFragment(choices=self.valid_atomic_indexing_types()),
+            length=0,
+        )
         self.epilogue_subtile_candidate_enabled: bool = False
         self.epilogue_subtile_autotune_choices: tuple[int | None, ...] | None = None
         self.epilogue_subtile_k_hint: int = 0
         self.has_pallas_inner_loops: bool = False
         self.has_pallas_symbolic_bounds: bool = False
+        self.store_indices: list[int] = []
         self.backend_tunable_fragments = self.backend.tunable_fragments()
         unknown_tunables = set(self.backend_tunable_fragments) - BACKEND_TUNABLE_KEYS
         if unknown_tunables:
@@ -191,30 +248,22 @@ class ConfigSpec:
                 f"Backend {self.backend_name!r} returned unknown tunables: {sorted(unknown_tunables)!r}"
             )
 
-    @staticmethod
-    def _uses_tensor_descriptor_indexing(indexing: object) -> bool:
-        if indexing == "tensor_descriptor":
-            return True
-        if isinstance(indexing, list) and indexing:
-            return all(value == "tensor_descriptor" for value in indexing)
-        return False
-
-    def _should_keep_epilogue_subtile_for_autotune(
-        self, config: Mapping[str, object]
-    ) -> bool:
+    def _should_keep_epilogue_subtile_for_autotune(self) -> bool:
         if self.epilogue_subtile_autotune_choices is None:
             return False
-        arch = _epilogue_subtile_autotune_arch()
-        if arch is None:
-            return False
-        if arch >= (10, 0):
-            if config.get("pid_type") not in (
-                "persistent_blocked",
-                "persistent_interleaved",
-            ):
-                return False
-            return self._uses_tensor_descriptor_indexing(config.get("indexing"))
-        return False
+        return supports_tensor_descriptor()
+
+    def fix_epilogue_subtile_store_indexing(self, config: dict[str, object]) -> None:
+        """Force subtiled store indexing to tensor_descriptor for correctness."""
+        if (
+            not self.epilogue_subtile_candidate_enabled
+            or "epilogue_subtile" not in config
+        ):
+            return
+        indexing = config.get("indexing")
+        if isinstance(indexing, list):
+            for i in self.store_indices:
+                indexing[i] = "tensor_descriptor"
 
     @staticmethod
     def _infer_epilogue_subtile_k_hint(args: Sequence[object]) -> int:
@@ -272,6 +321,12 @@ class ConfigSpec:
         if not self.backend.supports_block_ptr_indexing():
             return ("pointer",)
         return ("pointer", "block_ptr")
+
+    def valid_atomic_indexing_types(self) -> tuple[IndexingLiteral, ...]:
+        """Atomic ops only support pointer and tensor_descriptor (no block_ptr)."""
+        if supports_tensor_descriptor():
+            return ("pointer", "tensor_descriptor")
+        return ("pointer",)
 
     def _remove_duplicates(self) -> None:
         self.num_threads._remove_duplicates()
@@ -450,6 +505,7 @@ class ConfigSpec:
             "static_ranges",
             "load_eviction_policies",
             "indexing",
+            "atomic_indexing",
         ):
             if not config.get(name):
                 config.pop(name, None)
@@ -460,6 +516,7 @@ class ConfigSpec:
             "num_stages",
             "load_eviction_policies",
             "indexing",
+            "atomic_indexing",
             "pid_type",
             "num_sm_multiplier",
             "maxnreg",
@@ -477,6 +534,8 @@ class ConfigSpec:
             )
         if self.supports_config_key("indexing"):
             config.setdefault("indexing", self.indexing.default())
+        if self.supports_config_key("atomic_indexing"):
+            config.setdefault("atomic_indexing", self.atomic_indexing.default())
         for key, fragment in self.backend_tunable_fragments.items():
             config.setdefault(key, fragment.default())
         if self.has_pallas_inner_loops:
@@ -606,10 +665,23 @@ class ConfigSpec:
                 raise InvalidConfig(
                     f"epilogue_subtile must be one of {EPILOGUE_SUBTILE_EXTENDED_CHOICES!r}, got {val!r}"
                 )
-            elif _fix_invalid and not self._should_keep_epilogue_subtile_for_autotune(
-                config
-            ):
+            elif _fix_invalid and not self._should_keep_epilogue_subtile_for_autotune():
                 config.pop("epilogue_subtile", None)
+            # Epilogue subtiling is incompatible with flatten_loops because
+            # FlattenedTileStrategy does not support offset_var needed by
+            # the epilogue store codegen path.
+            flatten_loops = config.get("flatten_loops")
+            if (
+                "epilogue_subtile" in config
+                and isinstance(flatten_loops, list)
+                and any(flatten_loops)
+            ):
+                if _fix_invalid:
+                    config.pop("epilogue_subtile", None)
+                else:
+                    raise InvalidConfig(
+                        "epilogue_subtile is incompatible with flatten_loops=True"
+                    )
 
         # Set default values for grid indices when pid_type is not persistent
         if pid_type in ("flat", "xyz") and self.grid_block_ids:
@@ -646,6 +718,7 @@ class ConfigSpec:
 
         if self.supports_config_key("range_warp_specializes"):
             config["range_warp_specializes"] = range_warp_specializes
+
         # Allow tunable parameter keys in addition to backend-supported keys.
         allowed_keys = self.supported_config_keys() | {
             *self.user_defined_tunables.keys()
@@ -705,7 +778,27 @@ class ConfigSpec:
         )
 
     def default_config(self) -> helion.Config:
-        return self.flat_config(lambda x: x.default())
+        config = self.flat_config(lambda x: x.default())
+        self._shrink_for_numel_constraints(config)
+        return config
+
+    def _shrink_for_numel_constraints(self, config: helion.Config) -> None:
+        """Shrink block_sizes in *config* in-place so every tensor numel
+        constraint is satisfied.
+        """
+        block_sizes = config.config.get("block_sizes")
+        if (
+            not isinstance(block_sizes, list)
+            or not block_sizes
+            or not self.tensor_numel_constraints
+        ):
+            return
+        min_sizes = [
+            max(self.block_sizes[i].min_size, 1) for i in range(len(block_sizes))
+        ]
+        shrink_block_sizes_for_numel_constraints(
+            self.tensor_numel_constraints, block_sizes, min_sizes
+        )
 
     def _flat_fields(
         self,
@@ -763,6 +856,8 @@ class ConfigSpec:
             fields["num_stages"] = num_stages_fragment
         if self.supports_config_key("indexing"):
             fields["indexing"] = self.indexing
+        if self.supports_config_key("atomic_indexing"):
+            fields["atomic_indexing"] = self.atomic_indexing
         if self.supports_config_key("pid_type"):
             fields["pid_type"] = EnumFragment(self.allowed_pid_types)
         if self.supports_config_key("num_sm_multiplier"):
@@ -852,6 +947,7 @@ class ConfigSpec:
             "static_ranges",
             "load_eviction_policies",
             "indexing",
+            "atomic_indexing",
         ):
             if not config.get(name):
                 config.pop(name, None)
