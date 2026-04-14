@@ -1519,8 +1519,33 @@ class PallasBackend(Backend):
                     output_indices.append(i)
                     inplace_indices.append(i)
 
-        launcher_args = [*args, f"_output_indices={output_indices}"]
+        # Identify output-only args: remove from positional args and emit
+        # shape/dtype literals so the runtime can build out_shape without
+        # needing the actual tensors.
+        output_only_set = set(output_indices) - set(inplace_indices)
+        output_only_names: list[str] = []
+        output_only_shape_exprs: list[str] = []
+        if sorted_args is not None:
+            for i in output_indices:
+                if i in output_only_set:
+                    arg = sorted_args[i]
+                    assert isinstance(arg, TensorArg)
+                    output_only_names.append(arg.host_str())
+                    shape = tuple(arg.fake_value.shape)
+                    dtype = arg.fake_value.dtype
+                    output_only_shape_exprs.append(f"({shape}, {dtype})")
+        self._output_only_names = output_only_names
+        # Replace output-only tensors with None placeholders to keep
+        # indices aligned with _output_indices.
+        oo_name_set = set(output_only_names)
+        placeholder_args = ["None" if a in oo_name_set else a for a in args]
+
+        launcher_args = [*placeholder_args, f"_output_indices={output_indices}"]
         launcher_args.append(f"_inplace_indices={inplace_indices}")
+        if output_only_shape_exprs:
+            launcher_args.append(
+                f"_output_only_shapes=[{', '.join(output_only_shape_exprs)}]"
+            )
 
         if has_rng_ops:
             launcher_args.insert(-1, "_rng_seed_buffer")
