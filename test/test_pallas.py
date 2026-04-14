@@ -172,6 +172,19 @@ def pallas_inner_loop_add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 
 
 @helion.kernel(backend="pallas", static_shapes=True)
+def pallas_add_3d(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """Kernel with an outer grid loop and a 2D inner device loop."""
+    b, m, n = x.size()
+    out = torch.empty_like(x)
+    for tile_b in hl.tile(b):
+        for tile_m, tile_n in hl.tile([m, n]):
+            out[tile_b, tile_m, tile_n] = (
+                x[tile_b, tile_m, tile_n] + y[tile_b, tile_m, tile_n]
+            )
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
 def pallas_attention(
     q_in: torch.Tensor, k_in: torch.Tensor, v_in: torch.Tensor
 ) -> torch.Tensor:
@@ -353,7 +366,7 @@ class TestPallas(TestCase):
         from helion.runtime.config import Config
 
         bound = pallas_tile_begin_end.bind((x,))
-        code = bound.to_triton_code(Config(block_size=256))
+        code = bound.to_code(Config(block_size=256))
         self.assertIn("pl.program_id", code)
 
     def test_dynamic_scalar_no_recompile(self) -> None:
@@ -793,6 +806,36 @@ class TestPallas(TestCase):
         y = torch.arange(256, device=DEVICE, dtype=torch.int64)
         with self.assertRaises(TypeError, msg="does not support"):
             code_and_output(add_kernel, (x, y), block_size=128)
+
+    def test_fori_loop_multidim(self) -> None:
+        """Test fori_loop with a 2D inner loop (nested iteration)."""
+        args = (
+            torch.randn(4, 64, 128, device=DEVICE, dtype=torch.float32),
+            torch.randn(4, 64, 128, device=DEVICE, dtype=torch.float32),
+        )
+        code, result = code_and_output(
+            pallas_add_3d,
+            args,
+            block_sizes=[1, 8, 128],
+            pallas_loop_type="fori_loop",
+        )
+        self.assertGreaterEqual(code.count("jax.lax.fori_loop"), 2)
+        torch.testing.assert_close(result, args[0] + args[1])
+
+    def test_fori_loop_multidim_partial_tile(self) -> None:
+        """Test fori_loop with a 2D inner loop and a partial tail tile."""
+        args = (
+            torch.randn(4, 70, 130, device=DEVICE, dtype=torch.float32),
+            torch.randn(4, 70, 130, device=DEVICE, dtype=torch.float32),
+        )
+        code, result = code_and_output(
+            pallas_add_3d,
+            args,
+            block_sizes=[1, 8, 128],
+            pallas_loop_type="fori_loop",
+        )
+        self.assertGreaterEqual(code.count("jax.lax.fori_loop"), 2)
+        torch.testing.assert_close(result, args[0] + args[1])
 
 
 if __name__ == "__main__":

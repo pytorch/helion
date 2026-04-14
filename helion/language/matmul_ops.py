@@ -219,6 +219,17 @@ def enforce_dot_requirements(lhs: torch.Tensor, rhs: torch.Tensor) -> None:
     for shape, min_size in ((m, a), (n, b), (k, c)):
         block_idx = env.get_block_id(shape)
         if block_idx is not None:
+            # On Pallas, clamp min to the tensor dimension so we don't
+            # force blocks larger than the tensor (Pallas BlockSpecs can't
+            # handle that, unlike Triton which masks out-of-bounds accesses).
+            # The dot-level padding in matmul_utils.py will pad the smaller
+            # tile up to min_dot_size at codegen time.
+            if env.backend_name == "pallas":
+                try:
+                    bspec = env.config_spec.block_sizes.block_id_lookup(block_idx)
+                    min_size = min(min_size, bspec.size_hint)
+                except KeyError:
+                    pass
             env.block_sizes[block_idx].update_min_block(min_size, allow_flattened=True)
 
     # Triton only supports 2D dot operations.  When the operands are 3D
