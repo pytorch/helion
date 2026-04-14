@@ -881,15 +881,18 @@ class TileIRBackend(TritonBackend):
 _TORCH_TO_JAX_DTYPE: dict[str, str] = {
     "torch.float16": "jnp.float16",
     "torch.float32": "jnp.float32",
-    "torch.float64": "jnp.float64",
+    "torch.float64": "jnp.float32",
     "torch.bfloat16": "jnp.bfloat16",
+    "torch.float8_e4m3fn": "jnp.float8_e4m3fn",
+    "torch.float8_e5m2": "jnp.float8_e5m2",
     "torch.int8": "jnp.int8",
     "torch.int16": "jnp.int16",
     "torch.int32": "jnp.int32",
-    "torch.int64": "jnp.int64",
+    "torch.int64": "jnp.int32",
+    "torch.long": "jnp.int32",
     "torch.uint8": "jnp.uint8",
     "torch.uint32": "jnp.uint32",
-    "torch.uint64": "jnp.uint64",
+    "torch.uint64": "jnp.uint32",
     "torch.bool": "jnp.bool_",
     "torch.complex64": "jnp.complex64",
     "torch.complex128": "jnp.complex128",
@@ -1177,6 +1180,7 @@ class PallasBackend(Backend):
             tensor_ndim (int): Amount of dimensions for the tensor.
             bitwidth (int): Bitwidth of tensor elements
         """
+        bitwidth = min(bitwidth, 32)
         if dim_from_end == 0:  # Last dimension
             if tensor_ndim <= 1:
                 return 128 * (32 // bitwidth)
@@ -1388,7 +1392,7 @@ class PallasBackend(Backend):
                         # If not, fall-back to no tiling for the entire kernel
                         dim_size = tensor.shape[d]
                         dim_from_end = tensor.ndim - 1 - d
-                        bitwidth = tensor.dtype.itemsize * 8
+                        bitwidth = min(tensor.dtype.itemsize * 8, 32)
                         required_alignment = self._get_pallas_required_alignment(
                             dim_from_end, tensor.ndim, bitwidth
                         )
