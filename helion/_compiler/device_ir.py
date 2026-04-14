@@ -626,20 +626,26 @@ def _reduction_fx_inter_loop_rw_names(
     writes: set[str] = set()
     unknown = False
 
-    for node in graph.nodes:
-        if node.op != "call_function":
-            continue
-        if node.target is memory_ops.load:
-            nms, unmapped = _fx_trace_tensor_arg_rw_names(host, node.args[0])
-            reads.update(nms)
-            if unmapped or not nms:
-                unknown = True
-        elif node.target is memory_ops.store:
-            nms, unmapped = _fx_trace_tensor_arg_rw_names(host, node.args[0])
-            writes.update(nms)
-            if unmapped or not nms:
-                unknown = True
-        elif node.target in atomic_funcs:
+    for node in graph.find_nodes(
+        op="call_function", target=memory_ops.load, sort=False
+    ):
+        nms, unmapped = _fx_trace_tensor_arg_rw_names(host, node.args[0])
+        reads.update(nms)
+        if unmapped or not nms:
+            unknown = True
+
+    for node in graph.find_nodes(
+        op="call_function", target=memory_ops.store, sort=False
+    ):
+        nms, unmapped = _fx_trace_tensor_arg_rw_names(host, node.args[0])
+        writes.update(nms)
+        if unmapped or not nms:
+            unknown = True
+
+    for atomic_target in atomic_funcs:
+        for node in graph.find_nodes(
+            op="call_function", target=atomic_target, sort=False
+        ):
             nms, unmapped = _fx_trace_tensor_arg_rw_names(host, node.args[0])
             reads.update(nms)
             writes.update(nms)
