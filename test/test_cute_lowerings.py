@@ -57,10 +57,13 @@ from helion._compiler.cute.matmul_utils import cute_static_k_invariant_extent
 from helion._compiler.cute.matmul_utils import cute_supports_scalar_matmul_fallback
 from helion._compiler.device_ir import ForLoopGraphInfo
 from helion._compiler.device_ir import RootGraphInfo
+from helion._compiler.device_ir import collect_cute_half_atomic_output_promotions
 from helion._compiler.host_function import HostFunction
 from helion._compiler.reduction_strategy import PersistentReductionStrategy
 from helion._compiler.tile_strategy import DeviceGridState
 from helion._compiler.tile_strategy import DeviceLoopState
+from helion._compiler.tile_strategy import _lane_loop_iter
+from helion._compiler.variable_origin import NameOrigin
 from helion._compiler.variable_origin import TileBeginOrigin
 from helion._testing import DEVICE
 from helion._testing import onlyBackends
@@ -1456,6 +1459,89 @@ class TestCuteLowerings(unittest.TestCase):
             ),
         ):
             self.assertTrue(_loop_may_use_mma(fn, [0, 1]))
+
+    def test_collect_cute_half_atomic_output_promotions_declines_mixed_root_uses(
+        self,
+    ) -> None:
+        from helion.language import atomic_add
+        from helion.language._tracing_ops import _host_tensor
+
+        atomic_graph = Graph()
+        atomic_out = atomic_graph.call_function(_host_tensor, args=("out",))
+        atomic_value = atomic_graph.placeholder("atomic_value")
+        atomic_graph.call_function(atomic_add, args=(atomic_out, [0], atomic_value))
+        atomic_graph.output(atomic_out)
+
+        plain_graph = Graph()
+        plain_out = plain_graph.call_function(_host_tensor, args=("out",))
+        plain_graph.output(plain_out)
+
+        fake_out = torch.zeros(8, device=DEVICE, dtype=torch.float16)
+        fake_value = torch.zeros(8, device=DEVICE, dtype=torch.float32)
+        atomic_out.meta["val"] = fake_out
+        plain_out.meta["val"] = fake_out
+        atomic_value.meta["val"] = fake_value
+
+        fake_host_fn = SimpleNamespace(
+            tensor_to_origin={fake_out: NameOrigin("out")},
+        )
+
+        with patch.object(HostFunction, "current", return_value=fake_host_fn):
+            promotions = collect_cute_half_atomic_output_promotions(
+                [
+                    RootGraphInfo(graph_id=0, graph=atomic_graph, phase_index=0),
+                    RootGraphInfo(graph_id=1, graph=plain_graph, phase_index=1),
+                ]
+            )
+
+        self.assertEqual(promotions, {})
+
+    def test_collect_cute_half_atomic_output_promotions_declines_mixed_root_loop_uses(
+        self,
+    ) -> None:
+        from helion.language import atomic_add
+        from helion.language._tracing_ops import _host_tensor
+
+        root_graph = Graph()
+        root_out = root_graph.call_function(_host_tensor, args=("out",))
+        root_value = root_graph.placeholder("root_value")
+        root_graph.call_function(atomic_add, args=(root_out, [0], root_value))
+        root_graph.output(root_out)
+
+        loop_graph = Graph()
+        loop_out = loop_graph.call_function(_host_tensor, args=("out",))
+        loop_graph.output(loop_out)
+
+        fake_out = torch.zeros(8, device=DEVICE, dtype=torch.float16)
+        fake_value = torch.zeros(8, device=DEVICE, dtype=torch.float32)
+        root_out.meta["val"] = fake_out
+        loop_out.meta["val"] = fake_out
+        root_value.meta["val"] = fake_value
+
+        fake_host_fn = SimpleNamespace(
+            tensor_to_origin={fake_out: NameOrigin("out")},
+        )
+
+        with patch.object(HostFunction, "current", return_value=fake_host_fn):
+            promotions = collect_cute_half_atomic_output_promotions(
+                [
+                    RootGraphInfo(graph_id=0, graph=root_graph, phase_index=0),
+                    ForLoopGraphInfo(
+                        graph_id=1,
+                        graph=loop_graph,
+                        node_args=[],
+                        block_ids=[2],
+                    ),
+                ]
+            )
+
+        self.assertEqual(promotions, {})
+
+    def test_lane_loop_iter_uses_python_range_for_cute_lane_loops(self) -> None:
+        env = SimpleNamespace(backend=SimpleNamespace(name="cute"))
+        with patch.object(CompileEnvironment, "current", return_value=env):
+            self.assertEqual(ast.unparse(_lane_loop_iter(8)), "range(8)")
+            self.assertEqual(ast.unparse(_lane_loop_iter(9)), "range(9)")
 
     def test_create_loop_strategy_preserves_auto_threads_for_mma_candidate(
         self,

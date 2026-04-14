@@ -77,6 +77,32 @@ class MatmulExecutionPlan:
     lane_extent: int
 
 
+@dataclass(frozen=True)
+class CuTeGridExecutionPlan:
+    """Branch-scoped CuTe thread-axis policy chosen by layout planning."""
+
+    scoped_block_ids: frozenset[int]
+    block_axis_priority: dict[int, int]
+    disable_reduction_axis_reservation_for: frozenset[int]
+
+    def applies_to_block(self, block_id: int) -> bool:
+        return block_id in self.scoped_block_ids
+
+    def applies_to_any_block(self, block_ids: tuple[int, ...] | list[int]) -> bool:
+        return any(block_id in self.scoped_block_ids for block_id in block_ids)
+
+    def priority_for_block(self, block_id: int) -> int | None:
+        if block_id not in self.scoped_block_ids:
+            return None
+        return self.block_axis_priority.get(block_id)
+
+    def disables_reduction_axis_reservation(self, block_id: int) -> bool:
+        return (
+            block_id in self.scoped_block_ids
+            and block_id in self.disable_reduction_axis_reservation_for
+        )
+
+
 def _checked_div(a: SymIntLike, b: SymIntLike) -> SymIntLike:
     """Floor-divide *a* by *b*, asserting exact divisibility for concrete values."""
     if isinstance(a, int) and isinstance(b, int):

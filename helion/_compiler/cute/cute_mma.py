@@ -37,6 +37,7 @@ from ..matmul_utils import _needs_f32_accumulator
 from ..tile_strategy import DeviceLoopState
 from .layout import MatmulExecutionKind
 from .layout import MatmulExecutionPlan
+from .matmul_utils import analyze_direct_grouped_n_loads
 from .mma_support import get_cute_mma_support
 
 if TYPE_CHECKING:
@@ -161,30 +162,6 @@ def _trace_to_load_tensor(node: Node) -> tuple[Node, str, torch.Tensor] | None:
     if not isinstance(fake, torch.Tensor):
         return None
     return load_node, tensor_node.name, fake
-
-
-def _supports_direct_grouped_n_loads(lhs_load: Node, rhs_load: Node) -> bool:
-    def is_full_slice(index: object) -> bool:
-        return (
-            isinstance(index, slice)
-            and index.start is None
-            and index.stop is None
-            and index.step is None
-        )
-
-    if len(lhs_load.args) < 2 or len(rhs_load.args) < 2:
-        return False
-    lhs_index = lhs_load.args[1]
-    rhs_index = rhs_load.args[1]
-    if not isinstance(lhs_index, list) or not isinstance(rhs_index, list):
-        return False
-    if len(lhs_index) != 2 or len(rhs_index) != 2:
-        return False
-    return (
-        is_full_slice(lhs_index[1])
-        and is_full_slice(rhs_index[0])
-        and is_full_slice(rhs_index[1])
-    )
 
 
 def _has_mma_operands(lhs_node: Node, rhs_node: Node) -> bool:
@@ -1698,11 +1675,26 @@ def codegen_cute_mma_direct_mm(
         return None
     lhs_load, _, lhs_fake = lhs_info
     rhs_load, _, rhs_fake = rhs_info
-    if lhs_fake.ndim != 2 or rhs_fake.ndim != 2:
+    lhs_val = lhs_node.meta.get("val")
+    rhs_val = rhs_node.meta.get("val")
+    if (
+        lhs_fake.ndim != 2
+        or rhs_fake.ndim != 2
+        or not isinstance(lhs_val, torch.Tensor)
+        or not isinstance(rhs_val, torch.Tensor)
+        or lhs_val.ndim != 2
+        or rhs_val.ndim != 2
+    ):
         return None
     if lhs_fake.dtype not in (torch.float16, torch.bfloat16):
         return None
-    if not _supports_direct_grouped_n_loads(lhs_load, rhs_load):
+    load_plan = analyze_direct_grouped_n_loads(
+        lhs_load,
+        rhs_load,
+        k_extent=serial_k_extent,
+        n_extent=int(rhs_val.shape[1]),
+    )
+    if load_plan is None:
         return None
 
     mma_impl = _choose_mma_impl(lhs_fake.dtype, bm=plan.bm, bn=plan.bn, bk=plan.bk)
@@ -1738,7 +1730,7 @@ def codegen_cute_mma_direct_mm(
     mma_active = f"({tile_n_local}) < cutlass.Int32({_mma_active_n_threads(mma_impl)})"
     mma_thread_linear = f"{m_local} + ({tile_n_local}) * cutlass.Int32({plan.bm})"
     m_size = int(lhs_fake.shape[0])
-    n_size = int(rhs_fake.shape[1])
+    n_size = int(rhs_val.shape[1])
     k_size = serial_k_extent
 
     df = cg.device_function
@@ -1836,10 +1828,10 @@ def codegen_cute_mma_direct_mm(
             f"                _row = _flat // cutlass.Int32({plan.bk})\n"
             f"                _col = _flat % cutlass.Int32({plan.bk})\n"
             f"                _gm = {m_tile_origin} + _row\n"
-            f"                _gk = cutlass.Int32({k_offset_var}) + _col\n"
+            f"                _gk = cutlass.Int32({load_plan.lhs_k_offset}) + cutlass.Int32({k_offset_var}) + _col\n"
             f"                {smem_a}[_row, _col] = ("
             f"{lhs_arg_name}[_gm, _gk] "
-            f"if _gm < cutlass.Int32({m_size}) and _gk < cutlass.Int32({k_size}) "
+            f"if _gm < cutlass.Int32({m_size}) and _gk < cutlass.Int32({load_plan.lhs_k_offset + k_size}) "
             f"else {input_dtype_str}(0.0))\n"
             f"    cute.arch.sync_threads()\n"
             f"    for _n_group in range({plan.groups_per_lane}):\n"
@@ -1849,11 +1841,11 @@ def codegen_cute_mma_direct_mm(
             f"                if _flat < cutlass.Int32({plan.bn * plan.bk}):\n"
             f"                    _row = _flat // cutlass.Int32({plan.bk})\n"
             f"                    _col = _flat % cutlass.Int32({plan.bk})\n"
-            f"                    _gn = ({lane_group_base} + cutlass.Int32(_n_group)) * cutlass.Int32({plan.bn}) + _row\n"
-            f"                    _gk = cutlass.Int32({k_offset_var}) + _col\n"
+            f"                    _gn = cutlass.Int32({load_plan.rhs_n_offset}) + ({lane_group_base} + cutlass.Int32(_n_group)) * cutlass.Int32({plan.bn}) + _row\n"
+            f"                    _gk = cutlass.Int32({load_plan.rhs_k_offset}) + cutlass.Int32({k_offset_var}) + _col\n"
             f"                    {smem_b}[_row, _col] = ("
             f"{rhs_arg_name}[_gk, _gn] "
-            f"if _gn < cutlass.Int32({n_size}) and _gk < cutlass.Int32({k_size}) "
+            f"if _gn < cutlass.Int32({load_plan.rhs_n_offset + n_size}) and _gk < cutlass.Int32({load_plan.rhs_k_offset + k_size}) "
             f"else {input_dtype_str}(0.0))\n"
             f"        cute.arch.sync_threads()\n"
             f"        if {mma_active} and ({tile_group}) == cutlass.Int32(_n_group):\n"

@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import logging
 from typing import TYPE_CHECKING
-from typing import Sequence
 
 import torch
 
@@ -26,12 +25,14 @@ from ...language import memory_ops
 from ...language import reduce_ops
 from ..compile_environment import CompileEnvironment
 from ..device_ir import RootGraphInfo
+from .layout import CuTeGridExecutionPlan
 from .layout import LayoutConstraint
 from .layout import LayoutTag
 from .layout import MatmulExecutionKind
 from .layout import MatmulExecutionPlan
 from .layout import ThreadLayout
 from .layout_rules import preferred_constraint_for_node
+from .matmul_utils import analyze_direct_grouped_n_loads
 
 if TYPE_CHECKING:
     from ...runtime.config import Config
@@ -155,9 +156,6 @@ def _plan_matmul_execution(
             continue
         if lhs_val.dtype not in (torch.float16, torch.bfloat16):
             continue
-        if not _supports_direct_grouped_n_operands(lhs_node, rhs_node):
-            continue
-
         scalar_block_id = _direct_grouped_n_scalar_block_id(
             tile_strategy,
             lhs_val,
@@ -169,9 +167,8 @@ def _plan_matmul_execution(
         scalar_threads = tile_strategy.thread_extent_for_block_id(scalar_block_id)
         if scalar_threads is None or scalar_threads < 8 or scalar_threads % 8 != 0:
             continue
-        m_strategy = tile_strategy.block_id_to_strategy.get_any(m_block_id)
         scalar_strategy = tile_strategy.block_id_to_strategy.get((scalar_block_id,))
-        if m_strategy is None or scalar_strategy is None:
+        if scalar_strategy is None:
             continue
         lane_extent = getattr(scalar_strategy, "_synthetic_cute_lane_extent", 1)
         if not isinstance(lane_extent, int) or lane_extent <= 0:
@@ -181,6 +178,25 @@ def _plan_matmul_execution(
             size_hint(rhs_val.shape[1]) if callable(size_hint) else rhs_val.shape[1]
         )
         if not isinstance(n_extent, int):
+            continue
+        k_extent = (
+            size_hint(lhs_val.shape[1]) if callable(size_hint) else lhs_val.shape[1]
+        )
+        if not isinstance(k_extent, int):
+            continue
+        lhs_load = lhs_node if lhs_node.target is memory_ops.load else None
+        rhs_load = rhs_node if rhs_node.target is memory_ops.load else None
+        load_plan = (
+            None
+            if lhs_load is None or rhs_load is None
+            else analyze_direct_grouped_n_loads(
+                lhs_load,
+                rhs_load,
+                k_extent=k_extent,
+                n_extent=n_extent,
+            )
+        )
+        if lhs_load is None or rhs_load is None or load_plan is None:
             continue
         if scalar_threads * lane_extent < n_extent:
             continue
@@ -195,42 +211,19 @@ def _plan_matmul_execution(
             groups_per_lane=scalar_threads // 8,
             lane_extent=lane_extent,
         )
-        m_strategy._cute_thread_axis_priority = 0
-        scalar_strategy._cute_thread_axis_priority = 1
-        m_strategy._cute_disable_reduction_axis_reservation = True
-        scalar_strategy._cute_disable_reduction_axis_reservation = True
-
-
-def _supports_direct_grouped_n_operands(
-    lhs_node: torch.fx.Node, rhs_node: torch.fx.Node
-) -> bool:
-    def is_full_slice(index: object) -> bool:
-        return (
-            isinstance(index, slice)
-            and index.start is None
-            and index.stop is None
-            and index.step is None
+        graph_info.cute_grid_execution_plans = (
+            *graph_info.cute_grid_execution_plans,
+            CuTeGridExecutionPlan(
+                scoped_block_ids=frozenset({m_block_id, scalar_block_id}),
+                block_axis_priority={
+                    m_block_id: 0,
+                    scalar_block_id: 1,
+                },
+                disable_reduction_axis_reservation_for=frozenset(
+                    {m_block_id, scalar_block_id}
+                ),
+            ),
         )
-
-    def load_indices(node: torch.fx.Node) -> Sequence[object] | None:
-        if node.op != "call_function" or node.target is not memory_ops.load:
-            return None
-        if len(node.args) < 2:
-            return None
-        index = node.args[1]
-        return index if isinstance(index, list) else None
-
-    lhs_index = load_indices(lhs_node)
-    rhs_index = load_indices(rhs_node)
-    if lhs_index is None or rhs_index is None:
-        return False
-    if len(lhs_index) != 2 or len(rhs_index) != 2:
-        return False
-    return (
-        is_full_slice(lhs_index[1])
-        and is_full_slice(rhs_index[0])
-        and is_full_slice(rhs_index[1])
-    )
 
 
 def _direct_grouped_n_scalar_block_id(

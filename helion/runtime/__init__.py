@@ -3,6 +3,7 @@ from __future__ import annotations
 from contextlib import suppress
 import contextvars
 import linecache
+import os
 import sys
 from typing import Any
 from typing import cast
@@ -1318,6 +1319,7 @@ def _build_cute_schema_and_args(
     import cutlass.cute as cute
     from cutlass.cute.runtime import make_ptr
 
+    _ensure_cute_dsl_arch_env(args)
     schema: list[tuple[object, ...]] = []
     launch_args: list[object] = []
     for arg in args:
@@ -1347,6 +1349,23 @@ def _build_cute_schema_and_args(
 
     launch_args.extend((*grid, *block))
     return tuple(schema), tuple(launch_args)
+
+
+def _ensure_cute_dsl_arch_env(args: tuple[object, ...]) -> None:
+    tensor_args = [arg for arg in args if isinstance(arg, torch.Tensor)]
+    if tensor_args:
+        device = tensor_args[0].device
+        if device.type != "cuda":
+            return
+        with torch.cuda.device(device):
+            major, minor = torch.cuda.get_device_capability(device)
+    elif not torch.cuda.is_available():
+        return
+    else:
+        major, minor = torch.cuda.get_device_capability()
+    desired = f"sm_{major}{minor}"
+    if os.environ.get("CUTE_DSL_ARCH") != desired:
+        os.environ["CUTE_DSL_ARCH"] = desired
 
 
 def default_cute_launcher(

@@ -66,6 +66,13 @@ class ThreadAxisTracker:
             self.block_axes[block_id] = axis
 
 
+def _lane_loop_iter(extent: int) -> ast.AST:
+    # CuTe lane loops carry per-thread scalar state. Emitting them via
+    # cutlass.range(_constexpr) miscompiles scalar matmul paths, so keep them
+    # as ordinary Python loops.
+    return expr_from_string(f"range({extent})")
+
+
 @dataclasses.dataclass
 class LoopDimInfo:
     begin_var_name: str | None = None
@@ -167,7 +174,7 @@ class DeviceGridState(DeviceLoopOrGridState):
                 create(
                     ast.For,
                     target=create(ast.Name, id=lane_var, ctx=ast.Store()),
-                    iter=expr_from_string(f"range({extent})"),
+                    iter=_lane_loop_iter(extent),
                     body=wrapped,
                     orelse=[],
                     type_comment=None,
@@ -193,7 +200,7 @@ class PersistentReductionState(DeviceLoopOrGridState):
                 create(
                     ast.For,
                     target=create(ast.Name, id=lane_var, ctx=ast.Store()),
-                    iter=expr_from_string(f"range({extent})"),
+                    iter=_lane_loop_iter(extent),
                     body=wrapped,
                     orelse=[],
                     type_comment=None,
@@ -221,8 +228,6 @@ class TileStrategy:
             block_idx: self.fn.new_var(f"offset_{block_idx}", dce=True)
             for block_idx in block_ids
         }
-        self._cute_thread_axis_priority: int | None = None
-        self._cute_disable_reduction_axis_reservation: bool = False
 
     @property
     def fn(self) -> DeviceFunction:
@@ -682,7 +687,13 @@ class BlockSizeTileStrategy(TileStrategy):
             isinstance(strategy, ReductionStrategy) and strategy.thread_axes_used() > 0
             for strategy in self.fn.tile_strategy.strategies
         )
-        if self._cute_disable_reduction_axis_reservation:
+        plan = self.fn.tile_strategy.current_cute_grid_execution_plan(
+            block_ids=self.block_ids
+        )
+        if plan is not None and any(
+            plan.disables_reduction_axis_reservation(block_id)
+            for block_id in self.block_ids
+        ):
             return active_non_reduction_axes + active_reduction_axes
         reserved_reduction_axes = max(
             1 if has_reduction_strategy else 0, active_reduction_axes
@@ -2063,7 +2074,7 @@ class CuteNDTileStrategy(NDTileStrategy):
             lane_for = create(
                 ast.For,
                 target=create(ast.Name, id=lane_var, ctx=ast.Store()),
-                iter=expr_from_string(f"range({extent})"),
+                iter=_lane_loop_iter(extent),
                 body=body,
                 orelse=[],
                 type_comment=None,
