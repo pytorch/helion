@@ -468,6 +468,10 @@ class Backend(abc.ABC):
         loop_order = env.config_spec.loop_orders.config_get(
             config.loop_orders, block_ids[0]
         ) or [*range(len(block_ids))]
+        # The config lookup may return a loop_order from a wider tile call
+        # (e.g. 2-dim order for a 1-dim strategy created by grid fission).
+        if len(loop_order) != len(block_ids):
+            loop_order = [*range(len(block_ids))]
         l2_grouping = env.config_spec.l2_groupings.config_get(
             config.l2_groupings, block_ids[0], 1
         )

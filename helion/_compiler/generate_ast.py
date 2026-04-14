@@ -313,7 +313,10 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         self.current_grid_state = (
             device_grid if isinstance(device_grid, DeviceGridState) else None
         )
-        for idx in device_grid.block_ids:
+        # Use block_id_to_info keys (not strategy.block_ids) so that
+        # fully-fissioned dims handled by ForLoopGraphInfo device loops
+        # are not registered as active grid loops.
+        for idx in device_grid.block_id_to_info:
             self.active_device_loops[idx] = [device_grid]
 
     def generic_visit(self, node: ast.AST) -> ast.AST:

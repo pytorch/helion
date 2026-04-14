@@ -602,17 +602,62 @@ class DeviceIR:
             graphs_with_rolled_rdim |= used_graphs
 
     def build_codegen_graphs(self, config: Config) -> list[GraphInfo]:
-        """Build and return graph copies with reduction rolling applied.
+        """Build and return graph copies with reduction rolling and grid fission applied.
 
         Creates a temporary DeviceIR with copied graphs, applies reduction
-        rolling based on the config, and returns the resulting graphs.
-        The original graphs are never modified.
+        rolling and grid fission based on the config, and returns the
+        resulting graphs.  The original graphs are never modified.
         """
 
         temp = copy.copy(self)
         temp.graphs = [g.copy() for g in self.graphs]
         temp._apply_rolling(config)
+        temp._apply_grid_fission(config)
         return temp.graphs
+
+    def _apply_grid_fission(self, config: Config) -> None:
+        """Apply full-fission graph transformation for dims with factor=-1.
+
+        For each fully-fissioned grid dimension, wraps the root graph body
+        in a ForLoopGraphInfo so that the standard codegen_device_loop path
+        handles the loop generation.
+        """
+        import sympy
+
+        from .grid_fission import GridFissionTransformer
+
+        env = CompileEnvironment.current()
+        block_sizes = config.block_sizes
+        for i, block_ids in enumerate(self.grid_block_ids):
+            fission_factors = env.config_spec.grid_fissions.config_get(
+                config.grid_fissions, block_ids[0], None
+            )
+            if not fission_factors:
+                continue
+            root_graph_id = self.root_ids[i]
+            for block_id, factor in zip(block_ids, fission_factors, strict=True):
+                if factor == 0:
+                    continue
+                # Normalize: partial fission factor >= num_blocks → full fission.
+                # This mirrors the normalization in codegen_grid.
+                if factor > 0:
+                    bs_info = env.block_sizes[block_id]
+                    bs = env.config_spec.block_sizes.config_get(block_sizes, block_id)
+                    if bs_info.size is not None and bs is not None:
+                        numel_val = bs_info.numel
+                        if isinstance(numel_val, (int, sympy.Integer)):
+                            num_blocks = int(
+                                sympy.ceiling(sympy.Rational(int(numel_val), bs))
+                            )
+                            if factor >= num_blocks:
+                                factor = -1
+                if factor != -1:
+                    continue
+                numel = env.block_sizes[block_id].numel
+                transformer = GridFissionTransformer(self, block_id, numel)
+                new_graph = transformer.process(self.graphs[root_graph_id].graph)
+                # Replace only the graph payload to preserve root metadata
+                self.graphs[root_graph_id].graph = new_graph
 
     def _apply_rolling(self, config: Config) -> None:
         """Apply reduction rolling on the graph copies."""

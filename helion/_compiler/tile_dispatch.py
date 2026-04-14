@@ -42,8 +42,10 @@ class TileStrategyDispatch:
 
     def _add_loop_strategies(self, fn: DeviceFunction, config: Config) -> None:
         device_ir = HostFunction.current().device_ir
+        self.num_grid_strategies = 0
         for block_ids in device_ir.grid_block_ids:
             self._add_loop_strategy(block_ids, fn, config)
+            self.num_grid_strategies += 1
         for graph in fn.codegen.codegen_graphs:
             if isinstance(graph, ForLoopGraphInfo) and not isinstance(
                 graph, ReductionLoopGraphInfo
@@ -189,8 +191,7 @@ class TileStrategyDispatch:
 
     def _strategy_branches(self) -> list[list[TileStrategy]]:
         """Return strategy branches that execute mutually exclusively."""
-        device_ir = HostFunction.current().device_ir
-        num_grids = len(device_ir.grid_block_ids)
+        num_grids = self.num_grid_strategies
         grid_strategies = self.strategies[:num_grids]
 
         if num_grids <= 1:
