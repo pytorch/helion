@@ -468,27 +468,6 @@ def _pallas_make_reordered_kernel(
             original_order[orig_pos] = out_ref
         extra_refs = refs[n_tensor_inputs + len(_output_indices) :]
 
-        # --- DEBUG TRACE ---
-        print("\n[DEBUG TRACE] Executing Pallas Kernel")
-        print("Original Order (Tensors):")
-        for i, ref in enumerate(original_order):
-            if hasattr(ref, "shape"):
-                print(
-                    f"  Arg {i}: Shape={ref.shape}, Dtype={getattr(ref, 'dtype', 'unknown')}"
-                )
-            else:
-                print(f"  Arg {i}: Value={ref}")
-        print("Extra Refs (Scratches/VMEM):")
-        for i, ref in enumerate(extra_refs):
-            if hasattr(ref, "shape"):
-                print(
-                    f"  Scratch {i}: Shape={ref.shape}, Dtype={getattr(ref, 'dtype', 'unknown')}"
-                )
-            else:
-                print(f"  Scratch {i}: Value={ref} (Likely Semaphore)")
-        print("---------------------\n")
-        # -------------------
-
         pallas_kernel(*original_order, *extra_refs)  # type: ignore[operator]
 
     return reordered_kernel
@@ -843,19 +822,6 @@ def default_pallas_pipeline_launcher(
         if _pallas_interpret_flag():
             pallas_call_kwargs["interpret"] = True
 
-        # --- DEBUG PALLAS CALL ---
-        print(f"\n[DEBUG PALLAS CALL] {'Pipeline/Fori Launcher'}")
-        for k, v in pallas_call_kwargs.items():
-            if k == "grid_spec":
-                print(f"  {k}:")
-                print(f"    in_specs: {v.in_specs}")
-                print(f"    out_specs: {v.out_specs}")
-                print(f"    scratch_shapes: {v.scratch_shapes}")
-            else:
-                print(f"  {k}: {v}")
-        print("--------------------------\n")
-        # -------------------------
-
         jit_fn = pl.pallas_call(
             reordered_kernel,  # pyrefly: ignore[bad-argument-type]
             **pallas_call_kwargs,  # type: ignore[arg-type]
@@ -1003,19 +969,6 @@ def default_pallas_fori_launcher(
         }
         if _pallas_interpret_flag():
             pallas_call_kwargs["interpret"] = True
-
-        # --- DEBUG PALLAS CALL ---
-        print(f"\n[DEBUG PALLAS CALL] {'Pipeline/Fori Launcher'}")
-        for k, v in pallas_call_kwargs.items():
-            if k == "grid_spec":
-                print(f"  {k}:")
-                print(f"    in_specs: {v.in_specs}")
-                print(f"    out_specs: {v.out_specs}")
-                print(f"    scratch_shapes: {v.scratch_shapes}")
-            else:
-                print(f"  {k}: {v}")
-        print("--------------------------\n")
-        # -------------------------
 
         jit_fn = pl.pallas_call(
             reordered_kernel,  # pyrefly: ignore[bad-argument-type]

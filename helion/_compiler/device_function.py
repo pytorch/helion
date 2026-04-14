@@ -1024,11 +1024,6 @@ class HelionPallasPrinter(HelionTritonPrinter):
         # pyrefly: ignore [missing-attribute]
         return f"({self._print(lhs)} // {self._print(rhs)})"
 
-    def _print_PythonMod(self, expr: sympy.Expr) -> str:
-        lhs, rhs = expr.args
-        # pyrefly: ignore [missing-attribute]
-        return f"({self._print(lhs)} % {self._print(rhs)})"
-
 
 def pallas_texpr(expr: sympy.Expr) -> str:
     return HelionPallasPrinter().doprint(expr)

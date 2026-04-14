@@ -1226,7 +1226,6 @@ class PallasBackend(Backend):
         # Tiling size for 1D arrays.  Mosaic lowering enforces that rank-1
         # BlockSpec block shapes are a multiple of 128 * (32 // bitwidth).
         min_element_bits = min(min_element_bits, 32)
-        tiling_1d = 128 * (32 // min_element_bits)
 
         # Map block_id -> minimum dim_from_end across all tensors
         min_dim_from_end: dict[int, int] = {}
