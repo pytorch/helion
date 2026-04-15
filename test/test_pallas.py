@@ -679,37 +679,41 @@ class TestPallas(TestCase):
         expected = x + 0.5
         torch.testing.assert_close(result, expected)
 
+    @xfailIfPallas("Pallas backend not correctly handling tile index with offset")
     def test_tensor_access_tile_index_offset(self) -> None:
         @helion.kernel(backend="pallas", static_shapes=True)
-        def fn(x: torch.Tensor) -> torch.Tensor:
+        def fn(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
             (n,) = x.size()
             out = torch.zeros(n, device=DEVICE, dtype=torch.float32)
             for tile in hl.tile(n // 2):
                 out[tile] = x[tile]
-                out[tile.index + n // 2] = x[tile.index + n // 2]
+                out[tile.index + n // 2] = y[tile.index + n // 2]
             return out
 
         x = torch.randn(128, device=DEVICE, dtype=torch.float32)
-        result = fn(x)
-        torch.testing.assert_close(result, x)
+        y = torch.randn(128, device=DEVICE, dtype=torch.float32)
+        result = fn(x, y)
+        torch.testing.assert_close(result, torch.concat((x[:64], y[64:])))
 
+    @xfailIfPallas("Pallas backend not correctly handling tile index with offset")
     def test_tensor_access_tile_index_offset_2d(self) -> None:
         @helion.kernel(backend="pallas", static_shapes=True)
-        def fn(x: torch.Tensor) -> torch.Tensor:
+        def fn(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
             (n, m) = x.size()
             out = torch.zeros(x.size(), device=DEVICE, dtype=torch.float32)
             for tile1, tile2 in hl.tile([n // 2, m // 2]):
                 out[tile1, tile2] = x[tile1, tile2]
-                out[tile1.index + n // 2, tile2] = x[tile1.index + n // 2, tile2]
+                out[tile1.index + n // 2, tile2] = y[tile1.index + n // 2, tile2]
                 out[tile1, tile2 + m // 2] = x[tile1, tile2 + m // 2]
-                out[tile1.index + n // 2, tile2 + m // 2] = x[
+                out[tile1.index + n // 2, tile2 + m // 2] = y[
                     tile1.index + n // 2, tile2 + m // 2
                 ]
             return out
 
         x = torch.randn(128, 128, device=DEVICE, dtype=torch.float32)
-        _, result = code_and_output(fn, (x,), block_size=[128, 128])
-        torch.testing.assert_close(result, x)
+        y = torch.randn(128, 128, device=DEVICE, dtype=torch.float32)
+        _, result = code_and_output(fn, (x, y), block_size=[128, 128])
+        torch.testing.assert_close(result, torch.concat((x[:64, :], y[64:, :])))
 
     def test_tensor_access_tile_id(self) -> None:
         @helion.kernel(backend="pallas", static_shapes=True, config=helion.Config())
