@@ -1546,14 +1546,15 @@ class PallasBackend(Backend):
         # Replace output-only tensors with None placeholders to keep
         # indices aligned with _output_indices.
         oo_name_set = set(output_only_names)
-        placeholder_args = ["None" if a in oo_name_set else a for a in args]
+        filtered_args = [a for a in args if a not in oo_name_set]
 
-        launcher_args = [*placeholder_args, f"_output_indices={output_indices}"]
+        launcher_args = [*filtered_args, f"_output_indices={output_indices}"]
         launcher_args.append(f"_inplace_indices={inplace_indices}")
         if output_only_shape_exprs:
-            launcher_args.append(
-                f"_output_only_shapes=[{', '.join(output_only_shape_exprs)}]"
-            )
+            launcher_args.extend([
+                f"_output_only_shapes=[{', '.join(output_only_shape_exprs)}]",
+                f"_n_kernel_params={len(args)}",
+            ])
 
         if has_rng_ops:
             launcher_args.insert(-1, "_rng_seed_buffer")

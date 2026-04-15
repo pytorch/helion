@@ -253,9 +253,10 @@ def _pallas_build_block_specs(
     jnp: object,
     pltpu: object,
     grid: tuple[int, ...],
-    args: tuple[object, ...],
+    input_tensors: list[torch.Tensor],
     tensor_arg_indices: list[int],
     output_indices: list[int],
+    arg_to_tensor_pos: dict[int, int],
     block_spec_info: _BlockSpecInfo | None = None,
     _smem_arg_indices: list[int] | None = None,
     output_only_indices: list[int] | None = None,
@@ -264,10 +265,8 @@ def _pallas_build_block_specs(
     """Build ``in_specs`` and ``out_specs`` for ``pl.pallas_call``.
 
     ``block_spec_info`` is indexed by position among *all* tensor args.
-    ``output_only_indices`` lists tensor positions excluded from
-    ``tensor_arg_indices``; they are merged back to compute the mapping.
-    Output-only tensors are not in ``args``; their shapes come from
-    ``_output_only_shapes``.
+    ``input_tensors`` contains actual tensors for inputs; output-only
+    shapes come from ``_output_only_shapes``.
     """
     if block_spec_info is None or len(grid) == 0:
         return None, None
@@ -287,7 +286,7 @@ def _pallas_build_block_specs(
     def _get_tensor_or_proxy(idx: int) -> torch.Tensor | _ShapeProxy:
         if idx in oo_shape_map:
             return oo_shape_map[idx]
-        return cast("torch.Tensor", args[idx])
+        return input_tensors[arg_to_tensor_pos[idx]]
 
     in_specs = []
     for idx in tensor_arg_indices:
@@ -330,9 +329,10 @@ def _pallas_build_pipeline_specs(
     jnp: object,
     pltpu: object,
     grid: tuple[int, ...],
-    args: tuple[object, ...],
+    input_tensors: list[torch.Tensor],
     tensor_arg_indices: list[int],
     output_indices: list[int],
+    arg_to_tensor_pos: dict[int, int],
     block_spec_info: _BlockSpecInfo | None,
     pipeline_arg_indices: list[int] | None,
     output_only_indices: list[int] | None = None,
@@ -360,7 +360,11 @@ def _pallas_build_pipeline_specs(
         if idx in pipeline_set:
             return pl.BlockSpec(memory_space=pltpu.HBM)  # type: ignore[union-attr]
         if block_spec_info is not None:
-            t = oo_shape_map[idx] if idx in oo_shape_map else args[idx]
+            t = (
+                oo_shape_map[idx]
+                if idx in oo_shape_map
+                else input_tensors[arg_to_tensor_pos[idx]]
+            )
             return _pallas_make_block_spec(
                 pl,
                 jnp,
@@ -409,6 +413,7 @@ def _pallas_prepare_args(
 ) -> tuple[
     list[int],
     list[int],
+    list[torch.Tensor],
     dict[int, object],
     int,
     dict[int, int],
@@ -421,12 +426,13 @@ def _pallas_prepare_args(
     separately via ``_output_only_shapes`` for shape/dtype information.
 
     Returns a tuple of:
-    - tensor_arg_indices: positions of tensor args passed as pallas_call inputs
-    - output_only_indices: original positions of output-only tensors
-    - non_tensor_args: mapping of non-tensor arg positions to values
+    - tensor_arg_indices: kernel parameter positions of tensor inputs
+    - output_only_indices: kernel parameter positions of output-only tensors
+    - input_tensors: actual tensor objects for pallas_call inputs
+    - non_tensor_args: mapping of kernel positions to non-tensor values
     - n_tensor_inputs: count of tensor inputs (excl. output-only)
-    - arg_to_tensor_pos: mapping from original position to tensor-only position
-    - inplace_positions: positions that are both input and output
+    - arg_to_tensor_pos: mapping from kernel position to tensor-only position
+    - inplace_positions: kernel positions that are both input and output
     - out_shapes: JAX placeholders for output shapes
     """
     from .settings import is_pallas_interpret
@@ -444,17 +450,32 @@ def _pallas_prepare_args(
     inplace_set = set(_inplace_indices) if _inplace_indices is not None else output_set
     output_only = output_set - inplace_set
 
-    # tensor_arg_indices: positions in args that are tensors (inputs only).
-    # Output-only positions have None placeholders in args.
-    tensor_arg_indices = [
-        i for i in range(len(args)) if isinstance(args[i], torch.Tensor)
-    ]
+    # Output-only tensors are removed from args. Build mappings between
+    # reduced args positions and original kernel parameter positions.
     output_only_indices = sorted(output_only)
 
+    def _args_pos_to_kernel_pos(args_pos: int) -> int:
+        """Map a position in reduced args to original kernel parameter position."""
+        kernel_pos = args_pos
+        for oo_pos in output_only_indices:
+            if oo_pos <= kernel_pos:
+                kernel_pos += 1
+        return kernel_pos
+
+    # tensor_arg_indices uses KERNEL positions (for block specs, reordered kernel).
+    # kernel_to_args maps kernel positions back to args positions (for data access).
+    kernel_to_args: dict[int, int] = {}
+    tensor_arg_indices = []
+    for i in range(len(args)):
+        if isinstance(args[i], torch.Tensor):
+            kpos = _args_pos_to_kernel_pos(i)
+            tensor_arg_indices.append(kpos)
+            kernel_to_args[kpos] = i
+
     non_tensor_args: dict[int, object] = {
-        i: args[i]
+        _args_pos_to_kernel_pos(i): args[i]
         for i in range(len(args))
-        if not isinstance(args[i], torch.Tensor) and args[i] is not None
+        if not isinstance(args[i], torch.Tensor)
     }
     n_tensor_inputs = len(tensor_arg_indices)
     arg_to_tensor_pos = {orig: tpos for tpos, orig in enumerate(tensor_arg_indices)}
@@ -470,15 +491,24 @@ def _pallas_prepare_args(
     for orig_pos in _output_indices:
         if orig_pos in output_only:
             shape, dtype = next(oo_iter)
-            jax_dtype = torch_dtype_to_jax_runtime(dtype)  # pyrefly: ignore[bad-argument-type]
+            jax_dtype = torch_dtype_to_jax_runtime(
+                dtype
+            )  # pyrefly: ignore[bad-argument-type]
             out_shapes_list.append(jax.ShapeDtypeStruct(shape, jax_dtype))
         else:
-            out_shapes_list.append(placeholder_fn(args[orig_pos]))  # type: ignore[arg-type]
+            out_shapes_list.append(placeholder_fn(args[kernel_to_args[orig_pos]]))  # type: ignore[arg-type]
     out_shapes = tuple(out_shapes_list)
+
+    # Build input_tensors from args using kernel_to_args mapping.
+    input_tensors = [
+        cast("torch.Tensor", args[kernel_to_args[kpos]]).contiguous()
+        for kpos in tensor_arg_indices
+    ]
 
     return (
         tensor_arg_indices,
         output_only_indices,
+        input_tensors,
         non_tensor_args,
         n_tensor_inputs,
         arg_to_tensor_pos,
@@ -499,6 +529,7 @@ def _pallas_make_reordered_kernel(
     n_extra_refs: int = 0,
     skip_inplace_copy: set[int] | None = None,
     _smem_arg_indices: list[int] | None = None,
+    n_kernel_params: int | None = None,
 ) -> object:
     """Create a wrapper kernel that reorders pallas_call refs to the original arg order.
 
@@ -515,7 +546,7 @@ def _pallas_make_reordered_kernel(
     _skip_copy = skip_inplace_copy or set()
 
     def reordered_kernel(*refs: object) -> None:
-        _n_params = len(args)
+        _n_params = n_kernel_params if n_kernel_params is not None else len(args)
         original_order: list[object] = [None] * _n_params
         for tensor_pos, orig_pos in enumerate(tensor_arg_indices):
             original_order[orig_pos] = refs[tensor_pos]
@@ -672,8 +703,7 @@ def _ensure_cpu_tpu_info() -> None:
 
 def _pallas_invoke_and_return(
     jax_callable: object,
-    args: tuple[object, ...],
-    tensor_arg_indices: list[int],
+    input_tensors: list[torch.Tensor],
     arg_to_tensor_pos: dict[int, int],
     _output_indices: list[int],
 ) -> object:
@@ -683,9 +713,6 @@ def _pallas_invoke_and_return(
     as pallas_call inputs, so the JaxCallable returns new buffers for them.
     Returns a single tensor, a tuple of tensors, or None.
     """
-    input_tensors = [
-        cast("torch.Tensor", args[i]).contiguous() for i in tensor_arg_indices
-    ]
     results = jax_callable(*input_tensors)  # type: ignore[operator]
     if results is None:
         return None
@@ -722,6 +749,7 @@ def default_pallas_launcher(
     _output_indices: list[int] | None = None,
     _inplace_indices: list[int] | None = None,
     _output_only_shapes: list[tuple[tuple[int, ...], object]] | None = None,
+    _n_kernel_params: int | None = None,
     _block_spec_info: _BlockSpecInfo | None = None,
     _smem_arg_indices: list[int] | None = None,
     **kwargs: object,
@@ -754,6 +782,7 @@ def default_pallas_launcher(
         (
             tensor_arg_indices,
             output_only_indices,
+            input_tensors,
             non_tensor_args,
             n_tensor_inputs,
             arg_to_tensor_pos,
@@ -768,9 +797,10 @@ def default_pallas_launcher(
             jnp,
             pltpu,
             grid,
-            args,
+            input_tensors,
             tensor_arg_indices,
             _output_indices,
+            arg_to_tensor_pos,
             _block_spec_info,
             _smem_arg_indices,
             output_only_indices,
@@ -787,6 +817,7 @@ def default_pallas_launcher(
             inplace_positions,
             arg_to_tensor_pos,
             _smem_arg_indices=_smem_arg_indices,
+            n_kernel_params=_n_kernel_params,
         )
 
         out_shape_arg = out_shapes if len(out_shapes) > 1 else out_shapes[0]
@@ -823,8 +854,16 @@ def default_pallas_launcher(
             cache_attr="_pallas_cache",
         )
 
+    # Build input_tensors from args (works for both cache hit and miss).
+    # tensor_arg_indices order matches the order of tensors in args.
+    input_tensors = [
+        cast("torch.Tensor", a).contiguous()
+        for a in args
+        if isinstance(a, torch.Tensor)
+    ]
+
     return _pallas_invoke_and_return(
-        jax_callable, args, tensor_arg_indices, arg_to_tensor_pos, _output_indices
+        jax_callable, input_tensors, arg_to_tensor_pos, _output_indices
     )
 
 
@@ -835,6 +874,7 @@ def default_pallas_pipeline_launcher(
     _output_indices: list[int] | None = None,
     _inplace_indices: list[int] | None = None,
     _output_only_shapes: list[tuple[tuple[int, ...], object]] | None = None,
+    _n_kernel_params: int | None = None,
     _block_spec_info: _BlockSpecInfo | None = None,
     _scratch_shapes: list[tuple[tuple[int, ...], str]] | None = None,
     _pipeline_arg_indices: list[int] | None = None,
@@ -864,6 +904,7 @@ def default_pallas_pipeline_launcher(
         (
             tensor_arg_indices,
             output_only_indices,
+            input_tensors,
             non_tensor_args,
             n_tensor_inputs,
             arg_to_tensor_pos,
@@ -904,9 +945,10 @@ def default_pallas_pipeline_launcher(
             jnp,
             pltpu,
             grid,
-            args,
+            input_tensors,
             tensor_arg_indices,
             _output_indices,
+            arg_to_tensor_pos,
             _block_spec_info,
             _pipeline_arg_indices,
             output_only_indices,
@@ -925,6 +967,7 @@ def default_pallas_pipeline_launcher(
             arg_to_tensor_pos,
             n_extra_refs=len(scratch_shapes),
             skip_inplace_copy=_pipeline_set,
+            n_kernel_params=_n_kernel_params,
         )
 
         out_shape_arg = out_shapes if len(out_shapes) > 1 else out_shapes[0]
@@ -970,8 +1013,15 @@ def default_pallas_pipeline_launcher(
             trace_key_suffix="_pipeline",
         )
 
+    # Build input_tensors from args (works for both cache hit and miss).
+    input_tensors = [
+        cast("torch.Tensor", a).contiguous()
+        for a in args
+        if isinstance(a, torch.Tensor)
+    ]
+
     return _pallas_invoke_and_return(
-        jax_callable, args, tensor_arg_indices, arg_to_tensor_pos, _output_indices
+        jax_callable, input_tensors, arg_to_tensor_pos, _output_indices
     )
 
 
@@ -982,6 +1032,7 @@ def default_pallas_fori_launcher(
     _output_indices: list[int] | None = None,
     _inplace_indices: list[int] | None = None,
     _output_only_shapes: list[tuple[tuple[int, ...], object]] | None = None,
+    _n_kernel_params: int | None = None,
     _block_spec_info: _BlockSpecInfo | None = None,
     _scratch_shapes: list[tuple[tuple[int, ...], str | None, str]] | None = None,
     **kwargs: object,
@@ -1012,6 +1063,7 @@ def default_pallas_fori_launcher(
         (
             tensor_arg_indices,
             output_only_indices,
+            input_tensors,
             non_tensor_args,
             n_tensor_inputs,
             arg_to_tensor_pos,
@@ -1051,9 +1103,10 @@ def default_pallas_fori_launcher(
             jnp,
             pltpu,
             grid,
-            args,
+            input_tensors,
             tensor_arg_indices,
             _output_indices,
+            arg_to_tensor_pos,
             _block_spec_info,
             _fori_pipeline_indices,  # type: ignore[arg-type]
             output_only_indices,
@@ -1072,6 +1125,7 @@ def default_pallas_fori_launcher(
             arg_to_tensor_pos,
             n_extra_refs=len(scratch_shapes),
             skip_inplace_copy=_fori_pipeline_set,
+            n_kernel_params=_n_kernel_params,
         )
 
         out_shape_arg = out_shapes if len(out_shapes) > 1 else out_shapes[0]
@@ -1117,8 +1171,15 @@ def default_pallas_fori_launcher(
             trace_key_suffix="_fori",
         )
 
+    # Build input_tensors from args (works for both cache hit and miss).
+    input_tensors = [
+        cast("torch.Tensor", a).contiguous()
+        for a in args
+        if isinstance(a, torch.Tensor)
+    ]
+
     return _pallas_invoke_and_return(
-        jax_callable, args, tensor_arg_indices, arg_to_tensor_pos, _output_indices
+        jax_callable, input_tensors, arg_to_tensor_pos, _output_indices
     )
 
 
