@@ -244,6 +244,49 @@ def pallas_reduce_non_pow2(x: torch.Tensor) -> torch.Tensor:
 @onlyBackends(["triton", "pallas"])
 @skipUnlessPallas("JAX/Pallas TPU not available")
 class TestPallas(TestCase):
+    def test_estimate_pallas_vmem_bytes(self) -> None:
+        """VMEM OOM: Tests that block sizes and dtypes (fp32, bf16) are correctly estimated."""
+
+        # Test 1: float32 (4 bytes per element)
+        # 3 tensors * 2048 * 4096 * 4 bytes * 2 (multiplier) = ~201.3MB (OOM)
+        args_f32 = (
+            torch.randn(2048, 4096, device=DEVICE, dtype=torch.float32),
+            torch.randn(2048, 4096, device=DEVICE, dtype=torch.float32),
+        )
+        with self.assertRaisesRegex(
+            RuntimeError,
+            r"Ran out of memory in memory space vmem.*Estimated [0-9.]+MB exceeds",
+        ):
+            code_and_output(pallas_add_2d, args_f32, block_sizes=[2048, 4096])
+
+        # Test 2: bfloat16 (2 bytes per element)
+        # 3 tensors * 1024 * 4096 * 2 bytes * 2 (multiplier) = ~50.3MB (Passes safely under 64MB)
+        args_bf16 = (
+            torch.randn(1024, 4096, device=DEVICE, dtype=torch.bfloat16),
+            torch.randn(1024, 4096, device=DEVICE, dtype=torch.bfloat16),
+        )
+        try:
+            code_and_output(pallas_add_2d, args_bf16, block_sizes=[1024, 4096])
+        except Exception as e:
+            if "Ran out of memory in memory space vmem" in str(e):
+                self.fail(f"bfloat16 incorrectly threw VMEM OOM: {e}")
+
+        # Test 3: float8_e4m3fn (1 byte per element)
+        # 3 tensors * 4096 * 8192 * 1 byte * 2 (multiplier) = ~201.3MB (OOM)
+        args_fp8 = (
+            torch.randn(4096, 8192, device=DEVICE, dtype=torch.float32).to(
+                torch.float8_e4m3fn
+            ),
+            torch.randn(4096, 8192, device=DEVICE, dtype=torch.float32).to(
+                torch.float8_e4m3fn
+            ),
+        )
+        with self.assertRaisesRegex(
+            RuntimeError,
+            r"Ran out of memory in memory space vmem.*Estimated [0-9.]+MB exceeds",
+        ):
+            code_and_output(pallas_add_2d, args_fp8, block_sizes=[4096, 8192])
+
     def test_add_1d(self) -> None:
         args = (torch.randn(1024, device=DEVICE), torch.randn(1024, device=DEVICE))
         code, result = code_and_output(add_kernel, args, block_size=256)

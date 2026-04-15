@@ -231,6 +231,118 @@ def _pallas_make_block_spec(
     return pl.BlockSpec(block_shape, index_map, memory_space=memory_space)  # type: ignore[union-attr]
 
 
+_CACHED_VMEM_LIMIT_BYTES: int | None = None
+
+
+def _get_vmem_limit_bytes(pltpu: object) -> int:
+    """Safely retrieves the TPU VMEM capacity without crashing on hardware locks."""
+    global _CACHED_VMEM_LIMIT_BYTES
+    if _CACHED_VMEM_LIMIT_BYTES is not None:
+        return _CACHED_VMEM_LIMIT_BYTES
+
+    try:
+        get_tpu_info = pltpu.get_tpu_info
+        _CACHED_VMEM_LIMIT_BYTES = get_tpu_info().vmem_capacity_bytes
+    except Exception:
+        # Fallback if JAX fails to acquire the TPU backend lock (e.g., in a precompile fork).
+        # Default to 16MB (safe baseline for v4 and v5e per-core VMEM).
+        _CACHED_VMEM_LIMIT_BYTES = 16 * 1024 * 1024
+
+    return _CACHED_VMEM_LIMIT_BYTES
+
+
+def _estimate_pallas_vmem_bytes(
+    pl: object,
+    pltpu: object,
+    in_specs: list[object] | None,
+    out_specs: list[object] | object | None,
+    scratch_shapes: list[object] | list[Any] | None,
+    args: tuple[object, ...],
+    tensor_arg_indices: list[int],
+    output_indices: list[int],
+    pallas_aliases: dict[int, int] | None,
+) -> int:
+    """Estimates the VMEM required by the Pallas kernel."""
+    total_bytes = 0
+    in_spec_bytes = [0] * len(tensor_arg_indices)
+    out_spec_bytes = [0] * len(output_indices)
+
+    def _bytes_per_element(t: object) -> int:
+        import torch
+
+        if isinstance(t, torch.Tensor):
+            return t.element_size()
+
+        dtype = getattr(t, "dtype", None)
+        if dtype is not None:
+            # Works for torch.dtype and np.dtype/jnp.dtype
+            itemsize = getattr(dtype, "itemsize", None)
+            if itemsize is not None:
+                return itemsize
+
+        return 4
+
+    if in_specs:
+        for i, idx in enumerate(tensor_arg_indices):
+            spec = in_specs[i]
+            # pl.BlockSpec will have block_shape and memory_space.
+            # HBM is pl.ANY. We only count VMEM (which is not pl.ANY).
+            if spec is not None and getattr(spec, "memory_space", None) is not getattr(
+                pl, "ANY", None
+            ):
+                block_shape = getattr(spec, "block_shape", None)
+                if block_shape is not None:
+                    numel = 1
+                    for d in block_shape:
+                        numel *= int(d)
+                    in_spec_bytes[i] = numel * _bytes_per_element(args[idx])
+
+    if out_specs:
+        out_specs_list = (
+            out_specs if isinstance(out_specs, (list, tuple)) else [out_specs]
+        )
+        for i, idx in enumerate(output_indices):
+            if i < len(out_specs_list):
+                spec = out_specs_list[i]
+                if spec is not None and getattr(
+                    spec, "memory_space", None
+                ) is not getattr(pl, "ANY", None):
+                    block_shape = getattr(spec, "block_shape", None)
+                    if block_shape is not None:
+                        numel = 1
+                        for d in block_shape:
+                            numel *= int(d)
+                        out_spec_bytes[i] = numel * _bytes_per_element(args[idx])
+
+    pallas_aliases = pallas_aliases or {}
+    aliased_out_positions = set()
+    for in_pos, out_pos in pallas_aliases.items():
+        aliased_out_positions.add(out_pos)
+        if in_pos < len(in_spec_bytes) and out_pos < len(out_spec_bytes):
+            in_spec_bytes[in_pos] = max(in_spec_bytes[in_pos], out_spec_bytes[out_pos])
+
+    for out_pos in aliased_out_positions:
+        if out_pos < len(out_spec_bytes):
+            out_spec_bytes[out_pos] = 0
+
+    # Pallas pipelines and default launchers natively double buffer their BlockSpecs.
+    multiplier = 2
+    total_bytes += sum(in_spec_bytes) * multiplier
+    total_bytes += sum(out_spec_bytes) * multiplier
+
+    if scratch_shapes:
+        for scratch in scratch_shapes:
+            if type(scratch).__name__ == "VMEM":
+                numel = 1
+                shape = getattr(scratch, "shape", ())
+                for d in shape:
+                    numel *= int(d)
+                dtype_size = getattr(getattr(scratch, "dtype", None), "itemsize", 4)
+                total_bytes += numel * dtype_size
+
+    return total_bytes
+
+
 # Per-tensor block spec info: see ``_pallas_make_block_spec``.
 # grid_dims entries are int (direct grid dim), tuple (flat decomposition),
 # or None (untiled dim).
@@ -680,6 +792,24 @@ def default_pallas_launcher(
             for out_idx, orig_pos in enumerate(_output_indices)
         }
 
+        estimated_vmem = _estimate_pallas_vmem_bytes(
+            pl,
+            pltpu,
+            in_specs,
+            out_specs,
+            None,
+            args,
+            tensor_arg_indices,
+            _output_indices,
+            pallas_aliases,
+        )
+        vmem_limit_bytes = _get_vmem_limit_bytes(pltpu)
+        if estimated_vmem > vmem_limit_bytes:
+            raise RuntimeError(
+                f"XLA:TPU compile permanent error. Ran out of memory in memory space vmem. "
+                f"Estimated {estimated_vmem / 1e6:.2f}MB exceeds {vmem_limit_bytes / 1e6:.2f}MB vmem capacity."
+            )
+
         pallas_call_kwargs: dict[str, object] = {
             "out_shape": out_shape_arg,
             "input_output_aliases": pallas_aliases,
@@ -811,6 +941,24 @@ def default_pallas_pipeline_launcher(
             scratch_shapes=scratch_shapes,
             grid=grid,
         )
+
+        estimated_vmem = _estimate_pallas_vmem_bytes(
+            pl,
+            pltpu,
+            in_specs_list,
+            out_specs,
+            scratch_shapes,
+            args,
+            tensor_arg_indices,
+            _output_indices,
+            pallas_aliases,
+        )
+        vmem_limit_bytes = _get_vmem_limit_bytes(pltpu)
+        if estimated_vmem > vmem_limit_bytes:
+            raise RuntimeError(
+                f"XLA:TPU compile permanent error. Ran out of memory in memory space vmem. "
+                f"Estimated {estimated_vmem / 1e6:.2f}MB exceeds {vmem_limit_bytes / 1e6:.2f}MB vmem capacity."
+            )
 
         pallas_call_kwargs: dict[str, object] = {
             "out_shape": out_shape_arg,
@@ -944,6 +1092,24 @@ def default_pallas_fori_launcher(
             scratch_shapes=scratch_shapes,
             grid=grid,
         )
+
+        estimated_vmem = _estimate_pallas_vmem_bytes(
+            pl,
+            pltpu,
+            in_specs_list,
+            out_specs,
+            scratch_shapes,
+            args,
+            tensor_arg_indices,
+            _output_indices,
+            pallas_aliases,
+        )
+        vmem_limit_bytes = _get_vmem_limit_bytes(pltpu)
+        if estimated_vmem > vmem_limit_bytes:
+            raise RuntimeError(
+                f"XLA:TPU compile permanent error. Ran out of memory in memory space vmem. "
+                f"Estimated {estimated_vmem / 1e6:.2f}MB exceeds {vmem_limit_bytes / 1e6:.2f}MB vmem capacity."
+            )
 
         pallas_call_kwargs: dict[str, object] = {
             "out_shape": out_shape_arg,
