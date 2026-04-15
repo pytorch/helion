@@ -807,6 +807,28 @@ class TestPallas(TestCase):
         with self.assertRaises(TypeError, msg="does not support"):
             code_and_output(add_kernel, (x, y), block_size=128)
 
+    def test_output_only_mid_position(self) -> None:
+        """Output-only kernel with two inputs and one output-only tensor.
+
+        Verifies that the index shifting in _pallas_prepare_args works
+        correctly when output-only tensors are filtered from args.
+        Currently, function-argument tensors are always traced before
+        body-created tensors, so the output ends up last; the shifting
+        is defensive for potential future ordering changes.
+        """
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def mid_output_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size()):
+                out[tile] = x[tile] + y[tile]
+            return out
+
+        x = torch.randn(1024, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(1024, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(mid_output_kernel, (x, y), block_sizes=[1024])
+        torch.testing.assert_close(result, x + y)
+
     def test_fori_loop_multidim(self) -> None:
         """Test fori_loop with a 2D inner loop (nested iteration)."""
         args = (

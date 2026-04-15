@@ -298,10 +298,10 @@ def _pallas_build_block_specs(
                 pl,
                 jnp,
                 pltpu,
-                t,
+                t,  # pyrefly: ignore[bad-argument-type]
                 block_spec_info[tensor_pos],
                 should_use_smem,
-            )  # pyrefly: ignore[bad-argument-type]
+            )
         )
 
     out_specs_list = []
@@ -314,10 +314,10 @@ def _pallas_build_block_specs(
                 pl,
                 jnp,
                 pltpu,
-                t,
+                t,  # pyrefly: ignore[bad-argument-type]
                 block_spec_info[tensor_pos],
                 should_use_smem,
-            )  # pyrefly: ignore[bad-argument-type]
+            )
         )
 
     out_specs = out_specs_list if len(out_specs_list) > 1 else out_specs_list[0]
@@ -369,9 +369,9 @@ def _pallas_build_pipeline_specs(
                 pl,
                 jnp,
                 pltpu,
-                t,
+                t,  # pyrefly: ignore[bad-argument-type]
                 block_spec_info[arg_to_tpos[idx]],
-            )  # pyrefly: ignore[bad-argument-type]
+            )
         return pl.BlockSpec(memory_space=pl.ANY)  # type: ignore[union-attr]
 
     in_specs = [_spec_for(idx) for idx in tensor_arg_indices]
@@ -413,9 +413,9 @@ def _pallas_prepare_args(
 ) -> tuple[
     list[int],
     list[int],
-    list[torch.Tensor],
     dict[int, object],
     int,
+    dict[int, int],
     dict[int, int],
     set[int],
     tuple[object, ...],
@@ -428,10 +428,10 @@ def _pallas_prepare_args(
     Returns a tuple of:
     - tensor_arg_indices: kernel parameter positions of tensor inputs
     - output_only_indices: kernel parameter positions of output-only tensors
-    - input_tensors: actual tensor objects for pallas_call inputs
     - non_tensor_args: mapping of kernel positions to non-tensor values
     - n_tensor_inputs: count of tensor inputs (excl. output-only)
     - arg_to_tensor_pos: mapping from kernel position to tensor-only position
+    - kernel_to_args: mapping from kernel position to args position
     - inplace_positions: kernel positions that are both input and output
     - out_shapes: JAX placeholders for output shapes
     """
@@ -450,12 +450,12 @@ def _pallas_prepare_args(
     inplace_set = set(_inplace_indices) if _inplace_indices is not None else output_set
     output_only = output_set - inplace_set
 
-    # Output-only tensors are removed from args. Build mappings between
-    # reduced args positions and original kernel parameter positions.
+    # Output-only tensors are removed from args at codegen time. Build
+    # mappings between reduced-args positions and kernel parameter positions.
     output_only_indices = sorted(output_only)
 
     def _args_pos_to_kernel_pos(args_pos: int) -> int:
-        """Map a position in reduced args to original kernel parameter position."""
+        """Map a position in reduced args to the original kernel parameter position."""
         kernel_pos = args_pos
         for oo_pos in output_only_indices:
             if oo_pos <= kernel_pos:
@@ -492,26 +492,20 @@ def _pallas_prepare_args(
         if orig_pos in output_only:
             shape, dtype = next(oo_iter)
             jax_dtype = torch_dtype_to_jax_runtime(
-                dtype
-            )  # pyrefly: ignore[bad-argument-type]
+                dtype  # pyrefly: ignore[bad-argument-type]
+            )
             out_shapes_list.append(jax.ShapeDtypeStruct(shape, jax_dtype))
         else:
             out_shapes_list.append(placeholder_fn(args[kernel_to_args[orig_pos]]))  # type: ignore[arg-type]
     out_shapes = tuple(out_shapes_list)
 
-    # Build input_tensors from args using kernel_to_args mapping.
-    input_tensors = [
-        cast("torch.Tensor", args[kernel_to_args[kpos]]).contiguous()
-        for kpos in tensor_arg_indices
-    ]
-
     return (
         tensor_arg_indices,
         output_only_indices,
-        input_tensors,
         non_tensor_args,
         n_tensor_inputs,
         arg_to_tensor_pos,
+        kernel_to_args,
         inplace_positions,
         out_shapes,
     )
@@ -782,15 +776,20 @@ def default_pallas_launcher(
         (
             tensor_arg_indices,
             output_only_indices,
-            input_tensors,
             non_tensor_args,
             n_tensor_inputs,
             arg_to_tensor_pos,
+            kernel_to_args,
             inplace_positions,
             out_shapes,
         ) = _pallas_prepare_args(
             args, _output_indices, _inplace_indices, _output_only_shapes
         )
+
+        input_tensors = [
+            cast("torch.Tensor", args[kernel_to_args[kpos]]).contiguous()
+            for kpos in tensor_arg_indices
+        ]
 
         in_specs, out_specs = _pallas_build_block_specs(
             pl,
@@ -904,10 +903,10 @@ def default_pallas_pipeline_launcher(
         (
             tensor_arg_indices,
             output_only_indices,
-            input_tensors,
             non_tensor_args,
             n_tensor_inputs,
             arg_to_tensor_pos,
+            kernel_to_args,
             inplace_positions,
             out_shapes,
         ) = _pallas_prepare_args(
@@ -939,6 +938,11 @@ def default_pallas_pipeline_launcher(
                 scratch_shapes.append(
                     pltpu.VMEM(shape, jnp_dtype)  # pyrefly: ignore[bad-argument-type]
                 )
+
+        input_tensors = [
+            cast("torch.Tensor", args[kernel_to_args[kpos]]).contiguous()
+            for kpos in tensor_arg_indices
+        ]
 
         in_specs_list, out_specs = _pallas_build_pipeline_specs(
             pl,
@@ -1063,10 +1067,10 @@ def default_pallas_fori_launcher(
         (
             tensor_arg_indices,
             output_only_indices,
-            input_tensors,
             non_tensor_args,
             n_tensor_inputs,
             arg_to_tensor_pos,
+            kernel_to_args,
             inplace_positions,
             out_shapes,
         ) = _pallas_prepare_args(
@@ -1094,6 +1098,11 @@ def default_pallas_fori_launcher(
                 scratch_shapes.append(
                     pltpu.VMEM(shape, jnp_dtype)  # pyrefly: ignore[bad-argument-type]
                 )
+
+        input_tensors = [
+            cast("torch.Tensor", args[kernel_to_args[kpos]]).contiguous()
+            for kpos in tensor_arg_indices
+        ]
 
         # Build in_specs/out_specs: proper BlockSpecs for outer grid dims,
         # HBM refs for tensors used in the fori_loop body (DMA handles tiling).

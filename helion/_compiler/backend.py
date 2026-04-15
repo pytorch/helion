@@ -1538,8 +1538,17 @@ class PallasBackend(Backend):
                 if i in output_only_set:
                     arg = sorted_args[i]
                     assert isinstance(arg, TensorArg)
-                    output_only_names.append(arg.host_str())
                     shape = tuple(arg.fake_value.shape)
+                    # Skip output-only optimization for dynamic shapes:
+                    # symbolic dims can't be emitted as compile-time literals.
+                    # Merge output-only indices into inplace so the runtime
+                    # doesn't expect _output_only_shapes.
+                    if any(isinstance(s, torch.SymInt) for s in shape):
+                        output_only_names.clear()
+                        output_only_shape_exprs.clear()
+                        inplace_indices = sorted(set(inplace_indices) | output_only_set)
+                        break
+                    output_only_names.append(arg.host_str())
                     dtype = arg.fake_value.dtype
                     output_only_shape_exprs.append(f"({shape}, {dtype})")
         self._output_only_names = output_only_names
@@ -1551,10 +1560,12 @@ class PallasBackend(Backend):
         launcher_args = [*filtered_args, f"_output_indices={output_indices}"]
         launcher_args.append(f"_inplace_indices={inplace_indices}")
         if output_only_shape_exprs:
-            launcher_args.extend([
-                f"_output_only_shapes=[{', '.join(output_only_shape_exprs)}]",
-                f"_n_kernel_params={len(args)}",
-            ])
+            launcher_args.extend(
+                [
+                    f"_output_only_shapes=[{', '.join(output_only_shape_exprs)}]",
+                    f"_n_kernel_params={len(args)}",
+                ]
+            )
 
         if has_rng_ops:
             launcher_args.insert(-1, "_rng_seed_buffer")
