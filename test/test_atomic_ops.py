@@ -12,6 +12,7 @@ from helion._testing import code_and_output
 from helion._testing import onlyBackends
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfRocm
+from helion._testing import skipIfTileIR
 from helion._testing import xfailIfCute
 from helion._testing import xfailIfPallas
 import helion.language as hl
@@ -175,6 +176,58 @@ def atomic_cas_kernel(
 ) -> torch.Tensor:
     for i in hl.tile(x.size(0)):
         hl.atomic_cas(x, [i], expect[i], y[i])
+    return x
+
+
+# 2D kernels for tensor descriptor atomic tests (TD requires ndim >= 2 + static_shapes)
+
+
+@helion.kernel(static_shapes=True)
+def atomic_add_2d_td_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    for i, j in hl.tile([x.size(0), x.size(1)]):
+        hl.atomic_add(x, [i, j], y[i, j])
+    return x
+
+
+@helion.kernel(static_shapes=True)
+def atomic_and_2d_td_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    for i, j in hl.tile([x.size(0), x.size(1)]):
+        hl.atomic_and(x, [i, j], y[i, j])
+    return x
+
+
+@helion.kernel(static_shapes=True)
+def atomic_or_2d_td_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    for i, j in hl.tile([x.size(0), x.size(1)]):
+        hl.atomic_or(x, [i, j], y[i, j])
+    return x
+
+
+@helion.kernel(static_shapes=True)
+def atomic_xor_2d_td_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    for i, j in hl.tile([x.size(0), x.size(1)]):
+        hl.atomic_xor(x, [i, j], y[i, j])
+    return x
+
+
+@helion.kernel(static_shapes=True)
+def atomic_max_2d_td_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    for i, j in hl.tile([x.size(0), x.size(1)]):
+        hl.atomic_max(x, [i, j], y[i, j])
+    return x
+
+
+@helion.kernel(static_shapes=True)
+def atomic_min_2d_td_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    for i, j in hl.tile([x.size(0), x.size(1)]):
+        hl.atomic_min(x, [i, j], y[i, j])
+    return x
+
+
+@helion.kernel(static_shapes=True)
+def atomic_xchg_2d_td_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    for i, j in hl.tile([x.size(0), x.size(1)]):
+        hl.atomic_xchg(x, [i, j], y[i, j])
     return x
 
 
@@ -486,6 +539,175 @@ class TestAtomicOperations(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, expected)
         if _get_backend() == "triton":
             self.assertIn("tl.atomic_cas", code)
+
+    @onlyBackends("triton")
+    @skipIfRocm("Tensor descriptor not supported on ROCm")
+    @skipIfTileIR("TileIR does not support descriptor atomics")
+    def test_atomic_td_fallbacks(self):
+        """Test that tensor_descriptor atomics fall back to pointer when needed."""
+
+        # Return value consumed: should fall back to pointer
+        @helion.kernel(
+            config=helion.Config(
+                block_sizes=[64, 64],
+                indexing="tensor_descriptor",
+                atomic_indexing="tensor_descriptor",
+            ),
+            static_shapes=True,
+        )
+        def atomic_add_td_prev_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            out = torch.zeros_like(x)
+            for i, j in hl.tile([x.size(0), x.size(1)]):
+                prev = hl.atomic_add(x, [i, j], y[i, j])
+                out[i, j] = prev
+            return out
+
+        M, N = 128, 64
+        x = torch.zeros(M, N, device=DEVICE, dtype=torch.float32)
+        y = torch.ones(M, N, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(atomic_add_td_prev_kernel, (x, y))
+        expected = torch.zeros(M, N, device=DEVICE, dtype=torch.float32)
+        torch.testing.assert_close(result, expected)
+        self.assertIn("tl.atomic_add", code)
+        self.assertNotIn("desc.atomic_add(", code)
+
+        # Non-relaxed sem: should fall back to pointer
+        @helion.kernel(
+            config=helion.Config(
+                block_sizes=[64, 64],
+                indexing="tensor_descriptor",
+                atomic_indexing="tensor_descriptor",
+            ),
+            static_shapes=True,
+        )
+        def atomic_add_td_release_kernel(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> torch.Tensor:
+            for i, j in hl.tile([x.size(0), x.size(1)]):
+                hl.atomic_add(x, [i, j], y[i, j], sem="release")
+            return x
+
+        x2 = torch.zeros(M, N, device=DEVICE, dtype=torch.float32)
+        y2 = torch.ones(M, N, device=DEVICE, dtype=torch.float32)
+        code2, result2 = code_and_output(atomic_add_td_release_kernel, (x2, y2))
+        expected2 = torch.ones(M, N, device=DEVICE, dtype=torch.float32)
+        torch.testing.assert_close(result2, expected2)
+        self.assertIn("tl.atomic_add", code2)
+        self.assertNotIn("desc.atomic_add(", code2)
+
+    @onlyBackends("triton")
+    @skipIfRocm("Tensor descriptor not supported on ROCm")
+    @skipIfTileIR("TileIR does not support descriptor atomics")
+    def test_atomic_add_per_op_indexing(self):
+        """Test per-op atomic_indexing list: first op pointer, second op tensor_descriptor."""
+
+        @helion.kernel(
+            config=helion.Config(
+                block_sizes=[64, 64],
+                indexing="tensor_descriptor",
+                atomic_indexing=["pointer", "tensor_descriptor"],
+            ),
+            static_shapes=True,
+        )
+        def two_atomic_adds(
+            out1: torch.Tensor, out2: torch.Tensor, val: torch.Tensor
+        ) -> torch.Tensor:
+            for i, j in hl.tile([out1.size(0), out1.size(1)]):
+                hl.atomic_add(out1, [i, j], val[i, j])  # pointer
+                hl.atomic_add(out2, [i, j], val[i, j])  # tensor_descriptor
+            return out1
+
+        M, N = 128, 64
+        out1 = torch.zeros(M, N, device=DEVICE, dtype=torch.float32)
+        out2 = torch.zeros(M, N, device=DEVICE, dtype=torch.float32)
+        val = torch.ones(M, N, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(two_atomic_adds, (out1, out2, val))
+        expected = torch.ones(M, N, device=DEVICE, dtype=torch.float32)
+        torch.testing.assert_close(result, expected)
+        torch.testing.assert_close(out2, expected)
+        # out1 uses pointer: tl.atomic_add(out1 + ...)
+        self.assertIn("tl.atomic_add(out1", code)
+        # out2 uses tensor_descriptor: out2_desc.atomic_add(...)
+        self.assertIn("out2_desc.atomic_add(", code)
+        # out1 should NOT use descriptor, out2 should NOT use pointer
+        self.assertNotIn("out1_desc", code)
+        self.assertNotIn("tl.atomic_add(out2", code)
+
+    @onlyBackends("triton")
+    @skipIfRocm("Tensor descriptor not supported on ROCm")
+    @skipIfTileIR("TileIR does not support descriptor atomics")
+    def test_atomic_ops_tensor_descriptor(self):
+        """Test all TMA-supported atomic ops generate desc.atomic_{op} codegen."""
+        M, N = 128, 64
+        td_config = {
+            "block_sizes": [64, 64],
+            "indexing": "tensor_descriptor",
+            "atomic_indexing": "tensor_descriptor",
+        }
+        # (op_name, kernel, x, y, expected)
+        cases = [
+            (
+                "atomic_add",
+                atomic_add_2d_td_kernel,
+                torch.zeros(M, N, device=DEVICE, dtype=torch.float32),
+                torch.ones(M, N, device=DEVICE, dtype=torch.float32),
+                torch.ones(M, N, device=DEVICE, dtype=torch.float32),
+            ),
+            (
+                "atomic_and",
+                atomic_and_2d_td_kernel,
+                torch.full((M, N), 0b1111, device=DEVICE, dtype=torch.int32),
+                torch.full((M, N), 0b1010, device=DEVICE, dtype=torch.int32),
+                torch.full((M, N), 0b1010, device=DEVICE, dtype=torch.int32),
+            ),
+            (
+                "atomic_or",
+                atomic_or_2d_td_kernel,
+                torch.zeros(M, N, device=DEVICE, dtype=torch.int32),
+                torch.full((M, N), 0b1010, device=DEVICE, dtype=torch.int32),
+                torch.full((M, N), 0b1010, device=DEVICE, dtype=torch.int32),
+            ),
+            (
+                "atomic_xor",
+                atomic_xor_2d_td_kernel,
+                torch.full((M, N), 0b1010, device=DEVICE, dtype=torch.int32),
+                torch.full((M, N), 0b1100, device=DEVICE, dtype=torch.int32),
+                torch.full((M, N), 0b0110, device=DEVICE, dtype=torch.int32),
+            ),
+            (
+                "atomic_max",
+                atomic_max_2d_td_kernel,
+                torch.ones(M, N, device=DEVICE, dtype=torch.int32),
+                torch.full((M, N), 5, device=DEVICE, dtype=torch.int32),
+                torch.full((M, N), 5, device=DEVICE, dtype=torch.int32),
+            ),
+            (
+                "atomic_min",
+                atomic_min_2d_td_kernel,
+                torch.full((M, N), 10, device=DEVICE, dtype=torch.int32),
+                torch.full((M, N), 3, device=DEVICE, dtype=torch.int32),
+                torch.full((M, N), 3, device=DEVICE, dtype=torch.int32),
+            ),
+        ]
+        for op_name, kernel, x, y, expected in cases:
+            with self.subTest(op=op_name):
+                code, result = code_and_output(kernel, (x, y), **td_config)
+                torch.testing.assert_close(result, expected)
+                self.assertIn(f"desc.{op_name}(", code)
+                self.assertNotIn(f"tl.{op_name}", code)
+
+        # xchg is NOT a TMA reduction op — should fall back to pointer
+        with self.subTest(op="atomic_xchg_fallback"):
+            x = torch.zeros(M, N, device=DEVICE, dtype=torch.int32)
+            y = torch.ones(M, N, device=DEVICE, dtype=torch.int32)
+            code, result = code_and_output(
+                atomic_xchg_2d_td_kernel, (x, y), **td_config
+            )
+            torch.testing.assert_close(
+                result, torch.ones(M, N, device=DEVICE, dtype=torch.int32)
+            )
+            self.assertIn("tl.atomic_xchg", code)
+            self.assertNotIn("desc.atomic_xchg", code)
 
 
 if __name__ == "__main__":

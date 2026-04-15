@@ -22,6 +22,7 @@ from typing import Literal
 from typing import NamedTuple
 from typing import NoReturn
 from typing import Protocol
+from typing import cast
 from unittest.mock import patch
 
 import torch
@@ -182,7 +183,7 @@ class BenchmarkResult(NamedTuple):
     config: Config
     fn: Callable[..., object]
     perf: float
-    status: Literal["ok", "error", "timeout", "peer_compilation_fail"]
+    status: Literal["ok", "error", "timeout", "peer_compilation_fail", "filtered"]
     compile_time: float | None
 
 
@@ -366,7 +367,11 @@ class BaseSearch(BaseAutotuner):
 
     # TODO(hinriksnaer): migrate _benchmark to BenchmarkProvider
     def _benchmark(
-        self, configs: list[Config], *, desc: str = "Benchmarking"
+        self,
+        configs: list[Config],
+        *,
+        desc: str = "Benchmarking",
+        _skip_filter: bool = False,
     ) -> list[BenchmarkResult]:
         """
         Internal benchmark implementation. Compiles in parallel and benchmarks configs.
@@ -379,25 +384,58 @@ class BaseSearch(BaseAutotuner):
             A list of BenchmarkResult entries containing the configuration, compiled
             callable, measured performance, status, and compilation time.
         """
-        fns: list[Callable[..., object]] = []
-        valid_configs: list[Config] = []
+        config_filter = self.settings.autotune_config_filter
+        if config_filter is not None and not _skip_filter:
+            filtered_configs: list[Config | None] = [config_filter(c) for c in configs]
+            passing_indices = [
+                i for i, fc in enumerate(filtered_configs) if fc is not None
+            ]
+            passing_configs = cast(
+                "list[Config]",
+                [filtered_configs[i] for i in passing_indices],
+            )
+            inner_results = self._benchmark(
+                passing_configs, desc=desc, _skip_filter=True
+            )
+            inner_iter = iter(inner_results)
+            merged: list[BenchmarkResult] = []
+            passing_set = set(passing_indices)
+            for i, config in enumerate(configs):
+                if i in passing_set:
+                    merged.append(next(inner_iter))
+                else:
+                    self.log.debug(
+                        f"Config filtered out by autotune_config_filter: {config!r}"
+                    )
+                    merged.append(
+                        BenchmarkResult(
+                            config=config,
+                            fn=lambda *a, **kw: None,
+                            perf=inf,
+                            status="filtered",
+                            compile_time=None,
+                        )
+                    )
+            return merged
+
+        all_configs = configs
+        compiled: dict[int, Callable[..., object]] = {}
         futures: list[PrecompileFuture] | None = None
-        for i, config in enumerate(configs):
+        for i, config in enumerate(all_configs):
             try:
-                fn = self.kernel.compile_config(config, allow_print=False)
+                compiled[i] = self.kernel.compile_config(config, allow_print=False)
             except Exception:
                 # If all configs failed, raise error
-                if not valid_configs and i == len(configs) - 1:
+                if not compiled and i == len(all_configs) - 1:
                     raise
                 self.log.warning(
                     "Skipping config that failed to compile: %s",
                     self.kernel.format_kernel_decorator(config, self.settings),
                     exc_info=True,
                 )
-                continue
-            fns.append(fn)
-            valid_configs.append(config)
-        configs = valid_configs
+        fns = list(compiled.values())
+        valid_indices = list(compiled.keys())
+        configs = [all_configs[i] for i in valid_indices]
         if self.settings.autotune_precompile:
             futures = list(
                 starmap(
@@ -422,7 +460,12 @@ class BaseSearch(BaseAutotuner):
             is_workings = [True] * len(configs)
             precompile_status = ["ok"] * len(configs)
 
-        results: list[BenchmarkResult] = []
+        results: list[BenchmarkResult] = [
+            BenchmarkResult(
+                config=c, fn=_unset_fn, perf=inf, status="error", compile_time=None
+            )
+            for c in all_configs
+        ]
 
         # Render a progress bar only when the user requested it.
         iterator = iter_with_progress(
@@ -442,7 +485,9 @@ class BaseSearch(BaseAutotuner):
                 )
             else:
                 compile_time = None
-            status: Literal["ok", "error", "timeout", "peer_compilation_fail"]
+            status: Literal[
+                "ok", "error", "timeout", "peer_compilation_fail", "filtered"
+            ]
             if all(
                 all_gather_object(
                     is_working, process_group_name=self.kernel.env.process_group_name
@@ -473,27 +518,23 @@ class BaseSearch(BaseAutotuner):
                         config=config,
                     )
                 )
-                results.append(
-                    BenchmarkResult(
-                        config=config,
-                        fn=fn,
-                        perf=perf,
-                        status=status,
-                        compile_time=compile_time,
-                    )
+                results[valid_indices[index]] = BenchmarkResult(
+                    config=config,
+                    fn=fn,
+                    perf=perf,
+                    status=status,
+                    compile_time=compile_time,
                 )
             else:
                 status = "timeout" if reason == "timeout" else "error"
                 if is_working:
                     status = "peer_compilation_fail"
-                results.append(
-                    BenchmarkResult(
-                        config=config,
-                        fn=fn,
-                        perf=inf,
-                        status=status,
-                        compile_time=compile_time,
-                    )
+                results[valid_indices[index]] = BenchmarkResult(
+                    config=config,
+                    fn=fn,
+                    perf=inf,
+                    status=status,
+                    compile_time=compile_time,
                 )
         return results
 
@@ -648,9 +689,9 @@ class PopulationMember:
     perfs: list[float]
     flat_values: FlatConfig
     config: Config
-    status: Literal["ok", "error", "timeout", "peer_compilation_fail", "unknown"] = (
-        "unknown"
-    )
+    status: Literal[
+        "ok", "error", "timeout", "peer_compilation_fail", "filtered", "unknown"
+    ] = "unknown"
     compile_time: float | None = None
 
     @property

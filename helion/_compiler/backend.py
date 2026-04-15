@@ -26,6 +26,8 @@ if TYPE_CHECKING:
     from ..runtime.kernel import BoundKernel
     from .device_function import Argument
     from .device_function import DeviceFunction
+    from .device_ir import GraphInfo
+    from .tile_dispatch import TileStrategyDispatch
     from .tile_strategy import TileStrategy
 
     InductorOpOverrides = OpsHandler[Any]
@@ -45,6 +47,11 @@ class Backend(abc.ABC):
     def name(self) -> str:
         """Backend name used for codegen dispatch (e.g., 'triton')."""
         ...
+
+    @property
+    def experimental(self) -> bool:
+        """Whether this backend is experimental and should emit a warning."""
+        return True
 
     @property
     def codegen_name(self) -> str:
@@ -429,6 +436,18 @@ class Backend(abc.ABC):
     def launcher_keyword_args(self, config: Config, *, has_barrier: bool) -> list[str]:
         return []
 
+    def pre_codegen(
+        self,
+        graphs: list[GraphInfo],
+        config: Config,
+        tile_strategy: TileStrategyDispatch,
+    ) -> None:
+        """Run backend-specific passes after tiling is finalized, before codegen.
+
+        Backends can override this to analyze or transform the graphs.
+        """
+        return None
+
     def transform_host_arg(
         self,
         arg: Argument,
@@ -556,6 +575,10 @@ class TritonBackend(Backend):
     @property
     def name(self) -> str:
         return "triton"
+
+    @property
+    def experimental(self) -> bool:
+        return False
 
     def supports_config_key(self, key: str) -> bool:
         if key == "waves_per_eu":
@@ -1982,6 +2005,16 @@ class CuteBackend(Backend):
     def name(self) -> str:
         return "cute"
 
+    def pre_codegen(
+        self,
+        graphs: list[GraphInfo],
+        config: Config,
+        tile_strategy: TileStrategyDispatch,
+    ) -> None:
+        from .cute.layout_propagation import plan_layouts
+
+        plan_layouts(graphs, config, tile_strategy)
+
     def supports_config_key(self, key: str) -> bool:
         if key == "num_threads":
             return True
@@ -2765,7 +2798,7 @@ class MetalBackend(Backend):
 
     @property
     def function_decorator(self) -> str:
-        return ""
+        return "metal_jit"
 
     @property
     def constexpr_type(self) -> str:
@@ -2786,6 +2819,7 @@ class MetalBackend(Backend):
                 "from helion.runtime import default_metal_launcher"
                 " as _default_metal_launcher"
             ),
+            "metal_jit": ("from helion._compiler.metal.metal_jit import metal_jit"),
         }
 
     def index_type_str(self, index_dtype: torch.dtype) -> str:
