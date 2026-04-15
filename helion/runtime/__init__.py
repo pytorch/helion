@@ -458,7 +458,9 @@ def _pallas_prepare_args(
     for orig_pos in _output_indices:
         if orig_pos in output_only:
             shape, dtype = next(oo_iter)
-            jax_dtype = torch_dtype_to_jax_runtime(dtype)  # pyrefly: ignore[bad-argument-type]
+            jax_dtype = torch_dtype_to_jax_runtime(
+                dtype
+            )  # pyrefly: ignore[bad-argument-type]
             out_shapes_list.append(jax.ShapeDtypeStruct(shape, jax_dtype))
         else:
             out_shapes_list.append(placeholder_fn(args[orig_pos]))  # type: ignore[arg-type]
@@ -712,6 +714,7 @@ def default_pallas_launcher(
     _output_only_shapes: list[tuple[tuple[int, ...], object]] | None = None,
     _block_spec_info: _BlockSpecInfo | None = None,
     _smem_arg_indices: list[int] | None = None,
+    _reduction_pad_dims: list[tuple[int, int, int]] | None = None,
     **kwargs: object,
 ) -> object:
     """Default launcher for Pallas kernels on TPU (or CPU with interpret=True).
@@ -728,6 +731,49 @@ def default_pallas_launcher(
     """
     if _output_indices is None:
         _output_indices = []
+
+    # Pad tensors along reduction dims that don't evenly divide the block size.
+    # This prevents pl.ds(offset, block_size) from going out of bounds in the
+    # Pallas kernel.  Outputs are sliced back to original shapes after the call.
+    _orig_shapes: dict[int, tuple[int, ...]] | None = None
+    if _reduction_pad_dims:
+        import torch
+
+        args_list = list(args)
+        _orig_shapes = {}
+        for arg_idx, dim, pad_amount in _reduction_pad_dims:
+            a = args_list[arg_idx]
+            if not isinstance(a, torch.Tensor):
+                continue
+            _orig_shapes.setdefault(arg_idx, a.shape)
+            pad_widths = [0] * (2 * a.ndim)
+            # F.pad uses (last_dim_left, last_dim_right, ..., first_dim_left, first_dim_right)
+            pad_widths[2 * (a.ndim - 1 - dim) + 1] = pad_amount
+            args_list[arg_idx] = torch.nn.functional.pad(a, pad_widths)
+        args = tuple(args_list)
+        # Adjust output-only shapes
+        if _output_only_shapes is not None:
+            pad_by_arg: dict[int, dict[int, int]] = {}
+            for arg_idx, dim, pad_amount in _reduction_pad_dims:
+                pad_by_arg.setdefault(arg_idx, {})[dim] = pad_amount
+            new_shapes = []
+            for shape, dtype in _output_only_shapes:
+                # Find which output arg this corresponds to
+                # output_only shapes are ordered by their position in _output_indices
+                new_shapes.append((shape, dtype))
+            # Rebuild: output-only args have None placeholders in args
+            oo_idx = 0
+            for out_pos in sorted(_output_indices):
+                if args[out_pos] is None and out_pos in pad_by_arg:
+                    if oo_idx < len(new_shapes):
+                        old_shape, dtype = new_shapes[oo_idx]
+                        padded_shape = list(old_shape)
+                        for d, p in pad_by_arg[out_pos].items():
+                            padded_shape[d] += p
+                        new_shapes[oo_idx] = (tuple(padded_shape), dtype)
+                if args[out_pos] is None:
+                    oo_idx += 1
+            _output_only_shapes = new_shapes
 
     cache = getattr(pallas_kernel, "_pallas_cache", None)
     if cache is not None and cache[0] == grid:
@@ -809,9 +855,55 @@ def default_pallas_launcher(
             cache_attr="_pallas_cache",
         )
 
-    return _pallas_invoke_and_return(
+    result = _pallas_invoke_and_return(
         jax_callable, args, tensor_arg_indices, arg_to_tensor_pos, _output_indices
     )
+
+    # Slice output tensors back to original shapes after reduction padding.
+    if _orig_shapes and _reduction_pad_dims:
+        import torch
+
+        pad_by_arg: dict[int, dict[int, int]] = {}
+        for arg_idx, dim, pad_amount in _reduction_pad_dims:
+            pad_by_arg.setdefault(arg_idx, {})[dim] = pad_amount
+        if isinstance(result, tuple):
+            result_list = list(result)
+            for out_idx, orig_pos in enumerate(_output_indices):
+                if orig_pos in pad_by_arg and out_idx < len(result_list):
+                    t = result_list[out_idx]
+                    if isinstance(t, torch.Tensor):
+                        orig = _orig_shapes.get(orig_pos)
+                        if orig is not None:
+                            slices = tuple(
+                                slice(None, orig[d])
+                                if d in pad_by_arg[orig_pos]
+                                else slice(None)
+                                for d in range(t.ndim)
+                            )
+                            result_list[out_idx] = t[slices]
+                        else:
+                            # Output-only tensor: compute original shape from padded
+                            slices = tuple(
+                                slice(None, t.shape[d] - pad_by_arg[orig_pos][d])
+                                if d in pad_by_arg[orig_pos]
+                                else slice(None)
+                                for d in range(t.ndim)
+                            )
+                            result_list[out_idx] = t[slices]
+            result = tuple(result_list)
+        elif isinstance(result, torch.Tensor):
+            for orig_pos in _output_indices:
+                if orig_pos in pad_by_arg:
+                    slices = tuple(
+                        slice(None, result.shape[d] - pad_by_arg[orig_pos][d])
+                        if d in pad_by_arg[orig_pos]
+                        else slice(None)
+                        for d in range(result.ndim)
+                    )
+                    result = result[slices]
+                    break
+
+    return result
 
 
 def default_pallas_pipeline_launcher(

@@ -1433,6 +1433,67 @@ class PallasBackend(Backend):
             result.append((((None,) * tensor.ndim), ((None,) * tensor.ndim)))
         return result
 
+    def _compute_reduction_pad_info(
+        self,
+        sorted_args: list[Argument] | None,
+        config: Config,
+    ) -> list[tuple[int, int, int]] | None:
+        """Compute per-tensor padding needed for non-divisible looped reductions.
+
+        Returns a list of ``(arg_index, tensor_dim, pad_amount)`` tuples, or
+        ``None`` if no padding is needed.  The launcher pads input tensors and
+        adjusts output shapes so that ``pl.ds(offset, block_size)`` never
+        exceeds the tensor dimension.
+        """
+        if sorted_args is None:
+            return None
+
+        import sympy
+
+        from .compile_environment import CompileEnvironment
+        from .compile_environment import ReductionLoopBlockSizeSource
+        from .device_function import DeviceFunction
+        from .device_function import TensorArg
+
+        env = CompileEnvironment.current()
+        device_fn = DeviceFunction.current()
+
+        # Find reduction block_ids that need padding
+        pad_by_block_id: dict[int, int] = {}
+        for bsi in env.block_sizes:
+            if not bsi.reduction:
+                continue
+            if not isinstance(bsi.block_size_source, ReductionLoopBlockSizeSource):
+                continue
+            bs = bsi.block_size_source.from_config(config, bsi)
+            if bs is None or bs <= 1:
+                continue
+            numel = bsi.numel
+            if isinstance(numel, sympy.Expr):
+                try:
+                    numel = int(numel)
+                except (TypeError, ValueError):
+                    continue
+            pad = (-numel) % bs
+            if pad > 0:
+                pad_by_block_id[bsi.block_id] = pad
+
+        if not pad_by_block_id:
+            return None
+
+        # Map tensor args to their reduction dimensions
+        result: list[tuple[int, int, int]] = []
+        for i, arg in enumerate(sorted_args):
+            if not isinstance(arg, TensorArg):
+                continue
+            tensor = arg.fake_value
+            dim_block_ids = device_fn.pallas_tensor_dim_block_ids.get(id(tensor), {})
+            for dim, block_id in dim_block_ids.items():
+                if block_id in pad_by_block_id:
+                    result.append((i, dim, pad_by_block_id[block_id]))
+
+        return result or None
+
     def build_launcher_args(
         self,
         args: list[str],
@@ -1555,6 +1616,14 @@ class PallasBackend(Backend):
             if has_rng_ops:
                 block_spec_info.append(None)  # RNG seed buffer is untiled
             launcher_args.append(f"_block_spec_info={block_spec_info!r}")
+
+        # Compute reduction padding info for non-divisible looped reductions.
+        # When a reduction block does not evenly divide the reduction dimension,
+        # input/output tensors must be padded on the host so that pl.ds() never
+        # goes out of bounds inside the Pallas kernel.
+        reduction_pad_dims = self._compute_reduction_pad_info(sorted_args, config)
+        if reduction_pad_dims:
+            launcher_args.append(f"_reduction_pad_dims={reduction_pad_dims!r}")
 
         from .device_function import DeviceFunction
 

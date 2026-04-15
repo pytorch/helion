@@ -226,7 +226,7 @@ def _pallas_index_str(
                         parts.append(expr)
                     else:
                         parts.append(":")
-            if isinstance(idx, torch.SymInt):
+            if isinstance(idx, (torch.SymInt, slice)):
                 dim_map.setdefault(tensor_dim, block_id)
         elif isinstance(idx, int):
             parts.append(str(idx))

@@ -1094,11 +1094,6 @@ class TestExamples(RefEagerTestBase, TestCase):
             num_stages=3,
         )
 
-    @xfailIfPallas(
-        "Out-of-bounds slice when reduction_loops doesn't evenly divide the "
-        "reduction dimension (e.g. reduction_loops=32 on dim=48 generates "
-        "pl.ds(32, 32) which exceeds bounds)"
-    )
     def test_layernorm_reduction_not_divisible(self):
         """Reduction loop OOB when reduction_loops doesn't divide the reduction dim."""
         batch_size = 4
