@@ -35,12 +35,7 @@ from .. import exc
 from .._compat import shape_env_size_hint
 from .._utils import triton_is_available
 from ..language.constexpr import ConstExpr
-from .backend import Backend
-from .backend import CuteBackend
-from .backend import MetalBackend
-from .backend import PallasBackend
-from .backend import TileIRBackend
-from .backend import TritonBackend
+from .backend_registry import get_backend_class
 from .source_location import SourceLocation
 from .source_location import current_location
 from .variable_origin import BlockSizeOrigin
@@ -71,6 +66,7 @@ if TYPE_CHECKING:
 
     from .. import Config
     from ..runtime.settings import Settings
+    from .backend import Backend
 
     class _TLS(Protocol):
         env: CompileEnvironment | None
@@ -141,19 +137,12 @@ class CompileEnvironment:
             index_dtype or settings.index_dtype or torch.int32
         )
         self.process_group_name = None
-        backend_factory: dict[str, type[Backend]] = {
-            "triton": TritonBackend,
-            "pallas": PallasBackend,
-            "cute": CuteBackend,
-            "tileir": TileIRBackend,
-            "metal": MetalBackend,
-        }
-        self._backend = backend_factory[settings.backend]()
-        if settings.backend in ("pallas", "cute", "metal"):
+        self._backend = get_backend_class(settings.backend)()
+        if self._backend.experimental:
             from torch._dynamo.utils import warn_once
 
             warn_once(
-                f"The '{settings.backend}' backend is experimental and may have limited functionality.",
+                f"The '{self._backend.name}' backend is experimental and may have limited functionality.",
             )
         self.shape_env = ShapeEnv(
             specialize_zero_one=True,

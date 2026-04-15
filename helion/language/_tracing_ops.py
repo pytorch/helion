@@ -893,8 +893,14 @@ def _check_dma_alignment(vmem_shapes: list[tuple[int, ...]]) -> bool:
     """Check if all VMEM buffer shapes satisfy TPU DMA alignment.
 
     DMA requires last dim % 128 == 0 and second-to-last dim % 8 == 0
-    for 2D+ tensors.  Unlike outer BlockSpecs, emit_pipeline/fori_loop
-    inner DMA does NOT have a ``block == tensor_dim`` exception.
+    for 2D+ tensors. Note that these rules are currently optimized for
+    bf16 sublanes; they are overly conservative for f32 (no constraint)
+    and too lenient for 1D (which should be % 1024).
+
+    These rules differ from outer BlockSpec constraints where 1D is
+    dtype-dependent: 128 * (32 / bitwidth(dtype)). Unlike outer BlockSpecs,
+    emit_pipeline/fori_loop inner DMA does NOT have a ``block == tensor_dim``
+    exception.
     """
     for shape in vmem_shapes:
         if len(shape) >= 2:
@@ -1005,18 +1011,16 @@ def _codegen_fori_loop(state: CodegenState) -> object:
     use_dma = _check_dma_alignment(vmem_shapes)
 
     # With DMA: tensors need HBM refs (no outer BlockSpec) because DMA
-    # handles all slicing.  Without DMA: outer BlockSpecs handle outer
-    # dims; inner dims use pl.ds() — so don't suppress BlockSpecs.
+    # handles all slicing, and we register VMEM scratch buffers +
+    # semaphores for each tensor.  Without DMA: outer BlockSpecs handle
+    # outer dims and inner dims use pl.ds(), so neither is needed.
+    tensor_to_vmem: dict[str, str] = {}
+    tensor_to_sem: dict[str, str] = {}
     if use_dma:
         for fake, _tensor_node, _sub_meta in loaded_tensors.values():
             state.device_function.pallas_pipeline_tensor_ids.add(id(fake))
         for fake, _tensor_node, _sub_meta in stored_tensors.values():
             state.device_function.pallas_pipeline_tensor_ids.add(id(fake))
-
-    # When using DMA: register VMEM scratch buffers + DMA semaphores
-    tensor_to_vmem: dict[str, str] = {}
-    tensor_to_sem: dict[str, str] = {}
-    if use_dma:
         for (fake, _sub_meta, _direction), vmem_shape in zip(
             all_tensor_info, vmem_shapes, strict=True
         ):
@@ -1033,9 +1037,23 @@ def _codegen_fori_loop(state: CodegenState) -> object:
             tensor_to_sem[hbm_name] = sem_name
 
     # Build the body function
-    body_fn_name = state.device_function.new_var("_fori_body")
-    loop_var = state.device_function.new_var("_j")
     body_stmts: list[ast.AST] = []
+
+    strategy = _find_strategy(state, block_ids)
+
+    # NOTE: FlattenedTileStrategy with multi-dim inner loops is not handled
+    # yet.  The nested fori_loop emission assumes NDTileStrategy where each
+    # dimension has its own block size and grid extent.
+
+    # Create one loop variable per dimension for nested fori_loops.
+    # Each dimension gets its own fori_loop; the innermost wraps body_stmts.
+    if len(block_ids) == 1:
+        loop_vars = [state.device_function.new_var("_j")]
+    else:
+        loop_vars = [
+            state.device_function.new_var(f"_j{i}") for i in range(len(block_ids))
+        ]
+    dim_idx_exprs: list[str] = loop_vars
 
     # Build block_id_to_info
     block_id_to_info: dict[int, LoopDimInfo] = {}
@@ -1045,7 +1063,6 @@ def _codegen_fori_loop(state: CodegenState) -> object:
             end_expr=env.block_sizes[block_id].numel,
         )
 
-    strategy = _find_strategy(state, block_ids)
     # Set up mask variables for inner-loop block_ids
     _setup_inner_loop_masks(
         state,
@@ -1055,14 +1072,16 @@ def _codegen_fori_loop(state: CodegenState) -> object:
         env,
         body_stmts,
         # fori_loop has direct access to the loop variable
-        offset_expr_fn=lambda i, bs: f"{loop_var} * {bs} + jnp.arange({bs})",
+        offset_expr_fn=lambda i, bs: f"{dim_idx_exprs[i]} * {bs} + jnp.arange({bs})",
     )
-    # Create ForiLoopState
+
+    # Create ForiLoopState (body_fn_name and loop_var_name are currently
+    # unused by consumers but stored for debugging; use outermost values)
     fori_state = ForiLoopState(
         strategy=strategy,  # pyrefly: ignore[bad-argument-type]
         block_id_to_info=block_id_to_info,
-        body_fn_name=body_fn_name,
-        loop_var_name=loop_var,
+        body_fn_name="_fori_body_0",
+        loop_var_name=loop_vars[0],
         use_dma=use_dma,
         inner_statements=body_stmts,
         _tensor_to_vmem=tensor_to_vmem,
@@ -1084,8 +1103,9 @@ def _codegen_fori_loop(state: CodegenState) -> object:
                 begin_expr = begin_exprs[bid_idx]
                 iter_step_expr = iter_step_exprs[bid_idx]
                 slice_size_expr = slice_size_exprs[bid_idx]
+                dim_idx_expr = dim_idx_exprs[bid_idx]
                 parts.append(
-                    f"pl.ds(({begin_expr}) + ({loop_var}) * ({iter_step_expr}), {slice_size_expr})"
+                    f"pl.ds(({begin_expr}) + ({dim_idx_expr}) * ({iter_step_expr}), {slice_size_expr})"
                 )
                 needs_slice = True
             elif bid is not None and bid not in block_ids:
@@ -1139,7 +1159,7 @@ def _codegen_fori_loop(state: CodegenState) -> object:
                 offset_name = strategy.offset_var(bid)
                 state.codegen.add_statement(
                     statement_from_string(
-                        f"{offset_name} = ({begin_exprs[i]}) + ({loop_var}) * ({iter_step_exprs[i]})"
+                        f"{offset_name} = ({begin_exprs[i]}) + ({dim_idx_exprs[i]}) * ({iter_step_exprs[i]})"
                     )
                 )
 
@@ -1173,23 +1193,30 @@ def _codegen_fori_loop(state: CodegenState) -> object:
                     statement_from_string(f"{copy_out_var}.wait()")
                 )
 
-    # Emit the function def and fori_loop call
-    fn_def = statement_from_string(f"def {body_fn_name}({loop_var}, _): pass")
-    assert isinstance(fn_def, ast.FunctionDef)
-    fn_def.body = body_stmts or [ast.Pass()]  # pyrefly: ignore[bad-assignment]
-
-    # Compute n_tiles
-    if len(grid_parts) == 1:
-        n_tiles_expr = grid_parts[0]
-    else:
-        n_tiles_expr = " * ".join(f"({p})" for p in grid_parts)
-
-    state.add_statement(fn_def)
-    state.add_statement(
-        statement_from_string(
-            f"jax.lax.fori_loop(0, {n_tiles_expr}, {body_fn_name}, None)"
+    # Emit nested fori_loop calls — one per dimension.
+    # Build inside-out: innermost function wraps body_stmts, each outer
+    # function wraps the inner fori_loop call.
+    # Note: loops are emitted in block_ids order (not loop_order).
+    # loop_order is a config knob for the outer grid strategy (NDTileStrategy),
+    # not for inner device loops.  For element-wise ops iteration order does
+    # not affect correctness; for loop-carried state the user's source order
+    # (block_ids order) is the correct semantic order.
+    current_body = body_stmts or [ast.Pass()]  # pyrefly: ignore[bad-assignment]
+    for dim in reversed(range(len(loop_vars))):
+        fn_name = state.device_function.new_var(f"_fori_body_{dim}")
+        fn_def = statement_from_string(f"def {fn_name}({loop_vars[dim]}, _): pass")
+        assert isinstance(fn_def, ast.FunctionDef)
+        fn_def.body = current_body  # pyrefly: ignore[bad-assignment]
+        fori_call = statement_from_string(
+            f"jax.lax.fori_loop(0, {grid_parts[dim]}, {fn_name}, None)"
         )
-    )
+        if dim == 0:
+            # Outermost: emit function def and fori_loop call into the kernel
+            state.add_statement(fn_def)
+            state.add_statement(fori_call)
+        else:
+            # Inner: wrap in the next outer function's body
+            current_body = [fn_def, fori_call]
 
     # After fori_loop: read final loop-carried state from scratch
     if has_loop_state:

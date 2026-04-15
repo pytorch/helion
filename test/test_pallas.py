@@ -172,6 +172,19 @@ def pallas_inner_loop_add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 
 
 @helion.kernel(backend="pallas", static_shapes=True)
+def pallas_add_3d(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """Kernel with an outer grid loop and a 2D inner device loop."""
+    b, m, n = x.size()
+    out = torch.empty_like(x)
+    for tile_b in hl.tile(b):
+        for tile_m, tile_n in hl.tile([m, n]):
+            out[tile_b, tile_m, tile_n] = (
+                x[tile_b, tile_m, tile_n] + y[tile_b, tile_m, tile_n]
+            )
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
 def pallas_attention(
     q_in: torch.Tensor, k_in: torch.Tensor, v_in: torch.Tensor
 ) -> torch.Tensor:
@@ -353,7 +366,7 @@ class TestPallas(TestCase):
         from helion.runtime.config import Config
 
         bound = pallas_tile_begin_end.bind((x,))
-        code = bound.to_triton_code(Config(block_size=256))
+        code = bound.to_code(Config(block_size=256))
         self.assertIn("pl.program_id", code)
 
     def test_dynamic_scalar_no_recompile(self) -> None:
@@ -786,6 +799,79 @@ class TestPallas(TestCase):
         torch.testing.assert_close(result, x + 1.0)
         # out is read after write, so it must be in _inplace_indices
         self.assertIn("_inplace_indices=[1]", code)
+
+    def test_fori_loop_multidim(self) -> None:
+        """Test fori_loop with a 2D inner loop (nested iteration)."""
+        args = (
+            torch.randn(4, 64, 128, device=DEVICE, dtype=torch.float32),
+            torch.randn(4, 64, 128, device=DEVICE, dtype=torch.float32),
+        )
+        code, result = code_and_output(
+            pallas_add_3d,
+            args,
+            block_sizes=[1, 8, 128],
+            pallas_loop_type="fori_loop",
+        )
+        self.assertGreaterEqual(code.count("jax.lax.fori_loop"), 2)
+        torch.testing.assert_close(result, args[0] + args[1])
+
+    def test_fori_loop_multidim_partial_tile(self) -> None:
+        """Test fori_loop with a 2D inner loop and a partial tail tile."""
+        args = (
+            torch.randn(4, 70, 130, device=DEVICE, dtype=torch.float32),
+            torch.randn(4, 70, 130, device=DEVICE, dtype=torch.float32),
+        )
+        code, result = code_and_output(
+            pallas_add_3d,
+            args,
+            block_sizes=[1, 8, 128],
+            pallas_loop_type="fori_loop",
+        )
+        self.assertGreaterEqual(code.count("jax.lax.fori_loop"), 2)
+        torch.testing.assert_close(result, args[0] + args[1])
+
+    def test_fori_loop_no_dma_unaligned_inner_block(self) -> None:
+        """fori_loop with inner block violating DMA alignment (last dim % 128 != 0).
+
+        Exercises the non-DMA fallback: instead of pltpu.make_async_copy,
+        codegen should emit pl.ds() slicing into the outer BlockSpec refs.
+        """
+        args = (
+            torch.randn(64, 64, device=DEVICE, dtype=torch.float32),
+            torch.randn(64, 64, device=DEVICE, dtype=torch.float32),
+        )
+        code, result = code_and_output(
+            pallas_inner_loop_add,
+            args,
+            block_sizes=[8, 64],
+            pallas_loop_type="fori_loop",
+        )
+        self.assertIn("jax.lax.fori_loop", code)
+        self.assertNotIn("pltpu.make_async_copy", code)
+        self.assertIn("pl.ds(", code)
+        torch.testing.assert_close(result, args[0] + args[1])
+
+    def test_fori_loop_no_dma_multidim_unaligned(self) -> None:
+        """Nested fori_loop with a DMA-unaligned inner block.
+
+        2D inner loop where both inner dims are too small for DMA
+        (last dim = 64 < 128).  Validates that the non-DMA pl.ds()
+        path works with nested fori_loops, one per inner dim.
+        """
+        args = (
+            torch.randn(4, 32, 64, device=DEVICE, dtype=torch.float32),
+            torch.randn(4, 32, 64, device=DEVICE, dtype=torch.float32),
+        )
+        code, result = code_and_output(
+            pallas_add_3d,
+            args,
+            block_sizes=[1, 8, 64],
+            pallas_loop_type="fori_loop",
+        )
+        self.assertGreaterEqual(code.count("jax.lax.fori_loop"), 2)
+        self.assertNotIn("pltpu.make_async_copy", code)
+        self.assertIn("pl.ds(", code)
+        torch.testing.assert_close(result, args[0] + args[1])
 
 
 if __name__ == "__main__":

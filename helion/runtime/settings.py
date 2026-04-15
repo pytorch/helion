@@ -21,6 +21,7 @@ from torch._environment import is_fbcode
 from .. import exc
 from .._compat import is_hip
 from .._compat import supports_tf32_precision_on_amd
+from .._compiler.backend_registry import list_backends
 from ..autotuner.effort_profile import AutotuneEffort
 from ..autotuner.effort_profile import InitialPopulation
 from ..autotuner.effort_profile import get_effort_profile
@@ -29,6 +30,7 @@ from .ref_mode import RefMode
 if TYPE_CHECKING:
     from ..autotuner.base_search import BaseAutotuner
     from ..autotuner.pattern_search import InitialPopulationStrategy
+    from .config import Config
     from .kernel import BoundKernel
 
     _T = TypeVar("_T")
@@ -39,7 +41,6 @@ if TYPE_CHECKING:
         ) -> BaseAutotuner: ...
 
 
-BackendLiteral = Literal["triton", "pallas", "cute", "tileir", "metal"]
 DotPrecision = Literal["tf32", "tf32x3", "ieee"]
 PrecompileMode = Literal["spawn", "fork"] | None
 _TRUE_LITERALS = frozenset({"1", "true", "yes", "on"})
@@ -327,17 +328,11 @@ def _get_dot_precision() -> DotPrecision:
     )
 
 
-def _get_backend() -> BackendLiteral:
+def _get_backend() -> str:
     return _env_get_literal(
         "HELION_BACKEND",
-        cast("BackendLiteral", "triton"),
-        mapping={
-            "triton": "triton",
-            "pallas": "pallas",
-            "cute": "cute",
-            "tileir": "tileir",
-            "metal": "metal",
-        },
+        "triton",
+        mapping={name: name for name in list_backends()},
     )
 
 
@@ -349,7 +344,7 @@ def is_pallas_interpret() -> bool:
 @dataclasses.dataclass
 class _Settings:
     # see __slots__ below for the doc strings that show up in help(Settings)
-    backend: BackendLiteral = dataclasses.field(default_factory=_get_backend)
+    backend: str = dataclasses.field(default_factory=_get_backend)
     ignore_warnings: list[type[exc.BaseWarning]] = dataclasses.field(
         default_factory=_get_ignore_warnings
     )
@@ -513,6 +508,7 @@ class _Settings:
             _env_get_bool, "HELION_AUTOTUNE_WITH_TORCH_COMPILE_FUSION", False
         )
     )
+    autotune_config_filter: Callable[[Config], Config | None] | None = None
 
 
 class Settings(_Settings):
@@ -658,6 +654,14 @@ class Settings(_Settings):
             "If True, allow torch.compile to fuse this Helion kernel with surrounding Inductor ops "
             "(prologue/epilogue) when used inside torch.compile. Default False. "
             "Set HELION_TORCH_COMPILE_FUSION=1 to enable globally."
+        ),
+        "autotune_config_filter": (
+            "Optional callable ``(config: Config) -> Config | None`` that the autotuner calls on every "
+            "candidate config before compiling or benchmarking it.  If the callable returns None, "
+            "the config is skipped entirely (no compilation, no benchmarking).  If it returns a Config "
+            "(which may be a modified copy of the original), that config is used for benchmarking. "
+            "Also filters the explicit ``configs=[...]`` list when one is provided. "
+            "Pass as @helion.kernel(..., autotune_config_filter=my_filter_fn)."
         ),
         "autotune_with_torch_compile_fusion": (
             "If True, autotuning benchmarks the fused kernel (with epilogue/prologue) "
