@@ -14,6 +14,7 @@ from helion import _compat
 from helion._testing import DEVICE
 from helion._testing import EXAMPLES_DIR
 from helion._testing import HALF_DTYPE
+from helion._testing import LONG_INT_TYPE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import _get_backend
@@ -471,17 +472,17 @@ class TestExamples(RefEagerTestBase, TestCase):
             indexing="block_ptr",
         )
 
-    @xfailIfPallas("BlockSpec tiling failure")
+    @xfailIfPallas("missing BlockSpec for hl.load with computed indices")
     def test_cross_entropy(self):
         n, v = 128, 1000
-        args = (
-            torch.randn(n, v, device=DEVICE, dtype=torch.float32),
-            torch.randint(0, v, (n,), device=DEVICE, dtype=torch.long),
-        )
+        logits = torch.randn(n, v, device=DEVICE, dtype=torch.float32)
+        labels = torch.randint(0, v, (n,), device=DEVICE, dtype=LONG_INT_TYPE)
+        # PyTorch cross_entropy requires Long labels for the reference
+        expected = torch.nn.functional.cross_entropy(logits, labels.long())
         check_example(
             "cross_entropy",
-            args,
-            torch.nn.functional.cross_entropy(*args),
+            (logits, labels),
+            expected,
         )
 
     @xfailIfCute("CuTe Welford example still returns incorrect results")
