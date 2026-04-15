@@ -96,8 +96,9 @@ class LFBOPatternSearch(PatternSearch):
             already selected in the batch. Default: 1.0.
         initial_population_strategy: Strategy for generating the initial population.
             FROM_RANDOM generates initial_population random configs.
-            FROM_DEFAULT starts from only the default configuration.
-            Can be overridden by HELION_AUTOTUNER_INITIAL_POPULATION env var ("from_random" or "from_default").
+            FROM_BEST_AVAILABLE uses cached configs from prior runs, and fills the
+            remainder with random configs when best_available_pad_random is True.
+            Can be overridden by HELION_AUTOTUNER_INITIAL_POPULATION env var.
     """
 
     def __init__(
@@ -116,6 +117,7 @@ class LFBOPatternSearch(PatternSearch):
         patience: int = 1,
         similarity_penalty: float = 1.0,
         initial_population_strategy: InitialPopulationStrategy | None = None,
+        best_available_pad_random: bool = PATTERN_SEARCH_DEFAULTS.best_available_pad_random,
         num_neighbors_cap: int = -1,
         finishing_rounds: int = 0,
         compile_timeout_lower_bound: float = PATTERN_SEARCH_DEFAULTS.compile_timeout_lower_bound,
@@ -135,6 +137,7 @@ class LFBOPatternSearch(PatternSearch):
             max_generations=max_generations,
             min_improvement_delta=min_improvement_delta,
             initial_population_strategy=initial_population_strategy,
+            best_available_pad_random=best_available_pad_random,
             num_neighbors_cap=num_neighbors_cap,
             finishing_rounds=finishing_rounds,
             compile_timeout_lower_bound=compile_timeout_lower_bound,
@@ -170,6 +173,7 @@ class LFBOPatternSearch(PatternSearch):
             "copies": profile.lfbo_pattern_search.copies,
             "max_generations": profile.lfbo_pattern_search.max_generations,
             "initial_population_strategy": strategy,
+            "best_available_pad_random": profile.lfbo_pattern_search.best_available_pad_random,
             **PopulationBasedSearch.get_kwargs_from_profile(profile, settings),
         }
 
@@ -284,71 +288,71 @@ class LFBOPatternSearch(PatternSearch):
         Returns:
             List of the top n_sorted PopulationMember candidates, ordered by selection rank.
         """
+        if n_sorted <= 0 or not candidates:
+            return []
+
         # Score candidates
         candidate_X = np.array(
             [self.config_gen.encode_config(member.flat_values) for member in candidates]
         )
 
         n_samples = len(candidate_X)
+        n_selected = min(n_sorted, n_samples)
 
         # Get predicted probabilities (higher = more likely to be good)
         surrogate: RandomForestClassifier | None = self.surrogate
         if surrogate is None:
             # If surrogate is None, scores are random
-            with sync_seed():
+            with sync_seed(process_group_name=self.kernel.env.process_group_name):
                 scores = [random.random() for _ in range(n_samples)]
+            candidates_sorted = sorted(
+                zip(candidates, scores, strict=True),
+                key=operator.itemgetter(1),
+            )[:n_selected]
+            candidates_sorted = [member for member, _ in candidates_sorted]
         else:
             proba = np.asarray(surrogate.predict_proba(candidate_X))[:, 1]
 
-            # Compute pairwise similarity matrix using decision path Jaccard
-            similarity_matrix = self.compute_leaf_similarity(surrogate, candidate_X)
-
-            # Sequential greedy selection with diversity penalty
-            selected_indices = []
+            # Track the cumulative similarity to already-selected points and update
+            # it incrementally. This preserves the original ranking while avoiding
+            # the dense n_samples x n_samples similarity matrix.
+            leaf_indices = surrogate.apply(candidate_X)
+            n_trees = leaf_indices.shape[1]
+            similarity_sums = np.zeros(n_samples)
             remaining_indices = list(range(n_samples))
-            scores = np.zeros(n_samples)
+            selected_indices: list[int] = []
 
-            for rank in range(n_samples):
-                if len(selected_indices) == 0:
-                    # First selection: just use probability
-                    proba_minus_similarity = proba[remaining_indices]
-                else:
-                    # Compute mean similarity to already selected points for each remaining point
-                    mean_similarties = np.zeros(len(remaining_indices))
-                    for i, idx in enumerate(remaining_indices):
-                        similarities_to_selected = similarity_matrix[
-                            idx, selected_indices
-                        ]
-                        mean_similarties[i] = np.mean(similarities_to_selected)
-
-                    # Score = probability - lambda * mean_similarity
+            for _rank in range(n_selected):
+                if selected_indices:
+                    mean_similarities = similarity_sums[remaining_indices] / len(
+                        selected_indices
+                    )
                     proba_minus_similarity = (
                         proba[remaining_indices]
-                        - self.similarity_penalty * mean_similarties
+                        - self.similarity_penalty * mean_similarities
                     )
+                else:
+                    proba_minus_similarity = proba[remaining_indices]
 
-                # Select the point with highest score
-                best_local_idx = np.argmax(proba_minus_similarity)
-                best_global_idx = remaining_indices[best_local_idx]
-
-                # Assign ranking score (lower rank = better)
-                scores[best_global_idx] = rank
-
-                # Update selected and remaining
+                best_local_idx = int(np.argmax(proba_minus_similarity))
+                best_global_idx = remaining_indices.pop(best_local_idx)
                 selected_indices.append(best_global_idx)
-                remaining_indices.remove(best_global_idx)
 
-        # sort candidates by score
-        candidates_sorted = sorted(
-            zip(candidates, scores, strict=True),
-            key=operator.itemgetter(1),
-        )[:n_sorted]
+                if len(selected_indices) == n_selected:
+                    break
+
+                same_leaf: np.ndarray = (
+                    leaf_indices == leaf_indices[best_global_idx : best_global_idx + 1]
+                )
+                similarity_sums += same_leaf.sum(axis=1) / n_trees
+
+            candidates_sorted = [candidates[idx] for idx in selected_indices]
 
         self.log.debug(
-            f"Scoring {len(candidate_X)} neighbors, selecting {(n_sorted / len(candidate_X)) * 100:.0f}% neighbors: {len(candidates_sorted)}"
+            f"Scoring {len(candidate_X)} neighbors, selecting {(n_selected / len(candidate_X)) * 100:.0f}% neighbors: {len(candidates_sorted)}"
         )
 
-        return [member for member, score in candidates_sorted]
+        return candidates_sorted
 
     def _autotune(self) -> Config:
         initial_population_name = self.initial_population_strategy.name
@@ -377,7 +381,9 @@ class LFBOPatternSearch(PatternSearch):
 
         # again with higher accuracy
         self.rebenchmark_population(self.population, desc="Verifying initial results")
-        check_population_consistency(self.population)
+        check_population_consistency(
+            self.population, process_group_name=self.kernel.env.process_group_name
+        )
         self.population.sort(key=performance)
         starting_points = []
         for member in self.population[: self.copies]:
@@ -475,13 +481,19 @@ class LFBOPatternSearch(PatternSearch):
         neighbors: list[FlatConfig] = []
 
         # Generate num_neighbors random neighbors
+        overridden = self.config_gen.overridden_flat_indices
+        eligible_block = [
+            i for i in self.config_gen.block_size_indices if i not in overridden
+        ]
+        warp_idx = self.config_gen.num_warps_index
+        tune_warps = warp_idx >= 0 and warp_idx not in overridden
         for _ in range(self.num_neighbors):
             new_flat = [*base]  # Copy the base configuration
             modified_indices = set()
 
             # 1. Sample a block size index and change it
-            if self.config_gen.block_size_indices:
-                block_idx = random.choice(self.config_gen.block_size_indices)
+            if eligible_block:
+                block_idx = random.choice(eligible_block)
                 modified_indices.add(block_idx)
 
                 block_spec = self.config_gen.flat_spec[block_idx]
@@ -492,8 +504,7 @@ class LFBOPatternSearch(PatternSearch):
                     new_flat[block_idx] = random.choice(block_neighbors)
 
             # 2. Sample the num_warps index and change it
-            if self.config_gen.num_warps_index >= 0:
-                warp_idx = self.config_gen.num_warps_index
+            if tune_warps:
                 modified_indices.add(warp_idx)
 
                 warp_spec = self.config_gen.flat_spec[warp_idx]
@@ -509,7 +520,7 @@ class LFBOPatternSearch(PatternSearch):
             # Collect available pattern neighbors for remaining indices
             remaining_pattern_neighbors = []
             for index, spec in enumerate(self.config_gen.flat_spec):
-                if index not in modified_indices:
+                if index not in modified_indices and index not in overridden:
                     pattern_neighbors = spec.pattern_neighbors(base[index])
                     if pattern_neighbors:
                         remaining_pattern_neighbors.append((index, pattern_neighbors))
@@ -557,7 +568,7 @@ class LFBOPatternSearch(PatternSearch):
         patience = self.patience
         for _ in range(self.max_generations):
             candidates: list[PopulationMember] = [current]
-            with sync_seed():
+            with sync_seed(process_group_name=self.kernel.env.process_group_name):
                 all_neighbors = self._generate_neighbors(current.flat_values)
             for flat_config in all_neighbors:
                 new_member = self.make_unbenchmarked(flat_config)
@@ -655,9 +666,9 @@ class LFBOTreeSearch(LFBOPatternSearch):
             already selected in the batch. Default: 1.0.
         initial_population_strategy: Strategy for generating the initial population.
             FROM_RANDOM generates initial_population random configs.
-            FROM_DEFAULT starts from only the default configuration.
-            Can be overridden by HELION_AUTOTUNER_INITIAL_POPULATION env var
-            ("from_random" or "from_default").
+            FROM_BEST_AVAILABLE uses cached configs from prior runs, and fills the
+            remainder with random configs when best_available_pad_random is True.
+            Can be overridden by HELION_AUTOTUNER_INITIAL_POPULATION env var.
     """
 
     def __init__(
@@ -676,6 +687,7 @@ class LFBOTreeSearch(LFBOPatternSearch):
         patience: int = 1,
         similarity_penalty: float = 1.0,
         initial_population_strategy: InitialPopulationStrategy | None = None,
+        best_available_pad_random: bool = PATTERN_SEARCH_DEFAULTS.best_available_pad_random,
         finishing_rounds: int = 0,
         compile_timeout_lower_bound: float = PATTERN_SEARCH_DEFAULTS.compile_timeout_lower_bound,
         compile_timeout_quantile: float = PATTERN_SEARCH_DEFAULTS.compile_timeout_quantile,
@@ -694,6 +706,7 @@ class LFBOTreeSearch(LFBOPatternSearch):
             patience=patience,
             similarity_penalty=similarity_penalty,
             initial_population_strategy=initial_population_strategy,
+            best_available_pad_random=best_available_pad_random,
             finishing_rounds=finishing_rounds,
             compile_timeout_lower_bound=compile_timeout_lower_bound,
             compile_timeout_quantile=compile_timeout_quantile,
@@ -748,6 +761,12 @@ class LFBOTreeSearch(LFBOPatternSearch):
         n_trees = len(surrogate.estimators_)
         base_list = list(base)
         base_encoded = np.array(config_gen.encode_config(base), dtype=np.float64)
+        overridden = config_gen.overridden_flat_indices
+        eligible_block = [
+            i for i in config_gen.block_size_indices if i not in overridden
+        ]
+        warp_idx = config_gen.num_warps_index
+        tune_warps = warp_idx >= 0 and warp_idx not in overridden
 
         all_results: list[FlatConfig] = []
 
@@ -762,7 +781,7 @@ class LFBOTreeSearch(LFBOPatternSearch):
             path_node_indices = decision_path.indices.tolist()  # type: ignore[union-attr]
 
             # 3. Extract flat_spec indices (deduplicated, order-preserving)
-            seen: set[int] = set()
+            seen: set[int] = set(overridden)
             path_flat_indices: list[int] = []
             for node_id in path_node_indices:
                 feat = tree.feature[node_id]  # pyrefly: ignore [missing-attribute]
@@ -773,17 +792,14 @@ class LFBOTreeSearch(LFBOPatternSearch):
                         path_flat_indices.append(flat_idx)
 
             # 4. Augment with block_size and num_warps indices
-            if config_gen.block_size_indices:
-                bs_idx = random.choice(config_gen.block_size_indices)
+            if eligible_block:
+                bs_idx = random.choice(eligible_block)
                 if bs_idx not in seen:
                     seen.add(bs_idx)
                     path_flat_indices.append(bs_idx)
-            if (
-                config_gen.num_warps_index >= 0
-                and config_gen.num_warps_index not in seen
-            ):
-                seen.add(config_gen.num_warps_index)
-                path_flat_indices.append(config_gen.num_warps_index)
+            if tune_warps and warp_idx not in seen:
+                seen.add(warp_idx)
+                path_flat_indices.append(warp_idx)
 
             # 5. Greedy traversal with incremental encoding
             current_flat: FlatConfig = list(base)

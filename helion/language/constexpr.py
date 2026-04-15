@@ -58,6 +58,14 @@ class ConstExpr(NamedTuple):
         return bool(self.value)
 
 
+class ProcessGroupName(ConstExpr):
+    """
+    Used in type annotation to specify the argument as process group name.
+    Autotuning for distributed kernels will use this process group name
+    to run collectives to sync across ranks.
+    """
+
+
 @_decorators.api(is_device_only=False)
 def specialize(value: _T) -> _T:
     """
@@ -81,7 +89,6 @@ def specialize(value: _T) -> _T:
 @_decorators.type_propagation(specialize)
 def _(value: TypeInfo, *, origin: Origin) -> TypeInfo:
     from .._compiler.compile_environment import CompileEnvironment
-    from .._compiler.type_propagation import TypeInfo
 
     if origin.is_device():
         raise exc.SpecializeOnDevice
@@ -104,14 +111,36 @@ def _(value: TypeInfo, *, origin: Origin) -> TypeInfo:
                     env.specialized_strides.add((source.base.local_name, source.idx))
         return symint.__int__()
 
-    specialized = _convert_specializable(proxy, on_symint=handle_symint)
-    return TypeInfo.from_example(specialized, origin=origin)
+    _convert_specializable(proxy, on_symint=handle_symint)
+    return value
+
+
+@_decorators.register_fake(specialize)
+def _(value: _T) -> _T:
+    from .._compiler.compile_environment import CompileEnvironment
+
+    env = CompileEnvironment.current()
+
+    def handle_symint(symint: torch.SymInt) -> torch.SymInt:
+        syms = symint._sympy_().free_symbols
+        env.specialized_vars.update(syms)
+        for sym in syms:
+            for source in env.shape_env.var_to_sources.get(sym, []):
+                if (
+                    isinstance(source, TensorPropertySource)
+                    and source.prop == TensorProperty.STRIDE
+                    and isinstance(source.base, LocalSource)
+                    and source.idx is not None
+                ):
+                    env.specialized_strides.add((source.base.local_name, source.idx))
+        return symint
+
+    return _convert_specializable(value, on_symint=handle_symint)
 
 
 @_decorators.codegen(specialize, "common")
 def _(state: CodegenState) -> ast.AST:
-    value = state.proxy_arg(0)
-    specialized = _convert_specializable(value)
+    specialized = _convert_specializable(state.proxy_arg(0))
     return expr_from_string(repr(specialized))
 
 
@@ -123,7 +152,9 @@ def _(value: _T) -> _T:
 def _convert_specializable(
     value: _T,
     *,
-    on_symint: Callable[[torch.SymInt], int] = lambda symint: symint.__int__(),
+    on_symint: Callable[[torch.SymInt], int | torch.SymInt] = lambda symint: (
+        symint.__int__()
+    ),
 ) -> _T:
     if isinstance(value, torch.SymInt):
         # pyrefly: ignore [bad-return]

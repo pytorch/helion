@@ -7,6 +7,7 @@ import contextlib
 import copy
 import dataclasses
 import functools
+import math
 import operator
 import re
 import textwrap
@@ -184,6 +185,7 @@ def _make_fx(fn: Callable[..., object], *args: object) -> torch.fx.Graph:
         return get_proxy_slot(obj, tracer, default, transform)
 
     get_proxy_slot: Callable[..., object] = proxy_tensor.get_proxy_slot
+
     with (
         preserve_node_meta(),
         patch.object(proxy_tensor, "get_proxy_slot", _get_proxy_slot),
@@ -299,7 +301,7 @@ class ForLoopGraphInfo(NodeArgsGraphInfo):
         }
 
     def codegen(self, state: CodegenState) -> list[object]:
-        args = state.ast_args[-1]
+        args = state.ast_args[3]
         assert isinstance(args, list)
         assert all(isinstance(x, ast.AST) for x in args)
         with state.codegen.add_device_loop(
@@ -323,40 +325,78 @@ class ReductionLoopGraphInfo(ForLoopGraphInfo):
 @dataclasses.dataclass
 class IfGraphInfo(NodeArgsGraphInfo):
     predicate_is_tensor: bool = False
-    if_branch: IfGraphInfo | None = None
+    else_branch: ElseGraphInfo | None = None
+
+    if_arg_names: list[str] | None = None
+    else_arg_names: list[str] | None = None
+
+    # list of outputs of the branches,
+    # [(if_out_0, else_out_0), (if_out_1, else_out_1), ...]
+    # where each output is represented either as an index into the graph output,
+    # or as a name of a non-local variable that is written to
+    branches_outputs: list[tuple[int | str, ...]] | None = None
 
     @property
     def name(self) -> str:
-        return f"if_else_graph_{self.graph_id}"
+        return f"if_graph_{self.graph_id}"
 
     def kwargs(self) -> dict[str, object]:
         return {
             **super().kwargs(),
             "predicate_is_tensor": self.predicate_is_tensor,
-            "if_branch": self.if_branch,
+            "else_branch": self.else_branch,
+            "if_arg_names": self.if_arg_names,
+            "else_arg_names": self.else_arg_names,
+            "branches_outputs": self.branches_outputs,
         }
 
     def codegen(self, state: CodegenState) -> list[object]:
         from .generate_ast import GenerateAST
 
-        args = state.ast_args[2]
-        assert isinstance(args, list)
-        assert all(isinstance(x, ast.AST) for x in args)
+        if_args = state.ast_args[3]
+        assert isinstance(if_args, list)
+        assert all(isinstance(x, ast.AST) for x in if_args)
+        else_args = state.ast_args[4]
+        assert isinstance(else_args, list)
+        assert all(isinstance(x, ast.AST) for x in else_args)
+
         assert isinstance(state.codegen, GenerateAST)
-        if_branch = self.if_branch
-        if if_branch is not None and if_branch.graph_id in state.codegen.if_ast_nodes:
-            # This is an else-branch: attach to the if-branch's ast.If orelse
-            if_ast = state.codegen.if_ast_nodes[if_branch.graph_id]
-            stmts: list[ast.AST] = []
-            if_ast.orelse = stmts  # pyrefly: ignore[bad-assignment]
-        else:
-            # This is an if-branch (or standalone): create a new ast.If
-            test = state.ast_arg(0)
-            if_ast_node = create(ast.If, test=test, body=(stmts := []), orelse=[])
-            state.add_statement(if_ast_node)
-            state.codegen.if_ast_nodes[self.graph_id] = if_ast_node
-        with state.codegen.set_statements(stmts):
-            return codegen_call_with_graph(state.codegen, self.graph, args)
+
+        test = state.ast_arg(0)
+        body_stmts: list[ast.AST] = []
+        orelse_stmts: list[ast.AST] = []
+        if_ast_node = create(ast.If, test=test, body=body_stmts, orelse=orelse_stmts)
+        state.add_statement(if_ast_node)
+
+        with state.codegen.set_statements(body_stmts):
+            if_outputs = codegen_call_with_graph(state.codegen, self.graph, if_args)
+
+        else_outputs = []
+        if self.else_branch is not None:
+            else_graph = state.get_graph(self.else_branch)
+            assert isinstance(else_graph, ElseGraphInfo)
+            with state.codegen.set_statements(orelse_stmts):
+                else_outputs = codegen_call_with_graph(
+                    state.codegen, else_graph.graph, else_args
+                )
+
+        if len(body_stmts) == 0:
+            body_stmts.append(ast.Pass())
+        if len(orelse_stmts) == 0:
+            orelse_stmts.append(ast.Pass())
+        return if_outputs + else_outputs
+
+
+@dataclasses.dataclass
+class ElseGraphInfo(NodeArgsGraphInfo):
+    @property
+    def name(self) -> str:
+        return f"else_graph_{self.graph_id}"
+
+    def codegen(self, state: CodegenState) -> list[object]:
+        raise exc.InternalError(
+            RuntimeError("ElseGraphInfo should not be codegenned directly")
+        )
 
 
 @dataclasses.dataclass
@@ -394,13 +434,15 @@ class WhileLoopGraphInfo(NodeArgsGraphInfo):
 
         def emit_condition(
             target_statements: list[ast.AST],
+            cond_args: list[ast.AST] | None = None,
         ) -> ast.expr:
             with state.codegen.set_statements(target_statements):
                 cond_outputs = codegen_call_with_graph(
                     state.codegen,
                     cond_info.graph,
                     # pyrefly: ignore [bad-argument-type]
-                    args,
+                    cond_args or args,
+                    copy_named_args=False,
                 )
             if len(cond_outputs) != 1:
                 raise exc.InternalError(
@@ -434,7 +476,12 @@ class WhileLoopGraphInfo(NodeArgsGraphInfo):
 
         body_statements: list[ast.AST] = []
         with state.codegen.set_statements(body_statements):
-            outputs = codegen_call_with_graph(state.codegen, self.graph, args)
+            outputs = codegen_call_with_graph(
+                state.codegen,
+                self.graph,
+                args,
+                copy_named_args=False,
+            )
         loop_condition_update: list[ast.AST] = []
         cond_expr_loop = emit_condition(loop_condition_update)
         body_statements.extend(loop_condition_update)
@@ -602,17 +649,18 @@ class DeviceIR:
             graphs_with_rolled_rdim |= used_graphs
 
     def build_codegen_graphs(self, config: Config) -> list[GraphInfo]:
-        """Build and return graph copies with reduction rolling and grid fission applied.
+        """Build and return graph copies with reduction rolling, grid fission, and epilogue subtiling applied.
 
         Creates a temporary DeviceIR with copied graphs, applies reduction
-        rolling and grid fission based on the config, and returns the
-        resulting graphs.  The original graphs are never modified.
+        rolling, grid fission, and epilogue subtiling based on the config,
+        and returns the resulting graphs. The original graphs are never modified.
         """
 
         temp = copy.copy(self)
         temp.graphs = [g.copy() for g in self.graphs]
         temp._apply_rolling(config)
         temp._apply_grid_fission(config)
+        temp._apply_epilogue_subtiling(config)
         return temp.graphs
 
     def _apply_grid_fission(self, config: Config) -> None:
@@ -689,6 +737,29 @@ class DeviceIR:
                 # Replace only the graph payload to preserve root metadata
                 # (e.g., phase_index used for barrier phase splitting).
                 graph_info.graph = self.graphs[new_graph_id].graph
+
+    def _apply_epilogue_subtiling(self, config: Config) -> None:
+        """Apply epilogue subtiling on the graph copies if enabled."""
+        split_factor = config.epilogue_subtile
+        if not split_factor:
+            return
+
+        from .epilogue_subtiling import apply_epilogue_subtiling
+
+        env = CompileEnvironment.current()
+        configured_block_sizes = {
+            info.block_id: info.from_config_assert(config)
+            for info in env.block_sizes
+            if not info.reduction
+        }
+
+        for graph_info in self.graphs:
+            if isinstance(graph_info, RootGraphInfo):
+                apply_epilogue_subtiling(
+                    graph_info.graph,
+                    split_factor,
+                    configured_block_sizes,
+                )
 
     def __enter__(self) -> None:
         try:
@@ -792,6 +863,7 @@ class WalkDeviceAST(NodeVisitor):
         build_fn: Callable[[WalkDeviceAST], tuple[object, LiftTensorArgs]],
         *,
         graph_info_cls: type[NodeArgsGraphInfo],
+        copy_tensor_args: bool = True,
         **graph_kwargs: object,
     ) -> tuple[int, LiftTensorArgs]:
         outputs_holder: LiftTensorArgs | None = None
@@ -800,7 +872,9 @@ class WalkDeviceAST(NodeVisitor):
             nonlocal outputs_holder
             subgraph_walker = WalkDeviceAST(self.device_ir)
             subgraph_walker.scope.update(self._static_scope())
-            subgraph_walker.scope.update(inputs.replace_tensor_args(args))
+            subgraph_walker.scope.update(
+                inputs.replace_tensor_args(args, copy_tensors=copy_tensor_args)
+            )
             result, outputs_holder = build_fn(subgraph_walker)
             return result
 
@@ -886,7 +960,9 @@ class WalkDeviceAST(NodeVisitor):
                 return origin.is_device()
         return True
 
-    def _extract_tile_begin_end(self, for_node: ast.For) -> tuple[object, object]:
+    def _extract_tile_range(
+        self, for_node: ast.For, *, supports_step: bool
+    ) -> tuple[object, object, object | None]:
         call_node = for_node.iter
         assert isinstance(call_node, ast.Call)
         func_node = call_node.func
@@ -899,10 +975,36 @@ class WalkDeviceAST(NodeVisitor):
         if len(args) == 1:
             begin = None
             end = self.visit(args[0])
+            step = (
+                next(
+                    (
+                        self.visit(keyword.value)
+                        for keyword in call_node.keywords
+                        if keyword.arg == "step"
+                    ),
+                    None,
+                )
+                if supports_step
+                else None
+            )
         else:
             begin = self.visit(args[0])
             end = self.visit(args[1])
-        return begin, end
+            step = (
+                self.visit(args[2])
+                if supports_step and len(args) >= 3
+                else next(
+                    (
+                        self.visit(keyword.value)
+                        for keyword in call_node.keywords
+                        if keyword.arg == "step"
+                    ),
+                    None,
+                )
+                if supports_step
+                else None
+            )
+        return begin, end, step
 
     def _handle_sequence_unrolling(
         self,
@@ -982,11 +1084,22 @@ class WalkDeviceAST(NodeVisitor):
         elif node._loop_type == LoopType.DEVICE:
             rw: ReadWrites = ReadWrites.from_ast(node)
             inputs = self._lift_inputs(self._rw_names(rw))
-            begin, end = self._extract_tile_begin_end(node)
+            supports_step = False
+            if isinstance(inner_type, SequenceType):
+                supports_step = all(
+                    isinstance(value, GridIndexType) for value in inner_type.unpack()
+                )
+            else:
+                supports_step = isinstance(inner_type, GridIndexType)
+            begin, end, step = self._extract_tile_range(
+                node, supports_step=supports_step
+            )
             if isinstance(inner_type, SequenceType):
                 iter_vars = inner_type.unpack()
                 if begin is None:
                     begin = [0] * len(iter_vars)
+                if step is None:
+                    step = [None] * len(iter_vars)
             else:
                 if isinstance(inner_type, JaggedTileIndexType):
                     # hl.jagged_tile takes a 1D parent tensor, not a scalar bound.
@@ -1002,6 +1115,7 @@ class WalkDeviceAST(NodeVisitor):
                 iter_vars = [inner_type]
                 begin = [0] if begin is None else [begin]
                 end = [end]
+                step = [step]
             assert all(isinstance(x, (TileIndexType, GridIndexType)) for x in iter_vars)
 
             def build_subgraph(
@@ -1023,18 +1137,30 @@ class WalkDeviceAST(NodeVisitor):
                 graph_info_cls=ForLoopGraphInfo,
                 block_ids=block_ids,
             )
-            args = (
-                graph_idx,
-                begin,
-                end,
-                inputs.get_tensor_args(),
-            )
+            step_list = step if isinstance(step, list) else None
+            if step_list is None or all(s is None for s in step_list):
+                args = (
+                    graph_idx,
+                    begin,
+                    end,
+                    inputs.get_tensor_args(),
+                )
+                loop_target = _tracing_ops._for_loop
+            else:
+                args = (
+                    graph_idx,
+                    begin,
+                    end,
+                    inputs.get_tensor_args(),
+                    step_list,
+                )
+                loop_target = _tracing_ops._for_loop_step
             mode = proxy_tensor.get_proxy_mode()
             assert isinstance(mode, proxy_tensor.ProxyTorchDispatchMode)
             tracer = mode.tracer
             proxy_out = tracer.create_proxy(
                 "call_function",
-                _tracing_ops._for_loop,
+                loop_target,
                 # pyrefly: ignore [bad-argument-type]
                 *args_to_proxies(tracer, args),
             )
@@ -1081,6 +1207,7 @@ class WalkDeviceAST(NodeVisitor):
             inputs,
             build_condition,
             graph_info_cls=WhileConditionGraphInfo,
+            copy_tensor_args=False,
         )
 
         def build_body(
@@ -1095,6 +1222,7 @@ class WalkDeviceAST(NodeVisitor):
             build_body,
             graph_info_cls=WhileLoopGraphInfo,
             cond_graph_id=cond_graph_id,
+            copy_tensor_args=False,
         )
 
         args = (
@@ -1139,58 +1267,78 @@ class WalkDeviceAST(NodeVisitor):
             if body:
                 self._body(body)
             return
-        if_graph_id = self._create_if_subgraph(test_proxy, node.body)
-        if node.orelse:
-            self._create_if_subgraph(
-                _tracing_ops._not(test_proxy),
-                node.orelse,
-                orig_predicate=test_proxy,
-                if_branch_graph_id=if_graph_id,
-            )
+        self._create_if_subgraph(test_proxy, node.body, node.orelse)
 
     def _create_if_subgraph(
         self,
         test_proxy: object,
         body: list[ast.stmt],
-        orig_predicate: object | None = None,
-        if_branch_graph_id: int | None = None,
+        orelse: list[ast.stmt],
     ) -> int:
-        # Track whether the predicate is tensor-derived (vs truly scalar).
-        # Must check orig_predicate when provided because _not() converts
-        # tensors to SymBool before this method sees the else-branch predicate.
-        predicate_is_tensor = isinstance(
-            orig_predicate if orig_predicate is not None else test_proxy,
-            torch.Tensor,
+        # Track whether the predicate is a tensor with numel > 1
+        predicate_is_tensor = (
+            isinstance(test_proxy, torch.Tensor) and math.prod(test_proxy.shape) > 1
         )
-        rw: ReadWrites = ReadWrites.from_list(body)
-        inputs = self._lift_inputs(self._rw_names(rw))
+
+        if_branch_rw: ReadWrites = ReadWrites.from_list(body)
+        else_branch_rw: ReadWrites = ReadWrites.from_list(orelse)
+
+        if_branch_inputs = self._lift_inputs(self._rw_names(if_branch_rw))
+        else_branch_inputs = self._lift_inputs(self._rw_names(else_branch_rw))
 
         def build_body(
             subgraph_walker: WalkDeviceAST,
+            stmts: list[ast.stmt],
+            rw: ReadWrites,
         ) -> tuple[list[object], LiftTensorArgs]:
-            subgraph_walker._body(body)
+            subgraph_walker._body(stmts)
             outputs_local = self._collect_outputs(
                 subgraph_walker.scope, rw.writes, include_new=True
             )
             return outputs_local.get_tensor_args(), outputs_local
 
-        if_branch: IfGraphInfo | None = None
-        if if_branch_graph_id is not None:
-            graph_info = self.device_ir.graphs[if_branch_graph_id]
-            assert isinstance(graph_info, IfGraphInfo)
-            if_branch = graph_info
+        else_graph_idx, else_outputs = self._trace_graph(
+            else_branch_inputs,
+            functools.partial(build_body, stmts=orelse, rw=else_branch_rw),
+            graph_info_cls=ElseGraphInfo,
+        )
 
-        graph_idx, outputs = self._trace_graph(
-            inputs,
-            build_body,
+        if_graph_idx, if_outputs = self._trace_graph(
+            if_branch_inputs,
+            functools.partial(build_body, stmts=body, rw=if_branch_rw),
             graph_info_cls=IfGraphInfo,
             predicate_is_tensor=predicate_is_tensor,
-            if_branch=if_branch,
+            else_branch=else_graph_idx,
         )
+        if_graph = cast("IfGraphInfo", self.device_ir.graphs[if_graph_idx])
+
+        def get_arg_values_and_names(
+            inputs: LiftTensorArgs,
+        ) -> tuple[list[object], list[str]]:
+            input_tensor_arg_values = inputs.get_tensor_args()
+
+            def is_tensor_arg_value(v: object) -> bool:
+                return any(v is t for t in input_tensor_arg_values)
+
+            input_tensor_node_names = [
+                k for k, v in inputs.values.items() if is_tensor_arg_value(v)
+            ]
+
+            return input_tensor_arg_values, input_tensor_node_names
+
+        if_arg_values, if_graph.if_arg_names = get_arg_values_and_names(
+            if_branch_inputs
+        )
+        else_arg_values, if_graph.else_arg_names = get_arg_values_and_names(
+            else_branch_inputs
+        )
+
         args = (
             test_proxy,
-            graph_idx,
-            inputs.get_tensor_args(),
+            if_graph_idx,
+            else_graph_idx,
+            if_arg_values,
+            else_arg_values,
         )
         mode = proxy_tensor.get_proxy_mode()
         assert isinstance(mode, proxy_tensor.ProxyTorchDispatchMode)
@@ -1202,22 +1350,49 @@ class WalkDeviceAST(NodeVisitor):
             *args_to_proxies(tracer, args),
         )
         proxy_tensor.track_tensor_tree(
-            outputs.get_tensor_args(),
+            if_outputs.get_tensor_args() + else_outputs.get_tensor_args(),
             proxy_out,
             constant=None,
             tracer=tracer,
         )
-        for name, value in outputs.unflatten().items():
-            if name in self.scope:
-                try:
-                    self.scope[name] = _tracing_ops._phi(self.scope[name], value)
-                except Exception as e:
-                    raise exc.CantCombineTypesInControlFlow(
-                        name, self.scope[name], value
-                    ) from e
-            else:
-                self.scope[name] = value
-        return graph_idx
+
+        if_output_values = if_outputs.values
+        else_output_values = else_outputs.values
+        common_output_names = [n for n in if_output_values if n in else_output_values]
+
+        # branches_outputs:  [(if_out_0, else_out_0), (if_out_1, else_out_1), ...]
+        # where each output is either an index if the graph's output values,
+        # or a name of a nonlocal variable which the opposite branch writes to
+        if_graph.branches_outputs = []
+
+        def get_output_idx(name: str, output_values: dict[str, object]) -> int:
+            return next(i for i, n in enumerate(output_values) if n == name)
+
+        for name in common_output_names:
+            if_value = if_output_values[name]
+            else_value = else_output_values[name]
+            self.scope[name] = _tracing_ops._phi(if_value, else_value)
+            if_output_index = get_output_idx(name, if_output_values)
+            else_output_index = get_output_idx(name, else_output_values)
+            if_graph.branches_outputs.append((if_output_index, else_output_index))
+
+        for name in if_output_values:
+            if name not in common_output_names and name in self.scope:
+                self.scope[name] = _tracing_ops._phi(
+                    self.scope[name], if_output_values[name]
+                )
+                if_output_index = get_output_idx(name, if_output_values)
+                if_graph.branches_outputs.append((if_output_index, name))
+
+        for name in else_output_values:
+            if name not in common_output_names and name in self.scope:
+                self.scope[name] = _tracing_ops._phi(
+                    self.scope[name], else_output_values[name]
+                )
+                else_output_index = get_output_idx(name, else_output_values)
+                if_graph.branches_outputs.append((else_output_index, name))
+
+        return if_graph_idx
 
     def visit_Name(self, node: ast.Name) -> object:
         if node.id in self.scope:
@@ -1520,11 +1695,13 @@ class WalkDeviceAST(NodeVisitor):
 
 
 class LiftTensorArgs:
+    values: dict[str, object]
     flat_values: list[object]
     spec: pytree.TreeSpec
     tensor_indices: list[int]
 
     def __init__(self, values: dict[str, object]) -> None:
+        self.values = values
         self.flat_values, self.spec = pytree.tree_flatten(values)
         self.tensor_indices = [
             i
@@ -1535,11 +1712,13 @@ class LiftTensorArgs:
     def unflatten(self) -> dict[str, object]:
         return pytree.tree_unflatten(self.flat_values, self.spec)
 
-    def replace_tensor_args(self, args: Sequence[object]) -> dict[str, object]:
+    def replace_tensor_args(
+        self, args: Sequence[object], *, copy_tensors: bool = True
+    ) -> dict[str, object]:
         flat_values = [*self.flat_values]
         assert len(self.tensor_indices) == len(args)
         for i, v in zip(self.tensor_indices, args, strict=False):
-            flat_values[i] = _new_var(v)
+            flat_values[i] = _new_var(v) if copy_tensors else v
         return pytree.tree_unflatten(flat_values, self.spec)
 
     def get_tensor_args(self) -> list[object]:
@@ -1621,20 +1800,27 @@ class WalkHostAST(NodeVisitor):
             self.current_phase_roots = []
 
 
-def _count_device_loads_and_stores(device_ir: DeviceIR) -> tuple[int, int, int]:
+def _count_device_loads_and_stores(
+    device_ir: DeviceIR,
+) -> tuple[int, int, list[int]]:
     """Count the number of load and store operations in device code for autotuning.
 
     Returns:
-        tuple[int, int, int]: (total_load_count, loads_without_eviction_policy, store_count)
+        tuple[int, int, list[int]]: (
+            total_load_count,
+            loads_without_eviction_policy,
+            store_indices,
+        )
             - total_load_count: all loads (for indexing tunable)
             - loads_without_eviction_policy: loads that need eviction policy tuning
-            - store_count: all stores (for indexing tunable)
+            - store_indices: positions of store ops in the combined indexing list
     """
     from ..language import memory_ops
 
     total_load_count = 0
     loads_without_eviction_policy = 0
-    store_count = 0
+    memory_op_index = 0
+    store_indices: list[int] = []
 
     for graph_info in device_ir.graphs:
         for node in graph_info.graph.nodes:
@@ -1642,6 +1828,7 @@ def _count_device_loads_and_stores(device_ir: DeviceIR) -> tuple[int, int, int]:
                 # Check if this is a load operation
                 if node.target is memory_ops.load:
                     total_load_count += 1
+                    memory_op_index += 1
                     # Check if this load needs eviction policy tuning
                     # (user can still specify eviction_policy to override tuning)
                     eviction_policy_arg = node.kwargs.get("eviction_policy")
@@ -1653,29 +1840,49 @@ def _count_device_loads_and_stores(device_ir: DeviceIR) -> tuple[int, int, int]:
                             loads_without_eviction_policy += 1
                 # Check if this is a store operation
                 elif node.target is memory_ops.store:
-                    store_count += 1
+                    store_indices.append(memory_op_index)
+                    memory_op_index += 1
 
-    return total_load_count, loads_without_eviction_policy, store_count
+    return (
+        total_load_count,
+        loads_without_eviction_policy,
+        store_indices,
+    )
+
+
+def _count_device_atomics(device_ir: DeviceIR) -> int:
+    """Count the number of atomic operations in device code for autotuning."""
+    from ..language import atomic_ops
+
+    atomic_count = 0
+    for graph_info in device_ir.graphs:
+        for node in graph_info.graph.nodes:
+            if node.op == "call_function" and node.target in vars(atomic_ops).values():
+                atomic_count += 1
+    return atomic_count
 
 
 def _register_load_store_tunables(
-    total_load_count: int, loads_without_eviction_policy: int, store_count: int
+    total_load_count: int,
+    loads_without_eviction_policy: int,
+    store_indices: list[int],
 ) -> None:
     """Register list-based tunables (indexing, eviction policies) for all device loads and stores.
 
     Args:
         total_load_count: Total number of loads (for indexing tunable)
         loads_without_eviction_policy: Number of loads that need eviction policy tuning
-        store_count: Total number of stores (for indexing tunable)
+        store_indices: Positions of store ops in the combined indexing list
     """
+    store_count = len(store_indices)
+    env = CompileEnvironment.current()
+    env.config_spec.store_indices = store_indices
     if total_load_count == 0 and store_count == 0:
         return
 
     from ..autotuner.config_fragment import EnumFragment
     from ..autotuner.config_fragment import ListOf
     from ..autotuner.config_spec import get_valid_eviction_policies
-
-    env = CompileEnvironment.current()
 
     # Register eviction policies only for loads without explicit eviction_policy
     if loads_without_eviction_policy > 0:
@@ -1692,6 +1899,21 @@ def _register_load_store_tunables(
             EnumFragment(choices=env.config_spec.valid_indexing_types()),
             length=total_count,
         )
+
+
+def _register_atomic_tunables(atomic_count: int) -> None:
+    """Register atomic_indexing tunable for all atomic operations."""
+    if atomic_count == 0:
+        return
+
+    from ..autotuner.config_fragment import EnumFragment
+    from ..autotuner.config_fragment import ListOf
+
+    env = CompileEnvironment.current()
+    env.config_spec.atomic_indexing = ListOf(
+        EnumFragment(choices=env.config_spec.valid_atomic_indexing_types()),
+        length=atomic_count,
+    )
 
 
 def lower_to_device_ir(func: HostFunction) -> DeviceIR:
@@ -1716,6 +1938,10 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
         # Raise a friendly error instead of emitting an empty Triton function body.
         if len(device_ir.root_ids) == 0:
             raise exc.NoDeviceLoopsInKernel
+        from ..language.random_ops import rewrite_implicit_random_ops
+
+        for graph in device_ir.graphs:
+            rewrite_implicit_random_ops(graph.graph)
         for graph in device_ir.graphs:
             prepare_graph_lowerings(graph.graph)
         for graph in device_ir.graphs:
@@ -1723,6 +1949,21 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
             add_tile_with_offset_metadata(graph)
             remove_unnecessary_tile_index(graph.graph)
             remove_unnecessary_masking(graph.graph)
+
+        from .epilogue_subtiling import has_epilogue_subtiling_candidate
+
+        has_epilogue_subtile_candidate = False
+        for graph_info in device_ir.graphs:
+            if not isinstance(graph_info, RootGraphInfo):
+                continue
+            if has_epilogue_subtiling_candidate(graph_info.graph):
+                has_epilogue_subtile_candidate = True
+                break
+        config_spec = CompileEnvironment.current().config_spec
+        config_spec.epilogue_subtile_candidate_enabled = has_epilogue_subtile_candidate
+        config_spec.epilogue_subtile_k_hint = 0
+        config_spec.epilogue_subtile_autotune_choices = None
+
         device_ir.register_rollable_reductions()
         CompileEnvironment.current().config_spec.raise_grid_block_minimums()
         if len(device_ir.root_ids) > 1:
@@ -1730,12 +1971,17 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
             CompileEnvironment.current().config_spec.disallow_pid_type("xyz")
 
         # Count all device loads and stores and register tunables
-        total_load_count, loads_without_eviction_policy, store_count = (
-            _count_device_loads_and_stores(device_ir)
-        )
+        (
+            total_load_count,
+            loads_without_eviction_policy,
+            store_indices,
+        ) = _count_device_loads_and_stores(device_ir)
         _register_load_store_tunables(
-            total_load_count, loads_without_eviction_policy, store_count
+            total_load_count,
+            loads_without_eviction_policy,
+            store_indices,
         )
+        _register_atomic_tunables(_count_device_atomics(device_ir))
 
         return device_ir
 

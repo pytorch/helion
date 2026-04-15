@@ -3,6 +3,7 @@ from __future__ import annotations
 import collections
 import contextlib
 import dataclasses
+import logging
 import sys
 import threading
 import types
@@ -34,17 +35,27 @@ from .. import exc
 from .._compat import shape_env_size_hint
 from .._utils import triton_is_available
 from ..language.constexpr import ConstExpr
-from .backend import Backend
-from .backend import CuteBackend
-from .backend import MetalBackend
-from .backend import PallasBackend
-from .backend import TileIRBackend
-from .backend import TritonBackend
+from .backend_registry import get_backend_class
 from .source_location import SourceLocation
 from .source_location import current_location
 from .variable_origin import BlockSizeOrigin
 from .variable_origin import GridOrigin
 from .variable_origin import Origin
+from .variable_origin import TensorSizeOrigin
+
+log = logging.getLogger(__name__)
+
+
+def _make_numel_check(
+    symbols: list[sympy.Basic], expr: sympy.Basic
+) -> typing.Callable[..., bool]:
+    """Evaluate a sympy constraint with concrete block-size values."""
+
+    def check(*args: int) -> bool:
+        return bool(expr.subs(list(zip(symbols, args, strict=True))))
+
+    return check
+
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -55,6 +66,7 @@ if TYPE_CHECKING:
 
     from .. import Config
     from ..runtime.settings import Settings
+    from .backend import Backend
 
     class _TLS(Protocol):
         env: CompileEnvironment | None
@@ -124,19 +136,13 @@ class CompileEnvironment:
         self.index_dtype: torch.dtype = (
             index_dtype or settings.index_dtype or torch.int32
         )
-        backend_factory: dict[str, type[Backend]] = {
-            "triton": TritonBackend,
-            "pallas": PallasBackend,
-            "cute": CuteBackend,
-            "tileir": TileIRBackend,
-            "metal": MetalBackend,
-        }
-        self._backend = backend_factory[settings.backend]()
-        if settings.backend in ("pallas", "cute", "metal"):
+        self.process_group_name = None
+        self._backend = get_backend_class(settings.backend)()
+        if self._backend.experimental:
             from torch._dynamo.utils import warn_once
 
             warn_once(
-                f"The '{settings.backend}' backend is experimental and may have limited functionality.",
+                f"The '{self._backend.name}' backend is experimental and may have limited functionality.",
             )
         self.shape_env = ShapeEnv(
             specialize_zero_one=True,
@@ -205,14 +211,12 @@ class CompileEnvironment:
         sizes: Sequence[int | torch.SymInt],
         dtype: torch.dtype | None = None,
     ) -> None:
-        from .device_function import contains_only_block_size_symbols
-
         for size in sizes:
             if isinstance(size, torch.SymInt):
-                block_idx = self.get_block_id(size)
+                block_idx = self.resolve_block_id(size)
                 if block_idx is None:
-                    value = self.shape_env.replace(size._sympy_())
-                    if value.free_symbols and not contains_only_block_size_symbols(
+                    value = self.specialize_expr(self.shape_env.replace(size._sympy_()))
+                    if value.free_symbols and not self._is_static_kernel_shape_expr(
                         value
                     ):
                         raise exc.ShapeSpecializingAllocation
@@ -225,6 +229,25 @@ class CompileEnvironment:
                 torch.float16: 16,
             }.get(dtype, 32)
             self.kernel_min_element_bits = min(self.kernel_min_element_bits, bits)
+
+    def _is_static_kernel_shape_expr(self, expr: sympy.Expr) -> bool:
+        from .host_function import HostFunction
+
+        for symbol in expr.free_symbols:
+            if not isinstance(symbol, sympy.Symbol):
+                return False
+            if symbol in self.specialized_vars:
+                continue
+            origin_info = HostFunction.current().expr_to_origin.get(symbol)
+            if origin_info is None:
+                return False
+            origin = origin_info.origin
+            if isinstance(origin, BlockSizeOrigin):
+                continue
+            if origin.is_host() and not isinstance(origin, TensorSizeOrigin):
+                continue
+            return False
+        return True
 
     def finalize_config_spec(self) -> None:
         from .tile_strategy import FlattenedTileStrategy
@@ -240,6 +263,71 @@ class CompileEnvironment:
             kernel_tensor_sizes=self.kernel_tensor_sizes,  # pyrefly: ignore[bad-argument-type]
             min_element_bits=self.kernel_min_element_bits,
         )
+        self._extract_tensor_numel_constraints()
+
+    def _extract_tensor_numel_constraints(self) -> None:
+        """Compile per-tensor numel constraints from kernel_tensor_sizes."""
+        from ..autotuner.config_generation import TRITON_MAX_TENSOR_NUMEL
+        from ..autotuner.config_spec import TensorNumelConstraint
+
+        block_sym_to_id: dict[sympy.Symbol, int] = {}
+        for bs in self.block_sizes:
+            block_sym_to_id[bs.symbol()] = bs.block_id
+
+        seen_exprs: set[str] = set()
+        cs_block_sizes = self.config_spec.block_sizes
+        for shape in self.kernel_tensor_sizes:
+            if not shape:
+                continue
+            numel_expr = sympy.Mul(*shape) if len(shape) > 1 else shape[0]
+            all_free = numel_expr.free_symbols
+            involved_syms = all_free & block_sym_to_id.keys()
+            if not involved_syms:
+                continue
+            # Skip expressions with non-block-size free symbols (e.g.,
+            # runtime tensor dimensions) — they can't be evaluated at
+            # config generation time.
+            if all_free - block_sym_to_id.keys():
+                log.debug(
+                    "skipping numel constraint for shape %s: expression has "
+                    "non-block-size free symbols %s",
+                    shape,
+                    all_free - block_sym_to_id.keys(),
+                )
+                continue
+            try:
+                sym_to_cs_idx = {
+                    # pyrefly: ignore[bad-index]
+                    s: cs_block_sizes.block_id_to_index(block_sym_to_id[s])
+                    for s in involved_syms
+                }
+            except KeyError:
+                log.debug(
+                    "skipping numel constraint for shape %s: block_id removed "
+                    "during dedup",
+                    shape,
+                )
+                continue
+            ordered = sorted(involved_syms, key=lambda s: sym_to_cs_idx[s])
+            indices = tuple(sym_to_cs_idx[s] for s in ordered)
+            # pyrefly: ignore[unsupported-operation]
+            constraint_expr = numel_expr <= TRITON_MAX_TENSOR_NUMEL
+            # srepr is more canonical than str() for dedup; a false
+            # negative only causes a harmless duplicate, not a missed one.
+            dedup_key = sympy.srepr(constraint_expr)
+            if dedup_key in seen_exprs:
+                continue
+            seen_exprs.add(dedup_key)
+            expr_str = str(constraint_expr)
+            # pyrefly: ignore[bad-argument-type]
+            check_fn = _make_numel_check(ordered, constraint_expr)
+            self.config_spec.tensor_numel_constraints.append(
+                TensorNumelConstraint(
+                    check_fn=check_fn,
+                    block_indices=indices,
+                    expr_str=expr_str,
+                )
+            )
 
     def _disable_range_num_stages_for_aliasing(self) -> None:
         """
@@ -291,6 +379,12 @@ class CompileEnvironment:
                 block_size_source=source,
             )
         )
+        if isinstance(source, FixedBlockSizeSource) and isinstance(
+            source.value, torch.SymInt
+        ):
+            source_expr = _symint_expr(source.value)
+            if isinstance(source_expr, sympy.Symbol):
+                self.shape_env._constrain_unify(source.value, info.var)
 
         from .host_function import HostFunction
         from .host_function import SymbolOrigin
@@ -411,8 +505,8 @@ class CompileEnvironment:
     ) -> list[int | torch.SymInt]:
         """Normalize shape dimensions to use canonical block size variables."""
         return [
-            self.block_sizes[bid].var
-            if (bid := self.get_block_id(s)) is not None
+            self.block_sizes[self.canonical_block_id(bid)].var
+            if (bid := self.resolve_block_id(s)) is not None
             else s
             for s in shape
         ]
@@ -476,9 +570,9 @@ class CompileEnvironment:
             return []
         non_trivial = [d for d in indexer_tensor.size() if self.size_hint(d) != 1]
         # Use size-based approach to find block_id
-        bid = self.get_block_id(non_trivial[0]) if non_trivial else None
+        bid = self.resolve_block_id(non_trivial[0]) if non_trivial else None
         if bid is not None:
-            return [self.block_sizes[bid].var]
+            return [self.block_sizes[self.canonical_block_id(bid)].var]
         return non_trivial or [1]  # type: ignore[return-value]
 
     def new_index_result(
@@ -489,8 +583,17 @@ class CompileEnvironment:
         Uses size-based approach to normalize all dimensions that correspond
         to block sizes to their canonical variables.
         """
+        specialized_shape: list[int | torch.SymInt] = []
+        for dim in output_shape:
+            if isinstance(dim, torch.SymInt):
+                expr = self.specialize_expr(dim._sympy_())
+                if not expr.free_symbols:
+                    with contextlib.suppress(TypeError, ValueError):
+                        specialized_shape.append(int(expr))
+                        continue
+            specialized_shape.append(dim)
         # Normalize all dimensions to canonical block size variables
-        shape = self._normalize_shape_to_block_vars(list(output_shape))
+        shape = self._normalize_shape_to_block_vars(specialized_shape)
         return tensor.new_empty(shape)
 
     def to_fake(self, obj: object, origin: Origin) -> object:
@@ -679,8 +782,10 @@ class CompileEnvironment:
 
     def known_equal(self, a: int | torch.SymInt, b: int | torch.SymInt) -> bool:
         if isinstance(a, torch.SymInt) or isinstance(b, torch.SymInt):
-            sa = a._sympy_() if isinstance(a, torch.SymInt) else a
-            sb = b._sympy_() if isinstance(b, torch.SymInt) else b
+            sa = _symint_expr(a) if isinstance(a, torch.SymInt) else sympy.Integer(a)
+            sb = _symint_expr(b) if isinstance(b, torch.SymInt) else sympy.Integer(b)
+            if sa is None or sb is None:
+                return False
             if sa == sb:
                 return True
             res = self.shape_env._maybe_evaluate_static(sympy.Eq(sa, sb))
@@ -764,40 +869,156 @@ class CompileEnvironment:
             The block ID if the size corresponds to a registered block size, None otherwise.
         """
         if isinstance(size, torch.SymInt):
-            return self.get_block_id(size._sympy_())
+            expr = _symint_expr(size)
+            if isinstance(expr, sympy.Symbol):
+                return self.get_block_id(expr)
+            return None
         if isinstance(size, sympy.Symbol):
             from .host_function import HostFunction
 
             origin_info = HostFunction.current().expr_to_origin.get(size)
             if origin_info is not None and isinstance(
                 origin_info.origin,
-                (BlockSizeOrigin, GridOrigin),
+                BlockSizeOrigin,
             ):
+                return origin_info.origin.block_id
+            if origin_info is not None and type(origin_info.origin) is GridOrigin:
                 return origin_info.origin.block_id
         return None
 
     def resolve_block_id(self, size: object) -> int | None:
-        """Best-effort lookup of a block id for ``size``.
-
-        Falls back to matching constant reduction dimensions if ``get_block_id``
-        cannot resolve the identifier directly.
-        """
+        """Resolve the block id carried by ``size``'s symbolic provenance."""
 
         if not isinstance(size, (int, torch.SymInt, sympy.Expr)):
             return None
 
-        block_id = self.get_block_id(size)
-        if block_id is not None:
-            return block_id
+        if isinstance(size, torch.SymInt):
+            if (block_id := self.get_block_id(size)) is not None:
+                return block_id
+            expr = _symint_expr(size)
+            if isinstance(expr, sympy.Symbol):
+                from .host_function import HostFunction
 
-        expr = _to_sympy(size)
-        if expr is None or getattr(expr, "free_symbols", None):
+                origin_info = HostFunction.current().expr_to_origin.get(expr)
+                if origin_info is not None and isinstance(
+                    origin_info.origin, GridOrigin
+                ):
+                    return origin_info.origin.block_id
+            if isinstance(expr, sympy.Expr):
+                expr = self.specialize_expr(expr)
+                if expr is None or getattr(expr, "free_symbols", None):
+                    block_id = self.get_block_id(expr)
+                    if block_id is not None:
+                        return block_id
+                    if isinstance(expr, sympy.Symbol):
+                        from .host_function import HostFunction
+
+                        origin_info = HostFunction.current().expr_to_origin.get(expr)
+                        if origin_info is not None and isinstance(
+                            origin_info.origin, GridOrigin
+                        ):
+                            return origin_info.origin.block_id
+                if (
+                    expr is not None
+                    and not getattr(expr, "free_symbols", None)
+                    and hasattr(self, "block_sizes")
+                ):
+                    for info in reversed(self.block_sizes):
+                        if info.reduction and info.size_matches(expr):
+                            return info.block_id
             return None
 
-        for info in reversed(self.block_sizes):
-            if info.reduction and info.size_matches(expr):
-                return info.block_id
+        expr = _to_sympy(size)
+        if isinstance(expr, sympy.Expr):
+            expr = self.specialize_expr(expr)
+        if expr is None or getattr(expr, "free_symbols", None):
+            block_id = self.get_block_id(size)
+            if block_id is not None:
+                return block_id
+            if isinstance(expr, sympy.Symbol):
+                from .host_function import HostFunction
+
+                origin_info = HostFunction.current().expr_to_origin.get(expr)
+                if origin_info is not None and isinstance(
+                    origin_info.origin, GridOrigin
+                ):
+                    return origin_info.origin.block_id
+            return None
+        if (block_id := self.get_block_id(size)) is not None:
+            return block_id
+        if hasattr(self, "block_sizes"):
+            for info in reversed(self.block_sizes):
+                if info.reduction and info.size_matches(expr):
+                    return info.block_id
         return None
+
+    def canonical_block_id(self, block_id: int) -> int:
+        """Follow fixed block-size aliases back to their canonical symbolic owner."""
+
+        seen: set[int] = set()
+        current = block_id
+        while current not in seen:
+            seen.add(current)
+            source = self.block_sizes[current].block_size_source
+            if not isinstance(source, FixedBlockSizeSource):
+                break
+            value = source.value
+            if not isinstance(value, torch.SymInt):
+                break
+            next_block_id = self.get_block_id(value)
+            if next_block_id is None or next_block_id == current:
+                break
+            current = next_block_id
+        return current
+
+    def resolve_codegen_block_id(
+        self,
+        block_id: int,
+        codegen: object,
+        graph: object | None = None,
+    ) -> int:
+        """Map an aliased block-size symbol back to the live loop block for codegen."""
+
+        active_device_loops = getattr(codegen, "active_device_loops", {})
+        if active_device_loops.get(block_id):
+            return block_id
+
+        canonical = self.canonical_block_id(block_id)
+
+        def active_candidates(block_ids: list[int]) -> list[int]:
+            return [
+                candidate
+                for candidate in block_ids
+                if active_device_loops.get(candidate)
+                and self.canonical_block_id(candidate) == canonical
+            ]
+
+        def pick_candidate(candidates: list[int]) -> int | None:
+            if not candidates:
+                return None
+            if len(candidates) == 1:
+                return candidates[0]
+            return None
+
+        if graph is not None:
+            graph_block_ids = [
+                graph_info.block_ids
+                for graph_info in getattr(codegen, "codegen_graphs", [])
+                if hasattr(graph_info, "block_ids") and graph_info.graph is graph
+            ]
+            if len(graph_block_ids) == 1:
+                if (
+                    candidate := pick_candidate(active_candidates(graph_block_ids[0]))
+                ) is not None:
+                    return candidate
+
+        if (
+            candidate := pick_candidate(
+                active_candidates(list(active_device_loops.keys()))
+            )
+        ) is not None:
+            return candidate
+        return block_id
 
     def register_jagged_tile(self, block_id: int, parent_id: int) -> None:
         self.jagged_tile_parent_id[block_id] = parent_id
@@ -851,9 +1072,26 @@ class BlockSizeInfo:
         return CompileEnvironment.current().size_hint(size)
 
     def size_matches(self, numel: sympy.Expr | None) -> bool:
+        """Check if a concrete numel value matches this block's concrete size.
+
+        Both sides must be concrete (no free symbols) for this to return True.
+        Used by resolve_block_id to match constant reduction dimensions.
+        """
         if numel is None or not isinstance(self.size, (int, torch.SymInt)):
             return False
         return numel == self.numel
+
+    def dim_matches(self, dim_symbol: sympy.Expr | None) -> bool:
+        """Check if a symbolic tensor dimension corresponds to this block.
+
+        Compares against the sympy Symbol underlying self.var, which is the
+        same object as the symbol in kernel_tensor_sizes shape tuples (both
+        originate from the same fake tensor .size() call during tracing).
+        Used by adjust_block_size_constraints to map blocks to tensor dims.
+        """
+        if dim_symbol is None or not isinstance(self.size, (int, torch.SymInt)):
+            return False
+        return dim_symbol == _to_sympy(self.var)
 
     def mark_alternate_size(self, size: torch.SymInt | int | None) -> None:
         """If a block size is used with a different size, we need to clear the hint to enable masking."""
@@ -874,10 +1112,20 @@ class BlockSizeInfo:
             self.size = None
 
     def symbol(self) -> sympy.Symbol:
+        expr = _symint_expr(self.var)
+        if isinstance(expr, sympy.Symbol):
+            return expr
         return self.var._sympy_()
 
     def from_config(self, config: Config) -> int | torch.SymInt | None:
-        return self.block_size_source.from_config(config, self)
+        value = self.block_size_source.from_config(config, self)
+        if isinstance(value, torch.SymInt):
+            env = CompileEnvironment.current()
+            if (block_id := env.get_block_id(value)) is not None:
+                canonical_block_id = env.canonical_block_id(block_id)
+                if canonical_block_id != self.block_id:
+                    return env.block_sizes[canonical_block_id].from_config(config)
+        return value
 
     def from_config_assert(self, config: Config) -> int | torch.SymInt:
         val = self.from_config(config)
@@ -968,6 +1216,15 @@ def _to_sympy(x: int | torch.SymInt | sympy.Expr) -> sympy.Expr:
         return x
     # type: ignore [missing-attribute]
     return sympy.sympify(x)
+
+
+def _symint_expr(x: torch.SymInt) -> sympy.Expr | None:
+    expr = getattr(getattr(x, "node", None), "_expr", None)
+    if isinstance(expr, sympy.Expr):
+        return expr
+    with contextlib.suppress(Exception):
+        return x._sympy_()
+    return None
 
 
 def _has_unbacked(expr: sympy.Expr) -> bool:

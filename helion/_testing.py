@@ -30,10 +30,12 @@ from ._compat import requires_torch_version
 from ._compat import supports_amd_cdna_tunables
 from ._compat import supports_tensor_descriptor
 from ._dist_utils import is_master_rank
+from ._dist_utils import sync_object as sync_object
 from ._utils import counters
-from .autotuner.benchmarking import sync_object as sync_object
+from .autotuner.benchmarking import synchronize_device
 from .runtime.settings import _get_backend
-from helion.autotuner.base_search import _clone_args
+from .runtime.settings import is_pallas_interpret
+from helion.autotuner.benchmark_provider import _clone_args
 
 if _get_backend() == "pallas":
     from .autotuner.benchmarking import compute_repeat_generic as compute_repeat
@@ -51,6 +53,7 @@ from .runtime.settings import RefMode
 if TYPE_CHECKING:
     import types
 
+    from .runtime.kernel import BoundKernel
     from .runtime.kernel import Kernel
 
 
@@ -227,7 +230,9 @@ def _init_tpu_device() -> bool:
 
 
 # Determine DEVICE without calling functions that initialize CUDA.
-if _get_backend() == "pallas":
+if _get_backend() == "pallas" and is_pallas_interpret():
+    DEVICE = torch.device("cpu")
+elif _get_backend() == "pallas":
     _init_tpu_device()
     DEVICE = torch.device("tpu")
 elif torch.xpu.is_available():
@@ -391,9 +396,16 @@ def skipIfXPU(reason: str) -> Callable[[Callable], Callable]:
 
 
 def skipUnlessPallas(reason: str) -> Callable[[Callable], Callable]:
-    """Skip test unless JAX Pallas TPU backend is available."""
+    """Skip test unless JAX Pallas TPU backend or interpret mode is available."""
 
     def _has_tpu_pallas() -> bool:
+        if is_pallas_interpret():
+            try:
+                from jax.experimental import pallas
+
+                return True
+            except Exception:
+                return False
         try:
             from jax.experimental import pallas  # noqa: F401
             import torch_tpu.api  # type: ignore[import-not-found]
@@ -884,6 +896,62 @@ def import_path(filename: Path) -> types.ModuleType:
     return sys.modules[module_name]
 
 
+def _bound_test_config(bound: BoundKernel, **kwargs: object) -> Config:
+    if kwargs:
+        config = Config(
+            # pyrefly: ignore [bad-argument-type]
+            **kwargs
+        )
+    elif bound.kernel.configs:
+        (config,) = bound.kernel.configs
+    else:
+        config = bound.config_spec.default_config()
+    # Strip config keys not supported by the current backend so that
+    # tests with Triton-specific keys (num_warps, num_stages, indexing, etc.)
+    # can run on other backends like Pallas/TPU.
+    config_spec = bound.config_spec
+    for key in config_spec.unsupported_config_keys(config.config):
+        config.config.pop(key, None)
+    return config
+
+
+def _run_bound_kernel(
+    bound: BoundKernel,
+    args: tuple[object, ...],
+    config: Config,
+    *,
+    emit_code: bool,
+) -> tuple[str | None, object]:
+    has_device_tensor = any(
+        isinstance(value, torch.Tensor) and value.device.type != "cpu" for value in args
+    )
+    code = bound.to_triton_code(config) if emit_code else None
+    compiled_kernel = bound.compile_config(config)
+    try:
+        result = compiled_kernel(*args)
+        if has_device_tensor or (
+            isinstance(result, torch.Tensor) and result.device.type != "cpu"
+        ):
+            synchronize_device(result)
+    except Exception as exc:
+        if code is None:
+            try:
+                code = bound.to_triton_code(config)
+            except Exception:
+                code = None
+        if code is not None:
+            sys.stderr.write(f"Failed to run kernel:\n{code}\n")
+        else:
+            sys.stderr.write("Failed to run kernel.\n")
+        if has_device_tensor:
+            try:
+                synchronize_device(None)
+            except Exception as sync_error:
+                raise exc from sync_error
+        raise
+    return code, result
+
+
 def code_and_output(
     fn: Kernel,
     args: tuple[object, ...],
@@ -900,29 +968,37 @@ def code_and_output(
         code = inspect.getsource(fn.fn)
         return code, result
 
-    if kwargs:
-        config = Config(
-            # pyrefly: ignore [bad-argument-type]
-            **kwargs
-        )
-    elif fn.configs:
-        (config,) = fn.configs
-    else:
-        config = fn.bind(args).config_spec.default_config()
-    # Strip config keys not supported by the current backend so that
-    # tests with Triton-specific keys (num_warps, num_stages, indexing, etc.)
-    # can run on other backends like Pallas/TPU.
-    config_spec = fn.bind(args).config_spec
-    for key in config_spec.unsupported_config_keys(config.config):
-        config.config.pop(key, None)
-    code = fn.bind(args).to_triton_code(config)
-    compiled_kernel = fn.bind(args).compile_config(config)
-    try:
-        result = compiled_kernel(*args)
-    except Exception:
-        sys.stderr.write(f"Failed to run kernel:\n{code}\n")
-        raise
+    config = _bound_test_config(bound, **kwargs)
+    code, result = _run_bound_kernel(bound, args, config, emit_code=True)
+    assert code is not None
     return code, result
+
+
+def output_only(
+    fn: Kernel,
+    args: tuple[object, ...],
+    **kwargs: object,
+) -> object:
+    """Run a kernel for correctness checks without eagerly materializing code text."""
+    bound = fn.bind(args)
+    if is_ref_mode_enabled(bound.kernel.settings):
+        if kwargs:
+            # pyrefly: ignore [bad-argument-type]
+            config = Config(**kwargs)
+            bound._config = config
+        return fn(*args)
+
+    config = _bound_test_config(bound, **kwargs)
+    _code, result = _run_bound_kernel(bound, args, config, emit_code=False)
+    return result
+
+
+def _as_tensors(result: object) -> list[torch.Tensor]:
+    """Normalize a single tensor or tuple of tensors to a flat list."""
+    if isinstance(result, tuple):
+        return [t.clone() for t in result]
+    assert isinstance(result, torch.Tensor)
+    return [result.clone()]
 
 
 def run_example(
@@ -933,8 +1009,10 @@ def run_example(
     baseline_name: str = "torch",
     rtol: float = 1e-2,
     atol: float = 1e-1,
+    max_mismatch_pct: float | None = None,
     bwd: bool = False,
     trace_path: str | None = None,
+    process_group_name: str | None = None,
 ) -> None:
     """Run complete example: correctness check + benchmark.
 
@@ -946,9 +1024,15 @@ def run_example(
         baseline_name: Name for single baseline in output (default: "torch")
         rtol: Relative tolerance for correctness check (default: 1e-2)
         atol: Absolute tolerance for correctness check (default: 1e-1)
+        max_mismatch_pct: If set, use assert_close_with_mismatch_tolerance with this mismatch
+            fraction tolerance instead of strict assert_close (default: None)
         bwd: Whether to also test backward pass (default: False)
         trace_path: if not None, do profiling and save trace to this path
     """
+
+    if dist.is_initialized() and process_group_name is None:
+        assert dist.group.WORLD is not None
+        process_group_name = dist.group.WORLD.group_name
     try:
         torch.backends.cuda.matmul.fp32_precision = "tf32"
         torch.backends.cudnn.conv.fp32_precision = "tf32"  # type: ignore[reportAttributeAccessIssue]
@@ -963,20 +1047,31 @@ def run_example(
 
     # Check correctness against first baseline
     first_baseline_name, first_baseline_func = next(iter(baselines.items()))
-    expected = first_baseline_func(*args).clone()
+    expected = _as_tensors(first_baseline_func(*args))
 
     for name, func in {**kernels, **baselines}.items():
         if name != first_baseline_name:
             print(f"Testing {name} correctness...", file=sys.stderr)
             # Clone args to avoid buffer donation issues (e.g., Pallas/TPU)
-            cloned_args = _clone_args(args)
-            result = func(*cloned_args).clone()
-            torch.testing.assert_close(
-                result.to(torch.float32),
-                expected.to(torch.float32),
-                rtol=rtol,
-                atol=atol,
-            )
+            cloned_args = _clone_args(args, process_group_name=process_group_name)
+            result = _as_tensors(func(*cloned_args))
+            assert len(result) == len(expected)
+            for r, e in zip(result, expected, strict=True):
+                if max_mismatch_pct is not None:
+                    assert_close_with_mismatch_tolerance(
+                        r.to(torch.float32),
+                        e.to(torch.float32),
+                        atol=atol,
+                        rtol=rtol,
+                        max_mismatch_pct=max_mismatch_pct,
+                    )
+                else:
+                    torch.testing.assert_close(
+                        r.to(torch.float32),
+                        e.to(torch.float32),
+                        rtol=rtol,
+                        atol=atol,
+                    )
 
     # Test backward pass
     if bwd:
@@ -1054,7 +1149,7 @@ def run_example(
                     t.grad = None
 
     # Benchmark all functions — clone args to avoid buffer donation issues
-    cloned_args = _clone_args(args)
+    cloned_args = _clone_args(args, process_group_name=process_group_name)
     all_benchmarks = {**kernels, **baselines}
     bench_fns = [functools.partial(fn, *cloned_args) for fn in all_benchmarks.values()]
     repeat = compute_repeat(bench_fns[0])
@@ -1064,7 +1159,7 @@ def run_example(
     # Running different number of times on different ranks may cause
     # stuck processes.
     if dist.is_initialized():
-        repeat = sync_object(repeat)
+        repeat = sync_object(repeat, process_group_name=process_group_name)
 
     # pyrefly: ignore [bad-argument-type]
     profile_context = contextlib.nullcontext()
@@ -1103,6 +1198,50 @@ def run_example(
         print(f"{'=' * 65}\n", file=sys.stderr)
 
 
+def _assert_example_result_close(
+    result: object,
+    expected: object,
+    *,
+    skip_accuracy: bool,
+    atol: float,
+    rtol: float,
+) -> None:
+    if skip_accuracy:
+        return
+
+    # Use tree_map to apply assert_close to all tensor pairs
+    def assert_close_fn(got: object, exp: object) -> None:
+        # Skip if expected is None (i.e. we don't care what the actual value is)
+        if exp is None:
+            return
+        # Both None is OK
+        if got is None and exp is None:
+            return
+        assert isinstance(got, torch.Tensor) and isinstance(exp, torch.Tensor), (
+            f"Type mismatch: got {type(got)}, expected {type(exp)}"
+        )
+        torch.testing.assert_close(
+            got.to(torch.float32),
+            exp.to(torch.float32),
+            atol=atol,
+            rtol=rtol,
+        )
+
+    tree_map(assert_close_fn, result, expected)
+
+
+def _example_kernel(
+    name: str,
+    fn_name: str | None = None,
+    static_shapes: bool | None = None,
+) -> Kernel:
+    kernel_fn = getattr(import_path(EXAMPLES_DIR / f"{name}.py"), fn_name or name)
+    if static_shapes is not None:
+        assert static_shapes in (True, False)
+        kernel_fn.settings.static_shapes = static_shapes
+    return kernel_fn
+
+
 def check_example(
     name: str,
     args: tuple[torch.Tensor, ...],
@@ -1112,40 +1251,28 @@ def check_example(
     static_shapes: bool | None = None,
     atol: float = 1e-1,
     rtol: float = 1e-2,
+    emit_code: bool = True,
     **kwargs: object,
 ) -> str:
     """Helper used in unit tests to run a single example kernel and check its output."""
-    kernel_fn = getattr(import_path(EXAMPLES_DIR / f"{name}.py"), fn_name or name)
-    if static_shapes is not None:
-        assert static_shapes in (True, False)
-        kernel_fn.settings.static_shapes = static_shapes
+    kernel_fn = _example_kernel(name, fn_name=fn_name, static_shapes=static_shapes)
 
-    code, result = code_and_output(
-        kernel_fn,
-        args,
-        **kwargs,
+    if emit_code:
+        code, result = code_and_output(
+            kernel_fn,
+            args,
+            **kwargs,
+        )
+    else:
+        code = ""
+        result = output_only(
+            kernel_fn,
+            args,
+            **kwargs,
+        )
+    _assert_example_result_close(
+        result, expected, skip_accuracy=skip_accuracy, atol=atol, rtol=rtol
     )
-
-    if not skip_accuracy:
-        # Use tree_map to apply assert_close to all tensor pairs
-        def assert_close_fn(got: object, exp: object) -> None:
-            # Skip if expected is None (i.e. we don't care what the actual value is)
-            if exp is None:
-                return
-            # Both None is OK
-            if got is None and exp is None:
-                return
-            assert isinstance(got, torch.Tensor) and isinstance(exp, torch.Tensor), (
-                f"Type mismatch: got {type(got)}, expected {type(exp)}"
-            )
-            torch.testing.assert_close(
-                got.to(torch.float32),
-                exp.to(torch.float32),
-                atol=atol,
-                rtol=rtol,
-            )
-
-        tree_map(assert_close_fn, result, expected)
     return code
 
 
@@ -1441,8 +1568,10 @@ class TestCase(unittest.TestCase):
         counters.clear()
 
     def tearDown(self) -> None:
-        super().tearDown()
-        self._test_stack.close()
+        try:
+            super().tearDown()
+        finally:
+            self._test_stack.close()
 
     def assertExpectedJournal(self, value: str) -> None:
         """

@@ -12,6 +12,7 @@ from .._compat import warps_to_threads
 from .config_fragment import Category
 from .config_fragment import ConfigSpecFragment
 from .config_fragment import PowerOfTwoFragment
+from .config_spec import shrink_block_sizes_for_numel_constraints
 from helion._dist_utils import sync_seed
 
 if TYPE_CHECKING:
@@ -33,6 +34,7 @@ class ConfigGeneration:
         *,
         overrides: Mapping[str, object] | None = None,
         advanced_controls_files: list[str] | None = None,
+        process_group_name: str | None = None,
     ) -> None:
         def _collect_spec(spec: ConfigSpecFragment) -> object:
             """
@@ -49,6 +51,7 @@ class ConfigGeneration:
 
         super().__init__()
         self.config_spec = config_spec
+        self.process_group_name = process_group_name
         self._advanced_controls_files = advanced_controls_files
         self.flat_spec: list[ConfigSpecFragment] = []
         config_spec.flat_config(
@@ -75,6 +78,18 @@ class ConfigGeneration:
             if config_spec.block_sizes
             else 1
         )
+
+    @functools.cached_property
+    def overridden_flat_indices(self) -> set[int]:
+        """Return flat_spec indices that are frozen by config overrides."""
+        if not self._override_values:
+            return set()
+        result: set[int] = set()
+        for key in self._override_values:
+            if key in self._key_to_flat_indices:
+                indices, _ = self._key_to_flat_indices[key]
+                result.update(indices)
+        return result
 
     @functools.cached_property
     def _key_to_flat_indices(self) -> dict[str, tuple[list[int], bool]]:
@@ -139,7 +154,10 @@ class ConfigGeneration:
             advanced_controls_files=self._advanced_controls_files,
         )
         assert next(count) == len(flat_values)
-        return self._apply_overrides(config)
+        config = self._apply_overrides(config)
+        # Overrides may reintroduce pointer stores that break subtiled outputs
+        self.config_spec.fix_epilogue_subtile_store_indexing(config.config)
+        return config
 
     def block_numel(self, flat_config: FlatConfig) -> int:
         return functools.reduce(
@@ -147,6 +165,20 @@ class ConfigGeneration:
             [cast("int", flat_config[i]) for i in self.block_size_indices],
             1,
         )
+
+    def _shrink_for_numel_constraints(self, flat_config: FlatConfig) -> None:
+        """Shrink block sizes in flat_config to satisfy numel constraints."""
+        constraints = self.config_spec.tensor_numel_constraints
+        if not constraints:
+            return
+        block_sizes = [cast("int", flat_config[i]) for i in self.block_size_indices]
+        min_sizes = [
+            max(self.flat_spec[i].get_minimum(), self.min_block_size)
+            for i in self.block_size_indices
+        ]
+        shrink_block_sizes_for_numel_constraints(constraints, block_sizes, min_sizes)
+        for idx, fi in enumerate(self.block_size_indices):
+            flat_config[fi] = block_sizes[idx]
 
     def shrink_config(
         self, flat_config: FlatConfig, max_elements_per_thread: int
@@ -177,6 +209,7 @@ class ConfigGeneration:
                     changes += 1
             if changes == 0:
                 break
+        self._shrink_for_numel_constraints(flat_config)
 
     def default_flat(self) -> FlatConfig:
         """
@@ -185,7 +218,9 @@ class ConfigGeneration:
         Returns:
             The default flat configuration values.
         """
-        return [spec.default() for spec in self.flat_spec]
+        config = [spec.default() for spec in self.flat_spec]
+        self._shrink_for_numel_constraints(config)
+        return config
 
     def random_flat(self) -> FlatConfig:
         """
@@ -194,7 +229,8 @@ class ConfigGeneration:
         Returns:
             A random flat configuration.
         """
-        with sync_seed():
+
+        with sync_seed(process_group_name=self.process_group_name):
             config = [spec.random() for spec in self.flat_spec]
             self.shrink_config(config, PowerOfTwoFragment(1, 2048, 32).random())
             return config
@@ -219,11 +255,17 @@ class ConfigGeneration:
         """
         The main op in differential evolution, randomly combine `x` with `a + (b - c)`.
         """
-        crossover_mask = [random.random() < crossover_rate for _ in self.flat_spec]
-        crossover_mask[random.randrange(len(crossover_mask))] = True
+        overridden = self.overridden_flat_indices
         result = [*x]
-        for i, crossover in enumerate(crossover_mask):
-            if crossover:
+        mutated = False
+        for i, spec in enumerate(self.flat_spec):
+            if i not in overridden and random.random() < crossover_rate:
+                result[i] = spec.differential_mutation(a[i], b[i], c[i])
+                mutated = True
+        if not mutated:
+            eligible = [i for i in range(len(self.flat_spec)) if i not in overridden]
+            if eligible:
+                i = random.choice(eligible)
                 result[i] = self.flat_spec[i].differential_mutation(a[i], b[i], c[i])
         # TODO(jansel): can this be larger? (too large and Triton compile times blow up)
         self.shrink_config(result, 8192)

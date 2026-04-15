@@ -3,12 +3,17 @@ from __future__ import annotations
 import ast
 from contextlib import nullcontext
 import dataclasses
+import functools
+import hashlib
 from typing import TYPE_CHECKING
 from typing import cast
 
 import sympy
 import torch
+from torch._dynamo.utils import ExactWeakKeyDictionary
+from torch._inductor.codecache import PyCodeCache
 from torch._inductor.ir import Buffer
+from torch._inductor.ir import FinalizeCodegenResult
 from torch._inductor.ir import IRNode
 from torch._inductor.ir import Layout
 from torch._inductor.ir import MultiOutputLayout
@@ -17,6 +22,7 @@ from torch._inductor.ir import TemplateBuffer
 from torch._inductor.ir import TensorBox
 from torch._inductor.lowering import clone
 from torch._inductor.lowering import register_lowering
+from torch._inductor.select_algorithm import AlgorithmSelectorCache
 from torch._inductor.select_algorithm import (
     ExternalTritonTemplateKernel,  # pyrefly: ignore[missing-module-attribute]
 )
@@ -35,7 +41,9 @@ from .._dynamo.variables import _get_flat_output
 from ..ast_extension import unparse
 from ..generate_ast import generate_ast
 from ..indexing_strategy import SubscriptIndexing
+from ..output_header import _active_library_imports
 from ..output_header import get_needed_import_lines
+from helion.runtime.config import Config
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -73,11 +81,63 @@ class _FusionMetadata:
     prologue_vars: dict[str, dict[str, str]]
     prologue_fused_params: set[str]
     prologue_has_source: set[str]
-    prologue_first_indexing: dict[str, str] = dataclasses.field(default_factory=dict)
+
+
+class _FusionAutotuneAdapter:
+    """Adapter for fusion-aware autotuning.
+
+    ``compile_config`` returns the unfused kernel (for accuracy checking),
+    ``bench_compile_config`` returns the fused kernel (for benchmarking).
+    All other attributes are delegated to the wrapped ``BoundKernel`` via
+    ``__getattr__``.
+    """
+
+    def __init__(
+        self,
+        bound_kernel: BoundKernel,
+        bench_kernel_factory: Callable[
+            [Config], tuple[Callable[..., object], str | None]
+        ],
+        fusion_context_hash: str,
+    ) -> None:
+        self._bound_kernel = bound_kernel
+        self._factory = bench_kernel_factory
+        self._fusion_context_hash = fusion_context_hash
+        self._bench_cached_paths: dict[Config, str] = {}
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._bound_kernel, name)
+
+    def bench_compile_config(
+        self,
+        config: Config | dict[str, object] | None = None,
+        *,
+        allow_print: bool = True,
+    ) -> Callable[..., object]:
+        if not isinstance(config, Config):
+            config = (
+                Config.from_dict(config)
+                if config is not None
+                else self._bound_kernel.config_spec.default_config()
+            )
+        fn, path = self._factory(config)
+        if path is not None:
+            self._bench_cached_paths[config] = path
+        return fn
+
+    def get_cached_path(self, config: Config | None = None) -> str | None:
+        if config is None:
+            return None
+        return self._bench_cached_paths.get(config)
+
+    def extra_cache_key(self) -> str:
+        return self._fusion_context_hash
 
 
 class HelionTemplateBuffer(TemplateBuffer):
     """Inductor template buffer for Helion kernel."""
+
+    _fusion_config_cache: ExactWeakKeyDictionary = ExactWeakKeyDictionary()
 
     def __init__(
         self,
@@ -120,23 +180,18 @@ class HelionTemplateBuffer(TemplateBuffer):
         )
 
     def _render_with_hooks(self, kernel: Any) -> PartialRender:  # noqa: ANN401
-        """Set up fusion hooks, generate AST, and return a PartialRender.
+        """Set up fusion hooks, read metadata, return a placeholder PartialRender.
 
         Called as the ``render()`` function from the standard
-        ``codegen_template_body`` path.  ``_setup_fusion_hooks()``
-        populates fusion metadata on the kernel (epilogue indices,
-        prologue variables, source buffers, etc.); this method reads
-        that metadata and wires up store/load transform callbacks
-        before generating the Triton AST.
+        ``codegen_template_body`` path.  Always returns a placeholder —
+        autotuning and AST generation are deferred to
+        ``_finalize_codegen`` (called after Inductor has
+        processed epilogue/prologue subgraphs).
         """
-        # 1. Always autotune before AST generation.
-        if self._autotune_args:
-            self._bound_kernel.ensure_config_exists(self._autotune_args)
-
-        # 2. Set up fusion hooks.
+        # 1. Set up fusion hooks (requires V.kernel context).
         kernel._setup_fusion_hooks()
 
-        # 3. Read pre-computed fusion metadata from kernel into a single object.
+        # 2. Read pre-computed fusion metadata from kernel into a single object.
         prologue_fused_params = set(kernel._prologue_vars.keys())
         self._fusion_metadata = _FusionMetadata(
             epilogue_idx_by_param=kernel._epilogue_idx_by_param,
@@ -149,9 +204,9 @@ class HelionTemplateBuffer(TemplateBuffer):
                 if kernel._prologue_source_buffers.get(param_name) is not None
             },
         )
-        prologue_source_buffers = dict(kernel._prologue_source_buffers)
+        self._prologue_source_buffers = dict(kernel._prologue_source_buffers)
 
-        # 4. Build extra_params list from extra inputs and store targets.
+        # 3. Build extra_params list from extra inputs and store targets.
         extra_params_dict: dict[str, str] = {}
         for buf, param in kernel._extra_inputs.items():
             extra_params_dict.setdefault(param, buf)
@@ -163,28 +218,136 @@ class HelionTemplateBuffer(TemplateBuffer):
                     f"'{buf}' (from _extra_store_targets)"
                 )
             extra_params_dict.setdefault(param, buf)
-        extra_params = sorted(extra_params_dict.items())
-        extra_param_names = [p for p, _ in extra_params]
+        self._extra_params = sorted(extra_params_dict.items())
 
-        # 5. Generate Triton AST with store/load transform callbacks active.
-        root = self._generate_triton_ast(extra_params=extra_param_names)
-        if root is None:
-            return PartialRender("", kernel.render_hooks)
+        # Pre-compute benchmark example values while V.graph is available.
+        # Only needed when fusion-aware autotuning will actually run.
+        if (
+            self._autotune_args is not None
+            and self._bound_kernel.settings.autotune_with_torch_compile_fusion
+        ):
+            self._extra_param_examples = [
+                AlgorithmSelectorCache.benchmark_example_value(V.graph.get_buffer(buf))
+                for _, buf in self._extra_params
+            ]
+        else:
+            self._extra_param_examples = []
 
-        # 6. Compute call args and preamble, store on kernel.
+        # Return placeholder — autotuning and AST generation happen in _finalize_codegen.
+        return PartialRender("", kernel.render_hooks)
+
+    def _finalize_codegen(
+        self,
+        hook_outputs: dict[str, str],
+    ) -> FinalizeCodegenResult | None:
+        """Generate final kernel code after subgraph codegen.
+
+        Receives hook outputs (rendered epilogue/prologue code fragments)
+        from the kernel.  Returns a FinalizeCodegenResult with the final
+        source code and call metadata.
+        """
+        bk = self._bound_kernel
+        use_fusion_autotune = (
+            self._autotune_args is not None
+            and hook_outputs
+            and bk.settings.autotune_with_torch_compile_fusion
+        )
+        if use_fusion_autotune:
+            fusion_key = tuple(sorted(hook_outputs.items()))
+            bk_cache = self._fusion_config_cache.get(bk)
+            if bk_cache is not None and fusion_key in bk_cache:
+                cfg = bk_cache[fusion_key]
+            else:
+                cfg = bk._user_provided_config()
+                if cfg is None:
+                    fusion_context_hash = hashlib.sha256(
+                        repr(fusion_key).encode()
+                    ).hexdigest()
+                    adapter = _FusionAutotuneAdapter(
+                        bk,
+                        self._make_bench_kernel_factory(hook_outputs),
+                        fusion_context_hash,
+                    )
+                    cfg = bk.env.backend.autotune(
+                        adapter,  # pyrefly: ignore[bad-argument-type]
+                        self._autotune_args,  # pyrefly: ignore[bad-argument-type]
+                        force=False,
+                    )
+                if bk_cache is None:
+                    bk_cache = {}
+                    self._fusion_config_cache[bk] = bk_cache
+                bk_cache[fusion_key] = cfg
+        else:
+            if self._autotune_args is not None:
+                bk.ensure_config_exists(
+                    self._autotune_args,  # pyrefly: ignore[bad-argument-type]
+                )
+            cfg = bk._config
+
+        # Generate final AST with chosen config.
+        assert cfg is not None, (
+            "No config available: autotune_args was not provided and "
+            "no prior compilation has set a config on BoundKernel"
+        )
+        root, source = self._build_and_unparse(cfg, rename_with_placeholders=True)
+
         call_order, constant_repr = self._call_order_and_constant_repr()
-        kernel._call_preamble, kernel._call_args = self._build_call_args(
-            call_order, constant_repr, prologue_source_buffers, extra_params
+        call_preamble, call_args = self._build_call_args(
+            call_order, constant_repr, self._prologue_source_buffers, self._extra_params
+        )
+        imports = get_needed_import_lines(root)
+
+        return FinalizeCodegenResult(
+            source=source,
+            imports=imports,
+            call_preamble=call_preamble,
+            call_args=call_args,
         )
 
-        # 7. Store imports on kernel for emit_kernel_override, return
-        # PartialRender with just the kernel body (no import lines).
-        kernel._kernel_imports = get_needed_import_lines(root)
-        source = unparse(
-            root,
-            output_origin_lines=self._bound_kernel.settings.output_origin_lines,
-        )
-        return PartialRender(source, kernel.render_hooks)
+    def _make_bench_kernel_factory(
+        self,
+        hook_outputs: dict[str, str],
+    ) -> Callable[[Config], tuple[Callable[..., object], str | None]]:
+        """Build a closure that compiles the fused kernel for a given config.
+
+        The returned closure captures ``self`` (for ``_build_and_unparse``).
+        This is safe because the factory is only used synchronously within
+        ``_finalize_codegen`` and goes out of scope when autotuning
+        completes — no lifetime extension occurs.
+
+        Returns ``(kernel_fn, cached_path)`` — the callable plus the
+        file path of the compiled module (for diagnostic logging).
+        """
+        extra_tensors = self._extra_param_examples
+        kernel_name = self._bound_kernel.kernel.name
+
+        def _compile_for_config(
+            config: Config,
+        ) -> tuple[Callable[..., object], str | None]:
+            _root, source = self._build_and_unparse(config)
+
+            def _const(v: str) -> Callable[[], str]:
+                return lambda: v
+
+            hooks: dict[str, Callable[[], str] | None] = {
+                k: _const(v) for k, v in hook_outputs.items()
+            }
+            finalized = PartialRender(source, hooks).finalize_all()
+            # Import all active library imports unconditionally — the benchmark
+            # kernel is ephemeral and never shown to users, so unused imports
+            # are harmless.
+            lib = _active_library_imports()
+            all_imports = (
+                "from __future__ import annotations\n\n"
+                + "\n".join(lib.values())
+                + "\n\n"
+            )
+            fused_code = all_imports + finalized
+            module = PyCodeCache.load(fused_code)
+            compiled_fn = getattr(module, kernel_name)
+            return lambda *args: compiled_fn(*args, *extra_tensors), module.__file__
+
+        return _compile_for_config
 
     # ------------------------------------------------------------------ #
     # TemplateBuffer overrides for multi-output layout                   #
@@ -271,6 +434,7 @@ class HelionTemplateBuffer(TemplateBuffer):
         *,
         on_tensor_leaf: Callable[[str, Any, list[tuple[type, int]], int], None]
         | None = None,
+        fusion_enabled: bool = False,
         **buffer_kwargs: Any,  # noqa: ANN401
     ) -> tuple[HelionTemplateBuffer, tuple[TensorBox, ...]]:
         """Build a HelionTemplateBuffer and return ``(buf, outputs)``."""
@@ -301,6 +465,8 @@ class HelionTemplateBuffer(TemplateBuffer):
             named_inputs=realized_inputs,
             **buffer_kwargs,
         )
+        buf.allow_prologue_fusion = fusion_enabled
+        buf.allow_epilogue_fusion = fusion_enabled
         for inp in mutated_nodes:
             V.graph.never_reuse_buffers.add(inp.get_name())
 
@@ -364,44 +530,15 @@ class HelionTemplateBuffer(TemplateBuffer):
     # Private Helion-specific helpers                                    #
     # ------------------------------------------------------------------ #
 
-    def _generate_triton_ast(
-        self,
-        extra_params: list[str] | None = None,
-    ) -> ast.Module | None:
-        """Generate and rename the Triton kernel AST.
+    def _rename_with_placeholders(self, root: ast.Module) -> None:
+        """Rename functions and module-level vars with Placeholder suffixes.
 
-        Activates ``store_transform`` / ``load_transform`` callbacks when
-        active fusion specs are present so that ``hl.store`` / ``hl.load``
-        sites inline fused expressions directly.
+        This allows the kernel to coexist with others in Inductor's output.
         """
-        if not self._bound_kernel:
-            return None
-
-        cfg = self._bound_kernel._config
-        assert cfg is not None, "Config should be set after ensure_config_exists"
         host_fn = self._helion_kernel.name
         inner_fn = f"_helion_{host_fn}"
         inner_fn_placeholder = f"{inner_fn}_{Placeholder.KERNEL_NAME}"
 
-        with self._bound_kernel.env:
-            host_function = self._bound_kernel.host_function
-            assert host_function is not None, "BoundKernel must have a host_function"
-            fm = self._fusion_metadata
-            root = generate_ast(
-                host_function,
-                cfg,
-                emit_repro_caller=False,
-                store_transform=self._codegen_epilogue_fusion
-                if fm is not None and fm.epilogue_idx_by_param
-                else None,
-                load_transform=self._codegen_prologue_fusion
-                if fm is not None and fm.prologue_fused_params
-                else None,
-                extra_params=extra_params,
-            )
-
-        # Collect module-level variable names for uniquification
-        # (e.g. constexpr assignments like ``_BLOCK_SIZE_0 = tl.constexpr(32)``).
         module_level_vars: dict[str, str] = {
             target.id: f"{target.id}_{Placeholder.KERNEL_NAME}"
             for node in root.body
@@ -423,7 +560,47 @@ class HelionTemplateBuffer(TemplateBuffer):
                 elif node.id in module_level_vars:
                     node.id = module_level_vars[node.id]
 
-        return root
+    def _build_and_unparse(
+        self,
+        config: Config,
+        *,
+        rename_with_placeholders: bool = False,
+    ) -> tuple[ast.Module, str]:
+        """Build AST for config, optionally rename for Inductor, and unparse."""
+        fm = self._fusion_metadata
+        assert fm is not None
+        # Work on a copy so the caller's Config is not mutated with
+        # normalize defaults specific to this BoundKernel's config_spec.
+        config = Config(**config.config)  # pyrefly: ignore[bad-argument-type]
+        self._bound_kernel.env.config_spec.normalize(config)
+        extra_params = [p for p, _ in self._extra_params]
+        # Prologue deduplication tracking scoped to this codegen pass.
+        prologue_first_indexing: dict[str, str] = {}
+
+        with self._bound_kernel.env:
+            host_function = self._bound_kernel.host_function
+            root = generate_ast(
+                host_function,  # pyrefly: ignore[bad-argument-type]
+                config,
+                emit_repro_caller=False,
+                store_transform=self._codegen_epilogue_fusion
+                if fm.epilogue_idx_by_param
+                else None,
+                load_transform=functools.partial(
+                    self._codegen_prologue_fusion,
+                    prologue_first_indexing=prologue_first_indexing,
+                )
+                if fm.prologue_fused_params
+                else None,
+                extra_params=extra_params,
+            )
+        if rename_with_placeholders:
+            self._rename_with_placeholders(root)
+        source = unparse(
+            root,
+            output_origin_lines=self._bound_kernel.settings.output_origin_lines,
+        )
+        return root, source
 
     def _codegen_epilogue_fusion(
         self,
@@ -552,6 +729,8 @@ class HelionTemplateBuffer(TemplateBuffer):
         extra_mask: ast.expr | None,
         eviction_policy: ast.AST | None,
         codegen_load: Callable[..., ast.expr],
+        *,
+        prologue_first_indexing: dict[str, str],
     ) -> ast.expr:
         """Emit prologue variables + single ``<LOAD_INPUT_{param_name}>`` placeholder.
 
@@ -559,6 +738,9 @@ class HelionTemplateBuffer(TemplateBuffer):
         For prologue params, emits index/mask variable definitions and a
         ``<LOAD_INPUT_{param_name}>`` placeholder (expanded at finalize time
         by the hook closure), then returns a reference to the result variable.
+
+        ``prologue_first_indexing`` tracks which params have already been
+        emitted in this codegen pass (for multi-output deduplication).
         """
         assert self._fusion_metadata is not None
         param_name = state.device_function.tensor_arg(tensor).name
@@ -575,19 +757,16 @@ class HelionTemplateBuffer(TemplateBuffer):
         # store sites.  The prologue hook is only registered once per input,
         # so only emit the placeholder + variable definitions on the first
         # encounter; subsequent references just reuse the result variable.
-        # Multi-output: same input loaded at multiple store sites.
         # Prologue variables emitted once; reuse is safe because all loads
         # of the same fused input use the same subscript (same tile indices).
-        if param_name not in self._fusion_metadata.prologue_first_indexing:
+        if param_name not in prologue_first_indexing:
             xindex_name = prologue_vars["xindex"]
             xmask_name = prologue_vars["xmask"]
 
             # Compute linearized offset + mask from SubscriptIndexing
             indexing = SubscriptIndexing.create(state, tensor, [*subscript], extra_mask)
             offset_str = ast.unparse(indexing.index_expr)
-            self._fusion_metadata.prologue_first_indexing[param_name] = ", ".join(
-                indexing.dim_index_exprs
-            )
+            prologue_first_indexing[param_name] = ", ".join(indexing.dim_index_exprs)
             mask_str = (
                 ast.unparse(indexing.mask_expr) if indexing.has_mask() else "True"
             )
@@ -619,7 +798,7 @@ class HelionTemplateBuffer(TemplateBuffer):
                 state, tensor, [*subscript], extra_mask
             )
             new_offset = ", ".join(per_dim.dim_index_exprs)
-            first_offset = self._fusion_metadata.prologue_first_indexing[param_name]
+            first_offset = prologue_first_indexing[param_name]
             assert new_offset == first_offset, (
                 f"Prologue param {param_name} loaded with different subscripts "
                 f"at multiple store sites — fusion requires identical tile "
@@ -692,6 +871,22 @@ def lower_helion_kernel(
     # Build fake tensors for kernel binding (sympy exprs to concrete ints)
     def as_int(x: object, default: int) -> int:
         return int(x) if isinstance(x, (int, sympy.Integer)) else default
+
+    has_symbolic_shapes = any(
+        not isinstance(s, (int, sympy.Integer))
+        for r in realized.values()
+        for s in (*r.get_size(), *r.get_stride())
+    )
+
+    if has_symbolic_shapes and kernel.settings.static_shapes:
+        raise RuntimeError(
+            f"Helion kernel '{kernel.fn.__name__}' has static_shapes=True but is "
+            f"being compiled inside torch.compile(dynamic=True). "
+            f"static_shapes=True would bake incorrect placeholder sizes into the "
+            f"generated Triton code, producing wrong results at runtime. "
+            f"Set static_shapes=False on the kernel, e.g.: "
+            f"@helion.kernel(static_shapes=False)"
+        )
 
     all_args: dict[str, object] = {**constant_args}
     for n, r in realized.items():
@@ -807,6 +1002,7 @@ def lower_helion_kernel(
             if name in realized
         },
         on_tensor_leaf=on_tensor_leaf,
+        fusion_enabled=kernel.settings.torch_compile_fusion,
         kernel=kernel,
         bound_kernel=bound,
         constant_args=constant_args,

@@ -12,8 +12,8 @@ from helion._testing import HALF_DTYPE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
-from helion._testing import onlyBackends
 from helion._testing import skipUnlessTensorDescriptor
+from helion._testing import xfailIfPallas
 import helion.language as hl
 
 
@@ -35,7 +35,6 @@ def grid_2d_pytorch(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     return out
 
 
-@onlyBackends(["triton"])
 class TestGrid(RefEagerTestBase, TestCase):
     @skipUnlessTensorDescriptor("Tensor descriptor support is required")
     @patch.object(_compat, "_min_dot_size", lambda *args: (16, 16, 16))
@@ -121,6 +120,7 @@ class TestGrid(RefEagerTestBase, TestCase):
         )
         torch.testing.assert_close(result, grid_2d_pytorch(args[0], args[1]))
 
+    @xfailIfPallas("2D nested grids not working correctly Pallas")
     def test_grid_2d_idx_nested(self):
         @helion.kernel(static_shapes=True)
         def grid_2d_idx_nested(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -153,6 +153,7 @@ class TestGrid(RefEagerTestBase, TestCase):
         code, result = code_and_output(grid_2d_idx_nested, args)
         torch.testing.assert_close(result, grid_2d_pytorch(args[0], args[1]))
 
+    @xfailIfPallas("Grid begin/end not working on Pallas")
     def test_grid_begin_end(self):
         @helion.kernel(autotune_effort="none")
         def grid_begin_end(x: torch.Tensor) -> torch.Tensor:
@@ -173,6 +174,7 @@ class TestGrid(RefEagerTestBase, TestCase):
         code, result = code_and_output(grid_begin_end, (x,))
         torch.testing.assert_close(result, grid_begin_end_pytorch(x))
 
+    @xfailIfPallas("Grid begin/end not working on Pallas")
     def test_grid_begin_end_step(self):
         @helion.kernel(autotune_effort="none")
         def grid_begin_end_step(x: torch.Tensor) -> torch.Tensor:
@@ -193,6 +195,7 @@ class TestGrid(RefEagerTestBase, TestCase):
         code, result = code_and_output(grid_begin_end_step, (x,))
         torch.testing.assert_close(result, grid_begin_end_step_pytorch(x))
 
+    @xfailIfPallas("Grid begin/end not working on Pallas")
     def test_grid_end_step_kwarg(self):
         @helion.kernel(autotune_effort="none")
         def grid_end_step_kwarg(x: torch.Tensor) -> torch.Tensor:
@@ -213,6 +216,7 @@ class TestGrid(RefEagerTestBase, TestCase):
         code, result = code_and_output(grid_end_step_kwarg, (x,))
         torch.testing.assert_close(result, grid_end_step_kwarg_pytorch(x))
 
+    @xfailIfPallas("Grid begin/end not working on Pallas")
     def test_grid_multidim_begin_end(self):
         @helion.kernel(autotune_effort="none")
         def grid_multidim_begin_end(x: torch.Tensor) -> torch.Tensor:
@@ -236,6 +240,7 @@ class TestGrid(RefEagerTestBase, TestCase):
         code, result = code_and_output(grid_multidim_begin_end, (x,))
         torch.testing.assert_close(result, grid_multidim_begin_end_pytorch(x))
 
+    @xfailIfPallas("Grid begin/end not working on Pallas")
     def test_grid_multidim_begin_end_step(self):
         @helion.kernel(autotune_effort="none")
         def grid_multidim_begin_end_step(x: torch.Tensor) -> torch.Tensor:
@@ -259,6 +264,7 @@ class TestGrid(RefEagerTestBase, TestCase):
         code, result = code_and_output(grid_multidim_begin_end_step, (x,))
         torch.testing.assert_close(result, grid_multidim_begin_end_step_pytorch(x))
 
+    @xfailIfPallas("Tile begin/end not working on Pallas")
     def test_tile_begin_end(self):
         @helion.kernel(autotune_effort="none")
         def tile_begin_end(x: torch.Tensor) -> torch.Tensor:

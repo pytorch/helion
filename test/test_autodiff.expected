@@ -595,10 +595,10 @@ def _helion_backward_kernel(grad_out, x, grad_x):
     v_2 = 0.0
     v_3 = v_1 <= v_2
     # src[helion_bwd_cfb9b7eac08f.py:N]: where_val = torch.where(le_val, 0, grad_out_tile)
-    v_4 = 0.0
-    v_5 = tl.where(v_3, v_4, grad_out_tile)
+    scalar_tensor = 0
+    where_val = tl.where(v_3, scalar_tensor, grad_out_tile)
     # src[helion_bwd_cfb9b7eac08f.py:N]: grad_x[tile] = where_val
-    tl.store(grad_x + indices_0 * 1, v_5, None)
+    tl.store(grad_x + indices_0 * 1, where_val, None)
 
 def backward_kernel(grad_out: torch.Tensor, x: torch.Tensor, *, _launcher=_default_launcher):
     # src[helion_bwd_cfb9b7eac08f.py:N]: grad_x = torch.empty_like(x)

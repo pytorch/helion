@@ -21,6 +21,7 @@ from torch._environment import is_fbcode
 from .. import exc
 from .._compat import is_hip
 from .._compat import supports_tf32_precision_on_amd
+from .._compiler.backend_registry import list_backends
 from ..autotuner.effort_profile import AutotuneEffort
 from ..autotuner.effort_profile import InitialPopulation
 from ..autotuner.effort_profile import get_effort_profile
@@ -39,7 +40,6 @@ if TYPE_CHECKING:
         ) -> BaseAutotuner: ...
 
 
-BackendLiteral = Literal["triton", "pallas", "cute", "tileir", "metal"]
 DotPrecision = Literal["tf32", "tf32x3", "ieee"]
 PrecompileMode = Literal["spawn", "fork"] | None
 _TRUE_LITERALS = frozenset({"1", "true", "yes", "on"})
@@ -219,7 +219,7 @@ def _get_initial_population_strategy(
     Get the initial population strategy, respecting setting and env var overrides.
 
     Args:
-        default: The default strategy string from the effort profile ("from_random" or "from_default").
+        default: The default strategy string from the effort profile ("from_random" or "from_best_available").
         setting_override: Optional override from kernel decorator settings.
 
     Returns:
@@ -327,24 +327,23 @@ def _get_dot_precision() -> DotPrecision:
     )
 
 
-def _get_backend() -> BackendLiteral:
+def _get_backend() -> str:
     return _env_get_literal(
         "HELION_BACKEND",
-        cast("BackendLiteral", "triton"),
-        mapping={
-            "triton": "triton",
-            "pallas": "pallas",
-            "cute": "cute",
-            "tileir": "tileir",
-            "metal": "metal",
-        },
+        "triton",
+        mapping={name: name for name in list_backends()},
     )
+
+
+def is_pallas_interpret() -> bool:
+    """Return True if HELION_PALLAS_INTERPRET=1 is set."""
+    return _env_get_bool("HELION_PALLAS_INTERPRET", False)
 
 
 @dataclasses.dataclass
 class _Settings:
     # see __slots__ below for the doc strings that show up in help(Settings)
-    backend: BackendLiteral = dataclasses.field(default_factory=_get_backend)
+    backend: str = dataclasses.field(default_factory=_get_backend)
     ignore_warnings: list[type[exc.BaseWarning]] = dataclasses.field(
         default_factory=_get_ignore_warnings
     )
@@ -498,6 +497,16 @@ class _Settings:
         )
     )
     autotune_initial_population_strategy: InitialPopulation | None = None
+    torch_compile_fusion: bool = dataclasses.field(
+        default_factory=functools.partial(
+            _env_get_bool, "HELION_TORCH_COMPILE_FUSION", False
+        )
+    )
+    autotune_with_torch_compile_fusion: bool = dataclasses.field(
+        default_factory=functools.partial(
+            _env_get_bool, "HELION_AUTOTUNE_WITH_TORCH_COMPILE_FUSION", False
+        )
+    )
 
 
 class Settings(_Settings):
@@ -635,9 +644,20 @@ class Settings(_Settings):
         ),
         "autotune_initial_population_strategy": (
             "Override the initial population strategy for autotuning. "
-            "Valid values: 'from_random', 'from_default', 'from_best_available'. "
+            "Valid values: 'from_random', 'from_best_available'. "
             "When set, takes precedence over the HELION_AUTOTUNER_INITIAL_POPULATION env var "
             "and the effort profile default."
+        ),
+        "torch_compile_fusion": (
+            "If True, allow torch.compile to fuse this Helion kernel with surrounding Inductor ops "
+            "(prologue/epilogue) when used inside torch.compile. Default False. "
+            "Set HELION_TORCH_COMPILE_FUSION=1 to enable globally."
+        ),
+        "autotune_with_torch_compile_fusion": (
+            "If True, autotuning benchmarks the fused kernel (with epilogue/prologue) "
+            "to pick configs optimal for the actual fused workload. Default False. "
+            "Has no effect unless torch_compile_fusion is also True. "
+            "Set HELION_AUTOTUNE_WITH_TORCH_COMPILE_FUSION=1 to enable globally."
         ),
     }
 

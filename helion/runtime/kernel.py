@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import base64
 import contextlib
 import dataclasses
@@ -44,8 +45,8 @@ from .._compiler.generate_ast import generate_ast
 from .._compiler.host_function import HostFunction
 from .._compiler.inductor_lowering_extra import patch_inductor_lowerings
 from .._compiler.output_header import assert_no_conflicts
-from .._compiler.output_header import get_needed_imports
 from .._compiler.variable_origin import ArgumentOrigin
+from .._dist_utils import _find_process_group_name
 from .._dist_utils import check_config_consistancy as dist_check_config_consistancy
 from .._logging import LazyString
 from .._utils import counters
@@ -221,7 +222,7 @@ class Kernel(Generic[_R]):
                 raise TypeError(
                     f"Too many arguments passed to the kernel, expected: {self._num_params} got: {len(args)}."
                 )
-            signature = self.specialization_key(args)
+            signature = self._base_specialization_key(args)
             cache_key = self._get_bound_kernel_cache_key(args, signature)
             bound_kernel = (
                 None if cache_key is None else self._bound_kernels.get(cache_key, None)
@@ -240,18 +241,12 @@ class Kernel(Generic[_R]):
                 self._bound_kernels[cache_key] = bound_kernel
             return bound_kernel
 
-    def specialization_key(self, args: Sequence[object]) -> tuple[Hashable, ...]:
+    def _base_specialization_key(self, args: Sequence[object]) -> tuple[Hashable, ...]:
         """
-        Generate a specialization key for the given arguments.
-
-        This method generates a unique key for the arguments based on their types
-        and the corresponding extractor functions defined in `_specialization_extractors`.
-
-        Args:
-            args: The arguments to generate a specialization key for.
-
-        Returns:
-            Hashable: A hashable key representing the specialization of the arguments.
+        Generate the base specialization key from input argument metadata only,
+        using the per-type extractor functions defined in `_specialization_extractors`,
+        without any extras discovered during compilation. Used internally for
+        _specialize_extra lookups.
         """
         result = []
         assert len(args) <= len(self._annotations)
@@ -265,6 +260,27 @@ class Kernel(Generic[_R]):
         if self._key_fn is not None:
             return (*result, self._key_fn(*args))
         return (*result,)
+
+    def specialization_key(self, args: Sequence[object]) -> tuple[Hashable, ...]:
+        """
+        Generate the full specialization key for the given arguments, including
+        any additional specialization constraints discovered during compilation
+        (e.g. from hl.specialize() calls).
+
+        Before the first compilation, these extras are not yet known and the
+        key may be incomplete.
+
+        Args:
+            args: The arguments to generate a specialization key for.
+
+        Returns:
+            Hashable: A hashable key representing the specialization of the arguments.
+        """
+        base = self._base_specialization_key(args)
+        extra_fns = self._specialize_extra.get(base)
+        if extra_fns is not None:
+            return base + tuple([s(args) for s in extra_fns])
+        return base
 
     def _specialization_key(self, obj: object) -> Hashable:
         """
@@ -398,6 +414,8 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             return
 
         with self.env:
+            self._env.process_group_name = _find_process_group_name(kernel.fn, args)
+
             assert len(args) == len(self.kernel.signature.parameters)
             self.fake_args: list[object] = []
             constexpr_args = {}
@@ -441,6 +459,8 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                     config = self.env.config_spec.default_config()
                     self.maybe_log_repro(log.warning, args, config=config)
                     raise
+
+                self.env.config_spec.configure_epilogue_subtile_autotune(args)
 
     def _apply_mark_static(self, args: tuple[object, ...]) -> None:
         """
@@ -536,9 +556,27 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             if output_origin_lines is None:
                 output_origin_lines = self.settings.output_origin_lines
             with measure("BoundKernel.unparse"):
-                return get_needed_imports(root) + unparse(
-                    root, output_origin_lines=output_origin_lines
-                )
+                import_lines: list[str] = []
+                body_start = 0
+                for i, stmt in enumerate(root.body):
+                    if isinstance(stmt, (ast.Import, ast.ImportFrom)):
+                        if not (
+                            isinstance(stmt, ast.ImportFrom)
+                            and stmt.module == "__future__"
+                        ):
+                            import_lines.append(ast.unparse(stmt))
+                        continue
+                    body_start = i
+                    break
+                else:
+                    body_start = len(root.body)
+                body_root = ast.Module(body=root.body[body_start:], type_ignores=[])
+                ast.fix_missing_locations(body_root)
+                imports = "\n".join(import_lines)
+                body = unparse(body_root, output_origin_lines=output_origin_lines)
+                if imports:
+                    return f"from __future__ import annotations\n\n{imports}\n\n{body}"
+                return f"from __future__ import annotations\n\n{body}"
 
     def compile_config(
         self, config: ConfigLike | None = None, *, allow_print: bool = True
@@ -560,7 +598,9 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                 # pyrefly: ignore [bad-argument-type]
                 **config
             )
-        dist_check_config_consistancy(config)
+        dist_check_config_consistancy(
+            config, process_group_name=self._env.process_group_name
+        )
         if (rv := self._compile_cache.get(config)) is not None:
             return rv
         if (
@@ -605,6 +645,24 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         self._compile_cache[config] = rv
         self._cache_path_map[config] = module.__file__
         return rv
+
+    def bench_compile_config(
+        self,
+        config: Config | dict[str, object] | None = None,
+        *,
+        allow_print: bool = True,
+    ) -> Callable[..., object]:
+        return self.compile_config(config, allow_print=allow_print)
+
+    def extra_cache_key(self) -> str:
+        """Return extra data folded into the disk-cache key.
+
+        Returns ``""`` by default, leaving the cache key unchanged.
+        """
+        return ""
+
+    def is_cacheable(self) -> bool:
+        return True
 
     def get_cached_path(self, config: ConfigLike | None = None) -> str | None:
         """
@@ -811,16 +869,15 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             extractors.append(make_extractor(source))
         return extractors
 
-    def _implicit_config(self) -> Config | None:
+    def _user_provided_config(self) -> Config | None:
+        """Return a config if the user explicitly provided one, else None.
+
+        Checks the kernel's config list and settings to determine if
+        a config can be resolved without autotuning.
         """
-        Returns a single config that is implicitly used by this kernel, if any.
-        """
-        configs = self.kernel.configs
-        if self._config is not None:
-            return self._config
         if self.settings.force_autotune:
-            # If force autotune is enabled, do not pick an implicit config
             return None
+        configs = self.kernel.configs
         if len(configs) == 1:
             return configs[0]
         if len(configs) == 0 and self.kernel.settings.autotune_effort == "none":
@@ -833,6 +890,14 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                 )
             return config
         return None
+
+    def _implicit_config(self) -> Config | None:
+        """
+        Returns a single config that is implicitly used by this kernel, if any.
+        """
+        if self._config is not None:
+            return self._config
+        return self._user_provided_config()
 
     def _require_implicit_config(self) -> Config:
         """

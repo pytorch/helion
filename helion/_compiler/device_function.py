@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 from collections import defaultdict
+import contextlib
 import dataclasses
 import itertools
 import math
@@ -304,15 +305,33 @@ class DeviceFunction:
         self._indexing_config = config.indexing
         self.indexing_strategies: list[IndexingStrategy] = []
 
+        # Atomic indexing config (separate from load/store indexing)
+        self._atomic_indexing_config = config.atomic_indexing
+        self.atomic_indexing_strategies: list[IndexingStrategy] = []
+        self.atomic_op_index = 0
+
         self.rng_seed_count = 0
         self.device_load_index = 0
         self.device_store_index = 0
         # Single counter for both loads and stores for indexing assignment
         self.device_memory_op_index = 0
+        self.epilogue_subtile_store_indices: dict[str, int] = {}
         self.rng_seed_buffer_param_name = None
 
         # Pallas: id(fake_tensor) → {dim: block_id}, recorded during codegen
         self.pallas_tensor_dim_block_ids: dict[int, dict[int, int]] = {}
+        # Pallas: set of id(fake_tensor) for tensors accessed in pipeline body
+        self.pallas_pipeline_tensor_ids: set[int] = set()
+        # TODO(dunfanlu): consider duplicating and aliasing arguments if a tensor needs to be accessed via both VMEM and SMEM?
+        # Pallas: set of id(fake_tensor) for tensors requiring scalar accessing (SMEM)
+        self.pallas_smem_tensor_ids: set[int] = set()
+
+    def allocate_store_index(self) -> int:
+        """Bump store counters and return the indexing strategy slot."""
+        self.device_store_index += 1
+        idx = self.device_memory_op_index
+        self.device_memory_op_index += 1
+        return idx
 
     def get_indexing_strategy(self, index: int) -> IndexingStrategy:
         from .indexing_strategy import IndexingStrategy
@@ -343,25 +362,45 @@ class DeviceFunction:
 
         return self.indexing_strategies[index]
 
+    def get_atomic_indexing_strategy(self, index: int) -> IndexingStrategy:
+        from .indexing_strategy import IndexingStrategy
+        from .indexing_strategy import PointerIndexingStrategy
+
+        while len(self.atomic_indexing_strategies) <= index:
+            idx = len(self.atomic_indexing_strategies)
+
+            if isinstance(self._atomic_indexing_config, str):
+                if not self.atomic_indexing_strategies:
+                    strategy = IndexingStrategy.select(self._atomic_indexing_config)
+                else:
+                    strategy = self.atomic_indexing_strategies[0]
+            elif (
+                isinstance(self._atomic_indexing_config, list)
+                and self._atomic_indexing_config
+            ):
+                assert idx < len(self._atomic_indexing_config), (
+                    f"Atomic operation {idx} exceeds atomic_indexing config length "
+                    f"{len(self._atomic_indexing_config)}. Please specify atomic_indexing for all atomic ops."
+                )
+                strategy = IndexingStrategy.select(self._atomic_indexing_config[idx])
+            else:
+                strategy = PointerIndexingStrategy()
+
+            self.atomic_indexing_strategies.append(strategy)
+
+        return self.atomic_indexing_strategies[index]
+
     def has_rng_ops(self) -> bool:
         """Check if this kernel uses any RNG operations."""
         return self.rng_seed_count > 0 and self.rng_seed_buffer_param_name is not None
 
-    def allocate_rng_seed(self) -> int:
-        """Allocate a new RNG seed index and ensure buffer argument exists.
-
-        Returns:
-            The seed index for this RNG operation.
-        """
-        seed_index = self.rng_seed_count
-        self.rng_seed_count += 1
-
-        # Ensure seed buffer parameter name exists
+    def reserve_rng_seed(self, seed_index: int) -> None:
+        """Ensure the RNG seed buffer is available up to a specific index."""
+        assert seed_index >= 0
+        self.rng_seed_count = max(self.rng_seed_count, seed_index + 1)
         if self.rng_seed_buffer_param_name is None:
             # pyrefly: ignore [bad-assignment]
             self.rng_seed_buffer_param_name = self.new_var("rng_seed_buffer")
-
-        return seed_index
 
     def block_size_var(self, block_id: int) -> str | None:
         key = (block_id,)
@@ -433,7 +472,9 @@ class DeviceFunction:
 
     def sympy_expr(self, expr: sympy.Expr) -> str:
         env = CompileEnvironment.current()
-        expr = env.specialize_expr(env.shape_env.simplify(expr))
+        with contextlib.suppress(Exception):
+            expr = env.shape_env.simplify(expr)
+        expr = env.specialize_expr(expr)
         if not expr.free_symbols:
             return env.backend.sympy_printer_expr(expr)
         if expr in self.expr_to_var_info:
@@ -457,6 +498,7 @@ class DeviceFunction:
         return env.backend.sympy_printer_expr(expr.xreplace(replacements))
 
     def _lift_sympy_arg(self, expr: sympy.Expr) -> str:
+        env = CompileEnvironment.current()
         origin = HostFunction.current().expr_to_origin[expr]
         if isinstance(origin.origin, TensorSizeOrigin):
             assert origin.fake_value is not None
@@ -466,11 +508,13 @@ class DeviceFunction:
             )
             return arg.name
         if isinstance(origin.origin, BlockSizeOrigin):
-            result = self.block_size_var(origin.origin.block_id)
+            result = self.block_size_var(env.canonical_block_id(origin.origin.block_id))
             assert result is not None
             return result
         if isinstance(origin.origin, GridOrigin):
-            return self.codegen.offset_var(origin.origin.block_id)
+            return self.codegen.offset_var(
+                env.resolve_codegen_block_id(origin.origin.block_id, self.codegen)
+            )
         return self.expr_arg(expr, origin.origin).name
 
     def user_sympy_expr(self, expr: sympy.Expr) -> str:
@@ -844,7 +888,7 @@ class DeviceFunction:
         for var_name, expr in self.deferred_rdim_defs:
             expr_str = HostFunction.current().sympy_expr(expr)
             stmt = statement_from_string(
-                f"{var_name} = {backend.next_power_of_2_host_expr(expr_str)}"
+                f"{var_name} = {backend.dynamic_rdim_size_expr(expr_str)}"
             )
             codegen.host_statements.append(stmt)
         self.deferred_rdim_defs.clear()
@@ -864,6 +908,13 @@ class DeviceFunction:
         name = self.new_var(name_hint)
         self._scratch_args.append(ScratchArg(name, shape, dtype, scratch_type))
         return name
+
+    def scratch_read_slice(self, name: str) -> str | None:
+        """Return the index expression for reading logical data from a padded scratch.
+
+        Returns None if no padding was applied.
+        """
+        return None
 
     def register_dma_semaphore(self, name_hint: str = "sem") -> str:
         """Register a DMA semaphore scratch buffer and return its variable name."""
@@ -963,3 +1014,16 @@ class HelionCutePrinter(HelionTritonPrinter):
 
 def cute_texpr(expr: sympy.Expr) -> str:
     return HelionCutePrinter().doprint(expr)
+
+
+class HelionPallasPrinter(HelionTritonPrinter):
+    """Pallas printer that emits plain Python operators instead of Triton runtime helpers."""
+
+    def _print_FloorDiv(self, expr: sympy.Expr) -> str:
+        lhs, rhs = expr.args
+        # pyrefly: ignore [missing-attribute]
+        return f"({self._print(lhs)} // {self._print(rhs)})"
+
+
+def pallas_texpr(expr: sympy.Expr) -> str:
+    return HelionPallasPrinter().doprint(expr)

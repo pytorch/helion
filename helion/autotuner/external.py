@@ -70,6 +70,7 @@ def create_user_config_spec(
 @dataclasses.dataclass
 class _FakeEnv:
     device: torch.device
+    process_group_name: str | None = None
 
 
 class _ExternalKernelAdapter(_AutotunableKernel):
@@ -142,6 +143,14 @@ class _ExternalKernelAdapter(_AutotunableKernel):
             self._compile_cache[config] = self._compile_fn(config)
         return self._compile_cache[config]
 
+    def bench_compile_config(
+        self,
+        config: Config | dict[str, object] | None = None,
+        *,
+        allow_print: bool = True,
+    ) -> Callable[..., Any]:
+        return self.compile_config(config, allow_print=allow_print)
+
     def format_kernel_decorator(self, config: Config, settings: Settings) -> str:
         return f"config={config!r}"
 
@@ -164,6 +173,12 @@ class _ExternalKernelAdapter(_AutotunableKernel):
         config: Config | None = None,
     ) -> None:
         pass
+
+    def extra_cache_key(self) -> str:
+        return ""
+
+    def is_cacheable(self) -> bool:
+        return False
 
 
 SETTINGS_KWARGS = {
@@ -283,5 +298,5 @@ def autotune(
             **settings_kw,
         ),
         args,
-        **search_kw,
+        **search_kw,  # pyrefly: ignore[bad-argument-type]
     ).autotune()

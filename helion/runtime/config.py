@@ -43,7 +43,9 @@ class Config(Mapping[str, object]):
         num_sm_multiplier: NumSmMultiplierLiteral | None = None,
         maxnreg: MaxnregLiteral | None = None,
         indexing: IndexingLiteral | list[IndexingLiteral] | None = None,
+        atomic_indexing: IndexingLiteral | list[IndexingLiteral] | None = None,
         advanced_controls_file: str | None = None,
+        epilogue_subtile: int | None = None,
         # For user-defined properties
         **kwargs: object,
     ) -> None:
@@ -78,7 +80,12 @@ class Config(Mapping[str, object]):
                   indexing=["pointer", "block_ptr", "tensor_descriptor"]
                 - Empty/omitted (all loads/stores default to "pointer")
                 Valid strategies: "pointer", "tensor_descriptor", "block_ptr"
+            atomic_indexing: Indexing strategy for atomic operations (e.g., hl.atomic_add).
+                Same format as ``indexing`` (a single string or a list per atomic op).
+                Defaults to "pointer" when omitted.
             advanced_controls_file: Path to a PTXAS control file applied during compilation, or empty string for none.
+            epilogue_subtile: Split factor for the epilogue (post-matmul pointwise + store) along
+                the N dimension. None = disabled (default), valid values are 2 or 4.
             **kwargs: Additional user-defined configuration parameters.
         """
         self.config = {}
@@ -100,10 +107,12 @@ class Config(Mapping[str, object]):
             "num_warps": num_warps,
             "num_stages": num_stages,
             "indexing": indexing,
+            "atomic_indexing": atomic_indexing,
             "pid_type": pid_type,
             "num_sm_multiplier": num_sm_multiplier,
             "maxnreg": maxnreg,
             "advanced_controls_file": advanced_controls_file,
+            "epilogue_subtile": epilogue_subtile,
         }
         for key, value in core_props.items():
             if value is not None:
@@ -310,6 +319,17 @@ class Config(Mapping[str, object]):
         return cast(
             "IndexingLiteral | list[IndexingLiteral]", self.config.get("indexing", [])
         )
+
+    @property
+    def atomic_indexing(self) -> IndexingLiteral | list[IndexingLiteral]:
+        return cast(
+            "IndexingLiteral | list[IndexingLiteral]",
+            self.config.get("atomic_indexing", []),
+        )
+
+    @property
+    def epilogue_subtile(self) -> int | None:
+        return cast("int | None", self.config.get("epilogue_subtile", None))
 
 
 def _to_hashable(x: object) -> object:

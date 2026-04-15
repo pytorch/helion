@@ -14,7 +14,6 @@ from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
 from helion._testing import skipIfRefEager
-from helion._testing import xfailIfCute
 from helion.exc import ShapeSpecializingAllocation
 import helion.language as hl
 
@@ -71,9 +70,6 @@ class TestSpecialize(RefEagerTestBase, TestCase):
         with self.assertRaises(ShapeSpecializingAllocation):
             code_and_output(fn, (x,), block_size=16)
 
-    @xfailIfCute(
-        "cute: dynamic specialized accumulator tiles produce incorrect results"
-    )
     def test_dynamic_size_block_specialize(self):
         @helion.kernel()
         def fn(
@@ -92,9 +88,6 @@ class TestSpecialize(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, x + 1)
         self.assertEqual(len(fn.bind((x,)).config_spec.reduction_loops), 0)
 
-    @xfailIfCute(
-        "cute: dynamic specialized accumulator tiles produce incorrect results"
-    )
     def test_dynamic_size_block_non_power_of_two(self):
         @helion.kernel()
         def fn(
@@ -119,9 +112,6 @@ class TestSpecialize(RefEagerTestBase, TestCase):
             fn.bind((x,)) is not fn.bind((torch.zeros_like(x[:, 1:]),))
         )
 
-    @xfailIfCute(
-        "cute: dynamic specialized accumulator tiles produce incorrect results"
-    )
     def test_dynamic_size_block_non_power_of_two_outplace(self):
         @helion.kernel()
         def fn(
@@ -146,9 +136,6 @@ class TestSpecialize(RefEagerTestBase, TestCase):
             fn.bind((x,)) is not fn.bind((torch.zeros_like(x[:, 1:]),))
         )
 
-    @xfailIfCute(
-        "cute: dynamic specialized accumulator tiles produce incorrect results"
-    )
     def test_dynamic_size_block_non_power_of_two_swap_order(self):
         @helion.kernel()
         def fn(
@@ -173,9 +160,6 @@ class TestSpecialize(RefEagerTestBase, TestCase):
             fn.bind((x,)) is not fn.bind((torch.zeros_like(x[:, 1:]),))
         )
 
-    @xfailIfCute(
-        "cute: dynamic specialized accumulator tiles produce incorrect results"
-    )
     def test_dynamic_size_block_non_power_of_two_double_acc(self):
         @helion.kernel()
         def fn(
@@ -202,9 +186,6 @@ class TestSpecialize(RefEagerTestBase, TestCase):
             fn.bind((x,)) is not fn.bind((torch.zeros_like(x[:, 1:]),))
         )
 
-    @xfailIfCute(
-        "cute: dynamic specialized accumulator tiles produce incorrect results"
-    )
     def test_dynamic_size_block_non_power_of_two_matmul(self):
         @helion.kernel()
         def fn(
@@ -240,9 +221,6 @@ class TestSpecialize(RefEagerTestBase, TestCase):
             fn.bind((x,)) is not fn.bind((torch.zeros_like(x[:, 1:]),))
         )
 
-    @xfailIfCute(
-        "cute: register_block_size specialization can overthread to 32768-thread CTAs"
-    )
     def test_tensor_factory_specialize_non_power_of_2(self):
         def _test_with_factory(factory_fn, test_host=True):
             @helion.kernel()
@@ -542,6 +520,35 @@ class TestMarkStatic(RefEagerTestBase, TestCase):
         x2 = torch.randn([320, 128], device=DEVICE)
         torch._dynamo.mark_static(x2, -1)
         self.assertIsNot(fn.bind((x,)), fn.bind((x2,)))
+
+    @skipIfRefEager("specialization_key is not used in ref eager mode")
+    def test_specialization_key_includes_hl_specialize(self):
+        """Test that specialization_key() includes hl.specialize() extras after bind()."""
+
+        @helion.kernel(static_shapes=False, autotune_effort="none")
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            hl.specialize(x.size(-1))
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size()):
+                out[tile] = x[tile] * 2
+            return out
+
+        a = torch.randn([128, 64], device=DEVICE)
+        b = torch.randn([128, 32], device=DEVICE)
+
+        # Before bind: keys are equal (extras not yet known)
+        key_a_before = fn.specialization_key((a,))
+        key_b_before = fn.specialization_key((b,))
+        self.assertEqual(key_a_before, key_b_before)
+
+        # After bind: keys must differ because hl.specialize(x.size(-1))
+        # makes the kernel depend on the last dimension
+        fn.bind((a,))
+        fn.bind((b,))
+
+        key_a_after = fn.specialization_key((a,))
+        key_b_after = fn.specialization_key((b,))
+        self.assertNotEqual(key_a_after, key_b_after)
 
 
 if __name__ == "__main__":

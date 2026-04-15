@@ -171,7 +171,7 @@ class TestDebugUtils(RefEagerTestDisabled, TestCase):
             x = torch.randn([128], dtype=torch.float32, device=DEVICE)
 
             # Mock do_bench to fail on the second config with PTXASError (warn level).
-            # We patch helion.autotuner.base_search.do_bench (not triton.testing.do_bench)
+            # We patch helion.autotuner.benchmark_provider.do_bench (not triton.testing.do_bench)
             # because the autotuner imports do_bench from helion.autotuner.benchmarking.
             from torch._inductor.runtime.triton_compat import PTXASError
 
@@ -184,7 +184,9 @@ class TestDebugUtils(RefEagerTestDisabled, TestCase):
                 return 1.0  # Return a valid benchmark time for the first config
 
             with self.capture_output() as output_capture:
-                with mock.patch("helion.autotuner.base_search.do_bench", mock_do_bench):
+                with mock.patch(
+                    "helion.autotuner.benchmark_provider.do_bench", mock_do_bench
+                ):
                     # Autotune will try both configs, second one will fail and print repro
                     kernel.autotune([x], force=False)
 

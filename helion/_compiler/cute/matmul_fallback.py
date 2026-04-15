@@ -11,6 +11,7 @@ from ..compile_environment import CompileEnvironment
 from ..dtype_utils import cast_ast
 from ..matmul_utils import _needs_f32_accumulator
 from .indexing import CutePackedAffineLoad
+from .indexing import CutePackedTerms
 
 if TYPE_CHECKING:
     from ..helper_function import CodegenInterface
@@ -296,10 +297,11 @@ def _emit_cute_grouped_sum_reduction(
 def _emit_cute_matmul(
     cg: CodegenInterface,
     lhs: ast.AST | CutePackedAffineLoad,
-    rhs: ast.AST,
+    rhs: ast.AST | CutePackedTerms,
     *,
     accumulate_in_lane_loop: bool = True,
     k_block_id: int | None,
+    static_k_extent: int | None = None,
     acc: ast.AST | None = None,
     out_dtype: torch.dtype | None = None,
     acc_dtype: torch.dtype | None = None,
@@ -313,16 +315,32 @@ def _emit_cute_matmul(
         lhs_terms = tuple(lhs.terms)
     else:
         lhs_terms = (lhs,)
+    rhs_terms: tuple[ast.AST, ...]
+    if isinstance(rhs, CutePackedTerms):
+        rhs_terms = tuple(rhs.terms)
+    else:
+        rhs_terms = (rhs,)
     if (
         lhs_dtype is not None
         and rhs_dtype is not None
         and _needs_f32_accumulator(lhs_dtype, rhs_dtype)
     ):
         reduction_dtype = torch.float32
-        rhs = cast_ast(rhs, reduction_dtype)
+        rhs_terms = tuple(cast_ast(term, reduction_dtype) for term in rhs_terms)
         lhs_terms = tuple(cast_ast(term, reduction_dtype) for term in lhs_terms)
+    if len(lhs_terms) == len(rhs_terms):
+        term_pairs = zip(lhs_terms, rhs_terms, strict=True)
+    elif len(lhs_terms) == 1:
+        term_pairs = ((lhs_terms[0], rhs_term) for rhs_term in rhs_terms)
+    elif len(rhs_terms) == 1:
+        term_pairs = ((lhs_term, rhs_terms[0]) for lhs_term in lhs_terms)
+    else:
+        raise RuntimeError(
+            f"unsupported packed CuTe matmul arity: lhs={len(lhs_terms)} rhs={len(rhs_terms)}"
+        )
     product_terms = [
-        expr_from_string("{lhs} * {rhs}", lhs=term, rhs=rhs) for term in lhs_terms
+        expr_from_string("{lhs} * {rhs}", lhs=lhs_term, rhs=rhs_term)
+        for lhs_term, rhs_term in term_pairs
     ]
     if reduction_dtype is not None:
         product_terms = [cast_ast(term, reduction_dtype) for term in product_terms]
@@ -414,6 +432,19 @@ def _emit_cute_matmul(
                 loop_state=loop_state,
                 k_block_id=k_block_id,
             )
+        )
+    elif static_k_extent is not None and static_k_extent > 1:
+        scale_dtype = reduction_dtype or lhs_dtype or rhs_dtype or out_dtype
+        scale_expr = str(static_k_extent)
+        if scale_dtype is not None:
+            scale_expr = (
+                f"{CompileEnvironment.current().backend.dtype_str(scale_dtype)}"
+                f"({static_k_extent})"
+            )
+        product = expr_from_string(
+            "({product}) * ({scale})",
+            product=product,
+            scale=expr_from_string(scale_expr),
         )
     if reduction_base_acc is not None and reduction_dtype is not None:
         if acc_dtype != reduction_dtype:

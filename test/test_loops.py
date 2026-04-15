@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import functools
 from pathlib import Path
 import unittest
@@ -11,6 +12,7 @@ import helion
 from helion import _compat
 from helion import exc
 from helion._compat import use_tileir_tunables
+from helion._compiler.static_loop_unroller import StaticLoopUnroller
 from helion._testing import DEVICE
 from helion._testing import HALF_DTYPE
 from helion._testing import RefEagerTestBase
@@ -20,12 +22,12 @@ from helion._testing import code_and_output
 from helion._testing import import_path
 from helion._testing import onlyBackends
 from helion._testing import skipIfCudaCapabilityLessThan
+from helion._testing import skipIfFn
 from helion._testing import skipIfLowVRAM
 from helion._testing import skipIfNotTriton
 from helion._testing import skipIfPallas
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfTileIR
-from helion._testing import xfailIfCute
 from helion._testing import xfailIfPallas
 import helion.language as hl
 
@@ -66,6 +68,33 @@ def inplace_nested_loop_kernel(x: torch.Tensor) -> torch.Tensor:
 
 @onlyBackends(["triton", "cute", "pallas"])
 class TestLoops(RefEagerTestBase, TestCase):
+    @skipIfRefEager("StaticLoopUnroller unit test does not execute a kernel")
+    def test_static_unroller_rejects_multiple_counter_updates(self) -> None:
+        node = ast.parse("while i < 4:\n    i += 1\n    i += 1\n").body[0]
+        assert isinstance(node, ast.While)
+
+        unroller = StaticLoopUnroller()
+
+        self.assertIsNone(unroller._extract_induction_delta(node.body, "i"))
+        self.assertIsNone(unroller._unroll_counted_while(node, {"i": 0}))
+
+    @skipIfRefEager("StaticLoopUnroller unit test does not execute a kernel")
+    def test_static_unroller_nested_counted_while_updates_once(self) -> None:
+        node = ast.parse(
+            "while j < 2:\n    while i < 2:\n        i += 1\n    j += 1\n"
+        ).body[0]
+        assert isinstance(node, ast.While)
+
+        env = {"i": 0, "j": 0}
+        unroller = StaticLoopUnroller()
+        unrolled = unroller._unroll_counted_while(node, env)
+
+        self.assertIsNotNone(unrolled)
+        assert unrolled is not None
+        self.assertEqual(len(unrolled), 4)
+        self.assertTrue(all(isinstance(stmt, ast.AugAssign) for stmt in unrolled))
+        self.assertEqual(env["j"], 2)
+
     def test_pointwise_device_loop(self):
         args = (torch.randn([512, 512], device=DEVICE),)
         code, result = code_and_output(
@@ -98,10 +127,6 @@ class TestLoops(RefEagerTestBase, TestCase):
         self.assertIn("while while_cond", code)
         self.assertIn("while_cond =", code)
 
-    @xfailIfPallas("while loops not supported on pallas")
-    @xfailIfCute(
-        "while-loop tensor accumulator phi/update is unsupported in CuTe lowering"
-    )
     def test_while_accumulates_tensor(self) -> None:
         @helion.kernel(autotune_effort="none")
         def kernel(x: torch.Tensor) -> torch.Tensor:
@@ -138,7 +163,6 @@ class TestLoops(RefEagerTestBase, TestCase):
         with self.assertRaises(helion.exc.StatementNotSupported):
             kernel.bind((x,))
 
-    @xfailIfPallas("large 4D tensors may exceed TPU VMEM")
     @skipIfLowVRAM("Test requires high VRAM for [128, 128, 128, 128] tensors")
     def test_3d_device_loop0(self):
         args = (torch.randn([128, 128, 128, 128], device=DEVICE),)
@@ -283,7 +307,6 @@ class TestLoops(RefEagerTestBase, TestCase):
             result, functools.reduce(torch.matmul, args), atol=1e-1, rtol=1e-2
         )
 
-    @xfailIfPallas("hl.load/hl.store with extra_mask not supported on pallas")
     def test_use_block_size_var_without_hl_tile(self):
         """Test that block size var can be used without hl.tile()."""
 
@@ -309,8 +332,28 @@ class TestLoops(RefEagerTestBase, TestCase):
 
         code, result = code_and_output(copy_blockwise, (x,), block_sizes=[16])
         torch.testing.assert_close(result, x)
-        self.assertIn("_BLOCK_SIZE_0 = tl.constexpr(", code)
-        self.assertIn("tl.arange(0, _BLOCK_SIZE_0)", code)
+        if _get_backend() == "triton":
+            self.assertIn("_BLOCK_SIZE_0 = tl.constexpr(", code)
+            self.assertIn("tl.arange(0, _BLOCK_SIZE_0)", code)
+
+    @skipIfRefEager(
+        "Test is block size dependent which is not supported in ref eager mode"
+    )
+    @skipIfPallas("scalar tile.count stores are not supported on pallas")
+    def test_tile_count_with_begin_end(self) -> None:
+        @helion.kernel
+        def fn(begin: int, end: int, device: torch.device) -> torch.Tensor:
+            out = torch.zeros([1], dtype=torch.int32, device=device)
+            for tile in hl.tile(begin, end, block_size=32):
+                out[0] = tile.count
+            return out
+
+        begin, end = 10, 97
+        _, result = code_and_output(fn, (begin, end, DEVICE))
+        expected = torch.tensor(
+            [(end - begin + 32 - 1) // 32], dtype=torch.int32, device=DEVICE
+        )
+        torch.testing.assert_close(result, expected)
 
     @xfailIfPallas("data-dependent bounds hit JAX tracing issues on pallas")
     def test_data_dependent_bounds1(self):
@@ -449,10 +492,10 @@ class TestLoops(RefEagerTestBase, TestCase):
         self.assertEqual(spec.min_size, 32)
         self.assertEqual(spec.max_size, 256)
 
-    @xfailIfPallas("complex reduction with atomic_add not supported on pallas")
     @skipIfTileIR("Result mismatch with tileir backend")
-    @xfailIfCute(
-        "register-block-size reduction kernel exceeds CuTe thread-layout limits"
+    @skipIfFn(
+        lambda: _get_backend() == "cute",
+        "register-block-size reduction kernel exceeds CuTe thread-layout limits",
     )
     def test_register_block_size_codegen_size_hint(self):
         @helion.kernel(static_shapes=True)
@@ -491,7 +534,6 @@ class TestLoops(RefEagerTestBase, TestCase):
         expected = y_true[:, :].sum() / y_pred.size(0)
         torch.testing.assert_close(result, expected)
 
-    @xfailIfPallas("uses block_ptr indexing not supported on pallas")
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfTileIR("TileIR does not support block_ptr indexing")
     def test_reorder_with_register_block_size(self):
@@ -713,7 +755,6 @@ class TestLoops(RefEagerTestBase, TestCase):
         code, output = code_and_output(fn, (x,))
         torch.testing.assert_close(output, x + 6)
 
-    @xfailIfPallas("shape broadcasting mismatch in nested loop phi-node patterns")
     def test_variable_assignment_phi_nodes(self):
         """Test for phi node issue with variable assignments like U1 = two_x.
 
@@ -1218,7 +1259,6 @@ class TestLoops(RefEagerTestBase, TestCase):
         )  # Original dim 1 = second fastest varying
         self.assertIn("offset_0 = pid_2", code)  # Original dim 0 = slowest varying
 
-    @xfailIfPallas("BlockSpec shape mismatch with hl.full dynamic fill")
     def test_full_with_dynamic_fill_value(self):
         """Test hl.full with dynamic fill value from scalar tensor."""
 
@@ -1245,7 +1285,6 @@ class TestLoops(RefEagerTestBase, TestCase):
         expected = x + fill_value[0]
         torch.testing.assert_close(result, expected)
 
-    @xfailIfPallas("Mosaic compilation error with nested loop accumulator pattern")
     def test_nested_loop_accumulator(self):
         """Test variable scoping with nested loops and accumulator pattern."""
 
@@ -1389,6 +1428,23 @@ class TestLoops(RefEagerTestBase, TestCase):
         # Logic for modifying num_stages and loop unrolling factors should
         # change num_stages=1
         self.assertIn("num_stages=1", code)
+
+    def test_loop_with_symbolic_bounds(self):
+        @helion.kernel(
+            config=helion.Config(
+                block_sizes=[128, 128, 1],
+            )
+        )
+        def fn(x) -> torch.Tensor:
+            m, n = x.shape
+            out = torch.zeros([m, n], dtype=torch.float32, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                for inner_n in hl.tile(tile_n.begin, tile_n.end):
+                    out[tile_m, inner_n] = x[tile_m, inner_n]
+            return out
+
+        x = torch.randn(128, 1024, dtype=torch.float32, device=DEVICE)
+        torch.testing.assert_close(fn(x), x)
 
 
 if __name__ == "__main__":

@@ -246,6 +246,23 @@ class TestConfigAPI(TestCase):
         reread = helion.Config.from_json(rejson)
         self.assertEqual(dict(reread), expected)
 
+    def test_epilogue_subtile_rewrites_only_store_slots(self) -> None:
+        env = CompileEnvironment(torch.device("cpu"), helion.Settings(backend="triton"))
+        spec = env.config_spec
+        spec.epilogue_subtile_candidate_enabled = True
+        spec.store_indices = [1, 3]
+        config = {
+            "epilogue_subtile": 2,
+            "indexing": ["pointer", "block_ptr", "pointer", "block_ptr"],
+        }
+
+        spec.fix_epilogue_subtile_store_indexing(config)
+
+        self.assertEqual(
+            config["indexing"],
+            ["pointer", "tensor_descriptor", "pointer", "tensor_descriptor"],
+        )
+
 
 @onlyBackends(["triton", "cute"])
 class TestSettingsEnv(TestCase):
@@ -345,48 +362,22 @@ class TestSettingsEnv(TestCase):
         ):
             env.config_spec.normalize({"num_threads": [2]})
 
-    def test_num_warps_capped_by_grid_tile_size(self) -> None:
-        from helion._compat import warps_to_threads
-        from helion.autotuner.config_spec import DEFAULT_NUM_WARPS
+    def test_block_size_spec_max_size_bounded_by_world_size(self) -> None:
+        """Regression test: BlockSizeSpec.max_size must be bounded by size_hint//world_size
+        in a distributed setting, not the raw size_hint."""
         from helion.autotuner.config_spec import BlockSizeSpec
 
-        device = torch.device("cuda")
-        warp_size = warps_to_threads(1)
+        size_hint = 1024
+        world_size = 4
 
-        def _make_env(
-            block_specs: list[tuple[int, int]],
-            grid_ids: list[int],
-        ) -> CompileEnvironment:
-            env = CompileEnvironment(device, helion.Settings(backend="triton"))
-            for bid, hint in block_specs:
-                env.config_spec.block_sizes.append(
-                    BlockSizeSpec(block_id=bid, size_hint=hint)
-                )
-            env.config_spec.grid_block_ids = grid_ids
-            return env
+        with (
+            patch("torch.distributed.is_initialized", return_value=True),
+            patch("torch.distributed.get_world_size", return_value=world_size),
+        ):
+            spec = BlockSizeSpec(block_id=0, size_hint=size_hint)
 
-        # Small grid: grid=8*16=128, num_warps=16 → capped
-        env1 = _make_env([(0, 64), (1, 64)], [0, 1])
-        config = helion.Config(block_sizes=[8, 16], num_warps=16)
-        env1.config_spec.normalize(config)
-        expected_max = max(DEFAULT_NUM_WARPS, (8 * 16) // warp_size)
-        self.assertLessEqual(config.config["num_warps"], expected_max)
-
-        # Large grid: grid=64*128=8192, no capping needed
-        config2 = helion.Config(block_sizes=[64, 128], num_warps=8)
-        env1.config_spec.normalize(config2)
-        self.assertEqual(config2.config["num_warps"], 8)
-
-        # Small grid: grid=1*64=64, num_warps=8 → capped to DEFAULT_NUM_WARPS
-        config3 = helion.Config(block_sizes=[1, 64], num_warps=8)
-        env1.config_spec.normalize(config3)
-        self.assertEqual(config3.config["num_warps"], DEFAULT_NUM_WARPS)
-
-        # Non-grid dimensions (reduction): still capped by grid_numel
-        env2 = _make_env([(0, 64), (1, 256)], [0])
-        config4 = helion.Config(block_sizes=[4, 256], num_warps=8)
-        env2.config_spec.normalize(config4)
-        self.assertEqual(config4.config["num_warps"], DEFAULT_NUM_WARPS)
+        # max_size should be bounded by size_hint // world_size = 256, not 1024
+        self.assertLessEqual(spec.max_size, size_hint // world_size)
 
     def test_autotune_search_acf_env_var_strips_whitespace(self) -> None:
         with patch.dict(

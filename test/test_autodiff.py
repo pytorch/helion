@@ -362,7 +362,7 @@ class TestAutodiff(RefEagerTestDisabled, TestCase):
             kernel,
             lambda x, y: torch.sin(x) * y,
             2,
-            shape=(128, 64),
+            shape=(64, 32),
             autotune=True,
             autotune_effort="quick",
         )

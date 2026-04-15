@@ -339,6 +339,7 @@ def _(
 
     results = []
     has_data_dependent_bounds = False
+    has_symbolic_bounds = False
     for begin_part, end_part, bs in zip(
         begin_list,
         end_list,
@@ -353,21 +354,20 @@ def _(
         if isinstance(size, torch.Tensor):
             size = None  # data dependent size
             has_data_dependent_bounds = True
+        if isinstance(begin_part, torch.SymInt) or isinstance(end_part, torch.SymInt):
+            has_symbolic_bounds = True
         if bs is None:
             results.append(TileIndexType.allocate(size, origin))
         elif isinstance(bs, int):
             results.append(TileIndexType.allocate(size, origin, bs))
         elif isinstance(bs, torch.SymInt):
-            from .._compiler.compile_environment import CompileEnvironment
-
-            index = CompileEnvironment.current().get_block_id(bs)
+            env = CompileEnvironment.current()
+            index = env.get_block_id(bs)
             if index is None:
                 results.append(TileIndexType.allocate(size, origin, bs))
             else:
                 results.append(TileIndexType(origin=origin, block_id=index))
-                CompileEnvironment.current().block_sizes[index].mark_alternate_size(
-                    size
-                )
+                env.block_sizes[index].mark_alternate_size(size)
 
     _add_config_choices(
         [x.block_id for x in results],
@@ -380,6 +380,7 @@ def _(
             )
         ],
         has_data_dependent_bounds=has_data_dependent_bounds,
+        has_symbolic_bounds=has_symbolic_bounds,
     )
     # pyrefly: ignore [unbound-name]
     if unpack:
@@ -396,6 +397,7 @@ def _add_config_choices(
     has_begin: bool = False,
     allow_static_ranges: list[bool] | None = None,
     has_data_dependent_bounds: bool = False,
+    has_symbolic_bounds: bool = False,
 ) -> None:
     config_spec = CompileEnvironment.current().config_spec
 
@@ -427,12 +429,17 @@ def _add_config_choices(
         # just one set of choices for when we have persistent kernel loop
         _add_config_range_choice(block_ids)
     else:
+        if config_spec.backend_name == "pallas":
+            config_spec.has_pallas_inner_loops = True
         if allow_static_ranges is None:
             allow_static_ranges = [False] * len(block_ids)
         for block_id, allow_static_range in zip(
             block_ids, allow_static_ranges, strict=True
         ):
             _add_config_range_choice([block_id], allow_static_range=allow_static_range)
+
+        if has_symbolic_bounds and config_spec.backend_name == "pallas":
+            config_spec.has_pallas_symbolic_bounds = True
 
 
 def _add_config_range_choice(
@@ -550,7 +557,7 @@ def _(
             bs_list = bs_list * len(begin_list)
 
     # Build tile ranges for each dimension
-    dim_ranges: list[list[tuple[int, int, int]]] = []
+    dim_ranges: list[list[tuple[int, int, int, int, int]]] = []
     for b, e, bs in zip(begin_list, end_list, bs_list, strict=True):
         b_int, e_int = _to_int(b), _to_int(e)
         assert b_int is not None and e_int is not None
@@ -559,7 +566,10 @@ def _(
         bs_int = _to_int(bs) if bs is not None else (e_int - b_int)
         assert bs_int is not None
         dim_ranges.append(
-            [(s, min(s + bs_int, e_int), bs_int) for s in range(b_int, e_int, bs_int)]
+            [
+                (s, min(s + bs_int, e_int), bs_int, b_int, e_int)
+                for s in range(b_int, e_int, bs_int)
+            ]
         )
 
     if not dim_ranges:

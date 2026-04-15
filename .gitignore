@@ -3,6 +3,7 @@
 *.bak
 benchmarks/tritonbench
 *.bzl
+.build-wheels
 .cache
 .clangd
 core.[1-9]*

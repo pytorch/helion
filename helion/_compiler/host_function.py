@@ -89,6 +89,7 @@ class HostFunction:
         self.expr_to_origin: dict[sympy.Expr, SymbolOrigin] = {}
         self.tensor_to_origin: dict[torch.Tensor, Origin] = {}
         self.global_imports: dict[str, GlobalImport] = {}
+        self.rng_seed_slot_count = 0
         with self:
             with measure("HostFunction.parse_ast"):
                 source_indented = inspect.getsource(fn)
@@ -96,7 +97,14 @@ class HostFunction:
                 self.column_offset: int = source_indented.index(source[0])
                 root = ast.parse(source)
                 assert isinstance(root, ast.Module)
-                (root,) = root.body
+                function_defs = [
+                    stmt for stmt in root.body if isinstance(stmt, ast.FunctionDef)
+                ]
+                assert len(function_defs) == 1, (
+                    f"expected one function definition in parsed source, got "
+                    f"{[type(stmt).__name__ for stmt in root.body]}"
+                )
+                (root,) = function_defs
                 root = ast_extension.convert(root)
                 assert isinstance(root, ast.FunctionDef)
                 assert isinstance(root, ast_extension.ExtendedAST)
@@ -213,6 +221,11 @@ class HostFunction:
     def __repr__(self) -> str:
         return f"<HostFunction {self.name}>"
 
+    def allocate_rng_seed_slot(self) -> int:
+        seed_slot = self.rng_seed_slot_count
+        self.rng_seed_slot_count += 1
+        return seed_slot
+
     def set_local_types(self, local_types: dict[str, TypeInfo]) -> None:
         fn = HostFunction.current()
         self.local_types = local_types
@@ -221,7 +234,9 @@ class HostFunction:
 
     def sympy_expr(self, expr: sympy.Expr) -> str:
         env = CompileEnvironment.current()
-        expr = env.specialize_expr(env.shape_env.simplify(expr))
+        with contextlib.suppress(Exception):
+            expr = env.shape_env.simplify(expr)
+        expr = env.specialize_expr(expr)
         if not expr.free_symbols:
             return pexpr(expr)
         if expr in self.expr_to_origin:

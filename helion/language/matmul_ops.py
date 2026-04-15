@@ -12,18 +12,32 @@ from .._compat import min_dot_size
 from .._compiler.compile_environment import CompileEnvironment
 from .._compiler.compile_environment import format_shape
 from .._compiler.cute.indexing import CutePackedAffineLoad
-from .._compiler.cute.indexing import match_cute_duplicate_stack_reshape_rhs
+from .._compiler.cute.indexing import CutePackedTerms
 from .._compiler.cute.matmul_fallback import _emit_cute_matmul
+from .._compiler.cute.matmul_utils import cute_lower_rhs_for_matmul
+from .._compiler.cute.matmul_utils import cute_outer_accumulates_result
+from .._compiler.cute.matmul_utils import cute_outer_accumulator_dtype
+from .._compiler.cute.matmul_utils import cute_outer_accumulator_out_dtype
+from .._compiler.cute.matmul_utils import cute_resolve_active_block_id
+from .._compiler.cute.matmul_utils import cute_resolve_active_matmul_k_block_id
+from .._compiler.cute.matmul_utils import cute_static_k_invariant_extent
 from .._compiler.matmul_utils import _compute_out_dtype
 from .._compiler.matmul_utils import _emit_pallas_matmul
 from .._compiler.matmul_utils import _emit_tl_dot_scaled
 from .._compiler.matmul_utils import _needs_f32_accumulator
 from .._compiler.matmul_utils import emit_tl_dot_with_padding
 from . import _decorators
-from ._tracing_ops import _new_var
 
 if TYPE_CHECKING:
     from .._compiler.inductor_lowering import CodegenState
+
+
+def _cute_dot_outer_accumulates_result(fx_node: object, *, is_acc_none: bool) -> bool:
+    if not isinstance(fx_node, torch.fx.Node):
+        fx_node = getattr(fx_node, "fx_node", fx_node)
+    if not isinstance(fx_node, torch.fx.Node):
+        fx_node = None
+    return cute_outer_accumulates_result(fx_node, is_acc_none=is_acc_none)
 
 
 @_decorators.api(is_device_only=True)
@@ -85,33 +99,6 @@ def _cute_mma_matches_dot_semantics(
     if not _needs_f32_accumulator(lhs_dtype, rhs_dtype):
         return True
     return out_dtype in (None, torch.float32) and acc_dtype in (None, torch.float32)
-
-
-def _cute_dot_outer_accumulates_result(state: CodegenState, is_acc_none: bool) -> bool:
-    if not is_acc_none or state.fx_node is None:
-        return False
-    users = [user for user in state.fx_node.users if isinstance(user, torch.fx.Node)]
-    if len(users) != 1:
-        return False
-    (user,) = users
-    if user.target != torch.ops.aten.add.Tensor or len(user.args) < 2:
-        return False
-    lhs, rhs = user.args[:2]
-    if lhs is state.fx_node:
-        other_arg = rhs
-    elif rhs is state.fx_node:
-        other_arg = lhs
-    else:
-        return False
-    if not (isinstance(other_arg, torch.fx.Node) and other_arg.target == _new_var):
-        return False
-    stack_trace = user.meta.get("stack_trace")
-    if not isinstance(stack_trace, str):
-        return False
-    source_lines = [line.strip() for line in stack_trace.splitlines() if line.strip()]
-    if not source_lines:
-        return False
-    return "+=" in source_lines[-1]
 
 
 @_decorators.prepare_args(dot)
@@ -232,12 +219,24 @@ def enforce_dot_requirements(lhs: torch.Tensor, rhs: torch.Tensor) -> None:
     for shape, min_size in ((m, a), (n, b), (k, c)):
         block_idx = env.get_block_id(shape)
         if block_idx is not None:
+            # On Pallas, clamp min to the tensor dimension so we don't
+            # force blocks larger than the tensor (Pallas BlockSpecs can't
+            # handle that, unlike Triton which masks out-of-bounds accesses).
+            # The dot-level padding in matmul_utils.py will pad the smaller
+            # tile up to min_dot_size at codegen time.
+            if env.backend_name == "pallas":
+                try:
+                    bspec = env.config_spec.block_sizes.block_id_lookup(block_idx)
+                    min_size = min(min_size, bspec.size_hint)
+                except KeyError:
+                    pass
             env.block_sizes[block_idx].update_min_block(min_size, allow_flattened=True)
 
     # Triton only supports 2D dot operations.  When the operands are 3D
     # (batched matmul), constrain the batch dimension block size to 1 so
     # the codegen can squeeze it away before emitting tl.dot.
-    if len(lshape) == 3:
+    # Pallas uses jnp.matmul which handles batched matmul natively.
+    if len(lshape) == 3 and env.backend_name != "pallas":
         for batch_dim in (lshape[0], rshape[0]):
             block_idx = env.get_block_id(batch_dim)
             if block_idx is not None:
@@ -329,9 +328,12 @@ def _(state: CodegenState) -> object:
     acc_proxy = state.proxy_args[2] if len(state.proxy_args) > 2 else None
     out_dtype_proxy = state.proxy_args[3] if len(state.proxy_args) > 3 else None
 
-    lhs_ast = state.ast_arg(0)
+    lhs_ast = state.ast_args[0]
+    if isinstance(lhs_ast, int | float | bool | None):
+        lhs_ast = ast.Constant(value=lhs_ast)
     rhs_ast = state.ast_arg(1)
     acc_ast = state.ast_arg(2)
+    assert isinstance(lhs_ast, (ast.AST, CutePackedAffineLoad))
 
     is_acc_none = isinstance(acc_ast, ast.Constant) and acc_ast.value is None
 
@@ -366,28 +368,74 @@ def _(state: CodegenState) -> object:
         rhs_proxy.dtype,
         acc_dtype,
     )
-    k_block_id = CompileEnvironment.current().resolve_block_id(lhs_proxy.shape[-1])
+    outer_acc_dtype = cute_outer_accumulator_dtype(
+        state.fx_node,
+        is_acc_none=is_acc_none,
+    )
+    effective_out_dtype = cute_outer_accumulator_out_dtype(
+        resolved_out_dtype,
+        outer_acc_dtype,
+    )
+    k_block_id = cute_resolve_active_matmul_k_block_id(
+        state.codegen,
+        lhs_proxy.shape[-1],
+        rhs_proxy.shape[-2],
+        rhs_proxy.shape[-1],
+    )
+    packed_rhs = None
     if (
         k_block_id is None
         and state.fx_node is not None
         and len(state.fx_node.args) >= 2
         and isinstance(rhs_node := state.fx_node.args[1], torch.fx.Node)
-        and (packed_rhs := match_cute_duplicate_stack_reshape_rhs(rhs_node))
     ):
-        packed_node, _ = packed_rhs
-        k_block_id = CompileEnvironment.current().resolve_block_id(
-            packed_node.meta["val"].shape[0]
+        rhs_ast, packed_rhs = cute_lower_rhs_for_matmul(
+            state.env,
+            lhs_ast,
+            rhs_node,
+            rhs_ast,
+        )
+    if k_block_id is None and packed_rhs is not None:
+        packed_nodes, _ = packed_rhs
+        packed_node = packed_nodes[0]
+        k_block_id = cute_resolve_active_block_id(
+            state.codegen, packed_node.meta["val"].shape[0]
+        )
+    assert isinstance(rhs_ast, (ast.AST, CutePackedTerms))
+    static_k_extent = None
+    if k_block_id is None and state.fx_node is not None:
+        lhs_node = state.fx_node.args[0] if len(state.fx_node.args) > 0 else None
+        rhs_node = state.fx_node.args[1] if len(state.fx_node.args) > 1 else None
+        if isinstance(lhs_node, torch.fx.Node) and isinstance(rhs_node, torch.fx.Node):
+            static_k_extent = cute_static_k_invariant_extent(lhs_node, rhs_node)
+    env = CompileEnvironment.current()
+    size_hint = getattr(env, "size_hint", None)
+
+    def hinted(size: int | torch.SymInt) -> int:
+        if callable(size_hint):
+            hinted_size = size_hint(size)
+            assert isinstance(hinted_size, int)
+            return hinted_size
+        return int(size)
+
+    k_is_one = hinted(lhs_proxy.shape[-1]) == 1 and hinted(rhs_proxy.shape[-2]) == 1
+    if static_k_extent is None and k_block_id is None and not k_is_one:
+        raise exc.BackendUnsupported(
+            "cute",
+            "CuTe scalar matmul fallback requires an active K tile or a K-invariant static shortcut",
         )
     return _emit_cute_matmul(
         state.codegen,
         lhs_ast,
         rhs_ast,
-        accumulate_in_lane_loop=not _cute_dot_outer_accumulates_result(
-            state, is_acc_none
+        accumulate_in_lane_loop=not cute_outer_accumulates_result(
+            state.fx_node,
+            is_acc_none=is_acc_none,
         ),
         k_block_id=k_block_id,
+        static_k_extent=static_k_extent,
         acc=None if is_acc_none else acc_ast,
-        out_dtype=resolved_out_dtype,
+        out_dtype=effective_out_dtype,
         acc_dtype=acc_dtype,
         lhs_dtype=lhs_proxy.dtype,
         rhs_dtype=rhs_proxy.dtype,

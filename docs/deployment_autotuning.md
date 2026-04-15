@@ -118,7 +118,7 @@ starting configs are generated:
 | Effort | Initial Population Strategy | Use Case |
 |--------|---------------------------|----------|
 | `"none"` | N/A (no autotuning) | Development iteration — uses the default config only |
-| `"quick"` | `from_default` | Fast development tuning — starts from the default config and perturbs around it |
+| `"quick"` | `from_best_available` (no random padding) | Fast development tuning — reuses cached configs and default, no random exploration |
 | `"full"` | `from_random` | Production tuning — explores the full search space randomly |
 
 Set the effort via the decorator or an environment variable:
@@ -134,8 +134,8 @@ export HELION_AUTOTUNE_EFFORT=quick
 ```
 
 The `"quick"` preset is a practical middle ground: it seeds the initial
-population with a single configuration (the default) and runs a short
-search that perturbs around that starting point.  A typical `quick` run
+population with the default configuration plus any matching cached configs
+from prior runs, without adding random exploration.  A typical `quick` run
 finishes in seconds (e.g. ~3s / ~32 configs for a simple kernel),
 compared to `"full"` which generates a large random initial population
 and runs many more generations (often ~10 minutes).
@@ -148,14 +148,12 @@ its starting set of configurations before beginning the search:
 - **`from_random`** (default for `"full"`): Generates a fully random
   initial population, maximizing diversity in the search space.
 
-- **`from_default`** (default for `"quick"`): Seeds the initial
-  population with only the default configuration. The search algorithm
-  then perturbs around this single starting point, converging faster but
-  exploring a narrower region of the search space.
-
-- **`from_best_available`**: Seeds the initial population with the
-  default configuration plus the best configs from previous autotuning
-  runs found in the local cache.  This strategy is useful when:
+- **`from_best_available`** (default for `"quick"`): Seeds the initial
+  population with the default configuration plus the best configs from
+  previous autotuning runs found in the local cache.  When used with the
+  `"full"` effort, the remainder of the population budget is filled with
+  random configs.  When used with `"quick"`, only the default and cached
+  configs are used (no random padding).  This strategy is useful when:
 
   - You are **iterating on a kernel** and want to warm-start from what
     previously worked rather than searching from scratch.

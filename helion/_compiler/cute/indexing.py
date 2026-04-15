@@ -30,6 +30,11 @@ class CutePackedAffineLoad:
 
 
 @dataclasses.dataclass(frozen=True)
+class CutePackedTerms:
+    terms: tuple[ast.AST, ...]
+
+
+@dataclasses.dataclass(frozen=True)
 class CuteShapeChainView:
     node: Node
 
@@ -39,6 +44,7 @@ _CUTE_SHAPE_CHAIN_TARGETS = frozenset(
         torch.ops.aten.reshape.default,
         torch.ops.aten._unsafe_view.default,
         torch.ops.aten.view.default,
+        torch.ops.aten.expand.default,
         torch.ops.aten.permute.default,
         torch.ops.aten.unsqueeze.default,
         torch.ops.aten.squeeze.dim,
@@ -114,7 +120,7 @@ def unwrap_cute_affine_range_index(value: object) -> CuteAffineRangeIndex | None
     return None
 
 
-def match_cute_duplicate_stack_reshape_rhs(node: Node) -> tuple[Node, int] | None:
+def match_cute_stack_reshape_rhs(node: Node) -> tuple[tuple[Node, ...], int] | None:
     current = node
     while current.op == "call_function" and current.target in (
         torch.ops.aten.reshape.default,
@@ -147,6 +153,15 @@ def match_cute_duplicate_stack_reshape_rhs(node: Node) -> tuple[Node, int] | Non
         dim %= first_val.ndim + 1
     if dim != expected_dim:
         return None
+    return tuple(cast("Node", tensor) for tensor in tensors), len(tensors)
+
+
+def match_cute_duplicate_stack_reshape_rhs(node: Node) -> tuple[Node, int] | None:
+    matched = match_cute_stack_reshape_rhs(node)
+    if matched is None:
+        return None
+    tensors, factor = matched
+    first = tensors[0]
     if not all(tensor == first for tensor in tensors[1:]):
         return None
-    return first, len(tensors)
+    return first, factor

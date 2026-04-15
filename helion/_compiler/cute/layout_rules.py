@@ -63,7 +63,7 @@ def preferred_constraint_for_node(
         return _constraint_for_store(node, tile_strategy)
     if node.target is reduce_ops._reduce:
         return _constraint_for_reduce(node, tile_strategy)
-    if node.target is _tracing_ops._for_loop:
+    if _tracing_ops.is_for_loop_target(node.target):
         return None  # control flow -- handled at graph level
     # Pointwise / aten ops: unconstrained, inherit from inputs
     return None

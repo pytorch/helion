@@ -9,14 +9,16 @@ from typing import Callable
 from typing import TypeVar
 
 import torch
-import torch.distributed as dist
 
+from ..runtime.settings import _get_backend
+from ..runtime.settings import is_pallas_interpret
 from .progress_bar import iter_with_progress
+from helion._dist_utils import sync_object
 
 T = TypeVar("T")
 
 
-def _synchronize(result: object) -> None:
+def synchronize_device(result: object = None) -> None:
     """Wait for device computation to complete.
 
     For TPU tensors, uses ``torch_tpu``'s tensor-level sync which truly
@@ -38,7 +40,12 @@ def _synchronize(result: object) -> None:
                 "Install torch_tpu or torch.accelerator.synchronize() will return "
                 "before device computation finishes, producing incorrect benchmarks."
             ) from None
-    torch.accelerator.synchronize()
+    if (
+        not is_pallas_interpret()
+        and _get_backend() != "pallas"
+        and torch.accelerator.is_available()
+    ):
+        torch.accelerator.synchronize()
 
 
 def compute_repeat(
@@ -94,12 +101,12 @@ def compute_repeat_generic(
     """
     # Warm the pipeline once before collecting timing samples.
     out = fn()
-    _synchronize(out)
+    synchronize_device(out)
 
     start = time.perf_counter()
     for _ in range(estimate_runs):
         out = fn()
-    _synchronize(out)
+    synchronize_device(out)
     end = time.perf_counter()
 
     estimate_ms = (end - start) * 1000 / max(estimate_runs, 1)
@@ -181,7 +188,7 @@ def interleaved_bench_generic(
     out: object = None
     for fn in fns:
         out = fn()
-    _synchronize(out)
+    synchronize_device(out)
 
     all_times: list[list[float]] = [[] for _ in range(len(fns))]
 
@@ -193,27 +200,14 @@ def interleaved_bench_generic(
     )
     for _i in iterator:
         for j in range(len(fns)):
-            _synchronize(out)
+            synchronize_device(out)
             start = time.perf_counter()
             out = fns[j]()
-            _synchronize(out)
+            synchronize_device(out)
             end = time.perf_counter()
             all_times[j].append((end - start) * 1000)  # convert to ms
 
     return [statistics.median(times) for times in all_times]
-
-
-def sync_object(obj: T) -> T:
-    r"""
-    Synchronize the number of repeations across all ranks.
-    """
-    if not dist.is_initialized():
-        return obj
-
-    object_list = [obj]
-    # use the value from rank 0
-    dist.broadcast_object_list(object_list, 0)
-    return object_list[0]
 
 
 def _summarize_statistics_fallback(
@@ -252,6 +246,7 @@ def do_bench(
     grad_to_none: torch.Tensor | None = None,
     quantiles: list[float] | None = None,
     return_mode: str = "mean",
+    process_group_name: str | None = None,
 ) -> float | tuple[float, ...]:
     """
     Benchmark the runtime of the provided function. By default, return the median runtime of :code:`fn` along with
@@ -291,7 +286,9 @@ def do_bench(
         fn()
     end_event.record()
     di.synchronize()
-    estimate_ms = sync_object(start_event.elapsed_time(end_event) / 5)
+    estimate_ms = sync_object(
+        start_event.elapsed_time(end_event) / 5, process_group_name=process_group_name
+    )
 
     # compute number of warmup and repeat
     n_warmup = max(1, int(warmup / estimate_ms))
@@ -328,6 +325,7 @@ def do_bench_generic(
     grad_to_none: torch.Tensor | None = None,
     quantiles: list[float] | None = None,
     return_mode: str = "mean",
+    process_group_name: str | None = None,
 ) -> float | tuple[float, ...]:
     """
     Benchmark using wall-clock timing for backends without Triton event timing.
@@ -335,16 +333,18 @@ def do_bench_generic(
     assert return_mode in ["min", "max", "mean", "median", "all"]
 
     out = fn()
-    _synchronize(out)
+    synchronize_device(out)
 
     # Estimate the runtime of the function
-    _synchronize(out)
+    synchronize_device(out)
     start = time.perf_counter()
     for _ in range(5):
         out = fn()
-    _synchronize(out)
+    synchronize_device(out)
     end = time.perf_counter()
-    estimate_ms = sync_object((end - start) * 1000 / 5)
+    estimate_ms = sync_object(
+        (end - start) * 1000 / 5, process_group_name=process_group_name
+    )
 
     # compute number of warmup and repeat
     n_warmup = max(1, int(warmup / estimate_ms))
@@ -358,10 +358,10 @@ def do_bench_generic(
         if grad_to_none is not None:
             for x in grad_to_none:
                 x.grad = None
-        _synchronize(out)
+        synchronize_device(out)
         t0 = time.perf_counter()
         out = fn()
-        _synchronize(out)
+        synchronize_device(out)
         t1 = time.perf_counter()
         times.append((t1 - t0) * 1000)  # convert to ms
     return _summarize_statistics_fallback(times, quantiles, return_mode)

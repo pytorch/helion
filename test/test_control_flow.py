@@ -15,7 +15,6 @@ from helion._testing import onlyBackends
 from helion._testing import skipIfPallas
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfTileIR
-from helion._testing import xfailIfPallas
 import helion.language as hl
 
 
@@ -45,7 +44,35 @@ class TestControlFlow(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, torch.sin(x))
         self.assertEqual(code0, code1)
 
-    @xfailIfPallas("tensor-derived predicates unsupported on Pallas")
+    @skipIfTileIR("result tensor mismatch in tileIR")
+    def test_if_branch_modifies_nonlocal_var(self):
+        @helion.kernel()
+        def fn(x, v):
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size()):
+                delta = torch.zeros_like(x[tile])
+                if 3 < v < 7:
+                    delta += 1.0
+                    out[tile] = torch.sigmoid(x[tile])
+                else:
+                    delta += 2.0
+                    out[tile] = torch.sin(x[tile])
+                out[tile] = out[tile] + delta
+            return out
+
+        x = torch.randn([512, 512], device=DEVICE)
+        code0, result = code_and_output(
+            fn,
+            (x, 5),
+        )
+        torch.testing.assert_close(result, torch.sigmoid(x) + 1.0)
+        code1, result = code_and_output(
+            fn,
+            (x, 10),
+        )
+        torch.testing.assert_close(result, torch.sin(x) + 2.0)
+        self.assertEqual(code0, code1)
+
     def test_if_arg_indexed_scalar(self):
         @helion.kernel
         def fn(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -279,9 +306,6 @@ class TestControlFlow(RefEagerTestBase, TestCase):
             rtol=1e-4,
         )
 
-    @skipIfPallas(
-        "Pallas lowering fails on getitem for host-bool-gated static_range if branches"
-    )
     def test_if_new_variable_in_static_range(self):
         """Test that variables defined inside if/else within static_range work correctly.
 

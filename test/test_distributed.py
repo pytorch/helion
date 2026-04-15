@@ -10,6 +10,7 @@ from torch import Tensor
 from torch._C._distributed_c10d import _SymmetricMemory
 import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm_mem
+from torch.distributed.device_mesh import init_device_mesh
 from torch.testing._internal.common_distributed import MultiProcessTestCase
 from torch.testing._internal.common_distributed import skip_if_lt_x_gpu
 from torch.testing._internal.common_utils import instantiate_parametrized_tests
@@ -18,6 +19,7 @@ from torch.testing._internal.common_utils import run_tests
 
 import helion
 from helion._dist_utils import all_gather_object
+from helion._dist_utils import sync_object
 from helion._dist_utils import sync_seed
 from helion._testing import EXAMPLES_DIR
 from helion._testing import TestCase
@@ -174,19 +176,20 @@ class TestDistributed(TestCase, MultiProcessTestCase):
 
         self._init_process()
         torch.manual_seed(42 + self.rank)
+        pg_name = dist.group.WORLD.group_name
 
         x = torch.randn(1024, device=self.device)
-        xlist = all_gather_object(x)
+        xlist = all_gather_object(x, pg_name)
 
         self.assertFalse(_all_eq(xlist))
 
-        with sync_seed():
+        with sync_seed(process_group_name=pg_name):
             x = torch.randn(1024, device=self.device)
-        xlist = all_gather_object(x)
+        xlist = all_gather_object(x, pg_name)
         self.assertTrue(_all_eq(xlist))
 
         x = torch.randn(1024, device=self.device)
-        xlist = all_gather_object(x)
+        xlist = all_gather_object(x, pg_name)
         self.assertFalse(_all_eq(xlist))
 
         self._cleanup_process()
@@ -421,6 +424,163 @@ class TestDistributed(TestCase, MultiProcessTestCase):
 
         expected = ref_kernel(a, b)
 
+        torch.testing.assert_close(result, expected, rtol=1e-1, atol=1e-1)
+
+    @skipIfRocm("Distributed example requires CUDA/NCCL")
+    @skipIfXPU("Distributed operations require CCL, not yet fully integrated")
+    @skip_if_lt_x_gpu(4)
+    def test_fp8_matmul_reduce_scatter(self):
+        if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 9:
+            self.skipTest("FP8 requires CUDA compute capability >= 9.0")
+        self._init_process()
+
+        mod = import_path(EXAMPLES_DIR / "distributed" / "fp8_matmul_reduce_scatter.py")
+
+        _SymmetricMemory.signal_pad_size = 1024 * 1024 * 16
+        M, N, K = 512, 768, 1024
+
+        torch.manual_seed(42 + self.rank)
+        a = torch.randn(M, K, device=self.device).to(torch.float8_e4m3fn)
+
+        torch.manual_seed(42)
+        b = (
+            torch.randn(K, N, device=self.device)
+            .to(torch.float8_e4m3fn)
+            .t()
+            .contiguous()
+            .t()
+        )
+
+        scale_a = torch.rand(M, 1, device=self.device)
+        scale_b = torch.rand(1, N, device=self.device)
+
+        symm_mem_buffer = symm_mem.empty(M, N, dtype=torch.bfloat16, device=self.device)
+        symm_mem_hdl = symm_mem.rendezvous(symm_mem_buffer, dist.group.WORLD.group_name)
+
+        result = mod.fp8_matmul_reduce_scatter_kernel(
+            a,
+            b,
+            scale_a,
+            scale_b,
+            symm_mem_buffer,
+            symm_mem_hdl.signal_pad_ptrs_dev,
+            RANK=symm_mem_hdl.rank,
+            WORLD_SIZE=symm_mem_hdl.world_size,
+            GROUP_NAME=dist.group.WORLD.group_name,
+        )
+
+        expected = mod.reference_fp8_matmul_reduce_scatter(a, b, scale_a, scale_b)
+
+        torch.testing.assert_close(result, expected, rtol=8e-1, atol=8e-1)
+        self._cleanup_process()
+
+    @skipIfRocm("Distributed example requires CUDA/NCCL")
+    @skipIfXPU("Distributed operations require CCL, not yet fully integrated")
+    @skip_if_lt_x_gpu(4)
+    def test_two_dim_parallel_matmul(self):
+        self._init_process()
+        mod = import_path(EXAMPLES_DIR / "distributed" / "two_dim_parallel_matmul.py")
+        _SymmetricMemory.signal_pad_size = 1024 * 1024 * 16
+
+        tp_size = 2
+        sp_size = self.world_size // tp_size
+        mesh = init_device_mesh(
+            "cuda",
+            (sp_size, tp_size),
+            mesh_dim_names=("sp", "tp"),
+        )
+        tp_group = mesh.get_group("tp")
+        sp_rank = self.rank // tp_size
+        tp_rank = self.rank % tp_size
+
+        kernel = mod.two_dim_parallel_matmul_kernel.fn
+        kernel = helion.kernel(
+            kernel, ignore_warnings=[helion.exc.TensorOperationInWrapper]
+        )
+        context = unittest.mock.patch.dict(
+            os.environ, {"HELION_AUTOTUNER": "LFBOTreeSearch"}
+        )
+
+        with context:
+            self.do_test_two_dim_parallel_matmul(
+                kernel,
+                mod.reference_two_dim_parallel_matmul,
+                tp_group,
+                sp_rank,
+                tp_rank,
+                tp_size,
+                sp_size,
+            )
+        self._cleanup_process()
+
+    def do_test_two_dim_parallel_matmul(
+        self,
+        helion_fn,
+        ref_fn,
+        tp_group,
+        sp_rank,
+        tp_rank,
+        tp_size,
+        sp_size,
+    ):
+        M, K, N = 512, 256, 512
+        dtype = torch.float32
+
+        M_local = M // sp_size
+        K_local = K // tp_size
+
+        torch.manual_seed(42 + sp_rank * tp_size + tp_rank)
+        a_local = torch.randn(M_local, K_local, dtype=dtype, device=self.device)
+
+        torch.manual_seed(42 + tp_rank)
+        b_local = torch.randn(K_local, N, dtype=dtype, device=self.device)
+
+        tp_group_name = tp_group.group_name  # type: ignore[missing-attribute]
+        self.assertIsNotNone(tp_group_name)
+        self.assertEqual(dist.get_world_size(tp_group), 2)
+        self.assertEqual(dist.get_world_size(), 4)
+
+        symm_mem_buf = symm_mem.empty(M_local, N, dtype=dtype, device=self.device)
+        hdl = symm_mem.rendezvous(symm_mem_buf, tp_group_name)
+
+        import unittest.mock
+
+        with (
+            unittest.mock.patch(
+                "helion._dist_utils.sync_seed", wraps=sync_seed
+            ) as mock_sync_seed,
+            unittest.mock.patch(
+                "helion.autotuner.base_search.all_gather_object",
+                wraps=all_gather_object,
+            ) as mock_all_gather_object,
+            unittest.mock.patch(
+                "helion.autotuner.base_search.sync_object", wraps=sync_object
+            ) as mock_sync_object,
+        ):
+            result = helion_fn(
+                a_local,
+                b_local,
+                symm_mem_buf,
+                hdl.signal_pad_ptrs_dev,
+                TP_RANK=hdl.rank,
+                TP_SIZE=hdl.world_size,
+                GROUP_NAME=tp_group_name,
+            )
+
+        def _assert_pgn_group_size_2(mock: unittest.mock.MagicMock) -> None:
+            mock.assert_called()
+            pg_names = dist.distributed_c10d._world.pg_names  # type: ignore[attr-defined]
+            for call in mock.call_args_list:
+                pgn = call.kwargs.get("process_group_name")
+                self.assertIsNotNone(pgn)
+                group = next(g for g, name in pg_names.items() if name == pgn)
+                self.assertEqual(dist.get_world_size(group), 2)
+
+        _assert_pgn_group_size_2(mock_sync_seed)
+        _assert_pgn_group_size_2(mock_all_gather_object)
+        _assert_pgn_group_size_2(mock_sync_object)
+
+        expected = ref_fn(a_local, b_local, tp_group)
         torch.testing.assert_close(result, expected, rtol=1e-1, atol=1e-1)
 
 

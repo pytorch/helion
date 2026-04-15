@@ -23,6 +23,7 @@ from .ast_extension import statement_from_string
 from .compile_environment import CompileEnvironment
 from .compile_environment import _has_unbacked
 from .compile_environment import _to_sympy
+from .device_function import DeviceFunction
 from .host_function import HostFunction
 from .program_id import FlatProgramIDs
 from .program_id import ForEachProgramID
@@ -37,7 +38,6 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
 
     from ..runtime.config import Config
-    from .device_function import DeviceFunction
     from .inductor_lowering import CodegenState
 
     _T = TypeVar("_T")
@@ -68,8 +68,10 @@ class ThreadAxisTracker:
 
 @dataclasses.dataclass
 class LoopDimInfo:
-    end_var_name: str | None
-    end_expr: sympy.Expr | None
+    begin_var_name: str | None = None
+    begin_expr: sympy.Expr | None = None
+    end_var_name: str | None = None
+    end_expr: sympy.Expr | None = None
 
     def is_end_matching(self, size: int | torch.SymInt) -> bool:
         expected = _to_sympy(size)
@@ -151,12 +153,17 @@ class DeviceGridState(DeviceLoopOrGridState):
     lane_loops: list[tuple[str, object, ...]] = dataclasses.field(  # pyrefly: ignore
         default_factory=list
     )
+    lane_loop_blocks: set[int] = dataclasses.field(default_factory=set)
     lane_setup_statements: list[ast.AST] = dataclasses.field(default_factory=list)
     outer_prefix: list[ast.AST] = dataclasses.field(default_factory=list)
     outer_suffix: list[ast.AST] = dataclasses.field(default_factory=list)
 
     def has_lane_loops(self) -> bool:
         return bool(self.lane_loops)
+
+    def add_lane_loop(self, block_id: int, lane_var: str, extent: int) -> None:
+        self.lane_loops.append((lane_var, extent))
+        self.lane_loop_blocks.add(block_id)
 
     def wrap_body(self, body: list[ast.AST]) -> list[ast.AST]:
         wrapped: list[ast.AST] = [*self.lane_setup_statements, *body]
@@ -191,8 +198,30 @@ class DeviceGridState(DeviceLoopOrGridState):
         return wrapped
 
 
+@dataclasses.dataclass
 class PersistentReductionState(DeviceLoopOrGridState):
-    pass
+    lane_loops: list[tuple[str, int]] = dataclasses.field(default_factory=list)
+    lane_setup_statements: list[ast.AST] = dataclasses.field(default_factory=list)
+    outer_prefix: list[ast.AST] = dataclasses.field(default_factory=list)
+    outer_suffix: list[ast.AST] = dataclasses.field(default_factory=list)
+
+    def has_lane_loops(self) -> bool:
+        return bool(self.lane_loops)
+
+    def wrap_body(self, body: list[ast.AST]) -> list[ast.AST]:
+        wrapped: list[ast.AST] = [*self.lane_setup_statements, *body]
+        for lane_var, extent in reversed(self.lane_loops):
+            wrapped = [
+                create(
+                    ast.For,
+                    target=create(ast.Name, id=lane_var, ctx=ast.Store()),
+                    iter=expr_from_string(f"range({extent})"),
+                    body=wrapped,
+                    orelse=[],
+                    type_comment=None,
+                )
+            ]
+        return wrapped
 
 
 class TileStrategy:
@@ -265,7 +294,7 @@ class TileStrategy:
         )
         num_stages = config.num_stages
 
-        if config.indexing == "tensor_descriptor":
+        if "tensor_descriptor" in config.indexing:
             # Tensor descriptor + multi-stage pipelines in addition to unrolling tend to cause
             # CUDA "misaligned address" or "unspecified launch failure" errors.
             if range_num_stages > 0:
@@ -384,20 +413,91 @@ class TileStrategy:
         env = CompileEnvironment.current()
         block_id_to_info = {}
 
+        def begin_to_ast(value: object) -> ast.AST:
+            if isinstance(value, ast.AST):
+                return value
+            if isinstance(value, int):
+                return expr_from_string(repr(value))
+            if isinstance(value, sympy.Expr):
+                return expr_from_string(DeviceFunction.current().sympy_expr(value))
+            if isinstance(value, torch.SymInt):
+                return begin_to_ast(value._sympy_())
+            if isinstance(value, torch.Tensor):
+                tensor_arg = DeviceFunction.current().tensor_arg(value)
+                return expr_from_string(env.backend.scalar_load_expr(tensor_arg.name))
+            raise NotImplementedError(f"{type(value)} is not implemented.")
+
+        def normalize_dim_values(value: object) -> list[object]:
+            if isinstance(value, (list, tuple, torch.Size)):
+                return list(value)
+            return [value]
+
+        begin_values: list[object] | None = None
+        proxy_begins: list[object] | None = None
+        if isinstance(state.ast_args, (list, tuple)):
+            if len(state.ast_args) >= 2 and isinstance(state.ast_args[1], list):
+                begin_values = state.ast_args[1]
+        if isinstance(state.proxy_args, (list, tuple)):
+            if len(state.proxy_args) >= 2 and isinstance(
+                state.proxy_args[1], (list, tuple, torch.Size)
+            ):
+                proxy_begins = normalize_dim_values(state.proxy_args[1])
+                if begin_values is None:
+                    begin_values = proxy_begins
+            elif len(state.proxy_args) >= 2:
+                begin_arg, end_arg = state.proxy_args[:2]
+                if end_arg is None:
+                    proxy_begins = [0] * len(normalize_dim_values(begin_arg))
+                else:
+                    proxy_begins = normalize_dim_values(begin_arg)
+                if begin_values is None:
+                    begin_values = proxy_begins
+
         if use_proxy_ends:
-            _, _, proxy_ends, _ = state.proxy_args
+            _, _, proxy_ends, _, _ = state.proxy_args
             assert isinstance(proxy_ends, list)
-            for block_idx, end in zip(self.block_ids, proxy_ends, strict=True):
+            for idx, (block_idx, end) in enumerate(
+                zip(self.block_ids, proxy_ends, strict=True)
+            ):
+                begin_expr = None
+                begin_var_name = None
+                if proxy_begins is not None:
+                    begin = proxy_begins[idx]
+                    if isinstance(begin, (int, torch.SymInt)):
+                        begin_expr = _to_sympy(begin)
+                if begin_values is not None:
+                    begin_var_name = state.codegen.lift(
+                        begin_to_ast(begin_values[idx]),
+                        dce=True,
+                        prefix="begin",
+                    ).id
                 if isinstance(end, (int, torch.SymInt)):
                     end_expr = _to_sympy(end)
                 else:
                     end_expr = None
                 block_id_to_info[block_idx] = LoopDimInfo(
-                    end_var_name=None, end_expr=end_expr
+                    begin_var_name=begin_var_name,
+                    begin_expr=begin_expr,
+                    end_var_name=None,
+                    end_expr=end_expr,
                 )
         elif ends_override is not None:
             # Data-dependent bounds: use the provided ends
-            for block_id, end in zip(self.block_ids, ends_override, strict=True):
+            for idx, (block_id, end) in enumerate(
+                zip(self.block_ids, ends_override, strict=True)
+            ):
+                begin_expr = None
+                begin_var_name = None
+                if proxy_begins is not None:
+                    begin = proxy_begins[idx]
+                    if isinstance(begin, (int, torch.SymInt)):
+                        begin_expr = _to_sympy(begin)
+                if begin_values is not None:
+                    begin_var_name = state.codegen.lift(
+                        begin_to_ast(begin_values[idx]),
+                        dce=True,
+                        prefix="begin",
+                    ).id
                 if isinstance(end, (int, torch.SymInt)):
                     end_expr = _to_sympy(end)
                     end_var_name = state.sympy_expr(end_expr)
@@ -406,11 +506,26 @@ class TileStrategy:
                     end_expr = None
                     end_var_name = None
                 block_id_to_info[block_id] = LoopDimInfo(
-                    end_var_name=end_var_name, end_expr=end_expr
+                    begin_var_name=begin_var_name,
+                    begin_expr=begin_expr,
+                    end_var_name=end_var_name,
+                    end_expr=end_expr,
                 )
         else:
-            for block_id in self.block_ids:
+            for idx, block_id in enumerate(self.block_ids):
                 block_size_info = env.block_sizes[block_id]
+                begin_expr = None
+                begin_var_name = None
+                if proxy_begins is not None:
+                    begin = proxy_begins[idx]
+                    if isinstance(begin, (int, torch.SymInt)):
+                        begin_expr = _to_sympy(begin)
+                if begin_values is not None:
+                    begin_var_name = state.codegen.lift(
+                        begin_to_ast(begin_values[idx]),
+                        dce=True,
+                        prefix="begin",
+                    ).id
                 if block_size_info.size is None:
                     # Data-dependent bound - skip numel, it will be handled elsewhere
                     end_expr = None
@@ -419,7 +534,10 @@ class TileStrategy:
                     end_expr = block_size_info.numel
                     end_var_name = state.sympy_expr(end_expr)
                 block_id_to_info[block_id] = LoopDimInfo(
-                    end_var_name=end_var_name, end_expr=end_expr
+                    begin_var_name=begin_var_name,
+                    begin_expr=begin_expr,
+                    end_var_name=end_var_name,
+                    end_expr=end_expr,
                 )
 
         return block_id_to_info
@@ -675,32 +793,180 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
     def _uses_thread_axis(self) -> bool:
         return not (isinstance(self.block_size, int) and self.block_size == 1)
 
-    def _codegen_common(
+    def _numel_str(self, state: CodegenState, value: sympy.Expr | str) -> str:
+        if isinstance(value, str):
+            return value
+        return state.sympy_expr(value)
+
+    def _range_trip_count(
+        self,
+        begin: object,
+        end: object,
+        step: object | None,
+    ) -> sympy.Expr | str:
+        return self._range_numel_expr(begin, end, step)
+
+    def _range_numel_expr(
+        self, begin: object, end: object, step: object | None
+    ) -> sympy.Expr | str:
+        begin_expr = (
+            _to_sympy(begin)
+            if isinstance(begin, (int, torch.SymInt, sympy.Expr))
+            else None
+        )
+        end_expr = (
+            _to_sympy(end) if isinstance(end, (int, torch.SymInt, sympy.Expr)) else None
+        )
+        diff_expr = (
+            sympy.Add(end_expr, sympy.Mul(-1, begin_expr))
+            if begin_expr is not None and end_expr is not None
+            else None
+        )
+        if step is None or step == 1:
+            if diff_expr is not None:
+                return diff_expr
+            return f"(({self._expr_str(end)}) - ({self._expr_str(begin)}))"
+        assert isinstance(step, (int, torch.SymInt, sympy.Expr))
+        step_expr = _to_sympy(step)
+        if getattr(step_expr, "free_symbols", None):
+            return (
+                f"((({self._expr_str(end)}) - ({self._expr_str(begin)})) + "
+                f"({self._expr_str(step)}) - 1) // ({self._expr_str(step)})"
+            )
+        if diff_expr is not None:
+            return sympy.ceiling(sympy.Mul(diff_expr, sympy.Pow(step_expr, -1)))
+        return (
+            f"((({self._expr_str(end)}) - ({self._expr_str(begin)})) + "
+            f"({self._expr_str(step)}) - 1) // ({self._expr_str(step)})"
+        )
+
+    def _expr_str(self, value: object) -> str:
+        if isinstance(value, (int, torch.SymInt, sympy.Expr)):
+            return self.fn.sympy_expr(_to_sympy(value))
+        if isinstance(value, torch.Tensor):
+            tensor_arg = DeviceFunction.current().tensor_arg(value)
+            return CompileEnvironment.current().backend.scalar_load_expr(
+                tensor_arg.name
+            )
+        if isinstance(value, str):
+            return value
+        raise NotImplementedError(f"{type(value)} is not implemented.")
+
+    def _normalize_loop_steps(
+        self, step_arg: object | None, ndim: int
+    ) -> list[object | None]:
+        if step_arg is None:
+            return [None] * ndim
+        if isinstance(step_arg, (list, tuple)):
+            steps = list(step_arg)
+            assert len(steps) == ndim
+            return steps
+        return [step_arg] * ndim
+
+    def _extract_root_bounds(
         self, state: CodegenState
-    ) -> tuple[str, str, sympy.Expr, list[ast.AST]]:
+    ) -> tuple[list[object], list[object], list[object | None]]:
+        assert len(state.proxy_args) == 3
+        if state.proxy_args[1] is None:
+            begins: list[object] = [0] * len(self.block_ids)
+            ends_arg = state.proxy_args[0]
+        else:
+            begins_arg = state.proxy_args[0]
+            begins = (
+                list(begins_arg)
+                if isinstance(begins_arg, (list, tuple))
+                else [begins_arg]
+            )
+            ends_arg = state.proxy_args[1]
+        ends = list(ends_arg) if isinstance(ends_arg, (list, tuple)) else [ends_arg]
+        steps = self._normalize_loop_steps(state.proxy_args[2], len(self.block_ids))
+        assert len(begins) == len(self.block_ids)
+        assert len(ends) == len(self.block_ids)
+        return begins, ends, steps
+
+    def _extract_device_loop_bounds(
+        self, state: CodegenState
+    ) -> tuple[list[object], list[object], list[object | None]]:
+        if len(state.ast_args) == 5:
+            _, begins_arg, ends_arg, _, steps_arg = state.ast_args
+        else:
+            _, begins_arg, ends_arg, _ = state.ast_args
+            steps_arg = None
+        begins = (
+            list(begins_arg) if isinstance(begins_arg, (list, tuple)) else [begins_arg]
+        )
+        ends = list(ends_arg) if isinstance(ends_arg, (list, tuple)) else [ends_arg]
+        steps = self._normalize_loop_steps(steps_arg, len(self.block_ids))
+        assert len(begins) == len(self.block_ids)
+        assert len(ends) == len(self.block_ids)
+        return begins, ends, steps
+
+    def _codegen_common(
+        self,
+        state: CodegenState,
+        *,
+        begins: list[object] | None = None,
+        ends: list[object] | None = None,
+        steps: list[object | None] | None = None,
+    ) -> tuple[str, str, sympy.Expr | str, list[ast.AST]]:
         offsets_var = self._offsets_var
         block_size_var = self.block_size_var(-1)
         self._setup_block_size_constexpr(state, block_size_var, self.block_size)
         block_ids = self.block_ids
         env = CompileEnvironment.current()
-        total_numel = sympy.S.One
+        if begins is None:
+            begins = [0] * len(block_ids)
+        if ends is None:
+            ends = [env.block_sizes[block_id].numel for block_id in block_ids]
+        if steps is None:
+            steps = [None] * len(block_ids)
+        total_numel: sympy.Expr | str = sympy.S.One
         statements = []
 
         # pyrefly: ignore [bad-assignment]
-        for i, block_idx in enumerate(self._reorder(block_ids)):
-            numel = env.block_sizes[block_idx].numel
+        for i, (block_idx, begin, end, step) in enumerate(
+            self._reorder([*zip(block_ids, begins, ends, steps, strict=True)])
+        ):
+            cute_scalar_tile = (
+                CompileEnvironment.current().backend.name == "cute"
+                and len(block_ids) == 1
+                and self._uses_thread_axis()
+                and step not in (None, 1)
+            )
+            numel = (
+                self._range_numel_expr(begin, end, None)
+                if cute_scalar_tile
+                else self._range_trip_count(begin, end, step)
+            )
             block_index_var = self.index_var(block_idx)
             expr = offsets_var
             if total_numel != sympy.S.One:
-                expr = f"({expr}) // ({state.sympy_expr(total_numel)})"
+                expr = f"({expr}) // ({self._numel_str(state, total_numel)})"
             if i + 1 < len(block_ids):
-                expr = f"({expr}) % ({state.sympy_expr(numel)})"
+                expr = f"({expr}) % ({self._numel_str(state, numel)})"
+            step_expr = self._expr_str(step) if step not in (None, 1) else None
+            if step_expr is not None and not (
+                CompileEnvironment.current().backend.name == "cute"
+                and len(block_ids) == 1
+                and self._uses_thread_axis()
+            ):
+                expr = f"({expr}) * ({step_expr})"
+            if begin != 0:
+                expr = f"({self._expr_str(begin)}) + ({expr})"
             statements.append(statement_from_string(f"{block_index_var} = {expr}"))
-            total_numel = total_numel * numel
+            if isinstance(total_numel, str) or isinstance(numel, str):
+                total_numel = (
+                    f"({self._numel_str(state, total_numel)})"
+                    f" * ({self._numel_str(state, numel)})"
+                )
+            else:
+                assert isinstance(total_numel, sympy.Expr)
+                assert isinstance(numel, sympy.Expr)
+                total_numel = sympy.Mul(total_numel, numel)
 
         mask_var = self.mask_var(-1)
         if mask_var is not None:
-            mask_terms = [f"{offsets_var} < ({state.sympy_expr(total_numel)})"]
+            mask_terms = [f"{offsets_var} < ({self._numel_str(state, total_numel)})"]
             thread_mask = env.backend.thread_in_tile_mask_expr(
                 block_size_var, axis=self._flat_thread_axis()
             )
@@ -719,8 +985,124 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
         return self._compute_thread_axis_offset(self.fn.codegen.active_device_loops)
 
     def codegen_grid(self, state: CodegenState) -> DeviceGridState:
+        assert state.ast_args is None
+
+        from .ast_extension import ExtendedAST
+        from .type_propagation import GridIndexType
+        from .type_propagation import IterType
+        from .type_propagation import SequenceType
+
+        type_info = ExtendedAST.current()[-1]._type_info
+        scalar_grid_loop = False
+        if isinstance(type_info, IterType):
+            inner = (
+                type_info.inner.unpack()
+                if isinstance(type_info.inner, SequenceType)
+                else [type_info.inner]
+            )
+            scalar_grid_loop = len(inner) == 1 and isinstance(inner[0], GridIndexType)
+
+        if (
+            scalar_grid_loop
+            and len(self.block_ids) == 1
+            and len(state.proxy_args) == 3
+            and not isinstance(state.proxy_args[0], (list, tuple))
+            and (
+                state.proxy_args[1] is None
+                or not isinstance(state.proxy_args[1], (list, tuple))
+            )
+            and not isinstance(state.proxy_args[2], (list, tuple))
+        ):
+
+            def _range_bound_to_sympy(value: object) -> sympy.Expr:
+                assert isinstance(value, (int, torch.SymInt, sympy.Expr))
+                return _to_sympy(value)
+
+            step = state.proxy_args[2]
+            if step not in (None, 1):
+                block_id = self.block_ids[0]
+                if state.proxy_args[1] is None:
+                    begin = 0
+                    end = state.proxy_args[0]
+                else:
+                    begin = state.proxy_args[0]
+                    end = state.proxy_args[1]
+                    if isinstance(begin, (list, tuple)):
+                        assert len(begin) == 1
+                        begin = begin[0]
+                    if isinstance(end, (list, tuple)):
+                        assert len(end) == 1
+                        end = end[0]
+                begin_expr = _range_bound_to_sympy(begin)
+                end_expr = _range_bound_to_sympy(end)
+                step_expr = _range_bound_to_sympy(step)
+                trip_count = (
+                    f"(({state.sympy_expr(end_expr)}) - ({state.sympy_expr(begin_expr)}) + "
+                    f"({state.sympy_expr(step_expr)}) - 1) // ({state.sympy_expr(step_expr)})"
+                )
+
+                env = CompileEnvironment.current()
+                dtype = env.index_type()
+                pid_var = state.device_function.new_var("pid_flat", dce=True)
+                offsets_var = self._offsets_var
+                block_size_var = self.block_size_var(-1)
+                self._setup_block_size_constexpr(state, block_size_var, self.block_size)
+                pids = self.select_pid_strategy()
+                if isinstance(state.device_function.pid, ForEachProgramID):
+                    pids.shared_pid_var = state.device_function.pid.shared_pid_var
+                pids.append(PIDInfo(pid_var, block_size_var, trip_count, block_id))
+                state.add_statement(
+                    env.backend.arange_expr(
+                        offsets_var,
+                        pid_var,
+                        block_size_var,
+                        dtype,
+                        axis=self._flat_thread_axis(),
+                    )
+                )
+                index_var = self.index_var(block_id)
+                state.add_statement(
+                    f"{index_var} = ({state.sympy_expr(begin_expr)}) + ({offsets_var}) * ({state.sympy_expr(step_expr)})"
+                )
+                mask_var = self.mask_var(-1)
+                if mask_var is not None:
+                    mask_terms = [f"{offsets_var} < ({trip_count})"]
+                    thread_mask = env.backend.thread_in_tile_mask_expr(
+                        block_size_var, axis=self._flat_thread_axis()
+                    )
+                    if thread_mask is not None:
+                        mask_terms.insert(0, f"({thread_mask})")
+                    state.add_statement(
+                        statement_from_string(
+                            f"{mask_var} = {' and '.join(mask_terms)}"
+                        )
+                    )
+                pids.codegen(state)
+                if isinstance(state.device_function.pid, ForEachProgramID):
+                    shared_pid = state.device_function.pid
+                    shared_pid.cases.append(pids)
+                    shared_pid.codegen(state)
+                else:
+                    state.device_function.set_pid(pids)
+                tracker = ThreadAxisTracker()
+                if self._uses_thread_axis() and isinstance(self.block_size, int):
+                    tracker.record_all(
+                        self.block_ids, self._flat_thread_axis(), self.block_size
+                    )
+                return DeviceGridState(
+                    self,
+                    block_id_to_info=self._create_block_id_info_dict(
+                        state, ends_override=[end]
+                    ),
+                    thread_axis_sizes=tracker.sizes,
+                    block_thread_axes=tracker.block_axes,
+                )
+        begins, ends, steps = self._extract_root_bounds(state)
         block_size_var, offsets_var, total_numel, statements = self._codegen_common(
-            state
+            state,
+            begins=begins,
+            ends=ends,
+            steps=steps,
         )
         env = CompileEnvironment.current()
         dtype = env.index_type()
@@ -752,12 +1134,24 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
         else:
             state.device_function.set_pid(pids)
 
-        block_id_to_info = self._create_block_id_info_dict(state)
+        block_id_to_info = self._create_block_id_info_dict(state, ends_override=ends)
         tracker = ThreadAxisTracker()
-        if self._uses_thread_axis() and isinstance(self.block_size, int):
-            tracker.record_all(
-                self.block_ids, self._flat_thread_axis(), self.block_size
-            )
+        if self._uses_thread_axis():
+            thread_size: int | None = None
+            if isinstance(self.block_size, int):
+                thread_size = self.block_size
+            elif isinstance(self.block_size, torch.SymInt):
+                if (block_size_id := env.get_block_id(self.block_size)) is not None:
+                    config_block_size = env.config_spec.block_sizes.config_get(
+                        state.config.block_sizes,
+                        block_size_id,
+                    )
+                    if isinstance(config_block_size, int):
+                        thread_size = config_block_size
+            if thread_size is not None:
+                tracker.record_all(
+                    self.block_ids, self._flat_thread_axis(), thread_size
+                )
         return DeviceGridState(
             self,
             block_id_to_info=block_id_to_info,
@@ -766,13 +1160,17 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
         )
 
     def codegen_device_loop(self, state: CodegenState) -> DeviceLoopState:
+        begins, ends, steps = self._extract_device_loop_bounds(state)
         block_size_var, offsets_var, total_numel, statements = self._codegen_common(
-            state
+            state,
+            begins=begins,
+            ends=ends,
+            steps=steps,
         )
         env = CompileEnvironment.current()
         dtype = env.index_type()
         lid = self.new_var("lid")
-        numel_str = state.sympy_expr(total_numel)
+        numel_str = self._numel_str(state, total_numel)
         end_var = env.backend.cdiv_expr(numel_str, block_size_var, is_device=True)
         arange_expr = env.backend.arange_expr(
             offsets_var, lid, block_size_var, dtype, axis=self._flat_thread_axis()
@@ -792,12 +1190,24 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
             orelse=[],
             type_comment=None,
         )
-        block_id_to_info = self._create_block_id_info_dict(state, use_proxy_ends=True)
+        block_id_to_info = self._create_block_id_info_dict(state, ends_override=ends)
         tracker = ThreadAxisTracker()
-        if self._uses_thread_axis() and isinstance(self.block_size, int):
-            tracker.record_all(
-                self.block_ids, self._flat_thread_axis(), self.block_size
-            )
+        if self._uses_thread_axis():
+            thread_size: int | None = None
+            if isinstance(self.block_size, int):
+                thread_size = self.block_size
+            elif isinstance(self.block_size, torch.SymInt):
+                if (block_size_id := env.get_block_id(self.block_size)) is not None:
+                    config_block_size = env.config_spec.block_sizes.config_get(
+                        state.config.block_sizes,
+                        block_size_id,
+                    )
+                    if isinstance(config_block_size, int):
+                        thread_size = config_block_size
+            if thread_size is not None:
+                tracker.record_all(
+                    self.block_ids, self._flat_thread_axis(), thread_size
+                )
         return DeviceLoopState(
             self,
             for_node=for_node,
@@ -949,6 +1359,73 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
                 axis += 1
         return mapping
 
+    def _normalize_loop_steps(
+        self, step_arg: object | None, ndim: int
+    ) -> list[object | None]:
+        if step_arg is None:
+            return [None] * ndim
+        if isinstance(step_arg, (list, tuple)):
+            steps = list(step_arg)
+            assert len(steps) == ndim
+            return steps
+        return [step_arg] * ndim
+
+    def _root_grid_steps(self, state: CodegenState) -> list[object | None]:
+        from .ast_extension import ExtendedAST
+        from .type_propagation import GridIndexType
+        from .type_propagation import IterType
+        from .type_propagation import SequenceType
+
+        type_info = ExtendedAST.current()[-1]._type_info
+        assert isinstance(type_info, IterType)
+        inner = (
+            type_info.inner.unpack()
+            if isinstance(type_info.inner, SequenceType)
+            else [type_info.inner]
+        )
+        if not all(isinstance(value, GridIndexType) for value in inner):
+            return [None] * len(self.block_ids)
+        return self._normalize_loop_steps(state.proxy_args[2], len(self.block_ids))
+
+    def _range_numel_expr(
+        self, begin: object, end: object, step: object | None
+    ) -> sympy.Expr | str:
+        begin_expr = (
+            _to_sympy(begin)
+            if isinstance(begin, (int, torch.SymInt, sympy.Expr))
+            else None
+        )
+        end_expr = (
+            _to_sympy(end) if isinstance(end, (int, torch.SymInt, sympy.Expr)) else None
+        )
+        diff_expr = (
+            sympy.Add(end_expr, sympy.Mul(-1, begin_expr))
+            if begin_expr is not None and end_expr is not None
+            else None
+        )
+        if step is None or step == 1:
+            if diff_expr is not None:
+                return diff_expr
+            return f"(({self._expr_str(end)}) - ({self._expr_str(begin)}))"
+        assert isinstance(step, (int, torch.SymInt, sympy.Expr))
+        step_expr = _to_sympy(step)
+        if getattr(step_expr, "free_symbols", None):
+            return (
+                f"((({self._expr_str(end)}) - ({self._expr_str(begin)})) + "
+                f"({self._expr_str(step)}) - 1) // ({self._expr_str(step)})"
+            )
+        if diff_expr is not None:
+            return sympy.ceiling(sympy.Mul(diff_expr, sympy.Pow(step_expr, -1)))
+        return (
+            f"((({self._expr_str(end)}) - ({self._expr_str(begin)})) + "
+            f"({self._expr_str(step)}) - 1) // ({self._expr_str(step)})"
+        )
+
+    def _expr_str(self, value: object) -> str:
+        if isinstance(value, (int, torch.SymInt, sympy.Expr)):
+            return self.fn.sympy_expr(_to_sympy(value))
+        return ast.unparse(self._to_ast(value))
+
     def codegen_grid(self, state: CodegenState) -> DeviceGridState:
         block_ids = self.block_ids
         env = CompileEnvironment.current()
@@ -1028,6 +1505,7 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
         else:
             ends = [ends_arg]
         assert len(ends) == len(block_ids)
+        steps = self._root_grid_steps(state)
 
         tracker = ThreadAxisTracker()
         thread_axis_offset = self._thread_axis_offset(state)
@@ -1040,33 +1518,30 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
         partial_fission_dims: list[
             tuple[int, int, object, object, str, str, object, str]
         ] = []  # (block_idx, factor, begin, end, offset_var, block_size_var, numel, pid_var)
-        for block_idx, block_size, begin, end in reversed(
-            self._reorder([*zip(block_ids, block_sizes, begins, ends, strict=True)])
+        for block_idx, block_size, begin, end, step in reversed(
+            self._reorder(
+                [*zip(block_ids, block_sizes, begins, ends, steps, strict=True)]
+            )
         ):
             factor = fission_factor_map.get(block_idx, 0)
             if factor == -1:
                 continue
-            block_size_info = env.block_sizes[block_idx]
-            if block_size_info.size is None:
-                numel = self._get_data_dependent_numel(state, end, begin)
-            else:
-                numel = block_size_info.numel
+            numel = self._range_numel_expr(begin, end, step)
             device_function = state.device_function
             dtype = env.index_type()
             offset_var = self.offset_var(block_idx)
             index_var = self.index_var(block_idx)
             pid_var = device_function.new_var(f"pid_{grid_pid_index}", dce=True)
 
-            if block_size != 1:
-                block_size_var = self.block_size_var(block_idx)
-                assert block_size_var is not None
-                self._setup_block_size_constexpr(state, block_size_var, block_size)
-            else:
-                block_size_var = "1"
-
             if factor > 0:
                 # Partial fission: PID covers cdiv(numel, block_size * factor) blocks
                 # offset will be computed inside the fission loop
+                if block_size != 1:
+                    block_size_var = self.block_size_var(block_idx)
+                    assert block_size_var is not None
+                    self._setup_block_size_constexpr(state, block_size_var, block_size)
+                else:
+                    block_size_var = "1"
                 state.add_statement(f"{offset_var} = {pid_var}")
                 # For PIDInfo, adjust numel so grid shrinks by the fission factor
                 if isinstance(numel, sympy.Expr):
@@ -1099,15 +1574,28 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
                     begin_ast = self._to_ast(begin, to_dtype=dtype)
                     begin_offset_expr = f"{state.codegen.lift(begin_ast, dce=True, prefix='begin').id} + "
 
-                if block_size != 1:
+                if step not in (None, 1):
+                    step_ast = self._to_ast(step, to_dtype=dtype)
+                    step_var = state.codegen.lift(step_ast, dce=True, prefix="step").id
+                    block_size_var = "1"
+                    state.add_statement(
+                        f"{offset_var} = {begin_offset_expr}({pid_var}) * {step_var}"
+                    )
+                elif block_size != 1:
+                    block_size_var = self.block_size_var(block_idx)
+                    assert block_size_var is not None
+                    self._setup_block_size_constexpr(state, block_size_var, block_size)
                     state.add_statement(
                         f"{offset_var} = {begin_offset_expr}{pid_var} * {block_size_var}"
                     )
                 else:
+                    block_size_var = "1"
                     state.add_statement(f"{offset_var} = {begin_offset_expr}{pid_var}")
 
                 axis = thread_axis_offset + thread_axis_map[block_idx]
-                uses_thread_axis = self._uses_thread_axis(block_size)
+                uses_thread_axis = step in (None, 1) and self._uses_thread_axis(
+                    block_size
+                )
                 bs = block_size_var if uses_thread_axis else "1"
                 idx_expr = env.backend.grid_index_expr(offset_var, bs, dtype, axis=axis)
                 if uses_thread_axis and isinstance(block_size, int):
@@ -1115,7 +1603,7 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
                 state.add_statement(f"{index_var} = {idx_expr}")
                 # pyrefly: ignore [missing-attribute]
                 mask_statement = self._setup_mask(
-                    state, block_idx, block_size, index_var, numel
+                    state, block_idx, block_size, index_var, end
                 )
                 if mask_statement is not None:
                     state.add_statement(mask_statement)
@@ -1286,21 +1774,28 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
         body = innermost_body = []
         for_node: ast.For | None = None
         assert len(block_sizes) == len(block_ids)
-        _, begins, ends, _ = state.ast_args
-        _, _, proxy_ends, _ = state.proxy_args
+        if len(state.ast_args) == 5:
+            _, begins, ends, _, steps = state.ast_args
+        else:
+            _, begins, ends, _ = state.ast_args
+            steps = None
+        _, _, proxy_ends, *_ = state.proxy_args
         assert isinstance(begins, list)
         assert isinstance(ends, list)
+        if steps is None:
+            steps = [None] * len(block_ids)
+        assert isinstance(steps, list)
         assert isinstance(proxy_ends, list)
         block_id_to_info = {}
         tracker = ThreadAxisTracker()
         thread_axis_offset = self._thread_axis_offset(state)
         thread_axis_map = self._thread_axis_map()
-        for block_idx, block_size, begin, end, proxy_end in self._reorder(
-            [*zip(block_ids, block_sizes, begins, ends, proxy_ends, strict=True)]
+        for block_idx, block_size, begin, end, step, proxy_end in self._reorder(
+            [*zip(block_ids, block_sizes, begins, ends, steps, proxy_ends, strict=True)]
         ):
             offset_var = self.offset_var(block_idx)
             index_var = self.index_var(block_idx)
-            if block_size != 1:
+            if step in (None, 1) and block_size != 1:
                 block_size_var = self.block_size_var(block_idx)
                 assert block_size_var is not None
                 self._setup_block_size_constexpr(state, block_size_var, block_size)
@@ -1309,7 +1804,14 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
             end_var_name = state.codegen.lift(
                 self._to_ast(end, to_dtype=dtype), dce=True, prefix="end"
             ).id
+            begin_var_name = state.codegen.lift(
+                self._to_ast(begin, to_dtype=dtype), dce=True, prefix="begin"
+            ).id
             block_id_to_info[block_idx] = LoopDimInfo(
+                begin_var_name=begin_var_name,
+                begin_expr=_to_sympy(begin)
+                if isinstance(begin, (int, torch.SymInt))
+                else None,
                 end_var_name=end_var_name,
                 end_expr=self._fold_tile_end_op(state, proxy_end, block_size),
             )
@@ -1328,7 +1830,11 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
                         [block_idx],
                         begin="{begin}",
                         end="{end}",
-                        step=block_size_var,
+                        step=(
+                            ast.unparse(self._to_ast(step, to_dtype=range_dtype))
+                            if step not in (None, 1)
+                            else block_size_var
+                        ),
                     ),
                     begin=self._to_ast(begin, to_dtype=range_dtype),
                     end=self._to_ast(end, to_dtype=range_dtype),
@@ -1338,7 +1844,7 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
                 type_comment=None,
             )
             assert for_node.body is body
-            uses_thread_axis = self._uses_thread_axis(block_size)
+            uses_thread_axis = step in (None, 1) and self._uses_thread_axis(block_size)
             axis = thread_axis_offset + thread_axis_map[block_idx]
             bs = block_size_var if uses_thread_axis else "1"
             idx_expr = env.backend.loop_index_expr(offset_var, bs, dtype, axis=axis)
@@ -1410,8 +1916,8 @@ class NDTileStrategy(_BaseNDTileStrategy):
         )
 
         if env.is_jagged_tile(block_idx):
-            _, _, _, jagged_tile_parents_ast = state.ast_args
-            _, _, _, jagged_tile_parents_proxy = state.proxy_args
+            jagged_tile_parents_ast = state.ast_args[3]
+            jagged_tile_parents_proxy = state.proxy_args[3]
             assert isinstance(jagged_tile_parents_ast, list)
             assert isinstance(jagged_tile_parents_proxy, list)
             # We guarantee the first lifted loop input is the jagged_tile parent tensor.
@@ -1472,10 +1978,33 @@ class CuteNDTileStrategy(NDTileStrategy):
             ):
                 if block_id in self.inactive_block_ids:
                     continue
-                if nt > 0 and isinstance(bs, int) and bs > nt and bs % nt == 0:
+                static_bs = self._configured_block_size_int(bs)
+                if (
+                    nt > 0
+                    and static_bs is not None
+                    and static_bs > nt
+                    and static_bs % nt == 0
+                ):
                     self._lane_var_by_block[block_id] = self.fn.new_var(
                         f"lane_{block_id}"
                     )
+
+    def _configured_block_size_int(self, block_size: SymIntLike) -> int | None:
+        if isinstance(block_size, int):
+            return block_size
+        env = CompileEnvironment.current()
+        resolved_block_id = env.resolve_block_id(block_size)
+        if resolved_block_id is not None:
+            configured_size = env.block_sizes[resolved_block_id].from_config(
+                self.fn.config
+            )
+            if isinstance(configured_size, int):
+                return configured_size
+        block_size_expr = _to_sympy(block_size)
+        block_size_expr = env.specialize_expr(block_size_expr)
+        if getattr(block_size_expr, "free_symbols", None):
+            return None
+        return int(block_size_expr)
 
     def _elements_per_thread_for_block(self, block_id: int) -> int:
         """Elements per thread for *block_id* (derived from num_threads)."""
@@ -1485,7 +2014,7 @@ class CuteNDTileStrategy(NDTileStrategy):
         nt = self.num_threads[idx]
         if nt == 0:
             return 1
-        bs = self.block_size[idx]
+        bs = self._configured_block_size_int(self.block_size[idx])
         assert isinstance(bs, int)  # validated by _thread_extent_for_axis
         return bs // nt
 
@@ -1500,17 +2029,21 @@ class CuteNDTileStrategy(NDTileStrategy):
         nt = self.num_threads[idx]
         if nt == 0:
             return block_size
-        if not isinstance(block_size, int):
-            raise exc.BackendUnsupported(
-                "cute",
-                "num_threads requires static ND block sizes for cute",
-            )
-        if block_size % nt != 0:
+        resolved_block_size = block_size
+        if not isinstance(resolved_block_size, int):
+            static_block_size = self._configured_block_size_int(resolved_block_size)
+            if static_block_size is None:
+                raise exc.BackendUnsupported(
+                    "cute",
+                    "num_threads requires static ND block sizes for cute",
+                )
+            resolved_block_size = static_block_size
+        if resolved_block_size % nt != 0:
             raise exc.BackendUnsupported(
                 "cute",
                 (
                     "block size must be divisible by num_threads for cute axis "
-                    f"{block_id}: {block_size} is not divisible by {nt}"
+                    f"{block_id}: {resolved_block_size} is not divisible by {nt}"
                 ),
             )
         return nt
@@ -1543,6 +2076,14 @@ class CuteNDTileStrategy(NDTileStrategy):
             if self._uses_thread_axis_for_block(block_idx, block_size)
         )
 
+    def _static_thread_extent_for_block(
+        self, block_id: int, block_size: SymIntLike
+    ) -> int | None:
+        thread_extent = self._thread_extent_for_axis(block_id, block_size)
+        if isinstance(thread_extent, int):
+            return thread_extent
+        return self._configured_block_size_int(thread_extent)
+
     def thread_block_sizes(self) -> list[int]:
         sizes: list[int] = []
         block_size_by_id = dict(zip(self.block_ids, self.block_size, strict=True))
@@ -1550,10 +2091,12 @@ class CuteNDTileStrategy(NDTileStrategy):
             thread_extent = self._thread_extent_for_axis(
                 block_id, block_size_by_id[block_id]
             )
-            if self._uses_thread_axis_for_block(
-                block_id, block_size_by_id[block_id]
-            ) and isinstance(thread_extent, int):
-                sizes.append(thread_extent)
+            if self._uses_thread_axis_for_block(block_id, block_size_by_id[block_id]):
+                static_extent = thread_extent
+                if not isinstance(static_extent, int):
+                    static_extent = self._configured_block_size_int(static_extent)
+                if isinstance(static_extent, int):
+                    sizes.append(static_extent)
         return sizes
 
     def thread_block_size_exprs(self) -> list[str]:
@@ -1608,21 +2151,20 @@ class CuteNDTileStrategy(NDTileStrategy):
         else:
             ends = [ends_arg]
         assert len(ends) == len(block_ids)
+        steps = self._root_grid_steps(state)
 
         lane_setup_statements: list[ast.AST] = []
         tracker = ThreadAxisTracker()
         thread_axis_offset = self._thread_axis_offset(state)
         thread_axis_map = self._thread_axis_map()
-        for i, (block_idx, block_size, begin, end) in enumerate(
+        for i, (block_idx, block_size, begin, end, step) in enumerate(
             reversed(
-                self._reorder([*zip(block_ids, block_sizes, begins, ends, strict=True)])
+                self._reorder(
+                    [*zip(block_ids, block_sizes, begins, ends, steps, strict=True)]
+                )
             )
         ):
-            block_size_info = env.block_sizes[block_idx]
-            if block_size_info.size is None:
-                numel = self._get_data_dependent_numel(state, end, begin)
-            else:
-                numel = block_size_info.numel
+            numel = self._range_numel_expr(begin, end, step)
             device_function = state.device_function
             dtype = env.index_type()
             offset_var = self.offset_var(block_idx)
@@ -1636,7 +2178,14 @@ class CuteNDTileStrategy(NDTileStrategy):
                     f"{state.codegen.lift(begin_ast, dce=True, prefix='begin').id} + "
                 )
 
-            if block_size != 1:
+            if step not in (None, 1):
+                step_ast = self._to_ast(step, to_dtype=dtype)
+                step_var = state.codegen.lift(step_ast, dce=True, prefix="step").id
+                block_size_var = "1"
+                state.add_statement(
+                    f"{offset_var} = {begin_offset_expr}({pid_var}) * {step_var}"
+                )
+            elif block_size != 1:
                 block_size_var = self.block_size_var(block_idx)
                 assert block_size_var is not None
                 self._setup_block_size_constexpr(state, block_size_var, block_size)
@@ -1648,13 +2197,17 @@ class CuteNDTileStrategy(NDTileStrategy):
                 state.add_statement(f"{offset_var} = {begin_offset_expr}{pid_var}")
 
             elements_per_thread = self._elements_per_thread_for_block(block_idx)
-            uses_thread_axis = self._uses_thread_axis_for_block(block_idx, block_size)
+            uses_thread_axis = step in (None, 1) and self._uses_thread_axis_for_block(
+                block_idx, block_size
+            )
             axis = thread_axis_offset + thread_axis_map[block_idx]
             if uses_thread_axis:
                 idx_expr = f"{offset_var} + cutlass.Int32(cute.arch.thread_idx()[{axis}]) * {elements_per_thread}"
-                thread_extent = self._thread_extent_for_axis(block_idx, block_size)
-                if isinstance(thread_extent, int):
-                    tracker.record(block_idx, axis, thread_extent)
+                static_thread_extent = self._static_thread_extent_for_block(
+                    block_idx, block_size
+                )
+                if isinstance(static_thread_extent, int):
+                    tracker.record(block_idx, axis, static_thread_extent)
             else:
                 idx_expr = offset_var
             if lane_var := self._lane_var_by_block.get(block_idx):
@@ -1664,7 +2217,7 @@ class CuteNDTileStrategy(NDTileStrategy):
             )
 
             mask_statement = self._setup_mask(
-                state, block_idx, block_size, index_var, numel
+                state, block_idx, block_size, index_var, end
             )
             if mask_statement is not None:
                 lane_setup_statements.append(mask_statement)
@@ -1697,6 +2250,7 @@ class CuteNDTileStrategy(NDTileStrategy):
             self,
             block_id_to_info=block_id_to_info,
             lane_loops=lane_loops,
+            lane_loop_blocks=set(self._lane_var_by_block),
             lane_setup_statements=lane_setup_statements,
             thread_axis_sizes=tracker.sizes,
             block_thread_axes=tracker.block_axes,
@@ -1731,22 +2285,29 @@ class CuteNDTileStrategy(NDTileStrategy):
             body = [lane_for]
         for_node: ast.For | None = None
         assert len(block_sizes) == len(block_ids)
-        _, begins, ends, _ = state.ast_args
-        _, _, proxy_ends, _ = state.proxy_args
+        if len(state.ast_args) == 5:
+            _, begins, ends, _, steps = state.ast_args
+        else:
+            _, begins, ends, _ = state.ast_args
+            steps = None
+        _, _, proxy_ends, *_ = state.proxy_args
         assert isinstance(begins, list)
         assert isinstance(ends, list)
+        if steps is None:
+            steps = [None] * len(block_ids)
+        assert isinstance(steps, list)
         assert isinstance(proxy_ends, list)
         block_id_to_info = {}
         tracker = ThreadAxisTracker()
         thread_axis_offset = self._thread_axis_offset(state)
         thread_axis_map = self._thread_axis_map()
         index_setup: list[ast.stmt] = []
-        for block_idx, block_size, begin, end, proxy_end in self._reorder(
-            [*zip(block_ids, block_sizes, begins, ends, proxy_ends, strict=True)]
+        for block_idx, block_size, begin, end, step, proxy_end in self._reorder(
+            [*zip(block_ids, block_sizes, begins, ends, steps, proxy_ends, strict=True)]
         ):
             offset_var = self.offset_var(block_idx)
             index_var = self.index_var(block_idx)
-            if block_size != 1:
+            if step in (None, 1) and block_size != 1:
                 block_size_var = self.block_size_var(block_idx)
                 assert block_size_var is not None
                 self._setup_block_size_constexpr(state, block_size_var, block_size)
@@ -1755,7 +2316,14 @@ class CuteNDTileStrategy(NDTileStrategy):
             end_var_name = state.codegen.lift(
                 self._to_ast(end, to_dtype=dtype), dce=True, prefix="end"
             ).id
+            begin_var_name = state.codegen.lift(
+                self._to_ast(begin, to_dtype=dtype), dce=True, prefix="begin"
+            ).id
             block_id_to_info[block_idx] = LoopDimInfo(
+                begin_var_name=begin_var_name,
+                begin_expr=_to_sympy(begin)
+                if isinstance(begin, (int, torch.SymInt))
+                else None,
                 end_var_name=end_var_name,
                 end_expr=self._fold_tile_end_op(state, proxy_end, block_size),
             )
@@ -1774,7 +2342,11 @@ class CuteNDTileStrategy(NDTileStrategy):
                         [block_idx],
                         begin="{begin}",
                         end="{end}",
-                        step=block_size_var,
+                        step=(
+                            ast.unparse(self._to_ast(step, to_dtype=range_dtype))
+                            if step not in (None, 1)
+                            else block_size_var
+                        ),
                     ),
                     begin=self._to_ast(begin, to_dtype=range_dtype),
                     end=self._to_ast(end, to_dtype=range_dtype),
@@ -1784,13 +2356,17 @@ class CuteNDTileStrategy(NDTileStrategy):
                 type_comment=None,
             )
             elements_per_thread = self._elements_per_thread_for_block(block_idx)
-            uses_thread_axis = self._uses_thread_axis_for_block(block_idx, block_size)
+            uses_thread_axis = step in (None, 1) and self._uses_thread_axis_for_block(
+                block_idx, block_size
+            )
             axis = thread_axis_offset + thread_axis_map[block_idx]
             if uses_thread_axis:
                 idx_expr = f"{offset_var} + cutlass.Int32(cute.arch.thread_idx()[{axis}]) * {elements_per_thread}"
-                thread_extent = self._thread_extent_for_axis(block_idx, block_size)
-                if isinstance(thread_extent, int):
-                    tracker.record(block_idx, axis, thread_extent)
+                static_thread_extent = self._static_thread_extent_for_block(
+                    block_idx, block_size
+                )
+                if isinstance(static_thread_extent, int):
+                    tracker.record(block_idx, axis, static_thread_extent)
             else:
                 idx_expr = offset_var
             if lane_var := self._lane_var_by_block.get(block_idx):
@@ -1955,6 +2531,7 @@ class CuteFlattenedTileStrategy(FlattenedTileStrategy):
             self,
             block_id_to_info=block_id_to_info,
             lane_loops=lane_loops,
+            lane_loop_blocks=set(self.block_ids) if lane_loops else set(),
             lane_setup_statements=lane_setup_statements,
             thread_axis_sizes=tracker.sizes,
             block_thread_axes=tracker.block_axes,

@@ -17,16 +17,25 @@ from torch._inductor.codecache import torch_key
 
 from .. import exc
 from .._utils import counters
-from ..runtime.kernel import BoundKernel
 from .base_search import BaseAutotuner
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
     from ..runtime.config import Config
+    from ..runtime.kernel import BoundKernel
     from .base_search import BaseSearch
 
 log: logging.Logger = logging.getLogger(__name__)
+
+
+def should_skip_cache() -> bool:
+    """Return True when the user has requested that cache reads be skipped."""
+    return os.environ.get("HELION_SKIP_CACHE", "").strip().lower() not in {
+        "",
+        "0",
+        "false",
+    }
 
 
 class AutotuneCacheMeta(abc.ABCMeta):
@@ -45,9 +54,11 @@ class AutotuneCacheMeta(abc.ABCMeta):
         """
 
         def factory(kernel: BoundKernel, args: Sequence[Any]) -> BaseAutotuner:
-            if not isinstance(kernel, BoundKernel):
+            if not kernel.is_cacheable():
                 raise TypeError(
-                    "Autotune caches require a BoundKernel; external kernels are not cacheable"
+                    f"Autotune caches require a cacheable kernel "
+                    f"(e.g. BoundKernel); got {type(kernel).__name__}. "
+                    f"External kernels are not cacheable."
                 )
             return cls(search_cls(kernel, args))  # type: ignore[misc]
 
@@ -112,6 +123,9 @@ class LooseAutotuneCacheKey(BoundKernelInMemoryCacheKey):
     kernel_source_hash: Hash of source code of input Helion kernel
     hardware: Hardware of the input device
     runtime_name: Version of the cuda/rocm arch
+    backend: Kernel backend (e.g. triton, pallas)
+    config_spec_hash: Hash of the config spec (available knobs and their ranges)
+    extra_cache_key: Optional extra cache key from the kernel (e.g. fusion context hash)
     """
 
     kernel_source_hash: str
@@ -119,6 +133,7 @@ class LooseAutotuneCacheKey(BoundKernelInMemoryCacheKey):
     runtime_name: str
     backend: str
     config_spec_hash: str = ""
+    extra_cache_key: str = ""
 
     def stable_hash(self) -> str:
         return hashlib.sha256(repr(self).encode("utf-8")).hexdigest()
@@ -151,13 +166,14 @@ class AutotuneCacheBase(BaseAutotuner, abc.ABC, metaclass=AutotuneCacheMeta):
 
     def __init__(self, autotuner: BaseSearch) -> None:
         self.autotuner = autotuner
-        if not isinstance(self.autotuner.kernel, BoundKernel):
+        kernel = self.autotuner.kernel
+        if not kernel.is_cacheable():
             raise TypeError(
-                f"Autotune caches require a BoundKernel; got"
-                f" {type(self.autotuner.kernel).__name__}."
-                " External kernels are not cacheable."
+                f"Autotune caches require a cacheable kernel "
+                f"(e.g. BoundKernel); got {type(kernel).__name__}. "
+                f"External kernels are not cacheable."
             )
-        self.kernel: BoundKernel = self.autotuner.kernel
+        self.kernel: BoundKernel = kernel  # type: ignore[assignment]
         self.args = self.autotuner.args
 
     @abc.abstractmethod
@@ -182,22 +198,13 @@ class AutotuneCacheBase(BaseAutotuner, abc.ABC, metaclass=AutotuneCacheMeta):
         """Return a sequence of (description, key) tuples for all cache entries."""
         raise NotImplementedError
 
-    @staticmethod
-    def _skip_cache_env() -> bool:
-        """Return True when HELION_SKIP_CACHE requests that all cache I/O be skipped."""
-        return os.environ.get("HELION_SKIP_CACHE", "").strip().lower() not in {
-            "",
-            "0",
-            "false",
-        }
-
     def autotune(self, *, skip_cache: bool = False) -> Config:
         """Run autotuning, consulting and updating the on-disk cache.
 
         ``skip_cache`` (set by HELION_FORCE_AUTOTUNE) skips reading but
         still writes back.  HELION_SKIP_CACHE skips both reading and writing.
         """
-        skip_cache_env = self._skip_cache_env()
+        skip_cache_env = should_skip_cache()
         skip_read = skip_cache or skip_cache_env
 
         if not skip_read:

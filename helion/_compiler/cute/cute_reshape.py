@@ -12,9 +12,11 @@ active_device_loops, NOT from the global thread block dimensions.
 from __future__ import annotations
 
 import ast
+import contextlib
 from typing import TYPE_CHECKING
 from typing import cast
 
+import sympy
 import torch
 from torch.fx.node import Node
 from torch.fx.node import map_arg
@@ -27,6 +29,7 @@ from .indexing import is_cute_shape_chain_target
 
 if TYPE_CHECKING:
     from ..aten_lowering import LoweringContext
+    from ..compile_environment import Config
     from ..generate_ast import GenerateAST
     from ..inductor_lowering import CodegenState
 
@@ -47,7 +50,7 @@ def _shape_chain_only_users(node: Node) -> bool:
 def _get_tile_shape(
     fake_tensor: torch.Tensor,
     env: CompileEnvironment,
-    config: object,  # Config
+    config: Config,
 ) -> list[int]:
     """Map a FakeTensor's symbolic dimensions to concrete tile (block) sizes."""
     shape: list[int] = []
@@ -56,9 +59,32 @@ def _get_tile_shape(
         if block_id is not None:
             # pyrefly: ignore [bad-argument-type]
             bs = env.block_sizes[block_id].from_config(config)
-            shape.append(int(bs) if isinstance(bs, int) else int(dim_size))
-        else:
+            if isinstance(bs, int):
+                shape.append(int(bs))
+                continue
+        raw_expr = getattr(getattr(dim_size, "node", None), "_expr", None)
+        if isinstance(raw_expr, sympy.Expr):
+            replacements: dict[sympy.Symbol, sympy.Integer] = {}
+            for symbol in raw_expr.free_symbols:
+                if not isinstance(symbol, sympy.Symbol):
+                    break
+                block_id = env.get_block_id(symbol)
+                if block_id is None:
+                    break
+                # pyrefly: ignore [bad-argument-type]
+                bs = env.block_sizes[env.canonical_block_id(block_id)].from_config(
+                    config
+                )
+                if not isinstance(bs, int):
+                    break
+                replacements[symbol] = sympy.Integer(bs)
+            else:
+                shape.append(int(raw_expr.xreplace(replacements)))
+                continue
+        with contextlib.suppress(Exception):
             shape.append(int(dim_size))
+            continue
+        shape.append(env.size_hint(dim_size))
     return shape
 
 
@@ -306,6 +332,28 @@ def _inverse_permute_coords(coords: list[str], perm: list[int]) -> list[str]:
     return [coords[perm.index(i)] for i in range(len(perm))]
 
 
+def _expand_source_coords(
+    output_coords: list[str],
+    *,
+    source_shape: list[int],
+    output_shape: list[int],
+) -> list[str] | None:
+    rank_delta = len(output_shape) - len(source_shape)
+    if rank_delta < 0:
+        return None
+    source_coords: list[str] = []
+    for i, source_extent in enumerate(source_shape):
+        output_dim = i + rank_delta
+        output_extent = output_shape[output_dim]
+        if source_extent == 1:
+            source_coords.append("cutlass.Int32(0)")
+        elif source_extent == output_extent:
+            source_coords.append(output_coords[output_dim])
+        else:
+            return None
+    return source_coords
+
+
 def _stack_choice_expr(
     inputs: list[ast.AST],
     *,
@@ -364,6 +412,26 @@ def _resolve_shape_chain_expr(
         source_flat = _flat_index_from_coords(
             source_coords, _get_tile_shape(source_val, env, config)
         )
+        return _resolve_shape_chain_expr(ctx, source, source_flat)
+
+    if node.target is torch.ops.aten.expand.default:
+        source = node.args[0]
+        if not isinstance(source, Node):
+            return None
+        source_val = source.meta.get("val")
+        if not isinstance(source_val, torch.Tensor):
+            return None
+        output_shape = _get_tile_shape(value, env, config)
+        source_shape = _get_tile_shape(source_val, env, config)
+        output_coords = _coords_from_flat_index(flat_index, output_shape)
+        source_coords = _expand_source_coords(
+            output_coords,
+            source_shape=source_shape,
+            output_shape=output_shape,
+        )
+        if source_coords is None:
+            return None
+        source_flat = _flat_index_from_coords(source_coords, source_shape)
         return _resolve_shape_chain_expr(ctx, source, source_flat)
 
     if node.target is torch.ops.aten.transpose.int:
