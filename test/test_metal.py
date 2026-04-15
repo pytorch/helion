@@ -3,15 +3,17 @@ from __future__ import annotations
 import sys
 import unittest
 
-if sys.platform != "darwin":
-    raise unittest.SkipTest("Metal tests require macOS")
-
-
 import torch
 
 import helion
-from helion._compiler.metal.metal_jit import _MetalKernel
 import helion.language as hl
+
+if sys.platform == "darwin":
+    from helion._compiler.metal.metal_jit import _MetalKernel
+
+_requires_darwin = unittest.skipIf(
+    sys.platform != "darwin", "Metal tests require macOS"
+)
 
 DEVICE = "mps"
 
@@ -27,7 +29,7 @@ def _get_msl(kernel: helion.Kernel, args: tuple[object, ...]) -> str:
     """
     from torch._inductor.codecache import PyCodeCache
 
-    code = kernel.bind(args).to_triton_code()
+    code = kernel.bind(args).to_code()
     module = PyCodeCache.load(code)
     # Call the host function by name
     host_fn = getattr(module, kernel.fn.__name__)
@@ -215,6 +217,7 @@ def clamp_kernel(x: torch.Tensor, lo: float, hi: float) -> torch.Tensor:
 # ---------------------------------------------------------------------------
 
 
+@_requires_darwin
 class TestMetalCopy(unittest.TestCase):
     """Copy kernels that test load/store + masking."""
 
@@ -250,6 +253,7 @@ class TestMetalCopy(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
+@_requires_darwin
 class TestMetalBoundsMasking(unittest.TestCase):
     """Bounds masking tests using vector_add for both load and store paths."""
 
@@ -330,6 +334,7 @@ class TestMetalBoundsMasking(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
+@_requires_darwin
 class TestMetalArithmetic(unittest.TestCase):
     """Basic arithmetic elementwise kernels."""
 
@@ -363,6 +368,7 @@ class TestMetalArithmetic(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
+@_requires_darwin
 class TestMetalScalarArgs(unittest.TestCase):
     """Kernels that accept scalar (SymbolArgument) parameters."""
 
@@ -378,6 +384,7 @@ class TestMetalScalarArgs(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
+@_requires_darwin
 class TestMetalActivations(unittest.TestCase):
     """Activation function kernels."""
 
@@ -402,6 +409,7 @@ class TestMetalActivations(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
+@_requires_darwin
 class TestMetalMathOps(unittest.TestCase):
     """Math function kernels."""
 
@@ -438,6 +446,7 @@ class TestMetalMathOps(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
+@_requires_darwin
 class TestMetalDtypes(unittest.TestCase):
     """Elementwise ops across different dtypes."""
 
