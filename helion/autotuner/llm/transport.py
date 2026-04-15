@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import json
 import os
 import ssl
+from typing import TYPE_CHECKING
 from typing import Any
 from urllib import error as urllib_error
 from urllib import request as urllib_request
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 DEFAULT_REQUEST_TIMEOUT_S = 120.0
 # OpenAI Responses does not consume a temperature knob in our current request path,
@@ -128,6 +133,108 @@ def extract_anthropic_text(response: dict[str, object]) -> str:
     raise RuntimeError(f"Unexpected Anthropic payload: {response}")
 
 
+def _openai_payload(
+    model: str,
+    messages: list[dict[str, str]],
+    max_output_tokens: int,
+) -> dict[str, Any]:
+    """Build an OpenAI Responses request payload."""
+    system_prompt, input_messages = split_system_messages(messages)
+    payload: dict[str, Any] = {
+        "model": strip_provider_prefix(model),
+        "input": responses_input_from_messages(input_messages),
+        "max_output_tokens": max_output_tokens,
+    }
+    if system_prompt:
+        payload["instructions"] = system_prompt
+    return payload
+
+
+def _anthropic_payload(
+    model: str,
+    messages: list[dict[str, str]],
+    max_output_tokens: int,
+) -> dict[str, Any]:
+    """Build an Anthropic Messages request payload."""
+    system_prompt, input_messages = split_system_messages(messages)
+    payload: dict[str, Any] = {
+        "model": strip_provider_prefix(model),
+        "messages": anthropic_messages_from_history(input_messages),
+        "max_tokens": max_output_tokens,
+        "temperature": DEFAULT_ANTHROPIC_TEMPERATURE,
+    }
+    if system_prompt:
+        payload["system"] = system_prompt
+    return payload
+
+
+def _openai_headers(api_key: str) -> dict[str, str]:
+    """Build OpenAI-compatible auth headers."""
+    return {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+
+
+def _anthropic_headers(api_key: str) -> dict[str, str]:
+    """Build Anthropic Messages auth headers."""
+    return {
+        "content-type": "application/json",
+        "anthropic-version": "2023-06-01",
+        "x-api-key": api_key,
+    }
+
+
+@dataclass(frozen=True)
+class _ProviderConfig:
+    """Provider-specific transport configuration."""
+
+    endpoint: str
+    default_api_base: str
+    api_base_env_names: tuple[str, ...]
+    api_key_env_names: tuple[str, ...]
+    missing_api_key_error: str
+    build_payload: Callable[[str, list[dict[str, str]], int], dict[str, Any]]
+    build_headers: Callable[[str], dict[str, str]]
+    extract_text: Callable[[dict[str, object]], str]
+
+
+_PROVIDER_CONFIGS = {
+    "openai_responses": _ProviderConfig(
+        endpoint="responses",
+        default_api_base="https://api.openai.com",
+        api_base_env_names=("OPENAI_BASE_URL", "OPENAI_API_BASE"),
+        api_key_env_names=("OPENAI_API_KEY",),
+        missing_api_key_error=(
+            "OpenAI-compatible model requested but no api_key, HELION_LLM_API_KEY, "
+            "or OPENAI_API_KEY is set"
+        ),
+        build_payload=_openai_payload,
+        build_headers=_openai_headers,
+        extract_text=extract_openai_response_text,
+    ),
+    "anthropic": _ProviderConfig(
+        endpoint="messages",
+        default_api_base="https://api.anthropic.com",
+        api_base_env_names=("ANTHROPIC_BASE_URL",),
+        api_key_env_names=("ANTHROPIC_API_KEY",),
+        missing_api_key_error=(
+            "Anthropic model requested but no api_key, HELION_LLM_API_KEY, "
+            "or ANTHROPIC_API_KEY is set"
+        ),
+        build_payload=_anthropic_payload,
+        build_headers=_anthropic_headers,
+        extract_text=extract_anthropic_text,
+    ),
+}
+
+
+def _provider_config(provider: str) -> _ProviderConfig:
+    """Return the provider-specific transport configuration."""
+    normalized_provider = normalize_provider(provider)
+    return _PROVIDER_CONFIGS[normalized_provider]
+
+
 def _first_set_env(*names: str) -> str | None:
     """Return the first env var in the list that is present."""
     for name in names:
@@ -149,14 +256,8 @@ def _resolve_api_base(provider: str, api_base: str | None) -> str:
         return api_base
     if (generic_api_base := os.environ.get("HELION_LLM_API_BASE")) is not None:
         return generic_api_base
-    if provider == "openai_responses":
-        return (
-            os.environ.get("OPENAI_BASE_URL")
-            or os.environ.get("OPENAI_API_BASE")
-            or "https://api.openai.com"
-        )
-    assert provider == "anthropic"
-    return os.environ.get("ANTHROPIC_BASE_URL") or "https://api.anthropic.com"
+    config = _provider_config(provider)
+    return _first_set_env(*config.api_base_env_names) or config.default_api_base
 
 
 def _resolve_api_key(provider: str, api_key: str | None) -> str:
@@ -165,20 +266,10 @@ def _resolve_api_key(provider: str, api_key: str | None) -> str:
         return api_key
     if (generic_api_key := os.environ.get("HELION_LLM_API_KEY")) is not None:
         return generic_api_key
-    if provider == "openai_responses":
-        if (openai_api_key := os.environ.get("OPENAI_API_KEY")) is not None:
-            return openai_api_key
-        raise RuntimeError(
-            "OpenAI-compatible model requested but no api_key, HELION_LLM_API_KEY, "
-            "or OPENAI_API_KEY is set"
-        )
-    assert provider == "anthropic"
-    if (anthropic_api_key := os.environ.get("ANTHROPIC_API_KEY")) is not None:
-        return anthropic_api_key
-    raise RuntimeError(
-        "Anthropic model requested but no api_key, HELION_LLM_API_KEY, "
-        "or ANTHROPIC_API_KEY is set"
-    )
+    config = _provider_config(provider)
+    if resolved_api_key := _first_set_env(*config.api_key_env_names):
+        return resolved_api_key
+    raise RuntimeError(config.missing_api_key_error)
 
 
 def _resolve_v1_endpoint(api_base: str, endpoint: str) -> str:
@@ -217,44 +308,30 @@ def _build_provider_payload(
     max_output_tokens: int,
 ) -> dict[str, Any]:
     """Build the JSON request body for the selected provider."""
-    normalized_model = strip_provider_prefix(model)
-    system_prompt, input_messages = split_system_messages(messages)
-    if provider == "openai_responses":
-        payload: dict[str, Any] = {
-            "model": normalized_model,
-            "input": responses_input_from_messages(input_messages),
-            "max_output_tokens": max_output_tokens,
-        }
-        if system_prompt:
-            payload["instructions"] = system_prompt
-        return payload
-
-    assert provider == "anthropic"
-    payload = {
-        "model": normalized_model,
-        "messages": anthropic_messages_from_history(input_messages),
-        "max_tokens": max_output_tokens,
-        "temperature": DEFAULT_ANTHROPIC_TEMPERATURE,
-    }
-    if system_prompt:
-        payload["system"] = system_prompt
-    return payload
+    return _provider_config(provider).build_payload(model, messages, max_output_tokens)
 
 
 def _build_provider_headers(provider: str, api_key: str) -> dict[str, str]:
     """Build auth and content headers for the selected provider."""
-    if provider == "openai_responses":
-        return {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        }
+    return _provider_config(provider).build_headers(api_key)
 
-    assert provider == "anthropic"
-    return {
-        "content-type": "application/json",
-        "anthropic-version": "2023-06-01",
-        "x-api-key": api_key,
-    }
+
+def _load_json_response(
+    request: urllib_request.Request,
+    *,
+    request_timeout_s: float,
+    ssl_context: ssl.SSLContext | None,
+) -> object:
+    """Load one JSON response body, optionally using a custom SSL context."""
+    if ssl_context is None:
+        with urllib_request.urlopen(request, timeout=request_timeout_s) as response:
+            return json.load(response)
+    with urllib_request.urlopen(
+        request,
+        timeout=request_timeout_s,
+        context=ssl_context,
+    ) as response:
+        return json.load(response)
 
 
 def _post_json(
@@ -272,19 +349,11 @@ def _post_json(
         method="POST",
     )
     try:
-        if (ssl_context := _build_ssl_context()) is not None:
-            with urllib_request.urlopen(
-                request,
-                timeout=request_timeout_s,
-                context=ssl_context,
-            ) as response:
-                body = json.load(response)
-        else:
-            with urllib_request.urlopen(
-                request,
-                timeout=request_timeout_s,
-            ) as response:
-                body = json.load(response)
+        body = _load_json_response(
+            request,
+            request_timeout_s=request_timeout_s,
+            ssl_context=_build_ssl_context(),
+        )
     except urllib_error.HTTPError as e:
         body = e.read().decode("utf-8", errors="replace")
         raise RuntimeError(f"HTTP {e.code} from {url}: {body}") from e
@@ -307,20 +376,21 @@ def call_provider(
     request_timeout_s: float,
 ) -> str:
     """Resolve credentials, send one request, and extract text from the response."""
-    endpoint = "responses" if provider == "openai_responses" else "messages"
-    resolved_api_key = _resolve_api_key(provider, api_key)
+    normalized_provider = normalize_provider(provider)
+    config = _provider_config(normalized_provider)
+    resolved_api_key = _resolve_api_key(normalized_provider, api_key)
     response = _post_json(
-        _resolve_v1_endpoint(_resolve_api_base(provider, api_base), endpoint),
+        _resolve_v1_endpoint(
+            _resolve_api_base(normalized_provider, api_base),
+            config.endpoint,
+        ),
         _build_provider_payload(
-            provider,
+            normalized_provider,
             model=model,
             messages=messages,
             max_output_tokens=max_output_tokens,
         ),
-        _build_provider_headers(provider, resolved_api_key),
+        _build_provider_headers(normalized_provider, resolved_api_key),
         request_timeout_s=request_timeout_s,
     )
-    if provider == "openai_responses":
-        return extract_openai_response_text(response)
-    assert provider == "anthropic"
-    return extract_anthropic_text(response)
+    return config.extract_text(response)

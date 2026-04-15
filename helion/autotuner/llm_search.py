@@ -18,8 +18,10 @@ High-level flow:
 6. The final returned config comes from the best rebenchmarked config,
    not from an unrechecked one-shot LLM suggestion.
 
-The implementation keeps prompt formatting, transport, and search orchestration
-separate:
+The implementation keeps config parsing, workload analysis, prompting,
+transport, and search orchestration separate:
+- `configs.py` parses and validates sparse configs from LLM responses.
+- `workload.py` analyzes the kernel and hardware for prompt context.
 - `feedback.py` summarizes benchmark results for prompts.
 - `prompting.py` builds the actual prompt text.
 - `transport.py` handles provider I/O.
