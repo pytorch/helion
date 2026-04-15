@@ -2676,7 +2676,7 @@ class TestLLMGuidedSearch(TestCase):
         self.assertEqual(kwargs["configs_per_round"], 15)
         self.assertEqual(kwargs["max_rounds"], 4)
         self.assertEqual(kwargs["initial_random_configs"], 10)
-        self.assertNotIn("compile_timeout_s", kwargs)
+        self.assertEqual(kwargs["compile_timeout_s"], 15)
 
         quick_kwargs = LLMGuidedSearch.get_kwargs_from_profile(
             get_effort_profile("quick"), Settings()
@@ -2702,7 +2702,7 @@ class TestLLMGuidedSearch(TestCase):
         self.assertEqual(kwargs["provider"], "openai")
         self.assertEqual(kwargs["model"], "gpt-4.1-mini")
         self.assertEqual(kwargs["initial_random_configs"], 10)
-        self.assertNotIn("compile_timeout_s", kwargs)
+        self.assertEqual(kwargs["compile_timeout_s"], 21)
         self.assertNotIn("temperature", kwargs)
         self.assertNotIn("max_output_tokens", kwargs)
 

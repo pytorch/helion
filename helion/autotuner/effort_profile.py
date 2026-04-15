@@ -10,6 +10,7 @@ DEFAULT_LLM_MODEL = "gpt-5-2"
 DEFAULT_LLM_CONFIGS_PER_ROUND = 15
 DEFAULT_LLM_MAX_ROUNDS = 4
 DEFAULT_LLM_INITIAL_RANDOM_CONFIGS = 10
+DEFAULT_LLM_COMPILE_TIMEOUT_S: int | None = 15
 
 
 @dataclass(frozen=True)
@@ -44,6 +45,7 @@ class LLMSearchConfig:
     configs_per_round: int = DEFAULT_LLM_CONFIGS_PER_ROUND
     max_rounds: int = DEFAULT_LLM_MAX_ROUNDS
     initial_random_configs: int = DEFAULT_LLM_INITIAL_RANDOM_CONFIGS
+    compile_timeout_s: int | None = DEFAULT_LLM_COMPILE_TIMEOUT_S
 
 
 # Default values for each algorithm (single source of truth)

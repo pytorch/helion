@@ -18,8 +18,10 @@ High-level flow:
 6. The final returned config comes from the best rebenchmarked config,
    not from an unrechecked one-shot LLM suggestion.
 
-The implementation keeps prompt formatting, transport, and search orchestration
-separate:
+The implementation keeps config parsing, workload analysis, prompting,
+transport, and search orchestration separate:
+- `configs.py` parses and validates sparse configs from LLM responses.
+- `workload.py` analyzes the kernel and hardware for prompt context.
 - `feedback.py` summarizes benchmark results for prompts.
 - `prompting.py` builds the actual prompt text.
 - `transport.py` handles provider I/O.
@@ -29,6 +31,7 @@ separate:
 from __future__ import annotations
 
 import concurrent.futures
+import contextlib
 from dataclasses import dataclass
 import math
 import os
@@ -59,6 +62,7 @@ from .llm.transport import call_provider as _call_provider
 from .llm.transport import infer_provider as _infer_provider
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
     from collections.abc import Sequence
 
     from ..runtime.config import Config
@@ -98,6 +102,7 @@ def guided_search_kwargs_from_config(
                 "configs_per_round": config.configs_per_round,
                 "max_rounds": config.max_rounds,
                 "initial_random_configs": config.initial_random_configs,
+                "compile_timeout_s": config.compile_timeout_s,
             }
         )
 
@@ -105,6 +110,8 @@ def guided_search_kwargs_from_config(
         kwargs["provider"] = provider
     if (model := os.environ.get("HELION_LLM_MODEL")) is not None:
         kwargs["model"] = model
+    if (value := os.environ.get("HELION_LLM_COMPILE_TIMEOUT_S")) is not None:
+        kwargs["compile_timeout_s"] = int(value)
     return kwargs
 
 
@@ -151,6 +158,8 @@ class LLMGuidedSearch(PopulationBasedSearch):
         finishing_rounds: Number of finishing rounds to simplify the best config.
         api_base: Optional custom API base URL for the LLM provider.
         api_key: Optional API key. Defaults to the provider's env var (e.g. OPENAI_API_KEY).
+        compile_timeout_s: Optional compile-time cap applied only while the LLM
+            search benchmarks its exploratory configs.
     """
 
     def __init__(
@@ -168,6 +177,7 @@ class LLMGuidedSearch(PopulationBasedSearch):
         api_base: str | None = None,
         api_key: str | None = None,
         request_timeout_s: float = DEFAULT_REQUEST_TIMEOUT_S,
+        compile_timeout_s: int | None = None,
     ) -> None:
         super().__init__(kernel, args, finishing_rounds=finishing_rounds)
         if max_rounds < 1:
@@ -183,6 +193,7 @@ class LLMGuidedSearch(PopulationBasedSearch):
         self.api_base = api_base
         self.api_key = api_key
         self.request_timeout_s = request_timeout_s
+        self.compile_timeout_s = compile_timeout_s
 
         self._messages: list[dict[str, str]] = []
         self._all_benchmark_results: list[BenchmarkResult] = []
@@ -317,6 +328,26 @@ class LLMGuidedSearch(PopulationBasedSearch):
         )
 
     # ── Search loop ──────────────────────────────────────────────
+
+    @contextlib.contextmanager
+    def _llm_search_settings_context(self) -> Iterator[None]:
+        """LLM proposals timed out more often per config, so fail them fast."""
+        if self.compile_timeout_s is None:
+            yield
+            return
+
+        original_compile_timeout = self.settings.autotune_compile_timeout
+        self.settings.autotune_compile_timeout = min(
+            original_compile_timeout,
+            self.compile_timeout_s,
+        )
+        self.log(
+            f"LLM compile timeout capped at {self.settings.autotune_compile_timeout}s"
+        )
+        try:
+            yield
+        finally:
+            self.settings.autotune_compile_timeout = original_compile_timeout
 
     def _config_key(self, cfg: Config) -> str:
         """Return the stable key used to dedupe configs across rounds."""
@@ -581,7 +612,8 @@ class LLMGuidedSearch(PopulationBasedSearch):
             f"max_rounds={self.max_rounds}"
         )
         try:
-            return self._autotune_inner()
+            with self._llm_search_settings_context():
+                return self._autotune_inner()
         finally:
             if (executor := getattr(self, "_llm_executor", None)) is not None:
                 executor.shutdown(wait=False, cancel_futures=True)
@@ -590,7 +622,6 @@ class LLMGuidedSearch(PopulationBasedSearch):
 
     def _autotune_inner(self) -> Config:
         """Run round 0 once, then iterate the synchronized refinement rounds."""
-        # Run round 0 once, then iterate the regular refinement rounds.
         self._initialize_prompt_state()
         state = _SearchLoopState(seen_config_keys=set())
         self._run_initial_round(state)
