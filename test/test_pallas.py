@@ -745,6 +745,10 @@ class TestPallas(TestCase):
         # excluded from pallas_call inputs (no donation, no graph split).
         self.assertIn("_output_indices=[1]", code)
         self.assertIn("_inplace_indices=[]", code)
+        # Output-only allocation wrapped in FakeTensorMode (no real HBM).
+        self.assertIn("FakeTensorMode", code)
+        # Launcher return captured into output variable.
+        self.assertIn("out = _launcher(", code)
 
     def test_new_empty_output_only(self) -> None:
         """new_empty allocations should also be recognized as output-only."""
@@ -760,6 +764,8 @@ class TestPallas(TestCase):
         code, result = code_and_output(new_empty_relu, (x,), block_sizes=[1024])
         torch.testing.assert_close(result, torch.relu(x))
         self.assertIn("_inplace_indices=[]", code)
+        self.assertIn("FakeTensorMode", code)
+        self.assertIn("out = _launcher(", code)
 
     def test_mixed_inplace_and_output_only(self) -> None:
         """Kernel with both an inplace-mutated input and an output-only tensor.
@@ -784,6 +790,8 @@ class TestPallas(TestCase):
         # out is excluded from pallas_call inputs.
         self.assertIn("_output_indices=[0, 1]", code)
         self.assertIn("_inplace_indices=[0]", code)
+        self.assertIn("FakeTensorMode", code)
+        self.assertIn("out = _launcher(", code)
 
     def test_empty_like_read_stays_inplace(self) -> None:
         """An empty_like output that is also read should stay in _inplace_indices."""
@@ -801,6 +809,8 @@ class TestPallas(TestCase):
         torch.testing.assert_close(result, x + 1.0)
         # out is read after write, so it must be in _inplace_indices
         self.assertIn("_inplace_indices=[1]", code)
+        # Not output-only, so no FakeTensorMode wrapping.
+        self.assertNotIn("FakeTensorMode", code)
 
     def test_multiple_output_only(self) -> None:
         """Kernel returning two output-only tensors."""
@@ -823,6 +833,8 @@ class TestPallas(TestCase):
         # Both outputs are output-only: 2 outputs, 0 aliases
         self.assertIn("_output_indices=[1, 2]", code)
         self.assertIn("_inplace_indices=[]", code)
+        self.assertIn("FakeTensorMode", code)
+        self.assertIn("out1, out2 = _launcher(", code)
 
 
 if __name__ == "__main__":

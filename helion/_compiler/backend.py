@@ -942,6 +942,7 @@ class PallasBackend(Backend):
             "_default_pallas_launcher": "from helion.runtime import default_pallas_launcher as _default_pallas_launcher",
             "_default_pallas_pipeline_launcher": "from helion.runtime import default_pallas_pipeline_launcher as _default_pallas_pipeline_launcher",
             "_default_pallas_fori_launcher": "from helion.runtime import default_pallas_fori_launcher as _default_pallas_fori_launcher",
+            "FakeTensorMode": "from torch._subclasses.fake_tensor import FakeTensorMode",
         }
 
     # Config keys that Pallas actually uses.  Everything else
@@ -1518,6 +1519,18 @@ class PallasBackend(Backend):
                     # Input tensor mutated in-place
                     output_indices.append(i)
                     inplace_indices.append(i)
+
+        # Collect output-only tensor names for FakeTensorMode wrapping
+        # and launcher return capture in codegen.
+        output_only_set = set(output_indices) - set(inplace_indices)
+        output_only_names: list[str] = []
+        if sorted_args is not None:
+            for i in output_indices:
+                if i in output_only_set:
+                    arg = sorted_args[i]
+                    assert isinstance(arg, TensorArg)
+                    output_only_names.append(arg.host_str())
+        self._output_only_names = output_only_names
 
         launcher_args = [*args, f"_output_indices={output_indices}"]
         launcher_args.append(f"_inplace_indices={inplace_indices}")
