@@ -128,13 +128,9 @@ class ConfigGeneration:
                 assert isinstance(value, list)
                 field = flat_fields[key]
                 assert isinstance(field, BlockIdSequence)
-                # Sequence specs can normalize values in Config differently
-                # from how they are stored in FlatConfig. Only
-                # ReductionLoopSpec overrides this today, but keep the dispatch
-                # on the spec so flatten() remains the generic inverse of
-                # unflatten().
-                for idx, spec, v in zip(indices, field, value, strict=True):
-                    result[idx] = spec._encode_flat_value(self.config_spec, v)
+                encoded_values = field._encode_flat_values(self.config_spec, value)
+                for idx, encoded_value in zip(indices, encoded_values, strict=True):
+                    result[idx] = encoded_value
             else:
                 assert len(indices) == 1
                 result[indices[0]] = value

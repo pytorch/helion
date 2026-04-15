@@ -168,6 +168,16 @@ class BlockIdSequence(MutableSequence[_BlockIdItemT]):
         """Map a flattened version of the config using the given function."""
         return [spec._flat_config(base, fn) for spec in self._data]
 
+    def _encode_flat_values(
+        self, base: ConfigSpec, values: list[object]
+    ) -> list[object]:
+        """Encode normalized Config values into their flat-slot representation."""
+        assert len(values) == len(self)
+        return [
+            spec._encode_flat_value(base, value)
+            for spec, value in zip(self._data, values, strict=True)
+        ]
+
     def _reset_config_to_default(
         self, name: str, values: object, *, block_ids: list[int] | None = None
     ) -> list[object]:

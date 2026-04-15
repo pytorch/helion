@@ -1141,12 +1141,13 @@ class ReductionLoopSpec(_PowerOfTwoBlockIdItem):
         self, base: ConfigSpec, fn: Callable[[ConfigSpecFragment], object]
     ) -> int | None:
         fragment = self._flat_fragment(base)
+        low = fragment.low
+        high = fragment.high
         value = fn(fragment)
         assert isinstance(value, int)
-        if not (fragment.low <= value <= fragment.high):
+        if not (low <= value <= high):
             raise InvalidConfig(
-                "Invalid value for reduction loop "
-                f"{fragment.low} <= {value} <= {fragment.high}"
+                f"Invalid value for reduction loop {low} <= {value} <= {high}"
             )
         if value >= self.size_hint:
             return None  # max size becomes persistent reduction
