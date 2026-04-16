@@ -360,6 +360,16 @@ def _pallas_jnp_dtype_map() -> dict[str, object]:
         "jnp.uint8": jnp.uint8,
         "jnp.bool_": jnp.bool_,
     }
+def _pallas_check_dtypes(args: tuple[object, ...]) -> None:
+    """Raise if any tensor arg uses a dtype unsupported on TPU."""
+    from .._compiler.backend import _PALLAS_UNSUPPORTED_DTYPES
+
+    for a in args:
+        if isinstance(a, torch.Tensor) and a.dtype in _PALLAS_UNSUPPORTED_DTYPES:
+            raise TypeError(
+                f"Pallas/TPU does not support {a.dtype} tensors. "
+                f"Cast to a 32-bit type before calling the kernel."
+            )
 
 
 def _pallas_prepare_args(
@@ -606,6 +616,8 @@ def default_pallas_launcher(
     if _output_indices is None:
         _output_indices = []
 
+    _pallas_check_dtypes(args)
+
     cache = getattr(pallas_kernel, "_pallas_cache", None)
     if cache is not None and cache[0] == grid:
         _, jax_callable, tensor_arg_indices = cache
@@ -718,6 +730,8 @@ def default_pallas_pipeline_launcher(
         _output_indices = []
     if _scratch_shapes is None:
         _scratch_shapes = []
+
+    _pallas_check_dtypes(args)
 
     cache = getattr(pallas_kernel, "_pallas_pipeline_cache", None)
     if cache is not None and cache[0] == grid:
@@ -850,6 +864,8 @@ def default_pallas_fori_launcher(
         _output_indices = []
     if _scratch_shapes is None:
         _scratch_shapes = []
+
+    _pallas_check_dtypes(args)
 
     cache = getattr(pallas_kernel, "_pallas_fori_cache", None)
     if cache is not None and cache[0] == grid:

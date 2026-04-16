@@ -248,6 +248,12 @@ if _get_backend() == "pallas":
 else:
     HALF_DTYPE = torch.float16
 
+# Long integer dtype: int32 on TPU (64-bit types not supported), int64 elsewhere
+if _get_backend() == "pallas":
+    LONG_INT_TYPE = torch.int32
+else:
+    LONG_INT_TYPE = torch.int64
+
 
 def get_nvidia_gpu_model() -> str:
     """
