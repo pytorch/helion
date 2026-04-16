@@ -448,6 +448,17 @@ class Backend(abc.ABC):
         """
         return None
 
+    @staticmethod
+    def reserved_launch_param_names() -> frozenset[str]:
+        """Names reserved by this backend's kernel launch mechanism.
+
+        These names cannot be used as kernel variables because they
+        collide with parameters of the backend's kernel launch API
+        (e.g., Triton's ``run()`` method uses ``grid``, ``num_warps``,
+        ``num_stages``, etc.).
+        """
+        return frozenset()
+
     def transform_host_arg(
         self,
         arg: Argument,
@@ -846,6 +857,10 @@ class TritonBackend(Backend):
         out.extend(self.launcher_keyword_args(config, has_barrier=has_barrier))
         return out
 
+    @staticmethod
+    def reserved_launch_param_names() -> frozenset[str]:
+        return frozenset({"grid", "warmup", "num_warps", "num_stages"})
+
 
 class TileIRBackend(TritonBackend):
     """TileIR code generation backend (extends Triton)."""
@@ -875,6 +890,12 @@ class TileIRBackend(TritonBackend):
             "num_ctas": PowerOfTwoFragment(1, 2, 1),
             "occupancy": PowerOfTwoFragment(1, 8, 1),
         }
+
+    @staticmethod
+    def reserved_launch_param_names() -> frozenset[str]:
+        return frozenset(
+            {"grid", "warmup", "num_warps", "num_stages", "num_ctas", "occupancy"}
+        )
 
 
 # Mapping from torch dtype to JAX dtype string (e.g., "jnp.float32")
