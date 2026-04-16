@@ -21,7 +21,6 @@ if TYPE_CHECKING:
     from torch._inductor.ops_handler import OpsHandler
 
     from ..autotuner.config_fragment import ConfigSpecFragment
-    from ..runtime import _BlockSpecInfo
     from ..runtime.config import Config
     from ..runtime.kernel import BoundKernel
     from .device_function import Argument
@@ -1401,18 +1400,8 @@ class PallasBackend(Backend):
                 if bid is not None and bid in known_block_ids:
                     bs = env.block_sizes[bid].from_config(config)
                     if isinstance(bs, int):
-                        # Check that the block size meets Pallas requirements:
-                        # https://docs.jax.dev/en/latest/pallas/grid_blockspec.html
-                        # If not, fall-back to no tiling for the entire kernel
-                        dim_size = tensor.shape[d]
-                        dim_from_end = tensor.ndim - 1 - d
-                        bitwidth = tensor.dtype.itemsize * 8
-                        required_alignment = self._get_pallas_required_alignment(
-                            dim_from_end, tensor.ndim, bitwidth
-                        )
-                        if bs != dim_size and bs % required_alignment != 0:
-                            return self._no_tiling_block_spec_info(sorted_args)
                         block_shape.append(bs)
+                        dim_size = tensor.shape[d]
                         # When the block covers the entire tensor
                         # dimension there is only one tile, so the grid
                         # index must be constant 0 — iterating would
@@ -1428,27 +1417,6 @@ class PallasBackend(Backend):
                 block_shape.append(None)
                 grid_dims.append(None)
             result.append((tuple(block_shape), tuple(grid_dims)))
-        return result
-
-    def _no_tiling_block_spec_info(
-        self,
-        sorted_args: list[Argument],
-    ) -> _BlockSpecInfo:
-        result: _BlockSpecInfo = []
-
-        from .device_function import SymbolArgument
-        from .device_function import TensorArg
-        from .device_function import TensorSizeArg
-        from .device_function import TensorStrideArg
-
-        for arg in sorted_args:
-            if isinstance(arg, (SymbolArgument, TensorSizeArg, TensorStrideArg)):
-                result.append(None)  # scalars wrapped as 1-D tensors
-                continue
-            if not isinstance(arg, TensorArg) or arg.fake_value.ndim == 0:
-                continue
-            tensor = arg.fake_value
-            result.append((((None,) * tensor.ndim), ((None,) * tensor.ndim)))
         return result
 
     def build_launcher_args(
