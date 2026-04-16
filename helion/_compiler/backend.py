@@ -883,8 +883,6 @@ _TORCH_TO_JAX_DTYPE: dict[str, str] = {
     "torch.float32": "jnp.float32",
     "torch.float64": "jnp.float64",
     "torch.bfloat16": "jnp.bfloat16",
-    "torch.float8_e4m3fn": "jnp.float8_e4m3fn",
-    "torch.float8_e5m2": "jnp.float8_e5m2",
     "torch.int8": "jnp.int8",
     "torch.int16": "jnp.int16",
     "torch.int32": "jnp.int32",
