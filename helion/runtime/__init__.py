@@ -241,7 +241,7 @@ def _get_vmem_limit_bytes(pltpu: object) -> int:
         return _CACHED_VMEM_LIMIT_BYTES
 
     try:
-        get_tpu_info = pltpu.get_tpu_info
+        get_tpu_info = pltpu.get_tpu_info  # pyrefly: ignore[missing-attribute]
         _CACHED_VMEM_LIMIT_BYTES = get_tpu_info().vmem_capacity_bytes
     except Exception:
         # Fallback if JAX fails to acquire the TPU backend lock (e.g., in a precompile fork).
