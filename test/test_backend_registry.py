@@ -4,6 +4,7 @@ import unittest
 
 from helion._compiler.backend import Backend
 from helion._compiler.backend_registry import _REGISTRY
+from helion._compiler.backend_registry import all_reserved_launch_param_names
 from helion._compiler.backend_registry import get_backend_class
 from helion._compiler.backend_registry import list_backends
 from helion._compiler.backend_registry import register_compiler_backend
@@ -60,6 +61,16 @@ class TestBackendRegistry(unittest.TestCase):
             self.assertTrue(_TestBackend().experimental)
         finally:
             _REGISTRY.pop("_test_custom", None)
+
+    def test_all_reserved_launch_param_names_is_union(self) -> None:
+        result = all_reserved_launch_param_names()
+        self.assertIsInstance(result, frozenset)
+        # must contain at least the triton names
+        for expected in ("grid", "warmup", "num_warps", "num_stages"):
+            self.assertIn(expected, result)
+        # must be the union of all backends
+        for cls in _REGISTRY.values():
+            self.assertTrue(cls.reserved_launch_param_names().issubset(result))
 
 
 if __name__ == "__main__":
