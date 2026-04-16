@@ -53,7 +53,7 @@ def list_backends() -> list[str]:
     return list(_REGISTRY.keys())
 
 
-def all_reserved_launch_param_names() -> list[str]:
+def all_reserved_launch_param_names() -> frozenset[str]:
     """Union of reserved launch param names across all registered backends.
 
     Reserving all names ensures kernel portability. A variable name
@@ -63,7 +63,7 @@ def all_reserved_launch_param_names() -> list[str]:
     result: set[str] = set()
     for backend_cls in _REGISTRY.values():
         result.update(backend_cls.reserved_launch_param_names())
-    return list(result)
+    return frozenset(result)
 
 
 # register built-in backends

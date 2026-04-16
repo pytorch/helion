@@ -263,13 +263,11 @@ class DeviceFunction:
         self.namespace: _Namespace = _Namespace()
         self.namespace._used_names.update(reserved_names())
 
+        self.namespace._used_names.update(all_reserved_launch_param_names())
         self.namespace._used_names.update(
-            all_reserved_launch_param_names()
-            + [
-                x.removeprefix("_triton_config_")
-                for x in config
-                if x.startswith("_triton_config_")
-            ]
+            x.removeprefix("_triton_config_")
+            for x in config
+            if x.startswith("_triton_config_")
         )
         self._variable_renames: dict[str, list[str]] = {}
         self.dce_vars: list[str] = []

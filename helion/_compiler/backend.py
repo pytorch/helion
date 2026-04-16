@@ -436,7 +436,6 @@ class Backend(abc.ABC):
     def launcher_keyword_args(self, config: Config, *, has_barrier: bool) -> list[str]:
         return []
 
-<<<<<<< HEAD
     def pre_codegen(
         self,
         graphs: list[GraphInfo],
@@ -448,9 +447,9 @@ class Backend(abc.ABC):
         Backends can override this to analyze or transform the graphs.
         """
         return None
-=======
+
     @staticmethod
-    def reserved_launch_param_names() -> list[str]:
+    def reserved_launch_param_names() -> frozenset[str]:
         """Names reserved by this backend's kernel launch mechanism.
 
         These names cannot be used as kernel variables because they
@@ -458,8 +457,7 @@ class Backend(abc.ABC):
         (e.g., Triton's ``run()`` method uses ``grid``, ``num_warps``,
         ``num_stages``, etc.).
         """
-        return []
->>>>>>> 16b8a939 (moved backend specific reserved names to backend)
+        return frozenset()
 
     def transform_host_arg(
         self,
@@ -860,8 +858,8 @@ class TritonBackend(Backend):
         return out
 
     @staticmethod
-    def reserved_launch_param_names() -> list[str]:
-        return ["grid", "warmup", "num_warps", "num_stages"]
+    def reserved_launch_param_names() -> frozenset[str]:
+        return frozenset({"grid", "warmup", "num_warps", "num_stages"})
 
 
 class TileIRBackend(TritonBackend):
@@ -894,8 +892,10 @@ class TileIRBackend(TritonBackend):
         }
 
     @staticmethod
-    def reserved_launch_param_names() -> list[str]:
-        return ["grid", "warmup", "num_warps", "num_stages", "num_ctas", "occupancy"]
+    def reserved_launch_param_names() -> frozenset[str]:
+        return frozenset(
+            {"grid", "warmup", "num_warps", "num_stages", "num_ctas", "occupancy"}
+        )
 
 
 # Mapping from torch dtype to JAX dtype string (e.g., "jnp.float32")
@@ -927,10 +927,6 @@ class PallasBackend(Backend):
     @property
     def name(self) -> str:
         return "pallas"
-
-    @property
-    def experimental(self) -> bool:
-        return True
 
     def dtype_str(self, dtype: torch.dtype) -> str:
         key = str(dtype)
@@ -2808,10 +2804,6 @@ class CuteBackend(Backend):
 
 class MetalBackend(Backend):
     """Metal Shading Language (MSL) code generation backend for macOS."""
-
-    @property
-    def experimental(self) -> bool:
-        return True
 
     @staticmethod
     def _get_dtype_to_metal() -> dict[torch.dtype, str]:
