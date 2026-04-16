@@ -290,7 +290,7 @@ def _pallas_generated_index_code(
         )
 
     if isinstance(pattern, ArbitrarySlicePattern):
-        return _pallas_slice_code(idx, pattern, state, tensor, subscript_index)
+        return _pallas_slice_code(idx, pattern, state, tensor, tensor_dim)
 
     if isinstance(pattern, ArbitraryIndexPattern):
         if isinstance(idx, int):
@@ -387,7 +387,7 @@ def _pallas_slice_code(
     pattern: object,
     state: CodegenState,
     tensor: torch.Tensor,
-    subscript_index: int,
+    tensor_dim: int,
 ) -> str:
     from .._compiler.pallas.plan_tiling import ArbitrarySlicePattern
     from .._compiler.tile_strategy import DeviceLoopState
@@ -400,7 +400,7 @@ def _pallas_slice_code(
         )
 
     env = CompileEnvironment.current()
-    block_id = env.resolve_block_id(tensor.shape[subscript_index])
+    block_id = env.resolve_block_id(tensor.shape[tensor_dim])
     if block_id is not None:
         loops = state.codegen.active_device_loops.get(block_id)
         if loops and any(isinstance(loop, DeviceLoopState) for loop in loops):
