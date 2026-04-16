@@ -884,6 +884,26 @@ class TestPallas(TestCase):
         self.assertGreaterEqual(code.count("jax.lax.fori_loop"), 2)
         torch.testing.assert_close(result, args[0] + args[1])
 
+    def test_squeeze_slice_access(self) -> None:
+        """Test for the [None, :] indexing pattern (subscript index for slice >= tensor_ndim)"""
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def fn(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            (N,) = x.shape
+            (M,) = y.shape
+            out = torch.empty((N, M), dtype=x.dtype)
+            for tile in hl.tile([N], block_size=[M]):
+                out[tile, :] = (x[tile][:, None] < y[None, :]).to(torch.float32)
+            return out
+
+        N = 1024
+        M = 128
+        x = torch.randn(N, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(M, device=DEVICE, dtype=torch.float32)
+        result = fn(x, y)
+        expected = (x[:, None] < y[None, :]).to(torch.float32)
+        torch.testing.assert_close(result, expected)
+
 
 if __name__ == "__main__":
     unittest.main()
