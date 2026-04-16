@@ -360,6 +360,8 @@ def _pallas_jnp_dtype_map() -> dict[str, object]:
         "jnp.uint8": jnp.uint8,
         "jnp.bool_": jnp.bool_,
     }
+
+
 def _pallas_check_dtypes(args: tuple[object, ...]) -> None:
     """Raise if any tensor arg uses a dtype unsupported on TPU."""
     from .._compiler.backend import _PALLAS_UNSUPPORTED_DTYPES
