@@ -207,6 +207,9 @@ jobs:
           export SITE_PACKAGES=$(python -c "import site; print(site.getsitepackages()[0])")
           bazel build -c opt //ci/wheel:torch_tpu_wheel --config=helion_public_caching_readwrite --define WHEEL_VERSION=0.1.0 --define TORCH_SOURCE=local --action_env=PYTHONPATH=$TORCH_SOURCE:$SITE_PACKAGES --action_env=JAX_PLATFORMS=cpu
           uv pip install bazel-bin/ci/wheel/*.whl
+          # torch_tpu wheel is pinned to libtpu 0.0.38, but helion requires 0.0.40 to work
+          # we can remove this step as soon as torch_tpu updates its libtpu pin
+          uv pip install libtpu==0.0.40
           cd -
           rm -rf /tmp/torch_tpu
           # Verify

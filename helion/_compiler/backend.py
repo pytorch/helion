@@ -1311,8 +1311,8 @@ class PallasBackend(Backend):
     ):
         """Compute per-tensor ``(block_shape, grid_dims)`` from codegen tiling info.
 
-        Uses ``DeviceFunction.pallas_tensor_dim_block_ids`` (recorded during
-        load/store codegen from SymInt subscripts) for an unambiguous
+        Uses ``DeviceFunction.pallas_tensor_dim_tilings`` (recorded during
+        ``plan_tiling`` from SymInt subscripts) for an unambiguous
         dim → block_id mapping.
         """
         if sorted_args is None:
@@ -1383,11 +1383,21 @@ class PallasBackend(Backend):
             if not isinstance(arg, TensorArg) or arg.fake_value.ndim == 0:
                 continue
             tensor = arg.fake_value
-            dim_block_ids = device_fn.pallas_tensor_dim_block_ids.get(id(tensor), {})
+            dim_tilings = device_fn.pallas_tensor_dim_tilings.get(id(tensor))
+            if dim_tilings is None:
+                # this means this tensor isn't accessed at all in the kernel
+                result.append(None)
+                return None
             block_shape: list[int | None] = []
             grid_dims: list[int | tuple[int, int, int] | None] = []
             for d in range(tensor.ndim):
-                bid = dim_block_ids.get(d)
+                dim_tiling = dim_tilings[d]
+                if not dim_tiling.can_tile or len(dim_tiling.block_ids) == 0:
+                    block_shape.append(None)
+                    grid_dims.append(None)
+                    continue
+                assert len(dim_tiling.block_ids) == 1
+                bid = dim_tiling.block_ids[0]
                 if bid is not None and bid in known_block_ids:
                     bs = env.block_sizes[bid].from_config(config)
                     if isinstance(bs, int):
@@ -1599,6 +1609,16 @@ class PallasBackend(Backend):
             return self.build_launcher_name(config)
         except Exception:
             return self.default_launcher_name
+
+    def pre_codegen(
+        self,
+        graphs: list[GraphInfo],
+        config: Config,
+        tile_strategy: TileStrategyDispatch,
+    ) -> None:
+        from .pallas.plan_tiling import plan_tiling
+
+        plan_tiling(graphs, config, tile_strategy)
 
 
 def _detect_mma_loop(
