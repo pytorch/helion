@@ -347,6 +347,33 @@ def _jax_placeholder_for_tensor(t: torch.Tensor) -> object:
     return jax.ShapeDtypeStruct(tuple(t.shape), jax_dtype)
 
 
+def _pallas_jnp_dtype_map() -> dict[str, object]:
+    import jax.numpy as jnp
+
+    return {
+        "jnp.float32": jnp.float32,
+        "jnp.float16": jnp.float16,
+        "jnp.bfloat16": jnp.bfloat16,
+        "jnp.int32": jnp.int32,
+        "jnp.int16": jnp.int16,
+        "jnp.int8": jnp.int8,
+        "jnp.uint8": jnp.uint8,
+        "jnp.bool_": jnp.bool_,
+    }
+
+
+def _pallas_check_dtypes(args: tuple[object, ...]) -> None:
+    """Raise if any tensor arg uses a dtype unsupported on TPU."""
+    from .._compiler.backend import _PALLAS_UNSUPPORTED_DTYPES
+
+    for a in args:
+        if isinstance(a, torch.Tensor) and a.dtype in _PALLAS_UNSUPPORTED_DTYPES:
+            raise TypeError(
+                f"Pallas/TPU does not support {a.dtype} tensors. "
+                f"Cast to a 32-bit type before calling the kernel."
+            )
+
+
 def _pallas_prepare_args(
     args: tuple[object, ...],
     _output_indices: list[int],
@@ -591,6 +618,8 @@ def default_pallas_launcher(
     if _output_indices is None:
         _output_indices = []
 
+    _pallas_check_dtypes(args)
+
     cache = getattr(pallas_kernel, "_pallas_cache", None)
     if cache is not None and cache[0] == grid:
         _, jax_callable, tensor_arg_indices = cache
@@ -704,6 +733,8 @@ def default_pallas_pipeline_launcher(
     if _scratch_shapes is None:
         _scratch_shapes = []
 
+    _pallas_check_dtypes(args)
+
     cache = getattr(pallas_kernel, "_pallas_pipeline_cache", None)
     if cache is not None and cache[0] == grid:
         _, jax_callable, tensor_arg_indices = cache
@@ -724,16 +755,7 @@ def default_pallas_pipeline_launcher(
         ) = _pallas_prepare_args(args, _output_indices)
 
         # Build scratch shapes for VMEM
-        _jnp_dtype_map: dict[str, object] = {
-            "jnp.float32": jnp.float32,
-            "jnp.float16": jnp.float16,
-            "jnp.bfloat16": jnp.bfloat16,
-            "jnp.int32": jnp.int32,
-            "jnp.int16": jnp.int16,
-            "jnp.int8": jnp.int8,
-            "jnp.uint8": jnp.uint8,
-            "jnp.bool_": jnp.bool_,
-        }
+        _jnp_dtype_map = _pallas_jnp_dtype_map()
         scratch_shapes = []
         for scratch_entry in _scratch_shapes:
             if len(scratch_entry) == 3:
@@ -845,6 +867,8 @@ def default_pallas_fori_launcher(
     if _scratch_shapes is None:
         _scratch_shapes = []
 
+    _pallas_check_dtypes(args)
+
     cache = getattr(pallas_kernel, "_pallas_fori_cache", None)
     if cache is not None and cache[0] == grid:
         _, jax_callable, tensor_arg_indices = cache
@@ -865,16 +889,7 @@ def default_pallas_fori_launcher(
         ) = _pallas_prepare_args(args, _output_indices)
 
         # Build scratch shapes: VMEM buffers + DMA semaphores
-        _jnp_dtype_map: dict[str, object] = {
-            "jnp.float32": jnp.float32,
-            "jnp.float16": jnp.float16,
-            "jnp.bfloat16": jnp.bfloat16,
-            "jnp.int32": jnp.int32,
-            "jnp.int16": jnp.int16,
-            "jnp.int8": jnp.int8,
-            "jnp.uint8": jnp.uint8,
-            "jnp.bool_": jnp.bool_,
-        }
+        _jnp_dtype_map = _pallas_jnp_dtype_map()
         scratch_shapes = []
         for shape, dtype_str, scratch_type in _scratch_shapes:
             if scratch_type == "dma_semaphore":
