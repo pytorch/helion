@@ -5,12 +5,16 @@ import contextlib
 import datetime
 import functools
 from itertools import count
+from itertools import starmap
+import math
 from math import inf
 import os
 import tempfile
 import time
 from typing import TYPE_CHECKING
 from typing import Any
+from typing import Literal
+from typing import NamedTuple
 from typing import NoReturn
 from typing import cast
 
@@ -27,6 +31,7 @@ from ..runtime.precompile_shim import make_precompiler
 from .benchmarking import do_bench
 from .benchmarking import synchronize_device
 from .logger import SUPPRESSED_TRITON_CODE_MSG
+from .logger import AutotuneLogEntry
 from .logger import _get_failure_dump_dir
 from .logger import capture_output
 from .logger import classify_triton_exception
@@ -35,7 +40,9 @@ from .logger import log_generated_triton_code_debug
 from .logger import match_unrecoverable_runtime_error
 from .logger import maybe_dump_triton_failure
 from .precompile_future import PrecompileContext
+from .precompile_future import PrecompileFuture
 from .precompile_future import _ExtractedLaunchArgs
+from .progress_bar import iter_with_progress
 from helion._dist_utils import _clone_symm_mem_tensor
 from helion._dist_utils import all_gather_object
 from helion._dist_utils import get_signal_pad_ptrs_dev
@@ -43,6 +50,7 @@ from helion._dist_utils import is_symm_mem_tensor
 from helion._dist_utils import sync_object
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from collections.abc import Sequence
 
     from ..runtime.config import Config
@@ -53,11 +61,6 @@ if TYPE_CHECKING:
     from .base_search import _AutotunableKernel
     from .logger import AutotuningLogger
     from .metrics import AutotuneMetrics
-
-
-# TODO(hinriksnaer): benchmark_function mixes benchmarking with accuracy validation
-# (_validate_against_baseline, _compute_baseline, _assert_close) and arg management
-# (_clone_args, mutated_arg_indices). Worth decoupling these concerns.
 
 
 _FP8_DTYPES = {
@@ -229,6 +232,20 @@ def _triton_compile(
         return False
 
 
+class BenchmarkResult(NamedTuple):
+    """Result of benchmarking a single configuration."""
+
+    config: Config
+    fn: Callable[..., object]
+    perf: float
+    status: Literal["ok", "error", "timeout", "peer_compilation_fail", "filtered"]
+    compile_time: float | None
+
+
+def _unset_fn(*args: object) -> NoReturn:
+    raise RuntimeError("Uninitialized function")
+
+
 class BenchmarkProvider(abc.ABC):
     """Abstract interface for benchmarking kernel configurations.
 
@@ -241,11 +258,11 @@ class BenchmarkProvider(abc.ABC):
         provider = LocalBenchmarkProvider(...)
         provider.setup()
         try:
-            provider.benchmark_function(config, fn)
+            provider.benchmark(configs)
         finally:
             provider.cleanup()
 
-    ``BaseSearch.autotune()`` manages this lifecycle automatically.
+    ``BaseSearch`` manages this lifecycle automatically.
     """
 
     mutated_arg_indices: Sequence[int]
@@ -264,8 +281,20 @@ class BenchmarkProvider(abc.ABC):
         ...
 
     @abc.abstractmethod
-    def benchmark_function(self, config: Config, fn: CompiledConfig) -> float:
-        """Benchmark a single compiled function.  Returns time in ms or inf."""
+    def benchmark(
+        self,
+        configs: list[Config],
+        *,
+        desc: str = "Benchmarking",
+    ) -> list[BenchmarkResult]:
+        """Compile, precompile, validate, and time a batch of configs.
+
+        Handles the full benchmark flow: compilation, optional subprocess
+        precompilation, accuracy validation, timing, error classification,
+        and progress reporting.
+
+        Returns one ``BenchmarkResult`` per input config, in the same order.
+        """
         ...
 
     @abc.abstractmethod
@@ -567,7 +596,161 @@ class LocalBenchmarkProvider(BenchmarkProvider):
             return False
         return True
 
-    def benchmark_function(self, config: Config, fn: CompiledConfig) -> float:
+    def _create_precompile_future(
+        self, config: Config, fn: CompiledConfig
+    ) -> PrecompileFuture:
+        """Create a subprocess to precompile the kernel and detect hangs."""
+        ctx = self._precompile_context()
+        if not self.settings.autotune_precompile:
+            return PrecompileFuture.skip(ctx, config, True)
+        mode = self.settings.autotune_precompile
+        if mode not in {"fork", "spawn"}:
+            raise exc.InvalidAPIUsage("autotune_precompile must be 'fork' or 'spawn'")
+        if len(self.mutated_arg_indices) > 0:
+            args = _clone_args(
+                self.args,
+                self.kernel.env.process_group_name,
+                idx_to_clone=self.mutated_arg_indices,
+            )
+        else:
+            args = self.args
+        return PrecompileFuture.create(
+            ctx=ctx,
+            config=config,
+            fn=fn,
+            args=args,
+            result_path=self._next_precompile_result_path(),
+            args_path=self._precompile_args_path,
+        )
+
+    def benchmark(
+        self,
+        configs: list[Config],
+        *,
+        desc: str = "Benchmarking",
+    ) -> list[BenchmarkResult]:
+        """Compile, precompile, validate, and time a batch of configs."""
+        all_configs = configs
+        compiled: dict[int, Callable[..., object]] = {}
+        futures: list[PrecompileFuture] | None = None
+
+        # Compilation phase
+        for i, config in enumerate(all_configs):
+            try:
+                compiled[i] = self.kernel.compile_config(config, allow_print=False)
+            except Exception:
+                if not compiled and i == len(all_configs) - 1:
+                    raise
+                self.log.warning(
+                    "Skipping config that failed to compile: %s",
+                    self.kernel.format_kernel_decorator(config, self.settings),
+                    exc_info=True,
+                )
+        fns = list(compiled.values())
+        valid_indices = list(compiled.keys())
+        configs = [all_configs[i] for i in valid_indices]
+
+        # Precompile phase
+        if self.settings.autotune_precompile:
+            futures = list(
+                starmap(
+                    self._create_precompile_future,
+                    zip(configs, fns, strict=True),
+                )
+            )
+            precompile_desc = (
+                f"{desc} precompiling" if self.settings.autotune_progress_bar else None
+            )
+            is_workings = PrecompileFuture.wait_for_all(futures, desc=precompile_desc)
+            precompile_status: list[Literal["ok", "error", "timeout"]] = []
+            for future, ok in zip(futures, is_workings, strict=True):
+                reason = future.failure_reason
+                if ok:
+                    precompile_status.append("ok")
+                elif reason == "timeout":
+                    precompile_status.append("timeout")
+                else:
+                    precompile_status.append("error")
+        else:
+            is_workings = [True] * len(configs)
+            precompile_status = ["ok"] * len(configs)
+
+        # Initialize results with defaults
+        results: list[BenchmarkResult] = [
+            BenchmarkResult(
+                config=c, fn=_unset_fn, perf=inf, status="error", compile_time=None
+            )
+            for c in all_configs
+        ]
+
+        # Benchmark loop with progress reporting
+        iterator = iter_with_progress(
+            enumerate(zip(fns, is_workings, precompile_status, strict=True)),
+            total=len(configs),
+            description=f"{desc} exploring neighbors",
+            enabled=self.settings.autotune_progress_bar,
+        )
+        for index, (fn, is_working, reason) in iterator:
+            config = configs[index]
+            if futures is not None:
+                future = futures[index]
+                compile_time = (
+                    future.elapsed
+                    if future.process is not None and future.started
+                    else None
+                )
+            else:
+                compile_time = None
+            status: Literal[
+                "ok", "error", "timeout", "peer_compilation_fail", "filtered"
+            ]
+            if all(
+                all_gather_object(
+                    is_working,
+                    process_group_name=self.kernel.env.process_group_name,
+                )
+            ):
+                self.log.record_autotune_entry(
+                    AutotuneLogEntry(
+                        generation=self._autotune_metrics.num_generations,
+                        status="started",
+                        perf_ms=None,
+                        compile_time=compile_time,
+                        config=config,
+                    )
+                )
+                perf = self._benchmark_function(config, fn)
+                status = "ok" if math.isfinite(perf) else "error"
+                self.log.record_autotune_entry(
+                    AutotuneLogEntry(
+                        generation=self._autotune_metrics.num_generations,
+                        status=status,
+                        perf_ms=perf if math.isfinite(perf) else None,
+                        compile_time=compile_time,
+                        config=config,
+                    )
+                )
+                results[valid_indices[index]] = BenchmarkResult(
+                    config=config,
+                    fn=fn,
+                    perf=perf,
+                    status=status,
+                    compile_time=compile_time,
+                )
+            else:
+                status = "timeout" if reason == "timeout" else "error"
+                if is_working:
+                    status = "peer_compilation_fail"
+                results[valid_indices[index]] = BenchmarkResult(
+                    config=config,
+                    fn=fn,
+                    perf=inf,
+                    status=status,
+                    compile_time=compile_time,
+                )
+        return results
+
+    def _benchmark_function(self, config: Config, fn: CompiledConfig) -> float:
         """Benchmark a single compiled function.  Returns time in ms or inf."""
         self._autotune_metrics.num_configs_tested += 1
         self.log.debug(lambda: f"Running benchmark for {config!r}")
