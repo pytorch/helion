@@ -304,6 +304,102 @@ def _pallas_generated_index_code(
     )
 
 
+# Conservative VMEM threshold for gather tables. Emits a clear error
+# instead of a generic Mosaic OOM. Should be replaced with context-aware
+# VMEM budget accounting (e.g. querying actual capacity and other allocations).
+_PALLAS_GATHER_VMEM_THRESHOLD_BYTES = 16 << 20  # 16 MiB
+
+
+def _pallas_indirect_gather_positions(
+    indexing_patterns: list[object],
+) -> list[int]:
+    from .._compiler.pallas.plan_tiling import IndirectGatherPattern
+
+    return [
+        i
+        for i, p in enumerate(indexing_patterns)
+        if isinstance(p, IndirectGatherPattern)
+    ]
+
+
+def _pallas_emit_gather_load(
+    state: CodegenState,
+    tensor: torch.Tensor,
+    subscript: list[object] | tuple[object, ...],
+    indexing_patterns: list[object],
+    indirect_positions: list[int],
+    name: str,
+) -> ast.AST:
+    """Emit a one-hot matmul gather: one_hot(idx, V) @ table."""
+    from .._compiler.pallas.plan_tiling import IndirectGatherPattern
+
+    if len(indirect_positions) > 1:
+        raise NotImplementedError(
+            "Pallas backend: gather with multiple indirect dims is not supported"
+        )
+    indirect_pos = indirect_positions[0]
+    if indirect_pos != 0:
+        raise NotImplementedError(
+            "Pallas backend: indirect gather is only supported on dim 0"
+        )
+    pattern = indexing_patterns[indirect_pos]
+    assert isinstance(pattern, IndirectGatherPattern)
+
+    table_bytes = tensor.numel() * tensor.dtype.itemsize
+    if (
+        isinstance(table_bytes, int)
+        and table_bytes > _PALLAS_GATHER_VMEM_THRESHOLD_BYTES
+    ):
+        raise NotImplementedError(
+            f"Pallas backend: indirect gather requires the full table in VMEM "
+            f"({table_bytes} bytes > {_PALLAS_GATHER_VMEM_THRESHOLD_BYTES} byte "
+            f"threshold). Tile the kernel so the gathered table fits, or use a "
+            f"different access pattern."
+        )
+
+    if not tensor.dtype.is_floating_point:
+        raise NotImplementedError(
+            f"Pallas backend: indirect gather requires a floating-point table, "
+            f"got {tensor.dtype}"
+        )
+
+    vocab_size = tensor.shape[0]
+
+    ast_subscripts = state.ast_args[1]
+    assert isinstance(ast_subscripts, list)
+    ast_idx = ast_subscripts[indirect_pos]
+    assert isinstance(ast_idx, ast.AST)
+    idx_name = state.codegen.lift(ast_idx, dce=False, prefix="index").id
+
+    # Collect none_dims from subscript for expand_dims after the matmul
+    none_dims: list[int] = []
+    for out_pos, idx in enumerate(subscript):
+        if idx is None:
+            none_dims.append(out_pos)
+
+    jnp_dtype = CompileEnvironment.current().backend.dtype_str(tensor.dtype)
+    # TPU MXU requires 32-bit accumulator. For float32 tables we also need
+    # Precision.HIGHEST to prevent MXU from truncating inputs to bfloat16
+    # before multiply-accumulate. For half types the truncation is a no-op.
+    needs_highest = tensor.dtype not in (torch.bfloat16, torch.float16)
+    precision_arg = "precision=jax.lax.Precision.HIGHEST, " if needs_highest else ""
+    result = expr_from_string(
+        f"jax.lax.dot_general("
+        f"jax.nn.one_hot({idx_name}[...], {vocab_size}, dtype=jnp.float32), "
+        f"{name}[...].astype(jnp.float32), "
+        f"(((1,), (0,)), ((), ())), "
+        f"preferred_element_type=jnp.float32, "
+        f"{precision_arg}"
+        f").astype({jnp_dtype})"
+    )
+
+    for dim in none_dims:
+        result = expr_from_string(
+            f"jnp.expand_dims({{result}}, axis={dim})", result=result
+        )
+    return result
+
+
 def _pallas_tile_pattern_code(
     pattern: object,
     idx: object,
@@ -448,6 +544,12 @@ def _(state: CodegenState) -> None:
     device_fn = state.device_function
     device_fn.device_store_index += 1
     device_fn.device_memory_op_index += 1
+    indexing_patterns = _pallas_get_indexing_patterns(state, tensor)
+    if _pallas_indirect_gather_positions(indexing_patterns):
+        # TODO(pallas-scatter): emit one_hot(idx, V).T @ values
+        raise NotImplementedError(
+            "Pallas backend: indirect store (scatter) is not supported"
+        )
     index_str, _ = _pallas_index_str(state, subscript, tensor)
     state.codegen.add_statement(
         statement_from_string(f"{name}[{index_str}] = {{value}}", value=value)
@@ -1507,6 +1609,14 @@ def _(state: CodegenState) -> ast.AST:
     device_fn = state.device_function
     device_fn.device_load_index += 1
     device_fn.device_memory_op_index += 1
+
+    indexing_patterns = _pallas_get_indexing_patterns(state, tensor)
+    indirect_positions = _pallas_indirect_gather_positions(indexing_patterns)
+    if indirect_positions:
+        return _pallas_emit_gather_load(
+            state, tensor, subscript, indexing_patterns, indirect_positions, name
+        )
+
     index_str, none_dims = _pallas_index_str(state, subscript, tensor)
     result = expr_from_string(f"{name}[{index_str}]")
     for dim in none_dims:

@@ -65,6 +65,17 @@ class NonePattern(IndexingPattern):
 
 
 @dataclass
+class IndirectGatherPattern(IndexingPattern):
+    """Pattern for table[idx_tensor, :] where idx_tensor is a runtime tensor.
+
+    Codegen emits one_hot(idx, V) @ table. The table's first dim gets a None
+    BlockSpec (entire table in VMEM, no tiling on that dim).
+    """
+
+    idx_block_id: int | None = None
+
+
+@dataclass
 class DimensionTiling:
     """Tiling decision for a specific dimension of a tensor
 
@@ -183,6 +194,11 @@ def _detect_indexing_pattern(
 
     if isinstance(idx, torch.fx.Node):
         idx_val = idx.meta.get("val")
+        if isinstance(idx_val, torch.Tensor):
+            idx_block_id: int | None = None
+            if idx_val.ndim >= 1:
+                idx_block_id = env.get_block_id(idx_val.shape[0])
+            return IndirectGatherPattern(idx_block_id=idx_block_id)
         if isinstance(idx_val, torch.SymInt):
             block_id = env.get_block_id(idx_val)
             if block_id is not None:
@@ -269,6 +285,9 @@ def _update_tiling_decision(
 
     elif isinstance(pattern, NonePattern):
         pass
+
+    elif isinstance(pattern, IndirectGatherPattern):
+        _disallow_tiling()
 
     if isinstance(pattern, (TilePattern, TileBeginWithOffsetPattern)):
         block_size = env.block_sizes[pattern.block_id].from_config(config)
