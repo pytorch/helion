@@ -23,6 +23,7 @@ from helion._testing import import_path
 from helion._testing import onlyBackends
 from helion._testing import skipIfXPU
 
+
 def _set_preferred_symm_mem_backend(device: torch.device) -> str:
     preferred = "NVSHMEM"
     try:
