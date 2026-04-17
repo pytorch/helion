@@ -498,7 +498,6 @@ class TestRandom(RefEagerTestBase, TestCase):
             msg="Mixed tile argument order should produce identical results",
         )
 
-    @xfailIfPallas("rolled reductions not supported for pallas rand")
     @skipIfRocm("ROCm Triton worker crashes on rand with rolled reductions")
     def test_hl_rand_rolled_reductions(self):
         @helion.kernel(static_shapes=False)
