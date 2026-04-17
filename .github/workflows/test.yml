@@ -138,6 +138,8 @@ jobs:
           rm -rf triton/ || true
           if [[ "${{ matrix.backend }}" == "tileir" ]]; then
             git clone --recursive -b main https://github.com/triton-lang/Triton-to-tile-IR.git triton
+            # Pin to last known-good commit before 13.2 syncup broke Atan2Op build
+            git -C triton checkout 5d3ab8c13c
           else
             git clone https://github.com/triton-lang/triton.git triton
             if [[ "${{ matrix.python-version }}" == "3.14" ]]; then

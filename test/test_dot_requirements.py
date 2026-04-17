@@ -66,6 +66,7 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         spec = _matmul_kernel.bind(args).config_spec
         self.assertEqual([x.min_size for x in spec.block_sizes], [2, 8, 16])
 
+    @skipIfMTIA("MTIA requires tl.dot initial value stride >= 128 bytes")
     def test_matmul_smaller_than_min_dot_size(self) -> None:
         """Test matmul where K and N are smaller than min_dot_size (16 on CUDA).
 

@@ -620,7 +620,7 @@ class TritonBackend(Backend):
         if is_hip():
             fragments["waves_per_eu"] = EnumFragment(choices=(1, 2, 3, 4))
             if supports_amd_cdna_tunables():
-                fragments["matrix_instr_nonkdim"] = EnumFragment(choices=(0, 16, 32))
+                fragments["matrix_instr_nonkdim"] = EnumFragment(choices=(0, 16))
 
         if supports_mtia_tunables():
             fragments.update(get_mtia_tunable_fragments())

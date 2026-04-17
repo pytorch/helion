@@ -200,12 +200,16 @@ def _pallas_index_str(
     if not subscript:
         return "...", []
 
-    # Check if we're inside an emit_pipeline or fori_loop
+    # Check if we're inside an emit_pipeline or fori_loop with DMA.
+    # When fori_loop runs without DMA (use_dma=False), its block_ids
+    # are NOT treated as pipeline dims — they get pl.ds() slicing instead.
     in_pipeline = False
     pipeline_block_ids: set[int] = set()
     for loops in state.codegen.active_device_loops.values():
         for loop in loops:
-            if isinstance(loop, (EmitPipelineLoopState, ForiLoopState)):
+            if isinstance(loop, EmitPipelineLoopState) or (
+                isinstance(loop, ForiLoopState) and loop.use_dma
+            ):
                 in_pipeline = True
                 pipeline_block_ids.update(loop.block_ids)
 
@@ -314,6 +318,7 @@ def _pallas_tile_pattern_code(
 ) -> str:
     from .._compiler.pallas.plan_tiling import TilePattern
     from .._compiler.tile_strategy import DeviceLoopState
+    from .._compiler.tile_strategy import ForiLoopState
 
     assert isinstance(pattern, TilePattern)
 
@@ -327,7 +332,11 @@ def _pallas_tile_pattern_code(
         return ":"
 
     loops = state.codegen.active_device_loops.get(block_id)
-    if loops and any(isinstance(loop, DeviceLoopState) for loop in loops):
+    if loops and any(
+        isinstance(loop, DeviceLoopState)
+        or (isinstance(loop, ForiLoopState) and not loop.use_dma)
+        for loop in loops
+    ):
         return _pallas_ds_expr(state, block_id)
     return ":"
 
