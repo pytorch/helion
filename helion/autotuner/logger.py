@@ -461,6 +461,7 @@ _EXPECTED_TRITON_ERRORS_RE: re.Pattern[str] = re.compile(
                 "too many blocks in cooperative launch",  # CUDA cooperative launch limit
                 "too many resources requested for launch",  # Triton resource error
                 "CUDA error: out of memory",  # CUDA runtime OOM during kernel execution
+                "Ran out of memory in memory space vmem",  # TPU VMEM OOM (caught by Helion or XLA)
             ],
         )
     )
