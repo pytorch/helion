@@ -1996,16 +1996,19 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         def nested_in_place_add(
             a: Sequence[torch.Tensor],
             b: Sequence[torch.Tensor],
+            epsilon: float,
             out: Sequence[torch.Tensor],
         ):
             for tile in hl.tile(out[0].size()):
-                out[0][tile] += a[0][tile] + b[0][tile]
+                out[0][tile] += a[0][tile] + b[0][tile] + epsilon
             for tile in hl.tile(out[1].size()):
-                out[1][tile] += a[1][tile] + b[1][tile]
+                out[1][tile] += a[1][tile] + b[1][tile] + epsilon
 
+        epsilon = 1e-6
         args = (
             [torch.ones([128], device=DEVICE), torch.ones([128], device=DEVICE)],
             [torch.ones([128], device=DEVICE), torch.ones([128], device=DEVICE)],
+            epsilon,
             [torch.zeros([128], device=DEVICE), torch.zeros([128], device=DEVICE)],
         )
 
@@ -2015,10 +2018,10 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         # test that we overwrite c only once and the arguments are correctly
         #  cloned for each autotune run
         ref_out = [
-            torch.full([128], 2.0, device=DEVICE),
-            torch.full([128], 2.0, device=DEVICE),
+            torch.full([128], 2.0, device=DEVICE) + epsilon,
+            torch.full([128], 2.0, device=DEVICE) + epsilon,
         ]
-        torch.testing.assert_close(args[2], ref_out)
+        torch.testing.assert_close(args[3], ref_out)
 
     def test_only_mutated_tensors_cloned_during_benchmark(self) -> None:
         """
@@ -2032,13 +2035,15 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         def inplace_add(
             a: torch.Tensor,
             b: torch.Tensor,
+            epsilon: float,
             out: torch.Tensor,
         ):
             for tile in hl.tile(out.size()):
-                out[tile] += a[tile] + b[tile]
+                out[tile] += a[tile] + b[tile] + epsilon
 
         a = torch.full([128], 1.0, device=DEVICE)
         b = torch.full([128], 2.0, device=DEVICE)
+        epsilon = 1e-6
         out = torch.zeros([128], device=DEVICE)
 
         # Track clones separately for mutated vs non-mutated tensors
@@ -2060,7 +2065,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             return result
 
         with patch.object(torch.Tensor, "clone", tracking_clone):
-            inplace_add(a, b, out)
+            inplace_add(a, b, epsilon, out)
 
         # Mutated tensor (out) should be cloned during baseline AND benchmarking:
         #   _compute_baseline: 1 + baseline_post_args: 1
@@ -2080,7 +2085,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             f"Only mutated tensors should be cloned during benchmarking.",
         )
 
-        expected = torch.full([128], 3.0, device=DEVICE)
+        expected = torch.full([128], 3.0, device=DEVICE) + epsilon
         torch.testing.assert_close(out, expected)
 
     def test_chunked_allclose_memory(self):

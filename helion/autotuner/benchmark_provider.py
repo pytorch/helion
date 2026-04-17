@@ -373,11 +373,12 @@ class LocalBenchmarkProvider(BenchmarkProvider):
 
         original_args_flat, _ = tree_flatten(self.args)
         new_args_flat, _ = tree_flatten(new_args)
-        mutated_tensor_idxs = []
+        mutated_arg_idxs = []
         # we should only count tensors, since they won't be bound or removed
-        tensor_idx = 0
+        arg_idx = 0
         for old, new in zip(original_args_flat, new_args_flat, strict=False):
             if not (isinstance(old, torch.Tensor) and isinstance(new, torch.Tensor)):
+                arg_idx += 1
                 continue
             try:
                 equal = torch.equal(new, old)
@@ -387,14 +388,14 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                 # assume the argument was not mutated.
                 equal = True
             if not equal:
-                mutated_tensor_idxs.append(tensor_idx)
-            tensor_idx += 1
+                mutated_arg_idxs.append(arg_idx)
+            arg_idx += 1
         baseline_post_args = _clone_args(
             new_args,
             self.kernel.env.process_group_name,
-            idx_to_clone=mutated_tensor_idxs,
+            idx_to_clone=mutated_arg_idxs,
         )
-        return baseline_output, mutated_tensor_idxs, baseline_post_args
+        return baseline_output, mutated_arg_idxs, baseline_post_args
 
     def _compute_effective_tolerances(self) -> tuple[float, float]:
         """
