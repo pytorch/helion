@@ -57,6 +57,12 @@ jobs:
           echo "Detected ROCm image"
           rocminfo || echo "rocminfo not found"
 
+      - name: Run XPU command
+        if: startsWith(matrix.image, 'intel')
+        run: |
+          echo "Detected XPU image"
+          xpu-smi discovery || echo "xpu-smi not found"
+
       - name: Check out code
         uses: actions/checkout@v6
 
@@ -134,12 +140,14 @@ jobs:
           export CXX=clang++-20
           mkdir -p /tmp/$USER
           cd /tmp/$USER
-          uv pip uninstall triton pytorch-triton || true
+          uv pip uninstall triton pytorch-triton triton-xpu || true
           rm -rf triton/ || true
           if [[ "${{ matrix.backend }}" == "tileir" ]]; then
             git clone --recursive -b main https://github.com/triton-lang/Triton-to-tile-IR.git triton
             # Pin to last known-good commit before 13.2 syncup broke Atan2Op build
             git -C triton checkout 5d3ab8c13c
+          elif [[ "${{ matrix.alias }}" == *xpu* ]]; then
+            git clone https://github.com/intel/intel-xpu-backend-for-triton.git triton
           else
             git clone https://github.com/triton-lang/triton.git triton
             if [[ "${{ matrix.python-version }}" == "3.14" ]]; then
@@ -271,7 +279,10 @@ jobs:
           fi
           # For distributed tests, fail if any test is skipped, failed, or has an error
           SKIP_CHECK=$([[ "${{ contains(matrix.alias, 'distributed') }}" == "true" ]] && echo "! grep -qE '(SKIPPED|FAILED|ERROR)'" || echo "cat > /dev/null")
-          pytest $PARALLEL -rf --timeout=60 $EXTRA_FLAGS $TEST_PATH | tee >(eval $SKIP_CHECK)
+          if [[ "${{ matrix.alias }}" == *xpu* ]]; then
+            export TRITON_XPU_GEN_NATIVE_CODE=1
+          fi
+          pytest $PARALLEL -rf -v --timeout=60 $EXTRA_FLAGS $TEST_PATH | tee >(eval $SKIP_CHECK)
 
   test-notebooks:
     name: test-notebooks-cu128-py3.12-pytorch-2.9-a10g

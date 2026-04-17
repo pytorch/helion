@@ -18,6 +18,7 @@ from helion import exc
 from helion._compiler.compile_environment import CompileEnvironment
 from helion._testing import TestCase
 from helion._testing import onlyBackends
+from helion._testing import skipIfXPU
 
 
 def _json_safe_values() -> st.SearchStrategy[Any]:
@@ -283,6 +284,7 @@ class TestSettingsEnv(TestCase):
             ("persistent_blocked", "persistent_interleaved"),
         )
 
+    @skipIfXPU("Uses torch.device('cuda') directly")
     def test_distributed_limits_pid_types_to_persistent(self) -> None:
         settings = helion.Settings()
         with (
