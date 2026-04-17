@@ -210,7 +210,9 @@ def k(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 
 ### arange()
 
-See {func}`~helion.language.arange` for details.
+```{eval-rst}
+.. autofunction:: arange
+```
 
 ### rand()
 
@@ -289,21 +291,29 @@ The `Tile` class represents a portion of an iteration space with the following k
 
 ### reduce()
 
-See {func}`~helion.language.reduce` for details.
+```{eval-rst}
+.. autofunction:: reduce
+```
 
 ## Scan Operations
 
 ### associative_scan()
 
-See {func}`~helion.language.associative_scan` for details.
+```{eval-rst}
+.. autofunction:: associative_scan
+```
 
 ### cumsum()
 
-See {func}`~helion.language.cumsum` for details.
+```{eval-rst}
+.. autofunction:: cumsum
+```
 
 ### cumprod()
 
-See {func}`~helion.language.cumprod` for details.
+```{eval-rst}
+.. autofunction:: cumprod
+```
 
 ### tile_index()
 
@@ -339,23 +349,31 @@ See {func}`~helion.language.cumprod` for details.
 
 ### device_print()
 
-See {func}`~helion.language.device_print` for details.
+```{eval-rst}
+.. autofunction:: device_print
+```
 
 ## Constexpr Operations
 
 ### constexpr()
 
-See {class}`~helion.language.constexpr` for details.
+```{eval-rst}
+.. autoclass:: constexpr
+```
 
 ### specialize()
 
-See {func}`~helion.language.specialize` for details.
+```{eval-rst}
+.. autofunction:: specialize
+```
 
 ## Matrix Operations
 
 ### dot()
 
-See {func}`~helion.language.dot` for details.
+```{eval-rst}
+.. autofunction:: dot
+```
 
 ### dot_scaled()
 
