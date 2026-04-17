@@ -2,9 +2,7 @@ from __future__ import annotations
 
 import contextlib
 from datetime import timedelta
-import json
 import os
-import time
 from typing import ClassVar
 from unittest.mock import patch
 
@@ -25,65 +23,13 @@ from helion._testing import import_path
 from helion._testing import onlyBackends
 from helion._testing import skipIfXPU
 
-_AGENT_DEBUG_LOG_PATH = "/root/.cursor/debug-logs/debug-412933.log"
-_AGENT_DEBUG_SESSION_ID = "412933"
-
-
-def _agent_debug_log(
-    run_id: str, hypothesis_id: str, location: str, message: str, data: dict
-) -> None:
-    payload = {
-        "sessionId": _AGENT_DEBUG_SESSION_ID,
-        "runId": run_id,
-        "hypothesisId": hypothesis_id,
-        "location": location,
-        "message": message,
-        "data": data,
-        "timestamp": int(time.time() * 1000),
-    }
-    try:
-        log_dir = os.path.dirname(_AGENT_DEBUG_LOG_PATH)
-        if log_dir:
-            os.makedirs(log_dir, exist_ok=True)
-        with open(_AGENT_DEBUG_LOG_PATH, "a", encoding="utf-8") as fp:
-            fp.write(json.dumps(payload, default=str) + "\n")
-    except Exception:
-        pass
-
-
-def _set_preferred_symm_mem_backend(
-    run_id: str, rank: int, device: torch.device
-) -> str:
+def _set_preferred_symm_mem_backend(device: torch.device) -> str:
     preferred = "NVSHMEM"
     try:
         symm_mem.set_backend(preferred)
         selected = preferred
-    except RuntimeError as exc:
+    except RuntimeError:
         selected = str(symm_mem.get_backend(device) or "unknown")
-        # region agent log
-        _agent_debug_log(
-            run_id=run_id,
-            hypothesis_id="H12",
-            location="test/test_examples_dist.py:_set_preferred_symm_mem_backend",
-            message="Preferred symmetric memory backend unavailable; using fallback",
-            data={
-                "rank": rank,
-                "preferred_backend": preferred,
-                "selected_backend": selected,
-                "error_type": type(exc).__name__,
-                "error": str(exc),
-            },
-        )
-        # endregion
-    # region agent log
-    _agent_debug_log(
-        run_id=run_id,
-        hypothesis_id="H12",
-        location="test/test_examples_dist.py:_set_preferred_symm_mem_backend",
-        message="Selected symmetric memory backend",
-        data={"rank": rank, "selected_backend": selected},
-    )
-    # endregion
     return selected
 
 
@@ -141,21 +87,6 @@ class TestExamplesDist(TestCase, MultiProcessTestCase):
             timedelta(seconds=60), dist.group.WORLD
         )
         torch.manual_seed(42 + self.rank)
-        # region agent log
-        _agent_debug_log(
-            run_id=f"examples_dist_init_pid{os.getpid()}",
-            hypothesis_id="H6",
-            location="test/test_examples_dist.py:_init_process",
-            message="Initialized distributed examples process",
-            data={
-                "test_name": getattr(self, "_testMethodName", "unknown"),
-                "rank": self.rank,
-                "world_size": self.world_size,
-                "device": str(self.device),
-                "hip": torch.version.hip,
-            },
-        )
-        # endregion
 
     def _cleanup_process(self):
         torch.cuda.synchronize()
@@ -199,39 +130,8 @@ class TestExamplesDist(TestCase, MultiProcessTestCase):
         backend_stream = mod.copy_engine_all_gather_w_progress(
             a_out, a_shared, progress, 1
         )
-
-        # region agent log
-        _agent_debug_log(
-            run_id=f"examples_dist_ag_matmul_pid{os.getpid()}",
-            hypothesis_id="H7",
-            location="test/test_examples_dist.py:test_all_gather_matmul",
-            message="Calling all_gather_matmul kernel",
-            data={
-                "rank": self.rank,
-                "symm_rank": symm_mem_hdl.rank,
-                "group_name": symm_mem_group.group_name,
-            },
-        )
-        # endregion
         kernel = mod.helion_matmul_w_progress
         if torch.version.hip is not None:
-            # region agent log
-            _agent_debug_log(
-                run_id=f"examples_dist_ag_matmul_pid{os.getpid()}",
-                hypothesis_id="H7",
-                location="test/test_examples_dist.py:test_all_gather_matmul",
-                message="Using ROCm-safe matmul config",
-                data={
-                    "rank": self.rank,
-                    "config": {
-                        "block_sizes": [64, 64, 32],
-                        "num_warps": 4,
-                        "num_stages": 2,
-                        "indexing": "pointer",
-                    },
-                },
-            )
-            # endregion
             kernel = helion.kernel(
                 config=helion.Config(
                     block_sizes=[64, 64, 32],
@@ -241,26 +141,10 @@ class TestExamplesDist(TestCase, MultiProcessTestCase):
                 ),
                 static_shapes=True,
             )(mod.helion_matmul_w_progress.fn)
-        try:
-            _, result = code_and_output(
-                kernel,
-                (a_out, a_shared, b, progress, 1, symm_mem_hdl.rank),
-            )
-        except Exception as exc:
-            # region agent log
-            _agent_debug_log(
-                run_id=f"examples_dist_ag_matmul_pid{os.getpid()}",
-                hypothesis_id="H7",
-                location="test/test_examples_dist.py:test_all_gather_matmul",
-                message="All_gather_matmul kernel failed",
-                data={
-                    "rank": self.rank,
-                    "error_type": type(exc).__name__,
-                    "error": str(exc),
-                },
-            )
-            # endregion
-            raise
+        _, result = code_and_output(
+            kernel,
+            (a_out, a_shared, b, progress, 1, symm_mem_hdl.rank),
+        )
 
         # Synchronize CUDA before running reference
         torch.cuda.synchronize()
@@ -283,11 +167,7 @@ class TestExamplesDist(TestCase, MultiProcessTestCase):
 
         mod = import_path(EXAMPLES_DIR / "distributed" / "all_reduce.py")
 
-        selected_backend = _set_preferred_symm_mem_backend(
-            run_id=f"examples_dist_allreduce_pid{os.getpid()}",
-            rank=self.rank,
-            device=self.device,
-        )
+        selected_backend = _set_preferred_symm_mem_backend(self.device)
         group = dist.group.WORLD
         if selected_backend == "NVSHMEM":
             symm_mem.enable_symm_mem_for_group(group.group_name)
@@ -300,52 +180,22 @@ class TestExamplesDist(TestCase, MultiProcessTestCase):
         ).normal_()
 
         symm_mem_hdl = symm_mem.rendezvous(a_shared, group=group)
-
-        # region agent log
-        _agent_debug_log(
-            run_id=f"examples_dist_allreduce_pid{os.getpid()}",
-            hypothesis_id="H8",
-            location="test/test_examples_dist.py:test_all_reduce",
-            message="Calling examples all_reduce kernel",
-            data={
-                "rank": self.rank,
-                "symm_rank": symm_mem_hdl.rank,
-                "group_name": group.group_name,
-            },
-        )
-        # endregion
         kernel = mod.one_shot_all_reduce_kernel
         if torch.version.hip is not None:
             kernel = helion.kernel(
                 config=helion.Config(block_sizes=[8192], num_warps=16),
                 static_shapes=True,
             )(mod.one_shot_all_reduce_kernel.fn)
-        try:
-            _, result = code_and_output(
-                kernel,
-                (
-                    symm_mem_hdl.signal_pad_ptrs_dev,
-                    a_shared,
-                    symm_mem_hdl.rank,
-                    group.group_name,
-                    symm_mem_hdl.world_size,
-                ),
-            )
-        except Exception as exc:
-            # region agent log
-            _agent_debug_log(
-                run_id=f"examples_dist_allreduce_pid{os.getpid()}",
-                hypothesis_id="H8",
-                location="test/test_examples_dist.py:test_all_reduce",
-                message="Examples all_reduce kernel failed",
-                data={
-                    "rank": self.rank,
-                    "error_type": type(exc).__name__,
-                    "error": str(exc),
-                },
-            )
-            # endregion
-            raise
+        _, result = code_and_output(
+            kernel,
+            (
+                symm_mem_hdl.signal_pad_ptrs_dev,
+                a_shared,
+                symm_mem_hdl.rank,
+                group.group_name,
+                symm_mem_hdl.world_size,
+            ),
+        )
 
         # Synchronize CUDA before running reference
         torch.cuda.synchronize()
@@ -374,11 +224,7 @@ class TestExamplesDist(TestCase, MultiProcessTestCase):
 
         mod = import_path(EXAMPLES_DIR / "distributed" / "allreduce_bias_rmsnorm.py")
 
-        selected_backend = _set_preferred_symm_mem_backend(
-            run_id=f"examples_dist_rmsnorm_pid{os.getpid()}",
-            rank=self.rank,
-            device=self.device,
-        )
+        selected_backend = _set_preferred_symm_mem_backend(self.device)
         group = dist.group.WORLD
         if selected_backend == "NVSHMEM":
             symm_mem.enable_symm_mem_for_group(group.group_name)
@@ -397,21 +243,6 @@ class TestExamplesDist(TestCase, MultiProcessTestCase):
 
         symm_mem_buffer = symm_mem.empty(N, D, dtype=dtype, device=self.device)
         symm_mem_hdl = symm_mem.rendezvous(symm_mem_buffer, group.group_name)
-
-        # region agent log
-        _agent_debug_log(
-            run_id=f"examples_dist_rmsnorm_pid{os.getpid()}",
-            hypothesis_id="H9",
-            location="test/test_examples_dist.py:test_allreduce_bias_rmsnorm",
-            message="Calling examples allreduce_bias_rmsnorm kernel",
-            data={
-                "rank": self.rank,
-                "kernel_name": kernel_name,
-                "symm_rank": symm_mem_hdl.rank,
-                "group_name": group.group_name,
-            },
-        )
-        # endregion
         kernel = getattr(mod, kernel_name)
         if (
             torch.version.hip is not None
@@ -420,37 +251,20 @@ class TestExamplesDist(TestCase, MultiProcessTestCase):
             kernel = helion.jit(config=helion.Config(block_sizes=[4], num_warps=16))(
                 kernel.fn
             )
-        try:
-            _, result = code_and_output(
-                kernel,
-                (
-                    symm_mem_buffer,
-                    x,
-                    bias,
-                    weight,
-                    symm_mem_hdl.signal_pad_ptrs_dev,
-                    eps,  # EPS constexpr
-                    symm_mem_hdl.rank,  # RANK constexpr
-                    symm_mem_hdl.world_size,  # WORLD_SIZE constexpr
-                    group.group_name,  # GROUP_NAME constexpr
-                ),
-            )
-        except Exception as exc:
-            # region agent log
-            _agent_debug_log(
-                run_id=f"examples_dist_rmsnorm_pid{os.getpid()}",
-                hypothesis_id="H9",
-                location="test/test_examples_dist.py:test_allreduce_bias_rmsnorm",
-                message="Examples allreduce_bias_rmsnorm kernel failed",
-                data={
-                    "rank": self.rank,
-                    "kernel_name": kernel_name,
-                    "error_type": type(exc).__name__,
-                    "error": str(exc),
-                },
-            )
-            # endregion
-            raise
+        _, result = code_and_output(
+            kernel,
+            (
+                symm_mem_buffer,
+                x,
+                bias,
+                weight,
+                symm_mem_hdl.signal_pad_ptrs_dev,
+                eps,  # EPS constexpr
+                symm_mem_hdl.rank,  # RANK constexpr
+                symm_mem_hdl.world_size,  # WORLD_SIZE constexpr
+                group.group_name,  # GROUP_NAME constexpr
+            ),
+        )
 
         torch.cuda.synchronize()
 
@@ -467,11 +281,7 @@ class TestExamplesDist(TestCase, MultiProcessTestCase):
 
         mod = import_path(EXAMPLES_DIR / "distributed" / "matmul_reduce_scatter.py")
 
-        selected_backend = _set_preferred_symm_mem_backend(
-            run_id=f"examples_dist_matmul_rs_kernel_pid{os.getpid()}",
-            rank=self.rank,
-            device=self.device,
-        )
+        selected_backend = _set_preferred_symm_mem_backend(self.device)
         group = dist.group.WORLD
         if selected_backend == "NVSHMEM":
             symm_mem.enable_symm_mem_for_group(group.group_name)
@@ -494,48 +304,18 @@ class TestExamplesDist(TestCase, MultiProcessTestCase):
         # Setup symmetric memory like the wrapper does
         symm_mem_buffer = symm_mem.empty(M, N, dtype=dtype, device=self.device)
         symm_mem_hdl = symm_mem.rendezvous(symm_mem_buffer, group.group_name)
-
-        # region agent log
-        _agent_debug_log(
-            run_id=f"examples_dist_matmul_rs_kernel_pid{os.getpid()}",
-            hypothesis_id="H10",
-            location="test/test_examples_dist.py:test_matmul_reduce_scatter_kernel",
-            message="Calling examples matmul_reduce_scatter kernel",
-            data={
-                "rank": self.rank,
-                "symm_rank": symm_mem_hdl.rank,
-                "group_name": group.group_name,
-            },
+        _, result = code_and_output(
+            mod.matmul_reduce_scatter_kernel,
+            (
+                a,
+                b,
+                symm_mem_buffer,
+                symm_mem_hdl.signal_pad_ptrs_dev,
+                symm_mem_hdl.rank,  # RANK constexpr
+                symm_mem_hdl.world_size,  # WORLD_SIZE constexpr
+                group.group_name,  # GROUP_NAME constexpr
+            ),
         )
-        # endregion
-        try:
-            _, result = code_and_output(
-                mod.matmul_reduce_scatter_kernel,
-                (
-                    a,
-                    b,
-                    symm_mem_buffer,
-                    symm_mem_hdl.signal_pad_ptrs_dev,
-                    symm_mem_hdl.rank,  # RANK constexpr
-                    symm_mem_hdl.world_size,  # WORLD_SIZE constexpr
-                    group.group_name,  # GROUP_NAME constexpr
-                ),
-            )
-        except Exception as exc:
-            # region agent log
-            _agent_debug_log(
-                run_id=f"examples_dist_matmul_rs_kernel_pid{os.getpid()}",
-                hypothesis_id="H10",
-                location="test/test_examples_dist.py:test_matmul_reduce_scatter_kernel",
-                message="Examples matmul_reduce_scatter kernel failed",
-                data={
-                    "rank": self.rank,
-                    "error_type": type(exc).__name__,
-                    "error": str(exc),
-                },
-            )
-            # endregion
-            raise
 
         torch.cuda.synchronize()
 
@@ -552,11 +332,7 @@ class TestExamplesDist(TestCase, MultiProcessTestCase):
 
         mod = import_path(EXAMPLES_DIR / "distributed" / "matmul_reduce_scatter.py")
 
-        selected_backend = _set_preferred_symm_mem_backend(
-            run_id=f"examples_dist_matmul_rs_wrapper_pid{os.getpid()}",
-            rank=self.rank,
-            device=self.device,
-        )
+        selected_backend = _set_preferred_symm_mem_backend(self.device)
         group = dist.group.WORLD
         if selected_backend == "NVSHMEM":
             symm_mem.enable_symm_mem_for_group(group.group_name)
@@ -579,37 +355,11 @@ class TestExamplesDist(TestCase, MultiProcessTestCase):
         # Setup symmetric memory like the wrapper does
         symm_mem_buffer = symm_mem.empty(M, N, dtype=dtype, device=self.device)
         symm_mem.rendezvous(symm_mem_buffer, group.group_name)
-
-        # region agent log
-        _agent_debug_log(
-            run_id=f"examples_dist_matmul_rs_wrapper_pid{os.getpid()}",
-            hypothesis_id="H11",
-            location="test/test_examples_dist.py:test_matmul_reduce_scatter_wrapper",
-            message="Calling examples matmul_reduce_scatter wrapper",
-            data={"rank": self.rank, "group_name": group.group_name},
+        result = mod.helion_matmul_reduce_scatter(
+            symm_mem_buffer,
+            a,
+            b,
         )
-        # endregion
-        try:
-            result = mod.helion_matmul_reduce_scatter(
-                symm_mem_buffer,
-                a,
-                b,
-            )
-        except Exception as exc:
-            # region agent log
-            _agent_debug_log(
-                run_id=f"examples_dist_matmul_rs_wrapper_pid{os.getpid()}",
-                hypothesis_id="H11",
-                location="test/test_examples_dist.py:test_matmul_reduce_scatter_wrapper",
-                message="Examples matmul_reduce_scatter wrapper failed",
-                data={
-                    "rank": self.rank,
-                    "error_type": type(exc).__name__,
-                    "error": str(exc),
-                },
-            )
-            # endregion
-            raise
 
         torch.cuda.synchronize()
 

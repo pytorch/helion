@@ -2,9 +2,7 @@ from __future__ import annotations
 
 import contextlib
 from datetime import timedelta
-import json
 import os
-import time
 import unittest
 
 import torch
@@ -37,32 +35,6 @@ from helion.autotuner.effort_profile import RandomSearchConfig
 import helion.language as hl
 
 autotuner_names = ["fixed", *search_algorithms]
-
-
-_AGENT_DEBUG_LOG_PATH = "/root/.cursor/debug-logs/debug-412933.log"
-_AGENT_DEBUG_SESSION_ID = "412933"
-
-
-def _agent_debug_log(
-    run_id: str, hypothesis_id: str, location: str, message: str, data: dict
-) -> None:
-    payload = {
-        "sessionId": _AGENT_DEBUG_SESSION_ID,
-        "runId": run_id,
-        "hypothesisId": hypothesis_id,
-        "location": location,
-        "message": message,
-        "data": data,
-        "timestamp": int(time.time() * 1000),
-    }
-    try:
-        log_dir = os.path.dirname(_AGENT_DEBUG_LOG_PATH)
-        if log_dir:
-            os.makedirs(log_dir, exist_ok=True)
-        with open(_AGENT_DEBUG_LOG_PATH, "a", encoding="utf-8") as fp:
-            fp.write(json.dumps(payload, default=str) + "\n")
-    except Exception:
-        pass
 
 
 def custom_get_timeout(test_id: str) -> int:
@@ -185,21 +157,6 @@ class TestDistributed(TestCase, MultiProcessTestCase):
             timedelta(seconds=60), dist.group.WORLD
         )
         torch.manual_seed(42 + self.rank)
-        # region agent log
-        _agent_debug_log(
-            run_id=f"distributed_init_pid{os.getpid()}",
-            hypothesis_id="H1",
-            location="test/test_distributed.py:_init_process",
-            message="Initialized distributed process",
-            data={
-                "test_name": getattr(self, "_testMethodName", "unknown"),
-                "rank": self.rank,
-                "world_size": self.world_size,
-                "device": str(self.device),
-                "hip": torch.version.hip,
-            },
-        )
-        # endregion
 
     def _cleanup_process(self):
         self._exit_stack.close()
@@ -284,43 +241,12 @@ class TestDistributed(TestCase, MultiProcessTestCase):
         a_shared = symm_mem.empty(N, dtype=dtype, device=self.device).normal_()
 
         symm_mem_hdl = symm_mem.rendezvous(a_shared, group=group)
-
-        # region agent log
-        _agent_debug_log(
-            run_id=f"distributed_allreduce_pid{os.getpid()}",
-            hypothesis_id="H2",
-            location="test/test_distributed.py:do_test_allreduce",
-            message="Calling allreduce kernel",
-            data={
-                "rank": self.rank,
-                "group_name": group.group_name,
-                "symm_rank": symm_mem_hdl.rank,
-                "symm_world_size": symm_mem_hdl.world_size,
-            },
+        result = kernel(
+            a_shared,
+            symm_mem_hdl.rank,
+            group.group_name,
+            symm_mem_hdl.world_size,
         )
-        # endregion
-        try:
-            result = kernel(
-                a_shared,
-                symm_mem_hdl.rank,
-                group.group_name,
-                symm_mem_hdl.world_size,
-            )
-        except Exception as exc:
-            # region agent log
-            _agent_debug_log(
-                run_id=f"distributed_allreduce_pid{os.getpid()}",
-                hypothesis_id="H2",
-                location="test/test_distributed.py:do_test_allreduce",
-                message="Allreduce kernel failed",
-                data={
-                    "rank": self.rank,
-                    "error_type": type(exc).__name__,
-                    "error": str(exc),
-                },
-            )
-            # endregion
-            raise
 
         torch.cuda.synchronize()
 
@@ -393,48 +319,17 @@ class TestDistributed(TestCase, MultiProcessTestCase):
         torch.manual_seed(42)
         bias = torch.randn(D, device=self.device)
         weight = torch.randn(D, device=self.device)
-
-        # region agent log
-        _agent_debug_log(
-            run_id=f"distributed_rmsnorm_pid{os.getpid()}",
-            hypothesis_id="H3",
-            location="test/test_distributed.py:do_test_allreduce_bias_rmsnorm",
-            message="Calling allreduce_bias_rmsnorm kernel",
-            data={
-                "rank": self.rank,
-                "group_name": dist.group.WORLD.group_name,
-                "symm_rank": symm_mem_hdl.rank,
-                "symm_world_size": symm_mem_hdl.world_size,
-            },
+        result = kernel(
+            symm_mem_buffer,
+            x,
+            bias,
+            weight,
+            symm_mem_hdl.signal_pad_ptrs_dev,
+            eps,
+            symm_mem_hdl.rank,
+            symm_mem_hdl.world_size,
+            dist.group.WORLD.group_name,
         )
-        # endregion
-        try:
-            result = kernel(
-                symm_mem_buffer,
-                x,
-                bias,
-                weight,
-                symm_mem_hdl.signal_pad_ptrs_dev,
-                eps,
-                symm_mem_hdl.rank,
-                symm_mem_hdl.world_size,
-                dist.group.WORLD.group_name,
-            )
-        except Exception as exc:
-            # region agent log
-            _agent_debug_log(
-                run_id=f"distributed_rmsnorm_pid{os.getpid()}",
-                hypothesis_id="H3",
-                location="test/test_distributed.py:do_test_allreduce_bias_rmsnorm",
-                message="Allreduce_bias_rmsnorm kernel failed",
-                data={
-                    "rank": self.rank,
-                    "error_type": type(exc).__name__,
-                    "error": str(exc),
-                },
-            )
-            # endregion
-            raise
 
         expected = ref_kernel(x, bias, weight)
         torch.testing.assert_close(result, expected, rtol=1e-4, atol=1e-4)
@@ -510,46 +405,15 @@ class TestDistributed(TestCase, MultiProcessTestCase):
 
         symm_mem_buffer = symm_mem.empty(M, N, device=self.device)
         symm_mem_hdl = symm_mem.rendezvous(symm_mem_buffer, dist.group.WORLD.group_name)
-
-        # region agent log
-        _agent_debug_log(
-            run_id=f"distributed_matmul_rs_pid{os.getpid()}",
-            hypothesis_id="H4",
-            location="test/test_distributed.py:do_test_matmul_reduce_scatter",
-            message="Calling matmul_reduce_scatter kernel",
-            data={
-                "rank": self.rank,
-                "group_name": dist.group.WORLD.group_name,
-                "symm_rank": symm_mem_hdl.rank,
-                "symm_world_size": symm_mem_hdl.world_size,
-            },
+        result = kernel(
+            a,
+            b,
+            symm_mem_buffer,
+            symm_mem_hdl.signal_pad_ptrs_dev,
+            symm_mem_hdl.rank,  # RANK constexpr
+            symm_mem_hdl.world_size,  # WORLD_SIZE constexpr
+            dist.group.WORLD.group_name,  # GROUP_NAME constexpr
         )
-        # endregion
-        try:
-            result = kernel(
-                a,
-                b,
-                symm_mem_buffer,
-                symm_mem_hdl.signal_pad_ptrs_dev,
-                symm_mem_hdl.rank,  # RANK constexpr
-                symm_mem_hdl.world_size,  # WORLD_SIZE constexpr
-                dist.group.WORLD.group_name,  # GROUP_NAME constexpr
-            )
-        except Exception as exc:
-            # region agent log
-            _agent_debug_log(
-                run_id=f"distributed_matmul_rs_pid{os.getpid()}",
-                hypothesis_id="H4",
-                location="test/test_distributed.py:do_test_matmul_reduce_scatter",
-                message="Matmul_reduce_scatter kernel failed",
-                data={
-                    "rank": self.rank,
-                    "error_type": type(exc).__name__,
-                    "error": str(exc),
-                },
-            )
-            # endregion
-            raise
 
         expected = ref_kernel(a, b)
 
@@ -684,46 +548,15 @@ class TestDistributed(TestCase, MultiProcessTestCase):
                 "helion.autotuner.base_search.sync_object", wraps=sync_object
             ) as mock_sync_object,
         ):
-            # region agent log
-            _agent_debug_log(
-                run_id=f"distributed_2d_mm_pid{os.getpid()}",
-                hypothesis_id="H5",
-                location="test/test_distributed.py:do_test_two_dim_parallel_matmul",
-                message="Calling two_dim_parallel_matmul kernel",
-                data={
-                    "rank": self.rank,
-                    "tp_group_name": tp_group_name,
-                    "tp_rank": hdl.rank,
-                    "tp_world_size": hdl.world_size,
-                    "sp_rank": sp_rank,
-                },
+            result = helion_fn(
+                a_local,
+                b_local,
+                symm_mem_buf,
+                hdl.signal_pad_ptrs_dev,
+                TP_RANK=hdl.rank,
+                TP_SIZE=hdl.world_size,
+                GROUP_NAME=tp_group_name,
             )
-            # endregion
-            try:
-                result = helion_fn(
-                    a_local,
-                    b_local,
-                    symm_mem_buf,
-                    hdl.signal_pad_ptrs_dev,
-                    TP_RANK=hdl.rank,
-                    TP_SIZE=hdl.world_size,
-                    GROUP_NAME=tp_group_name,
-                )
-            except Exception as exc:
-                # region agent log
-                _agent_debug_log(
-                    run_id=f"distributed_2d_mm_pid{os.getpid()}",
-                    hypothesis_id="H5",
-                    location="test/test_distributed.py:do_test_two_dim_parallel_matmul",
-                    message="Two_dim_parallel_matmul kernel failed",
-                    data={
-                        "rank": self.rank,
-                        "error_type": type(exc).__name__,
-                        "error": str(exc),
-                    },
-                )
-                # endregion
-                raise
 
         def _assert_pgn_group_size_2(mock: unittest.mock.MagicMock) -> None:
             mock.assert_called()
