@@ -13,8 +13,8 @@ from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import skipIfMetal
-from helion._testing import skipUnlessTensorDescriptor
 from helion._testing import skipIfXPU
+from helion._testing import skipUnlessTensorDescriptor
 from helion._testing import xfailIfPallas
 import helion.language as hl
 
