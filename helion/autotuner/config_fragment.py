@@ -386,7 +386,7 @@ class PerDimListOf(ConfigSpecFragment):
     """Like ListOf but with independently typed fragments per dimension.
 
     Used when each dimension has a different set of valid choices (e.g.
-    grid fission factors that depend on per-dim num_blocks).
+    grid folding factors that depend on per-dim num_blocks).
     """
 
     fragments: list[ConfigSpecFragment]

@@ -147,7 +147,7 @@ class DeviceGridState(DeviceLoopOrGridState):
     # Each lane_loop entry is (var, extent) or (var, extent, setup, guard).
     # The optional third element contains AST statements placed inside the
     # loop body before the wrapped kernel body (e.g. offset/index/mask
-    # recomputation for partial fission).  The optional fourth element is
+    # recomputation for partial folding).  The optional fourth element is
     # a guard expression string; when present, the kernel body is wrapped
     # in ``if guard:`` inside the loop, after the setup statements.
     lane_loops: list[tuple[str, object, ...]] = dataclasses.field(  # pyrefly: ignore
@@ -715,7 +715,7 @@ class BlockSizeTileStrategy(TileStrategy):
         if pid_type == "xyz":
             if 1 < effective_dims <= 3:
                 return XYZProgramIDs()
-            # Fall back to flat when xyz is not feasible due to grid fission
+            # Fall back to flat when xyz is not feasible due to grid folding
             return FlatProgramIDs()
         if pid_type == "persistent_blocked":
             return PersistentBlockedProgramIDs()
@@ -1432,21 +1432,21 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
         block_sizes = self.block_size
         assert len(block_sizes) == len(block_ids)
 
-        # Determine per-dimension fission factors
-        fission_factors_list = env.config_spec.grid_fissions.config_get(
-            state.config.grid_fissions, block_ids[0], None
+        # Determine per-dimension folding factors
+        folding_factors_list = env.config_spec.grid_foldings.config_get(
+            state.config.grid_foldings, block_ids[0], None
         )
-        # Build a mapping from block_id to its fission factor
-        # factor=0: no fission (grid), factor=-1: full fission (loop),
-        # factor>0: partial fission (grid + loop of factor iterations)
-        fission_factor_map: dict[int, int] = {}
-        if fission_factors_list is not None:
-            fission_factor_map.update(zip(block_ids, fission_factors_list, strict=True))
+        # Build a mapping from block_id to its folding factor
+        # factor=0: no folding (grid), factor=-1: full folding (loop),
+        # factor>0: partial folding (grid + loop of factor iterations)
+        folding_factor_map: dict[int, int] = {}
+        if folding_factors_list is not None:
+            folding_factor_map.update(zip(block_ids, folding_factors_list, strict=True))
 
-        # Normalize: if a partial fission factor >= num_blocks in that dim,
-        # the grid dim would be 1 (degenerate), so treat as full fission.
+        # Normalize: if a partial folding factor >= num_blocks in that dim,
+        # the grid dim would be 1 (degenerate), so treat as full folding.
         for bid, bs in zip(block_ids, block_sizes, strict=True):
-            factor = fission_factor_map.get(bid, 0)
+            factor = folding_factor_map.get(bid, 0)
             if factor <= 0:
                 continue
             block_size_info = env.block_sizes[bid]
@@ -1455,11 +1455,11 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
                 if isinstance(numel_val, (int, sympy.Integer)):
                     num_blocks = int(sympy.ceiling(sympy.Rational(int(numel_val), bs)))
                     if factor >= num_blocks:
-                        fission_factor_map[bid] = -1
+                        folding_factor_map[bid] = -1
 
         # Count how many dims participate in the launch grid
         effective_grid_dims = sum(
-            1 for bid in block_ids if fission_factor_map.get(bid, 0) != -1
+            1 for bid in block_ids if folding_factor_map.get(bid, 0) != -1
         )
         if effective_grid_dims > 0:
             pids = self._select_pid_strategy_for_dims(effective_grid_dims)
@@ -1482,10 +1482,10 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
             ):
                 pids = XYZProgramIDs()
         else:
-            # All dims fully fissioned — grid would collapse to a single SM
+            # All dims fully folded — grid would collapse to a single SM
             # which is not a useful configuration; reject it.
             raise exc.InvalidConfig(
-                "Grid fission collapsed all dimensions, resulting in a single-SM grid"
+                "Grid folding collapsed all dimensions, resulting in a single-SM grid"
             )
 
         assert state.ast_args is None
@@ -1512,10 +1512,10 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
         thread_axis_map = self._thread_axis_map()
 
         # Phase 1: Process grid dims (factor=0 or factor>0) — PID-based
-        # Dims with factor=-1 (full fission) are skipped here.
+        # Dims with factor=-1 (full folding) are skipped here.
         grid_pid_index = 0
-        # Track which dims need partial fission loops (factor > 0)
-        partial_fission_dims: list[
+        # Track which dims need partial folding loops (factor > 0)
+        partial_folding_dims: list[
             tuple[int, int, object, object, str, str, object, str]
         ] = []  # (block_idx, factor, begin, end, offset_var, block_size_var, numel, pid_var)
         for block_idx, block_size, begin, end, step in reversed(
@@ -1523,7 +1523,7 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
                 [*zip(block_ids, block_sizes, begins, ends, steps, strict=True)]
             )
         ):
-            factor = fission_factor_map.get(block_idx, 0)
+            factor = folding_factor_map.get(block_idx, 0)
             if factor == -1:
                 continue
             numel = self._range_numel_expr(begin, end, step)
@@ -1534,8 +1534,8 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
             pid_var = device_function.new_var(f"pid_{grid_pid_index}", dce=True)
 
             if factor > 0:
-                # Partial fission: PID covers cdiv(numel, block_size * factor) blocks
-                # offset will be computed inside the fission loop
+                # Partial folding: PID covers cdiv(numel, block_size * factor) blocks
+                # offset will be computed inside the folding loop
                 if block_size != 1:
                     block_size_var = self.block_size_var(block_idx)
                     assert block_size_var is not None
@@ -1543,7 +1543,7 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
                 else:
                     block_size_var = "1"
                 state.add_statement(f"{offset_var} = {pid_var}")
-                # For PIDInfo, adjust numel so grid shrinks by the fission factor
+                # For PIDInfo, adjust numel so grid shrinks by the folding factor
                 if isinstance(numel, sympy.Expr):
                     # pyrefly: ignore [unsupported-operation]
                     adjusted_numel = sympy.ceiling(numel / factor)
@@ -1554,8 +1554,8 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
                 pid = PIDInfo(
                     pid_var, block_size_var, adjusted_numel, block_idx
                 )  # pyrefly: ignore[bad-argument-type]
-                # Save info for Phase 2 partial fission loop generation
-                partial_fission_dims.append(
+                # Save info for Phase 2 partial folding loop generation
+                partial_folding_dims.append(
                     (
                         block_idx,
                         factor,
@@ -1568,7 +1568,7 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
                     )
                 )
             else:
-                # No fission (factor=0): standard PID-based offset
+                # No folding (factor=0): standard PID-based offset
                 begin_offset_expr = ""
                 if begin != 0:
                     begin_ast = self._to_ast(begin, to_dtype=dtype)
@@ -1620,9 +1620,9 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
         else:
             state.device_function.set_pid(pids)
 
-        # Build partial-fission lane loops (factor > 0).
-        # Full fission (factor=-1) is handled by the graph transformation in
-        # build_codegen_graphs → _apply_grid_fission, which wraps those dims
+        # Build partial-folding lane loops (factor > 0).
+        # Full folding (factor=-1) is handled by the graph transformation in
+        # build_codegen_graphs → _apply_grid_folding, which wraps those dims
         # in ForLoopGraphInfo and lets codegen_device_loop handle them.
         lane_loops: list[tuple[str, object, ...]] = []  # pyrefly: ignore
         dtype = env.index_type()
@@ -1636,11 +1636,11 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
             block_size_var,
             numel,
             pid_var,
-        ) in partial_fission_dims:
+        ) in partial_folding_dims:
             block_size = dict(zip(block_ids, block_sizes, strict=True))[block_idx]
             index_var = self.index_var(block_idx)
-            fission_loop_var = state.device_function.new_var(
-                f"fission_{block_idx}", dce=True
+            folding_loop_var = state.device_function.new_var(
+                f"folding_{block_idx}", dce=True
             )
 
             # Per-loop setup: recompute offset/index/mask for each iteration
@@ -1655,11 +1655,11 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
             if block_size_var != "1":
                 offset_expr = (
                     f"{begin_offset_expr}"
-                    f"({pid_var} * {factor} + {fission_loop_var}) * {block_size_var}"
+                    f"({pid_var} * {factor} + {folding_loop_var}) * {block_size_var}"
                 )
             else:
                 offset_expr = (
-                    f"{begin_offset_expr}{pid_var} * {factor} + {fission_loop_var}"
+                    f"{begin_offset_expr}{pid_var} * {factor} + {folding_loop_var}"
                 )
             loop_setup.append(statement_from_string(f"{offset_var} = {offset_expr}"))
 
@@ -1674,10 +1674,10 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
             mask_statement = self._setup_mask(
                 state, block_idx, block_size, index_var, numel
             )
-            needs_fission_guard = not env.block_sizes[block_idx].known_multiple(
+            needs_folding_guard = not env.block_sizes[block_idx].known_multiple(
                 block_size * factor
             )
-            if mask_statement is None and needs_fission_guard:
+            if mask_statement is None and needs_folding_guard:
                 mask_var = state.device_function.new_var(f"mask_{block_idx}", dce=True)
                 self.mask_vars[block_idx] = mask_var
                 mask_statement = statement_from_string(
@@ -1686,13 +1686,13 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
                 )
             if mask_statement is not None:
                 loop_setup.append(mask_statement)
-            # Partial fission may iterate beyond numel when numel is not a
+            # Partial folding may iterate beyond numel when numel is not a
             # multiple of (block_size * factor).  Compute a scalar guard and
             # pass it to wrap_body which wraps the kernel body in ``if guard:``.
             guard_var: str | None = None
-            if needs_fission_guard:
+            if needs_folding_guard:
                 guard_var = state.device_function.new_var(
-                    f"fission_guard_{block_idx}", dce=True
+                    f"folding_guard_{block_idx}", dce=True
                 )
                 loop_setup.append(
                     statement_from_string(
@@ -1712,7 +1712,7 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
                 ),
                 end=expr_from_string(repr(factor)),
             )
-            lane_loops.append((fission_loop_var, range_expr, loop_setup, guard_var))
+            lane_loops.append((folding_loop_var, range_expr, loop_setup, guard_var))
 
         # Only use ends_override if there are data-dependent (tensor) bounds
         has_tensor_ends = any(isinstance(e, torch.Tensor) for e in ends)
@@ -1722,9 +1722,9 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
             )
         else:
             block_id_to_info = self._create_block_id_info_dict(state)
-        # Exclude fully-fissioned dims from block_id_to_info: they are
+        # Exclude fully-folded dims from block_id_to_info: they are
         # handled by ForLoopGraphInfo device loops, not the grid.
-        for bid, factor in fission_factor_map.items():
+        for bid, factor in folding_factor_map.items():
             if factor == -1:
                 block_id_to_info.pop(bid, None)
         return DeviceGridState(

@@ -503,21 +503,21 @@ class Backend(abc.ABC):
             config.loop_orders, block_ids[0]
         ) or [*range(len(block_ids))]
         # The config lookup may return a loop_order from a wider tile call
-        # (e.g. 2-dim order for a 1-dim strategy created by grid fission).
+        # (e.g. 2-dim order for a 1-dim strategy created by grid folding).
         if len(loop_order) != len(block_ids):
             loop_order = [*range(len(block_ids))]
         l2_grouping = env.config_spec.l2_groupings.config_get(
             config.l2_groupings, block_ids[0], 1
         )
 
-        # Grid fission overrides flatten — need ND strategy for per-dim fission
-        grid_fission_factors = env.config_spec.grid_fissions.config_get(
-            config.grid_fissions, block_ids[0], None
+        # Grid folding overrides flatten — need ND strategy for per-dim folding
+        grid_folding_factors = env.config_spec.grid_foldings.config_get(
+            config.grid_foldings, block_ids[0], None
         )
-        has_fission = grid_fission_factors is not None and any(
-            f != 0 for f in grid_fission_factors
+        has_folding = grid_folding_factors is not None and any(
+            f != 0 for f in grid_folding_factors
         )
-        if not has_fission and block_size_infos[0].is_flattened(config):
+        if not has_folding and block_size_infos[0].is_flattened(config):
             block_size = functools.reduce(
                 operator.mul, [bs.from_config_assert(config) for bs in block_size_infos]
             )

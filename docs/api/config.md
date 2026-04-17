@@ -91,28 +91,28 @@ Configs are typically discovered automatically through autotuning, but can also 
    Whether to use ``tl.static_range`` instead of ``tl.range``.
 ```
 
-### Grid Fission
+### Grid Folding
 
 ```{eval-rst}
-.. autoattribute:: Config.grid_fissions
+.. autoattribute:: Config.grid_foldings
 
-   Per-dimension fission factors that control how tile dimensions map to the GPU launch grid
+   Per-dimension folding factors that control how tile dimensions map to the GPU launch grid
    versus inner device loops. Each ``hl.tile()`` invocation with 2+ dimensions gets a list of
-   fission factors (one per tile dimension):
+   folding factors (one per tile dimension):
 
-   - ``0``: No fission — dimension is fully in the launch grid (default)
-   - ``k`` (power of 2, 2 ≤ k ≤ 64): Partial fission — grid shrinks by factor ``k``,
+   - ``0``: No folding — dimension is fully in the launch grid (default)
+   - ``k`` (power of 2, 2 ≤ k ≤ 64): Partial folding — grid shrinks by factor ``k``,
      each grid cell iterates ``k`` times in an inner ``tl.range`` loop
-   - ``-1``: Full fission — dimension is entirely in an inner device loop
+   - ``-1``: Full folding — dimension is entirely in an inner device loop
 
    **Example** for a 3D tile ``hl.tile([num_seqs, num_heads, max_query_len])``:
 
    .. code-block:: python
 
-      grid_fissions=[[0, 0, 0]]    # All dims in grid (default)
-      grid_fissions=[[0, 0, -1]]   # Last dim fully in loop (2D grid)
-      grid_fissions=[[0, 0, 4]]    # Last dim: grid shrinks 4x, loop of 4
-      grid_fissions=[[0, 2, -1]]   # Mixed: partial on dim 1, full on dim 2
+      grid_foldings=[[0, 0, 0]]    # All dims in grid (default)
+      grid_foldings=[[0, 0, -1]]   # Last dim fully in loop (2D grid)
+      grid_foldings=[[0, 0, 4]]    # Last dim: grid shrinks 4x, loop of 4
+      grid_foldings=[[0, 2, -1]]   # Mixed: partial on dim 1, full on dim 2
 
    This enables the autotuner to find optimal grid configurations between
    fully-parallel (all in grid) and fully-sequential (all in loop) extremes.

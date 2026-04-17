@@ -137,7 +137,7 @@ VALID_KEYS: frozenset[str] = frozenset(
         "l2_groupings",
         "reduction_loops",
         "flatten_loops",
-        "grid_fissions",
+        "grid_foldings",
         "range_unroll_factors",
         "range_warp_specializes",
         "range_num_stages",
@@ -208,7 +208,7 @@ class ConfigSpec:
         self.loop_orders: BlockIdSequence[LoopOrderSpec] = BlockIdSequence()
         self.l2_groupings: BlockIdSequence[L2GroupingSpec] = BlockIdSequence()
         self.flatten_loops: BlockIdSequence[FlattenLoopSpec] = BlockIdSequence()
-        self.grid_fissions: BlockIdSequence[GridFissionSpec] = BlockIdSequence()
+        self.grid_foldings: BlockIdSequence[GridFoldingSpec] = BlockIdSequence()
         self.reduction_loops: BlockIdSequence[ReductionLoopSpec] = BlockIdSequence()
         self.range_unroll_factors: BlockIdSequence[RangeUnrollFactorSpec] = (
             BlockIdSequence()
@@ -337,7 +337,7 @@ class ConfigSpec:
         self.loop_orders._remove_duplicates()
         self.l2_groupings._remove_duplicates()
         self.flatten_loops._remove_duplicates()
-        self.grid_fissions._remove_duplicates()
+        self.grid_foldings._remove_duplicates()
         self.range_unroll_factors._remove_duplicates()
         self.range_warp_specialize._remove_duplicates()
         self.range_num_stages._remove_duplicates()
@@ -389,7 +389,7 @@ class ConfigSpec:
             "reduction_loop",
             "l2_grouping",
             "flatten_loop",
-            "grid_fission",
+            "grid_folding",
             "range_unroll_factor",
             "range_warp_specialize",
             "range_num_stage",
@@ -432,7 +432,7 @@ class ConfigSpec:
             ("block_sizes", self.block_sizes, True),
             ("num_threads", self.num_threads, True),
             ("flatten_loops", self.flatten_loops, True),
-            ("grid_fissions", self.grid_fissions, False),
+            ("grid_foldings", self.grid_foldings, False),
             ("l2_groupings", self.l2_groupings, True),
             ("loop_orders", self.loop_orders, False),
             ("reduction_loops", self.reduction_loops, True),
@@ -503,7 +503,7 @@ class ConfigSpec:
             "loop_orders",
             "l2_groupings",
             "flatten_loops",
-            "grid_fissions",
+            "grid_foldings",
             "reduction_loops",
             "range_unroll_factors",
             "range_warp_specializes",
@@ -664,9 +664,9 @@ class ConfigSpec:
 
         # Per-dim degenerate factor rejection: factor >= num_blocks means
         # the grid collapses to 1 cell for that dim — equivalent to full
-        # fission.  Reject (or normalize to -1) to shrink the search space.
+        # folding.  Reject (or normalize to -1) to shrink the search space.
         # Only works for static shapes; skipped when numel is symbolic.
-        grid_fissions_list = cast("list[list[int]]", config.get("grid_fissions", []))
+        grid_foldings_list = cast("list[list[int]]", config.get("grid_foldings", []))
         block_sizes_list = cast("list[int]", config.get("block_sizes", []))
         from .._compiler.compile_environment import CompileEnvironment
         from .._compiler.compile_environment import NoCurrentEnvironment
@@ -676,10 +676,10 @@ class ConfigSpec:
         except NoCurrentEnvironment:
             env = None
         if env is not None:
-            for spec_idx, spec in enumerate(self.grid_fissions):
-                if spec_idx >= len(grid_fissions_list):
+            for spec_idx, spec in enumerate(self.grid_foldings):
+                if spec_idx >= len(grid_foldings_list):
                     continue
-                factors = grid_fissions_list[spec_idx]
+                factors = grid_foldings_list[spec_idx]
                 for dim_idx, (block_id, factor) in enumerate(
                     zip(spec.block_ids, factors, strict=True)
                 ):
@@ -698,15 +698,15 @@ class ConfigSpec:
                     if factor >= num_blocks:
                         # Always normalize — a degenerate partial factor
                         # has an unambiguous meaning (equivalent to -1).
-                        # Unlike all-dims-fissioned which has no valid grid,
+                        # Unlike all-dims-folded which has no valid grid,
                         # this is not truly invalid.  The search space
                         # reduction comes from the fragment filter in
-                        # GridFissionSpec._fragment(), not from rejection here.
+                        # GridFoldingSpec._fragment(), not from rejection here.
                         factors[dim_idx] = -1
 
-        # Reject grid_fissions that fission ALL dims — the grid would
+        # Reject grid_foldings that fold ALL dims — the grid would
         # collapse to a single SM, which is never useful.
-        for factors in grid_fissions_list:
+        for factors in grid_foldings_list:
             if factors and all(f != 0 for f in factors):
                 if _fix_invalid:
                     # Reset the last non-zero factor to 0 so at least one
@@ -717,26 +717,26 @@ class ConfigSpec:
                             break
                 else:
                     raise InvalidConfig(
-                        "grid_fissions cannot fission all dimensions "
+                        "grid_foldings cannot fold all dimensions "
                         "(grid would collapse to a single SM)"
                     )
 
-        # Force grid_fissions to all-zeros for persistent pid_types
+        # Force grid_foldings to all-zeros for persistent pid_types
         if pid_type in ("persistent_blocked", "persistent_interleaved"):
-            grid_fissions_list = cast(
-                "list[list[int]]", config.get("grid_fissions", [])
+            grid_foldings_list = cast(
+                "list[list[int]]", config.get("grid_foldings", [])
             )
-            has_fission = any(
-                factor != 0 for factors in grid_fissions_list for factor in factors
+            has_folding = any(
+                factor != 0 for factors in grid_foldings_list for factor in factors
             )
-            if has_fission:
+            if has_folding:
                 if _fix_invalid:
-                    config["grid_fissions"] = [
-                        [0] * len(factors) for factors in grid_fissions_list
+                    config["grid_foldings"] = [
+                        [0] * len(factors) for factors in grid_foldings_list
                     ]
                 else:
                     raise InvalidConfig(
-                        "grid_fissions is not supported with persistent pid_types"
+                        "grid_foldings is not supported with persistent pid_types"
                     )
 
         if "epilogue_subtile" in config:
@@ -903,7 +903,7 @@ class ConfigSpec:
                 for name, seq in [
                     ("loop_orders", self.loop_orders),
                     ("flatten_loops", self.flatten_loops),
-                    ("grid_fissions", self.grid_fissions),
+                    ("grid_foldings", self.grid_foldings),
                     ("l2_groupings", self.l2_groupings),
                     ("reduction_loops", self.reduction_loops),
                     ("range_unroll_factors", self.range_unroll_factors),
@@ -1023,7 +1023,7 @@ class ConfigSpec:
             "loop_orders",
             "num_threads",
             "flatten_loops",
-            "grid_fissions",
+            "grid_foldings",
             "reduction_loops",
             "l2_groupings",
             "range_unroll_factors",
@@ -1200,17 +1200,17 @@ class FlattenLoopSpec(_BlockIdItem):
         return False
 
 
-class GridFissionSpec(_BlockIdItem):
-    """Per-dimension fission factors for grid dimensions.
+class GridFoldingSpec(_BlockIdItem):
+    """Per-dimension folding factors for grid dimensions.
 
-    Each dimension gets a fission factor:
-      0  — no fission, dimension fully in launch grid
-      k  — partial fission (k must be power of 2, 2 ≤ k ≤ 64),
+    Each dimension gets a folding factor:
+      0  — no folding, dimension fully in launch grid
+      k  — partial folding (k must be power of 2, 2 ≤ k ≤ 64),
            grid shrinks by factor k, each grid cell loops k times
-      -1 — full fission, dimension entirely in an inner device loop
+      -1 — full folding, dimension entirely in an inner device loop
     """
 
-    # Valid fission factor choices (order matters for EnumFragment default)
+    # Valid folding factor choices (order matters for EnumFragment default)
     VALID_FACTORS: tuple[int, ...] = (0, -1, 2, 4, 8, 16, 32, 64)
 
     def _fragment(self, base: ConfigSpec) -> PerDimListOf | ListOf:
@@ -1230,7 +1230,7 @@ class GridFissionSpec(_BlockIdItem):
         for block_id in self.block_ids:
             bs_info = env.block_sizes[block_id]
             bs_spec = base.block_sizes.block_id_lookup(block_id)
-            # Compute max useful partial fission factor for this dim.
+            # Compute max useful partial folding factor for this dim.
             # factor >= num_blocks is degenerate (grid collapses to 1 cell),
             # so exclude those from the search space.
             max_factor: int | None = None

@@ -1,6 +1,6 @@
-"""Graph transformation that converts fully-fissioned grid dimensions into device loops.
+"""Graph transformation that converts fully-folded grid dimensions into device loops.
 
-When a tile dimension has ``grid_fissions = -1``, the dimension is removed from
+When a tile dimension has ``grid_foldings = -1``, the dimension is removed from
 the GPU launch grid and wrapped in an inner ``tl.range`` device loop instead.
 This is implemented as an IR graph transformation (similar to
 :mod:`roll_reduction`) so that the standard ``codegen_device_loop`` path handles
@@ -26,10 +26,10 @@ if TYPE_CHECKING:
     from .device_ir import DeviceIR
 
 
-class GridFissionTransformer:
-    """Wrap a fully-fissioned grid dimension into a ForLoopGraphInfo device loop.
+class GridFoldingTransformer:
+    """Wrap a fully-folded grid dimension into a ForLoopGraphInfo device loop.
 
-    For a grid tile ``hl.tile([M, N])`` with ``grid_fissions = [[0, -1]]``, this
+    For a grid tile ``hl.tile([M, N])`` with ``grid_foldings = [[0, -1]]``, this
     transformer wraps the root graph body in a ``ForLoopGraphInfo`` for block_id N.
     The standard ``codegen_device_loop`` path then generates the loop code.
 
@@ -87,12 +87,12 @@ class GridFissionTransformer:
         return placeholder
 
     def _numel_node_for(self, meta: dict[str, object]) -> torch.fx.Node:
-        """Create an outer-graph node representing the fissioned dimension's size."""
+        """Create an outer-graph node representing the folded dimension's size."""
         if self._numel_node is not None:
             return self._numel_node
         self._numel_node = node = self.outer_graph.call_function(
             _get_symnode,
-            (f"grid_fission_dim{self.block_id}",),
+            (f"grid_folding_dim{self.block_id}",),
             {},
         )
         node.meta.update(meta)
