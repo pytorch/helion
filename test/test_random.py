@@ -17,7 +17,6 @@ from helion._testing import onlyBackends
 from helion._testing import skipIfMTIA
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfRocm
-from helion._testing import xfailIfPallas
 import helion.language as hl
 from helion.runtime.config import Config
 from helion.runtime.ref_mode import is_ref_mode_enabled

@@ -1009,6 +1009,9 @@ class TestPallas(TestCase):
         self.assertIn("pl.ds(", code)
         torch.testing.assert_close(result, args[0] + args[1])
 
+    @xfailIfPallas(
+        "No config values to tune because all block sizes are fixed and Pallas no longer tunes reduction loops"
+    )
     def test_squeeze_slice_access(self) -> None:
         """Test for the [None, :] indexing pattern (subscript index for slice >= tensor_ndim)"""
 
