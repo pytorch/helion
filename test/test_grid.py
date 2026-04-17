@@ -120,7 +120,6 @@ class TestGrid(RefEagerTestBase, TestCase):
         )
         torch.testing.assert_close(result, grid_2d_pytorch(args[0], args[1]))
 
-    @xfailIfPallas("2D nested grids not working correctly Pallas")
     def test_grid_2d_idx_nested(self):
         @helion.kernel(static_shapes=True)
         def grid_2d_idx_nested(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -153,7 +152,6 @@ class TestGrid(RefEagerTestBase, TestCase):
         code, result = code_and_output(grid_2d_idx_nested, args)
         torch.testing.assert_close(result, grid_2d_pytorch(args[0], args[1]))
 
-    @xfailIfPallas("Grid begin/end not working on Pallas")
     def test_grid_begin_end(self):
         @helion.kernel(autotune_effort="none")
         def grid_begin_end(x: torch.Tensor) -> torch.Tensor:
@@ -216,7 +214,6 @@ class TestGrid(RefEagerTestBase, TestCase):
         code, result = code_and_output(grid_end_step_kwarg, (x,))
         torch.testing.assert_close(result, grid_end_step_kwarg_pytorch(x))
 
-    @xfailIfPallas("Grid begin/end not working on Pallas")
     def test_grid_multidim_begin_end(self):
         @helion.kernel(autotune_effort="none")
         def grid_multidim_begin_end(x: torch.Tensor) -> torch.Tensor:

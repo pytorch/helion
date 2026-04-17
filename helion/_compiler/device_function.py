@@ -30,6 +30,7 @@ from .ast_extension import statement_from_string
 from .ast_read_writes import ReadWrites
 from .ast_read_writes import ast_rename
 from .ast_read_writes import dead_assignment_elimination
+from .backend_registry import all_reserved_launch_param_names
 from .compile_environment import CompileEnvironment
 from .host_function import HostFunction
 from .host_function import NoCurrentFunction
@@ -46,6 +47,7 @@ if TYPE_CHECKING:
     from .generate_ast import GenerateAST
     from .indexing_strategy import IndexingStrategy
     from .program_id import ProgramIDs
+    from helion._compiler.pallas.plan_tiling import DimensionTiling
 
     _P = TypeVar("_P", bound="TensorPropertyArg")
 
@@ -260,24 +262,12 @@ class DeviceFunction:
         self.pid: ProgramIDs | None = None
         self.namespace: _Namespace = _Namespace()
         self.namespace._used_names.update(reserved_names())
+
+        self.namespace._used_names.update(all_reserved_launch_param_names())
         self.namespace._used_names.update(
-            # used by triton run() method
-            [
-                "grid",
-                "warmup",
-                "num_warps",
-                "num_stages",
-            ]
-            + (
-                ["num_ctas", "occupancy"]
-                if CompileEnvironment.current().backend_name == "tileir"
-                else []
-            )
-            + [
-                x.removeprefix("_triton_config_")
-                for x in config
-                if x.startswith("_triton_config_")
-            ]
+            x.removeprefix("_triton_config_")
+            for x in config
+            if x.startswith("_triton_config_")
         )
         self._variable_renames: dict[str, list[str]] = {}
         self.dce_vars: list[str] = []
@@ -318,8 +308,8 @@ class DeviceFunction:
         self.epilogue_subtile_store_indices: dict[str, int] = {}
         self.rng_seed_buffer_param_name = None
 
-        # Pallas: id(fake_tensor) → {dim: block_id}, recorded during codegen
-        self.pallas_tensor_dim_block_ids: dict[int, dict[int, int]] = {}
+        # Pallas: id(fake_tensor) → [DimensionTiling], recorded during `plan_tiling`
+        self.pallas_tensor_dim_tilings: dict[int, list[DimensionTiling]] = {}
         # Pallas: set of id(fake_tensor) for tensors accessed in pipeline body
         self.pallas_pipeline_tensor_ids: set[int] = set()
         # TODO(dunfanlu): consider duplicating and aliasing arguments if a tensor needs to be accessed via both VMEM and SMEM?

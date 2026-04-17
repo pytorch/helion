@@ -713,12 +713,13 @@ def generate_ast(
             load_transform=load_transform,
             extra_params=extra_params,
         )
-        CompileEnvironment.current().backend.pre_codegen(
-            graphs=codegen.codegen_graphs,
-            config=config,
-            tile_strategy=codegen.device_function.tile_strategy,
-        )
         with codegen.device_function:
+            CompileEnvironment.current().backend.pre_codegen(
+                graphs=codegen.codegen_graphs,
+                config=config,
+                tile_strategy=codegen.device_function.tile_strategy,
+            )
+
             for stmt in func.body:
                 codegen.add_statement(codegen.visit(stmt))
             kernel_def = codegen.device_function.codegen_function_def()
