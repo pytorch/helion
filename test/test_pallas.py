@@ -120,11 +120,56 @@ def pallas_sum_reduction(x: torch.Tensor) -> torch.Tensor:
 
 
 @helion.kernel(backend="pallas", static_shapes=True)
+def pallas_sum_reduce_dim0(x: torch.Tensor) -> torch.Tensor:
+    _n, m = x.size()
+    out = torch.empty([m], dtype=x.dtype, device=x.device)
+    for tile_m in hl.tile(m):
+        out[tile_m] = x[:, tile_m].sum(0)
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
+def pallas_sum_reduce_middle(x: torch.Tensor) -> torch.Tensor:
+    b, _n, m = x.size()
+    out = torch.empty([b, m], dtype=x.dtype, device=x.device)
+    for tile_b, tile_m in hl.tile([b, m]):
+        out[tile_b, tile_m] = x[tile_b, :, tile_m].sum(1)
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
+def pallas_sum_reduce_multiple(x: torch.Tensor) -> torch.Tensor:
+    b, _n, _m = x.size()
+    out = torch.empty([b], dtype=x.dtype, device=x.device)
+    for tile_b in hl.tile(b):
+        out[tile_b] = x[tile_b, :, :].sum([0, 1])
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
 def pallas_max_reduction(x: torch.Tensor) -> torch.Tensor:
     n, _m = x.size()
     out = torch.empty([n], dtype=x.dtype, device=x.device)
     for tile_n in hl.tile(n):
         out[tile_n] = torch.amax(x[tile_n, :], dim=-1)
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
+def pallas_min_reduction(x: torch.Tensor) -> torch.Tensor:
+    n, _m = x.size()
+    out = torch.empty([n], dtype=x.dtype, device=x.device)
+    for tile_n in hl.tile(n):
+        out[tile_n] = torch.amin(x[tile_n, :], dim=-1)
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
+def pallas_argmin_reduction(x: torch.Tensor) -> torch.Tensor:
+    n, _m = x.size()
+    out = torch.empty([n], dtype=torch.int32, device=x.device)
+    for tile_n in hl.tile(n):
+        out[tile_n] = torch.argmin(x[tile_n, :], dim=-1).to(torch.int32)
     return out
 
 
@@ -398,11 +443,48 @@ class TestPallas(TestCase):
         self.assertIn("jnp.sum", code)
         torch.testing.assert_close(result, x.sum(-1), rtol=1e-4, atol=1e-4)
 
+    def test_sum_reduction_large(self) -> None:
+        x = torch.randn(8, 16384, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(pallas_sum_reduction, (x,), block_size=1)
+        self.assertIn("jnp.sum", code)
+        torch.testing.assert_close(result, x.sum(-1), rtol=1e-3, atol=1e-3)
+
+    def test_sum_reduce_dim0(self) -> None:
+        x = torch.randn(64, 32, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(pallas_sum_reduce_dim0, (x,), block_size=16)
+        self.assertIn("jnp.sum", code)
+        torch.testing.assert_close(result, x.sum(0), rtol=1e-4, atol=1e-4)
+
+    def test_sum_reduce_middle(self) -> None:
+        x = torch.randn(4, 64, 32, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(
+            pallas_sum_reduce_middle, (x,), block_sizes=[2, 16]
+        )
+        self.assertIn("jnp.sum", code)
+        torch.testing.assert_close(result, x.sum(1), rtol=1e-4, atol=1e-4)
+
+    def test_sum_reduce_multiple(self) -> None:
+        x = torch.randn(4, 32, 64, device=DEVICE, dtype=torch.float32)
+        with self.assertRaises(NotImplementedError):
+            code_and_output(pallas_sum_reduce_multiple, (x,), block_size=2)
+
     def test_max_reduction(self) -> None:
         x = torch.randn(32, 64, device=DEVICE, dtype=torch.float32)
         code, result = code_and_output(pallas_max_reduction, (x,), block_size=16)
         self.assertIn("jnp.max", code)
         torch.testing.assert_close(result, torch.amax(x, dim=-1), rtol=1e-4, atol=1e-4)
+
+    def test_min_reduction(self) -> None:
+        x = torch.randn(32, 64, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(pallas_min_reduction, (x,), block_size=16)
+        self.assertIn("jnp.min", code)
+        torch.testing.assert_close(result, torch.amin(x, dim=-1), rtol=1e-4, atol=1e-4)
+
+    def test_argmin_reduction(self) -> None:
+        x = torch.randn(32, 64, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(pallas_argmin_reduction, (x,), block_size=16)
+        self.assertIn("jnp.argmin", code)
+        torch.testing.assert_close(result, torch.argmin(x, dim=-1).to(torch.int32))
 
     def test_tile_begin_end(self) -> None:
         x = torch.randn(1024, device=DEVICE, dtype=torch.float32)
@@ -927,6 +1009,9 @@ class TestPallas(TestCase):
         self.assertIn("pl.ds(", code)
         torch.testing.assert_close(result, args[0] + args[1])
 
+    @xfailIfPallas(
+        "No config values to tune because all block sizes are fixed and Pallas no longer tunes reduction loops"
+    )
     def test_squeeze_slice_access(self) -> None:
         """Test for the [None, :] indexing pattern (subscript index for slice >= tensor_ndim)"""
 

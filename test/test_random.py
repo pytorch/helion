@@ -17,7 +17,6 @@ from helion._testing import onlyBackends
 from helion._testing import skipIfMTIA
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfRocm
-from helion._testing import xfailIfPallas
 import helion.language as hl
 from helion.runtime.config import Config
 from helion.runtime.ref_mode import is_ref_mode_enabled
@@ -498,7 +497,6 @@ class TestRandom(RefEagerTestBase, TestCase):
             msg="Mixed tile argument order should produce identical results",
         )
 
-    @xfailIfPallas("rolled reductions not supported for pallas rand")
     @skipIfRocm("ROCm Triton worker crashes on rand with rolled reductions")
     def test_hl_rand_rolled_reductions(self):
         @helion.kernel(static_shapes=False)
