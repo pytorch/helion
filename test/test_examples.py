@@ -1561,6 +1561,7 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
 
     @xfailIfPallas("BackendError on pallas")
+    @skipIfXPU("Timeout on XPU")
     def test_gather_gemv(self):
         args = (
             torch.randn([4, 512, 512], device=DEVICE, dtype=torch.float32),
@@ -1676,6 +1677,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             block_sizes=[16, 8, 16],
         )
 
+    @skipIfXPU("Timeout on XPU")
     def test_fused_linear_jsd(self):
         beta = 0.5
         ignore_index = -100

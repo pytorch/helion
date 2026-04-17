@@ -23,6 +23,7 @@ from helion._testing import skipIfLowVRAM
 from helion._testing import skipIfNormalMode
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfTileIR
+from helion._testing import skipIfXPU
 from helion._testing import skipUnlessTensorDescriptor
 import helion.language as hl
 
@@ -746,6 +747,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
         "Test requires large memory",
         required_bytes=_LARGE_TENSOR_REQUIRED_BYTES,
     )
+    @skipIfXPU("Timeout on XPU")
     def test_large_tensor(self):
         @helion.kernel(autotune_effort="none")
         def f(x: torch.Tensor) -> torch.Tensor:
