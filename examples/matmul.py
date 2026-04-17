@@ -296,7 +296,7 @@ def check(m: int, k: int, n: int) -> None:
 # ``grid_foldings`` per-dimension values: 0 = no folding, -1 = full, k = partial.
 # The kernel is identical -- only the Config changes.
 
-GRID_FISSION_CONFIGS = {
+GRID_FOLDING_CONFIGS = {
     "no_folding [0,0]": helion.Config(
         block_sizes=[128, 128, 32],
         grid_foldings=[[0, 0]],
@@ -335,7 +335,7 @@ def check_grid_folding(m: int, k: int, n: int) -> None:
 
     bound = matmul.bind((x, y))
     kernels = {
-        name: bound.compile_config(cfg) for name, cfg in GRID_FISSION_CONFIGS.items()
+        name: bound.compile_config(cfg) for name, cfg in GRID_FOLDING_CONFIGS.items()
     }
     run_example(kernels, torch.matmul, (x, y))  # pyrefly: ignore[bad-argument-type]
 
