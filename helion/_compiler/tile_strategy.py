@@ -1446,20 +1446,6 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
         if folding_factors_list is not None:
             folding_factor_map.update(zip(block_ids, folding_factors_list, strict=True))
 
-        # Normalize: if a partial folding factor >= num_blocks in that dim,
-        # the grid dim would be 1 (degenerate), so treat as full folding.
-        for bid, bs in zip(block_ids, block_sizes, strict=True):
-            factor = folding_factor_map.get(bid, 0)
-            if factor <= 0:
-                continue
-            block_size_info = env.block_sizes[bid]
-            if block_size_info.size is not None:
-                numel_val = block_size_info.numel
-                if isinstance(numel_val, (int, sympy.Integer)):
-                    num_blocks = int(sympy.ceiling(sympy.Rational(int(numel_val), bs)))
-                    if factor >= num_blocks:
-                        folding_factor_map[bid] = -1
-
         # Count how many dims participate in the launch grid
         effective_grid_dims = sum(
             1 for bid in block_ids if folding_factor_map.get(bid, 0) != -1

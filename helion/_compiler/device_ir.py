@@ -671,9 +671,10 @@ class DeviceIR:
         handles the loop generation.
 
         Degenerate partial folding (factor >= num_blocks) is normalized to
-        -1 by ConfigSpec.normalize() before reaching here. The codegen_grid()
-        normalization in tile_strategy.py serves as a runtime fallback for
-        dynamic shapes where normalize() can't evaluate the check.
+        -1 by ConfigSpec.normalize() before reaching here. At codegen time,
+        degenerate partial folding that wasn't caught by normalize() is
+        handled as regular partial folding (grid dim=1, lane loop iterates
+        with bounds-checking guards).
         """
         from .grid_folding import GridFoldingTransformer
 

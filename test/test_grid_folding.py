@@ -30,6 +30,17 @@ def add_3d_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     return result
 
 
+@helion.kernel(autotune_effort="none")
+def add_2d_tile_begin_kernel(
+    x: torch.Tensor, y: torch.Tensor, bias: torch.Tensor
+) -> torch.Tensor:
+    result = x.new_empty(x.size())
+    for tile_m, tile_n in hl.tile([x.size(0), x.size(1)]):
+        b = bias[tile_m.begin]
+        result[tile_m, tile_n] = x[tile_m, tile_n] + y[tile_m, tile_n] + b
+    return result
+
+
 @onlyBackends(["triton"])
 class TestGridFolding(TestCase):
     def test_2d_full_folding(self):
@@ -211,6 +222,25 @@ class TestGridFolding(TestCase):
             (x, y),
             block_sizes=[4, 16, 8],
             grid_foldings=[[0, 0, 64]],
+        )
+        torch.testing.assert_close(result, x + y)
+
+    def test_degenerate_partial_folding_tile_begin(self):
+        """Degenerate partial folding (factor >= num_blocks) with tile.begin.
+
+        Regression: codegen_grid() normalized factor>=num_blocks to -1
+        without a ForLoopGraphInfo, causing IndexError in offset_var()
+        when tile.begin was accessed in the loop body.
+        """
+        # dim 0: size=4, block_size=4 → num_blocks=1, factor=8 >= 1 → degenerate
+        x = torch.randn(4, 64, device=DEVICE)
+        y = torch.randn(4, 64, device=DEVICE)
+        bias = torch.zeros(4, device=DEVICE)
+        code, result = code_and_output(
+            add_2d_tile_begin_kernel,
+            (x, y, bias),
+            block_sizes=[4, 32],
+            grid_foldings=[[8, 0]],
         )
         torch.testing.assert_close(result, x + y)
 
