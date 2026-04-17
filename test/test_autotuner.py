@@ -512,6 +512,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
     @patch.object(_compat, "_supports_maxnreg", lambda: True)
     @patch.object(loops, "_supports_warp_specialize", lambda: True)
     @skipIfRocm("config space differs on ROCm")
+    @skipIfXPU("maxnreg uses CUDA-specific register query")
     def test_config_fragment0(self):
         args = (
             torch.randn([512, 512], device=DEVICE),
@@ -531,6 +532,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
     @patch("torch.version.hip", None)
     @patch("torch.version.xpu", None)
     @skipIfRocm("config space differs on ROCm")
+    @skipIfXPU("maxnreg uses CUDA-specific register query")
     def test_config_fragment1(self):
         args = (
             torch.randn([8, 512, 512], device=DEVICE),
@@ -551,6 +553,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
     @patch("torch.version.xpu", None)
     @skipIfTileIR("tileir backend will ignore `warp specialization` hint")
     @skipIfRocm("config space differs on ROCm")
+    @skipIfXPU("maxnreg uses CUDA-specific register query")
     def test_config_warp_specialize_unroll(self):
         args = (
             torch.randn([8, 512, 512], device=DEVICE),
@@ -2090,6 +2093,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         expected = torch.full([128], 3.0, device=DEVICE) + epsilon
         torch.testing.assert_close(out, expected)
 
+    @skipIfXPU("CUDA specific API used to check memory usage")
     def test_chunked_allclose_memory(self):
         """Test that autotuning accuracy checks use chunked comparison for large tensors."""
         import helion.autotuner.benchmark_provider as _bs

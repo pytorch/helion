@@ -11,6 +11,7 @@ from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
 from helion._testing import skipIfRefEager
+from helion._testing import skipIfXPU
 from helion.autotuner.config_fragment import EnumFragment
 import helion.language as hl
 
@@ -177,6 +178,7 @@ class TestEpilogueSubtiling(TestCase):
         torch.testing.assert_close(out_none, out_s2, atol=1e-5, rtol=1e-5)
         torch.testing.assert_close(out_none, out_s4, atol=1e-5, rtol=1e-5)
 
+    @skipIfXPU("epilogue_subtile_autotune check uses CUDA device properties")
     def test_autotune_field_enabled_for_large_k(self):
         args = (
             torch.randn([128, 1024], device=DEVICE, dtype=torch.float32),
@@ -201,6 +203,7 @@ class TestEpilogueSubtiling(TestCase):
         fields = matmul_with_bias.bind(args).config_spec._flat_fields()
         self.assertNotIn("epilogue_subtile", fields)
 
+    @skipIfXPU("uses torch.cuda.get_device_capability() - Blackwell is CUDA-specific")
     def test_autotune_field_large_k_allows_s4_on_blackwell(self):
         args = (
             torch.randn([128, 16384], device=DEVICE, dtype=torch.float32),

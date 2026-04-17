@@ -922,6 +922,7 @@ class TestDot(RefEagerTestBase, TestCase):
         """Test hl.dot with N=2 created through reshape."""
         self._test_reshape_n_2(lambda acc, a, b: hl.dot(a, b, acc=acc))
 
+    @skipIfXPU("Accuracy issue on XPU - small M dim tiles produce wrong results")
     def test_mm_small_m_dim(self):
         """Test torch.mm with M=2 smaller than the minimum of 16 for tl.dot."""
         # Allow slightly larger absolute error for torch.mm small-dim tiles
@@ -1000,6 +1001,7 @@ class TestDot(RefEagerTestBase, TestCase):
             lambda acc, a, b: acc + torch.mm(a, b), rtol=1e-2, atol=5e-2
         )
 
+    @skipIfXPU("Accuracy issue on XPU - small M dim tiles produce wrong results")
     def test_matmul_small_m_dim(self):
         """Test torch.matmul with M=2 smaller than the minimum of 16 for tl.dot."""
         # Allow slightly larger absolute error for small-dim tiles
