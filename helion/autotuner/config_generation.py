@@ -238,13 +238,17 @@ class ConfigGeneration:
             return config
 
     def random_config(self) -> Config:
+        errors: dict[str, int] = {}
         for _ in range(64):
             try:
                 return self.unflatten(self.random_flat())
-            except InvalidConfig:
+            except InvalidConfig as e:
+                msg = str(e)
+                errors[msg] = errors.get(msg, 0) + 1
                 continue
+        summary = "; ".join(f"{msg} (x{n})" for msg, n in errors.items())
         raise InvalidConfig(
-            "failed to generate a valid random config after 64 attempts"
+            f"failed to generate a valid random config after 64 attempts: {summary}"
         )
 
     def random_population_flat(self, n: int) -> list[FlatConfig]:

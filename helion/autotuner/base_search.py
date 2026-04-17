@@ -819,7 +819,7 @@ class PopulationBasedSearch(BaseSearch):
 
         Returns:
             A population member with undefined performance, or None if the
-            configuration is invalid (e.g. all dimensions fissioned).
+            configuration is invalid.
         """
         try:
             config = self.config_gen.unflatten(flat_values)
