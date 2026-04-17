@@ -927,6 +927,9 @@ class PallasBackend(Backend):
     def name(self) -> str:
         return "pallas"
 
+    def max_reduction_threads(self) -> int | None:
+        return None
+
     def dtype_str(self, dtype: torch.dtype) -> str:
         key = str(dtype)
         if key not in _TORCH_TO_JAX_DTYPE:
