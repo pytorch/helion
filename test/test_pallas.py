@@ -966,6 +966,49 @@ class TestPallas(TestCase):
         self.assertGreaterEqual(code.count("jax.lax.fori_loop"), 2)
         torch.testing.assert_close(result, args[0] + args[1])
 
+    def test_fori_loop_no_dma_unaligned_inner_block(self) -> None:
+        """fori_loop with inner block violating DMA alignment (last dim % 128 != 0).
+
+        Exercises the non-DMA fallback: instead of pltpu.make_async_copy,
+        codegen should emit pl.ds() slicing into the outer BlockSpec refs.
+        """
+        args = (
+            torch.randn(64, 64, device=DEVICE, dtype=torch.float32),
+            torch.randn(64, 64, device=DEVICE, dtype=torch.float32),
+        )
+        code, result = code_and_output(
+            pallas_inner_loop_add,
+            args,
+            block_sizes=[8, 64],
+            pallas_loop_type="fori_loop",
+        )
+        self.assertIn("jax.lax.fori_loop", code)
+        self.assertNotIn("pltpu.make_async_copy", code)
+        self.assertIn("pl.ds(", code)
+        torch.testing.assert_close(result, args[0] + args[1])
+
+    def test_fori_loop_no_dma_multidim_unaligned(self) -> None:
+        """Nested fori_loop with a DMA-unaligned inner block.
+
+        2D inner loop where both inner dims are too small for DMA
+        (last dim = 64 < 128).  Validates that the non-DMA pl.ds()
+        path works with nested fori_loops, one per inner dim.
+        """
+        args = (
+            torch.randn(4, 32, 64, device=DEVICE, dtype=torch.float32),
+            torch.randn(4, 32, 64, device=DEVICE, dtype=torch.float32),
+        )
+        code, result = code_and_output(
+            pallas_add_3d,
+            args,
+            block_sizes=[1, 8, 64],
+            pallas_loop_type="fori_loop",
+        )
+        self.assertGreaterEqual(code.count("jax.lax.fori_loop"), 2)
+        self.assertNotIn("pltpu.make_async_copy", code)
+        self.assertIn("pl.ds(", code)
+        torch.testing.assert_close(result, args[0] + args[1])
+
     def test_squeeze_slice_access(self) -> None:
         """Test for the [None, :] indexing pattern (subscript index for slice >= tensor_ndim)"""
 
