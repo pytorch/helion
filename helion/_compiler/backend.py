@@ -979,7 +979,6 @@ class PallasBackend(Backend):
             "block_sizes",
             "loop_orders",
             "flatten_loops",
-            "reduction_loops",
             "pallas_loop_type",
         }
     )
