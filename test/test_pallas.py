@@ -556,9 +556,6 @@ class TestPallas(TestCase):
         expected = torch.bmm(a.float(), b.float()).to(torch.bfloat16)
         torch.testing.assert_close(result, expected, rtol=1e-2, atol=1e-2)
 
-    @xfailIfPallas(
-        "reduction tile K=256 doesn't evenly divide K=384, last tile reads OOB"
-    )
     def test_bmm_fori_loop_non_divisible_k(self) -> None:
         """Test fori_loop bmm where BLOCK_K=256 doesn't evenly divide K=384."""
         a = torch.randn(4, 128, 384, device=DEVICE, dtype=torch.bfloat16)
@@ -572,9 +569,6 @@ class TestPallas(TestCase):
         expected = torch.bmm(a.float(), b.float()).to(torch.bfloat16)
         torch.testing.assert_close(result, expected, rtol=1e-2, atol=1e-2)
 
-    @xfailIfPallas(
-        "reduction tile K=256 doesn't evenly divide K=384, last tile reads OOB"
-    )
     def test_bmm_emit_pipeline_non_divisible_k(self) -> None:
         """Test emit_pipeline bmm where BLOCK_K=256 doesn't evenly divide K=384."""
         a = torch.randn(4, 128, 384, device=DEVICE, dtype=torch.bfloat16)

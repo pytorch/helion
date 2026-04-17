@@ -303,7 +303,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             block_sizes=[16, 16, 16, 16],
         )
 
-    @xfailIfPallas("reduction tile K=256 doesn't evenly divide K=384")
+    @xfailIfPallas("default loop OOB slice for non-divisible reduction")
     @xfailIfCute("CuTE IR build error with non-divisible K block sizes")
     def test_bmm_non_divisible_k(self):
         args = (
