@@ -1126,9 +1126,6 @@ class ReductionLoopSpec(_PowerOfTwoBlockIdItem):
     def _flat_config(
         self, base: ConfigSpec, fn: Callable[[ConfigSpecFragment], object]
     ) -> int | None:
-        if base.backend_name == "pallas":
-            return None
-
         low = 8  # TODO(jansel): is smaller needed?
         high = next_power_of_2(max(low, self.size_hint))
         default = min(high, 4096)
