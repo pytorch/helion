@@ -370,7 +370,7 @@ class LFBOPatternSearch(PatternSearch):
                 visited.add(member.config)
                 self.population.append(member)
         self.set_generation(0)
-        self.parallel_benchmark_population(self.population, desc="Initial population")
+        self.benchmark_population(self.population, desc="Initial population")
 
         # Compute adaptive compile timeout based on initial population compile times
         self.set_adaptive_compile_timeout(
@@ -438,7 +438,7 @@ class LFBOPatternSearch(PatternSearch):
             unbenchmarked = [m for m in self.population if len(m.perfs) == 0]
             if unbenchmarked:
                 self.set_generation(generation)
-                self.parallel_benchmark_population(
+                self.benchmark_population(
                     unbenchmarked, desc=f"Generation {generation}:"
                 )
             # higher-accuracy rebenchmark

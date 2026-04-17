@@ -215,7 +215,7 @@ class DESurrogateHybrid(DifferentialEvolutionSearch):
             selected_candidates = self._generate_de_candidates(self.population_size)
 
         # Evaluate selected candidates
-        new_members = self.parallel_benchmark_flat(selected_candidates)
+        new_members = self.benchmark_flat_batch(selected_candidates)
 
         # Track observations
         for member in new_members:

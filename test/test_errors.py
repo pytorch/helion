@@ -92,7 +92,7 @@ class TestErrors(RefEagerTestDisabled, TestCase):
 
         with (
             mock.patch.object(
-                PopulationBasedSearch, "parallel_benchmark_flat", fake_parallel
+                PopulationBasedSearch, "benchmark_flat_batch", fake_parallel
             ),
             self.assertRaises(helion.exc.NoConfigFound),
         ):
