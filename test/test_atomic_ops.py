@@ -265,6 +265,7 @@ class TestAtomicOperations(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, expected)
 
     @xfailIfCute("cute: hl.arange atomic scatter requires an active non-reduction axis")
+    @xfailIfPallas("Integer indexing not supported on Pallas")
     def test_atomic_add_1d_tensor(self):
         M, N = 32, 64
         x = torch.randn(M, N, device=DEVICE, dtype=torch.float32)

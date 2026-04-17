@@ -21,7 +21,6 @@ if TYPE_CHECKING:
     from torch._inductor.ops_handler import OpsHandler
 
     from ..autotuner.config_fragment import ConfigSpecFragment
-    from ..runtime import _BlockSpecInfo
     from ..runtime.config import Config
     from ..runtime.kernel import BoundKernel
     from .device_function import Argument
@@ -448,6 +447,17 @@ class Backend(abc.ABC):
         """
         return None
 
+    @staticmethod
+    def reserved_launch_param_names() -> frozenset[str]:
+        """Names reserved by this backend's kernel launch mechanism.
+
+        These names cannot be used as kernel variables because they
+        collide with parameters of the backend's kernel launch API
+        (e.g., Triton's ``run()`` method uses ``grid``, ``num_warps``,
+        ``num_stages``, etc.).
+        """
+        return frozenset()
+
     def transform_host_arg(
         self,
         arg: Argument,
@@ -846,6 +856,10 @@ class TritonBackend(Backend):
         out.extend(self.launcher_keyword_args(config, has_barrier=has_barrier))
         return out
 
+    @staticmethod
+    def reserved_launch_param_names() -> frozenset[str]:
+        return frozenset({"grid", "warmup", "num_warps", "num_stages"})
+
 
 class TileIRBackend(TritonBackend):
     """TileIR code generation backend (extends Triton)."""
@@ -875,6 +889,12 @@ class TileIRBackend(TritonBackend):
             "num_ctas": PowerOfTwoFragment(1, 2, 1),
             "occupancy": PowerOfTwoFragment(1, 8, 1),
         }
+
+    @staticmethod
+    def reserved_launch_param_names() -> frozenset[str]:
+        return frozenset(
+            {"grid", "warmup", "num_warps", "num_stages", "num_ctas", "occupancy"}
+        )
 
 
 # Mapping from torch dtype to JAX dtype string (e.g., "jnp.float32")
@@ -1311,8 +1331,8 @@ class PallasBackend(Backend):
     ):
         """Compute per-tensor ``(block_shape, grid_dims)`` from codegen tiling info.
 
-        Uses ``DeviceFunction.pallas_tensor_dim_block_ids`` (recorded during
-        load/store codegen from SymInt subscripts) for an unambiguous
+        Uses ``DeviceFunction.pallas_tensor_dim_tilings`` (recorded during
+        ``plan_tiling`` from SymInt subscripts) for an unambiguous
         dim → block_id mapping.
         """
         if sorted_args is None:
@@ -1383,26 +1403,26 @@ class PallasBackend(Backend):
             if not isinstance(arg, TensorArg) or arg.fake_value.ndim == 0:
                 continue
             tensor = arg.fake_value
-            dim_block_ids = device_fn.pallas_tensor_dim_block_ids.get(id(tensor), {})
+            dim_tilings = device_fn.pallas_tensor_dim_tilings.get(id(tensor))
+            if dim_tilings is None:
+                # this means this tensor isn't accessed at all in the kernel
+                result.append(None)
+                return None
             block_shape: list[int | None] = []
             grid_dims: list[int | tuple[int, int, int] | None] = []
             for d in range(tensor.ndim):
-                bid = dim_block_ids.get(d)
+                dim_tiling = dim_tilings[d]
+                if not dim_tiling.can_tile or len(dim_tiling.block_ids) == 0:
+                    block_shape.append(None)
+                    grid_dims.append(None)
+                    continue
+                assert len(dim_tiling.block_ids) == 1
+                bid = dim_tiling.block_ids[0]
                 if bid is not None and bid in known_block_ids:
                     bs = env.block_sizes[bid].from_config(config)
                     if isinstance(bs, int):
-                        # Check that the block size meets Pallas requirements:
-                        # https://docs.jax.dev/en/latest/pallas/grid_blockspec.html
-                        # If not, fall-back to no tiling for the entire kernel
-                        dim_size = tensor.shape[d]
-                        dim_from_end = tensor.ndim - 1 - d
-                        bitwidth = tensor.dtype.itemsize * 8
-                        required_alignment = self._get_pallas_required_alignment(
-                            dim_from_end, tensor.ndim, bitwidth
-                        )
-                        if bs != dim_size and bs % required_alignment != 0:
-                            return self._no_tiling_block_spec_info(sorted_args)
                         block_shape.append(bs)
+                        dim_size = tensor.shape[d]
                         # When the block covers the entire tensor
                         # dimension there is only one tile, so the grid
                         # index must be constant 0 — iterating would
@@ -1418,27 +1438,6 @@ class PallasBackend(Backend):
                 block_shape.append(None)
                 grid_dims.append(None)
             result.append((tuple(block_shape), tuple(grid_dims)))
-        return result
-
-    def _no_tiling_block_spec_info(
-        self,
-        sorted_args: list[Argument],
-    ) -> _BlockSpecInfo:
-        result: _BlockSpecInfo = []
-
-        from .device_function import SymbolArgument
-        from .device_function import TensorArg
-        from .device_function import TensorSizeArg
-        from .device_function import TensorStrideArg
-
-        for arg in sorted_args:
-            if isinstance(arg, (SymbolArgument, TensorSizeArg, TensorStrideArg)):
-                result.append(None)  # scalars wrapped as 1-D tensors
-                continue
-            if not isinstance(arg, TensorArg) or arg.fake_value.ndim == 0:
-                continue
-            tensor = arg.fake_value
-            result.append((((None,) * tensor.ndim), ((None,) * tensor.ndim)))
         return result
 
     def build_launcher_args(
@@ -1599,6 +1598,16 @@ class PallasBackend(Backend):
             return self.build_launcher_name(config)
         except Exception:
             return self.default_launcher_name
+
+    def pre_codegen(
+        self,
+        graphs: list[GraphInfo],
+        config: Config,
+        tile_strategy: TileStrategyDispatch,
+    ) -> None:
+        from .pallas.plan_tiling import plan_tiling
+
+        plan_tiling(graphs, config, tile_strategy)
 
 
 def _detect_mma_loop(

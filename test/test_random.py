@@ -314,7 +314,6 @@ class TestRandom(RefEagerTestBase, TestCase):
         self.assertTrue(torch.all(output >= 0.0), "All values should be >= 0")
         self.assertTrue(torch.all(output < 1.0), "All values should be < 1")
 
-    @xfailIfPallas("3D hl.rand lowering hits TPU Mosaic unsupported shape cast")
     @skipIfRefEager("compile_config is not supported in ref eager mode")
     def test_hl_rand_3d(self):
         @helion.kernel(static_shapes=False, autotune_effort="none")
@@ -435,9 +434,6 @@ class TestRandom(RefEagerTestBase, TestCase):
             0.7 < q3_val < 0.8, f"Third quartile {q3_val:.3f} should be around 0.75"
         )
 
-    @xfailIfPallas(
-        "specialized non-tiled hl.rand hits TPU Mosaic unsupported shape cast"
-    )
     def test_hl_rand_non_tiled_dimensions(self):
         @helion.kernel(static_shapes=False)
         def rand_kernel_partial_tile(x: torch.Tensor, seed: int) -> torch.Tensor:
@@ -464,7 +460,6 @@ class TestRandom(RefEagerTestBase, TestCase):
         torch.testing.assert_close(output, output2, msg="it should deterministic")
 
     @skipIfMTIA("Skip on MTIA due to unaligned address crash")
-    @xfailIfPallas("reordered tile dims cause BlockSpec axis mismatch")
     def test_hl_rand_mixed_argument_order(self):
         @helion.kernel(static_shapes=False)
         def rand_kernel_normal_order(x: torch.Tensor, seed: int) -> torch.Tensor:
