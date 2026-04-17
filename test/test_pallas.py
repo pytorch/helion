@@ -120,6 +120,33 @@ def pallas_sum_reduction(x: torch.Tensor) -> torch.Tensor:
 
 
 @helion.kernel(backend="pallas", static_shapes=True)
+def pallas_sum_reduce_dim0(x: torch.Tensor) -> torch.Tensor:
+    _n, m = x.size()
+    out = torch.empty([m], dtype=x.dtype, device=x.device)
+    for tile_m in hl.tile(m):
+        out[tile_m] = x[:, tile_m].sum(0)
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
+def pallas_sum_reduce_middle(x: torch.Tensor) -> torch.Tensor:
+    b, _n, m = x.size()
+    out = torch.empty([b, m], dtype=x.dtype, device=x.device)
+    for tile_b, tile_m in hl.tile([b, m]):
+        out[tile_b, tile_m] = x[tile_b, :, tile_m].sum(1)
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
+def pallas_sum_reduce_multiple(x: torch.Tensor) -> torch.Tensor:
+    b, _n, _m = x.size()
+    out = torch.empty([b], dtype=x.dtype, device=x.device)
+    for tile_b in hl.tile(b):
+        out[tile_b] = x[tile_b, :, :].sum([0, 1])
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
 def pallas_max_reduction(x: torch.Tensor) -> torch.Tensor:
     n, _m = x.size()
     out = torch.empty([n], dtype=x.dtype, device=x.device)
@@ -403,6 +430,23 @@ class TestPallas(TestCase):
         code, result = code_and_output(pallas_sum_reduction, (x,), block_size=1)
         self.assertIn("jnp.sum", code)
         torch.testing.assert_close(result, x.sum(-1), rtol=1e-3, atol=1e-3)
+
+    def test_sum_reduce_dim0(self) -> None:
+        x = torch.randn(64, 32, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(pallas_sum_reduce_dim0, (x,), block_size=16)
+        self.assertIn("jnp.sum", code)
+        torch.testing.assert_close(result, x.sum(0), rtol=1e-4, atol=1e-4)
+
+    def test_sum_reduce_middle(self) -> None:
+        x = torch.randn(4, 64, 32, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(pallas_sum_reduce_middle, (x,), block_sizes=[2, 16])
+        self.assertIn("jnp.sum", code)
+        torch.testing.assert_close(result, x.sum(1), rtol=1e-4, atol=1e-4)
+
+    def test_sum_reduce_multiple(self) -> None:
+        x = torch.randn(4, 32, 64, device=DEVICE, dtype=torch.float32)
+        with self.assertRaises(NotImplementedError):
+            code_and_output(pallas_sum_reduce_multiple, (x,), block_size=2)
 
     def test_max_reduction(self) -> None:
         x = torch.randn(32, 64, device=DEVICE, dtype=torch.float32)
