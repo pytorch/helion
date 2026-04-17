@@ -457,7 +457,9 @@ class TestPallas(TestCase):
 
     def test_sum_reduce_middle(self) -> None:
         x = torch.randn(4, 64, 32, device=DEVICE, dtype=torch.float32)
-        code, result = code_and_output(pallas_sum_reduce_middle, (x,), block_sizes=[2, 16])
+        code, result = code_and_output(
+            pallas_sum_reduce_middle, (x,), block_sizes=[2, 16]
+        )
         self.assertIn("jnp.sum", code)
         torch.testing.assert_close(result, x.sum(1), rtol=1e-4, atol=1e-4)
 
