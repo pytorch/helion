@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import copy
 import functools
 import itertools
@@ -9,6 +10,7 @@ from typing import TYPE_CHECKING
 from typing import cast
 
 from .._compat import warps_to_threads
+from ..exc import InvalidConfig
 from .config_fragment import Category
 from .config_fragment import ConfigSpecFragment
 from .config_fragment import PowerOfTwoFragment
@@ -236,13 +238,32 @@ class ConfigGeneration:
             return config
 
     def random_config(self) -> Config:
-        return self.unflatten(self.random_flat())
+        for _ in range(64):
+            try:
+                return self.unflatten(self.random_flat())
+            except InvalidConfig:
+                continue
+        raise InvalidConfig(
+            "failed to generate a valid random config after 64 attempts"
+        )
 
     def random_population_flat(self, n: int) -> list[FlatConfig]:
         return [self.default_flat(), *[self.random_flat() for _ in range(n - 1)]]
 
     def random_population(self, n: int) -> list[Config]:
-        return [*map(self.unflatten, self.random_population_flat(n))]
+        result: list[Config] = []
+        attempts = 0
+        for flat in self.random_population_flat(n):
+            try:
+                result.append(self.unflatten(flat))
+            except InvalidConfig:
+                attempts += 1
+        # Retry to fill the population to the requested size
+        while len(result) < n and attempts < 64:
+            with contextlib.suppress(InvalidConfig):
+                result.append(self.unflatten(self.random_flat()))
+            attempts += 1
+        return result
 
     def differential_mutation(
         self,

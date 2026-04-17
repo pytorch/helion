@@ -806,10 +806,10 @@ class PopulationBasedSearch(BaseSearch):
         Returns:
             A list of population members with the benchmark results.
         """
-        result = [*map(self.make_unbenchmarked, to_check)]
+        result = [m for m in map(self.make_unbenchmarked, to_check) if m is not None]
         return self.parallel_benchmark_population(result)
 
-    def make_unbenchmarked(self, flat_values: FlatConfig) -> PopulationMember:
+    def make_unbenchmarked(self, flat_values: FlatConfig) -> PopulationMember | None:
         """
         Create a population member with unbenchmarked configuration.  You
         should pass the result of this to parallel_benchmark_population.
@@ -818,9 +818,13 @@ class PopulationBasedSearch(BaseSearch):
             flat_values: The flat configuration values.
 
         Returns:
-            A population member with undefined performance.
+            A population member with undefined performance, or None if the
+            configuration is invalid (e.g. all dimensions fissioned).
         """
-        config = self.config_gen.unflatten(flat_values)
+        try:
+            config = self.config_gen.unflatten(flat_values)
+        except exc.InvalidConfig:
+            return None
         return PopulationMember(_unset_fn, [], flat_values, config)
 
     def _get_current_hardware_and_specialization(
@@ -939,7 +943,13 @@ class PopulationBasedSearch(BaseSearch):
                 self.log.debug(
                     f"Cached config {i + 1} (transferred): {transferred_config}"
                 )
-            except (ValueError, TypeError, KeyError, AssertionError) as e:
+            except (
+                ValueError,
+                TypeError,
+                KeyError,
+                AssertionError,
+                exc.InvalidConfig,
+            ) as e:
                 self.log(f"Failed to transfer cached config {i + 1}: {e}")
                 continue
 
@@ -1113,8 +1123,8 @@ class PopulationBasedSearch(BaseSearch):
                     new_flat = [*current.flat_values]
                     new_flat[i] = default_flat[i]
                     candidate = self.make_unbenchmarked(new_flat)
-                    # Only add if this produces a different config
-                    if candidate.config != current.config:
+                    # Only add if valid and produces a different config
+                    if candidate is not None and candidate.config != current.config:
                         candidates.append(candidate)
 
             if len(candidates) <= 1:
@@ -1158,7 +1168,7 @@ class PopulationBasedSearch(BaseSearch):
                         if c.flat_values[i] != current.flat_values[i]:
                             combined_flat[i] = c.flat_values[i]
                 combined = self.make_unbenchmarked(combined_flat)
-                if combined.config != current.config:
+                if combined is not None and combined.config != current.config:
                     self.parallel_benchmark_population(
                         [combined],
                         desc=f"Finishing round {round_num}: combined",
