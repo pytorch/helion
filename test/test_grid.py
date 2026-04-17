@@ -364,5 +364,50 @@ class TestGrid(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, expected)
 
 
+    def test_computed_symint_in_grid(self):
+        """Regression test for #778: SourceOrigin NotImplementedError when using
+        computed SymInts (from arithmetic on device properties) in hl.grid."""
+
+        @helion.kernel(config=helion.Config(block_sizes=[1, 8192]))
+        def fn(
+            x: torch.Tensor, weight: torch.Tensor
+        ) -> torch.Tensor:
+            m, n = x.size()
+            n = hl.specialize(n)
+            out = torch.empty_like(x)
+            m_block = hl.register_block_size(m)
+            n_block = hl.register_block_size(n)
+            m_count = (m + m_block - 1) // m_block
+            n_count = (n + n_block - 1) // n_block
+
+            num_workers = torch.cuda.get_device_properties(x.device).multi_processor_count  # type: ignore[arg-type]
+            num_workers = num_workers + num_workers + num_workers + num_workers
+            total_work = m_count * n_count
+            work_per_worker = (total_work + num_workers - 1) // num_workers
+
+            for worker_id in hl.grid(num_workers):
+                for work_item in hl.grid(work_per_worker):
+                    work_n = (worker_id + num_workers * work_item) % n_count
+                    work_m = (worker_id + num_workers * work_item) // n_count
+                    work_n_start = work_n * n_block
+                    work_n_end = min(work_n_start + n_block, n)
+                    work_m_start = work_m * m_block
+                    work_m_end = min(work_m_start + m_block, m)
+                    for tile_n, tile_m in hl.tile(
+                        [work_n_start, work_m_start],
+                        [work_n_end, work_m_end],
+                        block_size=[n_block, m_block],
+                    ):
+                        x_tile = x[tile_m, tile_n].to(torch.float32)
+                        out[tile_m, tile_n] = x_tile.to(out.dtype)
+
+            return out
+
+        x = torch.randn(64, 1024, device=DEVICE)
+        w = torch.randn(1024, device=DEVICE)
+        code, result = code_and_output(fn, (x, w))
+        torch.testing.assert_close(result, x)
+
+
 if __name__ == "__main__":
     unittest.main()

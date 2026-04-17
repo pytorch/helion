@@ -243,6 +243,27 @@ class ClosureOrigin(WrappedOrigin):
 class SourceOrigin(HostOrigin):
     location: SourceLocation
 
+    def suggest_var_name(self) -> str:
+        import re
+
+        if self.location.line:
+            # Extract a useful identifier from the source line
+            line = self.location.line.strip()
+            # Try to find the left-hand side of an assignment
+            match = re.match(r"(\w+)\s*=", line)
+            if match:
+                return match.group(1)
+            # Fallback: sanitize the source text into a valid identifier
+            name = re.sub(r"[^a-zA-Z0-9_]", "_", line)[:30].strip("_")
+            if name and not name[0].isdigit():
+                return name
+        return "src_expr"
+
+    def host_str(self) -> str:
+        if self.location.line:
+            return self.location.line.strip()
+        return "src_expr"
+
 
 @dataclasses.dataclass
 class DeviceOrigin(Origin):

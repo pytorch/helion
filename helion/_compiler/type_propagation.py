@@ -1030,7 +1030,7 @@ class NumericType(TypeInfo):
     def populate_symbol_origins(self, origin: Origin) -> None:
         expr_to_origin = HostFunction.current().expr_to_origin
         expr = CompileEnvironment.current().shape_env.simplify(self.value._sympy_())
-        if expr not in expr_to_origin or origin.depth() < expr_to_origin[expr].depth():
+        if expr not in expr_to_origin or origin.depth() <= expr_to_origin[expr].depth():
             expr_to_origin[expr] = SymbolOrigin(origin)
 
 
