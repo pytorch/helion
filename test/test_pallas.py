@@ -1032,6 +1032,72 @@ class TestPallas(TestCase):
         expected = (x[:, None] < y[None, :]).to(torch.float32)
         torch.testing.assert_close(result, expected)
 
+    @staticmethod
+    def _indirect_gather_kernel():
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def gather(indices: torch.Tensor, table: torch.Tensor) -> torch.Tensor:
+            out = torch.empty(
+                [indices.size(0), table.size(1)],
+                dtype=table.dtype,
+                device=table.device,
+            )
+            for tile_b, tile_e in hl.tile([indices.size(0), table.size(1)]):
+                out[tile_b, tile_e] = table[indices[tile_b], tile_e]
+            return out
+
+        return gather
+
+    def test_indirect_gather_fits_vmem(self) -> None:
+        """Indirect gather emits one_hot matmul."""
+        gather = self._indirect_gather_kernel()
+        table = torch.randn(16, 64, device=DEVICE, dtype=torch.float32)
+        indices = torch.randint(0, 16, (256,), device=DEVICE, dtype=torch.int32)
+        code, result = code_and_output(gather, (indices, table), block_sizes=[128, 64])
+        self.assertIn("one_hot", code)
+        self.assertIn("HIGHEST", code)
+        expected = table.cpu()[indices.long().cpu()]
+        torch.testing.assert_close(result.cpu(), expected)
+
+    def test_indirect_gather_bf16(self) -> None:
+        """Indirect gather with bf16 table skips HIGHEST precision."""
+        gather = self._indirect_gather_kernel()
+        table = torch.randn(16, 64, device=DEVICE, dtype=torch.bfloat16)
+        indices = torch.randint(0, 16, (256,), device=DEVICE, dtype=torch.int32)
+        code, result = code_and_output(gather, (indices, table), block_sizes=[128, 64])
+        self.assertIn("one_hot", code)
+        self.assertIn("astype(jnp.bfloat16)", code)
+        self.assertNotIn("HIGHEST", code)
+        expected = table.cpu()[indices.long().cpu()]
+        torch.testing.assert_close(result.cpu(), expected)
+
+    def test_indirect_gather_too_large_raises(self) -> None:
+        """Indirect gather table over the VMEM threshold raises NotImplementedError."""
+        gather = self._indirect_gather_kernel()
+        # 65537 * 64 * 4 bytes = 16 MiB + 256 bytes, just above the threshold.
+        table = torch.randn(65537, 64, device=DEVICE, dtype=torch.float32)
+        indices = torch.randint(0, 65537, (256,), device=DEVICE, dtype=torch.int32)
+        with self.assertRaisesRegex(
+            Exception, "indirect gather requires the full table"
+        ):
+            code_and_output(gather, (indices, table), block_sizes=[128, 64])
+
+    def test_indirect_store_scatter_raises(self) -> None:
+        """Scatter (indirect store) is rejected with a clear error."""
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def scatter(
+            out: torch.Tensor, values: torch.Tensor, indices: torch.Tensor
+        ) -> torch.Tensor:
+            for tile_b, tile_e in hl.tile([values.size(0), values.size(1)]):
+                out[indices[tile_b], tile_e] = values[tile_b, tile_e]
+            return out
+
+        out = torch.zeros(16, 64, device=DEVICE, dtype=torch.float32)
+        values = torch.randn(8, 64, device=DEVICE, dtype=torch.float32)
+        indices = torch.arange(8, device=DEVICE, dtype=torch.int32)
+        with self.assertRaisesRegex(Exception, "indirect store"):
+            code_and_output(scatter, (out, values, indices), block_sizes=[8, 64])
+
 
 if __name__ == "__main__":
     unittest.main()
