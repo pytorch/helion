@@ -1133,10 +1133,14 @@ class TileIndexType(TypeInfo):
         numel: int | torch.SymInt | AutoSize | None,
         origin: Origin,
         block_size: int | torch.SymInt | None = None,
+        loop_begin: int | torch.SymInt | torch.Tensor | None = None,
+        loop_end: int | torch.SymInt | torch.Tensor | None = None,
     ) -> TileIndexType:
         env = CompileEnvironment.current()
         if block_size is None:
-            block_id = env.allocate_block_size(numel, source=LoopSpecBlockSizeSource())
+            block_id = env.allocate_block_size(
+                numel, source=LoopSpecBlockSizeSource(loop_begin, loop_end)
+            )
             env.config_spec.block_sizes.append(
                 BlockSizeSpec(
                     block_id=block_id,

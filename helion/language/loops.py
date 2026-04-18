@@ -356,14 +356,26 @@ def _(
         if isinstance(begin_part, torch.SymInt) or isinstance(end_part, torch.SymInt):
             has_symbolic_bounds = True
         if bs is None:
-            results.append(TileIndexType.allocate(size, origin))
+            results.append(
+                TileIndexType.allocate(
+                    size, origin, loop_begin=begin_part, loop_end=end_part
+                )
+            )
         elif isinstance(bs, int):
-            results.append(TileIndexType.allocate(size, origin, bs))
+            results.append(
+                TileIndexType.allocate(
+                    size, origin, bs, loop_begin=begin_part, loop_end=end_part
+                )
+            )
         elif isinstance(bs, torch.SymInt):
             env = CompileEnvironment.current()
             index = env.get_block_id(bs)
             if index is None:
-                results.append(TileIndexType.allocate(size, origin, bs))
+                results.append(
+                    TileIndexType.allocate(
+                        size, origin, bs, loop_begin=begin_part, loop_end=end_part
+                    )
+                )
             else:
                 results.append(TileIndexType(origin=origin, block_id=index))
                 env.block_sizes[index].mark_alternate_size(size)

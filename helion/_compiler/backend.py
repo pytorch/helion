@@ -1241,6 +1241,7 @@ class PallasBackend(Backend):
 
         from ..autotuner.config_spec import BlockSizeSpec
         from .compile_environment import BlockSizeInfo
+        from helion._compiler.compile_environment import LoopSpecBlockSizeSource
 
         # Map block_id -> minimum dim_from_end across all tensors
         min_dim_from_end: dict[int, int] = {}
@@ -1272,6 +1273,20 @@ class PallasBackend(Backend):
             if not isinstance(spec, BlockSizeSpec):
                 continue
             bid = spec.block_ids[0]
+            if block_sizes is not None:
+                block_size_info = block_sizes[bid]
+                assert isinstance(block_size_info, BlockSizeInfo)
+                if isinstance(
+                    block_size_info.block_size_source, LoopSpecBlockSizeSource
+                ):
+                    loop_begin = block_size_info.block_size_source.loop_begin
+                    if loop_begin is not None:
+                        if not isinstance(loop_begin, int) or loop_begin != 0:
+                            # this block is from a loop with non-zero begin
+                            # so we won't be able to use this block to tile the tensor dim
+                            # so skip enforcing alignment requirments
+                            continue
+
             dim_from_end = min_dim_from_end.get(bid, ndim - 1 - i)
             tensor_ndim = min_tensor_ndim.get(bid, ndim)
             requirement_alignment = self._get_pallas_required_alignment(

@@ -1171,6 +1171,9 @@ class FixedBlockSizeSource(BlockSizeSource):
 
 @dataclasses.dataclass
 class LoopSpecBlockSizeSource(BlockSizeSource):
+    loop_begin: int | torch.SymInt | torch.Tensor | None = None
+    loop_end: int | torch.SymInt | torch.Tensor | None = None
+
     def from_config(self, config: Config, block_size_info: BlockSizeInfo) -> int:
         env = CompileEnvironment.current()
         size = block_size_info.size
