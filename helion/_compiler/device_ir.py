@@ -640,7 +640,7 @@ class DeviceIR:
                 continue
             if used_graphs & graphs_with_rolled_rdim:
                 continue
-            if env.config_spec.backend_name != "pallas":
+            if env.backend_name != "pallas":
                 env.config_spec.reduction_loops.append(
                     ReductionLoopSpec(
                         block_id=rdim.block_id,
