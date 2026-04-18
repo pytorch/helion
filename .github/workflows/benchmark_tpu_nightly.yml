@@ -13,11 +13,9 @@ on:
         required: false
         type: string
         # Excluded kernels:
-        #   layer_norm: OOB slice when reduction_loops doesn't evenly divide the reduction dim (gh#1937)
-        #   grpo_loss: autotuning finds no working config on CI (all configs fail)
-        #   jagged_hstu_attn: default config fails while computing baseline on CI
-        #   softmax: default config block_sizes=[8] fails on CI TPU (works on dev pod); softmax_two_pass covers this
-        default: "exp,add,softmax_two_pass,welford,attention,bmm,broadcast_matmul,geglu,low_mem_dropout,swiglu,batch_softmax,sum,rms_norm"
+        #   grpo_loss: complex multi-kernel setup, needs special handling
+        #   jagged_hstu_attn: complex jagged attention with special data setup
+        default: "exp,add,softmax_two_pass,welford,attention,bmm,broadcast_matmul,geglu,low_mem_dropout,swiglu,batch_softmax,sum,rms_norm,layer_norm,softmax"
 
 permissions:
   contents: read
@@ -28,4 +26,4 @@ jobs:
     permissions:
       contents: read
     with:
-      kernels: ${{ github.event.inputs.kernels || 'exp,add,softmax_two_pass,welford,attention,bmm,broadcast_matmul,geglu,low_mem_dropout,swiglu,batch_softmax,sum,rms_norm' }}
+      kernels: ${{ github.event.inputs.kernels || 'exp,add,softmax_two_pass,welford,attention,bmm,broadcast_matmul,geglu,low_mem_dropout,swiglu,batch_softmax,sum,rms_norm,layer_norm,softmax' }}

@@ -236,6 +236,34 @@ def _rms_norm_baseline(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     return (weight * (hidden * torch.rsqrt(variance + 1e-5))).to(x.dtype)
 
 
+def _layer_norm_shapes() -> list[tuple[str, tuple[Any, ...]]]:
+    configs = [(2048, 4096), (2048, 8192), (4096, 4096)]
+    return [
+        (
+            f"[{m},{n}]",
+            (
+                torch.randn(m, n, device=DEVICE, dtype=torch.bfloat16),
+                [n],
+                torch.randn(n, device=DEVICE, dtype=torch.bfloat16),
+                torch.randn(n, device=DEVICE, dtype=torch.bfloat16),
+                1e-5,
+            ),
+        )
+        for m, n in configs
+    ]
+
+
+def _softmax_shapes_basic() -> list[tuple[str, tuple[Any, ...]]]:
+    shapes = [(4096, 2560), (2048, 4096), (1024, 8192)]
+    return [
+        (
+            f"[{m},{n}]",
+            (torch.randn(m, n, device=DEVICE, dtype=torch.bfloat16),),
+        )
+        for m, n in shapes
+    ]
+
+
 def _sum_shapes() -> list[tuple[str, tuple[Any, ...]]]:
     shapes = [(5120, 2560), (10240, 10240), (2048, 8192)]
     return [
@@ -314,6 +342,20 @@ KERNEL_MAPPINGS: dict[str, KernelMapping] = {
         "sum_kernel",
         functools.partial(torch.sum, dim=-1),
         _sum_shapes,
+        None,
+    ),
+    "layer_norm": (
+        "layer_norm",
+        "layer_norm",
+        torch.nn.functional.layer_norm,
+        _layer_norm_shapes,
+        None,
+    ),
+    "softmax": (
+        "softmax",
+        "softmax",
+        functools.partial(torch.softmax, dim=-1),
+        _softmax_shapes_basic,
         None,
     ),
     # rms_norm_fwd returns (output, inv_rms); the _unwrap_first wrapper in
