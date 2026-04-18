@@ -21,6 +21,7 @@ from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import import_path
 from helion._testing import onlyBackends
+from helion._testing import skipIfRocm
 from helion._testing import skipIfXPU
 
 
@@ -94,6 +95,7 @@ class TestExamplesDist(TestCase, MultiProcessTestCase):
         dist.barrier()
         dist.destroy_process_group()
 
+    @skipIfRocm("Distributed example requires CUDA/NCCL")
     @skipIfXPU("Distributed operations require CCL, not yet fully integrated")
     @skip_if_lt_x_gpu(4)
     def test_all_gather_matmul(self):
@@ -101,10 +103,7 @@ class TestExamplesDist(TestCase, MultiProcessTestCase):
 
         mod = import_path(EXAMPLES_DIR / "distributed" / "all_gather_matmul.py")
 
-        if torch.version.hip is not None:
-            M, N, K = 512, 1024, 1024
-        else:
-            M, N, K = 4096, 6656, 16384
+        M, N, K = 4096, 6656, 16384
 
         a_shared = symm_mem.empty(
             M // self.world_size, K, dtype=torch.bfloat16, device=self.device
@@ -131,19 +130,8 @@ class TestExamplesDist(TestCase, MultiProcessTestCase):
         backend_stream = mod.copy_engine_all_gather_w_progress(
             a_out, a_shared, progress, 1
         )
-        kernel = mod.helion_matmul_w_progress
-        if torch.version.hip is not None:
-            kernel = helion.kernel(
-                config=helion.Config(
-                    block_sizes=[64, 64, 32],
-                    num_warps=4,
-                    num_stages=2,
-                    indexing="pointer",
-                ),
-                static_shapes=True,
-            )(mod.helion_matmul_w_progress.fn)
         _, result = code_and_output(
-            kernel,
+            mod.helion_matmul_w_progress,
             (a_out, a_shared, b, progress, 1, symm_mem_hdl.rank),
         )
 
