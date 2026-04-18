@@ -414,7 +414,6 @@ class TestAtomicOperations(RefEagerTestBase, TestCase):
             )
         self.assertIn("Invalid memory semantic 'ERROR'", str(ctx.exception))
 
-    @xfailIfPallas("block_size=2 does not meet TPU alignment requirements")
     @skipIfRefEager(
         "Test is block size dependent which is not supported in ref eager mode"
     )

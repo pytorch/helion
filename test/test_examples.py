@@ -629,13 +629,14 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
 
     @xfailIfCute("CuTe RMSNorm backward example still returns incorrect results")
-    @skipIfPallas("Generated Pallas code causes Mosaic internal SegFault")
     def test_rms_norm_bwd(self):
         """Test backward pass for rms norm weight gradient."""
         batch_size, dim = 32, 64
-        x = torch.randn([batch_size, dim], device=DEVICE, dtype=HALF_DTYPE)
-        weight = torch.randn([dim], device=DEVICE, dtype=HALF_DTYPE, requires_grad=True)
-        grad_out = torch.randn([batch_size, dim], device=DEVICE, dtype=HALF_DTYPE)
+        x = torch.randn([batch_size, dim], device=DEVICE, dtype=torch.float32)
+        weight = torch.randn(
+            [dim], device=DEVICE, dtype=torch.float32, requires_grad=True
+        )
+        grad_out = torch.randn([batch_size, dim], device=DEVICE, dtype=torch.float32)
         eps = 1e-5
 
         # Compute forward pass to get rms

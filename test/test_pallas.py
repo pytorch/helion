@@ -716,7 +716,6 @@ class TestPallas(TestCase):
         expected[42, 79] = x[42, 79]
         torch.testing.assert_close(result, expected)
 
-    @xfailIfPallas("Result mismatch due to incorrect tiling")
     def test_scalar_index_transpose(self) -> None:
         """Scalar .begin index should collapse the dimension.
 
