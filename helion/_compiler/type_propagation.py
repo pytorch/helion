@@ -1173,22 +1173,24 @@ class TileIndexType(TypeInfo):
 
 
 class JaggedTileIndexType(TileIndexType):
-    parent_block_id: int
+    parent_block_ids: list[int]
 
-    def __init__(self, origin: Origin, block_id: int, parent_block_id: int) -> None:
+    def __init__(
+        self, origin: Origin, block_id: int, parent_block_ids: list[int]
+    ) -> None:
         super().__init__(origin, block_id)
-        self.parent_block_id = parent_block_id
+        self.parent_block_ids = parent_block_ids
 
     def merge(self, other: TypeInfo, var_name: str | None = None) -> TypeInfo:
         if isinstance(other, JaggedTileIndexType):
             if (
                 self.block_id == other.block_id
-                and self.parent_block_id == other.parent_block_id
+                and self.parent_block_ids == other.parent_block_ids
             ):
                 return self
             raise exc.TypeInferenceError(
-                f"JaggedTileIndexType mismatch: block/parent {self.block_id}/{self.parent_block_id} "
-                f"vs {other.block_id}/{other.parent_block_id}"
+                f"JaggedTileIndexType mismatch: block/parents {self.block_id}/{self.parent_block_ids} "
+                f"vs {other.block_id}/{other.parent_block_ids}"
             )
         return super().merge(other, var_name=var_name)
 
@@ -1934,11 +1936,11 @@ class TypePropagation(ast.NodeVisitor):
                 shape_id = [
                     env.resolve_block_id(size) for size in list(rhs.fake_value.shape)
                 ]
-                jagged_tile_info = env.jagged_tile_parent_id
-                for jagged_tile_id, parent_block_id in jagged_tile_info.items():
+                jagged_tile_info = env.jagged_tile_parent_ids
+                for jagged_tile_id, parent_block_ids in jagged_tile_info.items():
                     include_jagged = jagged_tile_id in shape_id
-                    include_parent = parent_block_id in shape_id
-                    if include_jagged and not include_parent:
+                    include_parents = all(p in shape_id for p in parent_block_ids)
+                    if include_jagged and not include_parents:
                         raise exc.InvalidJaggedTileUsage(
                             f"jagged_tile alone cannot be used without its parent in assignment {lhs.id}"
                         )

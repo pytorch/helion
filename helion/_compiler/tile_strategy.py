@@ -1701,14 +1701,18 @@ class NDTileStrategy(_BaseNDTileStrategy):
             jagged_tile_block_size = env.block_sizes[block_idx].var
             jagged_tile_parent_proxy = jagged_tile_parents_proxy[0]
             assert isinstance(jagged_tile_parent_proxy, torch.Tensor)
-            jagged_tile_parent_block_size = jagged_tile_parent_proxy.size(0)
-            assert isinstance(jagged_tile_parent_block_size, torch.SymInt)
+            parent_dims = list(jagged_tile_parent_proxy.size())
+            assert len(parent_dims) >= 1
+            assert all(isinstance(d, torch.SymInt) for d in parent_dims)
             env.jagged_tile_mask_shapes[block_idx] = [
-                jagged_tile_parent_block_size,
+                *parent_dims,
                 jagged_tile_block_size,
             ]
+            k = len(parent_dims)
+            child_expand = "[" + ", ".join(["None"] * k + [":"]) + "]"
+            parent_expand = "[" + ", ".join([":"] * k + ["None"]) + "]"
             return statement_from_string(
-                f"{mask_var} = ({index_var})[None,:] < {{parent}}[:,None]",
+                f"{mask_var} = ({index_var}){child_expand} < {{parent}}{parent_expand}",
                 parent=self._to_ast(jagged_tile_parent),
             )
 

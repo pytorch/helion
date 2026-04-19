@@ -284,6 +284,40 @@ class TestJaggedTile(RefEagerTestDisabled, TestCase):
         with self.assertRaises(helion.exc.InvalidJaggedTileUsage):
             code_and_output(dense_add_bad_jagged_tile, (x, y))
 
+    def test_jagged_tile_2d_parent(self):
+        @helion.kernel(autotune_effort="none")
+        def jagged_tile_2d_parent(
+            x: torch.Tensor, lengths: torch.Tensor
+        ) -> torch.Tensor:
+            b1, b2 = lengths.size()
+            out = torch.zeros([b1, b2], dtype=x.dtype, device=x.device)
+            for tile_b1, tile_b2 in hl.tile([b1, b2]):
+                row_lengths = lengths[tile_b1, tile_b2]
+                acc = hl.zeros([tile_b1, tile_b2], dtype=x.dtype)
+                for tile_k in hl.jagged_tile(row_lengths):
+                    acc += x[tile_b1, tile_b2, tile_k].sum(dim=2)
+                out[tile_b1, tile_b2] = acc
+            return out
+
+        lengths = torch.tensor([[3, 1], [2, 4]], device=DEVICE, dtype=torch.long)
+        max_k = 5
+        x = torch.randn(2, 2, max_k, device=DEVICE, dtype=torch.float32)
+
+        def ref(x_data: torch.Tensor, row_lengths: torch.Tensor) -> torch.Tensor:
+            b1, b2 = row_lengths.size()
+            out = torch.zeros((b1, b2), dtype=x_data.dtype, device=x_data.device)
+            for i in range(b1):
+                for j in range(b2):
+                    L = int(row_lengths[i, j].item())
+                    out[i, j] = x_data[i, j, :L].sum()
+            return out
+
+        code, result = code_and_output(jagged_tile_2d_parent, (x, lengths))
+        self.assertIn(
+            "mask_2 = indices_2[None, None, :] < row_lengths[:, :, None]", code
+        )
+        torch.testing.assert_close(result, ref(x, lengths))
+
 
 if __name__ == "__main__":
     unittest.main()
