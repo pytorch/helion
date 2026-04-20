@@ -998,9 +998,15 @@ class SubscriptIndexing(NamedTuple):
                     and (mv := state.codegen.mask_var(bid))
                     and not _is_size_one(fake_value.size(len(index_values)))
                 ):
-                    new_masks.setdefault(
-                        f"({mv}){tile_strategy.expand_str(output_size, pos)}"
-                    )
+                    if env.is_jagged_tile(bid):
+                        mask_shape = env.jagged_tile_mask_shapes[bid]
+                        new_masks.setdefault(
+                            f"({mv}){tile_strategy.jagged_tile_expand_str(mask_shape, output_size)}"
+                        )
+                    else:
+                        new_masks.setdefault(
+                            f"({mv}){tile_strategy.expand_str(output_size, pos)}"
+                        )
             else:
                 # Multi-dim tensor with multiple non-trivial dims
                 # Still need expansion for trailing/leading slice dimensions

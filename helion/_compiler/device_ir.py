@@ -1071,7 +1071,7 @@ class WalkDeviceAST(NodeVisitor):
                     step = [None] * len(iter_vars)
             else:
                 if isinstance(inner_type, JaggedTileIndexType):
-                    # hl.jagged_tile takes a 1D parent tensor, not a scalar bound.
+                    # hl.jagged_tile takes an N-D parent tensor, not a scalar bound.
                     assert isinstance(end, torch.Tensor)
                     jagged_parent = end
 
@@ -1079,7 +1079,9 @@ class WalkDeviceAST(NodeVisitor):
                     # _setup_mask uses that parent tensor to recover each lane's true end.
                     assert inputs.flat_values[0] is jagged_parent
 
-                    end = torch.amax(jagged_parent)
+                    # Flatten so the global max becomes a single-axis reduction —
+                    # Inductor only supports one reduction dim per buffer.
+                    end = torch.amax(jagged_parent.reshape(-1))
 
                 iter_vars = [inner_type]
                 begin = [0] if begin is None else [begin]
