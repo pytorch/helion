@@ -276,9 +276,8 @@ jobs:
           SKIP_CHECK=$([[ "${{ contains(matrix.alias, 'distributed') }}" == "true" ]] && echo "! grep -qE '(SKIPPED|FAILED|ERROR)'" || echo "cat > /dev/null")
           if [[ "${{ matrix.alias }}" == *xpu* ]]; then
             export TRITON_XPU_GEN_NATIVE_CODE=1
-            TIMEOUT_ARGS="--timeout=60 --timeout-method=thread"
           fi
-          pytest $PARALLEL -rf ${TIMEOUT_ARGS:---timeout=60} $EXTRA_FLAGS $TEST_PATH | tee >(eval $SKIP_CHECK)
+          pytest $PARALLEL -rf --timeout=60 --timeout-method=thread $EXTRA_FLAGS $TEST_PATH | tee >(eval $SKIP_CHECK)
 
   test-notebooks:
     name: test-notebooks-cu128-py3.12-pytorch-2.9-a10g
