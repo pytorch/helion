@@ -46,6 +46,17 @@ class _BlockIdItem:
     ) -> object:
         return fn(self._fragment(base))
 
+    def _encode_flat_value(self, base: ConfigSpec, value: object) -> object:
+        """Encode a normalized Config value into its flat-slot representation.
+
+        Most specs store the same value in Config and FlatConfig, so the
+        default implementation is the identity. ReductionLoopSpec is the
+        only override today: it normalizes persistent reductions to None in
+        Config, but FlatConfig stores that choice as an integer sentinel.
+        """
+        del base
+        return value
+
 
 _BlockIdItemT = TypeVar("_BlockIdItemT", bound=_BlockIdItem)
 
@@ -156,6 +167,16 @@ class BlockIdSequence(MutableSequence[_BlockIdItemT]):
     ) -> list[object]:
         """Map a flattened version of the config using the given function."""
         return [spec._flat_config(base, fn) for spec in self._data]
+
+    def _encode_flat_values(
+        self, base: ConfigSpec, values: list[object]
+    ) -> list[object]:
+        """Encode normalized Config values into their flat-slot representation."""
+        assert len(values) == len(self)
+        return [
+            spec._encode_flat_value(base, value)
+            for spec, value in zip(self._data, values, strict=True)
+        ]
 
     def _reset_config_to_default(
         self, name: str, values: object, *, block_ids: list[int] | None = None

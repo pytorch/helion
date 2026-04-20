@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
 from typing import cast
 
 from .._compat import warps_to_threads
+from .block_id_sequence import BlockIdSequence
 from .config_fragment import Category
 from .config_fragment import ConfigSpecFragment
 from .config_fragment import PowerOfTwoFragment
@@ -118,14 +119,18 @@ class ConfigGeneration:
     def flatten(self, config: Config) -> FlatConfig:
         """Inverse of unflatten: convert a Config to a FlatConfig."""
         result = self.default_flat()
+        flat_fields = self.config_spec._flat_fields()
         for key, (indices, is_sequence) in self._key_to_flat_indices.items():
             if key not in config.config:
                 continue
             value = config.config[key]
             if is_sequence:
                 assert isinstance(value, list)
-                for idx, v in zip(indices, value, strict=True):
-                    result[idx] = v
+                field = flat_fields[key]
+                assert isinstance(field, BlockIdSequence)
+                encoded_values = field._encode_flat_values(self.config_spec, value)
+                for idx, encoded_value in zip(indices, encoded_values, strict=True):
+                    result[idx] = encoded_value
             else:
                 assert len(indices) == 1
                 result[indices[0]] = value
