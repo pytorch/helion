@@ -1008,9 +1008,6 @@ class TestPallas(TestCase):
         self.assertIn("pl.ds(", code)
         torch.testing.assert_close(result, args[0] + args[1])
 
-    @xfailIfPallas(
-        "No config values to tune because all block sizes are fixed and Pallas no longer tunes reduction loops"
-    )
     def test_squeeze_slice_access(self) -> None:
         """Test for the [None, :] indexing pattern (subscript index for slice >= tensor_ndim)"""
 
@@ -1027,7 +1024,7 @@ class TestPallas(TestCase):
         M = 128
         x = torch.randn(N, device=DEVICE, dtype=torch.float32)
         y = torch.randn(M, device=DEVICE, dtype=torch.float32)
-        result = fn(x, y)
+        code, result = code_and_output(fn, (x, y))
         expected = (x[:, None] < y[None, :]).to(torch.float32)
         torch.testing.assert_close(result, expected)
 
