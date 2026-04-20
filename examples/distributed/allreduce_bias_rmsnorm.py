@@ -12,8 +12,10 @@ from __future__ import annotations
 
 import functools
 import os
+import random
 
 import torch
+from torch._C._distributed_c10d import _SymmetricMemory
 import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm_mem
 
@@ -31,6 +33,7 @@ from helion.runtime.dist_utils import symm_mem_sync
         reduction_loops=[1024],
     ),
     static_shapes=True,
+    ignore_warnings=[helion.exc.TensorOperationInWrapper],
 )
 def one_shot_allreduce_bias_rmsnorm_kernel(
     symm_mem_buffer: torch.Tensor,
@@ -41,7 +44,7 @@ def one_shot_allreduce_bias_rmsnorm_kernel(
     EPS: hl.constexpr,
     RANK: hl.constexpr,
     WORLD_SIZE: hl.constexpr,
-    GROUP_NAME: hl.constexpr,
+    GROUP_NAME: hl.ProcessGroupName,
 ) -> torch.Tensor:
     """
     Fused one-shot all-reduce + bias addition + RMS normalization.
@@ -123,6 +126,7 @@ def helion_one_shot_allreduce_bias_rmsnorm(
         block_sizes=[4],
         num_warps=32,
     ),
+    ignore_warnings=[helion.exc.TensorOperationInWrapper],
 )
 def two_shot_allreduce_bias_rmsnorm_kernel(
     symm_mem_buffer: torch.Tensor,
@@ -133,7 +137,7 @@ def two_shot_allreduce_bias_rmsnorm_kernel(
     EPS: hl.constexpr,
     RANK: hl.constexpr,
     WORLD_SIZE: hl.constexpr,
-    GROUP_NAME: hl.constexpr,
+    GROUP_NAME: hl.ProcessGroupName,
 ) -> torch.Tensor:
     N, D = x.size()
     output = torch.empty_like(x)
@@ -214,6 +218,88 @@ def helion_two_shot_allreduce_bias_rmsnorm(
     )
 
 
+_flashinfer_available = False
+try:
+    import flashinfer.comm as _flashinfer_comm  # pyrefly: ignore[missing-import]
+
+    if hasattr(_flashinfer_comm, "allreduce_fusion") and hasattr(
+        _flashinfer_comm, "create_allreduce_fusion_workspace"
+    ):
+        _flashinfer_available = True
+except ImportError:
+    pass
+
+flashinfer_workspace_cache: dict[str, object] = {}
+
+
+def flashinfer_allreduce_bias_rmsnorm(
+    x: torch.Tensor,
+    bias: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float = 1e-5,
+) -> torch.Tensor:
+    """
+    Flashinfer fused allreduce + bias + rmsnorm baseline.
+
+    Uses flashinfer's allreduce_fusion with kARResidualRMSNorm pattern.
+    The bias (broadcast to [N, D]) is passed as residual_in so the kernel
+    computes: rmsnorm(allreduce(x) + bias, weight, eps).
+    """
+    import flashinfer.comm as flashinfer_comm  # pyrefly: ignore[missing-import]
+
+    # pyrefly: ignore[missing-import]
+    from flashinfer.comm.mnnvl import TorchDistBackend
+
+    group = dist.group.WORLD
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    N, D = x.shape
+
+    cache_key = f"{world_size}_{rank}_{N}_{D}_{x.dtype}"
+    if cache_key not in flashinfer_workspace_cache:
+        comm_backend = TorchDistBackend(group=group)
+        rng_state = random.getstate()
+        random.seed(int.from_bytes(os.urandom(16), byteorder="big"))
+        try:
+            workspace = flashinfer_comm.create_allreduce_fusion_workspace(
+                backend="trtllm",
+                world_size=world_size,
+                rank=rank,
+                max_token_num=N,
+                hidden_dim=D,
+                dtype=x.dtype,
+                comm_backend=comm_backend,
+            )
+        finally:
+            random.setstate(rng_state)
+        flashinfer_workspace_cache[cache_key] = workspace
+
+    workspace = flashinfer_workspace_cache[cache_key]
+    pattern_code = flashinfer_comm.AllReduceFusionPattern.kARResidualRMSNorm
+
+    residual_in = bias.unsqueeze(0).expand(N, D).contiguous()
+    norm_out = torch.empty_like(x)
+    # allreduce_fusion writes the allreduce result back into `input` in-place
+    x = x.clone()
+
+    flashinfer_comm.allreduce_fusion(
+        input=x,
+        workspace=workspace,
+        pattern=pattern_code,
+        launch_with_pdl=True,
+        output=None,
+        residual_out=x,
+        norm_out=norm_out,
+        quant_out=None,
+        scale_out=None,
+        residual_in=residual_in,
+        rms_gamma=weight,
+        rms_eps=eps,
+        fp32_acc=True,
+    )
+    return norm_out
+
+
 def reference_allreduce_bias_rmsnorm(
     x: torch.Tensor,
     bias: torch.Tensor,
@@ -246,20 +332,28 @@ def test(N: int, D: int, device: torch.device, dtype: torch.dtype) -> None:
 
     benchmarks = {}
     KERNEL_FILTER = os.getenv("KERNEL_FILTER")
+    if _flashinfer_available and (not KERNEL_FILTER or "flashinfer" in KERNEL_FILTER):
+        benchmarks["flashinfer"] = flashinfer_allreduce_bias_rmsnorm
     if not KERNEL_FILTER or "one_shot" in KERNEL_FILTER:
+        # pyrefly: ignore[unsupported-operation]
         benchmarks["helion_one_shot"] = helion_one_shot_allreduce_bias_rmsnorm
     if not KERNEL_FILTER or "two_shot" in KERNEL_FILTER:
+        # pyrefly: ignore[unsupported-operation]
         benchmarks["helion_two_shot"] = helion_two_shot_allreduce_bias_rmsnorm
     assert len(benchmarks) > 0, f"No benchmark selected by filter: {KERNEL_FILTER}"
 
+    symm_mem_benchmarks = {}
     for k, v in benchmarks.items():
+        if k == "flashinfer":
+            continue
         symm_mem_buffer = symm_mem.empty(N, D, dtype=x.dtype, device=x.device)
         # pyrefly: ignore[missing-attribute]
         symm_mem.rendezvous(symm_mem_buffer, dist.group.WORLD.group_name)
-        benchmarks[k] = functools.partial(
+        symm_mem_benchmarks[k] = functools.partial(
             v,
             symm_mem_buffer,
         )
+    benchmarks.update(symm_mem_benchmarks)
 
     run_example(
         benchmarks,  # pyrefly: ignore[bad-argument-type]
@@ -285,14 +379,12 @@ def test(N: int, D: int, device: torch.device, dtype: torch.dtype) -> None:
 
 
 def main() -> None:
+    _SymmetricMemory.signal_pad_size = 1024 * 1024
     rank = int(os.environ["LOCAL_RANK"])
     torch.manual_seed(42 + rank)
     device = torch.device(f"cuda:{rank}")
     torch.cuda.set_device(device)
     dist.init_process_group("nccl")
-    symm_mem.enable_symm_mem_for_group(  # pyrefly: ignore [deprecated]
-        dist.group.WORLD.group_name  # type: ignore[missing-attribute]
-    )
 
     test(N=128, D=4096, device=device, dtype=torch.float32)
 
