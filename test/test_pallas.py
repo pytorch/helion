@@ -556,6 +556,38 @@ class TestPallas(TestCase):
         expected = torch.bmm(a.float(), b.float()).to(torch.bfloat16)
         torch.testing.assert_close(result, expected, rtol=1e-2, atol=1e-2)
 
+    @xfailIfPallas(
+        "reduction tile K=256 doesn't evenly divide K=384, last tile reads OOB"
+    )
+    def test_bmm_fori_loop_non_divisible_k(self) -> None:
+        """Test fori_loop bmm where BLOCK_K=256 doesn't evenly divide K=384."""
+        a = torch.randn(4, 128, 384, device=DEVICE, dtype=torch.bfloat16)
+        b = torch.randn(4, 384, 128, device=DEVICE, dtype=torch.bfloat16)
+        _code, result = code_and_output(
+            pallas_bmm,
+            (a, b),
+            block_sizes=[4, 128, 128, 256],
+            pallas_loop_type="fori_loop",
+        )
+        expected = torch.bmm(a.float(), b.float()).to(torch.bfloat16)
+        torch.testing.assert_close(result, expected, rtol=1e-2, atol=1e-2)
+
+    @xfailIfPallas(
+        "reduction tile K=256 doesn't evenly divide K=384, last tile reads OOB"
+    )
+    def test_bmm_emit_pipeline_non_divisible_k(self) -> None:
+        """Test emit_pipeline bmm where BLOCK_K=256 doesn't evenly divide K=384."""
+        a = torch.randn(4, 128, 384, device=DEVICE, dtype=torch.bfloat16)
+        b = torch.randn(4, 384, 128, device=DEVICE, dtype=torch.bfloat16)
+        _code, result = code_and_output(
+            pallas_bmm,
+            (a, b),
+            block_sizes=[4, 128, 128, 256],
+            pallas_loop_type="emit_pipeline",
+        )
+        expected = torch.bmm(a.float(), b.float()).to(torch.bfloat16)
+        torch.testing.assert_close(result, expected, rtol=1e-2, atol=1e-2)
+
     def test_emit_pipeline_codegen(self) -> None:
         """Test that pallas_loop_type='emit_pipeline' generates correct emit_pipeline code."""
         args = (

@@ -303,6 +303,20 @@ class TestExamples(RefEagerTestBase, TestCase):
             block_sizes=[16, 16, 16, 16],
         )
 
+    @xfailIfPallas("reduction tile K=256 doesn't evenly divide K=384")
+    @xfailIfCute("CuTE IR build error with non-divisible K block sizes")
+    def test_bmm_non_divisible_k(self):
+        args = (
+            torch.randn([4, 128, 384], device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn([4, 384, 128], device=DEVICE, dtype=HALF_DTYPE),
+        )
+        check_example(
+            "bmm",
+            args,
+            torch.bmm(args[0], args[1]),
+            block_sizes=[1, 128, 128, 256],
+        )
+
     @skipIfFn(
         lambda: _get_backend() == "cute", "CuTe FP8 GEMM example is not supported yet"
     )
