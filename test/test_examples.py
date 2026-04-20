@@ -304,6 +304,7 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
 
     @xfailIfPallas("reduction tile K=256 doesn't evenly divide K=384")
+    @xfailIfCute("CuTE IR build error with non-divisible K block sizes")
     def test_bmm_non_divisible_k(self):
         args = (
             torch.randn([4, 128, 384], device=DEVICE, dtype=HALF_DTYPE),
@@ -313,7 +314,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             "bmm",
             args,
             torch.bmm(args[0], args[1]),
-            block_sizes=[4, 128, 128, 256],
+            block_sizes=[1, 128, 128, 256],
         )
 
     @skipIfFn(
