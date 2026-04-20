@@ -1581,7 +1581,14 @@ class PallasBackend(Backend):
 
     def build_launcher_name(self, config: Config) -> str:
         """Return the launcher name to use based on ``pallas_loop_type``."""
+        from ..autotuner.config_spec import VALID_PALLAS_LOOP_TYPES
+
         pallas_loop_type = config.get("pallas_loop_type", "default")
+        if pallas_loop_type not in VALID_PALLAS_LOOP_TYPES:
+            raise ValueError(
+                f"Invalid pallas_loop_type {pallas_loop_type!r}. "
+                f"Expected one of {VALID_PALLAS_LOOP_TYPES}."
+            )
         if pallas_loop_type == "emit_pipeline":
             return "_default_pallas_pipeline_launcher"
         if pallas_loop_type == "fori_loop":
@@ -1591,13 +1598,13 @@ class PallasBackend(Backend):
     def get_launcher_name(self) -> str:
         """Return the launcher name based on the current config."""
         from .device_function import DeviceFunction
+        from .device_function import NoCurrentFunction
 
         try:
             device_fn = DeviceFunction.current()
-            config = device_fn.config
-            return self.build_launcher_name(config)
-        except Exception:
+        except NoCurrentFunction:
             return self.default_launcher_name
+        return self.build_launcher_name(device_fn.config)
 
     def pre_codegen(
         self,
