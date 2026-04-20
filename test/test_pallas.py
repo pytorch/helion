@@ -1031,6 +1031,101 @@ class TestPallas(TestCase):
         expected = (x[:, None] < y[None, :]).to(torch.float32)
         torch.testing.assert_close(result, expected)
 
+    def test_gather_2d_dim_1(self) -> None:
+        @helion.kernel(
+            backend="pallas",
+            static_shapes=True,
+            ignore_warnings=[helion.exc.TensorOperationInWrapper],
+        )
+        def fn(x: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
+            n, _v = x.shape
+            out = torch.zeros([n, 1], dtype=x.dtype, device=x.device)
+            for tile_n in hl.tile(n):
+                out[tile_n, :] = x[tile_n, :].gather(1, idx[tile_n, :])
+            return out
+
+        x = torch.randn(64, 256, device=DEVICE, dtype=torch.float32)
+        idx = torch.randint(0, 256, (64, 1), device=DEVICE, dtype=torch.int32)
+        code, result = code_and_output(fn, (x, idx), block_size=64)
+        expected = x.gather(1, idx.long())
+        torch.testing.assert_close(result, expected)
+
+    def test_gather_2d_dim_0(self) -> None:
+        @helion.kernel(
+            backend="pallas",
+            static_shapes=True,
+            ignore_warnings=[helion.exc.TensorOperationInWrapper],
+        )
+        def fn(x: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
+            _n, m = x.shape
+            out = torch.zeros([1, m], dtype=x.dtype, device=x.device)
+            for tile_m in hl.tile(m):
+                out[:, tile_m] = x[:, tile_m].gather(0, idx[:, tile_m])
+            return out
+
+        x = torch.randn(128, 64, device=DEVICE, dtype=torch.float32)
+        idx = torch.randint(0, 128, (1, 64), device=DEVICE, dtype=torch.int32)
+        code, result = code_and_output(fn, (x, idx), block_size=64)
+        expected = x.gather(0, idx.long())
+        torch.testing.assert_close(result, expected)
+
+    def test_gather_3d_dim_0(self) -> None:
+        @helion.kernel(
+            backend="pallas",
+            static_shapes=True,
+            ignore_warnings=[helion.exc.TensorOperationInWrapper],
+        )
+        def fn(x: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
+            _n, m, k = x.shape
+            out = torch.zeros([1, m, k], dtype=x.dtype, device=x.device)
+            for tile_m in hl.tile(m):
+                out[:, tile_m, :] = x[:, tile_m, :].gather(0, idx[:, tile_m, :])
+            return out
+
+        x = torch.randn(32, 16, 8, device=DEVICE, dtype=torch.float32)
+        idx = torch.randint(0, 32, (1, 16, 8), device=DEVICE, dtype=torch.int32)
+        code, result = code_and_output(fn, (x, idx), block_size=16)
+        expected = x.gather(0, idx.long())
+        torch.testing.assert_close(result, expected)
+
+    def test_gather_3d_dim_1(self) -> None:
+        @helion.kernel(
+            backend="pallas",
+            static_shapes=True,
+            ignore_warnings=[helion.exc.TensorOperationInWrapper],
+        )
+        def fn(x: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
+            n, _m, k = x.shape
+            out = torch.zeros([n, 1, k], dtype=x.dtype, device=x.device)
+            for tile_n in hl.tile(n):
+                out[tile_n, :, :] = x[tile_n, :, :].gather(1, idx[tile_n, :, :])
+            return out
+
+        x = torch.randn(16, 32, 8, device=DEVICE, dtype=torch.float32)
+        idx = torch.randint(0, 32, (16, 1, 8), device=DEVICE, dtype=torch.int32)
+        code, result = code_and_output(fn, (x, idx), block_size=16)
+        expected = x.gather(1, idx.long())
+        torch.testing.assert_close(result, expected)
+
+    def test_gather_3d_dim_2(self) -> None:
+        @helion.kernel(
+            backend="pallas",
+            static_shapes=True,
+            ignore_warnings=[helion.exc.TensorOperationInWrapper],
+        )
+        def fn(x: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
+            n, m, _k = x.shape
+            out = torch.zeros([n, m, 1], dtype=x.dtype, device=x.device)
+            for tile_n in hl.tile(n):
+                out[tile_n, :, :] = x[tile_n, :, :].gather(2, idx[tile_n, :, :])
+            return out
+
+        x = torch.randn(16, 8, 64, device=DEVICE, dtype=torch.float32)
+        idx = torch.randint(0, 64, (16, 8, 1), device=DEVICE, dtype=torch.int32)
+        code, result = code_and_output(fn, (x, idx), block_size=16)
+        expected = x.gather(2, idx.long())
+        torch.testing.assert_close(result, expected)
+
 
 if __name__ == "__main__":
     unittest.main()

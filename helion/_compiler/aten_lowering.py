@@ -1765,6 +1765,81 @@ def codegen_gather(ctx: LoweringContext, node: Node) -> object:
     return expr_from_string(result_var)
 
 
+@gather_lowering.register_codegen("pallas")
+def codegen_gather_pallas(ctx: LoweringContext, node: Node) -> object:
+    """Generate gather for Pallas using one_hot + multiply + sum.
+
+    TPU Mosaic has limited lax.gather support, so we implement
+    gather(input, dim, index) as:
+        mask = one_hot(index.squeeze(dim), input.shape[dim], dtype=input.dtype)
+        result = sum(input * mask, axis=dim, keepdims=True)
+    """
+    assert not node.kwargs, "gather does not support keyword arguments"
+    assert len(node.args) == 3, f"gather expects 3 arguments, got {len(node.args)}"
+
+    input_node = node.args[0]
+    dim = node.args[1]
+    index_node = node.args[2]
+
+    assert isinstance(input_node, Node), "gather input must be a Node"
+    assert isinstance(dim, int), f"gather dim must be int, got {type(dim)}"
+    assert isinstance(index_node, Node), "gather index must be a Node"
+
+    input_tensor = input_node.meta["val"]
+    assert isinstance(input_tensor, torch.Tensor), (
+        f"gather input must be a tensor, got {type(input_tensor)}"
+    )
+
+    ndim = input_tensor.ndim
+    if dim < 0:
+        dim = ndim + dim
+    assert 0 <= dim < ndim, (
+        f"gather dim {dim} out of range for tensor with {ndim} dimensions"
+    )
+
+    fn = ctx.cg.device_function
+
+    input_ast = _env_arg(ctx, input_node)
+    assert isinstance(input_ast, ast.AST)
+
+    index_ast = _env_arg(ctx, index_node)
+    assert isinstance(index_ast, ast.AST)
+
+    idx_var = fn.new_var("gather_idx")
+    mask_var = fn.new_var("gather_mask")
+    result_var = fn.new_var("gather_result")
+
+    ctx.cg.add_statement(
+        statement_from_string(
+            f"{idx_var} = jnp.squeeze({{index}}.astype(jnp.int32), axis={dim})",
+            index=index_ast,
+        )
+    )
+
+    ctx.cg.add_statement(
+        statement_from_string(
+            f"{mask_var} = jax.nn.one_hot({idx_var}, {{input}}.shape[{dim}], dtype={{input}}.dtype)",
+            input=input_ast,
+        )
+    )
+
+    if dim != ndim - 1:
+        ctx.cg.add_statement(
+            statement_from_string(
+                f"{mask_var} = jnp.moveaxis({mask_var}, -1, {dim})",
+            )
+        )
+
+    ctx.cg.add_statement(
+        statement_from_string(
+            f"{result_var} = jnp.sum({{input}} * {mask_var}, axis={dim}, keepdims=True)",
+            input=input_ast,
+        )
+    )
+
+    return expr_from_string(result_var)
+
+
 topk_lowering = register_lowering(torch.ops.aten.topk.default)
 
 
