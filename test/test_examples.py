@@ -472,7 +472,6 @@ class TestExamples(RefEagerTestBase, TestCase):
             indexing="block_ptr",
         )
 
-    @xfailIfPallas("missing BlockSpec for hl.load with computed indices")
     def test_cross_entropy(self):
         n, v = 128, 1000
         logits = torch.randn(n, v, device=DEVICE, dtype=torch.float32)
