@@ -3,6 +3,7 @@ from __future__ import annotations
 import abc
 import ast
 import functools
+import math
 import operator
 import re
 from typing import TYPE_CHECKING
@@ -1237,47 +1238,105 @@ class PallasBackend(Backend):
         ``min(block_size, tensor_dim)`` which equals the full array
         dimension -- always valid per TPU rules.
         """
+        from .ast_extension import ExtendedAST
+        from helion._compiler.host_function import HostFunction
+        from helion._compiler.type_propagation import SequenceType
+        from helion._compiler.type_propagation import TensorType
+        from helion._compiler.type_propagation import TileIndexType
+
+        host_func = HostFunction.current()
+
+        class TensorTiledAccessAnalyzer(ast.NodeVisitor):
+            def __init__(self, backend: PallasBackend) -> None:
+                super().__init__()
+                self.backend = backend
+                self.required_alignments: dict[int, int] = {}
+
+            def visit_Subscript(self, node: ast.Subscript) -> None:
+                assert isinstance(node, ExtendedAST)
+                assert isinstance(node.value, ExtendedAST)
+                value_type = node.value._type_info
+                if not isinstance(value_type, TensorType):
+                    return
+                tensor = value_type.fake_value
+                if isinstance(node.slice, (ast.Tuple, ast.List)):
+                    num_squeezed_dimensions = 0
+                    for i, subscript in enumerate(node.slice.elts):
+                        if (
+                            isinstance(subscript, ast.Constant)
+                            and subscript.value is None
+                        ):
+                            num_squeezed_dimensions += 1
+                            continue
+                        accessed_dim = i - num_squeezed_dimensions
+                        self.maybe_update_alignment_requirement(
+                            tensor, accessed_dim, subscript
+                        )
+                else:
+                    self.maybe_update_alignment_requirement(tensor, 0, node.slice)
+
+            def maybe_update_alignment_requirement(
+                self, tensor: torch.Tensor, accessed_dim_start: int, subscript: ast.AST
+            ) -> None:
+                if not isinstance(subscript, ExtendedAST):
+                    return
+                subscript_type = subscript._type_info
+                tile_index_types: list[TileIndexType] = []
+                if isinstance(subscript_type, TileIndexType):
+                    tile_index_types.append(subscript_type)
+                elif isinstance(subscript_type, SequenceType):
+                    for el_type in subscript_type.element_types:
+                        if isinstance(el_type, TileIndexType):
+                            tile_index_types.append(el_type)
+
+                for i, tile_index_type in enumerate(tile_index_types):
+                    bid = tile_index_type.block_id
+                    accessed_dim = accessed_dim_start + i
+                    dim_from_end = tensor.ndim - accessed_dim - 1
+                    bitwidth = tensor.dtype.itemsize * 8
+
+                    required_alignment = self.backend._get_pallas_required_alignment(
+                        dim_from_end, tensor.ndim, bitwidth
+                    )
+                    self.maybe_update_required_alignment(bid, required_alignment)
+
+            def maybe_update_required_alignment(
+                self, bid: int, required_alignment: int
+            ) -> None:
+                if bid not in self.required_alignments:
+                    self.required_alignments[bid] = required_alignment
+                else:
+                    self.required_alignments[bid] = max(
+                        self.required_alignments[bid], required_alignment
+                    )
+
+        analyzer = TensorTiledAccessAnalyzer(self)
+        for stmt in host_func.body:
+            analyzer.visit(stmt)
+
         from torch._inductor.runtime.runtime_utils import next_power_of_2
 
         from ..autotuner.config_spec import BlockSizeSpec
         from .compile_environment import BlockSizeInfo
 
-        # Map block_id -> minimum dim_from_end across all tensors
-        min_dim_from_end: dict[int, int] = {}
-        min_tensor_ndim: dict[int, int] = {}
         if block_sizes is not None and kernel_tensor_sizes is not None:
             for shape in kernel_tensor_sizes:
-                tensor_ndim = len(shape)
-                for d, dim_expr in enumerate(shape):
-                    for info in block_sizes:
-                        if not isinstance(info, BlockSizeInfo):
-                            continue
-                        if info.dim_matches(
-                            dim_expr  # pyrefly: ignore[bad-argument-type]
-                        ):
-                            dfe = tensor_ndim - 1 - d
-                            if info.block_id not in min_dim_from_end:
-                                min_dim_from_end[info.block_id] = dfe
-                                min_tensor_ndim[info.block_id] = tensor_ndim
-                            else:
-                                min_dim_from_end[info.block_id] = min(
-                                    min_dim_from_end[info.block_id], dfe
-                                )
-                                min_tensor_ndim[info.block_id] = min(
-                                    min_tensor_ndim[info.block_id],
-                                    tensor_ndim,
-                                )
+                for bid, info in enumerate(block_sizes):
+                    if not isinstance(info, BlockSizeInfo):
+                        continue
+                    # pyrefly: ignore[no-matching-overload]
+                    if math.prod(shape) == info.var:
+                        # avoid creating size-1 kernel tensors, which triggers Pallas Mosaic lowering failure:
+                        # https://github.com/jax-ml/jax/issues/36970
+                        analyzer.maybe_update_required_alignment(bid, 2)
 
-        for i, spec in enumerate(block_specs):
+        for spec in block_specs:
             if not isinstance(spec, BlockSizeSpec):
                 continue
             bid = spec.block_ids[0]
-            dim_from_end = min_dim_from_end.get(bid, ndim - 1 - i)
-            tensor_ndim = min_tensor_ndim.get(bid, ndim)
-            requirement_alignment = self._get_pallas_required_alignment(
-                dim_from_end, tensor_ndim, min_element_bits
-            )
-
+            if bid not in analyzer.required_alignments:
+                continue
+            requirement_alignment = analyzer.required_alignments[bid]
             # When the tensor dim is smaller than the alignment, any
             # block_size >= tensor_dim will be capped to tensor_dim at
             # runtime (full-dim access, always valid).  Use the
