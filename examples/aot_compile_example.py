@@ -30,9 +30,9 @@ import argparse
 import os
 
 import torch
-from triton.testing import do_bench
 
 from helion._testing import DEVICE
+from helion._testing import do_bench
 import helion.experimental
 import helion.language as hl
 
