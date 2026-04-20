@@ -135,6 +135,17 @@
       "pytorch-version": "pytorch-nightly",
       "alias": "b200",
       "backend": "cute"
+    },
+    {
+      "runner": "macos-26-xlarge",
+      "python-version": "3.12",
+      "ref-eager": false,
+      "image": "",
+      "runtime-version": "cpu",
+      "container-options": "",
+      "pytorch-version": "pytorch-2.9",
+      "alias": "m2-metal",
+      "backend": "metal"
     }
   ]
 }
