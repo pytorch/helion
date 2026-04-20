@@ -361,6 +361,7 @@ def test(N: int, D: int, device: torch.device, dtype: torch.dtype) -> None:
         args,
         rtol=1e-4,
         atol=1e-4,
+        interleaved=False,
     )
 
     if os.getenv("DO_PROFILE") == "1":
