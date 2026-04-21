@@ -835,7 +835,6 @@ class TestPallas(TestCase):
         expected = x + 0.5
         torch.testing.assert_close(result, expected)
 
-    @xfailIfPallas("Pallas backend not correctly handling tile index with offset")
     def test_tensor_access_tile_index_offset(self) -> None:
         @helion.kernel(backend="pallas", static_shapes=True)
         def fn(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:

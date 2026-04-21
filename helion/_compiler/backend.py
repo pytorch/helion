@@ -306,6 +306,15 @@ class Backend(abc.ABC):
         """
         return self.next_power_of_2_host_expr(expr)
 
+    def should_pad_tensor_factories(self) -> bool:
+        """Whether to pad tensor factory sizes to the next power of 2.
+
+        Triton benefits from power-of-2 tensor sizes.  Pallas block refs use
+        exact tensor dimensions, so padding would create shape mismatches
+        between padded accumulators and unpadded computation results.
+        """
+        return True
+
     def reduction_combine_expr(
         self,
         reduction_type: str,
@@ -1193,6 +1202,9 @@ class PallasBackend(Backend):
 
     def dynamic_rdim_size_expr(self, expr: str) -> str:
         return expr
+
+    def should_pad_tensor_factories(self) -> bool:
+        return False
 
     def _get_pallas_required_alignment(
         self, dim_from_end: int, tensor_ndim: int, bitwidth: int

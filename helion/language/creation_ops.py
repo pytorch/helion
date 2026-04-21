@@ -120,6 +120,18 @@ def _full_fake(
         raise TypeError(f"Expected list[SymInt], got {type(shape).__name__}")
     env = CompileEnvironment.current()
     env.add_kernel_tensor_size(shape)
+    if not env.backend.should_pad_tensor_factories():
+        normalized: list[int | torch.SymInt] = []
+        for s in shape:
+            bid = env.resolve_block_id(s)
+            if bid is not None:
+                normalized.append(env.block_sizes[env.canonical_block_id(bid)].var)
+            elif isinstance(s, int) and s > 1:
+                rdim = env.allocate_reduction_dimension(s)
+                normalized.append(rdim.var)
+            else:
+                normalized.append(s)
+        shape = normalized
     return torch.empty(
         [*shape],
         dtype=dtype,
@@ -173,9 +185,15 @@ def _full_codegen_pallas(state: CodegenState) -> ast.AST:
         for s in fake_value.size():
             bid = env.resolve_block_id(s)
             if bid is not None:
-                bs = env.block_sizes[bid].from_config(config)
-                assert isinstance(bs, int)
-                resolved_shape.append(bs)
+                bsi = env.block_sizes[bid]
+                if bsi.reduction and isinstance(bsi.size, (int, torch.SymInt)):
+                    resolved_shape.append(
+                        env.backend.static_rdim_size(bsi.size_hint())
+                    )
+                else:
+                    bs = bsi.from_config(config)
+                    assert isinstance(bs, int)
+                    resolved_shape.append(bs)
             else:
                 resolved_shape.append(int(s))
         shape = tuple(resolved_shape)
