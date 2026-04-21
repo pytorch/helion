@@ -800,14 +800,36 @@ class PopulationBasedSearch(BaseSearch):
         """
         Benchmark multiple flat configurations in parallel.
 
+        The returned list has the same length as ``to_check`` and preserves
+        positional correspondence.  Invalid configurations that cannot be
+        unflattened are represented as ``PopulationMember`` objects with
+        ``perf == inf`` and ``status == "error"`` (they are not benchmarked).
+
         Args:
             to_check: A list of flat configurations to benchmark.
 
         Returns:
-            A list of population members with the benchmark results.
+            A list of population members with the benchmark results, one per
+            entry in *to_check*.
         """
-        result = [m for m in map(self.make_unbenchmarked, to_check) if m is not None]
-        return self.parallel_benchmark_population(result)
+        from ..runtime.config import Config
+
+        valid: list[PopulationMember] = []
+        result: list[PopulationMember] = []
+        for flat in to_check:
+            m = self.make_unbenchmarked(flat)
+            if m is not None:
+                valid.append(m)
+                result.append(m)
+            else:
+                result.append(
+                    PopulationMember(
+                        _unset_fn, [float("inf")], flat, Config(), status="error"
+                    )
+                )
+
+        self.parallel_benchmark_population(valid)
+        return result
 
     def make_unbenchmarked(self, flat_values: FlatConfig) -> PopulationMember | None:
         """
