@@ -451,8 +451,6 @@ def _(state: CodegenState) -> None:
     assert isinstance(subscript, (list, tuple))
     value = state.ast_arg(2)
     assert isinstance(tensor, torch.Tensor)
-    if tensor.dtype.itemsize < 4:
-        value = CompileEnvironment.current().backend.cast_ast(value, tensor.dtype)
     name = state.device_function.tensor_arg(tensor).name
     name = _pallas_vmem_name(state, name)
     # Increment memory op index to stay in sync with triton backend
