@@ -507,6 +507,20 @@ class TestPallas(TestCase):
         self.assertNotIn("pltpu.emit_pipeline", code)
         torch.testing.assert_close(result, args[0] + args[1])
 
+    def test_invalid_pallas_loop_type_raises(self) -> None:
+        """Invalid pallas_loop_type values must raise instead of silently falling back."""
+        args = (
+            torch.randn(64, 128, device=DEVICE, dtype=torch.float32),
+            torch.randn(64, 128, device=DEVICE, dtype=torch.float32),
+        )
+        with self.assertRaisesRegex(ValueError, "Invalid pallas_loop_type 'pipeline'"):
+            code_and_output(
+                pallas_inner_loop_add,
+                args,
+                block_sizes=[8, 128],
+                pallas_loop_type="pipeline",
+            )
+
     def test_attention_default_fp32(self) -> None:
         """Test attention with default (for-loop) inner loop."""
         query = torch.randn(1, 4, 32, 64, dtype=torch.float32, device=DEVICE)
