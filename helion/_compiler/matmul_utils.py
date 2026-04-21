@@ -169,16 +169,13 @@ def _emit_pallas_matmul(
     if acc is not None:
         dot_expr = expr_from_string("{acc} + {dot}", acc=acc, dot=dot_expr)
 
-    # On Pallas/TPU, keep matmul results in f32 for better numerical stability
-    # and to avoid unnecessary bf16 downcasts that hurt softmax-heavy patterns.
-    # The final output store handles the dtype conversion.
+    # Cast back if the result should be narrower than f32
     if need_f32_acc and out_dtype is not None and out_dtype.itemsize < 4:
         env = CompileEnvironment.current()
-        if env.backend.name != "pallas":
-            dtype_str = env.backend.dtype_str(out_dtype)
-            dot_expr = expr_from_string(
-                f"lax.convert_element_type({{val}}, {dtype_str})", val=dot_expr
-            )
+        dtype_str = env.backend.dtype_str(out_dtype)
+        dot_expr = expr_from_string(
+            f"lax.convert_element_type({{val}}, {dtype_str})", val=dot_expr
+        )
 
     return dot_expr
 
