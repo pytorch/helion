@@ -1027,6 +1027,12 @@ class GenerateASTFromInductor(DefaultHandler):
             result_str = result_str.replace("::", ".")
         return self._lift(expr_from_string(result_str))
 
+    def constant(self, value: object, dtype: torch.dtype) -> str:
+        env = CompileEnvironment.current()
+        if env.backend.name == "pallas" and dtype.itemsize < 4:
+            dtype = torch.float32
+        return self._default("constant", (value, dtype), {})
+
     def to_dtype(
         self,
         x: object,
@@ -1116,6 +1122,9 @@ class GenerateASTFromInductor(DefaultHandler):
         if name in self.cg.device_function._constexpr_args:
             return name
 
+        env = CompileEnvironment.current()
+        if env.backend.name == "pallas" and dtype.itemsize < 4:
+            dtype = torch.float32
         return self._lift(self._create_cast_expr(expr_from_string(name), dtype))
 
 
