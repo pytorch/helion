@@ -842,7 +842,10 @@ class ReductionLowering(InductorLowering):
         # Non-looped reductions compute the value inline; cast now to ensure the
         # result dtype matches torch.* semantics reflected in meta["val"].dtype.
         desired_dtype = node.meta["val"].dtype
-        return CompileEnvironment.current().backend.cast_ast(result_ast, desired_dtype)
+        env = CompileEnvironment.current()
+        if env.backend.name == "pallas" and desired_dtype.itemsize < 4:
+            return result_ast
+        return env.backend.cast_ast(result_ast, desired_dtype)
 
     def get_masked_value(self, node: torch.fx.Node) -> float | bool | None:
         # reduction types that preserve zeroness
@@ -1042,10 +1045,23 @@ class GenerateASTFromInductor(DefaultHandler):
     ) -> str:
         """Emit explicit backend cast to enforce final dtype conversion.
 
+        On Pallas/TPU, skip downcasts from f32 to sub-32-bit types to keep
+        intermediate computations in f32. The Pallas store codegen adds an
+        explicit cast when writing to an output ref with a different dtype.
+
         We avoid delegating to the parent handler to prevent reliance on global
         device context during compute-type selection, and to guarantee a visible
         cast in generated code that matches PyTorch's dtype semantics.
         """
+        env = CompileEnvironment.current()
+        if (
+            env.backend.name == "pallas"
+            and dtype.itemsize < 4
+            and src_dtype is not None
+            and src_dtype.itemsize >= 4
+        ):
+            x_ast = self._to_ast(x)
+            return self._lift(x_ast)
         cast_expr = self._create_cast_expr(x, dtype)
         return self._lift(cast_expr)
 
