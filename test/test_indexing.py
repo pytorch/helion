@@ -558,6 +558,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
         "Test requires high VRAM",
         required_bytes=_LARGE_BF16_REQUIRED_BYTES,
     )
+    @skipIfXPU("worker crash on XPU")
     def test_int32_offset_out_of_range_error(self):
         repro_config = helion.Config(
             block_sizes=[32, 32],
