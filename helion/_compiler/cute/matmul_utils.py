@@ -8,7 +8,12 @@ from typing import cast
 import sympy
 import torch
 
+from ...language.memory_ops import load
+from ..ast_extension import expr_from_string
+from ..ast_extension import statement_from_string
 from ..compile_environment import CompileEnvironment
+from ..dtype_utils import cast_ast
+from ..matmul_utils import _needs_f32_accumulator
 from .indexing import CutePackedAffineLoad
 from .indexing import CutePackedTerms
 from .indexing import match_cute_stack_reshape_rhs
@@ -16,6 +21,7 @@ from .indexing import match_cute_stack_reshape_rhs
 if TYPE_CHECKING:
     from collections.abc import Mapping
 
+    from ..aten_lowering import LoweringContext
     from ..helper_function import CodegenInterface
 
 
@@ -150,6 +156,233 @@ def cute_static_k_invariant_extent(
     if rhs_k_extent != k_extent:
         return None
     return k_extent
+
+
+def cute_static_serial_matmul_k_extent(
+    lhs_node: torch.fx.Node | None,
+    rhs_node: torch.fx.Node | None,
+) -> int | None:
+    def serial_extent(size: object) -> int | None:
+        if (extent := _cute_static_int_extent(size)) is not None:
+            return extent
+        if not CompileEnvironment.has_current():
+            return None
+        env = CompileEnvironment.current()
+        if not env.settings.static_shapes:
+            return None
+        size_hint = getattr(env, "size_hint", None)
+        if not callable(size_hint):
+            return None
+        hinted_size = size_hint(size)
+        return hinted_size if isinstance(hinted_size, int) else None
+
+    if lhs_node is None or rhs_node is None:
+        return None
+    lhs_val = lhs_node.meta.get("val")
+    rhs_val = rhs_node.meta.get("val")
+    if not isinstance(lhs_val, torch.Tensor) or not isinstance(rhs_val, torch.Tensor):
+        return None
+    if lhs_val.ndim != 2 or rhs_val.ndim != 2:
+        return None
+    k_extent = serial_extent(lhs_val.shape[-1])
+    if k_extent is None or k_extent <= 1:
+        return k_extent
+    rhs_k_extent = serial_extent(rhs_val.shape[-2])
+    if rhs_k_extent != k_extent:
+        return None
+    return k_extent
+
+
+def emit_cute_serial_scalar_mm_from_loads(
+    ctx: LoweringContext,
+    lhs_node: torch.fx.Node,
+    rhs_node: torch.fx.Node,
+    *,
+    k_extent: int | None,
+    out_dtype: torch.dtype | None,
+) -> ast.AST | None:
+    def active_index_var(block_id: int) -> str | None:
+        active_device_loops = getattr(ctx.cg, "active_device_loops", {})
+        loops = active_device_loops.get(block_id)
+        if loops:
+            return loops[-1].strategy.index_var(block_id)
+        grid_state = getattr(ctx.cg, "current_grid_state", None)
+        if grid_state is not None and block_id in grid_state.block_ids:
+            return grid_state.strategy.index_var(block_id)
+        return None
+
+    def active_mask_var(block_id: int) -> str | None:
+        active_device_loops = getattr(ctx.cg, "active_device_loops", {})
+        loops = active_device_loops.get(block_id)
+        if loops:
+            return loops[-1].strategy.mask_var(block_id)
+        grid_state = getattr(ctx.cg, "current_grid_state", None)
+        if grid_state is not None and block_id in grid_state.block_ids:
+            return grid_state.strategy.mask_var(block_id)
+        return None
+
+    def is_full_slice(index: object) -> bool:
+        return (
+            isinstance(index, slice)
+            and index.start is None
+            and index.stop is None
+            and index.step is None
+        )
+
+    def hinted_int(value: object) -> int | None:
+        if value is None:
+            return None
+        if isinstance(value, int):
+            return value
+        size_hint = getattr(CompileEnvironment.current(), "size_hint", None)
+        if callable(size_hint):
+            hinted = size_hint(value)
+            if isinstance(hinted, int):
+                return hinted
+        return None
+
+    def slice_offset(
+        index: object, *, required_extent: int | None = None
+    ) -> int | None:
+        if is_full_slice(index):
+            return 0
+        if not isinstance(index, slice):
+            return None
+        if index.step not in (None, 1):
+            return None
+        start = hinted_int(index.start) or 0
+        stop = hinted_int(index.stop)
+        if stop is None:
+            return None
+        if required_extent is not None and stop - start != required_extent:
+            return None
+        return start
+
+    def add_offset(index_expr: str, offset: int) -> str:
+        if offset == 0:
+            return index_expr
+        return f"({index_expr}) + {offset}"
+
+    def tensor_ast_and_dtype(source: object) -> tuple[ast.AST, torch.dtype] | None:
+        if isinstance(source, torch.Tensor):
+            return (
+                expr_from_string(ctx.cg.device_function.tensor_arg(source).name),
+                source.dtype,
+            )
+        if isinstance(source, torch.fx.Node):
+            val = source.meta.get("val")
+            if isinstance(val, torch.Tensor):
+                return (
+                    expr_from_string(ctx.cg.device_function.tensor_arg(val).name),
+                    val.dtype,
+                )
+        return None
+
+    if k_extent is None:
+        return None
+    if lhs_node.target is not load or rhs_node.target is not load:
+        return None
+    if len(lhs_node.args) < 2 or len(rhs_node.args) < 2:
+        return None
+
+    lhs_source = lhs_node.args[0]
+    rhs_source = rhs_node.args[0]
+    lhs_index = lhs_node.args[1]
+    rhs_index = rhs_node.args[1]
+    lhs_info = tensor_ast_and_dtype(lhs_source)
+    rhs_info = tensor_ast_and_dtype(rhs_source)
+    if lhs_info is None or rhs_info is None:
+        return None
+    lhs_tensor, lhs_dtype = lhs_info
+    rhs_tensor, rhs_dtype = rhs_info
+    if not isinstance(lhs_index, list) or not isinstance(rhs_index, list):
+        return None
+    if len(lhs_index) != 2 or len(rhs_index) != 2:
+        return None
+    lhs_k_offset = slice_offset(lhs_index[1], required_extent=k_extent)
+    rhs_k_offset = slice_offset(rhs_index[0], required_extent=k_extent)
+    rhs_n_offset = slice_offset(rhs_index[1])
+    if lhs_k_offset is None or rhs_k_offset is None or rhs_n_offset is None:
+        return None
+    lhs_k_offset_int = lhs_k_offset
+    rhs_k_offset_int = rhs_k_offset
+    rhs_n_offset_int = rhs_n_offset
+
+    m_block_id = cute_resolve_active_block_id(ctx.cg, lhs_node.meta["val"].shape[0])
+    n_block_id = cute_resolve_active_block_id(ctx.cg, rhs_node.meta["val"].shape[-1])
+    if m_block_id is None or n_block_id is None:
+        return None
+    m_index = active_index_var(m_block_id)
+    n_index = active_index_var(n_block_id)
+    if m_index is None or n_index is None:
+        return None
+    m_index_str = m_index
+    n_index_str = n_index
+    m_mask = active_mask_var(m_block_id)
+    n_mask = active_mask_var(n_block_id)
+    reduction_dtype = out_dtype
+    if _needs_f32_accumulator(lhs_dtype, rhs_dtype):
+        reduction_dtype = torch.float32
+    backend = CompileEnvironment.current().backend
+    result_var = ctx.cg.device_function.new_var("dot_serial_result")
+
+    def masked_scalar_load(
+        tensor_value: ast.AST,
+        row_expr: str,
+        col_expr: str,
+        *,
+        source_dtype: torch.dtype,
+        mask_expr: str | None,
+    ) -> ast.AST:
+        value = expr_from_string(
+            f"{{tensor}}[{row_expr}, {col_expr}]",
+            tensor=tensor_value,
+        )
+        if mask_expr is not None:
+            zero = expr_from_string(f"{backend.dtype_str(source_dtype)}(0)")
+            value = expr_from_string(
+                "({value} if {mask} else {zero})",
+                value=value,
+                mask=expr_from_string(mask_expr),
+                zero=zero,
+            )
+        if reduction_dtype is not None:
+            value = cast_ast(value, reduction_dtype)
+        return value
+
+    def term_at(k_expr: str) -> ast.AST:
+        lhs_value = masked_scalar_load(
+            lhs_tensor,
+            m_index_str,
+            add_offset(k_expr, lhs_k_offset_int),
+            source_dtype=lhs_dtype,
+            mask_expr=m_mask,
+        )
+        rhs_value = masked_scalar_load(
+            rhs_tensor,
+            add_offset(k_expr, rhs_k_offset_int),
+            add_offset(n_index_str, rhs_n_offset_int),
+            source_dtype=rhs_dtype,
+            mask_expr=n_mask,
+        )
+        return expr_from_string("{lhs} * {rhs}", lhs=lhs_value, rhs=rhs_value)
+
+    ctx.cg.add_statement(
+        statement_from_string(f"{result_var} = {{term}}", term=term_at("0"))
+    )
+    if k_extent > 1:
+        k_var = ctx.cg.device_function.new_var("serial_k")
+        ctx.cg.add_statement(
+            statement_from_string(
+                f"for {k_var} in range(1, {k_extent}):\n"
+                f"    {result_var} = {result_var} + {{term}}",
+                term=term_at(k_var),
+            )
+        )
+    result = expr_from_string(result_var)
+    if out_dtype is not None and reduction_dtype != out_dtype:
+        result = cast_ast(result, out_dtype)
+    return result
 
 
 def cute_outer_accumulates_result(

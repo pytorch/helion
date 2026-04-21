@@ -64,6 +64,8 @@ if TYPE_CHECKING:
 
     from .. import Config
     from .backend import InductorOpOverrides
+    from .cute.layout import MatmulAxisModel
+    from .cute.layout import MatmulExecutionPlan
     from .cute.layout import ThreadLayout
     from .device_function import DeviceFunction
     from .device_ir import GraphInfo
@@ -1146,6 +1148,39 @@ class GraphInterpreter(LoweringContext, Interpreter):
             return value
         raise TypeError(f"Unsupported value type for AST conversion: {type(value)}")
 
+    @property
+    def cute_layout(self) -> ThreadLayout | None:
+        if V.current_node is None:
+            return None
+        from .cute.layout_propagation import META_KEY
+
+        constraint = V.current_node.meta.get(META_KEY)
+        if constraint is None:
+            return None
+        return constraint.primary_layout()
+
+    @property
+    def cute_matmul_axes(self) -> MatmulAxisModel | None:
+        if V.current_node is None:
+            return None
+        from .cute.layout_propagation import META_KEY
+
+        constraint = V.current_node.meta.get(META_KEY)
+        if constraint is None:
+            return None
+        return constraint.matmul_axes
+
+    @property
+    def cute_matmul_plan(self) -> MatmulExecutionPlan | None:
+        if V.current_node is None:
+            return None
+        from .cute.layout_propagation import META_KEY
+
+        constraint = V.current_node.meta.get(META_KEY)
+        if constraint is None:
+            return None
+        return constraint.matmul_plan
+
     def _create_named_result(self, node: Node, result: ast.expr) -> str:
         """Create a named variable for a node result, handling block-size-only expressions as constexpr."""
         val = node.meta.get("val")
@@ -1399,3 +1434,27 @@ class CodegenState(NamedTuple):
         if constraint is None:
             return None
         return constraint.primary_layout()  # type: ignore[return-value]
+
+    @property
+    def cute_matmul_axes(self) -> MatmulAxisModel | None:
+        """Return the planner-owned CuTe matmul axis model for the current FX node."""
+        if self.fx_node is None:
+            return None
+        from .cute.layout_propagation import META_KEY
+
+        constraint = self.fx_node.meta.get(META_KEY)
+        if constraint is None:
+            return None
+        return constraint.matmul_axes
+
+    @property
+    def cute_matmul_plan(self) -> MatmulExecutionPlan | None:
+        """Return the planner-owned CuTe matmul execution plan for the node."""
+        if self.fx_node is None:
+            return None
+        from .cute.layout_propagation import META_KEY
+
+        constraint = self.fx_node.meta.get(META_KEY)
+        if constraint is None:
+            return None
+        return constraint.matmul_plan

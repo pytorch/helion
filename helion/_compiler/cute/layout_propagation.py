@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import logging
 from typing import TYPE_CHECKING
+from typing import Sequence
 
 import torch
 
@@ -23,8 +24,12 @@ from ... import exc
 from ...language import _tracing_ops
 from ...language import memory_ops
 from ...language import reduce_ops
+from ..compile_environment import CompileEnvironment
+from ..device_ir import RootGraphInfo
 from .layout import LayoutConstraint
 from .layout import LayoutTag
+from .layout import MatmulExecutionKind
+from .layout import MatmulExecutionPlan
 from .layout import ThreadLayout
 from .layout_rules import preferred_constraint_for_node
 
@@ -63,6 +68,7 @@ def plan_layouts(
     """
     for graph_info in graphs:
         _seed_constraints(graph_info, tile_strategy)
+        _plan_matmul_execution(graph_info, tile_strategy)
         _forward_propagate(graph_info)
         _backward_propagate(graph_info)
         _resolve_layouts(graph_info)
@@ -86,6 +92,185 @@ def _seed_constraints(
         constraint = preferred_constraint_for_node(node, graph_info, tile_strategy)
         if constraint is not None:
             node.meta[META_KEY] = constraint
+
+
+def _plan_matmul_execution(
+    graph_info: GraphInfo,
+    tile_strategy: TileStrategyDispatch,
+) -> None:
+    from ..host_function import HostFunction
+
+    if not isinstance(graph_info, RootGraphInfo):
+        return
+    device_ir = HostFunction.current().device_ir
+    if len(device_ir.grid_block_ids) != 1 or len(device_ir.grid_block_ids[0]) != 1:
+        return
+    (m_block_id,) = device_ir.grid_block_ids[0]
+    env = CompileEnvironment.current()
+    config = tile_strategy.strategies[0].fn.config
+    m_block_size = env.block_sizes[m_block_id].from_config(config)
+    if not isinstance(m_block_size, int) or m_block_size <= 0 or m_block_size % 16 != 0:
+        return
+    m_threads = tile_strategy.thread_extent_for_block_id(m_block_id)
+    if not isinstance(m_threads, int) or m_threads != m_block_size:
+        return
+    # The direct grouped-N MMA path currently owns the root-kernel thread-axis
+    # mapping, so only enable it for a dedicated single-mm root graph.
+    matmul_nodes = [
+        node
+        for node in graph_info.graph.nodes
+        if node.op == "call_function" and node.target is torch.ops.aten.mm.default
+    ]
+    if len(matmul_nodes) != 1:
+        return
+    if any(
+        node.op == "call_function" and node.target is reduce_ops._reduce
+        for node in graph_info.graph.nodes
+    ):
+        return
+
+    for node in matmul_nodes:
+        constraint = node.meta.get(META_KEY)
+        if (
+            constraint is None
+            or constraint.matmul_axes is None
+            or node.op != "call_function"
+            or node.target is not torch.ops.aten.mm.default
+            or len(node.args) < 2
+        ):
+            continue
+        lhs_node = node.args[0]
+        rhs_node = node.args[1]
+        if not isinstance(lhs_node, torch.fx.Node) or not isinstance(
+            rhs_node, torch.fx.Node
+        ):
+            continue
+        lhs_val = lhs_node.meta.get("val")
+        rhs_val = rhs_node.meta.get("val")
+        if not isinstance(lhs_val, torch.Tensor) or not isinstance(
+            rhs_val, torch.Tensor
+        ):
+            continue
+        if lhs_val.ndim != 2 or rhs_val.ndim != 2:
+            continue
+        if lhs_val.dtype not in (torch.float16, torch.bfloat16):
+            continue
+        if not _supports_direct_grouped_n_operands(lhs_node, rhs_node):
+            continue
+
+        scalar_block_id = _direct_grouped_n_scalar_block_id(
+            tile_strategy,
+            lhs_val,
+            rhs_val,
+            exclude_block_id=m_block_id,
+        )
+        if scalar_block_id is None:
+            continue
+        scalar_threads = tile_strategy.thread_extent_for_block_id(scalar_block_id)
+        if scalar_threads is None or scalar_threads < 8 or scalar_threads % 8 != 0:
+            continue
+        m_strategy = tile_strategy.block_id_to_strategy.get_any(m_block_id)
+        scalar_strategy = tile_strategy.block_id_to_strategy.get((scalar_block_id,))
+        if m_strategy is None or scalar_strategy is None:
+            continue
+        lane_extent = getattr(scalar_strategy, "_synthetic_cute_lane_extent", 1)
+        if not isinstance(lane_extent, int) or lane_extent <= 0:
+            lane_extent = 1
+        size_hint = getattr(env, "size_hint", None)
+        n_extent = (
+            size_hint(rhs_val.shape[1]) if callable(size_hint) else rhs_val.shape[1]
+        )
+        if not isinstance(n_extent, int):
+            continue
+        if scalar_threads * lane_extent < n_extent:
+            continue
+
+        constraint.matmul_plan = MatmulExecutionPlan(
+            kind=MatmulExecutionKind.DIRECT_GROUPED_N,
+            m_block_id=m_block_id,
+            scalar_block_id=scalar_block_id,
+            bm=m_block_size,
+            bn=8,
+            bk=16,
+            groups_per_lane=scalar_threads // 8,
+            lane_extent=lane_extent,
+        )
+        m_strategy._cute_thread_axis_priority = 0
+        scalar_strategy._cute_thread_axis_priority = 1
+        m_strategy._cute_disable_reduction_axis_reservation = True
+        scalar_strategy._cute_disable_reduction_axis_reservation = True
+
+
+def _supports_direct_grouped_n_operands(
+    lhs_node: torch.fx.Node, rhs_node: torch.fx.Node
+) -> bool:
+    def is_full_slice(index: object) -> bool:
+        return (
+            isinstance(index, slice)
+            and index.start is None
+            and index.stop is None
+            and index.step is None
+        )
+
+    def load_indices(node: torch.fx.Node) -> Sequence[object] | None:
+        if node.op != "call_function" or node.target is not memory_ops.load:
+            return None
+        if len(node.args) < 2:
+            return None
+        index = node.args[1]
+        return index if isinstance(index, list) else None
+
+    lhs_index = load_indices(lhs_node)
+    rhs_index = load_indices(rhs_node)
+    if lhs_index is None or rhs_index is None:
+        return False
+    if len(lhs_index) != 2 or len(rhs_index) != 2:
+        return False
+    return (
+        is_full_slice(lhs_index[1])
+        and is_full_slice(rhs_index[0])
+        and is_full_slice(rhs_index[1])
+    )
+
+
+def _direct_grouped_n_scalar_block_id(
+    tile_strategy: TileStrategyDispatch,
+    lhs_val: torch.Tensor,
+    rhs_val: torch.Tensor,
+    *,
+    exclude_block_id: int,
+) -> int | None:
+    from ..reduction_strategy import PersistentReductionStrategy
+
+    env = CompileEnvironment.current()
+
+    def hinted_equal(lhs: int | torch.SymInt, rhs: int | torch.SymInt) -> bool:
+        if env.known_equal(lhs, rhs):
+            return True
+        size_hint = getattr(env, "size_hint", None)
+        if not callable(size_hint):
+            return False
+        hinted_lhs = size_hint(lhs)
+        hinted_rhs = size_hint(rhs)
+        return isinstance(hinted_lhs, int) and hinted_lhs == hinted_rhs
+
+    candidates: list[int] = []
+    for strategy in tile_strategy.strategies:
+        if not isinstance(strategy, PersistentReductionStrategy):
+            continue
+        block_id = strategy.block_index
+        if block_id == exclude_block_id:
+            continue
+        size = env.block_sizes[block_id].size
+        if not isinstance(size, int | torch.SymInt):
+            continue
+        if hinted_equal(size, lhs_val.shape[1]) and hinted_equal(
+            size, rhs_val.shape[1]
+        ):
+            candidates.append(block_id)
+    if len(candidates) != 1:
+        return None
+    return candidates[0]
 
 
 # ---------------------------------------------------------------------------
@@ -278,6 +463,20 @@ def _validate_layout_contracts(graph_info: GraphInfo) -> None:
                 # producer layouts, so a missed relayout here is not fatal.
                 continue
             consumer_layout = user_lc.input_layout
+            if (
+                producer_layout.tag is LayoutTag.MMA_ACCUMULATOR
+                and node.op == "call_function"
+                and node.target
+                in {
+                    torch.ops.aten.mm.default,
+                    torch.ops.aten.addmm.default,
+                    torch.ops.aten.baddbmm.default,
+                }
+            ):
+                # Matmul nodes may lower through a fused MMA epilogue or the
+                # scalar fallback, both of which own the accumulator transition
+                # directly instead of requiring an explicit relayout node.
+                continue
             if producer_layout.is_compatible(consumer_layout):
                 continue
             raise exc.BackendUnsupported(

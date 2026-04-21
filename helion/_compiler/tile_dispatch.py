@@ -212,6 +212,17 @@ class TileStrategyDispatch:
         For CuTe, reduction strategies must come first (axis 0) so that
         reduction threads are within the same warp for warp-level reductions.
         """
+        priorities = [strategy._cute_thread_axis_priority for strategy in branch]
+        if any(isinstance(priority, int) for priority in priorities):
+            return sorted(
+                branch,
+                key=lambda strategy: (
+                    strategy._cute_thread_axis_priority
+                    if strategy._cute_thread_axis_priority is not None
+                    else 1 << 30,
+                    self.strategies.index(strategy),
+                ),
+            )
         env = CompileEnvironment.current()
         if not env.backend.reduction_axis_first():
             return branch

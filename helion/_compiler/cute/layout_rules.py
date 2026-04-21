@@ -17,6 +17,8 @@ from ...language import reduce_ops
 from ..compile_environment import CompileEnvironment
 from .layout import LayoutConstraint
 from .layout import LayoutTag
+from .layout import MatmulAxisModel
+from .layout import MatmulOperandAxes
 from .layout import ThreadLayout
 
 if TYPE_CHECKING:
@@ -63,6 +65,13 @@ def preferred_constraint_for_node(
         return _constraint_for_store(node, tile_strategy)
     if node.target is reduce_ops._reduce:
         return _constraint_for_reduce(node, tile_strategy)
+    if node.target in {
+        torch.ops.aten.mm.default,
+        torch.ops.aten.addmm.default,
+        torch.ops.aten.bmm.default,
+        torch.ops.aten.baddbmm.default,
+    }:
+        return _constraint_for_matmul(node, tile_strategy)
     if _tracing_ops.is_for_loop_target(node.target):
         return None  # control flow -- handled at graph level
     # Pointwise / aten ops: unconstrained, inherit from inputs
@@ -79,6 +88,8 @@ def _constraint_for_load(
     tile_strategy: TileStrategyDispatch,
 ) -> LayoutConstraint | None:
     """Loads prefer coalesced access: threads along the contiguous dim."""
+    if operand_layout := _matmul_operand_layout(node, tile_strategy):
+        return LayoutConstraint(preferred_output=operand_layout)
     layout = _layout_from_tensor_strides(
         node, tile_strategy=tile_strategy, tag=LayoutTag.COALESCED
     )
@@ -188,6 +199,51 @@ def _constraint_for_reduce(
     return LayoutConstraint(preferred_input=layout)
 
 
+def _constraint_for_matmul(
+    node: torch.fx.Node,
+    tile_strategy: TileStrategyDispatch,
+) -> LayoutConstraint | None:
+    val = node.meta.get("val")
+    if not isinstance(val, torch.Tensor) or val.ndim < 2:
+        return None
+    layout = ThreadLayout.make_row_major(
+        val.shape[-2],
+        val.shape[-1],
+        num_threads=_clamp_threads(
+            val.shape[-1], _total_threads_from_strategy(tile_strategy)
+        )
+        if isinstance(val.shape[-1], int)
+        else _total_threads_from_strategy(tile_strategy),
+        tag=LayoutTag.MMA_ACCUMULATOR,
+    )
+    return LayoutConstraint(
+        preferred_output=layout,
+        matmul_axes=_matmul_axis_model(node),
+    )
+
+
+def _matmul_axis_model(node: torch.fx.Node) -> MatmulAxisModel | None:
+    if node.target in {
+        torch.ops.aten.mm.default,
+        torch.ops.aten.addmm.default,
+    }:
+        return MatmulAxisModel(
+            lhs=MatmulOperandAxes(m_dim=0, k_dim=1),
+            rhs=MatmulOperandAxes(n_dim=1, k_dim=0),
+            out=MatmulOperandAxes(m_dim=0, n_dim=1),
+        )
+    if node.target in {
+        torch.ops.aten.bmm.default,
+        torch.ops.aten.baddbmm.default,
+    }:
+        return MatmulAxisModel(
+            lhs=MatmulOperandAxes(m_dim=-2, k_dim=-1),
+            rhs=MatmulOperandAxes(n_dim=-1, k_dim=-2),
+            out=MatmulOperandAxes(m_dim=-2, n_dim=-1),
+        )
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -238,6 +294,71 @@ def _resolve_subscript_val(k: object) -> object:
     if isinstance(k, torch.fx.Node):
         return k.meta.get("val")
     return k
+
+
+def _matmul_operand_layout(
+    node: torch.fx.Node,
+    tile_strategy: TileStrategyDispatch,
+) -> ThreadLayout | None:
+    if len(node.users) != 1:
+        return None
+    (user,) = tuple(node.users)
+    if user.op != "call_function":
+        return None
+    if user.target not in {
+        torch.ops.aten.mm.default,
+        torch.ops.aten.addmm.default,
+        torch.ops.aten.bmm.default,
+        torch.ops.aten.baddbmm.default,
+    }:
+        return None
+    tensor = node.meta.get("val")
+    if not isinstance(tensor, torch.Tensor) or tensor.ndim != 2:
+        return None
+    if len(user.args) < 2:
+        return None
+    lhs_arg = (
+        user.args[1]
+        if user.target
+        in {
+            torch.ops.aten.addmm.default,
+            torch.ops.aten.baddbmm.default,
+        }
+        else user.args[0]
+    )
+    rhs_arg = (
+        user.args[2]
+        if user.target
+        in {
+            torch.ops.aten.addmm.default,
+            torch.ops.aten.baddbmm.default,
+        }
+        else user.args[1]
+    )
+    num_threads = _total_threads_from_strategy(tile_strategy)
+    if user.target in {
+        torch.ops.aten.mm.default,
+        torch.ops.aten.addmm.default,
+    }:
+        if node is lhs_arg:
+            return ThreadLayout.make_row_major(
+                tensor.shape[0],
+                tensor.shape[1],
+                num_threads=_clamp_threads(tensor.shape[1], num_threads)
+                if isinstance(tensor.shape[1], int)
+                else num_threads,
+                tag=LayoutTag.MMA_OPERAND_A,
+            )
+        if node is rhs_arg:
+            return ThreadLayout.make_row_major(
+                tensor.shape[1],
+                tensor.shape[0],
+                num_threads=_clamp_threads(tensor.shape[0], num_threads)
+                if isinstance(tensor.shape[0], int)
+                else num_threads,
+                tag=LayoutTag.MMA_OPERAND_B,
+            )
+    return None
 
 
 def _is_active_tile_dim(val: object, env: CompileEnvironment) -> bool:
