@@ -1332,6 +1332,23 @@ class PallasBackend(Backend):
                         # https://github.com/jax-ml/jax/issues/36970
                         analyzer.maybe_update_required_alignment(bid, 2)
 
+                # Update alignment from 'shape'; it's possible that the AST visitor
+                # would otherwise not be able to see this shape, for example when it
+                # comes from a lambda.
+                tensor_ndim = len(shape)
+                for d, dim_expr in enumerate(shape):
+                    for info in block_sizes:
+                        if not isinstance(info, BlockSizeInfo):
+                            continue
+                        if info.dim_matches(dim_expr):
+                            dim_from_end = tensor_ndim - 1 - d
+                            required_alignment = self._get_pallas_required_alignment(
+                                dim_from_end, tensor_ndim, min_element_bits
+                            )
+                            analyzer.maybe_update_required_alignment(
+                                info.block_id, required_alignment
+                            )
+
         for spec in block_specs:
             if not isinstance(spec, BlockSizeSpec):
                 continue
