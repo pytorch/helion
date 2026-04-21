@@ -731,6 +731,33 @@ def generate_ast(
             kernel_def = codegen.device_function.codegen_function_def()
             codegen.host_dead_code_elimination()
 
+            # Wrap output-only tensor allocations in FakeTensorMode()
+            # so they don't allocate real HBM. The launcher returns
+            # the real tensors, reassigning the variables.
+            output_only_names = getattr(
+                CompileEnvironment.current().backend, "_output_only_names", []
+            )
+            if output_only_names:
+                oo_set = set(output_only_names)
+                new_stmts: list[ast.AST] = []
+                for stmt in codegen.host_statements:
+                    if (
+                        isinstance(stmt, ast.Assign)
+                        and len(stmt.targets) == 1
+                        and isinstance(stmt.targets[0], ast.Name)
+                        and stmt.targets[0].id in oo_set
+                        and not getattr(stmt, "_is_kernel_call", False)
+                    ):
+                        with_stmt = statement_from_string(
+                            "with FakeTensorMode(allow_non_fake_inputs=True): pass"
+                        )
+                        assert isinstance(with_stmt, ast.With)
+                        with_stmt.body = [stmt]
+                        new_stmts.append(with_stmt)
+                    else:
+                        new_stmts.append(stmt)
+                codegen.host_statements = new_stmts
+
             # Inject RNG seed buffer creation if needed
             rng_statements = (
                 codegen.get_rng_seed_buffer_statements()

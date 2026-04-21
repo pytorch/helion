@@ -673,7 +673,7 @@ class _PallasInterpretCallable:
     2. Runs the pallas_call function
     3. For inplace outputs (donated tensors): copies JAX results back into
        the original torch tensors via ``copy_()``
-    4. Returns raw JAX results so ``_pallas_invoke_and_copy_back`` can
+    4. Returns raw JAX results so ``_pallas_invoke_and_return`` can
        handle output-only tensors (which are not in the input list)
 
     ``inplace_output_mapping`` maps each inplace output to its JAX result:
@@ -702,7 +702,7 @@ class _PallasInterpretCallable:
             )
             out_tensor.copy_(result_data)
         # Return JAX results so output-only tensors can be handled
-        # by _pallas_invoke_and_copy_back.
+        # by _pallas_invoke_and_return.
         return tuple(jax_results)
 
 
@@ -734,41 +734,44 @@ def _ensure_cpu_tpu_info() -> None:
         registry["cpu"] = lambda: _get_tpu_info_impl(ChipVersion.TPU_7X, 1)
 
 
-def _pallas_invoke_and_copy_back(
+def _pallas_invoke_and_return(
     jax_callable: object,
     args: tuple[object, ...],
     tensor_arg_indices: list[int],
     arg_to_tensor_pos: dict[int, int],
     _output_indices: list[int],
-) -> None:
-    """Run the JaxCallable and handle output-only results.
+) -> object:
+    """Run the JaxCallable and return output-only results.
 
     Output-only tensors (those not in ``arg_to_tensor_pos``) are not passed
-    as pallas_call inputs, so the JaxCallable returns them.
+    as pallas_call inputs, so the JaxCallable returns new buffers for them.
+    Returns a single tensor, a tuple of tensors, or None.
     """
     input_tensors = [
         cast("torch.Tensor", args[i]).contiguous() for i in tensor_arg_indices
     ]
     results = jax_callable(*input_tensors)  # type: ignore[operator]
     if results is None:
-        return
+        return None
     if not isinstance(results, (tuple, list)):
         results = (results,)
+    output_only_results = []
     for out_idx, orig_pos in enumerate(_output_indices):
         if orig_pos not in arg_to_tensor_pos:
-            out_tensor = cast("torch.Tensor", args[orig_pos])
             result = results[out_idx]
             if not isinstance(result, torch.Tensor):
                 # Interpret mode: pallas_call returns JAX arrays, convert to torch.
                 # On TPU, JaxCallable returns torch tensors directly.
+                out_tensor = cast("torch.Tensor", args[orig_pos])
                 result = _jax_to_torch(
                     result,
                     device=out_tensor.device,
                     dtype=out_tensor.dtype,
                 )
-            # Swap the pre-allocated tensor's storage with the result
-            # (zero-copy) instead of copying data.
-            out_tensor.set_(result)  # pyrefly: ignore[no-matching-overload]
+            output_only_results.append(result)
+    if len(output_only_results) == 1:
+        return output_only_results[0]
+    return tuple(output_only_results) if output_only_results else None
 
 
 def default_pallas_launcher(
@@ -780,7 +783,7 @@ def default_pallas_launcher(
     _block_spec_info: _BlockSpecInfo | None = None,
     _smem_arg_indices: list[int] | None = None,
     **kwargs: object,
-) -> None:
+) -> object:
     """Default launcher for Pallas kernels on TPU (or CPU with interpret=True).
 
     Uses ``JaxCallable`` from ``torch_tpu`` to compile and run the Pallas
@@ -893,7 +896,7 @@ def default_pallas_launcher(
             cache_attr="_pallas_cache",
         )
 
-    _pallas_invoke_and_copy_back(
+    return _pallas_invoke_and_return(
         jax_callable, args, tensor_arg_indices, arg_to_tensor_pos, _output_indices
     )
 
@@ -908,7 +911,7 @@ def default_pallas_pipeline_launcher(
     _scratch_shapes: list[tuple[tuple[int, ...], str]] | None = None,
     _pipeline_arg_indices: list[int] | None = None,
     **kwargs: object,
-) -> None:
+) -> object:
     """Launcher for Pallas kernels using PrefetchScalarGridSpec with scratch memory.
 
     Used when ``pallas_loop_type='emit_pipeline'``.  Pipeline-body tensors
@@ -1045,7 +1048,7 @@ def default_pallas_pipeline_launcher(
             trace_key_suffix="_pipeline",
         )
 
-    _pallas_invoke_and_copy_back(
+    return _pallas_invoke_and_return(
         jax_callable, args, tensor_arg_indices, arg_to_tensor_pos, _output_indices
     )
 
@@ -1059,7 +1062,7 @@ def default_pallas_fori_launcher(
     _block_spec_info: _BlockSpecInfo | None = None,
     _scratch_shapes: list[tuple[tuple[int, ...], str | None, str]] | None = None,
     **kwargs: object,
-) -> None:
+) -> object:
     """Launcher for Pallas kernels using fori_loop with manual DMA.
 
     Used when ``pallas_loop_type="fori_loop"``.  Passes all tensors as
@@ -1197,7 +1200,7 @@ def default_pallas_fori_launcher(
             trace_key_suffix="_fori",
         )
 
-    _pallas_invoke_and_copy_back(
+    return _pallas_invoke_and_return(
         jax_callable, args, tensor_arg_indices, arg_to_tensor_pos, _output_indices
     )
 
