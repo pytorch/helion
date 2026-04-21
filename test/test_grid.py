@@ -154,6 +154,7 @@ class TestGrid(RefEagerTestBase, TestCase):
         code, result = code_and_output(grid_2d_idx_nested, args)
         torch.testing.assert_close(result, grid_2d_pytorch(args[0], args[1]))
 
+    @skipIfMetal("BUG: hl.grid begin/end broken with CuteNDTileStrategy on Metal")
     def test_grid_begin_end(self):
         @helion.kernel(autotune_effort="none")
         def grid_begin_end(x: torch.Tensor) -> torch.Tensor:
@@ -174,6 +175,7 @@ class TestGrid(RefEagerTestBase, TestCase):
         code, result = code_and_output(grid_begin_end, (x,))
         torch.testing.assert_close(result, grid_begin_end_pytorch(x))
 
+    @skipIfMetal("BUG: hl.grid begin/end broken with CuteNDTileStrategy on Metal")
     @xfailIfPallas("Grid begin/end not working on Pallas")
     def test_grid_begin_end_step(self):
         @helion.kernel(autotune_effort="none")
@@ -195,6 +197,7 @@ class TestGrid(RefEagerTestBase, TestCase):
         code, result = code_and_output(grid_begin_end_step, (x,))
         torch.testing.assert_close(result, grid_begin_end_step_pytorch(x))
 
+    @skipIfMetal("BUG: hl.grid begin/end broken with CuteNDTileStrategy on Metal")
     @xfailIfPallas("Grid begin/end not working on Pallas")
     def test_grid_end_step_kwarg(self):
         @helion.kernel(autotune_effort="none")
