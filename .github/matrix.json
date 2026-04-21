@@ -103,7 +103,7 @@
       "alias": "xpu",
       "backend": "triton",
       "triton-repo": "https://github.com/intel/intel-xpu-backend-for-triton.git",
-      "triton-pin": "main"
+      "triton-pin": "8997b14d4d6580c401c842ea4fded92cdf7adaa8"
     },
     {
       "runner": "linux.rocm.gpu.ecosystem.gfx950.1",
