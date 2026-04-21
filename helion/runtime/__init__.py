@@ -1068,6 +1068,7 @@ def default_pallas_fori_launcher(
         )
 
         _fori_pipeline_set = set(_fori_pipeline_indices or [])  # type: ignore[arg-type]
+        _fori_skip_copy = _fori_pipeline_set | set(_output_indices)
         reordered_kernel = _pallas_make_reordered_kernel(
             pallas_kernel,
             args,
@@ -1078,7 +1079,7 @@ def default_pallas_fori_launcher(
             inplace_positions,
             arg_to_tensor_pos,
             n_extra_refs=len(scratch_shapes),
-            skip_inplace_copy=_fori_pipeline_set,
+            skip_inplace_copy=_fori_skip_copy,
         )
 
         out_shape_arg = out_shapes if len(out_shapes) > 1 else out_shapes[0]
