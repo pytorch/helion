@@ -778,6 +778,41 @@ class TestPallas(TestCase):
         expected = x.permute(0, 2, 1)
         torch.testing.assert_close(result, expected)
 
+    def test_tile_index_with_symbolic_offset(self) -> None:
+        """tile.index + tile.begin * constant should codegen valid variable names.
+
+        The offset in TileIndexWithOffsetPattern can be a sympy expression
+        (e.g. tile_chunk.begin * chunk_size). The codegen must use literal_expr()
+        to translate sympy symbols to their codegen variable names, otherwise
+        the generated code contains undefined variables like 'u8'.
+
+        Pattern from mamba2_chunk_state: iterates over chunks of rows, and
+        within each chunk uses tile_k.index + tile_chunk.begin * chunk_size
+        to compute the global row index.
+        """
+
+        @helion.kernel(
+            backend="pallas",
+            static_shapes=True,
+        )
+        def chunked_add(x: torch.Tensor) -> torch.Tensor:
+            nrows, ncols = x.shape
+            chunk_size = 64
+            nchunks = nrows // chunk_size
+            out = torch.empty_like(x)
+            for tile_col, tile_chunk in hl.tile([ncols, nchunks], block_size=[None, 1]):
+                for tile_k in hl.tile(chunk_size, block_size=64):
+                    # global_row = local_row_within_chunk + chunk_start
+                    row = tile_k.index + tile_chunk.begin * chunk_size
+                    out[row, tile_col] = x[row, tile_col] + 1.0
+            return out
+
+        # 4 chunks of 64 rows, 128 columns
+        x = torch.randn(256, 128, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(chunked_add, (x,), block_sizes=[128])
+        expected = x + 1.0
+        torch.testing.assert_close(result, expected)
+
     def test_scalar_access_hl_grid(self) -> None:
         @helion.kernel(backend="pallas", static_shapes=True, config=helion.Config())
         def fn(x: torch.Tensor) -> torch.Tensor:

@@ -350,7 +350,7 @@ def _pallas_tile_index_with_offset_pattern_code(
     assert isinstance(pattern, TileIndexWithOffsetPattern)
 
     block_id = pattern.block_id
-    offset_str = f"{pattern.offset}"
+    offset_str = state.device_function.literal_expr(pattern.offset)
     return _pallas_ds_expr(state, block_id, offset_str)
 
 
