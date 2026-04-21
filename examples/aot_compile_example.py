@@ -27,12 +27,13 @@ The standalone file is a drop-in replacement::
 from __future__ import annotations
 
 import argparse
+from functools import partial
 import os
 
 import torch
-from triton.testing import do_bench
 
 from helion._testing import DEVICE
+from helion._testing import do_bench
 import helion.experimental
 import helion.language as hl
 
@@ -64,10 +65,10 @@ def benchmark_add_2d() -> None:
     print(f"{'Shape':>16} {'Time (ms)':>12} {'GB/s':>10}")
     print("-" * 40)
     for m, n in shapes:
-        x = torch.randn(m, n, device=DEVICE, dtype=torch.float16)
-        y = torch.randn(m, n, device=DEVICE, dtype=torch.float16)
+        x = torch.randn(m, n, device=DEVICE, dtype=torch.bfloat16)
+        y = torch.randn(m, n, device=DEVICE, dtype=torch.bfloat16)
         add_2d(x, y)  # warmup
-        time_ms = do_bench(lambda x=x, y=y: add_2d(x, y))
+        time_ms = do_bench(partial(add_2d, x, y))
         assert isinstance(time_ms, float)
         total_bytes = x.numel() * x.element_size() * 3  # 2 reads + 1 write
         gbps = total_bytes / time_ms * 1e-6

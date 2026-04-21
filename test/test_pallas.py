@@ -778,6 +778,41 @@ class TestPallas(TestCase):
         expected = x.permute(0, 2, 1)
         torch.testing.assert_close(result, expected)
 
+    def test_tile_index_with_symbolic_offset(self) -> None:
+        """tile.index + tile.begin * constant should codegen valid variable names.
+
+        The offset in TileIndexWithOffsetPattern can be a sympy expression
+        (e.g. tile_chunk.begin * chunk_size). The codegen must use literal_expr()
+        to translate sympy symbols to their codegen variable names, otherwise
+        the generated code contains undefined variables like 'u8'.
+
+        Pattern from mamba2_chunk_state: iterates over chunks of rows, and
+        within each chunk uses tile_k.index + tile_chunk.begin * chunk_size
+        to compute the global row index.
+        """
+
+        @helion.kernel(
+            backend="pallas",
+            static_shapes=True,
+        )
+        def chunked_add(x: torch.Tensor) -> torch.Tensor:
+            nrows, ncols = x.shape
+            chunk_size = 64
+            nchunks = nrows // chunk_size
+            out = torch.empty_like(x)
+            for tile_col, tile_chunk in hl.tile([ncols, nchunks], block_size=[None, 1]):
+                for tile_k in hl.tile(chunk_size, block_size=64):
+                    # global_row = local_row_within_chunk + chunk_start
+                    row = tile_k.index + tile_chunk.begin * chunk_size
+                    out[row, tile_col] = x[row, tile_col] + 1.0
+            return out
+
+        # 4 chunks of 64 rows, 128 columns
+        x = torch.randn(256, 128, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(chunked_add, (x,), block_sizes=[128])
+        expected = x + 1.0
+        torch.testing.assert_close(result, expected)
+
     def test_scalar_access_hl_grid(self) -> None:
         @helion.kernel(backend="pallas", static_shapes=True, config=helion.Config())
         def fn(x: torch.Tensor) -> torch.Tensor:
@@ -918,8 +953,8 @@ class TestPallas(TestCase):
         # excluded from pallas_call inputs (no donation, no graph split).
         self.assertIn("_output_indices=[1]", code)
         self.assertIn("_inplace_indices=[]", code)
-        # Output-only allocation wrapped in FakeTensorMode (no real HBM).
-        self.assertIn("FakeTensorMode", code)
+        # Output-only allocation retargeted to device='meta' (no real HBM).
+        self.assertIn("device='meta'", code)
         # Launcher return captured into output variable.
         self.assertIn("out = _launcher(", code)
 
@@ -937,7 +972,7 @@ class TestPallas(TestCase):
         code, result = code_and_output(new_empty_relu, (x,), block_sizes=[1024])
         torch.testing.assert_close(result, torch.relu(x))
         self.assertIn("_inplace_indices=[]", code)
-        self.assertIn("FakeTensorMode", code)
+        self.assertIn("device='meta'", code)
         self.assertIn("out = _launcher(", code)
 
     def test_mixed_inplace_and_output_only(self) -> None:
@@ -963,7 +998,7 @@ class TestPallas(TestCase):
         # out is excluded from pallas_call inputs.
         self.assertIn("_output_indices=[0, 1]", code)
         self.assertIn("_inplace_indices=[0]", code)
-        self.assertIn("FakeTensorMode", code)
+        self.assertIn("device='meta'", code)
         self.assertIn("out = _launcher(", code)
 
     def test_empty_like_read_stays_inplace(self) -> None:
@@ -982,8 +1017,8 @@ class TestPallas(TestCase):
         torch.testing.assert_close(result, x + 1.0)
         # out is read after write, so it must be in _inplace_indices
         self.assertIn("_inplace_indices=[1]", code)
-        # Not output-only, so no FakeTensorMode wrapping.
-        self.assertNotIn("FakeTensorMode", code)
+        # Not output-only, so no device='meta' retargeting.
+        self.assertNotIn("device='meta'", code)
 
     def test_int64_tensor_raises(self) -> None:
         """Passing int64 tensors to a Pallas kernel should raise TypeError."""
@@ -1013,7 +1048,7 @@ class TestPallas(TestCase):
         # Both outputs are output-only: 2 outputs, 0 aliases
         self.assertIn("_output_indices=[1, 2]", code)
         self.assertIn("_inplace_indices=[]", code)
-        self.assertIn("FakeTensorMode", code)
+        self.assertIn("device='meta'", code)
         self.assertIn("out1, out2 = _launcher(", code)
 
     def test_fori_loop_multidim(self) -> None:

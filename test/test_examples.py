@@ -2234,7 +2234,7 @@ class TestExamples(RefEagerTestBase, TestCase):
         lambda: _get_backend() == "cute",
         "CuTe Mamba2 chunk-state destabilizes later cute tests when it fails in-process",
     )
-    @xfailIfPallas("BlockSpec tiling failure")
+    @xfailIfPallas("SMEM load lowering: Can only load scalars from SMEM")
     def test_mamba2_chunk_state(self):
         batch, nheads, ngroups, seqlen, chunk_size, headdim, dstate = (
             2,
@@ -2323,6 +2323,90 @@ class TestExamples(RefEagerTestBase, TestCase):
             fn_name="helion_mamba2_chunk_scan_kernel",
             atol=0.1,
             rtol=0.1,
+        )
+
+    @skipIfRocm("failure on rocm")
+    @skipIfA10G("failure on a10g")
+    @skipIfCudaCapabilityLessThan((9, 0), reason="se_block requires H100+")
+    def test_se_block_fwd(self):
+        m, n = 128, 128
+        x = torch.randn([m, n], device=DEVICE, dtype=torch.bfloat16)
+        w = torch.randn([n, n], device=DEVICE, dtype=torch.bfloat16)
+
+        # Compute expected output with PyTorch
+        expected = 2 * x * torch.sigmoid(x @ w)
+
+        args = (x, w)
+
+        check_example(
+            "se_block",
+            args,
+            (expected, None),  # (output, sigmoid)
+            fn_name="se_block_fwd",
+            block_sizes=[32],
+            num_warps=4,
+            num_stages=3,
+        )
+
+    @skipIfRocm("failure on rocm")
+    @skipIfA10G("failure on a10g")
+    @skipIfCudaCapabilityLessThan((9, 0), reason="se_block requires H100+")
+    def test_se_block_bwd_dx(self):
+        m, n = 128, 128
+        x = torch.randn([m, n], device=DEVICE, dtype=torch.float16, requires_grad=True)
+        w = torch.randn([n, n], device=DEVICE, dtype=torch.float16, requires_grad=True)
+        grad_out = torch.randn([m, n], device=DEVICE, dtype=torch.float16)
+
+        # Compute expected gradients with PyTorch
+        x_torch = x.detach().clone().requires_grad_(True)
+        w_torch = w.detach().clone().requires_grad_(True)
+        out_torch = 2 * x_torch * torch.sigmoid(x_torch @ w_torch)
+        out_torch.backward(grad_out)
+
+        # Compute sigmoid values using PyTorch reference
+        s = torch.sigmoid(x @ w)
+
+        args = (grad_out, x, w, s)
+
+        check_example(
+            "se_block",
+            args,
+            x_torch.grad,
+            fn_name="se_block_bwd_dx",
+            block_sizes=[32, 32, 32],
+            num_warps=4,
+            num_stages=3,
+        )
+
+    @skipIfRocm("failure on rocm")
+    @skipIfA10G("failure on a10g")
+    @skipIfCudaCapabilityLessThan((9, 0), reason="se_block requires H100+")
+    def test_se_block_bwd_dw(self):
+        m, n = 128, 128
+        x = torch.randn([m, n], device=DEVICE, dtype=torch.float16, requires_grad=True)
+        w = torch.randn([n, n], device=DEVICE, dtype=torch.float16, requires_grad=True)
+        grad_out = torch.randn([m, n], device=DEVICE, dtype=torch.float16)
+
+        # Compute expected gradients with PyTorch
+        x_torch = x.detach().clone().requires_grad_(True)
+        w_torch = w.detach().clone().requires_grad_(True)
+        out_torch = 2 * x_torch * torch.sigmoid(x_torch @ w_torch)
+        out_torch.backward(grad_out)
+
+        # Compute sigmoid values using PyTorch reference
+        s = torch.sigmoid(x @ w)
+
+        args = (grad_out, x, s)
+
+        check_example(
+            "se_block",
+            args,
+            w_torch.grad,
+            fn_name="se_block_bwd_dw",
+            block_sizes=[32, 32, 32],
+            num_warps=4,
+            num_stages=3,
+            rtol=1e-2,
         )
 
 

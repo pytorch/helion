@@ -763,9 +763,15 @@ def _pallas_invoke_and_return(
                 # Interpret mode: pallas_call returns JAX arrays, convert to torch.
                 # On TPU, JaxCallable returns torch tensors directly.
                 out_tensor = cast("torch.Tensor", args[orig_pos])
+                # Output-only tensors are allocated with ``device='meta'`` to
+                # avoid HBM; fall back to the first real input's device in
+                # interpret mode so the converted tensor lands somewhere real.
+                device = out_tensor.device
+                if device.type == "meta" and tensor_arg_indices:
+                    device = cast("torch.Tensor", args[tensor_arg_indices[0]]).device
                 result = _jax_to_torch(
                     result,
-                    device=out_tensor.device,
+                    device=device,
                     dtype=out_tensor.dtype,
                 )
             output_only_results.append(result)
