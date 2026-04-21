@@ -235,6 +235,19 @@ def pallas_two_pass_reduction(x: torch.Tensor) -> torch.Tensor:
 
 
 @helion.kernel(backend="pallas", static_shapes=True)
+def pallas_inner_loop_add_with_scalar_access(
+    x: torch.Tensor, y: torch.Tensor
+) -> torch.Tensor:
+    """Kernel that mixes pipeline-tiled and scalar reads of the same tensor."""
+    m, n = x.size()
+    out = torch.empty_like(x)
+    for tile_m in hl.tile(m):
+        for tile_n in hl.tile(n):
+            out[tile_m, tile_n] = x[tile_m, tile_n] + y[tile_m, tile_n] + x[0, 0]
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
 def pallas_add_3d(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     """Kernel with an outer grid loop and a 2D inner device loop."""
     b, m, n = x.size()
@@ -670,6 +683,24 @@ class TestPallas(TestCase):
         )
         expected = x - x.mean(dim=-1, keepdim=True)
         torch.testing.assert_close(result, expected, rtol=1e-4, atol=1e-4)
+
+    @xfailIfPallas("Pipeline + scalar access codegen not yet supported")
+    def test_pipeline_tensor_with_scalar_access(self) -> None:
+        """A pipeline tensor with scalar access should keep HBM, not be overridden to SMEM."""
+        args = (
+            torch.randn(64, 128, device=DEVICE, dtype=torch.float32),
+            torch.randn(64, 128, device=DEVICE, dtype=torch.float32),
+        )
+        expected = args[0] + args[1] + args[0][0, 0]
+        code, result = code_and_output(
+            pallas_inner_loop_add_with_scalar_access,
+            args,
+            block_sizes=[8, 128],
+            pallas_loop_type="emit_pipeline",
+        )
+        self.assertIn("pltpu.emit_pipeline", code)
+        self.assertIn("_pipeline_arg_indices=", code)
+        torch.testing.assert_close(result, expected)
 
     def test_attention_default_fp32(self) -> None:
         """Test attention with default (for-loop) inner loop."""
