@@ -165,7 +165,7 @@ class TestReductions(RefEagerTestBase, TestCase):
                 code, out = code_and_output(kernel, (x,), block_sizes=[4, 32])
                 torch.testing.assert_close(out, ref_fn(x), rtol=1e-4, atol=1e-4)
                 if _get_backend() == "cute":
-                    self.assertIn("cute.arch.alloc_smem", code)
+                    self.assertIn("_cute_grouped_reduce_shared_two_stage", code)
 
     def test_sum_constant_inner_dim(self):
         """Sum over a known-constant inner dimension (e.g., 2) should work.

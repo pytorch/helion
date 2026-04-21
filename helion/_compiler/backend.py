@@ -2142,6 +2142,10 @@ class CuteBackend(Backend):
             "cute": "import cutlass.cute as cute",
             "_default_cute_launcher": "from helion.runtime import default_cute_launcher as _default_cute_launcher",
             "_next_power_of_2": "from helion._utils import next_power_of_2 as _next_power_of_2",
+            "_cute_argreduce_index": "from helion._compiler.cute.reduce_helpers import _cute_argreduce_index",
+            "_cute_grouped_reduce_shared_tree": "from helion._compiler.cute.reduce_helpers import _cute_grouped_reduce_shared_tree",
+            "_cute_grouped_reduce_shared_two_stage": "from helion._compiler.cute.reduce_helpers import _cute_grouped_reduce_shared_two_stage",
+            "_cute_grouped_reduce_warp": "from helion._compiler.cute.reduce_helpers import _cute_grouped_reduce_warp",
         }
 
     def program_id_expr(self, dim: int, *, index_dtype: str) -> str:

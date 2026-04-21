@@ -1651,8 +1651,7 @@ class TestCuteLowerings(unittest.TestCase):
             for stmt in cg.statements
         )
         self.assertIn("argreduce_valid_smem", emitted)
-        self.assertIn("argmax_best_valid", emitted)
-        self.assertIn("candidate_valid", emitted)
+        self.assertIn("_cute_argreduce_index", emitted)
 
     def test_triton_argreduce_supports_dim_none_keepdim(self) -> None:
         graph = Graph()
@@ -2475,8 +2474,7 @@ class TestCuteLowerings(unittest.TestCase):
             for stmt in cg.statements
         )
         self.assertNotIn("cute.arch.warp_reduction_sum", emitted)
-        self.assertIn("dot_reduce_smem_1[dot_lane_1] = dot_masked_input_0_1", emitted)
-        self.assertIn("+ 1 < 48", emitted)
+        self.assertIn("_cute_grouped_reduce_shared_tree", emitted)
 
     def test_cute_index_exprs_skip_none_axes_and_zero_singletons(self) -> None:
         state = SimpleNamespace(
