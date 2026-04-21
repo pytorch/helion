@@ -731,15 +731,15 @@ def generate_ast(
             kernel_def = codegen.device_function.codegen_function_def()
             codegen.host_dead_code_elimination()
 
-            # Wrap output-only tensor allocations in FakeTensorMode()
-            # so they don't allocate real HBM. The launcher returns
-            # the real tensors, reassigning the variables.
+            # Retarget output-only tensor allocations to ``device='meta'`` so
+            # the factory call produces a zero-storage metadata-only tensor
+            # instead of allocating real HBM. The launcher reassigns the
+            # variable to the real result tensor.
             output_only_names = getattr(
                 CompileEnvironment.current().backend, "_output_only_names", []
             )
             if output_only_names:
                 oo_set = set(output_only_names)
-                new_stmts: list[ast.AST] = []
                 for stmt in codegen.host_statements:
                     if (
                         isinstance(stmt, ast.Assign)
@@ -747,16 +747,18 @@ def generate_ast(
                         and isinstance(stmt.targets[0], ast.Name)
                         and stmt.targets[0].id in oo_set
                         and not getattr(stmt, "_is_kernel_call", False)
+                        and isinstance(stmt.value, ast.Call)
                     ):
-                        with_stmt = statement_from_string(
-                            "with FakeTensorMode(allow_non_fake_inputs=True): pass"
+                        call = stmt.value
+                        call.keywords = [
+                            kw for kw in call.keywords if kw.arg != "device"
+                        ]
+                        call.keywords.append(
+                            ast.keyword(
+                                arg="device",
+                                value=ast.Constant(value="meta"),
+                            )
                         )
-                        assert isinstance(with_stmt, ast.With)
-                        with_stmt.body = [stmt]
-                        new_stmts.append(with_stmt)
-                    else:
-                        new_stmts.append(stmt)
-                codegen.host_statements = new_stmts
 
             # Inject RNG seed buffer creation if needed
             rng_statements = (
