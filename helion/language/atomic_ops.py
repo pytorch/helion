@@ -586,7 +586,7 @@ def _pallas_atomic_load_prev(
     Returns (tensor_name, index_str, prev_var_name).
     """
     from .._compiler.ast_extension import statement_from_string
-    from .memory_ops import _pallas_index_str
+    from .._compiler.pallas import codegen as pallas_codegen
 
     target = state.proxy_arg(0)
     index = state.proxy_arg(1)
@@ -598,7 +598,7 @@ def _pallas_atomic_load_prev(
         raise exc.AtomicOnDeviceTensor("pallas atomic")
 
     name = state.device_function.tensor_arg(target).name
-    index_str, _ = _pallas_index_str(state, index, target)
+    index_str, _ = pallas_codegen.index_str(state, index, target)
 
     prev_var = state.device_function.new_var("_prev", dce=True)
     state.codegen.add_statement(
@@ -1512,7 +1512,7 @@ def _(state: CodegenState) -> ast.AST:
 @_decorators.codegen(atomic_cas, "pallas")
 def _(state: CodegenState) -> ast.AST:
     from .._compiler.ast_extension import statement_from_string
-    from .memory_ops import _pallas_index_str
+    from .._compiler.pallas import codegen as pallas_codegen
 
     target = state.proxy_arg(0)
     index = state.proxy_arg(1)
@@ -1524,7 +1524,7 @@ def _(state: CodegenState) -> ast.AST:
         raise exc.AtomicOnDeviceTensor("pallas atomic_cas")
 
     name = state.device_function.tensor_arg(target).name
-    index_str, _ = _pallas_index_str(state, index, target)
+    index_str, _ = pallas_codegen.index_str(state, index, target)
 
     prev_var = state.device_function.new_var("_prev", dce=True)
     state.codegen.add_statement(
