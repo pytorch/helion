@@ -50,7 +50,8 @@ def _(state: CodegenState) -> ast.AST:
 
     The source and destination layouts are stored in the FX node's metadata:
       - node.meta["cute_layout_change_src"]  — ThreadLayout of the producer
-      - node.meta["cute_layout_constraint"].layout — ThreadLayout for the consumer
+      - node.meta["cute_layout_constraint"].output_layout — ThreadLayout for the
+        consumer-facing output
 
     Each thread writes its value to shared memory at the flat offset dictated
     by the *source* layout's strides, then (after a barrier) reads back from
@@ -65,7 +66,8 @@ def _(state: CodegenState) -> ast.AST:
     from .layout_propagation import META_KEY
 
     src_layout: ThreadLayout = state.fx_node.meta["cute_layout_change_src"]
-    dst_layout: ThreadLayout = state.fx_node.meta[META_KEY].layout
+    dst_layout = state.fx_node.meta[META_KEY].output_layout
+    assert dst_layout is not None
 
     log.debug(
         "layout change %s: %s -> %s",

@@ -1,8 +1,8 @@
-"""Per-operation rules for preferred CuTe TV layouts.
+"""Per-operation rules for CuTe TV layout contracts.
 
 Each rule inspects a torch.fx.Node and its metadata to determine the
-ideal thread-value layout.  These preferences are later reconciled by
-the propagation pass.
+ideal thread-value layout on the node's input and/or output edges. These
+contracts are later reconciled by the propagation pass.
 """
 
 from __future__ import annotations
@@ -51,8 +51,8 @@ def preferred_constraint_for_node(
 ) -> LayoutConstraint | None:
     """Return a LayoutConstraint for *node*, or None if unconstrained.
 
-    This only fills in the *preferred* field; the propagation pass
-    resolves the final *layout* field later.
+    This seeds preferred input/output layouts; the propagation pass resolves the
+    final layouts later.
     """
     if node.op != "call_function":
         return None
@@ -84,7 +84,7 @@ def _constraint_for_load(
     )
     if layout is None:
         return None
-    return LayoutConstraint(preferred=layout)
+    return LayoutConstraint(preferred_output=layout)
 
 
 # ---------------------------------------------------------------------------
@@ -102,7 +102,7 @@ def _constraint_for_store(
     )
     if layout is None:
         return None
-    return LayoutConstraint(preferred=layout)
+    return LayoutConstraint(preferred_input=layout)
 
 
 # ---------------------------------------------------------------------------
@@ -185,7 +185,7 @@ def _constraint_for_reduce(
             reduce_size, num_threads=num_threads, tag=LayoutTag.REDUCTION
         )
 
-    return LayoutConstraint(preferred=layout)
+    return LayoutConstraint(preferred_input=layout)
 
 
 # ---------------------------------------------------------------------------

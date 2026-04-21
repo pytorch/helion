@@ -54,9 +54,9 @@ def _log_cute_reduction_layout(state: CodegenState) -> None:
     if state.fx_node is None:
         return
     constraint = state.fx_node.meta.get(_CUTE_LAYOUT_META_KEY)
-    if constraint is None or constraint.layout is None:
+    if constraint is None or constraint.input_layout is None:
         return
-    layout = constraint.layout
+    layout = constraint.input_layout
     log.debug(
         "cute reduction %s: layout tag=%s thread=%s value=%s",
         state.fx_node.name,
@@ -76,9 +76,9 @@ def _reduction_threads_from_annotation(state: CodegenState) -> int | None:
     if state.fx_node is None:
         return None
     constraint = state.fx_node.meta.get(_CUTE_LAYOUT_META_KEY)
-    if constraint is None or constraint.layout is None:
+    if constraint is None or constraint.input_layout is None:
         return None
-    layout = constraint.layout
+    layout = constraint.input_layout
     if layout.tag != _CuteLayoutTag.REDUCTION:
         return None
     nt = layout.num_threads()
