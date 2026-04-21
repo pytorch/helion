@@ -206,6 +206,10 @@ def _detect_indexing_pattern(
                 block_id=tile_begin_with_offset.block_id,
                 offset=tile_begin_with_offset.offset,
             )
+        # Indices produced by other FX nodes, such as indices[tile] used in
+        # tensor-indexed atomics, are legal but cannot participate in Pallas
+        # tiling.
+        return ArbitraryIndexPattern(idx)
 
     if isinstance(idx, slice):
         if idx != slice(None):

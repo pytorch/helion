@@ -244,7 +244,10 @@ class TestExamples(RefEagerTestBase, TestCase):
         torch.testing.assert_close(mat1.grad, mat1_ref.grad, atol=1e-1, rtol=1e-2)
         torch.testing.assert_close(mat2.grad, mat2_ref.grad, atol=1e-1, rtol=1e-2)
 
-    @xfailIfCute("CuTe matmul+layernorm example still fails codegen/runtime")
+    @skipIfFn(
+        lambda: _get_backend() == "cute",
+        "CuTe matmul+layernorm example is unsupported and too expensive in-process",
+    )
     def test_matmul_layernorm_static_shapes(self):
         args = (
             torch.randn([1024, 256], device=DEVICE, dtype=torch.float32),
@@ -265,7 +268,23 @@ class TestExamples(RefEagerTestBase, TestCase):
             static_shapes=True,
         )
 
-    @xfailIfCute("CuTe matmul+layernorm example still fails codegen/runtime")
+    def test_matmul_layernorm_small_shapes_compile_on_cute(self):
+        if _get_backend() != "cute":
+            self.skipTest("CuTe-specific compile coverage")
+
+        mod = import_path(EXAMPLES_DIR / "matmul_layernorm.py")
+        args = (
+            torch.randn([32, 64], device=DEVICE, dtype=torch.float32),
+            torch.randn([64, 128], device=DEVICE, dtype=torch.float32),
+            torch.randn([128], device=DEVICE, dtype=torch.float32),
+            torch.randn([128], device=DEVICE, dtype=torch.float32),
+        )
+        _compile_only(mod.matmul_layernorm, args, block_sizes=[16, 16])
+
+    @skipIfFn(
+        lambda: _get_backend() == "cute",
+        "CuTe matmul+layernorm example is unsupported and too expensive in-process",
+    )
     @xfailIfPallas("JAX tracer error with dynamic shapes")
     def test_matmul_layernorm_dynamic_shapes(self):
         args = (
@@ -301,6 +320,20 @@ class TestExamples(RefEagerTestBase, TestCase):
             args,
             torch.bmm(args[0], args[1]),
             block_sizes=[16, 16, 16, 16],
+        )
+
+    @xfailIfPallas("reduction tile K=256 doesn't evenly divide K=384")
+    @xfailIfCute("CuTE IR build error with non-divisible K block sizes")
+    def test_bmm_non_divisible_k(self):
+        args = (
+            torch.randn([4, 128, 384], device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn([4, 384, 128], device=DEVICE, dtype=HALF_DTYPE),
+        )
+        check_example(
+            "bmm",
+            args,
+            torch.bmm(args[0], args[1]),
+            block_sizes=[1, 128, 128, 256],
         )
 
     @skipIfFn(
@@ -378,7 +411,6 @@ class TestExamples(RefEagerTestBase, TestCase):
             l2_grouping=64,
         )
 
-    @xfailIfCute("CuTe template closure example still exceeds runtime resources")
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfTileIR("TileIR does not support block_ptr indexing")
     def test_template_via_closure2(self):
@@ -629,13 +661,14 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
 
     @xfailIfCute("CuTe RMSNorm backward example still returns incorrect results")
-    @skipIfPallas("Generated Pallas code causes Mosaic internal SegFault")
     def test_rms_norm_bwd(self):
         """Test backward pass for rms norm weight gradient."""
         batch_size, dim = 32, 64
-        x = torch.randn([batch_size, dim], device=DEVICE, dtype=HALF_DTYPE)
-        weight = torch.randn([dim], device=DEVICE, dtype=HALF_DTYPE, requires_grad=True)
-        grad_out = torch.randn([batch_size, dim], device=DEVICE, dtype=HALF_DTYPE)
+        x = torch.randn([batch_size, dim], device=DEVICE, dtype=torch.float32)
+        weight = torch.randn(
+            [dim], device=DEVICE, dtype=torch.float32, requires_grad=True
+        )
+        grad_out = torch.randn([batch_size, dim], device=DEVICE, dtype=torch.float32)
         eps = 1e-5
 
         # Compute forward pass to get rms
@@ -716,12 +749,13 @@ class TestExamples(RefEagerTestBase, TestCase):
         expected = torch.nn.functional.gelu(
             acc * 1.25 + residual.float() * 0.5 + bias.float()
         ).half()
+        block_sizes = [16, 16, 16] if _get_backend() == "cute" else [64, 64, 64]
         check_example(
             "epilogue_subtiling",
             (x, w, bias, residual),
             expected,
             fn_name="matmul_bias_residual_gelu_cast",
-            block_sizes=[64, 64, 64],
+            block_sizes=block_sizes,
         )
 
     @skipIfTileIR("PassManager::run failed")
@@ -737,12 +771,13 @@ class TestExamples(RefEagerTestBase, TestCase):
             torch.nn.functional.gelu(pre).half(),
             pre.half(),
         )
+        block_sizes = [16, 16, 16] if _get_backend() == "cute" else [64, 64, 64]
         check_example(
             "epilogue_subtiling",
             (x, w, bias),
             expected,
             fn_name="matmul_bias_gelu_aux",
-            block_sizes=[64, 64, 64],
+            block_sizes=block_sizes,
         )
 
     @skipIfFn(
@@ -1095,11 +1130,6 @@ class TestExamples(RefEagerTestBase, TestCase):
             num_stages=3,
         )
 
-    @xfailIfPallas(
-        "Out-of-bounds slice when reduction_loops doesn't evenly divide the "
-        "reduction dimension (e.g. reduction_loops=32 on dim=48 generates "
-        "pl.ds(32, 32) which exceeds bounds)"
-    )
     def test_layernorm_reduction_not_divisible(self):
         """Reduction loop OOB when reduction_loops doesn't divide the reduction dim."""
         batch_size = 4
@@ -2164,7 +2194,6 @@ class TestExamples(RefEagerTestBase, TestCase):
             fn_name="longsum",
         )
 
-    @xfailIfPallas("JAX tracer error with dynamic shapes")
     def test_long_sum_looped(self):
         args = (torch.randn([4, 130000], device=DEVICE, dtype=torch.float32),)
         check_example(

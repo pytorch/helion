@@ -268,18 +268,23 @@ if triton_is_available():
             return tuple(int(v) for v in dot_size_val)
 
         if device.type == "cuda":
-            from triton.backends.nvidia.compiler import (
-                min_dot_size as min_dot_size_cuda,
-            )
-
             props = DeviceProperties.create(device)
-            return min_dot_size_cuda(
-                GPUTarget(
-                    backend=props.type,
-                    arch=props.cc,
-                    warp_size=props.warp_size or 32,
+            target = GPUTarget(
+                backend=props.type,
+                arch=props.cc,
+                warp_size=props.warp_size or 32,
+            )
+            if is_hip():
+                from triton.backends.amd.compiler import get_min_dot_size
+
+                get_min_size = get_min_dot_size(target)
+            else:
+                from triton.backends.nvidia.compiler import (
+                    min_dot_size as min_dot_size_cuda,
                 )
-            )(torch_dtype_to_tl(lhs), torch_dtype_to_tl(rhs))
+
+                get_min_size = min_dot_size_cuda(target)
+            return get_min_size(torch_dtype_to_tl(lhs), torch_dtype_to_tl(rhs))
 
         return (16, 16, 16)
 

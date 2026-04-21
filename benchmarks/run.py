@@ -367,6 +367,7 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "torch_compile_add-accuracy": "torch_compile_accuracy",
         "helion_add-speedup": "helion_speedup",
         "helion_add-accuracy": "helion_accuracy",
+        "helion_add-latency": "helion_latency_ms",
     },
     "vector_exp": {
         "torch_exp": "baseline",
@@ -376,6 +377,7 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "torch_compile_exp-accuracy": "torch_compile_accuracy",
         "helion_exp_tritonbench-speedup": "helion_speedup",
         "helion_exp_tritonbench-accuracy": "helion_accuracy",
+        "helion_exp_tritonbench-latency": "helion_latency_ms",
     },
     "sum": {
         "torch_sum": "baseline",
@@ -385,6 +387,7 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "torch_compile_sum-accuracy": "torch_compile_accuracy",
         "helion_sum_tritonbench-speedup": "helion_speedup",
         "helion_sum_tritonbench-accuracy": "helion_accuracy",
+        "helion_sum_tritonbench-latency": "helion_latency_ms",
     },
     "layer_norm": {
         "torch_layer_norm": "baseline",
@@ -394,6 +397,7 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "torch_compile_layer_norm-accuracy": "torch_compile_accuracy",
         "helion_layer_norm_tritonbench-speedup": "helion_speedup",
         "helion_layer_norm_tritonbench-accuracy": "helion_accuracy",
+        "helion_layer_norm_tritonbench-latency": "helion_latency_ms",
     },
     "layer_norm-bwd": {
         "torch_layer_norm": "baseline",
@@ -403,6 +407,7 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "torch_compile_layer_norm-accuracy": "torch_compile_accuracy",
         "helion_layer_norm_tritonbench-speedup": "helion_speedup",
         "helion_layer_norm_tritonbench-accuracy": "helion_accuracy",
+        "helion_layer_norm_tritonbench-latency": "helion_latency_ms",
     },
     "softmax": {
         "naive_softmax": "baseline",
@@ -412,6 +417,7 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "torch_compile_softmax-accuracy": "torch_compile_accuracy",
         "helion_softmax_tritonbench-speedup": "helion_speedup",
         "helion_softmax_tritonbench-accuracy": "helion_accuracy",
+        "helion_softmax_tritonbench-latency": "helion_latency_ms",
     },
     "softmax-bwd": {
         "naive_softmax": "baseline",
@@ -421,6 +427,7 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "torch_compile_softmax-accuracy": "torch_compile_accuracy",
         "helion_softmax_tritonbench-speedup": "helion_speedup",
         "helion_softmax_tritonbench-accuracy": "helion_accuracy",
+        "helion_softmax_tritonbench-latency": "helion_latency_ms",
     },
     "rms_norm": {
         "llama_rms": "baseline",
@@ -430,6 +437,7 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "torch_compile_rms-accuracy": "torch_compile_accuracy",
         "helion_rms_norm_tritonbench-speedup": "helion_speedup",
         "helion_rms_norm_tritonbench-accuracy": "helion_accuracy",
+        "helion_rms_norm_tritonbench-latency": "helion_latency_ms",
     },
     "rms_norm-bwd": {
         "llama_rms": "baseline",
@@ -439,6 +447,7 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "torch_compile_rms-accuracy": "torch_compile_accuracy",
         "helion_rms_norm_tritonbench-speedup": "helion_speedup",
         "helion_rms_norm_tritonbench-accuracy": "helion_accuracy",
+        "helion_rms_norm_tritonbench-latency": "helion_latency_ms",
     },
     "cross_entropy": {
         "cross_entropy_loss": "baseline",
@@ -448,6 +457,7 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "torch_compile_cross_entropy_loss-accuracy": "torch_compile_accuracy",
         "helion_cross_entropy-speedup": "helion_speedup",
         "helion_cross_entropy-accuracy": "helion_accuracy",
+        "helion_cross_entropy-latency": "helion_latency_ms",
     },
     "geglu": {
         "torch_geglu": "baseline",
@@ -457,6 +467,7 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "torch_compile_geglu-accuracy": "torch_compile_accuracy",
         "helion_geglu_tritonbench-speedup": "helion_speedup",
         "helion_geglu_tritonbench-accuracy": "helion_accuracy",
+        "helion_geglu_tritonbench-latency": "helion_latency_ms",
     },
     "swiglu": {
         "torch_swiglu": "baseline",
@@ -466,6 +477,7 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "torch_compile_swiglu-accuracy": "torch_compile_accuracy",
         "helion_swiglu_tritonbench-speedup": "helion_speedup",
         "helion_swiglu_tritonbench-accuracy": "helion_accuracy",
+        "helion_swiglu_tritonbench-latency": "helion_latency_ms",
     },
     "swiglu-bwd": {
         "torch_swiglu": "baseline",
@@ -475,6 +487,7 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "torch_compile_swiglu-accuracy": "torch_compile_accuracy",
         "helion_swiglu_tritonbench-speedup": "helion_speedup",
         "helion_swiglu_tritonbench-accuracy": "helion_accuracy",
+        "helion_swiglu_tritonbench-latency": "helion_latency_ms",
     },
     "jsd": {
         "torch_jsd": "baseline",
@@ -484,6 +497,7 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "torch_compile_jsd-accuracy": "torch_compile_accuracy",
         "helion_jsd_tritonbench-speedup": "helion_speedup",
         "helion_jsd_tritonbench-accuracy": "helion_accuracy",
+        "helion_jsd_tritonbench-latency": "helion_latency_ms",
     },
     "welford": {
         "eager_layer_norm": "baseline",
@@ -493,6 +507,7 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "torch_compile_welford-accuracy": "torch_compile_accuracy",
         "helion_welford-speedup": "helion_speedup",
         "helion_welford-accuracy": "helion_accuracy",
+        "helion_welford-latency": "helion_latency_ms",
     },
     "kl_div": {
         "torch_kl_div": "baseline",
@@ -502,6 +517,7 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "torch_compile_kl_div-accuracy": "torch_compile_accuracy",
         "helion_kl_div_tritonbench-speedup": "helion_speedup",
         "helion_kl_div_tritonbench-accuracy": "helion_accuracy",
+        "helion_kl_div_tritonbench-latency": "helion_latency_ms",
     },
     "gather_gemv": {
         "eager_gather_gemv": "baseline",
@@ -511,6 +527,7 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "torch_compile_gather_gemv-accuracy": "torch_compile_accuracy",
         "helion_gather_gemv_tritonbench-speedup": "helion_speedup",
         "helion_gather_gemv_tritonbench-accuracy": "helion_accuracy",
+        "helion_gather_gemv_tritonbench-latency": "helion_latency_ms",
     },
     "int4_gemm": {
         "preprocessed_eager_int4_gemm": "baseline",
@@ -520,6 +537,7 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "preprocessed_torch_compile_int4_gemm-accuracy": "torch_compile_accuracy",
         "helion_int4_gemm_tritonbench-speedup": "helion_speedup",
         "helion_int4_gemm_tritonbench-accuracy": "helion_accuracy",
+        "helion_int4_gemm_tritonbench-latency": "helion_latency_ms",
     },
     "grouped_gemm": {
         "aten_grouped_mm": "baseline",
@@ -529,12 +547,14 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "torch_compile_grouped_gemm-accuracy": "torch_compile_accuracy",
         "helion_grouped_gemm_jagged_persistent_tritonbench-speedup": "helion_speedup",
         "helion_grouped_gemm_jagged_persistent_tritonbench-accuracy": "helion_accuracy",
+        "helion_grouped_gemm_jagged_persistent_tritonbench-latency": "helion_latency_ms",
     },
     "jagged_layer_norm": {
         "torch_compile_nested_tensor_integration-speedup": "torch_compile_speedup",
         "torch_compile_nested_tensor_integration-accuracy": "torch_compile_accuracy",
         "helion_jagged_layer_norm_tritonbench-speedup": "helion_speedup",
         "helion_jagged_layer_norm_tritonbench-accuracy": "helion_accuracy",
+        "helion_jagged_layer_norm_tritonbench-latency": "helion_latency_ms",
     },
     "jagged_sum": {
         "triton_jagged_sum_no_pad_simple_fused-speedup": "triton_speedup",
@@ -543,6 +563,7 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "torch_compile_nested_tensor_integration-accuracy": "torch_compile_accuracy",
         "helion_jagged_sum_tritonbench-speedup": "helion_speedup",
         "helion_jagged_sum_tritonbench-accuracy": "helion_accuracy",
+        "helion_jagged_sum_tritonbench-latency": "helion_latency_ms",
     },
     "addmm": {
         "aten_addmm": "baseline",
@@ -552,6 +573,7 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "pt2_addmm_maxautotune-accuracy": "torch_compile_accuracy",
         "helion_addmm_tritonbench-speedup": "helion_speedup",
         "helion_addmm_tritonbench-accuracy": "helion_accuracy",
+        "helion_addmm_tritonbench-latency": "helion_latency_ms",
     },
     "addmm-bwd": {
         "aten_addmm": "baseline",
@@ -561,6 +583,7 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "pt2_addmm_maxautotune-accuracy": "torch_compile_accuracy",
         "helion_addmm_tritonbench-speedup": "helion_speedup",
         "helion_addmm_tritonbench-accuracy": "helion_accuracy",
+        "helion_addmm_tritonbench-latency": "helion_latency_ms",
     },
     # "ragged_attention": {
     #     "triton_ragged_attention-speedup": "triton_speedup",
@@ -578,6 +601,7 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "torch_compile_embedding-accuracy": "torch_compile_accuracy",
         "helion_embedding_tritonbench-speedup": "helion_speedup",
         "helion_embedding_tritonbench-accuracy": "helion_accuracy",
+        "helion_embedding_tritonbench-latency": "helion_latency_ms",
     },
     "jagged_mean": {
         "torch_jagged_mean_torch_sum": "baseline",
@@ -587,6 +611,7 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "torch_compile_jagged_mean_torch_sum-accuracy": "torch_compile_accuracy",
         "helion_jagged_mean_tritonbench-speedup": "helion_speedup",
         "helion_jagged_mean_tritonbench-accuracy": "helion_accuracy",
+        "helion_jagged_mean_tritonbench-latency": "helion_latency_ms",
     },
     "flash_attention": {
         "aten": "baseline",
@@ -596,6 +621,7 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "flex_attention-accuracy": "torch_compile_accuracy",
         "helion_attention-speedup": "helion_speedup",
         "helion_attention-accuracy": "helion_accuracy",
+        "helion_attention-latency": "helion_latency_ms",
     },
     "fp8_attention": {
         "triton_flash_v2": "baseline",
@@ -603,6 +629,7 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "triton_flash_v2_ws-accuracy": "triton_accuracy",
         "helion_fp8_attention_tritonbench-speedup": "helion_speedup",
         "helion_fp8_attention_tritonbench-accuracy": "helion_accuracy",
+        "helion_fp8_attention_tritonbench-latency": "helion_latency_ms",
     },
     "jagged_softmax": {
         "torch_jagged_softmax_torch_sum": "baseline",
@@ -612,6 +639,7 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "torch_compile_jagged_softmax_torch_sum-accuracy": "torch_compile_accuracy",
         "helion_jagged_softmax_tritonbench-speedup": "helion_speedup",
         "helion_jagged_softmax_tritonbench-accuracy": "helion_accuracy",
+        "helion_jagged_softmax_tritonbench-latency": "helion_latency_ms",
     },
     "fused_linear_jsd": {
         "torch_lm_head_jsd": "baseline",
@@ -621,6 +649,7 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "torch_compile_fused_linear_jsd-accuracy": "torch_compile_accuracy",
         "helion_fused_linear_jsd_fwd_tritonbench-speedup": "helion_speedup",
         "helion_fused_linear_jsd_fwd_tritonbench-accuracy": "helion_accuracy",
+        "helion_fused_linear_jsd_fwd_tritonbench-latency": "helion_latency_ms",
     },
     "gemm": {
         "aten_matmul": "baseline",
@@ -630,6 +659,7 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "pt2_triton_matmul-accuracy": "torch_compile_accuracy",
         "helion_matmul_tritonbench-speedup": "helion_speedup",
         "helion_matmul_tritonbench-accuracy": "helion_accuracy",
+        "helion_matmul_tritonbench-latency": "helion_latency_ms",
     },
     "gemm-bwd": {
         "aten_matmul": "baseline",
@@ -639,6 +669,7 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "pt2_triton_matmul-accuracy": "torch_compile_accuracy",
         "helion_matmul_tritonbench-speedup": "helion_speedup",
         "helion_matmul_tritonbench-accuracy": "helion_accuracy",
+        "helion_matmul_tritonbench-latency": "helion_latency_ms",
     },
     "fp8_gemm": {
         "torch_fp8_gemm": "baseline",
@@ -648,6 +679,7 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         f"{'blackwell_pt2' if IS_B200 else 'pt2'}_fp8_gemm-accuracy": "torch_compile_accuracy",
         "helion_fp8_gemm_tritonbench-speedup": "helion_speedup",
         "helion_fp8_gemm_tritonbench-accuracy": "helion_accuracy",
+        "helion_fp8_gemm_tritonbench-latency": "helion_latency_ms",
     },
     "low_mem_dropout": {
         "seeded_dropout-accuracy": "triton_accuracy",
@@ -656,6 +688,7 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "torch_compile_dropout-speedup": "torch_compile_speedup",
         "helion_low_mem_dropout_tritonbench-accuracy": "helion_accuracy",
         "helion_low_mem_dropout_tritonbench-speedup": "helion_speedup",
+        "helion_low_mem_dropout_tritonbench-latency": "helion_latency_ms",
     },
     "bf16xint16_gemm": {
         "bf16xbf16": "baseline",
@@ -665,6 +698,7 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "torch_compile_bf16xbf16-accuracy": "torch_compile_accuracy",
         "helion_bf16xint16_gemm_tritonbench-speedup": "helion_speedup",
         "helion_bf16xint16_gemm_tritonbench-accuracy": "helion_accuracy",
+        "helion_bf16xint16_gemm_tritonbench-latency": "helion_latency_ms",
     },
     "blackwell_attentions": {
         "aten": "baseline",
@@ -674,6 +708,7 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "flex_attention-accuracy": "torch_compile_accuracy",
         "helion_blackwell_attention_tritonbench-speedup": "helion_speedup",
         "helion_blackwell_attention_tritonbench-accuracy": "helion_accuracy",
+        "helion_blackwell_attention_tritonbench-latency": "helion_latency_ms",
     },
     "mamba2_chunk_scan": {
         "eager": "baseline",
@@ -681,6 +716,7 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "compile_accuracy": "torch_compile_accuracy",
         "helion_mamba2_chunk_scan_kernel_speedup": "helion_speedup",
         "helion_mamba2_chunk_scan_kernel_accuracy": "helion_accuracy",
+        "helion_mamba2_chunk_scan_kernel_latency": "helion_latency_ms",
     },
     "mamba2_chunk_state": {
         "eager": "baseline",
@@ -688,6 +724,7 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "compile_accuracy": "torch_compile_accuracy",
         "helion_mamba2_chunk_state_kernel_speedup": "helion_speedup",
         "helion_mamba2_chunk_state_kernel_accuracy": "helion_accuracy",
+        "helion_mamba2_chunk_state_kernel_latency": "helion_latency_ms",
     },
     "gdn_fwd_h": {
         "eager": "baseline",
@@ -695,6 +732,7 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "compile_accuracy": "torch_compile_accuracy",
         "helion_gdn_fwd_h_speedup": "helion_speedup",
         "helion_gdn_fwd_h_accuracy": "helion_accuracy",
+        "helion_gdn_fwd_h_latency": "helion_latency_ms",
     },
 }
 

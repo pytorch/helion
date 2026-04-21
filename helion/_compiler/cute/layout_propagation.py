@@ -1,10 +1,15 @@
-"""Layout propagation pass for the CuTe backend.
+"""Layout planning pass for the CuTe backend.
 
 Walks the Device IR graphs and:
-  1. Seeds constrained nodes (loads, stores, reductions) with preferred layouts.
-  2. Propagates layouts forward through unconstrained (pointwise) nodes.
-  3. Propagates layouts backward so producers adopt consumers' layouts.
-  4. Detects remaining conflicts and inserts ``_cute_layout_change`` nodes.
+  1. Seeds constrained nodes (loads, stores, reductions) with preferred input
+     and/or output layouts.
+  2. Propagates passthrough layouts forward through unconstrained pointwise
+     nodes.
+  3. Propagates consumer input layouts backward so flexible producers adopt
+     them.
+  4. Resolves authoritative input/output layouts.
+  5. Detects remaining conflicts and inserts ``_cute_layout_change`` nodes.
+  6. Rejects unresolved producer-output -> consumer-input mismatches early.
 """
 
 from __future__ import annotations
@@ -14,10 +19,20 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from ... import exc
+from ...language import _tracing_ops
+from ...language import memory_ops
+from ...language import reduce_ops
+from ..compile_environment import CompileEnvironment
+from ..device_ir import RootGraphInfo
+from .layout import CuTeGridExecutionPlan
 from .layout import LayoutConstraint
 from .layout import LayoutTag
+from .layout import MatmulExecutionKind
+from .layout import MatmulExecutionPlan
 from .layout import ThreadLayout
 from .layout_rules import preferred_constraint_for_node
+from .matmul_utils import analyze_direct_grouped_n_loads
 
 if TYPE_CHECKING:
     from ...runtime.config import Config
@@ -43,7 +58,8 @@ def plan_layouts(
 
     This annotates every relevant node with a ``LayoutConstraint`` in
     ``node.meta["cute_layout_constraint"]`` and inserts
-    ``_cute_layout_change`` nodes where needed.
+    ``_cute_layout_change`` nodes where needed. Any remaining mismatch on a
+    producer-output -> consumer-input edge is rejected before lowering.
 
     Args:
         graphs: Codegen graph copies to annotate.
@@ -53,10 +69,12 @@ def plan_layouts(
     """
     for graph_info in graphs:
         _seed_constraints(graph_info, tile_strategy)
+        _plan_matmul_execution(graph_info, tile_strategy)
         _forward_propagate(graph_info)
         _backward_propagate(graph_info)
         _resolve_layouts(graph_info)
         _insert_layout_changes(graph_info)
+        _validate_layout_contracts(graph_info)
 
     _validate_thread_budget_graphs(graphs)
 
@@ -77,30 +95,199 @@ def _seed_constraints(
             node.meta[META_KEY] = constraint
 
 
+def _plan_matmul_execution(
+    graph_info: GraphInfo,
+    tile_strategy: TileStrategyDispatch,
+) -> None:
+    from ..host_function import HostFunction
+
+    if not isinstance(graph_info, RootGraphInfo):
+        return
+    device_ir = HostFunction.current().device_ir
+    if len(device_ir.grid_block_ids) != 1 or len(device_ir.grid_block_ids[0]) != 1:
+        return
+    (m_block_id,) = device_ir.grid_block_ids[0]
+    env = CompileEnvironment.current()
+    config = tile_strategy.strategies[0].fn.config
+    m_block_size = env.block_sizes[m_block_id].from_config(config)
+    if not isinstance(m_block_size, int) or m_block_size <= 0 or m_block_size % 16 != 0:
+        return
+    m_threads = tile_strategy.thread_extent_for_block_id(m_block_id)
+    if not isinstance(m_threads, int) or m_threads != m_block_size:
+        return
+    # The direct grouped-N MMA path currently owns the root-kernel thread-axis
+    # mapping, so only enable it for a dedicated single-mm root graph.
+    matmul_nodes = [
+        node
+        for node in graph_info.graph.nodes
+        if node.op == "call_function" and node.target is torch.ops.aten.mm.default
+    ]
+    if len(matmul_nodes) != 1:
+        return
+    if any(
+        node.op == "call_function" and node.target is reduce_ops._reduce
+        for node in graph_info.graph.nodes
+    ):
+        return
+
+    for node in matmul_nodes:
+        constraint = node.meta.get(META_KEY)
+        if (
+            constraint is None
+            or constraint.matmul_axes is None
+            or node.op != "call_function"
+            or node.target is not torch.ops.aten.mm.default
+            or len(node.args) < 2
+        ):
+            continue
+        lhs_node = node.args[0]
+        rhs_node = node.args[1]
+        if not isinstance(lhs_node, torch.fx.Node) or not isinstance(
+            rhs_node, torch.fx.Node
+        ):
+            continue
+        lhs_val = lhs_node.meta.get("val")
+        rhs_val = rhs_node.meta.get("val")
+        if not isinstance(lhs_val, torch.Tensor) or not isinstance(
+            rhs_val, torch.Tensor
+        ):
+            continue
+        if lhs_val.ndim != 2 or rhs_val.ndim != 2:
+            continue
+        if lhs_val.dtype not in (torch.float16, torch.bfloat16):
+            continue
+        scalar_block_id = _direct_grouped_n_scalar_block_id(
+            tile_strategy,
+            lhs_val,
+            rhs_val,
+            exclude_block_id=m_block_id,
+        )
+        if scalar_block_id is None:
+            continue
+        scalar_threads = tile_strategy.thread_extent_for_block_id(scalar_block_id)
+        if scalar_threads is None or scalar_threads < 8 or scalar_threads % 8 != 0:
+            continue
+        scalar_strategy = tile_strategy.block_id_to_strategy.get((scalar_block_id,))
+        if scalar_strategy is None:
+            continue
+        lane_extent = getattr(scalar_strategy, "_synthetic_cute_lane_extent", 1)
+        if not isinstance(lane_extent, int) or lane_extent <= 0:
+            lane_extent = 1
+        size_hint = getattr(env, "size_hint", None)
+        n_extent = (
+            size_hint(rhs_val.shape[1]) if callable(size_hint) else rhs_val.shape[1]
+        )
+        if not isinstance(n_extent, int):
+            continue
+        k_extent = (
+            size_hint(lhs_val.shape[1]) if callable(size_hint) else lhs_val.shape[1]
+        )
+        if not isinstance(k_extent, int):
+            continue
+        lhs_load = lhs_node if lhs_node.target is memory_ops.load else None
+        rhs_load = rhs_node if rhs_node.target is memory_ops.load else None
+        load_plan = (
+            None
+            if lhs_load is None or rhs_load is None
+            else analyze_direct_grouped_n_loads(
+                lhs_load,
+                rhs_load,
+                k_extent=k_extent,
+                n_extent=n_extent,
+            )
+        )
+        if lhs_load is None or rhs_load is None or load_plan is None:
+            continue
+        if scalar_threads * lane_extent < n_extent:
+            continue
+
+        constraint.matmul_plan = MatmulExecutionPlan(
+            kind=MatmulExecutionKind.DIRECT_GROUPED_N,
+            m_block_id=m_block_id,
+            scalar_block_id=scalar_block_id,
+            bm=m_block_size,
+            bn=8,
+            bk=16,
+            groups_per_lane=scalar_threads // 8,
+            lane_extent=lane_extent,
+        )
+        graph_info.cute_grid_execution_plans = (
+            *graph_info.cute_grid_execution_plans,
+            CuTeGridExecutionPlan(
+                scoped_block_ids=frozenset({m_block_id, scalar_block_id}),
+                block_axis_priority={
+                    m_block_id: 0,
+                    scalar_block_id: 1,
+                },
+                disable_reduction_axis_reservation_for=frozenset(
+                    {m_block_id, scalar_block_id}
+                ),
+            ),
+        )
+
+
+def _direct_grouped_n_scalar_block_id(
+    tile_strategy: TileStrategyDispatch,
+    lhs_val: torch.Tensor,
+    rhs_val: torch.Tensor,
+    *,
+    exclude_block_id: int,
+) -> int | None:
+    from ..reduction_strategy import PersistentReductionStrategy
+
+    env = CompileEnvironment.current()
+
+    def hinted_equal(lhs: int | torch.SymInt, rhs: int | torch.SymInt) -> bool:
+        if env.known_equal(lhs, rhs):
+            return True
+        size_hint = getattr(env, "size_hint", None)
+        if not callable(size_hint):
+            return False
+        hinted_lhs = size_hint(lhs)
+        hinted_rhs = size_hint(rhs)
+        return isinstance(hinted_lhs, int) and hinted_lhs == hinted_rhs
+
+    candidates: list[int] = []
+    for strategy in tile_strategy.strategies:
+        if not isinstance(strategy, PersistentReductionStrategy):
+            continue
+        block_id = strategy.block_index
+        if block_id == exclude_block_id:
+            continue
+        size = env.block_sizes[block_id].size
+        if not isinstance(size, int | torch.SymInt):
+            continue
+        if hinted_equal(size, lhs_val.shape[1]) and hinted_equal(
+            size, rhs_val.shape[1]
+        ):
+            candidates.append(block_id)
+    if len(candidates) != 1:
+        return None
+    return candidates[0]
+
+
 # ---------------------------------------------------------------------------
 # Step 2 — Forward propagation
 # ---------------------------------------------------------------------------
 
 
 def _forward_propagate(graph_info: GraphInfo) -> None:
-    """Unconstrained nodes inherit layout from their first tensor input."""
+    """Passthrough tensor ops inherit layout from their first tensor input."""
     for node in graph_info.graph.nodes:
-        if node.op != "call_function":
+        if not _is_passthrough_layout_node(node):
             continue
-        if META_KEY in node.meta:
-            continue  # already has a constraint
-
-        # Check if this node produces a tensor
         val = node.meta.get("val")
         if not isinstance(val, torch.Tensor):
             continue
+        constraint = _constraint_for_node(node)
+        if constraint.preferred_output is not None:
+            continue
 
-        # Try to inherit from the first input that has a layout
         layout = _first_input_layout(node)
         if layout is not None:
-            node.meta[META_KEY] = LayoutConstraint(
-                preferred=layout.with_tag(LayoutTag.INHERITED),
-            )
+            inherited = layout.with_tag(LayoutTag.INHERITED)
+            constraint.preferred_input = inherited
+            constraint.preferred_output = inherited
 
 
 # ---------------------------------------------------------------------------
@@ -117,22 +304,28 @@ def _backward_propagate(graph_info: GraphInfo) -> None:
     pointwise) adopt backward-propagated layouts.
     """
     for node in reversed(list(graph_info.graph.nodes)):
-        if node.op != "call_function":
+        if not _is_output_flexible_layout_node(node):
             continue
-        constraint = node.meta.get(META_KEY)
-        if constraint is not None and constraint.required:
+        val = node.meta.get("val")
+        if not isinstance(val, torch.Tensor):
+            continue
+        constraint = _constraint_for_node(node)
+        if constraint.required:
             continue  # non-negotiable
 
         # Don't backward-propagate through nodes with semantic preferences
         # (reductions need threads along the reduction axis).
-        if constraint is not None and constraint.preferred is not None:
-            if constraint.preferred.tag in (
+        if (
+            constraint.preferred_output is not None
+            and constraint.preferred_output.tag
+            in (
                 LayoutTag.REDUCTION,
                 LayoutTag.MMA_OPERAND_A,
                 LayoutTag.MMA_OPERAND_B,
                 LayoutTag.MMA_ACCUMULATOR,
-            ):
-                continue
+            )
+        ):
+            continue
 
         user_layouts = _collect_user_layouts(node)
         if not user_layouts:
@@ -141,12 +334,10 @@ def _backward_propagate(graph_info: GraphInfo) -> None:
         # All users agree on the same layout?
         first = user_layouts[0]
         if all(first.is_compatible(ul) for ul in user_layouts[1:]):
-            # Adopt the users' layout if we don't have a semantic constraint
             inherited = first.with_tag(LayoutTag.INHERITED)
-            if constraint is None:
-                node.meta[META_KEY] = LayoutConstraint(preferred=inherited)
-            else:
-                constraint.preferred = inherited
+            if _is_passthrough_layout_node(node):
+                constraint.preferred_input = inherited
+            constraint.preferred_output = inherited
 
 
 # ---------------------------------------------------------------------------
@@ -155,11 +346,15 @@ def _backward_propagate(graph_info: GraphInfo) -> None:
 
 
 def _resolve_layouts(graph_info: GraphInfo) -> None:
-    """Copy ``preferred`` into ``layout`` for every annotated node."""
+    """Resolve authoritative input/output layouts for every annotated node."""
     for node in graph_info.graph.nodes:
         constraint = node.meta.get(META_KEY)
-        if constraint is not None and constraint.preferred is not None:
-            constraint.layout = constraint.preferred
+        if constraint is None:
+            continue
+        if constraint.preferred_input is not None:
+            constraint.input_layout = constraint.preferred_input
+        if constraint.preferred_output is not None:
+            constraint.output_layout = constraint.preferred_output
 
 
 # ---------------------------------------------------------------------------
@@ -174,15 +369,15 @@ def _insert_layout_changes(graph_info: GraphInfo) -> None:
     nodes = list(graph_info.graph.nodes)  # snapshot — we mutate the graph
     for node in nodes:
         producer_lc = node.meta.get(META_KEY)
-        if producer_lc is None or producer_lc.layout is None:
+        if producer_lc is None or producer_lc.output_layout is None:
             continue
-        producer_layout = producer_lc.layout
+        producer_layout = producer_lc.output_layout
 
         for user in list(node.users):
             user_lc = user.meta.get(META_KEY)
-            if user_lc is None or user_lc.layout is None:
+            if user_lc is None or user_lc.input_layout is None:
                 continue
-            consumer_layout = user_lc.layout
+            consumer_layout = user_lc.input_layout
 
             if producer_layout.is_compatible(consumer_layout):
                 continue
@@ -221,8 +416,10 @@ def _insert_layout_changes(graph_info: GraphInfo) -> None:
                 if "location" in node.meta:
                     change_node.meta["location"] = node.meta["location"]
                 change_node.meta[META_KEY] = LayoutConstraint(
-                    preferred=consumer_layout,
-                    layout=consumer_layout,
+                    preferred_input=producer_layout,
+                    preferred_output=consumer_layout,
+                    input_layout=producer_layout,
+                    output_layout=consumer_layout,
                 )
                 change_node.meta["cute_layout_change_src"] = producer_layout
 
@@ -241,6 +438,48 @@ def _insert_layout_changes(graph_info: GraphInfo) -> None:
                     consumer_layout.tag.value,
                     user.name,
                 )
+
+
+def _validate_layout_contracts(graph_info: GraphInfo) -> None:
+    """Reject unresolved producer-output -> consumer-input mismatches."""
+    for node in graph_info.graph.nodes:
+        producer_lc = node.meta.get(META_KEY)
+        if producer_lc is None or producer_lc.output_layout is None:
+            continue
+        producer_layout = producer_lc.output_layout
+        for user in node.users:
+            user_lc = user.meta.get(META_KEY)
+            if user_lc is None or user_lc.input_layout is None:
+                continue
+            if user.target is reduce_ops._reduce:
+                # Reduction lowering still has custom fallbacks for arbitrary
+                # producer layouts, so a missed relayout here is not fatal.
+                continue
+            consumer_layout = user_lc.input_layout
+            if (
+                producer_layout.tag is LayoutTag.MMA_ACCUMULATOR
+                and node.op == "call_function"
+                and node.target
+                in {
+                    torch.ops.aten.mm.default,
+                    torch.ops.aten.addmm.default,
+                    torch.ops.aten.baddbmm.default,
+                }
+            ):
+                # Matmul nodes may lower through a fused MMA epilogue or the
+                # scalar fallback, both of which own the accumulator transition
+                # directly instead of requiring an explicit relayout node.
+                continue
+            if producer_layout.is_compatible(consumer_layout):
+                continue
+            raise exc.BackendUnsupported(
+                "cute",
+                (
+                    "unresolved CuTe layout mismatch between "
+                    f"{node.name} ({producer_layout.tag.value}) and "
+                    f"{user.name} ({consumer_layout.tag.value})"
+                ),
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -268,24 +507,54 @@ def _validate_thread_budget_graphs(graphs: list[GraphInfo]) -> None:
 
 
 def _first_input_layout(node: torch.fx.Node) -> ThreadLayout | None:
-    """Return the resolved (or preferred) layout of node's first annotated input."""
+    """Return the preferred/resolved output layout of the first input."""
     for inp in node.all_input_nodes:
         lc = inp.meta.get(META_KEY)
-        if lc is not None:
-            return lc.layout or lc.preferred
+        if lc is None:
+            continue
+        layout = lc.output_layout or lc.preferred_output
+        if layout is not None:
+            return layout
     return None
 
 
 def _collect_user_layouts(node: torch.fx.Node) -> list[ThreadLayout]:
-    """Collect resolved/preferred layouts from all users of *node*."""
+    """Collect preferred/resolved consumer input layouts from all users."""
     layouts: list[ThreadLayout] = []
     for user in node.users:
         lc = user.meta.get(META_KEY)
-        if lc is not None:
-            layout = lc.layout or lc.preferred
-            if layout is not None:
-                layouts.append(layout)
+        if lc is None:
+            continue
+        layout = lc.input_layout or lc.preferred_input
+        if layout is not None:
+            layouts.append(layout)
     return layouts
+
+
+def _constraint_for_node(node: torch.fx.Node) -> LayoutConstraint:
+    constraint = node.meta.get(META_KEY)
+    if constraint is None:
+        constraint = LayoutConstraint()
+        node.meta[META_KEY] = constraint
+    return constraint
+
+
+def _is_passthrough_layout_node(node: torch.fx.Node) -> bool:
+    if node.op != "call_function":
+        return False
+    if node.target is memory_ops.load or node.target is memory_ops.store:
+        return False
+    if node.target is reduce_ops._reduce:
+        return False
+    return not _tracing_ops.is_for_loop_target(node.target)
+
+
+def _is_output_flexible_layout_node(node: torch.fx.Node) -> bool:
+    if node.op != "call_function":
+        return False
+    if node.target is memory_ops.store or node.target is reduce_ops._reduce:
+        return False
+    return not _tracing_ops.is_for_loop_target(node.target)
 
 
 def _tile_numels_match(a: ThreadLayout, b: ThreadLayout) -> bool:

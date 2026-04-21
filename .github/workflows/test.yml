@@ -61,6 +61,7 @@ jobs:
         uses: actions/checkout@v6
 
       - name: Install system dependencies
+        if: runner.os == 'Linux'
         run: |
           set -eux
           SUDO=$(command -v sudo 2>/dev/null || true)
@@ -107,9 +108,10 @@ jobs:
       - name: Install PyTorch
         run: |
           source .venv/bin/activate
-          if [[ "${{ matrix.pytorch-version }}" == "pytorch-2.9" ]]; then
-            # Install stable 2.9 from test channel
-            uv pip install -U "torch==2.9.*" --index-url https://download.pytorch.org/whl/${{ matrix.runtime-version }}
+          if [[ "${{ matrix.pytorch-version }}" == pytorch-[0-9]* ]]; then
+            VERSION="${{ matrix.pytorch-version }}"
+            VERSION="${VERSION#pytorch-}"
+            uv pip install -U "torch==${VERSION}.*" --index-url https://download.pytorch.org/whl/${{ matrix.runtime-version }}
           elif [[ "${{ matrix.runtime-version }}" == "tpu" ]]; then
             # TPU: install CPU-only PyTorch nightly (torch_tpu provides TPU backend)
             uv pip install -U --pre torch --index-url https://download.pytorch.org/whl/nightly/cpu
@@ -122,33 +124,22 @@ jobs:
             uv pip install -U --pre torch --index-url https://download.pytorch.org/whl/nightly/${{ matrix.runtime-version }}
           fi
 
-      - name: Install Triton
-        if: matrix.backend == 'tileir' || (matrix.backend == 'triton' && steps.cache.outputs.cache-hit != 'true' && matrix.pytorch-version != 'pytorch-2.9')
+      - name: Install Triton from source
+        if: matrix.triton-pin != ''
         run: |
           set -x
           source .venv/bin/activate
           apt-get update
-          apt-get install -y git
-          apt-get install -y clang-20 clang++-20 zlib1g-dev
+          apt-get install -y git clang-20 clang++-20 zlib1g-dev
           export CC=clang-20
           export CXX=clang++-20
           mkdir -p /tmp/$USER
           cd /tmp/$USER
           uv pip uninstall triton pytorch-triton || true
           rm -rf triton/ || true
-          if [[ "${{ matrix.backend }}" == "tileir" ]]; then
-            git clone --recursive -b main https://github.com/triton-lang/Triton-to-tile-IR.git triton
-            # Pin to last known-good commit before 13.2 syncup broke Atan2Op build
-            git -C triton checkout 5d3ab8c13c
-          else
-            git clone https://github.com/triton-lang/triton.git triton
-            if [[ "${{ matrix.python-version }}" == "3.14" ]]; then
-              # Pin Python 3.14 nightly to known-good Triton revision until backend detection is fixed upstream.
-              git -C triton checkout 77a13369
-            else
-              git -C triton checkout 9844da95
-            fi
-          fi
+          REPO="${{ matrix.triton-repo || 'https://github.com/triton-lang/triton.git' }}"
+          git clone --recursive "$REPO" triton
+          git -C triton checkout ${{ matrix.triton-pin }}
           cd triton/
           uv pip install -r python/requirements.txt
           MAX_JOBS=$(nproc) TRITON_PARALLEL_LINK_JOBS=2 uv pip install .
@@ -244,6 +235,12 @@ jobs:
           print(f'All {n} devices healthy')
           "
 
+      - name: MPS Availability Check
+        if: matrix.backend == 'metal'
+        run: |
+          source .venv/bin/activate
+          python -c "import torch; assert torch.backends.mps.is_available(), 'MPS not available'"
+
       - name: Run Tests
         run: |
           set -o pipefail
@@ -261,7 +258,7 @@ jobs:
           if [[ "${{ contains(matrix.alias, 'distributed') }}" == "true" ]]; then
             TEST_PATH="test/test_examples_dist.py"
             EXTRA_FLAGS="-rs"
-          elif [[ "${{ matrix.alias }}" == "tpu" ]]; then
+          elif [[ "${{ matrix.alias }}" == "tpu" || "$HELION_BACKEND" == "metal" ]]; then
             TEST_PATH="."
             EXTRA_FLAGS="--ignore=test/test_examples_dist.py"
             PARALLEL=""

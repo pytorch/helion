@@ -31,6 +31,78 @@ class LayoutTag(enum.Enum):
     IDENTITY = "identity"
 
 
+class MatmulAxisRole(enum.Enum):
+    """Semantic role of a logical matmul axis."""
+
+    M = "m"
+    N = "n"
+    K = "k"
+
+
+class MatmulExecutionKind(enum.Enum):
+    """Planner-selected CuTe execution scheme for a matmul node."""
+
+    DIRECT_GROUPED_N = "direct_grouped_n"
+
+
+@dataclass(frozen=True)
+class MatmulOperandAxes:
+    """Logical matmul-axis assignment for one operand/output tensor."""
+
+    m_dim: int | None = None
+    n_dim: int | None = None
+    k_dim: int | None = None
+
+
+@dataclass(frozen=True)
+class MatmulAxisModel:
+    """Planner-owned mapping from tensor dims to matmul M/N/K roles."""
+
+    lhs: MatmulOperandAxes
+    rhs: MatmulOperandAxes
+    out: MatmulOperandAxes
+
+
+@dataclass(frozen=True)
+class MatmulExecutionPlan:
+    """Planner-owned execution layout for a CuTe matmul node."""
+
+    kind: MatmulExecutionKind
+    m_block_id: int
+    scalar_block_id: int
+    bm: int
+    bn: int
+    bk: int
+    groups_per_lane: int
+    lane_extent: int
+
+
+@dataclass(frozen=True)
+class CuTeGridExecutionPlan:
+    """Branch-scoped CuTe thread-axis policy chosen by layout planning."""
+
+    scoped_block_ids: frozenset[int]
+    block_axis_priority: dict[int, int]
+    disable_reduction_axis_reservation_for: frozenset[int]
+
+    def applies_to_block(self, block_id: int) -> bool:
+        return block_id in self.scoped_block_ids
+
+    def applies_to_any_block(self, block_ids: tuple[int, ...] | list[int]) -> bool:
+        return any(block_id in self.scoped_block_ids for block_id in block_ids)
+
+    def priority_for_block(self, block_id: int) -> int | None:
+        if block_id not in self.scoped_block_ids:
+            return None
+        return self.block_axis_priority.get(block_id)
+
+    def disables_reduction_axis_reservation(self, block_id: int) -> bool:
+        return (
+            block_id in self.scoped_block_ids
+            and block_id in self.disable_reduction_axis_reservation_for
+        )
+
+
 def _checked_div(a: SymIntLike, b: SymIntLike) -> SymIntLike:
     """Floor-divide *a* by *b*, asserting exact divisibility for concrete values."""
     if isinstance(a, int) and isinstance(b, int):
@@ -172,11 +244,31 @@ class ThreadLayout:
 class LayoutConstraint:
     """Attached to a node via ``node.meta["cute_layout_constraint"]``.
 
-    * *preferred* -- the layout this node ideally wants (set by rules).
-    * *layout*    -- the resolved layout (set by the planner after propagation).
-    * *required*  -- if True the layout is non-negotiable (e.g. MMA atoms).
+    Layouts are tracked per edge direction:
+
+    * *preferred_input* / *input_layout* describe how this node consumes tensor
+      inputs.
+    * *preferred_output* / *output_layout* describe how this node produces its
+      tensor output.
+    * *required* marks the constraint as non-negotiable for propagation.
+
+    Pointwise / passthrough ops typically resolve both sides to the same
+    layout. Ops like ``load`` only have an output layout, while ``store`` and
+    ``reduce`` only have an input layout.
     """
 
-    preferred: ThreadLayout | None = None
-    layout: ThreadLayout | None = None
+    preferred_input: ThreadLayout | None = None
+    preferred_output: ThreadLayout | None = None
+    input_layout: ThreadLayout | None = None
+    output_layout: ThreadLayout | None = None
+    matmul_axes: MatmulAxisModel | None = None
+    matmul_plan: MatmulExecutionPlan | None = None
     required: bool = False
+
+    def primary_layout(self) -> ThreadLayout | None:
+        """Return the node's main resolved layout for logging/debugging."""
+        return self.input_layout or self.output_layout
+
+    def primary_preferred_layout(self) -> ThreadLayout | None:
+        """Return the node's main preferred layout for logging/debugging."""
+        return self.preferred_input or self.preferred_output

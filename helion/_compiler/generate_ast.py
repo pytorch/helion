@@ -81,6 +81,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
             collections.defaultdict(list)
         )
         self.current_grid_state: DeviceGridState | None = None
+        self.current_root_graph_info: GraphInfo | None = None
         self.max_thread_block_dims = [1, 1, 1]
         self.root_thread_block_dims = [1, 1, 1]
         self.referenced_thread_block_dims = [1, 1, 1]
@@ -437,66 +438,74 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                 self.set_on_device(),
                 self.set_statements(body),
             ):
-                iter_node = node.iter
-                assert isinstance(iter_node, ExtendedAST)
-                with iter_node:
-                    assert isinstance(iter_node, ast.Call)
-                    args = []
-                    kwargs = {}
-                    for arg_node in iter_node.args:
-                        assert not isinstance(arg_node, ast.Starred)
-                        assert isinstance(arg_node, ExtendedAST)
-                        assert arg_node._type_info is not None
-                        args.append(arg_node._type_info.proxy())
-                    for kwarg_node in iter_node.keywords:
-                        assert kwarg_node.arg is not None
-                        assert isinstance(kwarg_node.value, ExtendedAST)
-                        assert kwarg_node.value._type_info is not None
-                        kwargs[kwarg_node.arg] = kwarg_node.value._type_info.proxy()
-                    fn_node = iter_node.func
-                    assert isinstance(fn_node, ExtendedAST)
-                    assert fn_node._type_info is not None
-                    fn = fn_node._type_info.proxy()
-                    assert is_api_func(fn)
-                    env = CompileEnvironment.current()
-                    try:
-                        codegen_fn = fn._codegen[env.codegen_name]
-                    except KeyError:
-                        raise exc.BackendImplementationMissing(
-                            env.backend_name,
-                            f"codegen for API function {fn.__qualname__}",
-                        ) from None
-                    bound = fn._signature.bind(*args, **kwargs)
-                    bound.apply_defaults()
-
-                    from .inductor_lowering import CodegenState
-
-                    state = CodegenState(
-                        self,
-                        fx_node=None,
-                        proxy_args=[*bound.arguments.values()],
-                        # pyrefly: ignore [bad-argument-type]
-                        ast_args=None,
-                    )
-
-                    codegen_fn(state)
                 assert node._root_id is not None
-                root = self.get_graph(
+                root_graph_info = self.get_graph(
                     self.host_function.device_ir.root_ids[node._root_id],
-                ).graph
-                grid_state = self.current_grid_state
-                if (
-                    isinstance(grid_state, DeviceGridState)
-                    and grid_state.has_lane_loops()
-                ):
-                    wrapped_body: list[ast.AST] = []
-                    with self.set_statements(wrapped_body):
+                )
+                previous_root_graph_info = self.current_root_graph_info
+                self.current_root_graph_info = root_graph_info
+                try:
+                    iter_node = node.iter
+                    assert isinstance(iter_node, ExtendedAST)
+                    with iter_node:
+                        assert isinstance(iter_node, ast.Call)
+                        args = []
+                        kwargs = {}
+                        for arg_node in iter_node.args:
+                            assert not isinstance(arg_node, ast.Starred)
+                            assert isinstance(arg_node, ExtendedAST)
+                            assert arg_node._type_info is not None
+                            args.append(arg_node._type_info.proxy())
+                        for kwarg_node in iter_node.keywords:
+                            assert kwarg_node.arg is not None
+                            assert isinstance(kwarg_node.value, ExtendedAST)
+                            assert kwarg_node.value._type_info is not None
+                            kwargs[kwarg_node.arg] = kwarg_node.value._type_info.proxy()
+                        fn_node = iter_node.func
+                        assert isinstance(fn_node, ExtendedAST)
+                        assert fn_node._type_info is not None
+                        fn = fn_node._type_info.proxy()
+                        assert is_api_func(fn)
+                        env = CompileEnvironment.current()
+                        try:
+                            codegen_fn = fn._codegen[env.codegen_name]
+                        except KeyError:
+                            raise exc.BackendImplementationMissing(
+                                env.backend_name,
+                                f"codegen for API function {fn.__qualname__}",
+                            ) from None
+                        bound = fn._signature.bind(*args, **kwargs)
+                        bound.apply_defaults()
+
+                        from .inductor_lowering import CodegenState
+
+                        state = CodegenState(
+                            self,
+                            fx_node=None,
+                            proxy_args=[*bound.arguments.values()],
+                            # pyrefly: ignore [bad-argument-type]
+                            ast_args=None,
+                        )
+
+                        codegen_fn(state)
+                    root = root_graph_info.graph
+                    grid_state = self.current_grid_state
+                    if (
+                        isinstance(grid_state, DeviceGridState)
+                        and grid_state.has_lane_loops()
+                    ):
+                        wrapped_body: list[ast.AST] = []
+                        with self.set_statements(wrapped_body):
+                            codegen_call_with_graph(self, root, [])
+                        self.statements_stack[-1].extend(grid_state.outer_prefix)
+                        self.statements_stack[-1].extend(
+                            grid_state.wrap_body(wrapped_body)
+                        )
+                        self.statements_stack[-1].extend(grid_state.outer_suffix)
+                    else:
                         codegen_call_with_graph(self, root, [])
-                    self.statements_stack[-1].extend(grid_state.outer_prefix)
-                    self.statements_stack[-1].extend(grid_state.wrap_body(wrapped_body))
-                    self.statements_stack[-1].extend(grid_state.outer_suffix)
-                else:
-                    codegen_call_with_graph(self, root, [])
+                finally:
+                    self.current_root_graph_info = previous_root_graph_info
 
                 # Flush deferred RDIM definitions now that block sizes are determined
                 # This ensures block size and rdim vars are defined in the correct order
@@ -721,6 +730,33 @@ def generate_ast(
                 codegen.add_statement(codegen.visit(stmt))
             kernel_def = codegen.device_function.codegen_function_def()
             codegen.host_dead_code_elimination()
+
+            # Wrap output-only tensor allocations in FakeTensorMode()
+            # so they don't allocate real HBM. The launcher returns
+            # the real tensors, reassigning the variables.
+            output_only_names = getattr(
+                CompileEnvironment.current().backend, "_output_only_names", []
+            )
+            if output_only_names:
+                oo_set = set(output_only_names)
+                new_stmts: list[ast.AST] = []
+                for stmt in codegen.host_statements:
+                    if (
+                        isinstance(stmt, ast.Assign)
+                        and len(stmt.targets) == 1
+                        and isinstance(stmt.targets[0], ast.Name)
+                        and stmt.targets[0].id in oo_set
+                        and not getattr(stmt, "_is_kernel_call", False)
+                    ):
+                        with_stmt = statement_from_string(
+                            "with FakeTensorMode(allow_non_fake_inputs=True): pass"
+                        )
+                        assert isinstance(with_stmt, ast.With)
+                        with_stmt.body = [stmt]
+                        new_stmts.append(with_stmt)
+                    else:
+                        new_stmts.append(stmt)
+                codegen.host_statements = new_stmts
 
             # Inject RNG seed buffer creation if needed
             rng_statements = (

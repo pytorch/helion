@@ -239,11 +239,13 @@ elif torch.xpu.is_available():
     DEVICE = torch.device("xpu")
 elif _has_mtia_runtime():
     DEVICE = torch.device("mtia")
+elif _get_backend() == "metal" and torch.backends.mps.is_available():
+    DEVICE = torch.device("mps")
 else:
     DEVICE = torch.device("cuda")
 
 # Half-precision dtype: bfloat16 on TPU (float16 not supported), float16 elsewhere
-if _get_backend() == "pallas":
+if _get_backend() == "pallas" and not is_pallas_interpret():
     HALF_DTYPE = torch.bfloat16
 else:
     HALF_DTYPE = torch.float16
@@ -287,6 +289,11 @@ def skipIfTileIR(reason: str) -> Callable[[Callable], Callable]:
     """Skip test if running with tileir"""
     # Defers check to test execution time to avoid CUDA init during pytest-xdist collection.
     return skipIfFn(lambda: _get_backend() == "tileir", reason)
+
+
+def skipIfMetal(reason: str) -> Callable[[Callable], Callable]:
+    """Skip test if running with metal"""
+    return skipIfFn(lambda: _get_backend() == "metal", reason)
 
 
 def skipIfPallas(reason: str) -> Callable[[Callable], Callable]:

@@ -3,7 +3,9 @@ from __future__ import annotations
 import abc
 import ast
 import functools
+import math
 import operator
+import os
 import re
 from typing import TYPE_CHECKING
 from typing import Any
@@ -620,7 +622,7 @@ class TritonBackend(Backend):
         if is_hip():
             fragments["waves_per_eu"] = EnumFragment(choices=(1, 2, 3, 4))
             if supports_amd_cdna_tunables():
-                fragments["matrix_instr_nonkdim"] = EnumFragment(choices=(0, 16, 32))
+                fragments["matrix_instr_nonkdim"] = EnumFragment(choices=(0, 16))
 
         if supports_mtia_tunables():
             fragments.update(get_mtia_tunable_fragments())
@@ -927,6 +929,9 @@ class PallasBackend(Backend):
     def name(self) -> str:
         return "pallas"
 
+    def max_reduction_threads(self) -> int | None:
+        return None
+
     def dtype_str(self, dtype: torch.dtype) -> str:
         key = str(dtype)
         if key not in _TORCH_TO_JAX_DTYPE:
@@ -966,6 +971,7 @@ class PallasBackend(Backend):
             "_default_pallas_launcher": "from helion.runtime import default_pallas_launcher as _default_pallas_launcher",
             "_default_pallas_pipeline_launcher": "from helion.runtime import default_pallas_pipeline_launcher as _default_pallas_pipeline_launcher",
             "_default_pallas_fori_launcher": "from helion.runtime import default_pallas_fori_launcher as _default_pallas_fori_launcher",
+            "FakeTensorMode": "from torch._subclasses.fake_tensor import FakeTensorMode",
         }
 
     # Config keys that Pallas actually uses.  Everything else
@@ -976,7 +982,6 @@ class PallasBackend(Backend):
             "block_sizes",
             "loop_orders",
             "flatten_loops",
-            "reduction_loops",
             "pallas_loop_type",
         }
     )
@@ -1235,47 +1240,105 @@ class PallasBackend(Backend):
         ``min(block_size, tensor_dim)`` which equals the full array
         dimension -- always valid per TPU rules.
         """
+        from .ast_extension import ExtendedAST
+        from helion._compiler.host_function import HostFunction
+        from helion._compiler.type_propagation import SequenceType
+        from helion._compiler.type_propagation import TensorType
+        from helion._compiler.type_propagation import TileIndexType
+
+        host_func = HostFunction.current()
+
+        class TensorTiledAccessAnalyzer(ast.NodeVisitor):
+            def __init__(self, backend: PallasBackend) -> None:
+                super().__init__()
+                self.backend = backend
+                self.required_alignments: dict[int, int] = {}
+
+            def visit_Subscript(self, node: ast.Subscript) -> None:
+                assert isinstance(node, ExtendedAST)
+                assert isinstance(node.value, ExtendedAST)
+                value_type = node.value._type_info
+                if not isinstance(value_type, TensorType):
+                    return
+                tensor = value_type.fake_value
+                if isinstance(node.slice, (ast.Tuple, ast.List)):
+                    num_squeezed_dimensions = 0
+                    for i, subscript in enumerate(node.slice.elts):
+                        if (
+                            isinstance(subscript, ast.Constant)
+                            and subscript.value is None
+                        ):
+                            num_squeezed_dimensions += 1
+                            continue
+                        accessed_dim = i - num_squeezed_dimensions
+                        self.maybe_update_alignment_requirement(
+                            tensor, accessed_dim, subscript
+                        )
+                else:
+                    self.maybe_update_alignment_requirement(tensor, 0, node.slice)
+
+            def maybe_update_alignment_requirement(
+                self, tensor: torch.Tensor, accessed_dim_start: int, subscript: ast.AST
+            ) -> None:
+                if not isinstance(subscript, ExtendedAST):
+                    return
+                subscript_type = subscript._type_info
+                tile_index_types: list[TileIndexType] = []
+                if isinstance(subscript_type, TileIndexType):
+                    tile_index_types.append(subscript_type)
+                elif isinstance(subscript_type, SequenceType):
+                    for el_type in subscript_type.element_types:
+                        if isinstance(el_type, TileIndexType):
+                            tile_index_types.append(el_type)
+
+                for i, tile_index_type in enumerate(tile_index_types):
+                    bid = tile_index_type.block_id
+                    accessed_dim = accessed_dim_start + i
+                    dim_from_end = tensor.ndim - accessed_dim - 1
+                    bitwidth = tensor.dtype.itemsize * 8
+
+                    required_alignment = self.backend._get_pallas_required_alignment(
+                        dim_from_end, tensor.ndim, bitwidth
+                    )
+                    self.maybe_update_required_alignment(bid, required_alignment)
+
+            def maybe_update_required_alignment(
+                self, bid: int, required_alignment: int
+            ) -> None:
+                if bid not in self.required_alignments:
+                    self.required_alignments[bid] = required_alignment
+                else:
+                    self.required_alignments[bid] = max(
+                        self.required_alignments[bid], required_alignment
+                    )
+
+        analyzer = TensorTiledAccessAnalyzer(self)
+        for stmt in host_func.body:
+            analyzer.visit(stmt)
+
         from torch._inductor.runtime.runtime_utils import next_power_of_2
 
         from ..autotuner.config_spec import BlockSizeSpec
         from .compile_environment import BlockSizeInfo
 
-        # Map block_id -> minimum dim_from_end across all tensors
-        min_dim_from_end: dict[int, int] = {}
-        min_tensor_ndim: dict[int, int] = {}
         if block_sizes is not None and kernel_tensor_sizes is not None:
             for shape in kernel_tensor_sizes:
-                tensor_ndim = len(shape)
-                for d, dim_expr in enumerate(shape):
-                    for info in block_sizes:
-                        if not isinstance(info, BlockSizeInfo):
-                            continue
-                        if info.dim_matches(
-                            dim_expr  # pyrefly: ignore[bad-argument-type]
-                        ):
-                            dfe = tensor_ndim - 1 - d
-                            if info.block_id not in min_dim_from_end:
-                                min_dim_from_end[info.block_id] = dfe
-                                min_tensor_ndim[info.block_id] = tensor_ndim
-                            else:
-                                min_dim_from_end[info.block_id] = min(
-                                    min_dim_from_end[info.block_id], dfe
-                                )
-                                min_tensor_ndim[info.block_id] = min(
-                                    min_tensor_ndim[info.block_id],
-                                    tensor_ndim,
-                                )
+                for bid, info in enumerate(block_sizes):
+                    if not isinstance(info, BlockSizeInfo):
+                        continue
+                    # pyrefly: ignore[no-matching-overload]
+                    if math.prod(shape) == info.var:
+                        # avoid creating size-1 kernel tensors, which triggers Pallas Mosaic lowering failure:
+                        # https://github.com/jax-ml/jax/issues/36970
+                        analyzer.maybe_update_required_alignment(bid, 2)
 
-        for i, spec in enumerate(block_specs):
+        for spec in block_specs:
             if not isinstance(spec, BlockSizeSpec):
                 continue
             bid = spec.block_ids[0]
-            dim_from_end = min_dim_from_end.get(bid, ndim - 1 - i)
-            tensor_ndim = min_tensor_ndim.get(bid, ndim)
-            requirement_alignment = self._get_pallas_required_alignment(
-                dim_from_end, tensor_ndim, min_element_bits
-            )
-
+            if bid not in analyzer.required_alignments:
+                continue
+            requirement_alignment = analyzer.required_alignments[bid]
             # When the tensor dim is smaller than the alignment, any
             # block_size >= tensor_dim will be capped to tensor_dim at
             # runtime (full-dim access, always valid).  Use the
@@ -1525,6 +1588,18 @@ class PallasBackend(Backend):
                     # Input tensor mutated in-place
                     output_indices.append(i)
                     inplace_indices.append(i)
+
+        # Collect output-only tensor names for FakeTensorMode wrapping
+        # and launcher return capture in codegen.
+        output_only_set = set(output_indices) - set(inplace_indices)
+        output_only_names: list[str] = []
+        if sorted_args is not None:
+            for i in output_indices:
+                if i in output_only_set:
+                    arg = sorted_args[i]
+                    assert isinstance(arg, TensorArg)
+                    output_only_names.append(arg.host_str())
+        self._output_only_names = output_only_names
 
         launcher_args = [*args, f"_output_indices={output_indices}"]
         launcher_args.append(f"_inplace_indices={inplace_indices}")
@@ -1909,6 +1984,70 @@ def _loop_contains_matmul(
     return False
 
 
+def _loop_contains_atomic(
+    fn: DeviceFunction,
+    block_ids: list[int],
+) -> bool:
+    from ..language import atomic_ops
+    from ..language._decorators import is_api_func
+    from .device_ir import RootGraphInfo
+    from .host_function import HostFunction
+
+    atomic_targets = {
+        atomic_ops.atomic_add,
+        atomic_ops.atomic_and,
+        atomic_ops.atomic_cas,
+        atomic_ops.atomic_max,
+        atomic_ops.atomic_min,
+        atomic_ops.atomic_or,
+        atomic_ops.atomic_xchg,
+        atomic_ops.atomic_xor,
+    }
+    device_ir = HostFunction.current().device_ir
+    graph_by_id = {
+        graph_info.graph_id: graph_info
+        for graph_info in fn.codegen.codegen_graphs
+        if hasattr(graph_info, "graph")
+    }
+
+    def graph_contains_atomic(graph: object) -> bool:
+        if not isinstance(graph, torch.fx.Graph):
+            return False
+        for node in graph.nodes:
+            if node.op != "call_function":
+                continue
+            if node.target in atomic_targets:
+                return True
+            if is_api_func(node.target) and getattr(node.target, "__name__", "") in {
+                "_for_loop",
+                "_for_loop_step",
+            }:
+                graph_id = node.args[0] if node.args else None
+                if isinstance(graph_id, int):
+                    nested = graph_by_id.get(graph_id)
+                    if nested is not None and graph_contains_atomic(nested.graph):
+                        return True
+        return False
+
+    def graph_matches_loop(graph_info: object) -> bool:
+        if getattr(graph_info, "block_ids", None) == block_ids:
+            return True
+        if not isinstance(graph_info, RootGraphInfo):
+            return False
+        phase_index = graph_info.phase_index
+        return (
+            0 <= phase_index < len(device_ir.grid_block_ids)
+            and device_ir.grid_block_ids[phase_index] == block_ids
+        )
+
+    for graph_info in fn.codegen.codegen_graphs:
+        if not graph_matches_loop(graph_info):
+            continue
+        if graph_contains_atomic(getattr(graph_info, "graph", None)):
+            return True
+    return False
+
+
 def _graph_used_block_ids(
     fn: DeviceFunction,
     block_ids: list[int],
@@ -2081,6 +2220,10 @@ class CuteBackend(Backend):
             "cute": "import cutlass.cute as cute",
             "_default_cute_launcher": "from helion.runtime import default_cute_launcher as _default_cute_launcher",
             "_next_power_of_2": "from helion._utils import next_power_of_2 as _next_power_of_2",
+            "_cute_argreduce_index": "from helion._compiler.cute.reduce_helpers import _cute_argreduce_index",
+            "_cute_grouped_reduce_shared_tree": "from helion._compiler.cute.reduce_helpers import _cute_grouped_reduce_shared_tree",
+            "_cute_grouped_reduce_shared_two_stage": "from helion._compiler.cute.reduce_helpers import _cute_grouped_reduce_shared_two_stage",
+            "_cute_grouped_reduce_warp": "from helion._compiler.cute.reduce_helpers import _cute_grouped_reduce_warp",
         }
 
     def program_id_expr(self, dim: int, *, index_dtype: str) -> str:
@@ -2665,7 +2808,6 @@ class CuteBackend(Backend):
                 num_threads_config=original_num_threads_config,
                 grid_ids=grid_ids,
             )
-            may_use_mma = _loop_may_use_mma(fn, block_ids)
             should_filter_inactive_block_ids = len(block_ids) > 1
             inactive_block_ids: set[int] = set()
             if should_filter_inactive_block_ids:
@@ -2694,13 +2836,19 @@ class CuteBackend(Backend):
                         num_threads_config[i] = 1
             thread_limit = MAX_THREADS_PER_BLOCK
             if len(block_ids) > 1 and _loop_contains_matmul(fn, block_ids):
-                if mma_candidate or may_use_mma:
+                forced_mma_impl = os.environ.get("HELION_CUTE_MMA_IMPL", "auto")
+                if mma_candidate or (
+                    _loop_may_use_mma(fn, block_ids)
+                    and not _loop_contains_atomic(fn, block_ids)
+                    and forced_mma_impl.strip().lower() != "auto"
+                ):
                     thread_limit = MAX_THREADS_PER_BLOCK
                 else:
-                    # Matmul-heavy CuTe kernels can be register/smem limited
-                    # well before the 1024-thread hard cap. Keep their
-                    # auto-threaded ND tiles within 256 threads and let lane
-                    # loops cover the rest.
+                    # Matmul-heavy CuTe kernels with no viable MMA path, and
+                    # especially atomic-accumulating split-K loops, can be
+                    # register/smem limited well before the 1024-thread hard
+                    # cap. Keep those auto-threaded ND tiles within 256
+                    # threads and let lane loops cover the rest.
                     thread_limit = min(thread_limit, 256)
             if should_filter_inactive_block_ids and mma_candidate:
                 inactive_block_ids.clear()

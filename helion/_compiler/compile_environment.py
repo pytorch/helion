@@ -163,7 +163,7 @@ class CompileEnvironment:
         self.kernel_min_element_bits: int = 32  # smallest dtype bits across all tensors
         self.specialized_vars: set[sympy.Symbol] = set()
         self.specialized_strides: set[tuple[str, int]] = set()
-        self.jagged_tile_parent_id: dict[int, int] = {}
+        self.jagged_tile_parent_ids: dict[int, list[int]] = {}
         self.jagged_tile_mask_shapes: dict[int, list[torch.SymInt]] = {}
         self._symint_cache: dict[object, torch.SymInt] = {}
         self._foreign_symint_cache: dict[tuple[int, sympy.Expr], torch.SymInt] = {}
@@ -1020,11 +1020,11 @@ class CompileEnvironment:
             return candidate
         return block_id
 
-    def register_jagged_tile(self, block_id: int, parent_id: int) -> None:
-        self.jagged_tile_parent_id[block_id] = parent_id
+    def register_jagged_tile(self, block_id: int, parent_ids: list[int]) -> None:
+        self.jagged_tile_parent_ids[block_id] = parent_ids
 
     def is_jagged_tile(self, block_id: int) -> bool:
-        return block_id in self.jagged_tile_parent_id
+        return block_id in self.jagged_tile_parent_ids
 
 
 class NoCurrentEnvironment(RuntimeError):

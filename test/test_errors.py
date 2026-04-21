@@ -94,7 +94,7 @@ class TestErrors(RefEagerTestDisabled, TestCase):
 
         with (
             mock.patch.object(
-                PopulationBasedSearch, "parallel_benchmark_flat", fake_parallel
+                PopulationBasedSearch, "benchmark_flat_batch", fake_parallel
             ),
             self.assertRaises(helion.exc.NoConfigFound),
         ):
@@ -702,8 +702,8 @@ class TestInvalidConfig(RefEagerTestDisabled, TestCase):
             result.config, original_unflatten(search.config_gen.default_flat())
         )
 
-    def test_parallel_benchmark_flat_preserves_length(self):
-        """parallel_benchmark_flat returns same-length list with inf-perf error
+    def test_benchmark_flat_batch_preserves_length(self):
+        """benchmark_flat_batch returns same-length list with inf-perf error
         members for invalid configs."""
         fake_kernel = _make_fake_kernel()
         search = DifferentialEvolutionSearch(fake_kernel, args=())
@@ -735,10 +735,10 @@ class TestInvalidConfig(RefEagerTestDisabled, TestCase):
         with (
             mock.patch.object(search.config_gen, "unflatten", selective_unflatten),
             mock.patch.object(
-                search, "parallel_benchmark_population", fake_benchmark_population
+                search, "benchmark_population", fake_benchmark_population
             ),
         ):
-            result = search.parallel_benchmark_flat(to_check)
+            result = search.benchmark_flat_batch(to_check)
 
         self.assertEqual(len(result), len(to_check))
         for i, member in enumerate(result):
@@ -845,7 +845,7 @@ class TestInvalidConfig(RefEagerTestDisabled, TestCase):
         with (
             mock.patch.object(search, "make_unbenchmarked", make_only_default),
             mock.patch.object(
-                search, "parallel_benchmark_population", fake_benchmark_population
+                search, "benchmark_population", fake_benchmark_population
             ),
             mock.patch.object(
                 search, "rebenchmark_population", lambda self, *a, **kw: None

@@ -120,11 +120,56 @@ def pallas_sum_reduction(x: torch.Tensor) -> torch.Tensor:
 
 
 @helion.kernel(backend="pallas", static_shapes=True)
+def pallas_sum_reduce_dim0(x: torch.Tensor) -> torch.Tensor:
+    _n, m = x.size()
+    out = torch.empty([m], dtype=x.dtype, device=x.device)
+    for tile_m in hl.tile(m):
+        out[tile_m] = x[:, tile_m].sum(0)
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
+def pallas_sum_reduce_middle(x: torch.Tensor) -> torch.Tensor:
+    b, _n, m = x.size()
+    out = torch.empty([b, m], dtype=x.dtype, device=x.device)
+    for tile_b, tile_m in hl.tile([b, m]):
+        out[tile_b, tile_m] = x[tile_b, :, tile_m].sum(1)
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
+def pallas_sum_reduce_multiple(x: torch.Tensor) -> torch.Tensor:
+    b, _n, _m = x.size()
+    out = torch.empty([b], dtype=x.dtype, device=x.device)
+    for tile_b in hl.tile(b):
+        out[tile_b] = x[tile_b, :, :].sum([0, 1])
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
 def pallas_max_reduction(x: torch.Tensor) -> torch.Tensor:
     n, _m = x.size()
     out = torch.empty([n], dtype=x.dtype, device=x.device)
     for tile_n in hl.tile(n):
         out[tile_n] = torch.amax(x[tile_n, :], dim=-1)
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
+def pallas_min_reduction(x: torch.Tensor) -> torch.Tensor:
+    n, _m = x.size()
+    out = torch.empty([n], dtype=x.dtype, device=x.device)
+    for tile_n in hl.tile(n):
+        out[tile_n] = torch.amin(x[tile_n, :], dim=-1)
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
+def pallas_argmin_reduction(x: torch.Tensor) -> torch.Tensor:
+    n, _m = x.size()
+    out = torch.empty([n], dtype=torch.int32, device=x.device)
+    for tile_n in hl.tile(n):
+        out[tile_n] = torch.argmin(x[tile_n, :], dim=-1).to(torch.int32)
     return out
 
 
@@ -398,11 +443,48 @@ class TestPallas(TestCase):
         self.assertIn("jnp.sum", code)
         torch.testing.assert_close(result, x.sum(-1), rtol=1e-4, atol=1e-4)
 
+    def test_sum_reduction_large(self) -> None:
+        x = torch.randn(8, 16384, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(pallas_sum_reduction, (x,), block_size=1)
+        self.assertIn("jnp.sum", code)
+        torch.testing.assert_close(result, x.sum(-1), rtol=1e-3, atol=1e-3)
+
+    def test_sum_reduce_dim0(self) -> None:
+        x = torch.randn(64, 32, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(pallas_sum_reduce_dim0, (x,), block_size=16)
+        self.assertIn("jnp.sum", code)
+        torch.testing.assert_close(result, x.sum(0), rtol=1e-4, atol=1e-4)
+
+    def test_sum_reduce_middle(self) -> None:
+        x = torch.randn(4, 64, 32, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(
+            pallas_sum_reduce_middle, (x,), block_sizes=[2, 16]
+        )
+        self.assertIn("jnp.sum", code)
+        torch.testing.assert_close(result, x.sum(1), rtol=1e-4, atol=1e-4)
+
+    def test_sum_reduce_multiple(self) -> None:
+        x = torch.randn(4, 32, 64, device=DEVICE, dtype=torch.float32)
+        with self.assertRaises(NotImplementedError):
+            code_and_output(pallas_sum_reduce_multiple, (x,), block_size=2)
+
     def test_max_reduction(self) -> None:
         x = torch.randn(32, 64, device=DEVICE, dtype=torch.float32)
         code, result = code_and_output(pallas_max_reduction, (x,), block_size=16)
         self.assertIn("jnp.max", code)
         torch.testing.assert_close(result, torch.amax(x, dim=-1), rtol=1e-4, atol=1e-4)
+
+    def test_min_reduction(self) -> None:
+        x = torch.randn(32, 64, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(pallas_min_reduction, (x,), block_size=16)
+        self.assertIn("jnp.min", code)
+        torch.testing.assert_close(result, torch.amin(x, dim=-1), rtol=1e-4, atol=1e-4)
+
+    def test_argmin_reduction(self) -> None:
+        x = torch.randn(32, 64, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(pallas_argmin_reduction, (x,), block_size=16)
+        self.assertIn("jnp.argmin", code)
+        torch.testing.assert_close(result, torch.argmin(x, dim=-1).to(torch.int32))
 
     def test_tile_begin_end(self) -> None:
         x = torch.randn(1024, device=DEVICE, dtype=torch.float32)
@@ -474,6 +556,38 @@ class TestPallas(TestCase):
         expected = torch.bmm(a.float(), b.float()).to(torch.bfloat16)
         torch.testing.assert_close(result, expected, rtol=1e-2, atol=1e-2)
 
+    @xfailIfPallas(
+        "reduction tile K=256 doesn't evenly divide K=384, last tile reads OOB"
+    )
+    def test_bmm_fori_loop_non_divisible_k(self) -> None:
+        """Test fori_loop bmm where BLOCK_K=256 doesn't evenly divide K=384."""
+        a = torch.randn(4, 128, 384, device=DEVICE, dtype=torch.bfloat16)
+        b = torch.randn(4, 384, 128, device=DEVICE, dtype=torch.bfloat16)
+        _code, result = code_and_output(
+            pallas_bmm,
+            (a, b),
+            block_sizes=[4, 128, 128, 256],
+            pallas_loop_type="fori_loop",
+        )
+        expected = torch.bmm(a.float(), b.float()).to(torch.bfloat16)
+        torch.testing.assert_close(result, expected, rtol=1e-2, atol=1e-2)
+
+    @xfailIfPallas(
+        "reduction tile K=256 doesn't evenly divide K=384, last tile reads OOB"
+    )
+    def test_bmm_emit_pipeline_non_divisible_k(self) -> None:
+        """Test emit_pipeline bmm where BLOCK_K=256 doesn't evenly divide K=384."""
+        a = torch.randn(4, 128, 384, device=DEVICE, dtype=torch.bfloat16)
+        b = torch.randn(4, 384, 128, device=DEVICE, dtype=torch.bfloat16)
+        _code, result = code_and_output(
+            pallas_bmm,
+            (a, b),
+            block_sizes=[4, 128, 128, 256],
+            pallas_loop_type="emit_pipeline",
+        )
+        expected = torch.bmm(a.float(), b.float()).to(torch.bfloat16)
+        torch.testing.assert_close(result, expected, rtol=1e-2, atol=1e-2)
+
     def test_emit_pipeline_codegen(self) -> None:
         """Test that pallas_loop_type='emit_pipeline' generates correct emit_pipeline code."""
         args = (
@@ -489,6 +603,8 @@ class TestPallas(TestCase):
         self.assertIn("pltpu.emit_pipeline", code)
         self.assertIn("pl.BlockSpec", code)
         torch.testing.assert_close(result, args[0] + args[1])
+        # out is output-only, excluded from pallas_call inputs
+        self.assertIn("_inplace_indices=[]", code)
 
     def test_fori_loop_codegen(self) -> None:
         """Test that pallas_loop_type='fori_loop' generates correct fori_loop code."""
@@ -506,6 +622,8 @@ class TestPallas(TestCase):
         self.assertIn("pltpu.make_async_copy", code)
         self.assertNotIn("pltpu.emit_pipeline", code)
         torch.testing.assert_close(result, args[0] + args[1])
+        # out is output-only, excluded from pallas_call inputs
+        self.assertIn("_inplace_indices=[]", code)
 
     def test_attention_default_fp32(self) -> None:
         """Test attention with default (for-loop) inner loop."""
@@ -634,7 +752,6 @@ class TestPallas(TestCase):
         expected[42, 79] = x[42, 79]
         torch.testing.assert_close(result, expected)
 
-    @xfailIfPallas("Result mismatch due to incorrect tiling")
     def test_scalar_index_transpose(self) -> None:
         """Scalar .begin index should collapse the dimension.
 
@@ -787,11 +904,24 @@ class TestPallas(TestCase):
         torch.testing.assert_close(result, expected)
 
     def test_output_only_not_inplace(self) -> None:
-        """Output-only tensors should not appear in _inplace_indices."""
+        """Output-only tensors should not appear in _inplace_indices.
+
+        When _output_indices has more entries than _inplace_indices, the
+        extra outputs are excluded from pallas_call inputs and
+        input_output_aliases, eliminating the OpSplitMode::kSplitBoth
+        graph split in torch_tpu.
+        """
         x = torch.randn(1024, device=DEVICE, dtype=torch.float32)
         code, result = code_and_output(pallas_relu, (x,), block_sizes=[1024])
         torch.testing.assert_close(result, torch.relu(x))
+        # out is in _output_indices but not _inplace_indices, so it's
+        # excluded from pallas_call inputs (no donation, no graph split).
+        self.assertIn("_output_indices=[1]", code)
         self.assertIn("_inplace_indices=[]", code)
+        # Output-only allocation wrapped in FakeTensorMode (no real HBM).
+        self.assertIn("FakeTensorMode", code)
+        # Launcher return captured into output variable.
+        self.assertIn("out = _launcher(", code)
 
     def test_new_empty_output_only(self) -> None:
         """new_empty allocations should also be recognized as output-only."""
@@ -807,6 +937,8 @@ class TestPallas(TestCase):
         code, result = code_and_output(new_empty_relu, (x,), block_sizes=[1024])
         torch.testing.assert_close(result, torch.relu(x))
         self.assertIn("_inplace_indices=[]", code)
+        self.assertIn("FakeTensorMode", code)
+        self.assertIn("out = _launcher(", code)
 
     def test_mixed_inplace_and_output_only(self) -> None:
         """Kernel with both an inplace-mutated input and an output-only tensor.
@@ -827,8 +959,12 @@ class TestPallas(TestCase):
         expected_out = (x + 1.0) * 2.0
         code, result = code_and_output(inplace_and_output, (x,), block_sizes=[1024])
         torch.testing.assert_close(result, expected_out)
-        # x is inplace-mutated (index 0), out is output-only (not in inplace)
+        # 2 outputs (x and out), but only x is aliased (inplace).
+        # out is excluded from pallas_call inputs.
+        self.assertIn("_output_indices=[0, 1]", code)
         self.assertIn("_inplace_indices=[0]", code)
+        self.assertIn("FakeTensorMode", code)
+        self.assertIn("out = _launcher(", code)
 
     def test_empty_like_read_stays_inplace(self) -> None:
         """An empty_like output that is also read should stay in _inplace_indices."""
@@ -846,6 +982,8 @@ class TestPallas(TestCase):
         torch.testing.assert_close(result, x + 1.0)
         # out is read after write, so it must be in _inplace_indices
         self.assertIn("_inplace_indices=[1]", code)
+        # Not output-only, so no FakeTensorMode wrapping.
+        self.assertNotIn("FakeTensorMode", code)
 
     def test_int64_tensor_raises(self) -> None:
         """Passing int64 tensors to a Pallas kernel should raise TypeError."""
@@ -853,6 +991,30 @@ class TestPallas(TestCase):
         y = torch.arange(256, device=DEVICE, dtype=torch.int64)
         with self.assertRaises(TypeError, msg="does not support"):
             code_and_output(add_kernel, (x, y), block_size=128)
+
+    def test_multiple_output_only(self) -> None:
+        """Kernel returning two output-only tensors."""
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def two_outputs(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            out1 = torch.empty_like(x)
+            out2 = torch.empty_like(x)
+            for tile in hl.tile(x.size()):
+                out1[tile] = x[tile] + 1.0
+                out2[tile] = x[tile] * 2.0
+            return out1, out2
+
+        x = torch.randn(1024, device=DEVICE, dtype=torch.float32)
+        code, (result1, result2) = code_and_output(
+            two_outputs, (x,), block_sizes=[1024]
+        )
+        torch.testing.assert_close(result1, x + 1.0)
+        torch.testing.assert_close(result2, x * 2.0)
+        # Both outputs are output-only: 2 outputs, 0 aliases
+        self.assertIn("_output_indices=[1, 2]", code)
+        self.assertIn("_inplace_indices=[]", code)
+        self.assertIn("FakeTensorMode", code)
+        self.assertIn("out1, out2 = _launcher(", code)
 
     def test_fori_loop_multidim(self) -> None:
         """Test fori_loop with a 2D inner loop (nested iteration)."""
@@ -943,7 +1105,7 @@ class TestPallas(TestCase):
         M = 128
         x = torch.randn(N, device=DEVICE, dtype=torch.float32)
         y = torch.randn(M, device=DEVICE, dtype=torch.float32)
-        result = fn(x, y)
+        code, result = code_and_output(fn, (x, y))
         expected = (x[:, None] < y[None, :]).to(torch.float32)
         torch.testing.assert_close(result, expected)
 

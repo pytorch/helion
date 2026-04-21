@@ -34,9 +34,9 @@ This document explains how to work effectively in this repository.
 - Framework: PyTest. Place tests in `test/` and name `test_<feature>.py`.
 - Use helpers in `helion._testing` (e.g., `check_example`).
 - Runtime: Many tests require CUDA, PyTorch nightly, and Triton dev builds; keep each test fast (<~30s).
-- Local tips: For iteration, use `-k`, or set `HELION_USE_DEFAULT_CONFIG=1` to skip autotuning.
-  - Warning: Do not run the full test suite with `HELION_USE_DEFAULT_CONFIG=1` — it can change execution paths and break tests. Only use this env var for targeted local iteration on specific tests.
-- Helpful env vars: `HELION_LOGS=all|+all`, `HELION_PRINT_OUTPUT_CODE=1`, `HELION_USE_DEFAULT_CONFIG=1`.
+- Local tips: For iteration, use `-k`, or set `HELION_AUTOTUNE_EFFORT=none` to skip autotuning.
+  - Warning: Do not run the full test suite with `HELION_AUTOTUNE_EFFORT=none` — it can change execution paths and break tests. Only use this env var for targeted local iteration on specific tests.
+- Helpful env vars: `HELION_LOGS=all|+all`, `HELION_PRINT_OUTPUT_CODE=1`, `HELION_AUTOTUNE_EFFORT=none`.
 
 ### PyTest Debugging Tips
 

@@ -814,13 +814,27 @@ class DeviceFunction:
             has_barrier=env.has_barrier,
             sorted_args=arg_objects,
         )
-        # TODO(jansel): we should run CSE this statement
-        call_statement = statement_from_string(
-            f"_launcher({self.name}, {{call_grid_expr}}, {', '.join(call_args)})",
-            call_grid_expr=call_grid_expr,
+        # Check if the backend wants to capture return values for output-only tensors.
+        output_only_names = getattr(backend, "_output_only_names", [])
+        launcher_call = (
+            f"_launcher({self.name}, {{call_grid_expr}}, {', '.join(call_args)})"
         )
+        if output_only_names:
+            if len(output_only_names) == 1:
+                assign_target = output_only_names[0]
+            else:
+                assign_target = ", ".join(output_only_names)
+            call_statement = statement_from_string(
+                f"{assign_target} = {launcher_call}",
+                call_grid_expr=call_grid_expr,
+            )
+        else:
+            call_statement = statement_from_string(
+                launcher_call,
+                call_grid_expr=call_grid_expr,
+            )
         assert isinstance(call_statement, ExtendedAST)
-        # Mark the kernel call we can find it in codegen_precompile_def
+        # Mark the kernel call so we can find it in codegen_precompile_def
         call_statement._is_kernel_call = True
         return call_statement
 

@@ -6,7 +6,7 @@
 #
 # Examples:
 #   scripts/run-on-tpu.sh python -c 'import jax; print(jax.devices())'
-#   scripts/run-on-tpu.sh HELION_USE_DEFAULT_CONFIG=1 python -m pytest test/test_pallas.py -x
+#   scripts/run-on-tpu.sh HELION_AUTOTUNE_EFFORT=none python -m pytest test/test_pallas.py -x
 #
 # Environment variables:
 #   TPU_HOST        SSH host alias (default: tpu)

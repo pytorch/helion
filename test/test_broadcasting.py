@@ -52,23 +52,19 @@ class TestBroadcasting(RefEagerTestBase, TestCase):
         args = [torch.randn(512, 512, device=DEVICE), torch.randn(512, device=DEVICE)]
         assert not broadcast_fn.bind(args).config_spec.flatten_loops
 
-    @xfailIfPallas("[16, 8] isn't a valid tiling for this kernel in Pallas")
     def test_broadcast1(self):
         _check_broadcast_fn(
             block_sizes=[16, 8],
         )
 
-    @xfailIfPallas("[16, 8] isn't a valid tiling for this kernel in Pallas")
     def test_broadcast2(self):
         _check_broadcast_fn(block_size=[16, 8], loop_order=(1, 0))
 
-    @xfailIfPallas("[64, 1] isn't a valid tiling for this kernel in Pallas")
     def test_broadcast3(self):
         _check_broadcast_fn(
             block_sizes=[64, 1],
         )
 
-    @xfailIfPallas("[1, 64] isn't a valid tiling for this kernel in Pallas")
     def test_broadcast4(self):
         _check_broadcast_fn(
             block_sizes=[1, 64],
@@ -76,7 +72,6 @@ class TestBroadcasting(RefEagerTestBase, TestCase):
 
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfTileIR("TileIR does not support block_ptr indexing")
-    @xfailIfPallas("[32, 32] isn't a valid tiling for this kernel in Pallas")
     def test_broadcast5(self):
         code = _check_broadcast_fn(
             block_sizes=[32, 32],
