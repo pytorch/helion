@@ -5,6 +5,7 @@ import ast
 import functools
 import math
 import operator
+import os
 import re
 from typing import TYPE_CHECKING
 from typing import Any
@@ -1970,6 +1971,70 @@ def _loop_contains_matmul(
     return False
 
 
+def _loop_contains_atomic(
+    fn: DeviceFunction,
+    block_ids: list[int],
+) -> bool:
+    from ..language import atomic_ops
+    from ..language._decorators import is_api_func
+    from .device_ir import RootGraphInfo
+    from .host_function import HostFunction
+
+    atomic_targets = {
+        atomic_ops.atomic_add,
+        atomic_ops.atomic_and,
+        atomic_ops.atomic_cas,
+        atomic_ops.atomic_max,
+        atomic_ops.atomic_min,
+        atomic_ops.atomic_or,
+        atomic_ops.atomic_xchg,
+        atomic_ops.atomic_xor,
+    }
+    device_ir = HostFunction.current().device_ir
+    graph_by_id = {
+        graph_info.graph_id: graph_info
+        for graph_info in fn.codegen.codegen_graphs
+        if hasattr(graph_info, "graph")
+    }
+
+    def graph_contains_atomic(graph: object) -> bool:
+        if not isinstance(graph, torch.fx.Graph):
+            return False
+        for node in graph.nodes:
+            if node.op != "call_function":
+                continue
+            if node.target in atomic_targets:
+                return True
+            if is_api_func(node.target) and getattr(node.target, "__name__", "") in {
+                "_for_loop",
+                "_for_loop_step",
+            }:
+                graph_id = node.args[0] if node.args else None
+                if isinstance(graph_id, int):
+                    nested = graph_by_id.get(graph_id)
+                    if nested is not None and graph_contains_atomic(nested.graph):
+                        return True
+        return False
+
+    def graph_matches_loop(graph_info: object) -> bool:
+        if getattr(graph_info, "block_ids", None) == block_ids:
+            return True
+        if not isinstance(graph_info, RootGraphInfo):
+            return False
+        phase_index = graph_info.phase_index
+        return (
+            0 <= phase_index < len(device_ir.grid_block_ids)
+            and device_ir.grid_block_ids[phase_index] == block_ids
+        )
+
+    for graph_info in fn.codegen.codegen_graphs:
+        if not graph_matches_loop(graph_info):
+            continue
+        if graph_contains_atomic(getattr(graph_info, "graph", None)):
+            return True
+    return False
+
+
 def _graph_used_block_ids(
     fn: DeviceFunction,
     block_ids: list[int],
@@ -2730,7 +2795,6 @@ class CuteBackend(Backend):
                 num_threads_config=original_num_threads_config,
                 grid_ids=grid_ids,
             )
-            may_use_mma = _loop_may_use_mma(fn, block_ids)
             should_filter_inactive_block_ids = len(block_ids) > 1
             inactive_block_ids: set[int] = set()
             if should_filter_inactive_block_ids:
@@ -2759,13 +2823,19 @@ class CuteBackend(Backend):
                         num_threads_config[i] = 1
             thread_limit = MAX_THREADS_PER_BLOCK
             if len(block_ids) > 1 and _loop_contains_matmul(fn, block_ids):
-                if mma_candidate or may_use_mma:
+                forced_mma_impl = os.environ.get("HELION_CUTE_MMA_IMPL", "auto")
+                if mma_candidate or (
+                    _loop_may_use_mma(fn, block_ids)
+                    and not _loop_contains_atomic(fn, block_ids)
+                    and forced_mma_impl.strip().lower() != "auto"
+                ):
                     thread_limit = MAX_THREADS_PER_BLOCK
                 else:
-                    # Matmul-heavy CuTe kernels can be register/smem limited
-                    # well before the 1024-thread hard cap. Keep their
-                    # auto-threaded ND tiles within 256 threads and let lane
-                    # loops cover the rest.
+                    # Matmul-heavy CuTe kernels with no viable MMA path, and
+                    # especially atomic-accumulating split-K loops, can be
+                    # register/smem limited well before the 1024-thread hard
+                    # cap. Keep those auto-threaded ND tiles within 256
+                    # threads and let lane loops cover the rest.
                     thread_limit = min(thread_limit, 256)
             if should_filter_inactive_block_ids and mma_candidate:
                 inactive_block_ids.clear()

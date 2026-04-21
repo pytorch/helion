@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import ast
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import cast
 
 import sympy
 import torch
+from torch.fx.node import Node
 
 from ...language.memory_ops import load
 from ..ast_extension import expr_from_string
@@ -23,6 +25,13 @@ if TYPE_CHECKING:
 
     from ..aten_lowering import LoweringContext
     from ..helper_function import CodegenInterface
+
+
+@dataclass(frozen=True)
+class DirectGroupedNLoadPlan:
+    lhs_k_offset: int
+    rhs_k_offset: int
+    rhs_n_offset: int
 
 
 def _cute_static_int_extent(size: object) -> int | None:
@@ -221,14 +230,6 @@ def emit_cute_serial_scalar_mm_from_loads(
             return grid_state.strategy.mask_var(block_id)
         return None
 
-    def is_full_slice(index: object) -> bool:
-        return (
-            isinstance(index, slice)
-            and index.start is None
-            and index.stop is None
-            and index.step is None
-        )
-
     def hinted_int(value: object) -> int | None:
         if value is None:
             return None
@@ -240,23 +241,6 @@ def emit_cute_serial_scalar_mm_from_loads(
             if isinstance(hinted, int):
                 return hinted
         return None
-
-    def slice_offset(
-        index: object, *, required_extent: int | None = None
-    ) -> int | None:
-        if is_full_slice(index):
-            return 0
-        if not isinstance(index, slice):
-            return None
-        if index.step not in (None, 1):
-            return None
-        start = hinted_int(index.start) or 0
-        stop = hinted_int(index.stop)
-        if stop is None:
-            return None
-        if required_extent is not None and stop - start != required_extent:
-            return None
-        return start
 
     def add_offset(index_expr: str, offset: int) -> str:
         if offset == 0:
@@ -287,26 +271,27 @@ def emit_cute_serial_scalar_mm_from_loads(
 
     lhs_source = lhs_node.args[0]
     rhs_source = rhs_node.args[0]
-    lhs_index = lhs_node.args[1]
-    rhs_index = rhs_node.args[1]
     lhs_info = tensor_ast_and_dtype(lhs_source)
     rhs_info = tensor_ast_and_dtype(rhs_source)
     if lhs_info is None or rhs_info is None:
         return None
     lhs_tensor, lhs_dtype = lhs_info
     rhs_tensor, rhs_dtype = rhs_info
-    if not isinstance(lhs_index, list) or not isinstance(rhs_index, list):
+    rhs_val = rhs_node.meta.get("val")
+    n_extent = (
+        hinted_int(rhs_val.shape[1]) if isinstance(rhs_val, torch.Tensor) else None
+    )
+    load_plan = analyze_direct_grouped_n_loads(
+        lhs_node,
+        rhs_node,
+        k_extent=k_extent,
+        n_extent=n_extent,
+    )
+    if load_plan is None:
         return None
-    if len(lhs_index) != 2 or len(rhs_index) != 2:
-        return None
-    lhs_k_offset = slice_offset(lhs_index[1], required_extent=k_extent)
-    rhs_k_offset = slice_offset(rhs_index[0], required_extent=k_extent)
-    rhs_n_offset = slice_offset(rhs_index[1])
-    if lhs_k_offset is None or rhs_k_offset is None or rhs_n_offset is None:
-        return None
-    lhs_k_offset_int = lhs_k_offset
-    rhs_k_offset_int = rhs_k_offset
-    rhs_n_offset_int = rhs_n_offset
+    lhs_k_offset_int = load_plan.lhs_k_offset
+    rhs_k_offset_int = load_plan.rhs_k_offset
+    rhs_n_offset_int = load_plan.rhs_n_offset
 
     m_block_id = cute_resolve_active_block_id(ctx.cg, lhs_node.meta["val"].shape[0])
     n_block_id = cute_resolve_active_block_id(ctx.cg, rhs_node.meta["val"].shape[-1])
@@ -383,6 +368,92 @@ def emit_cute_serial_scalar_mm_from_loads(
     if out_dtype is not None and reduction_dtype != out_dtype:
         result = cast_ast(result, out_dtype)
     return result
+
+
+def analyze_direct_grouped_n_loads(
+    lhs_load: Node,
+    rhs_load: Node,
+    *,
+    k_extent: int | None,
+    n_extent: int | None = None,
+) -> DirectGroupedNLoadPlan | None:
+    def is_full_slice(index: object) -> bool:
+        return (
+            isinstance(index, slice)
+            and index.start is None
+            and index.stop is None
+            and index.step is None
+        )
+
+    def hinted_int(value: object) -> int | None:
+        if value is None:
+            return None
+        if isinstance(value, int):
+            return value
+        size_hint = getattr(CompileEnvironment.current(), "size_hint", None)
+        if callable(size_hint):
+            hinted = size_hint(value)
+            if isinstance(hinted, int):
+                return hinted
+        return None
+
+    def contiguous_index_offset(
+        index: object,
+        *,
+        required_extent: int | None = None,
+    ) -> int | None:
+        if is_full_slice(index):
+            return 0
+        if isinstance(index, Node):
+            if index.target is not torch.ops.prims.iota.default:
+                return None
+            if index.kwargs.get("step", 1) != 1:
+                return None
+            fake = index.meta.get("val")
+            if not isinstance(fake, torch.Tensor) or fake.ndim != 1:
+                return None
+            extent = hinted_int(fake.shape[0])
+            if extent is None:
+                return None
+            if required_extent is not None and extent != required_extent:
+                return None
+            start = hinted_int(index.kwargs.get("start", 0))
+            return 0 if start is None else start
+        if not isinstance(index, slice):
+            return None
+        if index.step not in (None, 1):
+            return None
+        start = hinted_int(index.start) or 0
+        stop = hinted_int(index.stop)
+        if stop is None:
+            return None
+        if required_extent is not None and stop - start != required_extent:
+            return None
+        return start
+
+    if lhs_load.target is not load or rhs_load.target is not load:
+        return None
+    if len(lhs_load.args) < 2 or len(rhs_load.args) < 2:
+        return None
+    lhs_index = lhs_load.args[1]
+    rhs_index = rhs_load.args[1]
+    if not isinstance(lhs_index, list) or not isinstance(rhs_index, list):
+        return None
+    if len(lhs_index) != 2 or len(rhs_index) != 2:
+        return None
+
+    lhs_k_offset = contiguous_index_offset(lhs_index[1], required_extent=k_extent)
+    rhs_k_offset = contiguous_index_offset(rhs_index[0], required_extent=k_extent)
+    rhs_n_offset = contiguous_index_offset(rhs_index[1], required_extent=n_extent)
+    if lhs_k_offset is None or rhs_k_offset is None or rhs_n_offset is None:
+        return None
+    if lhs_k_offset < 0 or rhs_k_offset < 0 or rhs_n_offset < 0:
+        return None
+    return DirectGroupedNLoadPlan(
+        lhs_k_offset=lhs_k_offset,
+        rhs_k_offset=rhs_k_offset,
+        rhs_n_offset=rhs_n_offset,
+    )
 
 
 def cute_outer_accumulates_result(

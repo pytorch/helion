@@ -14,6 +14,7 @@ from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
 import helion.language as hl
+from helion.runtime import _ensure_cute_dsl_arch_env
 from helion.runtime import default_cute_launcher
 
 cutlass = pytest.importorskip("cutlass")
@@ -1230,7 +1231,7 @@ class TestCuteBackend(TestCase):
         self.assertIn("cute.nvgpu.warp.MmaF16BF16Op", code)
         self.assertNotIn("dot_serial_result", code)
 
-    def test_matmul_direct_grouped_n_slice_operands_reject_cleanly(self) -> None:
+    def test_matmul_direct_grouped_n_slice_operands_use_mma(self) -> None:
         @helion.kernel(
             backend="cute",
             config=helion.Config(block_sizes=[32], indexing="block_ptr"),
@@ -1247,11 +1248,118 @@ class TestCuteBackend(TestCase):
             torch.randn(256, 160, device=DEVICE, dtype=HALF_DTYPE),
             torch.randn(160, 128, device=DEVICE, dtype=HALF_DTYPE),
         )
+        code, out = code_and_output(grouped_n_matmul, args)
+        expected = args[0][:, 16:144].float() @ args[1][16:144, :].float()
+        torch.testing.assert_close(out, expected.to(out.dtype), atol=1e-1, rtol=1e-2)
+        self.assertIn("cute.gemm", code)
+        self.assertNotIn("dot_serial_result", code)
+
+    def test_matmul_direct_grouped_n_rhs_offset_uses_mma(self) -> None:
+        @helion.kernel(
+            backend="cute",
+            config=helion.Config(block_sizes=[32], indexing="block_ptr"),
+            static_shapes=True,
+        )
+        def grouped_n_matmul(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, _n = x.size()
+            out = torch.empty([m, 128], dtype=x.dtype, device=x.device)
+            for tile_m in hl.tile(m):
+                out[tile_m, :] = x[tile_m, :] @ y[:, 16:144]
+            return out
+
+        args = (
+            torch.randn(256, 128, device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn(128, 160, device=DEVICE, dtype=HALF_DTYPE),
+        )
+        code, out = code_and_output(grouped_n_matmul, args)
+        expected = args[0].float() @ args[1][:, 16:144].float()
+        torch.testing.assert_close(out, expected.to(out.dtype), atol=1e-1, rtol=1e-2)
+        self.assertIn("cute.gemm", code)
+        self.assertNotIn("dot_serial_result", code)
+
+    def test_matmul_direct_grouped_n_noncontiguous_operands_reject_cleanly(
+        self,
+    ) -> None:
+        @helion.kernel(
+            backend="cute",
+            config=helion.Config(block_sizes=[32], indexing="block_ptr"),
+            static_shapes=True,
+        )
+        def grouped_n_matmul(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, _n = x.size()
+            out = torch.empty([m, 64], dtype=x.dtype, device=x.device)
+            for tile_m in hl.tile(m):
+                out[tile_m, :] = x[tile_m, 16:144:2] @ y[16:144:2, :]
+            return out
+
+        args = (
+            torch.randn(256, 160, device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn(160, 64, device=DEVICE, dtype=HALF_DTYPE),
+        )
         with self.assertRaisesRegex(
             helion.exc.BackendUnsupported,
-            "direct mm without an active K tile only supports contiguous direct-load operands",
+            "index type: <class 'slice'>",
         ):
             code_and_output(grouped_n_matmul, args)
+
+    def test_matmul_direct_grouped_n_negative_rhs_offset_rejects_cleanly(
+        self,
+    ) -> None:
+        @helion.kernel(
+            backend="cute",
+            config=helion.Config(block_sizes=[32], indexing="block_ptr"),
+            static_shapes=True,
+        )
+        def grouped_n_matmul(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, _n = x.size()
+            out = torch.empty([m, 128], dtype=x.dtype, device=x.device)
+            for tile_m in hl.tile(m):
+                out[tile_m, :] = x[tile_m, :] @ y[:, -144:-16]
+            return out
+
+        args = (
+            torch.randn(256, 128, device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn(128, 160, device=DEVICE, dtype=HALF_DTYPE),
+        )
+        with self.assertRaisesRegex(
+            helion.exc.BackendUnsupported,
+            "CuTe direct mm without an active K tile only supports contiguous direct-load operands",
+        ):
+            code_and_output(grouped_n_matmul, args)
+
+    def test_matmul_direct_grouped_n_multiple_mms_fall_back_cleanly(self) -> None:
+        @helion.kernel(
+            backend="cute",
+            config=helion.Config(block_sizes=[32], indexing="block_ptr"),
+            static_shapes=True,
+        )
+        def grouped_n_two_matmuls(
+            x1: torch.Tensor,
+            y1: torch.Tensor,
+            x2: torch.Tensor,
+            y2: torch.Tensor,
+        ) -> torch.Tensor:
+            m, _n = x1.size()
+            out = torch.empty([m, 128], dtype=x1.dtype, device=x1.device)
+            for tile_m in hl.tile(m):
+                out[tile_m, :] = x1[tile_m, 16:144] @ y1[16:144, :]
+                out[tile_m, :] += x2[tile_m, 16:144] @ y2[16:144, :]
+            return out
+
+        args = (
+            torch.randn(256, 160, device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn(160, 128, device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn(256, 160, device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn(160, 128, device=DEVICE, dtype=HALF_DTYPE),
+        )
+        code, out = code_and_output(grouped_n_two_matmuls, args)
+        expected = (
+            args[0][:, 16:144].float() @ args[1][16:144, :].float()
+            + args[2][:, 16:144].float() @ args[3][16:144, :].float()
+        )
+        torch.testing.assert_close(out, expected.to(out.dtype), atol=1e-1, rtol=1e-2)
+        self.assertNotIn("cute.nvgpu.warp.MmaF16BF16Op", code)
+        self.assertIn("dot_serial_result", code)
 
     def test_matmul_direct_grouped_n_respects_mma_override(self) -> None:
         @helion.kernel(
@@ -1318,6 +1426,14 @@ class TestCuteBackend(TestCase):
         torch.testing.assert_close(out, expected, atol=1e-1, rtol=1e-2)
         self.assertIn("cute.arch.warp_reduction_sum", code)
         self.assertNotIn("cute.gemm", code)
+
+    def test_cute_dsl_arch_env_tracks_launch_device(self) -> None:
+        tensor = torch.empty(1, device=DEVICE)
+        major, minor = torch.cuda.get_device_capability(tensor.device)
+        expected = f"sm_{major}{minor}"
+        with patch.dict(os.environ, {"CUTE_DSL_ARCH": "sm_00"}, clear=False):
+            _ensure_cute_dsl_arch_env((tensor,))
+            self.assertEqual(os.environ["CUTE_DSL_ARCH"], expected)
 
     def test_addmm_direct_full_k_tile_static_shapes_falls_back_correctly(self) -> None:
         args = (

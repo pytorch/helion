@@ -27,6 +27,7 @@ from .cute.indexing import CutePackedAffineLoad
 from .cute.indexing import CuteShapeChainView
 from .cute.indexing import is_cute_shape_chain_target
 from .cute.indexing import match_cute_affine_range_iota
+from .cute.iota_utils import cute_iota_has_atomic_tensor_index_only_users
 from .cute.matmul_fallback import _emit_cute_matmul
 from .cute.matmul_utils import cute_lower_rhs_for_matmul
 from .cute.matmul_utils import cute_outer_accumulates_result
@@ -1498,6 +1499,15 @@ def _cute_iota_expr(
     if block_id is None:
         if (active_expr := active_iota_expr()) is not None:
             return active_expr
+        if (
+            cute_iota_has_atomic_tensor_index_only_users(source_node, cg)
+            and isinstance(start, int)
+            and isinstance(step, int)
+        ):
+            return expr_from_string(
+                "cute.make_identity_tensor({length})",
+                length=ctx.to_ast(length_arg),
+            )
         raise exc.BackendUnsupported(
             "cute",
             "hl.arange() requires an active tile/reduction axis in cute kernels",
@@ -1545,6 +1555,15 @@ def _cute_iota_expr(
             expr = _grid_local_coord_expr(cg, block_id, thread_axis)
         elif (active_expr := active_iota_expr()) is not None:
             return active_expr
+        elif (
+            cute_iota_has_atomic_tensor_index_only_users(source_node, cg)
+            and isinstance(start, int)
+            and isinstance(step, int)
+        ):
+            return expr_from_string(
+                "cute.make_identity_tensor({length})",
+                length=ctx.to_ast(length_arg),
+            )
         else:
             raise exc.BackendUnsupported(
                 "cute",
