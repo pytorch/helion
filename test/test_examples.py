@@ -2234,7 +2234,7 @@ class TestExamples(RefEagerTestBase, TestCase):
         lambda: _get_backend() == "cute",
         "CuTe Mamba2 chunk-state destabilizes later cute tests when it fails in-process",
     )
-    @xfailIfPallas("BlockSpec tiling failure")
+    @xfailIfPallas("SMEM load lowering: Can only load scalars from SMEM")
     def test_mamba2_chunk_state(self):
         batch, nheads, ngroups, seqlen, chunk_size, headdim, dstate = (
             2,
