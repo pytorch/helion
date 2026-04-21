@@ -953,8 +953,8 @@ class TestPallas(TestCase):
         # excluded from pallas_call inputs (no donation, no graph split).
         self.assertIn("_output_indices=[1]", code)
         self.assertIn("_inplace_indices=[]", code)
-        # Output-only allocation wrapped in FakeTensorMode (no real HBM).
-        self.assertIn("FakeTensorMode", code)
+        # Output-only allocation retargeted to device='meta' (no real HBM).
+        self.assertIn("device='meta'", code)
         # Launcher return captured into output variable.
         self.assertIn("out = _launcher(", code)
 
@@ -972,7 +972,7 @@ class TestPallas(TestCase):
         code, result = code_and_output(new_empty_relu, (x,), block_sizes=[1024])
         torch.testing.assert_close(result, torch.relu(x))
         self.assertIn("_inplace_indices=[]", code)
-        self.assertIn("FakeTensorMode", code)
+        self.assertIn("device='meta'", code)
         self.assertIn("out = _launcher(", code)
 
     def test_mixed_inplace_and_output_only(self) -> None:
@@ -998,7 +998,7 @@ class TestPallas(TestCase):
         # out is excluded from pallas_call inputs.
         self.assertIn("_output_indices=[0, 1]", code)
         self.assertIn("_inplace_indices=[0]", code)
-        self.assertIn("FakeTensorMode", code)
+        self.assertIn("device='meta'", code)
         self.assertIn("out = _launcher(", code)
 
     def test_empty_like_read_stays_inplace(self) -> None:
@@ -1017,8 +1017,8 @@ class TestPallas(TestCase):
         torch.testing.assert_close(result, x + 1.0)
         # out is read after write, so it must be in _inplace_indices
         self.assertIn("_inplace_indices=[1]", code)
-        # Not output-only, so no FakeTensorMode wrapping.
-        self.assertNotIn("FakeTensorMode", code)
+        # Not output-only, so no device='meta' retargeting.
+        self.assertNotIn("device='meta'", code)
 
     def test_int64_tensor_raises(self) -> None:
         """Passing int64 tensors to a Pallas kernel should raise TypeError."""
@@ -1048,7 +1048,7 @@ class TestPallas(TestCase):
         # Both outputs are output-only: 2 outputs, 0 aliases
         self.assertIn("_output_indices=[1, 2]", code)
         self.assertIn("_inplace_indices=[]", code)
-        self.assertIn("FakeTensorMode", code)
+        self.assertIn("device='meta'", code)
         self.assertIn("out1, out2 = _launcher(", code)
 
     def test_fori_loop_multidim(self) -> None:
