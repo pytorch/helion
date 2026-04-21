@@ -1303,5 +1303,130 @@ class TestPallas(TestCase):
         )
 
 
+@skipUnlessPallas("JAX/Pallas TPU not available")
+class TestPallasIndirectGather(TestCase):
+    @staticmethod
+    def _gather_2d_kernel():
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def gather(indices: torch.Tensor, table: torch.Tensor) -> torch.Tensor:
+            out = torch.empty(
+                [indices.size(0), table.size(1)],
+                dtype=table.dtype,
+                device=table.device,
+            )
+            for tile_b, tile_e in hl.tile([indices.size(0), table.size(1)]):
+                out[tile_b, tile_e] = table[indices[tile_b], tile_e]
+            return out
+
+        return gather
+
+    def test_gather_fp32_uses_highest_precision(self) -> None:
+        gather = self._gather_2d_kernel()
+        table = torch.randn(16, 64, device=DEVICE, dtype=torch.float32)
+        indices = torch.randint(0, 16, (256,), device=DEVICE, dtype=torch.int32)
+        code, result = code_and_output(gather, (indices, table), block_sizes=[128, 64])
+        self.assertIn("one_hot", code)
+        self.assertIn("HIGHEST", code)
+        torch.testing.assert_close(result.cpu(), table.cpu()[indices.long().cpu()])
+
+    def test_gather_bf16_skips_highest(self) -> None:
+        gather = self._gather_2d_kernel()
+        table = torch.randn(16, 64, device=DEVICE, dtype=torch.bfloat16)
+        indices = torch.randint(0, 16, (256,), device=DEVICE, dtype=torch.int32)
+        code, result = code_and_output(gather, (indices, table), block_sizes=[128, 64])
+        self.assertIn("one_hot", code)
+        self.assertNotIn("HIGHEST", code)
+        self.assertNotIn("astype(jnp.float32)", code)
+        torch.testing.assert_close(result.cpu(), table.cpu()[indices.long().cpu()])
+
+    def test_gather_2d_index_tile(self) -> None:
+        """Regression: 2D index tile must contract the last axis, not axis 1."""
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def gather(indices: torch.Tensor, table: torch.Tensor) -> torch.Tensor:
+            out = torch.empty(
+                [indices.size(0), indices.size(1), table.size(1)],
+                dtype=table.dtype,
+                device=table.device,
+            )
+            for tile_b, tile_s, tile_e in hl.tile(
+                [indices.size(0), indices.size(1), table.size(1)]
+            ):
+                out[tile_b, tile_s, tile_e] = table[indices[tile_b, tile_s], tile_e]
+            return out
+
+        table = torch.randn(16, 128, device=DEVICE, dtype=torch.bfloat16)
+        indices = torch.randint(0, 16, (8, 128), device=DEVICE, dtype=torch.int32)
+        code, result = code_and_output(
+            gather, (indices, table), block_sizes=[8, 128, 128]
+        )
+        self.assertIn("one_hot", code)
+        torch.testing.assert_close(result.cpu(), table.cpu()[indices.long().cpu()])
+
+    def test_gather_over_vmem_budget_raises(self) -> None:
+        """Table above VMEM budget fails fast with a clear message."""
+        gather = self._gather_2d_kernel()
+        table = torch.randn(65537, 64, device=DEVICE, dtype=torch.float32)
+        indices = torch.randint(0, 65537, (256,), device=DEVICE, dtype=torch.int32)
+        with self.assertRaisesRegex(Exception, "exceeds the .* VMEM threshold"):
+            code_and_output(gather, (indices, table), block_sizes=[128, 64])
+
+    def test_gather_integer_table_rejected(self) -> None:
+        """Gather on non-floating tables raises at plan time."""
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def gather(indices: torch.Tensor, table: torch.Tensor) -> torch.Tensor:
+            out = torch.empty(
+                [indices.size(0), table.size(1)],
+                dtype=table.dtype,
+                device=table.device,
+            )
+            for tile_b, tile_e in hl.tile([indices.size(0), table.size(1)]):
+                out[tile_b, tile_e] = table[indices[tile_b], tile_e]
+            return out
+
+        table = torch.randint(0, 100, (16, 64), device=DEVICE, dtype=torch.int32)
+        indices = torch.randint(0, 16, (256,), device=DEVICE, dtype=torch.int32)
+        with self.assertRaisesRegex(Exception, "must be floating point"):
+            code_and_output(gather, (indices, table), block_sizes=[128, 64])
+
+    def test_scatter_raises(self) -> None:
+        """Indirect store has no Pallas strategy; plan_tiling must raise."""
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def scatter(
+            out: torch.Tensor, values: torch.Tensor, indices: torch.Tensor
+        ) -> torch.Tensor:
+            for tile_b, tile_e in hl.tile([values.size(0), values.size(1)]):
+                out[indices[tile_b], tile_e] = values[tile_b, tile_e]
+            return out
+
+        out = torch.zeros(16, 64, device=DEVICE, dtype=torch.float32)
+        values = torch.randn(8, 64, device=DEVICE, dtype=torch.float32)
+        indices = torch.arange(8, device=DEVICE, dtype=torch.int32)
+        with self.assertRaisesRegex(Exception, "indirect store"):
+            code_and_output(scatter, (out, values, indices), block_sizes=[8, 64])
+
+    def test_gather_1d_index_bumps_block_to_tpu_alignment(self) -> None:
+        """Nested ``idx[tile]`` inside a gather must still trigger 1D alignment.
+
+        The host-side alignment analyzer walks subscripts; when the index
+        tensor appears only as a nested subscript (``table[idx[tile], :]``),
+        the analyzer must still visit it. Without this, the 1D int32 index
+        keeps a user-requested block=8, the kernel emits an unaligned
+        ``pl.ds(offset, 8)`` on a 1D ref, and Mosaic rejects it with E2003.
+        """
+        gather = self._gather_2d_kernel()
+        table = torch.randn(1024, 256, device=DEVICE, dtype=torch.bfloat16)
+        indices = torch.randint(0, 1024, (1024,), device=DEVICE, dtype=torch.int32)
+        # User asks for BN=8 on the 1D int32 index; the analyzer must bump
+        # it to 128 so the emitted slice is sub-lane-aligned.
+        code, result = code_and_output(gather, (indices, table), block_sizes=[8, 64])
+        self.assertNotIn("pl.ds(offset_0, 8)", code)
+        torch.testing.assert_close(
+            result.cpu(), table.cpu()[indices.long().cpu()], rtol=1e-2, atol=1e-2
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

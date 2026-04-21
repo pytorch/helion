@@ -1308,6 +1308,9 @@ class PallasBackend(Backend):
                         )
                 else:
                     self.maybe_update_alignment_requirement(tensor, 0, node.slice)
+                # Nested subscripts (e.g. idx[tile] in table[idx[tile], :])
+                # are themselves tiled accesses and need their own alignment.
+                self.generic_visit(node)
 
             def maybe_update_alignment_requirement(
                 self, tensor: torch.Tensor, accessed_dim_start: int, subscript: ast.AST

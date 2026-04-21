@@ -1,4 +1,8 @@
-"""Pallas indexing codegen helpers."""
+"""Pallas indexing codegen.
+
+Public entry points for ``hl.load``/``hl.store`` and atomic ops:
+``load_expr``, ``index_str``, ``vmem_name``.
+"""
 
 from __future__ import annotations
 
@@ -7,8 +11,40 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from helion._compiler.ast_extension import expr_from_string
+
 if TYPE_CHECKING:
     from helion._compiler.inductor_lowering import CodegenState
+
+
+def load_expr(
+    state: CodegenState,
+    subscript: list[object],
+    tensor: torch.Tensor,
+) -> ast.AST:
+    """Pallas load codegen: normal path, or indirect gather if ``plan_tiling`` flagged it."""
+    from helion._compiler.pallas.gather import emit_gather
+    from helion._compiler.pallas.plan_tiling import IndirectGatherPattern
+
+    name = state.device_function.tensor_arg(tensor).name
+    name = vmem_name(state, name)
+    device_fn = state.device_function
+    device_fn.device_load_index += 1
+    device_fn.device_memory_op_index += 1
+
+    assert state.fx_node is not None
+    patterns = state.fx_node.meta.get("indexing_patterns") or ()
+    for pattern in patterns:
+        if isinstance(pattern, IndirectGatherPattern):
+            return emit_gather(state, subscript, pattern.plan, name)
+
+    idx_str, none_dims = index_str(state, subscript, tensor)
+    result = expr_from_string(f"{name}[{idx_str}]")
+    for dim in none_dims:
+        result = expr_from_string(
+            f"jnp.expand_dims({{result}}, axis={dim})", result=result
+        )
+    return result
 
 
 def _can_tile_dimension(state: CodegenState, tensor_dim: int) -> bool:

@@ -19,6 +19,7 @@ if TYPE_CHECKING:
     from ..device_ir import GraphInfo
     from ..host_function import SymbolOrigin
     from ..tile_dispatch import TileStrategyDispatch
+    from .gather import GatherPlan
 
 
 @dataclass
@@ -62,6 +63,18 @@ class ArbitraryIndexPattern(IndexingPattern):
 @dataclass
 class NonePattern(IndexingPattern):
     """None index pattern (broadcasting dimension) - allow tiling."""
+
+
+@dataclass
+class TensorIndexPattern(IndexingPattern):
+    """Tensor-valued index - no tiling. Resolved to IndirectGatherPattern for loads, rejected for stores."""
+
+
+@dataclass
+class IndirectGatherPattern(IndexingPattern):
+    """Indirect gather load ``table[idx, ...]`` - no tiling on this dim."""
+
+    plan: GatherPlan
 
 
 @dataclass
@@ -129,6 +142,7 @@ def _analyze_indexing(node: torch.fx.Node, config: Config) -> None:
     indexing_patterns = _analyze_subscript_patterns(
         tensor_val, list(subscript), dim_tilings, node, config
     )
+    _resolve_tensor_index_patterns(node, tensor_val, list(subscript), indexing_patterns)
     node.meta["indexing_patterns"] = indexing_patterns
 
 
@@ -206,6 +220,10 @@ def _detect_indexing_pattern(
                 block_id=tile_begin_with_offset.block_id,
                 offset=tile_begin_with_offset.offset,
             )
+        # A tensor-valued index that didn't match any arithmetic-of-tile
+        # pattern is an indirect gather (e.g. table[idx, :]).
+        if isinstance(idx_val, torch.Tensor):
+            return TensorIndexPattern()
         # Indices produced by other FX nodes, such as indices[tile] used in
         # tensor-indexed atomics, are legal but cannot participate in Pallas
         # tiling.
@@ -268,7 +286,7 @@ def _update_tiling_decision(
             # fow now we only support the `[:]` slice pattern
             _disallow_tiling()
 
-    elif isinstance(pattern, ArbitraryIndexPattern):
+    elif isinstance(pattern, (ArbitraryIndexPattern, TensorIndexPattern)):
         _disallow_tiling()
 
     elif isinstance(pattern, NonePattern):
@@ -295,6 +313,32 @@ def _update_tiling_decision(
                 and block_size % required_alignment != 0
             ):
                 _disallow_tiling()
+
+
+def _resolve_tensor_index_patterns(
+    node: torch.fx.Node,
+    tensor: torch.Tensor,
+    subscript: list[object],
+    patterns: list[IndexingPattern],
+) -> None:
+    """Replace TensorIndexPattern with IndirectGatherPattern for loads. Raise for stores."""
+    positions = [i for i, p in enumerate(patterns) if isinstance(p, TensorIndexPattern)]
+    if not positions:
+        return
+
+    from ...language import memory_ops
+
+    if node.target is not memory_ops.load:
+        op_name = getattr(node.target, "__name__", str(node.target))
+        raise NotImplementedError(
+            f"Pallas: indirect store (scatter) is not supported (op={op_name})."
+        )
+
+    from .gather import build_gather_plan
+
+    plan = build_gather_plan(tensor, subscript, positions)
+    for i in positions:
+        patterns[i] = IndirectGatherPattern(plan=plan)
 
 
 # Helper functions moved from memory_ops.py

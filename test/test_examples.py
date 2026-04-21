@@ -506,7 +506,6 @@ class TestExamples(RefEagerTestBase, TestCase):
             indexing="block_ptr",
         )
 
-    @xfailIfPallas("missing BlockSpec for hl.load with computed indices")
     def test_cross_entropy(self):
         n, v = 128, 1000
         logits = torch.randn(n, v, device=DEVICE, dtype=torch.float32)
@@ -708,7 +707,6 @@ class TestExamples(RefEagerTestBase, TestCase):
             atol=1e-2,
         )
 
-    @xfailIfPallas("BlockSpec tiling failure")
     def test_embedding_pointers(self):
         args = (
             torch.randint(0, 1024, [8, 128], device=DEVICE, dtype=torch.int32),
@@ -722,7 +720,6 @@ class TestExamples(RefEagerTestBase, TestCase):
             indexing="pointer",
         )
 
-    @xfailIfPallas("BlockSpec tiling failure")
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfTileIR("TileIR does not support block_ptr indexing")
     def test_embedding_block_ptr(self):

@@ -1235,19 +1235,7 @@ def _(state: CodegenState) -> ast.AST:
     subscript = state.proxy_arg(1)
     assert isinstance(tensor, torch.Tensor)
     assert isinstance(subscript, (list, tuple))
-    name = state.device_function.tensor_arg(tensor).name
-    name = pallas_codegen.vmem_name(state, name)
-    # Increment memory op index to stay in sync with triton backend
-    device_fn = state.device_function
-    device_fn.device_load_index += 1
-    device_fn.device_memory_op_index += 1
-    index_str, none_dims = pallas_codegen.index_str(state, subscript, tensor)
-    result = expr_from_string(f"{name}[{index_str}]")
-    for dim in none_dims:
-        result = expr_from_string(
-            f"jnp.expand_dims({{result}}, axis={dim})", result=result
-        )
-    return result
+    return pallas_codegen.load_expr(state, list(subscript), tensor)
 
 
 @_decorators.codegen(load, "metal")
