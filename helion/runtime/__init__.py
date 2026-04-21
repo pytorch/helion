@@ -966,6 +966,8 @@ def default_pallas_pipeline_launcher(
             "grid_spec": grid_spec,
             "compiler_params": pltpu.CompilerParams(  # pyrefly: ignore[bad-instantiation]
                 dimension_semantics=tuple("parallel" for _ in grid),
+                disable_bounds_checks=True,
+                disable_semaphore_checks=True,
             ),
         }
         if _pallas_interpret_flag():
@@ -1117,6 +1119,8 @@ def default_pallas_fori_launcher(
             "grid_spec": grid_spec,
             "compiler_params": pltpu.CompilerParams(  # pyrefly: ignore[bad-instantiation]
                 dimension_semantics=tuple("parallel" for _ in grid),
+                disable_bounds_checks=True,
+                disable_semaphore_checks=True,
             ),
         }
         if _pallas_interpret_flag():

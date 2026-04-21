@@ -138,6 +138,7 @@ def _emit_pallas_matmul(
     acc: ast.AST | None = None,
     need_f32_acc: bool = False,
     out_dtype: torch.dtype | None = None,
+    lhs_shape: torch.Size | None = None,
 ) -> ast.AST:
     """Build a ``jnp.matmul`` AST node for the Pallas backend.
 
@@ -154,15 +155,16 @@ def _emit_pallas_matmul(
     out_dtype:
         Desired output dtype.  Only used when *need_f32_acc* is True to
         decide whether a cast-back is required.
+    lhs_shape:
+        Shape of the left operand, used to determine if batch dim squeeze
+        is beneficial.
     """
-    if need_f32_acc:
-        dot_expr = expr_from_string(
-            "jnp.matmul({lhs}, {rhs}, preferred_element_type=jnp.float32)",
-            lhs=lhs,
-            rhs=rhs,
-        )
-    else:
-        dot_expr = expr_from_string("jnp.matmul({lhs}, {rhs})", lhs=lhs, rhs=rhs)
+    pref = ", preferred_element_type=jnp.float32" if need_f32_acc else ""
+    dot_expr = expr_from_string(
+        f"jnp.matmul({{lhs}}, {{rhs}}{pref})",
+        lhs=lhs,
+        rhs=rhs,
+    )
 
     if acc is not None:
         dot_expr = expr_from_string("{acc} + {dot}", acc=acc, dot=dot_expr)

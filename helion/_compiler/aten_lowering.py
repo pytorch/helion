@@ -933,6 +933,7 @@ def _pallas_dot(ctx: LoweringContext, node: Node, with_acc: bool) -> ast.AST:
     rhs_dtype = rhs_node_arg.meta["val"].dtype
     need_f32_acc = _needs_f32_accumulator(lhs_dtype, rhs_dtype)
     out_dtype = node.meta["val"].dtype if "val" in node.meta else None
+    lhs_shape = lhs_node_arg.meta["val"].shape
 
     return _emit_pallas_matmul(
         lhs,
@@ -940,6 +941,7 @@ def _pallas_dot(ctx: LoweringContext, node: Node, with_acc: bool) -> ast.AST:
         acc=acc if with_acc else None,
         need_f32_acc=need_f32_acc,
         out_dtype=out_dtype,
+        lhs_shape=lhs_shape,
     )
 
 
