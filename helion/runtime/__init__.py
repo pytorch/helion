@@ -914,6 +914,7 @@ def default_pallas_pipeline_launcher(
         )
 
         _pipeline_set = set(_pipeline_arg_indices or [])
+        _skip_copy = _pipeline_set | set(_output_indices)
         reordered_kernel = _pallas_make_reordered_kernel(
             pallas_kernel,
             args,
@@ -924,7 +925,7 @@ def default_pallas_pipeline_launcher(
             inplace_positions,
             arg_to_tensor_pos,
             n_extra_refs=len(scratch_shapes),
-            skip_inplace_copy=_pipeline_set,
+            skip_inplace_copy=_skip_copy,
         )
 
         out_shape_arg = out_shapes if len(out_shapes) > 1 else out_shapes[0]
