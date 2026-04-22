@@ -1999,16 +1999,16 @@ class CuteNDTileStrategy(NDTileStrategy):
             )
             axis = thread_axis_offset + thread_axis_map[block_idx]
             if uses_thread_axis:
-                idx_expr = f"{offset_var} + cutlass.Int32(cute.arch.thread_idx()[{axis}]) * {elements_per_thread}"
-                static_thread_extent = self._static_thread_extent_for_block(
-                    block_idx, block_size
+                idx_expr = env.backend.lane_index_expr(
+                    offset_var, elements_per_thread, axis=axis
                 )
-                if isinstance(static_thread_extent, int):
-                    tracker.record(block_idx, axis, static_thread_extent)
+                thread_extent = self._thread_extent_for_axis(block_idx, block_size)
+                if isinstance(thread_extent, int):
+                    tracker.record(block_idx, axis, thread_extent)
             else:
                 idx_expr = offset_var
             if lane_var := self._lane_var_by_block.get(block_idx):
-                idx_expr = f"{idx_expr} + cutlass.Int32({lane_var})"
+                idx_expr = f"{idx_expr} + {env.backend.lane_offset_expr(lane_var)}"
             lane_setup_statements.append(
                 statement_from_string(f"{index_var} = {idx_expr}")
             )
@@ -2158,16 +2158,16 @@ class CuteNDTileStrategy(NDTileStrategy):
             )
             axis = thread_axis_offset + thread_axis_map[block_idx]
             if uses_thread_axis:
-                idx_expr = f"{offset_var} + cutlass.Int32(cute.arch.thread_idx()[{axis}]) * {elements_per_thread}"
-                static_thread_extent = self._static_thread_extent_for_block(
-                    block_idx, block_size
+                idx_expr = env.backend.lane_index_expr(
+                    offset_var, elements_per_thread, axis=axis
                 )
-                if isinstance(static_thread_extent, int):
-                    tracker.record(block_idx, axis, static_thread_extent)
+                thread_extent = self._thread_extent_for_axis(block_idx, block_size)
+                if isinstance(thread_extent, int):
+                    tracker.record(block_idx, axis, thread_extent)
             else:
                 idx_expr = offset_var
             if lane_var := self._lane_var_by_block.get(block_idx):
-                idx_expr = f"{idx_expr} + cutlass.Int32({lane_var})"
+                idx_expr = f"{idx_expr} + {env.backend.lane_offset_expr(lane_var)}"
             index_setup.append(statement_from_string(f"{index_var} = {idx_expr}"))
             mask_statement = self._setup_mask(
                 state, block_idx, block_size, index_var, end
@@ -2276,7 +2276,7 @@ class CuteFlattenedTileStrategy(FlattenedTileStrategy):
 
         lane_setup_statements.append(
             statement_from_string(
-                f"{offsets_var} = {offsets_base_var} + cutlass.Int32({self._lane_var})"
+                f"{offsets_var} = {offsets_base_var} + {env.backend.lane_offset_expr(self._lane_var)}"
             )
         )
         for i, block_idx in enumerate(self._reorder(block_ids)):
@@ -2307,7 +2307,7 @@ class CuteFlattenedTileStrategy(FlattenedTileStrategy):
         pids.append(PIDInfo(pid_var, block_size_var, total_numel, self.block_ids[0]))
         axis = self._flat_thread_axis()
         state.add_statement(
-            f"{offsets_base_var} = ({pid_var}) * ({block_size_var}) + cutlass.Int32(cute.arch.thread_idx()[{axis}]) * {self._elements_per_thread}"
+            f"{offsets_base_var} = {env.backend.lane_index_expr(f'({pid_var}) * ({block_size_var})', self._elements_per_thread, axis=axis)}"
         )
         pids.codegen(state)
         if isinstance(state.device_function.pid, ForEachProgramID):
@@ -2349,7 +2349,7 @@ class CuteFlattenedTileStrategy(FlattenedTileStrategy):
 
         lane_setup_statements.append(
             statement_from_string(
-                f"{offsets_var} = {offsets_base_var} + cutlass.Int32({self._lane_var})"
+                f"{offsets_var} = {offsets_base_var} + {env.backend.lane_offset_expr(self._lane_var)}"
             )
         )
         for i, block_idx in enumerate(self._reorder(block_ids)):
@@ -2393,7 +2393,7 @@ class CuteFlattenedTileStrategy(FlattenedTileStrategy):
             body = [lane_for]
         body[:0] = [
             statement_from_string(
-                f"{offsets_base_var} = {lid} * ({block_size_var}) + cutlass.Int32(cute.arch.thread_idx()[{axis}]) * {self._elements_per_thread}"
+                f"{offsets_base_var} = {env.backend.lane_index_expr(f'{lid} * ({block_size_var})', self._elements_per_thread, axis=axis)}"
             )
         ]
         for_node = create(

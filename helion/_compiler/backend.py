@@ -307,6 +307,16 @@ class Backend(abc.ABC):
         """
         return self.next_power_of_2_host_expr(expr)
 
+    def lane_index_expr(
+        self, offset_var: str, elements_per_thread: int, *, axis: int
+    ) -> str:
+        """Thread index expression with elements-per-thread stride for lane loops."""
+        raise exc.BackendUnsupported(self.name, "lane index")
+
+    def lane_offset_expr(self, lane_var: str) -> str:
+        """Cast a lane variable for addition to an index expression."""
+        raise exc.BackendUnsupported(self.name, "lane offset")
+
     def reduction_combine_expr(
         self,
         reduction_type: str,
@@ -2258,6 +2268,14 @@ class CuteBackend(Backend):
     def grid_barrier_stmt(self, sem_arg: str) -> str | None:
         del sem_arg
         raise exc.BackendUnsupported(self.name, "hl.barrier()")
+
+    def lane_index_expr(
+        self, offset_var: str, elements_per_thread: int, *, axis: int
+    ) -> str:
+        return f"{offset_var} + cutlass.Int32(cute.arch.thread_idx()[{axis}]) * {elements_per_thread}"
+
+    def lane_offset_expr(self, lane_var: str) -> str:
+        return f"cutlass.Int32({lane_var})"
 
     def sympy_printer_expr(self, expr: sympy.Expr) -> str:
         from .device_function import cute_texpr
