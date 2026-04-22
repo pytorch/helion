@@ -285,7 +285,7 @@ class TestExamples(RefEagerTestBase, TestCase):
         lambda: _get_backend() == "cute",
         "CuTe matmul+layernorm example is unsupported and too expensive in-process",
     )
-    @xfailIfPallas("JAX tracer error with dynamic shapes")
+    @xfailIfPallas("broadcasting shape mismatch in codegen")
     def test_matmul_layernorm_dynamic_shapes(self):
         args = (
             torch.randn([128, 256], device=DEVICE, dtype=torch.float32),
@@ -506,7 +506,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             indexing="block_ptr",
         )
 
-    @xfailIfPallas("missing BlockSpec for hl.load with computed indices")
+    @xfailIfPallas("int tensor indexing not yet lowered for TPU")
     def test_cross_entropy(self):
         n, v = 128, 1000
         logits = torch.randn(n, v, device=DEVICE, dtype=torch.float32)
@@ -708,7 +708,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             atol=1e-2,
         )
 
-    @xfailIfPallas("BlockSpec tiling failure")
+    @xfailIfPallas("int tensor indexing not yet lowered for TPU")
     def test_embedding_pointers(self):
         args = (
             torch.randint(0, 1024, [8, 128], device=DEVICE, dtype=torch.int32),
@@ -722,7 +722,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             indexing="pointer",
         )
 
-    @xfailIfPallas("BlockSpec tiling failure")
+    @xfailIfPallas("int tensor indexing not yet lowered for TPU")
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfTileIR("TileIR does not support block_ptr indexing")
     def test_embedding_block_ptr(self):
@@ -825,7 +825,7 @@ class TestExamples(RefEagerTestBase, TestCase):
         lambda: _get_backend() == "cute",
         "CuTe dynamic attention destabilizes later cute tests when it fails in-process",
     )
-    @xfailIfPallas("JAX tracer error with dynamic shapes")
+    @xfailIfPallas("Mosaic compile error (dynamic shapes)")
     def test_attention_dynamic(self):
         args = (
             torch.randn(1, 32, 512, 64, dtype=torch.float32, device=DEVICE),
@@ -840,7 +840,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             block_sizes=[1, 64, 32],
         )
 
-    @xfailIfPallas("BlockSpec tiling failure")
+    @xfailIfPallas("int tensor indexing not yet lowered for TPU")
     def test_concat(self):
         args = (
             torch.randn(512, 500, device=DEVICE),
@@ -853,7 +853,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             fn_name="concat2d_dim1",
         )
 
-    @xfailIfPallas("BlockSpec tiling failure")
+    @xfailIfPallas("broadcasting shape mismatch in codegen")
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfTileIR("TileIR does not support block_ptr indexing")
     def test_concat_block_ptr(self):
@@ -870,7 +870,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             block_sizes=[128, 64],
         )
 
-    @xfailIfPallas("BlockSpec tiling failure")
+    @xfailIfPallas("Pallas rejects int64 inputs (jagged offsets)")
     def test_jagged_dense_add(self):
         mod = import_path(EXAMPLES_DIR / "jagged_dense_add.py")
         args = (
@@ -885,7 +885,7 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
 
     @xfailIfCute("CuTe jagged dense bmm example still returns incorrect results")
-    @xfailIfPallas("tensor-derived if-predicates not supported")
+    @xfailIfPallas("uses CUDA-only path in setup")
     @skipIfXPU("Jagged tensor operations not fully supported on XPU")
     @skipIfRefEager("hl.jagged_tile does not support ref mode yet")
     def test_jagged_dense_bmm(self):
@@ -900,7 +900,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             mod.jagged_dense_bmm_reference(*args),
         )
 
-    @xfailIfPallas("tensor-derived if-predicates not supported")
+    @xfailIfPallas("undefined name in generated code")
     @skipIfRefEager("Test has skip_accuracy=True and doesn't call assert_close")
     def test_moe_matmul_ogs(self):
         mod = import_path(EXAMPLES_DIR / "moe_matmul_ogs.py")
@@ -925,7 +925,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             skip_accuracy=True,  # TODO(yf225): fix unstable numerics
         )
 
-    @xfailIfPallas("InductorLoweringError")
+    @xfailIfPallas("accuracy mismatch on TPU")
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     def test_matmul_split_k(self):
         args = (
@@ -965,7 +965,7 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
 
     @xfailIfCute("CuTe jagged mean example still fails lowering/runtime")
-    @xfailIfPallas("JAX tracer error with dynamic shapes")
+    @xfailIfPallas("Pallas rejects int64 inputs (jagged offsets)")
     @skipIfRefEager("hl.jagged_tile does not support ref mode yet")
     def test_jagged_mean(self):
         num_rows, max_cols = 32, 64
@@ -1153,7 +1153,7 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
 
     @xfailIfCute("CuTe LayerNorm backward example still returns incorrect results")
-    @xfailIfPallas("InductorLoweringError")
+    @xfailIfPallas("Mosaic compile error")
     @skipIfA10G("accuracy check fails on A10G GPUs")
     def test_layernorm_bwd(self):
         """Test combined backward pass for layer norm with bias, including regression coverage."""
@@ -1266,7 +1266,7 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
 
     @xfailIfCute("CuTe jagged softmax example still fails lowering/runtime")
-    @xfailIfPallas("JAX tracer error with dynamic shapes")
+    @xfailIfPallas("Pallas rejects int64 inputs (jagged offsets)")
     @skipIfRefEager("hl.jagged_tile does not support ref mode yet")
     def test_jagged_softmax(self):
         num_rows, max_cols = 128, 64
@@ -1295,7 +1295,7 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
 
     @xfailIfCute("CuTe jagged HSTU attention example is not supported yet")
-    @xfailIfPallas("tensor-derived if-predicates not supported")
+    @xfailIfPallas("Pallas rejects int64 inputs (jagged offsets)")
     @skipIfXPU("Jagged tensor operations not fully supported on XPU")
     def test_jagged_hstu_attn(self):
         batch_size = 4
@@ -1368,7 +1368,7 @@ class TestExamples(RefEagerTestBase, TestCase):
                 rtol=1e-2,
             )
 
-    @xfailIfPallas("tensor-derived if-predicates not supported")
+    @xfailIfPallas("InductorLoweringError in codegen")
     def test_grouped_gemm_jagged(self):
         # Build small jagged grouped GEMM inputs
         torch.manual_seed(0)
@@ -1544,7 +1544,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             num_stages=3,
         )
 
-    @xfailIfPallas("BackendError on pallas")
+    @xfailIfPallas("int tensor indexing not yet lowered for TPU")
     def test_gather_gemv(self):
         args = (
             torch.randn([4, 512, 512], device=DEVICE, dtype=torch.float32),
@@ -1632,7 +1632,7 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
 
     @xfailIfCute("CuTe jagged sum example still returns incorrect results")
-    @xfailIfPallas("JAX tracer error")
+    @xfailIfPallas("Pallas rejects int64 inputs (jagged offsets)")
     @skipIfRefEager("hl.jagged_tile does not support ref mode yet")
     def test_jagged_sum(self):
         num_rows, max_cols = 128, 64
@@ -1704,7 +1704,7 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
 
     @xfailIfCute("CuTe jagged layer norm example still fails lowering/runtime")
-    @xfailIfPallas("JAX tracer error")
+    @xfailIfPallas("Pallas rejects int64 inputs (jagged offsets)")
     @skipIfRefEager("hl.jagged_tile does not support ref mode yet")
     def test_jagged_layer_norm(self):
         num_rows, max_cols = 128, 64
@@ -1800,7 +1800,7 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
 
     @xfailIfCute("CuTe squeeze-and-excitation backward still fails lowering/runtime")
-    @xfailIfPallas("conflicting tiling patterns")
+    @xfailIfPallas("broadcasting shape mismatch in codegen")
     @skipIfA10G("failure on a10g")
     @skipIfXPU("Squeeze-and-excitation network not supported on XPU")
     @skipIfTileIR("accuracy failure")
@@ -1845,7 +1845,7 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
 
     @xfailIfCute("CuTe squeeze-and-excitation backward still fails lowering/runtime")
-    @xfailIfPallas("tensor accessed with conflicting tiling patterns")
+    @xfailIfPallas("broadcasting shape mismatch in codegen")
     @skipIfA10G("failure on a10g")
     @skipIfTileIR("accuracy failure")
     def test_squeeze_and_excitation_net_bwd_da(self):
@@ -1996,7 +1996,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             block_sizes=[4, 16, 16],
         )
 
-    @xfailIfPallas("InductorLoweringError")
+    @xfailIfPallas("broadcasting shape mismatch in codegen")
     def test_grpo_loss_bwd(self):
         """Test backward pass for GRPO loss."""
         B, L, V = 2, 64, 128
@@ -2131,7 +2131,7 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
 
     @xfailIfCute("CuTe GDN forward example still fails CUTLASS DSL codegen")
-    @xfailIfPallas("operation not supported on TPU")
+    @xfailIfPallas("aten::_linalg_svd not implemented on TPU")
     def test_gdn_fwd_h(self):
         """Test gated delta net forward h kernel."""
         batch = 2
@@ -2271,7 +2271,7 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
 
     @xfailIfCute("CuTe Mamba2 chunk-scan example still returns incorrect results")
-    @xfailIfPallas("BlockSpec tiling failure")
+    @xfailIfPallas("AbstractRef attribute error in JAX lowering")
     def test_mamba2_chunk_scan(self):
         batch, nheads, ngroups, seqlen, chunk_size, headdim, dstate = (
             2,
