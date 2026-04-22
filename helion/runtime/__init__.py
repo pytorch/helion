@@ -780,7 +780,6 @@ def _pallas_invoke_and_return(
     return tuple(output_only_results) if output_only_results else None
 
 
-
 def _pallas_apply_padding(
     args: tuple[object, ...],
     _pad_sizes: dict[int, dict[int, int]] | None,
@@ -811,6 +810,8 @@ def _pallas_apply_padding(
             if needs_pad:
                 new_args[idx] = F.pad(tensor, pad_tuple)
     return tuple(new_args)
+
+
 def default_pallas_launcher(
     pallas_kernel: object,
     grid: tuple[int, ...],
