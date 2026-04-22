@@ -2745,7 +2745,7 @@ class TestFiniteSearchWarmStart(TestCase):
         self.assertEqual(len(search.configs), 3)
 
     def test_from_cache_uses_default_cap_from_settings(self):
-        """Without max_configs, the cap falls back to autotune_finite_warmstart_max."""
+        """Without max_configs, the cap falls back to the kernel settings' autotune_best_available_max_configs."""
         cfg1 = helion.Config(block_sizes=[16])
         cached = [helion.Config(block_sizes=[2**i]) for i in range(4, 14)]
         add, args = self._make_kernel_and_args()
@@ -2759,8 +2759,10 @@ class TestFiniteSearchWarmStart(TestCase):
 
         with patch.object(BaseSearch, "_find_similar_cached_configs", spy):
             search = FiniteSearch(bound, args, configs=[cfg1, helion.from_cache()])
-        self.assertEqual(observed_caps, [5])
-        self.assertEqual(len(search.configs), 6)
+        cap_in_effect = search.settings.autotune_best_available_max_configs
+        self.assertEqual(observed_caps, [cap_in_effect])
+        expected_cached = min(cap_in_effect, len(cached))
+        self.assertEqual(len(search.configs), 1 + expected_cached)
 
     def test_from_cache_single_marker_empty_cache_raises(self):
         """[from_cache()] alone with empty cache raises NotEnoughConfigs(0)."""
