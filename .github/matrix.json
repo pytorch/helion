@@ -93,7 +93,7 @@
       "triton-pin": "0d9283bf49"
     },
     {
-      "runner": "linux.rocm.gpu.ecosystem.gfx950.8",
+      "runner": "linux.rocm.gpu.ecosystem.gfx950.1",
       "python-version": "3.12",
       "ref-eager": false,
       "image": "rocm/dev-ubuntu-24.04:7.0-complete",
