@@ -312,6 +312,7 @@ class DeviceFunction:
         self.pallas_tensor_dim_tilings: dict[int, list[DimensionTiling]] = {}
         # Pallas: set of id(fake_tensor) for tensors accessed in pipeline body
         self.pallas_pipeline_tensor_ids: set[int] = set()
+        self.pallas_pad_info: dict[int, dict[int, int]] = {}
         # TODO(dunfanlu): consider duplicating and aliasing arguments if a tensor needs to be accessed via both VMEM and SMEM?
         # Pallas: set of id(fake_tensor) for tensors requiring scalar accessing (SMEM)
         self.pallas_smem_tensor_ids: set[int] = set()

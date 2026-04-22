@@ -1661,6 +1661,22 @@ class PallasBackend(Backend):
                 ]
                 launcher_args.append(f"_pipeline_arg_indices={pipeline_arg_indices!r}")
 
+        # Build _pad_info for Pallas with string substitution
+        pad_size_dict_str_parts = []
+        if sorted_args is not None:
+            for i, arg in enumerate(sorted_args):
+                if (
+                    hasattr(arg, "fake_value")
+                    and id(arg.fake_value) in device_fn.pallas_pad_info
+                ):
+                    dims_info = device_fn.pallas_pad_info[id(arg.fake_value)]
+                    dim_strs = [
+                        f"{dim}: _BLOCK_SIZE_{bid}" for dim, bid in dims_info.items()
+                    ]
+                    pad_size_dict_str_parts.append(f"{i}: {{{', '.join(dim_strs)}}}")
+        if pad_size_dict_str_parts:
+            launcher_args.append(f"_pad_sizes={{{', '.join(pad_size_dict_str_parts)}}}")
+
         return launcher_args
 
     def build_launcher_name(self, config: Config) -> str:

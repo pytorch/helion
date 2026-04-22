@@ -787,6 +787,7 @@ def default_pallas_launcher(
     _output_indices: list[int] | None = None,
     _inplace_indices: list[int] | None = None,
     _block_spec_info: _BlockSpecInfo | None = None,
+    _pad_sizes: dict[int, dict[int, int]] | None = None,
     _smem_arg_indices: list[int] | None = None,
     **kwargs: object,
 ) -> object:
@@ -804,6 +805,34 @@ def default_pallas_launcher(
     """
     if _output_indices is None:
         _output_indices = []
+
+    if _pad_sizes:
+        new_args = list(args)
+        import torch.nn.functional as F
+
+        for idx, dims in _pad_sizes.items():
+            tensor = new_args[idx]
+            if isinstance(tensor, torch.Tensor):
+                pad_tuple = []
+                # F.pad iterates backwards from last dimension
+                # so we pad dimension sizes starting from last
+                ndims = len(tensor.shape)
+                needs_pad = False
+                for d in range(ndims - 1, -1, -1):
+                    if d in dims:
+                        bs = dims[d]
+                        rem = tensor.shape[d] % bs
+                        if rem > 0:
+                            pad_amt = bs - rem
+                            needs_pad = True
+                        else:
+                            pad_amt = 0
+                        pad_tuple.extend([0, pad_amt])
+                    else:
+                        pad_tuple.extend([0, 0])
+                if needs_pad:
+                    new_args[idx] = F.pad(tensor, pad_tuple)
+        args = tuple(new_args)
 
     _pallas_check_dtypes(args)
 
@@ -914,6 +943,7 @@ def default_pallas_pipeline_launcher(
     _output_indices: list[int] | None = None,
     _inplace_indices: list[int] | None = None,
     _block_spec_info: _BlockSpecInfo | None = None,
+    _pad_sizes: dict[int, dict[int, int]] | None = None,
     _scratch_shapes: list[tuple[tuple[int, ...], str]] | None = None,
     _pipeline_arg_indices: list[int] | None = None,
     **kwargs: object,
@@ -928,6 +958,34 @@ def default_pallas_pipeline_launcher(
         _output_indices = []
     if _scratch_shapes is None:
         _scratch_shapes = []
+
+    if _pad_sizes:
+        new_args = list(args)
+        import torch.nn.functional as F
+
+        for idx, dims in _pad_sizes.items():
+            tensor = new_args[idx]
+            if isinstance(tensor, torch.Tensor):
+                pad_tuple = []
+                # F.pad iterates backwards from last dimension
+                # so we pad dimension sizes starting from last
+                ndims = len(tensor.shape)
+                needs_pad = False
+                for d in range(ndims - 1, -1, -1):
+                    if d in dims:
+                        bs = dims[d]
+                        rem = tensor.shape[d] % bs
+                        if rem > 0:
+                            pad_amt = bs - rem
+                            needs_pad = True
+                        else:
+                            pad_amt = 0
+                        pad_tuple.extend([0, pad_amt])
+                    else:
+                        pad_tuple.extend([0, 0])
+                if needs_pad:
+                    new_args[idx] = F.pad(tensor, pad_tuple)
+        args = tuple(new_args)
 
     _pallas_check_dtypes(args)
 
@@ -1066,6 +1124,7 @@ def default_pallas_fori_launcher(
     _output_indices: list[int] | None = None,
     _inplace_indices: list[int] | None = None,
     _block_spec_info: _BlockSpecInfo | None = None,
+    _pad_sizes: dict[int, dict[int, int]] | None = None,
     _scratch_shapes: list[tuple[tuple[int, ...], str | None, str]] | None = None,
     **kwargs: object,
 ) -> object:
@@ -1081,6 +1140,34 @@ def default_pallas_fori_launcher(
         _output_indices = []
     if _scratch_shapes is None:
         _scratch_shapes = []
+
+    if _pad_sizes:
+        new_args = list(args)
+        import torch.nn.functional as F
+
+        for idx, dims in _pad_sizes.items():
+            tensor = new_args[idx]
+            if isinstance(tensor, torch.Tensor):
+                pad_tuple = []
+                # F.pad iterates backwards from last dimension
+                # so we pad dimension sizes starting from last
+                ndims = len(tensor.shape)
+                needs_pad = False
+                for d in range(ndims - 1, -1, -1):
+                    if d in dims:
+                        bs = dims[d]
+                        rem = tensor.shape[d] % bs
+                        if rem > 0:
+                            pad_amt = bs - rem
+                            needs_pad = True
+                        else:
+                            pad_amt = 0
+                        pad_tuple.extend([0, pad_amt])
+                    else:
+                        pad_tuple.extend([0, 0])
+                if needs_pad:
+                    new_args[idx] = F.pad(tensor, pad_tuple)
+        args = tuple(new_args)
 
     _pallas_check_dtypes(args)
 
