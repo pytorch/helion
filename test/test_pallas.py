@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from typing import Callable
 import unittest
 
 import torch
@@ -1143,6 +1144,36 @@ class TestPallas(TestCase):
         code, result = code_and_output(fn, (x, y))
         expected = (x[:, None] < y[None, :]).to(torch.float32)
         torch.testing.assert_close(result, expected)
+
+    def test_matmul_1d_bias_closure(self) -> None:
+        """Verifies that ops in a closure also constrain the chosen block size."""
+
+        @helion.kernel(backend="pallas")
+        def matmul_custom(
+            x: torch.Tensor, y: torch.Tensor, epilogue: Callable
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], device=x.device, dtype=x.dtype)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = epilogue(acc, (tile_m, tile_n))
+            return out
+
+        x = torch.randn(1024, 1024, device=DEVICE, dtype=torch.bfloat16)
+        y = torch.randn(1024, 1024, device=DEVICE, dtype=torch.bfloat16)
+        bias = torch.randn(1024, device=DEVICE, dtype=torch.bfloat16)
+
+        code, result = code_and_output(
+            matmul_custom, (x, y, lambda acc, tile: acc + bias[tile[1]])
+        )
+
+        expected = x.float() @ y.float() + bias.float()
+        torch.testing.assert_close(
+            result, expected.to(torch.bfloat16), rtol=1e-2, atol=1e-2
+        )
 
 
 if __name__ == "__main__":

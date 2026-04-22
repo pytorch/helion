@@ -184,6 +184,14 @@ class Backend(abc.ABC):
     def supports_block_ptr_indexing(self) -> bool:
         return True
 
+    def process_fake_tensor_load(
+        self,
+        tensor: torch.Tensor,
+        index: list[object],
+    ) -> None:
+        """Called during `type_propagation` when processing a `load` memory op on fake tensors"""
+        return
+
     def adjust_block_size_constraints(
         self,
         block_specs: list[object],
@@ -1218,6 +1226,17 @@ class PallasBackend(Backend):
             return 8
         return 1  # No requirements for other dimensions
 
+    fake_tensor_loads: list[tuple[torch.Tensor, list[object]]]
+
+    def process_fake_tensor_load(
+        self,
+        tensor: torch.Tensor,
+        index: list[object],
+    ) -> None:
+        if not hasattr(self, "fake_tensor_loads"):
+            self.fake_tensor_loads = []
+        self.fake_tensor_loads.append((tensor, index))
+
     def adjust_block_size_constraints(
         self,
         block_specs: list[object],
@@ -1240,7 +1259,10 @@ class PallasBackend(Backend):
         ``min(block_size, tensor_dim)`` which equals the full array
         dimension -- always valid per TPU rules.
         """
+        from ..autotuner.config_spec import BlockSizeSpec
         from .ast_extension import ExtendedAST
+        from .compile_environment import BlockSizeInfo
+        from helion._compiler.compile_environment import _to_sympy
         from helion._compiler.host_function import HostFunction
         from helion._compiler.type_propagation import SequenceType
         from helion._compiler.type_propagation import TensorType
@@ -1253,6 +1275,7 @@ class PallasBackend(Backend):
                 super().__init__()
                 self.backend = backend
                 self.required_alignments: dict[int, int] = {}
+                self.update_requirements_from_fake_tensor_loads()
 
             def visit_Subscript(self, node: ast.Subscript) -> None:
                 assert isinstance(node, ExtendedAST)
@@ -1312,14 +1335,37 @@ class PallasBackend(Backend):
                         self.required_alignments[bid], required_alignment
                     )
 
+            def update_requirements_from_fake_tensor_loads(self) -> None:
+                # When tensors are indexed within external lambdas called by the kernel,
+                # they generate fake loads, which we don't pickup during AST walk.
+                if not hasattr(self.backend, "fake_tensor_loads"):
+                    return
+                if block_sizes is None:
+                    return
+                for info in block_sizes:
+                    if not isinstance(info, BlockSizeInfo):
+                        continue
+                    for tensor, subscripts in self.backend.fake_tensor_loads:
+                        for dim, subscript in enumerate(subscripts):
+                            if isinstance(subscript, torch.SymInt) and info.dim_matches(
+                                _to_sympy(subscript)
+                            ):
+                                dim_from_end = tensor.ndim - 1 - dim
+                                bitwidth = tensor.dtype.itemsize * 8
+                                required_alignment = (
+                                    self.backend._get_pallas_required_alignment(
+                                        dim_from_end, tensor.ndim, bitwidth
+                                    )
+                                )
+                                self.maybe_update_required_alignment(
+                                    info.block_id, required_alignment
+                                )
+
         analyzer = TensorTiledAccessAnalyzer(self)
         for stmt in host_func.body:
             analyzer.visit(stmt)
 
         from torch._inductor.runtime.runtime_utils import next_power_of_2
-
-        from ..autotuner.config_spec import BlockSizeSpec
-        from .compile_environment import BlockSizeInfo
 
         if block_sizes is not None and kernel_tensor_sizes is not None:
             for shape in kernel_tensor_sizes:
