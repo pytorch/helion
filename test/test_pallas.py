@@ -217,6 +217,23 @@ def pallas_inner_loop_add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 
 
 @helion.kernel(backend="pallas", static_shapes=True)
+def pallas_two_pass_reduction(x: torch.Tensor) -> torch.Tensor:
+    """Two inner reduction loops over the same dim: reduce to a per-row mean,
+    then subtract it from each element.
+    """
+    m, n = x.size()
+    out = torch.empty_like(x)
+    for tile_m in hl.tile(m):
+        acc = torch.zeros_like(x[tile_m, 0], dtype=torch.float32)
+        for tile_n in hl.tile(n):
+            acc = acc + torch.sum(x[tile_m, tile_n], dim=-1)
+        mean = (acc / n)[:, None]
+        for tile_n in hl.tile(n):
+            out[tile_m, tile_n] = x[tile_m, tile_n] - mean.to(x.dtype)
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
 def pallas_add_3d(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     """Kernel with an outer grid loop and a 2D inner device loop."""
     b, m, n = x.size()
@@ -624,6 +641,34 @@ class TestPallas(TestCase):
         torch.testing.assert_close(result, args[0] + args[1])
         # out is output-only, excluded from pallas_call inputs
         self.assertIn("_inplace_indices=[]", code)
+
+    def test_two_pass_reduction_emit_pipeline(self) -> None:
+        """Two inner reduction loops over the same dim compile and run under
+        ``pallas_loop_type='emit_pipeline'``.
+        """
+        x = torch.randn(256, 128, device=DEVICE, dtype=torch.float32)
+        _code, result = code_and_output(
+            pallas_two_pass_reduction,
+            (x,),
+            block_sizes=[128, 128, 128],
+            pallas_loop_type="emit_pipeline",
+        )
+        expected = x - x.mean(dim=-1, keepdim=True)
+        torch.testing.assert_close(result, expected, rtol=1e-4, atol=1e-4)
+
+    def test_two_pass_reduction_fori_loop(self) -> None:
+        """Two inner reduction loops over the same dim compile and run under
+        ``pallas_loop_type='fori_loop'``.
+        """
+        x = torch.randn(256, 128, device=DEVICE, dtype=torch.float32)
+        _code, result = code_and_output(
+            pallas_two_pass_reduction,
+            (x,),
+            block_sizes=[128, 128, 128],
+            pallas_loop_type="fori_loop",
+        )
+        expected = x - x.mean(dim=-1, keepdim=True)
+        torch.testing.assert_close(result, expected, rtol=1e-4, atol=1e-4)
 
     def test_attention_default_fp32(self) -> None:
         """Test attention with default (for-loop) inner loop."""
