@@ -64,10 +64,12 @@ if TYPE_CHECKING:
 
     from torch._guards import Source
 
+    from ..autotuner import ConfigSource
     from ..autotuner import ConfigSpec
     from ..autotuner.base_cache import BoundKernelInMemoryCacheKey
 
     ConfigLike = Config | dict[str, object]
+    ConfigsListEntry = ConfigLike | ConfigSource
 
 log: logging.Logger = logging.getLogger(__name__)
 _R = TypeVar("_R")
@@ -115,7 +117,7 @@ class Kernel(Generic[_R]):
         self,
         fn: Callable[..., _R],
         *,
-        configs: list[ConfigLike] | None = None,
+        configs: Sequence[ConfigsListEntry] | None = None,
         settings: Settings | None,
         key: Callable[..., Hashable] | None = None,
     ) -> None:
@@ -137,7 +139,7 @@ class Kernel(Generic[_R]):
         self.signature: inspect.Signature = inspect.signature(fn)
         self.settings: Settings = settings or Settings()
         self._key_fn: Callable[..., Hashable] | None = key
-        self.configs: list[Config] = [
+        self.configs: list[Config | ConfigSource] = [
             # pyrefly: ignore [bad-argument-type]
             Config(**c) if isinstance(c, dict) else c
             for c in configs or []
@@ -504,13 +506,8 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         return self.env.config_spec
 
     @property
-    def configs(self) -> list[Config]:
-        """
-        Alias for `self.kernel.configs`.
-
-        Returns:
-            list[Config]: The list of configurations.
-        """
+    def configs(self) -> list[Config | ConfigSource]:
+        """Return the kernel's configured configs (alias for `self.kernel.configs`)."""
         return self.kernel.configs
 
     def format_kernel_decorator(self, config: Config, settings: Settings) -> str:
@@ -895,7 +892,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         if self.settings.force_autotune:
             return None
         configs = self.kernel.configs
-        if len(configs) == 1:
+        if len(configs) == 1 and isinstance(configs[0], Config):
             return configs[0]
         if len(configs) == 0 and self.kernel.settings.autotune_effort == "none":
             config = self.config_spec.default_config()
@@ -1119,7 +1116,7 @@ def kernel(
     fn: Callable[..., _R],
     *,
     config: ConfigLike | None = None,
-    configs: list[ConfigLike] | None = None,
+    configs: Sequence[ConfigsListEntry] | None = None,
     key: Callable[..., Hashable] | None = None,
     **settings: object,
 ) -> Kernel[_R]: ...
@@ -1130,7 +1127,7 @@ def kernel(
     fn: None = None,
     *,
     config: ConfigLike | None = None,
-    configs: list[ConfigLike] | None = None,
+    configs: Sequence[ConfigsListEntry] | None = None,
     key: Callable[..., Hashable] | None = None,
     **settings: object,
 ) -> _KernelDecorator: ...
@@ -1140,7 +1137,7 @@ def kernel(
     fn: Callable[..., _R] | None = None,
     *,
     config: ConfigLike | None = None,
-    configs: list[ConfigLike] | None = None,
+    configs: Sequence[ConfigsListEntry] | None = None,
     key: Callable[..., Hashable] | None = None,
     **settings: object,
 ) -> Kernel[_R] | _KernelDecorator:

@@ -917,8 +917,8 @@ def _bound_test_config(bound: BoundKernel, **kwargs: object) -> Config:
             # pyrefly: ignore [bad-argument-type]
             **kwargs
         )
-    elif bound.kernel.configs:
-        (config,) = bound.kernel.configs
+    elif len(bound.kernel.configs) == 1 and isinstance(bound.kernel.configs[0], Config):
+        config = bound.kernel.configs[0]
     else:
         config = bound.config_spec.default_config()
     # Strip config keys not supported by the current backend so that

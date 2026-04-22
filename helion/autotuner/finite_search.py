@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING
 
 from .. import exc
 from .base_search import BaseSearch
+from .config_source import ConfigSource
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -13,8 +14,7 @@ if TYPE_CHECKING:
 
 
 class FiniteSearch(BaseSearch):
-    """
-    Search over a given list of configs, returning the best one.
+    """Search over a given list of configs, returning the best one.
 
     This strategy is similar to triton.Autotune, and is the default if you specify `helion.kernel(configs=[...])`.
     """
@@ -23,14 +23,27 @@ class FiniteSearch(BaseSearch):
         self,
         kernel: _AutotunableKernel,
         args: Sequence[object],
-        configs: list[Config] | None = None,
+        configs: Sequence[Config | ConfigSource] | None = None,
     ) -> None:
         super().__init__(kernel, args)
-        self.configs: list[Config] = [*(configs or ())]
-        if len(self.configs) == 0 and self.kernel.configs:
-            self.configs.extend(self.kernel.configs)
+        raw: list[Config | ConfigSource] = [*(configs or ())]
+        if len(raw) == 0 and self.kernel.configs:
+            raw = [*self.kernel.configs]
+        self.configs: list[Config] = self._resolve_sources(raw)
         if len(self.configs) < 2:
             raise exc.NotEnoughConfigs(len(self.configs))
+
+    def _resolve_sources(self, items: list[Config | ConfigSource]) -> list[Config]:
+        """Return a deduplicated list of Configs after resolving any ConfigSource markers in order."""
+        resolved: list[Config] = []
+        seen: set[Config] = set()
+        for item in items:
+            produced = item.resolve(self) if isinstance(item, ConfigSource) else [item]
+            for cfg in produced:
+                if cfg not in seen:
+                    seen.add(cfg)
+                    resolved.append(cfg)
+        return resolved
 
     def _autotune(self) -> Config:
         best_config = None

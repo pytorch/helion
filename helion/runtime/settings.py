@@ -507,6 +507,11 @@ class _Settings:
             _env_get_int, "HELION_BEST_AVAILABLE_MAX_CACHE_SCAN", 500
         )
     )
+    autotune_finite_warmstart_max: int = dataclasses.field(
+        default_factory=functools.partial(
+            _env_get_int, "HELION_FINITE_WARMSTART_MAX", 5
+        )
+    )
     autotune_initial_population_strategy: InitialPopulation | None = None
     torch_compile_fusion: bool = dataclasses.field(
         default_factory=functools.partial(
@@ -655,6 +660,10 @@ class Settings(_Settings):
         "autotune_best_available_max_cache_scan": (
             "Maximum number of cache files to scan when searching for matching configs in FROM_BEST_AVAILABLE strategy. "
             "Set HELION_BEST_AVAILABLE_MAX_CACHE_SCAN=N to override. Default is 500."
+        ),
+        "autotune_finite_warmstart_max": (
+            "Default cap on cached configs added by helion.from_cache() to a FiniteSearch list. "
+            "Set HELION_FINITE_WARMSTART_MAX=N to override. Default is 5."
         ),
         "autotune_initial_population_strategy": (
             "Override the initial population strategy for autotuning. "

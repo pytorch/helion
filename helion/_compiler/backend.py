@@ -580,17 +580,16 @@ class Backend(abc.ABC):
             bound_kernel.settings.autotune_precompile = None
 
         if not force and bound_kernel.kernel.configs:
-            if len(bound_kernel.kernel.configs) == 1:
-                (config,) = bound_kernel.kernel.configs
+            from ..autotuner import FiniteSearch
+            from ..runtime.config import Config
+
+            cfgs = bound_kernel.kernel.configs
+            if len(cfgs) == 1 and isinstance(cfgs[0], Config):
+                config = cfgs[0]
             else:
                 # We have finite predetermined configs, no need to precompile
                 bound_kernel.settings.autotune_precompile = None
-
-                from ..autotuner import FiniteSearch
-
-                config = FiniteSearch(
-                    bound_kernel, args, bound_kernel.configs
-                ).autotune()
+                config = FiniteSearch(bound_kernel, args, cfgs).autotune()
         else:
             bound_kernel.settings.check_autotuning_disabled()
             config = bound_kernel.settings.autotuner_fn(
