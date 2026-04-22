@@ -37,7 +37,9 @@ from helion._compiler.cute.cute_mma import _get_mma_k_loop_info
 from helion._compiler.cute.cute_mma import _make_tcgen05_layout_plan_setup
 from helion._compiler.cute.cute_mma import _mma_result_can_be_deferred
 from helion._compiler.cute.cute_mma import _new_tcgen05_layout_plan
+from helion._compiler.cute.cute_mma import _tcgen05_ab_stage_count
 from helion._compiler.cute.cute_mma import _tcgen05_pipeline_arrive_count
+from helion._compiler.cute.cute_mma import _tcgen05_root_m_threads
 from helion._compiler.cute.cute_mma import _tcgen05_tmem_barrier_thread_count
 from helion._compiler.cute.cute_mma import can_codegen_cute_mma_aten
 from helion._compiler.cute.cute_reshape import _get_dim_local_coord
@@ -77,6 +79,7 @@ from helion.language.memory_ops import _cute_combined_mask
 from helion.language.memory_ops import _cute_index_exprs
 from helion.language.memory_ops import _maybe_codegen_cute_packed_affine_lhs_load
 from helion.language.memory_ops import load
+from helion.runtime import _append_cute_wrapper_plan
 
 
 class _FakeBlockSize:
@@ -471,8 +474,434 @@ class TestCuteLowerings(unittest.TestCase):
             code = cute_matmul_mma_codegen_only.bind(args).to_triton_code(config)
 
         self.assertIn("cutlass.utils.blackwell_helpers.make_trivial_tiled_mma", code)
-        self.assertIn("cute.nvgpu.tcgen05.make_umma_smem_desc", code)
+        self.assertIn("cute.nvgpu.tcgen05.OperandMajorMode.MN", code)
+        self.assertIn(".make_fragment_B(", code)
+        self.assertIn("cute.gemm(", code)
+        self.assertIn(
+            "tcgen05_exec_active = tcgen05_warp_idx == cutlass.Int32(4)",
+            code,
+        )
+        self.assertIn("block=(64, 8, 1)", code)
+        self.assertIn("tcgen05_gC = cute.local_tile(out, (64, 8),", code)
+        self.assertIn("partition_C(tcgen05_gC)", code)
+        self.assertNotIn("for _tcgen05_store_i in range(", code)
         self.assertNotIn("cute.arch.warp_reduction_sum", code)
+
+    def test_tcgen05_codegen_auto_path_preserves_mma_mode(self) -> None:
+        @helion.kernel(backend="cute")
+        def cute_matmul_mma_codegen_only(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        args = (
+            torch.randn(256, 64, device=DEVICE, dtype=torch.float16),
+            torch.randn(64, 128, device=DEVICE, dtype=torch.float16),
+        )
+        support = SimpleNamespace(
+            supported_impls=("universal", "warp", "tcgen05"),
+            warp_f16bf16=True,
+            tcgen05_f16bf16=True,
+        )
+
+        with (
+            patch(
+                "helion._compiler.cute.cute_mma.get_cute_mma_support",
+                return_value=support,
+            ),
+            patch(
+                "helion._compiler.cute.mma_support.get_cute_mma_support",
+                return_value=support,
+            ),
+        ):
+            bound = cute_matmul_mma_codegen_only.bind(args)
+            config = bound.config_spec.default_config()
+            code = bound.to_triton_code(config)
+
+        self.assertEqual(config.config["block_sizes"][2], 16)
+        self.assertGreaterEqual(config.config["block_sizes"][0], 128)
+        self.assertLessEqual(config.config["block_sizes"][0], 256)
+        self.assertGreaterEqual(config.config["block_sizes"][1], 8)
+        self.assertLessEqual(config.config["block_sizes"][1], 128)
+        self.assertIn("cutlass.utils.blackwell_helpers.make_trivial_tiled_mma", code)
+        self.assertIn("cute.nvgpu.tcgen05.OperandMajorMode.MN", code)
+        self.assertIn(".make_fragment_B(", code)
+        self.assertIn("cute.gemm(", code)
+        self.assertIn(
+            "tcgen05_exec_active = tcgen05_warp_idx == cutlass.Int32(4)",
+            code,
+        )
+        self.assertIn(
+            "if tcgen05_exec_active:",
+            code,
+        )
+        self.assertIn(
+            "tcgen05_exec_leader = tcgen05_exec_active and tcgen05_lane_idx == cutlass.Int32(0)",
+            code,
+        )
+        self.assertIn(
+            "tcgen05_epi_tidx = tcgen05_lane_idx + tcgen05_warp_idx * cutlass.Int32(32) if tcgen05_epi_active else cutlass.Int32(0)",
+            code,
+        )
+        self.assertIn(
+            "mma_slice_tidx = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster()) % cutlass.Int32(2)",
+            code,
+        )
+        self.assertIn(
+            "if tcgen05_epi_active:",
+            code,
+        )
+
+    def test_tcgen05_dot_codegen_preregisters_collective_loads(self) -> None:
+        @helion.kernel(backend="cute")
+        def cute_dot_codegen_only(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        args = (
+            torch.randn(128, 16, device=DEVICE, dtype=torch.float16),
+            torch.randn(16, 256, device=DEVICE, dtype=torch.float16),
+        )
+        support = SimpleNamespace(
+            supported_impls=("universal", "warp", "tcgen05"),
+            warp_f16bf16=True,
+            tcgen05_f16bf16=True,
+        )
+
+        with (
+            patch(
+                "helion._compiler.cute.cute_mma.get_cute_mma_support",
+                return_value=support,
+            ),
+            patch(
+                "helion._compiler.cute.mma_support.get_cute_mma_support",
+                return_value=support,
+            ),
+        ):
+            bound = cute_dot_codegen_only.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            config = helion.Config(
+                block_sizes=[128, 256, 16],
+                l2_groupings=[4],
+                loop_orders=[[0, 1]],
+                num_stages=2,
+                num_warps=4,
+                pid_type="flat",
+                tcgen05_cluster_m=1,
+                tcgen05_ab_stages=2,
+                tcgen05_acc_stages=2,
+                tcgen05_c_stages=2,
+                tcgen05_num_epi_warps=4,
+                tcgen05_has_scheduler_warp=True,
+                tcgen05_has_epi_load_warp=True,
+            )
+            code = bound.to_triton_code(config)
+
+        self.assertIn("cute.nvgpu.tcgen05.CtaGroup.ONE", code)
+        self.assertIn("PipelineTmaUmma.create(", code)
+        self.assertNotIn("load = x[indices_0, indices_2]", code)
+        self.assertNotIn("load_1 = y[indices_2, indices_1]", code)
+        self.assertIn(
+            "if tcgen05_exec_active:\n                tcgen05_ab_pipeline.consumer_wait(",
+            code,
+        )
+        self.assertIn(
+            "if tcgen05_exec_active:\n            cute.arch.fence_view_async_shared()",
+            code,
+        )
+        self.assertIn(
+            "if tcgen05_exec_active:\n            for _tcgen05_kblk_idx in range(",
+            code,
+        )
+        self.assertIn(
+            "if tcgen05_exec_active:\n                tcgen05_ab_pipeline.consumer_release(",
+            code,
+        )
+        self.assertIn(
+            "tcgen05_acc_pipeline.consumer_release(tcgen05_acc_consumer_state)",
+            code,
+        )
+        self.assertNotIn("cute.arch.warp_reduction_sum", code)
+
+    def test_tcgen05_default_store_arrives_with_exec_warp(self) -> None:
+        @helion.kernel(backend="cute")
+        def cute_matmul_mma_codegen_only(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        args = (
+            torch.randn(256, 64, device=DEVICE, dtype=torch.float16),
+            torch.randn(64, 128, device=DEVICE, dtype=torch.float16),
+        )
+        support = SimpleNamespace(
+            supported_impls=("universal", "warp", "tcgen05"),
+            warp_f16bf16=True,
+            tcgen05_f16bf16=True,
+        )
+
+        with (
+            patch(
+                "helion._compiler.cute.cute_mma.get_cute_mma_support",
+                return_value=support,
+            ),
+            patch(
+                "helion._compiler.cute.mma_support.get_cute_mma_support",
+                return_value=support,
+            ),
+        ):
+            code = cute_matmul_mma_codegen_only.bind(args).to_triton_code(
+                helion.Config(
+                    block_sizes=[128, 32, 16],
+                    l2_groupings=[4],
+                    loop_orders=[[0, 1]],
+                    num_stages=2,
+                    num_warps=4,
+                    pid_type="flat",
+                )
+            )
+
+        self.assertIn("if tcgen05_exec_active:", code)
+        self.assertEqual(code.count("tcgen05_tmem_allocator.free("), 1)
+        self.assertIn(
+            "num_allocated_columns=tcgen05_acc_tmem_cols, dealloc_mbarrier_initialized=True",
+            code,
+        )
+        self.assertNotIn("tcgen05_tmem_alloc_barrier.arrive()", code)
+        self.assertNotIn("tcgen05_tmem_alloc_barrier.arrive_and_wait()", code)
+
+    def test_tcgen05_codegen_supports_serialized_root_n_threads(self) -> None:
+        @helion.kernel(backend="cute")
+        def cute_matmul_mma_codegen_only(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        args = (
+            torch.randn(128, 16, device=DEVICE, dtype=torch.float16),
+            torch.randn(16, 8, device=DEVICE, dtype=torch.float16),
+        )
+        config = helion.Config(
+            block_sizes=[128, 8, 16],
+            num_threads=[128, 2, 0],
+            loop_orders=[[0, 1]],
+        )
+        support = SimpleNamespace(
+            supported_impls=("universal", "warp", "tcgen05"),
+            warp_f16bf16=True,
+            tcgen05_f16bf16=True,
+        )
+
+        with (
+            patch.dict("os.environ", {"HELION_CUTE_MMA_IMPL": "tcgen05"}, clear=False),
+            patch(
+                "helion._compiler.cute.cute_mma.get_cute_mma_support",
+                return_value=support,
+            ),
+            patch(
+                "helion._compiler.cute.mma_support.get_cute_mma_support",
+                return_value=support,
+            ),
+        ):
+            code = cute_matmul_mma_codegen_only.bind(args).to_triton_code(config)
+
+        self.assertIn(
+            "mma_active = cutlass.Int32(cute.arch.thread_idx()[1]) < cutlass.Int32(2)",
+            code,
+        )
+        self.assertIn(
+            "tcgen05_epi_warp_count = cutlass.Int32(4)",
+            code,
+        )
+        self.assertIn(
+            "tcgen05_tmem_alloc_barrier = cutlass.pipeline.NamedBarrier(barrier_id=1, num_threads=160)",
+            code,
+        )
+        self.assertIn(
+            ".get_slice(tcgen05_epi_tidx)",
+            code,
+        )
+        self.assertIn("block=(128, 2, 1)", code)
+
+    def test_tcgen05_wrapper_plan_tracks_ab_stage_count(self) -> None:
+        @helion.kernel(backend="cute")
+        def cute_matmul_mma_codegen_only(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        args = (
+            torch.randn(256, 64, device=DEVICE, dtype=torch.float16),
+            torch.randn(64, 128, device=DEVICE, dtype=torch.float16),
+        )
+        config = helion.Config(
+            block_sizes=[128, 32, 16],
+            l2_groupings=[4],
+            loop_orders=[[0, 1]],
+            num_stages=1,
+            num_warps=4,
+            pid_type="flat",
+        )
+        support = SimpleNamespace(
+            supported_impls=("universal", "warp", "tcgen05"),
+            warp_f16bf16=True,
+            tcgen05_f16bf16=True,
+        )
+
+        with (
+            patch(
+                "helion._compiler.cute.cute_mma.get_cute_mma_support",
+                return_value=support,
+            ),
+            patch(
+                "helion._compiler.cute.mma_support.get_cute_mma_support",
+                return_value=support,
+            ),
+        ):
+            code = cute_matmul_mma_codegen_only.bind(args).to_triton_code(config)
+
+        self.assertIn("'kind': 'tcgen05_ab_tma'", code)
+        self.assertIn("'ab_stage_count': 2", code)
+
+    def test_tcgen05_ab_tma_wrapper_plan_respects_stage_count(self) -> None:
+        body: list[str] = []
+        call_args: list[str] = []
+        _append_cute_wrapper_plan(
+            body,
+            call_args,
+            {
+                "kind": "tcgen05_ab_tma",
+                "lhs_idx": 0,
+                "rhs_idx": 1,
+                "bm": 128,
+                "bn": 32,
+                "bk": 16,
+                "ab_stage_count": 1,
+                "input_dtype": "cutlass.Float16",
+                "acc_dtype": "cutlass.Float32",
+                "kernel_args": [
+                    "tma_atom_a",
+                    "tma_tensor_a",
+                    "tma_atom_b",
+                    "tma_tensor_b",
+                ],
+            },
+        )
+        emitted = "\n".join(body)
+        self.assertIn("make_smem_layout_a(", emitted)
+        self.assertIn("make_smem_layout_b(", emitted)
+        self.assertIn("cutlass.Float16, 1)", emitted)
+        self.assertEqual(
+            call_args, ["tma_atom_a", "tma_tensor_a", "tma_atom_b", "tma_tensor_b"]
+        )
+
+    def test_tcgen05_wide_codegen_uses_dense_physical_participant_ids(self) -> None:
+        @helion.kernel(backend="cute")
+        def cute_matmul_mma_codegen_only(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        args = (
+            torch.randn(256, 64, device=DEVICE, dtype=torch.float16),
+            torch.randn(64, 128, device=DEVICE, dtype=torch.float16),
+        )
+        config = helion.Config(
+            block_sizes=[128, 128, 16],
+            loop_orders=[[0, 1]],
+            num_stages=1,
+            pid_type="flat",
+        )
+        support = SimpleNamespace(
+            supported_impls=("universal", "warp", "tcgen05"),
+            warp_f16bf16=True,
+            tcgen05_f16bf16=True,
+        )
+
+        with (
+            patch.dict("os.environ", {"HELION_CUTE_MMA_IMPL": "tcgen05"}, clear=False),
+            patch(
+                "helion._compiler.cute.cute_mma.get_cute_mma_support",
+                return_value=support,
+            ),
+            patch(
+                "helion._compiler.cute.mma_support.get_cute_mma_support",
+                return_value=support,
+            ),
+        ):
+            code = cute_matmul_mma_codegen_only.bind(args).to_triton_code(config)
+
+        self.assertIn("block=(32, 8, 1)", code)
+        self.assertIn(
+            "mma_tidx = cutlass.Int32(cute.arch.thread_idx()[0]) + cutlass.Int32(cute.arch.thread_idx()[1]) * cutlass.Int32(32)",
+            code,
+        )
+        self.assertIn(
+            "mma_slice_tidx = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster()) % cutlass.Int32(2)",
+            code,
+        )
+        self.assertIn("thr_mma = tiled_mma.get_slice(mma_slice_tidx)", code)
+        self.assertNotIn("for lane_0 in cutlass.range_constexpr(", code)
+        self.assertNotIn("for lane_1 in cutlass.range_constexpr(", code)
+        self.assertNotIn(
+            "mma_tidx = cutlass.Int32(cute.arch.thread_idx()[0]) + cutlass.Int32(cute.arch.thread_idx()[1]) * cutlass.Int32(128)",
+            code,
+        )
+        self.assertNotIn("load = x[indices_0, indices_2]", code)
+        self.assertNotIn("load_1 = y[indices_2, indices_1]", code)
+        self.assertNotIn("tcgen05_store_tmem_load_atom", code)
+        self.assertIn("smem_c = cute.arch.alloc_smem", code)
+        self.assertIn(
+            "num_allocated_columns=tcgen05_acc_tmem_cols, dealloc_mbarrier_initialized=True",
+            code,
+        )
 
     def test_permute_codegen_materializes_non_store_use(self) -> None:
         graph = Graph()
@@ -2506,15 +2935,24 @@ class TestCuteLowerings(unittest.TestCase):
                     "universal",
                 )
                 self.assertEqual(
-                    _choose_mma_impl(torch.float16, bm=64, bn=16, bk=16),
+                    _choose_mma_impl(torch.float16, bm=32, bn=16, bk=16),
                     "universal",
                 )
 
     def test_tcgen05_thread_counts_match_participants_and_cta(self) -> None:
-        self.assertEqual(_tcgen05_pipeline_arrive_count(64), 4)
-        self.assertEqual(_tcgen05_pipeline_arrive_count(128), 8)
-        self.assertEqual(_tcgen05_tmem_barrier_thread_count(64, 8), 512)
-        self.assertEqual(_tcgen05_tmem_barrier_thread_count(128, 8), 1024)
+        self.assertEqual(_tcgen05_ab_stage_count(0), 1)
+        self.assertEqual(_tcgen05_ab_stage_count(1), 1)
+        self.assertEqual(_tcgen05_ab_stage_count(2), 2)
+        self.assertEqual(_tcgen05_ab_stage_count(4), 2)
+        self.assertEqual(_tcgen05_pipeline_arrive_count(128), 2)
+        self.assertEqual(_tcgen05_pipeline_arrive_count(256), 4)
+        self.assertEqual(_tcgen05_pipeline_arrive_count(1024), 4)
+        self.assertEqual(_tcgen05_root_m_threads(64, 8), 64)
+        self.assertEqual(_tcgen05_root_m_threads(64, 16), 32)
+        self.assertEqual(_tcgen05_root_m_threads(128, 256), 32)
+        self.assertEqual(_tcgen05_tmem_barrier_thread_count(128), 96)
+        self.assertEqual(_tcgen05_tmem_barrier_thread_count(256), 160)
+        self.assertEqual(_tcgen05_tmem_barrier_thread_count(1024), 160)
 
     def test_tcgen05_layout_plan_setup_uses_pipeline_thread_counts(self) -> None:
         df = _FakeDeviceFunction()
@@ -2525,14 +2963,180 @@ class TestCuteLowerings(unittest.TestCase):
             bm=128,
             bn=8,
             bk=16,
+            ab_stage_count=1,
+            acc_stage_count=2,
+            c_stage_count=4,
+            cta_thread_count=256,
+            epi_warp_count=4,
+            is_two_cta=False,
+            active_physical_n_threads=2,
             input_dtype_str="cutlass.Float16",
             acc_dtype_str="cutlass.Float32",
         )
 
         emitted = "\n".join(ast.unparse(stmt) for stmt in stmts)
-        self.assertIn("tcgen05_pipeline_arrive_count_1 = cutlass.Int32(8)", emitted)
+        self.assertIn("tcgen05_acc_stage_count_1 = cutlass.Int32(2)", emitted)
+        self.assertIn("tcgen05_ab_stage_count_1 = cutlass.Int32(1)", emitted)
+        self.assertIn("tcgen05_c_stage_count_1 = cutlass.Int32(4)", emitted)
+        self.assertIn("tcgen05_epi_warp_count_1 = cutlass.Int32(4)", emitted)
+        self.assertIn("tcgen05_epilog_sync_barrier_id_1 = cutlass.Int32(2)", emitted)
+        self.assertIn("tcgen05_acc_pipeline_arrive_count_1 = cutlass.Int32(4)", emitted)
+        self.assertIn("tcgen05_ab_pipeline_arrive_count_1 = cutlass.Int32(1)", emitted)
+        self.assertIn(
+            "make_smem_layout_a(tiled_mma, (128, 8, 16), cutlass.Float16, 1)", emitted
+        )
+        self.assertIn(
+            "make_smem_layout_b(tiled_mma, (128, 8, 16), cutlass.Float16, 1)", emitted
+        )
+        self.assertIn(
+            "make_smem_layout_epi(cutlass.Float32, tcgen05_c_layout_1, tcgen05_epi_tile_1, tcgen05_c_stage_count_1)",
+            emitted,
+        )
         self.assertNotIn(
-            "tcgen05_pipeline_arrive_count_1 = cutlass.Int32(256)", emitted
+            "tcgen05_acc_pipeline_arrive_count_1 = cutlass.Int32(256)", emitted
+        )
+
+        wider_plan = _new_tcgen05_layout_plan(df)
+        wider_stmts = _make_tcgen05_layout_plan_setup(
+            wider_plan,
+            "tiled_mma",
+            bm=128,
+            bn=32,
+            bk=16,
+            ab_stage_count=1,
+            acc_stage_count=2,
+            c_stage_count=2,
+            cta_thread_count=256,
+            epi_warp_count=4,
+            is_two_cta=False,
+            active_physical_n_threads=8,
+            input_dtype_str="cutlass.Float16",
+            acc_dtype_str="cutlass.Float32",
+        )
+        wider_emitted = "\n".join(ast.unparse(stmt) for stmt in wider_stmts)
+        self.assertIn("tcgen05_acc_stage_count_2 = cutlass.Int32(2)", wider_emitted)
+
+    def test_tcgen05_codegen_emits_cluster_and_role_split_knobs(self) -> None:
+        @helion.kernel(backend="cute")
+        def cute_matmul_mma_codegen_only(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        args = (
+            torch.randn(8192, 8192, device=DEVICE, dtype=torch.float16),
+            torch.randn(8192, 8192, device=DEVICE, dtype=torch.float16),
+        )
+        config = helion.Config(
+            block_sizes=[256, 256, 16],
+            tcgen05_cluster_m=2,
+            tcgen05_num_epi_warps=4,
+            tcgen05_has_scheduler_warp=True,
+            tcgen05_has_epi_load_warp=True,
+            pid_type="persistent_blocked",
+        )
+        support = SimpleNamespace(
+            supported_impls=("universal", "warp", "tcgen05"),
+            warp_f16bf16=True,
+            tcgen05_f16bf16=True,
+        )
+
+        with (
+            patch.dict("os.environ", {"HELION_CUTE_MMA_IMPL": "tcgen05"}, clear=False),
+            patch(
+                "helion._compiler.cute.cute_mma.get_cute_mma_support",
+                return_value=support,
+            ),
+            patch(
+                "helion._compiler.cute.mma_support.get_cute_mma_support",
+                return_value=support,
+            ),
+        ):
+            code = cute_matmul_mma_codegen_only.bind(args).to_triton_code(config)
+
+        self.assertIn(
+            "'cluster_m': 2",
+            code,
+        )
+        self.assertIn(
+            "'cluster_n': 1",
+            code,
+        )
+        self.assertIn("cute.nvgpu.tcgen05.CtaGroup.TWO", code)
+        self.assertIn("_BLOCK_SIZE_0 = 256", code)
+        self.assertIn("_BLOCK_SIZE_1 = 256", code)
+        self.assertIn("cute.arch.block_idx_in_cluster()", code)
+        self.assertIn("tcgen05_tma_warp = tcgen05_warp_idx == cutlass.Int32(5)", code)
+        self.assertIn(
+            "tcgen05_ab_load_active = tcgen05_warp_idx >= cutlass.Int32(5) and tcgen05_warp_idx < cutlass.Int32(6)",
+            code,
+        )
+        self.assertIn(
+            "tcgen05_epi_load_warp = tcgen05_warp_idx == cutlass.Int32(6)",
+            code,
+        )
+        self.assertIn("tcgen05_scheduler_warp = ", code)
+        self.assertIn(
+            "tcgen05_scheduler_warp = tcgen05_warp_idx == cutlass.Int32(7)",
+            code,
+        )
+        self.assertIn(
+            "tcgen05_exec_active = tcgen05_warp_idx == cutlass.Int32(4)", code
+        )
+        self.assertIn(
+            "cute.arch.make_warp_uniform(cute.arch.warp_idx()) == cutlass.Int32(5)",
+            code,
+        )
+        self.assertIn("tcgen05_epi_load_warp = ", code)
+        self.assertIn("block=(32, 8, 1)", code)
+        self.assertIn("cta_layout_vmnk=tcgen05_cluster_layout_vmnk", code)
+        self.assertIn("cutlass.utils.StaticPersistentTileScheduler.create(", code)
+        self.assertIn(
+            "cutlass.pipeline.pipeline_init_arrive(cluster_shape_mn=tcgen05_cluster_layout_vmnk, is_relaxed=True)",
+            code,
+        )
+        self.assertIn(
+            "cutlass.pipeline.pipeline_init_wait(cluster_shape_mn=tcgen05_cluster_layout_vmnk)",
+            code,
+        )
+        self.assertIn("while tcgen05_work_tile", code)
+        self.assertNotIn("for virtual_pid in ", code)
+
+        no_scheduler_config = helion.Config(
+            block_sizes=[256, 256, 16],
+            tcgen05_cluster_m=2,
+            tcgen05_num_epi_warps=4,
+            tcgen05_has_scheduler_warp=False,
+            tcgen05_has_epi_load_warp=True,
+            pid_type="persistent_blocked",
+        )
+        with (
+            patch.dict("os.environ", {"HELION_CUTE_MMA_IMPL": "tcgen05"}, clear=False),
+            patch(
+                "helion._compiler.cute.cute_mma.get_cute_mma_support",
+                return_value=support,
+            ),
+            patch(
+                "helion._compiler.cute.mma_support.get_cute_mma_support",
+                return_value=support,
+            ),
+        ):
+            no_scheduler_code = cute_matmul_mma_codegen_only.bind(args).to_triton_code(
+                no_scheduler_config
+            )
+
+        self.assertIn("tcgen05_scheduler_warp = False", no_scheduler_code)
+        self.assertIn(
+            "cute.arch.make_warp_uniform(cute.arch.warp_idx()) == cutlass.Int32(5)",
+            no_scheduler_code,
         )
 
     def test_cute_grouped_sum_reduction_uses_tree_for_non_warp_multiple_groups(

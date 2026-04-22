@@ -98,6 +98,11 @@ class TileStrategyDispatch:
         self.block_id_to_strategy[tuple(block_ids)] = strategy
 
     def _add_reduction_strategies(self, fn: DeviceFunction, config: Config) -> None:
+        # Make the dispatcher (with tile strategies already registered)
+        # visible to reduction-strategy __init__ via ``fn.tile_strategy``
+        # so reductions can shrink their thread count if total launch
+        # threads would otherwise exceed the per-block limit.
+        fn.tile_strategy = self
         env = CompileEnvironment.current()
         max_threads = env.backend.max_reduction_threads()
         rdims = [bs.block_id for bs in env.block_sizes if bs.reduction]

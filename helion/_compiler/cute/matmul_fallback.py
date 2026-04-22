@@ -108,7 +108,7 @@ def _emit_cute_grouped_sum_reduction(
     if thread_axis is None and isinstance(loop_block_axes, dict):
         thread_axis = loop_block_axes.get(k_block_id)
     if thread_axis is None:
-        return backend.reduction_expr(input_name, "sum", 0, threads_in_group=1)
+        return input_name
 
     reduce_extent = axis_sizes.get(thread_axis, 1)
     if reduce_extent <= 1:
