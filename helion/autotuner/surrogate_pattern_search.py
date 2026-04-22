@@ -366,7 +366,7 @@ class LFBOPatternSearch(PatternSearch):
         self.population = []
         for flat_config in self._generate_initial_population_flat():
             member = self.make_unbenchmarked(flat_config)
-            if member.config not in visited:
+            if member is not None and member.config not in visited:
                 visited.add(member.config)
                 self.population.append(member)
         self.set_generation(0)
@@ -572,7 +572,7 @@ class LFBOPatternSearch(PatternSearch):
                 all_neighbors = self._generate_neighbors(current.flat_values)
             for flat_config in all_neighbors:
                 new_member = self.make_unbenchmarked(flat_config)
-                if new_member.config not in visited:
+                if new_member is not None and new_member.config not in visited:
                     candidates.append(new_member)
                     visited.add(new_member.config)
 
