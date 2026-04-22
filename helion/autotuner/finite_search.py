@@ -35,15 +35,15 @@ class FiniteSearch(BaseSearch):
 
     def _resolve_sources(self, items: list[Config | ConfigSource]) -> list[Config]:
         """Return a deduplicated list of Configs after resolving any ConfigSource markers in order."""
-        resolved: list[Config] = []
-        seen: set[Config] = set()
-        for item in items:
-            produced = item.resolve(self) if isinstance(item, ConfigSource) else [item]
-            for cfg in produced:
-                if cfg not in seen:
-                    seen.add(cfg)
-                    resolved.append(cfg)
-        return resolved
+        return list(
+            dict.fromkeys(
+                cfg
+                for item in items
+                for cfg in (
+                    item.resolve(self) if isinstance(item, ConfigSource) else [item]
+                )
+            )
+        )
 
     def _autotune(self) -> Config:
         best_config = None
