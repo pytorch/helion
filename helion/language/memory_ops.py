@@ -449,7 +449,7 @@ def _pallas_slice_code(
 
 
 def _pallas_ds_expr(state: CodegenState, block_id: int, tile_offset: str = "") -> str:
-    \"\"\"Return a ``pl.ds(offset, block_size)`` expression for *block_id*, offset by *tile_offset*\"\"\"
+    """Return a ``pl.ds(offset, block_size)`` expression for *block_id*, offset by *tile_offset*"""
     offset = state.codegen.offset_var(block_id)
     if tile_offset:
         offset = f"{offset} + {tile_offset}"
@@ -462,7 +462,7 @@ def _pallas_ds_expr(state: CodegenState, block_id: int, tile_offset: str = "") -
 
 
 def _pallas_vmem_name(state: CodegenState, name: str) -> str:
-    \"\"\"Remap a tensor name to its VMEM ref name when inside emit_pipeline or fori_loop.\"\"\"
+    """Remap a tensor name to its VMEM ref name when inside emit_pipeline or fori_loop."""
     from .._compiler.tile_strategy import EmitPipelineLoopState
     from .._compiler.tile_strategy import ForiLoopState
 
@@ -495,7 +495,7 @@ def _(state: CodegenState) -> None:
 
 
 def _matching_block_ids(env: CompileEnvironment, size: object) -> list[int]:
-    \"\"\"Find all block_ids that match the given dimension size.\"\"\"
+    """Find all block_ids that match the given dimension size."""
     candidates: list[int] = []
     if isinstance(size, (int, torch.SymInt)):
         if (direct := env.get_block_id(size)) is not None:
@@ -513,11 +513,11 @@ def _matching_block_ids(env: CompileEnvironment, size: object) -> list[int]:
 
 
 def _log_cute_layout(state: CodegenState, op_name: str) -> None:
-    \"\"\"Log the CuTe layout annotation for the current node, if any.
+    """Log the CuTe layout annotation for the current node, if any.
 
     This is used during CuTe load/store codegen to make layout info
     visible for debugging and future codegen integration.
-    \"\"\"
+    """
     layout = state.cute_layout
     if layout is None:
         return
@@ -763,29 +763,29 @@ def _cute_index_exprs(
                     loop_info = active_loop_info(block_id)
                     begin_var = tile_begin_expr(block_id, loop_info)
                     block_size_var = (
-                        state.device_function.block_size_var(block_id) or \"1\"
+                        state.device_function.block_size_var(block_id) or "1"
                     )
                     if isinstance(origin_info.origin, TileBeginOrigin):
                         return begin_var
                     if isinstance(origin_info.origin, TileEndOrigin):
                         if loop_info is not None and loop_info.end_var_name is not None:
                             return loop_info.end_var_name
-                        return f\"({begin_var}) + ({block_size_var})\"
+                        return f"({begin_var}) + ({block_size_var})"
                     if isinstance(origin_info.origin, TileCountOrigin):
                         end_var = (
                             loop_info.end_var_name
                             if loop_info is not None
                             and loop_info.end_var_name is not None
-                            else f\"({begin_var}) + ({block_size_var})\"
+                            else f"({begin_var}) + ({block_size_var})"
                         )
-                        extent = f\"({end_var}) - ({begin_var})\"
+                        extent = f"({end_var}) - ({begin_var})"
                         return env.backend.cdiv_expr(
                             extent, block_size_var, is_device=True
                         )
                     if isinstance(origin_info.origin, TileIdOrigin):
-                        if block_size_var == \"1\":
+                        if block_size_var == "1":
                             return begin_var
-                        return f\"({begin_var}) // ({block_size_var})\"
+                        return f"({begin_var}) // ({block_size_var})"
                     return state.sympy_expr(expr)
         block_id = env.get_block_id(idx)
         if block_id is not None:
@@ -793,7 +793,7 @@ def _cute_index_exprs(
             return index_var_for_block_id(block_id, idx)
         if expr is not None:
             return state.sympy_expr(expr)
-        raise exc.BackendUnsupported(\"cute\", f\"unlowerable symbolic index: {idx}\")
+        raise exc.BackendUnsupported("cute", f"unlowerable symbolic index: {idx}")
 
     def active_loop_info(block_id: int) -> LoopDimInfo | None:
         loops = state.codegen.active_device_loops.get(block_id)
@@ -823,16 +823,16 @@ def _cute_index_exprs(
         loops = state.codegen.active_device_loops.get(block_id)
         if loops:
             return state.codegen.offset_var(block_id)
-        begin_var = \"0\"
+        begin_var = "0"
         if loop_info is not None and loop_info.begin_var_name is not None:
             begin_var = loop_info.begin_var_name
         global_index = active_index_var(block_id)
         local_coord = active_local_coord(block_id)
         if global_index is not None and local_coord is not None:
             return state.codegen.lift(
-                expr_from_string(f\"({global_index}) - ({local_coord})\"),
+                expr_from_string(f"({global_index}) - ({local_coord})"),
                 dce=True,
-                prefix=\"tile_begin\",
+                prefix="tile_begin",
             ).id
         if global_index is not None:
             return global_index
@@ -887,10 +887,10 @@ def _cute_index_exprs(
             return idx_var
 
         raise exc.BackendUnsupported(
-            \"cute\",
+            "cute",
             (
-                \"indexing dimension is not active in this scope \"
-                f\"(block_id={block_id}, size={size})\"
+                "indexing dimension is not active in this scope "
+                f"(block_id={block_id}, size={size})"
             ),
         )
 
@@ -919,20 +919,20 @@ def _cute_index_exprs(
 
             if isinstance(ast_idx, CuteAffineRangeIndex):
                 raise exc.BackendUnsupported(
-                    \"cute\",
-                    \"affine hl.arange() indexing is only supported in CuTe packed-matmul load fusion\",
+                    "cute",
+                    "affine hl.arange() indexing is only supported in CuTe packed-matmul load fusion",
                 )
             if not isinstance(ast_idx, ast.AST):
                 raise exc.BackendUnsupported(
-                    \"cute\", f\"tensor index without AST at position {pos}\"
+                    "cute", f"tensor index without AST at position {pos}"
                 )
-            lifted = state.codegen.lift(ast_idx, dce=True, prefix=\"index\")
+            lifted = state.codegen.lift(ast_idx, dce=True, prefix="index")
             index_dtype = env.backend.dtype_str(env.index_dtype)
-            result.append(f\"{index_dtype}({lifted.id})\")
+            result.append(f"{index_dtype}({lifted.id})")
             tensor_dim += 1
         elif isinstance(idx, slice) and idx == slice(None):
             if tensor is None:
-                raise exc.BackendUnsupported(\"cute\", \"slice indexing without tensor\")
+                raise exc.BackendUnsupported("cute", "slice indexing without tensor")
             dim_size = tensor.shape[tensor_dim]
             block_id = resolve_active_slice_block_id(dim_size, used_block_ids)
             if block_id is not None:
@@ -950,23 +950,23 @@ def _cute_index_exprs(
                 continue
             if inactive_slice_expr is None:
                 raise exc.BackendUnsupported(
-                    \"cute\",
+                    "cute",
                     (
-                        \"indexing dimension is not active in this scope \"
-                        f\"(tensor_dim={pos}, size={dim_size})\"
+                        "indexing dimension is not active in this scope "
+                        f"(tensor_dim={pos}, size={dim_size})"
                     ),
                 )
             result.append(inactive_slice_expr)
             tensor_dim += 1
         else:
-            raise exc.BackendUnsupported(\"cute\", f\"index type: {type(idx)}\")
+            raise exc.BackendUnsupported("cute", f"index type: {type(idx)}")
     return result
 
 
 def _cute_index_tuple(index_exprs: list[str]) -> str:
     if len(index_exprs) == 1:
-        return f\"({index_exprs[0]},)\"
-    return f\"({', '.join(index_exprs)})\"
+        return f"({index_exprs[0]},)"
+    return f"({', '.join(index_exprs)})"
 
 
 def _cute_combined_mask(
@@ -985,7 +985,7 @@ def _cute_combined_mask(
         return None
 
     if extra_mask is not None:
-        terms.append(state.codegen.lift(extra_mask, dce=True, prefix=\"mask\").id)
+        terms.append(state.codegen.lift(extra_mask, dce=True, prefix="mask").id)
 
     seen: set[int] = set()
     tensor_dim = 0
@@ -1014,7 +1014,7 @@ def _cute_combined_mask(
 
     if not terms:
         return None
-    return \" and \".join(f\"({term})\" for term in terms)
+    return " and ".join(f"({term})" for term in terms)
 
 
 def _codegen_cute_store_permute_lane_loops(
@@ -1049,21 +1049,21 @@ def _codegen_cute_store_permute_lane_loops(
         subscript,
         ast_subscript,
         tensor=tensor,
-        inactive_singleton_slice_expr=\"0\",
+        inactive_singleton_slice_expr="0",
     )
     index_tuple = _cute_index_tuple(index_exprs)
     mask_expr = _cute_combined_mask(state, subscript, extra_mask, tensor=tensor)
     tensor_name = state.device_function.tensor_arg(tensor).name
 
     input_node: torch.fx.Node
-    output_val = value_node.meta.get(\"val\")
+    output_val = value_node.meta.get("val")
     read_flat: str
     input_shape: list[int]
 
     info = _store_permute_info(value_node)
     if info is not None:
         input_node, perm = info
-        input_val = input_node.meta.get(\"val\")
+        input_val = input_node.meta.get("val")
         if not isinstance(input_val, torch.Tensor) or not isinstance(
             output_val, torch.Tensor
         ):
@@ -1073,12 +1073,12 @@ def _codegen_cute_store_permute_lane_loops(
         source_tensor_node = input_node.args[0] if input_node.args else None
         source_extra_mask = input_node.args[2] if len(input_node.args) > 2 else None
         if (
-            input_node.op == \"call_function\"
+            input_node.op == "call_function"
             and input_node.target is load
             and isinstance(source_tensor_node, torch.fx.Node)
             and source_extra_mask is None
         ):
-            source_tensor = source_tensor_node.meta.get(\"val\")
+            source_tensor = source_tensor_node.meta.get("val")
             if isinstance(source_tensor, torch.Tensor):
                 reordered_subscript = [
                     subscript[perm.index(i)] for i in range(len(perm))
@@ -1093,7 +1093,7 @@ def _codegen_cute_store_permute_lane_loops(
                     reordered_subscript,
                     ast_subscript=reordered_ast_subscript,
                     tensor=source_tensor,
-                    inactive_singleton_slice_expr=\"0\",
+                    inactive_singleton_slice_expr="0",
                 )
                 source_index_tuple = _cute_index_tuple(source_index_exprs)
                 source_name = state.device_function.tensor_arg(source_tensor).name
@@ -1108,24 +1108,24 @@ def _codegen_cute_store_permute_lane_loops(
                 )
                 return expr_from_string(
                     (
-                        f\"({tensor_name}.__setitem__({index_tuple}, \"
-                        f\"({source_name}[{source_index_tuple}] if {source_mask} else {source_dtype}(0))) \"
-                        f\"if {mask_expr} else None)\"
+                        f"({tensor_name}.__setitem__({index_tuple}, "
+                        f"({source_name}[{source_index_tuple}] if {source_mask} else {source_dtype}(0))) "
+                        f"if {mask_expr} else None)"
                     )
                     if source_mask is not None and mask_expr is not None
                     else (
-                        f\"{tensor_name}.__setitem__({index_tuple}, \"
-                        f\"{source_name}[{source_index_tuple}] if {source_mask} else {source_dtype}(0))\"
+                        f"{tensor_name}.__setitem__({index_tuple}, "
+                        f"{source_name}[{source_index_tuple}] if {source_mask} else {source_dtype}(0))"
                         if source_mask is not None
                         else (
-                            f\"({tensor_name}.__setitem__({index_tuple}, {source_name}[{source_index_tuple}]) \"
-                            f\"if {mask_expr} else None)\"
+                            f"({tensor_name}.__setitem__({index_tuple}, {source_name}[{source_index_tuple}]) "
+                            f"if {mask_expr} else None)"
                             if mask_expr is not None
-                            else f\"{tensor_name}.__setitem__({index_tuple}, {source_name}[{source_index_tuple}])\"
+                            else f"{tensor_name}.__setitem__({index_tuple}, {source_name}[{source_index_tuple}])"
                         )
                     )
                 )
-            raise exc.BackendUnsupported(\"cute\", \"permute lane-loop source tensor\")
+            raise exc.BackendUnsupported("cute", "permute lane-loop source tensor")
         env = CompileEnvironment.current()
         df = state.device_function
         input_shape = _get_tile_shape(input_val, env, df.config)
@@ -1146,7 +1146,7 @@ def _codegen_cute_store_permute_lane_loops(
         if not isinstance(input_arg, torch.fx.Node):
             return None
         input_node = input_arg
-        input_val = input_node.meta.get(\"val\")
+        input_val = input_node.meta.get("val")
         if not isinstance(input_val, torch.Tensor) or not isinstance(
             output_val, torch.Tensor
         ):
@@ -1181,36 +1181,36 @@ def _codegen_cute_store_permute_lane_loops(
         input_numel *= size
 
     dtype_str = env.backend.dtype_str(input_val.dtype)
-    smem_ptr = df.new_var(\"permute_smem_ptr\")
-    smem = df.new_var(\"permute_smem\")
+    smem_ptr = df.new_var("permute_smem_ptr")
+    smem = df.new_var("permute_smem")
     state.codegen.add_statement(
         statement_from_string(
-            f\"{smem_ptr} = cute.arch.alloc_smem({dtype_str}, {input_numel})\"
+            f"{smem_ptr} = cute.arch.alloc_smem({dtype_str}, {input_numel})"
         )
     )
     state.codegen.add_statement(
         statement_from_string(
-            f\"{smem} = cute.make_tensor({smem_ptr}, ({input_numel},))\"
+            f"{smem} = cute.make_tensor({smem_ptr}, ({input_numel},))"
         )
     )
 
     read_expr = (
-        f\"{df.tensor_arg(tensor).name}.__setitem__({index_tuple}, {smem}[{read_flat}])\"
+        f"{df.tensor_arg(tensor).name}.__setitem__({index_tuple}, {smem}[{read_flat}])"
         if mask_expr is None
         else (
-            f\"({df.tensor_arg(tensor).name}.__setitem__({index_tuple}, {smem}[{read_flat}]) \"
-            f\"if {mask_expr} else None)\"
+            f"({df.tensor_arg(tensor).name}.__setitem__({index_tuple}, {smem}[{read_flat}]) "
+            f"if {mask_expr} else None)"
         )
     )
     return expr_from_string(
-        f\"({smem}.__setitem__({current_flat}, {{value}}), \"
-        f\"cute.arch.sync_threads(), \"
-        f\"{read_expr})\",
+        f"({smem}.__setitem__({current_flat}, {{value}}), "
+        f"cute.arch.sync_threads(), "
+        f"{read_expr})",
         value=value,
     )
 
 
-@_decorators.codegen(store, \"metal\")
+@_decorators.codegen(store, "metal")
 def _(state: CodegenState) -> ast.AST:
     # Metal delegates to the same PointerIndexingStrategy as Triton.
     # This produces tl.store(ptr + offset, val, mask) in the AST;
@@ -1229,10 +1229,10 @@ def _(state: CodegenState) -> ast.AST:
         device_fn.device_memory_op_index += 1
         strategy = device_fn.get_indexing_strategy(indexing_idx)
         return strategy.codegen_store(state, tensor, [*subscript], value, extra_mask)
-    raise exc.BackendUnsupported(\"metal\", f\"store target type: {type(tensor)}\")
+    raise exc.BackendUnsupported("metal", f"store target type: {type(tensor)}")
 
 
-@_decorators.codegen(store, \"cute\")
+@_decorators.codegen(store, "cute")
 def _(state: CodegenState) -> ast.AST:
     tensor = state.proxy_arg(0)
     subscript = state.proxy_arg(1)
@@ -1245,7 +1245,7 @@ def _(state: CodegenState) -> ast.AST:
 
     if state.fx_node is not None and len(state.fx_node.args) > 2:
         value_node = state.fx_node.args[2]
-        if isinstance(value_node, torch.fx.Node) and value_node.op == \"call_function\":
+        if isinstance(value_node, torch.fx.Node) and value_node.op == "call_function":
             if isinstance(tensor, torch.Tensor):
                 rewritten_stmt = _codegen_cute_store_permute_lane_loops(
                     state,
@@ -1265,17 +1265,17 @@ def _(state: CodegenState) -> ast.AST:
                 value = rewritten
 
     if isinstance(tensor, tuple):
-        raise exc.BackendUnsupported(\"cute\", \"stack tensor store\")
+        raise exc.BackendUnsupported("cute", "stack tensor store")
     if not isinstance(tensor, torch.Tensor):
-        raise exc.BackendUnsupported(\"cute\", f\"store target type: {type(tensor)}\")
+        raise exc.BackendUnsupported("cute", f"store target type: {type(tensor)}")
 
-    _log_cute_layout(state, \"store\")
+    _log_cute_layout(state, "store")
 
     tensor_name = state.device_function.tensor_arg(tensor).name
     backend = CompileEnvironment.current().backend
     target_dtype = backend.dtype_str(tensor.dtype)
     value = expr_from_string(
-        backend.ast_to_dtype_expr(\"{value}\", target_dtype),
+        backend.ast_to_dtype_expr("{value}", target_dtype),
         value=value,
     )
     index_exprs = _cute_index_exprs(
@@ -1283,18 +1283,18 @@ def _(state: CodegenState) -> ast.AST:
         subscript,
         ast_subscript,
         tensor=tensor,
-        inactive_singleton_slice_expr=\"0\",
+        inactive_singleton_slice_expr="0",
     )
     index_tuple = _cute_index_tuple(index_exprs)
     assign_expr = expr_from_string(
-        f\"{tensor_name}.__setitem__({index_tuple}, {{value}})\", value=value
+        f"{tensor_name}.__setitem__({index_tuple}, {{value}})", value=value
     )
 
     mask_expr = _cute_combined_mask(state, subscript, extra_mask, tensor=tensor)
     if mask_expr is None:
         return assign_expr
     return expr_from_string(
-        f\"({tensor_name}.__setitem__({index_tuple}, {{value}}) if {mask_expr} else None)\",
+        f"({tensor_name}.__setitem__({index_tuple}, {{value}}) if {mask_expr} else None)",
         value=value,
     )
 
@@ -1325,7 +1325,7 @@ def _(
         grids = torch.meshgrid(
             # pyrefly: ignore [bad-argument-type]
             *(indices[i] for i in tensor_idx_positions),
-            indexing=\"ij\",
+            indexing="ij",
         )
         for i, grid in zip(tensor_idx_positions, grids, strict=False):
             # pyrefly: ignore [unsupported-operation]
@@ -1370,9 +1370,9 @@ def _(
             unique_count = stacked.unique(dim=0).size(0)
             if unique_count < stacked.size(0):
                 raise exc.DuplicateStoreIndicesError(
-                    \"hl.store with duplicate indices has undefined behavior in compiled mode. \"
-                    \"The order in which values are written to the same memory location is \"
-                    \"non-deterministic and may vary between Triton versions and backends.\"
+                    "hl.store with duplicate indices has undefined behavior in compiled mode. "
+                    "The order in which values are written to the same memory location is "
+                    "non-deterministic and may vary between Triton versions and backends."
                 )
 
         tensor.index_put_(tuple(valid_indices), values, accumulate=False)
@@ -1391,13 +1391,13 @@ def load(
     extra_mask: torch.Tensor | None = None,
     eviction_policy: str | None = None,
 ) -> torch.Tensor:
-    \"\"\"Load a value from a tensor using a list of indices.
+    """Load a value from a tensor using a list of indices.
 
     This function is equivalent to `tensor[index]` but allows
     setting `extra_mask=` to mask elements beyond the default masking
     based on the hl.tile range. It also accepts an optional
     `eviction_policy` which is forwarded to the underlying Triton `tl.load`
-    call to control the cache eviction behavior (e.g., \"evict_last\").
+    call to control the cache eviction behavior (e.g., "evict_last").
 
     Args:
         tensor: The tensor / stack tensor to load from
@@ -1406,7 +1406,7 @@ def load(
         eviction_policy: Optional Triton load eviction policy to hint cache behavior
     Returns:
         torch.Tensor: The loaded value
-    \"\"\"
+    """
     raise exc.NotInsideKernel
 
 
@@ -1444,10 +1444,10 @@ def _(
         tensor_shape = SubscriptIndexing.compute_shape(tensor_like, index)
         target_shape = list(dev_ptrs.size()) + tensor_shape
         return tensor_like.new_empty(target_shape)
-    raise NotImplementedError(f\"Unsupported tensor type: {type(tensor)}\")
+    raise NotImplementedError(f"Unsupported tensor type: {type(tensor)}")
 
 
-@_decorators.codegen(load, \"triton\")
+@_decorators.codegen(load, "triton")
 def _(state: CodegenState) -> ast.AST:
     tensor = state.proxy_arg(0)
     subscript = state.proxy_arg(1)
@@ -1480,7 +1480,7 @@ def _(state: CodegenState) -> ast.AST:
         tensor_node = state.fx_node.args[0] if state.fx_node is not None else None
         if (
             isinstance(tensor_node, torch.fx.Node)
-            and tensor_node.op == \"call_function\"
+            and tensor_node.op == "call_function"
             and tensor_node.target == tile_index
         ):
             # tile.index tensors are not real memory accesses; materialize the
@@ -1493,14 +1493,14 @@ def _(state: CodegenState) -> ast.AST:
             parts = []
             for idx in subscript:
                 if idx is None:
-                    parts.append(\"None\")
+                    parts.append("None")
                 elif idx == slice(None):
-                    parts.append(\":\")
+                    parts.append(":")
                 else:
                     raise AssertionError(
-                        f\"Unexpected index type in tile_index load: {idx}\"
+                        f"Unexpected index type in tile_index load: {idx}"
                     )
-            return expr_from_string(f\"{base_var}[{', '.join(parts)}]\")
+            return expr_from_string(f"{base_var}[{', '.join(parts)}]")
 
         # Use the shared memory op index for indexing strategy
         indexing_idx = device_fn.device_memory_op_index
@@ -1532,10 +1532,10 @@ def _(state: CodegenState) -> ast.AST:
         return StackIndexingStrategy.codegen_load(
             state, tensor, dev_ptrs_ast, [*subscript], extra_mask, eviction_policy
         )
-    raise NotImplementedError(f\"Unsupported tensor type: {type(tensor)}\")
+    raise NotImplementedError(f"Unsupported tensor type: {type(tensor)}")
 
 
-@_decorators.codegen(load, \"pallas\")
+@_decorators.codegen(load, "pallas")
 def _(state: CodegenState) -> ast.AST:
     tensor = state.proxy_arg(0)
     subscript = state.proxy_arg(1)
@@ -1548,15 +1548,15 @@ def _(state: CodegenState) -> ast.AST:
     device_fn.device_load_index += 1
     device_fn.device_memory_op_index += 1
     index_str, none_dims = _pallas_index_str(state, subscript, tensor)
-    result = expr_from_string(f\"{name}[{index_str}]\")
+    result = expr_from_string(f"{name}[{index_str}]")
     for dim in none_dims:
         result = expr_from_string(
-            f\"jnp.expand_dims({{result}}, axis={dim})\", result=result
+            f"jnp.expand_dims({{result}}, axis={dim})", result=result
         )
     return result
 
 
-@_decorators.codegen(load, \"metal\")
+@_decorators.codegen(load, "metal")
 def _(state: CodegenState) -> ast.AST:
     # Metal delegates to the same PointerIndexingStrategy as Triton.
     # This produces tl.load(ptr + offset, mask, other=0) in the AST;
@@ -1580,10 +1580,10 @@ def _(state: CodegenState) -> ast.AST:
         return strategy.codegen_load(
             state, tensor, [*subscript], extra_mask, eviction_policy
         )
-    raise exc.BackendUnsupported(\"metal\", f\"load tensor type: {type(tensor)}\")
+    raise exc.BackendUnsupported("metal", f"load tensor type: {type(tensor)}")
 
 
-@_decorators.codegen(load, \"cute\")
+@_decorators.codegen(load, "cute")
 def _(state: CodegenState) -> object:
     tensor = state.proxy_arg(0)
     subscript = state.proxy_arg(1)
@@ -1594,11 +1594,11 @@ def _(state: CodegenState) -> object:
     assert isinstance(extra_mask, (type(None), ast.AST))
 
     if isinstance(tensor, tuple):
-        raise exc.BackendUnsupported(\"cute\", \"stack tensor load\")
+        raise exc.BackendUnsupported("cute", "stack tensor load")
     if not isinstance(tensor, torch.Tensor):
-        raise exc.BackendUnsupported(\"cute\", f\"load tensor type: {type(tensor)}\")
+        raise exc.BackendUnsupported("cute", f"load tensor type: {type(tensor)}")
 
-    _log_cute_layout(state, \"load\")
+    _log_cute_layout(state, "load")
 
     packed_affine_lhs = _maybe_codegen_cute_packed_affine_lhs_load(
         state, tensor, subscript, extra_mask
@@ -1618,15 +1618,15 @@ def _(state: CodegenState) -> object:
         subscript,
         ast_subscript,
         tensor=tensor,
-        inactive_slice_expr=\"None\",
-        inactive_singleton_slice_expr=\"0\",
+        inactive_slice_expr="None",
+        inactive_singleton_slice_expr="0",
     )
-    load_expr = f\"{tensor_name}[{', '.join(index_exprs)}]\"
+    load_expr = f"{tensor_name}[{', '.join(index_exprs)}]"
     mask_expr = _cute_combined_mask(state, subscript, extra_mask, tensor=tensor)
     if mask_expr is None:
         return expr_from_string(load_expr)
     zero = CompileEnvironment.current().backend.dtype_str(tensor.dtype)
-    return expr_from_string(f\"({load_expr} if {mask_expr} else {zero}(0))\")
+    return expr_from_string(f"({load_expr} if {mask_expr} else {zero}(0))")
 
 
 @_decorators.get_masked_value(load)
@@ -1653,7 +1653,7 @@ def _(
         ]
         if len(tensor_idxs) > 1:
             # pyrefly: ignore [bad-argument-type]
-            grids = torch.meshgrid(*(indices[i] for i in tensor_idxs), indexing=\"ij\")
+            grids = torch.meshgrid(*(indices[i] for i in tensor_idxs), indexing="ij")
             for i, grid in zip(tensor_idxs, grids, strict=False):
                 indices[i] = grid
         # pyrefly: ignore [bad-argument-type]
