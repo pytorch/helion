@@ -1405,6 +1405,7 @@ def _(
     if isinstance(tensor, torch.Tensor):
         target_shape = SubscriptIndexing.compute_shape(tensor, index)
         env = CompileEnvironment.current()
+        env.backend.process_fake_tensor_load(tensor, index)
         return env.new_index_result(tensor, target_shape)
     if isinstance(tensor, tuple):
         tensor_like, dev_ptrs = tensor
