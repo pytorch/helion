@@ -53,6 +53,11 @@ jobs:
           cd docs/
           make html
 
+      - name: Add dashboard
+        run: |
+          mkdir -p ./site/dashboard
+          cp .github/dashboard/index.html ./site/dashboard/index.html
+
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v5
         with:

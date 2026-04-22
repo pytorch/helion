@@ -1,0 +1,49 @@
+name: Deploy Dashboard Data
+
+on:
+  workflow_run:
+    workflows: ["Benchmark Dispatch"]
+    types: [completed]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion != 'cancelled' }}
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Load existing data from dashboard-data branch
+        run: |
+          git fetch origin dashboard-data 2>/dev/null && \
+            git show origin/dashboard-data:dashboard-data.json > existing-data.json 2>/dev/null || \
+            echo '{}' > existing-data.json
+
+      - name: Build dashboard data
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python3 .github/dashboard/build_dashboard_data.py \
+            --repo ${{ github.repository }} \
+            --existing-data existing-data.json \
+            --output dashboard-data.json
+
+      - name: Push to dashboard-data branch
+        run: |
+          WORK=$(mktemp -d)
+          cp dashboard-data.json "$WORK/"
+          cd "$WORK"
+          git init -q
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout -b dashboard-data
+          git add dashboard-data.json
+          git commit -q -m "Update dashboard data $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          git remote add origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
+          git push --force origin dashboard-data
