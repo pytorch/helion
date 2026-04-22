@@ -31,7 +31,7 @@ class CachedConfigSource(ConfigSource):
         cap = (
             self.max_configs
             if self.max_configs is not None
-            else search.settings.autotune_finite_warmstart_max
+            else search.settings.autotune_best_available_max_configs
         )
         entries = search._find_similar_cached_configs(cap)
         configs: list[Config] = []
