@@ -1533,16 +1533,26 @@ class WalkDeviceAST(NodeVisitor):
             return None
         if not isinstance(target, ast.Subscript):
             raise exc.InvalidAssignment
+        assert isinstance(target, ExtendedAST)
+        assert isinstance(target.value, ExtendedAST)
+        assert target.value._type_info is not None
+        # Handle list element assignment (e.g., cached[i] = tensor in static_range)
+        if isinstance(target.value._type_info, SequenceType):
+            index_value = self.visit(target.slice)
+            if not isinstance(index_value, int):
+                raise exc.InvalidSequenceSubscription(target.slice)
+            val = self.visit(node.value)
+            base_list = self.visit(target.value)
+            assert isinstance(base_list, list)
+            base_list[index_value] = val
+            return None
         assert isinstance(node.value, ExtendedAST)
         rhs_type = node.value._type_info
-        assert isinstance(target, ExtendedAST)
         lhs_type = target._type_info
         if not isinstance(lhs_type, TensorType) or not isinstance(
             rhs_type, (TensorType, NumericType, LiteralType)
         ):
             raise exc.NonTensorSubscriptAssign(lhs_type, rhs_type)
-        assert isinstance(target.value, ExtendedAST)
-        assert target.value._type_info is not None
         target_origin = target.value._type_info.origin
         if not target_origin.is_host() and not isinstance(
             target.value._type_info, StackTensorType
