@@ -34,16 +34,19 @@ class FiniteSearch(BaseSearch):
             raise exc.NotEnoughConfigs(len(self.configs))
 
     def _resolve_sources(self, items: list[Config | ConfigSource]) -> list[Config]:
-        """Return a deduplicated list of Configs after resolving any ConfigSource markers in order."""
-        return list(
-            dict.fromkeys(
-                cfg
-                for item in items
-                for cfg in (
-                    item.resolve(self) if isinstance(item, ConfigSource) else [item]
-                )
-            )
-        )
+        """Return a list of Configs in order; inline items are kept as-given, source-produced Configs are deduplicated against the running set."""
+        result: list[Config] = []
+        seen: set[Config] = set()
+        for item in items:
+            if isinstance(item, ConfigSource):
+                for cfg in item.resolve(self):
+                    if cfg not in seen:
+                        seen.add(cfg)
+                        result.append(cfg)
+            else:
+                seen.add(item)
+                result.append(item)
+        return result
 
     def _autotune(self) -> Config:
         best_config = None
