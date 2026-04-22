@@ -42,9 +42,9 @@ a:hover{text-decoration:underline}
 .kernel-card:hover{border-color:var(--blue)}
 .kernel-card.placeholder{opacity:0.25;cursor:default;pointer-events:none}
 .kernel-card .left-accent{position:absolute;left:0;top:0;bottom:0;width:3px}
-.kernel-card .kc-body{display:flex;gap:8px}
-.kernel-card .kc-left{flex:1;min-width:0}
-.kernel-card .kc-right{flex:1;min-width:0;display:flex;align-items:center}
+.kernel-card .kc-body{display:flex;gap:16px;align-items:stretch}
+.kernel-card .kc-left{flex:0 0 auto;min-width:180px;display:flex;flex-direction:column;justify-content:center}
+.kernel-card .kc-right{flex:1;min-width:0;display:flex;align-items:stretch}
 .kernel-card .kc-header{display:flex;align-items:center;gap:8px;margin-bottom:6px;flex-wrap:wrap}
 .kernel-card .kc-name{font-size:13px;font-weight:600;word-break:break-word}
 .kernel-card .kc-tag{font-size:10px;font-weight:600;padding:2px 6px;border-radius:4px;text-transform:uppercase;letter-spacing:0.3px}
@@ -54,8 +54,8 @@ a:hover{text-decoration:underline}
 .kernel-card .kc-row .kc-label{color:var(--text-dim)}
 .kernel-card .kc-row .kc-val{font-weight:600}
 .kernel-card .kc-delta{font-size:13px;margin-bottom:3px}
-.kernel-card .sparkline-container{height:60px}
-.kernel-card .sparkline-container svg{width:100%;height:100%}
+.kernel-card .sparkline-container{width:100%;min-height:80px;display:flex;align-items:center}
+.kernel-card .sparkline-container svg{width:100%;height:100%;min-height:80px}
 .kernel-card .accuracy-warn{font-size:11px;color:var(--orange);margin-top:4px}
 .modal-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,0.65);z-index:1000;justify-content:center;align-items:flex-start;padding:40px 20px;overflow-y:auto}
 .modal-overlay.open{display:flex}
@@ -84,6 +84,7 @@ a:hover{text-decoration:underline}
 .data-table td{padding:8px 10px;border-bottom:1px solid var(--border)}
 .data-table tbody tr:hover{background:rgba(88,166,255,0.04)}
 .table-scroll{overflow-x:auto;max-height:600px;overflow-y:auto;border-radius:8px;border:1px solid var(--border);background:var(--surface)}
+.table-wrap{overflow-x:auto;border-radius:8px;border:1px solid var(--border);background:var(--surface)}
 .summary-row{display:flex;gap:12px;margin-bottom:20px;flex-wrap:wrap}
 .summary-card{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:16px 20px;flex:1;min-width:140px}
 .summary-card .sc-label{font-size:12px;color:var(--text-dim);margin-bottom:4px}
@@ -272,7 +273,10 @@ function getAccuracyFailures() {
 }
 function sparklineSvg(history, color) {
   if (!history || history.length < 2) return '';
-  const vals = history.map(h => h.helion_speedup_geomean).filter(v => v != null);
+  const vals = history
+    .filter(h => (h.branch || 'main') === 'main')
+    .map(h => h.helion_latency_avg_ms)
+    .filter(v => v > 0);
   if (vals.length < 2) return '';
   const mn = Math.min(...vals), mx = Math.max(...vals);
   const range = mx - mn || 1;
@@ -361,7 +365,6 @@ function renderOverviewGrid() {
         html += '<div class="kc-delta" style="color:var(--text-dim)">No data</div>';
         html += '</div><div class="kc-right"></div></div></div>';
       } else {
-        const latencyVal = e.helion_latency_avg_ms > 0 ? e.helion_latency_avg_ms.toFixed(2) + ' ms' : null;
         html += `<div class="kernel-card" data-kernel="${escHtml(e.kernel)}" data-platform="${escHtml(e.platform_short)}" onclick="showDetailModal('${escHtml(e.kernel)}','${escHtml(e.platform_short)}')">`;
         html += `<div class="left-accent" style="background:${color}"></div>`;
         html += '<div class="kc-header">';
@@ -370,18 +373,10 @@ function renderOverviewGrid() {
         else if (e.status === 'regressed') html += '<span class="kc-tag regressed">regressed perf</span>';
         html += '</div>';
         html += '<div class="kc-body"><div class="kc-left">';
-        if (latencyVal) {
-          html += `<div class="kc-row"><span class="kc-label">Latency</span><span class="kc-val" style="color:${color}">${latencyVal}</span></div>`;
-        } else {
-          html += `<div class="kc-row"><span class="kc-label">Speedup</span><span class="kc-val" style="color:${color}">${formatSpeedup(e.helion_speedup_geomean)}</span></div>`;
-        }
+        html += `<div class="kc-row"><span class="kc-label">Latency</span><span class="kc-val" style="color:${color}">${e.helion_latency_avg_ms.toFixed(2)} ms</span></div>`;
         html += `<div class="kc-row"><span class="kc-label">Compile time</span><span class="kc-val">${formatCompileTime(e.compile_time_avg_s)}</span></div>`;
-        if (latencyVal && e.latency_delta_pct != null) {
-          html += `<div class="kc-delta">Latency vs prev: ${formatDelta(e.latency_delta_pct, true)}</div>`;
-        } else {
-          html += `<div class="kc-delta">Speedup vs prev: ${formatDelta(e.speedup_delta_pct, false)}</div>`;
-        }
-        html += `<div class="kc-delta">Compile vs prev: ${formatDelta(e.compile_delta_pct, true)}</div>`;
+        html += `<div class="kc-delta">Latency vs prev: ${formatDelta(e.latency_delta_pct, true)}</div>`;
+        html += `<div class="kc-delta">Compile time vs prev: ${formatDelta(e.compile_delta_pct, true)}</div>`;
         if (e.accuracy_failures && e.accuracy_failures.length > 0) {
           html += `<div class="accuracy-warn">${e.accuracy_failures.length} accuracy fail</div>`;
         }
@@ -430,15 +425,18 @@ function renderSpeedupTrendChart() {
     { x: xLabels, y: tritonTrend, name: 'Triton', mode: 'lines+markers', line: { color: '#bc8cff', width: 2 }, marker: { size: 6 } },
   ];
   const allVals = [...helionTrend, ...tcTrend, ...tritonTrend].filter(v => v > 0);
-  const minY = allVals.length > 0 ? Math.min(...allVals) * 0.9 : 0;
-  const maxY = allVals.length > 0 ? Math.max(...allVals) * 1.1 : 2;
+  const rawMin = allVals.length > 0 ? Math.min(...allVals) : 0;
+  const rawMax = allVals.length > 0 ? Math.max(...allVals) : 2;
+  const pad = (rawMax - rawMin) * 0.15 || 0.1;
+  const minY = Math.max(0, rawMin - pad);
+  const maxY = rawMax + pad;
   const shapes = (minY < 1 && maxY > 1) ? [{
     type: 'line', x0: xLabels[0], x1: xLabels[xLabels.length - 1],
     y0: 1, y1: 1, line: { color: '#f85149', width: 1, dash: 'dash' }
   }] : [];
   const layout = Object.assign({}, plotlyDark, {
     xaxis: Object.assign({}, plotlyDark.xaxis, { tickangle: -40 }),
-    yaxis: Object.assign({}, plotlyDark.yaxis, { title: 'Geomean Speedup' }),
+    yaxis: Object.assign({}, plotlyDark.yaxis, { title: 'Geomean Speedup', range: [minY, maxY] }),
     shapes: shapes,
     legend: { font: { color: '#e6edf3', size: 11 }, bgcolor: 'rgba(0,0,0,0)' },
     height: 300
@@ -480,8 +478,8 @@ function renderSpeedup() {
     html += '<div id="speedup-trend-chart" style="width:100%;height:300px"></div>';
     html += '</div>';
   }
-  entries.sort((a, b) => (b.helion_speedup_geomean || 0) - (a.helion_speedup_geomean || 0));
-  html += '<div class="table-scroll"><table class="data-table"><thead><tr><th>Kernel</th><th>Platform</th><th>Commit</th><th>Helion</th><th>torch.compile</th><th>Triton</th><th>Compile Time</th><th>Best</th></tr></thead><tbody>';
+  entries.sort((a, b) => a.platform_short.localeCompare(b.platform_short) || a.kernel.localeCompare(b.kernel));
+  html += '<div class="table-wrap"><table class="data-table"><thead><tr><th>Kernel</th><th>Platform</th><th>Commit</th><th>Helion</th><th>torch.compile</th><th>Triton</th><th>Compile Time</th><th>Best</th></tr></thead><tbody>';
   entries.forEach(e => {
     const vals = [e.helion_speedup_geomean, e.torch_compile_speedup_geomean, e.triton_speedup_geomean];
     const names = ['Helion', 'torch.compile', 'Triton'];
@@ -521,12 +519,16 @@ function renderCompare(baseRunIdOverride, cmpRunIdOverride, baseBranchOverride, 
   const cmpBranch = cmpBranchOverride || 'main';
   const baseRuns = allRuns.filter(r => (r.branch || 'main') === baseBranch);
   const cmpRuns = allRuns.filter(r => (r.branch || 'main') === cmpBranch);
-  const runs = baseRuns; // backwards compat for below
   const baseRunId = baseRunIdOverride || (baseRuns[1] ? baseRuns[1].run_id : (baseRuns[0] ? baseRuns[0].run_id : null));
   const cmpRunId = cmpRunIdOverride || (cmpRuns[0] ? cmpRuns[0].run_id : null);
   const baseRun = DATA.runs.find(r => r.run_id === baseRunId);
   const cmpRun = DATA.runs.find(r => r.run_id === cmpRunId);
-  const { platforms, kernels } = getFiltered();
+  // Compare uses all kernels/platforms (including non-main) so cross-branch comparisons work
+  const allPlatforms = [...new Set(DATA.summary.map(s => s.platform_short))].sort();
+  const allKernels = [...new Set(DATA.summary.map(s => s.kernel))].sort();
+  const search = activeFilters.search.toLowerCase();
+  const platforms = activeFilters.platform === 'all' ? allPlatforms : [activeFilters.platform];
+  const kernels = search ? allKernels.filter(k => k.toLowerCase().includes(search)) : allKernels;
   let improved = 0, regressed = 0, unchanged = 0;
   const allDeltas = [];
   const comparisons = [];
@@ -629,20 +631,17 @@ function renderCompare(baseRunIdOverride, cmpRunIdOverride, baseBranchOverride, 
   if (changedComparisons.length > 0) {
     html += `<div style="font-size:14px;font-weight:600;margin-bottom:8px">Changed Kernels (${changedComparisons.length})</div>`;
     html += '<div class="compare-grid">';
+    const fmtLat = v => v && v > 0 ? v.toFixed(2) + ' ms' : '--';
     changedComparisons.forEach(c => {
       const color = platColor(c.platform_short);
-      const hasLat = c.baseLatency > 0 || c.cmpLatency > 0;
-      const fmtLat = v => v && v > 0 ? v.toFixed(2) + ' ms' : '--';
-      const perfD = hasLat ? c.latencyDelta : c.speedupDelta;
-      const isImproved = perfD != null && perfD > 10;
+      const perfD = c.latencyDelta != null ? c.latencyDelta : c.speedupDelta;
+      const isImproved = perfD > 10;
       const borderColor = isImproved ? 'var(--green)' : 'var(--red)';
       html += `<div class="compare-card" style="border-left:3px solid ${borderColor}">`;
       html += `<div class="cc-header"><span style="color:${color}">${escHtml(c.kernel)}</span> ${platBadge(c.platform_short)} <span class="kc-tag ${isImproved ? 'improved' : 'regressed'}">${isImproved ? 'improved' : 'regressed'} perf</span></div>`;
-      if (hasLat) {
-        html += `<div class="cc-row"><span class="cc-label">Latency</span><span>${fmtLat(c.baseLatency)} → ${fmtLat(c.cmpLatency)} (${formatDelta(c.latencyDelta, true)})</span></div>`;
-      }
+      html += `<div class="cc-row"><span class="cc-label">Latency</span><span>${fmtLat(c.baseLatency)} → ${fmtLat(c.cmpLatency)} (${formatDelta(c.latencyDelta, true)})</span></div>`;
       html += `<div class="cc-row"><span class="cc-label">Speedup</span><span>${formatSpeedup(c.baseSpeedup)} → ${formatSpeedup(c.cmpSpeedup)} (${formatDelta(c.speedupDelta, false)})</span></div>`;
-      html += `<div class="cc-row"><span class="cc-label">Compile</span><span>${formatCompileTime(c.baseCompile)} → ${formatCompileTime(c.cmpCompile)} (${formatDelta(c.compileDelta, true)})</span></div>`;
+      html += `<div class="cc-row"><span class="cc-label">Compile Time</span><span>${formatCompileTime(c.baseCompile)} → ${formatCompileTime(c.cmpCompile)} (${formatDelta(c.compileDelta, true)})</span></div>`;
       html += '</div>';
     });
     html += '</div>';
@@ -650,7 +649,7 @@ function renderCompare(baseRunIdOverride, cmpRunIdOverride, baseBranchOverride, 
     html += '<div style="padding:16px;background:var(--bg);border-radius:8px;margin-bottom:20px;text-align:center;color:var(--text-dim);font-size:13px">No kernels changed &gt;10% between selected commits</div>';
   }
   html += '<div style="font-size:14px;font-weight:600;margin-bottom:8px">All Kernels</div>';
-  html += '<div class="table-scroll"><table class="data-table"><thead><tr><th>Kernel</th><th>Platform</th><th>Base Latency</th><th>Target Latency</th><th>Latency Delta</th><th>Base Speedup</th><th>Target Speedup</th><th>Speedup Delta</th><th>Base Compile</th><th>Target Compile</th><th>Compile Delta</th></tr></thead><tbody>';
+  html += '<div class="table-wrap"><table class="data-table"><thead><tr><th>Kernel</th><th>Platform</th><th>Base Latency</th><th>Target Latency</th><th>Latency Delta</th><th>Base Speedup</th><th>Target Speedup</th><th>Speedup Delta</th><th>Base Compile Time</th><th>Target Compile Time</th><th>Compile Time Delta</th></tr></thead><tbody>';
   comparisons.forEach(c => {
     const fmtLat = v => v && v > 0 ? v.toFixed(2) + ' ms' : '--';
     html += `<tr>
@@ -743,7 +742,7 @@ function showDetailModal(kernel, platform_short) {
   const color = platColor(platform_short);
   let html = modalHeader(
     `${escHtml(kernel)} ${platBadge(platform_short)}`,
-    `Speedup Geomean: ${formatSpeedup(e.helion_speedup_geomean)} | Compile: ${formatCompileTime(e.compile_time_avg_s)}${e.helion_latency_avg_ms > 0 ? ' | Latency: ' + e.helion_latency_avg_ms.toFixed(2) + ' ms' : ''}`);
+    `Latency: ${e.helion_latency_avg_ms.toFixed(2)} ms | Speedup: ${formatSpeedup(e.helion_speedup_geomean)} | Compile Time: ${formatCompileTime(e.compile_time_avg_s)}`);
   html += '<div class="modal-split"><div class="modal-lhs">';
   if (e.status !== 'unchanged') {
     html += `<div style="margin-bottom:12px"><span class="kc-tag ${e.status}">${e.status} perf</span></div>`;
@@ -752,7 +751,7 @@ function showDetailModal(kernel, platform_short) {
     html += `<div class="accuracy-warn" style="margin-bottom:12px">${e.accuracy_failures.length} accuracy failure(s): ${e.accuracy_failures.join(', ')}</div>`;
   }
   html += '<h3 style="font-size:13px;color:var(--text-dim);text-transform:uppercase;letter-spacing:0.3px;margin-bottom:8px">Run History</h3>';
-  html += '<div class="table-scroll" style="max-height:300px"><table class="data-table"><thead><tr><th>Commit</th><th>Date</th><th>Latency</th><th>Speedup</th><th>Compile</th></tr></thead><tbody>';
+  html += '<div class="table-scroll" style="max-height:300px"><table class="data-table"><thead><tr><th>Commit</th><th>Date</th><th>Latency</th><th>Speedup</th><th>Compile Time</th></tr></thead><tbody>';
   const hist = [...(e.history || [])].reverse();
   hist.forEach((h, i) => {
     let speedupDelta = '', latencyDelta = '';
@@ -767,11 +766,10 @@ function showDetailModal(kernel, platform_short) {
         latencyDelta = ' ' + formatDelta(d, true);
       }
     }
-    const latencyVal = h.helion_latency_avg_ms > 0 ? h.helion_latency_avg_ms.toFixed(2) + ' ms' : '--';
     html += `<tr>
       <td><a href="${commitUrl(h.full_sha)}" target="_blank" title="Run #${h.run_id}">${escHtml(h.sha)}</a></td>
       <td style="font-size:11px">${formatDate(h.date)}</td>
-      <td>${latencyVal}${latencyDelta}</td>
+      <td>${h.helion_latency_avg_ms.toFixed(2)} ms${latencyDelta}</td>
       <td>${formatSpeedup(h.helion_speedup_geomean)}${speedupDelta}</td>
       <td>${formatCompileTime(h.compile_time_avg_s)}</td>
     </tr>`;
@@ -782,19 +780,15 @@ function showDetailModal(kernel, platform_short) {
   html += '<div class="modal-rhs">';
   const histFwd = e.history || [];
   if (histFwd.length >= 2) {
-    const hasLatency = histFwd.some(h => h.helion_latency_avg_ms > 0);
-    if (hasLatency) {
-      html += '<div class="chart-container"><h3>Latency Over Time</h3><div id="mc-latency" style="width:100%;height:220px"></div></div>';
-    } else {
-      html += '<div class="chart-container"><h3>Speedup Over Time</h3><div id="mc-speedup" style="width:100%;height:220px"></div></div>';
-    }
+    html += '<div class="chart-container"><h3>Latency Over Time</h3><div id="mc-latency" style="width:100%;height:220px"></div></div>';
+    html += '<div class="chart-container"><h3>Speedup Over Time</h3><div id="mc-speedup" style="width:100%;height:220px"></div></div>';
     html += '<div class="chart-container"><h3>Compile Time Over Time</h3><div id="mc-compile" style="width:100%;height:220px"></div></div>';
   }
   const latest = histFwd.length > 0 ? histFwd[histFwd.length - 1] : null;
   if (latest && latest.per_shape && latest.per_shape.shapes.length > 0) {
     html += '<div class="chart-container"><h3>Per-Shape Speedup (Latest Run)</h3><div id="mc-bar-speedup" style="width:100%;height:260px"></div></div>';
     const ps = latest.per_shape;
-    const hasCompileTimes = ps.compile_times && ps.compile_times.length > 0 && ps.compile_times.some(v => v > 0);
+    const hasCompileTimes = ps.helion_compile_time_s && ps.helion_compile_time_s.length > 0 && ps.helion_compile_time_s.some(v => v > 0);
     if (hasCompileTimes) {
       html += '<div class="chart-container"><h3>Per-Shape Compile Time (Latest Run)</h3><div id="mc-bar-compile" style="width:100%;height:220px"></div></div>';
     }
@@ -806,53 +800,45 @@ function showDetailModal(kernel, platform_short) {
     const commitUrls = histFwd.map(h => commitUrl(h.full_sha));
     const xLabels = histFwd.map(h => h.sha + '\n' + formatDate(h.date));
     if (histFwd.length >= 2) {
-      const hasLatency = histFwd.some(h => h.helion_latency_avg_ms > 0);
-      if (hasLatency) {
+      const clickHandler = function(data) {
+        if (data.points && data.points[0] && data.points[0].customdata) {
+          window.open(data.points[0].customdata, '_blank');
+        }
+      };
+      // Latency Over Time (only if data exists)
+      const latEl = document.getElementById('mc-latency');
+      if (latEl) {
         const latVals = histFwd.map(h => h.helion_latency_avg_ms > 0 ? h.helion_latency_avg_ms : null);
-        const latTrace = {
-          x: xLabels, y: latVals,
-          mode: 'lines+markers', line: { color: color, width: 2 }, marker: { size: 6 },
+        Plotly.newPlot(latEl, [{
+          x: xLabels, y: latVals, mode: 'lines+markers',
+          line: { color: color, width: 2 }, marker: { size: 6 },
           text: histFwd.map(h => h.sha), customdata: commitUrls,
           hovertemplate: '%{text}: %{y:.2f} ms<extra></extra>',
-          connectgaps: false
-        };
-        const latLayout = Object.assign({}, plotlyDark, {
+          connectgaps: false,
+        }], Object.assign({}, plotlyDark, {
           height: 220,
           xaxis: Object.assign({}, plotlyDark.xaxis, { tickangle: -40 }),
-          yaxis: Object.assign({}, plotlyDark.yaxis, { title: 'Latency (ms)' })
-        });
-        const latEl = document.getElementById('mc-latency');
-        if (latEl) {
-          Plotly.newPlot(latEl, [latTrace], latLayout, { responsive: true, displayModeBar: false });
-          latEl.on('plotly_click', function(data) {
-            if (data.points && data.points[0] && data.points[0].customdata) {
-              window.open(data.points[0].customdata, '_blank');
-            }
-          });
-        }
-      } else {
+          yaxis: Object.assign({}, plotlyDark.yaxis, { title: 'Latency (ms)' }),
+        }), { responsive: true, displayModeBar: false });
+        latEl.on('plotly_click', clickHandler);
+      }
+      // Speedup Over Time (always shown)
+      const spEl = document.getElementById('mc-speedup');
+      if (spEl) {
         const spVals = histFwd.map(h => h.helion_speedup_geomean > 0 ? h.helion_speedup_geomean : null);
-        const spTrace = {
-          x: xLabels, y: spVals,
-          mode: 'lines+markers', line: { color: color, width: 2 }, marker: { size: 6 },
+        Plotly.newPlot(spEl, [{
+          x: xLabels, y: spVals, mode: 'lines+markers',
+          line: { color: color, width: 2 }, marker: { size: 6 },
           text: histFwd.map(h => h.sha), customdata: commitUrls,
           hovertemplate: '%{text}: %{y:.2f}x<extra></extra>',
-          connectgaps: false
-        };
-        const spLayout = Object.assign({}, plotlyDark, {
+          connectgaps: false,
+        }], Object.assign({}, plotlyDark, {
           height: 220,
           xaxis: Object.assign({}, plotlyDark.xaxis, { tickangle: -40 }),
-          yaxis: Object.assign({}, plotlyDark.yaxis, { title: 'Speedup' })
-        });
-        const spEl = document.getElementById('mc-speedup');
-        if (spEl) {
-          Plotly.newPlot(spEl, [spTrace], spLayout, { responsive: true, displayModeBar: false });
-          spEl.on('plotly_click', function(data) {
-            if (data.points && data.points[0] && data.points[0].customdata) {
-              window.open(data.points[0].customdata, '_blank');
-            }
-          });
-        }
+          yaxis: Object.assign({}, plotlyDark.yaxis, { title: 'Speedup' }),
+          shapes: [{ type: 'line', xref: 'paper', x0: 0, x1: 1, y0: 1, y1: 1, line: { color: '#f85149', width: 1, dash: 'dash' } }],
+        }), { responsive: true, displayModeBar: false });
+        spEl.on('plotly_click', clickHandler);
       }
       // Compile time over time
       const ctVals = histFwd.map(h => h.compile_time_avg_s > 0 ? h.compile_time_avg_s : null);
@@ -908,10 +894,10 @@ function showDetailModal(kernel, platform_short) {
         }
       }
       // Per-shape compile time
-      const hasCompileTimes = ps.compile_times && ps.compile_times.length > 0 && ps.compile_times.some(v => v > 0);
+      const hasCompileTimes = ps.helion_compile_time_s && ps.helion_compile_time_s.length > 0 && ps.helion_compile_time_s.some(v => v > 0);
       if (hasCompileTimes) {
         const compileBarTrace = {
-          x: shapes, y: ps.compile_times, type: 'bar',
+          x: shapes, y: ps.helion_compile_time_s, type: 'bar',
           marker: { color: '#f0883e' },
           hovertemplate: '%{x}: %{y:.1f}s<extra></extra>'
         };

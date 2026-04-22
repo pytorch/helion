@@ -19,7 +19,7 @@ import urllib.error
 import urllib.request
 import zipfile
 
-RETENTION_DAYS = 90
+RETENTION_DAYS = 180
 
 
 def geo_mean(values):
@@ -231,7 +231,9 @@ def build_dashboard_data(cache_dir, runs_meta, existing_data=None):
     for entry in kernel_index.values():
         entry["history"].sort(key=lambda h: h["date"])
 
-    # Build summary (Overview/Speedup tabs) based on main branch only
+    # Build summary (Overview/Speedup tabs) based on main branch only.
+    # Entries with no main branch data are excluded from summary but their
+    # history is still preserved for the Compare tab.
     summary = []
     for key, entry in sorted(kernel_index.items()):
         latest = prev = None
@@ -244,11 +246,11 @@ def build_dashboard_data(cache_dir, runs_meta, existing_data=None):
                 prev = h
                 break
 
+        # Deltas and classification based only on main branch runs
         speedup_delta = fmt_delta(latest["helion_speedup_geomean"], prev["helion_speedup_geomean"]) if latest and prev else None
         compile_delta = fmt_delta(prev["compile_time_avg_s"], latest["compile_time_avg_s"]) if latest and prev and latest["compile_time_avg_s"] > 0 else None
         latency_delta = fmt_delta(prev["helion_latency_avg_ms"], latest["helion_latency_avg_ms"]) if latest and prev and latest["helion_latency_avg_ms"] > 0 else None
 
-        # Classification — prefer latency, fall back to speedup
         classify_delta = latency_delta if latency_delta is not None else speedup_delta
         status = "improved" if classify_delta and classify_delta > 10 else "regressed" if classify_delta and classify_delta < -10 else "unchanged"
 
@@ -259,10 +261,13 @@ def build_dashboard_data(cache_dir, runs_meta, existing_data=None):
                 if a < 1.0:
                     acc_failures.append(shapes[i] if i < len(shapes) else f"shape #{i}")
 
+        # has_main_data flags entries for Overview/Speedup filtering in the UI.
+        # Non-main-only entries still appear in summary so Compare tab can use them.
         summary.append({
             "kernel": entry["kernel"],
             "platform": entry["platform"],
             "platform_short": entry["platform_short"],
+            "has_main_data": latest is not None,
             "status": status,
             "accuracy_failures": acc_failures,
             "helion_speedup_geomean": latest["helion_speedup_geomean"] if latest else 0,
@@ -276,31 +281,42 @@ def build_dashboard_data(cache_dir, runs_meta, existing_data=None):
             "history": entry["history"],
         })
 
-    platforms = sorted({s["platform"] for s in summary})
-    platform_shorts = sorted({s["platform_short"] for s in summary})
-    unique_kernels = sorted({s["kernel"] for s in summary})
-    improved = sum(1 for s in summary if s["status"] == "improved")
-    regressed = sum(1 for s in summary if s["status"] == "regressed")
+    # Drop per_shape from non-latest history entries to keep dashboard JSON small.
+    # The detail modal's Per-Shape charts only render the latest run.
+    for entry in summary:
+        for h in entry["history"][:-1]:
+            h.pop("per_shape", None)
+
+    # Stats and platform/kernel lists reflect only entries with main branch data
+    main_summary = [s for s in summary if s["has_main_data"]]
+    platforms = sorted({s["platform"] for s in main_summary})
+    platform_shorts = sorted({s["platform_short"] for s in main_summary})
+    unique_kernels = sorted({s["kernel"] for s in main_summary})
+    improved = sum(1 for s in main_summary if s["status"] == "improved")
+    regressed = sum(1 for s in main_summary if s["status"] == "regressed")
+
+    main_runs = [r for r in runs_meta_sorted if r.get("branch") == "main"]
+    latest_main_run = main_runs[-1] if main_runs else {}
 
     return {
         "generated_at": runs[-1]["date"] if runs else "",
-        "latest_run": runs_meta_sorted[-1] if runs_meta_sorted else {},
+        "latest_run": latest_main_run,
         "runs": [{k: v for k, v in r.items() if k != "kernels"} for r in runs],
         "platforms": platforms,
         "platform_shorts": platform_shorts,
         "unique_kernels": unique_kernels,
         "stats": {
             "total_kernels": len(unique_kernels),
-            "total_combos": len(summary),
+            "total_combos": len(main_summary),
             "num_platforms": len(platforms),
             "improved_count": improved,
             "regressed_count": regressed,
-            "unchanged_count": len(summary) - improved - regressed,
-            "accuracy_failures": sum(len(s["accuracy_failures"]) for s in summary),
-            "helion_geomean": round(geo_mean([s["helion_speedup_geomean"] for s in summary]), 4),
-            "triton_geomean": round(geo_mean([s["triton_speedup_geomean"] for s in summary]), 4),
-            "torch_compile_geomean": round(geo_mean([s["torch_compile_speedup_geomean"] for s in summary]), 4),
-            "helion_wins": sum(1 for s in summary if s["helion_speedup_geomean"] > max(s["triton_speedup_geomean"], s["torch_compile_speedup_geomean"])),
+            "unchanged_count": len(main_summary) - improved - regressed,
+            "accuracy_failures": sum(len(s["accuracy_failures"]) for s in main_summary),
+            "helion_geomean": round(geo_mean([s["helion_speedup_geomean"] for s in main_summary]), 4),
+            "triton_geomean": round(geo_mean([s["triton_speedup_geomean"] for s in main_summary]), 4),
+            "torch_compile_geomean": round(geo_mean([s["torch_compile_speedup_geomean"] for s in main_summary]), 4),
+            "helion_wins": sum(1 for s in main_summary if s["helion_speedup_geomean"] > max(s["triton_speedup_geomean"], s["torch_compile_speedup_geomean"])),
         },
         "summary": summary,
     }
