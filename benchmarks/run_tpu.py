@@ -275,6 +275,19 @@ def _sum_shapes() -> list[tuple[str, tuple[Any, ...]]]:
     ]
 
 
+def _long_sum_shapes() -> list[tuple[str, tuple[Any, ...]]]:
+    # Long reduction dim: 131072 = 4x the 32768 block size used by the
+    # looped variants, so they actually loop.
+    shapes = [(4, 131072)]
+    return [
+        (
+            f"[{m},{n}]",
+            (torch.randn(m, n, device=DEVICE, dtype=torch.float32),),
+        )
+        for m, n in shapes
+    ]
+
+
 # Kernel mappings for TPU/Pallas benchmarks.
 # Format: kernel_name -> (module_file, kernel_fn_name, baseline_fn, shapes_fn,
 #                         max_mismatch_pct)
@@ -342,6 +355,27 @@ KERNEL_MAPPINGS: dict[str, KernelMapping] = {
         "sum_kernel",
         functools.partial(torch.sum, dim=-1),
         _sum_shapes,
+        None,
+    ),
+    "long_sum_naive": (
+        "long_sum",
+        "longsum",
+        functools.partial(torch.sum, dim=-1),
+        _long_sum_shapes,
+        None,
+    ),
+    "long_sum_loop": (
+        "long_sum",
+        "longsum_w_red_loop",
+        functools.partial(torch.sum, dim=-1),
+        _long_sum_shapes,
+        None,
+    ),
+    "long_sum_manual": (
+        "long_sum",
+        "longsum_manual",
+        functools.partial(torch.sum, dim=-1),
+        _long_sum_shapes,
         None,
     ),
     "layer_norm": (
