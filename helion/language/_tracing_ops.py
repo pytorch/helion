@@ -749,10 +749,12 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
         )
 
     # Record which tensors are in the pipeline body (need HBM refs)
+    from .._compiler.device_function import PallasMemorySpace
+
     for fake, _tensor_node, _sub_meta in loaded_tensors.values():
-        state.device_function.pallas_pipeline_tensor_ids.add(id(fake))
+        state.device_function.pallas_memory_space[id(fake)] = PallasMemorySpace.HBM
     for fake, _tensor_node, _sub_meta in stored_tensors.values():
-        state.device_function.pallas_pipeline_tensor_ids.add(id(fake))
+        state.device_function.pallas_memory_space[id(fake)] = PallasMemorySpace.HBM
 
     # Process loaded tensors (inputs to pipeline)
     for key, (fake, _tensor_node, sub_meta) in loaded_tensors.items():
@@ -1017,10 +1019,12 @@ def _codegen_fori_loop(state: CodegenState) -> object:
     tensor_to_vmem: dict[str, str] = {}
     tensor_to_sem: dict[str, str] = {}
     if use_dma:
+        from .._compiler.device_function import PallasMemorySpace
+
         for fake, _tensor_node, _sub_meta in loaded_tensors.values():
-            state.device_function.pallas_pipeline_tensor_ids.add(id(fake))
+            state.device_function.pallas_memory_space[id(fake)] = PallasMemorySpace.HBM
         for fake, _tensor_node, _sub_meta in stored_tensors.values():
-            state.device_function.pallas_pipeline_tensor_ids.add(id(fake))
+            state.device_function.pallas_memory_space[id(fake)] = PallasMemorySpace.HBM
         for (fake, _sub_meta, _direction), vmem_shape in zip(
             all_tensor_info, vmem_shapes, strict=True
         ):

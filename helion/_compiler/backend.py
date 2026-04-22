@@ -1671,14 +1671,18 @@ class PallasBackend(Backend):
         from .device_function import DeviceFunction
 
         device_fn = DeviceFunction.current()
-        smem_ids = device_fn.pallas_smem_tensor_ids
-        if smem_ids and sorted_args is not None:
+        from .device_function import PallasMemorySpace
+
+        mem_space = device_fn.pallas_memory_space
+        if sorted_args is not None:
             smem_arg_indices = [
                 i
                 for i, arg in enumerate(sorted_args)
-                if isinstance(arg, TensorArg) and id(arg.fake_value) in smem_ids
+                if isinstance(arg, TensorArg)
+                and mem_space.get(id(arg.fake_value)) == PallasMemorySpace.SMEM
             ]
-            launcher_args.append(f"_smem_arg_indices={smem_arg_indices!r}")
+            if smem_arg_indices:
+                launcher_args.append(f"_smem_arg_indices={smem_arg_indices!r}")
 
         # Pass scratch shapes for pipeline/fori_loop launcher
         pallas_loop_type = config.get("pallas_loop_type", "default")
@@ -1698,14 +1702,17 @@ class PallasBackend(Backend):
             # tensors (need HBM refs); all others get proper BlockSpecs.
             from .device_function import TensorArg
 
-            pipeline_ids = device_fn.pallas_pipeline_tensor_ids
-            if pipeline_ids and sorted_args is not None:
+            if sorted_args is not None:
                 pipeline_arg_indices = [
                     i
                     for i, arg in enumerate(sorted_args)
-                    if isinstance(arg, TensorArg) and id(arg.fake_value) in pipeline_ids
+                    if isinstance(arg, TensorArg)
+                    and mem_space.get(id(arg.fake_value)) == PallasMemorySpace.HBM
                 ]
-                launcher_args.append(f"_pipeline_arg_indices={pipeline_arg_indices!r}")
+                if pipeline_arg_indices:
+                    launcher_args.append(
+                        f"_pipeline_arg_indices={pipeline_arg_indices!r}"
+                    )
 
         return launcher_args
 
