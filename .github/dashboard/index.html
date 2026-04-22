@@ -514,10 +514,16 @@ function renderSpeedup() {
   }
 }
 // -------- Compare Tab --------
-function renderCompare(baseRunIdOverride, cmpRunIdOverride) {
-  const runs = [...DATA.runs].sort((a, b) => new Date(b.date) - new Date(a.date));
-  const baseRunId = baseRunIdOverride || (runs[1] ? runs[1].run_id : runs[0].run_id);
-  const cmpRunId = cmpRunIdOverride || runs[0].run_id;
+function renderCompare(baseRunIdOverride, cmpRunIdOverride, baseBranchOverride, cmpBranchOverride) {
+  const allRuns = [...DATA.runs].sort((a, b) => new Date(b.date) - new Date(a.date));
+  const allBranches = [...new Set(allRuns.map(r => r.branch || 'main'))].sort();
+  const baseBranch = baseBranchOverride || 'main';
+  const cmpBranch = cmpBranchOverride || 'main';
+  const baseRuns = allRuns.filter(r => (r.branch || 'main') === baseBranch);
+  const cmpRuns = allRuns.filter(r => (r.branch || 'main') === cmpBranch);
+  const runs = baseRuns; // backwards compat for below
+  const baseRunId = baseRunIdOverride || (baseRuns[1] ? baseRuns[1].run_id : (baseRuns[0] ? baseRuns[0].run_id : null));
+  const cmpRunId = cmpRunIdOverride || (cmpRuns[0] ? cmpRuns[0].run_id : null);
   const baseRun = DATA.runs.find(r => r.run_id === baseRunId);
   const cmpRun = DATA.runs.find(r => r.run_id === cmpRunId);
   const { platforms, kernels } = getFiltered();
@@ -578,16 +584,20 @@ function renderCompare(baseRunIdOverride, cmpRunIdOverride) {
   let html = '<h2 style="margin-bottom:16px">Compare Commits</h2>';
   html += '<div class="compare-selectors">';
   html += '<div class="commit-box"><h3>Base</h3>';
-  html += '<select id="cmp-base-branch"><option value="main">main</option></select>';
+  html += '<select id="cmp-base-branch">';
+  allBranches.forEach(b => { html += `<option value="${b}"${b === baseBranch ? ' selected' : ''}>${escHtml(b)}</option>`; });
+  html += '</select>';
   html += '<select id="cmp-base-commit">';
-  runs.forEach(r => { html += `<option value="${r.run_id}"${r.run_id === baseRunId ? ' selected' : ''}>${r.sha} (${formatDate(r.date)})</option>`; });
+  baseRuns.forEach(r => { html += `<option value="${r.run_id}"${r.run_id === baseRunId ? ' selected' : ''}>${r.sha} (${formatDate(r.date)})</option>`; });
   html += '</select>';
   html += baseRun ? `<div class="run-link">Run: <a href="${runUrl(baseRun.run_id)}" target="_blank">#${baseRun.run_id}</a></div>` : '';
   html += '</div>';
   html += '<div class="commit-box"><h3>Target</h3>';
-  html += '<select id="cmp-compare-branch"><option value="main">main</option></select>';
+  html += '<select id="cmp-compare-branch">';
+  allBranches.forEach(b => { html += `<option value="${b}"${b === cmpBranch ? ' selected' : ''}>${escHtml(b)}</option>`; });
+  html += '</select>';
   html += '<select id="cmp-compare-commit">';
-  runs.forEach(r => { html += `<option value="${r.run_id}"${r.run_id === cmpRunId ? ' selected' : ''}>${r.sha} (${formatDate(r.date)})</option>`; });
+  cmpRuns.forEach(r => { html += `<option value="${r.run_id}"${r.run_id === cmpRunId ? ' selected' : ''}>${r.sha} (${formatDate(r.date)})</option>`; });
   html += '</select>';
   html += cmpRun ? `<div class="run-link">Run: <a href="${runUrl(cmpRun.run_id)}" target="_blank">#${cmpRun.run_id}</a></div>` : '';
   html += '</div></div>';
@@ -660,15 +670,27 @@ function renderCompare(baseRunIdOverride, cmpRunIdOverride) {
   html += '</tbody></table></div>';
   document.getElementById('tab-compare').innerHTML = html;
   document.querySelectorAll('#tab-compare .data-table').forEach(makeSortable);
-  document.getElementById('cmp-base-commit').addEventListener('change', () => {
-    renderCompare(document.getElementById('cmp-base-commit').value, document.getElementById('cmp-compare-commit').value);
+  const cmpRerender = () => renderCompare(
+    document.getElementById('cmp-base-commit').value,
+    document.getElementById('cmp-compare-commit').value,
+    document.getElementById('cmp-base-branch').value,
+    document.getElementById('cmp-compare-branch').value,
+  );
+  document.getElementById('cmp-base-commit').addEventListener('change', cmpRerender);
+  document.getElementById('cmp-compare-commit').addEventListener('change', cmpRerender);
+  document.getElementById('cmp-base-branch').addEventListener('change', () => {
+    renderCompare(null, document.getElementById('cmp-compare-commit').value,
+      document.getElementById('cmp-base-branch').value,
+      document.getElementById('cmp-compare-branch').value);
   });
-  document.getElementById('cmp-compare-commit').addEventListener('change', () => {
-    renderCompare(document.getElementById('cmp-base-commit').value, document.getElementById('cmp-compare-commit').value);
+  document.getElementById('cmp-compare-branch').addEventListener('change', () => {
+    renderCompare(document.getElementById('cmp-base-commit').value, null,
+      document.getElementById('cmp-base-branch').value,
+      document.getElementById('cmp-compare-branch').value);
   });
   document.getElementById('cmp-plat-filter').addEventListener('change', e => {
     activeFilters.platform = e.target.value;
-    renderCompare(baseRunId, cmpRunId);
+    cmpRerender();
     renderOverviewGrid();
   });
   document.getElementById('cmp-improved-card').addEventListener('click', () => {
@@ -928,20 +950,12 @@ function initDashboard() {
 }
 function init() {
   if (DATA) { initDashboard(); return; }
-  const DATA_URLS = [
-    'dashboard-data.json',
-    `https://raw.githubusercontent.com/${REPO}/dashboard-data/dashboard-data.json`
-  ];
-  (function tryFetch(i) {
-    if (i >= DATA_URLS.length) {
-      document.getElementById('tab-overview').innerHTML = '<div style="padding:60px;text-align:center"><h2 style="color:var(--red);margin-bottom:12px">Data Not Loaded</h2><p style="color:var(--text-dim)">Could not load dashboard data.</p></div>';
-      return;
-    }
-    fetch(DATA_URLS[i])
-      .then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
-      .then(json => { DATA = json; initDashboard(); })
-      .catch(() => tryFetch(i + 1));
-  })(0);
+  fetch('dashboard-data.json')
+    .then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+    .then(json => { DATA = json; initDashboard(); })
+    .catch(() => {
+      document.getElementById('tab-overview').innerHTML = '<div style="padding:60px;text-align:center"><h2 style="color:var(--red);margin-bottom:12px">Data Not Loaded</h2><p style="color:var(--text-dim)">Could not load dashboard-data.json.</p></div>';
+    });
 }
 init();
 </script>
