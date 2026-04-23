@@ -58,6 +58,7 @@ a:hover{text-decoration:underline}
 .kernel-card .sparkline-container svg{width:100%;height:100%;min-height:80px}
 .kernel-card .fail-overlay{position:absolute;inset:0;display:flex;flex-direction:column;justify-content:center;align-items:center;gap:4px;background:rgba(13,17,23,0.75);border-radius:6px;padding:8px;text-align:center}
 .kernel-card .fail-overlay .fail-line{font-size:14px;font-weight:600}
+.kernel-card .fail-overlay .fail-subline{font-size:11px;color:var(--text-dim)}
 .kernel-card .fail-overlay .run-line{color:var(--yellow)}
 .kernel-card .fail-overlay .infra-line{color:var(--text-dim)}
 .kernel-card .accuracy-badge{position:absolute;top:6px;right:6px;font-size:14px;font-weight:700;color:var(--orange);background:rgba(240,136,62,0.2);padding:4px 10px;border-radius:6px;border:1px solid rgba(240,136,62,0.4)}
@@ -274,7 +275,7 @@ function getFailures() {
     const entry = { kernel: e.kernel, platform: platName(e.platform_short), platform_short: e.platform_short };
     if (e.accuracy_failures?.length) acc.push({ ...entry, shapes: e.accuracy_failures });
     if (e.run_failures?.length) run.push({ ...entry, shapes: e.run_failures });
-    if (e.infra_missing) infra.push(entry);
+    if (e.infra_missing) infra.push({ ...entry, last_seen_date: e.last_seen_date });
   });
   return { acc, run, infra };
 }
@@ -395,7 +396,10 @@ function renderOverviewGrid() {
         if (e.run_failures?.length || e.infra_missing) {
           overlay = '<div class="fail-overlay">';
           if (e.run_failures?.length) overlay += `<div class="fail-line run-line">${e.run_failures.length} shapes failed</div>`;
-          if (e.infra_missing) overlay += `<div class="fail-line infra-line">runner failed</div>`;
+          if (e.infra_missing) {
+            overlay += '<div class="fail-line infra-line">No Result</div>';
+            if (e.last_seen_date) overlay += `<div class="fail-subline">last seen ${formatDate(e.last_seen_date)}</div>`;
+          }
           overlay += '</div>';
         } else if (e.accuracy_failures?.length) {
           overlay = `<div class="accuracy-badge">${e.accuracy_failures.length} accuracy fail</div>`;
@@ -755,15 +759,17 @@ function showFailuresModal(fails) {
     h += `<p style="font-size:12px;color:var(--text-dim);margin-bottom:8px">${desc}</p>`;
     h += '<ul class="fail-list">';
     items.forEach(f => {
-      const shapes = f.shapes ? `<span class="fail-shapes">Shapes: ${f.shapes.map(escHtml).join(', ')}</span>` : '';
-      h += `<li><span class="fail-kernel">${escHtml(f.kernel)}</span>${platBadge(f.platform_short)}${shapes}</li>`;
+      let detail = '';
+      if (f.shapes) detail = `<span class="fail-shapes">Shapes: ${f.shapes.map(escHtml).join(', ')}</span>`;
+      else if (f.last_seen_date) detail = `<span class="fail-shapes">Last seen: ${formatDate(f.last_seen_date)}</span>`;
+      h += `<li><span class="fail-kernel">${escHtml(f.kernel)}</span>${platBadge(f.platform_short)}${detail}</li>`;
     });
     return h + '</ul>';
   };
   let html = modalHeader('CI Failures', 'Accuracy mismatches, kernel run failures, and infra issues');
   html += renderSection('Accuracy Failures', 'Kernel ran but produced incorrect output.', fails.acc);
   html += renderSection('Shape Failures', 'Shapes that failed to run (crash, OOM, compile error, timeout, or unsupported config).', fails.run);
-  html += renderSection('Runner Failures', 'Kernel missing from latest run — likely CI runner unavailable, job timeout, or artifact upload failed.', fails.infra);
+  html += renderSection('No Result', 'Benchmark did not produce output for this kernel — possible causes: runner unavailable, job timeout, crash, artifact upload failed, or harness skipped this kernel+platform combination.', fails.infra);
   openModal(html);
 }
 function showDetailModal(kernel, platform_short) {
@@ -784,7 +790,8 @@ function showDetailModal(kernel, platform_short) {
     html += `<div class="run-warn" style="margin-bottom:12px">${e.run_failures.length} shape failure(s): ${e.run_failures.join(', ')}</div>`;
   }
   if (e.infra_missing) {
-    html += `<div class="infra-warn" style="margin-bottom:12px">Runner failed — kernel missing from latest run (CI runner unavailable, timeout, or artifact upload failed)</div>`;
+    const lastSeen = e.last_seen_date ? ` (last seen ${formatDate(e.last_seen_date)})` : '';
+    html += `<div class="infra-warn" style="margin-bottom:12px">No result in latest run${lastSeen} — runner unavailable, timeout, crash, upload failed, or harness skipped this kernel+platform</div>`;
   }
   html += '<h3 style="font-size:13px;color:var(--text-dim);text-transform:uppercase;letter-spacing:0.3px;margin-bottom:8px">Run History</h3>';
   html += '<div class="table-scroll" style="max-height:300px"><table class="data-table"><thead><tr><th>Commit</th><th>Date</th><th>Latency</th><th>Speedup</th><th>Compile Time</th></tr></thead><tbody>';
