@@ -267,11 +267,13 @@ def _softmax_shapes_basic() -> list[tuple[str, tuple[Any, ...]]]:
 
 
 def _sum_shapes() -> list[tuple[str, tuple[Any, ...]]]:
+    # First entry matches examples/sum.py main() so --num-shapes 1 gives the
+    # canonical example config (fp32).
     shapes = [(5120, 2560), (10240, 10240), (2048, 8192)]
     return [
         (
             f"[{m},{n}]",
-            (torch.randn(m, n, device=DEVICE, dtype=torch.bfloat16),),
+            (torch.randn(m, n, device=DEVICE, dtype=torch.float32),),
         )
         for m, n in shapes
     ]
