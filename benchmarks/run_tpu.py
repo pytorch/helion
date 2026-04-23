@@ -49,7 +49,8 @@ EXAMPLES_DIR = Path(__file__).parent.parent / "examples"
 # Shape generators for multi-shape benchmarking.
 # Each returns a list of (label, args_tuple) pairs.
 def _exp_shapes() -> list[tuple[str, tuple[Any, ...]]]:
-    sizes = [1024, 4096, 16384, 65536, 262144, 1048576]
+    # First entry matches examples/exp.py main() (10240*10240 = ~105M elems).
+    sizes = [10240 * 10240, 1048576, 262144, 65536, 16384, 4096, 1024]
     return [
         (
             f"[{n}]",
@@ -60,7 +61,8 @@ def _exp_shapes() -> list[tuple[str, tuple[Any, ...]]]:
 
 
 def _add_shapes() -> list[tuple[str, tuple[Any, ...]]]:
-    sizes = [(128, 128), (256, 256), (512, 512), (1024, 1024), (2048, 2048)]
+    # First entry matches examples/add.py main() (1024x1024).
+    sizes = [(1024, 1024), (2048, 2048), (512, 512), (256, 256), (128, 128)]
     return [
         (
             f"[{m},{n}]",
@@ -157,16 +159,17 @@ def _broadcast_matmul_shapes() -> list[tuple[str, tuple[Any, ...]]]:
 
 
 def _geglu_shapes() -> list[tuple[str, tuple[Any, ...]]]:
-    shapes = [(1024, 512), (2048, 1024), (4096, 2048)]
+    # First entry matches examples/geglu.py main()'s first kernel_test_shape.
+    shapes = [(8, 2048, 4096), (8, 4096, 8192), (4096, 2048), (2048, 1024), (1024, 512)]
     return [
         (
-            f"[{m},{n}]",
+            "[" + ",".join(str(d) for d in s) + "]",
             (
-                torch.randn(m, n, device=DEVICE, dtype=torch.bfloat16),
-                torch.randn(m, n, device=DEVICE, dtype=torch.bfloat16),
+                torch.randn(*s, device=DEVICE, dtype=torch.bfloat16),
+                torch.randn(*s, device=DEVICE, dtype=torch.bfloat16),
             ),
         )
-        for m, n in shapes
+        for s in shapes
     ]
 
 
@@ -175,21 +178,23 @@ def _geglu_baseline(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
 
 
 def _swiglu_shapes() -> list[tuple[str, tuple[Any, ...]]]:
-    shapes = [(1024, 512), (2048, 1024), (4096, 2048)]
+    # First entry matches examples/swiglu.py main()'s first kernel_test_shape.
+    shapes = [(4, 8192, 4096), (8, 8192, 4096), (4096, 2048), (2048, 1024), (1024, 512)]
     return [
         (
-            f"[{m},{n}]",
+            "[" + ",".join(str(d) for d in s) + "]",
             (
-                torch.randn(m, n, device=DEVICE, dtype=torch.bfloat16),
-                torch.randn(m, n, device=DEVICE, dtype=torch.bfloat16),
+                torch.randn(*s, device=DEVICE, dtype=torch.bfloat16),
+                torch.randn(*s, device=DEVICE, dtype=torch.bfloat16),
             ),
         )
-        for m, n in shapes
+        for s in shapes
     ]
 
 
 def _low_mem_dropout_shapes() -> list[tuple[str, tuple[Any, ...]]]:
-    sizes = [4096, 16384, 65536, 262144]
+    # First entry matches examples/low_mem_dropout.py main()'s first check call.
+    sizes = [8192, 32768, 262144, 65536, 16384, 4096]
     return [
         (
             f"[{n}]",
@@ -239,7 +244,8 @@ def _rms_norm_baseline(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
 
 
 def _layer_norm_shapes() -> list[tuple[str, tuple[Any, ...]]]:
-    configs = [(2048, 4096), (2048, 8192), (4096, 4096)]
+    # First entry matches examples/layer_norm.py main() (4096, 10240).
+    configs = [(4096, 10240), (2048, 4096), (2048, 8192), (4096, 4096)]
     return [
         (
             f"[{m},{n}]",
