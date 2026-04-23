@@ -1385,6 +1385,16 @@ class SequenceType(CollectionType):
 
         return super().propagate_getitem(key, origin)
 
+    def propagate_setitem(
+        self, key: TypeInfo, value: TypeInfo, origin: Origin
+    ) -> TypeInfo:
+        if self.python_type is list and isinstance(key, SymIntType):
+            if not self.element_types:
+                raise exc.TypeInferenceError("Cannot index empty sequence")
+            new_elements = [elem.merge(value) for elem in self.element_types]
+            return SequenceType(origin=origin, element_types=new_elements)
+        return super().propagate_setitem(key, value, origin)
+
     def merge(self, other: TypeInfo, var_name: str | None = None) -> TypeInfo:
         if isinstance(other, SequenceType):
             self_elements = self.element_types
