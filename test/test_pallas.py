@@ -722,11 +722,17 @@ class TestPallas(TestCase):
         key = torch.randn(1, 4, 32, 64, dtype=torch.float32, device=DEVICE)
         val = torch.randn(1, 4, 32, 64, dtype=torch.float32, device=DEVICE)
         args = (query, key, val)
+
         _code, result = code_and_output(pallas_attention, args, block_sizes=[1, 32, 32])
         ref = torch.nn.functional.scaled_dot_product_attention(
             query.float().cpu(), key.float().cpu(), val.float().cpu()
         ).to(device=DEVICE)
         torch.testing.assert_close(result, ref, rtol=1e-2, atol=1e-2)
+
+        # test that we're not manually allocating and donating out tensor HBM,
+        # but are instead taking over tensor returned by torch_tpu JaxCallable
+        self.assertIn["out = torch.empty_like(q_view, device='meta')", _code]
+        self.assertIn["out = _launcher(", _code]
 
     def test_attention_emit_pipeline_correctness(self) -> None:
         """Test emit_pipeline attention with loop-carried state."""
