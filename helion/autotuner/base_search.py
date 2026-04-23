@@ -183,6 +183,9 @@ class BaseSearch(BaseAutotuner):
         counters: A counter to track various metrics during the search.
     """
 
+    if TYPE_CHECKING:
+        config_gen: ConfigGeneration
+
     def __init__(
         self,
         kernel: _AutotunableKernel,
