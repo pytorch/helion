@@ -11,6 +11,7 @@ if TYPE_CHECKING:
 
     from ..runtime.config import Config
     from .base_search import _AutotunableKernel
+    from .config_generation import ConfigGeneration
 
 
 class FiniteSearch(BaseSearch):
@@ -26,6 +27,11 @@ class FiniteSearch(BaseSearch):
         configs: Sequence[Config | ConfigSource] | None = None,
     ) -> None:
         super().__init__(kernel, args)
+        self.config_gen: ConfigGeneration = self.config_spec.create_config_generation(
+            overrides=self.settings.autotune_config_overrides or None,
+            advanced_controls_files=self.settings.autotune_search_acf or None,
+            process_group_name=kernel.env.process_group_name,
+        )
         raw: list[Config | ConfigSource] = [*(configs or ())]
         if len(raw) == 0 and self.kernel.configs:
             raw = [*self.kernel.configs]

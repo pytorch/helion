@@ -207,15 +207,6 @@ class BaseSearch(BaseAutotuner):
         self._prepared = False
         self._skip_cache = False
 
-    @functools.cached_property
-    def config_gen(self) -> ConfigGeneration:
-        """Return the lazily-created ConfigGeneration for this search's config_spec."""
-        return self.config_spec.create_config_generation(
-            overrides=self.settings.autotune_config_overrides or None,
-            advanced_controls_files=self.settings.autotune_search_acf or None,
-            process_group_name=self.kernel.env.process_group_name,
-        )
-
     def _prepare(self) -> None:
         """Some initialization deferred until autotuning actually runs.
 
