@@ -939,6 +939,43 @@ class DeviceFunction:
             (), None, name_hint=name_hint, scratch_type="dma_semaphore"
         )
 
+    def get_tensor_read_write_names(self) -> tuple[set[str], set[str]]:
+        """Returns AST names of read and written tensors"""
+        from helion.language import atomic_ops
+        from helion.language import memory_ops
+
+        read_names: set[str] = set()
+        write_names: set[str] = set()
+        for graph in self.codegen.codegen_graphs:
+            for node in graph.graph.nodes:
+                if node.op != "call_function":
+                    continue
+
+                def _get_tensor_name(node: torch.fx.Node) -> str:
+                    tensor_arg = node.args[0]
+                    assert isinstance(tensor_arg, torch.fx.Node)
+                    tensor_val = tensor_arg.meta.get("val")
+                    assert isinstance(tensor_val, torch.Tensor)
+                    return self.tensor_arg(tensor_val).name
+
+                if node.target is memory_ops.load:
+                    read_names.add(_get_tensor_name(node))
+                elif node.target is memory_ops.store:
+                    write_names.add(_get_tensor_name(node))
+                elif node.target in (
+                    atomic_ops.atomic_add,
+                    atomic_ops.atomic_cas,
+                    atomic_ops.atomic_or,
+                    atomic_ops.atomic_xor,
+                    atomic_ops.atomic_xchg,
+                    atomic_ops.atomic_min,
+                    atomic_ops.atomic_max,
+                    atomic_ops.atomic_and,
+                ):
+                    read_names.add(_get_tensor_name(node))
+                    write_names.add(_get_tensor_name(node))
+        return read_names, write_names
+
     def __enter__(self) -> None:
         try:
             tls.functions.append(self)
