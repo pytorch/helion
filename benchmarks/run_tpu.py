@@ -108,8 +108,10 @@ def _welford_baseline(
 
 
 def _attention_shapes() -> list[tuple[str, tuple[Any, ...]]]:
+    # First entry matches examples/attention.py main() so --num-shapes 1 gives
+    # the canonical example config.
     configs = [
-        (1, 4, 256, 64),
+        (2, 32, 1024, 64),
         (1, 4, 512, 64),
         (1, 4, 1024, 64),
         (2, 8, 512, 64),
@@ -118,7 +120,7 @@ def _attention_shapes() -> list[tuple[str, tuple[Any, ...]]]:
         (
             f"[{z},{h},{n},{d}]",
             tuple(
-                torch.randn(z, h, n, d, device=DEVICE, dtype=torch.float32)
+                torch.randn(z, h, n, d, device=DEVICE, dtype=torch.bfloat16)
                 for _ in range(3)
             ),
         )
