@@ -179,11 +179,16 @@ def build_dashboard_data(cache_dir, runs_meta, existing_data=None):
         key=lambda r: r["date"],
     )
 
-    # Index existing history by kernel|platform -> run_id
+    # Index existing history by kernel|platform_short -> run_id.
+    # Older caches may contain duplicate (kernel, platform_short) rows because
+    # AMD runners occasionally report platform as "AMD Radeon Graphics" vs
+    # "AMD Instinct MI325X". Merge those duplicates here.
+    existing_summary = {}
     existing_history = {}
-    existing_summary = {e["kernel"] + "|" + e["platform"]: e for e in (existing_data or {}).get("summary", [])}
-    for key, entry in existing_summary.items():
-        existing_history[key] = {h["run_id"]: h for h in entry.get("history", [])}
+    for e in (existing_data or {}).get("summary", []):
+        key = e["kernel"] + "|" + e.get("platform_short", "")
+        existing_summary[key] = e
+        existing_history.setdefault(key, {}).update({h["run_id"]: h for h in e.get("history", [])})
 
     # Parse each run's artifacts if present
     runs = []
@@ -202,7 +207,7 @@ def build_dashboard_data(cache_dir, runs_meta, existing_data=None):
             fresh_run_ids.add(run["run_id"])
             run_ids_with_data.add(run["run_id"])
         for k in run["kernels"]:
-            key = f"{k['kernel']}|{k['platform']}"
+            key = f"{k['kernel']}|{k['platform_short']}"
             if key not in kernel_index:
                 kernel_index[key] = {
                     "kernel": k["kernel"],
@@ -224,8 +229,8 @@ def build_dashboard_data(cache_dir, runs_meta, existing_data=None):
                 prev = existing_summary.get(key, {})
                 kernel_index[key] = {
                     "kernel": prev.get("kernel", key.split("|")[0]),
-                    "platform": prev.get("platform", key.split("|")[1] if "|" in key else "unknown"),
-                    "platform_short": prev.get("platform_short", ""),
+                    "platform": prev.get("platform", "unknown"),
+                    "platform_short": prev.get("platform_short", key.split("|")[1] if "|" in key else ""),
                     "shapes": [],
                     "history": [],
                 }
@@ -300,6 +305,7 @@ def build_dashboard_data(cache_dir, runs_meta, existing_data=None):
             "status": status,
             "accuracy_failures": acc_failures,
             "run_failures": run_failures,
+            "last_seen_date": latest_main["date"] if latest_main else None,
             "infra_missing": infra_missing,
             "helion_speedup_geomean": latest_data["helion_speedup_geomean"] if latest_data else 0,
             "triton_speedup_geomean": latest_data["triton_speedup_geomean"] if latest_data else 0,
