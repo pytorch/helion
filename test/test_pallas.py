@@ -1201,6 +1201,43 @@ class TestPallas(TestCase):
         self.assertIn("pl.ds(", code)
         torch.testing.assert_close(result, args[0] + args[1])
 
+    def test_tile_id_per_block_accumulator(self) -> None:
+        """Writing to ``out[tile.id, :]`` stores one row per outer grid iter.
+
+        This is the multi-block partial-reduction pattern used e.g. in
+        ``rms_norm_bwd``: each outer grid iter computes a per-block
+        accumulator and writes it into its own row of a ``[num_blocks, N]``
+        output tensor, which the host then sums across ``dim=0``.
+
+        Each grid iter ``i`` must land in row ``i``, so the kernel must
+        correctly interpret the scalar ``tile.id`` index against a tensor
+        whose outer dim has extent ``num_blocks`` (not ``M``).
+        """
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def per_block_reduction(x: torch.Tensor) -> torch.Tensor:
+            m, n = x.shape
+            m_block = hl.register_block_size(x.size(0))
+            out = x.new_empty(
+                [(x.size(0) + m_block - 1) // m_block, n], dtype=torch.float32
+            )
+            for mb_cta in hl.tile(m, block_size=m_block):
+                acc = x.new_zeros([n], dtype=torch.float32)
+                for mb in hl.tile(mb_cta.begin, mb_cta.end):
+                    acc += x[mb, :].to(torch.float32).sum(0)
+                out[mb_cta.id, :] = acc
+            return out
+
+        x = torch.randn(64, 128, device=DEVICE, dtype=torch.float32)
+        _code, result = code_and_output(
+            per_block_reduction,
+            (x,),
+            block_sizes=[8, 8],
+            pallas_loop_type="fori_loop",
+        )
+        ref = x.view(8, 8, 128).sum(1)
+        torch.testing.assert_close(result, ref, rtol=1e-3, atol=1e-3)
+
     def test_squeeze_slice_access(self) -> None:
         """Test for the [None, :] indexing pattern (subscript index for slice >= tensor_ndim)"""
 
