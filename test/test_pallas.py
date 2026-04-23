@@ -731,8 +731,8 @@ class TestPallas(TestCase):
 
         # test that we're not manually allocating and donating out tensor HBM,
         # but are instead taking over tensor returned by torch_tpu JaxCallable
-        self.assertIn["out = torch.empty_like(q_view, device='meta')", _code]
-        self.assertIn["out = _launcher(", _code]
+        self.assertIn("out = torch.empty_like(q_view, device='meta')", _code)
+        self.assertIn("out = _launcher(", _code)
 
     def test_attention_emit_pipeline_correctness(self) -> None:
         """Test emit_pipeline attention with loop-carried state."""
