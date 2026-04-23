@@ -19,7 +19,7 @@ import urllib.error
 import urllib.request
 import zipfile
 
-RETENTION_DAYS = 180
+RETENTION_DAYS = 365
 
 
 def geo_mean(values):
@@ -195,10 +195,12 @@ def build_dashboard_data(cache_dir, runs_meta, existing_data=None):
     # Build kernel history: fresh artifacts override, then fill from existing history
     kernel_index = {}
     fresh_run_ids = set()
+    run_ids_with_data = set()
 
     for run in runs:
         if run["kernels"]:
             fresh_run_ids.add(run["run_id"])
+            run_ids_with_data.add(run["run_id"])
         for k in run["kernels"]:
             key = f"{k['kernel']}|{k['platform']}"
             if key not in kernel_index:
@@ -217,6 +219,7 @@ def build_dashboard_data(cache_dir, runs_meta, existing_data=None):
         for key, cached_runs in existing_history.items():
             if run["run_id"] not in cached_runs:
                 continue
+            run_ids_with_data.add(run["run_id"])
             if key not in kernel_index:
                 prev = existing_summary.get(key, {})
                 kernel_index[key] = {
@@ -231,35 +234,61 @@ def build_dashboard_data(cache_dir, runs_meta, existing_data=None):
     for entry in kernel_index.values():
         entry["history"].sort(key=lambda h: h["date"])
 
+    # Global latest main run_id — used to detect kernels missing from the latest
+    # benchmark (likely CI infra issue vs. actual kernel crash).
+    latest_main_meta = next((r for r in reversed(runs_meta_sorted) if r.get("branch") == "main"), None)
+    latest_main_run_id = latest_main_meta["run_id"] if latest_main_meta else None
+
     # Build summary (Overview/Speedup tabs) based on main branch only.
     # Entries with no main branch data are excluded from summary but their
     # history is still preserved for the Compare tab.
     summary = []
     for key, entry in sorted(kernel_index.items()):
-        latest = prev = None
+        # Single pass: latest_main is the most recent main entry (used for failure
+        # classification); latest_data/prev_data are the most recent with non-zero
+        # data (used for perf display and deltas).
+        latest_main = latest_data = prev_data = None
         for h in reversed(entry["history"]):
-            if h.get("branch") != "main" or h["helion_speedup_geomean"] <= 0:
+            if h.get("branch") != "main":
                 continue
-            if latest is None:
-                latest = h
-            elif prev is None:
-                prev = h
+            if latest_main is None:
+                latest_main = h
+            if h["helion_speedup_geomean"] > 0:
+                if latest_data is None:
+                    latest_data = h
+                elif prev_data is None:
+                    prev_data = h
+            if latest_main is not None and prev_data is not None:
                 break
 
-        # Deltas and classification based only on main branch runs
-        speedup_delta = fmt_delta(latest["helion_speedup_geomean"], prev["helion_speedup_geomean"]) if latest and prev else None
-        compile_delta = fmt_delta(prev["compile_time_avg_s"], latest["compile_time_avg_s"]) if latest and prev and latest["compile_time_avg_s"] > 0 else None
-        latency_delta = fmt_delta(prev["helion_latency_avg_ms"], latest["helion_latency_avg_ms"]) if latest and prev and latest["helion_latency_avg_ms"] > 0 else None
+        speedup_delta = fmt_delta(latest_data["helion_speedup_geomean"], prev_data["helion_speedup_geomean"]) if latest_data and prev_data else None
+        compile_delta = fmt_delta(prev_data["compile_time_avg_s"], latest_data["compile_time_avg_s"]) if latest_data and prev_data and latest_data["compile_time_avg_s"] > 0 else None
+        latency_delta = fmt_delta(prev_data["helion_latency_avg_ms"], latest_data["helion_latency_avg_ms"]) if latest_data and prev_data and latest_data["helion_latency_avg_ms"] > 0 else None
 
         classify_delta = latency_delta if latency_delta is not None else speedup_delta
         status = "improved" if classify_delta and classify_delta > 10 else "regressed" if classify_delta and classify_delta < -10 else "unchanged"
 
         acc_failures = []
-        if latest and latest["per_shape"]["helion_accuracy"]:
-            shapes = latest["per_shape"]["shapes"]
-            for i, a in enumerate(latest["per_shape"]["helion_accuracy"]):
-                if a < 1.0:
-                    acc_failures.append(shapes[i] if i < len(shapes) else f"shape #{i}")
+        run_failures = []
+        # Kernel absent from the global latest main run → likely CI infra issue.
+        infra_missing = bool(latest_main_run_id) and (not latest_main or latest_main["run_id"] != latest_main_run_id)
+        if not infra_missing and latest_main:
+            latest_ps = latest_main.get("per_shape") or {}
+            shapes = latest_ps.get("shapes", [])
+            speedups = latest_ps.get("helion_speedup", [])
+            for i, a in enumerate(latest_ps.get("helion_accuracy", [])):
+                if a >= 1.0:
+                    continue
+                label = shapes[i] if i < len(shapes) else f"shape #{i}"
+                sp = speedups[i] if i < len(speedups) else 0
+                (acc_failures if sp and sp > 0 else run_failures).append(label)
+
+        # Strip per_shape from all history entries except latest_main; it's only
+        # read from latest_main (failure classification + detail modal's charts).
+        keep_run_id = latest_main["run_id"] if latest_main else None
+        for h in entry["history"]:
+            if h["run_id"] != keep_run_id:
+                h.pop("per_shape", None)
 
         # has_main_data flags entries for Overview/Speedup filtering in the UI.
         # Non-main-only entries still appear in summary so Compare tab can use them.
@@ -267,25 +296,21 @@ def build_dashboard_data(cache_dir, runs_meta, existing_data=None):
             "kernel": entry["kernel"],
             "platform": entry["platform"],
             "platform_short": entry["platform_short"],
-            "has_main_data": latest is not None,
+            "has_main_data": latest_data is not None,
             "status": status,
             "accuracy_failures": acc_failures,
-            "helion_speedup_geomean": latest["helion_speedup_geomean"] if latest else 0,
-            "triton_speedup_geomean": latest["triton_speedup_geomean"] if latest else 0,
-            "torch_compile_speedup_geomean": latest["torch_compile_speedup_geomean"] if latest else 0,
-            "compile_time_avg_s": latest["compile_time_avg_s"] if latest else 0,
-            "helion_latency_avg_ms": latest["helion_latency_avg_ms"] if latest else 0,
+            "run_failures": run_failures,
+            "infra_missing": infra_missing,
+            "helion_speedup_geomean": latest_data["helion_speedup_geomean"] if latest_data else 0,
+            "triton_speedup_geomean": latest_data["triton_speedup_geomean"] if latest_data else 0,
+            "torch_compile_speedup_geomean": latest_data["torch_compile_speedup_geomean"] if latest_data else 0,
+            "compile_time_avg_s": latest_data["compile_time_avg_s"] if latest_data else 0,
+            "helion_latency_avg_ms": latest_data["helion_latency_avg_ms"] if latest_data else 0,
             "speedup_delta_pct": speedup_delta,
             "compile_delta_pct": compile_delta,
             "latency_delta_pct": latency_delta,
             "history": entry["history"],
         })
-
-    # Drop per_shape from non-latest history entries to keep dashboard JSON small.
-    # The detail modal's Per-Shape charts only render the latest run.
-    for entry in summary:
-        for h in entry["history"][:-1]:
-            h.pop("per_shape", None)
 
     # Stats and platform/kernel lists reflect only entries with main branch data
     main_summary = [s for s in summary if s["has_main_data"]]
@@ -298,10 +323,14 @@ def build_dashboard_data(cache_dir, runs_meta, existing_data=None):
     main_runs = [r for r in runs_meta_sorted if r.get("branch") == "main"]
     latest_main_run = main_runs[-1] if main_runs else {}
 
+    # Drop runs whose artifacts expired and weren't previously cached; otherwise
+    # they pad charts with no-data gaps.
+    output_runs = [r for r in runs if r["run_id"] in run_ids_with_data]
+
     return {
         "generated_at": runs[-1]["date"] if runs else "",
         "latest_run": latest_main_run,
-        "runs": [{k: v for k, v in r.items() if k != "kernels"} for r in runs],
+        "runs": [{k: v for k, v in r.items() if k != "kernels"} for r in output_runs],
         "platforms": platforms,
         "platform_shorts": platform_shorts,
         "unique_kernels": unique_kernels,
@@ -313,6 +342,8 @@ def build_dashboard_data(cache_dir, runs_meta, existing_data=None):
             "regressed_count": regressed,
             "unchanged_count": len(main_summary) - improved - regressed,
             "accuracy_failures": sum(len(s["accuracy_failures"]) for s in main_summary),
+            "run_failures": sum(len(s["run_failures"]) for s in main_summary),
+            "infra_missing": sum(1 for s in main_summary if s["infra_missing"]),
             "helion_geomean": round(geo_mean([s["helion_speedup_geomean"] for s in main_summary]), 4),
             "triton_geomean": round(geo_mean([s["triton_speedup_geomean"] for s in main_summary]), 4),
             "torch_compile_geomean": round(geo_mean([s["torch_compile_speedup_geomean"] for s in main_summary]), 4),
