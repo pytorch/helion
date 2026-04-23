@@ -63,7 +63,9 @@ def fetch_runs(repo, workflow_name, days):
         if not data or not data.get("workflow_runs"):
             break
         for r in data["workflow_runs"]:
-            if r.get("conclusion") in ("success", "failure"):
+            # Include cancelled runs: successful jobs within them still upload artifacts
+            # before the workflow is killed (e.g., the 6-hour job timeout).
+            if r.get("conclusion") in ("success", "failure", "cancelled"):
                 runs.append({
                     "run_id": str(r["id"]),
                     "sha": r["head_sha"][:8],
