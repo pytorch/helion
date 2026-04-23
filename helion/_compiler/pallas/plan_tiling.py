@@ -206,6 +206,10 @@ def _detect_indexing_pattern(
                 block_id=tile_begin_with_offset.block_id,
                 offset=tile_begin_with_offset.offset,
             )
+        # Indices produced by other FX nodes, such as indices[tile] used in
+        # tensor-indexed atomics, are legal but cannot participate in Pallas
+        # tiling.
+        return ArbitraryIndexPattern(idx)
 
     if isinstance(idx, slice):
         if idx != slice(None):
@@ -310,7 +314,12 @@ def _maybe_get_symbol_origin(idx: object) -> SymbolOrigin | None:
 def _maybe_get_tile_begin_with_offset_info(
     idx: object,
 ) -> TileBeginWithOffsetPattern | None:
-    """Extended version that allows out-of-bounds and symbolic offsets."""
+    """Extended version that allows out-of-bounds and symbolic offsets.
+
+    Matches expressions that resolve to a tile's start offset within the
+    full loop extent (e.g. ``tile.begin``, ``tile.end - 1``, or affine
+    combinations of those with integer constants).
+    """
     from ..compile_environment import CompileEnvironment
     from ..compile_environment import _symint_expr
     from ..host_function import HostFunction
@@ -318,6 +327,7 @@ def _maybe_get_tile_begin_with_offset_info(
     from ..variable_origin import GridOrigin
     from ..variable_origin import TileBeginOrigin
     from ..variable_origin import TileEndOrigin
+    from ..variable_origin import TileIdOrigin
 
     idx_symbol_origin = _maybe_get_symbol_origin(idx)
     if isinstance(idx_symbol_origin, SymbolOrigin):
@@ -326,7 +336,7 @@ def _maybe_get_tile_begin_with_offset_info(
                 block_id=idx_symbol_origin.origin.block_id, offset=0
             )
         if isinstance(idx_symbol_origin.origin, GridOrigin) and not isinstance(
-            idx_symbol_origin.origin, TileEndOrigin
+            idx_symbol_origin.origin, (TileEndOrigin, TileIdOrigin)
         ):
             return TileBeginWithOffsetPattern(
                 block_id=idx_symbol_origin.origin.block_id, offset=0

@@ -5,7 +5,6 @@ import collections
 import contextlib
 import dataclasses
 import functools
-from itertools import starmap
 import logging
 import math
 from math import inf
@@ -19,8 +18,6 @@ import types
 from typing import TYPE_CHECKING
 from typing import Callable
 from typing import Literal
-from typing import NamedTuple
-from typing import NoReturn
 from typing import Protocol
 from typing import cast
 from unittest.mock import patch
@@ -33,15 +30,15 @@ from .. import exc
 from .._compat import extract_device
 from .._compat import get_device_name
 from .benchmark_provider import BenchmarkProvider
+from .benchmark_provider import BenchmarkResult
 from .benchmark_provider import LocalBenchmarkProvider
 from .benchmark_provider import _clone_args
+from .benchmark_provider import _unset_fn
 from .benchmarking import interleaved_bench
-from .logger import AutotuneLogEntry
 from .logger import AutotuningLogger
 from .metrics import AutotuneMetrics
 from .metrics import _run_post_autotune_hooks
 from .precompile_future import PrecompileFuture as PrecompileFuture
-from .progress_bar import iter_with_progress
 from helion._dist_utils import all_gather_object
 from helion._dist_utils import is_master_rank
 from helion._dist_utils import sync_object
@@ -50,7 +47,6 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
 
     from ..runtime.config import Config
-    from ..runtime.kernel import CompiledConfig
     from ..runtime.settings import Settings
     from . import ConfigSpec
     from .config_generation import ConfigGeneration
@@ -133,10 +129,6 @@ class _AutotunableKernel(Protocol):
         ...
 
 
-def _unset_fn(*args: object) -> NoReturn:
-    raise RuntimeError("Uninitialized function")
-
-
 _CODE_OBJECT_RE = re.compile(r"<code object .+?, line \d+>")
 
 
@@ -175,16 +167,6 @@ class BaseAutotuner(abc.ABC):
     @abc.abstractmethod
     def autotune(self, *, skip_cache: bool = False) -> Config:
         raise NotImplementedError
-
-
-class BenchmarkResult(NamedTuple):
-    """Result tuple returned by parallel_benchmark."""
-
-    config: Config
-    fn: Callable[..., object]
-    perf: float
-    status: Literal["ok", "error", "timeout", "peer_compilation_fail", "filtered"]
-    compile_time: float | None
 
 
 class BaseSearch(BaseAutotuner):
@@ -266,7 +248,6 @@ class BaseSearch(BaseAutotuner):
 
         return kwargs
 
-    # TODO(hinriksnaer): migrate set_adaptive_compile_timeout to BenchmarkProvider as post_initial_benchmark
     def set_adaptive_compile_timeout(
         self,
         members: list[PopulationMember],
@@ -322,92 +303,53 @@ class BaseSearch(BaseAutotuner):
             f"bounds=[{min_seconds}s, {original_timeout}s])"
         )
 
-    def create_precompile_future(
-        self, config: Config, fn: CompiledConfig
-    ) -> PrecompileFuture:
-        """
-        Create a subprocess that will precompile the kernel to detect hangs
-        during compilation.  The subprocess is not started until the returned
-        future is called or started explicitly.
-
-        Args:
-            config: The config that generated fn.
-            fn: The function to be precompiled.
-
-        Returns:
-            A ``PrecompileFuture`` that resolves to True on success or False on
-            failure/timeout when called.
-        """
-        # TODO(hinriksnaer): migrate create_precompile_future to BenchmarkProvider
-        bp = self.benchmark_provider
-        assert isinstance(bp, LocalBenchmarkProvider)
-        ctx = bp._precompile_context()
-        if not self.settings.autotune_precompile:
-            return PrecompileFuture.skip(ctx, config, True)
-        mode = self.settings.autotune_precompile
-        if mode not in {"fork", "spawn"}:
-            raise exc.InvalidAPIUsage("autotune_precompile must be 'fork' or 'spawn'")
-        if len(bp.mutated_arg_indices) > 0:
-            args = _clone_args(
-                self.args,
-                self.kernel.env.process_group_name,
-                idx_to_clone=bp.mutated_arg_indices,
-            )
-        else:
-            args = self.args
-
-        return PrecompileFuture.create(
-            ctx=ctx,
-            config=config,
-            fn=fn,
-            args=args,
-            result_path=bp._next_precompile_result_path(),
-            args_path=bp._precompile_args_path,
+    def _apply_config_filter(
+        self, configs: list[Config]
+    ) -> tuple[list[Config], list[int]]:
+        """Apply the user-provided config filter, returning passing configs and their indices."""
+        config_filter = self.settings.autotune_config_filter
+        if config_filter is None:
+            return configs, list(range(len(configs)))
+        filtered: list[Config | None] = [config_filter(c) for c in configs]
+        passing_indices = [i for i, fc in enumerate(filtered) if fc is not None]
+        passing_configs = cast(
+            "list[Config]",
+            [filtered[i] for i in passing_indices],
         )
+        return passing_configs, passing_indices
 
-    # TODO(hinriksnaer): migrate _benchmark to BenchmarkProvider
-    def _benchmark(
-        self,
-        configs: list[Config],
-        *,
-        desc: str = "Benchmarking",
-        _skip_filter: bool = False,
+    def benchmark_batch(
+        self, configs: list[Config], *, desc: str = "Benchmarking"
     ) -> list[BenchmarkResult]:
-        """
-        Internal benchmark implementation. Compiles in parallel and benchmarks configs.
+        """Compile and benchmark a batch of configurations.
+
+        Applies the config filter, delegates to the provider, and tracks
+        best performance.
 
         Args:
             configs: A list of configurations to benchmark.
             desc: Description for the progress bar.
 
         Returns:
-            A list of BenchmarkResult entries containing the configuration, compiled
-            callable, measured performance, status, and compilation time.
+            A list of BenchmarkResult entries, one per input config.
         """
-        config_filter = self.settings.autotune_config_filter
-        if config_filter is not None and not _skip_filter:
-            filtered_configs: list[Config | None] = [config_filter(c) for c in configs]
-            passing_indices = [
-                i for i, fc in enumerate(filtered_configs) if fc is not None
-            ]
-            passing_configs = cast(
-                "list[Config]",
-                [filtered_configs[i] for i in passing_indices],
-            )
-            inner_results = self._benchmark(
-                passing_configs, desc=desc, _skip_filter=True
-            )
+        passing_configs, passing_indices = self._apply_config_filter(configs)
+        inner_results = self.benchmark_provider.benchmark(passing_configs, desc=desc)
+
+        if len(passing_indices) == len(configs):
+            results = inner_results
+        else:
             inner_iter = iter(inner_results)
-            merged: list[BenchmarkResult] = []
             passing_set = set(passing_indices)
+            results = []
             for i, config in enumerate(configs):
                 if i in passing_set:
-                    merged.append(next(inner_iter))
+                    results.append(next(inner_iter))
                 else:
                     self.log.debug(
                         f"Config filtered out by autotune_config_filter: {config!r}"
                     )
-                    merged.append(
+                    results.append(
                         BenchmarkResult(
                             config=config,
                             fn=lambda *a, **kw: None,
@@ -416,146 +358,12 @@ class BaseSearch(BaseAutotuner):
                             compile_time=None,
                         )
                     )
-            return merged
 
-        all_configs = configs
-        compiled: dict[int, Callable[..., object]] = {}
-        futures: list[PrecompileFuture] | None = None
-        for i, config in enumerate(all_configs):
-            try:
-                compiled[i] = self.kernel.compile_config(config, allow_print=False)
-            except Exception:
-                # If all configs failed, raise error
-                if not compiled and i == len(all_configs) - 1:
-                    raise
-                self.log.warning(
-                    "Skipping config that failed to compile: %s",
-                    self.kernel.format_kernel_decorator(config, self.settings),
-                    exc_info=True,
-                )
-        fns = list(compiled.values())
-        valid_indices = list(compiled.keys())
-        configs = [all_configs[i] for i in valid_indices]
-        if self.settings.autotune_precompile:
-            futures = list(
-                starmap(
-                    self.create_precompile_future,
-                    zip(configs, fns, strict=True),
-                )
-            )
-            precompile_desc = (
-                f"{desc} precompiling" if self.settings.autotune_progress_bar else None
-            )
-            is_workings = PrecompileFuture.wait_for_all(futures, desc=precompile_desc)
-            precompile_status: list[Literal["ok", "error", "timeout"]] = []
-            for future, ok in zip(futures, is_workings, strict=True):
-                reason = future.failure_reason
-                if ok:
-                    precompile_status.append("ok")
-                elif reason == "timeout":
-                    precompile_status.append("timeout")
-                else:
-                    precompile_status.append("error")
-        else:
-            is_workings = [True] * len(configs)
-            precompile_status = ["ok"] * len(configs)
+        for r in results:
+            if r.perf < self.best_perf_so_far:
+                self.best_perf_so_far = r.perf
 
-        results: list[BenchmarkResult] = [
-            BenchmarkResult(
-                config=c, fn=_unset_fn, perf=inf, status="error", compile_time=None
-            )
-            for c in all_configs
-        ]
-
-        # Render a progress bar only when the user requested it.
-        iterator = iter_with_progress(
-            enumerate(zip(fns, is_workings, precompile_status, strict=True)),
-            total=len(configs),
-            description=f"{desc} exploring neighbors",
-            enabled=self.settings.autotune_progress_bar,
-        )
-        for index, (fn, is_working, reason) in iterator:
-            config = configs[index]
-            if futures is not None:
-                future = futures[index]
-                compile_time = (
-                    future.elapsed
-                    if future.process is not None and future.started
-                    else None
-                )
-            else:
-                compile_time = None
-            status: Literal[
-                "ok", "error", "timeout", "peer_compilation_fail", "filtered"
-            ]
-            if all(
-                all_gather_object(
-                    is_working, process_group_name=self.kernel.env.process_group_name
-                )
-            ):
-                # Log started before benchmarking to help identify hangs
-                self.log.record_autotune_entry(
-                    AutotuneLogEntry(
-                        generation=self._autotune_metrics.num_generations,
-                        status="started",
-                        perf_ms=None,
-                        compile_time=compile_time,
-                        config=config,
-                    )
-                )
-                # benchmark one-by-one to avoid noisy results
-                perf = self.benchmark_provider.benchmark_function(config, fn)
-                if perf < self.best_perf_so_far:
-                    self.best_perf_so_far = perf
-                status = "ok" if math.isfinite(perf) else "error"
-                # Log completion after benchmarking
-                self.log.record_autotune_entry(
-                    AutotuneLogEntry(
-                        generation=self._autotune_metrics.num_generations,
-                        status=status,
-                        perf_ms=perf if math.isfinite(perf) else None,
-                        compile_time=compile_time,
-                        config=config,
-                    )
-                )
-                results[valid_indices[index]] = BenchmarkResult(
-                    config=config,
-                    fn=fn,
-                    perf=perf,
-                    status=status,
-                    compile_time=compile_time,
-                )
-            else:
-                status = "timeout" if reason == "timeout" else "error"
-                if is_working:
-                    status = "peer_compilation_fail"
-                results[valid_indices[index]] = BenchmarkResult(
-                    config=config,
-                    fn=fn,
-                    perf=inf,
-                    status=status,
-                    compile_time=compile_time,
-                )
         return results
-
-    def benchmark_batch(
-        self, configs: list[Config], *, desc: str = "Benchmarking"
-    ) -> list[BenchmarkResult]:
-        """
-        Compile and benchmark a batch of configurations.
-
-        This is the primary entry point for benchmarking. It compiles and
-        benchmarks the given configs, then updates search-level metrics
-        (configs tested, failures, best performance).
-
-        Args:
-            configs: A list of configurations to benchmark.
-            desc: Description for the progress bar.
-
-        Returns:
-            A list of BenchmarkResult entries.
-        """
-        return self._benchmark(configs, desc=desc)
 
     def benchmark(self, config: Config) -> BenchmarkResult:
         """Compile and benchmark a single configuration.
@@ -791,36 +599,62 @@ class PopulationBasedSearch(BaseSearch):
         """
         config = self.config_gen.unflatten(flat_values)
         member = PopulationMember(_unset_fn, [], flat_values, config)
-        self.parallel_benchmark_population([member], desc="Benchmarking")
+        self.benchmark_population([member], desc="Benchmarking")
         return member
 
-    def parallel_benchmark_flat(
+    def benchmark_flat_batch(
         self, to_check: list[FlatConfig]
     ) -> list[PopulationMember]:
         """
         Benchmark multiple flat configurations in parallel.
 
+        The returned list has the same length as ``to_check`` and preserves
+        positional correspondence.  Invalid configurations that cannot be
+        unflattened are represented as ``PopulationMember`` objects with
+        ``perf == inf`` and ``status == "error"`` (they are not benchmarked).
+
         Args:
             to_check: A list of flat configurations to benchmark.
 
         Returns:
-            A list of population members with the benchmark results.
+            A list of population members with the benchmark results, one per
+            entry in *to_check*.
         """
-        result = [*map(self.make_unbenchmarked, to_check)]
-        return self.parallel_benchmark_population(result)
+        from ..runtime.config import Config
 
-    def make_unbenchmarked(self, flat_values: FlatConfig) -> PopulationMember:
+        valid: list[PopulationMember] = []
+        result: list[PopulationMember] = []
+        for flat in to_check:
+            m = self.make_unbenchmarked(flat)
+            if m is not None:
+                valid.append(m)
+                result.append(m)
+            else:
+                result.append(
+                    PopulationMember(
+                        _unset_fn, [float("inf")], flat, Config(), status="error"
+                    )
+                )
+
+        self.benchmark_population(valid)
+        return result
+
+    def make_unbenchmarked(self, flat_values: FlatConfig) -> PopulationMember | None:
         """
         Create a population member with unbenchmarked configuration.  You
-        should pass the result of this to parallel_benchmark_population.
+        should pass the result of this to benchmark_population.
 
         Args:
             flat_values: The flat configuration values.
 
         Returns:
-            A population member with undefined performance.
+            A population member with undefined performance, or None if the
+            configuration is invalid.
         """
-        config = self.config_gen.unflatten(flat_values)
+        try:
+            config = self.config_gen.unflatten(flat_values)
+        except exc.InvalidConfig:
+            return None
         return PopulationMember(_unset_fn, [], flat_values, config)
 
     def _get_current_hardware_and_specialization(
@@ -939,7 +773,13 @@ class PopulationBasedSearch(BaseSearch):
                 self.log.debug(
                     f"Cached config {i + 1} (transferred): {transferred_config}"
                 )
-            except (ValueError, TypeError, KeyError, AssertionError) as e:
+            except (
+                ValueError,
+                TypeError,
+                KeyError,
+                AssertionError,
+                exc.InvalidConfig,
+            ) as e:
                 self.log(f"Failed to transfer cached config {i + 1}: {e}")
                 continue
 
@@ -952,7 +792,7 @@ class PopulationBasedSearch(BaseSearch):
 
         return result
 
-    def parallel_benchmark_population(
+    def benchmark_population(
         self, members: list[PopulationMember], *, desc: str = "Benchmarking"
     ) -> list[PopulationMember]:
         """
@@ -1113,8 +953,8 @@ class PopulationBasedSearch(BaseSearch):
                     new_flat = [*current.flat_values]
                     new_flat[i] = default_flat[i]
                     candidate = self.make_unbenchmarked(new_flat)
-                    # Only add if this produces a different config
-                    if candidate.config != current.config:
+                    # Only add if valid and produces a different config
+                    if candidate is not None and candidate.config != current.config:
                         candidates.append(candidate)
 
             if len(candidates) <= 1:
@@ -1125,7 +965,7 @@ class PopulationBasedSearch(BaseSearch):
             unbenchmarked = [m for m in candidates if len(m.perfs) == 0]
             if unbenchmarked:
                 self.set_generation(self._autotune_metrics.num_generations + 1)
-                self.parallel_benchmark_population(
+                self.benchmark_population(
                     unbenchmarked, desc=f"Finishing round {round_num}"
                 )
 
@@ -1158,8 +998,8 @@ class PopulationBasedSearch(BaseSearch):
                         if c.flat_values[i] != current.flat_values[i]:
                             combined_flat[i] = c.flat_values[i]
                 combined = self.make_unbenchmarked(combined_flat)
-                if combined.config != current.config:
-                    self.parallel_benchmark_population(
+                if combined is not None and combined.config != current.config:
+                    self.benchmark_population(
                         [combined],
                         desc=f"Finishing round {round_num}: combined",
                     )

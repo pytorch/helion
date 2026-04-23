@@ -55,65 +55,12 @@ def _emit_cute_grouped_sum_reduction_shared_two_stage(
     group_span: int,
     group_count: int,
 ) -> str:
-    backend = CompileEnvironment.current().backend
-    dtype_str = backend.dtype_str(value_dtype)
-    warps_per_group = group_span // 32
-    partials_size = group_count * pre * warps_per_group
-    results_size = group_count * pre
-    smem_size = partials_size + results_size
-    smem_ptr_var = cg.device_function.new_var("dot_reduce_smem_ptr")
-    smem_var = cg.device_function.new_var("dot_reduce_smem")
-    group_id_var = cg.device_function.new_var("dot_group_id")
-    lane_in_warp_var = cg.device_function.new_var("dot_lane_in_warp")
-    warp_in_group_var = cg.device_function.new_var("dot_warp_in_group")
-    partials_base_var = cg.device_function.new_var("dot_partials_base")
-    results_base_var = cg.device_function.new_var("dot_results_base")
-    cg.add_statement(f"{smem_ptr_var} = cute.arch.alloc_smem({dtype_str}, {smem_size})")
-    cg.add_statement(f"{smem_var} = cute.make_tensor({smem_ptr_var}, ({smem_size},))")
-    cg.add_statement(f"{group_id_var} = ({lane_var}) // {group_span}")
-    cg.add_statement(f"{lane_in_warp_var} = ({lane_var}) % 32")
-    cg.add_statement(f"{warp_in_group_var} = ({lane_in_group_var}) // 32")
-    cg.add_statement(
-        f"{partials_base_var} = ({group_id_var}) * {pre * warps_per_group}"
-    )
-    cg.add_statement(f"{results_base_var} = {partials_size} + ({group_id_var}) * {pre}")
-
-    for p in range(pre):
-        masked_input_var = cg.device_function.new_var(f"dot_masked_input_{p}")
-        warp_partial_var = cg.device_function.new_var(f"dot_warp_partial_{p}")
-        partial_idx_var = cg.device_function.new_var(f"dot_partial_idx_{p}")
-        stage2_input_var = cg.device_function.new_var(f"dot_stage2_input_{p}")
-        group_result_var = cg.device_function.new_var(f"dot_group_result_{p}")
-        cg.add_statement(
-            f"{masked_input_var} = ({input_name}) if ({lane_mod_pre_var}) == {p} else ({identity_expr})"
-        )
-        cg.add_statement(
-            f"{warp_partial_var} = {backend.reduction_expr(masked_input_var, 'sum', 0, threads_in_group=32)}"
-        )
-        cg.add_statement(
-            f"{partial_idx_var} = ({partials_base_var}) + {p * warps_per_group} + ({warp_in_group_var})"
-        )
-        cg.add_statement(
-            statement_from_string(
-                f"""if ({lane_in_warp_var}) == 0:
-    {smem_var}[{partial_idx_var}] = {warp_partial_var}"""
-            )
-        )
-        cg.add_statement("cute.arch.sync_threads()")
-        cg.add_statement(
-            statement_from_string(
-                f"""if ({warp_in_group_var}) == 0:
-    {stage2_input_var} = {smem_var}[({partials_base_var}) + {p * warps_per_group} + ({lane_in_warp_var})] if ({lane_in_warp_var}) < {warps_per_group} else ({identity_expr})
-    {group_result_var} = {backend.reduction_expr(stage2_input_var, "sum", 0, threads_in_group=32)}
-    if ({lane_in_warp_var}) == 0:
-        {smem_var}[({results_base_var}) + {p}] = {group_result_var}"""
-            )
-        )
-        cg.add_statement("cute.arch.sync_threads()")
-
     result_var = cg.device_function.new_var("dot_reduce_result")
     cg.add_statement(
-        f"{result_var} = {smem_var}[({results_base_var}) + ({lane_mod_pre_var})]"
+        f"{result_var} = _cute_grouped_reduce_shared_two_stage("
+        f"{input_name}, 'sum', {identity_expr}, "
+        f"{lane_var}, {lane_in_group_var}, {lane_mod_pre_var}, "
+        f"pre={pre}, group_span={group_span}, group_count={group_count})"
     )
     return result_var
 
@@ -132,56 +79,13 @@ def _emit_cute_grouped_sum_reduction_shared_tree(
     num_threads: int,
     group_count: int,
 ) -> str:
-    backend = CompileEnvironment.current().backend
-    dtype_str = backend.dtype_str(value_dtype)
-    smem_size = num_threads + group_count * pre
-    smem_ptr_var = cg.device_function.new_var("dot_reduce_smem_ptr")
-    smem_var = cg.device_function.new_var("dot_reduce_smem")
-    group_base_var = cg.device_function.new_var("dot_group_base")
-    group_id_var = cg.device_function.new_var("dot_group_id")
-    result_base_var = cg.device_function.new_var("dot_result_base")
-    cg.add_statement(f"{smem_ptr_var} = cute.arch.alloc_smem({dtype_str}, {smem_size})")
-    cg.add_statement(f"{smem_var} = cute.make_tensor({smem_ptr_var}, ({smem_size},))")
-    cg.add_statement(f"{group_base_var} = ({lane_var}) - ({lane_in_group_var})")
-    cg.add_statement(f"{group_id_var} = ({lane_var}) // {group_span}")
-    cg.add_statement(f"{result_base_var} = {num_threads} + ({group_id_var}) * {pre}")
-
-    for p in range(pre):
-        masked_input_var = cg.device_function.new_var(f"dot_masked_input_{p}")
-        cg.add_statement(
-            f"{masked_input_var} = ({input_name}) if ({lane_mod_pre_var}) == {p} else ({identity_expr})"
-        )
-        cg.add_statement(f"{smem_var}[{lane_var}] = {masked_input_var}")
-        cg.add_statement("cute.arch.sync_threads()")
-        stride = 1
-        while stride < group_span:
-            cond = (
-                f"(({lane_in_group_var}) % {stride * 2}) == 0"
-                f" and ({lane_in_group_var}) + {stride} < {group_span}"
-            )
-            lhs = f"{smem_var}[{lane_var}]"
-            rhs = f"{smem_var}[({group_base_var}) + ({lane_in_group_var}) + {stride}]"
-            combined = backend.reduction_combine_expr("sum", lhs, rhs, value_dtype)
-            cg.add_statement(
-                statement_from_string(
-                    f"""if {cond}:
-    {smem_var}[{lane_var}] = {combined}"""
-                )
-            )
-            cg.add_statement("cute.arch.sync_threads()")
-            stride *= 2
-
-        cg.add_statement(
-            statement_from_string(
-                f"""if ({lane_in_group_var}) == 0:
-    {smem_var}[({result_base_var}) + {p}] = {smem_var}[{lane_var}]"""
-            )
-        )
-        cg.add_statement("cute.arch.sync_threads()")
-
     result_var = cg.device_function.new_var("dot_reduce_result")
     cg.add_statement(
-        f"{result_var} = {smem_var}[({result_base_var}) + ({lane_mod_pre_var})]"
+        f"{result_var} = _cute_grouped_reduce_shared_tree("
+        f"{input_name}, 'sum', {identity_expr}, "
+        f"{lane_var}, {lane_in_group_var}, {lane_mod_pre_var}, "
+        f"pre={pre}, group_span={group_span}, "
+        f"num_threads={num_threads}, group_count={group_count})"
     )
     return result_var
 
@@ -238,24 +142,11 @@ def _emit_cute_grouped_sum_reduction(
     identity_expr = f"{backend.dtype_str(value_dtype)}(0)"
     group_span = pre * reduce_extent
     if group_span <= 32:
-        lane_mod_pre = f"((({lane_expr}) % {group_span}) % {pre})"
-        reduced_terms: list[str] = []
-        for p in range(pre):
-            masked_input_var = cg.device_function.new_var(f"dot_masked_input_{p}")
-            reduced_var = cg.device_function.new_var(f"dot_reduced_{p}")
-            cg.add_statement(
-                f"{masked_input_var} = ({input_name}) if ({lane_mod_pre}) == {p} else ({identity_expr})"
-            )
-            cg.add_statement(
-                f"{reduced_var} = {backend.reduction_expr(masked_input_var, 'sum', 0, threads_in_group=group_span)}"
-            )
-            reduced_terms.append(reduced_var)
-        selected_result = reduced_terms[0]
-        for p, reduced in enumerate(reduced_terms[1:], start=1):
-            selected_result = (
-                f"({reduced}) if ({lane_mod_pre}) == {p} else ({selected_result})"
-            )
-        return selected_result
+        return (
+            "_cute_grouped_reduce_warp("
+            f"{input_name}, 'sum', {identity_expr}, {lane_expr}, "
+            f"pre={pre}, group_span={group_span})"
+        )
 
     assert num_threads % group_span == 0, (
         f"num_threads ({num_threads}) must be divisible by group_span ({group_span})"

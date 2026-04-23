@@ -66,6 +66,13 @@ class ThreadAxisTracker:
             self.block_axes[block_id] = axis
 
 
+def _lane_loop_iter(extent: int) -> ast.AST:
+    # CuTe lane loops carry per-thread scalar state. Emitting them via
+    # cutlass.range(_constexpr) miscompiles scalar matmul paths, so keep them
+    # as ordinary Python loops.
+    return expr_from_string(f"range({extent})")
+
+
 @dataclasses.dataclass
 class LoopDimInfo:
     begin_var_name: str | None = None
@@ -167,7 +174,7 @@ class DeviceGridState(DeviceLoopOrGridState):
                 create(
                     ast.For,
                     target=create(ast.Name, id=lane_var, ctx=ast.Store()),
-                    iter=expr_from_string(f"range({extent})"),
+                    iter=_lane_loop_iter(extent),
                     body=wrapped,
                     orelse=[],
                     type_comment=None,
@@ -193,7 +200,7 @@ class PersistentReductionState(DeviceLoopOrGridState):
                 create(
                     ast.For,
                     target=create(ast.Name, id=lane_var, ctx=ast.Store()),
-                    iter=expr_from_string(f"range({extent})"),
+                    iter=_lane_loop_iter(extent),
                     body=wrapped,
                     orelse=[],
                     type_comment=None,
@@ -680,6 +687,14 @@ class BlockSizeTileStrategy(TileStrategy):
             isinstance(strategy, ReductionStrategy) and strategy.thread_axes_used() > 0
             for strategy in self.fn.tile_strategy.strategies
         )
+        plan = self.fn.tile_strategy.current_cute_grid_execution_plan(
+            block_ids=self.block_ids
+        )
+        if plan is not None and any(
+            plan.disables_reduction_axis_reservation(block_id)
+            for block_id in self.block_ids
+        ):
+            return active_non_reduction_axes + active_reduction_axes
         reserved_reduction_axes = max(
             1 if has_reduction_strategy else 0, active_reduction_axes
         )
@@ -1701,14 +1716,20 @@ class NDTileStrategy(_BaseNDTileStrategy):
             jagged_tile_block_size = env.block_sizes[block_idx].var
             jagged_tile_parent_proxy = jagged_tile_parents_proxy[0]
             assert isinstance(jagged_tile_parent_proxy, torch.Tensor)
-            jagged_tile_parent_block_size = jagged_tile_parent_proxy.size(0)
-            assert isinstance(jagged_tile_parent_block_size, torch.SymInt)
+            parent_dims: list[torch.SymInt] = []
+            for d in jagged_tile_parent_proxy.size():
+                assert isinstance(d, torch.SymInt)
+                parent_dims.append(d)
+            assert len(parent_dims) >= 1
             env.jagged_tile_mask_shapes[block_idx] = [
-                jagged_tile_parent_block_size,
+                *parent_dims,
                 jagged_tile_block_size,
             ]
+            k = len(parent_dims)
+            child_expand = "[" + ", ".join(["None"] * k + [":"]) + "]"
+            parent_expand = "[" + ", ".join([":"] * k + ["None"]) + "]"
             return statement_from_string(
-                f"{mask_var} = ({index_var})[None,:] < {{parent}}[:,None]",
+                f"{mask_var} = ({index_var}){child_expand} < {{parent}}{parent_expand}",
                 parent=self._to_ast(jagged_tile_parent),
             )
 
@@ -1978,16 +1999,16 @@ class CuteNDTileStrategy(NDTileStrategy):
             )
             axis = thread_axis_offset + thread_axis_map[block_idx]
             if uses_thread_axis:
-                idx_expr = f"{offset_var} + cutlass.Int32(cute.arch.thread_idx()[{axis}]) * {elements_per_thread}"
-                static_thread_extent = self._static_thread_extent_for_block(
-                    block_idx, block_size
+                idx_expr = env.backend.lane_index_expr(
+                    offset_var, elements_per_thread, axis=axis
                 )
-                if isinstance(static_thread_extent, int):
-                    tracker.record(block_idx, axis, static_thread_extent)
+                thread_extent = self._thread_extent_for_axis(block_idx, block_size)
+                if isinstance(thread_extent, int):
+                    tracker.record(block_idx, axis, thread_extent)
             else:
                 idx_expr = offset_var
             if lane_var := self._lane_var_by_block.get(block_idx):
-                idx_expr = f"{idx_expr} + cutlass.Int32({lane_var})"
+                idx_expr = f"{idx_expr} + {env.backend.lane_offset_expr(lane_var)}"
             lane_setup_statements.append(
                 statement_from_string(f"{index_var} = {idx_expr}")
             )
@@ -2053,7 +2074,7 @@ class CuteNDTileStrategy(NDTileStrategy):
             lane_for = create(
                 ast.For,
                 target=create(ast.Name, id=lane_var, ctx=ast.Store()),
-                iter=expr_from_string(f"range({extent})"),
+                iter=_lane_loop_iter(extent),
                 body=body,
                 orelse=[],
                 type_comment=None,
@@ -2137,16 +2158,16 @@ class CuteNDTileStrategy(NDTileStrategy):
             )
             axis = thread_axis_offset + thread_axis_map[block_idx]
             if uses_thread_axis:
-                idx_expr = f"{offset_var} + cutlass.Int32(cute.arch.thread_idx()[{axis}]) * {elements_per_thread}"
-                static_thread_extent = self._static_thread_extent_for_block(
-                    block_idx, block_size
+                idx_expr = env.backend.lane_index_expr(
+                    offset_var, elements_per_thread, axis=axis
                 )
-                if isinstance(static_thread_extent, int):
-                    tracker.record(block_idx, axis, static_thread_extent)
+                thread_extent = self._thread_extent_for_axis(block_idx, block_size)
+                if isinstance(thread_extent, int):
+                    tracker.record(block_idx, axis, thread_extent)
             else:
                 idx_expr = offset_var
             if lane_var := self._lane_var_by_block.get(block_idx):
-                idx_expr = f"{idx_expr} + cutlass.Int32({lane_var})"
+                idx_expr = f"{idx_expr} + {env.backend.lane_offset_expr(lane_var)}"
             index_setup.append(statement_from_string(f"{index_var} = {idx_expr}"))
             mask_statement = self._setup_mask(
                 state, block_idx, block_size, index_var, end
@@ -2255,7 +2276,7 @@ class CuteFlattenedTileStrategy(FlattenedTileStrategy):
 
         lane_setup_statements.append(
             statement_from_string(
-                f"{offsets_var} = {offsets_base_var} + cutlass.Int32({self._lane_var})"
+                f"{offsets_var} = {offsets_base_var} + {env.backend.lane_offset_expr(self._lane_var)}"
             )
         )
         for i, block_idx in enumerate(self._reorder(block_ids)):
@@ -2286,7 +2307,7 @@ class CuteFlattenedTileStrategy(FlattenedTileStrategy):
         pids.append(PIDInfo(pid_var, block_size_var, total_numel, self.block_ids[0]))
         axis = self._flat_thread_axis()
         state.add_statement(
-            f"{offsets_base_var} = ({pid_var}) * ({block_size_var}) + cutlass.Int32(cute.arch.thread_idx()[{axis}]) * {self._elements_per_thread}"
+            f"{offsets_base_var} = {env.backend.lane_index_expr(f'({pid_var}) * ({block_size_var})', self._elements_per_thread, axis=axis)}"
         )
         pids.codegen(state)
         if isinstance(state.device_function.pid, ForEachProgramID):
@@ -2328,7 +2349,7 @@ class CuteFlattenedTileStrategy(FlattenedTileStrategy):
 
         lane_setup_statements.append(
             statement_from_string(
-                f"{offsets_var} = {offsets_base_var} + cutlass.Int32({self._lane_var})"
+                f"{offsets_var} = {offsets_base_var} + {env.backend.lane_offset_expr(self._lane_var)}"
             )
         )
         for i, block_idx in enumerate(self._reorder(block_ids)):
@@ -2372,7 +2393,7 @@ class CuteFlattenedTileStrategy(FlattenedTileStrategy):
             body = [lane_for]
         body[:0] = [
             statement_from_string(
-                f"{offsets_base_var} = {lid} * ({block_size_var}) + cutlass.Int32(cute.arch.thread_idx()[{axis}]) * {self._elements_per_thread}"
+                f"{offsets_base_var} = {env.backend.lane_index_expr(f'{lid} * ({block_size_var})', self._elements_per_thread, axis=axis)}"
             )
         ]
         for_node = create(

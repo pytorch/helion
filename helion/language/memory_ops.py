@@ -237,9 +237,19 @@ def _pallas_index_str(
         out_pos += 1
         tensor_dim += 1
 
-    requries_smem_access = all(":" not in p and "pl.ds" not in p for p in parts)
-    if requries_smem_access:
-        state.codegen.device_function.pallas_smem_tensor_ids.add(id(tensor))
+    from .._compiler.device_function import PallasMemorySpace
+
+    requires_smem_access = all(":" not in p and "pl.ds" not in p for p in parts)
+    if requires_smem_access:
+        # Don't override HBM — pipeline tensors keep their memory space
+        tid = id(tensor)
+        if (
+            state.codegen.device_function.pallas_memory_space.get(tid)
+            != PallasMemorySpace.HBM
+        ):
+            state.codegen.device_function.pallas_memory_space[tid] = (
+                PallasMemorySpace.SMEM
+            )
 
     return ", ".join(parts), none_dims
 
@@ -324,12 +334,18 @@ def _pallas_tile_pattern_code(
 
     block_id = pattern.block_id
 
+    # Pipeline-tiled dims are already sliced by emit_pipeline / fori_loop's
+    # BlockSpec or DMA copy, so the body should use ``:`` regardless of
+    # whether the planner marked the dim as tileable.
+    # TODO(yifeixu): the long-term fix is making ``can_tile`` per-loop-scope
+    # instead of per-tensor-dim so the planner doesn't mark this dim
+    # untileable in pipeline mode in the first place.
+    if in_pipeline and block_id in pipeline_block_ids:
+        return ":"
+
     can_tile = _can_tile_dimension(state, tensor_dim)
     if not can_tile:
         return _pallas_ds_expr(state, block_id)
-
-    if in_pipeline and block_id in pipeline_block_ids:
-        return ":"
 
     loops = state.codegen.active_device_loops.get(block_id)
     if loops and any(
@@ -350,7 +366,7 @@ def _pallas_tile_index_with_offset_pattern_code(
     assert isinstance(pattern, TileIndexWithOffsetPattern)
 
     block_id = pattern.block_id
-    offset_str = f"{pattern.offset}"
+    offset_str = state.device_function.literal_expr(pattern.offset)
     return _pallas_ds_expr(state, block_id, offset_str)
 
 
@@ -1405,6 +1421,7 @@ def _(
     if isinstance(tensor, torch.Tensor):
         target_shape = SubscriptIndexing.compute_shape(tensor, index)
         env = CompileEnvironment.current()
+        env.backend.process_fake_tensor_load(tensor, index)
         return env.new_index_result(tensor, target_shape)
     if isinstance(tensor, tuple):
         tensor_like, dev_ptrs = tensor

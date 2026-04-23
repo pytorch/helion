@@ -137,10 +137,10 @@ class PatternSearch(PopulationBasedSearch):
         self.population = []
         for flat_config in self._generate_initial_population_flat():
             member = self.make_unbenchmarked(flat_config)
-            if member.config not in visited:
+            if member is not None and member.config not in visited:
                 visited.add(member.config)
                 self.population.append(member)
-        self.parallel_benchmark_population(self.population, desc="Initial population")
+        self.benchmark_population(self.population, desc="Initial population")
 
         # Compute adaptive compile timeout based on initial population compile times
         self.set_adaptive_compile_timeout(
@@ -190,7 +190,7 @@ class PatternSearch(PopulationBasedSearch):
             unbenchmarked = [m for m in self.population if len(m.perfs) == 0]
             if unbenchmarked:
                 self.set_generation(generation)
-                self.parallel_benchmark_population(
+                self.benchmark_population(
                     unbenchmarked, desc=f"Generation {generation}:"
                 )
             # higher-accuracy rebenchmark
@@ -217,7 +217,7 @@ class PatternSearch(PopulationBasedSearch):
             candidates = [current]
             for flat_config in self._generate_neighbors(current.flat_values):
                 new_member = self.make_unbenchmarked(flat_config)
-                if new_member.config not in visited:
+                if new_member is not None and new_member.config not in visited:
                     visited.add(new_member.config)
                     candidates.append(new_member)
             if len(candidates) <= 1:

@@ -46,6 +46,8 @@ else:
     from .autotuner.benchmarking import do_bench as do_bench
     from .autotuner.benchmarking import interleaved_bench
 
+import typing
+
 from .runtime.config import Config
 from .runtime.ref_mode import is_ref_mode_enabled
 from .runtime.settings import RefMode
@@ -239,11 +241,13 @@ elif torch.xpu.is_available():
     DEVICE = torch.device("xpu")
 elif _has_mtia_runtime():
     DEVICE = torch.device("mtia")
+elif _get_backend() == "metal" and torch.backends.mps.is_available():
+    DEVICE = torch.device("mps")
 else:
     DEVICE = torch.device("cuda")
 
 # Half-precision dtype: bfloat16 on TPU (float16 not supported), float16 elsewhere
-if _get_backend() == "pallas":
+if _get_backend() == "pallas" and not is_pallas_interpret():
     HALF_DTYPE = torch.bfloat16
 else:
     HALF_DTYPE = torch.float16
@@ -287,6 +291,11 @@ def skipIfTileIR(reason: str) -> Callable[[Callable], Callable]:
     """Skip test if running with tileir"""
     # Defers check to test execution time to avoid CUDA init during pytest-xdist collection.
     return skipIfFn(lambda: _get_backend() == "tileir", reason)
+
+
+def skipIfMetal(reason: str) -> Callable[[Callable], Callable]:
+    """Skip test if running with metal"""
+    return skipIfFn(lambda: _get_backend() == "metal", reason)
 
 
 def skipIfPallas(reason: str) -> Callable[[Callable], Callable]:
@@ -1019,6 +1028,7 @@ def run_example(
     bwd: bool = False,
     trace_path: str | None = None,
     process_group_name: str | None = None,
+    interleaved: bool = True,
 ) -> None:
     """Run complete example: correctness check + benchmark.
 
@@ -1173,8 +1183,17 @@ def run_example(
         profile_context = torch.profiler.profile()
 
     with profile_context:
-        # pyrefly: ignore[bad-argument-type]
-        timings = interleaved_bench(bench_fns, repeat=repeat, desc="Benchmarking")
+        if interleaved:
+            # pyrefly: ignore[bad-argument-type]
+            timings = interleaved_bench(bench_fns, repeat=repeat, desc="Benchmarking")
+        else:
+            timings = typing.cast(
+                "list[float]",
+                [
+                    do_bench(bench_fn, process_group_name=process_group_name)
+                    for bench_fn in bench_fns
+                ],
+            )
 
     if trace_path is not None and is_master_rank():
         print(f"Write profile to {trace_path}")
