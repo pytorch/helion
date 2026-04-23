@@ -206,10 +206,14 @@ class BaseSearch(BaseAutotuner):
         self._benchmark_provider_cls = benchmark_provider_cls
         self._prepared = False
         self._skip_cache = False
-        self.config_gen: ConfigGeneration = self.config_spec.create_config_generation(
+
+    @functools.cached_property
+    def config_gen(self) -> ConfigGeneration:
+        """Return the lazily-created ConfigGeneration for this search's config_spec."""
+        return self.config_spec.create_config_generation(
             overrides=self.settings.autotune_config_overrides or None,
             advanced_controls_files=self.settings.autotune_search_acf or None,
-            process_group_name=kernel.env.process_group_name,
+            process_group_name=self.kernel.env.process_group_name,
         )
 
     def _prepare(self) -> None:
@@ -627,6 +631,11 @@ class PopulationBasedSearch(BaseSearch):
         self.finishing_rounds = finishing_rounds
         self.population: list[PopulationMember] = []
         self._best_available_seed_configs: list[Config] = []
+        self.config_gen: ConfigGeneration = self.config_spec.create_config_generation(
+            overrides=self.settings.autotune_config_overrides or None,
+            advanced_controls_files=self.settings.autotune_search_acf or None,
+            process_group_name=kernel.env.process_group_name,
+        )
 
     @classmethod
     def get_kwargs_from_profile(
