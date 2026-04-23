@@ -446,6 +446,37 @@ class ConfigSpec:
             config[name] = mapping._normalize(
                 name, config.get(name, ()), flatten=flatten
             )
+
+        # Clamp inner block sizes that are bounded by an outer block
+        # (e.g. ``hl.tile(outer.begin, outer.end)``): at this point the
+        # outer's concrete block size for this config is known, and the
+        # inner extent can never exceed it.
+        block_sizes_list = config.get("block_sizes")
+        if isinstance(block_sizes_list, list):
+            changed = False
+            new_block_sizes = list(block_sizes_list)
+            for i, spec in enumerate(self.block_sizes):
+                bb = spec.bounded_by_block_id
+                if (
+                    bb is None
+                    or i >= len(new_block_sizes)
+                    or new_block_sizes[i] is None
+                ):
+                    continue
+                outer_val = self.block_sizes.config_get(
+                    cast("list[int]", new_block_sizes),
+                    bb,
+                )
+                if (
+                    isinstance(outer_val, int)
+                    and isinstance(new_block_sizes[i], int)
+                    and new_block_sizes[i] > outer_val
+                ):
+                    new_block_sizes[i] = outer_val
+                    changed = True
+            if changed:
+                config["block_sizes"] = new_block_sizes
+
         if self.supports_config_key("num_threads"):
             num_threads = cast("list[int]", config.get("num_threads", []))
             if all(value == 0 for value in num_threads):
@@ -1009,6 +1040,7 @@ class BlockSizeSpec(_PowerOfTwoBlockIdItem):
         size_hint: int,
         min_size: int = 1,
         max_size: int | None = None,
+        bounded_by_block_id: int | None = None,
     ) -> None:
         super().__init__([block_id])
         self.size_hint = size_hint
@@ -1026,6 +1058,13 @@ class BlockSizeSpec(_PowerOfTwoBlockIdItem):
         self.max_size: int = (
             next_power_of_2(bounded_hint) if max_size is None else max_size
         )
+        # When this block's numel comes from another block's var (e.g.
+        # ``hl.tile(outer.begin, outer.end)``), store the outer block_id so
+        # normalize() can clamp this block's size to the outer's current
+        # config value.  The inner extent is bounded by the outer tile
+        # extent, so an inner block greater than the outer block's current
+        # value would address past the outer tile at runtime.
+        self.bounded_by_block_id: int | None = bounded_by_block_id
         if self.max_size < self.min_size:
             self.max_size = self.min_size
         assert self.min_size <= self.max_size

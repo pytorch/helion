@@ -39,6 +39,7 @@ from .compile_environment import AutoSize
 from .compile_environment import CompileEnvironment
 from .compile_environment import FixedBlockSizeSource
 from .compile_environment import LoopSpecBlockSizeSource
+from .compile_environment import _symint_expr
 from .compile_environment import warning
 from .device_function import contains_only_block_size_symbols
 from .host_function import HostFunction
@@ -1106,6 +1107,51 @@ def _get_hint(numel: int | torch.SymInt | AutoSize | None) -> int:
     return CompileEnvironment.current().size_hint(numel)
 
 
+def _detect_outer_block_bound(
+    numel: torch.SymInt, env: CompileEnvironment
+) -> int | None:
+    """If ``numel`` equals ``tile.end - tile.begin`` for an outer tile, return
+    that tile's block_id.  Used to cap inner-tile block sizes to the enclosing
+    outer tile's extent (e.g. ``hl.tile(outer.begin, outer.end)``).
+    """
+    from .host_function import HostFunction
+    from .variable_origin import TileBeginOrigin
+    from .variable_origin import TileEndOrigin
+
+    # Direct match: numel is another block's var.
+    direct = env.get_block_id(numel)
+    if direct is not None:
+        return direct
+
+    expr = _symint_expr(numel)
+    if expr is None:
+        return None
+    host_fn = HostFunction.current()
+
+    # Walk the free symbols: expect exactly one TileBeginOrigin and one
+    # TileEndOrigin with the same block_id.
+    begin_bid: int | None = None
+    end_bid: int | None = None
+    for sym in expr.free_symbols:
+        symbol_origin = host_fn.expr_to_origin.get(sym)
+        if symbol_origin is None:
+            return None
+        origin = symbol_origin.origin
+        if isinstance(origin, TileBeginOrigin):
+            if begin_bid is not None:
+                return None
+            begin_bid = origin.block_id
+        elif isinstance(origin, TileEndOrigin):
+            if end_bid is not None:
+                return None
+            end_bid = origin.block_id
+        else:
+            return None
+    if begin_bid is not None and end_bid is not None and begin_bid == end_bid:
+        return begin_bid
+    return None
+
+
 class TileIndexType(TypeInfo):
     block_id: int
 
@@ -1137,10 +1183,19 @@ class TileIndexType(TypeInfo):
         env = CompileEnvironment.current()
         if block_size is None:
             block_id = env.allocate_block_size(numel, source=LoopSpecBlockSizeSource())
+            outer_max: int | None = None
+            bounded_by: int | None = None
+            if isinstance(numel, torch.SymInt):
+                bounded_by = _detect_outer_block_bound(numel, env)
+                if bounded_by is not None:
+                    outer_spec = env.config_spec.block_sizes.block_id_lookup(bounded_by)
+                    outer_max = outer_spec.max_size
             env.config_spec.block_sizes.append(
                 BlockSizeSpec(
                     block_id=block_id,
                     size_hint=_get_hint(numel),
+                    max_size=outer_max,
+                    bounded_by_block_id=bounded_by,
                 )
             )
             if env.config_spec.supports_config_key("num_threads"):
