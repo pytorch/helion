@@ -765,6 +765,42 @@ class ConfigSpec:
                     max(min_block, spec.autotuner_min)
                 )
 
+    def lower_max_for_imbalanced_grid_dims(self) -> None:
+        """Lower max_size for the large grid dimension when the shape is skinny.
+
+        When one grid dimension is much larger than the other (e.g. M=1024, N=8192),
+        the autotuner samples large tile sizes for the big dimension that produce too
+        few grid blocks for good GPU occupancy.  Capping the larger dimension's tile
+        keeps the search in the useful region without hardcoding specific tile values.
+
+        Only applied to 2-D grids where max(dim) >= 4 * min(dim).
+        """
+        if len(self.grid_block_ids) != 2:
+            return
+
+        specs = []
+        for bid in self.grid_block_ids:
+            try:
+                specs.append(self.block_sizes.block_id_lookup(bid))
+            except KeyError:
+                return
+        hints = [s.size_hint for s in specs]
+        if any(h <= 0 for h in hints):
+            return
+
+        min_hint = min(hints)
+        max_hint = max(hints)
+        if max_hint < min_hint * 4:
+            return  # Square-ish shape — leave the search space alone
+
+        # Cap the larger dim's tile so that at least 4 blocks cover min_hint,
+        # keeping total blocks comparable across both dims.
+        # e.g. M=1024, N=8192: cap N-tile at max(64, 1024//4) = 256
+        cap = max(64, next_power_of_2(min_hint) // 2)
+        for spec, hint in zip(specs, hints, strict=True):
+            if hint == max_hint:
+                spec.update_max(min(spec.max_size, cap))
+
     def create_config_generation(
         self,
         *,
