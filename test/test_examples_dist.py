@@ -84,6 +84,7 @@ class TestExamplesDist(TestCase, MultiProcessTestCase):
             world_size=self.world_size,
             rank=self.rank,
             store=store,
+            device_id=self.device,
         )
         torch.distributed.distributed_c10d._set_pg_timeout(
             timedelta(seconds=60), dist.group.WORLD
@@ -156,10 +157,8 @@ class TestExamplesDist(TestCase, MultiProcessTestCase):
 
         mod = import_path(EXAMPLES_DIR / "distributed" / "all_reduce.py")
 
-        selected_backend = _set_preferred_symm_mem_backend(self.device)
+        _set_preferred_symm_mem_backend(self.device)
         group = dist.group.WORLD
-        if selected_backend == "NVSHMEM":
-            symm_mem.enable_symm_mem_for_group(group.group_name)
 
         N = 16384
         dtype = torch.bfloat16
@@ -213,10 +212,8 @@ class TestExamplesDist(TestCase, MultiProcessTestCase):
 
         mod = import_path(EXAMPLES_DIR / "distributed" / "allreduce_bias_rmsnorm.py")
 
-        selected_backend = _set_preferred_symm_mem_backend(self.device)
+        _set_preferred_symm_mem_backend(self.device)
         group = dist.group.WORLD
-        if selected_backend == "NVSHMEM":
-            symm_mem.enable_symm_mem_for_group(group.group_name)
 
         N, D = 128, 4096
         dtype = torch.float32
@@ -270,10 +267,8 @@ class TestExamplesDist(TestCase, MultiProcessTestCase):
 
         mod = import_path(EXAMPLES_DIR / "distributed" / "matmul_reduce_scatter.py")
 
-        selected_backend = _set_preferred_symm_mem_backend(self.device)
+        _set_preferred_symm_mem_backend(self.device)
         group = dist.group.WORLD
-        if selected_backend == "NVSHMEM":
-            symm_mem.enable_symm_mem_for_group(group.group_name)
 
         M, N, K = 512, 768, 1024
         dtype = torch.float32
@@ -321,10 +316,8 @@ class TestExamplesDist(TestCase, MultiProcessTestCase):
 
         mod = import_path(EXAMPLES_DIR / "distributed" / "matmul_reduce_scatter.py")
 
-        selected_backend = _set_preferred_symm_mem_backend(self.device)
+        _set_preferred_symm_mem_backend(self.device)
         group = dist.group.WORLD
-        if selected_backend == "NVSHMEM":
-            symm_mem.enable_symm_mem_for_group(group.group_name)
 
         M, N, K = 512, 768, 1024
         dtype = torch.float32
