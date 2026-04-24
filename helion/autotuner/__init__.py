@@ -8,9 +8,6 @@ from .config_fragment import EnumFragment as EnumFragment
 from .config_fragment import IntegerFragment as IntegerFragment
 from .config_fragment import ListOf as ListOf
 from .config_fragment import PowerOfTwoFragment as PowerOfTwoFragment
-from .config_source import CachedConfigSource as CachedConfigSource
-from .config_source import ConfigSource as ConfigSource
-from .config_source import from_cache as from_cache
 from .config_spec import ConfigSpec as ConfigSpec
 from .de_surrogate_hybrid import DESurrogateHybrid as DESurrogateHybrid
 from .differential_evolution import (
@@ -23,7 +20,9 @@ from .effort_profile import PatternSearchConfig as PatternSearchConfig
 from .effort_profile import RandomSearchConfig as RandomSearchConfig
 from .external import UserConfigSpec as UserConfigSpec
 from .external import autotune as autotune
+from .finite_search import CachedFiniteSearch as CachedFiniteSearch
 from .finite_search import FiniteSearch as FiniteSearch
+from .finite_search import from_cache as from_cache
 from .llm_search import LLMGuidedSearch as LLMGuidedSearch
 from .llm_seeded_lfbo import LLMSeededLFBOTreeSearch as LLMSeededLFBOTreeSearch
 from .llm_seeded_lfbo import LLMSeededSearch as LLMSeededSearch

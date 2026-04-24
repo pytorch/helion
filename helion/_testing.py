@@ -917,7 +917,7 @@ def _bound_test_config(bound: BoundKernel, **kwargs: object) -> Config:
             # pyrefly: ignore [bad-argument-type]
             **kwargs
         )
-    elif len(bound.kernel.configs) == 1 and isinstance(bound.kernel.configs[0], Config):
+    elif len(bound.kernel.configs) == 1:
         config = bound.kernel.configs[0]
     else:
         config = bound.config_spec.default_config()

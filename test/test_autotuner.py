@@ -2641,10 +2641,10 @@ class TestConfigFilter(TestCase):
 
 
 class TestFiniteSearchWarmStart(TestCase):
-    """Tests for helion.from_cache() + FiniteSearch config-source resolution."""
+    """Tests for helion.from_cache() — a CachedFiniteSearch autotuner_fn."""
 
-    def _make_kernel_and_args(self, configs=None):
-        @helion.kernel(configs=configs, autotune_log_level=0)
+    def _make_kernel_and_args(self):
+        @helion.kernel(autotune_log_level=0)
         def add(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
             out = torch.empty_like(a)
             for tile in hl.tile(out.size()):
@@ -2659,7 +2659,7 @@ class TestFiniteSearchWarmStart(TestCase):
 
     @staticmethod
     def _fake_cache_random(count):
-        """Return a patched _find_similar_cached_configs serving `count` distinct flats generated via the search's own config_gen; backend-agnostic."""
+        """Patch _find_similar_cached_configs to return `count` distinct backend-agnostic flats."""
         from helion.autotuner.local_cache import SavedBestConfig
 
         def fake_find(search_self, max_configs):
@@ -2692,28 +2692,34 @@ class TestFiniteSearchWarmStart(TestCase):
         return fake_find
 
     def test_from_cache_factory(self):
-        """helion.from_cache() returns a CachedConfigSource with the requested max_configs."""
-        from helion.autotuner.config_source import CachedConfigSource
+        """helion.from_cache() returns a callable that creates a CachedFiniteSearch."""
 
-        s1 = helion.from_cache()
-        self.assertIsInstance(s1, CachedConfigSource)
-        self.assertIsNone(s1.max_configs)
-        s2 = helion.from_cache(max_configs=3)
-        self.assertEqual(s2.max_configs, 3)
+        add, args = self._make_kernel_and_args()
+        bound = add.bind(args)
+        fn = helion.from_cache()
+        self.assertTrue(callable(fn))
+        with (
+            patch.object(BaseSearch, "_find_similar_cached_configs", return_value=[]),
+            self.assertRaises(exc.NotEnoughConfigs),
+        ):
+            fn(bound, args)
 
-    def test_from_cache_empty_cache_with_one_inline_raises(self):
-        """[cfg1, from_cache()] with empty cache raises NotEnoughConfigs."""
-        cfg1 = helion.Config(block_sizes=[16])
+    def test_from_cache_empty_cache_raises(self):
+        """CachedFiniteSearch with empty cache and no explicit configs raises NotEnoughConfigs."""
+        from helion.autotuner.finite_search import CachedFiniteSearch
+
         add, args = self._make_kernel_and_args()
         bound = add.bind(args)
         with (
             patch.object(BaseSearch, "_find_similar_cached_configs", return_value=[]),
             self.assertRaises(exc.NotEnoughConfigs),
         ):
-            FiniteSearch(bound, args, configs=[cfg1, helion.from_cache()])
+            CachedFiniteSearch(bound, args)
 
-    def test_from_cache_appends_cached(self):
-        """Cached configs are spliced into the resolved list after inline configs."""
+    def test_from_cache_prepends_cached(self):
+        """Cached configs appear before explicit configs in CachedFiniteSearch.configs."""
+        from helion.autotuner.finite_search import CachedFiniteSearch
+
         cfg1 = helion.Config(block_sizes=[16])
         add, args = self._make_kernel_and_args()
         bound = add.bind(args)
@@ -2726,28 +2732,14 @@ class TestFiniteSearchWarmStart(TestCase):
             return result
 
         with patch.object(BaseSearch, "_find_similar_cached_configs", spy):
-            search = FiniteSearch(bound, args, configs=[cfg1, helion.from_cache()])
-        self.assertEqual(search.configs[0], cfg1)
-        self.assertEqual(len(search.configs), 1 + fake_sizes[0])
-
-    def test_from_cache_dedup_within_cache(self):
-        """Duplicate cached entries collapse to a single resolved Config."""
-        from helion.autotuner.config_source import ConfigSource
-
-        cfg1 = helion.Config(block_sizes=[16])
-        cached = helion.Config(block_sizes=[32])
-
-        class _DupSource(ConfigSource):
-            def resolve(self, search):
-                return [cached, cached]
-
-        add, args = self._make_kernel_and_args()
-        bound = add.bind(args)
-        search = FiniteSearch(bound, args, configs=[cfg1, _DupSource()])
-        self.assertEqual(len(search.configs), 2)
+            search = CachedFiniteSearch(bound, args, configs=[cfg1])
+        self.assertEqual(len(search.configs), fake_sizes[0] + 1)
+        self.assertEqual(search.configs[-1], cfg1)
 
     def test_from_cache_respects_max_parameter(self):
-        """helion.from_cache(max_configs=N) caps the number of cached configs added."""
+        """from_cache(max_configs=N) caps the number of cached configs."""
+        from helion.autotuner.finite_search import CachedFiniteSearch
+
         cfg1 = helion.Config(block_sizes=[16])
         add, args = self._make_kernel_and_args()
         bound = add.bind(args)
@@ -2762,15 +2754,15 @@ class TestFiniteSearchWarmStart(TestCase):
             return result
 
         with patch.object(BaseSearch, "_find_similar_cached_configs", spy):
-            search = FiniteSearch(
-                bound, args, configs=[cfg1, helion.from_cache(max_configs=2)]
-            )
+            search = CachedFiniteSearch(bound, args, configs=[cfg1], max_configs=2)
         self.assertEqual(observed_caps, [2])
         self.assertLessEqual(fake_sizes[0], 2)
-        self.assertEqual(len(search.configs), 1 + fake_sizes[0])
+        self.assertEqual(len(search.configs), fake_sizes[0] + 1)
 
     def test_from_cache_uses_default_cap_from_settings(self):
-        """Without max_configs, the cap falls back to the kernel settings' autotune_best_available_max_configs."""
+        """Without max_configs, the cap falls back to autotune_best_available_max_configs."""
+        from helion.autotuner.finite_search import CachedFiniteSearch
+
         cfg1 = helion.Config(block_sizes=[16])
         add, args = self._make_kernel_and_args()
         bound = add.bind(args)
@@ -2785,59 +2777,29 @@ class TestFiniteSearchWarmStart(TestCase):
             return result
 
         with patch.object(BaseSearch, "_find_similar_cached_configs", spy):
-            search = FiniteSearch(bound, args, configs=[cfg1, helion.from_cache()])
+            search = CachedFiniteSearch(bound, args, configs=[cfg1])
         cap_in_effect = search.settings.autotune_best_available_max_configs
         self.assertEqual(observed_caps, [cap_in_effect])
         self.assertLessEqual(fake_sizes[0], cap_in_effect)
-        self.assertEqual(len(search.configs), 1 + fake_sizes[0])
+        self.assertEqual(len(search.configs), fake_sizes[0] + 1)
 
-    def test_inline_duplicates_preserved(self):
-        """Inline Configs are kept as-given; duplicates in the inline list are not deduplicated.
+    def test_kernel_autotuner_fn_accepts_from_cache(self):
+        """@helion.kernel(autotuner_fn=helion.from_cache()) stores the callable in settings."""
+        fn = helion.from_cache()
 
-        Regression guard for RandomSearch, which passes random_population(count=N) directly
-        as inline configs and can legitimately produce duplicate samples on small spaces.
-        """
-        cfg1 = helion.Config(block_sizes=[16])
-        cfg2 = helion.Config(block_sizes=[32])
-        add, args = self._make_kernel_and_args()
-        bound = add.bind(args)
-        search = FiniteSearch(bound, args, configs=[cfg1, cfg1, cfg2])
-        self.assertEqual(len(search.configs), 3)
-        self.assertEqual(search.configs.count(cfg1), 2)
-
-    def test_source_marker_alone_resolves(self):
-        """A single ConfigSource marker produces a resolved list equal to the source's output."""
-        from helion.autotuner.config_source import ConfigSource
-
-        cfg_a = helion.Config(block_sizes=[32])
-        cfg_b = helion.Config(block_sizes=[64])
-
-        class _StaticSource(ConfigSource):
-            def resolve(self, search):
-                return [cfg_a, cfg_b]
-
-        add, args = self._make_kernel_and_args()
-        bound = add.bind(args)
-        search = FiniteSearch(bound, args, configs=[_StaticSource()])
-        self.assertEqual(len(search.configs), 2)
-        self.assertCountEqual(search.configs, [cfg_a, cfg_b])
-
-    def test_kernel_decorator_accepts_from_cache(self):
-        """@helion.kernel(configs=[..., helion.from_cache()]) stores the source on kernel.configs."""
-        from helion.autotuner.config_source import CachedConfigSource
-
-        cfg1 = helion.Config(block_sizes=[16])
-        cfg2 = helion.Config(block_sizes=[32])
-
-        @helion.kernel(configs=[cfg1, cfg2, helion.from_cache(max_configs=3)])
+        @helion.kernel(autotuner_fn=fn, autotune_log_level=0)
         def add(a, b):
             out = torch.empty_like(a)
             for tile in hl.tile(out.size()):
                 out[tile] = a[tile] + b[tile]
             return out
 
-        self.assertEqual(len(add.configs), 3)
-        self.assertIsInstance(add.configs[-1], CachedConfigSource)
+        args = (
+            torch.randn([128], device=DEVICE),
+            torch.randn([128], device=DEVICE),
+        )
+        bound = add.bind(args)
+        self.assertIs(bound.settings.autotuner_fn, fn)
 
 
 if __name__ == "__main__":

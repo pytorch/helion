@@ -51,7 +51,6 @@ if TYPE_CHECKING:
     from . import ConfigSpec
     from .config_generation import ConfigGeneration
     from .config_generation import FlatConfig
-    from .config_source import ConfigSource
     from .local_cache import SavedBestConfig
     from helion.autotuner.effort_profile import AutotuneEffortProfile
 
@@ -72,7 +71,7 @@ class _AutotunableKernel(Protocol):
     def env(self) -> _HasDeviceAndProcessGroupName: ...
 
     @property
-    def configs(self) -> Sequence[Config | ConfigSource]: ...
+    def configs(self) -> Sequence[Config]: ...
 
     def compile_config(
         self,
@@ -182,9 +181,6 @@ class BaseSearch(BaseAutotuner):
         args: The arguments to be passed to the kernel.
         counters: A counter to track various metrics during the search.
     """
-
-    if TYPE_CHECKING:
-        config_gen: ConfigGeneration
 
     def __init__(
         self,
@@ -449,12 +445,7 @@ class BaseSearch(BaseAutotuner):
     def _get_current_hardware_and_specialization(
         self,
     ) -> tuple[str | None, str | None]:
-        """
-        Get the current hardware and specialization_key for matching cached configs.
-
-        Returns:
-            A tuple of (hardware, specialization_key) strings.
-        """
+        """Return (hardware, specialization_key) for matching cached configs."""
         hardware = get_device_name(extract_device(self.args))
 
         inner_kernel = getattr(self.kernel, "kernel", None)
@@ -468,20 +459,7 @@ class BaseSearch(BaseAutotuner):
         return hardware, specialization_key
 
     def _find_similar_cached_configs(self, max_configs: int) -> list[SavedBestConfig]:
-        """
-        Find cached configs that match hardware, specialization_key, and
-        structural fingerprint (config_spec_hash).
-
-        Returns an empty list when cache is skipped (via HELION_SKIP_CACHE
-        or the skip_cache parameter), so that "skip cache" consistently
-        means no cache reads of any kind.
-
-        Args:
-            max_configs: Maximum number of configs to return.
-
-        Returns:
-            List of matching SavedBestConfig objects, sorted by file modification time (most recent first).
-        """
+        """Return cached configs matching hardware, specialization_key, and config_spec_hash; empty if cache is skipped."""
         from .base_cache import should_skip_cache
 
         if self._skip_cache or should_skip_cache():

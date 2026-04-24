@@ -1,15 +1,17 @@
 from __future__ import annotations
 
+import contextlib
 from typing import TYPE_CHECKING
 
 from .. import exc
 from .base_search import BaseSearch
-from .config_source import ConfigSource
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from collections.abc import Sequence
 
     from ..runtime.config import Config
+    from ..runtime.kernel import BoundKernel
     from .base_search import _AutotunableKernel
     from .config_generation import ConfigGeneration
 
@@ -24,7 +26,7 @@ class FiniteSearch(BaseSearch):
         self,
         kernel: _AutotunableKernel,
         args: Sequence[object],
-        configs: Sequence[Config | ConfigSource] | None = None,
+        configs: Sequence[Config] | None = None,
     ) -> None:
         super().__init__(kernel, args)
         self.config_gen: ConfigGeneration = self.config_spec.create_config_generation(
@@ -32,27 +34,10 @@ class FiniteSearch(BaseSearch):
             advanced_controls_files=self.settings.autotune_search_acf or None,
             process_group_name=kernel.env.process_group_name,
         )
-        raw: list[Config | ConfigSource] = [*(configs or ())]
-        if len(raw) == 0 and self.kernel.configs:
-            raw = [*self.kernel.configs]
-        self.configs: list[Config] = self._resolve_sources(raw)
+        raw: list[Config] = list(configs if configs is not None else kernel.configs)
+        self.configs: list[Config] = raw
         if len(self.configs) < 2:
             raise exc.NotEnoughConfigs(len(self.configs))
-
-    def _resolve_sources(self, items: list[Config | ConfigSource]) -> list[Config]:
-        """Return a list of Configs in order; inline items are kept as-given, source-produced Configs are deduplicated against the running set."""
-        result: list[Config] = []
-        seen: set[Config] = set()
-        for item in items:
-            if isinstance(item, ConfigSource):
-                for cfg in item.resolve(self):
-                    if cfg not in seen:
-                        seen.add(cfg)
-                        result.append(cfg)
-            else:
-                seen.add(item)
-                result.append(item)
-        return result
 
     def _autotune(self) -> Config:
         best_config = None
@@ -63,3 +48,60 @@ class FiniteSearch(BaseSearch):
                 best_config = result.config
         assert best_config is not None
         return best_config
+
+
+class CachedFiniteSearch(FiniteSearch):
+    """FiniteSearch seeded with previously-cached best_configs prepended to the explicit config list."""
+
+    def __init__(
+        self,
+        kernel: _AutotunableKernel,
+        args: Sequence[object],
+        *,
+        configs: Sequence[Config] | None = None,
+        max_configs: int | None = None,
+    ) -> None:
+        BaseSearch.__init__(self, kernel, args)
+        self.config_gen: ConfigGeneration = self.config_spec.create_config_generation(
+            overrides=self.settings.autotune_config_overrides or None,
+            advanced_controls_files=self.settings.autotune_search_acf or None,
+            process_group_name=kernel.env.process_group_name,
+        )
+        self.settings.autotune_precompile = None
+        cap = (
+            max_configs
+            if max_configs is not None
+            else self.settings.autotune_best_available_max_configs
+        )
+        cached: list[Config] = []
+        for entry in self._find_similar_cached_configs(cap):
+            with contextlib.suppress(
+                ValueError,
+                TypeError,
+                KeyError,
+                AssertionError,
+                exc.InvalidConfig,
+            ):
+                cached.append(self.config_gen.unflatten(entry.to_mutable_flat_config()))
+        self.log(f"from_cache: resolved {len(cached)} cached config(s) (cap={cap})")
+        explicit: list[Config] = list(
+            configs if configs is not None else kernel.configs
+        )
+        self.configs: list[Config] = [*cached, *explicit]
+        if len(self.configs) < 2:
+            raise exc.NotEnoughConfigs(len(self.configs))
+
+
+def from_cache(
+    *, max_configs: int | None = None, configs: Sequence[Config] | None = None
+) -> Callable[..., CachedFiniteSearch]:
+    """Return an autotuner_fn that seeds FiniteSearch with previously-cached best_configs."""
+
+    def _fn(
+        bound_kernel: BoundKernel, args: Sequence[object], **kwargs: object
+    ) -> CachedFiniteSearch:
+        return CachedFiniteSearch(
+            bound_kernel, args, configs=configs, max_configs=max_configs
+        )
+
+    return _fn
