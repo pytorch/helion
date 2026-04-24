@@ -6,6 +6,7 @@ import os
 from typing import ClassVar
 from unittest.mock import patch
 
+import pytest
 import torch
 import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm_mem
@@ -26,6 +27,7 @@ from helion._testing import skipIfXPU
 
 @onlyBackends(["triton"])
 @instantiate_parametrized_tests
+@pytest.mark.timeout(180)
 class TestExamplesDist(TestCase, MultiProcessTestCase):
     _nvshmem_env: ClassVar[dict[str, str]] = {
         # Configure NVSHMEM to use smaller heap and work without NVSwitch
@@ -73,6 +75,7 @@ class TestExamplesDist(TestCase, MultiProcessTestCase):
             world_size=self.world_size,
             rank=self.rank,
             store=store,
+            device_id=self.device,
         )
         torch.distributed.distributed_c10d._set_pg_timeout(
             timedelta(seconds=60), dist.group.WORLD
@@ -150,7 +153,6 @@ class TestExamplesDist(TestCase, MultiProcessTestCase):
         # Only NVSHMEM backend implements `get_remote_tensor` for now.
         symm_mem.set_backend("NVSHMEM")
         group = dist.group.WORLD
-        symm_mem.enable_symm_mem_for_group(group.group_name)
 
         N = 16384
         dtype = torch.bfloat16
@@ -203,7 +205,6 @@ class TestExamplesDist(TestCase, MultiProcessTestCase):
         # Only NVSHMEM backend implements `get_remote_tensor` for now.
         symm_mem.set_backend("NVSHMEM")
         group = dist.group.WORLD
-        symm_mem.enable_symm_mem_for_group(group.group_name)
 
         N, D = 128, 4096
         dtype = torch.float32
@@ -254,7 +255,6 @@ class TestExamplesDist(TestCase, MultiProcessTestCase):
         # Only NVSHMEM backend implements `get_remote_tensor` for now.
         symm_mem.set_backend("NVSHMEM")
         group = dist.group.WORLD
-        symm_mem.enable_symm_mem_for_group(group.group_name)
 
         M, N, K = 512, 768, 1024
         dtype = torch.float32
@@ -307,7 +307,6 @@ class TestExamplesDist(TestCase, MultiProcessTestCase):
         # Only NVSHMEM backend implements `get_remote_tensor` for now.
         symm_mem.set_backend("NVSHMEM")
         group = dist.group.WORLD
-        symm_mem.enable_symm_mem_for_group(group.group_name)
 
         M, N, K = 512, 768, 1024
         dtype = torch.float32
