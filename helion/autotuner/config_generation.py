@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import copy
 import functools
 import itertools
@@ -9,6 +10,8 @@ from typing import TYPE_CHECKING
 from typing import cast
 
 from .._compat import warps_to_threads
+from ..exc import InvalidConfig
+from .block_id_sequence import BlockIdSequence
 from .config_fragment import Category
 from .config_fragment import ConfigSpecFragment
 from .config_fragment import PowerOfTwoFragment
@@ -118,14 +121,18 @@ class ConfigGeneration:
     def flatten(self, config: Config) -> FlatConfig:
         """Inverse of unflatten: convert a Config to a FlatConfig."""
         result = self.default_flat()
+        flat_fields = self.config_spec._flat_fields()
         for key, (indices, is_sequence) in self._key_to_flat_indices.items():
             if key not in config.config:
                 continue
             value = config.config[key]
             if is_sequence:
                 assert isinstance(value, list)
-                for idx, v in zip(indices, value, strict=True):
-                    result[idx] = v
+                field = flat_fields[key]
+                assert isinstance(field, BlockIdSequence)
+                encoded_values = field._encode_flat_values(self.config_spec, value)
+                for idx, encoded_value in zip(indices, encoded_values, strict=True):
+                    result[idx] = encoded_value
             else:
                 assert len(indices) == 1
                 result[indices[0]] = value
@@ -236,13 +243,36 @@ class ConfigGeneration:
             return config
 
     def random_config(self) -> Config:
-        return self.unflatten(self.random_flat())
+        errors: dict[str, int] = {}
+        for _ in range(64):
+            try:
+                return self.unflatten(self.random_flat())
+            except InvalidConfig as e:
+                msg = str(e)
+                errors[msg] = errors.get(msg, 0) + 1
+                continue
+        summary = "; ".join(f"{msg} (x{n})" for msg, n in errors.items())
+        raise InvalidConfig(
+            f"failed to generate a valid random config after 64 attempts: {summary}"
+        )
 
     def random_population_flat(self, n: int) -> list[FlatConfig]:
         return [self.default_flat(), *[self.random_flat() for _ in range(n - 1)]]
 
     def random_population(self, n: int) -> list[Config]:
-        return [*map(self.unflatten, self.random_population_flat(n))]
+        result: list[Config] = []
+        attempts = 0
+        for flat in self.random_population_flat(n):
+            try:
+                result.append(self.unflatten(flat))
+            except InvalidConfig:
+                attempts += 1
+        # Retry to fill the population to the requested size
+        while len(result) < n and attempts < 64:
+            with contextlib.suppress(InvalidConfig):
+                result.append(self.unflatten(self.random_flat()))
+            attempts += 1
+        return result
 
     def differential_mutation(
         self,

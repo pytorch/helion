@@ -184,6 +184,14 @@ class Backend(abc.ABC):
     def supports_block_ptr_indexing(self) -> bool:
         return True
 
+    def process_fake_tensor_load(
+        self,
+        tensor: torch.Tensor,
+        index: list[object],
+    ) -> None:
+        """Called during `type_propagation` when processing a `load` memory op on fake tensors"""
+        return
+
     def adjust_block_size_constraints(
         self,
         block_specs: list[object],
@@ -306,6 +314,16 @@ class Backend(abc.ABC):
         that need exact sizes can override to return the expression unchanged.
         """
         return self.next_power_of_2_host_expr(expr)
+
+    def lane_index_expr(
+        self, offset_var: str, elements_per_thread: int, *, axis: int
+    ) -> str:
+        """Thread index expression with elements-per-thread stride for lane loops."""
+        raise exc.BackendUnsupported(self.name, "lane index")
+
+    def lane_offset_expr(self, lane_var: str) -> str:
+        """Cast a lane variable for addition to an index expression."""
+        raise exc.BackendUnsupported(self.name, "lane offset")
 
     def reduction_combine_expr(
         self,
@@ -1217,6 +1235,17 @@ class PallasBackend(Backend):
             return 8
         return 1  # No requirements for other dimensions
 
+    fake_tensor_loads: list[tuple[torch.Tensor, list[object]]]
+
+    def process_fake_tensor_load(
+        self,
+        tensor: torch.Tensor,
+        index: list[object],
+    ) -> None:
+        if not hasattr(self, "fake_tensor_loads"):
+            self.fake_tensor_loads = []
+        self.fake_tensor_loads.append((tensor, index))
+
     def adjust_block_size_constraints(
         self,
         block_specs: list[object],
@@ -1239,7 +1268,10 @@ class PallasBackend(Backend):
         ``min(block_size, tensor_dim)`` which equals the full array
         dimension -- always valid per TPU rules.
         """
+        from ..autotuner.config_spec import BlockSizeSpec
         from .ast_extension import ExtendedAST
+        from .compile_environment import BlockSizeInfo
+        from helion._compiler.compile_environment import _to_sympy
         from helion._compiler.host_function import HostFunction
         from helion._compiler.type_propagation import SequenceType
         from helion._compiler.type_propagation import TensorType
@@ -1252,6 +1284,7 @@ class PallasBackend(Backend):
                 super().__init__()
                 self.backend = backend
                 self.required_alignments: dict[int, int] = {}
+                self.update_requirements_from_fake_tensor_loads()
 
             def visit_Subscript(self, node: ast.Subscript) -> None:
                 assert isinstance(node, ExtendedAST)
@@ -1311,14 +1344,37 @@ class PallasBackend(Backend):
                         self.required_alignments[bid], required_alignment
                     )
 
+            def update_requirements_from_fake_tensor_loads(self) -> None:
+                # When tensors are indexed within external lambdas called by the kernel,
+                # they generate fake loads, which we don't pickup during AST walk.
+                if not hasattr(self.backend, "fake_tensor_loads"):
+                    return
+                if block_sizes is None:
+                    return
+                for info in block_sizes:
+                    if not isinstance(info, BlockSizeInfo):
+                        continue
+                    for tensor, subscripts in self.backend.fake_tensor_loads:
+                        for dim, subscript in enumerate(subscripts):
+                            if isinstance(subscript, torch.SymInt) and info.dim_matches(
+                                _to_sympy(subscript)
+                            ):
+                                dim_from_end = tensor.ndim - 1 - dim
+                                bitwidth = tensor.dtype.itemsize * 8
+                                required_alignment = (
+                                    self.backend._get_pallas_required_alignment(
+                                        dim_from_end, tensor.ndim, bitwidth
+                                    )
+                                )
+                                self.maybe_update_required_alignment(
+                                    info.block_id, required_alignment
+                                )
+
         analyzer = TensorTiledAccessAnalyzer(self)
         for stmt in host_func.body:
             analyzer.visit(stmt)
 
         from torch._inductor.runtime.runtime_utils import next_power_of_2
-
-        from ..autotuner.config_spec import BlockSizeSpec
-        from .compile_environment import BlockSizeInfo
 
         if block_sizes is not None and kernel_tensor_sizes is not None:
             for shape in kernel_tensor_sizes:
@@ -1515,10 +1571,12 @@ class PallasBackend(Backend):
         # Determine which arg positions are outputs.  A tensor is an output if:
         #   1. It was created inside the function body (not in input_sources), OR
         #   2. It is a function parameter that is mutated in-place (e.g. x[tile] += ...)
-        from .ast_read_writes import ReadWrites
         from .compile_environment import CompileEnvironment
+        from .device_function import DeviceFunction
         from .device_function import TensorArg
         from .host_function import HostFunction
+
+        device_fn = DeviceFunction.current()
 
         def _empty_allocated_vars(body: list[ast.stmt]) -> set[str]:
             """Return names of variables allocated with torch.empty/empty_like/new_empty.
@@ -1549,38 +1607,22 @@ class PallasBackend(Backend):
         if sorted_args is not None:
             env = CompileEnvironment.current()
             host_fn = HostFunction.current()
-            mutated_params = set(ReadWrites.from_list(host_fn.body).inplace_writes) & {
-                a.arg for a in host_fn.args.args
-            }
+            read_names, write_names = device_fn.get_tensor_read_write_names()
+            mutated_params = write_names & {a.arg for a in host_fn.args.args}
             input_storages = {id(t.untyped_storage()) for t in env.input_sources}
-            # Collect reads from for-loop bodies only (kernel code), excluding
-            # host-level reads like ``return out``.
-            # Note: Python AST counts ``out[tile] = val`` as a Load of ``out``
-            # (the object must be loaded to index into it), but from Pallas's
-            # perspective this is a pure write — the tensor data is not read.
-            # Subtract such "false reads" by checking inplace_writes counts.
-            #
             # Only tensors allocated with torch.empty/empty_like/new_empty can be
             # output-only — their initial values are undefined, so it's safe
             # to use HBM BlockSpecs.  Tensors allocated with torch.zeros_like,
             # torch.full, etc. have meaningful initial values that must be
             # preserved via VMEM BlockSpecs.
             empty_vars = _empty_allocated_vars(host_fn.body)
-            kernel_reads: set[str] = set()
-            for stmt in host_fn.body:
-                if isinstance(stmt, ast.For):
-                    body_rw = ReadWrites.from_list(stmt.body)
-                    for name, read_count in body_rw.reads.items():
-                        iw_count = body_rw.inplace_writes.get(name, 0)
-                        if read_count > iw_count or name not in empty_vars:
-                            kernel_reads.add(name)
             for i, arg in enumerate(sorted_args):
                 if not isinstance(arg, TensorArg):
                     continue
                 if id(arg.fake_value.untyped_storage()) not in input_storages:
                     # Tensor created inside the function body (output)
                     output_indices.append(i)
-                    if arg.host_str() in kernel_reads:
+                    if arg.host_str() in read_names or arg.host_str() not in empty_vars:
                         # Also read by the kernel (e.g. broadcast result)
                         inplace_indices.append(i)
                 elif arg.host_str() in mutated_params:
@@ -1612,17 +1654,18 @@ class PallasBackend(Backend):
                 block_spec_info.append(None)  # RNG seed buffer is untiled
             launcher_args.append(f"_block_spec_info={block_spec_info!r}")
 
-        from .device_function import DeviceFunction
+        from .device_function import PallasMemorySpace
 
-        device_fn = DeviceFunction.current()
-        smem_ids = device_fn.pallas_smem_tensor_ids
-        if smem_ids and sorted_args is not None:
+        mem_space = device_fn.pallas_memory_space
+        if sorted_args is not None:
             smem_arg_indices = [
                 i
                 for i, arg in enumerate(sorted_args)
-                if isinstance(arg, TensorArg) and id(arg.fake_value) in smem_ids
+                if isinstance(arg, TensorArg)
+                and mem_space.get(id(arg.fake_value)) == PallasMemorySpace.SMEM
             ]
-            launcher_args.append(f"_smem_arg_indices={smem_arg_indices!r}")
+            if smem_arg_indices:
+                launcher_args.append(f"_smem_arg_indices={smem_arg_indices!r}")
 
         # Pass scratch shapes for pipeline/fori_loop launcher
         pallas_loop_type = config.get("pallas_loop_type", "default")
@@ -1642,20 +1685,30 @@ class PallasBackend(Backend):
             # tensors (need HBM refs); all others get proper BlockSpecs.
             from .device_function import TensorArg
 
-            pipeline_ids = device_fn.pallas_pipeline_tensor_ids
-            if pipeline_ids and sorted_args is not None:
+            if sorted_args is not None:
                 pipeline_arg_indices = [
                     i
                     for i, arg in enumerate(sorted_args)
-                    if isinstance(arg, TensorArg) and id(arg.fake_value) in pipeline_ids
+                    if isinstance(arg, TensorArg)
+                    and mem_space.get(id(arg.fake_value)) == PallasMemorySpace.HBM
                 ]
-                launcher_args.append(f"_pipeline_arg_indices={pipeline_arg_indices!r}")
+                if pipeline_arg_indices:
+                    launcher_args.append(
+                        f"_pipeline_arg_indices={pipeline_arg_indices!r}"
+                    )
 
         return launcher_args
 
     def build_launcher_name(self, config: Config) -> str:
         """Return the launcher name to use based on ``pallas_loop_type``."""
+        from ..autotuner.config_spec import VALID_PALLAS_LOOP_TYPES
+
         pallas_loop_type = config.get("pallas_loop_type", "default")
+        if pallas_loop_type not in VALID_PALLAS_LOOP_TYPES:
+            raise ValueError(
+                f"Invalid pallas_loop_type {pallas_loop_type!r}. "
+                f"Expected one of {VALID_PALLAS_LOOP_TYPES}."
+            )
         if pallas_loop_type == "emit_pipeline":
             return "_default_pallas_pipeline_launcher"
         if pallas_loop_type == "fori_loop":
@@ -1665,13 +1718,13 @@ class PallasBackend(Backend):
     def get_launcher_name(self) -> str:
         """Return the launcher name based on the current config."""
         from .device_function import DeviceFunction
+        from .device_function import NoCurrentFunction
 
         try:
             device_fn = DeviceFunction.current()
-            config = device_fn.config
-            return self.build_launcher_name(config)
-        except Exception:
+        except NoCurrentFunction:
             return self.default_launcher_name
+        return self.build_launcher_name(device_fn.config)
 
     def pre_codegen(
         self,
@@ -2258,6 +2311,14 @@ class CuteBackend(Backend):
     def grid_barrier_stmt(self, sem_arg: str) -> str | None:
         del sem_arg
         raise exc.BackendUnsupported(self.name, "hl.barrier()")
+
+    def lane_index_expr(
+        self, offset_var: str, elements_per_thread: int, *, axis: int
+    ) -> str:
+        return f"{offset_var} + cutlass.Int32(cute.arch.thread_idx()[{axis}]) * {elements_per_thread}"
+
+    def lane_offset_expr(self, lane_var: str) -> str:
+        return f"cutlass.Int32({lane_var})"
 
     def sympy_printer_expr(self, expr: sympy.Expr) -> str:
         from .device_function import cute_texpr

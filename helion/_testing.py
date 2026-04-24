@@ -46,6 +46,8 @@ else:
     from .autotuner.benchmarking import do_bench as do_bench
     from .autotuner.benchmarking import interleaved_bench
 
+import typing
+
 from .runtime.config import Config
 from .runtime.ref_mode import is_ref_mode_enabled
 from .runtime.settings import RefMode
@@ -1026,6 +1028,7 @@ def run_example(
     bwd: bool = False,
     trace_path: str | None = None,
     process_group_name: str | None = None,
+    interleaved: bool = True,
 ) -> dict[str, float]:
     """Run complete example: correctness check + benchmark.
 
@@ -1183,8 +1186,17 @@ def run_example(
         profile_context = torch.profiler.profile()
 
     with profile_context:
-        # pyrefly: ignore[bad-argument-type]
-        timings = interleaved_bench(bench_fns, repeat=repeat, desc="Benchmarking")
+        if interleaved:
+            # pyrefly: ignore[bad-argument-type]
+            timings = interleaved_bench(bench_fns, repeat=repeat, desc="Benchmarking")
+        else:
+            timings = typing.cast(
+                "list[float]",
+                [
+                    do_bench(bench_fn, process_group_name=process_group_name)
+                    for bench_fn in bench_fns
+                ],
+            )
 
     if trace_path is not None and is_master_rank():
         print(f"Write profile to {trace_path}")

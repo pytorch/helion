@@ -347,13 +347,15 @@ class TestExamples(RefEagerTestBase, TestCase):
 
         # Convert to FP8 format
         x_fp8 = x.to(torch.float8_e4m3fn)
-        y_fp8 = y.to(torch.float8_e4m3fn)
+        y_fp8 = y.to(torch.float8_e4m3fn).T.contiguous().T
 
         args = (x_fp8, y_fp8)
 
         # Import the reference implementation
         mod = import_path(EXAMPLES_DIR / "fp8_gemm.py")
-        expected = mod.reference_fp8_gemm_pytorch(x_fp8, y_fp8)
+        scale_a = torch.tensor(1.0, device=DEVICE)
+        scale_b = torch.tensor(1.0, device=DEVICE)
+        expected = mod.reference_fp8_gemm_pytorch(x_fp8, y_fp8, scale_a, scale_b)
 
         check_example(
             "fp8_gemm",
@@ -883,7 +885,7 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
 
     @xfailIfCute("CuTe jagged dense bmm example still returns incorrect results")
-    @xfailIfPallas("tensor-derived if-predicates not supported")
+    @xfailIfPallas("Pallas rejects int64 inputs (jagged offsets)")
     @skipIfXPU("Jagged tensor operations not fully supported on XPU")
     @skipIfRefEager("hl.jagged_tile does not support ref mode yet")
     def test_jagged_dense_bmm(self):
@@ -2234,7 +2236,7 @@ class TestExamples(RefEagerTestBase, TestCase):
         lambda: _get_backend() == "cute",
         "CuTe Mamba2 chunk-state destabilizes later cute tests when it fails in-process",
     )
-    @xfailIfPallas("BlockSpec tiling failure")
+    @xfailIfPallas("SMEM load lowering: Can only load scalars from SMEM")
     def test_mamba2_chunk_state(self):
         batch, nheads, ngroups, seqlen, chunk_size, headdim, dstate = (
             2,

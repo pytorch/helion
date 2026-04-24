@@ -3,6 +3,7 @@ from __future__ import annotations
 import unittest
 
 import torch
+from torch.testing._internal.common_device_type import largeTensorTest
 
 import helion
 from helion import exc
@@ -12,6 +13,7 @@ from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
 from helion._testing import skipIfRefEager
+from helion._testing import skipIfRocm
 import helion.language as hl
 
 
@@ -414,6 +416,73 @@ def kernel_list_comprehension_host_and_device(
 
         result[tile_idx] = acc
     return result
+
+
+@helion.kernel(autotune_effort="none")
+def kernel_list_register_cache_layernorm(
+    input_list: list[torch.Tensor],
+    ln_eps: float = 1e-5,
+) -> torch.Tensor:
+    """Two-pass layernorm over concatenated list elements using register cache."""
+    G = len(input_list)
+    M, D = input_list[0].shape
+    FULL_D = G * D
+    FULL_D = hl.specialize(FULL_D)
+    D = hl.specialize(D)
+    output = torch.empty(
+        [M, FULL_D], dtype=input_list[0].dtype, device=input_list[0].device
+    )
+    d_block = hl.register_block_size(helion.next_power_of_2(D))
+    for tile_m, tile_d in hl.tile([M, D], block_size=[None, d_block]):
+        row_sum = hl.zeros([tile_m], dtype=torch.float32)
+        row_sq_sum = hl.zeros([tile_m], dtype=torch.float32)
+        cached = [hl.zeros([tile_m, tile_d], dtype=input_list[0].dtype)] * G
+        for i in hl.static_range(G):
+            val = input_list[i][tile_m, tile_d]
+            cached[i] = val
+            val_f32 = val.to(torch.float32)
+            row_sum = row_sum + torch.sum(val_f32, dim=-1)
+            row_sq_sum = row_sq_sum + torch.sum(val_f32 * val_f32, dim=-1)
+        mean = row_sum / FULL_D
+        var = (row_sq_sum / FULL_D) - (mean * mean)
+        rstd = 1.0 / torch.sqrt(var + ln_eps)
+        for i in hl.static_range(G):
+            normalized = (cached[i].to(torch.float32) - mean[:, None]) * rstd[:, None]
+            output[tile_m, tile_d + i * D] = normalized.to(output.dtype)
+    return output
+
+
+@helion.kernel(autotune_effort="none")
+def kernel_list_no_cache_layernorm(
+    input_list: list[torch.Tensor],
+    ln_eps: float = 1e-5,
+) -> torch.Tensor:
+    """Two-pass layernorm without register cache (re-gathers in pass 2)."""
+    G = len(input_list)
+    M, D = input_list[0].shape
+    FULL_D = G * D
+    FULL_D = hl.specialize(FULL_D)
+    D = hl.specialize(D)
+    output = torch.empty(
+        [M, FULL_D], dtype=input_list[0].dtype, device=input_list[0].device
+    )
+    d_block = hl.register_block_size(helion.next_power_of_2(D))
+    for tile_m, tile_d in hl.tile([M, D], block_size=[None, d_block]):
+        row_sum = hl.zeros([tile_m], dtype=torch.float32)
+        row_sq_sum = hl.zeros([tile_m], dtype=torch.float32)
+        for i in hl.static_range(G):
+            val = input_list[i][tile_m, tile_d]
+            val_f32 = val.to(torch.float32)
+            row_sum = row_sum + torch.sum(val_f32, dim=-1)
+            row_sq_sum = row_sq_sum + torch.sum(val_f32 * val_f32, dim=-1)
+        mean = row_sum / FULL_D
+        var = (row_sq_sum / FULL_D) - (mean * mean)
+        rstd = 1.0 / torch.sqrt(var + ln_eps)
+        for i in hl.static_range(G):
+            val = input_list[i][tile_m, tile_d]
+            normalized = (val.to(torch.float32) - mean[:, None]) * rstd[:, None]
+            output[tile_m, tile_d + i * D] = normalized.to(output.dtype)
+    return output
 
 
 @onlyBackends(["triton"])
@@ -854,6 +923,88 @@ class TestUnrollTuples(RefEagerTestBase, TestCase):
         # = x * (2 + 4 + 6 + 4 + 8 + 12 + 6 + 12 + 18 + 8 + 16 + 24) = x * 120
         expected = x * 120
         torch.testing.assert_close(result, expected)
+
+    @largeTensorTest("8GB", device=DEVICE)
+    @skipIfRefEager("RuntimeError in ref eager mode")
+    def test_list_register_cache_layernorm(self):
+        """Test two-pass layernorm with register-cached list elements."""
+        M, D, G = 1024 * 1024, 32, 8
+        tensors = [
+            torch.randn(M, D, device=DEVICE, dtype=torch.bfloat16) for _ in range(G)
+        ]
+
+        code, result = code_and_output(kernel_list_register_cache_layernorm, (tensors,))
+
+        # Reference: concat then layernorm (no affine)
+        concatenated = torch.cat(tensors, dim=1).float()
+        mean = concatenated.mean(dim=-1)
+        var = ((concatenated - mean[:, None]) ** 2).mean(dim=-1)
+        rstd = 1.0 / torch.sqrt(var + 1e-5)
+        expected = ((concatenated - mean[:, None]) * rstd[:, None]).to(tensors[0].dtype)
+
+        torch.testing.assert_close(result, expected, atol=5 * 1e-2, rtol=5 * 1e-2)
+
+        # Verify register caching: G loads in pass 1, no re-loads in pass 2
+        triton_kernel = code[: code.index("\ndef kernel_list_register_cache")]
+        load_count = triton_kernel.count("tl.load")
+        assert load_count == G, f"Expected {G} loads, got {load_count}"
+
+    @largeTensorTest("8GB", device=DEVICE)
+    @skipIfRefEager("RuntimeError in ref eager mode")
+    def test_list_no_cache_layernorm(self):
+        """Test two-pass layernorm without register cache (re-gathers in pass 2)."""
+        M, D, G = 1024 * 1024, 32, 8
+        tensors = [
+            torch.randn(M, D, device=DEVICE, dtype=torch.bfloat16) for _ in range(G)
+        ]
+
+        code, result = code_and_output(kernel_list_no_cache_layernorm, (tensors,))
+
+        # Reference: concat then layernorm (no affine)
+        concatenated = torch.cat(tensors, dim=1).float()
+        mean = concatenated.mean(dim=-1)
+        var = ((concatenated - mean[:, None]) ** 2).mean(dim=-1)
+        rstd = 1.0 / torch.sqrt(var + 1e-5)
+        expected = ((concatenated - mean[:, None]) * rstd[:, None]).to(tensors[0].dtype)
+
+        torch.testing.assert_close(result, expected, atol=5 * 1e-2, rtol=5 * 1e-2)
+
+        # No cache: G loads in pass 1 + G loads in pass 2
+        triton_kernel = code[: code.index("\ndef kernel_list_no_cache")]
+        load_count = triton_kernel.count("tl.load")
+        assert load_count == 2 * G, f"Expected {2 * G} loads, got {load_count}"
+
+    @largeTensorTest("12GB", device=DEVICE)
+    @skipIfRefEager("Benchmark not applicable in ref eager mode")
+    @skipIfRocm("Benchmark timing unreliable on ROCm")
+    def test_register_cache_faster_than_no_cache(self):
+        """Verify register-cached layernorm is faster than re-gathering."""
+        from triton.testing import do_bench
+
+        M, D, G = 1024 * 1024, 32, 8
+        tensors = [
+            torch.randn(M, D, device=DEVICE, dtype=torch.bfloat16) for _ in range(G)
+        ]
+
+        # Warmup and correctness check
+        cached_result = kernel_list_register_cache_layernorm(tensors)
+        no_cache_result = kernel_list_no_cache_layernorm(tensors)
+        torch.testing.assert_close(
+            cached_result, no_cache_result, atol=5 * 1e-2, rtol=5 * 1e-2
+        )
+
+        ms_cached = do_bench(lambda: kernel_list_register_cache_layernorm(tensors))
+        ms_no_cache = do_bench(lambda: kernel_list_no_cache_layernorm(tensors))
+
+        speedup = ms_no_cache / ms_cached
+        print(
+            f"\nRegister cache: {ms_cached:.3f} ms, "
+            f"No cache: {ms_no_cache:.3f} ms, "
+            f"Speedup: {speedup:.2f}x"
+        )
+        assert speedup > 1.0, (
+            f"Expected register cache to be faster, got speedup={speedup:.2f}x"
+        )
 
 
 if __name__ == "__main__":

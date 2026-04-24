@@ -547,6 +547,7 @@ class PopulationBasedSearch(BaseSearch):
         super().__init__(kernel, args)
         self.finishing_rounds = finishing_rounds
         self.population: list[PopulationMember] = []
+        self._best_available_seed_configs: list[Config] = []
         self.config_gen: ConfigGeneration = self.config_spec.create_config_generation(
             overrides=self.settings.autotune_config_overrides or None,
             advanced_controls_files=self.settings.autotune_search_acf or None,
@@ -608,16 +609,38 @@ class PopulationBasedSearch(BaseSearch):
         """
         Benchmark multiple flat configurations in parallel.
 
+        The returned list has the same length as ``to_check`` and preserves
+        positional correspondence.  Invalid configurations that cannot be
+        unflattened are represented as ``PopulationMember`` objects with
+        ``perf == inf`` and ``status == "error"`` (they are not benchmarked).
+
         Args:
             to_check: A list of flat configurations to benchmark.
 
         Returns:
-            A list of population members with the benchmark results.
+            A list of population members with the benchmark results, one per
+            entry in *to_check*.
         """
-        result = [*map(self.make_unbenchmarked, to_check)]
-        return self.benchmark_population(result)
+        from ..runtime.config import Config
 
-    def make_unbenchmarked(self, flat_values: FlatConfig) -> PopulationMember:
+        valid: list[PopulationMember] = []
+        result: list[PopulationMember] = []
+        for flat in to_check:
+            m = self.make_unbenchmarked(flat)
+            if m is not None:
+                valid.append(m)
+                result.append(m)
+            else:
+                result.append(
+                    PopulationMember(
+                        _unset_fn, [float("inf")], flat, Config(), status="error"
+                    )
+                )
+
+        self.benchmark_population(valid)
+        return result
+
+    def make_unbenchmarked(self, flat_values: FlatConfig) -> PopulationMember | None:
         """
         Create a population member with unbenchmarked configuration.  You
         should pass the result of this to benchmark_population.
@@ -626,9 +649,13 @@ class PopulationBasedSearch(BaseSearch):
             flat_values: The flat configuration values.
 
         Returns:
-            A population member with undefined performance.
+            A population member with undefined performance, or None if the
+            configuration is invalid.
         """
-        config = self.config_gen.unflatten(flat_values)
+        try:
+            config = self.config_gen.unflatten(flat_values)
+        except exc.InvalidConfig:
+            return None
         return PopulationMember(_unset_fn, [], flat_values, config)
 
     def _get_current_hardware_and_specialization(
@@ -705,15 +732,20 @@ class PopulationBasedSearch(BaseSearch):
 
     def _generate_best_available_population_flat(self) -> list[FlatConfig]:
         """
-        Generate initial population using default config plus cached configs.
+        Generate initial population using default config, explicit seed configs,
+        and cached configs.
 
         Always starts with the default configuration, then adds up to
         MAX_BEST_AVAILABLE_CONFIGS matching cached configs from previous runs.
-        No random configs are added.  Duplicate configs are discarded.
+        Explicit seed configs provided by the caller are added ahead of cached
+        configs and are not suppressed by cache-skip settings. No random configs
+        are added. Duplicate configs are discarded.
 
         Returns:
             A list of unique FlatConfig values for the initial population.
-            Minimum size is 1 (just default), maximum is 1 + autotune_best_available_max_configs setting.
+            Minimum size is 1 (just default), plus any valid unique explicit
+            seed configs and up to autotune_best_available_max_configs cached
+            configs.
         """
         # Always start with the default config
         default_flat = self.config_gen.default_flat()
@@ -721,6 +753,16 @@ class PopulationBasedSearch(BaseSearch):
         seen: set[Config] = {default_config}
         result: list[FlatConfig] = [default_flat]
         self.log("Starting with default config")
+
+        for config in self._best_available_seed_configs:
+            try:
+                flat = self.config_gen.flatten(config)
+                transferred_config = self.config_gen.unflatten(flat)
+                if transferred_config not in seen:
+                    seen.add(transferred_config)
+                    result.append(flat)
+            except (ValueError, TypeError, KeyError, AssertionError) as e:
+                self.log(f"Failed to transfer explicit seed config: {e}")
 
         max_configs = self.settings.autotune_best_available_max_configs
         cached_entries = self._find_similar_cached_configs(max_configs)
@@ -747,18 +789,28 @@ class PopulationBasedSearch(BaseSearch):
                 self.log.debug(
                     f"Cached config {i + 1} (transferred): {transferred_config}"
                 )
-            except (ValueError, TypeError, KeyError, AssertionError) as e:
+            except (
+                ValueError,
+                TypeError,
+                KeyError,
+                AssertionError,
+                exc.InvalidConfig,
+            ) as e:
                 self.log(f"Failed to transfer cached config {i + 1}: {e}")
                 continue
 
         if duplicates > 0:
             self.log.debug(f"Discarded {duplicates} duplicate config(s)")
 
-        self.log(
-            f"Initial population: 1 default + {len(result) - 1} unique cached = {len(result)} total"
-        )
+        self.log(f"Initial population: {len(result)} total")
 
         return result
+
+    def set_best_available_seed_configs(
+        self,
+        configs: Sequence[Config],
+    ) -> None:
+        self._best_available_seed_configs = list(configs)
 
     def benchmark_population(
         self, members: list[PopulationMember], *, desc: str = "Benchmarking"
@@ -921,8 +973,8 @@ class PopulationBasedSearch(BaseSearch):
                     new_flat = [*current.flat_values]
                     new_flat[i] = default_flat[i]
                     candidate = self.make_unbenchmarked(new_flat)
-                    # Only add if this produces a different config
-                    if candidate.config != current.config:
+                    # Only add if valid and produces a different config
+                    if candidate is not None and candidate.config != current.config:
                         candidates.append(candidate)
 
             if len(candidates) <= 1:
@@ -966,7 +1018,7 @@ class PopulationBasedSearch(BaseSearch):
                         if c.flat_values[i] != current.flat_values[i]:
                             combined_flat[i] = c.flat_values[i]
                 combined = self.make_unbenchmarked(combined_flat)
-                if combined.config != current.config:
+                if combined is not None and combined.config != current.config:
                     self.benchmark_population(
                         [combined],
                         desc=f"Finishing round {round_num}: combined",

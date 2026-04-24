@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from typing import Callable
 import unittest
 
 import torch
@@ -213,6 +214,36 @@ def pallas_inner_loop_add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     for tile_m in hl.tile(m):
         for tile_n in hl.tile(n):
             out[tile_m, tile_n] = x[tile_m, tile_n] + y[tile_m, tile_n]
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
+def pallas_two_pass_reduction(x: torch.Tensor) -> torch.Tensor:
+    """Two inner reduction loops over the same dim: reduce to a per-row mean,
+    then subtract it from each element.
+    """
+    m, n = x.size()
+    out = torch.empty_like(x)
+    for tile_m in hl.tile(m):
+        acc = torch.zeros_like(x[tile_m, 0], dtype=torch.float32)
+        for tile_n in hl.tile(n):
+            acc = acc + torch.sum(x[tile_m, tile_n], dim=-1)
+        mean = (acc / n)[:, None]
+        for tile_n in hl.tile(n):
+            out[tile_m, tile_n] = x[tile_m, tile_n] - mean.to(x.dtype)
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
+def pallas_inner_loop_add_with_scalar_access(
+    x: torch.Tensor, y: torch.Tensor
+) -> torch.Tensor:
+    """Kernel that mixes pipeline-tiled and scalar reads of the same tensor."""
+    m, n = x.size()
+    out = torch.empty_like(x)
+    for tile_m in hl.tile(m):
+        for tile_n in hl.tile(n):
+            out[tile_m, tile_n] = x[tile_m, tile_n] + y[tile_m, tile_n] + x[0, 0]
     return out
 
 
@@ -625,17 +656,83 @@ class TestPallas(TestCase):
         # out is output-only, excluded from pallas_call inputs
         self.assertIn("_inplace_indices=[]", code)
 
+    def test_two_pass_reduction_emit_pipeline(self) -> None:
+        """Two inner reduction loops over the same dim compile and run under
+        ``pallas_loop_type='emit_pipeline'``.
+        """
+        x = torch.randn(256, 128, device=DEVICE, dtype=torch.float32)
+        _code, result = code_and_output(
+            pallas_two_pass_reduction,
+            (x,),
+            block_sizes=[128, 128, 128],
+            pallas_loop_type="emit_pipeline",
+        )
+        expected = x - x.mean(dim=-1, keepdim=True)
+        torch.testing.assert_close(result, expected, rtol=1e-4, atol=1e-4)
+
+    def test_two_pass_reduction_fori_loop(self) -> None:
+        """Two inner reduction loops over the same dim compile and run under
+        ``pallas_loop_type='fori_loop'``.
+        """
+        x = torch.randn(256, 128, device=DEVICE, dtype=torch.float32)
+        _code, result = code_and_output(
+            pallas_two_pass_reduction,
+            (x,),
+            block_sizes=[128, 128, 128],
+            pallas_loop_type="fori_loop",
+        )
+        expected = x - x.mean(dim=-1, keepdim=True)
+        torch.testing.assert_close(result, expected, rtol=1e-4, atol=1e-4)
+
+    @xfailIfPallas("Pipeline + scalar access codegen not yet supported")
+    def test_pipeline_tensor_with_scalar_access(self) -> None:
+        """A pipeline tensor with scalar access should keep HBM, not be overridden to SMEM."""
+        args = (
+            torch.randn(64, 128, device=DEVICE, dtype=torch.float32),
+            torch.randn(64, 128, device=DEVICE, dtype=torch.float32),
+        )
+        expected = args[0] + args[1] + args[0][0, 0]
+        code, result = code_and_output(
+            pallas_inner_loop_add_with_scalar_access,
+            args,
+            block_sizes=[8, 128],
+            pallas_loop_type="emit_pipeline",
+        )
+        self.assertIn("pltpu.emit_pipeline", code)
+        self.assertIn("_pipeline_arg_indices=", code)
+        torch.testing.assert_close(result, expected)
+
+    def test_invalid_pallas_loop_type_raises(self) -> None:
+        """Invalid pallas_loop_type values must raise instead of silently falling back."""
+        args = (
+            torch.randn(64, 128, device=DEVICE, dtype=torch.float32),
+            torch.randn(64, 128, device=DEVICE, dtype=torch.float32),
+        )
+        with self.assertRaisesRegex(ValueError, "Invalid pallas_loop_type 'pipeline'"):
+            code_and_output(
+                pallas_inner_loop_add,
+                args,
+                block_sizes=[8, 128],
+                pallas_loop_type="pipeline",
+            )
+
     def test_attention_default_fp32(self) -> None:
         """Test attention with default (for-loop) inner loop."""
         query = torch.randn(1, 4, 32, 64, dtype=torch.float32, device=DEVICE)
         key = torch.randn(1, 4, 32, 64, dtype=torch.float32, device=DEVICE)
         val = torch.randn(1, 4, 32, 64, dtype=torch.float32, device=DEVICE)
         args = (query, key, val)
+
         _code, result = code_and_output(pallas_attention, args, block_sizes=[1, 32, 32])
         ref = torch.nn.functional.scaled_dot_product_attention(
             query.float().cpu(), key.float().cpu(), val.float().cpu()
         ).to(device=DEVICE)
         torch.testing.assert_close(result, ref, rtol=1e-2, atol=1e-2)
+
+        # test that we're not manually allocating and donating out tensor HBM,
+        # but are instead taking over tensor returned by torch_tpu JaxCallable
+        self.assertIn("out = torch.empty_like(q_view, device='meta')", _code)
+        self.assertIn("out = _launcher(", _code)
 
     def test_attention_emit_pipeline_correctness(self) -> None:
         """Test emit_pipeline attention with loop-carried state."""
@@ -776,6 +873,41 @@ class TestPallas(TestCase):
         x = torch.randn(4, 64, 64, device=DEVICE, dtype=torch.float32)
         _, result = code_and_output(scalar_index_transpose, (x,))
         expected = x.permute(0, 2, 1)
+        torch.testing.assert_close(result, expected)
+
+    def test_tile_index_with_symbolic_offset(self) -> None:
+        """tile.index + tile.begin * constant should codegen valid variable names.
+
+        The offset in TileIndexWithOffsetPattern can be a sympy expression
+        (e.g. tile_chunk.begin * chunk_size). The codegen must use literal_expr()
+        to translate sympy symbols to their codegen variable names, otherwise
+        the generated code contains undefined variables like 'u8'.
+
+        Pattern from mamba2_chunk_state: iterates over chunks of rows, and
+        within each chunk uses tile_k.index + tile_chunk.begin * chunk_size
+        to compute the global row index.
+        """
+
+        @helion.kernel(
+            backend="pallas",
+            static_shapes=True,
+        )
+        def chunked_add(x: torch.Tensor) -> torch.Tensor:
+            nrows, ncols = x.shape
+            chunk_size = 64
+            nchunks = nrows // chunk_size
+            out = torch.empty_like(x)
+            for tile_col, tile_chunk in hl.tile([ncols, nchunks], block_size=[None, 1]):
+                for tile_k in hl.tile(chunk_size, block_size=64):
+                    # global_row = local_row_within_chunk + chunk_start
+                    row = tile_k.index + tile_chunk.begin * chunk_size
+                    out[row, tile_col] = x[row, tile_col] + 1.0
+            return out
+
+        # 4 chunks of 64 rows, 128 columns
+        x = torch.randn(256, 128, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(chunked_add, (x,), block_sizes=[128])
+        expected = x + 1.0
         torch.testing.assert_close(result, expected)
 
     def test_scalar_access_hl_grid(self) -> None:
@@ -1089,6 +1221,43 @@ class TestPallas(TestCase):
         self.assertIn("pl.ds(", code)
         torch.testing.assert_close(result, args[0] + args[1])
 
+    def test_tile_id_per_block_accumulator(self) -> None:
+        """Writing to ``out[tile.id, :]`` stores one row per outer grid iter.
+
+        This is the multi-block partial-reduction pattern used e.g. in
+        ``rms_norm_bwd``: each outer grid iter computes a per-block
+        accumulator and writes it into its own row of a ``[num_blocks, N]``
+        output tensor, which the host then sums across ``dim=0``.
+
+        Each grid iter ``i`` must land in row ``i``, so the kernel must
+        correctly interpret the scalar ``tile.id`` index against a tensor
+        whose outer dim has extent ``num_blocks`` (not ``M``).
+        """
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def per_block_reduction(x: torch.Tensor) -> torch.Tensor:
+            m, n = x.shape
+            m_block = hl.register_block_size(x.size(0))
+            out = x.new_empty(
+                [(x.size(0) + m_block - 1) // m_block, n], dtype=torch.float32
+            )
+            for mb_cta in hl.tile(m, block_size=m_block):
+                acc = x.new_zeros([n], dtype=torch.float32)
+                for mb in hl.tile(mb_cta.begin, mb_cta.end):
+                    acc += x[mb, :].to(torch.float32).sum(0)
+                out[mb_cta.id, :] = acc
+            return out
+
+        x = torch.randn(64, 128, device=DEVICE, dtype=torch.float32)
+        _code, result = code_and_output(
+            per_block_reduction,
+            (x,),
+            block_sizes=[8, 8],
+            pallas_loop_type="fori_loop",
+        )
+        ref = x.view(8, 8, 128).sum(1)
+        torch.testing.assert_close(result, ref, rtol=1e-3, atol=1e-3)
+
     def test_squeeze_slice_access(self) -> None:
         """Test for the [None, :] indexing pattern (subscript index for slice >= tensor_ndim)"""
 
@@ -1108,6 +1277,36 @@ class TestPallas(TestCase):
         code, result = code_and_output(fn, (x, y))
         expected = (x[:, None] < y[None, :]).to(torch.float32)
         torch.testing.assert_close(result, expected)
+
+    def test_matmul_1d_bias_closure(self) -> None:
+        """Verifies that ops in a closure also constrain the chosen block size."""
+
+        @helion.kernel(backend="pallas")
+        def matmul_custom(
+            x: torch.Tensor, y: torch.Tensor, epilogue: Callable
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], device=x.device, dtype=x.dtype)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = epilogue(acc, (tile_m, tile_n))
+            return out
+
+        x = torch.randn(1024, 1024, device=DEVICE, dtype=torch.bfloat16)
+        y = torch.randn(1024, 1024, device=DEVICE, dtype=torch.bfloat16)
+        bias = torch.randn(1024, device=DEVICE, dtype=torch.bfloat16)
+
+        code, result = code_and_output(
+            matmul_custom, (x, y, lambda acc, tile: acc + bias[tile[1]])
+        )
+
+        expected = x.float() @ y.float() + bias.float()
+        torch.testing.assert_close(
+            result, expected.to(torch.bfloat16), rtol=1e-2, atol=1e-2
+        )
 
 
 if __name__ == "__main__":

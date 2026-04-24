@@ -752,13 +752,9 @@ def generate_ast(
                         call = stmt.value
                         call.keywords = [
                             kw for kw in call.keywords if kw.arg != "device"
+                        ] + [
+                            ast.keyword(arg="device", value=ast.Constant(value="meta"))
                         ]
-                        call.keywords.append(
-                            ast.keyword(
-                                arg="device",
-                                value=ast.Constant(value="meta"),
-                            )
-                        )
 
             # Inject RNG seed buffer creation if needed
             rng_statements = (

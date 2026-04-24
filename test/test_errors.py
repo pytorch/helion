@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import unittest
 from unittest import mock
 
@@ -15,6 +16,7 @@ from helion.autotuner.base_search import PopulationBasedSearch
 from helion.autotuner.base_search import PopulationMember
 from helion.autotuner.differential_evolution import DifferentialEvolutionSearch
 from helion.autotuner.external import _FakeEnv
+from helion.exc import InvalidConfig
 import helion.language as hl
 
 
@@ -634,6 +636,245 @@ class TestErrors(RefEagerTestDisabled, TestCase):
             r"Device loop is empty after dead-code elimination",
         ):
             code_and_output(empty_kernel, (torch.randn(4, 4, device=DEVICE),))
+
+
+def _make_fake_kernel():
+    """Create a minimal fake kernel for autotuner unit tests."""
+
+    class FakeKernel:
+        def __init__(self) -> None:
+            self.settings = helion.Settings(
+                autotune_accuracy_check=False,
+                autotune_precompile=False,
+                autotune_log_level=0,
+            )
+            from helion._compiler.backend import TritonBackend
+            from helion.autotuner.config_spec import ConfigSpec
+
+            self.config_spec = ConfigSpec(backend=TritonBackend())
+            self.configs: list[helion.Config] = []
+
+        def compile_config(self, config: helion.Config, allow_print: bool = False):
+            return lambda *args: None
+
+        def format_kernel_decorator(
+            self, config: helion.Config, settings: helion.Settings
+        ) -> str:
+            return "@helion.kernel(...)"
+
+        def to_triton_code(
+            self,
+            config: helion.Config,
+            *,
+            emit_repro_caller: bool = False,
+            output_origin_lines: bool | None = None,
+        ) -> str:
+            return ""
+
+        @property
+        def env(self):
+            return _FakeEnv(device=DEVICE)
+
+    return FakeKernel()
+
+
+@onlyBackends(["triton"])
+class TestInvalidConfig(RefEagerTestDisabled, TestCase):
+    """Tests for autotuner robustness to InvalidConfig exceptions."""
+
+    def test_make_unbenchmarked_returns_none_on_invalid(self):
+        """make_unbenchmarked returns None when unflatten raises InvalidConfig."""
+        fake_kernel = _make_fake_kernel()
+        search = DifferentialEvolutionSearch(fake_kernel, args=())
+        original_unflatten = search.config_gen.unflatten
+
+        def always_invalid(flat_values):
+            raise InvalidConfig("test: forced invalid")
+
+        with mock.patch.object(search.config_gen, "unflatten", always_invalid):
+            result = search.make_unbenchmarked(search.config_gen.default_flat())
+        self.assertIsNone(result)
+
+        # Confirm it still works for valid configs
+        result = search.make_unbenchmarked(search.config_gen.default_flat())
+        self.assertIsNotNone(result)
+        self.assertEqual(
+            result.config, original_unflatten(search.config_gen.default_flat())
+        )
+
+    def test_benchmark_flat_batch_preserves_length(self):
+        """benchmark_flat_batch returns same-length list with inf-perf error
+        members for invalid configs."""
+        fake_kernel = _make_fake_kernel()
+        search = DifferentialEvolutionSearch(fake_kernel, args=())
+
+        default_flat = search.config_gen.default_flat()
+        # Build 5 copies of the default flat config
+        to_check = [list(default_flat) for _ in range(5)]
+
+        # Make positions 1 and 3 invalid
+        invalid_indices = {1, 3}
+        original_unflatten = search.config_gen.unflatten
+        call_count = 0
+
+        def selective_unflatten(flat_values):
+            nonlocal call_count
+            idx = call_count
+            call_count += 1
+            if idx in invalid_indices:
+                raise InvalidConfig("test: forced invalid")
+            return original_unflatten(flat_values)
+
+        def fake_benchmark_population(members, *, desc="Benchmarking"):
+            for m in members:
+                m.perfs.append(1.0)
+                m.fn = lambda *args: None
+                m.status = "ok"
+            return members
+
+        with (
+            mock.patch.object(search.config_gen, "unflatten", selective_unflatten),
+            mock.patch.object(
+                search, "benchmark_population", fake_benchmark_population
+            ),
+        ):
+            result = search.benchmark_flat_batch(to_check)
+
+        self.assertEqual(len(result), len(to_check))
+        for i, member in enumerate(result):
+            if i in invalid_indices:
+                self.assertTrue(
+                    math.isinf(member.perf), f"index {i} should have inf perf"
+                )
+                self.assertEqual(member.status, "error")
+            else:
+                self.assertAlmostEqual(member.perf, 1.0)
+                self.assertEqual(member.status, "ok")
+
+    def test_random_config_retries_on_invalid(self):
+        """random_config retries up to 64 times, then raises with summary."""
+        fake_kernel = _make_fake_kernel()
+        search = DifferentialEvolutionSearch(fake_kernel, args=())
+        gen = search.config_gen
+
+        # Fail 5 times then succeed
+        call_count = 0
+        original_unflatten = gen.unflatten
+
+        def fail_then_succeed(flat_values):
+            nonlocal call_count
+            call_count += 1
+            if call_count <= 5:
+                raise InvalidConfig("test: forced invalid")
+            return original_unflatten(flat_values)
+
+        with mock.patch.object(gen, "unflatten", fail_then_succeed):
+            config = gen.random_config()
+        self.assertIsNotNone(config)
+        self.assertEqual(call_count, 6)  # 5 failures + 1 success
+
+        # Always fail — should raise after 64 attempts
+        with (
+            mock.patch.object(
+                gen, "unflatten", side_effect=InvalidConfig("always bad")
+            ),
+            self.assertRaisesRegex(InvalidConfig, r"failed to generate.*64 attempts"),
+        ):
+            gen.random_config()
+
+    def test_random_population_fills_despite_invalid(self):
+        """random_population gracefully skips invalid configs and retries."""
+        fake_kernel = _make_fake_kernel()
+        search = DifferentialEvolutionSearch(fake_kernel, args=())
+        gen = search.config_gen
+
+        # Fail every other call
+        call_count = 0
+        original_unflatten = gen.unflatten
+
+        def intermittent_fail(flat_values):
+            nonlocal call_count
+            call_count += 1
+            if call_count % 2 == 0:
+                raise InvalidConfig("test: forced invalid")
+            return original_unflatten(flat_values)
+
+        with mock.patch.object(gen, "unflatten", intermittent_fail):
+            result = gen.random_population(5)
+
+        # Should still get 5 configs (retries fill the gaps)
+        self.assertEqual(len(result), 5)
+
+        # When all fail, should return fewer than requested (graceful degradation)
+        with mock.patch.object(
+            gen, "unflatten", side_effect=InvalidConfig("always bad")
+        ):
+            result = gen.random_population(5)
+        self.assertEqual(len(result), 0)
+
+    def test_pattern_search_skips_invalid_neighbors(self):
+        """Pattern search skips None members from make_unbenchmarked without crashing."""
+        from helion.autotuner.pattern_search import PatternSearch
+
+        fake_kernel = _make_fake_kernel()
+        search = PatternSearch(fake_kernel, args=())
+
+        # Build a small valid initial population
+        default_flat = search.config_gen.default_flat()
+        default_config = search.config_gen.unflatten(default_flat)
+        initial_member = PopulationMember(
+            lambda *args: None, [1.0], default_flat, default_config, status="ok"
+        )
+
+        # make_unbenchmarked returns None for all neighbors
+        original_make = search.make_unbenchmarked
+
+        def make_only_default(flat_values):
+            if flat_values == default_flat:
+                return original_make(flat_values)
+            return None
+
+        def fake_benchmark_population(members, *, desc="Benchmarking"):
+            for m in members:
+                if not m.perfs:
+                    m.perfs.append(1.0)
+                m.fn = lambda *args: None
+                m.status = "ok"
+            return members
+
+        with (
+            mock.patch.object(search, "make_unbenchmarked", make_only_default),
+            mock.patch.object(
+                search, "benchmark_population", fake_benchmark_population
+            ),
+            mock.patch.object(
+                search, "rebenchmark_population", lambda self, *a, **kw: None
+            ),
+            mock.patch.object(search, "rebenchmark", lambda *a, **kw: None),
+        ):
+            # Manually run the initial population phase
+            visited: set[helion.Config] = set()
+            search.population = []
+            for flat_config in search._generate_initial_population_flat():
+                member = search.make_unbenchmarked(flat_config)
+                if member is not None and member.config not in visited:
+                    visited.add(member.config)
+                    search.population.append(member)
+            fake_benchmark_population(search.population)
+
+            # All population members should be valid
+            for m in search.population:
+                self.assertIsNotNone(m.config)
+                self.assertTrue(math.isfinite(m.perf))
+
+            # Run one generation of pattern search from the default member
+            gen_iter = search._pattern_search_from(initial_member, visited)
+            candidates = next(gen_iter, None)
+            if candidates is not None:
+                # Only the starting member should be in candidates
+                # (all neighbors returned None)
+                self.assertEqual(len(candidates), 1)
+                self.assertEqual(candidates[0], initial_member)
 
 
 if __name__ == "__main__":

@@ -137,7 +137,7 @@ class PatternSearch(PopulationBasedSearch):
         self.population = []
         for flat_config in self._generate_initial_population_flat():
             member = self.make_unbenchmarked(flat_config)
-            if member.config not in visited:
+            if member is not None and member.config not in visited:
                 visited.add(member.config)
                 self.population.append(member)
         self.benchmark_population(self.population, desc="Initial population")
@@ -217,7 +217,7 @@ class PatternSearch(PopulationBasedSearch):
             candidates = [current]
             for flat_config in self._generate_neighbors(current.flat_values):
                 new_member = self.make_unbenchmarked(flat_config)
-                if new_member.config not in visited:
+                if new_member is not None and new_member.config not in visited:
                     visited.add(new_member.config)
                     candidates.append(new_member)
             if len(candidates) <= 1:

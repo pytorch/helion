@@ -9,7 +9,7 @@
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 :root{
   --bg:#0d1117;--surface:#161b22;--border:#30363d;--text:#e6edf3;--text-dim:#8b949e;
-  --green:#3fb950;--red:#f85149;--blue:#58a6ff;--orange:#f0883e;--purple:#bc8cff;
+  --green:#3fb950;--red:#f85149;--blue:#58a6ff;--orange:#f0883e;--yellow:#d29922;--purple:#bc8cff;
   --gray:#484f58;
 }
 body{background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;line-height:1.5;overflow-x:hidden}
@@ -42,9 +42,9 @@ a:hover{text-decoration:underline}
 .kernel-card:hover{border-color:var(--blue)}
 .kernel-card.placeholder{opacity:0.25;cursor:default;pointer-events:none}
 .kernel-card .left-accent{position:absolute;left:0;top:0;bottom:0;width:3px}
-.kernel-card .kc-body{display:flex;gap:8px}
-.kernel-card .kc-left{flex:1;min-width:0}
-.kernel-card .kc-right{flex:1;min-width:0;display:flex;align-items:center}
+.kernel-card .kc-body{display:flex;gap:16px;align-items:stretch}
+.kernel-card .kc-left{flex:0 0 auto;min-width:180px;display:flex;flex-direction:column;justify-content:center}
+.kernel-card .kc-right{flex:1;min-width:0;display:flex;align-items:stretch}
 .kernel-card .kc-header{display:flex;align-items:center;gap:8px;margin-bottom:6px;flex-wrap:wrap}
 .kernel-card .kc-name{font-size:13px;font-weight:600;word-break:break-word}
 .kernel-card .kc-tag{font-size:10px;font-weight:600;padding:2px 6px;border-radius:4px;text-transform:uppercase;letter-spacing:0.3px}
@@ -54,9 +54,14 @@ a:hover{text-decoration:underline}
 .kernel-card .kc-row .kc-label{color:var(--text-dim)}
 .kernel-card .kc-row .kc-val{font-weight:600}
 .kernel-card .kc-delta{font-size:13px;margin-bottom:3px}
-.kernel-card .sparkline-container{height:60px}
-.kernel-card .sparkline-container svg{width:100%;height:100%}
-.kernel-card .accuracy-warn{font-size:11px;color:var(--orange);margin-top:4px}
+.kernel-card .sparkline-container{width:100%;min-height:80px;display:flex;align-items:center;position:relative}
+.kernel-card .sparkline-container svg{width:100%;height:100%;min-height:80px}
+.kernel-card .fail-overlay{position:absolute;inset:0;display:flex;flex-direction:column;justify-content:center;align-items:center;gap:4px;background:rgba(13,17,23,0.75);border-radius:6px;padding:8px;text-align:center}
+.kernel-card .fail-overlay .fail-line{font-size:14px;font-weight:600}
+.kernel-card .fail-overlay .fail-subline{font-size:11px;color:var(--text-dim)}
+.kernel-card .fail-overlay .run-line{color:var(--yellow)}
+.kernel-card .fail-overlay .infra-line{color:var(--text-dim)}
+.kernel-card .accuracy-badge{position:absolute;top:6px;right:6px;font-size:14px;font-weight:700;color:var(--orange);background:rgba(240,136,62,0.2);padding:4px 10px;border-radius:6px;border:1px solid rgba(240,136,62,0.4)}
 .modal-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,0.65);z-index:1000;justify-content:center;align-items:flex-start;padding:40px 20px;overflow-y:auto}
 .modal-overlay.open{display:flex}
 .modal{background:var(--surface);border:1px solid var(--border);border-radius:12px;width:100%;max-width:1200px;padding:24px;position:relative}
@@ -84,6 +89,7 @@ a:hover{text-decoration:underline}
 .data-table td{padding:8px 10px;border-bottom:1px solid var(--border)}
 .data-table tbody tr:hover{background:rgba(88,166,255,0.04)}
 .table-scroll{overflow-x:auto;max-height:600px;overflow-y:auto;border-radius:8px;border:1px solid var(--border);background:var(--surface)}
+.table-wrap{overflow-x:auto;border-radius:8px;border:1px solid var(--border);background:var(--surface)}
 .summary-row{display:flex;gap:12px;margin-bottom:20px;flex-wrap:wrap}
 .summary-card{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:16px 20px;flex:1;min-width:140px}
 .summary-card .sc-label{font-size:12px;color:var(--text-dim);margin-bottom:4px}
@@ -150,6 +156,8 @@ function formatDate(d) {
   const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
   return months[dt.getMonth()] + ' ' + dt.getDate() + ', ' + String(dt.getHours()).padStart(2,'0') + ':' + String(dt.getMinutes()).padStart(2,'0');
 }
+const TREND_CHART_HEIGHT = 480;
+const geomean = (arr, empty = 0) => arr.length > 0 ? Math.exp(arr.reduce((s, v) => s + Math.log(v), 0) / arr.length) : empty;
 function formatDelta(v, invert) {
   if (v == null) return '<span class="delta-neutral">--</span>';
   const positive = invert ? v < 0 : v > 0;
@@ -261,18 +269,26 @@ function getFiltered() {
   if (search) kernels = kernels.filter(k => k.toLowerCase().includes(search));
   return { platforms: plats, kernels };
 }
-function getAccuracyFailures() {
-  const fails = [];
+function getFailures() {
+  const acc = [], run = [], infra = [];
   DATA.summary.forEach(e => {
-    if (e.accuracy_failures && e.accuracy_failures.length > 0) {
-      fails.push({ kernel: e.kernel, platform: platName(e.platform_short), platform_short: e.platform_short, shapes: e.accuracy_failures });
-    }
+    const entry = { kernel: e.kernel, platform: platName(e.platform_short), platform_short: e.platform_short };
+    if (e.accuracy_failures?.length) acc.push({ ...entry, shapes: e.accuracy_failures });
+    if (e.run_failures?.length) run.push({ ...entry, shapes: e.run_failures });
+    if (e.infra_missing) infra.push({ ...entry, last_seen_date: e.last_seen_date });
   });
-  return fails;
+  return { acc, run, infra };
 }
+// Prefer latency once a kernel has accumulated enough history; fall back to
+// speedup while latency recording is still ramping up.
+const LATENCY_MIN_POINTS = 14;
 function sparklineSvg(history, color) {
   if (!history || history.length < 2) return '';
-  const vals = history.map(h => h.helion_speedup_geomean).filter(v => v != null);
+  const mainHist = history.filter(h => (h.branch || 'main') === 'main');
+  const latency = mainHist.map(h => h.helion_latency_avg_ms).filter(v => v > 0);
+  const vals = latency.length >= LATENCY_MIN_POINTS
+    ? latency
+    : mainHist.map(h => h.helion_speedup_geomean).filter(v => v > 0);
   if (vals.length < 2) return '';
   const mn = Math.min(...vals), mx = Math.max(...vals);
   const range = mx - mn || 1;
@@ -288,8 +304,8 @@ function sparklineSvg(history, color) {
 function renderOverview() {
   const lr = DATA.latest_run;
   const st = DATA.stats;
-  const fails = getAccuracyFailures();
-  const failCount = st.accuracy_failures;
+  const fails = getFailures();
+  const failCount = (st.accuracy_failures || 0) + (st.run_failures || 0) + (st.infra_missing || 0);
   const ciPass = failCount === 0;
   let html = '<div class="status-row">';
   html += statusCard('Latest Commit',
@@ -361,7 +377,6 @@ function renderOverviewGrid() {
         html += '<div class="kc-delta" style="color:var(--text-dim)">No data</div>';
         html += '</div><div class="kc-right"></div></div></div>';
       } else {
-        const latencyVal = e.helion_latency_avg_ms > 0 ? e.helion_latency_avg_ms.toFixed(2) + ' ms' : null;
         html += `<div class="kernel-card" data-kernel="${escHtml(e.kernel)}" data-platform="${escHtml(e.platform_short)}" onclick="showDetailModal('${escHtml(e.kernel)}','${escHtml(e.platform_short)}')">`;
         html += `<div class="left-accent" style="background:${color}"></div>`;
         html += '<div class="kc-header">';
@@ -370,23 +385,26 @@ function renderOverviewGrid() {
         else if (e.status === 'regressed') html += '<span class="kc-tag regressed">regressed perf</span>';
         html += '</div>';
         html += '<div class="kc-body"><div class="kc-left">';
-        if (latencyVal) {
-          html += `<div class="kc-row"><span class="kc-label">Latency</span><span class="kc-val" style="color:${color}">${latencyVal}</span></div>`;
-        } else {
-          html += `<div class="kc-row"><span class="kc-label">Speedup</span><span class="kc-val" style="color:${color}">${formatSpeedup(e.helion_speedup_geomean)}</span></div>`;
-        }
+        html += `<div class="kc-row"><span class="kc-label">Latency</span><span class="kc-val" style="color:${color}">${e.helion_latency_avg_ms.toFixed(2)} ms</span></div>`;
         html += `<div class="kc-row"><span class="kc-label">Compile time</span><span class="kc-val">${formatCompileTime(e.compile_time_avg_s)}</span></div>`;
-        if (latencyVal && e.latency_delta_pct != null) {
-          html += `<div class="kc-delta">Latency vs prev: ${formatDelta(e.latency_delta_pct, true)}</div>`;
-        } else {
-          html += `<div class="kc-delta">Speedup vs prev: ${formatDelta(e.speedup_delta_pct, false)}</div>`;
-        }
-        html += `<div class="kc-delta">Compile vs prev: ${formatDelta(e.compile_delta_pct, true)}</div>`;
-        if (e.accuracy_failures && e.accuracy_failures.length > 0) {
-          html += `<div class="accuracy-warn">${e.accuracy_failures.length} accuracy fail</div>`;
-        }
+        html += `<div class="kc-delta">Latency vs prev: ${formatDelta(e.latency_delta_pct, true)}</div>`;
+        html += `<div class="kc-delta">Compile time vs prev: ${formatDelta(e.compile_delta_pct, true)}</div>`;
         html += '</div>';
-        html += `<div class="kc-right"><div class="sparkline-container">${sparklineSvg(e.history, color)}</div></div>`;
+        // run_fail and infra_missing mean no real perf data — cover sparkline with overlay.
+        // accuracy_fail kernels still ran; show sparkline with a small badge.
+        let overlay = '';
+        if (e.run_failures?.length || e.infra_missing) {
+          overlay = '<div class="fail-overlay">';
+          if (e.run_failures?.length) overlay += `<div class="fail-line run-line">${e.run_failures.length} shapes failed</div>`;
+          if (e.infra_missing) {
+            overlay += '<div class="fail-line infra-line">No Result</div>';
+            if (e.last_seen_date) overlay += `<div class="fail-subline">last seen ${formatDate(e.last_seen_date)}</div>`;
+          }
+          overlay += '</div>';
+        } else if (e.accuracy_failures?.length) {
+          overlay = `<div class="accuracy-badge">${e.accuracy_failures.length} accuracy fail</div>`;
+        }
+        html += `<div class="kc-right"><div class="sparkline-container">${sparklineSvg(e.history, color)}${overlay}</div></div>`;
         html += '</div></div>';
       }
     });
@@ -405,7 +423,6 @@ function renderSpeedupTrendChart() {
       if (e) entries.push(e);
     });
   });
-  const gm = arr => arr.length > 0 ? Math.exp(arr.reduce((s, v) => s + Math.log(v), 0) / arr.length) : 0;
   const runs = DATA.runs;
   const helionTrend = [], tcTrend = [], tritonTrend = [];
   const xLabels = [];
@@ -419,29 +436,40 @@ function renderSpeedupTrendChart() {
         if (h.triton_speedup_geomean > 0) rValsRun.push(h.triton_speedup_geomean);
       }
     });
-    helionTrend.push(gm(hValsRun));
-    tcTrend.push(gm(tValsRun));
-    tritonTrend.push(gm(rValsRun));
+    helionTrend.push(geomean(hValsRun, null));
+    tcTrend.push(geomean(tValsRun, null));
+    tritonTrend.push(geomean(rValsRun, null));
     xLabels.push(r.sha + '\n' + formatDate(r.date));
   });
+  let firstIdx = 0;
+  while (firstIdx < xLabels.length && helionTrend[firstIdx] == null && tcTrend[firstIdx] == null && tritonTrend[firstIdx] == null) {
+    firstIdx++;
+  }
+  helionTrend.splice(0, firstIdx);
+  tcTrend.splice(0, firstIdx);
+  tritonTrend.splice(0, firstIdx);
+  xLabels.splice(0, firstIdx);
   const traces = [
     { x: xLabels, y: helionTrend, name: 'Helion', mode: 'lines+markers', line: { color: '#3fb950', width: 2 }, marker: { size: 6 } },
     { x: xLabels, y: tcTrend, name: 'torch.compile', mode: 'lines+markers', line: { color: '#58a6ff', width: 2 }, marker: { size: 6 } },
     { x: xLabels, y: tritonTrend, name: 'Triton', mode: 'lines+markers', line: { color: '#bc8cff', width: 2 }, marker: { size: 6 } },
   ];
   const allVals = [...helionTrend, ...tcTrend, ...tritonTrend].filter(v => v > 0);
-  const minY = allVals.length > 0 ? Math.min(...allVals) * 0.9 : 0;
-  const maxY = allVals.length > 0 ? Math.max(...allVals) * 1.1 : 2;
+  const rawMin = allVals.length > 0 ? Math.min(...allVals) : 0;
+  const rawMax = allVals.length > 0 ? Math.max(...allVals) : 2;
+  const pad = (rawMax - rawMin) * 0.15 || 0.1;
+  const minY = Math.max(0, rawMin - pad);
+  const maxY = rawMax + pad;
   const shapes = (minY < 1 && maxY > 1) ? [{
     type: 'line', x0: xLabels[0], x1: xLabels[xLabels.length - 1],
     y0: 1, y1: 1, line: { color: '#f85149', width: 1, dash: 'dash' }
   }] : [];
   const layout = Object.assign({}, plotlyDark, {
     xaxis: Object.assign({}, plotlyDark.xaxis, { tickangle: -40 }),
-    yaxis: Object.assign({}, plotlyDark.yaxis, { title: 'Geomean Speedup' }),
+    yaxis: Object.assign({}, plotlyDark.yaxis, { title: 'Geomean Speedup', range: [minY, maxY] }),
     shapes: shapes,
     legend: { font: { color: '#e6edf3', size: 11 }, bgcolor: 'rgba(0,0,0,0)' },
-    height: 300
+    height: TREND_CHART_HEIGHT
   });
   Plotly.newPlot(el, traces, layout, { responsive: true, displayModeBar: false });
 }
@@ -457,8 +485,7 @@ function renderSpeedup() {
   const hVals = entries.map(e => e.helion_speedup_geomean).filter(v => v > 0);
   const tVals = entries.map(e => e.torch_compile_speedup_geomean).filter(v => v > 0);
   const rVals = entries.map(e => e.triton_speedup_geomean).filter(v => v > 0);
-  const gm = arr => arr.length > 0 ? Math.exp(arr.reduce((s, v) => s + Math.log(v), 0) / arr.length) : 0;
-  const helionGM = gm(hVals), tcGM = gm(tVals), tritonGM = gm(rVals);
+  const helionGM = geomean(hVals), tcGM = geomean(tVals), tritonGM = geomean(rVals);
   const helionWins = entries.filter(e => e.helion_speedup_geomean > Math.max(e.torch_compile_speedup_geomean || 0, e.triton_speedup_geomean || 0)).length;
   let html = '';
   html += '<h2 style="margin-bottom:4px">Speedup vs Eager Execution</h2>';
@@ -477,11 +504,11 @@ function renderSpeedup() {
   if (runs.length >= 2) {
     html += '<div style="background:var(--bg);border-radius:8px;padding:16px;margin-bottom:20px">';
     html += '<div style="font-size:14px;font-weight:600;margin-bottom:8px">Geomean Speedup Over Time</div>';
-    html += '<div id="speedup-trend-chart" style="width:100%;height:300px"></div>';
+    html += `<div id="speedup-trend-chart" style="width:100%;height:${TREND_CHART_HEIGHT}px"></div>`;
     html += '</div>';
   }
-  entries.sort((a, b) => (b.helion_speedup_geomean || 0) - (a.helion_speedup_geomean || 0));
-  html += '<div class="table-scroll"><table class="data-table"><thead><tr><th>Kernel</th><th>Platform</th><th>Commit</th><th>Helion</th><th>torch.compile</th><th>Triton</th><th>Compile Time</th><th>Best</th></tr></thead><tbody>';
+  entries.sort((a, b) => a.platform_short.localeCompare(b.platform_short) || a.kernel.localeCompare(b.kernel));
+  html += '<div class="table-wrap"><table class="data-table"><thead><tr><th>Kernel</th><th>Platform</th><th>Commit</th><th>Helion</th><th>torch.compile</th><th>Triton</th><th>Compile Time</th><th>Best</th></tr></thead><tbody>';
   entries.forEach(e => {
     const vals = [e.helion_speedup_geomean, e.torch_compile_speedup_geomean, e.triton_speedup_geomean];
     const names = ['Helion', 'torch.compile', 'Triton'];
@@ -514,18 +541,28 @@ function renderSpeedup() {
   }
 }
 // -------- Compare Tab --------
-function renderCompare(baseRunIdOverride, cmpRunIdOverride) {
-  const runs = [...DATA.runs].sort((a, b) => new Date(b.date) - new Date(a.date));
-  const baseRunId = baseRunIdOverride || (runs[1] ? runs[1].run_id : runs[0].run_id);
-  const cmpRunId = cmpRunIdOverride || runs[0].run_id;
+function renderCompare(baseRunIdOverride, cmpRunIdOverride, baseBranchOverride, cmpBranchOverride) {
+  const allRuns = [...DATA.runs].sort((a, b) => new Date(b.date) - new Date(a.date));
+  const allBranches = [...new Set(allRuns.map(r => r.branch || 'main'))].sort();
+  const baseBranch = baseBranchOverride || 'main';
+  const cmpBranch = cmpBranchOverride || 'main';
+  const baseRuns = allRuns.filter(r => (r.branch || 'main') === baseBranch);
+  const cmpRuns = allRuns.filter(r => (r.branch || 'main') === cmpBranch);
+  const baseRunId = baseRunIdOverride || (baseRuns[1] ? baseRuns[1].run_id : (baseRuns[0] ? baseRuns[0].run_id : null));
+  const cmpRunId = cmpRunIdOverride || (cmpRuns[0] ? cmpRuns[0].run_id : null);
   const baseRun = DATA.runs.find(r => r.run_id === baseRunId);
   const cmpRun = DATA.runs.find(r => r.run_id === cmpRunId);
-  const { platforms, kernels } = getFiltered();
+  // Compare uses all kernels/platforms (including non-main) so cross-branch comparisons work
+  const allPlatforms = [...new Set(DATA.summary.map(s => s.platform_short))].sort();
+  const allKernels = [...new Set(DATA.summary.map(s => s.kernel))].sort();
+  const search = activeFilters.search.toLowerCase();
+  const platforms = activeFilters.platform === 'all' ? allPlatforms : [activeFilters.platform];
+  const kernels = search ? allKernels.filter(k => k.toLowerCase().includes(search)) : allKernels;
   let improved = 0, regressed = 0, unchanged = 0;
   const allDeltas = [];
   const comparisons = [];
-  kernels.forEach(k => {
-    platforms.forEach(ps => {
+  platforms.forEach(ps => {
+    kernels.forEach(k => {
       const entry = kernelPlatMap[k + '||' + ps];
       if (!entry || !entry.history) return;
       const baseH = entry.history.find(h => h.run_id === baseRunId);
@@ -570,7 +607,7 @@ function renderCompare(baseRunIdOverride, cmpRunIdOverride) {
   if (allDeltas.length > 0) {
     const absDelta = allDeltas.map(d => Math.abs(d)).filter(d => d > 0);
     if (absDelta.length > 0) {
-      const gmVal = Math.exp(absDelta.reduce((s, v) => s + Math.log(v), 0) / absDelta.length);
+      const gmVal = geomean(absDelta);
       const positiveCount = allDeltas.filter(d => d > 0).length;
       geomeanDelta = positiveCount >= allDeltas.length / 2 ? gmVal : -gmVal;
     }
@@ -578,16 +615,20 @@ function renderCompare(baseRunIdOverride, cmpRunIdOverride) {
   let html = '<h2 style="margin-bottom:16px">Compare Commits</h2>';
   html += '<div class="compare-selectors">';
   html += '<div class="commit-box"><h3>Base</h3>';
-  html += '<select id="cmp-base-branch"><option value="main">main</option></select>';
+  html += '<select id="cmp-base-branch">';
+  allBranches.forEach(b => { html += `<option value="${b}"${b === baseBranch ? ' selected' : ''}>${escHtml(b)}</option>`; });
+  html += '</select>';
   html += '<select id="cmp-base-commit">';
-  runs.forEach(r => { html += `<option value="${r.run_id}"${r.run_id === baseRunId ? ' selected' : ''}>${r.sha} (${formatDate(r.date)})</option>`; });
+  baseRuns.forEach(r => { html += `<option value="${r.run_id}"${r.run_id === baseRunId ? ' selected' : ''}>${r.sha} (${formatDate(r.date)})</option>`; });
   html += '</select>';
   html += baseRun ? `<div class="run-link">Run: <a href="${runUrl(baseRun.run_id)}" target="_blank">#${baseRun.run_id}</a></div>` : '';
   html += '</div>';
   html += '<div class="commit-box"><h3>Target</h3>';
-  html += '<select id="cmp-compare-branch"><option value="main">main</option></select>';
+  html += '<select id="cmp-compare-branch">';
+  allBranches.forEach(b => { html += `<option value="${b}"${b === cmpBranch ? ' selected' : ''}>${escHtml(b)}</option>`; });
+  html += '</select>';
   html += '<select id="cmp-compare-commit">';
-  runs.forEach(r => { html += `<option value="${r.run_id}"${r.run_id === cmpRunId ? ' selected' : ''}>${r.sha} (${formatDate(r.date)})</option>`; });
+  cmpRuns.forEach(r => { html += `<option value="${r.run_id}"${r.run_id === cmpRunId ? ' selected' : ''}>${r.sha} (${formatDate(r.date)})</option>`; });
   html += '</select>';
   html += cmpRun ? `<div class="run-link">Run: <a href="${runUrl(cmpRun.run_id)}" target="_blank">#${cmpRun.run_id}</a></div>` : '';
   html += '</div></div>';
@@ -619,20 +660,17 @@ function renderCompare(baseRunIdOverride, cmpRunIdOverride) {
   if (changedComparisons.length > 0) {
     html += `<div style="font-size:14px;font-weight:600;margin-bottom:8px">Changed Kernels (${changedComparisons.length})</div>`;
     html += '<div class="compare-grid">';
+    const fmtLat = v => v && v > 0 ? v.toFixed(2) + ' ms' : '--';
     changedComparisons.forEach(c => {
       const color = platColor(c.platform_short);
-      const hasLat = c.baseLatency > 0 || c.cmpLatency > 0;
-      const fmtLat = v => v && v > 0 ? v.toFixed(2) + ' ms' : '--';
-      const perfD = hasLat ? c.latencyDelta : c.speedupDelta;
-      const isImproved = perfD != null && perfD > 10;
+      const perfD = c.latencyDelta != null ? c.latencyDelta : c.speedupDelta;
+      const isImproved = perfD > 10;
       const borderColor = isImproved ? 'var(--green)' : 'var(--red)';
       html += `<div class="compare-card" style="border-left:3px solid ${borderColor}">`;
       html += `<div class="cc-header"><span style="color:${color}">${escHtml(c.kernel)}</span> ${platBadge(c.platform_short)} <span class="kc-tag ${isImproved ? 'improved' : 'regressed'}">${isImproved ? 'improved' : 'regressed'} perf</span></div>`;
-      if (hasLat) {
-        html += `<div class="cc-row"><span class="cc-label">Latency</span><span>${fmtLat(c.baseLatency)} → ${fmtLat(c.cmpLatency)} (${formatDelta(c.latencyDelta, true)})</span></div>`;
-      }
+      html += `<div class="cc-row"><span class="cc-label">Latency</span><span>${fmtLat(c.baseLatency)} → ${fmtLat(c.cmpLatency)} (${formatDelta(c.latencyDelta, true)})</span></div>`;
       html += `<div class="cc-row"><span class="cc-label">Speedup</span><span>${formatSpeedup(c.baseSpeedup)} → ${formatSpeedup(c.cmpSpeedup)} (${formatDelta(c.speedupDelta, false)})</span></div>`;
-      html += `<div class="cc-row"><span class="cc-label">Compile</span><span>${formatCompileTime(c.baseCompile)} → ${formatCompileTime(c.cmpCompile)} (${formatDelta(c.compileDelta, true)})</span></div>`;
+      html += `<div class="cc-row"><span class="cc-label">Compile Time</span><span>${formatCompileTime(c.baseCompile)} → ${formatCompileTime(c.cmpCompile)} (${formatDelta(c.compileDelta, true)})</span></div>`;
       html += '</div>';
     });
     html += '</div>';
@@ -640,7 +678,7 @@ function renderCompare(baseRunIdOverride, cmpRunIdOverride) {
     html += '<div style="padding:16px;background:var(--bg);border-radius:8px;margin-bottom:20px;text-align:center;color:var(--text-dim);font-size:13px">No kernels changed &gt;10% between selected commits</div>';
   }
   html += '<div style="font-size:14px;font-weight:600;margin-bottom:8px">All Kernels</div>';
-  html += '<div class="table-scroll"><table class="data-table"><thead><tr><th>Kernel</th><th>Platform</th><th>Base Latency</th><th>Target Latency</th><th>Latency Delta</th><th>Base Speedup</th><th>Target Speedup</th><th>Speedup Delta</th><th>Base Compile</th><th>Target Compile</th><th>Compile Delta</th></tr></thead><tbody>';
+  html += '<div class="table-wrap"><table class="data-table"><thead><tr><th>Kernel</th><th>Platform</th><th>Base Latency</th><th>Target Latency</th><th>Latency Delta</th><th>Base Speedup</th><th>Target Speedup</th><th>Speedup Delta</th><th>Base Compile Time</th><th>Target Compile Time</th><th>Compile Time Delta</th></tr></thead><tbody>';
   comparisons.forEach(c => {
     const fmtLat = v => v && v > 0 ? v.toFixed(2) + ' ms' : '--';
     html += `<tr>
@@ -660,15 +698,27 @@ function renderCompare(baseRunIdOverride, cmpRunIdOverride) {
   html += '</tbody></table></div>';
   document.getElementById('tab-compare').innerHTML = html;
   document.querySelectorAll('#tab-compare .data-table').forEach(makeSortable);
-  document.getElementById('cmp-base-commit').addEventListener('change', () => {
-    renderCompare(document.getElementById('cmp-base-commit').value, document.getElementById('cmp-compare-commit').value);
+  const cmpRerender = () => renderCompare(
+    document.getElementById('cmp-base-commit').value,
+    document.getElementById('cmp-compare-commit').value,
+    document.getElementById('cmp-base-branch').value,
+    document.getElementById('cmp-compare-branch').value,
+  );
+  document.getElementById('cmp-base-commit').addEventListener('change', cmpRerender);
+  document.getElementById('cmp-compare-commit').addEventListener('change', cmpRerender);
+  document.getElementById('cmp-base-branch').addEventListener('change', () => {
+    renderCompare(null, document.getElementById('cmp-compare-commit').value,
+      document.getElementById('cmp-base-branch').value,
+      document.getElementById('cmp-compare-branch').value);
   });
-  document.getElementById('cmp-compare-commit').addEventListener('change', () => {
-    renderCompare(document.getElementById('cmp-base-commit').value, document.getElementById('cmp-compare-commit').value);
+  document.getElementById('cmp-compare-branch').addEventListener('change', () => {
+    renderCompare(document.getElementById('cmp-base-commit').value, null,
+      document.getElementById('cmp-base-branch').value,
+      document.getElementById('cmp-compare-branch').value);
   });
   document.getElementById('cmp-plat-filter').addEventListener('change', e => {
     activeFilters.platform = e.target.value;
-    renderCompare(baseRunId, cmpRunId);
+    cmpRerender();
     renderOverviewGrid();
   });
   document.getElementById('cmp-improved-card').addEventListener('click', () => {
@@ -703,16 +753,23 @@ document.getElementById('modal-overlay').addEventListener('click', e => {
 });
 document.addEventListener('keydown', e => { if (e.key === 'Escape') closeModal(); });
 function showFailuresModal(fails) {
-  let html = modalHeader('Accuracy Failures', 'Kernel/platform combinations with accuracy check failures');
-  html += '<ul class="fail-list">';
-  fails.forEach(f => {
-    html += `<li>
-      <span class="fail-kernel">${escHtml(f.kernel)}</span>
-      ${platBadge(f.platform_short)}
-      <span class="fail-shapes">Shapes: ${f.shapes.map(escHtml).join(', ')}</span>
-    </li>`;
-  });
-  html += '</ul>';
+  const renderSection = (title, desc, items) => {
+    if (!items.length) return '';
+    let h = `<h3 style="font-size:13px;color:var(--text-dim);text-transform:uppercase;letter-spacing:0.3px;margin:16px 0 8px">${title} (${items.length})</h3>`;
+    h += `<p style="font-size:12px;color:var(--text-dim);margin-bottom:8px">${desc}</p>`;
+    h += '<ul class="fail-list">';
+    items.forEach(f => {
+      let detail = '';
+      if (f.shapes) detail = `<span class="fail-shapes">Shapes: ${f.shapes.map(escHtml).join(', ')}</span>`;
+      else if (f.last_seen_date) detail = `<span class="fail-shapes">Last seen: ${formatDate(f.last_seen_date)}</span>`;
+      h += `<li><span class="fail-kernel">${escHtml(f.kernel)}</span>${platBadge(f.platform_short)}${detail}</li>`;
+    });
+    return h + '</ul>';
+  };
+  let html = modalHeader('CI Failures', 'Accuracy mismatches, kernel run failures, and infra issues');
+  html += renderSection('Accuracy Failures', 'Kernel ran but produced incorrect output.', fails.acc);
+  html += renderSection('Shape Failures', 'Shapes that failed to run (crash, OOM, compile error, timeout, or unsupported config).', fails.run);
+  html += renderSection('No Result', 'Benchmark did not produce output for this kernel — possible causes: runner unavailable, job timeout, crash, artifact upload failed, or harness skipped this kernel+platform combination.', fails.infra);
   openModal(html);
 }
 function showDetailModal(kernel, platform_short) {
@@ -721,16 +778,23 @@ function showDetailModal(kernel, platform_short) {
   const color = platColor(platform_short);
   let html = modalHeader(
     `${escHtml(kernel)} ${platBadge(platform_short)}`,
-    `Speedup Geomean: ${formatSpeedup(e.helion_speedup_geomean)} | Compile: ${formatCompileTime(e.compile_time_avg_s)}${e.helion_latency_avg_ms > 0 ? ' | Latency: ' + e.helion_latency_avg_ms.toFixed(2) + ' ms' : ''}`);
+    `Latency: ${e.helion_latency_avg_ms.toFixed(2)} ms | Speedup: ${formatSpeedup(e.helion_speedup_geomean)} | Compile Time: ${formatCompileTime(e.compile_time_avg_s)}`);
   html += '<div class="modal-split"><div class="modal-lhs">';
   if (e.status !== 'unchanged') {
     html += `<div style="margin-bottom:12px"><span class="kc-tag ${e.status}">${e.status} perf</span></div>`;
   }
-  if (e.accuracy_failures && e.accuracy_failures.length > 0) {
+  if (e.accuracy_failures?.length) {
     html += `<div class="accuracy-warn" style="margin-bottom:12px">${e.accuracy_failures.length} accuracy failure(s): ${e.accuracy_failures.join(', ')}</div>`;
   }
+  if (e.run_failures?.length) {
+    html += `<div class="run-warn" style="margin-bottom:12px">${e.run_failures.length} shape failure(s): ${e.run_failures.join(', ')}</div>`;
+  }
+  if (e.infra_missing) {
+    const lastSeen = e.last_seen_date ? ` (last seen ${formatDate(e.last_seen_date)})` : '';
+    html += `<div class="infra-warn" style="margin-bottom:12px">No result in latest run${lastSeen} — runner unavailable, timeout, crash, upload failed, or harness skipped this kernel+platform</div>`;
+  }
   html += '<h3 style="font-size:13px;color:var(--text-dim);text-transform:uppercase;letter-spacing:0.3px;margin-bottom:8px">Run History</h3>';
-  html += '<div class="table-scroll" style="max-height:300px"><table class="data-table"><thead><tr><th>Commit</th><th>Date</th><th>Latency</th><th>Speedup</th><th>Compile</th></tr></thead><tbody>';
+  html += '<div class="table-scroll" style="max-height:300px"><table class="data-table"><thead><tr><th>Commit</th><th>Date</th><th>Latency</th><th>Speedup</th><th>Compile Time</th></tr></thead><tbody>';
   const hist = [...(e.history || [])].reverse();
   hist.forEach((h, i) => {
     let speedupDelta = '', latencyDelta = '';
@@ -745,11 +809,10 @@ function showDetailModal(kernel, platform_short) {
         latencyDelta = ' ' + formatDelta(d, true);
       }
     }
-    const latencyVal = h.helion_latency_avg_ms > 0 ? h.helion_latency_avg_ms.toFixed(2) + ' ms' : '--';
     html += `<tr>
       <td><a href="${commitUrl(h.full_sha)}" target="_blank" title="Run #${h.run_id}">${escHtml(h.sha)}</a></td>
       <td style="font-size:11px">${formatDate(h.date)}</td>
-      <td>${latencyVal}${latencyDelta}</td>
+      <td>${h.helion_latency_avg_ms.toFixed(2)} ms${latencyDelta}</td>
       <td>${formatSpeedup(h.helion_speedup_geomean)}${speedupDelta}</td>
       <td>${formatCompileTime(h.compile_time_avg_s)}</td>
     </tr>`;
@@ -760,19 +823,15 @@ function showDetailModal(kernel, platform_short) {
   html += '<div class="modal-rhs">';
   const histFwd = e.history || [];
   if (histFwd.length >= 2) {
-    const hasLatency = histFwd.some(h => h.helion_latency_avg_ms > 0);
-    if (hasLatency) {
-      html += '<div class="chart-container"><h3>Latency Over Time</h3><div id="mc-latency" style="width:100%;height:220px"></div></div>';
-    } else {
-      html += '<div class="chart-container"><h3>Speedup Over Time</h3><div id="mc-speedup" style="width:100%;height:220px"></div></div>';
-    }
+    html += '<div class="chart-container"><h3>Latency Over Time</h3><div id="mc-latency" style="width:100%;height:220px"></div></div>';
+    html += '<div class="chart-container"><h3>Speedup Over Time</h3><div id="mc-speedup" style="width:100%;height:220px"></div></div>';
     html += '<div class="chart-container"><h3>Compile Time Over Time</h3><div id="mc-compile" style="width:100%;height:220px"></div></div>';
   }
   const latest = histFwd.length > 0 ? histFwd[histFwd.length - 1] : null;
   if (latest && latest.per_shape && latest.per_shape.shapes.length > 0) {
     html += '<div class="chart-container"><h3>Per-Shape Speedup (Latest Run)</h3><div id="mc-bar-speedup" style="width:100%;height:260px"></div></div>';
     const ps = latest.per_shape;
-    const hasCompileTimes = ps.compile_times && ps.compile_times.length > 0 && ps.compile_times.some(v => v > 0);
+    const hasCompileTimes = ps.helion_compile_time_s && ps.helion_compile_time_s.length > 0 && ps.helion_compile_time_s.some(v => v > 0);
     if (hasCompileTimes) {
       html += '<div class="chart-container"><h3>Per-Shape Compile Time (Latest Run)</h3><div id="mc-bar-compile" style="width:100%;height:220px"></div></div>';
     }
@@ -784,53 +843,45 @@ function showDetailModal(kernel, platform_short) {
     const commitUrls = histFwd.map(h => commitUrl(h.full_sha));
     const xLabels = histFwd.map(h => h.sha + '\n' + formatDate(h.date));
     if (histFwd.length >= 2) {
-      const hasLatency = histFwd.some(h => h.helion_latency_avg_ms > 0);
-      if (hasLatency) {
+      const clickHandler = function(data) {
+        if (data.points && data.points[0] && data.points[0].customdata) {
+          window.open(data.points[0].customdata, '_blank');
+        }
+      };
+      // Latency Over Time (only if data exists)
+      const latEl = document.getElementById('mc-latency');
+      if (latEl) {
         const latVals = histFwd.map(h => h.helion_latency_avg_ms > 0 ? h.helion_latency_avg_ms : null);
-        const latTrace = {
-          x: xLabels, y: latVals,
-          mode: 'lines+markers', line: { color: color, width: 2 }, marker: { size: 6 },
+        Plotly.newPlot(latEl, [{
+          x: xLabels, y: latVals, mode: 'lines+markers',
+          line: { color: color, width: 2 }, marker: { size: 6 },
           text: histFwd.map(h => h.sha), customdata: commitUrls,
           hovertemplate: '%{text}: %{y:.2f} ms<extra></extra>',
-          connectgaps: false
-        };
-        const latLayout = Object.assign({}, plotlyDark, {
+          connectgaps: false,
+        }], Object.assign({}, plotlyDark, {
           height: 220,
           xaxis: Object.assign({}, plotlyDark.xaxis, { tickangle: -40 }),
-          yaxis: Object.assign({}, plotlyDark.yaxis, { title: 'Latency (ms)' })
-        });
-        const latEl = document.getElementById('mc-latency');
-        if (latEl) {
-          Plotly.newPlot(latEl, [latTrace], latLayout, { responsive: true, displayModeBar: false });
-          latEl.on('plotly_click', function(data) {
-            if (data.points && data.points[0] && data.points[0].customdata) {
-              window.open(data.points[0].customdata, '_blank');
-            }
-          });
-        }
-      } else {
+          yaxis: Object.assign({}, plotlyDark.yaxis, { title: 'Latency (ms)' }),
+        }), { responsive: true, displayModeBar: false });
+        latEl.on('plotly_click', clickHandler);
+      }
+      // Speedup Over Time (always shown)
+      const spEl = document.getElementById('mc-speedup');
+      if (spEl) {
         const spVals = histFwd.map(h => h.helion_speedup_geomean > 0 ? h.helion_speedup_geomean : null);
-        const spTrace = {
-          x: xLabels, y: spVals,
-          mode: 'lines+markers', line: { color: color, width: 2 }, marker: { size: 6 },
+        Plotly.newPlot(spEl, [{
+          x: xLabels, y: spVals, mode: 'lines+markers',
+          line: { color: color, width: 2 }, marker: { size: 6 },
           text: histFwd.map(h => h.sha), customdata: commitUrls,
           hovertemplate: '%{text}: %{y:.2f}x<extra></extra>',
-          connectgaps: false
-        };
-        const spLayout = Object.assign({}, plotlyDark, {
+          connectgaps: false,
+        }], Object.assign({}, plotlyDark, {
           height: 220,
           xaxis: Object.assign({}, plotlyDark.xaxis, { tickangle: -40 }),
-          yaxis: Object.assign({}, plotlyDark.yaxis, { title: 'Speedup' })
-        });
-        const spEl = document.getElementById('mc-speedup');
-        if (spEl) {
-          Plotly.newPlot(spEl, [spTrace], spLayout, { responsive: true, displayModeBar: false });
-          spEl.on('plotly_click', function(data) {
-            if (data.points && data.points[0] && data.points[0].customdata) {
-              window.open(data.points[0].customdata, '_blank');
-            }
-          });
-        }
+          yaxis: Object.assign({}, plotlyDark.yaxis, { title: 'Speedup' }),
+          shapes: [{ type: 'line', xref: 'paper', x0: 0, x1: 1, y0: 1, y1: 1, line: { color: '#f85149', width: 1, dash: 'dash' } }],
+        }), { responsive: true, displayModeBar: false });
+        spEl.on('plotly_click', clickHandler);
       }
       // Compile time over time
       const ctVals = histFwd.map(h => h.compile_time_avg_s > 0 ? h.compile_time_avg_s : null);
@@ -886,10 +937,10 @@ function showDetailModal(kernel, platform_short) {
         }
       }
       // Per-shape compile time
-      const hasCompileTimes = ps.compile_times && ps.compile_times.length > 0 && ps.compile_times.some(v => v > 0);
+      const hasCompileTimes = ps.helion_compile_time_s && ps.helion_compile_time_s.length > 0 && ps.helion_compile_time_s.some(v => v > 0);
       if (hasCompileTimes) {
         const compileBarTrace = {
-          x: shapes, y: ps.compile_times, type: 'bar',
+          x: shapes, y: ps.helion_compile_time_s, type: 'bar',
           marker: { color: '#f0883e' },
           hovertemplate: '%{x}: %{y:.1f}s<extra></extra>'
         };
@@ -929,13 +980,10 @@ function initDashboard() {
 function init() {
   if (DATA) { initDashboard(); return; }
   fetch('dashboard-data.json')
-    .then(r => {
-      if (!r.ok) throw new Error('HTTP ' + r.status);
-      return r.json();
-    })
+    .then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
     .then(json => { DATA = json; initDashboard(); })
     .catch(() => {
-      document.getElementById('tab-overview').innerHTML = '<div style="padding:60px;text-align:center"><h2 style="color:var(--red);margin-bottom:12px">Data Not Loaded</h2><p style="color:var(--text-dim)">Could not load dashboard data. Place <code>dashboard-data.json</code> in the same directory and serve via HTTP.</p></div>';
+      document.getElementById('tab-overview').innerHTML = '<div style="padding:60px;text-align:center"><h2 style="color:var(--red);margin-bottom:12px">Data Not Loaded</h2><p style="color:var(--text-dim)">Could not load dashboard-data.json.</p></div>';
     });
 }
 init();

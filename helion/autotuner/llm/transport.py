@@ -157,12 +157,15 @@ def _anthropic_payload(
 ) -> dict[str, Any]:
     """Build an Anthropic Messages request payload."""
     system_prompt, input_messages = split_system_messages(messages)
+    normalized_model = strip_provider_prefix(model)
     payload: dict[str, Any] = {
-        "model": strip_provider_prefix(model),
+        "model": normalized_model,
         "messages": anthropic_messages_from_history(input_messages),
         "max_tokens": max_output_tokens,
-        "temperature": DEFAULT_ANTHROPIC_TEMPERATURE,
     }
+    # Claude Opus 4.7 returns HTTP 400 if `temperature` is present.
+    if not normalized_model.lower().startswith("claude-opus-4-7"):
+        payload["temperature"] = DEFAULT_ANTHROPIC_TEMPERATURE
     if system_prompt:
         payload["system"] = system_prompt
     return payload
