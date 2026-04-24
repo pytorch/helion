@@ -322,7 +322,6 @@ class TestExamples(RefEagerTestBase, TestCase):
             block_sizes=[16, 16, 16, 16],
         )
 
-    @xfailIfPallas("reduction tile K=256 doesn't evenly divide K=384")
     @xfailIfCute("CuTE IR build error with non-divisible K block sizes")
     def test_bmm_non_divisible_k(self):
         args = (
@@ -962,6 +961,17 @@ class TestExamples(RefEagerTestBase, TestCase):
             (x,),
             x.sum(-1),
             fn_name="longsum_manual",
+        )
+
+    def test_long_sum_manual_non_divisible(self):
+        """Reduction loop OOB when block_size doesn't divide the reduction dim."""
+        x = torch.randn([4, 50000], device=DEVICE, dtype=torch.float32)
+        check_example(
+            "long_sum",
+            (x,),
+            x.sum(-1),
+            fn_name="longsum_manual",
+            block_sizes=[32768, 1],
         )
 
     @xfailIfCute("CuTe jagged mean example still fails lowering/runtime")

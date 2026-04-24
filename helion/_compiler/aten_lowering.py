@@ -938,6 +938,13 @@ def _pallas_dot(ctx: LoweringContext, node: Node, with_acc: bool) -> ast.AST:
     need_f32_acc = _needs_f32_accumulator(lhs_dtype, rhs_dtype)
     out_dtype = node.meta["val"].dtype if "val" in node.meta else None
 
+    # Record matmul K-dim for host-side padding.  This covers all loop types
+    # (default, fori_loop DMA, emit_pipeline) because it traces from the
+    # matmul operands back to the source load() tensors.
+    from ..language.memory_ops import _record_pad_info_from_matmul
+
+    _record_pad_info_from_matmul(lhs_node_arg, rhs_node_arg)
+
     return _emit_pallas_matmul(
         lhs,
         rhs,

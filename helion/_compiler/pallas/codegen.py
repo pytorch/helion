@@ -112,6 +112,33 @@ def _generated_index_code(
     pipeline_block_ids: set[int],
 ) -> str:
     """Generate index code based on the indexing pattern."""
+    result = _dispatch_index_code(
+        pattern, idx, state, tensor, subscript_index, tensor_dim,
+        in_pipeline, pipeline_block_ids,
+    )
+
+    # Record dims using pl.ds() for host-side padding of non-divisible blocks.
+    if "pl.ds" in result:
+        from helion.language.memory_ops import _record_pad_info
+
+        block_id = _get_pattern_block_id(pattern, tensor, tensor_dim)
+        assert block_id is not None
+        _record_pad_info(state, tensor, tensor_dim, block_id)
+
+    return result
+
+
+def _dispatch_index_code(
+    pattern: object,
+    idx: object,
+    state: CodegenState,
+    tensor: torch.Tensor,
+    subscript_index: int,
+    tensor_dim: int,
+    in_pipeline: bool,
+    pipeline_block_ids: set[int],
+) -> str:
+    """Dispatch to the pattern-specific index code generator."""
     from helion._compiler.pallas.plan_tiling import ArbitraryIndexPattern
     from helion._compiler.pallas.plan_tiling import ArbitrarySlicePattern
     from helion._compiler.pallas.plan_tiling import TileBeginWithOffsetPattern
@@ -144,6 +171,30 @@ def _generated_index_code(
         f"Pattern: {pattern}, idx: {idx}, subscript_index: {subscript_index}. "
         f"All indexing patterns should be handled by the tiling analysis system."
     )
+
+
+def _get_pattern_block_id(
+    pattern: object, tensor: torch.Tensor, tensor_dim: int
+) -> int | None:
+    """Extract the block_id from an indexing pattern, if any."""
+    from helion._compiler.pallas.plan_tiling import TileBeginWithOffsetPattern
+    from helion._compiler.pallas.plan_tiling import TileIndexWithOffsetPattern
+    from helion._compiler.pallas.plan_tiling import TilePattern
+
+    if isinstance(
+        pattern,
+        (TilePattern, TileIndexWithOffsetPattern, TileBeginWithOffsetPattern),
+    ):
+        return pattern.block_id
+    from helion._compiler.pallas.plan_tiling import ArbitrarySlicePattern
+
+    if isinstance(pattern, ArbitrarySlicePattern):
+        from helion._compiler.compile_environment import CompileEnvironment
+
+        return CompileEnvironment.current().resolve_block_id(
+            tensor.shape[tensor_dim]
+        )
+    return None
 
 
 def _tile_pattern_code(

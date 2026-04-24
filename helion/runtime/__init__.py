@@ -740,44 +740,104 @@ def _pallas_invoke_and_return(
     tensor_arg_indices: list[int],
     arg_to_tensor_pos: dict[int, int],
     _output_indices: list[int],
+    _ds_pad_dims: list[tuple[int, int, int]] | None = None,
+    _orig_output_tensors: dict[int, torch.Tensor] | None = None,
 ) -> object:
     """Run the JaxCallable and return output-only results.
 
     Output-only tensors (those not in ``arg_to_tensor_pos``) are not passed
     as pallas_call inputs, so the JaxCallable returns new buffers for them.
     Returns a single tensor, a tuple of tensors, or None.
+
+    When ``_ds_pad_dims`` is provided, also handles:
+    - Copying sliced results back into original (unpadded) in-place output tensors
+    - Slicing padded output-only result tensors back to original shapes
     """
     input_tensors = [
         cast("torch.Tensor", args[i]).contiguous() for i in tensor_arg_indices
     ]
     results = jax_callable(*input_tensors)  # type: ignore[operator]
-    if results is None:
-        return None
-    if not isinstance(results, (tuple, list)):
-        results = (results,)
-    output_only_results = []
-    for out_idx, orig_pos in enumerate(_output_indices):
-        if orig_pos not in arg_to_tensor_pos:
-            result = results[out_idx]
-            if not isinstance(result, torch.Tensor):
-                # Interpret mode: pallas_call returns JAX arrays, convert to torch.
-                # On TPU, JaxCallable returns torch tensors directly.
-                out_tensor = cast("torch.Tensor", args[orig_pos])
-                # Output-only tensors are allocated with ``device='meta'`` to
-                # avoid HBM; fall back to the first real input's device in
-                # interpret mode so the converted tensor lands somewhere real.
-                device = out_tensor.device
-                if device.type == "meta" and tensor_arg_indices:
-                    device = cast("torch.Tensor", args[tensor_arg_indices[0]]).device
-                result = _jax_to_torch(
-                    result,
-                    device=device,
-                    dtype=out_tensor.dtype,
-                )
-            output_only_results.append(result)
+
+    # Collect output-only results
+    output_only_results: list[object] = []
+    if results is not None:
+        if not isinstance(results, (tuple, list)):
+            results = (results,)
+        for out_idx, orig_pos in enumerate(_output_indices):
+            if orig_pos not in arg_to_tensor_pos:
+                result = results[out_idx]
+                if not isinstance(result, torch.Tensor):
+                    out_tensor = cast("torch.Tensor", args[orig_pos])
+                    device = out_tensor.device
+                    if device.type == "meta" and tensor_arg_indices:
+                        device = cast(
+                            "torch.Tensor", args[tensor_arg_indices[0]]
+                        ).device
+                    result = _jax_to_torch(
+                        result, device=device, dtype=out_tensor.dtype
+                    )
+                output_only_results.append(result)
+
+    # Handle padding copy-back and result slicing
+    if _ds_pad_dims:
+        # Copy sliced results back into original in-place output tensors
+        if _orig_output_tensors:
+            pad_by_arg: dict[int, list[tuple[int, int]]] = {}
+            for arg_idx, dim, pad_amount in _ds_pad_dims:
+                pad_by_arg.setdefault(arg_idx, []).append((dim, pad_amount))
+            for arg_idx, orig_tensor in _orig_output_tensors.items():
+                padded = cast("torch.Tensor", args[arg_idx])
+                slices = [slice(None)] * padded.ndim
+                for dim, _pad in pad_by_arg.get(arg_idx, []):
+                    slices[dim] = slice(None, orig_tensor.shape[dim])
+                orig_tensor.copy_(padded[tuple(slices)])
+
+        # Slice padded output-only results back to original shapes
+        if output_only_results:
+            pad_by_arg_: dict[int, list[tuple[int, int]]] = {}
+            for arg_idx, dim, pad_amount in _ds_pad_dims:
+                pad_by_arg_.setdefault(arg_idx, []).append((dim, pad_amount))
+            compacted_idx = 0
+            for orig_pos in _output_indices:
+                if orig_pos not in arg_to_tensor_pos:
+                    pads = pad_by_arg_.get(orig_pos)
+                    if pads and compacted_idx < len(output_only_results):
+                        t = output_only_results[compacted_idx]
+                        if isinstance(t, torch.Tensor):
+                            slices = [slice(None)] * t.ndim
+                            for dim, pad in pads:
+                                slices[dim] = slice(None, t.shape[dim] - pad)
+                            output_only_results[compacted_idx] = t[tuple(slices)]
+                    compacted_idx += 1
+
     if len(output_only_results) == 1:
         return output_only_results[0]
     return tuple(output_only_results) if output_only_results else None
+
+
+def _pallas_apply_ds_padding(
+    args: tuple[object, ...],
+    _output_indices: list[int],
+    _ds_pad_dims: list[tuple[int, int, int]],
+) -> tuple[tuple[object, ...], dict[int, torch.Tensor]]:
+    """Pad tensor args along non-divisible pl.ds() dimensions.
+
+    Returns the padded args tuple and a dict mapping output arg indices
+    to their original (unpadded) tensors for post-call copy-back.
+    """
+    args_list = list(args)
+    orig_output_tensors: dict[int, torch.Tensor] = {}
+    output_set = set(_output_indices)
+    for arg_idx, dim, pad_amount in _ds_pad_dims:
+        a = args_list[arg_idx]
+        if not isinstance(a, torch.Tensor):
+            continue
+        if arg_idx in output_set:
+            orig_output_tensors[arg_idx] = a
+        pad_widths = [0] * (2 * a.ndim)
+        pad_widths[2 * (a.ndim - 1 - dim) + 1] = pad_amount
+        args_list[arg_idx] = torch.nn.functional.pad(a, pad_widths)
+    return tuple(args_list), orig_output_tensors
 
 
 def default_pallas_launcher(
@@ -788,6 +848,7 @@ def default_pallas_launcher(
     _inplace_indices: list[int] | None = None,
     _block_spec_info: _BlockSpecInfo | None = None,
     _smem_arg_indices: list[int] | None = None,
+    _ds_pad_dims: list[tuple[int, int, int]] | None = None,
     **kwargs: object,
 ) -> object:
     """Default launcher for Pallas kernels on TPU (or CPU with interpret=True).
@@ -804,6 +865,12 @@ def default_pallas_launcher(
     """
     if _output_indices is None:
         _output_indices = []
+
+    _orig_output_tensors: dict[int, torch.Tensor] | None = None
+    if _ds_pad_dims:
+        args, _orig_output_tensors = _pallas_apply_ds_padding(
+            args, _output_indices, _ds_pad_dims
+        )
 
     _pallas_check_dtypes(args)
 
@@ -903,7 +970,8 @@ def default_pallas_launcher(
         )
 
     return _pallas_invoke_and_return(
-        jax_callable, args, tensor_arg_indices, arg_to_tensor_pos, _output_indices
+        jax_callable, args, tensor_arg_indices, arg_to_tensor_pos,
+        _output_indices, _ds_pad_dims, _orig_output_tensors,
     )
 
 
@@ -916,6 +984,7 @@ def default_pallas_pipeline_launcher(
     _block_spec_info: _BlockSpecInfo | None = None,
     _scratch_shapes: list[tuple[tuple[int, ...], str]] | None = None,
     _pipeline_arg_indices: list[int] | None = None,
+    _ds_pad_dims: list[tuple[int, int, int]] | None = None,
     **kwargs: object,
 ) -> object:
     """Launcher for Pallas kernels using PrefetchScalarGridSpec with scratch memory.
@@ -930,6 +999,12 @@ def default_pallas_pipeline_launcher(
         _scratch_shapes = []
 
     _pallas_check_dtypes(args)
+
+    _orig_output_tensors: dict[int, torch.Tensor] | None = None
+    if _ds_pad_dims:
+        args, _orig_output_tensors = _pallas_apply_ds_padding(
+            args, _output_indices, _ds_pad_dims
+        )
 
     cache = getattr(pallas_kernel, "_pallas_pipeline_cache", None)
     if cache is not None and cache[0] == grid:
@@ -1055,7 +1130,8 @@ def default_pallas_pipeline_launcher(
         )
 
     return _pallas_invoke_and_return(
-        jax_callable, args, tensor_arg_indices, arg_to_tensor_pos, _output_indices
+        jax_callable, args, tensor_arg_indices, arg_to_tensor_pos,
+        _output_indices, _ds_pad_dims, _orig_output_tensors,
     )
 
 
@@ -1067,6 +1143,7 @@ def default_pallas_fori_launcher(
     _inplace_indices: list[int] | None = None,
     _block_spec_info: _BlockSpecInfo | None = None,
     _scratch_shapes: list[tuple[tuple[int, ...], str | None, str]] | None = None,
+    _ds_pad_dims: list[tuple[int, int, int]] | None = None,
     **kwargs: object,
 ) -> object:
     """Launcher for Pallas kernels using fori_loop with manual DMA.
@@ -1083,6 +1160,12 @@ def default_pallas_fori_launcher(
         _scratch_shapes = []
 
     _pallas_check_dtypes(args)
+
+    _orig_output_tensors: dict[int, torch.Tensor] | None = None
+    if _ds_pad_dims:
+        args, _orig_output_tensors = _pallas_apply_ds_padding(
+            args, _output_indices, _ds_pad_dims
+        )
 
     cache = getattr(pallas_kernel, "_pallas_fori_cache", None)
     if cache is not None and cache[0] == grid:
@@ -1207,7 +1290,8 @@ def default_pallas_fori_launcher(
         )
 
     return _pallas_invoke_and_return(
-        jax_callable, args, tensor_arg_indices, arg_to_tensor_pos, _output_indices
+        jax_callable, args, tensor_arg_indices, arg_to_tensor_pos,
+        _output_indices, _ds_pad_dims, _orig_output_tensors,
     )
 
 

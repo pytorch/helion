@@ -328,6 +328,13 @@ class DeviceFunction:
         # dict would then need to support multiple entries per tensor
         # or the tensor would get distinct arg IDs per memory space.
         self.pallas_memory_space: dict[int, PallasMemorySpace] = {}
+        # Pallas: id(fake_tensor) → {dim: block_id} for dims using pl.ds()
+        # that may need host-side padding when block size doesn't divide dim.
+        self.pallas_pad_info: dict[int, dict[int, int]] = {}
+        # Pallas: K block_ids from matmul ops — used to pad all tensors
+        # with those block_ids even when pl.ds() isn't in the kernel body
+        # (e.g., fori_loop DMA, emit_pipeline).
+        self.pallas_matmul_k_block_ids: set[int] = set()
 
     def allocate_store_index(self) -> int:
         """Bump store counters and return the indexing strategy slot."""

@@ -159,6 +159,43 @@ def _(state: CodegenState) -> ast.AST:
     raise NotImplementedError(f"Cannot store to type: {type(tensor)}")
 
 
+def _record_pad_info(
+    state: CodegenState,
+    tensor: torch.Tensor,
+    tensor_dim: int,
+    block_id: int,
+) -> None:
+    """Record that a tensor dimension uses pl.ds() and may need host-side padding."""
+    pad_info = state.device_function.pallas_pad_info
+    tensor_id = id(tensor)
+    if tensor_id not in pad_info:
+        pad_info[tensor_id] = {}
+    pad_info[tensor_id][tensor_dim] = block_id
+
+
+def _record_pad_info_from_matmul(
+    lhs_node: torch.fx.Node,
+    rhs_node: torch.fx.Node,
+) -> None:
+    """Record matmul K block_id for host-side padding.
+
+    Records the K block_id so that _compute_pad_info can pad all tensors
+    with that block_id on the K dimension.  This covers all Pallas loop
+    types including fori_loop DMA and emit_pipeline where the kernel body
+    doesn't go through the normal codegen pl.ds() path.
+    """
+    from .._compiler.compile_environment import CompileEnvironment
+    from .._compiler.device_function import DeviceFunction
+
+    env = CompileEnvironment.current()
+    device_fn = DeviceFunction.current()
+    lhs_val = lhs_node.meta["val"]
+    k_size = lhs_val.size(-1)
+    k_block_id = env.resolve_block_id(k_size)
+    if k_block_id is not None:
+        device_fn.pallas_matmul_k_block_ids.add(k_block_id)
+
+
 def _maybe_get_symbol_origin(idx: object) -> SymbolOrigin | None:
     if not isinstance(idx, torch.SymInt):
         return None

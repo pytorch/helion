@@ -1558,6 +1558,104 @@ class PallasBackend(Backend):
             result.append((tuple(block_shape), tuple(grid_dims)))
         return result
 
+    def _compute_pad_info(
+        self,
+        sorted_args: list[Argument] | None,
+        config: Config,
+    ) -> list[tuple[int, int, int]] | None:
+        """Compute per-tensor padding for pl.ds() dims with non-divisible block sizes.
+
+        Merges two sources:
+        1. Codegen-level ``pallas_pad_info`` — dims that use pl.ds() in the kernel body
+        2. Matmul K ``pallas_matmul_k_block_ids`` — K-dims from matmul lowering
+
+        Returns ``[(arg_index, tensor_dim, pad_amount), ...]`` or ``None``.
+        """
+        if sorted_args is None:
+            return None
+
+        from .device_function import DeviceFunction
+
+        device_fn = DeviceFunction.current()
+        if not device_fn.pallas_pad_info and not device_fn.pallas_matmul_k_block_ids:
+            return None
+
+        result = self._collect_codegen_pad_dims(sorted_args, config)
+        result += self._collect_matmul_k_pad_dims(sorted_args, config, result)
+        return result or None
+
+    def _pad_amount_for_block(self, block_id: int, config: Config) -> int | None:
+        """Return the padding needed for a block_id, or None if divisible."""
+        from .compile_environment import CompileEnvironment
+
+        env = CompileEnvironment.current()
+        bsi = env.block_sizes[block_id]
+        bs = bsi.from_config(config)
+        if not isinstance(bs, int) or bs <= 1:
+            return None
+        try:
+            numel = int(bsi.numel)
+        except (TypeError, ValueError):
+            return None
+        pad = (-numel) % bs
+        return pad if pad > 0 else None
+
+    def _collect_codegen_pad_dims(
+        self,
+        sorted_args: list[Argument],
+        config: Config,
+    ) -> list[tuple[int, int, int]]:
+        """Collect padding from codegen-level pl.ds() tracking."""
+        from .device_function import DeviceFunction
+        from .device_function import TensorArg
+
+        device_fn = DeviceFunction.current()
+        result: list[tuple[int, int, int]] = []
+        for i, arg in enumerate(sorted_args):
+            if not isinstance(arg, TensorArg):
+                continue
+            dims_info = device_fn.pallas_pad_info.get(id(arg.fake_value))
+            if dims_info is not None:
+                for dim, block_id in dims_info.items():
+                    pad = self._pad_amount_for_block(block_id, config)
+                    if pad is not None:
+                        result.append((i, dim, pad))
+        return result
+
+    def _collect_matmul_k_pad_dims(
+        self,
+        sorted_args: list[Argument],
+        config: Config,
+        already_covered: list[tuple[int, int, int]],
+    ) -> list[tuple[int, int, int]]:
+        """Collect padding from matmul K block_ids (fori_loop DMA, emit_pipeline)."""
+        from .device_function import DeviceFunction
+        from .device_function import TensorArg
+
+        device_fn = DeviceFunction.current()
+        if not device_fn.pallas_matmul_k_block_ids:
+            return []
+
+        covered = {(arg_idx, dim) for arg_idx, dim, _ in already_covered}
+        result: list[tuple[int, int, int]] = []
+        for i, arg in enumerate(sorted_args):
+            if not isinstance(arg, TensorArg):
+                continue
+            dim_tilings = device_fn.pallas_tensor_dim_tilings.get(
+                id(arg.fake_value)
+            )
+            if dim_tilings is None:
+                continue
+            for d, dt in enumerate(dim_tilings):
+                if (i, d) in covered:
+                    continue
+                for bid in dt.block_ids:
+                    if bid in device_fn.pallas_matmul_k_block_ids:
+                        pad = self._pad_amount_for_block(bid, config)
+                        if pad is not None:
+                            result.append((i, d, pad))
+        return result
+
     def build_launcher_args(
         self,
         args: list[str],
@@ -1653,6 +1751,10 @@ class PallasBackend(Backend):
             if has_rng_ops:
                 block_spec_info.append(None)  # RNG seed buffer is untiled
             launcher_args.append(f"_block_spec_info={block_spec_info!r}")
+
+        pad_info = self._compute_pad_info(sorted_args, config)
+        if pad_info:
+            launcher_args.append(f"_ds_pad_dims={pad_info!r}")
 
         from .device_function import PallasMemorySpace
 
