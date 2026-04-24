@@ -125,8 +125,8 @@ class TestGridFolding(TestCase):
 
     def test_2d_partial_folding(self):
         """Partial folding (factor=2) on last dim: grid shrinks by 2, loop of 2."""
-        x = torch.randn(64, 64, device=DEVICE)
-        y = torch.randn(64, 64, device=DEVICE)
+        x = torch.randn(256, 256, device=DEVICE)
+        y = torch.randn(256, 256, device=DEVICE)
         code, result = code_and_output(
             add_2d_kernel, (x, y), block_sizes=[32, 32], grid_foldings=[[0, 2]]
         )
@@ -136,8 +136,8 @@ class TestGridFolding(TestCase):
 
     def test_3d_partial_folding_last_dim(self):
         """Partial folding (factor=4) on last dim of 3D tile."""
-        x = torch.randn(8, 16, 128, device=DEVICE)
-        y = torch.randn(8, 16, 128, device=DEVICE)
+        x = torch.randn(32, 64, 512, device=DEVICE)
+        y = torch.randn(32, 64, 512, device=DEVICE)
         code, result = code_and_output(
             add_3d_kernel,
             (x, y),
@@ -149,8 +149,8 @@ class TestGridFolding(TestCase):
 
     def test_partial_folding_non_divisible(self):
         """Partial folding with non-divisible sizes."""
-        x = torch.randn(50, 70, device=DEVICE)
-        y = torch.randn(50, 70, device=DEVICE)
+        x = torch.randn(200, 300, device=DEVICE)
+        y = torch.randn(200, 300, device=DEVICE)
         code, result = code_and_output(
             add_2d_kernel, (x, y), block_sizes=[32, 32], grid_foldings=[[0, 2]]
         )
@@ -158,8 +158,8 @@ class TestGridFolding(TestCase):
 
     def test_mixed_partial_and_full_folding(self):
         """Mix of partial folding on one dim and full folding on another."""
-        x = torch.randn(8, 64, 128, device=DEVICE)
-        y = torch.randn(8, 64, 128, device=DEVICE)
+        x = torch.randn(32, 256, 512, device=DEVICE)
+        y = torch.randn(32, 256, 512, device=DEVICE)
         code, result = code_and_output(
             add_3d_kernel,
             (x, y),
@@ -175,8 +175,8 @@ class TestGridFolding(TestCase):
         This is a regression test: previously folding loop variables for
         outer dims were never used, causing stale offsets in the kernel body.
         """
-        x = torch.randn(8, 64, 128, device=DEVICE)
-        y = torch.randn(8, 64, 128, device=DEVICE)
+        x = torch.randn(32, 256, 512, device=DEVICE)
+        y = torch.randn(32, 256, 512, device=DEVICE)
         code, result = code_and_output(
             add_3d_kernel,
             (x, y),
@@ -334,8 +334,8 @@ class TestGridFoldingWithFlatten(TestCase):
 
     def test_partial_folding_with_flatten_falls_back(self):
         """Partial folding + flatten falls back to NDTileStrategy (no crash)."""
-        x = torch.randn(64, 64, device=DEVICE)
-        y = torch.randn(64, 64, device=DEVICE)
+        x = torch.randn(256, 256, device=DEVICE)
+        y = torch.randn(256, 256, device=DEVICE)
         code, result = code_and_output(
             add_2d_kernel,
             (x, y),
@@ -469,6 +469,62 @@ class TestGridFoldingGridSize(TestCase):
         # Partial B=2, full C: 1*(4/2)=2.
         self.assertEqual(grid_nf, 16)
         self.assertEqual(grid_mf, 2)
+
+
+class TestGridFoldingHeuristic(TestCase):
+    """Verify that the autotuner heuristic gates partial folding for small dims."""
+
+    @staticmethod
+    def _get_folding_choices(x: torch.Tensor, y: torch.Tensor) -> list[tuple[int, ...]]:
+        """Bind add_2d_kernel and return per-dim folding choices."""
+        from helion.autotuner.config_fragment import EnumFragment
+        from helion.autotuner.config_fragment import PerDimListOf
+
+        bound = add_2d_kernel.bind((x, y))
+        spec = bound.config_spec
+        gf_spec = spec.grid_foldings[0]
+        with bound.env:
+            frag = gf_spec._fragment(spec)
+        assert isinstance(frag, PerDimListOf)
+        choices = []
+        for f in frag.fragments:
+            assert isinstance(f, EnumFragment)
+            choices.append(f.choices)
+        return choices
+
+    def test_small_dims_no_partial_folding(self):
+        """Small grid (total blocks < MIN_GRID_SM_RATIO * SMs) → no partial folding."""
+        x = torch.randn(16, 16, device=DEVICE)
+        y = torch.randn(16, 16, device=DEVICE)
+        choices = self._get_folding_choices(x, y)
+        for dim_choices in choices:
+            self.assertTrue(
+                all(c <= 0 for c in dim_choices),
+                f"Expected only (0, -1) for small grid, got {dim_choices}",
+            )
+
+    def test_large_dims_allow_partial_folding(self):
+        """Large dimensions should include partial folding factors (2, 4, ...)."""
+        x = torch.randn(4096, 4096, device=DEVICE)
+        y = torch.randn(4096, 4096, device=DEVICE)
+        choices = self._get_folding_choices(x, y)
+        for dim_choices in choices:
+            has_partial = any(c > 0 for c in dim_choices)
+            self.assertTrue(
+                has_partial,
+                f"Expected partial factors for large dim, got {dim_choices}",
+            )
+
+    def test_mixed_dims_per_dim_gating(self):
+        """Heuristic should gate per-dimension: small dim no partial, large dim allows."""
+        x = torch.randn(3, 4096, device=DEVICE)
+        y = torch.randn(3, 4096, device=DEVICE)
+        choices = self._get_folding_choices(x, y)
+        # dim 0: 3 elements / min_block_size=1 → 3 blocks < MIN_BLOCKS_FOR_PARTIAL
+        self.assertTrue(
+            all(c <= 0 for c in choices[0]),
+            f"Expected only (0, -1) for small dim 0, got {choices[0]}",
+        )
 
 
 if __name__ == "__main__":

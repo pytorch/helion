@@ -1223,6 +1223,9 @@ class GridFoldingSpec(_BlockIdItem):
     # Valid folding factor choices (order matters for EnumFragment default)
     VALID_FACTORS: tuple[int, ...] = (0, -1, 2, 4, 8, 16, 32, 64)
 
+    MIN_BLOCKS_FOR_PARTIAL = 4
+    MIN_GRID_SM_RATIO = 2
+
     def _fragment(self, base: ConfigSpec) -> PerDimListOf | ListOf:
         from .._compiler.compile_environment import CompileEnvironment
         from .._compiler.compile_environment import NoCurrentEnvironment
@@ -1236,30 +1239,47 @@ class GridFoldingSpec(_BlockIdItem):
                 EnumFragment(choices=self.VALID_FACTORS),
                 length=len(self.block_ids),
             )
-        fragments: list[ConfigSpecFragment] = []
+
+        # First pass: compute num_blocks per dimension.
+        dim_num_blocks: list[int | None] = []
         for block_id in self.block_ids:
             bs_info = env.block_sizes[block_id]
             bs_spec = base.block_sizes.block_id_lookup(block_id)
-            # Compute max useful partial folding factor for this dim.
-            # factor >= num_blocks is degenerate (grid collapses to 1 cell),
-            # so exclude those from the search space.
-            max_factor: int | None = None
+            nb: int | None = None
             if bs_info.size is not None:
                 numel_val = bs_info.numel
                 if isinstance(numel_val, (int, sympy.Integer)):
                     min_bs = bs_spec.autotuner_min or bs_spec.min_size
-                    # Use the smallest possible block_size to get the largest
-                    # num_blocks — factors below that are always valid.
-                    num_blocks = int(
+                    nb = int(
                         sympy.ceiling(
                             sympy.Rational(int(numel_val), max(int(min_bs), 1))
                         )
                     )
-                    max_factor = num_blocks - 1
-            if max_factor is not None:
-                choices = tuple(
-                    f for f in self.VALID_FACTORS if f <= 0 or f <= max_factor
-                )
+            dim_num_blocks.append(nb)
+
+        # Gate: disable partial folding when the total launch grid is small
+        # relative to the number of SMs — folding can only hurt occupancy.
+        total_grid = 1
+        all_known = True
+        for nb in dim_num_blocks:
+            if nb is not None:
+                total_grid *= nb
+            else:
+                all_known = False
+        n_cus = num_compute_units()
+        small_grid = all_known and total_grid < self.MIN_GRID_SM_RATIO * n_cus
+
+        # Second pass: build per-dim fragments with heuristic gating.
+        fragments: list[ConfigSpecFragment] = []
+        for nb in dim_num_blocks:
+            if nb is not None:
+                max_factor = nb - 1
+                if small_grid or nb < self.MIN_BLOCKS_FOR_PARTIAL:
+                    choices = tuple(f for f in self.VALID_FACTORS if f <= 0)
+                else:
+                    choices = tuple(
+                        f for f in self.VALID_FACTORS if f <= 0 or f <= max_factor
+                    )
             else:
                 choices = self.VALID_FACTORS
             fragments.append(EnumFragment(choices=choices))
