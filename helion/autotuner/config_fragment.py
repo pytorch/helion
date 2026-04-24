@@ -383,10 +383,12 @@ class ListOf(ConfigSpecFragment):
 
 @dataclasses.dataclass
 class PerDimListOf(ConfigSpecFragment):
-    """Like ListOf but with independently typed fragments per dimension.
+    """Like ListOf but each position has its own fragment with distinct choices.
 
-    Used when each dimension has a different set of valid choices (e.g.
-    grid folding factors that depend on per-dim num_blocks).
+    ListOf repeats a single inner fragment for every position, so all
+    dimensions share the same valid values.  PerDimListOf holds a separate
+    fragment per dimension, allowing each to have a different choice set
+    (e.g. grid folding factors filtered by per-dim num_blocks).
     """
 
     fragments: list[ConfigSpecFragment]

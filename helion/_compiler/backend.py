@@ -34,6 +34,27 @@ if TYPE_CHECKING:
     InductorOpOverrides = OpsHandler[Any]
 
 
+def _project_loop_order(
+    loop_order: list[int],
+    original_block_ids: list[int],
+    current_block_ids: list[int],
+) -> list[int]:
+    """Project a wider loop_order onto a subset of block_ids.
+
+    When grid folding removes dimensions, the loop_order from the original
+    tile call may be wider than the current block_ids.  This preserves the
+    relative ordering of the surviving dimensions rather than falling back
+    to identity.
+    """
+    current_set = set(current_block_ids)
+    surviving_positions = {
+        i for i, bid in enumerate(original_block_ids) if bid in current_set
+    }
+    filtered = [p for p in loop_order if p in surviving_positions]
+    rank = {v: r for r, v in enumerate(sorted(filtered))}
+    return [rank[v] for v in filtered]
+
+
 class Backend(abc.ABC):
     """Abstract base class for Helion code generation backends.
 
@@ -532,10 +553,12 @@ class Backend(abc.ABC):
         loop_order = env.config_spec.loop_orders.config_get(
             config.loop_orders, block_ids[0]
         ) or [*range(len(block_ids))]
-        # The config lookup may return a loop_order from a wider tile call
-        # (e.g. 2-dim order for a 1-dim strategy created by grid folding).
         if len(loop_order) != len(block_ids):
-            loop_order = [*range(len(block_ids))]
+            loop_order = _project_loop_order(
+                loop_order,
+                env.config_spec.loop_orders.block_id_lookup(block_ids[0]).block_ids,
+                block_ids,
+            )
         l2_grouping = env.config_spec.l2_groupings.config_get(
             config.l2_groupings, block_ids[0], 1
         )
