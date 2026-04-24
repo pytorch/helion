@@ -317,6 +317,60 @@ def pallas_reduce_non_pow2(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
+def _cumsum_broadcast_ref(
+    a: torch.Tensor, b: torch.Tensor, block_k: int = 128
+) -> torch.Tensor:
+    """Eager reference for cumsum_broadcast kernels.
+
+    running[b,m] accumulates row sums; acc[b,m,d] += running[:,:,None].
+    """
+    batch, m, k = a.shape
+    head_dim = b.shape[-1]
+    running = torch.zeros(batch, m, dtype=torch.float32, device=a.device)
+    acc = torch.zeros(batch, m, head_dim, dtype=torch.float32, device=a.device)
+    for kb in range(0, k, block_k):
+        chunk = a[:, :, kb : kb + block_k]
+        running = running + chunk.sum(-1).float()
+        acc = acc + running[:, :, None]
+    return acc.to(a.dtype)
+
+
+def _scaled_bmm_ref(
+    a: torch.Tensor, b: torch.Tensor, block_k: int = 128
+) -> torch.Tensor:
+    """Eager reference for scaled_bmm kernels.
+
+    m_i[b,m] accumulates row sums; acc[b,m,d] += m_i[:,:,None].
+    """
+    batch, m, k = a.shape
+    head_dim = b.shape[-1]
+    m_i = torch.zeros(batch, m, dtype=torch.float32, device=a.device)
+    acc = torch.zeros(batch, m, head_dim, dtype=torch.float32, device=a.device)
+    for kb in range(0, k, block_k):
+        chunk = a[:, :, kb : kb + block_k]
+        m_i = m_i + chunk.sum(-1).float()
+        acc = acc + m_i[:, :, None]
+    return acc.to(a.dtype)
+
+
+def _running_max_broadcast_ref(
+    a: torch.Tensor, b: torch.Tensor, block_k: int = 128
+) -> torch.Tensor:
+    """Eager reference for running_max_broadcast kernel.
+
+    scale[b,m] = running max of chunk row maxes; acc[b,m,d] += scale[:,:,None].
+    """
+    batch, m, k = a.shape
+    head_dim = b.shape[-1]
+    scale = torch.zeros(batch, m, dtype=torch.float32, device=a.device)
+    acc = torch.zeros(batch, m, head_dim, dtype=torch.float32, device=a.device)
+    for kb in range(0, k, block_k):
+        chunk = a[:, :, kb : kb + block_k]
+        scale = torch.maximum(scale, chunk.amax(-1).float())
+        acc = acc + scale[:, :, None]
+    return acc.to(a.dtype)
+
+
 @onlyBackends(["triton", "pallas"])
 @skipUnlessPallas("JAX/Pallas TPU not available")
 class TestPallas(TestCase):
@@ -735,15 +789,25 @@ class TestPallas(TestCase):
         self.assertIn("out = _launcher(", _code)
 
     def test_attention_emit_pipeline_correctness(self) -> None:
-        """Test emit_pipeline attention with loop-carried state."""
+        """Test emit_pipeline attention with loop-carried state and pre-broadcast."""
         query = torch.randn(2, 2, 128, 128, dtype=torch.float32, device=DEVICE)
         key = torch.randn(2, 2, 128, 128, dtype=torch.float32, device=DEVICE)
         val = torch.randn(2, 2, 128, 128, dtype=torch.float32, device=DEVICE)
-        _code, result = code_and_output(
+        code, result = code_and_output(
             pallas_attention,
             (query, key, val),
             block_sizes=[4, 128, 128],
             pallas_loop_type="emit_pipeline",
+            pallas_pre_broadcast=True,
+        )
+        # m_i and l_i last dim 128 is the pre-broadcast trailing dim;
+        # acc last dim 128 is head_dim (unchanged)
+        self.assertIn(
+            "_scratch_shapes=["
+            "((4, 128, 128), 'jnp.float32', 'vmem'), "
+            "((4, 128, 128), 'jnp.float32', 'vmem'), "
+            "((4, 128, 128), 'jnp.float32', 'vmem')]",
+            code,
         )
         ref = torch.nn.functional.scaled_dot_product_attention(
             query.float().cpu(), key.float().cpu(), val.float().cpu()
@@ -751,7 +815,7 @@ class TestPallas(TestCase):
         torch.testing.assert_close(result, ref, rtol=1e-2, atol=1e-2)
 
     def test_attention_fori_loop_correctness(self) -> None:
-        """Test fori_loop attention with loop-carried state."""
+        """Test fori_loop attention with loop-carried state and pre-broadcast."""
         query = torch.randn(2, 2, 128, 128, dtype=torch.float32, device=DEVICE)
         key = torch.randn(2, 2, 128, 128, dtype=torch.float32, device=DEVICE)
         val = torch.randn(2, 2, 128, 128, dtype=torch.float32, device=DEVICE)
@@ -761,9 +825,23 @@ class TestPallas(TestCase):
             args,
             block_sizes=[4, 128, 128],
             pallas_loop_type="fori_loop",
+            pallas_pre_broadcast=True,
         )
         self.assertIn("jax.lax.fori_loop", code)
         self.assertIn("pltpu.make_async_copy", code)
+        # m_i and l_i last dim 128 is the pre-broadcast trailing dim;
+        # acc last dim 128 is head_dim; extra entries are DMA buffers/semaphores
+        self.assertIn(
+            "_scratch_shapes=["
+            "((4, 128, 128), 'jnp.float32', 'vmem'), "
+            "((4, 128, 128), 'jnp.float32', 'vmem'), "
+            "((4, 128, 128), 'jnp.float32', 'vmem'), "
+            "((4, 128, 128), 'jnp.float32', 'vmem'), "
+            "((), None, 'dma_semaphore'), "
+            "((4, 128, 128), 'jnp.float32', 'vmem'), "
+            "((), None, 'dma_semaphore')]",
+            code,
+        )
         ref = torch.nn.functional.scaled_dot_product_attention(
             query.float().cpu(), key.float().cpu(), val.float().cpu()
         ).to(device=DEVICE)
@@ -773,19 +851,30 @@ class TestPallas(TestCase):
         """Test emit_pipeline with seq_kv not divisible by block_k.
 
         Uses _explicit_indices to pass iteration index into body for
-        proper mask computation on partial tiles.
+        proper mask computation on partial tiles.  Pre-broadcast still
+        applies since block_k=256 is a multiple of 128.
         """
         # seq=384, block_k=256 -> 2 tiles, last is partial (128/256)
         query = torch.randn(1, 2, 128, 128, dtype=torch.float32, device=DEVICE)
         key = torch.randn(1, 2, 384, 128, dtype=torch.float32, device=DEVICE)
         val = torch.randn(1, 2, 384, 128, dtype=torch.float32, device=DEVICE)
-        _code, result = code_and_output(
+        code, result = code_and_output(
             pallas_attention,
             (query, key, val),
             block_sizes=[2, 128, 256],
             pallas_loop_type="emit_pipeline",
+            pallas_pre_broadcast=True,
         )
-        self.assertIn("_explicit_indices=True", _code)
+        self.assertIn("_explicit_indices=True", code)
+        # m_i and l_i last dim 128 is the pre-broadcast trailing dim;
+        # acc last dim 128 is head_dim (unchanged)
+        self.assertIn(
+            "_scratch_shapes=["
+            "((2, 128, 128), 'jnp.float32', 'vmem'), "
+            "((2, 128, 128), 'jnp.float32', 'vmem'), "
+            "((2, 128, 128), 'jnp.float32', 'vmem')]",
+            code,
+        )
         ref = torch.nn.functional.scaled_dot_product_attention(
             query.float().cpu(), key.float().cpu(), val.float().cpu()
         ).to(device=DEVICE)
@@ -1369,6 +1458,368 @@ class TestPallas(TestCase):
         torch.testing.assert_close(
             result, expected.to(torch.bfloat16), rtol=1e-2, atol=1e-2
         )
+
+    def test_pre_broadcast_emit_pipeline_codegen(self) -> None:
+        """Pre-broadcast with emit_pipeline: scratch shapes get extra trailing dim."""
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def cumsum_broadcast(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            batch, m, k = a.size()
+            head_dim = hl.specialize(b.size(-1))
+            out = torch.empty([batch, m, head_dim], device=a.device, dtype=a.dtype)
+            for tile_b, tile_m in hl.tile([batch, m]):
+                running = hl.zeros([tile_b, tile_m], dtype=torch.float32)
+                acc = hl.zeros([tile_b, tile_m, head_dim], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    chunk = a[tile_b, tile_m, tile_k]
+                    running = running + torch.sum(chunk, -1)
+                    acc = acc + running[:, :, None]
+                out[tile_b, tile_m, :] = acc.to(out.dtype)
+            return out
+
+        a = torch.randn(2, 128, 256, device=DEVICE, dtype=torch.float32)
+        b = torch.randn(2, 256, 128, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(
+            cumsum_broadcast,
+            (a, b),
+            block_sizes=[2, 128, 128],
+            pallas_loop_type="emit_pipeline",
+            pallas_pre_broadcast=True,
+        )
+        self.assertIn("pltpu.emit_pipeline", code)
+        self.assertIn(
+            "_scratch_shapes=["
+            "((2, 128, 128), 'jnp.float32', 'vmem'), "
+            "((2, 128, 128), 'jnp.float32', 'vmem')]",
+            code,
+        )
+        ref = _cumsum_broadcast_ref(a, b, block_k=128)
+        torch.testing.assert_close(result, ref, rtol=1e-2, atol=1e-2)
+
+    def test_pre_broadcast_fori_loop_codegen(self) -> None:
+        """Pre-broadcast with fori_loop: same transform applies."""
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def cumsum_broadcast(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            batch, m, k = a.size()
+            head_dim = hl.specialize(b.size(-1))
+            out = torch.empty([batch, m, head_dim], device=a.device, dtype=a.dtype)
+            for tile_b, tile_m in hl.tile([batch, m]):
+                running = hl.zeros([tile_b, tile_m], dtype=torch.float32)
+                acc = hl.zeros([tile_b, tile_m, head_dim], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    chunk = a[tile_b, tile_m, tile_k]
+                    running = running + torch.sum(chunk, -1)
+                    acc = acc + running[:, :, None]
+                out[tile_b, tile_m, :] = acc.to(out.dtype)
+            return out
+
+        a = torch.randn(2, 128, 256, device=DEVICE, dtype=torch.float32)
+        b = torch.randn(2, 256, 128, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(
+            cumsum_broadcast,
+            (a, b),
+            block_sizes=[2, 128, 128],
+            pallas_loop_type="fori_loop",
+            pallas_pre_broadcast=True,
+        )
+        self.assertIn("jax.lax.fori_loop", code)
+        self.assertIn(
+            "_scratch_shapes=["
+            "((2, 128, 128), 'jnp.float32', 'vmem'), "
+            "((2, 128, 128), 'jnp.float32', 'vmem'), "
+            "((2, 128, 128), 'jnp.float32', 'vmem'), "
+            "((), None, 'dma_semaphore')]",
+            code,
+        )
+        ref = _cumsum_broadcast_ref(a, b, block_k=128)
+        torch.testing.assert_close(result, ref, rtol=1e-2, atol=1e-2)
+
+    def test_pre_broadcast_skipped_non_multiple_of_128(self) -> None:
+        """Pre-broadcast is skipped when broadcast dim is not a multiple of 128.
+
+        Uses head_dim=64 so the broadcast target has last dim 64.
+        Since 64 % 128 != 0, the transform is skipped.
+        """
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def cumsum_broadcast_d64(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            batch, m, k = a.size()
+            head_dim = hl.specialize(b.size(-1))
+            out = torch.empty([batch, m, head_dim], device=a.device, dtype=a.dtype)
+            for tile_b, tile_m in hl.tile([batch, m]):
+                running = hl.zeros([tile_b, tile_m], dtype=torch.float32)
+                acc = hl.zeros([tile_b, tile_m, head_dim], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    chunk = a[tile_b, tile_m, tile_k]
+                    running = running + torch.sum(chunk, -1)
+                    acc = acc + running[:, :, None]
+                out[tile_b, tile_m, :] = acc.to(out.dtype)
+            return out
+
+        a = torch.randn(2, 128, 256, device=DEVICE, dtype=torch.float32)
+        b = torch.randn(2, 256, 64, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(
+            cumsum_broadcast_d64,
+            (a, b),
+            block_sizes=[2, 128, 128],
+            pallas_loop_type="emit_pipeline",
+            pallas_pre_broadcast=True,
+        )
+        self.assertNotIn("jnp.tile(", code)
+        self.assertIn(
+            "_scratch_shapes=["
+            "((2, 128), 'jnp.float32', 'vmem'), "
+            "((2, 128, 64), 'jnp.float32', 'vmem')]",
+            code,
+        )
+        ref = _cumsum_broadcast_ref(a, b, block_k=128)
+        torch.testing.assert_close(result, ref, rtol=1e-2, atol=1e-2)
+
+    def test_pre_broadcast_no_broadcast_no_transform(self) -> None:
+        """Pre-broadcast is a no-op when loop-carried state has no broadcast usage."""
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def accum_sum(x: torch.Tensor) -> torch.Tensor:
+            n, m = x.size()
+            out = torch.empty([n], device=x.device, dtype=x.dtype)
+            for tile_n in hl.tile(n):
+                acc = hl.zeros([tile_n], dtype=torch.float32)
+                for tile_m in hl.tile(m):
+                    acc = acc + torch.sum(x[tile_n, tile_m], -1)
+                out[tile_n] = acc.to(out.dtype)
+            return out
+
+        x = torch.randn(128, 256, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(
+            accum_sum,
+            (x,),
+            block_sizes=[128, 128],
+            pallas_loop_type="emit_pipeline",
+            pallas_pre_broadcast=True,
+        )
+        self.assertNotIn("jnp.tile(", code)
+        self.assertIn(
+            "_scratch_shapes=[((128,), 'jnp.float32', 'vmem')]",
+            code,
+        )
+        ref = x.sum(-1)
+        torch.testing.assert_close(result, ref, rtol=1e-2, atol=1e-2)
+
+    def test_pre_broadcast_correctness_emit_pipeline(self) -> None:
+        """Pre-broadcast correctness with emit_pipeline using a bespoke kernel."""
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def scaled_bmm(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            batch, m, k = a.size()
+            _, _, n = b.size()
+            head_dim = hl.specialize(n)
+            out = torch.empty([batch, m, head_dim], device=a.device, dtype=a.dtype)
+            for tile_b, tile_m in hl.tile([batch, m]):
+                m_i = hl.zeros([tile_b, tile_m], dtype=torch.float32)
+                acc = hl.zeros([tile_b, tile_m, head_dim], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    chunk = a[tile_b, tile_m, tile_k]
+                    row_sum = torch.sum(chunk, -1)
+                    m_i = m_i + row_sum
+                    acc = acc + m_i[:, :, None]
+                out[tile_b, tile_m, :] = acc.to(out.dtype)
+            return out
+
+        a = torch.randn(2, 128, 256, device=DEVICE, dtype=torch.float32)
+        b = torch.randn(2, 256, 128, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(
+            scaled_bmm,
+            (a, b),
+            block_sizes=[2, 128, 128],
+            pallas_loop_type="emit_pipeline",
+            pallas_pre_broadcast=True,
+        )
+        self.assertIn(
+            "_scratch_shapes=["
+            "((2, 128, 128), 'jnp.float32', 'vmem'), "
+            "((2, 128, 128), 'jnp.float32', 'vmem')]",
+            code,
+        )
+        ref = _scaled_bmm_ref(a, b, block_k=128)
+        torch.testing.assert_close(result, ref, rtol=1e-2, atol=1e-2)
+
+    def test_pre_broadcast_correctness_fori_loop(self) -> None:
+        """Pre-broadcast correctness with fori_loop using a bespoke kernel."""
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def scaled_bmm(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            batch, m, k = a.size()
+            _, _, n = b.size()
+            head_dim = hl.specialize(n)
+            out = torch.empty([batch, m, head_dim], device=a.device, dtype=a.dtype)
+            for tile_b, tile_m in hl.tile([batch, m]):
+                m_i = hl.zeros([tile_b, tile_m], dtype=torch.float32)
+                acc = hl.zeros([tile_b, tile_m, head_dim], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    chunk = a[tile_b, tile_m, tile_k]
+                    row_sum = torch.sum(chunk, -1)
+                    m_i = m_i + row_sum
+                    acc = acc + m_i[:, :, None]
+                out[tile_b, tile_m, :] = acc.to(out.dtype)
+            return out
+
+        a = torch.randn(2, 128, 256, device=DEVICE, dtype=torch.float32)
+        b = torch.randn(2, 256, 128, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(
+            scaled_bmm,
+            (a, b),
+            block_sizes=[2, 128, 128],
+            pallas_loop_type="fori_loop",
+            pallas_pre_broadcast=True,
+        )
+        self.assertIn(
+            "_scratch_shapes=["
+            "((2, 128, 128), 'jnp.float32', 'vmem'), "
+            "((2, 128, 128), 'jnp.float32', 'vmem'), "
+            "((2, 128, 128), 'jnp.float32', 'vmem'), "
+            "((), None, 'dma_semaphore')]",
+            code,
+        )
+        ref = _scaled_bmm_ref(a, b, block_k=128)
+        torch.testing.assert_close(result, ref, rtol=1e-2, atol=1e-2)
+
+    def test_pre_broadcast_reduction_unsqueeze(self) -> None:
+        """Pre-broadcast inserts unsqueeze for reduction results feeding pre-broadcast ops.
+
+        The inner-loop reduction torch.amax(chunk, -1) produces a 2D result
+        that feeds into torch.maximum(scale, ...) where scale is a pre-broadcast
+        node (3D after transform).  Step 4 of _annotate_pre_broadcast must
+        unsqueeze the reduction result to [..., 1] so JAX broadcast works.
+        """
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def running_max_broadcast(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            batch, m, k = a.size()
+            head_dim = hl.specialize(b.size(-1))
+            out = torch.empty([batch, m, head_dim], device=a.device, dtype=a.dtype)
+            for tile_b, tile_m in hl.tile([batch, m]):
+                scale = hl.zeros([tile_b, tile_m], dtype=torch.float32)
+                acc = hl.zeros([tile_b, tile_m, head_dim], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    chunk = a[tile_b, tile_m, tile_k]
+                    row_max = torch.amax(chunk, -1)
+                    scale = torch.maximum(scale, row_max)
+                    acc = acc + scale[:, :, None]
+                out[tile_b, tile_m, :] = acc.to(out.dtype)
+            return out
+
+        a = torch.randn(2, 128, 256, device=DEVICE, dtype=torch.float32)
+        b = torch.randn(2, 256, 128, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(
+            running_max_broadcast,
+            (a, b),
+            block_sizes=[2, 128, 128],
+            pallas_loop_type="emit_pipeline",
+            pallas_pre_broadcast=True,
+        )
+        self.assertIn(
+            "_scratch_shapes=["
+            "((2, 128, 128), 'jnp.float32', 'vmem'), "
+            "((2, 128, 128), 'jnp.float32', 'vmem')]",
+            code,
+        )
+        self.assertIn("unsqueeze_default = row_max[:, :, None]", code)
+        ref = _running_max_broadcast_ref(a, b, block_k=128)
+        torch.testing.assert_close(result, ref, rtol=1e-2, atol=1e-2)
+
+    def test_pre_broadcast_dynamic_shapes(self) -> None:
+        """Pre-broadcast with static_shapes=False exercises the SymInt codegen path.
+
+        When head_dim is not specialized, the inner FX graph carries it as a
+        backed SymInt.  The _pre_broadcast_tile codegen must handle SymInt
+        target_size and emit a valid tile expression.
+        """
+
+        @helion.kernel(backend="pallas", static_shapes=False)
+        def cumsum_broadcast_dynamic(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            batch, m, k = a.size()
+            head_dim = b.size(-1)
+            out = torch.empty([batch, m, head_dim], device=a.device, dtype=a.dtype)
+            for tile_b, tile_m in hl.tile([batch, m]):
+                running = hl.zeros([tile_b, tile_m], dtype=torch.float32)
+                acc = hl.zeros([tile_b, tile_m, head_dim], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    chunk = a[tile_b, tile_m, tile_k]
+                    running = running + torch.sum(chunk, -1)
+                    acc = acc + running[:, :, None]
+                out[tile_b, tile_m, :] = acc.to(out.dtype)
+            return out
+
+        # head_dim=256 > PRE_BROADCAST_SIZE=128 and a multiple of it
+        a = torch.randn(2, 128, 256, device=DEVICE, dtype=torch.float32)
+        b = torch.randn(2, 256, 256, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(
+            cumsum_broadcast_dynamic,
+            (a, b),
+            block_sizes=[2, 128, 128],
+            pallas_loop_type="emit_pipeline",
+            pallas_pre_broadcast=True,
+        )
+        self.assertIn("pltpu.emit_pipeline", code)
+        self.assertIn(
+            "_scratch_shapes=["
+            "((2, 128, 128), 'jnp.float32', 'vmem'), "
+            "((2, 128, 256), 'jnp.float32', 'vmem')]",
+            code,
+        )
+        ref = _cumsum_broadcast_ref(a, b, block_k=128)
+        torch.testing.assert_close(result, ref, rtol=1e-2, atol=1e-2)
+
+    def test_pre_broadcast_double_outer_use(self) -> None:
+        """Pre-broadcast value used twice via [:, :, None] in the outer scope.
+
+        Regression test: the outer rewrite must not append PRE_BROADCAST_SIZE
+        to the same base node twice when it has multiple subscript users.
+        """
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def double_use(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            batch, m, k = a.size()
+            head_dim = hl.specialize(b.size(-1))
+            out = torch.empty([batch, m, head_dim], device=a.device, dtype=a.dtype)
+            for tile_b, tile_m in hl.tile([batch, m]):
+                running = hl.zeros([tile_b, tile_m], dtype=torch.float32)
+                acc = hl.zeros([tile_b, tile_m, head_dim], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    chunk = a[tile_b, tile_m, tile_k]
+                    running = running + torch.sum(chunk, -1)
+                    acc = acc + running[:, :, None]
+                result = acc + running[:, :, None] * running[:, :, None]
+                out[tile_b, tile_m, :] = result.to(out.dtype)
+            return out
+
+        a = torch.randn(2, 128, 256, device=DEVICE, dtype=torch.float32)
+        b = torch.randn(2, 256, 128, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(
+            double_use,
+            (a, b),
+            block_sizes=[2, 128, 128],
+            pallas_loop_type="emit_pipeline",
+            pallas_pre_broadcast=True,
+        )
+        self.assertIn("pltpu.emit_pipeline", code)
+        self.assertIn(
+            "_scratch_shapes=["
+            "((2, 128, 128), 'jnp.float32', 'vmem'), "
+            "((2, 128, 128), 'jnp.float32', 'vmem')]",
+            code,
+        )
+        # Eager reference
+        block_k = 128
+        running = torch.zeros(2, 128, dtype=torch.float32, device=a.device)
+        acc_ref = torch.zeros(2, 128, 128, dtype=torch.float32, device=a.device)
+        for kb in range(0, 256, block_k):
+            chunk = a[:, :, kb : kb + block_k]
+            running = running + chunk.sum(-1).float()
+            acc_ref = acc_ref + running[:, :, None]
+        ref = (acc_ref + running[:, :, None] * running[:, :, None]).to(a.dtype)
+        torch.testing.assert_close(result, ref, rtol=1e-2, atol=1e-2)
 
 
 if __name__ == "__main__":

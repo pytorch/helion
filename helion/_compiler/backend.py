@@ -1000,6 +1000,7 @@ class PallasBackend(Backend):
             "loop_orders",
             "flatten_loops",
             "pallas_loop_type",
+            "pallas_pre_broadcast",
         }
     )
 
