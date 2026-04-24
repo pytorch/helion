@@ -66,7 +66,9 @@ class ThreadAxisTracker:
             self.block_axes[block_id] = axis
 
 
-def _lane_loop_iter(extent: int) -> ast.AST:
+def _lane_loop_iter(extent: int | ast.AST) -> ast.AST:
+    if isinstance(extent, ast.AST):
+        return extent
     # CuTe lane loops carry per-thread scalar state. Emitting them via
     # cutlass.range(_constexpr) miscompiles scalar matmul paths, so keep them
     # as ordinary Python loops.
