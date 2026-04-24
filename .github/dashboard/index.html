@@ -386,7 +386,7 @@ function renderOverviewGrid() {
         html += '</div>';
         html += '<div class="kc-body"><div class="kc-left">';
         html += `<div class="kc-row"><span class="kc-label">Latency</span><span class="kc-val" style="color:${color}">${e.helion_latency_avg_ms.toFixed(2)} ms</span></div>`;
-        html += `<div class="kc-row"><span class="kc-label">Compile time</span><span class="kc-val">${formatCompileTime(e.compile_time_avg_s)}</span></div>`;
+        html += `<div class="kc-row"><span class="kc-label">Compile time</span><span class="kc-val">${formatCompileTime(e.compile_time_geomean_s)}</span></div>`;
         html += `<div class="kc-delta">Latency vs prev: ${formatDelta(e.latency_delta_pct, true)}</div>`;
         html += `<div class="kc-delta">Compile time vs prev: ${formatDelta(e.compile_delta_pct, true)}</div>`;
         html += '</div>';
@@ -524,7 +524,7 @@ function renderSpeedup() {
       <td style="color:var(--green)">${formatSpeedup(e.helion_speedup_geomean)}</td>
       <td style="color:var(--blue)">${formatSpeedup(e.torch_compile_speedup_geomean)}</td>
       <td style="color:var(--purple)">${formatSpeedup(e.triton_speedup_geomean)}</td>
-      <td>${formatCompileTime(e.compile_time_avg_s)}</td>
+      <td>${formatCompileTime(e.compile_time_geomean_s)}</td>
       <td style="color:${colors[bestIdx]}">${names[bestIdx]}</td>
     </tr>`;
   });
@@ -570,8 +570,8 @@ function renderCompare(baseRunIdOverride, cmpRunIdOverride, baseBranchOverride, 
       if (!baseH && !cmpH) return;
       const baseSpeedup = baseH ? baseH.helion_speedup_geomean : null;
       const cmpSpeedup = cmpH ? cmpH.helion_speedup_geomean : null;
-      const baseCompile = baseH ? baseH.compile_time_avg_s : null;
-      const cmpCompile = cmpH ? cmpH.compile_time_avg_s : null;
+      const baseCompile = baseH ? baseH.compile_time_geomean_s : null;
+      const cmpCompile = cmpH ? cmpH.compile_time_geomean_s : null;
       const baseLatency = baseH ? baseH.helion_latency_avg_ms : null;
       const cmpLatency = cmpH ? cmpH.helion_latency_avg_ms : null;
       let speedupDelta = null;
@@ -778,7 +778,7 @@ function showDetailModal(kernel, platform_short) {
   const color = platColor(platform_short);
   let html = modalHeader(
     `${escHtml(kernel)} ${platBadge(platform_short)}`,
-    `Latency: ${e.helion_latency_avg_ms.toFixed(2)} ms | Speedup: ${formatSpeedup(e.helion_speedup_geomean)} | Compile Time: ${formatCompileTime(e.compile_time_avg_s)}`);
+    `Latency: ${e.helion_latency_avg_ms.toFixed(2)} ms | Speedup: ${formatSpeedup(e.helion_speedup_geomean)} | Compile Time: ${formatCompileTime(e.compile_time_geomean_s)}`);
   html += '<div class="modal-split"><div class="modal-lhs">';
   if (e.status !== 'unchanged') {
     html += `<div style="margin-bottom:12px"><span class="kc-tag ${e.status}">${e.status} perf</span></div>`;
@@ -814,7 +814,7 @@ function showDetailModal(kernel, platform_short) {
       <td style="font-size:11px">${formatDate(h.date)}</td>
       <td>${h.helion_latency_avg_ms.toFixed(2)} ms${latencyDelta}</td>
       <td>${formatSpeedup(h.helion_speedup_geomean)}${speedupDelta}</td>
-      <td>${formatCompileTime(h.compile_time_avg_s)}</td>
+      <td>${formatCompileTime(h.compile_time_geomean_s)}</td>
     </tr>`;
   });
   html += '</tbody></table></div>';
@@ -884,7 +884,7 @@ function showDetailModal(kernel, platform_short) {
         spEl.on('plotly_click', clickHandler);
       }
       // Compile time over time
-      const ctVals = histFwd.map(h => h.compile_time_avg_s > 0 ? h.compile_time_avg_s : null);
+      const ctVals = histFwd.map(h => h.compile_time_geomean_s > 0 ? h.compile_time_geomean_s : null);
       const ctTrace = {
         x: xLabels, y: ctVals,
         mode: 'lines+markers', line: { color: '#f0883e', width: 2 }, marker: { size: 6 },

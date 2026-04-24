@@ -159,7 +159,7 @@ def build_history_entry(run, metrics, shapes):
         "helion_speedup_geomean": round(geo_mean(metrics.get("helion_speedup", [])), 4),
         "triton_speedup_geomean": round(geo_mean(metrics.get("triton_speedup", [])), 4),
         "torch_compile_speedup_geomean": round(geo_mean(metrics.get("torch_compile_speedup", [])), 4),
-        "compile_time_avg_s": round(avg(metrics.get("helion_compile_time_s", [])), 2),
+        "compile_time_geomean_s": round(geo_mean(metrics.get("helion_compile_time_s", [])), 2),
         "helion_latency_avg_ms": round(avg(helion_lat), 4) if helion_lat else 0,
         "per_shape": {
             "shapes": shapes,
@@ -269,7 +269,7 @@ def build_dashboard_data(cache_dir, runs_meta, existing_data=None):
                 break
 
         speedup_delta = fmt_delta(latest_data["helion_speedup_geomean"], prev_data["helion_speedup_geomean"]) if latest_data and prev_data else None
-        compile_delta = fmt_delta(prev_data["compile_time_avg_s"], latest_data["compile_time_avg_s"]) if latest_data and prev_data and latest_data["compile_time_avg_s"] > 0 else None
+        compile_delta = fmt_delta(prev_data["compile_time_geomean_s"], latest_data["compile_time_geomean_s"]) if latest_data and prev_data and latest_data["compile_time_geomean_s"] > 0 else None
         latency_delta = fmt_delta(prev_data["helion_latency_avg_ms"], latest_data["helion_latency_avg_ms"]) if latest_data and prev_data and latest_data["helion_latency_avg_ms"] > 0 else None
 
         classify_delta = latency_delta if latency_delta is not None else speedup_delta
@@ -312,7 +312,7 @@ def build_dashboard_data(cache_dir, runs_meta, existing_data=None):
             "helion_speedup_geomean": latest_data["helion_speedup_geomean"] if latest_data else 0,
             "triton_speedup_geomean": latest_data["triton_speedup_geomean"] if latest_data else 0,
             "torch_compile_speedup_geomean": latest_data["torch_compile_speedup_geomean"] if latest_data else 0,
-            "compile_time_avg_s": latest_data["compile_time_avg_s"] if latest_data else 0,
+            "compile_time_geomean_s": latest_data["compile_time_geomean_s"] if latest_data else 0,
             "helion_latency_avg_ms": latest_data["helion_latency_avg_ms"] if latest_data else 0,
             "speedup_delta_pct": speedup_delta,
             "compile_delta_pct": compile_delta,
