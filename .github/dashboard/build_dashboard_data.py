@@ -14,12 +14,22 @@ import glob
 import json
 import math
 import os
+import re
 import subprocess
 import urllib.error
 import urllib.request
 import zipfile
 
 RETENTION_DAYS = 365
+
+
+def get_active_platforms(workflow_path):
+    """Extract active platform aliases from the benchmark dispatch workflow."""
+    try:
+        with open(workflow_path) as f:
+            return set(re.findall(r"alias:\s*(\S+)", f.read()))
+    except OSError:
+        return None
 
 
 def geo_mean(values):
@@ -100,13 +110,16 @@ def download_artifacts(repo, run_id, dest):
             os.remove(zip_path)
 
 
-def parse_run(run_dir):
+def parse_run(run_dir, active_platforms=None):
     """Parse all helionbench.json files in a run directory into kernel entries."""
     kernels = []
     for bench_dir in sorted(glob.glob(os.path.join(run_dir, "benchmark-results-*"))):
         dirname = os.path.basename(bench_dir)
         parts = dirname.replace("benchmark-results-", "").split("-", 1)
         platform_short = parts[0] if parts else "unknown"
+
+        if active_platforms and platform_short not in active_platforms:
+            continue
 
         bench_file = os.path.join(bench_dir, "helionbench.json")
         if not os.path.exists(bench_file):
@@ -173,7 +186,7 @@ def build_history_entry(run, metrics, shapes):
     }
 
 
-def build_dashboard_data(cache_dir, runs_meta, existing_data=None):
+def build_dashboard_data(cache_dir, runs_meta, existing_data=None, active_platforms=None):
     """Aggregate benchmark data across runs into the dashboard JSON structure."""
     cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=RETENTION_DAYS)
     runs_meta_sorted = sorted(
@@ -188,6 +201,8 @@ def build_dashboard_data(cache_dir, runs_meta, existing_data=None):
     existing_summary = {}
     existing_history = {}
     for e in (existing_data or {}).get("summary", []):
+        if active_platforms and e.get("platform_short", "") not in active_platforms:
+            continue
         key = e["kernel"] + "|" + e.get("platform_short", "")
         existing_summary[key] = e
         existing_history.setdefault(key, {}).update({h["run_id"]: h for h in e.get("history", [])})
@@ -196,7 +211,7 @@ def build_dashboard_data(cache_dir, runs_meta, existing_data=None):
     runs = []
     for meta in runs_meta_sorted:
         run_dir = os.path.join(cache_dir, meta["run_id"])
-        kernels = parse_run(run_dir) if os.path.isdir(run_dir) and os.listdir(run_dir) else []
+        kernels = parse_run(run_dir, active_platforms) if os.path.isdir(run_dir) and os.listdir(run_dir) else []
         runs.append({**meta, "kernel_count": len(kernels), "kernels": kernels})
 
     # Build kernel history: fresh artifacts override, then fill from existing history
@@ -366,8 +381,16 @@ def main():
     parser.add_argument("--repo", required=True)
     parser.add_argument("--workflow-name", default="Benchmark Dispatch")
     parser.add_argument("--existing-url", default=None, help="URL to fetch previous dashboard-data.json for incremental updates")
+    parser.add_argument("--dispatch-workflow", default=".github/workflows/benchmark_dispatch.yml",
+                        help="Path to benchmark dispatch workflow to derive active platforms")
     parser.add_argument("--output", default="dashboard-data.json")
     args = parser.parse_args()
+
+    active_platforms = get_active_platforms(args.dispatch_workflow)
+    if active_platforms:
+        print(f"Active platforms: {', '.join(sorted(active_platforms))}")
+    else:
+        print("Warning: could not read dispatch workflow, showing all platforms")
 
     existing = {}
     if args.existing_url:
@@ -390,7 +413,7 @@ def main():
         print(f"Downloading run {r['run_id']} ({r['sha']})...")
         download_artifacts(args.repo, r["run_id"], os.path.join(cache_dir, r["run_id"]))
 
-    data = build_dashboard_data(cache_dir, runs, existing)
+    data = build_dashboard_data(cache_dir, runs, existing, active_platforms)
     with open(args.output, "w") as f:
         json.dump(data, f, indent=2)
 
