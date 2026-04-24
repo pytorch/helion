@@ -982,6 +982,7 @@ class TestUnrollTuples(RefEagerTestBase, TestCase):
         from triton.testing import do_bench
 
         M, D, G = 1024 * 1024, 32, 8
+        torch.manual_seed(0)
         tensors = [
             torch.randn(M, D, device=DEVICE, dtype=torch.bfloat16) for _ in range(G)
         ]
