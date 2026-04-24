@@ -131,6 +131,37 @@ def _analyze_indexing(node: torch.fx.Node, config: Config) -> None:
     )
     node.meta["indexing_patterns"] = indexing_patterns
 
+    # Track SMEM eligibility (simplified — does not distinguish read vs write):
+    #   SMEM: only scalar access.  VMEM: vector/slice + scalar reads.
+    # A fully correct policy would check read vs write per access:
+    #   - Scalar read-only tensors could stay in VMEM (no SMEM needed)
+    #   - Scalar write requires SMEM
+    #   - Mixed scalar-write + slice needs tensor duplication (unsupported)
+    # For now we conservatively put all-scalar tensors in SMEM and
+    # mixed tensors in VMEM. This is correct for the common cases
+    # (scalar-only → SMEM, mixed scalar-read + slice → VMEM) but
+    # over-allocates SMEM for scalar-read-only tensors.
+    from ..device_function import PallasMemorySpace
+
+    is_all_scalar = all(
+        isinstance(p, (ArbitraryIndexPattern, TileBeginWithOffsetPattern, NonePattern))
+        for p in indexing_patterns
+    )
+    tid = id(tensor_val)
+    current = device_fn.pallas_memory_space.get(tid)
+    if is_all_scalar:
+        # Only mark for SMEM if not already assigned to VMEM or HBM
+        if current is None:
+            device_fn.pallas_memory_space[tid] = PallasMemorySpace.SMEM
+    else:
+        # Override SMEM → VMEM: this is intentional. When a tensor has
+        # both scalar and slice accesses, we keep it in VMEM because
+        # scalar *reads* work from VMEM (only scalar writes require
+        # SMEM). We optimistically assume the scalar access is a read.
+        # Don't override HBM (pipeline tensors).
+        if current != PallasMemorySpace.HBM:
+            device_fn.pallas_memory_space[tid] = PallasMemorySpace.VMEM
+
 
 def _analyze_subscript_patterns(
     tensor: torch.Tensor,
@@ -206,6 +237,10 @@ def _detect_indexing_pattern(
                 block_id=tile_begin_with_offset.block_id,
                 offset=tile_begin_with_offset.offset,
             )
+        # Indices produced by other FX nodes, such as indices[tile] used in
+        # tensor-indexed atomics, are legal but cannot participate in Pallas
+        # tiling.
+        return ArbitraryIndexPattern(idx)
 
     if isinstance(idx, slice):
         if idx != slice(None):
@@ -310,7 +345,12 @@ def _maybe_get_symbol_origin(idx: object) -> SymbolOrigin | None:
 def _maybe_get_tile_begin_with_offset_info(
     idx: object,
 ) -> TileBeginWithOffsetPattern | None:
-    """Extended version that allows out-of-bounds and symbolic offsets."""
+    """Extended version that allows out-of-bounds and symbolic offsets.
+
+    Matches expressions that resolve to a tile's start offset within the
+    full loop extent (e.g. ``tile.begin``, ``tile.end - 1``, or affine
+    combinations of those with integer constants).
+    """
     from ..compile_environment import CompileEnvironment
     from ..compile_environment import _symint_expr
     from ..host_function import HostFunction
@@ -318,6 +358,7 @@ def _maybe_get_tile_begin_with_offset_info(
     from ..variable_origin import GridOrigin
     from ..variable_origin import TileBeginOrigin
     from ..variable_origin import TileEndOrigin
+    from ..variable_origin import TileIdOrigin
 
     idx_symbol_origin = _maybe_get_symbol_origin(idx)
     if isinstance(idx_symbol_origin, SymbolOrigin):
@@ -326,7 +367,7 @@ def _maybe_get_tile_begin_with_offset_info(
                 block_id=idx_symbol_origin.origin.block_id, offset=0
             )
         if isinstance(idx_symbol_origin.origin, GridOrigin) and not isinstance(
-            idx_symbol_origin.origin, TileEndOrigin
+            idx_symbol_origin.origin, (TileEndOrigin, TileIdOrigin)
         ):
             return TileBeginWithOffsetPattern(
                 block_id=idx_symbol_origin.origin.block_id, offset=0

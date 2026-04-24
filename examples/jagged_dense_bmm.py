@@ -34,6 +34,7 @@ from __future__ import annotations
 import torch
 
 import helion
+from helion._testing import DEVICE
 from helion._testing import run_example
 import helion.language as hl
 
@@ -126,26 +127,22 @@ def random_input(
     max_seq_len: int = 3,
     dtype: torch.dtype = torch.float32,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    lengths = torch.randint(
-        max_seq_len + 1, size=(batch_size,), device=torch.device("cuda")
-    )
-    seq_offsets = torch.zeros(
-        (batch_size + 1,), dtype=torch.int64, device=torch.device("cuda")
-    )
+    lengths = torch.randint(max_seq_len + 1, size=(batch_size,), device=DEVICE)
+    seq_offsets = torch.zeros((batch_size + 1,), dtype=torch.int64, device=DEVICE)
     seq_offsets[1:] = torch.cumsum(lengths, dim=0)
     jagged_size = int(seq_offsets[-1].item())
     jagged = (
-        torch.empty((jagged_size, D), dtype=dtype, device=torch.device("cuda"))
+        torch.empty((jagged_size, D), dtype=dtype, device=DEVICE)
         .uniform_(-1.0, 1.0)
         .requires_grad_()
     )
     dense = (
-        torch.empty((batch_size, D, K), dtype=dtype, device=torch.device("cuda"))
+        torch.empty((batch_size, D, K), dtype=dtype, device=DEVICE)
         .uniform_(-1.0, 1.0)
         .requires_grad_()
     )
     bias = (
-        torch.empty((batch_size, K), dtype=dtype, device=torch.device("cuda"))
+        torch.empty((batch_size, K), dtype=dtype, device=DEVICE)
         .uniform_(-1.0, 1.0)
         .requires_grad_()
     )

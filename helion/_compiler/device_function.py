@@ -4,6 +4,7 @@ import ast
 from collections import defaultdict
 import contextlib
 import dataclasses
+import enum
 import itertools
 import math
 import threading
@@ -231,6 +232,14 @@ def _is_literal_constexpr(arg: ConstExprArg) -> bool:
         return False
 
 
+class PallasMemorySpace(enum.Enum):
+    """TPU memory space for Pallas tensors."""
+
+    HBM = "hbm"  # Pipeline body tensors (DMA)
+    SMEM = "smem"  # Scalar-only access
+    VMEM = "vmem"  # Vector/slice access (default)
+
+
 class DeviceFunction:
     def __init__(
         self,
@@ -310,11 +319,15 @@ class DeviceFunction:
 
         # Pallas: id(fake_tensor) → [DimensionTiling], recorded during `plan_tiling`
         self.pallas_tensor_dim_tilings: dict[int, list[DimensionTiling]] = {}
-        # Pallas: set of id(fake_tensor) for tensors accessed in pipeline body
-        self.pallas_pipeline_tensor_ids: set[int] = set()
-        # TODO(dunfanlu): consider duplicating and aliasing arguments if a tensor needs to be accessed via both VMEM and SMEM?
-        # Pallas: set of id(fake_tensor) for tensors requiring scalar accessing (SMEM)
-        self.pallas_smem_tensor_ids: set[int] = set()
+        # Pallas: id(fake_tensor) → memory space, determined during
+        # tracing (HBM for pipeline) and codegen (SMEM for scalar access).
+        # NOTE: Currently each tensor can only have one memory space.
+        # If a tensor needs both SMEM (scalar access) and VMEM (slice
+        # access), it will need tensor duplication — passing the same
+        # data as two separate args in different memory spaces. This
+        # dict would then need to support multiple entries per tensor
+        # or the tensor would get distinct arg IDs per memory space.
+        self.pallas_memory_space: dict[int, PallasMemorySpace] = {}
 
     def allocate_store_index(self) -> int:
         """Bump store counters and return the indexing strategy slot."""
@@ -814,13 +827,27 @@ class DeviceFunction:
             has_barrier=env.has_barrier,
             sorted_args=arg_objects,
         )
-        # TODO(jansel): we should run CSE this statement
-        call_statement = statement_from_string(
-            f"_launcher({self.name}, {{call_grid_expr}}, {', '.join(call_args)})",
-            call_grid_expr=call_grid_expr,
+        # Check if the backend wants to capture return values for output-only tensors.
+        output_only_names = getattr(backend, "_output_only_names", [])
+        launcher_call = (
+            f"_launcher({self.name}, {{call_grid_expr}}, {', '.join(call_args)})"
         )
+        if output_only_names:
+            if len(output_only_names) == 1:
+                assign_target = output_only_names[0]
+            else:
+                assign_target = ", ".join(output_only_names)
+            call_statement = statement_from_string(
+                f"{assign_target} = {launcher_call}",
+                call_grid_expr=call_grid_expr,
+            )
+        else:
+            call_statement = statement_from_string(
+                launcher_call,
+                call_grid_expr=call_grid_expr,
+            )
         assert isinstance(call_statement, ExtendedAST)
-        # Mark the kernel call we can find it in codegen_precompile_def
+        # Mark the kernel call so we can find it in codegen_precompile_def
         call_statement._is_kernel_call = True
         return call_statement
 
@@ -911,6 +938,43 @@ class DeviceFunction:
         return self.register_scratch(
             (), None, name_hint=name_hint, scratch_type="dma_semaphore"
         )
+
+    def get_tensor_read_write_names(self) -> tuple[set[str], set[str]]:
+        """Returns AST names of read and written tensors"""
+        from helion.language import atomic_ops
+        from helion.language import memory_ops
+
+        read_names: set[str] = set()
+        write_names: set[str] = set()
+        for graph in self.codegen.codegen_graphs:
+            for node in graph.graph.nodes:
+                if node.op != "call_function":
+                    continue
+
+                def _get_tensor_name(node: torch.fx.Node) -> str:
+                    tensor_arg = node.args[0]
+                    assert isinstance(tensor_arg, torch.fx.Node)
+                    tensor_val = tensor_arg.meta.get("val")
+                    assert isinstance(tensor_val, torch.Tensor)
+                    return self.tensor_arg(tensor_val).name
+
+                if node.target is memory_ops.load:
+                    read_names.add(_get_tensor_name(node))
+                elif node.target is memory_ops.store:
+                    write_names.add(_get_tensor_name(node))
+                elif node.target in (
+                    atomic_ops.atomic_add,
+                    atomic_ops.atomic_cas,
+                    atomic_ops.atomic_or,
+                    atomic_ops.atomic_xor,
+                    atomic_ops.atomic_xchg,
+                    atomic_ops.atomic_min,
+                    atomic_ops.atomic_max,
+                    atomic_ops.atomic_and,
+                ):
+                    read_names.add(_get_tensor_name(node))
+                    write_names.add(_get_tensor_name(node))
+        return read_names, write_names
 
     def __enter__(self) -> None:
         try:

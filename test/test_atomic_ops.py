@@ -6,6 +6,7 @@ import torch
 
 import helion
 from helion._testing import DEVICE
+from helion._testing import LONG_INT_TYPE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
@@ -13,7 +14,6 @@ from helion._testing import onlyBackends
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfRocm
 from helion._testing import skipIfTileIR
-from helion._testing import xfailIfCute
 from helion._testing import xfailIfPallas
 import helion.language as hl
 from helion.runtime.settings import _get_backend
@@ -114,6 +114,46 @@ def atomic_add_1d_tensor_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tenso
         hl.atomic_add(z, [hl.arange(0, n)], z_vec)
 
     return z
+
+
+@helion.kernel()
+def atomic_add_1d_tensor_offset_kernel(
+    x: torch.Tensor, y: torch.Tensor
+) -> torch.Tensor:
+    m, n = x.shape
+    n = hl.specialize(n)
+
+    z = torch.zeros([n + 16], dtype=x.dtype, device=x.device)
+
+    for tile_m in hl.tile(m):
+        x_tile = x[tile_m, :].to(torch.float32)
+        y_tile = y[tile_m, :].to(torch.float32)
+        z_vec = torch.sum(x_tile * y_tile, dim=0).to(x.dtype)
+        hl.atomic_add(z, [hl.arange(16, n + 16)], z_vec)
+
+    return z
+
+
+@helion.kernel()
+def atomic_add_1d_tensor_step_arange_kernel(x: torch.Tensor) -> torch.Tensor:
+    n = x.size(0)
+    n = hl.specialize(n)
+
+    z = torch.zeros([2 * n], dtype=x.dtype, device=x.device)
+    for _tile in hl.tile(1):
+        hl.atomic_add(z, [hl.arange(0, 2 * n, step=2)], x)
+    return z
+
+
+@helion.kernel()
+def atomic_add_tensor_index_kernel(
+    values: torch.Tensor, indices: torch.Tensor
+) -> torch.Tensor:
+    n = values.size(0)
+    out = torch.zeros([n], dtype=values.dtype, device=values.device)
+    for tile in hl.tile(n):
+        hl.atomic_add(out, [indices[tile]], values[tile])
+    return out
 
 
 # New kernels for other atomics
@@ -264,7 +304,6 @@ class TestAtomicOperations(RefEagerTestBase, TestCase):
         expected = torch.ones(8, device=DEVICE)
         torch.testing.assert_close(result, expected)
 
-    @xfailIfCute("cute: hl.arange atomic scatter requires an active non-reduction axis")
     @xfailIfPallas("Integer indexing not supported on Pallas")
     def test_atomic_add_1d_tensor(self):
         M, N = 32, 64
@@ -279,6 +318,56 @@ class TestAtomicOperations(RefEagerTestBase, TestCase):
         )
 
         expected = (x * y).sum(dim=0)
+        torch.testing.assert_close(result, expected)
+
+    def test_atomic_add_tensor_index(self):
+        if _get_backend() == "pallas":
+            self.skipTest("Pallas/TPU does not support integer tensor indexing")
+        values = torch.randn(64, device=DEVICE, dtype=torch.float32)
+        indices = torch.randperm(64, device=DEVICE, dtype=LONG_INT_TYPE)
+
+        code, result = code_and_output(
+            atomic_add_tensor_index_kernel,
+            (values, indices),
+            block_sizes=[32],
+        )
+
+        expected = torch.zeros(64, device=DEVICE, dtype=values.dtype)
+        expected.scatter_add_(0, indices, values)
+        torch.testing.assert_close(result, expected)
+
+    def test_atomic_add_1d_tensor_with_offset_arange(self):
+        if _get_backend() != "cute":
+            self.skipTest("CuTe-specific direct iota scatter regression")
+
+        M, N = 32, 64
+        x = torch.randn(M, N, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(M, N, device=DEVICE, dtype=torch.float32)
+
+        code, result = code_and_output(
+            atomic_add_1d_tensor_offset_kernel,
+            (x, y),
+            block_sizes=[32],
+        )
+
+        expected = torch.zeros(N + 16, device=DEVICE, dtype=x.dtype)
+        expected[16:] = (x * y).sum(dim=0)
+        torch.testing.assert_close(result, expected)
+
+    def test_atomic_add_1d_tensor_with_step_arange(self):
+        if _get_backend() != "cute":
+            self.skipTest("CuTe-specific stepped iota scatter regression")
+
+        N = 64
+        x = torch.randn(N, device=DEVICE, dtype=torch.float32)
+
+        code, result = code_and_output(
+            atomic_add_1d_tensor_step_arange_kernel,
+            (x,),
+        )
+
+        expected = torch.zeros(2 * N, device=DEVICE, dtype=x.dtype)
+        expected[::2] = x
         torch.testing.assert_close(result, expected)
 
     def test_atomic_add_returns_prev(self):
@@ -414,7 +503,6 @@ class TestAtomicOperations(RefEagerTestBase, TestCase):
             )
         self.assertIn("Invalid memory semantic 'ERROR'", str(ctx.exception))
 
-    @xfailIfPallas("block_size=2 does not meet TPU alignment requirements")
     @skipIfRefEager(
         "Test is block size dependent which is not supported in ref eager mode"
     )

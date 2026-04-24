@@ -749,10 +749,12 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
         )
 
     # Record which tensors are in the pipeline body (need HBM refs)
+    from .._compiler.device_function import PallasMemorySpace
+
     for fake, _tensor_node, _sub_meta in loaded_tensors.values():
-        state.device_function.pallas_pipeline_tensor_ids.add(id(fake))
+        state.device_function.pallas_memory_space[id(fake)] = PallasMemorySpace.HBM
     for fake, _tensor_node, _sub_meta in stored_tensors.values():
-        state.device_function.pallas_pipeline_tensor_ids.add(id(fake))
+        state.device_function.pallas_memory_space[id(fake)] = PallasMemorySpace.HBM
 
     # Process loaded tensors (inputs to pipeline)
     for key, (fake, _tensor_node, sub_meta) in loaded_tensors.items():
@@ -1017,10 +1019,12 @@ def _codegen_fori_loop(state: CodegenState) -> object:
     tensor_to_vmem: dict[str, str] = {}
     tensor_to_sem: dict[str, str] = {}
     if use_dma:
+        from .._compiler.device_function import PallasMemorySpace
+
         for fake, _tensor_node, _sub_meta in loaded_tensors.values():
-            state.device_function.pallas_pipeline_tensor_ids.add(id(fake))
+            state.device_function.pallas_memory_space[id(fake)] = PallasMemorySpace.HBM
         for fake, _tensor_node, _sub_meta in stored_tensors.values():
-            state.device_function.pallas_pipeline_tensor_ids.add(id(fake))
+            state.device_function.pallas_memory_space[id(fake)] = PallasMemorySpace.HBM
         for (fake, _sub_meta, _direction), vmem_shape in zip(
             all_tensor_info, vmem_shapes, strict=True
         ):
@@ -1337,6 +1341,7 @@ def _(state: CodegenState) -> list[object]:
     if_arg_ids = {arg.id for arg in if_args}
     union_args = if_args + [a for a in else_args if a.id not in if_arg_ids]
     arg_list_with_defaults = ", ".join(f"{n.id}={n.id}" for n in union_args)
+    if_return_names_str = ""
 
     if if_return_names:
         if_return_names_str = ", ".join(if_return_names)
@@ -1384,9 +1389,11 @@ def _(state: CodegenState) -> list[object]:
             )
         )
 
-    return [expr_from_string(n) for n in if_return_names] + [
-        expr_from_string(n) for n in else_return_names
-    ]
+    return cast(
+        "list[object]",
+        [expr_from_string(n) for n in if_return_names]
+        + [expr_from_string(n) for n in else_return_names],
+    )
 
 
 # Note we can't DCE phi nodes because there may be a loop carry dependency not captured in the outer graph

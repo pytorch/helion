@@ -177,8 +177,24 @@ def get_hardware_info(device: torch.device | None = None) -> HardwareInfo:
                 compute_capability=props.gcnArchName,
             )
 
+    # TPU / Pallas path
+    try:
+        import jax
+
+        tpu_devices = [d for d in jax.devices() if d.platform == "tpu"]
+        if tpu_devices:
+            first_tpu = tpu_devices[0]
+            return HardwareInfo(
+                device_kind="tpu",
+                hardware_name=first_tpu.device_kind,
+                runtime_version=jax.__version__,
+                compute_capability=first_tpu.device_kind,
+            )
+    except ImportError:
+        pass
+
     raise RuntimeError(
-        "No supported GPU device found. Helion requires CUDA, ROCm, or XPU."
+        "No supported GPU or TPU device found. Helion requires CUDA, ROCm, XPU, or TPU."
     )
 
 

@@ -15,11 +15,15 @@ from .differential_evolution import (
 )
 from .effort_profile import AutotuneEffortProfile as AutotuneEffortProfile
 from .effort_profile import DifferentialEvolutionConfig as DifferentialEvolutionConfig
+from .effort_profile import LLMSearchConfig as LLMSearchConfig
 from .effort_profile import PatternSearchConfig as PatternSearchConfig
 from .effort_profile import RandomSearchConfig as RandomSearchConfig
 from .external import UserConfigSpec as UserConfigSpec
 from .external import autotune as autotune
 from .finite_search import FiniteSearch as FiniteSearch
+from .llm_search import LLMGuidedSearch as LLMGuidedSearch
+from .llm_seeded_lfbo import LLMSeededLFBOTreeSearch as LLMSeededLFBOTreeSearch
+from .llm_seeded_lfbo import LLMSeededSearch as LLMSeededSearch
 from .local_cache import LocalAutotuneCache as LocalAutotuneCache
 from .local_cache import StrictLocalAutotuneCache as StrictLocalAutotuneCache
 from .pattern_search import InitialPopulationStrategy as InitialPopulationStrategy
@@ -35,6 +39,9 @@ search_algorithms: dict[str, type[BaseSearch]] = {
     "DESurrogateHybrid": DESurrogateHybrid,
     "LFBOPatternSearch": LFBOPatternSearch,
     "LFBOTreeSearch": LFBOTreeSearch,
+    "LLMGuidedSearch": LLMGuidedSearch,
+    "LLMSeededSearch": LLMSeededSearch,
+    "LLMSeededLFBOTreeSearch": LLMSeededLFBOTreeSearch,
     "DifferentialEvolutionSearch": DifferentialEvolutionSearch,
     "FiniteSearch": FiniteSearch,
     "PatternSearch": PatternSearch,

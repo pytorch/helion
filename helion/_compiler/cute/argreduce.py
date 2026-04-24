@@ -196,8 +196,6 @@ def codegen_cute_tile_argreduce(
     smem = ctx.cg.device_function.new_var("argreduce_smem")
     valid_smem_ptr = ctx.cg.device_function.new_var("argreduce_valid_smem_ptr")
     valid_smem = ctx.cg.device_function.new_var("argreduce_valid_smem")
-    best_value = ctx.cg.device_function.new_var(f"{reduction_type}_best_value")
-    best_valid = ctx.cg.device_function.new_var(f"{reduction_type}_best_valid")
     best_index = ctx.cg.device_function.new_var(f"{reduction_type}_best_index")
     result = ctx.cg.device_function.new_var(reduction_type)
 
@@ -229,52 +227,11 @@ def codegen_cute_tile_argreduce(
     )
     ctx.cg.add_statement(statement_from_string("cute.arch.sync_threads()"))
     scan_ready = _argreduce_scan_ready_expr(ctx.cg, input_val, dim)
-    scan_statements: list[ast.stmt] = [
-        statement_from_string(f"{best_index} = cutlass.Int64(0)")
-    ]
+    start_expr = "cutlass.Int32(0)"
+    stride_expr = "cutlass.Int32(1)"
+    extent = input_numel
 
-    if dim is None:
-        scan_statements.extend(
-            [
-                statement_from_string(f"{best_value} = {smem}[0]"),
-                statement_from_string(f"{best_valid} = {valid_smem}[0]"),
-            ]
-        )
-        for flat_idx in range(1, input_numel):
-            candidate = ctx.cg.device_function.new_var(
-                f"{reduction_type}_candidate_{flat_idx}"
-            )
-            candidate_valid = ctx.cg.device_function.new_var(
-                f"{reduction_type}_candidate_valid_{flat_idx}"
-            )
-            compare = (
-                f"(({candidate}) > ({best_value}))"
-                f" or ((({candidate}) == ({best_value})) and (cutlass.Int64({flat_idx}) < ({best_index})))"
-            )
-            if reduction_type == "argmin":
-                compare = (
-                    f"(({candidate}) < ({best_value}))"
-                    f" or ((({candidate}) == ({best_value})) and (cutlass.Int64({flat_idx}) < ({best_index})))"
-                )
-            better = (
-                f"(({candidate_valid}) != cutlass.Int32(0) and ({best_valid}) == cutlass.Int32(0))"
-                f" or ((({candidate_valid}) != cutlass.Int32(0)) and (({best_valid}) != cutlass.Int32(0)) and ({compare}))"
-            )
-            scan_statements.extend(
-                [
-                    statement_from_string(f"{candidate} = {smem}[{flat_idx}]"),
-                    statement_from_string(
-                        f"{candidate_valid} = {valid_smem}[{flat_idx}]"
-                    ),
-                    statement_from_string(
-                        f"""if {better}:
-    {best_value} = {candidate}
-    {best_valid} = {candidate_valid}
-    {best_index} = cutlass.Int64({flat_idx})"""
-                    ),
-                ]
-            )
-    else:
+    if dim is not None:
         output_coords = _coords_from_flat_index(output_flat, output_shape)
         if keepdim:
             initial_coords = [*output_coords]
@@ -286,65 +243,32 @@ def codegen_cute_tile_argreduce(
                 *output_coords[dim:],
             ]
         initial_flat = _flat_index_from_coords(initial_coords, input_shape)
-        scan_statements.extend(
-            [
-                statement_from_string(f"{best_value} = {smem}[{initial_flat}]"),
-                statement_from_string(f"{best_valid} = {valid_smem}[{initial_flat}]"),
-            ]
-        )
-        reduce_extent = input_shape[dim]
-        for reduce_idx in range(1, reduce_extent):
+        start_expr = initial_flat
+        extent = input_shape[dim]
+        if extent > 1:
             if keepdim:
                 source_coords = [*output_coords]
-                source_coords[dim] = f"cutlass.Int32({reduce_idx})"
+                source_coords[dim] = "cutlass.Int32(1)"
             else:
                 source_coords = [
                     *output_coords[:dim],
-                    f"cutlass.Int32({reduce_idx})",
+                    "cutlass.Int32(1)",
                     *output_coords[dim:],
                 ]
-            source_flat = _flat_index_from_coords(source_coords, input_shape)
-            candidate = ctx.cg.device_function.new_var(
-                f"{reduction_type}_candidate_{reduce_idx}"
-            )
-            candidate_valid = ctx.cg.device_function.new_var(
-                f"{reduction_type}_candidate_valid_{reduce_idx}"
-            )
-            compare = (
-                f"(({candidate}) > ({best_value}))"
-                f" or ((({candidate}) == ({best_value})) and (cutlass.Int64({reduce_idx}) < ({best_index})))"
-            )
-            if reduction_type == "argmin":
-                compare = (
-                    f"(({candidate}) < ({best_value}))"
-                    f" or ((({candidate}) == ({best_value})) and (cutlass.Int64({reduce_idx}) < ({best_index})))"
-                )
-            better = (
-                f"(({candidate_valid}) != cutlass.Int32(0) and ({best_valid}) == cutlass.Int32(0))"
-                f" or ((({candidate_valid}) != cutlass.Int32(0)) and (({best_valid}) != cutlass.Int32(0)) and ({compare}))"
-            )
-            scan_statements.extend(
-                [
-                    statement_from_string(f"{candidate} = {smem}[{source_flat}]"),
-                    statement_from_string(
-                        f"{candidate_valid} = {valid_smem}[{source_flat}]"
-                    ),
-                    statement_from_string(
-                        f"""if {better}:
-    {best_value} = {candidate}
-    {best_valid} = {candidate_valid}
-    {best_index} = cutlass.Int64({reduce_idx})"""
-                    ),
-                ]
-            )
+            stride_expr = f"(({_flat_index_from_coords(source_coords, input_shape)}) - ({initial_flat}))"
 
     result_init = backend.cast_expr("0", output_dtype_str)
     ctx.cg.add_statement(statement_from_string(f"{result} = {result_init}"))
-    scan_statements.append(
+    scan_statements: list[ast.stmt] = [
+        statement_from_string(
+            f"{best_index} = _cute_argreduce_index("
+            f"{smem}, {valid_smem}, {start_expr}, {stride_expr}, "
+            f"extent={extent}, reduction_type={reduction_type!r})"
+        ),
         statement_from_string(
             f"{result} = {backend.cast_expr(best_index, output_dtype_str)}"
-        )
-    )
+        ),
+    ]
     if scan_ready is None:
         for stmt in scan_statements:
             ctx.cg.add_statement(stmt)

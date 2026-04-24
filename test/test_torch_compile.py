@@ -2627,7 +2627,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             allow_torch_compile_fusion=allow_torch_compile_fusion,
             expected_num_kernels=3 if allow_torch_compile_fusion else None,
             kernels_ref=[k_add_inplace_ref],
-            expected_num_kernels_ref=2,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))

@@ -1,0 +1,992 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Helion Benchmark Dashboard</title>
+<script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#0d1117;--surface:#161b22;--border:#30363d;--text:#e6edf3;--text-dim:#8b949e;
+  --green:#3fb950;--red:#f85149;--blue:#58a6ff;--orange:#f0883e;--yellow:#d29922;--purple:#bc8cff;
+  --gray:#484f58;
+}
+body{background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;line-height:1.5;overflow-x:hidden}
+a{color:var(--blue);text-decoration:none}
+a:hover{text-decoration:underline}
+.header{background:var(--surface);border-bottom:1px solid var(--border);padding:16px 24px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px}
+.header-left{display:flex;align-items:center;gap:12px}
+.header h1{font-size:20px;font-weight:600;letter-spacing:-0.3px}
+.header .repo-link{font-size:13px;color:var(--text-dim)}
+.tabs{display:flex;gap:0;background:var(--surface);border-bottom:1px solid var(--border);padding:0 24px}
+.tab-btn{padding:10px 20px;font-size:14px;font-weight:500;color:var(--text-dim);background:none;border:none;border-bottom:2px solid transparent;cursor:pointer;transition:all .15s}
+.tab-btn:hover{color:var(--text)}
+.tab-btn.active{color:var(--text);border-bottom-color:var(--blue)}
+.tab-content{display:none;padding:24px}
+.tab-content.active{display:block}
+.status-row{display:flex;gap:12px;margin-bottom:20px;flex-wrap:wrap}
+.status-card{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:16px 20px;min-width:170px;flex:1}
+.status-card .label{font-size:12px;color:var(--text-dim);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:4px}
+.status-card .value{font-size:22px;font-weight:700}
+.status-card .sub{font-size:12px;color:var(--text-dim);margin-top:2px}
+.status-card.clickable,.summary-card.clickable{cursor:pointer;transition:border-color .15s}
+.status-card.clickable:hover,.summary-card.clickable:hover{border-color:var(--blue)}
+.filter-bar{display:flex;gap:12px;margin-bottom:20px;align-items:center;flex-wrap:wrap}
+.filter-bar select,.filter-bar input{background:var(--surface);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:8px 12px;font-size:13px;outline:none}
+.filter-bar select:focus,.filter-bar input:focus{border-color:var(--blue)}
+.filter-bar input{min-width:220px}
+.platform-grid{display:grid;gap:12px 16px;overflow-x:auto;padding-bottom:8px}
+.platform-col-header{text-align:center;font-size:14px;font-weight:600;padding:10px 12px;border-radius:8px 8px 0 0;letter-spacing:0.3px}
+.kernel-card{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:14px 16px;margin-bottom:10px;cursor:pointer;transition:border-color .15s;position:relative;overflow:hidden}
+.kernel-card:hover{border-color:var(--blue)}
+.kernel-card.placeholder{opacity:0.25;cursor:default;pointer-events:none}
+.kernel-card .left-accent{position:absolute;left:0;top:0;bottom:0;width:3px}
+.kernel-card .kc-body{display:flex;gap:16px;align-items:stretch}
+.kernel-card .kc-left{flex:0 0 auto;min-width:180px;display:flex;flex-direction:column;justify-content:center}
+.kernel-card .kc-right{flex:1;min-width:0;display:flex;align-items:stretch}
+.kernel-card .kc-header{display:flex;align-items:center;gap:8px;margin-bottom:6px;flex-wrap:wrap}
+.kernel-card .kc-name{font-size:13px;font-weight:600;word-break:break-word}
+.kernel-card .kc-tag{font-size:10px;font-weight:600;padding:2px 6px;border-radius:4px;text-transform:uppercase;letter-spacing:0.3px}
+.kernel-card .kc-tag.improved{background:rgba(63,185,80,0.15);color:var(--green)}
+.kernel-card .kc-tag.regressed{background:rgba(248,81,73,0.15);color:var(--red)}
+.kernel-card .kc-row{display:flex;gap:6px;align-items:center;font-size:12px;margin-bottom:3px}
+.kernel-card .kc-row .kc-label{color:var(--text-dim)}
+.kernel-card .kc-row .kc-val{font-weight:600}
+.kernel-card .kc-delta{font-size:13px;margin-bottom:3px}
+.kernel-card .sparkline-container{width:100%;min-height:80px;display:flex;align-items:center;position:relative}
+.kernel-card .sparkline-container svg{width:100%;height:100%;min-height:80px}
+.kernel-card .fail-overlay{position:absolute;inset:0;display:flex;flex-direction:column;justify-content:center;align-items:center;gap:4px;background:rgba(13,17,23,0.75);border-radius:6px;padding:8px;text-align:center}
+.kernel-card .fail-overlay .fail-line{font-size:14px;font-weight:600}
+.kernel-card .fail-overlay .fail-subline{font-size:11px;color:var(--text-dim)}
+.kernel-card .fail-overlay .run-line{color:var(--yellow)}
+.kernel-card .fail-overlay .infra-line{color:var(--text-dim)}
+.kernel-card .accuracy-badge{position:absolute;top:6px;right:6px;font-size:14px;font-weight:700;color:var(--orange);background:rgba(240,136,62,0.2);padding:4px 10px;border-radius:6px;border:1px solid rgba(240,136,62,0.4)}
+.modal-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,0.65);z-index:1000;justify-content:center;align-items:flex-start;padding:40px 20px;overflow-y:auto}
+.modal-overlay.open{display:flex}
+.modal{background:var(--surface);border:1px solid var(--border);border-radius:12px;width:100%;max-width:1200px;padding:24px;position:relative}
+.modal-split{display:grid;grid-template-columns:1fr 1fr;gap:20px}
+@media(max-width:900px){.modal-split{grid-template-columns:1fr}}
+.modal-lhs{overflow-y:auto;max-height:70vh}
+.modal-rhs{overflow-y:auto;max-height:70vh}
+.modal-close{position:absolute;right:16px;top:16px;background:none;border:none;color:var(--text-dim);font-size:22px;cursor:pointer;padding:4px 8px;border-radius:4px}
+.modal-close:hover{color:var(--text);background:var(--border)}
+.modal h2{font-size:18px;font-weight:600;margin-bottom:4px}
+.modal .modal-sub{font-size:13px;color:var(--text-dim);margin-bottom:16px}
+.modal .chart-container{margin-bottom:20px;background:var(--bg);border-radius:8px;padding:12px}
+.modal .chart-container h3{font-size:14px;font-weight:600;margin-bottom:8px}
+.modal-note{font-size:12px;color:var(--text-dim);font-style:italic;margin-top:12px;padding-top:12px;border-top:1px solid var(--border)}
+.fail-list{list-style:none;padding:0}
+.fail-list li{padding:8px 12px;border-bottom:1px solid var(--border);font-size:13px;display:flex;gap:12px;flex-wrap:wrap}
+.fail-list li:last-child{border-bottom:none}
+.fail-list .fail-kernel{font-weight:600}
+.fail-list .fail-shapes{color:var(--text-dim);font-size:12px}
+.data-table{width:100%;border-collapse:collapse;font-size:13px;margin-top:12px}
+.data-table th{text-align:left;padding:8px 10px;border-bottom:2px solid var(--border);color:var(--text-dim);font-weight:600;font-size:12px;text-transform:uppercase;letter-spacing:0.3px;position:sticky;top:0;background:var(--surface);cursor:pointer;user-select:none;white-space:nowrap}
+.data-table th:hover{color:var(--text)}
+.data-table th.sort-asc::after{content:' ▲';font-size:9px}
+.data-table th.sort-desc::after{content:' ▼';font-size:9px}
+.data-table td{padding:8px 10px;border-bottom:1px solid var(--border)}
+.data-table tbody tr:hover{background:rgba(88,166,255,0.04)}
+.table-scroll{overflow-x:auto;max-height:600px;overflow-y:auto;border-radius:8px;border:1px solid var(--border);background:var(--surface)}
+.table-wrap{overflow-x:auto;border-radius:8px;border:1px solid var(--border);background:var(--surface)}
+.summary-row{display:flex;gap:12px;margin-bottom:20px;flex-wrap:wrap}
+.summary-card{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:16px 20px;flex:1;min-width:140px}
+.summary-card .sc-label{font-size:12px;color:var(--text-dim);margin-bottom:4px}
+.summary-card .sc-value{font-size:24px;font-weight:700}
+.summary-card .sc-sub{font-size:12px;color:var(--text-dim);margin-top:2px}
+.compare-selectors{display:flex;gap:16px;margin-bottom:20px;flex-wrap:wrap}
+.commit-box{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:16px;flex:1;min-width:280px}
+.commit-box h3{font-size:13px;font-weight:600;margin-bottom:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:0.5px}
+.commit-box select{width:100%;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:8px 12px;font-size:13px;margin-bottom:8px;outline:none}
+.commit-box select:focus{border-color:var(--blue)}
+.commit-box .run-link{font-size:12px;color:var(--text-dim)}
+.compare-card{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:14px 16px;margin-bottom:10px}
+.compare-card .cc-header{font-size:13px;font-weight:600;margin-bottom:8px;display:flex;align-items:center;gap:8px}
+.compare-card .cc-row{display:flex;justify-content:space-between;font-size:12px;padding:3px 0}
+.compare-card .cc-row .cc-label{color:var(--text-dim)}
+.compare-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:12px;margin-bottom:20px}
+.plat-badge{display:inline-block;font-size:10px;font-weight:600;padding:2px 8px;border-radius:4px;letter-spacing:0.3px;text-transform:uppercase}
+.delta-pos{color:var(--green)}.delta-neg{color:var(--red)}.delta-neutral{color:var(--text-dim)}
+@media(max-width:768px){
+  .platform-grid{flex-direction:column}
+  .status-row,.summary-row{flex-direction:column}
+  .compare-selectors{flex-direction:column}
+  .tab-content{padding:16px}
+}
+</style>
+</head>
+<body>
+<div class="header">
+  <div class="header-left">
+    <h1>Helion Benchmark Dashboard</h1>
+    <a class="repo-link" href="https://github.com/pytorch/helion" target="_blank">pytorch/helion</a>
+  </div>
+</div>
+<div class="tabs">
+  <button class="tab-btn active" data-tab="overview">Overview</button>
+  <button class="tab-btn" data-tab="speedup">Speedup</button>
+  <button class="tab-btn" data-tab="compare">Compare</button>
+</div>
+<div id="tab-overview" class="tab-content active"></div>
+<div id="tab-speedup" class="tab-content"></div>
+<div id="tab-compare" class="tab-content"></div>
+<div class="modal-overlay" id="modal-overlay">
+  <div class="modal" id="modal-content"></div>
+</div>
+<script>
+const REPO = 'pytorch/helion';
+let DATA = typeof EMBEDDED_DATA !== 'undefined' ? EMBEDDED_DATA : null;
+const PLAT_COLORS = { h100: '#3fb950', b200: '#58a6ff', mi325x: '#f0883e', mi350x: '#bc8cff' };
+const PLAT_NAMES = { h100: 'H100', b200: 'B200', mi325x: 'MI325X', mi350x: 'MI350X' };
+const plotlyDark = {
+  paper_bgcolor: '#0d1117', plot_bgcolor: '#0d1117',
+  font: { color: '#e6edf3', size: 11 },
+  margin: { l: 50, r: 20, t: 10, b: 110 },
+  xaxis: { gridcolor: '#30363d', tickangle: -40 },
+  yaxis: { gridcolor: '#30363d' }
+};
+function commitUrl(sha) { return `https://github.com/${REPO}/commit/${sha}`; }
+function runUrl(id) { return `https://github.com/${REPO}/actions/runs/${id}`; }
+function formatSpeedup(v) { return v != null ? v.toFixed(2) + 'x' : '--'; }
+function formatCompileTime(s) { return s != null ? s.toFixed(1) + 's' : '--'; }
+function formatDate(d) {
+  if (!d) return '--';
+  const dt = new Date(d);
+  const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+  return months[dt.getMonth()] + ' ' + dt.getDate() + ', ' + String(dt.getHours()).padStart(2,'0') + ':' + String(dt.getMinutes()).padStart(2,'0');
+}
+const TREND_CHART_HEIGHT = 480;
+const geomean = (arr, empty = 0) => arr.length > 0 ? Math.exp(arr.reduce((s, v) => s + Math.log(v), 0) / arr.length) : empty;
+function formatDelta(v, invert) {
+  if (v == null) return '<span class="delta-neutral">--</span>';
+  const positive = invert ? v < 0 : v > 0;
+  const negative = invert ? v > 0 : v < 0;
+  const cls = positive ? 'delta-pos' : negative ? 'delta-neg' : 'delta-neutral';
+  const sign = v > 0 ? '+' : '';
+  return `<span class="${cls}">${sign}${v.toFixed(1)}%</span>`;
+}
+function platColor(ps) { return PLAT_COLORS[ps] || '#8b949e'; }
+function platName(ps) { return PLAT_NAMES[ps] || ps.toUpperCase(); }
+function platBadge(ps) {
+  const c = platColor(ps);
+  return `<span class="plat-badge" style="background:${c}22;color:${c}">${platName(ps)}</span>`;
+}
+function escHtml(s) { return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+// -------- Helper: status card (overview row) --------
+function statusCard(label, value, sub, opts) {
+  opts = opts || {};
+  const cls = 'status-card' + (opts.clickable ? ' clickable' : '');
+  const id = opts.id ? ` id="${opts.id}"` : '';
+  const vStyle = opts.valueColor ? ` style="color:${opts.valueColor}"` : '';
+  const extra = opts.extraHtml || '';
+  return `<div class="${cls}"${id}><div class="label">${label}</div><div class="value"${vStyle}>${value}</div><div class="sub">${sub}</div>${extra}</div>`;
+}
+// -------- Helper: summary card (speedup / compare row) --------
+function summaryCard(label, value, sub, opts) {
+  opts = opts || {};
+  const cls = 'summary-card' + (opts.clickable ? ' clickable' : '');
+  const id = opts.id ? ` id="${opts.id}"` : '';
+  const vStyle = opts.valueColor ? ` style="color:${opts.valueColor}"` : '';
+  const subHtml = sub ? `<div class="sc-sub">${sub}</div>` : '';
+  return `<div class="${cls}"${id}><div class="sc-label">${label}</div><div class="sc-value"${vStyle}>${value}</div>${subHtml}</div>`;
+}
+// -------- Helper: modal header with close button --------
+function modalHeader(title, sub) {
+  let h = '<button class="modal-close" onclick="closeModal()">&times;</button>';
+  h += `<h2>${title}</h2>`;
+  if (sub) h += `<p class="modal-sub">${sub}</p>`;
+  return h;
+}
+// -------- Helper: build perf change table for improved/regressed modals --------
+function perfChangeTable(list, color, extraHeaders) {
+  const headers = extraHeaders
+    ? '<th>Kernel</th><th>Platform</th><th>Metric</th><th>Base</th><th>Target</th><th>Change</th>'
+    : '<th>Kernel</th><th>Platform</th><th>Metric</th><th>Value</th><th>Change</th>';
+  let html = `<div class="table-scroll"><table class="data-table"><thead><tr>${headers}</tr></thead><tbody>`;
+  list.forEach(item => {
+    const hasLat = extraHeaders ? item.latencyDelta != null : item.latency_delta_pct != null;
+    const metric = hasLat ? 'Latency' : 'Speedup';
+    const delta = hasLat
+      ? (extraHeaders ? item.latencyDelta : item.latency_delta_pct)
+      : (extraHeaders ? item.speedupDelta : item.speedup_delta_pct);
+    const deltaStr = delta != null ? (delta > 0 ? '+' : '') + delta.toFixed(1) + '%' : '?';
+    if (extraHeaders) {
+      const base = hasLat ? (item.baseLatency ? item.baseLatency.toFixed(2) + ' ms' : '--') : formatSpeedup(item.baseSpeedup);
+      const cmp = hasLat ? (item.cmpLatency ? item.cmpLatency.toFixed(2) + ' ms' : '--') : formatSpeedup(item.cmpSpeedup);
+      html += `<tr><td>${escHtml(item.kernel)}</td><td>${platBadge(item.platform_short)}</td>
+        <td>${metric}</td><td>${base}</td><td>${cmp}</td>
+        <td style="color:${color}">${deltaStr}</td></tr>`;
+    } else {
+      const value = hasLat
+        ? (item.helion_latency_avg_ms > 0 ? item.helion_latency_avg_ms.toFixed(2) + ' ms' : '--')
+        : formatSpeedup(item.helion_speedup_geomean);
+      html += `<tr><td>${escHtml(item.kernel)}</td><td>${platBadge(item.platform_short)}</td>
+        <td>${metric}</td><td style="color:${color}">${value}</td>
+        <td style="color:${color}">${deltaStr}</td></tr>`;
+    }
+  });
+  html += '</tbody></table></div>';
+  return html;
+}
+function makeSortable(table) {
+  const headers = table.querySelectorAll('th');
+  headers.forEach((th, colIdx) => {
+    th.addEventListener('click', () => {
+      const tbody = table.querySelector('tbody');
+      const rows = Array.from(tbody.querySelectorAll('tr'));
+      const isAsc = th.classList.contains('sort-asc');
+      headers.forEach(h => { h.classList.remove('sort-asc', 'sort-desc'); });
+      th.classList.add(isAsc ? 'sort-desc' : 'sort-asc');
+      const dir = isAsc ? -1 : 1;
+      rows.sort((a, b) => {
+        const aText = (a.cells[colIdx].textContent || '').trim();
+        const bText = (b.cells[colIdx].textContent || '').trim();
+        const aNum = parseFloat(aText.replace(/[^0-9.\-]/g, ''));
+        const bNum = parseFloat(bText.replace(/[^0-9.\-]/g, ''));
+        if (!isNaN(aNum) && !isNaN(bNum)) return (aNum - bNum) * dir;
+        if (aText === '--' && bText !== '--') return 1;
+        if (bText === '--' && aText !== '--') return -1;
+        return aText.localeCompare(bText) * dir;
+      });
+      rows.forEach(r => tbody.appendChild(r));
+    });
+  });
+}
+let kernelPlatMap = {};
+let _cmpImproved = [], _cmpRegressed = [];
+let activeFilters = { platform: 'all', search: '' };
+function buildMaps() {
+  if (!DATA) return;
+  DATA.summary.forEach(e => {
+    kernelPlatMap[e.kernel + '||' + e.platform_short] = e;
+  });
+}
+function getFiltered() {
+  const plats = activeFilters.platform === 'all' ? DATA.platform_shorts : [activeFilters.platform];
+  const search = activeFilters.search.toLowerCase();
+  let kernels = DATA.unique_kernels;
+  if (search) kernels = kernels.filter(k => k.toLowerCase().includes(search));
+  return { platforms: plats, kernels };
+}
+function getFailures() {
+  const acc = [], run = [], infra = [];
+  DATA.summary.forEach(e => {
+    const entry = { kernel: e.kernel, platform: platName(e.platform_short), platform_short: e.platform_short };
+    if (e.accuracy_failures?.length) acc.push({ ...entry, shapes: e.accuracy_failures });
+    if (e.run_failures?.length) run.push({ ...entry, shapes: e.run_failures });
+    if (e.infra_missing) infra.push({ ...entry, last_seen_date: e.last_seen_date });
+  });
+  return { acc, run, infra };
+}
+// Prefer latency once a kernel has accumulated enough history; fall back to
+// speedup while latency recording is still ramping up.
+const LATENCY_MIN_POINTS = 14;
+function sparklineSvg(history, color) {
+  if (!history || history.length < 2) return '';
+  const mainHist = history.filter(h => (h.branch || 'main') === 'main');
+  const latency = mainHist.map(h => h.helion_latency_avg_ms).filter(v => v > 0);
+  const vals = latency.length >= LATENCY_MIN_POINTS
+    ? latency
+    : mainHist.map(h => h.helion_speedup_geomean).filter(v => v > 0);
+  if (vals.length < 2) return '';
+  const mn = Math.min(...vals), mx = Math.max(...vals);
+  const range = mx - mn || 1;
+  const w = 120, h = 28, pad = 2;
+  let pts = vals.map((v, i) => {
+    const x = pad + (i / (vals.length - 1)) * (w - 2*pad);
+    const y = h - pad - ((v - mn) / range) * (h - 2*pad);
+    return `${x},${y}`;
+  });
+  return `<svg viewBox="0 0 ${w} ${h}" preserveAspectRatio="none"><polyline points="${pts.join(' ')}" fill="none" stroke="${color}" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
+}
+// -------- Overview Tab --------
+function renderOverview() {
+  const lr = DATA.latest_run;
+  const st = DATA.stats;
+  const fails = getFailures();
+  const failCount = (st.accuracy_failures || 0) + (st.run_failures || 0) + (st.infra_missing || 0);
+  const ciPass = failCount === 0;
+  let html = '<div class="status-row">';
+  html += statusCard('Latest Commit',
+    `<a href="${commitUrl(lr.full_sha)}" target="_blank">${escHtml(lr.sha)}</a>`,
+    `${formatDate(lr.date)}`,
+    { extraHtml: `<div class="sub">Run <a href="${runUrl(lr.run_id)}" target="_blank">#${lr.run_id}</a></div>` });
+  html += statusCard('CI Status',
+    ciPass ? 'PASS' : failCount + ' FAIL',
+    ciPass ? 'All accuracy checks passed' : 'Click for details',
+    { id: 'ci-status-card', clickable: failCount > 0, valueColor: ciPass ? 'var(--green)' : 'var(--red)' });
+  html += statusCard('Improved Perf', st.improved_count,
+    st.improved_count > 0 ? 'Click for details' : 'kernels, &gt;10% threshold',
+    { id: 'improved-card', clickable: true, valueColor: 'var(--green)' });
+  html += statusCard('Regressed Perf', st.regressed_count,
+    st.regressed_count > 0 ? 'Click for details' : 'kernels, &gt;10% threshold',
+    { id: 'regressed-card', clickable: true, valueColor: st.regressed_count > 0 ? 'var(--red)' : 'var(--text-dim)' });
+  html += statusCard('Kernels', st.total_kernels, st.num_platforms + ' platforms');
+  html += '</div>';
+  html += '<div class="filter-bar">';
+  html += '<select id="ov-plat-filter"><option value="all">All Platforms</option>';
+  DATA.platform_shorts.forEach(p => { html += `<option value="${p}">${platName(p)}</option>`; });
+  html += '</select>';
+  html += '<input type="text" id="ov-search" placeholder="Search kernels...">';
+  html += '</div>';
+  html += '<div class="platform-grid" id="ov-grid"></div>';
+  document.getElementById('tab-overview').innerHTML = html;
+  document.getElementById('ov-plat-filter').addEventListener('change', e => { activeFilters.platform = e.target.value; renderOverviewGrid(); });
+  document.getElementById('ov-search').addEventListener('input', e => { activeFilters.search = e.target.value; renderOverviewGrid(); });
+  if (failCount > 0) {
+    document.getElementById('ci-status-card').addEventListener('click', () => showFailuresModal(fails));
+  }
+  const improved = DATA.summary.filter(s => s.status === 'improved');
+  const regressed = DATA.summary.filter(s => s.status === 'regressed');
+  document.getElementById('improved-card').addEventListener('click', () => {
+    let html = modalHeader(
+      improved.length === 0 ? 'Improved Perf' : `Improved Perf — ${improved.length} kernel(s)`,
+      improved.length === 0 ? 'No kernels improved &gt;10% vs previous run' : 'Kernels with &gt;10% improvement vs previous run (latency or speedup)');
+    if (improved.length > 0) html += perfChangeTable(improved, 'var(--green)', false);
+    openModal(html);
+  });
+  document.getElementById('regressed-card').addEventListener('click', () => {
+    let html = modalHeader(
+      regressed.length === 0 ? 'Regressed Perf' : `Regressed Perf — ${regressed.length} kernel(s)`,
+      regressed.length === 0 ? 'No kernels regressed &gt;10% vs previous run' : 'Kernels with &gt;10% regression vs previous run (latency or speedup)');
+    if (regressed.length > 0) html += perfChangeTable(regressed, 'var(--red)', false);
+    openModal(html);
+  });
+  renderOverviewGrid();
+}
+function renderOverviewGrid() {
+  const { platforms, kernels } = getFiltered();
+  const grid = document.getElementById('ov-grid');
+  let html = '';
+  grid.style.gridTemplateColumns = `repeat(${platforms.length}, 1fr)`;
+  platforms.forEach(ps => {
+    const color = platColor(ps);
+    html += `<div class="platform-col-header" style="background:${color}18;color:${color};border:1px solid ${color}44">${platName(ps)}</div>`;
+  });
+  kernels.forEach(k => {
+    platforms.forEach(ps => {
+      const color = platColor(ps);
+      const e = kernelPlatMap[k + '||' + ps];
+      if (!e) {
+        html += `<div class="kernel-card placeholder"><div class="left-accent" style="background:${color}"></div>`;
+        html += `<div class="kc-header"><span class="kc-name">${escHtml(k)}</span></div>`;
+        html += '<div class="kc-body"><div class="kc-left">';
+        html += '<div class="kc-row"><span class="kc-label">Latency</span><span class="kc-val">--</span></div>';
+        html += '<div class="kc-row"><span class="kc-label">Compile time</span><span class="kc-val">--</span></div>';
+        html += '<div class="kc-delta" style="color:var(--text-dim)">No data</div>';
+        html += '</div><div class="kc-right"></div></div></div>';
+      } else {
+        html += `<div class="kernel-card" data-kernel="${escHtml(e.kernel)}" data-platform="${escHtml(e.platform_short)}" onclick="showDetailModal('${escHtml(e.kernel)}','${escHtml(e.platform_short)}')">`;
+        html += `<div class="left-accent" style="background:${color}"></div>`;
+        html += '<div class="kc-header">';
+        html += `<span class="kc-name">${escHtml(e.kernel)}</span>`;
+        if (e.status === 'improved') html += '<span class="kc-tag improved">improved perf</span>';
+        else if (e.status === 'regressed') html += '<span class="kc-tag regressed">regressed perf</span>';
+        html += '</div>';
+        html += '<div class="kc-body"><div class="kc-left">';
+        html += `<div class="kc-row"><span class="kc-label">Latency</span><span class="kc-val" style="color:${color}">${e.helion_latency_avg_ms.toFixed(2)} ms</span></div>`;
+        html += `<div class="kc-row"><span class="kc-label">Compile time</span><span class="kc-val">${formatCompileTime(e.compile_time_geomean_s)}</span></div>`;
+        html += `<div class="kc-delta">Latency vs prev: ${formatDelta(e.latency_delta_pct, true)}</div>`;
+        html += `<div class="kc-delta">Compile time vs prev: ${formatDelta(e.compile_delta_pct, true)}</div>`;
+        html += '</div>';
+        // run_fail and infra_missing mean no real perf data — cover sparkline with overlay.
+        // accuracy_fail kernels still ran; show sparkline with a small badge.
+        let overlay = '';
+        if (e.run_failures?.length || e.infra_missing) {
+          overlay = '<div class="fail-overlay">';
+          if (e.run_failures?.length) overlay += `<div class="fail-line run-line">${e.run_failures.length} shapes failed</div>`;
+          if (e.infra_missing) {
+            overlay += '<div class="fail-line infra-line">No Result</div>';
+            if (e.last_seen_date) overlay += `<div class="fail-subline">last seen ${formatDate(e.last_seen_date)}</div>`;
+          }
+          overlay += '</div>';
+        } else if (e.accuracy_failures?.length) {
+          overlay = `<div class="accuracy-badge">${e.accuracy_failures.length} accuracy fail</div>`;
+        }
+        html += `<div class="kc-right"><div class="sparkline-container">${sparklineSvg(e.history, color)}${overlay}</div></div>`;
+        html += '</div></div>';
+      }
+    });
+  });
+  grid.innerHTML = html;
+}
+// -------- Speedup Tab --------
+function renderSpeedupTrendChart() {
+  const el = document.getElementById('speedup-trend-chart');
+  if (!el) return;
+  const { platforms, kernels } = getFiltered();
+  const entries = [];
+  kernels.forEach(k => {
+    platforms.forEach(ps => {
+      const e = kernelPlatMap[k + '||' + ps];
+      if (e) entries.push(e);
+    });
+  });
+  const runs = DATA.runs;
+  const helionTrend = [], tcTrend = [], tritonTrend = [];
+  const xLabels = [];
+  runs.forEach(r => {
+    const hValsRun = [], tValsRun = [], rValsRun = [];
+    entries.forEach(e => {
+      const h = (e.history || []).find(x => x.run_id === r.run_id);
+      if (h) {
+        if (h.helion_speedup_geomean > 0) hValsRun.push(h.helion_speedup_geomean);
+        if (h.torch_compile_speedup_geomean > 0) tValsRun.push(h.torch_compile_speedup_geomean);
+        if (h.triton_speedup_geomean > 0) rValsRun.push(h.triton_speedup_geomean);
+      }
+    });
+    helionTrend.push(geomean(hValsRun, null));
+    tcTrend.push(geomean(tValsRun, null));
+    tritonTrend.push(geomean(rValsRun, null));
+    xLabels.push(r.sha + '\n' + formatDate(r.date));
+  });
+  let firstIdx = 0;
+  while (firstIdx < xLabels.length && helionTrend[firstIdx] == null && tcTrend[firstIdx] == null && tritonTrend[firstIdx] == null) {
+    firstIdx++;
+  }
+  helionTrend.splice(0, firstIdx);
+  tcTrend.splice(0, firstIdx);
+  tritonTrend.splice(0, firstIdx);
+  xLabels.splice(0, firstIdx);
+  const traces = [
+    { x: xLabels, y: helionTrend, name: 'Helion', mode: 'lines+markers', line: { color: '#3fb950', width: 2 }, marker: { size: 6 } },
+    { x: xLabels, y: tcTrend, name: 'torch.compile', mode: 'lines+markers', line: { color: '#58a6ff', width: 2 }, marker: { size: 6 } },
+    { x: xLabels, y: tritonTrend, name: 'Triton', mode: 'lines+markers', line: { color: '#bc8cff', width: 2 }, marker: { size: 6 } },
+  ];
+  const allVals = [...helionTrend, ...tcTrend, ...tritonTrend].filter(v => v > 0);
+  const rawMin = allVals.length > 0 ? Math.min(...allVals) : 0;
+  const rawMax = allVals.length > 0 ? Math.max(...allVals) : 2;
+  const pad = (rawMax - rawMin) * 0.15 || 0.1;
+  const minY = Math.max(0, rawMin - pad);
+  const maxY = rawMax + pad;
+  const shapes = (minY < 1 && maxY > 1) ? [{
+    type: 'line', x0: xLabels[0], x1: xLabels[xLabels.length - 1],
+    y0: 1, y1: 1, line: { color: '#f85149', width: 1, dash: 'dash' }
+  }] : [];
+  const layout = Object.assign({}, plotlyDark, {
+    xaxis: Object.assign({}, plotlyDark.xaxis, { tickangle: -40 }),
+    yaxis: Object.assign({}, plotlyDark.yaxis, { title: 'Geomean Speedup', range: [minY, maxY] }),
+    shapes: shapes,
+    legend: { font: { color: '#e6edf3', size: 11 }, bgcolor: 'rgba(0,0,0,0)' },
+    height: TREND_CHART_HEIGHT
+  });
+  Plotly.newPlot(el, traces, layout, { responsive: true, displayModeBar: false });
+}
+function renderSpeedup() {
+  const { platforms, kernels } = getFiltered();
+  const entries = [];
+  kernels.forEach(k => {
+    platforms.forEach(ps => {
+      const e = kernelPlatMap[k + '||' + ps];
+      if (e) entries.push(e);
+    });
+  });
+  const hVals = entries.map(e => e.helion_speedup_geomean).filter(v => v > 0);
+  const tVals = entries.map(e => e.torch_compile_speedup_geomean).filter(v => v > 0);
+  const rVals = entries.map(e => e.triton_speedup_geomean).filter(v => v > 0);
+  const helionGM = geomean(hVals), tcGM = geomean(tVals), tritonGM = geomean(rVals);
+  const helionWins = entries.filter(e => e.helion_speedup_geomean > Math.max(e.torch_compile_speedup_geomean || 0, e.triton_speedup_geomean || 0)).length;
+  let html = '';
+  html += '<h2 style="margin-bottom:4px">Speedup vs Eager Execution</h2>';
+  html += '<p style="font-size:13px;color:var(--text-dim);margin-bottom:16px">Higher values = faster than PyTorch eager. Values &lt; 1.0 are slower than eager.</p>';
+  html += '<div class="filter-bar"><select id="sp-plat-filter"><option value="all">All Platforms</option>';
+  DATA.platform_shorts.forEach(p => { html += `<option value="${p}"${p === activeFilters.platform ? ' selected' : ''}>${platName(p)}</option>`; });
+  html += '</select></div>';
+  html += '<div class="summary-row">';
+  html += summaryCard('Helion Geomean', formatSpeedup(helionGM), null, { valueColor: 'var(--green)' });
+  html += summaryCard('torch.compile Geomean', formatSpeedup(tcGM), null, { valueColor: 'var(--blue)' });
+  html += summaryCard('Triton Geomean', formatSpeedup(tritonGM), null, { valueColor: 'var(--purple)' });
+  html += summaryCard('Helion Wins', helionWins, `of ${entries.length} kernel/platform combos`, { valueColor: 'var(--green)' });
+  html += '</div>';
+  // Speedup trend over time (Plotly)
+  const runs = DATA.runs;
+  if (runs.length >= 2) {
+    html += '<div style="background:var(--bg);border-radius:8px;padding:16px;margin-bottom:20px">';
+    html += '<div style="font-size:14px;font-weight:600;margin-bottom:8px">Geomean Speedup Over Time</div>';
+    html += `<div id="speedup-trend-chart" style="width:100%;height:${TREND_CHART_HEIGHT}px"></div>`;
+    html += '</div>';
+  }
+  entries.sort((a, b) => a.platform_short.localeCompare(b.platform_short) || a.kernel.localeCompare(b.kernel));
+  html += '<div class="table-wrap"><table class="data-table"><thead><tr><th>Kernel</th><th>Platform</th><th>Commit</th><th>Helion</th><th>torch.compile</th><th>Triton</th><th>Compile Time</th><th>Best</th></tr></thead><tbody>';
+  entries.forEach(e => {
+    const vals = [e.helion_speedup_geomean, e.torch_compile_speedup_geomean, e.triton_speedup_geomean];
+    const names = ['Helion', 'torch.compile', 'Triton'];
+    const colors = ['var(--green)', 'var(--blue)', 'var(--purple)'];
+    let bestIdx = 0;
+    vals.forEach((v, i) => { if ((v || 0) > (vals[bestIdx] || 0)) bestIdx = i; });
+    const latest = e.history && e.history.length > 0 ? e.history[e.history.length - 1] : null;
+    const commitLink = latest ? `<a href="${commitUrl(latest.full_sha)}" target="_blank" style="font-family:monospace;font-size:12px">${escHtml(latest.sha)}</a>` : '--';
+    html += `<tr>
+      <td>${escHtml(e.kernel)}</td>
+      <td>${platBadge(e.platform_short)}</td>
+      <td>${commitLink}</td>
+      <td style="color:var(--green)">${formatSpeedup(e.helion_speedup_geomean)}</td>
+      <td style="color:var(--blue)">${formatSpeedup(e.torch_compile_speedup_geomean)}</td>
+      <td style="color:var(--purple)">${formatSpeedup(e.triton_speedup_geomean)}</td>
+      <td>${formatCompileTime(e.compile_time_geomean_s)}</td>
+      <td style="color:${colors[bestIdx]}">${names[bestIdx]}</td>
+    </tr>`;
+  });
+  html += '</tbody></table></div>';
+  document.getElementById('tab-speedup').innerHTML = html;
+  document.querySelectorAll('#tab-speedup .data-table').forEach(makeSortable);
+  document.getElementById('sp-plat-filter').addEventListener('change', e => {
+    activeFilters.platform = e.target.value;
+    renderSpeedup();
+    renderOverviewGrid();
+  });
+  if (runs.length >= 2) {
+    setTimeout(() => renderSpeedupTrendChart(), 50);
+  }
+}
+// -------- Compare Tab --------
+function renderCompare(baseRunIdOverride, cmpRunIdOverride, baseBranchOverride, cmpBranchOverride) {
+  const allRuns = [...DATA.runs].sort((a, b) => new Date(b.date) - new Date(a.date));
+  const allBranches = [...new Set(allRuns.map(r => r.branch || 'main'))].sort();
+  const baseBranch = baseBranchOverride || 'main';
+  const cmpBranch = cmpBranchOverride || 'main';
+  const baseRuns = allRuns.filter(r => (r.branch || 'main') === baseBranch);
+  const cmpRuns = allRuns.filter(r => (r.branch || 'main') === cmpBranch);
+  const baseRunId = baseRunIdOverride || (baseRuns[1] ? baseRuns[1].run_id : (baseRuns[0] ? baseRuns[0].run_id : null));
+  const cmpRunId = cmpRunIdOverride || (cmpRuns[0] ? cmpRuns[0].run_id : null);
+  const baseRun = DATA.runs.find(r => r.run_id === baseRunId);
+  const cmpRun = DATA.runs.find(r => r.run_id === cmpRunId);
+  // Compare uses all kernels/platforms (including non-main) so cross-branch comparisons work
+  const allPlatforms = [...new Set(DATA.summary.map(s => s.platform_short))].sort();
+  const allKernels = [...new Set(DATA.summary.map(s => s.kernel))].sort();
+  const search = activeFilters.search.toLowerCase();
+  const platforms = activeFilters.platform === 'all' ? allPlatforms : [activeFilters.platform];
+  const kernels = search ? allKernels.filter(k => k.toLowerCase().includes(search)) : allKernels;
+  let improved = 0, regressed = 0, unchanged = 0;
+  const allDeltas = [];
+  const comparisons = [];
+  platforms.forEach(ps => {
+    kernels.forEach(k => {
+      const entry = kernelPlatMap[k + '||' + ps];
+      if (!entry || !entry.history) return;
+      const baseH = entry.history.find(h => h.run_id === baseRunId);
+      const cmpH = entry.history.find(h => h.run_id === cmpRunId);
+      if (!baseH && !cmpH) return;
+      const baseSpeedup = baseH ? baseH.helion_speedup_geomean : null;
+      const cmpSpeedup = cmpH ? cmpH.helion_speedup_geomean : null;
+      const baseCompile = baseH ? baseH.compile_time_geomean_s : null;
+      const cmpCompile = cmpH ? cmpH.compile_time_geomean_s : null;
+      const baseLatency = baseH ? baseH.helion_latency_avg_ms : null;
+      const cmpLatency = cmpH ? cmpH.helion_latency_avg_ms : null;
+      let speedupDelta = null;
+      if (baseSpeedup && cmpSpeedup && baseSpeedup > 0) {
+        speedupDelta = ((cmpSpeedup - baseSpeedup) / baseSpeedup) * 100;
+      }
+      let latencyDelta = null;
+      if (baseLatency && cmpLatency && baseLatency > 0 && cmpLatency > 0) {
+        latencyDelta = ((baseLatency - cmpLatency) / cmpLatency) * 100;
+      }
+      const perfDelta = latencyDelta != null ? latencyDelta : speedupDelta;
+      if (perfDelta != null) {
+        allDeltas.push(perfDelta);
+        if (perfDelta > 10) improved++;
+        else if (perfDelta < -10) regressed++;
+        else unchanged++;
+      } else {
+        unchanged++;
+      }
+      let compileDelta = null;
+      if (baseCompile && cmpCompile && baseCompile > 0) {
+        compileDelta = ((cmpCompile - baseCompile) / baseCompile) * 100;
+      }
+      comparisons.push({
+        kernel: k, platform_short: ps,
+        baseSpeedup, cmpSpeedup, speedupDelta,
+        baseLatency, cmpLatency, latencyDelta,
+        baseCompile, cmpCompile, compileDelta
+      });
+    });
+  });
+  let geomeanDelta = 0;
+  if (allDeltas.length > 0) {
+    const absDelta = allDeltas.map(d => Math.abs(d)).filter(d => d > 0);
+    if (absDelta.length > 0) {
+      const gmVal = geomean(absDelta);
+      const positiveCount = allDeltas.filter(d => d > 0).length;
+      geomeanDelta = positiveCount >= allDeltas.length / 2 ? gmVal : -gmVal;
+    }
+  }
+  let html = '<h2 style="margin-bottom:16px">Compare Commits</h2>';
+  html += '<div class="compare-selectors">';
+  html += '<div class="commit-box"><h3>Base</h3>';
+  html += '<select id="cmp-base-branch">';
+  allBranches.forEach(b => { html += `<option value="${b}"${b === baseBranch ? ' selected' : ''}>${escHtml(b)}</option>`; });
+  html += '</select>';
+  html += '<select id="cmp-base-commit">';
+  baseRuns.forEach(r => { html += `<option value="${r.run_id}"${r.run_id === baseRunId ? ' selected' : ''}>${r.sha} (${formatDate(r.date)})</option>`; });
+  html += '</select>';
+  html += baseRun ? `<div class="run-link">Run: <a href="${runUrl(baseRun.run_id)}" target="_blank">#${baseRun.run_id}</a></div>` : '';
+  html += '</div>';
+  html += '<div class="commit-box"><h3>Target</h3>';
+  html += '<select id="cmp-compare-branch">';
+  allBranches.forEach(b => { html += `<option value="${b}"${b === cmpBranch ? ' selected' : ''}>${escHtml(b)}</option>`; });
+  html += '</select>';
+  html += '<select id="cmp-compare-commit">';
+  cmpRuns.forEach(r => { html += `<option value="${r.run_id}"${r.run_id === cmpRunId ? ' selected' : ''}>${r.sha} (${formatDate(r.date)})</option>`; });
+  html += '</select>';
+  html += cmpRun ? `<div class="run-link">Run: <a href="${runUrl(cmpRun.run_id)}" target="_blank">#${cmpRun.run_id}</a></div>` : '';
+  html += '</div></div>';
+  html += '<div class="filter-bar"><select id="cmp-plat-filter"><option value="all">All Platforms</option>';
+  DATA.platform_shorts.forEach(p => { html += `<option value="${p}"${p === activeFilters.platform ? ' selected' : ''}>${platName(p)}</option>`; });
+  html += '</select></div>';
+  const improvedList = comparisons.filter(c => {
+    const d = c.latencyDelta != null ? c.latencyDelta : c.speedupDelta;
+    return d != null && d > 10;
+  });
+  const regressedList = comparisons.filter(c => {
+    const d = c.latencyDelta != null ? c.latencyDelta : c.speedupDelta;
+    return d != null && d < -10;
+  });
+  _cmpImproved = improvedList;
+  _cmpRegressed = regressedList;
+  html += '<div class="summary-row">';
+  html += summaryCard('Improved Perf', improved, improved > 0 ? 'Click for details' : '&gt;10% threshold',
+    { id: 'cmp-improved-card', clickable: true, valueColor: 'var(--green)' });
+  html += summaryCard('Regressed Perf', regressed, regressed > 0 ? 'Click for details' : '&gt;10% threshold',
+    { id: 'cmp-regressed-card', clickable: true, valueColor: regressed > 0 ? 'var(--red)' : 'var(--text-dim)' });
+  html += summaryCard('Unchanged', unchanged);
+  html += summaryCard('Geomean Perf Delta', formatDelta(geomeanDelta, false));
+  html += '</div>';
+  const changedComparisons = comparisons.filter(c => {
+    const d = c.latencyDelta != null ? c.latencyDelta : c.speedupDelta;
+    return d != null && (d > 10 || d < -10);
+  });
+  if (changedComparisons.length > 0) {
+    html += `<div style="font-size:14px;font-weight:600;margin-bottom:8px">Changed Kernels (${changedComparisons.length})</div>`;
+    html += '<div class="compare-grid">';
+    const fmtLat = v => v && v > 0 ? v.toFixed(2) + ' ms' : '--';
+    changedComparisons.forEach(c => {
+      const color = platColor(c.platform_short);
+      const perfD = c.latencyDelta != null ? c.latencyDelta : c.speedupDelta;
+      const isImproved = perfD > 10;
+      const borderColor = isImproved ? 'var(--green)' : 'var(--red)';
+      html += `<div class="compare-card" style="border-left:3px solid ${borderColor}">`;
+      html += `<div class="cc-header"><span style="color:${color}">${escHtml(c.kernel)}</span> ${platBadge(c.platform_short)} <span class="kc-tag ${isImproved ? 'improved' : 'regressed'}">${isImproved ? 'improved' : 'regressed'} perf</span></div>`;
+      html += `<div class="cc-row"><span class="cc-label">Latency</span><span>${fmtLat(c.baseLatency)} → ${fmtLat(c.cmpLatency)} (${formatDelta(c.latencyDelta, true)})</span></div>`;
+      html += `<div class="cc-row"><span class="cc-label">Speedup</span><span>${formatSpeedup(c.baseSpeedup)} → ${formatSpeedup(c.cmpSpeedup)} (${formatDelta(c.speedupDelta, false)})</span></div>`;
+      html += `<div class="cc-row"><span class="cc-label">Compile Time</span><span>${formatCompileTime(c.baseCompile)} → ${formatCompileTime(c.cmpCompile)} (${formatDelta(c.compileDelta, true)})</span></div>`;
+      html += '</div>';
+    });
+    html += '</div>';
+  } else {
+    html += '<div style="padding:16px;background:var(--bg);border-radius:8px;margin-bottom:20px;text-align:center;color:var(--text-dim);font-size:13px">No kernels changed &gt;10% between selected commits</div>';
+  }
+  html += '<div style="font-size:14px;font-weight:600;margin-bottom:8px">All Kernels</div>';
+  html += '<div class="table-wrap"><table class="data-table"><thead><tr><th>Kernel</th><th>Platform</th><th>Base Latency</th><th>Target Latency</th><th>Latency Delta</th><th>Base Speedup</th><th>Target Speedup</th><th>Speedup Delta</th><th>Base Compile Time</th><th>Target Compile Time</th><th>Compile Time Delta</th></tr></thead><tbody>';
+  comparisons.forEach(c => {
+    const fmtLat = v => v && v > 0 ? v.toFixed(2) + ' ms' : '--';
+    html += `<tr>
+      <td>${escHtml(c.kernel)}</td>
+      <td>${platBadge(c.platform_short)}</td>
+      <td>${fmtLat(c.baseLatency)}</td>
+      <td>${fmtLat(c.cmpLatency)}</td>
+      <td>${formatDelta(c.latencyDelta, true)}</td>
+      <td>${formatSpeedup(c.baseSpeedup)}</td>
+      <td>${formatSpeedup(c.cmpSpeedup)}</td>
+      <td>${formatDelta(c.speedupDelta, false)}</td>
+      <td>${formatCompileTime(c.baseCompile)}</td>
+      <td>${formatCompileTime(c.cmpCompile)}</td>
+      <td>${formatDelta(c.compileDelta, true)}</td>
+    </tr>`;
+  });
+  html += '</tbody></table></div>';
+  document.getElementById('tab-compare').innerHTML = html;
+  document.querySelectorAll('#tab-compare .data-table').forEach(makeSortable);
+  const cmpRerender = () => renderCompare(
+    document.getElementById('cmp-base-commit').value,
+    document.getElementById('cmp-compare-commit').value,
+    document.getElementById('cmp-base-branch').value,
+    document.getElementById('cmp-compare-branch').value,
+  );
+  document.getElementById('cmp-base-commit').addEventListener('change', cmpRerender);
+  document.getElementById('cmp-compare-commit').addEventListener('change', cmpRerender);
+  document.getElementById('cmp-base-branch').addEventListener('change', () => {
+    renderCompare(null, document.getElementById('cmp-compare-commit').value,
+      document.getElementById('cmp-base-branch').value,
+      document.getElementById('cmp-compare-branch').value);
+  });
+  document.getElementById('cmp-compare-branch').addEventListener('change', () => {
+    renderCompare(document.getElementById('cmp-base-commit').value, null,
+      document.getElementById('cmp-base-branch').value,
+      document.getElementById('cmp-compare-branch').value);
+  });
+  document.getElementById('cmp-plat-filter').addEventListener('change', e => {
+    activeFilters.platform = e.target.value;
+    cmpRerender();
+    renderOverviewGrid();
+  });
+  document.getElementById('cmp-improved-card').addEventListener('click', () => {
+    const list = _cmpImproved || [];
+    let mhtml = modalHeader(
+      list.length === 0 ? 'Improved Perf' : `Improved Perf — ${list.length} kernel(s)`,
+      list.length === 0 ? 'No kernels improved &gt;10% between selected commits' : 'Kernels with &gt;10% improvement between selected commits (latency or speedup)');
+    if (list.length > 0) mhtml += perfChangeTable(list, 'var(--green)', true);
+    openModal(mhtml);
+  });
+  document.getElementById('cmp-regressed-card').addEventListener('click', () => {
+    const list = _cmpRegressed || [];
+    let mhtml = modalHeader(
+      list.length === 0 ? 'Regressed Perf' : `Regressed Perf — ${list.length} kernel(s)`,
+      list.length === 0 ? 'No kernels regressed &gt;10% between selected commits' : 'Kernels with &gt;10% regression between selected commits (latency or speedup)');
+    if (list.length > 0) mhtml += perfChangeTable(list, 'var(--red)', true);
+    openModal(mhtml);
+  });
+}
+// -------- Modals --------
+function openModal(content) {
+  document.getElementById('modal-content').innerHTML = content;
+  document.getElementById('modal-overlay').classList.add('open');
+}
+function closeModal() {
+  const charts = document.querySelectorAll('#modal-content [id^="mc-"]');
+  charts.forEach(el => { try { Plotly.purge(el); } catch(e) {} });
+  document.getElementById('modal-overlay').classList.remove('open');
+}
+document.getElementById('modal-overlay').addEventListener('click', e => {
+  if (e.target === document.getElementById('modal-overlay')) closeModal();
+});
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closeModal(); });
+function showFailuresModal(fails) {
+  const renderSection = (title, desc, items) => {
+    if (!items.length) return '';
+    let h = `<h3 style="font-size:13px;color:var(--text-dim);text-transform:uppercase;letter-spacing:0.3px;margin:16px 0 8px">${title} (${items.length})</h3>`;
+    h += `<p style="font-size:12px;color:var(--text-dim);margin-bottom:8px">${desc}</p>`;
+    h += '<ul class="fail-list">';
+    items.forEach(f => {
+      let detail = '';
+      if (f.shapes) detail = `<span class="fail-shapes">Shapes: ${f.shapes.map(escHtml).join(', ')}</span>`;
+      else if (f.last_seen_date) detail = `<span class="fail-shapes">Last seen: ${formatDate(f.last_seen_date)}</span>`;
+      h += `<li><span class="fail-kernel">${escHtml(f.kernel)}</span>${platBadge(f.platform_short)}${detail}</li>`;
+    });
+    return h + '</ul>';
+  };
+  let html = modalHeader('CI Failures', 'Accuracy mismatches, kernel run failures, and infra issues');
+  html += renderSection('Accuracy Failures', 'Kernel ran but produced incorrect output.', fails.acc);
+  html += renderSection('Shape Failures', 'Shapes that failed to run (crash, OOM, compile error, timeout, or unsupported config).', fails.run);
+  html += renderSection('No Result', 'Benchmark did not produce output for this kernel — possible causes: runner unavailable, job timeout, crash, artifact upload failed, or harness skipped this kernel+platform combination.', fails.infra);
+  openModal(html);
+}
+function showDetailModal(kernel, platform_short) {
+  const e = kernelPlatMap[kernel + '||' + platform_short];
+  if (!e) return;
+  const color = platColor(platform_short);
+  let html = modalHeader(
+    `${escHtml(kernel)} ${platBadge(platform_short)}`,
+    `Latency: ${e.helion_latency_avg_ms.toFixed(2)} ms | Speedup: ${formatSpeedup(e.helion_speedup_geomean)} | Compile Time: ${formatCompileTime(e.compile_time_geomean_s)}`);
+  html += '<div class="modal-split"><div class="modal-lhs">';
+  if (e.status !== 'unchanged') {
+    html += `<div style="margin-bottom:12px"><span class="kc-tag ${e.status}">${e.status} perf</span></div>`;
+  }
+  if (e.accuracy_failures?.length) {
+    html += `<div class="accuracy-warn" style="margin-bottom:12px">${e.accuracy_failures.length} accuracy failure(s): ${e.accuracy_failures.join(', ')}</div>`;
+  }
+  if (e.run_failures?.length) {
+    html += `<div class="run-warn" style="margin-bottom:12px">${e.run_failures.length} shape failure(s): ${e.run_failures.join(', ')}</div>`;
+  }
+  if (e.infra_missing) {
+    const lastSeen = e.last_seen_date ? ` (last seen ${formatDate(e.last_seen_date)})` : '';
+    html += `<div class="infra-warn" style="margin-bottom:12px">No result in latest run${lastSeen} — runner unavailable, timeout, crash, upload failed, or harness skipped this kernel+platform</div>`;
+  }
+  html += '<h3 style="font-size:13px;color:var(--text-dim);text-transform:uppercase;letter-spacing:0.3px;margin-bottom:8px">Run History</h3>';
+  html += '<div class="table-scroll" style="max-height:300px"><table class="data-table"><thead><tr><th>Commit</th><th>Date</th><th>Latency</th><th>Speedup</th><th>Compile Time</th></tr></thead><tbody>';
+  const hist = [...(e.history || [])].reverse();
+  hist.forEach((h, i) => {
+    let speedupDelta = '', latencyDelta = '';
+    if (i < hist.length - 1) {
+      const prev = hist[i + 1];
+      if (prev.helion_speedup_geomean && h.helion_speedup_geomean && prev.helion_speedup_geomean > 0) {
+        const d = ((h.helion_speedup_geomean - prev.helion_speedup_geomean) / prev.helion_speedup_geomean) * 100;
+        speedupDelta = ' ' + formatDelta(d, false);
+      }
+      if (prev.helion_latency_avg_ms > 0 && h.helion_latency_avg_ms > 0) {
+        const d = ((prev.helion_latency_avg_ms - h.helion_latency_avg_ms) / h.helion_latency_avg_ms) * 100;
+        latencyDelta = ' ' + formatDelta(d, true);
+      }
+    }
+    html += `<tr>
+      <td><a href="${commitUrl(h.full_sha)}" target="_blank" title="Run #${h.run_id}">${escHtml(h.sha)}</a></td>
+      <td style="font-size:11px">${formatDate(h.date)}</td>
+      <td>${h.helion_latency_avg_ms.toFixed(2)} ms${latencyDelta}</td>
+      <td>${formatSpeedup(h.helion_speedup_geomean)}${speedupDelta}</td>
+      <td>${formatCompileTime(h.compile_time_geomean_s)}</td>
+    </tr>`;
+  });
+  html += '</tbody></table></div>';
+  html += '</div>'; // end modal-lhs
+  // RHS: Plotly charts
+  html += '<div class="modal-rhs">';
+  const histFwd = e.history || [];
+  if (histFwd.length >= 2) {
+    html += '<div class="chart-container"><h3>Latency Over Time</h3><div id="mc-latency" style="width:100%;height:220px"></div></div>';
+    html += '<div class="chart-container"><h3>Speedup Over Time</h3><div id="mc-speedup" style="width:100%;height:220px"></div></div>';
+    html += '<div class="chart-container"><h3>Compile Time Over Time</h3><div id="mc-compile" style="width:100%;height:220px"></div></div>';
+  }
+  const latest = histFwd.length > 0 ? histFwd[histFwd.length - 1] : null;
+  if (latest && latest.per_shape && latest.per_shape.shapes.length > 0) {
+    html += '<div class="chart-container"><h3>Per-Shape Speedup (Latest Run)</h3><div id="mc-bar-speedup" style="width:100%;height:260px"></div></div>';
+    const ps = latest.per_shape;
+    const hasCompileTimes = ps.helion_compile_time_s && ps.helion_compile_time_s.length > 0 && ps.helion_compile_time_s.some(v => v > 0);
+    if (hasCompileTimes) {
+      html += '<div class="chart-container"><h3>Per-Shape Compile Time (Latest Run)</h3><div id="mc-bar-compile" style="width:100%;height:220px"></div></div>';
+    }
+  }
+  html += '</div></div>'; // end modal-rhs + modal-split
+  openModal(html);
+  // Render Plotly charts after modal is visible
+  setTimeout(() => {
+    const commitUrls = histFwd.map(h => commitUrl(h.full_sha));
+    const xLabels = histFwd.map(h => h.sha + '\n' + formatDate(h.date));
+    if (histFwd.length >= 2) {
+      const clickHandler = function(data) {
+        if (data.points && data.points[0] && data.points[0].customdata) {
+          window.open(data.points[0].customdata, '_blank');
+        }
+      };
+      // Latency Over Time (only if data exists)
+      const latEl = document.getElementById('mc-latency');
+      if (latEl) {
+        const latVals = histFwd.map(h => h.helion_latency_avg_ms > 0 ? h.helion_latency_avg_ms : null);
+        Plotly.newPlot(latEl, [{
+          x: xLabels, y: latVals, mode: 'lines+markers',
+          line: { color: color, width: 2 }, marker: { size: 6 },
+          text: histFwd.map(h => h.sha), customdata: commitUrls,
+          hovertemplate: '%{text}: %{y:.2f} ms<extra></extra>',
+          connectgaps: false,
+        }], Object.assign({}, plotlyDark, {
+          height: 220,
+          xaxis: Object.assign({}, plotlyDark.xaxis, { tickangle: -40 }),
+          yaxis: Object.assign({}, plotlyDark.yaxis, { title: 'Latency (ms)' }),
+        }), { responsive: true, displayModeBar: false });
+        latEl.on('plotly_click', clickHandler);
+      }
+      // Speedup Over Time (always shown)
+      const spEl = document.getElementById('mc-speedup');
+      if (spEl) {
+        const spVals = histFwd.map(h => h.helion_speedup_geomean > 0 ? h.helion_speedup_geomean : null);
+        Plotly.newPlot(spEl, [{
+          x: xLabels, y: spVals, mode: 'lines+markers',
+          line: { color: color, width: 2 }, marker: { size: 6 },
+          text: histFwd.map(h => h.sha), customdata: commitUrls,
+          hovertemplate: '%{text}: %{y:.2f}x<extra></extra>',
+          connectgaps: false,
+        }], Object.assign({}, plotlyDark, {
+          height: 220,
+          xaxis: Object.assign({}, plotlyDark.xaxis, { tickangle: -40 }),
+          yaxis: Object.assign({}, plotlyDark.yaxis, { title: 'Speedup' }),
+          shapes: [{ type: 'line', xref: 'paper', x0: 0, x1: 1, y0: 1, y1: 1, line: { color: '#f85149', width: 1, dash: 'dash' } }],
+        }), { responsive: true, displayModeBar: false });
+        spEl.on('plotly_click', clickHandler);
+      }
+      // Compile time over time
+      const ctVals = histFwd.map(h => h.compile_time_geomean_s > 0 ? h.compile_time_geomean_s : null);
+      const ctTrace = {
+        x: xLabels, y: ctVals,
+        mode: 'lines+markers', line: { color: '#f0883e', width: 2 }, marker: { size: 6 },
+        text: histFwd.map(h => h.sha), customdata: commitUrls,
+        hovertemplate: '%{text}: %{y:.1f}s<extra></extra>',
+        connectgaps: false
+      };
+      const ctLayout = Object.assign({}, plotlyDark, {
+        height: 220,
+        xaxis: Object.assign({}, plotlyDark.xaxis, { tickangle: -40 }),
+        yaxis: Object.assign({}, plotlyDark.yaxis, { title: 'Compile Time (s)' })
+      });
+      const ctEl = document.getElementById('mc-compile');
+      if (ctEl) {
+        Plotly.newPlot(ctEl, [ctTrace], ctLayout, { responsive: true, displayModeBar: false });
+      }
+    }
+    // Per-shape bar charts
+    if (latest && latest.per_shape && latest.per_shape.shapes.length > 0) {
+      const ps = latest.per_shape;
+      const shapes = ps.shapes.map(s => s.length > 25 ? s.slice(0, 25) + '...' : s);
+      // Grouped bar chart for speedup
+      const barTraces = [];
+      if (ps.helion_speedup && ps.helion_speedup.length > 0) {
+        barTraces.push({ x: shapes, y: ps.helion_speedup, name: 'Helion', type: 'bar', marker: { color: '#3fb950' } });
+      }
+      if (ps.torch_compile_speedup && ps.torch_compile_speedup.length > 0) {
+        barTraces.push({ x: shapes, y: ps.torch_compile_speedup, name: 'torch.compile', type: 'bar', marker: { color: '#58a6ff' } });
+      }
+      if (ps.triton_speedup && ps.triton_speedup.length > 0) {
+        barTraces.push({ x: shapes, y: ps.triton_speedup, name: 'Triton', type: 'bar', marker: { color: '#bc8cff' } });
+      }
+      if (barTraces.length > 0) {
+        const allBarVals = barTraces.flatMap(t => t.y).filter(v => v > 0);
+        const barMax = allBarVals.length > 0 ? Math.max(...allBarVals) * 1.1 : 2;
+        const barShapes = (barMax > 1) ? [{
+          type: 'line', x0: -0.5, x1: shapes.length - 0.5,
+          y0: 1, y1: 1, line: { color: '#f85149', width: 1, dash: 'dash' }
+        }] : [];
+        const barLayout = Object.assign({}, plotlyDark, {
+          height: 260, barmode: 'group',
+          xaxis: Object.assign({}, plotlyDark.xaxis, { tickangle: -45 }),
+          yaxis: Object.assign({}, plotlyDark.yaxis, { title: 'Speedup' }),
+          shapes: barShapes,
+          legend: { font: { color: '#e6edf3', size: 11 }, bgcolor: 'rgba(0,0,0,0)' }
+        });
+        const barEl = document.getElementById('mc-bar-speedup');
+        if (barEl) {
+          Plotly.newPlot(barEl, barTraces, barLayout, { responsive: true, displayModeBar: false });
+        }
+      }
+      // Per-shape compile time
+      const hasCompileTimes = ps.helion_compile_time_s && ps.helion_compile_time_s.length > 0 && ps.helion_compile_time_s.some(v => v > 0);
+      if (hasCompileTimes) {
+        const compileBarTrace = {
+          x: shapes, y: ps.helion_compile_time_s, type: 'bar',
+          marker: { color: '#f0883e' },
+          hovertemplate: '%{x}: %{y:.1f}s<extra></extra>'
+        };
+        const compileBarLayout = Object.assign({}, plotlyDark, {
+          height: 220,
+          xaxis: Object.assign({}, plotlyDark.xaxis, { tickangle: -45 }),
+          yaxis: Object.assign({}, plotlyDark.yaxis, { title: 'Compile Time (s)' }),
+          showlegend: false
+        });
+        const compileBarEl = document.getElementById('mc-bar-compile');
+        if (compileBarEl) {
+          Plotly.newPlot(compileBarEl, [compileBarTrace], compileBarLayout, { responsive: true, displayModeBar: false });
+        }
+      }
+    }
+  }, 50);
+}
+// -------- Tab Switching --------
+document.querySelectorAll('.tab-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+    document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
+    btn.classList.add('active');
+    document.getElementById('tab-' + btn.dataset.tab).classList.add('active');
+    if (btn.dataset.tab === 'speedup') {
+      renderSpeedup();
+    } else if (btn.dataset.tab === 'compare') renderCompare();
+  });
+});
+// -------- Init --------
+function initDashboard() {
+  buildMaps();
+  renderOverview();
+  renderSpeedup();
+  renderCompare();
+}
+function init() {
+  if (DATA) { initDashboard(); return; }
+  fetch('dashboard-data.json')
+    .then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+    .then(json => { DATA = json; initDashboard(); })
+    .catch(() => {
+      document.getElementById('tab-overview').innerHTML = '<div style="padding:60px;text-align:center"><h2 style="color:var(--red);margin-bottom:12px">Data Not Loaded</h2><p style="color:var(--text-dim)">Could not load dashboard-data.json.</p></div>';
+    });
+}
+init();
+</script>
+</body>
+</html>

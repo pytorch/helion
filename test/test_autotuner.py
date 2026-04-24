@@ -143,7 +143,7 @@ class TestAutotuneIgnoreErrors(TestCase):
         with patch("torch.accelerator.synchronize", autospec=True) as sync:
             sync.return_value = None
             with pytest.raises(exc.TritonError) as err:
-                search.benchmark_provider.benchmark_function("cfg", bad_fn)
+                search.benchmark_provider._benchmark_function("cfg", bad_fn)
 
         assert "HELION_AUTOTUNE_IGNORE_ERRORS" in str(err.value)
 
@@ -159,7 +159,7 @@ class TestAutotuneIgnoreErrors(TestCase):
 
         with patch("torch.accelerator.synchronize", autospec=True) as sync:
             sync.return_value = None
-            result = search.benchmark_provider.benchmark_function("cfg", bad_fn)
+            result = search.benchmark_provider._benchmark_function("cfg", bad_fn)
 
         self.assertEqual(result, float("inf"))
         self.assertEqual(search._autotune_metrics.num_compile_failures, 1)
@@ -177,7 +177,7 @@ class TestAutotuneIgnoreErrors(TestCase):
         with patch("torch.accelerator.synchronize", autospec=True) as sync:
             sync.return_value = None
             with patch.object(search.log, "warning") as warn:
-                result = search.benchmark_provider.benchmark_function("cfg", bad_fn)
+                result = search.benchmark_provider._benchmark_function("cfg", bad_fn)
 
         self.assertEqual(result, float("inf"))
         warn.assert_not_called()
@@ -202,7 +202,7 @@ class TestAutotuneIgnoreErrors(TestCase):
         ):
             sync.return_value = None
             with pytest.raises(exc.TritonError) as err:
-                search.benchmark_provider.benchmark_function("cfg", bad_fn)
+                search.benchmark_provider._benchmark_function("cfg", bad_fn)
 
         # Verify the traceback was cleared
         assert err.value.__cause__.__traceback__ is None
@@ -231,7 +231,7 @@ class TestAutotuneIgnoreErrors(TestCase):
         ):
             sync.return_value = None
             with pytest.raises(exc.TritonError) as err:
-                search.benchmark_provider.benchmark_function("cfg", bad_fn)
+                search.benchmark_provider._benchmark_function("cfg", bad_fn)
 
         # Verify the traceback was cleared
         assert err.value.__cause__.__traceback__ is None
@@ -242,7 +242,7 @@ class TestAutotuneIgnoreErrors(TestCase):
         assert type(err.value.__cause__).__name__ == "RuntimeError"
 
     def test_benchmark_results_aligned_when_compile_fails(self):
-        """_benchmark must return one result per input config even when some
+        """benchmark_batch must return one result per input config even when some
         fail to compile."""
         settings = Settings(
             autotune_precompile=None,
@@ -266,11 +266,11 @@ class TestAutotuneIgnoreErrors(TestCase):
             patch.object(search.kernel, "compile_config", side_effect=fail_second),
             patch.object(
                 search.benchmark_provider,
-                "benchmark_function",
+                "_benchmark_function",
                 return_value=1.0,
             ),
         ):
-            results = search._benchmark(configs, desc="test")
+            results = search.benchmark_batch(configs, desc="test")
 
         self.assertEqual(len(results), 3)
         self.assertEqual(results[0].perf, 1.0)
@@ -419,7 +419,9 @@ class TestAutotuneIgnoreErrors(TestCase):
             ),
             patch("torch.cuda._lazy_init", side_effect=fake_lazy_init),
         ):
-            future = search.create_precompile_future("cfg", fake_compiled_fn)
+            future = search.benchmark_provider._create_precompile_future(
+                "cfg", fake_compiled_fn
+            )
             self.assertTrue(future())
 
         self.assertEqual(set(lazy_calls), {parent_pid})
@@ -1261,8 +1263,8 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
                 search._prepare()
                 if mode == "fork":
                     start_cm = patch.object(
-                        search,
-                        "create_precompile_future",
+                        search.benchmark_provider,
+                        "_create_precompile_future",
                         side_effect=lambda config, fn: (
                             base_search_module.PrecompileFuture.skip(
                                 search.benchmark_provider._precompile_context(),
@@ -1345,8 +1347,8 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
                 search._prepare()
                 if mode == "fork":
                     start_cm = patch.object(
-                        search,
-                        "create_precompile_future",
+                        search.benchmark_provider,
+                        "_create_precompile_future",
                         side_effect=lambda config, fn: (
                             base_search_module.PrecompileFuture.skip(
                                 search.benchmark_provider._precompile_context(),
@@ -1473,8 +1475,8 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             )
             search._prepare()
             with patch.object(
-                search,
-                "create_precompile_future",
+                search.benchmark_provider,
+                "_create_precompile_future",
                 side_effect=lambda config, fn: base_search_module.PrecompileFuture.skip(
                     search.benchmark_provider._precompile_context(), config, True
                 ),
@@ -1996,16 +1998,19 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         def nested_in_place_add(
             a: Sequence[torch.Tensor],
             b: Sequence[torch.Tensor],
+            epsilon: float,
             out: Sequence[torch.Tensor],
         ):
             for tile in hl.tile(out[0].size()):
-                out[0][tile] += a[0][tile] + b[0][tile]
+                out[0][tile] += a[0][tile] + b[0][tile] + epsilon
             for tile in hl.tile(out[1].size()):
-                out[1][tile] += a[1][tile] + b[1][tile]
+                out[1][tile] += a[1][tile] + b[1][tile] + epsilon
 
+        epsilon = 1e-6
         args = (
             [torch.ones([128], device=DEVICE), torch.ones([128], device=DEVICE)],
             [torch.ones([128], device=DEVICE), torch.ones([128], device=DEVICE)],
+            epsilon,
             [torch.zeros([128], device=DEVICE), torch.zeros([128], device=DEVICE)],
         )
 
@@ -2015,10 +2020,10 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         # test that we overwrite c only once and the arguments are correctly
         #  cloned for each autotune run
         ref_out = [
-            torch.full([128], 2.0, device=DEVICE),
-            torch.full([128], 2.0, device=DEVICE),
+            torch.full([128], 2.0, device=DEVICE) + epsilon,
+            torch.full([128], 2.0, device=DEVICE) + epsilon,
         ]
-        torch.testing.assert_close(args[2], ref_out)
+        torch.testing.assert_close(args[3], ref_out)
 
     def test_only_mutated_tensors_cloned_during_benchmark(self) -> None:
         """
@@ -2032,13 +2037,15 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         def inplace_add(
             a: torch.Tensor,
             b: torch.Tensor,
+            epsilon: float,
             out: torch.Tensor,
         ):
             for tile in hl.tile(out.size()):
-                out[tile] += a[tile] + b[tile]
+                out[tile] += a[tile] + b[tile] + epsilon
 
         a = torch.full([128], 1.0, device=DEVICE)
         b = torch.full([128], 2.0, device=DEVICE)
+        epsilon = 1e-6
         out = torch.zeros([128], device=DEVICE)
 
         # Track clones separately for mutated vs non-mutated tensors
@@ -2060,7 +2067,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             return result
 
         with patch.object(torch.Tensor, "clone", tracking_clone):
-            inplace_add(a, b, out)
+            inplace_add(a, b, epsilon, out)
 
         # Mutated tensor (out) should be cloned during baseline AND benchmarking:
         #   _compute_baseline: 1 + baseline_post_args: 1
@@ -2080,7 +2087,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             f"Only mutated tensors should be cloned during benchmarking.",
         )
 
-        expected = torch.full([128], 3.0, device=DEVICE)
+        expected = torch.full([128], 3.0, device=DEVICE) + epsilon
         torch.testing.assert_close(out, expected)
 
     def test_chunked_allclose_memory(self):
@@ -2202,8 +2209,8 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             search._prepare()
 
             with patch.object(
-                search,
-                "create_precompile_future",
+                search.benchmark_provider,
+                "_create_precompile_future",
                 side_effect=lambda config, fn: base_search_module.PrecompileFuture.skip(
                     search.benchmark_provider._precompile_context(), config, True
                 ),
