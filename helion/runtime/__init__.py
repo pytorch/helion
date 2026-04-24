@@ -7,6 +7,7 @@ import os
 import sys
 from typing import TYPE_CHECKING
 from typing import Any
+from typing import NamedTuple
 from typing import cast
 
 import torch
@@ -610,6 +611,176 @@ def _pallas_make_reordered_kernel(
     return reordered_kernel
 
 
+class _AtomicAccumInfo(NamedTuple):
+    """VMEM-scratch plan for atomic outputs hit by multiple cells.
+
+    Unmapped grid dims with ``grid[i] > 1`` cause races on HBM RMW, so we
+    mark them ``"arbitrary"`` and route the RMW through a VMEM scratch
+    preloaded on the first cell and committed on the last.  Atomic
+    outputs go in ``inplace_indices`` (so Pallas issues the in DMA that
+    refreshes ``out_ref``'s VMEM each cell, making intermediate trailer
+    DMAs no-op) and in ``skip_inplace_copy`` (so the reordered kernel's
+    ``out_ref[...] = in_ref[...]`` -- which our wrapper would resolve as
+    ``scratch[...] = in_ref[...]`` -- doesn't clobber the accumulator).
+    Single-TensorCore kernels only; ``pl.core_map`` would need a
+    cross-core barrier.
+    """
+
+    # ``"arbitrary"`` for dims driving accumulation, ``"parallel"`` otherwise.
+    dim_sem: tuple[str, ...]
+    # ``orig_pos`` -> VMEM tile shape.
+    scratch_tiles: dict[int, tuple[int, ...]]
+    # Sorted indices of dims marked ``"arbitrary"``.
+    arb_dims: list[int]
+
+    def positions(self) -> set[int]:
+        return set(self.scratch_tiles)
+
+
+def _atomic_scratch_dtype(target_dtype: torch.dtype) -> torch.dtype:
+    """f32 scratch for bf16/f16 targets so per-cell sums don't round."""
+    if target_dtype in (torch.bfloat16, torch.float16):
+        return torch.float32
+    return target_dtype
+
+
+def _atomic_accum_info(
+    grid: tuple[int, ...],
+    args: tuple[object, ...],
+    atomic_indices: list[int] | None,
+    block_spec_info: _BlockSpecInfo | None,
+    arg_to_tensor_pos: dict[int, int],
+) -> _AtomicAccumInfo:
+    """Inspect atomic outputs and decide which ones need VMEM accumulation."""
+    n = len(grid)
+    parallel = tuple("parallel" for _ in grid)
+    if not atomic_indices or block_spec_info is None:
+        return _AtomicAccumInfo(parallel, {}, [])
+
+    scratch_tiles: dict[int, tuple[int, ...]] = {}
+    arb: set[int] = set()
+    for orig_pos in atomic_indices:
+        tpos = arg_to_tensor_pos.get(orig_pos)
+        if tpos is None or tpos >= len(block_spec_info):
+            continue
+        info = block_spec_info[tpos]
+        if info is None:
+            continue
+        bshape, grid_mapping = info
+        mapped = {gd for gd in grid_mapping if isinstance(gd, int)}
+        unmapped = {i for i in range(n) if i not in mapped and grid[i] > 1}
+        if not unmapped:
+            continue
+        arb |= unmapped
+        t = args[orig_pos]
+        assert isinstance(t, torch.Tensor)
+        tile = tuple(
+            bs if bs is not None else t.shape[d] for d, bs in enumerate(bshape)
+        )
+        scratch_tiles[orig_pos] = tile
+    dim_sem = tuple("arbitrary" if i in arb else "parallel" for i in range(n))
+    return _AtomicAccumInfo(dim_sem, scratch_tiles, sorted(arb))
+
+
+def _wrap_atomic_accumulator(
+    inner: object,
+    atomic_out_to_scratch: dict[int, int],
+    atomic_out_to_in_pos: dict[int, int],
+    arb_dims: list[int],
+    grid: tuple[int, ...],
+    n_tensor_inputs: int,
+) -> object:
+    """Substitute VMEM scratches for atomic out-refs inside *inner*.
+
+    Preload from HBM on the first ``arb_dims`` cell, commit on the last.
+    ``convert_element_type`` handles the bf16/f16 target + f32 scratch
+    case and is a no-op when dtypes match.
+    """
+    n_scratches = len(atomic_out_to_scratch)
+
+    def wrapped(*refs: object) -> None:
+        from jax import lax
+        from jax.experimental import pallas as pl
+        import jax.numpy as jnp
+
+        inner_end = len(refs) - n_scratches
+        scratch_refs = {
+            out_idx: refs[inner_end + off]
+            for out_idx, off in atomic_out_to_scratch.items()
+        }
+
+        patched = list(refs[:inner_end])
+        original_out_refs: dict[int, object] = {}
+        for out_idx, s in scratch_refs.items():
+            slot = n_tensor_inputs + out_idx
+            original_out_refs[out_idx] = patched[slot]
+            patched[slot] = s
+
+        is_first: Any = jnp.bool_(True)
+        is_last: Any = jnp.bool_(True)
+        for d in arb_dims:
+            is_first = is_first & (pl.program_id(d) == 0)
+            is_last = is_last & (pl.program_id(d) == (grid[d] - 1))
+
+        @pl.when(is_first)  # type: ignore[arg-type]
+        def _init() -> None:
+            for out_idx, s in scratch_refs.items():
+                in_ref = refs[atomic_out_to_in_pos[out_idx]]
+                s[...] = lax.convert_element_type(in_ref[...], s.dtype)  # type: ignore[index,attr-defined]
+
+        inner(*patched)  # type: ignore[operator]
+
+        @pl.when(is_last)  # type: ignore[arg-type]
+        def _commit() -> None:
+            for out_idx, s in scratch_refs.items():
+                out_ref = original_out_refs[out_idx]
+                out_ref[...] = lax.convert_element_type(s[...], out_ref.dtype)  # type: ignore[index,attr-defined]
+
+    return wrapped
+
+
+def _apply_atomic_accumulator(
+    reordered_kernel: object,
+    info: _AtomicAccumInfo,
+    args: tuple[object, ...],
+    arg_to_tensor_pos: dict[int, int],
+    output_indices: list[int],
+    n_tensor_inputs: int,
+    grid: tuple[int, ...],
+    pltpu: object,
+) -> tuple[object, list[object]]:
+    """Return ``(kernel, scratch_shapes)``; no-op when no output needs a scratch."""
+    if not info.scratch_tiles:
+        return reordered_kernel, []
+
+    from torch._inductor.runtime.runtime_utils import torch_dtype_to_jax_runtime
+
+    atomic_out_to_scratch: dict[int, int] = {}
+    atomic_out_to_in_pos: dict[int, int] = {}
+    scratch_shapes: list[object] = []
+    for out_idx, orig_pos in enumerate(output_indices):
+        tile = info.scratch_tiles.get(orig_pos)
+        if tile is None:
+            continue
+        t = cast("torch.Tensor", args[orig_pos])
+        scratch_dtype = _atomic_scratch_dtype(t.dtype)
+        scratch_shapes.append(
+            pltpu.VMEM(tile, torch_dtype_to_jax_runtime(scratch_dtype))  # type: ignore[union-attr]
+        )
+        atomic_out_to_scratch[out_idx] = len(atomic_out_to_scratch)
+        atomic_out_to_in_pos[out_idx] = arg_to_tensor_pos[orig_pos]
+
+    wrapped = _wrap_atomic_accumulator(
+        reordered_kernel,
+        atomic_out_to_scratch,
+        atomic_out_to_in_pos,
+        info.arb_dims,
+        grid,
+        n_tensor_inputs,
+    )
+    return wrapped, scratch_shapes
+
+
 def _pallas_build_callable(
     pallas_kernel: object,
     grid: tuple[int, ...],
@@ -880,6 +1051,7 @@ def default_pallas_launcher(
     _block_spec_info: _BlockSpecInfo | None = None,
     _smem_arg_indices: list[int] | None = None,
     _ds_pad_dims: list[tuple[int, int, int, int]] | None = None,
+    _atomic_indices: list[int] | None = None,
     **kwargs: object,
 ) -> object:
     """Default launcher for Pallas kernels on TPU (or CPU with interpret=True).
@@ -892,7 +1064,9 @@ def default_pallas_launcher(
 
     Output-only tensors (in ``_output_indices`` but not in ``_inplace_indices``)
     are excluded from pallas_call inputs to save VMEM.  Their results are
-    returned as torch tensors.
+    returned as torch tensors.  ``_atomic_indices`` lists outputs written via
+    ``hl.atomic_*``; see :func:`_atomic_accum_info` for the multi-cell VMEM
+    scratch path.
     """
     if _output_indices is None:
         _output_indices = []
@@ -922,6 +1096,7 @@ def default_pallas_launcher(
             inplace_positions,
             out_shapes,
         ) = _pallas_prepare_args(args, _output_indices, _inplace_indices)
+        output_only_set: set[int] = set(output_only_indices)
 
         in_specs, out_specs = _pallas_build_block_specs(
             pl,
@@ -936,6 +1111,10 @@ def default_pallas_launcher(
             output_only_indices,
         )
 
+        atomic_info = _atomic_accum_info(
+            grid, args, _atomic_indices, _block_spec_info, arg_to_tensor_pos
+        )
+
         reordered_kernel = _pallas_make_reordered_kernel(
             pallas_kernel,
             args,
@@ -946,6 +1125,18 @@ def default_pallas_launcher(
             inplace_positions,
             arg_to_tensor_pos,
             _smem_arg_indices=_smem_arg_indices,
+            skip_inplace_copy=output_only_set | atomic_info.positions(),
+        )
+
+        reordered_kernel, scratch_shapes = _apply_atomic_accumulator(
+            reordered_kernel,
+            atomic_info,
+            args,
+            arg_to_tensor_pos,
+            _output_indices,
+            n_tensor_inputs,
+            grid,
+            pltpu,
         )
 
         out_shape_arg = out_shapes if len(out_shapes) > 1 else out_shapes[0]
@@ -961,7 +1152,7 @@ def default_pallas_launcher(
             pltpu,
             in_specs,
             out_specs,
-            None,
+            scratch_shapes,
             args,
             tensor_arg_indices,
             _output_indices,
@@ -974,16 +1165,34 @@ def default_pallas_launcher(
                 f"Estimated {estimated_vmem / 1e6:.2f}MB exceeds {vmem_limit_bytes / 1e6:.2f}MB vmem capacity."
             )
 
-        pallas_call_kwargs: dict[str, object] = {
-            "out_shape": out_shape_arg,
-            "input_output_aliases": pallas_aliases,
-            "grid": grid,
-        }
+        if scratch_shapes:
+            grid_spec = pltpu.PrefetchScalarGridSpec(
+                num_scalar_prefetch=0,
+                in_specs=list(in_specs) if in_specs is not None else [],
+                out_specs=out_specs if out_specs is not None else [],
+                scratch_shapes=scratch_shapes,  # pyrefly: ignore[bad-argument-type]
+                grid=grid,
+            )
+            pallas_call_kwargs: dict[str, object] = {
+                "out_shape": out_shape_arg,
+                "input_output_aliases": pallas_aliases,
+                "grid_spec": grid_spec,
+                "compiler_params": pltpu.CompilerParams(  # pyrefly: ignore[bad-instantiation]
+                    dimension_semantics=atomic_info.dim_sem,  # pyrefly: ignore[bad-argument-type]
+                ),
+            }
+        else:
+            pallas_call_kwargs = {
+                "out_shape": out_shape_arg,
+                "input_output_aliases": pallas_aliases,
+                "grid": grid,
+            }
+            if in_specs is not None:
+                pallas_call_kwargs["in_specs"] = in_specs
+                pallas_call_kwargs["out_specs"] = out_specs
+
         if _pallas_interpret_flag():
             pallas_call_kwargs["interpret"] = True
-        if in_specs is not None:
-            pallas_call_kwargs["in_specs"] = in_specs
-            pallas_call_kwargs["out_specs"] = out_specs
 
         jit_fn = pl.pallas_call(
             reordered_kernel,  # pyrefly: ignore[bad-argument-type]
@@ -1022,13 +1231,14 @@ def default_pallas_pipeline_launcher(
     _pipeline_arg_indices: list[int] | None = None,
     _ds_pad_dims: list[tuple[int, int, int, int]] | None = None,
     _smem_arg_indices: list[int] | None = None,
+    _atomic_indices: list[int] | None = None,
     **kwargs: object,
 ) -> object:
     """Launcher for Pallas kernels using PrefetchScalarGridSpec with scratch memory.
 
-    Used when ``pallas_loop_type='emit_pipeline'``.  Pipeline-body tensors
-    (listed in ``_pipeline_arg_indices``) use HBM refs; all other tensors
-    get proper BlockSpecs for automatic VMEM prefetch.
+    Pipeline-body tensors (``_pipeline_arg_indices``) use HBM refs; the
+    rest get BlockSpecs for automatic VMEM prefetch.  ``_atomic_indices``:
+    see :func:`default_pallas_launcher`.
     """
     if _output_indices is None:
         _output_indices = []
@@ -1095,7 +1305,10 @@ def default_pallas_pipeline_launcher(
             smem_arg_indices=_smem_arg_indices,
         )
 
-        _pipeline_set = set(_pipeline_arg_indices or [])
+        _pipeline_set: set[int] = set(_pipeline_arg_indices or [])
+        atomic_info = _atomic_accum_info(
+            grid, args, _atomic_indices, _block_spec_info, arg_to_tensor_pos
+        )
         reordered_kernel = _pallas_make_reordered_kernel(
             pallas_kernel,
             args,
@@ -1106,9 +1319,20 @@ def default_pallas_pipeline_launcher(
             inplace_positions,
             arg_to_tensor_pos,
             n_extra_refs=len(scratch_shapes),
-            skip_inplace_copy=_pipeline_set,
+            skip_inplace_copy=_pipeline_set | atomic_info.positions(),
             _smem_arg_indices=_smem_arg_indices,
         )
+        reordered_kernel, atomic_scratches = _apply_atomic_accumulator(
+            reordered_kernel,
+            atomic_info,
+            args,
+            arg_to_tensor_pos,
+            _output_indices,
+            n_tensor_inputs,
+            grid,
+            pltpu,
+        )
+        scratch_shapes.extend(atomic_scratches)  # pyrefly: ignore[bad-argument-type]
 
         out_shape_arg = out_shapes if len(out_shapes) > 1 else out_shapes[0]
 
@@ -1149,7 +1373,7 @@ def default_pallas_pipeline_launcher(
             "input_output_aliases": pallas_aliases,
             "grid_spec": grid_spec,
             "compiler_params": pltpu.CompilerParams(  # pyrefly: ignore[bad-instantiation]
-                dimension_semantics=tuple("parallel" for _ in grid),
+                dimension_semantics=atomic_info.dim_sem,  # pyrefly: ignore[bad-argument-type]
             ),
         }
         if _pallas_interpret_flag():
@@ -1192,15 +1416,15 @@ def default_pallas_fori_launcher(
     _scratch_shapes: list[tuple[tuple[int, ...], str | None, str]] | None = None,
     _ds_pad_dims: list[tuple[int, int, int, int]] | None = None,
     _smem_arg_indices: list[int] | None = None,
+    _atomic_indices: list[int] | None = None,
     **kwargs: object,
 ) -> object:
     """Launcher for Pallas kernels using fori_loop with manual DMA.
 
-    Used when ``pallas_loop_type="fori_loop"``.  Passes all tensors as
-    ``memory_space=pl.ANY`` (HBM refs) and adds scratch buffers as
-    ``pltpu.VMEM`` shapes plus ``pltpu.SemaphoreType.DMA`` for async copies.
-    The kernel uses ``jax.lax.fori_loop`` with ``pltpu.make_async_copy``
-    internally for DMA control.
+    All tensors are HBM refs; the kernel drives DMA via
+    ``pltpu.make_async_copy`` inside ``jax.lax.fori_loop``.  Scratch
+    buffers are ``pltpu.VMEM`` plus ``pltpu.SemaphoreType.DMA`` for the
+    async copies.  ``_atomic_indices``: see :func:`default_pallas_launcher`.
     """
     if _output_indices is None:
         _output_indices = []
@@ -1249,6 +1473,7 @@ def default_pallas_fori_launcher(
         # Build in_specs/out_specs: proper BlockSpecs for outer grid dims,
         # HBM refs for tensors used in the fori_loop body (DMA handles tiling).
         _fori_pipeline_indices = kwargs.get("_pipeline_arg_indices")
+        _fori_pipeline_set: set[int] = set(_fori_pipeline_indices or [])  # type: ignore[arg-type]
         assert _block_spec_info is not None, (
             "fori_loop launcher requires _block_spec_info from codegen"
         )
@@ -1266,7 +1491,9 @@ def default_pallas_fori_launcher(
             smem_arg_indices=_smem_arg_indices,
         )
 
-        _fori_pipeline_set = set(_fori_pipeline_indices or [])  # type: ignore[arg-type]
+        atomic_info = _atomic_accum_info(
+            grid, args, _atomic_indices, _block_spec_info, arg_to_tensor_pos
+        )
         reordered_kernel = _pallas_make_reordered_kernel(
             pallas_kernel,
             args,
@@ -1277,9 +1504,20 @@ def default_pallas_fori_launcher(
             inplace_positions,
             arg_to_tensor_pos,
             n_extra_refs=len(scratch_shapes),
-            skip_inplace_copy=_fori_pipeline_set,
+            skip_inplace_copy=_fori_pipeline_set | atomic_info.positions(),
             _smem_arg_indices=_smem_arg_indices,
         )
+        reordered_kernel, atomic_scratches = _apply_atomic_accumulator(
+            reordered_kernel,
+            atomic_info,
+            args,
+            arg_to_tensor_pos,
+            _output_indices,
+            n_tensor_inputs,
+            grid,
+            pltpu,
+        )
+        scratch_shapes.extend(atomic_scratches)  # pyrefly: ignore[bad-argument-type]
 
         out_shape_arg = out_shapes if len(out_shapes) > 1 else out_shapes[0]
 
@@ -1320,7 +1558,7 @@ def default_pallas_fori_launcher(
             "input_output_aliases": pallas_aliases,
             "grid_spec": grid_spec,
             "compiler_params": pltpu.CompilerParams(  # pyrefly: ignore[bad-instantiation]
-                dimension_semantics=tuple("parallel" for _ in grid),
+                dimension_semantics=atomic_info.dim_sem,  # pyrefly: ignore[bad-argument-type]
             ),
         }
         if _pallas_interpret_flag():
