@@ -563,23 +563,44 @@ class Backend(abc.ABC):
             config.l2_groupings, block_ids[0], 1
         )
 
-        # Grid folding overrides flatten — need ND strategy for per-dim folding
         grid_folding_factors = env.config_spec.grid_foldings.config_get(
             config.grid_foldings, block_ids[0], None
         )
+        is_sub_strategy = False
+        if grid_folding_factors is not None and len(grid_folding_factors) != len(
+            block_ids
+        ):
+            grid_folding_factors = None
+            is_sub_strategy = True
         has_folding = grid_folding_factors is not None and any(
             f != 0 for f in grid_folding_factors
         )
-        if not has_folding and block_size_infos[0].is_flattened(config):
-            block_size = functools.reduce(
-                operator.mul, [bs.from_config_assert(config) for bs in block_size_infos]
-            )
-            return FlattenedTileStrategy(
-                fn,
-                block_ids,
-                block_size=block_size,
-                loop_order=loop_order,
-            )
+        if not is_sub_strategy and block_size_infos[0].is_flattened(config):
+            folded_ids: set[int] = set()
+            use_flatten = not has_folding
+            if has_folding and grid_folding_factors is not None:
+                has_partial = any(f > 0 for f in grid_folding_factors)
+                if not has_partial:
+                    folded_ids = {
+                        bid
+                        for bid, f in zip(block_ids, grid_folding_factors, strict=True)
+                        if f == -1
+                    }
+                    use_flatten = len(folded_ids) < len(block_ids)
+            if use_flatten:
+                unfolded_sizes = [
+                    bs.from_config_assert(config)
+                    for bid, bs in zip(block_ids, block_size_infos, strict=True)
+                    if bid not in folded_ids
+                ]
+                block_size = functools.reduce(operator.mul, unfolded_sizes)
+                return FlattenedTileStrategy(
+                    fn,
+                    block_ids,
+                    block_size=block_size,
+                    loop_order=loop_order,
+                    folded_block_ids=folded_ids,
+                )
 
         return NDTileStrategy(
             fn,

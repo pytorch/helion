@@ -742,7 +742,14 @@ class BlockSizeTileStrategy(TileStrategy):
 
 
 class FlattenedTileStrategy(BlockSizeTileStrategy):
-    """Collapse all dimensions into single flat iteration space."""
+    """Collapse dimensions into single flat iteration space.
+
+    When folded_block_ids is provided, the folded dimensions are excluded
+    from the flat product and handled by ForLoopGraphInfo device loops.
+    The remaining (unfolded) dimensions are flattened together — enabling
+    "partial flattening" where some dims are in loops and the rest share
+    a single flat grid dim.
+    """
 
     # pyrefly: ignore [bad-override]
     block_size: SymIntLike
@@ -753,14 +760,19 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
         block_ids: list[int],
         block_size: list[SymIntLike] | SymIntLike,
         loop_order: list[int],
+        folded_block_ids: set[int] | frozenset[int] | None = None,
     ) -> None:
+        self._folded_block_ids: frozenset[int] = frozenset(folded_block_ids or ())
         assert isinstance(block_size, (int, torch.SymInt))
         super().__init__(fn, block_ids, block_size, loop_order)
         env = CompileEnvironment.current()
+        unfolded_numels = [
+            env.block_sizes[i].numel
+            for i in block_ids
+            if i not in self._folded_block_ids
+        ]
         if not env.backend.force_tile_mask() and env.known_multiple(
-            functools.reduce(
-                operator.mul, [env.block_sizes[i].numel for i in block_ids]
-            ),
+            functools.reduce(operator.mul, unfolded_numels),
             block_size,
         ):
             self._mask_var = None
@@ -772,7 +784,8 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
         assert key not in fn.block_size_var_cache
         fn.block_size_var_cache[key] = bs_var = self.new_var("_BLOCK_SIZE")
         for block_index in block_ids:
-            fn.block_size_var_cache[(block_index,)] = bs_var
+            if block_index not in self._folded_block_ids:
+                fn.block_size_var_cache[(block_index,)] = bs_var
 
     def new_var(self, prefix: str, dce: bool = False) -> str:
         return self.fn.new_var(
@@ -939,13 +952,19 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
         total_numel: sympy.Expr | str = sympy.S.One
         statements = []
 
+        reordered = self._reorder([*zip(block_ids, begins, ends, steps, strict=True)])
+        unfolded = [
+            (bid, b, e, s)
+            for bid, b, e, s in reordered
+            if bid not in self._folded_block_ids
+        ]
+        num_unfolded = len(unfolded)
+
         # pyrefly: ignore [bad-assignment]
-        for i, (block_idx, begin, end, step) in enumerate(
-            self._reorder([*zip(block_ids, begins, ends, steps, strict=True)])
-        ):
+        for i, (block_idx, begin, end, step) in enumerate(unfolded):
             cute_scalar_tile = (
                 CompileEnvironment.current().backend.name == "cute"
-                and len(block_ids) == 1
+                and num_unfolded == 1
                 and self._uses_thread_axis()
                 and step not in (None, 1)
             )
@@ -958,12 +977,12 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
             expr = offsets_var
             if total_numel != sympy.S.One:
                 expr = f"({expr}) // ({self._numel_str(state, total_numel)})"
-            if i + 1 < len(block_ids):
+            if i + 1 < num_unfolded:
                 expr = f"({expr}) % ({self._numel_str(state, numel)})"
             step_expr = self._expr_str(step) if step not in (None, 1) else None
             if step_expr is not None and not (
                 CompileEnvironment.current().backend.name == "cute"
-                and len(block_ids) == 1
+                and num_unfolded == 1
                 and self._uses_thread_axis()
             ):
                 expr = f"({expr}) * ({step_expr})"
@@ -1105,11 +1124,14 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
                     tracker.record_all(
                         self.block_ids, self._flat_thread_axis(), self.block_size
                     )
+                block_id_to_info = self._create_block_id_info_dict(
+                    state, ends_override=[end]
+                )
+                for bid in self._folded_block_ids:
+                    block_id_to_info.pop(bid, None)
                 return DeviceGridState(
                     self,
-                    block_id_to_info=self._create_block_id_info_dict(
-                        state, ends_override=[end]
-                    ),
+                    block_id_to_info=block_id_to_info,
                     thread_axis_sizes=tracker.sizes,
                     block_thread_axes=tracker.block_axes,
                 )
@@ -1151,6 +1173,8 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
             state.device_function.set_pid(pids)
 
         block_id_to_info = self._create_block_id_info_dict(state, ends_override=ends)
+        for bid in self._folded_block_ids:
+            block_id_to_info.pop(bid, None)
         tracker = ThreadAxisTracker()
         if self._uses_thread_axis():
             thread_size: int | None = None
@@ -1263,11 +1287,11 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
             return shapes
 
         env = CompileEnvironment.current()
-        # Filter out unit-sized blocks that don't need compacting
         compact_block_ids = [
             block_id
             for block_id in self.block_ids
-            if not (
+            if block_id not in self._folded_block_ids
+            and not (
                 isinstance(env.block_sizes[block_id].size, int)
                 and env.block_sizes[block_id].size == 1
             )

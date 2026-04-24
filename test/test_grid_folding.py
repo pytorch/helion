@@ -259,6 +259,93 @@ class TestGridFolding(TestCase):
             )
 
 
+@onlyBackends(["triton"])
+class TestGridFoldingWithFlatten(TestCase):
+    """Tests for combining grid folding with flatten_loops (partial flattening)."""
+
+    def test_full_folding_with_flatten_2d(self):
+        """2D tile: fold dim 1 fully, flatten remaining dim 0."""
+        x = torch.randn(64, 64, device=DEVICE)
+        y = torch.randn(64, 64, device=DEVICE)
+        code, result = code_and_output(
+            add_2d_kernel,
+            (x, y),
+            block_sizes=[32, 32],
+            grid_foldings=[[0, -1]],
+            flatten_loops=[True],
+        )
+        torch.testing.assert_close(result, x + y)
+        self.assertIn("tl.range(", code)
+
+    def test_full_folding_with_flatten_2d_first_dim(self):
+        """2D tile: fold dim 0 fully, flatten remaining dim 1."""
+        x = torch.randn(64, 64, device=DEVICE)
+        y = torch.randn(64, 64, device=DEVICE)
+        code, result = code_and_output(
+            add_2d_kernel,
+            (x, y),
+            block_sizes=[32, 32],
+            grid_foldings=[[-1, 0]],
+            flatten_loops=[True],
+        )
+        torch.testing.assert_close(result, x + y)
+        self.assertIn("tl.range(", code)
+
+    def test_full_folding_with_flatten_3d(self):
+        """3D tile: fold dim 2 fully, flatten remaining dims 0 and 1."""
+        x = torch.randn(8, 16, 64, device=DEVICE)
+        y = torch.randn(8, 16, 64, device=DEVICE)
+        code, result = code_and_output(
+            add_3d_kernel,
+            (x, y),
+            block_sizes=[8, 16, 32],
+            grid_foldings=[[0, 0, -1]],
+            flatten_loops=[True],
+        )
+        torch.testing.assert_close(result, x + y)
+        self.assertIn("tl.range(", code)
+
+    def test_full_folding_with_flatten_3d_two_folded(self):
+        """3D tile: fold dims 1 and 2 fully, flatten remaining dim 0."""
+        x = torch.randn(64, 16, 32, device=DEVICE)
+        y = torch.randn(64, 16, 32, device=DEVICE)
+        code, result = code_and_output(
+            add_3d_kernel,
+            (x, y),
+            block_sizes=[8, 16, 32],
+            grid_foldings=[[0, -1, -1]],
+            flatten_loops=[True],
+        )
+        torch.testing.assert_close(result, x + y)
+        self.assertIn("tl.range(", code)
+
+    def test_full_folding_with_flatten_non_divisible(self):
+        """Fold+flatten with non-block-divisible sizes."""
+        x = torch.randn(50, 70, device=DEVICE)
+        y = torch.randn(50, 70, device=DEVICE)
+        code, result = code_and_output(
+            add_2d_kernel,
+            (x, y),
+            block_sizes=[32, 32],
+            grid_foldings=[[0, -1]],
+            flatten_loops=[True],
+        )
+        torch.testing.assert_close(result, x + y)
+
+    def test_partial_folding_with_flatten_falls_back(self):
+        """Partial folding + flatten falls back to NDTileStrategy (no crash)."""
+        x = torch.randn(64, 64, device=DEVICE)
+        y = torch.randn(64, 64, device=DEVICE)
+        code, result = code_and_output(
+            add_2d_kernel,
+            (x, y),
+            block_sizes=[32, 32],
+            grid_foldings=[[0, 2]],
+            flatten_loops=[True],
+        )
+        torch.testing.assert_close(result, x + y)
+
+
 class TestGridFoldingGridSize(TestCase):
     """Verify that grid folding actually reduces the GPU launch grid."""
 
