@@ -172,26 +172,9 @@ jobs:
             echo "Using baseline: $BASELINE"
             echo "Available implementations for $kernel: $IMPLS"
 
-            # Do autotuning but do not record the results
-            ${{ inputs.env-vars }} python benchmarks/run.py \
-                --op $kernel \
-                --metrics speedup,accuracy \
-                --latency-measure-mode triton_do_bench \
-                --cudagraph \
-                --only $IMPLS \
-                --only-match-mode prefix-with-baseline \
-                --baseline $BASELINE \
-                --atol 1e-2 \
-                --rtol 1e-2 \
-                --input-sample-mode equally-spaced-k \
-                --keep-going \
-                ${{ inputs.custom-args }}
-
-            # Relax the GPU
-            sleep 2m
-
-            # Run again with cache and record results
-            ${{ inputs.env-vars }} HELION_PRINT_OUTPUT_CODE=1 HELION_ASSERT_CACHE_HIT=1 python benchmarks/run.py \
+            # Single pass: autotune search + codegen + compilation happen inline,
+            # so --measure-compile-time reports end-to-end user-visible compile time.
+            ${{ inputs.env-vars }} HELION_PRINT_OUTPUT_CODE=1 python benchmarks/run.py \
                 --op $kernel \
                 --metrics speedup,accuracy,latency \
                 --measure-compile-time \
