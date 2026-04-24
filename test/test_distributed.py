@@ -25,7 +25,6 @@ from helion._testing import EXAMPLES_DIR
 from helion._testing import TestCase
 from helion._testing import import_path
 from helion._testing import onlyBackends
-from helion._testing import skipIfRocm
 from helion._testing import skipIfXPU
 from helion.autotuner import search_algorithms
 from helion.autotuner.effort_profile import _PROFILES
@@ -165,7 +164,6 @@ class TestDistributed(TestCase, MultiProcessTestCase):
         dist.barrier()
         dist.destroy_process_group()
 
-    @skipIfRocm("Distributed example requires CUDA/NCCL")
     @skipIfXPU("Distributed operations require CCL, not yet fully integrated")
     @skip_if_lt_x_gpu(4)
     def test_sync_seed(self):
@@ -194,17 +192,17 @@ class TestDistributed(TestCase, MultiProcessTestCase):
 
         self._cleanup_process()
 
-    @skipIfRocm("Distributed example requires CUDA/NCCL")
     @skipIfXPU("Distributed operations require CCL, not yet fully integrated")
     @skip_if_lt_x_gpu(4)
     @parametrize("autotuner", autotuner_names)
     def test_allreduce(self, autotuner):
         self._init_process()
         if autotuner == "fixed":
+            fixed_num_warps = 16 if torch.version.hip is not None else 32
             kernel = helion.kernel(
                 config=helion.Config(
                     block_sizes=[8192],
-                    num_warps=32,
+                    num_warps=fixed_num_warps,
                 ),
                 ignore_warnings=[helion.exc.TensorOperationInWrapper],
             )(one_shot_allreduce_kernel)
@@ -243,7 +241,6 @@ class TestDistributed(TestCase, MultiProcessTestCase):
         a_shared = symm_mem.empty(N, dtype=dtype, device=self.device).normal_()
 
         symm_mem_hdl = symm_mem.rendezvous(a_shared, group=group)
-
         result = kernel(
             a_shared,
             symm_mem_hdl.rank,
@@ -258,7 +255,6 @@ class TestDistributed(TestCase, MultiProcessTestCase):
 
         torch.testing.assert_close(result, expected, rtol=1e-1, atol=1e-1)
 
-    @skipIfRocm("Distributed example requires CUDA/NCCL")
     @skipIfXPU("Distributed operations require CCL, not yet fully integrated")
     @skip_if_lt_x_gpu(4)
     @parametrize(
@@ -323,7 +319,6 @@ class TestDistributed(TestCase, MultiProcessTestCase):
         torch.manual_seed(42)
         bias = torch.randn(D, device=self.device)
         weight = torch.randn(D, device=self.device)
-
         result = kernel(
             symm_mem_buffer,
             x,
@@ -339,7 +334,6 @@ class TestDistributed(TestCase, MultiProcessTestCase):
         expected = ref_kernel(x, bias, weight)
         torch.testing.assert_close(result, expected, rtol=1e-4, atol=1e-4)
 
-    @skipIfRocm("Distributed example requires CUDA/NCCL")
     @skipIfXPU("Distributed operations require CCL, not yet fully integrated")
     @skip_if_lt_x_gpu(4)
     @parametrize("autotuner", autotuner_names)
@@ -411,7 +405,6 @@ class TestDistributed(TestCase, MultiProcessTestCase):
 
         symm_mem_buffer = symm_mem.empty(M, N, device=self.device)
         symm_mem_hdl = symm_mem.rendezvous(symm_mem_buffer, dist.group.WORLD.group_name)
-
         result = kernel(
             a,
             b,
@@ -426,7 +419,6 @@ class TestDistributed(TestCase, MultiProcessTestCase):
 
         torch.testing.assert_close(result, expected, rtol=1e-1, atol=1e-1)
 
-    @skipIfRocm("Distributed example requires CUDA/NCCL")
     @skipIfXPU("Distributed operations require CCL, not yet fully integrated")
     @skip_if_lt_x_gpu(4)
     def test_fp8_matmul_reduce_scatter(self):
@@ -474,7 +466,6 @@ class TestDistributed(TestCase, MultiProcessTestCase):
         torch.testing.assert_close(result, expected, rtol=8e-1, atol=8e-1)
         self._cleanup_process()
 
-    @skipIfRocm("Distributed example requires CUDA/NCCL")
     @skipIfXPU("Distributed operations require CCL, not yet fully integrated")
     @skip_if_lt_x_gpu(4)
     def test_two_dim_parallel_matmul(self):

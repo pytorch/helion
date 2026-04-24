@@ -15,6 +15,7 @@ from torch.testing._internal.common_utils import instantiate_parametrized_tests
 from torch.testing._internal.common_utils import parametrize
 from torch.testing._internal.common_utils import run_tests
 
+import helion
 from helion._testing import EXAMPLES_DIR
 from helion._testing import TestCase
 from helion._testing import code_and_output
@@ -22,6 +23,16 @@ from helion._testing import import_path
 from helion._testing import onlyBackends
 from helion._testing import skipIfRocm
 from helion._testing import skipIfXPU
+
+
+def _set_preferred_symm_mem_backend(device: torch.device) -> str:
+    preferred = "NVSHMEM"
+    try:
+        symm_mem.set_backend(preferred)
+        selected = preferred
+    except RuntimeError:
+        selected = str(symm_mem.get_backend(device) or "unknown")
+    return selected
 
 
 @onlyBackends(["triton"])
@@ -119,7 +130,6 @@ class TestExamplesDist(TestCase, MultiProcessTestCase):
         backend_stream = mod.copy_engine_all_gather_w_progress(
             a_out, a_shared, progress, 1
         )
-
         _, result = code_and_output(
             mod.helion_matmul_w_progress,
             (a_out, a_shared, b, progress, 1, symm_mem_hdl.rank),
@@ -139,7 +149,6 @@ class TestExamplesDist(TestCase, MultiProcessTestCase):
         torch.cuda.current_stream().wait_stream(backend_stream)
         self._cleanup_process()
 
-    @skipIfRocm("Distributed example requires CUDA/NCCL")
     @skipIfXPU("Distributed operations require CCL, not yet fully integrated")
     @skip_if_lt_x_gpu(4)
     def test_all_reduce(self):
@@ -147,10 +156,10 @@ class TestExamplesDist(TestCase, MultiProcessTestCase):
 
         mod = import_path(EXAMPLES_DIR / "distributed" / "all_reduce.py")
 
-        # Only NVSHMEM backend implements `get_remote_tensor` for now.
-        symm_mem.set_backend("NVSHMEM")
+        selected_backend = _set_preferred_symm_mem_backend(self.device)
         group = dist.group.WORLD
-        symm_mem.enable_symm_mem_for_group(group.group_name)
+        if selected_backend == "NVSHMEM":
+            symm_mem.enable_symm_mem_for_group(group.group_name)
 
         N = 16384
         dtype = torch.bfloat16
@@ -160,9 +169,14 @@ class TestExamplesDist(TestCase, MultiProcessTestCase):
         ).normal_()
 
         symm_mem_hdl = symm_mem.rendezvous(a_shared, group=group)
-
+        kernel = mod.one_shot_all_reduce_kernel
+        if torch.version.hip is not None:
+            kernel = helion.kernel(
+                config=helion.Config(block_sizes=[8192], num_warps=16),
+                static_shapes=True,
+            )(mod.one_shot_all_reduce_kernel.fn)
         _, result = code_and_output(
-            mod.one_shot_all_reduce_kernel,
+            kernel,
             (
                 symm_mem_hdl.signal_pad_ptrs_dev,
                 a_shared,
@@ -185,7 +199,6 @@ class TestExamplesDist(TestCase, MultiProcessTestCase):
 
         self._cleanup_process()
 
-    @skipIfRocm("Distributed example requires CUDA/NCCL")
     @skipIfXPU("Distributed operations require CCL, not yet fully integrated")
     @skip_if_lt_x_gpu(4)
     @parametrize(
@@ -200,10 +213,10 @@ class TestExamplesDist(TestCase, MultiProcessTestCase):
 
         mod = import_path(EXAMPLES_DIR / "distributed" / "allreduce_bias_rmsnorm.py")
 
-        # Only NVSHMEM backend implements `get_remote_tensor` for now.
-        symm_mem.set_backend("NVSHMEM")
+        selected_backend = _set_preferred_symm_mem_backend(self.device)
         group = dist.group.WORLD
-        symm_mem.enable_symm_mem_for_group(group.group_name)
+        if selected_backend == "NVSHMEM":
+            symm_mem.enable_symm_mem_for_group(group.group_name)
 
         N, D = 128, 4096
         dtype = torch.float32
@@ -219,9 +232,16 @@ class TestExamplesDist(TestCase, MultiProcessTestCase):
 
         symm_mem_buffer = symm_mem.empty(N, D, dtype=dtype, device=self.device)
         symm_mem_hdl = symm_mem.rendezvous(symm_mem_buffer, group.group_name)
-
+        kernel = getattr(mod, kernel_name)
+        if (
+            torch.version.hip is not None
+            and kernel_name == "two_shot_allreduce_bias_rmsnorm_kernel"
+        ):
+            kernel = helion.jit(config=helion.Config(block_sizes=[4], num_warps=16))(
+                kernel.fn
+            )
         _, result = code_and_output(
-            getattr(mod, kernel_name),
+            kernel,
             (
                 symm_mem_buffer,
                 x,
@@ -243,7 +263,6 @@ class TestExamplesDist(TestCase, MultiProcessTestCase):
 
         self._cleanup_process()
 
-    @skipIfRocm("Distributed example requires CUDA/NCCL")
     @skipIfXPU("Distributed operations require CCL, not yet fully integrated")
     @skip_if_lt_x_gpu(4)
     def test_matmul_reduce_scatter_kernel(self):
@@ -251,10 +270,10 @@ class TestExamplesDist(TestCase, MultiProcessTestCase):
 
         mod = import_path(EXAMPLES_DIR / "distributed" / "matmul_reduce_scatter.py")
 
-        # Only NVSHMEM backend implements `get_remote_tensor` for now.
-        symm_mem.set_backend("NVSHMEM")
+        selected_backend = _set_preferred_symm_mem_backend(self.device)
         group = dist.group.WORLD
-        symm_mem.enable_symm_mem_for_group(group.group_name)
+        if selected_backend == "NVSHMEM":
+            symm_mem.enable_symm_mem_for_group(group.group_name)
 
         M, N, K = 512, 768, 1024
         dtype = torch.float32
@@ -274,7 +293,6 @@ class TestExamplesDist(TestCase, MultiProcessTestCase):
         # Setup symmetric memory like the wrapper does
         symm_mem_buffer = symm_mem.empty(M, N, dtype=dtype, device=self.device)
         symm_mem_hdl = symm_mem.rendezvous(symm_mem_buffer, group.group_name)
-
         _, result = code_and_output(
             mod.matmul_reduce_scatter_kernel,
             (
@@ -296,7 +314,6 @@ class TestExamplesDist(TestCase, MultiProcessTestCase):
 
         self._cleanup_process()
 
-    @skipIfRocm("Distributed example requires CUDA/NCCL")
     @skipIfXPU("Distributed operations require CCL, not yet fully integrated")
     @skip_if_lt_x_gpu(4)
     def test_matmul_reduce_scatter_wrapper(self):
@@ -304,10 +321,10 @@ class TestExamplesDist(TestCase, MultiProcessTestCase):
 
         mod = import_path(EXAMPLES_DIR / "distributed" / "matmul_reduce_scatter.py")
 
-        # Only NVSHMEM backend implements `get_remote_tensor` for now.
-        symm_mem.set_backend("NVSHMEM")
+        selected_backend = _set_preferred_symm_mem_backend(self.device)
         group = dist.group.WORLD
-        symm_mem.enable_symm_mem_for_group(group.group_name)
+        if selected_backend == "NVSHMEM":
+            symm_mem.enable_symm_mem_for_group(group.group_name)
 
         M, N, K = 512, 768, 1024
         dtype = torch.float32
@@ -327,7 +344,6 @@ class TestExamplesDist(TestCase, MultiProcessTestCase):
         # Setup symmetric memory like the wrapper does
         symm_mem_buffer = symm_mem.empty(M, N, dtype=dtype, device=self.device)
         symm_mem.rendezvous(symm_mem_buffer, group.group_name)
-
         result = mod.helion_matmul_reduce_scatter(
             symm_mem_buffer,
             a,
