@@ -4884,6 +4884,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         kernel.reset()
         torch._dynamo.reset()
 
+        torch.manual_seed(0)
         x = torch.randn(128, device=DEVICE, dtype=torch.float32)
         y = torch.randn(128, device=DEVICE, dtype=torch.float32)
 
