@@ -39,6 +39,9 @@ jobs:
 
     env:
       HELION_AUTOTUNE_LOG_LEVEL: INFO
+      # Run autotune benchmarks in a subprocess so deadlocked kernels are
+      # SIGKILL'd at the per-config timeout instead of hanging the job.
+      HELION_AUTOTUNE_BENCHMARK_SUBPROCESS: "1"
 
     container:
       image: ${{ inputs.image }}

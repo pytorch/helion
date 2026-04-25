@@ -28,6 +28,9 @@ from .. import exc
 from ..runtime.precompile_shim import already_compiled
 from ..runtime.precompile_shim import already_compiled_fail
 from ..runtime.precompile_shim import make_precompiler
+from .benchmark_job import BenchmarkJob
+from .benchmark_worker import BenchmarkSubprocessError
+from .benchmark_worker import BenchmarkWorker
 from .benchmarking import do_bench
 from .benchmarking import synchronize_device
 from .logger import SUPPRESSED_TRITON_CODE_MSG
@@ -42,6 +45,7 @@ from .logger import maybe_dump_triton_failure
 from .precompile_future import PrecompileContext
 from .precompile_future import PrecompileFuture
 from .precompile_future import _ExtractedLaunchArgs
+from .precompile_future import _serialize_compiled_fn
 from .progress_bar import iter_with_progress
 from helion._dist_utils import _clone_symm_mem_tensor
 from helion._dist_utils import all_gather_object
@@ -334,6 +338,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         self._precompile_tmpdir: tempfile.TemporaryDirectory[str] | None = None
         self._precompile_args_path: str | None = None
         self._precompile_result_counter: count[int] = count()
+        self._benchmark_worker: BenchmarkWorker | None = None
 
         # TODO(hinriksnaer): baseline computation is expensive (compiles and runs
         # the kernel). Currently safe because the provider is only constructed
@@ -539,7 +544,10 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         """Prepare precompile tmpdir and args for spawn mode."""
         if self._precompile_tmpdir is None:
             self._precompile_tmpdir = tempfile.TemporaryDirectory()
-        if self.settings.autotune_precompile == "spawn":
+        if (
+            self.settings.autotune_precompile == "spawn"
+            or self._subprocess_benchmark_enabled()
+        ):
             args_path = os.path.join(self._precompile_tmpdir.name, "args.pt")
             torch.save(self.args, args_path)
             self._precompile_args_path = args_path
@@ -555,11 +563,27 @@ class LocalBenchmarkProvider(BenchmarkProvider):
 
     def cleanup(self) -> None:
         """Release precompile tmpdir and related resources."""
+        if self._benchmark_worker is not None:
+            self._benchmark_worker.shutdown()
+            self._benchmark_worker = None
         if self._precompile_tmpdir is not None:
             self._precompile_tmpdir.cleanup()
             self._precompile_tmpdir = None
         self._precompile_args_path = None
         self._precompile_result_counter = count()
+
+    def _subprocess_benchmark_enabled(self) -> bool:
+        """Subprocess benchmark path is opt-in and skipped for distributed /
+        mutated-arg kernels where the worker's simple job shape doesn't fit."""
+        if not self.settings.autotune_benchmark_subprocess:
+            return False
+        if dist.is_initialized():
+            return False
+        if len(self.mutated_arg_indices) > 0:
+            return False
+        # Custom do_bench implementations are not shipped to the worker.
+        _backend = getattr(self.config_spec, "backend", None)
+        return not (_backend is not None and _backend.get_do_bench() is not None)
 
     def _validate_against_baseline(
         self, config: Config, output: object, args: Sequence[object]
@@ -755,6 +779,14 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         """Benchmark a single compiled function.  Returns time in ms or inf."""
         self._autotune_metrics.num_configs_tested += 1
         self.log.debug(lambda: f"Running benchmark for {config!r}")
+
+        if self._subprocess_benchmark_enabled():
+            result = self._benchmark_function_subprocess(config, fn)
+            if result is not None:
+                return result
+            # None means the subprocess path could not handle this config
+            # (e.g., serialization failed); fall through to in-process.
+
         _captured_output: list[str] = [""]
         _capture_ctx = (
             capture_output()
@@ -921,3 +953,73 @@ class LocalBenchmarkProvider(BenchmarkProvider):
 
             self._autotune_metrics.num_compile_failures += 1
             return inf
+
+    def _benchmark_function_subprocess(
+        self, config: Config, fn: CompiledConfig
+    ) -> float | None:
+        """Benchmark ``fn`` in a long-lived spawn subprocess with a per-call
+        timeout. Returns the measured latency in ms, ``inf`` for a failure
+        we classified and handled, or ``None`` if the subprocess path cannot
+        handle this config and the caller should fall back to in-process.
+        """
+        if self._precompile_args_path is None:
+            return None
+        try:
+            fn_spec = _serialize_compiled_fn(fn)
+        except RuntimeError:
+            return None
+
+        if self._benchmark_worker is None:
+            self._benchmark_worker = BenchmarkWorker(device=None)
+
+        job = BenchmarkJob(
+            fn_spec=fn_spec,
+            args_path=self._precompile_args_path,
+            warmup=1,
+            rep=50,
+        )
+        timeout = float(self.settings.autotune_benchmark_timeout)
+
+        try:
+            latency = self._benchmark_worker.run(job, timeout=timeout)
+        except BenchmarkSubprocessError as e:
+            # Timeout or unexpected worker exit; skip config and continue.
+            self.log.warning(f"Benchmark subprocess failed for {config!r}: {e}")
+            self._autotune_metrics.num_compile_failures += 1
+            return inf
+        except Exception as e:
+            e.__traceback__ = None
+            if match_unrecoverable_runtime_error(e):
+                # Subprocess already killed itself via BenchmarkWorker's sticky
+                # check; surface to the caller the same way the in-process
+                # path does so autotuning aborts.
+                self.kernel.maybe_log_repro(self.log.error, self.args, config)
+                raise exc.TritonUnrecoverableRuntimeError(
+                    reason=str(e),
+                    decorator=self.kernel.format_kernel_decorator(
+                        config, self.settings
+                    ),
+                    error=f"{type(e).__qualname__}: {e}",
+                ) from e
+            self.log.debug(
+                f"Benchmark subprocess raised for {config!r}: {type(e).__name__}: {e}"
+            )
+            self._autotune_metrics.num_compile_failures += 1
+            return inf
+
+        # Kernel is known-safe; accuracy check launches in-process without hang risk.
+        if self.settings.autotune_accuracy_check:
+            try:
+                output = fn(*self.args)
+                synchronize_device(output)
+                if not self._validate_against_baseline(config, output, self.args):
+                    self._autotune_metrics.num_accuracy_failures += 1
+                    return inf
+            except Exception as e:
+                self.log.debug(
+                    f"Accuracy check raised for {config!r}: {type(e).__name__}: {e}"
+                )
+                self._autotune_metrics.num_compile_failures += 1
+                return inf
+
+        return float(latency)
