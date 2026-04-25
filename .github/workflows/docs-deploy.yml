@@ -60,6 +60,7 @@ jobs:
         run: |
           python3 .github/dashboard/build_dashboard_data.py \
             --repo ${{ github.repository }} \
+            --existing-url https://helionlang.com/dashboard/dashboard-data.json \
             --output ./dashboard-data.json
 
       - name: Add dashboard to site
