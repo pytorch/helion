@@ -1216,12 +1216,16 @@ class ConfigSpec:
     def lower_max_for_imbalanced_grid_dims(self) -> None:
         """Lower max_size for the large grid dimension when the shape is skinny.
 
-        When one grid dimension is much larger than the other (e.g. M=1024, N=8192),
-        the autotuner samples large tile sizes for the big dimension that produce too
-        few grid blocks for good GPU occupancy.  Capping the larger dimension's tile
-        keeps the search in the useful region without hardcoding specific tile values.
+        Mirrors raise_grid_block_minimums: that method raises the minimum tile to
+        prevent too many blocks per dimension; this method lowers the maximum tile
+        to prevent too few blocks when one dimension is much larger than the other.
 
-        Only applied to 2-D grids where max(dim) >= 4 * min(dim).
+        The cap is derived from num_compute_units() so it naturally relaxes on
+        smaller GPUs (fewer SMs/CUs → fewer blocks needed → larger tiles OK).
+
+        Only applied to 2-D grids where max(dim) >= 8 * min(dim).  The 8x threshold
+        is hardware-independent: below it the random sampler has a reasonable chance
+        of finding good balanced-tile configs on its own.
         """
         if len(self.grid_block_ids) != 2:
             return
@@ -1238,16 +1242,24 @@ class ConfigSpec:
 
         min_hint = min(hints)
         max_hint = max(hints)
-        if max_hint < min_hint * 4:
-            return  # Square-ish shape — leave the search space alone
+        if max_hint < min_hint * 8:
+            return  # Not severely imbalanced — leave the search space alone
 
-        # Cap the larger dim's tile so that at least 4 blocks cover min_hint,
-        # keeping total blocks comparable across both dims.
-        # e.g. M=1024, N=8192: cap N-tile at max(64, 1024//4) = 256
-        cap = max(64, next_power_of_2(min_hint) // 2)
+        # Derive cap from actual hardware: require at least 1 block per compute unit
+        # per grid dimension (mirroring raise_grid_block_minimums which uses n_cus*64).
+        n_cus = num_compute_units()
+        n_dims = len(self.grid_block_ids)
+        min_blocks_per_dim = math.ceil(n_cus ** (1.0 / n_dims))
+
         for spec, hint in zip(specs, hints, strict=True):
-            if hint == max_hint:
-                spec.update_max(min(spec.max_size, cap))
+            if hint != max_hint:
+                continue
+            max_tile = hint // min_blocks_per_dim
+            if max_tile < 2:
+                continue
+            # Round down to power of two
+            max_tile = 1 << (max_tile.bit_length() - 1)
+            spec.update_max(min(spec.max_size, max_tile))
 
     def create_config_generation(
         self,
