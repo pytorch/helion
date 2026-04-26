@@ -1160,7 +1160,11 @@ class TestLowerMaxForImbalancedGridDims(unittest.TestCase):
         return config_spec
 
     def test_skinny_n_caps_n_tile(self):
-        """Skinny-N (M=1024, N=8192): N-tile max should be capped."""
+        """Skinny-N (M=1024, N=8192): N-tile max should be capped (hardware-derived cap)."""
+        import math
+
+        from helion._compat import num_compute_units
+
         spec = self._make_spec(m=1024, n=8192)
         n_max_before = spec.block_sizes.block_id_lookup(1).max_size
         spec.lower_max_for_imbalanced_grid_dims()
@@ -1170,8 +1174,10 @@ class TestLowerMaxForImbalancedGridDims(unittest.TestCase):
         self.assertLess(n_max_after, n_max_before)
         # M tile (the smaller dim) should be unchanged
         self.assertEqual(m_max_after, spec.block_sizes.block_id_lookup(0).max_size)
-        # Cap should allow at least 4 blocks on N dim
-        self.assertGreaterEqual(8192 // n_max_after, 4)
+        # Cap is hardware-derived: at least min_blocks_per_dim blocks on N dim
+        n_cus = num_compute_units()
+        min_blocks_per_dim = math.ceil(n_cus**0.5)
+        self.assertGreaterEqual(8192 // n_max_after, min_blocks_per_dim)
 
     def test_skinny_m_caps_m_tile(self):
         """Skinny-M (M=8192, N=1024): M-tile max should be capped."""
@@ -1191,8 +1197,8 @@ class TestLowerMaxForImbalancedGridDims(unittest.TestCase):
         self.assertEqual(spec.block_sizes.block_id_lookup(1).max_size, n_max_before)
 
     def test_slightly_imbalanced_unchanged(self):
-        """3:1 ratio (M=1024, N=3072): below the 4x threshold, no change."""
-        spec = self._make_spec(m=1024, n=3072)
+        """6.4x ratio (M=1280, N=8192): below the 8x threshold, no change (covers int4_gemm regression)."""
+        spec = self._make_spec(m=1280, n=8192)
         n_max_before = spec.block_sizes.block_id_lookup(1).max_size
         spec.lower_max_for_imbalanced_grid_dims()
         self.assertEqual(spec.block_sizes.block_id_lookup(1).max_size, n_max_before)
