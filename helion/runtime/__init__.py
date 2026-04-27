@@ -850,7 +850,7 @@ def _pallas_apply_ds_padding(
         pad_amount = (-a.shape[dim]) % block_size
         if pad_amount == 0:
             continue
-        if arg_idx in output_set:
+        if arg_idx in output_set and arg_idx not in orig_output_tensors:
             orig_output_tensors[arg_idx] = a
         # F.pad takes (last_dim_left, last_dim_right, ..., first_dim_left, first_dim_right).
         # To right-pad dimension `dim`, set index 2*(ndim-1-dim) + 1.
