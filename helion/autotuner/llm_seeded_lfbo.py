@@ -234,12 +234,27 @@ class LLMSeededSearch(BaseSearch):
         self,
         second_stage_search: BaseSearch,
         llm_seed_config: Config,
+        llm_search: LLMGuidedSearch | None = None,
     ) -> None:
-        """Pass the best LLM config into searches that expose the seed hook."""
+        """Pass the best LLM config into searches that expose the seed hook.
+
+        For LFBO stage 2, also seed the surrogate's training set so LFBO
+        learns from the LLM's exploration, not just the single best config.
+        """
         if not self._second_stage_supports_best_available_handoff:
             return
         seeded_search = cast("PopulationBasedSearch", second_stage_search)
         seeded_search.set_best_available_seed_configs([llm_seed_config])
+
+        from .surrogate_pattern_search import LFBOPatternSearch
+
+        if llm_search is not None and isinstance(seeded_search, LFBOPatternSearch):
+            results = llm_search._all_benchmark_results
+            seeded_search.seed_training_data(results)
+            self.log(
+                f"Seeded LFBO surrogate with {len(results)} (config, perf) pairs "
+                "from the LLM stage."
+            )
 
     @staticmethod
     def _finite_perf(search: BaseSearch | None) -> float | None:
@@ -269,6 +284,7 @@ class LLMSeededSearch(BaseSearch):
     def _run_second_stage(
         self,
         llm_seed_config: Config | None,
+        llm_search: LLMGuidedSearch | None = None,
     ) -> tuple[BaseSearch, Config, float]:
         """Run stage 2, optionally seeded from the stage-1 best config."""
         seeded = llm_seed_config is not None
@@ -282,7 +298,9 @@ class LLMSeededSearch(BaseSearch):
         )
         second_stage_search = self._make_second_stage_search(seeded=seeded)
         if llm_seed_config is not None:
-            self._inject_seed_into_second_stage(second_stage_search, llm_seed_config)
+            self._inject_seed_into_second_stage(
+                second_stage_search, llm_seed_config, llm_search
+            )
         second_stage_start = time.perf_counter()
         best_config = second_stage_search.autotune()
         second_stage_wall_time = time.perf_counter() - second_stage_start
@@ -348,7 +366,7 @@ class LLMSeededSearch(BaseSearch):
         llm_search, llm_seed_config, llm_wall_time = self._run_llm_seed_stage()
         # Stage 2: run the configured follow-up search, seeded when stage 1 found a config.
         second_stage_search, best_config, second_stage_wall_time = (
-            self._run_second_stage(llm_seed_config)
+            self._run_second_stage(llm_seed_config, llm_search)
         )
 
         self._finalize_stage_metrics(
