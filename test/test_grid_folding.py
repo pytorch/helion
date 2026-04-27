@@ -6,9 +6,11 @@ import torch
 
 import helion
 from helion._testing import DEVICE
+from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
+from helion._testing import skipIfRefEager
 import helion.language as hl
 
 
@@ -42,7 +44,7 @@ def add_2d_tile_begin_kernel(
 
 
 @onlyBackends(["triton"])
-class TestGridFolding(TestCase):
+class TestGridFolding(RefEagerTestBase, TestCase):
     def test_2d_full_folding(self):
         """Full folding (factor=-1) on last dim of 2D tile into inner loop."""
         x = torch.randn(64, 64, device=DEVICE)
@@ -108,6 +110,7 @@ class TestGridFolding(TestCase):
         torch.testing.assert_close(result, x + y)
         self.assertIn("tl.range(", code)
 
+    @skipIfRefEager("config validation only runs during compilation")
     def test_persistent_rejects_folding(self):
         """Persistent kernel should reject non-zero grid_foldings."""
         from helion.exc import InvalidConfig
@@ -169,6 +172,7 @@ class TestGridFolding(TestCase):
         torch.testing.assert_close(result, x + y)
         self.assertIn("tl.range(", code)
 
+    @skipIfRefEager("checks generated code with assertGreaterEqual")
     def test_nested_partial_folding(self):
         """Partial folding on multiple dims simultaneously.
 
@@ -244,6 +248,7 @@ class TestGridFolding(TestCase):
         )
         torch.testing.assert_close(result, x + y)
 
+    @skipIfRefEager("config validation only runs during compilation")
     def test_all_dims_folded_rejects(self):
         """Foldinging ALL dims collapses the grid to 1 → InvalidConfig."""
         from helion.exc import InvalidConfig
@@ -260,7 +265,7 @@ class TestGridFolding(TestCase):
 
 
 @onlyBackends(["triton"])
-class TestGridFoldingWithFlatten(TestCase):
+class TestGridFoldingWithFlatten(RefEagerTestBase, TestCase):
     """Tests for combining grid folding with flatten_loops (partial flattening)."""
 
     def test_full_folding_with_flatten_2d(self):
@@ -346,6 +351,8 @@ class TestGridFoldingWithFlatten(TestCase):
         torch.testing.assert_close(result, x + y)
 
 
+@onlyBackends(["triton"])
+@skipIfRefEager("parses generated Triton code and launcher calls")
 class TestGridFoldingGridSize(TestCase):
     """Verify that grid folding actually reduces the GPU launch grid."""
 
@@ -471,6 +478,7 @@ class TestGridFoldingGridSize(TestCase):
         self.assertEqual(grid_mf, 2)
 
 
+@skipIfRefEager("inspects config_spec populated during compilation")
 class TestGridFoldingHeuristic(TestCase):
     """Verify that the autotuner heuristic gates partial folding for small dims."""
 
@@ -513,7 +521,7 @@ class TestGridFoldingHeuristic(TestCase):
             self.assertTrue(
                 all(c <= 0 for c in dim_choices),
                 f"Expected only (0, -1) for small grid (n_cus={n_cus}, "
-                f"dim={dim_size}, total={dim_size*dim_size}), got {dim_choices}",
+                f"dim={dim_size}, total={dim_size * dim_size}), got {dim_choices}",
             )
 
     def test_large_dims_allow_partial_folding(self):
