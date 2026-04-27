@@ -306,8 +306,8 @@ class LLMGuidedSearch(PopulationBasedSearch):
         return self._llm_executor.submit(self._call_llm, messages)
 
     def _max_output_tokens_for_request(self) -> int:
-        """Choose a small response budget that scales with configs_per_round."""
-        return max(384, min(1536, 192 + self.configs_per_round * 56))
+        """Response budget sized to fit verbose JSON from models like Opus 4.7."""
+        return max(512, min(4096, 256 + self.configs_per_round * 128))
 
     def _get_context_messages(self) -> list[dict[str, str]]:
         """Keep the fixed prompt prefix plus only the most recent round history."""

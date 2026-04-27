@@ -6,6 +6,7 @@ import random
 from typing import TYPE_CHECKING
 
 from .. import exc
+from .base_search import BenchmarkResult
 from .base_search import PopulationBasedSearch
 from .base_search import PopulationMember
 from .base_search import check_population_consistency
@@ -176,6 +177,27 @@ class LFBOPatternSearch(PatternSearch):
             "best_available_pad_random": profile.lfbo_pattern_search.best_available_pad_random,
             **PopulationBasedSearch.get_kwargs_from_profile(profile, settings),
         }
+
+    def seed_training_data(
+        self,
+        results: Sequence[BenchmarkResult],
+    ) -> None:
+        """Pre-populate the surrogate's training set with externally-benchmarked configs.
+
+        Useful when an outer loop (e.g. a hybrid LLM+LFBO search) has already
+        benchmarked configs and wants the LFBO surrogate to learn from them
+        rather than starting from scratch. Failed configs (perf=inf) are
+        kept since the surrogate's binary classifier learns from negatives too.
+        """
+        for result in results:
+            try:
+                flat_values = self.config_gen.flatten(result.config)
+                encoded = self.config_gen.encode_config(flat_values)
+            except Exception as e:
+                self.log.debug(f"seed_training_data: skipping config: {e}")
+                continue
+            self.train_x.append(encoded)
+            self.train_y.append(result.perf)
 
     def _fit_surrogate(self) -> None:
         train_x = np.array(self.train_x)

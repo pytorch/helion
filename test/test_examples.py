@@ -882,7 +882,7 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
 
     @xfailIfCute("CuTe jagged dense bmm example still returns incorrect results")
-    @xfailIfPallas("tensor-derived if-predicates not supported")
+    @xfailIfPallas("Pallas rejects int64 inputs (jagged offsets)")
     @skipIfXPU("Jagged tensor operations not fully supported on XPU")
     @skipIfRefEager("hl.jagged_tile does not support ref mode yet")
     def test_jagged_dense_bmm(self):
@@ -2233,7 +2233,9 @@ class TestExamples(RefEagerTestBase, TestCase):
         lambda: _get_backend() == "cute",
         "CuTe Mamba2 chunk-state destabilizes later cute tests when it fails in-process",
     )
-    @xfailIfPallas("SMEM load lowering: Can only load scalars from SMEM")
+    @xfailIfPallas(
+        "dA_cumsum has mixed scalar+slice access (VMEM), but Mosaic requires 32-bit for VMEM scalar extracts"
+    )
     def test_mamba2_chunk_state(self):
         batch, nheads, ngroups, seqlen, chunk_size, headdim, dstate = (
             2,

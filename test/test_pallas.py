@@ -722,11 +722,17 @@ class TestPallas(TestCase):
         key = torch.randn(1, 4, 32, 64, dtype=torch.float32, device=DEVICE)
         val = torch.randn(1, 4, 32, 64, dtype=torch.float32, device=DEVICE)
         args = (query, key, val)
+
         _code, result = code_and_output(pallas_attention, args, block_sizes=[1, 32, 32])
         ref = torch.nn.functional.scaled_dot_product_attention(
             query.float().cpu(), key.float().cpu(), val.float().cpu()
         ).to(device=DEVICE)
         torch.testing.assert_close(result, ref, rtol=1e-2, atol=1e-2)
+
+        # test that we're not manually allocating and donating out tensor HBM,
+        # but are instead taking over tensor returned by torch_tpu JaxCallable
+        self.assertIn("out = torch.empty_like(q_view, device='meta')", _code)
+        self.assertIn("out = _launcher(", _code)
 
     def test_attention_emit_pipeline_correctness(self) -> None:
         """Test emit_pipeline attention with loop-carried state."""
@@ -902,6 +908,68 @@ class TestPallas(TestCase):
         x = torch.randn(256, 128, device=DEVICE, dtype=torch.float32)
         code, result = code_and_output(chunked_add, (x,), block_sizes=[128])
         expected = x + 1.0
+        torch.testing.assert_close(result, expected)
+
+    def test_mixed_scalar_and_slice_access(self) -> None:
+        """Tensor accessed both as scalar and slice should not be placed in SMEM.
+
+        When a tensor has one access that is all-scalar (e.g. x[i, j, k])
+        and another that uses a slice (e.g. x[i, j, tile]), placing it in
+        SMEM causes 'Can only load scalars from SMEM' at runtime. The tensor
+        must stay in VMEM to support both access patterns.
+        """
+
+        @helion.kernel(
+            backend="pallas",
+            static_shapes=True,
+        )
+        def mixed_access(x: torch.Tensor) -> torch.Tensor:
+            B, N = x.shape
+            out = torch.empty_like(x)
+            for tile_b, tile_n in hl.tile([B, N], block_size=[1, None]):
+                # scalar access: x[tile_b.begin, N-1]
+                last_val = x[tile_b.begin, N - 1]
+                # slice access: x[tile_b.begin, tile_n]
+                out[tile_b.begin, tile_n] = x[tile_b.begin, tile_n] + last_val
+            return out
+
+        x = torch.randn(4, 128, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(mixed_access, (x,), block_sizes=[128])
+        # x has mixed access (scalar + slice), so it must stay in VMEM
+        self.assertNotIn("_smem_arg_indices", code)
+        expected = x + x[:, -1:]
+        torch.testing.assert_close(result, expected)
+
+    @xfailIfPallas(
+        "Mixed scalar write + slice needs tensor duplication into SMEM and VMEM"
+    )
+    def test_mixed_scalar_write_and_slice_access(self) -> None:
+        """Tensor with both scalar write and slice access is unsupported.
+
+        SMEM only supports scalar access; VMEM doesn't support scalar writes.
+        A tensor that needs both would require duplication into SMEM (for the
+        scalar write) and VMEM (for the slice access), which is not yet
+        implemented.
+        """
+
+        @helion.kernel(
+            backend="pallas",
+            static_shapes=True,
+        )
+        def mixed_write(x: torch.Tensor) -> torch.Tensor:
+            B, N = x.shape
+            out = torch.empty_like(x)
+            for tile_b, tile_n in hl.tile([B, N], block_size=[1, None]):
+                # slice read
+                out[tile_b.begin, tile_n] = x[tile_b.begin, tile_n]
+                # scalar write to same tensor
+                out[tile_b.begin, N - 1] = x[tile_b.begin, 0]
+            return out
+
+        x = torch.randn(4, 128, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(mixed_write, (x,), block_sizes=[128])
+        expected = x.clone()
+        expected[:, -1] = x[:, 0]
         torch.testing.assert_close(result, expected)
 
     def test_scalar_access_hl_grid(self) -> None:

@@ -83,25 +83,14 @@
       "runner": "linux.dgx.b200",
       "python-version": "3.12",
       "ref-eager": false,
-      "image": "nvidia/cuda:13.1.0-devel-ubuntu24.04",
+      "image": "nvidia/cuda:13.2.0-devel-ubuntu24.04",
       "runtime-version": "cu130",
       "container-options": "--gpus all",
       "pytorch-version": "pytorch-2.11",
       "alias": "b200",
       "backend": "tileir",
       "triton-repo": "https://github.com/triton-lang/Triton-to-tile-IR.git",
-      "triton-pin": "5d3ab8c13c"
-    },
-    {
-      "runner": "linux.rocm.gpu.gfx942.1",
-      "python-version": "3.12",
-      "ref-eager": false,
-      "image": "rocm/dev-ubuntu-24.04:7.0-complete",
-      "runtime-version": "rocm7.0",
-      "container-options": "--device=/dev/kfd --device=/dev/dri",
-      "pytorch-version": "pytorch-nightly",
-      "alias": "mi325x",
-      "backend": "triton"
+      "triton-pin": "0d9283bf49"
     },
     {
       "runner": "linux.rocm.gpu.ecosystem.gfx950.1",

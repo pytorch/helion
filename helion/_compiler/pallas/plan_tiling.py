@@ -145,6 +145,37 @@ def _analyze_indexing(node: torch.fx.Node, config: Config) -> None:
     _resolve_tensor_index_patterns(node, tensor_val, list(subscript), indexing_patterns)
     node.meta["indexing_patterns"] = indexing_patterns
 
+    # Track SMEM eligibility (simplified — does not distinguish read vs write):
+    #   SMEM: only scalar access.  VMEM: vector/slice + scalar reads.
+    # A fully correct policy would check read vs write per access:
+    #   - Scalar read-only tensors could stay in VMEM (no SMEM needed)
+    #   - Scalar write requires SMEM
+    #   - Mixed scalar-write + slice needs tensor duplication (unsupported)
+    # For now we conservatively put all-scalar tensors in SMEM and
+    # mixed tensors in VMEM. This is correct for the common cases
+    # (scalar-only → SMEM, mixed scalar-read + slice → VMEM) but
+    # over-allocates SMEM for scalar-read-only tensors.
+    from ..device_function import PallasMemorySpace
+
+    is_all_scalar = all(
+        isinstance(p, (ArbitraryIndexPattern, TileBeginWithOffsetPattern, NonePattern))
+        for p in indexing_patterns
+    )
+    tid = id(tensor_val)
+    current = device_fn.pallas_memory_space.get(tid)
+    if is_all_scalar:
+        # Only mark for SMEM if not already assigned to VMEM or HBM
+        if current is None:
+            device_fn.pallas_memory_space[tid] = PallasMemorySpace.SMEM
+    else:
+        # Override SMEM → VMEM: this is intentional. When a tensor has
+        # both scalar and slice accesses, we keep it in VMEM because
+        # scalar *reads* work from VMEM (only scalar writes require
+        # SMEM). We optimistically assume the scalar access is a read.
+        # Don't override HBM (pipeline tensors).
+        if current != PallasMemorySpace.HBM:
+            device_fn.pallas_memory_space[tid] = PallasMemorySpace.VMEM
+
 
 def _analyze_subscript_patterns(
     tensor: torch.Tensor,
