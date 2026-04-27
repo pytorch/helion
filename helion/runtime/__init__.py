@@ -791,8 +791,12 @@ def _pallas_invoke_and_return(
             if arg_idx in _orig_output_tensors:
                 padded_dims_by_arg.setdefault(arg_idx, []).append(dim)
 
-        # Copy sliced results back into original in-place output tensors
+        # Copy sliced results back into original in-place output tensors.
+        # Skip output-only tensors (not in arg_to_tensor_pos) — their
+        # results come from output_only_results, not from args.
         for arg_idx, orig_tensor in _orig_output_tensors.items():
+            if arg_idx not in arg_to_tensor_pos:
+                continue
             dims = padded_dims_by_arg.get(arg_idx)
             if not dims:
                 continue

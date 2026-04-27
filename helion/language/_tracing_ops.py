@@ -1307,6 +1307,9 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
                 begin_expr = begin_exprs[bid_idx]
                 iter_step_expr = iter_step_exprs[bid_idx]
                 block_shape_parts.append(slice_size_expr)
+                from .memory_ops import _record_pad_info
+
+                _record_pad_info(state, fake, dim_idx, bid)
                 if begin_expr == "0" and iter_step_expr == slice_size_expr:
                     lambda_parts.append(lambda_params[bid_idx])
                 else:
@@ -1763,6 +1766,9 @@ def _codegen_fori_loop(state: CodegenState) -> object:
                     f"pl.ds(({begin_expr}) + ({dim_idx_expr}) * ({iter_step_expr}), {slice_size_expr})"
                 )
                 needs_slice = True
+                from .memory_ops import _record_pad_info
+
+                _record_pad_info(state, fake, dim_idx, bid)
             elif bid is not None and bid not in block_ids:
                 # Outer grid dim: use grid offset
                 grid_loops = state.codegen.active_device_loops.get(bid)
