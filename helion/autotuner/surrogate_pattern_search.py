@@ -110,7 +110,7 @@ class LFBOPatternSearch(PatternSearch):
         initial_population: int = PATTERN_SEARCH_DEFAULTS.initial_population,
         copies: int = PATTERN_SEARCH_DEFAULTS.copies,
         max_generations: int = PATTERN_SEARCH_DEFAULTS.max_generations,
-        min_improvement_delta: float = 0.001,
+        min_improvement_delta: float = 0.003,
         frac_selected: float = 0.10,
         num_neighbors: int = 300,
         radius: int = 2,
@@ -162,6 +162,7 @@ class LFBOPatternSearch(PatternSearch):
     def get_kwargs_from_profile(
         cls, profile: AutotuneEffortProfile, settings: Settings
     ) -> dict[str, object]:
+        from ..runtime.settings import _env_get_float
         from ..runtime.settings import _get_initial_population_strategy
 
         assert profile.lfbo_pattern_search is not None
@@ -175,6 +176,9 @@ class LFBOPatternSearch(PatternSearch):
             "max_generations": profile.lfbo_pattern_search.max_generations,
             "initial_population_strategy": strategy,
             "best_available_pad_random": profile.lfbo_pattern_search.best_available_pad_random,
+            "min_improvement_delta": _env_get_float(
+                "HELION_AUTOTUNE_MIN_IMPROVEMENT_DELTA", 0.003
+            ),
             **PopulationBasedSearch.get_kwargs_from_profile(profile, settings),
         }
 
@@ -704,7 +708,7 @@ class LFBOTreeSearch(LFBOPatternSearch):
         initial_population: int = PATTERN_SEARCH_DEFAULTS.initial_population,
         copies: int = PATTERN_SEARCH_DEFAULTS.copies,
         max_generations: int = PATTERN_SEARCH_DEFAULTS.max_generations,
-        min_improvement_delta: float = 0.001,
+        min_improvement_delta: float = 0.003,
         quantile: float = 0.1,
         patience: int = 1,
         similarity_penalty: float = 1.0,
