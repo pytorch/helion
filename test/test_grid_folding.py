@@ -494,13 +494,26 @@ class TestGridFoldingHeuristic(TestCase):
 
     def test_small_dims_no_partial_folding(self):
         """Small grid (total blocks < MIN_GRID_SM_RATIO * SMs) → no partial folding."""
-        x = torch.randn(16, 16, device=DEVICE)
-        y = torch.randn(16, 16, device=DEVICE)
+        import math
+
+        from helion._compat import num_compute_units
+        from helion.autotuner.config_spec import GridFoldingSpec
+
+        n_cus = num_compute_units()
+        threshold = GridFoldingSpec.MIN_GRID_SM_RATIO * n_cus
+        # With min_block_size=1, num_blocks_per_dim = dim_size, so
+        # total_grid = dim_size^2.  Pick the largest square that stays below.
+        dim_size = max(2, math.isqrt(threshold - 1))
+        assert dim_size * dim_size < threshold
+
+        x = torch.randn(dim_size, dim_size, device=DEVICE)
+        y = torch.randn(dim_size, dim_size, device=DEVICE)
         choices = self._get_folding_choices(x, y)
         for dim_choices in choices:
             self.assertTrue(
                 all(c <= 0 for c in dim_choices),
-                f"Expected only (0, -1) for small grid, got {dim_choices}",
+                f"Expected only (0, -1) for small grid (n_cus={n_cus}, "
+                f"dim={dim_size}, total={dim_size*dim_size}), got {dim_choices}",
             )
 
     def test_large_dims_allow_partial_folding(self):
