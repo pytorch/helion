@@ -215,6 +215,16 @@ def _tile_pattern_code(
         for loop in loops
     ):
         return _ds_expr(state, block_id, tensor=tensor, tensor_dim=tensor_dim)
+
+    # When the tensor is in HBM (no outer BlockSpec) and we are NOT inside
+    # a pipeline/DMA loop (which handles slicing via DMA copies), grid dims
+    # must use explicit pl.ds() slicing instead of relying on BlockSpec.
+    if not in_pipeline:
+        from helion._compiler.device_function import PallasMemorySpace
+
+        mem_space = state.device_function.pallas_memory_space.get(id(tensor))
+        if mem_space == PallasMemorySpace.HBM:
+            return _ds_expr(state, block_id, tensor=tensor, tensor_dim=tensor_dim)
     return ":"
 
 

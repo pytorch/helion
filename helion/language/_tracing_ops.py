@@ -355,6 +355,22 @@ def _find_strategy(
     return strategy
 
 
+def _ast_to_str(value: object) -> str:
+    """Convert an AST node or constant to its string representation."""
+    if isinstance(value, ast.AST):
+        return ast.unparse(value)
+    return str(value)
+
+
+def _get_loop_bounds(state: CodegenState) -> tuple[list[object], list[object]]:
+    """Extract begin and end bound lists from the _for_loop state args."""
+    ast_begins = state.ast_args[1]
+    ast_ends = state.ast_args[2]
+    begins = list(ast_begins) if isinstance(ast_begins, (list, tuple)) else [ast_begins]
+    ends = list(ast_ends) if isinstance(ast_ends, (list, tuple)) else [ast_ends]
+    return begins, ends
+
+
 def _compute_grid_and_block_sizes(
     state: CodegenState,
     block_ids: list[int],
@@ -363,14 +379,30 @@ def _compute_grid_and_block_sizes(
     """Compute grid dimensions and block size vars for the given block_ids."""
     grid_parts: list[str] = []
     block_size_vars: list[str] = []
-    for block_id in block_ids:
+    begins: list[object] | None = None
+    ends: list[object] | None = None
+    for i, block_id in enumerate(block_ids):
         block_size_var = state.device_function.block_size_var(block_id)
         assert block_size_var is not None
         block_size_vars.append(block_size_var)
         block_value = env.block_sizes[block_id].from_config(state.config)
         if block_value is not None:
             state.device_function.constexpr_arg(block_size_var, block_value)
-        numel_expr = state.sympy_expr(env.block_sizes[block_id].numel)
+        if env.block_sizes[block_id].size is not None:
+            numel_expr = state.sympy_expr(env.block_sizes[block_id].numel)
+        else:
+            if begins is None:
+                begins, ends = _get_loop_bounds(state)
+            assert ends is not None
+            end_str = _ast_to_str(ends[i])
+            begin_str = _ast_to_str(begins[i])
+            if begin_str == "0":
+                numel_expr = end_str
+            else:
+                # Align begin up to block_size so pl.ds() offsets are
+                # tile-aligned on TPU.
+                aligned = f"(({begin_str} + {block_size_var} - 1) // {block_size_var} * {block_size_var})"
+                numel_expr = f"({end_str}) - ({aligned})"
         grid_parts.append(
             env.backend.cdiv_expr(numel_expr, block_size_var, is_device=True)
         )
@@ -381,13 +413,12 @@ def _pallas_loop_begin_and_step_exprs(
     state: CodegenState,
     block_ids: list[int],
     block_size_vars: list[str],
+    env: CompileEnvironment,
 ) -> tuple[list[str], list[str], list[str]]:
     """Return begin, per-iteration step, and slice-size expressions for loop dims."""
-    begins = state.proxy_arg(1)
+    ast_begins, _ = _get_loop_bounds(state)
     steps = state.proxy_arg(4) if len(state.proxy_args) > 4 else None
 
-    if not isinstance(begins, (list, tuple)):
-        begins = [begins]
     if not isinstance(steps, (list, tuple)):
         steps = [steps] * len(block_ids)
 
@@ -396,9 +427,12 @@ def _pallas_loop_begin_and_step_exprs(
     slice_size_exprs: list[str] = []
 
     for i in range(len(block_ids)):
-        begin = begins[i]
         step = steps[i]
-        begin_expr = state.sympy_expr(sympy.sympify(begin))
+        begin_expr = _ast_to_str(ast_begins[i])
+        # Align data-dependent begins up to block_size so pl.ds()
+        # offsets are tile-aligned on TPU.
+        if begin_expr != "0" and env.block_sizes[block_ids[i]].size is None:
+            begin_expr = f"(({begin_expr} + {block_size_vars[i]} - 1) // {block_size_vars[i]} * {block_size_vars[i]})"
         if step is None or sympy.sympify(step) in (
             sympy.Integer(0),
             sympy.Integer(1),
@@ -573,12 +607,26 @@ def _setup_inner_loop_masks(
 
     Returns True if any mask requires explicit indices.
     """
+    ast_begins: list[object] | None = None
+    ast_ends: list[object] | None = None
+
     needs_explicit = False
     if hasattr(strategy, "_setup_mask"):
         for i, bid in enumerate(block_ids):
             block_value = env.block_sizes[bid].from_config(state.config)
             assert isinstance(block_value, int)
-            numel_expr = state.sympy_expr(env.block_sizes[bid].numel)
+            if env.block_sizes[bid].size is not None:
+                numel_expr = state.sympy_expr(env.block_sizes[bid].numel)
+            else:
+                if ast_begins is None:
+                    ast_begins, ast_ends = _get_loop_bounds(state)
+                assert ast_ends is not None
+                end_str = _ast_to_str(ast_ends[i])
+                begin_str = _ast_to_str(ast_begins[i])
+                if begin_str == "0":
+                    numel_expr = end_str
+                else:
+                    numel_expr = f"({end_str}) - ({begin_str})"
             offset_var = state.device_function.new_var(f"offset_{bid}")
             mask_stmt = strategy._setup_mask(
                 state, bid, block_value, offset_var, numel_expr
@@ -1252,7 +1300,7 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
 
     loaded_tensors, stored_tensors = _classify_loop_tensors(graph_info, state)
     begin_exprs, iter_step_exprs, slice_size_exprs = _pallas_loop_begin_and_step_exprs(
-        state, block_ids, block_size_vars
+        state, block_ids, block_size_vars, env
     )
 
     # Build in_specs and out_specs
@@ -1431,9 +1479,10 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
     # Build block_id_to_info for the pipeline state
     block_id_to_info: dict[int, LoopDimInfo] = {}
     for block_id in block_ids:
+        block_info = env.block_sizes[block_id]
         block_id_to_info[block_id] = LoopDimInfo(
             end_var_name=None,
-            end_expr=env.block_sizes[block_id].numel,
+            end_expr=block_info.numel if block_info.size is not None else None,
         )
 
     strategy = _find_strategy(state, block_ids)
@@ -1628,7 +1677,7 @@ def _codegen_fori_loop(state: CodegenState) -> object:
 
     loaded_tensors, stored_tensors = _classify_loop_tensors(graph_info, state)
     begin_exprs, iter_step_exprs, slice_size_exprs = _pallas_loop_begin_and_step_exprs(
-        state, block_ids, block_size_vars
+        state, block_ids, block_size_vars, env
     )
 
     # --- Handle loop-carried state as scratch VMEM buffers ---
@@ -1666,6 +1715,14 @@ def _codegen_fori_loop(state: CodegenState) -> object:
         all_tensor_info, block_ids, slice_size_exprs, env, state
     )
     use_dma = _check_dma_alignment(vmem_shapes)
+
+    # Data-dependent loop bounds (block_size.size is None) produce offsets
+    # that aren't guaranteed to be tile-aligned, so DMA is unsafe.
+    if use_dma:
+        for bid in block_ids:
+            if env.block_sizes[bid].size is None:
+                use_dma = False
+                break
 
     # With DMA: tensors need HBM refs (no outer BlockSpec) because DMA
     # handles all slicing, and we register VMEM scratch buffers +
@@ -1717,9 +1774,10 @@ def _codegen_fori_loop(state: CodegenState) -> object:
     # Build block_id_to_info
     block_id_to_info: dict[int, LoopDimInfo] = {}
     for block_id in block_ids:
+        block_info = env.block_sizes[block_id]
         block_id_to_info[block_id] = LoopDimInfo(
             end_var_name=None,
-            end_expr=env.block_sizes[block_id].numel,
+            end_expr=block_info.numel if block_info.size is not None else None,
         )
 
     # Set up mask variables for inner-loop block_ids
@@ -1816,13 +1874,22 @@ def _codegen_fori_loop(state: CodegenState) -> object:
                 )
                 state.codegen.add_statement(statement_from_string(f"{copy_var}.wait()"))
         else:
-            # No DMA: emit offset assignments so pl.ds() indexing works
+            # No DMA: emit offset and index assignments so pl.ds() and
+            # tile index references work inside the loop body.
+            dtype = env.index_type()
             for i, bid in enumerate(block_ids):
                 offset_name = strategy.offset_var(bid)
+                index_name = strategy.index_var(bid)
                 state.codegen.add_statement(
                     statement_from_string(
                         f"{offset_name} = ({begin_exprs[i]}) + ({dim_idx_exprs[i]}) * ({iter_step_exprs[i]})"
                     )
+                )
+                idx_expr = env.backend.loop_index_expr(
+                    offset_name, block_size_vars[i], dtype, axis=0
+                )
+                state.codegen.add_statement(
+                    statement_from_string(f"{index_name} = {idx_expr}")
                 )
 
         # Codegen the user's body (loads/stores remapped via _tensor_to_vmem
