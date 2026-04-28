@@ -5,6 +5,7 @@ import contextlib
 import dataclasses
 import logging
 import sys
+import textwrap
 import threading
 import types
 import typing
@@ -195,6 +196,11 @@ class CompileEnvironment:
             self.config_spec.max_num_sm_multiplier = newmax
 
         self.has_barrier: bool = False
+        # Maps normalized source string -> (heuristic_values, arg_names)
+        # for triton.heuristics metadata stored during to_fake
+        self._heuristic_metadata: dict[
+            str, tuple[list[dict[str, object]], list[str]]
+        ] = {}
 
     def specialize_expr(self, expr: sympy.Expr) -> sympy.Expr:
         """Substitute any specialized vars with their concrete values."""
@@ -636,6 +642,25 @@ class CompileEnvironment:
 
             if isinstance(obj, JITFunction):
                 return user_defined_triton_kernel_transitive_closure_source_code(obj)
+
+            from triton.runtime.autotuner import Heuristics
+
+            if isinstance(obj, Heuristics):
+                from ..language.inline_triton_ops import unwrap_heuristics
+
+                inner, heuristic_values = unwrap_heuristics(obj)
+                if not isinstance(inner, JITFunction):
+                    raise exc.UnsupportedPythonType(
+                        f"triton.heuristics wrapping {type(inner).__name__}"
+                    )
+                src = user_defined_triton_kernel_transitive_closure_source_code(inner)
+                arg_names = list(inner.arg_names)
+                normalized_src = textwrap.dedent(src).strip()
+                self._heuristic_metadata[normalized_src] = (
+                    heuristic_values,
+                    arg_names,
+                )
+                return src
         # Handle functions and Kernel objects
         from ..runtime.kernel import Kernel
 

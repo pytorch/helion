@@ -21,6 +21,7 @@ from .._compiler.ast_extension import convert
 from .._compiler.ast_extension import create
 from .._compiler.ast_extension import expr_from_string
 from .._compiler.ast_extension import statement_from_string
+from .._compiler.compile_environment import CompileEnvironment
 from .._compiler.host_function import HostFunction
 from .._compiler.output_header import SOURCE_MODULE
 from . import _decorators
@@ -274,6 +275,150 @@ def _collect_output_metadata(
     )
 
 
+def unwrap_heuristics(
+    obj: object,
+) -> tuple[object, list[dict[str, object]]]:
+    """Unwrap a chain of triton.Heuristics wrappers.
+
+    Returns:
+        (inner_fn, heuristic_values_list) where inner_fn is the unwrapped
+        JITFunction (or other object) and heuristic_values_list is a list
+        of {param_name: heuristic_fn} dicts from outermost to innermost.
+    """
+    from .._utils import triton_is_available
+
+    if not triton_is_available():
+        return obj, []
+
+    from triton.runtime.autotuner import Heuristics
+
+    heuristic_values: list[dict[str, object]] = []
+    while isinstance(obj, Heuristics):
+        heuristic_values.append(obj.values)
+        obj = obj.fn
+    return obj, heuristic_values
+
+
+def _is_heuristics_wrapped(obj: object) -> bool:
+    """Check if an object is a triton.Heuristics wrapper."""
+    from .._utils import triton_is_available
+
+    if not triton_is_available():
+        return False
+
+    from triton.runtime.autotuner import Heuristics
+
+    return isinstance(obj, Heuristics)
+
+
+def _evaluate_heuristics(
+    triton_source_or_fn: object,
+    args_obj: object,
+    heuristic_values: list[dict[str, object]],
+    arg_names: list[str] | None = None,
+) -> dict[str, object]:
+    """Evaluate heuristic functions and return computed kwargs.
+
+    Processes heuristic layers from outermost to innermost, matching Triton's
+    runtime evaluation order so each layer can see previously-computed values.
+    """
+    heuristic_arg_dict: dict[str, object] = {}
+    if isinstance(args_obj, Mapping):
+        heuristic_arg_dict = dict(cast("Mapping[str, object]", args_obj))
+    elif isinstance(args_obj, Sequence) and not isinstance(args_obj, (str, bytes)):
+        if arg_names is None:
+            unwrapped_obj, _ = unwrap_heuristics(triton_source_or_fn)
+            if hasattr(unwrapped_obj, "arg_names"):
+                arg_names = list(unwrapped_obj.arg_names)
+            elif isinstance(triton_source_or_fn, str):
+                env = CompileEnvironment.current()
+                meta = env._heuristic_metadata.get(triton_source_or_fn)
+                if meta is not None:
+                    arg_names = meta[1]
+        if arg_names is not None:
+            for name, val in zip(arg_names, args_obj, strict=False):
+                heuristic_arg_dict[name] = val
+
+    heuristic_kwargs: dict[str, object] = {}
+    for values_dict in heuristic_values:
+        for key, heuristic_fn in values_dict.items():
+            combined = {**heuristic_arg_dict, **heuristic_kwargs}
+            assert callable(heuristic_fn)
+            result = heuristic_fn(combined)
+            if isinstance(result, torch.SymInt):
+                result = int(result)
+            elif isinstance(result, torch.SymFloat):
+                result = float(result)
+            elif isinstance(result, torch.SymBool):
+                result = bool(result)
+            heuristic_kwargs[key] = result
+
+    return heuristic_kwargs
+
+
+def _is_heuristics_decorator(decorator: ast.expr) -> bool:
+    """Check if an AST decorator node is @triton.heuristics(...)."""
+    if not isinstance(decorator, ast.Call):
+        return False
+    func = decorator.func
+    return (
+        isinstance(func, ast.Attribute)
+        and func.attr == "heuristics"
+        and isinstance(func.value, ast.Name)
+        and func.value.id == "triton"
+    )
+
+
+def _extract_heuristics_from_ast(
+    fn_def: ast.FunctionDef,
+) -> tuple[ast.FunctionDef, list[dict[str, object]]]:
+    """Extract @triton.heuristics decorators from a function definition AST.
+
+    Strips @triton.heuristics({...}) decorators, compiles their lambda
+    expressions into callable functions, and returns the cleaned function def
+    with a list of heuristic values dicts (top-to-bottom, outermost-first).
+    """
+    import triton
+    import triton.language as tl
+
+    heuristic_values: list[dict[str, object]] = []
+    remaining_decorators: list[ast.expr] = []
+
+    for decorator in fn_def.decorator_list:
+        if not _is_heuristics_decorator(decorator):
+            remaining_decorators.append(decorator)
+            continue
+
+        assert isinstance(decorator, ast.Call)
+        if not decorator.args:
+            remaining_decorators.append(decorator)
+            continue
+
+        dict_arg = decorator.args[0]
+        if not isinstance(dict_arg, ast.Dict):
+            remaining_decorators.append(decorator)
+            continue
+
+        values: dict[str, object] = {}
+        for key_node, val_node in zip(dict_arg.keys, dict_arg.values, strict=True):
+            if not isinstance(key_node, ast.Constant) or not isinstance(
+                key_node.value, str
+            ):
+                continue
+            # Compile the value expression into a callable
+            expr = ast.Expression(body=val_node)
+            ast.fix_missing_locations(expr)
+            code = compile(expr, "<heuristic>", "eval")
+            fn = eval(code, {"triton": triton, "tl": tl, "__builtins__": __builtins__})
+            values[key_node.value] = fn
+
+        if values:
+            heuristic_values.append(values)
+
+    fn_def.decorator_list = remaining_decorators
+    return fn_def, heuristic_values
+
+
 def _ensure_triton_jit_decorator(func_def: ast.FunctionDef) -> ast.FunctionDef:
     has_jit = any(
         (isinstance(d, ast.Attribute) and d.attr == "jit")
@@ -293,12 +438,14 @@ def _ensure_triton_jit_decorator(func_def: ast.FunctionDef) -> ast.FunctionDef:
 
 def _get_or_add_triton_function_preamble(
     state: CodegenState, triton_source_or_fn: object
-) -> str:
+) -> tuple[str, list[dict[str, object]], list[str] | None]:
     """
     Parse a @triton.jit function definition from source and add it once to the
-    device function preamble. Returns the (possibly renamed) function name to call.
+    device function preamble. Returns (function_name, heuristic_values_list, arg_names).
     """
     from triton import JITFunction
+
+    heuristic_values: list[dict[str, object]] = []
 
     if isinstance(triton_source_or_fn, str):
         candidate = textwrap.dedent(triton_source_or_fn).strip()
@@ -315,6 +462,7 @@ def _get_or_add_triton_function_preamble(
             module_obj = hf.global_imports[SOURCE_MODULE].value
             module_scope = cast("dict[str, object]", module_obj.__dict__)
             fn_obj = module_scope[candidate]
+            fn_obj, heuristic_values = unwrap_heuristics(fn_obj)
             func_obj = fn_obj if inspect.isfunction(fn_obj) else fn_obj.fn  # type: ignore[attr-defined]
             func_obj_typed: FunctionType = cast("FunctionType", func_obj)
             jit_fn = (
@@ -328,9 +476,12 @@ def _get_or_add_triton_function_preamble(
         else:
             src = candidate
             base_name_hint = None
+            env = CompileEnvironment.current()
+            if src in env._heuristic_metadata:
+                heuristic_values = env._heuristic_metadata[src][0]
     else:
-        # Expect a function object (already unwrapped by to_fake)
         func_obj = triton_source_or_fn
+        func_obj, heuristic_values = unwrap_heuristics(func_obj)
         func_obj_typed: FunctionType = cast("FunctionType", func_obj)
         assert isinstance(func_obj, JITFunction)
         src = user_defined_triton_kernel_transitive_closure_source_code(func_obj)
@@ -350,7 +501,22 @@ def _get_or_add_triton_function_preamble(
         raise exc.InvalidAPIUsage(
             "triton_kernel expects at least one function definition"
         )
-    fn_def = cast("ast.FunctionDef", convert(func_defs[0]))
+    raw_fn_def = func_defs[0]
+
+    raw_fn_def, ast_heuristic_values = _extract_heuristics_from_ast(raw_fn_def)
+    if ast_heuristic_values:
+        if heuristic_values:
+            raise exc.InvalidAPIUsage(
+                "triton_kernel source contains @triton.heuristics decorators, "
+                "but heuristic metadata was also provided via a Heuristics wrapper"
+            )
+        heuristic_values = ast_heuristic_values
+
+    parsed_arg_names: list[str] | None = None
+    if heuristic_values:
+        parsed_arg_names = [arg.arg for arg in raw_fn_def.args.args]
+
+    fn_def = cast("ast.FunctionDef", convert(raw_fn_def))
     fn_def = _ensure_triton_jit_decorator(fn_def)
 
     # Cache to avoid duplicate definitions
@@ -365,7 +531,7 @@ def _get_or_add_triton_function_preamble(
 
     key = f"{parsed_name}:{src}"
     if key in added:
-        return added[key]
+        return added[key], heuristic_values, parsed_arg_names
 
     # Ensure uniqueness of function name in module scope
     unique_name = state.device_function.new_var(parsed_name)
@@ -387,7 +553,7 @@ def _get_or_add_triton_function_preamble(
 
     added[key] = unique_name
     setattr(state.device_function, cache_name, added)
-    return unique_name
+    return unique_name, heuristic_values, parsed_arg_names
 
 
 def _emit_output_assertions(
@@ -536,10 +702,13 @@ def _(
     output_like: object,
 ) -> object:
     if not (
-        isinstance(triton_source_or_fn, str) or inspect.isfunction(triton_source_or_fn)
+        isinstance(triton_source_or_fn, str)
+        or inspect.isfunction(triton_source_or_fn)
+        or _is_heuristics_wrapped(triton_source_or_fn)
     ):
         raise exc.InvalidAPIUsage(
-            f"triton_kernel expects a string source or a function, got {type(triton_source_or_fn)}"
+            f"triton_kernel expects a string source, function, or "
+            f"@triton.heuristics-wrapped function, got {type(triton_source_or_fn)}"
         )
     _validate_args(args)
     return _fake_outputs(output_like)
@@ -552,15 +721,19 @@ def _(state: CodegenState) -> ast.AST | list[ast.AST]:
     output_like = state.proxy_arg(2)
 
     if not (
-        isinstance(triton_source_or_fn, str) or inspect.isfunction(triton_source_or_fn)
+        isinstance(triton_source_or_fn, str)
+        or inspect.isfunction(triton_source_or_fn)
+        or _is_heuristics_wrapped(triton_source_or_fn)
     ):
         raise exc.InvalidAPIUsage(
-            f"triton_kernel expects a string source or a function, got {type(triton_source_or_fn)}"
+            f"triton_kernel expects a string source, function, or "
+            f"@triton.heuristics-wrapped function, got {type(triton_source_or_fn)}"
         )
     _validate_args(args_obj)
 
-    # Install the Triton function into preamble (once) and get the callable name
-    fn_name = _get_or_add_triton_function_preamble(state, triton_source_or_fn)
+    fn_name, heuristic_values, heuristic_arg_names = (
+        _get_or_add_triton_function_preamble(state, triton_source_or_fn)
+    )
 
     # Resolve argument names similar to inline_triton formatting
     call_args_src = ""
@@ -587,6 +760,17 @@ def _(state: CodegenState) -> ast.AST | list[ast.AST]:
             )
         ]
         call_args_src = ", ".join(names)
+
+    if heuristic_values:
+        heuristic_kwargs = _evaluate_heuristics(
+            triton_source_or_fn, args_obj, heuristic_values, heuristic_arg_names
+        )
+        heuristic_pairs = [f"{k}={v!r}" for k, v in heuristic_kwargs.items()]
+        if heuristic_pairs:
+            if call_args_src:
+                call_args_src += ", " + ", ".join(heuristic_pairs)
+            else:
+                call_args_src = ", ".join(heuristic_pairs)
 
     call_expr = expr_from_string(f"{fn_name}({call_args_src})")
 
