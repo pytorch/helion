@@ -348,6 +348,15 @@ def min_dot_size(
     return _min_dot_size(device, lhs, rhs)
 
 
+@functools.cache
+def is_sm90() -> bool:
+    """Return True if the current CUDA device is H100 (sm_90)."""
+    if not torch.cuda.is_available():
+        return False
+    major, minor = torch.cuda.get_device_capability(torch.cuda.current_device())
+    return major == 9 and minor == 0
+
+
 def is_hip() -> bool:
     """Check if the current device uses the HIP (AMD ROCm) backend."""
     return _is_hip()

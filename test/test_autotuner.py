@@ -2284,6 +2284,107 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
 
 
 @onlyBackends(["triton"])
+class TestTritonIMA(RefEagerTestDisabled, TestCase):
+    def test_two_dot_batch_loop_ima(self):
+        """Test workaround for Triton shared-memory IMA with two tl.dot ops.
+
+        Triton has a shared-memory bug on H100 (sm_90) when 2+ tl.dot ops
+        coexist in a kernel with a batch loop: K block sizes of 16 or 32
+        cause IMA or silent corruption.  K_bs=8 and K_bs>=64 are safe.
+
+        The workaround in enforce_dot_requirements() detects the two-dot
+        pattern and constrains K block sizes to skip the broken range.
+        """
+
+        @helion.kernel(static_shapes=True)
+        def two_dot_bwd(
+            x: torch.Tensor,
+            A: torch.Tensor,
+            B: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            Batch, N, M = x.size()
+            K = A.size(0)
+            out1 = torch.empty((Batch, N, K), device=x.device, dtype=x.dtype)
+            out2 = torch.empty((Batch, M, K), device=x.device, dtype=x.dtype)
+            for tile_b in hl.tile(Batch, block_size=1):
+                # dot 1: x[N,M] @ A[K,M].T -> out1[N,K]
+                for tile_n, tile_k in hl.tile([N, K]):
+                    acc = hl.zeros([tile_n, tile_k], dtype=torch.float32)
+                    for tile_m in hl.tile(M):
+                        acc = torch.addmm(
+                            acc,
+                            x[tile_b.begin, tile_n, tile_m],
+                            A[tile_k, tile_m].t(),
+                        )
+                    out1[tile_b.begin, tile_n, tile_k] = acc.to(x.dtype)
+                # dot 2: x[N,M].T @ B[N,K] -> out2[M,K]
+                for tile_m2, tile_k2 in hl.tile([M, K]):
+                    acc2 = hl.zeros([tile_m2, tile_k2], dtype=torch.float32)
+                    for tile_n2 in hl.tile(N):
+                        acc2 = torch.addmm(
+                            acc2,
+                            x[tile_b.begin, tile_n2, tile_m2].t(),
+                            B[tile_n2, tile_k2],
+                        )
+                    out2[tile_b.begin, tile_m2, tile_k2] = acc2.to(x.dtype)
+            return out1, out2
+
+        K, N, M = 48, 192, 128
+        x = torch.randn(2, N, M, device=DEVICE, dtype=torch.bfloat16)
+        A = torch.randn(K, M, device=DEVICE, dtype=torch.bfloat16)
+        B = torch.randn(N, K, device=DEVICE, dtype=torch.bfloat16)
+        args = (x, A, B)
+
+        # block_sizes: [N, K(dot1), M(dot1-red), M(dot2), K(dot2), N(dot2-red)]
+        # good_config: K_bs=8 avoids the Triton shared-memory bug.
+        good_config = helion.Config(
+            block_sizes=[64, 8, 64, 64, 8, 64],
+            indexing="pointer",
+            num_stages=1,
+            num_warps=4,
+        )
+        # bad_config: K_bs=16 would trigger IMA on H100 without the
+        # workaround.  The constraint caps K_bs to 8 on sm_90, so
+        # this config becomes equivalent to good_config.
+        bad_config = helion.Config(
+            block_sizes=[64, 16, 64, 64, 16, 64],
+            indexing="pointer",
+            num_stages=1,
+            num_warps=4,
+        )
+
+        bound = two_dot_bwd.bind(args)
+        search = FiniteSearch(bound, args, configs=[good_config, bad_config])
+        winner = search.autotune()
+
+        # On H100 (sm_90), K_bs should be capped to 8 (not 16 or 32).
+        # On other GPUs the constraint is not applied.
+        if _compat.is_sm90():
+            k_bs_values = [winner.block_sizes[1], winner.block_sizes[4]]
+            for k_bs in k_bs_values:
+                self.assertTrue(
+                    k_bs <= 8 or k_bs >= 64,
+                    f"K_bs={k_bs} is in the broken range [16, 32]",
+                )
+
+        compiled = bound.compile_config(winner)
+        out1, out2 = compiled(*args)
+        self.assertTrue(torch.isfinite(out1).all())
+        self.assertTrue(torch.isfinite(out2).all())
+
+        # Verify correctness against PyTorch reference
+        ref_out1 = torch.bmm(
+            x.float(), A.float().t().unsqueeze(0).expand(2, -1, -1)
+        ).to(x.dtype)
+        ref_out2 = torch.bmm(
+            x.float().transpose(-2, -1),
+            B.float().unsqueeze(0).expand(2, -1, -1),
+        ).to(x.dtype)
+        torch.testing.assert_close(out1, ref_out1, atol=1e-1, rtol=1e-1)
+        torch.testing.assert_close(out2, ref_out2, atol=1e-1, rtol=1e-1)
+
+
+@onlyBackends(["triton"])
 class TestAutotuneRandomSeed(RefEagerTestDisabled, TestCase):
     def _autotune_and_record(self, **settings: object) -> float:
         search_capture: dict[str, RecordingRandomSearch] = {}

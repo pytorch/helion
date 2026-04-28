@@ -8,6 +8,7 @@ import torch
 from torch._subclasses.fake_tensor import FakeTensor
 
 from .. import exc
+from .._compat import is_sm90
 from .._compat import min_dot_size
 from .._compiler.compile_environment import CompileEnvironment
 from .._compiler.compile_environment import format_shape
@@ -198,6 +199,31 @@ def _(
     return (mat1, mat2, acc, out_dtype)
 
 
+def _apply_two_dot_k_constraint(env: CompileEnvironment, k_block_idx: int) -> None:
+    """Skip K_bs in {16, 32} for two-dot kernels on H100.
+
+    Triton has a shared-memory bug on H100 (sm_90) when 2+ tl.dot ops
+    coexist in a kernel: K block sizes of 16 and 32 cause IMA or silent
+    data corruption.  K_bs=8 and K_bs>=64 are safe.
+
+    If K >= 64, set min to 64 (skip 16/32, keep 64+).
+    If K < 64, set max to 8 (only safe option).
+    """
+    spec = env.config_spec
+    try:
+        block_spec = spec.block_sizes.block_id_lookup(k_block_idx)
+    except KeyError:
+        return
+    if block_spec.size_hint >= 64:
+        block_spec.update_min(64)
+    else:
+        # K_bs=8 is the only safe option below 64; override min_dot_size
+        # which may have already set min_size=16.
+        block_spec.min_size = min(block_spec.min_size, 8)
+        block_spec.autotuner_min = min(block_spec.autotuner_min, 8)
+        block_spec.update_max(8)
+
+
 def enforce_dot_requirements(lhs: torch.Tensor, rhs: torch.Tensor) -> None:
     """Update config-spec min/max sizes for a dot/matmul.
 
@@ -231,6 +257,19 @@ def enforce_dot_requirements(lhs: torch.Tensor, rhs: torch.Tensor) -> None:
                 except KeyError:
                     pass
             env.block_sizes[block_idx].update_min_block(min_size, allow_flattened=True)
+
+    # Track K block_ids for the two-dot IMA workaround.
+    k_block_idx = env.get_block_id(k)
+    if k_block_idx is not None:
+        env._dot_k_block_ids.append(k_block_idx)
+
+    # Triton has a shared-memory bug on H100 (sm_90) when 2+ tl.dot ops
+    # coexist in a kernel: K block sizes of 16 and 32 cause IMA or silent
+    # corruption.  K_bs=8 and K_bs>=64 are safe.
+    # See sweep_two_dot_ima.py for empirical data.
+    if len(env._dot_k_block_ids) >= 2 and is_sm90():
+        for k_id in env._dot_k_block_ids:
+            _apply_two_dot_k_constraint(env, k_id)
 
     # Triton only supports 2D dot operations.  When the operands are 3D
     # (batched matmul), constrain the batch dimension block size to 1 so
