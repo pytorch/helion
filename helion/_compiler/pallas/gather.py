@@ -25,7 +25,7 @@ _GATHER_VMEM_THRESHOLD_BYTES: int = 16 << 20  # 16 MiB
 
 @dataclass(frozen=True)
 class GatherPlan:
-    vocab_size: int
+    gather_axis_size: int
     indirect_pos: int
     none_dims: tuple[int, ...]
     jnp_dtype: str
@@ -54,14 +54,17 @@ def build_gather_plan(
             f"Pallas gather: table must be floating point, got {tensor.dtype}"
         )
 
-    vocab_size = tensor.shape[0]
+    gather_axis_size = tensor.shape[0]
     numel = tensor.numel()
-    if not isinstance(vocab_size, int) or not isinstance(numel, int):
+    if not isinstance(gather_axis_size, int) or not isinstance(numel, int):
         raise NotImplementedError(
             "Pallas gather: dynamic-shape tables are not supported; "
             "use @helion.kernel(static_shapes=True)"
         )
 
+    # TODO(thcmbs): conservative bound. Tiling on broadcast dims would shrink
+    # the actual VMEM block, so this rejects configurations that would fit.
+    # Replace with real VMEM accounting once available.
     table_bytes = numel * tensor.dtype.itemsize
     if table_bytes > _GATHER_VMEM_THRESHOLD_BYTES:
         raise NotImplementedError(
@@ -78,7 +81,7 @@ def build_gather_plan(
     jnp_dtype = CompileEnvironment.current().backend.dtype_str(tensor.dtype)
 
     return GatherPlan(
-        vocab_size=vocab_size,
+        gather_axis_size=gather_axis_size,
         indirect_pos=indirect_pos,
         none_dims=none_dims,
         jnp_dtype=jnp_dtype,
@@ -88,7 +91,6 @@ def build_gather_plan(
 
 def emit_gather(
     state: CodegenState,
-    subscript: list[object] | tuple[object, ...],
     plan: GatherPlan,
     name: str,
 ) -> ast.AST:
@@ -98,9 +100,8 @@ def emit_gather(
     HIGHEST and fp32 one_hot; bf16/fp16 stay in the table dtype (MXU truncation
     is a no-op and we avoid a VMEM upcast).
 
-    Contracting dim is ``jnp.ndim(idx)``: one_hot adds one trailing vocab axis.
+    Contracting dim is ``jnp.ndim(idx)``: one_hot adds one trailing axis.
     """
-    del subscript  # only plan.indirect_pos/none_dims are used
     ast_subscripts = state.ast_args[1]
     assert isinstance(ast_subscripts, list)
     ast_idx = ast_subscripts[plan.indirect_pos]
@@ -118,7 +119,7 @@ def emit_gather(
 
     result = expr_from_string(
         f"jax.lax.dot_general("
-        f"jax.nn.one_hot({idx_name}[...], {plan.vocab_size}, dtype={oh_dtype}), "
+        f"jax.nn.one_hot({idx_name}[...], {plan.gather_axis_size}, dtype={oh_dtype}), "
         f"{table_expr}, "
         f"(((jnp.ndim({idx_name}[...]),), (0,)), ((), ())), "
         f"preferred_element_type=jnp.float32, "

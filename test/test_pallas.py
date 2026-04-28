@@ -1395,7 +1395,8 @@ class TestPallasIndirectGather(TestCase):
         code, result = code_and_output(gather, (indices, table), block_sizes=[128, 64])
         self.assertIn("one_hot", code)
         self.assertIn("HIGHEST", code)
-        torch.testing.assert_close(result.cpu(), table.cpu()[indices.long().cpu()])
+        ref = table.cpu()[indices.long().cpu()].to(device=DEVICE)
+        torch.testing.assert_close(result, ref)
 
     def test_gather_bf16_skips_highest(self) -> None:
         gather = self._gather_2d_kernel()
@@ -1405,7 +1406,8 @@ class TestPallasIndirectGather(TestCase):
         self.assertIn("one_hot", code)
         self.assertNotIn("HIGHEST", code)
         self.assertNotIn("astype(jnp.float32)", code)
-        torch.testing.assert_close(result.cpu(), table.cpu()[indices.long().cpu()])
+        ref = table.cpu()[indices.long().cpu()].to(device=DEVICE)
+        torch.testing.assert_close(result, ref)
 
     def test_gather_2d_index_tile(self) -> None:
         """Regression: 2D index tile must contract the last axis, not axis 1."""
@@ -1429,7 +1431,8 @@ class TestPallasIndirectGather(TestCase):
             gather, (indices, table), block_sizes=[8, 128, 128]
         )
         self.assertIn("one_hot", code)
-        torch.testing.assert_close(result.cpu(), table.cpu()[indices.long().cpu()])
+        ref = table.cpu()[indices.long().cpu()].to(device=DEVICE)
+        torch.testing.assert_close(result, ref)
 
     def test_gather_over_vmem_budget_raises(self) -> None:
         """Table above VMEM budget fails fast with a clear message."""
@@ -1438,6 +1441,23 @@ class TestPallasIndirectGather(TestCase):
         indices = torch.randint(0, 65537, (256,), device=DEVICE, dtype=torch.int32)
         with self.assertRaisesRegex(Exception, "exceeds the .* VMEM threshold"):
             code_and_output(gather, (indices, table), block_sizes=[128, 64])
+
+    @xfailIfPallas(
+        "VMEM budget check uses full tensor.numel() instead of per-dim block sizes"
+    )
+    def test_gather_vmem_budget_uses_block_size(self) -> None:
+        """xfail: tiling broadcast dims should shrink the VMEM block.
+
+        The check today uses full ``tensor.numel()``, so configs that would
+        actually fit in VMEM after tiling are rejected. Will pass once the
+        VMEM accounting accounts for per-dim block sizes (TODO in gather.py).
+        """
+        gather = self._gather_2d_kernel()
+        # Full table = 8192 * 1024 * 4 = 32 MiB (over the 16 MiB limit).
+        # Real VMEM block with BE=256 = 8192 * 256 * 4 = 8 MiB, fits.
+        table = torch.randn(8192, 1024, device=DEVICE, dtype=torch.float32)
+        indices = torch.randint(0, 8192, (256,), device=DEVICE, dtype=torch.int32)
+        code_and_output(gather, (indices, table), block_sizes=[128, 256])
 
     def test_gather_integer_table_rejected(self) -> None:
         """Gather on non-floating tables raises at plan time."""
@@ -1476,24 +1496,16 @@ class TestPallasIndirectGather(TestCase):
             code_and_output(scatter, (out, values, indices), block_sizes=[8, 64])
 
     def test_gather_1d_index_bumps_block_to_tpu_alignment(self) -> None:
-        """Nested ``idx[tile]`` inside a gather must still trigger 1D alignment.
-
-        The host-side alignment analyzer walks subscripts; when the index
-        tensor appears only as a nested subscript (``table[idx[tile], :]``),
-        the analyzer must still visit it. Without this, the 1D int32 index
-        keeps a user-requested block=8, the kernel emits an unaligned
-        ``pl.ds(offset, 8)`` on a 1D ref, and Mosaic rejects it with E2003.
-        """
+        """Block size on a 1D int32 index must be bumped to 128."""
         gather = self._gather_2d_kernel()
         table = torch.randn(1024, 256, device=DEVICE, dtype=torch.bfloat16)
         indices = torch.randint(0, 1024, (1024,), device=DEVICE, dtype=torch.int32)
-        # User asks for BN=8 on the 1D int32 index; the analyzer must bump
-        # it to 128 so the emitted slice is sub-lane-aligned.
+        # If the bump didn't happen, the generated code would slice with
+        # `pl.ds(offset_0, 8)`. That string must not appear.
         code, result = code_and_output(gather, (indices, table), block_sizes=[8, 64])
         self.assertNotIn("pl.ds(offset_0, 8)", code)
-        torch.testing.assert_close(
-            result.cpu(), table.cpu()[indices.long().cpu()], rtol=1e-2, atol=1e-2
-        )
+        ref = table.cpu()[indices.long().cpu()].to(device=DEVICE)
+        torch.testing.assert_close(result, ref, rtol=1e-2, atol=1e-2)
 
 
 if __name__ == "__main__":

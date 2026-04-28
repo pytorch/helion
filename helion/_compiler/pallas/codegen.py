@@ -1,8 +1,4 @@
-"""Pallas indexing codegen.
-
-Public entry points for ``hl.load``/``hl.store`` and atomic ops:
-``load_expr``, ``index_str``, ``vmem_name``.
-"""
+"""Pallas indexing codegen helpers."""
 
 from __future__ import annotations
 
@@ -36,7 +32,7 @@ def load_expr(
     patterns = state.fx_node.meta.get("indexing_patterns") or ()
     for pattern in patterns:
         if isinstance(pattern, IndirectGatherPattern):
-            return emit_gather(state, subscript, pattern.plan, name)
+            return emit_gather(state, pattern.plan, name)
 
     idx_str, none_dims = index_str(state, subscript, tensor)
     result = expr_from_string(f"{name}[{idx_str}]")
