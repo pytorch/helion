@@ -990,17 +990,17 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         except Exception as e:
             e.__traceback__ = None
             if match_unrecoverable_runtime_error(e):
-                # Subprocess already killed itself via BenchmarkWorker's sticky
-                # check; surface to the caller the same way the in-process
-                # path does so autotuning aborts.
-                self.kernel.maybe_log_repro(self.log.error, self.args, config)
-                raise exc.TritonUnrecoverableRuntimeError(
-                    reason=str(e),
-                    decorator=self.kernel.format_kernel_decorator(
-                        config, self.settings
-                    ),
-                    error=f"{type(e).__qualname__}: {e}",
-                ) from e
+                # Worker is already killed; parent CUDA is unaffected.
+                # Skip this config and continue the search.
+                decorator = self.kernel.format_kernel_decorator(config, self.settings)
+                self.log.warning(
+                    f"Skipping config that triggered an unrecoverable runtime "
+                    f"error in the benchmark subprocess: "
+                    f"{type(e).__qualname__}: {e}\n  Config: {decorator}"
+                )
+                self.kernel.maybe_log_repro(self.log.warning, self.args, config)
+                self._autotune_metrics.num_compile_failures += 1
+                return inf
             self.log.debug(
                 f"Benchmark subprocess raised for {config!r}: {type(e).__name__}: {e}"
             )
