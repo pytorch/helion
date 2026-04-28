@@ -628,6 +628,7 @@ class PopulationBasedSearch(BaseSearch):
         super().__init__(kernel, args)
         self.finishing_rounds = finishing_rounds
         self.population: list[PopulationMember] = []
+        self._pool_final_rebenchmark_archive: dict[Config, PopulationMember] = {}
         self._best_available_seed_configs: list[Config] = []
         self.config_gen: ConfigGeneration = self.config_spec.create_config_generation(
             overrides=self.settings.autotune_config_overrides or None,
@@ -668,6 +669,134 @@ class PopulationBasedSearch(BaseSearch):
         """Replace the current best member in the population."""
         idx = min(range(len(self.population)), key=lambda i: self.population[i].perf)
         self.population[idx] = value
+
+    @staticmethod
+    def _first_finite_perf(member: PopulationMember) -> float:
+        for perf in member.perfs:
+            if math.isfinite(perf):
+                return perf
+        return inf
+
+    @staticmethod
+    def _median3(a: float, b: float, c: float) -> float:
+        return sorted((a, b, c))[1]
+
+    @staticmethod
+    def _pool_suspicious_rebenchmark_ratio() -> float:
+        value = os.getenv("HELION_AUTOTUNE_POOL_SUSPICIOUS_REBENCHMARK_RATIO")
+        if value is None or value.strip() == "":
+            return 0.85
+        return float(value)
+
+    @staticmethod
+    def _pool_final_rebenchmark_top_k() -> int:
+        value = os.getenv("HELION_AUTOTUNE_POOL_FINAL_REBENCHMARK_TOP_K")
+        if value is None or value.strip() == "":
+            return 8
+        return int(value)
+
+    def _pool_final_rebenchmark_archive_size(self) -> int:
+        top_k = self._pool_final_rebenchmark_top_k()
+        value = os.getenv("HELION_AUTOTUNE_POOL_FINAL_REBENCHMARK_ARCHIVE_SIZE")
+        if value is None or value.strip() == "":
+            return max(64, top_k * 4)
+        return max(top_k, int(value))
+
+    def _record_pool_final_rebenchmark_candidates(
+        self,
+        members: Sequence[PopulationMember],
+    ) -> None:
+        if self.settings.autotune_precompile != "pool":
+            return
+        archive_size = self._pool_final_rebenchmark_archive_size()
+        if archive_size <= 0:
+            return
+        for member in members:
+            raw_perf = self._first_finite_perf(member)
+            if not math.isfinite(raw_perf):
+                continue
+            prior = self._pool_final_rebenchmark_archive.get(member.config)
+            if prior is None or raw_perf < self._first_finite_perf(prior):
+                self._pool_final_rebenchmark_archive[member.config] = member
+        if len(self._pool_final_rebenchmark_archive) <= archive_size:
+            return
+        keep = sorted(
+            self._pool_final_rebenchmark_archive.values(),
+            key=self._first_finite_perf,
+        )[:archive_size]
+        self._pool_final_rebenchmark_archive = {
+            member.config: member for member in keep
+        }
+
+    def _confirm_suspicious_pool_rebenchmarks(
+        self,
+        members: list[PopulationMember],
+        timings: list[float],
+        *,
+        desc: str,
+    ) -> list[float]:
+        if self.settings.autotune_precompile != "pool":
+            return timings
+        ratio = self._pool_suspicious_rebenchmark_ratio()
+        if ratio <= 0:
+            return timings
+
+        suspicious: list[int] = []
+        for i, (member, timing) in enumerate(zip(members, timings, strict=True)):
+            raw_perf = self._first_finite_perf(member)
+            if not math.isfinite(raw_perf) or not math.isfinite(timing):
+                continue
+            if timing < ratio * raw_perf:
+                suspicious.append(i)
+        if not suspicious:
+            return timings
+
+        confirm_timings = self.benchmark_provider.confirm_rebenchmark(
+            [members[i].fn for i in suspicious],
+            desc=f"{desc}: confirming suspicious timings",
+        )
+        if confirm_timings is None:
+            return timings
+
+        timings = [*timings]
+        confirmed = 0
+        for i, confirm_timing in zip(suspicious, confirm_timings, strict=True):
+            raw_perf = self._first_finite_perf(members[i])
+            if math.isfinite(confirm_timing):
+                timings[i] = self._median3(raw_perf, timings[i], confirm_timing)
+                confirmed += 1
+            else:
+                timings[i] = raw_perf
+        self.log.debug(
+            f"{desc}: confirmed {confirmed}/{len(suspicious)} suspicious pool rebenchmark timing(s)"
+        )
+        return timings
+
+    def final_rebenchmark_top_k(self, fallback: PopulationMember) -> PopulationMember:
+        """Final pool-only verification over the best archived raw candidates."""
+        if self.settings.autotune_precompile != "pool":
+            return fallback
+        top_k = self._pool_final_rebenchmark_top_k()
+        if top_k <= 0:
+            return fallback
+
+        candidates_by_config = dict(self._pool_final_rebenchmark_archive)
+        candidates_by_config[fallback.config] = fallback
+        candidates = sorted(
+            candidates_by_config.values(),
+            key=lambda member: (self._first_finite_perf(member), member.perf),
+        )[:top_k]
+        if len(candidates) < 2:
+            return fallback
+
+        self.rebenchmark(
+            candidates, desc=f"Final pool verification top-{len(candidates)}"
+        )
+        best = min(candidates, key=performance)
+        self.log.debug(
+            f"Final pool verification selected {best.config!r} at {best.perf:.6f}ms"
+        )
+        return best
 
     def benchmark_flat(self, flat_values: FlatConfig) -> PopulationMember:
         """
@@ -838,6 +967,7 @@ class PopulationBasedSearch(BaseSearch):
             member.fn = result.fn
             member.status = result.status
             member.compile_time = result.compile_time
+        self._record_pool_final_rebenchmark_candidates(members)
         return members
 
     def compare(self, a: PopulationMember, b: PopulationMember) -> int:
@@ -892,29 +1022,45 @@ class PopulationBasedSearch(BaseSearch):
         repeat = min(1000, max(3, base_repeat))
         if (capstr := os.getenv("HELION_CAP_REBENCHMARK_REPEAT")) is not None:
             repeat = min(repeat, int(capstr))
-        if len(self.benchmark_provider.mutated_arg_indices) > 0:
-            bench_args = _clone_args(
-                self.args,
-                self.kernel.env.process_group_name,
-                idx_to_clone=self.benchmark_provider.mutated_arg_indices,
-            )
-        else:
-            bench_args = self.args
-        iterator = [functools.partial(m.fn, *bench_args) for m in members]
-        _backend = getattr(getattr(self, "config_spec", None), "backend", None)
-        _ib = (
-            _backend.get_interleaved_bench() if _backend is not None else None
-        ) or interleaved_bench
-        bench_fn: Callable[..., list[float]] = (
-            self.settings.autotune_benchmark_fn or _ib
+        provider_timings = self.benchmark_provider.rebenchmark(
+            [m.fn for m in members],
+            repeat=repeat,
+            desc=desc,
         )
-        if self.settings.autotune_progress_bar:
-            new_timings = bench_fn(iterator, repeat=repeat, desc=desc)
+        if provider_timings is None:
+            if len(self.benchmark_provider.mutated_arg_indices) > 0:
+                bench_args = _clone_args(
+                    self.args,
+                    self.kernel.env.process_group_name,
+                    idx_to_clone=self.benchmark_provider.mutated_arg_indices,
+                )
+            else:
+                bench_args = self.args
+            iterator = [functools.partial(m.fn, *bench_args) for m in members]
+            _backend = getattr(getattr(self, "config_spec", None), "backend", None)
+            _ib = (
+                _backend.get_interleaved_bench() if _backend is not None else None
+            ) or interleaved_bench
+            bench_fn: Callable[..., list[float]] = (
+                self.settings.autotune_benchmark_fn or _ib
+            )
+            if self.settings.autotune_progress_bar:
+                new_timings = bench_fn(iterator, repeat=repeat, desc=desc)
+            else:
+                new_timings = bench_fn(iterator, repeat=repeat)
+        elif not provider_timings:
+            return
         else:
-            new_timings = bench_fn(iterator, repeat=repeat)
+            new_timings = provider_timings
         new_timings = sync_object(
             new_timings, process_group_name=self.kernel.env.process_group_name
         )
+        if provider_timings is not None:
+            new_timings = self._confirm_suspicious_pool_rebenchmarks(
+                members,
+                list(new_timings),
+                desc=desc,
+            )
         for m, t in zip(members, new_timings, strict=True):
             m.perfs.append(t)
             if t < self.best_perf_so_far:

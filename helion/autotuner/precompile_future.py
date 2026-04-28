@@ -3,6 +3,8 @@ from __future__ import annotations
 import collections
 import contextlib
 import dataclasses
+import functools
+import hashlib
 import inspect
 import multiprocessing as mp
 from multiprocessing import connection
@@ -20,7 +22,6 @@ from typing import Iterable
 from typing import Literal
 from typing import NoReturn
 from typing import cast
-import uuid
 
 import torch
 
@@ -144,20 +145,46 @@ def _serialize_compiled_fn(fn: CompiledConfig) -> SerializedCompiledFunction:
 
 
 def _load_compiled_fn(fn_spec: SerializedCompiledFunction) -> CompiledConfig:
-    module_name = f"_helion_autotune_subprocess_{uuid.uuid4().hex}"
-    module = types.ModuleType(module_name)
-    module.__file__ = fn_spec.filename or "<helion-autotune-subprocess>"
-    module.__loader__ = None
-    module.__package__ = None
-    sys.modules[module_name] = module
-    exec(
-        compile(fn_spec.source_code, module.__file__, "exec"),
-        module.__dict__,
+    return _load_compiled_fn_cached(
+        fn_spec.function_name,
+        fn_spec.source_code,
+        fn_spec.filename,
+        fn_spec.module_name,
     )
-    fn = getattr(module, fn_spec.function_name, None)
+
+
+@functools.lru_cache(maxsize=256)
+def _load_compiled_fn_cached(
+    function_name: str,
+    source_code: str,
+    filename: str | None,
+    source_module_name: str | None,
+) -> CompiledConfig:
+    digest = hashlib.sha256()
+    digest.update(function_name.encode("utf-8"))
+    digest.update(b"\0")
+    digest.update((filename or "").encode("utf-8"))
+    digest.update(b"\0")
+    digest.update((source_module_name or "").encode("utf-8"))
+    digest.update(b"\0")
+    digest.update(source_code.encode("utf-8"))
+    module_name = f"_helion_autotune_subprocess_{digest.hexdigest()}"
+    if module_name in sys.modules:
+        module = sys.modules[module_name]
+    else:
+        module = types.ModuleType(module_name)
+        module.__file__ = filename or "<helion-autotune-subprocess>"
+        module.__loader__ = None
+        module.__package__ = None
+        sys.modules[module_name] = module
+        exec(
+            compile(source_code, module.__file__, "exec"),
+            module.__dict__,
+        )
+    fn = getattr(module, function_name, None)
     if fn is None:
         raise RuntimeError(
-            f"Unable to locate compiled kernel '{fn_spec.function_name}' in generated module"
+            f"Unable to locate compiled kernel '{function_name}' in generated module"
         )
     return fn
 
@@ -172,7 +199,10 @@ def _run_kernel_in_subprocess_spawn(
     _cap: list[str] = [""]
     try:
         fn = _load_compiled_fn(fn_spec)
-        args = torch.load(args_path)
+        # The args file is created by the current autotune run in a private
+        # TemporaryDirectory. It may legitimately contain callable kernel args
+        # such as matmul epilogues, which PyTorch's weights_only loader rejects.
+        args = torch.load(args_path, weights_only=False)
         assert isinstance(args, (tuple, list))
         synchronize_device(None)
         with capture_output() as _cap:
@@ -394,6 +424,10 @@ class PrecompileFuture:
         mode = ctx.settings.autotune_precompile
         decorator = ctx.kernel.format_kernel_decorator(config, ctx.settings)
 
+        if mode == "pool":
+            raise exc.InvalidAPIUsage(
+                "autotune_precompile='pool' is handled by the benchmark worker pool"
+            )
         if mode == "spawn":
             mp_ctx = mp.get_context("spawn")
             assert args_path is not None

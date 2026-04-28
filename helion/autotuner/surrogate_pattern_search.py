@@ -482,7 +482,8 @@ class LFBOPatternSearch(PatternSearch):
                 self._fit_surrogate()
 
         # Run finishing phase to simplify the best configuration
-        best = self.run_finishing_phase(self.best, self.finishing_rounds)
+        best = self.final_rebenchmark_top_k(self.best)
+        best = self.run_finishing_phase(best, self.finishing_rounds)
         return best.config
 
     def _generate_neighbors(self, base: FlatConfig) -> list[FlatConfig]:
