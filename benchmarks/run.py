@@ -181,6 +181,7 @@ KERNEL_MAPPINGS: dict[str, tuple[str, ...]] = {
         "rms_norm_tritonbench",
         {
             "num_inputs": 5,  # rms_norm-bwd has 6 inputs total but last input raises Triton OOM at default config: https://github.com/pytorch/helion/issues/711
+            "remove_flags": ["--cudagraph"],
         },
     ),
     "sum": ("tritonbench.operators.sum.operator", "examples.sum", "sum_tritonbench"),
@@ -242,6 +243,7 @@ KERNEL_MAPPINGS: dict[str, tuple[str, ...]] = {
         "layer_norm_tritonbench",
         {
             "num_inputs": 10,  # layer_norm-bwd takes long time on Benchmark CI, so use fewer inputs instead.
+            "remove_flags": ["--cudagraph"],
         },
     ),
     "jagged_softmax": (
