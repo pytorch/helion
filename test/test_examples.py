@@ -21,6 +21,7 @@ from helion._testing import _get_backend
 from helion._testing import check_example
 from helion._testing import get_nvidia_gpu_model
 from helion._testing import import_path
+from helion._testing import is_cuda
 from helion._testing import onlyBackends
 from helion._testing import skipIfA10G
 from helion._testing import skipIfCudaCapabilityLessThan
@@ -2347,7 +2348,10 @@ class TestExamples(RefEagerTestBase, TestCase):
 
     @skipIfRocm("failure on rocm")
     @skipIfA10G("failure on a10g")
-    @skipIfCudaCapabilityLessThan((9, 0), reason="se_block requires H100+")
+    @skipIfFn(
+        lambda: is_cuda() and torch.cuda.get_device_capability() < (9, 0),
+        reason="se_block CUDA path requires H100+",
+    )
     def test_se_block_fwd(self):
         m, n = 128, 128
         x = torch.randn([m, n], device=DEVICE, dtype=torch.bfloat16)
@@ -2370,12 +2374,15 @@ class TestExamples(RefEagerTestBase, TestCase):
 
     @skipIfRocm("failure on rocm")
     @skipIfA10G("failure on a10g")
-    @skipIfCudaCapabilityLessThan((9, 0), reason="se_block requires H100+")
+    @skipIfFn(
+        lambda: is_cuda() and torch.cuda.get_device_capability() < (9, 0),
+        reason="se_block CUDA path requires H100+",
+    )
     def test_se_block_bwd_dx(self):
         m, n = 128, 128
-        x = torch.randn([m, n], device=DEVICE, dtype=torch.float16, requires_grad=True)
-        w = torch.randn([n, n], device=DEVICE, dtype=torch.float16, requires_grad=True)
-        grad_out = torch.randn([m, n], device=DEVICE, dtype=torch.float16)
+        x = torch.randn([m, n], device=DEVICE, dtype=HALF_DTYPE, requires_grad=True)
+        w = torch.randn([n, n], device=DEVICE, dtype=HALF_DTYPE, requires_grad=True)
+        grad_out = torch.randn([m, n], device=DEVICE, dtype=HALF_DTYPE)
 
         # Compute expected gradients with PyTorch
         x_torch = x.detach().clone().requires_grad_(True)
@@ -2400,12 +2407,15 @@ class TestExamples(RefEagerTestBase, TestCase):
 
     @skipIfRocm("failure on rocm")
     @skipIfA10G("failure on a10g")
-    @skipIfCudaCapabilityLessThan((9, 0), reason="se_block requires H100+")
+    @skipIfFn(
+        lambda: is_cuda() and torch.cuda.get_device_capability() < (9, 0),
+        reason="se_block CUDA path requires H100+",
+    )
     def test_se_block_bwd_dw(self):
         m, n = 128, 128
-        x = torch.randn([m, n], device=DEVICE, dtype=torch.float16, requires_grad=True)
-        w = torch.randn([n, n], device=DEVICE, dtype=torch.float16, requires_grad=True)
-        grad_out = torch.randn([m, n], device=DEVICE, dtype=torch.float16)
+        x = torch.randn([m, n], device=DEVICE, dtype=HALF_DTYPE, requires_grad=True)
+        w = torch.randn([n, n], device=DEVICE, dtype=HALF_DTYPE, requires_grad=True)
+        grad_out = torch.randn([m, n], device=DEVICE, dtype=HALF_DTYPE)
 
         # Compute expected gradients with PyTorch
         x_torch = x.detach().clone().requires_grad_(True)
