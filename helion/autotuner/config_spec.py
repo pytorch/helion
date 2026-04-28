@@ -106,6 +106,7 @@ _BASE_BACKEND_TUNABLE_KEYS: frozenset[str] = frozenset(
         "num_ctas",
         "occupancy",
         "pallas_loop_type",
+        "pallas_pre_broadcast",
     }
 )
 
@@ -126,6 +127,7 @@ BACKEND_TUNABLE_KEYS: frozenset[str] = _get_backend_tunable_keys()
 BACKEND_SPECIFIC_KEYS: frozenset[str] = BACKEND_TUNABLE_KEYS | {
     "num_threads",
     "pallas_loop_type",
+    "pallas_pre_broadcast",
 }
 VALID_KEYS: frozenset[str] = frozenset(
     [
@@ -150,6 +152,7 @@ VALID_KEYS: frozenset[str] = frozenset(
         "atomic_indexing",
         "load_eviction_policies",
         "pallas_loop_type",
+        "pallas_pre_broadcast",
         *BACKEND_TUNABLE_KEYS,
         "advanced_controls_file",
         "epilogue_subtile",
