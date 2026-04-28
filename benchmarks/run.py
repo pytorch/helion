@@ -181,6 +181,11 @@ KERNEL_MAPPINGS: dict[str, tuple[str, ...]] = {
         "rms_norm_tritonbench",
         {
             "num_inputs": 5,  # rms_norm-bwd has 6 inputs total but last input raises Triton OOM at default config: https://github.com/pytorch/helion/issues/711
+            # tritonbench's torch_compile_rms_norm recompiles during CUDA graph
+            # capture for backward, producing "capturing stream has unjoined work"
+            # which poisons the CUDA context and OOMs other impls. Same workaround
+            # as grouped_gemm (PR #1662).
+            "remove_flags": ["--cudagraph"],
         },
     ),
     "sum": ("tritonbench.operators.sum.operator", "examples.sum", "sum_tritonbench"),
@@ -242,6 +247,11 @@ KERNEL_MAPPINGS: dict[str, tuple[str, ...]] = {
         "layer_norm_tritonbench",
         {
             "num_inputs": 10,  # layer_norm-bwd takes long time on Benchmark CI, so use fewer inputs instead.
+            # tritonbench's torch_compile_layer_norm recompiles during CUDA graph
+            # capture for backward, producing "capturing stream has unjoined work"
+            # which poisons the CUDA context and OOMs other impls. Same workaround
+            # as grouped_gemm (PR #1662).
+            "remove_flags": ["--cudagraph"],
         },
     ),
     "jagged_softmax": (
