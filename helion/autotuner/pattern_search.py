@@ -257,6 +257,13 @@ class PatternSearch(PopulationBasedSearch):
             return neighbors[: self.num_neighbors_cap]
         return neighbors
 
+    def _apply_numel_constraints(self, neighbors: list[FlatConfig]) -> list[FlatConfig]:
+        """Shrink each neighbor in place to satisfy tensor numel constraints."""
+        if self.config_gen.config_spec.tensor_numel_constraints:
+            for n in neighbors:
+                self.config_gen._shrink_for_numel_constraints(n)
+        return neighbors
+
     def _generate_neighbors(self, base: FlatConfig) -> list[FlatConfig]:
         """
         Generate neighboring configurations by changing one or two parameters at a time.
@@ -295,4 +302,4 @@ class PatternSearch(PopulationBasedSearch):
                         new_flat[second] = second_value
                         neighbors.append(new_flat)
 
-        return self.shrink_neighbors(neighbors)
+        return self.shrink_neighbors(self._apply_numel_constraints(neighbors))
