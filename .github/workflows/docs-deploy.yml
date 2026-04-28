@@ -5,9 +5,6 @@ on:
     branches:
       - main
   workflow_dispatch:
-  workflow_run:
-    workflows: ["Benchmark Dispatch"]
-    types: [completed]
 
 permissions:
   contents: read

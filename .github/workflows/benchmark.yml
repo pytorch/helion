@@ -39,6 +39,9 @@ jobs:
 
     env:
       HELION_AUTOTUNE_LOG_LEVEL: INFO
+      # Run autotune benchmarks in a subprocess so deadlocked kernels are
+      # SIGKILL'd at the per-config timeout instead of hanging the job.
+      HELION_AUTOTUNE_BENCHMARK_SUBPROCESS: "1"
 
     container:
       image: ${{ inputs.image }}
@@ -133,6 +136,7 @@ jobs:
           mkdir -p benchmarks/ && pushd benchmarks/
           git clone https://github.com/pytorch-labs/tritonbench/
           pushd tritonbench/
+          git checkout $(cat $GITHUB_WORKSPACE/.github/ci_commit_pins/tritonbench.txt)
           git submodule update --init --recursive
           uv pip install -r requirements.txt
           python install.py --liger
@@ -172,26 +176,9 @@ jobs:
             echo "Using baseline: $BASELINE"
             echo "Available implementations for $kernel: $IMPLS"
 
-            # Do autotuning but do not record the results
-            ${{ inputs.env-vars }} python benchmarks/run.py \
-                --op $kernel \
-                --metrics speedup,accuracy \
-                --latency-measure-mode triton_do_bench \
-                --cudagraph \
-                --only $IMPLS \
-                --only-match-mode prefix-with-baseline \
-                --baseline $BASELINE \
-                --atol 1e-2 \
-                --rtol 1e-2 \
-                --input-sample-mode equally-spaced-k \
-                --keep-going \
-                ${{ inputs.custom-args }}
-
-            # Relax the GPU
-            sleep 2m
-
-            # Run again with cache and record results
-            ${{ inputs.env-vars }} HELION_PRINT_OUTPUT_CODE=1 HELION_ASSERT_CACHE_HIT=1 python benchmarks/run.py \
+            # Single pass: autotune search + codegen + compilation happen inline,
+            # so --measure-compile-time reports end-to-end user-visible compile time.
+            ${{ inputs.env-vars }} HELION_PRINT_OUTPUT_CODE=1 python benchmarks/run.py \
                 --op $kernel \
                 --metrics speedup,accuracy,latency \
                 --measure-compile-time \

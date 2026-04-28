@@ -14,12 +14,22 @@ import glob
 import json
 import math
 import os
+import re
 import subprocess
 import urllib.error
 import urllib.request
 import zipfile
 
 RETENTION_DAYS = 365
+
+
+def get_active_platforms(workflow_path):
+    """Extract active platform aliases from the benchmark dispatch workflow."""
+    try:
+        with open(workflow_path) as f:
+            return set(re.findall(r"alias:\s*(\S+)", f.read()))
+    except OSError:
+        return None
 
 
 def geo_mean(values):
@@ -45,6 +55,7 @@ def fmt_delta(curr, prev):
 def gh_api(endpoint):
     r = subprocess.run(f'gh api "{endpoint}"', shell=True, capture_output=True, text=True)
     if r.returncode != 0:
+        print(f"Warning: gh api failed for {endpoint}: {r.stderr.strip()}")
         return None
     return json.loads(r.stdout)
 
@@ -59,12 +70,17 @@ def fetch_runs(repo, workflow_name, days):
     cutoff = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
     runs = []
     for page in range(1, 11):
-        data = gh_api(f"repos/{repo}/actions/workflows/{wf_id}/runs?per_page=100&page={page}&status=completed&created=>{cutoff}")
+        # Avoid status= and created= query filters — they are unreliable
+        # on the GitHub API (intermittently return 0 results). Filter
+        # client-side instead.
+        data = gh_api(f"repos/{repo}/actions/workflows/{wf_id}/runs?per_page=100&page={page}")
         if not data or not data.get("workflow_runs"):
             break
+        past_cutoff = False
         for r in data["workflow_runs"]:
-            # Include cancelled runs: successful jobs within them still upload artifacts
-            # before the workflow is killed (e.g., the 6-hour job timeout).
+            if r["created_at"] < cutoff:
+                past_cutoff = True
+                break
             if r.get("conclusion") in ("success", "failure", "cancelled"):
                 runs.append({
                     "run_id": str(r["id"]),
@@ -73,6 +89,8 @@ def fetch_runs(repo, workflow_name, days):
                     "date": r["created_at"],
                     "branch": r.get("head_branch", "main"),
                 })
+        if past_cutoff:
+            break
     return runs
 
 
@@ -100,13 +118,16 @@ def download_artifacts(repo, run_id, dest):
             os.remove(zip_path)
 
 
-def parse_run(run_dir):
+def parse_run(run_dir, active_platforms=None):
     """Parse all helionbench.json files in a run directory into kernel entries."""
     kernels = []
     for bench_dir in sorted(glob.glob(os.path.join(run_dir, "benchmark-results-*"))):
         dirname = os.path.basename(bench_dir)
         parts = dirname.replace("benchmark-results-", "").split("-", 1)
         platform_short = parts[0] if parts else "unknown"
+
+        if active_platforms and platform_short not in active_platforms:
+            continue
 
         bench_file = os.path.join(bench_dir, "helionbench.json")
         if not os.path.exists(bench_file):
@@ -159,7 +180,7 @@ def build_history_entry(run, metrics, shapes):
         "helion_speedup_geomean": round(geo_mean(metrics.get("helion_speedup", [])), 4),
         "triton_speedup_geomean": round(geo_mean(metrics.get("triton_speedup", [])), 4),
         "torch_compile_speedup_geomean": round(geo_mean(metrics.get("torch_compile_speedup", [])), 4),
-        "compile_time_avg_s": round(avg(metrics.get("helion_compile_time_s", [])), 2),
+        "compile_time_geomean_s": round(geo_mean(metrics.get("helion_compile_time_s", [])), 2),
         "helion_latency_avg_ms": round(avg(helion_lat), 4) if helion_lat else 0,
         "per_shape": {
             "shapes": shapes,
@@ -173,7 +194,7 @@ def build_history_entry(run, metrics, shapes):
     }
 
 
-def build_dashboard_data(cache_dir, runs_meta, existing_data=None):
+def build_dashboard_data(cache_dir, runs_meta, existing_data=None, active_platforms=None):
     """Aggregate benchmark data across runs into the dashboard JSON structure."""
     cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=RETENTION_DAYS)
     runs_meta_sorted = sorted(
@@ -188,6 +209,8 @@ def build_dashboard_data(cache_dir, runs_meta, existing_data=None):
     existing_summary = {}
     existing_history = {}
     for e in (existing_data or {}).get("summary", []):
+        if active_platforms and e.get("platform_short", "") not in active_platforms:
+            continue
         key = e["kernel"] + "|" + e.get("platform_short", "")
         existing_summary[key] = e
         existing_history.setdefault(key, {}).update({h["run_id"]: h for h in e.get("history", [])})
@@ -196,7 +219,7 @@ def build_dashboard_data(cache_dir, runs_meta, existing_data=None):
     runs = []
     for meta in runs_meta_sorted:
         run_dir = os.path.join(cache_dir, meta["run_id"])
-        kernels = parse_run(run_dir) if os.path.isdir(run_dir) and os.listdir(run_dir) else []
+        kernels = parse_run(run_dir, active_platforms) if os.path.isdir(run_dir) and os.listdir(run_dir) else []
         runs.append({**meta, "kernel_count": len(kernels), "kernels": kernels})
 
     # Build kernel history: fresh artifacts override, then fill from existing history
@@ -269,7 +292,7 @@ def build_dashboard_data(cache_dir, runs_meta, existing_data=None):
                 break
 
         speedup_delta = fmt_delta(latest_data["helion_speedup_geomean"], prev_data["helion_speedup_geomean"]) if latest_data and prev_data else None
-        compile_delta = fmt_delta(prev_data["compile_time_avg_s"], latest_data["compile_time_avg_s"]) if latest_data and prev_data and latest_data["compile_time_avg_s"] > 0 else None
+        compile_delta = fmt_delta(prev_data["compile_time_geomean_s"], latest_data["compile_time_geomean_s"]) if latest_data and prev_data and latest_data["compile_time_geomean_s"] > 0 else None
         latency_delta = fmt_delta(prev_data["helion_latency_avg_ms"], latest_data["helion_latency_avg_ms"]) if latest_data and prev_data and latest_data["helion_latency_avg_ms"] > 0 else None
 
         classify_delta = latency_delta if latency_delta is not None else speedup_delta
@@ -312,7 +335,7 @@ def build_dashboard_data(cache_dir, runs_meta, existing_data=None):
             "helion_speedup_geomean": latest_data["helion_speedup_geomean"] if latest_data else 0,
             "triton_speedup_geomean": latest_data["triton_speedup_geomean"] if latest_data else 0,
             "torch_compile_speedup_geomean": latest_data["torch_compile_speedup_geomean"] if latest_data else 0,
-            "compile_time_avg_s": latest_data["compile_time_avg_s"] if latest_data else 0,
+            "compile_time_geomean_s": latest_data["compile_time_geomean_s"] if latest_data else 0,
             "helion_latency_avg_ms": latest_data["helion_latency_avg_ms"] if latest_data else 0,
             "speedup_delta_pct": speedup_delta,
             "compile_delta_pct": compile_delta,
@@ -366,8 +389,16 @@ def main():
     parser.add_argument("--repo", required=True)
     parser.add_argument("--workflow-name", default="Benchmark Dispatch")
     parser.add_argument("--existing-url", default=None, help="URL to fetch previous dashboard-data.json for incremental updates")
+    parser.add_argument("--dispatch-workflow", default=".github/workflows/benchmark_dispatch.yml",
+                        help="Path to benchmark dispatch workflow to derive active platforms")
     parser.add_argument("--output", default="dashboard-data.json")
     args = parser.parse_args()
+
+    active_platforms = get_active_platforms(args.dispatch_workflow)
+    if active_platforms:
+        print(f"Active platforms: {', '.join(sorted(active_platforms))}")
+    else:
+        print("Warning: could not read dispatch workflow, showing all platforms")
 
     existing = {}
     if args.existing_url:
@@ -381,6 +412,15 @@ def main():
     runs = fetch_runs(args.repo, args.workflow_name, RETENTION_DAYS)
     print(f"Found {len(runs)} runs in last {RETENTION_DAYS} days")
 
+    if not runs and existing.get("runs"):
+        print(f"ERROR: fetch_runs returned 0 but existing data has {len(existing['runs'])} runs.")
+        print("This is likely a transient API failure. Using existing data as-is.")
+        with open(args.output, "w") as f:
+            json.dump(existing, f, indent=2)
+        s = existing.get("stats", {})
+        print(f"Output (existing): {s.get('total_combos', 0)} combos, {len(existing['runs'])} runs")
+        return
+
     cache_dir = "./benchmark-cache"
     os.makedirs(cache_dir, exist_ok=True)
     existing_ids = {r["run_id"] for r in existing.get("runs", [])}
@@ -390,7 +430,7 @@ def main():
         print(f"Downloading run {r['run_id']} ({r['sha']})...")
         download_artifacts(args.repo, r["run_id"], os.path.join(cache_dir, r["run_id"]))
 
-    data = build_dashboard_data(cache_dir, runs, existing)
+    data = build_dashboard_data(cache_dir, runs, existing, active_platforms)
     with open(args.output, "w") as f:
         json.dump(data, f, indent=2)
 

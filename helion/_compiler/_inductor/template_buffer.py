@@ -10,6 +10,7 @@ from typing import cast
 
 import sympy
 import torch
+from torch._dynamo.testing import rand_strided
 from torch._dynamo.utils import ExactWeakKeyDictionary
 from torch._inductor.codecache import PyCodeCache
 from torch._inductor.ir import Buffer
@@ -890,11 +891,16 @@ def lower_helion_kernel(
 
     all_args: dict[str, object] = {**constant_args}
     for n, r in realized.items():
-        all_args[n] = torch.empty_strided(
+        # Reused as autotune_args; uninitialized memory may contain NaN
+        # bytes that spuriously fail accuracy checks. rand_strided
+        # matches inductor's benchmark_example_value.
+        device = r.get_device()
+        assert device is not None
+        all_args[n] = rand_strided(
             [as_int(s, 64) for s in r.get_size()],
             [as_int(s, 1) for s in r.get_stride()],
             dtype=r.get_dtype(),
-            device=r.get_device(),
+            device=device,
         )
     _rebuild_container_args(all_args)
 

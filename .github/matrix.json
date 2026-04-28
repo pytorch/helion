@@ -93,17 +93,6 @@
       "triton-pin": "0d9283bf49"
     },
     {
-      "runner": "linux.rocm.gpu.gfx942.1",
-      "python-version": "3.12",
-      "ref-eager": false,
-      "image": "rocm/dev-ubuntu-24.04:7.0-complete",
-      "runtime-version": "rocm7.0",
-      "container-options": "--device=/dev/kfd --device=/dev/dri",
-      "pytorch-version": "pytorch-nightly",
-      "alias": "mi325x",
-      "backend": "triton"
-    },
-    {
       "runner": "linux.rocm.gpu.ecosystem.gfx950.1",
       "python-version": "3.12",
       "ref-eager": false,
