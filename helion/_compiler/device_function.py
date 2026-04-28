@@ -35,11 +35,13 @@ from .backend_registry import all_reserved_launch_param_names
 from .compile_environment import CompileEnvironment
 from .host_function import HostFunction
 from .host_function import NoCurrentFunction
+from .host_function import _resolve_sym
 from .output_header import reserved_names
 from .source_location import SyntheticLocation
 from .variable_origin import BlockSizeOrigin
 from .variable_origin import GridOrigin
 from .variable_origin import Origin
+from .variable_origin import SourceOrigin
 from .variable_origin import TensorSizeOrigin
 
 if TYPE_CHECKING:
@@ -487,7 +489,26 @@ class DeviceFunction:
             return self.expr_to_var_info[expr].name
         expr_to_origin = HostFunction.current().expr_to_origin
         if expr in expr_to_origin:
-            return self._lift_sympy_arg(expr)
+            origin = expr_to_origin[expr].origin
+            if not issubclass(origin.base_type(), SourceOrigin):
+                return env.backend.sympy_printer_expr(
+                    sympy.Symbol(self._lift_sympy_arg(expr), integer=True)
+                )
+        # Substitute compound sub-expressions that have a known name.
+        # E.g. expr_to_origin maps 4*u0 -> "num_workers"; substituting
+        # absorbs u0 so it doesn't need individual resolution.
+        original_symbols = expr.free_symbols
+        for compound, sym_origin in expr_to_origin.items():
+            if (
+                not isinstance(compound, sympy.Symbol)
+                and compound.free_symbols.issubset(expr.free_symbols)
+                and not issubclass(sym_origin.origin.base_type(), SourceOrigin)
+            ):
+                expr = expr.subs(
+                    compound,
+                    sympy.Symbol(self._lift_sympy_arg(compound), integer=True),
+                )
+        # Replace remaining individual symbols with their codegen names.
         replacements = {}
         for sym in sorted(expr.free_symbols, key=lambda x: x.name):
             assert isinstance(sym, sympy.Symbol)
@@ -495,10 +516,9 @@ class DeviceFunction:
                 replacements[sym] = sympy.Symbol(
                     self.expr_to_var_info[sym].name, integer=True
                 )
-            else:
-                assert sym in expr_to_origin, f"no origin found for {sym.name}"
-                replacements[sym] = sympy.Symbol(
-                    self._lift_sympy_arg(sym), integer=True
+            elif sym in original_symbols:
+                replacements[sym] = _resolve_sym(
+                    sym, expr_to_origin, lambda e, o: self._lift_sympy_arg(e)
                 )
         # pyrefly: ignore [bad-argument-type]
         return env.backend.sympy_printer_expr(expr.xreplace(replacements))
