@@ -159,6 +159,39 @@ def _matmul_shapes() -> list[tuple[str, tuple[Any, ...]]]:
     ]
 
 
+def _matmul_layernorm_baseline(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+) -> torch.Tensor:
+    matmul_out = torch.matmul(x, y)
+    return torch.nn.functional.layer_norm(
+        matmul_out.to(torch.float32),
+        normalized_shape=[matmul_out.shape[-1]],
+        weight=weight.to(torch.float32),
+        bias=bias.to(torch.float32),
+    ).to(matmul_out.dtype)
+
+
+def _matmul_layernorm_shapes() -> list[tuple[str, tuple[Any, ...]]]:
+    # Use larger, regular shapes than examples/matmul_layernorm.py main()
+    # (which uses small/odd n=200,400 to dodge an unrelated power-of-2 bug).
+    configs = [(1024, 1024, 1024), (2048, 1024, 1024)]
+    return [
+        (
+            f"[{m},{k},{n}]",
+            (
+                torch.randn(m, k, device=DEVICE, dtype=torch.bfloat16),
+                torch.randn(k, n, device=DEVICE, dtype=torch.bfloat16),
+                torch.randn(n, device=DEVICE, dtype=torch.bfloat16),
+                torch.randn(n, device=DEVICE, dtype=torch.bfloat16),
+            ),
+        )
+        for m, k, n in configs
+    ]
+
+
 def _broadcast_matmul_shapes() -> list[tuple[str, tuple[Any, ...]]]:
     configs = [(16, 512, 768, 1024), (8, 256, 512, 256), (4, 1024, 512, 512)]
     return [
@@ -225,6 +258,44 @@ def _low_mem_dropout_baseline(p: float, x: torch.Tensor, seed: int) -> torch.Ten
 
 def _swiglu_baseline(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     return nn.functional.silu(a).to(b.dtype) * b
+
+
+def _cross_entropy_shapes() -> list[tuple[str, tuple[Any, ...]]]:
+    # Match examples/cross_entropy.py main()'s shape, plus smaller variants.
+    configs = [(1024, 32000), (4096, 50257), (16384, 131072)]
+    return [
+        (
+            f"[{n},{v}]",
+            (
+                torch.randn(n, v, device=DEVICE, dtype=torch.float32),
+                torch.randint(0, v, (n,), device=DEVICE, dtype=torch.int32),
+            ),
+        )
+        for n, v in configs
+    ]
+
+
+def _cross_entropy_baseline(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+    # torch.nn.functional.cross_entropy requires Long labels; Pallas requires
+    # int32. Cast at the baseline boundary.
+    return nn.functional.cross_entropy(logits, labels.long())
+
+
+def _embedding_shapes() -> list[tuple[str, tuple[Any, ...]]]:
+    # First entry mirrors examples/embedding.py main() (16x64 weights, [256,32]
+    # indices). PR #2054's gather strategy keeps the weight table in VMEM
+    # (16 MiB threshold), so we cap the larger shapes accordingly.
+    configs = [(256, 32, 16, 64), (1024, 128, 4096, 256), (512, 256, 8192, 512)]
+    return [
+        (
+            f"[{a},{b},{ne},{ed}]",
+            (
+                torch.randint(0, ne, (a, b), device=DEVICE, dtype=torch.int32),
+                torch.randn(ne, ed, device=DEVICE, dtype=torch.float32),
+            ),
+        )
+        for a, b, ne, ed in configs
+    ]
 
 
 def _batch_softmax_shapes() -> list[tuple[str, tuple[Any, ...]]]:
@@ -323,13 +394,27 @@ def _long_sum_shapes() -> list[tuple[str, tuple[Any, ...]]]:
 #   max_mismatch_pct: fraction of elements allowed to mismatch (default None = strict)
 #
 # This list contains only kernels that reliably pass on Pallas/TPU.
-KernelMapping = tuple[
-    str,
-    str,
-    Callable[..., Any] | None,
-    Callable[[], list[tuple[str, tuple[Any, ...]]]] | None,
-    float | None,
-]
+# Each value is (module_file, kernel_fn_name, baseline_fn, shapes_fn,
+# max_mismatch_pct[, torch_compile_compatible]). The optional 6th element
+# defaults to True and should be set to False for kernels whose baseline
+# cannot be compiled with torch.compile(backend="tpu") (e.g. dropout RNG).
+KernelMapping = (
+    tuple[
+        str,
+        str,
+        Callable[..., Any] | None,
+        Callable[[], list[tuple[str, tuple[Any, ...]]]] | None,
+        float | None,
+    ]
+    | tuple[
+        str,
+        str,
+        Callable[..., Any] | None,
+        Callable[[], list[tuple[str, tuple[Any, ...]]]] | None,
+        float | None,
+        bool,
+    ]
+)
 KERNEL_MAPPINGS: dict[str, KernelMapping] = {
     "exp": ("exp", "exp", torch.exp, _exp_shapes, None),
     "add": ("add", "add", torch.add, _add_shapes, None),
@@ -350,6 +435,27 @@ KERNEL_MAPPINGS: dict[str, KernelMapping] = {
     ),
     "bmm": ("bmm", "bmm", torch.bmm, _bmm_shapes, None),
     "matmul": ("matmul", "matmul", torch.matmul, _matmul_shapes, None),
+    "matmul_layernorm": (
+        "matmul_layernorm",
+        "matmul_layernorm",
+        _matmul_layernorm_baseline,
+        _matmul_layernorm_shapes,
+        None,
+    ),
+    "cross_entropy": (
+        "cross_entropy",
+        "cross_entropy",
+        _cross_entropy_baseline,
+        _cross_entropy_shapes,
+        None,
+    ),
+    "embedding": (
+        "embedding",
+        "embedding",
+        torch.nn.functional.embedding,
+        _embedding_shapes,
+        None,
+    ),
     "broadcast_matmul": (
         "broadcast_matmul",
         "broadcast_matmul",
@@ -361,12 +467,15 @@ KERNEL_MAPPINGS: dict[str, KernelMapping] = {
     # low_mem_dropout: helion uses a deterministic seed-based mask while
     # torch.nn.functional.dropout uses a random mask, so outputs always differ.
     # Allow 100% mismatch to skip correctness but still benchmark both.
+    # torch.compile(backend="tpu") can't capture dropout RNG into a graph
+    # (BackendCompilerFailed), so disable the torch.compile baseline here.
     "low_mem_dropout": (
         "low_mem_dropout",
         "low_mem_dropout",
         _low_mem_dropout_baseline,
         _low_mem_dropout_shapes,
         1.0,
+        False,  # torch_compile_compatible
     ),
     "swiglu": ("swiglu", "swiglu_fwd", _swiglu_baseline, _swiglu_shapes, None),
     "batch_softmax": (
@@ -503,9 +612,9 @@ def run_kernel_inner(name: str) -> KernelResult:
     if name not in KERNEL_MAPPINGS:
         return KernelResult(name=name, passed=False, error=f"Unknown kernel: {name}")
 
-    module_file, kernel_fn_name, baseline_fn, shapes_fn, max_mismatch_pct = (
-        KERNEL_MAPPINGS[name]
-    )
+    mapping = KERNEL_MAPPINGS[name]
+    module_file, kernel_fn_name, baseline_fn, shapes_fn, max_mismatch_pct = mapping[:5]
+    torch_compile_compatible = mapping[5] if len(mapping) > 5 else True
 
     try:
         mod = import_example(module_file)
@@ -546,19 +655,22 @@ def run_kernel_inner(name: str) -> KernelResult:
                 # Build baselines dict. "torch" is the default kDefault path
                 # (lazy-eager); "torch_compile" runs the same baseline through
                 # torch.compile(backend="tpu") which uses kDeferAll / full graph.
+                # Some baselines can't be compiled (e.g., dropout RNG); for
+                # those, the kernel mapping sets torch_compile_compatible=False.
                 baselines: dict[str, Callable[..., Any]] = {"torch": baseline_fn}
-                try:
-                    baselines["torch_compile"] = torch.compile(
-                        baseline_fn,
-                        backend="tpu",
-                        dynamic=False,
-                        fullgraph=True,
-                    )
-                except Exception as e:
-                    print(
-                        f"    torch.compile setup failed; skipping torch.compile column: {e}",
-                        file=sys.stderr,
-                    )
+                if torch_compile_compatible:
+                    try:
+                        baselines["torch_compile"] = torch.compile(
+                            baseline_fn,
+                            backend="tpu",
+                            dynamic=False,
+                            fullgraph=True,
+                        )
+                    except Exception as e:
+                        print(
+                            f"    torch.compile setup failed; skipping torch.compile column: {e}",
+                            file=sys.stderr,
+                        )
 
                 timings = run_example(
                     kernel_fn, baselines, args, max_mismatch_pct=max_mismatch_pct
