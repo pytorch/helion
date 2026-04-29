@@ -261,8 +261,13 @@ def _swiglu_baseline(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
 
 
 def _cross_entropy_shapes() -> list[tuple[str, tuple[Any, ...]]]:
-    # Match examples/cross_entropy.py main()'s shape, plus smaller variants.
-    configs = [(1024, 32000), (4096, 50257), (16384, 131072)]
+    # Pallas constrains shapes here for two reasons:
+    # 1. PR #2054's gather strategy caps the logits table at 16 MiB VMEM.
+    # 2. The kernel reads a full [tile_n, V] row into VMEM, so V drives the
+    #    window size; with tile_n=128 fp32, V <= ~2048 to stay under the
+    #    64 MiB VMEM cap when combined with the gather one-hot intermediate.
+    # Pick small but representative shapes accordingly.
+    configs = [(128, 2048), (256, 1024), (128, 1024)]
     return [
         (
             f"[{n},{v}]",
