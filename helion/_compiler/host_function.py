@@ -140,9 +140,14 @@ class HostFunction:
                     propagate_types(self)
                 with measure("HostFunction.finalize_config_spec"):
                     env.finalize_config_spec()
+                _factory_padding = (
+                    patch_tensor_factories()
+                    if env.backend.pad_factory_tensors_to_power_of_2
+                    else contextlib.nullcontext()
+                )
                 with (
                     measure("HostFunction.lower_to_device_ir"),
-                    patch_tensor_factories(),
+                    _factory_padding,
                 ):
                     self.device_ir = lower_to_device_ir(self)
 
