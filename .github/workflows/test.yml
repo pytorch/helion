@@ -216,24 +216,11 @@ jobs:
 
       - name: CUDA Compute Check
         if: startsWith(matrix.image, 'nvidia')
+        env:
+          HELION_CUDA_CHECK_FORCE_FAIL_ATTEMPTS: ${{ matrix.alias == 'a10g' && matrix.python-version == '3.10' && matrix.backend == 'triton' && matrix.pytorch-version == 'pytorch-2.9' && '2' || '0' }}
+          HELION_CUDA_CHECK_RETRY_DELAY_SECONDS: ${{ matrix.alias == 'a10g' && matrix.python-version == '3.10' && matrix.backend == 'triton' && matrix.pytorch-version == 'pytorch-2.9' && '1' || '20' }}
         run: |
-          source .venv/bin/activate
-          python -c "
-          import torch, sys
-
-          assert torch.cuda.is_available(), 'FATAL: CUDA not available'
-          n = torch.cuda.device_count()
-          assert n > 0, 'FATAL: No CUDA devices found'
-          print(f'CUDA devices: {n}')
-
-          for i in range(n):
-              dev = torch.device('cuda', i)
-              a = torch.randn(256, 256, device=dev)
-              b = (a @ a).sum().item()
-              print(f'  Device {i} ({torch.cuda.get_device_name(i)}): OK')
-
-          print(f'All {n} devices healthy')
-          "
+          bash .github/scripts/cuda_compute_check.sh
 
       - name: MPS Availability Check
         if: matrix.backend == 'metal'
