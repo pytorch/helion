@@ -586,6 +586,85 @@ def codegen_view_dtype(ctx: LoweringContext, node: Node) -> object:
     )
 
 
+@view_dtype_lowering.register_codegen("cute")
+def codegen_view_dtype_cute(ctx: LoweringContext, node: Node) -> object:
+    """Per-element bitcast through shared memory ``cute.recast_tensor``.
+
+    CuTe DSL operates on per-thread scalars, so a dtype reinterpret has to
+    round-trip a value through shared memory: write as the source dtype, then
+    read the same memory through a recast view typed as the target dtype.
+    """
+    from .cute.cute_reshape import _flat_index_from_coords
+    from .cute.cute_reshape import _get_dim_local_coord
+    from .cute.cute_reshape import _get_tile_shape
+
+    tensor = map_arg(node.args[0], lambda arg: _env_arg(ctx, arg))
+    assert isinstance(tensor, ast.AST)
+    target_dtype = node.args[1]
+    assert isinstance(target_dtype, torch.dtype)
+
+    input_node = node.args[0]
+    assert isinstance(input_node, Node)
+    input_val = input_node.meta["val"]
+    assert isinstance(input_val, torch.Tensor)
+    if input_val.dtype.itemsize != target_dtype.itemsize:
+        raise exc.BackendUnsupported(
+            "cute",
+            f"view.dtype with mismatched widths: "
+            f"{input_val.dtype} ({input_val.dtype.itemsize} bytes) -> "
+            f"{target_dtype} ({target_dtype.itemsize} bytes)",
+        )
+
+    from .generate_ast import GenerateAST
+
+    cg = ctx.cg
+    assert isinstance(cg, GenerateAST)
+    df = cg.device_function
+    env = CompileEnvironment.current()
+    config = df.config
+
+    shape = _get_tile_shape(input_val, env, config)
+    if not shape:
+        shape = [1]
+    numel = 1
+    for s in shape:
+        numel *= s
+
+    src_dtype_str = env.backend.dtype_str(input_val.dtype)
+    tgt_dtype_str = env.backend.dtype_str(target_dtype)
+
+    smem_ptr = df.new_var("view_dtype_smem_ptr")
+    smem = df.new_var("view_dtype_smem")
+    smem_recast = df.new_var("view_dtype_smem_recast")
+
+    coords = [_get_dim_local_coord(cg, input_val, i) for i in range(len(shape))]
+    flat = _flat_index_from_coords(coords, shape) if coords else "cutlass.Int32(0)"
+
+    cg.add_statement(
+        statement_from_string(
+            f"{smem_ptr} = cute.arch.alloc_smem({src_dtype_str}, {numel})"
+        )
+    )
+    cg.add_statement(
+        statement_from_string(f"{smem} = cute.make_tensor({smem_ptr}, ({numel},))")
+    )
+    cg.add_statement(
+        statement_from_string(
+            f"{smem}[{flat}] = {src_dtype_str}({{_inp}})", _inp=tensor
+        )
+    )
+    cg.add_statement(statement_from_string("cute.arch.sync_threads()"))
+    cg.add_statement(
+        statement_from_string(
+            f"{smem_recast} = cute.recast_tensor({smem}, {tgt_dtype_str})"
+        )
+    )
+
+    result = df.new_var("view_dtype_value")
+    cg.add_statement(statement_from_string(f"{result} = {smem_recast}[{flat}]"))
+    return expr_from_string(result)
+
+
 alias_lowering = register_lowering(
     torch.ops.aten.alias.default,
     masked_value_fn=passthrough_masked_value,
