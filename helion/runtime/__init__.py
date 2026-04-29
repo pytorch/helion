@@ -652,7 +652,9 @@ def _pallas_build_callable(
 
     jax_callable = JaxCallable(
         name=kernel_name,
-        jit_fn=jax.jit(jit_fn),  # pyrefly: ignore[no-matching-overload]
+        jit_fn=jax.jit(
+            jit_fn  # pyrefly: ignore[bad-argument-type]
+        ),  # pyrefly: ignore[no-matching-overload]
         trace_key=f"{kernel_name}_{id(pallas_kernel)}_{grid}{trace_key_suffix}",
         input_output_aliases=call_aliases,
     )

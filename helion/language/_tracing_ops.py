@@ -198,6 +198,7 @@ def _loop_carried_indices(state: CodegenState, n_args: int) -> set[int]:
                 and len(phi_user.args) >= 1
                 and hasattr(phi_user.args[0], "name")
             ):
+                # pyrefly: ignore [bad-argument-type]
                 carried_names.add(phi_user.args[0].name)
 
     # Match against the _for_loop's arg list
