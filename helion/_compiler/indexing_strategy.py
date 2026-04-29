@@ -1470,7 +1470,7 @@ class BlockedSubscriptIndexing:
                     res.block_shape.append(1)
             elif isinstance(k, torch.SymInt):
                 symbol = _symint_expr(k)
-                # pyrefly: ignore[no-matching-overload]
+                # pyrefly: ignore[no-matching-overload, bad-argument-type]
                 origin = HostFunction.current().expr_to_origin.get(symbol)
                 if origin and isinstance(origin.origin, BlockSizeOrigin):
                     if fake_value.size(len(res.offsets)) != 1:
