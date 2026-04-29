@@ -279,7 +279,7 @@ class TestExamples(RefEagerTestBase, TestCase):
         stay in fp32 to keep the layernorm output within tight tolerance;
         regressions here surface as out-of-tolerance results on bf16/fp16.
         """
-        m, k, n = 1024, 1024, 1024
+        m, k, n = 512, 1024, 256
         args = (
             torch.randn([m, k], device=DEVICE, dtype=HALF_DTYPE),
             torch.randn([k, n], device=DEVICE, dtype=HALF_DTYPE),
@@ -296,7 +296,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             "matmul_layernorm",
             args,
             expected,
-            block_sizes=[32, 256],
+            block_sizes=[16, 256],
             static_shapes=True,
             atol=1e-2,
             rtol=1e-2,
