@@ -152,11 +152,11 @@ def _generated_index_code(
 
     if isinstance(pattern, TilePattern):
         return _tile_pattern_code(
-            pattern, idx, state, tensor_dim, in_pipeline, pipeline_block_ids
+            pattern, idx, state, tensor, tensor_dim, in_pipeline, pipeline_block_ids
         )
 
     if isinstance(pattern, TileIndexWithOffsetPattern):
-        return _tile_index_with_offset_pattern_code(pattern, state)
+        return _tile_index_with_offset_pattern_code(pattern, state, tensor, tensor_dim)
 
     if isinstance(pattern, TileBeginWithOffsetPattern):
         return _tile_begin_with_offset_pattern_code(
@@ -182,6 +182,7 @@ def _tile_pattern_code(
     pattern: object,
     idx: object,
     state: CodegenState,
+    tensor: torch.Tensor,
     tensor_dim: int,
     in_pipeline: bool,
     pipeline_block_ids: set[int],
@@ -205,7 +206,7 @@ def _tile_pattern_code(
 
     can_tile = _can_tile_dimension(state, tensor_dim)
     if not can_tile:
-        return _ds_expr(state, block_id)
+        return _ds_expr(state, block_id, tensor=tensor, tensor_dim=tensor_dim)
 
     loops = state.codegen.active_device_loops.get(block_id)
     if loops and any(
@@ -213,13 +214,15 @@ def _tile_pattern_code(
         or (isinstance(loop, ForiLoopState) and not loop.use_dma)
         for loop in loops
     ):
-        return _ds_expr(state, block_id)
+        return _ds_expr(state, block_id, tensor=tensor, tensor_dim=tensor_dim)
     return ":"
 
 
 def _tile_index_with_offset_pattern_code(
     pattern: object,
     state: CodegenState,
+    tensor: torch.Tensor,
+    tensor_dim: int,
 ) -> str:
     from helion._compiler.pallas.plan_tiling import TileIndexWithOffsetPattern
 
@@ -227,7 +230,7 @@ def _tile_index_with_offset_pattern_code(
 
     block_id = pattern.block_id
     offset_str = state.device_function.literal_expr(pattern.offset)
-    return _ds_expr(state, block_id, offset_str)
+    return _ds_expr(state, block_id, offset_str, tensor=tensor, tensor_dim=tensor_dim)
 
 
 def _tile_begin_with_offset_pattern_code(
@@ -291,19 +294,34 @@ def _slice_code(
         loops = state.codegen.active_device_loops.get(block_id)
         if loops and any(isinstance(loop, DeviceLoopState) for loop in loops):
             if block_id is not None:
-                return _ds_expr(state, block_id)
+                return _ds_expr(state, block_id, tensor=tensor, tensor_dim=tensor_dim)
 
     return ":"
 
 
-def _ds_expr(state: CodegenState, block_id: int, tile_offset: str = "") -> str:
-    """Return a ``pl.ds(offset, block_size)`` expression for *block_id*, offset by *tile_offset*"""
+def _ds_expr(
+    state: CodegenState,
+    block_id: int,
+    tile_offset: str = "",
+    *,
+    tensor: torch.Tensor | None = None,
+    tensor_dim: int | None = None,
+) -> str:
+    """Return a ``pl.ds(offset, block_size)`` expression for *block_id*, offset by *tile_offset*.
+
+    When *tensor* and *tensor_dim* are provided, records the dimension in
+    ``pallas_pad_info`` so the launcher can zero-pad non-divisible dims.
+    """
     offset = state.codegen.offset_var(block_id)
     if tile_offset:
         offset = f"{offset} + {tile_offset}"
     block_size = state.device_function.block_size_var(block_id)
     if block_size is None:
         return ":"
+    if tensor is not None and tensor_dim is not None:
+        from helion.language.memory_ops import _record_pad_info
+
+        _record_pad_info(state, tensor, tensor_dim, block_id)
     return f"pl.ds({offset}, {block_size})"
 
 

@@ -159,6 +159,25 @@ def _(state: CodegenState) -> ast.AST:
     raise NotImplementedError(f"Cannot store to type: {type(tensor)}")
 
 
+def _record_pad_info(
+    state: CodegenState,
+    tensor: torch.Tensor,
+    tensor_dim: int,
+    block_id: int,
+) -> None:
+    """Record that a tensor dimension uses pl.ds() and may need host-side padding.
+
+    Note: stores one block_id per (tensor, dim).  If two inner loops tile the
+    same dim with different block_ids, the last one wins.  This is fine when
+    both loops use the same block size (the common case).
+    """
+    pad_info = state.device_function.pallas_pad_info
+    tensor_id = id(tensor)
+    if tensor_id not in pad_info:
+        pad_info[tensor_id] = {}
+    pad_info[tensor_id][tensor_dim] = block_id
+
+
 def _maybe_get_symbol_origin(idx: object) -> SymbolOrigin | None:
     if not isinstance(idx, torch.SymInt):
         return None

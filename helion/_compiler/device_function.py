@@ -328,6 +328,9 @@ class DeviceFunction:
         # dict would then need to support multiple entries per tensor
         # or the tensor would get distinct arg IDs per memory space.
         self.pallas_memory_space: dict[int, PallasMemorySpace] = {}
+        # Pallas: id(fake_tensor) → {dim: block_id} for dims using pl.ds()
+        # that may need host-side padding when block size doesn't divide dim.
+        self.pallas_pad_info: dict[int, dict[int, int]] = {}
 
     def allocate_store_index(self) -> int:
         """Bump store counters and return the indexing strategy slot."""
