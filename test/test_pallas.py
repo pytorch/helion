@@ -640,6 +640,8 @@ class TestPallas(TestCase):
         code, result = code_and_output(pallas_bmm, (a, b))
         expected = torch.bmm(a.float(), b.float()).to(torch.bfloat16)
         torch.testing.assert_close(result, expected, rtol=1e-2, atol=1e-2)
+        # Block sizes >= 128 should get the pl.multiple_of alignment hint
+        self.assertIn("pl.multiple_of(", code)
 
     def test_bmm_fori_loop_non_divisible_k(self) -> None:
         """Test fori_loop bmm where BLOCK_K=256 doesn't evenly divide K=384."""
@@ -992,6 +994,9 @@ class TestPallas(TestCase):
         code, result = code_and_output(chunked_add, (x,), block_sizes=[128])
         expected = x + 1.0
         torch.testing.assert_close(result, expected)
+        # tile_k.index + offset uses TileIndexWithOffsetPattern — the
+        # pl.multiple_of hint should NOT be applied to offset expressions
+        self.assertNotIn("pl.multiple_of(", code)
 
     def test_mixed_scalar_and_slice_access(self) -> None:
         """Tensor accessed both as scalar and slice should not be placed in SMEM.
@@ -1361,6 +1366,8 @@ class TestPallas(TestCase):
         self.assertIn("jax.lax.fori_loop", code)
         self.assertNotIn("pltpu.make_async_copy", code)
         self.assertIn("pl.ds(", code)
+        # Block size 64 < 128 alignment — hint should NOT be applied
+        self.assertNotIn("pl.multiple_of(", code)
         torch.testing.assert_close(result, args[0] + args[1])
 
     def test_fori_loop_no_dma_multidim_unaligned(self) -> None:
