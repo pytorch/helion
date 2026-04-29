@@ -213,6 +213,7 @@ def prepare_node_lowering(
             buffer_name_to_output_index[buffer.get_name()] = i
 
     new_buffers = graph_lowering.buffers[prior_buffers:]
+    # pyrefly: ignore [unbound-name]
     assert buffer in new_buffers
     nodes = []
     extra_input_names = []

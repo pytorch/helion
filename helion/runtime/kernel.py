@@ -1293,7 +1293,7 @@ _specialization_extractors: dict[
     dict: lambda fn, x: _mapping_key(fn, x, type(x)),
     # pyrefly: ignore [missing-attribute]
     "namedtuple": lambda fn, x: _mapping_key(fn, x._asdict(), type(x)),
-    # pyrefly: ignore [no-matching-overload]
+    # pyrefly: ignore [no-matching-overload, bad-argument-type]
     "dataclass": lambda fn, x: _mapping_key(fn, dataclasses.asdict(x), type(x)),
     types.FunctionType: _function_key,
     types.BuiltinFunctionType: lambda fn, x: x,

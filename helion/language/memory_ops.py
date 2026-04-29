@@ -1357,7 +1357,7 @@ def _(
             grids = torch.meshgrid(*(indices[i] for i in tensor_idxs), indexing="ij")
             for i, grid in zip(tensor_idxs, grids, strict=False):
                 indices[i] = grid
-        # pyrefly: ignore [bad-argument-type]
+        # pyrefly: ignore [bad-argument-type, bad-index]
         return tensor[tuple(indices)]
 
     # Create zero result matching mask shape

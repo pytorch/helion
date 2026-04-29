@@ -85,7 +85,7 @@ def find_block_size_symbols(
     non_block_size_symbols = set()
 
     for symbol in expr.free_symbols:
-        # pyrefly: ignore [no-matching-overload]
+        # pyrefly: ignore [no-matching-overload, bad-argument-type]
         origin_info = hf.expr_to_origin.get(symbol)
         if origin_info is None or not isinstance(origin_info.origin, BlockSizeOrigin):
             # pyrefly: ignore [bad-argument-type]
