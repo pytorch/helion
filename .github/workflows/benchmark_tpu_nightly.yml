@@ -15,7 +15,7 @@ on:
         # Excluded kernels:
         #   grpo_loss: complex multi-kernel setup, needs special handling
         #   jagged_hstu_attn: complex jagged attention with special data setup
-        default: "exp,add,softmax_two_pass,welford,attention,bmm,broadcast_matmul,geglu,low_mem_dropout,swiglu,batch_softmax,sum,rms_norm,layer_norm,softmax,long_sum_naive,long_sum_loop,long_sum_manual"
+        default: "exp,add,softmax_two_pass,welford,attention,bmm,matmul,matmul_layernorm,cross_entropy,embedding,broadcast_matmul,geglu,low_mem_dropout,swiglu,batch_softmax,sum,rms_norm,layer_norm,softmax,long_sum_naive,long_sum_loop,long_sum_manual"
 
 permissions:
   contents: read
@@ -26,4 +26,4 @@ jobs:
     permissions:
       contents: read
     with:
-      kernels: ${{ github.event.inputs.kernels || 'exp,add,softmax_two_pass,welford,attention,bmm,broadcast_matmul,geglu,low_mem_dropout,swiglu,batch_softmax,sum,rms_norm,layer_norm,softmax,long_sum_naive,long_sum_loop,long_sum_manual' }}
+      kernels: ${{ github.event.inputs.kernels || 'exp,add,softmax_two_pass,welford,attention,bmm,matmul,matmul_layernorm,cross_entropy,embedding,broadcast_matmul,geglu,low_mem_dropout,swiglu,batch_softmax,sum,rms_norm,layer_norm,softmax,long_sum_naive,long_sum_loop,long_sum_manual' }}

@@ -595,6 +595,12 @@ def run_kernel(name: str) -> KernelResult:
     Uses SIGALRM instead of multiprocessing to avoid fork-after-TPU-init
     deadlocks on Linux.
     """
+    # Reset torch._dynamo state between kernels: each kernel calls
+    # torch.compile(baseline_fn, backend="tpu", fullgraph=True) and the
+    # global recompile_limit (default 8) is shared across kernels. Without
+    # the reset, kernels late in the run hit "Hard failure due to
+    # fullgraph=True" once dynamo gives up recompiling.
+    torch._dynamo.reset()
     old_handler = signal.signal(signal.SIGALRM, _alarm_handler)
     signal.alarm(KERNEL_TIMEOUT)
     try:

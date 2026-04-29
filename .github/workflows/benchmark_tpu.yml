@@ -18,6 +18,9 @@ jobs:
       HELION_BACKEND: pallas
       HELION_AUTOTUNE_LOG_LEVEL: INFO
       HELION_AUTOTUNE_EFFORT: full
+      # Bump per-kernel timeout from the default 20 min so welford's autotune
+      # at full effort doesn't get killed (it occasionally needs ~25 min).
+      HELION_BENCHMARK_KERNEL_TIMEOUT: "1800"
 
     runs-on: linux.google.tpuv7x.1
 
