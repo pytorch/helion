@@ -144,6 +144,21 @@ def _bmm_shapes() -> list[tuple[str, tuple[Any, ...]]]:
     ]
 
 
+def _matmul_shapes() -> list[tuple[str, tuple[Any, ...]]]:
+    # First entry matches examples/matmul.py main()'s check(1024, 1024, 1024).
+    configs = [(1024, 1024, 1024), (2048, 1024, 1024), (1024, 2048, 2048)]
+    return [
+        (
+            f"[{m},{k},{n}]",
+            (
+                torch.randn(m, k, device=DEVICE, dtype=torch.bfloat16),
+                torch.randn(k, n, device=DEVICE, dtype=torch.bfloat16),
+            ),
+        )
+        for m, k, n in configs
+    ]
+
+
 def _broadcast_matmul_shapes() -> list[tuple[str, tuple[Any, ...]]]:
     configs = [(16, 512, 768, 1024), (8, 256, 512, 256), (4, 1024, 512, 512)]
     return [
@@ -334,6 +349,7 @@ KERNEL_MAPPINGS: dict[str, KernelMapping] = {
         None,
     ),
     "bmm": ("bmm", "bmm", torch.bmm, _bmm_shapes, None),
+    "matmul": ("matmul", "matmul", torch.matmul, _matmul_shapes, None),
     "broadcast_matmul": (
         "broadcast_matmul",
         "broadcast_matmul",
@@ -420,7 +436,9 @@ class ShapeResult:
     passed: bool
     kernel_time_ms: float = 0.0
     baseline_time_ms: float = 0.0
-    speedup: float = 0.0
+    compile_baseline_time_ms: float = 0.0
+    speedup: float = 0.0  # Helion vs default torch (kDefault).
+    compile_vs_default: float = 0.0  # default-torch / torch.compile (full-graph win).
     error: str | None = None
 
 
@@ -525,19 +543,44 @@ def run_kernel_inner(name: str) -> KernelResult:
         for label, args in shapes:
             print(f"  Shape {label}:", file=sys.stderr)
             try:
+                # Build baselines dict. "torch" is the default kDefault path
+                # (lazy-eager); "torch_compile" runs the same baseline through
+                # torch.compile(backend="tpu") which uses kDeferAll / full graph.
+                baselines: dict[str, Callable[..., Any]] = {"torch": baseline_fn}
+                try:
+                    baselines["torch_compile"] = torch.compile(
+                        baseline_fn,
+                        backend="tpu",
+                        dynamic=False,
+                        fullgraph=True,
+                    )
+                except Exception as e:
+                    print(
+                        f"    torch.compile setup failed; skipping torch.compile column: {e}",
+                        file=sys.stderr,
+                    )
+
                 timings = run_example(
-                    kernel_fn, baseline_fn, args, max_mismatch_pct=max_mismatch_pct
+                    kernel_fn, baselines, args, max_mismatch_pct=max_mismatch_pct
                 )
                 kernel_ms = timings.get("helion", 0.0)
                 baseline_ms = timings.get("torch", 0.0)
+                compile_baseline_ms = timings.get("torch_compile", 0.0)
                 speedup = baseline_ms / kernel_ms if kernel_ms > 0 else 0.0
+                compile_vs_default = (
+                    baseline_ms / compile_baseline_ms
+                    if compile_baseline_ms > 0 and baseline_ms > 0
+                    else 0.0
+                )
                 shape_results.append(
                     ShapeResult(
                         shape=label,
                         passed=True,
                         kernel_time_ms=kernel_ms,
                         baseline_time_ms=baseline_ms,
+                        compile_baseline_time_ms=compile_baseline_ms,
                         speedup=speedup,
+                        compile_vs_default=compile_vs_default,
                     )
                 )
             except Exception as e:
@@ -698,15 +741,20 @@ def main() -> None:
                 sr_status = "PASS" if sr.passed else "FAIL"
                 print(f"    {sr.shape}: {sr_status}", file=sys.stderr)
 
-    # Summary table
-    print(f"\n{'=' * 75}", file=sys.stderr)
+    # Summary table. "Speedup" = Helion vs default torch (kDefault).
+    # "vs default" next to torch.compile = how much faster compile is than
+    # default torch (1.0x means no win, 2.0x means compile is 2x faster).
+    width = 100
+    print(f"\n{'=' * width}", file=sys.stderr)
     print("Summary", file=sys.stderr)
-    print(f"{'=' * 75}", file=sys.stderr)
+    print(f"{'=' * width}", file=sys.stderr)
     print(
-        f"{'Kernel':<22} {'Shape':<16} {'Status':<8} {'Helion (ms)':<14} {'Torch (ms)':<14} {'Speedup':<10}",
+        f"{'Kernel':<22} {'Shape':<16} {'Status':<8} "
+        f"{'Helion (ms)':<14} {'Torch (ms)':<14} {'Speedup':<10} "
+        f"{'Torch.compile (ms)':<20} {'vs default':<10}",
         file=sys.stderr,
     )
-    print(f"{'-' * 75}", file=sys.stderr)
+    print(f"{'-' * width}", file=sys.stderr)
     for result in results:
         if result.shape_results:
             for sr in result.shape_results:
@@ -718,8 +766,20 @@ def main() -> None:
                     f"{sr.baseline_time_ms:.4f}" if sr.baseline_time_ms > 0 else "-"
                 )
                 speedup_str = f"{sr.speedup:.2f}x" if sr.speedup > 0 else "-"
+                compile_str = (
+                    f"{sr.compile_baseline_time_ms:.4f}"
+                    if sr.compile_baseline_time_ms > 0
+                    else "-"
+                )
+                compile_vs_str = (
+                    f"{sr.compile_vs_default:.2f}x"
+                    if sr.compile_vs_default > 0
+                    else "-"
+                )
                 print(
-                    f"{result.name:<22} {sr.shape:<16} {status:<8} {kernel_str:<14} {baseline_str:<14} {speedup_str:<10}",
+                    f"{result.name:<22} {sr.shape:<16} {status:<8} "
+                    f"{kernel_str:<14} {baseline_str:<14} {speedup_str:<10} "
+                    f"{compile_str:<20} {compile_vs_str:<10}",
                     file=sys.stderr,
                 )
         else:
@@ -728,15 +788,17 @@ def main() -> None:
                 f"{result.kernel_time_ms:.1f}" if result.kernel_time_ms > 0 else "-"
             )
             print(
-                f"{result.name:<22} {'main()':<16} {status:<8} {time_str:<14} {'-':<14} {'-':<10}",
+                f"{result.name:<22} {'main()':<16} {status:<8} "
+                f"{time_str:<14} {'-':<14} {'-':<10} "
+                f"{'-':<20} {'-':<10}",
                 file=sys.stderr,
             )
 
     passed = sum(1 for r in results if r.passed)
     total = len(results)
-    print(f"{'-' * 75}", file=sys.stderr)
+    print(f"{'-' * width}", file=sys.stderr)
     print(f"Total: {passed}/{total} passed", file=sys.stderr)
-    print(f"{'=' * 75}\n", file=sys.stderr)
+    print(f"{'=' * width}\n", file=sys.stderr)
 
     if args.output:
         write_results_json(args.output, results)
