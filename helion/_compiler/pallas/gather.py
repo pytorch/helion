@@ -15,7 +15,9 @@ import torch
 from ..ast_extension import expr_from_string
 
 if TYPE_CHECKING:
+    from ...runtime.config import Config
     from ..inductor_lowering import CodegenState
+    from .plan_tiling import IndexingPattern
 
 
 # Fail early on oversized tables instead of a generic Mosaic OOM.
@@ -36,9 +38,12 @@ def build_gather_plan(
     tensor: torch.Tensor,
     subscript: list[object] | tuple[object, ...],
     indirect_positions: list[int],
+    patterns: list[IndexingPattern],
+    config: Config,
 ) -> GatherPlan:
     """Validate the gather site and return its plan. Runs during plan_tiling."""
     from ..compile_environment import CompileEnvironment
+    from .plan_tiling import resident_block_elements
 
     if len(indirect_positions) > 1:
         raise NotImplementedError(
@@ -54,24 +59,19 @@ def build_gather_plan(
             f"Pallas gather: table must be floating point, got {tensor.dtype}"
         )
 
-    gather_axis_size = tensor.shape[0]
-    numel = tensor.numel()
-    if not isinstance(gather_axis_size, int) or not isinstance(numel, int):
+    elements = resident_block_elements(tensor, patterns, config)
+    if elements is None:
         raise NotImplementedError(
             "Pallas gather: dynamic-shape tables are not supported; "
             "use @helion.kernel(static_shapes=True)"
         )
-
-    # TODO(thcmbs): conservative bound. Tiling on broadcast dims would shrink
-    # the actual VMEM block, so this rejects configurations that would fit.
-    # Replace with real VMEM accounting once available.
-    table_bytes = numel * tensor.dtype.itemsize
+    table_bytes = elements * tensor.dtype.itemsize
     if table_bytes > _GATHER_VMEM_THRESHOLD_BYTES:
         raise NotImplementedError(
-            f"Pallas gather: table is {table_bytes} bytes, exceeds the "
-            f"{_GATHER_VMEM_THRESHOLD_BYTES} byte VMEM threshold. The current "
-            f"codegen requires the full table in VMEM; reduce V or use a "
-            f"half-precision dtype."
+            f"Pallas gather: resident block is {table_bytes} bytes, exceeds "
+            f"the {_GATHER_VMEM_THRESHOLD_BYTES} byte VMEM threshold. The "
+            f"current codegen requires the full gather axis in VMEM; reduce "
+            f"V, tile the broadcast dims, or use a half-precision dtype."
         )
 
     # MXU truncates fp32 to bf16 without HIGHEST. For bf16/fp16 the truncation is a no-op.
@@ -81,7 +81,7 @@ def build_gather_plan(
     jnp_dtype = CompileEnvironment.current().backend.dtype_str(tensor.dtype)
 
     return GatherPlan(
-        gather_axis_size=gather_axis_size,
+        gather_axis_size=tensor.shape[0],
         indirect_pos=indirect_pos,
         none_dims=none_dims,
         jnp_dtype=jnp_dtype,
