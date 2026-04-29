@@ -634,5 +634,64 @@ class TestReduce(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, pytorch_result)
 
 
+# TODO(hinriksnaer): expand lambda reduce tests to pallas backend
+@onlyBackends(["triton", "cute"])
+class TestReduceLambda(RefEagerTestBase, TestCase):
+    """Test lambda support as combine_fn in hl.reduce."""
+
+    def test_lambda_before_loop(self):
+        """Lambda assigned at host level, before the tile loop."""
+
+        @helion.kernel(autotune_effort="none")
+        def kernel(x: torch.Tensor) -> torch.Tensor:
+            add_fn = lambda a, b: a + b  # noqa: E731, FURB118
+            result = torch.empty([x.size(0)], dtype=x.dtype, device=x.device)
+            for i in hl.tile(x.size(0)):
+                result[i] = hl.reduce(add_fn, x[i, :], dim=1)
+            return result
+
+        x = torch.tensor(
+            [[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0], [9.0, 10.0, 11.0, 12.0]],
+            device=DEVICE,
+        )
+        _, result = code_and_output(kernel, (x,))
+        torch.testing.assert_close(result, x.sum(dim=1))
+
+    def test_lambda_inside_loop(self):
+        """Lambda assigned inside the tile loop body."""
+
+        @helion.kernel(autotune_effort="none")
+        def kernel(x: torch.Tensor) -> torch.Tensor:
+            result = torch.empty([x.size(0)], dtype=x.dtype, device=x.device)
+            for i in hl.tile(x.size(0)):
+                add_fn = lambda a, b: a + b  # noqa: E731, FURB118
+                result[i] = hl.reduce(add_fn, x[i, :], dim=1)
+            return result
+
+        x = torch.tensor(
+            [[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0], [9.0, 10.0, 11.0, 12.0]],
+            device=DEVICE,
+        )
+        _, result = code_and_output(kernel, (x,))
+        torch.testing.assert_close(result, x.sum(dim=1))
+
+    def test_lambda_inline(self):
+        """Lambda passed directly as argument to hl.reduce."""
+
+        @helion.kernel(autotune_effort="none")
+        def kernel(x: torch.Tensor) -> torch.Tensor:
+            result = torch.empty([x.size(0)], dtype=x.dtype, device=x.device)
+            for i in hl.tile(x.size(0)):
+                result[i] = hl.reduce(lambda a, b: a + b, x[i, :], dim=1)  # noqa: FURB118
+            return result
+
+        x = torch.tensor(
+            [[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0], [9.0, 10.0, 11.0, 12.0]],
+            device=DEVICE,
+        )
+        _, result = code_and_output(kernel, (x,))
+        torch.testing.assert_close(result, x.sum(dim=1))
+
+
 if __name__ == "__main__":
     unittest.main()
