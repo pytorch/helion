@@ -227,18 +227,20 @@ class Kernel(Generic[_R]):
             bound_kernel = (
                 None if cache_key is None else self._bound_kernels.get(cache_key, None)
             )
-            if bound_kernel is None:
-                normalized_args: tuple[object, ...] = self.normalize_args(*args)
-                if len(normalized_args) != len(args):
-                    # we had default args that needed to be applied
-                    bound_kernel = self.bind(normalized_args)
-                else:
-                    bound_kernel = BoundKernel(self, args)
-                if cache_key is None:
-                    cache_key = self._create_bound_kernel_cache_key(
-                        bound_kernel, args, signature
-                    )
-                self._bound_kernels[cache_key] = bound_kernel
+            if bound_kernel is not None:
+                return bound_kernel
+
+            normalized_args: tuple[object, ...] = self.normalize_args(*args)
+            if len(normalized_args) != len(args):
+                # we had default args that needed to be applied
+                bound_kernel = self.bind(normalized_args)
+            else:
+                bound_kernel = BoundKernel(self, args)
+            if cache_key is None:
+                cache_key = self._create_bound_kernel_cache_key(
+                    bound_kernel, args, signature
+                )
+            self._bound_kernels[cache_key] = bound_kernel
             return bound_kernel
 
     def _base_specialization_key(self, args: Sequence[object]) -> tuple[Hashable, ...]:
