@@ -869,6 +869,53 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
     def _split_tcgen05_invariant_setup(
         self, device_function: DeviceFunction, body: list[ast.stmt]
     ) -> tuple[list[ast.stmt], list[ast.stmt]]:
+        # Deny-list mode: codegen has explicitly marked which statements
+        # depend on per-tile coordinates. Everything else can be hoisted
+        # out of the work-tile loop. This matches Quack's pattern of
+        # building pipelines once per kernel and replaying state per tile.
+        #
+        # The PID decomposition emitted by ``_decompose_virtual_pid``
+        # references ``virtual_pid_var`` (defined in the loop header) and
+        # produces ``pid_0``, ``pid_1`` etc. that are then consumed by
+        # downstream offset computations. To capture this transitive
+        # dependency without plumbing tagging through every codegen path,
+        # we do a single forward pass: seed the per-tile name set with
+        # ``virtual_pid_var``; any statement that reads or writes a
+        # per-tile name is itself per-tile, and any names it assigns
+        # become per-tile too.
+        if device_function.has_cute_tcgen05_per_tile_marks:
+            per_tile_names: set[str] = {self.virtual_pid_var}
+
+            def _stmt_names(stmt: ast.stmt) -> tuple[set[str], set[str]]:
+                reads: set[str] = set()
+                writes: set[str] = set()
+                for node in ast.walk(stmt):
+                    if isinstance(node, ast.Name):
+                        if isinstance(node.ctx, ast.Store):
+                            writes.add(node.id)
+                        else:
+                            reads.add(node.id)
+                return reads, writes
+
+            hoisted: list[ast.stmt] = []
+            wrapped: list[ast.stmt] = []
+            for stmt in body:
+                reads, writes = _stmt_names(stmt)
+                is_per_tile = (
+                    device_function.is_cute_tcgen05_per_tile(stmt)
+                    or bool(reads & per_tile_names)
+                    or bool(writes & per_tile_names)
+                )
+                if is_per_tile:
+                    per_tile_names.update(writes)
+                    wrapped.append(stmt)
+                else:
+                    hoisted.append(stmt)
+            return hoisted, wrapped
+
+        # Allow-list mode (legacy): codegen has explicitly marked invariant
+        # statements via ``register_cute_tcgen05_invariant_setup``. Anything
+        # registered hoists; everything else stays in the work-tile loop.
         hoisted = [
             stmt
             for stmt in body
@@ -882,6 +929,9 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             ]
             return hoisted, wrapped
 
+        # Heuristic fallback: scan for known per-tile patterns and split
+        # the prefix at the first one. Used when neither registration
+        # path is populated.
         start = None
         end = None
         for i, stmt in enumerate(body):

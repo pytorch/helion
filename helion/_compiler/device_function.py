@@ -406,6 +406,8 @@ class DeviceFunction:
         self._cute_tcgen05_store_values: dict[str, CuteTcgen05StoreValue] = {}
         self.cute_tcgen05_matmul_plan: CuteTcgen05MatmulPlan | None = None
         self._cute_tcgen05_invariant_setup_stmt_ids: set[int] = set()
+        self._cute_tcgen05_per_tile_stmt_ids: set[int] = set()
+        self._cute_tcgen05_post_persistent_loop_stmts: list[ast.stmt] = []
         self._cute_collective_handled_loads: set[str] = set()
         self.cute_cluster_shape: tuple[int, int, int] | None = None
         self.cute_block_shape: tuple[int, int, int] | None = None
@@ -605,6 +607,26 @@ class DeviceFunction:
 
     def is_cute_tcgen05_invariant_setup(self, stmt: ast.stmt) -> bool:
         return id(stmt) in self._cute_tcgen05_invariant_setup_stmt_ids
+
+    def register_cute_tcgen05_per_tile_stmts(self, stmts: list[ast.AST]) -> None:
+        """Mark statements that depend on per-tile coordinates.
+
+        When the persistent kernel splits the device-loop prefix into a
+        once-per-CTA setup and a per-tile body, statements registered here
+        stay inside the work-tile loop; everything else can be hoisted out.
+        Use for things like ``cute.local_tile`` over the per-tile (m, n)
+        offset, ``tma_partition`` of those per-tile tensors, and the initial
+        ``producer_acquire`` / TMA prefetch that warm the pipeline at the
+        start of each tile.
+        """
+        self._cute_tcgen05_per_tile_stmt_ids.update(id(stmt) for stmt in stmts)
+
+    def is_cute_tcgen05_per_tile(self, stmt: ast.stmt) -> bool:
+        return id(stmt) in self._cute_tcgen05_per_tile_stmt_ids
+
+    @property
+    def has_cute_tcgen05_per_tile_marks(self) -> bool:
+        return bool(self._cute_tcgen05_per_tile_stmt_ids)
 
     def get_cute_tcgen05_store_value(self, name: str) -> CuteTcgen05StoreValue | None:
         for alias in self._variable_renames.get(name, [name]):
