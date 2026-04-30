@@ -159,6 +159,25 @@ def _(state: CodegenState) -> ast.AST:
     raise NotImplementedError(f"Cannot store to type: {type(tensor)}")
 
 
+def _record_pad_info(
+    state: CodegenState,
+    tensor: torch.Tensor,
+    tensor_dim: int,
+    block_id: int,
+) -> None:
+    """Record that a tensor dimension uses pl.ds() and may need host-side padding.
+
+    Note: stores one block_id per (tensor, dim).  If two inner loops tile the
+    same dim with different block_ids, the last one wins.  This is fine when
+    both loops use the same block size (the common case).
+    """
+    pad_info = state.device_function.pallas_pad_info
+    tensor_id = id(tensor)
+    if tensor_id not in pad_info:
+        pad_info[tensor_id] = {}
+    pad_info[tensor_id][tensor_dim] = block_id
+
+
 def _maybe_get_symbol_origin(idx: object) -> SymbolOrigin | None:
     if not isinstance(idx, torch.SymInt):
         return None
@@ -1235,19 +1254,7 @@ def _(state: CodegenState) -> ast.AST:
     subscript = state.proxy_arg(1)
     assert isinstance(tensor, torch.Tensor)
     assert isinstance(subscript, (list, tuple))
-    name = state.device_function.tensor_arg(tensor).name
-    name = pallas_codegen.vmem_name(state, name)
-    # Increment memory op index to stay in sync with triton backend
-    device_fn = state.device_function
-    device_fn.device_load_index += 1
-    device_fn.device_memory_op_index += 1
-    index_str, none_dims = pallas_codegen.index_str(state, subscript, tensor)
-    result = expr_from_string(f"{name}[{index_str}]")
-    for dim in none_dims:
-        result = expr_from_string(
-            f"jnp.expand_dims({{result}}, axis={dim})", result=result
-        )
-    return result
+    return pallas_codegen.load_expr(state, list(subscript), tensor)
 
 
 @_decorators.codegen(load, "metal")
@@ -1350,7 +1357,7 @@ def _(
             grids = torch.meshgrid(*(indices[i] for i in tensor_idxs), indexing="ij")
             for i, grid in zip(tensor_idxs, grids, strict=False):
                 indices[i] = grid
-        # pyrefly: ignore [bad-argument-type]
+        # pyrefly: ignore [bad-argument-type, bad-index]
         return tensor[tuple(indices)]
 
     # Create zero result matching mask shape

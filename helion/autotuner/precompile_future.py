@@ -33,6 +33,7 @@ from .logger import capture_output
 from .logger import classify_triton_exception
 from .logger import format_triton_compile_failure
 from .logger import log_generated_triton_code_debug
+from .logger import match_unrecoverable_runtime_error
 from .logger import maybe_dump_triton_failure
 from .progress_bar import iter_with_progress
 
@@ -412,9 +413,18 @@ class PrecompileFuture:
             )
             process.daemon = True
         else:
-            precompiler = _prepare_precompiler_for_fork(
-                fn, args, config, ctx.kernel, decorator, ctx.log
-            )
+            try:
+                precompiler = _prepare_precompiler_for_fork(
+                    fn, args, config, ctx.kernel, decorator, ctx.log
+                )
+            except Exception as e:
+                e.__traceback__ = None
+                if match_unrecoverable_runtime_error(e):
+                    raise
+                action = classify_triton_exception(e)
+                if action == "raise" and not ctx.settings.autotune_ignore_errors:
+                    raise
+                return PrecompileFuture.skip(ctx, config, False)
             if precompiler is None:
                 return PrecompileFuture.skip(ctx, config, True)
             mp_ctx = mp.get_context("fork")

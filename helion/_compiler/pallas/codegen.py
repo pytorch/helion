@@ -7,8 +7,40 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from helion._compiler.ast_extension import expr_from_string
+
 if TYPE_CHECKING:
     from helion._compiler.inductor_lowering import CodegenState
+
+
+def load_expr(
+    state: CodegenState,
+    subscript: list[object],
+    tensor: torch.Tensor,
+) -> ast.AST:
+    """Pallas load codegen: normal path, or indirect gather if ``plan_tiling`` flagged it."""
+    from helion._compiler.pallas.gather import emit_gather
+    from helion._compiler.pallas.plan_tiling import IndirectGatherPattern
+
+    name = state.device_function.tensor_arg(tensor).name
+    name = vmem_name(state, name)
+    device_fn = state.device_function
+    device_fn.device_load_index += 1
+    device_fn.device_memory_op_index += 1
+
+    assert state.fx_node is not None
+    patterns = state.fx_node.meta.get("indexing_patterns") or ()
+    for pattern in patterns:
+        if isinstance(pattern, IndirectGatherPattern):
+            return emit_gather(state, pattern.plan, name)
+
+    idx_str, none_dims = index_str(state, subscript, tensor)
+    result = expr_from_string(f"{name}[{idx_str}]")
+    for dim in none_dims:
+        result = expr_from_string(
+            f"jnp.expand_dims({{result}}, axis={dim})", result=result
+        )
+    return result
 
 
 def _can_tile_dimension(state: CodegenState, tensor_dim: int) -> bool:
@@ -120,11 +152,11 @@ def _generated_index_code(
 
     if isinstance(pattern, TilePattern):
         return _tile_pattern_code(
-            pattern, idx, state, tensor_dim, in_pipeline, pipeline_block_ids
+            pattern, idx, state, tensor, tensor_dim, in_pipeline, pipeline_block_ids
         )
 
     if isinstance(pattern, TileIndexWithOffsetPattern):
-        return _tile_index_with_offset_pattern_code(pattern, state)
+        return _tile_index_with_offset_pattern_code(pattern, state, tensor, tensor_dim)
 
     if isinstance(pattern, TileBeginWithOffsetPattern):
         return _tile_begin_with_offset_pattern_code(
@@ -150,6 +182,7 @@ def _tile_pattern_code(
     pattern: object,
     idx: object,
     state: CodegenState,
+    tensor: torch.Tensor,
     tensor_dim: int,
     in_pipeline: bool,
     pipeline_block_ids: set[int],
@@ -173,7 +206,7 @@ def _tile_pattern_code(
 
     can_tile = _can_tile_dimension(state, tensor_dim)
     if not can_tile:
-        return _ds_expr(state, block_id)
+        return _ds_expr(state, block_id, tensor=tensor, tensor_dim=tensor_dim)
 
     loops = state.codegen.active_device_loops.get(block_id)
     if loops and any(
@@ -181,13 +214,15 @@ def _tile_pattern_code(
         or (isinstance(loop, ForiLoopState) and not loop.use_dma)
         for loop in loops
     ):
-        return _ds_expr(state, block_id)
+        return _ds_expr(state, block_id, tensor=tensor, tensor_dim=tensor_dim)
     return ":"
 
 
 def _tile_index_with_offset_pattern_code(
     pattern: object,
     state: CodegenState,
+    tensor: torch.Tensor,
+    tensor_dim: int,
 ) -> str:
     from helion._compiler.pallas.plan_tiling import TileIndexWithOffsetPattern
 
@@ -195,7 +230,7 @@ def _tile_index_with_offset_pattern_code(
 
     block_id = pattern.block_id
     offset_str = state.device_function.literal_expr(pattern.offset)
-    return _ds_expr(state, block_id, offset_str)
+    return _ds_expr(state, block_id, offset_str, tensor=tensor, tensor_dim=tensor_dim)
 
 
 def _tile_begin_with_offset_pattern_code(
@@ -259,20 +294,93 @@ def _slice_code(
         loops = state.codegen.active_device_loops.get(block_id)
         if loops and any(isinstance(loop, DeviceLoopState) for loop in loops):
             if block_id is not None:
-                return _ds_expr(state, block_id)
+                return _ds_expr(state, block_id, tensor=tensor, tensor_dim=tensor_dim)
 
     return ":"
 
 
-def _ds_expr(state: CodegenState, block_id: int, tile_offset: str = "") -> str:
-    """Return a ``pl.ds(offset, block_size)`` expression for *block_id*, offset by *tile_offset*"""
+def _ds_expr(
+    state: CodegenState,
+    block_id: int,
+    tile_offset: str = "",
+    *,
+    tensor: torch.Tensor | None = None,
+    tensor_dim: int | None = None,
+) -> str:
+    """Return a ``pl.ds(offset, block_size)`` expression for *block_id*, offset by *tile_offset*.
+
+    When *tensor* and *tensor_dim* are provided, records the dimension in
+    ``pallas_pad_info`` so the launcher can zero-pad non-divisible dims.
+    """
     offset = state.codegen.offset_var(block_id)
     if tile_offset:
         offset = f"{offset} + {tile_offset}"
     block_size = state.device_function.block_size_var(block_id)
     if block_size is None:
         return ":"
+    if tensor is not None and tensor_dim is not None:
+        from helion.language.memory_ops import _record_pad_info
+
+        _record_pad_info(state, tensor, tensor_dim, block_id)
+
+        # Skip when tile_offset is set (e.g. offset + 64) — the shift
+        # means the full expression may not be a multiple of block_size.
+        if not tile_offset:
+            alignment = _loop_offset_alignment(block_id, state)
+            if alignment is not None:
+                # Workaround for JAX <= 0.10.0 where AssumeMultipleOp
+                # short-circuits divisibility analysis (fixed in
+                # jax-ml/jax@33c38f50b): only apply when alignment meets
+                # Mosaic's requirement, otherwise the hint could replace
+                # a stronger proof Mosaic already has.
+                from helion._compiler.backend import PallasBackend
+                from helion._compiler.compile_environment import CompileEnvironment
+
+                backend = CompileEnvironment.current().backend
+                assert isinstance(backend, PallasBackend)
+                dim_from_end = tensor.ndim - 1 - tensor_dim
+                bitwidth = tensor.dtype.itemsize * 8
+                required = backend._get_pallas_required_alignment(
+                    dim_from_end, tensor.ndim, bitwidth
+                )
+                if alignment % required == 0:
+                    # e.g. pl.ds(pl.multiple_of(offset_3, _BLOCK_SIZE_3), _BLOCK_SIZE_3)
+                    offset = f"pl.multiple_of({offset}, {block_size})"
+
     return f"pl.ds({offset}, {block_size})"
+
+
+def _loop_offset_alignment(
+    block_id: int,
+    state: CodegenState,
+) -> int | None:
+    """Return the proven alignment of a loop's offset for *block_id*, or ``None``.
+
+    A loop with step ``block_size`` produces offsets ``begin + i * block_size``,
+    which are multiples of ``block_size`` iff ``begin`` is.  Returns
+    ``block_size`` (int) when provable, ``None`` otherwise.
+    """
+    import sympy
+
+    from helion._compiler.compile_environment import CompileEnvironment
+
+    env = CompileEnvironment.current()
+    bs_value = env.block_sizes[block_id].from_config(state.device_function.config)
+    if not isinstance(bs_value, int):
+        return None
+
+    # Check that the loop begins at a multiple of block_size.
+    loops = state.codegen.active_device_loops.get(block_id)
+    if loops:
+        info = loops[-1].block_id_to_info.get(block_id)
+        if info is not None and info.begin_expr is not None:
+            begin = info.begin_expr
+            if not isinstance(begin, (int, sympy.Integer)):
+                return None  # symbolic begin — can't prove alignment
+            if int(begin) % bs_value != 0:
+                return None
+
+    return bs_value
 
 
 def vmem_name(state: CodegenState, name: str) -> str:

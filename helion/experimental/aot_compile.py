@@ -113,6 +113,7 @@ def _rename_config_symbols(body: str, kernel_name: str, config_idx: int) -> str:
         r"^(_[A-Z][A-Z0-9_]*)\s*=\s*tl\.constexpr\(", body, re.MULTILINE
     )
     for name in sorted(constexpr_names, key=len, reverse=True):
+        # pyrefly: ignore [bad-specialization]
         body = re.sub(rf"\b{re.escape(name)}\b", f"{name}{sfx}", body)
 
     return body

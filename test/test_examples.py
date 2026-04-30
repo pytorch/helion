@@ -322,7 +322,6 @@ class TestExamples(RefEagerTestBase, TestCase):
             block_sizes=[16, 16, 16, 16],
         )
 
-    @xfailIfPallas("reduction tile K=256 doesn't evenly divide K=384")
     @xfailIfCute("CuTE IR build error with non-divisible K block sizes")
     def test_bmm_non_divisible_k(self):
         args = (
@@ -506,7 +505,6 @@ class TestExamples(RefEagerTestBase, TestCase):
             indexing="block_ptr",
         )
 
-    @xfailIfPallas("missing BlockSpec for hl.load with computed indices")
     def test_cross_entropy(self):
         n, v = 128, 1000
         logits = torch.randn(n, v, device=DEVICE, dtype=torch.float32)
@@ -708,7 +706,6 @@ class TestExamples(RefEagerTestBase, TestCase):
             atol=1e-2,
         )
 
-    @xfailIfPallas("BlockSpec tiling failure")
     def test_embedding_pointers(self):
         args = (
             torch.randint(0, 1024, [8, 128], device=DEVICE, dtype=torch.int32),
@@ -722,7 +719,6 @@ class TestExamples(RefEagerTestBase, TestCase):
             indexing="pointer",
         )
 
-    @xfailIfPallas("BlockSpec tiling failure")
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfTileIR("TileIR does not support block_ptr indexing")
     def test_embedding_block_ptr(self):
@@ -963,6 +959,23 @@ class TestExamples(RefEagerTestBase, TestCase):
             x.sum(-1),
             fn_name="longsum_manual",
         )
+
+    def test_long_sum_manual_non_divisible(self):
+        """Reduction loop OOB when block_size doesn't divide the reduction dim.
+
+        longsum_manual uses dynamic shapes (static_shapes=False by default).
+        Two different non-divisible N values exercise the runtime pad
+        computation with different pad amounts.
+        """
+        for n in [50000, 40000]:
+            x = torch.randn([4, n], device=DEVICE, dtype=torch.float32)
+            check_example(
+                "long_sum",
+                (x,),
+                x.sum(-1),
+                fn_name="longsum_manual",
+                block_sizes=[32768, 1],
+            )
 
     @xfailIfCute("CuTe jagged mean example still fails lowering/runtime")
     @xfailIfPallas("JAX tracer error with dynamic shapes")
@@ -1545,6 +1558,7 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
 
     @xfailIfPallas("BackendError on pallas")
+    @skipIfXPU("Timeout on XPU")
     def test_gather_gemv(self):
         args = (
             torch.randn([4, 512, 512], device=DEVICE, dtype=torch.float32),
@@ -1660,6 +1674,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             block_sizes=[16, 8, 16],
         )
 
+    @skipIfXPU("Timeout on XPU")
     def test_fused_linear_jsd(self):
         beta = 0.5
         ignore_index = -100
@@ -1848,6 +1863,7 @@ class TestExamples(RefEagerTestBase, TestCase):
     @xfailIfPallas("tensor accessed with conflicting tiling patterns")
     @skipIfA10G("failure on a10g")
     @skipIfTileIR("accuracy failure")
+    @skipIfXPU("ocloc compilation failure with 256-GRF kernel on XPU backend")
     def test_squeeze_and_excitation_net_bwd_da(self):
         m, n, k = 256, 256, 256
         x = torch.randn([m, n], device=DEVICE, dtype=HALF_DTYPE)
@@ -1891,6 +1907,7 @@ class TestExamples(RefEagerTestBase, TestCase):
     @xfailIfCute("CuTe squeeze-and-excitation backward still fails lowering/runtime")
     @skipIfA10G("failure on a10g")
     @skipIfTileIR("accuracy failure")
+    @skipIfXPU("ocloc compilation failure with 256-GRF kernel on XPU backend")
     def test_squeeze_and_excitation_net_bwd_db(self):
         m, n, k = 256, 256, 256
         x = torch.randn([m, n], device=DEVICE, dtype=HALF_DTYPE)

@@ -115,3 +115,22 @@ jobs:
       kernels: ${{ matrix.kernels }}
       env-vars: ${{ github.event.inputs.env_vars }}
       custom-args: ${{ github.event.inputs.custom_args }}
+
+  trigger-docs-deploy:
+    if: always()
+    needs: [run-b200, run-h100, run-mi350x]
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - name: Trigger docs deploy
+        uses: actions/github-script@v9
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'docs-deploy.yml',
+              ref: 'main'
+            })

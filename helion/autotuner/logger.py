@@ -27,6 +27,7 @@ from typing_extensions import Self
 
 from torch._inductor.runtime.triton_compat import OutOfResources
 from torch._inductor.runtime.triton_compat import PTXASError
+from torch.cuda import OutOfMemoryError as CudaOOMError
 
 from helion._dist_utils import is_master_rank
 
@@ -461,6 +462,8 @@ _EXPECTED_TRITON_ERRORS_RE: re.Pattern[str] = re.compile(
                 "too many blocks in cooperative launch",  # CUDA cooperative launch limit
                 "too many resources requested for launch",  # Triton resource error
                 "CUDA error: out of memory",  # CUDA runtime OOM during kernel execution
+                "CUDA out of memory",  # PyTorch torch.cuda.OutOfMemoryError
+                "[CUDA]: out of memory",  # Triton CUDA OOM
                 "Ran out of memory in memory space vmem",  # TPU VMEM OOM (caught by Helion or XLA)
             ],
         )
@@ -497,7 +500,7 @@ def classify_triton_exception(err: BaseException) -> Literal["raise", "warn", "d
       - "debug": benign/expected error; caller can log at debug level
     """
     # Known exception types first
-    if isinstance(err, OutOfResources):
+    if isinstance(err, (OutOfResources, CudaOOMError)):
         return "debug"
     # Different PTXASError classes may be raised from different modules; match by name as well
     if isinstance(err, PTXASError) or err.__class__.__name__ == "PTXASError":

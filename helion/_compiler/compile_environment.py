@@ -672,7 +672,7 @@ class CompileEnvironment:
             return tuple(self.to_fake(e, origin) for e in obj)
         if isinstance(obj, dict):
             return {k: self.to_fake(e, origin) for k, e in obj.items()}
-        if dataclasses.is_dataclass(obj):
+        if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
             return dataclasses.replace(
                 obj,
                 **{
@@ -709,6 +709,7 @@ class CompileEnvironment:
             result = self.shape_env.create_symintnode(
                 new_expr, hint=hint, source=source
             )
+        # pyrefly: ignore [unsupported-operation]
         self._foreign_symint_cache[cache_key] = result
         return result
 

@@ -1055,6 +1055,7 @@ class PallasBackend(Backend):
             "loop_orders",
             "flatten_loops",
             "pallas_loop_type",
+            "pallas_pre_broadcast",
         }
     )
 
@@ -1363,6 +1364,9 @@ class PallasBackend(Backend):
                         )
                 else:
                     self.maybe_update_alignment_requirement(tensor, 0, node.slice)
+                # Nested subscripts (e.g. idx[tile] in table[idx[tile], :])
+                # are themselves tiled accesses and need their own alignment.
+                self.generic_visit(node)
 
             def maybe_update_alignment_requirement(
                 self, tensor: torch.Tensor, accessed_dim_start: int, subscript: ast.AST
@@ -1613,6 +1617,46 @@ class PallasBackend(Backend):
             result.append((tuple(block_shape), tuple(grid_dims)))
         return result
 
+    def _compute_pad_info(
+        self,
+        sorted_args: list[Argument] | None,
+        config: Config,
+    ) -> list[tuple[int, int, int]] | None:
+        """Identify pl.ds() dims that may need padding and their block sizes.
+
+        Uses ``pallas_pad_info`` recorded during codegen to identify which
+        tensor dimensions use ``pl.ds()`` slicing.
+
+        Returns ``[(arg_index, tensor_dim, block_size), ...]`` or ``None``.
+        The launcher computes the actual pad amount at runtime as
+        ``(-tensor.shape[dim]) % block_size``.
+        """
+        if sorted_args is None:
+            return None
+
+        from .compile_environment import CompileEnvironment
+        from .device_function import DeviceFunction
+        from .device_function import TensorArg
+
+        env = CompileEnvironment.current()
+        device_fn = DeviceFunction.current()
+        if not device_fn.pallas_pad_info:
+            return None
+
+        result: list[tuple[int, int, int]] = []
+        for i, arg in enumerate(sorted_args):
+            if not isinstance(arg, TensorArg):
+                continue
+            dims_info = device_fn.pallas_pad_info.get(id(arg.fake_value))
+            if dims_info is not None:
+                for dim, block_id in dims_info.items():
+                    bsi = env.block_sizes[block_id]
+                    bs = bsi.from_config(config)
+                    if isinstance(bs, int) and bs > 1:
+                        result.append((i, dim, bs))
+
+        return result or None
+
     def build_launcher_args(
         self,
         args: list[str],
@@ -1708,6 +1752,10 @@ class PallasBackend(Backend):
             if has_rng_ops:
                 block_spec_info.append(None)  # RNG seed buffer is untiled
             launcher_args.append(f"_block_spec_info={block_spec_info!r}")
+
+        pad_info = self._compute_pad_info(sorted_args, config)
+        if pad_info:
+            launcher_args.append(f"_ds_pad_dims={pad_info!r}")
 
         from .device_function import PallasMemorySpace
 

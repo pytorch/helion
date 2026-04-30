@@ -55,6 +55,7 @@ def fmt_delta(curr, prev):
 def gh_api(endpoint):
     r = subprocess.run(f'gh api "{endpoint}"', shell=True, capture_output=True, text=True)
     if r.returncode != 0:
+        print(f"Warning: gh api failed for {endpoint}: {r.stderr.strip()}")
         return None
     return json.loads(r.stdout)
 
@@ -69,12 +70,17 @@ def fetch_runs(repo, workflow_name, days):
     cutoff = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
     runs = []
     for page in range(1, 11):
-        data = gh_api(f"repos/{repo}/actions/workflows/{wf_id}/runs?per_page=100&page={page}&status=completed&created=>{cutoff}")
+        # Avoid status= and created= query filters — they are unreliable
+        # on the GitHub API (intermittently return 0 results). Filter
+        # client-side instead.
+        data = gh_api(f"repos/{repo}/actions/workflows/{wf_id}/runs?per_page=100&page={page}")
         if not data or not data.get("workflow_runs"):
             break
+        past_cutoff = False
         for r in data["workflow_runs"]:
-            # Include cancelled runs: successful jobs within them still upload artifacts
-            # before the workflow is killed (e.g., the 6-hour job timeout).
+            if r["created_at"] < cutoff:
+                past_cutoff = True
+                break
             if r.get("conclusion") in ("success", "failure", "cancelled"):
                 runs.append({
                     "run_id": str(r["id"]),
@@ -83,6 +89,8 @@ def fetch_runs(repo, workflow_name, days):
                     "date": r["created_at"],
                     "branch": r.get("head_branch", "main"),
                 })
+        if past_cutoff:
+            break
     return runs
 
 
@@ -403,6 +411,15 @@ def main():
 
     runs = fetch_runs(args.repo, args.workflow_name, RETENTION_DAYS)
     print(f"Found {len(runs)} runs in last {RETENTION_DAYS} days")
+
+    if not runs and existing.get("runs"):
+        print(f"ERROR: fetch_runs returned 0 but existing data has {len(existing['runs'])} runs.")
+        print("This is likely a transient API failure. Using existing data as-is.")
+        with open(args.output, "w") as f:
+            json.dump(existing, f, indent=2)
+        s = existing.get("stats", {})
+        print(f"Output (existing): {s.get('total_combos', 0)} combos, {len(existing['runs'])} runs")
+        return
 
     cache_dir = "./benchmark-cache"
     os.makedirs(cache_dir, exist_ok=True)
