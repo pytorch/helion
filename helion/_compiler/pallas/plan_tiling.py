@@ -357,10 +357,12 @@ def resident_block_elements(
 
     Walks ``patterns`` alongside the tensor dims. Per-dim contribution:
       - ``NonePattern``: skipped (broadcast axis, no tensor dim consumed).
-      - ``TilePattern`` / ``TileBeginWithOffsetPattern``: configured
+      - ``TilePattern`` / ``TileIndexWithOffsetPattern``: configured
         ``block_size``, clamped to the full dim extent.
-      - Anything else (scalar index, full slice, indirect tensor index):
-        the full dim extent.
+      - ``TileBeginWithOffsetPattern`` / ``ArbitraryIndexPattern``: scalar
+        index, contributes 1.
+      - Anything else (full slice, indirect tensor index): the full dim
+        extent.
 
     Returns ``None`` if any consumed dim is symbolic.
     """
@@ -376,10 +378,12 @@ def resident_block_elements(
         if not isinstance(dim_size, int):
             # No support for dynamic shapes.
             return None
-        if isinstance(p, (TilePattern, TileBeginWithOffsetPattern)):
+        if isinstance(p, (TilePattern, TileIndexWithOffsetPattern)):
             bs = env.block_sizes[p.block_id].from_config(config)
             if isinstance(bs, int):
                 dim_size = min(bs, dim_size)
+        elif isinstance(p, (TileBeginWithOffsetPattern, ArbitraryIndexPattern)):
+            dim_size = 1
         elements *= dim_size
         # Advance only on patterns that consume a tensor dim; NonePattern doesn't.
         tdim += 1
