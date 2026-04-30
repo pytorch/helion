@@ -248,7 +248,8 @@ class Kernel(Generic[_R]):
         without any extras discovered during compilation. Used internally for
         _specialize_extra lookups.
         """
-        result = []
+        result: list[Hashable] = []
+        device_type: str | None = None
         assert len(args) <= len(self._annotations)
         for value, annotation in zip(args, self._annotations, strict=False):
             if isinstance(value, ConstExpr):
@@ -256,10 +257,15 @@ class Kernel(Generic[_R]):
             elif annotation is ConstExpr:
                 result.append(value)
             else:
+                if device_type is None and isinstance(value, torch.Tensor):
+                    # NOTE: device.type doesn't distinguish device index,
+                    # so two different GPU types on the same machine will
+                    # incorrectly share a cache entry.
+                    device_type = value.device.type
                 result.append(self._specialization_key(value))
         if self._key_fn is not None:
-            return (*result, self._key_fn(*args))
-        return (*result,)
+            return (*result, device_type, self._key_fn(*args))
+        return (*result, device_type)
 
     def specialization_key(self, args: Sequence[object]) -> tuple[Hashable, ...]:
         """
@@ -295,9 +301,8 @@ class Kernel(Generic[_R]):
         Returns:
             Hashable: A hashable key representing the specialization of the object.
         """
-        try:
-            extractor = _specialization_extractors[type(obj)]
-        except KeyError:
+        extractor = _specialization_extractors.get(type(obj))
+        if extractor is None:
             if isinstance(obj, torch.fx.GraphModule):
                 # GraphModule subclasses need special handling
                 extractor = _specialization_extractors[torch.fx.GraphModule]
@@ -307,9 +312,7 @@ class Kernel(Generic[_R]):
             elif dataclasses.is_dataclass(obj):
                 extractor = _specialization_extractors["dataclass"]
             else:
-                raise TypeError(
-                    f"unsupported argument type: {type(obj).__name__}"
-                ) from None
+                raise TypeError(f"unsupported argument type: {type(obj).__name__}")
         return extractor(self, obj)
 
     def normalize_args(self, *args: object, **kwargs: object) -> tuple[object, ...]:
@@ -1195,19 +1198,47 @@ def _safe_bucket_dim(s: int | torch.SymInt) -> Hashable:
     return min(s, 2)
 
 
+_EMPTY_FROZENSET: frozenset[int] = frozenset()
+
+
+def _bucketed_size(obj: torch.Tensor) -> tuple[Hashable, ...]:
+    sz = obj.size()
+    n = len(sz)
+    if n == 1:
+        return (_safe_bucket_dim(sz[0]),)
+    if n == 2:
+        return (_safe_bucket_dim(sz[0]), _safe_bucket_dim(sz[1]))
+    if n == 3:
+        return (
+            _safe_bucket_dim(sz[0]),
+            _safe_bucket_dim(sz[1]),
+            _safe_bucket_dim(sz[2]),
+        )
+    return tuple(_safe_bucket_dim(s) for s in sz)
+
+
+def _hashable_dims(dims: Sequence[int | torch.SymInt]) -> tuple[Hashable, ...]:
+    n = len(dims)
+    if n == 1:
+        return (_hashable_dim(dims[0]),)
+    if n == 2:
+        return (_hashable_dim(dims[0]), _hashable_dim(dims[1]))
+    if n == 3:
+        return (_hashable_dim(dims[0]), _hashable_dim(dims[1]), _hashable_dim(dims[2]))
+    return tuple(_hashable_dim(s) for s in dims)
+
+
 def _tensor_key(fn: Kernel, obj: torch.Tensor) -> Hashable:
-    # NOTE: If a machine has two different gpu types on the same machine,
-    # obj.device.type will incorrectly hit
-    static_indices = frozenset(getattr(obj, "_dynamo_static_indices", ()))
+    si = getattr(obj, "_dynamo_static_indices", None)
+    static_indices = frozenset(si) if si is not None else _EMPTY_FROZENSET
     if fn.settings.static_shapes:
         return (
             obj.dtype,
-            obj.device.type,
-            tuple(_hashable_dim(s) for s in obj.size()),
-            tuple(_hashable_dim(s) for s in obj.stride()),
+            _hashable_dims(obj.size()),
+            _hashable_dims(obj.stride()),
             static_indices,
         )
-    bucketed = tuple(_safe_bucket_dim(s) for s in obj.size())
+    bucketed = _bucketed_size(obj)
     if fn.settings.index_dtype is None:
         try:
             needs_int64 = bool(obj.numel() > _INT32_INDEX_LIMIT)
@@ -1215,14 +1246,12 @@ def _tensor_key(fn: Kernel, obj: torch.Tensor) -> Hashable:
             needs_int64 = True  # unbacked SymInt
         return (
             obj.dtype,
-            obj.device.type,
             bucketed,
             needs_int64,
             static_indices,
         )
     return (
         obj.dtype,
-        obj.device.type,
         bucketed,
         static_indices,
     )
