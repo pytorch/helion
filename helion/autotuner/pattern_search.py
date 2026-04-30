@@ -164,7 +164,7 @@ class PatternSearch(PopulationBasedSearch):
             raise exc.NoConfigFound
 
         search_copies = [self._pattern_search_from(m, visited) for m in starting_points]
-        for generation in range(1, self.max_generations + 1):
+        for generation in self._budgeted_range(1, self.max_generations + 1):
             prior_best = self.best
             new_population = {id(prior_best): prior_best}
             num_neighbors = 0

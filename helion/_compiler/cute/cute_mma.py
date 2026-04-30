@@ -902,6 +902,14 @@ def _emit_mma_pipeline(
     # confirm the launch grid has enough M-CTAs to satisfy the cluster
     # shape -- CUDA rejects clusters with fewer CTAs than the cluster size,
     # so symbolic M dimensions take the safe path too.
+    #
+    # The matmul autotune search also narrows to cluster_m=1 because
+    # runtime CUDA "unspecified launch failure" reproduces on the
+    # 1-CTA clustered path even when the demotion below would not
+    # trigger. The narrowing is the user-facing safety net; the
+    # demotion below is the codegen-side fallback that catches cases
+    # the narrowing missed (e.g. explicit Configs from ``set_config``
+    # with cluster_m=2 + bm=64).
     if tcgen05_cluster_m > 1:
         m_total = lhs_fake.shape[0]
         if (
@@ -1092,8 +1100,7 @@ def _emit_mma_pipeline(
             )
             # Register reallocation: producer warps (TMA, ab_load, scheduler)
             # decrease their per-thread register budget so the consumer warps
-            # (exec, epi, epi_load) can be raised. Matches Quack's sm100 split
-            # (gemm_sm100.py:215-216, 1018, 1239, 1257, 1331, 1375, 1513).
+            # (exec, epi, epi_load) can be raised. Matches Quack's sm100 split.
             # The setmaxregister calls are warp-uniform and must precede the
             # first pipeline op of each role; placing them with the role-gate
             # invariants keeps them out of the per-tile work loop.
@@ -1263,10 +1270,11 @@ def _emit_mma_pipeline(
                 f"{acc_dtype_str}, 0, cute.AddressSpace.tmem, assumed_align=16)"
             )
         )
-        prefix.append(statement_from_string(f"{acc_frag} = {acc_frag_base}"))
-        prefix.append(
-            statement_from_string(f"{tcgen05_epi_acc_frag_base} = {acc_frag_base}")
-        )
+        # ``acc_frag`` is reassigned per-tile below to a stage-indexed
+        # slice; an extra ``acc_frag = acc_frag_base`` here would land
+        # in the hoisted setup with a different CuTe type and break the
+        # persistent ``while`` ("acc_frag is structured different after
+        # this while").
         prefix.append(
             statement_from_string(
                 f"if {tcgen05_plan.exec_active}:\n"
