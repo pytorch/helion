@@ -463,6 +463,7 @@ _EXPECTED_TRITON_ERRORS_RE: re.Pattern[str] = re.compile(
                 "too many resources requested for launch",  # Triton resource error
                 "CUDA error: out of memory",  # CUDA runtime OOM during kernel execution
                 "CUDA out of memory",  # PyTorch torch.cuda.OutOfMemoryError
+                "[CUDA]: out of memory",  # Triton CUDA OOM
                 "Ran out of memory in memory space vmem",  # TPU VMEM OOM (caught by Helion or XLA)
             ],
         )
