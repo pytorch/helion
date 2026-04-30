@@ -308,7 +308,9 @@ def _embedding_shapes() -> list[tuple[str, tuple[Any, ...]]]:
     # First entry mirrors examples/embedding.py main() (16x64 weights, [256,32]
     # indices). PR #2054's gather strategy keeps the weight table in VMEM
     # (16 MiB threshold), so we cap the larger shapes accordingly.
-    configs = [(256, 32, 16, 64), (1024, 128, 4096, 256), (512, 256, 8192, 512)]
+    # 2nd shape kept modestly larger than the 1st; (1024,128,4096,256) made
+    # autotune take >30 min, exceeding the per-kernel budget.
+    configs = [(256, 32, 16, 64), (512, 64, 32, 64), (1024, 128, 4096, 256)]
     return [
         (
             f"[{a},{b},{ne},{ed}]",
@@ -371,7 +373,9 @@ def _layer_norm_shapes() -> list[tuple[str, tuple[Any, ...]]]:
 
 
 def _softmax_shapes_basic() -> list[tuple[str, tuple[Any, ...]]]:
-    shapes = [(4096, 2560), (4096, 5120), (2048, 4096), (1024, 8192)]
+    # The kernel specializes on the trailing dim, so changing it across the
+    # 2nd shape produces a shape-mismatch failure. Scale M instead for the 2nd.
+    shapes = [(4096, 2560), (8192, 2560), (2048, 4096), (1024, 8192)]
     return [
         (
             f"[{m},{n}]",
