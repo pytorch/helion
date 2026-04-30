@@ -12,6 +12,7 @@ from typing import Callable
 from typing import NamedTuple
 from typing import cast
 
+import sympy
 import torch
 from torch._inductor.runtime.runtime_utils import next_power_of_2
 import torch.distributed as dist
@@ -33,6 +34,7 @@ from .config_fragment import EnumFragment
 from .config_fragment import IntegerFragment
 from .config_fragment import ListOf
 from .config_fragment import NumWarpsFragment
+from .config_fragment import PerDimListOf
 from .config_fragment import PermutationFragment
 from .config_fragment import PowerOfTwoFragment
 from .config_fragment import assert_integer_power_of_two
@@ -137,6 +139,7 @@ VALID_KEYS: frozenset[str] = frozenset(
         "l2_groupings",
         "reduction_loops",
         "flatten_loops",
+        "grid_foldings",
         "range_unroll_factors",
         "range_warp_specializes",
         "range_num_stages",
@@ -208,6 +211,7 @@ class ConfigSpec:
         self.loop_orders: BlockIdSequence[LoopOrderSpec] = BlockIdSequence()
         self.l2_groupings: BlockIdSequence[L2GroupingSpec] = BlockIdSequence()
         self.flatten_loops: BlockIdSequence[FlattenLoopSpec] = BlockIdSequence()
+        self.grid_foldings: BlockIdSequence[GridFoldingSpec] = BlockIdSequence()
         self.reduction_loops: BlockIdSequence[ReductionLoopSpec] = BlockIdSequence()
         self.range_unroll_factors: BlockIdSequence[RangeUnrollFactorSpec] = (
             BlockIdSequence()
@@ -336,6 +340,7 @@ class ConfigSpec:
         self.loop_orders._remove_duplicates()
         self.l2_groupings._remove_duplicates()
         self.flatten_loops._remove_duplicates()
+        self.grid_foldings._remove_duplicates()
         self.range_unroll_factors._remove_duplicates()
         self.range_warp_specialize._remove_duplicates()
         self.range_num_stages._remove_duplicates()
@@ -387,6 +392,7 @@ class ConfigSpec:
             "reduction_loop",
             "l2_grouping",
             "flatten_loop",
+            "grid_folding",
             "range_unroll_factor",
             "range_warp_specialize",
             "range_num_stage",
@@ -429,6 +435,7 @@ class ConfigSpec:
             ("block_sizes", self.block_sizes, True),
             ("num_threads", self.num_threads, True),
             ("flatten_loops", self.flatten_loops, True),
+            ("grid_foldings", self.grid_foldings, False),
             ("l2_groupings", self.l2_groupings, True),
             ("loop_orders", self.loop_orders, False),
             ("reduction_loops", self.reduction_loops, True),
@@ -499,6 +506,7 @@ class ConfigSpec:
             "loop_orders",
             "l2_groupings",
             "flatten_loops",
+            "grid_foldings",
             "reduction_loops",
             "range_unroll_factors",
             "range_warp_specializes",
@@ -660,6 +668,83 @@ class ConfigSpec:
                     f"advanced_controls_file must be a string path, got {value!r}"
                 )
             config["advanced_controls_file"] = value
+
+        # Per-dim degenerate factor rejection: factor >= num_blocks means
+        # the grid collapses to 1 cell for that dim — equivalent to full
+        # folding.  Reject (or normalize to -1) to shrink the search space.
+        # Only works for static shapes; skipped when numel is symbolic.
+        grid_foldings_list = cast("list[list[int]]", config.get("grid_foldings", []))
+        block_sizes_list = cast("list[int]", config.get("block_sizes", []))
+        from .._compiler.compile_environment import CompileEnvironment
+        from .._compiler.compile_environment import NoCurrentEnvironment
+
+        try:
+            env: CompileEnvironment | None = CompileEnvironment.current()
+        except NoCurrentEnvironment:
+            env = None
+        if env is not None:
+            for spec_idx, spec in enumerate(self.grid_foldings):
+                if spec_idx >= len(grid_foldings_list):
+                    continue
+                factors = grid_foldings_list[spec_idx]
+                for dim_idx, (block_id, factor) in enumerate(
+                    zip(spec.block_ids, factors, strict=True)
+                ):
+                    if factor <= 0:
+                        continue
+                    bs_info = env.block_sizes[block_id]
+                    bs = self.block_sizes.config_get(block_sizes_list, block_id)
+                    if bs_info.size is None or bs is None:
+                        continue
+                    numel_val = bs_info.numel
+                    if not isinstance(numel_val, (int, sympy.Integer)):
+                        continue
+                    num_blocks = int(
+                        sympy.ceiling(sympy.Rational(int(numel_val), int(bs)))
+                    )
+                    if factor >= num_blocks:
+                        # Always normalize — a degenerate partial factor
+                        # has an unambiguous meaning (equivalent to -1).
+                        # Unlike all-dims-folded which has no valid grid,
+                        # this is not truly invalid.  The search space
+                        # reduction comes from the fragment filter in
+                        # GridFoldingSpec._fragment(), not from rejection here.
+                        factors[dim_idx] = -1
+
+        # Reject grid_foldings that fold ALL dims — the grid would
+        # collapse to a single SM, which is never useful.
+        for factors in grid_foldings_list:
+            if factors and all(f != 0 for f in factors):
+                if _fix_invalid:
+                    # Reset the last non-zero factor to 0 so at least one
+                    # dim stays in the grid.
+                    for i in reversed(range(len(factors))):
+                        if factors[i] != 0:
+                            factors[i] = 0
+                            break
+                else:
+                    raise InvalidConfig(
+                        "grid_foldings cannot fold all dimensions "
+                        "(grid would collapse to a single SM)"
+                    )
+
+        # Force grid_foldings to all-zeros for persistent pid_types
+        if pid_type in ("persistent_blocked", "persistent_interleaved"):
+            grid_foldings_list = cast(
+                "list[list[int]]", config.get("grid_foldings", [])
+            )
+            has_folding = any(
+                factor != 0 for factors in grid_foldings_list for factor in factors
+            )
+            if has_folding:
+                if _fix_invalid:
+                    config["grid_foldings"] = [
+                        [0] * len(factors) for factors in grid_foldings_list
+                    ]
+                else:
+                    raise InvalidConfig(
+                        "grid_foldings is not supported with persistent pid_types"
+                    )
 
         if "epilogue_subtile" in config:
             val = config["epilogue_subtile"]
@@ -825,6 +910,7 @@ class ConfigSpec:
                 for name, seq in [
                     ("loop_orders", self.loop_orders),
                     ("flatten_loops", self.flatten_loops),
+                    ("grid_foldings", self.grid_foldings),
                     ("l2_groupings", self.l2_groupings),
                     ("reduction_loops", self.reduction_loops),
                     ("range_unroll_factors", self.range_unroll_factors),
@@ -950,6 +1036,7 @@ class ConfigSpec:
             "loop_orders",
             "num_threads",
             "flatten_loops",
+            "grid_foldings",
             "reduction_loops",
             "l2_groupings",
             "range_unroll_factors",
@@ -1124,6 +1211,102 @@ class FlattenLoopSpec(_BlockIdItem):
 
     def _fill_missing(self) -> bool:
         return False
+
+
+class GridFoldingSpec(_BlockIdItem):
+    """Per-dimension folding factors for grid dimensions.
+
+    Each dimension gets a folding factor:
+      0  — no folding, dimension fully in launch grid
+      k  — partial folding (k must be power of 2, 2 ≤ k ≤ 64),
+           grid shrinks by factor k, each grid cell loops k times
+      -1 — full folding, dimension entirely in an inner device loop
+    """
+
+    # Valid folding factor choices (order matters for EnumFragment default)
+    VALID_FACTORS: tuple[int, ...] = (0, -1, 2, 4, 8, 16, 32, 64)
+
+    MIN_BLOCKS_FOR_PARTIAL = 4
+    MIN_GRID_SM_RATIO = 2
+
+    def _fragment(self, base: ConfigSpec) -> PerDimListOf | ListOf:
+        from .._compiler.compile_environment import CompileEnvironment
+        from .._compiler.compile_environment import NoCurrentEnvironment
+
+        try:
+            env = CompileEnvironment.current()
+        except NoCurrentEnvironment:
+            # Outside compilation (e.g. tests that enumerate fragments
+            # without binding a kernel) — use unfiltered choices.
+            return ListOf(
+                EnumFragment(choices=self.VALID_FACTORS),
+                length=len(self.block_ids),
+            )
+
+        # First pass: compute num_blocks per dimension.
+        dim_num_blocks: list[int | None] = []
+        for block_id in self.block_ids:
+            bs_info = env.block_sizes[block_id]
+            bs_spec = base.block_sizes.block_id_lookup(block_id)
+            nb: int | None = None
+            if bs_info.size is not None:
+                numel_val = bs_info.numel
+                if isinstance(numel_val, (int, sympy.Integer)):
+                    min_bs = bs_spec.autotuner_min or bs_spec.min_size
+                    nb = int(
+                        sympy.ceiling(
+                            sympy.Rational(int(numel_val), max(int(min_bs), 1))
+                        )
+                    )
+            dim_num_blocks.append(nb)
+
+        # Gate: disable partial folding when the total launch grid is small
+        # relative to the number of SMs — folding can only hurt occupancy.
+        total_grid = 1
+        all_known = True
+        for nb in dim_num_blocks:
+            if nb is not None:
+                total_grid *= nb
+            else:
+                all_known = False
+        n_cus = num_compute_units()
+        small_grid = all_known and total_grid < self.MIN_GRID_SM_RATIO * n_cus
+
+        # Second pass: build per-dim fragments with heuristic gating.
+        fragments: list[ConfigSpecFragment] = []
+        for nb in dim_num_blocks:
+            if nb is not None:
+                max_factor = nb - 1
+                if small_grid or nb < self.MIN_BLOCKS_FOR_PARTIAL:
+                    choices = tuple(f for f in self.VALID_FACTORS if f <= 0)
+                else:
+                    choices = tuple(
+                        f for f in self.VALID_FACTORS if f <= 0 or f <= max_factor
+                    )
+            else:
+                choices = self.VALID_FACTORS
+            fragments.append(EnumFragment(choices=choices))
+        return PerDimListOf(fragments=fragments)
+
+    def _normalize(self, name: str, value: object) -> list[int]:
+        if type(value) is not list:
+            if not isinstance(value, tuple):
+                raise InvalidConfig(f"{name} must be a list, got {value!r}")
+            value = [*value]
+        length = len(self.block_ids)
+        if len(value) != length:
+            raise InvalidConfig(f"{name} must be length {length}, got {len(value)}")
+        for i, v in enumerate(value):
+            if not isinstance(v, int):
+                raise InvalidConfig(f"{name}[{i}] must be an integer, got {v!r}")
+            if v not in self.VALID_FACTORS:
+                raise InvalidConfig(
+                    f"{name}[{i}] must be one of {self.VALID_FACTORS}, got {v}"
+                )
+        return value
+
+    def _fill_missing(self) -> list[int]:
+        return [0] * len(self.block_ids)
 
 
 class ReductionLoopSpec(_PowerOfTwoBlockIdItem):

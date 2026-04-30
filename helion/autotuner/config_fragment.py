@@ -379,3 +379,57 @@ class ListOf(ConfigSpecFragment):
         for v in value:
             encoded.extend(self.inner.encode(v))
         return encoded
+
+
+@dataclasses.dataclass
+class PerDimListOf(ConfigSpecFragment):
+    """Like ListOf but each position has its own fragment with distinct choices.
+
+    ListOf repeats a single inner fragment for every position, so all
+    dimensions share the same valid values.  PerDimListOf holds a separate
+    fragment per dimension, allowing each to have a different choice set
+    (e.g. grid folding factors filtered by per-dim num_blocks).
+    """
+
+    fragments: list[ConfigSpecFragment]
+
+    def default(self) -> list[object]:
+        return [f.default() for f in self.fragments]
+
+    def random(self) -> list[object]:
+        return [f.random() for f in self.fragments]
+
+    def pattern_neighbors(self, current: object, radius: int = 1) -> list[object]:
+        if not isinstance(current, list) or len(current) != len(self.fragments):
+            raise ValueError(
+                f"Expected list of length {len(self.fragments)}, got {current!r}"
+            )
+        neighbors: list[object] = []
+        for i, frag in enumerate(self.fragments):
+            for neighbor_value in frag.pattern_neighbors(current[i], radius):
+                neighbor = current.copy()
+                neighbor[i] = neighbor_value
+                neighbors.append(neighbor)
+        return neighbors
+
+    def differential_mutation(self, a: object, b: object, c: object) -> list[object]:
+        assert isinstance(a, list) and len(a) == len(self.fragments)
+        assert isinstance(b, list) and len(b) == len(self.fragments)
+        assert isinstance(c, list) and len(c) == len(self.fragments)
+        return [
+            self.fragments[i].differential_mutation(a[i], b[i], c[i])
+            for i in range(len(self.fragments))
+        ]
+
+    def fingerprint(self) -> tuple[int, ...]:
+        return (len(self.fragments),)
+
+    def dim(self) -> int:
+        return sum(f.dim() for f in self.fragments)
+
+    def encode(self, value: object) -> list[float]:
+        assert isinstance(value, list)
+        encoded = []
+        for v, frag in zip(value, self.fragments, strict=True):
+            encoded.extend(frag.encode(v))
+        return encoded

@@ -66,7 +66,9 @@ class ThreadAxisTracker:
             self.block_axes[block_id] = axis
 
 
-def _lane_loop_iter(extent: int) -> ast.AST:
+def _lane_loop_iter(extent: int | ast.AST) -> ast.AST:
+    if isinstance(extent, ast.AST):
+        return extent
     # CuTe lane loops carry per-thread scalar state. Emitting them via
     # cutlass.range(_constexpr) miscompiles scalar matmul paths, so keep them
     # as ordinary Python loops.
@@ -154,7 +156,15 @@ class ForiLoopState(DeviceLoopOrGridState):
 
 @dataclasses.dataclass
 class DeviceGridState(DeviceLoopOrGridState):
-    lane_loops: list[tuple[str, int]] = dataclasses.field(default_factory=list)
+    # Each lane_loop entry is (var, extent) or (var, extent, setup, guard).
+    # The optional third element contains AST statements placed inside the
+    # loop body before the wrapped kernel body (e.g. offset/index/mask
+    # recomputation for partial folding).  The optional fourth element is
+    # a guard expression string; when present, the kernel body is wrapped
+    # in ``if guard:`` inside the loop, after the setup statements.
+    lane_loops: list[tuple[str, object, ...]] = dataclasses.field(  # pyrefly: ignore
+        default_factory=list
+    )
     lane_loop_blocks: set[int] = dataclasses.field(default_factory=set)
     lane_setup_statements: list[ast.AST] = dataclasses.field(default_factory=list)
     outer_prefix: list[ast.AST] = dataclasses.field(default_factory=list)
@@ -169,7 +179,22 @@ class DeviceGridState(DeviceLoopOrGridState):
 
     def wrap_body(self, body: list[ast.AST]) -> list[ast.AST]:
         wrapped: list[ast.AST] = [*self.lane_setup_statements, *body]
-        for lane_var, extent in reversed(self.lane_loops):
+        for entry in reversed(self.lane_loops):
+            lane_var, extent = entry[0], entry[1]
+            setup: list[ast.AST] = list(entry[2]) if len(entry) > 2 else []
+            guard: str | None = entry[3] if len(entry) > 3 else None
+            # Guard wraps the body in an ``if`` to skip out-of-bounds iterations
+            if guard is not None:
+                wrapped = [
+                    create(
+                        ast.If,
+                        test=expr_from_string(guard),
+                        body=wrapped,
+                        orelse=[],
+                    )
+                ]
+            # Setup statements go before the guarded body, inside the loop
+            wrapped = [*setup, *wrapped]
             wrapped = [
                 create(
                     ast.For,
@@ -701,10 +726,15 @@ class BlockSizeTileStrategy(TileStrategy):
         return reserved_reduction_axes + active_non_reduction_axes
 
     def select_pid_strategy(self) -> ProgramIDs:
+        return self._select_pid_strategy_for_dims(len(self.block_ids))
+
+    def _select_pid_strategy_for_dims(self, effective_dims: int) -> ProgramIDs:
         pid_type = self.fn.config.pid_type
         if pid_type == "xyz":
-            assert 1 < len(self.block_ids) <= 3
-            return XYZProgramIDs()
+            if 1 < effective_dims <= 3:
+                return XYZProgramIDs()
+            # Fall back to flat when xyz is not feasible due to grid folding
+            return FlatProgramIDs()
         if pid_type == "persistent_blocked":
             return PersistentBlockedProgramIDs()
         if pid_type == "persistent_interleaved":
@@ -714,7 +744,14 @@ class BlockSizeTileStrategy(TileStrategy):
 
 
 class FlattenedTileStrategy(BlockSizeTileStrategy):
-    """Collapse all dimensions into single flat iteration space."""
+    """Collapse dimensions into single flat iteration space.
+
+    When folded_block_ids is provided, the folded dimensions are excluded
+    from the flat product and handled by ForLoopGraphInfo device loops.
+    The remaining (unfolded) dimensions are flattened together — enabling
+    "partial flattening" where some dims are in loops and the rest share
+    a single flat grid dim.
+    """
 
     # pyrefly: ignore [bad-override]
     block_size: SymIntLike
@@ -725,14 +762,19 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
         block_ids: list[int],
         block_size: list[SymIntLike] | SymIntLike,
         loop_order: list[int],
+        folded_block_ids: set[int] | frozenset[int] | None = None,
     ) -> None:
+        self._folded_block_ids: frozenset[int] = frozenset(folded_block_ids or ())
         assert isinstance(block_size, (int, torch.SymInt))
         super().__init__(fn, block_ids, block_size, loop_order)
         env = CompileEnvironment.current()
+        unfolded_numels = [
+            env.block_sizes[i].numel
+            for i in block_ids
+            if i not in self._folded_block_ids
+        ]
         if not env.backend.force_tile_mask() and env.known_multiple(
-            functools.reduce(
-                operator.mul, [env.block_sizes[i].numel for i in block_ids]
-            ),
+            functools.reduce(operator.mul, unfolded_numels),
             block_size,
         ):
             self._mask_var = None
@@ -744,7 +786,8 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
         assert key not in fn.block_size_var_cache
         fn.block_size_var_cache[key] = bs_var = self.new_var("_BLOCK_SIZE")
         for block_index in block_ids:
-            fn.block_size_var_cache[(block_index,)] = bs_var
+            if block_index not in self._folded_block_ids:
+                fn.block_size_var_cache[(block_index,)] = bs_var
 
     def new_var(self, prefix: str, dce: bool = False) -> str:
         return self.fn.new_var(
@@ -911,13 +954,19 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
         total_numel: sympy.Expr | str = sympy.S.One
         statements = []
 
+        reordered = self._reorder([*zip(block_ids, begins, ends, steps, strict=True)])
+        unfolded = [
+            (bid, b, e, s)
+            for bid, b, e, s in reordered
+            if bid not in self._folded_block_ids
+        ]
+        num_unfolded = len(unfolded)
+
         # pyrefly: ignore [bad-assignment]
-        for i, (block_idx, begin, end, step) in enumerate(
-            self._reorder([*zip(block_ids, begins, ends, steps, strict=True)])
-        ):
+        for i, (block_idx, begin, end, step) in enumerate(unfolded):
             cute_scalar_tile = (
                 CompileEnvironment.current().backend.name == "cute"
-                and len(block_ids) == 1
+                and num_unfolded == 1
                 and self._uses_thread_axis()
                 and step not in (None, 1)
             )
@@ -930,12 +979,12 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
             expr = offsets_var
             if total_numel != sympy.S.One:
                 expr = f"({expr}) // ({self._numel_str(state, total_numel)})"
-            if i + 1 < len(block_ids):
+            if i + 1 < num_unfolded:
                 expr = f"({expr}) % ({self._numel_str(state, numel)})"
             step_expr = self._expr_str(step) if step not in (None, 1) else None
             if step_expr is not None and not (
                 CompileEnvironment.current().backend.name == "cute"
-                and len(block_ids) == 1
+                and num_unfolded == 1
                 and self._uses_thread_axis()
             ):
                 expr = f"({expr}) * ({step_expr})"
@@ -1077,11 +1126,14 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
                     tracker.record_all(
                         self.block_ids, self._flat_thread_axis(), self.block_size
                     )
+                block_id_to_info = self._create_block_id_info_dict(
+                    state, ends_override=[end]
+                )
+                for bid in self._folded_block_ids:
+                    block_id_to_info.pop(bid, None)
                 return DeviceGridState(
                     self,
-                    block_id_to_info=self._create_block_id_info_dict(
-                        state, ends_override=[end]
-                    ),
+                    block_id_to_info=block_id_to_info,
                     thread_axis_sizes=tracker.sizes,
                     block_thread_axes=tracker.block_axes,
                 )
@@ -1123,6 +1175,8 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
             state.device_function.set_pid(pids)
 
         block_id_to_info = self._create_block_id_info_dict(state, ends_override=ends)
+        for bid in self._folded_block_ids:
+            block_id_to_info.pop(bid, None)
         tracker = ThreadAxisTracker()
         if self._uses_thread_axis():
             thread_size: int | None = None
@@ -1235,11 +1289,11 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
             return shapes
 
         env = CompileEnvironment.current()
-        # Filter out unit-sized blocks that don't need compacting
         compact_block_ids = [
             block_id
             for block_id in self.block_ids
-            if not (
+            if block_id not in self._folded_block_ids
+            and not (
                 isinstance(env.block_sizes[block_id].size, int)
                 and env.block_sizes[block_id].size == 1
             )
@@ -1293,6 +1347,7 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
     ) -> None:
         assert isinstance(block_size, list)
         super().__init__(fn, block_ids, block_size, loop_order)
+        self.mask_vars: dict[int, str | None] = {}
         for bs, block_idx in zip(block_size, block_ids, strict=True):
             if (block_idx,) not in fn.block_size_var_cache and bs != 1:
                 fn.block_size_var_cache[(block_idx,)] = fn.new_var(
@@ -1418,15 +1473,48 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
         env = CompileEnvironment.current()
         block_sizes = self.block_size
         assert len(block_sizes) == len(block_ids)
-        pids = self.select_pid_strategy()
-        if isinstance(state.device_function.pid, ForEachProgramID):
-            pids.shared_pid_var = state.device_function.pid.shared_pid_var
-        elif (
-            isinstance(pids, FlatProgramIDs)
-            and env.backend.name == "pallas"
-            and len(block_ids) >= 2
-        ):
-            pids = XYZProgramIDs()
+
+        # Determine per-dimension folding factors
+        folding_factors_list = env.config_spec.grid_foldings.config_get(
+            state.config.grid_foldings, block_ids[0], None
+        )
+        # Build a mapping from block_id to its folding factor
+        # factor=0: no folding (grid), factor=-1: full folding (loop),
+        # factor>0: partial folding (grid + loop of factor iterations)
+        folding_factor_map: dict[int, int] = {}
+        if folding_factors_list is not None:
+            folding_factor_map.update(zip(block_ids, folding_factors_list, strict=True))
+
+        # Count how many dims participate in the launch grid
+        effective_grid_dims = sum(
+            1 for bid in block_ids if folding_factor_map.get(bid, 0) != -1
+        )
+        if effective_grid_dims > 0:
+            pids = self._select_pid_strategy_for_dims(effective_grid_dims)
+            # Apply L2 grouping wrapping if applicable (needs >= 2 grid dims)
+            if (
+                hasattr(self, "l2_grouping")
+                and self.l2_grouping > 1
+                and effective_grid_dims >= 2
+            ):
+                pids = L2GroupingProgramIDs(
+                    group_size=self.l2_grouping,
+                    parent_strategy=pids,
+                )
+            if isinstance(state.device_function.pid, ForEachProgramID):
+                pids.shared_pid_var = state.device_function.pid.shared_pid_var
+            elif (
+                isinstance(pids, FlatProgramIDs)
+                and env.backend.name == "pallas"
+                and effective_grid_dims >= 2
+            ):
+                pids = XYZProgramIDs()
+        else:
+            # All dims fully folded — grid would collapse to a single SM
+            # which is not a useful configuration; reject it.
+            raise exc.InvalidConfig(
+                "Grid folding collapsed all dimensions, resulting in a single-SM grid"
+            )
 
         assert state.ast_args is None
         assert len(state.proxy_args) == 3
@@ -1450,59 +1538,108 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
         tracker = ThreadAxisTracker()
         thread_axis_offset = self._thread_axis_offset(state)
         thread_axis_map = self._thread_axis_map()
-        for i, (block_idx, block_size, begin, end, step) in enumerate(
-            reversed(
-                self._reorder(
-                    [*zip(block_ids, block_sizes, begins, ends, steps, strict=True)]
-                )
+
+        # Phase 1: Process grid dims (factor=0 or factor>0) — PID-based
+        # Dims with factor=-1 (full folding) are skipped here.
+        grid_pid_index = 0
+        # Track which dims need partial folding loops (factor > 0)
+        partial_folding_dims: list[
+            tuple[int, int, object, object, str, str, object, str]
+        ] = []  # (block_idx, factor, begin, end, offset_var, block_size_var, numel, pid_var)
+        for block_idx, block_size, begin, end, step in reversed(
+            self._reorder(
+                [*zip(block_ids, block_sizes, begins, ends, steps, strict=True)]
             )
         ):
+            factor = folding_factor_map.get(block_idx, 0)
+            if factor == -1:
+                continue
             numel = self._range_numel_expr(begin, end, step)
             device_function = state.device_function
             dtype = env.index_type()
             offset_var = self.offset_var(block_idx)
             index_var = self.index_var(block_idx)
-            pid_var = device_function.new_var(f"pid_{i}", dce=True)
+            pid_var = device_function.new_var(f"pid_{grid_pid_index}", dce=True)
 
-            begin_offset_expr = ""
-            if begin != 0:
-                begin_ast = self._to_ast(begin, to_dtype=dtype)
-                begin_offset_expr = (
-                    f"{state.codegen.lift(begin_ast, dce=True, prefix='begin').id} + "
-                )
-
-            if step not in (None, 1):
-                step_ast = self._to_ast(step, to_dtype=dtype)
-                step_var = state.codegen.lift(step_ast, dce=True, prefix="step").id
-                block_size_var = "1"
-                state.add_statement(
-                    f"{offset_var} = {begin_offset_expr}({pid_var}) * {step_var}"
-                )
-            elif block_size != 1:
-                block_size_var = self.block_size_var(block_idx)
-                assert block_size_var is not None
-                self._setup_block_size_constexpr(state, block_size_var, block_size)
-                state.add_statement(
-                    f"{offset_var} = {begin_offset_expr}{pid_var} * {block_size_var}"
+            if factor > 0:
+                # Partial folding: PID covers cdiv(numel, block_size * factor) blocks
+                # offset will be computed inside the folding loop
+                if block_size != 1:
+                    block_size_var = self.block_size_var(block_idx)
+                    assert block_size_var is not None
+                    self._setup_block_size_constexpr(state, block_size_var, block_size)
+                else:
+                    block_size_var = "1"
+                state.add_statement(f"{offset_var} = {pid_var}")
+                # For PIDInfo, adjust numel so grid shrinks by the folding factor
+                if isinstance(numel, sympy.Expr):
+                    # pyrefly: ignore [unsupported-operation]
+                    adjusted_numel = sympy.ceiling(numel / factor)
+                elif isinstance(numel, str):
+                    adjusted_numel = f"(({numel}) + {factor} - 1) // {factor}"
+                else:
+                    adjusted_numel = sympy.ceiling(sympy.Rational(numel, factor))
+                pid = PIDInfo(
+                    pid_var, block_size_var, adjusted_numel, block_idx
+                )  # pyrefly: ignore[bad-argument-type]
+                # Save info for Phase 2 partial folding loop generation
+                partial_folding_dims.append(
+                    (
+                        block_idx,
+                        factor,
+                        begin,
+                        end,
+                        offset_var,
+                        block_size_var,
+                        numel,
+                        pid_var,
+                    )
                 )
             else:
-                block_size_var = "1"
-                state.add_statement(f"{offset_var} = {begin_offset_expr}{pid_var}")
-            axis = thread_axis_offset + thread_axis_map[block_idx]
-            uses_thread_axis = step in (None, 1) and self._uses_thread_axis(block_size)
-            bs = block_size_var if uses_thread_axis else "1"
-            idx_expr = env.backend.grid_index_expr(offset_var, bs, dtype, axis=axis)
-            if uses_thread_axis and isinstance(block_size, int):
-                tracker.record(block_idx, axis, block_size)
-            state.add_statement(f"{index_var} = {idx_expr}")
-            # pyrefly: ignore [missing-attribute]
-            mask_statement = self._setup_mask(
-                state, block_idx, block_size, index_var, end
-            )
-            if mask_statement is not None:
-                state.add_statement(mask_statement)
-            pid = PIDInfo(pid_var, block_size_var, numel, block_idx)
+                # No folding (factor=0): standard PID-based offset
+                begin_offset_expr = ""
+                if begin != 0:
+                    begin_ast = self._to_ast(begin, to_dtype=dtype)
+                    begin_offset_expr = f"{state.codegen.lift(begin_ast, dce=True, prefix='begin').id} + "
+
+                if step not in (None, 1):
+                    step_ast = self._to_ast(step, to_dtype=dtype)
+                    step_var = state.codegen.lift(step_ast, dce=True, prefix="step").id
+                    block_size_var = "1"
+                    state.add_statement(
+                        f"{offset_var} = {begin_offset_expr}({pid_var}) * {step_var}"
+                    )
+                elif block_size != 1:
+                    block_size_var = self.block_size_var(block_idx)
+                    assert block_size_var is not None
+                    self._setup_block_size_constexpr(state, block_size_var, block_size)
+                    state.add_statement(
+                        f"{offset_var} = {begin_offset_expr}{pid_var} * {block_size_var}"
+                    )
+                else:
+                    block_size_var = "1"
+                    state.add_statement(f"{offset_var} = {begin_offset_expr}{pid_var}")
+
+                axis = thread_axis_offset + thread_axis_map[block_idx]
+                uses_thread_axis = step in (None, 1) and self._uses_thread_axis(
+                    block_size
+                )
+                bs = block_size_var if uses_thread_axis else "1"
+                idx_expr = env.backend.grid_index_expr(offset_var, bs, dtype, axis=axis)
+                if uses_thread_axis and isinstance(block_size, int):
+                    tracker.record(block_idx, axis, block_size)
+                state.add_statement(f"{index_var} = {idx_expr}")
+                # pyrefly: ignore [missing-attribute]
+                mask_statement = self._setup_mask(
+                    state, block_idx, block_size, index_var, end
+                )
+                if mask_statement is not None:
+                    state.add_statement(mask_statement)
+                pid = PIDInfo(pid_var, block_size_var, numel, block_idx)
+
             pids.append(pid)
+            grid_pid_index += 1
+
         pids.codegen(state)
         if isinstance(state.device_function.pid, ForEachProgramID):
             shared_pid = state.device_function.pid
@@ -1510,6 +1647,100 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
             shared_pid.codegen(state)
         else:
             state.device_function.set_pid(pids)
+
+        # Build partial-folding lane loops (factor > 0).
+        # Full folding (factor=-1) is handled by the graph transformation in
+        # build_codegen_graphs → _apply_grid_folding, which wraps those dims
+        # in ForLoopGraphInfo and lets codegen_device_loop handle them.
+        lane_loops: list[tuple[str, object, ...]] = []  # pyrefly: ignore
+        dtype = env.index_type()
+
+        for (
+            block_idx,
+            factor,
+            begin,
+            _end,
+            offset_var,
+            block_size_var,
+            numel,
+            pid_var,
+        ) in partial_folding_dims:
+            block_size = dict(zip(block_ids, block_sizes, strict=True))[block_idx]
+            index_var = self.index_var(block_idx)
+            folding_loop_var = state.device_function.new_var(
+                f"folding_{block_idx}", dce=True
+            )
+
+            # Per-loop setup: recompute offset/index/mask for each iteration
+            loop_setup: list[ast.AST] = []
+
+            begin_offset_expr = ""
+            if begin != 0:
+                begin_ast = self._to_ast(begin, to_dtype=dtype)
+                begin_offset_expr = (
+                    f"{state.codegen.lift(begin_ast, dce=True, prefix='begin').id} + "
+                )
+            if block_size_var != "1":
+                offset_expr = (
+                    f"{begin_offset_expr}"
+                    f"({pid_var} * {factor} + {folding_loop_var}) * {block_size_var}"
+                )
+            else:
+                offset_expr = (
+                    f"{begin_offset_expr}{pid_var} * {factor} + {folding_loop_var}"
+                )
+            loop_setup.append(statement_from_string(f"{offset_var} = {offset_expr}"))
+
+            axis = thread_axis_offset + thread_axis_map[block_idx]
+            uses_thread_axis = self._uses_thread_axis(block_size)
+            bs = block_size_var if uses_thread_axis else "1"
+            idx_expr = env.backend.loop_index_expr(offset_var, bs, dtype, axis=axis)
+            if uses_thread_axis and isinstance(block_size, int):
+                tracker.record(block_idx, axis, block_size)
+            loop_setup.append(statement_from_string(f"{index_var} = {idx_expr}"))
+            # pyrefly: ignore [missing-attribute]
+            mask_statement = self._setup_mask(
+                state, block_idx, block_size, index_var, numel
+            )
+            needs_folding_guard = not env.block_sizes[block_idx].known_multiple(
+                block_size * factor
+            )
+            if mask_statement is None and needs_folding_guard:
+                mask_var = state.device_function.new_var(f"mask_{block_idx}", dce=True)
+                self.mask_vars[block_idx] = mask_var
+                mask_statement = statement_from_string(
+                    f"{mask_var} = ({index_var}) < {{end}}",
+                    end=self._to_ast(numel),
+                )
+            if mask_statement is not None:
+                loop_setup.append(mask_statement)
+            # Partial folding may iterate beyond numel when numel is not a
+            # multiple of (block_size * factor).  Compute a scalar guard and
+            # pass it to wrap_body which wraps the kernel body in ``if guard:``.
+            guard_var: str | None = None
+            if needs_folding_guard:
+                guard_var = state.device_function.new_var(
+                    f"folding_guard_{block_idx}", dce=True
+                )
+                loop_setup.append(
+                    statement_from_string(
+                        f"{guard_var} = ({offset_var}) < {{end}}",
+                        end=self._to_ast(numel),
+                    )
+                )
+
+            # Build the tl.range expression for the lane loop
+            range_expr = expr_from_string(
+                self.get_range_call_str(
+                    state.config,
+                    [block_idx],
+                    begin="0",
+                    end="{end}",
+                    step="1",
+                ),
+                end=expr_from_string(repr(factor)),
+            )
+            lane_loops.append((folding_loop_var, range_expr, loop_setup, guard_var))
 
         # Only use ends_override if there are data-dependent (tensor) bounds
         has_tensor_ends = any(isinstance(e, torch.Tensor) for e in ends)
@@ -1519,11 +1750,17 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
             )
         else:
             block_id_to_info = self._create_block_id_info_dict(state)
+        # Exclude fully-folded dims from block_id_to_info: they are
+        # handled by ForLoopGraphInfo device loops, not the grid.
+        for bid, factor in folding_factor_map.items():
+            if factor == -1:
+                block_id_to_info.pop(bid, None)
         return DeviceGridState(
             self,
             block_id_to_info=block_id_to_info,
             thread_axis_sizes=tracker.sizes,
             block_thread_axes=tracker.block_axes,
+            lane_loops=lane_loops,
         )
 
     def _to_ast(self, x: object, to_dtype: str | None = None) -> ast.AST:

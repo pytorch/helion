@@ -34,6 +34,27 @@ if TYPE_CHECKING:
     InductorOpOverrides = OpsHandler[Any]
 
 
+def _project_loop_order(
+    loop_order: list[int],
+    original_block_ids: list[int],
+    current_block_ids: list[int],
+) -> list[int]:
+    """Project a wider loop_order onto a subset of block_ids.
+
+    When grid folding removes dimensions, the loop_order from the original
+    tile call may be wider than the current block_ids.  This preserves the
+    relative ordering of the surviving dimensions rather than falling back
+    to identity.
+    """
+    current_set = set(current_block_ids)
+    surviving_positions = {
+        i for i, bid in enumerate(original_block_ids) if bid in current_set
+    }
+    filtered = [p for p in loop_order if p in surviving_positions]
+    rank = {v: r for r, v in enumerate(sorted(filtered))}
+    return [rank[v] for v in filtered]
+
+
 class Backend(abc.ABC):
     """Abstract base class for Helion code generation backends.
 
@@ -532,20 +553,54 @@ class Backend(abc.ABC):
         loop_order = env.config_spec.loop_orders.config_get(
             config.loop_orders, block_ids[0]
         ) or [*range(len(block_ids))]
+        if len(loop_order) != len(block_ids):
+            loop_order = _project_loop_order(
+                loop_order,
+                env.config_spec.loop_orders.block_id_lookup(block_ids[0]).block_ids,
+                block_ids,
+            )
         l2_grouping = env.config_spec.l2_groupings.config_get(
             config.l2_groupings, block_ids[0], 1
         )
 
-        if block_size_infos[0].is_flattened(config):
-            block_size = functools.reduce(
-                operator.mul, [bs.from_config_assert(config) for bs in block_size_infos]
-            )
-            return FlattenedTileStrategy(
-                fn,
-                block_ids,
-                block_size=block_size,
-                loop_order=loop_order,
-            )
+        grid_folding_factors = env.config_spec.grid_foldings.config_get(
+            config.grid_foldings, block_ids[0], None
+        )
+        is_sub_strategy = False
+        if grid_folding_factors is not None and len(grid_folding_factors) != len(
+            block_ids
+        ):
+            grid_folding_factors = None
+            is_sub_strategy = True
+        has_folding = grid_folding_factors is not None and any(
+            f != 0 for f in grid_folding_factors
+        )
+        if not is_sub_strategy and block_size_infos[0].is_flattened(config):
+            folded_ids: set[int] = set()
+            use_flatten = not has_folding
+            if has_folding and grid_folding_factors is not None:
+                has_partial = any(f > 0 for f in grid_folding_factors)
+                if not has_partial:
+                    folded_ids = {
+                        bid
+                        for bid, f in zip(block_ids, grid_folding_factors, strict=True)
+                        if f == -1
+                    }
+                    use_flatten = len(folded_ids) < len(block_ids)
+            if use_flatten:
+                unfolded_sizes = [
+                    bs.from_config_assert(config)
+                    for bid, bs in zip(block_ids, block_size_infos, strict=True)
+                    if bid not in folded_ids
+                ]
+                block_size = functools.reduce(operator.mul, unfolded_sizes)
+                return FlattenedTileStrategy(
+                    fn,
+                    block_ids,
+                    block_size=block_size,
+                    loop_order=loop_order,
+                    folded_block_ids=folded_ids,
+                )
 
         return NDTileStrategy(
             fn,

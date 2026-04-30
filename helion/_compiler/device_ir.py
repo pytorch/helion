@@ -653,18 +653,51 @@ class DeviceIR:
             graphs_with_rolled_rdim |= used_graphs
 
     def build_codegen_graphs(self, config: Config) -> list[GraphInfo]:
-        """Build and return graph copies with reduction rolling and epilogue subtiling applied.
+        """Build and return graph copies with reduction rolling, grid folding, and epilogue subtiling applied.
 
         Creates a temporary DeviceIR with copied graphs, applies reduction
-        rolling and epilogue subtiling based on the config, and returns the
-        resulting graphs. The original graphs are never modified.
+        rolling, grid folding, and epilogue subtiling based on the config,
+        and returns the resulting graphs. The original graphs are never modified.
         """
 
         temp = copy.copy(self)
         temp.graphs = [g.copy() for g in self.graphs]
         temp._apply_rolling(config)
+        temp._apply_grid_folding(config)
         temp._apply_epilogue_subtiling(config)
         return temp.graphs
+
+    def _apply_grid_folding(self, config: Config) -> None:
+        """Apply full-folding graph transformation for dims with factor=-1.
+
+        For each fully-folded grid dimension, wraps the root graph body
+        in a ForLoopGraphInfo so that the standard codegen_device_loop path
+        handles the loop generation.
+
+        Degenerate partial folding (factor >= num_blocks) is normalized to
+        -1 by ConfigSpec.normalize() before reaching here. At codegen time,
+        degenerate partial folding that wasn't caught by normalize() is
+        handled as regular partial folding (grid dim=1, lane loop iterates
+        with bounds-checking guards).
+        """
+        from .grid_folding import GridFoldingTransformer
+
+        env = CompileEnvironment.current()
+        for i, block_ids in enumerate(self.grid_block_ids):
+            folding_factors = env.config_spec.grid_foldings.config_get(
+                config.grid_foldings, block_ids[0], None
+            )
+            if not folding_factors:
+                continue
+            root_graph_id = self.root_ids[i]
+            for block_id, factor in zip(block_ids, folding_factors, strict=True):
+                if factor != -1:
+                    continue
+                numel = env.block_sizes[block_id].numel
+                transformer = GridFoldingTransformer(self, block_id, numel)
+                new_graph = transformer.process(self.graphs[root_graph_id].graph)
+                # Replace only the graph payload to preserve root metadata
+                self.graphs[root_graph_id].graph = new_graph
 
     def _apply_rolling(self, config: Config) -> None:
         """Apply reduction rolling on the graph copies."""
