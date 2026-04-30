@@ -53,6 +53,10 @@ class PIDInfo(NamedTuple):
             numel_str = context.sympy_expr(self.numel)
         if self.block_size_var == "1":
             return numel_str
+        if not is_device:
+            # Grid dimensions are always non-negative, so we can use integer
+            # arithmetic directly instead of a function call like triton.cdiv.
+            return f"(({numel_str}) + ({self.block_size_var}) - 1) // ({self.block_size_var})"
         return CompileEnvironment.current().backend.cdiv_expr(
             numel_str, self.block_size_var, is_device=is_device
         )
