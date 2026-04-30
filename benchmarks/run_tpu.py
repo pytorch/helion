@@ -87,7 +87,10 @@ def _softmax_shapes() -> list[tuple[str, tuple[Any, ...]]]:
 
 
 def _welford_shapes() -> list[tuple[str, tuple[Any, ...]]]:
-    configs = [(262144, 1024), (262144, 1536), (262144, 2048)]
+    # welford's autotune is expensive (~22 min/shape at full effort), so the
+    # 2nd shape is *smaller* than the 1st (half the rows) to keep the
+    # kernel under the 30-min per-kernel timeout when --num-shapes 2.
+    configs = [(262144, 1024), (131072, 1024), (262144, 1536), (262144, 2048)]
     return [
         (
             f"[{s},{d}]",
