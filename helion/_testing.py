@@ -451,11 +451,16 @@ def skipIfNotCUDA() -> Callable[[Callable], Callable]:
 def skipIfCudaCapabilityLessThan(
     min_capability: tuple[int, int], *, reason: str | None = None
 ) -> Callable[[Callable], Callable]:
-    """Skip test if not running on CUDA or capability is less than min_capability."""
+    """Skip test if running on CUDA with capability less than min_capability.
+
+    Pass-through on non-CUDA backends. Combine with `skipIfNotCUDA()` (or
+    `skipIfPallas`/`skipIfXPU`/etc.) at the call site if the test also
+    requires a specific platform.
+    """
 
     def cond() -> bool:
         if not is_cuda():
-            return True
+            return False
         return torch.cuda.get_device_capability() < min_capability
 
     # Defers check to test execution time to avoid CUDA init during pytest-xdist collection.
