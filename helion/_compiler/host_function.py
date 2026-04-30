@@ -73,6 +73,27 @@ class SymbolOrigin(NamedTuple):
 
 
 class HostFunction:
+    """Parsed and lowered representation of a @helion.kernel function.
+
+    Constructed once per specialization during BoundKernel initialization.
+    Parses kernel source into an ExtendedAST, then runs config-independent
+    frontend passes to produce a DeviceIR:
+
+      1. Static loop unrolling (pure AST rewrite)
+      2. Type propagation (annotates AST, builds origin tracking
+         and config spec)
+      3. Config spec finalization
+      4. Device IR lowering (traces annotated AST into FX graphs)
+
+    These passes share mutable state across this object and
+    CompileEnvironment; the config spec in particular accumulates
+    contributions from passes 2-4.
+
+    The DeviceIR is later consumed by generate_ast() once per Config
+    to produce backend-specific output code. Accessed by compiler
+    passes via HostFunction.current() (thread-local stack).
+    """
+
     def __init__(
         self,
         fn: types.FunctionType,
