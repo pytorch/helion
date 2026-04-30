@@ -11,6 +11,7 @@ from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
 from helion._testing import skipIfMTIA
 from helion._testing import skipIfNotTriton
+from helion._testing import skipIfXPU
 import helion.language as hl
 
 
@@ -236,6 +237,7 @@ class TestAutodiff(RefEagerTestDisabled, TestCase):
 
         self._check_backward(kernel, lambda x: x * torch.sin(x), 1)
 
+    @skipIfXPU("Timeout on XPU")
     def test_sin_squared(self):
         @helion.kernel(autotune_effort="none")
         def kernel(x: torch.Tensor) -> torch.Tensor:
@@ -268,6 +270,7 @@ class TestAutodiff(RefEagerTestDisabled, TestCase):
 
         self._check_backward(kernel, lambda x, y: torch.exp(x) * torch.sin(y), 2)
 
+    @skipIfXPU("Timeout on XPU")
     def test_sin_x_cos_y(self):
         @helion.kernel(autotune_effort="none")
         def kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
