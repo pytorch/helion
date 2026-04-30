@@ -50,7 +50,7 @@ EXAMPLES_DIR = Path(__file__).parent.parent / "examples"
 # Each returns a list of (label, args_tuple) pairs.
 def _exp_shapes() -> list[tuple[str, tuple[Any, ...]]]:
     # First entry matches examples/exp.py main() (10240*10240 = ~105M elems).
-    sizes = [10240 * 10240, 1048576, 262144, 65536, 16384, 4096, 1024]
+    sizes = [10240 * 10240, 16384 * 16384, 1048576, 262144, 65536, 16384, 4096, 1024]
     return [
         (
             f"[{n}]",
@@ -112,8 +112,11 @@ def _welford_baseline(
 def _attention_shapes() -> list[tuple[str, tuple[Any, ...]]]:
     # First entry matches examples/attention.py main() so --num-shapes 1 gives
     # the canonical example config.
+    # First entry mirrors examples/attention.py main(); second is ~2x larger
+    # along seq_len so the bench shows scaling behavior.
     configs = [
         (2, 32, 1024, 64),
+        (2, 32, 2048, 64),
         (1, 4, 512, 64),
         (1, 4, 1024, 64),
         (2, 8, 512, 64),
@@ -131,7 +134,12 @@ def _attention_shapes() -> list[tuple[str, tuple[Any, ...]]]:
 
 
 def _bmm_shapes() -> list[tuple[str, tuple[Any, ...]]]:
-    configs = [(16, 512, 768, 1024), (8, 256, 512, 256), (4, 1024, 512, 512)]
+    configs = [
+        (16, 512, 768, 1024),
+        (32, 512, 768, 1024),
+        (8, 256, 512, 256),
+        (4, 1024, 512, 512),
+    ]
     return [
         (
             f"[{b},{m},{k},{n}]",
@@ -193,7 +201,12 @@ def _matmul_layernorm_shapes() -> list[tuple[str, tuple[Any, ...]]]:
 
 
 def _broadcast_matmul_shapes() -> list[tuple[str, tuple[Any, ...]]]:
-    configs = [(16, 512, 768, 1024), (8, 256, 512, 256), (4, 1024, 512, 512)]
+    configs = [
+        (16, 512, 768, 1024),
+        (32, 512, 768, 1024),
+        (8, 256, 512, 256),
+        (4, 1024, 512, 512),
+    ]
     return [
         (
             f"[{b},{m},{k},{n}]",
@@ -267,7 +280,9 @@ def _cross_entropy_shapes() -> list[tuple[str, tuple[Any, ...]]]:
     #    window size; with tile_n=128 fp32, V <= ~2048 to stay under the
     #    64 MiB VMEM cap when combined with the gather one-hot intermediate.
     # Pick small but representative shapes accordingly.
-    configs = [(128, 2048), (256, 1024), (128, 1024)]
+    # Only one shape fits comfortably under TPU VMEM at fp32; (256, 2048)
+    # already OOMs (75 MB > 64 MB cap), so we don't add a "larger" 2nd shape.
+    configs = [(128, 2048)]
     return [
         (
             f"[{n},{v}]",
@@ -304,7 +319,7 @@ def _embedding_shapes() -> list[tuple[str, tuple[Any, ...]]]:
 
 
 def _batch_softmax_shapes() -> list[tuple[str, tuple[Any, ...]]]:
-    configs = [(16, 512, 1024), (8, 256, 2048), (4, 1024, 512)]
+    configs = [(16, 512, 1024), (32, 512, 1024), (8, 256, 2048), (4, 1024, 512)]
     return [
         (
             f"[{b},{m},{n}]",
@@ -336,7 +351,7 @@ def _rms_norm_baseline(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
 
 def _layer_norm_shapes() -> list[tuple[str, tuple[Any, ...]]]:
     # First entry matches examples/layer_norm.py main() (4096, 10240).
-    configs = [(4096, 10240), (2048, 4096), (2048, 8192), (4096, 4096)]
+    configs = [(4096, 10240), (8192, 10240), (2048, 4096), (2048, 8192), (4096, 4096)]
     return [
         (
             f"[{m},{n}]",
@@ -353,7 +368,7 @@ def _layer_norm_shapes() -> list[tuple[str, tuple[Any, ...]]]:
 
 
 def _softmax_shapes_basic() -> list[tuple[str, tuple[Any, ...]]]:
-    shapes = [(4096, 2560), (2048, 4096), (1024, 8192)]
+    shapes = [(4096, 2560), (4096, 5120), (2048, 4096), (1024, 8192)]
     return [
         (
             f"[{m},{n}]",
@@ -379,7 +394,7 @@ def _sum_shapes() -> list[tuple[str, tuple[Any, ...]]]:
 def _long_sum_shapes() -> list[tuple[str, tuple[Any, ...]]]:
     # Long reduction dim: 131072 = 4x the 32768 block size used by the
     # looped variants, so they actually loop.
-    shapes = [(4, 131072)]
+    shapes = [(4, 131072), (8, 131072)]
     return [
         (
             f"[{m},{n}]",

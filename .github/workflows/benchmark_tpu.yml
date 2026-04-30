@@ -117,7 +117,7 @@ jobs:
           echo "=========================================="
 
           # First pass: autotune (populates cache)
-          python benchmarks/run_tpu.py --kernel "$KERNELS" --num-shapes 1
+          python benchmarks/run_tpu.py --kernel "$KERNELS" --num-shapes 2
 
           # Let TPU cool down
           sleep 1m
@@ -130,7 +130,7 @@ jobs:
           HELION_PRINT_OUTPUT_CODE=1 HELION_ASSERT_CACHE_HIT=1 \
             python benchmarks/run_tpu.py \
               --kernel "$KERNELS" \
-              --num-shapes 1 \
+              --num-shapes 2 \
               --output "$TEST_REPORTS_DIR/helionbench.json"
 
           if [[ -s "$TEST_REPORTS_DIR/helionbench.json" ]]; then
