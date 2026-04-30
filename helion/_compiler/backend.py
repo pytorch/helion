@@ -579,10 +579,7 @@ class Backend(abc.ABC):
         if not self.supports_precompile():
             bound_kernel.settings.autotune_precompile = None
 
-        from ..runtime.settings import default_autotuner_fn
-
-        use_default_fn = bound_kernel.settings.autotuner_fn is default_autotuner_fn
-        if not force and bound_kernel.kernel.configs and use_default_fn:
+        if not force and bound_kernel.kernel.configs:
             if len(bound_kernel.kernel.configs) == 1:
                 (config,) = bound_kernel.kernel.configs
             else:
