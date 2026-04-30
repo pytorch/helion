@@ -2054,6 +2054,81 @@ def _(state: CodegenState) -> list[object]:
     )
 
 
+@_decorators.codegen(_if, "cute")
+def _(state: CodegenState) -> list[object]:
+    """Emit dynamic if-conditions for the CuTe DSL backend.
+
+    CuTe DSL forbids referencing a variable after a dynamic if/else when the
+    variable is first defined inside the branches. Pre-declare any such output
+    in the outer scope before emitting the if so both branches reassign it.
+    """
+    from .._compiler.ast_extension import create
+    from .._compiler.device_ir import ElseGraphInfo
+    from .._compiler.device_ir import IfGraphInfo
+    from .._compiler.generate_ast import GenerateAST
+    from .._compiler.inductor_lowering import codegen_call_with_graph
+
+    graph_info = state.get_graph(state.proxy_arg(1))
+    assert isinstance(graph_info, IfGraphInfo)
+    assert isinstance(state.codegen, GenerateAST)
+
+    test = state.ast_arg(0)
+    if_args = state.ast_args[3]
+    else_args = state.ast_args[4]
+    assert isinstance(if_args, list)
+    assert isinstance(else_args, list)
+    assert all(isinstance(x, ast.AST) for x in if_args)
+    assert all(isinstance(x, ast.AST) for x in else_args)
+
+    if_body_stmts: list[ast.AST] = []
+    with state.codegen.set_statements(if_body_stmts):
+        if_outputs = codegen_call_with_graph(
+            state.codegen, graph_info.graph, [*if_args]
+        )
+
+    assert graph_info.else_branch is not None
+    else_graph = state.get_graph(graph_info.else_branch)
+    assert isinstance(else_graph, ElseGraphInfo)
+    else_body_stmts: list[ast.AST] = []
+    with state.codegen.set_statements(else_body_stmts):
+        else_outputs = codegen_call_with_graph(
+            state.codegen, else_graph.graph, [*else_args]
+        )
+
+    # Pre-declare any variable that is first defined inside both branches in the
+    # outer scope so CuTe DSL can resolve it after the if/else. The phi pass
+    # later renames the else-branch's name to match the if-branch's name, so we
+    # use the if-branch output name as the canonical pre-declared name.
+    if graph_info.branches_outputs is not None:
+        if_output_node = graph_info.graph.find_nodes(op="output")[0]
+        if_graph_outputs = cast("tuple[object, ...]", if_output_node.args[0])
+        backend = CompileEnvironment.current().backend
+        for if_entry, else_entry in graph_info.branches_outputs:
+            if not (isinstance(if_entry, int) and isinstance(else_entry, int)):
+                continue
+            if_name_node = if_outputs[if_entry]
+            assert isinstance(if_name_node, ast.Name)
+            fx_out = if_graph_outputs[if_entry]
+            if not isinstance(fx_out, torch.fx.Node):
+                continue
+            val = fx_out.meta.get("val")
+            if not isinstance(val, torch.Tensor):
+                continue
+            dtype_str = backend.dtype_str(val.dtype)
+            state.add_statement(
+                statement_from_string(f"{if_name_node.id} = {dtype_str}(0)")
+            )
+
+    if not if_body_stmts:
+        if_body_stmts.append(ast.Pass())
+    if not else_body_stmts:
+        else_body_stmts.append(ast.Pass())
+    if_ast_node = create(ast.If, test=test, body=if_body_stmts, orelse=else_body_stmts)
+    state.add_statement(if_ast_node)
+
+    return if_outputs + else_outputs
+
+
 # Note we can't DCE phi nodes because there may be a loop carry dependency not captured in the outer graph
 @has_side_effect
 @_decorators.api(allow_host_tensor=True)

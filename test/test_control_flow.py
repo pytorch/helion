@@ -18,7 +18,7 @@ from helion._testing import skipIfTileIR
 import helion.language as hl
 
 
-@onlyBackends(["triton", "pallas"])
+@onlyBackends(["triton", "pallas", "cute"])
 class TestControlFlow(RefEagerTestBase, TestCase):
     def test_if_arg(self):
         @helion.kernel()
