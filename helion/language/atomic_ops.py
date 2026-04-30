@@ -166,6 +166,7 @@ def _guard_cute_atomic_expr(
         for predicate in (
             _cute_active_mask_predicate(state),
             _cute_leader_thread_predicate(state, index),
+            _cute_unindexed_axis_leader_predicate(state, index),
             *(extra_predicates or []),
         )
         if predicate is not None
@@ -293,6 +294,74 @@ def _cute_leader_thread_predicate(
         return None
     return " and ".join(
         f"(cute.arch.thread_idx()[{axis}] == 0)" for axis in sorted(axes)
+    )
+
+
+def _cute_unindexed_axis_leader_predicate(
+    state: CodegenState,
+    index: list[object],
+) -> str | None:
+    """Return predicate restricting atomics to one thread per unindexed parallel axis.
+
+    When an atomic op is invoked inside ``hl.tile([m, n])`` but the index only
+    covers a subset of the tile dimensions (e.g. ``hl.atomic_add(dy, [tile_i],
+    reduced)`` after a reduction across ``tile_j``), every thread on the
+    unindexed axis would otherwise re-issue the atomic with the same value.
+    Restrict those axes to ``thread_idx[axis] == 0`` so the op fires once per
+    unique (indexed) coordinate.
+    """
+    from .._compiler.compile_environment import CompileEnvironment
+    from .._compiler.variable_origin import BlockSizeOrigin
+
+    env = CompileEnvironment.current()
+    indexed_block_ids: set[int] = set()
+    has_block_size_index = False
+    for idx in index:
+        if not isinstance(idx, torch.SymInt):
+            continue
+        expr = _symint_expr(idx)
+        if expr is None:
+            continue
+        origin_info = HostFunction.current().expr_to_origin.get(expr)
+        if origin_info is None or not isinstance(origin_info.origin, BlockSizeOrigin):
+            continue
+        has_block_size_index = True
+        assert state.fx_node is not None
+        indexed_block_ids.add(
+            env.resolve_codegen_block_id(
+                origin_info.origin.block_id,
+                state.codegen,
+                state.fx_node.graph,
+            )
+        )
+
+    if not has_block_size_index:
+        return None
+    assert state.fx_node is not None
+    fx_graph = state.fx_node.graph
+
+    leader_axes: set[int] = set()
+
+    def collect(thread_axes: dict[int, int]) -> None:
+        for candidate_block_id, thread_axis in thread_axes.items():
+            resolved = env.resolve_codegen_block_id(
+                candidate_block_id, state.codegen, fx_graph
+            )
+            if resolved in indexed_block_ids:
+                continue
+            leader_axes.add(thread_axis)
+
+    grid_state = state.codegen.current_grid_state
+    if grid_state is not None:
+        collect(grid_state.block_thread_axes)
+    for loops in state.codegen.active_device_loops.values():
+        for loop_state in loops:
+            collect(loop_state.block_thread_axes)
+
+    if not leader_axes:
+        return None
+    return " and ".join(
+        f"(cute.arch.thread_idx()[{axis}] == 0)" for axis in sorted(leader_axes)
     )
 
 
