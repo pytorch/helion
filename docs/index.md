@@ -12,6 +12,7 @@ Tutorials <helion_tutorials>
 Deployment <deployment_autotuning>
 TileIR Backend <tileir_backend>
 events
+Dashboard <https://helionlang.com/dashboard/>
 ```
 
 **Helion** is a Python-embedded domain-specific language (DSL) for
