@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import unittest
 
 import torch
@@ -979,6 +980,10 @@ class TestUnrollTuples(RefEagerTestBase, TestCase):
     @skipIfRefEager("Benchmark not applicable in ref eager mode")
     @skipIfRocm("Benchmark timing unreliable on ROCm")
     @skipIfXPU("Benchmark timing unreliable on XPU")
+    @unittest.skipIf(
+        "PYTEST_XDIST_WORKER" in os.environ,
+        "Benchmark timing unreliable under pytest-xdist",
+    )
     def test_register_cache_faster_than_no_cache(self):
         """Verify register-cached layernorm is faster than re-gathering."""
         from triton.testing import do_bench

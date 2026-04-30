@@ -338,7 +338,7 @@ def skipUnlessTileIR(reason: str) -> Callable[[Callable], Callable]:
 def _has_cute_dsl() -> bool:
     try:
         import cutlass.cute as _cute  # noqa: F401
-    except ModuleNotFoundError:
+    except ImportError:
         return False
     return True
 
