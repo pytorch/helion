@@ -95,28 +95,18 @@ class HostFunction:
                 source_indented = inspect.getsource(fn)
                 source = textwrap.dedent(source_indented)
                 self.column_offset: int = source_indented.index(source[0])
-                root = ast.parse(source)
-                assert isinstance(root, ast.Module)
-                function_defs = [
-                    stmt for stmt in root.body if isinstance(stmt, ast.FunctionDef)
-                ]
-                assert len(function_defs) == 1, (
-                    f"expected one function definition in parsed source, got "
-                    f"{[type(stmt).__name__ for stmt in root.body]}"
+
+                self.params: inspect.BoundArguments = inspect.signature(fn).bind(
+                    *fake_args
                 )
-                (root,) = function_defs
-                root = ast_extension.convert(root)
-                assert isinstance(root, ast.FunctionDef)
-                assert isinstance(root, ast_extension.ExtendedAST)
-                self.location = root._location
+                self.params.apply_defaults()
+
+                root: ast.FunctionDef = HostFunction._parse_source(source)
                 self.name: str = root.name
                 self.args: ast.arguments = root.args
                 self.body: list[ast.stmt] = root.body
-
-                self.params = inspect.signature(fn).bind(*fake_args)
-                self.params.apply_defaults()
-
-                HostFunction.validate_ast(root)
+                assert isinstance(root, ast_extension.ExtendedAST)
+                self.location = root._location
 
             from .device_ir import lower_to_device_ir
             from .static_loop_unroller import unroll_static_loops
@@ -153,6 +143,24 @@ class HostFunction:
         if torch.autograd.profiler._is_profiler_enabled:
             return env.shape_env.suppress_guards()
         return contextlib.nullcontext()
+
+    @staticmethod
+    def _parse_source(source: str) -> ast.FunctionDef:
+        """Parse dedented source into a validated ExtendedAST FunctionDef."""
+        root = ast.parse(source)
+        assert isinstance(root, ast.Module)
+        function_defs = [
+            stmt for stmt in root.body if isinstance(stmt, ast.FunctionDef)
+        ]
+        assert len(function_defs) == 1, (
+            f"expected one function definition in parsed source, got "
+            f"{[type(stmt).__name__ for stmt in root.body]}"
+        )
+        (root,) = function_defs
+        root = ast_extension.convert(root)
+        assert isinstance(root, ast.FunctionDef)
+        HostFunction.validate_ast(root)
+        return root
 
     @staticmethod
     def validate_ast(root: ast.FunctionDef) -> None:
