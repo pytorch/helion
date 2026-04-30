@@ -523,6 +523,12 @@ class TestCuteLowerings(unittest.TestCase):
             ),
         ):
             bound = cute_matmul_mma_codegen_only.bind(args)
+            # matmul_ops narrows tcgen05_cluster_m to (1,) for the
+            # bf16/fp16 matmul; this codegen-only test still exercises the
+            # cluster=2 path so widen the choices back so the default config
+            # picks cluster_m=2.
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            bound.env.config_spec.restrict_tcgen05_cluster_m_search((2, 1))
             config = bound.config_spec.default_config()
             code = bound.to_triton_code(config)
 
@@ -687,11 +693,17 @@ class TestCuteLowerings(unittest.TestCase):
         self.assertIn("if tcgen05_exec_active:", code)
         self.assertEqual(code.count("tcgen05_tmem_allocator.free("), 1)
         self.assertIn(
-            "num_allocated_columns=tcgen05_acc_tmem_cols, dealloc_mbarrier_initialized=True",
+            "num_allocated_columns=tcgen05_acc_tmem_cols, dealloc_mbarrier_initialized=True)",
             code,
         )
-        self.assertNotIn("tcgen05_tmem_alloc_barrier.arrive()", code)
-        self.assertNotIn("tcgen05_tmem_alloc_barrier.arrive_and_wait()", code)
+        # Direct TMEM->reg->GMEM SIMT epilogue (now used for all bn): the exec
+        # warp signals tcgen05_tmem_alloc_barrier.arrive() so the allocator
+        # teardown can wait on TMEM consumers, and the epi warps
+        # arrive_and_wait before freeing. The previous staged-via-smem_c
+        # epilogue used a different teardown sequence; the assertion below
+        # locks in the direct-store flow.
+        self.assertIn("tcgen05_tmem_alloc_barrier.arrive()", code)
+        self.assertIn("tcgen05_tmem_alloc_barrier.arrive_and_wait()", code)
 
     def test_tcgen05_codegen_supports_serialized_root_n_threads(self) -> None:
         @helion.kernel(backend="cute")
@@ -853,11 +865,15 @@ class TestCuteLowerings(unittest.TestCase):
             torch.randn(256, 64, device=DEVICE, dtype=torch.float16),
             torch.randn(64, 128, device=DEVICE, dtype=torch.float16),
         )
+        # cluster_m=2 was the implicit autotune default before the search
+        # space was tightened; this test still exercises the cluster-aware
+        # codegen path so request it explicitly.
         config = helion.Config(
             block_sizes=[128, 128, 16],
             loop_orders=[[0, 1]],
             num_stages=1,
             pid_type="flat",
+            tcgen05_cluster_m=2,
         )
         support = SimpleNamespace(
             supported_impls=("universal", "warp", "tcgen05"),
@@ -876,7 +892,12 @@ class TestCuteLowerings(unittest.TestCase):
                 return_value=support,
             ),
         ):
-            code = cute_matmul_mma_codegen_only.bind(args).to_triton_code(config)
+            bound = cute_matmul_mma_codegen_only.bind(args)
+            # See note above: widen cluster_m back to include 2 for the
+            # codegen-only test, since matmul_ops restricts it for runtime.
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            bound.env.config_spec.restrict_tcgen05_cluster_m_search((2, 1))
+            code = bound.to_triton_code(config)
 
         self.assertIn("block=(32, 8, 1)", code)
         self.assertIn(
@@ -897,9 +918,13 @@ class TestCuteLowerings(unittest.TestCase):
         self.assertNotIn("load = x[indices_0, indices_2]", code)
         self.assertNotIn("load_1 = y[indices_2, indices_1]", code)
         self.assertNotIn("tcgen05_store_tmem_load_atom", code)
-        self.assertIn("smem_c = cute.arch.alloc_smem", code)
+        # The wide tcgen05 epilogue now uses the direct TMEM->reg->GMEM SIMT
+        # path (`_codegen_cute_store_tcgen05_tile`) instead of staging through
+        # an intermediate `smem_c` allocation, so the float32 tile-wide SMEM
+        # buffer is no longer materialized.
+        self.assertNotIn("smem_c = cute.arch.alloc_smem", code)
         self.assertIn(
-            "num_allocated_columns=tcgen05_acc_tmem_cols, dealloc_mbarrier_initialized=True",
+            "num_allocated_columns=tcgen05_acc_tmem_cols, dealloc_mbarrier_initialized=True)",
             code,
         )
 
@@ -3060,7 +3085,14 @@ class TestCuteLowerings(unittest.TestCase):
                 return_value=support,
             ),
         ):
-            code = cute_matmul_mma_codegen_only.bind(args).to_triton_code(config)
+            bound = cute_matmul_mma_codegen_only.bind(args)
+            # matmul_ops narrows tcgen05_cluster_m to (1,) when binding the
+            # bf16/fp16 matmul because cluster_m=2 currently crashes the
+            # launch; this codegen-only test still exercises the cluster=2
+            # path so widen the choices back to (2, 1).
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            bound.env.config_spec.restrict_tcgen05_cluster_m_search((2, 1))
+            code = bound.to_triton_code(config)
 
         self.assertIn(
             "'cluster_m': 2",

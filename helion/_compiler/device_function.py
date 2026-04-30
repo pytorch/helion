@@ -230,6 +230,8 @@ class CuteTcgen05StoreValue:
     tma_producer_state: str = ""
     is_two_cta: bool = False
     use_tma: bool = False
+    ab_stage_count: int = 0
+    acc_stage_count: int = 0
 
 
 @dataclasses.dataclass(frozen=True)

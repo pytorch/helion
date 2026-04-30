@@ -1,0 +1,150 @@
+from __future__ import annotations
+
+from functools import lru_cache
+import inspect
+
+
+@lru_cache(maxsize=1)
+def cutedsl_has_opresultlist_fix() -> bool:
+    """Detect whether ``cutlass.cutlass_dsl.cutlass.if_generate`` recognises
+    ``ir.OpResultList`` containers for multi-result ``scf.if`` ops.
+
+    The PyPI ``nvidia-cutlass-dsl==4.5.0.dev0`` wheel (uploaded 2026-04-08)
+    ships an ``if_generate`` that wraps a multi-result ``OpResultList`` in a
+    one-element Python list, which then breaks the result-type ``zip`` and
+    raises ``DSLRuntimeError: <OpResultList> to integer conversion is not
+    supported`` from the next ``Int32(...)`` call. Newer (post-PyPI) builds
+    add an explicit ``isinstance(mlir_results, ir.OpResultList)`` guard that
+    fixes the bug — and is the marker we look for here.
+
+    Returns ``True`` when the fix is present, ``False`` for the buggy build.
+    """
+    try:
+        from cutlass.cutlass_dsl.cutlass import if_generate
+    except Exception:
+        return True
+    try:
+        src = inspect.getsource(if_generate)
+    except (OSError, TypeError):
+        return True
+    return "ir.OpResultList" in src
+
+
+def _advance_lines(state_expr: str, indent: str) -> list[str]:
+    """Inline body of a single ``state.advance()`` (buggy-cutedsl workaround)."""
+    phase_update = (
+        f"{indent}{state_expr}._phase = ({state_expr}._phase ^ cutlass.Int32(1)) "
+        f"if {state_expr}._index == {state_expr}.stages else {state_expr}._phase"
+    )
+    index_update = (
+        f"{indent}{state_expr}._index = cutlass.Int32(0) "
+        f"if {state_expr}._index == {state_expr}.stages else {state_expr}._index"
+    )
+    return [
+        f"{indent}{state_expr}._count = {state_expr}._count + cutlass.Int32(1)",
+        f"{indent}{state_expr}._index = {state_expr}._index + cutlass.Int32(1)",
+        phase_update,
+        index_update,
+    ]
+
+
+def emit_pipeline_advance(state_expr: str, *, indent: str = "") -> str:
+    """Emit code equivalent to ``<state_expr>.advance()``.
+
+    On cutedsl builds with the OpResultList fix this returns the natural
+    ``state.advance()`` call. On the buggy PyPI 4.5.0.dev0 build it inlines
+    the same semantics using two single-result Python ternaries (each of
+    which lowers to a single-result ``scf.if`` and avoids the broken
+    multi-result path inside ``pipeline.PipelineState.advance``). The
+    workaround body is wrapped in ``if True:`` so the returned string is
+    always exactly one Python top-level statement — both code paths can
+    therefore be passed straight to ``statement_from_string`` or spliced
+    into an existing block body without breaking ``ast.parse``.
+
+    The emitted lines all carry ``indent`` so the caller can splice the
+    string into an existing block without further reflowing.
+    """
+    if cutedsl_has_opresultlist_fix():
+        return f"{indent}{state_expr}.advance()"
+
+    inner = indent + "    "
+    body = "\n".join(_advance_lines(state_expr, inner))
+    return f"{indent}if True:\n{body}"
+
+
+def emit_producer_tail_tma_umma(
+    pipeline_expr: str,
+    state_expr: str,
+    *,
+    num_stages: int,
+    indent: str = "",
+) -> str:
+    """Emit code equivalent to ``<pipeline>.producer_tail(<state>)`` for a
+    ``PipelineTmaUmma`` (sm100 TMA→UMMA) pipeline.
+
+    The cutedsl implementation calls ``state.advance()`` ``num_stages-1``
+    times and then ``producer_acquire``. On the buggy PyPI build that
+    inner ``advance`` raises the OpResultList ``DSLRuntimeError`` —
+    helion's user-level ``state.advance()`` workaround can't reach those
+    nested calls, so we inline the whole tail here using the same
+    advance workaround for each stage hop. The leader-CTA fast path
+    (``cta_rank_in_cluster % 2 == 0``) is preserved so 2-CTA matmuls
+    still drain only the leader.
+
+    ``num_stages`` is a compile-time constant from helion's tcgen05 plan
+    (``ab_stage_count`` for the TMA pipeline).
+    """
+    if cutedsl_has_opresultlist_fix():
+        return f"{indent}{pipeline_expr}.producer_tail({state_expr})"
+
+    inner = indent + "    "
+    inner2 = inner + "    "
+    advance_blocks: list[str] = []
+    for _ in range(num_stages - 1):
+        advance_blocks.append(f"{inner}if True:")
+        advance_blocks.extend(_advance_lines(state_expr, inner2))
+    body_lines = [
+        f"{indent}_pt_bidx = cute.arch.block_idx_in_cluster()",
+        f"{indent}_pt_cta_rank = cute.arch.make_warp_uniform(_pt_bidx)",
+        f"{indent}if _pt_cta_rank % cutlass.Int32(2) == cutlass.Int32(0):",
+        *advance_blocks,
+        f"{inner}{pipeline_expr}.producer_acquire({state_expr})",
+    ]
+    return "\n".join(body_lines)
+
+
+def emit_producer_tail_umma_async(
+    pipeline_expr: str,
+    state_expr: str,
+    *,
+    num_stages: int,
+    indent: str = "",
+) -> str:
+    """Emit code equivalent to ``<pipeline>.producer_tail(<state>)`` for a
+    ``PipelineUmmaAsync`` (sm100 UMMA→async-consumer) pipeline.
+
+    The cutedsl implementation loops ``num_stages`` times, doing
+    ``sync_object_empty.wait`` followed by ``state.advance()`` per
+    iteration. We inline the wait + advance so each ``advance`` becomes
+    the same single-result-ternary workaround used by
+    :func:`emit_pipeline_advance`. ``num_stages`` is the compile-time
+    ``acc_stage_count`` from helion's tcgen05 plan.
+    """
+    if cutedsl_has_opresultlist_fix():
+        return f"{indent}{pipeline_expr}.producer_tail({state_expr})"
+
+    inner = indent + "    "
+    body_lines = [f"{indent}if True:"]
+    wait_line = (
+        f"{inner}{pipeline_expr}.sync_object_empty.wait("
+        f"{state_expr}.index, {state_expr}.phase)"
+    )
+    for _ in range(num_stages):
+        body_lines.extend(
+            (
+                wait_line,
+                f"{inner}if True:",
+                *_advance_lines(state_expr, inner + "    "),
+            )
+        )
+    return "\n".join(body_lines)
