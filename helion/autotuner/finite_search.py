@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import contextlib
 from typing import TYPE_CHECKING
 
 from .. import exc
@@ -67,22 +66,23 @@ class CachedFiniteSearch(FiniteSearch):
             advanced_controls_files=self.settings.autotune_search_acf or None,
             process_group_name=kernel.env.process_group_name,
         )
-        self.settings.autotune_precompile = None
         cap = (
             max_configs
             if max_configs is not None
             else self.settings.autotune_best_available_max_configs
         )
         cached: list[Config] = []
-        for entry in self._find_similar_cached_configs(cap):
-            with contextlib.suppress(
+        for i, entry in enumerate(self._find_similar_cached_configs(cap)):
+            try:
+                cached.append(self.config_gen.unflatten(entry.to_mutable_flat_config()))
+            except (
                 ValueError,
                 TypeError,
                 KeyError,
                 AssertionError,
                 exc.InvalidConfig,
-            ):
-                cached.append(self.config_gen.unflatten(entry.to_mutable_flat_config()))
+            ) as e:
+                self.log(f"from_cache: failed to transfer cached config {i + 1}: {e}")
         self.log(f"from_cache: resolved {len(cached)} cached config(s) (cap={cap})")
         explicit: list[Config] = list(
             configs if configs is not None else kernel.configs

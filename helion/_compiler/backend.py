@@ -583,15 +583,17 @@ class Backend(abc.ABC):
 
         use_default_fn = bound_kernel.settings.autotuner_fn is default_autotuner_fn
         if not force and bound_kernel.kernel.configs and use_default_fn:
-            from ..autotuner import FiniteSearch
-
-            cfgs = bound_kernel.kernel.configs
-            if len(cfgs) == 1:
-                config = cfgs[0]
+            if len(bound_kernel.kernel.configs) == 1:
+                (config,) = bound_kernel.kernel.configs
             else:
                 # We have finite predetermined configs, no need to precompile
                 bound_kernel.settings.autotune_precompile = None
-                config = FiniteSearch(bound_kernel, args, cfgs).autotune()
+
+                from ..autotuner import FiniteSearch
+
+                config = FiniteSearch(
+                    bound_kernel, args, bound_kernel.configs
+                ).autotune()
         else:
             bound_kernel.settings.check_autotuning_disabled()
             config = bound_kernel.settings.autotuner_fn(
