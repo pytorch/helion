@@ -417,29 +417,33 @@ def _pallas_build_pipeline_specs(
     args: tuple[object, ...],
     tensor_arg_indices: list[int],
     output_indices: list[int],
-    block_spec_info: _BlockSpecInfo | None,
+    block_spec_info: _BlockSpecInfo,
     pipeline_arg_indices: list[int] | None,
     output_only_indices: list[int] | None = None,
+    smem_arg_indices: list[int] | None = None,
 ) -> tuple[list[object], object]:
     """Build in/out specs for pipeline launchers.
 
     Pipeline-body tensors (listed in *pipeline_arg_indices*) get HBM refs.
     All other tensors get proper BlockSpecs for automatic VMEM prefetch.
+    Tensors in *smem_arg_indices* (only ever accessed by scalar index, e.g.
+    group offset tables) are placed in SMEM so dynamic scalar reads don't
+    require 128-lane alignment proofs against a small VMEM ref.
     """
     pipeline_set = set(pipeline_arg_indices or [])
+    smem_set = set(smem_arg_indices or [])
     all_positions = sorted(set(tensor_arg_indices) | set(output_only_indices or []))
     arg_to_tpos = {orig: tpos for tpos, orig in enumerate(all_positions)}
 
     def _spec_for(idx: int) -> object:
         if idx in pipeline_set:
             return pl.BlockSpec(memory_space=pltpu.HBM)  # type: ignore[union-attr]
-        if block_spec_info is not None:
-            t = args[idx]
-            assert isinstance(t, torch.Tensor)
-            return _pallas_make_block_spec(
-                pl, jnp, pltpu, t, block_spec_info[arg_to_tpos[idx]]
-            )
-        return pl.BlockSpec(memory_space=pl.ANY)  # type: ignore[union-attr]
+        tpos = arg_to_tpos[idx]
+        t = args[idx]
+        assert isinstance(t, torch.Tensor)
+        return _pallas_make_block_spec(
+            pl, jnp, pltpu, t, block_spec_info[tpos], tpos in smem_set
+        )
 
     in_specs = [_spec_for(idx) for idx in tensor_arg_indices]
     out_specs_list = [_spec_for(idx) for idx in output_indices]
@@ -652,7 +656,9 @@ def _pallas_build_callable(
 
     jax_callable = JaxCallable(
         name=kernel_name,
-        jit_fn=jax.jit(jit_fn),  # pyrefly: ignore[no-matching-overload]
+        jit_fn=jax.jit(
+            jit_fn  # pyrefly: ignore[bad-argument-type]
+        ),  # pyrefly: ignore[no-matching-overload]
         trace_key=f"{kernel_name}_{id(pallas_kernel)}_{grid}{trace_key_suffix}",
         input_output_aliases=call_aliases,
     )
@@ -1014,6 +1020,7 @@ def default_pallas_pipeline_launcher(
     _scratch_shapes: list[tuple[tuple[int, ...], str]] | None = None,
     _pipeline_arg_indices: list[int] | None = None,
     _ds_pad_dims: list[tuple[int, int, int]] | None = None,
+    _smem_arg_indices: list[int] | None = None,
     **kwargs: object,
 ) -> object:
     """Launcher for Pallas kernels using PrefetchScalarGridSpec with scratch memory.
@@ -1070,6 +1077,9 @@ def default_pallas_pipeline_launcher(
                     pltpu.VMEM(shape, jnp_dtype)  # pyrefly: ignore[bad-argument-type]
                 )
 
+        assert _block_spec_info is not None, (
+            "emit_pipeline launcher requires _block_spec_info from codegen"
+        )
         in_specs_list, out_specs = _pallas_build_pipeline_specs(
             pl,
             jnp,
@@ -1081,6 +1091,7 @@ def default_pallas_pipeline_launcher(
             _block_spec_info,
             _pipeline_arg_indices,
             output_only_indices,
+            smem_arg_indices=_smem_arg_indices,
         )
 
         _pipeline_set = set(_pipeline_arg_indices or [])
@@ -1095,6 +1106,7 @@ def default_pallas_pipeline_launcher(
             arg_to_tensor_pos,
             n_extra_refs=len(scratch_shapes),
             skip_inplace_copy=_pipeline_set,
+            _smem_arg_indices=_smem_arg_indices,
         )
 
         out_shape_arg = out_shapes if len(out_shapes) > 1 else out_shapes[0]
@@ -1178,6 +1190,7 @@ def default_pallas_fori_launcher(
     _block_spec_info: _BlockSpecInfo | None = None,
     _scratch_shapes: list[tuple[tuple[int, ...], str | None, str]] | None = None,
     _ds_pad_dims: list[tuple[int, int, int]] | None = None,
+    _smem_arg_indices: list[int] | None = None,
     **kwargs: object,
 ) -> object:
     """Launcher for Pallas kernels using fori_loop with manual DMA.
@@ -1235,6 +1248,9 @@ def default_pallas_fori_launcher(
         # Build in_specs/out_specs: proper BlockSpecs for outer grid dims,
         # HBM refs for tensors used in the fori_loop body (DMA handles tiling).
         _fori_pipeline_indices = kwargs.get("_pipeline_arg_indices")
+        assert _block_spec_info is not None, (
+            "fori_loop launcher requires _block_spec_info from codegen"
+        )
         in_specs_list, out_specs = _pallas_build_pipeline_specs(
             pl,
             jnp,
@@ -1246,6 +1262,7 @@ def default_pallas_fori_launcher(
             _block_spec_info,
             _fori_pipeline_indices,  # type: ignore[arg-type]
             output_only_indices,
+            smem_arg_indices=_smem_arg_indices,
         )
 
         _fori_pipeline_set = set(_fori_pipeline_indices or [])  # type: ignore[arg-type]
@@ -1260,6 +1277,7 @@ def default_pallas_fori_launcher(
             arg_to_tensor_pos,
             n_extra_refs=len(scratch_shapes),
             skip_inplace_copy=_fori_pipeline_set,
+            _smem_arg_indices=_smem_arg_indices,
         )
 
         out_shape_arg = out_shapes if len(out_shapes) > 1 else out_shapes[0]

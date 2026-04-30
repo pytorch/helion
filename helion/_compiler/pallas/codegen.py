@@ -322,7 +322,65 @@ def _ds_expr(
         from helion.language.memory_ops import _record_pad_info
 
         _record_pad_info(state, tensor, tensor_dim, block_id)
+
+        # Skip when tile_offset is set (e.g. offset + 64) — the shift
+        # means the full expression may not be a multiple of block_size.
+        if not tile_offset:
+            alignment = _loop_offset_alignment(block_id, state)
+            if alignment is not None:
+                # Workaround for JAX <= 0.10.0 where AssumeMultipleOp
+                # short-circuits divisibility analysis (fixed in
+                # jax-ml/jax@33c38f50b): only apply when alignment meets
+                # Mosaic's requirement, otherwise the hint could replace
+                # a stronger proof Mosaic already has.
+                from helion._compiler.backend import PallasBackend
+                from helion._compiler.compile_environment import CompileEnvironment
+
+                backend = CompileEnvironment.current().backend
+                assert isinstance(backend, PallasBackend)
+                dim_from_end = tensor.ndim - 1 - tensor_dim
+                bitwidth = tensor.dtype.itemsize * 8
+                required = backend._get_pallas_required_alignment(
+                    dim_from_end, tensor.ndim, bitwidth
+                )
+                if alignment % required == 0:
+                    # e.g. pl.ds(pl.multiple_of(offset_3, _BLOCK_SIZE_3), _BLOCK_SIZE_3)
+                    offset = f"pl.multiple_of({offset}, {block_size})"
+
     return f"pl.ds({offset}, {block_size})"
+
+
+def _loop_offset_alignment(
+    block_id: int,
+    state: CodegenState,
+) -> int | None:
+    """Return the proven alignment of a loop's offset for *block_id*, or ``None``.
+
+    A loop with step ``block_size`` produces offsets ``begin + i * block_size``,
+    which are multiples of ``block_size`` iff ``begin`` is.  Returns
+    ``block_size`` (int) when provable, ``None`` otherwise.
+    """
+    import sympy
+
+    from helion._compiler.compile_environment import CompileEnvironment
+
+    env = CompileEnvironment.current()
+    bs_value = env.block_sizes[block_id].from_config(state.device_function.config)
+    if not isinstance(bs_value, int):
+        return None
+
+    # Check that the loop begins at a multiple of block_size.
+    loops = state.codegen.active_device_loops.get(block_id)
+    if loops:
+        info = loops[-1].block_id_to_info.get(block_id)
+        if info is not None and info.begin_expr is not None:
+            begin = info.begin_expr
+            if not isinstance(begin, (int, sympy.Integer)):
+                return None  # symbolic begin — can't prove alignment
+            if int(begin) % bs_value != 0:
+                return None
+
+    return bs_value
 
 
 def vmem_name(state: CodegenState, name: str) -> str:
