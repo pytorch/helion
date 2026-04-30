@@ -818,22 +818,13 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         return " + ".join(terms) if terms else "cutlass.Int32(0)"
 
     def _tcgen05_scheduler_owner_warp_expr(self) -> str:
+        # The plan is registered unconditionally when tcgen05 MMA is selected
+        # (cute_mma.py: ``df.register_cute_tcgen05_matmul_plan(...)``). For the
+        # generic CuTe path that doesn't use tcgen05, fall back to warp 0.
         if (plan := self._tcgen05_plan()) is not None:
             return (
                 "cute.arch.make_warp_uniform(cute.arch.warp_idx()) "
                 f"== cutlass.Int32({plan.persistent_scheduler_owner_warp_id})"
-            )
-        config = DeviceFunction.current().config
-        epi_warps = int(str(config.get("tcgen05_num_epi_warps", 1)))
-        if bool(config.get("tcgen05_has_scheduler_warp", False)):
-            # Helion's current tcgen05 persistent path still body-wraps the
-            # clustered kernel. Until the role-local scheduler loop exists,
-            # piggyback scheduler ownership on the TMA warp so we don't carry a
-            # detached scheduler warp through the body-wide syncs.
-            scheduler_warp_id = epi_warps + 1
-            return (
-                "cute.arch.make_warp_uniform(cute.arch.warp_idx()) "
-                f"== cutlass.Int32({scheduler_warp_id})"
             )
         return "cute.arch.make_warp_uniform(cute.arch.warp_idx()) == cutlass.Int32(0)"
 

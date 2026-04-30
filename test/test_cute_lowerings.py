@@ -481,7 +481,8 @@ class TestCuteLowerings(unittest.TestCase):
             "tcgen05_exec_active = tcgen05_warp_idx == cutlass.Int32(4)",
             code,
         )
-        self.assertIn("block=(64, 8, 1)", code)
+        # 4 epi + 1 exec + 1 ab_load = 6 warps, no power-of-2 round-up.
+        self.assertIn("block=(64, 6, 1)", code)
         self.assertIn("tcgen05_gC = cute.local_tile(out, (64, 8),", code)
         self.assertIn("partition_C(tcgen05_gC)", code)
         self.assertNotIn("for _tcgen05_store_i in range(", code)
@@ -549,10 +550,10 @@ class TestCuteLowerings(unittest.TestCase):
             "if tcgen05_exec_active:",
             code,
         )
-        self.assertIn(
-            "tcgen05_exec_leader = tcgen05_exec_active and tcgen05_lane_idx == cutlass.Int32(0)",
-            code,
-        )
+        # Dropped dead exec_leader / epi_leader variables; the codegen
+        # paths that needed them inline ``cute.arch.elect_one()`` instead.
+        self.assertNotIn("tcgen05_exec_leader", code)
+        self.assertNotIn("tcgen05_epi_leader", code)
         self.assertIn(
             "tcgen05_epi_tidx = tcgen05_lane_idx + tcgen05_warp_idx * cutlass.Int32(32) if tcgen05_epi_active else cutlass.Int32(0)",
             code,
@@ -613,8 +614,6 @@ class TestCuteLowerings(unittest.TestCase):
                 tcgen05_acc_stages=2,
                 tcgen05_c_stages=2,
                 tcgen05_num_epi_warps=4,
-                tcgen05_has_scheduler_warp=True,
-                tcgen05_has_epi_load_warp=True,
             )
             code = bound.to_triton_code(config)
 
@@ -645,11 +644,12 @@ class TestCuteLowerings(unittest.TestCase):
         self.assertNotIn("cute.arch.warp_reduction_sum", code)
 
     def test_tcgen05_codegen_emits_setmaxregister_split(self) -> None:
-        """Tcgen05 codegen emits Quack-style register reallocation: producer
-        warps (TMA, AB-load, scheduler) call ``setmaxregister_decrease(120)``;
-        consumer warps (exec, epi, epi_load) call ``setmaxregister_increase(256)``.
-        Both branches gate on warp-uniform predicates so the calls only
-        fire on the right warps."""
+        """Tcgen05 codegen emits Quack-style register reallocation: consumer
+        warps (exec MMA + epilogue) call ``setmaxregister_increase(256)``;
+        every other warp (TMA, AB-load, idle padding warps) calls
+        ``setmaxregister_decrease(120)``. The "not consumer" framing of the
+        decrease branch catches idle warps so they don't sit at the default
+        ~168-register budget and steal headroom from real consumers."""
 
         @helion.kernel(backend="cute")
         def cute_matmul_setmaxregister(
@@ -698,14 +698,12 @@ class TestCuteLowerings(unittest.TestCase):
                 tcgen05_acc_stages=2,
                 tcgen05_c_stages=2,
                 tcgen05_num_epi_warps=4,
-                tcgen05_has_scheduler_warp=True,
-                tcgen05_has_epi_load_warp=True,
             )
             code = bound.to_triton_code(config)
 
-        # Producer warps drop to 120 regs.
+        # Non-consumer warps (TMA, AB-load, idle padding) drop to 120 regs.
         self.assertIn(
-            "if tcgen05_tma_warp or tcgen05_ab_load_active or tcgen05_scheduler_warp:",
+            "if not (tcgen05_exec_active or tcgen05_epi_active):",
             code,
         )
         self.assertIn(
@@ -714,7 +712,7 @@ class TestCuteLowerings(unittest.TestCase):
         )
         # Consumer / epi warps raise to 256 regs.
         self.assertIn(
-            "if tcgen05_exec_active or tcgen05_epi_active or tcgen05_epi_load_warp:",
+            "if tcgen05_exec_active or tcgen05_epi_active:",
             code,
         )
         self.assertIn(
@@ -790,8 +788,6 @@ class TestCuteLowerings(unittest.TestCase):
                 tcgen05_acc_stages=2,
                 tcgen05_c_stages=2,
                 tcgen05_num_epi_warps=4,
-                tcgen05_has_scheduler_warp=True,
-                tcgen05_has_epi_load_warp=True,
             )
             code = bound.to_triton_code(config)
 
@@ -873,8 +869,6 @@ class TestCuteLowerings(unittest.TestCase):
                 tcgen05_acc_stages=2,
                 tcgen05_c_stages=2,
                 tcgen05_num_epi_warps=4,
-                tcgen05_has_scheduler_warp=True,
-                tcgen05_has_epi_load_warp=True,
             )
             code = bound.to_triton_code(cfg)
 
@@ -975,8 +969,6 @@ class TestCuteLowerings(unittest.TestCase):
                 tcgen05_acc_stages=2,
                 tcgen05_c_stages=2,
                 tcgen05_num_epi_warps=4,
-                tcgen05_has_scheduler_warp=True,
-                tcgen05_has_epi_load_warp=True,
             )
             # The act of generating the Python source already runs the
             # CuTe DSL preprocessor; the IR verifier runs at first
@@ -1046,8 +1038,6 @@ class TestCuteLowerings(unittest.TestCase):
                 tcgen05_acc_stages=2,
                 tcgen05_c_stages=2,
                 tcgen05_num_epi_warps=4,
-                tcgen05_has_scheduler_warp=False,
-                tcgen05_has_epi_load_warp=False,
             )
             code = bound.to_triton_code(cfg)
 
@@ -1367,7 +1357,8 @@ class TestCuteLowerings(unittest.TestCase):
             bound.env.config_spec.restrict_tcgen05_cluster_m_search((2, 1))
             code = bound.to_triton_code(config)
 
-        self.assertIn("block=(32, 8, 1)", code)
+        # 4 epi + 1 exec + 1 ab_load = 6 warps; no idle scheduler/epi_load.
+        self.assertIn("block=(32, 6, 1)", code)
         self.assertIn(
             "mma_tidx = cutlass.Int32(cute.arch.thread_idx()[0]) + cutlass.Int32(cute.arch.thread_idx()[1]) * cutlass.Int32(32)",
             code,
@@ -3532,8 +3523,6 @@ class TestCuteLowerings(unittest.TestCase):
             block_sizes=[256, 256, 16],
             tcgen05_cluster_m=2,
             tcgen05_num_epi_warps=4,
-            tcgen05_has_scheduler_warp=True,
-            tcgen05_has_epi_load_warp=True,
             pid_type="persistent_blocked",
         )
         support = SimpleNamespace(
@@ -3580,23 +3569,17 @@ class TestCuteLowerings(unittest.TestCase):
             code,
         )
         self.assertIn(
-            "tcgen05_epi_load_warp = tcgen05_warp_idx == cutlass.Int32(6)",
-            code,
-        )
-        self.assertIn("tcgen05_scheduler_warp = ", code)
-        self.assertIn(
-            "tcgen05_scheduler_warp = tcgen05_warp_idx == cutlass.Int32(7)",
-            code,
-        )
-        self.assertIn(
             "tcgen05_exec_active = tcgen05_warp_idx == cutlass.Int32(4)", code
         )
         self.assertIn(
             "cute.arch.make_warp_uniform(cute.arch.warp_idx()) == cutlass.Int32(5)",
             code,
         )
-        self.assertIn("tcgen05_epi_load_warp = ", code)
-        self.assertIn("block=(32, 8, 1)", code)
+        # Dropped dead warps 6 (epi_load) and 7 (scheduler) -- the role
+        # split now launches a 6-warp CTA with no idle padding.
+        self.assertNotIn("tcgen05_epi_load_warp", code)
+        self.assertNotIn("tcgen05_scheduler_warp", code)
+        self.assertIn("block=(32, 6, 1)", code)
         self.assertIn("cta_layout_vmnk=tcgen05_cluster_layout_vmnk", code)
         self.assertIn("cutlass.utils.StaticPersistentTileScheduler.create(", code)
         self.assertIn(
@@ -3609,35 +3592,6 @@ class TestCuteLowerings(unittest.TestCase):
         )
         self.assertIn("while tcgen05_work_tile", code)
         self.assertNotIn("for virtual_pid in ", code)
-
-        no_scheduler_config = helion.Config(
-            block_sizes=[256, 256, 16],
-            tcgen05_cluster_m=2,
-            tcgen05_num_epi_warps=4,
-            tcgen05_has_scheduler_warp=False,
-            tcgen05_has_epi_load_warp=True,
-            pid_type="persistent_blocked",
-        )
-        with (
-            patch.dict("os.environ", {"HELION_CUTE_MMA_IMPL": "tcgen05"}, clear=False),
-            patch(
-                "helion._compiler.cute.cute_mma.get_cute_mma_support",
-                return_value=support,
-            ),
-            patch(
-                "helion._compiler.cute.mma_support.get_cute_mma_support",
-                return_value=support,
-            ),
-        ):
-            no_scheduler_code = cute_matmul_mma_codegen_only.bind(args).to_triton_code(
-                no_scheduler_config
-            )
-
-        self.assertIn("tcgen05_scheduler_warp = False", no_scheduler_code)
-        self.assertIn(
-            "cute.arch.make_warp_uniform(cute.arch.warp_idx()) == cutlass.Int32(5)",
-            no_scheduler_code,
-        )
 
     def test_cute_grouped_sum_reduction_uses_tree_for_non_warp_multiple_groups(
         self,
