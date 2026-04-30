@@ -235,6 +235,22 @@ def pallas_two_pass_reduction(x: torch.Tensor) -> torch.Tensor:
 
 
 @helion.kernel(backend="pallas", static_shapes=True)
+def pallas_scalar_lookup_in_pipeline(
+    biases: torch.Tensor, x: torch.Tensor, out: torch.Tensor
+) -> torch.Tensor:
+    """Per-program scalar lookup from a small 1-D table combined with an
+    inner pipeline loop. Each of the ``G`` outer programs reads its own
+    ``biases[g]`` and broadcasts it across the inner pipeline body."""
+    G = biases.size(0)
+    M = x.size(0)
+    for g in hl.grid(G):
+        b = biases[g]
+        for tile_m in hl.tile(M):
+            out[tile_m] = x[tile_m] + b
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
 def pallas_inner_loop_add_with_scalar_access(
     x: torch.Tensor, y: torch.Tensor
 ) -> torch.Tensor:
@@ -705,6 +721,45 @@ class TestPallas(TestCase):
         torch.testing.assert_close(result, args[0] + args[1])
         # out is output-only, excluded from pallas_call inputs
         self.assertIn("_inplace_indices=[]", code)
+
+    def _check_scalar_lookup_in_pipeline(self, loop_type: str) -> None:
+        torch.manual_seed(0)
+        x = torch.randn(256, device=DEVICE, dtype=torch.float32)
+        # Run with several distinct bias vectors; each invocation's
+        # observable output is the last program's read of biases[-1], so a
+        # fresh value of biases[-1] per call exercises the dynamic SMEM
+        # load with different runtime values rather than a fixed offset.
+        for biases_list in (
+            [1.0, 2.0, 3.0, 4.0],
+            [-7.5, 11.0, 0.0, 1234.5],
+            [100.0, -50.0, 25.0, -12.5],
+        ):
+            biases = torch.tensor(biases_list, device=DEVICE, dtype=torch.float32)
+            out = torch.zeros_like(x)
+            _code, result = code_and_output(
+                pallas_scalar_lookup_in_pipeline,
+                (biases, x, out),
+                block_sizes=[64],
+                pallas_loop_type=loop_type,
+            )
+            torch.testing.assert_close(
+                result, x + biases[-1].item(), rtol=1e-5, atol=1e-5
+            )
+
+    def test_scalar_lookup_with_emit_pipeline(self) -> None:
+        """``hl.grid`` outer + scalar lookup ``biases[g]`` + inner pipeline body
+        runs end-to-end under ``pallas_loop_type='emit_pipeline'``.
+
+        The scalar load index is per-program runtime, so ``biases`` has to
+        live in SMEM — Mosaic rejects a dynamic vector load from a small
+        VMEM ref because dim 0 isn't provably aligned to 128 lanes.
+        """
+        self._check_scalar_lookup_in_pipeline("emit_pipeline")
+
+    def test_scalar_lookup_with_fori_loop(self) -> None:
+        """Same kernel as :meth:`test_scalar_lookup_with_emit_pipeline`
+        compiled under ``pallas_loop_type='fori_loop'``."""
+        self._check_scalar_lookup_in_pipeline("fori_loop")
 
     def test_two_pass_reduction_emit_pipeline(self) -> None:
         """Two inner reduction loops over the same dim compile and run under
