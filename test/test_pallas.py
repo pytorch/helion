@@ -821,8 +821,8 @@ class TestPallas(TestCase):
                 pallas_loop_type="pipeline",
             )
 
-    def test_attention_default_fp32(self) -> None:
-        """Test attention with default (for-loop) inner loop."""
+    def test_attention_unroll_fp32(self) -> None:
+        """Test attention with unroll (for-loop) inner loop."""
         query = torch.randn(1, 4, 32, 64, dtype=torch.float32, device=DEVICE)
         key = torch.randn(1, 4, 32, 64, dtype=torch.float32, device=DEVICE)
         val = torch.randn(1, 4, 32, 64, dtype=torch.float32, device=DEVICE)
@@ -1368,8 +1368,8 @@ class TestPallas(TestCase):
         self.assertGreaterEqual(code.count("jax.lax.fori_loop"), 2)
         torch.testing.assert_close(result, args[0] + args[1])
 
-    def test_default_loop_multidim_non_divisible(self) -> None:
-        """Default loop with 2D inner loop where both dims are non-divisible.
+    def test_unroll_loop_multidim_non_divisible(self) -> None:
+        """Unroll loop with 2D inner loop where both dims are non-divisible.
 
         Regression test: when an output tensor is padded on multiple dims,
         _pallas_apply_ds_padding must save the original tensor reference

@@ -1716,7 +1716,7 @@ class PallasBackend(Backend):
                 launcher_args.append(f"_smem_arg_indices={smem_arg_indices!r}")
 
         # Pass scratch shapes for pipeline/fori_loop launcher
-        pallas_loop_type = config.get("pallas_loop_type", "default")
+        pallas_loop_type = config.get("pallas_loop_type", "unroll")
         if pallas_loop_type in ("emit_pipeline", "fori_loop"):
             scratch_shapes = [
                 (
@@ -1751,7 +1751,7 @@ class PallasBackend(Backend):
         """Return the launcher name to use based on ``pallas_loop_type``."""
         from ..autotuner.config_spec import VALID_PALLAS_LOOP_TYPES
 
-        pallas_loop_type = config.get("pallas_loop_type", "default")
+        pallas_loop_type = config.get("pallas_loop_type", "unroll")
         if pallas_loop_type not in VALID_PALLAS_LOOP_TYPES:
             raise ValueError(
                 f"Invalid pallas_loop_type {pallas_loop_type!r}. "

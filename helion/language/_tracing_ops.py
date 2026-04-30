@@ -238,12 +238,12 @@ def _(state: CodegenState) -> object:
     Otherwise falls through to the common ``ForLoopGraphInfo.codegen`` path.
     """
     config = state.config
-    pallas_loop_type = config.get("pallas_loop_type", "default")
+    pallas_loop_type = config.get("pallas_loop_type", "unroll")
     if pallas_loop_type == "emit_pipeline":
         return _codegen_emit_pipeline(state)
     if pallas_loop_type == "fori_loop":
         return _codegen_fori_loop(state)
-    # default: fall through to common codegen path
+    # unroll: fall through to common codegen path
     # pyrefly: ignore[bad-return]
     return state.get_graph(state.proxy_arg(0)).codegen(state)
 
@@ -252,7 +252,7 @@ def _(state: CodegenState) -> object:
 def _(state: CodegenState) -> None:
     """Emit inner stepped device loops for Pallas/TPU."""
     config = state.config
-    pallas_loop_type = config.get("pallas_loop_type", "default")
+    pallas_loop_type = config.get("pallas_loop_type", "unroll")
     if pallas_loop_type == "emit_pipeline":
         _codegen_emit_pipeline(state)
         return None

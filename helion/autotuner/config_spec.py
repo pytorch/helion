@@ -158,7 +158,7 @@ VALID_KEYS: frozenset[str] = frozenset(
         "epilogue_subtile",
     ]
 )
-VALID_PALLAS_LOOP_TYPES = ("default", "emit_pipeline", "fori_loop")
+VALID_PALLAS_LOOP_TYPES = ("unroll", "emit_pipeline", "fori_loop")
 VALID_PID_TYPES = ("flat", "xyz", "persistent_blocked", "persistent_interleaved")
 MIN_NUM_SM_MULTIPLIER = 1
 MAX_NUM_SM_MULTIPLIER = 128
@@ -543,7 +543,7 @@ class ConfigSpec:
             config.setdefault(key, fragment.default())
         if self.has_pallas_inner_loops:
             if self.has_pallas_symbolic_bounds:
-                # "default" uses Python range() which can't handle traced bounds.
+                # "unroll" uses Python range() which can't handle traced bounds.
                 # Between the remaining options, prefer "fori_loop": it handles
                 # both DMA-aligned and unaligned inner blocks, while
                 # "emit_pipeline" fails on unaligned dims.
@@ -889,7 +889,7 @@ class ConfigSpec:
         if self.has_pallas_inner_loops:
             choices = VALID_PALLAS_LOOP_TYPES
             if self.has_pallas_symbolic_bounds:
-                # Exclude "default" (uses Python range(), can't handle traced
+                # Exclude "unroll" (uses Python range(), can't handle traced
                 # bounds) and put "fori_loop" first: it handles both DMA-aligned
                 # and unaligned inner blocks, while "emit_pipeline" fails on
                 # unaligned dims.
