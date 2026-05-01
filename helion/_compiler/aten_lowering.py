@@ -25,6 +25,7 @@ from .cute.argreduce import codegen_cute_tile_argreduce
 from .cute.cute_mma import codegen_cute_mma_direct_mm
 from .cute.indexing import CutePackedAffineLoad
 from .cute.indexing import CuteShapeChainView
+from .cute.indexing import CuteSortableLoad
 from .cute.indexing import is_cute_shape_chain_target
 from .cute.indexing import match_cute_affine_range_iota
 from .cute.iota_utils import cute_iota_has_atomic_tensor_index_only_users
@@ -1704,6 +1705,94 @@ def codegen_arange_default_cute(ctx: LoweringContext, node: Node) -> object:
 sort_lowering = register_lowering(torch.ops.aten.sort.default)
 
 
+def _sort_args(node: Node) -> tuple[int, bool]:
+    dim = node.args[1] if len(node.args) > 1 else node.kwargs.get("dim", -1)
+    descending = (
+        node.args[2] if len(node.args) > 2 else node.kwargs.get("descending", False)
+    )
+    assert isinstance(dim, int), f"sort dim must be int, got {type(dim)}"
+    assert isinstance(descending, bool), (
+        f"sort descending must be bool, got {type(descending)}"
+    )
+    input_val = node.args[0]
+    assert isinstance(input_val, Node)
+    input_tensor = input_val.meta["val"]
+    ndim = input_tensor.ndim
+    if dim < 0:
+        dim = ndim + dim
+    assert dim == ndim - 1, (
+        f"sort only supports sorting on last dimension, got dim={dim}"
+    )
+    return dim, descending
+
+
+def _emit_cute_rank_sort(
+    ctx: LoweringContext,
+    load: CuteSortableLoad,
+    input_tensor: torch.Tensor,
+    *,
+    descending: bool,
+    k: int | None = None,
+) -> tuple[ast.AST, ast.AST]:
+    env = CompileEnvironment.current()
+    fn = ctx.cg.device_function
+    n = input_tensor.shape[-1]
+    n_hint = env.size_hint(n) if isinstance(n, torch.SymInt) else n
+    if not isinstance(n_hint, int):
+        raise exc.BackendUnsupported("cute", "dynamic sort extent")
+    dtype_str = env.backend.dtype_str(load.dtype)
+    index_dtype = env.backend.dtype_str(env.index_dtype)
+    out_pos = fn.new_var("sort_out_pos")
+    sorted_vals = fn.new_var("sorted_vals")
+    sorted_indices = fn.new_var("sorted_indices")
+    candidate = fn.new_var("sort_k")
+    probe = fn.new_var("sort_j")
+    candidate_rank = fn.new_var("sort_rank")
+    candidate_value = fn.new_var("sort_candidate")
+    probe_value = fn.new_var("sort_probe")
+    before = fn.new_var("sort_before")
+    selected = fn.new_var("sort_selected")
+
+    ctx.cg.add_statement(
+        statement_from_string(
+            f"{out_pos} = {index_dtype}({load.index_exprs[load.sort_index_pos]})"
+        )
+    )
+    ctx.cg.add_statement(statement_from_string(f"{sorted_vals} = {dtype_str}(0)"))
+    ctx.cg.add_statement(statement_from_string(f"{sorted_indices} = {index_dtype}(0)"))
+
+    cmp_op = ">" if descending else "<"
+
+    def indexed_load(index: str) -> str:
+        index_exprs = list(load.index_exprs)
+        index_exprs[load.sort_index_pos] = index
+        expr = f"{load.tensor_name}[{', '.join(index_exprs)}]"
+        if load.mask_expr is not None:
+            return f"({expr} if {load.mask_expr} else {dtype_str}(0))"
+        return expr
+
+    mask_suffix = f" and {out_pos} < {k}" if k is not None else ""
+    ctx.cg.add_statement(
+        statement_from_string(
+            "\n".join(
+                [
+                    f"for {candidate} in range(cutlass.Int32(0), cutlass.Int32({n_hint}), cutlass.Int32(1)):",
+                    f"    {candidate_value} = {indexed_load(candidate)}",
+                    f"    {candidate_rank} = {index_dtype}(0)",
+                    f"    for {probe} in range(cutlass.Int32(0), cutlass.Int32({n_hint}), cutlass.Int32(1)):",
+                    f"        {probe_value} = {indexed_load(probe)}",
+                    f"        {before} = ({probe_value} {cmp_op} {candidate_value}) or (({probe_value} == {candidate_value}) and ({probe} < {candidate}))",
+                    f"        {candidate_rank} = {candidate_rank} + ({index_dtype}(1) if {before} else {index_dtype}(0))",
+                    f"    {selected} = ({candidate_rank} == {out_pos}{mask_suffix})",
+                    f"    {sorted_vals} = {candidate_value} if {selected} else {sorted_vals}",
+                    f"    {sorted_indices} = {index_dtype}({candidate}) if {selected} else {sorted_indices}",
+                ]
+            )
+        )
+    )
+    return expr_from_string(sorted_vals), expr_from_string(sorted_indices)
+
+
 @sort_lowering.register_codegen("triton")
 def codegen_sort(ctx: LoweringContext, node: Node) -> object:
     """Generate tl.sort-based sort implementation.
@@ -1829,6 +1918,18 @@ def codegen_sort(ctx: LoweringContext, node: Node) -> object:
     return (expr_from_string(sorted_vals), expr_from_string(sorted_indices))
 
 
+@sort_lowering.register_codegen("cute")
+def codegen_sort_cute(ctx: LoweringContext, node: Node) -> object:
+    _, descending = _sort_args(node)
+    input_node = node.args[0]
+    assert isinstance(input_node, Node)
+    input_tensor = input_node.meta["val"]
+    load = _env_arg(ctx, input_node)
+    if not isinstance(load, CuteSortableLoad):
+        raise exc.BackendUnsupported("cute", "torch.sort input")
+    return _emit_cute_rank_sort(ctx, load, input_tensor, descending=descending)
+
+
 gather_lowering = register_lowering(
     torch.ops.aten.gather.default,
     masked_value_fn=passthrough_masked_value,
@@ -1898,6 +1999,23 @@ def codegen_gather(ctx: LoweringContext, node: Node) -> object:
 
 
 topk_lowering = register_lowering(torch.ops.aten.topk.default)
+
+
+def _topk_args(node: Node) -> tuple[int, int, bool]:
+    k = node.args[1]
+    assert isinstance(k, int), f"topk k must be int, got {type(k)}"
+    dim = node.args[2] if len(node.args) > 2 else node.kwargs.get("dim", -1)
+    largest = node.args[3] if len(node.args) > 3 else node.kwargs.get("largest", True)
+    assert isinstance(dim, int), f"topk dim must be int, got {type(dim)}"
+    assert isinstance(largest, bool), f"topk largest must be bool, got {type(largest)}"
+    input_val = node.args[0]
+    assert isinstance(input_val, Node)
+    input_tensor = input_val.meta["val"]
+    ndim = input_tensor.ndim
+    if dim < 0:
+        dim = ndim + dim
+    assert dim == ndim - 1, f"topk only supports the last dimension, got dim={dim}"
+    return k, dim, largest
 
 
 @topk_lowering.register_codegen("triton")
@@ -2053,3 +2171,17 @@ def codegen_topk(ctx: LoweringContext, node: Node) -> object:
         )
 
     return (expr_from_string(topk_vals), expr_from_string(topk_indices))
+
+
+@topk_lowering.register_codegen("cute")
+def codegen_topk_cute(ctx: LoweringContext, node: Node) -> object:
+    k, _, largest = _topk_args(node)
+    input_node = node.args[0]
+    assert isinstance(input_node, Node)
+    input_tensor = input_node.meta["val"]
+    load = _env_arg(ctx, input_node)
+    if not isinstance(load, CuteSortableLoad):
+        raise exc.BackendUnsupported("cute", "torch.topk input")
+    node.meta["cute_topk_lane_expr"] = load.index_exprs[load.sort_index_pos]
+    node.meta["cute_topk_k"] = k
+    return _emit_cute_rank_sort(ctx, load, input_tensor, descending=largest, k=k)
