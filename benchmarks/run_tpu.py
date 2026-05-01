@@ -121,15 +121,15 @@ def _attention_shapes() -> list[tuple[str, tuple[Any, ...]]]:
     # First entry mirrors examples/attention.py main(); second is the
     # reviewer's flagship shape — much larger seq_len + head_dim so the
     # bench exercises real LM-scale attention.
-    # 2nd shape: 16x the work of the 1st. (8,32,8192,128) was tried but
-    # the autotuner's default config OOMs at that scale before the search
-    # can compute its baseline.
+    # 2nd shape doubles seq_len. Tried (4,32,4096,128) and (8,32,8192,128)
+    # but the autotuner default OOMs at d=128 + larger seq before the search
+    # can compute its baseline. (2,32,2048,64) is the largest that fits.
     configs = [
         (2, 32, 1024, 64),
-        (4, 32, 4096, 128),
         (2, 32, 2048, 64),
         (1, 4, 512, 64),
         (1, 4, 1024, 64),
+        (2, 8, 512, 64),
     ]
     return [
         (
