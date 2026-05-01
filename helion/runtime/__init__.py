@@ -5,6 +5,7 @@ import contextvars
 import linecache
 import os
 import sys
+from typing import TYPE_CHECKING
 from typing import Any
 from typing import cast
 
@@ -16,6 +17,9 @@ from .._utils import triton_is_available
 from .config import Config as Config
 from .kernel import Kernel as Kernel
 from .kernel import kernel as kernel
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 _CUTLASS_SHUTDOWN_PATCHED = False
 
@@ -609,7 +613,7 @@ def _pallas_make_reordered_kernel(
 def _pallas_build_callable(
     pallas_kernel: object,
     grid: tuple[int, ...],
-    jit_fn: object,
+    jit_fn: Callable[..., object],
     _output_indices: list[int],
     arg_to_tensor_pos: dict[int, int],
     tensor_arg_indices: list[int],
@@ -656,9 +660,7 @@ def _pallas_build_callable(
 
     jax_callable = JaxCallable(
         name=kernel_name,
-        jit_fn=jax.jit(
-            jit_fn  # pyrefly: ignore[bad-argument-type]
-        ),  # pyrefly: ignore[no-matching-overload]
+        jit_fn=jax.jit(jit_fn),
         trace_key=f"{kernel_name}_{id(pallas_kernel)}_{grid}{trace_key_suffix}",
         input_output_aliases=call_aliases,
     )
@@ -689,7 +691,7 @@ class _PallasInterpretCallable:
 
     def __init__(
         self,
-        jit_fn: object,
+        jit_fn: Callable[..., object],
         inplace_output_mapping: list[tuple[int, int]],
     ) -> None:
         self._jit_fn = jit_fn

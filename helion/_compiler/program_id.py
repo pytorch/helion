@@ -818,15 +818,16 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         return " + ".join(terms) if terms else "cutlass.Int32(0)"
 
     def _tcgen05_scheduler_owner_warp_expr(self) -> str:
-        # The plan is registered unconditionally when tcgen05 MMA is selected
-        # (cute_mma.py: ``df.register_cute_tcgen05_matmul_plan(...)``). For the
-        # generic CuTe path that doesn't use tcgen05, fall back to warp 0.
-        if (plan := self._tcgen05_plan()) is not None:
-            return (
-                "cute.arch.make_warp_uniform(cute.arch.warp_idx()) "
-                f"== cutlass.Int32({plan.persistent_scheduler_owner_warp_id})"
-            )
-        return "cute.arch.make_warp_uniform(cute.arch.warp_idx()) == cutlass.Int32(0)"
+        # ``Tcgen05PersistentProgramIDs`` is only instantiated when the kernel
+        # selects tcgen05 MMA (see ``tile_strategy.select_pid_strategy``), and
+        # ``cute_mma.py`` always registers the matmul plan in that path before
+        # the persistent kernel setup runs.
+        plan = self._tcgen05_plan()
+        assert plan is not None, "tcgen05 persistent path requires a registered plan"
+        return (
+            "cute.arch.make_warp_uniform(cute.arch.warp_idx()) "
+            f"== cutlass.Int32({plan.persistent_scheduler_owner_warp_id})"
+        )
 
     def _tcgen05_scheduler_store_leader_expr(self) -> str:
         return (
@@ -835,8 +836,7 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         )
 
     def _tcgen05_cluster_scheduler_leader_expr(self) -> str:
-        cluster_size = self._tcgen05_cluster_m()
-        if cluster_size <= 1:
+        if self._tcgen05_cluster_m() <= 1:
             return self._tcgen05_scheduler_store_leader_expr()
         return (
             f"({self._tcgen05_scheduler_owner_warp_expr()}) "
@@ -957,7 +957,6 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         )
 
         cluster_m = self._tcgen05_cluster_m()
-        cluster_size = cluster_m
         tile_sched_params_var = device_function.new_var("tcgen05_tile_sched_params")
         tile_sched_var = device_function.new_var("tcgen05_tile_sched")
         work_tile_var = device_function.new_var("tcgen05_work_tile")
@@ -998,7 +997,7 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                 f"{work_tile_smem}[cutlass.Int32(3)] != cutlass.Int32(0)"
             )
         )
-        if cluster_size > 1:
+        if cluster_m > 1:
             work_tile_publish = [
                 statement_from_string(
                     f"{sched_pipeline}.producer_acquire({sched_producer_state})"
@@ -1010,7 +1009,7 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                 create(
                     ast.If,
                     test=expr_from_string(
-                        f"{sched_peer_rank} < cutlass.Int32({cluster_size})"
+                        f"{sched_peer_rank} < cutlass.Int32({cluster_m})"
                     ),
                     body=[
                         statement_from_string(
@@ -1058,7 +1057,7 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             statement_from_string(f"{self.virtual_pid_var} = {linear_pid_expr}"),
             *wrapped_body,
             self._tcgen05_scheduler_if(
-                cluster_scheduler_leader if cluster_size > 1 else scheduler_owner_warp,
+                cluster_scheduler_leader if cluster_m > 1 else scheduler_owner_warp,
                 [
                     statement_from_string(f"{tile_sched_var}.advance_to_next_work()"),
                     statement_from_string(
@@ -1071,7 +1070,7 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                 [
                     self._tcgen05_scheduler_if(consumer_leader, work_tile_consume),
                 ]
-                if cluster_size > 1
+                if cluster_m > 1
                 else []
             ),
             statement_from_string("cute.arch.sync_threads()"),
@@ -1080,7 +1079,7 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                 [
                     self._tcgen05_scheduler_if(consumer_leader, work_tile_release),
                 ]
-                if cluster_size > 1
+                if cluster_m > 1
                 else []
             ),
         ]
@@ -1103,7 +1102,7 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             ),
             statement_from_string(f"{work_tile_smem} = {work_tile_smem_tensor}"),
         ]
-        if cluster_size > 1:
+        if cluster_m > 1:
             setup.extend(
                 [
                     statement_from_string(
@@ -1115,7 +1114,7 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                     ),
                     statement_from_string(
                         f"{sched_pipeline_consumer_group} = cutlass.pipeline.CooperativeGroup("
-                        f"cutlass.pipeline.Agent.Thread, {cluster_size})"
+                        f"cutlass.pipeline.Agent.Thread, {cluster_m})"
                     ),
                     statement_from_string(
                         f"{sched_pipeline} = cutlass.pipeline.PipelineAsync.create("
@@ -1145,9 +1144,7 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         setup.extend(
             [
                 self._tcgen05_scheduler_if(
-                    cluster_scheduler_leader
-                    if cluster_size > 1
-                    else scheduler_owner_warp,
+                    cluster_scheduler_leader if cluster_m > 1 else scheduler_owner_warp,
                     [
                         statement_from_string(
                             f"{work_tile_var} = {tile_sched_var}.initial_work_tile_info()"
@@ -1157,7 +1154,7 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                 ),
             ]
         )
-        if cluster_size > 1:
+        if cluster_m > 1:
             setup.append(self._tcgen05_scheduler_if(consumer_leader, work_tile_consume))
         setup.extend(
             [
@@ -1165,7 +1162,7 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                 *refresh_work_tile,
             ]
         )
-        if cluster_size > 1:
+        if cluster_m > 1:
             setup.append(self._tcgen05_scheduler_if(consumer_leader, work_tile_release))
         setup.extend(
             [

@@ -38,7 +38,7 @@ from helion._compiler.cute.cute_mma import _make_tcgen05_layout_plan_setup
 from helion._compiler.cute.cute_mma import _mma_result_can_be_deferred
 from helion._compiler.cute.cute_mma import _new_tcgen05_layout_plan
 from helion._compiler.cute.cute_mma import _tcgen05_ab_stage_count
-from helion._compiler.cute.cute_mma import _tcgen05_pipeline_arrive_count
+from helion._compiler.cute.cute_mma import _tcgen05_epi_warp_count
 from helion._compiler.cute.cute_mma import _tcgen05_root_m_threads
 from helion._compiler.cute.cute_mma import _tcgen05_tmem_barrier_thread_count
 from helion._compiler.cute.cute_mma import can_codegen_cute_mma_aten
@@ -806,6 +806,79 @@ class TestCuteLowerings(unittest.TestCase):
         # used to land in the hoisted invariant block.)
         self.assertNotIn("acc_frag = acc_frag_base", code)
 
+    def test_tcgen05_mma_stage_uses_pipeline_consumer_state(self) -> None:
+        """tcgen05 + TMA picks the AB SMEM stage from
+        ``tma_consumer_state.index`` rather than the local
+        ``(k_offset // bk) % stage_count`` modular form.
+
+        The two values agree within a single tile (both advance by 1
+        per K iteration starting at 0), but across persistent virtual
+        tiles ``tma_consumer_state`` retains its end-of-tile value while
+        ``k_offset`` resets to zero. Computing ``mma_stage`` from
+        ``k_offset`` desyncs from the actual stage the consumer just
+        unblocked, so the K-loop reads the wrong SMEM slot. Pin the
+        consumer-state form here so future refactors can't silently
+        regress to the modular formula.
+        """
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_mma_stage(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        args = (
+            torch.randn(128, 16, device=DEVICE, dtype=torch.float16),
+            torch.randn(16, 256, device=DEVICE, dtype=torch.float16),
+        )
+        support = SimpleNamespace(
+            supported_impls=("universal", "warp", "tcgen05"),
+            warp_f16bf16=True,
+            tcgen05_f16bf16=True,
+        )
+        with (
+            patch(
+                "helion._compiler.cute.cute_mma.get_cute_mma_support",
+                return_value=support,
+            ),
+            patch(
+                "helion._compiler.cute.mma_support.get_cute_mma_support",
+                return_value=support,
+            ),
+        ):
+            bound = cute_matmul_mma_stage.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            config = helion.Config(
+                block_sizes=[128, 256, 16],
+                l2_groupings=[4],
+                loop_orders=[[0, 1]],
+                num_stages=2,
+                num_warps=8,
+                pid_type="flat",
+                tcgen05_cluster_m=1,
+                tcgen05_ab_stages=2,
+                tcgen05_acc_stages=2,
+                tcgen05_c_stages=2,
+                tcgen05_num_epi_warps=4,
+            )
+            code = bound.to_triton_code(config)
+
+        # The new form: mma_stage tracks the pipeline state directly.
+        self.assertIn("mma_stage = tcgen05_ab_consumer_state.index", code)
+        # The old modular form must NOT be emitted in the TMA path. The
+        # K-offset variable name is generated and may shift, so check
+        # the modular operator pattern itself rather than the full
+        # rendered expression -- if it ever comes back, persistent +
+        # tcgen05 desyncs across virtual tile boundaries again.
+        self.assertNotIn("// cutlass.Int32(16) % cutlass.Int32(2)", code)
+        self.assertNotIn("mma_stage = (", code)
+
     def test_tcgen05_persistent_post_loop_stmts_appear_after_while(self) -> None:
         """Compiling a persistent_blocked kernel must emit the cleanup
         block (producer_tail / TMEM allocator setup / free) AFTER the
@@ -1210,10 +1283,11 @@ class TestCuteLowerings(unittest.TestCase):
             "mma_active = cutlass.Int32(cute.arch.thread_idx()[1]) < cutlass.Int32(2)",
             code,
         )
-        self.assertIn(
-            "tcgen05_epi_warp_count = cutlass.Int32(4)",
-            code,
-        )
+        # The `tcgen05_epi_warp_count = cutlass.Int32(4)` binding is gone:
+        # the count is now inlined wherever it is used (as a `cutlass.Int32(4)`
+        # literal), which keeps the 4-epi-warp shape pinned without paying for
+        # an extra named compile-time constant.
+        self.assertNotIn("tcgen05_epi_warp_count = ", code)
         self.assertIn(
             "tcgen05_tmem_alloc_barrier = cutlass.pipeline.NamedBarrier(barrier_id=1, num_threads=160)",
             code,
@@ -3428,17 +3502,24 @@ class TestCuteLowerings(unittest.TestCase):
         self.assertEqual(_tcgen05_ab_stage_count(1), 1)
         self.assertEqual(_tcgen05_ab_stage_count(2), 2)
         self.assertEqual(_tcgen05_ab_stage_count(4), 2)
-        self.assertEqual(_tcgen05_pipeline_arrive_count(128), 2)
-        self.assertEqual(_tcgen05_pipeline_arrive_count(256), 4)
-        self.assertEqual(_tcgen05_pipeline_arrive_count(1024), 4)
+        self.assertEqual(_tcgen05_epi_warp_count({}, cta_thread_count=32), 1)
+        self.assertEqual(_tcgen05_epi_warp_count({}, cta_thread_count=128), 4)
+        self.assertEqual(
+            _tcgen05_epi_warp_count({"tcgen05_num_epi_warps": 2}, cta_thread_count=256),
+            2,
+        )
+        self.assertEqual(
+            _tcgen05_epi_warp_count({"tcgen05_num_epi_warps": 8}, cta_thread_count=128),
+            4,
+        )
         self.assertEqual(_tcgen05_root_m_threads(64, 8), 64)
         self.assertEqual(_tcgen05_root_m_threads(64, 16), 32)
         self.assertEqual(_tcgen05_root_m_threads(128, 256), 32)
-        self.assertEqual(_tcgen05_tmem_barrier_thread_count(128), 96)
-        self.assertEqual(_tcgen05_tmem_barrier_thread_count(256), 160)
-        self.assertEqual(_tcgen05_tmem_barrier_thread_count(1024), 160)
+        self.assertEqual(_tcgen05_tmem_barrier_thread_count(1), 64)
+        self.assertEqual(_tcgen05_tmem_barrier_thread_count(2), 96)
+        self.assertEqual(_tcgen05_tmem_barrier_thread_count(4), 160)
 
-    def test_tcgen05_layout_plan_setup_uses_pipeline_thread_counts(self) -> None:
+    def test_tcgen05_layout_plan_setup_inlines_constants(self) -> None:
         df = _FakeDeviceFunction()
         plan = _new_tcgen05_layout_plan(df)
         stmts = _make_tcgen05_layout_plan_setup(
@@ -3448,24 +3529,27 @@ class TestCuteLowerings(unittest.TestCase):
             bn=8,
             bk=16,
             ab_stage_count=1,
-            acc_stage_count=2,
-            c_stage_count=4,
-            cta_thread_count=256,
-            epi_warp_count=4,
             is_two_cta=False,
-            active_physical_n_threads=2,
             input_dtype_str="cutlass.Float16",
             acc_dtype_str="cutlass.Float32",
         )
 
         emitted = "\n".join(ast.unparse(stmt) for stmt in stmts)
-        self.assertIn("tcgen05_acc_stage_count_1 = cutlass.Int32(2)", emitted)
-        self.assertIn("tcgen05_ab_stage_count_1 = cutlass.Int32(1)", emitted)
-        self.assertIn("tcgen05_c_stage_count_1 = cutlass.Int32(4)", emitted)
-        self.assertIn("tcgen05_epi_warp_count_1 = cutlass.Int32(4)", emitted)
-        self.assertIn("tcgen05_epilog_sync_barrier_id_1 = cutlass.Int32(2)", emitted)
-        self.assertIn("tcgen05_acc_pipeline_arrive_count_1 = cutlass.Int32(4)", emitted)
-        self.assertIn("tcgen05_ab_pipeline_arrive_count_1 = cutlass.Int32(1)", emitted)
+        self.assertEqual(len(stmts), 6)
+        # Stage / warp counts are now inlined as cutlass.Int32 literals at the
+        # call site; the layout plan no longer materializes named constants for
+        # them. Checking for the *absence* of those bindings pins that contract.
+        self.assertNotIn("acc_stage_count", emitted)
+        self.assertNotIn("ab_stage_count_1 = ", emitted)
+        self.assertNotIn("c_stage_count", emitted)
+        self.assertNotIn("epi_warp_count_1 = ", emitted)
+        self.assertNotIn("epilog_sync_barrier_id", emitted)
+        self.assertNotIn("acc_pipeline_arrive_count", emitted)
+        self.assertNotIn("ab_pipeline_arrive_count", emitted)
+        self.assertNotIn("exec_thread_count", emitted)
+        # The dead smem_c / smem_desc_view layouts are also gone.
+        self.assertNotIn("smem_c_layout", emitted)
+        self.assertNotIn("smem_desc_view_layout", emitted)
         self.assertIn(
             "make_smem_layout_a(tiled_mma, (128, 8, 16), cutlass.Float16, 1)", emitted
         )
@@ -3473,32 +3557,9 @@ class TestCuteLowerings(unittest.TestCase):
             "make_smem_layout_b(tiled_mma, (128, 8, 16), cutlass.Float16, 1)", emitted
         )
         self.assertIn(
-            "make_smem_layout_epi(cutlass.Float32, tcgen05_c_layout_1, tcgen05_epi_tile_1, tcgen05_c_stage_count_1)",
+            "tcgen05_epilogue_rest_mode_1 = cute.make_layout(1, stride=0)",
             emitted,
         )
-        self.assertNotIn(
-            "tcgen05_acc_pipeline_arrive_count_1 = cutlass.Int32(256)", emitted
-        )
-
-        wider_plan = _new_tcgen05_layout_plan(df)
-        wider_stmts = _make_tcgen05_layout_plan_setup(
-            wider_plan,
-            "tiled_mma",
-            bm=128,
-            bn=32,
-            bk=16,
-            ab_stage_count=1,
-            acc_stage_count=2,
-            c_stage_count=2,
-            cta_thread_count=256,
-            epi_warp_count=4,
-            is_two_cta=False,
-            active_physical_n_threads=8,
-            input_dtype_str="cutlass.Float16",
-            acc_dtype_str="cutlass.Float32",
-        )
-        wider_emitted = "\n".join(ast.unparse(stmt) for stmt in wider_stmts)
-        self.assertIn("tcgen05_acc_stage_count_2 = cutlass.Int32(2)", wider_emitted)
 
     def test_tcgen05_codegen_emits_cluster_and_role_split_knobs(self) -> None:
         @helion.kernel(backend="cute")
@@ -3564,10 +3625,11 @@ class TestCuteLowerings(unittest.TestCase):
         self.assertIn("_BLOCK_SIZE_1 = 256", code)
         self.assertIn("cute.arch.block_idx_in_cluster()", code)
         self.assertIn("tcgen05_tma_warp = tcgen05_warp_idx == cutlass.Int32(5)", code)
-        self.assertIn(
-            "tcgen05_ab_load_active = tcgen05_warp_idx >= cutlass.Int32(5) and tcgen05_warp_idx < cutlass.Int32(6)",
-            code,
-        )
+        # `tcgen05_ab_load_active` was dropped: with a single A/B load warp at
+        # `tma_warp_id`, `tma_warp` already covers the same predicate, and the
+        # field is reintroducible if role-local persistent loops grow a second
+        # A/B load warp.
+        self.assertNotIn("tcgen05_ab_load_active", code)
         self.assertIn(
             "tcgen05_exec_active = tcgen05_warp_idx == cutlass.Int32(4)", code
         )
