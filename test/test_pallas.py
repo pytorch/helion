@@ -827,7 +827,12 @@ class TestPallas(TestCase):
         val = torch.randn(1, 4, 32, 64, dtype=torch.float32, device=DEVICE)
         args = (query, key, val)
 
-        _code, result = code_and_output(pallas_attention, args, block_sizes=[1, 32, 32])
+        _code, result = code_and_output(
+            pallas_attention,
+            args,
+            block_sizes=[1, 32, 32],
+            pallas_loop_type="unroll",
+        )
         ref = torch.nn.functional.scaled_dot_product_attention(
             query.float().cpu(), key.float().cpu(), val.float().cpu()
         ).to(device=DEVICE)
@@ -1383,6 +1388,7 @@ class TestPallas(TestCase):
             pallas_add_3d,
             args,
             block_sizes=[1, 8, 128],
+            pallas_loop_type="unroll",
         )
         torch.testing.assert_close(result, args[0] + args[1])
 
