@@ -1533,8 +1533,8 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
     return None
 
 
-def _check_dma_alignment(vmem_shapes: list[tuple[int, ...]]) -> bool:
-    """Check if all VMEM buffer shapes satisfy TPU DMA alignment.
+def _check_dma_alignment(vmem_shape: tuple[int, ...]) -> bool:
+    """Check if a VMEM buffer shape satisfies TPU DMA alignment.
 
     DMA requires last dim % 128 == 0 and second-to-last dim % 8 == 0
     for 2D+ tensors. Note that these rules are currently optimized for
@@ -1546,15 +1546,10 @@ def _check_dma_alignment(vmem_shapes: list[tuple[int, ...]]) -> bool:
     emit_pipeline/fori_loop inner DMA does NOT have a ``block == tensor_dim``
     exception.
     """
-    for shape in vmem_shapes:
-        if len(shape) >= 2:
-            if shape[-1] % 128 != 0:
-                return False
-            if shape[-2] % 8 != 0:
-                return False
-        elif len(shape) == 1:
-            if shape[0] % 128 != 0:
-                return False
+    if len(vmem_shape) >= 2:
+        return vmem_shape[-1] % 128 == 0 and vmem_shape[-2] % 8 == 0
+    if len(vmem_shape) == 1:
+        return vmem_shape[0] % 128 == 0
     return True
 
 
@@ -1665,7 +1660,7 @@ def _codegen_fori_loop(state: CodegenState) -> object:
     vmem_shapes = _compute_vmem_shapes(
         all_tensor_info, block_ids, slice_size_exprs, env, state
     )
-    use_dma = _check_dma_alignment(vmem_shapes)
+    use_dma = all(_check_dma_alignment(shape) for shape in vmem_shapes)
 
     # With DMA: tensors need HBM refs (no outer BlockSpec) because DMA
     # handles all slicing, and we register VMEM scratch buffers +
