@@ -503,6 +503,7 @@ class TestAtomicOperations(RefEagerTestBase, TestCase):
             )
         self.assertIn("Invalid memory semantic 'ERROR'", str(ctx.exception))
 
+    @xfailIfPallas("https://github.com/pytorch/helion/issues/2304")
     @skipIfRefEager(
         "Test is block size dependent which is not supported in ref eager mode"
     )
