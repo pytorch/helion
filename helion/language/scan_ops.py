@@ -14,6 +14,7 @@ from .. import exc
 from . import _decorators
 
 if TYPE_CHECKING:
+    from .._compiler.device_ir import HelperFunctionGraphInfo
     from .._compiler.helper_function import CombineFunction
     from .._compiler.inductor_lowering import CodegenState
     from .._compiler.type_propagation import Origin
@@ -348,6 +349,122 @@ def _(state: CodegenState) -> ast.AST | list[ast.AST]:
     return scan_expr
 
 
+@_decorators.codegen(_associative_scan, "cute")
+def _(state: CodegenState) -> ast.AST:
+    from torch.fx.node import Node
+
+    from .._compiler.ast_extension import expr_from_string
+    from .._compiler.ast_extension import statement_from_string
+    from .._compiler.compile_environment import CompileEnvironment
+    from .._compiler.cute.indexing import CuteSortableLoad
+    from .._compiler.device_ir import HelperFunctionGraphInfo
+
+    combine_graph_id = cast("int", state.proxy_arg(0))
+    dim = cast("int", state.proxy_arg(2))
+    reverse = bool(state.proxy_arg(3))
+    is_tuple_input = bool(state.proxy_arg(4))
+    if is_tuple_input:
+        raise exc.BackendUnsupported("cute", "tuple associative_scan")
+
+    helper_graph_info = state.get_graph(combine_graph_id)
+    assert isinstance(helper_graph_info, HelperFunctionGraphInfo)
+    op = _scan_combine_operator(helper_graph_info)
+    if op not in ("add", "max", "min", "mul"):
+        raise exc.BackendUnsupported("cute", "associative_scan combine function")
+
+    fx_node = state.fx_node
+    if fx_node is None:
+        raise exc.BackendUnsupported("cute", "associative_scan without FX node")
+    input_node = fx_node.args[1]
+    input_tensor = fx_node.meta["val"]
+    if dim < 0:
+        dim += input_tensor.ndim
+    if dim != input_tensor.ndim - 1:
+        raise exc.BackendUnsupported("cute", "associative_scan non-last dimension")
+
+    scan_source = state.ast_args[1]
+    sorted_source: tuple[CuteSortableLoad, bool] | None = None
+    if (
+        isinstance(input_node, Node)
+        and input_node.target is operator.getitem
+        and isinstance(input_node.args[0], Node)
+        and input_node.args[0].target is torch.ops.aten.sort.default
+    ):
+        sort_node = input_node.args[0]
+        load = sort_node.meta.get("cute_sort_load")
+        descending = sort_node.meta.get("cute_sort_descending")
+        if isinstance(load, CuteSortableLoad) and isinstance(descending, bool):
+            sorted_source = (load, descending)
+
+    if sorted_source is None:
+        if not isinstance(scan_source, CuteSortableLoad):
+            if isinstance(input_node, Node):
+                scan_source = input_node.meta.get("cute_sortable_load")
+        if not isinstance(scan_source, CuteSortableLoad):
+            raise exc.BackendUnsupported("cute", "associative_scan input")
+        load = scan_source
+    else:
+        load = sorted_source[0]
+
+    env = CompileEnvironment.current()
+    n = input_tensor.shape[-1]
+    n_hint = env.size_hint(n) if isinstance(n, torch.SymInt) else n
+    if not isinstance(n_hint, int):
+        raise exc.BackendUnsupported("cute", "dynamic associative_scan extent")
+
+    dtype_str = env.backend.dtype_str(input_tensor.dtype)
+    index_dtype = env.backend.dtype_str(env.index_dtype)
+    out_pos = state.device_function.new_var("scan_out_pos")
+    scan_i = state.device_function.new_var("scan_i")
+    acc = state.device_function.new_var("scan_acc")
+    initialized = state.device_function.new_var("scan_initialized")
+    include = state.device_function.new_var("scan_include")
+    value = state.device_function.new_var("scan_value")
+
+    state.codegen.add_statement(
+        statement_from_string(
+            f"{out_pos} = {index_dtype}({load.index_exprs[load.sort_index_pos]})"
+        )
+    )
+    identity = "1" if op == "mul" else "0"
+    state.codegen.add_statement(
+        statement_from_string(f"{acc} = {dtype_str}({identity})")
+    )
+    state.codegen.add_statement(statement_from_string(f"{initialized} = False"))
+
+    if op == "add":
+        combine_expr = f"{acc} + {value}"
+    elif op == "mul":
+        combine_expr = f"{acc} * {value}"
+    elif op == "max":
+        combine_expr = f"{acc} if {acc} > {value} else {value}"
+    elif op == "min":
+        combine_expr = f"{acc} if {acc} < {value} else {value}"
+    else:
+        raise AssertionError(op)
+    if sorted_source is not None:
+        value_lines = _cute_sorted_value_lines(
+            state, load, sorted_source[1], scan_i, value, n_hint
+        )
+    else:
+        value_lines = [f"    {value} = {_cute_scan_load_expr(load, scan_i)}"]
+    include_expr = f"{scan_i} >= {out_pos}" if reverse else f"{scan_i} <= {out_pos}"
+    state.codegen.add_statement(
+        statement_from_string(
+            "\n".join(
+                [
+                    f"for {scan_i} in range(cutlass.Int32(0), cutlass.Int32({n_hint}), cutlass.Int32(1)):",
+                    f"    {include} = {include_expr}",
+                    *value_lines,
+                    f"    {acc} = ({combine_expr}) if ({include} and {initialized}) else ({value} if {include} else {acc})",
+                    f"    {initialized} = True if {include} else {initialized}",
+                ]
+            )
+        )
+    )
+    return expr_from_string(acc)
+
+
 def _get_input_tensor_ast(state: CodegenState, is_tuple_input: bool) -> ast.AST:
     """Get the input tensor AST, handling tuple inputs specially."""
     if not is_tuple_input:
@@ -363,6 +480,93 @@ def _get_input_tensor_ast(state: CodegenState, is_tuple_input: bool) -> ast.AST:
         ]
         return create(ast.Tuple, elts=tuple_elts, ctx=ast.Load())
     return state.ast_arg(1)
+
+
+def _scan_combine_operator(helper_graph_info: HelperFunctionGraphInfo) -> str:
+    import operator as operator_mod
+
+    graph = helper_graph_info.graph
+    for node in graph.nodes:
+        if node.op != "call_function":
+            continue
+        if node.target in (
+            operator_mod.add,
+            torch.add,
+            torch.ops.aten.add.Tensor,
+            torch.ops.aten.add.Scalar,
+        ):
+            return "add"
+        if node.target in (
+            operator_mod.mul,
+            torch.mul,
+            torch.ops.aten.mul.Tensor,
+            torch.ops.aten.mul.Scalar,
+        ):
+            return "mul"
+        if node.target in (
+            torch.maximum,
+            torch.ops.aten.maximum.default,
+        ):
+            return "max"
+        if node.target in (
+            torch.minimum,
+            torch.ops.aten.minimum.default,
+        ):
+            return "min"
+    raise exc.BackendUnsupported("cute", "associative_scan combine graph")
+
+
+def _cute_scan_load_expr(load: object, index: str) -> str:
+    from .._compiler.compile_environment import CompileEnvironment
+    from .._compiler.cute.indexing import CuteSortableLoad
+
+    assert isinstance(load, CuteSortableLoad)
+    index_exprs = list(load.index_exprs)
+    index_exprs[load.sort_index_pos] = index
+    expr = f"{load.tensor_name}[{', '.join(index_exprs)}]"
+    if load.mask_expr is not None:
+        dtype_str = CompileEnvironment.current().backend.dtype_str(load.dtype)
+        return f"({expr} if {load.mask_expr} else {dtype_str}(0))"
+    return expr
+
+
+def _cute_sorted_value_lines(
+    state: CodegenState,
+    load: object,
+    descending: bool,
+    out_pos: str,
+    output_var: str,
+    n_hint: int,
+) -> list[str]:
+    from .._compiler.compile_environment import CompileEnvironment
+    from .._compiler.cute.indexing import CuteSortableLoad
+
+    assert isinstance(load, CuteSortableLoad)
+    env = CompileEnvironment.current()
+    dtype_str = env.backend.dtype_str(load.dtype)
+    index_dtype = env.backend.dtype_str(env.index_dtype)
+    sorted_value = state.device_function.new_var("scan_sorted_value")
+    candidate = state.device_function.new_var("scan_sort_k")
+    probe = state.device_function.new_var("scan_sort_j")
+    candidate_rank = state.device_function.new_var("scan_sort_rank")
+    candidate_value = state.device_function.new_var("scan_sort_candidate")
+    probe_value = state.device_function.new_var("scan_sort_probe")
+    before = state.device_function.new_var("scan_sort_before")
+    selected = state.device_function.new_var("scan_sort_selected")
+    cmp_op = ">" if descending else "<"
+    return [
+        f"    {sorted_value} = {dtype_str}(0)",
+        f"    for {candidate} in range(cutlass.Int32(0), cutlass.Int32({n_hint}), cutlass.Int32(1)):",
+        f"        {candidate_value} = {_cute_scan_load_expr(load, candidate)}",
+        f"        {candidate_rank} = {index_dtype}(0)",
+        f"        for {probe} in range(cutlass.Int32(0), cutlass.Int32({n_hint}), cutlass.Int32(1)):",
+        f"            {probe_value} = {_cute_scan_load_expr(load, probe)}",
+        f"            {before} = ({probe_value} {cmp_op} {candidate_value}) or (({probe_value} == {candidate_value}) and ({probe} < {candidate}))",
+        f"            {candidate_rank} = {candidate_rank} + ({index_dtype}(1) if {before} else {index_dtype}(0))",
+        f"        {selected} = {candidate_rank} == {out_pos}",
+        f"        {sorted_value} = {candidate_value} if {selected} else {sorted_value}",
+        f"    {output_var} = {sorted_value}",
+    ]
 
 
 def _register_helper_function(state: CodegenState, combine_graph_id: int) -> str:
