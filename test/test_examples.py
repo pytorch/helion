@@ -26,6 +26,7 @@ from helion._testing import skipIfA10G
 from helion._testing import skipIfCudaCapabilityLessThan
 from helion._testing import skipIfCudaSharedMemoryLessThan
 from helion._testing import skipIfFn
+from helion._testing import skipIfNotCUDA
 from helion._testing import skipIfPallas
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfRocm
@@ -369,6 +370,7 @@ class TestExamples(RefEagerTestBase, TestCase):
     @skipIfFn(
         lambda: _get_backend() == "cute", "CuTe FP8 GEMM example is not supported yet"
     )
+    @skipIfNotCUDA()
     @skipIfCudaCapabilityLessThan((9, 0), reason="FP8 requires CUDA capability >= 9.0")
     def test_fp8_gemm(self):
         # Create FP32 tensors and convert to FP8
@@ -1108,6 +1110,7 @@ class TestExamples(RefEagerTestBase, TestCase):
         lambda: _get_backend() == "cute",
         "CuTe FP8 attention destabilizes later cute tests when it fails in-process",
     )
+    @skipIfNotCUDA()
     @skipIfCudaCapabilityLessThan((9, 0), reason="FP8 requires CUDA capability >= 9.0")
     def test_fp8_attention(self):
         batch = 2
@@ -2390,7 +2393,7 @@ class TestExamples(RefEagerTestBase, TestCase):
 
     @skipIfRocm("failure on rocm")
     @skipIfA10G("failure on a10g")
-    @skipIfCudaCapabilityLessThan((9, 0), reason="se_block requires H100+")
+    @skipIfCudaCapabilityLessThan((9, 0), reason="se_block CUDA path requires H100+")
     def test_se_block_fwd(self):
         m, n = 128, 128
         x = torch.randn([m, n], device=DEVICE, dtype=torch.bfloat16)
@@ -2413,12 +2416,12 @@ class TestExamples(RefEagerTestBase, TestCase):
 
     @skipIfRocm("failure on rocm")
     @skipIfA10G("failure on a10g")
-    @skipIfCudaCapabilityLessThan((9, 0), reason="se_block requires H100+")
+    @skipIfCudaCapabilityLessThan((9, 0), reason="se_block CUDA path requires H100+")
     def test_se_block_bwd_dx(self):
         m, n = 128, 128
-        x = torch.randn([m, n], device=DEVICE, dtype=torch.float16, requires_grad=True)
-        w = torch.randn([n, n], device=DEVICE, dtype=torch.float16, requires_grad=True)
-        grad_out = torch.randn([m, n], device=DEVICE, dtype=torch.float16)
+        x = torch.randn([m, n], device=DEVICE, dtype=HALF_DTYPE, requires_grad=True)
+        w = torch.randn([n, n], device=DEVICE, dtype=HALF_DTYPE, requires_grad=True)
+        grad_out = torch.randn([m, n], device=DEVICE, dtype=HALF_DTYPE)
 
         # Compute expected gradients with PyTorch
         x_torch = x.detach().clone().requires_grad_(True)
@@ -2443,12 +2446,12 @@ class TestExamples(RefEagerTestBase, TestCase):
 
     @skipIfRocm("failure on rocm")
     @skipIfA10G("failure on a10g")
-    @skipIfCudaCapabilityLessThan((9, 0), reason="se_block requires H100+")
+    @skipIfCudaCapabilityLessThan((9, 0), reason="se_block CUDA path requires H100+")
     def test_se_block_bwd_dw(self):
         m, n = 128, 128
-        x = torch.randn([m, n], device=DEVICE, dtype=torch.float16, requires_grad=True)
-        w = torch.randn([n, n], device=DEVICE, dtype=torch.float16, requires_grad=True)
-        grad_out = torch.randn([m, n], device=DEVICE, dtype=torch.float16)
+        x = torch.randn([m, n], device=DEVICE, dtype=HALF_DTYPE, requires_grad=True)
+        w = torch.randn([n, n], device=DEVICE, dtype=HALF_DTYPE, requires_grad=True)
+        grad_out = torch.randn([m, n], device=DEVICE, dtype=HALF_DTYPE)
 
         # Compute expected gradients with PyTorch
         x_torch = x.detach().clone().requires_grad_(True)

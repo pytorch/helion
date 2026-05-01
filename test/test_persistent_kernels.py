@@ -12,6 +12,7 @@ from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
 from helion._testing import skipIfCudaCapabilityLessThan
+from helion._testing import skipIfNotCUDA
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfTileIR
 from helion._testing import skipIfXPU
@@ -1064,6 +1065,7 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
         self.assertIn("disallow_acc_multi_buffer=False", code_combined)
         self.assertIn("flatten=False", code_combined)
 
+    @skipIfNotCUDA()
     @skipIfCudaCapabilityLessThan(
         (12, 0), reason="Warp specialization requires CUDA capability >= 12.0"
     )

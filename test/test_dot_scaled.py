@@ -3,6 +3,7 @@ from __future__ import annotations
 import functools
 import os
 import sys
+from typing import TYPE_CHECKING
 import unittest
 
 import torch
@@ -14,14 +15,22 @@ from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
 from helion._testing import skipIfCudaCapabilityLessThan
+from helion._testing import skipIfNotCUDA
 from helion._testing import skipIfRefEager
 import helion.language as hl
 from helion.runtime.settings import _get_backend
 
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+
 # tl.dot_scaled requires SM 10.0+ (B200 / compute capability 10.0)
-requires_sm100 = skipIfCudaCapabilityLessThan(
-    (10, 0), reason="tl.dot_scaled requires CUDA capability >= 10.0 (B200+)"
-)
+def requires_sm100(fn: Callable) -> Callable:
+    return skipIfNotCUDA()(
+        skipIfCudaCapabilityLessThan(
+            (10, 0), reason="tl.dot_scaled requires CUDA capability >= 10.0 (B200+)"
+        )(fn)
+    )
 
 
 @functools.lru_cache(maxsize=1)
