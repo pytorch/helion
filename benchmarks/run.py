@@ -46,6 +46,7 @@ from torch.utils._pytree import tree_leaves
 from torch.utils._pytree import tree_map
 
 from helion._compat import get_device_name
+from helion._compile_time import enable as enable_compile_time
 from helion._compile_time import get_total_time as get_compile_total_time
 from helion._compile_time import reset as reset_compile_time
 from helion._testing import get_nvidia_gpu_model
@@ -1849,6 +1850,7 @@ def main() -> None:
 
     if args.measure_compile_time:
         os.environ["HELION_MEASURE_COMPILE_TIME"] = "1"
+        enable_compile_time()
 
     collected_metrics: list[AutotuneMetrics] = []
     if args.autotune_metrics or args.autotune_metrics_json:
