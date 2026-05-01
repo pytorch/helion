@@ -386,6 +386,21 @@ def _running_max_broadcast_ref(
     return acc.to(a.dtype)
 
 
+@helion.kernel(backend="pallas", static_shapes=True)
+def pallas_chunked_add(x: torch.Tensor) -> torch.Tensor:
+    """Iterates over chunks of rows; uses tile_k.index + tile_chunk.begin * chunk_size
+    to compute the global row index (TileIndexWithOffsetPattern)."""
+    nrows, ncols = x.shape
+    chunk_size = 64
+    nchunks = nrows // chunk_size
+    out = torch.empty_like(x)
+    for tile_col, tile_chunk in hl.tile([ncols, nchunks], block_size=[None, 1]):
+        for tile_k in hl.tile(chunk_size, block_size=64):
+            row = tile_k.index + tile_chunk.begin * chunk_size
+            out[row, tile_col] = x[row, tile_col] + 1.0
+    return out
+
+
 @onlyBackends(["triton", "pallas"])
 @skipUnlessPallas("JAX/Pallas TPU not available")
 class TestPallas(TestCase):
@@ -1031,31 +1046,31 @@ class TestPallas(TestCase):
         within each chunk uses tile_k.index + tile_chunk.begin * chunk_size
         to compute the global row index.
         """
-
-        @helion.kernel(
-            backend="pallas",
-            static_shapes=True,
-        )
-        def chunked_add(x: torch.Tensor) -> torch.Tensor:
-            nrows, ncols = x.shape
-            chunk_size = 64
-            nchunks = nrows // chunk_size
-            out = torch.empty_like(x)
-            for tile_col, tile_chunk in hl.tile([ncols, nchunks], block_size=[None, 1]):
-                for tile_k in hl.tile(chunk_size, block_size=64):
-                    # global_row = local_row_within_chunk + chunk_start
-                    row = tile_k.index + tile_chunk.begin * chunk_size
-                    out[row, tile_col] = x[row, tile_col] + 1.0
-            return out
-
         # 4 chunks of 64 rows, 128 columns
         x = torch.randn(256, 128, device=DEVICE, dtype=torch.float32)
-        code, result = code_and_output(chunked_add, (x,), block_sizes=[128])
+        code, result = code_and_output(pallas_chunked_add, (x,), block_sizes=[128])
         expected = x + 1.0
         torch.testing.assert_close(result, expected)
         # tile_k.index + offset uses TileIndexWithOffsetPattern — the
         # pl.multiple_of hint should NOT be applied to offset expressions
         self.assertNotIn("pl.multiple_of(", code)
+
+    def test_tile_index_with_symbolic_offset_emit_pipeline(self) -> None:
+        """Same kernel under pallas_loop_type='emit_pipeline'.
+
+        emit_pipeline must emit offset_<bid>/indices_<bid> in the body
+        prologue so kernel code that references tile.index sees defined
+        symbols.  Without the prologue emission, the body raises
+        ``NameError: name 'indices_2' is not defined`` at trace time.
+        """
+        x = torch.randn(256, 128, device=DEVICE, dtype=torch.float32)
+        _code, result = code_and_output(
+            pallas_chunked_add,
+            (x,),
+            block_sizes=[128],
+            pallas_loop_type="emit_pipeline",
+        )
+        torch.testing.assert_close(result, x + 1.0)
 
     def test_mixed_scalar_and_slice_access(self) -> None:
         """Tensor accessed both as scalar and slice should not be placed in SMEM.

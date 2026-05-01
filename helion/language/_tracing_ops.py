@@ -1437,8 +1437,28 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
         )
 
     strategy = _find_strategy(state, block_ids)
-    # Set up mask variables for inner-loop block_ids.
-    _needs_explicit_indices = _setup_inner_loop_masks(
+    # Emit offset_<bid>/indices_<bid> at the body prologue so kernel code
+    # that references tile.index (lowered to indices_<bid>) or pl.ds
+    # offsets (offset_<bid>) sees defined symbols.  Both vars are allocated
+    # dce=True, so unused emissions are pruned downstream.
+    _needs_explicit_indices = True
+    for i, bid in enumerate(block_ids):
+        offset_name = strategy.offset_var(bid)
+        index_name = strategy.index_var(bid)
+        body_stmts.extend(
+            [
+                statement_from_string(
+                    f"{offset_name} = ({begin_exprs[i]}) + "
+                    f"_pipeline_indices[{i}] * ({iter_step_exprs[i]})"
+                ),
+                statement_from_string(
+                    f"{index_name} = {offset_name} + "
+                    f"jnp.arange({block_size_vars[i]}, dtype=jnp.int32)"
+                ),
+            ]
+        )
+    # Set up mask variables for inner-loop block_ids (non-divisible bounds).
+    _setup_inner_loop_masks(
         state,
         strategy,
         block_ids,
