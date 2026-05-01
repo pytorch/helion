@@ -166,12 +166,17 @@ class CompileEnvironment:
         self.jagged_tile_parent_ids: dict[int, list[int]] = {}
         self.jagged_tile_mask_shapes: dict[int, list[torch.SymInt]] = {}
         self._symint_cache: dict[object, torch.SymInt] = {}
-        self._foreign_symint_cache: dict[tuple[int, sympy.Expr], torch.SymInt] = {}
+        self._foreign_symint_cache: dict[
+            tuple[int, sympy.Expr], int | torch.SymInt
+        ] = {}
         self.device_load_count = (
             0  # Track number of loads in all device code for eviction policy tuning
         )
         if settings.autotune_force_persistent or dist.is_initialized():
-            for pid_type in ("flat", "xyz"):
+            for pid_type in (
+                "flat",
+                "xyz",
+            ):
                 self.config_spec.disallow_pid_type(pid_type)
 
         if dist.is_initialized():
