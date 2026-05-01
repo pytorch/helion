@@ -218,7 +218,7 @@ jobs:
         if: matrix.backend == 'cute'
         run: |
           source .venv/bin/activate
-          SETUPTOOLS_SCM_PRETEND_VERSION="0.0.0" uv pip install .'[cute-cu12]'
+          SETUPTOOLS_SCM_PRETEND_VERSION="0.0.0" uv pip install --prerelease=allow .'[cute-cu13]'
 
       - name: CUDA Compute Check
         if: startsWith(matrix.image, 'nvidia')
