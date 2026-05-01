@@ -85,15 +85,19 @@ def index_str(
     if not subscript:
         return "...", []
 
-    # Check if we're inside an emit_pipeline or fori_loop with DMA.
-    # When fori_loop runs without DMA (use_dma=False), its block_ids
-    # are NOT treated as pipeline dims — they get pl.ds() slicing instead.
+    # Check if we're inside an emit_pipeline or fori_loop that pipelines
+    # this specific tensor.  Both loop types take a per-tensor decision:
+    # only tensors present in the loop's _dma_scratches mapping were
+    # routed through the inner DMA / Buffered BlockSpec.  Others stay on
+    # their outer BlockSpec and fall through to pl.ds().
+    tensor_name = state.codegen.device_function.tensor_arg(tensor).name
     in_pipeline = False
     pipeline_block_ids: set[int] = set()
     for loops in state.codegen.active_device_loops.values():
         for loop in loops:
-            if isinstance(loop, EmitPipelineLoopState) or (
-                isinstance(loop, ForiLoopState) and loop.use_dma
+            if (
+                isinstance(loop, (EmitPipelineLoopState, ForiLoopState))
+                and tensor_name in loop._dma_scratches
             ):
                 in_pipeline = True
                 pipeline_block_ids.update(loop.block_ids)
@@ -189,6 +193,7 @@ def _tile_pattern_code(
 ) -> str:
     from helion._compiler.pallas.plan_tiling import TilePattern
     from helion._compiler.tile_strategy import DeviceLoopState
+    from helion._compiler.tile_strategy import EmitPipelineLoopState
     from helion._compiler.tile_strategy import ForiLoopState
 
     assert isinstance(pattern, TilePattern)
@@ -208,10 +213,12 @@ def _tile_pattern_code(
     if not can_tile:
         return _ds_expr(state, block_id, tensor=tensor, tensor_dim=tensor_dim)
 
+    # Non-pipelined inner-loop tensors: a pipeline/fori loop exists over
+    # this block_id but this specific tensor was left on its outer
+    # BlockSpec, so the kernel must slice it in VMEM with pl.ds().
     loops = state.codegen.active_device_loops.get(block_id)
     if loops and any(
-        isinstance(loop, DeviceLoopState)
-        or (isinstance(loop, ForiLoopState) and not loop.use_dma)
+        isinstance(loop, (DeviceLoopState, EmitPipelineLoopState, ForiLoopState))
         for loop in loops
     ):
         return _ds_expr(state, block_id, tensor=tensor, tensor_dim=tensor_dim)
@@ -293,8 +300,7 @@ def _slice_code(
     if block_id is not None:
         loops = state.codegen.active_device_loops.get(block_id)
         if loops and any(isinstance(loop, DeviceLoopState) for loop in loops):
-            if block_id is not None:
-                return _ds_expr(state, block_id, tensor=tensor, tensor_dim=tensor_dim)
+            return _ds_expr(state, block_id, tensor=tensor, tensor_dim=tensor_dim)
 
     return ":"
 
@@ -391,7 +397,7 @@ def vmem_name(state: CodegenState, name: str) -> str:
     for loops in state.codegen.active_device_loops.values():
         for loop in loops:
             if isinstance(loop, (EmitPipelineLoopState, ForiLoopState)):
-                mapping = getattr(loop, "_tensor_to_vmem", None)
+                mapping = getattr(loop, "_dma_scratches", None)
                 if mapping and name in mapping:
                     return mapping[name]
     return name
