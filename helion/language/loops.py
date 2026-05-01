@@ -435,7 +435,12 @@ def _add_config_choices(
         ):
             _add_config_range_choice([block_id], allow_static_range=allow_static_range)
 
-        if has_symbolic_bounds and config_spec.backend_name == "pallas":
+        if (
+            has_symbolic_bounds or has_data_dependent_bounds
+        ) and config_spec.backend_name == "pallas":
+            # Both symbolic (SymInt) and tensor-derived (data-dependent)
+            # bounds need fori_loop; the "default" Python range() can't
+            # handle either as a traced upper bound.
             config_spec.has_pallas_symbolic_bounds = True
 
 

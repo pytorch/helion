@@ -264,6 +264,36 @@ def pallas_inner_loop_add_with_scalar_access(
 
 
 @helion.kernel(backend="pallas", static_shapes=True)
+def pallas_dynamic_inner_tile(offsets: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+    """Inner ``hl.tile(L)`` whose upper bound is tensor-derived
+    (``L = offsets[g+1] - offsets[g]``)."""
+    G = offsets.size(0) - 1
+    for g in hl.grid(G):
+        start = offsets[g]
+        end = offsets[g + 1]
+        L = end - start
+        for tile_l in hl.tile(L):
+            out[g, tile_l] = out[g, tile_l] * 2.0
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
+def pallas_dynamic_bound_scaled_copy(
+    offsets: torch.Tensor, x: torch.Tensor, out: torch.Tensor
+) -> torch.Tensor:
+    """All programs share an output region. Each program's inner ``hl.tile``
+    upper bound is ``offsets[g+1] - offsets[g]``."""
+    G = offsets.size(0) - 1
+    for g in hl.grid(G):
+        start = offsets[g]
+        end = offsets[g + 1]
+        L = end - start
+        for tile_l in hl.tile(L):
+            out[tile_l] = x[tile_l] * 2.0
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
 def pallas_add_3d(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     """Kernel with an outer grid loop and a 2D inner device loop."""
     b, m, n = x.size()
@@ -637,6 +667,62 @@ class TestPallas(TestCase):
         )
         self.assertIn("for ", code)
         torch.testing.assert_close(result, args[0] + args[1])
+
+    def test_dynamic_inner_loop_bound(self) -> None:
+        """Inner ``hl.tile`` with a tensor-derived upper bound must codegen
+        a ``lax.fori_loop`` whose iteration count is a runtime expression.
+
+        Without the fix:
+        - ``BlockSizeInfo.numel`` asserts because data-dependent sizes are
+          stored as ``None``.
+        - The autotuner picks ``pallas_loop_type='default'`` (Python
+          ``range``) which can't take traced bounds.
+        """
+
+        offsets = torch.tensor([0, 32, 80, 96], device=DEVICE, dtype=torch.int32)
+        out = torch.ones(3, 64, device=DEVICE, dtype=torch.float32)
+        bound = pallas_dynamic_inner_tile.bind((offsets, out))
+        # Default config picks fori_loop because the autotuner now classifies
+        # data-dependent (tensor) bounds as needing a traced loop.
+        config = bound.config_spec.default_config()
+        self.assertEqual(config.get("pallas_loop_type"), "fori_loop")
+        code = bound.to_code(config)
+        # The cdiv must use the runtime delta variable, not a literal.
+        self.assertIn("jax.lax.fori_loop", code)
+        # The end - start delta becomes a Python local before being used as
+        # the cdiv numerator; check the upper-bound expression isn't a pure
+        # literal cdiv.
+        import re
+
+        m = re.search(r"jax\.lax\.fori_loop\(0,\s*([^,]+),", code)
+        self.assertIsNotNone(m, "fori_loop with cdiv upper bound expected")
+        upper = m.group(1)
+        self.assertNotRegex(
+            upper,
+            r"^\(\d+\s*\+",
+            f"upper bound should not be a static literal, got {upper!r}",
+        )
+
+    def test_dynamic_inner_loop_bound_runs(self) -> None:
+        """End-to-end: a kernel with a tensor-derived inner ``hl.tile`` bound
+        compiles and runs. Each group's length equals the block size so no
+        last-tile masking is needed, and all programs write the same region
+        so the final state is deterministic regardless of execution order."""
+        torch.manual_seed(0)
+        block = 128
+        offsets = torch.tensor(
+            [0, block, 2 * block, 3 * block], device=DEVICE, dtype=torch.int32
+        )
+        x = torch.randn(3 * block, device=DEVICE, dtype=torch.float32)
+        out = torch.zeros_like(x)
+        _code, result = code_and_output(
+            pallas_dynamic_bound_scaled_copy,
+            (offsets, x, out),
+            block_sizes=[block],
+        )
+        expected = torch.zeros_like(x)
+        expected[:block] = x[:block] * 2.0
+        torch.testing.assert_close(result, expected, rtol=1e-5, atol=1e-5)
 
     def test_matmul_broadcast_bias(self) -> None:
         """Regression: bias [1, N] must not iterate grid dim 0.

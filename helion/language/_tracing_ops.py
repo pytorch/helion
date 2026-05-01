@@ -355,6 +355,44 @@ def _find_strategy(
     return strategy
 
 
+def _resolve_numel_str(
+    state: CodegenState,
+    env: CompileEnvironment,
+    block_id: int,
+    arg_index: int,
+) -> str:
+    """Return ``numel`` for ``block_id`` as a code string.
+
+    Static (int/SymInt) sizes go through ``state.sympy_expr``. Tensor-derived
+    (data-dependent) sizes fall back to ``end[i] - begin[i]`` from the
+    surrounding ``_for_loop`` op's ast/proxy args; Pallas/JAX traces those as
+    scalars at kernel-compile time so the resulting expression is valid.
+    """
+    size = env.block_sizes[block_id].size
+    if isinstance(size, (int, torch.SymInt)):
+        return state.sympy_expr(env.block_sizes[block_id].numel)
+
+    assert (
+        isinstance(state.ast_args, (list, tuple))
+        and len(state.ast_args) >= 3
+        and isinstance(state.ast_args[1], list)
+        and isinstance(state.ast_args[2], list)
+    ), "Data-dependent fori_loop bound requires runtime begin/end AST"
+    begin_asts = state.ast_args[1]
+    end_asts = state.ast_args[2]
+    end_str = ast.unparse(end_asts[arg_index])
+    begin_proxy = (
+        state.proxy_args[1][arg_index]
+        if isinstance(state.proxy_args, (list, tuple))
+        and len(state.proxy_args) > 1
+        and isinstance(state.proxy_args[1], (list, tuple))
+        else 0
+    )
+    if isinstance(begin_proxy, int) and begin_proxy == 0:
+        return end_str
+    return f"({end_str} - {ast.unparse(begin_asts[arg_index])})"
+
+
 def _compute_grid_and_block_sizes(
     state: CodegenState,
     block_ids: list[int],
@@ -363,14 +401,14 @@ def _compute_grid_and_block_sizes(
     """Compute grid dimensions and block size vars for the given block_ids."""
     grid_parts: list[str] = []
     block_size_vars: list[str] = []
-    for block_id in block_ids:
+    for i, block_id in enumerate(block_ids):
         block_size_var = state.device_function.block_size_var(block_id)
         assert block_size_var is not None
         block_size_vars.append(block_size_var)
         block_value = env.block_sizes[block_id].from_config(state.config)
         if block_value is not None:
             state.device_function.constexpr_arg(block_size_var, block_value)
-        numel_expr = state.sympy_expr(env.block_sizes[block_id].numel)
+        numel_expr = _resolve_numel_str(state, env, block_id, i)
         grid_parts.append(
             env.backend.cdiv_expr(numel_expr, block_size_var, is_device=True)
         )
@@ -621,7 +659,7 @@ def _setup_inner_loop_masks(
         for i, bid in enumerate(block_ids):
             block_value = env.block_sizes[bid].from_config(state.config)
             assert isinstance(block_value, int)
-            numel_expr = state.sympy_expr(env.block_sizes[bid].numel)
+            numel_expr = _resolve_numel_str(state, env, bid, i)
             offset_var = state.device_function.new_var(f"offset_{bid}")
             mask_stmt = strategy._setup_mask(
                 state, bid, block_value, offset_var, numel_expr
@@ -1471,12 +1509,21 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
     body_fn_name = state.device_function.new_var("_pipeline_body")
     body_stmts: list[ast.AST] = []
 
-    # Build block_id_to_info for the pipeline state
+    # Build block_id_to_info for the pipeline state. Tensor-derived sizes
+    # have no symbolic end_expr; emit_pipeline shouldn't actually be picked
+    # for data-dependent bounds (autotuner forces fori_loop), but keep the
+    # access guarded for safety.
     block_id_to_info: dict[int, LoopDimInfo] = {}
     for block_id in block_ids:
+        size = env.block_sizes[block_id].size
+        end_expr = (
+            env.block_sizes[block_id].numel
+            if isinstance(size, (int, torch.SymInt))
+            else None
+        )
         block_id_to_info[block_id] = LoopDimInfo(
             end_var_name=None,
-            end_expr=env.block_sizes[block_id].numel,
+            end_expr=end_expr,
         )
 
     strategy = _find_strategy(state, block_ids)
@@ -1761,12 +1808,19 @@ def _codegen_fori_loop(state: CodegenState) -> object:
         ]
     dim_idx_exprs: list[str] = loop_vars
 
-    # Build block_id_to_info
+    # Build block_id_to_info. Tensor-derived (data-dependent) sizes have no
+    # symbolic end_expr; downstream consumers handle end_expr=None.
     block_id_to_info: dict[int, LoopDimInfo] = {}
     for block_id in block_ids:
+        size = env.block_sizes[block_id].size
+        end_expr = (
+            env.block_sizes[block_id].numel
+            if isinstance(size, (int, torch.SymInt))
+            else None
+        )
         block_id_to_info[block_id] = LoopDimInfo(
             end_var_name=None,
-            end_expr=env.block_sizes[block_id].numel,
+            end_expr=end_expr,
         )
 
     # Emit offset_<bid>/indices_<bid> at the body prologue.
