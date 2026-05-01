@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING
 from typing import Callable
 from typing import Generator
 from typing import Sequence
+from typing import TypeVar
 from typing import cast
 import unittest
 
@@ -57,6 +58,8 @@ if TYPE_CHECKING:
 
     from .runtime.kernel import BoundKernel
     from .runtime.kernel import Kernel
+
+_R = TypeVar("_R")
 
 
 def _strip_launcher_args(value: str) -> str:
@@ -973,10 +976,10 @@ def _run_bound_kernel(
 
 
 def code_and_output(
-    fn: Kernel,
+    fn: Kernel[_R],
     args: tuple[object, ...],
     **kwargs: object,
-) -> tuple[str, object]:
+) -> tuple[str, _R]:
     bound = fn.bind(args)
     if is_ref_mode_enabled(bound.kernel.settings):
         if kwargs:
@@ -991,14 +994,14 @@ def code_and_output(
     config = _bound_test_config(bound, **kwargs)
     code, result = _run_bound_kernel(bound, args, config, emit_code=True)
     assert code is not None
-    return code, result
+    return code, cast("_R", result)
 
 
 def output_only(
-    fn: Kernel,
+    fn: Kernel[_R],
     args: tuple[object, ...],
     **kwargs: object,
-) -> object:
+) -> _R:
     """Run a kernel for correctness checks without eagerly materializing code text."""
     bound = fn.bind(args)
     if is_ref_mode_enabled(bound.kernel.settings):
@@ -1010,7 +1013,7 @@ def output_only(
 
     config = _bound_test_config(bound, **kwargs)
     _code, result = _run_bound_kernel(bound, args, config, emit_code=False)
-    return result
+    return cast("_R", result)
 
 
 def _as_tensors(result: object) -> list[torch.Tensor]:

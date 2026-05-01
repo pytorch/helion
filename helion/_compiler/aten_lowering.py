@@ -1926,7 +1926,11 @@ def codegen_sort_cute(ctx: LoweringContext, node: Node) -> object:
     input_tensor = input_node.meta["val"]
     load = _env_arg(ctx, input_node)
     if not isinstance(load, CuteSortableLoad):
+        load = input_node.meta.get("cute_sortable_load")
+    if not isinstance(load, CuteSortableLoad):
         raise exc.BackendUnsupported("cute", "torch.sort input")
+    node.meta["cute_sort_load"] = load
+    node.meta["cute_sort_descending"] = descending
     return _emit_cute_rank_sort(ctx, load, input_tensor, descending=descending)
 
 
@@ -2180,6 +2184,8 @@ def codegen_topk_cute(ctx: LoweringContext, node: Node) -> object:
     assert isinstance(input_node, Node)
     input_tensor = input_node.meta["val"]
     load = _env_arg(ctx, input_node)
+    if not isinstance(load, CuteSortableLoad):
+        load = input_node.meta.get("cute_sortable_load")
     if not isinstance(load, CuteSortableLoad):
         raise exc.BackendUnsupported("cute", "torch.topk input")
     node.meta["cute_topk_lane_expr"] = load.index_exprs[load.sort_index_pos]
