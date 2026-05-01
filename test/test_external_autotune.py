@@ -28,7 +28,7 @@ def _scaled_add_compile(config: Config):
     return lambda a, b: a * scale + b
 
 
-@onlyBackends(["triton"])
+@onlyBackends(["triton", "cute"])
 class TestExternalAutotune(TestCase):
     def test_basic_autotune(self):
         a = torch.randn(1024, device=DEVICE)
