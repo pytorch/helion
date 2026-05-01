@@ -556,6 +556,45 @@ def _read_final_loop_state(
     return final_results
 
 
+def _emit_inner_loop_offset_indices(
+    state: CodegenState,
+    strategy: object,
+    block_ids: list[int],
+    block_size_vars: list[str],
+    env: CompileEnvironment,
+    body_stmts: list[ast.AST],
+    offset_expr_fn: Callable[[int, str], str],
+) -> None:
+    """Emit ``offset_<bid> = …`` and ``indices_<bid> = …`` at the inner-loop
+    body prologue, using the canonical names from ``strategy``.
+
+    Used by ``_codegen_emit_pipeline`` and ``_codegen_fori_loop`` so kernel
+    code that references ``tile.index`` (lowered to ``indices_<bid>``) or
+    ``pl.ds`` offsets (``offset_<bid>``) sees defined symbols regardless of
+    whether the inner block is divisible.  Both vars are allocated
+    ``dce=True``, so unused emissions are pruned downstream.
+
+    Args:
+        offset_expr_fn: Given ``(block_id_index, block_size_var)``, returns a
+            string expression for the absolute start of the current iteration
+            (e.g. ``"(begin) + _j * (step)"``).
+    """
+    for i, bid in enumerate(block_ids):
+        offset_name = strategy.offset_var(bid)  # type: ignore[attr-defined]
+        index_name = strategy.index_var(bid)  # type: ignore[attr-defined]
+        idx_expr = env.backend.loop_index_expr(
+            offset_name, block_size_vars[i], env.index_type(), axis=0
+        )
+        body_stmts.extend(
+            [
+                statement_from_string(
+                    f"{offset_name} = {offset_expr_fn(i, block_size_vars[i])}"
+                ),
+                statement_from_string(f"{index_name} = {idx_expr}"),
+            ]
+        )
+
+
 def _setup_inner_loop_masks(
     state: CodegenState,
     strategy: object,
@@ -1437,26 +1476,19 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
         )
 
     strategy = _find_strategy(state, block_ids)
-    # Emit offset_<bid>/indices_<bid> at the body prologue so kernel code
-    # that references tile.index (lowered to indices_<bid>) or pl.ds
-    # offsets (offset_<bid>) sees defined symbols.  Both vars are allocated
-    # dce=True, so unused emissions are pruned downstream.
+    # Emit offset_<bid>/indices_<bid> at the body prologue.
     _needs_explicit_indices = True
-    for i, bid in enumerate(block_ids):
-        offset_name = strategy.offset_var(bid)
-        index_name = strategy.index_var(bid)
-        idx_expr = env.backend.loop_index_expr(
-            offset_name, block_size_vars[i], env.index_type(), axis=0
-        )
-        body_stmts.extend(
-            [
-                statement_from_string(
-                    f"{offset_name} = ({begin_exprs[i]}) + "
-                    f"_pipeline_indices[{i}] * ({iter_step_exprs[i]})"
-                ),
-                statement_from_string(f"{index_name} = {idx_expr}"),
-            ]
-        )
+    _emit_inner_loop_offset_indices(
+        state,
+        strategy,
+        block_ids,
+        block_size_vars,
+        env,
+        body_stmts,
+        offset_expr_fn=lambda i, bs: (
+            f"({begin_exprs[i]}) + _pipeline_indices[{i}] * ({iter_step_exprs[i]})"
+        ),
+    )
     # Set up mask variables for inner-loop block_ids (non-divisible bounds).
     _setup_inner_loop_masks(
         state,
@@ -1737,7 +1769,19 @@ def _codegen_fori_loop(state: CodegenState) -> object:
             end_expr=env.block_sizes[block_id].numel,
         )
 
-    # Set up mask variables for inner-loop block_ids
+    # Emit offset_<bid>/indices_<bid> at the body prologue.
+    _emit_inner_loop_offset_indices(
+        state,
+        strategy,
+        block_ids,
+        block_size_vars,
+        env,
+        body_stmts,
+        offset_expr_fn=lambda i, bs: (
+            f"({begin_exprs[i]}) + ({dim_idx_exprs[i]}) * ({iter_step_exprs[i]})"
+        ),
+    )
+    # Set up mask variables for inner-loop block_ids (non-divisible bounds).
     _setup_inner_loop_masks(
         state,
         strategy,
@@ -1830,15 +1874,6 @@ def _codegen_fori_loop(state: CodegenState) -> object:
                     statement_from_string(f"{copy_var}.start()")
                 )
                 state.codegen.add_statement(statement_from_string(f"{copy_var}.wait()"))
-        else:
-            # No DMA: emit offset assignments so pl.ds() indexing works
-            for i, bid in enumerate(block_ids):
-                offset_name = strategy.offset_var(bid)
-                state.codegen.add_statement(
-                    statement_from_string(
-                        f"{offset_name} = ({begin_exprs[i]}) + ({dim_idx_exprs[i]}) * ({iter_step_exprs[i]})"
-                    )
-                )
 
         # Codegen the user's body (loads/stores remapped via _tensor_to_vmem
         # when using DMA, or accessing HBM refs directly when not)

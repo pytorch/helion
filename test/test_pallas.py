@@ -1072,6 +1072,23 @@ class TestPallas(TestCase):
         )
         torch.testing.assert_close(result, x + 1.0)
 
+    def test_tile_index_with_symbolic_offset_fori_loop(self) -> None:
+        """Same kernel under pallas_loop_type='fori_loop'.
+
+        fori_loop has the same prologue gap as emit_pipeline: without
+        unconditional offset_<bid>/indices_<bid> emission, kernels that
+        reference tile.index inside a divisible inner loop raise
+        ``NameError: name 'indices_2' is not defined`` at trace time.
+        """
+        x = torch.randn(256, 128, device=DEVICE, dtype=torch.float32)
+        _code, result = code_and_output(
+            pallas_chunked_add,
+            (x,),
+            block_sizes=[128],
+            pallas_loop_type="fori_loop",
+        )
+        torch.testing.assert_close(result, x + 1.0)
+
     def test_mixed_scalar_and_slice_access(self) -> None:
         """Tensor accessed both as scalar and slice should not be placed in SMEM.
 
