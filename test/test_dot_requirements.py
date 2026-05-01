@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -65,6 +66,143 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         )
         spec = _matmul_kernel.bind(args).config_spec
         self.assertEqual([x.min_size for x in spec.block_sizes], [2, 8, 16])
+
+    @onlyBackends(["cute"])
+    def test_cute_tcgen05_matmul_constrains_search_space(self) -> None:
+        @helion.kernel(backend="cute")
+        def cute_matmul_mma(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        support = SimpleNamespace(
+            supported_impls=("universal", "warp", "tcgen05"),
+            warp_f16bf16=True,
+            tcgen05_f16bf16=True,
+        )
+        args = (
+            torch.randn([256, 64], device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn([64, 128], device=DEVICE, dtype=HALF_DTYPE),
+        )
+        with (
+            patch(
+                "helion._compiler.cute.cute_mma.get_cute_mma_support",
+                return_value=support,
+            ),
+            patch(
+                "helion._compiler.cute.mma_support.get_cute_mma_support",
+                return_value=support,
+            ),
+        ):
+            bound = cute_matmul_mma.bind(args)
+        spec = bound.config_spec
+        self.assertEqual([x.min_size for x in spec.block_sizes], [128, 8, 16])
+        self.assertEqual([x.max_size for x in spec.block_sizes], [256, 128, 16])
+        default_block_sizes = spec.default_config().config["block_sizes"]
+        self.assertEqual(default_block_sizes[2], 16)
+        self.assertGreaterEqual(default_block_sizes[0], 128)
+        self.assertLessEqual(default_block_sizes[0], 256)
+        self.assertGreaterEqual(default_block_sizes[1], 8)
+        self.assertLessEqual(default_block_sizes[1], 128)
+        self.assertEqual(spec.default_config().config["l2_groupings"], [1])
+        self.assertEqual(spec.default_config().config["tcgen05_cluster_m"], 2)
+
+    @onlyBackends(["cute"])
+    def test_cute_tcgen05_equal_dims_keep_default_within_max_bound(self) -> None:
+        @helion.kernel(backend="cute")
+        def cute_matmul_mma(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        support = SimpleNamespace(
+            supported_impls=("universal", "warp", "tcgen05"),
+            warp_f16bf16=True,
+            tcgen05_f16bf16=True,
+        )
+        args = (
+            torch.randn([8192, 8192], device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn([8192, 8192], device=DEVICE, dtype=HALF_DTYPE),
+        )
+        with (
+            patch(
+                "helion._compiler.cute.cute_mma.get_cute_mma_support",
+                return_value=support,
+            ),
+            patch(
+                "helion._compiler.cute.mma_support.get_cute_mma_support",
+                return_value=support,
+            ),
+        ):
+            bound = cute_matmul_mma.bind(args)
+        spec = bound.config_spec
+        self.assertEqual([x.min_size for x in spec.block_sizes], [128, 8, 16])
+        self.assertEqual([x.max_size for x in spec.block_sizes], [256, 256, 16])
+        default_block_sizes = spec.default_config().config["block_sizes"]
+        self.assertEqual(default_block_sizes[2], 16)
+        self.assertGreaterEqual(default_block_sizes[0], 128)
+        self.assertLessEqual(default_block_sizes[0], 256)
+        self.assertGreaterEqual(default_block_sizes[1], 8)
+        self.assertLessEqual(default_block_sizes[1], 256)
+        self.assertEqual(spec.default_config().config["l2_groupings"], [1])
+        self.assertEqual(spec.default_config().config["tcgen05_cluster_m"], 2)
+
+    @onlyBackends(["cute"])
+    def test_cute_tcgen05_widened_default_stays_on_tcgen05_path(self) -> None:
+        @helion.kernel(backend="cute")
+        def cute_matmul_mma(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        support = SimpleNamespace(
+            supported_impls=("universal", "warp", "tcgen05"),
+            warp_f16bf16=True,
+            tcgen05_f16bf16=True,
+        )
+        args = (
+            torch.randn([8192, 8192], device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn([8192, 8192], device=DEVICE, dtype=HALF_DTYPE),
+        )
+        with (
+            patch(
+                "helion._compiler.cute.cute_mma.get_cute_mma_support",
+                return_value=support,
+            ),
+            patch(
+                "helion._compiler.cute.mma_support.get_cute_mma_support",
+                return_value=support,
+            ),
+        ):
+            bound = cute_matmul_mma.bind(args)
+            config = bound.config_spec.default_config()
+            code = bound.to_triton_code(config)
+        self.assertEqual(config.config["block_sizes"][2], 16)
+        self.assertGreaterEqual(config.config["block_sizes"][0], 128)
+        self.assertLessEqual(config.config["block_sizes"][0], 256)
+        self.assertGreaterEqual(config.config["block_sizes"][1], 8)
+        self.assertLessEqual(config.config["block_sizes"][1], 256)
+        self.assertIn("make_trivial_tiled_mma", code)
+        self.assertIn(f"_BLOCK_SIZE_0 = {config.config['block_sizes'][0]}", code)
+        self.assertIn(f"_BLOCK_SIZE_1 = {config.config['block_sizes'][1]}", code)
 
     @skipIfMTIA("MTIA requires tl.dot initial value stride >= 128 bytes")
     def test_matmul_smaller_than_min_dot_size(self) -> None:

@@ -235,6 +235,22 @@ def pallas_two_pass_reduction(x: torch.Tensor) -> torch.Tensor:
 
 
 @helion.kernel(backend="pallas", static_shapes=True)
+def pallas_scalar_lookup_in_pipeline(
+    biases: torch.Tensor, x: torch.Tensor, out: torch.Tensor
+) -> torch.Tensor:
+    """Per-program scalar lookup from a small 1-D table combined with an
+    inner pipeline loop. Each of the ``G`` outer programs reads its own
+    ``biases[g]`` and broadcasts it across the inner pipeline body."""
+    G = biases.size(0)
+    M = x.size(0)
+    for g in hl.grid(G):
+        b = biases[g]
+        for tile_m in hl.tile(M):
+            out[tile_m] = x[tile_m] + b
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
 def pallas_inner_loop_add_with_scalar_access(
     x: torch.Tensor, y: torch.Tensor
 ) -> torch.Tensor:
@@ -279,12 +295,12 @@ def pallas_attention(
         m_i = hl.full([tile_b, tile_m], float("-inf"), dtype=torch.float32)
         l_i = torch.full_like(m_i, 1.0)
         acc = hl.zeros([tile_b, tile_m, head_dim], dtype=torch.float32)
-        q = q_view[tile_b, tile_m, :]
+        q = q_view[tile_b, tile_m, :] * qk_scale
         for tile_n in hl.tile(v_view.size(1)):
             k = k_view[tile_b, :, tile_n]
             qk = torch.bmm(q, k)
-            m_ij = torch.maximum(m_i, torch.amax(qk, -1) * qk_scale)
-            qk = qk * qk_scale - m_ij[:, :, None]
+            m_ij = torch.maximum(m_i, torch.amax(qk, -1))
+            qk = qk - m_ij[:, :, None]
             p = torch.exp2(qk)
             l_ij = torch.sum(p, -1)
             alpha = torch.exp2(m_i - m_ij)
@@ -294,7 +310,6 @@ def pallas_attention(
             p = p.to(v.dtype)
             acc = torch.baddbmm(acc, p, v)
             m_i = m_ij
-        m_i += torch.log2(l_i)
         acc = acc / l_i[:, :, None]
         out[tile_b, tile_m, :] = acc.to(out.dtype)
     return out.view(q_in.size())
@@ -640,6 +655,8 @@ class TestPallas(TestCase):
         code, result = code_and_output(pallas_bmm, (a, b))
         expected = torch.bmm(a.float(), b.float()).to(torch.bfloat16)
         torch.testing.assert_close(result, expected, rtol=1e-2, atol=1e-2)
+        # Block sizes >= 128 should get the pl.multiple_of alignment hint
+        self.assertIn("pl.multiple_of(", code)
 
     def test_bmm_fori_loop_non_divisible_k(self) -> None:
         """Test fori_loop bmm where BLOCK_K=256 doesn't evenly divide K=384."""
@@ -704,6 +721,45 @@ class TestPallas(TestCase):
         # out is output-only, excluded from pallas_call inputs
         self.assertIn("_inplace_indices=[]", code)
 
+    def _check_scalar_lookup_in_pipeline(self, loop_type: str) -> None:
+        torch.manual_seed(0)
+        x = torch.randn(256, device=DEVICE, dtype=torch.float32)
+        # Run with several distinct bias vectors; each invocation's
+        # observable output is the last program's read of biases[-1], so a
+        # fresh value of biases[-1] per call exercises the dynamic SMEM
+        # load with different runtime values rather than a fixed offset.
+        for biases_list in (
+            [1.0, 2.0, 3.0, 4.0],
+            [-7.5, 11.0, 0.0, 1234.5],
+            [100.0, -50.0, 25.0, -12.5],
+        ):
+            biases = torch.tensor(biases_list, device=DEVICE, dtype=torch.float32)
+            out = torch.zeros_like(x)
+            _code, result = code_and_output(
+                pallas_scalar_lookup_in_pipeline,
+                (biases, x, out),
+                block_sizes=[64],
+                pallas_loop_type=loop_type,
+            )
+            torch.testing.assert_close(
+                result, x + biases[-1].item(), rtol=1e-5, atol=1e-5
+            )
+
+    def test_scalar_lookup_with_emit_pipeline(self) -> None:
+        """``hl.grid`` outer + scalar lookup ``biases[g]`` + inner pipeline body
+        runs end-to-end under ``pallas_loop_type='emit_pipeline'``.
+
+        The scalar load index is per-program runtime, so ``biases`` has to
+        live in SMEM — Mosaic rejects a dynamic vector load from a small
+        VMEM ref because dim 0 isn't provably aligned to 128 lanes.
+        """
+        self._check_scalar_lookup_in_pipeline("emit_pipeline")
+
+    def test_scalar_lookup_with_fori_loop(self) -> None:
+        """Same kernel as :meth:`test_scalar_lookup_with_emit_pipeline`
+        compiled under ``pallas_loop_type='fori_loop'``."""
+        self._check_scalar_lookup_in_pipeline("fori_loop")
+
     def test_two_pass_reduction_emit_pipeline(self) -> None:
         """Two inner reduction loops over the same dim compile and run under
         ``pallas_loop_type='emit_pipeline'``.
@@ -764,14 +820,19 @@ class TestPallas(TestCase):
                 pallas_loop_type="pipeline",
             )
 
-    def test_attention_default_fp32(self) -> None:
-        """Test attention with default (for-loop) inner loop."""
+    def test_attention_unroll_fp32(self) -> None:
+        """Test attention with unroll (for-loop) inner loop."""
         query = torch.randn(1, 4, 32, 64, dtype=torch.float32, device=DEVICE)
         key = torch.randn(1, 4, 32, 64, dtype=torch.float32, device=DEVICE)
         val = torch.randn(1, 4, 32, 64, dtype=torch.float32, device=DEVICE)
         args = (query, key, val)
 
-        _code, result = code_and_output(pallas_attention, args, block_sizes=[1, 32, 32])
+        _code, result = code_and_output(
+            pallas_attention,
+            args,
+            block_sizes=[1, 32, 32],
+            pallas_loop_type="unroll",
+        )
         ref = torch.nn.functional.scaled_dot_product_attention(
             query.float().cpu(), key.float().cpu(), val.float().cpu()
         ).to(device=DEVICE)
@@ -992,6 +1053,9 @@ class TestPallas(TestCase):
         code, result = code_and_output(chunked_add, (x,), block_sizes=[128])
         expected = x + 1.0
         torch.testing.assert_close(result, expected)
+        # tile_k.index + offset uses TileIndexWithOffsetPattern — the
+        # pl.multiple_of hint should NOT be applied to offset expressions
+        self.assertNotIn("pl.multiple_of(", code)
 
     def test_mixed_scalar_and_slice_access(self) -> None:
         """Tensor accessed both as scalar and slice should not be placed in SMEM.
@@ -1308,8 +1372,8 @@ class TestPallas(TestCase):
         self.assertGreaterEqual(code.count("jax.lax.fori_loop"), 2)
         torch.testing.assert_close(result, args[0] + args[1])
 
-    def test_default_loop_multidim_non_divisible(self) -> None:
-        """Default loop with 2D inner loop where both dims are non-divisible.
+    def test_unroll_loop_multidim_non_divisible(self) -> None:
+        """Unroll loop with 2D inner loop where both dims are non-divisible.
 
         Regression test: when an output tensor is padded on multiple dims,
         _pallas_apply_ds_padding must save the original tensor reference
@@ -1324,6 +1388,7 @@ class TestPallas(TestCase):
             pallas_add_3d,
             args,
             block_sizes=[1, 8, 128],
+            pallas_loop_type="unroll",
         )
         torch.testing.assert_close(result, args[0] + args[1])
 
@@ -1361,6 +1426,8 @@ class TestPallas(TestCase):
         self.assertIn("jax.lax.fori_loop", code)
         self.assertNotIn("pltpu.make_async_copy", code)
         self.assertIn("pl.ds(", code)
+        # Block size 64 < 128 alignment — hint should NOT be applied
+        self.assertNotIn("pl.multiple_of(", code)
         torch.testing.assert_close(result, args[0] + args[1])
 
     def test_fori_loop_no_dma_multidim_unaligned(self) -> None:
@@ -1906,19 +1973,15 @@ class TestPallasIndirectGather(TestCase):
         with self.assertRaisesRegex(Exception, "exceeds the .* VMEM threshold"):
             code_and_output(gather, (indices, table), block_sizes=[128, 64])
 
-    @xfailIfPallas(
-        "VMEM budget check uses full tensor.numel() instead of per-dim block sizes"
-    )
     def test_gather_vmem_budget_uses_block_size(self) -> None:
-        """xfail: tiling broadcast dims should shrink the VMEM block.
+        """Tiling broadcast dims shrinks the VMEM block.
 
-        The check today uses full ``tensor.numel()``, so configs that would
-        actually fit in VMEM after tiling are rejected. Will pass once the
-        VMEM accounting accounts for per-dim block sizes (TODO in gather.py).
+        Full table is over the threshold but the resident block after tiling
+        the broadcast dim fits, so the check must pass.
         """
         gather = self._gather_2d_kernel()
         # Full table = 8192 * 1024 * 4 = 32 MiB (over the 16 MiB limit).
-        # Real VMEM block with BE=256 = 8192 * 256 * 4 = 8 MiB, fits.
+        # Resident VMEM block with BE=256 = 8192 * 256 * 4 = 8 MiB, fits.
         table = torch.randn(8192, 1024, device=DEVICE, dtype=torch.float32)
         indices = torch.randint(0, 8192, (256,), device=DEVICE, dtype=torch.int32)
         code_and_output(gather, (indices, table), block_sizes=[128, 256])

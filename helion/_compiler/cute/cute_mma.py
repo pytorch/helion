@@ -21,9 +21,11 @@ from __future__ import annotations
 
 import ast
 from dataclasses import dataclass
-import operator
 import os
+import textwrap
 from typing import TYPE_CHECKING
+from typing import Protocol
+from typing import cast
 
 import torch
 from torch._subclasses.fake_tensor import FakeTensor
@@ -32,6 +34,8 @@ from torch.fx.node import Node
 from ... import exc
 from ..ast_extension import expr_from_string
 from ..ast_extension import statement_from_string
+from ..device_function import CuteTcgen05MatmulPlan
+from ..device_function import CuteTcgen05StoreValue
 from ..dtype_utils import cast_ast
 from ..matmul_utils import _needs_f32_accumulator
 from ..tile_strategy import DeviceLoopState
@@ -60,8 +64,12 @@ _TRACE_THROUGH_TARGETS = {
 class _Tcgen05LayoutPlan:
     acc_stage_count: str
     ab_stage_count: str
+    c_stage_count: str
     exec_thread_count: str
-    consumer_thread_count: str
+    epi_warp_count: str
+    epilog_sync_barrier_id: str
+    acc_pipeline_arrive_count: str
+    ab_pipeline_arrive_count: str
     exec_active: str
     smem_a_layout: str
     smem_b_layout: str
@@ -72,6 +80,7 @@ class _Tcgen05LayoutPlan:
     tmem_load_atom: str
     acc_tmem_cols: str
     tmem_holding_buf: str
+    tmem_dealloc_mbar_ptr: str
     tmem_alloc_barrier: str
     tmem_allocator: str
     acc_tmem_ptr: str
@@ -82,6 +91,10 @@ class _Tcgen05LayoutPlan:
     acc_producer_state: str
     acc_consumer_state: str
     epilogue_rest_mode: str
+
+
+class _ConfigLike(Protocol):
+    def get(self, key: str, default: object = ...) -> object: ...
 
 
 def _iter_node_inputs(arg: object) -> list[Node]:
@@ -170,8 +183,8 @@ def _has_mma_operands(lhs_node: Node, rhs_node: Node) -> bool:
     rhs_info = _trace_to_load_tensor(rhs_node)
     if lhs_info is None or rhs_info is None:
         return False
-    _, _, lhs_fake = lhs_info
-    _, _, rhs_fake = rhs_info
+    lhs_load, _, lhs_fake = lhs_info
+    rhs_load, _, rhs_fake = rhs_info
     supported = {torch.float16, torch.bfloat16, torch.float32}
     return (
         lhs_fake.dtype in supported
@@ -390,6 +403,40 @@ def _local_mma_coord_expr(
     return f"{coord} * cutlass.Int32({elements_per_thread}) + cutlass.Int32({lane_var})"
 
 
+def _physical_mma_coord_expr(
+    cg: GenerateAST,
+    block_id: int,
+) -> str:
+    """Return the physical thread coordinate for an MMA output axis."""
+    block_thread_axes: dict[int, int] = {}
+    if cg.current_grid_state is not None:
+        block_thread_axes = cg.current_grid_state.block_thread_axes
+    thread_axis = block_thread_axes.get(block_id)
+    if thread_axis is None:
+        return "cutlass.Int32(0)"
+    return f"cutlass.Int32(cute.arch.thread_idx()[{thread_axis}])"
+
+
+def _grid_thread_extent(cg: GenerateAST, block_id: int) -> int:
+    grid_state = cg.current_grid_state
+    if grid_state is None:
+        return 1
+    thread_axis = grid_state.block_thread_axes.get(block_id)
+    if thread_axis is None:
+        return 1
+    return grid_state.thread_axis_sizes.get(thread_axis, 1)
+
+
+def _grid_cta_thread_count(cg: GenerateAST) -> int:
+    grid_state = cg.current_grid_state
+    if grid_state is None:
+        return 1
+    cta_threads = 1
+    for size in grid_state.thread_axis_sizes.values():
+        cta_threads *= size
+    return cta_threads
+
+
 def _get_mma_k_loop_info(
     cg: GenerateAST,
     env: CompileEnvironment,
@@ -500,22 +547,126 @@ def _device_loop_begin_expr(device_loop: DeviceLoopState) -> str:
     return ast.unparse(loop_iter.args[0])
 
 
-def _has_active_lane_loops(cg: GenerateAST) -> bool:
-    grid_state = cg.current_grid_state
-    if grid_state is not None and grid_state.has_lane_loops():
-        return True
+def _has_non_root_lane_loops(
+    cg: GenerateAST, *, allowed_loop_states: tuple[DeviceLoopState, ...] = ()
+) -> bool:
     seen: set[int] = set()
+    allowed_ids = {id(loop_state) for loop_state in allowed_loop_states}
     for loops in cg.active_device_loops.values():
         for loop_state in loops:
             key = id(loop_state)
             if key in seen:
                 continue
             seen.add(key)
+            if loop_state is cg.current_grid_state or key in allowed_ids:
+                continue
             strategy = getattr(loop_state, "strategy", None)
             lane_vars = getattr(strategy, "_lane_var_by_block", None)
             if lane_vars:
                 return True
     return False
+
+
+def prepare_cute_collective_lane_loop_suppression(
+    cg: GenerateAST, graph: torch.fx.Graph
+) -> None:
+    from ..compile_environment import CompileEnvironment
+
+    grid_state = cg.current_grid_state
+    if grid_state is None:
+        return
+
+    env = CompileEnvironment.current()
+    if env.backend_name != "cute":
+        return
+
+    for node in graph.nodes:
+        if node.op != "call_function":
+            continue
+        if node.target is torch.ops.aten.addmm.default:
+            with_acc = True
+            lhs_node = node.args[1]
+            rhs_node = node.args[2]
+            if not can_codegen_cute_mma_aten(node, with_acc):
+                continue
+        elif node.target is torch.ops.aten.mm.default:
+            with_acc = False
+            lhs_node = node.args[0]
+            rhs_node = node.args[1]
+            if not can_codegen_cute_mma_aten(node, with_acc):
+                continue
+        elif can_codegen_cute_mma_dot(node):
+            lhs_node = node.args[0]
+            rhs_node = node.args[1]
+        else:
+            continue
+
+        if not isinstance(lhs_node, Node) or not isinstance(rhs_node, Node):
+            continue
+
+        lhs_info = _trace_to_load_tensor(lhs_node)
+        rhs_info = _trace_to_load_tensor(rhs_node)
+        if lhs_info is None or rhs_info is None:
+            continue
+        lhs_load, _, lhs_fake = lhs_info
+        rhs_load, _, rhs_fake = rhs_info
+        if lhs_fake.ndim != 2 or rhs_fake.ndim != 2:
+            continue
+
+        if not (
+            isinstance(lhs_fake.shape[0], int)
+            and isinstance(rhs_fake.shape[1], int)
+            and isinstance(lhs_fake.shape[1], int)
+        ):
+            continue
+        m = lhs_fake.shape[0]
+        n = rhs_fake.shape[1]
+        k = lhs_fake.shape[1]
+        bm = bn = bk = None
+        candidate_block_ids = [*grid_state.block_ids]
+        if (
+            k_loop_info := _get_mma_k_loop_info(
+                cg, env, lhs_fake, rhs_fake, fx_node=node
+            )
+        ) is not None:
+            _, k_block_id, _, k_block_size = k_loop_info
+            candidate_block_ids.append(k_block_id)
+            bk = int(k_block_size)
+        for bid in dict.fromkeys(candidate_block_ids):
+            size = env.block_sizes[bid].size
+            bs = env.block_sizes[bid].from_config(cg.device_function.config)
+            if not isinstance(bs, int):
+                continue
+            if isinstance(size, (int, torch.SymInt)):
+                if bm is None and env.known_equal(size, lhs_fake.shape[0]):
+                    bm = int(bs)
+                elif bn is None and env.known_equal(size, rhs_fake.shape[1]):
+                    bn = int(bs)
+                elif bk is None and env.known_equal(size, lhs_fake.shape[1]):
+                    bk = int(bs)
+        if bm is None or bn is None or bk is None:
+            continue
+        if (
+            _choose_mma_impl(
+                lhs_fake.dtype, bm=bm, bn=bn, bk=bk, config=cg.device_function.config
+            )
+            != "tcgen05"
+        ):
+            continue
+        if m % bm != 0 or n % bn != 0 or k % bk != 0:
+            continue
+        if (
+            len(lhs_load.users) != 1
+            or len(rhs_load.users) != 1
+            or next(iter(lhs_load.users)) is not node
+            or next(iter(rhs_load.users)) is not node
+        ):
+            continue
+
+        cg.device_function.register_cute_collective_handled_load(lhs_load.name)
+        cg.device_function.register_cute_collective_handled_load(rhs_load.name)
+        if grid_state.has_lane_loops():
+            cg.device_function.suppress_cute_root_lane_loops = True
 
 
 def _mma_result_can_be_deferred(node: Node) -> bool:
@@ -543,14 +694,16 @@ def _emit_mma_pipeline(
     rhs_info = _trace_to_load_tensor(rhs_node)
     if lhs_info is None or rhs_info is None:
         return None
-    _, _, lhs_fake = lhs_info
-    _, _, rhs_fake = rhs_info
+    lhs_load, _, lhs_fake = lhs_info
+    rhs_load, _, rhs_fake = rhs_info
     if lhs_fake.ndim != 2 or rhs_fake.ndim != 2:
         return None
 
     df = cg.device_function
-    lhs_arg_name = df.tensor_arg(lhs_fake).name
-    rhs_arg_name = df.tensor_arg(rhs_fake).name
+    lhs_arg = df.tensor_arg(lhs_fake)
+    rhs_arg = df.tensor_arg(rhs_fake)
+    lhs_arg_name = lhs_arg.name
+    rhs_arg_name = rhs_arg.name
 
     input_dtype = lhs_fake.dtype
     _dtype_map = {
@@ -560,6 +713,15 @@ def _emit_mma_pipeline(
     }
     input_dtype_str = _dtype_map[input_dtype]
     acc_dtype_str = "cutlass.Float32"
+    tcgen05_use_tma = (
+        input_dtype in (torch.float16, torch.bfloat16)
+        and lhs_fake.is_contiguous()
+        and rhs_fake.is_contiguous()
+    )
+    tcgen05_use_tma_a = tcgen05_use_tma
+    tcgen05_use_tma_b = tcgen05_use_tma
+    tcgen05_use_tma = tcgen05_use_tma_a or tcgen05_use_tma_b
+    tcgen05_use_tma_pipeline = tcgen05_use_tma_a and tcgen05_use_tma_b
 
     k_total_size = int(lhs_fake.shape[1])
 
@@ -569,6 +731,8 @@ def _emit_mma_pipeline(
     if k_loop_info is None:
         return None
     device_loop, _, k_offset_var, bk = k_loop_info
+    if _has_non_root_lane_loops(cg):
+        return None
     k_loop_begin_expr = _device_loop_begin_expr(device_loop)
 
     # Get M, N offsets and block sizes from grid state
@@ -580,20 +744,33 @@ def _emit_mma_pipeline(
     bn: int | None = None
     grid_state = cg.current_grid_state
     if grid_state is not None:
-        for bid in grid_state.block_ids:
-            offset = grid_state.strategy.offset_var(bid)
-            bs_info = env.block_sizes[bid]
-            size = bs_info.size
-            bs = bs_info.from_config(df.config)
-            if isinstance(size, (int, torch.SymInt)):
-                if m_offset_var is None and env.known_equal(size, lhs_fake.shape[0]):
-                    m_offset_var = offset
-                    m_block_id = bid
-                    bm = int(bs) if isinstance(bs, int) else None
-                elif n_offset_var is None and env.known_equal(size, rhs_fake.shape[1]):
-                    n_offset_var = offset
-                    n_block_id = bid
-                    bn = int(bs) if isinstance(bs, int) else None
+        if len(grid_state.block_ids) == 2:
+            m_block_id, n_block_id = grid_state.block_ids
+            m_offset_var = grid_state.strategy.offset_var(m_block_id)
+            n_offset_var = grid_state.strategy.offset_var(n_block_id)
+            m_bs = env.block_sizes[m_block_id].from_config(df.config)
+            n_bs = env.block_sizes[n_block_id].from_config(df.config)
+            bm = int(m_bs) if isinstance(m_bs, int) else None
+            bn = int(n_bs) if isinstance(n_bs, int) else None
+        else:
+            for bid in grid_state.block_ids:
+                offset = grid_state.strategy.offset_var(bid)
+                bs_info = env.block_sizes[bid]
+                size = bs_info.size
+                bs = bs_info.from_config(df.config)
+                if isinstance(size, (int, torch.SymInt)):
+                    if m_offset_var is None and env.known_equal(
+                        size, lhs_fake.shape[0]
+                    ):
+                        m_offset_var = offset
+                        m_block_id = bid
+                        bm = int(bs) if isinstance(bs, int) else None
+                    elif n_offset_var is None and env.known_equal(
+                        size, rhs_fake.shape[1]
+                    ):
+                        n_offset_var = offset
+                        n_block_id = bid
+                        bn = int(bs) if isinstance(bs, int) else None
 
     if (
         bm is None
@@ -604,6 +781,11 @@ def _emit_mma_pipeline(
         or n_block_id is None
     ):
         return None
+    # The direct accumulator-to-output drain is still only used on the narrow
+    # N=8 family. Wider tcgen05 tiles now run through the output-TMA / staged
+    # epilogue path, which is working on current B200 runs but is still a
+    # separate lowering family from the narrow direct-store path.
+    tcgen05_direct_store = bn <= 8
 
     m_index_var = cg.index_var(m_block_id)
     n_index_var = cg.index_var(n_block_id)
@@ -614,30 +796,150 @@ def _emit_mma_pipeline(
     assert grid_state is not None
     m_local = _local_mma_coord_expr(cg, m_block_id)
     n_local = _local_mma_coord_expr(cg, n_block_id)
+    n_physical = _physical_mma_coord_expr(cg, n_block_id)
     m_global = f"cutlass.Int32({m_index_var})"
     n_global = f"cutlass.Int32({n_index_var})"
+    m_size = int(lhs_fake.shape[0])
+    n_size = int(rhs_fake.shape[1])
 
-    mma_impl = _choose_mma_impl(input_dtype, bm=bm, bn=bn, bk=bk)
+    mma_impl = _choose_mma_impl(input_dtype, bm=bm, bn=bn, bk=bk, config=df.config)
     zero_acc_expr = acc_expr is not None and _is_zero_acc_expr(acc_expr)
+    if (
+        not zero_acc_expr
+        and acc_expr is not None
+        and fx_node is not None
+        and fx_node.target is torch.ops.aten.addmm.default
+    ):
+        acc_node = fx_node.args[0] if fx_node.args else None
+        if isinstance(acc_node, Node) and _is_zero_init_acc_node(acc_node):
+            zero_acc_expr = True
     if acc_expr is not None and mma_impl != "universal" and not zero_acc_expr:
         mma_impl = "universal"
     if mma_impl != "universal" and zero_acc_expr:
         acc_expr = None
+    tcgen05_collective_handles_operand_loads = (
+        mma_impl == "tcgen05"
+        and fx_node is not None
+        and cg.current_grid_state is not None
+        and m_size % bm == 0
+        and n_size % bn == 0
+        and k_total_size % bk == 0
+        and len(lhs_load.users) == 1
+        and len(rhs_load.users) == 1
+        and next(iter(lhs_load.users)) is fx_node
+        and next(iter(rhs_load.users)) is fx_node
+    )
+    if tcgen05_collective_handles_operand_loads:
+        df.register_cute_collective_handled_load(lhs_load.name)
+        df.register_cute_collective_handled_load(rhs_load.name)
+        grid_state = cg.current_grid_state
+        assert grid_state is not None
+        if grid_state.has_lane_loops():
+            df.suppress_cute_root_lane_loops = True
 
     # Variable names
     tiled_mma = df.new_var("tiled_mma")
     thr_mma = df.new_var("thr_mma")
     acc_frag = df.new_var("acc_frag")
     acc_frag_base = df.new_var("acc_frag_base")
+    tcgen05_exec_acc_frag_base = df.new_var("tcgen05_exec_acc_frag_base")
+    tcgen05_exec_acc_tmem_ptr = df.new_var("tcgen05_exec_acc_tmem_ptr")
+    tcgen05_epi_acc_tmem_ptr = df.new_var("tcgen05_epi_acc_tmem_ptr")
+    tcgen05_epi_acc_frag_base = df.new_var("tcgen05_epi_acc_frag_base")
     tcgen05_plan = _new_tcgen05_layout_plan(df) if mma_impl == "tcgen05" else None
+    tcgen05_cluster_layout_vmnk = df.new_var("tcgen05_cluster_layout_vmnk")
 
     # === outer_prefix: MMA setup + shared memory alloc + accumulator init ===
     prefix = device_loop.outer_prefix
     suffix = device_loop.outer_suffix
 
-    mma_thread_linear: str | None = None
+    mma_participant_linear: str | None = None
+    mma_copy_linear: str | None = None
     mma_active: str | None = None
+    tma_warp: str | None = None
+    tcgen05_invariant_setup_start: int | None = None
+    warp_idx: str | None = None
+    lane_idx: str | None = None
+    epi_active: str | None = None
+    epi_leader: str | None = None
+    exec_leader: str | None = None
+    epi_tidx: str | None = None
     mma_phys_n = _mma_active_n_threads(mma_impl)
+    mma_physical_m_threads = _grid_thread_extent(cg, m_block_id)
+    tcgen05_cta_thread_count = _grid_cta_thread_count(cg)
+    tcgen05_cluster_m = _tcgen05_cluster_m(df.config)
+    # cluster_m == 2 currently requires CTA-local M tiles >= 128. Smaller
+    # M tiles (e.g. bm=64) miscompile with cluster_m=2, so transparently
+    # demote to a single-CTA cluster. Also demote when we cannot statically
+    # confirm the launch grid has enough M-CTAs to satisfy the cluster
+    # shape -- CUDA rejects clusters with fewer CTAs than the cluster size,
+    # so symbolic M dimensions take the safe path too.
+    if tcgen05_cluster_m > 1:
+        m_total = lhs_fake.shape[0]
+        if (
+            bm < 128
+            or not isinstance(m_total, int)
+            or m_total // bm < tcgen05_cluster_m
+        ):
+            tcgen05_cluster_m = 1
+    assert tcgen05_cluster_m == 1 or bm >= 128
+    tcgen05_is_two_cta = _tcgen05_use_2cta_instrs(bm=bm, cluster_m=tcgen05_cluster_m)
+    if mma_impl == "tcgen05" and tcgen05_cluster_m > 1:
+        df.cute_cluster_shape = (tcgen05_cluster_m, 1, 1)
+    tcgen05_acc_stage_count_value = _tcgen05_config_int(
+        df.config, "tcgen05_acc_stages", _tcgen05_acc_stage_count(bn)
+    )
+    tcgen05_ab_stage_count_value = _tcgen05_config_int(
+        df.config, "tcgen05_ab_stages", _tcgen05_ab_stage_count(df.config.num_stages)
+    )
+    tcgen05_c_stage_count_value = _tcgen05_config_int(
+        df.config, "tcgen05_c_stages", _tcgen05_c_stage_count(bn)
+    )
+    (
+        tcgen05_epi_warp_count_value,
+        tcgen05_ab_load_warp_count_value,
+        tcgen05_has_scheduler_warp,
+        tcgen05_has_epi_load_warp,
+    ) = _tcgen05_role_layout(
+        df.config, bn=bn, cta_thread_count=tcgen05_cta_thread_count
+    )
+    tcgen05_acc_pipeline_arrive_count_value = _tcgen05_pipeline_arrive_count(
+        tcgen05_cta_thread_count, tcgen05_epi_warp_count_value
+    )
+    tcgen05_tmem_barrier_thread_count_value = _tcgen05_tmem_barrier_thread_count(
+        tcgen05_cta_thread_count, tcgen05_epi_warp_count_value
+    )
+    tcgen05_matmul_plan: CuteTcgen05MatmulPlan | None = None
+    if mma_impl == "tcgen05":
+        tcgen05_matmul_plan = CuteTcgen05MatmulPlan(
+            bm=bm,
+            bn=bn,
+            bk=bk,
+            cluster_m=tcgen05_cluster_m,
+            is_two_cta=tcgen05_is_two_cta,
+            cta_thread_count=tcgen05_cta_thread_count,
+            physical_m_threads=mma_physical_m_threads,
+            acc_stage_count=tcgen05_acc_stage_count_value,
+            ab_stage_count=tcgen05_ab_stage_count_value,
+            c_stage_count=tcgen05_c_stage_count_value,
+            epi_warp_count=tcgen05_epi_warp_count_value,
+            ab_load_warp_count=tcgen05_ab_load_warp_count_value,
+            has_scheduler_warp=tcgen05_has_scheduler_warp,
+            has_epi_load_warp=tcgen05_has_epi_load_warp,
+        )
+        candidate_block_shape = tcgen05_matmul_plan.block_shape
+        df.register_cute_tcgen05_matmul_plan(tcgen05_matmul_plan)
+        if (
+            candidate_block_shape[0]
+            * candidate_block_shape[1]
+            * candidate_block_shape[2]
+            > 1024
+        ):
+            raise exc.BackendUnsupported(
+                "cute",
+                f"tcgen05 launch block shape {candidate_block_shape} exceeds 1024 threads",
+            )
+        df.cute_block_shape = candidate_block_shape
     if mma_impl == "universal":
         prefix.extend(
             _make_tiled_mma_setup(
@@ -649,35 +951,172 @@ def _emit_mma_pipeline(
                 acc_dtype_str,
                 bm,
                 bn,
+                tcgen05_cluster_m=tcgen05_cluster_m,
             )
         )
     else:
-        mma_thread_linear = df.new_var("mma_tidx")
+        tcgen05_invariant_setup_start = len(prefix) if mma_impl == "tcgen05" else None
+        mma_participant_linear = df.new_var("mma_tidx")
+        mma_slice_linear = df.new_var("mma_slice_tidx")
+        mma_copy_linear = df.new_var("mma_copy_tidx")
         mma_active = df.new_var("mma_active")
+        tma_warp = df.new_var("tcgen05_tma_warp")
+        warp_idx = df.new_var("tcgen05_warp_idx")
+        lane_idx = df.new_var("tcgen05_lane_idx")
+        epi_active = df.new_var("tcgen05_epi_active")
+        epi_leader = df.new_var("tcgen05_epi_leader")
+        exec_leader = df.new_var("tcgen05_exec_leader")
+        tcgen05_ab_load_active = df.new_var("tcgen05_ab_load_active")
+        tcgen05_epi_load_warp = df.new_var("tcgen05_epi_load_warp")
+        tcgen05_scheduler_warp = df.new_var("tcgen05_scheduler_warp")
+        epi_tidx = df.new_var("tcgen05_epi_tidx")
         prefix.append(
             statement_from_string(
-                f"{mma_thread_linear} = {m_local} + ({n_local}) * cutlass.Int32({bm})"
+                f"{warp_idx} = cute.arch.make_warp_uniform(cute.arch.warp_idx())"
+            )
+        )
+        prefix.append(statement_from_string(f"{lane_idx} = cute.arch.lane_idx()"))
+        prefix.append(
+            statement_from_string(
+                f"{mma_participant_linear} = "
+                f"{_physical_mma_coord_expr(cg, m_block_id)} + "
+                f"({n_physical}) * cutlass.Int32({mma_physical_m_threads})"
             )
         )
         prefix.append(
             statement_from_string(
-                f"{mma_active} = ({n_local}) < cutlass.Int32({mma_phys_n})"
+                f"{mma_copy_linear} = "
+                + (
+                    mma_participant_linear
+                    if tcgen05_collective_handles_operand_loads
+                    else f"{m_local} + ({n_local}) * cutlass.Int32({bm})"
+                )
             )
         )
-        prefix.extend(
-            _make_tiled_mma_setup(
-                mma_impl,
-                tiled_mma,
-                thr_mma,
-                mma_thread_linear,
-                input_dtype_str,
-                acc_dtype_str,
-                bm,
-                bn,
+        prefix.append(
+            statement_from_string(
+                f"{mma_active} = ({n_physical}) < cutlass.Int32({mma_phys_n})"
             )
         )
+        if mma_impl == "tcgen05":
+            assert tcgen05_plan is not None
+            assert tcgen05_matmul_plan is not None
+            prefix.append(
+                statement_from_string(
+                    f"{tma_warp} = {warp_idx} == cutlass.Int32({tcgen05_matmul_plan.tma_warp_id})"
+                )
+            )
+            prefix.append(
+                statement_from_string(
+                    f"{tcgen05_ab_load_active} = "
+                    f"{warp_idx} >= cutlass.Int32({tcgen05_matmul_plan.ab_load_warp_begin}) "
+                    f"and {warp_idx} < cutlass.Int32({tcgen05_matmul_plan.ab_load_warp_end})"
+                )
+            )
+            epi_load_warp_id = tcgen05_matmul_plan.epi_load_warp_id
+            prefix.append(
+                statement_from_string(
+                    f"{tcgen05_epi_load_warp} = "
+                    + (
+                        f"{warp_idx} == cutlass.Int32({epi_load_warp_id})"
+                        if epi_load_warp_id is not None
+                        else "False"
+                    )
+                )
+            )
+            scheduler_warp_id = tcgen05_matmul_plan.scheduler_warp_id
+            prefix.append(
+                statement_from_string(
+                    f"{tcgen05_scheduler_warp} = "
+                    + (
+                        f"{warp_idx} == cutlass.Int32({scheduler_warp_id})"
+                        if scheduler_warp_id is not None
+                        else "False"
+                    )
+                )
+            )
+            prefix.append(
+                statement_from_string(
+                    f"{tcgen05_plan.exec_active} = "
+                    f"{warp_idx} == cutlass.Int32({tcgen05_matmul_plan.exec_warp_id})"
+                )
+            )
+            prefix.append(
+                statement_from_string(
+                    f"{exec_leader} = "
+                    f"{tcgen05_plan.exec_active} and {lane_idx} == cutlass.Int32(0)"
+                )
+            )
+            prefix.append(
+                statement_from_string(
+                    f"{epi_active} = "
+                    f"{warp_idx} < cutlass.Int32({tcgen05_matmul_plan.epi_warp_count})"
+                )
+            )
+            prefix.append(
+                statement_from_string(f"{epi_leader} = {warp_idx} == cutlass.Int32(0)")
+            )
+            prefix.append(
+                statement_from_string(
+                    f"{epi_tidx} = {lane_idx} + {warp_idx} * cutlass.Int32(32)"
+                    f" if {epi_active} else cutlass.Int32(0)"
+                )
+            )
+            prefix.append(
+                statement_from_string(
+                    # tcgen05 tiled_mma slicing is CTA-scoped, not per-thread.
+                    # Quack/CUTLASS use the CTA's MMA tile coordinate here.
+                    # On Helion's 1-CTA path that is always 0, but clustered
+                    # widened kernels need the cluster-local CTA rank so each
+                    # CTA takes the right MMA slice.
+                    f"{mma_slice_linear} = "
+                    + (
+                        "cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster()) "
+                        f"% cutlass.Int32({tcgen05_cluster_m})"
+                        if tcgen05_cluster_m > 1
+                        else "cutlass.Int32(0)"
+                    )
+                )
+            )
+            prefix.extend(
+                _make_tiled_mma_setup(
+                    mma_impl,
+                    tiled_mma,
+                    thr_mma,
+                    mma_slice_linear,
+                    input_dtype_str,
+                    acc_dtype_str,
+                    bm,
+                    bn,
+                    tcgen05_cluster_m=tcgen05_cluster_m,
+                )
+            )
+        else:
+            prefix.append(
+                statement_from_string(f"{tma_warp} = {warp_idx} == cutlass.Int32(0)")
+            )
+            prefix.extend(
+                _make_tiled_mma_setup(
+                    mma_impl,
+                    tiled_mma,
+                    thr_mma,
+                    mma_participant_linear,
+                    input_dtype_str,
+                    acc_dtype_str,
+                    bm,
+                    bn,
+                    tcgen05_cluster_m=tcgen05_cluster_m,
+                )
+            )
     if mma_impl == "tcgen05":
         assert tcgen05_plan is not None
+        prefix.append(
+            statement_from_string(
+                f"{tcgen05_cluster_layout_vmnk} = cute.tiled_divide("
+                f"cute.make_layout(({tcgen05_cluster_m}, 1, 1)), "
+                f"({tiled_mma}.thr_id.shape,))"
+            )
+        )
         prefix.extend(
             _make_tcgen05_layout_plan_setup(
                 tcgen05_plan,
@@ -685,6 +1124,15 @@ def _emit_mma_pipeline(
                 bm=bm,
                 bn=bn,
                 bk=bk,
+                ab_stage_count=tcgen05_ab_stage_count_value,
+                acc_stage_count=tcgen05_acc_stage_count_value,
+                c_stage_count=tcgen05_c_stage_count_value,
+                cta_thread_count=tcgen05_cta_thread_count,
+                epi_warp_count=tcgen05_epi_warp_count_value,
+                is_two_cta=tcgen05_is_two_cta,
+                active_physical_n_threads=min(
+                    _grid_thread_extent(cg, n_block_id), mma_phys_n
+                ),
                 input_dtype_str=input_dtype_str,
                 acc_dtype_str=acc_dtype_str,
             )
@@ -693,13 +1141,7 @@ def _emit_mma_pipeline(
             statement_from_string(
                 f"{acc_frag_base} = {tiled_mma}.make_fragment_C("
                 f"cute.append({tiled_mma}.partition_shape_C(({bm}, {bn})), "
-                "1))"
-            )
-        )
-        prefix.append(
-            statement_from_string(
-                f"{tcgen05_plan.exec_active} = "
-                f"{mma_thread_linear} < {tcgen05_plan.exec_thread_count}"
+                f"{tcgen05_acc_stage_count_value}))"
             )
         )
         prefix.append(
@@ -715,8 +1157,14 @@ def _emit_mma_pipeline(
         )
         prefix.append(
             statement_from_string(
+                f"{tcgen05_plan.tmem_dealloc_mbar_ptr} = cute.arch.alloc_smem(cutlass.Int64, 1)"
+            )
+        )
+        prefix.append(
+            statement_from_string(
                 f"{tcgen05_plan.tmem_alloc_barrier} = cutlass.pipeline.NamedBarrier("
-                f"barrier_id=1, num_threads={_tcgen05_tmem_barrier_thread_count(bm, bn)})"
+                f"barrier_id={_tcgen05_tmem_alloc_barrier_id()}, "
+                f"num_threads={tcgen05_tmem_barrier_thread_count_value})"
             )
         )
         prefix.append(
@@ -724,77 +1172,129 @@ def _emit_mma_pipeline(
                 f"{tcgen05_plan.tmem_allocator} = cutlass.utils.TmemAllocator("
                 f"{tcgen05_plan.tmem_holding_buf}, "
                 f"barrier_for_retrieve={tcgen05_plan.tmem_alloc_barrier}, "
-                "allocator_warp_id=0, is_two_cta=False)"
+                f"allocator_warp_id=0, is_two_cta={tcgen05_is_two_cta!s}, "
+                f"two_cta_tmem_dealloc_mbar_ptr={tcgen05_plan.tmem_dealloc_mbar_ptr})"
+            )
+        )
+        if tcgen05_cluster_m > 1:
+            prefix.append(
+                statement_from_string(
+                    "cutlass.pipeline.pipeline_init_arrive("
+                    f"cluster_shape_mn={tcgen05_cluster_layout_vmnk}, "
+                    "is_relaxed=True)"
+                )
+            )
+            prefix.append(
+                statement_from_string(
+                    "cutlass.pipeline.pipeline_init_wait("
+                    f"cluster_shape_mn={tcgen05_cluster_layout_vmnk})"
+                )
+            )
+        if tcgen05_invariant_setup_start is not None:
+            df.register_cute_tcgen05_invariant_setup(
+                prefix[tcgen05_invariant_setup_start:]
+            )
+        prefix.append(
+            statement_from_string(
+                f"if {epi_active}:\n"
+                f"    {tcgen05_plan.tmem_allocator}.allocate({tcgen05_plan.acc_tmem_cols})"
             )
         )
         prefix.append(
             statement_from_string(
-                f"{tcgen05_plan.tmem_allocator}.allocate({tcgen05_plan.acc_tmem_cols})"
+                f"{tcgen05_exec_acc_tmem_ptr} = cute.make_ptr("
+                f"{acc_dtype_str}, 0, cute.AddressSpace.tmem, assumed_align=16)"
             )
         )
         prefix.append(
-            statement_from_string(f"{tcgen05_plan.tmem_allocator}.wait_for_alloc()")
+            statement_from_string(
+                f"{tcgen05_epi_acc_tmem_ptr} = cute.make_ptr("
+                f"{acc_dtype_str}, 0, cute.AddressSpace.tmem, assumed_align=16)"
+            )
+        )
+        prefix.append(statement_from_string(f"{acc_frag} = {acc_frag_base}"))
+        prefix.append(
+            statement_from_string(f"{tcgen05_epi_acc_frag_base} = {acc_frag_base}")
         )
         prefix.append(
             statement_from_string(
-                f"{tcgen05_plan.acc_tmem_ptr} = "
+                f"if {tcgen05_plan.exec_active}:\n"
+                f"    {tcgen05_plan.tmem_allocator}.wait_for_alloc()\n"
+                f"    {tcgen05_exec_acc_tmem_ptr} = "
                 f"{tcgen05_plan.tmem_allocator}.retrieve_ptr({acc_dtype_str})"
             )
         )
         prefix.append(
             statement_from_string(
-                f"{tcgen05_plan.acc_pipeline_barriers} = cute.arch.alloc_smem(cutlass.Int64, 2)"
+                f"if {epi_active}:\n"
+                f"    {tcgen05_plan.tmem_allocator}.wait_for_alloc()\n"
+                f"    {tcgen05_epi_acc_tmem_ptr} = "
+                f"{tcgen05_plan.tmem_allocator}.retrieve_ptr({acc_dtype_str})"
+            )
+        )
+        prefix.append(
+            statement_from_string(
+                f"{tcgen05_plan.acc_pipeline_barriers} = cute.arch.alloc_smem("
+                f"cutlass.Int64, cutlass.Int32({tcgen05_acc_stage_count_value * 2}))"
             )
         )
         prefix.append(
             statement_from_string(
                 f"{tcgen05_plan.acc_pipeline_producer_group} = "
-                f"cutlass.pipeline.CooperativeGroup("
-                f"cutlass.pipeline.Agent.Thread, {tcgen05_plan.consumer_thread_count})"
+                "cutlass.pipeline.CooperativeGroup("
+                "cutlass.pipeline.Agent.Thread)"
             )
         )
         prefix.append(
             statement_from_string(
                 f"{tcgen05_plan.acc_pipeline_consumer_group} = "
                 f"cutlass.pipeline.CooperativeGroup("
-                f"cutlass.pipeline.Agent.Thread, {tcgen05_plan.consumer_thread_count})"
+                f"cutlass.pipeline.Agent.Thread, cutlass.Int32({tcgen05_acc_pipeline_arrive_count_value}))"
             )
         )
         prefix.append(
             statement_from_string(
                 f"{tcgen05_plan.acc_pipeline} = cutlass.pipeline.PipelineUmmaAsync.create("
-                "num_stages=1, "
+                f"num_stages={tcgen05_acc_stage_count_value}, "
                 f"producer_group={tcgen05_plan.acc_pipeline_producer_group}, "
                 f"consumer_group={tcgen05_plan.acc_pipeline_consumer_group}, "
-                f"barrier_storage={tcgen05_plan.acc_pipeline_barriers})"
+                f"barrier_storage={tcgen05_plan.acc_pipeline_barriers}, "
+                f"cta_layout_vmnk={tcgen05_cluster_layout_vmnk})"
             )
         )
         prefix.append(
             statement_from_string(
                 f"{tcgen05_plan.acc_producer_state} = cutlass.pipeline.make_pipeline_state("
-                "cutlass.pipeline.PipelineUserType.Producer, 1)"
+                f"cutlass.pipeline.PipelineUserType.Producer, {tcgen05_acc_stage_count_value})"
             )
         )
         prefix.append(
             statement_from_string(
                 f"{tcgen05_plan.acc_consumer_state} = cutlass.pipeline.make_pipeline_state("
-                "cutlass.pipeline.PipelineUserType.Consumer, 1)"
+                f"cutlass.pipeline.PipelineUserType.Consumer, {tcgen05_acc_stage_count_value})"
             )
         )
         prefix.append(
             statement_from_string(
-                f"{acc_frag_base} = cute.make_tensor("
-                f"{tcgen05_plan.acc_tmem_ptr}, {acc_frag_base}.layout)"
+                f"{tcgen05_exec_acc_frag_base} = cute.make_tensor("
+                f"{tcgen05_exec_acc_tmem_ptr}, {acc_frag_base}.layout)"
             )
         )
         prefix.append(
             statement_from_string(
-                f"{acc_frag} = {acc_frag_base}[(None, 0, 0, {tcgen05_plan.acc_producer_state}.index)]"
+                f"{acc_frag} = "
+                f"{tcgen05_exec_acc_frag_base}[None, None, None, {tcgen05_plan.acc_producer_state}.index]"
             )
         )
         prefix.append(
             statement_from_string(
-                f"if {mma_active}:\n"
+                f"{tcgen05_epi_acc_frag_base} = cute.make_tensor("
+                f"{tcgen05_epi_acc_tmem_ptr}, {acc_frag_base}.layout)"
+            )
+        )
+        prefix.append(
+            statement_from_string(
+                f"if {tcgen05_plan.exec_active}:\n"
                 f"    {tcgen05_plan.acc_pipeline}.producer_acquire({tcgen05_plan.acc_producer_state})"
             )
         )
@@ -817,12 +1317,67 @@ def _emit_mma_pipeline(
     smem_b_mma = df.new_var("sB_mma")
     smem_a_mma_next = df.new_var("sA_mma_next")
     smem_b_mma_next = df.new_var("sB_mma_next")
-    smem_a_desc = df.new_var("sA_desc")
-    smem_b_desc = df.new_var("sB_desc")
+    tma_smem_a_layout = df.new_var("sA_tma_layout")
+    tma_smem_b_layout = df.new_var("sB_tma_layout")
+    tma_thr_mma = df.new_var("tma_thr_mma")
+    rhs_tma = df.new_var("rhs_tma")
+    gmem_a_tma = df.new_var("gA_tma")
+    gmem_b_tma = df.new_var("gB_tma")
+    gmem_a_tma_part = df.new_var("gA_tma_part")
+    gmem_b_tma_part = df.new_var("gB_tma_part")
+    tma_atom_a = df.new_var("tma_atom_a")
+    tma_atom_b = df.new_var("tma_atom_b")
+    tma_tensor_a = df.new_var("tma_tensor_a")
+    tma_tensor_b = df.new_var("tma_tensor_b")
+    tma_cta_layout = df.new_var("tma_cta_layout")
+    tma_gA = df.new_var("tma_gA")
+    tma_sA = df.new_var("tma_sA")
+    tma_gB = df.new_var("tma_gB")
+    tma_sB = df.new_var("tma_sB")
+    tma_initial_full_tile = df.new_var("tcgen05_tma_initial_full_tile")
+    tma_initial_next_full_tile = df.new_var("tcgen05_tma_initial_next_full_tile")
+    tma_full_tile = df.new_var("tcgen05_tma_full_tile")
+    tma_next_full_tile = df.new_var("tcgen05_tma_next_full_tile")
+    tma_k_tile = df.new_var("tcgen05_tma_k_tile")
+    tma_barrier_ptr = df.new_var("tcgen05_tma_barrier")
+    tma_producer_try_token = df.new_var("tcgen05_ab_producer_try_token")
+    tma_consumer_try_token = df.new_var("tcgen05_ab_consumer_try_token")
+    tma_cta_rank_in_cluster = df.new_var("tcgen05_cta_rank_in_cluster")
+    tma_block_in_cluster_coord_vmnk = df.new_var("tcgen05_block_in_cluster_coord_vmnk")
+    tma_a_mcast_mask = df.new_var("tcgen05_a_mcast_mask")
+    tma_b_mcast_mask = df.new_var("tcgen05_b_mcast_mask")
+    tma_pipeline_mbars = df.new_var("tcgen05_ab_pipeline_mbars")
+    tma_pipeline_producer_group = df.new_var("tcgen05_ab_pipeline_producer_group")
+    tma_pipeline_consumer_group = df.new_var("tcgen05_ab_pipeline_consumer_group")
+    tma_pipeline = df.new_var("tcgen05_ab_pipeline")
+    tma_producer_state = df.new_var("tcgen05_ab_producer_state")
+    tma_consumer_state = df.new_var("tcgen05_ab_consumer_state")
+    tcgen05_frag_a = df.new_var("tcgen05_tCrA")
+    tcgen05_frag_b = df.new_var("tcgen05_tCrB")
     mma_stage = df.new_var("mma_stage")
     mma_next_stage = df.new_var("mma_next_stage")
     if mma_impl == "tcgen05":
         assert tcgen05_plan is not None
+        if tcgen05_use_tma:
+            df.wrapper_only_params.extend(
+                [tma_atom_a, tma_tensor_a, tma_atom_b, tma_tensor_b]
+            )
+            cg.cute_wrapper_plans.append(
+                {
+                    "kind": "tcgen05_ab_tma",
+                    "lhs_name": lhs_arg_name,
+                    "rhs_name": rhs_arg_name,
+                    "bm": bm,
+                    "bn": bn,
+                    "bk": bk,
+                    "cluster_m": tcgen05_cluster_m,
+                    "cluster_n": 1,
+                    "ab_stage_count": tcgen05_ab_stage_count_value,
+                    "input_dtype": input_dtype_str,
+                    "acc_dtype": acc_dtype_str,
+                    "kernel_args": [tma_atom_a, tma_tensor_a, tma_atom_b, tma_tensor_b],
+                }
+            )
         prefix.append(
             statement_from_string(
                 f"{smem_a_ptr} = cute.arch.alloc_smem("
@@ -849,6 +1404,226 @@ def _emit_mma_pipeline(
                 f"{tcgen05_plan.smem_b_layout}.outer)"
             )
         )
+        prefix.append(
+            statement_from_string(
+                f"{tcgen05_frag_a} = {tiled_mma}.make_fragment_A({smem_a})"
+            )
+        )
+        prefix.append(
+            statement_from_string(
+                f"{tcgen05_frag_b} = {tiled_mma}.make_fragment_B({smem_b})"
+            )
+        )
+        if tcgen05_use_tma:
+            prefix.append(
+                statement_from_string(
+                    f"{tma_smem_a_layout} = cute.slice_({tcgen05_plan.smem_a_layout}, (None, None, None, 0))"
+                )
+            )
+            prefix.append(
+                statement_from_string(
+                    f"{tma_smem_b_layout} = cute.slice_({tcgen05_plan.smem_b_layout}, (None, None, None, 0))"
+                )
+            )
+            prefix.append(statement_from_string(f"{rhs_tma} = {tma_tensor_b}"))
+            prefix.append(
+                statement_from_string(
+                    f"{tma_thr_mma} = {tiled_mma}.get_slice(cutlass.Int32(0))"
+                )
+            )
+            prefix.append(
+                statement_from_string(
+                    f"{gmem_a_tma} = cute.local_tile("
+                    f"{tma_tensor_a}, ({bm}, {bk}), "
+                    f"({m_offset_var} // cutlass.Int32({bm}), None))"
+                )
+            )
+            prefix.append(
+                statement_from_string(
+                    f"{gmem_b_tma} = cute.local_tile("
+                    f"{tma_tensor_b}, ({bn}, {bk}), "
+                    f"({n_offset_var} // cutlass.Int32({bn}), None))"
+                )
+            )
+            prefix.append(
+                statement_from_string(
+                    f"{gmem_a_tma_part} = {tma_thr_mma}.partition_A({gmem_a_tma})"
+                )
+            )
+            prefix.append(
+                statement_from_string(
+                    f"{gmem_b_tma_part} = {tma_thr_mma}.partition_B({gmem_b_tma})"
+                )
+            )
+            prefix.append(
+                statement_from_string(f"{tma_cta_layout} = cute.make_layout(1)")
+            )
+            if tcgen05_cluster_m > 1 or tcgen05_is_two_cta:
+                prefix.append(
+                    statement_from_string(
+                        f"{tma_cta_rank_in_cluster} = cute.arch.make_warp_uniform("
+                        "cute.arch.block_idx_in_cluster())"
+                    )
+                )
+                prefix.append(
+                    statement_from_string(
+                        f"{tma_block_in_cluster_coord_vmnk} = "
+                        f"{tcgen05_cluster_layout_vmnk}.get_flat_coord({tma_cta_rank_in_cluster})"
+                    )
+                )
+                if tcgen05_is_two_cta:
+                    prefix.append(
+                        statement_from_string(
+                            f"{tma_a_mcast_mask} = cute.nvgpu.cpasync.create_tma_multicast_mask("
+                            f"{tcgen05_cluster_layout_vmnk}, {tma_block_in_cluster_coord_vmnk}, "
+                            "mcast_mode=2)"
+                        )
+                    )
+                if tcgen05_cluster_m > 1 or tcgen05_is_two_cta:
+                    prefix.append(
+                        statement_from_string(
+                            f"{tma_b_mcast_mask} = cute.nvgpu.cpasync.create_tma_multicast_mask("
+                            f"{tcgen05_cluster_layout_vmnk}, {tma_block_in_cluster_coord_vmnk}, "
+                            "mcast_mode=1)"
+                        )
+                    )
+            prefix.append(
+                statement_from_string(
+                    f"{tma_sA}, {tma_gA} = cute.nvgpu.cpasync.tma_partition("
+                    f"{tma_atom_a}, 0, {tma_cta_layout}, "
+                    f"cute.group_modes({smem_a}, 0, cute.rank({smem_a}) - 1), "
+                    f"cute.group_modes({gmem_a_tma_part}, 0, "
+                    f"cute.rank({gmem_a_tma_part}) - 1))"
+                )
+            )
+            prefix.append(
+                statement_from_string(
+                    f"{tma_sB}, {tma_gB} = cute.nvgpu.cpasync.tma_partition("
+                    f"{tma_atom_b}, 0, {tma_cta_layout}, "
+                    f"cute.group_modes({smem_b}, 0, cute.rank({smem_b}) - 1), "
+                    f"cute.group_modes({gmem_b_tma_part}, 0, "
+                    f"cute.rank({gmem_b_tma_part}) - 1))"
+                )
+            )
+            prefix.append(
+                statement_from_string(
+                    f"{tma_pipeline_mbars} = cute.arch.alloc_smem("
+                    f"cutlass.Int64, cutlass.Int32({tcgen05_ab_stage_count_value}))"
+                )
+            )
+            prefix.append(
+                statement_from_string(
+                    f"{tma_pipeline_producer_group} = cutlass.pipeline.CooperativeGroup("
+                    "cutlass.pipeline.Agent.Thread, 1)"
+                )
+            )
+            prefix.append(
+                statement_from_string(
+                    f"{tma_pipeline_consumer_group} = cutlass.pipeline.CooperativeGroup("
+                    f"cutlass.pipeline.Agent.Thread, {tcgen05_plan.ab_pipeline_arrive_count})"
+                )
+            )
+            prefix.append(
+                statement_from_string(
+                    f"{tma_pipeline} = cutlass.pipeline.PipelineTmaUmma.create("
+                    f"num_stages={tcgen05_ab_stage_count_value}, "
+                    f"producer_group={tma_pipeline_producer_group}, "
+                    f"consumer_group={tma_pipeline_consumer_group}, "
+                    "tx_count="
+                    f"{'cute.size_in_bytes(' + input_dtype_str + ', ' + tma_smem_a_layout + ')' if tcgen05_use_tma_a else '0'} + "
+                    f"{'cute.size_in_bytes(' + input_dtype_str + ', ' + tma_smem_b_layout + ')' if tcgen05_use_tma_b else '0'}, "
+                    f"barrier_storage={tma_pipeline_mbars}, "
+                    f"cta_layout_vmnk={tcgen05_cluster_layout_vmnk})"
+                )
+            )
+            prefix.append(
+                statement_from_string(
+                    f"{tma_producer_state} = cutlass.pipeline.make_pipeline_state("
+                    f"cutlass.pipeline.PipelineUserType.Producer, {tcgen05_ab_stage_count_value})"
+                )
+            )
+            prefix.append(
+                statement_from_string(
+                    f"{tma_consumer_state} = cutlass.pipeline.make_pipeline_state("
+                    f"cutlass.pipeline.PipelineUserType.Consumer, {tcgen05_ab_stage_count_value})"
+                )
+            )
+            if tcgen05_use_tma_pipeline:
+                prefix.append(
+                    statement_from_string(
+                        f"{tma_initial_full_tile} = "
+                        f"{m_offset_var} + cutlass.Int32({bm}) <= cutlass.Int32({m_size}) "
+                        f"and {n_offset_var} + cutlass.Int32({bn}) <= cutlass.Int32({n_size}) "
+                        f"and cutlass.Int32({bk}) <= cutlass.Int32({k_total_size})"
+                    )
+                )
+                prefix.append(
+                    statement_from_string(
+                        f"if {tma_initial_full_tile} and {tma_warp}:\n"
+                        f"    {tma_pipeline}.producer_acquire({tma_producer_state})\n"
+                        f"    {tma_barrier_ptr} = {tma_pipeline}.producer_get_barrier({tma_producer_state})\n"
+                        + (
+                            f"    cute.copy({tma_atom_a}, {tma_gA}[None, cutlass.Int32(0)], "
+                            f"{tma_sA}[None, {tma_producer_state}.index], "
+                            f"tma_bar_ptr={tma_barrier_ptr}"
+                            + (
+                                f", mcast_mask={tma_a_mcast_mask}"
+                                if tcgen05_is_two_cta
+                                else ""
+                            )
+                            + ")\n"
+                            f"    cute.copy({tma_atom_b}, {tma_gB}[None, cutlass.Int32(0)], "
+                            f"{tma_sB}[None, {tma_producer_state}.index], "
+                            f"tma_bar_ptr={tma_barrier_ptr}"
+                            + (
+                                f", mcast_mask={tma_b_mcast_mask}"
+                                if tcgen05_cluster_m > 1 or tcgen05_is_two_cta
+                                else ""
+                            )
+                            + ")\n"
+                        )
+                        + f"    {tma_pipeline}.producer_commit({tma_producer_state})\n"
+                        f"    {tma_producer_state}.advance()"
+                    )
+                )
+                if tcgen05_ab_stage_count_value > 1:
+                    prefix.append(
+                        statement_from_string(
+                            f"{tma_initial_next_full_tile} = "
+                            f"{m_offset_var} + cutlass.Int32({bm}) <= cutlass.Int32({m_size}) "
+                            f"and {n_offset_var} + cutlass.Int32({bn}) <= cutlass.Int32({n_size}) "
+                            f"and cutlass.Int32({bk * tcgen05_ab_stage_count_value}) <= cutlass.Int32({k_total_size})"
+                        )
+                    )
+                    prefix.append(
+                        statement_from_string(
+                            f"if {tma_initial_full_tile} and {tma_initial_next_full_tile} and {tma_warp}:\n"
+                            f"    {tma_pipeline}.producer_acquire({tma_producer_state})\n"
+                            f"    {tma_barrier_ptr} = {tma_pipeline}.producer_get_barrier({tma_producer_state})\n"
+                            + (
+                                f"    cute.copy({tma_atom_a}, {tma_gA}[None, cutlass.Int32({tcgen05_ab_stage_count_value - 1})], "
+                                f"{tma_sA}[None, {tma_producer_state}.index], "
+                                f"tma_bar_ptr={tma_barrier_ptr}"
+                                + (
+                                    f", mcast_mask={tma_a_mcast_mask}"
+                                    if tcgen05_is_two_cta
+                                    else ""
+                                )
+                                + ")\n"
+                                f"    cute.copy({tma_atom_b}, {tma_gB}[None, cutlass.Int32({tcgen05_ab_stage_count_value - 1})], "
+                                f"{tma_sB}[None, {tma_producer_state}.index], "
+                                f"tma_bar_ptr={tma_barrier_ptr}"
+                                + (
+                                    f", mcast_mask={tma_b_mcast_mask}"
+                                    if tcgen05_cluster_m > 1 or tcgen05_is_two_cta
+                                    else ""
+                                )
+                                + ")\n"
+                            )
+                            + f"    {tma_pipeline}.producer_commit({tma_producer_state})\n"
+                            f"    {tma_producer_state}.advance()"
+                        )
+                    )
     else:
         prefix.append(
             statement_from_string(
@@ -881,9 +1656,6 @@ def _emit_mma_pipeline(
     # --- Global → Shared memory with masking ---
     # Each thread loads elements into shared memory using scalar indexing
     # with bounds checking for non-divisible tile boundaries.
-    m_size = int(lhs_fake.shape[0])
-    n_size = int(rhs_fake.shape[1])
-
     if acc_expr is None and mma_impl == "universal":
         cg.add_statement(
             statement_from_string(
@@ -938,9 +1710,16 @@ def _emit_mma_pipeline(
                 f"else {input_dtype_str}(0.0))"
             )
         )
+        cg.add_statement(statement_from_string("cute.arch.sync_threads()"))
     else:
         active_threads = bm * mma_phys_n
-        assert mma_active is not None and mma_thread_linear is not None
+        assert (
+            mma_active is not None
+            and mma_participant_linear is not None
+            and mma_copy_linear is not None
+        )
+        load_thread_count = active_threads
+        load_guard = mma_active
         if mma_impl == "tcgen05":
             assert tcgen05_plan is not None
             cg.add_statement(
@@ -975,47 +1754,186 @@ def _emit_mma_pipeline(
                     f"{smem_b_mma_next} = {smem_b}[(None, 0, 0, {mma_next_stage})]"
                 )
             )
+            if tcgen05_use_tma:
+                cg.add_statement(
+                    statement_from_string(
+                        f"{tma_k_tile} = {k_offset_var} // cutlass.Int32({bk})"
+                    )
+                )
+                cg.add_statement(
+                    statement_from_string(
+                        f"{tma_full_tile} = "
+                        f"{m_offset_var} + cutlass.Int32({bm}) <= cutlass.Int32({m_size}) "
+                        f"and {n_offset_var} + cutlass.Int32({bn}) <= cutlass.Int32({n_size}) "
+                        f"and {k_offset_var} + cutlass.Int32({bk}) <= cutlass.Int32({k_total_size})"
+                    )
+                )
         smem_a_store = f"{smem_a}[_row, _col]"
         smem_b_store = f"{smem_b}[_row, _col]"
         if mma_impl == "tcgen05":
             smem_a_store = f"{smem_a_mma}[((_row, _col),)]"
             smem_b_store = f"{smem_b_mma}[((_row, _col),)]"
-        cg.add_statement(
-            statement_from_string(
-                f"if {mma_active}:\n"
-                f"    for _load_i in range(({bm * bk} + {active_threads} - 1) // {active_threads}):\n"
-                f"        _flat = {mma_thread_linear} + cutlass.Int32(_load_i) * cutlass.Int32({active_threads})\n"
-                f"        if _flat < cutlass.Int32({bm * bk}):\n"
-                f"            _row = _flat // cutlass.Int32({bk})\n"
-                f"            _col = _flat % cutlass.Int32({bk})\n"
-                f"            _gm = {m_offset_var} + _row\n"
-                f"            _gk = {k_offset_var} + _col\n"
-                f"            {smem_a_store} = ("
-                f"{lhs_arg_name}[_gm, _gk] "
-                f"if _gm < cutlass.Int32({m_size}) "
-                f"and _gk < cutlass.Int32({k_total_size}) "
-                f"else {input_dtype_str}(0.0))"
-            )
+        scalar_load_a = statement_from_string(
+            f"if {load_guard}:\n"
+            f"    for _load_i in range(({bm * bk} + {load_thread_count} - 1) // {load_thread_count}):\n"
+            f"        _flat = {mma_copy_linear} + cutlass.Int32(_load_i) * cutlass.Int32({load_thread_count})\n"
+            f"        if _flat < cutlass.Int32({bm * bk}):\n"
+            f"            _row = _flat // cutlass.Int32({bk})\n"
+            f"            _col = _flat % cutlass.Int32({bk})\n"
+            f"            _gm = {m_offset_var} + _row\n"
+            f"            _gk = {k_offset_var} + _col\n"
+            f"            {smem_a_store} = ("
+            f"{lhs_arg_name}[_gm, _gk] "
+            f"if _gm < cutlass.Int32({m_size}) "
+            f"and _gk < cutlass.Int32({k_total_size}) "
+            f"else {input_dtype_str}(0.0))"
         )
-        cg.add_statement(
-            statement_from_string(
-                f"if {mma_active}:\n"
-                f"    for _load_i in range(({bn * bk} + {active_threads} - 1) // {active_threads}):\n"
-                f"        _flat = {mma_thread_linear} + cutlass.Int32(_load_i) * cutlass.Int32({active_threads})\n"
-                f"        if _flat < cutlass.Int32({bn * bk}):\n"
-                f"            _row = _flat // cutlass.Int32({bk})\n"
-                f"            _col = _flat % cutlass.Int32({bk})\n"
-                f"            _gn = {n_offset_var} + _row\n"
-                f"            _gk = {k_offset_var} + _col\n"
-                f"            {smem_b_store} = ("
-                f"{rhs_arg_name}[_gk, _gn] "
-                f"if _gn < cutlass.Int32({n_size}) "
-                f"and _gk < cutlass.Int32({k_total_size}) "
-                f"else {input_dtype_str}(0.0))"
-            )
+        scalar_load_b = statement_from_string(
+            f"if {load_guard}:\n"
+            f"    for _load_i in range(({bn * bk} + {load_thread_count} - 1) // {load_thread_count}):\n"
+            f"        _flat = {mma_copy_linear} + cutlass.Int32(_load_i) * cutlass.Int32({load_thread_count})\n"
+            f"        if _flat < cutlass.Int32({bn * bk}):\n"
+            f"            _row = _flat // cutlass.Int32({bk})\n"
+            f"            _col = _flat % cutlass.Int32({bk})\n"
+            f"            _gn = {n_offset_var} + _row\n"
+            f"            _gk = {k_offset_var} + _col\n"
+            f"            {smem_b_store} = ("
+            f"{rhs_arg_name}[_gk, _gn] "
+            f"if _gn < cutlass.Int32({n_size}) "
+            f"and _gk < cutlass.Int32({k_total_size}) "
+            f"else {input_dtype_str}(0.0))"
         )
-
-    cg.add_statement(statement_from_string("cute.arch.sync_threads()"))
+        if mma_impl == "tcgen05" and tcgen05_use_tma:
+            scalar_load_a_src = textwrap.indent(ast.unparse(scalar_load_a), "    ")
+            scalar_load_b_src = textwrap.indent(ast.unparse(scalar_load_b), "    ")
+            scalar_load_a_tma_src = (
+                textwrap.indent(ast.unparse(scalar_load_a), "    ") + "\n"
+                if not tcgen05_use_tma_a
+                else ""
+            )
+            scalar_load_b_tma_src = (
+                textwrap.indent(ast.unparse(scalar_load_b), "    ") + "\n"
+                if not tcgen05_use_tma_b
+                else ""
+            )
+            tma_wait_src = f"        {tma_pipeline}.consumer_wait({tma_consumer_state}, {tma_consumer_try_token})\n"
+            if tcgen05_use_tma_pipeline:
+                assert tcgen05_plan is not None
+                cg.add_statement(
+                    statement_from_string(
+                        f"{tma_next_full_tile} = "
+                        f"{m_offset_var} + cutlass.Int32({bm}) <= cutlass.Int32({m_size}) "
+                        f"and {n_offset_var} + cutlass.Int32({bn}) <= cutlass.Int32({n_size}) "
+                        f"and {k_offset_var} + cutlass.Int32({bk * (tcgen05_ab_stage_count_value + 1)}) <= cutlass.Int32({k_total_size})"
+                    )
+                )
+                cg.add_statement(
+                    statement_from_string(
+                        f"{tma_producer_try_token} = cutlass.Boolean(0)"
+                    )
+                )
+                cg.add_statement(
+                    statement_from_string(
+                        f"{tma_consumer_try_token} = cutlass.Boolean(0)"
+                    )
+                )
+                cg.add_statement(
+                    statement_from_string(
+                        f"if {tma_full_tile}:\n"
+                        f"    if {tma_warp} and {tma_next_full_tile}:\n"
+                        f"        {tma_producer_try_token} = {tma_pipeline}.producer_try_acquire({tma_producer_state})\n"
+                        f"    if {tcgen05_plan.exec_active}:\n"
+                        f"        {tma_consumer_try_token} = {tma_pipeline}.consumer_try_wait({tma_consumer_state})\n"
+                        f"    if {tma_warp} and {tma_next_full_tile}:\n"
+                        f"        {tma_pipeline}.producer_acquire({tma_producer_state}, {tma_producer_try_token})\n"
+                        f"        {tma_barrier_ptr} = {tma_pipeline}.producer_get_barrier({tma_producer_state})\n"
+                        + (
+                            f"        cute.copy({tma_atom_a}, "
+                            f"{tma_gA}[None, {tma_k_tile} + cutlass.Int32({tcgen05_ab_stage_count_value})], "
+                            f"{tma_sA}[None, {tma_producer_state}.index], "
+                            f"tma_bar_ptr={tma_barrier_ptr}"
+                            + (
+                                f", mcast_mask={tma_a_mcast_mask}"
+                                if tcgen05_is_two_cta
+                                else ""
+                            )
+                            + ")\n"
+                            f"        cute.copy({tma_atom_b}, "
+                            f"{tma_gB}[None, {tma_k_tile} + cutlass.Int32({tcgen05_ab_stage_count_value})], "
+                            f"{tma_sB}[None, {tma_producer_state}.index], "
+                            f"tma_bar_ptr={tma_barrier_ptr}"
+                            + (
+                                f", mcast_mask={tma_b_mcast_mask}"
+                                if tcgen05_cluster_m > 1 or tcgen05_is_two_cta
+                                else ""
+                            )
+                            + ")\n"
+                        )
+                        + f"        {tma_pipeline}.producer_commit({tma_producer_state})\n"
+                        f"        {tma_producer_state}.advance()\n"
+                        f"    if {tcgen05_plan.exec_active}:\n"
+                        f"{tma_wait_src}"
+                        "else:\n"
+                        f"{scalar_load_a_src}\n"
+                        f"{scalar_load_b_src}\n"
+                        "    cute.arch.sync_threads()"
+                    )
+                )
+            else:
+                assert tcgen05_plan is not None
+                tma_copy_a_src = (
+                    (
+                        f"        cute.copy({tma_atom_a}, {tma_gA}[None, {tma_k_tile}], "
+                        f"{tma_sA}[None, {tma_producer_state}.index], tma_bar_ptr={tma_barrier_ptr}"
+                        + (
+                            f", mcast_mask={tma_a_mcast_mask}"
+                            if tcgen05_is_two_cta
+                            else ""
+                        )
+                        + ")\n"
+                    )
+                    if tcgen05_use_tma_a
+                    else ""
+                )
+                tma_copy_b_src = (
+                    (
+                        f"        cute.copy({tma_atom_b}, {tma_gB}[None, {tma_k_tile}], "
+                        f"{tma_sB}[None, {tma_producer_state}.index], tma_bar_ptr={tma_barrier_ptr}"
+                        + (
+                            f", mcast_mask={tma_b_mcast_mask}"
+                            if tcgen05_cluster_m > 1 or tcgen05_is_two_cta
+                            else ""
+                        )
+                        + ")\n"
+                    )
+                    if tcgen05_use_tma_b
+                    else ""
+                )
+                cg.add_statement(
+                    statement_from_string(
+                        f"if {tma_full_tile}:\n"
+                        f"    if {tma_warp}:\n"
+                        f"        {tma_pipeline}.producer_acquire({tma_producer_state})\n"
+                        f"        {tma_barrier_ptr} = {tma_pipeline}.producer_get_barrier({tma_producer_state})\n"
+                        f"{tma_copy_a_src}"
+                        f"{tma_copy_b_src}"
+                        f"        {tma_pipeline}.producer_commit({tma_producer_state})\n"
+                        f"{scalar_load_a_tma_src}"
+                        f"{scalar_load_b_tma_src}"
+                        f"    if {tcgen05_plan.exec_active}:\n"
+                        "        cute.arch.sync_warp()\n"
+                        f"{tma_wait_src}"
+                        "    cute.arch.sync_threads()\n"
+                        "else:\n"
+                        f"{scalar_load_a_src}\n"
+                        f"{scalar_load_b_src}\n"
+                        "    cute.arch.sync_threads()"
+                    )
+                )
+        else:
+            cg.add_statement(scalar_load_a)
+            cg.add_statement(scalar_load_b)
+            cg.add_statement(statement_from_string("cute.arch.sync_threads()"))
 
     # --- Shared → Register with f16→f32 cast ---
     if mma_impl == "universal":
@@ -1072,43 +1990,58 @@ def _emit_mma_pipeline(
         else:
             assert tcgen05_plan is not None
             cg.add_statement(
-                statement_from_string("cute.arch.fence_view_async_shared()")
-            )
-            cg.add_statement(
                 statement_from_string(
-                    f"{smem_a_desc} = cute.make_tensor("
-                    f"cute.nvgpu.tcgen05.make_umma_smem_desc("
-                    f"{smem_a_mma}.iterator, {smem_a_mma}.layout, 'k', "
-                    f"next_src={smem_a_mma_next}.iterator"
-                    "), "
-                    f"{tcgen05_plan.smem_desc_view_layout})"
-                )
-            )
-            cg.add_statement(
-                statement_from_string(
-                    f"{smem_b_desc} = cute.make_tensor("
-                    f"cute.nvgpu.tcgen05.make_umma_smem_desc("
-                    f"{smem_b_mma}.iterator, {smem_b_mma}.layout, 'k', "
-                    f"next_src={smem_b_mma_next}.iterator"
-                    "), "
-                    f"{tcgen05_plan.smem_desc_view_layout})"
-                )
-            )
-            cg.add_statement(
-                statement_from_string(
-                    f"{tiled_mma}.set("
-                    f"cute.nvgpu.tcgen05.Field.ACCUMULATE, "
-                    f"{k_offset_var} != {k_loop_begin_expr})"
+                    f"if {tcgen05_plan.exec_active}:\n    cute.arch.fence_view_async_shared()"
                 )
             )
             cg.add_statement(
                 statement_from_string(
                     f"if {tcgen05_plan.exec_active}:\n"
-                    f"    cute.mma_atom_call("
-                    f"{tiled_mma}, {acc_frag}, {smem_a_desc}, {smem_b_desc}, {acc_frag})"
+                    f"    for _tcgen05_kblk_idx in range(cute.size({tcgen05_frag_a}, mode=[2])):\n"
+                    f"        {tiled_mma}.set(\n"
+                    f"            cute.nvgpu.tcgen05.Field.ACCUMULATE,\n"
+                    f"            {k_offset_var} != {k_loop_begin_expr} or cutlass.Int32(_tcgen05_kblk_idx) != cutlass.Int32(0),\n"
+                    "        )\n"
+                    f"        cute.gemm(\n"
+                    f"            {tiled_mma},\n"
+                    f"            {acc_frag},\n"
+                    f"            {tcgen05_frag_a}[None, None, cutlass.Int32(_tcgen05_kblk_idx), {mma_stage}],\n"
+                    f"            {tcgen05_frag_b}[None, None, cutlass.Int32(_tcgen05_kblk_idx), {mma_stage}],\n"
+                    f"            {acc_frag},\n"
+                    "        )"
                 )
             )
-            cg.add_statement(statement_from_string("cute.arch.sync_threads()"))
+            if tcgen05_use_tma:
+                tma_release_src = (
+                    f"        {tma_pipeline}.consumer_release({tma_consumer_state})\n"
+                )
+                if tcgen05_use_tma_pipeline:
+                    cg.add_statement(
+                        statement_from_string(
+                            f"if {tma_full_tile}:\n"
+                            f"    if {tcgen05_plan.exec_active}:\n"
+                            f"{tma_release_src}"
+                            f"        {tma_consumer_state}.advance()\n"
+                            "else:\n"
+                            "    cute.arch.sync_threads()"
+                        )
+                    )
+                else:
+                    cg.add_statement(
+                        statement_from_string(
+                            f"if {tma_full_tile}:\n"
+                            "    cute.arch.sync_threads()\n"
+                            f"    if {tcgen05_plan.exec_active}:\n"
+                            "        cute.arch.sync_warp()\n"
+                            f"{tma_release_src}"
+                            f"    {tma_producer_state}.advance()\n"
+                            f"    {tma_consumer_state}.advance()\n"
+                            "else:\n"
+                            "    cute.arch.sync_threads()"
+                        )
+                    )
+            else:
+                cg.add_statement(statement_from_string("cute.arch.sync_threads()"))
 
     # === outer_suffix: convert fragment → per-thread scalar ===
     # Allocate smem_c in outer_prefix so all smem is allocated at the same
@@ -1116,9 +2049,9 @@ def _emit_mma_pipeline(
     smem_c_ptr = df.new_var("smem_c")
     smem_c = df.new_var("smem_c_t")
     tCsC = df.new_var("tCsC")
+    tcgen05_kernel_desc = df.new_var("tcgen05_kernel_desc")
     tcgen05_tacc = df.new_var("tcgen05_tacc")
     tcgen05_tacc_epi = df.new_var("tcgen05_tacc_epi")
-    tcgen05_tmem_ref = df.new_var("tcgen05_tmem_ref")
     tcgen05_tiled_copy_t2r = df.new_var("tcgen05_tiled_copy_t2r")
     tcgen05_thr_copy_t2r = df.new_var("tcgen05_thr_copy_t2r")
     tcgen05_ttr_tacc_base = df.new_var("tcgen05_ttr_tacc_base")
@@ -1138,19 +2071,25 @@ def _emit_mma_pipeline(
     tcgen05_acc_vec = df.new_var("tcgen05_acc_vec")
     tcgen05_subtile_count = df.new_var("tcgen05_subtile_count")
     result_var = df.new_var("mma_result")
+    tcgen05_root_output_tma = False
 
     tile_numel = bm * bn
-    prefix.append(
-        statement_from_string(
-            f"{smem_c_ptr} = cute.arch.alloc_smem({acc_dtype_str}, {tile_numel}, alignment=128)"
+    if mma_impl == "tcgen05":
+        tcgen05_root_output_tma = False
+    if mma_impl != "tcgen05" or (
+        not tcgen05_direct_store and not tcgen05_root_output_tma
+    ):
+        prefix.append(
+            statement_from_string(
+                f"{smem_c_ptr} = cute.arch.alloc_smem({acc_dtype_str}, {tile_numel}, alignment=128)"
+            )
         )
-    )
-    prefix.append(
-        statement_from_string(
-            f"{smem_c} = cute.make_tensor("
-            f"{smem_c_ptr}, cute.make_layout(({bm}, {bn}), stride=({bn}, 1)))"
+        prefix.append(
+            statement_from_string(
+                f"{smem_c} = cute.make_tensor("
+                f"{smem_c_ptr}, cute.make_layout(({bm}, {bn}), stride=({bn}, 1)))"
+            )
         )
-    )
     if mma_impl == "universal":
         suffix.append(
             statement_from_string(f"{tCsC} = {thr_mma}.partition_C({smem_c})")
@@ -1172,184 +2111,260 @@ def _emit_mma_pipeline(
                     f"        {tCsC}[_mma_i] = {acc_frag}[_mma_i]"
                 )
             )
+            suffix.append(statement_from_string("cute.arch.sync_threads()"))
         else:
             assert tcgen05_plan is not None
+            assert epi_active is not None
+            assert epi_tidx is not None
             suffix.append(
                 statement_from_string(
-                    f"if {mma_active}:\n"
+                    f"if {tcgen05_plan.exec_active}:\n"
                     f"    {tcgen05_plan.acc_pipeline}.producer_commit({tcgen05_plan.acc_producer_state})"
                 )
             )
             suffix.append(
                 statement_from_string(f"{tcgen05_plan.acc_producer_state}.advance()")
             )
+            if not tcgen05_direct_store:
+                epi_warp_ids = ", ".join(
+                    f"cutlass.Int32({i})" for i in range(tcgen05_epi_warp_count_value)
+                )
+                if tcgen05_epi_warp_count_value == 1:
+                    epi_warp_ids += ","
+                suffix.append(statement_from_string("cute.arch.sync_threads()"))
+                suffix.append(
+                    statement_from_string(
+                        f"{tcgen05_kernel_desc} = type('Tcgen05KernelDesc', (), {{"
+                        f"'cta_tile_shape_mnk': ({bm}, {bn}, {bk}), "
+                        f"'c_layout': {tcgen05_plan.c_layout}, "
+                        f"'c_dtype': {acc_dtype_str}, "
+                        f"'acc_dtype': {acc_dtype_str}, "
+                        f"'epilog_sync_bar_id': cutlass.Int32({_tcgen05_epilog_sync_barrier_id()}), "
+                        f"'epilogue_warp_id': ({epi_warp_ids}), "
+                        f"'num_c_stage': cutlass.Int32({tcgen05_c_stage_count_value}), "
+                        f"'use_2cta_instrs': {tcgen05_is_two_cta!s}"
+                        "})()"
+                    )
+                )
+                suffix.append(
+                    statement_from_string(
+                        f"{tcgen05_tcgc} = "
+                        "cutlass.utils.gemm.sm100.transform_partitioned_tensor_layout("
+                        f"{thr_mma}.partition_C({smem_c}))"
+                    )
+                )
+                suffix.append(
+                    statement_from_string(
+                        f"{tcgen05_tcgc_planned} = {_tcgen05_epilogue_dest_expr(tcgen05_plan, tcgen05_tcgc)}"
+                    )
+                )
+                suffix.append(
+                    statement_from_string(
+                        f"{tcgen05_tacc} = "
+                        "cutlass.utils.gemm.sm100.transform_partitioned_tensor_layout("
+                        f"{tcgen05_epi_acc_frag_base})"
+                    )
+                )
+                suffix.append(
+                    statement_from_string(
+                        f"{tcgen05_tiled_copy_t2r}, {tcgen05_ttr_tacc_base}, {tcgen05_ttr_racc} = "
+                        "cutlass.utils.gemm.sm100.epilogue_tmem_copy_and_partition("
+                        f"{tcgen05_kernel_desc}, {epi_tidx}, {tcgen05_tacc}, "
+                        f"{tcgen05_tcgc_planned}, {tcgen05_plan.epi_tile}, {tcgen05_is_two_cta!s})"
+                    )
+                )
+                suffix.append(
+                    statement_from_string(
+                        f"{tcgen05_thr_copy_t2r} = "
+                        f"{tcgen05_tiled_copy_t2r}.get_slice({epi_tidx})"
+                    )
+                )
+                suffix.append(
+                    statement_from_string(
+                        f"{tcgen05_tacc_epi} = cute.flat_divide({tcgen05_tacc}, {tcgen05_plan.epi_tile})"
+                    )
+                )
+                suffix.append(
+                    statement_from_string(
+                        f"{tcgen05_tcgc_epi} = cute.flat_divide({tcgen05_tcgc_planned}, {tcgen05_plan.epi_tile})"
+                    )
+                )
+                suffix.append(
+                    statement_from_string(
+                        f"{tcgen05_ttr_gc} = {tcgen05_thr_copy_t2r}.partition_D({tcgen05_tcgc_epi})"
+                    )
+                )
+                suffix.append(
+                    statement_from_string(
+                        f"{tcgen05_ttr_rc} = "
+                        f"cute.make_rmem_tensor({tcgen05_ttr_racc}.shape, {acc_dtype_str})"
+                    )
+                )
+                suffix.append(
+                    statement_from_string(
+                        f"{tcgen05_ttr_tacc_stage} = "
+                        f"{tcgen05_ttr_tacc_base}[(None, None, None, None, None, {tcgen05_plan.acc_consumer_state}.index)]"
+                    )
+                )
+                suffix.append(
+                    statement_from_string(
+                        f"if {epi_active}:\n"
+                        f"    {tcgen05_plan.acc_pipeline}.consumer_wait({tcgen05_plan.acc_consumer_state})"
+                    )
+                )
+                suffix.append(
+                    statement_from_string(
+                        f"{tcgen05_ttr_tacc} = cute.group_modes("
+                        f"{tcgen05_ttr_tacc_stage}, 3, cute.rank({tcgen05_ttr_tacc_stage}))"
+                    )
+                )
+                suffix.append(
+                    statement_from_string(
+                        f"{tcgen05_ttr_gc_grouped} = cute.group_modes("
+                        f"{tcgen05_ttr_gc}, 3, cute.rank({tcgen05_ttr_gc}))"
+                    )
+                )
+                suffix.append(
+                    statement_from_string(
+                        f"{tcgen05_mcld} = cute.max_common_layout("
+                        f"{tcgen05_ttr_rc}.layout, "
+                        f"{tcgen05_ttr_gc_grouped}[(None, None, None, 0)].layout)"
+                    )
+                )
+                suffix.append(
+                    statement_from_string(
+                        f"{tcgen05_num_bits} = min("
+                        f"{tcgen05_ttr_gc_grouped}.iterator.alignment * 8, "
+                        f"cute.size({tcgen05_mcld}) * {acc_dtype_str}.width, 256)"
+                    )
+                )
+                suffix.append(
+                    statement_from_string(
+                        f"{tcgen05_simt_atom} = cute.make_copy_atom("
+                        f"cute.nvgpu.CopyUniversalOp(), {acc_dtype_str}, "
+                        f"num_bits_per_copy={tcgen05_num_bits}, "
+                        f"l1c_evict_priority=cute.nvgpu.CacheEvictionPriority.NO_ALLOCATE)"
+                    )
+                )
+                suffix.append(
+                    statement_from_string(
+                        f"{tcgen05_subtile_count} = cute.size({tcgen05_ttr_tacc}.shape, mode=[3])"
+                    )
+                )
+                suffix.append(
+                    statement_from_string(
+                        f"for _tcgen05_subtile in range({tcgen05_subtile_count}):\n"
+                        f"    if {epi_active}:\n"
+                        f"        {tcgen05_ttr_tacc_mn} = {tcgen05_ttr_tacc}[(None, None, None, cutlass.Int32(_tcgen05_subtile))]\n"
+                        f"        cute.copy({tcgen05_tiled_copy_t2r}, {tcgen05_ttr_tacc_mn}, {tcgen05_ttr_racc})\n"
+                        f"        {tcgen05_acc_vec} = {tcgen05_ttr_racc}.load()\n"
+                        f"        {tcgen05_ttr_rc}.store({tcgen05_acc_vec})\n"
+                        f"        cute.copy({tcgen05_simt_atom}, {tcgen05_ttr_rc}, {tcgen05_ttr_gc_grouped}[(None, None, None, cutlass.Int32(_tcgen05_subtile))])\n"
+                        f"    cute.arch.sync_threads()"
+                    )
+                )
+                suffix.append(
+                    statement_from_string(
+                        f"if {epi_active}:\n"
+                        "    with cute.arch.elect_one():\n"
+                        f"        {tcgen05_plan.acc_pipeline}.consumer_release({tcgen05_plan.acc_consumer_state})"
+                    )
+                )
+                suffix.append(
+                    statement_from_string(
+                        f"{tcgen05_plan.acc_consumer_state}.advance()"
+                    )
+                )
+                suffix.append(statement_from_string("cute.arch.sync_threads()"))
+                if tcgen05_use_tma:
+                    suffix.append(
+                        statement_from_string(
+                            f"if {tma_warp}:\n"
+                            f"    {tma_pipeline}.producer_tail({tma_producer_state})"
+                        )
+                    )
+                suffix.append(
+                    statement_from_string(
+                        f"if {tcgen05_plan.exec_active}:\n"
+                        f"    {tcgen05_plan.acc_pipeline}.producer_tail({tcgen05_plan.acc_producer_state})"
+                    )
+                )
+                suffix.append(
+                    statement_from_string(
+                        f"{tcgen05_plan.tmem_allocator} = cutlass.utils.TmemAllocator("
+                        f"{tcgen05_plan.tmem_holding_buf}, "
+                        f"barrier_for_retrieve={tcgen05_plan.tmem_alloc_barrier}, "
+                        f"allocator_warp_id=0, is_two_cta={tcgen05_is_two_cta!s}, "
+                        f"two_cta_tmem_dealloc_mbar_ptr={tcgen05_plan.tmem_dealloc_mbar_ptr}, "
+                        f"num_allocated_columns={tcgen05_plan.acc_tmem_cols}, "
+                        "dealloc_mbarrier_initialized=True)"
+                    )
+                )
+                suffix.append(
+                    statement_from_string(
+                        f"if {epi_active}:\n"
+                        f"    {tcgen05_plan.tmem_allocator}.relinquish_alloc_permit()"
+                    )
+                )
+                suffix.append(
+                    statement_from_string(
+                        f"if {epi_active}:\n"
+                        f"    {tcgen05_plan.tmem_allocator}.free({tcgen05_epi_acc_tmem_ptr})"
+                    )
+                )
             suffix.append(statement_from_string("cute.arch.sync_threads()"))
-            suffix.append(
-                statement_from_string(
-                    f"{tcgen05_tcgc} = "
-                    "cutlass.utils.gemm.sm100.transform_partitioned_tensor_layout("
-                    f"{thr_mma}.partition_C({smem_c}))"
-                )
-            )
-            suffix.append(
-                statement_from_string(
-                    f"{tcgen05_tcgc_planned} = {_tcgen05_epilogue_dest_expr(tcgen05_plan, tcgen05_tcgc)}"
-                )
-            )
-            suffix.append(
-                statement_from_string(
-                    f"{tcgen05_tacc} = "
-                    "cutlass.utils.gemm.sm100.transform_partitioned_tensor_layout("
-                    f"{acc_frag_base})"
-                )
-            )
-            suffix.append(
-                statement_from_string(
-                    f"{tcgen05_tacc_epi} = cute.flat_divide({tcgen05_tacc}, {tcgen05_plan.epi_tile})"
-                )
-            )
-            suffix.append(
-                statement_from_string(
-                    f"{tcgen05_tmem_ref} = {tcgen05_tacc_epi}[(None, None, 0, 0, 0)]"
-                )
-            )
-            suffix.append(
-                statement_from_string(
-                    f"{tcgen05_tiled_copy_t2r} = "
-                    f"cute.nvgpu.tcgen05.make_tmem_copy({tcgen05_plan.tmem_load_atom}, {tcgen05_tmem_ref})"
-                )
-            )
-            suffix.append(
-                statement_from_string(
-                    f"{tcgen05_thr_copy_t2r} = {tcgen05_tiled_copy_t2r}.get_slice({mma_thread_linear})"
-                )
-            )
-            suffix.append(
-                statement_from_string(
-                    f"{tcgen05_ttr_tacc_base} = {tcgen05_thr_copy_t2r}.partition_S({tcgen05_tacc_epi})"
-                )
-            )
-            suffix.append(
-                statement_from_string(
-                    f"{tcgen05_tcgc_epi} = cute.flat_divide({tcgen05_tcgc_planned}, {tcgen05_plan.epi_tile})"
-                )
-            )
-            suffix.append(
-                statement_from_string(
-                    f"{tcgen05_ttr_gc} = {tcgen05_thr_copy_t2r}.partition_D({tcgen05_tcgc_epi})"
-                )
-            )
-            suffix.append(
-                statement_from_string(
-                    f"{tcgen05_ttr_racc} = cute.make_rmem_tensor("
-                    f"{tcgen05_ttr_gc}[(None, None, None, 0, 0, 0, 0, 0)].shape, {acc_dtype_str})"
-                )
-            )
-            suffix.append(
-                statement_from_string(
-                    f"{tcgen05_ttr_rc} = "
-                    f"cute.make_rmem_tensor({tcgen05_ttr_racc}.shape, {acc_dtype_str})"
-                )
-            )
-            suffix.append(
-                statement_from_string(
-                    f"{tcgen05_ttr_tacc_stage} = "
-                    f"{tcgen05_ttr_tacc_base}[(None, None, None, None, None, {tcgen05_plan.acc_consumer_state}.index)]"
-                )
-            )
-            suffix.append(
-                statement_from_string(
-                    f"if {mma_active}:\n"
-                    f"    {tcgen05_plan.acc_pipeline}.consumer_wait({tcgen05_plan.acc_consumer_state})"
-                )
-            )
-            suffix.append(
-                statement_from_string(
-                    f"{tcgen05_ttr_tacc} = cute.group_modes("
-                    f"{tcgen05_ttr_tacc_stage}, 3, cute.rank({tcgen05_ttr_tacc_stage}))"
-                )
-            )
-            suffix.append(
-                statement_from_string(
-                    f"{tcgen05_ttr_gc_grouped} = cute.group_modes("
-                    f"{tcgen05_ttr_gc}, 3, cute.rank({tcgen05_ttr_gc}))"
-                )
-            )
-            suffix.append(
-                statement_from_string(
-                    f"{tcgen05_mcld} = cute.max_common_layout("
-                    f"{tcgen05_ttr_rc}.layout, "
-                    f"{tcgen05_ttr_gc_grouped}[(None, None, None, 0)].layout)"
-                )
-            )
-            suffix.append(
-                statement_from_string(
-                    f"{tcgen05_num_bits} = min("
-                    f"{tcgen05_ttr_gc_grouped}.iterator.alignment * 8, "
-                    f"cute.size({tcgen05_mcld}) * {acc_dtype_str}.width, 256)"
-                )
-            )
-            suffix.append(
-                statement_from_string(
-                    f"{tcgen05_simt_atom} = cute.make_copy_atom("
-                    f"cute.nvgpu.CopyUniversalOp(), {acc_dtype_str}, "
-                    f"num_bits_per_copy={tcgen05_num_bits}, "
-                    f"l1c_evict_priority=cute.nvgpu.CacheEvictionPriority.NO_ALLOCATE)"
-                )
-            )
-            suffix.append(
-                statement_from_string(
-                    f"{tcgen05_subtile_count} = cute.size({tcgen05_ttr_tacc}.shape, mode=[3])"
-                )
-            )
-            suffix.append(
-                statement_from_string(
-                    f"for _tcgen05_subtile in range({tcgen05_subtile_count}):\n"
-                    f"    if {mma_active}:\n"
-                    f"        {tcgen05_ttr_tacc_mn} = {tcgen05_ttr_tacc}[(None, None, None, cutlass.Int32(_tcgen05_subtile))]\n"
-                    f"        cute.copy({tcgen05_tiled_copy_t2r}, {tcgen05_ttr_tacc_mn}, {tcgen05_ttr_racc})\n"
-                    f"        {tcgen05_acc_vec} = {tcgen05_ttr_racc}.load()\n"
-                    f"        {tcgen05_ttr_rc}.store({tcgen05_acc_vec})\n"
-                    f"        cute.copy({tcgen05_simt_atom}, {tcgen05_ttr_rc}, {tcgen05_ttr_gc_grouped}[(None, None, None, cutlass.Int32(_tcgen05_subtile))])\n"
-                    f"    cute.arch.sync_threads()"
-                )
-            )
-            suffix.append(
-                statement_from_string(
-                    f"if {mma_active}:\n"
-                    f"    with cute.arch.elect_one():\n"
-                    f"        {tcgen05_plan.acc_pipeline}.consumer_release({tcgen05_plan.acc_consumer_state})"
-                )
-            )
-            suffix.append(
-                statement_from_string(f"{tcgen05_plan.acc_consumer_state}.advance()")
-            )
-    suffix.append(statement_from_string("cute.arch.sync_threads()"))
+
     if mma_impl == "tcgen05":
         assert tcgen05_plan is not None
-        suffix.append(
-            statement_from_string(
-                f"if {mma_active}:\n"
-                f"    {tcgen05_plan.acc_pipeline}.producer_tail({tcgen05_plan.acc_producer_state})"
-            )
+        assert epi_tidx is not None
+        assert epi_active is not None
+        assert epi_leader is not None
+        assert exec_leader is not None
+        assert tma_warp is not None
+        df.register_cute_tcgen05_store_value(
+            result_var,
+            CuteTcgen05StoreValue(
+                bm=bm,
+                bn=bn,
+                bk=bk,
+                smem_name=""
+                if tcgen05_direct_store or tcgen05_root_output_tma
+                else smem_c,
+                thr_mma=thr_mma,
+                store_thr_mma=thr_mma,
+                epi_warp_count=tcgen05_epi_warp_count_value,
+                epi_acc_frag_base=tcgen05_epi_acc_frag_base,
+                epi_tidx=epi_tidx,
+                epi_active=epi_active,
+                epi_leader=epi_leader,
+                exec_active=tcgen05_plan.exec_active,
+                exec_leader=exec_leader,
+                epi_tile=tcgen05_plan.epi_tile,
+                c_stage_count=tcgen05_c_stage_count_value,
+                epilog_sync_barrier_id=_tcgen05_epilog_sync_barrier_id(),
+                tmem_load_atom=tcgen05_plan.tmem_load_atom,
+                epilogue_rest_mode=tcgen05_plan.epilogue_rest_mode,
+                acc_pipeline=tcgen05_plan.acc_pipeline,
+                acc_producer_state=tcgen05_plan.acc_producer_state,
+                acc_consumer_state=tcgen05_plan.acc_consumer_state,
+                tmem_alloc_barrier=tcgen05_plan.tmem_alloc_barrier,
+                tmem_allocator=tcgen05_plan.tmem_allocator,
+                tmem_holding_buf=tcgen05_plan.tmem_holding_buf,
+                tmem_dealloc_mbar_ptr=tcgen05_plan.tmem_dealloc_mbar_ptr,
+                epi_acc_tmem_ptr=tcgen05_epi_acc_tmem_ptr,
+                acc_tmem_cols=tcgen05_plan.acc_tmem_cols,
+                tma_warp=tma_warp,
+                tma_pipeline=tma_pipeline,
+                tma_producer_state=tma_producer_state,
+                is_two_cta=tcgen05_is_two_cta,
+                use_tma=tcgen05_use_tma,
+            ),
         )
-        suffix.append(statement_from_string("cute.arch.sync_threads()"))
+    else:
+        # Each thread reads its own (m, n) element from shared memory.
         suffix.append(
-            statement_from_string(
-                f"{tcgen05_plan.tmem_allocator}.relinquish_alloc_permit()"
-            )
+            statement_from_string(f"{result_var} = {smem_c}[{m_local}, {n_local}]")
         )
-        suffix.append(
-            statement_from_string(
-                f"{tcgen05_plan.tmem_allocator}.free("
-                f"{tcgen05_plan.acc_tmem_ptr}, {tcgen05_plan.acc_tmem_cols})"
-            )
-        )
-
-    # Each thread reads its own (m, n) element from shared memory
-    suffix.append(
-        statement_from_string(f"{result_var} = {smem_c}[{m_local}, {n_local}]")
-    )
 
     return expr_from_string(result_var)
 
@@ -1360,12 +2375,114 @@ def _mma_active_n_threads(mma_impl: str) -> int:
     return 0
 
 
-def _tcgen05_pipeline_arrive_count(bm: int) -> int:
-    # PipelineUmmaAsync counts elected arrivals, not every participating lane.
-    return (bm * _mma_active_n_threads("tcgen05")) // 32
+def _tcgen05_root_m_threads(bm: int, bn: int) -> int:
+    # Wide tcgen05 tiles use a compact physical M thread map plus root-lane
+    # serialization. Narrow N=8 tiles keep the original full-M thread family.
+    if bn <= 8:
+        return bm
+    return min(32, bm)
 
 
-_tcgen05_tmem_barrier_thread_count = operator.mul
+def _tcgen05_epilogue_warp_count(cta_thread_count: int) -> int:
+    cta_warp_count = max(1, cta_thread_count // 32)
+    return max(1, min(4, cta_warp_count - 2))
+
+
+def _tcgen05_pipeline_arrive_count(
+    cta_thread_count: int, epi_warp_count: int | None = None
+) -> int:
+    if epi_warp_count is None:
+        epi_warp_count = _tcgen05_epilogue_warp_count(cta_thread_count)
+    return epi_warp_count
+
+
+def _tcgen05_tmem_barrier_thread_count(
+    cta_thread_count: int, epi_warp_count: int | None = None
+) -> int:
+    if epi_warp_count is None:
+        epi_warp_count = _tcgen05_epilogue_warp_count(cta_thread_count)
+    return 32 * (epi_warp_count + 1)
+
+
+def _tcgen05_c_stage_count(bn: int) -> int:
+    # Match the SM100 GEMM helper: narrow epilogues use a deeper TMA-store
+    # ring buffer, while wider-N tiles fall back to two stages.
+    return 4 if bn <= 16 else 2
+
+
+def _tcgen05_tmem_alloc_barrier_id() -> int:
+    return 1
+
+
+def _tcgen05_epilog_sync_barrier_id() -> int:
+    # Helion currently reserves barrier 1 for the TMEM allocation flow.
+    return 2
+
+
+def _tcgen05_ab_stage_count(num_stages: int) -> int:
+    return max(1, min(int(num_stages), 2))
+
+
+def _tcgen05_acc_stage_count(bn: int) -> int:
+    # Match Quack/CUTLASS SM100 staging for the current non-blockscaled path:
+    # keep two accumulator stages for all currently supported N<=256 tiles.
+    return 2 if bn <= 256 else 1
+
+
+def _tcgen05_config_int(config: object, key: str, default: int) -> int:
+    value = cast("_ConfigLike", config).get(key, default)
+    if not isinstance(value, int):
+        return default
+    return value
+
+
+def _tcgen05_config_bool(config: object, key: str, default: bool) -> bool:
+    value = cast("_ConfigLike", config).get(key, default)
+    if not isinstance(value, bool):
+        return default
+    return value
+
+
+def _tcgen05_cluster_m(config: object) -> int:
+    return max(1, min(2, _tcgen05_config_int(config, "tcgen05_cluster_m", 1)))
+
+
+def _tcgen05_use_2cta_instrs(*, bm: int, cluster_m: int) -> bool:
+    # Match Quack/CUTLASS SM100: clustered kernels are not automatically the
+    # tcgen05 "CTA pair" instruction family. The special 2-CTA instructions only
+    # apply to the 256-wide M tiler. Our current legal Helion family still uses
+    # CTA-local M=128 tiles, even when the cluster shape is (2, 1, 1).
+    return cluster_m == 2 and bm == 256
+
+
+def _tcgen05_role_layout(
+    config: object,
+    *,
+    bn: int,
+    cta_thread_count: int,
+) -> tuple[int, int, bool, bool]:
+    cta_warp_count = max(1, cta_thread_count // 32)
+    epi_warp_count = min(
+        cta_warp_count,
+        max(1, _tcgen05_config_int(config, "tcgen05_num_epi_warps", 4)),
+    )
+    ab_load_warp_count = min(1, max(1, cta_warp_count - epi_warp_count - 1))
+    extra_warps = max(0, cta_warp_count - epi_warp_count - 1 - ab_load_warp_count)
+    want_epi_load_warp = _tcgen05_config_bool(
+        config, "tcgen05_has_epi_load_warp", bn >= 128
+    )
+    has_epi_load_warp = want_epi_load_warp and extra_warps >= 1
+    extra_warps -= int(has_epi_load_warp)
+    want_scheduler_warp = _tcgen05_config_bool(
+        config,
+        "tcgen05_has_scheduler_warp",
+        bn >= 128
+        or str(cast("_ConfigLike", config).get("pid_type", "")).startswith(
+            "persistent"
+        ),
+    )
+    has_scheduler_warp = want_scheduler_warp and extra_warps >= 1
+    return epi_warp_count, ab_load_warp_count, has_scheduler_warp, has_epi_load_warp
 
 
 def _mma_impl_matches_problem_shape(
@@ -1375,15 +2492,24 @@ def _mma_impl_matches_problem_shape(
     bm: int,
     bn: int,
     bk: int,
+    tcgen05_cluster_m: int = 1,
 ) -> bool:
     if mma_impl == "universal":
         return True
-    if input_dtype not in (torch.float16, torch.bfloat16) or bk != 16 or bn != 8:
+    if (
+        input_dtype not in (torch.float16, torch.bfloat16)
+        or bk != 16
+        or bn < 8
+        or bn > 256
+        or bn % 8 != 0
+    ):
         return False
     if mma_impl == "warp":
-        return bm >= 16 and bm % 16 == 0
+        return bm >= 16 and bm % 16 == 0 and bn == 8
     if mma_impl == "tcgen05":
-        return bm in (64, 128)
+        if bm in (64, 128):
+            return True
+        return bm == 256 and tcgen05_cluster_m == 2
     return False
 
 
@@ -1402,13 +2528,44 @@ def _is_zero_acc_expr(acc_expr: ast.AST) -> bool:
     return False
 
 
+def _is_zero_acc_node(node: Node | None) -> bool:
+    if node is None:
+        return False
+    if node.op != "call_function":
+        return False
+
+    if node.target in _TRACE_THROUGH_TARGETS:
+        src = node.args[0] if node.args else None
+        return isinstance(src, Node) and _is_zero_acc_node(src)
+
+    target_name = getattr(node.target, "__name__", "")
+    if target_name in {"clone", "detach"}:
+        src = node.args[0] if node.args else None
+        return isinstance(src, Node) and _is_zero_acc_node(src)
+    if target_name == "zeros":
+        return True
+    if target_name != "full":
+        return False
+
+    value = None
+    if len(node.args) > 1:
+        value = node.args[1]
+    elif "value" in node.kwargs:
+        value = node.kwargs["value"]
+    return value in (0, 0.0)
+
+
 def _choose_mma_impl(
     input_dtype: torch.dtype,
     *,
     bm: int,
     bn: int,
     bk: int,
+    config: object | None = None,
 ) -> str:
+    tcgen05_cluster_m = 1
+    if config is not None:
+        tcgen05_cluster_m = _tcgen05_cluster_m(config)
     env_choice = os.environ.get("HELION_CUTE_MMA_IMPL", "auto").strip().lower()
     support = get_cute_mma_support()
     if env_choice != "auto":
@@ -1426,10 +2583,18 @@ def _choose_mma_impl(
             bm=bm,
             bn=bn,
             bk=bk,
+            tcgen05_cluster_m=tcgen05_cluster_m,
         ):
             return env_choice
         return "universal"
-    if _mma_impl_matches_problem_shape("tcgen05", input_dtype, bm=bm, bn=bn, bk=bk):
+    if _mma_impl_matches_problem_shape(
+        "tcgen05",
+        input_dtype,
+        bm=bm,
+        bn=bn,
+        bk=bk,
+        tcgen05_cluster_m=tcgen05_cluster_m,
+    ):
         if support.tcgen05_f16bf16:
             return "tcgen05"
     if _mma_impl_matches_problem_shape("warp", input_dtype, bm=bm, bn=bn, bk=bk):
@@ -1447,6 +2612,8 @@ def _make_tiled_mma_setup(
     acc_dtype_str: str,
     bm: int,
     bn: int,
+    *,
+    tcgen05_cluster_m: int = 1,
 ) -> list[ast.AST]:
     if mma_impl == "warp":
         tiled_mma_expr = (
@@ -1456,7 +2623,13 @@ def _make_tiled_mma_setup(
             f"), atom_layout_mnk=({bm // 16}, 1, 1))"
         )
     elif mma_impl == "tcgen05":
-        tiled_mma_expr = _tcgen05_tiled_mma_expr(input_dtype_str, acc_dtype_str, bm, bn)
+        tiled_mma_expr = _tcgen05_tiled_mma_expr(
+            input_dtype_str,
+            acc_dtype_str,
+            bm,
+            bn,
+            tcgen05_cluster_m=tcgen05_cluster_m,
+        )
     else:
         assert mma_thread_linear
         return [
@@ -1482,14 +2655,19 @@ def _tcgen05_tiled_mma_expr(
     acc_dtype_str: str,
     bm: int,
     bn: int,
+    *,
+    tcgen05_cluster_m: int = 1,
 ) -> str:
+    cta_group_expr = "cute.nvgpu.tcgen05.CtaGroup.ONE"
+    if _tcgen05_use_2cta_instrs(bm=bm, cluster_m=tcgen05_cluster_m):
+        cta_group_expr = "cute.nvgpu.tcgen05.CtaGroup.TWO"
     return (
         "cutlass.utils.blackwell_helpers.make_trivial_tiled_mma("
         f"{input_dtype_str}, "
         "cute.nvgpu.tcgen05.OperandMajorMode.K, "
-        "cute.nvgpu.tcgen05.OperandMajorMode.K, "
+        "cute.nvgpu.tcgen05.OperandMajorMode.MN, "
         f"{acc_dtype_str}, "
-        "cute.nvgpu.tcgen05.CtaGroup.ONE, "
+        f"{cta_group_expr}, "
         f"({bm}, {bn}), "
         "cute.nvgpu.tcgen05.OperandSource.SMEM)"
     )
@@ -1499,8 +2677,12 @@ def _new_tcgen05_layout_plan(df: DeviceFunction) -> _Tcgen05LayoutPlan:
     return _Tcgen05LayoutPlan(
         acc_stage_count=df.new_var("tcgen05_acc_stage_count"),
         ab_stage_count=df.new_var("tcgen05_ab_stage_count"),
+        c_stage_count=df.new_var("tcgen05_c_stage_count"),
         exec_thread_count=df.new_var("tcgen05_exec_thread_count"),
-        consumer_thread_count=df.new_var("tcgen05_pipeline_arrive_count"),
+        epi_warp_count=df.new_var("tcgen05_epi_warp_count"),
+        epilog_sync_barrier_id=df.new_var("tcgen05_epilog_sync_barrier_id"),
+        acc_pipeline_arrive_count=df.new_var("tcgen05_acc_pipeline_arrive_count"),
+        ab_pipeline_arrive_count=df.new_var("tcgen05_ab_pipeline_arrive_count"),
         exec_active=df.new_var("tcgen05_exec_active"),
         smem_a_layout=df.new_var("sA_layout"),
         smem_b_layout=df.new_var("sB_layout"),
@@ -1511,6 +2693,7 @@ def _new_tcgen05_layout_plan(df: DeviceFunction) -> _Tcgen05LayoutPlan:
         tmem_load_atom=df.new_var("tcgen05_tmem_load_atom"),
         acc_tmem_cols=df.new_var("tcgen05_acc_tmem_cols"),
         tmem_holding_buf=df.new_var("tcgen05_tmem_holding_buf"),
+        tmem_dealloc_mbar_ptr=df.new_var("tcgen05_tmem_dealloc_mbar_ptr"),
         tmem_alloc_barrier=df.new_var("tcgen05_tmem_alloc_barrier"),
         tmem_allocator=df.new_var("tcgen05_tmem_allocator"),
         acc_tmem_ptr=df.new_var("tcgen05_acc_tmem_ptr"),
@@ -1531,21 +2714,44 @@ def _make_tcgen05_layout_plan_setup(
     bm: int,
     bn: int,
     bk: int,
+    ab_stage_count: int,
+    acc_stage_count: int,
+    c_stage_count: int,
+    cta_thread_count: int,
+    epi_warp_count: int,
+    is_two_cta: bool,
+    active_physical_n_threads: int,
     input_dtype_str: str,
     acc_dtype_str: str,
 ) -> list[ast.AST]:
     return [
-        statement_from_string(f"{plan.ab_stage_count} = cutlass.Int32(2)"),
+        statement_from_string(
+            f"{plan.acc_stage_count} = cutlass.Int32({acc_stage_count})"
+        ),
+        statement_from_string(
+            f"{plan.ab_stage_count} = cutlass.Int32({ab_stage_count})"
+        ),
+        statement_from_string(f"{plan.c_stage_count} = cutlass.Int32({c_stage_count})"),
         statement_from_string(f"{plan.exec_thread_count} = cutlass.Int32(32)"),
         statement_from_string(
-            f"{plan.consumer_thread_count} = "
-            f"cutlass.Int32({_tcgen05_pipeline_arrive_count(bm)})"
+            f"{plan.epi_warp_count} = cutlass.Int32({epi_warp_count})"
         ),
         statement_from_string(
-            f"{plan.smem_a_layout} = {_tcgen05_smem_layout_expr(tiled_mma, bm, bn, bk, input_dtype_str, operand='a')}"
+            f"{plan.epilog_sync_barrier_id} = "
+            f"cutlass.Int32({_tcgen05_epilog_sync_barrier_id()})"
         ),
         statement_from_string(
-            f"{plan.smem_b_layout} = {_tcgen05_smem_layout_expr(tiled_mma, bm, bn, bk, input_dtype_str, operand='b')}"
+            f"{plan.acc_pipeline_arrive_count} = "
+            f"cutlass.Int32({_tcgen05_pipeline_arrive_count(cta_thread_count, epi_warp_count)})"
+        ),
+        statement_from_string(f"{plan.ab_pipeline_arrive_count} = cutlass.Int32(1)"),
+        statement_from_string(
+            f"{plan.smem_a_layout} = "
+            f"{_tcgen05_smem_layout_expr(tiled_mma, bm, bn, bk, input_dtype_str, ab_stage_count, operand='a')}"
+        ),
+        statement_from_string(
+            f"{plan.smem_b_layout} = "
+            f"{_tcgen05_smem_layout_expr(tiled_mma, bm, bn, bk, input_dtype_str, ab_stage_count, operand='b')}"
         ),
         statement_from_string(
             f"{plan.smem_desc_view_layout} = cute.make_layout(1, stride=0)"
@@ -1560,12 +2766,12 @@ def _make_tcgen05_layout_plan_setup(
         ),
         statement_from_string(
             f"{plan.smem_c_layout} = cutlass.utils.blackwell_helpers.make_smem_layout_epi("
-            f"{acc_dtype_str}, {plan.c_layout}, {plan.epi_tile}, 1)"
+            f"{acc_dtype_str}, {plan.c_layout}, {plan.epi_tile}, {plan.c_stage_count})"
         ),
         statement_from_string(
             f"{plan.tmem_load_atom} = cutlass.utils.blackwell_helpers.get_tmem_load_op("
             f"({bm}, {bn}, {bk}), {plan.c_layout}, "
-            f"{acc_dtype_str}, {acc_dtype_str}, {plan.epi_tile}, False)"
+            f"{acc_dtype_str}, {acc_dtype_str}, {plan.epi_tile}, {is_two_cta!s})"
         ),
         statement_from_string(
             f"{plan.epilogue_rest_mode} = cute.make_layout(1, stride=0)"
@@ -1586,18 +2792,19 @@ def _tcgen05_smem_layout_expr(
     bn: int,
     bk: int,
     dtype_str: str,
+    num_stages: int,
     *,
     operand: str,
 ) -> str:
     if operand == "a":
         return (
             "cutlass.utils.blackwell_helpers.make_smem_layout_a("
-            f"{tiled_mma}, ({bm}, {bn}, {bk}), {dtype_str}, 2)"
+            f"{tiled_mma}, ({bm}, {bn}, {bk}), {dtype_str}, {num_stages})"
         )
     assert operand == "b"
     return (
         "cutlass.utils.blackwell_helpers.make_smem_layout_b("
-        f"{tiled_mma}, ({bm}, {bn}, {bk}), {dtype_str}, 2)"
+        f"{tiled_mma}, ({bm}, {bn}, {bk}), {dtype_str}, {num_stages})"
     )
 
 
@@ -1614,12 +2821,7 @@ def codegen_cute_mma(
 
     if not isinstance(ctx.cg, GenerateAST):
         return None
-    if _has_active_lane_loops(ctx.cg):
-        return None
-    if (
-        ctx.cg.current_grid_state is None
-        or len(ctx.cg.current_grid_state.block_ids) != 2
-    ):
+    if ctx.cg.current_grid_state is None:
         return None
     if not can_codegen_cute_mma_aten(node, with_acc):
         return None
@@ -1697,7 +2899,26 @@ def codegen_cute_mma_direct_mm(
     if load_plan is None:
         return None
 
-    mma_impl = _choose_mma_impl(lhs_fake.dtype, bm=plan.bm, bn=plan.bn, bk=plan.bk)
+    mma_impl = _choose_mma_impl(
+        lhs_fake.dtype,
+        bm=plan.bm,
+        bn=plan.bn,
+        bk=plan.bk,
+        config=ctx.cg.device_function.config,
+    )
+    # The grouped-N direct path only emits warp MMA. Auto-selection prefers
+    # tcgen05 for plan.bm in (64, 128), but tcgen05 isn't implemented here, so
+    # transparently fall back to warp on tcgen05-capable machines as long as
+    # the user didn't explicitly request a different implementation.
+    if (
+        mma_impl == "tcgen05"
+        and os.environ.get("HELION_CUTE_MMA_IMPL", "auto").strip().lower() == "auto"
+        and _mma_impl_matches_problem_shape(
+            "warp", lhs_fake.dtype, bm=plan.bm, bn=plan.bn, bk=plan.bk
+        )
+        and get_cute_mma_support().warp_f16bf16
+    ):
+        mma_impl = "warp"
     if mma_impl != "warp":
         return None
 
@@ -1886,12 +3107,7 @@ def codegen_cute_mma_dot(state: CodegenState) -> object | None:
 
     if not isinstance(state.codegen, GenerateAST):
         return None
-    if _has_active_lane_loops(state.codegen):
-        return None
-    if (
-        state.codegen.current_grid_state is None
-        or len(state.codegen.current_grid_state.block_ids) != 2
-    ):
+    if state.codegen.current_grid_state is None:
         return None
     if state.fx_node is None:
         return None

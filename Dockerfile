@@ -14,7 +14,9 @@ RUN apt-get update && \
         ca-certificates \
         curl \
         git \
+        libffi-dev \
         libgomp1 \
+        ninja-build \
         openssh-server \
         pkg-config \
         python-is-python3 \
@@ -41,18 +43,24 @@ COPY . ${WORKSPACE_DIR}
 
 RUN mkdir -p /workspace/pytorch
 
+RUN git clone --depth 1 https://github.com/Dao-AILab/quack.git /workspace/quack
+
 RUN python -m pip install \
         --pre \
         --index-url https://download.pytorch.org/whl/nightly/cu130 \
         --extra-index-url https://pypi.org/simple \
         torch \
         triton && \
+    python -m pip install -e /workspace/quack && \
     SETUPTOOLS_SCM_PRETEND_VERSION_FOR_HELION=0.0+docker \
     python -m pip install \
         -e '.[dev,cute-cu13]' \
         absl-py \
+        cffi \
+        apache-tvm-ffi \
         jax \
         packaging \
+        pytest-xdist \
         pyrefly==0.51.1 \
         ruff==0.15.0 && \
     if [ -d .git ]; then \

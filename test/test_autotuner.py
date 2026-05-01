@@ -443,6 +443,99 @@ class TestAutotuneIgnoreErrors(TestCase):
 
         self.assertEqual(set(lazy_calls), {parent_pid})
 
+    @pytest.mark.skipif(
+        "fork" not in mp.get_all_start_methods(),
+        reason="fork start method is unavailable on this platform",
+    )
+    def test_fork_precompile_expected_errors_skip_config(self):
+        from torch._inductor.runtime.triton_compat import OutOfResources
+
+        expected_errors = [
+            torch.cuda.OutOfMemoryError("CUDA out of memory"),
+            OutOfResources(128, 64, "shared memory"),
+            RuntimeError("out of resource: shared memory"),
+            RuntimeError("too many resources requested for launch"),
+            RuntimeError("CUDA error: out of memory"),
+            RuntimeError("[CUDA]: out of memory"),
+            RuntimeError("failed to translate module to LLVM IR"),
+        ]
+        for err in expected_errors:
+            with self.subTest(error=type(err).__name__, msg=str(err)):
+                settings = Settings(
+                    autotune_precompile="fork",
+                    autotune_ignore_errors=False,
+                    autotune_log_level=logging.CRITICAL,
+                )
+                search = self._make_search(settings, args=("arg0",))
+
+                def fake_compiled_fn(
+                    *fn_args: object, _launcher: Callable[..., object]
+                ) -> None:
+                    _launcher("fake_kernel", (1,), *fn_args)
+
+                with patch(
+                    "helion.autotuner.precompile_future._prepare_precompiler_for_fork",
+                    side_effect=err,
+                ):
+                    future = search.benchmark_provider._create_precompile_future(
+                        "cfg", fake_compiled_fn
+                    )
+
+                self.assertFalse(future.ok)
+
+    @pytest.mark.skipif(
+        "fork" not in mp.get_all_start_methods(),
+        reason="fork start method is unavailable on this platform",
+    )
+    def test_fork_precompile_illegal_memory_access_raises(self):
+        settings = Settings(
+            autotune_precompile="fork",
+            autotune_ignore_errors=True,
+            autotune_log_level=logging.CRITICAL,
+        )
+        search = self._make_search(settings, args=("arg0",))
+
+        def fake_compiled_fn(
+            *fn_args: object, _launcher: Callable[..., object]
+        ) -> None:
+            _launcher("fake_kernel", (1,), *fn_args)
+
+        with (
+            patch(
+                "helion.autotuner.precompile_future._prepare_precompiler_for_fork",
+                side_effect=RuntimeError("an illegal memory access was encountered"),
+            ),
+            pytest.raises(RuntimeError, match="illegal memory access"),
+        ):
+            search.benchmark_provider._create_precompile_future("cfg", fake_compiled_fn)
+
+    @pytest.mark.skipif(
+        "fork" not in mp.get_all_start_methods(),
+        reason="fork start method is unavailable on this platform",
+    )
+    def test_fork_precompile_unexpected_error_skipped_with_ignore_errors(self):
+        settings = Settings(
+            autotune_precompile="fork",
+            autotune_ignore_errors=True,
+            autotune_log_level=logging.CRITICAL,
+        )
+        search = self._make_search(settings, args=("arg0",))
+
+        def fake_compiled_fn(
+            *fn_args: object, _launcher: Callable[..., object]
+        ) -> None:
+            _launcher("fake_kernel", (1,), *fn_args)
+
+        with patch(
+            "helion.autotuner.precompile_future._prepare_precompiler_for_fork",
+            side_effect=RuntimeError("something unexpected"),
+        ):
+            future = search.benchmark_provider._create_precompile_future(
+                "cfg", fake_compiled_fn
+            )
+
+        self.assertFalse(future.ok)
+
     def _run_autotuner_and_check_logging(
         self, search_factory: Callable[[object, tuple[object, ...]], BaseSearch]
     ) -> None:
@@ -529,6 +622,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
     @patch.object(_compat, "_supports_maxnreg", lambda: True)
     @patch.object(loops, "_supports_warp_specialize", lambda: True)
     @skipIfRocm("config space differs on ROCm")
+    @skipIfXPU("maxnreg uses CUDA-specific register query")
     def test_config_fragment0(self):
         args = (
             torch.randn([512, 512], device=DEVICE),
@@ -548,6 +642,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
     @patch("torch.version.hip", None)
     @patch("torch.version.xpu", None)
     @skipIfRocm("config space differs on ROCm")
+    @skipIfXPU("maxnreg uses CUDA-specific register query")
     def test_config_fragment1(self):
         args = (
             torch.randn([8, 512, 512], device=DEVICE),
@@ -568,6 +663,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
     @patch("torch.version.xpu", None)
     @skipIfTileIR("tileir backend will ignore `warp specialization` hint")
     @skipIfRocm("config space differs on ROCm")
+    @skipIfXPU("maxnreg uses CUDA-specific register query")
     def test_config_warp_specialize_unroll(self):
         args = (
             torch.randn([8, 512, 512], device=DEVICE),
@@ -2107,6 +2203,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         expected = torch.full([128], 3.0, device=DEVICE) + epsilon
         torch.testing.assert_close(out, expected)
 
+    @skipIfXPU("CUDA specific API used to check memory usage")
     def test_chunked_allclose_memory(self):
         """Test that autotuning accuracy checks use chunked comparison for large tensors."""
         import helion.autotuner.benchmark_provider as _bs

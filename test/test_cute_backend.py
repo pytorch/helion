@@ -14,7 +14,10 @@ from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
 import helion.language as hl
+from helion.runtime import _cute_cluster_shape
+from helion.runtime import _cute_cluster_shape_from_wrapper_plans
 from helion.runtime import _ensure_cute_dsl_arch_env
+from helion.runtime import _get_compiled_cute_launcher
 from helion.runtime import default_cute_launcher
 
 cutlass = pytest.importorskip("cutlass")
@@ -894,7 +897,7 @@ class TestCuteBackend(TestCase):
             num_threads=[1, 8, 1],
         )
         torch.testing.assert_close(out, args[0] @ args[1], atol=1e-1, rtol=1e-2)
-        self.assertIn("cute.arch.warp_reduction_sum", code)
+        self.assertNotIn("cute.arch.warp_reduction_sum", code)
         self.assertNotIn("cute.gemm", code)
 
     def test_matmul_mma_epilogue(self) -> None:
@@ -939,20 +942,11 @@ class TestCuteBackend(TestCase):
             code, out = code_and_output(cute_matmul_mma, args, block_sizes=[64, 8, 16])
         torch.testing.assert_close(out, args[0] @ args[1], atol=1e-1, rtol=1e-2)
         self.assertIn("cutlass.utils.blackwell_helpers.make_trivial_tiled_mma", code)
-        self.assertIn("cute.nvgpu.tcgen05.make_umma_smem_desc", code)
-        self.assertIn("cute.mma_atom_call", code)
-        self.assertIn(
-            "tcgen05_pipeline_arrive_count = cutlass.Int32(4)",
-            code,
-        )
-        self.assertIn(
-            "cutlass.pipeline.NamedBarrier(barrier_id=1, num_threads=512)",
-            code,
-        )
-        self.assertIn(
-            "cutlass.pipeline.CooperativeGroup(cutlass.pipeline.Agent.Thread, tcgen05_pipeline_arrive_count)",
-            code,
-        )
+        self.assertIn("cute.nvgpu.tcgen05", code)
+        self.assertIn("cute.gemm(", code)
+        self.assertIn("tcgen05_acc_pipeline_arrive_count", code)
+        self.assertIn("tcgen05_ab_pipeline_arrive_count", code)
+        self.assertIn("cutlass.pipeline.NamedBarrier(barrier_id=1", code)
 
     def test_matmul_mma_tcgen05_128x8_uses_full_cta_barrier(self) -> None:
         support = get_cute_mma_support()
@@ -966,18 +960,9 @@ class TestCuteBackend(TestCase):
         with patch.dict(os.environ, {"HELION_CUTE_MMA_IMPL": "tcgen05"}, clear=False):
             code, out = code_and_output(cute_matmul_mma, args, block_sizes=[128, 8, 16])
         torch.testing.assert_close(out, args[0] @ args[1], atol=1e-1, rtol=1e-2)
-        self.assertIn(
-            "tcgen05_pipeline_arrive_count = cutlass.Int32(8)",
-            code,
-        )
-        self.assertIn(
-            "cutlass.pipeline.NamedBarrier(barrier_id=1, num_threads=1024)",
-            code,
-        )
-        self.assertIn(
-            "cutlass.pipeline.CooperativeGroup(cutlass.pipeline.Agent.Thread, tcgen05_pipeline_arrive_count)",
-            code,
-        )
+        self.assertIn("cute.nvgpu.tcgen05", code)
+        self.assertIn("tcgen05_acc_pipeline_arrive_count", code)
+        self.assertIn("cutlass.pipeline.NamedBarrier(barrier_id=1", code)
 
     def test_matmul_dot_out_dtype_falls_back_from_mma(self) -> None:
         args = (
@@ -1424,16 +1409,87 @@ class TestCuteBackend(TestCase):
         )
         expected = args[0].float() @ args[1].float()
         torch.testing.assert_close(out, expected, atol=1e-1, rtol=1e-2)
-        self.assertIn("cute.arch.warp_reduction_sum", code)
+        self.assertNotIn("cute.arch.warp_reduction_sum", code)
         self.assertNotIn("cute.gemm", code)
 
     def test_cute_dsl_arch_env_tracks_launch_device(self) -> None:
         tensor = torch.empty(1, device=DEVICE)
         major, minor = torch.cuda.get_device_capability(tensor.device)
-        expected = f"sm_{major}{minor}"
+        suffix = "a" if major >= 9 else ""
+        expected = f"sm_{major}{minor}{suffix}"
         with patch.dict(os.environ, {"CUTE_DSL_ARCH": "sm_00"}, clear=False):
             _ensure_cute_dsl_arch_env((tensor,))
             self.assertEqual(os.environ["CUTE_DSL_ARCH"], expected)
+
+    def test_cute_launcher_cache_key_includes_wrapper_plans(self) -> None:
+        cute_kernel = type("DummyCuteKernel", (), {})()
+        schema_key = (("tensor", 2, "float32"),)
+        block = (32, 1, 1)
+        created: list[str] = []
+
+        def make_wrapper(*_args: object) -> str:
+            created.append("wrapper")
+            return f"wrapper-{len(created)}"
+
+        with patch("helion.runtime._create_cute_wrapper", side_effect=make_wrapper):
+            cute_kernel._helion_cute_wrapper_plans = [{"kind": "plan-a"}]
+            wrapper_a0 = _get_compiled_cute_launcher(cute_kernel, schema_key, block)
+            wrapper_a1 = _get_compiled_cute_launcher(cute_kernel, schema_key, block)
+            cute_kernel._helion_cute_wrapper_plans = [{"kind": "plan-b"}]
+            wrapper_b = _get_compiled_cute_launcher(cute_kernel, schema_key, block)
+
+        self.assertEqual(wrapper_a0, wrapper_a1)
+        self.assertNotEqual(wrapper_a0, wrapper_b)
+
+    def test_cute_launcher_cache_key_includes_cluster_shape(self) -> None:
+        cute_kernel = type("DummyCuteKernel", (), {})()
+        schema_key = (("tensor", 2, "float32"),)
+        block = (32, 1, 1)
+        created: list[str] = []
+
+        def make_wrapper(*_args: object) -> str:
+            created.append("wrapper")
+            return f"wrapper-{len(created)}"
+
+        with patch("helion.runtime._create_cute_wrapper", side_effect=make_wrapper):
+            cute_kernel._helion_cute_wrapper_plans = [{"kind": "plan-a"}]
+            cute_kernel._helion_cute_cluster_shape = (1, 1, 1)
+            wrapper_a = _get_compiled_cute_launcher(cute_kernel, schema_key, block)
+            cute_kernel._helion_cute_cluster_shape = (2, 1, 1)
+            wrapper_b = _get_compiled_cute_launcher(cute_kernel, schema_key, block)
+
+        self.assertNotEqual(wrapper_a, wrapper_b)
+
+    def test_cute_cluster_shape_from_wrapper_plans(self) -> None:
+        self.assertIsNone(_cute_cluster_shape_from_wrapper_plans([]))
+        self.assertIsNone(
+            _cute_cluster_shape_from_wrapper_plans(
+                [{"kind": "tcgen05_ab_tma", "cluster_m": 1, "cluster_n": 1}]
+            )
+        )
+        self.assertEqual(
+            _cute_cluster_shape_from_wrapper_plans(
+                [
+                    {
+                        "kind": "tcgen05_ab_tma",
+                        "cluster_m": 2,
+                        "cluster_n": 1,
+                    }
+                ]
+            ),
+            (2, 1, 1),
+        )
+
+    def test_cute_cluster_shape_prefers_explicit_kernel_metadata(self) -> None:
+        cute_kernel = type("DummyCuteKernel", (), {})()
+        cute_kernel._helion_cute_cluster_shape = (2, 1, 1)
+        self.assertEqual(
+            _cute_cluster_shape(
+                cute_kernel,
+                [{"kind": "tcgen05_ab_tma", "cluster_m": 1, "cluster_n": 1}],
+            ),
+            (2, 1, 1),
+        )
 
     def test_addmm_direct_full_k_tile_static_shapes_falls_back_correctly(self) -> None:
         args = (

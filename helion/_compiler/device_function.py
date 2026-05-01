@@ -85,7 +85,7 @@ def find_block_size_symbols(
     non_block_size_symbols = set()
 
     for symbol in expr.free_symbols:
-        # pyrefly: ignore [no-matching-overload]
+        # pyrefly: ignore [no-matching-overload, bad-argument-type]
         origin_info = hf.expr_to_origin.get(symbol)
         if origin_info is None or not isinstance(origin_info.origin, BlockSizeOrigin):
             # pyrefly: ignore [bad-argument-type]
@@ -196,6 +196,115 @@ class StaticShape(Argument):
         super().__init__(repr(val))
 
 
+@dataclasses.dataclass(frozen=True)
+class CuteTcgen05StoreValue:
+    bm: int = 0
+    bn: int = 0
+    bk: int = 0
+    smem_name: str = ""
+    thr_mma: str = ""
+    store_thr_mma: str = ""
+    epi_warp_count: int = 0
+    epi_acc_frag_base: str = ""
+    epi_tidx: str = ""
+    epi_active: str = ""
+    epi_leader: str = ""
+    exec_active: str = ""
+    exec_leader: str = ""
+    epi_tile: str = ""
+    c_stage_count: int = 0
+    epilog_sync_barrier_id: int = 0
+    tmem_load_atom: str = ""
+    epilogue_rest_mode: str = ""
+    acc_pipeline: str = ""
+    acc_producer_state: str = ""
+    acc_consumer_state: str = ""
+    tmem_alloc_barrier: str = ""
+    tmem_allocator: str = ""
+    tmem_holding_buf: str = ""
+    tmem_dealloc_mbar_ptr: str = ""
+    epi_acc_tmem_ptr: str = ""
+    acc_tmem_cols: str = ""
+    tma_warp: str = ""
+    tma_pipeline: str = ""
+    tma_producer_state: str = ""
+    is_two_cta: bool = False
+    use_tma: bool = False
+
+
+@dataclasses.dataclass(frozen=True)
+class CuteTcgen05MatmulPlan:
+    """Kernel-wide tcgen05 collective contract selected by CuTe matmul codegen."""
+
+    bm: int
+    bn: int
+    bk: int
+    cluster_m: int
+    is_two_cta: bool
+    cta_thread_count: int
+    physical_m_threads: int
+    acc_stage_count: int
+    ab_stage_count: int
+    c_stage_count: int
+    epi_warp_count: int
+    ab_load_warp_count: int
+    has_scheduler_warp: bool
+    has_epi_load_warp: bool
+
+    @property
+    def exec_warp_id(self) -> int:
+        return self.epi_warp_count
+
+    @property
+    def ab_load_warp_begin(self) -> int:
+        return self.exec_warp_id + 1
+
+    @property
+    def ab_load_warp_end(self) -> int:
+        return self.ab_load_warp_begin + self.ab_load_warp_count
+
+    @property
+    def tma_warp_id(self) -> int:
+        return self.ab_load_warp_begin
+
+    @property
+    def epi_load_warp_id(self) -> int | None:
+        if self.has_epi_load_warp:
+            return self.ab_load_warp_end
+        return None
+
+    @property
+    def scheduler_warp_id(self) -> int | None:
+        if self.has_scheduler_warp:
+            return self.ab_load_warp_end + int(self.has_epi_load_warp)
+        return None
+
+    @property
+    def persistent_scheduler_owner_warp_id(self) -> int:
+        # The current persistent path still wraps the whole tcgen05 body, so the
+        # scheduler owner must also participate in CTA-wide producer syncs.
+        # Move this to scheduler_warp_id when role-local loops own scheduling.
+        return self.tma_warp_id
+
+    @property
+    def role_warp_count(self) -> int:
+        return (
+            self.epi_warp_count
+            + 1
+            + self.ab_load_warp_count
+            + int(self.has_epi_load_warp)
+            + int(self.has_scheduler_warp)
+        )
+
+    @property
+    def compact_role_warp_count(self) -> int:
+        return 1 << max(self.role_warp_count - 1, 0).bit_length()
+
+    @property
+    def block_shape(self) -> tuple[int, int, int]:
+        return (self.physical_m_threads, self.compact_role_warp_count, 1)
+
+
 _sort_order: dict[type[Argument], int] = {
     TensorDescriptorArg: 0,
     TensorArg: 0,
@@ -262,6 +371,7 @@ class DeviceFunction:
         self._constexpr_args: dict[str, ConstExprArg] = {}
         self._constexpr_host_defs: set[str] = set()
         self._scratch_args: list[ScratchArg] = []
+        self.wrapper_only_params: list[str] = []
         self._tensor_properties: dict[
             tuple[type[TensorPropertyArg], torch.Tensor, int], TensorPropertyArg
         ] = {}
@@ -291,6 +401,13 @@ class DeviceFunction:
         self.block_size_var_cache: dict[tuple[int, ...], str] = {}
         self.expr_to_var_info: dict[sympy.Expr, VarInfo] = {}
         self.deferred_rdim_defs: list[tuple[str, sympy.Expr]] = []
+        self._cute_tcgen05_store_values: dict[str, CuteTcgen05StoreValue] = {}
+        self.cute_tcgen05_matmul_plan: CuteTcgen05MatmulPlan | None = None
+        self._cute_tcgen05_invariant_setup_stmt_ids: set[int] = set()
+        self._cute_collective_handled_loads: set[str] = set()
+        self.cute_cluster_shape: tuple[int, int, int] | None = None
+        self.cute_block_shape: tuple[int, int, int] | None = None
+        self.suppress_cute_root_lane_loops = False
 
         from .helper_function import HelperFunctionManager
 
@@ -466,6 +583,38 @@ class DeviceFunction:
         ]
         for n in name_group:
             self._variable_renames[n] = name_group
+
+    def register_cute_tcgen05_store_value(
+        self, name: str, value: CuteTcgen05StoreValue
+    ) -> None:
+        self._cute_tcgen05_store_values[name] = value
+
+    def register_cute_tcgen05_matmul_plan(self, plan: CuteTcgen05MatmulPlan) -> None:
+        if self.cute_tcgen05_matmul_plan is not None:
+            if self.cute_tcgen05_matmul_plan != plan:
+                raise exc.BackendUnsupported(
+                    "cute", "mixed tcgen05 matmul collective plans in one kernel"
+                )
+            return
+        self.cute_tcgen05_matmul_plan = plan
+
+    def register_cute_tcgen05_invariant_setup(self, stmts: list[ast.AST]) -> None:
+        self._cute_tcgen05_invariant_setup_stmt_ids.update(id(stmt) for stmt in stmts)
+
+    def is_cute_tcgen05_invariant_setup(self, stmt: ast.stmt) -> bool:
+        return id(stmt) in self._cute_tcgen05_invariant_setup_stmt_ids
+
+    def get_cute_tcgen05_store_value(self, name: str) -> CuteTcgen05StoreValue | None:
+        for alias in self._variable_renames.get(name, [name]):
+            if (value := self._cute_tcgen05_store_values.get(alias)) is not None:
+                return value
+        return None
+
+    def register_cute_collective_handled_load(self, name: str) -> None:
+        self._cute_collective_handled_loads.add(name)
+
+    def is_cute_collective_handled_load(self, name: str) -> bool:
+        return name in self._cute_collective_handled_loads
 
     def set_pid(self, pid: ProgramIDs) -> None:
         if self.pid is not None:
@@ -743,7 +892,8 @@ class DeviceFunction:
         ]
 
         args = [arg.arg_def_node() for arg in param_args]
-        # Ordering invariant: [param_args, extra_params, rng_seed, scratch_args].
+        # Ordering invariant:
+        # [param_args, extra_params, rng_seed, scratch_args, wrapper_only_params].
         # codegen_function_call must match this order — it builds positional args
         # from param_args, extends with extra_params, then build_launcher_args
         # appends rng_seed_buffer.
@@ -756,6 +906,7 @@ class DeviceFunction:
         # Add scratch memory parameters (for emit_pipeline on Pallas/TPU)
         for scratch_arg in self._scratch_args:
             args.append(create_arg(scratch_arg.name))
+        args.extend(create_arg(name) for name in self.wrapper_only_params)
 
         # Generate inlined constexpr assignments at module level
         # (e.g., _BLOCK_SIZE_0 = tl.constexpr(256))

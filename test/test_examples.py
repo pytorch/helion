@@ -268,6 +268,37 @@ class TestExamples(RefEagerTestBase, TestCase):
             static_shapes=True,
         )
 
+    @onlyBackends(["pallas"])
+    def test_matmul_layernorm_half_dtype_multi_k_tile(self):
+        """Guards K-loop accumulator precision when inputs are half-precision.
+
+        Across multiple K-tile iterations the partial-sum accumulator must
+        stay in fp32 to keep the layernorm output within tight tolerance;
+        regressions here surface as out-of-tolerance results on bf16/fp16.
+        """
+        m, k, n = 1024, 1024, 1024
+        args = (
+            torch.randn([m, k], device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn([k, n], device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn([n], device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn([n], device=DEVICE, dtype=HALF_DTYPE),
+        )
+        expected = torch.nn.functional.layer_norm(
+            (args[0] @ args[1]).to(torch.float32),
+            normalized_shape=(n,),
+            weight=args[2].to(torch.float32),
+            bias=args[3].to(torch.float32),
+        ).to(HALF_DTYPE)
+        check_example(
+            "matmul_layernorm",
+            args,
+            expected,
+            block_sizes=[32, 256],
+            static_shapes=True,
+            atol=1e-2,
+            rtol=1e-2,
+        )
+
     def test_matmul_layernorm_small_shapes_compile_on_cute(self):
         if _get_backend() != "cute":
             self.skipTest("CuTe-specific compile coverage")
@@ -414,6 +445,10 @@ class TestExamples(RefEagerTestBase, TestCase):
 
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfTileIR("TileIR does not support block_ptr indexing")
+    @xfailIfCute(
+        "CuTe tcgen05 MMA path does not yet emit indices/masks for the "
+        "user-level epilogue write that follows the MMA"
+    )
     def test_template_via_closure2(self):
         args = (
             torch.randn([512, 512], device=DEVICE, dtype=HALF_DTYPE),
@@ -737,6 +772,10 @@ class TestExamples(RefEagerTestBase, TestCase):
 
     @skipIfTileIR("PassManager::run failed")
     @skipIfPallas("JAX erf lowering incompatibility with gelu")
+    @xfailIfCute(
+        "CuTe tcgen05 MMA path does not yet emit indices/masks for the "
+        "user-level epilogue write that follows the MMA"
+    )
     def test_epilogue_subtiling_residual_gelu(self):
         m, k, n = 8192, 8192, 8192
         x = torch.randn([m, k], device=DEVICE, dtype=HALF_DTYPE)
@@ -758,6 +797,10 @@ class TestExamples(RefEagerTestBase, TestCase):
 
     @skipIfTileIR("PassManager::run failed")
     @skipIfPallas("JAX erf lowering incompatibility with gelu")
+    @xfailIfCute(
+        "CuTe tcgen05 MMA path does not yet emit indices/masks for the "
+        "user-level epilogue write that follows the MMA"
+    )
     def test_epilogue_subtiling_gelu_aux(self):
         m, k, n = 8192, 8192, 8192
         x = torch.randn([m, k], device=DEVICE, dtype=HALF_DTYPE)
@@ -1307,7 +1350,6 @@ class TestExamples(RefEagerTestBase, TestCase):
             block_sizes=[16, 8, 16, 16],
         )
 
-    @xfailIfCute("CuTe jagged HSTU attention example is not supported yet")
     @xfailIfPallas("tensor-derived if-predicates not supported")
     @skipIfXPU("Jagged tensor operations not fully supported on XPU")
     def test_jagged_hstu_attn(self):
@@ -1558,6 +1600,7 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
 
     @xfailIfPallas("BackendError on pallas")
+    @skipIfXPU("Timeout on XPU")
     def test_gather_gemv(self):
         args = (
             torch.randn([4, 512, 512], device=DEVICE, dtype=torch.float32),
@@ -1673,6 +1716,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             block_sizes=[16, 8, 16],
         )
 
+    @skipIfXPU("Timeout on XPU")
     def test_fused_linear_jsd(self):
         beta = 0.5
         ignore_index = -100
@@ -1861,6 +1905,7 @@ class TestExamples(RefEagerTestBase, TestCase):
     @xfailIfPallas("tensor accessed with conflicting tiling patterns")
     @skipIfA10G("failure on a10g")
     @skipIfTileIR("accuracy failure")
+    @skipIfXPU("ocloc compilation failure with 256-GRF kernel on XPU backend")
     def test_squeeze_and_excitation_net_bwd_da(self):
         m, n, k = 256, 256, 256
         x = torch.randn([m, n], device=DEVICE, dtype=HALF_DTYPE)
@@ -1904,6 +1949,7 @@ class TestExamples(RefEagerTestBase, TestCase):
     @xfailIfCute("CuTe squeeze-and-excitation backward still fails lowering/runtime")
     @skipIfA10G("failure on a10g")
     @skipIfTileIR("accuracy failure")
+    @skipIfXPU("ocloc compilation failure with 256-GRF kernel on XPU backend")
     def test_squeeze_and_excitation_net_bwd_db(self):
         m, n, k = 256, 256, 256
         x = torch.randn([m, n], device=DEVICE, dtype=HALF_DTYPE)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import logging
+import textwrap
 from typing import TYPE_CHECKING
 
 import torch
@@ -729,6 +730,329 @@ def _cute_combined_mask(
     return " and ".join(f"({term})" for term in terms)
 
 
+def _cute_tensor_dim_size_expr(
+    state: CodegenState, tensor: torch.Tensor, dim: int
+) -> str:
+    return state.device_function.tensor_size(tensor, dim).name
+
+
+def _cute_tile_begin_expr(state: CodegenState, idx: object) -> str:
+    env = CompileEnvironment.current()
+
+    def active_index_var(block_id: int) -> str | None:
+        loops = state.codegen.active_device_loops.get(block_id)
+        if loops:
+            return loops[-1].strategy.index_var(block_id)
+        grid_state = state.codegen.current_grid_state
+        if grid_state is not None and block_id in grid_state.block_ids:
+            return grid_state.strategy.index_var(block_id)
+        return None
+
+    def active_local_coord(block_id: int) -> str | None:
+        from .._compiler.cute.cute_reshape import _grid_local_coord_expr
+
+        loops = state.codegen.active_device_loops.get(block_id)
+        if loops:
+            thread_axis = loops[-1].block_thread_axes.get(block_id)
+            if thread_axis is not None:
+                return _grid_local_coord_expr(state.codegen, block_id, thread_axis)
+        grid_state = state.codegen.current_grid_state
+        if grid_state is not None:
+            thread_axis = grid_state.block_thread_axes.get(block_id)
+            if thread_axis is not None:
+                return _grid_local_coord_expr(state.codegen, block_id, thread_axis)
+        return None
+
+    def tile_begin_from_block_id(block_id: int) -> str:
+        loops = state.codegen.active_device_loops.get(block_id)
+        if loops:
+            return state.codegen.offset_var(block_id)
+        global_index = active_index_var(block_id)
+        local_coord = active_local_coord(block_id)
+        if global_index is not None and local_coord is not None:
+            return state.codegen.lift(
+                expr_from_string(f"({global_index}) - ({local_coord})"),
+                dce=True,
+                prefix="tile_begin",
+            ).id
+        if global_index is not None:
+            return global_index
+        return "0"
+
+    if isinstance(idx, int):
+        return str(idx)
+    if not isinstance(idx, torch.SymInt):
+        raise exc.BackendUnsupported("cute", f"tile base index type: {type(idx)}")
+
+    expr = _symint_expr(idx)
+    if expr is not None:
+        origin_info = HostFunction.current().expr_to_origin.get(expr)
+        if origin_info is not None and isinstance(origin_info.origin, TileBeginOrigin):
+            return tile_begin_from_block_id(origin_info.origin.block_id)
+    block_id = env.get_block_id(idx)
+    if block_id is not None:
+        return tile_begin_from_block_id(block_id)
+    if expr is not None:
+        return state.sympy_expr(expr)
+    raise exc.BackendUnsupported("cute", f"unlowerable tile base index: {idx}")
+
+
+def _codegen_cute_store_tcgen05_tile(
+    state: CodegenState,
+    tensor: torch.Tensor,
+    subscript: list[object] | tuple[object, ...],
+    ast_subscript: list[object] | tuple[object, ...],
+    extra_mask: ast.AST | None,
+    value_name: str,
+) -> ast.AST | None:
+    if extra_mask is not None or tensor.ndim != 2:
+        return None
+
+    tcgen05_value = state.device_function.get_cute_tcgen05_store_value(value_name)
+    if tcgen05_value is None:
+        return None
+
+    backend = CompileEnvironment.current().backend
+    df = state.device_function
+    tensor_name = df.tensor_arg(tensor).name
+    target_dtype = backend.dtype_str(tensor.dtype)
+    base_indices = [_cute_tile_begin_expr(state, idx) for idx in subscript]
+    if len(base_indices) != 2:
+        return None
+
+    if tcgen05_value.smem_name:
+        compact_warp_count = 1 << (tcgen05_value.epi_warp_count + 1).bit_length()
+        total_threads = 32 * compact_warp_count
+        linear_tid = "cutlass.Int32(cute.arch.thread_idx()[0])"
+        if compact_warp_count > 1:
+            linear_tid = (
+                f"{linear_tid} + cutlass.Int32(cute.arch.thread_idx()[1])"
+                " * cutlass.Int32(32)"
+            )
+        m_size = _cute_tensor_dim_size_expr(state, tensor, 0)
+        n_size = _cute_tensor_dim_size_expr(state, tensor, 1)
+        numel = tcgen05_value.bm * tcgen05_value.bn
+        iters = (numel + total_threads - 1) // total_threads
+        return statement_from_string(
+            f"for _tcgen05_store_i in range({iters}):\n"
+            f"    _tcgen05_flat = {linear_tid} + cutlass.Int32(_tcgen05_store_i) * cutlass.Int32({total_threads})\n"
+            f"    if _tcgen05_flat < cutlass.Int32({numel}):\n"
+            f"        _tcgen05_row = _tcgen05_flat // cutlass.Int32({tcgen05_value.bn})\n"
+            f"        _tcgen05_col = _tcgen05_flat % cutlass.Int32({tcgen05_value.bn})\n"
+            f"        _tcgen05_m = {base_indices[0]} + _tcgen05_row\n"
+            f"        _tcgen05_n = {base_indices[1]} + _tcgen05_col\n"
+            f"        if _tcgen05_m < {m_size} and _tcgen05_n < {n_size}:\n"
+            f"            {tensor_name}.__setitem__((_tcgen05_m, _tcgen05_n), "
+            f"{backend.ast_to_dtype_expr(f'{tcgen05_value.smem_name}[(_tcgen05_row, _tcgen05_col)]', target_dtype)})"
+        )
+
+    store_thr_mma = tcgen05_value.store_thr_mma or tcgen05_value.thr_mma
+    m_size = _cute_tensor_dim_size_expr(state, tensor, 0)
+    n_size = _cute_tensor_dim_size_expr(state, tensor, 1)
+    tile_coord_m = f"({base_indices[0]}) // cutlass.Int32({tcgen05_value.bm})"
+    tile_coord_n = f"({base_indices[1]}) // cutlass.Int32({tcgen05_value.bn})"
+    full_tile = df.new_var("tcgen05_full_tile")
+
+    gmem_tile = df.new_var("tcgen05_gC")
+    coord_tile = df.new_var("tcgen05_cC")
+    tcgc_base = df.new_var("tcgen05_tCgC_base")
+    tccc_base = df.new_var("tcgen05_tCcC_base")
+    tcgc = df.new_var("tcgen05_tCgC")
+    tcgc_planned = df.new_var("tcgen05_tCgC_planned")
+    tccc = df.new_var("tcgen05_tCcC")
+    tacc = df.new_var("tcgen05_tAcc")
+    epi_tile = df.new_var("tcgen05_store_epi_tile")
+    tiled_copy_t2r = df.new_var("tcgen05_tiled_copy_t2r")
+    thr_copy_t2r = df.new_var("tcgen05_thr_copy_t2r")
+    ttr_tacc_base = df.new_var("tcgen05_tTR_tAcc_base")
+    tcgc_epi = df.new_var("tcgen05_tCgC_epi")
+    tccc_epi = df.new_var("tcgen05_tCcC_epi")
+    ttr_gc = df.new_var("tcgen05_tTR_gC")
+    ttr_cc = df.new_var("tcgen05_tTR_cC")
+    ttr_racc = df.new_var("tcgen05_tTR_rAcc")
+    ttr_rd = df.new_var("tcgen05_tTR_rD")
+    ttr_tacc_stage = df.new_var("tcgen05_tTR_tAcc_stage")
+    ttr_tacc = df.new_var("tcgen05_tTR_tAcc")
+    ttr_gc_grouped = df.new_var("tcgen05_tTR_gC_grouped")
+    ttr_cc_grouped = df.new_var("tcgen05_tTR_cC_grouped")
+    ttr_tacc_mn = df.new_var("tcgen05_tTR_tAcc_mn")
+    ttr_gc_subtile = df.new_var("tcgen05_tTR_gC_subtile")
+    ttr_cc_subtile = df.new_var("tcgen05_tTR_cC_subtile")
+    pred_c = df.new_var("tcgen05_pred_C")
+    pred_c_shape = df.new_var("tcgen05_pred_C_shape")
+    acc_vec = df.new_var("tcgen05_acc_vec")
+    kernel_desc = df.new_var("tcgen05_kernel_desc")
+    mcld = df.new_var("tcgen05_mcld")
+    num_bits = df.new_var("tcgen05_num_bits")
+    simt_atom = df.new_var("tcgen05_simt_atom")
+    subtile_count = df.new_var("tcgen05_subtile_count")
+    epi_warp_ids = ", ".join(
+        f"cutlass.Int32({i})" for i in range(tcgen05_value.epi_warp_count)
+    )
+    if tcgen05_value.epi_warp_count == 1:
+        epi_warp_ids += ","
+    store_body = [
+        "cute.arch.sync_threads()",
+        (
+            f"{kernel_desc} = type('Tcgen05KernelDesc', (), {{"
+            f"'cta_tile_shape_mnk': ({tcgen05_value.bm}, {tcgen05_value.bn}, {tcgen05_value.bk}), "
+            "'c_layout': cutlass.utils.layout.LayoutEnum.ROW_MAJOR, "
+            f"'c_dtype': {target_dtype}, "
+            "'acc_dtype': cutlass.Float32, "
+            f"'epilog_sync_bar_id': cutlass.Int32({tcgen05_value.epilog_sync_barrier_id}), "
+            f"'epilogue_warp_id': ({epi_warp_ids}), "
+            f"'num_c_stage': cutlass.Int32({tcgen05_value.c_stage_count}), "
+            f"'use_2cta_instrs': {tcgen05_value.is_two_cta!s}"
+            "})()"
+        ),
+        (
+            f"{epi_tile} = cutlass.utils.blackwell_helpers.compute_epilogue_tile_shape("
+            f"({tcgen05_value.bm}, {tcgen05_value.bn}), False, "
+            f"cutlass.utils.layout.LayoutEnum.ROW_MAJOR, {target_dtype})"
+        ),
+        (
+            f"{full_tile} = "
+            f"({base_indices[0]}) + cutlass.Int32({tcgen05_value.bm}) <= {m_size} "
+            f"and ({base_indices[1]}) + cutlass.Int32({tcgen05_value.bn}) <= {n_size}"
+        ),
+        (
+            f"{gmem_tile} = cute.local_tile("
+            f"{tensor_name}, ({tcgen05_value.bm}, {tcgen05_value.bn}), "
+            f"({tile_coord_m}, {tile_coord_n}))"
+        ),
+        f"{tcgc_base} = {store_thr_mma}.partition_C({gmem_tile})",
+        (
+            f"{tcgc} = cutlass.utils.gemm.sm100.transform_partitioned_tensor_layout("
+            f"{tcgc_base})"
+        ),
+        (
+            f"{tcgc_planned} = cute.make_tensor("
+            f"{tcgc}.iterator, "
+            f"cute.append(cute.append(cute.append({tcgc}.layout, {tcgen05_value.epilogue_rest_mode}), {tcgen05_value.epilogue_rest_mode}), {tcgen05_value.epilogue_rest_mode}))"
+        ),
+        (
+            f"{tacc} = cutlass.utils.gemm.sm100.transform_partitioned_tensor_layout("
+            f"{tcgen05_value.epi_acc_frag_base})"
+        ),
+        (
+            f"{tiled_copy_t2r}, {ttr_tacc_base}, {ttr_racc} = "
+            "cutlass.utils.gemm.sm100.epilogue_tmem_copy_and_partition("
+            f"{kernel_desc}, {tcgen05_value.epi_tidx}, {tacc}, {tcgc_planned}, {epi_tile}, {tcgen05_value.is_two_cta!s})"
+        ),
+        f"{thr_copy_t2r} = {tiled_copy_t2r}.get_slice({tcgen05_value.epi_tidx})",
+        f"{tcgc_epi} = cute.flat_divide({tcgc_planned}, {epi_tile})",
+        f"{ttr_gc} = {thr_copy_t2r}.partition_D({tcgc_epi})",
+        (
+            f"{ttr_tacc_stage} = {ttr_tacc_base}["
+            f"(None, None, None, None, None, {tcgen05_value.acc_consumer_state}.index)]"
+        ),
+        (
+            f"if {tcgen05_value.epi_active}:\n"
+            f"    {tcgen05_value.acc_pipeline}.consumer_wait({tcgen05_value.acc_consumer_state})"
+        ),
+        f"{ttr_tacc} = cute.group_modes({ttr_tacc_stage}, 3, cute.rank({ttr_tacc_stage}))",
+        f"{ttr_gc_grouped} = cute.group_modes({ttr_gc}, 3, cute.rank({ttr_gc}))",
+        (
+            f"{ttr_racc} = cute.make_rmem_tensor("
+            f"{ttr_gc_grouped}[(None, None, None, 0)].shape, cutlass.Float32)"
+        ),
+        f"{ttr_rd} = cute.make_rmem_tensor({ttr_racc}.shape, {target_dtype})",
+        (
+            f"{mcld} = cute.max_common_layout("
+            f"{ttr_rd}.layout, {ttr_gc_grouped}[(None, None, None, 0)].layout)"
+        ),
+        (
+            f"{num_bits} = min("
+            f"{ttr_gc_grouped}.iterator.alignment * 8, "
+            f"cute.size({mcld}) * {target_dtype}.width, 256)"
+        ),
+        (
+            f"{simt_atom} = cute.make_copy_atom("
+            f"cute.nvgpu.CopyUniversalOp(), {target_dtype}, "
+            f"num_bits_per_copy={num_bits}, "
+            f"l1c_evict_priority=cute.nvgpu.CacheEvictionPriority.NO_ALLOCATE)"
+        ),
+        f"{subtile_count} = cute.size({ttr_tacc}.shape, mode=[3])",
+        (
+            f"for _tcgen05_subtile in range({subtile_count}):\n"
+            f"    if {tcgen05_value.epi_active}:\n"
+            f"        {ttr_tacc_mn} = {ttr_tacc}[(None, None, None, cutlass.Int32(_tcgen05_subtile))]\n"
+            f"        {ttr_gc_subtile} = {ttr_gc_grouped}[(None, None, None, cutlass.Int32(_tcgen05_subtile))]\n"
+            f"        cute.copy({tiled_copy_t2r}, {ttr_tacc_mn}, {ttr_racc})\n"
+            f"        {acc_vec} = {ttr_racc}.load().to({target_dtype})\n"
+            f"        {ttr_rd}.store({acc_vec})\n"
+            f"        if {full_tile}:\n"
+            f"            cute.copy({simt_atom}, {ttr_rd}, {ttr_gc_subtile})\n"
+            f"        else:\n"
+            f"            {coord_tile} = cute.local_tile(cute.make_identity_tensor(({m_size}, {n_size})), ({tcgen05_value.bm}, {tcgen05_value.bn}), ({tile_coord_m}, {tile_coord_n}))\n"
+            f"            {tccc_base} = {store_thr_mma}.partition_C({coord_tile})\n"
+            f"            {tccc} = cutlass.utils.gemm.sm100.transform_partitioned_tensor_layout({tccc_base})\n"
+            f"            {tccc_epi} = cute.flat_divide({tccc}, {epi_tile})\n"
+            f"            {ttr_cc} = {thr_copy_t2r}.partition_D({tccc_epi})\n"
+            f"            {ttr_cc_grouped} = cute.group_modes({ttr_cc}, 3, cute.rank({ttr_cc}))\n"
+            f"            {ttr_cc_subtile} = {ttr_cc_grouped}[(None, None, None, cutlass.Int32(_tcgen05_subtile))]\n"
+            f"            {pred_c_shape} = (1, *{ttr_cc_subtile}.shape[1:])\n"
+            f"            {pred_c} = cute.make_rmem_tensor({pred_c_shape}, cutlass.Boolean)\n"
+            f"            for _pred_m in range({ttr_cc_subtile}.shape[1]):\n"
+            f"                for _pred_n in range({ttr_cc_subtile}.shape[2]):\n"
+            f"                    _coord = {ttr_cc_subtile}[(0, _pred_m, _pred_n)]\n"
+            f"                    {pred_c}[(0, _pred_m, _pred_n)] = cute.elem_less(_coord, ({m_size}, {n_size}))\n"
+            f"            cute.copy({simt_atom}, {ttr_rd}, {ttr_gc_subtile}, pred={pred_c})\n"
+            f"        if _tcgen05_subtile == {subtile_count} - 1:\n"
+            f"            with cute.arch.elect_one():\n"
+            f"                {tcgen05_value.acc_pipeline}.consumer_release({tcgen05_value.acc_consumer_state})\n"
+            f"            {tcgen05_value.acc_consumer_state}.advance()\n"
+        ),
+        "cute.arch.sync_threads()",
+    ]
+    if tcgen05_value.use_tma:
+        store_body.append(
+            f"if {tcgen05_value.tma_warp}:\n"
+            f"    {tcgen05_value.tma_pipeline}.producer_tail({tcgen05_value.tma_producer_state})"
+        )
+    store_body.extend(
+        [
+            (
+                f"if {tcgen05_value.exec_active}:\n"
+                f"    {tcgen05_value.tmem_alloc_barrier}.arrive()"
+            ),
+            (
+                f"if {tcgen05_value.exec_active}:\n"
+                f"    {tcgen05_value.acc_pipeline}.producer_tail({tcgen05_value.acc_producer_state})"
+            ),
+            (
+                f"{tcgen05_value.tmem_allocator} = cutlass.utils.TmemAllocator("
+                f"{tcgen05_value.tmem_holding_buf}, "
+                f"barrier_for_retrieve={tcgen05_value.tmem_alloc_barrier}, "
+                f"allocator_warp_id=0, is_two_cta={tcgen05_value.is_two_cta!s}, "
+                f"two_cta_tmem_dealloc_mbar_ptr={tcgen05_value.tmem_dealloc_mbar_ptr}, "
+                f"num_allocated_columns={tcgen05_value.acc_tmem_cols}, "
+                "dealloc_mbarrier_initialized=True)"
+            ),
+            "cute.arch.sync_threads()",
+        ]
+    )
+    store_body.extend(
+        [
+            (
+                f"if {tcgen05_value.epi_active}:\n"
+                f"    {tcgen05_value.tmem_allocator}.relinquish_alloc_permit()"
+            ),
+            (
+                f"if {tcgen05_value.epi_active}:\n"
+                f"    {tcgen05_value.tmem_alloc_barrier}.arrive_and_wait()"
+            ),
+            (
+                f"if {tcgen05_value.epi_active}:\n"
+                f"    {tcgen05_value.tmem_allocator}.free({tcgen05_value.epi_acc_tmem_ptr})"
+            ),
+        ]
+    )
+    return statement_from_string(
+        "if True:\n" + textwrap.indent("\n".join(store_body), "    ")
+    )
+
+
 def _codegen_cute_store_permute_lane_loops(
     state: CodegenState,
     tensor: torch.Tensor,
@@ -982,6 +1306,19 @@ def _(state: CodegenState) -> ast.AST:
         raise exc.BackendUnsupported("cute", f"store target type: {type(tensor)}")
 
     _log_cute_layout(state, "store")
+
+    if isinstance(value, ast.Name):
+        rewritten_stmt = _codegen_cute_store_tcgen05_tile(
+            state,
+            tensor,
+            subscript,
+            ast_subscript,
+            extra_mask,
+            value.id,
+        )
+        if rewritten_stmt is not None:
+            state.add_statement(rewritten_stmt)
+            return ast.Constant(value=None)
 
     tensor_name = state.device_function.tensor_arg(tensor).name
     backend = CompileEnvironment.current().backend
@@ -1301,6 +1638,13 @@ def _(state: CodegenState) -> object:
 
     _log_cute_layout(state, "load")
 
+    if state.device_function.suppress_cute_root_lane_loops or (
+        state.fx_node is not None
+        and state.device_function.is_cute_collective_handled_load(state.fx_node.name)
+    ):
+        zero = CompileEnvironment.current().backend.dtype_str(tensor.dtype)
+        return expr_from_string(f"{zero}(0)")
+
     packed_affine_lhs = _maybe_codegen_cute_packed_affine_lhs_load(
         state, tensor, subscript, extra_mask
     )
@@ -1357,7 +1701,7 @@ def _(
             grids = torch.meshgrid(*(indices[i] for i in tensor_idxs), indexing="ij")
             for i, grid in zip(tensor_idxs, grids, strict=False):
                 indices[i] = grid
-        # pyrefly: ignore [bad-argument-type]
+        # pyrefly: ignore [bad-argument-type, bad-index]
         return tensor[tuple(indices)]
 
     # Create zero result matching mask shape

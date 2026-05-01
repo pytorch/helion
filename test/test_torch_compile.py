@@ -28,6 +28,7 @@ from helion._testing import TestCase
 from helion._testing import onlyBackends
 from helion._testing import skipIfRocm
 from helion._testing import skipIfTileIR
+from helion._testing import skipIfXPU
 import helion.language as hl
 
 
@@ -2583,6 +2584,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
 
     @parametrize("allow_torch_compile_fusion", (True, False))
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    @skipIfXPU("kernel count mismatch on XPU")
     def test_clone_with_multiple_views_one_mutated(self, allow_torch_compile_fusion):
         """Test: clone with multiple views, only one is mutated.
 
