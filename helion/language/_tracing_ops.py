@@ -561,9 +561,11 @@ def _emit_inner_loop_offset_indices(
     strategy: object,
     block_ids: list[int],
     block_size_vars: list[str],
+    begin_exprs: list[str],
+    iter_step_exprs: list[str],
+    loop_index_exprs: list[str],
     env: CompileEnvironment,
     body_stmts: list[ast.AST],
-    offset_expr_fn: Callable[[int, str], str],
 ) -> None:
     """Emit ``offset_<bid> = …`` and ``indices_<bid> = …`` at the inner-loop
     body prologue, using the canonical names from ``strategy``.
@@ -575,9 +577,10 @@ def _emit_inner_loop_offset_indices(
     ``dce=True``, so unused emissions are pruned downstream.
 
     Args:
-        offset_expr_fn: Given ``(block_id_index, block_size_var)``, returns a
-            string expression for the absolute start of the current iteration
-            (e.g. ``"(begin) + _j * (step)"``).
+        loop_index_exprs: Per-block-id expression for the inner-loop iteration
+            index (``_pipeline_indices[i]`` for emit_pipeline; the fori_loop
+            variable like ``_j`` for fori_loop).  Combined with ``begin_exprs``
+            and ``iter_step_exprs`` to form the absolute start of the tile.
     """
     for i, bid in enumerate(block_ids):
         offset_name = strategy.offset_var(bid)  # type: ignore[attr-defined]
@@ -588,7 +591,8 @@ def _emit_inner_loop_offset_indices(
         body_stmts.extend(
             [
                 statement_from_string(
-                    f"{offset_name} = {offset_expr_fn(i, block_size_vars[i])}"
+                    f"{offset_name} = ({begin_exprs[i]}) + "
+                    f"({loop_index_exprs[i]}) * ({iter_step_exprs[i]})"
                 ),
                 statement_from_string(f"{index_name} = {idx_expr}"),
             ]
@@ -1482,11 +1486,11 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
         strategy,
         block_ids,
         block_size_vars,
+        begin_exprs,
+        iter_step_exprs,
+        [f"_pipeline_indices[{i}]" for i in range(len(block_ids))],
         env,
         body_stmts,
-        offset_expr_fn=lambda i, bs: (
-            f"({begin_exprs[i]}) + _pipeline_indices[{i}] * ({iter_step_exprs[i]})"
-        ),
     )
     # Set up mask variables for inner-loop block_ids (non-divisible bounds).
     _setup_inner_loop_masks(
@@ -1771,11 +1775,11 @@ def _codegen_fori_loop(state: CodegenState) -> object:
         strategy,
         block_ids,
         block_size_vars,
+        begin_exprs,
+        iter_step_exprs,
+        dim_idx_exprs,
         env,
         body_stmts,
-        offset_expr_fn=lambda i, bs: (
-            f"({begin_exprs[i]}) + ({dim_idx_exprs[i]}) * ({iter_step_exprs[i]})"
-        ),
     )
     # Set up mask variables for inner-loop block_ids (non-divisible bounds).
     _setup_inner_loop_masks(
