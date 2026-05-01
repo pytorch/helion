@@ -62,7 +62,9 @@ def _exp_shapes() -> list[tuple[str, tuple[Any, ...]]]:
 
 def _add_shapes() -> list[tuple[str, tuple[Any, ...]]]:
     # First entry matches examples/add.py main() (1024x1024).
-    sizes = [(1024, 1024), (2048, 2048), (512, 512), (256, 256), (128, 128)]
+    # 1st = canonical small (matches main()); 2nd = very large (escape the
+    # ~180 µs torch_tpu sync overhead floor and exercise memory-bandwidth).
+    sizes = [(1024, 1024), (16384, 16384), (2048, 2048), (512, 512), (128, 128)]
     return [
         (
             f"[{m},{n}]",
@@ -76,7 +78,8 @@ def _add_shapes() -> list[tuple[str, tuple[Any, ...]]]:
 
 
 def _softmax_shapes() -> list[tuple[str, tuple[Any, ...]]]:
-    shapes = [(1024, 256), (1024, 512), (1024, 1024), (1024, 2048), (1024, 4096)]
+    # 1st small/canonical; 2nd very large to be memory-bound.
+    shapes = [(1024, 256), (8192, 8192), (1024, 512), (1024, 2048), (1024, 4096)]
     return [
         (
             f"[{m},{n}]",
@@ -87,10 +90,10 @@ def _softmax_shapes() -> list[tuple[str, tuple[Any, ...]]]:
 
 
 def _welford_shapes() -> list[tuple[str, tuple[Any, ...]]]:
-    # welford's autotune is expensive (~22 min/shape at full effort), so the
-    # 2nd shape is *smaller* than the 1st (half the rows) to keep the
-    # kernel under the 30-min per-kernel timeout when --num-shapes 2.
-    configs = [(262144, 1024), (131072, 1024), (262144, 1536), (262144, 2048)]
+    # 1st canonical; 2nd much larger (4x the bytes per row). welford's
+    # autotune is expensive (~10-25 min/shape) so the bumped 60-min
+    # per-kernel timeout is what makes the 2nd shape feasible.
+    configs = [(262144, 1024), (524288, 4096), (262144, 1536), (262144, 2048)]
     return [
         (
             f"[{s},{d}]",
@@ -115,14 +118,15 @@ def _welford_baseline(
 def _attention_shapes() -> list[tuple[str, tuple[Any, ...]]]:
     # First entry matches examples/attention.py main() so --num-shapes 1 gives
     # the canonical example config.
-    # First entry mirrors examples/attention.py main(); second is ~2x larger
-    # along seq_len so the bench shows scaling behavior.
+    # First entry mirrors examples/attention.py main(); second is the
+    # reviewer's flagship shape — much larger seq_len + head_dim so the
+    # bench exercises real LM-scale attention.
     configs = [
         (2, 32, 1024, 64),
+        (8, 32, 8192, 128),
         (2, 32, 2048, 64),
         (1, 4, 512, 64),
         (1, 4, 1024, 64),
-        (2, 8, 512, 64),
     ]
     return [
         (
@@ -139,7 +143,7 @@ def _attention_shapes() -> list[tuple[str, tuple[Any, ...]]]:
 def _bmm_shapes() -> list[tuple[str, tuple[Any, ...]]]:
     configs = [
         (16, 512, 768, 1024),
-        (32, 512, 768, 1024),
+        (64, 2048, 2048, 2048),
         (8, 256, 512, 256),
         (4, 1024, 512, 512),
     ]
@@ -157,7 +161,7 @@ def _bmm_shapes() -> list[tuple[str, tuple[Any, ...]]]:
 
 def _matmul_shapes() -> list[tuple[str, tuple[Any, ...]]]:
     # First entry matches examples/matmul.py main()'s check(1024, 1024, 1024).
-    configs = [(1024, 1024, 1024), (2048, 1024, 1024), (1024, 2048, 2048)]
+    configs = [(1024, 1024, 1024), (8192, 8192, 8192), (1024, 2048, 2048)]
     return [
         (
             f"[{m},{k},{n}]",
@@ -188,7 +192,7 @@ def _matmul_layernorm_baseline(
 def _matmul_layernorm_shapes() -> list[tuple[str, tuple[Any, ...]]]:
     # Use larger, regular shapes than examples/matmul_layernorm.py main()
     # (which uses small/odd n=200,400 to dodge an unrelated power-of-2 bug).
-    configs = [(1024, 1024, 1024), (2048, 1024, 1024)]
+    configs = [(1024, 1024, 1024), (4096, 4096, 4096)]
     return [
         (
             f"[{m},{k},{n}]",
@@ -206,7 +210,7 @@ def _matmul_layernorm_shapes() -> list[tuple[str, tuple[Any, ...]]]:
 def _broadcast_matmul_shapes() -> list[tuple[str, tuple[Any, ...]]]:
     configs = [
         (16, 512, 768, 1024),
-        (32, 512, 768, 1024),
+        (64, 2048, 2048, 2048),
         (8, 256, 512, 256),
         (4, 1024, 512, 512),
     ]
@@ -224,7 +228,13 @@ def _broadcast_matmul_shapes() -> list[tuple[str, tuple[Any, ...]]]:
 
 def _geglu_shapes() -> list[tuple[str, tuple[Any, ...]]]:
     # First entry matches examples/geglu.py main()'s first kernel_test_shape.
-    shapes = [(8, 2048, 4096), (8, 4096, 8192), (4096, 2048), (2048, 1024), (1024, 512)]
+    shapes = [
+        (8, 2048, 4096),
+        (16, 8192, 8192),
+        (4096, 2048),
+        (2048, 1024),
+        (1024, 512),
+    ]
     return [
         (
             "[" + ",".join(str(d) for d in s) + "]",
@@ -243,7 +253,13 @@ def _geglu_baseline(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
 
 def _swiglu_shapes() -> list[tuple[str, tuple[Any, ...]]]:
     # First entry matches examples/swiglu.py main()'s first kernel_test_shape.
-    shapes = [(4, 8192, 4096), (8, 8192, 4096), (4096, 2048), (2048, 1024), (1024, 512)]
+    shapes = [
+        (4, 8192, 4096),
+        (16, 16384, 4096),
+        (8, 8192, 4096),
+        (4096, 2048),
+        (1024, 512),
+    ]
     return [
         (
             "[" + ",".join(str(d) for d in s) + "]",
@@ -258,7 +274,7 @@ def _swiglu_shapes() -> list[tuple[str, tuple[Any, ...]]]:
 
 def _low_mem_dropout_shapes() -> list[tuple[str, tuple[Any, ...]]]:
     # First entry matches examples/low_mem_dropout.py main()'s first check call.
-    sizes = [8192, 32768, 262144, 65536, 16384, 4096]
+    sizes = [8192, 33554432, 32768, 262144, 65536, 16384, 4096]
     return [
         (
             f"[{n}]",
@@ -324,7 +340,7 @@ def _embedding_shapes() -> list[tuple[str, tuple[Any, ...]]]:
 
 
 def _batch_softmax_shapes() -> list[tuple[str, tuple[Any, ...]]]:
-    configs = [(16, 512, 1024), (32, 512, 1024), (8, 256, 2048), (4, 1024, 512)]
+    configs = [(16, 512, 1024), (64, 2048, 4096), (32, 512, 1024), (4, 1024, 512)]
     return [
         (
             f"[{b},{m},{n}]",
@@ -335,7 +351,7 @@ def _batch_softmax_shapes() -> list[tuple[str, tuple[Any, ...]]]:
 
 
 def _rms_norm_shapes() -> list[tuple[str, tuple[Any, ...]]]:
-    configs = [(2048, 4096), (2048, 8192), (4096, 4096)]
+    configs = [(2048, 4096), (8192, 16384), (2048, 8192), (4096, 4096)]
     return [
         (
             f"[{m},{n}]",
@@ -356,7 +372,7 @@ def _rms_norm_baseline(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
 
 def _layer_norm_shapes() -> list[tuple[str, tuple[Any, ...]]]:
     # First entry matches examples/layer_norm.py main() (4096, 10240).
-    configs = [(4096, 10240), (8192, 10240), (2048, 4096), (2048, 8192), (4096, 4096)]
+    configs = [(4096, 10240), (16384, 16384), (2048, 4096), (2048, 8192), (4096, 4096)]
     return [
         (
             f"[{m},{n}]",
@@ -375,7 +391,9 @@ def _layer_norm_shapes() -> list[tuple[str, tuple[Any, ...]]]:
 def _softmax_shapes_basic() -> list[tuple[str, tuple[Any, ...]]]:
     # The kernel specializes on the trailing dim, so changing it across the
     # 2nd shape produces a shape-mismatch failure. Scale M instead for the 2nd.
-    shapes = [(4096, 2560), (8192, 2560), (2048, 4096), (1024, 8192)]
+    # Kernel specializes on the trailing dim, so keep N=2560 across shapes.
+    # Scale M to grow memory traffic for the 2nd shape.
+    shapes = [(4096, 2560), (65536, 2560), (8192, 2560), (1024, 8192)]
     return [
         (
             f"[{m},{n}]",
@@ -388,7 +406,7 @@ def _softmax_shapes_basic() -> list[tuple[str, tuple[Any, ...]]]:
 def _sum_shapes() -> list[tuple[str, tuple[Any, ...]]]:
     # First entry matches examples/sum.py main() so --num-shapes 1 gives the
     # canonical example config (fp32).
-    shapes = [(5120, 2560), (10240, 10240), (2048, 8192)]
+    shapes = [(5120, 2560), (16384, 16384), (2048, 8192)]
     return [
         (
             f"[{m},{n}]",
@@ -401,7 +419,7 @@ def _sum_shapes() -> list[tuple[str, tuple[Any, ...]]]:
 def _long_sum_shapes() -> list[tuple[str, tuple[Any, ...]]]:
     # Long reduction dim: 131072 = 4x the 32768 block size used by the
     # looped variants, so they actually loop.
-    shapes = [(4, 131072), (8, 131072)]
+    shapes = [(4, 131072), (64, 524288)]
     return [
         (
             f"[{m},{n}]",
