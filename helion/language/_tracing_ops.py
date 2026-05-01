@@ -556,6 +556,49 @@ def _read_final_loop_state(
     return final_results
 
 
+def _emit_inner_loop_offset_indices(
+    state: CodegenState,
+    strategy: object,
+    block_ids: list[int],
+    block_size_vars: list[str],
+    begin_exprs: list[str],
+    iter_step_exprs: list[str],
+    loop_index_exprs: list[str],
+    env: CompileEnvironment,
+    body_stmts: list[ast.AST],
+) -> None:
+    """Emit ``offset_<bid> = …`` and ``indices_<bid> = …`` at the inner-loop
+    body prologue, using the canonical names from ``strategy``.
+
+    Used by ``_codegen_emit_pipeline`` and ``_codegen_fori_loop`` so kernel
+    code that references ``tile.index`` (lowered to ``indices_<bid>``) or
+    ``pl.ds`` offsets (``offset_<bid>``) sees defined symbols regardless of
+    whether the inner block is divisible.  Both vars are allocated
+    ``dce=True``, so unused emissions are pruned downstream.
+
+    Args:
+        loop_index_exprs: Per-block-id expression for the inner-loop iteration
+            index (``_pipeline_indices[i]`` for emit_pipeline; the fori_loop
+            variable like ``_j`` for fori_loop).  Combined with ``begin_exprs``
+            and ``iter_step_exprs`` to form the absolute start of the tile.
+    """
+    for i, bid in enumerate(block_ids):
+        offset_name = strategy.offset_var(bid)  # type: ignore[attr-defined]
+        index_name = strategy.index_var(bid)  # type: ignore[attr-defined]
+        idx_expr = env.backend.loop_index_expr(
+            offset_name, block_size_vars[i], env.index_type(), axis=0
+        )
+        body_stmts.extend(
+            [
+                statement_from_string(
+                    f"{offset_name} = ({begin_exprs[i]}) + "
+                    f"({loop_index_exprs[i]}) * ({iter_step_exprs[i]})"
+                ),
+                statement_from_string(f"{index_name} = {idx_expr}"),
+            ]
+        )
+
+
 def _setup_inner_loop_masks(
     state: CodegenState,
     strategy: object,
@@ -1437,8 +1480,20 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
         )
 
     strategy = _find_strategy(state, block_ids)
-    # Set up mask variables for inner-loop block_ids.
-    _needs_explicit_indices = _setup_inner_loop_masks(
+    # Emit offset_<bid>/indices_<bid> at the body prologue.
+    _emit_inner_loop_offset_indices(
+        state,
+        strategy,
+        block_ids,
+        block_size_vars,
+        begin_exprs,
+        iter_step_exprs,
+        [f"_pipeline_indices[{i}]" for i in range(len(block_ids))],
+        env,
+        body_stmts,
+    )
+    # Set up mask variables for inner-loop block_ids (non-divisible bounds).
+    _setup_inner_loop_masks(
         state,
         strategy,
         block_ids,
@@ -1487,11 +1542,9 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
             _write_back_loop_carried(state, scratch_names, carried, graph_results)
 
     all_body_params = body_params
-    if _needs_explicit_indices:
-        # emit_pipeline passes indices as a single tuple argument
-        fn_args = "_pipeline_indices, " + ", ".join(all_body_params)
-    else:
-        fn_args = ", ".join(all_body_params)
+    # emit_pipeline passes indices as a single tuple argument; the prologue
+    # always references _pipeline_indices, so the body always takes it.
+    fn_args = "_pipeline_indices, " + ", ".join(all_body_params)
     fn_def = statement_from_string(f"def {body_fn_name}({fn_args}): pass")
     assert isinstance(fn_def, ast.FunctionDef)
     fn_def.body = body_stmts or [ast.Pass()]  # pyrefly: ignore[bad-assignment]
@@ -1506,8 +1559,7 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
         spec_parts.append(f"in_specs=[{in_specs_str}]")
     if out_specs:
         spec_parts.append(f"out_specs=[{out_specs_str}]")
-    if _needs_explicit_indices:
-        spec_parts.append("_explicit_indices=True")
+    spec_parts.append("_explicit_indices=True")
     specs_str = ", ".join(spec_parts)
 
     all_pipeline_args = pipeline_in_args + pipeline_out_args
@@ -1717,7 +1769,19 @@ def _codegen_fori_loop(state: CodegenState) -> object:
             end_expr=env.block_sizes[block_id].numel,
         )
 
-    # Set up mask variables for inner-loop block_ids
+    # Emit offset_<bid>/indices_<bid> at the body prologue.
+    _emit_inner_loop_offset_indices(
+        state,
+        strategy,
+        block_ids,
+        block_size_vars,
+        begin_exprs,
+        iter_step_exprs,
+        dim_idx_exprs,
+        env,
+        body_stmts,
+    )
+    # Set up mask variables for inner-loop block_ids (non-divisible bounds).
     _setup_inner_loop_masks(
         state,
         strategy,
@@ -1810,15 +1874,6 @@ def _codegen_fori_loop(state: CodegenState) -> object:
                     statement_from_string(f"{copy_var}.start()")
                 )
                 state.codegen.add_statement(statement_from_string(f"{copy_var}.wait()"))
-        else:
-            # No DMA: emit offset assignments so pl.ds() indexing works
-            for i, bid in enumerate(block_ids):
-                offset_name = strategy.offset_var(bid)
-                state.codegen.add_statement(
-                    statement_from_string(
-                        f"{offset_name} = ({begin_exprs[i]}) + ({dim_idx_exprs[i]}) * ({iter_step_exprs[i]})"
-                    )
-                )
 
         # Codegen the user's body (loads/stores remapped via _tensor_to_vmem
         # when using DMA, or accessing HBM refs directly when not)
