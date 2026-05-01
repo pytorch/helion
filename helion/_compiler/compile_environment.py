@@ -191,7 +191,7 @@ class CompileEnvironment:
                 max_num_blocks_for_symm_mem() // num_sms,
                 self.config_spec.max_num_sm_multiplier,
             )
-            newmax = max(1, 1 << (raw_max.bit_length() - 1))
+            newmax = 1 << (raw_max.bit_length() - 1) if raw_max > 0 else 1
             if newmax < self.config_spec.max_num_sm_multiplier:
                 warnings.warn(
                     f"max_num_sm_multipler is reduced from {self.config_spec.max_num_sm_multiplier} to {newmax} due to the restriction of _SymmetricMemory.signal_pad_size={_SymmetricMemory.signal_pad_size}. Increase the signal pad size to allow autotuner to choose among all possible values in the range.",
