@@ -72,7 +72,8 @@ def attention(
         q = q_view[tile_b, tile_m, :] * qk_scale
         for tile_n in hl.tile(v_view.size(1)):
             k = k_view[tile_b, :, tile_n]
-            qk = torch.bmm(q, k)
+            # Keep scores in fp32 to match SDPA tolerances on bf16/fp16 inputs.
+            qk = hl.dot(q, k, out_dtype=torch.float32)
             m_ij = torch.maximum(m_i, torch.amax(qk, -1))
             qk = qk - m_ij[:, :, None]
             p = torch.exp2(qk)
