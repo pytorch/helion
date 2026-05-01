@@ -1849,7 +1849,6 @@ def main() -> None:
     results: list[RunResult] = []
 
     if args.measure_compile_time:
-        os.environ["HELION_MEASURE_COMPILE_TIME"] = "1"
         enable_compile_time()
 
     collected_metrics: list[AutotuneMetrics] = []
