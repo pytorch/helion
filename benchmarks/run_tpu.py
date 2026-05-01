@@ -121,9 +121,12 @@ def _attention_shapes() -> list[tuple[str, tuple[Any, ...]]]:
     # First entry mirrors examples/attention.py main(); second is the
     # reviewer's flagship shape — much larger seq_len + head_dim so the
     # bench exercises real LM-scale attention.
+    # 2nd shape: 16x the work of the 1st. (8,32,8192,128) was tried but
+    # the autotuner's default config OOMs at that scale before the search
+    # can compute its baseline.
     configs = [
         (2, 32, 1024, 64),
-        (8, 32, 8192, 128),
+        (4, 32, 4096, 128),
         (2, 32, 2048, 64),
         (1, 4, 512, 64),
         (1, 4, 1024, 64),
@@ -192,7 +195,9 @@ def _matmul_layernorm_baseline(
 def _matmul_layernorm_shapes() -> list[tuple[str, tuple[Any, ...]]]:
     # Use larger, regular shapes than examples/matmul_layernorm.py main()
     # (which uses small/odd n=200,400 to dodge an unrelated power-of-2 bug).
-    configs = [(1024, 1024, 1024), (4096, 4096, 4096)]
+    # (4096,4096,4096) hit "Default config failed while computing baseline"
+    # — autotuner default OOMs before search starts.
+    configs = [(1024, 1024, 1024), (2048, 2048, 2048)]
     return [
         (
             f"[{m},{k},{n}]",
@@ -351,7 +356,9 @@ def _batch_softmax_shapes() -> list[tuple[str, tuple[Any, ...]]]:
 
 
 def _rms_norm_shapes() -> list[tuple[str, tuple[Any, ...]]]:
-    configs = [(2048, 4096), (8192, 16384), (2048, 8192), (4096, 4096)]
+    # (8192,16384) hit "No working config found" — search space exhausted at
+    # 16384 trailing dim. Step back to (8192,8192).
+    configs = [(2048, 4096), (8192, 8192), (2048, 8192), (4096, 4096)]
     return [
         (
             f"[{m},{n}]",
@@ -419,7 +426,9 @@ def _sum_shapes() -> list[tuple[str, tuple[Any, ...]]]:
 def _long_sum_shapes() -> list[tuple[str, tuple[Any, ...]]]:
     # Long reduction dim: 131072 = 4x the 32768 block size used by the
     # looped variants, so they actually loop.
-    shapes = [(4, 131072), (64, 524288)]
+    # (64, 524288) fp32 is 128 MB just for the input — VMEM OOM (cap is 64 MB).
+    # Keep the reduction dim 524288 to test long reductions, but smaller batch.
+    shapes = [(4, 131072), (8, 524288)]
     return [
         (
             f"[{m},{n}]",
