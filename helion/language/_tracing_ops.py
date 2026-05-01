@@ -1477,7 +1477,6 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
 
     strategy = _find_strategy(state, block_ids)
     # Emit offset_<bid>/indices_<bid> at the body prologue.
-    _needs_explicit_indices = True
     _emit_inner_loop_offset_indices(
         state,
         strategy,
@@ -1539,11 +1538,9 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
             _write_back_loop_carried(state, scratch_names, carried, graph_results)
 
     all_body_params = body_params
-    if _needs_explicit_indices:
-        # emit_pipeline passes indices as a single tuple argument
-        fn_args = "_pipeline_indices, " + ", ".join(all_body_params)
-    else:
-        fn_args = ", ".join(all_body_params)
+    # emit_pipeline passes indices as a single tuple argument; the prologue
+    # always references _pipeline_indices, so the body always takes it.
+    fn_args = "_pipeline_indices, " + ", ".join(all_body_params)
     fn_def = statement_from_string(f"def {body_fn_name}({fn_args}): pass")
     assert isinstance(fn_def, ast.FunctionDef)
     fn_def.body = body_stmts or [ast.Pass()]  # pyrefly: ignore[bad-assignment]
@@ -1558,8 +1555,7 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
         spec_parts.append(f"in_specs=[{in_specs_str}]")
     if out_specs:
         spec_parts.append(f"out_specs=[{out_specs_str}]")
-    if _needs_explicit_indices:
-        spec_parts.append("_explicit_indices=True")
+    spec_parts.append("_explicit_indices=True")
     specs_str = ", ".join(spec_parts)
 
     all_pipeline_args = pipeline_in_args + pipeline_out_args
