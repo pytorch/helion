@@ -10,7 +10,12 @@ from typing import cast
 import uuid
 
 IndexingLiteral = Literal["pointer", "tensor_descriptor", "block_ptr"]
-PidTypeLiteral = Literal["flat", "xyz", "persistent_blocked", "persistent_interleaved"]
+PidTypeLiteral = Literal[
+    "flat",
+    "xyz",
+    "persistent_blocked",
+    "persistent_interleaved",
+]
 EvictionPolicyLiteral = Literal["", "first", "last"]
 NumSmMultiplierLiteral = Literal[1, 2, 4, 8]
 MaxnregLiteral = Literal[32, 64, 128, 256] | None

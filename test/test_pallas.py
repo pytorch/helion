@@ -295,12 +295,12 @@ def pallas_attention(
         m_i = hl.full([tile_b, tile_m], float("-inf"), dtype=torch.float32)
         l_i = torch.full_like(m_i, 1.0)
         acc = hl.zeros([tile_b, tile_m, head_dim], dtype=torch.float32)
-        q = q_view[tile_b, tile_m, :]
+        q = q_view[tile_b, tile_m, :] * qk_scale
         for tile_n in hl.tile(v_view.size(1)):
             k = k_view[tile_b, :, tile_n]
             qk = torch.bmm(q, k)
-            m_ij = torch.maximum(m_i, torch.amax(qk, -1) * qk_scale)
-            qk = qk * qk_scale - m_ij[:, :, None]
+            m_ij = torch.maximum(m_i, torch.amax(qk, -1))
+            qk = qk - m_ij[:, :, None]
             p = torch.exp2(qk)
             l_ij = torch.sum(p, -1)
             alpha = torch.exp2(m_i - m_ij)
@@ -310,7 +310,6 @@ def pallas_attention(
             p = p.to(v.dtype)
             acc = torch.baddbmm(acc, p, v)
             m_i = m_ij
-        m_i += torch.log2(l_i)
         acc = acc / l_i[:, :, None]
         out[tile_b, tile_m, :] = acc.to(out.dtype)
     return out.view(q_in.size())
@@ -821,14 +820,19 @@ class TestPallas(TestCase):
                 pallas_loop_type="pipeline",
             )
 
-    def test_attention_default_fp32(self) -> None:
-        """Test attention with default (for-loop) inner loop."""
+    def test_attention_unroll_fp32(self) -> None:
+        """Test attention with unroll (for-loop) inner loop."""
         query = torch.randn(1, 4, 32, 64, dtype=torch.float32, device=DEVICE)
         key = torch.randn(1, 4, 32, 64, dtype=torch.float32, device=DEVICE)
         val = torch.randn(1, 4, 32, 64, dtype=torch.float32, device=DEVICE)
         args = (query, key, val)
 
-        _code, result = code_and_output(pallas_attention, args, block_sizes=[1, 32, 32])
+        _code, result = code_and_output(
+            pallas_attention,
+            args,
+            block_sizes=[1, 32, 32],
+            pallas_loop_type="unroll",
+        )
         ref = torch.nn.functional.scaled_dot_product_attention(
             query.float().cpu(), key.float().cpu(), val.float().cpu()
         ).to(device=DEVICE)
@@ -1368,8 +1372,8 @@ class TestPallas(TestCase):
         self.assertGreaterEqual(code.count("jax.lax.fori_loop"), 2)
         torch.testing.assert_close(result, args[0] + args[1])
 
-    def test_default_loop_multidim_non_divisible(self) -> None:
-        """Default loop with 2D inner loop where both dims are non-divisible.
+    def test_unroll_loop_multidim_non_divisible(self) -> None:
+        """Unroll loop with 2D inner loop where both dims are non-divisible.
 
         Regression test: when an output tensor is padded on multiple dims,
         _pallas_apply_ds_padding must save the original tensor reference
@@ -1384,6 +1388,7 @@ class TestPallas(TestCase):
             pallas_add_3d,
             args,
             block_sizes=[1, 8, 128],
+            pallas_loop_type="unroll",
         )
         torch.testing.assert_close(result, args[0] + args[1])
 
@@ -1968,19 +1973,15 @@ class TestPallasIndirectGather(TestCase):
         with self.assertRaisesRegex(Exception, "exceeds the .* VMEM threshold"):
             code_and_output(gather, (indices, table), block_sizes=[128, 64])
 
-    @xfailIfPallas(
-        "VMEM budget check uses full tensor.numel() instead of per-dim block sizes"
-    )
     def test_gather_vmem_budget_uses_block_size(self) -> None:
-        """xfail: tiling broadcast dims should shrink the VMEM block.
+        """Tiling broadcast dims shrinks the VMEM block.
 
-        The check today uses full ``tensor.numel()``, so configs that would
-        actually fit in VMEM after tiling are rejected. Will pass once the
-        VMEM accounting accounts for per-dim block sizes (TODO in gather.py).
+        Full table is over the threshold but the resident block after tiling
+        the broadcast dim fits, so the check must pass.
         """
         gather = self._gather_2d_kernel()
         # Full table = 8192 * 1024 * 4 = 32 MiB (over the 16 MiB limit).
-        # Real VMEM block with BE=256 = 8192 * 256 * 4 = 8 MiB, fits.
+        # Resident VMEM block with BE=256 = 8192 * 256 * 4 = 8 MiB, fits.
         table = torch.randn(8192, 1024, device=DEVICE, dtype=torch.float32)
         indices = torch.randint(0, 8192, (256,), device=DEVICE, dtype=torch.int32)
         code_and_output(gather, (indices, table), block_sizes=[128, 256])

@@ -369,6 +369,38 @@ class PersistentReductionStrategy(ReductionStrategy):
             self._thread_count = next_power_of_2(min(size_hint, max_threads))
         else:
             self._thread_count = 0
+        # On cute, the launch block dim is capped at MAX_THREADS_PER_BLOCK.
+        # If the existing tile strategies already claim that budget, the
+        # reduction's Y/Z axis silently collapses to 1, producing kernels
+        # whose ``thread_idx[axis] + synthetic_lane * thread_count`` indexing
+        # only covers ``padded_size // thread_count`` of the reduction extent.
+        # Shrink ``_thread_count`` here so the full extent stays addressable
+        # via the synthetic lane loop.
+        # Tile strategies are added before reduction strategies, so they are
+        # already on the dispatcher by the time we get here.
+        tile_dispatch = getattr(fn, "tile_strategy", None)
+        if (
+            env.backend.name == "cute"
+            and self._thread_count > 1
+            and tile_dispatch is not None
+        ):
+            from .cute.thread_budget import MAX_THREADS_PER_BLOCK
+
+            other_threads = 1
+            for strategy in tile_dispatch.strategies:
+                if isinstance(strategy, ReductionStrategy):
+                    count = strategy._reduction_thread_count()
+                    if count > 0:
+                        other_threads *= count
+                else:
+                    for size in strategy.thread_block_sizes():
+                        if size > 1:
+                            other_threads *= size
+            while (
+                other_threads * self._thread_count > MAX_THREADS_PER_BLOCK
+                and self._thread_count > 1
+            ):
+                self._thread_count //= 2
         self._synthetic_cute_lane_var: str | None = None
         self._synthetic_cute_lane_extent = 1
         is_graph_reduction_dim = any(

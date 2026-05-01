@@ -28,7 +28,7 @@ from helion.experimental.aot_kernel import extract_shape_features
 from helion.runtime.config import Config
 
 
-@onlyBackends(["triton"])
+@onlyBackends(["triton", "cute"])
 class TestShapeKey:
     """Tests for ShapeKey class."""
 
@@ -52,7 +52,7 @@ class TestShapeKey:
         assert key1.stable_hash() != key3.stable_hash()
 
 
-@onlyBackends(["triton"])
+@onlyBackends(["triton", "cute"])
 class TestSerializeTuple:
     """Tests for tuple serialization."""
 
@@ -69,7 +69,7 @@ class TestSerializeTuple:
         assert deserialized == t
 
 
-@onlyBackends(["triton"])
+@onlyBackends(["triton", "cute"])
 class TestConfigSubsetSelection:
     """Tests for config subset selection algorithm."""
 
@@ -118,7 +118,7 @@ class TestConfigSubsetSelection:
         assert len(selected) == 2
 
 
-@onlyBackends(["triton"])
+@onlyBackends(["triton", "cute"])
 class TestGetAOTMode:
     """Tests for get_aot_mode."""
 
@@ -141,7 +141,7 @@ class TestGetAOTMode:
             get_aot_mode()
 
 
-@onlyBackends(["triton"])
+@onlyBackends(["triton", "cute"])
 class TestBatchedParameter:
     """Tests for the batched parameter in aot_kernel."""
 
@@ -240,7 +240,7 @@ class TestBatchedParameter:
         assert features_with_batched == features_without_batched
 
 
-@onlyBackends(["triton"])
+@onlyBackends(["triton", "cute"])
 class TestConfigValidityPartitioning:
     """Tests for config validity partitioning in select_config_subset."""
 

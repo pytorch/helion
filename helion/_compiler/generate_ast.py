@@ -25,6 +25,7 @@ from .ast_read_writes import dead_assignment_elimination
 from .ast_read_writes import dead_expression_elimination
 from .ast_read_writes import definitely_does_not_have_side_effects
 from .compile_environment import CompileEnvironment
+from .device_function import ConstExprArg
 from .device_function import DeviceFunction
 from .helper_function import CodegenInterface
 from .inductor_lowering import CodegenState
@@ -75,6 +76,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         self.codegen_graphs = func.device_ir.build_codegen_graphs(config)
         self.host_statements: list[ast.AST] = []
         self.module_statements: list[ast.stmt] = []
+        self.cute_wrapper_plans: list[dict[str, object]] = []
         self.statements_stack: list[list[ast.AST]] = [self.host_statements]
         self.on_device = False
         self.active_device_loops: dict[int, list[DeviceLoopOrGridState]] = (
@@ -498,9 +500,13 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                         with self.set_statements(wrapped_body):
                             codegen_call_with_graph(self, root, [])
                         self.statements_stack[-1].extend(grid_state.outer_prefix)
-                        self.statements_stack[-1].extend(
-                            grid_state.wrap_body(wrapped_body)
-                        )
+                        if self.device_function.suppress_cute_root_lane_loops:
+                            self.statements_stack[-1].extend(wrapped_body)
+                            self.device_function.suppress_cute_root_lane_loops = False
+                        else:
+                            self.statements_stack[-1].extend(
+                                grid_state.wrap_body(wrapped_body)
+                            )
                         self.statements_stack[-1].extend(grid_state.outer_suffix)
                     else:
                         codegen_call_with_graph(self, root, [])
@@ -763,6 +769,40 @@ def generate_ast(
                 else []
             )
             final_host_statements = rng_statements + codegen.host_statements
+            if codegen.cute_wrapper_plans:
+                launcher_arg_positions: dict[str, int] = {}
+                for idx, arg in enumerate(
+                    [
+                        arg
+                        for arg in codegen.device_function.sorted_args()
+                        if not (
+                            isinstance(arg, ConstExprArg) and arg.host_str() != arg.name
+                        )
+                    ]
+                ):
+                    launcher_arg_positions[arg.name] = idx
+                resolved_wrapper_plans: list[dict[str, object]] = []
+                for plan in codegen.cute_wrapper_plans:
+                    resolved = dict(plan)
+                    for key in ("lhs_name", "rhs_name", "c_name"):
+                        if key in resolved:
+                            resolved[key[:-5] + "_idx"] = launcher_arg_positions[
+                                str(resolved.pop(key))
+                            ]
+                    resolved_wrapper_plans.append(resolved)
+                final_host_statements = [
+                    statement_from_string(
+                        f"{codegen.device_function.name}._helion_cute_wrapper_plans = {resolved_wrapper_plans!r}"
+                    ),
+                    *final_host_statements,
+                ]
+            if codegen.device_function.cute_cluster_shape is not None:
+                final_host_statements = [
+                    statement_from_string(
+                        f"{codegen.device_function.name}._helion_cute_cluster_shape = {codegen.device_function.cute_cluster_shape!r}"
+                    ),
+                    *final_host_statements,
+                ]
 
             # Assert sourceless prologue params were actually removed by DCE
             if codegen.device_function.sourceless_prologue_params:

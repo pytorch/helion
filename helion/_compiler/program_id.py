@@ -5,6 +5,7 @@ import ast
 import dataclasses
 from typing import TYPE_CHECKING
 from typing import NamedTuple
+from typing import cast
 
 import torch
 
@@ -29,6 +30,7 @@ def typed_program_id(dim: int = 0) -> str:
 if TYPE_CHECKING:
     import sympy
 
+    from .device_function import CuteTcgen05MatmulPlan
     from .inductor_lowering import CodegenState
 
 NUM_SM_VAR = "_NUM_SM"
@@ -53,6 +55,10 @@ class PIDInfo(NamedTuple):
             numel_str = context.sympy_expr(self.numel)
         if self.block_size_var == "1":
             return numel_str
+        if not is_device:
+            # Grid dimensions are always non-negative, so we can use integer
+            # arithmetic directly instead of a function call like triton.cdiv.
+            return f"(({numel_str}) + ({self.block_size_var}) - 1) // ({self.block_size_var})"
         return CompileEnvironment.current().backend.cdiv_expr(
             numel_str, self.block_size_var, is_device=is_device
         )
@@ -748,3 +754,395 @@ class PersistentInterleavedProgramIDs(PersistentProgramIDs):
 
     def __init__(self) -> None:
         super().__init__(is_blocked=False)
+
+
+class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
+    """tcgen05 persistent scheduler for blocked and interleaved PID orders."""
+
+    def __init__(self, *, is_blocked: bool) -> None:
+        super().__init__(is_blocked=is_blocked)
+
+    def _tcgen05_plan(self) -> CuteTcgen05MatmulPlan | None:
+        return DeviceFunction.current().cute_tcgen05_matmul_plan
+
+    def _tcgen05_cluster_m(self) -> int:
+        if (plan := self._tcgen05_plan()) is not None:
+            return plan.cluster_m
+        config = DeviceFunction.current().config
+        cluster_m = int(str(config.get("tcgen05_cluster_m", 1)))
+        return max(1, min(cluster_m, 2))
+
+    def _tcgen05_num_tiles_expr(self, *, is_device: bool) -> str:
+        dims = [pid.num_pids_expr(is_device=is_device) for pid in self.pid_info]
+        while len(dims) < 3:
+            dims.append("1")
+        return f"({', '.join(dims[:3])})"
+
+    def _tcgen05_linear_virtual_pid_expr(self, work_tile_var: str) -> str:
+        terms: list[str] = []
+        for i, _pid in enumerate(self.pid_info):
+            coord = f"{work_tile_var}.tile_idx[{i}]"
+            if i == 0:
+                terms.append(coord)
+                continue
+            stride = " * ".join(
+                f"({pid.num_pids_expr(is_device=True)})" for pid in self.pid_info[:i]
+            )
+            terms.append(f"({coord}) * ({stride})")
+        return " + ".join(terms) if terms else "cutlass.Int32(0)"
+
+    def _tcgen05_linear_virtual_pid_from_coords_expr(self, coords: list[str]) -> str:
+        terms: list[str] = []
+        for i, coord in enumerate(coords[: len(self.pid_info)]):
+            if i == 0:
+                terms.append(coord)
+                continue
+            stride = " * ".join(
+                f"({pid.num_pids_expr(is_device=True)})" for pid in self.pid_info[:i]
+            )
+            terms.append(f"({coord}) * ({stride})")
+        return " + ".join(terms) if terms else "cutlass.Int32(0)"
+
+    def _tcgen05_scheduler_owner_warp_expr(self) -> str:
+        if (plan := self._tcgen05_plan()) is not None:
+            return (
+                "cute.arch.make_warp_uniform(cute.arch.warp_idx()) "
+                f"== cutlass.Int32({plan.persistent_scheduler_owner_warp_id})"
+            )
+        config = DeviceFunction.current().config
+        epi_warps = int(str(config.get("tcgen05_num_epi_warps", 1)))
+        if bool(config.get("tcgen05_has_scheduler_warp", False)):
+            # Helion's current tcgen05 persistent path still body-wraps the
+            # clustered kernel. Until the role-local scheduler loop exists,
+            # piggyback scheduler ownership on the TMA warp so we don't carry a
+            # detached scheduler warp through the body-wide syncs.
+            scheduler_warp_id = epi_warps + 1
+            return (
+                "cute.arch.make_warp_uniform(cute.arch.warp_idx()) "
+                f"== cutlass.Int32({scheduler_warp_id})"
+            )
+        return "cute.arch.make_warp_uniform(cute.arch.warp_idx()) == cutlass.Int32(0)"
+
+    def _tcgen05_scheduler_store_leader_expr(self) -> str:
+        return (
+            f"({self._tcgen05_scheduler_owner_warp_expr()}) "
+            "and cute.arch.lane_idx() == cutlass.Int32(0)"
+        )
+
+    def _tcgen05_cluster_scheduler_leader_expr(self) -> str:
+        cluster_size = self._tcgen05_cluster_m()
+        if cluster_size <= 1:
+            return self._tcgen05_scheduler_store_leader_expr()
+        return (
+            f"({self._tcgen05_scheduler_owner_warp_expr()}) "
+            "and cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster()) == cutlass.Int32(0)"
+        )
+
+    def _tcgen05_store_work_tile_statements(
+        self, work_tile_var: str, smem_var: str
+    ) -> list[ast.stmt]:
+        return [
+            statement_from_string(
+                f"{smem_var}[cutlass.Int32(0)] = {work_tile_var}.tile_idx[0]"
+            ),
+            statement_from_string(
+                f"{smem_var}[cutlass.Int32(1)] = {work_tile_var}.tile_idx[1]"
+            ),
+            statement_from_string(
+                f"{smem_var}[cutlass.Int32(2)] = {work_tile_var}.tile_idx[2]"
+            ),
+            statement_from_string(
+                f"{smem_var}[cutlass.Int32(3)] = "
+                f"(cutlass.Int32(1) if {work_tile_var}.is_valid_tile else cutlass.Int32(0))"
+            ),
+        ]
+
+    def _tcgen05_scheduler_if(self, predicate: str, body: list[ast.stmt]) -> ast.If:
+        return create(
+            ast.If,
+            test=expr_from_string(predicate),
+            body=body,
+            orelse=[],
+        )
+
+    def _split_tcgen05_invariant_setup(
+        self, device_function: DeviceFunction, body: list[ast.stmt]
+    ) -> tuple[list[ast.stmt], list[ast.stmt]]:
+        hoisted = [
+            stmt
+            for stmt in body
+            if device_function.is_cute_tcgen05_invariant_setup(stmt)
+        ]
+        if hoisted:
+            wrapped = [
+                stmt
+                for stmt in body
+                if not device_function.is_cute_tcgen05_invariant_setup(stmt)
+            ]
+            return hoisted, wrapped
+
+        start = None
+        end = None
+        for i, stmt in enumerate(body):
+            text = ast.unparse(stmt)
+            if start is None and "tcgen05_warp_idx =" in text:
+                start = i
+                continue
+            if start is not None and (
+                "make_pipeline_state(" in text
+                or ".allocate(" in text
+                or ".wait_for_alloc(" in text
+                or ".retrieve_ptr(" in text
+                or "acc_frag = " in text
+                or ".producer_acquire(" in text
+                or "cute.local_tile(" in text
+                or "offset_" in text
+            ):
+                end = i
+                break
+        if start is None or end is None or end <= start:
+            return [], body
+        return body[start:end], [*body[:start], *body[end:]]
+
+    def _setup_tcgen05_persistent_kernel(
+        self, device_function: DeviceFunction
+    ) -> list[ast.stmt]:
+        wrapped_body = cast("list[ast.stmt]", list(device_function.body))
+        if isinstance(device_function.pid, ForEachProgramID):
+            shared_pid_var = device_function.pid.shared_pid_var
+            wrapped_body = [
+                statement_from_string(f"{shared_pid_var} = {self.virtual_pid_var}"),
+                *wrapped_body,
+            ]
+        hoisted_setup, wrapped_body = self._split_tcgen05_invariant_setup(
+            device_function, wrapped_body
+        )
+
+        cluster_m = self._tcgen05_cluster_m()
+        cluster_size = cluster_m
+        tile_sched_params_var = device_function.new_var("tcgen05_tile_sched_params")
+        tile_sched_var = device_function.new_var("tcgen05_tile_sched")
+        work_tile_var = device_function.new_var("tcgen05_work_tile")
+        work_tile_smem_ptr = device_function.new_var("tcgen05_work_tile_smem_ptr")
+        work_tile_smem = device_function.new_var("tcgen05_work_tile_smem")
+        work_tile_smem_tensor = device_function.new_var("tcgen05_work_tile_smem_tensor")
+        work_tile_coord_vars = [
+            device_function.new_var(f"tcgen05_work_tile_idx_{i}") for i in range(3)
+        ]
+        work_tile_valid_var = device_function.new_var("tcgen05_work_tile_valid")
+        scheduler_owner_warp = self._tcgen05_scheduler_owner_warp_expr()
+        cluster_scheduler_leader = self._tcgen05_cluster_scheduler_leader_expr()
+        consumer_leader = device_function.new_var("tcgen05_sched_consumer_leader")
+        linear_pid_expr = self._tcgen05_linear_virtual_pid_from_coords_expr(
+            work_tile_coord_vars
+        )
+        sched_pipeline_mbars = device_function.new_var("tcgen05_sched_pipeline_mbars")
+        sched_pipeline = device_function.new_var("tcgen05_sched_pipeline")
+        sched_pipeline_producer_group = device_function.new_var(
+            "tcgen05_sched_pipeline_producer_group"
+        )
+        sched_pipeline_consumer_group = device_function.new_var(
+            "tcgen05_sched_pipeline_consumer_group"
+        )
+        sched_producer_state = device_function.new_var("tcgen05_sched_producer_state")
+        sched_consumer_state = device_function.new_var("tcgen05_sched_consumer_state")
+        sched_barrier_ptr = device_function.new_var("tcgen05_sched_barrier_ptr")
+        sched_peer_rank = device_function.new_var("tcgen05_sched_peer_rank")
+        sched_peer_m = device_function.new_var("tcgen05_sched_peer_m")
+
+        refresh_work_tile = [
+            statement_from_string(f"{coord_var} = {work_tile_smem}[cutlass.Int32({i})]")
+            for i, coord_var in enumerate(work_tile_coord_vars)
+        ]
+        refresh_work_tile.append(
+            statement_from_string(
+                f"{work_tile_valid_var} = "
+                f"{work_tile_smem}[cutlass.Int32(3)] != cutlass.Int32(0)"
+            )
+        )
+        if cluster_size > 1:
+            work_tile_publish = [
+                statement_from_string(
+                    f"{sched_pipeline}.producer_acquire({sched_producer_state})"
+                ),
+                statement_from_string(
+                    f"{sched_barrier_ptr} = {sched_pipeline}.producer_get_barrier({sched_producer_state})"
+                ),
+                statement_from_string(f"{sched_peer_rank} = cute.arch.lane_idx()"),
+                create(
+                    ast.If,
+                    test=expr_from_string(
+                        f"{sched_peer_rank} < cutlass.Int32({cluster_size})"
+                    ),
+                    body=[
+                        statement_from_string(
+                            f"{sched_peer_m} = {sched_peer_rank} % cutlass.Int32({cluster_m})"
+                        ),
+                        statement_from_string(
+                            f"_cute_store_shared_remote_x4("
+                            f"{work_tile_var}.tile_idx[0] + {sched_peer_m}, "
+                            f"{work_tile_var}.tile_idx[1], "
+                            f"{work_tile_var}.tile_idx[2], "
+                            f"(cutlass.Int32(1) if {work_tile_var}.is_valid_tile else cutlass.Int32(0)), "
+                            f"smem_ptr={work_tile_smem_ptr}, "
+                            f"mbar_ptr={sched_barrier_ptr}, "
+                            f"peer_cta_rank_in_cluster={sched_peer_rank})"
+                        ),
+                    ],
+                    orelse=[],
+                ),
+                statement_from_string(
+                    f"{sched_pipeline}.producer_commit({sched_producer_state})"
+                ),
+                statement_from_string(f"{sched_producer_state}.advance()"),
+            ]
+            work_tile_consume = [
+                statement_from_string(
+                    f"{sched_pipeline}.consumer_wait({sched_consumer_state})"
+                ),
+                statement_from_string("cute.arch.fence_view_async_shared()"),
+                statement_from_string("cute.arch.sync_warp()"),
+            ]
+            work_tile_release = [
+                statement_from_string(
+                    f"{sched_pipeline}.consumer_release({sched_consumer_state})"
+                ),
+                statement_from_string(f"{sched_consumer_state}.advance()"),
+            ]
+        else:
+            work_tile_publish = self._tcgen05_store_work_tile_statements(
+                work_tile_var, work_tile_smem
+            )
+            work_tile_consume = []
+            work_tile_release = []
+
+        loop_body = [
+            statement_from_string(f"{self.virtual_pid_var} = {linear_pid_expr}"),
+            *wrapped_body,
+            self._tcgen05_scheduler_if(
+                cluster_scheduler_leader if cluster_size > 1 else scheduler_owner_warp,
+                [
+                    statement_from_string(f"{tile_sched_var}.advance_to_next_work()"),
+                    statement_from_string(
+                        f"{work_tile_var} = {tile_sched_var}.get_current_work()"
+                    ),
+                    *work_tile_publish,
+                ],
+            ),
+            *(
+                [
+                    self._tcgen05_scheduler_if(consumer_leader, work_tile_consume),
+                ]
+                if cluster_size > 1
+                else []
+            ),
+            statement_from_string("cute.arch.sync_threads()"),
+            *refresh_work_tile,
+            *(
+                [
+                    self._tcgen05_scheduler_if(consumer_leader, work_tile_release),
+                ]
+                if cluster_size > 1
+                else []
+            ),
+        ]
+        setup = [
+            statement_from_string(
+                f"{tile_sched_params_var} = cutlass.utils.PersistentTileSchedulerParams("
+                f"{self._tcgen05_num_tiles_expr(is_device=True)}, "
+                f"({cluster_m}, 1, 1))"
+            ),
+            statement_from_string(
+                f"{tile_sched_var} = cutlass.utils.StaticPersistentTileScheduler.create("
+                f"{tile_sched_params_var}, cute.arch.block_idx(), cute.arch.grid_dim())"
+            ),
+            statement_from_string(
+                f"{work_tile_smem_ptr} = cute.arch.alloc_smem(cutlass.Int32, 4, alignment=16)"
+            ),
+            statement_from_string(
+                f"{work_tile_smem_tensor} = cute.make_tensor("
+                f"{work_tile_smem_ptr}, cute.make_layout((4,), stride=(1,)))"
+            ),
+            statement_from_string(f"{work_tile_smem} = {work_tile_smem_tensor}"),
+        ]
+        if cluster_size > 1:
+            setup.extend(
+                [
+                    statement_from_string(
+                        f"{sched_pipeline_mbars} = cute.arch.alloc_smem(cutlass.Int64, cutlass.Int32(2))"
+                    ),
+                    statement_from_string(
+                        f"{sched_pipeline_producer_group} = cutlass.pipeline.CooperativeGroup("
+                        "cutlass.pipeline.Agent.Thread, cute.arch.WARP_SIZE)"
+                    ),
+                    statement_from_string(
+                        f"{sched_pipeline_consumer_group} = cutlass.pipeline.CooperativeGroup("
+                        f"cutlass.pipeline.Agent.Thread, {cluster_size})"
+                    ),
+                    statement_from_string(
+                        f"{sched_pipeline} = cutlass.pipeline.PipelineAsync.create("
+                        "num_stages=1, "
+                        f"producer_group={sched_pipeline_producer_group}, "
+                        f"consumer_group={sched_pipeline_consumer_group}, "
+                        f"barrier_storage={sched_pipeline_mbars}, "
+                        "consumer_mask=cutlass.Int32(0), "
+                        "defer_sync=True)"
+                    ),
+                    statement_from_string(
+                        f"{sched_producer_state} = cutlass.pipeline.make_pipeline_state("
+                        "cutlass.pipeline.PipelineUserType.Producer, 1)"
+                    ),
+                    statement_from_string(
+                        f"{sched_consumer_state} = cutlass.pipeline.make_pipeline_state("
+                        "cutlass.pipeline.PipelineUserType.Consumer, 1)"
+                    ),
+                    statement_from_string(
+                        f"{consumer_leader} = cute.arch.make_warp_uniform(cute.arch.warp_idx()) == cutlass.Int32(0) "
+                        "and cute.arch.lane_idx() == cutlass.Int32(0)"
+                    ),
+                ]
+            )
+        else:
+            setup.append(statement_from_string(f"{consumer_leader} = False"))
+        setup.extend(
+            [
+                self._tcgen05_scheduler_if(
+                    cluster_scheduler_leader
+                    if cluster_size > 1
+                    else scheduler_owner_warp,
+                    [
+                        statement_from_string(
+                            f"{work_tile_var} = {tile_sched_var}.initial_work_tile_info()"
+                        ),
+                        *work_tile_publish,
+                    ],
+                ),
+            ]
+        )
+        if cluster_size > 1:
+            setup.append(self._tcgen05_scheduler_if(consumer_leader, work_tile_consume))
+        setup.extend(
+            [
+                statement_from_string("cute.arch.sync_threads()"),
+                *refresh_work_tile,
+            ]
+        )
+        if cluster_size > 1:
+            setup.append(self._tcgen05_scheduler_if(consumer_leader, work_tile_release))
+        setup.extend(
+            [
+                *hoisted_setup,
+                create(
+                    ast.While,
+                    test=expr_from_string(work_tile_valid_var),
+                    body=loop_body,
+                    orelse=[],
+                ),
+            ]
+        )
+        return setup
+
+    def setup_persistent_kernel(
+        self, device_function: DeviceFunction, total_pids_expr: str | None = None
+    ) -> list[ast.stmt] | None:
+        return self._setup_tcgen05_persistent_kernel(device_function)

@@ -873,9 +873,6 @@ class TestRNG(RefEagerTestBase, TestCase):
 
     @skipIfXPU("RNG with specialized dimensions not supported on XPU")
     @xfailIfPallas("specialized-dimension rand_like hits TPU MLIR refinement mismatch")
-    @xfailIfCute(
-        "CuTe matmul plus specialized-dimension rand_like still returns unstable NaNs"
-    )
     @skipIfRefEager("compiled codegen inspection is not applicable in ref eager mode")
     @skipIfRocm("ROCm Triton worker crashes on specialized-dimension rand_like")
     def test_rand_like_with_specialized_dimension(self):

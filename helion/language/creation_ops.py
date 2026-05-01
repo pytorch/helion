@@ -162,7 +162,7 @@ def _full_codegen_pallas(state: CodegenState) -> ast.AST:
     from .._compiler.ast_extension import statement_from_string
 
     config = state.config
-    pallas_loop_type = config.get("pallas_loop_type", "default")
+    pallas_loop_type = config.get("pallas_loop_type", "unroll")
 
     if pallas_loop_type in ("emit_pipeline", "fori_loop"):
         fake_value = state.fake_value

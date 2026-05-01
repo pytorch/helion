@@ -57,8 +57,7 @@ def matmul_layernorm(
     for tile_m in hl.tile(m):
         acc = hl.zeros([tile_m, n], dtype=torch.float32)
         for tile_k in hl.tile(k):
-            mm = torch.matmul(x[tile_m, tile_k], y[tile_k, :])
-            acc = acc + mm
+            acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, :])
         eps = 1e-5
         sum_vals = acc.sum(dim=-1, keepdim=True)
         mean = sum_vals / n
