@@ -857,6 +857,7 @@ class ConfigSpec:
             min_block = min(min_block, default)
             if min_block >= 2:
                 min_block = 1 << (min_block.bit_length() - 1)
+                min_block = min(min_block, spec.max_size)
                 spec.autotuner_min = assert_integer_power_of_two(
                     max(min_block, spec.autotuner_min)
                 )
