@@ -698,7 +698,7 @@ class TestExamples(RefEagerTestBase, TestCase):
     @xfailIfCute("CuTe RMSNorm backward example still returns incorrect results")
     def test_rms_norm_bwd(self):
         """Test backward pass for rms norm weight gradient."""
-        batch_size, dim = 32, 64
+        batch_size, dim = 2048, 2048
         x = torch.randn([batch_size, dim], device=DEVICE, dtype=torch.float32)
         weight = torch.randn(
             [dim], device=DEVICE, dtype=torch.float32, requires_grad=True
