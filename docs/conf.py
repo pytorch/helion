@@ -239,6 +239,13 @@ linkcheck_ignore = [
     r"https://pytorchconference.*\.sched\.com/.*",  # Returns 403 to bots
 ]
 
+# docs.pytorch.org/docs/stable/* serves a JS-only redirect stub to the
+# versioned URL, so linkcheck can't see the real anchors. Skip anchor
+# verification for that host while still checking the URL resolves.
+linkcheck_anchors_ignore_for_url = [
+    r"https://docs\.pytorch\.org/.*",
+]
+
 # autodoc-typehints configuration
 typehints_fully_qualified = False
 always_document_param_types = True
