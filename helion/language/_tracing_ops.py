@@ -1445,16 +1445,16 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
     for i, bid in enumerate(block_ids):
         offset_name = strategy.offset_var(bid)
         index_name = strategy.index_var(bid)
+        idx_expr = env.backend.loop_index_expr(
+            offset_name, block_size_vars[i], env.index_type(), axis=0
+        )
         body_stmts.extend(
             [
                 statement_from_string(
                     f"{offset_name} = ({begin_exprs[i]}) + "
                     f"_pipeline_indices[{i}] * ({iter_step_exprs[i]})"
                 ),
-                statement_from_string(
-                    f"{index_name} = {offset_name} + "
-                    f"jnp.arange({block_size_vars[i]}, dtype=jnp.int32)"
-                ),
+                statement_from_string(f"{index_name} = {idx_expr}"),
             ]
         )
     # Set up mask variables for inner-loop block_ids (non-divisible bounds).
