@@ -27,8 +27,8 @@ except ModuleNotFoundError:  # pragma: no cover
     import tomli as tomllib
 
 
-DEFAULT_ALLOWED_CUDA_VERSIONS = ["13.0"]
-DEFAULT_DATA_CENTER_IDS = ["US-CA-2", "US-IL-1", "US-GA-2"]
+DEFAULT_ALLOWED_CUDA_VERSIONS: list[str] = []
+DEFAULT_DATA_CENTER_IDS: list[str] = []
 DEFAULT_DATA_CENTER_PRIORITY = "availability"
 DEFAULT_GPU_TYPE_IDS = ["NVIDIA B200"]
 DEFAULT_IMAGE_NAME = "docker.io/jansel/helion:latest"
@@ -38,7 +38,7 @@ DEFAULT_REMOTE_DIR = "/workspace/helion"
 DEFAULT_STATE_DIR = ".runpod-state"
 DEFAULT_POLL_INTERVAL = 5.0
 DEFAULT_TIMEOUT = 20 * 60
-DEFAULT_CREATE_RETRIES = 8
+DEFAULT_CREATE_RETRIES = 30
 DEFAULT_CREATE_RETRY_INITIAL_DELAY = 15.0
 DEFAULT_CREATE_RETRY_MAX_DELAY = 120.0
 RSYNC_EXCLUDES = [
@@ -902,7 +902,6 @@ def run_remote_command(
 def build_payload(args: argparse.Namespace, pod_name: str) -> dict[str, Any]:
     user_env = parse_env(args.env)
     payload: dict[str, Any] = {
-        "allowedCudaVersions": args.allowed_cuda_versions,
         "computeType": "GPU",
         "gpuCount": args.gpu_count,
         "gpuTypeIds": args.gpu_type_ids,
@@ -913,6 +912,8 @@ def build_payload(args: argparse.Namespace, pod_name: str) -> dict[str, Any]:
         "supportPublicIp": args.support_public_ip,
         "env": user_env,
     }
+    if args.allowed_cuda_versions:
+        payload["allowedCudaVersions"] = args.allowed_cuda_versions
     if args.cloud_type:
         payload["cloudType"] = args.cloud_type
     if args.data_center_ids:
@@ -946,7 +947,7 @@ def parse_args(repo_root: Path) -> argparse.Namespace:
     parser.add_argument(
         "--any-data-center",
         action="store_true",
-        help="Do not apply the default data center allowlist.",
+        help="Do not apply a data center allowlist. This is the default.",
     )
     parser.add_argument(
         "--data-center-priority",
@@ -958,7 +959,7 @@ def parse_args(repo_root: Path) -> argparse.Namespace:
         "--allowed-cuda-version",
         dest="allowed_cuda_versions",
         action="append",
-        help="Allowed CUDA version. Repeatable. Defaults to 13.0.",
+        help="Allowed CUDA version. Repeatable. Defaults to any CUDA version.",
     )
     parser.add_argument(
         "--gpu-type-id",
@@ -1018,7 +1019,7 @@ def parse_args(repo_root: Path) -> argparse.Namespace:
     parser.add_argument(
         "--retry-with-any-cuda",
         action=argparse.BooleanOptionalAction,
-        default=False,
+        default=True,
         help="On capacity errors, retry once without an allowed CUDA version constraint.",
     )
     parser.add_argument(
@@ -1044,7 +1045,9 @@ def parse_args(repo_root: Path) -> argparse.Namespace:
         action="store_true",
         help="Build the local Docker image with --image-name and push it to the registry.",
     )
-    parser.add_argument("--list", action="store_true", help="List pods and exit.")
+    parser.add_argument(
+        "--list", "--status", action="store_true", help="List pods and exit."
+    )
     parser.add_argument(
         "--cleanup",
         "--stop",
@@ -1136,7 +1139,11 @@ def main() -> int:
     eprint(f"Pod name: {payload['name']}")
     eprint(f"Image: {payload['imageName']}")
     eprint(f"GPU types: {', '.join(payload['gpuTypeIds'])}")
-    eprint(f"Allowed CUDA versions: {', '.join(payload['allowedCudaVersions'])}")
+    allowed_cuda_versions = payload.get("allowedCudaVersions") or []
+    eprint(
+        "Allowed CUDA versions: "
+        + (", ".join(allowed_cuda_versions) if allowed_cuda_versions else "any")
+    )
     if args.data_center_ids:
         eprint(
             "Data centers: "
