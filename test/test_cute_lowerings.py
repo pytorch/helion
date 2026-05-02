@@ -69,6 +69,7 @@ from helion._compiler.device_ir import ForLoopGraphInfo
 from helion._compiler.device_ir import RootGraphInfo
 from helion._compiler.device_ir import collect_cute_half_atomic_output_promotions
 from helion._compiler.host_function import HostFunction
+from helion._compiler.reduction_strategy import BlockReductionStrategy
 from helion._compiler.reduction_strategy import PersistentReductionStrategy
 from helion._compiler.tile_strategy import DeviceGridState
 from helion._compiler.tile_strategy import DeviceLoopState
@@ -4559,6 +4560,340 @@ class TestInitialPrefetchTmaBuilder(unittest.TestCase):
         )
         self.assertIn("a_mcast_mask", two_cta)
         self.assertIn("b_mcast_mask", two_cta)
+
+
+class TestReductionLoopCarriedAccumulatorCheck(unittest.TestCase):
+    """Unit tests for ``_cute_reduction_needs_loop_carried_accumulator``.
+
+    The helper consolidates the three cute-specific "no live thread axis"
+    conditions in :meth:`BlockReductionStrategy.codegen_reduction`. Each
+    condition individually returns the same outcome -- ``expr =
+    input_name`` -- so the helper short-circuits the disjunction.
+
+    Tests instantiate ``BlockReductionStrategy`` via ``__new__`` to skip
+    the device-function plumbing (the helper only reads ``self._codegen``
+    and ``self.block_ids``).
+    """
+
+    def _make_strategy(
+        self,
+        *,
+        block_index: int = 0,
+        active_device_loops: dict[int, list[object]] | None = None,
+        current_grid_state: object | None = None,
+    ) -> BlockReductionStrategy:
+        strategy = BlockReductionStrategy.__new__(BlockReductionStrategy)
+        strategy.block_ids = [block_index]
+        strategy._codegen = SimpleNamespace(
+            active_device_loops=active_device_loops or {},
+            current_grid_state=current_grid_state,
+        )
+        return strategy
+
+    def _make_loop_state(
+        self,
+        block_id: int,
+        *,
+        threaded: bool,
+    ) -> DeviceLoopState:
+        block_thread_axes: dict[int, int] = {block_id: 0} if threaded else {}
+        return DeviceLoopState(
+            strategy=_FakeLoopStrategy([block_id]),
+            block_id_to_info={},
+            for_node=ast.For(
+                target=ast.Name(id=f"i_{block_id}", ctx=ast.Store()),
+                iter=ast.Call(
+                    func=ast.Name(id="range", ctx=ast.Load()),
+                    args=[ast.Constant(value=1)],
+                    keywords=[],
+                ),
+                body=[],
+                orelse=[],
+                type_comment=None,
+            ),
+            inner_statements=[],
+            block_thread_axes=block_thread_axes,
+        )
+
+    def _make_grid_state(
+        self,
+        *,
+        block_thread_axes: dict[int, int] | None = None,
+        lane_loop_blocks: set[int] | None = None,
+    ) -> DeviceGridState:
+        grid = DeviceGridState(
+            strategy=_FakeLoopStrategy([0]),
+            block_id_to_info={},
+            block_thread_axes=block_thread_axes or {},
+        )
+        if lane_loop_blocks:
+            for block_id in lane_loop_blocks:
+                grid.add_lane_loop(block_id, f"synthetic_lane_{block_id}", 4)
+        return grid
+
+    def _patch_backend(self, name: str) -> contextlib.AbstractContextManager:
+        env = SimpleNamespace(backend=SimpleNamespace(name=name))
+        return patch.object(CompileEnvironment, "current", return_value=env)
+
+    def test_returns_false_when_block_has_live_thread_axis_in_grid(self) -> None:
+        # The reduction block is mapped to a thread axis in the current
+        # grid; no loop-carried accumulator is needed.
+        grid = self._make_grid_state(block_thread_axes={0: 0})
+        strategy = self._make_strategy(current_grid_state=grid)
+        with self._patch_backend("cute"):
+            self.assertFalse(strategy._cute_reduction_needs_loop_carried_accumulator())
+
+    def test_returns_false_when_block_has_live_thread_axis_in_loop(self) -> None:
+        loop = self._make_loop_state(0, threaded=True)
+        strategy = self._make_strategy(active_device_loops={0: [loop]})
+        with self._patch_backend("cute"):
+            self.assertFalse(strategy._cute_reduction_needs_loop_carried_accumulator())
+
+    def test_returns_true_when_block_serial_loop_no_thread(self) -> None:
+        # A serial DeviceLoopState exists for the reduction block but no
+        # thread axis -- the surrounding loop must accumulate.
+        loop = self._make_loop_state(0, threaded=False)
+        strategy = self._make_strategy(active_device_loops={0: [loop]})
+        with self._patch_backend("cute"):
+            self.assertTrue(strategy._cute_reduction_needs_loop_carried_accumulator())
+
+    def test_returns_true_when_block_has_lane_loops(self) -> None:
+        # A lane loop iterates the reduction block; the synthetic per-thread
+        # iteration is not backed by real threads.
+        grid = self._make_grid_state(lane_loop_blocks={0})
+        strategy = self._make_strategy(current_grid_state=grid)
+        with self._patch_backend("cute"):
+            self.assertTrue(strategy._cute_reduction_needs_loop_carried_accumulator())
+
+    def test_returns_true_when_no_active_loop_or_grid(self) -> None:
+        # No live thread axis at all -> let the surrounding loop
+        # accumulate.
+        strategy = self._make_strategy()
+        with self._patch_backend("cute"):
+            self.assertTrue(strategy._cute_reduction_needs_loop_carried_accumulator())
+
+    def test_returns_false_for_non_cute_backend(self) -> None:
+        # The helper short-circuits to False on backends other than cute,
+        # whose native warp / lane reductions handle the reduction.
+        strategy = self._make_strategy()
+        for backend_name in ("triton", "pallas", "tileir"):
+            with self._patch_backend(backend_name):
+                self.assertFalse(
+                    strategy._cute_reduction_needs_loop_carried_accumulator(),
+                    f"backend {backend_name!r} should not need loop-carried accumulator",
+                )
+
+    def test_returns_false_when_lane_loop_block_differs(self) -> None:
+        # Lane loop iterates a different block than the reduction block;
+        # the reduction block still needs a thread axis check.
+        grid = self._make_grid_state(
+            block_thread_axes={0: 0},
+            lane_loop_blocks={1},
+        )
+        strategy = self._make_strategy(current_grid_state=grid)
+        with self._patch_backend("cute"):
+            self.assertFalse(strategy._cute_reduction_needs_loop_carried_accumulator())
+
+    def test_returns_true_when_lane_loop_overrides_thread_axis(self) -> None:
+        # When the reduction block has BOTH a lane loop AND a thread axis
+        # (from a different active loop state), the lane-loop check fires
+        # first and the helper returns True. Lane-looped blocks are not
+        # safe to reduce across via warp lanes regardless of whether
+        # another active loop also maps a thread axis to the same block.
+        grid = self._make_grid_state(
+            block_thread_axes={0: 0},
+            lane_loop_blocks={0},
+        )
+        strategy = self._make_strategy(current_grid_state=grid)
+        with self._patch_backend("cute"):
+            self.assertTrue(strategy._cute_reduction_needs_loop_carried_accumulator())
+
+    def test_returns_true_when_serial_loop_overrides_global_thread_axis(self) -> None:
+        # When the reduction block is iterated by a serial DeviceLoopState
+        # locally but has a thread axis in some OTHER active device loop
+        # (e.g., the same block id is reused across nested scopes), the
+        # local serial check still wins and the helper returns True. The
+        # surrounding serial loop must own the accumulator.
+        #
+        # This is an internal-ordering pin: the constructed state
+        # (same block id appearing as both a serial loop under its own
+        # key and a threaded loop under an unrelated key) is unlikely
+        # in real code paths but locks in the disjunction's ordering.
+        local_loop = self._make_loop_state(0, threaded=False)
+        other_loop = self._make_loop_state(0, threaded=True)
+        # The local serial check looks at active_device_loops[block_index]
+        # (key 0) and sees only the serial loop, while the global
+        # has-live-thread-axis walk iterates every value list and also
+        # picks up the threaded loop under key 9.
+        strategy = self._make_strategy(
+            active_device_loops={0: [local_loop], 9: [other_loop]},
+        )
+        with self._patch_backend("cute"):
+            self.assertTrue(strategy._cute_reduction_needs_loop_carried_accumulator())
+
+    def test_block_index_property_drives_check(self) -> None:
+        # The helper consults ``self.block_index`` (== block_ids[0])
+        # rather than a per-call argument; constructing the strategy
+        # with a different block_index flips the answer when only that
+        # block has a thread axis.
+        grid = self._make_grid_state(block_thread_axes={5: 0})
+        with self._patch_backend("cute"):
+            # block_index=5: thread axis present -> False
+            strategy_with_axis = self._make_strategy(
+                block_index=5, current_grid_state=grid
+            )
+            self.assertFalse(
+                strategy_with_axis._cute_reduction_needs_loop_carried_accumulator()
+            )
+            # block_index=7: thread axis absent for this block -> True
+            strategy_without_axis = self._make_strategy(
+                block_index=7, current_grid_state=grid
+            )
+            self.assertTrue(
+                strategy_without_axis._cute_reduction_needs_loop_carried_accumulator()
+            )
+
+
+class TestReductionBlockClassifiers(unittest.TestCase):
+    """Direct unit tests for the three "block classifier" helpers
+    (``_reduction_block_is_serial`` / ``_reduction_block_has_lane_loops`` /
+    ``_reduction_block_has_live_thread_axis``) on ``ReductionStrategy``.
+
+    The consolidated ``_cute_reduction_needs_loop_carried_accumulator``
+    helper is OR-combined from these three predicates plus a backend
+    guard. These tests pin each predicate individually so future changes
+    to the OR composition can be validated against the building blocks.
+    """
+
+    def _make_strategy(
+        self,
+        *,
+        block_index: int = 0,
+        active_device_loops: dict[int, list[object]] | None = None,
+        current_grid_state: object | None = None,
+    ) -> BlockReductionStrategy:
+        strategy = BlockReductionStrategy.__new__(BlockReductionStrategy)
+        strategy.block_ids = [block_index]
+        strategy._codegen = SimpleNamespace(
+            active_device_loops=active_device_loops or {},
+            current_grid_state=current_grid_state,
+        )
+        return strategy
+
+    def _serial_loop(self, block_id: int) -> DeviceLoopState:
+        return DeviceLoopState(
+            strategy=_FakeLoopStrategy([block_id]),
+            block_id_to_info={},
+            for_node=ast.For(
+                target=ast.Name(id=f"i_{block_id}", ctx=ast.Store()),
+                iter=ast.Call(
+                    func=ast.Name(id="range", ctx=ast.Load()),
+                    args=[ast.Constant(value=1)],
+                    keywords=[],
+                ),
+                body=[],
+                orelse=[],
+                type_comment=None,
+            ),
+            inner_statements=[],
+            block_thread_axes={},
+        )
+
+    def _threaded_loop(self, block_id: int) -> DeviceLoopState:
+        loop = self._serial_loop(block_id)
+        loop.block_thread_axes[block_id] = 0
+        return loop
+
+    def test_block_is_serial_true_for_unthreaded_loop(self) -> None:
+        strategy = self._make_strategy(active_device_loops={0: [self._serial_loop(0)]})
+        self.assertTrue(strategy._reduction_block_is_serial())
+
+    def test_block_is_serial_false_when_loop_threads_axis(self) -> None:
+        strategy = self._make_strategy(
+            active_device_loops={0: [self._threaded_loop(0)]}
+        )
+        self.assertFalse(strategy._reduction_block_is_serial())
+
+    def test_block_is_serial_false_when_no_loop(self) -> None:
+        strategy = self._make_strategy()
+        self.assertFalse(strategy._reduction_block_is_serial())
+
+    def test_block_is_serial_false_when_codegen_unset(self) -> None:
+        strategy = BlockReductionStrategy.__new__(BlockReductionStrategy)
+        strategy.block_ids = [0]
+        # No ``_codegen`` attribute at all -> defensive False.
+        self.assertFalse(strategy._reduction_block_is_serial())
+
+    def test_block_has_lane_loops_in_current_grid(self) -> None:
+        grid = DeviceGridState(
+            strategy=_FakeLoopStrategy([0]),
+            block_id_to_info={},
+        )
+        grid.add_lane_loop(0, "synthetic_lane_0", 4)
+        strategy = self._make_strategy(current_grid_state=grid)
+        self.assertTrue(strategy._reduction_block_has_lane_loops())
+
+    def test_block_has_lane_loops_in_other_active_loop(self) -> None:
+        # Another active grid state holds a lane loop for the reduction
+        # block; the predicate walks all active loops.
+        other_grid = DeviceGridState(
+            strategy=_FakeLoopStrategy([0]),
+            block_id_to_info={},
+        )
+        other_grid.add_lane_loop(0, "synthetic_lane_0", 4)
+        strategy = self._make_strategy(
+            active_device_loops={9: [other_grid]},
+        )
+        self.assertTrue(strategy._reduction_block_has_lane_loops())
+
+    def test_block_has_lane_loops_false_for_other_block(self) -> None:
+        grid = DeviceGridState(
+            strategy=_FakeLoopStrategy([0]),
+            block_id_to_info={},
+        )
+        grid.add_lane_loop(1, "synthetic_lane_1", 4)
+        strategy = self._make_strategy(current_grid_state=grid)
+        self.assertFalse(strategy._reduction_block_has_lane_loops())
+
+    def test_block_has_lane_loops_false_when_grid_has_no_lane_loops(self) -> None:
+        grid = DeviceGridState(
+            strategy=_FakeLoopStrategy([0]),
+            block_id_to_info={},
+        )
+        strategy = self._make_strategy(current_grid_state=grid)
+        self.assertFalse(strategy._reduction_block_has_lane_loops())
+
+    def test_block_has_live_thread_axis_in_current_grid(self) -> None:
+        grid = DeviceGridState(
+            strategy=_FakeLoopStrategy([0]),
+            block_id_to_info={},
+            block_thread_axes={0: 0},
+        )
+        strategy = self._make_strategy(current_grid_state=grid)
+        self.assertTrue(strategy._reduction_block_has_live_thread_axis())
+
+    def test_block_has_live_thread_axis_in_active_loop(self) -> None:
+        strategy = self._make_strategy(
+            active_device_loops={0: [self._threaded_loop(0)]}
+        )
+        self.assertTrue(strategy._reduction_block_has_live_thread_axis())
+
+    def test_block_has_live_thread_axis_in_other_active_loop(self) -> None:
+        # The reduction block id appears as a thread axis in some OTHER
+        # active loop entry (not the one keyed by the same block id);
+        # the predicate's third walk-step covers this.
+        strategy = self._make_strategy(
+            active_device_loops={9: [self._threaded_loop(0)]},
+        )
+        self.assertTrue(strategy._reduction_block_has_live_thread_axis())
+
+    def test_block_has_live_thread_axis_false_when_no_axis(self) -> None:
+        strategy = self._make_strategy()
+        self.assertFalse(strategy._reduction_block_has_live_thread_axis())
+
+    def test_block_has_live_thread_axis_false_when_only_serial_loop(self) -> None:
+        strategy = self._make_strategy(active_device_loops={0: [self._serial_loop(0)]})
+        self.assertFalse(strategy._reduction_block_has_live_thread_axis())
 
 
 if __name__ == "__main__":

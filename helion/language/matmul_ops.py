@@ -293,21 +293,13 @@ def enforce_dot_requirements(lhs: torch.Tensor, rhs: torch.Tensor) -> None:
 
             spec = env.config_spec
             spec.cute_tcgen05_search_enabled = True
-            # The current tcgen05 lowering does not interoperate with the
-            # persistent virtual-pid loop on B200: any total_tiles > 1
-            # silently produces wrong output (only the single-tile case
-            # is verified correct). Drop those pid types from the
-            # autotune search until the role-local persistent rewrite
-            # lands. A host-side guard converts the silent miscompare
-            # into a loud RuntimeError for explicit user configs that
-            # bypass autotune.
-            spec.disallow_pid_type("persistent_blocked")
-            spec.disallow_pid_type("persistent_interleaved")
-            # cluster_m=2 (2-CTA tcgen05 instructions) currently CUDA-launch-
-            # fails on B200 across all matmul block-size combinations
-            # exercised. Narrow the autotune search to cluster_m=1 for the
-            # BF16/FP16 matmul path until the 2-CTA lowering is fixed.
-            spec.restrict_tcgen05_cluster_m_search((1,))
+            # Narrow the autotune search to tcgen05 configs that have been
+            # validated to compile and run correctly on B200. Today this
+            # excludes the persistent pid types (multi-tile silently
+            # miscomputes) and ``cluster_m=2`` (CUDA launch fails). See
+            # ``narrow_tcgen05_autotune_to_validated_configs`` for the
+            # full rationale and how each restriction lifts.
+            spec.narrow_tcgen05_autotune_to_validated_configs()
             max_tcgen05_n = min(256, pow2_floor_at_least(static_n, 8))
             max_tcgen05_m = 256 if max_tcgen05_n >= 128 and static_m >= 256 else 128
             # Larger tile_k packs more cute.gemm instructions per K loop
