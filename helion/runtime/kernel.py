@@ -508,6 +508,12 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         """Return the kernel's configured configs (alias for `self.kernel.configs`)."""
         return self.kernel.configs
 
+    def _normalize_config(self, config: ConfigLike) -> Config:
+        if isinstance(config, Config):
+            return config
+        # pyrefly: ignore [bad-argument-type]
+        return Config(**config)
+
     def format_kernel_decorator(self, config: Config, settings: Settings) -> str:
         """Return the @helion.kernel decorator snippet capturing configs and settings that influence Triton code generation."""
         parts = [
@@ -538,9 +544,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         if config is None:
             config = self._require_implicit_config()
         with self.env, measure("BoundKernel.to_code"):
-            if not isinstance(config, Config):
-                # pyrefly: ignore [bad-argument-type]
-                config = Config(**config)
+            config = self._normalize_config(config)
             # Work on a copy so the caller's Config is not mutated with
             # normalize defaults (e.g. indexing, load_eviction_policies)
             # specific to this BoundKernel's config_spec.  Without this,
@@ -605,11 +609,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         """
         if config is None:
             config = self._require_implicit_config()
-        if not isinstance(config, Config):
-            config = Config(
-                # pyrefly: ignore [bad-argument-type]
-                **config
-            )
+        config = self._normalize_config(config)
         dist_check_config_consistancy(
             config, process_group_name=self._env.process_group_name
         )
@@ -687,11 +687,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         """
         if config is None:
             config = self._require_implicit_config()
-        if not isinstance(config, Config):
-            config = Config(
-                # pyrefly: ignore [bad-argument-type]
-                **config
-            )
+        config = self._normalize_config(config)
         return self._cache_path_map.get(config, None)
 
     def _debug_str(self) -> str:
@@ -807,11 +803,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         Args:
             config: The configuration to set.
         """
-        if not isinstance(config, Config):
-            config = Config(
-                # pyrefly: ignore [bad-argument-type]
-                **config
-            )
+        config = self._normalize_config(config)
         self._run = self.compile_config(config)
         self._config = config
         counters["best_config_decorator"][
@@ -991,8 +983,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
 
         if config is None:
             config = self._require_implicit_config()
-        if not isinstance(config, Config):
-            config = Config(**config)  # pyrefly: ignore [bad-argument-type]
+        config = self._normalize_config(config)
         compiled_fn = self._compile_cache.get(config)
         if compiled_fn is None:
             return None
