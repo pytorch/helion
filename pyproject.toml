@@ -74,6 +74,8 @@ Issues = "https://github.com/pytorch/helion/issues"
 target-version = "py310"
 line-length = 88
 src = ["helion"]
+extend-exclude = ["**/_helion_aot_*.py"]
+force-exclude = true
 
 [tool.ruff.format]
 docstring-code-format = true
