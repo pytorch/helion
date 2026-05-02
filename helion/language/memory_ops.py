@@ -1691,6 +1691,7 @@ def _(state: CodegenState) -> object:
     mask_expr = _cute_combined_mask(state, subscript, extra_mask, tensor=tensor)
     if state.fx_node is not None and any(
         user.target in (torch.ops.aten.sort.default, torch.ops.aten.topk.default)
+        or getattr(user.target, "__name__", None) == "_associative_scan"
         for user in state.fx_node.users
     ):
         from .._compiler.cute.indexing import CuteSortableLoad
@@ -1706,7 +1707,7 @@ def _(state: CodegenState) -> object:
             tensor_dim += 1
         if sort_index_pos < 0:
             raise exc.BackendUnsupported("cute", "sort/topk input rank")
-        return CuteSortableLoad(
+        sortable_load = CuteSortableLoad(
             expr=expr_from_string(
                 load_expr
                 if mask_expr is None
@@ -1718,6 +1719,8 @@ def _(state: CodegenState) -> object:
             mask_expr=mask_expr,
             dtype=tensor.dtype,
         )
+        state.fx_node.meta["cute_sortable_load"] = sortable_load
+        return sortable_load.expr
     if mask_expr is None:
         return expr_from_string(load_expr)
     zero = CompileEnvironment.current().backend.dtype_str(tensor.dtype)
