@@ -265,6 +265,13 @@ class ConfigSpec:
         self.has_pallas_inner_loops: bool = False
         self.has_pallas_symbolic_bounds: bool = False
         self.cute_tcgen05_search_enabled: bool = False
+        # Allowed values of tcgen05_cluster_m the autotuner is allowed to
+        # *search* over. None means "use the default set defined by
+        # _tcgen05_optional_fragments". This is consulted by _flat_fields()
+        # when constructing the search space and is independent of which
+        # values are *legal* in a user-supplied helion.Config (the latter
+        # always accepts the full set of legal values).
+        self._tcgen05_cluster_m_search_choices: tuple[int, ...] | None = None
         self.store_indices: list[int] = []
         self.backend_tunable_fragments = self.backend.tunable_fragments()
         unknown_tunables = set(self.backend_tunable_fragments) - BACKEND_TUNABLE_KEYS
@@ -378,6 +385,16 @@ class ConfigSpec:
         )
         assert self.allowed_pid_types
 
+    def restrict_tcgen05_cluster_m_search(self, choices: tuple[int, ...]) -> None:
+        """Narrow the autotune search over tcgen05_cluster_m to *choices*.
+
+        Does not affect what values are legal in user-supplied configs;
+        normalize() validates against the full set of legal values returned by
+        _tcgen05_optional_fragments(for_search=False).
+        """
+        assert choices, "tcgen05_cluster_m search must allow at least one value"
+        self._tcgen05_cluster_m_search_choices = choices
+
     def supports_config_key(self, key: str) -> bool:
         return self.backend.supports_config_key(key)
 
@@ -396,9 +413,29 @@ class ConfigSpec:
             return IntegerFragment(1, 1, 1)
         return IntegerFragment(1, 8, self._default_num_stages())
 
-    def _tcgen05_optional_fragments(self) -> dict[str, ConfigSpecFragment]:
+    def _tcgen05_optional_fragments(
+        self, *, for_search: bool = False
+    ) -> dict[str, ConfigSpecFragment]:
+        # The "validation" view (default) keeps the full set of legal values
+        # so user-supplied configs (e.g. helion.Config(...,
+        # tcgen05_cluster_m=2)) round-trip through normalize() without being
+        # rejected.
+        #
+        # The "search" view (for_search=True) is consulted by _flat_fields()
+        # to build the autotune search space, and may be narrower because
+        # some legal values are known to crash at runtime. Specifically,
+        # cluster_m=2 (2-CTA tcgen05 instructions) currently produces
+        # CUDA_ERROR_LAUNCH_FAILED at runtime on B200 across the matmul
+        # block-size combinations exercised; matmul_ops.enforce_dot_requirements
+        # calls restrict_tcgen05_cluster_m_search((1,)) for the BF16/FP16
+        # matmul path so the autotuner does not pick a crashing config and
+        # tear down the GPU context for the whole tuning run.
+        if for_search and self._tcgen05_cluster_m_search_choices is not None:
+            cluster_m_choices = self._tcgen05_cluster_m_search_choices
+        else:
+            cluster_m_choices = (1, 2)
         return {
-            "tcgen05_cluster_m": EnumFragment((2, 1)),
+            "tcgen05_cluster_m": EnumFragment(cluster_m_choices),
             "tcgen05_ab_stages": IntegerFragment(1, 2, 2),
             "tcgen05_acc_stages": IntegerFragment(1, 2, 2),
             "tcgen05_c_stages": EnumFragment((2, 4)),
@@ -962,7 +999,7 @@ class ConfigSpec:
         if self.supports_config_key("load_eviction_policies"):
             fields["load_eviction_policies"] = self.load_eviction_policies
         if self.cute_tcgen05_search_enabled:
-            fields.update(self._tcgen05_optional_fragments())
+            fields.update(self._tcgen05_optional_fragments(for_search=True))
         # num_threads is backend-specific (only CuteBackend).
         # Not included in the autotuner search space because num_threads
         # values must divide block_sizes (which are also tuned), making

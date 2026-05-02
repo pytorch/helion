@@ -103,15 +103,21 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
             bound = cute_matmul_mma.bind(args)
         spec = bound.config_spec
         self.assertEqual([x.min_size for x in spec.block_sizes], [128, 8, 16])
-        self.assertEqual([x.max_size for x in spec.block_sizes], [256, 128, 16])
+        # tile_k upper bound was previously hardcoded to 16; the cute tcgen05
+        # path now allows multiples of 16 up to min(128, static_k) so the
+        # autotuner can pack more cute.gemm instructions per K iteration.
+        self.assertEqual([x.max_size for x in spec.block_sizes], [256, 128, 64])
         default_block_sizes = spec.default_config().config["block_sizes"]
-        self.assertEqual(default_block_sizes[2], 16)
+        self.assertGreaterEqual(default_block_sizes[2], 16)
+        self.assertLessEqual(default_block_sizes[2], 64)
         self.assertGreaterEqual(default_block_sizes[0], 128)
         self.assertLessEqual(default_block_sizes[0], 256)
         self.assertGreaterEqual(default_block_sizes[1], 8)
         self.assertLessEqual(default_block_sizes[1], 128)
         self.assertEqual(spec.default_config().config["l2_groupings"], [1])
-        self.assertEqual(spec.default_config().config["tcgen05_cluster_m"], 2)
+        # cluster_m default is now 1 (cluster_m=2 has runtime issues); the
+        # autotuner search space restricts the choice accordingly.
+        self.assertEqual(spec.default_config().config["tcgen05_cluster_m"], 1)
 
     @onlyBackends(["cute"])
     def test_cute_tcgen05_equal_dims_keep_default_within_max_bound(self) -> None:
@@ -149,15 +155,20 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
             bound = cute_matmul_mma.bind(args)
         spec = bound.config_spec
         self.assertEqual([x.min_size for x in spec.block_sizes], [128, 8, 16])
-        self.assertEqual([x.max_size for x in spec.block_sizes], [256, 256, 16])
+        # tile_k upper bound is now 128 (the static_k=8192 case; capped at 128
+        # to keep AB SMEM staging budget sane).
+        self.assertEqual([x.max_size for x in spec.block_sizes], [256, 256, 128])
         default_block_sizes = spec.default_config().config["block_sizes"]
-        self.assertEqual(default_block_sizes[2], 16)
+        self.assertGreaterEqual(default_block_sizes[2], 16)
+        self.assertLessEqual(default_block_sizes[2], 128)
         self.assertGreaterEqual(default_block_sizes[0], 128)
         self.assertLessEqual(default_block_sizes[0], 256)
         self.assertGreaterEqual(default_block_sizes[1], 8)
         self.assertLessEqual(default_block_sizes[1], 256)
         self.assertEqual(spec.default_config().config["l2_groupings"], [1])
-        self.assertEqual(spec.default_config().config["tcgen05_cluster_m"], 2)
+        # cluster_m default is now 1 (cluster_m=2 has runtime issues); the
+        # autotuner search space restricts the choice accordingly.
+        self.assertEqual(spec.default_config().config["tcgen05_cluster_m"], 1)
 
     @onlyBackends(["cute"])
     def test_cute_tcgen05_widened_default_stays_on_tcgen05_path(self) -> None:

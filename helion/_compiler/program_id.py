@@ -13,6 +13,7 @@ from .ast_extension import create
 from .ast_extension import expr_from_string
 from .ast_extension import statement_from_string
 from .compile_environment import CompileEnvironment
+from .cute.cutedsl_compat import emit_pipeline_advance
 from .device_function import DeviceFunction
 from .device_function import TensorArg
 from .host_function import HostFunction
@@ -994,7 +995,7 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                 statement_from_string(
                     f"{sched_pipeline}.producer_commit({sched_producer_state})"
                 ),
-                statement_from_string(f"{sched_producer_state}.advance()"),
+                statement_from_string(emit_pipeline_advance(sched_producer_state)),
             ]
             work_tile_consume = [
                 statement_from_string(
@@ -1007,7 +1008,7 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                 statement_from_string(
                     f"{sched_pipeline}.consumer_release({sched_consumer_state})"
                 ),
-                statement_from_string(f"{sched_consumer_state}.advance()"),
+                statement_from_string(emit_pipeline_advance(sched_consumer_state)),
             ]
         else:
             work_tile_publish = self._tcgen05_store_work_tile_statements(

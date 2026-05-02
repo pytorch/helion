@@ -2465,6 +2465,67 @@ class CuteBackend(Backend):
             return "cutlass.Float32"
         return self.dtype_str(dtype)
 
+    def supports_precompile(self) -> bool:
+        # The CuTe DSL does not expose a Triton-style precompile entry point;
+        # the autotuner has to compile + benchmark each config inline.
+        return False
+
+    def classify_autotune_exception(self, err: BaseException) -> str | None:
+        # Exceptions raised from inside the cute/cutlass DSL during compile or
+        # launch are expected when an invalid config is tried; treat them as
+        # benign so the autotuner moves on. Anything else (AssertionError,
+        # NameError/TypeError/AttributeError from generated code, ...) is
+        # almost certainly a real Helion bug and is surfaced at warn level so
+        # it gets noticed without terminating tuning.
+        cls = type(err)
+        module = getattr(cls, "__module__", "") or ""
+        if module.startswith(("cutlass", "cute")):
+            return "debug"
+        if isinstance(err, Exception):
+            return "warn"
+        return None
+
+    def get_do_bench(self) -> Callable[..., float | tuple[float, ...]]:
+        # The default Triton do_bench uses CUDA events that mis-time the CuTe
+        # path on Blackwell - launches show up as ~5ms when the kernel is
+        # actually 250ms+. Use synchronized wall-clock timing instead so
+        # autotune scores reflect real performance.
+        from ..autotuner.benchmarking import do_bench_generic
+
+        return do_bench_generic
+
+    def get_interleaved_bench(self) -> Callable[..., list[float]]:
+        # Same rationale as get_do_bench: the default interleaved bench uses
+        # CUDA events that mis-time the CuTe path. Use the synchronized
+        # wall-clock fallback so the autotuner's interleaved compare path
+        # produces real timings.
+        from ..autotuner.benchmarking import interleaved_bench_generic
+
+        return interleaved_bench_generic
+
+    def autotune(
+        self,
+        bound_kernel: BoundKernel[Any],
+        args: Sequence[object],
+        *,
+        force: bool = True,
+        **kwargs: object,
+    ) -> Config:
+        # When the user explicitly requests autotuning (force=True, e.g. via
+        # bound.autotune(...)), run the real Backend.autotune search. The
+        # default config for the cute matmul / tcgen05 path is too far from
+        # the optimum to be useful as a "no-op" autotune answer.
+        #
+        # When force=False (implicit autotune from __call__), keep the prior
+        # behavior of returning default_config(): the cute search space
+        # contains many invalid configs and full search would be far too
+        # expensive to trigger silently from a kernel call site.
+        # Note: Backend.autotune already does (force or settings.force_autotune)
+        # so we don't need to pre-OR; just forward whichever the caller passed.
+        if force or bound_kernel.settings.force_autotune:
+            return super().autotune(bound_kernel, args, force=force, **kwargs)
+        return bound_kernel.config_spec.default_config()
+
     @property
     def function_decorator(self) -> str:
         return "cute.kernel"
@@ -3244,16 +3305,6 @@ class CuteBackend(Backend):
             loop_order=loop_order,
             num_threads=flat_num_threads,
         )
-
-    def autotune(
-        self,
-        bound_kernel: BoundKernel[Any],
-        args: Sequence[object],
-        *,
-        force: bool = True,
-        **kwargs: object,
-    ) -> Config:
-        return bound_kernel.config_spec.default_config()
 
 
 class MetalBackend(Backend):

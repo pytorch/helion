@@ -109,7 +109,7 @@ jobs:
           path: |
             ~/.cache/uv
             ~/.venv
-          key: ${{ matrix.python-version }}-${{ matrix.runtime-version }}-${{ matrix.pytorch-version }}-${{ hashFiles('.github/workflows/test.yml') }}-${{ steps.date.outputs.month }}
+          key: ${{ matrix.python-version }}-${{ matrix.runtime-version }}-${{ matrix.pytorch-version }}-${{ matrix.backend }}-${{ hashFiles('.github/workflows/test.yml') }}-${{ steps.date.outputs.month }}
 
       - name: Install PyTorch
         run: |

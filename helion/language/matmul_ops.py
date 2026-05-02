@@ -277,6 +277,12 @@ def enforce_dot_requirements(lhs: torch.Tensor, rhs: torch.Tensor) -> None:
         and static_m >= 64
         and static_n >= 8
         and static_k >= 16
+        # The tcgen05 direct-store epilogue's predicated SIMT path
+        # CUDA-launch-fails for partial M tiles on B200. Gate the tcgen05
+        # specialization on M being a clean multiple of the minimum tcgen05
+        # M tile (64) so generated tiles are always full and the predicated
+        # branch is never taken.
+        and static_m % 64 == 0
     ):
         from .._compiler.cute.mma_support import get_cute_mma_support
 
@@ -287,12 +293,27 @@ def enforce_dot_requirements(lhs: torch.Tensor, rhs: torch.Tensor) -> None:
 
             spec = env.config_spec
             spec.cute_tcgen05_search_enabled = True
+            # The current tcgen05 lowering does not interoperate with the
+            # persistent virtual-pid loop on B200; combining them produces
+            # CUDA_ERROR_LAUNCH_FAILED at runtime. Drop those pid types from
+            # the autotune search until the lowering is fixed.
+            spec.disallow_pid_type("persistent_blocked")
+            spec.disallow_pid_type("persistent_interleaved")
+            # cluster_m=2 (2-CTA tcgen05 instructions) currently CUDA-launch-
+            # fails on B200 across all matmul block-size combinations
+            # exercised. Narrow the autotune search to cluster_m=1 for the
+            # BF16/FP16 matmul path until the 2-CTA lowering is fixed.
+            spec.restrict_tcgen05_cluster_m_search((1,))
             max_tcgen05_n = min(256, pow2_floor_at_least(static_n, 8))
             max_tcgen05_m = 256 if max_tcgen05_n >= 128 and static_m >= 256 else 128
+            # Larger tile_k packs more cute.gemm instructions per K loop
+            # iteration on tcgen05 (mma instruction K is fixed at 16 for
+            # BF16/FP16). Cap at 128 to keep AB SMEM staging budget sane.
+            max_tcgen05_k = min(128, pow2_floor_at_least(static_k, 16))
             for axis_name, shape, max_size in (
                 ("m", m, min(max_tcgen05_m, pow2_floor_at_least(static_m, 64))),
                 ("n", n, min(max_tcgen05_n, pow2_floor_at_least(static_n, 8))),
-                ("k", k, 16),
+                ("k", k, max_tcgen05_k),
             ):
                 block_idx = env.get_block_id(shape)
                 if block_idx is None:

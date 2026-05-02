@@ -39,6 +39,7 @@ from ..device_function import CuteTcgen05StoreValue
 from ..dtype_utils import cast_ast
 from ..matmul_utils import _needs_f32_accumulator
 from ..tile_strategy import DeviceLoopState
+from .cutedsl_compat import emit_pipeline_advance
 from .layout import MatmulExecutionKind
 from .layout import MatmulExecutionPlan
 from .matmul_utils import analyze_direct_grouped_n_loads
@@ -781,11 +782,13 @@ def _emit_mma_pipeline(
         or n_block_id is None
     ):
         return None
-    # The direct accumulator-to-output drain is still only used on the narrow
-    # N=8 family. Wider tcgen05 tiles now run through the output-TMA / staged
-    # epilogue path, which is working on current B200 runs but is still a
-    # separate lowering family from the narrow direct-store path.
-    tcgen05_direct_store = bn <= 8
+    # All tcgen05 widths share the direct TMEM->register->GMEM SIMT epilogue
+    # emitted by `_codegen_cute_store_tcgen05_tile` in
+    # `helion/language/memory_ops.py`. It uses
+    # `cutlass.utils.gemm.sm100.epilogue_tmem_copy_and_partition` for the
+    # TMEM->reg copy and a SIMT `CopyUniversalOp` for the reg->GMEM store on
+    # the four epi warps, avoiding the SMEM round-trip used by the previous
+    # staged path.
 
     m_index_var = cg.index_var(m_block_id)
     n_index_var = cg.index_var(n_block_id)
@@ -1583,7 +1586,7 @@ def _emit_mma_pipeline(
                             + ")\n"
                         )
                         + f"    {tma_pipeline}.producer_commit({tma_producer_state})\n"
-                        f"    {tma_producer_state}.advance()"
+                        + emit_pipeline_advance(tma_producer_state, indent="    ")
                     )
                 )
                 if tcgen05_ab_stage_count_value > 1:
@@ -1621,7 +1624,7 @@ def _emit_mma_pipeline(
                                 + ")\n"
                             )
                             + f"    {tma_pipeline}.producer_commit({tma_producer_state})\n"
-                            f"    {tma_producer_state}.advance()"
+                            + emit_pipeline_advance(tma_producer_state, indent="    ")
                         )
                     )
     else:
@@ -1870,7 +1873,8 @@ def _emit_mma_pipeline(
                             + ")\n"
                         )
                         + f"        {tma_pipeline}.producer_commit({tma_producer_state})\n"
-                        f"        {tma_producer_state}.advance()\n"
+                        + emit_pipeline_advance(tma_producer_state, indent="        ")
+                        + "\n"
                         f"    if {tcgen05_plan.exec_active}:\n"
                         f"{tma_wait_src}"
                         "else:\n"
@@ -1967,7 +1971,7 @@ def _emit_mma_pipeline(
         )
         cg.add_statement(
             statement_from_string(
-                f"cute.gemm({tiled_mma}, {acc_frag}, {rA}, {rB}, {acc_frag})"
+                f"cute.gemm({tiled_mma}, {acc_frag}, [{rA}], [{rB}], {acc_frag})"
             )
         )
     else:
@@ -1984,7 +1988,7 @@ def _emit_mma_pipeline(
                     f"        {rA}[_mma_i] = {tAsA}[_mma_i]\n"
                     f"    for _mma_i in range(cute.size({rB})):\n"
                     f"        {rB}[_mma_i] = {tBsB}[_mma_i]\n"
-                    f"    cute.gemm({tiled_mma}, {acc_frag}, {rA}, {rB}, {acc_frag})"
+                    f"    cute.gemm({tiled_mma}, {acc_frag}, [{rA}], [{rB}], {acc_frag})"
                 )
             )
         else:
@@ -2005,8 +2009,8 @@ def _emit_mma_pipeline(
                     f"        cute.gemm(\n"
                     f"            {tiled_mma},\n"
                     f"            {acc_frag},\n"
-                    f"            {tcgen05_frag_a}[None, None, cutlass.Int32(_tcgen05_kblk_idx), {mma_stage}],\n"
-                    f"            {tcgen05_frag_b}[None, None, cutlass.Int32(_tcgen05_kblk_idx), {mma_stage}],\n"
+                    f"            [{tcgen05_frag_a}[None, None, cutlass.Int32(_tcgen05_kblk_idx), {mma_stage}]],\n"
+                    f"            [{tcgen05_frag_b}[None, None, cutlass.Int32(_tcgen05_kblk_idx), {mma_stage}]],\n"
                     f"            {acc_frag},\n"
                     "        )"
                 )
@@ -2021,7 +2025,10 @@ def _emit_mma_pipeline(
                             f"if {tma_full_tile}:\n"
                             f"    if {tcgen05_plan.exec_active}:\n"
                             f"{tma_release_src}"
-                            f"        {tma_consumer_state}.advance()\n"
+                            + emit_pipeline_advance(
+                                tma_consumer_state, indent="        "
+                            )
+                            + "\n"
                             "else:\n"
                             "    cute.arch.sync_threads()"
                         )
@@ -2034,8 +2041,10 @@ def _emit_mma_pipeline(
                             f"    if {tcgen05_plan.exec_active}:\n"
                             "        cute.arch.sync_warp()\n"
                             f"{tma_release_src}"
-                            f"    {tma_producer_state}.advance()\n"
-                            f"    {tma_consumer_state}.advance()\n"
+                            + emit_pipeline_advance(tma_producer_state, indent="    ")
+                            + "\n"
+                            + emit_pipeline_advance(tma_consumer_state, indent="    ")
+                            + "\n"
                             "else:\n"
                             "    cute.arch.sync_threads()"
                         )
@@ -2045,40 +2054,17 @@ def _emit_mma_pipeline(
 
     # === outer_suffix: convert fragment → per-thread scalar ===
     # Allocate smem_c in outer_prefix so all smem is allocated at the same
-    # scope level (CuTe DSL assigns static smem offsets per scope).
+    # scope level (CuTe DSL assigns static smem offsets per scope). Only the
+    # `universal` and `warp` MMA paths still need the staged smem_c buffer;
+    # tcgen05 now uses the direct TMEM->reg->GMEM SIMT epilogue from
+    # `_codegen_cute_store_tcgen05_tile` and skips the smem_c allocation.
     smem_c_ptr = df.new_var("smem_c")
     smem_c = df.new_var("smem_c_t")
     tCsC = df.new_var("tCsC")
-    tcgen05_kernel_desc = df.new_var("tcgen05_kernel_desc")
-    tcgen05_tacc = df.new_var("tcgen05_tacc")
-    tcgen05_tacc_epi = df.new_var("tcgen05_tacc_epi")
-    tcgen05_tiled_copy_t2r = df.new_var("tcgen05_tiled_copy_t2r")
-    tcgen05_thr_copy_t2r = df.new_var("tcgen05_thr_copy_t2r")
-    tcgen05_ttr_tacc_base = df.new_var("tcgen05_ttr_tacc_base")
-    tcgen05_ttr_tacc_stage = df.new_var("tcgen05_ttr_tacc_stage")
-    tcgen05_ttr_tacc = df.new_var("tcgen05_ttr_tacc")
-    tcgen05_ttr_tacc_mn = df.new_var("tcgen05_ttr_tacc_mn")
-    tcgen05_ttr_racc = df.new_var("tcgen05_ttr_racc")
-    tcgen05_tcgc = df.new_var("tcgen05_tcgc")
-    tcgen05_tcgc_planned = df.new_var("tcgen05_tcgc_planned")
-    tcgen05_tcgc_epi = df.new_var("tcgen05_tcgc_epi")
-    tcgen05_ttr_gc = df.new_var("tcgen05_ttr_gC")
-    tcgen05_ttr_gc_grouped = df.new_var("tcgen05_ttr_gC_grouped")
-    tcgen05_ttr_rc = df.new_var("tcgen05_ttr_rc")
-    tcgen05_mcld = df.new_var("tcgen05_mcld")
-    tcgen05_num_bits = df.new_var("tcgen05_num_bits")
-    tcgen05_simt_atom = df.new_var("tcgen05_simt_atom")
-    tcgen05_acc_vec = df.new_var("tcgen05_acc_vec")
-    tcgen05_subtile_count = df.new_var("tcgen05_subtile_count")
     result_var = df.new_var("mma_result")
-    tcgen05_root_output_tma = False
 
     tile_numel = bm * bn
-    if mma_impl == "tcgen05":
-        tcgen05_root_output_tma = False
-    if mma_impl != "tcgen05" or (
-        not tcgen05_direct_store and not tcgen05_root_output_tma
-    ):
+    if mma_impl != "tcgen05":
         prefix.append(
             statement_from_string(
                 f"{smem_c_ptr} = cute.arch.alloc_smem({acc_dtype_str}, {tile_numel}, alignment=128)"
@@ -2123,195 +2109,16 @@ def _emit_mma_pipeline(
                 )
             )
             suffix.append(
-                statement_from_string(f"{tcgen05_plan.acc_producer_state}.advance()")
+                statement_from_string(
+                    emit_pipeline_advance(tcgen05_plan.acc_producer_state)
+                )
             )
-            if not tcgen05_direct_store:
-                epi_warp_ids = ", ".join(
-                    f"cutlass.Int32({i})" for i in range(tcgen05_epi_warp_count_value)
-                )
-                if tcgen05_epi_warp_count_value == 1:
-                    epi_warp_ids += ","
-                suffix.append(statement_from_string("cute.arch.sync_threads()"))
-                suffix.append(
-                    statement_from_string(
-                        f"{tcgen05_kernel_desc} = type('Tcgen05KernelDesc', (), {{"
-                        f"'cta_tile_shape_mnk': ({bm}, {bn}, {bk}), "
-                        f"'c_layout': {tcgen05_plan.c_layout}, "
-                        f"'c_dtype': {acc_dtype_str}, "
-                        f"'acc_dtype': {acc_dtype_str}, "
-                        f"'epilog_sync_bar_id': cutlass.Int32({_tcgen05_epilog_sync_barrier_id()}), "
-                        f"'epilogue_warp_id': ({epi_warp_ids}), "
-                        f"'num_c_stage': cutlass.Int32({tcgen05_c_stage_count_value}), "
-                        f"'use_2cta_instrs': {tcgen05_is_two_cta!s}"
-                        "})()"
-                    )
-                )
-                suffix.append(
-                    statement_from_string(
-                        f"{tcgen05_tcgc} = "
-                        "cutlass.utils.gemm.sm100.transform_partitioned_tensor_layout("
-                        f"{thr_mma}.partition_C({smem_c}))"
-                    )
-                )
-                suffix.append(
-                    statement_from_string(
-                        f"{tcgen05_tcgc_planned} = {_tcgen05_epilogue_dest_expr(tcgen05_plan, tcgen05_tcgc)}"
-                    )
-                )
-                suffix.append(
-                    statement_from_string(
-                        f"{tcgen05_tacc} = "
-                        "cutlass.utils.gemm.sm100.transform_partitioned_tensor_layout("
-                        f"{tcgen05_epi_acc_frag_base})"
-                    )
-                )
-                suffix.append(
-                    statement_from_string(
-                        f"{tcgen05_tiled_copy_t2r}, {tcgen05_ttr_tacc_base}, {tcgen05_ttr_racc} = "
-                        "cutlass.utils.gemm.sm100.epilogue_tmem_copy_and_partition("
-                        f"{tcgen05_kernel_desc}, {epi_tidx}, {tcgen05_tacc}, "
-                        f"{tcgen05_tcgc_planned}, {tcgen05_plan.epi_tile}, {tcgen05_is_two_cta!s})"
-                    )
-                )
-                suffix.append(
-                    statement_from_string(
-                        f"{tcgen05_thr_copy_t2r} = "
-                        f"{tcgen05_tiled_copy_t2r}.get_slice({epi_tidx})"
-                    )
-                )
-                suffix.append(
-                    statement_from_string(
-                        f"{tcgen05_tacc_epi} = cute.flat_divide({tcgen05_tacc}, {tcgen05_plan.epi_tile})"
-                    )
-                )
-                suffix.append(
-                    statement_from_string(
-                        f"{tcgen05_tcgc_epi} = cute.flat_divide({tcgen05_tcgc_planned}, {tcgen05_plan.epi_tile})"
-                    )
-                )
-                suffix.append(
-                    statement_from_string(
-                        f"{tcgen05_ttr_gc} = {tcgen05_thr_copy_t2r}.partition_D({tcgen05_tcgc_epi})"
-                    )
-                )
-                suffix.append(
-                    statement_from_string(
-                        f"{tcgen05_ttr_rc} = "
-                        f"cute.make_rmem_tensor({tcgen05_ttr_racc}.shape, {acc_dtype_str})"
-                    )
-                )
-                suffix.append(
-                    statement_from_string(
-                        f"{tcgen05_ttr_tacc_stage} = "
-                        f"{tcgen05_ttr_tacc_base}[(None, None, None, None, None, {tcgen05_plan.acc_consumer_state}.index)]"
-                    )
-                )
-                suffix.append(
-                    statement_from_string(
-                        f"if {epi_active}:\n"
-                        f"    {tcgen05_plan.acc_pipeline}.consumer_wait({tcgen05_plan.acc_consumer_state})"
-                    )
-                )
-                suffix.append(
-                    statement_from_string(
-                        f"{tcgen05_ttr_tacc} = cute.group_modes("
-                        f"{tcgen05_ttr_tacc_stage}, 3, cute.rank({tcgen05_ttr_tacc_stage}))"
-                    )
-                )
-                suffix.append(
-                    statement_from_string(
-                        f"{tcgen05_ttr_gc_grouped} = cute.group_modes("
-                        f"{tcgen05_ttr_gc}, 3, cute.rank({tcgen05_ttr_gc}))"
-                    )
-                )
-                suffix.append(
-                    statement_from_string(
-                        f"{tcgen05_mcld} = cute.max_common_layout("
-                        f"{tcgen05_ttr_rc}.layout, "
-                        f"{tcgen05_ttr_gc_grouped}[(None, None, None, 0)].layout)"
-                    )
-                )
-                suffix.append(
-                    statement_from_string(
-                        f"{tcgen05_num_bits} = min("
-                        f"{tcgen05_ttr_gc_grouped}.iterator.alignment * 8, "
-                        f"cute.size({tcgen05_mcld}) * {acc_dtype_str}.width, 256)"
-                    )
-                )
-                suffix.append(
-                    statement_from_string(
-                        f"{tcgen05_simt_atom} = cute.make_copy_atom("
-                        f"cute.nvgpu.CopyUniversalOp(), {acc_dtype_str}, "
-                        f"num_bits_per_copy={tcgen05_num_bits}, "
-                        f"l1c_evict_priority=cute.nvgpu.CacheEvictionPriority.NO_ALLOCATE)"
-                    )
-                )
-                suffix.append(
-                    statement_from_string(
-                        f"{tcgen05_subtile_count} = cute.size({tcgen05_ttr_tacc}.shape, mode=[3])"
-                    )
-                )
-                suffix.append(
-                    statement_from_string(
-                        f"for _tcgen05_subtile in range({tcgen05_subtile_count}):\n"
-                        f"    if {epi_active}:\n"
-                        f"        {tcgen05_ttr_tacc_mn} = {tcgen05_ttr_tacc}[(None, None, None, cutlass.Int32(_tcgen05_subtile))]\n"
-                        f"        cute.copy({tcgen05_tiled_copy_t2r}, {tcgen05_ttr_tacc_mn}, {tcgen05_ttr_racc})\n"
-                        f"        {tcgen05_acc_vec} = {tcgen05_ttr_racc}.load()\n"
-                        f"        {tcgen05_ttr_rc}.store({tcgen05_acc_vec})\n"
-                        f"        cute.copy({tcgen05_simt_atom}, {tcgen05_ttr_rc}, {tcgen05_ttr_gc_grouped}[(None, None, None, cutlass.Int32(_tcgen05_subtile))])\n"
-                        f"    cute.arch.sync_threads()"
-                    )
-                )
-                suffix.append(
-                    statement_from_string(
-                        f"if {epi_active}:\n"
-                        "    with cute.arch.elect_one():\n"
-                        f"        {tcgen05_plan.acc_pipeline}.consumer_release({tcgen05_plan.acc_consumer_state})"
-                    )
-                )
-                suffix.append(
-                    statement_from_string(
-                        f"{tcgen05_plan.acc_consumer_state}.advance()"
-                    )
-                )
-                suffix.append(statement_from_string("cute.arch.sync_threads()"))
-                if tcgen05_use_tma:
-                    suffix.append(
-                        statement_from_string(
-                            f"if {tma_warp}:\n"
-                            f"    {tma_pipeline}.producer_tail({tma_producer_state})"
-                        )
-                    )
-                suffix.append(
-                    statement_from_string(
-                        f"if {tcgen05_plan.exec_active}:\n"
-                        f"    {tcgen05_plan.acc_pipeline}.producer_tail({tcgen05_plan.acc_producer_state})"
-                    )
-                )
-                suffix.append(
-                    statement_from_string(
-                        f"{tcgen05_plan.tmem_allocator} = cutlass.utils.TmemAllocator("
-                        f"{tcgen05_plan.tmem_holding_buf}, "
-                        f"barrier_for_retrieve={tcgen05_plan.tmem_alloc_barrier}, "
-                        f"allocator_warp_id=0, is_two_cta={tcgen05_is_two_cta!s}, "
-                        f"two_cta_tmem_dealloc_mbar_ptr={tcgen05_plan.tmem_dealloc_mbar_ptr}, "
-                        f"num_allocated_columns={tcgen05_plan.acc_tmem_cols}, "
-                        "dealloc_mbarrier_initialized=True)"
-                    )
-                )
-                suffix.append(
-                    statement_from_string(
-                        f"if {epi_active}:\n"
-                        f"    {tcgen05_plan.tmem_allocator}.relinquish_alloc_permit()"
-                    )
-                )
-                suffix.append(
-                    statement_from_string(
-                        f"if {epi_active}:\n"
-                        f"    {tcgen05_plan.tmem_allocator}.free({tcgen05_epi_acc_tmem_ptr})"
-                    )
-                )
+            # The full TMEM->reg->GMEM epilogue + allocator teardown for
+            # tcgen05 is emitted by `_codegen_cute_store_tcgen05_tile` when
+            # the kernel actually stores `out[tile_m, tile_n] = result`. That
+            # path covers all bn widths now (the previously separate
+            # staged-via-smem_c flow has been removed; the dead code lived
+            # here).
             suffix.append(statement_from_string("cute.arch.sync_threads()"))
 
     if mma_impl == "tcgen05":
@@ -2327,9 +2134,7 @@ def _emit_mma_pipeline(
                 bm=bm,
                 bn=bn,
                 bk=bk,
-                smem_name=""
-                if tcgen05_direct_store or tcgen05_root_output_tma
-                else smem_c,
+                smem_name="",
                 thr_mma=thr_mma,
                 store_thr_mma=thr_mma,
                 epi_warp_count=tcgen05_epi_warp_count_value,
@@ -2358,6 +2163,8 @@ def _emit_mma_pipeline(
                 tma_producer_state=tma_producer_state,
                 is_two_cta=tcgen05_is_two_cta,
                 use_tma=tcgen05_use_tma,
+                ab_stage_count=tcgen05_ab_stage_count_value,
+                acc_stage_count=tcgen05_acc_stage_count_value,
             ),
         )
     else:
@@ -2498,15 +2305,22 @@ def _mma_impl_matches_problem_shape(
         return True
     if (
         input_dtype not in (torch.float16, torch.bfloat16)
-        or bk != 16
         or bn < 8
         or bn > 256
         or bn % 8 != 0
     ):
         return False
     if mma_impl == "warp":
-        return bm >= 16 and bm % 16 == 0 and bn == 8
+        # Warp MMA atom is fixed-K (16 elements per BF16/FP16 instruction).
+        return bk == 16 and bm >= 16 and bm % 16 == 0 and bn == 8
     if mma_impl == "tcgen05":
+        # tcgen05 mma instruction K is 16 elements for BF16/FP16, but the
+        # tile's K can be any positive multiple of that (the inner cute.gemm
+        # loop just runs more instructions per K iteration). Larger tile_k
+        # roughly halves the per-K-iter overhead per doubling. Capped at 256
+        # to keep AB SMEM staging budget sane.
+        if bk < 16 or bk > 256 or bk % 16 != 0:
+            return False
         if bm in (64, 128):
             return True
         return bm == 256 and tcgen05_cluster_m == 2
@@ -3078,7 +2892,7 @@ def codegen_cute_mma_direct_mm(
             f"                {rA}[_mma_i] = {tAsA}[_mma_i]\n"
             f"            for _mma_i in range(cute.size({rB})):\n"
             f"                {rB}[_mma_i] = {tBsB}[_mma_i]\n"
-            f"            cute.gemm({tiled_mma}, {acc_frag}, {rA}, {rB}, {acc_frag})\n"
+            f"            cute.gemm({tiled_mma}, {acc_frag}, [{rA}], [{rB}], {acc_frag})\n"
             f"        cute.arch.sync_threads()"
         )
     )

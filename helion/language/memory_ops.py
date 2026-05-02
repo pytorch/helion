@@ -14,6 +14,9 @@ from .._compiler.ast_extension import expr_from_string
 from .._compiler.ast_extension import statement_from_string
 from .._compiler.compile_environment import CompileEnvironment
 from .._compiler.compile_environment import _symint_expr
+from .._compiler.cute.cutedsl_compat import emit_pipeline_advance
+from .._compiler.cute.cutedsl_compat import emit_producer_tail_tma_umma
+from .._compiler.cute.cutedsl_compat import emit_producer_tail_umma_async
 from .._compiler.host_function import HostFunction
 from .._compiler.indexing_strategy import SubscriptIndexing
 from .._compiler.pallas import codegen as pallas_codegen
@@ -976,15 +979,43 @@ def _codegen_cute_store_tcgen05_tile(
             f"num_bits_per_copy={num_bits}, "
             f"l1c_evict_priority=cute.nvgpu.CacheEvictionPriority.NO_ALLOCATE)"
         ),
-        f"{subtile_count} = cute.size({ttr_tacc}.shape, mode=[3])",
+        f"{subtile_count} = cutlass.const_expr(cute.size({ttr_tacc}.shape, mode=[3]))",
         (
-            f"for _tcgen05_subtile in range({subtile_count}):\n"
+            # Per-subtile loop: TMEM->reg (t2r) first, then reg->GMEM (SIMT
+            # store). On the last subtile we release the acc consumer slot
+            # *before* the GMEM store so the next mainloop tile's MMA can
+            # producer_acquire the TMEM stage and begin issuing UMMAs while
+            # this tile's epilogue is still draining to GMEM. This mirrors the
+            # release-acc-inside-the-subtile-loop pattern in Quack's sm100
+            # gemm epilogue. Without c_pipeline SMEM staging we can only
+            # release after the final t2r (not per-subtile), but even one
+            # tile of overlap measurably improves the wide tcgen05 path on
+            # B200. `cutlass.range(..., unroll_full=True)` keeps the loop
+            # statically unrolled so `tiled_copy_t2r` (a TiledCopy that wraps
+            # a tcgen05 tmem_load atom) is not captured as an scf.for iter_arg
+            # — the cute-to-nvvm pass cannot legalize that conversion through
+            # iter_args and aborts during compile.
+            f"for _tcgen05_subtile in cutlass.range({subtile_count}, unroll_full=True):\n"
             f"    if {tcgen05_value.epi_active}:\n"
             f"        {ttr_tacc_mn} = {ttr_tacc}[(None, None, None, cutlass.Int32(_tcgen05_subtile))]\n"
             f"        {ttr_gc_subtile} = {ttr_gc_grouped}[(None, None, None, cutlass.Int32(_tcgen05_subtile))]\n"
             f"        cute.copy({tiled_copy_t2r}, {ttr_tacc_mn}, {ttr_racc})\n"
             f"        {acc_vec} = {ttr_racc}.load().to({target_dtype})\n"
             f"        {ttr_rd}.store({acc_vec})\n"
+            f"        if _tcgen05_subtile == {subtile_count} - 1:\n"
+            # `cute.copy(t2r, ...)` issues async TMEM->reg loads. Releasing
+            # the acc consumer slot lets the MMA producer re-acquire the TMEM
+            # stage and issue UMMAs that overwrite TMEM, so we must fence the
+            # in-flight async TMEM loads first to avoid a race on the last
+            # subtile's `ttr_racc` / `ttr_rd` data. This matches Quack's
+            # sm100 gemm fence-before-release pattern.
+            f"            cute.arch.fence_view_async_tmem_load()\n"
+            f"            with cute.arch.elect_one():\n"
+            f"                {tcgen05_value.acc_pipeline}.consumer_release({tcgen05_value.acc_consumer_state})\n"
+            + emit_pipeline_advance(
+                tcgen05_value.acc_consumer_state, indent="            "
+            )
+            + "\n"
             f"        if {full_tile}:\n"
             f"            cute.copy({simt_atom}, {ttr_rd}, {ttr_gc_subtile})\n"
             f"        else:\n"
@@ -1002,17 +1033,18 @@ def _codegen_cute_store_tcgen05_tile(
             f"                    _coord = {ttr_cc_subtile}[(0, _pred_m, _pred_n)]\n"
             f"                    {pred_c}[(0, _pred_m, _pred_n)] = cute.elem_less(_coord, ({m_size}, {n_size}))\n"
             f"            cute.copy({simt_atom}, {ttr_rd}, {ttr_gc_subtile}, pred={pred_c})\n"
-            f"        if _tcgen05_subtile == {subtile_count} - 1:\n"
-            f"            with cute.arch.elect_one():\n"
-            f"                {tcgen05_value.acc_pipeline}.consumer_release({tcgen05_value.acc_consumer_state})\n"
-            f"            {tcgen05_value.acc_consumer_state}.advance()\n"
         ),
         "cute.arch.sync_threads()",
     ]
     if tcgen05_value.use_tma:
         store_body.append(
             f"if {tcgen05_value.tma_warp}:\n"
-            f"    {tcgen05_value.tma_pipeline}.producer_tail({tcgen05_value.tma_producer_state})"
+            + emit_producer_tail_tma_umma(
+                tcgen05_value.tma_pipeline,
+                tcgen05_value.tma_producer_state,
+                num_stages=tcgen05_value.ab_stage_count,
+                indent="    ",
+            )
         )
     store_body.extend(
         [
@@ -1022,7 +1054,12 @@ def _codegen_cute_store_tcgen05_tile(
             ),
             (
                 f"if {tcgen05_value.exec_active}:\n"
-                f"    {tcgen05_value.acc_pipeline}.producer_tail({tcgen05_value.acc_producer_state})"
+                + emit_producer_tail_umma_async(
+                    tcgen05_value.acc_pipeline,
+                    tcgen05_value.acc_producer_state,
+                    num_stages=tcgen05_value.acc_stage_count,
+                    indent="    ",
+                )
             ),
             (
                 f"{tcgen05_value.tmem_allocator} = cutlass.utils.TmemAllocator("
