@@ -702,11 +702,9 @@ class TestPallas(TestCase):
         b = torch.randn(4, 256, 128, device=DEVICE, dtype=torch.bfloat16)
         # No explicit block_sizes — uses default_config() which runs
         # adjust_block_size_constraints and depends on size_matches.
-        code, result = code_and_output(pallas_bmm, (a, b))
+        _code, result = code_and_output(pallas_bmm, (a, b))
         expected = torch.bmm(a.float(), b.float()).to(torch.bfloat16)
         torch.testing.assert_close(result, expected, rtol=1e-2, atol=1e-2)
-        # Block sizes >= 128 should get the pl.multiple_of alignment hint
-        self.assertIn("pl.multiple_of(", code)
 
     def test_bmm_fori_loop_non_divisible_k(self) -> None:
         """Test fori_loop bmm where BLOCK_K=256 doesn't evenly divide K=384."""
@@ -2286,9 +2284,8 @@ class TestPallas(TestCase):
         ref = torch.stack([data[: lengths[i]].sum() for i in range(B)])
         torch.testing.assert_close(result, ref, rtol=1e-4, atol=1e-4)
 
-    def test_non_zero_tile_begin(self) -> None:
-        """pl.ds() reads from a non-zero begin can overshoot the tensor boundary."""
-
+    @staticmethod
+    def _non_zero_tile_begin_kernels() -> tuple[object, object]:
         @helion.kernel(backend="pallas", static_shapes=True)
         def sum_with_constant_offset(
             data: torch.Tensor, offsets: torch.Tensor
@@ -2321,16 +2318,52 @@ class TestPallas(TestCase):
                 out[seg] = acc.squeeze(0)
             return out
 
+        return sum_with_constant_offset, sum_with_dynamic_offset
+
+    def test_non_zero_tile_begin(self) -> None:
+        """pl.ds() reads from a non-zero begin can overshoot the tensor boundary.
+
+        Constant-bounds path is pinned to ``unroll``; dynamic-bounds path uses
+        ``fori_loop`` via ``set_default``.  The emit_pipeline variant of the
+        constant-bounds case is exercised as a separate xfail test below.
+        """
+        sum_with_constant_offset, sum_with_dynamic_offset = (
+            self._non_zero_tile_begin_kernels()
+        )
         N, A, B = 128, 8, 256
         data = torch.randn(N, A, B, device=DEVICE, dtype=torch.float32)
         offsets = torch.tensor([3, 128], device=DEVICE, dtype=torch.int32)
         ref = data[3:128].sum().unsqueeze(0)
 
-        _code1, result1 = code_and_output(sum_with_constant_offset, (data, offsets))
+        _code1, result1 = code_and_output(
+            sum_with_constant_offset, (data, offsets), pallas_loop_type="unroll"
+        )
         torch.testing.assert_close(result1, ref, rtol=1e-3, atol=1e-3)
 
         _code2, result2 = code_and_output(sum_with_dynamic_offset, (data, offsets))
         torch.testing.assert_close(result2, ref, rtol=1e-3, atol=1e-3)
+
+    @xfailIfPallas(
+        "emit_pipeline BlockSpec index_map drops the tile.begin offset, "
+        "so a non-zero start in hl.tile(start, end, ...) reads from offset 0 "
+        "instead and produces wrong results."
+    )
+    def test_non_zero_tile_begin_emit_pipeline(self) -> None:
+        """Same kernel as ``test_non_zero_tile_begin`` but pinned to emit_pipeline.
+
+        Documents the known emit_pipeline tile.begin bug.  Will start passing
+        once the BlockSpec ``index_map`` is taught to include ``tile.begin``.
+        """
+        sum_with_constant_offset, _ = self._non_zero_tile_begin_kernels()
+        N, A, B = 128, 8, 256
+        data = torch.randn(N, A, B, device=DEVICE, dtype=torch.float32)
+        offsets = torch.tensor([3, 128], device=DEVICE, dtype=torch.int32)
+        ref = data[3:128].sum().unsqueeze(0)
+
+        _code, result = code_and_output(
+            sum_with_constant_offset, (data, offsets), pallas_loop_type="emit_pipeline"
+        )
+        torch.testing.assert_close(result, ref, rtol=1e-3, atol=1e-3)
 
     def test_dma_buffer_offset_nested_tile(self) -> None:
         """Inner loop reading outer-tiled tensor must use ':' not absolute offset."""

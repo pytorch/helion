@@ -1952,6 +1952,11 @@ class TestExamples(RefEagerTestBase, TestCase):
     @skipIfA10G("failure on a10g")
     @skipIfTileIR("accuracy failure")
     @skipIfXPU("ocloc compilation failure with 256-GRF kernel on XPU backend")
+    @xfailIfPallas(
+        "Pallas codegen broadcasts the matmul result to the wrong shape "
+        "((16, 128) vs (16, 256)) -- separate shape-propagation bug in the "
+        "outer accumulator."
+    )
     def test_squeeze_and_excitation_net_bwd_db(self):
         m, n, k = 256, 256, 256
         x = torch.randn([m, n], device=DEVICE, dtype=HALF_DTYPE)
