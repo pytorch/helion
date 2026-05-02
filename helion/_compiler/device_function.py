@@ -405,9 +405,8 @@ class DeviceFunction:
         self.deferred_rdim_defs: list[tuple[str, sympy.Expr]] = []
         self._cute_tcgen05_store_values: dict[str, CuteTcgen05StoreValue] = {}
         self.cute_tcgen05_matmul_plan: CuteTcgen05MatmulPlan | None = None
-        self._cute_tcgen05_invariant_setup_stmt_ids: set[int] = set()
         self._cute_tcgen05_per_tile_stmt_ids: set[int] = set()
-        self._cute_tcgen05_post_persistent_loop_stmts: list[ast.stmt] = []
+        self._cute_tcgen05_post_loop_stmt_ids: set[int] = set()
         self._cute_collective_handled_loads: set[str] = set()
         self.cute_cluster_shape: tuple[int, int, int] | None = None
         self.cute_block_shape: tuple[int, int, int] | None = None
@@ -602,12 +601,6 @@ class DeviceFunction:
             return
         self.cute_tcgen05_matmul_plan = plan
 
-    def register_cute_tcgen05_invariant_setup(self, stmts: list[ast.AST]) -> None:
-        self._cute_tcgen05_invariant_setup_stmt_ids.update(id(stmt) for stmt in stmts)
-
-    def is_cute_tcgen05_invariant_setup(self, stmt: ast.stmt) -> bool:
-        return id(stmt) in self._cute_tcgen05_invariant_setup_stmt_ids
-
     def register_cute_tcgen05_per_tile_stmts(self, stmts: list[ast.AST]) -> None:
         """Mark statements that depend on per-tile coordinates.
 
@@ -627,6 +620,29 @@ class DeviceFunction:
     @property
     def has_cute_tcgen05_per_tile_marks(self) -> bool:
         return bool(self._cute_tcgen05_per_tile_stmt_ids)
+
+    def register_cute_tcgen05_post_loop_stmts(self, stmts: list[ast.AST]) -> None:
+        """Mark statements that should run AFTER the persistent work-tile loop.
+
+        This is the natural home for one-shot pipeline drains (``producer_tail``),
+        TMEM deallocation, and any other cleanup that conceptually runs once
+        the kernel has finished all its tiles. Without this tag, those
+        statements would remain inside the work-tile loop and execute on
+        every virtual tile, which is at best wasted work and at worst
+        incorrect (re-freeing a TMEM buffer the next tile still needs).
+
+        Non-persistent kernels skip the post-loop split entirely; the
+        statements stay where the codegen emitted them, which is already
+        the end of the device function.
+        """
+        self._cute_tcgen05_post_loop_stmt_ids.update(id(stmt) for stmt in stmts)
+
+    def is_cute_tcgen05_post_loop(self, stmt: ast.stmt) -> bool:
+        return id(stmt) in self._cute_tcgen05_post_loop_stmt_ids
+
+    @property
+    def has_cute_tcgen05_post_loop_marks(self) -> bool:
+        return bool(self._cute_tcgen05_post_loop_stmt_ids)
 
     def get_cute_tcgen05_store_value(self, name: str) -> CuteTcgen05StoreValue | None:
         for alias in self._variable_renames.get(name, [name]):

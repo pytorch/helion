@@ -812,7 +812,7 @@ def _codegen_cute_store_tcgen05_tile(
     ast_subscript: list[object] | tuple[object, ...],
     extra_mask: ast.AST | None,
     value_name: str,
-) -> ast.AST | None:
+) -> list[ast.AST] | ast.AST | None:
     if extra_mask is not None or tensor.ndim != 2:
         return None
 
@@ -1037,8 +1037,17 @@ def _codegen_cute_store_tcgen05_tile(
         ),
         "cute.arch.sync_threads()",
     ]
+    main_stmt = statement_from_string(
+        "if True:\n" + textwrap.indent("\n".join(store_body), "    ")
+    )
+    # Pipeline drain + TMEM dealloc are one-shot cleanup. They must run
+    # AFTER all tiles have been processed (in the persistent path) and
+    # naturally land at the end of the kernel in the non-persistent path.
+    # Keep them as separate statements so the persistent splitter can
+    # extract them via the post-loop registration below.
+    post_loop_lines: list[str] = []
     if tcgen05_value.use_tma:
-        store_body.append(
+        post_loop_lines.append(
             f"if {tcgen05_value.tma_warp}:\n"
             + emit_producer_tail_tma_umma(
                 tcgen05_value.tma_pipeline,
@@ -1047,7 +1056,7 @@ def _codegen_cute_store_tcgen05_tile(
                 indent="    ",
             )
         )
-    store_body.extend(
+    post_loop_lines.extend(
         [
             (
                 f"if {tcgen05_value.exec_active}:\n"
@@ -1072,10 +1081,6 @@ def _codegen_cute_store_tcgen05_tile(
                 f"{emit_dealloc_mbarrier_initialized_kwarg()})"
             ),
             "cute.arch.sync_threads()",
-        ]
-    )
-    store_body.extend(
-        [
             (
                 f"if {tcgen05_value.epi_active}:\n"
                 f"    {tcgen05_value.tmem_allocator}.relinquish_alloc_permit()"
@@ -1090,9 +1095,11 @@ def _codegen_cute_store_tcgen05_tile(
             ),
         ]
     )
-    return statement_from_string(
-        "if True:\n" + textwrap.indent("\n".join(store_body), "    ")
-    )
+    post_loop_stmts: list[ast.AST] = [
+        statement_from_string(line) for line in post_loop_lines
+    ]
+    df.register_cute_tcgen05_post_loop_stmts(post_loop_stmts)
+    return [main_stmt, *post_loop_stmts]
 
 
 def _codegen_cute_store_permute_lane_loops(
@@ -1359,7 +1366,11 @@ def _(state: CodegenState) -> ast.AST:
             value.id,
         )
         if rewritten_stmt is not None:
-            state.add_statement(rewritten_stmt)
+            stmts = (
+                rewritten_stmt if isinstance(rewritten_stmt, list) else [rewritten_stmt]
+            )
+            for stmt in stmts:
+                state.add_statement(stmt)
             return ast.Constant(value=None)
 
     tensor_name = state.device_function.tensor_arg(tensor).name

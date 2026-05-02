@@ -28,6 +28,19 @@ def typed_program_id(dim: int = 0) -> str:
     return env.backend.program_id_expr(dim, index_dtype=env.index_type())
 
 
+def _stmt_name_uses(stmt: ast.AST) -> tuple[set[str], set[str]]:
+    """Return ``(reads, writes)`` for the names referenced in ``stmt``."""
+    reads: set[str] = set()
+    writes: set[str] = set()
+    for node in ast.walk(stmt):
+        if isinstance(node, ast.Name):
+            if isinstance(node.ctx, ast.Store):
+                writes.add(node.id)
+            else:
+                reads.add(node.id)
+    return reads, writes
+
+
 if TYPE_CHECKING:
     import sympy
 
@@ -869,91 +882,66 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
     def _split_tcgen05_invariant_setup(
         self, device_function: DeviceFunction, body: list[ast.stmt]
     ) -> tuple[list[ast.stmt], list[ast.stmt]]:
-        # Deny-list mode: codegen has explicitly marked which statements
-        # depend on per-tile coordinates. Everything else can be hoisted
-        # out of the work-tile loop. This matches Quack's pattern of
-        # building pipelines once per kernel and replaying state per tile.
-        #
-        # The PID decomposition emitted by ``_decompose_virtual_pid``
-        # references ``virtual_pid_var`` (defined in the loop header) and
-        # produces ``pid_0``, ``pid_1`` etc. that are then consumed by
-        # downstream offset computations. To capture this transitive
-        # dependency without plumbing tagging through every codegen path,
-        # we do a single forward pass: seed the per-tile name set with
-        # ``virtual_pid_var``; any statement that reads or writes a
-        # per-tile name is itself per-tile, and any names it assigns
-        # become per-tile too.
-        if device_function.has_cute_tcgen05_per_tile_marks:
-            per_tile_names: set[str] = {self.virtual_pid_var}
+        """Split the device-function prefix into hoisted setup vs per-tile body.
 
-            def _stmt_names(stmt: ast.stmt) -> tuple[set[str], set[str]]:
-                reads: set[str] = set()
-                writes: set[str] = set()
-                for node in ast.walk(stmt):
-                    if isinstance(node, ast.Name):
-                        if isinstance(node.ctx, ast.Store):
-                            writes.add(node.id)
-                        else:
-                            reads.add(node.id)
-                return reads, writes
+        Codegen has explicitly tagged the per-tile statements via
+        ``register_cute_tcgen05_per_tile_stmts``. Everything else can be
+        hoisted out of the work-tile loop. This matches Quack's pattern of
+        building pipelines once per kernel and replaying state per tile.
 
-            hoisted: list[ast.stmt] = []
-            wrapped: list[ast.stmt] = []
-            for stmt in body:
-                reads, writes = _stmt_names(stmt)
-                is_per_tile = (
-                    device_function.is_cute_tcgen05_per_tile(stmt)
-                    or bool(reads & per_tile_names)
-                    or bool(writes & per_tile_names)
-                )
-                if is_per_tile:
-                    per_tile_names.update(writes)
-                    wrapped.append(stmt)
-                else:
-                    hoisted.append(stmt)
-            return hoisted, wrapped
-
-        # Allow-list mode (legacy): codegen has explicitly marked invariant
-        # statements via ``register_cute_tcgen05_invariant_setup``. Anything
-        # registered hoists; everything else stays in the work-tile loop.
-        hoisted = [
-            stmt
-            for stmt in body
-            if device_function.is_cute_tcgen05_invariant_setup(stmt)
-        ]
-        if hoisted:
-            wrapped = [
-                stmt
-                for stmt in body
-                if not device_function.is_cute_tcgen05_invariant_setup(stmt)
-            ]
-            return hoisted, wrapped
-
-        # Heuristic fallback: scan for known per-tile patterns and split
-        # the prefix at the first one. Used when neither registration
-        # path is populated.
-        start = None
-        end = None
-        for i, stmt in enumerate(body):
-            text = ast.unparse(stmt)
-            if start is None and "tcgen05_warp_idx =" in text:
-                start = i
-                continue
-            if start is not None and (
-                "make_pipeline_state(" in text
-                or ".allocate(" in text
-                or ".wait_for_alloc(" in text
-                or ".retrieve_ptr(" in text
-                or "acc_frag = " in text
-                or ".producer_acquire(" in text
-                or "cute.local_tile(" in text
-                or "offset_" in text
-            ):
-                end = i
-                break
-        if start is None or end is None or end <= start:
+        The PID decomposition emitted by ``_decompose_virtual_pid``
+        references ``virtual_pid_var`` (defined in the loop header) and
+        produces ``pid_0``, ``pid_1`` etc. that are then consumed by
+        downstream offset computations. To capture this transitive
+        dependency without plumbing tagging through every codegen path, we
+        do a single forward pass: seed the per-tile name set with
+        ``virtual_pid_var``; any statement that reads or writes a per-tile
+        name is itself per-tile, and any names it assigns become per-tile
+        too.
+        """
+        if not device_function.has_cute_tcgen05_per_tile_marks:
             return [], body
-        return body[start:end], [*body[:start], *body[end:]]
+
+        per_tile_names: set[str] = {self.virtual_pid_var}
+        hoisted: list[ast.stmt] = []
+        wrapped: list[ast.stmt] = []
+        for stmt in body:
+            reads, writes = _stmt_name_uses(stmt)
+            is_per_tile = (
+                device_function.is_cute_tcgen05_per_tile(stmt)
+                or bool(reads & per_tile_names)
+                or bool(writes & per_tile_names)
+            )
+            if is_per_tile:
+                per_tile_names.update(writes)
+                wrapped.append(stmt)
+            else:
+                hoisted.append(stmt)
+        return hoisted, wrapped
+
+    def _extract_tcgen05_post_loop_stmts(
+        self, device_function: DeviceFunction, body: list[ast.stmt]
+    ) -> tuple[list[ast.stmt], list[ast.stmt]]:
+        """Pull post-loop tagged statements out of ``body``.
+
+        Returns ``(remaining, post_loop)`` preserving relative order.
+
+        Statements registered via ``register_cute_tcgen05_post_loop_stmts``
+        belong after the persistent work-tile loop (one-shot drains:
+        ``producer_tail``, TMEM dealloc, allocator setup). Without this
+        extraction they would execute every tile, which wastes work and
+        can corrupt pipeline state.
+        """
+        if not device_function.has_cute_tcgen05_post_loop_marks:
+            return body, []
+        remaining: list[ast.stmt] = []
+        post_loop: list[ast.stmt] = []
+        for stmt in body:
+            if device_function.is_cute_tcgen05_post_loop(stmt):
+                post_loop.append(stmt)
+            else:
+                remaining.append(stmt)
+        return remaining, post_loop
 
     def _setup_tcgen05_persistent_kernel(
         self, device_function: DeviceFunction
@@ -965,6 +953,14 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                 statement_from_string(f"{shared_pid_var} = {self.virtual_pid_var}"),
                 *wrapped_body,
             ]
+        # Order matters: pull post-loop cleanup out FIRST so the per-tile
+        # splitter never has a chance to trace those statements into the
+        # work-tile body via name propagation. Reversing this would re-
+        # introduce the dominance-error class of bugs that motivated the
+        # post-loop tag.
+        wrapped_body, post_loop_stmts = self._extract_tcgen05_post_loop_stmts(
+            device_function, wrapped_body
+        )
         hoisted_setup, wrapped_body = self._split_tcgen05_invariant_setup(
             device_function, wrapped_body
         )
@@ -1189,6 +1185,7 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                     body=loop_body,
                     orelse=[],
                 ),
+                *post_loop_stmts,
             ]
         )
         return setup

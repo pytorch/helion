@@ -885,7 +885,6 @@ def _emit_mma_pipeline(
     mma_copy_linear: str | None = None
     mma_active: str | None = None
     tma_warp: str | None = None
-    tcgen05_invariant_setup_start: int | None = None
     warp_idx: str | None = None
     lane_idx: str | None = None
     epi_active: str | None = None
@@ -991,7 +990,6 @@ def _emit_mma_pipeline(
             )
         )
     else:
-        tcgen05_invariant_setup_start = len(prefix) if mma_impl == "tcgen05" else None
         mma_participant_linear = df.new_var("mma_tidx")
         mma_slice_linear = df.new_var("mma_slice_tidx")
         mma_copy_linear = df.new_var("mma_copy_tidx")
@@ -1247,10 +1245,6 @@ def _emit_mma_pipeline(
                     "cutlass.pipeline.pipeline_init_wait("
                     f"cluster_shape_mn={tcgen05_cluster_layout_vmnk})"
                 )
-            )
-        if tcgen05_invariant_setup_start is not None:
-            df.register_cute_tcgen05_invariant_setup(
-                prefix[tcgen05_invariant_setup_start:]
             )
         prefix.append(
             statement_from_string(
