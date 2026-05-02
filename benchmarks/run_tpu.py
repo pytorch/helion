@@ -90,10 +90,10 @@ def _softmax_shapes() -> list[tuple[str, tuple[Any, ...]]]:
 
 
 def _welford_shapes() -> list[tuple[str, tuple[Any, ...]]]:
-    # 1st canonical; 2nd much larger (4x the bytes per row). welford's
-    # autotune is expensive (~10-25 min/shape) so the bumped 60-min
-    # per-kernel timeout is what makes the 2nd shape feasible.
-    configs = [(262144, 1024), (524288, 4096), (262144, 1536), (262144, 2048)]
+    # 1st canonical; 2nd is 2x the rows (same D). welford's autotune is
+    # expensive (~16 min/shape at full effort), and (524288, 4096) blew
+    # through the 60-min cap last run — back off to (524288, 1024).
+    configs = [(262144, 1024), (524288, 1024), (262144, 1536), (262144, 2048)]
     return [
         (
             f"[{s},{d}]",
@@ -295,6 +295,81 @@ def _low_mem_dropout_baseline(p: float, x: torch.Tensor, seed: int) -> torch.Ten
 
 def _swiglu_baseline(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     return nn.functional.silu(a).to(b.dtype) * b
+
+
+def _se_block_shapes() -> list[tuple[str, tuple[Any, ...]]]:
+    # 1st matches examples/se_block.py main() (1024, 1024); 2nd very large.
+    configs = [(1024, 1024), (8192, 8192)]
+    return [
+        (
+            f"[{m},{n}]",
+            (
+                torch.randn(m, n, device=DEVICE, dtype=torch.bfloat16),
+                torch.randn(n, n, device=DEVICE, dtype=torch.bfloat16),
+            ),
+        )
+        for m, n in configs
+    ]
+
+
+def _se_block_baseline(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    return 2 * x * torch.sigmoid(x @ w)
+
+
+def _squeeze_and_excitation_net_shapes() -> list[tuple[str, tuple[Any, ...]]]:
+    # 1st matches examples/squeeze_and_excitation_net.py main() (1024,1024,1024);
+    # 2nd very large.
+    configs = [(1024, 1024, 1024), (4096, 4096, 4096)]
+    return [
+        (
+            f"[{m},{n},{k}]",
+            (
+                torch.randn(m, n, device=DEVICE, dtype=torch.float32),
+                torch.randn(n, k, device=DEVICE, dtype=torch.float32),
+                torch.randn(k, n, device=DEVICE, dtype=torch.float32),
+            ),
+        )
+        for m, n, k in configs
+    ]
+
+
+def _squeeze_and_excitation_net_baseline(
+    x: torch.Tensor, a: torch.Tensor, b: torch.Tensor
+) -> torch.Tensor:
+    return torch.mul(x, torch.sigmoid(torch.relu(x @ a) @ b))
+
+
+def _rms_norm_bwd_shapes() -> list[tuple[str, tuple[Any, ...]]]:
+    # 1st small canonical; 2nd very large to exercise scaling.
+    # rsqrt is computed from x via the fwd kernel.
+    configs = [(2048, 4096), (8192, 8192)]
+    out: list[tuple[str, tuple[Any, ...]]] = []
+    eps = 1e-5
+    for m, n in configs:
+        x = torch.randn(m, n, device=DEVICE, dtype=torch.float32)
+        weight = torch.randn(n, device=DEVICE, dtype=torch.float32)
+        grad_out = torch.randn(m, n, device=DEVICE, dtype=torch.float32)
+        # rsqrt is [m, 1]: 1 / sqrt(mean(x^2) + eps)
+        var = x.pow(2).mean(dim=-1, keepdim=True)
+        rsqrt = torch.rsqrt(var + eps)
+        out.append((f"[{m},{n}]", (grad_out, x, weight, rsqrt)))
+    return out
+
+
+def _rms_norm_bwd_baseline(
+    grad_out: torch.Tensor,
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    rsqrt: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    # Mirror the kernel's signature: (dx, dw).
+    x_norm = x * rsqrt
+    dx_norm = grad_out * weight
+    dw = (grad_out * x_norm).sum(dim=0)
+    # dx = (dx_norm - x_norm * mean(dx_norm * x_norm)) * rsqrt
+    mean_term = (dx_norm * x_norm).mean(dim=-1, keepdim=True)
+    dx = (dx_norm - x_norm * mean_term) * rsqrt
+    return dx, dw
 
 
 def _cross_entropy_shapes() -> list[tuple[str, tuple[Any, ...]]]:
@@ -588,6 +663,27 @@ KERNEL_MAPPINGS: dict[str, KernelMapping] = {
         "rms_norm_fwd",
         _rms_norm_baseline,
         _rms_norm_shapes,
+        None,
+    ),
+    "rms_norm_bwd": (
+        "rms_norm",
+        "rms_norm_bwd",
+        _rms_norm_bwd_baseline,
+        _rms_norm_bwd_shapes,
+        None,
+    ),
+    "se_block": (
+        "se_block",
+        "se_block_fwd",
+        _se_block_baseline,
+        _se_block_shapes,
+        None,
+    ),
+    "squeeze_and_excitation_net": (
+        "squeeze_and_excitation_net",
+        "squeeze_and_excitation_net_fwd",
+        _squeeze_and_excitation_net_baseline,
+        _squeeze_and_excitation_net_shapes,
         None,
     ),
 }
