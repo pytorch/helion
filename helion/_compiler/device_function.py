@@ -404,6 +404,7 @@ class DeviceFunction:
         self.cute_tcgen05_matmul_plan: CuteTcgen05MatmulPlan | None = None
         self._cute_tcgen05_per_tile_stmt_ids: set[int] = set()
         self._cute_tcgen05_post_loop_stmt_ids: set[int] = set()
+        self._cute_tcgen05_tma_load_role_stmt_ids: set[int] = set()
         self._cute_collective_handled_loads: set[str] = set()
         self.cute_cluster_shape: tuple[int, int, int] | None = None
         self.cute_block_shape: tuple[int, int, int] | None = None
@@ -640,6 +641,41 @@ class DeviceFunction:
     @property
     def has_cute_tcgen05_post_loop_marks(self) -> bool:
         return bool(self._cute_tcgen05_post_loop_stmt_ids)
+
+    def register_cute_tcgen05_tma_load_role_stmts(self, stmts: list[ast.AST]) -> None:
+        """Mark statements that belong to the TMA-load warp's role block.
+
+        When the persistent kernel splits the work-tile body into role
+        blocks (see ``Tcgen05PersistentProgramIDs._collect_tcgen05_role_blocks``),
+        statements registered here are pulled into a TMA-load-specific
+        role block. The block is gated by the TMA-load warp predicate so
+        only that warp executes its body. Use for statements whose work
+        is conceptually owned by the TMA-load warp -- e.g. the initial
+        TMA prefetch ``producer_acquire`` / ``cute.copy`` /
+        ``producer_commit`` cycle that warms the AB pipeline at the
+        start of each tile.
+
+        Statements registered here must ALSO be registered as per-tile
+        via ``register_cute_tcgen05_per_tile_stmts`` first: the role-block
+        partitioner runs on the post-split wrapped body, and an unmarked
+        per-tile statement would be hoisted out of the work-tile loop
+        before the partitioner ever sees it. The assertion below enforces
+        the call ordering at registration time.
+        """
+        for stmt in stmts:
+            assert id(stmt) in self._cute_tcgen05_per_tile_stmt_ids, (
+                "TMA-load role stmts must be registered as per-tile first "
+                "(otherwise the persistent splitter would hoist them out "
+                "of the work-tile loop before the role partitioner runs)"
+            )
+        self._cute_tcgen05_tma_load_role_stmt_ids.update(id(stmt) for stmt in stmts)
+
+    def is_cute_tcgen05_tma_load_role(self, stmt: ast.stmt) -> bool:
+        return id(stmt) in self._cute_tcgen05_tma_load_role_stmt_ids
+
+    @property
+    def has_cute_tcgen05_tma_load_role_marks(self) -> bool:
+        return bool(self._cute_tcgen05_tma_load_role_stmt_ids)
 
     def get_cute_tcgen05_store_value(self, name: str) -> CuteTcgen05StoreValue | None:
         for alias in self._variable_renames.get(name, [name]):

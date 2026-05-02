@@ -3901,7 +3901,8 @@ class TestCuteLowerings(unittest.TestCase):
 
 @onlyBackends(["cute"])
 class TestPersistentLoopSplitter(unittest.TestCase):
-    """Unit tests for ``ProgramID._split_tcgen05_invariant_setup``.
+    """Unit tests for the per-tile / post-loop splitters and the
+    role-block partitioner on ``Tcgen05PersistentProgramIDs``.
 
     Codegen tags every statement that depends on per-tile coordinates via
     ``register_cute_tcgen05_per_tile_stmts``. The splitter then hoists the
@@ -3909,6 +3910,12 @@ class TestPersistentLoopSplitter(unittest.TestCase):
     seeded from ``virtual_pid_var``) are also kept in the wrapped body, so
     the PID decomposition emitted by ``_decompose_virtual_pid`` doesn't
     have to plumb tagging through every callsite.
+
+    Statements registered via ``register_cute_tcgen05_tma_load_role_stmts``
+    are routed through ``_collect_tcgen05_role_blocks`` into TMA-load role
+    blocks; everything else stays in shared blocks. The consumer
+    ``_emit_role_block_stmts`` wraps non-shared blocks in
+    ``if {role_predicate}: ...``.
     """
 
     def _make_helper(self) -> tuple[object, object]:
@@ -3926,6 +3933,7 @@ class TestPersistentLoopSplitter(unittest.TestCase):
             def __init__(self) -> None:
                 self._per_tile_ids: set[int] = set()
                 self._post_loop_ids: set[int] = set()
+                self._tma_load_role_ids: set[int] = set()
 
             def register_cute_tcgen05_per_tile_stmts(
                 self, stmts: list[ast.AST]
@@ -3951,11 +3959,35 @@ class TestPersistentLoopSplitter(unittest.TestCase):
             def has_cute_tcgen05_post_loop_marks(self) -> bool:
                 return bool(self._post_loop_ids)
 
+            def register_cute_tcgen05_tma_load_role_stmts(
+                self, stmts: list[ast.AST]
+            ) -> None:
+                for s in stmts:
+                    assert id(s) in self._per_tile_ids, (
+                        "TMA-load role stmts must be registered as per-tile first"
+                    )
+                self._tma_load_role_ids.update(id(s) for s in stmts)
+
+            def is_cute_tcgen05_tma_load_role(self, stmt: ast.AST) -> bool:
+                return id(stmt) in self._tma_load_role_ids
+
+            @property
+            def has_cute_tcgen05_tma_load_role_marks(self) -> bool:
+                return bool(self._tma_load_role_ids)
+
         splitter = Tcgen05PersistentProgramIDs.__new__(Tcgen05PersistentProgramIDs)
         # The splitter walks ASTs looking for references to the
         # virtual_pid var. Tests use simple statements that don't mention
         # any pid, so an unused sentinel name is fine.
         splitter.virtual_pid_var = "__test_virtual_pid__"  # type: ignore[attr-defined]
+        # ``_collect_tcgen05_role_blocks`` calls
+        # ``_tcgen05_tma_load_role_predicate`` which would normally hit
+        # ``DeviceFunction.current().cute_tcgen05_matmul_plan``. Replace
+        # with a sentinel string the tests can match against, so this
+        # unit suite stays decoupled from the real DeviceFunction stack.
+        splitter._tcgen05_tma_load_role_predicate = (  # type: ignore[attr-defined]
+            lambda: "__test_tma_load_warp__"
+        )
         return splitter, _MinimalDeviceFunction()
 
     def _stmt(self, text: str) -> ast.stmt:
@@ -4044,6 +4076,106 @@ class TestPersistentLoopSplitter(unittest.TestCase):
         remaining, post_loop = splitter._extract_tcgen05_post_loop_stmts(df, body)
         self.assertEqual(remaining, [a, b, c])
         self.assertEqual(post_loop, [post_a, post_b])
+
+    def test_role_blocks_single_block_when_no_tma_load_marks(self) -> None:
+        """``_collect_tcgen05_role_blocks`` returns a single shared block
+        carrying the full body when no TMA-load tags are present. This is
+        the safe default for non-tcgen05 / universal-MMA paths and any
+        kernel that never registers TMA-load role tags. The downstream
+        consumer ``_build_tcgen05_persistent_tile_body`` handles the
+        single-block case identically to the pre-split implementation."""
+        splitter, df = self._make_helper()
+        a = self._stmt("a = 1")
+        b = self._stmt("b = 2")
+        body = [a, b]
+        blocks = splitter._collect_tcgen05_role_blocks(df, body)
+        self.assertEqual(len(blocks), 1)
+        self.assertIsNone(blocks[0].role_predicate)
+        self.assertEqual(blocks[0].stmts, body)
+
+    def test_role_blocks_partition_tagged_runs(self) -> None:
+        """Each maximal run of consecutive TMA-load-tagged statements
+        becomes its own role block; surrounding shared statements stay
+        in shared blocks. Block ordering preserves the input emit order
+        of the per-tile body."""
+        splitter, df = self._make_helper()
+        shared_a = self._stmt("a = 1")
+        tma_load_x = self._stmt("tma_pipeline.producer_acquire(s)")
+        tma_load_y = self._stmt("cute.copy(t, s)")
+        shared_b = self._stmt("b = 2")
+        tma_load_z = self._stmt("tma_pipeline.producer_commit(s)")
+        df.register_cute_tcgen05_per_tile_stmts([tma_load_x, tma_load_y, tma_load_z])
+        df.register_cute_tcgen05_tma_load_role_stmts(
+            [tma_load_x, tma_load_y, tma_load_z]
+        )
+        body = [shared_a, tma_load_x, tma_load_y, shared_b, tma_load_z]
+        blocks = splitter._collect_tcgen05_role_blocks(df, body)
+        self.assertEqual(len(blocks), 4)
+        # First block: shared_a (before any tma_load run)
+        self.assertIsNone(blocks[0].role_predicate)
+        self.assertEqual(blocks[0].stmts, [shared_a])
+        # Second block: tma_load_x + tma_load_y (consecutive)
+        self.assertEqual(blocks[1].role_predicate, "__test_tma_load_warp__")
+        self.assertEqual(blocks[1].stmts, [tma_load_x, tma_load_y])
+        # Third block: shared_b
+        self.assertIsNone(blocks[2].role_predicate)
+        self.assertEqual(blocks[2].stmts, [shared_b])
+        # Fourth block: tma_load_z (singleton run)
+        self.assertEqual(blocks[3].role_predicate, "__test_tma_load_warp__")
+        self.assertEqual(blocks[3].stmts, [tma_load_z])
+
+    def test_role_blocks_preserve_relative_order_in_emit(self) -> None:
+        """Tagged statements stay in their original positions relative
+        to surrounding shared statements. This matters because the
+        ``tma_initial_full_tile`` boolean is set in a shared statement
+        BEFORE the TMA-load-tagged prefetch IF reads it; reordering
+        would dangle a free reference and CuTe DSL would error with
+        'cannot access free variable ...'."""
+        splitter, df = self._make_helper()
+        define_bool = self._stmt("ready = True")
+        prefetch = self._stmt("if ready and tma_warp:\n    tma_pipeline.acquire()")
+        df.register_cute_tcgen05_per_tile_stmts([prefetch])
+        df.register_cute_tcgen05_tma_load_role_stmts([prefetch])
+        body = [define_bool, prefetch]
+        blocks = splitter._collect_tcgen05_role_blocks(df, body)
+        # define_bool must appear in the FIRST emitted block; prefetch in
+        # the SECOND. Reversing the order would put `prefetch` ahead of
+        # `define_bool` and `ready` would be undefined when prefetch reads it.
+        self.assertEqual(len(blocks), 2)
+        self.assertIsNone(blocks[0].role_predicate)
+        self.assertEqual(blocks[0].stmts, [define_bool])
+        self.assertEqual(blocks[1].role_predicate, "__test_tma_load_warp__")
+        self.assertEqual(blocks[1].stmts, [prefetch])
+
+    def test_role_blocks_emit_consumer_wraps_tma_load_in_role_if(self) -> None:
+        """The consumer ``_emit_role_block_stmts`` wraps non-shared
+        blocks in ``if {role_predicate}: ...`` and emits shared blocks
+        as naked statements. An empty block is a no-op (no degenerate
+        ``if {}:`` is emitted)."""
+        from helion._compiler.program_id import Tcgen05PersistentProgramIDs
+
+        splitter, _df = self._make_helper()
+        s = self._stmt("a = 1")
+
+        shared = Tcgen05PersistentProgramIDs._PersistentRoleBlock(
+            role_predicate=None, stmts=[s]
+        )
+        out = splitter._emit_role_block_stmts(shared)
+        self.assertEqual(out, [s])
+
+        gated = Tcgen05PersistentProgramIDs._PersistentRoleBlock(
+            role_predicate="my_warp", stmts=[s]
+        )
+        out = splitter._emit_role_block_stmts(gated)
+        self.assertEqual(len(out), 1)
+        self.assertIsInstance(out[0], ast.If)
+        self.assertEqual(ast.unparse(out[0].test), "my_warp")
+        self.assertEqual(out[0].body, [s])
+
+        empty_gated = Tcgen05PersistentProgramIDs._PersistentRoleBlock(
+            role_predicate="my_warp", stmts=[]
+        )
+        self.assertEqual(splitter._emit_role_block_stmts(empty_gated), [])
 
     def test_virtual_pid_dependencies_are_traced_transitively(self) -> None:
         """The splitter walks each statement's name uses / defines and

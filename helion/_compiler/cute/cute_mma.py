@@ -876,14 +876,28 @@ def _emit_mma_pipeline(
     # ``DeviceFunction.register_cute_tcgen05_per_tile_stmts`` and
     # ``ProgramID._split_tcgen05_invariant_setup``.
     per_tile_stmts: list[ast.AST] = []
+    # Statements that conceptually belong to the TMA-load warp's role
+    # block (see ``Tcgen05PersistentProgramIDs._collect_tcgen05_role_blocks``).
+    # Today this is exclusively the initial TMA prefetch ``producer_acquire``
+    # / ``cute.copy`` / ``producer_commit`` cycle that warms the AB pipeline
+    # at the start of each tile. The K-loop's per-iter TMA copies are emitted
+    # inline with the rest of the K-loop body and stay in the shared role
+    # block until role-local persistent loops land (see ``cute_plan.md``).
+    tma_load_role_stmts: list[ast.AST] = []
 
-    def _emit_per_tile(text: str) -> ast.stmt:
+    def _emit_per_tile(text: str, *, tma_load: bool = False) -> ast.stmt:
         """Append a per-tile statement to ``prefix`` and tag it for the
         persistent-loop splitter. Returns the AST node so callers can
-        chain (e.g. when constructing ``If`` bodies)."""
+        chain (e.g. when constructing ``If`` bodies). When ``tma_load``
+        is true the statement is ALSO tagged for the role-block
+        partitioner so it lands in the TMA-load warp's role block when
+        the persistent kernel emits warp-role-gated bodies.
+        """
         stmt = statement_from_string(text)
         prefix.append(stmt)
         per_tile_stmts.append(stmt)
+        if tma_load:
+            tma_load_role_stmts.append(stmt)
         return stmt
 
     mma_participant_linear: str | None = None
@@ -1555,6 +1569,15 @@ def _emit_mma_pipeline(
                 # full-tile predicates and the TMA copies reference per-tile
                 # gA/gB tensors and m_offset/n_offset, so they must stay in
                 # the work-tile body.
+                #
+                # The full-tile predicate booleans (``tma_initial_full_tile``,
+                # ``tma_initial_next_full_tile``) are read by every warp later
+                # for cross-role gating, so they live in the shared role
+                # block. The producer_acquire/cute.copy/producer_commit
+                # cycles below are exclusively TMA-load work (they are
+                # already gated by ``if {tma_warp}:`` inline) and therefore
+                # also tagged with ``tma_load=True`` so the role
+                # partitioner can route them into the TMA-load block.
                 _emit_per_tile(
                     f"{tma_initial_full_tile} = "
                     f"{m_offset_var} + cutlass.Int32({bm}) <= cutlass.Int32({m_size}) "
@@ -1586,7 +1609,8 @@ def _emit_mma_pipeline(
                         + ")\n"
                     )
                     + f"    {tma_pipeline}.producer_commit({tma_producer_state})\n"
-                    + emit_pipeline_advance(tma_producer_state, indent="    ")
+                    + emit_pipeline_advance(tma_producer_state, indent="    "),
+                    tma_load=True,
                 )
                 if tcgen05_ab_stage_count_value > 1:
                     _emit_per_tile(
@@ -1620,7 +1644,8 @@ def _emit_mma_pipeline(
                             + ")\n"
                         )
                         + f"    {tma_pipeline}.producer_commit({tma_producer_state})\n"
-                        + emit_pipeline_advance(tma_producer_state, indent="    ")
+                        + emit_pipeline_advance(tma_producer_state, indent="    "),
+                        tma_load=True,
                     )
     else:
         prefix.append(
@@ -2193,6 +2218,14 @@ def _emit_mma_pipeline(
     # ``_setup_tcgen05_persistent_kernel``).
     if per_tile_stmts:
         df.register_cute_tcgen05_per_tile_stmts(per_tile_stmts)
+    # Register TMA-load role-block statements with the persistent role
+    # partitioner (see ``Tcgen05PersistentProgramIDs._collect_tcgen05_role_blocks``).
+    # These statements stay in the work-tile body (they are also tagged
+    # per-tile above) but are routed into the TMA-load role block so a
+    # future role-local-while rewrite can lift them out without breaking
+    # the rest of the body.
+    if tma_load_role_stmts:
+        df.register_cute_tcgen05_tma_load_role_stmts(tma_load_role_stmts)
 
     return expr_from_string(result_var)
 
