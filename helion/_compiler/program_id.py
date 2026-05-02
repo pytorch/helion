@@ -934,9 +934,63 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                 remaining.append(stmt)
         return remaining, post_loop
 
+    def _emit_host_multi_tile_guard(self, device_function: DeviceFunction) -> None:
+        """Emit a host-side guard against multi-tile execution.
+
+        Persistent + tcgen05 currently produces wrong output when the kernel
+        processes more than one work tile in total. Empirically, even with
+        148 SMs and 4 work tiles (so each CTA processes 0 or 1 tile), the
+        persistent wrapper interferes with kernel correctness across tile
+        boundaries. Only the single-tile case is verified correct. The fix
+        is the role-local persistent rewrite; until that lands, this guard
+        fails loudly when a user explicitly opts into a config whose problem
+        shape exercises the broken path.
+
+        The autotuner narrowing in ``matmul_ops.enforce_dot_requirements``
+        already removes ``persistent_blocked`` / ``persistent_interleaved``
+        from the search space for tcgen05 BF16/FP16 matmuls, so this guard
+        only fires for explicit user configs that bypass autotune.
+
+        The threshold is intentionally ``total_tiles > 1`` and not
+        ``tiles_per_cta > 1`` or ``total_tiles > num_sms``: we have observed
+        wrong output even when ``total_tiles <= num_sms`` (148 SMs, 4 work
+        tiles). Loosening the guard to a per-CTA bound would re-introduce
+        the silent wrong-output failure mode. Tighten only after the role-
+        local persistent rewrite makes the multi-tile path actually
+        correct.
+        """
+        host_total_pids = " * ".join(
+            f"({pid.num_pids_expr(is_device=False)})" for pid in self.pid_info
+        )
+        if not host_total_pids:
+            return
+        # Bind the host-side total-tiles expression once so non-trivial pid-
+        # count expressions are not duplicated in the emitted source. The
+        # private name avoids colliding with user/host vars.
+        total_var = "_helion_tcgen05_persistent_total_tiles"
+        device_function.codegen.host_statements.append(
+            statement_from_string(f"{total_var} = {host_total_pids}")
+        )
+        # Use %-style formatting in the generated code so the f-string braces
+        # do not collide with ``statement_from_string`` placeholder syntax.
+        guard = (
+            f"if {total_var} > 1:\n"
+            "    raise RuntimeError(\n"
+            "        'Helion CuTe persistent + tcgen05 currently produces '\n"
+            "        'wrong output when the kernel processes more than one '\n"
+            "        'work tile total. The kernel was launched with '\n"
+            "        'total_tiles=%d > 1, which exercises the multi-tile '\n"
+            "        'path. Use a non-persistent pid_type (e.g. \"flat\") or '\n"
+            "        'pick block sizes that keep total_tiles == 1.'"
+            f"        % ({total_var},)\n"
+            "    )"
+        )
+        device_function.codegen.host_statements.append(statement_from_string(guard))
+
     def _setup_tcgen05_persistent_kernel(
         self, device_function: DeviceFunction
     ) -> list[ast.stmt]:
+        self._emit_host_multi_tile_guard(device_function)
         wrapped_body = cast("list[ast.stmt]", list(device_function.body))
         if isinstance(device_function.pid, ForEachProgramID):
             shared_pid_var = device_function.pid.shared_pid_var

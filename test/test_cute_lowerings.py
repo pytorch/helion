@@ -986,14 +986,16 @@ class TestCuteLowerings(unittest.TestCase):
     def test_tcgen05_persistent_path_compiles(self) -> None:
         """End-to-end compile check for the persistent + tcgen05 combo.
 
-        The post-loop split landed in follow-on 8 fixed the CuTe IR
+        The post-loop split fixes the CuTe IR
         ``operand #7 does not dominate this use`` verifier crash. This
         test pins that — if a future change re-introduces a state
         carry that can't be expressed as a scf.while iter arg, the IR
         verifier will reject the kernel and ``to_triton_code(cfg)``
         will raise. Numerical correctness on the persistent path is
-        still gapped (item 6 / role-local persistent loops), so this
-        test only asserts that codegen + IR verify succeed."""
+        still gapped for the multi-tile case pending the role-local
+        persistent rewrite; see
+        ``test_tcgen05_persistent_single_tile_runtime_correctness`` for
+        the single-tile runtime regression guard."""
 
         @helion.kernel(backend="cute")
         def cute_matmul_persistent_compile(
@@ -1048,11 +1050,162 @@ class TestCuteLowerings(unittest.TestCase):
             # execution (cute.compile) — but the code-string check below
             # is enough to confirm the persistent loop is in the right
             # shape. Running the kernel is intentionally NOT done here:
-            # numerical correctness on the persistent path is the next
-            # work item, not this regression guard.
+            # multi-tile numerical correctness on the persistent path
+            # is the next work item, not this regression guard.
             code = bound.to_triton_code(cfg)
             self.assertIn("while tcgen05_work_tile_valid", code)
             self.assertIn("tcgen05_acc_pipeline.producer_tail", code)
+            # The host-side multi-tile guard must be emitted: the
+            # persistent + tcgen05 path silently produces wrong output
+            # for total_tiles > 1, so we fail loudly until the role-
+            # local persistent rewrite lands.
+            self.assertIn(
+                "Helion CuTe persistent + tcgen05 currently produces",
+                code,
+            )
+
+    def test_tcgen05_persistent_multi_tile_runtime_guard(self) -> None:
+        """Multi-tile + persistent + tcgen05 must raise ``RuntimeError``.
+
+        The persistent + tcgen05 combo produces wrong output when the
+        kernel processes more than one work tile total. Until the role-
+        local persistent rewrite lands, the codegen emits a host-side
+        guard that fails loudly instead of silently returning bad data.
+        This test pins that guard.
+        """
+
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_multi_tile(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        # 256 / 128 = 2 tiles per axis -> 4 total work tiles -> guard fires.
+        args = (
+            torch.randn(256, 32, device=DEVICE, dtype=torch.float16),
+            torch.randn(32, 256, device=DEVICE, dtype=torch.float16),
+        )
+        support = SimpleNamespace(
+            supported_impls=("universal", "warp", "tcgen05"),
+            warp_f16bf16=True,
+            tcgen05_f16bf16=True,
+        )
+        with (
+            patch(
+                "helion._compiler.cute.cute_mma.get_cute_mma_support",
+                return_value=support,
+            ),
+            patch(
+                "helion._compiler.cute.mma_support.get_cute_mma_support",
+                return_value=support,
+            ),
+        ):
+            bound = cute_matmul_multi_tile.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            cfg = helion.Config(
+                block_sizes=[128, 128, 16],
+                l2_groupings=[1],
+                loop_orders=[[0, 1]],
+                num_stages=2,
+                num_warps=8,
+                pid_type="persistent_blocked",
+                tcgen05_cluster_m=1,
+                tcgen05_ab_stages=2,
+                tcgen05_acc_stages=2,
+                tcgen05_c_stages=2,
+                tcgen05_num_epi_warps=4,
+            )
+            bound.set_config(cfg)
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "Helion CuTe persistent \\+ tcgen05 currently produces",
+            ):
+                bound(*args)
+
+    def test_tcgen05_persistent_single_tile_runtime_correctness(self) -> None:
+        """Persistent + tcgen05 produces correct output for single-tile shapes.
+
+        The mma_stage / suffix per-tile tagging fixes (mma_stage =
+        consumer_state.index, suffix per-tile tagging) made single-tile-
+        per-CTA cases correct on B200: ``128x128xK`` for any K, including
+        K=48 with 3 K-iterations. This test runs the kernel for those
+        documented shapes and checks against ATen. Multi-tile cases are
+        blocked by a host-side guard
+        (``test_tcgen05_persistent_multi_tile_runtime_guard``) until the
+        role-local persistent rewrite closes the multi-tile gap.
+        """
+
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_single_tile(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        # 128 // 128 = 1 tile each axis -> 1 total work tile -> single-tile
+        # path. The cross product of K, dtype, pid_type matters: prior bugs
+        # only manifested with specific combinations of these.
+        # - K size (16, 32, 48, 64): 16 hits exactly one K-iter; 32, 48, 64
+        #   hit multi-K-iter and previously failed with mma_stage desync.
+        # - dtype (fp16, bf16): both go through the same tcgen05 codegen
+        #   path, but pinning bf16 catches dtype-specific lowering
+        #   regressions.
+        # - pid_type ('persistent_blocked', 'persistent_interleaved'):
+        #   both share ``Tcgen05PersistentProgramIDs`` so the host-side
+        #   guard and per-tile tagging apply to both.
+        for k_size in (16, 32, 48, 64):
+            for dtype in (torch.float16, torch.bfloat16):
+                for pid_type in (
+                    "persistent_blocked",
+                    "persistent_interleaved",
+                ):
+                    with self.subTest(K=k_size, dtype=str(dtype), pid_type=pid_type):
+                        x = torch.randn(128, k_size, device=DEVICE, dtype=dtype)
+                        y = torch.randn(k_size, 128, device=DEVICE, dtype=dtype)
+
+                        bound = cute_matmul_single_tile.bind((x, y))
+                        bound.env.config_spec.cute_tcgen05_search_enabled = True
+                        cfg = helion.Config(
+                            block_sizes=[128, 128, 16],
+                            l2_groupings=[1],
+                            loop_orders=[[0, 1]],
+                            num_stages=2,
+                            num_warps=8,
+                            pid_type=pid_type,
+                            tcgen05_cluster_m=1,
+                            tcgen05_ab_stages=2,
+                            tcgen05_acc_stages=2,
+                            tcgen05_c_stages=2,
+                            tcgen05_num_epi_warps=4,
+                        )
+                        bound.set_config(cfg)
+                        out = bound(x, y)
+                        expected = x @ y
+                        # Single-tile cases should be exact: the bug was
+                        # a stage desync that only surfaced across tile
+                        # boundaries.
+                        torch.testing.assert_close(out, expected, atol=2e-1, rtol=1e-2)
 
     def test_tcgen05_codegen_registers_post_loop_cleanup(self) -> None:
         """``_codegen_cute_store_tcgen05_tile`` returns a list whose tail
