@@ -30,6 +30,55 @@ def cutedsl_has_opresultlist_fix() -> bool:
     return "ir.OpResultList" in src
 
 
+@lru_cache(maxsize=1)
+def cutedsl_tmem_allocator_has_dealloc_init_kwarg() -> bool:
+    """Detect whether ``cutlass.utils.TmemAllocator.__init__`` accepts the
+    ``dealloc_mbarrier_initialized`` keyword argument.
+
+    The PyPI ``nvidia-cutlass-dsl==4.5.0.dev0`` wheel unconditionally calls
+    ``self._init_dealloc_mbarrier`` in ``__init__`` whenever ``is_two_cta``
+    is True; newer builds add a ``dealloc_mbarrier_initialized`` flag that
+    short-circuits the init so a second allocator (e.g. one constructed in
+    the epilogue after the matmul prologue already initialized the
+    barrier) doesn't double-init the mbarrier. Helion emits the kwarg in
+    the epilogue path; we omit it on builds without the parameter.
+
+    Returns ``True`` when the kwarg is supported, ``False`` otherwise.
+
+    ``inspect.signature`` doesn't see kwargs that ``@dsl_user_op`` strips
+    from the wrapper, so we resolve the underlying ``__wrapped__`` first
+    and fall back to source scanning.
+    """
+    try:
+        from cutlass.utils import TmemAllocator
+    except Exception:
+        return True
+    init = TmemAllocator.__init__
+    inner = getattr(init, "__wrapped__", init)
+    try:
+        sig = inspect.signature(inner)
+    except (TypeError, ValueError):
+        sig = None
+    if sig is not None and "dealloc_mbarrier_initialized" in sig.parameters:
+        return True
+    try:
+        src = inspect.getsource(inner)
+    except (OSError, TypeError):
+        return True
+    return "dealloc_mbarrier_initialized" in src
+
+
+def emit_dealloc_mbarrier_initialized_kwarg() -> str:
+    """Emit ``dealloc_mbarrier_initialized=True`` (with a leading comma) on
+    cutedsl builds that accept it, else an empty string. Designed to be
+    spliced into a ``TmemAllocator(...)`` argument list as the *last* arg
+    so the comma-prefix is always safe.
+    """
+    if cutedsl_tmem_allocator_has_dealloc_init_kwarg():
+        return ", dealloc_mbarrier_initialized=True"
+    return ""
+
+
 def _advance_lines(state_expr: str, indent: str) -> list[str]:
     """Inline body of a single ``state.advance()`` (buggy-cutedsl workaround)."""
     phase_update = (

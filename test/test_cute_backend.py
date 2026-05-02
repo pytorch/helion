@@ -1460,6 +1460,35 @@ class TestCuteBackend(TestCase):
 
         self.assertNotEqual(wrapper_a, wrapper_b)
 
+    def test_cute_launcher_reuses_compiled_wrapper(self) -> None:
+        cute_kernel = type("DummyCuteKernel", (), {})()
+        schema_key = (("tensor", 2, "float32"),)
+        block = (32, 1, 1)
+        compiled_calls: list[tuple[object, tuple[object, ...]]] = []
+        launched_args: list[tuple[object, ...]] = []
+
+        class FakeCompiled:
+            def __call__(self, *args: object) -> tuple[str, tuple[object, ...]]:
+                launched_args.append(args)
+                return ("launched", args)
+
+        def fake_compile(jit_func: object, *args: object) -> FakeCompiled:
+            compiled_calls.append((jit_func, args))
+            return FakeCompiled()
+
+        with (
+            patch("helion.runtime._create_cute_wrapper", return_value="jit-wrapper"),
+            patch("cutlass.cute.compile", side_effect=fake_compile),
+        ):
+            launcher = _get_compiled_cute_launcher(cute_kernel, schema_key, block)
+            first = launcher(1, 2, 3)
+            second = launcher(4, 5, 6)
+
+        self.assertEqual(compiled_calls, [("jit-wrapper", (1, 2, 3))])
+        self.assertEqual(launched_args, [(1, 2, 3), (4, 5, 6)])
+        self.assertEqual(first, ("launched", (1, 2, 3)))
+        self.assertEqual(second, ("launched", (4, 5, 6)))
+
     def test_cute_cluster_shape_from_wrapper_plans(self) -> None:
         self.assertIsNone(_cute_cluster_shape_from_wrapper_plans([]))
         self.assertIsNone(

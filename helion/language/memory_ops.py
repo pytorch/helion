@@ -14,6 +14,7 @@ from .._compiler.ast_extension import expr_from_string
 from .._compiler.ast_extension import statement_from_string
 from .._compiler.compile_environment import CompileEnvironment
 from .._compiler.compile_environment import _symint_expr
+from .._compiler.cute.cutedsl_compat import emit_dealloc_mbarrier_initialized_kwarg
 from .._compiler.cute.cutedsl_compat import emit_pipeline_advance
 from .._compiler.cute.cutedsl_compat import emit_producer_tail_tma_umma
 from .._compiler.cute.cutedsl_compat import emit_producer_tail_umma_async
@@ -1067,8 +1068,8 @@ def _codegen_cute_store_tcgen05_tile(
                 f"barrier_for_retrieve={tcgen05_value.tmem_alloc_barrier}, "
                 f"allocator_warp_id=0, is_two_cta={tcgen05_value.is_two_cta!s}, "
                 f"two_cta_tmem_dealloc_mbar_ptr={tcgen05_value.tmem_dealloc_mbar_ptr}, "
-                f"num_allocated_columns={tcgen05_value.acc_tmem_cols}, "
-                "dealloc_mbarrier_initialized=True)"
+                f"num_allocated_columns={tcgen05_value.acc_tmem_cols}"
+                f"{emit_dealloc_mbarrier_initialized_kwarg()})"
             ),
             "cute.arch.sync_threads()",
         ]
