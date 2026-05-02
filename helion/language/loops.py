@@ -435,8 +435,8 @@ def _add_config_choices(
         ):
             _add_config_range_choice([block_id], allow_static_range=allow_static_range)
 
-        if has_symbolic_bounds and config_spec.backend_name == "pallas":
-            config_spec.has_pallas_symbolic_bounds = True
+        if has_symbolic_bounds or has_data_dependent_bounds:
+            config_spec.has_symbolic_or_data_dependent_bounds = True
 
 
 def _add_config_range_choice(
