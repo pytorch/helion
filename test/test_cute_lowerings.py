@@ -622,7 +622,9 @@ class TestCuteLowerings(unittest.TestCase):
         self.assertNotIn("load = x[indices_0, indices_2]", code)
         self.assertNotIn("load_1 = y[indices_2, indices_1]", code)
         self.assertIn(
-            "if tcgen05_exec_active:\n                tcgen05_ab_pipeline.consumer_wait(",
+            "if tcgen05_exec_active:\n"
+            "                tcgen05_ab_consumer_try_token = tcgen05_ab_pipeline.consumer_try_wait(tcgen05_ab_consumer_state)\n"
+            "                tcgen05_ab_pipeline.consumer_wait(tcgen05_ab_consumer_state, tcgen05_ab_consumer_try_token)",
             code,
         )
         self.assertIn(
@@ -642,6 +644,82 @@ class TestCuteLowerings(unittest.TestCase):
             code,
         )
         self.assertNotIn("cute.arch.warp_reduction_sum", code)
+
+    def test_tcgen05_kloop_tma_producer_split_into_separate_if(self) -> None:
+        """Pin the per-K-iter producer/consumer split: producer work is
+        emitted as ``if {tma_full_tile} and {tma_warp} and
+        {tma_next_full_tile}: ...`` separate from the consumer/scalar-
+        fallback ``if {tma_full_tile}: ... else: ...`` block.
+        """
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_kloop_split(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        args = (
+            torch.randn(128, 256, device=DEVICE, dtype=torch.float16),
+            torch.randn(256, 256, device=DEVICE, dtype=torch.float16),
+        )
+        support = SimpleNamespace(
+            supported_impls=("universal", "warp", "tcgen05"),
+            warp_f16bf16=True,
+            tcgen05_f16bf16=True,
+        )
+        with (
+            patch(
+                "helion._compiler.cute.cute_mma.get_cute_mma_support",
+                return_value=support,
+            ),
+            patch(
+                "helion._compiler.cute.mma_support.get_cute_mma_support",
+                return_value=support,
+            ),
+        ):
+            bound = cute_matmul_kloop_split.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            config = helion.Config(
+                block_sizes=[128, 256, 16],
+                l2_groupings=[1],
+                loop_orders=[[0, 1]],
+                num_stages=2,
+                num_warps=4,
+                pid_type="flat",
+                tcgen05_cluster_m=1,
+                tcgen05_ab_stages=2,
+                tcgen05_acc_stages=2,
+                tcgen05_c_stages=2,
+                tcgen05_num_epi_warps=4,
+            )
+            code = bound.to_triton_code(config)
+
+        self.assertIn(
+            "if tcgen05_tma_full_tile and tcgen05_tma_warp "
+            "and tcgen05_tma_next_full_tile:",
+            code,
+        )
+        self.assertIn(
+            "tcgen05_ab_pipeline.producer_acquire("
+            "tcgen05_ab_producer_state, tcgen05_ab_producer_try_token)",
+            code,
+        )
+        self.assertIn(
+            "tcgen05_ab_pipeline.producer_commit(tcgen05_ab_producer_state)",
+            code,
+        )
+        self.assertIn("cute.arch.sync_threads()", code)
+        compound_shape = (
+            "if tcgen05_tma_full_tile:\n"
+            "                if tcgen05_tma_warp and tcgen05_tma_next_full_tile:"
+        )
+        self.assertNotIn(compound_shape, code)
 
     def test_tcgen05_codegen_emits_setmaxregister_split(self) -> None:
         """Tcgen05 codegen emits Quack-style register reallocation: consumer

@@ -1845,6 +1845,10 @@ def _emit_mma_pipeline(
                 if not tcgen05_use_tma_b
                 else ""
             )
+            # Per-K-iter TMA work is emitted as two adjacent statements
+            # (producer-side ``if`` and consumer/fallback ``if``) so the
+            # producer half is a separate top-level statement; see
+            # ``cute_plan.md`` for the role-lift plan.
             tma_wait_src = f"        {tma_pipeline}.consumer_wait({tma_consumer_state}, {tma_consumer_try_token})\n"
             if tcgen05_use_tma_pipeline:
                 assert tcgen05_plan is not None
@@ -1866,54 +1870,53 @@ def _emit_mma_pipeline(
                         f"{tma_consumer_try_token} = cutlass.Boolean(0)"
                     )
                 )
-                cg.add_statement(
-                    statement_from_string(
-                        f"if {tma_full_tile}:\n"
-                        f"    if {tma_warp} and {tma_next_full_tile}:\n"
-                        f"        {tma_producer_try_token} = {tma_pipeline}.producer_try_acquire({tma_producer_state})\n"
-                        f"    if {tcgen05_plan.exec_active}:\n"
-                        f"        {tma_consumer_try_token} = {tma_pipeline}.consumer_try_wait({tma_consumer_state})\n"
-                        f"    if {tma_warp} and {tma_next_full_tile}:\n"
-                        f"        {tma_pipeline}.producer_acquire({tma_producer_state}, {tma_producer_try_token})\n"
-                        f"        {tma_barrier_ptr} = {tma_pipeline}.producer_get_barrier({tma_producer_state})\n"
+                pipeline_producer_src = (
+                    f"if {tma_full_tile} and {tma_warp} and {tma_next_full_tile}:\n"
+                    f"    {tma_producer_try_token} = {tma_pipeline}.producer_try_acquire({tma_producer_state})\n"
+                    f"    {tma_pipeline}.producer_acquire({tma_producer_state}, {tma_producer_try_token})\n"
+                    f"    {tma_barrier_ptr} = {tma_pipeline}.producer_get_barrier({tma_producer_state})\n"
+                    + (
+                        f"    cute.copy({tma_atom_a}, "
+                        f"{tma_gA}[None, {tma_k_tile} + cutlass.Int32({tcgen05_ab_stage_count_value})], "
+                        f"{tma_sA}[None, {tma_producer_state}.index], "
+                        f"tma_bar_ptr={tma_barrier_ptr}"
                         + (
-                            f"        cute.copy({tma_atom_a}, "
-                            f"{tma_gA}[None, {tma_k_tile} + cutlass.Int32({tcgen05_ab_stage_count_value})], "
-                            f"{tma_sA}[None, {tma_producer_state}.index], "
-                            f"tma_bar_ptr={tma_barrier_ptr}"
-                            + (
-                                f", mcast_mask={tma_a_mcast_mask}"
-                                if tcgen05_is_two_cta
-                                else ""
-                            )
-                            + ")\n"
-                            f"        cute.copy({tma_atom_b}, "
-                            f"{tma_gB}[None, {tma_k_tile} + cutlass.Int32({tcgen05_ab_stage_count_value})], "
-                            f"{tma_sB}[None, {tma_producer_state}.index], "
-                            f"tma_bar_ptr={tma_barrier_ptr}"
-                            + (
-                                f", mcast_mask={tma_b_mcast_mask}"
-                                if tcgen05_cluster_m > 1 or tcgen05_is_two_cta
-                                else ""
-                            )
-                            + ")\n"
+                            f", mcast_mask={tma_a_mcast_mask}"
+                            if tcgen05_is_two_cta
+                            else ""
                         )
-                        + f"        {tma_pipeline}.producer_commit({tma_producer_state})\n"
-                        + emit_pipeline_advance(tma_producer_state, indent="        ")
-                        + "\n"
-                        f"    if {tcgen05_plan.exec_active}:\n"
-                        f"{tma_wait_src}"
-                        "else:\n"
-                        f"{scalar_load_a_src}\n"
-                        f"{scalar_load_b_src}\n"
-                        "    cute.arch.sync_threads()"
+                        + ")\n"
+                        f"    cute.copy({tma_atom_b}, "
+                        f"{tma_gB}[None, {tma_k_tile} + cutlass.Int32({tcgen05_ab_stage_count_value})], "
+                        f"{tma_sB}[None, {tma_producer_state}.index], "
+                        f"tma_bar_ptr={tma_barrier_ptr}"
+                        + (
+                            f", mcast_mask={tma_b_mcast_mask}"
+                            if tcgen05_cluster_m > 1 or tcgen05_is_two_cta
+                            else ""
+                        )
+                        + ")\n"
                     )
+                    + f"    {tma_pipeline}.producer_commit({tma_producer_state})\n"
+                    + emit_pipeline_advance(tma_producer_state, indent="    ")
                 )
+                cg.add_statement(statement_from_string(pipeline_producer_src))
+                pipeline_consumer_src = (
+                    f"if {tma_full_tile}:\n"
+                    f"    if {tcgen05_plan.exec_active}:\n"
+                    f"        {tma_consumer_try_token} = {tma_pipeline}.consumer_try_wait({tma_consumer_state})\n"
+                    f"{tma_wait_src}"
+                    "else:\n"
+                    f"{scalar_load_a_src}\n"
+                    f"{scalar_load_b_src}\n"
+                    "    cute.arch.sync_threads()"
+                )
+                cg.add_statement(statement_from_string(pipeline_consumer_src))
             else:
                 assert tcgen05_plan is not None
                 tma_copy_a_src = (
                     (
-                        f"        cute.copy({tma_atom_a}, {tma_gA}[None, {tma_k_tile}], "
+                        f"    cute.copy({tma_atom_a}, {tma_gA}[None, {tma_k_tile}], "
                         f"{tma_sA}[None, {tma_producer_state}.index], tma_bar_ptr={tma_barrier_ptr}"
                         + (
                             f", mcast_mask={tma_a_mcast_mask}"
@@ -1927,7 +1930,7 @@ def _emit_mma_pipeline(
                 )
                 tma_copy_b_src = (
                     (
-                        f"        cute.copy({tma_atom_b}, {tma_gB}[None, {tma_k_tile}], "
+                        f"    cute.copy({tma_atom_b}, {tma_gB}[None, {tma_k_tile}], "
                         f"{tma_sB}[None, {tma_producer_state}.index], tma_bar_ptr={tma_barrier_ptr}"
                         + (
                             f", mcast_mask={tma_b_mcast_mask}"
@@ -1939,27 +1942,32 @@ def _emit_mma_pipeline(
                     if tcgen05_use_tma_b
                     else ""
                 )
-                cg.add_statement(
-                    statement_from_string(
-                        f"if {tma_full_tile}:\n"
-                        f"    if {tma_warp}:\n"
-                        f"        {tma_pipeline}.producer_acquire({tma_producer_state})\n"
-                        f"        {tma_barrier_ptr} = {tma_pipeline}.producer_get_barrier({tma_producer_state})\n"
-                        f"{tma_copy_a_src}"
-                        f"{tma_copy_b_src}"
-                        f"        {tma_pipeline}.producer_commit({tma_producer_state})\n"
-                        f"{scalar_load_a_tma_src}"
-                        f"{scalar_load_b_tma_src}"
-                        f"    if {tcgen05_plan.exec_active}:\n"
-                        "        cute.arch.sync_warp()\n"
-                        f"{tma_wait_src}"
-                        "    cute.arch.sync_threads()\n"
-                        "else:\n"
-                        f"{scalar_load_a_src}\n"
-                        f"{scalar_load_b_src}\n"
-                        "    cute.arch.sync_threads()"
-                    )
+                non_pipeline_producer_src = (
+                    f"if {tma_full_tile} and {tma_warp}:\n"
+                    f"    {tma_pipeline}.producer_acquire({tma_producer_state})\n"
+                    f"    {tma_barrier_ptr} = {tma_pipeline}.producer_get_barrier({tma_producer_state})\n"
+                    f"{tma_copy_a_src}"
+                    f"{tma_copy_b_src}"
+                    f"    {tma_pipeline}.producer_commit({tma_producer_state})"
                 )
+                cg.add_statement(statement_from_string(non_pipeline_producer_src))
+                # ``scalar_load_{a,b}_tma_src`` gate on ``mma_active``
+                # (not ``tma_warp``), so they live in the consumer
+                # block alongside the cross-warp ``sync_threads()``.
+                non_pipeline_consumer_src = (
+                    f"if {tma_full_tile}:\n"
+                    f"{scalar_load_a_tma_src}"
+                    f"{scalar_load_b_tma_src}"
+                    f"    if {tcgen05_plan.exec_active}:\n"
+                    "        cute.arch.sync_warp()\n"
+                    f"{tma_wait_src}"
+                    "    cute.arch.sync_threads()\n"
+                    "else:\n"
+                    f"{scalar_load_a_src}\n"
+                    f"{scalar_load_b_src}\n"
+                    "    cute.arch.sync_threads()"
+                )
+                cg.add_statement(statement_from_string(non_pipeline_consumer_src))
         else:
             cg.add_statement(scalar_load_a)
             cg.add_statement(scalar_load_b)
