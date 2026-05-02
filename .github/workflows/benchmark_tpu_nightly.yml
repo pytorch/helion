@@ -16,6 +16,24 @@ on:
         #   grpo_loss: complex multi-kernel setup, needs special handling
         #   jagged_hstu_attn: complex jagged attention with special data setup
         default: "exp,add,softmax_two_pass,welford,attention,bmm,matmul,matmul_layernorm,cross_entropy,embedding,broadcast_matmul,geglu,low_mem_dropout,swiglu,batch_softmax,sum,rms_norm,rms_norm_bwd,layer_norm,softmax,long_sum_naive,long_sum_loop,long_sum_manual,se_block,squeeze_and_excitation_net"
+      autotuner:
+        description: |
+          Optional HELION_AUTOTUNER override. Leave empty for the default
+          LFBOTreeSearch. Set to "LLMGuidedSearch" or "LLMSeededLFBOTreeSearch"
+          to use an LLM-guided search (requires the HELION_LLM_API_KEY repo
+          secret to be configured).
+        required: false
+        type: choice
+        default: ''
+        options:
+          - ''
+          - 'LLMGuidedSearch'
+          - 'LLMSeededLFBOTreeSearch'
+      llm_model:
+        description: 'LLM model name when autotuner is LLM-based.'
+        required: false
+        type: string
+        default: 'claude-opus-4-7'
 
 permissions:
   contents: read
@@ -25,5 +43,9 @@ jobs:
     uses: ./.github/workflows/benchmark_tpu.yml
     permissions:
       contents: read
+    secrets:
+      HELION_LLM_API_KEY: ${{ secrets.HELION_LLM_API_KEY }}
     with:
       kernels: ${{ github.event.inputs.kernels || 'exp,add,softmax_two_pass,welford,attention,bmm,matmul,matmul_layernorm,cross_entropy,embedding,broadcast_matmul,geglu,low_mem_dropout,swiglu,batch_softmax,sum,rms_norm,rms_norm_bwd,layer_norm,softmax,long_sum_naive,long_sum_loop,long_sum_manual,se_block,squeeze_and_excitation_net' }}
+      autotuner: ${{ github.event.inputs.autotuner || '' }}
+      llm_model: ${{ github.event.inputs.llm_model || 'claude-opus-4-7' }}

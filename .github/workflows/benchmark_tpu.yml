@@ -6,6 +6,23 @@ on:
       kernels:
         required: true
         type: string
+      autotuner:
+        description: |
+          Optional HELION_AUTOTUNER override (e.g. LLMGuidedSearch,
+          LLMSeededLFBOTreeSearch). Empty string = default LFBOTreeSearch.
+          When set to an LLM-based autotuner the secret HELION_LLM_API_KEY
+          must be configured at the repo/org level.
+        required: false
+        type: string
+        default: ''
+      llm_model:
+        description: 'LLM model name when an LLM-based autotuner is selected.'
+        required: false
+        type: string
+        default: 'claude-opus-4-7'
+    secrets:
+      HELION_LLM_API_KEY:
+        required: false
 
 permissions:
   contents: read
@@ -23,6 +40,13 @@ jobs:
       # variable (10-25 min per shape under TPU contention), so 60 min total
       # gives safe headroom.
       HELION_BENCHMARK_KERNEL_TIMEOUT: "3600"
+      # Optional autotuner override (empty = default LFBOTreeSearch).
+      HELION_AUTOTUNER: ${{ inputs.autotuner }}
+      HELION_LLM_MODEL: ${{ inputs.llm_model }}
+      # Only consumed when HELION_AUTOTUNER is an LLM-based search.
+      # If the secret isn't set, this resolves to an empty string and the
+      # LLM transport will raise a clear error at autotune time.
+      HELION_LLM_API_KEY: ${{ secrets.HELION_LLM_API_KEY }}
 
     runs-on: linux.google.tpuv7x.1
 
