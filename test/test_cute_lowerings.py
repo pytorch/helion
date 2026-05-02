@@ -529,9 +529,12 @@ class TestCuteLowerings(unittest.TestCase):
         with patch_cute_mma_support():
             bound = cute_matmul_mma_codegen_only.bind(args)
             # matmul_ops narrows tcgen05_cluster_m to (1,) for the
-            # bf16/fp16 matmul; this codegen-only test still exercises the
-            # cluster=2 path so widen the choices back so the default config
-            # picks cluster_m=2.
+            # bf16/fp16 matmul because cluster_m=2 currently CUDA-launch
+            # fails; this codegen-only test still exercises the cluster=2
+            # path so widen the choices back so the default config picks
+            # cluster_m=2. tcgen05_num_epi_warps is already narrowed to
+            # (4,) by the matmul-side helper -- the only currently-correct
+            # value -- so no override is needed for that knob.
             bound.env.config_spec.cute_tcgen05_search_enabled = True
             bound.env.config_spec.restrict_tcgen05_cluster_m_search((2, 1))
             config = bound.config_spec.default_config()
@@ -1464,15 +1467,17 @@ class TestCuteLowerings(unittest.TestCase):
             torch.randn(256, 64, device=DEVICE, dtype=torch.float16),
             torch.randn(64, 128, device=DEVICE, dtype=torch.float16),
         )
-        # cluster_m=2 was the implicit autotune default before the search
-        # space was tightened; this test still exercises the cluster-aware
-        # codegen path so request it explicitly.
+        # cluster_m=2 and num_epi_warps=4 were the implicit autotune
+        # defaults before the search space was tightened; this test still
+        # exercises the cluster-aware multi-warp epi codegen path so
+        # request both explicitly.
         config = helion.Config(
             block_sizes=[128, 128, 16],
             loop_orders=[[0, 1]],
             num_stages=1,
             pid_type="flat",
             tcgen05_cluster_m=2,
+            tcgen05_num_epi_warps=4,
         )
 
         with (
