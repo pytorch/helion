@@ -644,6 +644,145 @@ class TestCuteLowerings(unittest.TestCase):
         )
         self.assertNotIn("cute.arch.warp_reduction_sum", code)
 
+    def test_tcgen05_codegen_emits_setmaxregister_split(self) -> None:
+        """Tcgen05 codegen emits Quack-style register reallocation: producer
+        warps (TMA, AB-load, scheduler) call ``setmaxregister_decrease(120)``;
+        consumer warps (exec, epi, epi_load) call ``setmaxregister_increase(256)``.
+        Both branches gate on warp-uniform predicates so the calls only
+        fire on the right warps."""
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_setmaxregister(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        args = (
+            torch.randn(128, 16, device=DEVICE, dtype=torch.float16),
+            torch.randn(16, 256, device=DEVICE, dtype=torch.float16),
+        )
+        support = SimpleNamespace(
+            supported_impls=("universal", "warp", "tcgen05"),
+            warp_f16bf16=True,
+            tcgen05_f16bf16=True,
+        )
+        with (
+            patch(
+                "helion._compiler.cute.cute_mma.get_cute_mma_support",
+                return_value=support,
+            ),
+            patch(
+                "helion._compiler.cute.mma_support.get_cute_mma_support",
+                return_value=support,
+            ),
+        ):
+            bound = cute_matmul_setmaxregister.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            config = helion.Config(
+                block_sizes=[128, 256, 16],
+                l2_groupings=[4],
+                loop_orders=[[0, 1]],
+                num_stages=2,
+                num_warps=8,
+                pid_type="flat",
+                tcgen05_cluster_m=1,
+                tcgen05_ab_stages=2,
+                tcgen05_acc_stages=2,
+                tcgen05_c_stages=2,
+                tcgen05_num_epi_warps=4,
+                tcgen05_has_scheduler_warp=True,
+                tcgen05_has_epi_load_warp=True,
+            )
+            code = bound.to_triton_code(config)
+
+        # Producer warps drop to 120 regs.
+        self.assertIn(
+            "if tcgen05_tma_warp or tcgen05_ab_load_active or tcgen05_scheduler_warp:",
+            code,
+        )
+        self.assertIn(
+            "cute.arch.setmaxregister_decrease(cutlass.Int32(120))",
+            code,
+        )
+        # Consumer / epi warps raise to 256 regs.
+        self.assertIn(
+            "if tcgen05_exec_active or tcgen05_epi_active or tcgen05_epi_load_warp:",
+            code,
+        )
+        self.assertIn(
+            "cute.arch.setmaxregister_increase(cutlass.Int32(256))",
+            code,
+        )
+        # The setmaxregister calls land between the warp-role boolean
+        # assignments and the MMA setup, so they sit in the registered
+        # invariant block and do not get re-emitted per work-tile.
+        decrease_pos = code.find(
+            "cute.arch.setmaxregister_decrease(cutlass.Int32(120))"
+        )
+        increase_pos = code.find(
+            "cute.arch.setmaxregister_increase(cutlass.Int32(256))"
+        )
+        epi_active_pos = code.find("tcgen05_epi_tidx = ")
+        mma_slice_pos = code.find("mma_slice_tidx = ")
+        self.assertGreater(decrease_pos, epi_active_pos)
+        self.assertGreater(increase_pos, epi_active_pos)
+        self.assertLess(decrease_pos, mma_slice_pos)
+        self.assertLess(increase_pos, mma_slice_pos)
+
+    def test_tcgen05_setmaxregister_omitted_without_tcgen05(self) -> None:
+        """The non-tcgen05 (warp / universal) MMA paths do not emit
+        setmaxregister. The Quack-style register split is specific to the
+        warp-specialized tcgen05 producer/consumer roles."""
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_warp_only(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        args = (
+            torch.randn(128, 16, device=DEVICE, dtype=torch.float16),
+            torch.randn(16, 64, device=DEVICE, dtype=torch.float16),
+        )
+        # Force the warp impl by reporting only warp_f16bf16 support.
+        support = SimpleNamespace(
+            supported_impls=("universal", "warp"),
+            warp_f16bf16=True,
+            tcgen05_f16bf16=False,
+        )
+        with (
+            patch(
+                "helion._compiler.cute.cute_mma.get_cute_mma_support",
+                return_value=support,
+            ),
+            patch(
+                "helion._compiler.cute.mma_support.get_cute_mma_support",
+                return_value=support,
+            ),
+        ):
+            bound = cute_matmul_warp_only.bind(args)
+            config = bound.config_spec.default_config()
+            code = bound.to_triton_code(config)
+
+        # No setmaxregister either way on the warp path: no producer/consumer
+        # split exists.
+        self.assertNotIn("setmaxregister_decrease", code)
+        self.assertNotIn("setmaxregister_increase", code)
+
     def test_tcgen05_default_store_arrives_with_exec_warp(self) -> None:
         @helion.kernel(backend="cute")
         def cute_matmul_mma_codegen_only(
@@ -3260,6 +3399,185 @@ class TestCuteLowerings(unittest.TestCase):
                 ),
                 "(mask_1)",
             )
+
+
+@onlyBackends(["cute"])
+class TestPersistentLoopSplitter(unittest.TestCase):
+    """Unit tests for ``ProgramID._split_tcgen05_invariant_setup``.
+
+    The splitter has three modes:
+
+    1. **Deny-list (new):** when codegen has registered any per-tile
+       statements via ``register_cute_tcgen05_per_tile_stmts``, anything
+       NOT marked is hoistable. This matches the Quack pattern of
+       building pipelines once per kernel.
+    2. **Allow-list (legacy):** when codegen has registered any invariant
+       statements via ``register_cute_tcgen05_invariant_setup``, only
+       those statements are hoisted.
+    3. **Heuristic fallback:** when neither registration is populated,
+       scan for known per-tile patterns (`make_pipeline_state`,
+       ``cute.local_tile``, ``offset_``, etc.) and split at the first one.
+    """
+
+    def _make_helper(self) -> tuple[object, object]:
+        """Construct a real splitter and a minimal device-function stand-in.
+
+        The splitter only needs the predicate methods from device function
+        (``is_cute_tcgen05_invariant_setup``,
+        ``has_cute_tcgen05_per_tile_marks``,
+        ``is_cute_tcgen05_per_tile``). ``Tcgen05PersistentProgramIDs`` is a
+        concrete subclass of ``ProgramIDs`` with the splitter; instantiate
+        it without ``__init__`` to skip the device-function plumbing."""
+
+        from helion._compiler.program_id import Tcgen05PersistentProgramIDs
+
+        class _MinimalDeviceFunction:
+            def __init__(self) -> None:
+                self._invariant_ids: set[int] = set()
+                self._per_tile_ids: set[int] = set()
+
+            def register_cute_tcgen05_invariant_setup(
+                self, stmts: list[ast.AST]
+            ) -> None:
+                self._invariant_ids.update(id(s) for s in stmts)
+
+            def is_cute_tcgen05_invariant_setup(self, stmt: ast.AST) -> bool:
+                return id(stmt) in self._invariant_ids
+
+            def register_cute_tcgen05_per_tile_stmts(
+                self, stmts: list[ast.AST]
+            ) -> None:
+                self._per_tile_ids.update(id(s) for s in stmts)
+
+            def is_cute_tcgen05_per_tile(self, stmt: ast.AST) -> bool:
+                return id(stmt) in self._per_tile_ids
+
+            @property
+            def has_cute_tcgen05_per_tile_marks(self) -> bool:
+                return bool(self._per_tile_ids)
+
+        splitter = Tcgen05PersistentProgramIDs.__new__(Tcgen05PersistentProgramIDs)
+        # The deny-list splitter walks ASTs looking for references to the
+        # virtual_pid var. Tests use simple statements that don't mention
+        # any pid, so an unused sentinel name is fine.
+        splitter.virtual_pid_var = "__test_virtual_pid__"  # type: ignore[attr-defined]
+        return splitter, _MinimalDeviceFunction()
+
+    def _stmt(self, text: str) -> ast.stmt:
+        return ast.parse(text).body[0]
+
+    def test_deny_list_mode_hoists_unmarked_statements(self) -> None:
+        splitter, df = self._make_helper()
+        invariant_a = self._stmt("tma_atom_a = make_atom()")
+        invariant_b = self._stmt("ab_pipeline = PipelineTmaUmma.create()")
+        per_tile_a = self._stmt("gA = cute.local_tile(tA, (128, 16), (m // 128, None))")
+        per_tile_b = self._stmt("acc_pipeline.producer_acquire(state)")
+        body = [invariant_a, invariant_b, per_tile_a, per_tile_b]
+        df.register_cute_tcgen05_per_tile_stmts([per_tile_a, per_tile_b])
+        hoisted, wrapped = splitter._split_tcgen05_invariant_setup(df, body)
+        self.assertEqual(hoisted, [invariant_a, invariant_b])
+        self.assertEqual(wrapped, [per_tile_a, per_tile_b])
+
+    def test_deny_list_mode_preserves_relative_order(self) -> None:
+        """The splitter's two list comprehensions iterate ``body`` in
+        order, so hoisted and wrapped slices each preserve the input
+        ordering. This is required: pipeline ``.create(...)`` must run
+        before the per-tile producer_acquire, and consumer_state must be
+        initialized before any tile body uses it."""
+        splitter, df = self._make_helper()
+        a = self._stmt("a = 1")
+        per_tile = self._stmt("g = local_tile(t, (128, 16), (m, None))")
+        b = self._stmt("b = 2")
+        df.register_cute_tcgen05_per_tile_stmts([per_tile])
+        hoisted, wrapped = splitter._split_tcgen05_invariant_setup(df, [a, per_tile, b])
+        self.assertEqual(hoisted, [a, b])
+        self.assertEqual(wrapped, [per_tile])
+
+    def test_allow_list_mode_used_when_per_tile_unset(self) -> None:
+        splitter, df = self._make_helper()
+        a = self._stmt("a = 1")
+        b = self._stmt("b = 2")
+        c = self._stmt("c = 3")
+        df.register_cute_tcgen05_invariant_setup([a, c])
+        hoisted, wrapped = splitter._split_tcgen05_invariant_setup(df, [a, b, c])
+        self.assertEqual(hoisted, [a, c])
+        self.assertEqual(wrapped, [b])
+
+    def test_heuristic_mode_when_no_registration(self) -> None:
+        splitter, df = self._make_helper()
+        warp_idx = self._stmt("tcgen05_warp_idx = cute.arch.warp_idx()")
+        lane_idx = self._stmt("tcgen05_lane_idx = cute.arch.lane_idx()")
+        local_tile = self._stmt("gA = cute.local_tile(tA, (128, 16), (m // 128, None))")
+        producer_acquire = self._stmt("ab_pipeline.producer_acquire(state)")
+        body = [warp_idx, lane_idx, local_tile, producer_acquire]
+        # Neither registration was populated; the heuristic looks for
+        # ``tcgen05_warp_idx =`` to start the invariant range and stops
+        # at the first per-tile pattern (``cute.local_tile``).
+        hoisted, wrapped = splitter._split_tcgen05_invariant_setup(df, body)
+        self.assertEqual(hoisted, [warp_idx, lane_idx])
+        self.assertEqual(wrapped, [local_tile, producer_acquire])
+
+    def test_deny_list_traces_virtual_pid_dependencies(self) -> None:
+        """The deny-list splitter walks each statement's name uses /
+        defines and propagates the per-tile property: anything that
+        reads or writes a per-tile name is itself per-tile, and anything
+        it assigns is also per-tile. Seeded with ``virtual_pid_var``,
+        this captures the PID decomposition + downstream offset chain
+        emitted by ``_decompose_virtual_pid`` without requiring those
+        sites to register themselves."""
+        splitter, df = self._make_helper()
+        # Pretend cute_mma marked just one statement explicitly per-tile.
+        marked = self._stmt("g = cute.local_tile(t, (128, 16), (m, None))")
+        df.register_cute_tcgen05_per_tile_stmts([marked])
+
+        # Statements that use virtual_pid_var should fall on the
+        # wrapped side; downstream statements that consume their
+        # writes (pid_0, pid_1 here) should follow.
+        invariant_a = self._stmt("smem_a = cute.arch.alloc_smem(F32, 256)")
+        decompose_pid = self._stmt("pid_0 = __test_virtual_pid__ % blocks_0")
+        decompose_pid_2 = self._stmt("pid_1 = __test_virtual_pid__ // blocks_0")
+        derive_m = self._stmt("m_offset = pid_0 * BLOCK_M")
+        derive_n = self._stmt("n_offset = pid_1 * BLOCK_N")
+        invariant_b = self._stmt("ab_pipeline = PipelineTmaUmma.create()")
+
+        body = [
+            invariant_a,
+            decompose_pid,
+            decompose_pid_2,
+            derive_m,
+            derive_n,
+            marked,
+            invariant_b,
+        ]
+        hoisted, wrapped = splitter._split_tcgen05_invariant_setup(df, body)
+        # invariant_a and invariant_b have no per-tile dep — hoisted.
+        # decompose_pid uses virtual_pid → wrapped, defines pid_0.
+        # decompose_pid_2 uses virtual_pid → wrapped, defines pid_1.
+        # derive_m uses pid_0 → wrapped, defines m_offset.
+        # derive_n uses pid_1 → wrapped, defines n_offset.
+        # marked is explicitly per-tile.
+        self.assertEqual(hoisted, [invariant_a, invariant_b])
+        self.assertEqual(
+            wrapped,
+            [decompose_pid, decompose_pid_2, derive_m, derive_n, marked],
+        )
+
+    def test_deny_list_takes_precedence_over_allow_list(self) -> None:
+        """When BOTH registrations are populated, deny-list wins. This
+        keeps the new path's semantics consistent and avoids accidental
+        hoisting of statements that the legacy allow-list omitted."""
+        splitter, df = self._make_helper()
+        invariant_a = self._stmt("a = 1")
+        invariant_b = self._stmt("b = 2")
+        per_tile = self._stmt("c = m + 1")
+        df.register_cute_tcgen05_invariant_setup([invariant_a])  # legacy
+        df.register_cute_tcgen05_per_tile_stmts([per_tile])  # new
+        body = [invariant_a, invariant_b, per_tile]
+        hoisted, wrapped = splitter._split_tcgen05_invariant_setup(df, body)
+        # Deny-list mode hoists invariant_b too (it isn't marked
+        # per-tile), even though the legacy allow-list didn't include it.
+        self.assertEqual(hoisted, [invariant_a, invariant_b])
+        self.assertEqual(wrapped, [per_tile])
 
 
 if __name__ == "__main__":

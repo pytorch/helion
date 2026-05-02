@@ -60,6 +60,15 @@ _TRACE_THROUGH_TARGETS = {
     # data shuffle.  Permuted operands fall back to scalar codegen.
 }
 
+# Register reallocation budget for tcgen05 warp-specialized kernels.
+# Producer warps (TMA loads, scheduler) only do address arithmetic and
+# barrier ops, so they can give back registers; consumer warps (MMA
+# exec, epilogue) need the extra budget for register-resident
+# accumulators and TMEM↔RMEM staging. Values match Quack's sm100
+# reference (`gemm_sm100.py`).
+_TCGEN05_PRODUCER_REGS = 120
+_TCGEN05_CONSUMER_REGS = 256
+
 
 @dataclass(frozen=True)
 class _Tcgen05LayoutPlan:
@@ -855,6 +864,22 @@ def _emit_mma_pipeline(
     # === outer_prefix: MMA setup + shared memory alloc + accumulator init ===
     prefix = device_loop.outer_prefix
     suffix = device_loop.outer_suffix
+    # Statements appended to ``prefix`` that reference per-tile coordinates
+    # (m_offset_var, n_offset_var, advancing pipeline state). When the
+    # persistent kernel splits the device-loop prefix, these stay inside the
+    # work-tile loop while everything else hoists out. See
+    # ``DeviceFunction.register_cute_tcgen05_per_tile_stmts`` and
+    # ``ProgramID._split_tcgen05_invariant_setup``.
+    per_tile_stmts: list[ast.AST] = []
+
+    def _emit_per_tile(text: str) -> ast.stmt:
+        """Append a per-tile statement to ``prefix`` and tag it for the
+        persistent-loop splitter. Returns the AST node so callers can
+        chain (e.g. when constructing ``If`` bodies)."""
+        stmt = statement_from_string(text)
+        prefix.append(stmt)
+        per_tile_stmts.append(stmt)
+        return stmt
 
     mma_participant_linear: str | None = None
     mma_copy_linear: str | None = None
@@ -1063,6 +1088,29 @@ def _emit_mma_pipeline(
                 statement_from_string(
                     f"{epi_tidx} = {lane_idx} + {warp_idx} * cutlass.Int32(32)"
                     f" if {epi_active} else cutlass.Int32(0)"
+                )
+            )
+            # Register reallocation: producer warps (TMA, ab_load, scheduler)
+            # decrease their per-thread register budget so the consumer warps
+            # (exec, epi, epi_load) can be raised. Matches Quack's sm100 split
+            # (gemm_sm100.py:215-216, 1018, 1239, 1257, 1331, 1375, 1513).
+            # The setmaxregister calls are warp-uniform and must precede the
+            # first pipeline op of each role; placing them with the role-gate
+            # invariants keeps them out of the per-tile work loop.
+            prefix.append(
+                statement_from_string(
+                    f"if {tma_warp} or {tcgen05_ab_load_active} or "
+                    f"{tcgen05_scheduler_warp}:\n"
+                    f"    cute.arch.setmaxregister_decrease("
+                    f"cutlass.Int32({_TCGEN05_PRODUCER_REGS}))"
+                )
+            )
+            prefix.append(
+                statement_from_string(
+                    f"if {tcgen05_plan.exec_active} or {epi_active} or "
+                    f"{tcgen05_epi_load_warp}:\n"
+                    f"    cute.arch.setmaxregister_increase("
+                    f"cutlass.Int32({_TCGEN05_CONSUMER_REGS}))"
                 )
             )
             prefix.append(
@@ -1283,11 +1331,15 @@ def _emit_mma_pipeline(
                 f"{tcgen05_exec_acc_tmem_ptr}, {acc_frag_base}.layout)"
             )
         )
-        prefix.append(
-            statement_from_string(
-                f"{acc_frag} = "
-                f"{tcgen05_exec_acc_frag_base}[None, None, None, {tcgen05_plan.acc_producer_state}.index]"
-            )
+        # ``acc_frag`` indexes ``tcgen05_exec_acc_frag_base`` by the current
+        # ``acc_producer_state.index`` stage. The K-loop suffix advances
+        # that producer state once per UMMA fence, so under the persistent
+        # path each tile sees a different index. Mark per-tile so the
+        # alias is recomputed inside the work-tile loop.
+        _emit_per_tile(
+            f"{acc_frag} = "
+            f"{tcgen05_exec_acc_frag_base}[None, None, None, "
+            f"{tcgen05_plan.acc_producer_state}.index]"
         )
         prefix.append(
             statement_from_string(
@@ -1295,11 +1347,16 @@ def _emit_mma_pipeline(
                 f"{tcgen05_epi_acc_tmem_ptr}, {acc_frag_base}.layout)"
             )
         )
-        prefix.append(
-            statement_from_string(
-                f"if {tcgen05_plan.exec_active}:\n"
-                f"    {tcgen05_plan.acc_pipeline}.producer_acquire({tcgen05_plan.acc_producer_state})"
-            )
+        # Initial producer_acquire for stage 0 of the acc pipeline. The
+        # ``acc_producer_state`` advances once per UMMA fence inside the
+        # K-loop, so per tile we want to start by acquiring whatever stage
+        # the persistent loop currently points at. Tag as per-tile so this
+        # acquire stays in the work-tile body when the persistent loop
+        # splitter runs.
+        _emit_per_tile(
+            f"if {tcgen05_plan.exec_active}:\n"
+            f"    {tcgen05_plan.acc_pipeline}.producer_acquire("
+            f"{tcgen05_plan.acc_producer_state})"
         )
     else:
         prefix.append(
@@ -1434,29 +1491,25 @@ def _emit_mma_pipeline(
                     f"{tma_thr_mma} = {tiled_mma}.get_slice(cutlass.Int32(0))"
                 )
             )
-            prefix.append(
-                statement_from_string(
-                    f"{gmem_a_tma} = cute.local_tile("
-                    f"{tma_tensor_a}, ({bm}, {bk}), "
-                    f"({m_offset_var} // cutlass.Int32({bm}), None))"
-                )
+            # gA, gB depend on per-tile (m_offset_var, n_offset_var). Their
+            # downstream partitions and tma_partition outputs all inherit
+            # that per-tile dependency, so all of these stay inside the
+            # work-tile body when the persistent loop splitter runs.
+            _emit_per_tile(
+                f"{gmem_a_tma} = cute.local_tile("
+                f"{tma_tensor_a}, ({bm}, {bk}), "
+                f"({m_offset_var} // cutlass.Int32({bm}), None))"
             )
-            prefix.append(
-                statement_from_string(
-                    f"{gmem_b_tma} = cute.local_tile("
-                    f"{tma_tensor_b}, ({bn}, {bk}), "
-                    f"({n_offset_var} // cutlass.Int32({bn}), None))"
-                )
+            _emit_per_tile(
+                f"{gmem_b_tma} = cute.local_tile("
+                f"{tma_tensor_b}, ({bn}, {bk}), "
+                f"({n_offset_var} // cutlass.Int32({bn}), None))"
             )
-            prefix.append(
-                statement_from_string(
-                    f"{gmem_a_tma_part} = {tma_thr_mma}.partition_A({gmem_a_tma})"
-                )
+            _emit_per_tile(
+                f"{gmem_a_tma_part} = {tma_thr_mma}.partition_A({gmem_a_tma})"
             )
-            prefix.append(
-                statement_from_string(
-                    f"{gmem_b_tma_part} = {tma_thr_mma}.partition_B({gmem_b_tma})"
-                )
+            _emit_per_tile(
+                f"{gmem_b_tma_part} = {tma_thr_mma}.partition_B({gmem_b_tma})"
             )
             prefix.append(
                 statement_from_string(f"{tma_cta_layout} = cute.make_layout(1)")
@@ -1490,23 +1543,21 @@ def _emit_mma_pipeline(
                             "mcast_mode=1)"
                         )
                     )
-            prefix.append(
-                statement_from_string(
-                    f"{tma_sA}, {tma_gA} = cute.nvgpu.cpasync.tma_partition("
-                    f"{tma_atom_a}, 0, {tma_cta_layout}, "
-                    f"cute.group_modes({smem_a}, 0, cute.rank({smem_a}) - 1), "
-                    f"cute.group_modes({gmem_a_tma_part}, 0, "
-                    f"cute.rank({gmem_a_tma_part}) - 1))"
-                )
+            # tma_partition consumes the per-tile gA_part / gB_part, so the
+            # resulting (tma_sA, tma_gA) / (tma_sB, tma_gB) are also per-tile.
+            _emit_per_tile(
+                f"{tma_sA}, {tma_gA} = cute.nvgpu.cpasync.tma_partition("
+                f"{tma_atom_a}, 0, {tma_cta_layout}, "
+                f"cute.group_modes({smem_a}, 0, cute.rank({smem_a}) - 1), "
+                f"cute.group_modes({gmem_a_tma_part}, 0, "
+                f"cute.rank({gmem_a_tma_part}) - 1))"
             )
-            prefix.append(
-                statement_from_string(
-                    f"{tma_sB}, {tma_gB} = cute.nvgpu.cpasync.tma_partition("
-                    f"{tma_atom_b}, 0, {tma_cta_layout}, "
-                    f"cute.group_modes({smem_b}, 0, cute.rank({smem_b}) - 1), "
-                    f"cute.group_modes({gmem_b_tma_part}, 0, "
-                    f"cute.rank({gmem_b_tma_part}) - 1))"
-                )
+            _emit_per_tile(
+                f"{tma_sB}, {tma_gB} = cute.nvgpu.cpasync.tma_partition("
+                f"{tma_atom_b}, 0, {tma_cta_layout}, "
+                f"cute.group_modes({smem_b}, 0, cute.rank({smem_b}) - 1), "
+                f"cute.group_modes({gmem_b_tma_part}, 0, "
+                f"cute.rank({gmem_b_tma_part}) - 1))"
             )
             prefix.append(
                 statement_from_string(
@@ -1552,21 +1603,57 @@ def _emit_mma_pipeline(
                 )
             )
             if tcgen05_use_tma_pipeline:
-                prefix.append(
-                    statement_from_string(
-                        f"{tma_initial_full_tile} = "
+                # Initial TMA prefetch warms stages 0..ab_stage_count-1 of the
+                # AB pipeline at the START of each tile. Both the boolean
+                # full-tile predicates and the TMA copies reference per-tile
+                # gA/gB tensors and m_offset/n_offset, so they must stay in
+                # the work-tile body.
+                _emit_per_tile(
+                    f"{tma_initial_full_tile} = "
+                    f"{m_offset_var} + cutlass.Int32({bm}) <= cutlass.Int32({m_size}) "
+                    f"and {n_offset_var} + cutlass.Int32({bn}) <= cutlass.Int32({n_size}) "
+                    f"and cutlass.Int32({bk}) <= cutlass.Int32({k_total_size})"
+                )
+                _emit_per_tile(
+                    f"if {tma_initial_full_tile} and {tma_warp}:\n"
+                    f"    {tma_pipeline}.producer_acquire({tma_producer_state})\n"
+                    f"    {tma_barrier_ptr} = {tma_pipeline}.producer_get_barrier({tma_producer_state})\n"
+                    + (
+                        f"    cute.copy({tma_atom_a}, {tma_gA}[None, cutlass.Int32(0)], "
+                        f"{tma_sA}[None, {tma_producer_state}.index], "
+                        f"tma_bar_ptr={tma_barrier_ptr}"
+                        + (
+                            f", mcast_mask={tma_a_mcast_mask}"
+                            if tcgen05_is_two_cta
+                            else ""
+                        )
+                        + ")\n"
+                        f"    cute.copy({tma_atom_b}, {tma_gB}[None, cutlass.Int32(0)], "
+                        f"{tma_sB}[None, {tma_producer_state}.index], "
+                        f"tma_bar_ptr={tma_barrier_ptr}"
+                        + (
+                            f", mcast_mask={tma_b_mcast_mask}"
+                            if tcgen05_cluster_m > 1 or tcgen05_is_two_cta
+                            else ""
+                        )
+                        + ")\n"
+                    )
+                    + f"    {tma_pipeline}.producer_commit({tma_producer_state})\n"
+                    + emit_pipeline_advance(tma_producer_state, indent="    ")
+                )
+                if tcgen05_ab_stage_count_value > 1:
+                    _emit_per_tile(
+                        f"{tma_initial_next_full_tile} = "
                         f"{m_offset_var} + cutlass.Int32({bm}) <= cutlass.Int32({m_size}) "
                         f"and {n_offset_var} + cutlass.Int32({bn}) <= cutlass.Int32({n_size}) "
-                        f"and cutlass.Int32({bk}) <= cutlass.Int32({k_total_size})"
+                        f"and cutlass.Int32({bk * tcgen05_ab_stage_count_value}) <= cutlass.Int32({k_total_size})"
                     )
-                )
-                prefix.append(
-                    statement_from_string(
-                        f"if {tma_initial_full_tile} and {tma_warp}:\n"
+                    _emit_per_tile(
+                        f"if {tma_initial_full_tile} and {tma_initial_next_full_tile} and {tma_warp}:\n"
                         f"    {tma_pipeline}.producer_acquire({tma_producer_state})\n"
                         f"    {tma_barrier_ptr} = {tma_pipeline}.producer_get_barrier({tma_producer_state})\n"
                         + (
-                            f"    cute.copy({tma_atom_a}, {tma_gA}[None, cutlass.Int32(0)], "
+                            f"    cute.copy({tma_atom_a}, {tma_gA}[None, cutlass.Int32({tcgen05_ab_stage_count_value - 1})], "
                             f"{tma_sA}[None, {tma_producer_state}.index], "
                             f"tma_bar_ptr={tma_barrier_ptr}"
                             + (
@@ -1575,7 +1662,7 @@ def _emit_mma_pipeline(
                                 else ""
                             )
                             + ")\n"
-                            f"    cute.copy({tma_atom_b}, {tma_gB}[None, cutlass.Int32(0)], "
+                            f"    cute.copy({tma_atom_b}, {tma_gB}[None, cutlass.Int32({tcgen05_ab_stage_count_value - 1})], "
                             f"{tma_sB}[None, {tma_producer_state}.index], "
                             f"tma_bar_ptr={tma_barrier_ptr}"
                             + (
@@ -1587,45 +1674,6 @@ def _emit_mma_pipeline(
                         )
                         + f"    {tma_pipeline}.producer_commit({tma_producer_state})\n"
                         + emit_pipeline_advance(tma_producer_state, indent="    ")
-                    )
-                )
-                if tcgen05_ab_stage_count_value > 1:
-                    prefix.append(
-                        statement_from_string(
-                            f"{tma_initial_next_full_tile} = "
-                            f"{m_offset_var} + cutlass.Int32({bm}) <= cutlass.Int32({m_size}) "
-                            f"and {n_offset_var} + cutlass.Int32({bn}) <= cutlass.Int32({n_size}) "
-                            f"and cutlass.Int32({bk * tcgen05_ab_stage_count_value}) <= cutlass.Int32({k_total_size})"
-                        )
-                    )
-                    prefix.append(
-                        statement_from_string(
-                            f"if {tma_initial_full_tile} and {tma_initial_next_full_tile} and {tma_warp}:\n"
-                            f"    {tma_pipeline}.producer_acquire({tma_producer_state})\n"
-                            f"    {tma_barrier_ptr} = {tma_pipeline}.producer_get_barrier({tma_producer_state})\n"
-                            + (
-                                f"    cute.copy({tma_atom_a}, {tma_gA}[None, cutlass.Int32({tcgen05_ab_stage_count_value - 1})], "
-                                f"{tma_sA}[None, {tma_producer_state}.index], "
-                                f"tma_bar_ptr={tma_barrier_ptr}"
-                                + (
-                                    f", mcast_mask={tma_a_mcast_mask}"
-                                    if tcgen05_is_two_cta
-                                    else ""
-                                )
-                                + ")\n"
-                                f"    cute.copy({tma_atom_b}, {tma_gB}[None, cutlass.Int32({tcgen05_ab_stage_count_value - 1})], "
-                                f"{tma_sB}[None, {tma_producer_state}.index], "
-                                f"tma_bar_ptr={tma_barrier_ptr}"
-                                + (
-                                    f", mcast_mask={tma_b_mcast_mask}"
-                                    if tcgen05_cluster_m > 1 or tcgen05_is_two_cta
-                                    else ""
-                                )
-                                + ")\n"
-                            )
-                            + f"    {tma_pipeline}.producer_commit({tma_producer_state})\n"
-                            + emit_pipeline_advance(tma_producer_state, indent="    ")
-                        )
                     )
     else:
         prefix.append(
@@ -2172,6 +2220,16 @@ def _emit_mma_pipeline(
         suffix.append(
             statement_from_string(f"{result_var} = {smem_c}[{m_local}, {n_local}]")
         )
+
+    # Register per-tile statements with the persistent-loop splitter so
+    # everything else hoists out of the work-tile loop. The splitter also
+    # auto-detects PID-decomposition statements via ``virtual_pid_var``
+    # name lookup, so callers don't need to plumb registration through
+    # ``_decompose_virtual_pid``. No-op when the kernel uses a
+    # non-persistent ``pid_type`` (the splitter is only invoked from
+    # ``_setup_tcgen05_persistent_kernel``).
+    if per_tile_stmts:
+        df.register_cute_tcgen05_per_tile_stmts(per_tile_stmts)
 
     return expr_from_string(result_var)
 
