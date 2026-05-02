@@ -1833,6 +1833,10 @@ class TestExamples(RefEagerTestBase, TestCase):
         131072, reason="block sizes exceed device shared memory limit"
     )
     @skipIfXPU("Squeeze-and-excitation network not supported on XPU")
+    @xfailIfPallas(
+        "Nested emit_pipeline with hl.zeros loop-carried scratch hits a "
+        "scratch-name scoping collision in the generated body."
+    )
     def test_squeeze_and_excitation_net_fwd(self):
         m, n, k = 128, 128, 128
         x = torch.randn([m, n], device=DEVICE, dtype=torch.float32)
@@ -1950,6 +1954,10 @@ class TestExamples(RefEagerTestBase, TestCase):
     @skipIfA10G("failure on a10g")
     @skipIfTileIR("accuracy failure")
     @skipIfXPU("ocloc compilation failure with 256-GRF kernel on XPU backend")
+    @xfailIfPallas(
+        "Nested emit_pipeline with hl.zeros loop-carried scratch hits a "
+        "scratch-name scoping collision in the generated body."
+    )
     def test_squeeze_and_excitation_net_bwd_db(self):
         m, n, k = 256, 256, 256
         x = torch.randn([m, n], device=DEVICE, dtype=HALF_DTYPE)

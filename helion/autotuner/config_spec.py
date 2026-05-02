@@ -165,7 +165,7 @@ VALID_KEYS: frozenset[str] = frozenset(
         "epilogue_subtile",
     ]
 )
-VALID_PALLAS_LOOP_TYPES = ("unroll", "emit_pipeline", "fori_loop")
+VALID_PALLAS_LOOP_TYPES = ("emit_pipeline", "unroll", "fori_loop")
 VALID_PID_TYPES = (
     "flat",
     "xyz",

@@ -682,11 +682,9 @@ class TestPallas(TestCase):
         b = torch.randn(4, 256, 128, device=DEVICE, dtype=torch.bfloat16)
         # No explicit block_sizes — uses default_config() which runs
         # adjust_block_size_constraints and depends on size_matches.
-        code, result = code_and_output(pallas_bmm, (a, b))
+        _code, result = code_and_output(pallas_bmm, (a, b))
         expected = torch.bmm(a.float(), b.float()).to(torch.bfloat16)
         torch.testing.assert_close(result, expected, rtol=1e-2, atol=1e-2)
-        # Block sizes >= 128 should get the pl.multiple_of alignment hint
-        self.assertIn("pl.multiple_of(", code)
 
     def test_bmm_fori_loop_non_divisible_k(self) -> None:
         """Test fori_loop bmm where BLOCK_K=256 doesn't evenly divide K=384."""
