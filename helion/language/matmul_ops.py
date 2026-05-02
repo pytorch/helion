@@ -294,9 +294,13 @@ def enforce_dot_requirements(lhs: torch.Tensor, rhs: torch.Tensor) -> None:
             spec = env.config_spec
             spec.cute_tcgen05_search_enabled = True
             # The current tcgen05 lowering does not interoperate with the
-            # persistent virtual-pid loop on B200; combining them produces
-            # CUDA_ERROR_LAUNCH_FAILED at runtime. Drop those pid types from
-            # the autotune search until the lowering is fixed.
+            # persistent virtual-pid loop on B200: any total_tiles > 1
+            # silently produces wrong output (only the single-tile case
+            # is verified correct). Drop those pid types from the
+            # autotune search until the role-local persistent rewrite
+            # lands. A host-side guard converts the silent miscompare
+            # into a loud RuntimeError for explicit user configs that
+            # bypass autotune.
             spec.disallow_pid_type("persistent_blocked")
             spec.disallow_pid_type("persistent_interleaved")
             # cluster_m=2 (2-CTA tcgen05 instructions) currently CUDA-launch-
