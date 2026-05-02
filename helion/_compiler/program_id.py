@@ -1010,6 +1010,66 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             device_function, wrapped_body
         )
 
+        layout = self._build_tcgen05_persistent_layout(device_function)
+
+        setup: list[ast.stmt] = []
+        setup.extend(self._build_tcgen05_persistent_prelude(layout))
+        setup.extend(hoisted_setup)
+        setup.append(
+            create(
+                ast.While,
+                test=expr_from_string(layout.work_tile_valid_var),
+                body=self._build_tcgen05_persistent_tile_body(layout, wrapped_body),
+                orelse=[],
+            )
+        )
+        setup.extend(post_loop_stmts)
+        return setup
+
+    @dataclasses.dataclass
+    class _Tcgen05PersistentLayout:
+        """Variables and predicates threaded through the persistent kernel.
+
+        The layout is materialised once per kernel and shared between the
+        prelude (pre-loop init) and the per-tile body. Cluster-only
+        fields are unused when ``cluster_m == 1``.
+        """
+
+        cluster_m: int
+        scheduler_owner_warp: str
+        cluster_scheduler_leader: str
+        consumer_leader_var: str
+        scheduler_leader_predicate: str
+        tile_sched_params_var: str
+        tile_sched_var: str
+        work_tile_var: str
+        work_tile_smem_ptr: str
+        work_tile_smem: str
+        work_tile_smem_tensor: str
+        work_tile_coord_vars: list[str]
+        work_tile_valid_var: str
+        linear_pid_expr: str
+        sched_pipeline_mbars: str
+        sched_pipeline: str
+        sched_pipeline_producer_group: str
+        sched_pipeline_consumer_group: str
+        sched_producer_state: str
+        sched_consumer_state: str
+        sched_barrier_ptr: str
+        sched_peer_rank: str
+        sched_peer_m: str
+        refresh_work_tile_stmts: list[ast.stmt]
+        work_tile_publish_stmts: list[ast.stmt]
+        work_tile_consume_stmts: list[ast.stmt]
+        work_tile_release_stmts: list[ast.stmt]
+
+    def _build_tcgen05_persistent_layout(
+        self, device_function: DeviceFunction
+    ) -> _Tcgen05PersistentLayout:
+        """Allocate persistent-kernel variables and build the work-tile
+        publish/consume/release/refresh statement helpers shared between
+        the prelude and the per-tile body.
+        """
         cluster_m = self._tcgen05_cluster_m()
         tile_sched_params_var = device_function.new_var("tcgen05_tile_sched_params")
         tile_sched_var = device_function.new_var("tcgen05_tile_sched")
@@ -1023,7 +1083,10 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         work_tile_valid_var = device_function.new_var("tcgen05_work_tile_valid")
         scheduler_owner_warp = self._tcgen05_scheduler_owner_warp_expr()
         cluster_scheduler_leader = self._tcgen05_cluster_scheduler_leader_expr()
-        consumer_leader = device_function.new_var("tcgen05_sched_consumer_leader")
+        consumer_leader_var = device_function.new_var("tcgen05_sched_consumer_leader")
+        scheduler_leader_predicate = (
+            cluster_scheduler_leader if cluster_m > 1 else scheduler_owner_warp
+        )
         linear_pid_expr = self._tcgen05_linear_virtual_pid_from_coords_expr(
             work_tile_coord_vars
         )
@@ -1041,7 +1104,7 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         sched_peer_rank = device_function.new_var("tcgen05_sched_peer_rank")
         sched_peer_m = device_function.new_var("tcgen05_sched_peer_m")
 
-        refresh_work_tile = [
+        refresh_work_tile: list[ast.stmt] = [
             statement_from_string(f"{coord_var} = {work_tile_smem}[cutlass.Int32({i})]")
             for i, coord_var in enumerate(work_tile_coord_vars)
         ]
@@ -1051,8 +1114,9 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                 f"{work_tile_smem}[cutlass.Int32(3)] != cutlass.Int32(0)"
             )
         )
+
         if cluster_m > 1:
-            work_tile_publish = [
+            work_tile_publish: list[ast.stmt] = [
                 statement_from_string(
                     f"{sched_pipeline}.producer_acquire({sched_producer_state})"
                 ),
@@ -1087,14 +1151,14 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                 ),
                 statement_from_string(emit_pipeline_advance(sched_producer_state)),
             ]
-            work_tile_consume = [
+            work_tile_consume: list[ast.stmt] = [
                 statement_from_string(
                     f"{sched_pipeline}.consumer_wait({sched_consumer_state})"
                 ),
                 statement_from_string("cute.arch.fence_view_async_shared()"),
                 statement_from_string("cute.arch.sync_warp()"),
             ]
-            work_tile_release = [
+            work_tile_release: list[ast.stmt] = [
                 statement_from_string(
                     f"{sched_pipeline}.consumer_release({sched_consumer_state})"
                 ),
@@ -1107,130 +1171,177 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             work_tile_consume = []
             work_tile_release = []
 
-        loop_body = [
-            statement_from_string(f"{self.virtual_pid_var} = {linear_pid_expr}"),
-            *wrapped_body,
-            self._tcgen05_scheduler_if(
-                cluster_scheduler_leader if cluster_m > 1 else scheduler_owner_warp,
-                [
-                    statement_from_string(f"{tile_sched_var}.advance_to_next_work()"),
-                    statement_from_string(
-                        f"{work_tile_var} = {tile_sched_var}.get_current_work()"
-                    ),
-                    *work_tile_publish,
-                ],
-            ),
-            *(
-                [
-                    self._tcgen05_scheduler_if(consumer_leader, work_tile_consume),
-                ]
-                if cluster_m > 1
-                else []
-            ),
-            statement_from_string("cute.arch.sync_threads()"),
-            *refresh_work_tile,
-            *(
-                [
-                    self._tcgen05_scheduler_if(consumer_leader, work_tile_release),
-                ]
-                if cluster_m > 1
-                else []
-            ),
-        ]
-        setup = [
+        return self._Tcgen05PersistentLayout(
+            cluster_m=cluster_m,
+            scheduler_owner_warp=scheduler_owner_warp,
+            cluster_scheduler_leader=cluster_scheduler_leader,
+            consumer_leader_var=consumer_leader_var,
+            scheduler_leader_predicate=scheduler_leader_predicate,
+            tile_sched_params_var=tile_sched_params_var,
+            tile_sched_var=tile_sched_var,
+            work_tile_var=work_tile_var,
+            work_tile_smem_ptr=work_tile_smem_ptr,
+            work_tile_smem=work_tile_smem,
+            work_tile_smem_tensor=work_tile_smem_tensor,
+            work_tile_coord_vars=work_tile_coord_vars,
+            work_tile_valid_var=work_tile_valid_var,
+            linear_pid_expr=linear_pid_expr,
+            sched_pipeline_mbars=sched_pipeline_mbars,
+            sched_pipeline=sched_pipeline,
+            sched_pipeline_producer_group=sched_pipeline_producer_group,
+            sched_pipeline_consumer_group=sched_pipeline_consumer_group,
+            sched_producer_state=sched_producer_state,
+            sched_consumer_state=sched_consumer_state,
+            sched_barrier_ptr=sched_barrier_ptr,
+            sched_peer_rank=sched_peer_rank,
+            sched_peer_m=sched_peer_m,
+            refresh_work_tile_stmts=refresh_work_tile,
+            work_tile_publish_stmts=work_tile_publish,
+            work_tile_consume_stmts=work_tile_consume,
+            work_tile_release_stmts=work_tile_release,
+        )
+
+    def _build_tcgen05_persistent_prelude(
+        self, layout: _Tcgen05PersistentLayout
+    ) -> list[ast.stmt]:
+        """Pre-loop init: allocate SMEM, set up the tile scheduler, fetch
+        the initial work tile, and publish/consume it so every warp sees
+        a coherent first tile.
+        """
+        prelude: list[ast.stmt] = [
             statement_from_string(
-                f"{tile_sched_params_var} = cutlass.utils.PersistentTileSchedulerParams("
+                f"{layout.tile_sched_params_var} = cutlass.utils.PersistentTileSchedulerParams("
                 f"{self._tcgen05_num_tiles_expr(is_device=True)}, "
-                f"({cluster_m}, 1, 1))"
+                f"({layout.cluster_m}, 1, 1))"
             ),
             statement_from_string(
-                f"{tile_sched_var} = cutlass.utils.StaticPersistentTileScheduler.create("
-                f"{tile_sched_params_var}, cute.arch.block_idx(), cute.arch.grid_dim())"
+                f"{layout.tile_sched_var} = cutlass.utils.StaticPersistentTileScheduler.create("
+                f"{layout.tile_sched_params_var}, cute.arch.block_idx(), cute.arch.grid_dim())"
             ),
             statement_from_string(
-                f"{work_tile_smem_ptr} = cute.arch.alloc_smem(cutlass.Int32, 4, alignment=16)"
+                f"{layout.work_tile_smem_ptr} = cute.arch.alloc_smem(cutlass.Int32, 4, alignment=16)"
             ),
             statement_from_string(
-                f"{work_tile_smem_tensor} = cute.make_tensor("
-                f"{work_tile_smem_ptr}, cute.make_layout((4,), stride=(1,)))"
+                f"{layout.work_tile_smem_tensor} = cute.make_tensor("
+                f"{layout.work_tile_smem_ptr}, cute.make_layout((4,), stride=(1,)))"
             ),
-            statement_from_string(f"{work_tile_smem} = {work_tile_smem_tensor}"),
+            statement_from_string(
+                f"{layout.work_tile_smem} = {layout.work_tile_smem_tensor}"
+            ),
         ]
-        if cluster_m > 1:
-            setup.extend(
+        if layout.cluster_m > 1:
+            prelude.extend(
                 [
                     statement_from_string(
-                        f"{sched_pipeline_mbars} = cute.arch.alloc_smem(cutlass.Int64, cutlass.Int32(2))"
+                        f"{layout.sched_pipeline_mbars} = cute.arch.alloc_smem(cutlass.Int64, cutlass.Int32(2))"
                     ),
                     statement_from_string(
-                        f"{sched_pipeline_producer_group} = cutlass.pipeline.CooperativeGroup("
+                        f"{layout.sched_pipeline_producer_group} = cutlass.pipeline.CooperativeGroup("
                         "cutlass.pipeline.Agent.Thread, cute.arch.WARP_SIZE)"
                     ),
                     statement_from_string(
-                        f"{sched_pipeline_consumer_group} = cutlass.pipeline.CooperativeGroup("
-                        f"cutlass.pipeline.Agent.Thread, {cluster_m})"
+                        f"{layout.sched_pipeline_consumer_group} = cutlass.pipeline.CooperativeGroup("
+                        f"cutlass.pipeline.Agent.Thread, {layout.cluster_m})"
                     ),
                     statement_from_string(
-                        f"{sched_pipeline} = cutlass.pipeline.PipelineAsync.create("
+                        f"{layout.sched_pipeline} = cutlass.pipeline.PipelineAsync.create("
                         "num_stages=1, "
-                        f"producer_group={sched_pipeline_producer_group}, "
-                        f"consumer_group={sched_pipeline_consumer_group}, "
-                        f"barrier_storage={sched_pipeline_mbars}, "
+                        f"producer_group={layout.sched_pipeline_producer_group}, "
+                        f"consumer_group={layout.sched_pipeline_consumer_group}, "
+                        f"barrier_storage={layout.sched_pipeline_mbars}, "
                         "consumer_mask=cutlass.Int32(0), "
                         "defer_sync=True)"
                     ),
                     statement_from_string(
-                        f"{sched_producer_state} = cutlass.pipeline.make_pipeline_state("
+                        f"{layout.sched_producer_state} = cutlass.pipeline.make_pipeline_state("
                         "cutlass.pipeline.PipelineUserType.Producer, 1)"
                     ),
                     statement_from_string(
-                        f"{sched_consumer_state} = cutlass.pipeline.make_pipeline_state("
+                        f"{layout.sched_consumer_state} = cutlass.pipeline.make_pipeline_state("
                         "cutlass.pipeline.PipelineUserType.Consumer, 1)"
                     ),
                     statement_from_string(
-                        f"{consumer_leader} = cute.arch.make_warp_uniform(cute.arch.warp_idx()) == cutlass.Int32(0) "
+                        f"{layout.consumer_leader_var} = "
+                        "cute.arch.make_warp_uniform(cute.arch.warp_idx()) == cutlass.Int32(0) "
                         "and cute.arch.lane_idx() == cutlass.Int32(0)"
                     ),
                 ]
             )
         else:
-            setup.append(statement_from_string(f"{consumer_leader} = False"))
-        setup.extend(
-            [
+            prelude.append(
+                statement_from_string(f"{layout.consumer_leader_var} = False")
+            )
+        prelude.append(
+            self._tcgen05_scheduler_if(
+                layout.scheduler_leader_predicate,
+                [
+                    statement_from_string(
+                        f"{layout.work_tile_var} = {layout.tile_sched_var}.initial_work_tile_info()"
+                    ),
+                    *layout.work_tile_publish_stmts,
+                ],
+            )
+        )
+        if layout.cluster_m > 1:
+            prelude.append(
                 self._tcgen05_scheduler_if(
-                    cluster_scheduler_leader if cluster_m > 1 else scheduler_owner_warp,
-                    [
-                        statement_from_string(
-                            f"{work_tile_var} = {tile_sched_var}.initial_work_tile_info()"
-                        ),
-                        *work_tile_publish,
-                    ],
-                ),
-            ]
-        )
-        if cluster_m > 1:
-            setup.append(self._tcgen05_scheduler_if(consumer_leader, work_tile_consume))
-        setup.extend(
-            [
-                statement_from_string("cute.arch.sync_threads()"),
-                *refresh_work_tile,
-            ]
-        )
-        if cluster_m > 1:
-            setup.append(self._tcgen05_scheduler_if(consumer_leader, work_tile_release))
-        setup.extend(
-            [
-                *hoisted_setup,
-                create(
-                    ast.While,
-                    test=expr_from_string(work_tile_valid_var),
-                    body=loop_body,
-                    orelse=[],
-                ),
-                *post_loop_stmts,
-            ]
-        )
-        return setup
+                    layout.consumer_leader_var,
+                    list(layout.work_tile_consume_stmts),
+                )
+            )
+        prelude.append(statement_from_string("cute.arch.sync_threads()"))
+        prelude.extend(layout.refresh_work_tile_stmts)
+        if layout.cluster_m > 1:
+            prelude.append(
+                self._tcgen05_scheduler_if(
+                    layout.consumer_leader_var,
+                    list(layout.work_tile_release_stmts),
+                )
+            )
+        return prelude
+
+    def _build_tcgen05_persistent_tile_body(
+        self,
+        layout: _Tcgen05PersistentLayout,
+        wrapped_body: list[ast.stmt],
+    ) -> list[ast.stmt]:
+        """Per-tile body inside the ``while``: run the user's kernel
+        body, then advance the scheduler and refresh the published work
+        tile so the next iteration sees the updated state.
+        """
+        body: list[ast.stmt] = [
+            statement_from_string(f"{self.virtual_pid_var} = {layout.linear_pid_expr}"),
+            *wrapped_body,
+            self._tcgen05_scheduler_if(
+                layout.scheduler_leader_predicate,
+                [
+                    statement_from_string(
+                        f"{layout.tile_sched_var}.advance_to_next_work()"
+                    ),
+                    statement_from_string(
+                        f"{layout.work_tile_var} = {layout.tile_sched_var}.get_current_work()"
+                    ),
+                    *layout.work_tile_publish_stmts,
+                ],
+            ),
+        ]
+        if layout.cluster_m > 1:
+            body.append(
+                self._tcgen05_scheduler_if(
+                    layout.consumer_leader_var,
+                    list(layout.work_tile_consume_stmts),
+                )
+            )
+        body.append(statement_from_string("cute.arch.sync_threads()"))
+        body.extend(layout.refresh_work_tile_stmts)
+        if layout.cluster_m > 1:
+            body.append(
+                self._tcgen05_scheduler_if(
+                    layout.consumer_leader_var,
+                    list(layout.work_tile_release_stmts),
+                )
+            )
+        return body
 
     def setup_persistent_kernel(
         self, device_function: DeviceFunction, total_pids_expr: str | None = None
