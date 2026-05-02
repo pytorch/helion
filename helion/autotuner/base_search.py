@@ -204,6 +204,7 @@ class BaseSearch(BaseAutotuner):
         self.best_perf_so_far = inf
         self._benchmark_provider_cls = benchmark_provider_cls
         self._prepared = False
+        self._skip_cache = False
 
     def _prepare(self) -> None:
         """Some initialization deferred until autotuning actually runs.
@@ -441,6 +442,60 @@ class BaseSearch(BaseAutotuner):
                 print(triton_code, file=sys.stderr)
         return best
 
+    def _get_current_hardware_and_specialization(
+        self,
+    ) -> tuple[str | None, str | None]:
+        """Return (hardware, specialization_key) for matching cached configs."""
+        hardware = get_device_name(extract_device(self.args))
+
+        inner_kernel = getattr(self.kernel, "kernel", None)
+        if inner_kernel is None or not hasattr(
+            inner_kernel, "_base_specialization_key"
+        ):
+            return hardware, None
+        spec_key = inner_kernel._base_specialization_key(self.args)
+        specialization_key = str(_normalize_spec_key(spec_key))
+
+        return hardware, specialization_key
+
+    def _find_similar_cached_configs(self, max_configs: int) -> list[SavedBestConfig]:
+        """Return cached configs matching hardware, specialization_key, and config_spec_hash; empty if cache is skipped."""
+        from .base_cache import should_skip_cache
+
+        if self._skip_cache or should_skip_cache():
+            return []
+
+        from .local_cache import get_helion_cache_dir
+        from .local_cache import iter_cache_entries
+
+        current_hardware, current_spec_key = (
+            self._get_current_hardware_and_specialization()
+        )
+        if current_hardware is None or current_spec_key is None:
+            return []
+
+        current_fingerprint_hash = self.config_spec.structural_fingerprint_hash()
+
+        matching: list[SavedBestConfig] = []
+        for entry in iter_cache_entries(
+            get_helion_cache_dir(),
+            max_scan=self.settings.autotune_best_available_max_cache_scan,
+        ):
+            if entry.hardware != current_hardware:
+                continue
+            if _normalize_spec_key_str(entry.specialization_key) != current_spec_key:
+                continue
+            # Skip entries without a matching structural fingerprint or flat_config.
+            if entry.config_spec_hash != current_fingerprint_hash:
+                continue
+            if entry.flat_config is None:
+                continue
+            matching.append(entry)
+            if len(matching) >= max_configs:
+                break
+
+        return matching
+
     def _autotune(self) -> Config:
         """
         Abstract method to perform the actual autotuning.
@@ -657,78 +712,6 @@ class PopulationBasedSearch(BaseSearch):
         except exc.InvalidConfig:
             return None
         return PopulationMember(_unset_fn, [], flat_values, config)
-
-    def _get_current_hardware_and_specialization(
-        self,
-    ) -> tuple[str | None, str | None]:
-        """
-        Get the current hardware and specialization_key for matching cached configs.
-
-        Returns:
-            A tuple of (hardware, specialization_key) strings.
-        """
-        hardware = get_device_name(extract_device(self.args))
-
-        inner_kernel = getattr(self.kernel, "kernel", None)
-        if inner_kernel is None or not hasattr(
-            inner_kernel, "_base_specialization_key"
-        ):
-            return hardware, None
-        spec_key = inner_kernel._base_specialization_key(self.args)
-        specialization_key = str(_normalize_spec_key(spec_key))
-
-        return hardware, specialization_key
-
-    def _find_similar_cached_configs(self, max_configs: int) -> list[SavedBestConfig]:
-        """
-        Find cached configs that match hardware, specialization_key, and
-        structural fingerprint (config_spec_hash).
-
-        Returns an empty list when cache is skipped (via HELION_SKIP_CACHE
-        or the skip_cache parameter), so that "skip cache" consistently
-        means no cache reads of any kind.
-
-        Args:
-            max_configs: Maximum number of configs to return.
-
-        Returns:
-            List of matching SavedBestConfig objects, sorted by file modification time (most recent first).
-        """
-        from .base_cache import should_skip_cache
-
-        if self._skip_cache or should_skip_cache():
-            return []
-
-        from .local_cache import get_helion_cache_dir
-        from .local_cache import iter_cache_entries
-
-        current_hardware, current_spec_key = (
-            self._get_current_hardware_and_specialization()
-        )
-        if current_hardware is None or current_spec_key is None:
-            return []
-
-        current_fingerprint_hash = self.config_spec.structural_fingerprint_hash()
-
-        matching: list[SavedBestConfig] = []
-        for entry in iter_cache_entries(
-            get_helion_cache_dir(),
-            max_scan=self.settings.autotune_best_available_max_cache_scan,
-        ):
-            if entry.hardware != current_hardware:
-                continue
-            if _normalize_spec_key_str(entry.specialization_key) != current_spec_key:
-                continue
-            # Skip entries without a matching structural fingerprint or flat_config.
-            if entry.config_spec_hash != current_fingerprint_hash:
-                continue
-            if entry.flat_config is None:
-                continue
-            matching.append(entry)
-            if len(matching) >= max_configs:
-                break
-
-        return matching
 
     def _generate_best_available_population_flat(self) -> list[FlatConfig]:
         """

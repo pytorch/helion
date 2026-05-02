@@ -649,7 +649,8 @@ class Settings(_Settings):
             "If None (default), uses the built-in benchmark function."
         ),
         "autotune_best_available_max_configs": (
-            "Maximum number of cached configs to use for FROM_BEST_AVAILABLE initial population strategy. "
+            "Maximum number of cached configs to use for FROM_BEST_AVAILABLE initial population "
+            "and for helion.from_cache() warm-start in FiniteSearch. "
             "Set HELION_BEST_AVAILABLE_MAX_CONFIGS=N to override. Default is 20."
         ),
         "autotune_best_available_max_cache_scan": (

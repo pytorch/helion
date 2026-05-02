@@ -2655,5 +2655,167 @@ class TestConfigFilter(TestCase):
         self.assertEqual(results[1].config.get("num_warps"), 2)
 
 
+class TestFiniteSearchWarmStart(TestCase):
+    """Tests for helion.from_cache() — a CachedFiniteSearch autotuner_fn."""
+
+    def _make_kernel_and_args(self):
+        @helion.kernel(autotune_log_level=0)
+        def add(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(a)
+            for tile in hl.tile(out.size()):
+                out[tile] = a[tile] + b[tile]
+            return out
+
+        args = (
+            torch.randn([128], device=DEVICE),
+            torch.randn([128], device=DEVICE),
+        )
+        return add, args
+
+    @staticmethod
+    def _fake_cache_random(count):
+        """Patch _find_similar_cached_configs to return `count` distinct backend-agnostic flats."""
+        from helion.autotuner.local_cache import SavedBestConfig
+
+        def fake_find(search_self, max_configs):
+            distinct: list[tuple] = []
+            for _ in range(20):
+                if len(distinct) >= count:
+                    break
+                batch = search_self.config_gen.random_population_flat(
+                    max(count * 3, 10)
+                )
+                for flat in batch:
+                    t = tuple(flat)
+                    if t not in distinct:
+                        distinct.append(t)
+                        if len(distinct) >= count:
+                            break
+            out = []
+            for flat in distinct[:max_configs]:
+                out.append(
+                    SavedBestConfig(
+                        hardware="x",
+                        specialization_key="x",
+                        config=search_self.config_gen.unflatten(list(flat)),
+                        config_spec_hash="x",
+                        flat_config=flat,
+                    )
+                )
+            return out
+
+        return fake_find
+
+    def test_from_cache_factory(self):
+        """helion.from_cache() returns a callable that creates a CachedFiniteSearch."""
+
+        add, args = self._make_kernel_and_args()
+        bound = add.bind(args)
+        fn = helion.from_cache()
+        self.assertTrue(callable(fn))
+        with (
+            patch.object(BaseSearch, "_find_similar_cached_configs", return_value=[]),
+            self.assertRaises(exc.NotEnoughConfigs),
+        ):
+            fn(bound, args)
+
+    def test_from_cache_empty_cache_raises(self):
+        """CachedFiniteSearch with empty cache and no explicit configs raises NotEnoughConfigs."""
+        from helion.autotuner.finite_search import CachedFiniteSearch
+
+        add, args = self._make_kernel_and_args()
+        bound = add.bind(args)
+        with (
+            patch.object(BaseSearch, "_find_similar_cached_configs", return_value=[]),
+            self.assertRaises(exc.NotEnoughConfigs),
+        ):
+            CachedFiniteSearch(bound, args)
+
+    def test_from_cache_prepends_cached(self):
+        """Cached configs appear before explicit configs in CachedFiniteSearch.configs."""
+        from helion.autotuner.finite_search import CachedFiniteSearch
+
+        cfg1 = helion.Config(block_sizes=[16])
+        add, args = self._make_kernel_and_args()
+        bound = add.bind(args)
+        fake_fn = self._fake_cache_random(2)
+        fake_sizes: list[int] = []
+
+        def spy(search_self, max_configs):
+            result = fake_fn(search_self, max_configs)
+            fake_sizes.append(len(result))
+            return result
+
+        with patch.object(BaseSearch, "_find_similar_cached_configs", spy):
+            search = CachedFiniteSearch(bound, args, configs=[cfg1])
+        self.assertEqual(len(search.configs), fake_sizes[0] + 1)
+        self.assertEqual(search.configs[-1], cfg1)
+
+    def test_from_cache_respects_max_parameter(self):
+        """from_cache(max_configs=N) caps the number of cached configs."""
+        from helion.autotuner.finite_search import CachedFiniteSearch
+
+        cfg1 = helion.Config(block_sizes=[16])
+        add, args = self._make_kernel_and_args()
+        bound = add.bind(args)
+        observed_caps: list[int] = []
+        fake_sizes: list[int] = []
+        fake_fn = self._fake_cache_random(5)
+
+        def spy(search_self, max_configs):
+            observed_caps.append(max_configs)
+            result = fake_fn(search_self, max_configs)
+            fake_sizes.append(len(result))
+            return result
+
+        with patch.object(BaseSearch, "_find_similar_cached_configs", spy):
+            search = CachedFiniteSearch(bound, args, configs=[cfg1], max_configs=2)
+        self.assertEqual(observed_caps, [2])
+        self.assertLessEqual(fake_sizes[0], 2)
+        self.assertEqual(len(search.configs), fake_sizes[0] + 1)
+
+    def test_from_cache_uses_default_cap_from_settings(self):
+        """Without max_configs, the cap falls back to autotune_best_available_max_configs."""
+        from helion.autotuner.finite_search import CachedFiniteSearch
+
+        cfg1 = helion.Config(block_sizes=[16])
+        add, args = self._make_kernel_and_args()
+        bound = add.bind(args)
+        observed_caps: list[int] = []
+        fake_sizes: list[int] = []
+        fake_fn = self._fake_cache_random(5)
+
+        def spy(search_self, max_configs):
+            observed_caps.append(max_configs)
+            result = fake_fn(search_self, max_configs)
+            fake_sizes.append(len(result))
+            return result
+
+        with patch.object(BaseSearch, "_find_similar_cached_configs", spy):
+            search = CachedFiniteSearch(bound, args, configs=[cfg1])
+        cap_in_effect = search.settings.autotune_best_available_max_configs
+        self.assertEqual(observed_caps, [cap_in_effect])
+        self.assertLessEqual(fake_sizes[0], cap_in_effect)
+        self.assertEqual(len(search.configs), fake_sizes[0] + 1)
+
+    def test_kernel_autotuner_fn_accepts_from_cache(self):
+        """@helion.kernel(autotuner_fn=helion.from_cache()) stores the callable in settings."""
+        fn = helion.from_cache()
+
+        @helion.kernel(autotuner_fn=fn, autotune_log_level=0)
+        def add(a, b):
+            out = torch.empty_like(a)
+            for tile in hl.tile(out.size()):
+                out[tile] = a[tile] + b[tile]
+            return out
+
+        args = (
+            torch.randn([128], device=DEVICE),
+            torch.randn([128], device=DEVICE),
+        )
+        bound = add.bind(args)
+        self.assertIs(bound.settings.autotuner_fn, fn)
+
+
 if __name__ == "__main__":
     unittest.main()

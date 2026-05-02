@@ -115,7 +115,7 @@ class Kernel(Generic[_R]):
         self,
         fn: Callable[..., _R],
         *,
-        configs: list[ConfigLike] | None = None,
+        configs: Sequence[ConfigLike] | None = None,
         settings: Settings | None,
         key: Callable[..., Hashable] | None = None,
     ) -> None:
@@ -505,12 +505,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
 
     @property
     def configs(self) -> list[Config]:
-        """
-        Alias for `self.kernel.configs`.
-
-        Returns:
-            list[Config]: The list of configurations.
-        """
+        """Return the kernel's configured configs (alias for `self.kernel.configs`)."""
         return self.kernel.configs
 
     def format_kernel_decorator(self, config: Config, settings: Settings) -> str:
@@ -1119,7 +1114,7 @@ def kernel(
     fn: Callable[..., _R],
     *,
     config: ConfigLike | None = None,
-    configs: list[ConfigLike] | None = None,
+    configs: Sequence[ConfigLike] | None = None,
     key: Callable[..., Hashable] | None = None,
     **settings: object,
 ) -> Kernel[_R]: ...
@@ -1130,7 +1125,7 @@ def kernel(
     fn: None = None,
     *,
     config: ConfigLike | None = None,
-    configs: list[ConfigLike] | None = None,
+    configs: Sequence[ConfigLike] | None = None,
     key: Callable[..., Hashable] | None = None,
     **settings: object,
 ) -> _KernelDecorator: ...
@@ -1140,7 +1135,7 @@ def kernel(
     fn: Callable[..., _R] | None = None,
     *,
     config: ConfigLike | None = None,
-    configs: list[ConfigLike] | None = None,
+    configs: Sequence[ConfigLike] | None = None,
     key: Callable[..., Hashable] | None = None,
     **settings: object,
 ) -> Kernel[_R] | _KernelDecorator:
