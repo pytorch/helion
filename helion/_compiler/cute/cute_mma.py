@@ -69,23 +69,29 @@ _TRACE_THROUGH_TARGETS = {
 _TCGEN05_PRODUCER_REGS = 120
 _TCGEN05_CONSUMER_REGS = 256
 
+# Named-barrier ids reserved by Helion's tcgen05 codegen. Kept as module
+# constants so the codegen sites read symbolically instead of hardcoding
+# magic numbers, and so the next free id is obvious if a third role-local
+# barrier is added.
+_TCGEN05_TMEM_ALLOC_BARRIER_ID = 1
+_TCGEN05_EPILOG_SYNC_BARRIER_ID = 2
+
 
 @dataclass(frozen=True)
 class _Tcgen05LayoutPlan:
-    acc_stage_count: str
-    ab_stage_count: str
-    c_stage_count: str
-    exec_thread_count: str
-    epi_warp_count: str
-    epilog_sync_barrier_id: str
-    acc_pipeline_arrive_count: str
-    ab_pipeline_arrive_count: str
+    """Generated CuTe variable names for the tcgen05 layout setup.
+
+    Pure name container: every field is the textual identifier of a value
+    materialized in the kernel prefix. Compile-time integer constants
+    (stage counts, arrive counts, barrier ids) are not stored here; they
+    live as Python ints alongside ``CuteTcgen05MatmulPlan`` and get
+    inlined at the codegen call site.
+    """
+
     exec_active: str
     smem_a_layout: str
     smem_b_layout: str
-    smem_desc_view_layout: str
     c_layout: str
-    smem_c_layout: str
     epi_tile: str
     tmem_load_atom: str
     acc_tmem_cols: str
@@ -93,7 +99,6 @@ class _Tcgen05LayoutPlan:
     tmem_dealloc_mbar_ptr: str
     tmem_alloc_barrier: str
     tmem_allocator: str
-    acc_tmem_ptr: str
     acc_pipeline_barriers: str
     acc_pipeline_producer_group: str
     acc_pipeline_consumer_group: str
@@ -382,23 +387,37 @@ def _is_zero_init_acc_node(node: Node) -> bool:
     return False
 
 
+def _physical_mma_coord_expr(
+    cg: GenerateAST,
+    block_id: int,
+) -> str:
+    """Return the physical thread coordinate for an MMA output axis."""
+    grid_state = cg.current_grid_state
+    if grid_state is None:
+        return "cutlass.Int32(0)"
+    thread_axis = grid_state.block_thread_axes.get(block_id)
+    if thread_axis is None:
+        return "cutlass.Int32(0)"
+    return f"cutlass.Int32(cute.arch.thread_idx()[{thread_axis}])"
+
+
 def _local_mma_coord_expr(
     cg: GenerateAST,
     block_id: int,
 ) -> str:
-    """Return the current block-local coordinate for an MMA output axis."""
-    block_thread_axes: dict[int, int] = {}
-    if cg.current_grid_state is not None:
-        block_thread_axes = cg.current_grid_state.block_thread_axes
-    thread_axis = block_thread_axes.get(block_id)
-    if thread_axis is None:
-        return "cutlass.Int32(0)"
+    """Return the current block-local coordinate for an MMA output axis.
 
-    coord = f"cutlass.Int32(cute.arch.thread_idx()[{thread_axis}])"
-    if cg.current_grid_state is None:
+    Same as ``_physical_mma_coord_expr`` plus a lane offset when the grid
+    strategy has registered a per-block lane var (the lane-loop fast path
+    serializes `elements_per_thread` consecutive elements per physical
+    thread).
+    """
+    coord = _physical_mma_coord_expr(cg, block_id)
+    grid_state = cg.current_grid_state
+    if grid_state is None or grid_state.block_thread_axes.get(block_id) is None:
         return coord
 
-    strategy = cg.current_grid_state.strategy
+    strategy = grid_state.strategy
     lane_vars = getattr(strategy, "_lane_var_by_block", None)
     if not isinstance(lane_vars, dict) or block_id not in lane_vars:
         return coord
@@ -411,20 +430,6 @@ def _local_mma_coord_expr(
     if elements_per_thread == 1:
         return f"{coord} + cutlass.Int32({lane_var})"
     return f"{coord} * cutlass.Int32({elements_per_thread}) + cutlass.Int32({lane_var})"
-
-
-def _physical_mma_coord_expr(
-    cg: GenerateAST,
-    block_id: int,
-) -> str:
-    """Return the physical thread coordinate for an MMA output axis."""
-    block_thread_axes: dict[int, int] = {}
-    if cg.current_grid_state is not None:
-        block_thread_axes = cg.current_grid_state.block_thread_axes
-    thread_axis = block_thread_axes.get(block_id)
-    if thread_axis is None:
-        return "cutlass.Int32(0)"
-    return f"cutlass.Int32(cute.arch.thread_idx()[{thread_axis}])"
 
 
 def _grid_thread_extent(cg: GenerateAST, block_id: int) -> int:
@@ -928,15 +933,11 @@ def _emit_mma_pipeline(
     tcgen05_c_stage_count_value = _tcgen05_config_int(
         df.config, "tcgen05_c_stages", _tcgen05_c_stage_count(bn)
     )
-    (
-        tcgen05_epi_warp_count_value,
-        tcgen05_ab_load_warp_count_value,
-    ) = _tcgen05_role_layout(df.config, cta_thread_count=tcgen05_cta_thread_count)
-    tcgen05_acc_pipeline_arrive_count_value = _tcgen05_pipeline_arrive_count(
-        tcgen05_cta_thread_count, tcgen05_epi_warp_count_value
+    tcgen05_epi_warp_count_value = _tcgen05_epi_warp_count(
+        df.config, cta_thread_count=tcgen05_cta_thread_count
     )
     tcgen05_tmem_barrier_thread_count_value = _tcgen05_tmem_barrier_thread_count(
-        tcgen05_cta_thread_count, tcgen05_epi_warp_count_value
+        tcgen05_epi_warp_count_value
     )
     tcgen05_matmul_plan: CuteTcgen05MatmulPlan | None = None
     if mma_impl == "tcgen05":
@@ -952,7 +953,6 @@ def _emit_mma_pipeline(
             ab_stage_count=tcgen05_ab_stage_count_value,
             c_stage_count=tcgen05_c_stage_count_value,
             epi_warp_count=tcgen05_epi_warp_count_value,
-            ab_load_warp_count=tcgen05_ab_load_warp_count_value,
         )
         candidate_block_shape = tcgen05_matmul_plan.block_shape
         df.register_cute_tcgen05_matmul_plan(tcgen05_matmul_plan)
@@ -990,7 +990,6 @@ def _emit_mma_pipeline(
         warp_idx = df.new_var("tcgen05_warp_idx")
         lane_idx = df.new_var("tcgen05_lane_idx")
         epi_active = df.new_var("tcgen05_epi_active")
-        tcgen05_ab_load_active = df.new_var("tcgen05_ab_load_active")
         epi_tidx = df.new_var("tcgen05_epi_tidx")
         prefix.append(
             statement_from_string(
@@ -1023,16 +1022,14 @@ def _emit_mma_pipeline(
         if mma_impl == "tcgen05":
             assert tcgen05_plan is not None
             assert tcgen05_matmul_plan is not None
+            # The current lowering has a single A/B load warp at
+            # `tma_warp_id`, so `tma_warp` doubles as the A/B-load-active
+            # predicate. When role-local persistent loops land and split
+            # those roles, this is the place to add a separate
+            # `tcgen05_ab_load_active` predicate.
             prefix.append(
                 statement_from_string(
                     f"{tma_warp} = {warp_idx} == cutlass.Int32({tcgen05_matmul_plan.tma_warp_id})"
-                )
-            )
-            prefix.append(
-                statement_from_string(
-                    f"{tcgen05_ab_load_active} = "
-                    f"{warp_idx} >= cutlass.Int32({tcgen05_matmul_plan.ab_load_warp_begin}) "
-                    f"and {warp_idx} < cutlass.Int32({tcgen05_matmul_plan.ab_load_warp_end})"
                 )
             )
             prefix.append(
@@ -1141,14 +1138,7 @@ def _emit_mma_pipeline(
                 bn=bn,
                 bk=bk,
                 ab_stage_count=tcgen05_ab_stage_count_value,
-                acc_stage_count=tcgen05_acc_stage_count_value,
-                c_stage_count=tcgen05_c_stage_count_value,
-                cta_thread_count=tcgen05_cta_thread_count,
-                epi_warp_count=tcgen05_epi_warp_count_value,
                 is_two_cta=tcgen05_is_two_cta,
-                active_physical_n_threads=min(
-                    _grid_thread_extent(cg, n_block_id), mma_phys_n
-                ),
                 input_dtype_str=input_dtype_str,
                 acc_dtype_str=acc_dtype_str,
             )
@@ -1179,7 +1169,7 @@ def _emit_mma_pipeline(
         prefix.append(
             statement_from_string(
                 f"{tcgen05_plan.tmem_alloc_barrier} = cutlass.pipeline.NamedBarrier("
-                f"barrier_id={_tcgen05_tmem_alloc_barrier_id()}, "
+                f"barrier_id={_TCGEN05_TMEM_ALLOC_BARRIER_ID}, "
                 f"num_threads={tcgen05_tmem_barrier_thread_count_value})"
             )
         )
@@ -1262,7 +1252,7 @@ def _emit_mma_pipeline(
             statement_from_string(
                 f"{tcgen05_plan.acc_pipeline_consumer_group} = "
                 f"cutlass.pipeline.CooperativeGroup("
-                f"cutlass.pipeline.Agent.Thread, cutlass.Int32({tcgen05_acc_pipeline_arrive_count_value}))"
+                f"cutlass.pipeline.Agent.Thread, cutlass.Int32({tcgen05_epi_warp_count_value}))"
             )
         )
         prefix.append(
@@ -1337,12 +1327,9 @@ def _emit_mma_pipeline(
     smem_b = df.new_var("sB")
     smem_a_mma = df.new_var("sA_mma")
     smem_b_mma = df.new_var("sB_mma")
-    smem_a_mma_next = df.new_var("sA_mma_next")
-    smem_b_mma_next = df.new_var("sB_mma_next")
     tma_smem_a_layout = df.new_var("sA_tma_layout")
     tma_smem_b_layout = df.new_var("sB_tma_layout")
     tma_thr_mma = df.new_var("tma_thr_mma")
-    rhs_tma = df.new_var("rhs_tma")
     gmem_a_tma = df.new_var("gA_tma")
     gmem_b_tma = df.new_var("gB_tma")
     gmem_a_tma_part = df.new_var("gA_tma_part")
@@ -1377,7 +1364,6 @@ def _emit_mma_pipeline(
     tcgen05_frag_a = df.new_var("tcgen05_tCrA")
     tcgen05_frag_b = df.new_var("tcgen05_tCrB")
     mma_stage = df.new_var("mma_stage")
-    mma_next_stage = df.new_var("mma_next_stage")
     if mma_impl == "tcgen05":
         assert tcgen05_plan is not None
         if tcgen05_use_tma:
@@ -1447,7 +1433,6 @@ def _emit_mma_pipeline(
                     f"{tma_smem_b_layout} = cute.slice_({tcgen05_plan.smem_b_layout}, (None, None, None, 0))"
                 )
             )
-            prefix.append(statement_from_string(f"{rhs_tma} = {tma_tensor_b}"))
             prefix.append(
                 statement_from_string(
                     f"{tma_thr_mma} = {tiled_mma}.get_slice(cutlass.Int32(0))"
@@ -1536,7 +1521,7 @@ def _emit_mma_pipeline(
             prefix.append(
                 statement_from_string(
                     f"{tma_pipeline_consumer_group} = cutlass.pipeline.CooperativeGroup("
-                    f"cutlass.pipeline.Agent.Thread, {tcgen05_plan.ab_pipeline_arrive_count})"
+                    "cutlass.pipeline.Agent.Thread, 1)"
                 )
             )
             prefix.append(
@@ -1735,18 +1720,34 @@ def _emit_mma_pipeline(
         load_guard = mma_active
         if mma_impl == "tcgen05":
             assert tcgen05_plan is not None
-            cg.add_statement(
-                statement_from_string(
-                    f"{mma_stage} = "
-                    f"({k_offset_var} // cutlass.Int32({bk})) % {tcgen05_plan.ab_stage_count}"
+            # The smem cache for A/B is laid out as (..., ab_stage_count); we
+            # index into the current stage every K-loop iteration.
+            #
+            # When the kernel uses the TMA pipeline, ``tma_consumer_state.index``
+            # is the canonical stage index: it advances exactly once per K-loop
+            # iteration via ``consumer_release`` + ``advance``, and (critically
+            # for the persistent path) it carries its value across virtual
+            # tiles. Computing ``mma_stage`` from ``k_offset // bk`` resets to
+            # zero at each tile while the pipeline state stays where it was at
+            # the end of the prior tile -- the two diverge across persistent
+            # tile boundaries. Use the pipeline state directly so the K-loop
+            # always reads the stage the consumer just unblocked.
+            #
+            # For the non-TMA tcgen05 path there is no pipeline state to track
+            # and ``ab_stage_count`` is always 1, so the modular form is a
+            # constant zero anyway.
+            if tcgen05_use_tma:
+                cg.add_statement(
+                    statement_from_string(f"{mma_stage} = {tma_consumer_state}.index")
                 )
-            )
-            cg.add_statement(
-                statement_from_string(
-                    f"{mma_next_stage} = "
-                    f"({mma_stage} + cutlass.Int32(1)) % {tcgen05_plan.ab_stage_count}"
+            else:
+                cg.add_statement(
+                    statement_from_string(
+                        f"{mma_stage} = "
+                        f"({k_offset_var} // cutlass.Int32({bk})) "
+                        f"% cutlass.Int32({tcgen05_ab_stage_count_value})"
+                    )
                 )
-            )
             cg.add_statement(
                 statement_from_string(
                     f"{smem_a_mma} = {smem_a}[(None, 0, 0, {mma_stage})]"
@@ -1755,16 +1756,6 @@ def _emit_mma_pipeline(
             cg.add_statement(
                 statement_from_string(
                     f"{smem_b_mma} = {smem_b}[(None, 0, 0, {mma_stage})]"
-                )
-            )
-            cg.add_statement(
-                statement_from_string(
-                    f"{smem_a_mma_next} = {smem_a}[(None, 0, 0, {mma_next_stage})]"
-                )
-            )
-            cg.add_statement(
-                statement_from_string(
-                    f"{smem_b_mma_next} = {smem_b}[(None, 0, 0, {mma_next_stage})]"
                 )
             )
             if tcgen05_use_tma:
@@ -2112,24 +2103,40 @@ def _emit_mma_pipeline(
             assert tcgen05_plan is not None
             assert epi_active is not None
             assert epi_tidx is not None
-            suffix.append(
-                statement_from_string(
-                    f"if {tcgen05_plan.exec_active}:\n"
-                    f"    {tcgen05_plan.acc_pipeline}.producer_commit({tcgen05_plan.acc_producer_state})"
-                )
+            # The K-loop suffix's `acc_pipeline.producer_commit` +
+            # `acc_producer_state.advance()` must run ONCE PER OUTPUT TILE.
+            # In the persistent path, the splitter walks top-level
+            # statements and only marks them per-tile if they read or
+            # write a name that's already per-tile. These suffix
+            # statements only mutate ``acc_producer_state`` via a method
+            # call (no AST-visible write) and reference no per-tile
+            # name directly, so without explicit tagging they get hoisted
+            # out of the work-tile loop -- which means the SECOND tile
+            # never commits its accumulator and the consumer-side
+            # ``consumer_wait`` deadlocks (or the data is silently wrong
+            # if no deadlock fires). Tag them per-tile via
+            # ``_emit_per_tile_suffix`` so they stay inside the work-tile
+            # loop.
+            suffix_stmt = statement_from_string(
+                f"if {tcgen05_plan.exec_active}:\n"
+                f"    {tcgen05_plan.acc_pipeline}.producer_commit({tcgen05_plan.acc_producer_state})"
             )
-            suffix.append(
-                statement_from_string(
-                    emit_pipeline_advance(tcgen05_plan.acc_producer_state)
-                )
+            suffix.append(suffix_stmt)
+            per_tile_stmts.append(suffix_stmt)
+            advance_stmt = statement_from_string(
+                emit_pipeline_advance(tcgen05_plan.acc_producer_state)
             )
+            suffix.append(advance_stmt)
+            per_tile_stmts.append(advance_stmt)
             # The full TMEM->reg->GMEM epilogue + allocator teardown for
             # tcgen05 is emitted by `_codegen_cute_store_tcgen05_tile` when
             # the kernel actually stores `out[tile_m, tile_n] = result`. That
             # path covers all bn widths now (the previously separate
             # staged-via-smem_c flow has been removed; the dead code lived
             # here).
-            suffix.append(statement_from_string("cute.arch.sync_threads()"))
+            sync_stmt = statement_from_string("cute.arch.sync_threads()")
+            suffix.append(sync_stmt)
+            per_tile_stmts.append(sync_stmt)
 
     if mma_impl == "tcgen05":
         assert tcgen05_plan is not None
@@ -2142,9 +2149,7 @@ def _emit_mma_pipeline(
                 bm=bm,
                 bn=bn,
                 bk=bk,
-                smem_name="",
                 thr_mma=thr_mma,
-                store_thr_mma=thr_mma,
                 epi_warp_count=tcgen05_epi_warp_count_value,
                 epi_acc_frag_base=tcgen05_epi_acc_frag_base,
                 epi_tidx=epi_tidx,
@@ -2152,7 +2157,7 @@ def _emit_mma_pipeline(
                 exec_active=tcgen05_plan.exec_active,
                 epi_tile=tcgen05_plan.epi_tile,
                 c_stage_count=tcgen05_c_stage_count_value,
-                epilog_sync_barrier_id=_tcgen05_epilog_sync_barrier_id(),
+                epilog_sync_barrier_id=_TCGEN05_EPILOG_SYNC_BARRIER_ID,
                 tmem_load_atom=tcgen05_plan.tmem_load_atom,
                 epilogue_rest_mode=tcgen05_plan.epilogue_rest_mode,
                 acc_pipeline=tcgen05_plan.acc_pipeline,
@@ -2206,24 +2211,7 @@ def _tcgen05_root_m_threads(bm: int, bn: int) -> int:
     return min(32, bm)
 
 
-def _tcgen05_epilogue_warp_count(cta_thread_count: int) -> int:
-    cta_warp_count = max(1, cta_thread_count // 32)
-    return max(1, min(4, cta_warp_count - 2))
-
-
-def _tcgen05_pipeline_arrive_count(
-    cta_thread_count: int, epi_warp_count: int | None = None
-) -> int:
-    if epi_warp_count is None:
-        epi_warp_count = _tcgen05_epilogue_warp_count(cta_thread_count)
-    return epi_warp_count
-
-
-def _tcgen05_tmem_barrier_thread_count(
-    cta_thread_count: int, epi_warp_count: int | None = None
-) -> int:
-    if epi_warp_count is None:
-        epi_warp_count = _tcgen05_epilogue_warp_count(cta_thread_count)
+def _tcgen05_tmem_barrier_thread_count(epi_warp_count: int) -> int:
     return 32 * (epi_warp_count + 1)
 
 
@@ -2231,15 +2219,6 @@ def _tcgen05_c_stage_count(bn: int) -> int:
     # Match the SM100 GEMM helper: narrow epilogues use a deeper TMA-store
     # ring buffer, while wider-N tiles fall back to two stages.
     return 4 if bn <= 16 else 2
-
-
-def _tcgen05_tmem_alloc_barrier_id() -> int:
-    return 1
-
-
-def _tcgen05_epilog_sync_barrier_id() -> int:
-    # Helion currently reserves barrier 1 for the TMEM allocation flow.
-    return 2
 
 
 def _tcgen05_ab_stage_count(num_stages: int) -> int:
@@ -2271,23 +2250,19 @@ def _tcgen05_use_2cta_instrs(*, bm: int, cluster_m: int) -> bool:
     return cluster_m == 2 and bm == 256
 
 
-def _tcgen05_role_layout(
-    config: object,
-    *,
-    cta_thread_count: int,
-) -> tuple[int, int]:
-    """Pick the warp-role split for a tcgen05 matmul kernel.
+def _tcgen05_epi_warp_count(config: object, *, cta_thread_count: int) -> int:
+    """Pick the epilogue warp count for a tcgen05 matmul kernel.
 
-    The current lowering has a single TMA / A-B load warp; widening this
-    is gated on the role-local persistent-loop refactor (see
-    ``cute_plan.md``). Until then ``ab_load_warp_count`` is always 1.
+    Returns at most ``cta_thread_count // 32`` warps, capped by the
+    ``tcgen05_num_epi_warps`` autotune knob (default 4). The other roles
+    (one MMA exec warp + one A/B load warp) are added on top of this in
+    ``CuteTcgen05MatmulPlan.role_warp_count``.
     """
     cta_warp_count = max(1, cta_thread_count // 32)
-    epi_warp_count = min(
+    return min(
         cta_warp_count,
         max(1, _tcgen05_config_int(config, "tcgen05_num_epi_warps", 4)),
     )
-    return epi_warp_count, 1
 
 
 def _mma_impl_matches_problem_shape(
@@ -2487,20 +2462,10 @@ def _tcgen05_tiled_mma_expr(
 
 def _new_tcgen05_layout_plan(df: DeviceFunction) -> _Tcgen05LayoutPlan:
     return _Tcgen05LayoutPlan(
-        acc_stage_count=df.new_var("tcgen05_acc_stage_count"),
-        ab_stage_count=df.new_var("tcgen05_ab_stage_count"),
-        c_stage_count=df.new_var("tcgen05_c_stage_count"),
-        exec_thread_count=df.new_var("tcgen05_exec_thread_count"),
-        epi_warp_count=df.new_var("tcgen05_epi_warp_count"),
-        epilog_sync_barrier_id=df.new_var("tcgen05_epilog_sync_barrier_id"),
-        acc_pipeline_arrive_count=df.new_var("tcgen05_acc_pipeline_arrive_count"),
-        ab_pipeline_arrive_count=df.new_var("tcgen05_ab_pipeline_arrive_count"),
         exec_active=df.new_var("tcgen05_exec_active"),
         smem_a_layout=df.new_var("sA_layout"),
         smem_b_layout=df.new_var("sB_layout"),
-        smem_desc_view_layout=df.new_var("smem_desc_view_layout"),
         c_layout=df.new_var("tcgen05_c_layout"),
-        smem_c_layout=df.new_var("sC_layout"),
         epi_tile=df.new_var("tcgen05_epi_tile"),
         tmem_load_atom=df.new_var("tcgen05_tmem_load_atom"),
         acc_tmem_cols=df.new_var("tcgen05_acc_tmem_cols"),
@@ -2508,7 +2473,6 @@ def _new_tcgen05_layout_plan(df: DeviceFunction) -> _Tcgen05LayoutPlan:
         tmem_dealloc_mbar_ptr=df.new_var("tcgen05_tmem_dealloc_mbar_ptr"),
         tmem_alloc_barrier=df.new_var("tcgen05_tmem_alloc_barrier"),
         tmem_allocator=df.new_var("tcgen05_tmem_allocator"),
-        acc_tmem_ptr=df.new_var("tcgen05_acc_tmem_ptr"),
         acc_pipeline_barriers=df.new_var("tcgen05_acc_pipeline_barriers"),
         acc_pipeline_producer_group=df.new_var("tcgen05_acc_pipeline_producer_group"),
         acc_pipeline_consumer_group=df.new_var("tcgen05_acc_pipeline_consumer_group"),
@@ -2527,36 +2491,11 @@ def _make_tcgen05_layout_plan_setup(
     bn: int,
     bk: int,
     ab_stage_count: int,
-    acc_stage_count: int,
-    c_stage_count: int,
-    cta_thread_count: int,
-    epi_warp_count: int,
     is_two_cta: bool,
-    active_physical_n_threads: int,
     input_dtype_str: str,
     acc_dtype_str: str,
 ) -> list[ast.AST]:
     return [
-        statement_from_string(
-            f"{plan.acc_stage_count} = cutlass.Int32({acc_stage_count})"
-        ),
-        statement_from_string(
-            f"{plan.ab_stage_count} = cutlass.Int32({ab_stage_count})"
-        ),
-        statement_from_string(f"{plan.c_stage_count} = cutlass.Int32({c_stage_count})"),
-        statement_from_string(f"{plan.exec_thread_count} = cutlass.Int32(32)"),
-        statement_from_string(
-            f"{plan.epi_warp_count} = cutlass.Int32({epi_warp_count})"
-        ),
-        statement_from_string(
-            f"{plan.epilog_sync_barrier_id} = "
-            f"cutlass.Int32({_tcgen05_epilog_sync_barrier_id()})"
-        ),
-        statement_from_string(
-            f"{plan.acc_pipeline_arrive_count} = "
-            f"cutlass.Int32({_tcgen05_pipeline_arrive_count(cta_thread_count, epi_warp_count)})"
-        ),
-        statement_from_string(f"{plan.ab_pipeline_arrive_count} = cutlass.Int32(1)"),
         statement_from_string(
             f"{plan.smem_a_layout} = "
             f"{_tcgen05_smem_layout_expr(tiled_mma, bm, bn, bk, input_dtype_str, ab_stage_count, operand='a')}"
@@ -2566,19 +2505,12 @@ def _make_tcgen05_layout_plan_setup(
             f"{_tcgen05_smem_layout_expr(tiled_mma, bm, bn, bk, input_dtype_str, ab_stage_count, operand='b')}"
         ),
         statement_from_string(
-            f"{plan.smem_desc_view_layout} = cute.make_layout(1, stride=0)"
-        ),
-        statement_from_string(
             f"{plan.c_layout} = cutlass.utils.layout.LayoutEnum.ROW_MAJOR"
         ),
         statement_from_string(
             f"{plan.epi_tile} = cutlass.utils.blackwell_helpers.compute_epilogue_tile_shape("
             f"({bm}, {bn}), False, {plan.c_layout}, "
             f"{acc_dtype_str})"
-        ),
-        statement_from_string(
-            f"{plan.smem_c_layout} = cutlass.utils.blackwell_helpers.make_smem_layout_epi("
-            f"{acc_dtype_str}, {plan.c_layout}, {plan.epi_tile}, {plan.c_stage_count})"
         ),
         statement_from_string(
             f"{plan.tmem_load_atom} = cutlass.utils.blackwell_helpers.get_tmem_load_op("

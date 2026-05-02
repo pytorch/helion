@@ -201,9 +201,7 @@ class CuteTcgen05StoreValue:
     bm: int = 0
     bn: int = 0
     bk: int = 0
-    smem_name: str = ""
     thr_mma: str = ""
-    store_thr_mma: str = ""
     epi_warp_count: int = 0
     epi_acc_frag_base: str = ""
     epi_tidx: str = ""
@@ -243,10 +241,11 @@ class CuteTcgen05MatmulPlan:
     - one A/B load warp at ``tma_warp_id`` -- doubles as the TMA warp and,
       in the persistent path, also owns the tile scheduler
 
-    ``ab_load_warp_count`` is currently always 1; the field is kept so the
-    role layout / launch shape continues to plumb through if a future
-    role-local persistent rewrite splits TMA load and A/B prefetch onto
-    separate warps.
+    ``ab_load_warp_count`` defaults to 1 -- the current lowering has a
+    single TMA / A-B load warp. The field is kept so the role layout /
+    launch shape continues to plumb through if a future role-local
+    persistent rewrite splits TMA load and A/B prefetch onto separate
+    warps.
 
     Earlier revisions tracked separate ``has_scheduler_warp`` /
     ``has_epi_load_warp`` flags. Neither role was wired to actual work --
@@ -269,7 +268,7 @@ class CuteTcgen05MatmulPlan:
     ab_stage_count: int
     c_stage_count: int
     epi_warp_count: int
-    ab_load_warp_count: int
+    ab_load_warp_count: int = 1
 
     @property
     def exec_warp_id(self) -> int:

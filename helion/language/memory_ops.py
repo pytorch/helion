@@ -828,33 +828,6 @@ def _codegen_cute_store_tcgen05_tile(
     if len(base_indices) != 2:
         return None
 
-    if tcgen05_value.smem_name:
-        compact_warp_count = 1 << (tcgen05_value.epi_warp_count + 1).bit_length()
-        total_threads = 32 * compact_warp_count
-        linear_tid = "cutlass.Int32(cute.arch.thread_idx()[0])"
-        if compact_warp_count > 1:
-            linear_tid = (
-                f"{linear_tid} + cutlass.Int32(cute.arch.thread_idx()[1])"
-                " * cutlass.Int32(32)"
-            )
-        m_size = _cute_tensor_dim_size_expr(state, tensor, 0)
-        n_size = _cute_tensor_dim_size_expr(state, tensor, 1)
-        numel = tcgen05_value.bm * tcgen05_value.bn
-        iters = (numel + total_threads - 1) // total_threads
-        return statement_from_string(
-            f"for _tcgen05_store_i in range({iters}):\n"
-            f"    _tcgen05_flat = {linear_tid} + cutlass.Int32(_tcgen05_store_i) * cutlass.Int32({total_threads})\n"
-            f"    if _tcgen05_flat < cutlass.Int32({numel}):\n"
-            f"        _tcgen05_row = _tcgen05_flat // cutlass.Int32({tcgen05_value.bn})\n"
-            f"        _tcgen05_col = _tcgen05_flat % cutlass.Int32({tcgen05_value.bn})\n"
-            f"        _tcgen05_m = {base_indices[0]} + _tcgen05_row\n"
-            f"        _tcgen05_n = {base_indices[1]} + _tcgen05_col\n"
-            f"        if _tcgen05_m < {m_size} and _tcgen05_n < {n_size}:\n"
-            f"            {tensor_name}.__setitem__((_tcgen05_m, _tcgen05_n), "
-            f"{backend.ast_to_dtype_expr(f'{tcgen05_value.smem_name}[(_tcgen05_row, _tcgen05_col)]', target_dtype)})"
-        )
-
-    store_thr_mma = tcgen05_value.store_thr_mma or tcgen05_value.thr_mma
     m_size = _cute_tensor_dim_size_expr(state, tensor, 0)
     n_size = _cute_tensor_dim_size_expr(state, tensor, 1)
     tile_coord_m = f"({base_indices[0]}) // cutlass.Int32({tcgen05_value.bm})"
@@ -928,7 +901,7 @@ def _codegen_cute_store_tcgen05_tile(
             f"{tensor_name}, ({tcgen05_value.bm}, {tcgen05_value.bn}), "
             f"({tile_coord_m}, {tile_coord_n}))"
         ),
-        f"{tcgc_base} = {store_thr_mma}.partition_C({gmem_tile})",
+        f"{tcgc_base} = {tcgen05_value.thr_mma}.partition_C({gmem_tile})",
         (
             f"{tcgc} = cutlass.utils.gemm.sm100.transform_partitioned_tensor_layout("
             f"{tcgc_base})"
@@ -1021,7 +994,7 @@ def _codegen_cute_store_tcgen05_tile(
             f"            cute.copy({simt_atom}, {ttr_rd}, {ttr_gc_subtile})\n"
             f"        else:\n"
             f"            {coord_tile} = cute.local_tile(cute.make_identity_tensor(({m_size}, {n_size})), ({tcgen05_value.bm}, {tcgen05_value.bn}), ({tile_coord_m}, {tile_coord_n}))\n"
-            f"            {tccc_base} = {store_thr_mma}.partition_C({coord_tile})\n"
+            f"            {tccc_base} = {tcgen05_value.thr_mma}.partition_C({coord_tile})\n"
             f"            {tccc} = cutlass.utils.gemm.sm100.transform_partitioned_tensor_layout({tccc_base})\n"
             f"            {tccc_epi} = cute.flat_divide({tccc}, {epi_tile})\n"
             f"            {ttr_cc} = {thr_copy_t2r}.partition_D({tccc_epi})\n"

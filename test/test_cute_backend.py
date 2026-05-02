@@ -944,8 +944,20 @@ class TestCuteBackend(TestCase):
         self.assertIn("cutlass.utils.blackwell_helpers.make_trivial_tiled_mma", code)
         self.assertIn("cute.nvgpu.tcgen05", code)
         self.assertIn("cute.gemm(", code)
-        self.assertIn("tcgen05_acc_pipeline_arrive_count", code)
-        self.assertIn("tcgen05_ab_pipeline_arrive_count", code)
+        # ``tcgen05_acc_pipeline_arrive_count`` / ``tcgen05_ab_pipeline_arrive_count``
+        # are no longer materialized as named compile-time constants -- they
+        # were always literal ints, so codegen now passes the values inline.
+        # Pin the inline form instead: the acc consumer group must be sized to
+        # the epi warp count (4) and the AB pipeline still uses one TMA arriver.
+        self.assertIn(
+            "cutlass.pipeline.CooperativeGroup("
+            "cutlass.pipeline.Agent.Thread, cutlass.Int32(4))",
+            code,
+        )
+        self.assertIn(
+            "cutlass.pipeline.CooperativeGroup(cutlass.pipeline.Agent.Thread, 1)",
+            code,
+        )
         self.assertIn("cutlass.pipeline.NamedBarrier(barrier_id=1", code)
 
     def test_matmul_mma_tcgen05_128x8_uses_full_cta_barrier(self) -> None:
@@ -961,7 +973,12 @@ class TestCuteBackend(TestCase):
             code, out = code_and_output(cute_matmul_mma, args, block_sizes=[128, 8, 16])
         torch.testing.assert_close(out, args[0] @ args[1], atol=1e-1, rtol=1e-2)
         self.assertIn("cute.nvgpu.tcgen05", code)
-        self.assertIn("tcgen05_acc_pipeline_arrive_count", code)
+        # Pin the inline arrive-count form (cf. ``test_matmul_mma_tcgen05``).
+        self.assertIn(
+            "cutlass.pipeline.CooperativeGroup("
+            "cutlass.pipeline.Agent.Thread, cutlass.Int32(4))",
+            code,
+        )
         self.assertIn("cutlass.pipeline.NamedBarrier(barrier_id=1", code)
 
     def test_matmul_dot_out_dtype_falls_back_from_mma(self) -> None:
