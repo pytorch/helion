@@ -76,7 +76,9 @@ from helion._compiler.tile_strategy import _lane_loop_iter
 from helion._compiler.variable_origin import NameOrigin
 from helion._compiler.variable_origin import TileBeginOrigin
 from helion._testing import DEVICE
+from helion._testing import default_cute_mma_support
 from helion._testing import onlyBackends
+from helion._testing import patch_cute_mma_support
 import helion.language as hl
 from helion.language import _tracing_ops
 from helion.language._tracing_ops import _mask_to
@@ -88,6 +90,25 @@ from helion.language.memory_ops import _cute_index_exprs
 from helion.language.memory_ops import _maybe_codegen_cute_packed_affine_lhs_load
 from helion.language.memory_ops import load
 from helion.runtime import _append_cute_wrapper_plan
+
+
+def _make_tcgen05_persistent_config(**overrides: object) -> helion.Config:
+    """Build a ``helion.Config`` for the tcgen05 + TMA pipeline path."""
+    defaults: dict[str, object] = {
+        "block_sizes": [128, 256, 16],
+        "l2_groupings": [1],
+        "loop_orders": [[0, 1]],
+        "num_stages": 2,
+        "num_warps": 8,
+        "pid_type": "flat",
+        "tcgen05_cluster_m": 1,
+        "tcgen05_ab_stages": 2,
+        "tcgen05_acc_stages": 2,
+        "tcgen05_c_stages": 2,
+        "tcgen05_num_epi_warps": 4,
+    }
+    defaults.update(overrides)
+    return helion.Config(**defaults)  # type: ignore[arg-type]
 
 
 class _FakeBlockSize:
@@ -462,22 +483,10 @@ class TestCuteLowerings(unittest.TestCase):
             torch.randn(64, 8, device=DEVICE, dtype=torch.float16),
         )
         config = helion.Config(block_sizes=[64, 8, 16])
-        support = SimpleNamespace(
-            supported_impls=("universal", "warp", "tcgen05"),
-            warp_f16bf16=True,
-            tcgen05_f16bf16=True,
-        )
 
         with (
             patch.dict("os.environ", {"HELION_CUTE_MMA_IMPL": "tcgen05"}, clear=False),
-            patch(
-                "helion._compiler.cute.cute_mma.get_cute_mma_support",
-                return_value=support,
-            ),
-            patch(
-                "helion._compiler.cute.mma_support.get_cute_mma_support",
-                return_value=support,
-            ),
+            patch_cute_mma_support(),
         ):
             code = cute_matmul_mma_codegen_only.bind(args).to_triton_code(config)
 
@@ -515,22 +524,8 @@ class TestCuteLowerings(unittest.TestCase):
             torch.randn(256, 64, device=DEVICE, dtype=torch.float16),
             torch.randn(64, 128, device=DEVICE, dtype=torch.float16),
         )
-        support = SimpleNamespace(
-            supported_impls=("universal", "warp", "tcgen05"),
-            warp_f16bf16=True,
-            tcgen05_f16bf16=True,
-        )
 
-        with (
-            patch(
-                "helion._compiler.cute.cute_mma.get_cute_mma_support",
-                return_value=support,
-            ),
-            patch(
-                "helion._compiler.cute.mma_support.get_cute_mma_support",
-                return_value=support,
-            ),
-        ):
+        with patch_cute_mma_support():
             bound = cute_matmul_mma_codegen_only.bind(args)
             # matmul_ops narrows tcgen05_cluster_m to (1,) for the
             # bf16/fp16 matmul; this codegen-only test still exercises the
@@ -592,36 +587,12 @@ class TestCuteLowerings(unittest.TestCase):
             torch.randn(128, 16, device=DEVICE, dtype=torch.float16),
             torch.randn(16, 256, device=DEVICE, dtype=torch.float16),
         )
-        support = SimpleNamespace(
-            supported_impls=("universal", "warp", "tcgen05"),
-            warp_f16bf16=True,
-            tcgen05_f16bf16=True,
-        )
-
-        with (
-            patch(
-                "helion._compiler.cute.cute_mma.get_cute_mma_support",
-                return_value=support,
-            ),
-            patch(
-                "helion._compiler.cute.mma_support.get_cute_mma_support",
-                return_value=support,
-            ),
-        ):
+        with patch_cute_mma_support():
             bound = cute_dot_codegen_only.bind(args)
             bound.env.config_spec.cute_tcgen05_search_enabled = True
-            config = helion.Config(
-                block_sizes=[128, 256, 16],
+            config = _make_tcgen05_persistent_config(
                 l2_groupings=[4],
-                loop_orders=[[0, 1]],
-                num_stages=2,
                 num_warps=4,
-                pid_type="flat",
-                tcgen05_cluster_m=1,
-                tcgen05_ab_stages=2,
-                tcgen05_acc_stages=2,
-                tcgen05_c_stages=2,
-                tcgen05_num_epi_warps=4,
             )
             code = bound.to_triton_code(config)
 
@@ -676,36 +647,10 @@ class TestCuteLowerings(unittest.TestCase):
             torch.randn(128, 256, device=DEVICE, dtype=torch.float16),
             torch.randn(256, 256, device=DEVICE, dtype=torch.float16),
         )
-        support = SimpleNamespace(
-            supported_impls=("universal", "warp", "tcgen05"),
-            warp_f16bf16=True,
-            tcgen05_f16bf16=True,
-        )
-        with (
-            patch(
-                "helion._compiler.cute.cute_mma.get_cute_mma_support",
-                return_value=support,
-            ),
-            patch(
-                "helion._compiler.cute.mma_support.get_cute_mma_support",
-                return_value=support,
-            ),
-        ):
+        with patch_cute_mma_support():
             bound = cute_matmul_kloop_split.bind(args)
             bound.env.config_spec.cute_tcgen05_search_enabled = True
-            config = helion.Config(
-                block_sizes=[128, 256, 16],
-                l2_groupings=[1],
-                loop_orders=[[0, 1]],
-                num_stages=2,
-                num_warps=4,
-                pid_type="flat",
-                tcgen05_cluster_m=1,
-                tcgen05_ab_stages=2,
-                tcgen05_acc_stages=2,
-                tcgen05_c_stages=2,
-                tcgen05_num_epi_warps=4,
-            )
+            config = _make_tcgen05_persistent_config(num_warps=4)
             code = bound.to_triton_code(config)
 
         self.assertIn(
@@ -755,36 +700,10 @@ class TestCuteLowerings(unittest.TestCase):
             torch.randn(128, 16, device=DEVICE, dtype=torch.float16),
             torch.randn(16, 256, device=DEVICE, dtype=torch.float16),
         )
-        support = SimpleNamespace(
-            supported_impls=("universal", "warp", "tcgen05"),
-            warp_f16bf16=True,
-            tcgen05_f16bf16=True,
-        )
-        with (
-            patch(
-                "helion._compiler.cute.cute_mma.get_cute_mma_support",
-                return_value=support,
-            ),
-            patch(
-                "helion._compiler.cute.mma_support.get_cute_mma_support",
-                return_value=support,
-            ),
-        ):
+        with patch_cute_mma_support():
             bound = cute_matmul_setmaxregister.bind(args)
             bound.env.config_spec.cute_tcgen05_search_enabled = True
-            config = helion.Config(
-                block_sizes=[128, 256, 16],
-                l2_groupings=[4],
-                loop_orders=[[0, 1]],
-                num_stages=2,
-                num_warps=8,
-                pid_type="flat",
-                tcgen05_cluster_m=1,
-                tcgen05_ab_stages=2,
-                tcgen05_acc_stages=2,
-                tcgen05_c_stages=2,
-                tcgen05_num_epi_warps=4,
-            )
+            config = _make_tcgen05_persistent_config(l2_groupings=[4])
             code = bound.to_triton_code(config)
 
         # Non-consumer warps (TMA, AB-load, idle padding) drop to 120 regs.
@@ -845,36 +764,10 @@ class TestCuteLowerings(unittest.TestCase):
             torch.randn(128, 16, device=DEVICE, dtype=torch.float16),
             torch.randn(16, 256, device=DEVICE, dtype=torch.float16),
         )
-        support = SimpleNamespace(
-            supported_impls=("universal", "warp", "tcgen05"),
-            warp_f16bf16=True,
-            tcgen05_f16bf16=True,
-        )
-        with (
-            patch(
-                "helion._compiler.cute.cute_mma.get_cute_mma_support",
-                return_value=support,
-            ),
-            patch(
-                "helion._compiler.cute.mma_support.get_cute_mma_support",
-                return_value=support,
-            ),
-        ):
+        with patch_cute_mma_support():
             bound = cute_matmul_acc_frag.bind(args)
             bound.env.config_spec.cute_tcgen05_search_enabled = True
-            config = helion.Config(
-                block_sizes=[128, 256, 16],
-                l2_groupings=[4],
-                loop_orders=[[0, 1]],
-                num_stages=2,
-                num_warps=8,
-                pid_type="flat",
-                tcgen05_cluster_m=1,
-                tcgen05_ab_stages=2,
-                tcgen05_acc_stages=2,
-                tcgen05_c_stages=2,
-                tcgen05_num_epi_warps=4,
-            )
+            config = _make_tcgen05_persistent_config(l2_groupings=[4])
             code = bound.to_triton_code(config)
 
         # The per-tile slice that actually gives acc_frag its working
@@ -923,36 +816,10 @@ class TestCuteLowerings(unittest.TestCase):
             torch.randn(128, 16, device=DEVICE, dtype=torch.float16),
             torch.randn(16, 256, device=DEVICE, dtype=torch.float16),
         )
-        support = SimpleNamespace(
-            supported_impls=("universal", "warp", "tcgen05"),
-            warp_f16bf16=True,
-            tcgen05_f16bf16=True,
-        )
-        with (
-            patch(
-                "helion._compiler.cute.cute_mma.get_cute_mma_support",
-                return_value=support,
-            ),
-            patch(
-                "helion._compiler.cute.mma_support.get_cute_mma_support",
-                return_value=support,
-            ),
-        ):
+        with patch_cute_mma_support():
             bound = cute_matmul_mma_stage.bind(args)
             bound.env.config_spec.cute_tcgen05_search_enabled = True
-            config = helion.Config(
-                block_sizes=[128, 256, 16],
-                l2_groupings=[4],
-                loop_orders=[[0, 1]],
-                num_stages=2,
-                num_warps=8,
-                pid_type="flat",
-                tcgen05_cluster_m=1,
-                tcgen05_ab_stages=2,
-                tcgen05_acc_stages=2,
-                tcgen05_c_stages=2,
-                tcgen05_num_epi_warps=4,
-            )
+            config = _make_tcgen05_persistent_config(l2_groupings=[4])
             code = bound.to_triton_code(config)
 
         # The new form: mma_stage tracks the pipeline state directly.
@@ -995,39 +862,16 @@ class TestCuteLowerings(unittest.TestCase):
             torch.randn(256, 32, device=DEVICE, dtype=torch.float16),
             torch.randn(32, 256, device=DEVICE, dtype=torch.float16),
         )
-        support = SimpleNamespace(
-            supported_impls=("universal", "warp", "tcgen05"),
-            warp_f16bf16=True,
-            tcgen05_f16bf16=True,
-        )
-        with (
-            patch(
-                "helion._compiler.cute.cute_mma.get_cute_mma_support",
-                return_value=support,
-            ),
-            patch(
-                "helion._compiler.cute.mma_support.get_cute_mma_support",
-                return_value=support,
-            ),
-        ):
+        with patch_cute_mma_support():
             bound = cute_matmul_persistent_post_loop.bind(args)
             bound.env.config_spec.cute_tcgen05_search_enabled = True
             # ``persistent_blocked`` is normally disallowed for tcgen05
             # via ``enforce_dot_requirements`` — the matmul lowering still
             # has correctness gaps on the persistent path. The codegen
             # itself accepts the config, which is what this test exercises.
-            cfg = helion.Config(
+            cfg = _make_tcgen05_persistent_config(
                 block_sizes=[128, 128, 16],
-                l2_groupings=[1],
-                loop_orders=[[0, 1]],
-                num_stages=2,
-                num_warps=8,
                 pid_type="persistent_blocked",
-                tcgen05_cluster_m=1,
-                tcgen05_ab_stages=2,
-                tcgen05_acc_stages=2,
-                tcgen05_c_stages=2,
-                tcgen05_num_epi_warps=4,
             )
             code = bound.to_triton_code(cfg)
 
@@ -1101,35 +945,12 @@ class TestCuteLowerings(unittest.TestCase):
             torch.randn(256, 32, device=DEVICE, dtype=torch.float16),
             torch.randn(32, 256, device=DEVICE, dtype=torch.float16),
         )
-        support = SimpleNamespace(
-            supported_impls=("universal", "warp", "tcgen05"),
-            warp_f16bf16=True,
-            tcgen05_f16bf16=True,
-        )
-        with (
-            patch(
-                "helion._compiler.cute.cute_mma.get_cute_mma_support",
-                return_value=support,
-            ),
-            patch(
-                "helion._compiler.cute.mma_support.get_cute_mma_support",
-                return_value=support,
-            ),
-        ):
+        with patch_cute_mma_support():
             bound = cute_matmul_persistent_compile.bind(args)
             bound.env.config_spec.cute_tcgen05_search_enabled = True
-            cfg = helion.Config(
+            cfg = _make_tcgen05_persistent_config(
                 block_sizes=[128, 128, 16],
-                l2_groupings=[1],
-                loop_orders=[[0, 1]],
-                num_stages=2,
-                num_warps=8,
                 pid_type="persistent_blocked",
-                tcgen05_cluster_m=1,
-                tcgen05_ab_stages=2,
-                tcgen05_acc_stages=2,
-                tcgen05_c_stages=2,
-                tcgen05_num_epi_warps=4,
             )
             # The act of generating the Python source already runs the
             # CuTe DSL preprocessor; the IR verifier runs at first
@@ -1185,35 +1006,12 @@ class TestCuteLowerings(unittest.TestCase):
             torch.randn(128, 32, device=DEVICE, dtype=torch.float16),
             torch.randn(32, 128, device=DEVICE, dtype=torch.float16),
         )
-        support = SimpleNamespace(
-            supported_impls=("universal", "warp", "tcgen05"),
-            warp_f16bf16=True,
-            tcgen05_f16bf16=True,
-        )
-        with (
-            patch(
-                "helion._compiler.cute.cute_mma.get_cute_mma_support",
-                return_value=support,
-            ),
-            patch(
-                "helion._compiler.cute.mma_support.get_cute_mma_support",
-                return_value=support,
-            ),
-        ):
+        with patch_cute_mma_support():
             bound = cute_matmul_persistent_role.bind(args)
             bound.env.config_spec.cute_tcgen05_search_enabled = True
-            cfg = helion.Config(
+            cfg = _make_tcgen05_persistent_config(
                 block_sizes=[128, 128, 16],
-                l2_groupings=[1],
-                loop_orders=[[0, 1]],
-                num_stages=2,
-                num_warps=8,
                 pid_type="persistent_blocked",
-                tcgen05_cluster_m=1,
-                tcgen05_ab_stages=2,
-                tcgen05_acc_stages=2,
-                tcgen05_c_stages=2,
-                tcgen05_num_epi_warps=4,
             )
             code = bound.to_triton_code(cfg)
         # The TMA-load warp predicate the partitioner uses for the
@@ -1303,35 +1101,12 @@ class TestCuteLowerings(unittest.TestCase):
             torch.randn(256, 32, device=DEVICE, dtype=torch.float16),
             torch.randn(32, 256, device=DEVICE, dtype=torch.float16),
         )
-        support = SimpleNamespace(
-            supported_impls=("universal", "warp", "tcgen05"),
-            warp_f16bf16=True,
-            tcgen05_f16bf16=True,
-        )
-        with (
-            patch(
-                "helion._compiler.cute.cute_mma.get_cute_mma_support",
-                return_value=support,
-            ),
-            patch(
-                "helion._compiler.cute.mma_support.get_cute_mma_support",
-                return_value=support,
-            ),
-        ):
+        with patch_cute_mma_support():
             bound = cute_matmul_multi_tile.bind(args)
             bound.env.config_spec.cute_tcgen05_search_enabled = True
-            cfg = helion.Config(
+            cfg = _make_tcgen05_persistent_config(
                 block_sizes=[128, 128, 16],
-                l2_groupings=[1],
-                loop_orders=[[0, 1]],
-                num_stages=2,
-                num_warps=8,
                 pid_type="persistent_blocked",
-                tcgen05_cluster_m=1,
-                tcgen05_ab_stages=2,
-                tcgen05_acc_stages=2,
-                tcgen05_c_stages=2,
-                tcgen05_num_epi_warps=4,
             )
             bound.set_config(cfg)
             with self.assertRaisesRegex(
@@ -1442,36 +1217,10 @@ class TestCuteLowerings(unittest.TestCase):
             torch.randn(128, 16, device=DEVICE, dtype=torch.float16),
             torch.randn(16, 128, device=DEVICE, dtype=torch.float16),
         )
-        support = SimpleNamespace(
-            supported_impls=("universal", "warp", "tcgen05"),
-            warp_f16bf16=True,
-            tcgen05_f16bf16=True,
-        )
-        with (
-            patch(
-                "helion._compiler.cute.cute_mma.get_cute_mma_support",
-                return_value=support,
-            ),
-            patch(
-                "helion._compiler.cute.mma_support.get_cute_mma_support",
-                return_value=support,
-            ),
-        ):
+        with patch_cute_mma_support():
             bound = cute_matmul_post_loop.bind(args)
             bound.env.config_spec.cute_tcgen05_search_enabled = True
-            cfg = helion.Config(
-                block_sizes=[128, 128, 16],
-                l2_groupings=[1],
-                loop_orders=[[0, 1]],
-                num_stages=2,
-                num_warps=8,
-                pid_type="flat",
-                tcgen05_cluster_m=1,
-                tcgen05_ab_stages=2,
-                tcgen05_acc_stages=2,
-                tcgen05_c_stages=2,
-                tcgen05_num_epi_warps=4,
-            )
+            cfg = _make_tcgen05_persistent_config(block_sizes=[128, 128, 16])
             code = bound.to_triton_code(cfg)
 
         # The cleanup statements are the post-loop tail. They must be
@@ -1511,20 +1260,11 @@ class TestCuteLowerings(unittest.TestCase):
             torch.randn(16, 64, device=DEVICE, dtype=torch.float16),
         )
         # Force the warp impl by reporting only warp_f16bf16 support.
-        support = SimpleNamespace(
-            supported_impls=("universal", "warp"),
-            warp_f16bf16=True,
-            tcgen05_f16bf16=False,
-        )
-        with (
-            patch(
-                "helion._compiler.cute.cute_mma.get_cute_mma_support",
-                return_value=support,
-            ),
-            patch(
-                "helion._compiler.cute.mma_support.get_cute_mma_support",
-                return_value=support,
-            ),
+        with patch_cute_mma_support(
+            default_cute_mma_support(
+                supported_impls=("universal", "warp"),
+                tcgen05_f16bf16=False,
+            )
         ):
             bound = cute_matmul_warp_only.bind(args)
             config = bound.config_spec.default_config()
@@ -1554,22 +1294,8 @@ class TestCuteLowerings(unittest.TestCase):
             torch.randn(256, 64, device=DEVICE, dtype=torch.float16),
             torch.randn(64, 128, device=DEVICE, dtype=torch.float16),
         )
-        support = SimpleNamespace(
-            supported_impls=("universal", "warp", "tcgen05"),
-            warp_f16bf16=True,
-            tcgen05_f16bf16=True,
-        )
 
-        with (
-            patch(
-                "helion._compiler.cute.cute_mma.get_cute_mma_support",
-                return_value=support,
-            ),
-            patch(
-                "helion._compiler.cute.mma_support.get_cute_mma_support",
-                return_value=support,
-            ),
-        ):
+        with patch_cute_mma_support():
             code = cute_matmul_mma_codegen_only.bind(args).to_triton_code(
                 helion.Config(
                     block_sizes=[128, 32, 16],
@@ -1620,22 +1346,10 @@ class TestCuteLowerings(unittest.TestCase):
             num_threads=[128, 2, 0],
             loop_orders=[[0, 1]],
         )
-        support = SimpleNamespace(
-            supported_impls=("universal", "warp", "tcgen05"),
-            warp_f16bf16=True,
-            tcgen05_f16bf16=True,
-        )
 
         with (
             patch.dict("os.environ", {"HELION_CUTE_MMA_IMPL": "tcgen05"}, clear=False),
-            patch(
-                "helion._compiler.cute.cute_mma.get_cute_mma_support",
-                return_value=support,
-            ),
-            patch(
-                "helion._compiler.cute.mma_support.get_cute_mma_support",
-                return_value=support,
-            ),
+            patch_cute_mma_support(),
         ):
             code = cute_matmul_mma_codegen_only.bind(args).to_triton_code(config)
 
@@ -1685,22 +1399,8 @@ class TestCuteLowerings(unittest.TestCase):
             num_warps=4,
             pid_type="flat",
         )
-        support = SimpleNamespace(
-            supported_impls=("universal", "warp", "tcgen05"),
-            warp_f16bf16=True,
-            tcgen05_f16bf16=True,
-        )
 
-        with (
-            patch(
-                "helion._compiler.cute.cute_mma.get_cute_mma_support",
-                return_value=support,
-            ),
-            patch(
-                "helion._compiler.cute.mma_support.get_cute_mma_support",
-                return_value=support,
-            ),
-        ):
+        with patch_cute_mma_support():
             code = cute_matmul_mma_codegen_only.bind(args).to_triton_code(config)
 
         self.assertIn("'kind': 'tcgen05_ab_tma'", code)
@@ -1767,22 +1467,10 @@ class TestCuteLowerings(unittest.TestCase):
             pid_type="flat",
             tcgen05_cluster_m=2,
         )
-        support = SimpleNamespace(
-            supported_impls=("universal", "warp", "tcgen05"),
-            warp_f16bf16=True,
-            tcgen05_f16bf16=True,
-        )
 
         with (
             patch.dict("os.environ", {"HELION_CUTE_MMA_IMPL": "tcgen05"}, clear=False),
-            patch(
-                "helion._compiler.cute.cute_mma.get_cute_mma_support",
-                return_value=support,
-            ),
-            patch(
-                "helion._compiler.cute.mma_support.get_cute_mma_support",
-                return_value=support,
-            ),
+            patch_cute_mma_support(),
         ):
             bound = cute_matmul_mma_codegen_only.bind(args)
             # See note above: widen cluster_m back to include 2 for the
@@ -3824,15 +3512,9 @@ class TestCuteLowerings(unittest.TestCase):
         self.assertIn("permute_smem", code)
 
     def test_choose_mma_impl_forced_incompatible_override_falls_back(self) -> None:
-        support = SimpleNamespace(
-            supported_impls=("universal", "warp", "tcgen05"),
-            warp_f16bf16=True,
-            tcgen05_f16bf16=True,
-        )
-
         with patch(
             "helion._compiler.cute.cute_mma.get_cute_mma_support",
-            return_value=support,
+            return_value=default_cute_mma_support(),
         ):
             with patch.dict(
                 "os.environ", {"HELION_CUTE_MMA_IMPL": "warp"}, clear=False
@@ -3946,22 +3628,10 @@ class TestCuteLowerings(unittest.TestCase):
             tcgen05_num_epi_warps=4,
             pid_type="persistent_blocked",
         )
-        support = SimpleNamespace(
-            supported_impls=("universal", "warp", "tcgen05"),
-            warp_f16bf16=True,
-            tcgen05_f16bf16=True,
-        )
 
         with (
             patch.dict("os.environ", {"HELION_CUTE_MMA_IMPL": "tcgen05"}, clear=False),
-            patch(
-                "helion._compiler.cute.cute_mma.get_cute_mma_support",
-                return_value=support,
-            ),
-            patch(
-                "helion._compiler.cute.mma_support.get_cute_mma_support",
-                return_value=support,
-            ),
+            patch_cute_mma_support(),
         ):
             bound = cute_matmul_mma_codegen_only.bind(args)
             # matmul_ops narrows tcgen05_cluster_m to (1,) when binding the

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -14,6 +13,7 @@ from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
+from helion._testing import patch_cute_mma_support
 from helion._testing import skipIfMTIA
 import helion.language as hl
 
@@ -81,25 +81,11 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
                 out[tile_m, tile_n] = acc.to(x.dtype)
             return out
 
-        support = SimpleNamespace(
-            supported_impls=("universal", "warp", "tcgen05"),
-            warp_f16bf16=True,
-            tcgen05_f16bf16=True,
-        )
         args = (
             torch.randn([256, 64], device=DEVICE, dtype=HALF_DTYPE),
             torch.randn([64, 128], device=DEVICE, dtype=HALF_DTYPE),
         )
-        with (
-            patch(
-                "helion._compiler.cute.cute_mma.get_cute_mma_support",
-                return_value=support,
-            ),
-            patch(
-                "helion._compiler.cute.mma_support.get_cute_mma_support",
-                return_value=support,
-            ),
-        ):
+        with patch_cute_mma_support():
             bound = cute_matmul_mma.bind(args)
         spec = bound.config_spec
         self.assertEqual([x.min_size for x in spec.block_sizes], [128, 8, 16])
@@ -133,25 +119,11 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
                 out[tile_m, tile_n] = acc.to(x.dtype)
             return out
 
-        support = SimpleNamespace(
-            supported_impls=("universal", "warp", "tcgen05"),
-            warp_f16bf16=True,
-            tcgen05_f16bf16=True,
-        )
         args = (
             torch.randn([8192, 8192], device=DEVICE, dtype=HALF_DTYPE),
             torch.randn([8192, 8192], device=DEVICE, dtype=HALF_DTYPE),
         )
-        with (
-            patch(
-                "helion._compiler.cute.cute_mma.get_cute_mma_support",
-                return_value=support,
-            ),
-            patch(
-                "helion._compiler.cute.mma_support.get_cute_mma_support",
-                return_value=support,
-            ),
-        ):
+        with patch_cute_mma_support():
             bound = cute_matmul_mma.bind(args)
         spec = bound.config_spec
         self.assertEqual([x.min_size for x in spec.block_sizes], [128, 8, 16])
@@ -184,25 +156,11 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
                 out[tile_m, tile_n] = acc.to(x.dtype)
             return out
 
-        support = SimpleNamespace(
-            supported_impls=("universal", "warp", "tcgen05"),
-            warp_f16bf16=True,
-            tcgen05_f16bf16=True,
-        )
         args = (
             torch.randn([8192, 8192], device=DEVICE, dtype=HALF_DTYPE),
             torch.randn([8192, 8192], device=DEVICE, dtype=HALF_DTYPE),
         )
-        with (
-            patch(
-                "helion._compiler.cute.cute_mma.get_cute_mma_support",
-                return_value=support,
-            ),
-            patch(
-                "helion._compiler.cute.mma_support.get_cute_mma_support",
-                return_value=support,
-            ),
-        ):
+        with patch_cute_mma_support():
             bound = cute_matmul_mma.bind(args)
             config = bound.config_spec.default_config()
             code = bound.to_triton_code(config)
