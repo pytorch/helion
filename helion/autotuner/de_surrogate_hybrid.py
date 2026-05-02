@@ -175,7 +175,7 @@ class DESurrogateHybrid(DifferentialEvolutionSearch):
         self.generations_without_improvement = 0
 
         # Evolution loop
-        for gen in range(2, self.max_generations + 1):
+        for gen in self._budgeted_range(2, self.max_generations + 1):
             self.set_generation(gen)
             self._evolve_generation(gen)
 

@@ -438,6 +438,12 @@ class _Settings:
             "HELION_AUTOTUNE_MAX_GENERATIONS",
         )
     )
+    autotune_budget_seconds: int | None = dataclasses.field(
+        default_factory=functools.partial(
+            _env_get_optional_int,
+            "HELION_AUTOTUNE_BUDGET_SECONDS",
+        )
+    )
     autotune_ignore_errors: bool = dataclasses.field(
         default_factory=functools.partial(
             _env_get_bool, "HELION_AUTOTUNE_IGNORE_ERRORS", False
@@ -577,6 +583,13 @@ class Settings(_Settings):
         "autotune_search_acf": "List of PTXAS Advanced Controls Files (ACFs) to search during autotuning. ACFs are highly specialized configurations for specific hardware and use cases; when autotuning with ACFs, default -O3 is always considered. Empty list disables.",
         "autotune_progress_bar": "If True, show progress bar during autotuning. Default is True. Set HELION_AUTOTUNE_PROGRESS_BAR=0 to disable.",
         "autotune_max_generations": "Override the maximum number of generations for Pattern Search and Differential Evolution Search autotuning algorithms with HELION_AUTOTUNE_MAX_GENERATIONS=N or @helion.kernel(autotune_max_generations=N).",
+        "autotune_budget_seconds": (
+            "Wall-clock budget in seconds for the entire autotune. When the "
+            "budget is exceeded the search returns the best config found so "
+            "far. Set with HELION_AUTOTUNE_BUDGET_SECONDS=N or "
+            "@helion.kernel(autotune_budget_seconds=N). Default None "
+            "(no budget)."
+        ),
         "autotune_ignore_errors": (
             "If True, skip logging and raising autotune errors. "
             "Set HELION_AUTOTUNE_IGNORE_ERRORS=1 to enable globally."

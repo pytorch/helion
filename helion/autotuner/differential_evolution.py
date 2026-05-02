@@ -265,7 +265,7 @@ class DifferentialEvolutionSearch(PopulationBasedSearch):
             self.best_perf_history = [self.best.perf]
             self.generations_without_improvement = 0
 
-        for i in range(2, self.max_generations):
+        for i in self._budgeted_range(2, self.max_generations):
             self.set_generation(i)
             self.log(f"Generation {i} starting")
             replaced = self.evolve_population()

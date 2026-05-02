@@ -737,6 +737,79 @@ class TestCuteLowerings(unittest.TestCase):
         self.assertLess(decrease_pos, mma_slice_pos)
         self.assertLess(increase_pos, mma_slice_pos)
 
+    def test_tcgen05_codegen_does_not_emit_dead_acc_frag_alias(self) -> None:
+        """After the acc_frag persistent-loop fix, the prefix should
+        NOT emit the dead ``acc_frag = acc_frag_base`` initialization
+        that gets unconditionally overwritten by the per-tile
+        ``acc_frag = exec_acc_frag_base[..., index]`` slice. Hoisting
+        the dead alias under the persistent kernel splitter caused a
+        CuTe DSL "structured different after this while" error."""
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_acc_frag(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        args = (
+            torch.randn(128, 16, device=DEVICE, dtype=torch.float16),
+            torch.randn(16, 256, device=DEVICE, dtype=torch.float16),
+        )
+        support = SimpleNamespace(
+            supported_impls=("universal", "warp", "tcgen05"),
+            warp_f16bf16=True,
+            tcgen05_f16bf16=True,
+        )
+        with (
+            patch(
+                "helion._compiler.cute.cute_mma.get_cute_mma_support",
+                return_value=support,
+            ),
+            patch(
+                "helion._compiler.cute.mma_support.get_cute_mma_support",
+                return_value=support,
+            ),
+        ):
+            bound = cute_matmul_acc_frag.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            config = helion.Config(
+                block_sizes=[128, 256, 16],
+                l2_groupings=[4],
+                loop_orders=[[0, 1]],
+                num_stages=2,
+                num_warps=8,
+                pid_type="flat",
+                tcgen05_cluster_m=1,
+                tcgen05_ab_stages=2,
+                tcgen05_acc_stages=2,
+                tcgen05_c_stages=2,
+                tcgen05_num_epi_warps=4,
+                tcgen05_has_scheduler_warp=True,
+                tcgen05_has_epi_load_warp=True,
+            )
+            code = bound.to_triton_code(config)
+
+        # The per-tile slice that actually gives acc_frag its working
+        # shape SHOULD still be emitted.
+        self.assertIn(
+            "acc_frag = tcgen05_exec_acc_frag_base[None, None, None, "
+            "tcgen05_acc_producer_state.index]",
+            code,
+        )
+        # The dead pre-slice initialization should NOT appear.
+        # (``acc_frag_base`` is still referenced via
+        # ``tcgen05_epi_acc_frag_base = acc_frag_base`` and via the
+        # exec/epi acc_frag tensor construction; we're specifically
+        # ruling out the bare ``acc_frag = acc_frag_base`` line that
+        # used to land in the hoisted invariant block.)
+        self.assertNotIn("acc_frag = acc_frag_base", code)
+
     def test_tcgen05_setmaxregister_omitted_without_tcgen05(self) -> None:
         """The non-tcgen05 (warp / universal) MMA paths do not emit
         setmaxregister. The Quack-style register split is specific to the

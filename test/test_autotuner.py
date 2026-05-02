@@ -12,12 +12,14 @@ from pathlib import Path
 import pickle
 import random
 import tempfile
+import time
 from types import SimpleNamespace
 from typing import Callable
 from typing import ClassVar
 from typing import Sequence
 import unittest
 from unittest import skip
+from unittest.mock import Mock
 from unittest.mock import patch
 
 import numpy as np
@@ -2815,6 +2817,155 @@ class TestFiniteSearchWarmStart(TestCase):
         )
         bound = add.bind(args)
         self.assertIs(bound.settings.autotuner_fn, fn)
+
+
+@onlyBackends(["triton"])
+class TestAutotuneBudget(TestCase):
+    def _make_search(self, settings: Settings) -> BaseSearch:
+        search = BaseSearch.__new__(BaseSearch)
+        search.settings = settings
+        search.kernel = SimpleNamespace(
+            format_kernel_decorator=lambda config, s: "decorator",
+            to_triton_code=lambda config: "code",
+            maybe_log_repro=lambda log_func, args, config=None: None,
+        )
+        search.args = ()
+        search.log = AutotuningLogger(settings)
+        search.config_spec = SimpleNamespace(default_config=dict)
+        search._benchmark_provider_cls = LocalBenchmarkProvider
+        search.best_perf_so_far = float("inf")
+        search._prepared = False
+        with patch.object(
+            LocalBenchmarkProvider,
+            "_compute_baseline",
+            return_value=(None, [], None),
+        ):
+            search._prepare()
+        return search
+
+    def test_setting_default_is_none(self) -> None:
+        with without_env_var("HELION_AUTOTUNE_BUDGET_SECONDS"):
+            settings = Settings()
+        self.assertIsNone(settings.autotune_budget_seconds)
+
+    def test_setting_from_env_var(self) -> None:
+        with patch.dict(
+            os.environ,
+            {"HELION_AUTOTUNE_BUDGET_SECONDS": "300"},
+            clear=False,
+        ):
+            settings = Settings()
+        self.assertEqual(settings.autotune_budget_seconds, 300)
+
+    def test_setting_from_kwarg(self) -> None:
+        settings = Settings(autotune_budget_seconds=42)
+        self.assertEqual(settings.autotune_budget_seconds, 42)
+
+    def test_no_budget_yields_full_range(self) -> None:
+        settings = Settings(
+            autotune_budget_seconds=None,
+            autotune_log_level=logging.CRITICAL,
+        )
+        search = self._make_search(settings)
+        search._autotune_budget_start = time.perf_counter() - 1e9
+        self.assertEqual(list(search._budgeted_range(1, 4)), [1, 2, 3])
+
+    def test_budget_yields_while_time_remains(self) -> None:
+        settings = Settings(
+            autotune_budget_seconds=600,
+            autotune_log_level=logging.CRITICAL,
+        )
+        search = self._make_search(settings)
+        self.assertEqual(list(search._budgeted_range(1, 4)), [1, 2, 3])
+
+    def test_budget_stops_range_when_elapsed_exceeds(self) -> None:
+        settings = Settings(
+            autotune_budget_seconds=1,
+            autotune_log_level=logging.CRITICAL,
+        )
+        search = self._make_search(settings)
+        search._autotune_budget_start = time.perf_counter() - 2.0
+        search.log = Mock()
+        self.assertEqual(list(search._budgeted_range(10)), [])
+        search.log.assert_called_once()
+
+    def test_budget_unset_when_prepare_not_called(self) -> None:
+        settings = Settings(
+            autotune_budget_seconds=1,
+            autotune_log_level=logging.CRITICAL,
+        )
+        search = BaseSearch.__new__(BaseSearch)
+        search.settings = settings
+        search._autotune_budget_start = None
+        self.assertEqual(list(search._budgeted_range(3)), [0, 1, 2])
+
+    def test_budget_resets_when_prepare_called_again(self) -> None:
+        settings = Settings(
+            autotune_budget_seconds=60,
+            autotune_log_level=logging.CRITICAL,
+        )
+        search = self._make_search(settings)
+        search._autotune_budget_start = time.perf_counter() - 100.0
+        self.assertEqual(list(search._budgeted_range(1)), [])
+
+        search._prepared = False
+        with patch.object(
+            LocalBenchmarkProvider,
+            "_compute_baseline",
+            return_value=(None, [], None),
+        ):
+            search._prepare()
+        self.assertEqual(list(search._budgeted_range(1)), [0])
+
+    def test_budget_zero_immediately_exhausts(self) -> None:
+        settings = Settings(
+            autotune_budget_seconds=0,
+            autotune_log_level=logging.CRITICAL,
+        )
+        search = self._make_search(settings)
+        time.sleep(0.001)
+        self.assertEqual(list(search._budgeted_range(10)), [])
+
+    def test_setting_has_user_facing_description(self) -> None:
+        self.assertIn("autotune_budget_seconds", Settings.__slots__)
+        description = Settings.__slots__["autotune_budget_seconds"]
+        self.assertIn("HELION_AUTOTUNE_BUDGET_SECONDS", description)
+        self.assertIn("best", description.lower())
+
+    def test_generation_loops_use_budgeted_range(self) -> None:
+        import inspect
+
+        from helion.autotuner.de_surrogate_hybrid import DESurrogateHybrid
+        from helion.autotuner.differential_evolution import DifferentialEvolutionSearch
+        from helion.autotuner.llm_search import LLMGuidedSearch
+        from helion.autotuner.pattern_search import PatternSearch
+        from helion.autotuner.surrogate_pattern_search import LFBOPatternSearch
+
+        for cls in (
+            DESurrogateHybrid,
+            DifferentialEvolutionSearch,
+            LLMGuidedSearch,
+            PatternSearch,
+            LFBOPatternSearch,
+        ):
+            source = inspect.getsource(cls)
+            self.assertIn(
+                "_budgeted_range",
+                source,
+                f"{cls.__name__} should use _budgeted_range for generation loops",
+            )
+
+    def test_finishing_phase_respects_budget(self) -> None:
+        import inspect
+
+        from helion.autotuner.base_search import PopulationBasedSearch
+
+        source = inspect.getsource(PopulationBasedSearch.run_finishing_phase)
+        self.assertIn(
+            "_budgeted_range",
+            source,
+            "run_finishing_phase should stop when the autotune budget is exhausted",
+        )
 
 
 if __name__ == "__main__":
