@@ -959,6 +959,28 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         never registers TMA-load role tags. The consumer
         (``_build_tcgen05_persistent_tile_body``) handles the
         single-block case identically to the pre-split implementation.
+
+        **Nested tags inside top-level loops.** The K-loop's per-iter
+        TMA producer block is emitted INSIDE the K-loop body via
+        ``cg.add_statement(...)``, so it is not a top-level statement
+        of the per-tile body. Tagged statements found inside top-level
+        ``for`` / ``while`` loop bodies get rewritten in place: each
+        tagged child statement is wrapped with
+        ``if {role_predicate}: <child>`` so the role gate is visible in
+        the generated source. The containing loop itself stays in the
+        shared block because the loop body still has work for the
+        non-TMA-load warps (consumer ``consumer_wait``, scalar fallback
+        loads, cross-warp ``sync_threads()``). This is structural prep
+        for the upcoming role-local-while lift (``cute_plan.md`` step
+        3b) -- once the producer body lifts into a TMA-load-warp-local
+        ``while``, the wrapping goes away because the lifted block runs
+        only on the TMA-load warp.
+
+        Recursion is intentionally one level deep: the K-loop is the
+        only top-level loop the role partitioner needs to reach into
+        today, and a one-level recursion keeps the code simple. If
+        future codegen places tagged statements inside nested loops the
+        recursion can be deepened then.
         """
         if not device_function.has_cute_tcgen05_tma_load_role_marks:
             return [self._PersistentRoleBlock(role_predicate=None, stmts=list(body))]
@@ -967,6 +989,14 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         current_shared: list[ast.stmt] = []
         current_tma_load: list[ast.stmt] = []
         tma_load_predicate = self._tcgen05_tma_load_role_predicate()
+        # Track every role-tag id the partitioner consumes so we can
+        # detect a registered tag that never landed in a role block --
+        # i.e. a top-level tag that was hoisted out of the work-tile
+        # body before the partitioner ran, or a tag buried in a
+        # container the recursion does not enter (anything other than
+        # a top-level ``for`` / ``while``). Either case would silently
+        # drop the role gate, so we assert below.
+        visited_tma_load_ids: set[int] = set()
 
         def flush_shared() -> None:
             if current_shared:
@@ -987,15 +1017,53 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                 )
                 current_tma_load.clear()
 
+        def wrap_nested_tma_load_in_for_or_while(stmt: ast.stmt) -> None:
+            """Walk a top-level ``for`` / ``while`` body; wrap tagged
+            children in ``if {role_predicate}: <child>``. Mutates the
+            loop body in place so the loop emits with role gating in
+            place of the original child."""
+            if not isinstance(stmt, (ast.For, ast.While)):
+                return
+            new_body: list[ast.stmt] = []
+            for child in stmt.body:
+                if device_function.is_cute_tcgen05_tma_load_role(child):
+                    visited_tma_load_ids.add(id(child))
+                    new_body.append(
+                        create(
+                            ast.If,
+                            test=expr_from_string(tma_load_predicate),
+                            body=[child],
+                            orelse=[],
+                        )
+                    )
+                else:
+                    new_body.append(child)
+            stmt.body = new_body
+
         for stmt in body:
             if device_function.is_cute_tcgen05_tma_load_role(stmt):
                 flush_shared()
+                visited_tma_load_ids.add(id(stmt))
                 current_tma_load.append(stmt)
             else:
                 flush_tma_load()
+                wrap_nested_tma_load_in_for_or_while(stmt)
                 current_shared.append(stmt)
         flush_shared()
         flush_tma_load()
+
+        registered_tma_load_ids = device_function.cute_tcgen05_tma_load_role_stmt_ids
+        missed_ids = registered_tma_load_ids - visited_tma_load_ids
+        assert not missed_ids, (
+            f"{len(missed_ids)} TMA-load role-tagged statement(s) were "
+            "registered but not visited by the role partitioner. Top-level "
+            "tagged stmts must also be per-tile-registered (otherwise the "
+            "splitter hoists them out of the work-tile body before the "
+            "partitioner runs); nested tagged stmts must be direct children "
+            "of a top-level ``for`` / ``while`` in the per-tile body (the "
+            "recursion is one level deep and does not enter ``if`` / other "
+            "containers)."
+        )
         return blocks
 
     def _extract_tcgen05_post_loop_stmts(

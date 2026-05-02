@@ -1142,6 +1142,127 @@ class TestCuteLowerings(unittest.TestCase):
                 code,
             )
 
+    def test_tcgen05_persistent_kloop_producer_wrapped_in_role_predicate(
+        self,
+    ) -> None:
+        """Pin the per-K-iter TMA producer block being wrapped in the
+        TMA-load warp role gate when the persistent + tcgen05 path is
+        active. The role partitioner recurses one level into the
+        K-loop body and wraps the tagged producer ``if`` in
+        ``if {tma_load_warp_predicate}: ...``. This is structural prep
+        for the role-local-while lift in ``cute_plan.md`` step 3b: the
+        tagged statement is now the lift target.
+
+        The wrapping is functionally redundant (the tagged ``if``
+        already contains the inline ``and tma_warp`` gate), so the
+        kernel must still produce identical output today. The lift in
+        step 3b drops the inline gate when the producer body moves
+        into a TMA-load-warp-local ``while``."""
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_persistent_role(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        args = (
+            torch.randn(128, 32, device=DEVICE, dtype=torch.float16),
+            torch.randn(32, 128, device=DEVICE, dtype=torch.float16),
+        )
+        support = SimpleNamespace(
+            supported_impls=("universal", "warp", "tcgen05"),
+            warp_f16bf16=True,
+            tcgen05_f16bf16=True,
+        )
+        with (
+            patch(
+                "helion._compiler.cute.cute_mma.get_cute_mma_support",
+                return_value=support,
+            ),
+            patch(
+                "helion._compiler.cute.mma_support.get_cute_mma_support",
+                return_value=support,
+            ),
+        ):
+            bound = cute_matmul_persistent_role.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            cfg = helion.Config(
+                block_sizes=[128, 128, 16],
+                l2_groupings=[1],
+                loop_orders=[[0, 1]],
+                num_stages=2,
+                num_warps=8,
+                pid_type="persistent_blocked",
+                tcgen05_cluster_m=1,
+                tcgen05_ab_stages=2,
+                tcgen05_acc_stages=2,
+                tcgen05_c_stages=2,
+                tcgen05_num_epi_warps=4,
+            )
+            code = bound.to_triton_code(cfg)
+        # The TMA-load warp predicate the partitioner uses for the
+        # role gate. The TMA-load warp id is 5 for the 8-warp,
+        # epi-warps=4 layout (epi=warps 0..3, exec=4, tma=5, ab-load=6,
+        # scheduler=7). This must match the inline gate text emitted
+        # by ``cute_mma.py`` so the redundancy is visible (and so the
+        # role-local lift in step 3b can drop the inline gate cleanly).
+        role_predicate = (
+            "cute.arch.make_warp_uniform(cute.arch.warp_idx()) == cutlass.Int32(5)"
+        )
+        # Structurally verify that the per-K-iter producer ``if`` is
+        # the body of an ``if {role_predicate}: ...`` that lives INSIDE
+        # a top-level ``for`` / ``while`` loop (the K-loop). A literal
+        # substring match would also accept the initial-prefetch role
+        # gate (which is wrapped at top level via the existing path,
+        # not via the new recursion), so the structural check is the
+        # only way to pin the new behavior added here.
+        tree = ast.parse(code)
+        found_in_loop = False
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.For, ast.While)):
+                continue
+            for child in node.body:
+                if not (
+                    isinstance(child, ast.If)
+                    and ast.unparse(child.test) == role_predicate
+                ):
+                    continue
+                # The wrapped child must be a single ``if`` whose test
+                # is the per-K-iter producer signature. The initial
+                # prefetch's role gate has multiple stmts inside (no
+                # outer ``if``), so this filters it out.
+                if len(child.body) != 1:
+                    continue
+                inner = child.body[0]
+                if not isinstance(inner, ast.If):
+                    continue
+                inner_test_src = ast.unparse(inner.test)
+                if (
+                    "tcgen05_tma_full_tile" in inner_test_src
+                    and "tcgen05_tma_warp" in inner_test_src
+                    and "tcgen05_tma_next_full_tile" in inner_test_src
+                ):
+                    found_in_loop = True
+                    break
+            if found_in_loop:
+                break
+        self.assertTrue(
+            found_in_loop,
+            "Expected the per-K-iter producer ``if`` to be the body of "
+            "an ``if {role_predicate}: ...`` inside a top-level "
+            "``for`` / ``while`` (the K-loop). This pins the role "
+            "partitioner's one-level recursion into the K-loop body. "
+            "Generated code:\n" + code,
+        )
+
     def test_tcgen05_persistent_multi_tile_runtime_guard(self) -> None:
         """Multi-tile + persistent + tcgen05 must raise ``RuntimeError``.
 
@@ -4040,10 +4161,11 @@ class TestPersistentLoopSplitter(unittest.TestCase):
             def register_cute_tcgen05_tma_load_role_stmts(
                 self, stmts: list[ast.AST]
             ) -> None:
-                for s in stmts:
-                    assert id(s) in self._per_tile_ids, (
-                        "TMA-load role stmts must be registered as per-tile first"
-                    )
+                # The real ``DeviceFunction`` accepts both top-level
+                # tagged statements (which must also be per-tile-registered)
+                # and tagged children inside a per-tile container (e.g.
+                # the K-loop body). The unit suite mirrors that: tag any
+                # statement, whether or not it's per-tile-registered.
                 self._tma_load_role_ids.update(id(s) for s in stmts)
 
             def is_cute_tcgen05_tma_load_role(self, stmt: ast.AST) -> bool:
@@ -4052,6 +4174,10 @@ class TestPersistentLoopSplitter(unittest.TestCase):
             @property
             def has_cute_tcgen05_tma_load_role_marks(self) -> bool:
                 return bool(self._tma_load_role_ids)
+
+            @property
+            def cute_tcgen05_tma_load_role_stmt_ids(self) -> frozenset[int]:
+                return frozenset(self._tma_load_role_ids)
 
         splitter = Tcgen05PersistentProgramIDs.__new__(Tcgen05PersistentProgramIDs)
         # The splitter walks ASTs looking for references to the
@@ -4254,6 +4380,86 @@ class TestPersistentLoopSplitter(unittest.TestCase):
             role_predicate="my_warp", stmts=[]
         )
         self.assertEqual(splitter._emit_role_block_stmts(empty_gated), [])
+
+    def test_role_blocks_recurse_into_top_level_for_loop(self) -> None:
+        """The role partitioner recurses one level into top-level
+        ``for`` / ``while`` loop bodies and wraps tagged children in
+        ``if {role_predicate}: <child>`` in place. The containing loop
+        stays in the shared block. This is structural prep for the
+        TMA-load role's role-local-while lift in ``cute_plan.md`` step
+        3b: today the per-K-iter producer ``if`` block lives inside
+        the K-loop body and gets wrapped by the recursion; step 3b
+        lifts it out as a separate top-level statement.
+        """
+        splitter, df = self._make_helper()
+        producer = self._stmt(
+            "if tma_full_tile and tma_warp:\n    tma_pipeline.producer_acquire(state)"
+        )
+        consumer = self._stmt(
+            "if tma_full_tile:\n"
+            "    if exec_active:\n"
+            "        tma_pipeline.consumer_wait(state)"
+        )
+        kloop = ast.parse("for k in range(K):\n    pass").body[0]
+        # Replace the dummy ``pass`` body with the real two child
+        # statements so we can tag the producer.
+        kloop.body = [producer, consumer]
+        # Tag only the producer; the consumer stays shared inside the
+        # loop body. The K-loop itself is not tagged -- it's a shared
+        # statement that contains a tagged child.
+        df.register_cute_tcgen05_tma_load_role_stmts([producer])
+        body = [kloop]
+        blocks = splitter._collect_tcgen05_role_blocks(df, body)
+        # Single shared block carrying the (mutated) K-loop.
+        self.assertEqual(len(blocks), 1)
+        self.assertIsNone(blocks[0].role_predicate)
+        self.assertIs(blocks[0].stmts[0], kloop)
+        # Producer is now wrapped with the role predicate; consumer
+        # stays naked.
+        self.assertEqual(len(kloop.body), 2)
+        wrapped = kloop.body[0]
+        self.assertIsInstance(wrapped, ast.If)
+        self.assertEqual(ast.unparse(wrapped.test), "__test_tma_load_warp__")
+        self.assertEqual(wrapped.body, [producer])
+        self.assertIs(kloop.body[1], consumer)
+
+    def test_role_blocks_recurse_into_top_level_while_loop(self) -> None:
+        """Same recursion behavior for ``while`` as for ``for``. This
+        future-proofs the partitioner in case codegen places tagged
+        statements inside a top-level ``while`` (e.g. a producer
+        loop driven by pipeline state rather than a static range)."""
+        splitter, df = self._make_helper()
+        producer = self._stmt("tma_pipeline.producer_acquire(state)")
+        wloop = ast.parse("while True:\n    pass").body[0]
+        wloop.body = [producer]
+        df.register_cute_tcgen05_tma_load_role_stmts([producer])
+        body = [wloop]
+        blocks = splitter._collect_tcgen05_role_blocks(df, body)
+        self.assertEqual(len(blocks), 1)
+        self.assertIsNone(blocks[0].role_predicate)
+        self.assertIs(blocks[0].stmts[0], wloop)
+        self.assertEqual(len(wloop.body), 1)
+        wrapped = wloop.body[0]
+        self.assertIsInstance(wrapped, ast.If)
+        self.assertEqual(ast.unparse(wrapped.test), "__test_tma_load_warp__")
+        self.assertEqual(wrapped.body, [producer])
+
+    def test_role_blocks_no_recurse_into_non_loop_top_level(self) -> None:
+        """Recursion is one level deep AND only into ``for`` / ``while``
+        statements -- NOT into ``if`` / function bodies / etc. The
+        partitioner asserts that every registered tag is consumed, so
+        registering a tag inside a non-loop container fails loudly
+        instead of silently dropping the role gate. This keeps the
+        contract narrow (only for/while are recursed into) and surfaces
+        bad registrations at compile time."""
+        splitter, df = self._make_helper()
+        inner = self._stmt("tma_pipeline.producer_acquire(state)")
+        outer_if = self._stmt("if some_predicate:\n    pass")
+        outer_if.body = [inner]
+        df.register_cute_tcgen05_tma_load_role_stmts([inner])
+        body = [outer_if]
+        with self.assertRaises(AssertionError):
+            splitter._collect_tcgen05_role_blocks(df, body)
 
     def test_virtual_pid_dependencies_are_traced_transitively(self) -> None:
         """The splitter walks each statement's name uses / defines and
