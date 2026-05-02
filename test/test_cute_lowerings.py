@@ -32,11 +32,17 @@ from helion._compiler.backend import _loop_contains_matmul
 from helion._compiler.backend import _loop_may_use_mma
 from helion._compiler.compile_environment import CompileEnvironment
 from helion._compiler.cute.argreduce import codegen_cute_tile_argreduce
+from helion._compiler.cute.cute_mma import _build_kloop_non_pipeline_producer_if
+from helion._compiler.cute.cute_mma import _build_kloop_non_pipeline_release_if
+from helion._compiler.cute.cute_mma import _build_kloop_pipeline_consumer_if
+from helion._compiler.cute.cute_mma import _build_kloop_pipeline_producer_if
+from helion._compiler.cute.cute_mma import _build_kloop_pipeline_release_if
 from helion._compiler.cute.cute_mma import _choose_mma_impl
 from helion._compiler.cute.cute_mma import _get_mma_k_loop_info
 from helion._compiler.cute.cute_mma import _make_tcgen05_layout_plan_setup
 from helion._compiler.cute.cute_mma import _mma_result_can_be_deferred
 from helion._compiler.cute.cute_mma import _new_tcgen05_layout_plan
+from helion._compiler.cute.cute_mma import _PerKiterTmaArgs
 from helion._compiler.cute.cute_mma import _tcgen05_ab_stage_count
 from helion._compiler.cute.cute_mma import _tcgen05_epi_warp_count
 from helion._compiler.cute.cute_mma import _tcgen05_root_m_threads
@@ -4505,6 +4511,215 @@ class TestPersistentLoopSplitter(unittest.TestCase):
             wrapped,
             [decompose_pid, decompose_pid_2, derive_m, derive_n, marked],
         )
+
+
+class TestPerKiterTmaBuilders(unittest.TestCase):
+    """AST shape tests for the per-K-iter TMA builders in ``cute_mma.py``."""
+
+    def _scalar_load_a(self) -> ast.stmt:
+        return ast.parse("if mma_active:\n    smem_a[r, c] = lhs[g]").body[0]
+
+    def _scalar_load_b(self) -> ast.stmt:
+        return ast.parse("if mma_active:\n    smem_b[r, c] = rhs[g]").body[0]
+
+    def _make_args(
+        self,
+        *,
+        cluster_m: int = 1,
+        is_two_cta: bool = False,
+        use_tma_a: bool = True,
+        use_tma_b: bool = True,
+    ) -> _PerKiterTmaArgs:
+        return _PerKiterTmaArgs(
+            tma_pipeline="ab_pipeline",
+            tma_producer_state="ab_producer_state",
+            tma_consumer_state="ab_consumer_state",
+            tma_producer_try_token="ab_producer_try_token",
+            tma_consumer_try_token="ab_consumer_try_token",
+            tma_barrier_ptr="tma_barrier_ptr",
+            tma_full_tile="full_tile",
+            tma_next_full_tile="next_full_tile",
+            tma_warp="tma_warp",
+            tma_atom_a="tma_atom_a",
+            tma_atom_b="tma_atom_b",
+            tma_gA="gA",
+            tma_gB="gB",
+            tma_sA="sA",
+            tma_sB="sB",
+            tma_k_tile="tma_k_tile",
+            tma_a_mcast_mask="a_mcast_mask",
+            tma_b_mcast_mask="b_mcast_mask",
+            ab_stage_count=2,
+            cluster_m=cluster_m,
+            is_two_cta=is_two_cta,
+            use_tma_a=use_tma_a,
+            use_tma_b=use_tma_b,
+            exec_active="exec_active",
+            scalar_load_a=self._scalar_load_a(),
+            scalar_load_b=self._scalar_load_b(),
+        )
+
+    @staticmethod
+    def _stmt_kinds(stmts: list[ast.stmt]) -> list[str]:
+        kinds = []
+        for stmt in stmts:
+            if isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call):
+                func = stmt.value.func
+                if isinstance(func, ast.Attribute):
+                    kinds.append(func.attr)
+                elif isinstance(func, ast.Name):
+                    kinds.append(func.id)
+                else:
+                    kinds.append(type(func).__name__)
+            elif (
+                isinstance(stmt, ast.Assign)
+                and isinstance(stmt.value, ast.Call)
+                and isinstance(stmt.value.func, ast.Attribute)
+            ):
+                kinds.append(f"={stmt.value.func.attr}")
+            else:
+                kinds.append(type(stmt).__name__)
+        return kinds
+
+    def test_pipeline_producer_if_predicate_and_body(self) -> None:
+        args = self._make_args()
+        node = _build_kloop_pipeline_producer_if(args)
+        self.assertIsInstance(node, ast.If)
+        self.assertEqual(
+            ast.unparse(node.test),
+            "full_tile and tma_warp and next_full_tile",
+        )
+        # Body must follow the prefetch protocol: try_acquire (token
+        # assign), acquire, get_barrier (assign), copy A, copy B,
+        # commit, advance.
+        self.assertEqual(
+            self._stmt_kinds(node.body),
+            [
+                "=producer_try_acquire",
+                "producer_acquire",
+                "=producer_get_barrier",
+                "copy",
+                "copy",
+                "producer_commit",
+                "advance",
+            ],
+        )
+        # Both cute.copy calls index the prefetch slot
+        # (tma_k_tile + ab_stage_count == 2).
+        body_src = ast.unparse(ast.Module(body=node.body, type_ignores=[]))
+        self.assertIn("tma_k_tile + cutlass.Int32(2)", body_src)
+
+    def test_pipeline_consumer_if_predicate_and_body(self) -> None:
+        args = self._make_args()
+        node = _build_kloop_pipeline_consumer_if(args)
+        self.assertIsInstance(node, ast.If)
+        self.assertEqual(ast.unparse(node.test), "full_tile")
+        # Full-tile branch is one inner ``if exec_active:`` with
+        # consumer_try_wait + consumer_wait.
+        self.assertEqual(len(node.body), 1)
+        inner = node.body[0]
+        self.assertIsInstance(inner, ast.If)
+        self.assertEqual(ast.unparse(inner.test), "exec_active")
+        self.assertEqual(
+            self._stmt_kinds(inner.body),
+            ["=consumer_try_wait", "consumer_wait"],
+        )
+        # Partial-tile fallback is scalar loads + sync_threads.
+        orelse_src = ast.unparse(ast.Module(body=node.orelse, type_ignores=[]))
+        self.assertIn("smem_a", orelse_src)
+        self.assertIn("smem_b", orelse_src)
+        self.assertIn("cute.arch.sync_threads", orelse_src)
+
+    def test_pipeline_release_if_predicate_and_body(self) -> None:
+        args = self._make_args()
+        node = _build_kloop_pipeline_release_if(args)
+        self.assertIsInstance(node, ast.If)
+        self.assertEqual(ast.unparse(node.test), "full_tile")
+        self.assertEqual(len(node.body), 1)
+        inner = node.body[0]
+        self.assertIsInstance(inner, ast.If)
+        self.assertEqual(ast.unparse(inner.test), "exec_active")
+        # Producer-state advance lives in the producer block, not here.
+        self.assertEqual(
+            self._stmt_kinds(inner.body),
+            ["consumer_release", "advance"],
+        )
+        body_src = ast.unparse(ast.Module(body=inner.body, type_ignores=[]))
+        self.assertIn("ab_consumer_state.advance", body_src)
+        self.assertNotIn("ab_producer_state.advance", body_src)
+
+    def test_non_pipeline_release_advances_both_states(self) -> None:
+        args = self._make_args()
+        node = _build_kloop_non_pipeline_release_if(args)
+        self.assertIsInstance(node, ast.If)
+        self.assertEqual(ast.unparse(node.test), "full_tile")
+        # Single-stage: CTA sync, then exec-warp release, then BOTH
+        # producer + consumer state advance.
+        self.assertEqual(
+            self._stmt_kinds(node.body),
+            ["sync_threads", "If", "advance", "advance"],
+        )
+        body_src = ast.unparse(ast.Module(body=node.body, type_ignores=[]))
+        self.assertIn("ab_producer_state.advance", body_src)
+        self.assertIn("ab_consumer_state.advance", body_src)
+        self.assertIn("consumer_release", body_src)
+
+    def test_producer_skips_copy_when_operand_not_tma_loaded(self) -> None:
+        # The pipelined producer asserts both flags True, so this only
+        # exercises the non-pipelined branch.
+        args_a_only = self._make_args(use_tma_a=True, use_tma_b=False)
+        body_src_a_only = ast.unparse(
+            ast.Module(
+                body=_build_kloop_non_pipeline_producer_if(args_a_only).body,
+                type_ignores=[],
+            )
+        )
+        self.assertIn("cute.copy(tma_atom_a", body_src_a_only)
+        self.assertNotIn("cute.copy(tma_atom_b", body_src_a_only)
+
+        args_b_only = self._make_args(use_tma_a=False, use_tma_b=True)
+        body_src_b_only = ast.unparse(
+            ast.Module(
+                body=_build_kloop_non_pipeline_producer_if(args_b_only).body,
+                type_ignores=[],
+            )
+        )
+        self.assertNotIn("cute.copy(tma_atom_a", body_src_b_only)
+        self.assertIn("cute.copy(tma_atom_b", body_src_b_only)
+
+    def test_mcast_mask_asymmetry_between_a_and_b(self) -> None:
+        # A only multicasts in 2-CTA mode; B multicasts on cluster_m>1
+        # OR 2-CTA. Pin the asymmetry on both producer builders.
+        for builder in (
+            _build_kloop_pipeline_producer_if,
+            _build_kloop_non_pipeline_producer_if,
+        ):
+            single = ast.unparse(
+                ast.Module(
+                    body=builder(self._make_args(cluster_m=1, is_two_cta=False)).body,
+                    type_ignores=[],
+                )
+            )
+            self.assertNotIn("a_mcast_mask", single)
+            self.assertNotIn("b_mcast_mask", single)
+
+            clustered = ast.unparse(
+                ast.Module(
+                    body=builder(self._make_args(cluster_m=2, is_two_cta=False)).body,
+                    type_ignores=[],
+                )
+            )
+            self.assertNotIn("a_mcast_mask", clustered)
+            self.assertIn("b_mcast_mask", clustered)
+
+            two_cta = ast.unparse(
+                ast.Module(
+                    body=builder(self._make_args(cluster_m=2, is_two_cta=True)).body,
+                    type_ignores=[],
+                )
+            )
+            self.assertIn("a_mcast_mask", two_cta)
+            self.assertIn("b_mcast_mask", two_cta)
 
 
 if __name__ == "__main__":
