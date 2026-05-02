@@ -2518,6 +2518,21 @@ def _tcgen05_epi_warp_count(config: object, *, cta_thread_count: int) -> int:
     ``tcgen05_num_epi_warps`` autotune knob (default 4). The other roles
     (one MMA exec warp + one A/B load warp) are added on top of this in
     ``CuteTcgen05MatmulPlan.role_warp_count``.
+
+    Today the only correct value for the SIMT-store epilogue is 4: the
+    CUTLASS ``epilogue_tmem_copy_and_partition`` helper uses
+    ``tmem_warp_shape_mn = (4, 1)`` for every supported tcgen05 path,
+    which hard-codes a 4-warp t2r partition; the hardware ``tcgen05.ld``
+    is per-warp so the partition is uncoverable by fewer warps. Both
+    the autotune search and ``Config.normalize()`` validation are
+    pinned to ``(4,)`` via
+    ``ConfigSpec.narrow_tcgen05_autotune_to_validated_configs``;
+    ``_codegen_cute_store_tcgen05_tile`` raises ``BackendUnsupported``
+    if a value other than 4 still slips through. The 1 / 2 branches
+    will only become meaningful when item 2's multi-warp epilogue
+    (c_pipeline SMEM ring + TMA bulk store) lands and lets the t2r
+    side keep its 4-warp partition independent of how many warps drive
+    the GMEM store. See ``cute_plan.md`` Section 2.
     """
     cta_warp_count = max(1, cta_thread_count // 32)
     return min(
