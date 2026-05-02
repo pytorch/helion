@@ -208,9 +208,7 @@ class CuteTcgen05StoreValue:
     epi_acc_frag_base: str = ""
     epi_tidx: str = ""
     epi_active: str = ""
-    epi_leader: str = ""
     exec_active: str = ""
-    exec_leader: str = ""
     epi_tile: str = ""
     c_stage_count: int = 0
     epilog_sync_barrier_id: int = 0
@@ -236,7 +234,29 @@ class CuteTcgen05StoreValue:
 
 @dataclasses.dataclass(frozen=True)
 class CuteTcgen05MatmulPlan:
-    """Kernel-wide tcgen05 collective contract selected by CuTe matmul codegen."""
+    """Kernel-wide tcgen05 collective contract selected by CuTe matmul codegen.
+
+    Warp-role layout in the launched CTA:
+
+    - ``epi_warp_count`` epilogue warps starting at warp 0
+    - one MMA exec warp at ``exec_warp_id``
+    - one A/B load warp at ``tma_warp_id`` -- doubles as the TMA warp and,
+      in the persistent path, also owns the tile scheduler
+
+    ``ab_load_warp_count`` is currently always 1; the field is kept so the
+    role layout / launch shape continues to plumb through if a future
+    role-local persistent rewrite splits TMA load and A/B prefetch onto
+    separate warps.
+
+    Earlier revisions tracked separate ``has_scheduler_warp`` /
+    ``has_epi_load_warp`` flags. Neither role was wired to actual work --
+    the persistent scheduler always rode on the TMA warp, and the epilogue
+    load was folded into the consumer epi warps. Removing those flags drops
+    two dead warps from the launched block (saving register budget for the
+    real consumer warps) and simplifies the autotune search space. When
+    role-local persistent loops land, the dedicated roles can come back as
+    real launch dimensions instead of placeholders.
+    """
 
     bm: int
     bn: int
@@ -250,8 +270,6 @@ class CuteTcgen05MatmulPlan:
     c_stage_count: int
     epi_warp_count: int
     ab_load_warp_count: int
-    has_scheduler_warp: bool
-    has_epi_load_warp: bool
 
     @property
     def exec_warp_id(self) -> int:
@@ -270,41 +288,21 @@ class CuteTcgen05MatmulPlan:
         return self.ab_load_warp_begin
 
     @property
-    def epi_load_warp_id(self) -> int | None:
-        if self.has_epi_load_warp:
-            return self.ab_load_warp_end
-        return None
-
-    @property
-    def scheduler_warp_id(self) -> int | None:
-        if self.has_scheduler_warp:
-            return self.ab_load_warp_end + int(self.has_epi_load_warp)
-        return None
-
-    @property
     def persistent_scheduler_owner_warp_id(self) -> int:
-        # The current persistent path still wraps the whole tcgen05 body, so the
-        # scheduler owner must also participate in CTA-wide producer syncs.
-        # Move this to scheduler_warp_id when role-local loops own scheduling.
+        # Persistent scheduling rides on the TMA warp because the current
+        # tcgen05 body still uses one CTA-wide ``while``: the scheduler owner
+        # has to be inside the same producer sync structure as the TMA load
+        # warp. Once role-local loops land this can move onto a dedicated
+        # scheduler warp.
         return self.tma_warp_id
 
     @property
     def role_warp_count(self) -> int:
-        return (
-            self.epi_warp_count
-            + 1
-            + self.ab_load_warp_count
-            + int(self.has_epi_load_warp)
-            + int(self.has_scheduler_warp)
-        )
-
-    @property
-    def compact_role_warp_count(self) -> int:
-        return 1 << max(self.role_warp_count - 1, 0).bit_length()
+        return self.epi_warp_count + 1 + self.ab_load_warp_count
 
     @property
     def block_shape(self) -> tuple[int, int, int]:
-        return (self.physical_m_threads, self.compact_role_warp_count, 1)
+        return (self.physical_m_threads, self.role_warp_count, 1)
 
 
 _sort_order: dict[type[Argument], int] = {

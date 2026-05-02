@@ -219,15 +219,20 @@ jobs:
         run: |
           source .venv/bin/activate
           SETUPTOOLS_SCM_PRETEND_VERSION="0.0.0" uv pip install --prerelease=allow .'[cute-cu13]'
-          # The PyPI nvidia-cutlass-dsl-libs-base and -libs-cu13 wheels both
-          # ship cutlass/cute/tensor.py with conflicting content: libs-base's
-          # tensor.py imports cvt_f4e2m1_f16_intrinsic from .arch, which
-          # exists in libs-base's arch/numeric_conversion.py but not in
-          # cu13's. When uv resolves the install order non-deterministically
-          # and libs-base wins on disk, `import cutlass.cute` raises
-          # ImportError. Force-reinstall cu13 last so cu13's tensor.py
-          # (which only imports the symbols both wheels have) wins.
-          uv pip install --prerelease=allow --reinstall nvidia-cutlass-dsl-libs-cu13
+          # The PyPI nvidia-cutlass-dsl-libs-base and -libs-cu13 wheels ship
+          # several Python files (tensor.py, algorithm.py, _nvvm_enum_gen.py,
+          # nvvm_wrappers.py, ...) at the same install path with conflicting
+          # content. cu13's versions are the ones that actually match the
+          # cu13 binary; libs-base's versions either reference symbols
+          # missing from cu13's arch (cvt_f4e2m1_f16_intrinsic) or use the
+          # pre-list-API ``cute.gemm`` signature. When uv's first pass
+          # resolves both in non-deterministic order and libs-base wins on
+          # disk, every cute test crashes (ImportError, AttributeError on
+          # nvvm.VoteSyncKind, AttributeError on ``a.shape`` from gemm).
+          # Force-reinstall cu13 *with --no-deps* so uv doesn't drag
+          # libs-base back in afterwards — that cu13-only step is the last
+          # writer, so its files win on disk.
+          uv pip install --prerelease=allow --reinstall --no-deps nvidia-cutlass-dsl-libs-cu13
 
       - name: CUDA Compute Check
         if: startsWith(matrix.image, 'nvidia')

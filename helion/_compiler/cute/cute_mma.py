@@ -888,8 +888,6 @@ def _emit_mma_pipeline(
     warp_idx: str | None = None
     lane_idx: str | None = None
     epi_active: str | None = None
-    epi_leader: str | None = None
-    exec_leader: str | None = None
     epi_tidx: str | None = None
     mma_phys_n = _mma_active_n_threads(mma_impl)
     mma_physical_m_threads = _grid_thread_extent(cg, m_block_id)
@@ -933,11 +931,7 @@ def _emit_mma_pipeline(
     (
         tcgen05_epi_warp_count_value,
         tcgen05_ab_load_warp_count_value,
-        tcgen05_has_scheduler_warp,
-        tcgen05_has_epi_load_warp,
-    ) = _tcgen05_role_layout(
-        df.config, bn=bn, cta_thread_count=tcgen05_cta_thread_count
-    )
+    ) = _tcgen05_role_layout(df.config, cta_thread_count=tcgen05_cta_thread_count)
     tcgen05_acc_pipeline_arrive_count_value = _tcgen05_pipeline_arrive_count(
         tcgen05_cta_thread_count, tcgen05_epi_warp_count_value
     )
@@ -959,8 +953,6 @@ def _emit_mma_pipeline(
             c_stage_count=tcgen05_c_stage_count_value,
             epi_warp_count=tcgen05_epi_warp_count_value,
             ab_load_warp_count=tcgen05_ab_load_warp_count_value,
-            has_scheduler_warp=tcgen05_has_scheduler_warp,
-            has_epi_load_warp=tcgen05_has_epi_load_warp,
         )
         candidate_block_shape = tcgen05_matmul_plan.block_shape
         df.register_cute_tcgen05_matmul_plan(tcgen05_matmul_plan)
@@ -998,11 +990,7 @@ def _emit_mma_pipeline(
         warp_idx = df.new_var("tcgen05_warp_idx")
         lane_idx = df.new_var("tcgen05_lane_idx")
         epi_active = df.new_var("tcgen05_epi_active")
-        epi_leader = df.new_var("tcgen05_epi_leader")
-        exec_leader = df.new_var("tcgen05_exec_leader")
         tcgen05_ab_load_active = df.new_var("tcgen05_ab_load_active")
-        tcgen05_epi_load_warp = df.new_var("tcgen05_epi_load_warp")
-        tcgen05_scheduler_warp = df.new_var("tcgen05_scheduler_warp")
         epi_tidx = df.new_var("tcgen05_epi_tidx")
         prefix.append(
             statement_from_string(
@@ -1047,38 +1035,10 @@ def _emit_mma_pipeline(
                     f"and {warp_idx} < cutlass.Int32({tcgen05_matmul_plan.ab_load_warp_end})"
                 )
             )
-            epi_load_warp_id = tcgen05_matmul_plan.epi_load_warp_id
-            prefix.append(
-                statement_from_string(
-                    f"{tcgen05_epi_load_warp} = "
-                    + (
-                        f"{warp_idx} == cutlass.Int32({epi_load_warp_id})"
-                        if epi_load_warp_id is not None
-                        else "False"
-                    )
-                )
-            )
-            scheduler_warp_id = tcgen05_matmul_plan.scheduler_warp_id
-            prefix.append(
-                statement_from_string(
-                    f"{tcgen05_scheduler_warp} = "
-                    + (
-                        f"{warp_idx} == cutlass.Int32({scheduler_warp_id})"
-                        if scheduler_warp_id is not None
-                        else "False"
-                    )
-                )
-            )
             prefix.append(
                 statement_from_string(
                     f"{tcgen05_plan.exec_active} = "
                     f"{warp_idx} == cutlass.Int32({tcgen05_matmul_plan.exec_warp_id})"
-                )
-            )
-            prefix.append(
-                statement_from_string(
-                    f"{exec_leader} = "
-                    f"{tcgen05_plan.exec_active} and {lane_idx} == cutlass.Int32(0)"
                 )
             )
             prefix.append(
@@ -1088,32 +1048,32 @@ def _emit_mma_pipeline(
                 )
             )
             prefix.append(
-                statement_from_string(f"{epi_leader} = {warp_idx} == cutlass.Int32(0)")
-            )
-            prefix.append(
                 statement_from_string(
                     f"{epi_tidx} = {lane_idx} + {warp_idx} * cutlass.Int32(32)"
                     f" if {epi_active} else cutlass.Int32(0)"
                 )
             )
-            # Register reallocation: producer warps (TMA, ab_load, scheduler)
-            # decrease their per-thread register budget so the consumer warps
-            # (exec, epi, epi_load) can be raised. Matches Quack's sm100 split.
-            # The setmaxregister calls are warp-uniform and must precede the
-            # first pipeline op of each role; placing them with the role-gate
-            # invariants keeps them out of the per-tile work loop.
+            # Register reallocation: consumer warps (exec MMA + epilogue
+            # warps) request a larger per-thread register budget; the
+            # producer warps (TMA load, A/B load) drop to the producer
+            # budget. The "not consumer" form is just a more compact
+            # spelling of "tma_warp or ab_load_active"; both are
+            # equivalent now that the launched CTA has no idle padding
+            # warps. Matches Quack's sm100 split. The setmaxregister
+            # calls are warp-uniform and must precede the first pipeline
+            # op of each role; placing them with the role-gate invariants
+            # keeps them out of the per-tile work loop.
+            consumer_predicate = f"{tcgen05_plan.exec_active} or {epi_active}"
             prefix.append(
                 statement_from_string(
-                    f"if {tma_warp} or {tcgen05_ab_load_active} or "
-                    f"{tcgen05_scheduler_warp}:\n"
+                    f"if not ({consumer_predicate}):\n"
                     f"    cute.arch.setmaxregister_decrease("
                     f"cutlass.Int32({_TCGEN05_PRODUCER_REGS}))"
                 )
             )
             prefix.append(
                 statement_from_string(
-                    f"if {tcgen05_plan.exec_active} or {epi_active} or "
-                    f"{tcgen05_epi_load_warp}:\n"
+                    f"if {consumer_predicate}:\n"
                     f"    cute.arch.setmaxregister_increase("
                     f"cutlass.Int32({_TCGEN05_CONSUMER_REGS}))"
                 )
@@ -2175,8 +2135,6 @@ def _emit_mma_pipeline(
         assert tcgen05_plan is not None
         assert epi_tidx is not None
         assert epi_active is not None
-        assert epi_leader is not None
-        assert exec_leader is not None
         assert tma_warp is not None
         df.register_cute_tcgen05_store_value(
             result_var,
@@ -2191,9 +2149,7 @@ def _emit_mma_pipeline(
                 epi_acc_frag_base=tcgen05_epi_acc_frag_base,
                 epi_tidx=epi_tidx,
                 epi_active=epi_active,
-                epi_leader=epi_leader,
                 exec_active=tcgen05_plan.exec_active,
-                exec_leader=exec_leader,
                 epi_tile=tcgen05_plan.epi_tile,
                 c_stage_count=tcgen05_c_stage_count_value,
                 epilog_sync_barrier_id=_tcgen05_epilog_sync_barrier_id(),
@@ -2303,13 +2259,6 @@ def _tcgen05_config_int(config: object, key: str, default: int) -> int:
     return value
 
 
-def _tcgen05_config_bool(config: object, key: str, default: bool) -> bool:
-    value = cast("_ConfigLike", config).get(key, default)
-    if not isinstance(value, bool):
-        return default
-    return value
-
-
 def _tcgen05_cluster_m(config: object) -> int:
     return max(1, min(2, _tcgen05_config_int(config, "tcgen05_cluster_m", 1)))
 
@@ -2325,31 +2274,20 @@ def _tcgen05_use_2cta_instrs(*, bm: int, cluster_m: int) -> bool:
 def _tcgen05_role_layout(
     config: object,
     *,
-    bn: int,
     cta_thread_count: int,
-) -> tuple[int, int, bool, bool]:
+) -> tuple[int, int]:
+    """Pick the warp-role split for a tcgen05 matmul kernel.
+
+    The current lowering has a single TMA / A-B load warp; widening this
+    is gated on the role-local persistent-loop refactor (see
+    ``cute_plan.md``). Until then ``ab_load_warp_count`` is always 1.
+    """
     cta_warp_count = max(1, cta_thread_count // 32)
     epi_warp_count = min(
         cta_warp_count,
         max(1, _tcgen05_config_int(config, "tcgen05_num_epi_warps", 4)),
     )
-    ab_load_warp_count = min(1, max(1, cta_warp_count - epi_warp_count - 1))
-    extra_warps = max(0, cta_warp_count - epi_warp_count - 1 - ab_load_warp_count)
-    want_epi_load_warp = _tcgen05_config_bool(
-        config, "tcgen05_has_epi_load_warp", bn >= 128
-    )
-    has_epi_load_warp = want_epi_load_warp and extra_warps >= 1
-    extra_warps -= int(has_epi_load_warp)
-    want_scheduler_warp = _tcgen05_config_bool(
-        config,
-        "tcgen05_has_scheduler_warp",
-        bn >= 128
-        or str(cast("_ConfigLike", config).get("pid_type", "")).startswith(
-            "persistent"
-        ),
-    )
-    has_scheduler_warp = want_scheduler_warp and extra_warps >= 1
-    return epi_warp_count, ab_load_warp_count, has_scheduler_warp, has_epi_load_warp
+    return epi_warp_count, 1
 
 
 def _mma_impl_matches_problem_shape(

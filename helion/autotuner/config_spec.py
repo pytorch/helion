@@ -112,8 +112,6 @@ _BASE_BACKEND_TUNABLE_KEYS: frozenset[str] = frozenset(
         "tcgen05_acc_stages",
         "tcgen05_c_stages",
         "tcgen05_num_epi_warps",
-        "tcgen05_has_scheduler_warp",
-        "tcgen05_has_epi_load_warp",
     }
 )
 
@@ -189,8 +187,6 @@ CUTE_TCGEN05_TUNABLE_KEYS: tuple[str, ...] = (
     "tcgen05_acc_stages",
     "tcgen05_c_stages",
     "tcgen05_num_epi_warps",
-    "tcgen05_has_scheduler_warp",
-    "tcgen05_has_epi_load_warp",
 )
 
 
@@ -440,8 +436,6 @@ class ConfigSpec:
             "tcgen05_acc_stages": IntegerFragment(1, 2, 2),
             "tcgen05_c_stages": EnumFragment((2, 4)),
             "tcgen05_num_epi_warps": IntegerFragment(1, 4, 4),
-            "tcgen05_has_scheduler_warp": EnumFragment((True, False)),
-            "tcgen05_has_epi_load_warp": EnumFragment((True, False)),
         }
 
     @staticmethod
