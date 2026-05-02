@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import logging
+import operator
 import textwrap
 from typing import TYPE_CHECKING
 
@@ -482,7 +483,10 @@ def _cute_index_exprs(
                         return begin_var
                     if isinstance(origin_info.origin, TileEndOrigin):
                         if loop_info is not None and loop_info.end_var_name is not None:
-                            return loop_info.end_var_name
+                            return env.backend.minimum_expr(
+                                f"({begin_var}) + ({block_size_var})",
+                                loop_info.end_var_name,
+                            )
                         return f"({begin_var}) + ({block_size_var})"
                     if isinstance(origin_info.origin, TileCountOrigin):
                         end_var = (
@@ -1334,12 +1338,29 @@ def _(state: CodegenState) -> ast.AST:
         tensor=tensor,
         inactive_singleton_slice_expr="0",
     )
+    topk_lane_expr: object | None = None
+    topk_k: object | None = None
+    if state.fx_node is not None and len(state.fx_node.args) > 2:
+        value_node = state.fx_node.args[2]
+        if (
+            isinstance(value_node, torch.fx.Node)
+            and value_node.target is operator.getitem
+            and isinstance(value_node.args[0], torch.fx.Node)
+            and value_node.args[0].target is torch.ops.aten.topk.default
+        ):
+            topk_lane_expr = value_node.args[0].meta.get("cute_topk_lane_expr")
+            topk_k = value_node.args[0].meta.get("cute_topk_k")
+    if isinstance(topk_lane_expr, str) and isinstance(topk_k, int):
+        index_exprs[-1] = topk_lane_expr
     index_tuple = _cute_index_tuple(index_exprs)
     assign_expr = expr_from_string(
         f"{tensor_name}.__setitem__({index_tuple}, {{value}})", value=value
     )
 
     mask_expr = _cute_combined_mask(state, subscript, extra_mask, tensor=tensor)
+    if isinstance(topk_lane_expr, str) and isinstance(topk_k, int):
+        topk_mask = f"({topk_lane_expr}) < {topk_k}"
+        mask_expr = topk_mask if mask_expr is None else f"({mask_expr}) and {topk_mask}"
     if mask_expr is None:
         return assign_expr
     return expr_from_string(
@@ -1668,6 +1689,35 @@ def _(state: CodegenState) -> object:
     )
     load_expr = f"{tensor_name}[{', '.join(index_exprs)}]"
     mask_expr = _cute_combined_mask(state, subscript, extra_mask, tensor=tensor)
+    if state.fx_node is not None and any(
+        user.target in (torch.ops.aten.sort.default, torch.ops.aten.topk.default)
+        for user in state.fx_node.users
+    ):
+        from .._compiler.cute.indexing import CuteSortableLoad
+
+        tensor_dim = 0
+        sort_index_pos = -1
+        for idx in subscript:
+            if idx is None:
+                continue
+            if tensor_dim == tensor.ndim - 1:
+                sort_index_pos = tensor_dim
+                break
+            tensor_dim += 1
+        if sort_index_pos < 0:
+            raise exc.BackendUnsupported("cute", "sort/topk input rank")
+        return CuteSortableLoad(
+            expr=expr_from_string(
+                load_expr
+                if mask_expr is None
+                else f"({load_expr} if {mask_expr} else {CompileEnvironment.current().backend.dtype_str(tensor.dtype)}(0))"
+            ),
+            tensor_name=tensor_name,
+            index_exprs=tuple(index_exprs),
+            sort_index_pos=sort_index_pos,
+            mask_expr=mask_expr,
+            dtype=tensor.dtype,
+        )
     if mask_expr is None:
         return expr_from_string(load_expr)
     zero = CompileEnvironment.current().backend.dtype_str(tensor.dtype)

@@ -33,10 +33,12 @@ from helion._testing import skipIfPyTorchBaseVerLessThan
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfTileIR
 from helion._testing import skipUnlessTensorDescriptor
+from helion._testing import xfailIfCute
 import helion.language as hl
+from helion.runtime.settings import _get_backend
 
 
-@onlyBackends(["triton"])
+@onlyBackends(["triton", "cute"])
 class TestMisc(RefEagerTestBase, TestCase):
     def test_binary_operation_duplicate_args(self):
         """Test case to reproduce issue #221: binary operations with duplicate tensor references"""
@@ -297,6 +299,8 @@ class TestMisc(RefEagerTestBase, TestCase):
         Previously, the cast could be hoisted/ignored leading to FP32 p fed into BF16 v.
         This test ensures kernel runs and matches reference with BF16 inputs.
         """
+        if _get_backend() == "cute":
+            pytest.xfail("CUTe reduction codegen exceeds shared memory")
 
         @helion.kernel(autotune_effort="none", dot_precision=get_test_dot_precision())
         def kernel(
@@ -519,7 +523,8 @@ class TestMisc(RefEagerTestBase, TestCase):
         )
         torch.testing.assert_close(result, (inp_tuple[0] + inp_tuple[1][:, :30]) * 3)
 
-        self.assertNotEqualCode(code_pointer, code_block)
+        if _get_backend() == "triton":
+            self.assertNotEqualCode(code_pointer, code_block)
 
     @skipUnlessTensorDescriptor("Tensor descriptor support is required")
     def test_tuple_literal_subscript_w_descriptor(self):
@@ -744,8 +749,9 @@ class TestMisc(RefEagerTestBase, TestCase):
         code, result = code_and_output(foo, (x, 16))
         expected = torch.full([64], 17, dtype=torch.int32, device=DEVICE)
         torch.testing.assert_close(result, expected)
-        # Verify that tl.full is used for the constant
-        self.assertIn("tl.full([], 16", code)
+        if _get_backend() == "triton":
+            # Verify that tl.full is used for the constant
+            self.assertIn("tl.full([], 16", code)
 
     def test_torch_sort_in_kernel(self):
         """Test that torch.sort works inside Helion kernels.
@@ -771,7 +777,8 @@ class TestMisc(RefEagerTestBase, TestCase):
         ref_vals, ref_indices = torch.sort(x, dim=-1, descending=True)
         torch.testing.assert_close(vals, ref_vals)
         torch.testing.assert_close(indices, ref_indices)
-        self.assertIn("tl.sort", code)
+        if _get_backend() == "triton":
+            self.assertIn("tl.sort", code)
 
     def test_torch_sort_ascending(self):
         """Test torch.sort with ascending order (descending=False)."""
@@ -793,8 +800,10 @@ class TestMisc(RefEagerTestBase, TestCase):
         ref_vals, ref_indices = torch.sort(x, dim=-1, descending=False)
         torch.testing.assert_close(vals, ref_vals)
         torch.testing.assert_close(indices, ref_indices)
-        self.assertIn("tl.sort", code)
+        if _get_backend() == "triton":
+            self.assertIn("tl.sort", code)
 
+    @xfailIfCute("CUTe does not lower associative scan yet")
     def test_torch_sort_then_cumsum(self):
         """Test that torch.sort result can be used as input to torch.cumsum.
 
@@ -822,8 +831,9 @@ class TestMisc(RefEagerTestBase, TestCase):
         ref_vals, _ = torch.sort(x, dim=-1, descending=True)
         ref_cumsum = torch.cumsum(ref_vals, dim=-1)
         torch.testing.assert_close(result, ref_cumsum)
-        self.assertIn("tl.sort", code)
-        self.assertIn("tl.associative_scan", code)
+        if _get_backend() == "triton":
+            self.assertIn("tl.sort", code)
+            self.assertIn("tl.associative_scan", code)
 
     def test_torch_sort_skips_argsort_when_indices_unused(self):
         """Test that sort skips O(N^2) argsort when indices are not used.
@@ -848,9 +858,10 @@ class TestMisc(RefEagerTestBase, TestCase):
 
         ref_vals, _ = torch.sort(x, dim=-1, descending=True)
         torch.testing.assert_close(result, ref_vals)
-        self.assertIn("tl.sort", code)
-        # Argsort rank computation should NOT be present
-        self.assertNotIn("tl.sum(tl.where(", code)
+        if _get_backend() == "triton":
+            self.assertIn("tl.sort", code)
+            # Argsort rank computation should NOT be present
+            self.assertNotIn("tl.sum(tl.where(", code)
 
         # Contrast: when indices ARE used, argsort code must be generated
         @helion.kernel()
@@ -870,9 +881,11 @@ class TestMisc(RefEagerTestBase, TestCase):
         ref_vals2, ref_idx2 = torch.sort(x, dim=-1, descending=True)
         torch.testing.assert_close(vals2, ref_vals2)
         torch.testing.assert_close(idx2, ref_idx2)
-        # Argsort rank computation SHOULD be present when indices are used
-        self.assertIn("tl.sum(tl.where(", code2)
+        if _get_backend() == "triton":
+            # Argsort rank computation SHOULD be present when indices are used
+            self.assertIn("tl.sum(tl.where(", code2)
 
+    @xfailIfCute("CUTe does not lower associative scan yet")
     def test_cumsum_does_not_alias_input(self):
         """Regression test: torch.cumsum output must not alias its input.
 
@@ -925,8 +938,9 @@ class TestMisc(RefEagerTestBase, TestCase):
         ref_vals, ref_indices = torch.topk(x, k, dim=-1, largest=True)
         torch.testing.assert_close(vals, ref_vals)
         torch.testing.assert_close(indices, ref_indices)
-        # Uses tl.topk for largest=True
-        self.assertIn("tl.topk", code)
+        if _get_backend() == "triton":
+            # Uses tl.topk for largest=True
+            self.assertIn("tl.topk", code)
 
     def test_torch_topk_smallest(self):
         """Test torch.topk with largest=False (k smallest elements)."""
@@ -952,8 +966,9 @@ class TestMisc(RefEagerTestBase, TestCase):
         ref_vals, ref_indices = torch.topk(x, k, dim=-1, largest=False)
         torch.testing.assert_close(vals, ref_vals)
         torch.testing.assert_close(indices, ref_indices)
-        # Uses tl.sort for largest=False (tl.topk only supports largest=True)
-        self.assertIn("tl.sort", code)
+        if _get_backend() == "triton":
+            # Uses tl.sort for largest=False (tl.topk only supports largest=True)
+            self.assertIn("tl.sort", code)
 
     def test_profiler_does_not_concretize_block_vars(self):
         """Compiling a kernel inside a torch.profiler context must not
@@ -1000,6 +1015,7 @@ class TestMisc(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, expected)
 
     @skipIfRefEager("Config tests not applicable in ref eager mode")
+    @xfailIfCute("CUTe supports up to three thread axes")
     def test_default_block_sizes_high_dim_with_reduction(self):
         """Regression test for issue #1354: default config hangs when indexing
         tensor with enough dims.

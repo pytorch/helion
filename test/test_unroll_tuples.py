@@ -14,6 +14,7 @@ from helion._testing import code_and_output
 from helion._testing import onlyBackends
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfRocm
+from helion._testing import skipIfXPU
 import helion.language as hl
 
 
@@ -977,6 +978,7 @@ class TestUnrollTuples(RefEagerTestBase, TestCase):
     @largeTensorTest("12GB", device=DEVICE)
     @skipIfRefEager("Benchmark not applicable in ref eager mode")
     @skipIfRocm("Benchmark timing unreliable on ROCm")
+    @skipIfXPU("Benchmark timing unreliable on XPU")
     def test_register_cache_faster_than_no_cache(self):
         """Verify register-cached layernorm is faster than re-gathering."""
         from triton.testing import do_bench

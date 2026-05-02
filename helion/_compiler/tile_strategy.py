@@ -132,24 +132,25 @@ class EmitPipelineLoopState(DeviceLoopOrGridState):
     pipeline_call: ast.AST | None = None
     outer_prefix: list[ast.AST] = dataclasses.field(default_factory=list)
     outer_suffix: list[ast.AST] = dataclasses.field(default_factory=list)
+    _tensor_to_dma_scratch: dict[str, str] = dataclasses.field(default_factory=dict)
 
 
 @dataclasses.dataclass
 class ForiLoopState(DeviceLoopOrGridState):
     """State for fori_loop-based loops on TPU (Pallas backend).
 
-    Uses jax.lax.fori_loop with pltpu.make_async_copy for manual DMA control.
-    When ``use_dma=False``, skips DMA and accesses HBM refs directly via
-    ``pl.ds`` slicing (used when inner block shapes violate TPU DMA alignment).
+    Uses jax.lax.fori_loop with pltpu.make_async_copy for tensors whose
+    inner-block shape passes ``_check_dma_alignment``; tensors that fail
+    are kept on their outer BlockSpec and accessed via ``pl.ds`` from the
+    body.  Per-tensor pipelining membership lives in ``_tensor_to_dma_scratch``.
     """
 
     body_fn_name: str
     loop_var_name: str  # The fori_loop index variable (e.g., "_j")
-    use_dma: bool = True
     inner_statements: list[ast.AST] = dataclasses.field(default_factory=list)
     outer_prefix: list[ast.AST] = dataclasses.field(default_factory=list)
     outer_suffix: list[ast.AST] = dataclasses.field(default_factory=list)
-    _tensor_to_vmem: dict[str, str] = dataclasses.field(default_factory=dict)
+    _tensor_to_dma_scratch: dict[str, str] = dataclasses.field(default_factory=dict)
     _tensor_to_sem: dict[str, str] = dataclasses.field(default_factory=dict)
 
 

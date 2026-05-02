@@ -29,6 +29,7 @@ class CompileTimeTracker:
     """
 
     _instance: CompileTimeTracker | None = None
+    _atexit_registered: ClassVar[bool] = False
     _lock = threading.Lock()
 
     def __init__(self) -> None:
@@ -44,10 +45,16 @@ class CompileTimeTracker:
         if cls._instance is None:
             with cls._lock:
                 if cls._instance is None:
-                    cls._instance = CompileTimeTracker()
+                    cls._instance = cls()
                     if _enabled:
-                        atexit.register(cls._instance.print_report)
+                        cls._register_atexit_unlocked(cls._instance)
         return cls._instance
+
+    @classmethod
+    def _register_atexit_unlocked(cls, tracker: CompileTimeTracker) -> None:
+        if not cls._atexit_registered:
+            atexit.register(tracker.print_report)
+            cls._atexit_registered = True
 
     def start(self, name: str) -> None:
         """Start timing a named section."""
@@ -244,6 +251,16 @@ def measure(name: str) -> contextlib.AbstractContextManager[None]:
     if not _enabled:
         return _NOOP
     return _MeasureContext(name, get_tracker())
+
+
+def enable() -> None:
+    """Enable compile-time measurement after this module has been imported."""
+    global _enabled
+    with CompileTimeTracker._lock:
+        _enabled = True
+        if CompileTimeTracker._instance is None:
+            CompileTimeTracker._instance = CompileTimeTracker()
+        CompileTimeTracker._register_atexit_unlocked(CompileTimeTracker._instance)
 
 
 def timed(name: str | None = None) -> Callable[[_F], _F]:

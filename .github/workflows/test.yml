@@ -175,7 +175,7 @@ jobs:
             --extra-index-url https://us-python.pkg.dev/ml-oss-artifacts-published/jax/simple/ \
             --find-links https://storage.googleapis.com/jax-releases/libtpu_releases.html \
             --pre \
-            'jax==0.9.2' 'jaxlib==0.9.2' 'libtpu==0.0.40' 'tpu-info==0.7.1' 'jaxtyping' 'frozendict'
+            'jax==0.9.2' 'jaxlib==0.9.2' 'libtpu==0.0.40' 'tpu-info==0.7.1' 'jaxtyping' 'frozendict' 'immutabledict'
           # Install Bazel
           if ! command -v bazel &> /dev/null; then
             sudo curl -L https://github.com/bazelbuild/bazelisk/releases/download/v1.27.0/bazelisk-linux-amd64 -o /usr/local/bin/bazel
@@ -218,7 +218,7 @@ jobs:
         if: matrix.backend == 'cute'
         run: |
           source .venv/bin/activate
-          SETUPTOOLS_SCM_PRETEND_VERSION="0.0.0" uv pip install .'[cute-cu12]'
+          SETUPTOOLS_SCM_PRETEND_VERSION="0.0.0" uv pip install --prerelease=allow .'[cute-cu13]'
 
       - name: CUDA Compute Check
         if: startsWith(matrix.image, 'nvidia')
@@ -259,6 +259,8 @@ jobs:
           if [[ "${{ matrix.ref-eager }}" == "true" ]]; then export HELION_INTERPRET=1; fi
           if [[ "${{ matrix.backend }}" == "tileir" ]]; then export ENABLE_TILE=1; fi
           export HELION_BACKEND=${{ matrix.backend }}
+          # Disable TorchTPU build cache to prevent running out of disk space.
+          export TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE=disabled
           # -rf: print failed tests
           # --timeout: max allowed time for each test
           PARALLEL="-n4"

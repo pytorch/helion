@@ -316,6 +316,21 @@ def pallas_attention(
 
 
 @helion.kernel(backend="pallas", static_shapes=True)
+def pallas_row_scale_mul(x: torch.Tensor, r: torch.Tensor) -> torch.Tensor:
+    """Elementwise multiply ``x [M, N]`` by per-row scale ``r [M, 1]``.
+
+    Iterates rows with a two-level tiling: an outer CTA tile and an inner
+    ``hl.tile(begin, end)`` that becomes the per-Pallas-loop-type body.
+    """
+    m, _ = x.shape
+    out = torch.empty_like(x)
+    for mb_cta in hl.tile(m, block_size=8):
+        for mb in hl.tile(mb_cta.begin, mb_cta.end):
+            out[mb, :] = x[mb, :] * r[mb, :]
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
 def pallas_reduce_non_pow2(x: torch.Tensor) -> torch.Tensor:
     """Softmax over a non-power-of-2 reduction dim.
 
@@ -384,6 +399,21 @@ def _running_max_broadcast_ref(
         scale = torch.maximum(scale, chunk.amax(-1).float())
         acc = acc + scale[:, :, None]
     return acc.to(a.dtype)
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
+def pallas_chunked_add(x: torch.Tensor) -> torch.Tensor:
+    """Iterates over chunks of rows; uses tile_k.index + tile_chunk.begin * chunk_size
+    to compute the global row index (TileIndexWithOffsetPattern)."""
+    nrows, ncols = x.shape
+    chunk_size = 64
+    nchunks = nrows // chunk_size
+    out = torch.empty_like(x)
+    for tile_col, tile_chunk in hl.tile([ncols, nchunks], block_size=[None, 1]):
+        for tile_k in hl.tile(chunk_size, block_size=64):
+            row = tile_k.index + tile_chunk.begin * chunk_size
+            out[row, tile_col] = x[row, tile_col] + 1.0
+    return out
 
 
 @onlyBackends(["triton", "pallas"])
@@ -1031,31 +1061,48 @@ class TestPallas(TestCase):
         within each chunk uses tile_k.index + tile_chunk.begin * chunk_size
         to compute the global row index.
         """
-
-        @helion.kernel(
-            backend="pallas",
-            static_shapes=True,
-        )
-        def chunked_add(x: torch.Tensor) -> torch.Tensor:
-            nrows, ncols = x.shape
-            chunk_size = 64
-            nchunks = nrows // chunk_size
-            out = torch.empty_like(x)
-            for tile_col, tile_chunk in hl.tile([ncols, nchunks], block_size=[None, 1]):
-                for tile_k in hl.tile(chunk_size, block_size=64):
-                    # global_row = local_row_within_chunk + chunk_start
-                    row = tile_k.index + tile_chunk.begin * chunk_size
-                    out[row, tile_col] = x[row, tile_col] + 1.0
-            return out
-
         # 4 chunks of 64 rows, 128 columns
         x = torch.randn(256, 128, device=DEVICE, dtype=torch.float32)
-        code, result = code_and_output(chunked_add, (x,), block_sizes=[128])
+        code, result = code_and_output(pallas_chunked_add, (x,), block_sizes=[128])
         expected = x + 1.0
         torch.testing.assert_close(result, expected)
         # tile_k.index + offset uses TileIndexWithOffsetPattern — the
         # pl.multiple_of hint should NOT be applied to offset expressions
         self.assertNotIn("pl.multiple_of(", code)
+
+    def test_tile_index_with_symbolic_offset_emit_pipeline(self) -> None:
+        """Same kernel under pallas_loop_type='emit_pipeline'.
+
+        emit_pipeline must emit offset_<bid>/indices_<bid> in the body
+        prologue so kernel code that references tile.index sees defined
+        symbols.  Without the prologue emission, the body raises
+        ``NameError: name 'indices_2' is not defined`` at trace time.
+        """
+        x = torch.randn(256, 128, device=DEVICE, dtype=torch.float32)
+        _code, result = code_and_output(
+            pallas_chunked_add,
+            (x,),
+            block_sizes=[128],
+            pallas_loop_type="emit_pipeline",
+        )
+        torch.testing.assert_close(result, x + 1.0)
+
+    def test_tile_index_with_symbolic_offset_fori_loop(self) -> None:
+        """Same kernel under pallas_loop_type='fori_loop'.
+
+        fori_loop has the same prologue gap as emit_pipeline: without
+        unconditional offset_<bid>/indices_<bid> emission, kernels that
+        reference tile.index inside a divisible inner loop raise
+        ``NameError: name 'indices_2' is not defined`` at trace time.
+        """
+        x = torch.randn(256, 128, device=DEVICE, dtype=torch.float32)
+        _code, result = code_and_output(
+            pallas_chunked_add,
+            (x,),
+            block_sizes=[128],
+            pallas_loop_type="fori_loop",
+        )
+        torch.testing.assert_close(result, x + 1.0)
 
     def test_mixed_scalar_and_slice_access(self) -> None:
         """Tensor accessed both as scalar and slice should not be placed in SMEM.
@@ -1488,6 +1535,45 @@ class TestPallas(TestCase):
         )
         ref = x.view(8, 8, 128).sum(1)
         torch.testing.assert_close(result, ref, rtol=1e-3, atol=1e-3)
+
+    def test_emit_pipeline_per_tensor_pipelined_mixed(self) -> None:
+        """An emit_pipeline body can mix pipelined and non-pipelined tensors.
+
+        Aligned tensors pass through ``pltpu.emit_pipeline``'s ``pl.Buffered``
+        BlockSpecs, while unaligned ones stay on the outer pallas_call
+        BlockSpec and are closure-read from the body via ``pl.ds``.
+        """
+        x = torch.randn(64, 128, device=DEVICE, dtype=torch.float32)
+        r = torch.randn(64, 1, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(
+            pallas_row_scale_mul,
+            (x, r),
+            block_sizes=[8],
+            pallas_loop_type="emit_pipeline",
+        )
+        self.assertIn("pltpu.emit_pipeline", code)
+        self.assertIn("pl.ds(", code)
+        torch.testing.assert_close(result, x * r)
+
+    def test_fori_loop_per_tensor_dma_mixed(self) -> None:
+        """A fori_loop body can mix DMA-aligned and DMA-unaligned tensors.
+
+        Aligned tensors take ``pltpu.make_async_copy`` scratch buffers; the
+        unaligned tensor stays in its outer BlockSpec VMEM ref and is read
+        via ``pl.ds``.
+        """
+        x = torch.randn(64, 128, device=DEVICE, dtype=torch.float32)
+        r = torch.randn(64, 1, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(
+            pallas_row_scale_mul,
+            (x, r),
+            block_sizes=[8],
+            pallas_loop_type="fori_loop",
+        )
+        self.assertIn("pltpu.make_async_copy", code)
+        self.assertIn("pl.ds(", code)
+        self.assertIn("_pipeline_arg_indices=", code)
+        torch.testing.assert_close(result, x * r)
 
     def test_squeeze_slice_access(self) -> None:
         """Test for the [None, :] indexing pattern (subscript index for slice >= tensor_ndim)"""

@@ -581,7 +581,17 @@ def _(
         )
     else:
         # For non-FP8 tensors, use regular matmul
-        result = torch.mm(mat1, mat2, out_dtype=resolved_out_dtype)
+        if mat1.ndim == 3 or mat2.ndim == 3:
+            mat1_batched = mat1 if mat1.ndim == 3 else mat1.unsqueeze(0)
+            mat2_batched = mat2 if mat2.ndim == 3 else mat2.unsqueeze(0)
+            batch = max(mat1_batched.shape[0], mat2_batched.shape[0])
+            result = torch.bmm(
+                mat1_batched.expand(batch, -1, -1),
+                mat2_batched.expand(batch, -1, -1),
+                out_dtype=resolved_out_dtype,
+            )
+        else:
+            result = torch.mm(mat1, mat2, out_dtype=resolved_out_dtype)
 
     if acc is not None:
         return acc + result

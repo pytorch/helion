@@ -2044,6 +2044,21 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             encoded = fragment.encode(value)
             self.assertEqual(len(encoded), dim)
 
+    def test_block_size_fragment_autotuner_min_clamp(self):
+        """random_config() must not crash when autotuner_min > max_size."""
+        from examples.attention import attention
+
+        q, k, v = [
+            torch.randn(4, 48, 128, 128, dtype=torch.bfloat16, device=DEVICE)
+            for _ in range(3)
+        ]
+        bound = attention.bind((q, k, v))
+        config_spec = bound.config_spec
+        config_spec.raise_grid_block_minimums()
+        gen = ConfigGeneration(config_spec)
+        config = gen.random_config()
+        self.assertEqual(config["block_sizes"][0], 1)
+
     def test_autotune_benchmark_fn(self) -> None:
         """Test that custom benchmark function is used during rebenchmarking."""
         # Track benchmark function calls
