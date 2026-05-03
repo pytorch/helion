@@ -1456,6 +1456,108 @@ def _emit_mma_pipeline(
             mma_exec_role_stmts.append(stmt)
         return stmt
 
+    tcgen05_tmem_setup_emitted = False
+
+    def _emit_tcgen05_tmem_setup() -> None:
+        nonlocal tcgen05_tmem_setup_emitted
+
+        assert not tcgen05_tmem_setup_emitted
+        assert tcgen05_plan is not None
+        assert tcgen05_mma_owner_active is not None
+        assert epi_active is not None
+        tcgen05_tmem_setup_emitted = True
+
+        if tcgen05_cluster_m > 1:
+            # Keep the two-CTA cluster rendezvous after the AB/acc pipeline
+            # objects exist and before any role allocates or retrieves TMEM.
+            prefix.append(
+                statement_from_string(
+                    "cutlass.pipeline.pipeline_init_arrive("
+                    f"cluster_shape_mn={tcgen05_cluster_layout_vmnk}, "
+                    "is_relaxed=True)"
+                )
+            )
+            prefix.append(
+                statement_from_string(
+                    "cutlass.pipeline.pipeline_init_wait("
+                    f"cluster_shape_mn={tcgen05_cluster_layout_vmnk})"
+                )
+            )
+        prefix.append(
+            statement_from_string(
+                f"if {epi_active}:\n"
+                f"    {tcgen05_plan.tmem_allocator}.allocate({tcgen05_plan.acc_tmem_cols})"
+            )
+        )
+        prefix.append(
+            statement_from_string(
+                f"{tcgen05_exec_acc_tmem_ptr} = cute.make_ptr("
+                f"{acc_dtype_str}, 0, cute.AddressSpace.tmem, assumed_align=16)"
+            )
+        )
+        prefix.append(
+            statement_from_string(
+                f"{tcgen05_epi_acc_tmem_ptr} = cute.make_ptr("
+                f"{acc_dtype_str}, 0, cute.AddressSpace.tmem, assumed_align=16)"
+            )
+        )
+        # ``acc_frag`` is reassigned per-tile below to a stage-indexed
+        # slice; an extra ``acc_frag = acc_frag_base`` here would land
+        # in the hoisted setup with a different CuTe type and break the
+        # persistent ``while`` ("acc_frag is structured different after
+        # this while").
+        prefix.append(
+            statement_from_string(
+                f"if {tcgen05_plan.exec_active}:\n"
+                f"    {tcgen05_plan.tmem_allocator}.wait_for_alloc()\n"
+                f"    {tcgen05_exec_acc_tmem_ptr} = "
+                f"{tcgen05_plan.tmem_allocator}.retrieve_ptr({acc_dtype_str})"
+            )
+        )
+        prefix.append(
+            statement_from_string(
+                f"if {epi_active}:\n"
+                f"    {tcgen05_plan.tmem_allocator}.wait_for_alloc()\n"
+                f"    {tcgen05_epi_acc_tmem_ptr} = "
+                f"{tcgen05_plan.tmem_allocator}.retrieve_ptr({acc_dtype_str})"
+            )
+        )
+        prefix.append(
+            statement_from_string(
+                f"{tcgen05_exec_acc_frag_base} = cute.make_tensor("
+                f"{tcgen05_exec_acc_tmem_ptr}, {acc_frag_base}.layout)"
+            )
+        )
+        # ``acc_frag`` indexes ``tcgen05_exec_acc_frag_base`` by the current
+        # ``acc_producer_state.index`` stage. The K-loop suffix advances
+        # that producer state once per UMMA fence, so under the persistent
+        # path each tile sees a different index. Mark per-tile so the
+        # alias is recomputed inside the work-tile loop.
+        _emit_per_tile(
+            f"{acc_frag} = "
+            f"{tcgen05_exec_acc_frag_base}[None, None, None, "
+            f"{tcgen05_plan.acc_producer_state}.index]",
+            mma_exec=tcgen05_use_role_local_mma_exec,
+        )
+        prefix.append(
+            statement_from_string(
+                f"{tcgen05_epi_acc_frag_base} = cute.make_tensor("
+                f"{tcgen05_epi_acc_tmem_ptr}, {acc_frag_base}.layout)"
+            )
+        )
+        # Initial producer_acquire for stage 0 of the acc pipeline. The
+        # ``acc_producer_state`` advances once per UMMA fence inside the
+        # K-loop, so per tile we want to start by acquiring whatever stage
+        # the persistent loop currently points at. Tag as per-tile so this
+        # acquire stays in the work-tile body when the persistent loop
+        # splitter runs.
+        _emit_per_tile(
+            f"if {tcgen05_mma_owner_active}:\n"
+            f"    {tcgen05_plan.acc_pipeline}.producer_acquire("
+            f"{tcgen05_plan.acc_producer_state})",
+            mma_exec=tcgen05_use_role_local_mma_exec,
+        )
+
     mma_participant_linear: str | None = None
     mma_copy_linear: str | None = None
     mma_active: str | None = None
@@ -1739,59 +1841,6 @@ def _emit_mma_pipeline(
                 f"two_cta_tmem_dealloc_mbar_ptr={tcgen05_plan.tmem_dealloc_mbar_ptr})"
             )
         )
-        if tcgen05_cluster_m > 1:
-            prefix.append(
-                statement_from_string(
-                    "cutlass.pipeline.pipeline_init_arrive("
-                    f"cluster_shape_mn={tcgen05_cluster_layout_vmnk}, "
-                    "is_relaxed=True)"
-                )
-            )
-            prefix.append(
-                statement_from_string(
-                    "cutlass.pipeline.pipeline_init_wait("
-                    f"cluster_shape_mn={tcgen05_cluster_layout_vmnk})"
-                )
-            )
-        prefix.append(
-            statement_from_string(
-                f"if {epi_active}:\n"
-                f"    {tcgen05_plan.tmem_allocator}.allocate({tcgen05_plan.acc_tmem_cols})"
-            )
-        )
-        prefix.append(
-            statement_from_string(
-                f"{tcgen05_exec_acc_tmem_ptr} = cute.make_ptr("
-                f"{acc_dtype_str}, 0, cute.AddressSpace.tmem, assumed_align=16)"
-            )
-        )
-        prefix.append(
-            statement_from_string(
-                f"{tcgen05_epi_acc_tmem_ptr} = cute.make_ptr("
-                f"{acc_dtype_str}, 0, cute.AddressSpace.tmem, assumed_align=16)"
-            )
-        )
-        # ``acc_frag`` is reassigned per-tile below to a stage-indexed
-        # slice; an extra ``acc_frag = acc_frag_base`` here would land
-        # in the hoisted setup with a different CuTe type and break the
-        # persistent ``while`` ("acc_frag is structured different after
-        # this while").
-        prefix.append(
-            statement_from_string(
-                f"if {tcgen05_plan.exec_active}:\n"
-                f"    {tcgen05_plan.tmem_allocator}.wait_for_alloc()\n"
-                f"    {tcgen05_exec_acc_tmem_ptr} = "
-                f"{tcgen05_plan.tmem_allocator}.retrieve_ptr({acc_dtype_str})"
-            )
-        )
-        prefix.append(
-            statement_from_string(
-                f"if {epi_active}:\n"
-                f"    {tcgen05_plan.tmem_allocator}.wait_for_alloc()\n"
-                f"    {tcgen05_epi_acc_tmem_ptr} = "
-                f"{tcgen05_plan.tmem_allocator}.retrieve_ptr({acc_dtype_str})"
-            )
-        )
         prefix.append(
             statement_from_string(
                 f"{tcgen05_plan.acc_pipeline_barriers} = cute.arch.alloc_smem("
@@ -1834,41 +1883,8 @@ def _emit_mma_pipeline(
                 f"cutlass.pipeline.PipelineUserType.Consumer, {tcgen05_acc_stage_count_value})"
             )
         )
-        prefix.append(
-            statement_from_string(
-                f"{tcgen05_exec_acc_frag_base} = cute.make_tensor("
-                f"{tcgen05_exec_acc_tmem_ptr}, {acc_frag_base}.layout)"
-            )
-        )
-        # ``acc_frag`` indexes ``tcgen05_exec_acc_frag_base`` by the current
-        # ``acc_producer_state.index`` stage. The K-loop suffix advances
-        # that producer state once per UMMA fence, so under the persistent
-        # path each tile sees a different index. Mark per-tile so the
-        # alias is recomputed inside the work-tile loop.
-        _emit_per_tile(
-            f"{acc_frag} = "
-            f"{tcgen05_exec_acc_frag_base}[None, None, None, "
-            f"{tcgen05_plan.acc_producer_state}.index]",
-            mma_exec=tcgen05_use_role_local_mma_exec,
-        )
-        prefix.append(
-            statement_from_string(
-                f"{tcgen05_epi_acc_frag_base} = cute.make_tensor("
-                f"{tcgen05_epi_acc_tmem_ptr}, {acc_frag_base}.layout)"
-            )
-        )
-        # Initial producer_acquire for stage 0 of the acc pipeline. The
-        # ``acc_producer_state`` advances once per UMMA fence inside the
-        # K-loop, so per tile we want to start by acquiring whatever stage
-        # the persistent loop currently points at. Tag as per-tile so this
-        # acquire stays in the work-tile body when the persistent loop
-        # splitter runs.
-        _emit_per_tile(
-            f"if {tcgen05_mma_owner_active}:\n"
-            f"    {tcgen05_plan.acc_pipeline}.producer_acquire("
-            f"{tcgen05_plan.acc_producer_state})",
-            mma_exec=tcgen05_use_role_local_mma_exec,
-        )
+        if not tcgen05_use_tma:
+            _emit_tcgen05_tmem_setup()
     else:
         prefix.append(
             statement_from_string(
@@ -2130,6 +2146,7 @@ def _emit_mma_pipeline(
                     f"cutlass.pipeline.PipelineUserType.Consumer, {tcgen05_ab_stage_count_value})"
                 )
             )
+            _emit_tcgen05_tmem_setup()
             if tcgen05_use_tma_pipeline:
                 # Initial TMA prefetch warms stages 0..ab_stage_count-1 of the
                 # AB pipeline at the START of each tile. Both the boolean
