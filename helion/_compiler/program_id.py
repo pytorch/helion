@@ -929,6 +929,17 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             f"== cutlass.Int32({plan.exec_warp_id})"
         )
 
+    def _tcgen05_epi_role_predicate(self) -> str:
+        """Boolean expression that gates the epilogue warps' role block."""
+        plan = self._tcgen05_plan()
+        assert plan is not None, (
+            "tcgen05 epilogue role predicate requires a registered matmul plan"
+        )
+        return (
+            "cute.arch.make_warp_uniform(cute.arch.warp_idx()) "
+            f"< cutlass.Int32({plan.epi_warp_count})"
+        )
+
     def _split_tcgen05_invariant_setup(
         self, device_function: DeviceFunction, body: list[ast.stmt]
     ) -> tuple[list[ast.stmt], list[ast.stmt]]:
@@ -1054,6 +1065,7 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         """
         tma_load_predicate = self._tcgen05_tma_load_role_predicate()
         mma_exec_predicate = self._tcgen05_mma_exec_role_predicate()
+        epi_predicate = self._tcgen05_epi_role_predicate()
         role_predicates_by_id: dict[int, str] = {}
         for stmt_id in device_function.cute_tcgen05_tma_load_role_stmt_ids:
             role_predicates_by_id[stmt_id] = tma_load_predicate
@@ -1062,6 +1074,11 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                 "tcgen05 role statement registered for multiple warp roles"
             )
             role_predicates_by_id[stmt_id] = mma_exec_predicate
+        for stmt_id in device_function.cute_tcgen05_epi_role_stmt_ids:
+            assert stmt_id not in role_predicates_by_id, (
+                "tcgen05 role statement registered for multiple warp roles"
+            )
+            role_predicates_by_id[stmt_id] = epi_predicate
 
         if not role_predicates_by_id:
             single = self._PersistentRoleBlock(role_predicate=None, stmts=list(body))
@@ -1235,10 +1252,10 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         processes more than one work tile in total. Empirically, even with
         148 SMs and 4 work tiles (so each CTA processes 0 or 1 tile), the
         persistent wrapper interferes with kernel correctness across tile
-        boundaries. Only the single-tile case is verified correct. The fix
-        is the role-local persistent rewrite; until that lands, this guard
-        fails loudly when a user explicitly opts into a config whose problem
-        shape exercises the broken path.
+        boundaries. Only the single-tile case is verified correct. The
+        role-local persistent shape is now emitted for the current roles,
+        but this guard stays until multi-tile runtime correctness is proven
+        and the persistent-pid autotune restrictions can be lifted.
 
         The autotuner narrowing in ``matmul_ops.enforce_dot_requirements``
         already removes ``persistent_blocked`` / ``persistent_interleaved``
@@ -1975,10 +1992,10 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         runs only on its predicated warps, then every warp enters the shared
         ``while`` so existing CTA-wide barriers remain valid.
 
-        **Current limitation.** The TMA-load and MMA-exec mainloop roles
-        are extracted today. The epi roles still live in the shared
-        ``while``, and multi-tile persistent tcgen05 remains blocked by the
-        host guard until those roles move out too.
+        **Current limitation.** The TMA-load, MMA-exec, and SIMT epilogue
+        roles are extracted today. Multi-tile persistent tcgen05 remains
+        blocked by the host guard until multi-tile correctness is proven and
+        the autotune restrictions can be lifted.
         """
         # Wrap the shared body's tagged-removed view in the standard
         # per-tile shape. ``shared_role_blocks`` reuses the
@@ -1997,8 +2014,9 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         # gets one role-local loop carrying all of its per-tile
         # statements in source order. Emit the loops in explicit role
         # order instead of first-seen source order: TMA-load publishes
-        # operands before MMA-exec consumes them. Adding another role
-        # must update ``role_order`` so omitted predicates fail loudly.
+        # operands, MMA-exec consumes them and publishes accumulator stages,
+        # then epi consumes those stages. Adding another role must update
+        # ``role_order`` so omitted predicates fail loudly.
         merged: dict[str, list[ast.stmt]] = {}
         for role_block in partition.role_blocks_extracted:
             assert role_block.role_predicate is not None
@@ -2007,6 +2025,7 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         role_order = {
             self._tcgen05_tma_load_role_predicate(): 0,
             self._tcgen05_mma_exec_role_predicate(): 1,
+            self._tcgen05_epi_role_predicate(): 2,
         }
         unknown_predicates = set(merged) - set(role_order)
         assert not unknown_predicates, (
