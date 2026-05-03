@@ -555,15 +555,11 @@ class TestCuteLowerings(unittest.TestCase):
 
         with patch_cute_mma_support():
             bound = cute_matmul_mma_codegen_only.bind(args)
-            # matmul_ops narrows tcgen05_cluster_m to (1,) for the
-            # bf16/fp16 matmul because cluster_m=2 currently CUDA-launch
-            # fails; this codegen-only test still exercises the cluster=2
-            # path so widen the choices back so the default config picks
-            # cluster_m=2. tcgen05_num_epi_warps is already narrowed to
-            # (4,) by the matmul-side helper -- the only currently-correct
-            # value -- so no override is needed for that knob.
+            # Keep the narrowed cluster_m=1 search. Explicit flat
+            # cluster_m=2 configs are rejected until G3 runtime ownership is
+            # validated, and this auto-path test only needs to pin tcgen05.
             bound.env.config_spec.cute_tcgen05_search_enabled = True
-            bound.env.config_spec.restrict_tcgen05_cluster_m_search((2, 1))
+            bound.env.config_spec.restrict_tcgen05_cluster_m_search((1,))
             config = bound.config_spec.default_config()
             code = bound.to_triton_code(config)
 
@@ -592,10 +588,8 @@ class TestCuteLowerings(unittest.TestCase):
             "tcgen05_epi_tidx = tcgen05_lane_idx + tcgen05_warp_idx * cutlass.Int32(32) if tcgen05_epi_active else cutlass.Int32(0)",
             code,
         )
-        self.assertIn(
-            "mma_slice_tidx = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster()) % cutlass.Int32(2)",
-            code,
-        )
+        self.assertIn("mma_slice_tidx = cutlass.Int32(0)", code)
+        self.assertNotIn("_helion_cute_cluster_shape = (2, 1, 1)", code)
         self.assertIn(
             "if tcgen05_epi_active:",
             code,
@@ -1490,13 +1484,135 @@ class TestCuteLowerings(unittest.TestCase):
             )
             bound.set_config(cfg)
             code = bound.to_triton_code(cfg)
-            self.assertIn("tcgen05_role_local", code)
+            self.assertNotIn("tcgen05_role_local", code)
             self.assertIn(Tcgen05PersistentProgramIDs._MULTI_TILE_GUARD_TOTAL_VAR, code)
             with self.assertRaisesRegex(
                 RuntimeError,
                 "supports multi-tile execution only",
             ):
                 bound(*args)
+
+    def test_tcgen05_persistent_cluster_m2_two_cta_runtime_guard(self) -> None:
+        """CtaGroup.TWO codegen is still guarded before runtime launch.
+
+        The G3 structural path emits bm=256 / cluster_m=2 / CtaGroup.TWO
+        code, but the runtime ownership path is not validated yet. Guard even
+        the single-output-tile case so explicit configs cannot hang the GPU.
+        """
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_cluster_m2_two_cta(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        args = (
+            torch.randn(256, 32, device=DEVICE, dtype=torch.float16),
+            torch.randn(32, 256, device=DEVICE, dtype=torch.float16),
+        )
+        from helion._compiler.program_id import Tcgen05PersistentProgramIDs
+
+        with patch_cute_mma_support():
+            bound = cute_matmul_cluster_m2_two_cta.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            cfg = _make_tcgen05_persistent_config(
+                block_sizes=[256, 256, 16],
+                pid_type="persistent_blocked",
+                tcgen05_cluster_m=2,
+            )
+            bound.set_config(cfg)
+            code = bound.to_triton_code(cfg)
+            self.assertIn("cute.nvgpu.tcgen05.CtaGroup.TWO", code)
+            self.assertIn(
+                "virtual_pid = tcgen05_work_tile_idx_0 // cutlass.Int32(2)",
+                code,
+            )
+            self.assertIn(Tcgen05PersistentProgramIDs._MULTI_TILE_GUARD_TOTAL_VAR, code)
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "supports multi-tile execution only",
+            ):
+                bound(*args)
+
+    def test_tcgen05_flat_cluster_m2_two_cta_rejected(self) -> None:
+        """Flat CtaGroup.TWO configs do not have the persistent host guard."""
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_flat_cluster_m2(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        args = (
+            torch.randn(256, 32, device=DEVICE, dtype=torch.float16),
+            torch.randn(32, 256, device=DEVICE, dtype=torch.float16),
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_flat_cluster_m2.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            bound.env.config_spec.restrict_tcgen05_cluster_m_search((2, 1))
+            cfg = _make_tcgen05_persistent_config(
+                block_sizes=[256, 256, 16],
+                pid_type="flat",
+                tcgen05_cluster_m=2,
+            )
+            with self.assertRaisesRegex(
+                exc.BackendUnsupported,
+                "tcgen05_cluster_m > 1",
+            ):
+                bound.to_triton_code(cfg)
+
+    def test_non_tcgen05_flat_cluster_m2_fallback_is_allowed(self) -> None:
+        """tcgen05_cluster_m is irrelevant after falling back from tcgen05."""
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_float32_cluster_m2(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        args = (
+            torch.randn(256, 32, device=DEVICE, dtype=torch.float32),
+            torch.randn(32, 256, device=DEVICE, dtype=torch.float32),
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_float32_cluster_m2.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            bound.env.config_spec.restrict_tcgen05_cluster_m_search((2, 1))
+            cfg = _make_tcgen05_persistent_config(
+                block_sizes=[256, 256, 16],
+                pid_type="flat",
+                tcgen05_cluster_m=2,
+            )
+            code = bound.to_triton_code(cfg)
+
+        self.assertIn("_launcher(_helion_cute_matmul_float32_cluster_m2", code)
+        self.assertNotIn("cute.nvgpu.tcgen05.CtaGroup.TWO", code)
+        self.assertNotIn("_helion_cute_cluster_shape = (2, 1, 1)", code)
 
     def test_tcgen05_persistent_single_tile_runtime_correctness(self) -> None:
         """Persistent + tcgen05 produces correct output for single-tile shapes.
@@ -1916,7 +2032,7 @@ class TestCuteLowerings(unittest.TestCase):
             block_sizes=[128, 128, 16],
             loop_orders=[[0, 1]],
             num_stages=1,
-            pid_type="flat",
+            pid_type="persistent_blocked",
             tcgen05_cluster_m=2,
             tcgen05_num_epi_warps=4,
         )
@@ -1926,8 +2042,8 @@ class TestCuteLowerings(unittest.TestCase):
             patch_cute_mma_support(),
         ):
             bound = cute_matmul_mma_codegen_only.bind(args)
-            # See note above: widen cluster_m back to include 2 for the
-            # codegen-only test, since matmul_ops restricts it for runtime.
+            # Persistent cluster_m=2 remains host-guarded before launch, but
+            # the structural codegen path is still useful to inspect.
             bound.env.config_spec.cute_tcgen05_search_enabled = True
             bound.env.config_spec.restrict_tcgen05_cluster_m_search((2, 1))
             code = bound.to_triton_code(config)
@@ -4104,6 +4220,22 @@ class TestCuteLowerings(unittest.TestCase):
             code,
         )
         self.assertIn("cute.nvgpu.tcgen05.CtaGroup.TWO", code)
+        self.assertIn("_helion_tcgen05_persistent_total_tiles", code)
+        self.assertIn(
+            "PersistentTileSchedulerParams(((8192 + _BLOCK_SIZE_0 - 1) // "
+            "_BLOCK_SIZE_0 * 2",
+            code,
+        )
+        self.assertIn(
+            "virtual_pid = tcgen05_work_tile_idx_0 // cutlass.Int32(2)",
+            code,
+        )
+        self.assertIn(
+            "tcgen05_tma_warp and (cute.arch.make_warp_uniform("
+            "cute.arch.block_idx_in_cluster()) == cutlass.Int32(0))",
+            code,
+        )
+        self.assertNotIn("'kind': 'tcgen05_d_tma'", code)
         self.assertIn("_BLOCK_SIZE_0 = 256", code)
         self.assertIn("_BLOCK_SIZE_1 = 256", code)
         self.assertIn("cute.arch.block_idx_in_cluster()", code)

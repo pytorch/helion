@@ -18,6 +18,7 @@ from .cute.cutedsl_compat import emit_pipeline_advance
 from .device_function import DeviceFunction
 from .device_function import TensorArg
 from .host_function import HostFunction
+from .host_function import NoCurrentFunction
 
 
 def typed_program_id(dim: int = 0) -> str:
@@ -778,7 +779,13 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         super().__init__(is_blocked=is_blocked)
 
     def _tcgen05_plan(self) -> CuteTcgen05MatmulPlan | None:
-        return DeviceFunction.current().cute_tcgen05_matmul_plan
+        try:
+            return DeviceFunction.current().cute_tcgen05_matmul_plan
+        except NoCurrentFunction:
+            # Unit tests exercise builder helpers without entering a
+            # DeviceFunction; in that context the tcgen05 plan-dependent
+            # branches should behave like the legacy 1-CTA path.
+            return None
 
     def _tcgen05_cluster_m(self) -> int:
         if (plan := self._tcgen05_plan()) is not None:
@@ -787,10 +794,31 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         cluster_m = int(str(config.get("tcgen05_cluster_m", 1)))
         return max(1, min(cluster_m, 2))
 
-    def _tcgen05_num_tiles_expr(self, *, is_device: bool) -> str:
+    def _tcgen05_is_two_cta(self) -> bool:
+        if (plan := self._tcgen05_plan()) is not None:
+            return plan.is_two_cta
+        return False
+
+    def _tcgen05_output_tile_dims_expr(self, *, is_device: bool) -> list[str]:
+        assert len(self.pid_info) <= 3, (
+            "tcgen05 persistent scheduler supports at most 3 PID dimensions"
+        )
         dims = [pid.num_pids_expr(is_device=is_device) for pid in self.pid_info]
         while len(dims) < 3:
             dims.append("1")
+        return dims
+
+    def _tcgen05_scheduler_tile_dims_expr(self, *, is_device: bool) -> list[str]:
+        dims = self._tcgen05_output_tile_dims_expr(is_device=is_device)
+        if self._tcgen05_is_two_cta():
+            # CtaGroup.TWO uses two CTAs to produce one logical M tile. Model
+            # scheduler M as CTA slots, then collapse back to logical M when
+            # binding virtual_pid for PID decomposition.
+            dims[0] = f"({dims[0]}) * {self._tcgen05_cluster_m()}"
+        return dims
+
+    def _tcgen05_num_tiles_expr(self, *, is_device: bool) -> str:
+        dims = self._tcgen05_scheduler_tile_dims_expr(is_device=is_device)
         return f"({', '.join(dims[:3])})"
 
     def _tcgen05_num_work_clusters_expr(self, *, is_device: bool) -> str:
@@ -802,9 +830,7 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         needs one z block per persistent work cluster, not a flat x-only
         ``(_NUM_SM,)`` grid.
         """
-        dims = [pid.num_pids_expr(is_device=is_device) for pid in self.pid_info]
-        while len(dims) < 3:
-            dims.append("1")
+        dims = self._tcgen05_scheduler_tile_dims_expr(is_device=is_device)
         cluster_m = self._tcgen05_cluster_m()
         if cluster_m > 1:
             dims[0] = f"(({dims[0]}) + {cluster_m} - 1) // {cluster_m}"
@@ -830,12 +856,17 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             f"({cluster_m}, 1, min(({total_clusters}), ({max_persistent_clusters})))"
         )
 
+    def _tcgen05_logical_m_coord_expr(self, coord: str) -> str:
+        if self._tcgen05_is_two_cta():
+            return f"({coord}) // cutlass.Int32({self._tcgen05_cluster_m()})"
+        return coord
+
     def _tcgen05_linear_virtual_pid_expr(self, work_tile_var: str) -> str:
         terms: list[str] = []
         for i, _pid in enumerate(self.pid_info):
             coord = f"{work_tile_var}.tile_idx[{i}]"
             if i == 0:
-                terms.append(coord)
+                terms.append(self._tcgen05_logical_m_coord_expr(coord))
                 continue
             stride = " * ".join(
                 f"({pid.num_pids_expr(is_device=True)})" for pid in self.pid_info[:i]
@@ -847,7 +878,7 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         terms: list[str] = []
         for i, coord in enumerate(coords[: len(self.pid_info)]):
             if i == 0:
-                terms.append(coord)
+                terms.append(self._tcgen05_logical_m_coord_expr(coord))
                 continue
             stride = " * ".join(
                 f"({pid.num_pids_expr(is_device=True)})" for pid in self.pid_info[:i]
@@ -1278,7 +1309,7 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         "execution only for single-root static full tiles with "
         "tcgen05_cluster_m=1. Partial K/M/N tile fallback shapes, "
         "multi-root kernels, and unvalidated cluster_m settings can "
-        "produce wrong output or launch failures. The kernel was launched "
+        "produce wrong output, hang, or launch-fail. The kernel was launched "
         "with total_tiles=%d, which is outside the validated persistent "
         "scheduler set for this path. "
         'Use a non-persistent pid_type (e.g. "flat"), pick a single-root '
@@ -1298,9 +1329,9 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         The single-root static full-tile role-local path has multi-tile
         runtime coverage only for ``tcgen05_cluster_m == 1``. Legacy
         non-role-local tcgen05 persistent kernels, multi-root kernels, and
-        explicit cluster_m > 1 configs still hit, or lack coverage for,
-        wrong-output / launch-failure modes in multi-tile shapes, so this
-        guard remains for those paths. Single-tile shapes continue to run
+        cluster_m > 1 configs still hit, or lack coverage for, wrong-output /
+        hang / launch-failure modes, so this guard remains for those paths.
+        Single-tile fallback shapes with ``cluster_m == 1`` continue to run
         because they do not exercise scheduler tile-to-tile transitions.
 
         The autotuner narrowing in
@@ -1314,8 +1345,9 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         launch and wrong-output failures into a host error. Multi-root
         kernels use ``total_tiles > 0`` because the scheduler grid is
         derived from only the first root case; even one tile in a later case
-        is unsafe. For cluster_m > 1 this keeps unvalidated multi-tile
-        execution disabled until 2-CTA runtime coverage lands.
+        is unsafe. Cluster_m > 1 configs also use ``total_tiles > 0`` because
+        CtaGroup.TWO codegen is structural-only until G3 runtime ownership is
+        validated.
         """
         host_total_pids = host_total_pids_expr
         if host_total_pids is None:
@@ -1382,7 +1414,7 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             self._emit_host_multi_tile_guard(
                 device_function,
                 host_guard_total_pids,
-                guard_threshold=0 if is_multi_root else 1,
+                guard_threshold=0 if is_multi_root or layout.cluster_m > 1 else 1,
             )
 
         setup: list[ast.stmt] = []
@@ -2073,13 +2105,13 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         runs only on its predicated warps, then every warp enters the shared
         ``while`` so existing CTA-wide barriers remain valid.
 
-        **Current limitation.** The TMA-load, MMA-exec, and SIMT epilogue
-        roles are extracted today. Single-root static full-tile multi-tile
-        correctness is validated for ``cluster_m == 1``. Partial fallback
-        shapes, multi-root ForEach kernels, and ``cluster_m > 1`` configs
-        remain guarded for multi-tile execution, and persistent pid types
-        stay out of autotune until the search can admit only the validated
-        role-local subset.
+        **Current limitation.** The TMA-load, MMA-exec, and TMA-store
+        epilogue roles are extracted today. Single-root static full-tile
+        multi-tile correctness is validated for ``cluster_m == 1``. Partial
+        fallback shapes, multi-root ForEach kernels, and cluster_m > 1
+        configs remain guarded for runtime execution, and autotune keeps
+        cluster_m=2 out of the search until the G3 ownership path is
+        runtime-correct and benchmarked.
         """
         # Wrap the shared body's tagged-removed view in the standard
         # per-tile shape. ``shared_role_blocks`` reuses the
