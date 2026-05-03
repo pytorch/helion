@@ -70,6 +70,9 @@ _TRACE_THROUGH_TARGETS = {
 # reference (`gemm_sm100.py`).
 _TCGEN05_PRODUCER_REGS = 120
 _TCGEN05_CONSUMER_REGS = 256
+_TCGEN05_CLUSTER_LEADER_PREDICATE = (
+    "cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster()) == cutlass.Int32(0)"
+)
 
 # Named-barrier ids reserved by Helion's tcgen05 codegen. Kept as module
 # constants so the codegen sites read symbolically instead of hardcoding
@@ -766,14 +769,38 @@ def _kloop_tma_copy_b_src(args: _PerKiterTmaArgs, *, k_offset: str) -> str:
     )
 
 
-def _tma_producer_predicate(tma_warp: str, *, is_two_cta: bool) -> str:
+def _two_cta_tma_copy_src(copy_src: str, *, is_two_cta: bool) -> str:
+    """Gate only TMA copy instructions to the 2-CTA cluster leader.
+
+    Both CTAs still run the surrounding PipelineTmaUmma producer state
+    machine so their local producer state stays aligned with the consumer
+    releases; the multicast TMA copies themselves are issued by CTA 0.
+    """
     if not is_two_cta:
-        return tma_warp
+        return copy_src
     return (
-        f"{tma_warp} and "
-        "cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster()) "
-        "== cutlass.Int32(0)"
+        f"    if {_TCGEN05_CLUSTER_LEADER_PREDICATE}:\n"
+        f"{textwrap.indent(copy_src, '    ')}"
     )
+
+
+def _tcgen05_two_cta_owner_predicate(
+    exec_active: str, *, is_two_cta: bool, gate_exec_warp: bool
+) -> str | None:
+    predicate_terms = []
+    if gate_exec_warp:
+        predicate_terms.append(exec_active)
+    if is_two_cta:
+        predicate_terms.append(_TCGEN05_CLUSTER_LEADER_PREDICATE)
+    if not predicate_terms:
+        return None
+    return " and ".join(predicate_terms)
+
+
+def _tcgen05_emit_optional_gate(src: str, predicate: str | None, *, indent: str) -> str:
+    if predicate is None:
+        return textwrap.indent(src, indent)
+    return f"{indent}if {predicate}:\n{textwrap.indent(src, indent + '    ')}"
 
 
 def _build_kloop_pipeline_producer_if(
@@ -792,10 +819,11 @@ def _build_kloop_pipeline_producer_if(
     k_offset = f"{args.tma_k_tile} + cutlass.Int32({args.ab_stage_count})"
     predicate_terms = [args.tma_full_tile]
     if gate_tma_warp:
-        predicate_terms.append(
-            _tma_producer_predicate(args.tma_warp, is_two_cta=args.is_two_cta)
-        )
+        predicate_terms.append(args.tma_warp)
     predicate_terms.append(args.tma_next_full_tile)
+    copy_src = _kloop_tma_copy_a_src(args, k_offset=k_offset) + _kloop_tma_copy_b_src(
+        args, k_offset=k_offset
+    )
     src = (
         f"if {' and '.join(predicate_terms)}:\n"
         f"    {args.tma_producer_try_token} = "
@@ -804,8 +832,7 @@ def _build_kloop_pipeline_producer_if(
         f"{args.tma_producer_state}, {args.tma_producer_try_token})\n"
         f"    {args.tma_barrier_ptr} = "
         f"{args.tma_pipeline}.producer_get_barrier({args.tma_producer_state})\n"
-        + _kloop_tma_copy_a_src(args, k_offset=k_offset)
-        + _kloop_tma_copy_b_src(args, k_offset=k_offset)
+        + _two_cta_tma_copy_src(copy_src, is_two_cta=args.is_two_cta)
         + f"    {args.tma_pipeline}.producer_commit({args.tma_producer_state})\n"
         + emit_pipeline_advance(args.tma_producer_state, indent="    ")
     )
@@ -825,12 +852,15 @@ def _build_kloop_pipeline_consumer_if(
         f"{args.tma_pipeline}.consumer_wait("
         f"{args.tma_consumer_state}, {args.tma_consumer_try_token})"
     )
-    if gate_exec_warp:
-        full_tile_src = (
-            f"    if {args.exec_active}:\n{textwrap.indent(consumer_src, '        ')}"
-        )
-    else:
-        full_tile_src = textwrap.indent(consumer_src, "    ")
+    full_tile_src = _tcgen05_emit_optional_gate(
+        consumer_src,
+        _tcgen05_two_cta_owner_predicate(
+            args.exec_active,
+            is_two_cta=args.is_two_cta,
+            gate_exec_warp=gate_exec_warp,
+        ),
+        indent="    ",
+    )
     fallback_src = ""
     if include_scalar_fallback:
         scalar_load_a_src = textwrap.indent(ast.unparse(args.scalar_load_a), "    ")
@@ -854,18 +884,28 @@ def _build_kloop_pipeline_release_if(
     """Per-K-iter consumer release ``if`` for the pipelined branch.
 
     Producer-state advance lives in the producer block (one per
-    commit), so it is intentionally absent here.
+    commit), so only the consumer-state advance is emitted here.
     """
-    release_src = (
-        f"{args.tma_pipeline}.consumer_release({args.tma_consumer_state})\n"
-        + emit_pipeline_advance(args.tma_consumer_state)
+    release_src = f"{args.tma_pipeline}.consumer_release({args.tma_consumer_state})"
+    release_gate = _tcgen05_two_cta_owner_predicate(
+        args.exec_active,
+        is_two_cta=args.is_two_cta,
+        gate_exec_warp=gate_exec_warp,
     )
-    if gate_exec_warp:
+    advance_src = emit_pipeline_advance(args.tma_consumer_state)
+    if args.is_two_cta:
+        # With gate_exec_warp=False the caller is already inside the
+        # role-local exec loop, so every iteration can advance local state.
+        advance_gate = args.exec_active if gate_exec_warp else None
         full_tile_src = (
-            f"    if {args.exec_active}:\n{textwrap.indent(release_src, '        ')}"
+            _tcgen05_emit_optional_gate(release_src, release_gate, indent="    ")
+            + "\n"
+            + _tcgen05_emit_optional_gate(advance_src, advance_gate, indent="    ")
         )
     else:
-        full_tile_src = textwrap.indent(release_src, "    ")
+        full_tile_src = _tcgen05_emit_optional_gate(
+            release_src + "\n" + advance_src, release_gate, indent="    "
+        )
     fallback_src = (
         "\nelse:\n    cute.arch.sync_threads()" if include_scalar_fallback else ""
     )
@@ -874,13 +914,15 @@ def _build_kloop_pipeline_release_if(
 
 
 def _build_tcgen05_mma_fence_stmt(
-    exec_active: str, *, gate_exec_warp: bool = True
+    exec_active: str, *, gate_exec_warp: bool = True, is_two_cta: bool = False
 ) -> ast.stmt:
-    if gate_exec_warp:
-        return statement_from_string(
-            f"if {exec_active}:\n    cute.arch.fence_view_async_shared()"
-        )
-    return statement_from_string("cute.arch.fence_view_async_shared()")
+    fence_src = "cute.arch.fence_view_async_shared()"
+    predicate = _tcgen05_two_cta_owner_predicate(
+        exec_active, is_two_cta=is_two_cta, gate_exec_warp=gate_exec_warp
+    )
+    if predicate is None:
+        return statement_from_string(fence_src)
+    return statement_from_string(f"if {predicate}:\n    {fence_src}")
 
 
 def _build_tcgen05_mma_issue_stmt(
@@ -894,6 +936,7 @@ def _build_tcgen05_mma_issue_stmt(
     k_offset_var: str,
     k_loop_begin_expr: str,
     gate_exec_warp: bool = True,
+    is_two_cta: bool = False,
 ) -> ast.stmt:
     issue_src = (
         f"for _tcgen05_kblk_idx in range(cute.size({tcgen05_frag_a}, mode=[2])):\n"
@@ -909,8 +952,11 @@ def _build_tcgen05_mma_issue_stmt(
         f"        {acc_frag},\n"
         "    )"
     )
-    if gate_exec_warp:
-        issue_src = f"if {exec_active}:\n{textwrap.indent(issue_src, '    ')}"
+    predicate = _tcgen05_two_cta_owner_predicate(
+        exec_active, is_two_cta=is_two_cta, gate_exec_warp=gate_exec_warp
+    )
+    if predicate is not None:
+        issue_src = f"if {predicate}:\n{textwrap.indent(issue_src, '    ')}"
     return statement_from_string(issue_src)
 
 
@@ -926,13 +972,15 @@ def _build_kloop_non_pipeline_producer_if(
     predicate_terms = [args.tma_full_tile]
     if gate_tma_warp:
         predicate_terms.append(args.tma_warp)
+    copy_src = _kloop_tma_copy_a_src(
+        args, k_offset=args.tma_k_tile
+    ) + _kloop_tma_copy_b_src(args, k_offset=args.tma_k_tile)
     src = (
         f"if {' and '.join(predicate_terms)}:\n"
         f"    {args.tma_pipeline}.producer_acquire({args.tma_producer_state})\n"
         f"    {args.tma_barrier_ptr} = "
         f"{args.tma_pipeline}.producer_get_barrier({args.tma_producer_state})\n"
-        + _kloop_tma_copy_a_src(args, k_offset=args.tma_k_tile)
-        + _kloop_tma_copy_b_src(args, k_offset=args.tma_k_tile)
+        + _two_cta_tma_copy_src(copy_src, is_two_cta=args.is_two_cta)
         + f"    {args.tma_pipeline}.producer_commit({args.tma_producer_state})"
     )
     return statement_from_string(src)
@@ -1082,15 +1130,16 @@ def _build_initial_prefetch_if(
     copy B / producer_commit / advance``. Caller passes a literal
     ``cutlass.Int32(stage_idx)`` for ``k_offset``.
     """
-    tma_producer = _tma_producer_predicate(args.tma_warp, is_two_cta=args.is_two_cta)
-    predicate = " and ".join([*full_tile_gates, tma_producer])
+    predicate = " and ".join([*full_tile_gates, args.tma_warp])
+    copy_src = _initial_prefetch_copy_a_src(
+        args, k_offset=k_offset
+    ) + _initial_prefetch_copy_b_src(args, k_offset=k_offset)
     src = (
         f"if {predicate}:\n"
         f"    {args.tma_pipeline}.producer_acquire({args.tma_producer_state})\n"
         f"    {args.tma_barrier_ptr} = "
         f"{args.tma_pipeline}.producer_get_barrier({args.tma_producer_state})\n"
-        + _initial_prefetch_copy_a_src(args, k_offset=k_offset)
-        + _initial_prefetch_copy_b_src(args, k_offset=k_offset)
+        + _two_cta_tma_copy_src(copy_src, is_two_cta=args.is_two_cta)
         + f"    {args.tma_pipeline}.producer_commit({args.tma_producer_state})\n"
         + emit_pipeline_advance(args.tma_producer_state, indent="    ")
     )
@@ -1426,6 +1475,10 @@ def _emit_mma_pipeline(
     tcgen05_ab_stage_count_value = _tcgen05_config_int(
         df.config, "tcgen05_ab_stages", _tcgen05_ab_stage_count(df.config.num_stages)
     )
+    # Only CtaGroup.TWO uses a two-CTA UMMA release owner. Keep the
+    # CtaGroup.ONE clustered fallback on the legacy single-arrival shape
+    # until that path has separate runtime validation.
+    tcgen05_ab_consumer_arrive_count_value = 2 if tcgen05_is_two_cta else 1
     tcgen05_c_stage_count_value = _tcgen05_config_int(
         df.config, "tcgen05_c_stages", _tcgen05_c_stage_count(bn)
     )
@@ -1436,6 +1489,7 @@ def _emit_mma_pipeline(
         tcgen05_epi_warp_count_value
     )
     tcgen05_matmul_plan: CuteTcgen05MatmulPlan | None = None
+    tcgen05_mma_owner_active: str | None = None
     if mma_impl == "tcgen05":
         tcgen05_matmul_plan = CuteTcgen05MatmulPlan(
             bm=bm,
@@ -1449,6 +1503,12 @@ def _emit_mma_pipeline(
             ab_stage_count=tcgen05_ab_stage_count_value,
             c_stage_count=tcgen05_c_stage_count_value,
             epi_warp_count=tcgen05_epi_warp_count_value,
+        )
+        assert tcgen05_plan is not None
+        tcgen05_mma_owner_active = _tcgen05_two_cta_owner_predicate(
+            tcgen05_plan.exec_active,
+            is_two_cta=tcgen05_is_two_cta,
+            gate_exec_warp=True,
         )
         candidate_block_shape = tcgen05_matmul_plan.block_shape
         df.register_cute_tcgen05_matmul_plan(tcgen05_matmul_plan)
@@ -1619,6 +1679,7 @@ def _emit_mma_pipeline(
             )
     if mma_impl == "tcgen05":
         assert tcgen05_plan is not None
+        assert tcgen05_mma_owner_active is not None
         prefix.append(
             statement_from_string(
                 f"{tcgen05_cluster_layout_vmnk} = cute.tiled_divide("
@@ -1803,7 +1864,7 @@ def _emit_mma_pipeline(
         # acquire stays in the work-tile body when the persistent loop
         # splitter runs.
         _emit_per_tile(
-            f"if {tcgen05_plan.exec_active}:\n"
+            f"if {tcgen05_mma_owner_active}:\n"
             f"    {tcgen05_plan.acc_pipeline}.producer_acquire("
             f"{tcgen05_plan.acc_producer_state})",
             mma_exec=tcgen05_use_role_local_mma_exec,
@@ -2041,7 +2102,7 @@ def _emit_mma_pipeline(
             prefix.append(
                 statement_from_string(
                     f"{tma_pipeline_consumer_group} = cutlass.pipeline.CooperativeGroup("
-                    "cutlass.pipeline.Agent.Thread, 1)"
+                    f"cutlass.pipeline.Agent.Thread, cutlass.Int32({tcgen05_ab_consumer_arrive_count_value}))"
                 )
             )
             prefix.append(
@@ -2404,7 +2465,9 @@ def _emit_mma_pipeline(
                             include_scalar_fallback=False,
                         ),
                         _build_tcgen05_mma_fence_stmt(
-                            tcgen05_plan.exec_active, gate_exec_warp=False
+                            tcgen05_plan.exec_active,
+                            gate_exec_warp=False,
+                            is_two_cta=tcgen05_is_two_cta,
                         ),
                         _build_tcgen05_mma_issue_stmt(
                             exec_active=tcgen05_plan.exec_active,
@@ -2416,6 +2479,7 @@ def _emit_mma_pipeline(
                             k_offset_var=k_offset_var,
                             k_loop_begin_expr=k_loop_begin_expr,
                             gate_exec_warp=False,
+                            is_two_cta=tcgen05_is_two_cta,
                         ),
                         _build_kloop_pipeline_release_if(
                             tma_kloop_args,
@@ -2524,7 +2588,10 @@ def _emit_mma_pipeline(
             assert tcgen05_plan is not None
             if not tcgen05_use_role_local_mma_exec:
                 cg.add_statement(
-                    _build_tcgen05_mma_fence_stmt(tcgen05_plan.exec_active)
+                    _build_tcgen05_mma_fence_stmt(
+                        tcgen05_plan.exec_active,
+                        is_two_cta=tcgen05_is_two_cta,
+                    )
                 )
                 cg.add_statement(
                     _build_tcgen05_mma_issue_stmt(
@@ -2536,6 +2603,7 @@ def _emit_mma_pipeline(
                         mma_stage=mma_stage,
                         k_offset_var=k_offset_var,
                         k_loop_begin_expr=k_loop_begin_expr,
+                        is_two_cta=tcgen05_is_two_cta,
                     )
                 )
                 if tcgen05_use_tma:
@@ -2599,6 +2667,7 @@ def _emit_mma_pipeline(
             suffix.append(statement_from_string("cute.arch.sync_threads()"))
         else:
             assert tcgen05_plan is not None
+            assert tcgen05_mma_owner_active is not None
             assert epi_active is not None
             assert epi_tidx is not None
             # The K-loop suffix's `acc_pipeline.producer_commit` +
@@ -2616,7 +2685,7 @@ def _emit_mma_pipeline(
             # ``_emit_per_tile_suffix`` so they stay inside the work-tile
             # loop.
             suffix_stmt = statement_from_string(
-                f"if {tcgen05_plan.exec_active}:\n"
+                f"if {tcgen05_mma_owner_active}:\n"
                 f"    {tcgen05_plan.acc_pipeline}.producer_commit({tcgen05_plan.acc_producer_state})"
             )
             suffix.append(suffix_stmt)
