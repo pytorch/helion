@@ -907,6 +907,105 @@ def _build_kloop_non_pipeline_release_if(args: _PerKiterTmaArgs) -> ast.stmt:
     return statement_from_string(src)
 
 
+@dataclass(frozen=True)
+class _InitialPrefetchTmaArgs:
+    """Variable names threaded into the initial-prefetch TMA builder.
+
+    The initial prefetch warms stages ``0..ab_stage_count-1`` of the AB
+    pipeline at the start of each tile. Only valid on the tcgen05 TMA
+    path, which requires both A and B to be TMA-loaded, so both
+    ``cute.copy`` emissions are always present.
+
+    All ``str`` fields name a Python identifier or expression in the
+    generated code; every name is guaranteed bound at the call site.
+    """
+
+    tma_pipeline: str
+    tma_producer_state: str
+    tma_barrier_ptr: str
+    tma_warp: str
+    tma_atom_a: str
+    tma_atom_b: str
+    tma_gA: str
+    tma_gB: str
+    tma_sA: str
+    tma_sB: str
+    tma_a_mcast_mask: str
+    tma_b_mcast_mask: str
+    cluster_m: int
+    is_two_cta: bool
+
+
+def _initial_prefetch_copy_a_src(
+    args: _InitialPrefetchTmaArgs, *, k_offset: str
+) -> str:
+    """Initial-prefetch TMA copy source for A.
+
+    A only multicasts in 2-CTA mode (asymmetric vs. B, which also
+    multicasts across cluster CTAs); matches the asymmetry pinned by
+    ``test_mcast_mask_asymmetry_between_a_and_b`` for the per-K-iter
+    builders.
+    """
+    mcast = f", mcast_mask={args.tma_a_mcast_mask}" if args.is_two_cta else ""
+    return (
+        f"    cute.copy({args.tma_atom_a}, "
+        f"{args.tma_gA}[None, {k_offset}], "
+        f"{args.tma_sA}[None, {args.tma_producer_state}.index], "
+        f"tma_bar_ptr={args.tma_barrier_ptr}{mcast})\n"
+    )
+
+
+def _initial_prefetch_copy_b_src(
+    args: _InitialPrefetchTmaArgs, *, k_offset: str
+) -> str:
+    """Initial-prefetch TMA copy source for B.
+
+    B multicasts on ``cluster_m > 1`` or 2-CTA; A only on 2-CTA, so the
+    two helpers are not folded together.
+    """
+    mcast = (
+        f", mcast_mask={args.tma_b_mcast_mask}"
+        if args.cluster_m > 1 or args.is_two_cta
+        else ""
+    )
+    return (
+        f"    cute.copy({args.tma_atom_b}, "
+        f"{args.tma_gB}[None, {k_offset}], "
+        f"{args.tma_sB}[None, {args.tma_producer_state}.index], "
+        f"tma_bar_ptr={args.tma_barrier_ptr}{mcast})\n"
+    )
+
+
+def _build_initial_prefetch_if(
+    args: _InitialPrefetchTmaArgs,
+    *,
+    full_tile_gates: list[str],
+    k_offset: str,
+) -> ast.stmt:
+    """Initial-prefetch ``if`` block for stage ``k_offset``.
+
+    The predicate is ``<full_tile_gates joined with ' and '> and
+    {args.tma_warp}``: stage-0 callers pass
+    ``[tma_initial_full_tile]``; stage-(N-1) callers (only when
+    ``ab_stage_count > 1``) extend with ``tma_initial_next_full_tile``.
+    The body performs ``producer_acquire / get_barrier / copy A /
+    copy B / producer_commit / advance``. Caller passes a literal
+    ``cutlass.Int32(stage_idx)`` for ``k_offset``.
+    """
+    predicate = " and ".join([*full_tile_gates, args.tma_warp])
+    src = (
+        f"if {predicate}:\n"
+        f"    {args.tma_pipeline}.producer_acquire({args.tma_producer_state})\n"
+        f"    {args.tma_barrier_ptr} = "
+        f"{args.tma_pipeline}.producer_get_barrier({args.tma_producer_state})\n"
+        + _initial_prefetch_copy_a_src(args, k_offset=k_offset)
+        + _initial_prefetch_copy_b_src(args, k_offset=k_offset)
+        + f"    {args.tma_pipeline}.producer_commit({args.tma_producer_state})\n"
+        + emit_pipeline_advance(args.tma_producer_state, indent="    ")
+    )
+    return statement_from_string(src)
+
+
 def _emit_mma_pipeline(
     cg: GenerateAST,
     lhs_node: Node,
@@ -1803,40 +1902,37 @@ def _emit_mma_pipeline(
                 # already gated by ``if {tma_warp}:`` inline) and therefore
                 # also tagged with ``tma_load=True`` so the role
                 # partitioner can route them into the TMA-load block.
+                assert tma_warp is not None
+                prefetch_args = _InitialPrefetchTmaArgs(
+                    tma_pipeline=tma_pipeline,
+                    tma_producer_state=tma_producer_state,
+                    tma_barrier_ptr=tma_barrier_ptr,
+                    tma_warp=tma_warp,
+                    tma_atom_a=tma_atom_a,
+                    tma_atom_b=tma_atom_b,
+                    tma_gA=tma_gA,
+                    tma_gB=tma_gB,
+                    tma_sA=tma_sA,
+                    tma_sB=tma_sB,
+                    tma_a_mcast_mask=tma_a_mcast_mask,
+                    tma_b_mcast_mask=tma_b_mcast_mask,
+                    cluster_m=tcgen05_cluster_m,
+                    is_two_cta=tcgen05_is_two_cta,
+                )
                 _emit_per_tile(
                     f"{tma_initial_full_tile} = "
                     f"{m_offset_var} + cutlass.Int32({bm}) <= cutlass.Int32({m_size}) "
                     f"and {n_offset_var} + cutlass.Int32({bn}) <= cutlass.Int32({n_size}) "
                     f"and cutlass.Int32({bk}) <= cutlass.Int32({k_total_size})"
                 )
-                _emit_per_tile(
-                    f"if {tma_initial_full_tile} and {tma_warp}:\n"
-                    f"    {tma_pipeline}.producer_acquire({tma_producer_state})\n"
-                    f"    {tma_barrier_ptr} = {tma_pipeline}.producer_get_barrier({tma_producer_state})\n"
-                    + (
-                        f"    cute.copy({tma_atom_a}, {tma_gA}[None, cutlass.Int32(0)], "
-                        f"{tma_sA}[None, {tma_producer_state}.index], "
-                        f"tma_bar_ptr={tma_barrier_ptr}"
-                        + (
-                            f", mcast_mask={tma_a_mcast_mask}"
-                            if tcgen05_is_two_cta
-                            else ""
-                        )
-                        + ")\n"
-                        f"    cute.copy({tma_atom_b}, {tma_gB}[None, cutlass.Int32(0)], "
-                        f"{tma_sB}[None, {tma_producer_state}.index], "
-                        f"tma_bar_ptr={tma_barrier_ptr}"
-                        + (
-                            f", mcast_mask={tma_b_mcast_mask}"
-                            if tcgen05_cluster_m > 1 or tcgen05_is_two_cta
-                            else ""
-                        )
-                        + ")\n"
-                    )
-                    + f"    {tma_pipeline}.producer_commit({tma_producer_state})\n"
-                    + emit_pipeline_advance(tma_producer_state, indent="    "),
-                    tma_load=True,
+                stage0_prefetch = _build_initial_prefetch_if(
+                    prefetch_args,
+                    full_tile_gates=[tma_initial_full_tile],
+                    k_offset="cutlass.Int32(0)",
                 )
+                prefix.append(stage0_prefetch)
+                per_tile_stmts.append(stage0_prefetch)
+                tma_load_role_stmts.append(stage0_prefetch)
                 if tcgen05_ab_stage_count_value > 1:
                     _emit_per_tile(
                         f"{tma_initial_next_full_tile} = "
@@ -1844,34 +1940,17 @@ def _emit_mma_pipeline(
                         f"and {n_offset_var} + cutlass.Int32({bn}) <= cutlass.Int32({n_size}) "
                         f"and cutlass.Int32({bk * tcgen05_ab_stage_count_value}) <= cutlass.Int32({k_total_size})"
                     )
-                    _emit_per_tile(
-                        f"if {tma_initial_full_tile} and {tma_initial_next_full_tile} and {tma_warp}:\n"
-                        f"    {tma_pipeline}.producer_acquire({tma_producer_state})\n"
-                        f"    {tma_barrier_ptr} = {tma_pipeline}.producer_get_barrier({tma_producer_state})\n"
-                        + (
-                            f"    cute.copy({tma_atom_a}, {tma_gA}[None, cutlass.Int32({tcgen05_ab_stage_count_value - 1})], "
-                            f"{tma_sA}[None, {tma_producer_state}.index], "
-                            f"tma_bar_ptr={tma_barrier_ptr}"
-                            + (
-                                f", mcast_mask={tma_a_mcast_mask}"
-                                if tcgen05_is_two_cta
-                                else ""
-                            )
-                            + ")\n"
-                            f"    cute.copy({tma_atom_b}, {tma_gB}[None, cutlass.Int32({tcgen05_ab_stage_count_value - 1})], "
-                            f"{tma_sB}[None, {tma_producer_state}.index], "
-                            f"tma_bar_ptr={tma_barrier_ptr}"
-                            + (
-                                f", mcast_mask={tma_b_mcast_mask}"
-                                if tcgen05_cluster_m > 1 or tcgen05_is_two_cta
-                                else ""
-                            )
-                            + ")\n"
-                        )
-                        + f"    {tma_pipeline}.producer_commit({tma_producer_state})\n"
-                        + emit_pipeline_advance(tma_producer_state, indent="    "),
-                        tma_load=True,
+                    stage_n_prefetch = _build_initial_prefetch_if(
+                        prefetch_args,
+                        full_tile_gates=[
+                            tma_initial_full_tile,
+                            tma_initial_next_full_tile,
+                        ],
+                        k_offset=f"cutlass.Int32({tcgen05_ab_stage_count_value - 1})",
                     )
+                    prefix.append(stage_n_prefetch)
+                    per_tile_stmts.append(stage_n_prefetch)
+                    tma_load_role_stmts.append(stage_n_prefetch)
     else:
         prefix.append(
             statement_from_string(

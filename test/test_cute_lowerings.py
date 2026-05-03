@@ -32,6 +32,7 @@ from helion._compiler.backend import _loop_contains_matmul
 from helion._compiler.backend import _loop_may_use_mma
 from helion._compiler.compile_environment import CompileEnvironment
 from helion._compiler.cute.argreduce import codegen_cute_tile_argreduce
+from helion._compiler.cute.cute_mma import _build_initial_prefetch_if
 from helion._compiler.cute.cute_mma import _build_kloop_non_pipeline_producer_if
 from helion._compiler.cute.cute_mma import _build_kloop_non_pipeline_release_if
 from helion._compiler.cute.cute_mma import _build_kloop_pipeline_consumer_if
@@ -39,6 +40,7 @@ from helion._compiler.cute.cute_mma import _build_kloop_pipeline_producer_if
 from helion._compiler.cute.cute_mma import _build_kloop_pipeline_release_if
 from helion._compiler.cute.cute_mma import _choose_mma_impl
 from helion._compiler.cute.cute_mma import _get_mma_k_loop_info
+from helion._compiler.cute.cute_mma import _InitialPrefetchTmaArgs
 from helion._compiler.cute.cute_mma import _make_tcgen05_layout_plan_setup
 from helion._compiler.cute.cute_mma import _mma_result_can_be_deferred
 from helion._compiler.cute.cute_mma import _new_tcgen05_layout_plan
@@ -4720,6 +4722,167 @@ class TestPerKiterTmaBuilders(unittest.TestCase):
             )
             self.assertIn("a_mcast_mask", two_cta)
             self.assertIn("b_mcast_mask", two_cta)
+
+
+class TestInitialPrefetchTmaBuilder(unittest.TestCase):
+    """AST shape tests for ``_build_initial_prefetch_if`` in ``cute_mma.py``.
+
+    Two call sites use this builder: the stage-0 prefetch
+    (``full_tile_gates=[tma_initial_full_tile]``) and -- only when
+    ``ab_stage_count > 1`` -- the stage-(N-1) prefetch which also
+    AND-gates on ``tma_initial_next_full_tile``. The builder appends
+    ``args.tma_warp`` as the trailing gate. Tests pin the predicate
+    shape, the body, and the same A/B mcast asymmetry that the per-K-iter
+    builders enforce.
+    """
+
+    def _make_args(
+        self,
+        *,
+        cluster_m: int = 1,
+        is_two_cta: bool = False,
+    ) -> _InitialPrefetchTmaArgs:
+        return _InitialPrefetchTmaArgs(
+            tma_pipeline="ab_pipeline",
+            tma_producer_state="ab_producer_state",
+            tma_barrier_ptr="tma_barrier_ptr",
+            tma_warp="tma_warp",
+            tma_atom_a="tma_atom_a",
+            tma_atom_b="tma_atom_b",
+            tma_gA="gA",
+            tma_gB="gB",
+            tma_sA="sA",
+            tma_sB="sB",
+            tma_a_mcast_mask="a_mcast_mask",
+            tma_b_mcast_mask="b_mcast_mask",
+            cluster_m=cluster_m,
+            is_two_cta=is_two_cta,
+        )
+
+    @staticmethod
+    def _stmt_kinds(stmts: list[ast.stmt]) -> list[str]:
+        kinds = []
+        for stmt in stmts:
+            if isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call):
+                func = stmt.value.func
+                if isinstance(func, ast.Attribute):
+                    kinds.append(func.attr)
+                elif isinstance(func, ast.Name):
+                    kinds.append(func.id)
+                else:
+                    kinds.append(type(func).__name__)
+            elif (
+                isinstance(stmt, ast.Assign)
+                and isinstance(stmt.value, ast.Call)
+                and isinstance(stmt.value.func, ast.Attribute)
+            ):
+                kinds.append(f"={stmt.value.func.attr}")
+            else:
+                kinds.append(type(stmt).__name__)
+        return kinds
+
+    def test_stage0_predicate_and_body(self) -> None:
+        """Stage-0 prefetch: predicate is ``initial_full_tile and
+        tma_warp``; body is acquire / get_barrier / copy A / copy B /
+        commit / advance with ``k_offset = cutlass.Int32(0)``. No
+        try-token (initial prefetch always takes the slow path).
+        """
+        args = self._make_args()
+        node = _build_initial_prefetch_if(
+            args,
+            full_tile_gates=["initial_full_tile"],
+            k_offset="cutlass.Int32(0)",
+        )
+        self.assertIsInstance(node, ast.If)
+        self.assertEqual(
+            ast.unparse(node.test),
+            "initial_full_tile and tma_warp",
+        )
+        self.assertEqual(
+            self._stmt_kinds(node.body),
+            [
+                "producer_acquire",
+                "=producer_get_barrier",
+                "copy",
+                "copy",
+                "producer_commit",
+                "advance",
+            ],
+        )
+        body_src = ast.unparse(ast.Module(body=node.body, type_ignores=[]))
+        self.assertIn("cutlass.Int32(0)", body_src)
+        # No try-token in the prefetch path.
+        self.assertNotIn("producer_try_acquire", body_src)
+        self.assertNotIn("ab_producer_try_token", body_src)
+
+    def test_stage_n_minus_one_predicate_extends_with_next_full_tile(self) -> None:
+        """Stage-(N-1) prefetch (when ``ab_stage_count > 1``): caller
+        AND-gates on ``initial_next_full_tile`` via ``full_tile_gates``
+        and supplies ``cutlass.Int32(stage_count - 1)`` as ``k_offset``.
+        The builder appends ``args.tma_warp`` as the trailing gate.
+        """
+        args = self._make_args()
+        node = _build_initial_prefetch_if(
+            args,
+            full_tile_gates=["initial_full_tile", "initial_next_full_tile"],
+            k_offset="cutlass.Int32(1)",
+        )
+        self.assertEqual(
+            ast.unparse(node.test),
+            "initial_full_tile and initial_next_full_tile and tma_warp",
+        )
+        body_src = ast.unparse(ast.Module(body=node.body, type_ignores=[]))
+        self.assertIn("cutlass.Int32(1)", body_src)
+        # The non-stage-0 prefetch reads from gA[None, Int32(stage-1)] /
+        # gB[None, Int32(stage-1)], not Int32(0).
+        self.assertNotIn("None, cutlass.Int32(0)", body_src)
+
+    def test_mcast_mask_asymmetry_matches_per_kiter(self) -> None:
+        """A only multicasts in 2-CTA mode; B multicasts on
+        ``cluster_m > 1`` OR 2-CTA. Same asymmetry as the per-K-iter
+        builders -- the prefetch must read from the same gA/gB layouts
+        with the same multicast modes, otherwise stages 0 and N-1 of
+        the pipeline land in different SMEM slices than the K-loop
+        producer expects.
+        """
+        single = ast.unparse(
+            ast.Module(
+                body=_build_initial_prefetch_if(
+                    self._make_args(cluster_m=1, is_two_cta=False),
+                    full_tile_gates=["full_tile"],
+                    k_offset="cutlass.Int32(0)",
+                ).body,
+                type_ignores=[],
+            )
+        )
+        self.assertNotIn("a_mcast_mask", single)
+        self.assertNotIn("b_mcast_mask", single)
+
+        clustered = ast.unparse(
+            ast.Module(
+                body=_build_initial_prefetch_if(
+                    self._make_args(cluster_m=2, is_two_cta=False),
+                    full_tile_gates=["full_tile"],
+                    k_offset="cutlass.Int32(0)",
+                ).body,
+                type_ignores=[],
+            )
+        )
+        self.assertNotIn("a_mcast_mask", clustered)
+        self.assertIn("b_mcast_mask", clustered)
+
+        two_cta = ast.unparse(
+            ast.Module(
+                body=_build_initial_prefetch_if(
+                    self._make_args(cluster_m=2, is_two_cta=True),
+                    full_tile_gates=["full_tile"],
+                    k_offset="cutlass.Int32(0)",
+                ).body,
+                type_ignores=[],
+            )
+        )
+        self.assertIn("a_mcast_mask", two_cta)
+        self.assertIn("b_mcast_mask", two_cta)
 
 
 if __name__ == "__main__":
