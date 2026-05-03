@@ -1101,10 +1101,7 @@ class ConfigSpec:
             if self.cute_tcgen05_search_enabled:
                 fields["l2_groupings"] = self.l2_groupings
                 fields.update(self._tcgen05_optional_fragments(for_search=True))
-                if (
-                    self.supports_config_key("pid_type")
-                    and len(self.allowed_pid_types) > 1
-                ):
+                if self.supports_config_key("pid_type"):
                     fields["pid_type"] = EnumFragment(self.allowed_pid_types)
             if self.supports_config_key("num_threads"):
                 fields["num_threads"] = self.num_threads
