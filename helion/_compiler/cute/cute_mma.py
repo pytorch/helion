@@ -1223,13 +1223,10 @@ def _emit_mma_pipeline(
         or n_block_id is None
     ):
         return None
-    # All tcgen05 widths share the direct TMEM->register->GMEM SIMT epilogue
-    # emitted by `_codegen_cute_store_tcgen05_tile` in
-    # `helion/language/memory_ops.py`. It uses
-    # `cutlass.utils.gemm.sm100.epilogue_tmem_copy_and_partition` for the
-    # TMEM->reg copy and a SIMT `CopyUniversalOp` for the reg->GMEM store on
-    # the four epi warps, avoiding the SMEM round-trip used by the previous
-    # staged path.
+    # tcgen05 epilogues are emitted by `_codegen_cute_store_tcgen05_tile` in
+    # `helion/language/memory_ops.py`. Static-full flat kernels use the SMEM
+    # staged TMA-store epilogue; persistent and partial fallback kernels still
+    # use the direct TMEM->register->GMEM SIMT path.
 
     m_index_var = cg.index_var(m_block_id)
     n_index_var = cg.index_var(n_block_id)
@@ -1274,6 +1271,16 @@ def _emit_mma_pipeline(
     tcgen05_use_role_local_mma_exec = tcgen05_use_role_local_tma_producer
     # Keep a distinct name so future epi-role gating changes are localized.
     tcgen05_use_role_local_epi = tcgen05_use_role_local_tma_producer
+    # Flat kernels process one output tile per CTA, so the c_pipeline stage is
+    # just the subtile index. Persistent kernels need an explicit per-work-tile
+    # ring counter before c_pipeline stages can safely span multiple tiles.
+    tcgen05_use_tma_store_epilogue = (
+        mma_impl == "tcgen05"
+        and tcgen05_use_tma_pipeline
+        and tcgen05_static_full_tiles
+        and _tcgen05_cluster_m(df.config) == 1
+        and not _is_persistent_pid_config(df.config)
+    )
     tcgen05_collective_handles_operand_loads = (
         mma_impl == "tcgen05"
         and fx_node is not None
@@ -1801,8 +1808,14 @@ def _emit_mma_pipeline(
     gmem_b_tma_part = df.new_var("gB_tma_part")
     tma_atom_a = df.new_var("tma_atom_a")
     tma_atom_b = df.new_var("tma_atom_b")
+    tma_store_atom = (
+        df.new_var("tcgen05_tma_store_atom") if tcgen05_use_tma_store_epilogue else ""
+    )
     tma_tensor_a = df.new_var("tma_tensor_a")
     tma_tensor_b = df.new_var("tma_tensor_b")
+    tma_store_tensor = (
+        df.new_var("tcgen05_tma_store_tensor") if tcgen05_use_tma_store_epilogue else ""
+    )
     tma_cta_layout = df.new_var("tma_cta_layout")
     tma_gA = df.new_var("tma_gA")
     tma_sA = df.new_var("tma_sA")
@@ -2511,8 +2524,8 @@ def _emit_mma_pipeline(
     # Allocate smem_c in outer_prefix so all smem is allocated at the same
     # scope level (CuTe DSL assigns static smem offsets per scope). Only the
     # `universal` and `warp` MMA paths still need the staged smem_c buffer;
-    # tcgen05 now uses the direct TMEM->reg->GMEM SIMT epilogue from
-    # `_codegen_cute_store_tcgen05_tile` and skips the smem_c allocation.
+    # tcgen05 epilogues are handled by `_codegen_cute_store_tcgen05_tile`
+    # and skip the older generic smem_c allocation.
     smem_c_ptr = df.new_var("smem_c")
     smem_c = df.new_var("smem_c_t")
     tCsC = df.new_var("tCsC")
@@ -2586,12 +2599,10 @@ def _emit_mma_pipeline(
             per_tile_stmts.append(advance_stmt)
             if tcgen05_use_role_local_mma_exec:
                 mma_exec_role_stmts.append(advance_stmt)
-            # The full TMEM->reg->GMEM epilogue + allocator teardown for
-            # tcgen05 is emitted by `_codegen_cute_store_tcgen05_tile` when
-            # the kernel actually stores `out[tile_m, tile_n] = result`. That
-            # path covers all bn widths now (the previously separate
-            # staged-via-smem_c flow has been removed; the dead code lived
-            # here).
+            # The tcgen05 epilogue + allocator teardown is emitted by
+            # `_codegen_cute_store_tcgen05_tile` when the kernel stores
+            # `out[tile_m, tile_n] = result`. Static-full flat kernels take
+            # the TMA-store path; persistent/partial fallbacks keep SIMT.
             sync_stmt = statement_from_string("cute.arch.sync_threads()")
             suffix.append(sync_stmt)
             per_tile_stmts.append(sync_stmt)
@@ -2601,6 +2612,7 @@ def _emit_mma_pipeline(
         assert epi_tidx is not None
         assert epi_active is not None
         assert tma_warp is not None
+        assert warp_idx is not None
         df.register_cute_tcgen05_store_value(
             result_var,
             CuteTcgen05StoreValue(
@@ -2613,6 +2625,7 @@ def _emit_mma_pipeline(
                 epi_tidx=epi_tidx,
                 epi_active=epi_active,
                 exec_active=tcgen05_plan.exec_active,
+                warp_idx=warp_idx,
                 epi_tile=tcgen05_plan.epi_tile,
                 c_stage_count=tcgen05_c_stage_count_value,
                 epilog_sync_barrier_id=_TCGEN05_EPILOG_SYNC_BARRIER_ID,
@@ -2630,9 +2643,12 @@ def _emit_mma_pipeline(
                 tma_warp=tma_warp,
                 tma_pipeline=tma_pipeline,
                 tma_producer_state=tma_producer_state,
+                tma_store_atom=tma_store_atom,
+                tma_store_tensor=tma_store_tensor,
                 is_two_cta=tcgen05_is_two_cta,
                 use_tma=tcgen05_use_tma,
                 use_role_local_epi=tcgen05_use_role_local_epi,
+                use_tma_store_epilogue=tcgen05_use_tma_store_epilogue,
                 ab_stage_count=tcgen05_ab_stage_count_value,
                 acc_stage_count=tcgen05_acc_stage_count_value,
             ),
