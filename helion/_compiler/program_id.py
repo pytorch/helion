@@ -793,6 +793,43 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             dims.append("1")
         return f"({', '.join(dims[:3])})"
 
+    def _tcgen05_num_work_clusters_expr(self, *, is_device: bool) -> str:
+        """Return the number of scheduler work clusters.
+
+        ``StaticPersistentTileScheduler.create`` initializes its current
+        work index from ``block_idx.z`` and uses ``block_idx.x/y`` only as
+        the CTA's coordinate inside a cluster. The launch grid therefore
+        needs one z block per persistent work cluster, not a flat x-only
+        ``(_NUM_SM,)`` grid.
+        """
+        dims = [pid.num_pids_expr(is_device=is_device) for pid in self.pid_info]
+        while len(dims) < 3:
+            dims.append("1")
+        cluster_m = self._tcgen05_cluster_m()
+        if cluster_m > 1:
+            dims[0] = f"(({dims[0]}) + {cluster_m} - 1) // {cluster_m}"
+        return " * ".join(f"({dim})" for dim in dims[:3])
+
+    def codegen_grid(self) -> ast.AST:
+        # Tcgen05 persistent kernels, including guarded legacy fallback
+        # shapes, use CUTLASS' z-indexed scheduler instead of the parent
+        # virtual-PID loop. Multi-root ForEach kernels are still host-guarded
+        # because this grid is derived from this case's pid_info only.
+        cluster_m = self._tcgen05_cluster_m()
+        total_clusters = self._tcgen05_num_work_clusters_expr(is_device=False)
+        if cluster_m == 1:
+            max_persistent_clusters = self.grid_size_expr
+        else:
+            # ``grid_size_expr`` is expressed in CTAs. A tcgen05 scheduler
+            # work cluster owns ``cluster_m`` CTAs along M, so z may contain
+            # at most the CTA budget divided by that cluster size. Explicit
+            # cluster_m > 1 configs still codegen, but multi-tile runtime is
+            # guarded until that lowering is validated.
+            max_persistent_clusters = f"max(1, ({self.grid_size_expr}) // {cluster_m})"
+        return expr_from_string(
+            f"({cluster_m}, 1, min(({total_clusters}), ({max_persistent_clusters})))"
+        )
+
     def _tcgen05_linear_virtual_pid_expr(self, work_tile_var: str) -> str:
         terms: list[str] = []
         for i, _pid in enumerate(self.pid_info):
@@ -1237,42 +1274,54 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
     # the test pin and the error path stay in sync. ``%d`` is filled in at
     # runtime with the bound total-tile count.
     _MULTI_TILE_GUARD_MESSAGE: ClassVar[str] = (
-        "Helion CuTe persistent + tcgen05 currently produces "
-        "wrong output when the kernel processes more than one "
-        "work tile total. The kernel was launched with "
-        "total_tiles=%d > 1, which exercises the multi-tile "
-        'path. Use a non-persistent pid_type (e.g. "flat") or '
-        "pick block sizes that keep total_tiles == 1."
+        "Helion CuTe persistent + tcgen05 currently supports multi-tile "
+        "execution only for single-root static full tiles with "
+        "tcgen05_cluster_m=1. Partial K/M/N tile fallback shapes, "
+        "multi-root kernels, and unvalidated cluster_m settings can "
+        "produce wrong output or launch failures. The kernel was launched "
+        "with total_tiles=%d, which is outside the validated persistent "
+        "scheduler set for this path. "
+        'Use a non-persistent pid_type (e.g. "flat"), pick a single-root '
+        "static-full-tile kernel with tcgen05_cluster_m=1, or, for "
+        "single-root fallback paths, pick block sizes that keep "
+        "total_tiles == 1."
     )
 
-    def _emit_host_multi_tile_guard(self, device_function: DeviceFunction) -> None:
+    def _emit_host_multi_tile_guard(
+        self,
+        device_function: DeviceFunction,
+        host_total_pids_expr: str | None = None,
+        guard_threshold: int = 1,
+    ) -> None:
         """Emit a host-side guard against multi-tile execution.
 
-        Persistent + tcgen05 currently produces wrong output when the kernel
-        processes more than one work tile in total. Empirically, even with
-        148 SMs and 4 work tiles (so each CTA processes 0 or 1 tile), the
-        persistent wrapper interferes with kernel correctness across tile
-        boundaries. Only the single-tile case is verified correct. The
-        role-local persistent shape is now emitted for the current roles,
-        but this guard stays until multi-tile runtime correctness is proven
-        and the persistent-pid autotune restrictions can be lifted.
+        The single-root static full-tile role-local path has multi-tile
+        runtime coverage only for ``tcgen05_cluster_m == 1``. Legacy
+        non-role-local tcgen05 persistent kernels, multi-root kernels, and
+        explicit cluster_m > 1 configs still hit, or lack coverage for,
+        wrong-output / launch-failure modes in multi-tile shapes, so this
+        guard remains for those paths. Single-tile shapes continue to run
+        because they do not exercise scheduler tile-to-tile transitions.
 
-        The autotuner narrowing in ``matmul_ops.enforce_dot_requirements``
-        already removes ``persistent_blocked`` / ``persistent_interleaved``
-        from the search space for tcgen05 BF16/FP16 matmuls, so this guard
-        only fires for explicit user configs that bypass autotune.
+        The autotuner narrowing in
+        ``ConfigSpec.narrow_tcgen05_autotune_to_validated_configs`` removes
+        ``persistent_blocked`` / ``persistent_interleaved`` from the search
+        space for tcgen05 BF16/FP16 matmuls, so this guard only fires for
+        explicit user configs that bypass autotune.
 
-        The threshold is intentionally ``total_tiles > 1`` and not
-        ``tiles_per_cta > 1`` or ``total_tiles > num_sms``: we have observed
-        wrong output even when ``total_tiles <= num_sms`` (148 SMs, 4 work
-        tiles). Loosening the guard to a per-CTA bound would re-introduce
-        the silent wrong-output failure mode. Tighten only after the role-
-        local persistent rewrite makes the multi-tile path actually
-        correct.
+        The threshold is intentionally ``total_tiles > 1`` for guarded
+        single-root paths. For partial fallback shapes this converts known
+        launch and wrong-output failures into a host error. Multi-root
+        kernels use ``total_tiles > 0`` because the scheduler grid is
+        derived from only the first root case; even one tile in a later case
+        is unsafe. For cluster_m > 1 this keeps unvalidated multi-tile
+        execution disabled until 2-CTA runtime coverage lands.
         """
-        host_total_pids = " * ".join(
-            f"({pid.num_pids_expr(is_device=False)})" for pid in self.pid_info
-        )
+        host_total_pids = host_total_pids_expr
+        if host_total_pids is None:
+            host_total_pids = " * ".join(
+                f"({pid.num_pids_expr(is_device=False)})" for pid in self.pid_info
+            )
         if not host_total_pids:
             return
         # Bind the host-side total-tiles expression once so non-trivial pid-
@@ -1286,18 +1335,23 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         # the total-tile count at runtime.
         message_literal = repr(self._MULTI_TILE_GUARD_MESSAGE)
         guard = (
-            f"if {total_var} > 1:\n"
+            f"if {total_var} > {guard_threshold}:\n"
             f"    raise RuntimeError({message_literal} % ({total_var},))"
         )
         device_function.codegen.host_statements.append(statement_from_string(guard))
 
     def _setup_tcgen05_persistent_kernel(
-        self, device_function: DeviceFunction
+        self,
+        device_function: DeviceFunction,
     ) -> list[ast.stmt]:
-        self._emit_host_multi_tile_guard(device_function)
         wrapped_body = cast("list[ast.stmt]", list(device_function.body))
-        if isinstance(device_function.pid, ForEachProgramID):
-            shared_pid_var = device_function.pid.shared_pid_var
+        multi_root_pid = device_function.pid
+        is_multi_root = isinstance(multi_root_pid, ForEachProgramID)
+        host_guard_total_pids = None
+        if is_multi_root:
+            assert isinstance(multi_root_pid, ForEachProgramID)
+            shared_pid_var = multi_root_pid.shared_pid_var
+            host_guard_total_pids = multi_root_pid.total_pids_expr(is_device=False)
             wrapped_body = [
                 statement_from_string(f"{shared_pid_var} = {self.virtual_pid_var}"),
                 *wrapped_body,
@@ -1317,8 +1371,19 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         layout = self._build_tcgen05_persistent_layout(device_function)
         partition = self._partition_tcgen05_role_blocks(device_function, wrapped_body)
         use_role_local_body = bool(partition.role_blocks_extracted)
+        use_validated_role_local_body = (
+            use_role_local_body and layout.cluster_m == 1 and not is_multi_root
+        )
         if use_role_local_body:
+            # Retarget even for guarded cluster_m>1 / multi-root codegen so
+            # compile-only inspection still sees the role-local scheduler shape.
             self._retarget_tcgen05_shared_scheduler_to_exec(layout)
+        if not use_validated_role_local_body:
+            self._emit_host_multi_tile_guard(
+                device_function,
+                host_guard_total_pids,
+                guard_threshold=0 if is_multi_root else 1,
+            )
 
         setup: list[ast.stmt] = []
         setup.extend(self._build_tcgen05_persistent_prelude(layout))
@@ -1754,9 +1819,10 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         original tagged statements; shared blocks emit naked
         statements. The defines-before-uses invariant from the
         pre-split body carries through, so single-tile correctness is
-        unchanged. Multi-tile is still gated by the host-side guard
-        (see ``_emit_host_multi_tile_guard``) until role-local
-        persistent loops land.
+        unchanged. Multi-tile remains gated by the host-side guard when
+        this shared-only shape is used for the legacy non-role-local path.
+        Static full-tile role-local kernels use sibling role-local loops
+        and lift that guard only for validated ``cluster_m == 1`` configs.
 
         ``emit_block_wide_sync`` controls the per-tile
         ``cute.arch.sync_threads()`` (a CTA-wide barrier). The default
@@ -1993,9 +2059,12 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         ``while`` so existing CTA-wide barriers remain valid.
 
         **Current limitation.** The TMA-load, MMA-exec, and SIMT epilogue
-        roles are extracted today. Multi-tile persistent tcgen05 remains
-        blocked by the host guard until multi-tile correctness is proven and
-        the autotune restrictions can be lifted.
+        roles are extracted today. Single-root static full-tile multi-tile
+        correctness is validated for ``cluster_m == 1``. Partial fallback
+        shapes, multi-root ForEach kernels, and ``cluster_m > 1`` configs
+        remain guarded for multi-tile execution, and persistent pid types
+        stay out of autotune until the search can admit only the validated
+        role-local subset.
         """
         # Wrap the shared body's tagged-removed view in the standard
         # per-tile shape. ``shared_role_blocks`` reuses the

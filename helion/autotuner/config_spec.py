@@ -466,17 +466,20 @@ class ConfigSpec:
         num_epi_warps restriction additionally tightens validation
         because the underlying failure mode is silent wrong output.
 
-        * **Multi-tile persistent.** The current tcgen05 lowering does not
-          interoperate with the persistent virtual-pid loop on B200: any
-          ``total_tiles > 1`` silently produces wrong output (only the
-          single-tile case is verified correct). Drop ``persistent_blocked``
-          and ``persistent_interleaved`` from the autotune pid_type search
-          until the role-local persistent rewrite lands. A host-side guard
+        * **Persistent autotune gating.** Static full-tile tcgen05
+          persistent kernels now use role-local loops and have multi-tile
+          runtime coverage. Autotune still explores shapes/block sizes that
+          can fall back to the legacy non-role-local persistent path, which
+          remains guarded because partial multi-tile kernels launch-fail or
+          miscompute. Drop ``persistent_blocked`` and
+          ``persistent_interleaved`` from the autotune pid_type search until
+          the search space can admit only validated single-root static
+          full-tile role-local ``cluster_m=1`` configs. Fixing the legacy
+          fallback is separate cleanup, not the next autotune re-entry
+          criterion. The host-side guard
           (``Tcgen05PersistentProgramIDs._emit_host_multi_tile_guard``)
-          converts the silent miscompare into a loud ``RuntimeError`` for
-          explicit user configs that bypass autotune. Lifts when item 1
-          (mainloop role-local persistent loops) lands; see
-          ``cute_plan.md`` "Closing the Perf Gap — Priority Order".
+          converts explicit unsafe user configs into a loud
+          ``RuntimeError``.
 
         * **2-CTA cluster.** ``cluster_m=2`` (2-CTA tcgen05 instructions)
           currently CUDA-launch-fails on B200 across the matmul block-size
