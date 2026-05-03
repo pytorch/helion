@@ -4570,6 +4570,88 @@ class TestCuteDslCompat(unittest.TestCase):
         self.assertNotIn("acc_pipeline.sync_object_empty.wait", src)
         self.assertIn("acc_pipeline.producer_acquire(acc_state)", src)
 
+    def test_tma_umma_tail_uses_upstream_when_advance_and_tail_safe(self) -> None:
+        from helion._compiler.cute import cutedsl_compat
+
+        with (
+            patch.object(
+                cutedsl_compat, "cutedsl_has_opresultlist_fix", return_value=True
+            ),
+            patch.object(
+                cutedsl_compat,
+                "cutedsl_tma_umma_tail_has_peer_cta_semantics",
+                return_value=True,
+            ),
+        ):
+            self.assertEqual(
+                cutedsl_compat.emit_producer_tail_tma_umma(
+                    "ab_pipeline", "ab_state", num_stages=3
+                ),
+                "ab_pipeline.producer_tail(ab_state)",
+            )
+
+    def test_tma_umma_tail_inlines_when_tail_semantics_unsafe(self) -> None:
+        from helion._compiler.cute import cutedsl_compat
+
+        with (
+            patch.object(
+                cutedsl_compat, "cutedsl_has_opresultlist_fix", return_value=True
+            ),
+            patch.object(
+                cutedsl_compat,
+                "cutedsl_tma_umma_tail_has_peer_cta_semantics",
+                return_value=False,
+            ),
+        ):
+            src = cutedsl_compat.emit_producer_tail_tma_umma(
+                "ab_pipeline", "ab_state", num_stages=3
+            )
+
+        self.assertNotIn("block_idx_in_cluster", src)
+        self.assertNotIn("_pt_cta_rank", src)
+        self.assertNotIn("if True", src)
+        self.assertLess(
+            src.index("ab_state._count = ab_state._count + cutlass.Int32(1)"),
+            src.index("ab_pipeline.producer_acquire(ab_state)"),
+        )
+        self.assertEqual(
+            src.count("ab_state._count = ab_state._count + cutlass.Int32(1)"),
+            2,
+        )
+        self.assertIn("ab_pipeline.producer_acquire(ab_state)", src)
+
+    def test_tma_umma_tail_inlines_when_advance_workaround_needed(self) -> None:
+        from helion._compiler.cute import cutedsl_compat
+
+        with patch.object(
+            cutedsl_compat, "cutedsl_has_opresultlist_fix", return_value=False
+        ):
+            src = cutedsl_compat.emit_producer_tail_tma_umma(
+                "ab_pipeline", "ab_state", num_stages=3
+            )
+
+        self.assertNotIn("block_idx_in_cluster", src)
+        self.assertNotIn("if True", src)
+        self.assertIn("ab_pipeline.producer_acquire(ab_state)", src)
+
+    def test_tma_umma_tail_detector_allows_state_rename(self) -> None:
+        from helion._compiler.cute import cutedsl_compat
+
+        cutedsl_compat.cutedsl_tma_umma_tail_has_peer_cta_semantics.cache_clear()
+        src = """
+def producer_tail(self, producer_state):
+    for i in range(self.num_stages - 1):
+        producer_state.advance()
+    self.producer_acquire(producer_state)
+"""
+        try:
+            with patch.object(cutedsl_compat.inspect, "getsource", return_value=src):
+                self.assertTrue(
+                    cutedsl_compat.cutedsl_tma_umma_tail_has_peer_cta_semantics()
+                )
+        finally:
+            cutedsl_compat.cutedsl_tma_umma_tail_has_peer_cta_semantics.cache_clear()
+
 
 @onlyBackends(["cute"])
 class TestPersistentLoopSplitter(unittest.TestCase):
