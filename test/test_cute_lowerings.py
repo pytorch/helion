@@ -870,9 +870,10 @@ class TestCuteLowerings(unittest.TestCase):
             bound = cute_matmul_persistent_post_loop.bind(args)
             bound.env.config_spec.cute_tcgen05_search_enabled = True
             # ``persistent_blocked`` is normally disallowed for tcgen05
-            # via ``enforce_dot_requirements`` — the matmul lowering still
-            # has correctness gaps on the persistent path. The codegen
-            # itself accepts the config, which is what this test exercises.
+            # via ``enforce_dot_requirements`` because autotune can still
+            # choose configs that fall back to guarded partial persistent
+            # paths. The codegen itself accepts the explicit config, which
+            # is what this structural test exercises.
             cfg = _make_tcgen05_persistent_config(
                 block_sizes=[128, 128, 16],
                 pid_type="persistent_blocked",
@@ -925,11 +926,8 @@ class TestCuteLowerings(unittest.TestCase):
         test pins that — if a future change re-introduces a state
         carry that can't be expressed as a scf.while iter arg, the IR
         verifier will reject the kernel and ``to_triton_code(cfg)``
-        will raise. Numerical correctness on the persistent path is
-        still gapped for the multi-tile case pending the role-local
-        persistent rewrite; see
-        ``test_tcgen05_persistent_single_tile_runtime_correctness`` for
-        the single-tile runtime regression guard."""
+        will raise. Static full-tile multi-tile correctness is covered
+        by ``test_tcgen05_persistent_multi_tile_runtime_correctness``."""
 
         @helion.kernel(backend="cute")
         def cute_matmul_persistent_compile(
@@ -958,28 +956,20 @@ class TestCuteLowerings(unittest.TestCase):
             )
             # The act of generating the Python source already runs the
             # CuTe DSL preprocessor; the IR verifier runs at first
-            # execution (cute.compile) — but the code-string check below
-            # is enough to confirm the persistent loop is in the right
-            # shape. Running the kernel is intentionally NOT done here:
-            # multi-tile numerical correctness on the persistent path
-            # is the next work item, not this regression guard.
+            # execution (cute.compile). The code-string checks below pin
+            # the persistent host wrapper shape; runtime coverage for both
+            # z-seeded and tile-advance scheduler paths lives in
+            # ``test_tcgen05_persistent_multi_tile_runtime_correctness``.
             code = bound.to_triton_code(cfg)
             self.assertIn("while tcgen05_work_tile_valid", code)
             self.assertIn("tcgen05_acc_pipeline.producer_tail", code)
-            # The host-side multi-tile guard must be emitted: the
-            # persistent + tcgen05 path silently produces wrong output
-            # for total_tiles > 1, so we fail loudly until the role-
-            # local persistent rewrite lands.
             from helion._compiler.program_id import Tcgen05PersistentProgramIDs
 
-            self.assertIn(
+            self.assertNotIn(
                 Tcgen05PersistentProgramIDs._MULTI_TILE_GUARD_TOTAL_VAR,
                 code,
             )
-            self.assertIn(
-                "Helion CuTe persistent + tcgen05 currently produces",
-                code,
-            )
+            self.assertRegex(code, r"\(\s*1\s*,\s*1\s*,\s*min\s*\(")
 
     def test_tcgen05_persistent_kloop_producer_lifts_to_role_local_while(
         self,
@@ -1252,14 +1242,15 @@ class TestCuteLowerings(unittest.TestCase):
         self.assertIn("cute.arch.sync_threads()", code)
         self.assertIn("if tcgen05_tma_full_tile", code)
 
-    def test_tcgen05_persistent_multi_tile_runtime_guard(self) -> None:
-        """Multi-tile + persistent + tcgen05 must raise ``RuntimeError``.
+    def test_tcgen05_persistent_multi_tile_runtime_correctness(self) -> None:
+        """Static full-tile persistent + tcgen05 is correct for multi-tile shapes.
 
-        The persistent + tcgen05 combo produces wrong output when the
-        kernel processes more than one work tile total. The role-local
-        persistent shape is now emitted for the current roles, but the
-        codegen still emits a host-side guard until multi-tile runtime
-        correctness is proven. This test pins that guard.
+        The tcgen05 static scheduler seeds work from ``block_idx.z``. The
+        persistent launch grid must therefore be ``(cluster_m, 1,
+        persistent_clusters)`` rather than the generic 1D ``(_NUM_SM,)``
+        persistent grid. The chosen shape has more scheduler work clusters
+        than SMs and more than one M/N tile, so at least one CTA must
+        execute ``advance_to_next_work()`` across a 2D output tile space.
         """
 
         from helion._compiler.cute.mma_support import get_cute_mma_support
@@ -1279,22 +1270,135 @@ class TestCuteLowerings(unittest.TestCase):
                 out[tile_m, tile_n] = acc.to(x.dtype)
             return out
 
-        # 256 / 128 = 2 tiles per axis -> 4 total work tiles -> guard fires.
+        num_sms = torch.cuda.get_device_properties(DEVICE).multi_processor_count
+        m_tiles = 2
+        n_tiles = (num_sms + m_tiles - 1) // m_tiles + 8
+        self.assertGreater(m_tiles * n_tiles, num_sms)
+        m = m_tiles * 128
+        n = n_tiles * 128
+        k = 32
+
+        for dtype in (torch.float16, torch.bfloat16):
+            for pid_type in ("persistent_blocked", "persistent_interleaved"):
+                with self.subTest(dtype=str(dtype), pid_type=pid_type):
+                    torch.manual_seed(0)
+                    args = (
+                        torch.randn(m, k, device=DEVICE, dtype=dtype),
+                        torch.randn(k, n, device=DEVICE, dtype=dtype),
+                    )
+                    with patch_cute_mma_support():
+                        bound = cute_matmul_multi_tile.bind(args)
+                        bound.env.config_spec.cute_tcgen05_search_enabled = True
+                        cfg = _make_tcgen05_persistent_config(
+                            block_sizes=[128, 128, 16],
+                            pid_type=pid_type,
+                        )
+                        bound.set_config(cfg)
+                        code = bound.to_triton_code(cfg)
+                        self.assertNotIn("_helion_tcgen05_persistent_total_tiles", code)
+                        self.assertRegex(code, r"\(\s*1\s*,\s*1\s*,\s*min\s*\(")
+                        out = bound(*args)
+                    expected = args[0] @ args[1]
+                    # Match the single-tile tcgen05 runtime test tolerance:
+                    # this test targets persistent scheduler state, not a
+                    # new accumulator-precision contract.
+                    torch.testing.assert_close(out, expected, atol=2e-1, rtol=1e-2)
+
+    def test_tcgen05_persistent_partial_multi_tile_runtime_guard(self) -> None:
+        """Partial legacy persistent + tcgen05 still raises ``RuntimeError``.
+
+        Static full tiles use role-local persistent loops and have multi-tile
+        coverage. Partial K/M/N shapes stay on the legacy shared TMA fallback
+        path, which still launch-fails for multi-tile shapes; keep the
+        host-side guard for that non-role-local path.
+        """
+
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_partial_multi_tile(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        # K=17 is not a static full tile for bk=16, so role-local extraction
+        # stays disabled. M/N are 2x2 tiles, so the legacy multi-tile guard
+        # must fire before the CUDA launch.
         args = (
-            torch.randn(256, 32, device=DEVICE, dtype=torch.float16),
-            torch.randn(32, 256, device=DEVICE, dtype=torch.float16),
+            torch.randn(256, 17, device=DEVICE, dtype=torch.float16),
+            torch.randn(17, 256, device=DEVICE, dtype=torch.float16),
         )
         with patch_cute_mma_support():
-            bound = cute_matmul_multi_tile.bind(args)
+            bound = cute_matmul_partial_multi_tile.bind(args)
             bound.env.config_spec.cute_tcgen05_search_enabled = True
             cfg = _make_tcgen05_persistent_config(
                 block_sizes=[128, 128, 16],
                 pid_type="persistent_blocked",
             )
             bound.set_config(cfg)
+            code = bound.to_triton_code(cfg)
+            self.assertIn("_helion_tcgen05_persistent_total_tiles", code)
+            self.assertNotIn("tcgen05_role_local", code)
             with self.assertRaisesRegex(
                 RuntimeError,
-                "Helion CuTe persistent \\+ tcgen05 currently produces",
+                "supports multi-tile execution only",
+            ):
+                bound(*args)
+
+    def test_tcgen05_persistent_cluster_m2_multi_tile_runtime_guard(self) -> None:
+        """Static full-tile cluster_m=2 remains guarded for multi-tile shapes."""
+
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_cluster_m2_multi_tile(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        args = (
+            torch.randn(256, 32, device=DEVICE, dtype=torch.float16),
+            torch.randn(32, 256, device=DEVICE, dtype=torch.float16),
+        )
+        from helion._compiler.program_id import Tcgen05PersistentProgramIDs
+
+        with patch_cute_mma_support():
+            bound = cute_matmul_cluster_m2_multi_tile.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            cfg = _make_tcgen05_persistent_config(
+                block_sizes=[128, 128, 16],
+                pid_type="persistent_blocked",
+                tcgen05_cluster_m=2,
+            )
+            bound.set_config(cfg)
+            code = bound.to_triton_code(cfg)
+            self.assertIn("tcgen05_role_local", code)
+            self.assertIn(Tcgen05PersistentProgramIDs._MULTI_TILE_GUARD_TOTAL_VAR, code)
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "supports multi-tile execution only",
             ):
                 bound(*args)
 
@@ -1305,10 +1409,9 @@ class TestCuteLowerings(unittest.TestCase):
         consumer_state.index, suffix per-tile tagging) made single-tile-
         per-CTA cases correct on B200: ``128x128xK`` for any K, including
         K=48 with 3 K-iterations. This test runs the kernel for those
-        documented shapes and checks against ATen. Multi-tile cases are
-        blocked by a host-side guard
-        (``test_tcgen05_persistent_multi_tile_runtime_guard``) until the
-        role-local persistent rewrite closes the multi-tile gap.
+        documented shapes and checks against ATen; multi-tile static
+        full-shape coverage lives in
+        ``test_tcgen05_persistent_multi_tile_runtime_correctness``.
         """
 
         from helion._compiler.cute.mma_support import get_cute_mma_support
@@ -4299,6 +4402,83 @@ class TestPersistentLoopSplitter(unittest.TestCase):
             work_tile_consume_stmts=[],
             work_tile_release_stmts=[],
         )
+
+    def test_tcgen05_persistent_foreach_multi_root_keeps_host_guard(self) -> None:
+        """Multi-root tcgen05 role-local codegen is guarded as unvalidated.
+
+        ``ForEachProgramID.codegen_grid()`` delegates to the first case's
+        grid today. Until tcgen05 grows a scheduler/grid that spans all root
+        cases, the validated guard-lift path must exclude multi-root kernels
+        and the host guard must count the combined case space.
+        """
+
+        from helion._compiler.program_id import ForEachProgramID
+        from helion._compiler.program_id import Tcgen05PersistentProgramIDs
+
+        class _Case:
+            def __init__(self, expr: str) -> None:
+                self.expr = expr
+
+            def total_pids_expr(self, *, is_device: bool) -> str:
+                return self.expr
+
+        fake_pid = ForEachProgramID("pid_shared")
+        fake_pid.cases = [_Case("0"), _Case("1")]  # type: ignore[list-item]
+        self_stmt = self._stmt("shared_work = 1")
+
+        class _DeviceFunction:
+            def __init__(self) -> None:
+                self.body = [self_stmt]
+                self.pid = fake_pid
+                self.codegen = SimpleNamespace(host_statements=[])
+
+        splitter, _ = self._make_helper()
+        splitter.virtual_pid_var = "virtual_pid"  # type: ignore[attr-defined]
+        layout = self._make_minimal_layout(cluster_m=1)
+        role_stmt = self._stmt("role_work = 1")
+        role_block = Tcgen05PersistentProgramIDs._PersistentRoleBlock(
+            role_predicate="role_warp", stmts=[role_stmt]
+        )
+        partition = Tcgen05PersistentProgramIDs._PartitionedRoleBody(
+            role_blocks_inline=[role_block],
+            role_blocks_extracted=[role_block],
+            shared_body_extracted=[],
+        )
+        retargeted: list[object] = []
+        device_function = _DeviceFunction()
+
+        splitter._extract_tcgen05_post_loop_stmts = (  # type: ignore[attr-defined]
+            lambda device, body: (body, [])
+        )
+        splitter._split_tcgen05_invariant_setup = (  # type: ignore[attr-defined]
+            lambda device, body: ([], body)
+        )
+        splitter._build_tcgen05_persistent_layout = (  # type: ignore[attr-defined]
+            lambda device: layout
+        )
+        splitter._partition_tcgen05_role_blocks = (  # type: ignore[attr-defined]
+            lambda device, body: partition
+        )
+        splitter._retarget_tcgen05_shared_scheduler_to_exec = (  # type: ignore[attr-defined]
+            lambda layout_arg: retargeted.append(layout_arg)
+        )
+        splitter._build_tcgen05_persistent_prelude = (  # type: ignore[attr-defined]
+            lambda layout_arg: []
+        )
+        splitter._build_tcgen05_persistent_tile_body_role_local = (  # type: ignore[attr-defined]
+            lambda device, layout_arg, partition_arg: ([], [])
+        )
+
+        splitter._setup_tcgen05_persistent_kernel(device_function)
+
+        self.assertEqual(retargeted, [layout])
+        total_var = Tcgen05PersistentProgramIDs._MULTI_TILE_GUARD_TOTAL_VAR
+        host_src = "\n".join(
+            ast.unparse(stmt) for stmt in device_function.codegen.host_statements
+        )
+        self.assertIn(f"{total_var} = 0 + 1", host_src)
+        self.assertIn(f"if {total_var} > 0", host_src)
+        self.assertIn("supports multi-tile execution only", host_src)
 
     def test_unmarked_statements_are_hoisted(self) -> None:
         splitter, df = self._make_helper()

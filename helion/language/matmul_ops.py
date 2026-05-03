@@ -295,14 +295,17 @@ def enforce_dot_requirements(lhs: torch.Tensor, rhs: torch.Tensor) -> None:
             spec.cute_tcgen05_search_enabled = True
             # Narrow the autotune search to tcgen05 configs that have been
             # validated to compile and run correctly on B200. Today this
-            # excludes the persistent pid types (multi-tile silently
-            # miscomputes), ``cluster_m=2`` (CUDA launch fails), and
-            # ``num_epi_warps != 4`` (only 4 is validated correct;
-            # 1 and 2 are directly verified to produce wrong output and
-            # 3 is unsafe by extension). The num_epi_warps restriction
-            # also tightens normalize() so an explicit user config that
-            # bypasses autotune raises ``InvalidConfig`` rather than
-            # silently miscomputing — there is no loud crash for this
+            # still excludes persistent pid types from autotune even though
+            # static full-tile role-local persistent kernels have multi-tile
+            # runtime coverage: the search can still choose configs that fall
+            # back to the legacy non-role-local persistent path, where partial
+            # multi-tile shapes are guarded. It also excludes ``cluster_m=2``
+            # (CUDA launch fails) and ``num_epi_warps != 4`` (only 4 is
+            # validated correct; 1 and 2 are directly verified to produce
+            # wrong output and 3 is unsafe by extension). The num_epi_warps
+            # restriction also tightens normalize() so an explicit user
+            # config that bypasses autotune raises ``InvalidConfig`` rather
+            # than silently miscomputing — there is no loud crash for this
             # failure mode. See
             # ``narrow_tcgen05_autotune_to_validated_configs`` for the
             # full rationale and how each restriction lifts.
