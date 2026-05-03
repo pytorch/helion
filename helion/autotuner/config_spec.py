@@ -268,6 +268,20 @@ class ConfigSpec:
         # values are *legal* in a user-supplied helion.Config (the latter
         # always accepts the full set of legal values).
         self._tcgen05_cluster_m_search_choices: tuple[int, ...] | None = None
+        # Allowed values of tcgen05_num_epi_warps the autotuner is allowed
+        # to *search* over. ``None`` means "use the default IntegerFragment
+        # range defined by _tcgen05_optional_fragments". This is consulted by
+        # _flat_fields() when constructing the search space.
+        self._tcgen05_num_epi_warps_search_choices: tuple[int, ...] | None = None
+        # Allowed values of tcgen05_num_epi_warps a *user-supplied*
+        # ``helion.Config`` is permitted to specify. ``None`` means "use
+        # the default IntegerFragment range" (i.e. accept anything in
+        # [1, 4]). Unlike the cluster_m narrowing, the matmul path
+        # tightens validation here too because num_epi_warps != 4
+        # currently produces *silent wrong output* on B200 — there is
+        # no loud crash to alert a user who bypasses autotune via an
+        # explicit config, so normalize() must reject the unsafe values.
+        self._tcgen05_num_epi_warps_validation_choices: tuple[int, ...] | None = None
         self.store_indices: list[int] = []
         self.backend_tunable_fragments = self.backend.tunable_fragments()
         unknown_tunables = set(self.backend_tunable_fragments) - BACKEND_TUNABLE_KEYS
@@ -391,10 +405,44 @@ class ConfigSpec:
         assert choices, "tcgen05_cluster_m search must allow at least one value"
         self._tcgen05_cluster_m_search_choices = choices
 
+    def restrict_tcgen05_num_epi_warps_search(self, choices: tuple[int, ...]) -> None:
+        """Narrow the autotune search over tcgen05_num_epi_warps to *choices*.
+
+        Does not affect what values are legal in user-supplied configs.
+        See ``restrict_tcgen05_num_epi_warps_validation`` for the
+        complementary helper that tightens normalize().
+        """
+        assert choices, "tcgen05_num_epi_warps search must allow at least one value"
+        self._tcgen05_num_epi_warps_search_choices = choices
+
+    def restrict_tcgen05_num_epi_warps_validation(
+        self, choices: tuple[int, ...]
+    ) -> None:
+        """Restrict the *legal* values of tcgen05_num_epi_warps in
+        user-supplied configs to *choices*.
+
+        Unlike the search-only narrowing helpers, this also tightens
+        what ``normalize()`` accepts: a user-supplied
+        ``helion.Config(tcgen05_num_epi_warps=N)`` with N not in
+        *choices* will raise ``InvalidConfig``. Used by the BF16/FP16
+        matmul path because num_epi_warps != 4 currently produces
+        silent wrong output (no loud crash to alert a user who bypasses
+        autotune via an explicit config).
+        """
+        assert choices, "tcgen05_num_epi_warps validation must allow at least one value"
+        self._tcgen05_num_epi_warps_validation_choices = choices
+
     def narrow_tcgen05_autotune_to_validated_configs(self) -> None:
         """Narrow the tcgen05 autotune search to combinations validated on B200.
 
-        Two structural limitations bound the safe autotune space today:
+        Three structural limitations bound the safe autotune space today.
+        Each narrowing is documented inline so the rationale stays close
+        to the call. The cluster_m and pid_type restrictions are
+        *search-only* — user-supplied ``helion.Config(...)`` values are
+        still validated against the full set of legal options (see
+        ``_tcgen05_optional_fragments(for_search=False)``). The
+        num_epi_warps restriction additionally tightens validation
+        because the underlying failure mode is silent wrong output.
 
         * **Multi-tile persistent.** The current tcgen05 lowering does not
           interoperate with the persistent virtual-pid loop on B200: any
@@ -404,21 +452,38 @@ class ConfigSpec:
           until the role-local persistent rewrite lands. A host-side guard
           (``Tcgen05PersistentProgramIDs._emit_host_multi_tile_guard``)
           converts the silent miscompare into a loud ``RuntimeError`` for
-          explicit user configs that bypass autotune.
+          explicit user configs that bypass autotune. Lifts when item 1
+          (mainloop role-local persistent loops) lands; see
+          ``cute_plan.md`` "Closing the Perf Gap — Priority Order".
 
         * **2-CTA cluster.** ``cluster_m=2`` (2-CTA tcgen05 instructions)
           currently CUDA-launch-fails on B200 across the matmul block-size
           combinations exercised. Narrow ``tcgen05_cluster_m`` to ``(1,)``
           for the BF16/FP16 matmul path until the 2-CTA lowering is fixed.
+          Lifts when item 3 (2-CTA persistent) lands. CUDA launch failure
+          is loud, so user-supplied ``cluster_m=2`` is still legal.
 
-        User-supplied ``helion.Config(...)`` values are still validated
-        against the full set of legal options (see
-        ``_tcgen05_optional_fragments(for_search=False)``); only the
-        autotune *search* is narrowed.
+        * **Multi-warp epilogue.** Only ``tcgen05_num_epi_warps=4`` is
+          validated correct on B200 today. Direct verification at
+          ``num_epi_warps ∈ {1, 2}`` shows the tcgen05 SIMT-store
+          epilogue miscompiles (~75% of elements diverge from the
+          torch reference at M=N=K=256 bf16); ``num_epi_warps=3`` is
+          not separately validated and is treated as unsafe by
+          extension. Narrow both the autotune search *and* the
+          validation accept-set to ``(4,)`` so the autotuner cannot
+          converge on a wrong-output config and a user-supplied
+          ``helion.Config(tcgen05_num_epi_warps=N!=4)`` raises
+          ``InvalidConfig`` rather than silently miscomputing. The
+          underlying correctness bug is what blocks
+          ``num_epi_warps != 4`` from being usable; fixing it is the
+          actual unblocker for item 2 (multi-warp epilogue with
+          c_pipeline SMEM ring + TMA bulk store).
         """
         self.disallow_pid_type("persistent_blocked")
         self.disallow_pid_type("persistent_interleaved")
         self.restrict_tcgen05_cluster_m_search((1,))
+        self.restrict_tcgen05_num_epi_warps_search((4,))
+        self.restrict_tcgen05_num_epi_warps_validation((4,))
 
     def supports_config_key(self, key: str) -> bool:
         return self.backend.supports_config_key(key)
@@ -441,30 +506,50 @@ class ConfigSpec:
     def _tcgen05_optional_fragments(
         self, *, for_search: bool = False
     ) -> dict[str, ConfigSpecFragment]:
-        # The "validation" view (default) keeps the full set of legal values
-        # so user-supplied configs (e.g. helion.Config(...,
-        # tcgen05_cluster_m=2)) round-trip through normalize() without being
-        # rejected.
+        # The "validation" view (default) defines what user-supplied
+        # configs are allowed to specify. By default it keeps the full
+        # set of legal values so e.g. ``helion.Config(...,
+        # tcgen05_cluster_m=2)`` round-trips through normalize()
+        # unchanged. The matmul path additionally calls
+        # ``restrict_tcgen05_num_epi_warps_validation`` to *tighten*
+        # this view for ``tcgen05_num_epi_warps`` because non-4 values
+        # silently miscompute on B200 (see
+        # ``narrow_tcgen05_autotune_to_validated_configs``); without
+        # that tightening, an explicit user config bypassing autotune
+        # would produce wrong output with no diagnostic.
         #
         # The "search" view (for_search=True) is consulted by _flat_fields()
         # to build the autotune search space, and may be narrower because
-        # some legal values are known to crash at runtime. Specifically,
-        # cluster_m=2 (2-CTA tcgen05 instructions) currently produces
-        # CUDA_ERROR_LAUNCH_FAILED at runtime on B200 across the matmul
-        # block-size combinations exercised; matmul_ops.enforce_dot_requirements
-        # calls restrict_tcgen05_cluster_m_search((1,)) for the BF16/FP16
-        # matmul path so the autotuner does not pick a crashing config and
-        # tear down the GPU context for the whole tuning run.
+        # some legal values are known to regress perf or crash at runtime.
+        # ``matmul_ops.enforce_dot_requirements`` calls
+        # ``narrow_tcgen05_autotune_to_validated_configs`` for the BF16/FP16
+        # matmul path so the autotuner does not pick a regressing /
+        # crashing config and tear down the GPU context for the whole
+        # tuning run. See ``narrow_tcgen05_autotune_to_validated_configs``
+        # for the per-knob rationale.
         if for_search and self._tcgen05_cluster_m_search_choices is not None:
             cluster_m_choices = self._tcgen05_cluster_m_search_choices
         else:
             cluster_m_choices = (1, 2)
+        if for_search and self._tcgen05_num_epi_warps_search_choices is not None:
+            num_epi_warps_fragment: ConfigSpecFragment = EnumFragment(
+                self._tcgen05_num_epi_warps_search_choices
+            )
+        elif (
+            not for_search
+            and self._tcgen05_num_epi_warps_validation_choices is not None
+        ):
+            num_epi_warps_fragment = EnumFragment(
+                self._tcgen05_num_epi_warps_validation_choices
+            )
+        else:
+            num_epi_warps_fragment = IntegerFragment(1, 4, 4)
         return {
             "tcgen05_cluster_m": EnumFragment(cluster_m_choices),
             "tcgen05_ab_stages": IntegerFragment(1, 2, 2),
             "tcgen05_acc_stages": IntegerFragment(1, 2, 2),
             "tcgen05_c_stages": EnumFragment((2, 4)),
-            "tcgen05_num_epi_warps": IntegerFragment(1, 4, 4),
+            "tcgen05_num_epi_warps": num_epi_warps_fragment,
         }
 
     @staticmethod
@@ -676,6 +761,9 @@ class ConfigSpec:
         for key, fragment in self.backend_tunable_fragments.items():
             config.setdefault(key, fragment.default())
         tcgen05_optional_fragments = self._tcgen05_optional_fragments()
+        tcgen05_optional_search_fragments = self._tcgen05_optional_fragments(
+            for_search=True
+        )
         if self.cute_tcgen05_search_enabled:
             for key, fragment in tcgen05_optional_fragments.items():
                 if key in config:
@@ -683,7 +771,14 @@ class ConfigSpec:
                         key, fragment, config[key]
                     )
                 else:
-                    config[key] = fragment.default()
+                    # Fill missing keys from the search-view default so a
+                    # minimized config (Config.minimize strips values that
+                    # match default_config(), which is built from the
+                    # search view via _flat_fields) round-trips back to
+                    # the same effective config when re-normalized. The
+                    # validation view above is still used to validate
+                    # user-supplied values against the full legal range.
+                    config[key] = tcgen05_optional_search_fragments[key].default()
         else:
             for key in tcgen05_optional_fragments:
                 if key not in config:
