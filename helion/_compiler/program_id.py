@@ -2124,6 +2124,9 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
     _TCGEN05_OMIT_SHARED_PURE_CALLS: ClassVar[frozenset[str]] = frozenset(
         {
             "range",
+            "max",
+            "min",
+            "cutlass.BFloat16",
             "cutlass.Boolean",
             "cutlass.Float16",
             "cutlass.Float32",
@@ -2187,6 +2190,8 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             )
         if isinstance(expr, ast.Call):
             call_path = cls._tcgen05_call_path(expr.func)
+            if call_path in {"max", "min"} and expr.keywords:
+                return False
             return (
                 call_path in cls._TCGEN05_OMIT_SHARED_PURE_CALLS
                 and all(cls._tcgen05_expr_safe_to_omit(arg) for arg in expr.args)
