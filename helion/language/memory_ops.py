@@ -1238,6 +1238,10 @@ def _codegen_cute_store_tcgen05_tile(
         df.wrapper_only_params.extend(
             [tcgen05_value.tma_store_atom, tcgen05_value.tma_store_tensor]
         )
+        if tcgen05_value.use_role_local_epi:
+            df.register_cute_tcgen05_epi_role_tile_counter(
+                tcgen05_value.role_local_tile_counter
+            )
         state.codegen.cute_wrapper_plans.append(
             {
                 "kind": "tcgen05_d_tma",
@@ -1303,6 +1307,12 @@ def _codegen_cute_store_tcgen05_tile(
     tma_common_store_setup = store_common_setup(
         tcgen05_value.tma_store_tensor, include_full_tile=False
     )
+    tma_c_buffer_expr = "cutlass.Int32(_tcgen05_subtile)"
+    if tcgen05_value.role_local_tile_counter:
+        tma_c_buffer_expr = (
+            f"{tcgen05_value.role_local_tile_counter} * "
+            f"cutlass.Int32({subtile_count}) + cutlass.Int32(_tcgen05_subtile)"
+        )
     simt_store_body_core = [
         *simt_common_store_setup,
         (
@@ -1516,7 +1526,7 @@ def _codegen_cute_store_tcgen05_tile(
                 tcgen05_value.acc_consumer_state, indent="            "
             )
             + "\n"
-            f"        {c_buffer} = cutlass.Int32(_tcgen05_subtile) % cutlass.Int32({tcgen05_value.c_stage_count})\n"
+            f"        {c_buffer} = ({tma_c_buffer_expr}) % cutlass.Int32({tcgen05_value.c_stage_count})\n"
             f"        cute.copy({tiled_copy_r2s}, {trs_rd}, {trs_sd}[(None, None, None, {c_buffer})])\n"
             f"        cute.arch.fence_proxy('async.shared', space='cta')\n"
             f"        {epilog_sync_barrier}.arrive_and_wait()\n"
