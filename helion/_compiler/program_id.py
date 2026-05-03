@@ -1628,8 +1628,12 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                 statement_from_string(
                     f"{sched_pipeline}.producer_acquire({sched_producer_state})"
                 ),
+                # The scheduler pipeline is intentionally one-stage. Match
+                # Quack by arming the consumer-state full mbarrier before the
+                # async remote stores; if this pipeline gains more stages,
+                # producer/consumer state pairing must be revisited together.
                 statement_from_string(
-                    f"{sched_barrier_ptr} = {sched_pipeline}.producer_get_barrier({sched_producer_state})"
+                    f"{sched_barrier_ptr} = {sched_pipeline}.producer_get_barrier({sched_consumer_state})"
                 ),
                 statement_from_string(f"{sched_peer_rank} = cute.arch.lane_idx()"),
                 create(
@@ -1640,6 +1644,13 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                     body=[
                         statement_from_string(
                             f"{sched_peer_m} = {sched_peer_rank} % cutlass.Int32({cluster_m})"
+                        ),
+                        # _cute_store_shared_remote_x4 writes four Int32
+                        # values, so each remote async transaction expects
+                        # 16 bytes.
+                        statement_from_string(
+                            "cute.arch.mbarrier_arrive_and_expect_tx("
+                            f"{sched_barrier_ptr}, 16, {sched_peer_rank})"
                         ),
                         statement_from_string(
                             f"_cute_store_shared_remote_x4("
@@ -1653,9 +1664,6 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                         ),
                     ],
                     orelse=[],
-                ),
-                statement_from_string(
-                    f"{sched_pipeline}.producer_commit({sched_producer_state})"
                 ),
                 statement_from_string(emit_pipeline_advance(sched_producer_state)),
             ]
@@ -1743,9 +1751,12 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                     statement_from_string(
                         f"{layout.sched_pipeline_mbars} = cute.arch.alloc_smem(cutlass.Int64, cutlass.Int32(2))"
                     ),
+                    # Only the scheduler leader CTA publishes each remote
+                    # work tile, so every peer full barrier receives one
+                    # arrive-and-expect-tx, not one arrival per cluster CTA.
                     statement_from_string(
                         f"{layout.sched_pipeline_producer_group} = cutlass.pipeline.CooperativeGroup("
-                        "cutlass.pipeline.Agent.Thread, cute.arch.WARP_SIZE)"
+                        "cutlass.pipeline.Agent.Thread, 1)"
                     ),
                     statement_from_string(
                         f"{layout.sched_pipeline_consumer_group} = cutlass.pipeline.CooperativeGroup("
