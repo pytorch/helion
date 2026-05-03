@@ -1609,7 +1609,15 @@ def _codegen_cute_store_tcgen05_tile(
                 f"num_allocated_columns={tcgen05_value.acc_tmem_cols}"
                 f"{emit_dealloc_mbarrier_initialized_kwarg()})"
             ),
-            "cute.arch.sync_threads()",
+        ]
+    )
+    if not tcgen05_value.is_two_cta:
+        # Keep the long-validated cluster_m=1 teardown unchanged. The guarded
+        # CtaGroup.TWO path follows Quack's dealloc sequence without this CTA
+        # sync: epi warps synchronize through tmem_alloc_barrier before free.
+        post_loop_lines.append("cute.arch.sync_threads()")
+    post_loop_lines.extend(
+        [
             (
                 f"if {tcgen05_value.epi_active}:\n"
                 f"    {tcgen05_value.tmem_allocator}.relinquish_alloc_permit()"

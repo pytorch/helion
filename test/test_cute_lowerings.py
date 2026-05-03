@@ -1567,6 +1567,30 @@ class TestCuteLowerings(unittest.TestCase):
                 "cutlass.pipeline.Agent.Thread, cutlass.Int32(8))",
                 code,
             )
+            tmem_arrive_pos = code.index("tcgen05_tmem_alloc_barrier.arrive()")
+            acc_tail_marker = (
+                "tcgen05_acc_pipeline.producer_tail"
+                if "tcgen05_acc_pipeline.producer_tail" in code
+                else "tcgen05_acc_pipeline.producer_acquire(tcgen05_acc_producer_state)"
+            )
+            acc_tail_pos = code.index(acc_tail_marker)
+            tmem_dealloc_allocator_pos = code.index(
+                "num_allocated_columns=tcgen05_acc_tmem_cols"
+            )
+            relinquish_pos = code.index(
+                "tcgen05_tmem_allocator.relinquish_alloc_permit()"
+            )
+            tmem_wait_pos = code.index("tcgen05_tmem_alloc_barrier.arrive_and_wait()")
+            tmem_free_pos = code.index("tcgen05_tmem_allocator.free(")
+            self.assertLess(tmem_arrive_pos, acc_tail_pos)
+            self.assertLess(acc_tail_pos, tmem_dealloc_allocator_pos)
+            self.assertLess(tmem_dealloc_allocator_pos, relinquish_pos)
+            self.assertLess(relinquish_pos, tmem_wait_pos)
+            self.assertLess(tmem_wait_pos, tmem_free_pos)
+            self.assertNotIn(
+                "cute.arch.sync_threads()",
+                code[tmem_dealloc_allocator_pos:relinquish_pos],
+            )
             init_arrive = "cutlass.pipeline.pipeline_init_arrive("
             init_wait = "cutlass.pipeline.pipeline_init_wait("
             self.assertLess(
@@ -4513,6 +4537,38 @@ class TestCuteLowerings(unittest.TestCase):
                 ),
                 "(mask_1)",
             )
+
+
+@onlyBackends(["cute"])
+class TestCuteDslCompat(unittest.TestCase):
+    def test_umma_async_tail_workaround_preserves_leader_cta_guard(self) -> None:
+        from helion._compiler.cute import cutedsl_compat
+
+        with patch.object(
+            cutedsl_compat, "cutedsl_has_opresultlist_fix", return_value=False
+        ):
+            src = cutedsl_compat.emit_producer_tail_umma_async(
+                "acc_pipeline", "acc_state", num_stages=3
+            )
+
+        self.assertIn("cute.arch.block_idx_in_cluster()", src)
+        self.assertIn("cute.arch.make_warp_uniform(_pt_bidx)", src)
+        leader_guard = "if _pt_cta_rank % cutlass.Int32(2) == cutlass.Int32(0):"
+        self.assertIn(leader_guard, src)
+        self.assertLess(
+            src.index(leader_guard),
+            src.index("acc_state._count = acc_state._count + cutlass.Int32(1)"),
+        )
+        self.assertLess(
+            src.index("acc_state._count = acc_state._count + cutlass.Int32(1)"),
+            src.index("acc_pipeline.producer_acquire(acc_state)"),
+        )
+        self.assertEqual(
+            src.count("acc_state._count = acc_state._count + cutlass.Int32(1)"),
+            2,
+        )
+        self.assertNotIn("acc_pipeline.sync_object_empty.wait", src)
+        self.assertIn("acc_pipeline.producer_acquire(acc_state)", src)
 
 
 @onlyBackends(["cute"])
