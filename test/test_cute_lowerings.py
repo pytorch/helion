@@ -1547,7 +1547,8 @@ class TestCuteLowerings(unittest.TestCase):
             code = bound.to_triton_code(cfg)
             self.assertIn("cute.nvgpu.tcgen05.CtaGroup.TWO", code)
             self.assertIn(
-                "virtual_pid = tcgen05_work_tile_idx_0 // cutlass.Int32(2)",
+                "virtual_pid = tcgen05_role_local_0_work_tile.tile_idx[0] "
+                "// cutlass.Int32(2)",
                 code,
             )
             self.assertIn(
@@ -1581,30 +1582,9 @@ class TestCuteLowerings(unittest.TestCase):
                 code.index(init_wait),
                 code.index("tcgen05_tmem_allocator.allocate("),
             )
-            self.assertIn(
-                "tcgen05_sched_barrier_ptr = "
-                "tcgen05_sched_pipeline.producer_get_barrier("
-                "tcgen05_sched_consumer_state)",
-                code,
-            )
-            self.assertIn(
-                "tcgen05_sched_pipeline_producer_group = "
-                "cutlass.pipeline.CooperativeGroup("
-                "cutlass.pipeline.Agent.Thread, 1)",
-                code,
-            )
-            self.assertNotIn(
-                "tcgen05_sched_pipeline_producer_group = "
-                "cutlass.pipeline.CooperativeGroup("
-                "cutlass.pipeline.Agent.Thread, cute.arch.WARP_SIZE)",
-                code,
-            )
-            self.assertIn(
-                "cute.arch.mbarrier_arrive_and_expect_tx("
-                "tcgen05_sched_barrier_ptr, 16, tcgen05_sched_peer_rank)",
-                code,
-            )
-            self.assertNotIn("tcgen05_sched_pipeline.producer_commit", code)
+            self.assertNotIn("tcgen05_sched_pipeline", code)
+            self.assertNotIn("tcgen05_work_tile_smem", code)
+            self.assertNotIn("tcgen05_tile_sched.advance_to_next_work()", code)
             tma_role_predicate = (
                 "cute.arch.make_warp_uniform(cute.arch.warp_idx()) == cutlass.Int32(5)"
             )
@@ -1618,7 +1598,6 @@ class TestCuteLowerings(unittest.TestCase):
             found_role_local_tma = False
             found_role_local_exec = False
             found_role_local_epi = False
-            found_shared_loop = False
             for node in ast.walk(tree):
                 if not isinstance(node, ast.If):
                     continue
@@ -1678,11 +1657,10 @@ class TestCuteLowerings(unittest.TestCase):
                     and ast.unparse(node.test) == "tcgen05_work_tile_valid"
                 ):
                     continue
-                found_shared_loop = True
-                shared_src = ast.unparse(node)
-                self.assertNotIn("cute.copy(tma_atom_a", shared_src)
-                self.assertNotIn("cute.gemm(", shared_src)
-                self.assertNotIn("tcgen05_acc_pipeline.consumer_wait", shared_src)
+                self.fail(
+                    "Fully role-local CtaGroup.TWO codegen should not emit "
+                    "the residual shared scheduler loop. Generated code:\n" + code
+                )
             self.assertTrue(
                 found_role_local_tma,
                 "Expected role-local TMA-load work in CtaGroup.TWO codegen. "
@@ -1697,11 +1675,6 @@ class TestCuteLowerings(unittest.TestCase):
                 found_role_local_epi,
                 "Expected role-local SIMT epilogue work in CtaGroup.TWO "
                 "codegen. Generated code:\n" + code,
-            )
-            self.assertTrue(
-                found_shared_loop,
-                "Expected the guarded CtaGroup.TWO codegen to retain the "
-                "shared scheduler loop. Generated code:\n" + code,
             )
             self.assertIn(Tcgen05PersistentProgramIDs._MULTI_TILE_GUARD_TOTAL_VAR, code)
             with self.assertRaisesRegex(
@@ -4395,7 +4368,8 @@ class TestCuteLowerings(unittest.TestCase):
             code,
         )
         self.assertIn(
-            "virtual_pid = tcgen05_work_tile_idx_0 // cutlass.Int32(2)",
+            "virtual_pid = tcgen05_role_local_0_work_tile.tile_idx[0] "
+            "// cutlass.Int32(2)",
             code,
         )
         self.assertIn("tcgen05_role_local_0_tile_sched_params", code)
@@ -4442,7 +4416,8 @@ class TestCuteLowerings(unittest.TestCase):
             "cutlass.pipeline.pipeline_init_wait(cluster_shape_mn=tcgen05_cluster_layout_vmnk)",
             code,
         )
-        self.assertIn("while tcgen05_work_tile", code)
+        self.assertIn("while tcgen05_role_local_0_work_tile.is_valid_tile", code)
+        self.assertNotIn("while tcgen05_work_tile_valid", code)
         self.assertNotIn("for virtual_pid in ", code)
 
     def test_cute_grouped_sum_reduction_uses_tree_for_non_warp_multiple_groups(
@@ -5547,6 +5522,70 @@ class TestPersistentLoopSplitter(unittest.TestCase):
         self.assertIn("offset_0 = pid_0 * 128", loop_src)
         self.assertLess(loop_src.find("offset_0 ="), loop_src.find("for offset_2"))
         self.assertNotIn("consumer_wait", loop_src)
+
+    def test_omit_shared_loop_rejects_observable_shared_stmt(self) -> None:
+        """Fully role-local CtaGroup.TWO codegen omits the residual shared
+        loop. If the tagged-removed shared view ever contains an observable
+        operation, the omission must fail loudly instead of dropping it."""
+        from helion._compiler.program_id import Tcgen05PersistentProgramIDs
+
+        splitter, _ = self._make_helper()
+        unsafe_stmts = [
+            "cute.copy(src, dst)",
+            "tmp = cute.copy(src, dst)",
+            "tmp = some_pipeline_call(src)",
+            "if side_effecting_call():\n    tmp = 1",
+            "for idx in side_effecting_call():\n    tmp = idx",
+        ]
+        for stmt_src in unsafe_stmts:
+            with self.subTest(stmt_src=stmt_src):
+                partition = Tcgen05PersistentProgramIDs._PartitionedRoleBody(
+                    role_blocks_inline=[],
+                    role_blocks_extracted=[],
+                    shared_body_extracted=[self._stmt(stmt_src)],
+                )
+
+                with self.assertRaisesRegex(
+                    AssertionError, "discard observable shared statement"
+                ):
+                    splitter._assert_tcgen05_omit_shared_loop_safe(partition)
+
+    def test_role_local_tile_body_can_skip_shared_body_build(self) -> None:
+        """When the caller omits the residual shared loop, the role-local
+        builder should not construct and discard that body. Dependency-only
+        scalar setup is still allowed because role-local loops clone it."""
+        from helion._compiler.program_id import Tcgen05PersistentProgramIDs
+
+        stub_df, splitter = self._make_role_local_stubs(num_pid_dims=1)
+        layout = self._make_minimal_layout(cluster_m=2)
+        shared_stmt = self._stmt("pid_0 = __test_virtual_pid__")
+        role_stmt = self._stmt("role_value = pid_0")
+        role_block = Tcgen05PersistentProgramIDs._PersistentRoleBlock(
+            role_predicate="__test_tma_load_warp__", stmts=[role_stmt]
+        )
+        partition = Tcgen05PersistentProgramIDs._PartitionedRoleBody(
+            role_blocks_inline=[],
+            role_blocks_extracted=[role_block],
+            shared_body_extracted=[shared_stmt],
+        )
+
+        def fail_shared_builder(layout_arg: object, role_blocks_arg: object) -> None:
+            self.fail("omitted shared loop should not build shared_tile_body")
+
+        splitter._build_tcgen05_persistent_tile_body = fail_shared_builder  # type: ignore[method-assign]
+
+        role_local_whiles, shared_tile_body = (
+            splitter._build_tcgen05_persistent_tile_body_role_local(
+                stub_df, layout, partition, build_shared_tile_body=False
+            )
+        )
+
+        self.assertEqual(shared_tile_body, [])
+        self.assertEqual(len(role_local_whiles), 1)
+        while_stmt = role_local_whiles[0].body[-1]
+        loop_src = "\n".join(ast.unparse(s) for s in while_stmt.body)
+        self.assertIn("pid_0 = __test_virtual_pid__", loop_src)
+        self.assertIn("role_value = pid_0", loop_src)
 
     def test_role_local_tile_body_builder_returns_two_lists(self) -> None:
         """``_build_tcgen05_persistent_tile_body_role_local`` returns
