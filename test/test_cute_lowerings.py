@@ -3956,6 +3956,103 @@ class TestPersistentLoopSplitter(unittest.TestCase):
     def _stmt(self, text: str) -> ast.stmt:
         return ast.parse(text).body[0]
 
+    def _make_role_local_stubs(self, *, num_pid_dims: int = 2) -> tuple[object, object]:
+        """Build a richer device-function stub plus per-pid stubs that
+        the role-local-while builders need (``new_var`` for variable
+        allocation, ``num_pids_expr`` for scheduler tile counts, and
+        the per-tile / TMA-load registration methods used by
+        ``_partition_tcgen05_role_blocks``).
+
+        Returns ``(stub_device_function, splitter)``. The splitter is
+        the same one this class's ``_make_helper`` returns, but with
+        ``pid_info`` bound to ``num_pid_dims`` stand-in PIDs."""
+
+        class _StubDeviceFunction:
+            def __init__(self) -> None:
+                self._counter = 0
+                self._per_tile_ids: set[int] = set()
+                self._tma_load_role_ids: set[int] = set()
+
+            def new_var(self, name: str) -> str:
+                self._counter += 1
+                return f"{name}__{self._counter}"
+
+            def register_cute_tcgen05_per_tile_stmts(
+                self, stmts: list[ast.AST]
+            ) -> None:
+                self._per_tile_ids.update(id(s) for s in stmts)
+
+            def is_cute_tcgen05_per_tile(self, stmt: ast.AST) -> bool:
+                return id(stmt) in self._per_tile_ids
+
+            @property
+            def has_cute_tcgen05_per_tile_marks(self) -> bool:
+                return bool(self._per_tile_ids)
+
+            def register_cute_tcgen05_tma_load_role_stmts(
+                self, stmts: list[ast.AST]
+            ) -> None:
+                self._tma_load_role_ids.update(id(s) for s in stmts)
+
+            def is_cute_tcgen05_tma_load_role(self, stmt: ast.AST) -> bool:
+                return id(stmt) in self._tma_load_role_ids
+
+            @property
+            def has_cute_tcgen05_tma_load_role_marks(self) -> bool:
+                return bool(self._tma_load_role_ids)
+
+            @property
+            def cute_tcgen05_tma_load_role_stmt_ids(self) -> frozenset[int]:
+                return frozenset(self._tma_load_role_ids)
+
+        class _PidStub:
+            def num_pids_expr(self, *, is_device: bool) -> str:
+                return "16"
+
+        splitter, _ = self._make_helper()
+        splitter.pid_info = [_PidStub() for _ in range(num_pid_dims)]  # type: ignore[attr-defined]
+        return _StubDeviceFunction(), splitter
+
+    def _make_minimal_layout(self, *, cluster_m: int = 1) -> object:
+        """Build a fake ``_Tcgen05PersistentLayout`` with the minimum
+        fields used by the shared-while tile body builder and the
+        role-local while builder. The default ``cluster_m=1`` keeps
+        the cluster-only branches inert; tests that exercise cluster
+        behavior can override."""
+        from helion._compiler.program_id import Tcgen05PersistentProgramIDs
+
+        return Tcgen05PersistentProgramIDs._Tcgen05PersistentLayout(
+            cluster_m=cluster_m,
+            scheduler_owner_warp="owner_warp",
+            cluster_scheduler_leader="cluster_leader",
+            consumer_leader_var="consumer_leader",
+            scheduler_leader_predicate="leader_pred",
+            tile_sched_params_var="tile_sched_params",
+            tile_sched_var="tile_sched",
+            work_tile_var="work_tile",
+            work_tile_smem_ptr="work_tile_smem_ptr",
+            work_tile_smem="work_tile_smem",
+            work_tile_smem_tensor="work_tile_smem_t",
+            work_tile_coord_vars=["c_0"],
+            work_tile_valid_var="work_tile_valid",
+            linear_pid_expr="c_0",
+            sched_pipeline_mbars="sm",
+            sched_pipeline="sp",
+            sched_pipeline_producer_group="pg",
+            sched_pipeline_consumer_group="cg",
+            sched_producer_state="ps",
+            sched_consumer_state="cs",
+            sched_barrier_ptr="bp",
+            sched_peer_rank="pr",
+            sched_peer_m="pm",
+            refresh_work_tile_stmts=[self._stmt("c_0 = work_tile_smem[0]")],
+            work_tile_publish_stmts=[
+                self._stmt("work_tile_smem[0] = work_tile.tile_idx[0]")
+            ],
+            work_tile_consume_stmts=[],
+            work_tile_release_stmts=[],
+        )
+
     def test_unmarked_statements_are_hoisted(self) -> None:
         splitter, df = self._make_helper()
         invariant_a = self._stmt("tma_atom_a = make_atom()")
@@ -4264,6 +4361,356 @@ class TestPersistentLoopSplitter(unittest.TestCase):
             wrapped,
             [decompose_pid, decompose_pid_2, derive_m, derive_n, marked],
         )
+
+    def test_partition_returns_three_views(self) -> None:
+        """``_partition_tcgen05_role_blocks`` returns a structured
+        ``_PartitionedRoleBody`` with three independent views of the
+        same input body:
+
+        - ``role_blocks_inline`` keeps the role-tagged statements in
+          their original positions inside the linear block sequence,
+          so the legacy inline-weave consumer
+          (``_build_tcgen05_persistent_tile_body``) preserves the
+          original emit order.
+        - ``role_blocks_extracted`` carries each non-shared role
+          block as a standalone unit, ready to be lifted into a
+          role-local ``while``.
+        - ``shared_body_extracted`` is the input body with every
+          top-level tagged statement removed (the extract-and-remove
+          view), so the role-local-while consumer can wire it
+          directly into the shared ``while``.
+
+        Both extracted views are independent of the inline view, so
+        mutating one does not affect the other.
+        """
+        splitter, df = self._make_helper()
+        shared_a = self._stmt("a = 1")
+        tma_load_x = self._stmt("tma_pipeline.producer_acquire(s)")
+        shared_b = self._stmt("b = 2")
+        tma_load_y = self._stmt("cute.copy(t, s)")
+        shared_c = self._stmt("c = 3")
+        df.register_cute_tcgen05_per_tile_stmts([tma_load_x, tma_load_y])
+        df.register_cute_tcgen05_tma_load_role_stmts([tma_load_x, tma_load_y])
+        body = [shared_a, tma_load_x, shared_b, tma_load_y, shared_c]
+        partition = splitter._partition_tcgen05_role_blocks(df, body)
+        # Inline view: shared_a / tma_load_x / shared_b / tma_load_y /
+        # shared_c interleaved -- 5 blocks with predicate alternating.
+        self.assertEqual(len(partition.role_blocks_inline), 5)
+        self.assertIsNone(partition.role_blocks_inline[0].role_predicate)
+        self.assertEqual(partition.role_blocks_inline[0].stmts, [shared_a])
+        self.assertEqual(
+            partition.role_blocks_inline[1].role_predicate, "__test_tma_load_warp__"
+        )
+        self.assertEqual(partition.role_blocks_inline[1].stmts, [tma_load_x])
+        self.assertIsNone(partition.role_blocks_inline[2].role_predicate)
+        self.assertEqual(partition.role_blocks_inline[2].stmts, [shared_b])
+        self.assertEqual(
+            partition.role_blocks_inline[3].role_predicate, "__test_tma_load_warp__"
+        )
+        self.assertEqual(partition.role_blocks_inline[3].stmts, [tma_load_y])
+        self.assertIsNone(partition.role_blocks_inline[4].role_predicate)
+        self.assertEqual(partition.role_blocks_inline[4].stmts, [shared_c])
+        # Extracted view: only the non-shared blocks, decoupled from
+        # the surrounding shared statements -- two role blocks since
+        # the runs are non-adjacent.
+        self.assertEqual(len(partition.role_blocks_extracted), 2)
+        self.assertEqual(
+            partition.role_blocks_extracted[0].role_predicate, "__test_tma_load_warp__"
+        )
+        self.assertEqual(partition.role_blocks_extracted[0].stmts, [tma_load_x])
+        self.assertEqual(
+            partition.role_blocks_extracted[1].role_predicate, "__test_tma_load_warp__"
+        )
+        self.assertEqual(partition.role_blocks_extracted[1].stmts, [tma_load_y])
+        # Shared body: tagged statements have been removed; only the
+        # surrounding shared statements remain in their original order.
+        self.assertEqual(
+            partition.shared_body_extracted, [shared_a, shared_b, shared_c]
+        )
+
+    def test_partition_extracted_views_are_independent_lists(self) -> None:
+        """Mutating ``role_blocks_extracted`` or
+        ``shared_body_extracted`` must not affect the inline view.
+        This isolation is required because the role-local-while
+        consumer rewrites the extracted view (e.g. wraps statements in
+        an ``ast.If``); the inline view must remain usable for the
+        legacy inline-weave consumer in the same kernel."""
+        splitter, df = self._make_helper()
+        tma_load_x = self._stmt("tma_pipeline.producer_acquire(s)")
+        shared_a = self._stmt("a = 1")
+        df.register_cute_tcgen05_per_tile_stmts([tma_load_x])
+        df.register_cute_tcgen05_tma_load_role_stmts([tma_load_x])
+        body = [tma_load_x, shared_a]
+        partition = splitter._partition_tcgen05_role_blocks(df, body)
+        # Mutate the extracted view's stmts list and confirm the
+        # inline view's stmts list is unchanged.
+        partition.role_blocks_extracted[0].stmts.append(shared_a)
+        self.assertEqual(partition.role_blocks_inline[0].stmts, [tma_load_x])
+        # Mutate shared_body_extracted and confirm the inline view's
+        # shared block (which carries the same stmt) is unchanged.
+        partition.shared_body_extracted.append(tma_load_x)
+        self.assertEqual(partition.role_blocks_inline[1].stmts, [shared_a])
+
+    def test_partition_no_marks_returns_full_body_unchanged(self) -> None:
+        """Without TMA-load marks, the partition is a degenerate one
+        with the full body in a single shared block in the inline
+        view, no extracted role blocks, and the full body in
+        ``shared_body_extracted``. The role-local-while consumer can
+        still call this safely; it just gets zero role-local whiles
+        and the full body in the shared while."""
+        splitter, df = self._make_helper()
+        a = self._stmt("a = 1")
+        b = self._stmt("b = 2")
+        body = [a, b]
+        partition = splitter._partition_tcgen05_role_blocks(df, body)
+        self.assertEqual(len(partition.role_blocks_inline), 1)
+        self.assertIsNone(partition.role_blocks_inline[0].role_predicate)
+        self.assertEqual(partition.role_blocks_inline[0].stmts, body)
+        self.assertEqual(partition.role_blocks_extracted, [])
+        self.assertEqual(partition.shared_body_extracted, body)
+
+    def test_partition_recursion_only_mutates_inline_view(self) -> None:
+        """When tagged statements live inside top-level ``for`` /
+        ``while`` loop bodies, the partitioner mutates the loop body
+        in place (wrapping tagged children in
+        ``if {role_predicate}:``). This shape applies ONLY to the
+        legacy inline-weave consumer; the extracted view must still
+        return zero extracted role blocks for the role-local-while
+        consumer because the tagged statements are nested inside a
+        per-tile container, not at the top level. The role-local
+        producer K-loop lift (``cute_plan.md`` step 3b proper) is
+        expected to move the tagged producer block to a top-level
+        sibling K-loop so it lands in ``role_blocks_extracted``."""
+        splitter, df = self._make_helper()
+        producer = self._stmt(
+            "if tma_full_tile and tma_warp:\n    tma_pipeline.producer_acquire(state)"
+        )
+        kloop = ast.parse("for k in range(K):\n    pass").body[0]
+        kloop.body = [producer]
+        df.register_cute_tcgen05_tma_load_role_stmts([producer])
+        body = [kloop]
+        partition = splitter._partition_tcgen05_role_blocks(df, body)
+        # No top-level tagged stmts -> no extracted role blocks.
+        self.assertEqual(partition.role_blocks_extracted, [])
+        # Shared body holds the K-loop unchanged in identity.
+        self.assertEqual(partition.shared_body_extracted, [kloop])
+        # Inline view's single shared block carries the K-loop, and
+        # the K-loop body has been mutated to wrap producer in an If.
+        self.assertEqual(len(partition.role_blocks_inline), 1)
+        self.assertEqual(partition.role_blocks_inline[0].stmts, [kloop])
+        self.assertEqual(len(kloop.body), 1)
+        wrapped = kloop.body[0]
+        self.assertIsInstance(wrapped, ast.If)
+        self.assertEqual(ast.unparse(wrapped.test), "__test_tma_load_warp__")
+
+    def test_role_local_while_emits_scheduler_and_loop(self) -> None:
+        """``_build_role_local_while`` emits a single top-level
+        statement: an ``if {role_predicate}:`` whose body contains
+        the role-local scheduler init + a ``while`` loop iterating
+        the role's work tiles.
+
+        The structure mirrors Quack's per-role persistent loop in
+        ``gemm_sm100.py``: allocate a
+        ``StaticPersistentTileScheduler``, peek at the first work
+        tile, run the loop body once per tile, then advance and
+        refresh. Cross-warp synchronization in the parent kernel is
+        through pipeline barriers, not through ``sync_threads`` --
+        intentional, because the role-local while runs on a disjoint
+        warp set from the shared while."""
+        from helion._compiler.program_id import Tcgen05PersistentProgramIDs
+
+        stub_df, splitter = self._make_role_local_stubs(num_pid_dims=2)
+        layout = self._make_minimal_layout()
+
+        # Pre-bound role block: a single statement representing the
+        # initial-prefetch IF that today lives in the TMA-load role.
+        prefetch = self._stmt(
+            "if tma_initial_full_tile and tma_warp:\n"
+            "    tma_pipeline.producer_acquire(state)\n"
+            "    cute.copy(atom, gA, sA)"
+        )
+        role_block = Tcgen05PersistentProgramIDs._PersistentRoleBlock(
+            role_predicate="__test_tma_load_warp__", stmts=[prefetch]
+        )
+        emitted = splitter._build_role_local_while(
+            stub_df, layout, role_block, scheduler_var_prefix="rl_test"
+        )
+
+        # Outer ``if {role_predicate}: ...`` wraps the whole role-
+        # local while -- only the predicated warps enter.
+        self.assertIsInstance(emitted, ast.If)
+        self.assertEqual(ast.unparse(emitted.test), "__test_tma_load_warp__")
+        # Inside the ``if``: scheduler params, scheduler create,
+        # initial work tile, and the while loop. Anything else is
+        # premature scaffolding and would surface as a test failure.
+        self.assertGreaterEqual(len(emitted.body), 4)
+        params_stmt = emitted.body[0]
+        sched_stmt = emitted.body[1]
+        init_tile_stmt = emitted.body[2]
+        while_stmt = emitted.body[-1]
+        self.assertIn("PersistentTileSchedulerParams", ast.unparse(params_stmt))
+        self.assertIn("StaticPersistentTileScheduler.create", ast.unparse(sched_stmt))
+        self.assertIn("initial_work_tile_info", ast.unparse(init_tile_stmt))
+        self.assertIsInstance(while_stmt, ast.While)
+        # While guard: ``{work_tile_var}.is_valid_tile``.
+        self.assertIn("is_valid_tile", ast.unparse(while_stmt.test))
+        # Body must include the role block's statement and a
+        # scheduler advance + work-tile refresh.
+        body_src = "\n".join(ast.unparse(s) for s in while_stmt.body)
+        self.assertIn("producer_acquire(state)", body_src)
+        self.assertIn("advance_to_next_work", body_src)
+        self.assertIn("get_current_work", body_src)
+
+    def test_role_local_while_assigns_virtual_pid_var(self) -> None:
+        """The role-local ``while`` body MUST bind
+        ``self.virtual_pid_var`` from the role-local work-tile
+        coordinates before running the role block, because the role
+        block's statements may reference ``virtual_pid_var``
+        transitively (e.g. through PID decomposition). Without this
+        binding, the role-local while would dereference a name that
+        only the shared ``while`` defines -- a compile-time error
+        in the cute-DSL frontend."""
+        from helion._compiler.program_id import Tcgen05PersistentProgramIDs
+
+        stub_df, splitter = self._make_role_local_stubs(num_pid_dims=2)
+        layout = self._make_minimal_layout()
+        prefetch = self._stmt("tma_pipeline.producer_acquire(state)")
+        role_block = Tcgen05PersistentProgramIDs._PersistentRoleBlock(
+            role_predicate="__test_tma_load_warp__", stmts=[prefetch]
+        )
+        emitted = splitter._build_role_local_while(
+            stub_df, layout, role_block, scheduler_var_prefix="rl_pid_test"
+        )
+        # Role-local while body's first statement must bind
+        # virtual_pid_var so the role block's downstream references
+        # see it.
+        while_stmt = emitted.body[-1]
+        first_in_loop = while_stmt.body[0]
+        first_src = ast.unparse(first_in_loop)
+        self.assertIn(splitter.virtual_pid_var, first_src)
+
+    def test_role_local_while_rejects_shared_role_block(self) -> None:
+        """A shared role block has no predicate, so a role-local
+        ``while`` would have nothing to gate on. The helper asserts
+        this rather than emitting a ``while`` that runs on every
+        warp -- which would be incorrect because the shared body
+        runs in the shared ``while``, not in any role-local one."""
+        from helion._compiler.program_id import Tcgen05PersistentProgramIDs
+
+        stub_df, splitter = self._make_role_local_stubs(num_pid_dims=1)
+        layout = self._make_minimal_layout()
+        shared_block = Tcgen05PersistentProgramIDs._PersistentRoleBlock(
+            role_predicate=None, stmts=[self._stmt("a = 1")]
+        )
+        with self.assertRaises(AssertionError):
+            splitter._build_role_local_while(
+                stub_df, layout, shared_block, scheduler_var_prefix="rl_shared_test"
+            )
+
+    def test_role_local_tile_body_builder_returns_two_lists(self) -> None:
+        """``_build_tcgen05_persistent_tile_body_role_local`` returns
+        ``(role_local_whiles, shared_tile_body)``. The role-local
+        whiles list has one entry per unique role predicate in the
+        partition; the shared tile body is the per-tile body for the
+        shared ``while`` (without the extracted role blocks). This is
+        the consumer that the persistent-kernel setup wires up when
+        the K-loop split lands; today it is exercised only by this
+        unit test suite (the production path still uses
+        ``_build_tcgen05_persistent_tile_body``)."""
+        stub_df, splitter = self._make_role_local_stubs(num_pid_dims=1)
+        layout = self._make_minimal_layout()
+
+        shared_a = self._stmt("a = 1")
+        tma_load_x = self._stmt("tma_pipeline.producer_acquire(s)")
+        shared_b = self._stmt("b = 2")
+        body = [shared_a, tma_load_x, shared_b]
+        stub_df.register_cute_tcgen05_per_tile_stmts([tma_load_x])
+        stub_df.register_cute_tcgen05_tma_load_role_stmts([tma_load_x])
+        partition = splitter._partition_tcgen05_role_blocks(stub_df, body)
+        role_local_whiles, shared_tile_body = (
+            splitter._build_tcgen05_persistent_tile_body_role_local(
+                stub_df, layout, partition
+            )
+        )
+        # One role-local while per unique predicate (just one here).
+        self.assertEqual(len(role_local_whiles), 1)
+        rl_while = role_local_whiles[0]
+        self.assertIsInstance(rl_while, ast.If)
+        self.assertEqual(ast.unparse(rl_while.test), "__test_tma_load_warp__")
+        # The shared tile body must NOT contain the extracted
+        # tagged statement.
+        shared_src = "\n".join(ast.unparse(s) for s in shared_tile_body)
+        self.assertNotIn("producer_acquire(s)", shared_src)
+        # The shared tile body must NOT emit the block-wide
+        # sync_threads in role-local mode -- otherwise warps running
+        # the role-local while (a sibling loop) would never reach the
+        # barrier and the kernel would hang.
+        self.assertNotIn("sync_threads", shared_src)
+        # The role-local while body should hold the tagged stmt.
+        rl_src = "\n".join(ast.unparse(s) for s in rl_while.body)
+        self.assertIn("producer_acquire(s)", rl_src)
+
+    def test_role_local_tile_body_merges_extracted_blocks_by_predicate(
+        self,
+    ) -> None:
+        """Multiple top-level TMA-load-tagged runs separated by shared
+        statements partition into multiple ``role_blocks_extracted``
+        entries with the same role predicate. The role-local consumer
+        MUST merge them into a single role-local ``while`` so per-tile
+        ordering of the role's statements is preserved -- emitting one
+        loop per extracted block would run all tiles' first chunk
+        before the second chunk and break AB-pipeline ordering."""
+        stub_df, splitter = self._make_role_local_stubs(num_pid_dims=1)
+        layout = self._make_minimal_layout()
+        shared_a = self._stmt("a = 1")
+        tma_load_x = self._stmt("tma_pipeline.producer_acquire(s_x)")
+        shared_b = self._stmt("b = 2")
+        tma_load_y = self._stmt("tma_pipeline.producer_acquire(s_y)")
+        shared_c = self._stmt("c = 3")
+        body = [shared_a, tma_load_x, shared_b, tma_load_y, shared_c]
+        stub_df.register_cute_tcgen05_per_tile_stmts([tma_load_x, tma_load_y])
+        stub_df.register_cute_tcgen05_tma_load_role_stmts([tma_load_x, tma_load_y])
+        partition = splitter._partition_tcgen05_role_blocks(stub_df, body)
+        # Sanity: partitioner produced two extracted blocks.
+        self.assertEqual(len(partition.role_blocks_extracted), 2)
+        role_local_whiles, _ = splitter._build_tcgen05_persistent_tile_body_role_local(
+            stub_df, layout, partition
+        )
+        # Consumer merges them into one loop per unique predicate.
+        self.assertEqual(len(role_local_whiles), 1)
+        rl_while = role_local_whiles[0]
+        loop_body_src = "\n".join(ast.unparse(s) for s in rl_while.body[-1].body)
+        # Both tagged stmts must appear in the same loop body, in
+        # source order (x before y).
+        x_pos = loop_body_src.find("producer_acquire(s_x)")
+        y_pos = loop_body_src.find("producer_acquire(s_y)")
+        self.assertNotEqual(x_pos, -1)
+        self.assertNotEqual(y_pos, -1)
+        self.assertLess(x_pos, y_pos)
+
+    def test_role_local_while_uses_layout_cluster_m(self) -> None:
+        """The role-local scheduler MUST use the same cluster shape as
+        the shared scheduler so it visits tiles in the same order. The
+        shared scheduler in ``_build_tcgen05_persistent_prelude`` uses
+        ``(layout.cluster_m, 1, 1)``; if ``_build_role_local_while``
+        hardcoded ``(1, 1, 1)`` instead, role-local and shared would
+        diverge for ``cluster_m > 1`` and break AB-pipeline ordering
+        between TMA-load and consumer warps."""
+        from helion._compiler.program_id import Tcgen05PersistentProgramIDs
+
+        stub_df, splitter = self._make_role_local_stubs(num_pid_dims=1)
+        layout = self._make_minimal_layout(cluster_m=2)
+        prefetch = self._stmt("tma_pipeline.producer_acquire(state)")
+        role_block = Tcgen05PersistentProgramIDs._PersistentRoleBlock(
+            role_predicate="__test_tma_load_warp__", stmts=[prefetch]
+        )
+        emitted = splitter._build_role_local_while(
+            stub_df, layout, role_block, scheduler_var_prefix="rl_cluster_test"
+        )
+        # The PersistentTileSchedulerParams call site must reference
+        # cluster_m=2 in the cluster shape tuple.
+        params_src = ast.unparse(emitted.body[0])
+        self.assertIn("(2, 1, 1)", params_src)
 
 
 class TestPerKiterTmaBuilders(unittest.TestCase):
