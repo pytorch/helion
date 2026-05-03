@@ -878,11 +878,18 @@ def _emit_mma_pipeline(
     per_tile_stmts: list[ast.AST] = []
     # Statements that conceptually belong to the TMA-load warp's role
     # block (see ``Tcgen05PersistentProgramIDs._collect_tcgen05_role_blocks``).
-    # Today this is exclusively the initial TMA prefetch ``producer_acquire``
-    # / ``cute.copy`` / ``producer_commit`` cycle that warms the AB pipeline
-    # at the start of each tile. The K-loop's per-iter TMA copies are emitted
-    # inline with the rest of the K-loop body and stay in the shared role
-    # block until role-local persistent loops land (see ``cute_plan.md``).
+    # Two kinds of statements get tagged:
+    # - The initial TMA prefetch ``producer_acquire`` / ``cute.copy`` /
+    #   ``producer_commit`` cycle at the start of each tile. These are
+    #   top-level statements added via ``_emit_per_tile(..., tma_load=True)``.
+    # - The per-K-iter producer block (``if {tma_full_tile} and {tma_warp}
+    #   [and {tma_next_full_tile}]: producer_acquire / cute.copy /
+    #   producer_commit``). These are emitted INSIDE the K-loop body via
+    #   ``cg.add_statement`` and added to the list directly. The role
+    #   partitioner recurses one level into top-level ``for`` / ``while``
+    #   loops to find these tagged children and wraps them with
+    #   ``if {tma_warp_predicate}: ...`` -- structural prep for the
+    #   role-local-while lift in ``cute_plan.md`` step 3b.
     tma_load_role_stmts: list[ast.AST] = []
 
     def _emit_per_tile(text: str, *, tma_load: bool = False) -> ast.stmt:
@@ -1846,9 +1853,12 @@ def _emit_mma_pipeline(
                 else ""
             )
             # Per-K-iter TMA work is emitted as two adjacent statements
-            # (producer-side ``if`` and consumer/fallback ``if``) so the
-            # producer half is a separate top-level statement; see
-            # ``cute_plan.md`` for the role-lift plan.
+            # inside the K-loop body: a producer-side ``if`` and a
+            # consumer/fallback ``if``. The producer half is tagged
+            # ``tma_load`` so the role partitioner can wrap it with the
+            # TMA-load warp predicate (and, in step 3b, lift it into a
+            # TMA-load-warp-local ``while``); see ``cute_plan.md`` for
+            # the role-lift plan.
             tma_wait_src = f"        {tma_pipeline}.consumer_wait({tma_consumer_state}, {tma_consumer_try_token})\n"
             if tcgen05_use_tma_pipeline:
                 assert tcgen05_plan is not None
@@ -1900,7 +1910,17 @@ def _emit_mma_pipeline(
                     + f"    {tma_pipeline}.producer_commit({tma_producer_state})\n"
                     + emit_pipeline_advance(tma_producer_state, indent="    ")
                 )
-                cg.add_statement(statement_from_string(pipeline_producer_src))
+                # The per-K-iter producer block lives INSIDE the K-loop
+                # body (it's added via ``cg.add_statement``), so the
+                # statement isn't a top-level per-tile statement and
+                # doesn't need to be registered as per-tile. The role
+                # partitioner recurses into top-level ``for`` / ``while``
+                # bodies to find this tagged child and wraps it with
+                # ``if {tma_warp_predicate}: ...`` -- structural prep
+                # for the role-local ``while`` lift in step 3b.
+                pipeline_producer_stmt = statement_from_string(pipeline_producer_src)
+                cg.add_statement(pipeline_producer_stmt)
+                tma_load_role_stmts.append(pipeline_producer_stmt)
                 pipeline_consumer_src = (
                     f"if {tma_full_tile}:\n"
                     f"    if {tcgen05_plan.exec_active}:\n"
@@ -1950,7 +1970,17 @@ def _emit_mma_pipeline(
                     f"{tma_copy_b_src}"
                     f"    {tma_pipeline}.producer_commit({tma_producer_state})"
                 )
-                cg.add_statement(statement_from_string(non_pipeline_producer_src))
+                # See the comment on the pipeline branch's producer
+                # tagging above: the K-loop is kept inside the work-tile
+                # body via per-tile name propagation, so this producer
+                # stmt rides along inside the K-loop. The role
+                # partitioner recurses one level into the K-loop to
+                # find this tag.
+                non_pipeline_producer_stmt = statement_from_string(
+                    non_pipeline_producer_src
+                )
+                cg.add_statement(non_pipeline_producer_stmt)
+                tma_load_role_stmts.append(non_pipeline_producer_stmt)
                 # ``scalar_load_{a,b}_tma_src`` gate on ``mma_active``
                 # (not ``tma_warp``), so they live in the consumer
                 # block alongside the cross-warp ``sync_threads()``.
@@ -2228,10 +2258,19 @@ def _emit_mma_pipeline(
         df.register_cute_tcgen05_per_tile_stmts(per_tile_stmts)
     # Register TMA-load role-block statements with the persistent role
     # partitioner (see ``Tcgen05PersistentProgramIDs._collect_tcgen05_role_blocks``).
-    # These statements stay in the work-tile body (they are also tagged
-    # per-tile above) but are routed into the TMA-load role block so a
-    # future role-local-while rewrite can lift them out without breaking
-    # the rest of the body.
+    # Two registration shapes land here:
+    # - Top-level prefix statements (the initial TMA prefetch IFs) --
+    #   these are ALSO registered as per-tile via ``_emit_per_tile``,
+    #   which is what keeps them inside the work-tile body so the
+    #   partitioner can see them at top level.
+    # - Nested statements emitted inside the K-loop body via
+    #   ``cg.add_statement(...)`` -- these are NOT per-tile-registered;
+    #   the K-loop itself rides into the work-tile body via per-tile
+    #   name propagation, and the partitioner recurses one level into
+    #   it to wrap these tagged children.
+    # The partitioner asserts at run time that every registered tag was
+    # visited, so a misregistered top-level stmt fails loudly rather
+    # than silently dropping its role gate.
     if tma_load_role_stmts:
         df.register_cute_tcgen05_tma_load_role_stmts(tma_load_role_stmts)
 

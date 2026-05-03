@@ -655,19 +655,24 @@ class DeviceFunction:
         ``producer_commit`` cycle that warms the AB pipeline at the
         start of each tile.
 
-        Statements registered here must ALSO be registered as per-tile
-        via ``register_cute_tcgen05_per_tile_stmts`` first: the role-block
-        partitioner runs on the post-split wrapped body, and an unmarked
-        per-tile statement would be hoisted out of the work-tile loop
-        before the partitioner ever sees it. The assertion below enforces
-        the call ordering at registration time.
+        Statements registered here must be reachable from the per-tile
+        wrapped body when the role partitioner runs. Two registration
+        shapes are valid:
+
+        - **Top-level statements** -- register the statement as per-tile
+          first via ``register_cute_tcgen05_per_tile_stmts``, otherwise
+          the splitter will hoist it out of the work-tile body before
+          the role partitioner ever sees it. The initial TMA prefetch
+          IF-blocks emitted from ``cute_mma.py`` take this shape.
+        - **Nested statements inside a per-tile container** (e.g. the
+          per-K-iter TMA producer block emitted inside the K-loop body
+          via ``cg.add_statement(...)``) -- the containing statement
+          stays in the work-tile body because it transitively depends
+          on per-tile names, and the role partitioner recurses into
+          top-level ``for`` / ``while`` loops to find tagged children.
+          These tagged children do NOT need to be per-tile-registered
+          themselves; the parent loop carries them.
         """
-        for stmt in stmts:
-            assert id(stmt) in self._cute_tcgen05_per_tile_stmt_ids, (
-                "TMA-load role stmts must be registered as per-tile first "
-                "(otherwise the persistent splitter would hoist them out "
-                "of the work-tile loop before the role partitioner runs)"
-            )
         self._cute_tcgen05_tma_load_role_stmt_ids.update(id(stmt) for stmt in stmts)
 
     def is_cute_tcgen05_tma_load_role(self, stmt: ast.stmt) -> bool:
@@ -676,6 +681,16 @@ class DeviceFunction:
     @property
     def has_cute_tcgen05_tma_load_role_marks(self) -> bool:
         return bool(self._cute_tcgen05_tma_load_role_stmt_ids)
+
+    @property
+    def cute_tcgen05_tma_load_role_stmt_ids(self) -> frozenset[int]:
+        """Snapshot of every registered TMA-load role-tag id. The role
+        partitioner uses this to validate that every registered tag was
+        consumed (either at top level or via the one-level for/while
+        recursion) -- a registered tag that never gets visited indicates
+        a bad registration shape that would otherwise silently miscompile.
+        """
+        return frozenset(self._cute_tcgen05_tma_load_role_stmt_ids)
 
     def get_cute_tcgen05_store_value(self, name: str) -> CuteTcgen05StoreValue | None:
         for alias in self._variable_renames.get(name, [name]):
