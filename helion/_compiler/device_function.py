@@ -227,6 +227,7 @@ class CuteTcgen05StoreValue:
     tma_producer_state: str = ""
     tma_store_atom: str = ""
     tma_store_tensor: str = ""
+    role_local_tile_counter: str = ""
     is_two_cta: bool = False
     use_tma: bool = False
     use_role_local_epi: bool = False
@@ -412,6 +413,7 @@ class DeviceFunction:
         self._cute_tcgen05_tma_load_role_stmt_ids: set[int] = set()
         self._cute_tcgen05_mma_exec_role_stmt_ids: set[int] = set()
         self._cute_tcgen05_epi_role_stmt_ids: set[int] = set()
+        self.cute_tcgen05_epi_role_tile_counter_var: str | None = None
         self._cute_collective_handled_loads: set[str] = set()
         self.cute_cluster_shape: tuple[int, int, int] | None = None
         self.cute_block_shape: tuple[int, int, int] | None = None
@@ -729,6 +731,18 @@ class DeviceFunction:
         TMEM-to-GMEM store work that must advance once per tile on epi warps.
         """
         self._cute_tcgen05_epi_role_stmt_ids.update(id(stmt) for stmt in stmts)
+
+    def register_cute_tcgen05_epi_role_tile_counter(self, name: str) -> None:
+        """Publish the per-iteration tile counter used by the epi role.
+
+        Persistent TMA-store epilogues use this counter to rotate SMEM stages
+        across work tiles. The role-local while builder owns its lifetime; the
+        store body only reads it.
+        """
+        if self.cute_tcgen05_epi_role_tile_counter_var is None:
+            self.cute_tcgen05_epi_role_tile_counter_var = name
+            return
+        assert self.cute_tcgen05_epi_role_tile_counter_var == name
 
     def is_cute_tcgen05_epi_role(self, stmt: ast.stmt) -> bool:
         return id(stmt) in self._cute_tcgen05_epi_role_stmt_ids
