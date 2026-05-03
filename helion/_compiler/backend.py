@@ -1567,15 +1567,19 @@ class PallasBackend(Backend):
         self,
         sorted_args: list[Argument] | None,
         config: Config,
-    ) -> list[tuple[int, int, int]] | None:
+    ) -> list[tuple[int, int, int, int]] | None:
         """Identify pl.ds() dims that may need padding and their block sizes.
 
         Uses ``pallas_pad_info`` recorded during codegen to identify which
         tensor dimensions use ``pl.ds()`` slicing.
 
-        Returns ``[(arg_index, tensor_dim, block_size), ...]`` or ``None``.
-        The launcher computes the actual pad amount at runtime as
-        ``(-tensor.shape[dim]) % block_size``.
+        Returns ``[(arg_index, tensor_dim, block_size, extra_pad), ...]``
+        or ``None``.  The launcher computes the actual pad amount at runtime
+        as ``(-tensor.shape[dim]) % block_size + extra_pad``.
+
+        ``extra_pad`` is 0 when the tile loop starts at offset 0,
+        ``begin % block_size`` for a constant begin offset, or
+        ``block_size - 1`` for a data-dependent begin.
         """
         if sorted_args is None:
             return None
@@ -1589,17 +1593,17 @@ class PallasBackend(Backend):
         if not device_fn.pallas_pad_info:
             return None
 
-        result: list[tuple[int, int, int]] = []
+        result: list[tuple[int, int, int, int]] = []
         for i, arg in enumerate(sorted_args):
             if not isinstance(arg, TensorArg):
                 continue
             dims_info = device_fn.pallas_pad_info.get(id(arg.fake_value))
             if dims_info is not None:
-                for dim, block_id in dims_info.items():
+                for dim, (block_id, extra_pad) in dims_info.items():
                     bsi = env.block_sizes[block_id]
                     bs = bsi.from_config(config)
                     if isinstance(bs, int) and bs > 1:
-                        result.append((i, dim, bs))
+                        result.append((i, dim, bs, extra_pad))
 
         return result or None
 

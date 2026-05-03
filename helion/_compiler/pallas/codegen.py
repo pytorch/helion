@@ -327,7 +327,8 @@ def _ds_expr(
     if tensor is not None and tensor_dim is not None:
         from helion.language.memory_ops import _record_pad_info
 
-        _record_pad_info(state, tensor, tensor_dim, block_id)
+        extra_pad = _loop_begin_extra_pad(block_id, state)
+        _record_pad_info(state, tensor, tensor_dim, block_id, extra_pad)
 
         # Skip when tile_offset is set (e.g. offset + 64) — the shift
         # means the full expression may not be a multiple of block_size.
@@ -354,6 +355,39 @@ def _ds_expr(
                     offset = f"pl.multiple_of({offset}, {block_size})"
 
     return f"pl.ds({offset}, {block_size})"
+
+
+def _loop_begin_extra_pad(block_id: int, state: CodegenState) -> int:
+    """Return extra padding needed for a non-zero loop begin.
+
+    A ``pl.ds(offset, block_size)`` read starting at a non-zero begin can
+    overshoot the tensor boundary by up to ``begin % block_size`` elements
+    beyond what ``(-N) % block_size`` accounts for.  Returns 0 when the
+    loop starts at 0, ``begin % block_size`` for a provably constant begin,
+    or ``block_size - 1`` for a data-dependent begin.
+    """
+    import sympy
+
+    from helion._compiler.compile_environment import CompileEnvironment
+
+    env = CompileEnvironment.current()
+    bs_value = env.block_sizes[block_id].from_config(state.device_function.config)
+    if not isinstance(bs_value, int):
+        return 0
+
+    loops = state.codegen.active_device_loops.get(block_id)
+    if not loops:
+        return 0
+
+    info = loops[-1].block_id_to_info.get(block_id)
+    if info is None or info.begin_expr is None:
+        return 0
+
+    begin = info.begin_expr
+    if isinstance(begin, (int, sympy.Integer)):
+        return int(begin) % bs_value
+
+    return bs_value - 1
 
 
 def _loop_offset_alignment(
