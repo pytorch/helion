@@ -4,6 +4,7 @@ import abc
 import ast
 import dataclasses
 from typing import TYPE_CHECKING
+from typing import ClassVar
 from typing import NamedTuple
 from typing import cast
 
@@ -1090,6 +1091,24 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                 remaining.append(stmt)
         return remaining, post_loop
 
+    # Host-side variable that binds the total-tile expression once so the
+    # guard message can format it. Private name avoids user/host collisions.
+    _MULTI_TILE_GUARD_TOTAL_VAR: ClassVar[str] = (
+        "_helion_tcgen05_persistent_total_tiles"
+    )
+
+    # Error message body for the multi-tile guard. Kept as a class constant so
+    # the test pin and the error path stay in sync. ``%d`` is filled in at
+    # runtime with the bound total-tile count.
+    _MULTI_TILE_GUARD_MESSAGE: ClassVar[str] = (
+        "Helion CuTe persistent + tcgen05 currently produces "
+        "wrong output when the kernel processes more than one "
+        "work tile total. The kernel was launched with "
+        "total_tiles=%d > 1, which exercises the multi-tile "
+        'path. Use a non-persistent pid_type (e.g. "flat") or '
+        "pick block sizes that keep total_tiles == 1."
+    )
+
     def _emit_host_multi_tile_guard(self, device_function: DeviceFunction) -> None:
         """Emit a host-side guard against multi-tile execution.
 
@@ -1121,25 +1140,18 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         if not host_total_pids:
             return
         # Bind the host-side total-tiles expression once so non-trivial pid-
-        # count expressions are not duplicated in the emitted source. The
-        # private name avoids colliding with user/host vars.
-        total_var = "_helion_tcgen05_persistent_total_tiles"
+        # count expressions are not duplicated in the emitted source.
+        total_var = self._MULTI_TILE_GUARD_TOTAL_VAR
         device_function.codegen.host_statements.append(
             statement_from_string(f"{total_var} = {host_total_pids}")
         )
-        # Use %-style formatting in the generated code so the f-string braces
-        # do not collide with ``statement_from_string`` placeholder syntax.
+        # Use ``repr()`` so the literal survives ``statement_from_string``
+        # placeholder parsing (``{word}`` is reserved); ``%d`` interpolates
+        # the total-tile count at runtime.
+        message_literal = repr(self._MULTI_TILE_GUARD_MESSAGE)
         guard = (
             f"if {total_var} > 1:\n"
-            "    raise RuntimeError(\n"
-            "        'Helion CuTe persistent + tcgen05 currently produces '\n"
-            "        'wrong output when the kernel processes more than one '\n"
-            "        'work tile total. The kernel was launched with '\n"
-            "        'total_tiles=%d > 1, which exercises the multi-tile '\n"
-            "        'path. Use a non-persistent pid_type (e.g. \"flat\") or '\n"
-            "        'pick block sizes that keep total_tiles == 1.'"
-            f"        % ({total_var},)\n"
-            "    )"
+            f"    raise RuntimeError({message_literal} % ({total_var},))"
         )
         device_function.codegen.host_statements.append(statement_from_string(guard))
 

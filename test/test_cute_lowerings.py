@@ -966,6 +966,12 @@ class TestCuteLowerings(unittest.TestCase):
             # persistent + tcgen05 path silently produces wrong output
             # for total_tiles > 1, so we fail loudly until the role-
             # local persistent rewrite lands.
+            from helion._compiler.program_id import Tcgen05PersistentProgramIDs
+
+            self.assertIn(
+                Tcgen05PersistentProgramIDs._MULTI_TILE_GUARD_TOTAL_VAR,
+                code,
+            )
             self.assertIn(
                 "Helion CuTe persistent + tcgen05 currently produces",
                 code,
