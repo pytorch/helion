@@ -1362,7 +1362,7 @@ def _emit_mma_pipeline(
         mma_impl == "tcgen05"
         and tcgen05_use_tma_pipeline
         and tcgen05_static_full_tiles
-        and tcgen05_cluster_m == 1
+        and (tcgen05_cluster_m == 1 or tcgen05_is_two_cta)
         and tcgen05_pid_is_persistent
     )
     # Keep a distinct name so future MMA-exec gating changes are localized.
@@ -1589,6 +1589,13 @@ def _emit_mma_pipeline(
     )
     tcgen05_tmem_barrier_thread_count_value = _tcgen05_tmem_barrier_thread_count(
         tcgen05_epi_warp_count_value
+    )
+    # Each CtaGroup.TWO CTA has its own epilogue warps consuming the
+    # distributed accumulator slot, so the acc empty barrier expects each
+    # CTA's epi warp leaders. The CtaGroup.ONE clustered fallback remains
+    # on the single-CTA count until it has separate runtime coverage.
+    tcgen05_acc_consumer_arrive_count_value = tcgen05_epi_warp_count_value * (
+        2 if tcgen05_is_two_cta else 1
     )
     tcgen05_matmul_plan: CuteTcgen05MatmulPlan | None = None
     tcgen05_mma_owner_active: str | None = None
@@ -1858,7 +1865,7 @@ def _emit_mma_pipeline(
             statement_from_string(
                 f"{tcgen05_plan.acc_pipeline_consumer_group} = "
                 f"cutlass.pipeline.CooperativeGroup("
-                f"cutlass.pipeline.Agent.Thread, cutlass.Int32({tcgen05_epi_warp_count_value}))"
+                f"cutlass.pipeline.Agent.Thread, cutlass.Int32({tcgen05_acc_consumer_arrive_count_value}))"
             )
         )
         prefix.append(

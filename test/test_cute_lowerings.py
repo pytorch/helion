@@ -1545,11 +1545,6 @@ class TestCuteLowerings(unittest.TestCase):
             )
             bound.set_config(cfg)
             code = bound.to_triton_code(cfg)
-            owner_predicate = (
-                "if tcgen05_exec_active and "
-                "cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster()) "
-                "== cutlass.Int32(0):"
-            )
             self.assertIn("cute.nvgpu.tcgen05.CtaGroup.TWO", code)
             self.assertIn(
                 "virtual_pid = tcgen05_work_tile_idx_0 // cutlass.Int32(2)",
@@ -1559,6 +1554,12 @@ class TestCuteLowerings(unittest.TestCase):
                 "tcgen05_ab_pipeline_consumer_group = "
                 "cutlass.pipeline.CooperativeGroup("
                 "cutlass.pipeline.Agent.Thread, cutlass.Int32(2))",
+                code,
+            )
+            self.assertIn(
+                "tcgen05_acc_pipeline_consumer_group = "
+                "cutlass.pipeline.CooperativeGroup("
+                "cutlass.pipeline.Agent.Thread, cutlass.Int32(8))",
                 code,
             )
             init_arrive = "cutlass.pipeline.pipeline_init_arrive("
@@ -1604,38 +1605,103 @@ class TestCuteLowerings(unittest.TestCase):
                 code,
             )
             self.assertNotIn("tcgen05_sched_pipeline.producer_commit", code)
-            self.assertIn(
-                "if tcgen05_tma_initial_full_tile and tcgen05_tma_warp:\n"
-                "            tcgen05_ab_pipeline.producer_acquire",
-                code,
+            tma_role_predicate = (
+                "cute.arch.make_warp_uniform(cute.arch.warp_idx()) == cutlass.Int32(5)"
             )
-            self.assertIn(
-                "if cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster()) "
-                "== cutlass.Int32(0):\n"
-                "                cute.copy(tma_atom_a",
-                code,
+            exec_role_predicate = (
+                "cute.arch.make_warp_uniform(cute.arch.warp_idx()) == cutlass.Int32(4)"
             )
-            self.assertIn(owner_predicate, code)
-            self.assertIn(
-                "tcgen05_ab_pipeline.consumer_release(tcgen05_ab_consumer_state)",
-                code,
+            epi_role_predicate = (
+                "cute.arch.make_warp_uniform(cute.arch.warp_idx()) < cutlass.Int32(4)"
             )
-            self.assertIn(
-                "if tcgen05_exec_active:\n"
-                "                    tcgen05_ab_consumer_state.advance()",
-                code,
+            tree = ast.parse(code)
+            found_role_local_tma = False
+            found_role_local_exec = False
+            found_role_local_epi = False
+            found_shared_loop = False
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.If):
+                    continue
+                test_src = ast.unparse(node.test)
+                for role_child in ast.walk(node):
+                    if not (
+                        isinstance(role_child, ast.While)
+                        and "tcgen05_role_local" in ast.unparse(role_child.test)
+                    ):
+                        continue
+                    role_src = ast.unparse(role_child)
+                    if test_src == tma_role_predicate:
+                        self.assertIn("tcgen05_ab_pipeline.producer_acquire", role_src)
+                        self.assertIn("cute.copy(tma_atom_a", role_src)
+                        self.assertIn(_TCGEN05_CLUSTER_LEADER_PREDICATE, role_src)
+                        found_role_local_tma = True
+                    elif test_src == exec_role_predicate:
+                        self.assertIn("tcgen05_ab_pipeline.consumer_wait", role_src)
+                        self.assertIn("cute.gemm(", role_src)
+                        self.assertIn("tcgen05_ab_pipeline.consumer_release", role_src)
+                        self.assertIn("tcgen05_ab_consumer_state.advance()", role_src)
+                        leader_blocks = [
+                            ast.unparse(child)
+                            for child in ast.walk(role_child)
+                            if isinstance(child, ast.If)
+                            and _TCGEN05_CLUSTER_LEADER_PREDICATE
+                            in ast.unparse(child.test)
+                        ]
+                        self.assertTrue(
+                            any(
+                                "tcgen05_acc_pipeline.producer_acquire("
+                                "tcgen05_acc_producer_state)" in block
+                                for block in leader_blocks
+                            ),
+                            "Expected the CtaGroup.TWO exec owner to acquire "
+                            "the acc producer state. Generated role code:\n" + role_src,
+                        )
+                        self.assertTrue(
+                            any(
+                                "tcgen05_acc_pipeline.producer_commit("
+                                "tcgen05_acc_producer_state)" in block
+                                for block in leader_blocks
+                            ),
+                            "Expected the CtaGroup.TWO exec owner to commit "
+                            "the acc producer state. Generated role code:\n" + role_src,
+                        )
+                        self.assertIn("tcgen05_acc_producer_state.advance()", role_src)
+                        found_role_local_exec = True
+                    elif test_src == epi_role_predicate:
+                        self.assertIn("tcgen05_acc_pipeline.consumer_wait", role_src)
+                        self.assertIn("cute.nvgpu.CopyUniversalOp()", role_src)
+                        self.assertNotIn("PipelineTmaStore.create", role_src)
+                        found_role_local_epi = True
+            for node in ast.walk(tree):
+                if not (
+                    isinstance(node, ast.While)
+                    and ast.unparse(node.test) == "tcgen05_work_tile_valid"
+                ):
+                    continue
+                found_shared_loop = True
+                shared_src = ast.unparse(node)
+                self.assertNotIn("cute.copy(tma_atom_a", shared_src)
+                self.assertNotIn("cute.gemm(", shared_src)
+                self.assertNotIn("tcgen05_acc_pipeline.consumer_wait", shared_src)
+            self.assertTrue(
+                found_role_local_tma,
+                "Expected role-local TMA-load work in CtaGroup.TWO codegen. "
+                "Generated code:\n" + code,
             )
-            self.assertIn(
-                f"{owner_predicate}\n"
-                "            tcgen05_acc_pipeline.producer_acquire("
-                "tcgen05_acc_producer_state)",
-                code,
+            self.assertTrue(
+                found_role_local_exec,
+                "Expected role-local MMA-exec work in CtaGroup.TWO codegen. "
+                "Generated code:\n" + code,
             )
-            self.assertIn(
-                f"{owner_predicate}\n"
-                "            tcgen05_acc_pipeline.producer_commit("
-                "tcgen05_acc_producer_state)",
-                code,
+            self.assertTrue(
+                found_role_local_epi,
+                "Expected role-local SIMT epilogue work in CtaGroup.TWO "
+                "codegen. Generated code:\n" + code,
+            )
+            self.assertTrue(
+                found_shared_loop,
+                "Expected the guarded CtaGroup.TWO codegen to retain the "
+                "shared scheduler loop. Generated code:\n" + code,
             )
             self.assertIn(Tcgen05PersistentProgramIDs._MULTI_TILE_GUARD_TOTAL_VAR, code)
             with self.assertRaisesRegex(
@@ -4332,17 +4398,12 @@ class TestCuteLowerings(unittest.TestCase):
             "virtual_pid = tcgen05_work_tile_idx_0 // cutlass.Int32(2)",
             code,
         )
-        self.assertIn(
-            "if tcgen05_tma_initial_full_tile and tcgen05_tma_warp:\n"
-            "            tcgen05_ab_pipeline.producer_acquire",
-            code,
-        )
-        self.assertIn(
-            "if cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster()) "
-            "== cutlass.Int32(0):\n"
-            "                cute.copy(tma_atom_a",
-            code,
-        )
+        self.assertIn("tcgen05_role_local_0_tile_sched_params", code)
+        self.assertIn("tcgen05_role_local_1_tile_sched_params", code)
+        self.assertIn("tcgen05_role_local_2_tile_sched_params", code)
+        self.assertIn("tcgen05_ab_pipeline.producer_acquire", code)
+        self.assertIn(f"if {_TCGEN05_CLUSTER_LEADER_PREDICATE}:", code)
+        self.assertIn("cute.copy(tma_atom_a", code)
         self.assertIn(
             "if tcgen05_exec_active and "
             "cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster()) "
