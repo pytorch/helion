@@ -981,22 +981,15 @@ class TestCuteLowerings(unittest.TestCase):
                 code,
             )
 
-    def test_tcgen05_persistent_kloop_producer_wrapped_in_role_predicate(
+    def test_tcgen05_persistent_kloop_producer_lifts_to_role_local_while(
         self,
     ) -> None:
-        """Pin the per-K-iter TMA producer block being wrapped in the
-        TMA-load warp role gate when the persistent + tcgen05 path is
-        active. The role partitioner recurses one level into the
-        K-loop body and wraps the tagged producer ``if`` in
-        ``if {tma_load_warp_predicate}: ...``. This is structural prep
-        for the role-local-while lift in ``cute_plan.md`` step 3b: the
-        tagged statement is now the lift target.
-
-        The wrapping is functionally redundant (the tagged ``if``
-        already contains the inline ``and tma_warp`` gate), so the
-        kernel must still produce identical output today. The lift in
-        step 3b drops the inline gate when the producer body moves
-        into a TMA-load-warp-local ``while``."""
+        """Persistent tcgen05 lifts the per-K-iter TMA producer into a
+        TMA-load-warp-local persistent loop. The producer K-loop is now
+        a top-level extracted role block, not an inline wrapper inside
+        the shared consumer K-loop, and its predicate drops the inline
+        ``tcgen05_tma_warp`` gate because the enclosing role-local loop
+        already restricts execution to that warp."""
 
         @helion.kernel(backend="cute")
         def cute_matmul_persistent_role(
@@ -1024,60 +1017,142 @@ class TestCuteLowerings(unittest.TestCase):
                 pid_type="persistent_blocked",
             )
             code = bound.to_triton_code(cfg)
-        # The TMA-load warp predicate the partitioner uses for the
-        # role gate. The TMA-load warp id is 5 for the 8-warp,
-        # epi-warps=4 layout (epi=warps 0..3, exec=4, tma=5, ab-load=6,
-        # scheduler=7). This must match the inline gate text emitted
-        # by ``cute_mma.py`` so the redundancy is visible (and so the
-        # role-local lift in step 3b can drop the inline gate cleanly).
+        # The TMA-load warp predicate the partitioner uses for the role
+        # gate. The TMA-load warp id is 5 for the 6-warp layout
+        # (epi=warps 0..3, exec=4, tma=5).
         role_predicate = (
             "cute.arch.make_warp_uniform(cute.arch.warp_idx()) == cutlass.Int32(5)"
         )
-        # Structurally verify that the per-K-iter producer ``if`` is
-        # the body of an ``if {role_predicate}: ...`` that lives INSIDE
-        # a top-level ``for`` / ``while`` loop (the K-loop). A literal
-        # substring match would also accept the initial-prefetch role
-        # gate (which is wrapped at top level via the existing path,
-        # not via the new recursion), so the structural check is the
-        # only way to pin the new behavior added here.
         tree = ast.parse(code)
-        found_in_loop = False
+        found_role_local_producer_loop = False
+        shared_consumer_loop_has_producer = False
+        shared_loop_preserves_barriers = False
+        shared_scheduler_retargeted_to_exec = False
+        shared_loop_excludes_tma = False
         for node in ast.walk(tree):
-            if not isinstance(node, (ast.For, ast.While)):
+            if not (
+                isinstance(node, ast.If) and ast.unparse(node.test) == role_predicate
+            ):
                 continue
-            for child in node.body:
+            for role_child in ast.walk(node):
                 if not (
-                    isinstance(child, ast.If)
-                    and ast.unparse(child.test) == role_predicate
+                    isinstance(role_child, ast.While)
+                    and "tcgen05_role_local" in ast.unparse(role_child.test)
                 ):
                     continue
-                # The wrapped child must be a single ``if`` whose test
-                # is the per-K-iter producer signature. The initial
-                # prefetch's role gate has multiple stmts inside (no
-                # outer ``if``), so this filters it out.
-                if len(child.body) != 1:
-                    continue
-                inner = child.body[0]
-                if not isinstance(inner, ast.If):
-                    continue
-                inner_test_src = ast.unparse(inner.test)
-                if (
-                    "tcgen05_tma_full_tile" in inner_test_src
-                    and "tcgen05_tma_warp" in inner_test_src
-                    and "tcgen05_tma_next_full_tile" in inner_test_src
-                ):
-                    found_in_loop = True
-                    break
-            if found_in_loop:
-                break
+                role_src = ast.unparse(role_child)
+                self.assertIn("pid_0 = virtual_pid % num_blocks_0", role_src)
+                self.assertIn("offset_0 = pid_0 * _BLOCK_SIZE_0", role_src)
+                self.assertIn("for offset_2 in range", role_src)
+                self.assertIn(
+                    "if tcgen05_tma_full_tile and tcgen05_tma_next_full_tile",
+                    role_src,
+                )
+                self.assertNotIn(
+                    "tcgen05_tma_full_tile and tcgen05_tma_warp and "
+                    "tcgen05_tma_next_full_tile",
+                    role_src,
+                )
+                found_role_local_producer_loop = True
+
+        for node in ast.walk(tree):
+            if not (
+                isinstance(node, ast.While)
+                and ast.unparse(node.test) == "tcgen05_work_tile_valid"
+            ):
+                continue
+            shared_src = ast.unparse(node)
+            shared_consumer_loop_has_producer = (
+                "producer_try_acquire(tcgen05_ab_producer_state)" in shared_src
+            )
+            self.assertIn("consumer_try_wait(tcgen05_ab_consumer_state)", shared_src)
+            shared_loop_preserves_barriers = "cute.arch.sync_threads()" in shared_src
+            shared_scheduler_retargeted_to_exec = (
+                "cute.arch.make_warp_uniform(cute.arch.warp_idx()) == cutlass.Int32(4)"
+                in shared_src
+                and "tcgen05_tile_sched.advance_to_next_work()" in shared_src
+            )
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.If):
+                continue
+            test_src = ast.unparse(node.test)
+            if not (test_src.startswith("not ") and "cutlass.Int32(5)" in test_src):
+                continue
+            shared_loop_excludes_tma = any(
+                isinstance(child, ast.While)
+                and ast.unparse(child.test) == "tcgen05_work_tile_valid"
+                for child in node.body
+            )
         self.assertTrue(
-            found_in_loop,
-            "Expected the per-K-iter producer ``if`` to be the body of "
-            "an ``if {role_predicate}: ...`` inside a top-level "
-            "``for`` / ``while`` (the K-loop). This pins the role "
-            "partitioner's one-level recursion into the K-loop body. "
-            "Generated code:\n" + code,
+            found_role_local_producer_loop,
+            "Expected a role-local TMA producer while containing the "
+            "producer-only K-loop. Generated code:\n" + code,
         )
+        self.assertTrue(
+            shared_loop_preserves_barriers,
+            "Shared persistent while must preserve CTA barriers so the "
+            "TMA warp can rejoin as a barrier participant. Generated code:\n" + code,
+        )
+        self.assertTrue(
+            shared_scheduler_retargeted_to_exec,
+            "Shared scheduler advance should be owned by the exec warp in "
+            "the role-local TMA producer path. Generated code:\n" + code,
+        )
+        self.assertFalse(
+            shared_loop_excludes_tma,
+            "The TMA warp must still enter the shared while after its "
+            "role-local producer loop so existing sync_threads barriers "
+            "remain valid. Generated code:\n" + code,
+        )
+        self.assertFalse(
+            shared_consumer_loop_has_producer,
+            "Shared persistent while should keep the consumer K-loop but not "
+            "the TMA producer K-loop. Generated code:\n" + code,
+        )
+
+    def test_tcgen05_persistent_partial_single_tile_keeps_shared_tma_path(
+        self,
+    ) -> None:
+        """Partial-tile TMA fallback keeps the legacy shared-loop shape.
+
+        The role-local TMA producer path removes CTA-wide barriers from the
+        shared loop because the TMA-load warp runs a sibling loop. Partial
+        tiles still need the scalar fallback barriers in the shared loop, so
+        static edge shapes must not opt into the role-local producer path.
+        """
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_persistent_partial(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        args = (
+            torch.randn(96, 32, device=DEVICE, dtype=torch.float16),
+            torch.randn(32, 96, device=DEVICE, dtype=torch.float16),
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_persistent_partial.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            cfg = _make_tcgen05_persistent_config(
+                block_sizes=[128, 128, 16],
+                pid_type="persistent_blocked",
+            )
+            code = bound.to_triton_code(cfg)
+
+        self.assertIn("while tcgen05_work_tile_valid", code)
+        self.assertNotIn("tcgen05_role_local", code)
+        self.assertIn("tcgen05_tma_warp", code)
+        self.assertIn("cute.arch.sync_threads()", code)
+        self.assertIn("if tcgen05_tma_full_tile", code)
 
     def test_tcgen05_persistent_multi_tile_runtime_guard(self) -> None:
         """Multi-tile + persistent + tcgen05 must raise ``RuntimeError``.
@@ -4607,23 +4682,103 @@ class TestPersistentLoopSplitter(unittest.TestCase):
                 stub_df, layout, shared_block, scheduler_var_prefix="rl_shared_test"
             )
 
+    def test_role_local_dependency_stmts_pull_pid_offset_chain(self) -> None:
+        """Extracted role blocks still need tile-local names that were
+        computed by the shared PID-decomposition prefix. The dependency
+        helper pulls the nearest shared definitions transitively so the
+        role-local loop can compute ``offset_0`` before issuing TMA
+        partitions that read it."""
+        stub_df, splitter = self._make_role_local_stubs(num_pid_dims=2)
+        layout = self._make_minimal_layout()
+        pid_0 = self._stmt("pid_0 = __test_virtual_pid__ % num_blocks_0")
+        pid_1 = self._stmt("pid_1 = __test_virtual_pid__ // num_blocks_0")
+        offset_0 = self._stmt("offset_0 = pid_0 * 128")
+        offset_1 = self._stmt("offset_1 = pid_1 * 256")
+        unrelated = self._stmt("acc = 0.0")
+        tma_load = self._stmt(
+            "gA = cute.local_tile(tensor_a, (128, 16), (offset_0, None))"
+        )
+        body = [pid_0, pid_1, offset_0, offset_1, unrelated, tma_load]
+        stub_df.register_cute_tcgen05_per_tile_stmts([tma_load])
+        stub_df.register_cute_tcgen05_tma_load_role_stmts([tma_load])
+        partition = splitter._partition_tcgen05_role_blocks(stub_df, body)
+
+        role_local_whiles, _ = splitter._build_tcgen05_persistent_tile_body_role_local(
+            stub_df, layout, partition
+        )
+
+        self.assertEqual(len(role_local_whiles), 1)
+        while_stmt = role_local_whiles[0].body[-1]
+        loop_src = "\n".join(ast.unparse(s) for s in while_stmt.body)
+        self.assertIn("pid_0 = __test_virtual_pid__ % num_blocks_0", loop_src)
+        self.assertIn("offset_0 = pid_0 * 128", loop_src)
+        self.assertNotIn("offset_1 = pid_1 * 256", loop_src)
+        self.assertNotIn("acc = 0.0", loop_src)
+        self.assertLess(loop_src.find("offset_0 ="), loop_src.find("cute.local_tile"))
+
+    def test_role_local_dependency_stmts_ignore_role_internal_defs(self) -> None:
+        """Role-local dependencies should include only free reads.
+
+        The producer K-loop defines and then reads per-iteration names such as
+        ``tcgen05_tma_full_tile``. Those reads are local to the extracted role
+        body and must not cause the dependency scanner to pull the shared
+        consumer K-loop that happens to write the same names.
+        """
+        stub_df, splitter = self._make_role_local_stubs(num_pid_dims=2)
+        layout = self._make_minimal_layout()
+        pid_0 = self._stmt("pid_0 = __test_virtual_pid__ % num_blocks_0")
+        offset_0 = self._stmt("offset_0 = pid_0 * 128")
+        shared_kloop = self._stmt(
+            "for offset_2 in range(K):\n"
+            "    tcgen05_tma_full_tile = offset_2 + 16 <= K\n"
+            "    tcgen05_tma_next_full_tile = offset_2 + 32 <= K\n"
+            "    tcgen05_ab_producer_try_token = shared_try_token\n"
+            "    tcgen05_ab_pipeline.consumer_wait(tcgen05_ab_consumer_state)"
+        )
+        producer_kloop = self._stmt(
+            "for offset_2 in range(K):\n"
+            "    tcgen05_tma_k_tile = offset_2 // 16\n"
+            "    tcgen05_tma_full_tile = offset_2 + 16 <= K\n"
+            "    tcgen05_tma_next_full_tile = offset_2 + 32 <= K\n"
+            "    tcgen05_ab_producer_try_token = "
+            "tcgen05_ab_pipeline.producer_try_acquire(tcgen05_ab_producer_state)\n"
+            "    if tcgen05_tma_full_tile and tcgen05_tma_next_full_tile "
+            "and tcgen05_ab_producer_try_token:\n"
+            "        tma_tile = offset_0"
+        )
+        body = [pid_0, offset_0, shared_kloop, producer_kloop]
+        stub_df.register_cute_tcgen05_per_tile_stmts([producer_kloop])
+        stub_df.register_cute_tcgen05_tma_load_role_stmts([producer_kloop])
+        partition = splitter._partition_tcgen05_role_blocks(stub_df, body)
+
+        role_local_whiles, _ = splitter._build_tcgen05_persistent_tile_body_role_local(
+            stub_df, layout, partition
+        )
+
+        self.assertEqual(len(role_local_whiles), 1)
+        while_stmt = role_local_whiles[0].body[-1]
+        loop_src = "\n".join(ast.unparse(s) for s in while_stmt.body)
+        self.assertEqual(loop_src.count("for offset_2 in range(K):"), 1)
+        self.assertIn("offset_0 = pid_0 * 128", loop_src)
+        self.assertLess(loop_src.find("offset_0 ="), loop_src.find("for offset_2"))
+        self.assertNotIn("consumer_wait", loop_src)
+
     def test_role_local_tile_body_builder_returns_two_lists(self) -> None:
         """``_build_tcgen05_persistent_tile_body_role_local`` returns
         ``(role_local_whiles, shared_tile_body)``. The role-local
         whiles list has one entry per unique role predicate in the
         partition; the shared tile body is the per-tile body for the
-        shared ``while`` (without the extracted role blocks). This is
-        the consumer that the persistent-kernel setup wires up when
-        the K-loop split lands; today it is exercised only by this
-        unit test suite (the production path still uses
-        ``_build_tcgen05_persistent_tile_body``)."""
+        shared ``while`` (without the extracted role blocks). The
+        persistent-kernel setup wires this consumer when top-level
+        TMA-load role blocks are extracted."""
         stub_df, splitter = self._make_role_local_stubs(num_pid_dims=1)
         layout = self._make_minimal_layout()
 
         shared_a = self._stmt("a = 1")
+        shared_sync = self._stmt("if needs_barrier:\n    cute.arch.sync_threads()")
         tma_load_x = self._stmt("tma_pipeline.producer_acquire(s)")
         shared_b = self._stmt("b = 2")
-        body = [shared_a, tma_load_x, shared_b]
+        body = [shared_a, shared_sync, tma_load_x, shared_b]
         stub_df.register_cute_tcgen05_per_tile_stmts([tma_load_x])
         stub_df.register_cute_tcgen05_tma_load_role_stmts([tma_load_x])
         partition = splitter._partition_tcgen05_role_blocks(stub_df, body)
@@ -4641,11 +4796,11 @@ class TestPersistentLoopSplitter(unittest.TestCase):
         # tagged statement.
         shared_src = "\n".join(ast.unparse(s) for s in shared_tile_body)
         self.assertNotIn("producer_acquire(s)", shared_src)
-        # The shared tile body must NOT emit the block-wide
-        # sync_threads in role-local mode -- otherwise warps running
-        # the role-local while (a sibling loop) would never reach the
-        # barrier and the kernel would hang.
-        self.assertNotIn("sync_threads", shared_src)
+        # The TMA-only role-local intermediate keeps every warp in the
+        # shared while after the producer loop, so existing CTA-wide
+        # barriers must be preserved rather than stripped recursively.
+        self.assertIn("if needs_barrier:\n    cute.arch.sync_threads()", shared_src)
+        self.assertIn("cute.arch.sync_threads()", shared_src)
         # The role-local while body should hold the tagged stmt.
         rl_src = "\n".join(ast.unparse(s) for s in rl_while.body)
         self.assertIn("producer_acquire(s)", rl_src)
@@ -4809,6 +4964,22 @@ class TestPerKiterTmaBuilders(unittest.TestCase):
         # (tma_k_tile + ab_stage_count == 2).
         body_src = ast.unparse(ast.Module(body=node.body, type_ignores=[]))
         self.assertIn("tma_k_tile + cutlass.Int32(2)", body_src)
+
+    def test_pipeline_producer_if_can_drop_inline_tma_warp_gate(self) -> None:
+        args = self._make_args()
+        node = _build_kloop_pipeline_producer_if(args, gate_tma_warp=False)
+        self.assertIsInstance(node, ast.If)
+        self.assertEqual(ast.unparse(node.test), "full_tile and next_full_tile")
+        body_src = ast.unparse(ast.Module(body=node.body, type_ignores=[]))
+        self.assertNotIn("tma_warp", body_src)
+
+    def test_non_pipeline_producer_if_can_drop_inline_tma_warp_gate(self) -> None:
+        args = self._make_args()
+        node = _build_kloop_non_pipeline_producer_if(args, gate_tma_warp=False)
+        self.assertIsInstance(node, ast.If)
+        self.assertEqual(ast.unparse(node.test), "full_tile")
+        body_src = ast.unparse(ast.Module(body=node.body, type_ignores=[]))
+        self.assertNotIn("tma_warp", body_src)
 
     def test_pipeline_consumer_if_predicate_and_body(self) -> None:
         args = self._make_args()

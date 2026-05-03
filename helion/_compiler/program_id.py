@@ -830,6 +830,14 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             f"== cutlass.Int32({plan.persistent_scheduler_owner_warp_id})"
         )
 
+    def _tcgen05_exec_warp_expr(self) -> str:
+        plan = self._tcgen05_plan()
+        assert plan is not None, "tcgen05 persistent path requires a registered plan"
+        return (
+            "cute.arch.make_warp_uniform(cute.arch.warp_idx()) "
+            f"== cutlass.Int32({plan.exec_warp_id})"
+        )
+
     def _tcgen05_scheduler_store_leader_expr(self) -> str:
         return (
             f"({self._tcgen05_scheduler_owner_warp_expr()}) "
@@ -842,6 +850,28 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         return (
             f"({self._tcgen05_scheduler_owner_warp_expr()}) "
             "and cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster()) == cutlass.Int32(0)"
+        )
+
+    def _retarget_tcgen05_shared_scheduler_to_exec(
+        self, layout: Tcgen05PersistentProgramIDs._Tcgen05PersistentLayout
+    ) -> None:
+        """Make the shared persistent loop's scheduler live on the exec warp.
+
+        Once the TMA-load warp is lifted into a role-local sibling loop, its
+        primary work is no longer in the shared loop. In the current TMA-only
+        intermediate the TMA warp still rejoins the shared loop to participate
+        in CTA-wide barriers, but scheduler side effects should be owned by a
+        warp whose work remains in the shared consumer body. The exec warp is
+        the earliest non-epilogue role with one warp-wide predicate.
+        """
+        exec_warp = self._tcgen05_exec_warp_expr()
+        layout.scheduler_owner_warp = exec_warp
+        layout.cluster_scheduler_leader = (
+            f"({exec_warp}) "
+            "and cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster()) == cutlass.Int32(0)"
+        )
+        layout.scheduler_leader_predicate = (
+            layout.cluster_scheduler_leader if layout.cluster_m > 1 else exec_warp
         )
 
     def _tcgen05_store_work_tile_statements(
@@ -1243,19 +1273,44 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         )
 
         layout = self._build_tcgen05_persistent_layout(device_function)
-        role_blocks = self._collect_tcgen05_role_blocks(device_function, wrapped_body)
+        partition = self._partition_tcgen05_role_blocks(device_function, wrapped_body)
+        use_role_local_body = bool(partition.role_blocks_extracted)
+        if use_role_local_body:
+            self._retarget_tcgen05_shared_scheduler_to_exec(layout)
 
         setup: list[ast.stmt] = []
         setup.extend(self._build_tcgen05_persistent_prelude(layout))
         setup.extend(hoisted_setup)
-        setup.append(
-            create(
-                ast.While,
-                test=expr_from_string(layout.work_tile_valid_var),
-                body=self._build_tcgen05_persistent_tile_body(layout, role_blocks),
-                orelse=[],
+        if use_role_local_body:
+            role_local_whiles, shared_tile_body = (
+                self._build_tcgen05_persistent_tile_body_role_local(
+                    device_function, layout, partition
+                )
             )
-        )
+            setup.extend(role_local_whiles)
+            # This G1 3b intermediate only extracts the TMA-load producer.
+            # All warps still enter the shared loop after any role-local
+            # producer work so existing CTA-wide barriers remain valid for
+            # exec/epi synchronization and work-tile metadata publication.
+            setup.append(
+                create(
+                    ast.While,
+                    test=expr_from_string(layout.work_tile_valid_var),
+                    body=shared_tile_body,
+                    orelse=[],
+                )
+            )
+        else:
+            setup.append(
+                create(
+                    ast.While,
+                    test=expr_from_string(layout.work_tile_valid_var),
+                    body=self._build_tcgen05_persistent_tile_body(
+                        layout, partition.role_blocks_inline
+                    ),
+                    orelse=[],
+                )
+            )
         setup.extend(post_loop_stmts)
         return setup
 
@@ -1285,11 +1340,11 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         The role-local consumer
         (:meth:`_build_tcgen05_persistent_tile_body_role_local`) emits
         one role-local ``while`` per unique role predicate driven by
-        its own scheduler instance, while the shared body runs in a
-        sibling ``while`` (the same overall shape Quack uses for its
-        TMA-load / MMA-exec / epi role-local persistent loops in
-        ``gemm_sm100.py``). Cross-role synchronization is via the AB /
-        acc pipelines, not ``cute.arch.sync_threads()``.
+        its own scheduler instance. In the TMA-only intermediate, every
+        warp still enters the shared body after any role-local work so
+        existing CTA-wide ``cute.arch.sync_threads()`` barriers remain
+        valid. The AB / acc pipelines carry producer-consumer ordering
+        between the role-local producer and the shared consumer.
         """
 
         role_predicate: str | None
@@ -1662,13 +1717,12 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
 
         ``emit_block_wide_sync`` controls the per-tile
         ``cute.arch.sync_threads()`` (a CTA-wide barrier). The default
-        ``True`` is correct only when every warp in the CTA runs this
-        shared ``while``. The role-local-while consumer
-        (:meth:`_build_tcgen05_persistent_tile_body_role_local`) passes
-        ``False`` because some warps run sibling role-local ``while``
-        loops and would never reach the barrier, hanging the kernel.
-        Cross-warp synchronization in the role-local shape is via the
-        AB / acc pipeline barriers instead.
+        ``True`` is correct for the current TMA-only role-local
+        intermediate because every warp still enters this shared
+        ``while`` after any role-local producer work. Passing ``False``
+        is reserved for the later fully role-local shape where no
+        role-local warp reaches the shared loop and the remaining work
+        has a replacement non-CTA synchronization scheme.
 
         See :meth:`_build_tcgen05_persistent_tile_body_role_local` for
         the role-local-while consumer that lifts non-shared role blocks
@@ -1718,6 +1772,7 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         layout: _Tcgen05PersistentLayout,
         role_block: Tcgen05PersistentProgramIDs._PersistentRoleBlock,
         scheduler_var_prefix: str,
+        dependency_stmts: list[ast.stmt] | None = None,
     ) -> ast.stmt:
         """Build a role-local ``while`` for one extracted role block.
 
@@ -1729,11 +1784,12 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         per tile, advances its own scheduler, and refreshes its own
         work-tile state.
 
-        Cross-role synchronization is via the AB / acc pipelines (the
-        existing pipeline barriers carry the data dependency); no
-        ``cute.arch.sync_threads()`` is emitted between the role-local
-        ``while`` and the shared ``while`` because the two run on
-        disjoint warp sets.
+        Cross-role producer-consumer synchronization is via the AB /
+        acc pipelines (the existing pipeline barriers carry the data
+        dependency); no ``cute.arch.sync_threads()`` is emitted inside
+        the role-local loop. In the current TMA-only intermediate, the
+        role-local warp still enters the shared loop afterwards so the
+        shared loop's existing CTA-wide barriers remain valid.
 
         The returned statement is the role-local ``while`` itself,
         wrapped in ``if {role_predicate}:`` so only the matching warps
@@ -1793,6 +1849,8 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         per_tile_body: list[ast.stmt] = [
             statement_from_string(f"{self.virtual_pid_var} = {linear_pid_expr}"),
         ]
+        if dependency_stmts is not None:
+            per_tile_body.extend(dependency_stmts)
         per_tile_body.extend(role_block.stmts)
         per_tile_body.extend(
             [
@@ -1819,6 +1877,43 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             orelse=[],
         )
 
+    def _role_local_dependency_stmts(
+        self, shared_body: list[ast.stmt], role_stmts: list[ast.stmt]
+    ) -> list[ast.stmt]:
+        """Return shared per-tile statements needed by an extracted role.
+
+        Extracted TMA-load statements still read tile-local names such as
+        ``offset_0`` / ``offset_1`` that are normally produced by the shared
+        PID-decomposition prefix. Walk the shared body backwards from the
+        role's reads and pull in the nearest definitions, adding their reads
+        transitively. The returned statements preserve source order and run
+        immediately after the role-local ``virtual_pid`` binding.
+
+        This intentionally simple pass assumes the dependency prefix is made
+        of flat, unconditional per-tile assignments (PID decomposition,
+        offsets, TMA tensor partitions). ``ast.walk`` treats writes inside
+        compound statements as unconditional; if conditional prefix defines
+        become necessary, this helper needs control-flow-aware dominance.
+        """
+        needed: set[str] = set()
+        internal_writes: set[str] = set()
+        for stmt in role_stmts:
+            reads, writes = _stmt_name_uses(stmt)
+            needed.update(reads)
+            internal_writes.update(writes)
+        needed.difference_update(internal_writes)
+
+        selected_reversed: list[ast.stmt] = []
+        for stmt in reversed(shared_body):
+            reads, writes = _stmt_name_uses(stmt)
+            if not writes or not (writes & needed):
+                continue
+            selected_reversed.append(stmt)
+            needed.difference_update(writes)
+            needed.update(reads)
+        selected_reversed.reverse()
+        return selected_reversed
+
     def _build_tcgen05_persistent_tile_body_role_local(
         self,
         device_function: DeviceFunction,
@@ -1843,34 +1938,22 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         - ``shared_tile_body`` is the per-tile body for the shared
           ``while`` (the work-tile body without the extracted role
           blocks). Built via :meth:`_build_tcgen05_persistent_tile_body`
-          with ``emit_block_wide_sync=False`` so the per-tile
-          ``cute.arch.sync_threads()`` is omitted -- otherwise the
-          warps running role-local loops would never reach the barrier
-          and the kernel would hang. Cross-warp synchronization in
-          this shape is via the AB / acc pipelines instead.
+          with existing ``cute.arch.sync_threads()`` calls preserved. In
+          this TMA-only intermediate all warps still enter the shared
+          ``while`` after the role-local producer branch, so those CTA-wide
+          barriers remain valid for exec/epi synchronization and
+          work-tile metadata publication.
 
         Caller wires both into the persistent kernel as siblings of
-        each other inside the same setup list. The shared ``while``
-        runs on every warp that does NOT match a role predicate; each
-        role-local ``while`` runs only on its predicated warps.
+        each other inside the same setup list. In this TMA-only
+        intermediate, each role-local ``while`` runs only on its
+        predicated warps, then every warp enters the shared ``while``
+        so existing CTA-wide barriers remain valid.
 
-        **Requirements / known limitations** (must be addressed before
-        wiring this consumer into production codegen; today it is
-        exercised only by the unit test suite):
-
-        1. Per-tile prerequisites referenced by an extracted role
-           block (e.g. predicate setup, offsets, TMA tensors) must
-           also be tagged with the same role -- otherwise they live
-           only in the shared body and the role-local loop will see
-           undefined names. The K-loop split (``cute_plan.md`` step
-           3b proper) is expected to land a single producer-only
-           K-loop tagged top-level so this requirement is met by
-           construction.
-        2. The per-K-iter producer block is currently nested inside
-           the shared ``while``'s K-loop body; today the TMA-load warp
-           does NOT issue per-K-iter producer work because it does not
-           run the shared ``while``. The K-loop split must land before
-           this consumer is enabled in production codegen.
+        **Current limitation.** Only the TMA-load producer role is
+        extracted today. The MMA-exec and epi roles still live in the
+        shared ``while``, and multi-tile persistent tcgen05 remains
+        blocked by the host guard until those roles move out too.
         """
         # Wrap the shared body's tagged-removed view in the standard
         # per-tile shape. ``shared_role_blocks`` reuses the
@@ -1883,7 +1966,7 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             )
         ]
         shared_tile_body = self._build_tcgen05_persistent_tile_body(
-            layout, shared_role_blocks, emit_block_wide_sync=False
+            layout, shared_role_blocks
         )
         # Merge extracted blocks by ``role_predicate`` so each predicate
         # gets one role-local loop carrying all of its per-tile
@@ -1905,6 +1988,9 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                     layout,
                     merged_block,
                     scheduler_var_prefix=f"tcgen05_role_local_{i}",
+                    dependency_stmts=self._role_local_dependency_stmts(
+                        partition.shared_body_extracted, stmts
+                    ),
                 )
             )
         return role_local_whiles, shared_tile_body
