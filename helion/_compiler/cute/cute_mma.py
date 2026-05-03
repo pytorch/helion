@@ -689,6 +689,224 @@ def _mma_result_can_be_deferred(node: Node) -> bool:
     return all(user.op == "output" for user in node.users)
 
 
+@dataclass(frozen=True)
+class _PerKiterTmaArgs:
+    """Variable names + flags threaded into the per-K-iter TMA builders.
+
+    All ``str`` fields name a Python identifier in the generated code.
+    Only valid when the tcgen05 TMA path is active, so every name is
+    guaranteed bound at the call site.
+    """
+
+    tma_pipeline: str
+    tma_producer_state: str
+    tma_consumer_state: str
+    tma_producer_try_token: str
+    tma_consumer_try_token: str
+    tma_barrier_ptr: str
+    tma_full_tile: str
+    tma_next_full_tile: str
+    tma_warp: str
+    tma_atom_a: str
+    tma_atom_b: str
+    tma_gA: str
+    tma_gB: str
+    tma_sA: str
+    tma_sB: str
+    tma_k_tile: str
+    tma_a_mcast_mask: str
+    tma_b_mcast_mask: str
+    ab_stage_count: int
+    cluster_m: int
+    is_two_cta: bool
+    use_tma_a: bool
+    use_tma_b: bool
+    exec_active: str
+    scalar_load_a: ast.stmt
+    scalar_load_b: ast.stmt
+
+
+def _kloop_tma_copy_a_src(args: _PerKiterTmaArgs, *, k_offset: str) -> str:
+    """Per-K-iter TMA copy source for A; ``""`` when A is not TMA-loaded.
+
+    A only multicasts in 2-CTA mode (asymmetric vs. B, which also
+    multicasts across cluster CTAs).
+    """
+    if not args.use_tma_a:
+        return ""
+    mcast = f", mcast_mask={args.tma_a_mcast_mask}" if args.is_two_cta else ""
+    return (
+        f"    cute.copy({args.tma_atom_a}, "
+        f"{args.tma_gA}[None, {k_offset}], "
+        f"{args.tma_sA}[None, {args.tma_producer_state}.index], "
+        f"tma_bar_ptr={args.tma_barrier_ptr}{mcast})\n"
+    )
+
+
+def _kloop_tma_copy_b_src(args: _PerKiterTmaArgs, *, k_offset: str) -> str:
+    """Per-K-iter TMA copy source for B; ``""`` when B is not TMA-loaded.
+
+    B multicasts on ``cluster_m > 1`` or 2-CTA; A only on 2-CTA, so the
+    two helpers are not folded together.
+    """
+    if not args.use_tma_b:
+        return ""
+    mcast = (
+        f", mcast_mask={args.tma_b_mcast_mask}"
+        if args.cluster_m > 1 or args.is_two_cta
+        else ""
+    )
+    return (
+        f"    cute.copy({args.tma_atom_b}, "
+        f"{args.tma_gB}[None, {k_offset}], "
+        f"{args.tma_sB}[None, {args.tma_producer_state}.index], "
+        f"tma_bar_ptr={args.tma_barrier_ptr}{mcast})\n"
+    )
+
+
+def _build_kloop_pipeline_producer_if(args: _PerKiterTmaArgs) -> ast.stmt:
+    """Per-K-iter TMA producer ``if`` for the pipelined branch.
+
+    The pipelined branch is only entered when both A and B are TMA-
+    loaded (``tcgen05_use_tma_pipeline = use_tma_a and use_tma_b``), so
+    both ``cute.copy`` emissions must be present; assert that invariant
+    rather than silently dropping a side.
+    """
+    assert args.use_tma_a and args.use_tma_b, (
+        "pipelined branch requires both A and B to be TMA-loaded"
+    )
+    k_offset = f"{args.tma_k_tile} + cutlass.Int32({args.ab_stage_count})"
+    src = (
+        f"if {args.tma_full_tile} and {args.tma_warp} and {args.tma_next_full_tile}:\n"
+        f"    {args.tma_producer_try_token} = "
+        f"{args.tma_pipeline}.producer_try_acquire({args.tma_producer_state})\n"
+        f"    {args.tma_pipeline}.producer_acquire("
+        f"{args.tma_producer_state}, {args.tma_producer_try_token})\n"
+        f"    {args.tma_barrier_ptr} = "
+        f"{args.tma_pipeline}.producer_get_barrier({args.tma_producer_state})\n"
+        + _kloop_tma_copy_a_src(args, k_offset=k_offset)
+        + _kloop_tma_copy_b_src(args, k_offset=k_offset)
+        + f"    {args.tma_pipeline}.producer_commit({args.tma_producer_state})\n"
+        + emit_pipeline_advance(args.tma_producer_state, indent="    ")
+    )
+    return statement_from_string(src)
+
+
+def _build_kloop_pipeline_consumer_if(args: _PerKiterTmaArgs) -> ast.stmt:
+    """Per-K-iter TMA consumer / scalar-fallback ``if`` for the pipelined branch."""
+    scalar_load_a_src = textwrap.indent(ast.unparse(args.scalar_load_a), "    ")
+    scalar_load_b_src = textwrap.indent(ast.unparse(args.scalar_load_b), "    ")
+    src = (
+        f"if {args.tma_full_tile}:\n"
+        f"    if {args.exec_active}:\n"
+        f"        {args.tma_consumer_try_token} = "
+        f"{args.tma_pipeline}.consumer_try_wait({args.tma_consumer_state})\n"
+        f"        {args.tma_pipeline}.consumer_wait("
+        f"{args.tma_consumer_state}, {args.tma_consumer_try_token})\n"
+        "else:\n"
+        f"{scalar_load_a_src}\n"
+        f"{scalar_load_b_src}\n"
+        "    cute.arch.sync_threads()"
+    )
+    return statement_from_string(src)
+
+
+def _build_kloop_pipeline_release_if(args: _PerKiterTmaArgs) -> ast.stmt:
+    """Per-K-iter consumer release ``if`` for the pipelined branch.
+
+    Producer-state advance lives in the producer block (one per
+    commit), so it is intentionally absent here.
+    """
+    src = (
+        f"if {args.tma_full_tile}:\n"
+        f"    if {args.exec_active}:\n"
+        f"        {args.tma_pipeline}.consumer_release({args.tma_consumer_state})\n"
+        + emit_pipeline_advance(args.tma_consumer_state, indent="        ")
+        + "\n"
+        "else:\n"
+        "    cute.arch.sync_threads()"
+    )
+    return statement_from_string(src)
+
+
+def _build_kloop_non_pipeline_producer_if(args: _PerKiterTmaArgs) -> ast.stmt:
+    """Per-K-iter TMA producer ``if`` for the non-pipelined branch.
+
+    Single AB stage alive at a time: no try-token, no stage-count
+    offset on the cute.copy, and no ``advance`` here (the release block
+    advances both producer and consumer state).
+    """
+    src = (
+        f"if {args.tma_full_tile} and {args.tma_warp}:\n"
+        f"    {args.tma_pipeline}.producer_acquire({args.tma_producer_state})\n"
+        f"    {args.tma_barrier_ptr} = "
+        f"{args.tma_pipeline}.producer_get_barrier({args.tma_producer_state})\n"
+        + _kloop_tma_copy_a_src(args, k_offset=args.tma_k_tile)
+        + _kloop_tma_copy_b_src(args, k_offset=args.tma_k_tile)
+        + f"    {args.tma_pipeline}.producer_commit({args.tma_producer_state})"
+    )
+    return statement_from_string(src)
+
+
+def _build_kloop_non_pipeline_consumer_if(args: _PerKiterTmaArgs) -> ast.stmt:
+    """Per-K-iter consumer / scalar-fallback ``if`` for the non-pipelined branch.
+
+    Interleaves scalar fallback loads for any operand NOT TMA-loaded
+    into the full-tile branch (e.g. A-TMA + B-scalar still loads B
+    here on full tiles).
+    """
+    scalar_load_a_src = textwrap.indent(ast.unparse(args.scalar_load_a), "    ")
+    scalar_load_b_src = textwrap.indent(ast.unparse(args.scalar_load_b), "    ")
+    scalar_load_a_tma_src = (
+        textwrap.indent(ast.unparse(args.scalar_load_a), "    ") + "\n"
+        if not args.use_tma_a
+        else ""
+    )
+    scalar_load_b_tma_src = (
+        textwrap.indent(ast.unparse(args.scalar_load_b), "    ") + "\n"
+        if not args.use_tma_b
+        else ""
+    )
+    src = (
+        f"if {args.tma_full_tile}:\n"
+        f"{scalar_load_a_tma_src}"
+        f"{scalar_load_b_tma_src}"
+        f"    if {args.exec_active}:\n"
+        "        cute.arch.sync_warp()\n"
+        f"        {args.tma_pipeline}.consumer_wait("
+        f"{args.tma_consumer_state}, {args.tma_consumer_try_token})\n"
+        "    cute.arch.sync_threads()\n"
+        "else:\n"
+        f"{scalar_load_a_src}\n"
+        f"{scalar_load_b_src}\n"
+        "    cute.arch.sync_threads()"
+    )
+    return statement_from_string(src)
+
+
+def _build_kloop_non_pipeline_release_if(args: _PerKiterTmaArgs) -> ast.stmt:
+    """Per-K-iter consumer release ``if`` for the non-pipelined branch.
+
+    CTA-wide ``sync_threads()`` runs first so every warp sees the
+    consumer wait completed; single-stage means BOTH producer and
+    consumer state must advance here.
+    """
+    src = (
+        f"if {args.tma_full_tile}:\n"
+        "    cute.arch.sync_threads()\n"
+        f"    if {args.exec_active}:\n"
+        "        cute.arch.sync_warp()\n"
+        f"        {args.tma_pipeline}.consumer_release({args.tma_consumer_state})\n"
+        + emit_pipeline_advance(args.tma_producer_state, indent="    ")
+        + "\n"
+        + emit_pipeline_advance(args.tma_consumer_state, indent="    ")
+        + "\n"
+        "else:\n"
+        "    cute.arch.sync_threads()"
+    )
+    return statement_from_string(src)
+
+
 def _emit_mma_pipeline(
     cg: GenerateAST,
     lhs_node: Node,
@@ -1682,6 +1900,9 @@ def _emit_mma_pipeline(
     rB = df.new_var("rB")
     tAsA = df.new_var("tAsA")
     tBsB = df.new_var("tBsB")
+    # Built once below in the tcgen05+TMA branch; reused by the
+    # release block emitted later in the same branch.
+    tma_kloop_args: _PerKiterTmaArgs | None = None
 
     # --- Global → Shared memory with masking ---
     # Each thread loads elements into shared memory using scalar indexing
@@ -1840,28 +2061,37 @@ def _emit_mma_pipeline(
             f"else {input_dtype_str}(0.0))"
         )
         if mma_impl == "tcgen05" and tcgen05_use_tma:
-            scalar_load_a_src = textwrap.indent(ast.unparse(scalar_load_a), "    ")
-            scalar_load_b_src = textwrap.indent(ast.unparse(scalar_load_b), "    ")
-            scalar_load_a_tma_src = (
-                textwrap.indent(ast.unparse(scalar_load_a), "    ") + "\n"
-                if not tcgen05_use_tma_a
-                else ""
+            assert tcgen05_plan is not None
+            assert tma_warp is not None
+            tma_kloop_args = _PerKiterTmaArgs(
+                tma_pipeline=tma_pipeline,
+                tma_producer_state=tma_producer_state,
+                tma_consumer_state=tma_consumer_state,
+                tma_producer_try_token=tma_producer_try_token,
+                tma_consumer_try_token=tma_consumer_try_token,
+                tma_barrier_ptr=tma_barrier_ptr,
+                tma_full_tile=tma_full_tile,
+                tma_next_full_tile=tma_next_full_tile,
+                tma_warp=tma_warp,
+                tma_atom_a=tma_atom_a,
+                tma_atom_b=tma_atom_b,
+                tma_gA=tma_gA,
+                tma_gB=tma_gB,
+                tma_sA=tma_sA,
+                tma_sB=tma_sB,
+                tma_k_tile=tma_k_tile,
+                tma_a_mcast_mask=tma_a_mcast_mask,
+                tma_b_mcast_mask=tma_b_mcast_mask,
+                ab_stage_count=tcgen05_ab_stage_count_value,
+                cluster_m=tcgen05_cluster_m,
+                is_two_cta=tcgen05_is_two_cta,
+                use_tma_a=tcgen05_use_tma_a,
+                use_tma_b=tcgen05_use_tma_b,
+                exec_active=tcgen05_plan.exec_active,
+                scalar_load_a=scalar_load_a,
+                scalar_load_b=scalar_load_b,
             )
-            scalar_load_b_tma_src = (
-                textwrap.indent(ast.unparse(scalar_load_b), "    ") + "\n"
-                if not tcgen05_use_tma_b
-                else ""
-            )
-            # Per-K-iter TMA work is emitted as two adjacent statements
-            # inside the K-loop body: a producer-side ``if`` and a
-            # consumer/fallback ``if``. The producer half is tagged
-            # ``tma_load`` so the role partitioner can wrap it with the
-            # TMA-load warp predicate (and, in step 3b, lift it into a
-            # TMA-load-warp-local ``while``); see ``cute_plan.md`` for
-            # the role-lift plan.
-            tma_wait_src = f"        {tma_pipeline}.consumer_wait({tma_consumer_state}, {tma_consumer_try_token})\n"
             if tcgen05_use_tma_pipeline:
-                assert tcgen05_plan is not None
                 cg.add_statement(
                     statement_from_string(
                         f"{tma_next_full_tile} = "
@@ -1880,124 +2110,22 @@ def _emit_mma_pipeline(
                         f"{tma_consumer_try_token} = cutlass.Boolean(0)"
                     )
                 )
-                pipeline_producer_src = (
-                    f"if {tma_full_tile} and {tma_warp} and {tma_next_full_tile}:\n"
-                    f"    {tma_producer_try_token} = {tma_pipeline}.producer_try_acquire({tma_producer_state})\n"
-                    f"    {tma_pipeline}.producer_acquire({tma_producer_state}, {tma_producer_try_token})\n"
-                    f"    {tma_barrier_ptr} = {tma_pipeline}.producer_get_barrier({tma_producer_state})\n"
-                    + (
-                        f"    cute.copy({tma_atom_a}, "
-                        f"{tma_gA}[None, {tma_k_tile} + cutlass.Int32({tcgen05_ab_stage_count_value})], "
-                        f"{tma_sA}[None, {tma_producer_state}.index], "
-                        f"tma_bar_ptr={tma_barrier_ptr}"
-                        + (
-                            f", mcast_mask={tma_a_mcast_mask}"
-                            if tcgen05_is_two_cta
-                            else ""
-                        )
-                        + ")\n"
-                        f"    cute.copy({tma_atom_b}, "
-                        f"{tma_gB}[None, {tma_k_tile} + cutlass.Int32({tcgen05_ab_stage_count_value})], "
-                        f"{tma_sB}[None, {tma_producer_state}.index], "
-                        f"tma_bar_ptr={tma_barrier_ptr}"
-                        + (
-                            f", mcast_mask={tma_b_mcast_mask}"
-                            if tcgen05_cluster_m > 1 or tcgen05_is_two_cta
-                            else ""
-                        )
-                        + ")\n"
-                    )
-                    + f"    {tma_pipeline}.producer_commit({tma_producer_state})\n"
-                    + emit_pipeline_advance(tma_producer_state, indent="    ")
+                # Producer is tagged for the role partitioner so it gets
+                # wrapped in ``if {tma_warp_predicate}: ...`` when the
+                # K-loop is split per-role.
+                pipeline_producer_stmt = _build_kloop_pipeline_producer_if(
+                    tma_kloop_args
                 )
-                # The per-K-iter producer block lives INSIDE the K-loop
-                # body (it's added via ``cg.add_statement``), so the
-                # statement isn't a top-level per-tile statement and
-                # doesn't need to be registered as per-tile. The role
-                # partitioner recurses into top-level ``for`` / ``while``
-                # bodies to find this tagged child and wraps it with
-                # ``if {tma_warp_predicate}: ...`` -- structural prep
-                # for the role-local ``while`` lift in step 3b.
-                pipeline_producer_stmt = statement_from_string(pipeline_producer_src)
                 cg.add_statement(pipeline_producer_stmt)
                 tma_load_role_stmts.append(pipeline_producer_stmt)
-                pipeline_consumer_src = (
-                    f"if {tma_full_tile}:\n"
-                    f"    if {tcgen05_plan.exec_active}:\n"
-                    f"        {tma_consumer_try_token} = {tma_pipeline}.consumer_try_wait({tma_consumer_state})\n"
-                    f"{tma_wait_src}"
-                    "else:\n"
-                    f"{scalar_load_a_src}\n"
-                    f"{scalar_load_b_src}\n"
-                    "    cute.arch.sync_threads()"
-                )
-                cg.add_statement(statement_from_string(pipeline_consumer_src))
+                cg.add_statement(_build_kloop_pipeline_consumer_if(tma_kloop_args))
             else:
-                assert tcgen05_plan is not None
-                tma_copy_a_src = (
-                    (
-                        f"    cute.copy({tma_atom_a}, {tma_gA}[None, {tma_k_tile}], "
-                        f"{tma_sA}[None, {tma_producer_state}.index], tma_bar_ptr={tma_barrier_ptr}"
-                        + (
-                            f", mcast_mask={tma_a_mcast_mask}"
-                            if tcgen05_is_two_cta
-                            else ""
-                        )
-                        + ")\n"
-                    )
-                    if tcgen05_use_tma_a
-                    else ""
-                )
-                tma_copy_b_src = (
-                    (
-                        f"    cute.copy({tma_atom_b}, {tma_gB}[None, {tma_k_tile}], "
-                        f"{tma_sB}[None, {tma_producer_state}.index], tma_bar_ptr={tma_barrier_ptr}"
-                        + (
-                            f", mcast_mask={tma_b_mcast_mask}"
-                            if tcgen05_cluster_m > 1 or tcgen05_is_two_cta
-                            else ""
-                        )
-                        + ")\n"
-                    )
-                    if tcgen05_use_tma_b
-                    else ""
-                )
-                non_pipeline_producer_src = (
-                    f"if {tma_full_tile} and {tma_warp}:\n"
-                    f"    {tma_pipeline}.producer_acquire({tma_producer_state})\n"
-                    f"    {tma_barrier_ptr} = {tma_pipeline}.producer_get_barrier({tma_producer_state})\n"
-                    f"{tma_copy_a_src}"
-                    f"{tma_copy_b_src}"
-                    f"    {tma_pipeline}.producer_commit({tma_producer_state})"
-                )
-                # See the comment on the pipeline branch's producer
-                # tagging above: the K-loop is kept inside the work-tile
-                # body via per-tile name propagation, so this producer
-                # stmt rides along inside the K-loop. The role
-                # partitioner recurses one level into the K-loop to
-                # find this tag.
-                non_pipeline_producer_stmt = statement_from_string(
-                    non_pipeline_producer_src
+                non_pipeline_producer_stmt = _build_kloop_non_pipeline_producer_if(
+                    tma_kloop_args
                 )
                 cg.add_statement(non_pipeline_producer_stmt)
                 tma_load_role_stmts.append(non_pipeline_producer_stmt)
-                # ``scalar_load_{a,b}_tma_src`` gate on ``mma_active``
-                # (not ``tma_warp``), so they live in the consumer
-                # block alongside the cross-warp ``sync_threads()``.
-                non_pipeline_consumer_src = (
-                    f"if {tma_full_tile}:\n"
-                    f"{scalar_load_a_tma_src}"
-                    f"{scalar_load_b_tma_src}"
-                    f"    if {tcgen05_plan.exec_active}:\n"
-                    "        cute.arch.sync_warp()\n"
-                    f"{tma_wait_src}"
-                    "    cute.arch.sync_threads()\n"
-                    "else:\n"
-                    f"{scalar_load_a_src}\n"
-                    f"{scalar_load_b_src}\n"
-                    "    cute.arch.sync_threads()"
-                )
-                cg.add_statement(statement_from_string(non_pipeline_consumer_src))
+                cg.add_statement(_build_kloop_non_pipeline_consumer_if(tma_kloop_args))
         else:
             cg.add_statement(scalar_load_a)
             cg.add_statement(scalar_load_b)
@@ -2080,38 +2208,12 @@ def _emit_mma_pipeline(
                 )
             )
             if tcgen05_use_tma:
-                tma_release_src = (
-                    f"        {tma_pipeline}.consumer_release({tma_consumer_state})\n"
-                )
+                assert tma_kloop_args is not None
                 if tcgen05_use_tma_pipeline:
-                    cg.add_statement(
-                        statement_from_string(
-                            f"if {tma_full_tile}:\n"
-                            f"    if {tcgen05_plan.exec_active}:\n"
-                            f"{tma_release_src}"
-                            + emit_pipeline_advance(
-                                tma_consumer_state, indent="        "
-                            )
-                            + "\n"
-                            "else:\n"
-                            "    cute.arch.sync_threads()"
-                        )
-                    )
+                    cg.add_statement(_build_kloop_pipeline_release_if(tma_kloop_args))
                 else:
                     cg.add_statement(
-                        statement_from_string(
-                            f"if {tma_full_tile}:\n"
-                            "    cute.arch.sync_threads()\n"
-                            f"    if {tcgen05_plan.exec_active}:\n"
-                            "        cute.arch.sync_warp()\n"
-                            f"{tma_release_src}"
-                            + emit_pipeline_advance(tma_producer_state, indent="    ")
-                            + "\n"
-                            + emit_pipeline_advance(tma_consumer_state, indent="    ")
-                            + "\n"
-                            "else:\n"
-                            "    cute.arch.sync_threads()"
-                        )
+                        _build_kloop_non_pipeline_release_if(tma_kloop_args)
                     )
             else:
                 cg.add_statement(statement_from_string("cute.arch.sync_threads()"))
