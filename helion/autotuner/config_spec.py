@@ -391,6 +391,35 @@ class ConfigSpec:
         assert choices, "tcgen05_cluster_m search must allow at least one value"
         self._tcgen05_cluster_m_search_choices = choices
 
+    def narrow_tcgen05_autotune_to_validated_configs(self) -> None:
+        """Narrow the tcgen05 autotune search to combinations validated on B200.
+
+        Two structural limitations bound the safe autotune space today:
+
+        * **Multi-tile persistent.** The current tcgen05 lowering does not
+          interoperate with the persistent virtual-pid loop on B200: any
+          ``total_tiles > 1`` silently produces wrong output (only the
+          single-tile case is verified correct). Drop ``persistent_blocked``
+          and ``persistent_interleaved`` from the autotune pid_type search
+          until the role-local persistent rewrite lands. A host-side guard
+          (``Tcgen05PersistentProgramIDs._emit_host_multi_tile_guard``)
+          converts the silent miscompare into a loud ``RuntimeError`` for
+          explicit user configs that bypass autotune.
+
+        * **2-CTA cluster.** ``cluster_m=2`` (2-CTA tcgen05 instructions)
+          currently CUDA-launch-fails on B200 across the matmul block-size
+          combinations exercised. Narrow ``tcgen05_cluster_m`` to ``(1,)``
+          for the BF16/FP16 matmul path until the 2-CTA lowering is fixed.
+
+        User-supplied ``helion.Config(...)`` values are still validated
+        against the full set of legal options (see
+        ``_tcgen05_optional_fragments(for_search=False)``); only the
+        autotune *search* is narrowed.
+        """
+        self.disallow_pid_type("persistent_blocked")
+        self.disallow_pid_type("persistent_interleaved")
+        self.restrict_tcgen05_cluster_m_search((1,))
+
     def supports_config_key(self, key: str) -> bool:
         return self.backend.supports_config_key(key)
 

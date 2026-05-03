@@ -133,6 +133,16 @@ class ReductionStrategy(TileStrategy):
         return [count] if count > 0 else []
 
     def _reduction_block_has_lane_loops(self) -> bool:
+        """Return True when this reduction block is being traversed via a
+        lane loop on the cute backend (synthetic per-thread iteration
+        inside a ``DeviceGridState`` that does not have a live thread for
+        every logical lane).
+
+        Lane loops serialize part of the logical tile in Python rather
+        than mapping it to actual threads, so reductions over the looped
+        block cannot be fast-pathed via a warp-level reduction (every
+        participating axis must be backed by a live thread).
+        """
         codegen = getattr(self, "_codegen", None)
         if codegen is None:
             return False
@@ -154,6 +164,14 @@ class ReductionStrategy(TileStrategy):
         return False
 
     def _reduction_block_is_serial(self) -> bool:
+        """Return True when this reduction block is being traversed by a
+        serial ``DeviceLoopState`` (a Python ``for`` loop) rather than a
+        live thread axis.
+
+        Reductions over a serially-iterated block cannot be fast-pathed
+        via a warp-level reduction; the surrounding loop has to carry the
+        accumulator.
+        """
         codegen = getattr(self, "_codegen", None)
         if codegen is None:
             return False
@@ -166,6 +184,15 @@ class ReductionStrategy(TileStrategy):
         return False
 
     def _reduction_block_has_live_thread_axis(self) -> bool:
+        """Return True when this reduction block is mapped to a live thread
+        axis in the active loop nest (in either the current grid or any
+        active device loop).
+
+        A ``False`` return on the cute backend means a warp-level reduction
+        across this block would fold together unrelated tensor elements,
+        because no real threads back the block. The caller falls back to
+        loop-carried accumulation.
+        """
         codegen = getattr(self, "_codegen", None)
         if codegen is None:
             return False
@@ -184,35 +211,39 @@ class ReductionStrategy(TileStrategy):
                     return True
         return False
 
+    def _cute_reduction_needs_loop_carried_accumulator(self) -> bool:
+        """Return True when, on the cute backend, the surrounding loop
+        nest must perform the reduction via loop-carried accumulation
+        instead of a warp-level reduction across threads.
+
+        This consolidates the three "no live thread axis" conditions
+        previously checked separately in
+        :meth:`BlockReductionStrategy.codegen_reduction`:
+
+        * :meth:`_reduction_block_is_serial` — the block is iterated by
+          a serial ``DeviceLoopState`` rather than a thread axis;
+        * :meth:`_reduction_block_has_lane_loops` — the block is
+          iterated by a lane loop (synthetic per-thread iteration);
+        * ``not _reduction_block_has_live_thread_axis()`` — the block
+          is not mapped to any thread axis at all.
+
+        In every case the conclusion is the same: there is no live
+        thread axis to reduce across, so the surrounding loop must
+        accumulate the partial values across iterations.
+
+        Always returns False for non-cute backends (Triton / Pallas /
+        TileIR all use their native warp / lane reductions).
+        """
+        if CompileEnvironment.current().backend.name != "cute":
+            return False
+        return (
+            self._reduction_block_is_serial()
+            or self._reduction_block_has_lane_loops()
+            or not self._reduction_block_has_live_thread_axis()
+        )
+
     def _planned_thread_dims(self) -> tuple[int, int, int]:
         return self.fn.tile_strategy.thread_block_dims()
-
-    def _block_has_live_thread_axis(
-        self, block_id: int, extent: int | None = None
-    ) -> bool:
-        axis = self.fn.tile_strategy.thread_axis_for_block_id(block_id)
-        if axis is None:
-            return False
-        planned_dims = self._planned_thread_dims()
-        if axis >= len(planned_dims):
-            return False
-        live_extent = planned_dims[axis]
-        return live_extent > 1 and not (extent is not None and extent > live_extent)
-
-    def _reduction_dim_has_live_thread_axis(
-        self,
-        fake_input: torch.Tensor,
-        dim: int,
-    ) -> bool:
-        env = CompileEnvironment.current()
-        normalized_dim = dim if dim >= 0 else fake_input.ndim + dim
-        if not (0 <= normalized_dim < fake_input.ndim):
-            return False
-        block_id = env.resolve_block_id(fake_input.size(normalized_dim))
-        if block_id is None:
-            return False
-        extent = self.fn.tile_strategy.thread_extent_for_block_id(block_id)
-        return self._block_has_live_thread_axis(block_id, extent)
 
     def _get_thread_axis(self) -> int:
         """Compute the thread axis index for this reduction strategy.
@@ -1359,26 +1390,14 @@ class BlockReductionStrategy(ReductionStrategy):
             )
         ) is not None:
             expr = strided_expr
-        elif env.backend.name == "cute" and self._reduction_block_is_serial():
-            # The current reduction block is being traversed by a serial device
-            # loop rather than live threads, so the surrounding loop-carried
-            # accumulator performs the real reduction. Each iteration should
-            # contribute only its current scalar value.
-            expr = input_name
-        elif env.backend.name == "cute" and self._reduction_block_has_lane_loops():
-            # Under active lane loops the reduction is serialized by the
-            # surrounding Python loops, so each iteration should contribute its
-            # current scalar value directly. Applying a thread reduction here
-            # would incorrectly collapse across the live thread lanes instead.
-            expr = input_name
-        elif (
-            env.backend.name == "cute"
-            and not self._reduction_block_has_live_thread_axis()
-        ):
-            # The current reduction block is not backed by a live thread axis
-            # in the active loop nest, so reducing across warp lanes would fold
-            # together unrelated tensor elements. Let the surrounding loop-
-            # carried accumulator perform the reduction instead.
+        elif self._cute_reduction_needs_loop_carried_accumulator():
+            # The reduction block is not backed by a live thread axis in the
+            # active loop nest (it is iterated either by a serial device
+            # loop, by a synthetic lane loop, or has no thread axis at
+            # all). A warp-level reduction would fold together unrelated
+            # tensor elements, so each iteration contributes only its
+            # current scalar value and the surrounding loop-carried
+            # accumulator performs the real reduction.
             expr = input_name
         else:
             expr = self.call_reduction_function(
