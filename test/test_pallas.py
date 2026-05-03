@@ -2200,6 +2200,46 @@ class TestPallas(TestCase):
                     ).sum(dim=0)
         torch.testing.assert_close(result, ref, rtol=1e-3, atol=1e-3)
 
+    def test_nested_tile_matmul_mask_cast(self) -> None:
+        """Two nested data-dependent tiles with matmul need float mask expansion."""
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def jagged_kernel(
+            x: torch.Tensor, y: torch.Tensor, offsets: torch.Tensor
+        ) -> torch.Tensor:
+            num_segs = offsets.size(0) - 1
+            out = torch.zeros([num_segs], dtype=x.dtype, device=x.device)
+            for seg in hl.grid(num_segs):
+                start = offsets[seg]
+                end = offsets[seg + 1]
+                acc = hl.zeros([1], dtype=x.dtype)
+                for tile_i in hl.tile(start, end):
+                    for tile_j in hl.tile(start, end):
+                        gram = torch.matmul(
+                            x[tile_i, :], y[tile_j, :].transpose(-2, -1)
+                        )
+                        acc = acc + gram.sum(dim=0).sum(dim=0).unsqueeze(0)
+                out[seg] = acc.squeeze(0)
+            return out
+
+        N, D = 128, 128
+        x = torch.randn(N, D, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(N, D, device=DEVICE, dtype=torch.float32)
+        offsets = torch.tensor([0, 64, 128], device=DEVICE, dtype=torch.int32)
+
+        _code, result = code_and_output(
+            jagged_kernel,
+            (x, y, offsets),
+            block_sizes=[32, 32],
+            pallas_loop_type="fori_loop",
+        )
+
+        ref = torch.zeros(offsets.size(0) - 1, device=DEVICE, dtype=x.dtype)
+        for i in range(offsets.size(0) - 1):
+            s, e = int(offsets[i]), int(offsets[i + 1])
+            ref[i] = (x[s:e] @ y[s:e].T).sum()
+        torch.testing.assert_close(result, ref, rtol=1e-2, atol=1e-2)
+
 
 @skipUnlessPallas("JAX/Pallas TPU not available")
 class TestPallasIndirectGather(TestCase):

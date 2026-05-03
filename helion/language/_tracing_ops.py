@@ -2566,12 +2566,15 @@ def _(state: CodegenState) -> ast.AST:
             mask_var := state.codegen.mask_var(index)
         ) is not None:
             expand = state.tile_strategy.expand_str(input_sizes, dim)
-            expr = f"({mask_var}{expand})"
+            # Cast bool mask to float before expanding — Mosaic cannot
+            # reshape bool vectors (e.g. vector<32xi1> → vector<32x1xi1>).
+            expr = f"({mask_var}.astype(jnp.float32){expand})"
             if expr not in mask_exprs:
                 mask_exprs.append(expr)
     if not mask_exprs:
         return state.ast_arg(0)
-    mask_expr = "&".join(mask_exprs)
+    # Combine float masks via multiplication (equivalent to bool AND).
+    mask_expr = " * ".join(mask_exprs)
     if len(mask_exprs) < len(input_sizes):
         mask_expr = backend.broadcast_to_expr(
             mask_expr, state.tile_strategy.shape_str(input_sizes)
