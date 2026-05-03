@@ -800,41 +800,106 @@ def _build_kloop_pipeline_producer_if(
     return statement_from_string(src)
 
 
-def _build_kloop_pipeline_consumer_if(args: _PerKiterTmaArgs) -> ast.stmt:
+def _build_kloop_pipeline_consumer_if(
+    args: _PerKiterTmaArgs,
+    *,
+    gate_exec_warp: bool = True,
+    include_scalar_fallback: bool = True,
+) -> ast.stmt:
     """Per-K-iter TMA consumer / scalar-fallback ``if`` for the pipelined branch."""
-    scalar_load_a_src = textwrap.indent(ast.unparse(args.scalar_load_a), "    ")
-    scalar_load_b_src = textwrap.indent(ast.unparse(args.scalar_load_b), "    ")
-    src = (
-        f"if {args.tma_full_tile}:\n"
-        f"    if {args.exec_active}:\n"
-        f"        {args.tma_consumer_try_token} = "
+    consumer_src = (
+        f"{args.tma_consumer_try_token} = "
         f"{args.tma_pipeline}.consumer_try_wait({args.tma_consumer_state})\n"
-        f"        {args.tma_pipeline}.consumer_wait("
-        f"{args.tma_consumer_state}, {args.tma_consumer_try_token})\n"
-        "else:\n"
-        f"{scalar_load_a_src}\n"
-        f"{scalar_load_b_src}\n"
-        "    cute.arch.sync_threads()"
+        f"{args.tma_pipeline}.consumer_wait("
+        f"{args.tma_consumer_state}, {args.tma_consumer_try_token})"
     )
+    if gate_exec_warp:
+        full_tile_src = (
+            f"    if {args.exec_active}:\n{textwrap.indent(consumer_src, '        ')}"
+        )
+    else:
+        full_tile_src = textwrap.indent(consumer_src, "    ")
+    fallback_src = ""
+    if include_scalar_fallback:
+        scalar_load_a_src = textwrap.indent(ast.unparse(args.scalar_load_a), "    ")
+        scalar_load_b_src = textwrap.indent(ast.unparse(args.scalar_load_b), "    ")
+        fallback_src = (
+            "\nelse:\n"
+            f"{scalar_load_a_src}\n"
+            f"{scalar_load_b_src}\n"
+            "    cute.arch.sync_threads()"
+        )
+    src = f"if {args.tma_full_tile}:\n{full_tile_src}{fallback_src}"
     return statement_from_string(src)
 
 
-def _build_kloop_pipeline_release_if(args: _PerKiterTmaArgs) -> ast.stmt:
+def _build_kloop_pipeline_release_if(
+    args: _PerKiterTmaArgs,
+    *,
+    gate_exec_warp: bool = True,
+    include_scalar_fallback: bool = True,
+) -> ast.stmt:
     """Per-K-iter consumer release ``if`` for the pipelined branch.
 
     Producer-state advance lives in the producer block (one per
     commit), so it is intentionally absent here.
     """
-    src = (
-        f"if {args.tma_full_tile}:\n"
-        f"    if {args.exec_active}:\n"
-        f"        {args.tma_pipeline}.consumer_release({args.tma_consumer_state})\n"
-        + emit_pipeline_advance(args.tma_consumer_state, indent="        ")
-        + "\n"
-        "else:\n"
-        "    cute.arch.sync_threads()"
+    release_src = (
+        f"{args.tma_pipeline}.consumer_release({args.tma_consumer_state})\n"
+        + emit_pipeline_advance(args.tma_consumer_state)
     )
+    if gate_exec_warp:
+        full_tile_src = (
+            f"    if {args.exec_active}:\n{textwrap.indent(release_src, '        ')}"
+        )
+    else:
+        full_tile_src = textwrap.indent(release_src, "    ")
+    fallback_src = (
+        "\nelse:\n    cute.arch.sync_threads()" if include_scalar_fallback else ""
+    )
+    src = f"if {args.tma_full_tile}:\n{full_tile_src}{fallback_src}"
     return statement_from_string(src)
+
+
+def _build_tcgen05_mma_fence_stmt(
+    exec_active: str, *, gate_exec_warp: bool = True
+) -> ast.stmt:
+    if gate_exec_warp:
+        return statement_from_string(
+            f"if {exec_active}:\n    cute.arch.fence_view_async_shared()"
+        )
+    return statement_from_string("cute.arch.fence_view_async_shared()")
+
+
+def _build_tcgen05_mma_issue_stmt(
+    *,
+    exec_active: str,
+    tiled_mma: str,
+    acc_frag: str,
+    tcgen05_frag_a: str,
+    tcgen05_frag_b: str,
+    mma_stage: str,
+    k_offset_var: str,
+    k_loop_begin_expr: str,
+    gate_exec_warp: bool = True,
+) -> ast.stmt:
+    issue_src = (
+        f"for _tcgen05_kblk_idx in range(cute.size({tcgen05_frag_a}, mode=[2])):\n"
+        f"    {tiled_mma}.set(\n"
+        f"        cute.nvgpu.tcgen05.Field.ACCUMULATE,\n"
+        f"        {k_offset_var} != {k_loop_begin_expr} or cutlass.Int32(_tcgen05_kblk_idx) != cutlass.Int32(0),\n"
+        "    )\n"
+        f"    cute.gemm(\n"
+        f"        {tiled_mma},\n"
+        f"        {acc_frag},\n"
+        f"        [{tcgen05_frag_a}[None, None, cutlass.Int32(_tcgen05_kblk_idx), {mma_stage}]],\n"
+        f"        [{tcgen05_frag_b}[None, None, cutlass.Int32(_tcgen05_kblk_idx), {mma_stage}]],\n"
+        f"        {acc_frag},\n"
+        "    )"
+    )
+    if gate_exec_warp:
+        issue_src = f"if {exec_active}:\n{textwrap.indent(issue_src, '    ')}"
+    return statement_from_string(issue_src)
 
 
 def _build_kloop_non_pipeline_producer_if(
@@ -1205,6 +1270,8 @@ def _emit_mma_pipeline(
         and tcgen05_static_full_tiles
         and _is_persistent_pid_config(df.config)
     )
+    # Keep a distinct name so future MMA-exec gating changes are localized.
+    tcgen05_use_role_local_mma_exec = tcgen05_use_role_local_tma_producer
     tcgen05_collective_handles_operand_loads = (
         mma_impl == "tcgen05"
         and fx_node is not None
@@ -1256,20 +1323,28 @@ def _emit_mma_pipeline(
     #   kernels. The role-local-while partitioner extracts that whole
     #   loop into the TMA-load warp's persistent loop.
     tma_load_role_stmts: list[ast.AST] = []
+    # Statements conceptually owned by the MMA-exec warp. These are
+    # extracted only with the same narrow static-full persistent tcgen05
+    # predicate as the role-local TMA producer path.
+    mma_exec_role_stmts: list[ast.AST] = []
 
-    def _emit_per_tile(text: str, *, tma_load: bool = False) -> ast.stmt:
+    def _emit_per_tile(
+        text: str, *, tma_load: bool = False, mma_exec: bool = False
+    ) -> ast.stmt:
         """Append a per-tile statement to ``prefix`` and tag it for the
         persistent-loop splitter. Returns the AST node so callers can
         chain (e.g. when constructing ``If`` bodies). When ``tma_load``
         is true the statement is ALSO tagged for the role-block
-        partitioner so it lands in the TMA-load warp's role block when
-        the persistent kernel emits warp-role-gated bodies.
+        partitioner so it lands in the TMA-load warp's role block; when
+        ``mma_exec`` is true it lands in the MMA-exec warp's role block.
         """
         stmt = statement_from_string(text)
         prefix.append(stmt)
         per_tile_stmts.append(stmt)
         if tma_load:
             tma_load_role_stmts.append(stmt)
+        if mma_exec:
+            mma_exec_role_stmts.append(stmt)
         return stmt
 
     mma_participant_linear: str | None = None
@@ -1677,7 +1752,8 @@ def _emit_mma_pipeline(
         _emit_per_tile(
             f"{acc_frag} = "
             f"{tcgen05_exec_acc_frag_base}[None, None, None, "
-            f"{tcgen05_plan.acc_producer_state}.index]"
+            f"{tcgen05_plan.acc_producer_state}.index]",
+            mma_exec=tcgen05_use_role_local_mma_exec,
         )
         prefix.append(
             statement_from_string(
@@ -1694,7 +1770,8 @@ def _emit_mma_pipeline(
         _emit_per_tile(
             f"if {tcgen05_plan.exec_active}:\n"
             f"    {tcgen05_plan.acc_pipeline}.producer_acquire("
-            f"{tcgen05_plan.acc_producer_state})"
+            f"{tcgen05_plan.acc_producer_state})",
+            mma_exec=tcgen05_use_role_local_mma_exec,
         )
     else:
         prefix.append(
@@ -1753,6 +1830,11 @@ def _emit_mma_pipeline(
     if mma_impl == "tcgen05":
         assert tcgen05_plan is not None
         if tcgen05_use_tma:
+            # Applied for every tcgen05 TMA path even though only the role-local
+            # path strictly needs it: TMA wrapper plans consume the original
+            # tensor arguments on the host even when device DCE sees no scalar
+            # fallback references to those tensors.
+            df.placeholder_args.update((lhs_arg_name, rhs_arg_name))
             df.wrapper_only_params.extend(
                 [tma_atom_a, tma_tensor_a, tma_atom_b, tma_tensor_b]
             )
@@ -2105,6 +2187,10 @@ def _emit_mma_pipeline(
         )
         load_thread_count = active_threads
         load_guard = mma_active
+        mma_stage_stmt: ast.stmt | None = None
+        smem_a_mma_stmt: ast.stmt | None = None
+        smem_b_mma_stmt: ast.stmt | None = None
+        tma_full_tile_stmt: ast.stmt | None = None
         if mma_impl == "tcgen05":
             assert tcgen05_plan is not None
             # The smem cache for A/B is laid out as (..., ab_stage_count); we
@@ -2124,41 +2210,38 @@ def _emit_mma_pipeline(
             # and ``ab_stage_count`` is always 1, so the modular form is a
             # constant zero anyway.
             if tcgen05_use_tma:
-                cg.add_statement(
-                    statement_from_string(f"{mma_stage} = {tma_consumer_state}.index")
+                mma_stage_stmt = statement_from_string(
+                    f"{mma_stage} = {tma_consumer_state}.index"
                 )
             else:
-                cg.add_statement(
-                    statement_from_string(
-                        f"{mma_stage} = "
-                        f"({k_offset_var} // cutlass.Int32({bk})) "
-                        f"% cutlass.Int32({tcgen05_ab_stage_count_value})"
-                    )
+                mma_stage_stmt = statement_from_string(
+                    f"{mma_stage} = "
+                    f"({k_offset_var} // cutlass.Int32({bk})) "
+                    f"% cutlass.Int32({tcgen05_ab_stage_count_value})"
                 )
-            cg.add_statement(
-                statement_from_string(
-                    f"{smem_a_mma} = {smem_a}[(None, 0, 0, {mma_stage})]"
-                )
+            smem_a_mma_stmt = statement_from_string(
+                f"{smem_a_mma} = {smem_a}[(None, 0, 0, {mma_stage})]"
             )
-            cg.add_statement(
-                statement_from_string(
-                    f"{smem_b_mma} = {smem_b}[(None, 0, 0, {mma_stage})]"
-                )
+            smem_b_mma_stmt = statement_from_string(
+                f"{smem_b_mma} = {smem_b}[(None, 0, 0, {mma_stage})]"
             )
+            if not tcgen05_use_role_local_mma_exec:
+                cg.add_statement(mma_stage_stmt)
+                cg.add_statement(smem_a_mma_stmt)
+                cg.add_statement(smem_b_mma_stmt)
             if tcgen05_use_tma:
-                cg.add_statement(
-                    statement_from_string(
-                        f"{tma_k_tile} = {k_offset_var} // cutlass.Int32({bk})"
-                    )
+                tma_k_tile_stmt = statement_from_string(
+                    f"{tma_k_tile} = {k_offset_var} // cutlass.Int32({bk})"
                 )
-                cg.add_statement(
-                    statement_from_string(
-                        f"{tma_full_tile} = "
-                        f"{m_offset_var} + cutlass.Int32({bm}) <= cutlass.Int32({m_size}) "
-                        f"and {n_offset_var} + cutlass.Int32({bn}) <= cutlass.Int32({n_size}) "
-                        f"and {k_offset_var} + cutlass.Int32({bk}) <= cutlass.Int32({k_total_size})"
-                    )
+                tma_full_tile_stmt = statement_from_string(
+                    f"{tma_full_tile} = "
+                    f"{m_offset_var} + cutlass.Int32({bm}) <= cutlass.Int32({m_size}) "
+                    f"and {n_offset_var} + cutlass.Int32({bn}) <= cutlass.Int32({n_size}) "
+                    f"and {k_offset_var} + cutlass.Int32({bk}) <= cutlass.Int32({k_total_size})"
                 )
+                if not tcgen05_use_role_local_mma_exec:
+                    cg.add_statement(tma_k_tile_stmt)
+                    cg.add_statement(tma_full_tile_stmt)
         smem_a_store = f"{smem_a}[_row, _col]"
         smem_b_store = f"{smem_b}[_row, _col]"
         if mma_impl == "tcgen05":
@@ -2256,34 +2339,78 @@ def _emit_mma_pipeline(
                     prefix.append(producer_loop)
                     per_tile_stmts.append(producer_loop)
                     tma_load_role_stmts.append(producer_loop)
-                cg.add_statement(
-                    statement_from_string(
-                        f"{tma_next_full_tile} = "
-                        f"{m_offset_var} + cutlass.Int32({bm}) <= cutlass.Int32({m_size}) "
-                        f"and {n_offset_var} + cutlass.Int32({bn}) <= cutlass.Int32({n_size}) "
-                        f"and {k_offset_var} + cutlass.Int32({bk * (tcgen05_ab_stage_count_value + 1)}) <= cutlass.Int32({k_total_size})"
+                if tcgen05_use_role_local_mma_exec:
+                    assert mma_stage_stmt is not None
+                    assert smem_a_mma_stmt is not None
+                    assert smem_b_mma_stmt is not None
+                    assert tma_full_tile_stmt is not None
+                    exec_loop_body: list[ast.stmt] = [
+                        mma_stage_stmt,
+                        smem_a_mma_stmt,
+                        smem_b_mma_stmt,
+                        tma_full_tile_stmt,
+                        statement_from_string(
+                            f"{tma_consumer_try_token} = cutlass.Boolean(0)"
+                        ),
+                        _build_kloop_pipeline_consumer_if(
+                            tma_kloop_args,
+                            gate_exec_warp=False,
+                            include_scalar_fallback=False,
+                        ),
+                        _build_tcgen05_mma_fence_stmt(
+                            tcgen05_plan.exec_active, gate_exec_warp=False
+                        ),
+                        _build_tcgen05_mma_issue_stmt(
+                            exec_active=tcgen05_plan.exec_active,
+                            tiled_mma=tiled_mma,
+                            acc_frag=acc_frag,
+                            tcgen05_frag_a=tcgen05_frag_a,
+                            tcgen05_frag_b=tcgen05_frag_b,
+                            mma_stage=mma_stage,
+                            k_offset_var=k_offset_var,
+                            k_loop_begin_expr=k_loop_begin_expr,
+                            gate_exec_warp=False,
+                        ),
+                        _build_kloop_pipeline_release_if(
+                            tma_kloop_args,
+                            gate_exec_warp=False,
+                            include_scalar_fallback=False,
+                        ),
+                    ]
+                    exec_loop = _clone_k_loop_with_body(device_loop, exec_loop_body)
+                    prefix.append(exec_loop)
+                    per_tile_stmts.append(exec_loop)
+                    mma_exec_role_stmts.append(exec_loop)
+                else:
+                    cg.add_statement(
+                        statement_from_string(
+                            f"{tma_next_full_tile} = "
+                            f"{m_offset_var} + cutlass.Int32({bm}) <= cutlass.Int32({m_size}) "
+                            f"and {n_offset_var} + cutlass.Int32({bn}) <= cutlass.Int32({n_size}) "
+                            f"and {k_offset_var} + cutlass.Int32({bk * (tcgen05_ab_stage_count_value + 1)}) <= cutlass.Int32({k_total_size})"
+                        )
                     )
-                )
-                cg.add_statement(
-                    statement_from_string(
-                        f"{tma_producer_try_token} = cutlass.Boolean(0)"
+                    cg.add_statement(
+                        statement_from_string(
+                            f"{tma_producer_try_token} = cutlass.Boolean(0)"
+                        )
                     )
-                )
-                cg.add_statement(
-                    statement_from_string(
-                        f"{tma_consumer_try_token} = cutlass.Boolean(0)"
+                    cg.add_statement(
+                        statement_from_string(
+                            f"{tma_consumer_try_token} = cutlass.Boolean(0)"
+                        )
                     )
-                )
-                if not tcgen05_use_role_local_tma_producer:
-                    # Legacy inline path: keep producer and consumer adjacent
-                    # inside the shared K-loop. Persistent role-local mode
-                    # emits the producer as a top-level sibling loop above so
-                    # the TMA-load role can extract it wholesale.
-                    pipeline_producer_stmt = _build_kloop_pipeline_producer_if(
-                        tma_kloop_args
-                    )
-                    cg.add_statement(pipeline_producer_stmt)
-                cg.add_statement(_build_kloop_pipeline_consumer_if(tma_kloop_args))
+                    if not tcgen05_use_role_local_tma_producer:
+                        # Legacy inline path: keep producer and consumer
+                        # adjacent inside the shared K-loop. Persistent
+                        # role-local mode emits the producer as a top-level
+                        # sibling loop above so the TMA-load role can extract
+                        # it wholesale.
+                        pipeline_producer_stmt = _build_kloop_pipeline_producer_if(
+                            tma_kloop_args
+                        )
+                        cg.add_statement(pipeline_producer_stmt)
+                    cg.add_statement(_build_kloop_pipeline_consumer_if(tma_kloop_args))
             else:
                 non_pipeline_producer_stmt = _build_kloop_non_pipeline_producer_if(
                     tma_kloop_args
@@ -2349,38 +2476,34 @@ def _emit_mma_pipeline(
             )
         else:
             assert tcgen05_plan is not None
-            cg.add_statement(
-                statement_from_string(
-                    f"if {tcgen05_plan.exec_active}:\n    cute.arch.fence_view_async_shared()"
+            if not tcgen05_use_role_local_mma_exec:
+                cg.add_statement(
+                    _build_tcgen05_mma_fence_stmt(tcgen05_plan.exec_active)
                 )
-            )
-            cg.add_statement(
-                statement_from_string(
-                    f"if {tcgen05_plan.exec_active}:\n"
-                    f"    for _tcgen05_kblk_idx in range(cute.size({tcgen05_frag_a}, mode=[2])):\n"
-                    f"        {tiled_mma}.set(\n"
-                    f"            cute.nvgpu.tcgen05.Field.ACCUMULATE,\n"
-                    f"            {k_offset_var} != {k_loop_begin_expr} or cutlass.Int32(_tcgen05_kblk_idx) != cutlass.Int32(0),\n"
-                    "        )\n"
-                    f"        cute.gemm(\n"
-                    f"            {tiled_mma},\n"
-                    f"            {acc_frag},\n"
-                    f"            {tcgen05_frag_a}[None, None, cutlass.Int32(_tcgen05_kblk_idx), {mma_stage}],\n"
-                    f"            {tcgen05_frag_b}[None, None, cutlass.Int32(_tcgen05_kblk_idx), {mma_stage}],\n"
-                    f"            {acc_frag},\n"
-                    "        )"
-                )
-            )
-            if tcgen05_use_tma:
-                assert tma_kloop_args is not None
-                if tcgen05_use_tma_pipeline:
-                    cg.add_statement(_build_kloop_pipeline_release_if(tma_kloop_args))
-                else:
-                    cg.add_statement(
-                        _build_kloop_non_pipeline_release_if(tma_kloop_args)
+                cg.add_statement(
+                    _build_tcgen05_mma_issue_stmt(
+                        exec_active=tcgen05_plan.exec_active,
+                        tiled_mma=tiled_mma,
+                        acc_frag=acc_frag,
+                        tcgen05_frag_a=tcgen05_frag_a,
+                        tcgen05_frag_b=tcgen05_frag_b,
+                        mma_stage=mma_stage,
+                        k_offset_var=k_offset_var,
+                        k_loop_begin_expr=k_loop_begin_expr,
                     )
-            else:
-                cg.add_statement(statement_from_string("cute.arch.sync_threads()"))
+                )
+                if tcgen05_use_tma:
+                    assert tma_kloop_args is not None
+                    if tcgen05_use_tma_pipeline:
+                        cg.add_statement(
+                            _build_kloop_pipeline_release_if(tma_kloop_args)
+                        )
+                    else:
+                        cg.add_statement(
+                            _build_kloop_non_pipeline_release_if(tma_kloop_args)
+                        )
+                else:
+                    cg.add_statement(statement_from_string("cute.arch.sync_threads()"))
 
     # === outer_suffix: convert fragment → per-thread scalar ===
     # Allocate smem_c in outer_prefix so all smem is allocated at the same
@@ -2452,11 +2575,15 @@ def _emit_mma_pipeline(
             )
             suffix.append(suffix_stmt)
             per_tile_stmts.append(suffix_stmt)
+            if tcgen05_use_role_local_mma_exec:
+                mma_exec_role_stmts.append(suffix_stmt)
             advance_stmt = statement_from_string(
                 emit_pipeline_advance(tcgen05_plan.acc_producer_state)
             )
             suffix.append(advance_stmt)
             per_tile_stmts.append(advance_stmt)
+            if tcgen05_use_role_local_mma_exec:
+                mma_exec_role_stmts.append(advance_stmt)
             # The full TMEM->reg->GMEM epilogue + allocator teardown for
             # tcgen05 is emitted by `_codegen_cute_store_tcgen05_tile` when
             # the kernel actually stores `out[tile_m, tile_n] = result`. That
@@ -2522,8 +2649,8 @@ def _emit_mma_pipeline(
     # ``_setup_tcgen05_persistent_kernel``).
     if per_tile_stmts:
         df.register_cute_tcgen05_per_tile_stmts(per_tile_stmts)
-    # Register TMA-load role-block statements with the persistent role
-    # partitioner (see ``Tcgen05PersistentProgramIDs._collect_tcgen05_role_blocks``).
+    # Register role-block statements with the persistent role partitioner
+    # (see ``Tcgen05PersistentProgramIDs._collect_tcgen05_role_blocks``).
     # Two registration shapes land here:
     # - Top-level prefix statements (the initial TMA prefetch IFs) --
     #   these are ALSO registered as per-tile via ``_emit_per_tile``,
@@ -2533,12 +2660,17 @@ def _emit_mma_pipeline(
     #   ``cg.add_statement(...)`` -- these are NOT per-tile-registered;
     #   the K-loop itself rides into the work-tile body via per-tile
     #   name propagation, and the partitioner recurses one level into
-    #   it to wrap these tagged children.
+    #   it to wrap these tagged children. The current static-full
+    #   role-local path emits producer and exec K-loops as top-level
+    #   sibling loops, so nested tags mainly serve the legacy inline path.
+    #   Revisit this traversal if the legacy inline path is removed.
     # The partitioner asserts at run time that every registered tag was
     # visited, so a misregistered top-level stmt fails loudly rather
     # than silently dropping its role gate.
     if tma_load_role_stmts:
         df.register_cute_tcgen05_tma_load_role_stmts(tma_load_role_stmts)
+    if mma_exec_role_stmts:
+        df.register_cute_tcgen05_mma_exec_role_stmts(mma_exec_role_stmts)
 
     return expr_from_string(result_var)
 
