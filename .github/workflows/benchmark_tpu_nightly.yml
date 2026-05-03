@@ -15,7 +15,11 @@ on:
         # Excluded kernels:
         #   grpo_loss: complex multi-kernel setup, needs special handling
         #   jagged_hstu_attn: complex jagged attention with special data setup
-        default: "exp,add,softmax_two_pass,welford,attention,bmm,matmul,matmul_layernorm,cross_entropy,embedding,broadcast_matmul,geglu,low_mem_dropout,swiglu,batch_softmax,sum,rms_norm,rms_norm_bwd,layer_norm,softmax,long_sum_naive,long_sum_loop,long_sum_manual,se_block,squeeze_and_excitation_net"
+        # rms_norm_bwd is placed last because some autotune config triggers a
+        # fatal TPU "program continuator halted" error that crashes the whole
+        # Python process; keeping it last contains the blast radius so the
+        # other kernels still get autotuned in pass 1.
+        default: "exp,add,softmax_two_pass,welford,attention,bmm,matmul,matmul_layernorm,cross_entropy,embedding,broadcast_matmul,geglu,low_mem_dropout,swiglu,batch_softmax,sum,rms_norm,layer_norm,softmax,long_sum_naive,long_sum_loop,long_sum_manual,se_block,squeeze_and_excitation_net,rms_norm_bwd"
       autotuner:
         description: |
           Optional HELION_AUTOTUNER override. Leave empty for the default
@@ -46,6 +50,6 @@ jobs:
     secrets:
       HELION_LLM_API_KEY: ${{ secrets.HELION_LLM_API_KEY }}
     with:
-      kernels: ${{ github.event.inputs.kernels || 'exp,add,softmax_two_pass,welford,attention,bmm,matmul,matmul_layernorm,cross_entropy,embedding,broadcast_matmul,geglu,low_mem_dropout,swiglu,batch_softmax,sum,rms_norm,rms_norm_bwd,layer_norm,softmax,long_sum_naive,long_sum_loop,long_sum_manual,se_block,squeeze_and_excitation_net' }}
+      kernels: ${{ github.event.inputs.kernels || 'exp,add,softmax_two_pass,welford,attention,bmm,matmul,matmul_layernorm,cross_entropy,embedding,broadcast_matmul,geglu,low_mem_dropout,swiglu,batch_softmax,sum,rms_norm,layer_norm,softmax,long_sum_naive,long_sum_loop,long_sum_manual,se_block,squeeze_and_excitation_net,rms_norm_bwd' }}
       autotuner: ${{ github.event.inputs.autotuner || '' }}
       llm_model: ${{ github.event.inputs.llm_model || 'claude-opus-4-7' }}
