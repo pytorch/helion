@@ -820,6 +820,20 @@ def _codegen_cute_store_tcgen05_tile(
     if tcgen05_value is None:
         return None
 
+    # Backstop for callers that bypass Config.normalize() validation;
+    # see _tcgen05_epi_warp_count docstring and cute_plan.md.
+    if tcgen05_value.epi_warp_count != 4:
+        raise exc.BackendUnsupported(
+            "cute",
+            f"tcgen05 SIMT-store epilogue requires "
+            f"tcgen05_num_epi_warps=4 (got {tcgen05_value.epi_warp_count}). "
+            "CUTLASS tmem_warp_shape_mn=(4,1) hard-codes a 4-warp t2r "
+            "partition for the supported tcgen05 path; per-warp "
+            "tcgen05.ld semantics make the partition uncoverable by "
+            "fewer warps. Lifts when the c_pipeline-driven multi-warp "
+            "epilogue lands (see cute_plan.md).",
+        )
+
     backend = CompileEnvironment.current().backend
     df = state.device_function
     tensor_name = df.tensor_arg(tensor).name

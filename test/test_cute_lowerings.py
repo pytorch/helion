@@ -1248,6 +1248,75 @@ class TestCuteLowerings(unittest.TestCase):
             code,
         )
 
+    def test_tcgen05_store_rejects_num_epi_warps_not_four(self) -> None:
+        """Codegen backstop fires when ``epi_warp_count != 4`` slips past
+        ``Config.normalize()`` validation (rationale in cute_plan.md §2)."""
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_epi_check(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        args = (
+            torch.randn(128, 16, device=DEVICE, dtype=torch.bfloat16),
+            torch.randn(16, 128, device=DEVICE, dtype=torch.bfloat16),
+        )
+        with patch_cute_mma_support():
+            for n_epi in (1, 2):
+                bound = cute_matmul_epi_check.bind(args)
+                bound.env.config_spec.cute_tcgen05_search_enabled = True
+                bound.env.config_spec._tcgen05_num_epi_warps_validation_choices = None
+                cfg = helion.Config(
+                    block_sizes=[128, 128, 16],
+                    l2_groupings=[1],
+                    loop_orders=[[0, 1]],
+                    num_stages=2,
+                    num_warps=8,
+                    pid_type="flat",
+                    tcgen05_cluster_m=1,
+                    tcgen05_ab_stages=2,
+                    tcgen05_acc_stages=2,
+                    tcgen05_c_stages=2,
+                    tcgen05_num_epi_warps=n_epi,
+                )
+                with self.assertRaises(exc.BackendUnsupported) as cm:
+                    bound.to_triton_code(cfg)
+                msg = str(cm.exception)
+                self.assertIn("tcgen05_num_epi_warps=4", msg)
+                self.assertIn(f"got {n_epi}", msg)
+                self.assertIn("tmem_warp_shape_mn=(4,1)", msg)
+                self.assertIn("cute_plan.md", msg)
+
+        with patch_cute_mma_support():
+            bound = cute_matmul_epi_check.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            cfg = helion.Config(
+                block_sizes=[128, 128, 16],
+                l2_groupings=[1],
+                loop_orders=[[0, 1]],
+                num_stages=2,
+                num_warps=8,
+                pid_type="flat",
+                tcgen05_cluster_m=1,
+                tcgen05_ab_stages=2,
+                tcgen05_acc_stages=2,
+                tcgen05_c_stages=2,
+                tcgen05_num_epi_warps=4,
+            )
+            code = bound.to_triton_code(cfg)
+            self.assertIn(
+                "'epilogue_warp_id': (cutlass.Int32(0), cutlass.Int32(1), "
+                "cutlass.Int32(2), cutlass.Int32(3))",
+                code,
+            )
+
     def test_tcgen05_setmaxregister_omitted_without_tcgen05(self) -> None:
         """The non-tcgen05 (warp / universal) MMA paths do not emit
         setmaxregister. The Quack-style register split is specific to the
