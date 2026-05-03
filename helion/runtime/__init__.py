@@ -1380,6 +1380,10 @@ def _torch_dtype_to_cutlass(dtype: torch.dtype) -> object:
         torch.float32: cutlass.Float32,
         torch.float64: cutlass.Float64,
         torch.bfloat16: cutlass.BFloat16,
+        # CuTe does not support i1 global-memory tensors; torch.bool is stored
+        # as one byte, so pass bool tensor pointers as uint8 and let load
+        # lowering convert nonzero bytes back to cutlass.Boolean registers.
+        torch.bool: cutlass.Uint8,
         torch.int8: cutlass.Int8,
         torch.int16: cutlass.Int16,
         torch.int32: cutlass.Int32,

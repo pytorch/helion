@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import contextlib
 import logging
 import operator
 import textwrap
@@ -8,6 +9,7 @@ from typing import TYPE_CHECKING
 
 import torch
 from torch.fx import has_side_effect
+from torch.fx.node import map_arg
 
 from .. import exc
 from .._compiler.ast_extension import expr_from_string
@@ -629,6 +631,15 @@ def _cute_index_exprs(
             ast_idx = ast_subscript[pos]
         if idx is None:
             continue
+        if (
+            tensor is not None
+            and tensor_dim < tensor.ndim
+            and env.known_equal(tensor.shape[tensor_dim], 1)
+            and not (isinstance(idx, slice) and idx == slice(None))
+        ):
+            result.append("0")
+            tensor_dim += 1
+            continue
         if isinstance(idx, torch.SymInt):
             result.append(symint_index_expr(idx, used_block_ids))
             tensor_dim += 1
@@ -690,6 +701,315 @@ def _cute_index_tuple(index_exprs: list[str]) -> str:
     return f"({', '.join(index_exprs)})"
 
 
+def _cute_affine_range_block_id(state: CodegenState, affine: object) -> int | None:
+    from .._compiler.cute.indexing import CuteAffineRangeIndex
+
+    if not isinstance(affine, CuteAffineRangeIndex):
+        return None
+    env = CompileEnvironment.current()
+    base_meta = getattr(affine.base, "meta", {})
+    base_val = base_meta.get("val") if isinstance(base_meta, dict) else None
+    block_id = env.resolve_block_id(base_val) if base_val is not None else None
+    if block_id is None:
+        codegen = base_meta.get("codegen") if isinstance(base_meta, dict) else None
+        if isinstance(codegen, ast.Name) and codegen.id.startswith("_BLOCK_SIZE_"):
+            with contextlib.suppress(ValueError):
+                block_id = int(codegen.id.removeprefix("_BLOCK_SIZE_"))
+    if block_id is None:
+        return None
+    if state.fx_node is not None:
+        return env.resolve_codegen_block_id(
+            block_id, state.codegen, state.fx_node.graph
+        )
+    return block_id
+
+
+def _cute_affine_range_expr(
+    state: CodegenState,
+    affine: object,
+    lane_var: str,
+    *,
+    dtype: torch.dtype | None = None,
+) -> str | None:
+    from .._compiler.cute.indexing import CuteAffineRangeIndex
+
+    if not isinstance(affine, CuteAffineRangeIndex):
+        return None
+    if affine.step != 1 or affine.factor <= 0:
+        return None
+    block_id = _cute_affine_range_block_id(state, affine)
+    if block_id is None:
+        return None
+    index_var = _cute_active_index_var(state, block_id)
+    if index_var is None:
+        return None
+    expr = f"({affine.factor}) * ({index_var}) + cutlass.Int32({lane_var})"
+    if dtype is not None:
+        expr = f"{CompileEnvironment.current().backend.dtype_str(dtype)}({expr})"
+    return expr
+
+
+def _codegen_cute_affine_range_store(
+    state: CodegenState,
+    tensor: torch.Tensor,
+    subscript: list[object] | tuple[object, ...],
+    ast_subscript: list[object] | tuple[object, ...],
+    value: object,
+    extra_mask: ast.AST | None,
+    value_node: torch.fx.Node | None = None,
+) -> ast.AST | None:
+    from .._compiler.ast_extension import create
+    from .._compiler.cute.indexing import CuteAffineRangeIndex
+
+    affine_positions = [
+        (pos, idx)
+        for pos, idx in enumerate(ast_subscript)
+        if isinstance(idx, CuteAffineRangeIndex)
+    ]
+    if len(affine_positions) != 1 or len(subscript) != 1 or extra_mask is not None:
+        return None
+    _pos, affine = affine_positions[0]
+    block_id = _cute_affine_range_block_id(state, affine)
+    if block_id is None:
+        return None
+
+    lane_var = state.device_function.new_var("affine_lane", dce=True)
+    index_expr = _cute_affine_range_expr(
+        state, affine, lane_var, dtype=CompileEnvironment.current().index_dtype
+    )
+    if index_expr is None:
+        return None
+    backend = CompileEnvironment.current().backend
+    if (
+        value_node is not None
+        and value_node.op == "call_function"
+        and value_node.target is load
+    ):
+        source_tensor_node = value_node.args[0]
+        if not isinstance(source_tensor_node, torch.fx.Node):
+            return None
+        source_tensor = source_tensor_node.meta.get("val")
+        if not isinstance(source_tensor, torch.Tensor):
+            return None
+        source_subscript = value_node.args[1]
+        if (
+            not isinstance(source_subscript, (list, tuple))
+            or len(source_subscript) != 1
+        ):
+            return None
+        ast_source_subscript = list(
+            map_arg(tuple(source_subscript), lambda arg: state.env[arg])
+        )
+        (source_affine,) = ast_source_subscript
+        if not isinstance(source_affine, CuteAffineRangeIndex):
+            return None
+        if source_affine.factor != affine.factor:
+            return None
+        source_index_expr = _cute_affine_range_expr(
+            state,
+            source_affine,
+            lane_var,
+            dtype=CompileEnvironment.current().index_dtype,
+        )
+        if source_index_expr is None:
+            return None
+        source_name = state.device_function.tensor_arg(source_tensor).name
+        value_expr = f"{source_name}[{source_index_expr}]"
+        if source_tensor.dtype is torch.bool:
+            value_expr = f"({value_expr} != cutlass.Uint8(0))"
+    elif isinstance(value, CuteAffineRangeIndex):
+        value_expr = _cute_affine_range_expr(state, value, lane_var, dtype=value.dtype)
+        if value_expr is None:
+            return None
+    elif isinstance(value, ast.AST):
+        value_expr = ast.unparse(value)
+    elif isinstance(value, (int, float, bool)):
+        value_expr = repr(value)
+    else:
+        return None
+
+    target_dtype = backend.dtype_str(tensor.dtype)
+    value_expr = backend.ast_to_dtype_expr(value_expr, target_dtype)
+    tensor_name = state.device_function.tensor_arg(tensor).name
+    store_expr = (
+        f"{tensor_name}.__setitem__({_cute_index_tuple([index_expr])}, {value_expr})"
+    )
+    mask_var = _cute_active_mask_var(state, block_id)
+    if mask_var is not None:
+        store_expr = f"{store_expr} if {mask_var} else None"
+
+    return create(
+        ast.For,
+        target=create(ast.Name, id=lane_var, ctx=ast.Store()),
+        iter=expr_from_string(f"range({affine.factor})"),
+        body=[create(ast.Expr, value=expr_from_string(store_expr))],
+        orelse=[],
+        type_comment=None,
+    )
+
+
+def _is_cute_affine_range_load_for_store(
+    state: CodegenState,
+    subscript: list[object] | tuple[object, ...],
+    ast_subscript: list[object] | tuple[object, ...],
+) -> bool:
+    from .._compiler.cute.indexing import CuteAffineRangeIndex
+    from .._compiler.cute.indexing import match_cute_affine_range_iota
+
+    def compatible_store_user(user: torch.fx.Node) -> bool:
+        if (
+            user.op != "call_function"
+            or user.target is not store
+            or len(user.args) < 4
+            or user.args[2] is not state.fx_node
+            or user.args[3] is not None
+        ):
+            return False
+        store_subscript = user.args[1]
+        return (
+            isinstance(store_subscript, (list, tuple))
+            and len(store_subscript) == 1
+            and isinstance(store_subscript[0], torch.fx.Node)
+            and match_cute_affine_range_iota(store_subscript[0]) is not None
+        )
+
+    return (
+        state.fx_node is not None
+        and len(state.fx_node.users) > 0
+        and all(compatible_store_user(user) for user in state.fx_node.users)
+        and len(subscript) == 1
+        and len(ast_subscript) == 1
+        and isinstance(ast_subscript[0], CuteAffineRangeIndex)
+    )
+
+
+def _cute_positive_1d_slice_bounds(
+    tensor: torch.Tensor, index: object
+) -> tuple[int, int, int, int] | None:
+    if not isinstance(index, slice) or index == slice(None):
+        return None
+    with contextlib.suppress(TypeError):
+        dim_size = int(tensor.shape[0])
+        start, stop, step = index.indices(dim_size)
+        if step <= 0:
+            return None
+        length = max(0, (stop - start + step - 1) // step)
+        return start, stop, step, length
+    return None
+
+
+def _is_cute_strided_slice_load_for_store(
+    state: CodegenState,
+    tensor: torch.Tensor,
+    subscript: list[object] | tuple[object, ...],
+) -> bool:
+    def compatible_store_user(user: torch.fx.Node) -> bool:
+        if (
+            user.op != "call_function"
+            or user.target is not store
+            or len(user.args) < 4
+            or user.args[2] is not state.fx_node
+            or user.args[3] is not None
+        ):
+            return False
+        target_node = user.args[0]
+        if not isinstance(target_node, torch.fx.Node):
+            return False
+        target_tensor = target_node.meta.get("val")
+        if not isinstance(target_tensor, torch.Tensor) or target_tensor.ndim != 1:
+            return False
+        store_subscript = user.args[1]
+        return (
+            isinstance(store_subscript, (list, tuple))
+            and len(store_subscript) == 1
+            and _cute_positive_1d_slice_bounds(target_tensor, store_subscript[0])
+            is not None
+        )
+
+    return (
+        state.fx_node is not None
+        and len(state.fx_node.users) > 0
+        and all(compatible_store_user(user) for user in state.fx_node.users)
+        and tensor.ndim == 1
+        and len(subscript) == 1
+        and _cute_positive_1d_slice_bounds(tensor, subscript[0]) is not None
+    )
+
+
+def _codegen_cute_strided_slice_store(
+    state: CodegenState,
+    tensor: torch.Tensor,
+    subscript: list[object] | tuple[object, ...],
+    value: object,
+    extra_mask: ast.AST | None,
+    value_node: torch.fx.Node | None = None,
+) -> ast.AST | None:
+    from .._compiler.ast_extension import create
+
+    if tensor.ndim != 1 or len(subscript) != 1 or extra_mask is not None:
+        return None
+    target_bounds = _cute_positive_1d_slice_bounds(tensor, subscript[0])
+    if target_bounds is None:
+        return None
+    target_start, _target_stop, target_step, target_length = target_bounds
+
+    env = CompileEnvironment.current()
+    backend = env.backend
+    index_dtype = backend.dtype_str(env.index_dtype)
+    loop_var = state.device_function.new_var("slice_idx", dce=True)
+    target_index = f"{index_dtype}({target_start} + {loop_var} * {target_step})"
+
+    if (
+        value_node is not None
+        and value_node.op == "call_function"
+        and value_node.target is load
+    ):
+        source_tensor_node = value_node.args[0]
+        if not isinstance(source_tensor_node, torch.fx.Node):
+            return None
+        source_tensor = source_tensor_node.meta.get("val")
+        if not isinstance(source_tensor, torch.Tensor) or source_tensor.ndim != 1:
+            return None
+        source_subscript = value_node.args[1]
+        if (
+            not isinstance(source_subscript, (list, tuple))
+            or len(source_subscript) != 1
+        ):
+            return None
+        source_bounds = _cute_positive_1d_slice_bounds(
+            source_tensor, source_subscript[0]
+        )
+        if source_bounds is None:
+            return None
+        source_start, _source_stop, source_step, source_length = source_bounds
+        if source_length != target_length:
+            return None
+        source_index = f"{index_dtype}({source_start} + {loop_var} * {source_step})"
+        source_name = state.device_function.tensor_arg(source_tensor).name
+        value_expr = f"{source_name}[{source_index}]"
+        if source_tensor.dtype is torch.bool:
+            value_expr = f"({value_expr} != cutlass.Uint8(0))"
+    elif isinstance(value, ast.AST):
+        value_expr = ast.unparse(value)
+    elif isinstance(value, (int, float, bool)):
+        value_expr = repr(value)
+    else:
+        return None
+
+    target_name = state.device_function.tensor_arg(tensor).name
+    target_dtype = backend.dtype_str(tensor.dtype)
+    value_expr = backend.ast_to_dtype_expr(value_expr, target_dtype)
+    store_expr = f"{target_name}.__setitem__(({target_index},), {value_expr})"
+    return create(
+        ast.For,
+        target=create(ast.Name, id=loop_var, ctx=ast.Store()),
+        iter=expr_from_string(f"range({target_length})"),
+        body=[create(ast.Expr, value=expr_from_string(store_expr))],
+        orelse=[],
+        type_comment=None,
+    )
+
+
 def _cute_combined_mask(
     state: CodegenState,
     subscript: list[object] | tuple[object, ...],
@@ -721,6 +1041,19 @@ def _cute_combined_mask(
                 if bid not in seen and mask_var_for_block_id(bid) is not None:
                     block_id = bid
                     break
+        elif isinstance(idx, torch.Tensor):
+            for dim_size in idx.shape:
+                for bid in _matching_block_ids(env, dim_size):
+                    if bid in seen:
+                        continue
+                    mask_var = mask_var_for_block_id(bid)
+                    if mask_var is not None:
+                        seen.add(bid)
+                        if mask_var not in terms:
+                            terms.append(mask_var)
+                        break
+                else:
+                    continue
         else:
             tensor_dim += 1
             continue
@@ -1089,6 +1422,167 @@ def _codegen_cute_store_tcgen05_tile(
     return [main_stmt, *post_loop_stmts]
 
 
+def _codegen_cute_store_loaded_index_trailing_slices(
+    state: CodegenState,
+    tensor: torch.Tensor,
+    subscript: list[object] | tuple[object, ...],
+    ast_subscript: list[object] | tuple[object, ...],
+    extra_mask: ast.AST | None,
+    value_node: torch.fx.Node,
+) -> ast.AST | None:
+    from .._compiler.ast_extension import create
+
+    if value_node.target is not load or len(value_node.args) < 2:
+        return None
+    source_tensor_node = value_node.args[0]
+    if not isinstance(source_tensor_node, torch.fx.Node):
+        return None
+    source_tensor = source_tensor_node.meta.get("val")
+    if not isinstance(source_tensor, torch.Tensor):
+        return None
+    source_subscript = value_node.args[1]
+    if not isinstance(source_subscript, (list, tuple)) or not source_subscript:
+        return None
+    indexer = source_subscript[0]
+    if not isinstance(indexer, torch.fx.Node):
+        return None
+    indexer_value = indexer.meta.get("val")
+    if not isinstance(indexer_value, torch.Tensor) or indexer_value.ndim == 0:
+        return None
+    trailing_source = [*source_subscript[1:]]
+    if not trailing_source or not all(idx == slice(None) for idx in trailing_source):
+        return None
+    if len(subscript) != indexer_value.ndim + len(trailing_source):
+        return None
+    trailing_store = subscript[indexer_value.ndim :]
+    if not all(idx == slice(None) for idx in trailing_store):
+        return None
+
+    ast_source_subscript = list(
+        map_arg(tuple(source_subscript), lambda arg: state.env[arg])
+    )
+    index_exprs = _cute_index_exprs(
+        state,
+        [indexer_value],
+        [ast_source_subscript[0]],
+        tensor=source_tensor,
+        inactive_singleton_slice_expr="0",
+    )
+    if len(index_exprs) != 1:
+        return None
+
+    prefix_subscript = [*subscript[: indexer_value.ndim]]
+    prefix_ast_subscript = [*ast_subscript[: indexer_value.ndim]]
+    target_prefix = _cute_index_exprs(
+        state,
+        prefix_subscript,
+        prefix_ast_subscript,
+        tensor=tensor,
+        inactive_singleton_slice_expr="0",
+    )
+    if len(target_prefix) != indexer_value.ndim:
+        return None
+
+    env = CompileEnvironment.current()
+    index_dtype = env.backend.dtype_str(env.index_dtype)
+    source_loop_vars = [
+        state.device_function.new_var("slice_idx", dce=True) for _ in trailing_source
+    ]
+    source_indices = [
+        index_exprs[0],
+        *[f"{index_dtype}({var})" for var in source_loop_vars],
+    ]
+    target_indices = [
+        *target_prefix,
+        *[f"{index_dtype}({var})" for var in source_loop_vars],
+    ]
+    if len(source_indices) != source_tensor.ndim or len(target_indices) != tensor.ndim:
+        return None
+
+    source_name = state.device_function.tensor_arg(source_tensor).name
+    target_name = state.device_function.tensor_arg(tensor).name
+    source_dtype = env.backend.dtype_str(source_tensor.dtype)
+    target_dtype = env.backend.dtype_str(tensor.dtype)
+    source_mask = _cute_combined_mask(
+        state,
+        [indexer_value],
+        None,
+        tensor=source_tensor,
+    )
+    target_mask = _cute_combined_mask(
+        state,
+        prefix_subscript,
+        extra_mask,
+        tensor=tensor,
+    )
+    masks = [mask for mask in (source_mask, target_mask) if mask is not None]
+    mask_expr = " and ".join(f"({mask})" for mask in masks) if masks else None
+    load_expr = f"{source_name}[{', '.join(source_indices)}]"
+    if mask_expr is not None:
+        load_expr = f"({load_expr} if {mask_expr} else {source_dtype}(0))"
+    store_expr = (
+        f"{target_name}.__setitem__({_cute_index_tuple(target_indices)}, "
+        f"{env.backend.ast_to_dtype_expr(load_expr, target_dtype)})"
+    )
+    if mask_expr is not None:
+        store_expr = f"{store_expr} if {mask_expr} else None"
+
+    tensor_dim = 0
+    for idx in prefix_subscript:
+        block_id = None
+        if isinstance(idx, torch.SymInt):
+            block_id = env.get_block_id(idx)
+        elif idx == slice(None) and tensor_dim < tensor.ndim:
+            block_id = next(
+                (
+                    candidate
+                    for candidate in _matching_block_ids(env, tensor.shape[tensor_dim])
+                    if candidate in state.codegen.active_device_loops
+                ),
+                None,
+            )
+        tensor_dim += 1
+        if block_id is None:
+            continue
+        axis = None
+        grid_state = state.codegen.current_grid_state
+        if grid_state is not None:
+            axis = grid_state.block_thread_axes.get(block_id)
+        if axis is None:
+            loops = state.codegen.active_device_loops.get(block_id)
+            if loops:
+                axis = loops[-1].block_thread_axes.get(block_id)
+        if axis is None or not (0 <= axis < 3):
+            continue
+        block_size = env.block_sizes[block_id].from_config(state.config)
+        if not isinstance(block_size, int):
+            continue
+        state.codegen.max_thread_block_dims[axis] = max(
+            state.codegen.max_thread_block_dims[axis],
+            block_size,
+        )
+        state.codegen.referenced_thread_block_dims[axis] = max(
+            state.codegen.referenced_thread_block_dims[axis],
+            block_size,
+        )
+
+    stmt: ast.stmt = create(ast.Expr, value=expr_from_string(store_expr))
+    for loop_var, source_pos in reversed(
+        [*zip(source_loop_vars, range(1, len(source_subscript)), strict=True)]
+    ):
+        extent = _cute_tensor_dim_size_expr(state, source_tensor, source_pos)
+        stmt = create(
+            ast.For,
+            target=create(ast.Name, id=loop_var, ctx=ast.Store()),
+            iter=expr_from_string(f"range({extent})"),
+            body=[stmt],
+            orelse=[],
+            type_comment=None,
+        )
+    state.add_statement(stmt)
+    return ast.Constant(value=None)
+
+
 def _codegen_cute_store_permute_lane_loops(
     state: CodegenState,
     tensor: torch.Tensor,
@@ -1311,14 +1805,55 @@ def _(state: CodegenState) -> ast.AST:
     assert isinstance(subscript, (list, tuple))
     ast_subscript = state.ast_args[1]
     assert isinstance(ast_subscript, (list, tuple))
-    value = state.ast_arg(2)
+    raw_value = state.ast_args[2]
     extra_mask = state.ast_args[3]
     assert isinstance(extra_mask, (type(None), ast.AST))
-
+    value_node = None
     if state.fx_node is not None and len(state.fx_node.args) > 2:
-        value_node = state.fx_node.args[2]
-        if isinstance(value_node, torch.fx.Node) and value_node.op == "call_function":
+        maybe_value_node = state.fx_node.args[2]
+        if isinstance(maybe_value_node, torch.fx.Node):
+            value_node = maybe_value_node
+
+    if isinstance(tensor, torch.Tensor):
+        affine_range_store = _codegen_cute_affine_range_store(
+            state,
+            tensor,
+            subscript,
+            ast_subscript,
+            raw_value,
+            extra_mask,
+            value_node,
+        )
+        if affine_range_store is not None:
+            state.add_statement(affine_range_store)
+            return ast.Constant(value=None)
+        strided_slice_store = _codegen_cute_strided_slice_store(
+            state,
+            tensor,
+            subscript,
+            raw_value,
+            extra_mask,
+            value_node,
+        )
+        if strided_slice_store is not None:
+            state.add_statement(strided_slice_store)
+            return ast.Constant(value=None)
+
+    value = state.ast_arg(2)
+
+    if value_node is not None:
+        if value_node.op == "call_function":
             if isinstance(tensor, torch.Tensor):
+                rewritten_stmt = _codegen_cute_store_loaded_index_trailing_slices(
+                    state,
+                    tensor,
+                    subscript,
+                    ast_subscript,
+                    extra_mask,
+                    value_node,
+                )
+                if rewritten_stmt is not None:
+                    return rewritten_stmt
                 rewritten_stmt = _codegen_cute_store_permute_lane_loops(
                     state,
                     tensor,
@@ -1695,6 +2230,29 @@ def _(state: CodegenState) -> object:
 
     _log_cute_layout(state, "load")
 
+    from ..language import tile_index
+
+    tensor_node = state.fx_node.args[0] if state.fx_node is not None else None
+    if (
+        isinstance(tensor_node, torch.fx.Node)
+        and tensor_node.op == "call_function"
+        and tensor_node.target == tile_index
+    ):
+        env = CompileEnvironment.current()
+        block_id = env.get_block_id(tensor.size(0))
+        if block_id is None:
+            raise exc.BackendUnsupported("cute", "tile_index load block id")
+        index_var = _cute_active_index_var(state, block_id)
+        if index_var is None:
+            raise exc.BackendUnsupported("cute", "inactive tile_index load")
+        for idx in subscript:
+            if idx is None or idx == slice(None):
+                continue
+            raise exc.BackendUnsupported(
+                "cute", f"tile_index load index type: {type(idx)}"
+            )
+        return expr_from_string(index_var)
+
     if state.device_function.suppress_cute_root_lane_loops or (
         state.fx_node is not None
         and state.device_function.is_cute_collective_handled_load(state.fx_node.name)
@@ -1714,6 +2272,13 @@ def _(state: CodegenState) -> object:
     if packed_rhs_load is not None:
         return packed_rhs_load
 
+    if _is_cute_affine_range_load_for_store(state, subscript, ast_subscript):
+        zero = CompileEnvironment.current().backend.dtype_str(tensor.dtype)
+        return expr_from_string(f"{zero}(0)")
+    if _is_cute_strided_slice_load_for_store(state, tensor, subscript):
+        zero = CompileEnvironment.current().backend.dtype_str(tensor.dtype)
+        return expr_from_string(f"{zero}(0)")
+
     tensor_name = state.device_function.tensor_arg(tensor).name
     index_exprs = _cute_index_exprs(
         state,
@@ -1725,6 +2290,11 @@ def _(state: CodegenState) -> object:
     )
     load_expr = f"{tensor_name}[{', '.join(index_exprs)}]"
     mask_expr = _cute_combined_mask(state, subscript, extra_mask, tensor=tensor)
+    if tensor.dtype is torch.bool:
+        load_expr = f"({load_expr} != cutlass.Uint8(0))"
+        if mask_expr is None:
+            return expr_from_string(load_expr)
+        return expr_from_string(f"({load_expr} if {mask_expr} else cutlass.Boolean(0))")
     if state.fx_node is not None and any(
         user.target in (torch.ops.aten.sort.default, torch.ops.aten.topk.default)
         or getattr(user.target, "__name__", None) == "_associative_scan"

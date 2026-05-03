@@ -608,6 +608,27 @@ class LoopedReductionStrategy(ReductionStrategy):
             self._thread_count = next_power_of_2(min(block_size, max_threads))
         else:
             self._thread_count = 0
+        if env.backend.name == "cute" and self._thread_count > 1:
+            from .cute.thread_budget import MAX_THREADS_PER_BLOCK
+
+            other_threads = 1
+            tile_dispatch = getattr(fn, "tile_strategy", None)
+            if tile_dispatch is not None:
+                for strategy in tile_dispatch.strategies:
+                    if isinstance(strategy, ReductionStrategy):
+                        count = strategy._reduction_thread_count()
+                        if count > 0:
+                            other_threads *= count
+                    else:
+                        for size in strategy.thread_block_sizes():
+                            if size > 1:
+                                other_threads *= size
+            while (
+                other_threads * self._thread_count > MAX_THREADS_PER_BLOCK
+                and self._thread_count > 1
+            ):
+                self._thread_count //= 2
+            self.block_size = min(self.block_size, self._thread_count)
 
     def _reduction_thread_count(self) -> int:
         return self._thread_count

@@ -2178,9 +2178,9 @@ def collect_cute_half_atomic_output_promotions(
             if not isinstance(value_node, torch.fx.Node):
                 return False
             value_val = value_node.meta.get("val")
-            if (
-                not isinstance(value_val, torch.Tensor)
-                or value_val.dtype != torch.float32
+            if not isinstance(value_val, torch.Tensor) or value_val.dtype not in (
+                torch.float16,
+                torch.float32,
             ):
                 return False
         return True
@@ -2196,10 +2196,38 @@ def rewrite_cute_half_atomic_output_allocations(
     host_fn: HostFunction,
     promotions: dict[str, torch.dtype],
 ) -> None:
+    torch_factory_names = {
+        "empty",
+        "empty_like",
+        "full",
+        "full_like",
+        "ones",
+        "ones_like",
+        "zeros",
+        "zeros_like",
+    }
+
     def dtype_expr(dtype: torch.dtype) -> ast.expr:
         expr = expr_from_string(f"torch.{str(dtype).split('.', 1)[1]}")
         assert isinstance(expr, ast.expr)
         return expr
+
+    def is_torch_factory_call(call: ast.Call) -> bool:
+        return (
+            isinstance(call.func, ast.Attribute)
+            and call.func.attr in torch_factory_names
+            and isinstance(call.func.value, ast.Name)
+            and call.func.value.id == "torch"
+        )
+
+    def rewrite_allocation_dtype(call: ast.Call) -> None:
+        dtype = dtype_expr(torch.float32)
+        for kwarg in call.keywords:
+            if kwarg.arg == "dtype":
+                kwarg.value = dtype
+                return
+        if is_torch_factory_call(call):
+            call.keywords.append(create(ast.keyword, arg="dtype", value=dtype))
 
     def rewrite_return_expr(expr: ast.expr) -> ast.expr:
         if isinstance(expr, ast.Name) and expr.id in promotions:
@@ -2211,12 +2239,14 @@ def rewrite_cute_half_atomic_output_allocations(
             assert isinstance(cast_expr, ast.expr)
             return cast_expr
         if isinstance(expr, ast.Tuple):
-            return ast.Tuple(
+            return create(
+                ast.Tuple,
                 elts=[rewrite_return_expr(elt) for elt in expr.elts],
                 ctx=expr.ctx,
             )
         if isinstance(expr, ast.List):
-            return ast.List(
+            return create(
+                ast.List,
                 elts=[rewrite_return_expr(elt) for elt in expr.elts],
                 ctx=expr.ctx,
             )
@@ -2230,10 +2260,7 @@ def rewrite_cute_half_atomic_output_allocations(
             and stmt.targets[0].id in promotions
             and isinstance(stmt.value, ast.Call)
         ):
-            for kwarg in stmt.value.keywords:
-                if kwarg.arg == "dtype":
-                    kwarg.value = dtype_expr(torch.float32)
-                    break
+            rewrite_allocation_dtype(stmt.value)
         elif isinstance(stmt, ast.Return) and stmt.value is not None:
             stmt.value = rewrite_return_expr(stmt.value)
 
