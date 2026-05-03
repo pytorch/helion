@@ -1219,8 +1219,7 @@ def _codegen_cute_store_tcgen05_tile(
     )
     if tcgen05_value.epi_warp_count == 1:
         epi_warp_ids += ","
-    store_body = [
-        "cute.arch.sync_threads()",
+    store_body_core = [
         (
             f"{kernel_desc} = type('Tcgen05KernelDesc', (), {{"
             f"'cta_tile_shape_mnk': ({tcgen05_value.bm}, {tcgen05_value.bn}, {tcgen05_value.bk}), "
@@ -1355,11 +1354,29 @@ def _codegen_cute_store_tcgen05_tile(
             f"                    {pred_c}[(0, _pred_m, _pred_n)] = cute.elem_less(_coord, ({m_size}, {n_size}))\n"
             f"            cute.copy({simt_atom}, {ttr_rd}, {ttr_gc_subtile}, pred={pred_c})\n"
         ),
-        "cute.arch.sync_threads()",
     ]
-    main_stmt = statement_from_string(
-        "if True:\n" + textwrap.indent("\n".join(store_body), "    ")
-    )
+    main_stmts: list[ast.AST]
+    if tcgen05_value.use_role_local_epi:
+        sync_before_stmt = statement_from_string("cute.arch.sync_threads()")
+        main_stmt = statement_from_string(
+            "if True:\n" + textwrap.indent("\n".join(store_body_core), "    ")
+        )
+        sync_after_stmt = statement_from_string("cute.arch.sync_threads()")
+        df.register_cute_tcgen05_per_tile_stmts(
+            [sync_before_stmt, main_stmt, sync_after_stmt]
+        )
+        df.register_cute_tcgen05_epi_role_stmts([main_stmt])
+        main_stmts = [sync_before_stmt, main_stmt, sync_after_stmt]
+    else:
+        store_body = [
+            "cute.arch.sync_threads()",
+            *store_body_core,
+            "cute.arch.sync_threads()",
+        ]
+        main_stmt = statement_from_string(
+            "if True:\n" + textwrap.indent("\n".join(store_body), "    ")
+        )
+        main_stmts = [main_stmt]
     # Pipeline drain + TMEM dealloc are one-shot cleanup. They must run
     # AFTER all tiles have been processed (in the persistent path) and
     # naturally land at the end of the kernel in the non-persistent path.
@@ -1419,7 +1436,7 @@ def _codegen_cute_store_tcgen05_tile(
         statement_from_string(line) for line in post_loop_lines
     ]
     df.register_cute_tcgen05_post_loop_stmts(post_loop_stmts)
-    return [main_stmt, *post_loop_stmts]
+    return [*main_stmts, *post_loop_stmts]
 
 
 def _codegen_cute_store_loaded_index_trailing_slices(
