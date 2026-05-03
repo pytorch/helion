@@ -501,7 +501,12 @@ class TestCuteLowerings(unittest.TestCase):
         )
         # 4 epi + 1 exec + 1 ab_load = 6 warps, no power-of-2 round-up.
         self.assertIn("block=(64, 6, 1)", code)
-        self.assertIn("tcgen05_gC = cute.local_tile(out, (64, 8),", code)
+        self.assertIn("'kind': 'tcgen05_d_tma'", code)
+        self.assertIn("cutlass.pipeline.PipelineTmaStore.create", code)
+        self.assertIn(
+            "tcgen05_gC = cute.local_tile(tcgen05_tma_store_tensor, (64, 8),",
+            code,
+        )
         self.assertIn("partition_C(tcgen05_gC)", code)
         self.assertNotIn("for _tcgen05_store_i in range(", code)
         self.assertNotIn("cute.arch.warp_reduction_sum", code)
@@ -1198,6 +1203,62 @@ class TestCuteLowerings(unittest.TestCase):
             "K-loop. Generated code:\n" + code,
         )
 
+    def test_tcgen05_flat_static_full_uses_tma_store_epilogue(self) -> None:
+        """Static-full flat tcgen05 lowers the first G2 TMA-store epilogue.
+
+        Persistent kernels keep the SIMT epilogue until the c_pipeline ring
+        has an explicit per-tile stage counter. The flat fast path has one
+        output tile per CTA, so it can use the staged SMEM + TMA bulk store
+        path without spanning multiple scheduler tiles.
+        """
+
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_flat_tma_store(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        torch.manual_seed(0)
+        args = (
+            torch.randn(256, 32, device=DEVICE, dtype=torch.float16),
+            torch.randn(32, 256, device=DEVICE, dtype=torch.float16),
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_flat_tma_store.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            cfg = _make_tcgen05_persistent_config(
+                block_sizes=[128, 128, 16],
+                pid_type="flat",
+            )
+            code = bound.to_triton_code(cfg)
+            self.assertIn("'kind': 'tcgen05_d_tma'", code)
+            self.assertIn("cutlass.pipeline.PipelineTmaStore.create", code)
+            self.assertIn(
+                "cutlass.utils.gemm.sm100.epilogue_smem_copy_and_partition",
+                code,
+            )
+            self.assertIn("cute.nvgpu.cpasync.tma_partition", code)
+            self.assertIn("cute.copy(tcgen05_tma_store_atom", code)
+            self.assertNotIn("cute.nvgpu.CopyUniversalOp()", code)
+            bound.set_config(cfg)
+            out = bound(*args)
+
+        expected = args[0] @ args[1]
+        torch.testing.assert_close(out, expected, atol=2e-1, rtol=1e-2)
+
     def test_tcgen05_persistent_partial_single_tile_keeps_shared_tma_path(
         self,
     ) -> None:
@@ -1668,12 +1729,11 @@ class TestCuteLowerings(unittest.TestCase):
             "num_allocated_columns=tcgen05_acc_tmem_cols, dealloc_mbarrier_initialized=True)",
             code,
         )
-        # Direct TMEM->reg->GMEM SIMT epilogue (now used for all bn): the exec
-        # warp signals tcgen05_tmem_alloc_barrier.arrive() so the allocator
-        # teardown can wait on TMEM consumers, and the epi warps
-        # arrive_and_wait before freeing. The previous staged-via-smem_c
-        # epilogue used a different teardown sequence; the assertion below
-        # locks in the direct-store flow.
+        # tcgen05 epilogue teardown: the exec warp signals
+        # tcgen05_tmem_alloc_barrier.arrive() so allocator teardown can wait on
+        # TMEM consumers, and epi warps arrive_and_wait before freeing. The
+        # previous staged-via-smem_c epilogue used a different sequence; the
+        # assertion below locks in the current teardown flow.
         self.assertIn("tcgen05_tmem_alloc_barrier.arrive()", code)
         self.assertIn("tcgen05_tmem_alloc_barrier.arrive_and_wait()", code)
 
@@ -1721,8 +1781,9 @@ class TestCuteLowerings(unittest.TestCase):
             "tcgen05_tmem_alloc_barrier = cutlass.pipeline.NamedBarrier(barrier_id=1, num_threads=160)",
             code,
         )
+        self.assertIn("tcgen05_epi_tidx", code)
         self.assertIn(
-            ".get_slice(tcgen05_epi_tidx)",
+            "cutlass.utils.gemm.sm100.epilogue_tmem_copy_and_partition",
             code,
         )
         self.assertIn("block=(128, 2, 1)", code)
@@ -1856,10 +1917,10 @@ class TestCuteLowerings(unittest.TestCase):
         self.assertNotIn("load = x[indices_0, indices_2]", code)
         self.assertNotIn("load_1 = y[indices_2, indices_1]", code)
         self.assertNotIn("tcgen05_store_tmem_load_atom", code)
-        # The wide tcgen05 epilogue now uses the direct TMEM->reg->GMEM SIMT
-        # path (`_codegen_cute_store_tcgen05_tile`) instead of staging through
-        # an intermediate `smem_c` allocation, so the float32 tile-wide SMEM
-        # buffer is no longer materialized.
+        # The wide tcgen05 epilogue is emitted by
+        # `_codegen_cute_store_tcgen05_tile` instead of staging through an
+        # intermediate generic `smem_c` allocation, so the float32 tile-wide
+        # SMEM buffer is no longer materialized.
         self.assertNotIn("smem_c = cute.arch.alloc_smem", code)
         self.assertIn(
             "num_allocated_columns=tcgen05_acc_tmem_cols, dealloc_mbarrier_initialized=True)",
