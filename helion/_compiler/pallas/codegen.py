@@ -294,7 +294,7 @@ def _tile_pattern_code(
     # TODO(yifeixu): the long-term fix is making ``can_tile`` per-loop-scope
     # instead of per-tensor-dim so the planner doesn't mark this dim
     # untileable in pipeline mode in the first place.
-    if in_pipeline and block_id in pipeline_block_ids:
+    if in_pipeline:
         return ":"
 
     can_tile = _can_tile_dimension(state, tensor_dim)

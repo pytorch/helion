@@ -2061,6 +2061,52 @@ class TestPallas(TestCase):
         _code2, result2 = code_and_output(sum_with_dynamic_offset, (data, offsets))
         torch.testing.assert_close(result2, ref, rtol=1e-3, atol=1e-3)
 
+    def test_dma_buffer_offset_nested_tile(self) -> None:
+        """Inner loop reading outer-tiled tensor must use ':' not absolute offset."""
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def outer_in_inner(
+            x: torch.Tensor, y: torch.Tensor, offsets: torch.Tensor
+        ) -> torch.Tensor:
+            A = hl.specialize(x.size(1))
+            B = hl.specialize(x.size(2))
+            num_segs = offsets.size(0) - 1
+            out = torch.zeros([num_segs, A, B], dtype=x.dtype, device=x.device)
+            for seg in hl.grid(num_segs):
+                start = offsets[seg]
+                end = offsets[seg + 1]
+                for tile_i in hl.tile(start, end):
+                    for tile_j in hl.tile(start, end):
+                        out[seg, :, :] = (
+                            out[seg, :, :]
+                            + x[tile_i, :, :].sum(dim=0)
+                            + y[tile_j, :, :].sum(dim=0)
+                        )
+            return out
+
+        N, A, B = 128, 8, 256
+        x = torch.randn(N, A, B, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(N, A, B, device=DEVICE, dtype=torch.float32)
+        offsets = torch.tensor([0, 64, 128], device=DEVICE, dtype=torch.int32)
+
+        _code, result = code_and_output(
+            outer_in_inner,
+            (x, y, offsets),
+            block_sizes=[32, 32],
+            pallas_loop_type="fori_loop",
+        )
+
+        block = 32
+        ref = torch.zeros(offsets.size(0) - 1, A, B, device=DEVICE, dtype=x.dtype)
+        for seg in range(offsets.size(0) - 1):
+            s, e = int(offsets[seg]), int(offsets[seg + 1])
+            for i in range(0, e - s, block):
+                for j in range(0, e - s, block):
+                    ref[seg] += x[s + i : s + i + block].sum(dim=0) + y[
+                        s + j : s + j + block
+                    ].sum(dim=0)
+        torch.testing.assert_close(result, ref, rtol=1e-3, atol=1e-3)
+
     def test_jagged_sum_3d(self) -> None:
         """3D jagged sum with load-time masking for out-of-bounds data."""
 
