@@ -870,6 +870,24 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             orelse=[],
         )
 
+    def _tcgen05_tma_load_role_predicate(self) -> str:
+        """Boolean expression that gates the TMA-load warp's role block.
+
+        ``CuteTcgen05MatmulPlan.tma_warp_id`` is the launched-CTA warp
+        index assigned to TMA load + (currently) the persistent
+        scheduler. Match the tagging that ``cute_mma.py`` already emits
+        (``f"{tma_warp} = {warp_idx} == cutlass.Int32({tma_warp_id})"``)
+        so the predicate evaluates the same on every warp.
+        """
+        plan = self._tcgen05_plan()
+        assert plan is not None, (
+            "tcgen05 TMA-load role predicate requires a registered matmul plan"
+        )
+        return (
+            "cute.arch.make_warp_uniform(cute.arch.warp_idx()) "
+            f"== cutlass.Int32({plan.tma_warp_id})"
+        )
+
     def _split_tcgen05_invariant_setup(
         self, device_function: DeviceFunction, body: list[ast.stmt]
     ) -> tuple[list[ast.stmt], list[ast.stmt]]:
@@ -909,6 +927,76 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             else:
                 hoisted.append(stmt)
         return hoisted, wrapped
+
+    def _collect_tcgen05_role_blocks(
+        self, device_function: DeviceFunction, body: list[ast.stmt]
+    ) -> list[Tcgen05PersistentProgramIDs._PersistentRoleBlock]:
+        """Partition the per-tile body into warp-role blocks.
+
+        The producer walks the body in order. Each maximal run of
+        consecutive TMA-load-tagged statements is collapsed into a
+        TMA-load role block gated by the TMA-load warp predicate.
+        Everything else lives in the surrounding shared blocks. This
+        preserves the original emit order: a TMA initial prefetch
+        sandwiched between shared statements stays sandwiched, only
+        wrapped in a role-gate ``if``. The defines-before-uses
+        invariant carries over (e.g. the per-tile
+        ``tma_initial_full_tile`` boolean is set in a shared block
+        BEFORE the TMA-load block reads it, exactly as today).
+
+        Today the tagged statements already gate themselves on
+        ``if {tma_warp}:`` inline, so wrapping them in a role-block
+        ``if`` is functionally redundant -- the inner ``if {tma_warp}:``
+        and the outer role predicate are equivalent. The redundancy is
+        intentional: it makes the role partition visible in the
+        generated source, and it gives the future role-local-while
+        rewrite a structurally separated chunk to lift out without
+        chasing inline gates.
+
+        When no TMA-load tags are present, the producer returns a
+        single shared block carrying the full body. This is the
+        non-tcgen05 path, the universal-MMA path, and any kernel that
+        never registers TMA-load role tags. The consumer
+        (``_build_tcgen05_persistent_tile_body``) handles the
+        single-block case identically to the pre-split implementation.
+        """
+        if not device_function.has_cute_tcgen05_tma_load_role_marks:
+            return [self._PersistentRoleBlock(role_predicate=None, stmts=list(body))]
+
+        blocks: list[Tcgen05PersistentProgramIDs._PersistentRoleBlock] = []
+        current_shared: list[ast.stmt] = []
+        current_tma_load: list[ast.stmt] = []
+        tma_load_predicate = self._tcgen05_tma_load_role_predicate()
+
+        def flush_shared() -> None:
+            if current_shared:
+                blocks.append(
+                    self._PersistentRoleBlock(
+                        role_predicate=None, stmts=list(current_shared)
+                    )
+                )
+                current_shared.clear()
+
+        def flush_tma_load() -> None:
+            if current_tma_load:
+                blocks.append(
+                    self._PersistentRoleBlock(
+                        role_predicate=tma_load_predicate,
+                        stmts=list(current_tma_load),
+                    )
+                )
+                current_tma_load.clear()
+
+        for stmt in body:
+            if device_function.is_cute_tcgen05_tma_load_role(stmt):
+                flush_shared()
+                current_tma_load.append(stmt)
+            else:
+                flush_tma_load()
+                current_shared.append(stmt)
+        flush_shared()
+        flush_tma_load()
+        return blocks
 
     def _extract_tcgen05_post_loop_stmts(
         self, device_function: DeviceFunction, body: list[ast.stmt]
@@ -1011,6 +1099,7 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         )
 
         layout = self._build_tcgen05_persistent_layout(device_function)
+        role_blocks = self._collect_tcgen05_role_blocks(device_function, wrapped_body)
 
         setup: list[ast.stmt] = []
         setup.extend(self._build_tcgen05_persistent_prelude(layout))
@@ -1019,12 +1108,46 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             create(
                 ast.While,
                 test=expr_from_string(layout.work_tile_valid_var),
-                body=self._build_tcgen05_persistent_tile_body(layout, wrapped_body),
+                body=self._build_tcgen05_persistent_tile_body(layout, role_blocks),
                 orelse=[],
             )
         )
         setup.extend(post_loop_stmts)
         return setup
+
+    @dataclasses.dataclass
+    class _PersistentRoleBlock:
+        """One warp-role's contribution to the per-tile work-tile body.
+
+        Each role block carries the statements that conceptually belong
+        to one warp role (TMA-load / MMA-exec / epi / scheduler), plus a
+        ``role_predicate`` boolean expression that evaluates true on the
+        warps that should run those statements. ``role_predicate is
+        None`` denotes a "shared" block that runs on every warp -- this
+        is the default for kernel statements that have no explicit role
+        tag (e.g. PID decomposition, offset compute, cross-role
+        ``cute.arch.sync_threads()`` calls).
+
+        Today's consumer (``_build_tcgen05_persistent_tile_body``) emits
+        each role block sequentially inside the shared work-tile
+        ``while``: shared blocks become naked statements, role-gated
+        blocks become ``if {role_predicate}: ...`` wrappers. This is
+        functionally equivalent to the pre-split persistent body because
+        every role-tagged statement was already gated on the same
+        predicate inside its emit site (e.g. the initial TMA prefetch
+        was already wrapped in ``if {tma_warp}:`` in ``cute_mma.py``).
+
+        The data structure exists so a future commit can rewrite the
+        consumer to emit each non-shared role block in its OWN
+        role-local ``while`` loop (Quack's TMA-load /
+        MMA-exec / epi role-local persistent loops in ``gemm_sm100.py``).
+        That requires per-role local scheduler state and pipeline-only
+        synchronization (no ``cute.arch.sync_threads()`` between roles),
+        so it is bigger than this commit can absorb safely.
+        """
+
+        role_predicate: str | None
+        stmts: list[ast.stmt]
 
     @dataclasses.dataclass
     class _Tcgen05PersistentLayout:
@@ -1300,18 +1423,57 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             )
         return prelude
 
+    def _emit_role_block_stmts(
+        self, role_block: Tcgen05PersistentProgramIDs._PersistentRoleBlock
+    ) -> list[ast.stmt]:
+        """Emit a role block's statements, gated on its role predicate.
+
+        Shared blocks (``role_predicate is None``) emit naked
+        statements -- there is no per-warp gating, every warp runs them.
+        Role-gated blocks wrap their statements in ``if {predicate}:``
+        so only the matching warps execute the body. An empty
+        non-shared block emits nothing (no degenerate ``if {}:``).
+        """
+        if not role_block.stmts:
+            return []
+        if role_block.role_predicate is None:
+            return list(role_block.stmts)
+        return [
+            create(
+                ast.If,
+                test=expr_from_string(role_block.role_predicate),
+                body=list(role_block.stmts),
+                orelse=[],
+            )
+        ]
+
     def _build_tcgen05_persistent_tile_body(
         self,
         layout: _Tcgen05PersistentLayout,
-        wrapped_body: list[ast.stmt],
+        role_blocks: list[Tcgen05PersistentProgramIDs._PersistentRoleBlock],
     ) -> list[ast.stmt]:
         """Per-tile body inside the ``while``: run the user's kernel
-        body, then advance the scheduler and refresh the published work
-        tile so the next iteration sees the updated state.
+        body (split into warp-role blocks), then advance the scheduler
+        and refresh the published work tile so the next iteration sees
+        the updated state.
+
+        Role blocks are emitted in the order returned by
+        ``_collect_tcgen05_role_blocks``, which preserves the original
+        emit order of the per-tile body. TMA-load role blocks become
+        ``if {tma_warp_predicate}: ...`` wrappers in place of the
+        original tagged statements; shared blocks emit naked
+        statements. The defines-before-uses invariant from the
+        pre-split body carries through, so single-tile correctness is
+        unchanged. Multi-tile is still gated by the host-side guard
+        (see ``_emit_host_multi_tile_guard``) until role-local
+        persistent loops land.
         """
         body: list[ast.stmt] = [
             statement_from_string(f"{self.virtual_pid_var} = {layout.linear_pid_expr}"),
-            *wrapped_body,
+        ]
+        for role_block in role_blocks:
+            body.extend(self._emit_role_block_stmts(role_block))
+        body.append(
             self._tcgen05_scheduler_if(
                 layout.scheduler_leader_predicate,
                 [
@@ -1323,8 +1485,8 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                     ),
                     *layout.work_tile_publish_stmts,
                 ],
-            ),
-        ]
+            )
+        )
         if layout.cluster_m > 1:
             body.append(
                 self._tcgen05_scheduler_if(
