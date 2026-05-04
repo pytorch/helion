@@ -26,7 +26,14 @@ import helion.language as hl
 
 
 # %%
-@helion.kernel(ignore_warnings=[helion.exc.TensorOperationInWrapper])
+def baseline_ce(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+    return torch.nn.functional.cross_entropy(logits, labels.long())
+
+
+@helion.kernel(
+    ignore_warnings=[helion.exc.TensorOperationInWrapper],
+    autotune_baseline_fn=baseline_ce,
+)
 def cross_entropy(
     logits: torch.Tensor,  # [N, V] input logits
     labels: torch.Tensor,  # [N] target labels
@@ -97,9 +104,6 @@ def main() -> None:
     n = batch_size * seq_len
     logits = torch.randn(n, vocab_size, device=DEVICE, dtype=torch.float32)
     labels = torch.randint(0, vocab_size, (n,), device=DEVICE, dtype=LONG_INT_TYPE)
-
-    def baseline_ce(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
-        return torch.nn.functional.cross_entropy(logits, labels.long())
 
     run_example(
         cross_entropy,
