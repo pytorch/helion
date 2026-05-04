@@ -9,6 +9,7 @@ from unittest import mock
 import benchmarks.compare_matmul_backends as compare_matmul_backends
 from benchmarks.compare_matmul_backends import _build_subprocess_cmd
 from benchmarks.compare_matmul_backends import _build_two_cta_ncu_command
+from benchmarks.compare_matmul_backends import _cluster_m1_flat_args
 from benchmarks.compare_matmul_backends import _helion_role_local_loop_summaries
 from benchmarks.compare_matmul_backends import _make_helion_config_from_args
 from benchmarks.compare_matmul_backends import _parse_csv_list
@@ -52,6 +53,7 @@ def _args(**overrides: object) -> argparse.Namespace:
             "sm__cycles_elapsed.avg",
             "smsp__cycles_elapsed.avg",
         ],
+        "ncu_target_config": "two_cta_seed",
         "ncu_warmup_launches": 1,
         "ncu_profile_launches": 1,
         "ncu_command_only": False,
@@ -252,6 +254,16 @@ class TestCompareMatmulBackends(unittest.TestCase):
             ["tensor_descriptor", "tensor_descriptor", "tensor_descriptor"],
         )
 
+    def test_ncu_cluster_m1_flat_config_pins_correct_path_baseline(self) -> None:
+        config = _make_helion_config_from_args(_cluster_m1_flat_args(_args())).config
+
+        self.assertEqual(config["block_sizes"], [128, 256, 128])
+        self.assertEqual(config["pid_type"], "flat")
+        self.assertEqual(config["tcgen05_cluster_m"], 1)
+        self.assertEqual(config["tcgen05_acc_stages"], 1)
+        self.assertEqual(config["tcgen05_c_stages"], 4)
+        self.assertNotIn("indexing", config)
+
     def test_source_marker_helpers_count_aliases_and_lines(self) -> None:
         source = (
             "PipelineTmaStore.create(\n"
@@ -430,6 +442,7 @@ def epilogue():
             seed=123,
             ncu_binary="/opt/ncu",
             ncu_metrics=["metric_a", "metric_b"],
+            ncu_target_config="cluster_m1_flat",
             ncu_warmup_launches=2,
             ncu_profile_launches=3,
         )
@@ -448,6 +461,8 @@ def epilogue():
         self.assertIn("--helion-two-cta-ncu-target", cmd)
         self.assertIn("--helion-backend", cmd)
         self.assertIn("cute", cmd)
+        self.assertIn("--ncu-target-config", cmd)
+        self.assertIn("cluster_m1_flat", cmd)
         self.assertIn("--skip-correctness", cmd)
         self.assertIn("1", cmd)
         self.assertIn("--m", cmd)
@@ -467,6 +482,7 @@ def epilogue():
         self.assertTrue(payload["command_only"])
         self.assertEqual(payload["command"][0], "/missing/ncu")
         self.assertNotIn("returncode", payload)
+        self.assertEqual(payload["target_config"], "two_cta_seed")
 
     def test_two_cta_ncu_target_brackets_only_target_launches(self) -> None:
         events: list[str] = []
@@ -575,6 +591,40 @@ def epilogue():
             ],
             "Warp",
         )
+
+    def test_parse_ncu_raw_wide_csv_metrics(self) -> None:
+        metrics = _parse_ncu_csv_metrics(
+            '{"impl": "target"}\n'
+            '"ID","Kernel Name","Section Name","sm__cycles_elapsed.avg",'
+            '"smsp__warp_issue_stalled_barrier_per_warp_active.pct"\n'
+            '"","","","cycle","%"\n'
+            '"0","kernel_name","","100","2.5"\n',
+            [
+                "sm__cycles_elapsed.avg",
+                "smsp__warp_issue_stalled_barrier_per_warp_active.pct",
+            ],
+        )
+
+        self.assertEqual(metrics["sm__cycles_elapsed.avg"][0]["value"], "100")
+        self.assertEqual(metrics["sm__cycles_elapsed.avg"][0]["unit"], "cycle")
+        self.assertEqual(
+            metrics["smsp__warp_issue_stalled_barrier_per_warp_active.pct"][0][
+                "kernel"
+            ],
+            "kernel_name",
+        )
+
+    def test_two_cta_ncu_report_fails_when_metrics_do_not_parse(self) -> None:
+        completed = argparse.Namespace(returncode=0, stdout="no csv", stderr="")
+        with (
+            mock.patch.object(
+                compare_matmul_backends.subprocess,
+                "run",
+                return_value=completed,
+            ),
+            self.assertRaisesRegex(SystemExit, "no requested metrics were parsed"),
+        ):
+            _run_helion_two_cta_ncu_report(_args(helion_two_cta_ncu_report=True))
 
     def test_two_cta_diagnostic_sweep_rejects_print_codegen(self) -> None:
         with self.assertRaisesRegex(
