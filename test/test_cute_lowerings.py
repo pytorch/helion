@@ -1560,9 +1560,9 @@ class TestCuteLowerings(unittest.TestCase):
     ) -> None:
         """Single-output-tile CtaGroup.TWO codegen runs correctly.
 
-        Scheduler-recycling cluster_m=2 is still guarded separately, but
-        this path now has runtime coverage for the AB TMA/UMMA ownership
-        and tail-drain sequence.
+        The same role-local scheduler path is used for single-tile and
+        scheduler-recycling CtaGroup.TWO; this case covers the AB TMA/UMMA
+        ownership and tail-drain sequence with one logical tile.
         """
 
         from helion._compiler.cute.mma_support import get_cute_mma_support
@@ -1607,17 +1607,20 @@ class TestCuteLowerings(unittest.TestCase):
             code = bound.to_triton_code(cfg)
             self.assertIn("cute.nvgpu.tcgen05.CtaGroup.TWO", code)
             self.assertIn(
-                "tcgen05_role_local_0_work_tile_linear = cute.arch.block_idx()[2]",
+                "tcgen05_role_local_0_tile_sched = "
+                "cutlass.utils.StaticPersistentTileScheduler.create(",
                 code,
             )
             self.assertIn(
-                "virtual_pid = (tcgen05_role_local_0_work_tile_idx_0 "
-                "* cutlass.Int32(2) + tcgen05_role_local_0_cta_rank) "
+                "virtual_pid = tcgen05_role_local_0_work_tile.tile_idx[0] "
                 "// cutlass.Int32(2)",
                 code,
             )
-            self.assertNotIn("StaticPersistentTileScheduler.create", code)
-            self.assertNotIn("while tcgen05_role_local_0_work_tile", code)
+            self.assertIn("StaticPersistentTileScheduler.create", code)
+            self.assertIn(
+                "while tcgen05_role_local_0_work_tile.is_valid_tile",
+                code,
+            )
             self.assertIn(
                 "tcgen05_ab_pipeline_consumer_group = "
                 "cutlass.pipeline.CooperativeGroup("
@@ -1818,11 +1821,7 @@ class TestCuteLowerings(unittest.TestCase):
                 "codegen. Generated code:\n" + code,
             )
             total_var = Tcgen05PersistentProgramIDs._MULTI_TILE_GUARD_TOTAL_VAR
-            self.assertIn(
-                f"if {total_var} > "
-                f"{Tcgen05PersistentProgramIDs._CUDA_GRID_DIM_Z_LIMIT}:",
-                code,
-            )
+            self.assertNotIn(total_var, code)
             out = bound(*args)
         expected = args[0] @ args[1]
         torch.testing.assert_close(out, expected, atol=2e-1, rtol=1e-2)
@@ -1873,26 +1872,25 @@ class TestCuteLowerings(unittest.TestCase):
                     code = bound.to_triton_code(cfg)
                     self.assertIn("cute.nvgpu.tcgen05.CtaGroup.TWO", code)
                     self.assertIn(
-                        "tcgen05_role_local_0_work_tile_linear = "
-                        "cute.arch.block_idx()[2]",
+                        "tcgen05_role_local_0_tile_sched = "
+                        "cutlass.utils.StaticPersistentTileScheduler.create(",
                         code,
                     )
-                    self.assertNotIn("while tcgen05_role_local_0_work_tile", code)
-                    self.assertNotIn("StaticPersistentTileScheduler.create", code)
-                    total_var = Tcgen05PersistentProgramIDs._MULTI_TILE_GUARD_TOTAL_VAR
                     self.assertIn(
-                        f"if {total_var} > "
-                        f"{Tcgen05PersistentProgramIDs._CUDA_GRID_DIM_Z_LIMIT}:",
+                        "while tcgen05_role_local_0_work_tile.is_valid_tile",
                         code,
                     )
+                    self.assertIn("StaticPersistentTileScheduler.create", code)
+                    total_var = Tcgen05PersistentProgramIDs._MULTI_TILE_GUARD_TOTAL_VAR
+                    self.assertNotIn(total_var, code)
                     out = bound(*args)
                 expected = args[0] @ args[1]
                 torch.testing.assert_close(out, expected, atol=2e-1, rtol=1e-2)
 
-    def test_tcgen05_persistent_cluster_m2_two_cta_grid_avoids_recycling(
+    def test_tcgen05_persistent_cluster_m2_two_cta_grid_caps_for_recycling(
         self,
     ) -> None:
-        """CtaGroup.TWO launch grid covers all logical work tiles directly."""
+        """CtaGroup.TWO launch grid caps at persistent work-cluster capacity."""
 
         @helion.kernel(backend="cute")
         def cute_matmul_cluster_m2_two_cta_grid(
@@ -1928,17 +1926,17 @@ class TestCuteLowerings(unittest.TestCase):
             code = bound.to_triton_code(cfg)
             self.assertIn("cute.nvgpu.tcgen05.CtaGroup.TWO", code)
             self.assertIn(
-                "tcgen05_role_local_0_work_tile_linear = cute.arch.block_idx()[2]",
+                "tcgen05_role_local_0_tile_sched = "
+                "cutlass.utils.StaticPersistentTileScheduler.create(",
                 code,
             )
-            self.assertNotIn("StaticPersistentTileScheduler.create", code)
-            self.assertNotIn("while tcgen05_role_local_0_work_tile", code)
-            total_var = Tcgen05PersistentProgramIDs._MULTI_TILE_GUARD_TOTAL_VAR
+            self.assertIn("StaticPersistentTileScheduler.create", code)
             self.assertIn(
-                f"if {total_var} > "
-                f"{Tcgen05PersistentProgramIDs._CUDA_GRID_DIM_Z_LIMIT}:",
+                "while tcgen05_role_local_0_work_tile.is_valid_tile",
                 code,
             )
+            total_var = Tcgen05PersistentProgramIDs._MULTI_TILE_GUARD_TOTAL_VAR
+            self.assertNotIn(total_var, code)
             launcher_lines = [
                 line
                 for line in code.splitlines()
@@ -1946,13 +1944,19 @@ class TestCuteLowerings(unittest.TestCase):
             ]
             self.assertEqual(len(launcher_lines), 1, code)
             self.assertRegex(launcher_lines[0], r"_launcher\([^,]+,\s*\(2,\s*1,")
-            self.assertNotIn("_NUM_SM", launcher_lines[0])
-            self.assertNotIn("min(", launcher_lines[0])
+            self.assertIn("_NUM_SM", launcher_lines[0])
+            self.assertRegex(launcher_lines[0], r"//\s*2")
+            self.assertIn("min(", launcher_lines[0])
 
-    def test_tcgen05_persistent_cluster_m2_two_cta_grid_z_limit_guard(
+    def test_tcgen05_persistent_cluster_m2_two_cta_grid_z_limit_uses_recycling(
         self,
     ) -> None:
-        """Direct-grid CtaGroup.TWO guards shapes beyond CUDA gridDim.z."""
+        """CtaGroup.TWO recycling avoids direct-grid z-limit launches."""
+
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
 
         @helion.kernel(backend="cute")
         def cute_matmul_cluster_m2_two_cta_grid_z_limit(
@@ -1968,9 +1972,10 @@ class TestCuteLowerings(unittest.TestCase):
                 out[tile_m, tile_n] = acc.to(x.dtype)
             return out
 
+        torch.manual_seed(0)
         args = (
-            torch.randn(65536, 32, device=DEVICE, dtype=torch.bfloat16),
-            torch.randn(32, 65536, device=DEVICE, dtype=torch.bfloat16),
+            torch.randn(3072, 32, device=DEVICE, dtype=torch.bfloat16),
+            torch.randn(32, 3072, device=DEVICE, dtype=torch.bfloat16),
         )
         from helion._compiler.program_id import Tcgen05PersistentProgramIDs
 
@@ -1986,31 +1991,30 @@ class TestCuteLowerings(unittest.TestCase):
             code = bound.to_triton_code(cfg)
             total_var = Tcgen05PersistentProgramIDs._MULTI_TILE_GUARD_TOTAL_VAR
             self.assertIn("cute.nvgpu.tcgen05.CtaGroup.TWO", code)
-            self.assertIn(total_var, code)
+            self.assertNotIn(total_var, code)
+            self.assertNotIn("no more than 65535 output tiles", code)
             self.assertIn(
-                f"if {total_var} > "
-                f"{Tcgen05PersistentProgramIDs._CUDA_GRID_DIM_Z_LIMIT}:",
+                "tcgen05_role_local_0_tile_sched = "
+                "cutlass.utils.StaticPersistentTileScheduler.create(",
                 code,
             )
-            self.assertIn("no more than 65535 output tiles", code)
+            self.assertIn("StaticPersistentTileScheduler.create", code)
             launcher_lines = [
                 line
                 for line in code.splitlines()
                 if "_launcher(" in line and "_helion_cute" in line
             ]
             self.assertEqual(len(launcher_lines), 1, code)
-            self.assertNotIn("_NUM_SM", launcher_lines[0])
-            self.assertNotIn("min(", launcher_lines[0])
-            with self.assertRaisesRegex(
-                RuntimeError,
-                "no more than 65535 output tiles",
-            ):
-                bound(*args)
+            self.assertIn("_NUM_SM // 2", launcher_lines[0])
+            self.assertIn("min(", launcher_lines[0])
+            out = bound(*args)
+        expected = args[0] @ args[1]
+        torch.testing.assert_close(out, expected, atol=2e-1, rtol=1e-2)
 
     def test_tcgen05_persistent_cluster_m2_two_cta_large_runtime_correctness(
         self,
     ) -> None:
-        """Large CtaGroup.TWO multi-tile codegen avoids scheduler recycling."""
+        """Large CtaGroup.TWO multi-tile codegen recycles scheduler state."""
 
         from helion._compiler.cute.mma_support import get_cute_mma_support
 
@@ -2051,17 +2055,17 @@ class TestCuteLowerings(unittest.TestCase):
             code = bound.to_triton_code(cfg)
             self.assertIn("cute.nvgpu.tcgen05.CtaGroup.TWO", code)
             self.assertIn(
-                "tcgen05_role_local_0_work_tile_linear = cute.arch.block_idx()[2]",
+                "tcgen05_role_local_0_tile_sched = "
+                "cutlass.utils.StaticPersistentTileScheduler.create(",
                 code,
             )
-            self.assertNotIn("while tcgen05_role_local_0_work_tile", code)
-            self.assertNotIn("StaticPersistentTileScheduler.create", code)
-            total_var = Tcgen05PersistentProgramIDs._MULTI_TILE_GUARD_TOTAL_VAR
             self.assertIn(
-                f"if {total_var} > "
-                f"{Tcgen05PersistentProgramIDs._CUDA_GRID_DIM_Z_LIMIT}:",
+                "while tcgen05_role_local_0_work_tile.is_valid_tile",
                 code,
             )
+            self.assertIn("StaticPersistentTileScheduler.create", code)
+            total_var = Tcgen05PersistentProgramIDs._MULTI_TILE_GUARD_TOTAL_VAR
+            self.assertNotIn(total_var, code)
             first = bound(*args)
             second = bound(*args)
         expected = args[0] @ args[1]
@@ -2113,21 +2117,17 @@ class TestCuteLowerings(unittest.TestCase):
                     code = bound.to_triton_code(cfg)
                     self.assertIn("cute.nvgpu.tcgen05.CtaGroup.TWO", code)
                     self.assertIn(
-                        "tcgen05_role_local_0_work_tile_linear = "
-                        "cute.arch.block_idx()[2]",
-                        code,
-                    )
-                    self.assertNotIn("while tcgen05_role_local_0_work_tile", code)
-                    self.assertNotIn("StaticPersistentTileScheduler.create", code)
-                    self.assertIn(
-                        Tcgen05PersistentProgramIDs._MULTI_TILE_GUARD_TOTAL_VAR,
+                        "tcgen05_role_local_0_tile_sched = "
+                        "cutlass.utils.StaticPersistentTileScheduler.create(",
                         code,
                     )
                     self.assertIn(
-                        f"if {Tcgen05PersistentProgramIDs._MULTI_TILE_GUARD_TOTAL_VAR} > "
-                        f"{Tcgen05PersistentProgramIDs._CUDA_GRID_DIM_Z_LIMIT}:",
+                        "while tcgen05_role_local_0_work_tile.is_valid_tile",
                         code,
                     )
+                    self.assertIn("StaticPersistentTileScheduler.create", code)
+                    total_var = Tcgen05PersistentProgramIDs._MULTI_TILE_GUARD_TOTAL_VAR
+                    self.assertNotIn(total_var, code)
                     self.assertNotIn(
                         f"if {Tcgen05PersistentProgramIDs._MULTI_TILE_GUARD_TOTAL_VAR} > 0:",
                         code,
