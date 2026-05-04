@@ -47,9 +47,13 @@ FP32_FALLBACK_OPS_UNARY = [
     torch.ops.aten.exp.default,
 ]
 
-# Register fp32 fallback lowerings for ops that don't support fp16/bfloat16
+# Register fp32 fallback lowerings in a separate dict so that
+# `patch_inductor_lowerings` can skip them on backends (Pallas) where
+# Mosaic handles bf16 transcendentals natively and the round-trip would
+# only double per-element VMEM working-set.
+fp32_fallback_dispatch: dict[Callable[..., Any] | str, Callable[..., Any]] = {}
 for op in FP32_FALLBACK_OPS_UNARY:
-    inductor_lowering_dispatch[op] = create_fp16_to_fp32_unary_fallback_lowering(
+    fp32_fallback_dispatch[op] = create_fp16_to_fp32_unary_fallback_lowering(
         original_lowerings[op]
     )
 
@@ -62,11 +66,20 @@ def patch_inductor_lowerings() -> Generator[None, Any, Any]:
     affecting the global state, especially in cases where Helion
     is missing support for a specific lowering.
     """
+    from .compile_environment import CompileEnvironment
+
     # pyrefly: ignore [implicit-import]
     original_lowerings = torch._inductor.lowering.lowerings.copy()
     try:
         # pyrefly: ignore [implicit-import]
         torch._inductor.lowering.lowerings.update(inductor_lowering_dispatch)
+        # The fp32 round-trip is a Triton/CUDA workaround for libdevice
+        # /tl_math bf16 limitations. Mosaic on TPU handles bf16
+        # transcendentals natively, so installing the fallback there
+        # would only double per-element VMEM working-set.
+        if CompileEnvironment.current().backend_name != "pallas":
+            # pyrefly: ignore [implicit-import]
+            torch._inductor.lowering.lowerings.update(fp32_fallback_dispatch)
         yield
     finally:
         # pyrefly: ignore [implicit-import]
