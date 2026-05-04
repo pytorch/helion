@@ -2002,6 +2002,82 @@ def codegen_gather(ctx: LoweringContext, node: Node) -> object:
     return expr_from_string(result_var)
 
 
+@gather_lowering.register_codegen("cute")
+def codegen_gather_cute(ctx: LoweringContext, node: Node) -> object:
+    assert not node.kwargs, "gather does not support keyword arguments"
+    assert len(node.args) == 3, f"gather expects 3 arguments, got {len(node.args)}"
+
+    input_node = node.args[0]
+    dim = node.args[1]
+    index_node = node.args[2]
+    assert isinstance(input_node, Node)
+    assert isinstance(dim, int)
+    assert isinstance(index_node, Node)
+
+    from ..language.memory_ops import _cute_combined_mask
+    from ..language.memory_ops import _cute_index_exprs
+    from ..language.memory_ops import load
+    from .inductor_lowering import CodegenState
+
+    if input_node.target is not load:
+        raise exc.BackendUnsupported("cute", "torch.gather input")
+    tensor_node = input_node.args[0]
+    if not isinstance(tensor_node, Node):
+        raise exc.BackendUnsupported("cute", "torch.gather tensor input")
+    tensor = tensor_node.meta["val"]
+    if not isinstance(tensor, torch.Tensor):
+        raise exc.BackendUnsupported("cute", "torch.gather tensor input")
+    input_subscript = input_node.args[1]
+    if not isinstance(input_subscript, (list, tuple)):
+        raise exc.BackendUnsupported("cute", "torch.gather input subscript")
+
+    ndim = len(input_subscript)
+    if dim < 0:
+        dim += ndim
+    if not (0 <= dim < ndim):
+        raise exc.InvalidReductionDim(dim)
+
+    proxy_subscript = cast(
+        "list[object]",
+        list(map_arg(tuple(input_subscript), lambda arg: arg.meta["val"])),
+    )
+    ast_subscript = cast(
+        "list[object]",
+        list(map_arg(tuple(input_subscript), lambda arg: _env_arg(ctx, arg))),
+    )
+    index_ast = _env_arg(ctx, index_node)
+    assert isinstance(index_ast, ast.AST)
+    proxy_subscript[dim] = index_node.meta["val"]
+    ast_subscript[dim] = index_ast
+
+    from .generate_ast import GenerateAST
+
+    if not isinstance(ctx.cg, GenerateAST):
+        raise exc.NotAllowedInHelperFunction
+
+    state = CodegenState(ctx.cg, fx_node=node, env=ctx.env)
+    index_exprs = _cute_index_exprs(
+        state,
+        proxy_subscript,
+        ast_subscript,
+        tensor=tensor,
+        inactive_slice_expr="None",
+        inactive_singleton_slice_expr="0",
+    )
+    tensor_name = ctx.cg.device_function.tensor_arg(tensor).name
+    load_expr = f"{tensor_name}[{', '.join(index_exprs)}]"
+    mask_expr = _cute_combined_mask(state, proxy_subscript, None, tensor=tensor)
+    if tensor.dtype is torch.bool:
+        load_expr = f"({load_expr} != cutlass.Uint8(0))"
+        if mask_expr is None:
+            return expr_from_string(load_expr)
+        return expr_from_string(f"({load_expr} if {mask_expr} else cutlass.Boolean(0))")
+    if mask_expr is None:
+        return expr_from_string(load_expr)
+    zero = CompileEnvironment.current().backend.dtype_str(tensor.dtype)
+    return expr_from_string(f"({load_expr} if {mask_expr} else {zero}(0))")
+
+
 topk_lowering = register_lowering(torch.ops.aten.topk.default)
 
 

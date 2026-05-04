@@ -2023,8 +2023,13 @@ class CuteNDTileStrategy(NDTileStrategy):
                     offset_var, elements_per_thread, axis=axis
                 )
                 thread_extent = self._thread_extent_for_axis(block_idx, block_size)
-                if isinstance(thread_extent, int):
-                    tracker.record(block_idx, axis, thread_extent)
+                static_extent = (
+                    thread_extent
+                    if isinstance(thread_extent, int)
+                    else self._static_thread_extent_for_block(block_idx, block_size)
+                )
+                if isinstance(static_extent, int):
+                    tracker.record(block_idx, axis, static_extent)
             else:
                 idx_expr = offset_var
             if lane_var := self._lane_var_by_block.get(block_idx):
@@ -2189,8 +2194,13 @@ class CuteNDTileStrategy(NDTileStrategy):
                     offset_var, elements_per_thread, axis=axis
                 )
                 thread_extent = self._thread_extent_for_axis(block_idx, block_size)
-                if isinstance(thread_extent, int):
-                    tracker.record(block_idx, axis, thread_extent)
+                static_extent = (
+                    thread_extent
+                    if isinstance(thread_extent, int)
+                    else self._static_thread_extent_for_block(block_idx, block_size)
+                )
+                if isinstance(static_extent, int):
+                    tracker.record(block_idx, axis, static_extent)
             else:
                 idx_expr = offset_var
             if lane_var := self._lane_var_by_block.get(block_idx):

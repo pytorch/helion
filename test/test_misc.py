@@ -34,7 +34,6 @@ from helion._testing import skipIfPyTorchBaseVerLessThan
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfTileIR
 from helion._testing import skipUnlessTensorDescriptor
-from helion._testing import xfailIfCute
 import helion.language as hl
 from helion.runtime.settings import _get_backend
 
@@ -1017,7 +1016,6 @@ class TestMisc(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, expected)
 
     @skipIfRefEager("Config tests not applicable in ref eager mode")
-    @xfailIfCute("CUTe supports up to three thread axes")
     def test_default_block_sizes_high_dim_with_reduction(self):
         """Regression test for issue #1354: default config hangs when indexing
         tensor with enough dims.

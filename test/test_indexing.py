@@ -4,6 +4,7 @@ import math
 import unittest
 from unittest.mock import patch
 
+import pytest
 import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.fx.experimental.symbolic_shapes import ShapeEnv
@@ -17,6 +18,7 @@ from helion._testing import DEVICE
 from helion._testing import HALF_DTYPE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
+from helion._testing import _get_backend
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
 from helion._testing import skipIfLowVRAM
@@ -25,6 +27,7 @@ from helion._testing import skipIfRefEager
 from helion._testing import skipIfTileIR
 from helion._testing import skipIfXPU
 from helion._testing import skipUnlessTensorDescriptor
+from helion._testing import xfailIfCute
 import helion.language as hl
 
 _LARGE_BF16_SHAPE = (51200, 51200)
@@ -69,7 +72,7 @@ def reduction_sum(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
-@onlyBackends(["triton"])
+@onlyBackends(["triton", "cute"])
 class TestIndexing(RefEagerTestBase, TestCase):
     @skipIfRefEager(
         "Test is block size dependent which is not supported in ref eager mode"
@@ -122,6 +125,11 @@ class TestIndexing(RefEagerTestBase, TestCase):
             result, torch.arange(0, 100, device=DEVICE, dtype=torch.int32)
         )
 
+    @pytest.mark.xfail(
+        _get_backend() == "cute",
+        reason="CuTe matmul fallback with non-power-of-two static dimensions can generate invalid shared-memory indexing",
+        run=False,
+    )
     def test_hl_arange_non_power_of_2(self):
         @helion.kernel
         def _matmul_layernorm_bwd_dxdy(
@@ -263,6 +271,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
             result, torch.where(torch.arange(200, device=DEVICE) % 2 == 0, x, 0)
         )
 
+    @xfailIfCute("CuTe does not yet lower untiled cartesian hl.arange store indices")
     def test_mask_store_cartesian(self):
         @helion.kernel(autotune_effort="none")
         def cartesian_masked_store_kernel(
@@ -337,6 +346,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
         result = cartesian_masked_store_kernel(packed, shared_b, offsets)
         torch.testing.assert_close(result, expected)
 
+    @xfailIfCute("CuTe does not yet lower untiled 3D cartesian hl.arange store indices")
     def test_mask_store_cartesian_3d(self):
         @helion.kernel(autotune_effort="none")
         def cartesian_masked_store_kernel_3d(
@@ -460,8 +470,9 @@ class TestIndexing(RefEagerTestBase, TestCase):
                         block_size=block_size,
                         indexing=indexing,
                     )
-                    self.assertIn(indexing, code_test)
-                    self.assertIn("tl.where", code_test)
+                    if _get_backend() == "triton":
+                        self.assertIn(indexing, code_test)
+                        self.assertIn("tl.where", code_test)
                     torch.testing.assert_close(result_test, result_pointer)
 
     @skipIfTileIR("TileIR does not support block_ptr indexing")
@@ -488,14 +499,15 @@ class TestIndexing(RefEagerTestBase, TestCase):
                     block_size=16,
                     indexing=indexing,
                 )
-                # The masked store should fall back to pointer
-                store_lines = [
-                    line for line in code.splitlines() if "tl.store(" in line
-                ]
-                self.assertTrue(store_lines)
-                for line in store_lines:
-                    self.assertNotIn("block_ptr", line)
-                    self.assertNotIn("tensor_descriptor", line)
+                if _get_backend() == "triton":
+                    # The masked store should fall back to pointer
+                    store_lines = [
+                        line for line in code.splitlines() if "tl.store(" in line
+                    ]
+                    self.assertTrue(store_lines)
+                    for line in store_lines:
+                        self.assertNotIn("block_ptr", line)
+                        self.assertNotIn("tensor_descriptor", line)
                 torch.testing.assert_close(
                     result,
                     torch.where(torch.arange(200, device=DEVICE) % 2 == 0, x, 0),
@@ -621,7 +633,8 @@ class TestIndexing(RefEagerTestBase, TestCase):
             code, out = code_and_output(kernel, (x, y))
             torch.accelerator.synchronize()
             checker = self.assertIn if expect_int64_in_code else self.assertNotIn
-            checker("tl.int64", code)
+            int64_token = "cutlass.Int64" if _get_backend() == "cute" else "tl.int64"
+            checker(int64_token, code)
             torch.accelerator.synchronize()
             ref_out = torch.add(x, y)
             del x, y
@@ -731,12 +744,19 @@ class TestIndexing(RefEagerTestBase, TestCase):
 
         # Test int64 case: program_id should be cast to int64
         code_int64, result_int64 = code_and_output(add_kernel_int64, (x, y))
-        self.assertIn("tl.program_id(0).to(tl.int64)", code_int64)
+        if _get_backend() == "cute":
+            self.assertIn("cutlass.Int64(cute.arch.block_idx()[0])", code_int64)
+        else:
+            self.assertIn("tl.program_id(0).to(tl.int64)", code_int64)
 
         # Test int32 case: program_id should NOT be cast
         code_int32, result_int32 = code_and_output(add_kernel_int32, (x, y))
-        self.assertNotIn(".to(tl.int64)", code_int32)
-        self.assertIn("tl.program_id(0)", code_int32)
+        if _get_backend() == "cute":
+            self.assertNotIn("cutlass.Int64(cute.arch.block_idx()[0])", code_int32)
+            self.assertIn("cutlass.Int32(cute.arch.block_idx()[0])", code_int32)
+        else:
+            self.assertNotIn(".to(tl.int64)", code_int32)
+            self.assertIn("tl.program_id(0)", code_int32)
 
         # Both should produce correct results
         expected = x + y
@@ -1719,6 +1739,11 @@ class TestIndexing(RefEagerTestBase, TestCase):
     @skipIfRefEager(
         "Test is block size dependent which is not supported in ref eager mode"
     )
+    @pytest.mark.xfail(
+        _get_backend() == "cute",
+        reason="CuTe attention dot lowering with tile-offset K/V loads is incorrect",
+        run=False,
+    )
     def test_tile_with_offset_from_expr(self):
         @helion.kernel(
             autotune_effort="none",
@@ -1810,8 +1835,9 @@ class TestIndexing(RefEagerTestBase, TestCase):
         )
         expected = a + b + c
         torch.testing.assert_close(result, expected, rtol=1e-3, atol=1e-3)
-        self.assertIn("tl.load", code)
-        self.assertIn("tl.make_block_ptr", code)
+        if _get_backend() == "triton":
+            self.assertIn("tl.load", code)
+            self.assertIn("tl.make_block_ptr", code)
 
     def test_per_load_indexing_backward_compat(self):
         @helion.kernel
@@ -1889,11 +1915,12 @@ class TestIndexing(RefEagerTestBase, TestCase):
             block_size=[16, 16],
         )
         torch.testing.assert_close(result1, expected, rtol=1e-3, atol=1e-3)
-        # Verify we have both pointer loads and block_ptr store
-        self.assertIn("tl.load", code1)
-        self.assertIn("tl.make_block_ptr", code1)
-        # Count occurrences: should have block_ptr for store
-        self.assertEqual(code1.count("tl.make_block_ptr"), 1)
+        if _get_backend() == "triton":
+            # Verify we have both pointer loads and block_ptr store
+            self.assertIn("tl.load", code1)
+            self.assertIn("tl.make_block_ptr", code1)
+            # Count occurrences: should have block_ptr for store
+            self.assertEqual(code1.count("tl.make_block_ptr"), 1)
 
         # Test 2: Different mix - block_ptr loads, pointer store
         code2, result2 = code_and_output(
@@ -1903,8 +1930,9 @@ class TestIndexing(RefEagerTestBase, TestCase):
             block_size=[16, 16],
         )
         torch.testing.assert_close(result2, expected, rtol=1e-3, atol=1e-3)
-        # Should have 2 block_ptrs for loads, regular store
-        self.assertEqual(code2.count("tl.make_block_ptr"), 2)
+        if _get_backend() == "triton":
+            # Should have 2 block_ptrs for loads, regular store
+            self.assertEqual(code2.count("tl.make_block_ptr"), 2)
 
         # Test 3: All block_ptr
         code3, result3 = code_and_output(
@@ -1914,8 +1942,9 @@ class TestIndexing(RefEagerTestBase, TestCase):
             block_size=[16, 16],
         )
         torch.testing.assert_close(result3, expected, rtol=1e-3, atol=1e-3)
-        # Should have 3 block_ptrs total (2 loads + 1 store)
-        self.assertEqual(code3.count("tl.make_block_ptr"), 3)
+        if _get_backend() == "triton":
+            # Should have 3 block_ptrs total (2 loads + 1 store)
+            self.assertEqual(code3.count("tl.make_block_ptr"), 3)
 
         # Test 4: Verify single string applies to all loads and stores
         code4, result4 = code_and_output(
@@ -2252,13 +2281,14 @@ class TestIndexing(RefEagerTestBase, TestCase):
             block_size=[2],
         )
 
-        # Verify the mask is present in the store (not None)
-        self.assertIn("tl.store", code)
-        # The mask should be something like mask_0[:, None], not None
-        self.assertNotIn(
-            "tl.store(dx + (load_1 * dx_stride_0 + load_2 * dx_stride_1), load, None)",
-            code,
-        )
+        if _get_backend() == "triton":
+            # Verify the mask is present in the store (not None)
+            self.assertIn("tl.store", code)
+            # The mask should be something like mask_0[:, None], not None
+            self.assertNotIn(
+                "tl.store(dx + (load_1 * dx_stride_0 + load_2 * dx_stride_1), load, None)",
+                code,
+            )
 
         # Compute expected result
         expected = torch.zeros(5, 20, device=DEVICE)
@@ -2268,6 +2298,9 @@ class TestIndexing(RefEagerTestBase, TestCase):
 
         torch.testing.assert_close(result, expected)
 
+    @xfailIfCute(
+        "CuTe does not yet support static hl.arange tensor indexers mixed with non-consecutive tensor indexers"
+    )
     def test_non_consecutive_tensor_indexers_no_broadcast(self):
         """Test that non-consecutive tensor indexers don't get incorrectly broadcast.
 
@@ -2324,6 +2357,9 @@ class TestIndexing(RefEagerTestBase, TestCase):
             )
         torch.testing.assert_close(result, expected)
 
+    @xfailIfCute(
+        "CuTe layout propagation does not yet resolve mixed scalar/block stores with size-1 dimensions"
+    )
     def test_mixed_scalar_block_store_size1_dim(self):
         """Test store with mixed scalar/block indexing when block dimension has size 1.
 
@@ -2527,6 +2563,9 @@ class TestIndexing(RefEagerTestBase, TestCase):
         expected = data[index_source, :, :]
         torch.testing.assert_close(result, expected)
 
+    @xfailIfCute(
+        "CuTe batched matmul lowering for full-slice loads in reduction loops is incorrect"
+    )
     def test_full_slice_in_reduction_loop(self):
         """Full slice between two tiled dims: q[tile_n, :, tile_d]
 

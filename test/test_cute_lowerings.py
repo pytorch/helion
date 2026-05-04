@@ -2672,11 +2672,11 @@ class TestCuteLowerings(unittest.TestCase):
             ]
         )
         env = SimpleNamespace(
-            block_sizes={
-                0: _FakeBlockSize(128, block_id=0),
-                1: _FakeBlockSize(8, block_id=1),
-                2: _FakeBlockSize(16, block_id=2, reduction=True),
-            },
+            block_sizes=[
+                _FakeBlockSize(128, block_id=0),
+                _FakeBlockSize(8, block_id=1),
+                _FakeBlockSize(16, block_id=2, reduction=True),
+            ],
             config_spec=SimpleNamespace(
                 num_threads=SimpleNamespace(config_get=lambda *args: 0),
                 loop_orders=SimpleNamespace(config_get=lambda *args: None),
