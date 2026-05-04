@@ -10,7 +10,10 @@ import random
 import signal
 import tempfile
 import time
+from types import SimpleNamespace
 from typing import TYPE_CHECKING
+from typing import Any
+from typing import cast
 import unittest
 from unittest.mock import patch
 
@@ -22,15 +25,18 @@ from helion._testing import import_path
 from helion._testing import onlyBackends
 from helion._testing import skipIfXPU
 from helion.autotuner.benchmark_job import _load_args
+from helion.autotuner.benchmark_pool import PoolBenchmarkManager
 from helion.autotuner.benchmark_provider import LocalBenchmarkProvider
 from helion.autotuner.benchmark_worker import BenchmarkTimeout
 from helion.autotuner.benchmark_worker import BenchmarkWorker
 from helion.autotuner.benchmark_worker import BenchmarkWorkerDied
 from helion.autotuner.benchmark_worker import BenchmarkWorkerPool
+from helion.autotuner.benchmark_worker import WorkerPoolResult
+from helion.autotuner.precompile_future import SerializedCompiledFunction
 from helion.autotuner.random_search import RandomSearch
+from helion.runtime.config import Config
 
 if TYPE_CHECKING:
-    from helion.runtime.config import Config
     from helion.runtime.kernel import CompiledConfig
 
 
@@ -140,6 +146,59 @@ class TestWorkerPoolPrecompile(unittest.TestCase):
                 _load_args.cache_clear()
 
         self.assertIs(loaded[0], _callable_kernel_arg)
+
+    def test_false_precompile_result_is_failure(self) -> None:
+        # A worker precompile returning False should count as a real compile failure.
+        class FakePool:
+            def start_all(self, limit: int | None = None) -> None:
+                self.limit = limit
+
+            def map_jobs(
+                self,
+                jobs: list[object],
+                timeout: float,
+            ) -> list[WorkerPoolResult]:
+                return [
+                    WorkerPoolResult(worker_index=0, elapsed=0.25, result=False)
+                    for _ in jobs
+                ]
+
+        class FakeLog:
+            def debug(self, *_args: object, **_kwargs: object) -> None:
+                pass
+
+        def fake_fn() -> None:
+            pass
+
+        metrics = SimpleNamespace(num_compile_failures=0)
+        manager = cast("Any", PoolBenchmarkManager.__new__(PoolBenchmarkManager))
+        manager._pool = FakePool()
+        manager._log = FakeLog()
+        manager._autotune_metrics = metrics
+        manager._precompile_worker_by_fn = {}
+
+        def serialize_fn(_fn: object) -> SerializedCompiledFunction:
+            return SerializedCompiledFunction(
+                function_name="fake_fn",
+                source_code="def fake_fn(): pass",
+                filename=None,
+                module_name=None,
+            )
+
+        result = manager.precompile(
+            [Config()],
+            [fake_fn],
+            args_path="args.pt",
+            timeout=1,
+            desc=None,
+            serialize_fn=serialize_fn,
+        )
+
+        self.assertEqual(result.is_workings, [False])
+        self.assertEqual(result.statuses, ["error"])
+        self.assertEqual(result.compile_times, [0.25])
+        self.assertEqual(metrics.num_compile_failures, 1)
+        self.assertEqual(manager._precompile_worker_by_fn, {})
 
 
 # Subprocess benchmarking depends on Backend.supports_precompile(); only the
