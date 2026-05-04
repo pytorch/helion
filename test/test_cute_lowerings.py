@@ -1785,8 +1785,12 @@ class TestCuteLowerings(unittest.TestCase):
                         found_role_local_exec = True
                     elif test_src == epi_role_predicate:
                         self.assertIn("tcgen05_acc_pipeline.consumer_wait", role_src)
-                        self.assertIn("cute.nvgpu.CopyUniversalOp()", role_src)
-                        self.assertNotIn("PipelineTmaStore.create", role_src)
+                        self.assertIn("PipelineTmaStore.create", role_src)
+                        self.assertIn("cute.nvgpu.cpasync.tma_partition", role_src)
+                        self.assertIn("cute.copy(tcgen05_tma_store_atom", role_src)
+                        self.assertIn("tcgen05_tma_store_role_tile", role_src)
+                        self.assertNotIn("cute.nvgpu.CopyUniversalOp()", role_src)
+                        self._assert_tma_store_acquire_before_smem_write(role_src)
                         found_role_local_epi = True
             for node in ast.walk(tree):
                 if not (
@@ -1810,7 +1814,7 @@ class TestCuteLowerings(unittest.TestCase):
             )
             self.assertTrue(
                 found_role_local_epi,
-                "Expected role-local SIMT epilogue work in CtaGroup.TWO "
+                "Expected role-local TMA-store epilogue work in CtaGroup.TWO "
                 "codegen. Generated code:\n" + code,
             )
             total_var = Tcgen05PersistentProgramIDs._MULTI_TILE_GUARD_TOTAL_VAR
@@ -4863,7 +4867,9 @@ class TestCuteLowerings(unittest.TestCase):
             "== cutlass.Int32(0):",
             code,
         )
-        self.assertNotIn("'kind': 'tcgen05_d_tma'", code)
+        self.assertIn("'kind': 'tcgen05_d_tma'", code)
+        self.assertIn("cutlass.pipeline.PipelineTmaStore.create", code)
+        self.assertNotIn("cute.nvgpu.CopyUniversalOp()", code)
         self.assertIn("_BLOCK_SIZE_0 = 256", code)
         self.assertIn("_BLOCK_SIZE_1 = 256", code)
         self.assertIn("cute.arch.block_idx_in_cluster()", code)
