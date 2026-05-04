@@ -1363,14 +1363,14 @@ def _emit_mma_pipeline(
     tcgen05_use_role_local_persistent_body = tcgen05_use_role_local_tma_producer
     # Flat kernels process one output tile per CTA, so the c_pipeline stage is
     # just the subtile index. Persistent kernels use a role-local tile counter
-    # to rotate c_pipeline stages across work tiles. Keep cluster_m=2 on the
-    # predicated SIMT store until the G3 two-CTA epilogue ownership path is
-    # validated end-to-end.
+    # to rotate c_pipeline stages across work tiles. Static-full CtaGroup.TWO
+    # uses the same SMEM-staged TMA-store epilogue: each CTA's epilogue warp 0
+    # stores its partitioned C tile.
     tcgen05_use_tma_store_epilogue = (
         mma_impl == "tcgen05"
         and tcgen05_use_tma_pipeline
         and tcgen05_static_full_tiles
-        and tcgen05_cluster_m == 1
+        and (tcgen05_cluster_m == 1 or tcgen05_is_two_cta)
         and (not _is_persistent_pid_config(df.config) or tcgen05_use_role_local_epi)
     )
     tcgen05_collective_handles_operand_loads = (
@@ -2783,8 +2783,8 @@ def _emit_mma_pipeline(
             # The tcgen05 epilogue + allocator teardown is emitted by
             # `_codegen_cute_store_tcgen05_tile` when the kernel stores
             # `out[tile_m, tile_n] = result`. Static-full flat and validated
-            # role-local persistent kernels take the TMA-store path;
-            # partial/unsupported fallbacks keep SIMT.
+            # role-local persistent kernels, including CtaGroup.TWO, take the
+            # TMA-store path; partial/unsupported fallbacks keep SIMT.
             sync_stmt = statement_from_string("cute.arch.sync_threads()")
             suffix.append(sync_stmt)
             per_tile_stmts.append(sync_stmt)
