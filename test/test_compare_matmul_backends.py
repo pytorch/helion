@@ -12,6 +12,7 @@ from benchmarks.compare_matmul_backends import _build_two_cta_ncu_command
 from benchmarks.compare_matmul_backends import _cluster_m1_flat_args
 from benchmarks.compare_matmul_backends import _helion_role_local_loop_summaries
 from benchmarks.compare_matmul_backends import _make_helion_config_from_args
+from benchmarks.compare_matmul_backends import _ncu_target_quack_args
 from benchmarks.compare_matmul_backends import _parse_csv_list
 from benchmarks.compare_matmul_backends import _parse_indexing_list
 from benchmarks.compare_matmul_backends import _parse_int_list
@@ -91,6 +92,16 @@ def _args(**overrides: object) -> argparse.Namespace:
     }
     values.update(overrides)
     return argparse.Namespace(**values)
+
+
+def _cmd_value(cmd: list[str], flag: str) -> str:
+    try:
+        index = cmd.index(flag)
+    except ValueError as exc:
+        raise AssertionError(f"missing command flag {flag}") from exc
+    if index + 1 >= len(cmd):
+        raise AssertionError(f"missing command value after {flag}")
+    return cmd[index + 1]
 
 
 class TestCompareMatmulBackends(unittest.TestCase):
@@ -450,25 +461,82 @@ def epilogue():
         cmd = _build_two_cta_ncu_command(args)
 
         self.assertEqual(cmd[0], "/opt/ncu")
-        self.assertIn("--metrics", cmd)
-        self.assertIn("metric_a,metric_b", cmd)
-        self.assertIn("--profile-from-start", cmd)
-        self.assertIn("off", cmd)
-        self.assertIn("--launch-skip", cmd)
-        self.assertIn("2", cmd)
-        self.assertIn("--launch-count", cmd)
-        self.assertIn("3", cmd)
+        self.assertEqual(_cmd_value(cmd, "--metrics"), "metric_a,metric_b")
+        self.assertEqual(_cmd_value(cmd, "--profile-from-start"), "off")
+        self.assertEqual(_cmd_value(cmd, "--launch-skip"), "2")
+        self.assertEqual(_cmd_value(cmd, "--launch-count"), "3")
         self.assertIn("--helion-two-cta-ncu-target", cmd)
-        self.assertIn("--helion-backend", cmd)
-        self.assertIn("cute", cmd)
-        self.assertIn("--ncu-target-config", cmd)
-        self.assertIn("cluster_m1_flat", cmd)
-        self.assertIn("--skip-correctness", cmd)
-        self.assertIn("1", cmd)
-        self.assertIn("--m", cmd)
-        self.assertIn("2048", cmd)
-        self.assertIn("--dtype", cmd)
-        self.assertIn("float16", cmd)
+        self.assertEqual(_cmd_value(cmd, "--helion-backend"), "cute")
+        self.assertEqual(_cmd_value(cmd, "--ncu-target-config"), "cluster_m1_flat")
+        self.assertEqual(_cmd_value(cmd, "--skip-correctness"), "1")
+        self.assertEqual(_cmd_value(cmd, "--m"), "2048")
+        self.assertEqual(_cmd_value(cmd, "--n"), "1024")
+        self.assertEqual(_cmd_value(cmd, "--k"), "512")
+        self.assertEqual(_cmd_value(cmd, "--dtype"), "float16")
+
+    def test_two_cta_ncu_command_pins_quack_baseline_args(self) -> None:
+        args = _args(
+            ncu_target_config="quack_same_tile",
+            quack_path="/tmp/quack-alt",
+            quack_pingpong=1,
+            quack_persistent=0,
+            quack_dynamic_persistent=0,
+            quack_max_swizzle_size=4,
+        )
+
+        cmd = _build_two_cta_ncu_command(args)
+
+        self.assertEqual(_cmd_value(cmd, "--ncu-target-config"), "quack_same_tile")
+        self.assertEqual(_cmd_value(cmd, "--quack-path"), "/tmp/quack-alt")
+        self.assertEqual(_cmd_value(cmd, "--quack-pingpong"), "0")
+        self.assertEqual(_cmd_value(cmd, "--quack-persistent"), "1")
+        self.assertEqual(_cmd_value(cmd, "--quack-dynamic-persistent"), "1")
+        self.assertEqual(_cmd_value(cmd, "--quack-max-swizzle-size"), "8")
+
+    def test_two_cta_ncu_quack_targets_pin_full_baseline(self) -> None:
+        same_tile = _ncu_target_quack_args(
+            _args(
+                ncu_target_config="quack_same_tile",
+                quack_tile_m=512,
+                quack_tile_n=512,
+                quack_cluster_m=4,
+                quack_cluster_n=2,
+                quack_pingpong=1,
+                quack_persistent=0,
+                quack_dynamic_persistent=0,
+                quack_max_swizzle_size=4,
+            )
+        )
+        best = _ncu_target_quack_args(
+            _args(
+                ncu_target_config="quack_best",
+                quack_tile_m=128,
+                quack_tile_n=128,
+                quack_cluster_m=1,
+                quack_cluster_n=2,
+                quack_pingpong=1,
+                quack_persistent=0,
+                quack_dynamic_persistent=0,
+                quack_max_swizzle_size=4,
+            )
+        )
+
+        self.assertEqual(same_tile.quack_tile_m, 128)
+        self.assertEqual(same_tile.quack_tile_n, 256)
+        self.assertEqual(same_tile.quack_cluster_m, 1)
+        self.assertEqual(same_tile.quack_cluster_n, 1)
+        self.assertEqual(same_tile.quack_pingpong, 0)
+        self.assertEqual(same_tile.quack_persistent, 1)
+        self.assertEqual(same_tile.quack_dynamic_persistent, 1)
+        self.assertEqual(same_tile.quack_max_swizzle_size, 8)
+        self.assertEqual(best.quack_tile_m, 256)
+        self.assertEqual(best.quack_tile_n, 256)
+        self.assertEqual(best.quack_cluster_m, 2)
+        self.assertEqual(best.quack_cluster_n, 1)
+        self.assertEqual(best.quack_pingpong, 0)
+        self.assertEqual(best.quack_persistent, 1)
+        self.assertEqual(best.quack_dynamic_persistent, 1)
+        self.assertEqual(best.quack_max_swizzle_size, 8)
 
     def test_two_cta_ncu_report_command_only_does_not_run_profiler(self) -> None:
         payload = _run_helion_two_cta_ncu_report(
@@ -556,6 +624,90 @@ def epilogue():
         )
         self.assertEqual(payload["warmup_launches"], 2)
         self.assertEqual(payload["profile_launches"], 3)
+
+    def test_two_cta_ncu_target_profiles_quack_target(self) -> None:
+        events: list[str] = []
+
+        def run() -> object:
+            events.append("quack")
+            return object()
+
+        prepared = argparse.Namespace(
+            a=object(),
+            b=object(),
+            dtype=object(),
+            config={"tile_m": 128, "tile_n": 256, "cluster_m": 1},
+            run=run,
+        )
+
+        cudart = mock.Mock()
+
+        def start() -> int:
+            events.append("start")
+            return 0
+
+        def stop() -> int:
+            events.append("stop")
+            return 0
+
+        def synchronize() -> None:
+            events.append("sync")
+
+        cudart.cudaProfilerStart.side_effect = start
+        cudart.cudaProfilerStop.side_effect = stop
+
+        with (
+            mock.patch.object(
+                compare_matmul_backends,
+                "_prepare_quack_direct",
+                return_value=prepared,
+            ) as prepare_quack,
+            mock.patch.object(
+                compare_matmul_backends.torch.cuda,
+                "cudart",
+                return_value=cudart,
+            ),
+            mock.patch.object(
+                compare_matmul_backends.torch.cuda,
+                "synchronize",
+                side_effect=synchronize,
+            ),
+        ):
+            payload = _run_helion_two_cta_ncu_target(
+                _args(
+                    ncu_target_config="quack_same_tile",
+                    quack_pingpong=1,
+                    quack_persistent=0,
+                    quack_dynamic_persistent=0,
+                    quack_max_swizzle_size=4,
+                    skip_correctness=1,
+                    ncu_warmup_launches=1,
+                    ncu_profile_launches=2,
+                )
+            )
+
+        quack_args = prepare_quack.call_args.args[0]
+        self.assertEqual(quack_args.quack_tile_m, 128)
+        self.assertEqual(quack_args.quack_cluster_m, 1)
+        self.assertEqual(quack_args.quack_pingpong, 0)
+        self.assertEqual(quack_args.quack_persistent, 1)
+        self.assertEqual(quack_args.quack_dynamic_persistent, 1)
+        self.assertEqual(quack_args.quack_max_swizzle_size, 8)
+        self.assertEqual(
+            events,
+            [
+                "sync",
+                "start",
+                "quack",
+                "sync",
+                "quack",
+                "quack",
+                "sync",
+                "stop",
+            ],
+        )
+        self.assertEqual(payload["impl"], "quack-direct:quack_same_tile:ncu-target")
+        self.assertEqual(payload["config"], prepared.config)
 
     def test_two_cta_ncu_report_missing_binary_fails_cleanly(self) -> None:
         with (
