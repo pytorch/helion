@@ -8,6 +8,8 @@ from benchmarks.compare_matmul_backends import _make_helion_config_from_args
 from benchmarks.compare_matmul_backends import _parse_indexing_list
 from benchmarks.compare_matmul_backends import _parse_int_list
 from benchmarks.compare_matmul_backends import _parse_optional_bool_list
+from benchmarks.compare_matmul_backends import _two_cta_diagnostic_variant_args
+from benchmarks.compare_matmul_backends import _validate_args
 
 
 def _args(**overrides: object) -> argparse.Namespace:
@@ -20,7 +22,12 @@ def _args(**overrides: object) -> argparse.Namespace:
         "warmup_ms": 1000,
         "rep_ms": 500,
         "seed": 0,
+        "impl": "all",
+        "impls": None,
+        "print_codegen": False,
+        "json": False,
         "skip_correctness": 0,
+        "helion_two_cta_diagnostic_sweep": False,
         "quack_path": None,
         "quack_tile_m": 256,
         "quack_tile_n": 256,
@@ -130,6 +137,76 @@ class TestCompareMatmulBackends(unittest.TestCase):
             _parse_int_list("1")
         with self.assertRaises(argparse.ArgumentTypeError):
             _parse_indexing_list("not_an_indexing")
+
+    def test_two_cta_diagnostic_sweep_pins_validated_family(self) -> None:
+        variants = dict(_two_cta_diagnostic_variant_args(_args()))
+
+        self.assertEqual(
+            set(variants),
+            {"seed", "seed_maxnreg128", "warps16", "quick_selected_family"},
+        )
+        for variant_args in variants.values():
+            config = _make_helion_config_from_args(variant_args).config
+            self.assertEqual(config["block_sizes"], [256, 256, 128])
+            self.assertEqual(config["pid_type"], "persistent_blocked")
+            self.assertEqual(config["tcgen05_cluster_m"], 2)
+            self.assertEqual(config["l2_groupings"], [4])
+            self.assertEqual(config["tcgen05_num_epi_warps"], 4)
+            self.assertEqual(config["range_flattens"], [None, None])
+            self.assertEqual(config["range_multi_buffers"], [None, None])
+            self.assertEqual(config["range_warp_specializes"], [None, None])
+
+        seed_config = _make_helion_config_from_args(variants["seed"]).config
+        self.assertEqual(seed_config["num_warps"], 4)
+        self.assertNotIn("maxnreg", seed_config)
+        self.assertEqual(
+            seed_config["indexing"],
+            ["tensor_descriptor", "tensor_descriptor", "tensor_descriptor"],
+        )
+
+        maxnreg_config = _make_helion_config_from_args(
+            variants["seed_maxnreg128"]
+        ).config
+        self.assertEqual(maxnreg_config["maxnreg"], 128)
+        self.assertEqual(maxnreg_config["num_warps"], 4)
+
+        warps16_config = _make_helion_config_from_args(variants["warps16"]).config
+        self.assertEqual(warps16_config["num_warps"], 16)
+        self.assertNotIn("maxnreg", warps16_config)
+
+        quick_config = _make_helion_config_from_args(
+            variants["quick_selected_family"]
+        ).config
+        self.assertEqual(quick_config["num_warps"], 16)
+        self.assertEqual(quick_config["maxnreg"], 128)
+        self.assertEqual(
+            quick_config["indexing"],
+            ["tensor_descriptor", "pointer", "tensor_descriptor"],
+        )
+
+    def test_two_cta_diagnostic_sweep_rejects_print_codegen(self) -> None:
+        with self.assertRaisesRegex(
+            SystemExit,
+            "--helion-two-cta-diagnostic-sweep does not support --print-codegen",
+        ):
+            _validate_args(
+                _args(
+                    helion_two_cta_diagnostic_sweep=True,
+                    print_codegen=True,
+                )
+            )
+
+    def test_two_cta_diagnostic_sweep_rejects_non_helion_impl(self) -> None:
+        with self.assertRaisesRegex(
+            SystemExit,
+            "--helion-two-cta-diagnostic-sweep only supports",
+        ):
+            _validate_args(
+                _args(
+                    helion_two_cta_diagnostic_sweep=True,
+                    impl="quack-direct",
+                )
+            )
 
 
 if __name__ == "__main__":
