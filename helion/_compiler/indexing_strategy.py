@@ -25,6 +25,7 @@ from .tile_strategy import DeviceLoopState
 from .utils import compute_slice_size
 from .variable_origin import BlockSizeOrigin
 from .variable_origin import GridOrigin
+from .variable_origin import TileBeginOrigin
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -124,6 +125,32 @@ def _resolve_codegen_block_id(state: CodegenState, block_id: int) -> int:
     env = CompileEnvironment.current()
     graph = state.fx_node.graph if state.fx_node is not None else None
     return env.resolve_codegen_block_id(block_id, state.codegen, graph)
+
+
+def _scalar_symint_can_codegen_as_scalar(k: torch.SymInt) -> bool:
+    expr = _symint_expr(k)
+    if not isinstance(expr, sympy.Expr):
+        return False
+    if not expr.free_symbols:
+        return True
+
+    expr_to_origin = HostFunction.current().expr_to_origin
+    for symbol in expr.free_symbols:
+        origin_info = expr_to_origin.get(symbol)
+        if origin_info is None:
+            return False
+
+        origin = origin_info.origin
+        if isinstance(origin, BlockSizeOrigin):
+            return False
+        if isinstance(origin, GridOrigin):
+            if type(origin) is GridOrigin or isinstance(origin, TileBeginOrigin):
+                continue
+            return False
+        if not origin.is_host():
+            return False
+
+    return True
 
 
 def _has_active_codegen_block(state: CodegenState, block_idx: int) -> bool:
@@ -503,12 +530,12 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
                 if isinstance(symbol, sympy.Symbol):
                     origin = HostFunction.current().expr_to_origin.get(symbol)
                 if origin and isinstance(origin.origin, BlockSizeOrigin):
-                    block_size = env.block_sizes[
-                        origin.origin.block_id
-                    ].from_config(config)
+                    block_size = env.block_sizes[origin.origin.block_id].from_config(
+                        config
+                    )
                     if not valid_block_size(block_size, stride, i):
                         return False
-                elif not (origin and isinstance(origin.origin, GridOrigin)):
+                elif not _scalar_symint_can_codegen_as_scalar(k):
                     return False
 
         return True

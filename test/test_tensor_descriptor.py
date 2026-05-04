@@ -509,7 +509,6 @@ class TestTensorDescriptor(RefEagerTestBase, TestCase):
         result_unaligned = add_one(x_unaligned)
         torch.testing.assert_close(result_unaligned, x_unaligned + 1.0)
 
-
     @skipUnlessTensorDescriptor("Tensor descriptor support is required")
     def test_scalar_symint_subscript(self):
         """tile.begin (a SymInt without BlockSizeOrigin) should not prevent
@@ -534,6 +533,62 @@ class TestTensorDescriptor(RefEagerTestBase, TestCase):
         x = torch.randn(4, 128, device=DEVICE, dtype=torch.float32)
         code, result = code_and_output(batched_add, (x,))
         torch.testing.assert_close(result, x + 1.0)
+
+        self.assertIn(get_tensor_descriptor_fn_name(), code)
+        self.assertNotIn("tl.load(", code)
+        self.assertNotIn("tl.store(", code)
+
+    @skipUnlessTensorDescriptor("Tensor descriptor support is required")
+    def test_composite_scalar_symint_subscript(self):
+        """Known scalar SymInt expressions should still use tensor descriptors."""
+
+        @helion.kernel(
+            config=helion.Config(
+                block_sizes=[64],
+                indexing="tensor_descriptor",
+            ),
+            static_shapes=True,
+        )
+        def gather_rows(x: torch.Tensor, start: int) -> torch.Tensor:
+            _, n = x.size()
+            out = torch.empty([2, n], device=x.device, dtype=x.dtype)
+            for tile_n in hl.tile(n):
+                out[0, tile_n] = x[start + 3, tile_n]
+                out[1, tile_n] = x[start - start + 1, tile_n]
+            return out
+
+        x = torch.randn(8, 128, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(gather_rows, (x, 2))
+        expected = torch.stack([x[5], x[1]])
+        torch.testing.assert_close(result, expected)
+
+        self.assertIn(get_tensor_descriptor_fn_name(), code)
+        self.assertNotIn("tl.load(", code)
+        self.assertNotIn("tl.store(", code)
+
+    @skipUnlessTensorDescriptor("Tensor descriptor support is required")
+    def test_composite_tile_begin_scalar_symint_subscript(self):
+        """Scalar expressions composed with tile.begin are descriptor-safe."""
+
+        @helion.kernel(
+            config=helion.Config(
+                block_sizes=[64],
+                indexing="tensor_descriptor",
+            ),
+            static_shapes=True,
+        )
+        def copy_offset_rows(x: torch.Tensor, start: int) -> torch.Tensor:
+            _, n = x.size()
+            rows = 4
+            out = torch.empty([rows, n], device=x.device, dtype=x.dtype)
+            for tile_b in hl.tile(rows, block_size=1):
+                for tile_n in hl.tile(n):
+                    out[tile_b.begin, tile_n] = x[start + tile_b.begin, tile_n]
+            return out
+
+        x = torch.randn(8, 128, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(copy_offset_rows, (x, 2))
+        torch.testing.assert_close(result, x[2:6])
 
         self.assertIn(get_tensor_descriptor_fn_name(), code)
         self.assertNotIn("tl.load(", code)
