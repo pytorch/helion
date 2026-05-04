@@ -13,7 +13,9 @@ from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
+from helion._testing import patch_cute_mma_support
 from helion._testing import skipIfMTIA
+from helion.exc import InvalidConfig
 import helion.language as hl
 
 
@@ -66,6 +68,113 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         spec = _matmul_kernel.bind(args).config_spec
         self.assertEqual([x.min_size for x in spec.block_sizes], [2, 8, 16])
 
+    @onlyBackends(["cute"])
+    def test_cute_tcgen05_matmul_constrains_search_space(self) -> None:
+        @helion.kernel(backend="cute")
+        def cute_matmul_mma(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        args = (
+            torch.randn([256, 64], device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn([64, 128], device=DEVICE, dtype=HALF_DTYPE),
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_mma.bind(args)
+        spec = bound.config_spec
+        self.assertEqual([x.min_size for x in spec.block_sizes], [128, 8, 16])
+        # tile_k upper bound was previously hardcoded to 16; the cute tcgen05
+        # path now allows multiples of 16 up to min(128, static_k) so the
+        # autotuner can pack more cute.gemm instructions per K iteration.
+        self.assertEqual([x.max_size for x in spec.block_sizes], [256, 128, 64])
+        default_block_sizes = spec.default_config().config["block_sizes"]
+        self.assertGreaterEqual(default_block_sizes[2], 16)
+        self.assertLessEqual(default_block_sizes[2], 64)
+        self.assertGreaterEqual(default_block_sizes[0], 128)
+        self.assertLessEqual(default_block_sizes[0], 256)
+        self.assertGreaterEqual(default_block_sizes[1], 8)
+        self.assertLessEqual(default_block_sizes[1], 128)
+        self.assertEqual(spec.default_config().config["l2_groupings"], [1])
+        # cluster_m default is now 1 (cluster_m=2 has runtime issues); the
+        # autotuner search space restricts the choice accordingly.
+        self.assertEqual(spec.default_config().config["tcgen05_cluster_m"], 1)
+
+    @onlyBackends(["cute"])
+    def test_cute_tcgen05_equal_dims_keep_default_within_max_bound(self) -> None:
+        @helion.kernel(backend="cute")
+        def cute_matmul_mma(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        args = (
+            torch.randn([8192, 8192], device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn([8192, 8192], device=DEVICE, dtype=HALF_DTYPE),
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_mma.bind(args)
+        spec = bound.config_spec
+        self.assertEqual([x.min_size for x in spec.block_sizes], [128, 8, 16])
+        # tile_k upper bound is now 128 (the static_k=8192 case; capped at 128
+        # to keep AB SMEM staging budget sane).
+        self.assertEqual([x.max_size for x in spec.block_sizes], [256, 256, 128])
+        default_block_sizes = spec.default_config().config["block_sizes"]
+        self.assertGreaterEqual(default_block_sizes[2], 16)
+        self.assertLessEqual(default_block_sizes[2], 128)
+        self.assertGreaterEqual(default_block_sizes[0], 128)
+        self.assertLessEqual(default_block_sizes[0], 256)
+        self.assertGreaterEqual(default_block_sizes[1], 8)
+        self.assertLessEqual(default_block_sizes[1], 256)
+        self.assertEqual(spec.default_config().config["l2_groupings"], [1])
+        # cluster_m default is now 1 (cluster_m=2 has runtime issues); the
+        # autotuner search space restricts the choice accordingly.
+        self.assertEqual(spec.default_config().config["tcgen05_cluster_m"], 1)
+
+    @onlyBackends(["cute"])
+    def test_cute_tcgen05_widened_default_stays_on_tcgen05_path(self) -> None:
+        @helion.kernel(backend="cute")
+        def cute_matmul_mma(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        args = (
+            torch.randn([8192, 8192], device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn([8192, 8192], device=DEVICE, dtype=HALF_DTYPE),
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_mma.bind(args)
+            config = bound.config_spec.default_config()
+            code = bound.to_triton_code(config)
+        self.assertEqual(config.config["block_sizes"][2], 16)
+        self.assertGreaterEqual(config.config["block_sizes"][0], 128)
+        self.assertLessEqual(config.config["block_sizes"][0], 256)
+        self.assertGreaterEqual(config.config["block_sizes"][1], 8)
+        self.assertLessEqual(config.config["block_sizes"][1], 256)
+        self.assertIn("make_trivial_tiled_mma", code)
+        self.assertIn(f"_BLOCK_SIZE_0 = {config.config['block_sizes'][0]}", code)
+        self.assertIn(f"_BLOCK_SIZE_1 = {config.config['block_sizes'][1]}", code)
+
+    @skipIfMTIA("MTIA requires tl.dot initial value stride >= 128 bytes")
     def test_matmul_smaller_than_min_dot_size(self) -> None:
         """Test matmul where K and N are smaller than min_dot_size (16 on CUDA).
 
@@ -137,6 +246,351 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         )
         expected = torch.bmm(args[0], args[1])
         torch.testing.assert_close(result, expected, atol=1e-1, rtol=1e-2)
+
+    @onlyBackends(["cute"])
+    def test_cute_tcgen05_validated_autotune_narrowing(self) -> None:
+        """``narrow_tcgen05_autotune_to_validated_configs`` consolidates the
+        three known tcgen05 limitations into a single config_spec call.
+
+        Pin the resulting state so any future change to the helper has to
+        update the test as well: persistent pid types are dropped from the
+        autotune search, the cluster_m search is narrowed to ``(1,)``,
+        and the num_epi_warps search is narrowed to ``(4,)``.
+        """
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_mma(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        args = (
+            torch.randn([256, 64], device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn([64, 128], device=DEVICE, dtype=HALF_DTYPE),
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_mma.bind(args)
+        spec = bound.config_spec
+        # Persistent pid types miscompute multi-tile silently today; they
+        # are dropped from the autotune pid_type search.
+        self.assertNotIn("persistent_blocked", spec.allowed_pid_types)
+        self.assertNotIn("persistent_interleaved", spec.allowed_pid_types)
+        # cluster_m=2 currently CUDA-launch-fails on B200; the autotune
+        # search is narrowed to cluster_m=1.
+        self.assertEqual(spec._tcgen05_cluster_m_search_choices, (1,))
+        # num_epi_warps != 4 currently produces wrong output on B200
+        # (only 4 epi warps lowers correctly today). The autotune search
+        # is narrowed to num_epi_warps=4 so the autotuner does not
+        # converge on a wrong-output config.
+        self.assertEqual(spec._tcgen05_num_epi_warps_search_choices, (4,))
+        # The validated narrowing leaves cluster_m=2 still accepted as a
+        # legal value for an explicit user-supplied helion.Config
+        # (CUDA-launch-failure is loud and won't silently miscompute).
+        validation_fragments = spec._tcgen05_optional_fragments(for_search=False)
+        self.assertEqual(validation_fragments["tcgen05_cluster_m"].choices, (1, 2))
+        # num_epi_warps is the exception: validation is also tightened
+        # to (4,) because non-4 values silently produce wrong output, so
+        # an explicit user-supplied helion.Config must be rejected
+        # rather than allowed to miscompute.
+        self.assertEqual(spec._tcgen05_num_epi_warps_validation_choices, (4,))
+        self.assertEqual(validation_fragments["tcgen05_num_epi_warps"].choices, (4,))
+        # The search view exposes the same narrowed EnumFragment.
+        search_fragments = spec._tcgen05_optional_fragments(for_search=True)
+        self.assertEqual(search_fragments["tcgen05_num_epi_warps"].choices, (4,))
+
+    def test_narrow_tcgen05_autotune_to_validated_configs_helper(self) -> None:
+        """Direct unit test for the narrowing helper that does not depend
+        on the dot-requirements bind path. The helper only manipulates the
+        autotune search state on the receiver and is safe to invoke on any
+        ``ConfigSpec`` instance."""
+
+        @helion.kernel
+        def stub(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size(0)):
+                out[tile] = x[tile] + 1
+            return out
+
+        args = (torch.randn([1024], device=DEVICE),)
+        spec = stub.bind(args).config_spec
+        before_pid = set(spec.allowed_pid_types)
+        spec.narrow_tcgen05_autotune_to_validated_configs()
+        # Both persistent types are dropped (idempotently if they were
+        # already absent).
+        self.assertNotIn("persistent_blocked", spec.allowed_pid_types)
+        self.assertNotIn("persistent_interleaved", spec.allowed_pid_types)
+        # Other pid types are preserved.
+        for pid_type in before_pid - {"persistent_blocked", "persistent_interleaved"}:
+            self.assertIn(pid_type, spec.allowed_pid_types)
+        # The cluster_m search is now narrowed to (1,).
+        self.assertEqual(spec._tcgen05_cluster_m_search_choices, (1,))
+        # The num_epi_warps search is now narrowed to (4,) -- the only
+        # currently-correct value on B200 (1 and 2 are directly verified
+        # to produce wrong output, 3 is unsafe by extension).
+        self.assertEqual(spec._tcgen05_num_epi_warps_search_choices, (4,))
+        # Validation is also tightened for num_epi_warps because the
+        # failure mode is silent wrong output.
+        self.assertEqual(spec._tcgen05_num_epi_warps_validation_choices, (4,))
+        # Calling it twice is idempotent.
+        spec.narrow_tcgen05_autotune_to_validated_configs()
+        self.assertNotIn("persistent_blocked", spec.allowed_pid_types)
+        self.assertEqual(spec._tcgen05_cluster_m_search_choices, (1,))
+        self.assertEqual(spec._tcgen05_num_epi_warps_search_choices, (4,))
+        self.assertEqual(spec._tcgen05_num_epi_warps_validation_choices, (4,))
+
+    def test_restrict_tcgen05_num_epi_warps_search_helper(self) -> None:
+        """Direct unit test for ``restrict_tcgen05_num_epi_warps_search``.
+
+        The helper sets the per-instance search-only override and never
+        affects the validation view returned by
+        ``_tcgen05_optional_fragments(for_search=False)``. The test
+        exercises the override on its own (i.e. without going through
+        the full ``narrow_tcgen05_autotune_to_validated_configs``
+        consolidation) so any future regression to the helper itself is
+        caught here directly.
+        """
+
+        @helion.kernel
+        def stub(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size(0)):
+                out[tile] = x[tile] + 1
+            return out
+
+        args = (torch.randn([1024], device=DEVICE),)
+        spec = stub.bind(args).config_spec
+        # Default state: no override is set, so the search uses the
+        # default IntegerFragment range and the validation view keeps
+        # the same range.
+        self.assertIsNone(spec._tcgen05_num_epi_warps_search_choices)
+        default_search = spec._tcgen05_optional_fragments(for_search=True)
+        self.assertEqual(default_search["tcgen05_num_epi_warps"].low, 1)
+        self.assertEqual(default_search["tcgen05_num_epi_warps"].high, 4)
+
+        spec.restrict_tcgen05_num_epi_warps_search((1, 2))
+        self.assertEqual(spec._tcgen05_num_epi_warps_search_choices, (1, 2))
+        narrowed_search = spec._tcgen05_optional_fragments(for_search=True)
+        # Narrowing flips the search view to an EnumFragment so the
+        # autotuner samples only the listed values.
+        self.assertEqual(narrowed_search["tcgen05_num_epi_warps"].choices, (1, 2))
+        # Validation view is unaffected by the search-only helper:
+        # user-supplied helion.Config values in [1, 4] still round-trip
+        # through normalize() unless ``restrict_tcgen05_num_epi_warps_validation``
+        # is also called (see ``test_restrict_tcgen05_num_epi_warps_validation_helper``).
+        validation = spec._tcgen05_optional_fragments(for_search=False)
+        self.assertEqual(validation["tcgen05_num_epi_warps"].low, 1)
+        self.assertEqual(validation["tcgen05_num_epi_warps"].high, 4)
+
+        # Empty override raises (a misuse: every search must allow at
+        # least one value).
+        with self.assertRaises(AssertionError):
+            spec.restrict_tcgen05_num_epi_warps_search(())
+
+    def test_restrict_tcgen05_num_epi_warps_validation_helper(self) -> None:
+        """Direct unit test for ``restrict_tcgen05_num_epi_warps_validation``.
+
+        Unlike the search-only sibling, this helper tightens what
+        ``normalize()`` accepts so user-supplied configs with bad
+        values are rejected with ``InvalidConfig`` rather than silently
+        accepted. Used by the BF16/FP16 matmul path because non-4
+        epi-warp counts produce silent wrong output.
+        """
+
+        @helion.kernel
+        def stub(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size(0)):
+                out[tile] = x[tile] + 1
+            return out
+
+        args = (torch.randn([1024], device=DEVICE),)
+        spec = stub.bind(args).config_spec
+        # Default state: validation view is the full IntegerFragment.
+        self.assertIsNone(spec._tcgen05_num_epi_warps_validation_choices)
+        default_validation = spec._tcgen05_optional_fragments(for_search=False)
+        self.assertEqual(default_validation["tcgen05_num_epi_warps"].low, 1)
+        self.assertEqual(default_validation["tcgen05_num_epi_warps"].high, 4)
+
+        spec.restrict_tcgen05_num_epi_warps_validation((4,))
+        self.assertEqual(spec._tcgen05_num_epi_warps_validation_choices, (4,))
+        narrowed_validation = spec._tcgen05_optional_fragments(for_search=False)
+        # Validation view flipped to EnumFragment with the restricted choices.
+        self.assertEqual(narrowed_validation["tcgen05_num_epi_warps"].choices, (4,))
+        # Search view unaffected by the validation-only helper.
+        search = spec._tcgen05_optional_fragments(for_search=True)
+        self.assertEqual(search["tcgen05_num_epi_warps"].low, 1)
+        self.assertEqual(search["tcgen05_num_epi_warps"].high, 4)
+
+        # Empty override raises.
+        with self.assertRaises(AssertionError):
+            spec.restrict_tcgen05_num_epi_warps_validation(())
+
+    @onlyBackends(["cute"])
+    def test_cute_tcgen05_num_epi_warps_search_routes_through_flat_fields(
+        self,
+    ) -> None:
+        """End-to-end check that the narrowed num_epi_warps search shows
+        up in ``_flat_fields()`` (the autotuner's single source of truth
+        for the search space). Without this routing, the narrow_helper
+        would only flip the per-instance flag while the autotuner kept
+        sampling the full IntegerFragment range.
+        """
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_mma(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        args = (
+            torch.randn([256, 64], device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn([64, 128], device=DEVICE, dtype=HALF_DTYPE),
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_mma.bind(args)
+        spec = bound.config_spec
+        # cute_tcgen05_search_enabled gates the inclusion of the tcgen05
+        # optional fragments in _flat_fields(); enforce_dot_requirements
+        # set it during bind, so the narrowed search view should appear.
+        self.assertTrue(spec.cute_tcgen05_search_enabled)
+        flat_fields = spec._flat_fields()
+        self.assertIn("tcgen05_num_epi_warps", flat_fields)
+        # The matmul-side narrowing collapses the search to (4,);
+        # _flat_fields exposes that as an EnumFragment with a single
+        # choice rather than the default IntegerFragment(1, 4, 4).
+        self.assertEqual(flat_fields["tcgen05_num_epi_warps"].choices, (4,))
+        # cluster_m is similarly narrowed via the same helper.
+        self.assertEqual(flat_fields["tcgen05_cluster_m"].choices, (1,))
+
+    @onlyBackends(["cute"])
+    def test_cute_tcgen05_user_config_num_epi_warps_validation(self) -> None:
+        """A user-supplied ``helion.Config(..., tcgen05_num_epi_warps=N)``
+        must be rejected by ``normalize()`` for any N != 4 once the
+        matmul path has narrowed the validation accept-set to ``(4,)``.
+        ``num_epi_warps != 4`` produces silent wrong output today, so
+        accepting an explicit user value would silently miscompute —
+        the validation tightening is the only loud signal for a user
+        bypassing autotune. The legal value 4 must still round-trip.
+        """
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_mma(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        args = (
+            torch.randn([256, 64], device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn([64, 128], device=DEVICE, dtype=HALF_DTYPE),
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_mma.bind(args)
+        spec = bound.config_spec
+        # Both the search and validation accept-sets are narrowed to (4,).
+        self.assertEqual(spec._tcgen05_num_epi_warps_search_choices, (4,))
+        self.assertEqual(spec._tcgen05_num_epi_warps_validation_choices, (4,))
+        # Non-4 values are rejected: silent wrong output on the
+        # current SIMT-store epilogue.
+        for n_epi in (1, 2, 3):
+            cfg = helion.Config(
+                block_sizes=[128, 16, 16],
+                tcgen05_num_epi_warps=n_epi,
+            )
+            with self.assertRaises(InvalidConfig):
+                spec.normalize(cfg)
+        # The validated value still round-trips unchanged.
+        cfg = helion.Config(
+            block_sizes=[128, 16, 16],
+            tcgen05_num_epi_warps=4,
+        )
+        spec.normalize(cfg)
+        self.assertEqual(cfg.config["tcgen05_num_epi_warps"], 4)
+
+    @onlyBackends(["cute"])
+    def test_cute_tcgen05_minimize_normalize_round_trip(self) -> None:
+        """The autotuner minimizes the winning config by stripping values
+        that match ``default_config()`` (built from the *search* view),
+        and the cached/minimized config is later re-expanded by
+        ``normalize()``. If the fill-missing branch in normalize() used
+        the validation-view default instead of the search-view default,
+        the narrowed ``tcgen05_num_epi_warps=4`` choice would silently
+        round-trip back to ``4`` only by accident (the validation
+        IntegerFragment default also happens to be 4 today). Pin the
+        search-view default routing so that, when the search view's
+        default later diverges from the validation-view default again
+        (e.g. when item 2 lifts the narrowing back to a smaller value),
+        normalize() picks up the search-view default instead of the
+        validation default.
+        """
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_mma(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        args = (
+            torch.randn([256, 64], device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn([64, 128], device=DEVICE, dtype=HALF_DTYPE),
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_mma.bind(args)
+        spec = bound.config_spec
+        # The narrowed search default is what default_config() exposes.
+        default_cfg = spec.default_config()
+        self.assertEqual(default_cfg.config["tcgen05_num_epi_warps"], 4)
+        # Simulate the autotuner's minimize step: a winning config of 4
+        # matches the search-view default and gets stripped.
+        winning = helion.Config(**default_cfg.config)
+        minimized = winning.minimize(spec)
+        self.assertNotIn("tcgen05_num_epi_warps", minimized.config)
+        # Re-normalizing the minimized config (what happens on the next
+        # to_code() call after a cache reload) must restore the same
+        # effective value via the search-view fill-missing branch.
+        spec.normalize(minimized)
+        self.assertEqual(minimized.config["tcgen05_num_epi_warps"], 4)
+        # Now simulate a future state where the search-view default
+        # diverges from the validation-view default. Restrict the
+        # search to (2,) (interior of the validation range) and confirm
+        # that the fill-missing branch picks up the search-view default
+        # of 2 rather than the validation-view default of 4. To do
+        # this we must also lift the validation narrowing so that 2 is
+        # a legal user-supplied value (otherwise constructing the
+        # ``helion.Config(tcgen05_num_epi_warps=2)`` below would be
+        # rejected by ``normalize``'s validation pass).
+        spec._tcgen05_num_epi_warps_validation_choices = None
+        spec.restrict_tcgen05_num_epi_warps_search((2,))
+        new_default = spec.default_config()
+        self.assertEqual(new_default.config["tcgen05_num_epi_warps"], 2)
+        winning_2 = helion.Config(**new_default.config)
+        minimized_2 = winning_2.minimize(spec)
+        self.assertNotIn("tcgen05_num_epi_warps", minimized_2.config)
+        spec.normalize(minimized_2)
+        self.assertEqual(minimized_2.config["tcgen05_num_epi_warps"], 2)
 
 
 @onlyBackends(["pallas"])

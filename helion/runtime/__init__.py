@@ -3,7 +3,9 @@ from __future__ import annotations
 from contextlib import suppress
 import contextvars
 import linecache
+import os
 import sys
+from typing import TYPE_CHECKING
 from typing import Any
 from typing import cast
 
@@ -15,6 +17,9 @@ from .._utils import triton_is_available
 from .config import Config as Config
 from .kernel import Kernel as Kernel
 from .kernel import kernel as kernel
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 _CUTLASS_SHUTDOWN_PATCHED = False
 
@@ -231,6 +236,118 @@ def _pallas_make_block_spec(
     return pl.BlockSpec(block_shape, index_map, memory_space=memory_space)  # type: ignore[union-attr]
 
 
+_CACHED_VMEM_LIMIT_BYTES: int | None = None
+
+
+def _get_vmem_limit_bytes(pltpu: object) -> int:
+    """Safely retrieves the TPU VMEM capacity without crashing on hardware locks."""
+    global _CACHED_VMEM_LIMIT_BYTES
+    if _CACHED_VMEM_LIMIT_BYTES is not None:
+        return _CACHED_VMEM_LIMIT_BYTES
+
+    try:
+        get_tpu_info = pltpu.get_tpu_info  # pyrefly: ignore[missing-attribute]
+        _CACHED_VMEM_LIMIT_BYTES = get_tpu_info().vmem_capacity_bytes
+    except Exception:
+        # Fallback if JAX fails to acquire the TPU backend lock (e.g., in a precompile fork).
+        # Default to 16MB (safe baseline for v4 and v5e per-core VMEM).
+        _CACHED_VMEM_LIMIT_BYTES = 16 * 1024 * 1024
+
+    return _CACHED_VMEM_LIMIT_BYTES
+
+
+def _estimate_pallas_vmem_bytes(
+    pl: object,
+    pltpu: object,
+    in_specs: list[object] | None,
+    out_specs: list[object] | object | None,
+    scratch_shapes: list[object] | list[Any] | None,
+    args: tuple[object, ...],
+    tensor_arg_indices: list[int],
+    output_indices: list[int],
+    pallas_aliases: dict[int, int] | None,
+) -> int:
+    """Estimates the VMEM required by the Pallas kernel."""
+    total_bytes = 0
+    in_spec_bytes = [0] * len(tensor_arg_indices)
+    out_spec_bytes = [0] * len(output_indices)
+
+    def _bytes_per_element(t: object) -> int:
+        import torch
+
+        if isinstance(t, torch.Tensor):
+            return t.element_size()
+
+        dtype = getattr(t, "dtype", None)
+        if dtype is not None:
+            # Works for torch.dtype and np.dtype/jnp.dtype
+            itemsize = getattr(dtype, "itemsize", None)
+            if itemsize is not None:
+                return itemsize
+
+        return 4
+
+    if in_specs:
+        for i, idx in enumerate(tensor_arg_indices):
+            spec = in_specs[i]
+            # pl.BlockSpec will have block_shape and memory_space.
+            # HBM is pl.ANY. We only count VMEM (which is not pl.ANY).
+            if spec is not None and getattr(spec, "memory_space", None) is not getattr(
+                pl, "ANY", None
+            ):
+                block_shape = getattr(spec, "block_shape", None)
+                if block_shape is not None:
+                    numel = 1
+                    for d in block_shape:
+                        numel *= int(d)
+                    in_spec_bytes[i] = numel * _bytes_per_element(args[idx])
+
+    if out_specs:
+        out_specs_list = (
+            out_specs if isinstance(out_specs, (list, tuple)) else [out_specs]
+        )
+        for i, idx in enumerate(output_indices):
+            if i < len(out_specs_list):
+                spec = out_specs_list[i]
+                if spec is not None and getattr(
+                    spec, "memory_space", None
+                ) is not getattr(pl, "ANY", None):
+                    block_shape = getattr(spec, "block_shape", None)
+                    if block_shape is not None:
+                        numel = 1
+                        for d in block_shape:
+                            numel *= int(d)
+                        out_spec_bytes[i] = numel * _bytes_per_element(args[idx])
+
+    pallas_aliases = pallas_aliases or {}
+    aliased_out_positions = set()
+    for in_pos, out_pos in pallas_aliases.items():
+        aliased_out_positions.add(out_pos)
+        if in_pos < len(in_spec_bytes) and out_pos < len(out_spec_bytes):
+            in_spec_bytes[in_pos] = max(in_spec_bytes[in_pos], out_spec_bytes[out_pos])
+
+    for out_pos in aliased_out_positions:
+        if out_pos < len(out_spec_bytes):
+            out_spec_bytes[out_pos] = 0
+
+    # Pallas pipelines and default launchers natively double buffer their BlockSpecs.
+    multiplier = 2
+    total_bytes += sum(in_spec_bytes) * multiplier
+    total_bytes += sum(out_spec_bytes) * multiplier
+
+    if scratch_shapes:
+        for scratch in scratch_shapes:
+            if type(scratch).__name__ == "VMEM":
+                numel = 1
+                shape = getattr(scratch, "shape", ())
+                for d in shape:
+                    numel *= int(d)
+                dtype_size = getattr(getattr(scratch, "dtype", None), "itemsize", 4)
+                total_bytes += numel * dtype_size
+
+    return total_bytes
+
+
 # Per-tensor block spec info: see ``_pallas_make_block_spec``.
 # grid_dims entries are int (direct grid dim), tuple (flat decomposition),
 # or None (untiled dim).
@@ -249,47 +366,45 @@ def _pallas_build_block_specs(
     output_indices: list[int],
     block_spec_info: _BlockSpecInfo | None = None,
     _smem_arg_indices: list[int] | None = None,
-    _output_only_set: set[int] | None = None,
+    output_only_indices: list[int] | None = None,
 ) -> tuple[list[object] | None, object | None]:
     """Build ``in_specs`` and ``out_specs`` for ``pl.pallas_call``.
 
-    Output-only tensors (in ``_output_only_set``) get HBM in_specs
-    to avoid VMEM pressure while keeping VMEM out_specs for writes.
+    ``block_spec_info`` is indexed by position among *all* tensor args.
+    ``output_only_indices`` lists tensor positions excluded from
+    ``tensor_arg_indices``; they are merged back to compute the mapping.
     """
     if block_spec_info is None or len(grid) == 0:
         return None, None
 
-    output_only_set = _output_only_set or set()
+    all_positions = sorted(set(tensor_arg_indices) | set(output_only_indices or []))
+    all_arg_to_tensor_pos = {orig: tpos for tpos, orig in enumerate(all_positions)}
 
     in_specs = []
-    for tensor_pos, idx in enumerate(tensor_arg_indices):
+    for idx in tensor_arg_indices:
         t = args[idx]
         assert isinstance(t, torch.Tensor)
-        if idx in output_only_set:
-            in_specs.append(pl.BlockSpec(memory_space=pl.ANY))  # type: ignore[union-attr]
-        else:
-            should_use_smem = tensor_pos in (_smem_arg_indices or [])
-            in_specs.append(
-                _pallas_make_block_spec(
-                    pl, jnp, pltpu, t, block_spec_info[tensor_pos], should_use_smem
-                )
+        tensor_pos = all_arg_to_tensor_pos[idx]
+        should_use_smem = tensor_pos in (_smem_arg_indices or [])
+        in_specs.append(
+            _pallas_make_block_spec(
+                pl, jnp, pltpu, t, block_spec_info[tensor_pos], should_use_smem
             )
+        )
 
-    arg_to_tensor_pos = {orig: tpos for tpos, orig in enumerate(tensor_arg_indices)}
     out_specs_list = []
     for idx in output_indices:
         t = args[idx]
         assert isinstance(t, torch.Tensor)
-        # Output-only tensors keep VMEM out_specs so the kernel can write
-        # to them; only their in_specs use HBM to avoid VMEM pressure.
-        should_use_smem = arg_to_tensor_pos[idx] in (_smem_arg_indices or [])
+        tensor_pos = all_arg_to_tensor_pos[idx]
+        should_use_smem = tensor_pos in (_smem_arg_indices or [])
         out_specs_list.append(
             _pallas_make_block_spec(
                 pl,
                 jnp,
                 pltpu,
                 t,
-                block_spec_info[arg_to_tensor_pos[idx]],
+                block_spec_info[tensor_pos],
                 should_use_smem,
             )
         )
@@ -306,27 +421,33 @@ def _pallas_build_pipeline_specs(
     args: tuple[object, ...],
     tensor_arg_indices: list[int],
     output_indices: list[int],
-    block_spec_info: _BlockSpecInfo | None,
+    block_spec_info: _BlockSpecInfo,
     pipeline_arg_indices: list[int] | None,
+    output_only_indices: list[int] | None = None,
+    smem_arg_indices: list[int] | None = None,
 ) -> tuple[list[object], object]:
     """Build in/out specs for pipeline launchers.
 
     Pipeline-body tensors (listed in *pipeline_arg_indices*) get HBM refs.
     All other tensors get proper BlockSpecs for automatic VMEM prefetch.
+    Tensors in *smem_arg_indices* (only ever accessed by scalar index, e.g.
+    group offset tables) are placed in SMEM so dynamic scalar reads don't
+    require 128-lane alignment proofs against a small VMEM ref.
     """
     pipeline_set = set(pipeline_arg_indices or [])
-    arg_to_tpos = {orig: tpos for tpos, orig in enumerate(tensor_arg_indices)}
+    smem_set = set(smem_arg_indices or [])
+    all_positions = sorted(set(tensor_arg_indices) | set(output_only_indices or []))
+    arg_to_tpos = {orig: tpos for tpos, orig in enumerate(all_positions)}
 
     def _spec_for(idx: int) -> object:
         if idx in pipeline_set:
             return pl.BlockSpec(memory_space=pltpu.HBM)  # type: ignore[union-attr]
-        if block_spec_info is not None:
-            t = args[idx]
-            assert isinstance(t, torch.Tensor)
-            return _pallas_make_block_spec(
-                pl, jnp, pltpu, t, block_spec_info[arg_to_tpos[idx]]
-            )
-        return pl.BlockSpec(memory_space=pl.ANY)  # type: ignore[union-attr]
+        tpos = arg_to_tpos[idx]
+        t = args[idx]
+        assert isinstance(t, torch.Tensor)
+        return _pallas_make_block_spec(
+            pl, jnp, pltpu, t, block_spec_info[tpos], tpos in smem_set
+        )
 
     in_specs = [_spec_for(idx) for idx in tensor_arg_indices]
     out_specs_list = [_spec_for(idx) for idx in output_indices]
@@ -347,6 +468,21 @@ def _jax_placeholder_for_tensor(t: torch.Tensor) -> object:
     return jax.ShapeDtypeStruct(tuple(t.shape), jax_dtype)
 
 
+def _pallas_jnp_dtype_map() -> dict[str, object]:
+    import jax.numpy as jnp
+
+    return {
+        "jnp.float32": jnp.float32,
+        "jnp.float16": jnp.float16,
+        "jnp.bfloat16": jnp.bfloat16,
+        "jnp.int32": jnp.int32,
+        "jnp.int16": jnp.int16,
+        "jnp.int8": jnp.int8,
+        "jnp.uint8": jnp.uint8,
+        "jnp.bool_": jnp.bool_,
+    }
+
+
 def _pallas_check_dtypes(args: tuple[object, ...]) -> None:
     """Raise if any tensor arg uses a dtype unsupported on TPU."""
     from .._compiler.backend import _PALLAS_UNSUPPORTED_DTYPES
@@ -362,25 +498,24 @@ def _pallas_check_dtypes(args: tuple[object, ...]) -> None:
 def _pallas_prepare_args(
     args: tuple[object, ...],
     _output_indices: list[int],
+    _inplace_indices: list[int] | None = None,
 ) -> tuple[
-    set[int],
+    list[int],
     list[int],
     dict[int, object],
     int,
     dict[int, int],
-    list[object],
     set[int],
     tuple[object, ...],
 ]:
     """Extract and organize tensor/non-tensor args for Pallas launchers.
 
     Returns a tuple of:
-    - output_set: set of output arg positions
-    - tensor_arg_indices: positions of tensor args
+    - tensor_arg_indices: positions of tensor args passed as pallas_call inputs
+    - output_only_indices: positions of output-only tensors (excluded from inputs)
     - non_tensor_args: mapping of non-tensor arg positions to values
-    - n_tensor_inputs: count of tensor args
+    - n_tensor_inputs: count of tensor inputs (excl. output-only)
     - arg_to_tensor_pos: mapping from original position to tensor-only position
-    - outputs: list of output tensors
     - inplace_positions: positions that are both input and output
     - out_shapes: JAX placeholders for output shapes
     """
@@ -396,25 +531,29 @@ def _pallas_prepare_args(
         placeholder_fn = jax_placeholder
 
     output_set = set(_output_indices)
-    tensor_arg_indices = [
+    inplace_set = set(_inplace_indices) if _inplace_indices is not None else output_set
+    output_only = output_set - inplace_set
+
+    all_tensor_positions = [
         i for i in range(len(args)) if isinstance(args[i], torch.Tensor)
     ]
+    output_only_indices = [i for i in all_tensor_positions if i in output_only]
+    tensor_arg_indices = [i for i in all_tensor_positions if i not in output_only]
+
     non_tensor_args: dict[int, object] = {
         i: args[i] for i in range(len(args)) if not isinstance(args[i], torch.Tensor)
     }
     n_tensor_inputs = len(tensor_arg_indices)
     arg_to_tensor_pos = {orig: tpos for tpos, orig in enumerate(tensor_arg_indices)}
-    outputs = [args[i] for i in _output_indices]
     inplace_positions = output_set & set(tensor_arg_indices)
-    out_shapes = tuple(placeholder_fn(out) for out in outputs)  # type: ignore[arg-type]
+    out_shapes = tuple(placeholder_fn(args[i]) for i in _output_indices)  # type: ignore[arg-type]
 
     return (
-        output_set,
         tensor_arg_indices,
+        output_only_indices,
         non_tensor_args,
         n_tensor_inputs,
         arg_to_tensor_pos,
-        outputs,
         inplace_positions,
         out_shapes,
     )
@@ -441,10 +580,9 @@ def _pallas_make_reordered_kernel(
     reordered args.
 
     *skip_inplace_copy* is a set of original-arg positions for which the
-    initial ``out_ref[...] = in_ref[...]`` copy should be skipped.  This is
-    needed for outputs backed by HBM refs (``pl.ANY``) where direct
-    load/store is not allowed.  Outputs with VMEM BlockSpecs still get the
-    copy so that ``input_output_aliases`` correctly preloads their contents.
+    initial ``out_ref[...] = in_ref[...]`` copy should be skipped.  Used by
+    pipeline/fori launchers for pipeline-body tensors backed by HBM refs
+    where direct load/store is not allowed.
     """
     _skip_copy = skip_inplace_copy or set()
 
@@ -475,7 +613,7 @@ def _pallas_make_reordered_kernel(
 def _pallas_build_callable(
     pallas_kernel: object,
     grid: tuple[int, ...],
-    jit_fn: object,
+    jit_fn: Callable[..., object],
     _output_indices: list[int],
     arg_to_tensor_pos: dict[int, int],
     tensor_arg_indices: list[int],
@@ -490,11 +628,19 @@ def _pallas_build_callable(
     """
 
     def _make_interpret_callable() -> _PallasInterpretCallable:
-        output_tensor_positions = [
-            arg_to_tensor_pos[orig_pos] for orig_pos in _output_indices
+        # Map (out_idx in _output_indices) -> tensor_pos for inplace outputs.
+        # out_idx must match jax_results ordering (all outputs), not filtered.
+        inplace_output_mapping = [
+            (out_idx, arg_to_tensor_pos[orig_pos])
+            for out_idx, orig_pos in enumerate(_output_indices)
+            if orig_pos in arg_to_tensor_pos
         ]
-        callable_obj = _PallasInterpretCallable(jit_fn, output_tensor_positions)
-        setattr(pallas_kernel, cache_attr, (grid, callable_obj, tensor_arg_indices))
+        callable_obj = _PallasInterpretCallable(jit_fn, inplace_output_mapping)
+        setattr(
+            pallas_kernel,
+            cache_attr,
+            (grid, callable_obj, tensor_arg_indices, arg_to_tensor_pos),
+        )
         return callable_obj
 
     if _pallas_interpret_flag():
@@ -509,46 +655,63 @@ def _pallas_build_callable(
 
     call_aliases: dict[int, int] = {}
     for out_idx, orig_pos in enumerate(_output_indices):
-        call_aliases[arg_to_tensor_pos[orig_pos]] = out_idx
+        if orig_pos in arg_to_tensor_pos:
+            call_aliases[arg_to_tensor_pos[orig_pos]] = out_idx
 
     jax_callable = JaxCallable(
         name=kernel_name,
-        jit_fn=jax.jit(jit_fn),  # pyrefly: ignore[no-matching-overload]
+        jit_fn=jax.jit(jit_fn),
         trace_key=f"{kernel_name}_{id(pallas_kernel)}_{grid}{trace_key_suffix}",
         input_output_aliases=call_aliases,
     )
-    setattr(pallas_kernel, cache_attr, (grid, jax_callable, tensor_arg_indices))
+    setattr(
+        pallas_kernel,
+        cache_attr,
+        (grid, jax_callable, tensor_arg_indices, arg_to_tensor_pos),
+    )
     return jax_callable
 
 
 class _PallasInterpretCallable:
     """Thin wrapper that converts torch tensors <-> JAX arrays for interpret mode.
 
-    ``pallas_call`` with ``input_output_aliases`` returns new JAX arrays for the
-    outputs.  This wrapper copies those results back into the original torch
-    output tensors (identified by ``output_tensor_positions``).
+    In interpret mode, ``pallas_call`` runs on CPU and returns JAX arrays.
+    This wrapper:
+    1. Converts input torch tensors to JAX arrays
+    2. Runs the pallas_call function
+    3. For inplace outputs (donated tensors): copies JAX results back into
+       the original torch tensors via ``copy_()``
+    4. Returns raw JAX results so ``_pallas_invoke_and_return`` can
+       handle output-only tensors (which are not in the input list)
+
+    ``inplace_output_mapping`` maps each inplace output to its JAX result:
+    a list of ``(out_idx, tensor_pos)`` where ``out_idx`` indexes into
+    ``jax_results`` and ``tensor_pos`` indexes into ``input_tensors``.
     """
 
     def __init__(
         self,
-        jit_fn: object,
-        output_tensor_positions: list[int],
+        jit_fn: Callable[..., object],
+        inplace_output_mapping: list[tuple[int, int]],
     ) -> None:
         self._jit_fn = jit_fn
-        self._output_tensor_positions = output_tensor_positions
+        self._inplace_output_mapping = inplace_output_mapping
 
-    def __call__(self, *input_tensors: torch.Tensor) -> None:
+    def __call__(self, *input_tensors: torch.Tensor) -> tuple[object, ...]:
         jax_inputs = [_torch_to_jax(t) for t in input_tensors]
         jax_results = self._jit_fn(*jax_inputs)  # type: ignore[operator]
         if not isinstance(jax_results, (tuple, list)):
             jax_results = (jax_results,)
-        # Write results back into the original output tensors.
-        for out_idx, tensor_pos in enumerate(self._output_tensor_positions):
+        # Write inplace results back into the original output tensors.
+        for out_idx, tensor_pos in self._inplace_output_mapping:
             out_tensor = input_tensors[tensor_pos]
             result_data = _jax_to_torch(
                 jax_results[out_idx], device=out_tensor.device, dtype=out_tensor.dtype
             )
             out_tensor.copy_(result_data)
+        # Return JAX results so output-only tensors can be handled
+        # by _pallas_invoke_and_return.
+        return tuple(jax_results)
 
 
 def _pallas_interpret_flag() -> bool:
@@ -579,6 +742,135 @@ def _ensure_cpu_tpu_info() -> None:
         registry["cpu"] = lambda: _get_tpu_info_impl(ChipVersion.TPU_7X, 1)
 
 
+def _pallas_invoke_and_return(
+    jax_callable: object,
+    args: tuple[object, ...],
+    tensor_arg_indices: list[int],
+    arg_to_tensor_pos: dict[int, int],
+    _output_indices: list[int],
+    _ds_pad_dims: list[tuple[int, int, int, int]] | None = None,
+    _orig_output_tensors: dict[int, torch.Tensor] | None = None,
+) -> object:
+    """Run the JaxCallable and return output-only results.
+
+    Output-only tensors (those not in ``arg_to_tensor_pos``) are not passed
+    as pallas_call inputs, so the JaxCallable returns new buffers for them.
+    Returns a single tensor, a tuple of tensors, or None.
+
+    When ``_ds_pad_dims`` is provided, also handles:
+    - Copying sliced results back into original (unpadded) in-place output tensors
+    - Slicing padded output-only result tensors back to original shapes
+    """
+    input_tensors = [
+        cast("torch.Tensor", args[i]).contiguous() for i in tensor_arg_indices
+    ]
+    results = jax_callable(*input_tensors)  # type: ignore[operator]
+    if results is None:
+        return None
+    if not isinstance(results, (tuple, list)):
+        results = (results,)
+    output_only_results = []
+    for out_idx, orig_pos in enumerate(_output_indices):
+        if orig_pos not in arg_to_tensor_pos:
+            result = results[out_idx]
+            if not isinstance(result, torch.Tensor):
+                # Interpret mode: pallas_call returns JAX arrays, convert to torch.
+                # On TPU, JaxCallable returns torch tensors directly.
+                out_tensor = cast("torch.Tensor", args[orig_pos])
+                # Output-only tensors are allocated with ``device='meta'`` to
+                # avoid HBM; fall back to the first real input's device in
+                # interpret mode so the converted tensor lands somewhere real.
+                device = out_tensor.device
+                if device.type == "meta" and tensor_arg_indices:
+                    device = cast("torch.Tensor", args[tensor_arg_indices[0]]).device
+                result = _jax_to_torch(
+                    result,
+                    device=device,
+                    dtype=out_tensor.dtype,
+                )
+            output_only_results.append(result)
+
+    # Handle padding copy-back and result slicing
+    if _ds_pad_dims and _orig_output_tensors:
+        # _ds_pad_dims contains (arg_idx, dim, block_size, extra_pad).
+        # Build a map from arg_idx → [(dim, ...)] for padded output args.
+        padded_dims_by_arg: dict[int, list[int]] = {}
+        for arg_idx, dim, _bs, _extra in _ds_pad_dims:
+            if arg_idx in _orig_output_tensors:
+                padded_dims_by_arg.setdefault(arg_idx, []).append(dim)
+
+        # Copy sliced results back into original in-place output tensors.
+        # Skip output-only tensors (not in arg_to_tensor_pos) — their
+        # results come from output_only_results, not from args.
+        for arg_idx, orig_tensor in _orig_output_tensors.items():
+            if arg_idx not in arg_to_tensor_pos:
+                continue
+            dims = padded_dims_by_arg.get(arg_idx)
+            if not dims:
+                continue
+            padded = cast("torch.Tensor", args[arg_idx])
+            slices = [slice(None)] * padded.ndim
+            for dim in dims:
+                slices[dim] = slice(None, orig_tensor.shape[dim])
+            orig_tensor.copy_(padded[tuple(slices)])
+
+        # Slice padded output-only results back to original shapes
+        if output_only_results:
+            compacted_idx = 0
+            for orig_pos in _output_indices:
+                if orig_pos not in arg_to_tensor_pos:
+                    orig = _orig_output_tensors.get(orig_pos)
+                    dims = padded_dims_by_arg.get(orig_pos)
+                    if (
+                        orig is not None
+                        and dims
+                        and compacted_idx < len(output_only_results)
+                    ):
+                        t = output_only_results[compacted_idx]
+                        if isinstance(t, torch.Tensor):
+                            slices = [slice(None)] * t.ndim
+                            for dim in dims:
+                                slices[dim] = slice(None, orig.shape[dim])
+                            output_only_results[compacted_idx] = t[tuple(slices)]
+                    compacted_idx += 1
+
+    if len(output_only_results) == 1:
+        return output_only_results[0]
+    return tuple(output_only_results) if output_only_results else None
+
+
+def _pallas_apply_ds_padding(
+    args: tuple[object, ...],
+    _output_indices: list[int],
+    _ds_pad_dims: list[tuple[int, int, int, int]],
+) -> tuple[tuple[object, ...], dict[int, torch.Tensor]]:
+    """Pad tensor args so ``pl.ds(offset, block_size)`` never reads OOB.
+
+    ``_ds_pad_dims`` contains ``(arg_index, dim, block_size, extra_pad)``
+    tuples.  The pad amount is ``(-tensor.shape[dim]) % block_size +
+    extra_pad``, where *extra_pad* accounts for non-zero loop begins.
+
+    Returns the padded args tuple and a dict mapping output arg indices
+    to their original (unpadded) tensors for post-call copy-back.
+    """
+    args_list = list(args)
+    orig_output_tensors: dict[int, torch.Tensor] = {}
+    output_set = set(_output_indices)
+    for arg_idx, dim, block_size, extra_pad in _ds_pad_dims:
+        a = args_list[arg_idx]
+        if not isinstance(a, torch.Tensor):
+            continue
+        pad_amount = (-a.shape[dim]) % block_size + extra_pad
+        if pad_amount == 0:
+            continue
+        if arg_idx in output_set and arg_idx not in orig_output_tensors:
+            orig_output_tensors[arg_idx] = a
+        pad_widths = [0] * (2 * a.ndim)
+        pad_widths[2 * (a.ndim - 1 - dim) + 1] = pad_amount
+        args_list[arg_idx] = torch.nn.functional.pad(a, pad_widths)
+    return tuple(args_list), orig_output_tensors
+
+
 def default_pallas_launcher(
     pallas_kernel: object,
     grid: tuple[int, ...],
@@ -587,8 +879,9 @@ def default_pallas_launcher(
     _inplace_indices: list[int] | None = None,
     _block_spec_info: _BlockSpecInfo | None = None,
     _smem_arg_indices: list[int] | None = None,
+    _ds_pad_dims: list[tuple[int, int, int, int]] | None = None,
     **kwargs: object,
-) -> None:
+) -> object:
     """Default launcher for Pallas kernels on TPU (or CPU with interpret=True).
 
     Uses ``JaxCallable`` from ``torch_tpu`` to compile and run the Pallas
@@ -598,39 +891,37 @@ def default_pallas_launcher(
     buffers (zero-copy on TPU).
 
     Output-only tensors (in ``_output_indices`` but not in ``_inplace_indices``)
-    get HBM in_specs to avoid VMEM pressure while still being donated.
+    are excluded from pallas_call inputs to save VMEM.  Their results are
+    returned as torch tensors.
     """
     if _output_indices is None:
         _output_indices = []
+
+    _orig_output_tensors: dict[int, torch.Tensor] | None = None
+    if _ds_pad_dims:
+        args, _orig_output_tensors = _pallas_apply_ds_padding(
+            args, _output_indices, _ds_pad_dims
+        )
 
     _pallas_check_dtypes(args)
 
     cache = getattr(pallas_kernel, "_pallas_cache", None)
     if cache is not None and cache[0] == grid:
-        _, jax_callable, tensor_arg_indices = cache
+        _, jax_callable, tensor_arg_indices, arg_to_tensor_pos = cache
     else:
         from jax.experimental import pallas as pl
         from jax.experimental.pallas import tpu as pltpu
         import jax.numpy as jnp
 
         (
-            output_set,
             tensor_arg_indices,
+            output_only_indices,
             non_tensor_args,
             n_tensor_inputs,
             arg_to_tensor_pos,
-            outputs,
             inplace_positions,
             out_shapes,
-        ) = _pallas_prepare_args(args, _output_indices)
-
-        # Derive output-only set: outputs not in _inplace_indices.
-        inplace_set = (
-            set(_inplace_indices)
-            if _inplace_indices is not None
-            else set(_output_indices)
-        )
-        output_only_set = set(_output_indices) - inplace_set
+        ) = _pallas_prepare_args(args, _output_indices, _inplace_indices)
 
         in_specs, out_specs = _pallas_build_block_specs(
             pl,
@@ -642,7 +933,7 @@ def default_pallas_launcher(
             _output_indices,
             _block_spec_info,
             _smem_arg_indices,
-            output_only_set,
+            output_only_indices,
         )
 
         reordered_kernel = _pallas_make_reordered_kernel(
@@ -655,7 +946,6 @@ def default_pallas_launcher(
             inplace_positions,
             arg_to_tensor_pos,
             _smem_arg_indices=_smem_arg_indices,
-            skip_inplace_copy=output_only_set,
         )
 
         out_shape_arg = out_shapes if len(out_shapes) > 1 else out_shapes[0]
@@ -663,7 +953,26 @@ def default_pallas_launcher(
         pallas_aliases = {
             arg_to_tensor_pos[orig_pos]: out_idx
             for out_idx, orig_pos in enumerate(_output_indices)
+            if orig_pos in arg_to_tensor_pos
         }
+
+        estimated_vmem = _estimate_pallas_vmem_bytes(
+            pl,
+            pltpu,
+            in_specs,
+            out_specs,
+            None,
+            args,
+            tensor_arg_indices,
+            _output_indices,
+            pallas_aliases,
+        )
+        vmem_limit_bytes = _get_vmem_limit_bytes(pltpu)
+        if estimated_vmem > vmem_limit_bytes:
+            raise RuntimeError(
+                f"XLA:TPU compile permanent error. Ran out of memory in memory space vmem. "
+                f"Estimated {estimated_vmem / 1e6:.2f}MB exceeds {vmem_limit_bytes / 1e6:.2f}MB vmem capacity."
+            )
 
         pallas_call_kwargs: dict[str, object] = {
             "out_shape": out_shape_arg,
@@ -691,10 +1000,15 @@ def default_pallas_launcher(
             cache_attr="_pallas_cache",
         )
 
-    input_tensors = [
-        cast("torch.Tensor", args[i]).contiguous() for i in tensor_arg_indices
-    ]
-    jax_callable(*input_tensors)  # type: ignore[operator]
+    return _pallas_invoke_and_return(
+        jax_callable,
+        args,
+        tensor_arg_indices,
+        arg_to_tensor_pos,
+        _output_indices,
+        _ds_pad_dims,
+        _orig_output_tensors,
+    )
 
 
 def default_pallas_pipeline_launcher(
@@ -702,11 +1016,14 @@ def default_pallas_pipeline_launcher(
     grid: tuple[int, ...],
     *args: object,
     _output_indices: list[int] | None = None,
+    _inplace_indices: list[int] | None = None,
     _block_spec_info: _BlockSpecInfo | None = None,
     _scratch_shapes: list[tuple[tuple[int, ...], str]] | None = None,
     _pipeline_arg_indices: list[int] | None = None,
+    _ds_pad_dims: list[tuple[int, int, int, int]] | None = None,
+    _smem_arg_indices: list[int] | None = None,
     **kwargs: object,
-) -> None:
+) -> object:
     """Launcher for Pallas kernels using PrefetchScalarGridSpec with scratch memory.
 
     Used when ``pallas_loop_type='emit_pipeline'``.  Pipeline-body tensors
@@ -718,38 +1035,34 @@ def default_pallas_pipeline_launcher(
     if _scratch_shapes is None:
         _scratch_shapes = []
 
+    _orig_output_tensors: dict[int, torch.Tensor] | None = None
+    if _ds_pad_dims:
+        args, _orig_output_tensors = _pallas_apply_ds_padding(
+            args, _output_indices, _ds_pad_dims
+        )
+
     _pallas_check_dtypes(args)
 
     cache = getattr(pallas_kernel, "_pallas_pipeline_cache", None)
     if cache is not None and cache[0] == grid:
-        _, jax_callable, tensor_arg_indices = cache
+        _, jax_callable, tensor_arg_indices, arg_to_tensor_pos = cache
     else:
         from jax.experimental import pallas as pl
         from jax.experimental.pallas import tpu as pltpu
         import jax.numpy as jnp
 
         (
-            output_set,
             tensor_arg_indices,
+            output_only_indices,
             non_tensor_args,
             n_tensor_inputs,
             arg_to_tensor_pos,
-            outputs,
             inplace_positions,
             out_shapes,
-        ) = _pallas_prepare_args(args, _output_indices)
+        ) = _pallas_prepare_args(args, _output_indices, _inplace_indices)
 
         # Build scratch shapes for VMEM
-        _jnp_dtype_map: dict[str, object] = {
-            "jnp.float32": jnp.float32,
-            "jnp.float16": jnp.float16,
-            "jnp.bfloat16": jnp.bfloat16,
-            "jnp.int32": jnp.int32,
-            "jnp.int16": jnp.int16,
-            "jnp.int8": jnp.int8,
-            "jnp.uint8": jnp.uint8,
-            "jnp.bool_": jnp.bool_,
-        }
+        _jnp_dtype_map = _pallas_jnp_dtype_map()
         scratch_shapes = []
         for scratch_entry in _scratch_shapes:
             if len(scratch_entry) == 3:
@@ -765,6 +1078,9 @@ def default_pallas_pipeline_launcher(
                     pltpu.VMEM(shape, jnp_dtype)  # pyrefly: ignore[bad-argument-type]
                 )
 
+        assert _block_spec_info is not None, (
+            "emit_pipeline launcher requires _block_spec_info from codegen"
+        )
         in_specs_list, out_specs = _pallas_build_pipeline_specs(
             pl,
             jnp,
@@ -775,6 +1091,8 @@ def default_pallas_pipeline_launcher(
             _output_indices,
             _block_spec_info,
             _pipeline_arg_indices,
+            output_only_indices,
+            smem_arg_indices=_smem_arg_indices,
         )
 
         _pipeline_set = set(_pipeline_arg_indices or [])
@@ -789,6 +1107,7 @@ def default_pallas_pipeline_launcher(
             arg_to_tensor_pos,
             n_extra_refs=len(scratch_shapes),
             skip_inplace_copy=_pipeline_set,
+            _smem_arg_indices=_smem_arg_indices,
         )
 
         out_shape_arg = out_shapes if len(out_shapes) > 1 else out_shapes[0]
@@ -796,6 +1115,7 @@ def default_pallas_pipeline_launcher(
         pallas_aliases = {
             arg_to_tensor_pos[orig_pos]: out_idx
             for out_idx, orig_pos in enumerate(_output_indices)
+            if orig_pos in arg_to_tensor_pos
         }
 
         grid_spec = pltpu.PrefetchScalarGridSpec(
@@ -805,6 +1125,24 @@ def default_pallas_pipeline_launcher(
             scratch_shapes=scratch_shapes,
             grid=grid,
         )
+
+        estimated_vmem = _estimate_pallas_vmem_bytes(
+            pl,
+            pltpu,
+            in_specs_list,
+            out_specs,
+            scratch_shapes,
+            args,
+            tensor_arg_indices,
+            _output_indices,
+            pallas_aliases,
+        )
+        vmem_limit_bytes = _get_vmem_limit_bytes(pltpu)
+        if estimated_vmem > vmem_limit_bytes:
+            raise RuntimeError(
+                f"XLA:TPU compile permanent error. Ran out of memory in memory space vmem. "
+                f"Estimated {estimated_vmem / 1e6:.2f}MB exceeds {vmem_limit_bytes / 1e6:.2f}MB vmem capacity."
+            )
 
         pallas_call_kwargs: dict[str, object] = {
             "out_shape": out_shape_arg,
@@ -833,10 +1171,15 @@ def default_pallas_pipeline_launcher(
             trace_key_suffix="_pipeline",
         )
 
-    input_tensors = [
-        cast("torch.Tensor", args[i]).contiguous() for i in tensor_arg_indices
-    ]
-    jax_callable(*input_tensors)  # type: ignore[operator]
+    return _pallas_invoke_and_return(
+        jax_callable,
+        args,
+        tensor_arg_indices,
+        arg_to_tensor_pos,
+        _output_indices,
+        _ds_pad_dims,
+        _orig_output_tensors,
+    )
 
 
 def default_pallas_fori_launcher(
@@ -844,10 +1187,13 @@ def default_pallas_fori_launcher(
     grid: tuple[int, ...],
     *args: object,
     _output_indices: list[int] | None = None,
+    _inplace_indices: list[int] | None = None,
     _block_spec_info: _BlockSpecInfo | None = None,
     _scratch_shapes: list[tuple[tuple[int, ...], str | None, str]] | None = None,
+    _ds_pad_dims: list[tuple[int, int, int, int]] | None = None,
+    _smem_arg_indices: list[int] | None = None,
     **kwargs: object,
-) -> None:
+) -> object:
     """Launcher for Pallas kernels using fori_loop with manual DMA.
 
     Used when ``pallas_loop_type="fori_loop"``.  Passes all tensors as
@@ -861,38 +1207,34 @@ def default_pallas_fori_launcher(
     if _scratch_shapes is None:
         _scratch_shapes = []
 
+    _orig_output_tensors: dict[int, torch.Tensor] | None = None
+    if _ds_pad_dims:
+        args, _orig_output_tensors = _pallas_apply_ds_padding(
+            args, _output_indices, _ds_pad_dims
+        )
+
     _pallas_check_dtypes(args)
 
     cache = getattr(pallas_kernel, "_pallas_fori_cache", None)
     if cache is not None and cache[0] == grid:
-        _, jax_callable, tensor_arg_indices = cache
+        _, jax_callable, tensor_arg_indices, arg_to_tensor_pos = cache
     else:
         from jax.experimental import pallas as pl
         from jax.experimental.pallas import tpu as pltpu
         import jax.numpy as jnp
 
         (
-            output_set,
             tensor_arg_indices,
+            output_only_indices,
             non_tensor_args,
             n_tensor_inputs,
             arg_to_tensor_pos,
-            outputs,
             inplace_positions,
             out_shapes,
-        ) = _pallas_prepare_args(args, _output_indices)
+        ) = _pallas_prepare_args(args, _output_indices, _inplace_indices)
 
         # Build scratch shapes: VMEM buffers + DMA semaphores
-        _jnp_dtype_map: dict[str, object] = {
-            "jnp.float32": jnp.float32,
-            "jnp.float16": jnp.float16,
-            "jnp.bfloat16": jnp.bfloat16,
-            "jnp.int32": jnp.int32,
-            "jnp.int16": jnp.int16,
-            "jnp.int8": jnp.int8,
-            "jnp.uint8": jnp.uint8,
-            "jnp.bool_": jnp.bool_,
-        }
+        _jnp_dtype_map = _pallas_jnp_dtype_map()
         scratch_shapes = []
         for shape, dtype_str, scratch_type in _scratch_shapes:
             if scratch_type == "dma_semaphore":
@@ -907,6 +1249,9 @@ def default_pallas_fori_launcher(
         # Build in_specs/out_specs: proper BlockSpecs for outer grid dims,
         # HBM refs for tensors used in the fori_loop body (DMA handles tiling).
         _fori_pipeline_indices = kwargs.get("_pipeline_arg_indices")
+        assert _block_spec_info is not None, (
+            "fori_loop launcher requires _block_spec_info from codegen"
+        )
         in_specs_list, out_specs = _pallas_build_pipeline_specs(
             pl,
             jnp,
@@ -917,6 +1262,8 @@ def default_pallas_fori_launcher(
             _output_indices,
             _block_spec_info,
             _fori_pipeline_indices,  # type: ignore[arg-type]
+            output_only_indices,
+            smem_arg_indices=_smem_arg_indices,
         )
 
         _fori_pipeline_set = set(_fori_pipeline_indices or [])  # type: ignore[arg-type]
@@ -931,6 +1278,7 @@ def default_pallas_fori_launcher(
             arg_to_tensor_pos,
             n_extra_refs=len(scratch_shapes),
             skip_inplace_copy=_fori_pipeline_set,
+            _smem_arg_indices=_smem_arg_indices,
         )
 
         out_shape_arg = out_shapes if len(out_shapes) > 1 else out_shapes[0]
@@ -938,6 +1286,7 @@ def default_pallas_fori_launcher(
         pallas_aliases = {
             arg_to_tensor_pos[orig_pos]: out_idx
             for out_idx, orig_pos in enumerate(_output_indices)
+            if orig_pos in arg_to_tensor_pos
         }
 
         grid_spec = pltpu.PrefetchScalarGridSpec(
@@ -947,6 +1296,24 @@ def default_pallas_fori_launcher(
             scratch_shapes=scratch_shapes,
             grid=grid,
         )
+
+        estimated_vmem = _estimate_pallas_vmem_bytes(
+            pl,
+            pltpu,
+            in_specs_list,
+            out_specs,
+            scratch_shapes,
+            args,
+            tensor_arg_indices,
+            _output_indices,
+            pallas_aliases,
+        )
+        vmem_limit_bytes = _get_vmem_limit_bytes(pltpu)
+        if estimated_vmem > vmem_limit_bytes:
+            raise RuntimeError(
+                f"XLA:TPU compile permanent error. Ran out of memory in memory space vmem. "
+                f"Estimated {estimated_vmem / 1e6:.2f}MB exceeds {vmem_limit_bytes / 1e6:.2f}MB vmem capacity."
+            )
 
         pallas_call_kwargs: dict[str, object] = {
             "out_shape": out_shape_arg,
@@ -975,10 +1342,15 @@ def default_pallas_fori_launcher(
             trace_key_suffix="_fori",
         )
 
-    input_tensors = [
-        cast("torch.Tensor", args[i]).contiguous() for i in tensor_arg_indices
-    ]
-    jax_callable(*input_tensors)  # type: ignore[operator]
+    return _pallas_invoke_and_return(
+        jax_callable,
+        args,
+        tensor_arg_indices,
+        arg_to_tensor_pos,
+        _output_indices,
+        _ds_pad_dims,
+        _orig_output_tensors,
+    )
 
 
 def _torch_to_jax(t: torch.Tensor) -> object:
@@ -1007,6 +1379,10 @@ def _torch_dtype_to_cutlass(dtype: torch.dtype) -> object:
         torch.float32: cutlass.Float32,
         torch.float64: cutlass.Float64,
         torch.bfloat16: cutlass.BFloat16,
+        # CuTe does not support i1 global-memory tensors; torch.bool is stored
+        # as one byte, so pass bool tensor pointers as uint8 and let load
+        # lowering convert nonzero bytes back to cutlass.Boolean registers.
+        torch.bool: cutlass.Uint8,
         torch.int8: cutlass.Int8,
         torch.int16: cutlass.Int16,
         torch.int32: cutlass.Int32,
@@ -1037,9 +1413,143 @@ def _cute_scalar_annotation(kind: str) -> str:
     return mapping[kind]
 
 
+def _append_cute_wrapper_plan(
+    body: list[str],
+    call_args: list[str],
+    plan: dict[str, object],
+) -> None:
+    def plan_int(key: str, default: int | None = None) -> int:
+        value = plan.get(key, default) if default is not None else plan[key]
+        assert isinstance(value, int)
+        return value
+
+    kind = plan["kind"]
+    if kind != "tcgen05_ab_tma":
+        raise exc.BackendUnsupported("cute", f"wrapper plan kind: {kind}")
+
+    lhs_idx_key = "lhs_idx" if "lhs_idx" in plan else "lhsidx"
+    rhs_idx_key = "rhs_idx" if "rhs_idx" in plan else "rhsidx"
+    lhs_idx = plan_int(lhs_idx_key)
+    rhs_idx = plan_int(rhs_idx_key)
+    bm = plan_int("bm")
+    bn = plan_int("bn")
+    bk = plan_int("bk")
+    cluster_m = plan_int("cluster_m", 1)
+    cluster_n = plan_int("cluster_n", 1)
+    input_dtype = str(plan["input_dtype"])
+    acc_dtype = str(plan["acc_dtype"])
+    ab_stage_count = plan_int("ab_stage_count", 2)
+    kernel_args = [str(arg) for arg in cast("list[object]", plan["kernel_args"])]
+    assert len(kernel_args) == 4
+    tma_atom_a, tma_tensor_a, tma_atom_b, tma_tensor_b = kernel_args
+
+    cta_group = (
+        "cute.nvgpu.tcgen05.CtaGroup.TWO"
+        if cluster_m * cluster_n == 2 and bm == 256
+        else "cute.nvgpu.tcgen05.CtaGroup.ONE"
+    )
+    cluster_shape = f"({cluster_m}, {cluster_n}, 1)"
+    tiled_mma = f"{tma_atom_a}_tiled_mma"
+    cluster_layout_vmnk = f"{tma_atom_a}_cluster_layout_vmnk"
+    smem_a_layout = f"{tma_atom_a}_smem_layout"
+    smem_b_layout = f"{tma_atom_b}_smem_layout"
+    rhs_tma = f"{tma_atom_b}_rhs_tma"
+    body.extend(
+        (
+            (
+                f"    {tiled_mma} = cutlass.utils.blackwell_helpers.make_trivial_tiled_mma("
+                f"{input_dtype}, "
+                "cute.nvgpu.tcgen05.OperandMajorMode.K, "
+                "cute.nvgpu.tcgen05.OperandMajorMode.MN, "
+                f"{acc_dtype}, "
+                f"{cta_group}, "
+                f"({bm}, {bn}), "
+                "cute.nvgpu.tcgen05.OperandSource.SMEM)"
+            ),
+            (
+                f"    {cluster_layout_vmnk} = cute.tiled_divide("
+                f"cute.make_layout({cluster_shape}), ({tiled_mma}.thr_id.shape,))"
+            ),
+            (
+                f"    {smem_a_layout} = cutlass.utils.blackwell_helpers.make_smem_layout_a("
+                f"{tiled_mma}, ({bm}, {bn}, {bk}), {input_dtype}, {ab_stage_count})"
+            ),
+            (
+                f"    {smem_b_layout} = cutlass.utils.blackwell_helpers.make_smem_layout_b("
+                f"{tiled_mma}, ({bm}, {bn}, {bk}), {input_dtype}, {ab_stage_count})"
+            ),
+            (
+                f"    {rhs_tma} = cute.make_tensor("
+                f"arg{rhs_idx}.iterator, "
+                "layout=cute.make_layout("
+                f"(arg{rhs_idx}_shape1, arg{rhs_idx}_shape0), "
+                f"stride=(arg{rhs_idx}_stride1, arg{rhs_idx}_stride0)))"
+            ),
+            f"    {rhs_tma}.mark_layout_dynamic(leading_dim=0)",
+            (
+                f"    {tma_atom_a}, {tma_tensor_a} = cute.nvgpu.make_tiled_tma_atom_A("
+                "cutlass.utils.blackwell_helpers.cluster_shape_to_tma_atom_A("
+                f"{cluster_shape}, {tiled_mma}.thr_id), "
+                f"arg{lhs_idx}, "
+                f"cute.slice_({smem_a_layout}, (None, None, None, 0)), "
+                f"({bm}, {bn}, {bk}), {tiled_mma})"
+            ),
+            (
+                f"    {tma_atom_b}, {tma_tensor_b} = cute.nvgpu.make_tiled_tma_atom_B("
+                "cutlass.utils.blackwell_helpers.cluster_shape_to_tma_atom_B("
+                f"{cluster_shape}, {tiled_mma}.thr_id), "
+                f"{rhs_tma}, "
+                f"cute.slice_({smem_b_layout}, (None, None, None, 0)), "
+                f"({bm}, {bn}, {bk}), {tiled_mma}, {cluster_layout_vmnk}.shape)"
+            ),
+        )
+    )
+    call_args.extend(kernel_args)
+
+
+def _cute_cluster_shape_from_wrapper_plans(
+    wrapper_plans: list[dict[str, object]],
+) -> tuple[int, int, int] | None:
+    cluster_m = 1
+    cluster_n = 1
+    for plan in wrapper_plans:
+        if plan.get("kind") != "tcgen05_ab_tma":
+            continue
+        plan_cluster_m = plan.get("cluster_m", 1)
+        plan_cluster_n = plan.get("cluster_n", 1)
+        assert isinstance(plan_cluster_m, int)
+        assert isinstance(plan_cluster_n, int)
+        cluster_m = max(cluster_m, plan_cluster_m)
+        cluster_n = max(cluster_n, plan_cluster_n)
+    if cluster_m * cluster_n <= 1:
+        return None
+    return (cluster_m, cluster_n, 1)
+
+
+def _cute_cluster_shape(
+    cute_kernel: object, wrapper_plans: list[dict[str, object]]
+) -> tuple[int, int, int] | None:
+    explicit_cluster_shape = getattr(
+        cast("Any", cute_kernel), "_helion_cute_cluster_shape", None
+    )
+    if explicit_cluster_shape is not None:
+        if (
+            isinstance(explicit_cluster_shape, tuple)
+            and len(explicit_cluster_shape) == 3
+            and all(isinstance(dim, int) for dim in explicit_cluster_shape)
+        ):
+            return cast("tuple[int, int, int]", explicit_cluster_shape)
+        raise exc.BackendUnsupported(
+            "cute",
+            f"invalid _helion_cute_cluster_shape: {explicit_cluster_shape!r}",
+        )
+    return _cute_cluster_shape_from_wrapper_plans(wrapper_plans)
+
+
 def _create_cute_wrapper(
     cute_kernel: object,
     schema_key: tuple[tuple[object, ...], ...],
+    block: tuple[int, int, int],
 ) -> object:
     _patch_cutlass_jit_shutdown_unload()
     import cutlass
@@ -1087,17 +1597,24 @@ def _create_cute_wrapper(
             "grid_x: cutlass.Int32",
             "grid_y: cutlass.Int32",
             "grid_z: cutlass.Int32",
-            "block_x: cutlass.Int32",
-            "block_y: cutlass.Int32",
-            "block_z: cutlass.Int32",
         )
     )
+    wrapper_plans = [
+        cast("dict[str, object]", plan)
+        for plan in getattr(cast("Any", cute_kernel), "_helion_cute_wrapper_plans", [])
+    ]
+    for plan in wrapper_plans:
+        _append_cute_wrapper_plan(body, call_args, plan)
+    launch_suffix = f", block={block!r}"
+    cluster_shape = _cute_cluster_shape(cute_kernel, wrapper_plans)
+    if cluster_shape is not None:
+        launch_suffix += f", cluster={list(cluster_shape)!r}"
     body.extend(
         (
             f"    _helion_cute_kernel_tag = {kernel_tag!r}",
             "    _kernel("
             + ", ".join(call_args)
-            + ").launch(grid=(grid_x, grid_y, grid_z), block=(block_x, block_y, block_z))",
+            + f").launch(grid=(grid_x, grid_y, grid_z){launch_suffix})",
         )
     )
 
@@ -1114,7 +1631,7 @@ def _create_cute_wrapper(
         "cute": cute,
         "_kernel": cute_kernel,
     }
-    filename = f"<helion_cute_launcher:{kernel_tag}:{schema_key!r}>"
+    filename = f"<helion_cute_launcher:{kernel_tag}:{schema_key!r}:{block!r}>"
     linecache.cache[filename] = (
         len(source),
         None,
@@ -1125,10 +1642,36 @@ def _create_cute_wrapper(
     return namespace[func_name]
 
 
+class _CompiledCuteLauncher:
+    """Lazily compile a Helion ``@cute.jit`` wrapper via ``cute.compile``.
+
+    The first call uses ``cute.compile(jit_func, *args)`` to produce a compiled
+    callable; subsequent calls invoke the compiled callable directly. This
+    bypasses the per-launch ``@cute.jit`` argument-handling/dispatch path,
+    matching Quack's pattern (see ``gemm_tvm_ffi_utils.py``). On B200 this
+    collapses ~200ms of per-launch host overhead into ~0.1ms.
+    """
+
+    __slots__ = ("_compiled", "_jit_func")
+
+    def __init__(self, jit_func: object) -> None:
+        self._jit_func = jit_func
+        self._compiled: object = None
+
+    def __call__(self, *args: object) -> object:
+        compiled = self._compiled
+        if compiled is None:
+            import cutlass.cute as cute
+
+            compiled = cute.compile(self._jit_func, *args)
+            self._compiled = compiled
+        return cast("Any", compiled)(*args)
+
+
 def _get_compiled_cute_launcher(
     cute_kernel: object,
     schema_key: tuple[tuple[object, ...], ...],
-    launch_args: tuple[object, ...],
+    block: tuple[int, int, int],
 ) -> object:
     try:
         # pyrefly: ignore [missing-attribute]
@@ -1137,24 +1680,33 @@ def _get_compiled_cute_launcher(
         cache = {}
         # pyrefly: ignore [missing-attribute]
         cute_kernel._helion_cute_compiled_launchers = cache
-    cached = cache.get(schema_key)
+    wrapper_plans = tuple(
+        repr(plan)
+        for plan in getattr(cast("Any", cute_kernel), "_helion_cute_wrapper_plans", [])
+    )
+    cluster_shape = getattr(
+        cast("Any", cute_kernel), "_helion_cute_cluster_shape", None
+    )
+    cache_key = (schema_key, block, wrapper_plans, repr(cluster_shape))
+    cached = cache.get(cache_key)
     if cached is not None:
         return cached
 
-    wrapper = _create_cute_wrapper(cute_kernel, schema_key)
-    cache[schema_key] = wrapper
-    return wrapper
+    jit_func = _create_cute_wrapper(cute_kernel, schema_key, block)
+    launcher = _CompiledCuteLauncher(jit_func)
+    cache[cache_key] = launcher
+    return launcher
 
 
 def _build_cute_schema_and_args(
     args: tuple[object, ...],
     grid: tuple[int, int, int],
-    block: tuple[int, int, int],
 ) -> tuple[tuple[tuple[object, ...], ...], tuple[object, ...]]:
     _patch_cutlass_jit_shutdown_unload()
     import cutlass.cute as cute
     from cutlass.cute.runtime import make_ptr
 
+    _ensure_cute_dsl_arch_env(args)
     schema: list[tuple[object, ...]] = []
     launch_args: list[object] = []
     for arg in args:
@@ -1182,8 +1734,28 @@ def _build_cute_schema_and_args(
         schema.append(("scalar", scalar_kind))
         launch_args.append(scalar_value)
 
-    launch_args.extend((*grid, *block))
+    launch_args.extend(grid)
     return tuple(schema), tuple(launch_args)
+
+
+def _ensure_cute_dsl_arch_env(args: tuple[object, ...]) -> None:
+    tensor_args = [arg for arg in args if isinstance(arg, torch.Tensor)]
+    if tensor_args:
+        device = tensor_args[0].device
+        if device.type != "cuda":
+            return
+        with torch.cuda.device(device):
+            major, minor = torch.cuda.get_device_capability(device)
+    elif not torch.cuda.is_available():
+        return
+    else:
+        major, minor = torch.cuda.get_device_capability()
+    # CUTLASS DSL distinguishes post-Hopper arch variants such as sm_90a/sm_100a,
+    # while torch.cuda.get_device_capability() only returns major/minor.
+    suffix = "a" if major >= 9 else ""
+    desired = f"sm_{major}{minor}{suffix}"
+    if os.environ.get("CUTE_DSL_ARCH") != desired:
+        os.environ["CUTE_DSL_ARCH"] = desired
 
 
 def default_cute_launcher(
@@ -1214,10 +1786,8 @@ def default_cute_launcher(
     if any(dim <= 0 for dim in grid_xyz):
         return None
 
-    schema_key, launch_args = _build_cute_schema_and_args(
-        tuple(args), grid_xyz, block_xyz
-    )
-    compiled = _get_compiled_cute_launcher(cute_kernel, schema_key, launch_args)
+    schema_key, launch_args = _build_cute_schema_and_args(tuple(args), grid_xyz)
+    compiled = _get_compiled_cute_launcher(cute_kernel, schema_key, block_xyz)
     return cast("Any", compiled)(*launch_args)
 
 

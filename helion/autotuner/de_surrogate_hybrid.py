@@ -175,7 +175,7 @@ class DESurrogateHybrid(DifferentialEvolutionSearch):
         self.generations_without_improvement = 0
 
         # Evolution loop
-        for gen in range(2, self.max_generations + 1):
+        for gen in self._budgeted_range(2, self.max_generations + 1):
             self.set_generation(gen)
             self._evolve_generation(gen)
 
@@ -215,7 +215,7 @@ class DESurrogateHybrid(DifferentialEvolutionSearch):
             selected_candidates = self._generate_de_candidates(self.population_size)
 
         # Evaluate selected candidates
-        new_members = self.parallel_benchmark_flat(selected_candidates)
+        new_members = self.benchmark_flat_batch(selected_candidates)
 
         # Track observations
         for member in new_members:

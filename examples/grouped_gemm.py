@@ -212,9 +212,7 @@ def grouped_gemm_jagged_persistent(
                             b_blk = hl.load(
                                 B,
                                 [k_idx, col_idx],
-                                extra_mask=cols_valid[
-                                    None, :
-                                ],  # pyrefly: ignore[bad-index]
+                                extra_mask=cols_valid[None, :],  # pyrefly: ignore[bad-index]
                             )
 
                             # Perform tile-level matrix multiplication and accumulate

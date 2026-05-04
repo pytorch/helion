@@ -13,11 +13,6 @@ on:
         required: false
         type: boolean
         default: true
-      run_mi325x:
-        description: 'Run benchmark on MI325X'
-        required: false
-        type: boolean
-        default: false
       run_mi350x:
         description: 'Run benchmark on MI350X'
         required: false
@@ -94,33 +89,6 @@ jobs:
       env-vars: ${{ github.event.inputs.env_vars }}
       custom-args: ${{ github.event.inputs.custom_args }}
 
-  gen-matrix-mi325x:
-    uses: ./.github/workflows/compute-benchmark-matrix.yml
-    if: ${{ github.event.inputs.run_mi325x == 'true' }}
-    with:
-      max-runners: 6
-      kernels: ${{ github.event.inputs.kernels }}
-
-  run-mi325x:
-    needs: gen-matrix-mi325x
-    uses: ./.github/workflows/benchmark.yml
-    strategy:
-      fail-fast: false
-      matrix: ${{ fromJSON(needs.gen-matrix-mi325x.outputs.matrix) }}
-    permissions:
-      id-token: write
-      contents: read
-    with:
-      runner: linux.rocm.gpu.gfx942.1
-      python-version: "3.12"
-      image: rocm/dev-ubuntu-24.04:7.1.1-complete
-      runtime-version: rocm7.1
-      container-options: --device=/dev/kfd --device=/dev/dri
-      alias: mi325x
-      kernels: ${{ matrix.kernels }}
-      env-vars: ${{ github.event.inputs.env_vars }}
-      custom-args: ${{ github.event.inputs.custom_args }}
-
   gen-matrix-mi350x:
     uses: ./.github/workflows/compute-benchmark-matrix.yml
     if: ${{ github.event.inputs.run_mi350x == 'true' }}
@@ -147,3 +115,22 @@ jobs:
       kernels: ${{ matrix.kernels }}
       env-vars: ${{ github.event.inputs.env_vars }}
       custom-args: ${{ github.event.inputs.custom_args }}
+
+  trigger-docs-deploy:
+    if: always()
+    needs: [run-b200, run-h100, run-mi350x]
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - name: Trigger docs deploy
+        uses: actions/github-script@v9
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'docs-deploy.yml',
+              ref: 'main'
+            })

@@ -77,6 +77,8 @@ if TYPE_CHECKING:
     from collections.abc import Iterable
     from collections.abc import Sequence
 
+    from .cute.layout import CuTeGridExecutionPlan
+
     class _TLS(Protocol):
         device_irs: list[DeviceIR]
 
@@ -249,6 +251,7 @@ class GraphInfo:
 @dataclasses.dataclass
 class RootGraphInfo(GraphInfo):
     phase_index: int = 0
+    cute_grid_execution_plans: tuple[CuTeGridExecutionPlan, ...] = ()
 
     def kwargs(self) -> dict[str, object]:
         return {
@@ -640,12 +643,13 @@ class DeviceIR:
                 continue
             if used_graphs & graphs_with_rolled_rdim:
                 continue
-            env.config_spec.reduction_loops.append(
-                ReductionLoopSpec(
-                    block_id=rdim.block_id,
-                    size_hint=rdim.size_hint(),
+            if env.backend_name != "pallas":
+                env.config_spec.reduction_loops.append(
+                    ReductionLoopSpec(
+                        block_id=rdim.block_id,
+                        size_hint=rdim.size_hint(),
+                    )
                 )
-            )
             graphs_with_rolled_rdim |= used_graphs
 
     def build_codegen_graphs(self, config: Config) -> list[GraphInfo]:
@@ -1070,7 +1074,7 @@ class WalkDeviceAST(NodeVisitor):
                     step = [None] * len(iter_vars)
             else:
                 if isinstance(inner_type, JaggedTileIndexType):
-                    # hl.jagged_tile takes a 1D parent tensor, not a scalar bound.
+                    # hl.jagged_tile takes an N-D parent tensor, not a scalar bound.
                     assert isinstance(end, torch.Tensor)
                     jagged_parent = end
 
@@ -1078,7 +1082,9 @@ class WalkDeviceAST(NodeVisitor):
                     # _setup_mask uses that parent tensor to recover each lane's true end.
                     assert inputs.flat_values[0] is jagged_parent
 
-                    end = torch.amax(jagged_parent)
+                    # Flatten so the global max becomes a single-axis reduction —
+                    # Inductor only supports one reduction dim per buffer.
+                    end = torch.amax(jagged_parent.reshape(-1))
 
                 iter_vars = [inner_type]
                 begin = [0] if begin is None else [begin]
@@ -1527,16 +1533,26 @@ class WalkDeviceAST(NodeVisitor):
             return None
         if not isinstance(target, ast.Subscript):
             raise exc.InvalidAssignment
+        assert isinstance(target, ExtendedAST)
+        assert isinstance(target.value, ExtendedAST)
+        assert target.value._type_info is not None
+        # Handle list element assignment (e.g., cached[i] = tensor in static_range)
+        if isinstance(target.value._type_info, SequenceType):
+            index_value = self.visit(target.slice)
+            if not isinstance(index_value, int):
+                raise exc.InvalidSequenceSubscription(target.slice)
+            val = self.visit(node.value)
+            base_list = self.visit(target.value)
+            assert isinstance(base_list, list)
+            base_list[index_value] = val
+            return None
         assert isinstance(node.value, ExtendedAST)
         rhs_type = node.value._type_info
-        assert isinstance(target, ExtendedAST)
         lhs_type = target._type_info
         if not isinstance(lhs_type, TensorType) or not isinstance(
             rhs_type, (TensorType, NumericType, LiteralType)
         ):
             raise exc.NonTensorSubscriptAssign(lhs_type, rhs_type)
-        assert isinstance(target.value, ExtendedAST)
-        assert target.value._type_info is not None
         target_origin = target.value._type_info.origin
         if not target_origin.is_host() and not isinstance(
             target.value._type_info, StackTensorType
@@ -1910,6 +1926,12 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
 
         for graph in device_ir.graphs:
             rewrite_implicit_random_ops(graph.graph)
+        if CompileEnvironment.current().backend.name == "cute":
+            promotions = collect_cute_half_atomic_output_promotions(device_ir.graphs)
+            if promotions:
+                host_fn = HostFunction.current()
+                rewrite_cute_half_atomic_output_allocations(host_fn, promotions)
+                promote_cute_root_graph_host_tensors(device_ir.graphs, promotions)
         for graph in device_ir.graphs:
             prepare_graph_lowerings(graph.graph)
         for graph in device_ir.graphs:
@@ -2115,3 +2137,151 @@ def remove_unnecessary_tile_index(graph: torch.fx.Graph) -> None:
                 user.args = tuple(new_args)
         if len(node.users) == 0:
             graph.erase_node(node)
+
+
+def collect_cute_half_atomic_output_promotions(
+    graph_infos: list[GraphInfo],
+) -> dict[str, torch.dtype]:
+    from ..language import atomic_add
+    from ..language._tracing_ops import _host_tensor
+    from .variable_origin import ArgumentOrigin
+
+    promotions: dict[str, torch.dtype] = {}
+    host_fn = HostFunction.current()
+    host_tensor_nodes: dict[str, list[torch.fx.Node]] = {}
+
+    for graph_info in graph_infos:
+        for node in graph_info.graph.nodes:
+            if node.op == "call_function" and node.target is _host_tensor:
+                target_name = node.args[0]
+                if isinstance(target_name, str):
+                    host_tensor_nodes.setdefault(target_name, []).append(node)
+
+    def is_promotable_target(node: torch.fx.Node) -> bool:
+        target_val = node.meta.get("val")
+        if (
+            not isinstance(target_val, torch.Tensor)
+            or target_val.dtype != torch.float16
+        ):
+            return False
+        origin = host_fn.tensor_to_origin.get(target_val)
+        if origin is None or isinstance(origin, ArgumentOrigin):
+            return False
+        if not node.users:
+            return False
+        for user in node.users:
+            if user.op != "call_function" or user.target is not atomic_add:
+                return False
+            if len(user.args) < 3 or user.args[0] is not node or len(user.users) != 0:
+                return False
+            value_node = user.args[2]
+            if not isinstance(value_node, torch.fx.Node):
+                return False
+            value_val = value_node.meta.get("val")
+            if not isinstance(value_val, torch.Tensor) or value_val.dtype not in (
+                torch.float16,
+                torch.float32,
+            ):
+                return False
+        return True
+
+    for target_name, nodes in host_tensor_nodes.items():
+        if all(is_promotable_target(node) for node in nodes):
+            promotions[target_name] = torch.float16
+
+    return promotions
+
+
+def rewrite_cute_half_atomic_output_allocations(
+    host_fn: HostFunction,
+    promotions: dict[str, torch.dtype],
+) -> None:
+    torch_factory_names = {
+        "empty",
+        "empty_like",
+        "full",
+        "full_like",
+        "ones",
+        "ones_like",
+        "zeros",
+        "zeros_like",
+    }
+
+    def dtype_expr(dtype: torch.dtype) -> ast.expr:
+        expr = expr_from_string(f"torch.{str(dtype).split('.', 1)[1]}")
+        assert isinstance(expr, ast.expr)
+        return expr
+
+    def is_torch_factory_call(call: ast.Call) -> bool:
+        return (
+            isinstance(call.func, ast.Attribute)
+            and call.func.attr in torch_factory_names
+            and isinstance(call.func.value, ast.Name)
+            and call.func.value.id == "torch"
+        )
+
+    def rewrite_allocation_dtype(call: ast.Call) -> None:
+        dtype = dtype_expr(torch.float32)
+        for kwarg in call.keywords:
+            if kwarg.arg == "dtype":
+                kwarg.value = dtype
+                return
+        if is_torch_factory_call(call):
+            call.keywords.append(create(ast.keyword, arg="dtype", value=dtype))
+
+    def rewrite_return_expr(expr: ast.expr) -> ast.expr:
+        if isinstance(expr, ast.Name) and expr.id in promotions:
+            cast_expr = expr_from_string(
+                "{value}.to({dtype})",
+                value=expr,
+                dtype=dtype_expr(promotions[expr.id]),
+            )
+            assert isinstance(cast_expr, ast.expr)
+            return cast_expr
+        if isinstance(expr, ast.Tuple):
+            return create(
+                ast.Tuple,
+                elts=[rewrite_return_expr(elt) for elt in expr.elts],
+                ctx=expr.ctx,
+            )
+        if isinstance(expr, ast.List):
+            return create(
+                ast.List,
+                elts=[rewrite_return_expr(elt) for elt in expr.elts],
+                ctx=expr.ctx,
+            )
+        return expr
+
+    for stmt in ast.walk(ast.Module(body=host_fn.body, type_ignores=[])):
+        if (
+            isinstance(stmt, ast.Assign)
+            and len(stmt.targets) == 1
+            and isinstance(stmt.targets[0], ast.Name)
+            and stmt.targets[0].id in promotions
+            and isinstance(stmt.value, ast.Call)
+        ):
+            rewrite_allocation_dtype(stmt.value)
+        elif isinstance(stmt, ast.Return) and stmt.value is not None:
+            stmt.value = rewrite_return_expr(stmt.value)
+
+
+def promote_cute_root_graph_host_tensors(
+    graph_infos: list[GraphInfo],
+    promotions: dict[str, torch.dtype],
+) -> None:
+    from ..language._tracing_ops import _host_tensor
+
+    host_fn = HostFunction.current()
+    for graph_info in graph_infos:
+        for node in graph_info.graph.nodes:
+            if node.op != "call_function" or node.target is not _host_tensor:
+                continue
+            target_name = node.args[0]
+            if not isinstance(target_name, str) or target_name not in promotions:
+                continue
+            value = node.meta.get("val")
+            if isinstance(value, torch.Tensor):
+                promoted_value = value.to(dtype=torch.float32)
+                if origin := host_fn.tensor_to_origin.get(value):
+                    host_fn.tensor_to_origin[promoted_value] = origin
+                node.meta["val"] = promoted_value

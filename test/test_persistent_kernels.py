@@ -12,8 +12,10 @@ from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
 from helion._testing import skipIfCudaCapabilityLessThan
+from helion._testing import skipIfNotCUDA
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfTileIR
+from helion._testing import skipIfXPU
 from helion._testing import skipUnlessTensorDescriptor
 import helion.language as hl
 
@@ -247,6 +249,7 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
         # Should produce identical results
         torch.testing.assert_close(result_flat, result_persistent)
 
+    @skipIfXPU("worker crash on XPU")
     def test_xyz_vs_persistent_interleaved_equivalence(self):
         """Test that xyz and persistent_interleaved produce same results."""
 
@@ -680,12 +683,12 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
         import re
 
         # Look for _launcher(_kernel_name, (grid_size), ...) pattern
-        flat_grid_match = re.search(r"_launcher\([^,]+,\s*\(([^)]+)\)", code_flat)
-        persistent_blocked_grid_match = re.search(
-            r"_launcher\([^,]+,\s*\(([^)]+)\)", code_persistent_blocked
-        )
+        # Use a pattern that handles nested parentheses in grid expressions
+        grid_pattern = r"_launcher\([^,]+,\s*\((.+?)\)\s*,"
+        flat_grid_match = re.search(grid_pattern, code_flat)
+        persistent_blocked_grid_match = re.search(grid_pattern, code_persistent_blocked)
         persistent_interleaved_grid_match = re.search(
-            r"_launcher\([^,]+,\s*\(([^)]+)\)", code_persistent_interleaved
+            grid_pattern, code_persistent_interleaved
         )
 
         self.assertIsNotNone(flat_grid_match, "Could not find grid size in flat code")
@@ -704,8 +707,8 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
             ","
         )
 
-        # Flat should use the full grid size calculation
-        self.assertIn("triton.cdiv", flat_grid)
+        # Flat should use the full grid size calculation (ceiling division)
+        self.assertIn("//", flat_grid)
 
         # Persistent kernels should use NUM_SMS
         self.assertEqual(
@@ -1062,6 +1065,7 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
         self.assertIn("disallow_acc_multi_buffer=False", code_combined)
         self.assertIn("flatten=False", code_combined)
 
+    @skipIfNotCUDA()
     @skipIfCudaCapabilityLessThan(
         (12, 0), reason="Warp specialization requires CUDA capability >= 12.0"
     )

@@ -1,18 +1,34 @@
 from __future__ import annotations
 
+import importlib
 import os
 from unittest.mock import patch
 
+import pytest
 import torch
 
 import helion
-from helion._compiler.cute.mma_support import get_cute_mma_support
 from helion._testing import DEVICE
 from helion._testing import HALF_DTYPE
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
 import helion.language as hl
+from helion.runtime import _cute_cluster_shape
+from helion.runtime import _cute_cluster_shape_from_wrapper_plans
+from helion.runtime import _ensure_cute_dsl_arch_env
+from helion.runtime import _get_compiled_cute_launcher
+from helion.runtime import default_cute_launcher
+
+cutlass = pytest.importorskip("cutlass")
+cute = pytest.importorskip("cutlass.cute")
+
+get_cute_mma_support = importlib.import_module(
+    "helion._compiler.cute.mma_support"
+).get_cute_mma_support
+_cute_grouped_reduce_shared_tree = importlib.import_module(
+    "helion._compiler.cute.reduce_helpers"
+)._cute_grouped_reduce_shared_tree
 
 
 @helion.kernel(backend="cute")
@@ -76,7 +92,7 @@ def cute_pointwise_chain(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     return out
 
 
-@helion.kernel(backend="cute")
+@helion.kernel(backend="cute", autotune_effort="none")
 def cute_affine_scalar_args(
     x: torch.Tensor,
     scale: int,
@@ -169,6 +185,103 @@ def cute_row_prod(x: torch.Tensor) -> torch.Tensor:
             row_prod = row_prod * torch.prod(vals, dim=1)
         out[tile_n] = row_prod
     return out
+
+
+@cute.kernel
+def cute_shared_tree_reduce_max(inp, out):
+    lane = cutlass.Int32(cute.arch.thread_idx()[0]) + cutlass.Int32(
+        cute.arch.thread_idx()[1]
+    ) * cutlass.Int32(3)
+    lane_in_group = lane % 48
+    lane_mod_pre = lane_in_group % 3
+    reduce_idx = lane_in_group // 3
+    result = _cute_grouped_reduce_shared_tree(
+        inp[lane_mod_pre, reduce_idx],
+        "max",
+        cutlass.Float32(float("-inf")),
+        lane,
+        lane_in_group,
+        lane_mod_pre,
+        pre=3,
+        group_span=48,
+        num_threads=48,
+        group_count=1,
+    )
+    if lane_in_group < 3:
+        out[lane_in_group] = result
+
+
+@cute.kernel
+def cute_shared_tree_reduce_min(inp, out):
+    lane = cutlass.Int32(cute.arch.thread_idx()[0]) + cutlass.Int32(
+        cute.arch.thread_idx()[1]
+    ) * cutlass.Int32(3)
+    lane_in_group = lane % 48
+    lane_mod_pre = lane_in_group % 3
+    reduce_idx = lane_in_group // 3
+    result = _cute_grouped_reduce_shared_tree(
+        inp[lane_mod_pre, reduce_idx],
+        "min",
+        cutlass.Float32(float("inf")),
+        lane,
+        lane_in_group,
+        lane_mod_pre,
+        pre=3,
+        group_span=48,
+        num_threads=48,
+        group_count=1,
+    )
+    if lane_in_group < 3:
+        out[lane_in_group] = result
+
+
+@cute.kernel
+def cute_shared_tree_reduce_prod(inp, out):
+    lane = cutlass.Int32(cute.arch.thread_idx()[0]) + cutlass.Int32(
+        cute.arch.thread_idx()[1]
+    ) * cutlass.Int32(3)
+    lane_in_group = lane % 48
+    lane_mod_pre = lane_in_group % 3
+    reduce_idx = lane_in_group // 3
+    result = _cute_grouped_reduce_shared_tree(
+        inp[lane_mod_pre, reduce_idx],
+        "prod",
+        cutlass.Float32(1.0),
+        lane,
+        lane_in_group,
+        lane_mod_pre,
+        pre=3,
+        group_span=48,
+        num_threads=48,
+        group_count=1,
+    )
+    if lane_in_group < 3:
+        out[lane_in_group] = result
+
+
+@cute.kernel
+def cute_shared_tree_matmul_sum(lhs, rhs, out):
+    lane = cutlass.Int32(cute.arch.thread_idx()[0]) + cutlass.Int32(
+        cute.arch.thread_idx()[1]
+    ) * cutlass.Int32(3)
+    lane_in_group = lane % 48
+    row = lane_in_group % 3
+    reduce_idx = lane_in_group // 3
+    product = lhs[row, reduce_idx] * rhs[reduce_idx, cutlass.Int32(0)]
+    result = _cute_grouped_reduce_shared_tree(
+        product,
+        "sum",
+        cutlass.Float32(0.0),
+        lane,
+        lane_in_group,
+        row,
+        pre=3,
+        group_span=48,
+        num_threads=48,
+        group_count=1,
+    )
+    if lane_in_group < 3:
+        out[row, cutlass.Int32(0)] = result
 
 
 @helion.kernel(backend="cute")
@@ -707,6 +820,28 @@ class TestCuteBackend(TestCase):
                 _code, out = code_and_output(kernel, args, block_sizes=[2, 8])
                 torch.testing.assert_close(out, expected, rtol=1e-4, atol=1e-4)
 
+    def test_direct_shared_tree_reduce_helpers_non_sum(self) -> None:
+        x = torch.rand(3, 16, device=DEVICE, dtype=torch.float32) + 0.5
+        cases = [
+            (
+                cute_shared_tree_reduce_max,
+                torch.amax(x.to(torch.float32), dim=1),
+            ),
+            (
+                cute_shared_tree_reduce_min,
+                torch.amin(x.to(torch.float32), dim=1),
+            ),
+            (
+                cute_shared_tree_reduce_prod,
+                torch.prod(x.to(torch.float32), dim=1),
+            ),
+        ]
+        for kernel, expected in cases:
+            with self.subTest(kernel=kernel.__name__):
+                out = torch.empty_like(expected)
+                default_cute_launcher(kernel, (1,), x, out, block=(3, 16, 1))
+                torch.testing.assert_close(out, expected, rtol=1e-4, atol=1e-4)
+
     def test_permute_transposes_tile_values(self) -> None:
         """Permute should shuffle scalar values between threads."""
 
@@ -762,7 +897,7 @@ class TestCuteBackend(TestCase):
             num_threads=[1, 8, 1],
         )
         torch.testing.assert_close(out, args[0] @ args[1], atol=1e-1, rtol=1e-2)
-        self.assertIn("cute.arch.warp_reduction_sum", code)
+        self.assertNotIn("cute.arch.warp_reduction_sum", code)
         self.assertNotIn("cute.gemm", code)
 
     def test_matmul_mma_epilogue(self) -> None:
@@ -807,20 +942,23 @@ class TestCuteBackend(TestCase):
             code, out = code_and_output(cute_matmul_mma, args, block_sizes=[64, 8, 16])
         torch.testing.assert_close(out, args[0] @ args[1], atol=1e-1, rtol=1e-2)
         self.assertIn("cutlass.utils.blackwell_helpers.make_trivial_tiled_mma", code)
-        self.assertIn("cute.nvgpu.tcgen05.make_umma_smem_desc", code)
-        self.assertIn("cute.mma_atom_call", code)
+        self.assertIn("cute.nvgpu.tcgen05", code)
+        self.assertIn("cute.gemm(", code)
+        # ``tcgen05_acc_pipeline_arrive_count`` / ``tcgen05_ab_pipeline_arrive_count``
+        # are no longer materialized as named compile-time constants -- they
+        # were always literal ints, so codegen now passes the values inline.
+        # Pin the inline form instead: the acc consumer group must be sized to
+        # the epi warp count (4) and the AB pipeline still uses one TMA arriver.
         self.assertIn(
-            "tcgen05_pipeline_arrive_count = cutlass.Int32(4)",
+            "cutlass.pipeline.CooperativeGroup("
+            "cutlass.pipeline.Agent.Thread, cutlass.Int32(4))",
             code,
         )
         self.assertIn(
-            "cutlass.pipeline.NamedBarrier(barrier_id=1, num_threads=512)",
+            "cutlass.pipeline.CooperativeGroup(cutlass.pipeline.Agent.Thread, 1)",
             code,
         )
-        self.assertIn(
-            "cutlass.pipeline.CooperativeGroup(cutlass.pipeline.Agent.Thread, tcgen05_pipeline_arrive_count)",
-            code,
-        )
+        self.assertIn("cutlass.pipeline.NamedBarrier(barrier_id=1", code)
 
     def test_matmul_mma_tcgen05_128x8_uses_full_cta_barrier(self) -> None:
         support = get_cute_mma_support()
@@ -834,18 +972,14 @@ class TestCuteBackend(TestCase):
         with patch.dict(os.environ, {"HELION_CUTE_MMA_IMPL": "tcgen05"}, clear=False):
             code, out = code_and_output(cute_matmul_mma, args, block_sizes=[128, 8, 16])
         torch.testing.assert_close(out, args[0] @ args[1], atol=1e-1, rtol=1e-2)
+        self.assertIn("cute.nvgpu.tcgen05", code)
+        # Pin the inline arrive-count form (cf. ``test_matmul_mma_tcgen05``).
         self.assertIn(
-            "tcgen05_pipeline_arrive_count = cutlass.Int32(8)",
+            "cutlass.pipeline.CooperativeGroup("
+            "cutlass.pipeline.Agent.Thread, cutlass.Int32(4))",
             code,
         )
-        self.assertIn(
-            "cutlass.pipeline.NamedBarrier(barrier_id=1, num_threads=1024)",
-            code,
-        )
-        self.assertIn(
-            "cutlass.pipeline.CooperativeGroup(cutlass.pipeline.Agent.Thread, tcgen05_pipeline_arrive_count)",
-            code,
-        )
+        self.assertIn("cutlass.pipeline.NamedBarrier(barrier_id=1", code)
 
     def test_matmul_dot_out_dtype_falls_back_from_mma(self) -> None:
         args = (
@@ -1003,6 +1137,15 @@ class TestCuteBackend(TestCase):
         self.assertIn("cute.arch.warp_reduction_sum", code)
         self.assertNotIn("cute.gemm", code)
 
+    def test_direct_shared_tree_sum_matches_matmul_lane_mapping(self) -> None:
+        lhs = torch.randn(3, 16, device=DEVICE, dtype=torch.float32)
+        rhs = torch.randn(16, 1, device=DEVICE, dtype=torch.float32)
+        out = torch.empty(3, 1, device=DEVICE, dtype=torch.float32)
+        default_cute_launcher(
+            cute_shared_tree_matmul_sum, (1,), lhs, rhs, out, block=(3, 16, 1)
+        )
+        torch.testing.assert_close(out, lhs @ rhs, atol=1e-5, rtol=1e-5)
+
     def test_addmm_direct_full_k_tile_falls_back_correctly(self) -> None:
         args = (
             torch.randn(4, 4, device=DEVICE, dtype=torch.float32),
@@ -1066,6 +1209,209 @@ class TestCuteBackend(TestCase):
         torch.testing.assert_close(out, expected, atol=1e-1, rtol=1e-2)
         self.assertNotIn("cute.gemm", code)
 
+    def test_matmul_direct_grouped_n_uses_mma(self) -> None:
+        @helion.kernel(
+            backend="cute",
+            config=helion.Config(block_sizes=[32], indexing="block_ptr"),
+            static_shapes=True,
+        )
+        def grouped_n_matmul(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, _n = x.size()
+            out = torch.empty([m, y.size(1)], dtype=x.dtype, device=x.device)
+            for tile_m in hl.tile(m):
+                out[tile_m, :] = x[tile_m, :] @ y[:, :]
+            return out
+
+        args = (
+            torch.randn(256, 128, device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn(128, 128, device=DEVICE, dtype=HALF_DTYPE),
+        )
+        code, out = code_and_output(grouped_n_matmul, args)
+        expected = args[0].float() @ args[1].float()
+        torch.testing.assert_close(out, expected.to(out.dtype), atol=1e-1, rtol=1e-2)
+        self.assertIn("cute.gemm", code)
+        self.assertIn("cute.nvgpu.warp.MmaF16BF16Op", code)
+        self.assertNotIn("dot_serial_result", code)
+
+    def test_matmul_direct_grouped_n_slice_operands_use_mma(self) -> None:
+        @helion.kernel(
+            backend="cute",
+            config=helion.Config(block_sizes=[32], indexing="block_ptr"),
+            static_shapes=True,
+        )
+        def grouped_n_matmul(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, _n = x.size()
+            out = torch.empty([m, 128], dtype=x.dtype, device=x.device)
+            for tile_m in hl.tile(m):
+                out[tile_m, :] = x[tile_m, 16:144] @ y[16:144, :]
+            return out
+
+        args = (
+            torch.randn(256, 160, device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn(160, 128, device=DEVICE, dtype=HALF_DTYPE),
+        )
+        code, out = code_and_output(grouped_n_matmul, args)
+        expected = args[0][:, 16:144].float() @ args[1][16:144, :].float()
+        torch.testing.assert_close(out, expected.to(out.dtype), atol=1e-1, rtol=1e-2)
+        self.assertIn("cute.gemm", code)
+        self.assertNotIn("dot_serial_result", code)
+
+    def test_matmul_direct_grouped_n_rhs_offset_uses_mma(self) -> None:
+        @helion.kernel(
+            backend="cute",
+            config=helion.Config(block_sizes=[32], indexing="block_ptr"),
+            static_shapes=True,
+        )
+        def grouped_n_matmul(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, _n = x.size()
+            out = torch.empty([m, 128], dtype=x.dtype, device=x.device)
+            for tile_m in hl.tile(m):
+                out[tile_m, :] = x[tile_m, :] @ y[:, 16:144]
+            return out
+
+        args = (
+            torch.randn(256, 128, device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn(128, 160, device=DEVICE, dtype=HALF_DTYPE),
+        )
+        code, out = code_and_output(grouped_n_matmul, args)
+        expected = args[0].float() @ args[1][:, 16:144].float()
+        torch.testing.assert_close(out, expected.to(out.dtype), atol=1e-1, rtol=1e-2)
+        self.assertIn("cute.gemm", code)
+        self.assertNotIn("dot_serial_result", code)
+
+    def test_matmul_direct_grouped_n_noncontiguous_operands_reject_cleanly(
+        self,
+    ) -> None:
+        @helion.kernel(
+            backend="cute",
+            config=helion.Config(block_sizes=[32], indexing="block_ptr"),
+            static_shapes=True,
+        )
+        def grouped_n_matmul(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, _n = x.size()
+            out = torch.empty([m, 64], dtype=x.dtype, device=x.device)
+            for tile_m in hl.tile(m):
+                out[tile_m, :] = x[tile_m, 16:144:2] @ y[16:144:2, :]
+            return out
+
+        args = (
+            torch.randn(256, 160, device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn(160, 64, device=DEVICE, dtype=HALF_DTYPE),
+        )
+        with self.assertRaisesRegex(
+            helion.exc.BackendUnsupported,
+            "index type: <class 'slice'>",
+        ):
+            code_and_output(grouped_n_matmul, args)
+
+    def test_matmul_direct_grouped_n_negative_rhs_offset_rejects_cleanly(
+        self,
+    ) -> None:
+        @helion.kernel(
+            backend="cute",
+            config=helion.Config(block_sizes=[32], indexing="block_ptr"),
+            static_shapes=True,
+        )
+        def grouped_n_matmul(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, _n = x.size()
+            out = torch.empty([m, 128], dtype=x.dtype, device=x.device)
+            for tile_m in hl.tile(m):
+                out[tile_m, :] = x[tile_m, :] @ y[:, -144:-16]
+            return out
+
+        args = (
+            torch.randn(256, 128, device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn(128, 160, device=DEVICE, dtype=HALF_DTYPE),
+        )
+        with self.assertRaisesRegex(
+            helion.exc.BackendUnsupported,
+            "CuTe direct mm without an active K tile only supports contiguous direct-load operands",
+        ):
+            code_and_output(grouped_n_matmul, args)
+
+    def test_matmul_direct_grouped_n_multiple_mms_fall_back_cleanly(self) -> None:
+        @helion.kernel(
+            backend="cute",
+            config=helion.Config(block_sizes=[32], indexing="block_ptr"),
+            static_shapes=True,
+        )
+        def grouped_n_two_matmuls(
+            x1: torch.Tensor,
+            y1: torch.Tensor,
+            x2: torch.Tensor,
+            y2: torch.Tensor,
+        ) -> torch.Tensor:
+            m, _n = x1.size()
+            out = torch.empty([m, 128], dtype=x1.dtype, device=x1.device)
+            for tile_m in hl.tile(m):
+                out[tile_m, :] = x1[tile_m, 16:144] @ y1[16:144, :]
+                out[tile_m, :] += x2[tile_m, 16:144] @ y2[16:144, :]
+            return out
+
+        args = (
+            torch.randn(256, 160, device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn(160, 128, device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn(256, 160, device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn(160, 128, device=DEVICE, dtype=HALF_DTYPE),
+        )
+        code, out = code_and_output(grouped_n_two_matmuls, args)
+        expected = (
+            args[0][:, 16:144].float() @ args[1][16:144, :].float()
+            + args[2][:, 16:144].float() @ args[3][16:144, :].float()
+        )
+        torch.testing.assert_close(out, expected.to(out.dtype), atol=1e-1, rtol=1e-2)
+        self.assertNotIn("cute.nvgpu.warp.MmaF16BF16Op", code)
+        self.assertIn("dot_serial_result", code)
+
+    def test_matmul_direct_grouped_n_respects_mma_override(self) -> None:
+        @helion.kernel(
+            backend="cute",
+            config=helion.Config(block_sizes=[32], indexing="block_ptr"),
+            static_shapes=True,
+        )
+        def grouped_n_matmul(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, _n = x.size()
+            out = torch.empty([m, y.size(1)], dtype=x.dtype, device=x.device)
+            for tile_m in hl.tile(m):
+                out[tile_m, :] = x[tile_m, :] @ y[:, :]
+            return out
+
+        args = (
+            torch.randn(256, 128, device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn(128, 128, device=DEVICE, dtype=HALF_DTYPE),
+        )
+        with patch.dict(os.environ, {"HELION_CUTE_MMA_IMPL": "universal"}, clear=False):
+            code, out = code_and_output(grouped_n_matmul, args)
+        expected = args[0].float() @ args[1].float()
+        torch.testing.assert_close(out, expected.to(out.dtype), atol=1e-1, rtol=1e-2)
+        self.assertNotIn("cute.gemm", code)
+
+    def test_matmul_direct_grouped_n_mismatched_threads_falls_back(self) -> None:
+        @helion.kernel(
+            backend="cute",
+            config=helion.Config(
+                block_sizes=[64],
+                num_threads=[32],
+                indexing="block_ptr",
+            ),
+            static_shapes=True,
+        )
+        def grouped_n_matmul(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, _n = x.size()
+            out = torch.empty([m, y.size(1)], dtype=x.dtype, device=x.device)
+            for tile_m in hl.tile(m):
+                out[tile_m, :] = x[tile_m, :] @ y[:, :]
+            return out
+
+        args = (
+            torch.randn(256, 128, device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn(128, 128, device=DEVICE, dtype=HALF_DTYPE),
+        )
+        code, out = code_and_output(grouped_n_matmul, args)
+        expected = args[0].float() @ args[1].float()
+        torch.testing.assert_close(out, expected.to(out.dtype), atol=1e-1, rtol=1e-2)
+        self.assertNotIn("cute.gemm", code)
+
     def test_dot_acc_dynamic_shape_uses_mma(self) -> None:
         args = (
             torch.randn(64, 64, device=DEVICE, dtype=torch.bfloat16),
@@ -1080,8 +1426,116 @@ class TestCuteBackend(TestCase):
         )
         expected = args[0].float() @ args[1].float()
         torch.testing.assert_close(out, expected, atol=1e-1, rtol=1e-2)
-        self.assertIn("cute.arch.warp_reduction_sum", code)
+        self.assertNotIn("cute.arch.warp_reduction_sum", code)
         self.assertNotIn("cute.gemm", code)
+
+    def test_cute_dsl_arch_env_tracks_launch_device(self) -> None:
+        tensor = torch.empty(1, device=DEVICE)
+        major, minor = torch.cuda.get_device_capability(tensor.device)
+        suffix = "a" if major >= 9 else ""
+        expected = f"sm_{major}{minor}{suffix}"
+        with patch.dict(os.environ, {"CUTE_DSL_ARCH": "sm_00"}, clear=False):
+            _ensure_cute_dsl_arch_env((tensor,))
+            self.assertEqual(os.environ["CUTE_DSL_ARCH"], expected)
+
+    def test_cute_launcher_cache_key_includes_wrapper_plans(self) -> None:
+        cute_kernel = type("DummyCuteKernel", (), {})()
+        schema_key = (("tensor", 2, "float32"),)
+        block = (32, 1, 1)
+        created: list[str] = []
+
+        def make_wrapper(*_args: object) -> str:
+            created.append("wrapper")
+            return f"wrapper-{len(created)}"
+
+        with patch("helion.runtime._create_cute_wrapper", side_effect=make_wrapper):
+            cute_kernel._helion_cute_wrapper_plans = [{"kind": "plan-a"}]
+            wrapper_a0 = _get_compiled_cute_launcher(cute_kernel, schema_key, block)
+            wrapper_a1 = _get_compiled_cute_launcher(cute_kernel, schema_key, block)
+            cute_kernel._helion_cute_wrapper_plans = [{"kind": "plan-b"}]
+            wrapper_b = _get_compiled_cute_launcher(cute_kernel, schema_key, block)
+
+        self.assertEqual(wrapper_a0, wrapper_a1)
+        self.assertNotEqual(wrapper_a0, wrapper_b)
+
+    def test_cute_launcher_cache_key_includes_cluster_shape(self) -> None:
+        cute_kernel = type("DummyCuteKernel", (), {})()
+        schema_key = (("tensor", 2, "float32"),)
+        block = (32, 1, 1)
+        created: list[str] = []
+
+        def make_wrapper(*_args: object) -> str:
+            created.append("wrapper")
+            return f"wrapper-{len(created)}"
+
+        with patch("helion.runtime._create_cute_wrapper", side_effect=make_wrapper):
+            cute_kernel._helion_cute_wrapper_plans = [{"kind": "plan-a"}]
+            cute_kernel._helion_cute_cluster_shape = (1, 1, 1)
+            wrapper_a = _get_compiled_cute_launcher(cute_kernel, schema_key, block)
+            cute_kernel._helion_cute_cluster_shape = (2, 1, 1)
+            wrapper_b = _get_compiled_cute_launcher(cute_kernel, schema_key, block)
+
+        self.assertNotEqual(wrapper_a, wrapper_b)
+
+    def test_cute_launcher_reuses_compiled_wrapper(self) -> None:
+        cute_kernel = type("DummyCuteKernel", (), {})()
+        schema_key = (("tensor", 2, "float32"),)
+        block = (32, 1, 1)
+        compiled_calls: list[tuple[object, tuple[object, ...]]] = []
+        launched_args: list[tuple[object, ...]] = []
+
+        class FakeCompiled:
+            def __call__(self, *args: object) -> tuple[str, tuple[object, ...]]:
+                launched_args.append(args)
+                return ("launched", args)
+
+        def fake_compile(jit_func: object, *args: object) -> FakeCompiled:
+            compiled_calls.append((jit_func, args))
+            return FakeCompiled()
+
+        with (
+            patch("helion.runtime._create_cute_wrapper", return_value="jit-wrapper"),
+            patch("cutlass.cute.compile", side_effect=fake_compile),
+        ):
+            launcher = _get_compiled_cute_launcher(cute_kernel, schema_key, block)
+            first = launcher(1, 2, 3)
+            second = launcher(4, 5, 6)
+
+        self.assertEqual(compiled_calls, [("jit-wrapper", (1, 2, 3))])
+        self.assertEqual(launched_args, [(1, 2, 3), (4, 5, 6)])
+        self.assertEqual(first, ("launched", (1, 2, 3)))
+        self.assertEqual(second, ("launched", (4, 5, 6)))
+
+    def test_cute_cluster_shape_from_wrapper_plans(self) -> None:
+        self.assertIsNone(_cute_cluster_shape_from_wrapper_plans([]))
+        self.assertIsNone(
+            _cute_cluster_shape_from_wrapper_plans(
+                [{"kind": "tcgen05_ab_tma", "cluster_m": 1, "cluster_n": 1}]
+            )
+        )
+        self.assertEqual(
+            _cute_cluster_shape_from_wrapper_plans(
+                [
+                    {
+                        "kind": "tcgen05_ab_tma",
+                        "cluster_m": 2,
+                        "cluster_n": 1,
+                    }
+                ]
+            ),
+            (2, 1, 1),
+        )
+
+    def test_cute_cluster_shape_prefers_explicit_kernel_metadata(self) -> None:
+        cute_kernel = type("DummyCuteKernel", (), {})()
+        cute_kernel._helion_cute_cluster_shape = (2, 1, 1)
+        self.assertEqual(
+            _cute_cluster_shape(
+                cute_kernel,
+                [{"kind": "tcgen05_ab_tma", "cluster_m": 1, "cluster_n": 1}],
+            ),
+            (2, 1, 1),
+        )
 
     def test_addmm_direct_full_k_tile_static_shapes_falls_back_correctly(self) -> None:
         args = (
@@ -1164,5 +1618,4 @@ class TestCuteBackend(TestCase):
         expected = x[:, : end.item()].sum(dim=1)
         torch.testing.assert_close(out, expected, rtol=1e-4, atol=1e-4)
         self.assertIn("block=(32, 32, 1)", code)
-        self.assertIn("cute.arch.alloc_smem", code)
-        self.assertIn("cute.arch.sync_threads()", code)
+        self.assertIn("_cute_grouped_reduce_shared_two_stage", code)

@@ -325,10 +325,12 @@ def decompose_rand(
     shape: list[int | torch.SymInt],
     *,
     seed: int | torch.SymInt | torch.Tensor,
+    offsets: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    env = CompileEnvironment.current()
-    offset = _explicit_offset_from_shape(shape, device=env.device)
-    return _philox_rand_from_seed_and_offset(seed, offset)
+    if offsets is None:
+        env = CompileEnvironment.current()
+        offsets = _explicit_offset_from_shape(shape, device=env.device)
+    return _philox_rand_from_seed_and_offset(seed, offsets)
 
 
 def decompose_randint(
@@ -567,6 +569,17 @@ def _resolve_seed_desc(
     )
 
 
+def _resolve_offsets_desc(
+    flat_args: tuple[object, ...],
+    desc: _ArgDesc | None,
+) -> torch.Tensor | None:
+    if desc is None:
+        return None
+    value = _resolve_rewrite_arg(flat_args, desc)
+    assert isinstance(value, torch.Tensor)
+    return value
+
+
 def _random_rewrite_nodes(graph: torch.fx.Graph) -> list[Node]:
     targets = (
         rand,
@@ -593,15 +606,23 @@ def rewrite_implicit_random_ops(graph: torch.fx.Graph) -> None:
             shape_arg = node.args[0]
             descriptors, shape_desc = _shape_rewrite_desc(shape_arg)
             seed_desc = _add_rewrite_desc(descriptors, node.args[1])
+            offsets_arg = node.args[3]
+            offsets_desc: _ArgDesc | None = (
+                _add_rewrite_desc(descriptors, offsets_arg)
+                if offsets_arg is not None
+                else None
+            )
 
             def helper(
                 *flat_args: object,
                 shape_desc: tuple[_ArgDesc, ...] = tuple(shape_desc),
                 seed_desc: _ArgDesc = seed_desc,
+                offsets_desc: _ArgDesc | None = offsets_desc,
             ) -> torch.Tensor:
                 shape = [_resolve_shape_desc(flat_args, desc) for desc in shape_desc]
                 seed = _resolve_seed_desc(flat_args, seed_desc)
-                return decompose_rand(shape, seed=seed)
+                offsets = _resolve_offsets_desc(flat_args, offsets_desc)
+                return decompose_rand(shape, seed=seed, offsets=offsets)
 
             replacement = _trace_rewrite_subgraph(graph, node, helper, descriptors)
         elif node.target is randint:
@@ -715,17 +736,25 @@ def rand(
     shape: list[object],
     seed: int | torch.Tensor,
     device: torch.device | None = None,
+    offsets: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
     hl.rand provides a Philox-based pseudorandom number generator (PRNG) that
     operates independently of PyTorch's global random seed. Instead, it
-    requires an explicit seed argument. Offsets are derived from the full
-    logical sizes of the tiles specified in the shape argument.
+    requires an explicit seed argument. By default, offsets are derived from
+    the full logical sizes of the tiles specified in the shape argument. An
+    explicit ``offsets`` tensor may be supplied to bypass the implicit offset
+    computation; the output will then have ``offsets.shape`` and ``shape`` is
+    ignored (an empty list ``[]`` is fine).
 
     Args:
-        shape: A list of sizes for the output tensor
+        shape: A list of sizes for the output tensor. Ignored when ``offsets``
+            is provided.
         seed: A single element int64 tensor or int literal
         device: Device must match the current compile environment device
+        offsets: Optional explicit int64 offset tensor fed directly into the
+            philox RNG. When provided, the output shape equals
+            ``offsets.shape``.
 
     Returns:
         torch.Tensor: A device tensor of float32 dtype filled with uniform
@@ -741,6 +770,20 @@ def rand(
                 for tile_m in hl.tile(m):
                     output[tile_m] = hl.rand([tile_m], seed=42)
                 return output
+
+        With explicit offsets (e.g. spaced out so sibling streams may use
+        offsets ``+1`` and ``+2``):
+
+        .. code-block:: python
+
+            @helion.kernel
+            def spaced_rand_kernel(x: torch.Tensor) -> torch.Tensor:
+                output = torch.zeros_like(x)
+                (m,) = x.shape
+                for tile_m in hl.tile(m):
+                    base = hl.arange(tile_m).to(torch.int64) * 3
+                    output[tile_m] = hl.rand([], seed=42, offsets=base)
+                return output
     """
     raise NotInsideKernel
 
@@ -750,15 +793,28 @@ def _rand_fake(
     shape: list[int | torch.SymInt],
     seed: int | torch.Tensor,
     device: torch.device | None = None,
+    offsets: torch.Tensor | None = None,
 ) -> torch.Tensor:
     if not isinstance(shape, (list, tuple)):
         raise TypeError(f"Expected list[SymInt], got {type(shape).__name__}")
     env = CompileEnvironment.current()
+    rng_device = env.device if device is None else device
+    if offsets is not None:
+        if not isinstance(offsets, torch.Tensor):
+            raise TypeError(
+                f"Expected torch.Tensor for offsets, got {type(offsets).__name__}"
+            )
+        env.add_kernel_tensor_size(offsets.shape)
+        return torch.empty(
+            [*offsets.shape],
+            dtype=torch.float32,
+            device=rng_device,
+        )
     env.add_kernel_tensor_size(shape)
     return torch.empty(
         [*shape],
         dtype=torch.float32,
-        device=env.device if device is None else device,
+        device=rng_device,
     )
 
 
@@ -772,9 +828,12 @@ def _(
     shape: list[int | RefTile],
     seed: int | torch.Tensor,
     device: torch.device | None = None,
+    offsets: torch.Tensor | None = None,
 ) -> torch.Tensor:
     env = CompileEnvironment.current()
     rng_device = env.device if device is None else device
+    if offsets is not None:
+        return philox_rand_ref(seed, offsets).to(device=rng_device)
     processed_shape, offset = _ref_rng_shape_and_offset(shape, device=rng_device)
     return philox_rand_ref(seed, offset).reshape(processed_shape).to(device=rng_device)
 

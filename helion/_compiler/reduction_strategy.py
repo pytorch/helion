@@ -54,9 +54,9 @@ def _log_cute_reduction_layout(state: CodegenState) -> None:
     if state.fx_node is None:
         return
     constraint = state.fx_node.meta.get(_CUTE_LAYOUT_META_KEY)
-    if constraint is None or constraint.layout is None:
+    if constraint is None or constraint.input_layout is None:
         return
-    layout = constraint.layout
+    layout = constraint.input_layout
     log.debug(
         "cute reduction %s: layout tag=%s thread=%s value=%s",
         state.fx_node.name,
@@ -76,9 +76,9 @@ def _reduction_threads_from_annotation(state: CodegenState) -> int | None:
     if state.fx_node is None:
         return None
     constraint = state.fx_node.meta.get(_CUTE_LAYOUT_META_KEY)
-    if constraint is None or constraint.layout is None:
+    if constraint is None or constraint.input_layout is None:
         return None
-    layout = constraint.layout
+    layout = constraint.input_layout
     if layout.tag != _CuteLayoutTag.REDUCTION:
         return None
     nt = layout.num_threads()
@@ -133,6 +133,16 @@ class ReductionStrategy(TileStrategy):
         return [count] if count > 0 else []
 
     def _reduction_block_has_lane_loops(self) -> bool:
+        """Return True when this reduction block is being traversed via a
+        lane loop on the cute backend (synthetic per-thread iteration
+        inside a ``DeviceGridState`` that does not have a live thread for
+        every logical lane).
+
+        Lane loops serialize part of the logical tile in Python rather
+        than mapping it to actual threads, so reductions over the looped
+        block cannot be fast-pathed via a warp-level reduction (every
+        participating axis must be backed by a live thread).
+        """
         codegen = getattr(self, "_codegen", None)
         if codegen is None:
             return False
@@ -154,6 +164,14 @@ class ReductionStrategy(TileStrategy):
         return False
 
     def _reduction_block_is_serial(self) -> bool:
+        """Return True when this reduction block is being traversed by a
+        serial ``DeviceLoopState`` (a Python ``for`` loop) rather than a
+        live thread axis.
+
+        Reductions over a serially-iterated block cannot be fast-pathed
+        via a warp-level reduction; the surrounding loop has to carry the
+        accumulator.
+        """
         codegen = getattr(self, "_codegen", None)
         if codegen is None:
             return False
@@ -166,6 +184,15 @@ class ReductionStrategy(TileStrategy):
         return False
 
     def _reduction_block_has_live_thread_axis(self) -> bool:
+        """Return True when this reduction block is mapped to a live thread
+        axis in the active loop nest (in either the current grid or any
+        active device loop).
+
+        A ``False`` return on the cute backend means a warp-level reduction
+        across this block would fold together unrelated tensor elements,
+        because no real threads back the block. The caller falls back to
+        loop-carried accumulation.
+        """
         codegen = getattr(self, "_codegen", None)
         if codegen is None:
             return False
@@ -184,35 +211,39 @@ class ReductionStrategy(TileStrategy):
                     return True
         return False
 
+    def _cute_reduction_needs_loop_carried_accumulator(self) -> bool:
+        """Return True when, on the cute backend, the surrounding loop
+        nest must perform the reduction via loop-carried accumulation
+        instead of a warp-level reduction across threads.
+
+        This consolidates the three "no live thread axis" conditions
+        previously checked separately in
+        :meth:`BlockReductionStrategy.codegen_reduction`:
+
+        * :meth:`_reduction_block_is_serial` — the block is iterated by
+          a serial ``DeviceLoopState`` rather than a thread axis;
+        * :meth:`_reduction_block_has_lane_loops` — the block is
+          iterated by a lane loop (synthetic per-thread iteration);
+        * ``not _reduction_block_has_live_thread_axis()`` — the block
+          is not mapped to any thread axis at all.
+
+        In every case the conclusion is the same: there is no live
+        thread axis to reduce across, so the surrounding loop must
+        accumulate the partial values across iterations.
+
+        Always returns False for non-cute backends (Triton / Pallas /
+        TileIR all use their native warp / lane reductions).
+        """
+        if CompileEnvironment.current().backend.name != "cute":
+            return False
+        return (
+            self._reduction_block_is_serial()
+            or self._reduction_block_has_lane_loops()
+            or not self._reduction_block_has_live_thread_axis()
+        )
+
     def _planned_thread_dims(self) -> tuple[int, int, int]:
         return self.fn.tile_strategy.thread_block_dims()
-
-    def _block_has_live_thread_axis(
-        self, block_id: int, extent: int | None = None
-    ) -> bool:
-        axis = self.fn.tile_strategy.thread_axis_for_block_id(block_id)
-        if axis is None:
-            return False
-        planned_dims = self._planned_thread_dims()
-        if axis >= len(planned_dims):
-            return False
-        live_extent = planned_dims[axis]
-        return live_extent > 1 and not (extent is not None and extent > live_extent)
-
-    def _reduction_dim_has_live_thread_axis(
-        self,
-        fake_input: torch.Tensor,
-        dim: int,
-    ) -> bool:
-        env = CompileEnvironment.current()
-        normalized_dim = dim if dim >= 0 else fake_input.ndim + dim
-        if not (0 <= normalized_dim < fake_input.ndim):
-            return False
-        block_id = env.resolve_block_id(fake_input.size(normalized_dim))
-        if block_id is None:
-            return False
-        extent = self.fn.tile_strategy.thread_extent_for_block_id(block_id)
-        return self._block_has_live_thread_axis(block_id, extent)
 
     def _get_thread_axis(self) -> int:
         """Compute the thread axis index for this reduction strategy.
@@ -369,6 +400,38 @@ class PersistentReductionStrategy(ReductionStrategy):
             self._thread_count = next_power_of_2(min(size_hint, max_threads))
         else:
             self._thread_count = 0
+        # On cute, the launch block dim is capped at MAX_THREADS_PER_BLOCK.
+        # If the existing tile strategies already claim that budget, the
+        # reduction's Y/Z axis silently collapses to 1, producing kernels
+        # whose ``thread_idx[axis] + synthetic_lane * thread_count`` indexing
+        # only covers ``padded_size // thread_count`` of the reduction extent.
+        # Shrink ``_thread_count`` here so the full extent stays addressable
+        # via the synthetic lane loop.
+        # Tile strategies are added before reduction strategies, so they are
+        # already on the dispatcher by the time we get here.
+        tile_dispatch = getattr(fn, "tile_strategy", None)
+        if (
+            env.backend.name == "cute"
+            and self._thread_count > 1
+            and tile_dispatch is not None
+        ):
+            from .cute.thread_budget import MAX_THREADS_PER_BLOCK
+
+            other_threads = 1
+            for strategy in tile_dispatch.strategies:
+                if isinstance(strategy, ReductionStrategy):
+                    count = strategy._reduction_thread_count()
+                    if count > 0:
+                        other_threads *= count
+                else:
+                    for size in strategy.thread_block_sizes():
+                        if size > 1:
+                            other_threads *= size
+            while (
+                other_threads * self._thread_count > MAX_THREADS_PER_BLOCK
+                and self._thread_count > 1
+            ):
+                self._thread_count //= 2
         self._synthetic_cute_lane_var: str | None = None
         self._synthetic_cute_lane_extent = 1
         is_graph_reduction_dim = any(
@@ -545,6 +608,27 @@ class LoopedReductionStrategy(ReductionStrategy):
             self._thread_count = next_power_of_2(min(block_size, max_threads))
         else:
             self._thread_count = 0
+        if env.backend.name == "cute" and self._thread_count > 1:
+            from .cute.thread_budget import MAX_THREADS_PER_BLOCK
+
+            other_threads = 1
+            tile_dispatch = getattr(fn, "tile_strategy", None)
+            if tile_dispatch is not None:
+                for strategy in tile_dispatch.strategies:
+                    if isinstance(strategy, ReductionStrategy):
+                        count = strategy._reduction_thread_count()
+                        if count > 0:
+                            other_threads *= count
+                    else:
+                        for size in strategy.thread_block_sizes():
+                            if size > 1:
+                                other_threads *= size
+            while (
+                other_threads * self._thread_count > MAX_THREADS_PER_BLOCK
+                and self._thread_count > 1
+            ):
+                self._thread_count //= 2
+            self.block_size = min(self.block_size, self._thread_count)
 
     def _reduction_thread_count(self) -> int:
         return self._thread_count
@@ -1236,27 +1320,11 @@ class BlockReductionStrategy(ReductionStrategy):
                 group_count=group_count,
             )
 
-        lane_in_group = f"(({lane_expr}) % {group_span})"
-        lane_mod_pre = f"(({lane_in_group}) % {pre})"
-        reduced_terms: list[str] = []
-        for p in range(pre):
-            masked_input_var = self.fn.new_var(f"strided_masked_input_{p}", dce=True)
-            reduced_var = self.fn.new_var(f"strided_reduced_{p}", dce=True)
-            state.add_statement(
-                f"{masked_input_var} = ({input_name}) if ({lane_mod_pre}) == {p} else ({identity_expr})"
-            )
-            # dim=0: reducing scalar per-thread values across warp lanes
-            reduction = backend.reduction_expr(
-                masked_input_var, reduction_type, 0, threads_in_group=group_span
-            )
-            state.add_statement(f"{reduced_var} = {reduction}")
-            reduced_terms.append(reduced_var)
-        selected_result = reduced_terms[0]
-        for p, reduced in enumerate(reduced_terms[1:], start=1):
-            selected_result = (
-                f"({reduced}) if ({lane_mod_pre}) == {p} else ({selected_result})"
-            )
-        return selected_result
+        return (
+            "_cute_grouped_reduce_warp("
+            f"{input_name}, {reduction_type!r}, {identity_expr}, {lane_expr}, "
+            f"pre={pre}, group_span={group_span})"
+        )
 
     def _strided_thread_reduction_expr_shared_two_stage(
         self,
@@ -1273,72 +1341,12 @@ class BlockReductionStrategy(ReductionStrategy):
         group_span: int,
         group_count: int,
     ) -> str:
-        backend = CompileEnvironment.current().backend
-        dtype = _dtype_str(fake_input.dtype)
-        warps_per_group = group_span // 32
-        partials_size = group_count * pre * warps_per_group
-        results_size = group_count * pre
-        smem_size = partials_size + results_size
-        smem_ptr_var = self.fn.new_var("strided_reduce_smem_ptr", dce=True)
-        smem_var = self.fn.new_var("strided_reduce_smem", dce=True)
-        group_id_var = self.fn.new_var("strided_group_id", dce=True)
-        lane_in_warp_var = self.fn.new_var("strided_lane_in_warp", dce=True)
-        warp_in_group_var = self.fn.new_var("strided_warp_in_group", dce=True)
-        partials_base_var = self.fn.new_var("strided_partials_base", dce=True)
-        results_base_var = self.fn.new_var("strided_results_base", dce=True)
-        state.add_statement(
-            f"{smem_ptr_var} = cute.arch.alloc_smem({dtype}, {smem_size})"
-        )
-        state.add_statement(
-            f"{smem_var} = cute.make_tensor({smem_ptr_var}, ({smem_size},))"
-        )
-        state.add_statement(f"{group_id_var} = ({lane_var}) // {group_span}")
-        state.add_statement(f"{lane_in_warp_var} = ({lane_var}) % 32")
-        state.add_statement(f"{warp_in_group_var} = ({lane_in_group_var}) // 32")
-        state.add_statement(
-            f"{partials_base_var} = ({group_id_var}) * {pre * warps_per_group}"
-        )
-        state.add_statement(
-            f"{results_base_var} = {partials_size} + ({group_id_var}) * {pre}"
-        )
-
-        for p in range(pre):
-            masked_input_var = self.fn.new_var(f"strided_masked_input_{p}", dce=True)
-            warp_partial_var = self.fn.new_var(f"strided_warp_partial_{p}", dce=True)
-            partial_idx_var = self.fn.new_var(f"strided_partial_idx_{p}", dce=True)
-            stage2_input_var = self.fn.new_var(f"strided_stage2_input_{p}", dce=True)
-            group_result_var = self.fn.new_var(f"strided_group_result_{p}", dce=True)
-            state.add_statement(
-                f"{masked_input_var} = ({input_name}) if ({lane_mod_pre_var}) == {p} else ({identity_expr})"
-            )
-            state.add_statement(
-                f"{warp_partial_var} = {backend.reduction_expr(masked_input_var, reduction_type, 0, threads_in_group=32)}"
-            )
-            state.add_statement(
-                f"{partial_idx_var} = ({partials_base_var}) + {p * warps_per_group} + ({warp_in_group_var})"
-            )
-            state.add_statement(
-                statement_from_string(
-                    f"""if ({lane_in_warp_var}) == 0:
-    {smem_var}[{partial_idx_var}] = {warp_partial_var}"""
-                )
-            )
-            state.add_statement("cute.arch.sync_threads()")
-
-            state.add_statement(
-                statement_from_string(
-                    f"""if ({warp_in_group_var}) == 0:
-    {stage2_input_var} = {smem_var}[({partials_base_var}) + {p * warps_per_group} + ({lane_in_warp_var})] if ({lane_in_warp_var}) < {warps_per_group} else ({identity_expr})
-    {group_result_var} = {backend.reduction_expr(stage2_input_var, reduction_type, 0, threads_in_group=32)}
-    if ({lane_in_warp_var}) == 0:
-        {smem_var}[({results_base_var}) + {p}] = {group_result_var}"""
-                )
-            )
-            state.add_statement("cute.arch.sync_threads()")
-
         result_var = self.fn.new_var("strided_reduce_result", dce=True)
         state.add_statement(
-            f"{result_var} = {smem_var}[({results_base_var}) + ({lane_mod_pre_var})]"
+            f"{result_var} = _cute_grouped_reduce_shared_two_stage("
+            f"{input_name}, {reduction_type!r}, {identity_expr}, "
+            f"{lane_var}, {lane_in_group_var}, {lane_mod_pre_var}, "
+            f"pre={pre}, group_span={group_span}, group_count={group_count})"
         )
         return result_var
 
@@ -1358,66 +1366,13 @@ class BlockReductionStrategy(ReductionStrategy):
         num_threads: int,
         group_count: int,
     ) -> str:
-        backend = CompileEnvironment.current().backend
-        dtype = _dtype_str(fake_input.dtype)
-        smem_size = num_threads + group_count * pre
-        smem_ptr_var = self.fn.new_var("strided_reduce_smem_ptr", dce=True)
-        smem_var = self.fn.new_var("strided_reduce_smem", dce=True)
-        group_base_var = self.fn.new_var("strided_group_base", dce=True)
-        group_id_var = self.fn.new_var("strided_group_id", dce=True)
-        result_base_var = self.fn.new_var("strided_result_base", dce=True)
-        state.add_statement(
-            f"{smem_ptr_var} = cute.arch.alloc_smem({dtype}, {smem_size})"
-        )
-        state.add_statement(
-            f"{smem_var} = cute.make_tensor({smem_ptr_var}, ({smem_size},))"
-        )
-        state.add_statement(f"{group_base_var} = ({lane_var}) - ({lane_in_group_var})")
-        state.add_statement(f"{group_id_var} = ({lane_var}) // {group_span}")
-        state.add_statement(
-            f"{result_base_var} = {num_threads} + ({group_id_var}) * {pre}"
-        )
-
-        for p in range(pre):
-            masked_input_var = self.fn.new_var(f"strided_masked_input_{p}", dce=True)
-            state.add_statement(
-                f"{masked_input_var} = ({input_name}) if ({lane_mod_pre_var}) == {p} else ({identity_expr})"
-            )
-            state.add_statement(f"{smem_var}[{lane_var}] = {masked_input_var}")
-            state.add_statement("cute.arch.sync_threads()")
-            stride = 1
-            while stride < group_span:
-                cond = (
-                    f"(({lane_in_group_var}) % {stride * 2}) == 0"
-                    f" and ({lane_in_group_var}) + {stride} < {group_span}"
-                )
-                lhs = f"{smem_var}[{lane_var}]"
-                rhs = (
-                    f"{smem_var}[({group_base_var}) + ({lane_in_group_var}) + {stride}]"
-                )
-                combined = backend.reduction_combine_expr(
-                    reduction_type, lhs, rhs, fake_input.dtype
-                )
-                state.add_statement(
-                    statement_from_string(
-                        f"""if {cond}:
-    {smem_var}[{lane_var}] = {combined}"""
-                    )
-                )
-                state.add_statement("cute.arch.sync_threads()")
-                stride *= 2
-
-            state.add_statement(
-                statement_from_string(
-                    f"""if ({lane_in_group_var}) == 0:
-    {smem_var}[({result_base_var}) + {p}] = {smem_var}[{lane_var}]"""
-                )
-            )
-            state.add_statement("cute.arch.sync_threads()")
-
         result_var = self.fn.new_var("strided_reduce_result", dce=True)
         state.add_statement(
-            f"{result_var} = {smem_var}[({result_base_var}) + ({lane_mod_pre_var})]"
+            f"{result_var} = _cute_grouped_reduce_shared_tree("
+            f"{input_name}, {reduction_type!r}, {identity_expr}, "
+            f"{lane_var}, {lane_in_group_var}, {lane_mod_pre_var}, "
+            f"pre={pre}, group_span={group_span}, "
+            f"num_threads={num_threads}, group_count={group_count})"
         )
         return result_var
 
@@ -1456,26 +1411,14 @@ class BlockReductionStrategy(ReductionStrategy):
             )
         ) is not None:
             expr = strided_expr
-        elif env.backend.name == "cute" and self._reduction_block_is_serial():
-            # The current reduction block is being traversed by a serial device
-            # loop rather than live threads, so the surrounding loop-carried
-            # accumulator performs the real reduction. Each iteration should
-            # contribute only its current scalar value.
-            expr = input_name
-        elif env.backend.name == "cute" and self._reduction_block_has_lane_loops():
-            # Under active lane loops the reduction is serialized by the
-            # surrounding Python loops, so each iteration should contribute its
-            # current scalar value directly. Applying a thread reduction here
-            # would incorrectly collapse across the live thread lanes instead.
-            expr = input_name
-        elif (
-            env.backend.name == "cute"
-            and not self._reduction_block_has_live_thread_axis()
-        ):
-            # The current reduction block is not backed by a live thread axis
-            # in the active loop nest, so reducing across warp lanes would fold
-            # together unrelated tensor elements. Let the surrounding loop-
-            # carried accumulator perform the reduction instead.
+        elif self._cute_reduction_needs_loop_carried_accumulator():
+            # The reduction block is not backed by a live thread axis in the
+            # active loop nest (it is iterated either by a serial device
+            # loop, by a synthetic lane loop, or has no thread axis at
+            # all). A warp-level reduction would fold together unrelated
+            # tensor elements, so each iteration contributes only its
+            # current scalar value and the surrounding loop-carried
+            # accumulator performs the real reduction.
             expr = input_name
         else:
             expr = self.call_reduction_function(

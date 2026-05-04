@@ -284,6 +284,117 @@ class TestJaggedTile(RefEagerTestDisabled, TestCase):
         with self.assertRaises(helion.exc.InvalidJaggedTileUsage):
             code_and_output(dense_add_bad_jagged_tile, (x, y))
 
+    def test_jagged_tile_2d_parent(self):
+        @helion.kernel(autotune_effort="none")
+        def jagged_tile_2d_parent(
+            x: torch.Tensor, lengths: torch.Tensor
+        ) -> torch.Tensor:
+            b1, b2 = lengths.size()
+            out = torch.zeros([b1, b2], dtype=x.dtype, device=x.device)
+            for tile_b1, tile_b2 in hl.tile([b1, b2]):
+                row_lengths = lengths[tile_b1, tile_b2]
+                acc = hl.zeros([tile_b1, tile_b2], dtype=x.dtype)
+                for tile_k in hl.jagged_tile(row_lengths):
+                    acc += x[tile_b1, tile_b2, tile_k].sum(dim=2)
+                out[tile_b1, tile_b2] = acc
+            return out
+
+        lengths = torch.tensor([[3, 1], [2, 4]], device=DEVICE, dtype=torch.long)
+        max_k = 5
+        x = torch.randn(2, 2, max_k, device=DEVICE, dtype=torch.float32)
+
+        def ref(x_data: torch.Tensor, row_lengths: torch.Tensor) -> torch.Tensor:
+            b1, b2 = row_lengths.size()
+            out = torch.zeros((b1, b2), dtype=x_data.dtype, device=x_data.device)
+            for i in range(b1):
+                for j in range(b2):
+                    L = int(row_lengths[i, j].item())
+                    out[i, j] = x_data[i, j, :L].sum()
+            return out
+
+        code, result = code_and_output(jagged_tile_2d_parent, (x, lengths))
+        self.assertIn(
+            "mask_2 = indices_2[None, None, :] < row_lengths[:, :, None]", code
+        )
+        torch.testing.assert_close(result, ref(x, lengths))
+
+    def test_jagged_tile_tensor_index_parent_blocksize_1(self):
+        # Regression: jagged_tile with parent block_size=1 exercises
+        # jagged_tile_expand_str on a (P_b, P_k) mask against a (1, P_k)-style
+        # output, which is where the size-1 dst fallback becomes relevant.
+        @helion.kernel(config={"block_sizes": [1, 4]})
+        def jagged_row_sum(
+            x_data: torch.Tensor, x_offsets: torch.Tensor
+        ) -> torch.Tensor:
+            b = x_offsets.size(0) - 1
+            out = torch.zeros([b], dtype=x_data.dtype, device=x_data.device)
+            for tile_b in hl.tile(b):
+                starts = x_offsets[tile_b]
+                ends = x_offsets[tile_b.index + 1]
+                nnz = ends - starts
+                acc = hl.zeros([tile_b], dtype=x_data.dtype)
+                for tile_k in hl.jagged_tile(nnz):
+                    idx = starts[:, None] + tile_k.index[None, :]
+                    acc += x_data[idx].sum(dim=1)
+                out[tile_b] = acc
+            return out
+
+        offsets = torch.tensor([0, 3, 4, 8, 10], device=DEVICE, dtype=torch.long)
+        x = torch.randn(int(offsets[-1].item()), device=DEVICE, dtype=torch.float32)
+
+        def ref(x_data: torch.Tensor, x_offsets: torch.Tensor) -> torch.Tensor:
+            b = x_offsets.numel() - 1
+            out = torch.zeros([b], dtype=x_data.dtype, device=x_data.device)
+            for i in range(b):
+                s = int(x_offsets[i].item())
+                e = int(x_offsets[i + 1].item())
+                out[i] = x_data[s:e].sum()
+            return out
+
+        _, result = code_and_output(jagged_row_sum, (x, offsets))
+        torch.testing.assert_close(result, ref(x, offsets))
+
+    def test_jagged_tile_tensor_index_2d_parent_blocksize_1(self):
+        # Regression: 2-D parent with block_sizes=[1, 1, 4] routes a 3-D jagged
+        # mask through the handle_broadcast_tensor + jagged_tile_expand_str
+        # pipeline. Verifies the dispatch path on an ND parent shape.
+        @helion.kernel(config={"block_sizes": [1, 1, 4]})
+        def jagged_tile_2d_parent(
+            x_data: torch.Tensor, offsets: torch.Tensor
+        ) -> torch.Tensor:
+            b1, b2 = offsets.size(0) - 1, offsets.size(1)
+            out = torch.zeros([b1, b2], dtype=x_data.dtype, device=x_data.device)
+            for tile_b1, tile_b2 in hl.tile([b1, b2]):
+                starts = offsets[tile_b1, tile_b2]
+                ends = offsets[tile_b1.index + 1, tile_b2]
+                nnz = ends - starts
+                acc = hl.zeros([tile_b1, tile_b2], dtype=x_data.dtype)
+                for tile_k in hl.jagged_tile(nnz):
+                    idx = starts[:, :, None] + tile_k.index[None, None, :]
+                    acc += x_data[idx].sum(dim=2)
+                out[tile_b1, tile_b2] = acc
+            return out
+
+        offsets = torch.tensor(
+            [[0, 0], [3, 2], [4, 5], [8, 7]], device=DEVICE, dtype=torch.long
+        )
+        total = int(offsets[-1].max().item()) + 4
+        x = torch.randn(total, device=DEVICE, dtype=torch.float32)
+
+        def ref(x_data: torch.Tensor, off: torch.Tensor) -> torch.Tensor:
+            b1 = off.size(0) - 1
+            b2 = off.size(1)
+            out = torch.zeros((b1, b2), dtype=x_data.dtype, device=x_data.device)
+            for i in range(b1):
+                for j in range(b2):
+                    s = int(off[i, j].item())
+                    e = int(off[i + 1, j].item())
+                    out[i, j] = x_data[s:e].sum()
+            return out
+
+        _, result = code_and_output(jagged_tile_2d_parent, (x, offsets))
+        torch.testing.assert_close(result, ref(x, offsets))
+
 
 if __name__ == "__main__":
     unittest.main()

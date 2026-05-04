@@ -183,6 +183,26 @@ Related settings for `from_best_available` (see {doc}`api/settings`):
 | `autotune_best_available_max_configs` | `HELION_BEST_AVAILABLE_MAX_CONFIGS` | 20 | Maximum cached configs to seed |
 | `autotune_best_available_max_cache_scan` | `HELION_BEST_AVAILABLE_MAX_CACHE_SCAN` | 500 | Maximum cache files to scan |
 
+### Autotune budget
+
+Set ``autotune_budget_seconds`` (or
+``HELION_AUTOTUNE_BUDGET_SECONDS``) to cap autotune wall time and
+return the best configuration found so far when the budget elapses:
+
+```bash
+export HELION_AUTOTUNE_BUDGET_SECONDS=300
+```
+
+```python
+@helion.kernel(autotune_budget_seconds=300)
+def my_kernel(x: torch.Tensor) -> torch.Tensor:
+    ...
+```
+
+The budget is checked between generations and during the finishing
+phase. In-flight compiling and benchmarking completes before the
+search stops. The default is ``None`` (no budget).
+
 ## Deploy a Single Config
 
 If one configuration wins for every production call, bake it into the decorator:

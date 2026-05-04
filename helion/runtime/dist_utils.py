@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import torch
 import triton
 import triton.language as tl
 
@@ -97,7 +98,7 @@ def _wait_signal(addrs, sem: tl.constexpr) -> None:  # noqa: ANN001
 
 
 @triton.jit
-def symm_mem_sync(
+def _symm_mem_sync_cuda(
     signal_pad_ptrs,  # noqa: ANN001
     block_id,  # noqa: ANN001
     rank: tl.constexpr,
@@ -158,3 +159,59 @@ def symm_mem_sync(
 
     if hasSubsequentMemAccess:
         tl.debug_barrier()
+
+
+@triton.jit
+def _symm_mem_sync_rocm(
+    signal_pad_ptrs,  # noqa: ANN001
+    block_id,  # noqa: ANN001
+    rank: tl.constexpr,
+    world_size: tl.constexpr,
+    hasPreviousMemAccess: tl.constexpr = False,  # pyrefly: ignore[bad-function-definition]
+    hasSubsequentMemAccess: tl.constexpr = False,  # pyrefly: ignore[bad-function-definition]
+) -> None:
+    """
+    ROCm fallback for symmetric-memory barrier synchronization.
+
+    This avoids CUDA inline PTX asm and relies on Triton atomics.
+    """
+    if block_id is None:
+        block_id = _get_flat_bid()
+    signal_pad_ptrs = signal_pad_ptrs.to(tl.pointer_type(tl.uint64))
+    local_signal_pad_addr = tl.load(signal_pad_ptrs + rank).to(
+        tl.pointer_type(tl.uint32)
+    )
+
+    if hasPreviousMemAccess:
+        tl.debug_barrier()
+
+    for remote_rank in tl.static_range(0, world_size):
+        remote_signal_pad_addr = tl.load(signal_pad_ptrs + remote_rank).to(
+            tl.pointer_type(tl.uint32)
+        )
+        send_addr = remote_signal_pad_addr + block_id * world_size + rank
+        if hasPreviousMemAccess:
+            while tl.atomic_cas(send_addr, 0, 1, sem="release", scope="sys") != 0:
+                pass
+        else:
+            while tl.atomic_cas(send_addr, 0, 1, sem="relaxed", scope="sys") != 0:
+                pass
+    for remote_rank in tl.static_range(0, world_size):
+        wait_addr = local_signal_pad_addr + block_id * world_size + remote_rank
+        if hasSubsequentMemAccess:
+            while tl.atomic_cas(wait_addr, 1, 0, sem="acquire", scope="sys") != 1:
+                pass
+        else:
+            while tl.atomic_cas(wait_addr, 1, 0, sem="relaxed", scope="sys") != 1:
+                pass
+
+    if hasSubsequentMemAccess:
+        tl.debug_barrier()
+
+
+SYMM_MEM_SYNC_IMPL = (
+    "rocm_atomic" if torch.version.hip is not None else "cuda_inline_asm"
+)
+symm_mem_sync = (
+    _symm_mem_sync_rocm if torch.version.hip is not None else _symm_mem_sync_cuda
+)

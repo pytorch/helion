@@ -7,6 +7,7 @@ from .config_fragment import BooleanFragment as BooleanFragment
 from .config_fragment import EnumFragment as EnumFragment
 from .config_fragment import IntegerFragment as IntegerFragment
 from .config_fragment import ListOf as ListOf
+from .config_fragment import NumThreadsFragment as NumThreadsFragment
 from .config_fragment import PowerOfTwoFragment as PowerOfTwoFragment
 from .config_spec import ConfigSpec as ConfigSpec
 from .de_surrogate_hybrid import DESurrogateHybrid as DESurrogateHybrid
@@ -15,11 +16,17 @@ from .differential_evolution import (
 )
 from .effort_profile import AutotuneEffortProfile as AutotuneEffortProfile
 from .effort_profile import DifferentialEvolutionConfig as DifferentialEvolutionConfig
+from .effort_profile import LLMSearchConfig as LLMSearchConfig
 from .effort_profile import PatternSearchConfig as PatternSearchConfig
 from .effort_profile import RandomSearchConfig as RandomSearchConfig
 from .external import UserConfigSpec as UserConfigSpec
 from .external import autotune as autotune
+from .finite_search import CachedFiniteSearch as CachedFiniteSearch
 from .finite_search import FiniteSearch as FiniteSearch
+from .finite_search import from_cache as from_cache
+from .llm_search import LLMGuidedSearch as LLMGuidedSearch
+from .llm_seeded_lfbo import LLMSeededLFBOTreeSearch as LLMSeededLFBOTreeSearch
+from .llm_seeded_lfbo import LLMSeededSearch as LLMSeededSearch
 from .local_cache import LocalAutotuneCache as LocalAutotuneCache
 from .local_cache import StrictLocalAutotuneCache as StrictLocalAutotuneCache
 from .pattern_search import InitialPopulationStrategy as InitialPopulationStrategy
@@ -35,6 +42,9 @@ search_algorithms: dict[str, type[BaseSearch]] = {
     "DESurrogateHybrid": DESurrogateHybrid,
     "LFBOPatternSearch": LFBOPatternSearch,
     "LFBOTreeSearch": LFBOTreeSearch,
+    "LLMGuidedSearch": LLMGuidedSearch,
+    "LLMSeededSearch": LLMSeededSearch,
+    "LLMSeededLFBOTreeSearch": LLMSeededLFBOTreeSearch,
     "DifferentialEvolutionSearch": DifferentialEvolutionSearch,
     "FiniteSearch": FiniteSearch,
     "PatternSearch": PatternSearch,

@@ -28,7 +28,7 @@ def type_propagation_report(fn: Kernel, *args, ignore=False):
     return fn.bind(args)._debug_str()
 
 
-@onlyBackends(["triton"])
+@onlyBackends(["triton", "cute"])
 class TestTypePropagation(RefEagerTestDisabled, TestCase):
     def test_add(self):
         output = type_propagation_report(

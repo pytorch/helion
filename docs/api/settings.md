@@ -165,6 +165,10 @@ def my_kernel(x: torch.Tensor) -> torch.Tensor:
 
    Lower values result in faster autotuning but may find less optimal configurations.
 
+.. autoattribute:: Settings.autotune_budget_seconds
+
+   Wall-clock budget in seconds for autotuning. When the budget is exceeded, Helion returns the best configuration found so far. Controlled by ``HELION_AUTOTUNE_BUDGET_SECONDS``.
+
 .. autoattribute:: Settings.autotune_ignore_errors
 
    Continue autotuning even when candidate configurations raise recoverable runtime errors (for example, GPU out-of-memory). Default is ``False``. Controlled by ``HELION_AUTOTUNE_IGNORE_ERRORS``.
@@ -313,6 +317,7 @@ Built-in values for ``HELION_AUTOTUNER`` include ``"LFBOTreeSearch"`` (default),
 | ``HELION_AUTOTUNE_PRECOMPILE_JOBS`` | ``autotune_precompile_jobs`` | Cap the number of concurrent Triton precompile subprocesses. |
 | ``HELION_AUTOTUNE_RANDOM_SEED`` | ``autotune_random_seed`` | Seed used for randomized autotuning searches. |
 | ``HELION_AUTOTUNE_MAX_GENERATIONS`` | ``autotune_max_generations`` | Upper bound on generations for Pattern Search and Differential Evolution. |
+| ``HELION_AUTOTUNE_BUDGET_SECONDS`` | ``autotune_budget_seconds`` | Wall-clock budget for an autotune run. |
 | ``HELION_AUTOTUNE_ACCURACY_CHECK`` | ``autotune_accuracy_check`` | Toggle baseline validation for candidate configs. |
 | ``HELION_AUTOTUNE_EFFORT`` | ``autotune_effort`` | Select autotuning preset (``"none"``, ``"quick"``, ``"full"``). |
 | ``HELION_AUTOTUNE_SEARCH_ACF`` | ``autotune_search_acf`` | Comma-separated list of PTXAS config file paths to search during autotuning. |
@@ -334,7 +339,7 @@ Built-in values for ``HELION_AUTOTUNER`` include ``"LFBOTreeSearch"`` (default),
 | ``HELION_ALLOW_WARP_SPECIALIZE`` | ``allow_warp_specialize`` | Permit warp-specialized code generation for ``tl.range``. |
 | ``HELION_DEBUG_DTYPE_ASSERTS`` | ``debug_dtype_asserts`` | Inject dtype assertions after each lowering step. |
 | ``HELION_INTERPRET`` | ``ref_mode`` | Run kernels through the reference interpreter when set to ``1`` (maps to ``RefMode.EAGER``). |
-| ``HELION_AUTOTUNER`` | ``default_autotuner_fn`` | Select which autotuner implementation to instantiate. Default is ``"LFBOTreeSearch"``. Other options: ``"LFBOPatternSearch"``, ``"DESurrogateHybrid"``, ``"PatternSearch"``, ``"DifferentialEvolutionSearch"``, ``"FiniteSearch"``, ``"RandomSearch"``. |
+| ``HELION_AUTOTUNER`` | ``default_autotuner_fn`` | Select which autotuner implementation to instantiate. Default is ``"LFBOTreeSearch"``. Other options: ``"LFBOPatternSearch"``, ``"DESurrogateHybrid"``, ``"PatternSearch"``, ``"DifferentialEvolutionSearch"``, ``"FiniteSearch"``, ``"RandomSearch"``, ``"LLMGuidedSearch"``, ``"LLMSeededSearch"``, ``"LLMSeededLFBOTreeSearch"``. See :doc:`autotuner` for LLM configuration. |
 | ``HELION_BACKEND`` | ``backend`` | Code generation backend (``"triton"`` (default), ``"pallas"``, ``"cute"``, ``"tileir"``). |
 
 ## See Also

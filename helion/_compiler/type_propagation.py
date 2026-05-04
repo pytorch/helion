@@ -1173,22 +1173,24 @@ class TileIndexType(TypeInfo):
 
 
 class JaggedTileIndexType(TileIndexType):
-    parent_block_id: int
+    parent_block_ids: list[int]
 
-    def __init__(self, origin: Origin, block_id: int, parent_block_id: int) -> None:
+    def __init__(
+        self, origin: Origin, block_id: int, parent_block_ids: list[int]
+    ) -> None:
         super().__init__(origin, block_id)
-        self.parent_block_id = parent_block_id
+        self.parent_block_ids = parent_block_ids
 
     def merge(self, other: TypeInfo, var_name: str | None = None) -> TypeInfo:
         if isinstance(other, JaggedTileIndexType):
             if (
                 self.block_id == other.block_id
-                and self.parent_block_id == other.parent_block_id
+                and self.parent_block_ids == other.parent_block_ids
             ):
                 return self
             raise exc.TypeInferenceError(
-                f"JaggedTileIndexType mismatch: block/parent {self.block_id}/{self.parent_block_id} "
-                f"vs {other.block_id}/{other.parent_block_id}"
+                f"JaggedTileIndexType mismatch: block/parents {self.block_id}/{self.parent_block_ids} "
+                f"vs {other.block_id}/{other.parent_block_ids}"
             )
         return super().merge(other, var_name=var_name)
 
@@ -1382,6 +1384,16 @@ class SequenceType(CollectionType):
             return first_type
 
         return super().propagate_getitem(key, origin)
+
+    def propagate_setitem(
+        self, key: TypeInfo, value: TypeInfo, origin: Origin
+    ) -> TypeInfo:
+        if self.python_type is list and isinstance(key, SymIntType):
+            if not self.element_types:
+                raise exc.TypeInferenceError("Cannot index empty sequence")
+            new_elements = [elem.merge(value) for elem in self.element_types]
+            return SequenceType(origin=origin, element_types=new_elements)
+        return super().propagate_setitem(key, value, origin)
 
     def merge(self, other: TypeInfo, var_name: str | None = None) -> TypeInfo:
         if isinstance(other, SequenceType):
@@ -1934,11 +1946,11 @@ class TypePropagation(ast.NodeVisitor):
                 shape_id = [
                     env.resolve_block_id(size) for size in list(rhs.fake_value.shape)
                 ]
-                jagged_tile_info = env.jagged_tile_parent_id
-                for jagged_tile_id, parent_block_id in jagged_tile_info.items():
+                jagged_tile_info = env.jagged_tile_parent_ids
+                for jagged_tile_id, parent_block_ids in jagged_tile_info.items():
                     include_jagged = jagged_tile_id in shape_id
-                    include_parent = parent_block_id in shape_id
-                    if include_jagged and not include_parent:
+                    include_parents = all(p in shape_id for p in parent_block_ids)
+                    if include_jagged and not include_parents:
                         raise exc.InvalidJaggedTileUsage(
                             f"jagged_tile alone cannot be used without its parent in assignment {lhs.id}"
                         )
@@ -2053,11 +2065,11 @@ class TypePropagation(ast.NodeVisitor):
             cls(elements),
         )
 
-    # pyrefly: ignore [bad-assignment, bad-param-name-override]
+    # pyrefly: ignore [bad-assignment, bad-param-name-override, bad-override-mutable-attribute]
     visit_List: _VisitMethod = _list_or_tuple
-    # pyrefly: ignore [bad-assignment, bad-param-name-override]
+    # pyrefly: ignore [bad-assignment, bad-param-name-override, bad-override-mutable-attribute]
     visit_Tuple: _VisitMethod = _list_or_tuple
-    # pyrefly: ignore [bad-assignment, bad-param-name-override]
+    # pyrefly: ignore [bad-assignment, bad-param-name-override, bad-override-mutable-attribute]
     visit_Set: _VisitMethod = _unsupported(set)
 
     def visit_Dict(self, node: ast.Dict) -> TypeInfo:
@@ -2088,7 +2100,7 @@ class TypePropagation(ast.NodeVisitor):
             raise exc.CannotReadDeviceVariableOnHost(node.id)
         return result
 
-    # pyrefly: ignore [bad-assignment, bad-param-name-override]
+    # pyrefly: ignore [bad-assignment, bad-param-name-override, bad-override-mutable-attribute]
     visit_Starred: _VisitMethod = generic_visit
 
     def visit_Expr(self, node: ast.Expr) -> TypeInfo:
@@ -2326,9 +2338,9 @@ class TypePropagation(ast.NodeVisitor):
             self.visit(node.msg)
         return NoType(origin=self.origin())
 
-    # pyrefly: ignore [bad-assignment, bad-param-name-override]
+    # pyrefly: ignore [bad-assignment, bad-param-name-override, bad-override-mutable-attribute]
     visit_Raise: _VisitMethod = generic_statement
-    # pyrefly: ignore [bad-assignment, bad-param-name-override]
+    # pyrefly: ignore [bad-assignment, bad-param-name-override, bad-override-mutable-attribute]
     visit_Delete: _VisitMethod = generic_statement
 
     def visit_Pass(self, node: ast.Pass) -> TypeInfo:
@@ -2336,9 +2348,9 @@ class TypePropagation(ast.NodeVisitor):
 
     # pyrefly: ignore [bad-assignment]
     visit_TypeAlias: _VisitMethod = generic_statement
-    # pyrefly: ignore [bad-assignment, bad-param-name-override]
+    # pyrefly: ignore [bad-assignment, bad-param-name-override, bad-override-mutable-attribute]
     visit_Import: _VisitMethod = generic_statement
-    # pyrefly: ignore [bad-assignment, bad-param-name-override]
+    # pyrefly: ignore [bad-assignment, bad-param-name-override, bad-override-mutable-attribute]
     visit_ImportFrom: _VisitMethod = generic_statement
 
     def visit_Global(self, node: ast.Global) -> TypeInfo:
@@ -2346,7 +2358,7 @@ class TypePropagation(ast.NodeVisitor):
         return NoType(origin=self.origin())
 
     # TODO(jansel): support lambda
-    # pyrefly: ignore [bad-assignment, bad-param-name-override]
+    # pyrefly: ignore [bad-assignment, bad-param-name-override, bad-override-mutable-attribute]
     visit_Lambda: _VisitMethod = generic_visit
 
     ################################################################
@@ -2440,9 +2452,9 @@ class TypePropagation(ast.NodeVisitor):
         self.scope.merge_if_else(body, orelse)
         return NoType(origin=self.origin())
 
-    # pyrefly: ignore [bad-assignment, bad-param-name-override]
+    # pyrefly: ignore [bad-assignment, bad-param-name-override, bad-override-mutable-attribute]
     visit_Break: _VisitMethod = generic_statement
-    # pyrefly: ignore [bad-assignment, bad-param-name-override]
+    # pyrefly: ignore [bad-assignment, bad-param-name-override, bad-override-mutable-attribute]
     visit_Continue: _VisitMethod = generic_statement
 
     def visit_Try(self, node: ast.Try) -> TypeInfo:
@@ -2465,11 +2477,11 @@ class TypePropagation(ast.NodeVisitor):
             self.visit(child_node)
         return NoType(origin=self.origin())
 
-    # pyrefly: ignore [bad-assignment, bad-param-name-override]
+    # pyrefly: ignore [bad-assignment, bad-param-name-override, bad-override-mutable-attribute]
     visit_ExceptHandler: _VisitMethod = _not_on_device_statement
-    # pyrefly: ignore [bad-assignment, bad-param-name-override]
+    # pyrefly: ignore [bad-assignment, bad-param-name-override, bad-override-mutable-attribute]
     visit_With: _VisitMethod = _not_on_device_statement
-    # pyrefly: ignore [bad-assignment, bad-param-name-override]
+    # pyrefly: ignore [bad-assignment, bad-param-name-override, bad-override-mutable-attribute]
     visit_Return: _VisitMethod = _not_on_device_statement
 
     def _not_supported(self, node: ast.AST) -> TypeInfo:
@@ -2594,44 +2606,44 @@ class TypePropagation(ast.NodeVisitor):
         return DictType(self.origin(), result_elements)
 
     # TODO(jansel): need to implement these
-    # pyrefly: ignore [bad-assignment, bad-param-name-override]
+    # pyrefly: ignore [bad-assignment, bad-param-name-override, bad-override-mutable-attribute]
     visit_SetComp: _VisitMethod = _not_supported
 
     # TODO(jansel): support closure functions defined on host
-    # pyrefly: ignore [bad-assignment, bad-param-name-override]
+    # pyrefly: ignore [bad-assignment, bad-param-name-override, bad-override-mutable-attribute]
     visit_FunctionDef: _VisitMethod = _not_supported
 
-    # pyrefly: ignore [bad-assignment, bad-param-name-override]
+    # pyrefly: ignore [bad-assignment, bad-param-name-override, bad-override-mutable-attribute]
     visit_ClassDef: _VisitMethod = _not_supported
-    # pyrefly: ignore [bad-assignment, bad-param-name-override]
+    # pyrefly: ignore [bad-assignment, bad-param-name-override, bad-override-mutable-attribute]
     visit_Yield: _VisitMethod = _not_supported
-    # pyrefly: ignore [bad-assignment, bad-param-name-override]
+    # pyrefly: ignore [bad-assignment, bad-param-name-override, bad-override-mutable-attribute]
     visit_YieldFrom: _VisitMethod = _not_supported
-    # pyrefly: ignore [bad-assignment, bad-param-name-override]
+    # pyrefly: ignore [bad-assignment, bad-param-name-override, bad-override-mutable-attribute]
     visit_AsyncFunctionDef: _VisitMethod = _not_supported
-    # pyrefly: ignore [bad-assignment, bad-param-name-override]
+    # pyrefly: ignore [bad-assignment, bad-param-name-override, bad-override-mutable-attribute]
     visit_AsyncFor: _VisitMethod = _not_supported
-    # pyrefly: ignore [bad-assignment, bad-param-name-override]
+    # pyrefly: ignore [bad-assignment, bad-param-name-override, bad-override-mutable-attribute]
     visit_AsyncWith: _VisitMethod = _not_supported
-    # pyrefly: ignore [bad-assignment, bad-param-name-override]
+    # pyrefly: ignore [bad-assignment, bad-param-name-override, bad-override-mutable-attribute]
     visit_Await: _VisitMethod = _not_supported
-    # pyrefly: ignore [bad-assignment, bad-param-name-override]
+    # pyrefly: ignore [bad-assignment, bad-param-name-override, bad-override-mutable-attribute]
     visit_Match: _VisitMethod = _not_supported
-    # pyrefly: ignore [bad-assignment, bad-param-name-override]
+    # pyrefly: ignore [bad-assignment, bad-param-name-override, bad-override-mutable-attribute]
     visit_MatchValue: _VisitMethod = _not_supported
-    # pyrefly: ignore [bad-assignment, bad-param-name-override]
+    # pyrefly: ignore [bad-assignment, bad-param-name-override, bad-override-mutable-attribute]
     visit_MatchSingleton: _VisitMethod = _not_supported
-    # pyrefly: ignore [bad-assignment, bad-param-name-override]
+    # pyrefly: ignore [bad-assignment, bad-param-name-override, bad-override-mutable-attribute]
     visit_MatchSequence: _VisitMethod = _not_supported
-    # pyrefly: ignore [bad-assignment, bad-param-name-override]
+    # pyrefly: ignore [bad-assignment, bad-param-name-override, bad-override-mutable-attribute]
     visit_MatchStar: _VisitMethod = _not_supported
-    # pyrefly: ignore [bad-assignment, bad-param-name-override]
+    # pyrefly: ignore [bad-assignment, bad-param-name-override, bad-override-mutable-attribute]
     visit_MatchMapping: _VisitMethod = _not_supported
-    # pyrefly: ignore [bad-assignment, bad-param-name-override]
+    # pyrefly: ignore [bad-assignment, bad-param-name-override, bad-override-mutable-attribute]
     visit_MatchClass: _VisitMethod = _not_supported
-    # pyrefly: ignore [bad-assignment, bad-param-name-override]
+    # pyrefly: ignore [bad-assignment, bad-param-name-override, bad-override-mutable-attribute]
     visit_MatchAs: _VisitMethod = _not_supported
-    # pyrefly: ignore [bad-assignment, bad-param-name-override]
+    # pyrefly: ignore [bad-assignment, bad-param-name-override, bad-override-mutable-attribute]
     visit_MatchOr: _VisitMethod = _not_supported
 
 

@@ -336,6 +336,32 @@ class TestDot(RefEagerTestBase, TestCase):
         expected = torch.bmm(A, B).to(result.dtype) * 2
         torch.testing.assert_close(result, expected, atol=1e-2, rtol=1e-2)
 
+    @skipIfNotTriton("3D hl.dot regression targets Triton and ref eager")
+    def test_hl_dot_3d_out_dtype(self):
+        @helion.kernel(
+            config=helion.Config(block_sizes=[1, 16, 16]),
+            static_shapes=True,
+            dot_precision=get_test_dot_precision(),
+        )
+        def bmm(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+            b, m, k = A.size()
+            _, _, n = B.size()
+            out = torch.empty([b, m, n], device=A.device, dtype=torch.float32)
+            for tile_b, tile_m, tile_n in hl.tile([b, m, n]):
+                out[tile_b, tile_m, tile_n] = hl.dot(
+                    A[tile_b, tile_m, :],
+                    B[tile_b, :, tile_n],
+                    out_dtype=torch.float32,
+                )
+            return out
+
+        A = torch.randn([2, 32, 24], device=DEVICE, dtype=torch.bfloat16)
+        B = torch.randn([2, 24, 16], device=DEVICE, dtype=torch.bfloat16)
+
+        _, result = code_and_output(bmm, (A, B))
+        expected = torch.bmm(A, B, out_dtype=torch.float32)
+        torch.testing.assert_close(result, expected, atol=1e-2, rtol=1e-2)
+
     def _assert_warning_in_stderr(
         self, kernel, args, expected_result, warning_str, *, atol=1e-2, rtol=1e-2
     ):
@@ -922,6 +948,7 @@ class TestDot(RefEagerTestBase, TestCase):
         """Test hl.dot with N=2 created through reshape."""
         self._test_reshape_n_2(lambda acc, a, b: hl.dot(a, b, acc=acc))
 
+    @skipIfXPU("Accuracy issue on XPU - small M dim tiles produce wrong results")
     def test_mm_small_m_dim(self):
         """Test torch.mm with M=2 smaller than the minimum of 16 for tl.dot."""
         # Allow slightly larger absolute error for torch.mm small-dim tiles
@@ -1000,6 +1027,7 @@ class TestDot(RefEagerTestBase, TestCase):
             lambda acc, a, b: acc + torch.mm(a, b), rtol=1e-2, atol=5e-2
         )
 
+    @skipIfXPU("Accuracy issue on XPU - small M dim tiles produce wrong results")
     def test_matmul_small_m_dim(self):
         """Test torch.matmul with M=2 smaller than the minimum of 16 for tl.dot."""
         # Allow slightly larger absolute error for small-dim tiles

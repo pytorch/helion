@@ -32,6 +32,7 @@ from .program_id import PersistentBlockedProgramIDs
 from .program_id import PersistentInterleavedProgramIDs
 from .program_id import PIDInfo
 from .program_id import ProgramIDs
+from .program_id import Tcgen05PersistentProgramIDs
 from .program_id import XYZProgramIDs
 
 if TYPE_CHECKING:
@@ -64,6 +65,13 @@ class ThreadAxisTracker:
         self.sizes[axis] = size
         for block_id in block_ids:
             self.block_axes[block_id] = axis
+
+
+def _lane_loop_iter(extent: int) -> ast.AST:
+    # CuTe lane loops carry per-thread scalar state. Emitting them via
+    # cutlass.range(_constexpr) miscompiles scalar matmul paths, so keep them
+    # as ordinary Python loops.
+    return expr_from_string(f"range({extent})")
 
 
 @dataclasses.dataclass
@@ -124,13 +132,17 @@ class EmitPipelineLoopState(DeviceLoopOrGridState):
     pipeline_call: ast.AST | None = None
     outer_prefix: list[ast.AST] = dataclasses.field(default_factory=list)
     outer_suffix: list[ast.AST] = dataclasses.field(default_factory=list)
+    _tensor_to_dma_scratch: dict[str, str] = dataclasses.field(default_factory=dict)
 
 
 @dataclasses.dataclass
 class ForiLoopState(DeviceLoopOrGridState):
     """State for fori_loop-based loops on TPU (Pallas backend).
 
-    Uses jax.lax.fori_loop with pltpu.make_async_copy for manual DMA control.
+    Uses jax.lax.fori_loop with pltpu.make_async_copy for tensors whose
+    inner-block shape passes ``_check_dma_alignment``; tensors that fail
+    are kept on their outer BlockSpec and accessed via ``pl.ds`` from the
+    body.  Per-tensor pipelining membership lives in ``_tensor_to_dma_scratch``.
     """
 
     body_fn_name: str
@@ -138,7 +150,7 @@ class ForiLoopState(DeviceLoopOrGridState):
     inner_statements: list[ast.AST] = dataclasses.field(default_factory=list)
     outer_prefix: list[ast.AST] = dataclasses.field(default_factory=list)
     outer_suffix: list[ast.AST] = dataclasses.field(default_factory=list)
-    _tensor_to_vmem: dict[str, str] = dataclasses.field(default_factory=dict)
+    _tensor_to_dma_scratch: dict[str, str] = dataclasses.field(default_factory=dict)
     _tensor_to_sem: dict[str, str] = dataclasses.field(default_factory=dict)
 
 
@@ -164,7 +176,7 @@ class DeviceGridState(DeviceLoopOrGridState):
                 create(
                     ast.For,
                     target=create(ast.Name, id=lane_var, ctx=ast.Store()),
-                    iter=expr_from_string(f"range({extent})"),
+                    iter=_lane_loop_iter(extent),
                     body=wrapped,
                     orelse=[],
                     type_comment=None,
@@ -190,7 +202,7 @@ class PersistentReductionState(DeviceLoopOrGridState):
                 create(
                     ast.For,
                     target=create(ast.Name, id=lane_var, ctx=ast.Store()),
-                    iter=expr_from_string(f"range({extent})"),
+                    iter=_lane_loop_iter(extent),
                     body=wrapped,
                     orelse=[],
                     type_comment=None,
@@ -677,22 +689,47 @@ class BlockSizeTileStrategy(TileStrategy):
             isinstance(strategy, ReductionStrategy) and strategy.thread_axes_used() > 0
             for strategy in self.fn.tile_strategy.strategies
         )
+        plan = self.fn.tile_strategy.current_cute_grid_execution_plan(
+            block_ids=self.block_ids
+        )
+        if plan is not None and any(
+            plan.disables_reduction_axis_reservation(block_id)
+            for block_id in self.block_ids
+        ):
+            return active_non_reduction_axes + active_reduction_axes
         reserved_reduction_axes = max(
             1 if has_reduction_strategy else 0, active_reduction_axes
         )
         return reserved_reduction_axes + active_non_reduction_axes
 
     def select_pid_strategy(self) -> ProgramIDs:
+        backend_name = CompileEnvironment.current().backend.name
         pid_type = self.fn.config.pid_type
         if pid_type == "xyz":
             assert 1 < len(self.block_ids) <= 3
             return XYZProgramIDs()
+        use_tcgen05_scheduler = self._use_tcgen05_persistent_scheduler(
+            pid_type, backend_name
+        )
         if pid_type == "persistent_blocked":
+            if use_tcgen05_scheduler:
+                return Tcgen05PersistentProgramIDs(is_blocked=True)
             return PersistentBlockedProgramIDs()
         if pid_type == "persistent_interleaved":
+            if use_tcgen05_scheduler:
+                return Tcgen05PersistentProgramIDs(is_blocked=False)
             return PersistentInterleavedProgramIDs()
         assert pid_type == "flat"
         return FlatProgramIDs()
+
+    def _use_tcgen05_persistent_scheduler(
+        self, pid_type: str, backend_name: str
+    ) -> bool:
+        if backend_name != "cute" or not pid_type.startswith("persistent"):
+            return False
+        from .backend import _kernel_specialized_mma_impl
+
+        return _kernel_specialized_mma_impl(self.fn, config=self.fn.config) == "tcgen05"
 
 
 class FlattenedTileStrategy(BlockSizeTileStrategy):
@@ -1698,14 +1735,20 @@ class NDTileStrategy(_BaseNDTileStrategy):
             jagged_tile_block_size = env.block_sizes[block_idx].var
             jagged_tile_parent_proxy = jagged_tile_parents_proxy[0]
             assert isinstance(jagged_tile_parent_proxy, torch.Tensor)
-            jagged_tile_parent_block_size = jagged_tile_parent_proxy.size(0)
-            assert isinstance(jagged_tile_parent_block_size, torch.SymInt)
+            parent_dims: list[torch.SymInt] = []
+            for d in jagged_tile_parent_proxy.size():
+                assert isinstance(d, torch.SymInt)
+                parent_dims.append(d)
+            assert len(parent_dims) >= 1
             env.jagged_tile_mask_shapes[block_idx] = [
-                jagged_tile_parent_block_size,
+                *parent_dims,
                 jagged_tile_block_size,
             ]
+            k = len(parent_dims)
+            child_expand = "[" + ", ".join(["None"] * k + [":"]) + "]"
+            parent_expand = "[" + ", ".join([":"] * k + ["None"]) + "]"
             return statement_from_string(
-                f"{mask_var} = ({index_var})[None,:] < {{parent}}[:,None]",
+                f"{mask_var} = ({index_var}){child_expand} < {{parent}}{parent_expand}",
                 parent=self._to_ast(jagged_tile_parent),
             )
 
@@ -1927,6 +1970,7 @@ class CuteNDTileStrategy(NDTileStrategy):
         steps = self._root_grid_steps(state)
 
         lane_setup_statements: list[ast.AST] = []
+        outer_setup_statements: list[ast.AST] = []
         tracker = ThreadAxisTracker()
         thread_axis_offset = self._thread_axis_offset(state)
         thread_axis_map = self._thread_axis_map()
@@ -1975,25 +2019,36 @@ class CuteNDTileStrategy(NDTileStrategy):
             )
             axis = thread_axis_offset + thread_axis_map[block_idx]
             if uses_thread_axis:
-                idx_expr = f"{offset_var} + cutlass.Int32(cute.arch.thread_idx()[{axis}]) * {elements_per_thread}"
-                static_thread_extent = self._static_thread_extent_for_block(
-                    block_idx, block_size
+                idx_expr = env.backend.lane_index_expr(
+                    offset_var, elements_per_thread, axis=axis
                 )
-                if isinstance(static_thread_extent, int):
-                    tracker.record(block_idx, axis, static_thread_extent)
+                thread_extent = self._thread_extent_for_axis(block_idx, block_size)
+                static_extent = (
+                    thread_extent
+                    if isinstance(thread_extent, int)
+                    else self._static_thread_extent_for_block(block_idx, block_size)
+                )
+                if isinstance(static_extent, int):
+                    tracker.record(block_idx, axis, static_extent)
             else:
                 idx_expr = offset_var
             if lane_var := self._lane_var_by_block.get(block_idx):
-                idx_expr = f"{idx_expr} + cutlass.Int32({lane_var})"
-            lane_setup_statements.append(
-                statement_from_string(f"{index_var} = {idx_expr}")
-            )
+                idx_expr = f"{idx_expr} + {env.backend.lane_offset_expr(lane_var)}"
+                target = lane_setup_statements
+            else:
+                # Setup that does not depend on a lane variable can be hoisted
+                # out of the lane loops. This avoids reassignments inside the
+                # lane-loop body that confuse the CuTe DSL preprocessor when
+                # its internal negative-step machinery emits identifiers like
+                # ``offset_<n>`` that collide with helion's tile offsets.
+                target = outer_setup_statements
+            target.append(statement_from_string(f"{index_var} = {idx_expr}"))
 
             mask_statement = self._setup_mask(
                 state, block_idx, block_size, index_var, end
             )
             if mask_statement is not None:
-                lane_setup_statements.append(mask_statement)
+                target.append(mask_statement)
             pid = PIDInfo(pid_var, block_size_var, numel, block_idx)
             pids.append(pid)
         pids.codegen(state)
@@ -2025,6 +2080,7 @@ class CuteNDTileStrategy(NDTileStrategy):
             lane_loops=lane_loops,
             lane_loop_blocks=set(self._lane_var_by_block),
             lane_setup_statements=lane_setup_statements,
+            outer_prefix=outer_setup_statements,
             thread_axis_sizes=tracker.sizes,
             block_thread_axes=tracker.block_axes,
         )
@@ -2050,7 +2106,7 @@ class CuteNDTileStrategy(NDTileStrategy):
             lane_for = create(
                 ast.For,
                 target=create(ast.Name, id=lane_var, ctx=ast.Store()),
-                iter=expr_from_string(f"range({extent})"),
+                iter=_lane_loop_iter(extent),
                 body=body,
                 orelse=[],
                 type_comment=None,
@@ -2134,16 +2190,21 @@ class CuteNDTileStrategy(NDTileStrategy):
             )
             axis = thread_axis_offset + thread_axis_map[block_idx]
             if uses_thread_axis:
-                idx_expr = f"{offset_var} + cutlass.Int32(cute.arch.thread_idx()[{axis}]) * {elements_per_thread}"
-                static_thread_extent = self._static_thread_extent_for_block(
-                    block_idx, block_size
+                idx_expr = env.backend.lane_index_expr(
+                    offset_var, elements_per_thread, axis=axis
                 )
-                if isinstance(static_thread_extent, int):
-                    tracker.record(block_idx, axis, static_thread_extent)
+                thread_extent = self._thread_extent_for_axis(block_idx, block_size)
+                static_extent = (
+                    thread_extent
+                    if isinstance(thread_extent, int)
+                    else self._static_thread_extent_for_block(block_idx, block_size)
+                )
+                if isinstance(static_extent, int):
+                    tracker.record(block_idx, axis, static_extent)
             else:
                 idx_expr = offset_var
             if lane_var := self._lane_var_by_block.get(block_idx):
-                idx_expr = f"{idx_expr} + cutlass.Int32({lane_var})"
+                idx_expr = f"{idx_expr} + {env.backend.lane_offset_expr(lane_var)}"
             index_setup.append(statement_from_string(f"{index_var} = {idx_expr}"))
             mask_statement = self._setup_mask(
                 state, block_idx, block_size, index_var, end
@@ -2252,7 +2313,7 @@ class CuteFlattenedTileStrategy(FlattenedTileStrategy):
 
         lane_setup_statements.append(
             statement_from_string(
-                f"{offsets_var} = {offsets_base_var} + cutlass.Int32({self._lane_var})"
+                f"{offsets_var} = {offsets_base_var} + {env.backend.lane_offset_expr(self._lane_var)}"
             )
         )
         for i, block_idx in enumerate(self._reorder(block_ids)):
@@ -2283,7 +2344,7 @@ class CuteFlattenedTileStrategy(FlattenedTileStrategy):
         pids.append(PIDInfo(pid_var, block_size_var, total_numel, self.block_ids[0]))
         axis = self._flat_thread_axis()
         state.add_statement(
-            f"{offsets_base_var} = ({pid_var}) * ({block_size_var}) + cutlass.Int32(cute.arch.thread_idx()[{axis}]) * {self._elements_per_thread}"
+            f"{offsets_base_var} = {env.backend.lane_index_expr(f'({pid_var}) * ({block_size_var})', self._elements_per_thread, axis=axis)}"
         )
         pids.codegen(state)
         if isinstance(state.device_function.pid, ForEachProgramID):
@@ -2325,7 +2386,7 @@ class CuteFlattenedTileStrategy(FlattenedTileStrategy):
 
         lane_setup_statements.append(
             statement_from_string(
-                f"{offsets_var} = {offsets_base_var} + cutlass.Int32({self._lane_var})"
+                f"{offsets_var} = {offsets_base_var} + {env.backend.lane_offset_expr(self._lane_var)}"
             )
         )
         for i, block_idx in enumerate(self._reorder(block_ids)):
@@ -2369,7 +2430,7 @@ class CuteFlattenedTileStrategy(FlattenedTileStrategy):
             body = [lane_for]
         body[:0] = [
             statement_from_string(
-                f"{offsets_base_var} = {lid} * ({block_size_var}) + cutlass.Int32(cute.arch.thread_idx()[{axis}]) * {self._elements_per_thread}"
+                f"{offsets_base_var} = {env.backend.lane_index_expr(f'{lid} * ({block_size_var})', self._elements_per_thread, axis=axis)}"
             )
         ]
         for_node = create(

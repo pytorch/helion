@@ -12,9 +12,9 @@ from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import import_path
 from helion._testing import onlyBackends
+from helion._testing import skipIfLowVRAM
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfTileIR
-from helion._testing import xfailIfCute
 import helion.language as hl
 from helion.runtime.settings import _get_backend
 
@@ -111,6 +111,10 @@ class TestGenerateAst(RefEagerTestBase, TestCase):
         )
         torch.testing.assert_close(result, args[0] + args[1])
 
+    @skipIfLowVRAM(
+        "Test requires sufficient free VRAM for [512, 512, 512] tensors",
+        required_bytes=3 * 1024**3,
+    )
     def test_add_tilend0(self):
         args = (
             torch.randn([512, 512, 512], device=DEVICE),
@@ -121,6 +125,10 @@ class TestGenerateAst(RefEagerTestBase, TestCase):
         )
         torch.testing.assert_close(result, args[0] + args[1])
 
+    @skipIfLowVRAM(
+        "Test requires sufficient free VRAM for [512, 512, 512] tensors",
+        required_bytes=3 * 1024**3,
+    )
     def test_add_tilend1(self):
         args = (
             torch.randn([512, 512, 512], device=DEVICE),
@@ -131,6 +139,10 @@ class TestGenerateAst(RefEagerTestBase, TestCase):
         )
         torch.testing.assert_close(result, args[0] + args[1])
 
+    @skipIfLowVRAM(
+        "Test requires sufficient free VRAM for [512, 512, 512] tensors",
+        required_bytes=3 * 1024**3,
+    )
     def test_add_tilend2(self):
         args = (
             torch.randn([512, 512, 512], device=DEVICE),
@@ -141,6 +153,10 @@ class TestGenerateAst(RefEagerTestBase, TestCase):
         )
         torch.testing.assert_close(result, args[0] + args[1])
 
+    @skipIfLowVRAM(
+        "Test requires sufficient free VRAM for [512, 512, 512] tensors",
+        required_bytes=3 * 1024**3,
+    )
     def test_add_tilend3(self):
         args = (
             torch.randn([512, 512, 512], device=DEVICE),
@@ -274,9 +290,6 @@ class TestGenerateAst(RefEagerTestBase, TestCase):
             self.assertIn("cutlass.BFloat16", code)
 
     @skipIfTileIR("TileIR does not support block_ptr indexing")
-    @xfailIfCute(
-        "cute: sigmoid epilogue still relies on unsupported scalar matmul fallback without an active K tile"
-    )
     def test_sigmoid_scalar_autocast(self):
         @helion.kernel(
             config=helion.Config(
@@ -304,7 +317,10 @@ class TestGenerateAst(RefEagerTestBase, TestCase):
         w = torch.randn(n, n, device=DEVICE, dtype=dtype)
 
         code, result = code_and_output(se_block_fwd, (x, w))
-
+        if _get_backend() == "cute":
+            self.assertIn("cute.gemm", code)
+            self.assertIn("cute.nvgpu.warp.MmaF16BF16Op", code)
+            self.assertNotIn("dot_serial_result", code)
         x_fp32 = x.to(torch.float32)
         w_fp32 = w.to(torch.float32)
         expected = (2.0 * x_fp32 * torch.sigmoid(x_fp32 @ w_fp32)).to(dtype)
@@ -312,9 +328,6 @@ class TestGenerateAst(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, expected, atol=1e-1, rtol=1e-1)
 
     @skipIfTileIR("TileIR does not support block_ptr indexing")
-    @xfailIfCute(
-        "cute: sigmoid epilogue still relies on unsupported scalar matmul fallback without an active K tile"
-    )
     def test_fast_sigmoid(self):
         @helion.kernel(
             config=helion.Config(
@@ -343,10 +356,13 @@ class TestGenerateAst(RefEagerTestBase, TestCase):
         w = torch.randn(n, n, device=DEVICE, dtype=dtype)
 
         code, result = code_and_output(se_block_fwd, (x, w))
-
         if _get_backend() == "triton":
             self.assertIn("fast_dividef", code)
             self.assertIn("fast_expf", code)
+        elif _get_backend() == "cute":
+            self.assertIn("cute.gemm", code)
+            self.assertIn("cute.nvgpu.warp.MmaF16BF16Op", code)
+            self.assertNotIn("dot_serial_result", code)
 
         x_fp32 = x.to(torch.float32)
         w_fp32 = w.to(torch.float32)

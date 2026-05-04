@@ -64,6 +64,8 @@ if TYPE_CHECKING:
 
     from .. import Config
     from .backend import InductorOpOverrides
+    from .cute.layout import MatmulAxisModel
+    from .cute.layout import MatmulExecutionPlan
     from .cute.layout import ThreadLayout
     from .device_function import DeviceFunction
     from .device_ir import GraphInfo
@@ -211,6 +213,7 @@ def prepare_node_lowering(
             buffer_name_to_output_index[buffer.get_name()] = i
 
     new_buffers = graph_lowering.buffers[prior_buffers:]
+    # pyrefly: ignore [unbound-name]
     assert buffer in new_buffers
     nodes = []
     extra_input_names = []
@@ -1146,6 +1149,39 @@ class GraphInterpreter(LoweringContext, Interpreter):
             return value
         raise TypeError(f"Unsupported value type for AST conversion: {type(value)}")
 
+    @property
+    def cute_layout(self) -> ThreadLayout | None:
+        if V.current_node is None:
+            return None
+        from .cute.layout_propagation import META_KEY
+
+        constraint = V.current_node.meta.get(META_KEY)
+        if constraint is None:
+            return None
+        return constraint.primary_layout()
+
+    @property
+    def cute_matmul_axes(self) -> MatmulAxisModel | None:
+        if V.current_node is None:
+            return None
+        from .cute.layout_propagation import META_KEY
+
+        constraint = V.current_node.meta.get(META_KEY)
+        if constraint is None:
+            return None
+        return constraint.matmul_axes
+
+    @property
+    def cute_matmul_plan(self) -> MatmulExecutionPlan | None:
+        if V.current_node is None:
+            return None
+        from .cute.layout_propagation import META_KEY
+
+        constraint = V.current_node.meta.get(META_KEY)
+        if constraint is None:
+            return None
+        return constraint.matmul_plan
+
     def _create_named_result(self, node: Node, result: ast.expr) -> str:
         """Create a named variable for a node result, handling block-size-only expressions as constexpr."""
         val = node.meta.get("val")
@@ -1322,6 +1358,9 @@ def codegen_call_with_graph(
     copy_named_args: bool = True,
 ) -> list[object]:
     with compile_lock:
+        from .cute.cute_mma import prepare_cute_collective_lane_loop_suppression
+
+        prepare_cute_collective_lane_loop_suppression(cg, graph)
         new_args = []
         placeholders = graph.find_nodes(op="placeholder")
         for arg, placeholder in zip(args, placeholders, strict=True):
@@ -1398,4 +1437,28 @@ class CodegenState(NamedTuple):
         constraint = self.fx_node.meta.get(META_KEY)
         if constraint is None:
             return None
-        return constraint.layout  # type: ignore[return-value]
+        return constraint.primary_layout()  # type: ignore[return-value]
+
+    @property
+    def cute_matmul_axes(self) -> MatmulAxisModel | None:
+        """Return the planner-owned CuTe matmul axis model for the current FX node."""
+        if self.fx_node is None:
+            return None
+        from .cute.layout_propagation import META_KEY
+
+        constraint = self.fx_node.meta.get(META_KEY)
+        if constraint is None:
+            return None
+        return constraint.matmul_axes
+
+    @property
+    def cute_matmul_plan(self) -> MatmulExecutionPlan | None:
+        """Return the planner-owned CuTe matmul execution plan for the node."""
+        if self.fx_node is None:
+            return None
+        from .cute.layout_propagation import META_KEY
+
+        constraint = self.fx_node.meta.get(META_KEY)
+        if constraint is None:
+            return None
+        return constraint.matmul_plan

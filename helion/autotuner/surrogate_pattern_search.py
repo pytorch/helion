@@ -6,6 +6,7 @@ import random
 from typing import TYPE_CHECKING
 
 from .. import exc
+from .base_search import BenchmarkResult
 from .base_search import PopulationBasedSearch
 from .base_search import PopulationMember
 from .base_search import check_population_consistency
@@ -176,6 +177,27 @@ class LFBOPatternSearch(PatternSearch):
             "best_available_pad_random": profile.lfbo_pattern_search.best_available_pad_random,
             **PopulationBasedSearch.get_kwargs_from_profile(profile, settings),
         }
+
+    def seed_training_data(
+        self,
+        results: Sequence[BenchmarkResult],
+    ) -> None:
+        """Pre-populate the surrogate's training set with externally-benchmarked configs.
+
+        Useful when an outer loop (e.g. a hybrid LLM+LFBO search) has already
+        benchmarked configs and wants the LFBO surrogate to learn from them
+        rather than starting from scratch. Failed configs (perf=inf) are
+        kept since the surrogate's binary classifier learns from negatives too.
+        """
+        for result in results:
+            try:
+                flat_values = self.config_gen.flatten(result.config)
+                encoded = self.config_gen.encode_config(flat_values)
+            except Exception as e:
+                self.log.debug(f"seed_training_data: skipping config: {e}")
+                continue
+            self.train_x.append(encoded)
+            self.train_y.append(result.perf)
 
     def _fit_surrogate(self) -> None:
         train_x = np.array(self.train_x)
@@ -366,11 +388,11 @@ class LFBOPatternSearch(PatternSearch):
         self.population = []
         for flat_config in self._generate_initial_population_flat():
             member = self.make_unbenchmarked(flat_config)
-            if member.config not in visited:
+            if member is not None and member.config not in visited:
                 visited.add(member.config)
                 self.population.append(member)
         self.set_generation(0)
-        self.parallel_benchmark_population(self.population, desc="Initial population")
+        self.benchmark_population(self.population, desc="Initial population")
 
         # Compute adaptive compile timeout based on initial population compile times
         self.set_adaptive_compile_timeout(
@@ -409,7 +431,7 @@ class LFBOPatternSearch(PatternSearch):
             for idx, m in enumerate(starting_points)
         ]
 
-        for generation in range(1, self.max_generations + 1):
+        for generation in self._budgeted_range(1, self.max_generations + 1):
             prior_best = self.best
             new_population = {id(prior_best): prior_best}
             num_neighbors = 0
@@ -438,7 +460,7 @@ class LFBOPatternSearch(PatternSearch):
             unbenchmarked = [m for m in self.population if len(m.perfs) == 0]
             if unbenchmarked:
                 self.set_generation(generation)
-                self.parallel_benchmark_population(
+                self.benchmark_population(
                     unbenchmarked, desc=f"Generation {generation}:"
                 )
             # higher-accuracy rebenchmark
@@ -572,7 +594,7 @@ class LFBOPatternSearch(PatternSearch):
                 all_neighbors = self._generate_neighbors(current.flat_values)
             for flat_config in all_neighbors:
                 new_member = self.make_unbenchmarked(flat_config)
-                if new_member.config not in visited:
+                if new_member is not None and new_member.config not in visited:
                     candidates.append(new_member)
                     visited.add(new_member.config)
 

@@ -80,6 +80,15 @@ class TestBroadcasting(RefEagerTestBase, TestCase):
         if _get_backend() == "triton":
             self.assertIn("tl.make_block_ptr", code)
 
+    @skipIfTileIR("tt.make_tensor_ptr legalization not supported in pinned tileir")
+    def test_broadcast6(self):
+        code = _check_broadcast_fn(
+            block_sizes=[128, 128],
+            indexing="block_ptr",
+        )
+        if _get_backend() == "triton":
+            self.assertIn("tl.make_block_ptr", code)
+
     @xfailIfPallas("constexpr scalar + None-broadcast unsupported")
     def test_constexpr_index(self):
         @helion.kernel

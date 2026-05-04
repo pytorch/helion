@@ -17,10 +17,7 @@ from typing import TypeVar
 
 _F = TypeVar("_F", bound=Callable[..., Any])
 
-
-def _is_enabled() -> bool:
-    """Check if compile time measurement is enabled via HELION_MEASURE_COMPILE_TIME=1."""
-    return os.environ.get("HELION_MEASURE_COMPILE_TIME", "0") == "1"
+_enabled: bool = os.environ.get("HELION_MEASURE_COMPILE_TIME", "0") == "1"
 
 
 class CompileTimeTracker:
@@ -32,6 +29,7 @@ class CompileTimeTracker:
     """
 
     _instance: CompileTimeTracker | None = None
+    _atexit_registered: ClassVar[bool] = False
     _lock = threading.Lock()
 
     def __init__(self) -> None:
@@ -47,14 +45,20 @@ class CompileTimeTracker:
         if cls._instance is None:
             with cls._lock:
                 if cls._instance is None:
-                    cls._instance = CompileTimeTracker()
-                    if _is_enabled():
-                        atexit.register(cls._instance.print_report)
+                    cls._instance = cls()
+                    if _enabled:
+                        cls._register_atexit_unlocked(cls._instance)
         return cls._instance
+
+    @classmethod
+    def _register_atexit_unlocked(cls, tracker: CompileTimeTracker) -> None:
+        if not cls._atexit_registered:
+            atexit.register(tracker.print_report)
+            cls._atexit_registered = True
 
     def start(self, name: str) -> None:
         """Start timing a named section."""
-        if not _is_enabled():
+        if not _enabled:
             return
         tid = threading.get_ident()
         with self._timer_lock:
@@ -64,7 +68,7 @@ class CompileTimeTracker:
 
     def stop(self, name: str) -> float:
         """Stop timing a named section and return elapsed time."""
-        if not _is_enabled():
+        if not _enabled:
             return 0.0
         end_time = time.perf_counter()
         tid = threading.get_ident()
@@ -92,7 +96,7 @@ class CompileTimeTracker:
 
     def record(self, name: str, elapsed: float) -> None:
         """Directly record a timing measurement."""
-        if not _is_enabled():
+        if not _enabled:
             return
         with self._timer_lock:
             self._timings[name] += elapsed
@@ -225,23 +229,38 @@ def get_tracker() -> CompileTimeTracker:
     return CompileTimeTracker.instance()
 
 
-@contextlib.contextmanager
-def measure(name: str) -> Generator[None, None, None]:
-    """
-    Context manager to measure compilation time for a named section.
+_NOOP: contextlib.AbstractContextManager[None] = contextlib.nullcontext()
 
-    Usage:
-        with measure("phase_name"):
-            # code to measure
 
-    Only active when HELION_MEASURE_COMPILE_TIME=1 is set.
-    """
-    tracker = get_tracker()
-    tracker.start(name)
-    try:
-        yield
-    finally:
-        tracker.stop(name)
+class _MeasureContext:
+    __slots__ = ("_name", "_tracker")
+
+    def __init__(self, name: str, tracker: CompileTimeTracker) -> None:
+        self._name = name
+        self._tracker = tracker
+
+    def __enter__(self) -> None:
+        self._tracker.start(self._name)
+        return None
+
+    def __exit__(self, *args: object) -> None:
+        self._tracker.stop(self._name)
+
+
+def measure(name: str) -> contextlib.AbstractContextManager[None]:
+    if not _enabled:
+        return _NOOP
+    return _MeasureContext(name, get_tracker())
+
+
+def enable() -> None:
+    """Enable compile-time measurement after this module has been imported."""
+    global _enabled
+    with CompileTimeTracker._lock:
+        _enabled = True
+        if CompileTimeTracker._instance is None:
+            CompileTimeTracker._instance = CompileTimeTracker()
+        CompileTimeTracker._register_atexit_unlocked(CompileTimeTracker._instance)
 
 
 def timed(name: str | None = None) -> Callable[[_F], _F]:
@@ -266,7 +285,7 @@ def timed(name: str | None = None) -> Callable[[_F], _F]:
 
         @functools.wraps(fn)
         def wrapper(*args: object, **kwargs: object) -> object:
-            if not _is_enabled():
+            if not _enabled:
                 return fn(*args, **kwargs)
             tracker = get_tracker()
             tracker.start(section_name)

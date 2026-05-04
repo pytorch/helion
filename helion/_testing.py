@@ -12,12 +12,15 @@ import os
 from pathlib import Path
 import re
 import sys
+from types import SimpleNamespace
 from typing import TYPE_CHECKING
 from typing import Callable
 from typing import Generator
 from typing import Sequence
+from typing import TypeVar
 from typing import cast
 import unittest
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -46,6 +49,8 @@ else:
     from .autotuner.benchmarking import do_bench as do_bench
     from .autotuner.benchmarking import interleaved_bench
 
+import typing
+
 from .runtime.config import Config
 from .runtime.ref_mode import is_ref_mode_enabled
 from .runtime.settings import RefMode
@@ -55,6 +60,8 @@ if TYPE_CHECKING:
 
     from .runtime.kernel import BoundKernel
     from .runtime.kernel import Kernel
+
+_R = TypeVar("_R")
 
 
 def _strip_launcher_args(value: str) -> str:
@@ -239,11 +246,13 @@ elif torch.xpu.is_available():
     DEVICE = torch.device("xpu")
 elif _has_mtia_runtime():
     DEVICE = torch.device("mtia")
+elif _get_backend() == "metal" and torch.backends.mps.is_available():
+    DEVICE = torch.device("mps")
 else:
     DEVICE = torch.device("cuda")
 
 # Half-precision dtype: bfloat16 on TPU (float16 not supported), float16 elsewhere
-if _get_backend() == "pallas":
+if _get_backend() == "pallas" and not is_pallas_interpret():
     HALF_DTYPE = torch.bfloat16
 else:
     HALF_DTYPE = torch.float16
@@ -289,6 +298,11 @@ def skipIfTileIR(reason: str) -> Callable[[Callable], Callable]:
     return skipIfFn(lambda: _get_backend() == "tileir", reason)
 
 
+def skipIfMetal(reason: str) -> Callable[[Callable], Callable]:
+    """Skip test if running with metal"""
+    return skipIfFn(lambda: _get_backend() == "metal", reason)
+
+
 def skipIfPallas(reason: str) -> Callable[[Callable], Callable]:
     """Skip test if running with pallas"""
     # Defers check to test execution time to avoid CUDA init during pytest-xdist collection.
@@ -326,7 +340,7 @@ def skipUnlessTileIR(reason: str) -> Callable[[Callable], Callable]:
 def _has_cute_dsl() -> bool:
     try:
         import cutlass.cute as _cute  # noqa: F401
-    except ModuleNotFoundError:
+    except ImportError:
         return False
     return True
 
@@ -339,6 +353,48 @@ def skipUnlessCuteAvailable(reason: str) -> Callable[[Callable], Callable]:
 def xfailIfCute(reason: str) -> Callable[[Callable], Callable]:
     """Mark test xfail when CUTLASS CuTe backend is selected."""
     return xfailIfFn(lambda: _get_backend() == "cute", reason)
+
+
+def skipIfCute(reason: str) -> Callable[[Callable], Callable]:
+    """Skip test when CUTLASS CuTe backend is selected."""
+    return skipIfFn(lambda: _get_backend() == "cute", reason)
+
+
+def default_cute_mma_support(
+    *,
+    supported_impls: tuple[str, ...] = ("universal", "warp", "tcgen05"),
+    warp_f16bf16: bool = True,
+    tcgen05_f16bf16: bool = True,
+) -> SimpleNamespace:
+    """Return a ``get_cute_mma_support()`` mock with tcgen05-on defaults."""
+    return SimpleNamespace(
+        supported_impls=supported_impls,
+        warp_f16bf16=warp_f16bf16,
+        tcgen05_f16bf16=tcgen05_f16bf16,
+    )
+
+
+@contextlib.contextmanager
+def patch_cute_mma_support(
+    support: SimpleNamespace | None = None,
+) -> Generator[SimpleNamespace, None, None]:
+    """Patch both ``get_cute_mma_support`` bindings.
+
+    ``cute_mma`` re-binds the symbol from ``mma_support`` at import time.
+    """
+    if support is None:
+        support = default_cute_mma_support()
+    with (
+        patch(
+            "helion._compiler.cute.cute_mma.get_cute_mma_support",
+            return_value=support,
+        ),
+        patch(
+            "helion._compiler.cute.mma_support.get_cute_mma_support",
+            return_value=support,
+        ),
+    ):
+        yield support
 
 
 def skipIfNotTriton(reason: str) -> Callable[[Callable], Callable]:
@@ -442,11 +498,16 @@ def skipIfNotCUDA() -> Callable[[Callable], Callable]:
 def skipIfCudaCapabilityLessThan(
     min_capability: tuple[int, int], *, reason: str | None = None
 ) -> Callable[[Callable], Callable]:
-    """Skip test if not running on CUDA or capability is less than min_capability."""
+    """Skip test if running on CUDA with capability less than min_capability.
+
+    Pass-through on non-CUDA backends. Combine with `skipIfNotCUDA()` (or
+    `skipIfPallas`/`skipIfXPU`/etc.) at the call site if the test also
+    requires a specific platform.
+    """
 
     def cond() -> bool:
         if not is_cuda():
-            return True
+            return False
         return torch.cuda.get_device_capability() < min_capability
 
     # Defers check to test execution time to avoid CUDA init during pytest-xdist collection.
@@ -908,8 +969,8 @@ def _bound_test_config(bound: BoundKernel, **kwargs: object) -> Config:
             # pyrefly: ignore [bad-argument-type]
             **kwargs
         )
-    elif bound.kernel.configs:
-        (config,) = bound.kernel.configs
+    elif len(bound.kernel.configs) == 1:
+        config = bound.kernel.configs[0]
     else:
         config = bound.config_spec.default_config()
     # Strip config keys not supported by the current backend so that
@@ -959,10 +1020,10 @@ def _run_bound_kernel(
 
 
 def code_and_output(
-    fn: Kernel,
+    fn: Kernel[_R],
     args: tuple[object, ...],
     **kwargs: object,
-) -> tuple[str, object]:
+) -> tuple[str, _R]:
     bound = fn.bind(args)
     if is_ref_mode_enabled(bound.kernel.settings):
         if kwargs:
@@ -977,14 +1038,14 @@ def code_and_output(
     config = _bound_test_config(bound, **kwargs)
     code, result = _run_bound_kernel(bound, args, config, emit_code=True)
     assert code is not None
-    return code, result
+    return code, cast("_R", result)
 
 
 def output_only(
-    fn: Kernel,
+    fn: Kernel[_R],
     args: tuple[object, ...],
     **kwargs: object,
-) -> object:
+) -> _R:
     """Run a kernel for correctness checks without eagerly materializing code text."""
     bound = fn.bind(args)
     if is_ref_mode_enabled(bound.kernel.settings):
@@ -996,7 +1057,7 @@ def output_only(
 
     config = _bound_test_config(bound, **kwargs)
     _code, result = _run_bound_kernel(bound, args, config, emit_code=False)
-    return result
+    return cast("_R", result)
 
 
 def _as_tensors(result: object) -> list[torch.Tensor]:
@@ -1019,6 +1080,7 @@ def run_example(
     bwd: bool = False,
     trace_path: str | None = None,
     process_group_name: str | None = None,
+    interleaved: bool = True,
 ) -> None:
     """Run complete example: correctness check + benchmark.
 
@@ -1173,8 +1235,17 @@ def run_example(
         profile_context = torch.profiler.profile()
 
     with profile_context:
-        # pyrefly: ignore[bad-argument-type]
-        timings = interleaved_bench(bench_fns, repeat=repeat, desc="Benchmarking")
+        if interleaved:
+            # pyrefly: ignore[bad-argument-type]
+            timings = interleaved_bench(bench_fns, repeat=repeat, desc="Benchmarking")
+        else:
+            timings = typing.cast(
+                "list[float]",
+                [
+                    do_bench(bench_fn, process_group_name=process_group_name)
+                    for bench_fn in bench_fns
+                ],
+            )
 
     if trace_path is not None and is_master_rank():
         print(f"Write profile to {trace_path}")

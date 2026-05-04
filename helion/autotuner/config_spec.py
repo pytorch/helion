@@ -32,6 +32,7 @@ from .config_fragment import ConfigSpecFragment
 from .config_fragment import EnumFragment
 from .config_fragment import IntegerFragment
 from .config_fragment import ListOf
+from .config_fragment import NumThreadsFragment
 from .config_fragment import NumWarpsFragment
 from .config_fragment import PermutationFragment
 from .config_fragment import PowerOfTwoFragment
@@ -106,6 +107,12 @@ _BASE_BACKEND_TUNABLE_KEYS: frozenset[str] = frozenset(
         "num_ctas",
         "occupancy",
         "pallas_loop_type",
+        "pallas_pre_broadcast",
+        "tcgen05_cluster_m",
+        "tcgen05_ab_stages",
+        "tcgen05_acc_stages",
+        "tcgen05_c_stages",
+        "tcgen05_num_epi_warps",
     }
 )
 
@@ -126,6 +133,7 @@ BACKEND_TUNABLE_KEYS: frozenset[str] = _get_backend_tunable_keys()
 BACKEND_SPECIFIC_KEYS: frozenset[str] = BACKEND_TUNABLE_KEYS | {
     "num_threads",
     "pallas_loop_type",
+    "pallas_pre_broadcast",
 }
 VALID_KEYS: frozenset[str] = frozenset(
     [
@@ -150,13 +158,19 @@ VALID_KEYS: frozenset[str] = frozenset(
         "atomic_indexing",
         "load_eviction_policies",
         "pallas_loop_type",
+        "pallas_pre_broadcast",
         *BACKEND_TUNABLE_KEYS,
         "advanced_controls_file",
         "epilogue_subtile",
     ]
 )
-VALID_PALLAS_LOOP_TYPES = ("default", "emit_pipeline", "fori_loop")
-VALID_PID_TYPES = ("flat", "xyz", "persistent_blocked", "persistent_interleaved")
+VALID_PALLAS_LOOP_TYPES = ("unroll", "emit_pipeline", "fori_loop")
+VALID_PID_TYPES = (
+    "flat",
+    "xyz",
+    "persistent_blocked",
+    "persistent_interleaved",
+)
 MIN_NUM_SM_MULTIPLIER = 1
 MAX_NUM_SM_MULTIPLIER = 128
 DEFAULT_NUM_SM_MULTIPLIER = 1
@@ -168,6 +182,34 @@ EPILOGUE_SUBTILE_MIN_K_HINT_EXTENDED = 16384
 # Lower values allow higher occupancy but may hurt performance for register-heavy kernels
 VALID_MAXNREG = (None, 32, 64, 128, 256)
 DEFAULT_MAXNREG = None
+CUTE_TCGEN05_TUNABLE_KEYS: tuple[str, ...] = (
+    "tcgen05_cluster_m",
+    "tcgen05_ab_stages",
+    "tcgen05_acc_stages",
+    "tcgen05_c_stages",
+    "tcgen05_num_epi_warps",
+)
+_CUTE_IMPLICIT_DEFAULT_KEYS: frozenset[str] = frozenset(
+    {
+        "loop_orders",
+        "flatten_loops",
+        "l2_groupings",
+        "range_unroll_factors",
+        "range_warp_specializes",
+        "range_num_stages",
+        "range_multi_buffers",
+        "range_flattens",
+        "static_ranges",
+        "load_eviction_policies",
+        "indexing",
+        "atomic_indexing",
+        "num_warps",
+        "num_stages",
+        "pid_type",
+        "num_sm_multiplier",
+        "maxnreg",
+    }
+)
 
 
 def _epilogue_subtile_autotune_arch() -> tuple[int, int] | None:
@@ -239,7 +281,29 @@ class ConfigSpec:
         self.epilogue_subtile_autotune_choices: tuple[int | None, ...] | None = None
         self.epilogue_subtile_k_hint: int = 0
         self.has_pallas_inner_loops: bool = False
-        self.has_pallas_symbolic_bounds: bool = False
+        self.has_symbolic_or_data_dependent_bounds: bool = False
+        self.cute_tcgen05_search_enabled: bool = False
+        # Allowed values of tcgen05_cluster_m the autotuner is allowed to
+        # *search* over. None means "use the default set defined by
+        # _tcgen05_optional_fragments". This is consulted by _flat_fields()
+        # when constructing the search space and is independent of which
+        # values are *legal* in a user-supplied helion.Config (the latter
+        # always accepts the full set of legal values).
+        self._tcgen05_cluster_m_search_choices: tuple[int, ...] | None = None
+        # Allowed values of tcgen05_num_epi_warps the autotuner is allowed
+        # to *search* over. ``None`` means "use the default IntegerFragment
+        # range defined by _tcgen05_optional_fragments". This is consulted by
+        # _flat_fields() when constructing the search space.
+        self._tcgen05_num_epi_warps_search_choices: tuple[int, ...] | None = None
+        # Allowed values of tcgen05_num_epi_warps a *user-supplied*
+        # ``helion.Config`` is permitted to specify. ``None`` means "use
+        # the default IntegerFragment range" (i.e. accept anything in
+        # [1, 4]). Unlike the cluster_m narrowing, the matmul path
+        # tightens validation here too because num_epi_warps != 4
+        # currently produces *silent wrong output* on B200 — there is
+        # no loud crash to alert a user who bypasses autotune via an
+        # explicit config, so normalize() must reject the unsafe values.
+        self._tcgen05_num_epi_warps_validation_choices: tuple[int, ...] | None = None
         self.store_indices: list[int] = []
         self.backend_tunable_fragments = self.backend.tunable_fragments()
         unknown_tunables = set(self.backend_tunable_fragments) - BACKEND_TUNABLE_KEYS
@@ -290,6 +354,11 @@ class ConfigSpec:
 
     def configure_epilogue_subtile_autotune(self, args: Sequence[object]) -> None:
         self.epilogue_subtile_k_hint = self._infer_epilogue_subtile_k_hint(args)
+        if self.backend_name == "cute":
+            # CuTe does not lower the hl.split()-based epilogue subtiling path yet.
+            # Keep it out of the autotune field set until that codegen exists.
+            self.epilogue_subtile_autotune_choices = None
+            return
         arch = _epilogue_subtile_autotune_arch()
         if arch is None:
             self.epilogue_subtile_autotune_choices = None
@@ -348,11 +417,186 @@ class ConfigSpec:
         )
         assert self.allowed_pid_types
 
+    def restrict_tcgen05_cluster_m_search(self, choices: tuple[int, ...]) -> None:
+        """Narrow the autotune search over tcgen05_cluster_m to *choices*.
+
+        Does not affect what values are legal in user-supplied configs;
+        normalize() validates against the full set of legal values returned by
+        _tcgen05_optional_fragments(for_search=False).
+        """
+        assert choices, "tcgen05_cluster_m search must allow at least one value"
+        self._tcgen05_cluster_m_search_choices = choices
+
+    def restrict_tcgen05_num_epi_warps_search(self, choices: tuple[int, ...]) -> None:
+        """Narrow the autotune search over tcgen05_num_epi_warps to *choices*.
+
+        Does not affect what values are legal in user-supplied configs.
+        See ``restrict_tcgen05_num_epi_warps_validation`` for the
+        complementary helper that tightens normalize().
+        """
+        assert choices, "tcgen05_num_epi_warps search must allow at least one value"
+        self._tcgen05_num_epi_warps_search_choices = choices
+
+    def restrict_tcgen05_num_epi_warps_validation(
+        self, choices: tuple[int, ...]
+    ) -> None:
+        """Restrict the *legal* values of tcgen05_num_epi_warps in
+        user-supplied configs to *choices*.
+
+        Unlike the search-only narrowing helpers, this also tightens
+        what ``normalize()`` accepts: a user-supplied
+        ``helion.Config(tcgen05_num_epi_warps=N)`` with N not in
+        *choices* will raise ``InvalidConfig``. Used by the BF16/FP16
+        matmul path because num_epi_warps != 4 currently produces
+        silent wrong output (no loud crash to alert a user who bypasses
+        autotune via an explicit config).
+        """
+        assert choices, "tcgen05_num_epi_warps validation must allow at least one value"
+        self._tcgen05_num_epi_warps_validation_choices = choices
+
+    def narrow_tcgen05_autotune_to_validated_configs(self) -> None:
+        """Narrow the tcgen05 autotune search to combinations validated on B200.
+
+        Three structural limitations bound the safe autotune space today.
+        Each narrowing is documented inline so the rationale stays close
+        to the call. The cluster_m and pid_type restrictions are
+        *search-only* — user-supplied ``helion.Config(...)`` values are
+        still validated against the full set of legal options (see
+        ``_tcgen05_optional_fragments(for_search=False)``). The
+        num_epi_warps restriction additionally tightens validation
+        because the underlying failure mode is silent wrong output.
+
+        * **Multi-tile persistent.** The current tcgen05 lowering does not
+          interoperate with the persistent virtual-pid loop on B200: any
+          ``total_tiles > 1`` silently produces wrong output (only the
+          single-tile case is verified correct). Drop ``persistent_blocked``
+          and ``persistent_interleaved`` from the autotune pid_type search
+          until the role-local persistent rewrite lands. A host-side guard
+          (``Tcgen05PersistentProgramIDs._emit_host_multi_tile_guard``)
+          converts the silent miscompare into a loud ``RuntimeError`` for
+          explicit user configs that bypass autotune. Lifts when item 1
+          (mainloop role-local persistent loops) lands; see
+          ``cute_plan.md`` "Closing the Perf Gap — Priority Order".
+
+        * **2-CTA cluster.** ``cluster_m=2`` (2-CTA tcgen05 instructions)
+          currently CUDA-launch-fails on B200 across the matmul block-size
+          combinations exercised. Narrow ``tcgen05_cluster_m`` to ``(1,)``
+          for the BF16/FP16 matmul path until the 2-CTA lowering is fixed.
+          Lifts when item 3 (2-CTA persistent) lands. CUDA launch failure
+          is loud, so user-supplied ``cluster_m=2`` is still legal.
+
+        * **Multi-warp epilogue.** Only ``tcgen05_num_epi_warps=4`` is
+          validated correct on B200 today. Direct verification at
+          ``num_epi_warps ∈ {1, 2}`` shows the tcgen05 SIMT-store
+          epilogue miscompiles (~75% of elements diverge from the
+          torch reference at M=N=K=256 bf16); ``num_epi_warps=3`` is
+          not separately validated and is treated as unsafe by
+          extension. Narrow both the autotune search *and* the
+          validation accept-set to ``(4,)`` so the autotuner cannot
+          converge on a wrong-output config and a user-supplied
+          ``helion.Config(tcgen05_num_epi_warps=N!=4)`` raises
+          ``InvalidConfig`` rather than silently miscomputing. The
+          underlying correctness bug is what blocks
+          ``num_epi_warps != 4`` from being usable; fixing it is the
+          actual unblocker for item 2 (multi-warp epilogue with
+          c_pipeline SMEM ring + TMA bulk store).
+        """
+        self.disallow_pid_type("persistent_blocked")
+        self.disallow_pid_type("persistent_interleaved")
+        self.restrict_tcgen05_cluster_m_search((1,))
+        self.restrict_tcgen05_num_epi_warps_search((4,))
+        self.restrict_tcgen05_num_epi_warps_validation((4,))
+
     def supports_config_key(self, key: str) -> bool:
         return self.backend.supports_config_key(key)
 
     def supported_config_keys(self) -> frozenset[str]:
         return frozenset(key for key in VALID_KEYS if self.supports_config_key(key))
+
+    def _default_num_stages(self) -> int:
+        return DEFAULT_NUM_STAGES
+
+    def _num_stages_fragment(self) -> ConfigSpecFragment:
+        if self.backend_name == "tileir":
+            return EnumFragment(choices=tuple(range(1, 11)))
+        if supports_amd_cdna_tunables():
+            return IntegerFragment(1, 4, self._default_num_stages())
+        if self.backend_name == "metal":
+            return IntegerFragment(1, 1, 1)
+        return IntegerFragment(1, 8, self._default_num_stages())
+
+    def _tcgen05_optional_fragments(
+        self, *, for_search: bool = False
+    ) -> dict[str, ConfigSpecFragment]:
+        # The "validation" view (default) defines what user-supplied
+        # configs are allowed to specify. By default it keeps the full
+        # set of legal values so e.g. ``helion.Config(...,
+        # tcgen05_cluster_m=2)`` round-trips through normalize()
+        # unchanged. The matmul path additionally calls
+        # ``restrict_tcgen05_num_epi_warps_validation`` to *tighten*
+        # this view for ``tcgen05_num_epi_warps`` because non-4 values
+        # silently miscompute on B200 (see
+        # ``narrow_tcgen05_autotune_to_validated_configs``); without
+        # that tightening, an explicit user config bypassing autotune
+        # would produce wrong output with no diagnostic.
+        #
+        # The "search" view (for_search=True) is consulted by _flat_fields()
+        # to build the autotune search space, and may be narrower because
+        # some legal values are known to regress perf or crash at runtime.
+        # ``matmul_ops.enforce_dot_requirements`` calls
+        # ``narrow_tcgen05_autotune_to_validated_configs`` for the BF16/FP16
+        # matmul path so the autotuner does not pick a regressing /
+        # crashing config and tear down the GPU context for the whole
+        # tuning run. See ``narrow_tcgen05_autotune_to_validated_configs``
+        # for the per-knob rationale.
+        if for_search and self._tcgen05_cluster_m_search_choices is not None:
+            cluster_m_choices = self._tcgen05_cluster_m_search_choices
+        else:
+            cluster_m_choices = (1, 2)
+        if for_search and self._tcgen05_num_epi_warps_search_choices is not None:
+            num_epi_warps_fragment: ConfigSpecFragment = EnumFragment(
+                self._tcgen05_num_epi_warps_search_choices
+            )
+        elif (
+            not for_search
+            and self._tcgen05_num_epi_warps_validation_choices is not None
+        ):
+            num_epi_warps_fragment = EnumFragment(
+                self._tcgen05_num_epi_warps_validation_choices
+            )
+        else:
+            num_epi_warps_fragment = IntegerFragment(1, 4, 4)
+        return {
+            "tcgen05_cluster_m": EnumFragment(cluster_m_choices),
+            "tcgen05_ab_stages": IntegerFragment(1, 2, 2),
+            "tcgen05_acc_stages": IntegerFragment(1, 2, 2),
+            "tcgen05_c_stages": EnumFragment((2, 4)),
+            "tcgen05_num_epi_warps": num_epi_warps_fragment,
+        }
+
+    @staticmethod
+    def _validate_optional_fragment_value(
+        name: str, fragment: ConfigSpecFragment, value: object
+    ) -> object:
+        if isinstance(fragment, BooleanFragment):
+            if type(value) is not bool:
+                raise InvalidConfig(f"{name} must be a boolean, got {value!r}")
+            return value
+        if isinstance(fragment, EnumFragment):
+            if value not in fragment.choices:
+                raise InvalidConfig(
+                    f"{name} must be one of {fragment.choices!r}, got {value!r}"
+                )
+            return value
+        if isinstance(fragment, IntegerFragment):
+            if type(value) is not int:
+                raise InvalidConfig(f"{name} must be an integer, got {value!r}")
+            if value < fragment.low or value > fragment.high:
+                raise InvalidConfig(
+                    f"{name} must be in [{fragment.low}, {fragment.high}], got {value!r}"
+                )
+            return value
+        raise InvalidConfig(f"Unsupported optional fragment type for {name}")
 
     def unsupported_config_keys(self, config: Mapping[str, object]) -> list[str]:
         return sorted(
@@ -421,6 +665,7 @@ class ConfigSpec:
                     raise InvalidConfig(
                         f"Unsupported config keys for backend {self.backend_name!r}: {backend_specific}"
                     )
+        provided_keys = set(config)
 
         for name, mapping, flatten in [
             ("block_sizes", self.block_sizes, True),
@@ -527,7 +772,7 @@ class ConfigSpec:
         if self.supports_config_key("num_warps"):
             config.setdefault("num_warps", DEFAULT_NUM_WARPS)
         if self.supports_config_key("num_stages"):
-            config.setdefault("num_stages", DEFAULT_NUM_STAGES)
+            config.setdefault("num_stages", self._default_num_stages())
         if self.supports_config_key("load_eviction_policies"):
             config.setdefault(
                 "load_eviction_policies", self.load_eviction_policies.default()
@@ -538,11 +783,44 @@ class ConfigSpec:
             config.setdefault("atomic_indexing", self.atomic_indexing.default())
         for key, fragment in self.backend_tunable_fragments.items():
             config.setdefault(key, fragment.default())
+        tcgen05_optional_fragments = self._tcgen05_optional_fragments()
+        tcgen05_optional_search_fragments = self._tcgen05_optional_fragments(
+            for_search=True
+        )
+        if self.cute_tcgen05_search_enabled:
+            for key, fragment in tcgen05_optional_fragments.items():
+                if key in config:
+                    config[key] = self._validate_optional_fragment_value(
+                        key, fragment, config[key]
+                    )
+                else:
+                    # Fill missing keys from the search-view default so a
+                    # minimized config (Config.minimize strips values that
+                    # match default_config(), which is built from the
+                    # search view via _flat_fields) round-trips back to
+                    # the same effective config when re-normalized. The
+                    # validation view above is still used to validate
+                    # user-supplied values against the full legal range.
+                    config[key] = tcgen05_optional_search_fragments[key].default()
+        else:
+            for key in tcgen05_optional_fragments:
+                if key not in config:
+                    continue
+                if _fix_invalid:
+                    config.pop(key, None)
+                else:
+                    raise InvalidConfig(
+                        f"{key} is only supported for tcgen05-enabled CuTe matmul kernels"
+                    )
         if self.has_pallas_inner_loops:
-            choices = VALID_PALLAS_LOOP_TYPES
-            if self.has_pallas_symbolic_bounds:
-                choices = tuple(c for c in choices if c != "default")
-            config.setdefault("pallas_loop_type", choices[0])
+            if self.has_symbolic_or_data_dependent_bounds:
+                # "unroll" uses Python range() which can't handle traced bounds.
+                # Between the remaining options, prefer "fori_loop": it handles
+                # both DMA-aligned and unaligned inner blocks, while
+                # "emit_pipeline" fails on unaligned dims.
+                config.setdefault("pallas_loop_type", "fori_loop")
+            else:
+                config.setdefault("pallas_loop_type", VALID_PALLAS_LOOP_TYPES[0])
 
         if self.supports_config_key("pid_type"):
             if "pid_type" in config:
@@ -719,6 +997,10 @@ class ConfigSpec:
         if self.supports_config_key("range_warp_specializes"):
             config["range_warp_specializes"] = range_warp_specializes
 
+        if self.backend_name == "cute":
+            for key in _CUTE_IMPLICIT_DEFAULT_KEYS - provided_keys:
+                config.pop(key, None)
+
         # Allow tunable parameter keys in addition to backend-supported keys.
         allowed_keys = self.supported_config_keys() | {
             *self.user_defined_tunables.keys()
@@ -757,6 +1039,7 @@ class ConfigSpec:
             min_block = min(min_block, default)
             if min_block >= 2:
                 min_block = 1 << (min_block.bit_length() - 1)
+                min_block = min(min_block, spec.max_size)
                 spec.autotuner_min = assert_integer_power_of_two(
                     max(min_block, spec.autotuner_min)
                 )
@@ -810,6 +1093,14 @@ class ConfigSpec:
         fields: dict[str, BlockIdSequence[Any] | ConfigSpecFragment] = {
             "block_sizes": self.block_sizes,
         }
+        if self.backend_name == "cute":
+            if self.cute_tcgen05_search_enabled:
+                fields["l2_groupings"] = self.l2_groupings
+                fields.update(self._tcgen05_optional_fragments(for_search=True))
+            if self.supports_config_key("num_threads"):
+                fields["num_threads"] = self.num_threads
+            fields.update(self.user_defined_tunables)
+            return fields
 
         # Only add sequence keys that the backend supports
         fields.update(
@@ -833,22 +1124,14 @@ class ConfigSpec:
 
         # Scalar fields (ConfigSpecFragment)
         is_tileir = self.backend_name == "tileir"
-
         if is_tileir:
             # TileIR: num_warps is unused (fixed at 4), num_stages has wider range
             num_warps_fragment: ConfigSpecFragment = NumWarpsFragment(4, 4)
-            num_stages_fragment: ConfigSpecFragment = EnumFragment(
-                choices=tuple(range(1, 11))
-            )
         elif supports_amd_cdna_tunables():
             num_warps_fragment = NumWarpsFragment(1, 16, DEFAULT_NUM_WARPS)
-            num_stages_fragment = IntegerFragment(1, 4, DEFAULT_NUM_STAGES)
-        elif self.backend_name == "metal":
-            num_warps_fragment = NumWarpsFragment(1, 32, DEFAULT_NUM_WARPS)
-            num_stages_fragment = IntegerFragment(1, 1, 1)
         else:
             num_warps_fragment = NumWarpsFragment(1, 32, DEFAULT_NUM_WARPS)
-            num_stages_fragment = IntegerFragment(1, 8, DEFAULT_NUM_STAGES)
+        num_stages_fragment = self._num_stages_fragment()
 
         if self.supports_config_key("num_warps"):
             fields["num_warps"] = num_warps_fragment
@@ -868,12 +1151,10 @@ class ConfigSpec:
             )
         if self.supports_config_key("load_eviction_policies"):
             fields["load_eviction_policies"] = self.load_eviction_policies
-        # num_threads is backend-specific (only CuteBackend).
-        # Not included in the autotuner search space because num_threads
-        # values must divide block_sizes (which are also tuned), making
-        # independent tuning produce many invalid configs.  Users can set
-        # num_threads explicitly in the Config constructor.
-        # TODO(future): add coupled tuning of num_threads and block_sizes
+        if self.cute_tcgen05_search_enabled:
+            fields.update(self._tcgen05_optional_fragments(for_search=True))
+        if self.supports_config_key("num_threads"):
+            fields["num_threads"] = self.num_threads
         if is_tileir:
             fields["num_ctas"] = self.backend_tunable_fragments["num_ctas"]
             fields["occupancy"] = self.backend_tunable_fragments["occupancy"]
@@ -881,8 +1162,14 @@ class ConfigSpec:
             fields.update(self.backend_tunable_fragments)
         if self.has_pallas_inner_loops:
             choices = VALID_PALLAS_LOOP_TYPES
-            if self.has_pallas_symbolic_bounds:
-                choices = tuple(c for c in choices if c != "default")
+            if self.has_symbolic_or_data_dependent_bounds:
+                # Exclude "unroll" (uses Python range(), can't handle traced
+                # bounds) and put "fori_loop" first: it handles both DMA-aligned
+                # and unaligned inner blocks, while "emit_pipeline" fails on
+                # unaligned dims.
+                # TODO(thcmbs): Also exclude "emit_pipeline" when has_pallas_dma_unaligned
+                # is set, to avoid wasted autotuning effort. See PR #1969 review discussion.
+                choices = ("fori_loop", "emit_pipeline")
             fields["pallas_loop_type"] = EnumFragment(choices=choices)
         # Only include maxnreg on CUDA devices (not supported on AMD and Intel GPU)
         if self.supports_config_key("maxnreg") and supports_maxnreg():
@@ -1073,8 +1360,9 @@ class BlockSizeSpec(_PowerOfTwoBlockIdItem):
             default = 16
         else:
             default = 1
+        low = min(max(self.min_size, self.autotuner_min), self.max_size)
         return BlockSizeFragment(
-            max(self.min_size, self.autotuner_min),
+            low,
             self.max_size,
             default,
         )
@@ -1091,10 +1379,10 @@ class NumThreadsSpec(_PowerOfTwoBlockIdItem):
             return 0
         return super()._normalize(name, value)
 
-    def _fragment(self, base: ConfigSpec) -> PowerOfTwoFragment:
+    def _fragment(self, base: ConfigSpec) -> NumThreadsFragment:
         max_threads = min(max(self.size_hint, 1), 1024)
         default = next_power_of_2(max_threads)
-        return PowerOfTwoFragment(1, default, default)
+        return NumThreadsFragment(default)
 
     def _fill_missing(self) -> int:
         return 0
@@ -1123,9 +1411,10 @@ class ReductionLoopSpec(_PowerOfTwoBlockIdItem):
         super().__init__([block_id])
         self.size_hint = size_hint
 
-    def _flat_config(
-        self, base: ConfigSpec, fn: Callable[[ConfigSpecFragment], object]
-    ) -> int | None:
+    def _flat_fragment(self, base: ConfigSpec) -> BlockSizeFragment:
+        # Shared by both directions:
+        # - unflatten: flat integer -> Config value via _flat_config()
+        # - flatten: Config value -> flat integer via _encode_flat_value()
         low = 8  # TODO(jansel): is smaller needed?
         high = next_power_of_2(max(low, self.size_hint))
         default = min(high, 4096)
@@ -1134,7 +1423,15 @@ class ReductionLoopSpec(_PowerOfTwoBlockIdItem):
         if base.max_reduction_threads is not None:
             if self.size_hint > base.max_reduction_threads:
                 default = min(default, base.max_reduction_threads)
-        value = fn(BlockSizeFragment(low, high, default))
+        return BlockSizeFragment(low, high, default)
+
+    def _flat_config(
+        self, base: ConfigSpec, fn: Callable[[ConfigSpecFragment], object]
+    ) -> int | None:
+        fragment = self._flat_fragment(base)
+        low = fragment.low
+        high = fragment.high
+        value = fn(fragment)
         assert isinstance(value, int)
         if not (low <= value <= high):
             raise InvalidConfig(
@@ -1142,6 +1439,16 @@ class ReductionLoopSpec(_PowerOfTwoBlockIdItem):
             )
         if value >= self.size_hint:
             return None  # max size becomes persistent reduction
+        return value
+
+    def _encode_flat_value(self, base: ConfigSpec, value: object) -> object:
+        # None means "persistent reduction" in the normalized Config. In the
+        # flat search space that same choice is represented by an integer
+        # sentinel, typically the fragment default such as 1024 for a 1024-wide
+        # reduction. This is the one non-identity Config <-> FlatConfig
+        # mapping today.
+        if value is None:
+            return self._flat_fragment(base).default()
         return value
 
     def _normalize(self, name: str, value: object) -> int | None:

@@ -18,6 +18,7 @@ from helion import exc
 from helion._compiler.compile_environment import CompileEnvironment
 from helion._testing import TestCase
 from helion._testing import onlyBackends
+from helion._testing import skipIfXPU
 
 
 def _json_safe_values() -> st.SearchStrategy[Any]:
@@ -283,6 +284,7 @@ class TestSettingsEnv(TestCase):
             ("persistent_blocked", "persistent_interleaved"),
         )
 
+    @skipIfXPU("Uses torch.device('cuda') directly")
     def test_distributed_limits_pid_types_to_persistent(self) -> None:
         settings = helion.Settings()
         with (
@@ -305,6 +307,18 @@ class TestSettingsEnv(TestCase):
         ):
             env = CompileEnvironment(torch.device("cuda", 0), settings)
         self.assertEqual(env.config_spec.max_num_sm_multiplier, 32)
+
+    def test_persistent_block_limit_handles_zero_raw_max(self) -> None:
+        # max_blocks=144, 148 SMs -> 144 // 148 = 0 -> must clamp to 1
+        # without crashing on `1 << -1`.
+        settings = helion.Settings()
+        with (
+            patch("torch.distributed.is_initialized", return_value=True),
+            patch("helion._dist_utils.max_num_blocks_for_symm_mem", return_value=144),
+            patch("helion.runtime.get_num_sm", return_value=148),
+        ):
+            env = CompileEnvironment(torch.device("cuda", 0), settings)
+        self.assertEqual(env.config_spec.max_num_sm_multiplier, 1)
 
     def test_backend_env_var_accepts_cute(self) -> None:
         with patch.dict(

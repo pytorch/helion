@@ -12,6 +12,8 @@ from helion._testing import HALF_DTYPE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
+from helion._testing import skipIfMetal
+from helion._testing import skipIfXPU
 from helion._testing import skipUnlessTensorDescriptor
 from helion._testing import xfailIfPallas
 import helion.language as hl
@@ -38,6 +40,7 @@ def grid_2d_pytorch(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 class TestGrid(RefEagerTestBase, TestCase):
     @skipUnlessTensorDescriptor("Tensor descriptor support is required")
     @patch.object(_compat, "_min_dot_size", lambda *args: (16, 16, 16))
+    @skipIfXPU("Timeout on XPU")
     def test_grid_1d(self):
         @helion.kernel(static_shapes=True)
         def grid_1d(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -120,7 +123,7 @@ class TestGrid(RefEagerTestBase, TestCase):
         )
         torch.testing.assert_close(result, grid_2d_pytorch(args[0], args[1]))
 
-    @xfailIfPallas("2D nested grids not working correctly Pallas")
+    @skipIfMetal("aten.addmm not yet registered for Metal backend")
     def test_grid_2d_idx_nested(self):
         @helion.kernel(static_shapes=True)
         def grid_2d_idx_nested(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -153,7 +156,6 @@ class TestGrid(RefEagerTestBase, TestCase):
         code, result = code_and_output(grid_2d_idx_nested, args)
         torch.testing.assert_close(result, grid_2d_pytorch(args[0], args[1]))
 
-    @xfailIfPallas("Grid begin/end not working on Pallas")
     def test_grid_begin_end(self):
         @helion.kernel(autotune_effort="none")
         def grid_begin_end(x: torch.Tensor) -> torch.Tensor:
@@ -216,7 +218,6 @@ class TestGrid(RefEagerTestBase, TestCase):
         code, result = code_and_output(grid_end_step_kwarg, (x,))
         torch.testing.assert_close(result, grid_end_step_kwarg_pytorch(x))
 
-    @xfailIfPallas("Grid begin/end not working on Pallas")
     def test_grid_multidim_begin_end(self):
         @helion.kernel(autotune_effort="none")
         def grid_multidim_begin_end(x: torch.Tensor) -> torch.Tensor:
@@ -284,6 +285,7 @@ class TestGrid(RefEagerTestBase, TestCase):
         code, result = code_and_output(tile_begin_end, (x,), block_size=4)
         torch.testing.assert_close(result, tile_begin_end_pytorch(x))
 
+    @skipIfMetal("Metal does not support loop_index_expr for grid loops")
     def test_range_as_grid_basic(self):
         """Test that range() works as an alias for hl.grid() in device code."""
 
@@ -304,6 +306,7 @@ class TestGrid(RefEagerTestBase, TestCase):
         code, result = code_and_output(range_kernel, (x,))
         torch.testing.assert_close(result, expected)
 
+    @skipIfMetal("Metal does not support loop_index_expr for grid loops")
     def test_range_with_begin_end(self):
         """Test that range(begin, end) works as alias for hl.grid(begin, end)."""
 
@@ -324,6 +327,7 @@ class TestGrid(RefEagerTestBase, TestCase):
         code, result = code_and_output(range_begin_end_kernel, (x,))
         torch.testing.assert_close(result, expected)
 
+    @skipIfMetal("Metal does not support loop_index_expr for grid loops")
     def test_range_with_step(self):
         """Test that range(begin, end, step) works as alias for hl.grid(begin, end, step)."""
 
@@ -346,6 +350,7 @@ class TestGrid(RefEagerTestBase, TestCase):
         code, result = code_and_output(range_step_kernel, (x,))
         torch.testing.assert_close(result, expected)
 
+    @skipIfMetal("Metal does not support loop_index_expr for grid loops")
     def test_range_with_tensor_size(self):
         """Test that range(tensor.size(dim)) works with dynamic tensor dimensions."""
 

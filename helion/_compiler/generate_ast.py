@@ -25,6 +25,7 @@ from .ast_read_writes import dead_assignment_elimination
 from .ast_read_writes import dead_expression_elimination
 from .ast_read_writes import definitely_does_not_have_side_effects
 from .compile_environment import CompileEnvironment
+from .device_function import ConstExprArg
 from .device_function import DeviceFunction
 from .helper_function import CodegenInterface
 from .inductor_lowering import CodegenState
@@ -75,12 +76,14 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         self.codegen_graphs = func.device_ir.build_codegen_graphs(config)
         self.host_statements: list[ast.AST] = []
         self.module_statements: list[ast.stmt] = []
+        self.cute_wrapper_plans: list[dict[str, object]] = []
         self.statements_stack: list[list[ast.AST]] = [self.host_statements]
         self.on_device = False
         self.active_device_loops: dict[int, list[DeviceLoopOrGridState]] = (
             collections.defaultdict(list)
         )
         self.current_grid_state: DeviceGridState | None = None
+        self.current_root_graph_info: GraphInfo | None = None
         self.max_thread_block_dims = [1, 1, 1]
         self.root_thread_block_dims = [1, 1, 1]
         self.referenced_thread_block_dims = [1, 1, 1]
@@ -437,66 +440,78 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                 self.set_on_device(),
                 self.set_statements(body),
             ):
-                iter_node = node.iter
-                assert isinstance(iter_node, ExtendedAST)
-                with iter_node:
-                    assert isinstance(iter_node, ast.Call)
-                    args = []
-                    kwargs = {}
-                    for arg_node in iter_node.args:
-                        assert not isinstance(arg_node, ast.Starred)
-                        assert isinstance(arg_node, ExtendedAST)
-                        assert arg_node._type_info is not None
-                        args.append(arg_node._type_info.proxy())
-                    for kwarg_node in iter_node.keywords:
-                        assert kwarg_node.arg is not None
-                        assert isinstance(kwarg_node.value, ExtendedAST)
-                        assert kwarg_node.value._type_info is not None
-                        kwargs[kwarg_node.arg] = kwarg_node.value._type_info.proxy()
-                    fn_node = iter_node.func
-                    assert isinstance(fn_node, ExtendedAST)
-                    assert fn_node._type_info is not None
-                    fn = fn_node._type_info.proxy()
-                    assert is_api_func(fn)
-                    env = CompileEnvironment.current()
-                    try:
-                        codegen_fn = fn._codegen[env.codegen_name]
-                    except KeyError:
-                        raise exc.BackendImplementationMissing(
-                            env.backend_name,
-                            f"codegen for API function {fn.__qualname__}",
-                        ) from None
-                    bound = fn._signature.bind(*args, **kwargs)
-                    bound.apply_defaults()
-
-                    from .inductor_lowering import CodegenState
-
-                    state = CodegenState(
-                        self,
-                        fx_node=None,
-                        proxy_args=[*bound.arguments.values()],
-                        # pyrefly: ignore [bad-argument-type]
-                        ast_args=None,
-                    )
-
-                    codegen_fn(state)
                 assert node._root_id is not None
-                root = self.get_graph(
+                root_graph_info = self.get_graph(
                     self.host_function.device_ir.root_ids[node._root_id],
-                ).graph
-                grid_state = self.current_grid_state
-                if (
-                    isinstance(grid_state, DeviceGridState)
-                    and grid_state.has_lane_loops()
-                ):
-                    wrapped_body: list[ast.AST] = []
-                    with self.set_statements(wrapped_body):
+                )
+                previous_root_graph_info = self.current_root_graph_info
+                self.current_root_graph_info = root_graph_info
+                try:
+                    iter_node = node.iter
+                    assert isinstance(iter_node, ExtendedAST)
+                    with iter_node:
+                        assert isinstance(iter_node, ast.Call)
+                        args = []
+                        kwargs = {}
+                        for arg_node in iter_node.args:
+                            assert not isinstance(arg_node, ast.Starred)
+                            assert isinstance(arg_node, ExtendedAST)
+                            assert arg_node._type_info is not None
+                            args.append(arg_node._type_info.proxy())
+                        for kwarg_node in iter_node.keywords:
+                            assert kwarg_node.arg is not None
+                            assert isinstance(kwarg_node.value, ExtendedAST)
+                            assert kwarg_node.value._type_info is not None
+                            kwargs[kwarg_node.arg] = kwarg_node.value._type_info.proxy()
+                        fn_node = iter_node.func
+                        assert isinstance(fn_node, ExtendedAST)
+                        assert fn_node._type_info is not None
+                        fn = fn_node._type_info.proxy()
+                        assert is_api_func(fn)
+                        env = CompileEnvironment.current()
+                        try:
+                            codegen_fn = fn._codegen[env.codegen_name]
+                        except KeyError:
+                            raise exc.BackendImplementationMissing(
+                                env.backend_name,
+                                f"codegen for API function {fn.__qualname__}",
+                            ) from None
+                        bound = fn._signature.bind(*args, **kwargs)
+                        bound.apply_defaults()
+
+                        from .inductor_lowering import CodegenState
+
+                        state = CodegenState(
+                            self,
+                            fx_node=None,
+                            proxy_args=[*bound.arguments.values()],
+                            # pyrefly: ignore [bad-argument-type]
+                            ast_args=None,
+                        )
+
+                        codegen_fn(state)
+                    root = root_graph_info.graph
+                    grid_state = self.current_grid_state
+                    if (
+                        isinstance(grid_state, DeviceGridState)
+                        and grid_state.has_lane_loops()
+                    ):
+                        wrapped_body: list[ast.AST] = []
+                        with self.set_statements(wrapped_body):
+                            codegen_call_with_graph(self, root, [])
+                        self.statements_stack[-1].extend(grid_state.outer_prefix)
+                        if self.device_function.suppress_cute_root_lane_loops:
+                            self.statements_stack[-1].extend(wrapped_body)
+                            self.device_function.suppress_cute_root_lane_loops = False
+                        else:
+                            self.statements_stack[-1].extend(
+                                grid_state.wrap_body(wrapped_body)
+                            )
+                        self.statements_stack[-1].extend(grid_state.outer_suffix)
+                    else:
                         codegen_call_with_graph(self, root, [])
-                    self.statements_stack[-1].extend(grid_state.outer_prefix)
-                    self.statements_stack[-1].extend(grid_state.wrap_body(wrapped_body))
-                    self.statements_stack[-1].extend(grid_state.outer_suffix)
-                else:
-                    codegen_call_with_graph(self, root, [])
+                finally:
+                    self.current_root_graph_info = previous_root_graph_info
 
                 # Flush deferred RDIM definitions now that block sizes are determined
                 # This ensures block size and rdim vars are defined in the correct order
@@ -710,16 +725,42 @@ def generate_ast(
             load_transform=load_transform,
             extra_params=extra_params,
         )
-        CompileEnvironment.current().backend.pre_codegen(
-            graphs=codegen.codegen_graphs,
-            config=config,
-            tile_strategy=codegen.device_function.tile_strategy,
-        )
         with codegen.device_function:
+            CompileEnvironment.current().backend.pre_codegen(
+                graphs=codegen.codegen_graphs,
+                config=config,
+                tile_strategy=codegen.device_function.tile_strategy,
+            )
+
             for stmt in func.body:
                 codegen.add_statement(codegen.visit(stmt))
             kernel_def = codegen.device_function.codegen_function_def()
             codegen.host_dead_code_elimination()
+
+            # Retarget output-only tensor allocations to ``device='meta'`` so
+            # the factory call produces a zero-storage metadata-only tensor
+            # instead of allocating real HBM. The launcher reassigns the
+            # variable to the real result tensor.
+            output_only_names = getattr(
+                CompileEnvironment.current().backend, "_output_only_names", []
+            )
+            if output_only_names:
+                oo_set = set(output_only_names)
+                for stmt in codegen.host_statements:
+                    if (
+                        isinstance(stmt, ast.Assign)
+                        and len(stmt.targets) == 1
+                        and isinstance(stmt.targets[0], ast.Name)
+                        and stmt.targets[0].id in oo_set
+                        and not getattr(stmt, "_is_kernel_call", False)
+                        and isinstance(stmt.value, ast.Call)
+                    ):
+                        call = stmt.value
+                        call.keywords = [
+                            kw for kw in call.keywords if kw.arg != "device"
+                        ] + [
+                            ast.keyword(arg="device", value=ast.Constant(value="meta"))
+                        ]
 
             # Inject RNG seed buffer creation if needed
             rng_statements = (
@@ -728,6 +769,40 @@ def generate_ast(
                 else []
             )
             final_host_statements = rng_statements + codegen.host_statements
+            if codegen.cute_wrapper_plans:
+                launcher_arg_positions: dict[str, int] = {}
+                for idx, arg in enumerate(
+                    [
+                        arg
+                        for arg in codegen.device_function.sorted_args()
+                        if not (
+                            isinstance(arg, ConstExprArg) and arg.host_str() != arg.name
+                        )
+                    ]
+                ):
+                    launcher_arg_positions[arg.name] = idx
+                resolved_wrapper_plans: list[dict[str, object]] = []
+                for plan in codegen.cute_wrapper_plans:
+                    resolved = dict(plan)
+                    for key in ("lhs_name", "rhs_name", "c_name"):
+                        if key in resolved:
+                            resolved[key[:-5] + "_idx"] = launcher_arg_positions[
+                                str(resolved.pop(key))
+                            ]
+                    resolved_wrapper_plans.append(resolved)
+                final_host_statements = [
+                    statement_from_string(
+                        f"{codegen.device_function.name}._helion_cute_wrapper_plans = {resolved_wrapper_plans!r}"
+                    ),
+                    *final_host_statements,
+                ]
+            if codegen.device_function.cute_cluster_shape is not None:
+                final_host_statements = [
+                    statement_from_string(
+                        f"{codegen.device_function.name}._helion_cute_cluster_shape = {codegen.device_function.cute_cluster_shape!r}"
+                    ),
+                    *final_host_statements,
+                ]
 
             # Assert sourceless prologue params were actually removed by DCE
             if codegen.device_function.sourceless_prologue_params:

@@ -4,6 +4,7 @@ import ast
 from collections import defaultdict
 import contextlib
 import dataclasses
+import enum
 import itertools
 import math
 import threading
@@ -30,6 +31,7 @@ from .ast_extension import statement_from_string
 from .ast_read_writes import ReadWrites
 from .ast_read_writes import ast_rename
 from .ast_read_writes import dead_assignment_elimination
+from .backend_registry import all_reserved_launch_param_names
 from .compile_environment import CompileEnvironment
 from .host_function import HostFunction
 from .host_function import NoCurrentFunction
@@ -46,6 +48,7 @@ if TYPE_CHECKING:
     from .generate_ast import GenerateAST
     from .indexing_strategy import IndexingStrategy
     from .program_id import ProgramIDs
+    from helion._compiler.pallas.plan_tiling import DimensionTiling
 
     _P = TypeVar("_P", bound="TensorPropertyArg")
 
@@ -82,7 +85,7 @@ def find_block_size_symbols(
     non_block_size_symbols = set()
 
     for symbol in expr.free_symbols:
-        # pyrefly: ignore [no-matching-overload]
+        # pyrefly: ignore [no-matching-overload, bad-argument-type]
         origin_info = hf.expr_to_origin.get(symbol)
         if origin_info is None or not isinstance(origin_info.origin, BlockSizeOrigin):
             # pyrefly: ignore [bad-argument-type]
@@ -193,6 +196,114 @@ class StaticShape(Argument):
         super().__init__(repr(val))
 
 
+@dataclasses.dataclass(frozen=True)
+class CuteTcgen05StoreValue:
+    bm: int = 0
+    bn: int = 0
+    bk: int = 0
+    thr_mma: str = ""
+    epi_warp_count: int = 0
+    epi_acc_frag_base: str = ""
+    epi_tidx: str = ""
+    epi_active: str = ""
+    exec_active: str = ""
+    epi_tile: str = ""
+    c_stage_count: int = 0
+    epilog_sync_barrier_id: int = 0
+    tmem_load_atom: str = ""
+    epilogue_rest_mode: str = ""
+    acc_pipeline: str = ""
+    acc_producer_state: str = ""
+    acc_consumer_state: str = ""
+    tmem_alloc_barrier: str = ""
+    tmem_allocator: str = ""
+    tmem_holding_buf: str = ""
+    tmem_dealloc_mbar_ptr: str = ""
+    epi_acc_tmem_ptr: str = ""
+    acc_tmem_cols: str = ""
+    tma_warp: str = ""
+    tma_pipeline: str = ""
+    tma_producer_state: str = ""
+    is_two_cta: bool = False
+    use_tma: bool = False
+    ab_stage_count: int = 0
+    acc_stage_count: int = 0
+
+
+@dataclasses.dataclass(frozen=True)
+class CuteTcgen05MatmulPlan:
+    """Kernel-wide tcgen05 collective contract selected by CuTe matmul codegen.
+
+    Warp-role layout in the launched CTA:
+
+    - ``epi_warp_count`` epilogue warps starting at warp 0
+    - one MMA exec warp at ``exec_warp_id``
+    - one A/B load warp at ``tma_warp_id`` -- doubles as the TMA warp and,
+      in the persistent path, also owns the tile scheduler
+
+    ``ab_load_warp_count`` defaults to 1 -- the current lowering has a
+    single TMA / A-B load warp. The field is kept so the role layout /
+    launch shape continues to plumb through if a future role-local
+    persistent rewrite splits TMA load and A/B prefetch onto separate
+    warps.
+
+    Earlier revisions tracked separate ``has_scheduler_warp`` /
+    ``has_epi_load_warp`` flags. Neither role was wired to actual work --
+    the persistent scheduler always rode on the TMA warp, and the epilogue
+    load was folded into the consumer epi warps. Removing those flags drops
+    two dead warps from the launched block (saving register budget for the
+    real consumer warps) and simplifies the autotune search space. When
+    role-local persistent loops land, the dedicated roles can come back as
+    real launch dimensions instead of placeholders.
+    """
+
+    bm: int
+    bn: int
+    bk: int
+    cluster_m: int
+    is_two_cta: bool
+    cta_thread_count: int
+    physical_m_threads: int
+    acc_stage_count: int
+    ab_stage_count: int
+    c_stage_count: int
+    epi_warp_count: int
+    ab_load_warp_count: int = 1
+
+    @property
+    def exec_warp_id(self) -> int:
+        return self.epi_warp_count
+
+    @property
+    def ab_load_warp_begin(self) -> int:
+        return self.exec_warp_id + 1
+
+    @property
+    def ab_load_warp_end(self) -> int:
+        return self.ab_load_warp_begin + self.ab_load_warp_count
+
+    @property
+    def tma_warp_id(self) -> int:
+        return self.ab_load_warp_begin
+
+    @property
+    def persistent_scheduler_owner_warp_id(self) -> int:
+        # Persistent scheduling rides on the TMA warp because the current
+        # tcgen05 body still uses one CTA-wide ``while``: the scheduler owner
+        # has to be inside the same producer sync structure as the TMA load
+        # warp. Once role-local loops land this can move onto a dedicated
+        # scheduler warp.
+        return self.tma_warp_id
+
+    @property
+    def role_warp_count(self) -> int:
+        return self.epi_warp_count + 1 + self.ab_load_warp_count
+
+    @property
+    def block_shape(self) -> tuple[int, int, int]:
+        return (self.physical_m_threads, self.role_warp_count, 1)
+
+
 _sort_order: dict[type[Argument], int] = {
     TensorDescriptorArg: 0,
     TensorArg: 0,
@@ -229,6 +340,14 @@ def _is_literal_constexpr(arg: ConstExprArg) -> bool:
         return False
 
 
+class PallasMemorySpace(enum.Enum):
+    """TPU memory space for Pallas tensors."""
+
+    HBM = "hbm"  # Pipeline body tensors (DMA)
+    SMEM = "smem"  # Scalar-only access
+    VMEM = "vmem"  # Vector/slice access (default)
+
+
 class DeviceFunction:
     def __init__(
         self,
@@ -251,6 +370,7 @@ class DeviceFunction:
         self._constexpr_args: dict[str, ConstExprArg] = {}
         self._constexpr_host_defs: set[str] = set()
         self._scratch_args: list[ScratchArg] = []
+        self.wrapper_only_params: list[str] = []
         self._tensor_properties: dict[
             tuple[type[TensorPropertyArg], torch.Tensor, int], TensorPropertyArg
         ] = {}
@@ -260,24 +380,12 @@ class DeviceFunction:
         self.pid: ProgramIDs | None = None
         self.namespace: _Namespace = _Namespace()
         self.namespace._used_names.update(reserved_names())
+
+        self.namespace._used_names.update(all_reserved_launch_param_names())
         self.namespace._used_names.update(
-            # used by triton run() method
-            [
-                "grid",
-                "warmup",
-                "num_warps",
-                "num_stages",
-            ]
-            + (
-                ["num_ctas", "occupancy"]
-                if CompileEnvironment.current().backend_name == "tileir"
-                else []
-            )
-            + [
-                x.removeprefix("_triton_config_")
-                for x in config
-                if x.startswith("_triton_config_")
-            ]
+            x.removeprefix("_triton_config_")
+            for x in config
+            if x.startswith("_triton_config_")
         )
         self._variable_renames: dict[str, list[str]] = {}
         self.dce_vars: list[str] = []
@@ -292,6 +400,15 @@ class DeviceFunction:
         self.block_size_var_cache: dict[tuple[int, ...], str] = {}
         self.expr_to_var_info: dict[sympy.Expr, VarInfo] = {}
         self.deferred_rdim_defs: list[tuple[str, sympy.Expr]] = []
+        self._cute_tcgen05_store_values: dict[str, CuteTcgen05StoreValue] = {}
+        self.cute_tcgen05_matmul_plan: CuteTcgen05MatmulPlan | None = None
+        self._cute_tcgen05_per_tile_stmt_ids: set[int] = set()
+        self._cute_tcgen05_post_loop_stmt_ids: set[int] = set()
+        self._cute_tcgen05_tma_load_role_stmt_ids: set[int] = set()
+        self._cute_collective_handled_loads: set[str] = set()
+        self.cute_cluster_shape: tuple[int, int, int] | None = None
+        self.cute_block_shape: tuple[int, int, int] | None = None
+        self.suppress_cute_root_lane_loops = False
 
         from .helper_function import HelperFunctionManager
 
@@ -318,13 +435,20 @@ class DeviceFunction:
         self.epilogue_subtile_store_indices: dict[str, int] = {}
         self.rng_seed_buffer_param_name = None
 
-        # Pallas: id(fake_tensor) → {dim: block_id}, recorded during codegen
-        self.pallas_tensor_dim_block_ids: dict[int, dict[int, int]] = {}
-        # Pallas: set of id(fake_tensor) for tensors accessed in pipeline body
-        self.pallas_pipeline_tensor_ids: set[int] = set()
-        # TODO(dunfanlu): consider duplicating and aliasing arguments if a tensor needs to be accessed via both VMEM and SMEM?
-        # Pallas: set of id(fake_tensor) for tensors requiring scalar accessing (SMEM)
-        self.pallas_smem_tensor_ids: set[int] = set()
+        # Pallas: id(fake_tensor) → [DimensionTiling], recorded during `plan_tiling`
+        self.pallas_tensor_dim_tilings: dict[int, list[DimensionTiling]] = {}
+        # Pallas: id(fake_tensor) → memory space, determined during
+        # tracing (HBM for pipeline) and codegen (SMEM for scalar access).
+        # NOTE: Currently each tensor can only have one memory space.
+        # If a tensor needs both SMEM (scalar access) and VMEM (slice
+        # access), it will need tensor duplication — passing the same
+        # data as two separate args in different memory spaces. This
+        # dict would then need to support multiple entries per tensor
+        # or the tensor would get distinct arg IDs per memory space.
+        self.pallas_memory_space: dict[int, PallasMemorySpace] = {}
+        # Pallas: id(fake_tensor) → {dim: (block_id, extra_pad)} for dims
+        # using pl.ds() that may need host-side padding.
+        self.pallas_pad_info: dict[int, dict[int, tuple[int, int]]] = {}
 
     def allocate_store_index(self) -> int:
         """Bump store counters and return the indexing strategy slot."""
@@ -460,6 +584,125 @@ class DeviceFunction:
         ]
         for n in name_group:
             self._variable_renames[n] = name_group
+
+    def register_cute_tcgen05_store_value(
+        self, name: str, value: CuteTcgen05StoreValue
+    ) -> None:
+        self._cute_tcgen05_store_values[name] = value
+
+    def register_cute_tcgen05_matmul_plan(self, plan: CuteTcgen05MatmulPlan) -> None:
+        if self.cute_tcgen05_matmul_plan is not None:
+            if self.cute_tcgen05_matmul_plan != plan:
+                raise exc.BackendUnsupported(
+                    "cute", "mixed tcgen05 matmul collective plans in one kernel"
+                )
+            return
+        self.cute_tcgen05_matmul_plan = plan
+
+    def register_cute_tcgen05_per_tile_stmts(self, stmts: list[ast.AST]) -> None:
+        """Mark statements that depend on per-tile coordinates.
+
+        When the persistent kernel splits the device-loop prefix into a
+        once-per-CTA setup and a per-tile body, statements registered here
+        stay inside the work-tile loop; everything else can be hoisted out.
+        Use for things like ``cute.local_tile`` over the per-tile (m, n)
+        offset, ``tma_partition`` of those per-tile tensors, and the initial
+        ``producer_acquire`` / TMA prefetch that warm the pipeline at the
+        start of each tile.
+        """
+        self._cute_tcgen05_per_tile_stmt_ids.update(id(stmt) for stmt in stmts)
+
+    def is_cute_tcgen05_per_tile(self, stmt: ast.stmt) -> bool:
+        return id(stmt) in self._cute_tcgen05_per_tile_stmt_ids
+
+    @property
+    def has_cute_tcgen05_per_tile_marks(self) -> bool:
+        return bool(self._cute_tcgen05_per_tile_stmt_ids)
+
+    def register_cute_tcgen05_post_loop_stmts(self, stmts: list[ast.AST]) -> None:
+        """Mark statements that should run AFTER the persistent work-tile loop.
+
+        This is the natural home for one-shot pipeline drains (``producer_tail``),
+        TMEM deallocation, and any other cleanup that conceptually runs once
+        the kernel has finished all its tiles. Without this tag, those
+        statements would remain inside the work-tile loop and execute on
+        every virtual tile, which is at best wasted work and at worst
+        incorrect (re-freeing a TMEM buffer the next tile still needs).
+
+        Non-persistent kernels skip the post-loop split entirely; the
+        statements stay where the codegen emitted them, which is already
+        the end of the device function.
+        """
+        self._cute_tcgen05_post_loop_stmt_ids.update(id(stmt) for stmt in stmts)
+
+    def is_cute_tcgen05_post_loop(self, stmt: ast.stmt) -> bool:
+        return id(stmt) in self._cute_tcgen05_post_loop_stmt_ids
+
+    @property
+    def has_cute_tcgen05_post_loop_marks(self) -> bool:
+        return bool(self._cute_tcgen05_post_loop_stmt_ids)
+
+    def register_cute_tcgen05_tma_load_role_stmts(self, stmts: list[ast.AST]) -> None:
+        """Mark statements that belong to the TMA-load warp's role block.
+
+        When the persistent kernel splits the work-tile body into role
+        blocks (see ``Tcgen05PersistentProgramIDs._collect_tcgen05_role_blocks``),
+        statements registered here are pulled into a TMA-load-specific
+        role block. The block is gated by the TMA-load warp predicate so
+        only that warp executes its body. Use for statements whose work
+        is conceptually owned by the TMA-load warp -- e.g. the initial
+        TMA prefetch ``producer_acquire`` / ``cute.copy`` /
+        ``producer_commit`` cycle that warms the AB pipeline at the
+        start of each tile.
+
+        Statements registered here must be reachable from the per-tile
+        wrapped body when the role partitioner runs. Two registration
+        shapes are valid:
+
+        - **Top-level statements** -- register the statement as per-tile
+          first via ``register_cute_tcgen05_per_tile_stmts``, otherwise
+          the splitter will hoist it out of the work-tile body before
+          the role partitioner ever sees it. The initial TMA prefetch
+          IF-blocks emitted from ``cute_mma.py`` take this shape.
+        - **Nested statements inside a per-tile container** (e.g. the
+          per-K-iter TMA producer block emitted inside the K-loop body
+          via ``cg.add_statement(...)``) -- the containing statement
+          stays in the work-tile body because it transitively depends
+          on per-tile names, and the role partitioner recurses into
+          top-level ``for`` / ``while`` loops to find tagged children.
+          These tagged children do NOT need to be per-tile-registered
+          themselves; the parent loop carries them.
+        """
+        self._cute_tcgen05_tma_load_role_stmt_ids.update(id(stmt) for stmt in stmts)
+
+    def is_cute_tcgen05_tma_load_role(self, stmt: ast.stmt) -> bool:
+        return id(stmt) in self._cute_tcgen05_tma_load_role_stmt_ids
+
+    @property
+    def has_cute_tcgen05_tma_load_role_marks(self) -> bool:
+        return bool(self._cute_tcgen05_tma_load_role_stmt_ids)
+
+    @property
+    def cute_tcgen05_tma_load_role_stmt_ids(self) -> frozenset[int]:
+        """Snapshot of every registered TMA-load role-tag id. The role
+        partitioner uses this to validate that every registered tag was
+        consumed (either at top level or via the one-level for/while
+        recursion) -- a registered tag that never gets visited indicates
+        a bad registration shape that would otherwise silently miscompile.
+        """
+        return frozenset(self._cute_tcgen05_tma_load_role_stmt_ids)
+
+    def get_cute_tcgen05_store_value(self, name: str) -> CuteTcgen05StoreValue | None:
+        for alias in self._variable_renames.get(name, [name]):
+            if (value := self._cute_tcgen05_store_values.get(alias)) is not None:
+                return value
+        return None
+
+    def register_cute_collective_handled_load(self, name: str) -> None:
+        self._cute_collective_handled_loads.add(name)
+
+    def is_cute_collective_handled_load(self, name: str) -> bool:
+        return name in self._cute_collective_handled_loads
 
     def set_pid(self, pid: ProgramIDs) -> None:
         if self.pid is not None:
@@ -737,7 +980,8 @@ class DeviceFunction:
         ]
 
         args = [arg.arg_def_node() for arg in param_args]
-        # Ordering invariant: [param_args, extra_params, rng_seed, scratch_args].
+        # Ordering invariant:
+        # [param_args, extra_params, rng_seed, scratch_args, wrapper_only_params].
         # codegen_function_call must match this order — it builds positional args
         # from param_args, extends with extra_params, then build_launcher_args
         # appends rng_seed_buffer.
@@ -750,6 +994,7 @@ class DeviceFunction:
         # Add scratch memory parameters (for emit_pipeline on Pallas/TPU)
         for scratch_arg in self._scratch_args:
             args.append(create_arg(scratch_arg.name))
+        args.extend(create_arg(name) for name in self.wrapper_only_params)
 
         # Generate inlined constexpr assignments at module level
         # (e.g., _BLOCK_SIZE_0 = tl.constexpr(256))
@@ -824,13 +1069,27 @@ class DeviceFunction:
             has_barrier=env.has_barrier,
             sorted_args=arg_objects,
         )
-        # TODO(jansel): we should run CSE this statement
-        call_statement = statement_from_string(
-            f"_launcher({self.name}, {{call_grid_expr}}, {', '.join(call_args)})",
-            call_grid_expr=call_grid_expr,
+        # Check if the backend wants to capture return values for output-only tensors.
+        output_only_names = getattr(backend, "_output_only_names", [])
+        launcher_call = (
+            f"_launcher({self.name}, {{call_grid_expr}}, {', '.join(call_args)})"
         )
+        if output_only_names:
+            if len(output_only_names) == 1:
+                assign_target = output_only_names[0]
+            else:
+                assign_target = ", ".join(output_only_names)
+            call_statement = statement_from_string(
+                f"{assign_target} = {launcher_call}",
+                call_grid_expr=call_grid_expr,
+            )
+        else:
+            call_statement = statement_from_string(
+                launcher_call,
+                call_grid_expr=call_grid_expr,
+            )
         assert isinstance(call_statement, ExtendedAST)
-        # Mark the kernel call we can find it in codegen_precompile_def
+        # Mark the kernel call so we can find it in codegen_precompile_def
         call_statement._is_kernel_call = True
         return call_statement
 
@@ -921,6 +1180,43 @@ class DeviceFunction:
         return self.register_scratch(
             (), None, name_hint=name_hint, scratch_type="dma_semaphore"
         )
+
+    def get_tensor_read_write_names(self) -> tuple[set[str], set[str]]:
+        """Returns AST names of read and written tensors"""
+        from helion.language import atomic_ops
+        from helion.language import memory_ops
+
+        read_names: set[str] = set()
+        write_names: set[str] = set()
+        for graph in self.codegen.codegen_graphs:
+            for node in graph.graph.nodes:
+                if node.op != "call_function":
+                    continue
+
+                def _get_tensor_name(node: torch.fx.Node) -> str:
+                    tensor_arg = node.args[0]
+                    assert isinstance(tensor_arg, torch.fx.Node)
+                    tensor_val = tensor_arg.meta.get("val")
+                    assert isinstance(tensor_val, torch.Tensor)
+                    return self.tensor_arg(tensor_val).name
+
+                if node.target is memory_ops.load:
+                    read_names.add(_get_tensor_name(node))
+                elif node.target is memory_ops.store:
+                    write_names.add(_get_tensor_name(node))
+                elif node.target in (
+                    atomic_ops.atomic_add,
+                    atomic_ops.atomic_cas,
+                    atomic_ops.atomic_or,
+                    atomic_ops.atomic_xor,
+                    atomic_ops.atomic_xchg,
+                    atomic_ops.atomic_min,
+                    atomic_ops.atomic_max,
+                    atomic_ops.atomic_and,
+                ):
+                    read_names.add(_get_tensor_name(node))
+                    write_names.add(_get_tensor_name(node))
+        return read_names, write_names
 
     def __enter__(self) -> None:
         try:

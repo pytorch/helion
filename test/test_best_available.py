@@ -303,6 +303,27 @@ class TestBestAvailable(unittest.TestCase):
         re_flat = config_gen.flatten(restored)
         self.assertEqual(re_flat, flat)
 
+    def test_flatten_persistent_reduction_loop_roundtrip(self):
+        """Persistent reductions normalize to None but must round-trip to the flat sentinel."""
+        config_spec = ConfigSpec(backend=TritonBackend())
+        config_spec.block_sizes.append(
+            BlockSizeSpec(block_id=0, size_hint=64, min_size=16, max_size=256)
+        )
+        config_spec.reduction_loops.append(ReductionLoopSpec(block_id=1, size_hint=128))
+
+        config_gen = ConfigGeneration(config_spec)
+        default_flat = config_gen.default_flat()
+        rl_indices, rl_is_seq = config_gen._key_to_flat_indices["reduction_loops"]
+        self.assertTrue(rl_is_seq)
+        self.assertEqual(len(rl_indices), 1)
+        self.assertEqual(default_flat[rl_indices[0]], 128)
+
+        config = config_gen.unflatten(default_flat)
+        self.assertEqual(config.config["reduction_loops"], [None])
+
+        roundtripped = config_gen.flatten(config)
+        self.assertEqual(roundtripped, default_flat)
+
 
 class TestCacheMatching(unittest.TestCase):
     """Tests for cache file matching in warm start."""
