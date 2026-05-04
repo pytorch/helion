@@ -8,6 +8,7 @@ from unittest import mock
 
 import benchmarks.compare_matmul_backends as compare_matmul_backends
 from benchmarks.compare_matmul_backends import _build_subprocess_cmd
+from benchmarks.compare_matmul_backends import _helion_role_local_loop_summaries
 from benchmarks.compare_matmul_backends import _make_helion_config_from_args
 from benchmarks.compare_matmul_backends import _parse_indexing_list
 from benchmarks.compare_matmul_backends import _parse_int_list
@@ -16,6 +17,7 @@ from benchmarks.compare_matmul_backends import _quack_codegen_sources
 from benchmarks.compare_matmul_backends import _source_bundle_summary
 from benchmarks.compare_matmul_backends import _source_marker_counts
 from benchmarks.compare_matmul_backends import _source_marker_lines
+from benchmarks.compare_matmul_backends import _source_symbol_marker_summaries
 from benchmarks.compare_matmul_backends import _two_cta_diagnostic_variant_args
 from benchmarks.compare_matmul_backends import _two_cta_seed_args
 from benchmarks.compare_matmul_backends import _validate_args
@@ -78,8 +80,13 @@ class TestCompareMatmulBackends(unittest.TestCase):
     @staticmethod
     def _write_quack_codegen_sources(quack_root: Path) -> None:
         sources = {
-            Path("quack") / "gemm_sm100.py": "cute.arch.griddepcontrol_wait()\n",
-            Path("quack") / "gemm_base.py": "PipelineTmaStore.create(\n",
+            Path("quack") / "gemm_sm100.py": (
+                "class Gemm:\n"
+                "    def producer(self):\n"
+                "        cute.arch.griddepcontrol_wait()\n"
+            ),
+            Path("quack")
+            / "gemm_base.py": "def store():\n    PipelineTmaStore.create()\n",
             Path("quack") / "pipeline.py": "PipelineTmaUmma\n",
             Path("quack") / "tile_scheduler.py": "TileSchedulerCls\n",
         }
@@ -268,6 +275,76 @@ class TestCompareMatmulBackends(unittest.TestCase):
             ["quack.py:1"],
         )
 
+    def test_helion_role_local_loop_summaries_group_markers_by_role(self) -> None:
+        code = """
+def kernel():
+    if cute.arch.make_warp_uniform(cute.arch.warp_idx()) == cutlass.Int32(5):
+        cute.arch.griddepcontrol_wait()
+        sched = cutlass.utils.StaticPersistentTileScheduler.create(params)
+        while tcgen05_role_local_0_work_tile.is_valid_tile:
+            tcgen05_ab_pipeline.producer_acquire(state)
+    if cute.arch.make_warp_uniform(cute.arch.warp_idx()) == cutlass.Int32(6):
+        sched = cutlass.utils.StaticPersistentTileScheduler.create(params)
+        while tcgen05_role_local_1_work_tile.is_valid_tile:
+            tcgen05_acc_pipeline.producer_acquire(state)
+"""
+
+        summaries = _helion_role_local_loop_summaries(code)
+
+        self.assertEqual(
+            [summary["role"] for summary in summaries], ["tma_load", "mma_exec"]
+        )
+        self.assertEqual(summaries[0]["markers"]["griddepcontrol_wait"], 1)
+        self.assertEqual(summaries[0]["markers"]["persistent_scheduler"], 1)
+        self.assertEqual(summaries[0]["markers"]["work_tile_loop"], 1)
+        self.assertEqual(summaries[0]["markers"]["producer_acquire"], 1)
+        self.assertEqual(
+            [entry["marker"] for entry in summaries[0]["marker_trace"]],
+            [
+                "griddepcontrol_wait",
+                "persistent_scheduler",
+                "work_tile_loop",
+                "producer_acquire",
+            ],
+        )
+
+    def test_source_symbol_marker_summaries_groups_quack_markers(self) -> None:
+        summaries = _source_symbol_marker_summaries(
+            {
+                "quack/gemm_sm100.py": """
+class Gemm:
+    def producer(self):
+        cute.arch.griddepcontrol_wait()
+        PipelineTmaUmma()
+
+def epilogue():
+    PipelineTmaStore.create()
+""",
+                "quack/pipeline.py": "def no_markers():\n    return None\n",
+            }
+        )
+
+        self.assertEqual(
+            [(summary["source"], summary["symbol"]) for summary in summaries],
+            [
+                ("quack/gemm_sm100.py", "Gemm.producer"),
+                ("quack/gemm_sm100.py", "epilogue"),
+            ],
+        )
+        self.assertEqual(summaries[0]["markers"]["griddepcontrol_wait"], 1)
+        self.assertEqual(summaries[0]["markers"]["pipeline_tma_umma"], 1)
+        self.assertEqual(summaries[1]["markers"]["pipeline_tma_store"], 1)
+
+    def test_source_symbol_marker_summaries_do_not_truncate(self) -> None:
+        source = "\n\n".join(
+            f"def marker_{idx}():\n    PipelineTmaStore.create()" for idx in range(20)
+        )
+
+        summaries = _source_symbol_marker_summaries({"quack/generated.py": source})
+
+        self.assertEqual(len(summaries), 20)
+        self.assertEqual(summaries[-1]["symbol"], "marker_19")
+
     def test_quack_codegen_sources_use_requested_root(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             quack_root = Path(tmpdir)
@@ -293,7 +370,7 @@ class TestCompareMatmulBackends(unittest.TestCase):
             self._write_quack_codegen_sources(quack_root)
             prepared = argparse.Namespace(
                 active_config="fake-config",
-                code="PipelineTmaStore.create(\n",
+                code="def kernel():\n    PipelineTmaStore.create()\n",
                 codegen={"uses_tcgen05": True},
             )
             with mock.patch.object(
@@ -306,6 +383,11 @@ class TestCompareMatmulBackends(unittest.TestCase):
         gemm_source = str(Path(quack_root.name) / "quack" / "gemm_sm100.py")
         self.assertIn(gemm_source, payload["quack"]["sources"])
         self.assertEqual(payload["quack"]["markers"]["griddepcontrol_wait"], 1)
+        self.assertEqual(
+            payload["quack"]["marker_symbols"][0]["symbol"],
+            "Gemm.producer",
+        )
+        self.assertEqual(payload["helion"]["role_local_loops"], [])
 
     def test_two_cta_codegen_report_fails_cleanly_without_quack_sources(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
