@@ -233,7 +233,8 @@ class TestCompareMatmulBackends(unittest.TestCase):
             "while work_tile.is_valid_tile:\n"
             "tcgen05_epilog_sync_barrier.arrive_and_wait()\n"
             "epilogue_barrier.arrive_and_wait()\n"
-            "cute.arch.griddepcontrol_wait()"
+            "cute.arch.griddepcontrol_wait()\n"
+            "cute.arch.griddepcontrol_launch_dependents()"
         )
 
         counts = _source_marker_counts(source)
@@ -243,6 +244,7 @@ class TestCompareMatmulBackends(unittest.TestCase):
         self.assertEqual(counts["work_tile_loop"], 1)
         self.assertEqual(counts["epilogue_barrier_wait"], 2)
         self.assertEqual(counts["griddepcontrol_wait"], 1)
+        self.assertEqual(counts["griddepcontrol_launch_dependents"], 1)
         self.assertEqual(lines["pipeline_tma_store"], [1])
         self.assertEqual(lines["epilogue_barrier_wait"], [3, 4])
 
