@@ -24,6 +24,8 @@ from helion._testing import RefEagerTestDisabled
 from helion._testing import import_path
 from helion._testing import onlyBackends
 from helion._testing import skipIfXPU
+from helion.autotuner.base_search import PopulationBasedSearch
+from helion.autotuner.base_search import PopulationMember
 from helion.autotuner.benchmark_job import RebenchmarkJob
 from helion.autotuner.benchmark_job import _load_args
 from helion.autotuner.benchmark_pool import PoolBenchmarkManager
@@ -297,6 +299,49 @@ class TestWorkerPoolPrecompile(unittest.TestCase):
         self.assertEqual(pool.job.repeat, 7)
         self.assertEqual(len(pool.job.fn_specs), 2)
         self.assertEqual(pool.timeout, 20.0)
+
+    def test_population_rebenchmark_uses_provider_timings(self) -> None:
+        # BaseSearch should use provider rebenchmark timings when available.
+        class FakeProvider:
+            def __init__(self) -> None:
+                self.mutated_arg_indices: list[int] = []
+                self.fns: list[object] | None = None
+                self.repeat: int | None = None
+
+            def rebenchmark(
+                self,
+                fns: list[object],
+                *,
+                repeat: int,
+                desc: str,
+            ) -> list[float]:
+                self.fns = fns
+                self.repeat = repeat
+                return [0.70, 0.80]
+
+        def fn_a() -> None:
+            pass
+
+        def fn_b() -> None:
+            pass
+
+        provider = FakeProvider()
+        search = cast("Any", PopulationBasedSearch.__new__(PopulationBasedSearch))
+        search.settings = Settings(autotune_precompile="pool")
+        search.kernel = SimpleNamespace(env=SimpleNamespace(process_group_name=None))
+        search.best_perf_so_far = 1.0
+        search.benchmark_provider = provider
+        members = [
+            PopulationMember(fn=fn_a, perfs=[1.00], flat_values=[], config=Config()),
+            PopulationMember(fn=fn_b, perfs=[0.90], flat_values=[], config=Config()),
+        ]
+
+        search.rebenchmark(members, desc="verify")
+
+        self.assertEqual(provider.fns, [fn_a, fn_b])
+        self.assertEqual(provider.repeat, 200)
+        self.assertEqual(members[0].perfs[-1], 0.70)
+        self.assertEqual(members[1].perfs[-1], 0.80)
 
     def test_false_precompile_result_is_failure(self) -> None:
         # A worker precompile returning False should count as a real compile failure.
