@@ -15,6 +15,7 @@ from .ast_extension import expr_from_string
 from .ast_extension import statement_from_string
 from .compile_environment import CompileEnvironment
 from .cute.cutedsl_compat import emit_pipeline_advance
+from .cute.tcgen05_constants import TCGEN05_TWO_CTA_MAX_K_TILES
 from .device_function import DeviceFunction
 from .device_function import TensorArg
 from .host_function import HostFunction
@@ -775,10 +776,7 @@ class PersistentInterleavedProgramIDs(PersistentProgramIDs):
 class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
     """tcgen05 persistent scheduler for blocked and interleaved PID orders."""
 
-    # Covers the fixed 4096^3 benchmark at bk=16 and is exercised by the
-    # max-K runtime test. Re-verify that test plus the guard-boundary test
-    # before raising this threshold.
-    _VALIDATED_TWO_CTA_MAX_K_TILES: ClassVar[int] = 256
+    _VALIDATED_TWO_CTA_MAX_K_TILES: ClassVar[int] = TCGEN05_TWO_CTA_MAX_K_TILES
 
     def __init__(self, *, is_blocked: bool) -> None:
         super().__init__(is_blocked=is_blocked)
