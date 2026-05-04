@@ -42,6 +42,7 @@ from helion._testing import skipIfRefEager
 from helion._testing import skipIfRocm
 from helion._testing import skipIfTileIR
 from helion._testing import skipIfXPU
+from helion._testing import skipUnlessCuteAvailable
 from helion.autotuner import DESurrogateHybrid
 from helion.autotuner import DifferentialEvolutionSearch
 from helion.autotuner import LFBOPatternSearch
@@ -54,6 +55,7 @@ from helion.autotuner.config_fragment import BooleanFragment
 from helion.autotuner.config_fragment import EnumFragment
 from helion.autotuner.config_fragment import IntegerFragment
 from helion.autotuner.config_fragment import ListOf
+from helion.autotuner.config_fragment import NumThreadsFragment
 from helion.autotuner.config_fragment import PermutationFragment
 from helion.autotuner.config_fragment import PowerOfTwoFragment
 from helion.autotuner.config_generation import ConfigGeneration
@@ -2018,6 +2020,12 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         self.assertEqual(pow2_frag.encode(8), [3.0])  # log2(8) = 3
         self.assertEqual(pow2_frag.encode(16), [4.0])  # log2(16) = 4
 
+        # Test NumThreadsFragment (0 is the CuTe auto-thread sentinel)
+        num_threads_frag = NumThreadsFragment(high=128)
+        self.assertEqual(num_threads_frag.dim(), 1)
+        self.assertEqual(num_threads_frag.encode(0), [0.0])
+        self.assertEqual(num_threads_frag.encode(8), [4.0])
+
         # Test EnumFragment (one-hot encoding)
         enum_frag = EnumFragment(choices=("a", "b", "c"))
         self.assertEqual(enum_frag.dim(), 3)
@@ -2040,6 +2048,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             (BooleanFragment(), True),
             (IntegerFragment(1, 10, 5), 5),
             (PowerOfTwoFragment(2, 128, 8), 16),
+            (NumThreadsFragment(128), 0),
             (EnumFragment(choices=("a", "b")), "b"),
         ]:
             dim = fragment.dim()
@@ -2412,6 +2421,82 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         self.assertEqual(
             search._autotune_metrics.num_accuracy_failures, len(search.configs)
         )
+
+
+@skipIfRefEager("Autotuning requires compilation, not supported in ref eager mode")
+@skipUnlessCuteAvailable("CUTLASS CuTe Python DSL is not available")
+@onlyBackends(["cute"])
+class TestCuteAutotuner(TestCase):
+    def test_implicit_call_uses_autotuner_fn(self) -> None:
+        calls: list[bool] = []
+
+        def autotuner_fn(bound_kernel, args, **kwargs):
+            class RecordingAutotuner:
+                def autotune(self, *, skip_cache: bool = False):
+                    calls.append(skip_cache)
+                    return bound_kernel.config_spec.default_config()
+
+            return RecordingAutotuner()
+
+        @helion.kernel(
+            backend="cute",
+            autotuner_fn=autotuner_fn,
+            autotune_log_level=0,
+        )
+        def add(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(a)
+            for tile in hl.tile(out.size()):
+                out[tile] = a[tile] + b[tile]
+            return out
+
+        args = (
+            torch.randn([8], device=DEVICE),
+            torch.randn([8], device=DEVICE),
+        )
+        torch.testing.assert_close(add(*args), sum(args))
+        self.assertEqual(calls, [False])
+
+    def test_cute_config_generation_repairs_num_threads(self) -> None:
+        @helion.kernel(backend="cute", autotune_log_level=0)
+        def add(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(a)
+            for tile in hl.tile(out.size()):
+                out[tile] = a[tile] + b[tile]
+            return out
+
+        args = (
+            torch.randn([16, 64], device=DEVICE),
+            torch.randn([16, 64], device=DEVICE),
+        )
+        bound = add.bind(args)
+        gen = ConfigGeneration(bound.config_spec)
+        flat_keys = {
+            key for key, _count, _is_sequence in gen.config_spec.flat_key_layout()
+        }
+        self.assertEqual(flat_keys, {"block_sizes", "num_threads"})
+
+        repaired = gen.unflatten(
+            gen.flatten(helion.Config(block_sizes=[16, 64], num_threads=[128, 128]))
+        )
+        self.assertEqual(repaired.block_sizes, [16, 64])
+        self.assertEqual(repaired.num_threads, [16, 64])
+
+        configs = [gen.random_config() for _ in range(20)]
+        self.assertTrue(any(config.num_threads for config in configs))
+        for config in configs:
+            self.assertLessEqual(set(config.config), {"block_sizes", "num_threads"})
+            self.assertNotIn("persistent", config.pid_type)
+            explicit_threads = [nt for nt in config.num_threads if nt > 0]
+            if explicit_threads:
+                self.assertLessEqual(math.prod(explicit_threads), 1024)
+            for block_size, num_threads in zip(
+                config.block_sizes,
+                config.num_threads,
+                strict=False,
+            ):
+                if num_threads > 0:
+                    self.assertLessEqual(num_threads, block_size)
+                    self.assertEqual(block_size % num_threads, 0)
 
 
 @onlyBackends(["triton"])

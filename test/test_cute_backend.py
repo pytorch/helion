@@ -92,7 +92,7 @@ def cute_pointwise_chain(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     return out
 
 
-@helion.kernel(backend="cute")
+@helion.kernel(backend="cute", autotune_effort="none")
 def cute_affine_scalar_args(
     x: torch.Tensor,
     scale: int,
