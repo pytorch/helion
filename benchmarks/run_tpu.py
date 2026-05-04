@@ -656,8 +656,9 @@ KERNEL_MAPPINGS: dict[str, KernelMapping] = {
         _softmax_shapes_basic,
         None,
     ),
-    # rms_norm_fwd returns (output, inv_rms); the _unwrap_first wrapper in
-    # run_kernel_inner extracts just the first element for run_example.
+    # rms_norm_fwd returns (output, inv_rms) but _rms_norm_baseline returns
+    # only the primary tensor, so run_kernel_inner unwraps the kernel output.
+    # rms_norm_bwd's baseline returns a tuple too, so no unwrap there.
     "rms_norm": (
         "rms_norm",
         "rms_norm_fwd",
@@ -794,7 +795,11 @@ def run_kernel_inner(name: str) -> KernelResult:
         all_passed = True
         shape_results: list[ShapeResult] = []
 
-        # Wrap kernel functions that return tuples so run_example sees a single tensor
+        # Some kernels (e.g. rms_norm_fwd) return (primary, aux) but their
+        # baseline returns only the primary tensor; in that case unwrap the
+        # kernel output so run_example's len-equality check passes. When the
+        # baseline ALSO returns a tuple (e.g. rms_norm_bwd → (grad_x, grad_w)),
+        # leave both sides as tuples so they compare element-wise.
         def _unwrap_first(fn: Callable[..., Any]) -> Callable[..., torch.Tensor]:
             @functools.wraps(fn)
             def wrapper(*a: object) -> torch.Tensor:
@@ -803,7 +808,8 @@ def run_kernel_inner(name: str) -> KernelResult:
 
             return wrapper
 
-        kernel_fn = _unwrap_first(kernel_fn)
+        if not isinstance(baseline_fn(*shapes[0][1]), tuple):
+            kernel_fn = _unwrap_first(kernel_fn)
 
         for label, args in shapes:
             print(f"  Shape {label}:", file=sys.stderr)
