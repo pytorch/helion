@@ -24,6 +24,7 @@ from .host_function import HostFunction
 from .tile_strategy import DeviceLoopState
 from .utils import compute_slice_size
 from .variable_origin import BlockSizeOrigin
+from .variable_origin import GridOrigin
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -507,9 +508,8 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
                     ].from_config(config)
                     if not valid_block_size(block_size, stride, i):
                         return False
-                # Non-BlockSizeOrigin SymInt is a scalar index
-                # (block_shape=1 in BlockedSubscriptIndexing.create),
-                # same as int — no valid_block_size check needed.
+                elif not (origin and isinstance(origin.origin, GridOrigin)):
+                    return False
 
         return True
 
