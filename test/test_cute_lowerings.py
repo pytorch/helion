@@ -1567,6 +1567,31 @@ class TestCuteLowerings(unittest.TestCase):
                 "cutlass.pipeline.Agent.Thread, cutlass.Int32(8))",
                 code,
             )
+            self.assertIn(
+                "tcgen05_acc_pipeline = "
+                "cutlass.pipeline.PipelineUmmaAsync.create("
+                "num_stages=2, "
+                "producer_group=tcgen05_acc_pipeline_producer_group, "
+                "consumer_group=tcgen05_acc_pipeline_consumer_group, "
+                "barrier_storage=tcgen05_acc_pipeline_barriers, "
+                "cta_layout_vmnk=tcgen05_cluster_layout_vmnk, "
+                "defer_sync=True)",
+                code,
+            )
+            self.assertIn(
+                "tcgen05_ab_pipeline = "
+                "cutlass.pipeline.PipelineTmaUmma.create("
+                "num_stages=2, "
+                "producer_group=tcgen05_ab_pipeline_producer_group, "
+                "consumer_group=tcgen05_ab_pipeline_consumer_group, "
+                "tx_count=cute.size_in_bytes(cutlass.BFloat16, "
+                "sA_tma_layout) + cute.size_in_bytes(cutlass.BFloat16, "
+                "sB_tma_layout), "
+                "barrier_storage=tcgen05_ab_pipeline_mbars, "
+                "cta_layout_vmnk=tcgen05_cluster_layout_vmnk, "
+                "defer_sync=True)",
+                code,
+            )
             tmem_arrive_pos = code.index("tcgen05_tmem_alloc_barrier.arrive()")
             acc_tail_marker = (
                 "tcgen05_acc_pipeline.producer_tail"
