@@ -1313,9 +1313,9 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         "with total_tiles=%d, which is outside the validated persistent "
         "scheduler set for this path. "
         'Use a non-persistent pid_type (e.g. "flat"), pick a single-root '
-        "static-full-tile kernel with tcgen05_cluster_m=1, or, for "
-        "single-root fallback paths, pick block sizes that keep "
-        "total_tiles == 1."
+        "static-full-tile kernel with tcgen05_cluster_m=1, or pick the "
+        "validated single-root static-full CtaGroup.TWO shape with block "
+        "sizes that keep total_tiles == 1."
     )
 
     def _emit_host_multi_tile_guard(
@@ -1328,11 +1328,13 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
 
         The single-root static full-tile role-local path has multi-tile
         runtime coverage only for ``tcgen05_cluster_m == 1``. Legacy
-        non-role-local tcgen05 persistent kernels, multi-root kernels, and
-        cluster_m > 1 configs still hit, or lack coverage for, wrong-output /
-        hang / launch-failure modes, so this guard remains for those paths.
-        Single-tile fallback shapes with ``cluster_m == 1`` continue to run
-        because they do not exercise scheduler tile-to-tile transitions.
+        non-role-local tcgen05 persistent kernels, multi-root kernels,
+        cluster_m > 1 fallback configs, and cluster_m > 1 multi-tile configs
+        still hit, or lack coverage for, wrong-output / hang / launch-failure
+        modes, so this guard remains for those paths. Single-tile cluster_m=1
+        fallback shapes and the validated static-full CtaGroup.TWO shape
+        continue to run because they do not exercise scheduler tile-to-tile
+        transitions.
 
         The autotuner narrowing in
         ``ConfigSpec.narrow_tcgen05_autotune_to_validated_configs`` removes
@@ -1341,13 +1343,13 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         explicit user configs that bypass autotune.
 
         The threshold is intentionally ``total_tiles > 1`` for guarded
-        single-root paths. For partial fallback shapes this converts known
-        launch and wrong-output failures into a host error. Multi-root
-        kernels use ``total_tiles > 0`` because the scheduler grid is
-        derived from only the first root case; even one tile in a later case
-        is unsafe. Cluster_m > 1 configs also use ``total_tiles > 0`` because
-        CtaGroup.TWO codegen is structural-only until G3 runtime ownership is
-        validated.
+        validated single-root paths. For cluster_m > 1 fallback and multi-tile
+        shapes this converts known launch, timeout, and wrong-output failures
+        into a host error while allowing the validated single-output-tile
+        CtaGroup.TWO path only when role-local static-full codegen was
+        extracted. Multi-root kernels use ``total_tiles > 0`` because the
+        scheduler grid is derived from only the first root case; even one tile
+        in a later case is unsafe.
         """
         host_total_pids = host_total_pids_expr
         if host_total_pids is None:
@@ -1423,11 +1425,14 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             # Retarget even for guarded cluster_m>1 / multi-root codegen so
             # compile-only inspection still sees the role-local scheduler shape.
             self._retarget_tcgen05_shared_scheduler_to_exec(layout)
+        allow_single_tile_guarded_path = not is_multi_root and (
+            layout.cluster_m == 1 or (layout.cluster_m == 2 and full_role_local_body)
+        )
         if not use_validated_role_local_body:
             self._emit_host_multi_tile_guard(
                 device_function,
                 host_guard_total_pids,
-                guard_threshold=0 if is_multi_root or layout.cluster_m > 1 else 1,
+                guard_threshold=1 if allow_single_tile_guarded_path else 0,
             )
 
         setup: list[ast.stmt] = []
