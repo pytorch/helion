@@ -798,7 +798,6 @@ class TestAtomicOperations(RefEagerTestBase, TestCase):
             self.assertIn("tl.atomic_xchg", code)
             self.assertNotIn("desc.atomic_xchg", code)
 
-
     @onlyBackends("triton")
     @skipIfRocm("Tensor descriptor not supported on ROCm")
     @skipIfTileIR("TileIR does not support descriptor atomics")
@@ -813,13 +812,15 @@ class TestAtomicOperations(RefEagerTestBase, TestCase):
             ),
             static_shapes=True,
         )
-        def batched_atomic_add(
-            x: torch.Tensor, y: torch.Tensor
-        ) -> torch.Tensor:
+        def batched_atomic_add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
             B, M, N = x.size()
             for tile_b in hl.tile(B, block_size=1):
                 for tile_m, tile_n in hl.tile([M, N]):
-                    hl.atomic_add(x, [tile_b.begin, tile_m, tile_n], y[tile_b.begin, tile_m, tile_n])
+                    hl.atomic_add(
+                        x,
+                        [tile_b.begin, tile_m, tile_n],
+                        y[tile_b.begin, tile_m, tile_n],
+                    )
             return x
 
         x = torch.zeros(4, 64, 64, device=DEVICE, dtype=torch.float32)
