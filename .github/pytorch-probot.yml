@@ -2,4 +2,8 @@ retryable_workflows:
   - "test"
   - "benchmark"
 retryable_step_names:
+  - "Install PyTorch"
+  - "Install Triton from source"
   - "CUDA Compute Check"
+  - "Inductor Worker Check"
+  - "XPU Compute Check"
