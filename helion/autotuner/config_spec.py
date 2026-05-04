@@ -26,6 +26,7 @@ from .._compiler.cute.tcgen05_constants import TCGEN05_ONE_CTA_MAX_BLOCK_M
 from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
 from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
 from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_MAX_K_TILES
+from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_SEED_L2_GROUPING
 from ..exc import InvalidConfig
 from .block_id_sequence import BlockIdSequence
 from .block_id_sequence import _BlockIdItem
@@ -494,6 +495,7 @@ class ConfigSpec:
                         TCGEN05_TWO_CTA_BLOCK_N,
                         bk,
                     ],
+                    l2_groupings=[TCGEN05_TWO_CTA_SEED_L2_GROUPING],
                     pid_type="persistent_blocked",
                     tcgen05_cluster_m=2,
                     # Matches the validated tcgen05 search restriction.

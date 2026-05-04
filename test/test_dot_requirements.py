@@ -10,6 +10,7 @@ from helion import _compat
 from helion._compiler.cute.tcgen05_constants import TCGEN05_ONE_CTA_MAX_BLOCK_M
 from helion._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
 from helion._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
+from helion._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_SEED_L2_GROUPING
 from helion._testing import DEVICE
 from helion._testing import HALF_DTYPE
 from helion._testing import RefEagerTestDisabled
@@ -269,29 +270,35 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
 
         config = {
             "block_sizes": [256, 256, 16],
+            "l2_groupings": [1],
             "pid_type": "persistent_blocked",
             "tcgen05_cluster_m": 2,
         }
         spec.normalize(config, _fix_invalid=True)
         self.assertEqual(config["tcgen05_cluster_m"], 2)
+        self.assertEqual(config["l2_groupings"], [1])
 
         for override in (
             {"pid_type": "flat"},
             {"block_sizes": [128, 256, 16]},
             {"block_sizes": [256, 128, 16]},
+            {"l2_groupings": [16]},
             {"pid_type": "persistent_interleaved"},
         ):
             with self.subTest(override=override):
                 config = {
                     "block_sizes": [256, 256, 16],
+                    "l2_groupings": [1],
                     "pid_type": "persistent_blocked",
                     "tcgen05_cluster_m": 2,
                     **override,
                 }
                 spec.normalize(config, _fix_invalid=True)
+                expected_l2_groupings = override.get("l2_groupings", [1])
                 self.assertEqual(config["tcgen05_cluster_m"], 2)
                 self.assertEqual(config["pid_type"], "persistent_blocked")
                 self.assertEqual(config["block_sizes"][:3], [256, 256, 16])
+                self.assertEqual(config["l2_groupings"], expected_l2_groupings)
 
     @onlyBackends(["cute"])
     def test_cute_tcgen05_cluster_m1_persistent_search_caps_m_tile(self) -> None:
@@ -383,6 +390,7 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
                 seed["block_sizes"][:3],
                 [TCGEN05_TWO_CTA_BLOCK_M, TCGEN05_TWO_CTA_BLOCK_N, 128],
             )
+            self.assertEqual(seed["l2_groupings"], [TCGEN05_TWO_CTA_SEED_L2_GROUPING])
             self.assertEqual(seed["pid_type"], "persistent_blocked")
             self.assertEqual(seed["tcgen05_num_epi_warps"], 4)
 
@@ -465,6 +473,7 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
                 original_block_sizes = list(block_sizes)
                 config = {
                     "block_sizes": block_sizes,
+                    "l2_groupings": [1],
                     "pid_type": "flat",
                     "tcgen05_cluster_m": 2,
                 }
@@ -472,6 +481,7 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
                 self.assertEqual(config["tcgen05_cluster_m"], 1)
                 self.assertEqual(config["pid_type"], "flat")
                 self.assertEqual(config["block_sizes"], original_block_sizes)
+                self.assertEqual(config["l2_groupings"], [1])
 
         original_allowed_pid_types = spec.allowed_pid_types
         try:
@@ -482,6 +492,7 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
                     TCGEN05_TWO_CTA_BLOCK_N,
                     16,
                 ],
+                "l2_groupings": [1],
                 "pid_type": "flat",
                 "tcgen05_cluster_m": 2,
             }
@@ -494,6 +505,7 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
             config["block_sizes"],
             [TCGEN05_TWO_CTA_BLOCK_M, TCGEN05_TWO_CTA_BLOCK_N, 16],
         )
+        self.assertEqual(config["l2_groupings"], [1])
 
     @skipIfMTIA("MTIA requires tl.dot initial value stride >= 128 bytes")
     def test_matmul_smaller_than_min_dot_size(self) -> None:
