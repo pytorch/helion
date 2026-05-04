@@ -509,37 +509,16 @@ class TestTensorDescriptor(RefEagerTestBase, TestCase):
         result_unaligned = add_one(x_unaligned)
         torch.testing.assert_close(result_unaligned, x_unaligned + 1.0)
 
-    @skipUnlessTensorDescriptor("Tensor descriptor support is required")
-    def test_scalar_symint_subscript(self):
-        """tile.begin (a SymInt without BlockSizeOrigin) should not prevent
-        tensor descriptor indexing.  Before the fix, is_supported() rejected
-        these and silently fell back to pointer indexing."""
-
-        @helion.kernel(
-            config=helion.Config(
-                block_sizes=[64],
-                indexing="tensor_descriptor",
-            ),
-            static_shapes=True,
-        )
-        def batched_add(x: torch.Tensor) -> torch.Tensor:
-            B, N = x.size()
-            out = torch.empty_like(x)
-            for tile_b in hl.tile(B, block_size=1):
-                for tile_n in hl.tile(N):
-                    out[tile_b.begin, tile_n] = x[tile_b.begin, tile_n] + 1.0
-            return out
-
-        x = torch.randn(4, 128, device=DEVICE, dtype=torch.float32)
-        code, result = code_and_output(batched_add, (x,))
-        torch.testing.assert_close(result, x + 1.0)
-
+    def assert_uses_tensor_descriptors(self, code: str) -> None:
         self.assertIn(get_tensor_descriptor_fn_name(), code)
         self.assertNotIn("tl.load(", code)
         self.assertNotIn("tl.store(", code)
 
+    def assert_tensor_descriptor_not_used_for(self, code: str, name: str) -> None:
+        self.assertNotIn(f"{name}_desc = {get_tensor_descriptor_fn_name()}", code)
+
     @skipUnlessTensorDescriptor("Tensor descriptor support is required")
-    def test_composite_scalar_symint_subscript(self):
+    def test_scalar_symint_subscript_allowlist(self):
         """Known scalar SymInt expressions should still use tensor descriptors."""
 
         @helion.kernel(
@@ -551,24 +530,13 @@ class TestTensorDescriptor(RefEagerTestBase, TestCase):
         )
         def gather_rows(x: torch.Tensor, start: int) -> torch.Tensor:
             _, n = x.size()
-            out = torch.empty([2, n], device=x.device, dtype=x.dtype)
+            out = torch.empty([4, n], device=x.device, dtype=x.dtype)
             for tile_n in hl.tile(n):
-                out[0, tile_n] = x[start + 3, tile_n]
-                out[1, tile_n] = x[start - start + 1, tile_n]
+                out[0, tile_n] = x[3, tile_n]
+                out[1, tile_n] = x[start, tile_n]
+                out[2, tile_n] = x[start + 3, tile_n]
+                out[3, tile_n] = x[start - start + 1, tile_n]
             return out
-
-        x = torch.randn(8, 128, device=DEVICE, dtype=torch.float32)
-        code, result = code_and_output(gather_rows, (x, 2))
-        expected = torch.stack([x[5], x[1]])
-        torch.testing.assert_close(result, expected)
-
-        self.assertIn(get_tensor_descriptor_fn_name(), code)
-        self.assertNotIn("tl.load(", code)
-        self.assertNotIn("tl.store(", code)
-
-    @skipUnlessTensorDescriptor("Tensor descriptor support is required")
-    def test_composite_tile_begin_scalar_symint_subscript(self):
-        """Scalar expressions composed with tile.begin are descriptor-safe."""
 
         @helion.kernel(
             config=helion.Config(
@@ -586,13 +554,123 @@ class TestTensorDescriptor(RefEagerTestBase, TestCase):
                     out[tile_b.begin, tile_n] = x[start + tile_b.begin, tile_n]
             return out
 
+        @helion.kernel(
+            config=helion.Config(
+                block_sizes=[64],
+                indexing="tensor_descriptor",
+            ),
+            static_shapes=True,
+        )
+        def copy_grid_rows(x: torch.Tensor) -> torch.Tensor:
+            _, n = x.size()
+            rows = 4
+            out = torch.empty([rows, n], device=x.device, dtype=x.dtype)
+            for row in hl.grid(rows):
+                for tile_n in hl.tile(n):
+                    out[row, tile_n] = x[row, tile_n]
+            return out
+
         x = torch.randn(8, 128, device=DEVICE, dtype=torch.float32)
+
+        code, result = code_and_output(gather_rows, (x, 2))
+        expected = torch.stack([x[3], x[2], x[5], x[1]])
+        torch.testing.assert_close(result, expected)
+        self.assert_uses_tensor_descriptors(code)
+
         code, result = code_and_output(copy_offset_rows, (x, 2))
         torch.testing.assert_close(result, x[2:6])
+        self.assert_uses_tensor_descriptors(code)
 
-        self.assertIn(get_tensor_descriptor_fn_name(), code)
-        self.assertNotIn("tl.load(", code)
-        self.assertNotIn("tl.store(", code)
+        code, result = code_and_output(copy_grid_rows, (x,))
+        torch.testing.assert_close(result, x[:4])
+        self.assert_uses_tensor_descriptors(code)
+
+    @skipUnlessTensorDescriptor("Tensor descriptor support is required")
+    def test_scalar_symint_subscript_blocklist(self):
+        """Unsafe scalar SymInt expressions should fall back for that tensor."""
+
+        @helion.kernel(
+            config=helion.Config(
+                block_sizes=[64],
+                indexing="tensor_descriptor",
+            ),
+            static_shapes=True,
+        )
+        def read_tile_end(x: torch.Tensor) -> torch.Tensor:
+            _, n = x.size()
+            rows = 4
+            out = torch.empty([rows, n], device=x.device, dtype=x.dtype)
+            for tile_b in hl.tile(rows, block_size=1):
+                for tile_n in hl.tile(n):
+                    out[tile_b.begin, tile_n] = x[tile_b.end, tile_n]
+            return out
+
+        @helion.kernel(
+            config=helion.Config(
+                block_sizes=[64],
+                indexing="tensor_descriptor",
+            ),
+            static_shapes=True,
+        )
+        def read_tile_count(x: torch.Tensor) -> torch.Tensor:
+            _, n = x.size()
+            rows = 4
+            out = torch.empty([rows, n], device=x.device, dtype=x.dtype)
+            for tile_b in hl.tile(rows, block_size=1):
+                for tile_n in hl.tile(n):
+                    out[tile_b.begin, tile_n] = x[tile_b.count, tile_n]
+            return out
+
+        @helion.kernel(
+            config=helion.Config(
+                block_sizes=[64],
+                indexing="tensor_descriptor",
+            ),
+            static_shapes=True,
+        )
+        def read_tile_id(x: torch.Tensor) -> torch.Tensor:
+            _, n = x.size()
+            rows = 4
+            out = torch.empty([rows, n], device=x.device, dtype=x.dtype)
+            for tile_b in hl.tile(rows, block_size=1):
+                for tile_n in hl.tile(n):
+                    out[tile_b.begin, tile_n] = x[tile_b.id, tile_n]
+            return out
+
+        @helion.kernel(
+            config=helion.Config(
+                block_sizes=[64, 64],
+                indexing="tensor_descriptor",
+            ),
+            static_shapes=True,
+        )
+        def read_indirect_rows(x: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
+            _, n = x.size()
+            rows = indices.size(0)
+            out = torch.empty([rows, n], device=x.device, dtype=x.dtype)
+            for tile_b, tile_n in hl.tile([rows, n]):
+                idx = indices[tile_b]
+                out[tile_b, tile_n] = x[idx, tile_n]
+            return out
+
+        x = torch.randn(8, 128, device=DEVICE, dtype=torch.float32)
+
+        code, result = code_and_output(read_tile_end, (x,))
+        torch.testing.assert_close(result, x[1:5])
+        self.assert_tensor_descriptor_not_used_for(code, "x")
+
+        code, result = code_and_output(read_tile_count, (x,))
+        torch.testing.assert_close(result, x[4].expand(4, 128))
+        self.assert_tensor_descriptor_not_used_for(code, "x")
+
+        code, result = code_and_output(read_tile_id, (x,))
+        torch.testing.assert_close(result, x[:4])
+        self.assert_tensor_descriptor_not_used_for(code, "x")
+
+        indices = torch.tensor([3, 1, 4, 0], device=DEVICE, dtype=torch.int64)
+        code, result = code_and_output(read_indirect_rows, (x, indices))
+        torch.testing.assert_close(result, x[indices])
+        self.assert_tensor_descriptor_not_used_for(code, "x")
 
 
 if __name__ == "__main__":
