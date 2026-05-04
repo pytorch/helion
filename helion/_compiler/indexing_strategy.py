@@ -131,24 +131,35 @@ def _scalar_symint_can_codegen_as_scalar(k: torch.SymInt) -> bool:
     expr = _symint_expr(k)
     if not isinstance(expr, sympy.Expr):
         return False
+
+    # Constants, including SymInts simplified to constants, are scalar offsets.
     if not expr.free_symbols:
         return True
 
     expr_to_origin = HostFunction.current().expr_to_origin
     for symbol in expr.free_symbols:
+        # Every symbol must be known to DeviceFunction.sympy_expr(), otherwise
+        # tensor descriptor lowering would fail when printing the scalar offset.
         origin_info = expr_to_origin.get(symbol)
         if origin_info is None:
             return False
 
         origin = origin_info.origin
+        # BlockSizeOrigin represents a descriptor block extent, not a scalar
+        # offset. Those symbols must use the block-size validation path above.
         if isinstance(origin, BlockSizeOrigin):
             return False
         if isinstance(origin, GridOrigin):
-            # Exact GridOrigin is used for hl.grid() variables and already
-            # represents the loop offset; subclasses may need different math.
+            # Exact GridOrigin (hl.grid()) and TileBeginOrigin (tile.begin)
+            # already represent the loop offset. Other GridOrigin subclasses
+            # such as tile.end/count/id need different math, so fall back.
             if type(origin) is GridOrigin or isinstance(origin, TileBeginOrigin):
                 continue
             return False
+
+        # Host-derived values (scalar args, tensor sizes, attributes/items) can
+        # be lifted as scalar arguments. Device-derived values are not uniform
+        # descriptor offsets.
         if not origin.is_host():
             return False
 
