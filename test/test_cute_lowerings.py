@@ -4713,6 +4713,7 @@ class TestPersistentLoopSplitter(unittest.TestCase):
         self.assertIn("(2, 1, 1)", params_src)
 
 
+@onlyBackends(["cute"])
 class TestPerKiterTmaBuilders(unittest.TestCase):
     """AST shape tests for the per-K-iter TMA builders in ``cute_mma.py``."""
 
@@ -4922,6 +4923,7 @@ class TestPerKiterTmaBuilders(unittest.TestCase):
             self.assertIn("b_mcast_mask", two_cta)
 
 
+@onlyBackends(["cute"])
 class TestInitialPrefetchTmaBuilder(unittest.TestCase):
     """AST shape tests for ``_build_initial_prefetch_if`` in ``cute_mma.py``.
 
@@ -5083,6 +5085,7 @@ class TestInitialPrefetchTmaBuilder(unittest.TestCase):
         self.assertIn("b_mcast_mask", two_cta)
 
 
+@onlyBackends(["cute"])
 class TestReductionLoopCarriedAccumulatorCheck(unittest.TestCase):
     """Unit tests for ``_cute_reduction_needs_loop_carried_accumulator``.
 
@@ -5275,6 +5278,7 @@ class TestReductionLoopCarriedAccumulatorCheck(unittest.TestCase):
             )
 
 
+@onlyBackends(["cute"])
 class TestReductionBlockClassifiers(unittest.TestCase):
     """Direct unit tests for the three "block classifier" helpers
     (``_reduction_block_is_serial`` / ``_reduction_block_has_lane_loops`` /
