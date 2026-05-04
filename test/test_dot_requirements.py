@@ -390,6 +390,10 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
                 seed["block_sizes"][:3],
                 [TCGEN05_TWO_CTA_BLOCK_M, TCGEN05_TWO_CTA_BLOCK_N, 128],
             )
+            self.assertEqual(
+                seed["indexing"],
+                ["tensor_descriptor", "tensor_descriptor", "tensor_descriptor"],
+            )
             self.assertEqual(seed["l2_groupings"], [TCGEN05_TWO_CTA_SEED_L2_GROUPING])
             self.assertEqual(seed["pid_type"], "persistent_blocked")
             self.assertEqual(seed["tcgen05_num_epi_warps"], 4)
@@ -436,6 +440,43 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         self.assertEqual(len(configs), 2)
         self.assertEqual(configs[0].config["tcgen05_cluster_m"], 1)
         assert_seeded(configs)
+
+    @onlyBackends(["cute"])
+    def test_cute_tcgen05_two_cta_seed_indexing_matches_live_spec(self) -> None:
+        @helion.kernel(backend="cute")
+        def cute_matmul_mma_epilogue(
+            x: torch.Tensor, y: torch.Tensor, bias: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = (acc + bias[tile_n]).to(x.dtype)
+            return out
+
+        args = (
+            torch.empty([4096, 4096], device=DEVICE, dtype=HALF_DTYPE),
+            torch.empty([4096, 4096], device=DEVICE, dtype=HALF_DTYPE),
+            torch.empty([4096], device=DEVICE, dtype=HALF_DTYPE),
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_mma_epilogue.bind(args)
+        self.assertGreater(bound.config_spec.indexing.length, 3)
+
+        configs = bound.config_spec.create_config_generation().random_population(2)
+        seeded = [
+            config.config
+            for config in configs
+            if config.config["tcgen05_cluster_m"] == 2
+        ]
+        self.assertEqual(len(seeded), 1)
+        self.assertEqual(
+            len(seeded[0]["indexing"]),
+            bound.config_spec.indexing.length,
+        )
 
     @onlyBackends(["cute"])
     def test_cute_tcgen05_two_cta_projection_falls_back_before_mutation(
