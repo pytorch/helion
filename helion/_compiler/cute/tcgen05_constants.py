@@ -6,3 +6,7 @@ from __future__ import annotations
 TCGEN05_TWO_CTA_BLOCK_M = 256
 TCGEN05_TWO_CTA_BLOCK_N = 256
 TCGEN05_TWO_CTA_MAX_K_TILES = 256
+
+# CtaGroup.ONE tcgen05 MMA covers 64/128 M tiles; 256 M tiles are validated only
+# after projecting onto the CtaGroup.TWO path.
+TCGEN05_ONE_CTA_MAX_BLOCK_M = 128

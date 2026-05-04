@@ -22,6 +22,7 @@ from .._compat import supports_amd_cdna_tunables
 from .._compat import supports_maxnreg
 from .._compat import supports_tensor_descriptor
 from .._compat import warps_to_threads
+from .._compiler.cute.tcgen05_constants import TCGEN05_ONE_CTA_MAX_BLOCK_M
 from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
 from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
 from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_MAX_K_TILES
@@ -541,6 +542,24 @@ class ConfigSpec:
         block_sizes[0] = TCGEN05_TWO_CTA_BLOCK_M
         block_sizes[1] = TCGEN05_TWO_CTA_BLOCK_N
 
+    def _fix_tcgen05_cluster_m1_persistent_search_config(
+        self, config: dict[str, object]
+    ) -> None:
+        """Keep search-only CtaGroup.ONE persistent configs on tcgen05 tiles."""
+        if not (
+            self.cute_tcgen05_search_enabled
+            and config.get("tcgen05_cluster_m", 1) == 1
+            and config.get("pid_type")
+            in {"persistent_blocked", "persistent_interleaved"}
+        ):
+            return
+        block_sizes = config.get("block_sizes")
+        if not isinstance(block_sizes, list) or not block_sizes:
+            return
+        bm = block_sizes[0]
+        if isinstance(bm, int) and not isinstance(bm, bool):
+            block_sizes[0] = min(bm, TCGEN05_ONE_CTA_MAX_BLOCK_M)
+
     def restrict_tcgen05_num_epi_warps_search(self, choices: tuple[int, ...]) -> None:
         """Narrow the autotune search over tcgen05_num_epi_warps to *choices*.
 
@@ -967,6 +986,7 @@ class ConfigSpec:
 
         if _fix_invalid:
             self._fix_tcgen05_cluster_m2_search_config(config)
+            self._fix_tcgen05_cluster_m1_persistent_search_config(config)
 
         if self.supports_config_key("num_sm_multiplier"):
             # Validate num_sm_multiplier is a power of two in range

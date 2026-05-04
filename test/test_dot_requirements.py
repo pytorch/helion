@@ -7,6 +7,7 @@ import torch
 
 import helion
 from helion import _compat
+from helion._compiler.cute.tcgen05_constants import TCGEN05_ONE_CTA_MAX_BLOCK_M
 from helion._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
 from helion._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
 from helion._testing import DEVICE
@@ -291,6 +292,63 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
                 self.assertEqual(config["tcgen05_cluster_m"], 2)
                 self.assertEqual(config["pid_type"], "persistent_blocked")
                 self.assertEqual(config["block_sizes"][:3], [256, 256, 16])
+
+    @onlyBackends(["cute"])
+    def test_cute_tcgen05_cluster_m1_persistent_search_caps_m_tile(self) -> None:
+        """Search-only cluster_m=1 persistent configs stay on tcgen05 M tiles."""
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_mma(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        args = (
+            torch.empty([4096, 4096], device=DEVICE, dtype=HALF_DTYPE),
+            torch.empty([4096, 4096], device=DEVICE, dtype=HALF_DTYPE),
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_mma.bind(args)
+        spec = bound.config_spec
+
+        for pid_type in ("persistent_blocked", "persistent_interleaved"):
+            with self.subTest(pid_type=pid_type):
+                config = {
+                    "block_sizes": [256, 32, 16],
+                    "pid_type": pid_type,
+                    "tcgen05_cluster_m": 1,
+                }
+                spec.normalize(config, _fix_invalid=True)
+                self.assertEqual(config["tcgen05_cluster_m"], 1)
+                self.assertEqual(config["pid_type"], pid_type)
+                self.assertEqual(
+                    config["block_sizes"][:3],
+                    [TCGEN05_ONE_CTA_MAX_BLOCK_M, 32, 16],
+                )
+
+        flat_config = {
+            "block_sizes": [256, 32, 16],
+            "pid_type": "flat",
+            "tcgen05_cluster_m": 1,
+        }
+        spec.normalize(flat_config, _fix_invalid=True)
+        self.assertEqual(flat_config["block_sizes"][:3], [256, 32, 16])
+
+        two_cta_config = {
+            "block_sizes": [256, 32, 16],
+            "pid_type": "persistent_interleaved",
+            "tcgen05_cluster_m": 2,
+        }
+        spec.normalize(two_cta_config, _fix_invalid=True)
+        self.assertEqual(two_cta_config["tcgen05_cluster_m"], 2)
+        self.assertEqual(two_cta_config["pid_type"], "persistent_blocked")
+        self.assertEqual(two_cta_config["block_sizes"][:3], [256, 256, 16])
 
     @onlyBackends(["cute"])
     def test_cute_tcgen05_two_cta_seeded_in_initial_populations(self) -> None:
