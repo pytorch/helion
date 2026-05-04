@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import random
 import signal
+import tempfile
 import time
 from typing import TYPE_CHECKING
 import unittest
@@ -20,6 +21,7 @@ from helion._testing import RefEagerTestDisabled
 from helion._testing import import_path
 from helion._testing import onlyBackends
 from helion._testing import skipIfXPU
+from helion.autotuner.benchmark_job import _load_args
 from helion.autotuner.benchmark_provider import LocalBenchmarkProvider
 from helion.autotuner.benchmark_worker import BenchmarkTimeout
 from helion.autotuner.benchmark_worker import BenchmarkWorker
@@ -66,6 +68,10 @@ class _ReturnValue:
 
     def __call__(self) -> object:
         return self.value
+
+
+def _callable_kernel_arg(value: object) -> object:
+    return value
 
 
 class TestBenchmarkWorkerFailureModes(unittest.TestCase):
@@ -119,6 +125,21 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
         self.assertEqual([r.result for r in results], ["a", "b"])
         self.assertTrue(all(0 <= r.worker_index < 2 for r in results))
         self.assertTrue(all(r.elapsed >= 0 for r in results))
+
+
+class TestWorkerPoolPrecompile(unittest.TestCase):
+    def test_worker_arg_loading_allows_callable_kernel_args(self) -> None:
+        # Worker arg loading must allow trusted callable args such as matmul epilogues.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = str(Path(tmpdir) / "args.pt")
+            torch.save((_callable_kernel_arg,), path)
+            _load_args.cache_clear()
+            try:
+                loaded = _load_args(path)
+            finally:
+                _load_args.cache_clear()
+
+        self.assertIs(loaded[0], _callable_kernel_arg)
 
 
 # Subprocess benchmarking depends on Backend.supports_precompile(); only the
