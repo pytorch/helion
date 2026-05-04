@@ -2512,20 +2512,7 @@ class CuteBackend(Backend):
         force: bool = True,
         **kwargs: object,
     ) -> Config:
-        # When the user explicitly requests autotuning (force=True, e.g. via
-        # bound.autotune(...)), run the real Backend.autotune search. The
-        # default config for the cute matmul / tcgen05 path is too far from
-        # the optimum to be useful as a "no-op" autotune answer.
-        #
-        # When force=False (implicit autotune from __call__), keep the prior
-        # behavior of returning default_config(): the cute search space
-        # contains many invalid configs and full search would be far too
-        # expensive to trigger silently from a kernel call site.
-        # Note: Backend.autotune already does (force or settings.force_autotune)
-        # so we don't need to pre-OR; just forward whichever the caller passed.
-        if force or bound_kernel.settings.force_autotune:
-            return super().autotune(bound_kernel, args, force=force, **kwargs)
-        return bound_kernel.config_spec.default_config()
+        return super().autotune(bound_kernel, args, force=force, **kwargs)
 
     @property
     def function_decorator(self) -> str:

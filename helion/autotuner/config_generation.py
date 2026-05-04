@@ -68,6 +68,13 @@ class ConfigGeneration:
             for i, spec in enumerate(self.flat_spec)
             if spec.category() == Category.BLOCK_SIZE
         ]
+        self.num_threads_indices: list[int] = []
+        self._cute_num_thread_block_pairs: list[tuple[int, int]] = []
+        self._cute_block_index_by_id: dict[int, int] = {}
+        self._cute_num_thread_index_by_id: dict[int, int] = {}
+        self._cute_flatten_loop_groups: list[tuple[int, list[int]]] = []
+        if self.config_spec.backend_name == "cute":
+            self._init_cute_num_thread_pairs()
         self.num_warps_index: int = next(
             (
                 i
@@ -81,6 +88,49 @@ class ConfigGeneration:
             if config_spec.block_sizes
             else 1
         )
+
+    def _init_cute_num_thread_pairs(self) -> None:
+        """Pair each CuTe num_threads flat slot with its block_size slot."""
+        try:
+            block_indices, _ = self._key_to_flat_indices["block_sizes"]
+            num_thread_indices, _ = self._key_to_flat_indices["num_threads"]
+        except KeyError:
+            return
+        self.num_threads_indices = num_thread_indices
+        block_index_by_id = {
+            spec.block_id: block_indices[i]
+            for i, spec in enumerate(self.config_spec.block_sizes)
+            if i < len(block_indices)
+        }
+        num_thread_index_by_id = {
+            spec.block_id: num_thread_indices[i]
+            for i, spec in enumerate(self.config_spec.num_threads)
+            if i < len(num_thread_indices)
+        }
+        self._cute_block_index_by_id = block_index_by_id
+        self._cute_num_thread_index_by_id = num_thread_index_by_id
+        self._cute_num_thread_block_pairs = [
+            (num_thread_indices[i], block_index_by_id[spec.block_id])
+            for i, spec in enumerate(self.config_spec.num_threads)
+            if i < len(num_thread_indices) and spec.block_id in block_index_by_id
+        ]
+        try:
+            flatten_indices, _ = self._key_to_flat_indices["flatten_loops"]
+        except KeyError:
+            return
+        self._cute_flatten_loop_groups = [
+            (
+                flatten_indices[i],
+                [
+                    block_id
+                    for block_id in spec.block_ids
+                    if block_id in block_index_by_id
+                    and block_id in num_thread_index_by_id
+                ],
+            )
+            for i, spec in enumerate(self.config_spec.flatten_loops)
+            if i < len(flatten_indices)
+        ]
 
     @functools.cached_property
     def overridden_flat_indices(self) -> set[int]:
@@ -118,6 +168,100 @@ class ConfigGeneration:
         self.config_spec.normalize(config.config)
         return config
 
+    @staticmethod
+    def _largest_power_of_two_at_most(value: int) -> int:
+        return 1 << (max(value, 1).bit_length() - 1)
+
+    def _repair_cute_num_threads(self, flat_config: FlatConfig) -> None:
+        """Keep CuTe launch-thread choices compatible with tuned block sizes."""
+        if not self._cute_num_thread_block_pairs:
+            return
+
+        for num_threads_idx, block_size_idx in self._cute_num_thread_block_pairs:
+            num_threads = flat_config[num_threads_idx]
+            block_size = flat_config[block_size_idx]
+            if (
+                type(num_threads) is not int
+                or num_threads == 0
+                or type(block_size) is not int
+                or block_size <= 0
+            ):
+                continue
+            if num_threads > block_size:
+                num_threads = self._largest_power_of_two_at_most(block_size)
+            while num_threads > 1 and block_size % num_threads != 0:
+                num_threads //= 2
+            flat_config[num_threads_idx] = max(num_threads, 1)
+
+        for flatten_idx, block_ids in self._cute_flatten_loop_groups:
+            if flat_config[flatten_idx] is not True:
+                continue
+            group: list[tuple[int, int, bool, int]] = []
+            for block_id in block_ids:
+                block_size = flat_config[self._cute_block_index_by_id[block_id]]
+                num_threads_idx = self._cute_num_thread_index_by_id[block_id]
+                num_threads = flat_config[num_threads_idx]
+                if (
+                    type(block_size) is not int
+                    or block_size <= 0
+                    or type(num_threads) is not int
+                ):
+                    group = []
+                    break
+                resolved_threads = num_threads if num_threads > 0 else block_size
+                group.append(
+                    (num_threads_idx, block_size, num_threads == 0, resolved_threads)
+                )
+            if not group:
+                continue
+            thread_product = functools.reduce(
+                operator.mul, (item[3] for item in group), 1
+            )
+            auto_positions = [i for i, item in enumerate(group) if item[2]]
+            while thread_product > 1024 and auto_positions:
+                largest_pos = max(auto_positions, key=lambda i: group[i][3])
+                num_threads_idx, block_size, is_auto, resolved_threads = group[
+                    largest_pos
+                ]
+                if resolved_threads <= 1:
+                    auto_positions.remove(largest_pos)
+                    continue
+                next_threads = resolved_threads // 2
+                while next_threads > 1 and block_size % next_threads != 0:
+                    next_threads //= 2
+                if next_threads == resolved_threads:
+                    auto_positions.remove(largest_pos)
+                    continue
+                flat_config[num_threads_idx] = next_threads
+                group[largest_pos] = (
+                    num_threads_idx,
+                    block_size,
+                    is_auto,
+                    next_threads,
+                )
+                thread_product = (thread_product // resolved_threads) * next_threads
+
+        explicit_indices = [
+            idx
+            for idx, _ in self._cute_num_thread_block_pairs
+            if type(flat_config[idx]) is int and cast("int", flat_config[idx]) > 0
+        ]
+        thread_product = functools.reduce(
+            operator.mul,
+            (cast("int", flat_config[idx]) for idx in explicit_indices),
+            1,
+        )
+        while thread_product > 1024 and explicit_indices:
+            largest_idx = max(
+                explicit_indices,
+                key=lambda idx: cast("int", flat_config[idx]),
+            )
+            largest = cast("int", flat_config[largest_idx])
+            if largest <= 1:
+                break
+            flat_config[largest_idx] = largest // 2
+            thread_product //= 2
+
     def flatten(self, config: Config) -> FlatConfig:
         """Inverse of unflatten: convert a Config to a FlatConfig."""
         result = self.default_flat()
@@ -136,6 +280,7 @@ class ConfigGeneration:
             else:
                 assert len(indices) == 1
                 result[indices[0]] = value
+        self._repair_cute_num_threads(result)
         return result
 
     def unflatten(self, flat_values: FlatConfig) -> Config:
@@ -155,6 +300,7 @@ class ConfigGeneration:
             return flat_values[i]
 
         assert len(flat_values) == len(self.flat_spec)
+        self._repair_cute_num_threads(flat_values)
         count: itertools.count[int] = itertools.count()
         config = self.config_spec.flat_config(
             get_next_value,
@@ -217,6 +363,7 @@ class ConfigGeneration:
             if changes == 0:
                 break
         self._shrink_for_numel_constraints(flat_config)
+        self._repair_cute_num_threads(flat_config)
 
     def default_flat(self) -> FlatConfig:
         """
@@ -227,6 +374,7 @@ class ConfigGeneration:
         """
         config = [spec.default() for spec in self.flat_spec]
         self._shrink_for_numel_constraints(config)
+        self._repair_cute_num_threads(config)
         return config
 
     def random_flat(self) -> FlatConfig:
@@ -240,6 +388,7 @@ class ConfigGeneration:
         with sync_seed(process_group_name=self.process_group_name):
             config = [spec.random() for spec in self.flat_spec]
             self.shrink_config(config, PowerOfTwoFragment(1, 2048, 32).random())
+            self._repair_cute_num_threads(config)
             return config
 
     def random_config(self) -> Config:
@@ -299,6 +448,7 @@ class ConfigGeneration:
                 result[i] = self.flat_spec[i].differential_mutation(a[i], b[i], c[i])
         # TODO(jansel): can this be larger? (too large and Triton compile times blow up)
         self.shrink_config(result, 8192)
+        self._repair_cute_num_threads(result)
         return result
 
     def encode_config(self, flat_config: FlatConfig) -> list[float]:
