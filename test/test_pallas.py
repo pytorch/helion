@@ -1987,6 +1987,34 @@ class TestPallas(TestCase):
         ref = (acc_ref + running[:, :, None] * running[:, :, None]).to(a.dtype)
         torch.testing.assert_close(result, ref, rtol=1e-2, atol=1e-2)
 
+    def test_data_dependent_loop_bounds(self) -> None:
+        """Data-dependent loop: hl.tile(0, n) where n comes from a tensor."""
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def data_dependent_sum(
+            data: torch.Tensor, lengths: torch.Tensor
+        ) -> torch.Tensor:
+            B = lengths.size(0)
+            out = torch.zeros([B], dtype=data.dtype, device=data.device)
+            for seg in hl.grid(B):
+                n = lengths[seg]
+                acc = hl.zeros([1], dtype=data.dtype)
+                for tile in hl.tile(0, n):
+                    acc = acc + data[tile].sum(dim=0).unsqueeze(0)
+                out[seg] = acc.squeeze(0)
+            return out
+
+        N = 256
+        B = 4
+        data = torch.randn(N, device=DEVICE, dtype=torch.float32)
+        lengths = torch.tensor([128, 256, 128, 256], device=DEVICE, dtype=torch.int32)
+        code, result = code_and_output(
+            data_dependent_sum,
+            (data, lengths),
+        )
+        ref = torch.stack([data[: lengths[i]].sum() for i in range(B)])
+        torch.testing.assert_close(result, ref, rtol=1e-4, atol=1e-4)
+
 
 @skipUnlessPallas("JAX/Pallas TPU not available")
 class TestPallasIndirectGather(TestCase):

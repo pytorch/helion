@@ -281,7 +281,7 @@ class ConfigSpec:
         self.epilogue_subtile_autotune_choices: tuple[int | None, ...] | None = None
         self.epilogue_subtile_k_hint: int = 0
         self.has_pallas_inner_loops: bool = False
-        self.has_pallas_symbolic_bounds: bool = False
+        self.has_symbolic_or_data_dependent_bounds: bool = False
         self.cute_tcgen05_search_enabled: bool = False
         # Allowed values of tcgen05_cluster_m the autotuner is allowed to
         # *search* over. None means "use the default set defined by
@@ -813,7 +813,7 @@ class ConfigSpec:
                         f"{key} is only supported for tcgen05-enabled CuTe matmul kernels"
                     )
         if self.has_pallas_inner_loops:
-            if self.has_pallas_symbolic_bounds:
+            if self.has_symbolic_or_data_dependent_bounds:
                 # "unroll" uses Python range() which can't handle traced bounds.
                 # Between the remaining options, prefer "fori_loop": it handles
                 # both DMA-aligned and unaligned inner blocks, while
@@ -1162,7 +1162,7 @@ class ConfigSpec:
             fields.update(self.backend_tunable_fragments)
         if self.has_pallas_inner_loops:
             choices = VALID_PALLAS_LOOP_TYPES
-            if self.has_pallas_symbolic_bounds:
+            if self.has_symbolic_or_data_dependent_bounds:
                 # Exclude "unroll" (uses Python range(), can't handle traced
                 # bounds) and put "fori_loop" first: it handles both DMA-aligned
                 # and unaligned inner blocks, while "emit_pipeline" fails on
