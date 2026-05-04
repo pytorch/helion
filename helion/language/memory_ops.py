@@ -1294,8 +1294,10 @@ def _codegen_cute_store_tcgen05_tile(
     tcgen05_is_two_cta = tcgen05_value.is_two_cta
     tcgen05_thr_mma = tcgen05_value.thr_mma
 
-    def store_common_setup(gmem_tensor: str, *, include_full_tile: bool) -> list[str]:
-        setup = [
+    def store_common_setup(
+        gmem_tensor: str, *, include_full_tile: bool
+    ) -> tuple[list[str], list[str]]:
+        static_setup = [
             (
                 f"{kernel_desc} = type('Tcgen05KernelDesc', (), {{"
                 f"'cta_tile_shape_mnk': ({tcgen05_bm}, {tcgen05_bn}, {tcgen05_bk}), "
@@ -1314,13 +1316,14 @@ def _codegen_cute_store_tcgen05_tile(
                 f"cutlass.utils.layout.LayoutEnum.ROW_MAJOR, {target_dtype})"
             ),
         ]
+        tile_setup: list[str] = []
         if include_full_tile:
-            setup.append(
+            tile_setup.append(
                 f"{full_tile} = "
                 f"({base_indices[0]}) + cutlass.Int32({tcgen05_bm}) <= {m_size} "
                 f"and ({base_indices[1]}) + cutlass.Int32({tcgen05_bn}) <= {n_size}"
             )
-        setup.extend(
+        tile_setup.extend(
             [
                 (
                     f"{gmem_tile} = cute.local_tile("
@@ -1330,10 +1333,12 @@ def _codegen_cute_store_tcgen05_tile(
                 f"{tcgc_base} = {tcgen05_thr_mma}.partition_C({gmem_tile})",
             ]
         )
-        return setup
+        return static_setup, tile_setup
 
-    simt_common_store_setup = store_common_setup(tensor_name, include_full_tile=True)
-    tma_common_store_setup = store_common_setup(
+    simt_static_store_setup, simt_tile_store_setup = store_common_setup(
+        tensor_name, include_full_tile=True
+    )
+    tma_static_store_setup, tma_tile_store_setup = store_common_setup(
         tcgen05_value.tma_store_tensor, include_full_tile=False
     )
     tma_c_buffer_expr = "cutlass.Int32(_tcgen05_subtile)"
@@ -1343,7 +1348,8 @@ def _codegen_cute_store_tcgen05_tile(
             f"cutlass.Int32({subtile_count}) + cutlass.Int32(_tcgen05_subtile)"
         )
     simt_store_body_core = [
-        *simt_common_store_setup,
+        *simt_static_store_setup,
+        *simt_tile_store_setup,
         (
             f"{tcgc} = cutlass.utils.gemm.sm100.transform_partitioned_tensor_layout("
             f"{tcgc_base})"
@@ -1428,10 +1434,6 @@ def _codegen_cute_store_tcgen05_tile(
             f"            cute.arch.fence_view_async_tmem_load()\n"
             f"            with cute.arch.elect_one():\n"
             f"                {tcgen05_value.acc_pipeline}.consumer_release({tcgen05_value.acc_consumer_state})\n"
-            + emit_pipeline_advance(
-                tcgen05_value.acc_consumer_state, indent="            "
-            )
-            + "\n"
             f"        if {full_tile}:\n"
             f"            cute.copy({simt_atom}, {ttr_rd}, {ttr_gc_subtile})\n"
             f"        else:\n"
@@ -1449,10 +1451,38 @@ def _codegen_cute_store_tcgen05_tile(
             f"                    _coord = {ttr_cc_subtile}[(0, _pred_m, _pred_n)]\n"
             f"                    {pred_c}[(0, _pred_m, _pred_n)] = cute.elem_less(_coord, ({m_size}, {n_size}))\n"
             f"            cute.copy({simt_atom}, {ttr_rd}, {ttr_gc_subtile}, pred={pred_c})\n"
+            # Advance is a per-thread local state update, so it intentionally
+            # stays outside elect_one; only the mbarrier release is elected.
+            f"if {tcgen05_value.epi_active}:\n"
+            + emit_pipeline_advance(tcgen05_value.acc_consumer_state, indent="    ")
         ),
     ]
-    tma_store_body_core = [
-        *tma_common_store_setup,
+    tma_store_pipeline_setup = [
+        (
+            f"{epilog_sync_barrier} = cutlass.pipeline.NamedBarrier("
+            f"barrier_id=cutlass.Int32({tcgen05_value.epilog_sync_barrier_id}), "
+            f"num_threads=cutlass.Int32({tcgen05_value.epi_warp_count * 32}))"
+        ),
+        (
+            f"{c_pipeline_producer_group} = cutlass.pipeline.CooperativeGroup("
+            f"cutlass.pipeline.Agent.Thread, cutlass.Int32({tcgen05_value.epi_warp_count * 32}))"
+        ),
+        (
+            f"{c_pipeline} = cutlass.pipeline.PipelineTmaStore.create("
+            f"num_stages={tcgen05_value.c_stage_count}, "
+            f"producer_group={c_pipeline_producer_group})"
+        ),
+    ]
+    tma_store_pipeline_tail = (
+        f"if {tcgen05_value.warp_idx} == cutlass.Int32(0):\n"
+        f"    {c_pipeline}.producer_tail()"
+    )
+    tma_store_first_subtile_acquire = (
+        f"if {tcgen05_value.epi_active} and "
+        f"{tcgen05_value.warp_idx} == cutlass.Int32(0):\n"
+        f"    {c_pipeline}.producer_acquire()"
+    )
+    tma_store_smem_setup = [
         # Must match the wrapper-side `tcgen05_d_tma` TMA atom layout in
         # `helion/runtime/__init__.py`; both describe one D SMEM stage.
         (
@@ -1469,6 +1499,27 @@ def _codegen_cute_store_tcgen05_tile(
             f"cute.recast_ptr({smem_d_ptr}, {smem_d_layout}.inner, dtype={target_dtype}), "
             f"{smem_d_layout}.outer)"
         ),
+    ]
+    tma_store_acc_layout_setup = [
+        (
+            f"{tacc} = cutlass.utils.gemm.sm100.transform_partitioned_tensor_layout("
+            f"{tcgen05_value.epi_acc_frag_base})"
+        ),
+    ]
+    tma_store_role_invariant_setup = [
+        *tma_static_store_setup,
+        *tma_store_smem_setup,
+        *tma_store_acc_layout_setup,
+    ]
+    # Non-role-local stores keep pipeline/SMEM setup before per-tile C
+    # partitioning so the hoisted role-local prefix matches the same
+    # invariant setup subset.
+    tma_store_body_core = [
+        *([] if tcgen05_value.use_role_local_epi else tma_static_store_setup),
+        *([] if tcgen05_value.use_role_local_epi else tma_store_pipeline_setup),
+        *([] if tcgen05_value.use_role_local_epi else tma_store_smem_setup),
+        tma_store_first_subtile_acquire,
+        *tma_tile_store_setup,
         (
             f"{tcgc} = cutlass.utils.gemm.sm100.transform_partitioned_tensor_layout("
             f"{tcgc_base})"
@@ -1478,10 +1529,7 @@ def _codegen_cute_store_tcgen05_tile(
             f"{tcgc}.iterator, "
             f"cute.append(cute.append(cute.append({tcgc}.layout, {tcgen05_value.epilogue_rest_mode}), {tcgen05_value.epilogue_rest_mode}), {tcgen05_value.epilogue_rest_mode}))"
         ),
-        (
-            f"{tacc} = cutlass.utils.gemm.sm100.transform_partitioned_tensor_layout("
-            f"{tcgen05_value.epi_acc_frag_base})"
-        ),
+        *([] if tcgen05_value.use_role_local_epi else tma_store_acc_layout_setup),
         (
             f"{tiled_copy_t2r}, {ttr_tacc_base}, {ttr_racc} = "
             "cutlass.utils.gemm.sm100.epilogue_tmem_copy_and_partition("
@@ -1508,71 +1556,58 @@ def _codegen_cute_store_tcgen05_tile(
         ),
         f"{bsg_gd} = cute.group_modes({bsg_gd}, 1, cute.rank({bsg_gd}))",
         (
-            f"{epilog_sync_barrier} = cutlass.pipeline.NamedBarrier("
-            f"barrier_id=cutlass.Int32({tcgen05_value.epilog_sync_barrier_id}), "
-            f"num_threads=cutlass.Int32({tcgen05_value.epi_warp_count * 32}))"
-        ),
-        (
-            f"{c_pipeline_producer_group} = cutlass.pipeline.CooperativeGroup("
-            f"cutlass.pipeline.Agent.Thread, cutlass.Int32({tcgen05_value.epi_warp_count * 32}))"
-        ),
-        (
-            f"{c_pipeline} = cutlass.pipeline.PipelineTmaStore.create("
-            f"num_stages={tcgen05_value.c_stage_count}, "
-            f"producer_group={c_pipeline_producer_group})"
-        ),
-        (
             f"{ttr_tacc_stage} = {ttr_tacc_base}["
             f"(None, None, None, None, None, {tcgen05_value.acc_consumer_state}.index)]"
-        ),
-        (
-            f"if {tcgen05_value.epi_active}:\n"
-            f"    {tcgen05_value.acc_pipeline}.consumer_wait({tcgen05_value.acc_consumer_state})"
         ),
         f"{ttr_tacc} = cute.group_modes({ttr_tacc_stage}, 3, cute.rank({ttr_tacc_stage}))",
         f"{subtile_count} = cutlass.const_expr(cute.size({ttr_tacc}.shape, mode=[3]))",
         (
-            # Per-subtile loop: all epi warps first do TMEM->reg work, then
-            # warp 0 acquires the TMA-store SMEM stage before any warp writes
-            # that stage. A CTA-scoped named barrier ensures all epi warps
-            # have observed warp 0's acquire before they write SMEM; a second
-            # barrier ensures the SMEM writes and fence are visible before
-            # warp 0 issues and commits the TMA operation.
-            # Placing acquire before R2S staging lets the previous subtile's
-            # TMA store overlap this subtile's TMEM load and conversion work.
+            # Warp 0 pre-acquires the first TMA-store SMEM stage before
+            # per-tile C-store setup. The subtile loop acquires only later
+            # stages, so C-stage waits can overlap setup, the first
+            # acc-pipeline wait, and the other epi warps' TMEM
+            # load/conversion work on later subtile iterations.
+            # A CTA-scoped named barrier ensures all epi warps have observed
+            # warp 0's acquire before they write SMEM; a second barrier ensures
+            # the SMEM writes and Quack-style async-shared fence are visible
+            # before warp 0 issues and commits the TMA operation.
+            # Compute the SMEM ring index after the first barrier so the
+            # acquire/barrier/index order stays aligned with Quack's
+            # TMA-store epilogue.
+            # The accumulator consumer state advances after the loop, matching
+            # Quack's call-site ordering while preserving the early release.
             # After warp 0 commits the TMA store, the next subtile's
             # producer_acquire plus the first named barrier are enough to
             # keep all epi warps from writing a reused SMEM stage too early.
             # Avoiding a post-commit barrier matches Quack's epilogue loop.
             f"for _tcgen05_subtile in cutlass.range({subtile_count}, unroll_full=True):\n"
             f"    if {tcgen05_value.epi_active}:\n"
+            f"        if _tcgen05_subtile != 0 and {tcgen05_value.warp_idx} == cutlass.Int32(0):\n"
+            f"            {c_pipeline}.producer_acquire()\n"
+            f"        if _tcgen05_subtile == 0:\n"
+            f"            {tcgen05_value.acc_pipeline}.consumer_wait({tcgen05_value.acc_consumer_state})\n"
             f"        {ttr_tacc_mn} = {ttr_tacc}[(None, None, None, cutlass.Int32(_tcgen05_subtile))]\n"
             f"        cute.copy({tiled_copy_t2r}, {ttr_tacc_mn}, {ttr_racc})\n"
             f"        {acc_vec} = {trs_racc}.load().to({target_dtype})\n"
-            f"        {trs_rd}.store({acc_vec})\n"
             f"        if _tcgen05_subtile == {subtile_count} - 1:\n"
             f"            cute.arch.fence_view_async_tmem_load()\n"
             f"            with cute.arch.elect_one():\n"
             f"                {tcgen05_value.acc_pipeline}.consumer_release({tcgen05_value.acc_consumer_state})\n"
-            + emit_pipeline_advance(
-                tcgen05_value.acc_consumer_state, indent="            "
-            )
-            + "\n"
-            f"        {c_buffer} = ({tma_c_buffer_expr}) % cutlass.Int32({tcgen05_value.c_stage_count})\n"
-            f"        if {tcgen05_value.warp_idx} == cutlass.Int32(0):\n"
-            f"            {c_pipeline}.producer_acquire()\n"
+            f"        {trs_rd}.store({acc_vec})\n"
             f"        {epilog_sync_barrier}.arrive_and_wait()\n"
+            f"        {c_buffer} = ({tma_c_buffer_expr}) % cutlass.Int32({tcgen05_value.c_stage_count})\n"
             f"        cute.copy({tiled_copy_r2s}, {trs_rd}, {trs_sd}[(None, None, None, {c_buffer})])\n"
-            f"        cute.arch.fence_proxy('async.shared', space='cta')\n"
+            f"        cute.arch.fence_view_async_shared()\n"
             f"        {epilog_sync_barrier}.arrive_and_wait()\n"
             f"        if {tcgen05_value.warp_idx} == cutlass.Int32(0):\n"
             f"            cute.copy({tcgen05_value.tma_store_atom}, {bsg_sd}[(None, {c_buffer})], {bsg_gd}[(None, cutlass.Int32(_tcgen05_subtile))])\n"
             f"            {c_pipeline}.producer_commit()\n"
+            # Advance is a per-thread local state update, so it intentionally
+            # stays outside elect_one; only the mbarrier release is elected.
+            f"if {tcgen05_value.epi_active}:\n"
+            + emit_pipeline_advance(tcgen05_value.acc_consumer_state, indent="    ")
         ),
-        (
-            f"if {tcgen05_value.warp_idx} == cutlass.Int32(0):\n"
-            f"    {c_pipeline}.producer_tail()"
-        ),
+        *([] if tcgen05_value.use_role_local_epi else [tma_store_pipeline_tail]),
     ]
     store_body_core = (
         tma_store_body_core
@@ -1581,6 +1616,21 @@ def _codegen_cute_store_tcgen05_tile(
     )
     main_stmts: list[ast.AST]
     if tcgen05_value.use_role_local_epi:
+        # These setup statements intentionally remain virtual-pid-independent.
+        # The persistent splitter hoists them before the role-local scheduler
+        # loops; if future setup reads per-tile state, it must be registered
+        # as per-tile work instead.
+        tma_store_hoisted_stmts = (
+            [
+                statement_from_string(line)
+                for line in [
+                    *tma_store_pipeline_setup,
+                    *tma_store_role_invariant_setup,
+                ]
+            ]
+            if tcgen05_value.use_tma_store_epilogue
+            else []
+        )
         sync_before_stmt = statement_from_string("cute.arch.sync_threads()")
         main_stmt = statement_from_string(
             "if True:\n" + textwrap.indent("\n".join(store_body_core), "    ")
@@ -1590,7 +1640,12 @@ def _codegen_cute_store_tcgen05_tile(
             [sync_before_stmt, main_stmt, sync_after_stmt]
         )
         df.register_cute_tcgen05_epi_role_stmts([main_stmt])
-        main_stmts = [sync_before_stmt, main_stmt, sync_after_stmt]
+        main_stmts = [
+            *tma_store_hoisted_stmts,
+            sync_before_stmt,
+            main_stmt,
+            sync_after_stmt,
+        ]
     else:
         store_body = [
             "cute.arch.sync_threads()",
@@ -1607,6 +1662,12 @@ def _codegen_cute_store_tcgen05_tile(
     # Keep them as separate statements so the persistent splitter can
     # extract them via the post-loop registration below.
     post_loop_lines: list[str] = []
+    if tcgen05_value.use_tma_store_epilogue and tcgen05_value.use_role_local_epi:
+        # Role-local persistent epilogues reuse the C-store pipeline across
+        # scheduler-recycled work tiles. Draining it inside each tile would
+        # serialize the next tile's epilogue against this tile's TMA stores.
+        # The tail must run before TMEM dealloc setup below.
+        post_loop_lines.append(tma_store_pipeline_tail)
     if tcgen05_value.use_tma:
         post_loop_lines.append(
             f"if {tcgen05_value.tma_warp}:\n"

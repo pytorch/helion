@@ -1270,7 +1270,7 @@ class ConfigSpec:
                     fields["pid_type"] = EnumFragment(self.allowed_pid_types)
                 if self.supports_config_key("indexing") and self.indexing.length > 0:
                     fields["indexing"] = self.indexing
-            if self.supports_config_key("num_threads"):
+            elif self.supports_config_key("num_threads"):
                 fields["num_threads"] = self.num_threads
             fields.update(self.user_defined_tunables)
             return fields

@@ -997,6 +997,7 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         self.assertEqual(flat_fields["tcgen05_cluster_m"].choices, (1,))
         self.assertIn("persistent_blocked", flat_fields["pid_type"].choices)
         self.assertIn("persistent_interleaved", flat_fields["pid_type"].choices)
+        self.assertNotIn("num_threads", flat_fields)
 
     @onlyBackends(["cute"])
     def test_cute_tcgen05_user_config_num_epi_warps_validation(self) -> None:

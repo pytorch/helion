@@ -308,34 +308,180 @@ class TestCuteLowerings(unittest.TestCase):
             ),
         )
 
-    def _assert_tma_store_acquire_before_smem_write(self, code: str) -> None:
+    def _assert_tma_store_epilogue_order(
+        self, code: str, *, require_tail: bool = True
+    ) -> None:
         acquire = "tcgen05_c_pipeline.producer_acquire()"
+        t2r_copy = "cute.copy(tcgen05_tiled_copy_t2r"
+        c_buffer = "tcgen05_c_buffer = "
+        r2s_source_store = "tcgen05_tRS_rD.store(tcgen05_acc_vec)"
         r2s_copy = "cute.copy(tcgen05_tiled_copy_r2s"
         tma_copy = "cute.copy(tcgen05_tma_store_atom"
         commit = "tcgen05_c_pipeline.producer_commit()"
+        acc_wait = "tcgen05_acc_pipeline.consumer_wait(tcgen05_acc_consumer_state)"
+        acc_release = (
+            "tcgen05_acc_pipeline.consumer_release(tcgen05_acc_consumer_state)"
+        )
+        acc_advance = "tcgen05_acc_consumer_state.advance()"
+        acc_advance_inline = (
+            "tcgen05_acc_consumer_state._count = "
+            "tcgen05_acc_consumer_state._count + cutlass.Int32(1)"
+        )
+        gmem_tile = "tcgen05_gC = cute.local_tile("
+        subtile_loop = "for _tcgen05_subtile in cutlass.range("
+        later_subtile_guard = "if _tcgen05_subtile != 0"
         barrier = "tcgen05_epilog_sync_barrier.arrive_and_wait()"
+        shared_fence = "cute.arch.fence_view_async_shared()"
         tail = "tcgen05_c_pipeline.producer_tail()"
 
-        self.assertEqual(code.count(acquire), 1, code)
-        acquire_pos = code.find(acquire)
+        self.assertEqual(code.count(acquire), 2, code)
+        self.assertEqual(code.count(acc_wait), 1, code)
+        self.assertEqual(code.count(acc_release), 1, code)
+        self.assertEqual(
+            code.count(acc_advance) + code.count(acc_advance_inline), 1, code
+        )
+        first_acquire_pos = code.find(acquire)
+        gmem_tile_pos = code.find(gmem_tile, first_acquire_pos)
+        subtile_loop_pos = code.find(subtile_loop, gmem_tile_pos)
+        later_subtile_guard_pos = code.find(later_subtile_guard, subtile_loop_pos)
+        acquire_pos = code.find(acquire, first_acquire_pos + len(acquire))
+        acc_wait_pos = code.find(acc_wait, acquire_pos)
+        t2r_pos = code.find(t2r_copy)
+        acc_release_pos = code.find(acc_release)
+        acc_advance_pos = code.find(acc_advance, acc_release_pos)
+        if acc_advance_pos < 0:
+            acc_advance_pos = code.find(acc_advance_inline, acc_release_pos)
+        r2s_source_store_pos = code.find(r2s_source_store, acc_release_pos)
+        c_buffer_pos = code.find(c_buffer, acquire_pos)
         r2s_pos = code.find(r2s_copy)
         tma_pos = code.find(tma_copy)
         commit_pos = code.find(commit)
         for needle, pos in (
             (acquire, acquire_pos),
+            (acc_wait, acc_wait_pos),
+            (t2r_copy, t2r_pos),
+            (acc_release, acc_release_pos),
+            ("acc consumer state advance", acc_advance_pos),
+            (c_buffer, c_buffer_pos),
+            (r2s_source_store, r2s_source_store_pos),
             (r2s_copy, r2s_pos),
             (tma_copy, tma_pos),
             (commit, commit_pos),
         ):
             self.assertGreaterEqual(pos, 0, f"Missing {needle!r} in:\n{code}")
+        for needle, pos in (
+            ("first C producer acquire", first_acquire_pos),
+            (gmem_tile, gmem_tile_pos),
+            (subtile_loop, subtile_loop_pos),
+            (later_subtile_guard, later_subtile_guard_pos),
+        ):
+            self.assertGreaterEqual(pos, 0, f"Missing {needle!r} in:\n{code}")
         tail_pos = code.find(tail, commit_pos)
-        self.assertGreaterEqual(tail_pos, 0, f"Missing {tail!r} in:\n{code}")
-        self.assertLess(acquire_pos, r2s_pos, code)
-        self.assertLess(r2s_pos, tma_pos, code)
+        if require_tail:
+            self.assertGreaterEqual(tail_pos, 0, f"Missing {tail!r} in:\n{code}")
+        else:
+            # Callers pass a bounded role-local while source segment here; a
+            # tail in that segment would drain once per scheduler-recycled tile.
+            self.assertNotIn(tail, code)
+            tail_pos = len(code)
+        epilogue_slice = code[acquire_pos:tail_pos]
+        self.assertEqual(epilogue_slice.count(shared_fence), 1, code)
+        self.assertNotIn("cute.arch.fence_proxy('async.shared'", epilogue_slice)
+        first_barrier_pos = code.find(barrier, acquire_pos)
+        self.assertGreaterEqual(first_barrier_pos, 0, code)
+        second_barrier_pos = code.find(barrier, first_barrier_pos + len(barrier))
+        self.assertGreaterEqual(second_barrier_pos, 0, code)
+        shared_fence_pos = code.find(shared_fence, r2s_pos)
+        self.assertGreaterEqual(shared_fence_pos, 0, code)
+        self.assertLess(first_acquire_pos, gmem_tile_pos, code)
+        self.assertLess(gmem_tile_pos, subtile_loop_pos, code)
+        self.assertLess(subtile_loop_pos, later_subtile_guard_pos, code)
+        self.assertLess(later_subtile_guard_pos, acquire_pos, code)
+        self.assertLess(acquire_pos, acc_wait_pos, code)
+        self.assertLess(acc_wait_pos, t2r_pos, code)
+        self.assertLess(t2r_pos, acc_release_pos, code)
+        self.assertLess(acquire_pos, first_barrier_pos, code)
+        self.assertLess(acc_release_pos, first_barrier_pos, code)
+        self.assertLess(acc_release_pos, r2s_source_store_pos, code)
+        self.assertLess(r2s_source_store_pos, first_barrier_pos, code)
+        self.assertLess(first_barrier_pos, c_buffer_pos, code)
+        self.assertLess(c_buffer_pos, r2s_pos, code)
+        self.assertLess(r2s_pos, shared_fence_pos, code)
+        self.assertLess(shared_fence_pos, second_barrier_pos, code)
+        self.assertLess(second_barrier_pos, tma_pos, code)
         self.assertLess(tma_pos, commit_pos, code)
+        self.assertLess(commit_pos, acc_advance_pos, code)
+        self.assertLess(acc_advance_pos, tail_pos, code)
         loop_tail = code[commit_pos:tail_pos]
         self.assertNotIn(barrier, loop_tail, code)
         self.assertEqual(code[acquire_pos:tail_pos].count(barrier), 2, code)
+
+    def _role_local_while_source_for_predicate(
+        self, code: str, tree: ast.AST, role_predicate: str
+    ) -> tuple[str, int, int]:
+        matches: list[ast.While] = []
+        for node in ast.walk(tree):
+            if not (
+                isinstance(node, ast.If) and ast.unparse(node.test) == role_predicate
+            ):
+                continue
+            for role_child in ast.walk(node):
+                if isinstance(
+                    role_child, ast.While
+                ) and "tcgen05_role_local" in ast.unparse(role_child.test):
+                    matches.append(role_child)
+        self.assertEqual(
+            len(matches),
+            1,
+            "Expected exactly one role-local while for "
+            f"{role_predicate!r}. Generated code:\n{code}",
+        )
+        role_src = ast.get_source_segment(code, matches[0])
+        self.assertIsNotNone(
+            role_src,
+            "Expected parsed role-local while to preserve source extent. "
+            "Generated code:\n" + code,
+        )
+        assert role_src is not None
+        role_start = code.index(role_src)
+        return role_src, role_start, role_start + len(role_src)
+
+    def _assert_role_local_c_store_pipeline_lifetime(
+        self, code: str, tree: ast.AST, role_predicate: str
+    ) -> str:
+        create = "tcgen05_c_pipeline = cutlass.pipeline.PipelineTmaStore.create("
+        tail = "tcgen05_c_pipeline.producer_tail()"
+        dealloc = "num_allocated_columns=tcgen05_acc_tmem_cols"
+        invariant_setup = [
+            "tcgen05_kernel_desc = type('Tcgen05KernelDesc'",
+            (
+                "tcgen05_store_epi_tile = "
+                "cutlass.utils.blackwell_helpers.compute_epilogue_tile_shape("
+            ),
+            "tcgen05_sD_layout = cutlass.utils.blackwell_helpers.make_smem_layout_epi(",
+            "tcgen05_sD_ptr = cute.arch.alloc_smem(",
+            "tcgen05_sD = cute.make_tensor(",
+            (
+                "tcgen05_tAcc = "
+                "cutlass.utils.gemm.sm100.transform_partitioned_tensor_layout("
+            ),
+        ]
+
+        role_src, role_start, role_end = self._role_local_while_source_for_predicate(
+            code, tree, role_predicate
+        )
+        self.assertNotIn("PipelineTmaStore.create", role_src)
+        self.assertNotIn(tail, role_src)
+        create_pos = code.index(create)
+        tail_pos = code.index(tail)
+        dealloc_pos = code.index(dealloc)
+        self.assertLess(create_pos, role_start)
+        for needle in invariant_setup:
+            self.assertNotIn(needle, role_src)
+            self.assertLess(code.index(needle), role_start)
+        self.assertLess(role_end, tail_pos)
+        self.assertLess(tail_pos, dealloc_pos)
+        return role_src
 
     def test_mma_k_loop_selection_uses_reduction_block(self) -> None:
         env = _fake_env({32: 0, 64: 1, 16: 2, 7: 3})
@@ -1138,18 +1284,17 @@ class TestCuteLowerings(unittest.TestCase):
                     "tcgen05_acc_pipeline.consumer_wait(tcgen05_acc_consumer_state)",
                     role_src,
                 )
-                self.assertIn("PipelineTmaStore.create", role_src)
+                self.assertNotIn("PipelineTmaStore.create", role_src)
                 self.assertIn("cute.nvgpu.cpasync.tma_partition", role_src)
                 self.assertIn("cute.copy(tcgen05_tma_store_atom", role_src)
                 self.assertIn("tcgen05_tma_store_role_tile", role_src)
                 self.assertNotIn("cute.nvgpu.CopyUniversalOp()", role_src)
                 self.assertIn("cute.copy(tcgen05_tiled_copy_t2r", role_src)
-                self._assert_tma_store_acquire_before_smem_write(role_src)
+                self._assert_tma_store_epilogue_order(role_src, require_tail=False)
                 self.assertIn(
                     "tcgen05_acc_pipeline.consumer_release(tcgen05_acc_consumer_state)",
                     role_src,
                 )
-                self.assertIn("tcgen05_acc_consumer_state.advance()", role_src)
                 self.assertNotIn("cute.arch.sync_threads()", role_src)
                 found_role_local_epi_loop = True
 
@@ -1210,6 +1355,9 @@ class TestCuteLowerings(unittest.TestCase):
             found_role_local_epi_loop,
             "Expected a role-local epilogue while containing acc consumer "
             "and SIMT store work. Generated code:\n" + code,
+        )
+        self._assert_role_local_c_store_pipeline_lifetime(
+            code, tree, epi_role_predicate
         )
         self.assertTrue(
             shared_loop_preserves_barriers,
@@ -1283,7 +1431,7 @@ class TestCuteLowerings(unittest.TestCase):
             self.assertIn("cute.nvgpu.cpasync.tma_partition", code)
             self.assertIn("cute.copy(tcgen05_tma_store_atom", code)
             self.assertNotIn("cute.nvgpu.CopyUniversalOp()", code)
-            self._assert_tma_store_acquire_before_smem_write(code)
+            self._assert_tma_store_epilogue_order(code)
             bound.set_config(cfg)
             out = bound(*args)
 
@@ -1781,6 +1929,9 @@ class TestCuteLowerings(unittest.TestCase):
                 "cute.arch.make_warp_uniform(cute.arch.warp_idx()) < cutlass.Int32(4)"
             )
             tree = ast.parse(code)
+            self._assert_role_local_c_store_pipeline_lifetime(
+                code, tree, epi_role_predicate
+            )
             found_role_local_tma = False
             found_role_local_exec = False
             found_role_local_epi = False
@@ -1858,12 +2009,12 @@ class TestCuteLowerings(unittest.TestCase):
                     found_role_local_exec = True
                 elif test_src == epi_role_predicate:
                     self.assertIn("tcgen05_acc_pipeline.consumer_wait", role_src)
-                    self.assertIn("PipelineTmaStore.create", role_src)
+                    self.assertNotIn("PipelineTmaStore.create", role_src)
                     self.assertIn("cute.nvgpu.cpasync.tma_partition", role_src)
                     self.assertIn("cute.copy(tcgen05_tma_store_atom", role_src)
                     self.assertIn("tcgen05_tma_store_role_tile", role_src)
                     self.assertNotIn("cute.nvgpu.CopyUniversalOp()", role_src)
-                    self._assert_tma_store_acquire_before_smem_write(role_src)
+                    self._assert_tma_store_epilogue_order(role_src, require_tail=False)
                     found_role_local_epi = True
             for node in ast.walk(tree):
                 if not (
