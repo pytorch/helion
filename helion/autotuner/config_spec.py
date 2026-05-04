@@ -468,6 +468,54 @@ class ConfigSpec:
         # reopening the search choices.
         self.restrict_tcgen05_cluster_m_search((1, 2))
 
+    def _tcgen05_cluster_m2_seed_config(self) -> helion.Config | None:
+        constraints = self._tcgen05_cluster_m2_search_constraints
+        if constraints is None or "persistent_blocked" not in self.allowed_pid_types:
+            return None
+        if len(self.block_sizes) != 3:
+            return None
+
+        bm_fragment = cast("BlockSizeFragment", self.block_sizes[0]._fragment(self))
+        bn_fragment = cast("BlockSizeFragment", self.block_sizes[1]._fragment(self))
+        bk_fragment = cast("BlockSizeFragment", self.block_sizes[2]._fragment(self))
+        if not (
+            bm_fragment.low <= TCGEN05_TWO_CTA_BLOCK_M <= bm_fragment.high
+            and bn_fragment.low <= TCGEN05_TWO_CTA_BLOCK_N <= bn_fragment.high
+        ):
+            return None
+
+        bk = bk_fragment.high
+        while bk >= bk_fragment.low:
+            if self._tcgen05_cluster_m2_bk_is_valid(bk, constraints):
+                return helion.Config(
+                    block_sizes=[
+                        TCGEN05_TWO_CTA_BLOCK_M,
+                        TCGEN05_TWO_CTA_BLOCK_N,
+                        bk,
+                    ],
+                    pid_type="persistent_blocked",
+                    tcgen05_cluster_m=2,
+                    # Matches the validated tcgen05 search restriction.
+                    tcgen05_num_epi_warps=4,
+                )
+            bk //= 2
+        return None
+
+    @staticmethod
+    def _tcgen05_cluster_m2_bk_is_valid(
+        bk: int, constraints: Tcgen05ClusterM2SearchConstraints
+    ) -> bool:
+        return constraints.static_k % bk == 0 and (
+            constraints.static_k // bk <= constraints.max_k_tiles
+        )
+
+    def autotune_seed_configs(self) -> list[helion.Config]:
+        """Return validated extra configs that should be benchmarked early."""
+        cluster_m2_seed = self._tcgen05_cluster_m2_seed_config()
+        if cluster_m2_seed is None:
+            return []
+        return [cluster_m2_seed]
+
     def _fix_tcgen05_cluster_m2_search_config(self, config: dict[str, object]) -> None:
         """Canonicalize unvalidated search-only ``cluster_m=2`` products."""
         if not (
@@ -486,10 +534,7 @@ class ConfigSpec:
         if not isinstance(bk, int) or isinstance(bk, bool):
             config["tcgen05_cluster_m"] = 1
             return
-        if constraints.static_k % bk != 0:
-            config["tcgen05_cluster_m"] = 1
-            return
-        if constraints.static_k // bk > constraints.max_k_tiles:
+        if not self._tcgen05_cluster_m2_bk_is_valid(bk, constraints):
             config["tcgen05_cluster_m"] = 1
             return
         config["pid_type"] = "persistent_blocked"
@@ -1276,32 +1321,67 @@ class ConfigSpec:
         fields.update(self.user_defined_tunables)
         return fields
 
-    def structural_fingerprint(self) -> tuple[tuple[str | int, ...], ...]:
+    def structural_fingerprint(
+        self, *, advanced_controls_files: list[str] | None = None
+    ) -> tuple[tuple[str | int, ...], ...]:
         """Return a hashable structural description of this ConfigSpec's search space.
 
         Captures field names, sequence lengths, per-item block_ids lengths
-        (for PermutationFragment), and ListOf inner lengths.  Two ConfigSpecs
-        with the same fingerprint can safely exchange FlatConfig values.
+        (for PermutationFragment), ListOf inner lengths, and optional ACF slot
+        presence.  Two ConfigSpecs with the same fingerprint can safely exchange
+        FlatConfig values.
         """
-        return tuple(
+        result: list[tuple[str | int, ...]] = [
             (key, *field.fingerprint()) for key, field in self._flat_fields().items()
-        )
+        ]
+        acf_fragment = self._advanced_controls_file_fragment(advanced_controls_files)
+        if acf_fragment is not None:
+            result.append(
+                (
+                    "advanced_controls_file",
+                    *cast("tuple[str, ...]", acf_fragment.choices),
+                )
+            )
+        return tuple(result)
 
-    def structural_fingerprint_hash(self) -> str:
+    def structural_fingerprint_hash(
+        self, *, advanced_controls_files: list[str] | None = None
+    ) -> str:
         """Return a hex-digest SHA-256 hash of the structural fingerprint."""
         return hashlib.sha256(
-            repr(self.structural_fingerprint()).encode("utf-8")
+            repr(
+                self.structural_fingerprint(
+                    advanced_controls_files=advanced_controls_files
+                )
+            ).encode("utf-8")
         ).hexdigest()
 
-    def flat_key_layout(self) -> list[tuple[str, int, bool]]:
+    def _advanced_controls_file_fragment(
+        self, advanced_controls_files: list[str] | None
+    ) -> EnumFragment | None:
+        # Empty list means no autotuning with ACFs.
+        if not advanced_controls_files:
+            return None
+        files = advanced_controls_files
+        # When non-empty list is provided then ensure default -O3 is considered.
+        if "" not in files:
+            files = [*files, ""]
+        return EnumFragment(tuple(files))
+
+    def flat_key_layout(
+        self, *, advanced_controls_files: list[str] | None = None
+    ) -> list[tuple[str, int, bool]]:
         """Return (key_name, num_flat_entries, is_sequence) for each field.
 
         is_sequence is True for BlockIdSequence keys whose list values
         are spread across individual flat slots.
         """
-        return [
+        result = [
             (key, *field._flat_key_info()) for key, field in self._flat_fields().items()
         ]
+        if self._advanced_controls_file_fragment(advanced_controls_files) is not None:
+            result.append(("advanced_controls_file", 1, False))
+        return result
 
     def flat_config(
         self,
@@ -1332,13 +1412,9 @@ class ConfigSpec:
         ):
             if not config.get(name):
                 config.pop(name, None)
-        # Empty list means no autotuning with ACFs.
-        if advanced_controls_files:
-            files = advanced_controls_files
-            # When non-empty list is provided then ensure default -O3 is considered.
-            if "" not in files:
-                files = [*files, ""]
-            config["advanced_controls_file"] = fn(EnumFragment(tuple(files)))
+        acf_fragment = self._advanced_controls_file_fragment(advanced_controls_files)
+        if acf_fragment is not None:
+            config["advanced_controls_file"] = fn(acf_fragment)
         self.normalize(config, _fix_invalid=True)
         return helion.Config(**config)
 

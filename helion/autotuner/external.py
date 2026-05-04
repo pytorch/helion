@@ -21,6 +21,7 @@ if TYPE_CHECKING:
     import helion
     from helion.autotuner.block_id_sequence import BlockIdSequence
     from helion.autotuner.config_fragment import ConfigSpecFragment
+    from helion.autotuner.config_fragment import EnumFragment
 
 
 class UserConfigSpec(ConfigSpec):
@@ -36,6 +37,11 @@ class UserConfigSpec(ConfigSpec):
         self,
     ) -> dict[str, BlockIdSequence[Any] | ConfigSpecFragment]:
         return dict(self.user_defined_tunables)
+
+    def _advanced_controls_file_fragment(
+        self, advanced_controls_files: list[str] | None
+    ) -> EnumFragment | None:
+        return None
 
     def flat_config(
         self,

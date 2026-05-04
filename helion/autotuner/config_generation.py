@@ -152,7 +152,9 @@ class ConfigGeneration:
         """
         mapping: dict[str, tuple[list[int], bool]] = {}
         idx = 0
-        for key, count, is_sequence in self.config_spec.flat_key_layout():
+        for key, count, is_sequence in self.config_spec.flat_key_layout(
+            advanced_controls_files=self._advanced_controls_files
+        ):
             mapping[key] = (list(range(idx, idx + count)), is_sequence)
             idx += count
         assert idx == len(self.flat_spec), (
@@ -377,6 +379,28 @@ class ConfigGeneration:
         self._repair_cute_num_threads(config)
         return config
 
+    def seed_flat_config_pairs(self) -> list[tuple[FlatConfig, Config]]:
+        """Return ConfigSpec-provided seeds as flat and normalized configs.
+
+        ``ConfigSpec.autotune_seed_configs()`` is compiler-owned and must
+        return configs that match the live spec structurally. ``InvalidConfig``
+        means overrides make a seed inapplicable; other flatten/unflatten
+        exceptions are programming errors and intentionally surface.
+        """
+        result: list[tuple[FlatConfig, Config]] = []
+        seen: set[Config] = set()
+        for config in self.config_spec.autotune_seed_configs():
+            try:
+                flat = self.flatten(config)
+                normalized = self.unflatten(flat)
+            except InvalidConfig:
+                continue
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            result.append((flat, normalized))
+        return result
+
     def random_flat(self) -> FlatConfig:
         """
         Generate a random flat configuration.
@@ -406,7 +430,20 @@ class ConfigGeneration:
         )
 
     def random_population_flat(self, n: int) -> list[FlatConfig]:
-        return [self.default_flat(), *[self.random_flat() for _ in range(n - 1)]]
+        if n <= 0:
+            return [self.default_flat()]
+        default_flat = self.default_flat()
+        result = [default_flat]
+        if len(result) >= n:
+            return result[:n]
+        for flat, _config in self.seed_flat_config_pairs():
+            if any(flat == existing for existing in result):
+                continue
+            result.append(flat)
+            if len(result) >= n:
+                return result[:n]
+        result.extend(self.random_flat() for _ in range(n - len(result)))
+        return result
 
     def random_population(self, n: int) -> list[Config]:
         result: list[Config] = []
