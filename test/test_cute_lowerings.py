@@ -1614,7 +1614,7 @@ class TestCuteLowerings(unittest.TestCase):
             self.assertIn(
                 "tcgen05_ab_pipeline_consumer_group = "
                 "cutlass.pipeline.CooperativeGroup("
-                "cutlass.pipeline.Agent.Thread, cutlass.Int32(2))",
+                "cutlass.pipeline.Agent.Thread, cutlass.Int32(1))",
                 code,
             )
             self.assertIn(
@@ -1770,14 +1770,15 @@ class TestCuteLowerings(unittest.TestCase):
                             "Expected the CtaGroup.TWO exec owner to commit "
                             "the acc producer state. Generated role code:\n" + role_src,
                         )
-                        self.assertFalse(
+                        self.assertTrue(
                             any(
                                 "tcgen05_ab_pipeline.consumer_release("
                                 "tcgen05_ab_consumer_state)" in block
                                 for block in leader_blocks
                             ),
-                            "AB empty release must be reached by both CTA exec "
-                            "warps so TMA producer_tail can drain. Generated "
+                            "AB empty release must be leader-owned so the "
+                            "PipelineTmaUmma multicast mask supplies the peer "
+                            "CTA's empty signal exactly once. Generated "
                             "role code:\n" + role_src,
                         )
                         self.assertIn("tcgen05_acc_producer_state.advance()", role_src)
@@ -2050,10 +2051,15 @@ class TestCuteLowerings(unittest.TestCase):
         torch.testing.assert_close(first, expected, atol=2e-1, rtol=1e-2)
         torch.testing.assert_close(second, expected, atol=2e-1, rtol=1e-2)
 
-    def test_tcgen05_persistent_cluster_m2_two_cta_long_k_runtime_guard(
+    def test_tcgen05_persistent_cluster_m2_two_cta_k_cap_runtime_correctness(
         self,
     ) -> None:
-        """Long-K CtaGroup.TWO remains guarded until that loop is validated."""
+        """CtaGroup.TWO codegen runs correctly at the validated K cap."""
+
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
 
         @helion.kernel(backend="cute")
         def cute_matmul_cluster_m2_two_cta_long_k(
@@ -2069,14 +2075,71 @@ class TestCuteLowerings(unittest.TestCase):
                 out[tile_m, tile_n] = acc.to(x.dtype)
             return out
 
+        from helion._compiler.program_id import Tcgen05PersistentProgramIDs
+
+        for k_size in (64, 256, 4096):
+            with self.subTest(k_size=k_size):
+                torch.manual_seed(0)
+                args = (
+                    torch.randn(256, k_size, device=DEVICE, dtype=torch.bfloat16),
+                    torch.randn(k_size, 256, device=DEVICE, dtype=torch.bfloat16),
+                )
+                with patch_cute_mma_support():
+                    bound = cute_matmul_cluster_m2_two_cta_long_k.bind(args)
+                    bound.env.config_spec.cute_tcgen05_search_enabled = True
+                    cfg = _make_tcgen05_persistent_config(
+                        block_sizes=[256, 256, 16],
+                        pid_type="persistent_blocked",
+                        tcgen05_cluster_m=2,
+                    )
+                    bound.set_config(cfg)
+                    code = bound.to_triton_code(cfg)
+                    self.assertIn("cute.nvgpu.tcgen05.CtaGroup.TWO", code)
+                    self.assertIn("while tcgen05_role_local_0_work_tile", code)
+                    self.assertIn(
+                        Tcgen05PersistentProgramIDs._MULTI_TILE_GUARD_TOTAL_VAR,
+                        code,
+                    )
+                    self.assertIn(
+                        f"if {Tcgen05PersistentProgramIDs._MULTI_TILE_GUARD_TOTAL_VAR} > "
+                        f"{Tcgen05PersistentProgramIDs._CUDA_GRID_DIM_Z_LIMIT}:",
+                        code,
+                    )
+                    self.assertNotIn(
+                        f"if {Tcgen05PersistentProgramIDs._MULTI_TILE_GUARD_TOTAL_VAR} > 0:",
+                        code,
+                    )
+                    out = bound(*args)
+                expected = args[0] @ args[1]
+                torch.testing.assert_close(out, expected, atol=2e-1, rtol=1e-2)
+
+    def test_tcgen05_persistent_cluster_m2_two_cta_k_tile_limit_guard(
+        self,
+    ) -> None:
+        """CtaGroup.TWO shapes above the validated K-tile cap stay guarded."""
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_cluster_m2_two_cta_k_tile_limit(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
         args = (
-            torch.randn(256, 64, device=DEVICE, dtype=torch.bfloat16),
-            torch.randn(64, 256, device=DEVICE, dtype=torch.bfloat16),
+            torch.randn(256, 4112, device=DEVICE, dtype=torch.bfloat16),
+            torch.randn(4112, 256, device=DEVICE, dtype=torch.bfloat16),
         )
         from helion._compiler.program_id import Tcgen05PersistentProgramIDs
 
         with patch_cute_mma_support():
-            bound = cute_matmul_cluster_m2_two_cta_long_k.bind(args)
+            bound = cute_matmul_cluster_m2_two_cta_k_tile_limit.bind(args)
             bound.env.config_spec.cute_tcgen05_search_enabled = True
             cfg = _make_tcgen05_persistent_config(
                 block_sizes=[256, 256, 16],
@@ -2086,13 +2149,15 @@ class TestCuteLowerings(unittest.TestCase):
             bound.set_config(cfg)
             code = bound.to_triton_code(cfg)
             self.assertIn("cute.nvgpu.tcgen05.CtaGroup.TWO", code)
-            self.assertIn("while tcgen05_role_local_0_work_tile", code)
-            self.assertIn(Tcgen05PersistentProgramIDs._MULTI_TILE_GUARD_TOTAL_VAR, code)
             self.assertIn(
                 f"if {Tcgen05PersistentProgramIDs._MULTI_TILE_GUARD_TOTAL_VAR} > 0:",
                 code,
             )
-            with self.assertRaisesRegex(RuntimeError, r"long-K CtaGroup\.TWO"):
+            self.assertIn("above the validated K-tile limit", code)
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "above the validated K-tile limit",
+            ):
                 bound(*args)
 
     def test_tcgen05_flat_cluster_m2_two_cta_rejected(self) -> None:
@@ -4759,8 +4824,8 @@ class TestCuteLowerings(unittest.TestCase):
             bound = cute_matmul_mma_codegen_only.bind(args)
             # matmul_ops narrows tcgen05_cluster_m to (1,) when binding the
             # bf16/fp16 matmul until the cluster=2 path is benchmarked. This
-            # long-K codegen-only test still exercises the guarded cluster=2
-            # structure, so widen the choices back to (2, 1).
+            # K-over-cap codegen-only test still exercises the guarded
+            # cluster=2 structure, so widen the choices back to (2, 1).
             bound.env.config_spec.cute_tcgen05_search_enabled = True
             bound.env.config_spec.restrict_tcgen05_cluster_m_search((2, 1))
             code = bound.to_triton_code(config)
@@ -4775,7 +4840,7 @@ class TestCuteLowerings(unittest.TestCase):
         )
         self.assertIn("cute.nvgpu.tcgen05.CtaGroup.TWO", code)
         self.assertIn("_helion_tcgen05_persistent_total_tiles", code)
-        self.assertIn("long-K CtaGroup.TWO", code)
+        self.assertIn("above the validated K-tile limit", code)
         self.assertIn(
             "PersistentTileSchedulerParams(((8192 + _BLOCK_SIZE_0 - 1) // "
             "_BLOCK_SIZE_0 * 2",
@@ -6499,7 +6564,7 @@ class TestPerKiterTmaBuilders(unittest.TestCase):
         self.assertNotIn("exec_active", body_src)
         self.assertEqual(node.orelse, [])
 
-    def test_pipeline_release_two_cta_releases_from_both_exec_warps(
+    def test_pipeline_release_two_cta_releases_from_leader_and_advances_both(
         self,
     ) -> None:
         args = self._make_args(cluster_m=2, is_two_cta=True)
@@ -6509,7 +6574,10 @@ class TestPerKiterTmaBuilders(unittest.TestCase):
         self.assertEqual(self._stmt_kinds(node.body), ["If", "If"])
         release_gate, advance_gate = node.body
         self.assertIsInstance(release_gate, ast.If)
-        self.assertEqual(ast.unparse(release_gate.test), "exec_active")
+        self.assertEqual(
+            ast.unparse(release_gate.test),
+            f"exec_active and {_TCGEN05_CLUSTER_LEADER_PREDICATE}",
+        )
         self.assertEqual(self._stmt_kinds(release_gate.body), ["consumer_release"])
         self.assertIsInstance(advance_gate, ast.If)
         self.assertEqual(ast.unparse(advance_gate.test), "exec_active")
