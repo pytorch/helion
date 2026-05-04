@@ -330,11 +330,13 @@ def role():
     tcgen05_acc_pipeline.producer_commit(state)
     tcgen05_acc_pipeline.consumer_wait(state)
     tcgen05_c_pipeline.producer_acquire()
+    cute.copy(tma_atom, epi_src, epi_dst)
+    tcgen05_c_pipeline.producer_commit(state)
 """
         )
 
         self.assertEqual(summary["counts"]["ab_producer_acquire"], 1)
-        self.assertEqual(summary["counts"]["tma_copy"], 1)
+        self.assertEqual(summary["counts"]["tma_copy"], 2)
         self.assertEqual(summary["counts"]["umma_gemm"], 1)
         self.assertEqual(
             [event["event"] for event in summary["trace"]],
@@ -347,6 +349,8 @@ def role():
                 "acc_producer_commit",
                 "acc_consumer_wait",
                 "c_producer_acquire",
+                "tma_copy",
+                "c_producer_commit",
             ],
         )
         self.assertEqual(
@@ -364,6 +368,43 @@ def role():
                 ("acc_wait_to_c_acquire", 1, 1),
             ],
         )
+        self.assertEqual(
+            [
+                (
+                    window["name"],
+                    window["complete"],
+                    window["line_span"],
+                    window["event_span"],
+                )
+                for window in summary["windows"]
+            ],
+            [
+                ("tma_load_issue", True, 2, 2),
+                ("umma_issue", True, 2, 2),
+                ("epilogue_store_issue", True, 3, 3),
+            ],
+        )
+
+    def test_pipeline_event_windows_do_not_cross_next_anchor(self) -> None:
+        summary = _pipeline_event_summary(
+            """
+def role():
+    tcgen05_ab_pipeline.producer_acquire(first)
+    tcgen05_ab_pipeline.producer_acquire(second)
+    cute.copy(tma_atom, src, dst)
+    tcgen05_ab_pipeline.producer_commit(state)
+"""
+        )
+
+        windows = [
+            window
+            for window in summary["windows"]
+            if window["name"] == "tma_load_issue"
+        ]
+        self.assertEqual(len(windows), 2)
+        self.assertFalse(windows[0]["complete"])
+        self.assertEqual(windows[0]["missing_events"], ["tma_copy"])
+        self.assertTrue(windows[1]["complete"])
 
     def test_source_bundle_pipeline_summary_tracks_sources(self) -> None:
         summary = _source_bundle_pipeline_summary(
@@ -409,6 +450,7 @@ def kernel():
         self.assertEqual(
             summaries[0]["pipeline_events"]["counts"]["ab_producer_acquire"], 1
         )
+        self.assertFalse(summaries[0]["pipeline_events"]["windows"][0]["complete"])
         self.assertEqual(
             [entry["marker"] for entry in summaries[0]["marker_trace"]],
             [
@@ -456,6 +498,7 @@ def epilogue():
         self.assertEqual(summaries[0]["symbol"], "load")
         self.assertEqual(summaries[0]["markers"], {})
         self.assertEqual(summaries[0]["pipeline_events"]["counts"]["tma_copy"], 1)
+        self.assertEqual(summaries[0]["pipeline_events"]["windows"], [])
 
     def test_source_symbol_marker_summaries_do_not_truncate(self) -> None:
         source = "\n\n".join(
@@ -511,6 +554,9 @@ def epilogue():
         )
         self.assertIn("pipeline_events", payload["helion"])
         self.assertIn("pipeline_events", payload["quack"])
+        self.assertIn(
+            "windows", payload["quack"]["marker_symbols"][0]["pipeline_events"]
+        )
         self.assertEqual(payload["helion"]["role_local_loops"], [])
 
     def test_two_cta_codegen_report_fails_cleanly_without_quack_sources(self) -> None:
