@@ -313,6 +313,8 @@ class TestCuteLowerings(unittest.TestCase):
         r2s_copy = "cute.copy(tcgen05_tiled_copy_r2s"
         tma_copy = "cute.copy(tcgen05_tma_store_atom"
         commit = "tcgen05_c_pipeline.producer_commit()"
+        barrier = "tcgen05_epilog_sync_barrier.arrive_and_wait()"
+        tail = "tcgen05_c_pipeline.producer_tail()"
 
         self.assertEqual(code.count(acquire), 1, code)
         acquire_pos = code.find(acquire)
@@ -326,9 +328,14 @@ class TestCuteLowerings(unittest.TestCase):
             (commit, commit_pos),
         ):
             self.assertGreaterEqual(pos, 0, f"Missing {needle!r} in:\n{code}")
+        tail_pos = code.find(tail, commit_pos)
+        self.assertGreaterEqual(tail_pos, 0, f"Missing {tail!r} in:\n{code}")
         self.assertLess(acquire_pos, r2s_pos, code)
         self.assertLess(r2s_pos, tma_pos, code)
         self.assertLess(tma_pos, commit_pos, code)
+        loop_tail = code[commit_pos:tail_pos]
+        self.assertNotIn(barrier, loop_tail, code)
+        self.assertEqual(code[acquire_pos:tail_pos].count(barrier), 2, code)
 
     def test_mma_k_loop_selection_uses_reduction_block(self) -> None:
         env = _fake_env({32: 0, 64: 1, 16: 2, 7: 3})
