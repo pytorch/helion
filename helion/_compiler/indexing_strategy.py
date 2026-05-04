@@ -497,12 +497,19 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
                 if not valid_block_size(block_size, stride, i):
                     return False
             elif isinstance(k, torch.SymInt):
-                block_id = env.get_block_id(k)
-                if block_id is None:
-                    return False
-                block_size = env.block_sizes[block_id].from_config(config)
-                if not valid_block_size(block_size, stride, i):
-                    return False
+                symbol = _symint_expr(k)
+                origin = None
+                if isinstance(symbol, sympy.Symbol):
+                    origin = HostFunction.current().expr_to_origin.get(symbol)
+                if origin and isinstance(origin.origin, BlockSizeOrigin):
+                    block_size = env.block_sizes[
+                        origin.origin.block_id
+                    ].from_config(config)
+                    if not valid_block_size(block_size, stride, i):
+                        return False
+                # Non-BlockSizeOrigin SymInt is a scalar index
+                # (block_shape=1 in BlockedSubscriptIndexing.create),
+                # same as int — no valid_block_size check needed.
 
         return True
 

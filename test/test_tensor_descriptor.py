@@ -510,5 +510,35 @@ class TestTensorDescriptor(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result_unaligned, x_unaligned + 1.0)
 
 
+    @skipUnlessTensorDescriptor("Tensor descriptor support is required")
+    def test_scalar_symint_subscript(self):
+        """tile.begin (a SymInt without BlockSizeOrigin) should not prevent
+        tensor descriptor indexing.  Before the fix, is_supported() rejected
+        these and silently fell back to pointer indexing."""
+
+        @helion.kernel(
+            config=helion.Config(
+                block_sizes=[64],
+                indexing="tensor_descriptor",
+            ),
+            static_shapes=True,
+        )
+        def batched_add(x: torch.Tensor) -> torch.Tensor:
+            B, N = x.size()
+            out = torch.empty_like(x)
+            for tile_b in hl.tile(B, block_size=1):
+                for tile_n in hl.tile(N):
+                    out[tile_b.begin, tile_n] = x[tile_b.begin, tile_n] + 1.0
+            return out
+
+        x = torch.randn(4, 128, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(batched_add, (x,))
+        torch.testing.assert_close(result, x + 1.0)
+
+        self.assertIn(get_tensor_descriptor_fn_name(), code)
+        self.assertNotIn("tl.load(", code)
+        self.assertNotIn("tl.store(", code)
+
+
 if __name__ == "__main__":
     unittest.main()
