@@ -871,12 +871,16 @@ def _build_kloop_pipeline_release_if(
     """Per-K-iter consumer release ``if`` for the pipelined branch.
 
     Producer-state advance lives in the producer block (one per
-    commit), so only the consumer-state advance is emitted here.
+    commit), so only the consumer-state advance is emitted here. In
+    CtaGroup.TWO the empty-barrier release is leader-owned, matching the
+    PipelineTmaUmma multicast-mask semantics, while both CTA exec warps still
+    advance their local consumer state. Peer CTAs participate via the
+    multicast mask; separate peer arrivals over-count the empty barrier.
     """
     release_src = f"{args.tma_pipeline}.consumer_release({args.tma_consumer_state})"
-    # For CtaGroup.TWO, both CTA exec warps must release the AB empty barrier
-    # so the peer-CTA TMA producer tail can drain after the final tile.
-    release_gate = args.exec_active if gate_exec_warp else None
+    release_gate = _tcgen05_two_cta_owner_predicate(
+        args.exec_active, is_two_cta=args.is_two_cta, gate_exec_warp=gate_exec_warp
+    )
     advance_src = emit_pipeline_advance(args.tma_consumer_state)
     if args.is_two_cta:
         # With gate_exec_warp=False the caller is already inside the
@@ -1566,10 +1570,12 @@ def _emit_mma_pipeline(
     tcgen05_ab_stage_count_value = _tcgen05_config_int(
         df.config, "tcgen05_ab_stages", _tcgen05_ab_stage_count(df.config.num_stages)
     )
-    # Only CtaGroup.TWO uses a two-CTA UMMA release owner. Keep the
-    # CtaGroup.ONE clustered fallback on the legacy single-arrival shape
-    # until that path has separate runtime validation.
-    tcgen05_ab_consumer_arrive_count_value = 2 if tcgen05_is_two_cta else 1
+    # PipelineTmaUmma empty barriers are released by the leader CTA with the
+    # pipeline's multicast mask. Peer CTAs still advance local consumer state,
+    # but they must not add a second empty-barrier arrival: doing so lets the
+    # TMA producer reuse an AB stage before the leader's ordered release when
+    # the K loop has more than two tiles.
+    tcgen05_ab_consumer_arrive_count_value = 1
     tcgen05_c_stage_count_value = _tcgen05_config_int(
         df.config, "tcgen05_c_stages", _tcgen05_c_stage_count(bn)
     )
