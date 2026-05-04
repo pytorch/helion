@@ -18,9 +18,11 @@ from benchmarks.compare_matmul_backends import _parse_indexing_list
 from benchmarks.compare_matmul_backends import _parse_int_list
 from benchmarks.compare_matmul_backends import _parse_ncu_csv_metrics
 from benchmarks.compare_matmul_backends import _parse_optional_bool_list
+from benchmarks.compare_matmul_backends import _pipeline_event_summary
 from benchmarks.compare_matmul_backends import _quack_codegen_sources
 from benchmarks.compare_matmul_backends import _run_helion_two_cta_ncu_report
 from benchmarks.compare_matmul_backends import _run_helion_two_cta_ncu_target
+from benchmarks.compare_matmul_backends import _source_bundle_pipeline_summary
 from benchmarks.compare_matmul_backends import _source_bundle_summary
 from benchmarks.compare_matmul_backends import _source_marker_counts
 from benchmarks.compare_matmul_backends import _source_marker_lines
@@ -316,6 +318,71 @@ class TestCompareMatmulBackends(unittest.TestCase):
             ["quack.py:1"],
         )
 
+    def test_pipeline_event_summary_reports_ordered_gaps(self) -> None:
+        summary = _pipeline_event_summary(
+            """
+def role():
+    tcgen05_ab_pipeline.producer_acquire(state)
+    cute.copy(tma_atom, src, dst)
+    tcgen05_ab_pipeline.producer_commit(state)
+    tcgen05_ab_pipeline.consumer_wait(state)
+    cute.gemm(tiled_mma, acc, a, b, acc)
+    tcgen05_acc_pipeline.producer_commit(state)
+    tcgen05_acc_pipeline.consumer_wait(state)
+    tcgen05_c_pipeline.producer_acquire()
+"""
+        )
+
+        self.assertEqual(summary["counts"]["ab_producer_acquire"], 1)
+        self.assertEqual(summary["counts"]["tma_copy"], 1)
+        self.assertEqual(summary["counts"]["umma_gemm"], 1)
+        self.assertEqual(
+            [event["event"] for event in summary["trace"]],
+            [
+                "ab_producer_acquire",
+                "tma_copy",
+                "ab_producer_commit",
+                "ab_consumer_wait",
+                "umma_gemm",
+                "acc_producer_commit",
+                "acc_consumer_wait",
+                "c_producer_acquire",
+            ],
+        )
+        self.assertEqual(
+            [
+                (gap["name"], gap["line_delta"], gap["event_delta"])
+                for gap in summary["gaps"]
+            ],
+            [
+                ("ab_acquire_to_tma_copy", 1, 1),
+                ("tma_copy_to_ab_commit", 1, 1),
+                ("ab_commit_to_ab_wait", 1, 1),
+                ("ab_wait_to_umma", 1, 1),
+                ("umma_to_acc_commit", 1, 1),
+                ("acc_commit_to_acc_wait", 1, 1),
+                ("acc_wait_to_c_acquire", 1, 1),
+            ],
+        )
+
+    def test_source_bundle_pipeline_summary_tracks_sources(self) -> None:
+        summary = _source_bundle_pipeline_summary(
+            {
+                "generated.py": "tcgen05_ab_pipeline.producer_acquire(state)\n",
+                "quack.py": "ab_pipeline.producer_commit(state)\n",
+            }
+        )
+
+        self.assertEqual(summary["counts"]["ab_producer_acquire"], 1)
+        self.assertEqual(summary["counts"]["ab_producer_commit"], 1)
+        self.assertEqual(
+            [(event["source"], event["event"]) for event in summary["trace"]],
+            [
+                ("generated.py", "ab_producer_acquire"),
+                ("quack.py", "ab_producer_commit"),
+            ],
+        )
+
     def test_helion_role_local_loop_summaries_group_markers_by_role(self) -> None:
         code = """
 def kernel():
@@ -339,6 +406,9 @@ def kernel():
         self.assertEqual(summaries[0]["markers"]["persistent_scheduler"], 1)
         self.assertEqual(summaries[0]["markers"]["work_tile_loop"], 1)
         self.assertEqual(summaries[0]["markers"]["producer_acquire"], 1)
+        self.assertEqual(
+            summaries[0]["pipeline_events"]["counts"]["ab_producer_acquire"], 1
+        )
         self.assertEqual(
             [entry["marker"] for entry in summaries[0]["marker_trace"]],
             [
@@ -374,7 +444,18 @@ def epilogue():
         )
         self.assertEqual(summaries[0]["markers"]["griddepcontrol_wait"], 1)
         self.assertEqual(summaries[0]["markers"]["pipeline_tma_umma"], 1)
+        self.assertEqual(summaries[0]["pipeline_events"]["counts"]["pdl_wait"], 1)
         self.assertEqual(summaries[1]["markers"]["pipeline_tma_store"], 1)
+
+    def test_source_symbol_marker_summaries_include_pipeline_only_symbols(self) -> None:
+        summaries = _source_symbol_marker_summaries(
+            {"quack/generated.py": "def load():\n    cute.copy(tma_atom, src, dst)\n"}
+        )
+
+        self.assertEqual(len(summaries), 1)
+        self.assertEqual(summaries[0]["symbol"], "load")
+        self.assertEqual(summaries[0]["markers"], {})
+        self.assertEqual(summaries[0]["pipeline_events"]["counts"]["tma_copy"], 1)
 
     def test_source_symbol_marker_summaries_do_not_truncate(self) -> None:
         source = "\n\n".join(
@@ -428,6 +509,8 @@ def epilogue():
             payload["quack"]["marker_symbols"][0]["symbol"],
             "Gemm.producer",
         )
+        self.assertIn("pipeline_events", payload["helion"])
+        self.assertIn("pipeline_events", payload["quack"])
         self.assertEqual(payload["helion"]["role_local_loops"], [])
 
     def test_two_cta_codegen_report_fails_cleanly_without_quack_sources(self) -> None:
