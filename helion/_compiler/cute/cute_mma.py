@@ -1597,6 +1597,9 @@ def _emit_mma_pipeline(
     tcgen05_acc_consumer_arrive_count_value = tcgen05_epi_warp_count_value * (
         2 if tcgen05_is_two_cta else 1
     )
+    tcgen05_defer_pipeline_sync_arg = (
+        ", defer_sync=True" if tcgen05_cluster_m > 1 else ""
+    )
     tcgen05_matmul_plan: CuteTcgen05MatmulPlan | None = None
     tcgen05_mma_owner_active: str | None = None
     if mma_impl == "tcgen05":
@@ -1875,7 +1878,8 @@ def _emit_mma_pipeline(
                 f"producer_group={tcgen05_plan.acc_pipeline_producer_group}, "
                 f"consumer_group={tcgen05_plan.acc_pipeline_consumer_group}, "
                 f"barrier_storage={tcgen05_plan.acc_pipeline_barriers}, "
-                f"cta_layout_vmnk={tcgen05_cluster_layout_vmnk})"
+                f"cta_layout_vmnk={tcgen05_cluster_layout_vmnk}"
+                f"{tcgen05_defer_pipeline_sync_arg})"
             )
         )
         prefix.append(
@@ -2138,7 +2142,8 @@ def _emit_mma_pipeline(
                     f"{'cute.size_in_bytes(' + input_dtype_str + ', ' + tma_smem_a_layout + ')' if tcgen05_use_tma_a else '0'} + "
                     f"{'cute.size_in_bytes(' + input_dtype_str + ', ' + tma_smem_b_layout + ')' if tcgen05_use_tma_b else '0'}, "
                     f"barrier_storage={tma_pipeline_mbars}, "
-                    f"cta_layout_vmnk={tcgen05_cluster_layout_vmnk})"
+                    f"cta_layout_vmnk={tcgen05_cluster_layout_vmnk}"
+                    f"{tcgen05_defer_pipeline_sync_arg})"
                 )
             )
             prefix.append(
