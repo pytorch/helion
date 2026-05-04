@@ -24,6 +24,7 @@ from helion.autotuner.benchmark_provider import LocalBenchmarkProvider
 from helion.autotuner.benchmark_worker import BenchmarkTimeout
 from helion.autotuner.benchmark_worker import BenchmarkWorker
 from helion.autotuner.benchmark_worker import BenchmarkWorkerDied
+from helion.autotuner.benchmark_worker import BenchmarkWorkerPool
 from helion.autotuner.random_search import RandomSearch
 
 if TYPE_CHECKING:
@@ -69,6 +70,7 @@ class _ReturnValue:
 
 class TestBenchmarkWorkerFailureModes(unittest.TestCase):
     def test_timeout_kills_worker(self) -> None:
+        # A timed-out job should kill the worker and the next job should respawn it.
         worker = BenchmarkWorker()
         try:
             t0 = time.time()
@@ -82,8 +84,7 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
             worker.shutdown()
 
     def test_sticky_error_kills_worker(self) -> None:
-        # Errors matching _UNRECOVERABLE_RUNTIME_ERROR_RE force the worker
-        # to be killed so the next call spawns a fresh CUDA context.
+        # Sticky CUDA-style errors should kill the worker before the next job.
         worker = BenchmarkWorker()
         try:
             with self.assertRaises(RuntimeError) as ctx:
@@ -95,6 +96,7 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
             worker.shutdown()
 
     def test_worker_crash_raises_died(self) -> None:
+        # A worker process crash should surface as BenchmarkWorkerDied.
         worker = BenchmarkWorker()
         try:
             with self.assertRaises(BenchmarkWorkerDied):
@@ -102,6 +104,21 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
             self.assertFalse(worker.alive())
         finally:
             worker.shutdown()
+
+    def test_pool_run_jobs_reports_worker_and_elapsed(self) -> None:
+        # Pool job execution should preserve result order and report timing metadata.
+        pool = BenchmarkWorkerPool(2)
+        try:
+            results = pool.run_jobs(
+                [_ReturnValue("a"), _ReturnValue("b")],
+                timeout=30.0,
+            )
+        finally:
+            pool.shutdown()
+
+        self.assertEqual([r.result for r in results], ["a", "b"])
+        self.assertTrue(all(0 <= r.worker_index < 2 for r in results))
+        self.assertTrue(all(r.elapsed >= 0 for r in results))
 
 
 # Subprocess benchmarking depends on Backend.supports_precompile(); only the
