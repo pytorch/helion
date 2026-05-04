@@ -355,6 +355,28 @@ def _find_strategy(
     return strategy
 
 
+def _get_loop_begin_and_end(
+    state: CodegenState, loop_dim_index: int
+) -> tuple[str, str]:
+    """Extract the begin and end values from the _for_loop state args."""
+    ast_begins = state.ast_args[1]
+    ast_ends = state.ast_args[2]
+    begins = list(ast_begins) if isinstance(ast_begins, (list, tuple)) else [ast_begins]
+    ends = list(ast_ends) if isinstance(ast_ends, (list, tuple)) else [ast_ends]
+
+    def _to_str(value: object) -> str:
+        if isinstance(value, ast.AST):
+            return ast.unparse(value)
+        return str(value)
+
+    return _to_str(begins[loop_dim_index]), _to_str(ends[loop_dim_index])
+
+
+def _get_loop_numel(state: CodegenState, loop_dim_index: int) -> str:
+    begin, end = _get_loop_begin_and_end(state, loop_dim_index)
+    return f"(({end}) - ({begin}))"
+
+
 def _compute_grid_and_block_sizes(
     state: CodegenState,
     block_ids: list[int],
@@ -363,14 +385,14 @@ def _compute_grid_and_block_sizes(
     """Compute grid dimensions and block size vars for the given block_ids."""
     grid_parts: list[str] = []
     block_size_vars: list[str] = []
-    for block_id in block_ids:
+    for i, block_id in enumerate(block_ids):
         block_size_var = state.device_function.block_size_var(block_id)
         assert block_size_var is not None
         block_size_vars.append(block_size_var)
         block_value = env.block_sizes[block_id].from_config(state.config)
         if block_value is not None:
             state.device_function.constexpr_arg(block_size_var, block_value)
-        numel_expr = state.sympy_expr(env.block_sizes[block_id].numel)
+        numel_expr = _get_loop_numel(state, i)
         grid_parts.append(
             env.backend.cdiv_expr(numel_expr, block_size_var, is_device=True)
         )
@@ -383,11 +405,8 @@ def _pallas_loop_begin_and_step_exprs(
     block_size_vars: list[str],
 ) -> tuple[list[str], list[str], list[str]]:
     """Return begin, per-iteration step, and slice-size expressions for loop dims."""
-    begins = state.proxy_arg(1)
     steps = state.proxy_arg(4) if len(state.proxy_args) > 4 else None
 
-    if not isinstance(begins, (list, tuple)):
-        begins = [begins]
     if not isinstance(steps, (list, tuple)):
         steps = [steps] * len(block_ids)
 
@@ -396,9 +415,8 @@ def _pallas_loop_begin_and_step_exprs(
     slice_size_exprs: list[str] = []
 
     for i in range(len(block_ids)):
-        begin = begins[i]
         step = steps[i]
-        begin_expr = state.sympy_expr(sympy.sympify(begin))
+        begin_expr, _ = _get_loop_begin_and_end(state, i)
         if step is None or sympy.sympify(step) in (
             sympy.Integer(0),
             sympy.Integer(1),
@@ -621,7 +639,7 @@ def _setup_inner_loop_masks(
         for i, bid in enumerate(block_ids):
             block_value = env.block_sizes[bid].from_config(state.config)
             assert isinstance(block_value, int)
-            numel_expr = state.sympy_expr(env.block_sizes[bid].numel)
+            numel_expr = _get_loop_numel(state, i)
             offset_var = state.device_function.new_var(f"offset_{bid}")
             mask_stmt = strategy._setup_mask(
                 state, bid, block_value, offset_var, numel_expr
@@ -1482,9 +1500,12 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
     # Build block_id_to_info for the pipeline state
     block_id_to_info: dict[int, LoopDimInfo] = {}
     for block_id in block_ids:
+        block_size = env.block_sizes[block_id]
+        # when the block_size.size is None, we cannot form a SymPy expr for the numel
+        sympy_end_expr = block_size.numel if block_size.size is not None else None
         block_id_to_info[block_id] = LoopDimInfo(
             end_var_name=None,
-            end_expr=env.block_sizes[block_id].numel,
+            end_expr=sympy_end_expr,
         )
 
     strategy = _find_strategy(state, block_ids)
@@ -1816,9 +1837,12 @@ def _codegen_fori_loop(state: CodegenState) -> object:
     # Build block_id_to_info
     block_id_to_info: dict[int, LoopDimInfo] = {}
     for block_id in block_ids:
+        block_size = env.block_sizes[block_id]
+        # when the block_size.size is None, we cannot form a SymPy expr for the numel
+        sympy_end_expr = block_size.numel if block_size.size is not None else None
         block_id_to_info[block_id] = LoopDimInfo(
             end_var_name=None,
-            end_expr=env.block_sizes[block_id].numel,
+            end_expr=sympy_end_expr,
         )
 
     # Emit offset_<bid>/indices_<bid> at the body prologue.

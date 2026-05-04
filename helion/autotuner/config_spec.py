@@ -32,6 +32,7 @@ from .config_fragment import ConfigSpecFragment
 from .config_fragment import EnumFragment
 from .config_fragment import IntegerFragment
 from .config_fragment import ListOf
+from .config_fragment import NumThreadsFragment
 from .config_fragment import NumWarpsFragment
 from .config_fragment import PermutationFragment
 from .config_fragment import PowerOfTwoFragment
@@ -188,6 +189,27 @@ CUTE_TCGEN05_TUNABLE_KEYS: tuple[str, ...] = (
     "tcgen05_c_stages",
     "tcgen05_num_epi_warps",
 )
+_CUTE_IMPLICIT_DEFAULT_KEYS: frozenset[str] = frozenset(
+    {
+        "loop_orders",
+        "flatten_loops",
+        "l2_groupings",
+        "range_unroll_factors",
+        "range_warp_specializes",
+        "range_num_stages",
+        "range_multi_buffers",
+        "range_flattens",
+        "static_ranges",
+        "load_eviction_policies",
+        "indexing",
+        "atomic_indexing",
+        "num_warps",
+        "num_stages",
+        "pid_type",
+        "num_sm_multiplier",
+        "maxnreg",
+    }
+)
 
 
 def _epilogue_subtile_autotune_arch() -> tuple[int, int] | None:
@@ -259,7 +281,7 @@ class ConfigSpec:
         self.epilogue_subtile_autotune_choices: tuple[int | None, ...] | None = None
         self.epilogue_subtile_k_hint: int = 0
         self.has_pallas_inner_loops: bool = False
-        self.has_pallas_symbolic_bounds: bool = False
+        self.has_symbolic_or_data_dependent_bounds: bool = False
         self.cute_tcgen05_search_enabled: bool = False
         # Allowed values of tcgen05_cluster_m the autotuner is allowed to
         # *search* over. None means "use the default set defined by
@@ -643,6 +665,7 @@ class ConfigSpec:
                     raise InvalidConfig(
                         f"Unsupported config keys for backend {self.backend_name!r}: {backend_specific}"
                     )
+        provided_keys = set(config)
 
         for name, mapping, flatten in [
             ("block_sizes", self.block_sizes, True),
@@ -790,7 +813,7 @@ class ConfigSpec:
                         f"{key} is only supported for tcgen05-enabled CuTe matmul kernels"
                     )
         if self.has_pallas_inner_loops:
-            if self.has_pallas_symbolic_bounds:
+            if self.has_symbolic_or_data_dependent_bounds:
                 # "unroll" uses Python range() which can't handle traced bounds.
                 # Between the remaining options, prefer "fori_loop": it handles
                 # both DMA-aligned and unaligned inner blocks, while
@@ -974,6 +997,10 @@ class ConfigSpec:
         if self.supports_config_key("range_warp_specializes"):
             config["range_warp_specializes"] = range_warp_specializes
 
+        if self.backend_name == "cute":
+            for key in _CUTE_IMPLICIT_DEFAULT_KEYS - provided_keys:
+                config.pop(key, None)
+
         # Allow tunable parameter keys in addition to backend-supported keys.
         allowed_keys = self.supported_config_keys() | {
             *self.user_defined_tunables.keys()
@@ -1066,6 +1093,14 @@ class ConfigSpec:
         fields: dict[str, BlockIdSequence[Any] | ConfigSpecFragment] = {
             "block_sizes": self.block_sizes,
         }
+        if self.backend_name == "cute":
+            if self.cute_tcgen05_search_enabled:
+                fields["l2_groupings"] = self.l2_groupings
+                fields.update(self._tcgen05_optional_fragments(for_search=True))
+            if self.supports_config_key("num_threads"):
+                fields["num_threads"] = self.num_threads
+            fields.update(self.user_defined_tunables)
+            return fields
 
         # Only add sequence keys that the backend supports
         fields.update(
@@ -1118,12 +1153,8 @@ class ConfigSpec:
             fields["load_eviction_policies"] = self.load_eviction_policies
         if self.cute_tcgen05_search_enabled:
             fields.update(self._tcgen05_optional_fragments(for_search=True))
-        # num_threads is backend-specific (only CuteBackend).
-        # Not included in the autotuner search space because num_threads
-        # values must divide block_sizes (which are also tuned), making
-        # independent tuning produce many invalid configs.  Users can set
-        # num_threads explicitly in the Config constructor.
-        # TODO(future): add coupled tuning of num_threads and block_sizes
+        if self.supports_config_key("num_threads"):
+            fields["num_threads"] = self.num_threads
         if is_tileir:
             fields["num_ctas"] = self.backend_tunable_fragments["num_ctas"]
             fields["occupancy"] = self.backend_tunable_fragments["occupancy"]
@@ -1131,7 +1162,7 @@ class ConfigSpec:
             fields.update(self.backend_tunable_fragments)
         if self.has_pallas_inner_loops:
             choices = VALID_PALLAS_LOOP_TYPES
-            if self.has_pallas_symbolic_bounds:
+            if self.has_symbolic_or_data_dependent_bounds:
                 # Exclude "unroll" (uses Python range(), can't handle traced
                 # bounds) and put "fori_loop" first: it handles both DMA-aligned
                 # and unaligned inner blocks, while "emit_pipeline" fails on
@@ -1348,10 +1379,10 @@ class NumThreadsSpec(_PowerOfTwoBlockIdItem):
             return 0
         return super()._normalize(name, value)
 
-    def _fragment(self, base: ConfigSpec) -> PowerOfTwoFragment:
+    def _fragment(self, base: ConfigSpec) -> NumThreadsFragment:
         max_threads = min(max(self.size_hint, 1), 1024)
         default = next_power_of_2(max_threads)
-        return PowerOfTwoFragment(1, default, default)
+        return NumThreadsFragment(default)
 
     def _fill_missing(self) -> int:
         return 0

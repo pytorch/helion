@@ -2242,7 +2242,7 @@ def _emit_mma_pipeline(
         )
         cg.add_statement(
             statement_from_string(
-                f"cute.gemm({tiled_mma}, {acc_frag}, [{rA}], [{rB}], {acc_frag})"
+                f"cute.gemm({tiled_mma}, {acc_frag}, {rA}, {rB}, {acc_frag})"
             )
         )
     else:
@@ -2259,7 +2259,7 @@ def _emit_mma_pipeline(
                     f"        {rA}[_mma_i] = {tAsA}[_mma_i]\n"
                     f"    for _mma_i in range(cute.size({rB})):\n"
                     f"        {rB}[_mma_i] = {tBsB}[_mma_i]\n"
-                    f"    cute.gemm({tiled_mma}, {acc_frag}, [{rA}], [{rB}], {acc_frag})"
+                    f"    cute.gemm({tiled_mma}, {acc_frag}, {rA}, {rB}, {acc_frag})"
                 )
             )
         else:
@@ -2280,8 +2280,8 @@ def _emit_mma_pipeline(
                     f"        cute.gemm(\n"
                     f"            {tiled_mma},\n"
                     f"            {acc_frag},\n"
-                    f"            [{tcgen05_frag_a}[None, None, cutlass.Int32(_tcgen05_kblk_idx), {mma_stage}]],\n"
-                    f"            [{tcgen05_frag_b}[None, None, cutlass.Int32(_tcgen05_kblk_idx), {mma_stage}]],\n"
+                    f"            {tcgen05_frag_a}[None, None, cutlass.Int32(_tcgen05_kblk_idx), {mma_stage}],\n"
+                    f"            {tcgen05_frag_b}[None, None, cutlass.Int32(_tcgen05_kblk_idx), {mma_stage}],\n"
                     f"            {acc_frag},\n"
                     "        )"
                 )
@@ -3098,7 +3098,7 @@ def codegen_cute_mma_direct_mm(
             f"                {rA}[_mma_i] = {tAsA}[_mma_i]\n"
             f"            for _mma_i in range(cute.size({rB})):\n"
             f"                {rB}[_mma_i] = {tBsB}[_mma_i]\n"
-            f"            cute.gemm({tiled_mma}, {acc_frag}, [{rA}], [{rB}], {acc_frag})\n"
+            f"            cute.gemm({tiled_mma}, {acc_frag}, {rA}, {rB}, {acc_frag})\n"
             f"        cute.arch.sync_threads()"
         )
     )

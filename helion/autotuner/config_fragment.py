@@ -322,6 +322,61 @@ class NumWarpsFragment(PowerOfTwoFragment):
         return Category.NUM_WARPS
 
 
+class NumThreadsFragment(ConfigSpecFragment):
+    """CuTe launch-thread count for one tile axis.
+
+    The value ``0`` means "auto": let the CuTe backend derive a thread count
+    from the selected block size and shrink it as needed for the 1024-thread
+    CTA limit. Positive values are powers of two and are repaired against the
+    paired block size by ConfigGeneration before benchmarking.
+    """
+
+    def __init__(self, high: int) -> None:
+        self.high = assert_integer_power_of_two(max(high, 1))
+
+    def default(self) -> int:
+        return 0
+
+    def random(self) -> int:
+        if random.random() < 0.25:
+            return 0
+        return PowerOfTwoFragment(1, self.high, self.high).random()
+
+    def pattern_neighbors(self, current: object, radius: int = 1) -> list[object]:
+        if current == 0:
+            return [1] if self.high == 1 else [1, self.high]
+        assert_integer_power_of_two(current)
+        neighbors = PowerOfTwoFragment(1, self.high, self.high).pattern_neighbors(
+            current, radius
+        )
+        return [0, *neighbors]
+
+    def differential_mutation(self, a: object, b: object, c: object) -> int:
+        if b == c:
+            return cast("int", a)
+        if a == 0 or b == 0 or c == 0:
+            return self.random()
+        return PowerOfTwoFragment(1, self.high, self.high).differential_mutation(
+            a, b, c
+        )
+
+    def dim(self) -> int:
+        return 1
+
+    def encode(self, value: object) -> list[float]:
+        if value == 0:
+            return [0.0]
+        if not isinstance(value, int):
+            raise TypeError(
+                f"Expected int for NumThreadsFragment, got {type(value).__name__}: {value!r}"
+            )
+        assert_integer_power_of_two(value)
+        return [math.log2(float(value)) + 1.0]
+
+    def get_minimum(self) -> int:
+        return 0
+
+
 @dataclasses.dataclass
 class ListOf(ConfigSpecFragment):
     """Wrapper that creates a list of independently tunable fragments.
