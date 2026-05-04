@@ -2015,6 +2015,97 @@ class TestPallas(TestCase):
         ref = torch.stack([data[: lengths[i]].sum() for i in range(B)])
         torch.testing.assert_close(result, ref, rtol=1e-4, atol=1e-4)
 
+    def test_non_zero_tile_begin(self) -> None:
+        """pl.ds() reads from a non-zero begin can overshoot the tensor boundary."""
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def sum_with_constant_offset(
+            data: torch.Tensor, offsets: torch.Tensor
+        ) -> torch.Tensor:
+            B = offsets.size(0) - 1
+            out = torch.zeros([B], dtype=data.dtype, device=data.device)
+            for seg in hl.grid(B):
+                acc = hl.zeros([1], dtype=data.dtype)
+                for tile in hl.tile(3, 128, block_size=16):
+                    acc = acc + data[tile, :, :].sum(dim=0).sum(dim=0).sum(
+                        dim=0
+                    ).unsqueeze(0)
+                out[seg] = acc.squeeze(0)
+            return out
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def sum_with_dynamic_offset(
+            data: torch.Tensor, offsets: torch.Tensor
+        ) -> torch.Tensor:
+            B = offsets.size(0) - 1
+            out = torch.zeros([B], dtype=data.dtype, device=data.device)
+            for seg in hl.grid(B):
+                start = offsets[seg]
+                end = offsets[seg + 1]
+                acc = hl.zeros([1], dtype=data.dtype)
+                for tile in hl.tile(start, end, block_size=16):
+                    acc = acc + data[tile, :, :].sum(dim=0).sum(dim=0).sum(
+                        dim=0
+                    ).unsqueeze(0)
+                out[seg] = acc.squeeze(0)
+            return out
+
+        N, A, B = 128, 8, 256
+        data = torch.randn(N, A, B, device=DEVICE, dtype=torch.float32)
+        offsets = torch.tensor([3, 128], device=DEVICE, dtype=torch.int32)
+        ref = data[3:128].sum().unsqueeze(0)
+
+        _code1, result1 = code_and_output(sum_with_constant_offset, (data, offsets))
+        torch.testing.assert_close(result1, ref, rtol=1e-3, atol=1e-3)
+
+        _code2, result2 = code_and_output(sum_with_dynamic_offset, (data, offsets))
+        torch.testing.assert_close(result2, ref, rtol=1e-3, atol=1e-3)
+
+    def test_jagged_sum_3d(self) -> None:
+        """3D jagged sum with load-time masking for out-of-bounds data."""
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def jagged_sum_3d(
+            x_data: torch.Tensor, x_offsets: torch.Tensor
+        ) -> torch.Tensor:
+            num_rows = x_offsets.size(0) - 1
+            out = torch.zeros([num_rows], dtype=x_data.dtype, device=x_data.device)
+            for seq_index in hl.grid(num_rows):
+                start = x_offsets[seq_index]
+                end = x_offsets[seq_index + 1]
+                row_sums = hl.zeros([1], dtype=x_data.dtype)
+                for tile in hl.tile(start, end):
+                    vals = x_data[tile, :, :]
+                    row_sums = row_sums + vals.sum(dim=0).sum(dim=0).sum(
+                        dim=0
+                    ).unsqueeze(0)
+                out[seq_index] = row_sums.squeeze(0)
+            return out
+
+        num_segments, A, B, max_seqlen = 8, 8, 256, 64
+        seq_lengths = torch.randint(
+            1, max_seqlen + 1, (num_segments,), dtype=torch.int32
+        )
+        x_offsets = torch.cat(
+            [
+                torch.zeros(1, dtype=torch.int32),
+                torch.cumsum(seq_lengths, dim=0).to(torch.int32),
+            ]
+        ).to(DEVICE)
+        N = int(x_offsets[-1])
+        x_data = torch.randn(N, A, B, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(
+            jagged_sum_3d,
+            (x_data, x_offsets),
+        )
+        ref = torch.stack(
+            [
+                x_data[x_offsets[i] : x_offsets[i + 1], :, :].sum()
+                for i in range(num_segments)
+            ]
+        )
+        torch.testing.assert_close(result, ref, rtol=1e-3, atol=1e-3)
+
 
 @skipUnlessPallas("JAX/Pallas TPU not available")
 class TestPallasIndirectGather(TestCase):

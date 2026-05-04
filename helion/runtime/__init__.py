@@ -748,7 +748,7 @@ def _pallas_invoke_and_return(
     tensor_arg_indices: list[int],
     arg_to_tensor_pos: dict[int, int],
     _output_indices: list[int],
-    _ds_pad_dims: list[tuple[int, int, int]] | None = None,
+    _ds_pad_dims: list[tuple[int, int, int, int]] | None = None,
     _orig_output_tensors: dict[int, torch.Tensor] | None = None,
 ) -> object:
     """Run the JaxCallable and return output-only results.
@@ -792,10 +792,10 @@ def _pallas_invoke_and_return(
 
     # Handle padding copy-back and result slicing
     if _ds_pad_dims and _orig_output_tensors:
-        # _ds_pad_dims contains (arg_idx, dim, block_size).
+        # _ds_pad_dims contains (arg_idx, dim, block_size, extra_pad).
         # Build a map from arg_idx → [(dim, ...)] for padded output args.
         padded_dims_by_arg: dict[int, list[int]] = {}
-        for arg_idx, dim, _bs in _ds_pad_dims:
+        for arg_idx, dim, _bs, _extra in _ds_pad_dims:
             if arg_idx in _orig_output_tensors:
                 padded_dims_by_arg.setdefault(arg_idx, []).append(dim)
 
@@ -842,12 +842,13 @@ def _pallas_invoke_and_return(
 def _pallas_apply_ds_padding(
     args: tuple[object, ...],
     _output_indices: list[int],
-    _ds_pad_dims: list[tuple[int, int, int]],
+    _ds_pad_dims: list[tuple[int, int, int, int]],
 ) -> tuple[tuple[object, ...], dict[int, torch.Tensor]]:
-    """Pad tensor args along non-divisible pl.ds() dimensions.
+    """Pad tensor args so ``pl.ds(offset, block_size)`` never reads OOB.
 
-    ``_ds_pad_dims`` contains ``(arg_index, dim, block_size)`` tuples.
-    The pad amount is computed at runtime as ``(-tensor.shape[dim]) % block_size``.
+    ``_ds_pad_dims`` contains ``(arg_index, dim, block_size, extra_pad)``
+    tuples.  The pad amount is ``(-tensor.shape[dim]) % block_size +
+    extra_pad``, where *extra_pad* accounts for non-zero loop begins.
 
     Returns the padded args tuple and a dict mapping output arg indices
     to their original (unpadded) tensors for post-call copy-back.
@@ -855,17 +856,15 @@ def _pallas_apply_ds_padding(
     args_list = list(args)
     orig_output_tensors: dict[int, torch.Tensor] = {}
     output_set = set(_output_indices)
-    for arg_idx, dim, block_size in _ds_pad_dims:
+    for arg_idx, dim, block_size, extra_pad in _ds_pad_dims:
         a = args_list[arg_idx]
         if not isinstance(a, torch.Tensor):
             continue
-        pad_amount = (-a.shape[dim]) % block_size
+        pad_amount = (-a.shape[dim]) % block_size + extra_pad
         if pad_amount == 0:
             continue
         if arg_idx in output_set and arg_idx not in orig_output_tensors:
             orig_output_tensors[arg_idx] = a
-        # F.pad takes (last_dim_left, last_dim_right, ..., first_dim_left, first_dim_right).
-        # To right-pad dimension `dim`, set index 2*(ndim-1-dim) + 1.
         pad_widths = [0] * (2 * a.ndim)
         pad_widths[2 * (a.ndim - 1 - dim) + 1] = pad_amount
         args_list[arg_idx] = torch.nn.functional.pad(a, pad_widths)
@@ -880,7 +879,7 @@ def default_pallas_launcher(
     _inplace_indices: list[int] | None = None,
     _block_spec_info: _BlockSpecInfo | None = None,
     _smem_arg_indices: list[int] | None = None,
-    _ds_pad_dims: list[tuple[int, int, int]] | None = None,
+    _ds_pad_dims: list[tuple[int, int, int, int]] | None = None,
     **kwargs: object,
 ) -> object:
     """Default launcher for Pallas kernels on TPU (or CPU with interpret=True).
@@ -1021,7 +1020,7 @@ def default_pallas_pipeline_launcher(
     _block_spec_info: _BlockSpecInfo | None = None,
     _scratch_shapes: list[tuple[tuple[int, ...], str]] | None = None,
     _pipeline_arg_indices: list[int] | None = None,
-    _ds_pad_dims: list[tuple[int, int, int]] | None = None,
+    _ds_pad_dims: list[tuple[int, int, int, int]] | None = None,
     _smem_arg_indices: list[int] | None = None,
     **kwargs: object,
 ) -> object:
@@ -1191,7 +1190,7 @@ def default_pallas_fori_launcher(
     _inplace_indices: list[int] | None = None,
     _block_spec_info: _BlockSpecInfo | None = None,
     _scratch_shapes: list[tuple[tuple[int, ...], str | None, str]] | None = None,
-    _ds_pad_dims: list[tuple[int, int, int]] | None = None,
+    _ds_pad_dims: list[tuple[int, int, int, int]] | None = None,
     _smem_arg_indices: list[int] | None = None,
     **kwargs: object,
 ) -> object:

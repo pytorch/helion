@@ -433,6 +433,30 @@ def _pallas_loop_begin_and_step_exprs(
     return begin_exprs, iter_step_exprs, slice_size_exprs
 
 
+def _compute_pipeline_or_dma_extra_pad(
+    begin_expr: str,
+    bid: int,
+    env: CompileEnvironment,
+    state: CodegenState,
+) -> int:
+    """Return extra host-side padding for a pipeline/DMA dim with a non-zero begin.
+
+    When ``pl.ds(offset, block_size)`` reads from a tensor whose loop starts
+    at a non-zero begin, the last block can overshoot the tensor boundary
+    beyond what ``(-shape) % block_size`` accounts for.  The worst case is
+    ``block_size - 1`` extra elements when the begin is data-dependent.
+
+    # TODO(dunfanlu): if begin isn't "0" but is another constexpr int,
+    # we should be able to use a smaller padding than bs-1?
+    """
+    if begin_expr == "0":
+        return 0
+    bs_val = env.block_sizes[bid].from_config(state.config)
+    if isinstance(bs_val, int):
+        return bs_val - 1
+    return 0
+
+
 def _scratch_read(state: CodegenState, sname: str) -> str:
     """Read expression for a scratch buffer, slicing if padded for TPU."""
     sl = state.device_function.scratch_read_slice(sname)
@@ -1378,7 +1402,10 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
                 block_shape_parts.append(slice_size_expr)
                 from .memory_ops import _record_pad_info
 
-                _record_pad_info(state, fake, dim_idx, bid)
+                extra_pad = _compute_pipeline_or_dma_extra_pad(
+                    begin_expr, bid, env, state
+                )
+                _record_pad_info(state, fake, dim_idx, bid, extra_pad)
                 if begin_expr == "0" and iter_step_expr == slice_size_expr:
                     lambda_parts.append(lambda_params[bid_idx])
                 else:
@@ -1903,7 +1930,10 @@ def _codegen_fori_loop(state: CodegenState) -> object:
                 needs_slice = True
                 from .memory_ops import _record_pad_info
 
-                _record_pad_info(state, fake, dim_idx, bid)
+                extra_pad = _compute_pipeline_or_dma_extra_pad(
+                    begin_expr, bid, env, state
+                )
+                _record_pad_info(state, fake, dim_idx, bid, extra_pad)
             elif bid is not None and bid not in block_ids:
                 # Outer grid dim: use grid offset
                 grid_loops = state.codegen.active_device_loops.get(bid)
