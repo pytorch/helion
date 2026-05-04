@@ -129,7 +129,7 @@ class HostFunction:
         self.location: SourceLocation = UnknownLocation()
         self.definition: KernelDef | None = None
         self.compiler_state: CompilerState = CompilerState()
-        self.device_ir: DeviceIR | None = None
+        self._device_ir: DeviceIR | None = None
         # TODO(hinriksnaer): could be a local in KernelCompiler.parse()
         # if SourceLocation.from_ast() took code/column_offset explicitly.
         self._column_offset: int = 0
@@ -178,6 +178,15 @@ class HostFunction:
     @property
     def column_offset(self) -> int:
         return self._column_offset
+
+    @property
+    def device_ir(self) -> DeviceIR:
+        assert self._device_ir is not None
+        return self._device_ir
+
+    @device_ir.setter
+    def device_ir(self, value: DeviceIR) -> None:
+        self._device_ir = value
 
     @property
     def expr_to_origin(self) -> dict[sympy.Expr, SymbolOrigin]:
@@ -298,8 +307,8 @@ class HostFunction:
                 )
             ),
         ]
-        if self.device_ir is not None:
-            result.append(self.device_ir.debug_str())
+        if self._device_ir is not None:
+            result.append(self._device_ir.debug_str())
         return "\n\n".join(result)
 
     def codegen_function_def(
