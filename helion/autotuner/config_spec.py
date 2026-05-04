@@ -22,6 +22,9 @@ from .._compat import supports_amd_cdna_tunables
 from .._compat import supports_maxnreg
 from .._compat import supports_tensor_descriptor
 from .._compat import warps_to_threads
+from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
+from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
+from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_MAX_K_TILES
 from ..exc import InvalidConfig
 from .block_id_sequence import BlockIdSequence
 from .block_id_sequence import _BlockIdItem
@@ -58,6 +61,13 @@ class TensorNumelConstraint(NamedTuple):
     check_fn: Callable[..., bool]
     block_indices: tuple[int, ...]
     expr_str: str
+
+
+class Tcgen05ClusterM2SearchConstraints(NamedTuple):
+    """Search-only envelope where ``tcgen05_cluster_m=2`` is validated."""
+
+    static_k: int
+    max_k_tiles: int
 
 
 def shrink_block_sizes_for_numel_constraints(
@@ -290,6 +300,9 @@ class ConfigSpec:
         # values are *legal* in a user-supplied helion.Config (the latter
         # always accepts the full set of legal values).
         self._tcgen05_cluster_m_search_choices: tuple[int, ...] | None = None
+        self._tcgen05_cluster_m2_search_constraints: (
+            Tcgen05ClusterM2SearchConstraints | None
+        ) = None
         # Allowed values of tcgen05_num_epi_warps the autotuner is allowed
         # to *search* over. ``None`` means "use the default IntegerFragment
         # range defined by _tcgen05_optional_fragments". This is consulted by
@@ -426,6 +439,62 @@ class ConfigSpec:
         """
         assert choices, "tcgen05_cluster_m search must allow at least one value"
         self._tcgen05_cluster_m_search_choices = choices
+        if 2 not in choices:
+            self._tcgen05_cluster_m2_search_constraints = None
+
+    def allow_tcgen05_cluster_m2_search(
+        self,
+        *,
+        static_k: int,
+        max_k_tiles: int = TCGEN05_TWO_CTA_MAX_K_TILES,
+    ) -> None:
+        """Allow validated CtaGroup.TWO candidates in the autotune search.
+
+        The search space cannot express cross-field constraints directly.
+        This helper exposes ``tcgen05_cluster_m=2`` but records enough context
+        for search-time normalization to project ``cluster_m=2`` products onto
+        the validated ``persistent_blocked`` + ``256x256`` CtaGroup.TWO block
+        tile within the K-tile cap. Problems outside this envelope keep
+        ``tcgen05_cluster_m`` narrowed to ``(1,)``.
+        """
+        assert static_k > 0, "static_k is required for cluster_m=2 K-cap checks"
+        assert max_k_tiles > 0, "cluster_m=2 max K tiles must be positive"
+        self._tcgen05_cluster_m2_search_constraints = Tcgen05ClusterM2SearchConstraints(
+            static_k=static_k,
+            max_k_tiles=max_k_tiles,
+        )
+        # ``restrict_tcgen05_cluster_m_search`` intentionally clears the
+        # constraints whenever 2 is absent; set them immediately before
+        # reopening the search choices.
+        self.restrict_tcgen05_cluster_m_search((1, 2))
+
+    def _fix_tcgen05_cluster_m2_search_config(self, config: dict[str, object]) -> None:
+        """Canonicalize unvalidated search-only ``cluster_m=2`` products."""
+        if not (
+            self.cute_tcgen05_search_enabled and config.get("tcgen05_cluster_m") == 2
+        ):
+            return
+        constraints = self._tcgen05_cluster_m2_search_constraints
+        if constraints is None or "persistent_blocked" not in self.allowed_pid_types:
+            config["tcgen05_cluster_m"] = 1
+            return
+        block_sizes = config.get("block_sizes")
+        if not isinstance(block_sizes, list) or len(block_sizes) < 3:
+            config["tcgen05_cluster_m"] = 1
+            return
+        bk = block_sizes[2]
+        if not isinstance(bk, int) or isinstance(bk, bool):
+            config["tcgen05_cluster_m"] = 1
+            return
+        if constraints.static_k % bk != 0:
+            config["tcgen05_cluster_m"] = 1
+            return
+        if constraints.static_k // bk > constraints.max_k_tiles:
+            config["tcgen05_cluster_m"] = 1
+            return
+        config["pid_type"] = "persistent_blocked"
+        block_sizes[0] = TCGEN05_TWO_CTA_BLOCK_M
+        block_sizes[1] = TCGEN05_TWO_CTA_BLOCK_N
 
     def restrict_tcgen05_num_epi_warps_search(self, choices: tuple[int, ...]) -> None:
         """Narrow the autotune search over tcgen05_num_epi_warps to *choices*.
@@ -455,7 +524,11 @@ class ConfigSpec:
         self._tcgen05_num_epi_warps_validation_choices = choices
 
     def narrow_tcgen05_autotune_to_validated_configs(
-        self, *, allow_persistent_pid_types: bool = False
+        self,
+        *,
+        allow_persistent_pid_types: bool = False,
+        allow_cluster_m2_search: bool = False,
+        cluster_m2_static_k: int | None = None,
     ) -> None:
         """Narrow the tcgen05 autotune search to combinations validated on B200.
 
@@ -481,12 +554,15 @@ class ConfigSpec:
           (``Tcgen05PersistentProgramIDs._emit_host_multi_tile_guard``),
           which raises a loud ``RuntimeError``.
 
-        * **2-CTA cluster.** ``cluster_m=2`` (2-CTA tcgen05 instructions)
-          currently CUDA-launch-fails on B200 across the matmul block-size
-          combinations exercised. Narrow ``tcgen05_cluster_m`` to ``(1,)``
-          for the BF16/FP16 matmul path until the 2-CTA lowering is fixed.
-          Lifts when item 3 (2-CTA persistent) lands. CUDA launch failure
-          is loud, so user-supplied ``cluster_m=2`` is still legal.
+        * **2-CTA cluster.** ``cluster_m=2`` is searched only when the
+          caller proves the static problem can form validated role-local
+          CtaGroup.TWO candidates. The search view may expose ``(1, 2)``,
+          but search-time normalization projects ``cluster_m=2`` products
+          onto the validated ``persistent_blocked`` + ``256x256`` tile shape
+          with ``K / bk`` at or below the validated K-tile cap. CUDA launch
+          failures are loud, so user-supplied ``cluster_m=2`` is still legal
+          and handled by the runtime guard when outside the validated
+          envelope.
 
         * **Multi-warp epilogue.** Only ``tcgen05_num_epi_warps=4`` is
           validated correct on B200 today. Direct verification at
@@ -507,7 +583,16 @@ class ConfigSpec:
         if not allow_persistent_pid_types:
             self.disallow_pid_type("persistent_blocked")
             self.disallow_pid_type("persistent_interleaved")
-        self.restrict_tcgen05_cluster_m_search((1,))
+        if allow_cluster_m2_search:
+            assert allow_persistent_pid_types, (
+                "cluster_m=2 search requires persistent pid types"
+            )
+            assert cluster_m2_static_k is not None, (
+                "cluster_m=2 search requires a static K extent"
+            )
+            self.allow_tcgen05_cluster_m2_search(static_k=cluster_m2_static_k)
+        else:
+            self.restrict_tcgen05_cluster_m_search((1,))
         self.restrict_tcgen05_num_epi_warps_search((4,))
         self.restrict_tcgen05_num_epi_warps_validation((4,))
 
@@ -834,6 +919,9 @@ class ConfigSpec:
                     )
             else:
                 config["pid_type"] = VALID_PID_TYPES[0]
+
+        if _fix_invalid:
+            self._fix_tcgen05_cluster_m2_search_config(config)
 
         if self.supports_config_key("num_sm_multiplier"):
             # Validate num_sm_multiplier is a power of two in range
