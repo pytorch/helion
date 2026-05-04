@@ -1814,6 +1814,34 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         result = add(*args)
         torch.testing.assert_close(result, sum(args))
 
+    def test_env_autotune_effort_none_ignores_force_autotune(self):
+        autotuner_fn = Mock(
+            side_effect=AssertionError("autotuner should not run with effort=none")
+        )
+
+        with patch.dict(
+            os.environ,
+            {
+                "HELION_AUTOTUNE_EFFORT": "none",
+                "HELION_FORCE_AUTOTUNE": "1",
+            },
+        ):
+
+            @helion.kernel(autotuner_fn=autotuner_fn)
+            def add(a, b):
+                out = torch.empty_like(a)
+                for tile in hl.tile(out.size()):
+                    out[tile] = a[tile] + b[tile]
+                return out
+
+        args = (
+            torch.randn([8], device=DEVICE),
+            torch.randn([8], device=DEVICE),
+        )
+        result = add(*args)
+        torch.testing.assert_close(result, sum(args))
+        autotuner_fn.assert_not_called()
+
     def test_autotune_effort_quick(self):
         """Test that quick effort profile uses correct default values."""
         # Get the quick profile defaults

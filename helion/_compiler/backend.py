@@ -580,7 +580,11 @@ class Backend(abc.ABC):
         if not self.supports_precompile():
             bound_kernel.settings.autotune_precompile = None
 
-        if not force and bound_kernel.kernel.configs:
+        if bound_kernel.settings.autotune_effort == "none" and (
+            force or not bound_kernel.kernel.configs
+        ):
+            config = bound_kernel.config_spec.default_config()
+        elif not force and bound_kernel.kernel.configs:
             if len(bound_kernel.kernel.configs) == 1:
                 (config,) = bound_kernel.kernel.configs
             else:
