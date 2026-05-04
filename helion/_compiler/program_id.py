@@ -1496,8 +1496,10 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             )
 
         setup: list[ast.stmt] = []
-        # Fully role-local CtaGroup.TWO uses one scheduler per role and does
-        # not consume the shared work-tile SMEM handoff.
+        # Fully role-local CtaGroup.TWO does not consume the shared work-tile
+        # SMEM handoff. Validated direct-grid CtaGroup.TWO also skips the
+        # per-role StaticPersistentTileScheduler because grid.z already names
+        # the one logical work tile this CTA cluster owns.
         if not omit_shared_loop:
             setup.extend(self._build_tcgen05_persistent_prelude(layout))
         setup.extend(hoisted_setup)
@@ -1509,6 +1511,7 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                         layout,
                         partition,
                         build_shared_tile_body=False,
+                        use_direct_grid=use_validated_two_cta_role_local_body,
                     )
                 )
             else:
@@ -2138,6 +2141,106 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             orelse=[],
         )
 
+    def _direct_grid_work_tile_coord_stmts(
+        self,
+        device_function: DeviceFunction,
+        layout: _Tcgen05PersistentLayout,
+        scheduler_var_prefix: str,
+    ) -> tuple[list[ast.stmt], list[str]]:
+        """Bind scheduler tile coordinates directly from the launch grid.
+
+        Validated role-local CtaGroup.TWO launches one CTA cluster per logical
+        output tile. The scheduler work-cluster index is therefore exactly
+        ``block_idx.z`` and does not need a ``StaticPersistentTileScheduler``.
+        The M coordinate is still expressed in scheduler CTA slots, so the
+        local CTA rank is folded into coordinate 0 and the existing
+        ``virtual_pid`` collapse maps both peer CTAs back to one logical tile.
+        """
+        assert layout.cluster_m > 1
+        dims = self._tcgen05_output_tile_dims_expr(is_device=True)
+        work_tile_linear = device_function.new_var(
+            f"{scheduler_var_prefix}_work_tile_linear"
+        )
+        cta_rank = device_function.new_var(f"{scheduler_var_prefix}_cta_rank")
+        stmts: list[ast.stmt] = [
+            statement_from_string(f"{work_tile_linear} = cute.arch.block_idx()[2]"),
+            statement_from_string(
+                f"{cta_rank} = "
+                "cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())"
+            ),
+        ]
+        remainder = work_tile_linear
+        logical_coords: list[str] = []
+        for i in range(len(self.pid_info)):
+            coord = device_function.new_var(f"{scheduler_var_prefix}_work_tile_idx_{i}")
+            logical_coords.append(coord)
+            if i + 1 < len(self.pid_info):
+                dim = dims[i]
+                stmts.append(
+                    statement_from_string(f"{coord} = ({remainder}) % ({dim})")
+                )
+                next_remainder = device_function.new_var(
+                    f"{scheduler_var_prefix}_work_tile_remainder_{i}"
+                )
+                stmts.append(
+                    statement_from_string(
+                        f"{next_remainder} = ({remainder}) // ({dim})"
+                    )
+                )
+                remainder = next_remainder
+            else:
+                stmts.append(statement_from_string(f"{coord} = {remainder}"))
+
+        coord_terms = list(logical_coords)
+        coord_terms[0] = (
+            f"{logical_coords[0]} * cutlass.Int32({layout.cluster_m}) + {cta_rank}"
+        )
+        return stmts, coord_terms
+
+    def _build_role_local_direct_grid_body(
+        self,
+        device_function: DeviceFunction,
+        layout: _Tcgen05PersistentLayout,
+        role_block: Tcgen05PersistentProgramIDs._PersistentRoleBlock,
+        scheduler_var_prefix: str,
+        dependency_stmts: list[ast.stmt] | None = None,
+    ) -> ast.stmt:
+        """Build one direct-grid role body without a persistent scheduler loop."""
+        assert role_block.role_predicate is not None, (
+            "_build_role_local_direct_grid_body requires a non-shared role block"
+        )
+        prelude, coord_terms = self._direct_grid_work_tile_coord_stmts(
+            device_function, layout, scheduler_var_prefix
+        )
+        linear_pid_expr = self._tcgen05_linear_virtual_pid_from_coords_expr(coord_terms)
+
+        body: list[ast.stmt] = [
+            *prelude,
+            statement_from_string(f"{self.virtual_pid_var} = {linear_pid_expr}"),
+        ]
+        if dependency_stmts is not None:
+            body.extend(dependency_stmts)
+        body.extend(role_block.stmts)
+
+        if (
+            role_block.role_predicate == self._tcgen05_epi_role_predicate()
+            and device_function.cute_tcgen05_epi_role_tile_counter_var is not None
+        ):
+            body.insert(
+                len(prelude),
+                statement_from_string(
+                    f"{device_function.cute_tcgen05_epi_role_tile_counter_var} = "
+                    "cutlass.Int32(0)"
+                ),
+            )
+
+        return create(
+            ast.If,
+            test=expr_from_string(role_block.role_predicate),
+            body=body,
+            orelse=[],
+        )
+
     def _role_local_dependency_stmts(
         self, shared_body: list[ast.stmt], role_stmts: list[ast.stmt]
     ) -> list[ast.stmt]:
@@ -2344,6 +2447,7 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         partition: Tcgen05PersistentProgramIDs._PartitionedRoleBody,
         *,
         build_shared_tile_body: bool = True,
+        use_direct_grid: bool = False,
     ) -> tuple[list[ast.stmt], list[ast.stmt]]:
         """Build the per-tile body in role-local-while form.
 
@@ -2353,7 +2457,7 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
           -- one per unique ``role_predicate`` in
           ``partition.role_blocks_extracted``. Multiple extracted role
           blocks sharing the same predicate are merged into a single
-          role-local loop with their statements concatenated in the
+          role-local loop/body with their statements concatenated in the
           order they appear in the source body, so per-tile ordering
           across the role's statements is preserved (otherwise tile 0's
           first chunk would run for every tile before tile 0's second
@@ -2371,14 +2475,16 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
 
         Caller wires both into the persistent kernel as siblings of
         each other inside the same setup list when the residual shared loop
-        is needed. Each role-local ``while`` runs only on its predicated
-        warps.
+        is needed. Each role-local ``while`` or direct-grid body runs only on
+        its predicated warps.
 
         **Current limitation.** The TMA-load, MMA-exec, and TMA-store
         epilogue roles are extracted today. Single-root static full-tile
         multi-tile correctness is validated for ``cluster_m == 1`` and for
         role-local CtaGroup.TWO ``cluster_m == 2`` up to the validated K-tile
-        cap, launched with one scheduler work cluster per logical tile. Partial
+        cap, launched with one scheduler work cluster per logical tile. The
+        validated direct-grid path can pass ``use_direct_grid=True`` to bind
+        work-tile coordinates directly from ``block_idx.z``. Partial
         fallback shapes, CtaGroup.TWO shapes above the K-tile cap, and
         multi-root ForEach kernels remain guarded for runtime execution, and
         autotune keeps cluster_m=2 out of the search until the G3 ownership
@@ -2429,15 +2535,20 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             merged_block = self._PersistentRoleBlock(
                 role_predicate=predicate, stmts=stmts
             )
+            dependency_stmts = self._role_local_dependency_stmts(
+                partition.shared_body_extracted, stmts
+            )
             role_local_whiles.append(
-                self._build_role_local_while(
+                (
+                    self._build_role_local_direct_grid_body
+                    if use_direct_grid
+                    else self._build_role_local_while
+                )(
                     device_function,
                     layout,
                     merged_block,
                     scheduler_var_prefix=f"tcgen05_role_local_{i}",
-                    dependency_stmts=self._role_local_dependency_stmts(
-                        partition.shared_body_extracted, stmts
-                    ),
+                    dependency_stmts=dependency_stmts,
                 )
             )
         return role_local_whiles, shared_tile_body
