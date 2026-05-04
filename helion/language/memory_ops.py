@@ -1593,6 +1593,13 @@ def _codegen_cute_store_tcgen05_tile(
                 indent="    ",
             )
         )
+    if tcgen05_value.is_two_cta:
+        # PDL parity with Quack/CUTLASS: after all MMAs are issued, hint
+        # dependent kernels before this role starts the final acc drain.
+        post_loop_lines.append(
+            f"if {tcgen05_value.exec_active}:\n"
+            "    cute.arch.griddepcontrol_launch_dependents()"
+        )
     post_loop_lines.extend(
         [
             (

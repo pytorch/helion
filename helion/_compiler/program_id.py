@@ -2049,20 +2049,30 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         sched_var = device_function.new_var(f"{scheduler_var_prefix}_tile_sched")
         work_tile_var = device_function.new_var(f"{scheduler_var_prefix}_work_tile")
 
-        prelude: list[ast.stmt] = [
-            statement_from_string(
-                f"{sched_params_var} = cutlass.utils.PersistentTileSchedulerParams("
-                f"{self._tcgen05_num_tiles_expr(is_device=True)}, "
-                f"({layout.cluster_m}, 1, 1))"
-            ),
-            statement_from_string(
-                f"{sched_var} = cutlass.utils.StaticPersistentTileScheduler.create("
-                f"{sched_params_var}, cute.arch.block_idx(), cute.arch.grid_dim())"
-            ),
-            statement_from_string(
-                f"{work_tile_var} = {sched_var}.initial_work_tile_info()"
-            ),
-        ]
+        prelude: list[ast.stmt] = []
+        if (
+            self._tcgen05_is_two_cta()
+            and role_block.role_predicate == self._tcgen05_tma_load_role_predicate()
+        ):
+            # PDL parity with Quack/CUTLASS: TMA producers wait before
+            # touching scheduler state or issuing global-memory TMA work.
+            prelude.append(statement_from_string("cute.arch.griddepcontrol_wait()"))
+        prelude.extend(
+            [
+                statement_from_string(
+                    f"{sched_params_var} = cutlass.utils.PersistentTileSchedulerParams("
+                    f"{self._tcgen05_num_tiles_expr(is_device=True)}, "
+                    f"({layout.cluster_m}, 1, 1))"
+                ),
+                statement_from_string(
+                    f"{sched_var} = cutlass.utils.StaticPersistentTileScheduler.create("
+                    f"{sched_params_var}, cute.arch.block_idx(), cute.arch.grid_dim())"
+                ),
+                statement_from_string(
+                    f"{work_tile_var} = {sched_var}.initial_work_tile_info()"
+                ),
+            ]
+        )
         tile_counter_var = None
         if (
             role_block.role_predicate == self._tcgen05_epi_role_predicate()
