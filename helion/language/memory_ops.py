@@ -172,10 +172,15 @@ def _record_pad_info(
     tensor: torch.Tensor,
     tensor_dim: int,
     block_id: int,
+    extra_pad: int = 0,
 ) -> None:
     """Record that a tensor dimension uses pl.ds() and may need host-side padding.
 
-    Note: stores one block_id per (tensor, dim).  If two inner loops tile the
+    *extra_pad* accounts for non-zero loop begins: 0 when the loop starts
+    at offset 0, ``begin % block_size`` for a constant begin, or
+    ``block_size - 1`` for a data-dependent begin.
+
+    Note: stores one entry per (tensor, dim).  If two inner loops tile the
     same dim with different block_ids, the last one wins.  This is fine when
     both loops use the same block size (the common case).
     """
@@ -183,7 +188,7 @@ def _record_pad_info(
     tensor_id = id(tensor)
     if tensor_id not in pad_info:
         pad_info[tensor_id] = {}
-    pad_info[tensor_id][tensor_dim] = block_id
+    pad_info[tensor_id][tensor_dim] = (block_id, extra_pad)
 
 
 def _maybe_get_symbol_origin(idx: object) -> SymbolOrigin | None:

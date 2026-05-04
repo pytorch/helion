@@ -2015,6 +2015,52 @@ class TestPallas(TestCase):
         ref = torch.stack([data[: lengths[i]].sum() for i in range(B)])
         torch.testing.assert_close(result, ref, rtol=1e-4, atol=1e-4)
 
+    def test_non_zero_tile_begin(self) -> None:
+        """pl.ds() reads from a non-zero begin can overshoot the tensor boundary."""
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def sum_with_constant_offset(
+            data: torch.Tensor, offsets: torch.Tensor
+        ) -> torch.Tensor:
+            B = offsets.size(0) - 1
+            out = torch.zeros([B], dtype=data.dtype, device=data.device)
+            for seg in hl.grid(B):
+                acc = hl.zeros([1], dtype=data.dtype)
+                for tile in hl.tile(3, 128, block_size=16):
+                    acc = acc + data[tile, :, :].sum(dim=0).sum(dim=0).sum(
+                        dim=0
+                    ).unsqueeze(0)
+                out[seg] = acc.squeeze(0)
+            return out
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def sum_with_dynamic_offset(
+            data: torch.Tensor, offsets: torch.Tensor
+        ) -> torch.Tensor:
+            B = offsets.size(0) - 1
+            out = torch.zeros([B], dtype=data.dtype, device=data.device)
+            for seg in hl.grid(B):
+                start = offsets[seg]
+                end = offsets[seg + 1]
+                acc = hl.zeros([1], dtype=data.dtype)
+                for tile in hl.tile(start, end, block_size=16):
+                    acc = acc + data[tile, :, :].sum(dim=0).sum(dim=0).sum(
+                        dim=0
+                    ).unsqueeze(0)
+                out[seg] = acc.squeeze(0)
+            return out
+
+        N, A, B = 128, 8, 256
+        data = torch.randn(N, A, B, device=DEVICE, dtype=torch.float32)
+        offsets = torch.tensor([3, 128], device=DEVICE, dtype=torch.int32)
+        ref = data[3:128].sum().unsqueeze(0)
+
+        _code1, result1 = code_and_output(sum_with_constant_offset, (data, offsets))
+        torch.testing.assert_close(result1, ref, rtol=1e-3, atol=1e-3)
+
+        _code2, result2 = code_and_output(sum_with_dynamic_offset, (data, offsets))
+        torch.testing.assert_close(result2, ref, rtol=1e-3, atol=1e-3)
+
 
 @skipUnlessPallas("JAX/Pallas TPU not available")
 class TestPallasIndirectGather(TestCase):
