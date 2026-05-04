@@ -144,6 +144,8 @@ def _scalar_symint_can_codegen_as_scalar(k: torch.SymInt) -> bool:
         if isinstance(origin, BlockSizeOrigin):
             return False
         if isinstance(origin, GridOrigin):
+            # Exact GridOrigin is used for hl.grid() variables and already
+            # represents the loop offset; subclasses may need different math.
             if type(origin) is GridOrigin or isinstance(origin, TileBeginOrigin):
                 continue
             return False
