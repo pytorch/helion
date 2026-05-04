@@ -1354,6 +1354,9 @@ def _emit_mma_pipeline(
     tcgen05_use_role_local_mma_exec = tcgen05_use_role_local_tma_producer
     # Keep a distinct name so future epi-role gating changes are localized.
     tcgen05_use_role_local_epi = tcgen05_use_role_local_tma_producer
+    # This is the kernel-wide contract ProgramID consumes. Today the TMA
+    # producer flag is the master predicate for all three role-local loops.
+    tcgen05_use_role_local_persistent_body = tcgen05_use_role_local_tma_producer
     # Flat kernels process one output tile per CTA, so the c_pipeline stage is
     # just the subtile index. Persistent kernels use a role-local tile counter
     # to rotate c_pipeline stages across work tiles. Keep cluster_m=2 on the
@@ -1593,8 +1596,10 @@ def _emit_mma_pipeline(
             bm=bm,
             bn=bn,
             bk=bk,
+            k_tile_count=(k_total_size + bk - 1) // bk,
             cluster_m=tcgen05_cluster_m,
             is_two_cta=tcgen05_is_two_cta,
+            uses_role_local_persistent_body=tcgen05_use_role_local_persistent_body,
             cta_thread_count=tcgen05_cta_thread_count,
             physical_m_threads=mma_physical_m_threads,
             acc_stage_count=tcgen05_acc_stage_count_value,

@@ -266,8 +266,10 @@ class CuteTcgen05MatmulPlan:
     bm: int
     bn: int
     bk: int
+    k_tile_count: int
     cluster_m: int
     is_two_cta: bool
+    uses_role_local_persistent_body: bool
     cta_thread_count: int
     physical_m_threads: int
     acc_stage_count: int
