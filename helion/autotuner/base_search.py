@@ -892,26 +892,36 @@ class PopulationBasedSearch(BaseSearch):
         repeat = min(1000, max(3, base_repeat))
         if (capstr := os.getenv("HELION_CAP_REBENCHMARK_REPEAT")) is not None:
             repeat = min(repeat, int(capstr))
-        if len(self.benchmark_provider.mutated_arg_indices) > 0:
-            bench_args = _clone_args(
-                self.args,
-                self.kernel.env.process_group_name,
-                idx_to_clone=self.benchmark_provider.mutated_arg_indices,
-            )
-        else:
-            bench_args = self.args
-        iterator = [functools.partial(m.fn, *bench_args) for m in members]
-        _backend = getattr(getattr(self, "config_spec", None), "backend", None)
-        _ib = (
-            _backend.get_interleaved_bench() if _backend is not None else None
-        ) or interleaved_bench
-        bench_fn: Callable[..., list[float]] = (
-            self.settings.autotune_benchmark_fn or _ib
+        provider_timings = self.benchmark_provider.rebenchmark(
+            [m.fn for m in members],
+            repeat=repeat,
+            desc=desc,
         )
-        if self.settings.autotune_progress_bar:
-            new_timings = bench_fn(iterator, repeat=repeat, desc=desc)
+        if provider_timings is None:
+            if len(self.benchmark_provider.mutated_arg_indices) > 0:
+                bench_args = _clone_args(
+                    self.args,
+                    self.kernel.env.process_group_name,
+                    idx_to_clone=self.benchmark_provider.mutated_arg_indices,
+                )
+            else:
+                bench_args = self.args
+            iterator = [functools.partial(m.fn, *bench_args) for m in members]
+            _backend = getattr(getattr(self, "config_spec", None), "backend", None)
+            _ib = (
+                _backend.get_interleaved_bench() if _backend is not None else None
+            ) or interleaved_bench
+            bench_fn: Callable[..., list[float]] = (
+                self.settings.autotune_benchmark_fn or _ib
+            )
+            if self.settings.autotune_progress_bar:
+                new_timings = bench_fn(iterator, repeat=repeat, desc=desc)
+            else:
+                new_timings = bench_fn(iterator, repeat=repeat)
+        elif not provider_timings:
+            return
         else:
-            new_timings = bench_fn(iterator, repeat=repeat)
+            new_timings = provider_timings
         new_timings = sync_object(
             new_timings, process_group_name=self.kernel.env.process_group_name
         )
