@@ -105,6 +105,11 @@ def _env_get_optional_float(var_name: str) -> float | None:
         raise ValueError(f"{var_name} must be a float, got {value!r}") from err
 
 
+def _env_get_float(var_name: str, default: float) -> float:
+    result = _env_get_optional_float(var_name)
+    return default if result is None else result
+
+
 def _env_get_bool(var_name: str, default: bool) -> bool:
     value = os.environ.get(var_name)
     if value is None or (value := value.strip()) == "":
