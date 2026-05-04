@@ -138,6 +138,8 @@ def _scalar_symint_can_codegen_as_scalar(k: torch.SymInt) -> bool:
 
     expr_to_origin = HostFunction.current().expr_to_origin
     for symbol in expr.free_symbols:
+        if not isinstance(symbol, sympy.Symbol):
+            return False
         # Every symbol must be known to DeviceFunction.sympy_expr(), otherwise
         # tensor descriptor lowering would fail when printing the scalar offset.
         origin_info = expr_to_origin.get(symbol)
