@@ -90,10 +90,11 @@ def _softmax_shapes() -> list[tuple[str, tuple[Any, ...]]]:
 
 
 def _welford_shapes() -> list[tuple[str, tuple[Any, ...]]]:
-    # 1st canonical; 2nd is 2x the rows (same D). welford's autotune is
-    # expensive (~16 min/shape at full effort), and (524288, 4096) blew
-    # through the 60-min cap last run — back off to (524288, 1024).
-    configs = [(262144, 1024), (524288, 1024), (262144, 1536), (262144, 2048)]
+    # 1st canonical; 2nd is 2x rows but half D (vs 1st) so total memory
+    # traffic stays similar. welford's autotune is expensive (~16 min/shape
+    # at full effort), so (524288, 4096) and (524288, 1024) both timed out
+    # past the 60-min cap in earlier runs — back off to (524288, 512).
+    configs = [(262144, 1024), (524288, 512), (262144, 1536), (262144, 2048)]
     return [
         (
             f"[{s},{d}]",
