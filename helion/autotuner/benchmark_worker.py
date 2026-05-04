@@ -7,10 +7,14 @@ import ctypes
 import ctypes.util
 import multiprocessing as mp
 import os
+import queue
 import signal
 import sys
+import threading
+import time
 from typing import TYPE_CHECKING
 from typing import Callable
+from typing import NamedTuple
 from typing import TypeVar
 
 from .logger import _UNRECOVERABLE_RUNTIME_ERROR_RE
@@ -19,6 +23,12 @@ if TYPE_CHECKING:
     from multiprocessing.connection import Connection
 
 _T = TypeVar("_T")
+
+
+class WorkerPoolResult(NamedTuple):
+    worker_index: int
+    elapsed: float
+    result: object
 
 
 def _set_pdeathsig() -> None:
@@ -146,3 +156,97 @@ class BenchmarkWorker:
                 connection.close()
         self._process = None
         self._parent_connection = None
+
+
+class BenchmarkWorkerPool:
+    """Pool of long-lived ``BenchmarkWorker`` processes."""
+
+    def __init__(self, num_workers: int) -> None:
+        if num_workers < 1:
+            raise ValueError(f"num_workers must be >= 1, got {num_workers}")
+        self.workers = [BenchmarkWorker(device=None) for _ in range(num_workers)]
+
+    @property
+    def num_workers(self) -> int:
+        return len(self.workers)
+
+    def run_job_on_worker(
+        self, worker_index: int, job: Callable[[], _T], timeout: float
+    ) -> _T:
+        return self.workers[worker_index % self.num_workers].run(job, timeout=timeout)
+
+    def run_jobs(
+        self, jobs: list[Callable[[], object]], timeout: float
+    ) -> list[WorkerPoolResult]:
+        """Run jobs across the worker pool while preserving input order.
+
+        Each worker thread owns one worker and pulls job indices from a shared
+        queue, so slow jobs do not block unrelated workers. Worker exceptions
+        are captured in ``WorkerPoolResult.result`` for the corresponding job.
+        """
+        if not jobs:
+            return []
+        active_workers = min(self.num_workers, len(jobs))
+        result_slots: list[WorkerPoolResult | None] = [None] * len(jobs)
+        work_queue: queue.Queue[int] = queue.Queue()
+        for i in range(len(jobs)):
+            work_queue.put(i)
+
+        def process_queue(worker_idx: int) -> None:
+            worker = self.workers[worker_idx]
+            while True:
+                try:
+                    i = work_queue.get_nowait()
+                except queue.Empty:
+                    return
+                start = time.perf_counter()
+                job_result = _run_job_capture_error(worker, jobs[i], timeout)
+                result_slots[i] = WorkerPoolResult(
+                    worker_index=worker_idx,
+                    elapsed=time.perf_counter() - start,
+                    result=job_result,
+                )
+
+        _run_worker_threads(process_queue, active_workers)
+        ordered_results: list[WorkerPoolResult] = []
+        for slot in result_slots:
+            assert slot is not None
+            ordered_results.append(slot)
+        return ordered_results
+
+    def start_all(self, limit: int | None = None) -> None:
+        """Start workers before threaded dispatch so their lifetime is not
+        tied to short-lived dispatch threads."""
+        if limit is None:
+            limit = self.num_workers
+        for worker in self.workers[:limit]:
+            if not worker.alive():
+                worker._start()
+
+    def shutdown(self) -> None:
+        for w in self.workers:
+            with contextlib.suppress(Exception):
+                w.shutdown()
+
+
+def _run_job_capture_error(
+    worker: BenchmarkWorker, job: Callable[[], object], timeout: float
+) -> object:
+    try:
+        return worker.run(job, timeout=timeout)
+    except BaseException as e:
+        e.__traceback__ = None
+        return e
+
+
+def _run_worker_threads(target: Callable[[int], None], n: int) -> None:
+    if n == 1:
+        target(0)
+        return
+    threads = [
+        threading.Thread(target=target, args=(i,), daemon=True) for i in range(n)
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
