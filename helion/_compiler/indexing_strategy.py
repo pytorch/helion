@@ -459,7 +459,9 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
         if not (2 <= fake_tensor.ndim <= 5):
             return False
 
-        # 2) Exactly 1 dimension should have stride==1
+        # 2) Exactly one dimension must be contiguous. Triton may permute the
+        # descriptor so this dimension is last, but support checks are easier
+        # to express in the original tensor dimension order.
         env = CompileEnvironment.current()
         stride_one_dim = None
         element_size = fake_tensor.element_size()
@@ -486,6 +488,7 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
                 stride_one_dim = dim
             else:
                 # 3) All other dimensions should have 16-byte aligned strides
+                # so the descriptor remains valid for the whole tensor layout.
                 byte_stride = stride * element_size
                 if byte_stride % 16 != 0:
                     return False
@@ -516,8 +519,10 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
             # generated stores stay aligned and avoid misaligned-address errors.
             return block_size * element_size >= 16
 
-        # 4) Validate subscript forms and collect the block_shape that will be
-        # passed to tl.make_tensor_descriptor.
+        # 4) Validate subscript forms and collect the descriptor block_shape in
+        # tensor-dimension order. Scalar indices become block_shape=1, which is
+        # fine for batch/head dimensions but invalid if it lands on the
+        # contiguous dimension checked below.
         descriptor_block_shape: list[int | torch.SymInt] = []
         sizes = fake_tensor.size()
         strides = fake_tensor.stride()
@@ -528,15 +533,18 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
                 continue
             size, stride = size_stride.popleft()
             if isinstance(k, int):
+                # Python integer indexing collapses this tensor dimension to a
+                # scalar offset, so the descriptor block in that dimension is 1.
                 descriptor_block_shape.append(1)
             elif isinstance(k, slice):
                 # Slices with steps are not supported in tensor descriptor mode
                 if k.step is not None and k.step != 1:
                     return False
                 block_size = env.allocate_reduction_dimension(size).from_config(config)
-                descriptor_block_shape.append(block_size)
                 if not valid_block_size(block_size, stride, i):
                     return False
+                assert isinstance(block_size, int)
+                descriptor_block_shape.append(block_size)
             elif (
                 tile_info := _get_tile_with_offset_info(k, state.fx_node, i)
             ) is not None:
@@ -546,9 +554,10 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
                     if tile_info.block_size is not None
                     else env.block_sizes[tile_info.block_id].from_config(config)
                 )
-                descriptor_block_shape.append(block_size)
                 if not valid_block_size(block_size, stride, i):
                     return False
+                assert isinstance(block_size, int)
+                descriptor_block_shape.append(block_size)
             elif isinstance(k, torch.SymInt):
                 symbol = _symint_expr(k)
                 origin = None
@@ -558,16 +567,25 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
                     block_size = env.block_sizes[origin.origin.block_id].from_config(
                         config
                     )
-                    descriptor_block_shape.append(block_size)
                     if not valid_block_size(block_size, stride, i):
                         return False
+                    assert isinstance(block_size, int)
+                    descriptor_block_shape.append(block_size)
                 else:
+                    # Lowerable scalar SymInt offsets also collapse the tensor
+                    # dimension to block_shape=1. The final stride-one check
+                    # below decides whether that scalar dimension is legal for
+                    # tensor descriptors.
                     descriptor_block_shape.append(1)
                     if not _scalar_symint_can_codegen_as_scalar(k):
                         return False
 
         if len(descriptor_block_shape) != fake_tensor.ndim:
             return False
+        # Triton requires the descriptor's contiguous dimension to cover at
+        # least 16 bytes. This catches cases like g[batch, tile_t, head], where
+        # scalar head indexing would emit block_shape=[1, block_t, 1] and the
+        # stride-one dimension would move only one element.
         return valid_block_size(
             descriptor_block_shape[stride_one_dim],
             fake_tensor.stride(stride_one_dim),
