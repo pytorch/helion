@@ -474,6 +474,18 @@ class TestTensorDescriptor(RefEagerTestBase, TestCase):
         expected = x + 1.0
         torch.testing.assert_close(result, expected)
 
+        # Repeat with a 2-byte dtype to ensure the byte-size check scales with
+        # dtype, not just element count. block_size=4 gives 4 * 2 = 8 bytes.
+        x_half = torch.randn([8, 16], device=DEVICE, dtype=HALF_DTYPE)
+        code_half, result_half = code_and_output(
+            kernel_small_block,
+            (x_half,),
+            indexing="tensor_descriptor",
+            block_sizes=[4, 4],
+        )
+        self.assertNotIn(get_tensor_descriptor_fn_name(), code_half)
+        torch.testing.assert_close(result_half, x_half + 1.0)
+
     @skipUnlessTensorDescriptor("Tensor descriptor support is required")
     def test_dynamic_shape_stride_alignment(self):
         """Test that aligned and unaligned strides produce correct results with dynamic shapes.
@@ -570,7 +582,22 @@ class TestTensorDescriptor(RefEagerTestBase, TestCase):
                     out[row, tile_n] = x[row, tile_n]
             return out
 
+        @helion.kernel(
+            config=helion.Config(
+                block_sizes=[64, 64],
+                indexing="tensor_descriptor",
+            ),
+            static_shapes=True,
+        )
+        def scalar_noncontiguous_dims(x: torch.Tensor) -> torch.Tensor:
+            _, _, t, d = x.size()
+            out = torch.empty([t, d], device=x.device, dtype=x.dtype)
+            for tile_t, tile_d in hl.tile([t, d]):
+                out[tile_t, tile_d] = x[0, 0, tile_t, tile_d]
+            return out
+
         x = torch.randn(8, 128, device=DEVICE, dtype=torch.float32)
+        x4d = torch.randn(2, 4, 128, 64, device=DEVICE, dtype=torch.float32)
 
         code, result = code_and_output(gather_rows, (x, 2))
         expected = torch.stack([x[3], x[2], x[5], x[1]])
@@ -583,6 +610,10 @@ class TestTensorDescriptor(RefEagerTestBase, TestCase):
 
         code, result = code_and_output(copy_grid_rows, (x,))
         torch.testing.assert_close(result, x[:4])
+        self.assert_uses_tensor_descriptors(code)
+
+        code, result = code_and_output(scalar_noncontiguous_dims, (x4d,))
+        torch.testing.assert_close(result, x4d[0, 0])
         self.assert_uses_tensor_descriptors(code)
 
     @skipUnlessTensorDescriptor("Tensor descriptor support is required")
@@ -653,7 +684,22 @@ class TestTensorDescriptor(RefEagerTestBase, TestCase):
                 out[tile_b, tile_n] = x[idx, tile_n]
             return out
 
+        @helion.kernel(
+            config=helion.Config(
+                block_sizes=[64],
+                indexing="tensor_descriptor",
+            ),
+            static_shapes=True,
+        )
+        def scalar_contiguous_dim(g: torch.Tensor) -> torch.Tensor:
+            _, t, _ = g.size()
+            out = torch.empty([t], device=g.device, dtype=g.dtype)
+            for tile_t in hl.tile(t):
+                out[tile_t] = g[0, tile_t, 0]
+            return out
+
         x = torch.randn(8, 128, device=DEVICE, dtype=torch.float32)
+        g = torch.randn(2, 128, 80, device=DEVICE, dtype=torch.float32)
 
         code, result = code_and_output(read_tile_end, (x,))
         torch.testing.assert_close(result, x[1:5])
@@ -671,6 +717,10 @@ class TestTensorDescriptor(RefEagerTestBase, TestCase):
         code, result = code_and_output(read_indirect_rows, (x, indices))
         torch.testing.assert_close(result, x[indices])
         self.assert_tensor_descriptor_not_used_for(code, "x")
+
+        code, result = code_and_output(scalar_contiguous_dim, (g,))
+        torch.testing.assert_close(result, g[0, :, 0])
+        self.assert_tensor_descriptor_not_used_for(code, "g")
 
 
 if __name__ == "__main__":

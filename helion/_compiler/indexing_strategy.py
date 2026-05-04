@@ -461,7 +461,7 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
 
         # 2) Exactly 1 dimension should have stride==1
         env = CompileEnvironment.current()
-        stride_one_count = 0
+        stride_one_dim = None
         element_size = fake_tensor.element_size()
         for dim in range(fake_tensor.ndim):
             raw_stride = fake_tensor.stride(dim)
@@ -475,17 +475,21 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
                 # it holds for all shapes in the specialization bucket.
                 hint = env.size_hint(raw_stride)
                 if hint == 1:
-                    stride_one_count += 1
+                    if stride_one_dim is not None:
+                        return False
+                    stride_one_dim = dim
                     continue
                 return False
             if stride == 1:
-                stride_one_count += 1
+                if stride_one_dim is not None:
+                    return False
+                stride_one_dim = dim
             else:
                 # 3) All other dimensions should have 16-byte aligned strides
                 byte_stride = stride * element_size
                 if byte_stride % 16 != 0:
                     return False
-        if stride_one_count != 1:
+        if stride_one_dim is None:
             # There should be exactly one dimension with stride==1
             return False
 
@@ -512,7 +516,9 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
             # generated stores stay aligned and avoid misaligned-address errors.
             return block_size * element_size >= 16
 
-        # 4) Check minimum 16 bytes in each dimension
+        # 4) Validate subscript forms and collect the block_shape that will be
+        # passed to tl.make_tensor_descriptor.
+        descriptor_block_shape: list[int | torch.SymInt] = []
         sizes = fake_tensor.size()
         strides = fake_tensor.stride()
         size_stride = collections.deque(zip(sizes, strides, strict=True))
@@ -521,11 +527,14 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
             if k is None:
                 continue
             size, stride = size_stride.popleft()
-            if isinstance(k, slice):
+            if isinstance(k, int):
+                descriptor_block_shape.append(1)
+            elif isinstance(k, slice):
                 # Slices with steps are not supported in tensor descriptor mode
                 if k.step is not None and k.step != 1:
                     return False
                 block_size = env.allocate_reduction_dimension(size).from_config(config)
+                descriptor_block_shape.append(block_size)
                 if not valid_block_size(block_size, stride, i):
                     return False
             elif (
@@ -537,6 +546,7 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
                     if tile_info.block_size is not None
                     else env.block_sizes[tile_info.block_id].from_config(config)
                 )
+                descriptor_block_shape.append(block_size)
                 if not valid_block_size(block_size, stride, i):
                     return False
             elif isinstance(k, torch.SymInt):
@@ -548,12 +558,21 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
                     block_size = env.block_sizes[origin.origin.block_id].from_config(
                         config
                     )
+                    descriptor_block_shape.append(block_size)
                     if not valid_block_size(block_size, stride, i):
                         return False
-                elif not _scalar_symint_can_codegen_as_scalar(k):
-                    return False
+                else:
+                    descriptor_block_shape.append(1)
+                    if not _scalar_symint_can_codegen_as_scalar(k):
+                        return False
 
-        return True
+        if len(descriptor_block_shape) != fake_tensor.ndim:
+            return False
+        return valid_block_size(
+            descriptor_block_shape[stride_one_dim],
+            fake_tensor.stride(stride_one_dim),
+            stride_one_dim,
+        )
 
     def codegen_load(
         self,
