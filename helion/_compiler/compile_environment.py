@@ -157,9 +157,11 @@ class CompileEnvironment:
         self.config_spec = ConfigSpec(
             backend=self.backend,
         )
+        # TODO(hinriksnaer): tracing state, not env config. move to CompilerState?
         self.kernel_tensor_sizes: dict[tuple[sympy.Expr, ...], int] = (
             collections.Counter()
         )
+        # TODO(hinriksnaer): tracing state, not env config. move to CompilerState?
         self.kernel_min_element_bits: int = 32  # smallest dtype bits across all tensors
         self.specialized_vars: set[sympy.Symbol] = set()
         self.specialized_strides: set[tuple[str, int]] = set()
@@ -169,6 +171,7 @@ class CompileEnvironment:
         self._foreign_symint_cache: dict[
             tuple[int, sympy.Expr], int | torch.SymInt
         ] = {}
+        # TODO(hinriksnaer): tracing state, not env config. move to CompilerState?
         self.device_load_count = (
             0  # Track number of loads in all device code for eviction policy tuning
         )
@@ -199,6 +202,7 @@ class CompileEnvironment:
                 )
             self.config_spec.max_num_sm_multiplier = newmax
 
+        # TODO(hinriksnaer): tracing flag, not env config. move to CompilerState?
         self.has_barrier: bool = False
 
     def specialize_expr(self, expr: sympy.Expr) -> sympy.Expr:

@@ -1940,6 +1940,8 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
             remove_unnecessary_tile_index(graph.graph)
             remove_unnecessary_masking(graph.graph)
 
+        # TODO(hinriksnaer): extract into a separate step? everything below
+        # is post-processing computed from the completed DeviceIR.
         from .epilogue_subtiling import has_epilogue_subtiling_candidate
 
         has_epilogue_subtile_candidate = False

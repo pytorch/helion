@@ -64,6 +64,8 @@ class SourceLocation(traceback.FrameSummary):
 
     @staticmethod
     def from_ast(node: ast.AST) -> SourceLocation:
+        # TODO(hinriksnaer): take code and column_offset as parameters
+        # to decouple from HostFunction.current()?
         from .host_function import HostFunction
 
         host_function = HostFunction.current()
