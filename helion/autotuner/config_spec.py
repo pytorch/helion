@@ -489,18 +489,28 @@ class ConfigSpec:
         bk = bk_fragment.high
         while bk >= bk_fragment.low:
             if self._tcgen05_cluster_m2_bk_is_valid(bk, constraints):
-                return helion.Config(
-                    block_sizes=[
+                seed_config: dict[str, Any] = {
+                    "block_sizes": [
                         TCGEN05_TWO_CTA_BLOCK_M,
                         TCGEN05_TWO_CTA_BLOCK_N,
                         bk,
                     ],
-                    l2_groupings=[TCGEN05_TWO_CTA_SEED_L2_GROUPING],
-                    pid_type="persistent_blocked",
-                    tcgen05_cluster_m=2,
+                    "l2_groupings": [TCGEN05_TWO_CTA_SEED_L2_GROUPING],
+                    "pid_type": "persistent_blocked",
+                    "tcgen05_cluster_m": 2,
                     # Matches the validated tcgen05 search restriction.
-                    tcgen05_num_epi_warps=4,
-                )
+                    "tcgen05_num_epi_warps": 4,
+                }
+                # Pure matmul has exactly the A/B/C indexing slots. Fused
+                # epilogues add more memory ops, so leave those seeds to the
+                # spec default rather than constructing a partial list.
+                if self.indexing.length == 3:
+                    seed_config["indexing"] = [
+                        "tensor_descriptor",
+                        "tensor_descriptor",
+                        "tensor_descriptor",
+                    ]
+                return helion.Config(**seed_config)
             bk //= 2
         return None
 
@@ -1258,6 +1268,8 @@ class ConfigSpec:
                 fields.update(self._tcgen05_optional_fragments(for_search=True))
                 if self.supports_config_key("pid_type"):
                     fields["pid_type"] = EnumFragment(self.allowed_pid_types)
+                if self.supports_config_key("indexing") and self.indexing.length > 0:
+                    fields["indexing"] = self.indexing
             if self.supports_config_key("num_threads"):
                 fields["num_threads"] = self.num_threads
             fields.update(self.user_defined_tunables)
