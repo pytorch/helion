@@ -24,6 +24,7 @@ from helion._testing import RefEagerTestDisabled
 from helion._testing import import_path
 from helion._testing import onlyBackends
 from helion._testing import skipIfXPU
+from helion.autotuner.benchmark_job import RebenchmarkJob
 from helion.autotuner.benchmark_job import _load_args
 from helion.autotuner.benchmark_pool import PoolBenchmarkManager
 from helion.autotuner.benchmark_provider import LocalBenchmarkProvider
@@ -32,9 +33,11 @@ from helion.autotuner.benchmark_worker import BenchmarkWorker
 from helion.autotuner.benchmark_worker import BenchmarkWorkerDied
 from helion.autotuner.benchmark_worker import BenchmarkWorkerPool
 from helion.autotuner.benchmark_worker import WorkerPoolResult
+from helion.autotuner.effort_profile import get_effort_profile
 from helion.autotuner.precompile_future import SerializedCompiledFunction
 from helion.autotuner.random_search import RandomSearch
 from helion.runtime.config import Config
+from helion.runtime.settings import Settings
 
 if TYPE_CHECKING:
     from helion.runtime.kernel import CompiledConfig
@@ -147,6 +150,154 @@ class TestWorkerPoolPrecompile(unittest.TestCase):
 
         self.assertIs(loaded[0], _callable_kernel_arg)
 
+    def test_subprocess_benchmark_keeps_effort_rebenchmark_threshold(self) -> None:
+        # Subprocess benchmarking should not weaken full-effort rebenchmarking.
+        settings = Settings(
+            autotune_effort="full",
+            autotune_benchmark_subprocess=True,
+        )
+
+        self.assertEqual(
+            settings.get_rebenchmark_threshold(),
+            get_effort_profile("full").rebenchmark_threshold,
+        )
+
+    def test_explicit_rebenchmark_threshold_overrides_subprocess_default(self) -> None:
+        # Explicit rebenchmark thresholds should still override profile defaults.
+        settings = Settings(
+            autotune_effort="full",
+            autotune_benchmark_subprocess=True,
+            autotune_rebenchmark_threshold=1.25,
+        )
+
+        self.assertEqual(settings.get_rebenchmark_threshold(), 1.25)
+
+    def test_pool_mode_env_value_is_supported(self) -> None:
+        # HELION_AUTOTUNE_PRECOMPILE=pool should parse into the pool mode.
+        with patch.dict(os.environ, {"HELION_AUTOTUNE_PRECOMPILE": "pool"}):
+            self.assertEqual(Settings().autotune_precompile, "pool")
+
+    def test_pool_auto_worker_cap_defaults_to_32(self) -> None:
+        # Auto-sized pools should default to a 32-worker cap.
+        with patch.dict(os.environ, {"HELION_AUTOTUNE_PRECOMPILE_WORKERS_CAP": ""}):
+            self.assertEqual(Settings().autotune_precompile_workers_cap, 32)
+
+    def test_pool_cleanup_shuts_down_worker_pool(self) -> None:
+        # Pool workers should not retain CUDA memory after one autotune finishes.
+        class FakePoolManager:
+            def __init__(self) -> None:
+                self.shutdown_called = False
+
+            def shutdown(self) -> None:
+                self.shutdown_called = True
+
+        fake_pool_manager = FakePoolManager()
+        provider = cast("Any", LocalBenchmarkProvider.__new__(LocalBenchmarkProvider))
+        provider.settings = Settings(autotune_precompile="pool")
+        provider._benchmark_worker = None
+        provider._pool_manager = fake_pool_manager
+        provider._serialized_fn_specs = {1: None}
+        provider._precompile_tmpdir = None
+        provider._precompile_args_path = "args.pt"
+
+        provider.cleanup()
+
+        self.assertTrue(fake_pool_manager.shutdown_called)
+        self.assertIsNone(provider._pool_manager)
+        self.assertEqual(provider._serialized_fn_specs, {})
+        self.assertIsNone(provider._precompile_args_path)
+
+    def test_pool_mode_implies_subprocess_benchmark(self) -> None:
+        # Pool mode should benchmark in workers even without the subprocess env flag.
+        provider = cast("Any", LocalBenchmarkProvider.__new__(LocalBenchmarkProvider))
+        provider.settings = Settings(
+            autotune_precompile="pool",
+            autotune_benchmark_subprocess=False,
+        )
+        provider.config_spec = SimpleNamespace(backend=None)
+        provider.mutated_arg_indices = []
+
+        self.assertTrue(provider._subprocess_benchmark_enabled())
+
+    def test_pool_mode_reports_disabled_worker_reason(self) -> None:
+        # Explicitly disabled pool workers should fail with an actionable reason.
+        provider = cast("Any", LocalBenchmarkProvider.__new__(LocalBenchmarkProvider))
+        provider.settings = Settings(
+            autotune_precompile="pool",
+            autotune_precompile_workers=-1,
+        )
+        provider.config_spec = SimpleNamespace(backend=None)
+        provider.mutated_arg_indices = []
+        provider._precompile_args_path = "args.pt"
+        provider._pool_size = lambda: 1
+
+        reason = provider._pool_mode_unavailable_reason()
+        self.assertIsNotNone(reason)
+        assert reason is not None
+        self.assertIn("disabled", reason)
+
+    def test_rebenchmark_uses_worker_pool(self) -> None:
+        # Full-effort rebenchmarking should run on the worker that precompiled the config.
+        class FakePoolManager:
+            def __init__(self) -> None:
+                self.worker_index: int | None = None
+                self.job: object | None = None
+                self.timeout: float | None = None
+
+            def worker_index_for_fn(self, _fn: object) -> int:
+                return 3
+
+            def run_on(
+                self,
+                worker_index: int,
+                job: object,
+                timeout: float,
+            ) -> list[float]:
+                self.worker_index = worker_index
+                self.job = job
+                self.timeout = timeout
+                return [1.0, 2.0]
+
+        class FakeLog:
+            def warning(self, *_args: object, **_kwargs: object) -> None:
+                pass
+
+            def debug(self, *_args: object, **_kwargs: object) -> None:
+                pass
+
+        def fake_fn() -> None:
+            pass
+
+        pool = FakePoolManager()
+        provider = cast("Any", LocalBenchmarkProvider.__new__(LocalBenchmarkProvider))
+        provider.settings = Settings(
+            autotune_benchmark_subprocess=True,
+            autotune_benchmark_timeout=10,
+        )
+        provider.config_spec = SimpleNamespace(backend=None)
+        provider.mutated_arg_indices = []
+        provider._precompile_args_path = "args.pt"
+        provider._pool_manager = pool
+        provider._benchmark_worker = None
+        provider._autotune_metrics = SimpleNamespace(num_compile_failures=0)
+        provider.log = FakeLog()
+        provider._serialize_fn_for_worker = lambda _fn: SerializedCompiledFunction(
+            function_name="fake_fn",
+            source_code="def fake_fn(): pass",
+            filename=None,
+            module_name=None,
+        )
+
+        result = provider.rebenchmark([fake_fn, fake_fn], repeat=7, desc="verify")
+
+        self.assertEqual(result, [1.0, 2.0])
+        self.assertEqual(pool.worker_index, 3)
+        self.assertIsInstance(pool.job, RebenchmarkJob)
+        assert isinstance(pool.job, RebenchmarkJob)
+        self.assertEqual(pool.job.repeat, 7)
+        self.assertEqual(len(pool.job.fn_specs), 2)
+        self.assertEqual(pool.timeout, 20.0)
+
     def test_false_precompile_result_is_failure(self) -> None:
         # A worker precompile returning False should count as a real compile failure.
         class FakePool:
@@ -207,6 +358,7 @@ class TestWorkerPoolPrecompile(unittest.TestCase):
 class TestSubprocessBenchmarkIntegration(RefEagerTestDisabled, unittest.TestCase):
     @skipIfXPU("matmul config space includes maxnreg, unsupported on XPU")
     def test_autotune_with_subprocess_bench(self) -> None:
+        # Subprocess benchmarking should support a small end-to-end autotune run.
         if not torch.cuda.is_available():
             self.skipTest("requires CUDA")
 
@@ -227,6 +379,7 @@ class TestSubprocessBenchmarkIntegration(RefEagerTestDisabled, unittest.TestCase
 
     @skipIfXPU("matmul config space includes maxnreg, unsupported on XPU")
     def test_autotune_continues_when_subprocess_reports_inf(self) -> None:
+        # A subset of failed subprocess benchmarks should not abort the search.
         # Patches _benchmark_function_subprocess to return inf for a
         # fraction of configs, simulating BenchmarkTimeout / worker death;
         # autotune must still pick a best config from the rest.
