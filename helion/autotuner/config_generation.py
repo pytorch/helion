@@ -7,6 +7,7 @@ import itertools
 import operator
 import random
 from typing import TYPE_CHECKING
+from typing import Callable
 from typing import cast
 
 from .._compat import warps_to_threads
@@ -20,6 +21,7 @@ from helion._dist_utils import sync_seed
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
+    from collections.abc import Sequence
 
     from .. import Config
     from . import ConfigSpec
@@ -429,26 +431,63 @@ class ConfigGeneration:
             f"failed to generate a valid random config after 64 attempts: {summary}"
         )
 
-    def random_population_flat(self, n: int) -> list[FlatConfig]:
+    def random_population_flat(
+        self,
+        n: int,
+        *,
+        config_hints: Sequence[Config] = (),
+        log_func: Callable[[str], None] | None = None,
+    ) -> list[FlatConfig]:
         if n <= 0:
             return [self.default_flat()]
         default_flat = self.default_flat()
         result = [default_flat]
-        if len(result) >= n:
-            return result[:n]
-        for flat, _config in self.seed_flat_config_pairs():
-            if any(flat == existing for existing in result):
+        seen = {self.unflatten([*default_flat])}
+
+        for i, config in enumerate(config_hints):
+            try:
+                flat = self.flatten(config)
+                transferred_config = self.unflatten(flat)
+            except (
+                InvalidConfig,
+                ValueError,
+                TypeError,
+                KeyError,
+                AssertionError,
+            ) as e:
+                if log_func is not None:
+                    log_func(f"Failed to transfer autotune hint {i + 1}: {e}")
                 continue
+            if transferred_config in seen:
+                continue
+            seen.add(transferred_config)
             result.append(flat)
             if len(result) >= n:
                 return result[:n]
+
+        for flat, transferred_config in self.seed_flat_config_pairs():
+            if transferred_config in seen:
+                continue
+            seen.add(transferred_config)
+            result.append(flat)
+            if len(result) >= n:
+                return result[:n]
+
         result.extend(self.random_flat() for _ in range(n - len(result)))
         return result
 
-    def random_population(self, n: int) -> list[Config]:
+    def random_population(
+        self,
+        n: int,
+        *,
+        config_hints: Sequence[Config] = (),
+        log_func: Callable[[str], None] | None = None,
+    ) -> list[Config]:
         result: list[Config] = []
         attempts = 0
-        for flat in self.random_population_flat(n):
+        for flat in self.random_population_flat(
+            n, config_hints=config_hints, log_func=log_func
+        ):
             try:
                 result.append(self.unflatten(flat))
             except InvalidConfig:

@@ -134,6 +134,10 @@ class _ExternalKernelAdapter(_AutotunableKernel):
     def configs(self) -> list[Config]:
         return self._configs
 
+    @property
+    def autotune_hints(self) -> list[Config]:
+        return []
+
     def compile_config(
         self,
         config: Config | dict[str, object] | None = None,

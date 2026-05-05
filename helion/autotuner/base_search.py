@@ -74,6 +74,9 @@ class _AutotunableKernel(Protocol):
     @property
     def configs(self) -> Sequence[Config]: ...
 
+    @property
+    def autotune_hints(self) -> Sequence[Config]: ...
+
     def compile_config(
         self,
         config: Config | dict[str, object] | None = None,
@@ -535,6 +538,10 @@ class BaseSearch(BaseAutotuner):
         """
         raise NotImplementedError
 
+    def _autotune_hint_configs(self) -> Sequence[Config]:
+        """Return user-provided autotune hints when the kernel supports them."""
+        return getattr(self.kernel, "autotune_hints", ())
+
     def set_generation(self, generation: int) -> None:
         self._autotune_metrics.num_generations = generation
 
@@ -764,6 +771,22 @@ class PopulationBasedSearch(BaseSearch):
         seen: set[Config] = {default_config}
         result: list[FlatConfig] = [default_flat]
         self.log("Starting with default config")
+
+        for i, config in enumerate(self._autotune_hint_configs()):
+            try:
+                flat = self.config_gen.flatten(config)
+                transferred_config = self.config_gen.unflatten(flat)
+                if transferred_config not in seen:
+                    seen.add(transferred_config)
+                    result.append(flat)
+            except (
+                ValueError,
+                TypeError,
+                KeyError,
+                AssertionError,
+                exc.InvalidConfig,
+            ) as e:
+                self.log(f"Failed to transfer autotune hint {i + 1}: {e}")
 
         for flat, transferred_config in self.config_gen.seed_flat_config_pairs():
             if transferred_config not in seen:

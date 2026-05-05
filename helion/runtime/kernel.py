@@ -116,6 +116,7 @@ class Kernel(Generic[_R]):
         fn: Callable[..., _R],
         *,
         configs: Sequence[ConfigLike] | None = None,
+        autotune_hints: Sequence[ConfigLike] | None = None,
         settings: Settings | None,
         key: Callable[..., Hashable] | None = None,
     ) -> None:
@@ -125,6 +126,8 @@ class Kernel(Generic[_R]):
         Args:
             fn: The function to be compiled as a Helion kernel.
             configs: A list of configurations to use for the kernel.
+            autotune_hints: A list of configurations to seed the autotuner's
+                initial population without restricting the search.
             settings: The settings to be used by the Kernel. If None, a new `Settings()` instance is created.
             key: Optional callable that returns an extra hashable component for specialization.
         """
@@ -141,6 +144,11 @@ class Kernel(Generic[_R]):
             # pyrefly: ignore [bad-argument-type]
             Config(**c) if isinstance(c, dict) else c
             for c in configs or []
+        ]
+        self.autotune_hints: list[Config] = [
+            # pyrefly: ignore [bad-argument-type]
+            Config(**c) if isinstance(c, dict) else c
+            for c in autotune_hints or []
         ]
         self._bound_kernels: dict[BoundKernelInMemoryCacheKey, BoundKernel] = {}
         self._specialize_extra: dict[
@@ -507,6 +515,11 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
     def configs(self) -> list[Config]:
         """Return the kernel's configured configs (alias for `self.kernel.configs`)."""
         return self.kernel.configs
+
+    @property
+    def autotune_hints(self) -> list[Config]:
+        """Return configs that seed autotuning without constraining the search."""
+        return self.kernel.autotune_hints
 
     def _normalize_config(self, config: ConfigLike) -> Config:
         if isinstance(config, Config):
@@ -1108,6 +1121,7 @@ def kernel(
     *,
     config: ConfigLike | None = None,
     configs: Sequence[ConfigLike] | None = None,
+    autotune_hints: ConfigLike | Sequence[ConfigLike] | None = None,
     key: Callable[..., Hashable] | None = None,
     **settings: object,
 ) -> Kernel[_R]: ...
@@ -1119,6 +1133,7 @@ def kernel(
     *,
     config: ConfigLike | None = None,
     configs: Sequence[ConfigLike] | None = None,
+    autotune_hints: ConfigLike | Sequence[ConfigLike] | None = None,
     key: Callable[..., Hashable] | None = None,
     **settings: object,
 ) -> _KernelDecorator: ...
@@ -1129,6 +1144,7 @@ def kernel(
     *,
     config: ConfigLike | None = None,
     configs: Sequence[ConfigLike] | None = None,
+    autotune_hints: ConfigLike | Sequence[ConfigLike] | None = None,
     key: Callable[..., Hashable] | None = None,
     **settings: object,
 ) -> Kernel[_R] | _KernelDecorator:
@@ -1142,6 +1158,8 @@ def kernel(
         configs: A list of configurations to use for the kernel. Can only specify
             one of config or configs. Refer to the ``helion.Config`` class for
             details.
+        autotune_hints: A single configuration or list of configurations to include
+            in the autotuner's initial population without restricting the search.
         key: Optional callable returning a hashable that augments the specialization key.
         settings: Keyword arguments representing settings for the Kernel.
             Can also use settings=Settings(...) to pass a Settings object
@@ -1160,6 +1178,12 @@ def kernel(
         configs = [config]
     elif configs is None:
         configs = []
+    if autotune_hints is None:
+        normalized_autotune_hints = []
+    elif isinstance(autotune_hints, (Config, dict)):
+        normalized_autotune_hints = [autotune_hints]
+    else:
+        normalized_autotune_hints = list(autotune_hints)
 
     if settings_obj := settings.get("settings"):
         assert len(settings) == 1, "settings must be the only keyword argument"
@@ -1169,9 +1193,19 @@ def kernel(
 
     if fn is None:
         return functools.partial(
-            kernel, configs=configs, settings=settings_obj, key=key
+            kernel,
+            configs=configs,
+            autotune_hints=normalized_autotune_hints,
+            settings=settings_obj,
+            key=key,
         )
-    return Kernel(fn, configs=configs, settings=settings_obj, key=key)
+    return Kernel(
+        fn,
+        configs=configs,
+        autotune_hints=normalized_autotune_hints,
+        settings=settings_obj,
+        key=key,
+    )
 
 
 def _hashable_dim(s: int | torch.SymInt) -> Hashable:

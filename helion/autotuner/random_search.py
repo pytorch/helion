@@ -42,7 +42,10 @@ class RandomSearch(FiniteSearch):
                 overrides=kernel.settings.autotune_config_overrides or None,
                 advanced_controls_files=kernel.settings.autotune_search_acf or None,
                 process_group_name=kernel.env.process_group_name,
-            ).random_population(count),
+            ).random_population(
+                count,
+                config_hints=getattr(kernel, "autotune_hints", ()),
+            ),
         )
 
     @classmethod
