@@ -145,8 +145,9 @@ def my_kernel(x: torch.Tensor) -> torch.Tensor:
    Select the autotuner precompile mode, which adds parallelism and
    checks for errors/timeouts. ``"fork"`` (default) is faster but does
    not include the error check run, ``"spawn"`` runs kernel warm-up in a
-   fresh process including running to check for errors, or None to
-   disables precompile checks altogether. Controlled by
+   fresh process including running to check for errors, ``"pool"`` uses
+   long-lived worker processes and implies subprocess benchmarking, or
+   None disables precompile checks altogether. Controlled by
    ``HELION_AUTOTUNE_PRECOMPILE``.
 
 .. autoattribute:: Settings.autotune_random_seed
@@ -313,8 +314,9 @@ Built-in values for ``HELION_AUTOTUNER`` include ``"LFBOTreeSearch"`` (default),
 | ``HELION_AUTOTUNE_COMPILE_TIMEOUT`` | ``autotune_compile_timeout`` | Maximum seconds to wait for Triton compilation during autotuning. |
 | ``HELION_AUTOTUNE_LOG_LEVEL`` | ``autotune_log_level`` | Adjust logging verbosity; accepts names like ``INFO`` or numeric levels. |
 | ``HELION_AUTOTUNE_LOG`` | ``autotune_log`` | Base filename for per-config CSV telemetry and mirrored autotune logs. |
-| ``HELION_AUTOTUNE_PRECOMPILE`` | ``autotune_precompile`` | Select the autotuner precompile mode (``"fork"`` (default), ``"spawn"``, or disable when empty). |
+| ``HELION_AUTOTUNE_PRECOMPILE`` | ``autotune_precompile`` | Select the autotuner precompile mode (``"fork"`` (default), ``"spawn"``, ``"pool"``, or disable when empty). |
 | ``HELION_AUTOTUNE_PRECOMPILE_JOBS`` | ``autotune_precompile_jobs`` | Cap the number of concurrent Triton precompile subprocesses. |
+| ``HELION_AUTOTUNE_PRECOMPILE_WORKERS_CAP`` | ``autotune_precompile_workers_cap`` | Cap the auto-decided worker-pool size. Default is ``32``. |
 | ``HELION_AUTOTUNE_RANDOM_SEED`` | ``autotune_random_seed`` | Seed used for randomized autotuning searches. |
 | ``HELION_AUTOTUNE_MAX_GENERATIONS`` | ``autotune_max_generations`` | Upper bound on generations for Pattern Search and Differential Evolution. |
 | ``HELION_AUTOTUNE_BUDGET_SECONDS`` | ``autotune_budget_seconds`` | Wall-clock budget for an autotune run. |

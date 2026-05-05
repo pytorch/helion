@@ -185,7 +185,7 @@ class DESurrogateHybrid(DifferentialEvolutionSearch):
 
         self.rebenchmark_population()
 
-        best = self.best
+        best = self.final_rebenchmark_top_k(self.best)
         self.log("=" * 70)
         self.log(f"✓ Best configuration: {best.perf:.4f} ms")
         self.log(f"Total evaluations: {len(self.all_observations)}")

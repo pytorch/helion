@@ -39,9 +39,9 @@ jobs:
 
     env:
       HELION_AUTOTUNE_LOG_LEVEL: INFO
-      # Run autotune benchmarks in a subprocess so deadlocked kernels are
-      # SIGKILL'd at the per-config timeout instead of hanging the job.
-      HELION_AUTOTUNE_BENCHMARK_SUBPROCESS: "1"
+      # Perf CI measures the default fork precompile path unless a dispatch
+      # explicitly overrides it via env-vars, e.g. HELION_AUTOTUNE_PRECOMPILE=pool.
+      HELION_AUTOTUNE_PRECOMPILE: "fork"
 
     container:
       image: ${{ inputs.image }}
