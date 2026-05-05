@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from .base_search import normalize_autotune_hints
 from .effort_profile import RANDOM_SEARCH_DEFAULTS
 from .finite_search import FiniteSearch
 
@@ -44,7 +45,7 @@ class RandomSearch(FiniteSearch):
                 process_group_name=kernel.env.process_group_name,
             ).random_population(
                 count,
-                config_hints=kernel.autotune_hints,
+                config_hints=normalize_autotune_hints(kernel.settings),
             ),
         )
 

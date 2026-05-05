@@ -74,9 +74,6 @@ class _AutotunableKernel(Protocol):
     @property
     def configs(self) -> Sequence[Config]: ...
 
-    @property
-    def autotune_hints(self) -> Sequence[Config]: ...
-
     def compile_config(
         self,
         config: Config | dict[str, object] | None = None,
@@ -146,6 +143,22 @@ class _CodeSentinel:
 
 
 _CODE_SENTINEL = _CodeSentinel()
+
+
+def normalize_autotune_hints(settings: Settings) -> tuple[Config, ...]:
+    """Return autotune hints from settings as concrete Config objects."""
+    from ..runtime.config import Config
+
+    hints = settings.autotune_hints
+    if hints is None:
+        return ()
+    if isinstance(hints, Config):
+        return (hints,)
+    if isinstance(hints, dict):
+        return (Config.from_dict(hints),)
+    return tuple(
+        Config.from_dict(hint) if isinstance(hint, dict) else hint for hint in hints
+    )
 
 
 def _normalize_spec_key(key: object) -> object:
@@ -539,8 +552,8 @@ class BaseSearch(BaseAutotuner):
         raise NotImplementedError
 
     def _autotune_hint_configs(self) -> Sequence[Config]:
-        """Return user-provided autotune hints normalized by the kernel."""
-        return self.kernel.autotune_hints
+        """Return user-provided autotune hints normalized from settings."""
+        return normalize_autotune_hints(self.settings)
 
     def set_generation(self, generation: int) -> None:
         self._autotune_metrics.num_generations = generation

@@ -142,22 +142,6 @@ class Kernel(Generic[_R]):
             Config(**config) if isinstance(config, dict) else config
             for config in configs or []
         ]
-        autotune_hints = self.settings.autotune_hints
-        if autotune_hints is None:
-            self.autotune_hints = []
-        elif isinstance(autotune_hints, (Config, dict)):
-            self.autotune_hints = [
-                # pyrefly: ignore [bad-argument-type]
-                Config(**autotune_hints)
-                if isinstance(autotune_hints, dict)
-                else autotune_hints
-            ]
-        else:
-            self.autotune_hints = [
-                # pyrefly: ignore [bad-argument-type]
-                Config(**config) if isinstance(config, dict) else config
-                for config in autotune_hints
-            ]
         self._bound_kernels: dict[BoundKernelInMemoryCacheKey, BoundKernel] = {}
         self._specialize_extra: dict[
             Hashable, list[Callable[[Sequence[object]], Hashable]]
@@ -523,11 +507,6 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
     def configs(self) -> list[Config]:
         """Return the kernel's configured configs (alias for `self.kernel.configs`)."""
         return self.kernel.configs
-
-    @property
-    def autotune_hints(self) -> list[Config]:
-        """Return configs that seed autotuning without constraining the search."""
-        return self.kernel.autotune_hints
 
     def _normalize_config(self, config: ConfigLike) -> Config:
         if isinstance(config, Config):

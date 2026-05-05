@@ -2684,7 +2684,7 @@ class TestAutotuneHints(TestCase):
         hint = helion.Config(block_sizes=[16], num_warps=8)
         add, _args = self._make_kernel_and_args(autotune_hints=hint)
 
-        self.assertEqual(add.autotune_hints, [hint])
+        self.assertEqual(add.settings.autotune_hints, hint)
         self.assertEqual(add.configs, [])
 
     def test_random_initial_population_includes_hints(self) -> None:
