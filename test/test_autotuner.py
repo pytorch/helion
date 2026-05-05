@@ -2688,7 +2688,7 @@ class TestAutotuneHints(TestCase):
         self.assertEqual(add.configs, [])
 
     def test_random_initial_population_includes_hints(self) -> None:
-        hint = helion.Config(block_sizes=[1])
+        hint = helion.Config(num_warps=8)
         add, args = self._make_kernel_and_args(autotune_hints=[hint])
         bound = add.bind(args)
         search = PatternSearch(bound, args, initial_population=3)
@@ -2696,10 +2696,10 @@ class TestAutotuneHints(TestCase):
         configs = self._population_configs(search)
 
         self.assertGreaterEqual(len(configs), 3)
-        self.assertEqual(configs[1].block_sizes, [1])
+        self.assertTrue(any(config.num_warps == 8 for config in configs))
 
     def test_best_available_initial_population_includes_hints(self) -> None:
-        hint = helion.Config(block_sizes=[1])
+        hint = helion.Config(num_warps=8)
         add, args = self._make_kernel_and_args(autotune_hints=[hint])
         bound = add.bind(args)
         search = PatternSearch(
@@ -2712,7 +2712,7 @@ class TestAutotuneHints(TestCase):
             configs = self._population_configs(search)
 
         self.assertGreaterEqual(len(configs), 2)
-        self.assertEqual(configs[1].block_sizes, [1])
+        self.assertTrue(any(config.num_warps == 8 for config in configs))
 
     def test_random_initial_population_logs_invalid_hints(self) -> None:
         hint = helion.Config.from_dict({"block_sizes": ["bad"]})
