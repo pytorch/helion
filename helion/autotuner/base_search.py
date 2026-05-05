@@ -500,7 +500,9 @@ class BaseSearch(BaseAutotuner):
         if current_hardware is None or current_spec_key is None:
             return []
 
-        current_fingerprint_hash = self.config_spec.structural_fingerprint_hash()
+        current_fingerprint_hash = self.config_spec.structural_fingerprint_hash(
+            advanced_controls_files=self.settings.autotune_search_acf or None
+        )
 
         matching: list[SavedBestConfig] = []
         for entry in iter_cache_entries(
@@ -762,6 +764,11 @@ class PopulationBasedSearch(BaseSearch):
         seen: set[Config] = {default_config}
         result: list[FlatConfig] = [default_flat]
         self.log("Starting with default config")
+
+        for flat, transferred_config in self.config_gen.seed_flat_config_pairs():
+            if transferred_config not in seen:
+                seen.add(transferred_config)
+                result.append(flat)
 
         for config in self._best_available_seed_configs:
             try:

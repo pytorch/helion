@@ -207,6 +207,7 @@ class CuteTcgen05StoreValue:
     epi_tidx: str = ""
     epi_active: str = ""
     exec_active: str = ""
+    warp_idx: str = ""
     epi_tile: str = ""
     c_stage_count: int = 0
     epilog_sync_barrier_id: int = 0
@@ -224,8 +225,13 @@ class CuteTcgen05StoreValue:
     tma_warp: str = ""
     tma_pipeline: str = ""
     tma_producer_state: str = ""
+    tma_store_atom: str = ""
+    tma_store_tensor: str = ""
+    role_local_tile_counter: str = ""
     is_two_cta: bool = False
     use_tma: bool = False
+    use_role_local_epi: bool = False
+    use_tma_store_epilogue: bool = False
     ab_stage_count: int = 0
     acc_stage_count: int = 0
 
@@ -260,8 +266,10 @@ class CuteTcgen05MatmulPlan:
     bm: int
     bn: int
     bk: int
+    k_tile_count: int
     cluster_m: int
     is_two_cta: bool
+    uses_role_local_persistent_body: bool
     cta_thread_count: int
     physical_m_threads: int
     acc_stage_count: int
@@ -405,6 +413,9 @@ class DeviceFunction:
         self._cute_tcgen05_per_tile_stmt_ids: set[int] = set()
         self._cute_tcgen05_post_loop_stmt_ids: set[int] = set()
         self._cute_tcgen05_tma_load_role_stmt_ids: set[int] = set()
+        self._cute_tcgen05_mma_exec_role_stmt_ids: set[int] = set()
+        self._cute_tcgen05_epi_role_stmt_ids: set[int] = set()
+        self.cute_tcgen05_epi_role_tile_counter_var: str | None = None
         self._cute_collective_handled_loads: set[str] = set()
         self.cute_cluster_shape: tuple[int, int, int] | None = None
         self.cute_block_shape: tuple[int, int, int] | None = None
@@ -691,6 +702,61 @@ class DeviceFunction:
         a bad registration shape that would otherwise silently miscompile.
         """
         return frozenset(self._cute_tcgen05_tma_load_role_stmt_ids)
+
+    def register_cute_tcgen05_mma_exec_role_stmts(self, stmts: list[ast.AST]) -> None:
+        """Mark statements that belong to the MMA-exec warp's role block.
+
+        The persistent tcgen05 role partitioner pulls these statements into
+        an MMA-exec-specific role-local ``while``. Use for AB consumer wait /
+        release, UMMA issue, and acc-pipeline producer work that must advance
+        once per tile on the exec warp.
+        """
+        self._cute_tcgen05_mma_exec_role_stmt_ids.update(id(stmt) for stmt in stmts)
+
+    def is_cute_tcgen05_mma_exec_role(self, stmt: ast.stmt) -> bool:
+        return id(stmt) in self._cute_tcgen05_mma_exec_role_stmt_ids
+
+    @property
+    def has_cute_tcgen05_mma_exec_role_marks(self) -> bool:
+        return bool(self._cute_tcgen05_mma_exec_role_stmt_ids)
+
+    @property
+    def cute_tcgen05_mma_exec_role_stmt_ids(self) -> frozenset[int]:
+        """Snapshot of every registered MMA-exec role-tag id."""
+        return frozenset(self._cute_tcgen05_mma_exec_role_stmt_ids)
+
+    def register_cute_tcgen05_epi_role_stmts(self, stmts: list[ast.AST]) -> None:
+        """Mark statements that belong to the epilogue warp role block.
+
+        The persistent tcgen05 role partitioner pulls these statements into
+        an epi-warp-local ``while``. Use for acc-pipeline consumer work and
+        TMEM-to-GMEM store work that must advance once per tile on epi warps.
+        """
+        self._cute_tcgen05_epi_role_stmt_ids.update(id(stmt) for stmt in stmts)
+
+    def register_cute_tcgen05_epi_role_tile_counter(self, name: str) -> None:
+        """Publish the per-iteration tile counter used by the epi role.
+
+        Persistent TMA-store epilogues use this counter to rotate SMEM stages
+        across work tiles. The role-local while builder owns its lifetime; the
+        store body only reads it.
+        """
+        if self.cute_tcgen05_epi_role_tile_counter_var is None:
+            self.cute_tcgen05_epi_role_tile_counter_var = name
+            return
+        assert self.cute_tcgen05_epi_role_tile_counter_var == name
+
+    def is_cute_tcgen05_epi_role(self, stmt: ast.stmt) -> bool:
+        return id(stmt) in self._cute_tcgen05_epi_role_stmt_ids
+
+    @property
+    def has_cute_tcgen05_epi_role_marks(self) -> bool:
+        return bool(self._cute_tcgen05_epi_role_stmt_ids)
+
+    @property
+    def cute_tcgen05_epi_role_stmt_ids(self) -> frozenset[int]:
+        """Snapshot of every registered epilogue role-tag id."""
+        return frozenset(self._cute_tcgen05_epi_role_stmt_ids)
 
     def get_cute_tcgen05_store_value(self, name: str) -> CuteTcgen05StoreValue | None:
         for alias in self._variable_renames.get(name, [name]):

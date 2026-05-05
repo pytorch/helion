@@ -7,6 +7,10 @@ import torch
 
 import helion
 from helion import _compat
+from helion._compiler.cute.tcgen05_constants import TCGEN05_ONE_CTA_MAX_BLOCK_M
+from helion._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
+from helion._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
+from helion._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_SEED_L2_GROUPING
 from helion._testing import DEVICE
 from helion._testing import HALF_DTYPE
 from helion._testing import RefEagerTestDisabled
@@ -15,6 +19,8 @@ from helion._testing import code_and_output
 from helion._testing import onlyBackends
 from helion._testing import patch_cute_mma_support
 from helion._testing import skipIfMTIA
+from helion.autotuner.pattern_search import InitialPopulationStrategy
+from helion.autotuner.pattern_search import PatternSearch
 from helion.exc import InvalidConfig
 import helion.language as hl
 
@@ -31,6 +37,45 @@ def _matmul_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
             acc += torch.matmul(x[tile_m, tile_k], y[tile_k, tile_n])
         out[tile_m, tile_n] = acc
     return out
+
+
+def _cute_two_matmuls_impl(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    x2: torch.Tensor,
+    y2: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    m, k = x.size()
+    _, n = y.size()
+    out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+    m2, k2 = x2.size()
+    _, n2 = y2.size()
+    out2 = torch.empty([m2, n2], dtype=x2.dtype, device=x2.device)
+
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+        out[tile_m, tile_n] = acc.to(x.dtype)
+
+    for tile_m2, tile_n2 in hl.tile([m2, n2]):
+        acc2 = hl.zeros([tile_m2, tile_n2], dtype=torch.float32)
+        for tile_k2 in hl.tile(k2):
+            acc2 = torch.addmm(
+                acc2,
+                x2[tile_m2, tile_k2],
+                y2[tile_k2, tile_n2],
+            )
+        out2[tile_m2, tile_n2] = acc2.to(x2.dtype)
+    return out, out2
+
+
+_cute_two_matmuls_kernel = helion.kernel(_cute_two_matmuls_impl, backend="cute")
+_cute_two_matmuls_force_persistent_kernel = helion.kernel(
+    _cute_two_matmuls_impl,
+    backend="cute",
+    autotune_force_persistent=True,
+)
 
 
 @onlyBackends(["triton", "cute"])
@@ -102,9 +147,12 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         self.assertGreaterEqual(default_block_sizes[1], 8)
         self.assertLessEqual(default_block_sizes[1], 128)
         self.assertEqual(spec.default_config().config["l2_groupings"], [1])
-        # cluster_m default is now 1 (cluster_m=2 has runtime issues); the
-        # autotuner search space restricts the choice accordingly.
+        # This small-N problem cannot form the validated 256x256 CtaGroup.TWO
+        # tile, so the autotuner keeps cluster_m narrowed to 1.
         self.assertEqual(spec.default_config().config["tcgen05_cluster_m"], 1)
+        self.assertEqual(spec._tcgen05_cluster_m_search_choices, (1,))
+        self.assertIn("persistent_blocked", spec.allowed_pid_types)
+        self.assertIn("persistent_interleaved", spec.allowed_pid_types)
 
     @onlyBackends(["cute"])
     def test_cute_tcgen05_equal_dims_keep_default_within_max_bound(self) -> None:
@@ -139,9 +187,30 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         self.assertGreaterEqual(default_block_sizes[1], 8)
         self.assertLessEqual(default_block_sizes[1], 256)
         self.assertEqual(spec.default_config().config["l2_groupings"], [1])
-        # cluster_m default is now 1 (cluster_m=2 has runtime issues); the
-        # autotuner search space restricts the choice accordingly.
+        # K=8192 can form validated CtaGroup.TWO products at bk >= 32 even
+        # though bk=16 is over the K-tile cap. The search exposes cluster_m=2,
+        # and normalization drops only the invalid per-bk products.
         self.assertEqual(spec.default_config().config["tcgen05_cluster_m"], 1)
+        self.assertEqual(spec._tcgen05_cluster_m_search_choices, (1, 2))
+        over_cap_config = {
+            "block_sizes": [256, 256, 16],
+            "pid_type": "flat",
+            "tcgen05_cluster_m": 2,
+        }
+        spec.normalize(over_cap_config, _fix_invalid=True)
+        self.assertEqual(over_cap_config["tcgen05_cluster_m"], 1)
+        self.assertEqual(over_cap_config["pid_type"], "flat")
+        valid_config = {
+            "block_sizes": [128, 256, 32],
+            "pid_type": "flat",
+            "tcgen05_cluster_m": 2,
+        }
+        spec.normalize(valid_config, _fix_invalid=True)
+        self.assertEqual(valid_config["tcgen05_cluster_m"], 2)
+        self.assertEqual(valid_config["pid_type"], "persistent_blocked")
+        self.assertEqual(valid_config["block_sizes"][:3], [256, 256, 32])
+        self.assertIn("persistent_blocked", spec.allowed_pid_types)
+        self.assertIn("persistent_interleaved", spec.allowed_pid_types)
 
     @onlyBackends(["cute"])
     def test_cute_tcgen05_widened_default_stays_on_tcgen05_path(self) -> None:
@@ -173,6 +242,311 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         self.assertIn("make_trivial_tiled_mma", code)
         self.assertIn(f"_BLOCK_SIZE_0 = {config.config['block_sizes'][0]}", code)
         self.assertIn(f"_BLOCK_SIZE_1 = {config.config['block_sizes'][1]}", code)
+
+    @onlyBackends(["cute"])
+    def test_cute_tcgen05_two_cta_enters_validated_search_space(self) -> None:
+        @helion.kernel(backend="cute")
+        def cute_matmul_mma(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        args = (
+            torch.empty([4096, 4096], device=DEVICE, dtype=HALF_DTYPE),
+            torch.empty([4096, 4096], device=DEVICE, dtype=HALF_DTYPE),
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_mma.bind(args)
+        spec = bound.config_spec
+        self.assertEqual(spec._tcgen05_cluster_m_search_choices, (1, 2))
+        search_fragments = spec._tcgen05_optional_fragments(for_search=True)
+        self.assertEqual(search_fragments["tcgen05_cluster_m"].choices, (1, 2))
+
+        config = {
+            "block_sizes": [256, 256, 16],
+            "l2_groupings": [1],
+            "pid_type": "persistent_blocked",
+            "tcgen05_cluster_m": 2,
+        }
+        spec.normalize(config, _fix_invalid=True)
+        self.assertEqual(config["tcgen05_cluster_m"], 2)
+        self.assertEqual(config["l2_groupings"], [1])
+
+        for override in (
+            {"pid_type": "flat"},
+            {"block_sizes": [128, 256, 16]},
+            {"block_sizes": [256, 128, 16]},
+            {"l2_groupings": [16]},
+            {"pid_type": "persistent_interleaved"},
+        ):
+            with self.subTest(override=override):
+                config = {
+                    "block_sizes": [256, 256, 16],
+                    "l2_groupings": [1],
+                    "pid_type": "persistent_blocked",
+                    "tcgen05_cluster_m": 2,
+                    **override,
+                }
+                spec.normalize(config, _fix_invalid=True)
+                expected_l2_groupings = override.get("l2_groupings", [1])
+                self.assertEqual(config["tcgen05_cluster_m"], 2)
+                self.assertEqual(config["pid_type"], "persistent_blocked")
+                self.assertEqual(config["block_sizes"][:3], [256, 256, 16])
+                self.assertEqual(config["l2_groupings"], expected_l2_groupings)
+
+    @onlyBackends(["cute"])
+    def test_cute_tcgen05_cluster_m1_persistent_search_caps_m_tile(self) -> None:
+        """Search-only cluster_m=1 persistent configs stay on tcgen05 M tiles."""
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_mma(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        args = (
+            torch.empty([4096, 4096], device=DEVICE, dtype=HALF_DTYPE),
+            torch.empty([4096, 4096], device=DEVICE, dtype=HALF_DTYPE),
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_mma.bind(args)
+        spec = bound.config_spec
+
+        for pid_type in ("persistent_blocked", "persistent_interleaved"):
+            with self.subTest(pid_type=pid_type):
+                config = {
+                    "block_sizes": [256, 32, 16],
+                    "pid_type": pid_type,
+                    "tcgen05_cluster_m": 1,
+                }
+                spec.normalize(config, _fix_invalid=True)
+                self.assertEqual(config["tcgen05_cluster_m"], 1)
+                self.assertEqual(config["pid_type"], pid_type)
+                self.assertEqual(
+                    config["block_sizes"][:3],
+                    [TCGEN05_ONE_CTA_MAX_BLOCK_M, 32, 16],
+                )
+
+        flat_config = {
+            "block_sizes": [256, 32, 16],
+            "pid_type": "flat",
+            "tcgen05_cluster_m": 1,
+        }
+        spec.normalize(flat_config, _fix_invalid=True)
+        self.assertEqual(flat_config["block_sizes"][:3], [256, 32, 16])
+
+        two_cta_config = {
+            "block_sizes": [256, 32, 16],
+            "pid_type": "persistent_interleaved",
+            "tcgen05_cluster_m": 2,
+        }
+        spec.normalize(two_cta_config, _fix_invalid=True)
+        self.assertEqual(two_cta_config["tcgen05_cluster_m"], 2)
+        self.assertEqual(two_cta_config["pid_type"], "persistent_blocked")
+        self.assertEqual(two_cta_config["block_sizes"][:3], [256, 256, 16])
+
+    @onlyBackends(["cute"])
+    def test_cute_tcgen05_two_cta_seeded_in_initial_populations(self) -> None:
+        @helion.kernel(backend="cute")
+        def cute_matmul_mma(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        args = (
+            torch.empty([4096, 4096], device=DEVICE, dtype=HALF_DTYPE),
+            torch.empty([4096, 4096], device=DEVICE, dtype=HALF_DTYPE),
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_mma.bind(args)
+
+        def assert_seeded(configs: list[helion.Config]) -> None:
+            seeded = [
+                config.config
+                for config in configs
+                if config.config["tcgen05_cluster_m"] == 2
+            ]
+            self.assertEqual(len(seeded), 1)
+            seed = seeded[0]
+            self.assertEqual(
+                seed["block_sizes"][:3],
+                [TCGEN05_TWO_CTA_BLOCK_M, TCGEN05_TWO_CTA_BLOCK_N, 128],
+            )
+            self.assertEqual(
+                seed["indexing"],
+                ["tensor_descriptor", "tensor_descriptor", "tensor_descriptor"],
+            )
+            self.assertEqual(seed["l2_groupings"], [TCGEN05_TWO_CTA_SEED_L2_GROUPING])
+            self.assertEqual(seed["pid_type"], "persistent_blocked")
+            self.assertEqual(seed["tcgen05_num_epi_warps"], 4)
+
+        config_gen = bound.config_spec.create_config_generation()
+        zero_flat = config_gen.random_population_flat(0)
+        self.assertEqual(len(zero_flat), 1)
+        zero_config = config_gen.unflatten(zero_flat[0])
+        self.assertEqual(zero_config.config["tcgen05_cluster_m"], 1)
+        one_flat = config_gen.random_population_flat(1)
+        self.assertEqual(len(one_flat), 1)
+        one_config = config_gen.unflatten(one_flat[0])
+        self.assertEqual(one_config.config["tcgen05_cluster_m"], 1)
+        one_config_population = config_gen.random_population(1)
+        self.assertEqual(len(one_config_population), 1)
+        self.assertEqual(one_config_population[0].config["tcgen05_cluster_m"], 1)
+        assert_seeded(config_gen.random_population(2))
+
+        acf_config_gen = bound.config_spec.create_config_generation(
+            advanced_controls_files=["/tmp/helion-test.acf"]
+        )
+        acf_configs = acf_config_gen.random_population(2)
+        self.assertEqual(len(acf_configs), 2)
+        self.assertEqual(
+            {config.config["advanced_controls_file"] for config in acf_configs},
+            {"/tmp/helion-test.acf"},
+        )
+        assert_seeded(acf_configs)
+
+        with patch.object(
+            PatternSearch, "_find_similar_cached_configs", return_value=[]
+        ):
+            search = PatternSearch(
+                bound,
+                args,
+                initial_population=30,
+                initial_population_strategy=InitialPopulationStrategy.FROM_BEST_AVAILABLE,
+                best_available_pad_random=False,
+            )
+            configs = [
+                search.config_gen.unflatten(flat)
+                for flat in search._generate_initial_population_flat()
+            ]
+        self.assertEqual(len(configs), 2)
+        self.assertEqual(configs[0].config["tcgen05_cluster_m"], 1)
+        assert_seeded(configs)
+
+    @onlyBackends(["cute"])
+    def test_cute_tcgen05_two_cta_seed_indexing_matches_live_spec(self) -> None:
+        @helion.kernel(backend="cute")
+        def cute_matmul_mma_epilogue(
+            x: torch.Tensor, y: torch.Tensor, bias: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = (acc + bias[tile_n]).to(x.dtype)
+            return out
+
+        args = (
+            torch.empty([4096, 4096], device=DEVICE, dtype=HALF_DTYPE),
+            torch.empty([4096, 4096], device=DEVICE, dtype=HALF_DTYPE),
+            torch.empty([4096], device=DEVICE, dtype=HALF_DTYPE),
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_mma_epilogue.bind(args)
+        self.assertGreater(bound.config_spec.indexing.length, 3)
+
+        configs = bound.config_spec.create_config_generation().random_population(2)
+        seeded = [
+            config.config
+            for config in configs
+            if config.config["tcgen05_cluster_m"] == 2
+        ]
+        self.assertEqual(len(seeded), 1)
+        self.assertEqual(
+            len(seeded[0]["indexing"]),
+            bound.config_spec.indexing.length,
+        )
+
+    @onlyBackends(["cute"])
+    def test_cute_tcgen05_two_cta_projection_falls_back_before_mutation(
+        self,
+    ) -> None:
+        """Invalid cluster_m=2 search products fall back without pid churn."""
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_mma(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        args = (
+            torch.empty([4096, 4096], device=DEVICE, dtype=HALF_DTYPE),
+            torch.empty([4096, 4096], device=DEVICE, dtype=HALF_DTYPE),
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_mma.bind(args)
+        spec = bound.config_spec
+
+        for block_sizes in (
+            [TCGEN05_TWO_CTA_BLOCK_M, TCGEN05_TWO_CTA_BLOCK_N],
+            [TCGEN05_TWO_CTA_BLOCK_M, TCGEN05_TWO_CTA_BLOCK_N, 8],
+            [TCGEN05_TWO_CTA_BLOCK_M, TCGEN05_TWO_CTA_BLOCK_N, 24],
+            [TCGEN05_TWO_CTA_BLOCK_M, TCGEN05_TWO_CTA_BLOCK_N, True],
+        ):
+            with self.subTest(block_sizes=block_sizes):
+                original_block_sizes = list(block_sizes)
+                config = {
+                    "block_sizes": block_sizes,
+                    "l2_groupings": [1],
+                    "pid_type": "flat",
+                    "tcgen05_cluster_m": 2,
+                }
+                spec._fix_tcgen05_cluster_m2_search_config(config)
+                self.assertEqual(config["tcgen05_cluster_m"], 1)
+                self.assertEqual(config["pid_type"], "flat")
+                self.assertEqual(config["block_sizes"], original_block_sizes)
+                self.assertEqual(config["l2_groupings"], [1])
+
+        original_allowed_pid_types = spec.allowed_pid_types
+        try:
+            spec.allowed_pid_types = ("flat",)
+            config = {
+                "block_sizes": [
+                    TCGEN05_TWO_CTA_BLOCK_M,
+                    TCGEN05_TWO_CTA_BLOCK_N,
+                    16,
+                ],
+                "l2_groupings": [1],
+                "pid_type": "flat",
+                "tcgen05_cluster_m": 2,
+            }
+            spec._fix_tcgen05_cluster_m2_search_config(config)
+        finally:
+            spec.allowed_pid_types = original_allowed_pid_types
+        self.assertEqual(config["tcgen05_cluster_m"], 1)
+        self.assertEqual(config["pid_type"], "flat")
+        self.assertEqual(
+            config["block_sizes"],
+            [TCGEN05_TWO_CTA_BLOCK_M, TCGEN05_TWO_CTA_BLOCK_N, 16],
+        )
+        self.assertEqual(config["l2_groupings"], [1])
 
     @skipIfMTIA("MTIA requires tl.dot initial value stride >= 128 bytes")
     def test_matmul_smaller_than_min_dot_size(self) -> None:
@@ -250,12 +624,14 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
     @onlyBackends(["cute"])
     def test_cute_tcgen05_validated_autotune_narrowing(self) -> None:
         """``narrow_tcgen05_autotune_to_validated_configs`` consolidates the
-        three known tcgen05 limitations into a single config_spec call.
+        tcgen05 limitations into a single config_spec call.
 
         Pin the resulting state so any future change to the helper has to
-        update the test as well: persistent pid types are dropped from the
-        autotune search, the cluster_m search is narrowed to ``(1,)``,
-        and the num_epi_warps search is narrowed to ``(4,)``.
+        update the test as well: persistent pid types stay in the autotune
+        search for validated static full-tile shapes, the cluster_m search
+        stays narrowed to ``(1,)`` when the problem cannot form the validated
+        256x256 CtaGroup.TWO tile, and the num_epi_warps search is narrowed
+        to ``(4,)``.
         """
 
         @helion.kernel(backend="cute")
@@ -277,12 +653,12 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         with patch_cute_mma_support():
             bound = cute_matmul_mma.bind(args)
         spec = bound.config_spec
-        # Persistent pid types miscompute multi-tile silently today; they
-        # are dropped from the autotune pid_type search.
-        self.assertNotIn("persistent_blocked", spec.allowed_pid_types)
-        self.assertNotIn("persistent_interleaved", spec.allowed_pid_types)
-        # cluster_m=2 currently CUDA-launch-fails on B200; the autotune
-        # search is narrowed to cluster_m=1.
+        # Every candidate M/N/K block size divides this static problem, so
+        # role-local persistent pid types are admitted back into autotune.
+        self.assertIn("persistent_blocked", spec.allowed_pid_types)
+        self.assertIn("persistent_interleaved", spec.allowed_pid_types)
+        # This N=128 problem cannot form a validated 256x256 CtaGroup.TWO
+        # tile, so the autotune search stays narrowed to cluster_m=1.
         self.assertEqual(spec._tcgen05_cluster_m_search_choices, (1,))
         # num_epi_warps != 4 currently produces wrong output on B200
         # (only 4 epi warps lowers correctly today). The autotune search
@@ -303,6 +679,116 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         # The search view exposes the same narrowed EnumFragment.
         search_fragments = spec._tcgen05_optional_fragments(for_search=True)
         self.assertEqual(search_fragments["tcgen05_num_epi_warps"].choices, (4,))
+
+    @onlyBackends(["cute"])
+    def test_cute_tcgen05_partial_tile_search_keeps_persistent_pid_types_out(
+        self,
+    ) -> None:
+        """Autotune excludes persistent pid types when the search can sample
+        block sizes that produce partial tiles."""
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_mma(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        args = (
+            torch.randn([256, 64], device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn([64, 192], device=DEVICE, dtype=HALF_DTYPE),
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_mma.bind(args)
+        spec = bound.config_spec
+        self.assertEqual([x.max_size for x in spec.block_sizes], [256, 128, 64])
+        self.assertNotIn("persistent_blocked", spec.allowed_pid_types)
+        self.assertNotIn("persistent_interleaved", spec.allowed_pid_types)
+        self.assertEqual(spec._tcgen05_cluster_m_search_choices, (1,))
+        self.assertEqual(spec._tcgen05_num_epi_warps_search_choices, (4,))
+
+    @onlyBackends(["cute"])
+    def test_cute_tcgen05_multi_root_search_keeps_persistent_pid_types_out(
+        self,
+    ) -> None:
+        """Multi-root tcgen05 kernels keep persistent pid types out of autotune
+        until the persistent scheduler/grid spans every root case."""
+
+        args = (
+            torch.randn([256, 64], device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn([64, 128], device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn([256, 64], device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn([64, 128], device=DEVICE, dtype=HALF_DTYPE),
+        )
+        with patch_cute_mma_support():
+            bound = _cute_two_matmuls_kernel.bind(args)
+        spec = bound.config_spec
+        self.assertNotIn("persistent_blocked", spec.allowed_pid_types)
+        self.assertNotIn("persistent_interleaved", spec.allowed_pid_types)
+        self.assertEqual(spec._tcgen05_cluster_m_search_choices, (1,))
+        self.assertEqual(spec._tcgen05_num_epi_warps_search_choices, (4,))
+
+    @onlyBackends(["cute"])
+    def test_cute_tcgen05_multi_root_forced_persistent_raises_invalid_config(
+        self,
+    ) -> None:
+        """Forced-persistent multi-root tcgen05 has no valid pid search choice."""
+
+        args = (
+            torch.randn([256, 64], device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn([64, 128], device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn([256, 64], device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn([64, 128], device=DEVICE, dtype=HALF_DTYPE),
+        )
+        with (
+            patch_cute_mma_support(),
+            self.assertRaisesRegex(
+                InvalidConfig,
+                "CuTe tcgen05 multi-root kernels do not support persistent pid types",
+            ),
+        ):
+            _cute_two_matmuls_force_persistent_kernel.bind(args)
+
+    @onlyBackends(["cute"])
+    def test_cute_tcgen05_multi_root_distributed_raises_invalid_config(
+        self,
+    ) -> None:
+        """Distributed mode also makes the pid search persistent-only."""
+
+        args = (
+            torch.randn([256, 64], device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn([64, 128], device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn([256, 64], device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn([64, 128], device=DEVICE, dtype=HALF_DTYPE),
+        )
+        with (
+            patch_cute_mma_support(),
+            patch("torch.distributed.is_initialized", return_value=True),
+            patch("torch.distributed.get_rank", return_value=0),
+            patch("torch.distributed.get_world_size", return_value=1),
+            patch("torch.distributed.distributed_c10d.get_rank", return_value=0),
+            patch("torch.distributed.distributed_c10d.get_world_size", return_value=1),
+            patch("torch._logging._internal.dist.get_rank", return_value=0),
+            patch(
+                "torch.fx.experimental.symbolic_shapes.trace_structured",
+                lambda *args, **kwargs: None,
+            ),
+            patch(
+                "helion.runtime.kernel._find_process_group_name",
+                return_value="world",
+            ),
+            patch("helion._dist_utils.max_num_blocks_for_symm_mem", return_value=10000),
+            self.assertRaisesRegex(
+                InvalidConfig,
+                "CuTe tcgen05 multi-root kernels do not support persistent pid types",
+            ),
+        ):
+            _cute_two_matmuls_kernel.bind(args)
 
     def test_narrow_tcgen05_autotune_to_validated_configs_helper(self) -> None:
         """Direct unit test for the narrowing helper that does not depend
@@ -328,7 +814,8 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         # Other pid types are preserved.
         for pid_type in before_pid - {"persistent_blocked", "persistent_interleaved"}:
             self.assertIn(pid_type, spec.allowed_pid_types)
-        # The cluster_m search is now narrowed to (1,).
+        # The cluster_m search is narrowed to (1,) unless the matmul caller
+        # proves it can form validated CtaGroup.TWO search candidates.
         self.assertEqual(spec._tcgen05_cluster_m_search_choices, (1,))
         # The num_epi_warps search is now narrowed to (4,) -- the only
         # currently-correct value on B200 (1 and 2 are directly verified
@@ -341,6 +828,40 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         spec.narrow_tcgen05_autotune_to_validated_configs()
         self.assertNotIn("persistent_blocked", spec.allowed_pid_types)
         self.assertEqual(spec._tcgen05_cluster_m_search_choices, (1,))
+        self.assertEqual(spec._tcgen05_num_epi_warps_search_choices, (4,))
+        self.assertEqual(spec._tcgen05_num_epi_warps_validation_choices, (4,))
+
+        spec = stub.bind(args).config_spec
+        spec.allowed_pid_types = (
+            "flat",
+            "xyz",
+            "persistent_blocked",
+            "persistent_interleaved",
+        )
+        spec.narrow_tcgen05_autotune_to_validated_configs(
+            allow_persistent_pid_types=True
+        )
+        self.assertIn("persistent_blocked", spec.allowed_pid_types)
+        self.assertIn("persistent_interleaved", spec.allowed_pid_types)
+        self.assertEqual(spec._tcgen05_cluster_m_search_choices, (1,))
+        self.assertEqual(spec._tcgen05_num_epi_warps_search_choices, (4,))
+        self.assertEqual(spec._tcgen05_num_epi_warps_validation_choices, (4,))
+
+        spec = stub.bind(args).config_spec
+        spec.allowed_pid_types = (
+            "flat",
+            "xyz",
+            "persistent_blocked",
+            "persistent_interleaved",
+        )
+        spec.narrow_tcgen05_autotune_to_validated_configs(
+            allow_persistent_pid_types=True,
+            allow_cluster_m2_search=True,
+            cluster_m2_static_k=4096,
+        )
+        self.assertIn("persistent_blocked", spec.allowed_pid_types)
+        self.assertIn("persistent_interleaved", spec.allowed_pid_types)
+        self.assertEqual(spec._tcgen05_cluster_m_search_choices, (1, 2))
         self.assertEqual(spec._tcgen05_num_epi_warps_search_choices, (4,))
         self.assertEqual(spec._tcgen05_num_epi_warps_validation_choices, (4,))
 
@@ -471,8 +992,11 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         # _flat_fields exposes that as an EnumFragment with a single
         # choice rather than the default IntegerFragment(1, 4, 4).
         self.assertEqual(flat_fields["tcgen05_num_epi_warps"].choices, (4,))
-        # cluster_m is similarly narrowed via the same helper.
+        # This small-N problem cannot form the validated 256x256
+        # CtaGroup.TWO tile, so cluster_m is narrowed to 1.
         self.assertEqual(flat_fields["tcgen05_cluster_m"].choices, (1,))
+        self.assertIn("persistent_blocked", flat_fields["pid_type"].choices)
+        self.assertIn("persistent_interleaved", flat_fields["pid_type"].choices)
 
     @onlyBackends(["cute"])
     def test_cute_tcgen05_user_config_num_epi_warps_validation(self) -> None:
