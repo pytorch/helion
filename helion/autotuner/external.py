@@ -136,7 +136,16 @@ class _ExternalKernelAdapter(_AutotunableKernel):
 
     @property
     def autotune_hints(self) -> list[Config]:
-        return []
+        hints = self.settings.autotune_hints
+        if hints is None:
+            return []
+        if isinstance(hints, Config):
+            return [hints]
+        if isinstance(hints, dict):
+            return [Config.from_dict(hints)]
+        return [
+            Config.from_dict(hint) if isinstance(hint, dict) else hint for hint in hints
+        ]
 
     def compile_config(
         self,

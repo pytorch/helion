@@ -539,8 +539,8 @@ class BaseSearch(BaseAutotuner):
         raise NotImplementedError
 
     def _autotune_hint_configs(self) -> Sequence[Config]:
-        """Return user-provided autotune hints when the kernel supports them."""
-        return getattr(self.kernel, "autotune_hints", ())
+        """Return user-provided autotune hints normalized by the kernel."""
+        return self.kernel.autotune_hints
 
     def set_generation(self, generation: int) -> None:
         self._autotune_metrics.num_generations = generation

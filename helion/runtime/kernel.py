@@ -116,7 +116,6 @@ class Kernel(Generic[_R]):
         fn: Callable[..., _R],
         *,
         configs: Sequence[ConfigLike] | None = None,
-        autotune_hints: Sequence[ConfigLike] | None = None,
         settings: Settings | None,
         key: Callable[..., Hashable] | None = None,
     ) -> None:
@@ -126,8 +125,6 @@ class Kernel(Generic[_R]):
         Args:
             fn: The function to be compiled as a Helion kernel.
             configs: A list of configurations to use for the kernel.
-            autotune_hints: A list of configurations to seed the autotuner's
-                initial population without restricting the search.
             settings: The settings to be used by the Kernel. If None, a new `Settings()` instance is created.
             key: Optional callable that returns an extra hashable component for specialization.
         """
@@ -142,14 +139,25 @@ class Kernel(Generic[_R]):
         self._key_fn: Callable[..., Hashable] | None = key
         self.configs: list[Config] = [
             # pyrefly: ignore [bad-argument-type]
-            Config(**c) if isinstance(c, dict) else c
-            for c in configs or []
+            Config(**config) if isinstance(config, dict) else config
+            for config in configs or []
         ]
-        self.autotune_hints: list[Config] = [
-            # pyrefly: ignore [bad-argument-type]
-            Config(**c) if isinstance(c, dict) else c
-            for c in autotune_hints or []
-        ]
+        autotune_hints = self.settings.autotune_hints
+        if autotune_hints is None:
+            self.autotune_hints = []
+        elif isinstance(autotune_hints, (Config, dict)):
+            self.autotune_hints = [
+                # pyrefly: ignore [bad-argument-type]
+                Config(**autotune_hints)
+                if isinstance(autotune_hints, dict)
+                else autotune_hints
+            ]
+        else:
+            self.autotune_hints = [
+                # pyrefly: ignore [bad-argument-type]
+                Config(**config) if isinstance(config, dict) else config
+                for config in autotune_hints
+            ]
         self._bound_kernels: dict[BoundKernelInMemoryCacheKey, BoundKernel] = {}
         self._specialize_extra: dict[
             Hashable, list[Callable[[Sequence[object]], Hashable]]
@@ -1121,7 +1129,6 @@ def kernel(
     *,
     config: ConfigLike | None = None,
     configs: Sequence[ConfigLike] | None = None,
-    autotune_hints: ConfigLike | Sequence[ConfigLike] | None = None,
     key: Callable[..., Hashable] | None = None,
     **settings: object,
 ) -> Kernel[_R]: ...
@@ -1133,7 +1140,6 @@ def kernel(
     *,
     config: ConfigLike | None = None,
     configs: Sequence[ConfigLike] | None = None,
-    autotune_hints: ConfigLike | Sequence[ConfigLike] | None = None,
     key: Callable[..., Hashable] | None = None,
     **settings: object,
 ) -> _KernelDecorator: ...
@@ -1144,7 +1150,6 @@ def kernel(
     *,
     config: ConfigLike | None = None,
     configs: Sequence[ConfigLike] | None = None,
-    autotune_hints: ConfigLike | Sequence[ConfigLike] | None = None,
     key: Callable[..., Hashable] | None = None,
     **settings: object,
 ) -> Kernel[_R] | _KernelDecorator:
@@ -1158,8 +1163,6 @@ def kernel(
         configs: A list of configurations to use for the kernel. Can only specify
             one of config or configs. Refer to the ``helion.Config`` class for
             details.
-        autotune_hints: A single configuration or list of configurations to include
-            in the autotuner's initial population without restricting the search.
         key: Optional callable returning a hashable that augments the specialization key.
         settings: Keyword arguments representing settings for the Kernel.
             Can also use settings=Settings(...) to pass a Settings object
@@ -1178,12 +1181,6 @@ def kernel(
         configs = [config]
     elif configs is None:
         configs = []
-    if autotune_hints is None:
-        normalized_autotune_hints = []
-    elif isinstance(autotune_hints, (Config, dict)):
-        normalized_autotune_hints = [autotune_hints]
-    else:
-        normalized_autotune_hints = list(autotune_hints)
 
     if settings_obj := settings.get("settings"):
         assert len(settings) == 1, "settings must be the only keyword argument"
@@ -1195,14 +1192,12 @@ def kernel(
         return functools.partial(
             kernel,
             configs=configs,
-            autotune_hints=normalized_autotune_hints,
             settings=settings_obj,
             key=key,
         )
     return Kernel(
         fn,
         configs=configs,
-        autotune_hints=normalized_autotune_hints,
         settings=settings_obj,
         key=key,
     )

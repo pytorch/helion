@@ -44,7 +44,7 @@ class RandomSearch(FiniteSearch):
                 process_group_name=kernel.env.process_group_name,
             ).random_population(
                 count,
-                config_hints=getattr(kernel, "autotune_hints", ()),
+                config_hints=kernel.autotune_hints,
             ),
         )
 

@@ -34,6 +34,7 @@ if TYPE_CHECKING:
     from .kernel import BoundKernel
 
     _T = TypeVar("_T")
+    ConfigLike = Config | dict[str, object]
 
     class AutotunerFunction(Protocol):
         def __call__(
@@ -473,6 +474,7 @@ class _Settings:
     autotune_config_overrides: dict[str, object] = dataclasses.field(
         default_factory=_get_autotune_config_overrides
     )
+    autotune_hints: ConfigLike | Sequence[ConfigLike] | None = None
     autotune_effort: AutotuneEffort = dataclasses.field(
         default_factory=functools.partial(
             _env_get_literal,
@@ -614,6 +616,10 @@ class Settings(_Settings):
         "autotune_config_overrides": (
             "Dictionary of config key/value pairs forced during autotuning. "
             "Accepts HELION_AUTOTUNE_CONFIG_OVERRIDES='{\"num_warps\":4}'."
+        ),
+        "autotune_hints": (
+            "A Config or sequence of Configs to seed the autotuner initial population "
+            "without constraining the search space."
         ),
         "allow_warp_specialize": "If True, allow warp specialization for tl.range calls on CUDA devices.",
         "debug_dtype_asserts": "If True, emit tl.static_assert checks for dtype after each device node.",
