@@ -1508,15 +1508,14 @@ def _codegen_cute_store_tcgen05_tile(
         f"{ttr_tacc} = cute.group_modes({ttr_tacc_stage}, 3, cute.rank({ttr_tacc_stage}))",
         f"{subtile_count} = cutlass.const_expr(cute.size({ttr_tacc}.shape, mode=[3]))",
         (
-            # Per-subtile loop: all epi warps stage TMEM->reg->SMEM, then a
-            # CTA-scoped named barrier makes the SMEM stage visible before
-            # warp 0 issues the S2G TMA copy. A second barrier keeps the epi
-            # warps from reusing that SMEM stage before warp 0 has committed
-            # the TMA operation. `PipelineTmaStore.create` starts with stages
-            # available, so the first subtile intentionally has no explicit
-            # acquire before its copy. The current acquire-after-commit order
-            # is correct but may serialize some next-subtile work; investigate
-            # acquire-before-R2S staging as a follow-up before changing it.
+            # Per-subtile loop: all epi warps first do TMEM->reg work, then
+            # warp 0 acquires the TMA-store SMEM stage before any warp writes
+            # that stage. A CTA-scoped named barrier ensures all epi warps
+            # have observed warp 0's acquire before they write SMEM; a second
+            # barrier keeps the epi warps from advancing before warp 0 has
+            # issued and committed the TMA operation.
+            # Placing acquire before R2S staging lets the previous subtile's
+            # TMA store overlap this subtile's TMEM load and conversion work.
             f"for _tcgen05_subtile in cutlass.range({subtile_count}, unroll_full=True):\n"
             f"    if {tcgen05_value.epi_active}:\n"
             f"        {ttr_tacc_mn} = {ttr_tacc}[(None, None, None, cutlass.Int32(_tcgen05_subtile))]\n"
@@ -1532,13 +1531,15 @@ def _codegen_cute_store_tcgen05_tile(
             )
             + "\n"
             f"        {c_buffer} = ({tma_c_buffer_expr}) % cutlass.Int32({tcgen05_value.c_stage_count})\n"
+            f"        if {tcgen05_value.warp_idx} == cutlass.Int32(0):\n"
+            f"            {c_pipeline}.producer_acquire()\n"
+            f"        {epilog_sync_barrier}.arrive_and_wait()\n"
             f"        cute.copy({tiled_copy_r2s}, {trs_rd}, {trs_sd}[(None, None, None, {c_buffer})])\n"
             f"        cute.arch.fence_proxy('async.shared', space='cta')\n"
             f"        {epilog_sync_barrier}.arrive_and_wait()\n"
             f"        if {tcgen05_value.warp_idx} == cutlass.Int32(0):\n"
             f"            cute.copy({tcgen05_value.tma_store_atom}, {bsg_sd}[(None, {c_buffer})], {bsg_gd}[(None, cutlass.Int32(_tcgen05_subtile))])\n"
             f"            {c_pipeline}.producer_commit()\n"
-            f"            {c_pipeline}.producer_acquire()\n"
             f"        {epilog_sync_barrier}.arrive_and_wait()\n"
         ),
         (

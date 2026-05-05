@@ -306,6 +306,28 @@ class TestCuteLowerings(unittest.TestCase):
             ),
         )
 
+    def _assert_tma_store_acquire_before_smem_write(self, code: str) -> None:
+        acquire = "tcgen05_c_pipeline.producer_acquire()"
+        r2s_copy = "cute.copy(tcgen05_tiled_copy_r2s"
+        tma_copy = "cute.copy(tcgen05_tma_store_atom"
+        commit = "tcgen05_c_pipeline.producer_commit()"
+
+        self.assertEqual(code.count(acquire), 1, code)
+        acquire_pos = code.find(acquire)
+        r2s_pos = code.find(r2s_copy)
+        tma_pos = code.find(tma_copy)
+        commit_pos = code.find(commit)
+        for needle, pos in (
+            (acquire, acquire_pos),
+            (r2s_copy, r2s_pos),
+            (tma_copy, tma_pos),
+            (commit, commit_pos),
+        ):
+            self.assertGreaterEqual(pos, 0, f"Missing {needle!r} in:\n{code}")
+        self.assertLess(acquire_pos, r2s_pos, code)
+        self.assertLess(r2s_pos, tma_pos, code)
+        self.assertLess(tma_pos, commit_pos, code)
+
     def test_mma_k_loop_selection_uses_reduction_block(self) -> None:
         env = _fake_env({32: 0, 64: 1, 16: 2, 7: 3})
         r_loop = _fake_device_loop(3)
@@ -1123,6 +1145,7 @@ class TestCuteLowerings(unittest.TestCase):
                 self.assertIn("tcgen05_tma_store_role_tile", role_src)
                 self.assertNotIn("cute.nvgpu.CopyUniversalOp()", role_src)
                 self.assertIn("cute.copy(tcgen05_tiled_copy_t2r", role_src)
+                self._assert_tma_store_acquire_before_smem_write(role_src)
                 self.assertIn(
                     "tcgen05_acc_pipeline.consumer_release(tcgen05_acc_consumer_state)",
                     role_src,
@@ -1261,6 +1284,7 @@ class TestCuteLowerings(unittest.TestCase):
             self.assertIn("cute.nvgpu.cpasync.tma_partition", code)
             self.assertIn("cute.copy(tcgen05_tma_store_atom", code)
             self.assertNotIn("cute.nvgpu.CopyUniversalOp()", code)
+            self._assert_tma_store_acquire_before_smem_write(code)
             bound.set_config(cfg)
             out = bound(*args)
 
