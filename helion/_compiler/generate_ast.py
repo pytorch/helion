@@ -157,13 +157,11 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                     prev_global_writes = self._global_barrier_tensor_names(
                         prev_for.host_loop_writes
                     )
-                    cur_info.needs_barrier_before = (
-                        needs_inter_loop_debug_barrier_for_global_raw(
-                            prev_global_writes,
-                            cur_info.host_loop_reads,
-                            global_barrier_tensor_names=self._global_barrier_tensor_names,
-                            prev_metadata_unknown=prev_for.reduction_barrier_unknown,
-                        )
+                    cur_info.needs_barrier_before = needs_inter_loop_debug_barrier_for_global_raw(
+                        prev_global_writes,
+                        cur_info.host_loop_reads,
+                        global_barrier_tensor_names=self._global_barrier_tensor_names,
+                        prev_metadata_unknown=prev_for.reduction_barrier_unknown,
                     )
                 prev_for = cur_info
 
@@ -524,7 +522,6 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                 self.set_on_device(),
                 self.set_statements(body),
             ):
-                self.reset_inter_loop_barrier_state()
                 assert node._root_id is not None
                 root_graph_info = self.get_graph(
                     self.host_function.device_ir.root_ids[node._root_id],
@@ -563,38 +560,6 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                             ) from None
                         bound = fn._signature.bind(*args, **kwargs)
                         bound.apply_defaults()
-                iter_node = node.iter
-                assert isinstance(iter_node, ExtendedAST)
-                with iter_node:
-                    assert isinstance(iter_node, ast.Call)
-                    args = []
-                    kwargs = {}
-                    for arg_node in iter_node.args:
-                        assert not isinstance(arg_node, ast.Starred)
-                        assert isinstance(arg_node, ExtendedAST)
-                        assert arg_node._type_info is not None
-                        args.append(arg_node._type_info.proxy())
-                    for kwarg_node in iter_node.keywords:
-                        assert kwarg_node.arg is not None
-                        assert isinstance(kwarg_node.value, ExtendedAST)
-                        assert kwarg_node.value._type_info is not None
-                        kwargs[kwarg_node.arg] = kwarg_node.value._type_info.proxy()
-                    fn_node = iter_node.func
-                    assert isinstance(fn_node, ExtendedAST)
-                    assert fn_node._type_info is not None
-                    fn = fn_node._type_info.proxy()
-                    assert is_api_func(fn)
-                    env = CompileEnvironment.current()
-                    try:
-                        codegen_fn = fn._codegen[env.codegen_name]
-                    except KeyError:
-                        raise exc.BackendImplementationMissing(
-                            env.backend_name,
-                            f"codegen for API function {fn.__qualname__}",
-                        ) from None
-                    bound = fn._signature.bind(*args, **kwargs)
-                    bound.apply_defaults()
-
                         from .inductor_lowering import CodegenState
 
                         state = CodegenState(
