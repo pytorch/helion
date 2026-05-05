@@ -299,6 +299,22 @@ class BenchmarkProvider(abc.ABC):
         """
         return None
 
+    def benchmark_isolated(
+        self,
+        fns: list[Callable[..., object]],
+        *,
+        warmup: int,
+        rep: int,
+        desc: str = "Benchmarking",
+    ) -> list[float] | None:
+        """Optionally benchmark callables independently via the provider.
+
+        Returning ``None`` means the caller should use its default in-process
+        path. Returning a list gives one timing per callable; isolated failures
+        should be represented as ``inf`` timings.
+        """
+        return None
+
     @abc.abstractmethod
     def setup(self) -> None:
         """Prepare resources needed before benchmarking begins (e.g. tmpdir)."""
@@ -1232,3 +1248,58 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                 self.log.debug(f"{desc} subprocess raised: {type(e).__name__}: {e}")
         self._autotune_metrics.num_compile_failures += len(fn_specs)
         return [inf] * len(fn_specs)
+
+    def benchmark_isolated(
+        self,
+        fns: list[Callable[..., object]],
+        *,
+        warmup: int,
+        rep: int,
+        desc: str = "Benchmarking",
+    ) -> list[float] | None:
+        if not self._subprocess_benchmark_enabled():
+            return None
+        if self.settings.autotune_benchmark_fn is not None:
+            return None
+        if self._precompile_args_path is None:
+            return None
+
+        timings: list[float] = []
+        timeout = float(self.settings.autotune_benchmark_timeout)
+        for fn in fns:
+            fn_spec = self._serialize_fn_for_worker(cast("CompiledConfig", fn))
+            if fn_spec is None:
+                return None
+            job = BenchmarkJob(
+                fn_spec=fn_spec,
+                args_path=self._precompile_args_path,
+                warmup=warmup,
+                rep=rep,
+            )
+            worker_index = (
+                self._pool_manager.worker_index_for_fn(fn)
+                if self._pool_manager is not None
+                else 0
+            )
+            try:
+                timing = self._run_subprocess_job(
+                    job,
+                    timeout,
+                    worker_index=worker_index,
+                )
+            except BenchmarkSubprocessError as e:
+                self.log.warning(f"{desc} subprocess failed: {e}")
+                self._autotune_metrics.num_compile_failures += 1
+                timing = inf
+            except Exception as e:
+                e.__traceback__ = None
+                if match_unrecoverable_runtime_error(e):
+                    self.log.warning(f"{desc} sticky CUDA error skipped: {e}")
+                else:
+                    self.log.debug(
+                        f"{desc} subprocess raised: {type(e).__name__}: {e}"
+                    )
+                self._autotune_metrics.num_compile_failures += 1
+                timing = inf
+            timings.append(float(timing))
+        return timings
