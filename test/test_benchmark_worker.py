@@ -174,6 +174,27 @@ class TestWorkerPoolPrecompile(unittest.TestCase):
 
         self.assertEqual(settings.get_rebenchmark_threshold(), 1.25)
 
+    def test_pool_mode_defaults_suspicious_rebenchmark_ratio(self) -> None:
+        # Pool mode rechecks suspiciously fast rebenchmark timings by default.
+        self.assertEqual(
+            Settings(autotune_precompile="pool").get_suspicious_rebenchmark_ratio(),
+            0.9,
+        )
+        self.assertIsNone(
+            Settings(autotune_precompile="fork").get_suspicious_rebenchmark_ratio()
+        )
+
+    def test_explicit_suspicious_rebenchmark_ratio_overrides_pool_default(
+        self,
+    ) -> None:
+        # Explicit suspicious rebenchmark ratios should override the pool default.
+        settings = Settings(
+            autotune_precompile="pool",
+            autotune_suspicious_rebenchmark_ratio=0.75,
+        )
+
+        self.assertEqual(settings.get_suspicious_rebenchmark_ratio(), 0.75)
+
     def test_pool_mode_env_value_is_supported(self) -> None:
         # HELION_AUTOTUNE_PRECOMPILE=pool should parse into the pool mode.
         with patch.dict(os.environ, {"HELION_AUTOTUNE_PRECOMPILE": "pool"}):
@@ -390,7 +411,7 @@ class TestWorkerPoolPrecompile(unittest.TestCase):
 
         provider = FakeProvider()
         search = cast("Any", PopulationBasedSearch.__new__(PopulationBasedSearch))
-        search.settings = Settings(autotune_precompile="pool")
+        search.settings = Settings(autotune_precompile="fork")
         search.kernel = SimpleNamespace(env=SimpleNamespace(process_group_name=None))
         search.best_perf_so_far = 1.0
         search.benchmark_provider = provider
@@ -405,6 +426,62 @@ class TestWorkerPoolPrecompile(unittest.TestCase):
         self.assertEqual(provider.repeat, 200)
         self.assertEqual(members[0].perfs[-1], 0.70)
         self.assertEqual(members[1].perfs[-1], 0.80)
+
+    def test_pool_rebenchmark_confirms_suspicious_timings(self) -> None:
+        # Pool mode should recheck timings that are suspiciously faster than before.
+        class FakeProvider:
+            def __init__(self) -> None:
+                self.mutated_arg_indices: list[int] = []
+                self.confirm_fns: list[object] | None = None
+                self.confirm_warmup: int | None = None
+                self.confirm_rep: int | None = None
+
+            def rebenchmark(
+                self,
+                fns: list[object],
+                *,
+                repeat: int,
+                desc: str,
+            ) -> list[float]:
+                return [0.70, 0.95]
+
+            def benchmark_isolated(
+                self,
+                fns: list[object],
+                *,
+                warmup: int,
+                rep: int,
+                desc: str,
+            ) -> list[float]:
+                self.confirm_fns = fns
+                self.confirm_warmup = warmup
+                self.confirm_rep = rep
+                return [0.92]
+
+        def fn_a() -> None:
+            pass
+
+        def fn_b() -> None:
+            pass
+
+        provider = FakeProvider()
+        search = cast("Any", PopulationBasedSearch.__new__(PopulationBasedSearch))
+        search.settings = Settings(autotune_precompile="pool")
+        search.kernel = SimpleNamespace(env=SimpleNamespace(process_group_name=None))
+        search.best_perf_so_far = 1.0
+        search.benchmark_provider = provider
+        members = [
+            PopulationMember(fn=fn_a, perfs=[1.00], flat_values=[], config=Config()),
+            PopulationMember(fn=fn_b, perfs=[1.00], flat_values=[], config=Config()),
+        ]
+
+        search.rebenchmark(members, desc="verify")
+
+        self.assertEqual(provider.confirm_fns, [fn_a])
+        self.assertEqual(provider.confirm_warmup, 25)
+        self.assertEqual(provider.confirm_rep, 100)
+        self.assertEqual(members[0].perfs[-1], 0.92)
+        self.assertEqual(members[1].perfs[-1], 0.95)
 
     def test_false_precompile_result_is_failure(self) -> None:
         # A worker precompile returning False should count as a real compile failure.
