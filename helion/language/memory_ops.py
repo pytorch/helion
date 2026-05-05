@@ -1512,10 +1512,14 @@ def _codegen_cute_store_tcgen05_tile(
             # warp 0 acquires the TMA-store SMEM stage before any warp writes
             # that stage. A CTA-scoped named barrier ensures all epi warps
             # have observed warp 0's acquire before they write SMEM; a second
-            # barrier keeps the epi warps from advancing before warp 0 has
-            # issued and committed the TMA operation.
+            # barrier ensures the SMEM writes and fence are visible before
+            # warp 0 issues and commits the TMA operation.
             # Placing acquire before R2S staging lets the previous subtile's
             # TMA store overlap this subtile's TMEM load and conversion work.
+            # After warp 0 commits the TMA store, the next subtile's
+            # producer_acquire plus the first named barrier are enough to
+            # keep all epi warps from writing a reused SMEM stage too early.
+            # Avoiding a post-commit barrier matches Quack's epilogue loop.
             f"for _tcgen05_subtile in cutlass.range({subtile_count}, unroll_full=True):\n"
             f"    if {tcgen05_value.epi_active}:\n"
             f"        {ttr_tacc_mn} = {ttr_tacc}[(None, None, None, cutlass.Int32(_tcgen05_subtile))]\n"
@@ -1540,7 +1544,6 @@ def _codegen_cute_store_tcgen05_tile(
             f"        if {tcgen05_value.warp_idx} == cutlass.Int32(0):\n"
             f"            cute.copy({tcgen05_value.tma_store_atom}, {bsg_sd}[(None, {c_buffer})], {bsg_gd}[(None, cutlass.Int32(_tcgen05_subtile))])\n"
             f"            {c_pipeline}.producer_commit()\n"
-            f"        {epilog_sync_barrier}.arrive_and_wait()\n"
         ),
         (
             f"if {tcgen05_value.warp_idx} == cutlass.Int32(0):\n"
