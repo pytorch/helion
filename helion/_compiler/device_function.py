@@ -207,6 +207,7 @@ class CuteTcgen05StoreValue:
     epi_tidx: str = ""
     epi_active: str = ""
     exec_active: str = ""
+    warp_idx: str = ""
     epi_tile: str = ""
     c_stage_count: int = 0
     epilog_sync_barrier_id: int = 0
@@ -224,9 +225,12 @@ class CuteTcgen05StoreValue:
     tma_warp: str = ""
     tma_pipeline: str = ""
     tma_producer_state: str = ""
+    tma_store_atom: str = ""
+    tma_store_tensor: str = ""
     is_two_cta: bool = False
     use_tma: bool = False
     use_role_local_epi: bool = False
+    use_tma_store_epilogue: bool = False
     ab_stage_count: int = 0
     acc_stage_count: int = 0
 
