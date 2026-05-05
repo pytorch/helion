@@ -1,18 +1,15 @@
 name: Benchmark TPU Nightly
 
+# TODO: delete this file before merging.
+# Nightly TPU runs are dispatched from benchmark_nightly.yml (run_tpu: 'true').
+# This file only exists to give the PR branch its own push-triggered TPU run
+# while iterating on the dashboard integration. After merge, manual TPU runs
+# go through benchmark_dispatch.yml directly (run_tpu=true).
+
 on:
-  push:  # TODO: remove before merging — temporary trigger for CI testing
+  push:
     branches:
       - yifeixu/tpu-nightly-benchmark
-  schedule:
-    - cron: '0 10 * * *'  # Runs at 2 AM PST (10 AM UTC)
-  workflow_dispatch:
-    inputs:
-      kernels_tpu:
-        description: 'Comma-separated list of kernels to benchmark on TPU'
-        required: false
-        type: string
-        default: ''
 
 jobs:
   dispatch-benchmark:
@@ -26,20 +23,15 @@ jobs:
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
-            const inputs = {
-              run_h100: 'false',
-              run_b200: 'false',
-              run_mi350x: 'false',
-              run_tpu: 'true',
-            };
-            const kernelsTpu = '${{ github.event.inputs.kernels_tpu }}';
-            if (kernelsTpu) {
-              inputs.kernels_tpu = kernelsTpu;
-            }
             await github.rest.actions.createWorkflowDispatch({
               owner: context.repo.owner,
               repo: context.repo.repo,
               workflow_id: 'benchmark_dispatch.yml',
               ref: context.ref.replace('refs/heads/', ''),
-              inputs,
+              inputs: {
+                run_h100: 'false',
+                run_b200: 'false',
+                run_mi350x: 'false',
+                run_tpu: 'true',
+              },
             })
