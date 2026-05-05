@@ -8,48 +8,38 @@ on:
     - cron: '0 10 * * *'  # Runs at 2 AM PST (10 AM UTC)
   workflow_dispatch:
     inputs:
-      kernels:
-        description: 'Comma-separated list of kernels to benchmark'
+      kernels_tpu:
+        description: 'Comma-separated list of kernels to benchmark on TPU'
         required: false
         type: string
-        # Excluded kernels:
-        #   grpo_loss: complex multi-kernel setup, needs special handling
-        #   jagged_hstu_attn: complex jagged attention with special data setup
-        # rms_norm_bwd is placed last because some autotune config triggers a
-        # fatal TPU "program continuator halted" error that crashes the whole
-        # Python process; keeping it last contains the blast radius so the
-        # other kernels still get autotuned in pass 1.
-        default: "exp,add,softmax_two_pass,welford,attention,bmm,matmul,matmul_layernorm,cross_entropy,embedding,broadcast_matmul,geglu,low_mem_dropout,swiglu,batch_softmax,sum,rms_norm,layer_norm,softmax,long_sum_naive,long_sum_loop,long_sum_manual,se_block,squeeze_and_excitation_net,rms_norm_bwd"
-      autotuner:
-        description: |
-          Optional HELION_AUTOTUNER override. Leave empty for the default
-          LFBOTreeSearch. Set to "LLMGuidedSearch" or "LLMSeededLFBOTreeSearch"
-          to use an LLM-guided search (requires the HELION_LLM_API_KEY repo
-          secret to be configured).
-        required: false
-        type: choice
         default: ''
-        options:
-          - ''
-          - 'LLMGuidedSearch'
-          - 'LLMSeededLFBOTreeSearch'
-      llm_model:
-        description: 'LLM model name when autotuner is LLM-based.'
-        required: false
-        type: string
-        default: 'claude-opus-4-7'
-
-permissions:
-  contents: read
 
 jobs:
-  benchmark-tpu:
-    uses: ./.github/workflows/benchmark_tpu.yml
+  dispatch-benchmark:
+    runs-on: ubuntu-latest
     permissions:
+      actions: write
       contents: read
-    secrets:
-      HELION_LLM_API_KEY: ${{ secrets.HELION_LLM_API_KEY }}
-    with:
-      kernels: ${{ github.event.inputs.kernels || 'exp,add,softmax_two_pass,welford,attention,bmm,matmul,matmul_layernorm,cross_entropy,embedding,broadcast_matmul,geglu,low_mem_dropout,swiglu,batch_softmax,sum,rms_norm,layer_norm,softmax,long_sum_naive,long_sum_loop,long_sum_manual,se_block,squeeze_and_excitation_net,rms_norm_bwd' }}
-      autotuner: ${{ github.event.inputs.autotuner || '' }}
-      llm_model: ${{ github.event.inputs.llm_model || 'claude-opus-4-7' }}
+    steps:
+      - name: Dispatch benchmark_dispatch workflow (TPU only)
+        uses: actions/github-script@v9
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const inputs = {
+              run_h100: 'false',
+              run_b200: 'false',
+              run_mi350x: 'false',
+              run_tpu: 'true',
+            };
+            const kernelsTpu = '${{ github.event.inputs.kernels_tpu }}';
+            if (kernelsTpu) {
+              inputs.kernels_tpu = kernelsTpu;
+            }
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'benchmark_dispatch.yml',
+              ref: context.ref.replace('refs/heads/', ''),
+              inputs,
+            })
