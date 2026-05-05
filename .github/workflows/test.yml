@@ -214,6 +214,28 @@ jobs:
           uv pip install libtpu==0.0.40
           cd -
           rm -rf /tmp/torch_tpu
+          # torch_tpu's backend extension dynamically links against libpython3.X.so.
+          # uv-managed (python-build-standalone) interpreters ship libpython under
+          # sys.base_prefix/lib, while system Python uses sysconfig's LIBDIR; pick
+          # whichever actually contains LDLIBRARY.
+          PYTHON_LIB_DIR="$(python -c '
+          import os, sys, sysconfig
+          ldlib = sysconfig.get_config_var("LDLIBRARY") or ""
+          for d in (
+              os.path.join(sys.base_prefix, "lib"),
+              sysconfig.get_config_var("LIBDIR") or "",
+              sysconfig.get_config_var("LIBPL") or "",
+          ):
+              if d and ldlib and os.path.exists(os.path.join(d, ldlib)):
+                  print(d)
+                  break
+          ')"
+          if [ -z "$PYTHON_LIB_DIR" ]; then
+            echo "Could not locate libpython shared object" >&2
+            exit 1
+          fi
+          echo "LD_LIBRARY_PATH=${PYTHON_LIB_DIR}:${LD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"
+          export LD_LIBRARY_PATH="${PYTHON_LIB_DIR}:${LD_LIBRARY_PATH:-}"
           # Verify
           python -c "from torch_tpu import api; print(f'TPU device: {api.tpu_device()}')"
 
