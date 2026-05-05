@@ -984,13 +984,15 @@ class TestCuteLowerings(unittest.TestCase):
     def test_tcgen05_persistent_kloop_producer_lifts_to_role_local_while(
         self,
     ) -> None:
-        """Persistent tcgen05 lifts mainloop producer and exec work into
+        """Persistent tcgen05 lifts producer, exec, and epi work into
         role-local persistent loops. The TMA producer K-loop is now a
         top-level extracted role block, not an inline wrapper inside the
         shared K-loop, and its predicate drops the inline
         ``tcgen05_tma_warp`` gate because the enclosing role-local loop
         already restricts execution to that warp. The MMA-exec role owns
-        AB consumer wait/release, UMMA issue, and acc producer state."""
+        AB consumer wait/release, UMMA issue, and acc producer state. The
+        epi role owns acc consumer wait/release and the SIMT TMEM->GMEM
+        store body."""
 
         @helion.kernel(backend="cute")
         def cute_matmul_persistent_role(
@@ -1027,9 +1029,13 @@ class TestCuteLowerings(unittest.TestCase):
         exec_role_predicate = (
             "cute.arch.make_warp_uniform(cute.arch.warp_idx()) == cutlass.Int32(4)"
         )
+        epi_role_predicate = (
+            "cute.arch.make_warp_uniform(cute.arch.warp_idx()) < cutlass.Int32(4)"
+        )
         tree = ast.parse(code)
         found_role_local_producer_loop = False
         found_role_local_exec_loop = False
+        found_role_local_epi_loop = False
         shared_loop_has_tma_producer = False
         shared_loop_preserves_barriers = False
         shared_scheduler_retargeted_to_exec = False
@@ -1096,6 +1102,34 @@ class TestCuteLowerings(unittest.TestCase):
 
         for node in ast.walk(tree):
             if not (
+                isinstance(node, ast.If)
+                and ast.unparse(node.test) == epi_role_predicate
+            ):
+                continue
+            for role_child in ast.walk(node):
+                if not (
+                    isinstance(role_child, ast.While)
+                    and "tcgen05_role_local" in ast.unparse(role_child.test)
+                ):
+                    continue
+                role_src = ast.unparse(role_child)
+                self.assertIn(
+                    "tcgen05_acc_pipeline.consumer_wait(tcgen05_acc_consumer_state)",
+                    role_src,
+                )
+                self.assertIn("cute.nvgpu.CopyUniversalOp()", role_src)
+                self.assertIn("cute.copy(tcgen05_tiled_copy_t2r", role_src)
+                self.assertIn("cute.copy(tcgen05_simt_atom", role_src)
+                self.assertIn(
+                    "tcgen05_acc_pipeline.consumer_release(tcgen05_acc_consumer_state)",
+                    role_src,
+                )
+                self.assertIn("tcgen05_acc_consumer_state.advance()", role_src)
+                self.assertNotIn("cute.arch.sync_threads()", role_src)
+                found_role_local_epi_loop = True
+
+        for node in ast.walk(tree):
+            if not (
                 isinstance(node, ast.While)
                 and ast.unparse(node.test) == "tcgen05_work_tile_valid"
             ):
@@ -1110,6 +1144,15 @@ class TestCuteLowerings(unittest.TestCase):
                 "tcgen05_acc_pipeline.producer_commit(tcgen05_acc_producer_state)",
                 shared_src,
             )
+            self.assertNotIn(
+                "tcgen05_acc_pipeline.consumer_wait(tcgen05_acc_consumer_state)",
+                shared_src,
+            )
+            self.assertNotIn(
+                "tcgen05_acc_pipeline.consumer_release(tcgen05_acc_consumer_state)",
+                shared_src,
+            )
+            self.assertNotIn("cute.nvgpu.CopyUniversalOp()", shared_src)
             shared_loop_preserves_barriers = "cute.arch.sync_threads()" in shared_src
             shared_scheduler_retargeted_to_exec = (
                 "cute.arch.make_warp_uniform(cute.arch.warp_idx()) == cutlass.Int32(4)"
@@ -1136,6 +1179,11 @@ class TestCuteLowerings(unittest.TestCase):
             found_role_local_exec_loop,
             "Expected a role-local MMA-exec while containing AB consumer, "
             "UMMA issue, and acc producer work. Generated code:\n" + code,
+        )
+        self.assertTrue(
+            found_role_local_epi_loop,
+            "Expected a role-local epilogue while containing acc consumer "
+            "and SIMT store work. Generated code:\n" + code,
         )
         self.assertTrue(
             shared_loop_preserves_barriers,
@@ -1208,10 +1256,10 @@ class TestCuteLowerings(unittest.TestCase):
         """Multi-tile + persistent + tcgen05 must raise ``RuntimeError``.
 
         The persistent + tcgen05 combo produces wrong output when the
-        kernel processes more than one work tile total. Until the role-
-        local persistent rewrite lands, the codegen emits a host-side
-        guard that fails loudly instead of silently returning bad data.
-        This test pins that guard.
+        kernel processes more than one work tile total. The role-local
+        persistent shape is now emitted for the current roles, but the
+        codegen still emits a host-side guard until multi-tile runtime
+        correctness is proven. This test pins that guard.
         """
 
         from helion._compiler.cute.mma_support import get_cute_mma_support
@@ -4018,6 +4066,7 @@ class TestPersistentLoopSplitter(unittest.TestCase):
                 self._post_loop_ids: set[int] = set()
                 self._tma_load_role_ids: set[int] = set()
                 self._mma_exec_role_ids: set[int] = set()
+                self._epi_role_ids: set[int] = set()
 
             def register_cute_tcgen05_per_tile_stmts(
                 self, stmts: list[ast.AST]
@@ -4080,6 +4129,22 @@ class TestPersistentLoopSplitter(unittest.TestCase):
             def cute_tcgen05_mma_exec_role_stmt_ids(self) -> frozenset[int]:
                 return frozenset(self._mma_exec_role_ids)
 
+            def register_cute_tcgen05_epi_role_stmts(
+                self, stmts: list[ast.AST]
+            ) -> None:
+                self._epi_role_ids.update(id(s) for s in stmts)
+
+            def is_cute_tcgen05_epi_role(self, stmt: ast.AST) -> bool:
+                return id(stmt) in self._epi_role_ids
+
+            @property
+            def has_cute_tcgen05_epi_role_marks(self) -> bool:
+                return bool(self._epi_role_ids)
+
+            @property
+            def cute_tcgen05_epi_role_stmt_ids(self) -> frozenset[int]:
+                return frozenset(self._epi_role_ids)
+
         splitter = Tcgen05PersistentProgramIDs.__new__(Tcgen05PersistentProgramIDs)
         # The splitter walks ASTs looking for references to the
         # virtual_pid var. Tests use simple statements that don't mention
@@ -4095,6 +4160,9 @@ class TestPersistentLoopSplitter(unittest.TestCase):
         )
         splitter._tcgen05_mma_exec_role_predicate = (  # type: ignore[attr-defined]
             lambda: "__test_mma_exec_warp__"
+        )
+        splitter._tcgen05_epi_role_predicate = (  # type: ignore[attr-defined]
+            lambda: "__test_epi_warp__"
         )
         return splitter, _MinimalDeviceFunction()
 
@@ -4118,6 +4186,7 @@ class TestPersistentLoopSplitter(unittest.TestCase):
                 self._per_tile_ids: set[int] = set()
                 self._tma_load_role_ids: set[int] = set()
                 self._mma_exec_role_ids: set[int] = set()
+                self._epi_role_ids: set[int] = set()
 
             def new_var(self, name: str) -> str:
                 self._counter += 1
@@ -4166,6 +4235,22 @@ class TestPersistentLoopSplitter(unittest.TestCase):
             @property
             def cute_tcgen05_mma_exec_role_stmt_ids(self) -> frozenset[int]:
                 return frozenset(self._mma_exec_role_ids)
+
+            def register_cute_tcgen05_epi_role_stmts(
+                self, stmts: list[ast.AST]
+            ) -> None:
+                self._epi_role_ids.update(id(s) for s in stmts)
+
+            def is_cute_tcgen05_epi_role(self, stmt: ast.AST) -> bool:
+                return id(stmt) in self._epi_role_ids
+
+            @property
+            def has_cute_tcgen05_epi_role_marks(self) -> bool:
+                return bool(self._epi_role_ids)
+
+            @property
+            def cute_tcgen05_epi_role_stmt_ids(self) -> frozenset[int]:
+                return frozenset(self._epi_role_ids)
 
         class _PidStub:
             def num_pids_expr(self, *, is_device: bool) -> str:
@@ -4351,18 +4436,28 @@ class TestPersistentLoopSplitter(unittest.TestCase):
         shared = self._stmt("tile = pid")
         tma_load = self._stmt("tma_pipeline.producer_acquire(s)")
         mma_exec = self._stmt("acc_pipeline.producer_acquire(s)")
-        df.register_cute_tcgen05_per_tile_stmts([tma_load, mma_exec])
+        epi = self._stmt("acc_pipeline.consumer_wait(s)")
+        df.register_cute_tcgen05_per_tile_stmts([tma_load, mma_exec, epi])
         df.register_cute_tcgen05_tma_load_role_stmts([tma_load])
         df.register_cute_tcgen05_mma_exec_role_stmts([mma_exec])
+        df.register_cute_tcgen05_epi_role_stmts([epi])
 
-        blocks = splitter._collect_tcgen05_role_blocks(df, [shared, tma_load, mma_exec])
+        blocks = splitter._collect_tcgen05_role_blocks(
+            df, [shared, tma_load, mma_exec, epi]
+        )
 
         self.assertEqual(
             [block.role_predicate for block in blocks],
-            [None, "__test_tma_load_warp__", "__test_mma_exec_warp__"],
+            [
+                None,
+                "__test_tma_load_warp__",
+                "__test_mma_exec_warp__",
+                "__test_epi_warp__",
+            ],
         )
         self.assertEqual(blocks[1].stmts, [tma_load])
         self.assertEqual(blocks[2].stmts, [mma_exec])
+        self.assertEqual(blocks[3].stmts, [epi])
 
     def test_role_blocks_preserve_relative_order_in_emit(self) -> None:
         """Tagged statements stay in their original positions relative
@@ -4948,17 +5043,21 @@ class TestPersistentLoopSplitter(unittest.TestCase):
         self.assertNotEqual(y_pos, -1)
         self.assertLess(x_pos, y_pos)
 
-    def test_role_local_tile_body_orders_tma_before_exec(self) -> None:
+    def test_role_local_tile_body_orders_tma_before_exec_before_epi(self) -> None:
         """The exec role may be tagged earlier in source order because
         acc-fragment setup is emitted before TMA partition setup. The
-        role-local consumer still emits the TMA-load producer loop before
-        the MMA-exec loop so producer work reaches the AB pipeline first."""
+        epi role may be tagged even later from the store path. The role-local
+        consumer still emits TMA-load before MMA-exec before epi so producer
+        work reaches the AB pipeline first and accumulator stages are published
+        before epilogue warps consume them."""
         stub_df, splitter = self._make_role_local_stubs(num_pid_dims=1)
         layout = self._make_minimal_layout()
         mma_exec = self._stmt("acc_pipeline.producer_acquire(s_exec)")
         tma_load = self._stmt("tma_pipeline.producer_acquire(s_tma)")
-        body = [mma_exec, tma_load]
-        stub_df.register_cute_tcgen05_per_tile_stmts([mma_exec, tma_load])
+        epi = self._stmt("acc_pipeline.consumer_wait(s_epi)")
+        body = [epi, mma_exec, tma_load]
+        stub_df.register_cute_tcgen05_per_tile_stmts([epi, mma_exec, tma_load])
+        stub_df.register_cute_tcgen05_epi_role_stmts([epi])
         stub_df.register_cute_tcgen05_mma_exec_role_stmts([mma_exec])
         stub_df.register_cute_tcgen05_tma_load_role_stmts([tma_load])
         partition = splitter._partition_tcgen05_role_blocks(stub_df, body)
@@ -4967,13 +5066,14 @@ class TestPersistentLoopSplitter(unittest.TestCase):
             stub_df, layout, partition
         )
 
-        self.assertEqual(len(role_local_whiles), 2)
+        self.assertEqual(len(role_local_whiles), 3)
         self.assertEqual(
             ast.unparse(role_local_whiles[0].test), "__test_tma_load_warp__"
         )
         self.assertEqual(
             ast.unparse(role_local_whiles[1].test), "__test_mma_exec_warp__"
         )
+        self.assertEqual(ast.unparse(role_local_whiles[2].test), "__test_epi_warp__")
 
     def test_role_local_while_uses_layout_cluster_m(self) -> None:
         """The role-local scheduler MUST use the same cluster shape as

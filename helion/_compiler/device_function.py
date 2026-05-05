@@ -226,6 +226,7 @@ class CuteTcgen05StoreValue:
     tma_producer_state: str = ""
     is_two_cta: bool = False
     use_tma: bool = False
+    use_role_local_epi: bool = False
     ab_stage_count: int = 0
     acc_stage_count: int = 0
 
@@ -406,6 +407,7 @@ class DeviceFunction:
         self._cute_tcgen05_post_loop_stmt_ids: set[int] = set()
         self._cute_tcgen05_tma_load_role_stmt_ids: set[int] = set()
         self._cute_tcgen05_mma_exec_role_stmt_ids: set[int] = set()
+        self._cute_tcgen05_epi_role_stmt_ids: set[int] = set()
         self._cute_collective_handled_loads: set[str] = set()
         self.cute_cluster_shape: tuple[int, int, int] | None = None
         self.cute_block_shape: tuple[int, int, int] | None = None
@@ -714,6 +716,27 @@ class DeviceFunction:
     def cute_tcgen05_mma_exec_role_stmt_ids(self) -> frozenset[int]:
         """Snapshot of every registered MMA-exec role-tag id."""
         return frozenset(self._cute_tcgen05_mma_exec_role_stmt_ids)
+
+    def register_cute_tcgen05_epi_role_stmts(self, stmts: list[ast.AST]) -> None:
+        """Mark statements that belong to the epilogue warp role block.
+
+        The persistent tcgen05 role partitioner pulls these statements into
+        an epi-warp-local ``while``. Use for acc-pipeline consumer work and
+        TMEM-to-GMEM store work that must advance once per tile on epi warps.
+        """
+        self._cute_tcgen05_epi_role_stmt_ids.update(id(stmt) for stmt in stmts)
+
+    def is_cute_tcgen05_epi_role(self, stmt: ast.stmt) -> bool:
+        return id(stmt) in self._cute_tcgen05_epi_role_stmt_ids
+
+    @property
+    def has_cute_tcgen05_epi_role_marks(self) -> bool:
+        return bool(self._cute_tcgen05_epi_role_stmt_ids)
+
+    @property
+    def cute_tcgen05_epi_role_stmt_ids(self) -> frozenset[int]:
+        """Snapshot of every registered epilogue role-tag id."""
+        return frozenset(self._cute_tcgen05_epi_role_stmt_ids)
 
     def get_cute_tcgen05_store_value(self, name: str) -> CuteTcgen05StoreValue | None:
         for alias in self._variable_renames.get(name, [name]):

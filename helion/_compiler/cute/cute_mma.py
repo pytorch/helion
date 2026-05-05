@@ -1272,6 +1272,8 @@ def _emit_mma_pipeline(
     )
     # Keep a distinct name so future MMA-exec gating changes are localized.
     tcgen05_use_role_local_mma_exec = tcgen05_use_role_local_tma_producer
+    # Keep a distinct name so future epi-role gating changes are localized.
+    tcgen05_use_role_local_epi = tcgen05_use_role_local_tma_producer
     tcgen05_collective_handles_operand_loads = (
         mma_impl == "tcgen05"
         and fx_node is not None
@@ -2630,6 +2632,7 @@ def _emit_mma_pipeline(
                 tma_producer_state=tma_producer_state,
                 is_two_cta=tcgen05_is_two_cta,
                 use_tma=tcgen05_use_tma,
+                use_role_local_epi=tcgen05_use_role_local_epi,
                 ab_stage_count=tcgen05_ab_stage_count_value,
                 acc_stage_count=tcgen05_acc_stage_count_value,
             ),
