@@ -1028,11 +1028,13 @@ class TestExamples(RefEagerTestBase, TestCase):
     def test_jagged_mean(self):
         num_rows, max_cols = 32, 64
         M = 8  # number of features
-        lengths = torch.randint(1, max_cols + 1, (num_rows,), device=DEVICE)
+        lengths = torch.randint(
+            1, max_cols + 1, (num_rows,), dtype=LONG_INT_TYPE, device=DEVICE
+        )
         x_offsets = torch.cat(
             [
-                torch.zeros(1, dtype=torch.long, device=DEVICE),
-                torch.cumsum(lengths, dim=0),
+                torch.zeros(1, dtype=LONG_INT_TYPE, device=DEVICE),
+                torch.cumsum(lengths, dim=0, dtype=LONG_INT_TYPE),
             ]
         )
         nnz = int(x_offsets[-1])
@@ -1330,11 +1332,13 @@ class TestExamples(RefEagerTestBase, TestCase):
     def test_jagged_softmax(self):
         num_rows, max_cols = 128, 64
         M = 8  # number of features
-        lengths = torch.randint(1, max_cols + 1, (num_rows,), device=DEVICE)
+        lengths = torch.randint(
+            1, max_cols + 1, (num_rows,), dtype=LONG_INT_TYPE, device=DEVICE
+        )
         x_offsets = torch.cat(
             [
-                torch.zeros(1, dtype=torch.long, device=DEVICE),
-                torch.cumsum(lengths, dim=0),
+                torch.zeros(1, dtype=LONG_INT_TYPE, device=DEVICE),
+                torch.cumsum(lengths, dim=0, dtype=LONG_INT_TYPE),
             ]
         )
         nnz = int(x_offsets[-1])
@@ -1373,7 +1377,7 @@ class TestExamples(RefEagerTestBase, TestCase):
         seq_offsets = torch.cat(
             [
                 torch.tensor([0], dtype=torch.int32, device=DEVICE),
-                torch.cumsum(seq_lengths, dim=0),
+                torch.cumsum(seq_lengths, dim=0, dtype=torch.int32),
             ]
         )
         total_seq_len = int(seq_offsets[-1].item())
@@ -1696,11 +1700,13 @@ class TestExamples(RefEagerTestBase, TestCase):
     def test_jagged_sum(self):
         num_rows, max_cols = 128, 64
         M = 8  # number of features
-        lengths = torch.randint(1, max_cols + 1, (num_rows,), device=DEVICE)
+        lengths = torch.randint(
+            1, max_cols + 1, (num_rows,), dtype=LONG_INT_TYPE, device=DEVICE
+        )
         x_offsets = torch.cat(
             [
-                torch.zeros(1, dtype=torch.long, device=DEVICE),
-                torch.cumsum(lengths, dim=0),
+                torch.zeros(1, dtype=LONG_INT_TYPE, device=DEVICE),
+                torch.cumsum(lengths, dim=0, dtype=LONG_INT_TYPE),
             ]
         )
         nnz = int(x_offsets[-1])
@@ -1769,11 +1775,13 @@ class TestExamples(RefEagerTestBase, TestCase):
     def test_jagged_layer_norm(self):
         num_rows, max_cols = 128, 64
         M = 8  # number of features
-        lengths = torch.randint(1, max_cols + 1, (num_rows,), device=DEVICE)
+        lengths = torch.randint(
+            1, max_cols + 1, (num_rows,), dtype=LONG_INT_TYPE, device=DEVICE
+        )
         x_offsets = torch.cat(
             [
-                torch.zeros(1, dtype=torch.long, device=DEVICE),
-                torch.cumsum(lengths, dim=0),
+                torch.zeros(1, dtype=LONG_INT_TYPE, device=DEVICE),
+                torch.cumsum(lengths, dim=0, dtype=LONG_INT_TYPE),
             ]
         )
         nnz = int(x_offsets[-1])
