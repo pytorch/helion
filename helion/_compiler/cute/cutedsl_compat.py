@@ -172,10 +172,10 @@ def emit_producer_tail_umma_async(
     """Emit code equivalent to ``<pipeline>.producer_tail(<state>)`` for a
     ``PipelineUmmaAsync`` (sm100 UMMA→async-consumer) pipeline.
 
-    The cutedsl implementation loops ``num_stages`` times, doing
-    ``sync_object_empty.wait`` followed by ``state.advance()`` per
-    iteration. We inline the wait + advance so each ``advance`` becomes
-    the same single-result-ternary workaround used by
+    The cutedsl implementation gates the drain to the leader CTA, advances
+    ``num_stages - 1`` times, then calls ``producer_acquire``. We inline
+    the same leader guard plus advances so each ``advance`` becomes the
+    same single-result-ternary workaround used by
     :func:`emit_pipeline_advance`. ``num_stages`` is the compile-time
     ``acc_stage_count`` from helion's tcgen05 plan.
     """
@@ -183,17 +183,19 @@ def emit_producer_tail_umma_async(
         return f"{indent}{pipeline_expr}.producer_tail({state_expr})"
 
     inner = indent + "    "
-    body_lines = [f"{indent}if True:"]
-    wait_line = (
-        f"{inner}{pipeline_expr}.sync_object_empty.wait("
-        f"{state_expr}.index, {state_expr}.phase)"
-    )
-    for _ in range(num_stages):
+    leader_inner = inner + "    "
+    body_lines = [
+        f"{indent}if True:",
+        f"{inner}_pt_bidx = cute.arch.block_idx_in_cluster()",
+        f"{inner}_pt_cta_rank = cute.arch.make_warp_uniform(_pt_bidx)",
+        f"{inner}if _pt_cta_rank % cutlass.Int32(2) == cutlass.Int32(0):",
+    ]
+    for _ in range(num_stages - 1):
         body_lines.extend(
             (
-                wait_line,
-                f"{inner}if True:",
-                *_advance_lines(state_expr, inner + "    "),
+                f"{leader_inner}if True:",
+                *_advance_lines(state_expr, leader_inner + "    "),
             )
         )
+    body_lines.append(f"{leader_inner}{pipeline_expr}.producer_acquire({state_expr})")
     return "\n".join(body_lines)
