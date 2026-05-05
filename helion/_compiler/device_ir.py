@@ -46,6 +46,7 @@ from .ast_extension import expr_from_string
 from .ast_read_writes import ReadWrites
 from .compile_environment import CompileEnvironment
 from .host_function import HostFunction
+from .host_function import NoCurrentFunction
 from .inductor_lowering import APIFuncLowering
 from .inductor_lowering import CodegenState
 from .inductor_lowering import codegen_call_with_graph
@@ -292,6 +293,27 @@ class NodeArgsGraphInfo(GraphInfo):
 @dataclasses.dataclass
 class ForLoopGraphInfo(NodeArgsGraphInfo):
     block_ids: list[int]
+    # Host AST read/write names for this device loop body (siblings only; see
+    # ReadWrites.visit_For). Used to insert tl.debug_barrier() between loops
+    # when there is a global read-after-write dependency.
+    host_loop_reads: frozenset[str] = dataclasses.field(default_factory=frozenset)
+    host_loop_writes: frozenset[str] = dataclasses.field(default_factory=frozenset)
+    # True when FX analysis could not map every load/store/atomic buffer back
+    # to a host-named buffer.  Concretely, this fires when the tensor argument
+    # of an hl.load / hl.store / atomic op in a rolled reduction graph:
+    #   * comes from a _host_tensor FX node whose Origin does not unwrap to a
+    #     NameOrigin (anonymous device temporary), or
+    #   * has no meta["val"] Tensor and no traceable host-tensor ancestor
+    #     (e.g. a buffer created entirely on-device via slicing/cat/where chains).
+    # When True, codegen conservatively inserts an inter-loop barrier because we
+    # cannot prove the absence of a global RAW dependency.
+    # See _reduction_fx_inter_loop_rw_names / Origin.root_rw_name.
+    reduction_barrier_unknown: bool = False
+    # Precomputed by GenerateAST._compute_inter_loop_barriers: True iff a
+    # tl.debug_barrier() must be emitted immediately before this for-loop's
+    # outer prefix to make global writes from the previous sibling for-loop
+    # in this scope visible.  Not copied across graph copies; recomputed.
+    needs_barrier_before: bool = False
 
     @property
     def name(self) -> str:
@@ -301,6 +323,11 @@ class ForLoopGraphInfo(NodeArgsGraphInfo):
         return {
             **super().kwargs(),
             "block_ids": [*self.block_ids],
+            "host_loop_reads": self.host_loop_reads,
+            "host_loop_writes": self.host_loop_writes,
+            "reduction_barrier_unknown": self.reduction_barrier_unknown,
+            # needs_barrier_before is intentionally not copied -- it is
+            # recomputed by GenerateAST per codegen run.
         }
 
     def codegen(self, state: CodegenState) -> list[object]:
@@ -310,7 +337,8 @@ class ForLoopGraphInfo(NodeArgsGraphInfo):
         with state.codegen.add_device_loop(
             state.device_function.tile_strategy.codegen_device_loop(
                 state, self.block_ids
-            )
+            ),
+            needs_barrier_before=self.needs_barrier_before,
         ):
             return codegen_call_with_graph(
                 state.codegen,
@@ -523,6 +551,121 @@ class KernelPhase:
     )
 
 
+def _tensor_to_inter_loop_rw_name(host: HostFunction, t: torch.Tensor) -> str | None:
+    o = host.tensor_to_origin.get(t)
+    if o is None:
+        return None
+    return o.root_rw_name()
+
+
+def _fx_trace_tensor_arg_rw_names(
+    host: HostFunction, arg: object, seen: set[int] | None = None
+) -> tuple[list[str], bool]:
+    """Map a load/store tensor FX arg to host variable names; bool is True if unmapped."""
+    from ..language import _tracing_ops
+
+    if seen is None:
+        seen = set()
+    if isinstance(arg, tuple):
+        unmapped = False
+        out: list[str] = []
+        for a in arg:
+            sub, u = _fx_trace_tensor_arg_rw_names(host, a, seen)
+            out.extend(sub)
+            unmapped = unmapped or u
+        return out, unmapped
+    if not isinstance(arg, torch.fx.Node):
+        return [], False
+    nid = id(arg)
+    if nid in seen:
+        return [], False
+    seen.add(nid)
+    val = arg.meta.get("val")
+    if isinstance(val, torch.Tensor):
+        n = _tensor_to_inter_loop_rw_name(host, val)
+        if n is not None:
+            return [n], False
+    if arg.op == "call_function" and arg.target is _tracing_ops._host_tensor:
+        val = arg.meta.get("val")
+        if isinstance(val, torch.Tensor):
+            n = _tensor_to_inter_loop_rw_name(host, val)
+            if n is not None:
+                return [n], False
+        return [], True
+    unmapped_child = False
+    out2: list[str] = []
+    for a in arg.args:
+        sub, u = _fx_trace_tensor_arg_rw_names(host, a, seen)
+        out2.extend(sub)
+        unmapped_child = unmapped_child or u
+    return out2, unmapped_child
+
+
+def _reduction_fx_inter_loop_rw_names(
+    graph: torch.fx.Graph,
+    host: HostFunction,
+) -> tuple[frozenset[str], frozenset[str], bool]:
+    """Infer host buffer names read/written in a rolled reduction FX subgraph.
+
+    Returns (reads, writes, reduction_barrier_unknown). The unknown flag is set
+    when hl.load/hl.store/atomic touches memory we cannot map to a host name, so
+    codegen must fall back to a conservative inter-loop barrier.
+    """
+    from ..language import atomic_add
+    from ..language import atomic_and
+    from ..language import atomic_cas
+    from ..language import atomic_max
+    from ..language import atomic_min
+    from ..language import atomic_or
+    from ..language import atomic_xchg
+    from ..language import atomic_xor
+    from ..language import memory_ops
+
+    atomic_funcs = frozenset(
+        {
+            atomic_add,
+            atomic_and,
+            atomic_cas,
+            atomic_max,
+            atomic_min,
+            atomic_or,
+            atomic_xchg,
+            atomic_xor,
+        }
+    )
+    reads: set[str] = set()
+    writes: set[str] = set()
+    unknown = False
+
+    for node in graph.find_nodes(
+        op="call_function", target=memory_ops.load, sort=False
+    ):
+        nms, unmapped = _fx_trace_tensor_arg_rw_names(host, node.args[0])
+        reads.update(nms)
+        if unmapped or not nms:
+            unknown = True
+
+    for node in graph.find_nodes(
+        op="call_function", target=memory_ops.store, sort=False
+    ):
+        nms, unmapped = _fx_trace_tensor_arg_rw_names(host, node.args[0])
+        writes.update(nms)
+        if unmapped or not nms:
+            unknown = True
+
+    for atomic_target in atomic_funcs:
+        for node in graph.find_nodes(
+            op="call_function", target=atomic_target, sort=False
+        ):
+            nms, unmapped = _fx_trace_tensor_arg_rw_names(host, node.args[0])
+            reads.update(nms)
+            writes.update(nms)
+            if unmapped or not nms:
+                unknown = True
+
+    return frozenset(reads), frozenset(writes), unknown
+
+
 class DeviceIR:
     def __init__(self) -> None:
         super().__init__()
@@ -557,11 +700,22 @@ class DeviceIR:
         block_index: int,
         node_args: list[torch.fx.Node],
     ) -> int:
+        try:
+            host = HostFunction.current()
+        except NoCurrentFunction:
+            reads, writes, reduction_unk = frozenset(), frozenset(), True
+        else:
+            reads, writes, reduction_unk = _reduction_fx_inter_loop_rw_names(
+                graph, host
+            )
         return self.add_graph(
             graph,
             graph_info_cls=ReductionLoopGraphInfo,
             block_ids=[block_index],
             node_args=node_args,
+            host_loop_reads=reads,
+            host_loop_writes=writes,
+            reduction_barrier_unknown=reduction_unk,
         )
 
     def add_root_graph(self, graph: torch.fx.Graph) -> None:
@@ -1105,11 +1259,14 @@ class WalkDeviceAST(NodeVisitor):
                 assert isinstance(var, (TileIndexType, GridIndexType))
                 block_ids.append(var.block_id)
 
+            host_reads, host_writes = rw.read_and_write_name_frozensets()
             graph_idx, outputs = self._trace_graph(
                 inputs,
                 build_subgraph,
                 graph_info_cls=ForLoopGraphInfo,
                 block_ids=block_ids,
+                host_loop_reads=host_reads,
+                host_loop_writes=host_writes,
             )
             step_list = step if isinstance(step, list) else None
             if step_list is None or all(s is None for s in step_list):
