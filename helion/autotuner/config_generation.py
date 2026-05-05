@@ -444,6 +444,9 @@ class ConfigGeneration:
         result = [default_flat]
         seen = {self.unflatten([*default_flat])}
 
+        # Initial population order is default -> user hints -> compiler seeds
+        # -> random.  This preserves hint priority without dropping built-in
+        # backend/compiler seeds from ConfigSpec.autotune_seed_configs().
         for i, config in enumerate(config_hints):
             try:
                 flat = self.flatten(config)

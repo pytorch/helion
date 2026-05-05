@@ -146,7 +146,7 @@ _CODE_SENTINEL = _CodeSentinel()
 
 
 def normalize_autotune_hints(settings: Settings) -> tuple[Config, ...]:
-    """Return autotune hints from settings as concrete Config objects."""
+    """Return user-provided autotune hints from settings as concrete Configs."""
     from ..runtime.config import Config
 
     hints = settings.autotune_hints
@@ -785,6 +785,8 @@ class PopulationBasedSearch(BaseSearch):
         result: list[FlatConfig] = [default_flat]
         self.log("Starting with default config")
 
+        # User hints are explicit requests, so try them before compiler-owned
+        # seeds and cached configs while still deduplicating normalized configs.
         for i, config in enumerate(self._autotune_hint_configs()):
             try:
                 flat = self.config_gen.flatten(config)
@@ -801,6 +803,8 @@ class PopulationBasedSearch(BaseSearch):
             ) as e:
                 self.log(f"Failed to transfer autotune hint {i + 1}: {e}")
 
+        # Compiler-owned seeds come from ConfigSpec.autotune_seed_configs();
+        # they encode backend/compiler heuristics and complement user hints.
         for flat, transferred_config in self.config_gen.seed_flat_config_pairs():
             if transferred_config not in seen:
                 seen.add(transferred_config)
