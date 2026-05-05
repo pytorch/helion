@@ -26,6 +26,7 @@ from helion._testing import onlyBackends
 from helion._testing import skipIfXPU
 from helion.autotuner.base_search import PopulationBasedSearch
 from helion.autotuner.base_search import PopulationMember
+from helion.autotuner.benchmark_job import BenchmarkJob
 from helion.autotuner.benchmark_job import RebenchmarkJob
 from helion.autotuner.benchmark_job import _load_args
 from helion.autotuner.benchmark_pool import PoolBenchmarkManager
@@ -237,6 +238,73 @@ class TestWorkerPoolPrecompile(unittest.TestCase):
         self.assertIsNotNone(reason)
         assert reason is not None
         self.assertIn("disabled", reason)
+
+    def test_benchmark_isolated_routes_each_fn_to_owner_worker(self) -> None:
+        # Isolated benchmarking should route each config to its precompile owner.
+        class FakePoolManager:
+            def __init__(self) -> None:
+                self.calls: list[tuple[int, object, float]] = []
+
+            def worker_index_for_fn(self, fn: object) -> int:
+                return 2 if fn is fake_fn_a else 1
+
+            def run_job_on_worker(
+                self,
+                worker_index: int,
+                job: object,
+                timeout: float,
+            ) -> float:
+                self.calls.append((worker_index, job, timeout))
+                return float(worker_index)
+
+        class FakeLog:
+            def warning(self, *_args: object, **_kwargs: object) -> None:
+                pass
+
+            def debug(self, *_args: object, **_kwargs: object) -> None:
+                pass
+
+        def fake_fn_a() -> None:
+            pass
+
+        def fake_fn_b() -> None:
+            pass
+
+        pool = FakePoolManager()
+        provider = cast("Any", LocalBenchmarkProvider.__new__(LocalBenchmarkProvider))
+        provider.settings = Settings(
+            autotune_precompile="pool",
+            autotune_benchmark_timeout=10,
+        )
+        provider.config_spec = SimpleNamespace(backend=None)
+        provider.mutated_arg_indices = []
+        provider._precompile_args_path = "args.pt"
+        provider._pool_manager = pool
+        provider._benchmark_worker = None
+        provider._autotune_metrics = SimpleNamespace(num_compile_failures=0)
+        provider.log = FakeLog()
+        provider._serialize_fn_for_worker = lambda _fn: SerializedCompiledFunction(
+            function_name="fake_fn",
+            source_code="def fake_fn(): pass",
+            filename=None,
+            module_name=None,
+        )
+
+        result = provider.benchmark_isolated(
+            [fake_fn_a, fake_fn_b],
+            warmup=25,
+            rep=100,
+            desc="verify",
+        )
+
+        self.assertEqual(result, [2.0, 1.0])
+        self.assertEqual([call[0] for call in pool.calls], [2, 1])
+        self.assertTrue(all(isinstance(call[1], BenchmarkJob) for call in pool.calls))
+        self.assertTrue(all(call[2] == 10.0 for call in pool.calls))
+        for _, job, _ in pool.calls:
+            assert isinstance(job, BenchmarkJob)
+            self.assertEqual(job.warmup, 25)
+            self.assertEqual(job.rep, 100)
 
     def test_rebenchmark_uses_worker_pool(self) -> None:
         # Full-effort rebenchmarking should run on the worker that precompiled the config.
