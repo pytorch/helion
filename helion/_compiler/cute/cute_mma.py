@@ -44,6 +44,9 @@ from .layout import MatmulExecutionKind
 from .layout import MatmulExecutionPlan
 from .matmul_utils import analyze_direct_grouped_n_loads
 from .mma_support import get_cute_mma_support
+from .tcgen05_constants import TCGEN05_ACC_PRODUCER_MODE_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_ACC_PRODUCER_MODE_NORMAL
+from .tcgen05_constants import TCGEN05_ACC_PRODUCER_MODE_SKIP_UMMA
 from .tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
 
 if TYPE_CHECKING:
@@ -1397,6 +1400,19 @@ def _emit_mma_pipeline(
     )
     # Keep a distinct name so future MMA-exec gating changes are localized.
     tcgen05_use_role_local_mma_exec = tcgen05_use_role_local_tma_producer
+    tcgen05_acc_producer_mode = df.config.get(
+        TCGEN05_ACC_PRODUCER_MODE_CONFIG_KEY,
+        TCGEN05_ACC_PRODUCER_MODE_NORMAL,
+    )
+    diagnose_skip_umma_issue = (
+        tcgen05_acc_producer_mode == TCGEN05_ACC_PRODUCER_MODE_SKIP_UMMA
+    )
+    if diagnose_skip_umma_issue and mma_impl != "tcgen05":
+        raise exc.BackendUnsupported(
+            "cute",
+            f"{TCGEN05_ACC_PRODUCER_MODE_CONFIG_KEY}="
+            f"{TCGEN05_ACC_PRODUCER_MODE_SKIP_UMMA!r} requires tcgen05 MMA codegen",
+        )
     # Static-full CtaGroup.TWO keeps a prefetched AB consumer token live
     # across the accumulator acquire and each K-loop issue. CtaGroup.ONE
     # keeps the older adjacent try-wait/wait sequence.
@@ -2636,29 +2652,32 @@ def _emit_mma_pipeline(
                             use_existing_try_token=tcgen05_use_role_local_ab_consumer_prefetch,
                         )
                     )
-                    exec_loop_body.extend(
-                        [
-                            _build_tcgen05_mma_fence_stmt(
-                                tcgen05_plan.exec_active,
-                                gate_exec_warp=False,
-                                is_two_cta=tcgen05_is_two_cta,
-                            ),
-                            _build_tcgen05_mma_issue_stmt(
-                                exec_active=tcgen05_plan.exec_active,
-                                tiled_mma=tiled_mma,
-                                acc_frag=acc_frag,
-                                tcgen05_frag_a=tcgen05_frag_a,
-                                tcgen05_frag_b=tcgen05_frag_b,
-                                mma_stage=mma_stage,
-                                gate_exec_warp=False,
-                                is_two_cta=tcgen05_is_two_cta,
-                            ),
-                            _build_kloop_pipeline_release_if(
-                                tma_kloop_args,
-                                gate_exec_warp=False,
-                                include_scalar_fallback=False,
-                            ),
-                        ]
+                    if not diagnose_skip_umma_issue:
+                        exec_loop_body.extend(
+                            [
+                                _build_tcgen05_mma_fence_stmt(
+                                    tcgen05_plan.exec_active,
+                                    gate_exec_warp=False,
+                                    is_two_cta=tcgen05_is_two_cta,
+                                ),
+                                _build_tcgen05_mma_issue_stmt(
+                                    exec_active=tcgen05_plan.exec_active,
+                                    tiled_mma=tiled_mma,
+                                    acc_frag=acc_frag,
+                                    tcgen05_frag_a=tcgen05_frag_a,
+                                    tcgen05_frag_b=tcgen05_frag_b,
+                                    mma_stage=mma_stage,
+                                    gate_exec_warp=False,
+                                    is_two_cta=tcgen05_is_two_cta,
+                                ),
+                            ]
+                        )
+                    exec_loop_body.append(
+                        _build_kloop_pipeline_release_if(
+                            tma_kloop_args,
+                            gate_exec_warp=False,
+                            include_scalar_fallback=False,
+                        )
                     )
                     if tcgen05_use_role_local_ab_consumer_prefetch:
                         exec_loop_body.extend(
@@ -2767,23 +2786,24 @@ def _emit_mma_pipeline(
         else:
             assert tcgen05_plan is not None
             if not tcgen05_use_role_local_mma_exec:
-                cg.add_statement(
-                    _build_tcgen05_mma_fence_stmt(
-                        tcgen05_plan.exec_active,
-                        is_two_cta=tcgen05_is_two_cta,
+                if not diagnose_skip_umma_issue:
+                    cg.add_statement(
+                        _build_tcgen05_mma_fence_stmt(
+                            tcgen05_plan.exec_active,
+                            is_two_cta=tcgen05_is_two_cta,
+                        )
                     )
-                )
-                cg.add_statement(
-                    _build_tcgen05_mma_issue_stmt(
-                        exec_active=tcgen05_plan.exec_active,
-                        tiled_mma=tiled_mma,
-                        acc_frag=acc_frag,
-                        tcgen05_frag_a=tcgen05_frag_a,
-                        tcgen05_frag_b=tcgen05_frag_b,
-                        mma_stage=mma_stage,
-                        is_two_cta=tcgen05_is_two_cta,
+                    cg.add_statement(
+                        _build_tcgen05_mma_issue_stmt(
+                            exec_active=tcgen05_plan.exec_active,
+                            tiled_mma=tiled_mma,
+                            acc_frag=acc_frag,
+                            tcgen05_frag_a=tcgen05_frag_a,
+                            tcgen05_frag_b=tcgen05_frag_b,
+                            mma_stage=mma_stage,
+                            is_two_cta=tcgen05_is_two_cta,
+                        )
                     )
-                )
                 if tcgen05_use_tma:
                     assert tma_kloop_args is not None
                     if tcgen05_use_tma_pipeline:

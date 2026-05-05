@@ -19,6 +19,7 @@ import torch
 
 from .. import exc
 from .ast_extension import expr_from_string
+from .cute.tcgen05_constants import TCGEN05_CUBIN_LINEINFO_CONFIG_KEY
 
 if TYPE_CHECKING:
     from torch._inductor.ops_handler import OpsHandler
@@ -2917,6 +2918,13 @@ class CuteBackend(Backend):
                 final_kernel_text,
             )
         }
+
+        def launcher_args_with_compile_options(block_arg: str) -> list[str]:
+            launcher_args = [block_arg]
+            if config.get(TCGEN05_CUBIN_LINEINFO_CONFIG_KEY) is True:
+                launcher_args.append("cute_compile_options='--generate-line-info'")
+            return launcher_args
+
         block_size_values = {
             name: int(value)
             for name, value in re.findall(
@@ -3058,7 +3066,9 @@ class CuteBackend(Backend):
                 ):
                     dims = expr_dims
             elif dims == (1, 1, 1):
-                return [f"block=({dim_exprs[0]}, {dim_exprs[1]}, {dim_exprs[2]})"]
+                return launcher_args_with_compile_options(
+                    f"block=({dim_exprs[0]}, {dim_exprs[1]}, {dim_exprs[2]})"
+                )
         if offset_thread_dims != [1, 1, 1]:
             candidate_dims = tuple(
                 starmap(max, zip(dims, offset_thread_dims, strict=True))
@@ -3081,7 +3091,9 @@ class CuteBackend(Backend):
         from .cute.thread_budget import check_thread_limit
 
         check_thread_limit(dims[0] * dims[1] * dims[2], context=str(tuple(dims)))
-        return [f"block=({dims[0]}, {dims[1]}, {dims[2]})"]
+        return launcher_args_with_compile_options(
+            f"block=({dims[0]}, {dims[1]}, {dims[2]})"
+        )
 
     def build_launcher_args(
         self,

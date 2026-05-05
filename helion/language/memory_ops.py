@@ -20,6 +20,20 @@ from .._compiler.cute.cutedsl_compat import emit_dealloc_mbarrier_initialized_kw
 from .._compiler.cute.cutedsl_compat import emit_pipeline_advance
 from .._compiler.cute.cutedsl_compat import emit_producer_tail_tma_umma
 from .._compiler.cute.cutedsl_compat import emit_producer_tail_umma_async
+from .._compiler.cute.tcgen05_constants import (
+    TCGEN05_ACC_WAIT_PLACEMENT_BEFORE_SUBTILE_LOOP,
+)
+from .._compiler.cute.tcgen05_constants import TCGEN05_ACC_WAIT_PLACEMENT_CONFIG_KEY
+from .._compiler.cute.tcgen05_constants import TCGEN05_ACC_WAIT_PLACEMENT_SUBTILE_LOOP
+from .._compiler.cute.tcgen05_constants import TCGEN05_C_ACQUIRE_PLACEMENT_CONFIG_KEY
+from .._compiler.cute.tcgen05_constants import TCGEN05_C_ACQUIRE_PLACEMENT_FIRST_IN_LOOP
+from .._compiler.cute.tcgen05_constants import (
+    TCGEN05_C_ACQUIRE_PLACEMENT_LATER_BEFORE_BARRIER,
+)
+from .._compiler.cute.tcgen05_constants import TCGEN05_C_ACQUIRE_PLACEMENT_PRE_LOOP
+from .._compiler.cute.tcgen05_constants import TCGEN05_C_STORE_MODE_CONFIG_KEY
+from .._compiler.cute.tcgen05_constants import TCGEN05_C_STORE_MODE_NORMAL
+from .._compiler.cute.tcgen05_constants import TCGEN05_C_STORE_MODE_SKIP_EPILOGUE_STORE
 from .._compiler.host_function import HostFunction
 from .._compiler.indexing_strategy import SubscriptIndexing
 from .._compiler.pallas import codegen as pallas_codegen
@@ -1477,10 +1491,85 @@ def _codegen_cute_store_tcgen05_tile(
         f"if {tcgen05_value.warp_idx} == cutlass.Int32(0):\n"
         f"    {c_pipeline}.producer_tail()"
     )
+    c_acquire_placement = state.device_function.config.get(
+        TCGEN05_C_ACQUIRE_PLACEMENT_CONFIG_KEY,
+        TCGEN05_C_ACQUIRE_PLACEMENT_PRE_LOOP,
+    )
+    acc_wait_placement = state.device_function.config.get(
+        TCGEN05_ACC_WAIT_PLACEMENT_CONFIG_KEY,
+        TCGEN05_ACC_WAIT_PLACEMENT_SUBTILE_LOOP,
+    )
+    c_store_mode = state.device_function.config.get(
+        TCGEN05_C_STORE_MODE_CONFIG_KEY,
+        TCGEN05_C_STORE_MODE_NORMAL,
+    )
+    diagnose_first_c_acquire_in_loop = (
+        c_acquire_placement == TCGEN05_C_ACQUIRE_PLACEMENT_FIRST_IN_LOOP
+    )
+    diagnose_later_c_acquire_before_barrier = (
+        c_acquire_placement == TCGEN05_C_ACQUIRE_PLACEMENT_LATER_BEFORE_BARRIER
+    )
+    diagnose_acc_wait_before_subtile_loop = (
+        acc_wait_placement == TCGEN05_ACC_WAIT_PLACEMENT_BEFORE_SUBTILE_LOOP
+    )
+    diagnose_skip_epilogue_store = (
+        c_store_mode == TCGEN05_C_STORE_MODE_SKIP_EPILOGUE_STORE
+    )
     tma_store_first_subtile_acquire = (
-        f"if {tcgen05_value.epi_active} and "
-        f"{tcgen05_value.warp_idx} == cutlass.Int32(0):\n"
-        f"    {c_pipeline}.producer_acquire()"
+        []
+        if diagnose_first_c_acquire_in_loop
+        else [
+            (
+                f"if {tcgen05_value.epi_active} and "
+                f"{tcgen05_value.warp_idx} == cutlass.Int32(0):\n"
+                f"    {c_pipeline}.producer_acquire()"
+            )
+        ]
+    )
+    tma_store_loop_first_subtile_acquire = (
+        (
+            f"        if _tcgen05_subtile == 0 and "
+            f"{tcgen05_value.warp_idx} == cutlass.Int32(0):\n"
+            f"            {c_pipeline}.producer_acquire()\n"
+        )
+        if diagnose_first_c_acquire_in_loop
+        else ""
+    )
+    tma_store_loop_later_subtile_acquire = (
+        ""
+        if diagnose_later_c_acquire_before_barrier
+        else (
+            f"        if _tcgen05_subtile != 0 and "
+            f"{tcgen05_value.warp_idx} == cutlass.Int32(0):\n"
+            f"            {c_pipeline}.producer_acquire()\n"
+        )
+    )
+    tma_store_loop_late_later_subtile_acquire = (
+        (
+            f"        if _tcgen05_subtile != 0 and "
+            f"{tcgen05_value.warp_idx} == cutlass.Int32(0):\n"
+            f"            {c_pipeline}.producer_acquire()\n"
+        )
+        if diagnose_later_c_acquire_before_barrier
+        else ""
+    )
+    tma_store_pre_loop_acc_wait = (
+        [
+            (
+                f"if {tcgen05_value.epi_active}:\n"
+                f"    {tcgen05_value.acc_pipeline}.consumer_wait({tcgen05_value.acc_consumer_state})"
+            )
+        ]
+        if diagnose_acc_wait_before_subtile_loop
+        else []
+    )
+    tma_store_loop_acc_wait = (
+        ""
+        if diagnose_acc_wait_before_subtile_loop
+        else (
+            f"        if _tcgen05_subtile == 0:\n"
+            f"            {tcgen05_value.acc_pipeline}.consumer_wait({tcgen05_value.acc_consumer_state})\n"
+        )
     )
     tma_store_smem_setup = [
         # Must match the wrapper-side `tcgen05_d_tma` TMA atom layout in
@@ -1511,6 +1600,22 @@ def _codegen_cute_store_tcgen05_tile(
         *tma_store_smem_setup,
         *tma_store_acc_layout_setup,
     ]
+    suppressed_store_body_core = [
+        (
+            # Diagnostic-only invalid-output mode. Keep the accumulator
+            # pipeline draining so persistent kernels do not deadlock, but
+            # suppress C-pipeline acquire/commit, R2S/SMEM work, and TMA D
+            # stores to bound whether hot waits are tied to the C-store path.
+            f"if {tcgen05_value.epi_active}:\n"
+            f"    {tcgen05_value.acc_pipeline}.consumer_wait({tcgen05_value.acc_consumer_state})\n"
+            f"    with cute.arch.elect_one():\n"
+            f"        {tcgen05_value.acc_pipeline}.consumer_release({tcgen05_value.acc_consumer_state})\n"
+            + emit_pipeline_advance(
+                tcgen05_value.acc_consumer_state,
+                indent="    ",
+            )
+        )
+    ]
     # Non-role-local stores keep pipeline/SMEM setup before per-tile C
     # partitioning so the hoisted role-local prefix matches the same
     # invariant setup subset.
@@ -1518,7 +1623,7 @@ def _codegen_cute_store_tcgen05_tile(
         *([] if tcgen05_value.use_role_local_epi else tma_static_store_setup),
         *([] if tcgen05_value.use_role_local_epi else tma_store_pipeline_setup),
         *([] if tcgen05_value.use_role_local_epi else tma_store_smem_setup),
-        tma_store_first_subtile_acquire,
+        *tma_store_first_subtile_acquire,
         *tma_tile_store_setup,
         (
             f"{tcgc} = cutlass.utils.gemm.sm100.transform_partitioned_tensor_layout("
@@ -1561,12 +1666,22 @@ def _codegen_cute_store_tcgen05_tile(
         ),
         f"{ttr_tacc} = cute.group_modes({ttr_tacc_stage}, 3, cute.rank({ttr_tacc_stage}))",
         f"{subtile_count} = cutlass.const_expr(cute.size({ttr_tacc}.shape, mode=[3]))",
+        *tma_store_pre_loop_acc_wait,
         (
             # Warp 0 pre-acquires the first TMA-store SMEM stage before
             # per-tile C-store setup. The subtile loop acquires only later
             # stages, so C-stage waits can overlap setup, the first
             # acc-pipeline wait, and the other epi warps' TMEM
-            # load/conversion work on later subtile iterations.
+            # load/conversion work on later subtile iterations. The
+            # diagnostic tcgen05_c_acquire_placement=first_in_loop moves only
+            # that first acquire into the subtile loop; later acquires and
+            # the accumulator wait keep their default order. The diagnostic
+            # later_before_barrier placement keeps the first acquire in
+            # production position and moves only later-subtile acquires just
+            # before the first epilogue barrier. The diagnostic
+            # tcgen05_acc_wait_placement=before_subtile_loop keeps both C
+            # acquire sites in production position and moves only the
+            # accumulator consumer wait before the subtile loop.
             # A CTA-scoped named barrier ensures all epi warps have observed
             # warp 0's acquire before they write SMEM; a second barrier ensures
             # the SMEM writes and Quack-style async-shared fence are visible
@@ -1582,10 +1697,9 @@ def _codegen_cute_store_tcgen05_tile(
             # Avoiding a post-commit barrier matches Quack's epilogue loop.
             f"for _tcgen05_subtile in cutlass.range({subtile_count}, unroll_full=True):\n"
             f"    if {tcgen05_value.epi_active}:\n"
-            f"        if _tcgen05_subtile != 0 and {tcgen05_value.warp_idx} == cutlass.Int32(0):\n"
-            f"            {c_pipeline}.producer_acquire()\n"
-            f"        if _tcgen05_subtile == 0:\n"
-            f"            {tcgen05_value.acc_pipeline}.consumer_wait({tcgen05_value.acc_consumer_state})\n"
+            f"{tma_store_loop_first_subtile_acquire}"
+            f"{tma_store_loop_later_subtile_acquire}"
+            f"{tma_store_loop_acc_wait}"
             f"        {ttr_tacc_mn} = {ttr_tacc}[(None, None, None, cutlass.Int32(_tcgen05_subtile))]\n"
             f"        cute.copy({tiled_copy_t2r}, {ttr_tacc_mn}, {ttr_racc})\n"
             f"        {acc_vec} = {trs_racc}.load().to({target_dtype})\n"
@@ -1594,6 +1708,7 @@ def _codegen_cute_store_tcgen05_tile(
             f"            with cute.arch.elect_one():\n"
             f"                {tcgen05_value.acc_pipeline}.consumer_release({tcgen05_value.acc_consumer_state})\n"
             f"        {trs_rd}.store({acc_vec})\n"
+            f"{tma_store_loop_late_later_subtile_acquire}"
             f"        {epilog_sync_barrier}.arrive_and_wait()\n"
             f"        {c_buffer} = ({tma_c_buffer_expr}) % cutlass.Int32({tcgen05_value.c_stage_count})\n"
             f"        cute.copy({tiled_copy_r2s}, {trs_rd}, {trs_sd}[(None, None, None, {c_buffer})])\n"
@@ -1610,9 +1725,13 @@ def _codegen_cute_store_tcgen05_tile(
         *([] if tcgen05_value.use_role_local_epi else [tma_store_pipeline_tail]),
     ]
     store_body_core = (
-        tma_store_body_core
-        if tcgen05_value.use_tma_store_epilogue
-        else simt_store_body_core
+        suppressed_store_body_core
+        if diagnose_skip_epilogue_store
+        else (
+            tma_store_body_core
+            if tcgen05_value.use_tma_store_epilogue
+            else simt_store_body_core
+        )
     )
     main_stmts: list[ast.AST]
     if tcgen05_value.use_role_local_epi:
@@ -1628,7 +1747,7 @@ def _codegen_cute_store_tcgen05_tile(
                     *tma_store_role_invariant_setup,
                 ]
             ]
-            if tcgen05_value.use_tma_store_epilogue
+            if tcgen05_value.use_tma_store_epilogue and not diagnose_skip_epilogue_store
             else []
         )
         sync_before_stmt = statement_from_string("cute.arch.sync_threads()")
@@ -1662,7 +1781,11 @@ def _codegen_cute_store_tcgen05_tile(
     # Keep them as separate statements so the persistent splitter can
     # extract them via the post-loop registration below.
     post_loop_lines: list[str] = []
-    if tcgen05_value.use_tma_store_epilogue and tcgen05_value.use_role_local_epi:
+    if (
+        tcgen05_value.use_tma_store_epilogue
+        and tcgen05_value.use_role_local_epi
+        and not diagnose_skip_epilogue_store
+    ):
         # Role-local persistent epilogues reuse the C-store pipeline across
         # scheduler-recycled work tiles. Draining it inside each tile would
         # serialize the next tile's epilogue against this tile's TMA stores.

@@ -1750,10 +1750,11 @@ class _CompiledCuteLauncher:
     collapses ~200ms of per-launch host overhead into ~0.1ms.
     """
 
-    __slots__ = ("_compiled", "_jit_func")
+    __slots__ = ("_compile_options", "_compiled", "_jit_func")
 
-    def __init__(self, jit_func: object) -> None:
+    def __init__(self, jit_func: object, compile_options: str | None) -> None:
         self._jit_func = jit_func
+        self._compile_options = compile_options
         self._compiled: object = None
 
     def __call__(self, *args: object) -> object:
@@ -1761,7 +1762,14 @@ class _CompiledCuteLauncher:
         if compiled is None:
             import cutlass.cute as cute
 
-            compiled = cute.compile(self._jit_func, *args)
+            if self._compile_options is None:
+                compiled = cute.compile(self._jit_func, *args)
+            else:
+                compiled = cute.compile(
+                    self._jit_func,
+                    *args,
+                    options=self._compile_options,
+                )
             self._compiled = compiled
         return cast("Any", compiled)(*args)
 
@@ -1770,6 +1778,7 @@ def _get_compiled_cute_launcher(
     cute_kernel: object,
     schema_key: tuple[tuple[object, ...], ...],
     block: tuple[int, int, int],
+    compile_options: str | None = None,
 ) -> object:
     try:
         # pyrefly: ignore [missing-attribute]
@@ -1785,13 +1794,19 @@ def _get_compiled_cute_launcher(
     cluster_shape = getattr(
         cast("Any", cute_kernel), "_helion_cute_cluster_shape", None
     )
-    cache_key = (schema_key, block, wrapper_plans, repr(cluster_shape))
+    cache_key = (
+        schema_key,
+        block,
+        wrapper_plans,
+        repr(cluster_shape),
+        compile_options,
+    )
     cached = cache.get(cache_key)
     if cached is not None:
         return cached
 
     jit_func = _create_cute_wrapper(cute_kernel, schema_key, block)
-    launcher = _CompiledCuteLauncher(jit_func)
+    launcher = _CompiledCuteLauncher(jit_func, compile_options)
     cache[cache_key] = launcher
     return launcher
 
@@ -1873,6 +1888,9 @@ def default_cute_launcher(
     **kwargs: object,
 ) -> object:
     block = kwargs.pop("block", (256, 1, 1))
+    cute_compile_options = kwargs.pop("cute_compile_options", None)
+    if cute_compile_options is not None and not isinstance(cute_compile_options, str):
+        raise ValueError(f"Invalid CuTe compile options: {cute_compile_options!r}")
     if not isinstance(block, tuple) or len(block) < 1:
         raise ValueError(f"Invalid block specification: {block}")
     if not isinstance(grid, tuple) or len(grid) < 1:
@@ -1897,7 +1915,12 @@ def default_cute_launcher(
     schema_key, launch_args = _build_cute_schema_and_args(
         cute_kernel, tuple(args), grid_xyz
     )
-    compiled = _get_compiled_cute_launcher(cute_kernel, schema_key, block_xyz)
+    compiled = _get_compiled_cute_launcher(
+        cute_kernel,
+        schema_key,
+        block_xyz,
+        compile_options=cute_compile_options,
+    )
     return cast("Any", compiled)(*launch_args)
 
 

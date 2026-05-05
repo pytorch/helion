@@ -1440,6 +1440,348 @@ class TestCuteLowerings(unittest.TestCase):
         expected = args[0] @ args[1]
         torch.testing.assert_close(out, expected, atol=2e-1, rtol=1e-2)
 
+    def test_tcgen05_diagnostic_first_c_acquire_moves_into_subtile_loop(
+        self,
+    ) -> None:
+        """The first-C-acquire discriminator changes only that acquire site."""
+
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_flat_tma_store(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        torch.manual_seed(0)
+        args = (
+            torch.randn(256, 32, device=DEVICE, dtype=torch.float16),
+            torch.randn(32, 256, device=DEVICE, dtype=torch.float16),
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_flat_tma_store.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            cfg = _make_tcgen05_persistent_config(
+                block_sizes=[128, 128, 16],
+                pid_type="flat",
+                tcgen05_c_acquire_placement="first_in_loop",
+            )
+            code = bound.to_triton_code(cfg)
+
+        acquire = "tcgen05_c_pipeline.producer_acquire()"
+        gmem_tile = "tcgen05_gC = cute.local_tile("
+        subtile_loop = "for _tcgen05_subtile in cutlass.range("
+        first_subtile_guard = (
+            "if _tcgen05_subtile == 0 and tcgen05_warp_idx == cutlass.Int32(0):"
+        )
+        later_subtile_guard = (
+            "if _tcgen05_subtile != 0 and tcgen05_warp_idx == cutlass.Int32(0):"
+        )
+        acc_wait = "tcgen05_acc_pipeline.consumer_wait(tcgen05_acc_consumer_state)"
+
+        self.assertEqual(code.count(acquire), 2, code)
+        gmem_tile_pos = code.find(gmem_tile)
+        subtile_loop_pos = code.find(subtile_loop, gmem_tile_pos)
+        first_subtile_guard_pos = code.find(first_subtile_guard, subtile_loop_pos)
+        first_acquire_pos = code.find(acquire, first_subtile_guard_pos)
+        later_subtile_guard_pos = code.find(later_subtile_guard, first_acquire_pos)
+        later_acquire_pos = code.find(acquire, later_subtile_guard_pos)
+        acc_wait_pos = code.find(acc_wait, later_acquire_pos)
+        for needle, pos in (
+            (gmem_tile, gmem_tile_pos),
+            (subtile_loop, subtile_loop_pos),
+            (first_subtile_guard, first_subtile_guard_pos),
+            ("first in-loop C acquire", first_acquire_pos),
+            (later_subtile_guard, later_subtile_guard_pos),
+            ("later C acquire", later_acquire_pos),
+            (acc_wait, acc_wait_pos),
+        ):
+            self.assertGreaterEqual(pos, 0, f"Missing {needle!r} in:\n{code}")
+        self.assertLess(gmem_tile_pos, subtile_loop_pos, code)
+        self.assertLess(subtile_loop_pos, first_subtile_guard_pos, code)
+        self.assertLess(first_subtile_guard_pos, first_acquire_pos, code)
+        self.assertLess(first_acquire_pos, later_subtile_guard_pos, code)
+        self.assertLess(later_subtile_guard_pos, later_acquire_pos, code)
+        self.assertLess(later_acquire_pos, acc_wait_pos, code)
+
+    def test_tcgen05_diagnostic_later_c_acquire_moves_before_barrier(
+        self,
+    ) -> None:
+        @helion.kernel(backend="cute")
+        def cute_matmul_flat_tma_store(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        torch.manual_seed(0)
+        args = (
+            torch.randn(256, 32, device=DEVICE, dtype=torch.float16),
+            torch.randn(32, 256, device=DEVICE, dtype=torch.float16),
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_flat_tma_store.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            cfg = _make_tcgen05_persistent_config(
+                block_sizes=[128, 128, 16],
+                pid_type="flat",
+                tcgen05_c_acquire_placement="later_before_barrier",
+            )
+            code = bound.to_triton_code(cfg)
+
+        acquire = "tcgen05_c_pipeline.producer_acquire()"
+        gmem_tile = "tcgen05_gC = cute.local_tile("
+        subtile_loop = "for _tcgen05_subtile in cutlass.range("
+        later_subtile_guard = (
+            "if _tcgen05_subtile != 0 and tcgen05_warp_idx == cutlass.Int32(0):"
+        )
+        acc_wait = "tcgen05_acc_pipeline.consumer_wait(tcgen05_acc_consumer_state)"
+        rmem_store = "tcgen05_tRS_rD.store(tcgen05_acc_vec)"
+        first_barrier = "tcgen05_epilog_sync_barrier.arrive_and_wait()"
+
+        self.assertEqual(code.count(acquire), 2, code)
+        self.assertEqual(code.count(later_subtile_guard), 1, code)
+        first_acquire_pos = code.find(acquire)
+        gmem_tile_pos = code.find(gmem_tile)
+        subtile_loop_pos = code.find(subtile_loop, gmem_tile_pos)
+        acc_wait_pos = code.find(acc_wait, subtile_loop_pos)
+        rmem_store_pos = code.find(rmem_store, acc_wait_pos)
+        later_subtile_guard_pos = code.find(later_subtile_guard, rmem_store_pos)
+        later_acquire_pos = code.find(acquire, later_subtile_guard_pos)
+        first_barrier_pos = code.find(first_barrier, later_acquire_pos)
+        for needle, pos in (
+            ("pre-loop C acquire", first_acquire_pos),
+            (gmem_tile, gmem_tile_pos),
+            (subtile_loop, subtile_loop_pos),
+            (acc_wait, acc_wait_pos),
+            (rmem_store, rmem_store_pos),
+            (later_subtile_guard, later_subtile_guard_pos),
+            ("delayed later C acquire", later_acquire_pos),
+            (first_barrier, first_barrier_pos),
+        ):
+            self.assertGreaterEqual(pos, 0, f"Missing {needle!r} in:\n{code}")
+        self.assertLess(first_acquire_pos, gmem_tile_pos, code)
+        self.assertLess(gmem_tile_pos, subtile_loop_pos, code)
+        self.assertLess(subtile_loop_pos, acc_wait_pos, code)
+        self.assertLess(acc_wait_pos, rmem_store_pos, code)
+        self.assertLess(rmem_store_pos, later_subtile_guard_pos, code)
+        self.assertLess(later_subtile_guard_pos, later_acquire_pos, code)
+        self.assertLess(later_acquire_pos, first_barrier_pos, code)
+
+    def test_tcgen05_diagnostic_acc_wait_moves_before_subtile_loop(
+        self,
+    ) -> None:
+        @helion.kernel(backend="cute")
+        def cute_matmul_flat_tma_store(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        torch.manual_seed(0)
+        args = (
+            torch.randn(256, 32, device=DEVICE, dtype=torch.float16),
+            torch.randn(32, 256, device=DEVICE, dtype=torch.float16),
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_flat_tma_store.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            cfg = _make_tcgen05_persistent_config(
+                block_sizes=[128, 128, 16],
+                pid_type="flat",
+                tcgen05_acc_wait_placement="before_subtile_loop",
+            )
+            code = bound.to_triton_code(cfg)
+
+        acquire = "tcgen05_c_pipeline.producer_acquire()"
+        gmem_tile = "tcgen05_gC = cute.local_tile("
+        acc_wait = "tcgen05_acc_pipeline.consumer_wait(tcgen05_acc_consumer_state)"
+        subtile_loop = "for _tcgen05_subtile in cutlass.range("
+        subtile_acc_wait = (
+            "if _tcgen05_subtile == 0:\n"
+            "            tcgen05_acc_pipeline.consumer_wait(tcgen05_acc_consumer_state)"
+        )
+        later_subtile_guard = (
+            "if _tcgen05_subtile != 0 and tcgen05_warp_idx == cutlass.Int32(0):"
+        )
+        t2r_copy = "cute.copy(tcgen05_tiled_copy_t2r"
+
+        self.assertEqual(code.count(acc_wait), 1, code)
+        self.assertNotIn(subtile_acc_wait, code)
+        first_acquire_pos = code.find(acquire)
+        gmem_tile_pos = code.find(gmem_tile)
+        acc_wait_pos = code.find(acc_wait, gmem_tile_pos)
+        subtile_loop_pos = code.find(subtile_loop, acc_wait_pos)
+        later_subtile_guard_pos = code.find(later_subtile_guard, subtile_loop_pos)
+        later_acquire_pos = code.find(acquire, later_subtile_guard_pos)
+        t2r_copy_pos = code.find(t2r_copy, later_acquire_pos)
+        for needle, pos in (
+            ("pre-loop C acquire", first_acquire_pos),
+            (gmem_tile, gmem_tile_pos),
+            (acc_wait, acc_wait_pos),
+            (subtile_loop, subtile_loop_pos),
+            (later_subtile_guard, later_subtile_guard_pos),
+            ("later C acquire", later_acquire_pos),
+            (t2r_copy, t2r_copy_pos),
+        ):
+            self.assertGreaterEqual(pos, 0, f"Missing {needle!r} in:\n{code}")
+        self.assertLess(first_acquire_pos, gmem_tile_pos, code)
+        self.assertLess(gmem_tile_pos, acc_wait_pos, code)
+        self.assertLess(acc_wait_pos, subtile_loop_pos, code)
+        self.assertLess(subtile_loop_pos, later_subtile_guard_pos, code)
+        self.assertLess(later_subtile_guard_pos, later_acquire_pos, code)
+        self.assertLess(later_acquire_pos, t2r_copy_pos, code)
+
+    def test_tcgen05_diagnostic_skip_epilogue_store_drains_acc_pipeline(
+        self,
+    ) -> None:
+        @helion.kernel(backend="cute")
+        def cute_matmul_flat_tma_store(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        torch.manual_seed(0)
+        args = (
+            torch.randn(256, 32, device=DEVICE, dtype=torch.float16),
+            torch.randn(32, 256, device=DEVICE, dtype=torch.float16),
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_flat_tma_store.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            unsafe_cfg = _make_tcgen05_persistent_config(
+                block_sizes=[128, 128, 16],
+                pid_type="flat",
+                tcgen05_c_store_mode="skip_epilogue_store",
+            )
+            with self.assertRaisesRegex(
+                exc.InvalidConfig,
+                "tcgen05_diagnostic_invalid_output",
+            ):
+                bound.to_triton_code(unsafe_cfg)
+            cfg = _make_tcgen05_persistent_config(
+                block_sizes=[128, 128, 16],
+                pid_type="flat",
+                tcgen05_c_store_mode="skip_epilogue_store",
+                tcgen05_diagnostic_invalid_output=True,
+            )
+            code = bound.to_triton_code(cfg)
+
+        acc_wait = "tcgen05_acc_pipeline.consumer_wait(tcgen05_acc_consumer_state)"
+        acc_release = (
+            "tcgen05_acc_pipeline.consumer_release(tcgen05_acc_consumer_state)"
+        )
+        c_acquire = "tcgen05_c_pipeline.producer_acquire()"
+        c_commit = "tcgen05_c_pipeline.producer_commit()"
+        tma_store = "cute.copy(tcgen05_tma_store_atom"
+        r2s_copy = "cute.copy(tcgen05_tiled_copy_r2s"
+
+        self.assertIn(acc_wait, code)
+        self.assertIn(acc_release, code)
+        self.assertNotIn(c_acquire, code)
+        self.assertNotIn(c_commit, code)
+        self.assertNotIn(tma_store, code)
+        self.assertNotIn(r2s_copy, code)
+
+    def test_tcgen05_diagnostic_skip_umma_keeps_pipeline_handshakes(
+        self,
+    ) -> None:
+        @helion.kernel(backend="cute")
+        def cute_matmul_persistent_role(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        torch.manual_seed(0)
+        args = (
+            torch.randn(128, 32, device=DEVICE, dtype=torch.float16),
+            torch.randn(32, 128, device=DEVICE, dtype=torch.float16),
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_persistent_role.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            unsafe_cfg = _make_tcgen05_persistent_config(
+                block_sizes=[128, 128, 16],
+                pid_type="persistent_blocked",
+                tcgen05_acc_producer_mode="skip_umma",
+            )
+            with self.assertRaisesRegex(
+                exc.InvalidConfig,
+                "tcgen05_diagnostic_invalid_output",
+            ):
+                bound.to_triton_code(unsafe_cfg)
+            cfg = _make_tcgen05_persistent_config(
+                block_sizes=[128, 128, 16],
+                pid_type="persistent_blocked",
+                tcgen05_acc_producer_mode="skip_umma",
+                tcgen05_diagnostic_invalid_output=True,
+            )
+            code = bound.to_triton_code(cfg)
+
+        exec_role_predicate = (
+            "cute.arch.make_warp_uniform(cute.arch.warp_idx()) == cutlass.Int32(4)"
+        )
+        role_src, _, _ = self._role_local_while_source_for_predicate(
+            code,
+            ast.parse(code),
+            exec_role_predicate,
+        )
+        self.assertIn(
+            "tcgen05_acc_pipeline.producer_acquire(tcgen05_acc_producer_state)",
+            role_src,
+        )
+        self.assertIn("consumer_try_wait(tcgen05_ab_consumer_state)", role_src)
+        self.assertIn("consumer_release(tcgen05_ab_consumer_state)", role_src)
+        self.assertIn(
+            "tcgen05_acc_pipeline.producer_commit(tcgen05_acc_producer_state)",
+            role_src,
+        )
+        self.assertIn("tcgen05_acc_producer_state.advance()", role_src)
+        self.assertNotIn("cute.gemm(", role_src)
+        self.assertNotIn("cute.arch.fence_view_async_shared()", role_src)
+        self.assertNotIn("cute.nvgpu.tcgen05.Field.ACCUMULATE, True", role_src)
+
     def test_tcgen05_persistent_partial_single_tile_keeps_shared_tma_path(
         self,
     ) -> None:
