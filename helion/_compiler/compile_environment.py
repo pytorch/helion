@@ -1195,7 +1195,11 @@ class ReductionLoopBlockSizeSource(BlockSizeSource):
             len(config.reduction_loops) <= self.reduction_loop
             or config.reduction_loops[self.reduction_loop] is None
         ):
-            return max(1, next_power_of_2(block_size_info.size_hint()))
+            size = max(1, block_size_info.size_hint())
+            # Backends override static_rdim_size to control whether the
+            # persistent-reduction extent is rounded up to a power of two
+            # (Triton/CuTe) or kept exact (Pallas).
+            return CompileEnvironment.current().backend.static_rdim_size(size)
         return config.reduction_loops[self.reduction_loop]
 
 
