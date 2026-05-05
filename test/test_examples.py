@@ -1209,7 +1209,10 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
 
     @xfailIfCute("CuTe LayerNorm backward example still returns incorrect results")
-    @xfailIfPallas("InductorLoweringError")
+    @xfailIfPallas(
+        "block_sizes=[32, 1] violates TPU 128-alignment for 1D fp32 mean/rstd; "
+        "shapes also have dim < 128 (escape hatch needs full-dim coverage)"
+    )
     @skipIfA10G("accuracy check fails on A10G GPUs")
     def test_layernorm_bwd(self):
         """Test combined backward pass for layer norm with bias, including regression coverage."""
