@@ -819,6 +819,7 @@ class TestSpecKeyNormalization(unittest.TestCase):
             mock_cache.key = key
             mock_cache._get_local_cache_path.return_value = cache_path
             mock_cache.kernel.backend_cache_key.return_value = None
+            mock_cache.autotuner.settings = Settings()
             # Make flatten() return a JSON-serializable list
             mock_cache.kernel.config_spec.create_config_generation.return_value.flatten.return_value = [
                 64,
@@ -833,6 +834,65 @@ class TestSpecKeyNormalization(unittest.TestCase):
             # put() stores raw str(v), so code object reprs are present
             self.assertIn("<code object", spec_key_str)
             self.assertIn("tensor_spec", spec_key_str)
+
+    def test_put_stores_acf_aware_flat_config(self):
+        """ACF cache keys and stored flat configs use the same flat layout."""
+        config_spec = ConfigSpec(backend=TritonBackend())
+        config_spec.block_sizes.append(
+            BlockSizeSpec(block_id=0, size_hint=64, min_size=16, max_size=256)
+        )
+        acf_files = ["/tmp/helion-test.acf"]
+        config = Config(
+            block_sizes=[64],
+            num_warps=4,
+            num_stages=3,
+            advanced_controls_file="/tmp/helion-test.acf",
+        )
+        acf_config_gen = config_spec.create_config_generation(
+            advanced_controls_files=acf_files
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache_path = Path(tmpdir) / "acf.best_config"
+            key = LooseAutotuneCacheKey(
+                specialization_key=("tensor_spec",),
+                extra_results=(),
+                kernel_source_hash="abc123",
+                hardware="test_hw",
+                runtime_name="1.0",
+                backend="triton",
+                config_spec_hash=config_spec.structural_fingerprint_hash(
+                    advanced_controls_files=acf_files
+                ),
+            )
+
+            mock_cache = MagicMock()
+            mock_cache.key = key
+            mock_cache._get_local_cache_path.return_value = cache_path
+            mock_cache.kernel.config_spec = config_spec
+            mock_cache.kernel.backend_cache_key.return_value = None
+            mock_cache.autotuner.settings = Settings(autotune_search_acf=acf_files)
+
+            LocalAutotuneCache.put(mock_cache, config)
+
+            data = json.loads(cache_path.read_text())
+            stored_flat = json.loads(data["flat_config"])
+            expected_flat = acf_config_gen.flatten(config)
+            self.assertEqual(stored_flat, expected_flat)
+            self.assertEqual(len(stored_flat), len(acf_config_gen.flat_spec))
+            entries = list(iter_cache_entries(Path(tmpdir)))
+            self.assertEqual(len(entries), 1)
+            self.assertEqual(entries[0].to_mutable_flat_config(), expected_flat)
+
+            roundtripped = acf_config_gen.unflatten(entries[0].to_mutable_flat_config())
+            self.assertEqual(
+                roundtripped.config["advanced_controls_file"],
+                "/tmp/helion-test.acf",
+            )
+            self.assertEqual(
+                data["key"]["fields"]["config_spec_hash"],
+                key.config_spec_hash,
+            )
 
 
 class TestStructuralFingerprint(unittest.TestCase):

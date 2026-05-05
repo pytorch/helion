@@ -879,12 +879,10 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         Checks the kernel's config list and settings to determine if
         a config can be resolved without autotuning.
         """
-        if self.settings.force_autotune:
-            return None
         configs = self.kernel.configs
-        if len(configs) == 1:
-            return configs[0]
-        if len(configs) == 0 and self.kernel.settings.autotune_effort == "none":
+        if self.kernel.settings.autotune_effort == "none" and (
+            len(configs) == 0 or self.settings.force_autotune
+        ):
             config = self.config_spec.default_config()
             if not is_ref_mode_enabled(self.kernel.settings):
                 kernel_decorator = self.format_kernel_decorator(config, self.settings)
@@ -893,6 +891,10 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                     file=sys.stderr,
                 )
             return config
+        if self.settings.force_autotune:
+            return None
+        if len(configs) == 1:
+            return configs[0]
         return None
 
     def _implicit_config(self) -> Config | None:
