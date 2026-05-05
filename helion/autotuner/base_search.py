@@ -787,21 +787,12 @@ class PopulationBasedSearch(BaseSearch):
 
         # User hints are explicit requests, so try them before compiler-owned
         # seeds and cached configs while still deduplicating normalized configs.
-        for i, config in enumerate(self._autotune_hint_configs()):
-            try:
-                flat = self.config_gen.flatten(config)
-                transferred_config = self.config_gen.unflatten(flat)
-                if transferred_config not in seen:
-                    seen.add(transferred_config)
-                    result.append(flat)
-            except (
-                ValueError,
-                TypeError,
-                KeyError,
-                AssertionError,
-                exc.InvalidConfig,
-            ) as e:
-                self.log(f"Failed to transfer autotune hint {i + 1}: {e}")
+        for flat, transferred_config in self.config_gen.hint_flat_config_pairs(
+            self._autotune_hint_configs(), self.log
+        ):
+            if transferred_config not in seen:
+                seen.add(transferred_config)
+                result.append(flat)
 
         # Compiler-owned seeds come from ConfigSpec.autotune_seed_configs();
         # they encode backend/compiler heuristics and complement user hints.

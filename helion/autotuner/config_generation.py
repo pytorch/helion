@@ -403,6 +403,34 @@ class ConfigGeneration:
             result.append((flat, normalized))
         return result
 
+    def hint_flat_config_pairs(
+        self,
+        config_hints: Sequence[Config],
+        log_func: Callable[[str], None] | None = None,
+    ) -> list[tuple[FlatConfig, Config]]:
+        """Return user-provided hints as flat and normalized configs."""
+        result: list[tuple[FlatConfig, Config]] = []
+        seen: set[Config] = set()
+        for i, config in enumerate(config_hints):
+            try:
+                flat = self.flatten(config)
+                normalized = self.unflatten(flat)
+            except (
+                InvalidConfig,
+                ValueError,
+                TypeError,
+                KeyError,
+                AssertionError,
+            ) as e:
+                if log_func is not None:
+                    log_func(f"Failed to transfer autotune hint {i + 1}: {e}")
+                continue
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            result.append((flat, normalized))
+        return result
+
     def random_flat(self) -> FlatConfig:
         """
         Generate a random flat configuration.
@@ -442,36 +470,20 @@ class ConfigGeneration:
             return [self.default_flat()]
         default_flat = self.default_flat()
         result = [default_flat]
-        seen = {self.unflatten([*default_flat])}
 
         # Initial population order is default -> user hints -> compiler seeds
         # -> random.  This preserves hint priority without dropping built-in
         # backend/compiler seeds from ConfigSpec.autotune_seed_configs().
-        for i, config in enumerate(config_hints):
-            try:
-                flat = self.flatten(config)
-                transferred_config = self.unflatten(flat)
-            except (
-                InvalidConfig,
-                ValueError,
-                TypeError,
-                KeyError,
-                AssertionError,
-            ) as e:
-                if log_func is not None:
-                    log_func(f"Failed to transfer autotune hint {i + 1}: {e}")
+        for flat, _config in self.hint_flat_config_pairs(config_hints, log_func):
+            if any(flat == existing for existing in result):
                 continue
-            if transferred_config in seen:
-                continue
-            seen.add(transferred_config)
             result.append(flat)
             if len(result) >= n:
                 return result[:n]
 
-        for flat, transferred_config in self.seed_flat_config_pairs():
-            if transferred_config in seen:
+        for flat, _config in self.seed_flat_config_pairs():
+            if any(flat == existing for existing in result):
                 continue
-            seen.add(transferred_config)
             result.append(flat)
             if len(result) >= n:
                 return result[:n]
