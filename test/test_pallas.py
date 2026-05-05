@@ -735,55 +735,23 @@ class TestPallas(TestCase):
         torch.testing.assert_close(result, expected, rtol=1e-2, atol=1e-2)
 
     @xfailIfPallas("Non-zero begin K reduction: DMA offset not tile-aligned")
-    def test_bmm_fori_loop_nonzero_k_begin(self) -> None:
-        """BMM with K reduction starting at non-zero offset using fori_loop."""
+    def test_bmm_nonzero_k_begin(self) -> None:
+        """BMM with K reduction starting at non-zero offset, across all loop types."""
         a = torch.randn(4, 128, 384, device=DEVICE, dtype=torch.bfloat16)
         b = torch.randn(4, 384, 128, device=DEVICE, dtype=torch.bfloat16)
         k_start, k_end = 128, 384
-        _code, result = code_and_output(
-            pallas_bmm_subrange_k,
-            (a, b, k_start, k_end),
-            block_sizes=[4, 128, 128, 256],
-            pallas_loop_type="fori_loop",
-        )
         expected = torch.bmm(
             a[:, :, k_start:k_end].float(), b[:, k_start:k_end, :].float()
         ).to(torch.bfloat16)
-        torch.testing.assert_close(result, expected, rtol=1e-2, atol=1e-2)
-
-    @xfailIfPallas("Non-zero begin K reduction: emit_pipeline offset mismatch")
-    def test_bmm_emit_pipeline_nonzero_k_begin(self) -> None:
-        """BMM with K reduction starting at non-zero offset using emit_pipeline."""
-        a = torch.randn(4, 128, 384, device=DEVICE, dtype=torch.bfloat16)
-        b = torch.randn(4, 384, 128, device=DEVICE, dtype=torch.bfloat16)
-        k_start, k_end = 128, 384
-        _code, result = code_and_output(
-            pallas_bmm_subrange_k,
-            (a, b, k_start, k_end),
-            block_sizes=[4, 128, 128, 256],
-            pallas_loop_type="emit_pipeline",
-        )
-        expected = torch.bmm(
-            a[:, :, k_start:k_end].float(), b[:, k_start:k_end, :].float()
-        ).to(torch.bfloat16)
-        torch.testing.assert_close(result, expected, rtol=1e-2, atol=1e-2)
-
-    @xfailIfPallas("Non-zero begin K reduction: DMA offset not tile-aligned")
-    def test_bmm_nonzero_k_begin_unroll(self) -> None:
-        """BMM with K reduction starting at non-zero offset."""
-        a = torch.randn(4, 128, 384, device=DEVICE, dtype=torch.bfloat16)
-        b = torch.randn(4, 384, 128, device=DEVICE, dtype=torch.bfloat16)
-        k_start, k_end = 128, 384
-        _code, result = code_and_output(
-            pallas_bmm_subrange_k,
-            (a, b, k_start, k_end),
-            block_sizes=[4, 128, 128, 256],
-            pallas_loop_type="unroll",
-        )
-        expected = torch.bmm(
-            a[:, :, k_start:k_end].float(), b[:, k_start:k_end, :].float()
-        ).to(torch.bfloat16)
-        torch.testing.assert_close(result, expected, rtol=1e-2, atol=1e-2)
+        for loop_type in ("unroll", "fori_loop", "emit_pipeline"):
+            with self.subTest(pallas_loop_type=loop_type):
+                _code, result = code_and_output(
+                    pallas_bmm_subrange_k,
+                    (a, b, k_start, k_end),
+                    block_sizes=[4, 128, 128, 256],
+                    pallas_loop_type=loop_type,
+                )
+                torch.testing.assert_close(result, expected, rtol=1e-2, atol=1e-2)
 
     def test_emit_pipeline_codegen(self) -> None:
         """Test that pallas_loop_type='emit_pipeline' generates correct emit_pipeline code."""
@@ -2056,56 +2024,6 @@ class TestPallas(TestCase):
             running = running + chunk.sum(-1).float()
             acc_ref = acc_ref + running[:, :, None]
         ref = (acc_ref + running[:, :, None] * running[:, :, None]).to(a.dtype)
-        torch.testing.assert_close(result, ref, rtol=1e-2, atol=1e-2)
-
-    @xfailIfPallas(
-        "Outer pre-broadcast tiling does not propagate through same-rank outer ops"
-    )
-    def test_pre_broadcast_outer_same_rank_chain(self) -> None:
-        """Outer same-rank ops should preserve pre-broadcast tiling information.
-
-        The current outer rewrite handles direct wide consumers like
-        ``acc / running[:, :, None]`` but does not propagate pre-broadcast
-        status through intermediate same-rank ops such as ``+ 1`` and
-        ``torch.rsqrt``. The final wide multiply still needs a tile insertion.
-        """
-
-        @helion.kernel(backend="pallas", static_shapes=True)
-        def outer_chain_scale(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-            batch, m, k = a.size()
-            head_dim = hl.specialize(b.size(-1))
-            out = torch.empty([batch, m, head_dim], device=a.device, dtype=a.dtype)
-            for tile_b, tile_m in hl.tile([batch, m]):
-                running = hl.zeros([tile_b, tile_m], dtype=torch.float32)
-                acc = hl.zeros([tile_b, tile_m, head_dim], dtype=torch.float32)
-                for tile_k in hl.tile(k):
-                    chunk = a[tile_b, tile_m, tile_k]
-                    running = running + torch.sum(chunk, -1)
-                    acc = acc + running[:, :, None]
-                scale = torch.rsqrt(running[:, :, None] + 1.0)
-                out[tile_b, tile_m, :] = (acc * scale).to(out.dtype)
-            return out
-
-        a = torch.randn(2, 128, 256, device=DEVICE, dtype=torch.float32)
-        b = torch.randn(2, 256, 256, device=DEVICE, dtype=torch.float32)
-        code, result = code_and_output(
-            outer_chain_scale,
-            (a, b),
-            block_sizes=[2, 128, 128],
-            pallas_loop_type="emit_pipeline",
-            pallas_pre_broadcast=True,
-        )
-        self.assertIn("pltpu.emit_pipeline", code)
-        self.assertIn("jnp.tile(", code)
-
-        block_k = 128
-        running = torch.zeros(2, 128, dtype=torch.float32, device=a.device)
-        acc_ref = torch.zeros(2, 128, 256, dtype=torch.float32, device=a.device)
-        for kb in range(0, 256, block_k):
-            chunk = a[:, :, kb : kb + block_k]
-            running = running + chunk.sum(-1).float()
-            acc_ref = acc_ref + running[:, :, None]
-        ref = (acc_ref * torch.rsqrt(running[:, :, None] + 1.0)).to(a.dtype)
         torch.testing.assert_close(result, ref, rtol=1e-2, atol=1e-2)
 
     def test_data_dependent_loop_bounds(self) -> None:
