@@ -17,6 +17,8 @@ from helion._testing import code_and_output
 from helion._testing import onlyBackends
 from helion._testing import patch_cute_mma_support
 from helion._testing import skipIfMTIA
+from helion.autotuner.pattern_search import InitialPopulationStrategy
+from helion.autotuner.pattern_search import PatternSearch
 from helion.exc import InvalidConfig
 import helion.language as hl
 
@@ -289,6 +291,85 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
                 self.assertEqual(config["tcgen05_cluster_m"], 2)
                 self.assertEqual(config["pid_type"], "persistent_blocked")
                 self.assertEqual(config["block_sizes"][:3], [256, 256, 16])
+
+    @onlyBackends(["cute"])
+    def test_cute_tcgen05_two_cta_seeded_in_initial_populations(self) -> None:
+        @helion.kernel(backend="cute")
+        def cute_matmul_mma(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        args = (
+            torch.empty([4096, 4096], device=DEVICE, dtype=HALF_DTYPE),
+            torch.empty([4096, 4096], device=DEVICE, dtype=HALF_DTYPE),
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_mma.bind(args)
+
+        def assert_seeded(configs: list[helion.Config]) -> None:
+            seeded = [
+                config.config
+                for config in configs
+                if config.config["tcgen05_cluster_m"] == 2
+            ]
+            self.assertEqual(len(seeded), 1)
+            seed = seeded[0]
+            self.assertEqual(
+                seed["block_sizes"][:3],
+                [TCGEN05_TWO_CTA_BLOCK_M, TCGEN05_TWO_CTA_BLOCK_N, 128],
+            )
+            self.assertEqual(seed["pid_type"], "persistent_blocked")
+            self.assertEqual(seed["tcgen05_num_epi_warps"], 4)
+
+        config_gen = bound.config_spec.create_config_generation()
+        zero_flat = config_gen.random_population_flat(0)
+        self.assertEqual(len(zero_flat), 1)
+        zero_config = config_gen.unflatten(zero_flat[0])
+        self.assertEqual(zero_config.config["tcgen05_cluster_m"], 1)
+        one_flat = config_gen.random_population_flat(1)
+        self.assertEqual(len(one_flat), 1)
+        one_config = config_gen.unflatten(one_flat[0])
+        self.assertEqual(one_config.config["tcgen05_cluster_m"], 1)
+        one_config_population = config_gen.random_population(1)
+        self.assertEqual(len(one_config_population), 1)
+        self.assertEqual(one_config_population[0].config["tcgen05_cluster_m"], 1)
+        assert_seeded(config_gen.random_population(2))
+
+        acf_config_gen = bound.config_spec.create_config_generation(
+            advanced_controls_files=["/tmp/helion-test.acf"]
+        )
+        acf_configs = acf_config_gen.random_population(2)
+        self.assertEqual(len(acf_configs), 2)
+        self.assertEqual(
+            {config.config["advanced_controls_file"] for config in acf_configs},
+            {"/tmp/helion-test.acf"},
+        )
+        assert_seeded(acf_configs)
+
+        with patch.object(
+            PatternSearch, "_find_similar_cached_configs", return_value=[]
+        ):
+            search = PatternSearch(
+                bound,
+                args,
+                initial_population=30,
+                initial_population_strategy=InitialPopulationStrategy.FROM_BEST_AVAILABLE,
+                best_available_pad_random=False,
+            )
+            configs = [
+                search.config_gen.unflatten(flat)
+                for flat in search._generate_initial_population_flat()
+            ]
+        self.assertEqual(len(configs), 2)
+        self.assertEqual(configs[0].config["tcgen05_cluster_m"], 1)
+        assert_seeded(configs)
 
     @onlyBackends(["cute"])
     def test_cute_tcgen05_two_cta_projection_falls_back_before_mutation(

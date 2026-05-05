@@ -96,6 +96,46 @@ class TestAdvancedCompilerConfiguration(TestCase):
         kernel_with_acf.reset()
         kernel_without_acf.reset()
 
+    def test_autotune_search_acf_changes_structural_fingerprint(self) -> None:
+        x = torch.randn(4, device=DEVICE)
+        bound = _copy_kernel.bind((x,))
+
+        without_acf = bound.config_spec.structural_fingerprint()
+        with_acf = bound.config_spec.structural_fingerprint(
+            advanced_controls_files=["/some/path.bin"]
+        )
+        with_same_acf_explicit_default = bound.config_spec.structural_fingerprint(
+            advanced_controls_files=["/some/path.bin", ""]
+        )
+        with_reordered_acf = bound.config_spec.structural_fingerprint(
+            advanced_controls_files=["", "/some/path.bin"]
+        )
+        with_other_acf = bound.config_spec.structural_fingerprint(
+            advanced_controls_files=["/other/path.bin"]
+        )
+
+        self.assertNotEqual(without_acf, with_acf)
+        self.assertNotIn("advanced_controls_file", [key for key, *_ in without_acf])
+        self.assertIn("advanced_controls_file", [key for key, *_ in with_acf])
+        self.assertIn(("advanced_controls_file", "/some/path.bin", ""), with_acf)
+        self.assertEqual(with_acf, with_same_acf_explicit_default)
+        self.assertNotEqual(with_acf, with_reordered_acf)
+        self.assertNotEqual(with_acf, with_other_acf)
+        self.assertNotEqual(
+            bound.config_spec.structural_fingerprint_hash(),
+            bound.config_spec.structural_fingerprint_hash(
+                advanced_controls_files=["/some/path.bin"]
+            ),
+        )
+        self.assertNotEqual(
+            bound.config_spec.structural_fingerprint_hash(
+                advanced_controls_files=["/some/path.bin"]
+            ),
+            bound.config_spec.structural_fingerprint_hash(
+                advanced_controls_files=["/other/path.bin"]
+            ),
+        )
+
     @skipIfRefEager("Codegen inspection not applicable in ref eager mode")
     def test_empty_string_means_no_config(self) -> None:
         x = torch.randn(128, device=DEVICE)
