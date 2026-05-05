@@ -1507,13 +1507,68 @@ class TestCuteLowerings(unittest.TestCase):
             ):
                 bound(*args)
 
-    def test_tcgen05_persistent_cluster_m2_two_cta_runtime_guard(self) -> None:
-        """CtaGroup.TWO codegen is still guarded before runtime launch.
+    def test_tcgen05_persistent_cluster_m2_partial_single_tile_runtime_guard(
+        self,
+    ) -> None:
+        """Partial single-tile cluster_m=2 fallback remains guarded."""
 
-        The G3 structural path emits bm=256 / cluster_m=2 / CtaGroup.TWO
-        code, but the runtime ownership path is not validated yet. Guard even
-        the single-output-tile case so explicit configs cannot hang the GPU.
+        @helion.kernel(backend="cute")
+        def cute_matmul_cluster_m2_partial_single_tile(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        args = (
+            torch.randn(256, 17, device=DEVICE, dtype=torch.float16),
+            torch.randn(17, 256, device=DEVICE, dtype=torch.float16),
+        )
+        from helion._compiler.program_id import Tcgen05PersistentProgramIDs
+
+        with patch_cute_mma_support():
+            bound = cute_matmul_cluster_m2_partial_single_tile.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            cfg = _make_tcgen05_persistent_config(
+                block_sizes=[256, 256, 16],
+                pid_type="persistent_blocked",
+                tcgen05_cluster_m=2,
+            )
+            bound.set_config(cfg)
+            code = bound.to_triton_code(cfg)
+            self.assertIn("cute.nvgpu.tcgen05.CtaGroup.TWO", code)
+            self.assertNotIn("tcgen05_role_local", code)
+            self.assertIn(Tcgen05PersistentProgramIDs._MULTI_TILE_GUARD_TOTAL_VAR, code)
+            self.assertIn(
+                f"if {Tcgen05PersistentProgramIDs._MULTI_TILE_GUARD_TOTAL_VAR} > 0:",
+                code,
+            )
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "supports multi-tile execution only",
+            ):
+                bound(*args)
+
+    def test_tcgen05_persistent_cluster_m2_two_cta_single_tile_runtime_correctness(
+        self,
+    ) -> None:
+        """Single-output-tile CtaGroup.TWO codegen runs correctly.
+
+        Multi-tile cluster_m=2 is still guarded separately, but the
+        single-output-tile path now has runtime coverage for the AB
+        TMA/UMMA ownership and tail-drain sequence.
         """
+
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
 
         @helion.kernel(backend="cute")
         def cute_matmul_cluster_m2_two_cta(
@@ -1529,9 +1584,10 @@ class TestCuteLowerings(unittest.TestCase):
                 out[tile_m, tile_n] = acc.to(x.dtype)
             return out
 
+        torch.manual_seed(0)
         args = (
-            torch.randn(256, 32, device=DEVICE, dtype=torch.bfloat16),
-            torch.randn(32, 256, device=DEVICE, dtype=torch.bfloat16),
+            torch.randn(256, 16, device=DEVICE, dtype=torch.bfloat16),
+            torch.randn(16, 256, device=DEVICE, dtype=torch.bfloat16),
         )
         from helion._compiler.program_id import Tcgen05PersistentProgramIDs
 
@@ -1541,8 +1597,8 @@ class TestCuteLowerings(unittest.TestCase):
             cfg = _make_tcgen05_persistent_config(
                 block_sizes=[256, 256, 16],
                 # Grouped PID decomposition leaves pure scalar setup in the
-                # omitted shared view; the host guard should still compile
-                # and raise instead of tripping the omit-safety assertion.
+                # omitted shared view; single-tile runtime should compile and
+                # run instead of tripping the omit-safety assertion.
                 l2_groupings=[4],
                 pid_type="persistent_blocked",
                 tcgen05_cluster_m=2,
@@ -1579,14 +1635,19 @@ class TestCuteLowerings(unittest.TestCase):
                 code,
             )
             self.assertIn(
+                "tcgen05_ab_pipeline_tx_count = "
+                "(cute.size_in_bytes(cutlass.BFloat16, sA_tma_layout) + "
+                "cute.size_in_bytes(cutlass.BFloat16, sB_tma_layout)) * "
+                "cute.size(tiled_mma.thr_id.shape)",
+                code,
+            )
+            self.assertIn(
                 "tcgen05_ab_pipeline = "
                 "cutlass.pipeline.PipelineTmaUmma.create("
                 "num_stages=2, "
                 "producer_group=tcgen05_ab_pipeline_producer_group, "
                 "consumer_group=tcgen05_ab_pipeline_consumer_group, "
-                "tx_count=cute.size_in_bytes(cutlass.BFloat16, "
-                "sA_tma_layout) + cute.size_in_bytes(cutlass.BFloat16, "
-                "sB_tma_layout), "
+                "tx_count=tcgen05_ab_pipeline_tx_count, "
                 "barrier_storage=tcgen05_ab_pipeline_mbars, "
                 "cta_layout_vmnk=tcgen05_cluster_layout_vmnk, "
                 "defer_sync=True)",
@@ -1664,8 +1725,20 @@ class TestCuteLowerings(unittest.TestCase):
                     role_src = ast.unparse(role_child)
                     if test_src == tma_role_predicate:
                         self.assertIn("tcgen05_ab_pipeline.producer_acquire", role_src)
+                        self.assertIn(
+                            "cute.nvgpu.cpasync.tma_partition("
+                            "tma_atom_a, tma_a_cta_coord, tma_a_cta_layout",
+                            role_src,
+                        )
+                        self.assertIn(
+                            "cute.nvgpu.cpasync.tma_partition("
+                            "tma_atom_b, tma_b_cta_coord, tma_b_cta_layout",
+                            role_src,
+                        )
                         self.assertIn("cute.copy(tma_atom_a", role_src)
-                        self.assertIn(_TCGEN05_CLUSTER_LEADER_PREDICATE, role_src)
+                        self.assertNotIn(
+                            f"if {_TCGEN05_CLUSTER_LEADER_PREDICATE}", role_src
+                        )
                         found_role_local_tma = True
                     elif test_src == exec_role_predicate:
                         self.assertIn("tcgen05_ab_pipeline.consumer_wait", role_src)
@@ -1696,6 +1769,16 @@ class TestCuteLowerings(unittest.TestCase):
                             ),
                             "Expected the CtaGroup.TWO exec owner to commit "
                             "the acc producer state. Generated role code:\n" + role_src,
+                        )
+                        self.assertFalse(
+                            any(
+                                "tcgen05_ab_pipeline.consumer_release("
+                                "tcgen05_ab_consumer_state)" in block
+                                for block in leader_blocks
+                            ),
+                            "AB empty release must be reached by both CTA exec "
+                            "warps so TMA producer_tail can drain. Generated "
+                            "role code:\n" + role_src,
                         )
                         self.assertIn("tcgen05_acc_producer_state.advance()", role_src)
                         found_role_local_exec = True
@@ -1730,11 +1813,13 @@ class TestCuteLowerings(unittest.TestCase):
                 "codegen. Generated code:\n" + code,
             )
             self.assertIn(Tcgen05PersistentProgramIDs._MULTI_TILE_GUARD_TOTAL_VAR, code)
-            with self.assertRaisesRegex(
-                RuntimeError,
-                "supports multi-tile execution only",
-            ):
-                bound(*args)
+            self.assertIn(
+                f"if {Tcgen05PersistentProgramIDs._MULTI_TILE_GUARD_TOTAL_VAR} > 1:",
+                code,
+            )
+            out = bound(*args)
+        expected = args[0] @ args[1]
+        torch.testing.assert_close(out, expected, atol=2e-1, rtol=1e-2)
 
     def test_tcgen05_flat_cluster_m2_two_cta_rejected(self) -> None:
         """Flat CtaGroup.TWO configs do not have the persistent host guard."""
@@ -6025,7 +6110,7 @@ class TestPerKiterTmaBuilders(unittest.TestCase):
         body_src = ast.unparse(ast.Module(body=node.body, type_ignores=[]))
         self.assertNotIn("tma_warp", body_src)
 
-    def test_pipeline_producer_two_cta_gates_copies_not_pipeline_state(
+    def test_pipeline_producer_two_cta_keeps_per_cta_copies(
         self,
     ) -> None:
         args = self._make_args(cluster_m=2, is_two_cta=True)
@@ -6041,15 +6126,14 @@ class TestPerKiterTmaBuilders(unittest.TestCase):
                 "=producer_try_acquire",
                 "producer_acquire",
                 "=producer_get_barrier",
-                "If",
+                "copy",
+                "copy",
                 "producer_commit",
                 "advance",
             ],
         )
-        copy_gate = node.body[3]
-        self.assertIsInstance(copy_gate, ast.If)
-        self.assertEqual(ast.unparse(copy_gate.test), _TCGEN05_CLUSTER_LEADER_PREDICATE)
-        self.assertEqual(self._stmt_kinds(copy_gate.body), ["copy", "copy"])
+        body_src = ast.unparse(ast.Module(body=node.body, type_ignores=[]))
+        self.assertNotIn(_TCGEN05_CLUSTER_LEADER_PREDICATE, body_src)
 
     def test_non_pipeline_producer_if_can_drop_inline_tma_warp_gate(self) -> None:
         args = self._make_args()
@@ -6139,7 +6223,7 @@ class TestPerKiterTmaBuilders(unittest.TestCase):
         self.assertNotIn("exec_active", body_src)
         self.assertEqual(node.orelse, [])
 
-    def test_pipeline_release_two_cta_gates_release_not_state_advance(
+    def test_pipeline_release_two_cta_releases_from_both_exec_warps(
         self,
     ) -> None:
         args = self._make_args(cluster_m=2, is_two_cta=True)
@@ -6149,10 +6233,7 @@ class TestPerKiterTmaBuilders(unittest.TestCase):
         self.assertEqual(self._stmt_kinds(node.body), ["If", "If"])
         release_gate, advance_gate = node.body
         self.assertIsInstance(release_gate, ast.If)
-        self.assertEqual(
-            ast.unparse(release_gate.test),
-            f"exec_active and {_TCGEN05_CLUSTER_LEADER_PREDICATE}",
-        )
+        self.assertEqual(ast.unparse(release_gate.test), "exec_active")
         self.assertEqual(self._stmt_kinds(release_gate.body), ["consumer_release"])
         self.assertIsInstance(advance_gate, ast.If)
         self.assertEqual(ast.unparse(advance_gate.test), "exec_active")
@@ -6366,7 +6447,7 @@ class TestInitialPrefetchTmaBuilder(unittest.TestCase):
         # gB[None, Int32(stage-1)], not Int32(0).
         self.assertNotIn("None, cutlass.Int32(0)", body_src)
 
-    def test_two_cta_prefetch_gates_copies_not_pipeline_state(self) -> None:
+    def test_two_cta_prefetch_keeps_per_cta_copies(self) -> None:
         args = self._make_args(cluster_m=2, is_two_cta=True)
         node = _build_initial_prefetch_if(
             args,
@@ -6380,15 +6461,14 @@ class TestInitialPrefetchTmaBuilder(unittest.TestCase):
             [
                 "producer_acquire",
                 "=producer_get_barrier",
-                "If",
+                "copy",
+                "copy",
                 "producer_commit",
                 "advance",
             ],
         )
-        copy_gate = node.body[2]
-        self.assertIsInstance(copy_gate, ast.If)
-        self.assertEqual(ast.unparse(copy_gate.test), _TCGEN05_CLUSTER_LEADER_PREDICATE)
-        self.assertEqual(self._stmt_kinds(copy_gate.body), ["copy", "copy"])
+        body_src = ast.unparse(ast.Module(body=node.body, type_ignores=[]))
+        self.assertNotIn(_TCGEN05_CLUSTER_LEADER_PREDICATE, body_src)
 
     def test_mcast_mask_asymmetry_matches_per_kiter(self) -> None:
         """A only multicasts in 2-CTA mode; B multicasts on

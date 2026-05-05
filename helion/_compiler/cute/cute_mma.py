@@ -769,21 +769,6 @@ def _kloop_tma_copy_b_src(args: _PerKiterTmaArgs, *, k_offset: str) -> str:
     )
 
 
-def _two_cta_tma_copy_src(copy_src: str, *, is_two_cta: bool) -> str:
-    """Gate only TMA copy instructions to the 2-CTA cluster leader.
-
-    Both CTAs still run the surrounding PipelineTmaUmma producer state
-    machine so their local producer state stays aligned with the consumer
-    releases; the multicast TMA copies themselves are issued by CTA 0.
-    """
-    if not is_two_cta:
-        return copy_src
-    return (
-        f"    if {_TCGEN05_CLUSTER_LEADER_PREDICATE}:\n"
-        f"{textwrap.indent(copy_src, '    ')}"
-    )
-
-
 def _tcgen05_two_cta_owner_predicate(
     exec_active: str, *, is_two_cta: bool, gate_exec_warp: bool
 ) -> str | None:
@@ -824,6 +809,8 @@ def _build_kloop_pipeline_producer_if(
     copy_src = _kloop_tma_copy_a_src(args, k_offset=k_offset) + _kloop_tma_copy_b_src(
         args, k_offset=k_offset
     )
+    # CtaGroup.TWO uses CTA-rank-specific TMA partitions, so both CTAs issue
+    # these copies; PipelineTmaUmma gates the full-barrier tx setup internally.
     src = (
         f"if {' and '.join(predicate_terms)}:\n"
         f"    {args.tma_producer_try_token} = "
@@ -832,7 +819,7 @@ def _build_kloop_pipeline_producer_if(
         f"{args.tma_producer_state}, {args.tma_producer_try_token})\n"
         f"    {args.tma_barrier_ptr} = "
         f"{args.tma_pipeline}.producer_get_barrier({args.tma_producer_state})\n"
-        + _two_cta_tma_copy_src(copy_src, is_two_cta=args.is_two_cta)
+        + copy_src
         + f"    {args.tma_pipeline}.producer_commit({args.tma_producer_state})\n"
         + emit_pipeline_advance(args.tma_producer_state, indent="    ")
     )
@@ -887,11 +874,9 @@ def _build_kloop_pipeline_release_if(
     commit), so only the consumer-state advance is emitted here.
     """
     release_src = f"{args.tma_pipeline}.consumer_release({args.tma_consumer_state})"
-    release_gate = _tcgen05_two_cta_owner_predicate(
-        args.exec_active,
-        is_two_cta=args.is_two_cta,
-        gate_exec_warp=gate_exec_warp,
-    )
+    # For CtaGroup.TWO, both CTA exec warps must release the AB empty barrier
+    # so the peer-CTA TMA producer tail can drain after the final tile.
+    release_gate = args.exec_active if gate_exec_warp else None
     advance_src = emit_pipeline_advance(args.tma_consumer_state)
     if args.is_two_cta:
         # With gate_exec_warp=False the caller is already inside the
@@ -980,7 +965,7 @@ def _build_kloop_non_pipeline_producer_if(
         f"    {args.tma_pipeline}.producer_acquire({args.tma_producer_state})\n"
         f"    {args.tma_barrier_ptr} = "
         f"{args.tma_pipeline}.producer_get_barrier({args.tma_producer_state})\n"
-        + _two_cta_tma_copy_src(copy_src, is_two_cta=args.is_two_cta)
+        + copy_src
         + f"    {args.tma_pipeline}.producer_commit({args.tma_producer_state})"
     )
     return statement_from_string(src)
@@ -1139,7 +1124,7 @@ def _build_initial_prefetch_if(
         f"    {args.tma_pipeline}.producer_acquire({args.tma_producer_state})\n"
         f"    {args.tma_barrier_ptr} = "
         f"{args.tma_pipeline}.producer_get_barrier({args.tma_producer_state})\n"
-        + _two_cta_tma_copy_src(copy_src, is_two_cta=args.is_two_cta)
+        + copy_src
         + f"    {args.tma_pipeline}.producer_commit({args.tma_producer_state})\n"
         + emit_pipeline_advance(args.tma_producer_state, indent="    ")
     )
@@ -1559,6 +1544,7 @@ def _emit_mma_pipeline(
         )
 
     mma_participant_linear: str | None = None
+    mma_slice_linear: str | None = None
     mma_copy_linear: str | None = None
     mma_active: str | None = None
     tma_warp: str | None = None
@@ -1931,6 +1917,10 @@ def _emit_mma_pipeline(
         df.new_var("tcgen05_tma_store_tensor") if tcgen05_use_tma_store_epilogue else ""
     )
     tma_cta_layout = df.new_var("tma_cta_layout")
+    tma_a_cta_layout = df.new_var("tma_a_cta_layout")
+    tma_b_cta_layout = df.new_var("tma_b_cta_layout")
+    tma_a_cta_coord = df.new_var("tma_a_cta_coord")
+    tma_b_cta_coord = df.new_var("tma_b_cta_coord")
     tma_gA = df.new_var("tma_gA")
     tma_sA = df.new_var("tma_sA")
     tma_gB = df.new_var("tma_gB")
@@ -1950,6 +1940,7 @@ def _emit_mma_pipeline(
     tma_pipeline_mbars = df.new_var("tcgen05_ab_pipeline_mbars")
     tma_pipeline_producer_group = df.new_var("tcgen05_ab_pipeline_producer_group")
     tma_pipeline_consumer_group = df.new_var("tcgen05_ab_pipeline_consumer_group")
+    tma_pipeline_tx_count = df.new_var("tcgen05_ab_pipeline_tx_count")
     tma_pipeline = df.new_var("tcgen05_ab_pipeline")
     tma_producer_state = df.new_var("tcgen05_ab_producer_state")
     tma_consumer_state = df.new_var("tcgen05_ab_consumer_state")
@@ -2025,6 +2016,11 @@ def _emit_mma_pipeline(
             )
         )
         if tcgen05_use_tma:
+            if tcgen05_is_two_cta:
+                assert mma_slice_linear is not None
+                tma_thr_mma_slice = mma_slice_linear
+            else:
+                tma_thr_mma_slice = "cutlass.Int32(0)"
             prefix.append(
                 statement_from_string(
                     f"{tma_smem_a_layout} = cute.slice_({tcgen05_plan.smem_a_layout}, (None, None, None, 0))"
@@ -2037,7 +2033,7 @@ def _emit_mma_pipeline(
             )
             prefix.append(
                 statement_from_string(
-                    f"{tma_thr_mma} = {tiled_mma}.get_slice(cutlass.Int32(0))"
+                    f"{tma_thr_mma} = {tiled_mma}.get_slice({tma_thr_mma_slice})"
                 )
             )
             # gA, gB depend on per-tile (m_offset_var, n_offset_var). Their
@@ -2064,9 +2060,25 @@ def _emit_mma_pipeline(
                 f"{gmem_b_tma_part} = {tma_thr_mma}.partition_B({gmem_b_tma})",
                 tma_load=tcgen05_use_role_local_tma_producer,
             )
-            prefix.append(
-                statement_from_string(f"{tma_cta_layout} = cute.make_layout(1)")
-            )
+            if tcgen05_is_two_cta:
+                prefix.append(
+                    statement_from_string(
+                        f"{tma_a_cta_layout} = cute.make_layout("
+                        f"cute.slice_({tcgen05_cluster_layout_vmnk}, "
+                        "(0, 0, None, 0)).shape)"
+                    )
+                )
+                prefix.append(
+                    statement_from_string(
+                        f"{tma_b_cta_layout} = cute.make_layout("
+                        f"cute.slice_({tcgen05_cluster_layout_vmnk}, "
+                        "(0, None, 0, 0)).shape)"
+                    )
+                )
+            else:
+                prefix.append(
+                    statement_from_string(f"{tma_cta_layout} = cute.make_layout(1)")
+                )
             if tcgen05_cluster_m > 1 or tcgen05_is_two_cta:
                 prefix.append(
                     statement_from_string(
@@ -2080,6 +2092,17 @@ def _emit_mma_pipeline(
                         f"{tcgen05_cluster_layout_vmnk}.get_flat_coord({tma_cta_rank_in_cluster})"
                     )
                 )
+                if tcgen05_is_two_cta:
+                    prefix.append(
+                        statement_from_string(
+                            f"{tma_a_cta_coord} = {tma_block_in_cluster_coord_vmnk}[2]"
+                        )
+                    )
+                    prefix.append(
+                        statement_from_string(
+                            f"{tma_b_cta_coord} = {tma_block_in_cluster_coord_vmnk}[1]"
+                        )
+                    )
                 if tcgen05_is_two_cta:
                     prefix.append(
                         statement_from_string(
@@ -2098,9 +2121,17 @@ def _emit_mma_pipeline(
                     )
             # tma_partition consumes the per-tile gA_part / gB_part, so the
             # resulting (tma_sA, tma_gA) / (tma_sB, tma_gB) are also per-tile.
+            tma_a_cta_coord_expr = tma_a_cta_coord if tcgen05_is_two_cta else "0"
+            tma_b_cta_coord_expr = tma_b_cta_coord if tcgen05_is_two_cta else "0"
+            tma_a_cta_layout_expr = (
+                tma_a_cta_layout if tcgen05_is_two_cta else tma_cta_layout
+            )
+            tma_b_cta_layout_expr = (
+                tma_b_cta_layout if tcgen05_is_two_cta else tma_cta_layout
+            )
             _emit_per_tile(
                 f"{tma_sA}, {tma_gA} = cute.nvgpu.cpasync.tma_partition("
-                f"{tma_atom_a}, 0, {tma_cta_layout}, "
+                f"{tma_atom_a}, {tma_a_cta_coord_expr}, {tma_a_cta_layout_expr}, "
                 f"cute.group_modes({smem_a}, 0, cute.rank({smem_a}) - 1), "
                 f"cute.group_modes({gmem_a_tma_part}, 0, "
                 f"cute.rank({gmem_a_tma_part}) - 1))",
@@ -2108,7 +2139,7 @@ def _emit_mma_pipeline(
             )
             _emit_per_tile(
                 f"{tma_sB}, {tma_gB} = cute.nvgpu.cpasync.tma_partition("
-                f"{tma_atom_b}, 0, {tma_cta_layout}, "
+                f"{tma_atom_b}, {tma_b_cta_coord_expr}, {tma_b_cta_layout_expr}, "
                 f"cute.group_modes({smem_b}, 0, cute.rank({smem_b}) - 1), "
                 f"cute.group_modes({gmem_b_tma_part}, 0, "
                 f"cute.rank({gmem_b_tma_part}) - 1))",
@@ -2134,13 +2165,23 @@ def _emit_mma_pipeline(
             )
             prefix.append(
                 statement_from_string(
+                    f"{tma_pipeline_tx_count} = "
+                    f"({'cute.size_in_bytes(' + input_dtype_str + ', ' + tma_smem_a_layout + ')' if tcgen05_use_tma_a else '0'} + "
+                    f"{'cute.size_in_bytes(' + input_dtype_str + ', ' + tma_smem_b_layout + ')' if tcgen05_use_tma_b else '0'})"
+                    + (
+                        f" * cute.size({tiled_mma}.thr_id.shape)"
+                        if tcgen05_is_two_cta
+                        else ""
+                    )
+                )
+            )
+            prefix.append(
+                statement_from_string(
                     f"{tma_pipeline} = cutlass.pipeline.PipelineTmaUmma.create("
                     f"num_stages={tcgen05_ab_stage_count_value}, "
                     f"producer_group={tma_pipeline_producer_group}, "
                     f"consumer_group={tma_pipeline_consumer_group}, "
-                    "tx_count="
-                    f"{'cute.size_in_bytes(' + input_dtype_str + ', ' + tma_smem_a_layout + ')' if tcgen05_use_tma_a else '0'} + "
-                    f"{'cute.size_in_bytes(' + input_dtype_str + ', ' + tma_smem_b_layout + ')' if tcgen05_use_tma_b else '0'}, "
+                    f"tx_count={tma_pipeline_tx_count}, "
                     f"barrier_storage={tma_pipeline_mbars}, "
                     f"cta_layout_vmnk={tcgen05_cluster_layout_vmnk}"
                     f"{tcgen05_defer_pipeline_sync_arg})"
