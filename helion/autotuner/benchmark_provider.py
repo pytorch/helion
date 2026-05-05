@@ -582,10 +582,8 @@ class LocalBenchmarkProvider(BenchmarkProvider):
     def cleanup(self) -> None:
         """Release per-autotune resources.
 
-        Pool workers are reused across generations inside one autotune, but
-        not across separate autotune calls.  Long-lived CUDA contexts retain
-        allocator/module caches, so keeping them around after selection can
-        starve the parent process or the next kernel of GPU memory.
+        Pool workers normally stop here to release CUDA caches; process-level
+        reuse keeps the pool alive for cross-shape benchmarking.
         """
         if self._benchmark_worker is not None:
             self._benchmark_worker.shutdown()
@@ -684,6 +682,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                 num_workers=self._pool_size(),
                 log=self.log,
                 autotune_metrics=self._autotune_metrics,
+                reuse_process_pool=self.settings.autotune_pool_reuse_process,
             )
         return self._pool_manager
 

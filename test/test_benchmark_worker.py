@@ -29,6 +29,7 @@ from helion.autotuner.base_search import PopulationMember
 from helion.autotuner.benchmark_job import BenchmarkJob
 from helion.autotuner.benchmark_job import RebenchmarkJob
 from helion.autotuner.benchmark_job import _load_args
+import helion.autotuner.benchmark_pool as benchmark_pool
 from helion.autotuner.benchmark_pool import PoolBenchmarkManager
 from helion.autotuner.benchmark_provider import LocalBenchmarkProvider
 from helion.autotuner.benchmark_worker import BenchmarkTimeout
@@ -82,8 +83,26 @@ class _ReturnValue:
         return self.value
 
 
+class _FakeBenchmarkWorkerPool:
+    def __init__(self, num_workers: int) -> None:
+        self.num_workers = num_workers
+        self.shutdown_called = False
+
+    def shutdown(self) -> None:
+        self.shutdown_called = True
+
+
 def _callable_kernel_arg(value: object) -> object:
     return value
+
+
+def _make_pool_manager(num_workers: int) -> PoolBenchmarkManager:
+    return PoolBenchmarkManager(
+        num_workers=num_workers,
+        log=cast("Any", SimpleNamespace()),
+        autotune_metrics=cast("Any", SimpleNamespace()),
+        reuse_process_pool=True,
+    )
 
 
 class TestBenchmarkWorkerFailureModes(unittest.TestCase):
@@ -212,10 +231,64 @@ class TestWorkerPoolPrecompile(unittest.TestCase):
                 "owner_isolated",
             )
 
+    def test_pool_process_reuse_env_value_is_supported(self) -> None:
+        # Process-level pool reuse should stay opt-in behind its env flag.
+        with patch.dict(os.environ, {"HELION_AUTOTUNE_POOL_REUSE_PROCESS": "1"}):
+            self.assertTrue(Settings().autotune_pool_reuse_process)
+
     def test_pool_auto_worker_cap_defaults_to_32(self) -> None:
         # Auto-sized pools should default to a 32-worker cap.
         with patch.dict(os.environ, {"HELION_AUTOTUNE_PRECOMPILE_WORKERS_CAP": ""}):
             self.assertEqual(Settings().autotune_precompile_workers_cap, 32)
+
+    def test_process_pool_reuse_keeps_pool_across_managers(self) -> None:
+        # Process reuse should preserve workers until global shutdown.
+        with patch.object(
+            benchmark_pool,
+            "BenchmarkWorkerPool",
+            _FakeBenchmarkWorkerPool,
+        ):
+            benchmark_pool._shutdown_process_pool()
+            try:
+                manager_a = _make_pool_manager(2)
+                pool_a = cast("Any", manager_a)._pool
+                manager_a.shutdown()
+
+                manager_b = _make_pool_manager(2)
+                pool_b = cast("Any", manager_b)._pool
+
+                self.assertIs(pool_a, pool_b)
+                self.assertFalse(pool_a.shutdown_called)
+                manager_b.shutdown()
+                self.assertFalse(pool_a.shutdown_called)
+
+                benchmark_pool._shutdown_process_pool()
+                self.assertTrue(pool_a.shutdown_called)
+            finally:
+                benchmark_pool._shutdown_process_pool()
+
+    def test_process_pool_reuse_replaces_pool_when_size_changes(self) -> None:
+        # Changing pool size should discard the old process-level pool.
+        with patch.object(
+            benchmark_pool,
+            "BenchmarkWorkerPool",
+            _FakeBenchmarkWorkerPool,
+        ):
+            benchmark_pool._shutdown_process_pool()
+            try:
+                manager_a = _make_pool_manager(2)
+                pool_a = cast("Any", manager_a)._pool
+                manager_b = _make_pool_manager(3)
+                pool_b = cast("Any", manager_b)._pool
+
+                self.assertIsNot(pool_a, pool_b)
+                self.assertTrue(pool_a.shutdown_called)
+                self.assertFalse(pool_b.shutdown_called)
+
+                manager_a.shutdown()
+                manager_b.shutdown()
+            finally:
+                benchmark_pool._shutdown_process_pool()
 
     def test_pool_cleanup_shuts_down_worker_pool(self) -> None:
         # Pool workers should not retain CUDA memory after one autotune finishes.

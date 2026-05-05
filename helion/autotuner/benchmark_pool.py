@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import atexit
+import threading
 from typing import TYPE_CHECKING
 from typing import Callable
 from typing import Literal
@@ -30,6 +32,38 @@ class PoolPrecompileResult(NamedTuple):
     compile_times: list[float | None]
 
 
+_PROCESS_POOL_LOCK = threading.Lock()
+_PROCESS_POOL: BenchmarkWorkerPool | None = None
+
+
+def _get_or_create_process_pool(num_workers: int) -> BenchmarkWorkerPool:
+    global _PROCESS_POOL
+
+    old_pool: BenchmarkWorkerPool | None = None
+    with _PROCESS_POOL_LOCK:
+        if _PROCESS_POOL is not None and _PROCESS_POOL.num_workers == num_workers:
+            return _PROCESS_POOL
+        old_pool = _PROCESS_POOL
+        pool = BenchmarkWorkerPool(num_workers)
+        _PROCESS_POOL = pool
+    if old_pool is not None:
+        old_pool.shutdown()
+    return pool
+
+
+def _shutdown_process_pool() -> None:
+    global _PROCESS_POOL
+
+    with _PROCESS_POOL_LOCK:
+        pool = _PROCESS_POOL
+        _PROCESS_POOL = None
+    if pool is not None:
+        pool.shutdown()
+
+
+atexit.register(_shutdown_process_pool)
+
+
 def estimate_tree_bytes(obj: object) -> int:
     """Estimate pytree tensor storage, counting shared storage once."""
     total = 0
@@ -56,7 +90,7 @@ def estimate_tree_bytes(obj: object) -> int:
 
 
 class PoolBenchmarkManager:
-    """Owns the long-lived worker pool for one autotune call."""
+    """Owns or borrows the long-lived worker pool for one autotune call."""
 
     def __init__(
         self,
@@ -64,14 +98,21 @@ class PoolBenchmarkManager:
         num_workers: int,
         log: AutotuningLogger,
         autotune_metrics: AutotuneMetrics,
+        reuse_process_pool: bool = False,
     ) -> None:
-        self._pool = BenchmarkWorkerPool(num_workers)
+        self._pool = (
+            _get_or_create_process_pool(num_workers)
+            if reuse_process_pool
+            else BenchmarkWorkerPool(num_workers)
+        )
+        self._owns_pool = not reuse_process_pool
         self._log = log
         self._autotune_metrics = autotune_metrics
         self._precompile_worker_by_fn: dict[int, int] = {}
 
     def shutdown(self) -> None:
-        self._pool.shutdown()
+        if self._owns_pool:
+            self._pool.shutdown()
         self._precompile_worker_by_fn.clear()
 
     def worker_index_for_fn(self, fn: Callable[..., object]) -> int:
