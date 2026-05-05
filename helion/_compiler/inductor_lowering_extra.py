@@ -77,7 +77,11 @@ def patch_inductor_lowerings() -> Generator[None, Any, Any]:
         # /tl_math bf16 limitations. Mosaic on TPU handles bf16
         # transcendentals natively, so installing the fallback there
         # would only double per-element VMEM working-set.
-        if CompileEnvironment.current().backend_name != "pallas":
+        is_pallas = (
+            CompileEnvironment.has_current()
+            and CompileEnvironment.current().backend_name == "pallas"
+        )
+        if not is_pallas:
             # pyrefly: ignore [implicit-import]
             torch._inductor.lowering.lowerings.update(fp32_fallback_dispatch)
         yield
