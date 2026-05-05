@@ -201,10 +201,21 @@ class ConfigGeneration:
         if self.num_warps_index < 0 or not self.block_size_indices:
             return
         num_threads = warps_to_threads(cast("int", flat_config[self.num_warps_index]))
-        # Respect Triton's maximum tensor element limit
-        triton_limit = TRITON_MAX_TENSOR_NUMEL
+        # Respect the backend's per-tile element ceiling (Triton: 2**20;
+        # Pallas: None, since the real bound is VMEM bytes). Unit-test
+        # callers may invoke shrink_config without an active environment;
+        # default to the Triton limit in that case.
+        from .._compiler.compile_environment import CompileEnvironment
+
+        backend_limit: int | None = TRITON_MAX_TENSOR_NUMEL
+        if CompileEnvironment.has_current():
+            backend_limit = CompileEnvironment.current().backend.max_tensor_numel
         theoretical_max_elements = max_elements_per_thread * num_threads
-        max_elements = min(theoretical_max_elements, triton_limit)
+        max_elements = (
+            theoretical_max_elements
+            if backend_limit is None
+            else min(theoretical_max_elements, backend_limit)
+        )
         while self.block_numel(flat_config) > max_elements:
             changes = 0
             for i in self.block_size_indices:
