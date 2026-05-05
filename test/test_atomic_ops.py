@@ -798,6 +798,43 @@ class TestAtomicOperations(RefEagerTestBase, TestCase):
             self.assertIn("tl.atomic_xchg", code)
             self.assertNotIn("desc.atomic_xchg", code)
 
+    @onlyBackends("triton")
+    @skipIfRocm("Tensor descriptor not supported on ROCm")
+    @skipIfTileIR("TileIR does not support descriptor atomics")
+    def test_atomic_td_scalar_symint(self):
+        """Composite scalar SymInts should not prevent descriptor atomics."""
+
+        @helion.kernel(
+            config=helion.Config(
+                block_sizes=[64, 64],
+                indexing="tensor_descriptor",
+                atomic_indexing="tensor_descriptor",
+            ),
+            static_shapes=True,
+        )
+        def batched_atomic_add(
+            x: torch.Tensor, y: torch.Tensor, start: int
+        ) -> torch.Tensor:
+            B, M, N = x.size()
+            for tile_b in hl.tile(B - start, block_size=1):
+                for tile_m, tile_n in hl.tile([M, N]):
+                    batch = start + tile_b.begin
+                    hl.atomic_add(
+                        x,
+                        [batch, tile_m, tile_n],
+                        y[batch, tile_m, tile_n],
+                    )
+            return x
+
+        x = torch.zeros(4, 64, 64, device=DEVICE, dtype=torch.float32)
+        y = torch.ones(4, 64, 64, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(batched_atomic_add, (x, y, 1))
+        expected = torch.zeros_like(x)
+        expected[1:] = 1
+        torch.testing.assert_close(result, expected)
+        self.assertIn("desc.atomic_add(", code)
+        self.assertNotIn("tl.atomic_add(", code)
+
 
 if __name__ == "__main__":
     unittest.main()
