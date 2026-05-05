@@ -2152,6 +2152,54 @@ class TestPallas(TestCase):
         )
         torch.testing.assert_close(result, ref, rtol=1e-3, atol=1e-3)
 
+    def test_nested_fori_loop_scratch_scoping(self) -> None:
+        """Nested hl.tile(start, end) with inner accumulator"""
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def nested_tile_sum(
+            x: torch.Tensor, y: torch.Tensor, offsets: torch.Tensor
+        ) -> torch.Tensor:
+            A = hl.specialize(x.size(1))
+            B = hl.specialize(x.size(2))
+            num_segs = offsets.size(0) - 1
+            out = torch.zeros([num_segs, A, B], dtype=x.dtype, device=x.device)
+            for seg in hl.grid(num_segs):
+                start = offsets[seg]
+                end = offsets[seg + 1]
+                acc = hl.zeros([1, A, B], dtype=x.dtype)
+                for tile_i in hl.tile(start, end):
+                    inner_acc = hl.zeros([1, A, B], dtype=x.dtype)
+                    for tile_j in hl.tile(start, end):
+                        inner_acc = inner_acc + (x[tile_i, :, :] * y[tile_j, :, :]).sum(
+                            dim=0
+                        ).unsqueeze(0)
+                    acc = acc + inner_acc
+                out[seg, :, :] = acc.squeeze(0)
+            return out
+
+        N, A, B = 128, 8, 256
+        x = torch.randn(N, A, B, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(N, A, B, device=DEVICE, dtype=torch.float32)
+        offsets = torch.tensor([0, 64, 128], device=DEVICE, dtype=torch.int32)
+
+        _code, result = code_and_output(
+            nested_tile_sum,
+            (x, y, offsets),
+            block_sizes=[32, 32],
+            pallas_loop_type="fori_loop",
+        )
+
+        block = 32
+        ref = torch.zeros(offsets.size(0) - 1, A, B, device=DEVICE, dtype=x.dtype)
+        for seg in range(offsets.size(0) - 1):
+            s, e = int(offsets[seg]), int(offsets[seg + 1])
+            for i in range(0, e - s, block):
+                for j in range(0, e - s, block):
+                    ref[seg] += (
+                        x[s + i : s + i + block] * y[s + j : s + j + block]
+                    ).sum(dim=0)
+        torch.testing.assert_close(result, ref, rtol=1e-3, atol=1e-3)
+
 
 @skipUnlessPallas("JAX/Pallas TPU not available")
 class TestPallasIndirectGather(TestCase):
