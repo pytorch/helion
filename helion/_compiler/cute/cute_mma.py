@@ -766,6 +766,16 @@ def _kloop_tma_copy_b_src(args: _PerKiterTmaArgs, *, k_offset: str) -> str:
     )
 
 
+def _tma_producer_predicate(tma_warp: str, *, is_two_cta: bool) -> str:
+    if not is_two_cta:
+        return tma_warp
+    return (
+        f"{tma_warp} and "
+        "cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster()) "
+        "== cutlass.Int32(0)"
+    )
+
+
 def _build_kloop_pipeline_producer_if(
     args: _PerKiterTmaArgs, *, gate_tma_warp: bool = True
 ) -> ast.stmt:
@@ -782,7 +792,9 @@ def _build_kloop_pipeline_producer_if(
     k_offset = f"{args.tma_k_tile} + cutlass.Int32({args.ab_stage_count})"
     predicate_terms = [args.tma_full_tile]
     if gate_tma_warp:
-        predicate_terms.append(args.tma_warp)
+        predicate_terms.append(
+            _tma_producer_predicate(args.tma_warp, is_two_cta=args.is_two_cta)
+        )
     predicate_terms.append(args.tma_next_full_tile)
     src = (
         f"if {' and '.join(predicate_terms)}:\n"
@@ -1070,7 +1082,8 @@ def _build_initial_prefetch_if(
     copy B / producer_commit / advance``. Caller passes a literal
     ``cutlass.Int32(stage_idx)`` for ``k_offset``.
     """
-    predicate = " and ".join([*full_tile_gates, args.tma_warp])
+    tma_producer = _tma_producer_predicate(args.tma_warp, is_two_cta=args.is_two_cta)
+    predicate = " and ".join([*full_tile_gates, tma_producer])
     src = (
         f"if {predicate}:\n"
         f"    {args.tma_pipeline}.producer_acquire({args.tma_producer_state})\n"
@@ -1262,11 +1275,46 @@ def _emit_mma_pipeline(
     tcgen05_static_full_tiles = (
         m_size % bm == 0 and n_size % bn == 0 and k_total_size % bk == 0
     )
+    tcgen05_pid_is_persistent = _is_persistent_pid_config(df.config)
+    tcgen05_cluster_m = _tcgen05_cluster_m(df.config)
+    tcgen05_requested_two_cta = _tcgen05_use_2cta_instrs(
+        bm=bm, cluster_m=tcgen05_cluster_m
+    )
+    # cluster_m == 2 has two valid shapes:
+    # - bm=128, CtaGroup.ONE, where each clustered CTA owns a different
+    #   128-row output tile. This legacy clustered shape remains guarded.
+    # - bm=256, CtaGroup.TWO, where two CTAs cooperate on one 256-row output
+    #   tile. That shape is valid even when the logical M tile count is 1, so
+    #   do not apply the old "at least cluster_m M tiles" demotion to it.
+    #
+    # Still demote unsupported or unguarded shapes before emitting cluster code.
+    # The autotune search is separately narrowed to the validated subset; this
+    # catches explicit user configs that bypass autotune. For non-tcgen05 MMA
+    # implementations the tcgen05 cluster knob is irrelevant, so normalize it
+    # away instead of rejecting an otherwise valid fallback config.
+    if mma_impl != "tcgen05":
+        tcgen05_cluster_m = 1
+    elif tcgen05_cluster_m > 1:
+        if not tcgen05_pid_is_persistent:
+            raise exc.BackendUnsupported(
+                "cute",
+                "tcgen05_cluster_m > 1 is currently supported only for "
+                "guarded persistent tcgen05 codegen while G3 validates "
+                "CtaGroup.TWO runtime ownership. Use tcgen05_cluster_m=1 "
+                "or a persistent pid_type.",
+            )
+        if bm < 128 or (
+            not tcgen05_requested_two_cta and m_size // bm < tcgen05_cluster_m
+        ):
+            tcgen05_cluster_m = 1
+    assert tcgen05_cluster_m == 1 or bm >= 128
+    tcgen05_is_two_cta = tcgen05_requested_two_cta and tcgen05_cluster_m > 1
     tcgen05_use_role_local_tma_producer = (
         mma_impl == "tcgen05"
         and tcgen05_use_tma_pipeline
         and tcgen05_static_full_tiles
-        and _is_persistent_pid_config(df.config)
+        and tcgen05_cluster_m == 1
+        and tcgen05_pid_is_persistent
     )
     # Keep a distinct name so future MMA-exec gating changes are localized.
     tcgen05_use_role_local_mma_exec = tcgen05_use_role_local_tma_producer
@@ -1274,13 +1322,14 @@ def _emit_mma_pipeline(
     tcgen05_use_role_local_epi = tcgen05_use_role_local_tma_producer
     # Flat kernels process one output tile per CTA, so the c_pipeline stage is
     # just the subtile index. Persistent kernels use a role-local tile counter
-    # to rotate c_pipeline stages across work tiles. Keep this narrowed to the
-    # same static-full cluster_m=1 set as the validated role-local path.
+    # to rotate c_pipeline stages across work tiles. Keep cluster_m=2 on the
+    # predicated SIMT store until the G3 two-CTA epilogue ownership path is
+    # validated end-to-end.
     tcgen05_use_tma_store_epilogue = (
         mma_impl == "tcgen05"
         and tcgen05_use_tma_pipeline
         and tcgen05_static_full_tiles
-        and _tcgen05_cluster_m(df.config) == 1
+        and tcgen05_cluster_m == 1
         and (not _is_persistent_pid_config(df.config) or tcgen05_use_role_local_epi)
     )
     tcgen05_collective_handles_operand_loads = (
@@ -1369,31 +1418,6 @@ def _emit_mma_pipeline(
     mma_phys_n = _mma_active_n_threads(mma_impl)
     mma_physical_m_threads = _grid_thread_extent(cg, m_block_id)
     tcgen05_cta_thread_count = _grid_cta_thread_count(cg)
-    tcgen05_cluster_m = _tcgen05_cluster_m(df.config)
-    # cluster_m == 2 currently requires CTA-local M tiles >= 128. Smaller
-    # M tiles (e.g. bm=64) miscompile with cluster_m=2, so transparently
-    # demote to a single-CTA cluster. Also demote when we cannot statically
-    # confirm the launch grid has enough M-CTAs to satisfy the cluster
-    # shape -- CUDA rejects clusters with fewer CTAs than the cluster size,
-    # so symbolic M dimensions take the safe path too.
-    #
-    # The matmul autotune search also narrows to cluster_m=1 because
-    # runtime CUDA "unspecified launch failure" reproduces on the
-    # 1-CTA clustered path even when the demotion below would not
-    # trigger. The narrowing is the user-facing safety net; the
-    # demotion below is the codegen-side fallback that catches cases
-    # the narrowing missed (e.g. explicit Configs from ``set_config``
-    # with cluster_m=2 + bm=64).
-    if tcgen05_cluster_m > 1:
-        m_total = lhs_fake.shape[0]
-        if (
-            bm < 128
-            or not isinstance(m_total, int)
-            or m_total // bm < tcgen05_cluster_m
-        ):
-            tcgen05_cluster_m = 1
-    assert tcgen05_cluster_m == 1 or bm >= 128
-    tcgen05_is_two_cta = _tcgen05_use_2cta_instrs(bm=bm, cluster_m=tcgen05_cluster_m)
     if mma_impl == "tcgen05" and tcgen05_cluster_m > 1:
         df.cute_cluster_shape = (tcgen05_cluster_m, 1, 1)
     tcgen05_acc_stage_count_value = _tcgen05_config_int(
