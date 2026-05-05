@@ -150,6 +150,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                 if node.target not in (_for_loop, _for_loop_step):
                     continue
                 cur_id = node.args[0]
+                assert isinstance(cur_id, int)
                 cur_info = self.codegen_graphs[cur_id]
                 if not isinstance(cur_info, ForLoopGraphInfo):
                     continue
@@ -173,7 +174,9 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         out: set[str] = set()
         scratch_names = {s.name for s in self.device_function._scratch_args}
         local_types = self.host_function.local_types
-        smem_ids = self.device_function.pallas_smem_tensor_ids
+        from .device_function import PallasMemorySpace
+
+        pallas_memory_space = self.device_function.pallas_memory_space
         for name in names:
             if name in scratch_names:
                 continue
@@ -185,7 +188,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                 out.add(name)
                 continue
             if isinstance(ti, TensorType):
-                if id(ti.fake_value) in smem_ids:
+                if pallas_memory_space.get(id(ti.fake_value)) == PallasMemorySpace.SMEM:
                     continue
                 out.add(name)
             elif isinstance(ti, StackTensorType):
