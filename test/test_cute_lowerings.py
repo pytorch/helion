@@ -1581,6 +1581,30 @@ class TestCuteLowerings(unittest.TestCase):
                 code.index("tcgen05_tmem_allocator.allocate("),
             )
             self.assertIn(
+                "tcgen05_sched_barrier_ptr = "
+                "tcgen05_sched_pipeline.producer_get_barrier("
+                "tcgen05_sched_consumer_state)",
+                code,
+            )
+            self.assertIn(
+                "tcgen05_sched_pipeline_producer_group = "
+                "cutlass.pipeline.CooperativeGroup("
+                "cutlass.pipeline.Agent.Thread, 1)",
+                code,
+            )
+            self.assertNotIn(
+                "tcgen05_sched_pipeline_producer_group = "
+                "cutlass.pipeline.CooperativeGroup("
+                "cutlass.pipeline.Agent.Thread, cute.arch.WARP_SIZE)",
+                code,
+            )
+            self.assertIn(
+                "cute.arch.mbarrier_arrive_and_expect_tx("
+                "tcgen05_sched_barrier_ptr, 16, tcgen05_sched_peer_rank)",
+                code,
+            )
+            self.assertNotIn("tcgen05_sched_pipeline.producer_commit", code)
+            self.assertIn(
                 "if tcgen05_tma_initial_full_tile and tcgen05_tma_warp:\n"
                 "            tcgen05_ab_pipeline.producer_acquire",
                 code,
