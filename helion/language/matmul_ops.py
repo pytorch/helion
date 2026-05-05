@@ -334,9 +334,11 @@ def enforce_dot_requirements(lhs: torch.Tensor, rhs: torch.Tensor) -> None:
             # static-full CtaGroup.TWO problems whose search space can form
             # validated 256x256 tiles within the K-tile cap. Search-time
             # normalization projects cluster_m=2 products onto that validated
-            # tile/pid shape. ``num_epi_warps != 4`` remains excluded because
-            # only 4 is validated correct; 1 and 2 are directly verified to
-            # produce wrong output and 3 is unsafe by extension.
+            # tile/pid shape and caps cluster_m=1 persistent products at
+            # tcgen05-supported M tiles so search does not fall through the
+            # universal fallback. ``num_epi_warps != 4`` remains excluded
+            # because only 4 is validated correct; 1 and 2 are directly
+            # verified to produce wrong output and 3 is unsafe by extension.
             # The num_epi_warps restriction also tightens normalize() so an
             # explicit user config that bypasses autotune raises
             # ``InvalidConfig`` rather than silently miscomputing — there is
