@@ -272,8 +272,13 @@ class CompileEnvironment:
 
     def _extract_tensor_numel_constraints(self) -> None:
         """Compile per-tensor numel constraints from kernel_tensor_sizes."""
-        from ..autotuner.config_generation import TRITON_MAX_TENSOR_NUMEL
         from ..autotuner.config_spec import TensorNumelConstraint
+
+        max_numel = self.backend.max_tensor_numel
+        if max_numel is None:
+            # Backend (e.g. Pallas) has no compile-time per-tile element cap;
+            # VMEM byte budget is enforced separately at runtime.
+            return
 
         block_sym_to_id: dict[sympy.Symbol, int] = {}
         for bs in self.block_sizes:
@@ -316,7 +321,7 @@ class CompileEnvironment:
             ordered = sorted(involved_syms, key=lambda s: sym_to_cs_idx[s])
             indices = tuple(sym_to_cs_idx[s] for s in ordered)
             # pyrefly: ignore[unsupported-operation]
-            constraint_expr = numel_expr <= TRITON_MAX_TENSOR_NUMEL
+            constraint_expr = numel_expr <= max_numel
             # srepr is more canonical than str() for dedup; a false
             # negative only causes a harmless duplicate, not a missed one.
             dedup_key = sympy.srepr(constraint_expr)

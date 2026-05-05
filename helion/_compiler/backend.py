@@ -66,6 +66,21 @@ class Backend(abc.ABC):
         return True
 
     @property
+    def max_tensor_numel(self) -> int | None:
+        """Per-tile maximum tensor element count enforced during config search.
+
+        Triton has a hard internal ceiling (currently 2**20) past which its
+        codegen rejects the kernel, so the search must avoid generating
+        configs that exceed it. Pallas/Mosaic has no analogous compile-time
+        cap; tile size is bounded by VMEM bytes (already guarded at runtime
+        in :mod:`helion.runtime`). Backends that don't need the cap should
+        return ``None`` to disable the constraint.
+        """
+        from ..autotuner.config_generation import TRITON_MAX_TENSOR_NUMEL
+
+        return TRITON_MAX_TENSOR_NUMEL
+
+    @property
     def codegen_name(self) -> str:
         """Backend name used to look up registered codegen functions."""
         return self.name
@@ -961,6 +976,12 @@ class PallasBackend(Backend):
     @property
     def pad_factory_tensors_to_power_of_2(self) -> bool:
         return False
+
+    @property
+    def max_tensor_numel(self) -> int | None:
+        # No compile-time element cap on Pallas; VMEM byte budget is the
+        # real constraint and is enforced separately at runtime.
+        return None
 
     def max_reduction_threads(self) -> int | None:
         return None
