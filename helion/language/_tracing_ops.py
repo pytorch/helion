@@ -519,21 +519,13 @@ def _setup_loop_carried_state(
             continue
         if isinstance(proxy, torch.Tensor):
             assert isinstance(arg_ast, ast.Name)
-            # Reuse existing scratch if the init value is already in one
-            # (e.g. from hl.full / hl.zeros). Otherwise allocate new.
-            existing = any(
-                s.name == arg_ast.id for s in state.device_function._scratch_args
+            shape = _resolve_shape(proxy, env, state.config)
+            dtype = proxy.dtype
+            scratch_name = state.device_function.register_scratch(
+                shape, dtype, name_hint=f"scratch_{i}"
             )
-            if existing:
-                scratch_name = arg_ast.id
-            else:
-                shape = _resolve_shape(proxy, env, state.config)
-                dtype = proxy.dtype
-                scratch_name = state.device_function.register_scratch(
-                    shape, dtype, name_hint=f"scratch_{i}"
-                )
-                # Initialize scratch with the arg value.
-                state.add_statement(_scratch_write_stmt(state, scratch_name, arg_ast))
+            # Initialize scratch with the arg value.
+            state.add_statement(_scratch_write_stmt(state, scratch_name, arg_ast))
             scratch_names.append(scratch_name)
 
             # Result will be read after loop
