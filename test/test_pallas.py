@@ -769,7 +769,7 @@ class TestPallas(TestCase):
         torch.testing.assert_close(result, expected, rtol=1e-2, atol=1e-2)
 
     @xfailIfPallas("Non-zero begin K reduction: DMA offset not tile-aligned")
-    def test_bmm_nonzero_k_begin(self) -> None:
+    def test_bmm_nonzero_k_begin_unroll(self) -> None:
         """BMM with K reduction starting at non-zero offset."""
         a = torch.randn(4, 128, 384, device=DEVICE, dtype=torch.bfloat16)
         b = torch.randn(4, 384, 128, device=DEVICE, dtype=torch.bfloat16)
