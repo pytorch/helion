@@ -405,6 +405,7 @@ class DeviceFunction:
         self._cute_tcgen05_per_tile_stmt_ids: set[int] = set()
         self._cute_tcgen05_post_loop_stmt_ids: set[int] = set()
         self._cute_tcgen05_tma_load_role_stmt_ids: set[int] = set()
+        self._cute_tcgen05_mma_exec_role_stmt_ids: set[int] = set()
         self._cute_collective_handled_loads: set[str] = set()
         self.cute_cluster_shape: tuple[int, int, int] | None = None
         self.cute_block_shape: tuple[int, int, int] | None = None
@@ -691,6 +692,28 @@ class DeviceFunction:
         a bad registration shape that would otherwise silently miscompile.
         """
         return frozenset(self._cute_tcgen05_tma_load_role_stmt_ids)
+
+    def register_cute_tcgen05_mma_exec_role_stmts(self, stmts: list[ast.AST]) -> None:
+        """Mark statements that belong to the MMA-exec warp's role block.
+
+        The persistent tcgen05 role partitioner pulls these statements into
+        an MMA-exec-specific role-local ``while``. Use for AB consumer wait /
+        release, UMMA issue, and acc-pipeline producer work that must advance
+        once per tile on the exec warp.
+        """
+        self._cute_tcgen05_mma_exec_role_stmt_ids.update(id(stmt) for stmt in stmts)
+
+    def is_cute_tcgen05_mma_exec_role(self, stmt: ast.stmt) -> bool:
+        return id(stmt) in self._cute_tcgen05_mma_exec_role_stmt_ids
+
+    @property
+    def has_cute_tcgen05_mma_exec_role_marks(self) -> bool:
+        return bool(self._cute_tcgen05_mma_exec_role_stmt_ids)
+
+    @property
+    def cute_tcgen05_mma_exec_role_stmt_ids(self) -> frozenset[int]:
+        """Snapshot of every registered MMA-exec role-tag id."""
+        return frozenset(self._cute_tcgen05_mma_exec_role_stmt_ids)
 
     def get_cute_tcgen05_store_value(self, name: str) -> CuteTcgen05StoreValue | None:
         for alias in self._variable_renames.get(name, [name]):

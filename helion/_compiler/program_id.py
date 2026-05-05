@@ -857,12 +857,11 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
     ) -> None:
         """Make the shared persistent loop's scheduler live on the exec warp.
 
-        Once the TMA-load warp is lifted into a role-local sibling loop, its
-        primary work is no longer in the shared loop. In the current TMA-only
-        intermediate the TMA warp still rejoins the shared loop to participate
-        in CTA-wide barriers, but scheduler side effects should be owned by a
-        warp whose work remains in the shared consumer body. The exec warp is
-        the earliest non-epilogue role with one warp-wide predicate.
+        Once the TMA-load warp is lifted into a role-local sibling loop, the
+        scheduler should not ride on that producer role. The exec warp remains
+        a single, always-launched warp that rejoins the shared loop after any
+        role-local work, making it a stable owner for the intermediate G1
+        shapes until a dedicated scheduler or fully role-local epilogue lands.
         """
         exec_warp = self._tcgen05_exec_warp_expr()
         layout.scheduler_owner_warp = exec_warp
@@ -917,6 +916,17 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         return (
             "cute.arch.make_warp_uniform(cute.arch.warp_idx()) "
             f"== cutlass.Int32({plan.tma_warp_id})"
+        )
+
+    def _tcgen05_mma_exec_role_predicate(self) -> str:
+        """Boolean expression that gates the MMA-exec warp's role block."""
+        plan = self._tcgen05_plan()
+        assert plan is not None, (
+            "tcgen05 MMA-exec role predicate requires a registered matmul plan"
+        )
+        return (
+            "cute.arch.make_warp_uniform(cute.arch.warp_idx()) "
+            f"== cutlass.Int32({plan.exec_warp_id})"
         )
 
     def _split_tcgen05_invariant_setup(
@@ -990,9 +1000,9 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
 
         - ``role_blocks_inline``: the legacy linear sequence of role
           blocks preserving the original emit order. Top-level
-          TMA-load-tagged statements stay sandwiched between shared
-          blocks here, ready for the inline-weave consumer to wrap them
-          in ``if {role_predicate}: ...``.
+          role-tagged statements stay sandwiched between shared blocks
+          here, ready for the inline-weave consumer to wrap them in
+          ``if {role_predicate}: ...``.
         - ``role_blocks_extracted``: each non-shared role block as a
           standalone unit, decoupled from any surrounding shared
           statements. The extract-and-remove consumer in
@@ -1004,47 +1014,37 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
           role blocks fill the role-local ``while`` siblings.
 
         The producer walks the body in order. Each maximal run of
-        consecutive TMA-load-tagged statements is collapsed into a
-        TMA-load role block gated by the TMA-load warp predicate.
-        Everything else lives in the surrounding shared blocks. This
-        preserves the original emit order: a TMA initial prefetch
-        sandwiched between shared statements stays sandwiched, only
-        wrapped in a role-gate ``if``. The defines-before-uses
-        invariant carries over (e.g. the per-tile
-        ``tma_initial_full_tile`` boolean is set in a shared block
-        BEFORE the TMA-load block reads it, exactly as today).
+        consecutive statements tagged for the same role is collapsed into
+        a role block gated by that role's warp predicate. Everything else
+        lives in the surrounding shared blocks. This preserves the
+        original emit order for the inline view: role-tagged statements
+        sandwiched between shared statements stay sandwiched, only wrapped
+        in a role-gate ``if``. The extracted view removes top-level role
+        blocks from the shared body and emits them as role-local sibling
+        ``while`` loops.
 
-        Today the tagged statements already gate themselves on
-        ``if {tma_warp}:`` inline, so wrapping them in a role-block
-        ``if`` is functionally redundant -- the inner ``if {tma_warp}:``
-        and the outer role predicate are equivalent. The redundancy is
-        intentional: it makes the role partition visible in the
-        generated source, and it gives the future role-local-while
-        rewrite a structurally separated chunk to lift out without
-        chasing inline gates.
+        Some tagged statements still gate themselves on role predicates
+        inline. In the inline view that is functionally redundant with the
+        outer role-block ``if``. In the extracted role-local path, newly
+        split producer / exec K-loops can drop those inline gates because
+        the enclosing role-local ``while`` already restricts execution.
 
-        When no TMA-load tags are present, the producer returns a
-        single shared block carrying the full body. This is the
-        non-tcgen05 path, the universal-MMA path, and any kernel that
-        never registers TMA-load role tags. The consumer
+        When no role tags are present, the producer returns a single
+        shared block carrying the full body. This is the non-tcgen05 path,
+        the universal-MMA path, and any kernel that never registers role
+        tags. The consumer
         (``_build_tcgen05_persistent_tile_body``) handles the
         single-block case identically to the pre-split implementation.
 
         **Nested tags inside top-level loops.** The K-loop's per-iter
-        TMA producer block is emitted INSIDE the K-loop body via
-        ``cg.add_statement(...)``, so it is not a top-level statement
+        role blocks can be emitted INSIDE the K-loop body via
+        ``cg.add_statement(...)``, so they are not top-level statements
         of the per-tile body. Tagged statements found inside top-level
         ``for`` / ``while`` loop bodies get rewritten in place: each
         tagged child statement is wrapped with
         ``if {role_predicate}: <child>`` so the role gate is visible in
-        the generated source. The containing loop itself stays in the
-        shared block because the loop body still has work for the
-        non-TMA-load warps (consumer ``consumer_wait``, scalar fallback
-        loads, cross-warp ``sync_threads()``). This is structural prep
-        for the upcoming role-local-while lift (``cute_plan.md`` step
-        3b) -- once the producer body lifts into a TMA-load-warp-local
-        ``while``, the wrapping goes away because the lifted block runs
-        only on the TMA-load warp.
+        the generated source. This legacy inline path is still used for
+        shapes that do not enter the role-local static-full path.
 
         Recursion is intentionally one level deep: the K-loop is the
         only top-level loop the role partitioner needs to reach into
@@ -1052,7 +1052,18 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         future codegen places tagged statements inside nested loops the
         recursion can be deepened then.
         """
-        if not device_function.has_cute_tcgen05_tma_load_role_marks:
+        tma_load_predicate = self._tcgen05_tma_load_role_predicate()
+        mma_exec_predicate = self._tcgen05_mma_exec_role_predicate()
+        role_predicates_by_id: dict[int, str] = {}
+        for stmt_id in device_function.cute_tcgen05_tma_load_role_stmt_ids:
+            role_predicates_by_id[stmt_id] = tma_load_predicate
+        for stmt_id in device_function.cute_tcgen05_mma_exec_role_stmt_ids:
+            assert stmt_id not in role_predicates_by_id, (
+                "tcgen05 role statement registered for multiple warp roles"
+            )
+            role_predicates_by_id[stmt_id] = mma_exec_predicate
+
+        if not role_predicates_by_id:
             single = self._PersistentRoleBlock(role_predicate=None, stmts=list(body))
             return self._PartitionedRoleBody(
                 role_blocks_inline=[single],
@@ -1064,8 +1075,8 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         extracted_blocks: list[Tcgen05PersistentProgramIDs._PersistentRoleBlock] = []
         shared_body_extracted: list[ast.stmt] = []
         current_shared: list[ast.stmt] = []
-        current_tma_load: list[ast.stmt] = []
-        tma_load_predicate = self._tcgen05_tma_load_role_predicate()
+        current_role_predicate: str | None = None
+        current_role_stmts: list[ast.stmt] = []
         # Track every role-tag id the partitioner consumes so we can
         # detect a registered tag that never landed in a role block --
         # i.e. a top-level tag that was hoisted out of the work-tile
@@ -1073,7 +1084,10 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         # container the recursion does not enter (anything other than
         # a top-level ``for`` / ``while``). Either case would silently
         # drop the role gate, so we assert below.
-        visited_tma_load_ids: set[int] = set()
+        visited_role_ids: set[int] = set()
+
+        def role_predicate_for(stmt: ast.stmt) -> str | None:
+            return role_predicates_by_id.get(id(stmt))
 
         def flush_shared() -> None:
             if current_shared:
@@ -1084,8 +1098,10 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                 )
                 current_shared.clear()
 
-        def flush_tma_load() -> None:
-            if current_tma_load:
+        def flush_role() -> None:
+            nonlocal current_role_predicate
+            if current_role_stmts:
+                assert current_role_predicate is not None
                 # The inline view holds the role block in its original
                 # position so the inline-weave consumer keeps the
                 # defines-before-uses invariant unchanged. The extracted
@@ -1095,19 +1111,20 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                 # shared body's order.
                 inline_blocks.append(
                     self._PersistentRoleBlock(
-                        role_predicate=tma_load_predicate,
-                        stmts=list(current_tma_load),
+                        role_predicate=current_role_predicate,
+                        stmts=list(current_role_stmts),
                     )
                 )
                 extracted_blocks.append(
                     self._PersistentRoleBlock(
-                        role_predicate=tma_load_predicate,
-                        stmts=list(current_tma_load),
+                        role_predicate=current_role_predicate,
+                        stmts=list(current_role_stmts),
                     )
                 )
-                current_tma_load.clear()
+                current_role_stmts.clear()
+                current_role_predicate = None
 
-        def wrap_nested_tma_load_in_for_or_while(stmt: ast.stmt) -> None:
+        def wrap_nested_role_in_for_or_while(stmt: ast.stmt) -> None:
             """Walk a top-level ``for`` / ``while`` body; wrap tagged
             children in ``if {role_predicate}: <child>``. Mutates the
             loop body in place so the loop emits with role gating in
@@ -1116,12 +1133,13 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                 return
             new_body: list[ast.stmt] = []
             for child in stmt.body:
-                if device_function.is_cute_tcgen05_tma_load_role(child):
-                    visited_tma_load_ids.add(id(child))
+                child_predicate = role_predicate_for(child)
+                if child_predicate is not None:
+                    visited_role_ids.add(id(child))
                     new_body.append(
                         create(
                             ast.If,
-                            test=expr_from_string(tma_load_predicate),
+                            test=expr_from_string(child_predicate),
                             body=[child],
                             orelse=[],
                         )
@@ -1131,22 +1149,29 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             stmt.body = new_body
 
         for stmt in body:
-            if device_function.is_cute_tcgen05_tma_load_role(stmt):
+            role_predicate = role_predicate_for(stmt)
+            if role_predicate is not None:
                 flush_shared()
-                visited_tma_load_ids.add(id(stmt))
-                current_tma_load.append(stmt)
+                visited_role_ids.add(id(stmt))
+                if (
+                    current_role_predicate is not None
+                    and current_role_predicate != role_predicate
+                ):
+                    flush_role()
+                current_role_predicate = role_predicate
+                current_role_stmts.append(stmt)
             else:
-                flush_tma_load()
-                wrap_nested_tma_load_in_for_or_while(stmt)
+                flush_role()
+                wrap_nested_role_in_for_or_while(stmt)
                 current_shared.append(stmt)
                 shared_body_extracted.append(stmt)
         flush_shared()
-        flush_tma_load()
+        flush_role()
 
-        registered_tma_load_ids = device_function.cute_tcgen05_tma_load_role_stmt_ids
-        missed_ids = registered_tma_load_ids - visited_tma_load_ids
+        registered_role_ids = frozenset(role_predicates_by_id)
+        missed_ids = registered_role_ids - visited_role_ids
         assert not missed_ids, (
-            f"{len(missed_ids)} TMA-load role-tagged statement(s) were "
+            f"{len(missed_ids)} tcgen05 role-tagged statement(s) were "
             "registered but not visited by the role partitioner. Top-level "
             "tagged stmts must also be per-tile-registered (otherwise the "
             "splitter hoists them out of the work-tile body before the "
@@ -1288,10 +1313,9 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                 )
             )
             setup.extend(role_local_whiles)
-            # This G1 3b intermediate only extracts the TMA-load producer.
             # All warps still enter the shared loop after any role-local
-            # producer work so existing CTA-wide barriers remain valid for
-            # exec/epi synchronization and work-tile metadata publication.
+            # mainloop work so existing CTA-wide barriers remain valid for
+            # epilogue synchronization and work-tile metadata publication.
             setup.append(
                 create(
                     ast.While,
@@ -1340,11 +1364,13 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         The role-local consumer
         (:meth:`_build_tcgen05_persistent_tile_body_role_local`) emits
         one role-local ``while`` per unique role predicate driven by
-        its own scheduler instance. In the TMA-only intermediate, every
+        its own scheduler instance. In the current mainloop-role
+        intermediate, every
         warp still enters the shared body after any role-local work so
         existing CTA-wide ``cute.arch.sync_threads()`` barriers remain
         valid. The AB / acc pipelines carry producer-consumer ordering
-        between the role-local producer and the shared consumer.
+        between the role-local TMA producer, role-local MMA exec, and
+        shared epilogue consumer.
         """
 
         role_predicate: str | None
@@ -1717,9 +1743,9 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
 
         ``emit_block_wide_sync`` controls the per-tile
         ``cute.arch.sync_threads()`` (a CTA-wide barrier). The default
-        ``True`` is correct for the current TMA-only role-local
+        ``True`` is correct for the current mainloop-role-local
         intermediate because every warp still enters this shared
-        ``while`` after any role-local producer work. Passing ``False``
+        ``while`` after any role-local mainloop work. Passing ``False``
         is reserved for the later fully role-local shape where no
         role-local warp reaches the shared loop and the remaining work
         has a replacement non-CTA synchronization scheme.
@@ -1787,9 +1813,9 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         Cross-role producer-consumer synchronization is via the AB /
         acc pipelines (the existing pipeline barriers carry the data
         dependency); no ``cute.arch.sync_threads()`` is emitted inside
-        the role-local loop. In the current TMA-only intermediate, the
-        role-local warp still enters the shared loop afterwards so the
-        shared loop's existing CTA-wide barriers remain valid.
+        the role-local loop. The role-local warp still enters the shared
+        loop afterwards so the shared loop's existing CTA-wide barriers
+        remain valid.
 
         The returned statement is the role-local ``while`` itself,
         wrapped in ``if {role_predicate}:`` so only the matching warps
@@ -1939,21 +1965,20 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
           ``while`` (the work-tile body without the extracted role
           blocks). Built via :meth:`_build_tcgen05_persistent_tile_body`
           with existing ``cute.arch.sync_threads()`` calls preserved. In
-          this TMA-only intermediate all warps still enter the shared
-          ``while`` after the role-local producer branch, so those CTA-wide
-          barriers remain valid for exec/epi synchronization and
-          work-tile metadata publication.
+          this intermediate all warps still enter the shared ``while`` after
+          any role-local mainloop work, so those CTA-wide barriers remain
+          valid for epilogue synchronization and work-tile metadata
+          publication.
 
         Caller wires both into the persistent kernel as siblings of
-        each other inside the same setup list. In this TMA-only
-        intermediate, each role-local ``while`` runs only on its
-        predicated warps, then every warp enters the shared ``while``
-        so existing CTA-wide barriers remain valid.
+        each other inside the same setup list. Each role-local ``while``
+        runs only on its predicated warps, then every warp enters the shared
+        ``while`` so existing CTA-wide barriers remain valid.
 
-        **Current limitation.** Only the TMA-load producer role is
-        extracted today. The MMA-exec and epi roles still live in the
-        shared ``while``, and multi-tile persistent tcgen05 remains
-        blocked by the host guard until those roles move out too.
+        **Current limitation.** The TMA-load and MMA-exec mainloop roles
+        are extracted today. The epi roles still live in the shared
+        ``while``, and multi-tile persistent tcgen05 remains blocked by the
+        host guard until those roles move out too.
         """
         # Wrap the shared body's tagged-removed view in the standard
         # per-tile shape. ``shared_role_blocks`` reuses the
@@ -1970,15 +1995,27 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         )
         # Merge extracted blocks by ``role_predicate`` so each predicate
         # gets one role-local loop carrying all of its per-tile
-        # statements in source order. ``dict`` preserves insertion
-        # order, which is the order role predicates first appear in
-        # the body -- consistent across runs so emitted code is stable.
+        # statements in source order. Emit the loops in explicit role
+        # order instead of first-seen source order: TMA-load publishes
+        # operands before MMA-exec consumes them. Adding another role
+        # must update ``role_order`` so omitted predicates fail loudly.
         merged: dict[str, list[ast.stmt]] = {}
         for role_block in partition.role_blocks_extracted:
             assert role_block.role_predicate is not None
             merged.setdefault(role_block.role_predicate, []).extend(role_block.stmts)
         role_local_whiles: list[ast.stmt] = []
-        for i, (predicate, stmts) in enumerate(merged.items()):
+        role_order = {
+            self._tcgen05_tma_load_role_predicate(): 0,
+            self._tcgen05_mma_exec_role_predicate(): 1,
+        }
+        unknown_predicates = set(merged) - set(role_order)
+        assert not unknown_predicates, (
+            "tcgen05 role-local order missing predicate(s): "
+            + ", ".join(sorted(unknown_predicates))
+        )
+        ordered_predicates = sorted(merged, key=lambda predicate: role_order[predicate])
+        for i, predicate in enumerate(ordered_predicates):
+            stmts = merged[predicate]
             merged_block = self._PersistentRoleBlock(
                 role_predicate=predicate, stmts=stmts
             )
