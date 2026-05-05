@@ -1224,9 +1224,10 @@ def _emit_mma_pipeline(
     ):
         return None
     # tcgen05 epilogues are emitted by `_codegen_cute_store_tcgen05_tile` in
-    # `helion/language/memory_ops.py`. Static-full flat kernels use the SMEM
-    # staged TMA-store epilogue; persistent and partial fallback kernels still
-    # use the direct TMEM->register->GMEM SIMT path.
+    # `helion/language/memory_ops.py`. Static-full flat kernels and validated
+    # role-local persistent kernels use the SMEM-staged TMA-store epilogue;
+    # partial/unsupported fallbacks keep the direct TMEM->register->GMEM SIMT
+    # path.
 
     m_index_var = cg.index_var(m_block_id)
     n_index_var = cg.index_var(n_block_id)
@@ -1272,14 +1273,15 @@ def _emit_mma_pipeline(
     # Keep a distinct name so future epi-role gating changes are localized.
     tcgen05_use_role_local_epi = tcgen05_use_role_local_tma_producer
     # Flat kernels process one output tile per CTA, so the c_pipeline stage is
-    # just the subtile index. Persistent kernels need an explicit per-work-tile
-    # ring counter before c_pipeline stages can safely span multiple tiles.
+    # just the subtile index. Persistent kernels use a role-local tile counter
+    # to rotate c_pipeline stages across work tiles. Keep this narrowed to the
+    # same static-full cluster_m=1 set as the validated role-local path.
     tcgen05_use_tma_store_epilogue = (
         mma_impl == "tcgen05"
         and tcgen05_use_tma_pipeline
         and tcgen05_static_full_tiles
         and _tcgen05_cluster_m(df.config) == 1
-        and not _is_persistent_pid_config(df.config)
+        and (not _is_persistent_pid_config(df.config) or tcgen05_use_role_local_epi)
     )
     tcgen05_collective_handles_operand_loads = (
         mma_impl == "tcgen05"
@@ -1839,6 +1841,11 @@ def _emit_mma_pipeline(
     tma_pipeline = df.new_var("tcgen05_ab_pipeline")
     tma_producer_state = df.new_var("tcgen05_ab_producer_state")
     tma_consumer_state = df.new_var("tcgen05_ab_consumer_state")
+    tma_store_role_tile_counter = (
+        df.new_var("tcgen05_tma_store_role_tile")
+        if tcgen05_use_tma_store_epilogue and tcgen05_use_role_local_epi
+        else ""
+    )
     tcgen05_frag_a = df.new_var("tcgen05_tCrA")
     tcgen05_frag_b = df.new_var("tcgen05_tCrB")
     mma_stage = df.new_var("mma_stage")
@@ -2601,8 +2608,9 @@ def _emit_mma_pipeline(
                 mma_exec_role_stmts.append(advance_stmt)
             # The tcgen05 epilogue + allocator teardown is emitted by
             # `_codegen_cute_store_tcgen05_tile` when the kernel stores
-            # `out[tile_m, tile_n] = result`. Static-full flat kernels take
-            # the TMA-store path; persistent/partial fallbacks keep SIMT.
+            # `out[tile_m, tile_n] = result`. Static-full flat and validated
+            # role-local persistent kernels take the TMA-store path;
+            # partial/unsupported fallbacks keep SIMT.
             sync_stmt = statement_from_string("cute.arch.sync_threads()")
             suffix.append(sync_stmt)
             per_tile_stmts.append(sync_stmt)
@@ -2645,6 +2653,7 @@ def _emit_mma_pipeline(
                 tma_producer_state=tma_producer_state,
                 tma_store_atom=tma_store_atom,
                 tma_store_tensor=tma_store_tensor,
+                role_local_tile_counter=tma_store_role_tile_counter,
                 is_two_cta=tcgen05_is_two_cta,
                 use_tma=tcgen05_use_tma,
                 use_role_local_epi=tcgen05_use_role_local_epi,

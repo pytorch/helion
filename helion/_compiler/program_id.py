@@ -1941,6 +1941,15 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                 f"{work_tile_var} = {sched_var}.initial_work_tile_info()"
             ),
         ]
+        tile_counter_var = None
+        if (
+            role_block.role_predicate == self._tcgen05_epi_role_predicate()
+            and device_function.cute_tcgen05_epi_role_tile_counter_var is not None
+        ):
+            tile_counter_var = device_function.cute_tcgen05_epi_role_tile_counter_var
+            prelude.append(
+                statement_from_string(f"{tile_counter_var} = cutlass.Int32(0)")
+            )
 
         # Per-iteration refresh of role-local work-tile coordinates.
         # The role block's statements reference ``self.virtual_pid_var``
@@ -1961,6 +1970,12 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         if dependency_stmts is not None:
             per_tile_body.extend(dependency_stmts)
         per_tile_body.extend(role_block.stmts)
+        if tile_counter_var is not None:
+            per_tile_body.append(
+                statement_from_string(
+                    f"{tile_counter_var} = {tile_counter_var} + cutlass.Int32(1)"
+                )
+            )
         per_tile_body.extend(
             [
                 statement_from_string(f"{sched_var}.advance_to_next_work()"),

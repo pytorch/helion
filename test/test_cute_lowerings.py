@@ -986,8 +986,8 @@ class TestCuteLowerings(unittest.TestCase):
         ``tcgen05_tma_warp`` gate because the enclosing role-local loop
         already restricts execution to that warp. The MMA-exec role owns
         AB consumer wait/release, UMMA issue, and acc producer state. The
-        epi role owns acc consumer wait/release and the SIMT TMEM->GMEM
-        store body."""
+        epi role owns acc consumer wait/release and the TMA-store epilogue
+        with a role-local tile counter for the SMEM ring."""
 
         @helion.kernel(backend="cute")
         def cute_matmul_persistent_role(
@@ -1015,6 +1015,11 @@ class TestCuteLowerings(unittest.TestCase):
                 pid_type="persistent_blocked",
             )
             code = bound.to_triton_code(cfg)
+        self.assertIn("'kind': 'tcgen05_d_tma'", code)
+        self.assertIn(
+            "tcgen05_tma_store_role_tile = tcgen05_tma_store_role_tile + cutlass.Int32(1)",
+            code,
+        )
         # The role predicates the partitioner uses for role gates. The
         # TMA-load warp id is 5 and the exec warp id is 4 for the 6-warp layout
         # (epi=warps 0..3, exec=4, tma=5).
@@ -1112,9 +1117,12 @@ class TestCuteLowerings(unittest.TestCase):
                     "tcgen05_acc_pipeline.consumer_wait(tcgen05_acc_consumer_state)",
                     role_src,
                 )
-                self.assertIn("cute.nvgpu.CopyUniversalOp()", role_src)
+                self.assertIn("PipelineTmaStore.create", role_src)
+                self.assertIn("cute.nvgpu.cpasync.tma_partition", role_src)
+                self.assertIn("cute.copy(tcgen05_tma_store_atom", role_src)
+                self.assertIn("tcgen05_tma_store_role_tile", role_src)
+                self.assertNotIn("cute.nvgpu.CopyUniversalOp()", role_src)
                 self.assertIn("cute.copy(tcgen05_tiled_copy_t2r", role_src)
-                self.assertIn("cute.copy(tcgen05_simt_atom", role_src)
                 self.assertIn(
                     "tcgen05_acc_pipeline.consumer_release(tcgen05_acc_consumer_state)",
                     role_src,
@@ -1148,6 +1156,7 @@ class TestCuteLowerings(unittest.TestCase):
                 shared_src,
             )
             self.assertNotIn("cute.nvgpu.CopyUniversalOp()", shared_src)
+            self.assertNotIn("PipelineTmaStore.create", shared_src)
             shared_loop_preserves_barriers = "cute.arch.sync_threads()" in shared_src
             shared_scheduler_retargeted_to_exec = (
                 "cute.arch.make_warp_uniform(cute.arch.warp_idx()) == cutlass.Int32(4)"
@@ -1206,10 +1215,9 @@ class TestCuteLowerings(unittest.TestCase):
     def test_tcgen05_flat_static_full_uses_tma_store_epilogue(self) -> None:
         """Static-full flat tcgen05 lowers the first G2 TMA-store epilogue.
 
-        Persistent kernels keep the SIMT epilogue until the c_pipeline ring
-        has an explicit per-tile stage counter. The flat fast path has one
-        output tile per CTA, so it can use the staged SMEM + TMA bulk store
-        path without spanning multiple scheduler tiles.
+        The flat fast path has one output tile per CTA, so its staged SMEM +
+        TMA bulk store path can use the subtile index directly as the ring
+        stage. Persistent kernels use a role-local tile counter instead.
         """
 
         from helion._compiler.cute.mma_support import get_cute_mma_support
@@ -1299,6 +1307,7 @@ class TestCuteLowerings(unittest.TestCase):
 
         self.assertIn("while tcgen05_work_tile_valid", code)
         self.assertNotIn("tcgen05_role_local", code)
+        self.assertNotIn("'kind': 'tcgen05_d_tma'", code)
         self.assertIn("tcgen05_tma_warp", code)
         self.assertIn("cute.arch.sync_threads()", code)
         self.assertIn("if tcgen05_tma_full_tile", code)
@@ -1358,6 +1367,8 @@ class TestCuteLowerings(unittest.TestCase):
                         code = bound.to_triton_code(cfg)
                         self.assertNotIn("_helion_tcgen05_persistent_total_tiles", code)
                         self.assertRegex(code, r"\(\s*1\s*,\s*1\s*,\s*min\s*\(")
+                        self.assertIn("cutlass.pipeline.PipelineTmaStore.create", code)
+                        self.assertNotIn("cute.nvgpu.CopyUniversalOp()", code)
                         out = bound(*args)
                     expected = args[0] @ args[1]
                     # Match the single-tile tcgen05 runtime test tolerance:
@@ -4231,6 +4242,7 @@ class TestPersistentLoopSplitter(unittest.TestCase):
                 self._tma_load_role_ids: set[int] = set()
                 self._mma_exec_role_ids: set[int] = set()
                 self._epi_role_ids: set[int] = set()
+                self.cute_tcgen05_epi_role_tile_counter_var: str | None = None
 
             def register_cute_tcgen05_per_tile_stmts(
                 self, stmts: list[ast.AST]
@@ -4351,6 +4363,7 @@ class TestPersistentLoopSplitter(unittest.TestCase):
                 self._tma_load_role_ids: set[int] = set()
                 self._mma_exec_role_ids: set[int] = set()
                 self._epi_role_ids: set[int] = set()
+                self.cute_tcgen05_epi_role_tile_counter_var: str | None = None
 
             def new_var(self, name: str) -> str:
                 self._counter += 1
