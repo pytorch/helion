@@ -1215,6 +1215,12 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         if self._precompile_args_path is None:
             return None
 
+        if (
+            self._pool_manager is not None
+            and self.settings.autotune_pool_rebenchmark_mode == "owner_isolated"
+        ):
+            return self._rebenchmark_owner_isolated(fns, repeat=repeat, desc=desc)
+
         fn_specs: list[SerializedCompiledFunction] = []
         for fn in fns:
             fn_spec = self._serialize_fn_for_worker(cast("CompiledConfig", fn))
@@ -1250,6 +1256,49 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                 self.log.debug(f"{desc} subprocess raised: {type(e).__name__}: {e}")
         self._autotune_metrics.num_compile_failures += len(fn_specs)
         return [inf] * len(fn_specs)
+
+    def _rebenchmark_owner_isolated(
+        self,
+        fns: list[Callable[..., object]],
+        *,
+        repeat: int,
+        desc: str,
+    ) -> list[float] | None:
+        assert self._pool_manager is not None
+        assert self._precompile_args_path is not None
+
+        timings: list[float] = []
+        timeout = float(self.settings.autotune_benchmark_timeout)
+        for fn in fns:
+            fn_spec = self._serialize_fn_for_worker(cast("CompiledConfig", fn))
+            if fn_spec is None:
+                return None
+            job = RebenchmarkJob(
+                fn_specs=[fn_spec],
+                args_path=self._precompile_args_path,
+                repeat=repeat,
+            )
+            worker_index = self._pool_manager.worker_index_for_fn(fn)
+            try:
+                result = self._run_subprocess_job(
+                    job,
+                    timeout,
+                    worker_index=worker_index,
+                )
+                timings.append(result[0])
+            except BenchmarkSubprocessError as e:
+                self.log.warning(f"{desc} subprocess failed: {e}")
+                self._autotune_metrics.num_compile_failures += 1
+                timings.append(inf)
+            except Exception as e:
+                e.__traceback__ = None
+                if match_unrecoverable_runtime_error(e):
+                    self.log.warning(f"{desc} sticky CUDA error skipped: {e}")
+                else:
+                    self.log.debug(f"{desc} subprocess raised: {type(e).__name__}: {e}")
+                self._autotune_metrics.num_compile_failures += 1
+                timings.append(inf)
+        return timings
 
     def benchmark_isolated(
         self,
@@ -1298,9 +1347,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                 if match_unrecoverable_runtime_error(e):
                     self.log.warning(f"{desc} sticky CUDA error skipped: {e}")
                 else:
-                    self.log.debug(
-                        f"{desc} subprocess raised: {type(e).__name__}: {e}"
-                    )
+                    self.log.debug(f"{desc} subprocess raised: {type(e).__name__}: {e}")
                 self._autotune_metrics.num_compile_failures += 1
                 timing = inf
             timings.append(float(timing))

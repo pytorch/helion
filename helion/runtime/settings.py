@@ -44,6 +44,7 @@ if TYPE_CHECKING:
 
 DotPrecision = Literal["tf32", "tf32x3", "ieee"]
 PrecompileMode = Literal["spawn", "fork", "pool"] | None
+PoolRebenchmarkMode = Literal["grouped", "owner_isolated"]
 _TRUE_LITERALS = frozenset({"1", "true", "yes", "on"})
 _FALSE_LITERALS = frozenset({"0", "false", "no", "off"})
 
@@ -414,6 +415,17 @@ class _Settings:
             _env_get_int, "HELION_AUTOTUNE_PRECOMPILE_WORKERS_CAP", 32
         )
     )
+    autotune_pool_rebenchmark_mode: PoolRebenchmarkMode = dataclasses.field(
+        default_factory=functools.partial(
+            _env_get_literal,
+            "HELION_AUTOTUNE_POOL_REBENCHMARK_MODE",
+            cast("PoolRebenchmarkMode", "grouped"),
+            mapping={
+                "grouped": "grouped",
+                "owner_isolated": "owner_isolated",
+            },
+        )
+    )
     autotune_precompile_jobs: int | None = dataclasses.field(
         default_factory=functools.partial(
             _env_get_optional_int,
@@ -592,6 +604,7 @@ class Settings(_Settings):
         "autotune_precompile_jobs": "Maximum concurrent Triton precompile processes, default to cpu count.",
         "autotune_precompile_workers": "Worker-pool precompile size used when autotune_precompile='pool'. 0 (default) auto-decides from GPU memory + cpu count. >0 sets an explicit count. <0 disables the pool path. Set HELION_AUTOTUNE_PRECOMPILE_WORKERS=N to override.",
         "autotune_precompile_workers_cap": "Upper bound on the auto-decided worker-pool size when autotune_precompile_workers=0 (auto-decide). Defaults to 32. Override via HELION_AUTOTUNE_PRECOMPILE_WORKERS_CAP=N. Has no effect when autotune_precompile_workers is set to a positive value (explicit count) or a negative value (pool disabled).",
+        "autotune_pool_rebenchmark_mode": "Pool-mode rebenchmark strategy. 'grouped' (default) rebenchmarks candidates together in one worker job; 'owner_isolated' rebenchmarks each candidate on the worker that precompiled it. Set HELION_AUTOTUNE_POOL_REBENCHMARK_MODE=owner_isolated to enable.",
         "autotune_random_seed": "Seed used for autotuner random number generation. Defaults to HELION_AUTOTUNE_RANDOM_SEED or a time-based seed.",
         "autotune_accuracy_check": "If True, validate candidate configs against the baseline kernel output before accepting them during autotuning.",
         "autotune_rebenchmark_threshold": "If a config is within threshold*best_perf, re-benchmark it to avoid outliers. Defaults to effort profile value. Set HELION_REBENCHMARK_THRESHOLD to override.",

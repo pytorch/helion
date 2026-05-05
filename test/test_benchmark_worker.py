@@ -180,6 +180,17 @@ class TestWorkerPoolPrecompile(unittest.TestCase):
         with patch.dict(os.environ, {"HELION_AUTOTUNE_PRECOMPILE": "pool"}):
             self.assertEqual(Settings().autotune_precompile, "pool")
 
+    def test_pool_owner_rebenchmark_env_value_is_supported(self) -> None:
+        # Owner-isolated pool rebenchmarking should stay opt-in behind its env flag.
+        with patch.dict(
+            os.environ,
+            {"HELION_AUTOTUNE_POOL_REBENCHMARK_MODE": "owner_isolated"},
+        ):
+            self.assertEqual(
+                Settings().autotune_pool_rebenchmark_mode,
+                "owner_isolated",
+            )
+
     def test_pool_auto_worker_cap_defaults_to_32(self) -> None:
         # Auto-sized pools should default to a 32-worker cap.
         with patch.dict(os.environ, {"HELION_AUTOTUNE_PRECOMPILE_WORKERS_CAP": ""}):
@@ -306,15 +317,14 @@ class TestWorkerPoolPrecompile(unittest.TestCase):
             self.assertEqual(job.warmup, 25)
             self.assertEqual(job.rep, 100)
 
-    def test_rebenchmark_uses_worker_pool(self) -> None:
-        # Full-effort rebenchmarking should run on the worker that precompiled the config.
+    def test_rebenchmark_uses_group_worker_job(self) -> None:
+        # Pool rebenchmarking should use one grouped job to avoid per-candidate overhead.
         class FakePoolManager:
             def __init__(self) -> None:
-                self.worker_index: int | None = None
-                self.job: object | None = None
-                self.timeout: float | None = None
+                self.calls: list[tuple[int, object, float]] = []
 
-            def worker_index_for_fn(self, _fn: object) -> int:
+            def worker_index_for_fn(self, fn: object) -> int:
+                self.fn = fn
                 return 3
 
             def run_job_on_worker(
@@ -323,10 +333,8 @@ class TestWorkerPoolPrecompile(unittest.TestCase):
                 job: object,
                 timeout: float,
             ) -> list[float]:
-                self.worker_index = worker_index
-                self.job = job
-                self.timeout = timeout
-                return [1.0, 2.0]
+                self.calls.append((worker_index, job, timeout))
+                return [0.30, 0.40]
 
         class FakeLog:
             def warning(self, *_args: object, **_kwargs: object) -> None:
@@ -335,7 +343,10 @@ class TestWorkerPoolPrecompile(unittest.TestCase):
             def debug(self, *_args: object, **_kwargs: object) -> None:
                 pass
 
-        def fake_fn() -> None:
+        def fake_fn_a() -> None:
+            pass
+
+        def fake_fn_b() -> None:
             pass
 
         pool = FakePoolManager()
@@ -358,15 +369,78 @@ class TestWorkerPoolPrecompile(unittest.TestCase):
             module_name=None,
         )
 
-        result = provider.rebenchmark([fake_fn, fake_fn], repeat=7, desc="verify")
+        result = provider.rebenchmark([fake_fn_a, fake_fn_b], repeat=7, desc="verify")
 
-        self.assertEqual(result, [1.0, 2.0])
-        self.assertEqual(pool.worker_index, 3)
-        self.assertIsInstance(pool.job, RebenchmarkJob)
-        assert isinstance(pool.job, RebenchmarkJob)
-        self.assertEqual(pool.job.repeat, 7)
-        self.assertEqual(len(pool.job.fn_specs), 2)
-        self.assertEqual(pool.timeout, 20.0)
+        self.assertEqual(result, [0.30, 0.40])
+        self.assertIs(pool.fn, fake_fn_a)
+        self.assertEqual(len(pool.calls), 1)
+        worker_index, job, timeout = pool.calls[0]
+        self.assertEqual(worker_index, 3)
+        self.assertIsInstance(job, RebenchmarkJob)
+        self.assertEqual(timeout, 20.0)
+
+    def test_owner_isolated_rebenchmark_uses_owner_worker_pool(self) -> None:
+        # Owner-isolated mode should route each candidate to its precompile owner.
+        class FakePoolManager:
+            def __init__(self) -> None:
+                self.calls: list[tuple[int, object, float]] = []
+
+            def worker_index_for_fn(self, fn: object) -> int:
+                return 3 if fn is fake_fn_a else 4
+
+            def run_job_on_worker(
+                self,
+                worker_index: int,
+                job: object,
+                timeout: float,
+            ) -> list[float]:
+                self.calls.append((worker_index, job, timeout))
+                return [float(worker_index)]
+
+        class FakeLog:
+            def warning(self, *_args: object, **_kwargs: object) -> None:
+                pass
+
+            def debug(self, *_args: object, **_kwargs: object) -> None:
+                pass
+
+        def fake_fn_a() -> None:
+            pass
+
+        def fake_fn_b() -> None:
+            pass
+
+        pool = FakePoolManager()
+        provider = cast("Any", LocalBenchmarkProvider.__new__(LocalBenchmarkProvider))
+        provider.settings = Settings(
+            autotune_benchmark_subprocess=True,
+            autotune_benchmark_timeout=10,
+            autotune_pool_rebenchmark_mode="owner_isolated",
+        )
+        provider.config_spec = SimpleNamespace(backend=None)
+        provider.mutated_arg_indices = []
+        provider._precompile_args_path = "args.pt"
+        provider._pool_manager = pool
+        provider._benchmark_worker = None
+        provider._autotune_metrics = SimpleNamespace(num_compile_failures=0)
+        provider.log = FakeLog()
+        provider._serialize_fn_for_worker = lambda _fn: SerializedCompiledFunction(
+            function_name="fake_fn",
+            source_code="def fake_fn(): pass",
+            filename=None,
+            module_name=None,
+        )
+
+        result = provider.rebenchmark([fake_fn_a, fake_fn_b], repeat=7, desc="verify")
+
+        self.assertEqual(result, [3.0, 4.0])
+        self.assertEqual([call[0] for call in pool.calls], [3, 4])
+        self.assertTrue(all(isinstance(call[1], RebenchmarkJob) for call in pool.calls))
+        self.assertTrue(all(call[2] == 10.0 for call in pool.calls))
+        for _, job, _ in pool.calls:
+            assert isinstance(job, RebenchmarkJob)
+            self.assertEqual(job.repeat, 7)
+            self.assertEqual(len(job.fn_specs), 1)
 
     def test_population_rebenchmark_uses_provider_timings(self) -> None:
         # BaseSearch should use provider rebenchmark timings when available.
