@@ -1562,6 +1562,59 @@ class TestCuteLowerings(unittest.TestCase):
             ):
                 bound(*args)
 
+    def test_tcgen05_persistent_cluster_m2_two_cta_pdl_codegen(self) -> None:
+        """CtaGroup.TWO emits Quack-aligned PDL markers in validated codegen."""
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_cluster_m2_two_cta_pdl(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        torch.manual_seed(0)
+        args = (
+            torch.randn(256, 16, device=DEVICE, dtype=torch.bfloat16),
+            torch.randn(16, 256, device=DEVICE, dtype=torch.bfloat16),
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_cluster_m2_two_cta_pdl.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            cfg = _make_tcgen05_persistent_config(
+                block_sizes=[256, 256, 16],
+                l2_groupings=[4],
+                pid_type="persistent_blocked",
+                tcgen05_cluster_m=2,
+            )
+            bound.set_config(cfg)
+            code = bound.to_triton_code(cfg)
+
+        self.assertEqual(code.count("cute.arch.griddepcontrol_wait()"), 1)
+        self.assertEqual(code.count("cute.arch.griddepcontrol_launch_dependents()"), 1)
+        tma_role_pos = code.index(
+            "if cute.arch.make_warp_uniform(cute.arch.warp_idx()) == cutlass.Int32(5):"
+        )
+        wait_pos = code.index("cute.arch.griddepcontrol_wait()", tma_role_pos)
+        tma_sched_pos = code.index(
+            "StaticPersistentTileScheduler.create(", tma_role_pos
+        )
+        tma_acquire_pos = code.index(
+            "tcgen05_ab_pipeline.producer_acquire", tma_role_pos
+        )
+        pdl_launch_pos = code.index("cute.arch.griddepcontrol_launch_dependents()")
+        tmem_arrive_pos = code.index("tcgen05_tmem_alloc_barrier.arrive()")
+
+        self.assertLess(wait_pos, tma_sched_pos)
+        self.assertLess(wait_pos, tma_acquire_pos)
+        self.assertLess(pdl_launch_pos, tmem_arrive_pos)
+
     def test_tcgen05_persistent_cluster_m2_two_cta_single_tile_runtime_correctness(
         self,
     ) -> None:
@@ -1613,6 +1666,10 @@ class TestCuteLowerings(unittest.TestCase):
             bound.set_config(cfg)
             code = bound.to_triton_code(cfg)
             self.assertIn("cute.nvgpu.tcgen05.CtaGroup.TWO", code)
+            self.assertEqual(code.count("cute.arch.griddepcontrol_wait()"), 1)
+            self.assertEqual(
+                code.count("cute.arch.griddepcontrol_launch_dependents()"), 1
+            )
             self.assertIn(
                 "tcgen05_role_local_0_tile_sched = "
                 "cutlass.utils.StaticPersistentTileScheduler.create(",
@@ -1671,6 +1728,7 @@ class TestCuteLowerings(unittest.TestCase):
                 code,
             )
             tmem_arrive_pos = code.index("tcgen05_tmem_alloc_barrier.arrive()")
+            pdl_launch_pos = code.index("cute.arch.griddepcontrol_launch_dependents()")
             acc_tail_marker = (
                 "tcgen05_acc_pipeline.producer_tail"
                 if "tcgen05_acc_pipeline.producer_tail" in code
@@ -1685,6 +1743,7 @@ class TestCuteLowerings(unittest.TestCase):
             )
             tmem_wait_pos = code.index("tcgen05_tmem_alloc_barrier.arrive_and_wait()")
             tmem_free_pos = code.index("tcgen05_tmem_allocator.free(")
+            self.assertLess(pdl_launch_pos, tmem_arrive_pos)
             self.assertLess(tmem_arrive_pos, acc_tail_pos)
             self.assertLess(acc_tail_pos, tmem_dealloc_allocator_pos)
             self.assertLess(tmem_dealloc_allocator_pos, relinquish_pos)
@@ -1735,6 +1794,14 @@ class TestCuteLowerings(unittest.TestCase):
                 test_src = ast.unparse(node.test)
                 role_src = ast.unparse(node)
                 if test_src == tma_role_predicate:
+                    self.assertLess(
+                        role_src.index("cute.arch.griddepcontrol_wait()"),
+                        role_src.index("StaticPersistentTileScheduler.create("),
+                    )
+                    self.assertLess(
+                        role_src.index("cute.arch.griddepcontrol_wait()"),
+                        role_src.index("tcgen05_ab_pipeline.producer_acquire"),
+                    )
                     self.assertIn("tcgen05_ab_pipeline.producer_acquire", role_src)
                     self.assertIn(
                         "cute.nvgpu.cpasync.tma_partition("
@@ -6374,8 +6441,43 @@ class TestPersistentLoopSplitter(unittest.TestCase):
         )
         # The PersistentTileSchedulerParams call site must reference
         # cluster_m=2 in the cluster shape tuple.
-        params_src = ast.unparse(emitted.body[0])
-        self.assertIn("(2, 1, 1)", params_src)
+        body_srcs = [ast.unparse(stmt) for stmt in emitted.body]
+        params_srcs = [
+            src for src in body_srcs if "PersistentTileSchedulerParams" in src
+        ]
+        self.assertEqual(len(params_srcs), 1)
+        self.assertIn("(2, 1, 1)", params_srcs[0])
+
+    def test_role_local_while_skips_pdl_wait_without_two_cta(self) -> None:
+        """The Quack PDL wait is paired with the two-CTA launch-dependents."""
+        from helion._compiler.program_id import Tcgen05PersistentProgramIDs
+
+        stub_df, splitter = self._make_role_local_stubs(num_pid_dims=1)
+        layout = self._make_minimal_layout(cluster_m=2)
+        prefetch = self._stmt("tma_pipeline.producer_acquire(state)")
+        role_block = Tcgen05PersistentProgramIDs._PersistentRoleBlock(
+            role_predicate="__test_tma_load_warp__", stmts=[prefetch]
+        )
+        with (
+            patch.object(
+                Tcgen05PersistentProgramIDs,
+                "_tcgen05_is_two_cta",
+                return_value=False,
+            ),
+            patch.object(
+                Tcgen05PersistentProgramIDs,
+                "_tcgen05_tma_load_role_predicate",
+                return_value="__test_tma_load_warp__",
+            ),
+        ):
+            emitted = splitter._build_role_local_while(
+                stub_df,
+                layout,
+                role_block,
+                scheduler_var_prefix="rl_non_two_cta_pdl",
+            )
+
+        self.assertNotIn("cute.arch.griddepcontrol_wait()", ast.unparse(emitted))
 
 
 @onlyBackends(["cute"])
