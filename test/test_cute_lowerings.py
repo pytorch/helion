@@ -1561,6 +1561,25 @@ class TestCuteLowerings(unittest.TestCase):
                 "cutlass.pipeline.Agent.Thread, cutlass.Int32(2))",
                 code,
             )
+            init_arrive = "cutlass.pipeline.pipeline_init_arrive("
+            init_wait = "cutlass.pipeline.pipeline_init_wait("
+            self.assertLess(
+                code.index(
+                    "tcgen05_acc_pipeline = cutlass.pipeline.PipelineUmmaAsync.create("
+                ),
+                code.index(init_arrive),
+            )
+            self.assertLess(
+                code.index(
+                    "tcgen05_ab_pipeline = cutlass.pipeline.PipelineTmaUmma.create("
+                ),
+                code.index(init_arrive),
+            )
+            self.assertLess(code.index(init_arrive), code.index(init_wait))
+            self.assertLess(
+                code.index(init_wait),
+                code.index("tcgen05_tmem_allocator.allocate("),
+            )
             self.assertIn(
                 "if tcgen05_tma_initial_full_tile and tcgen05_tma_warp:\n"
                 "            tcgen05_ab_pipeline.producer_acquire",
