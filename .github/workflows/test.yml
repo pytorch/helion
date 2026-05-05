@@ -71,8 +71,11 @@ jobs:
         run: |
           set -eux
           SUDO=$(command -v sudo 2>/dev/null || true)
-          $SUDO apt-get update
-          $SUDO apt-get install -y libdw1 curl wget git pkg-config zlib1g-dev build-essential
+          retry () {
+            "$@" || (sleep 10 && "$@") || (sleep 20 && "$@") || (sleep 40 && "$@")
+          }
+          retry $SUDO apt-get update
+          retry $SUDO apt-get install -y --fix-missing libdw1 curl wget git pkg-config zlib1g-dev build-essential
 
       - name: Install NVSHMEM
         if: contains(matrix.alias, 'distributed')
@@ -251,6 +254,43 @@ jobs:
               a = torch.randn(256, 256, device=dev)
               b = (a @ a).sum().item()
               print(f'  Device {i} ({torch.cuda.get_device_name(i)}): OK')
+
+          print(f'All {n} devices healthy')
+          "
+
+      - name: Inductor Worker Check
+        if: startsWith(matrix.image, 'nvidia')
+        run: |
+          source .venv/bin/activate
+          python -c "
+          import torch
+
+          @torch.compile
+          def f(x):
+              return (x + 1).relu()
+
+          x = torch.randn(8, device='cuda')
+          f(x).sum().item()
+          print('Inductor worker subprocess: OK')
+          "
+
+      - name: XPU Compute Check
+        if: startsWith(matrix.image, 'intel')
+        run: |
+          source .venv/bin/activate
+          python -c "
+          import torch
+
+          assert torch.xpu.is_available(), 'FATAL: XPU not available'
+          n = torch.xpu.device_count()
+          assert n > 0, 'FATAL: No XPU devices found'
+          print(f'XPU devices: {n}')
+
+          for i in range(n):
+              dev = torch.device('xpu', i)
+              a = torch.randn(256, 256, device=dev)
+              b = (a @ a).sum().item()
+              print(f'  Device {i} ({torch.xpu.get_device_name(i)}): OK')
 
           print(f'All {n} devices healthy')
           "
