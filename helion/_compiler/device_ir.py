@@ -298,9 +298,22 @@ class ForLoopGraphInfo(NodeArgsGraphInfo):
     # when there is a global read-after-write dependency.
     host_loop_reads: frozenset[str] = dataclasses.field(default_factory=frozenset)
     host_loop_writes: frozenset[str] = dataclasses.field(default_factory=frozenset)
-    # True when FX analysis could not map every load/store/atomic buffer to a host
-    # name (see _reduction_fx_inter_loop_rw_names / Origin.root_rw_name).
+    # True when FX analysis could not map every load/store/atomic buffer back
+    # to a host-named buffer.  Concretely, this fires when the tensor argument
+    # of an hl.load / hl.store / atomic op in a rolled reduction graph:
+    #   * comes from a _host_tensor FX node whose Origin does not unwrap to a
+    #     NameOrigin (anonymous device temporary), or
+    #   * has no meta["val"] Tensor and no traceable host-tensor ancestor
+    #     (e.g. a buffer created entirely on-device via slicing/cat/where chains).
+    # When True, codegen conservatively inserts an inter-loop barrier because we
+    # cannot prove the absence of a global RAW dependency.
+    # See _reduction_fx_inter_loop_rw_names / Origin.root_rw_name.
     reduction_barrier_unknown: bool = False
+    # Precomputed by GenerateAST._compute_inter_loop_barriers: True iff a
+    # tl.debug_barrier() must be emitted immediately before this for-loop's
+    # outer prefix to make global writes from the previous sibling for-loop
+    # in this scope visible.  Not copied across graph copies; recomputed.
+    needs_barrier_before: bool = False
 
     @property
     def name(self) -> str:
@@ -313,6 +326,8 @@ class ForLoopGraphInfo(NodeArgsGraphInfo):
             "host_loop_reads": self.host_loop_reads,
             "host_loop_writes": self.host_loop_writes,
             "reduction_barrier_unknown": self.reduction_barrier_unknown,
+            # needs_barrier_before is intentionally not copied -- it is
+            # recomputed by GenerateAST per codegen run.
         }
 
     def codegen(self, state: CodegenState) -> list[object]:
@@ -323,9 +338,7 @@ class ForLoopGraphInfo(NodeArgsGraphInfo):
             state.device_function.tile_strategy.codegen_device_loop(
                 state, self.block_ids
             ),
-            host_loop_reads=self.host_loop_reads,
-            host_loop_writes=self.host_loop_writes,
-            inter_loop_dep_metadata_unknown=self.reduction_barrier_unknown,
+            needs_barrier_before=self.needs_barrier_before,
         ):
             return codegen_call_with_graph(
                 state.codegen,
@@ -387,7 +400,6 @@ class IfGraphInfo(NodeArgsGraphInfo):
         state.add_statement(if_ast_node)
 
         with state.codegen.set_statements(body_stmts):
-            state.codegen.reset_inter_loop_barrier_state()
             if_outputs = codegen_call_with_graph(state.codegen, self.graph, if_args)
 
         else_outputs = []
@@ -395,7 +407,6 @@ class IfGraphInfo(NodeArgsGraphInfo):
             else_graph = state.get_graph(self.else_branch)
             assert isinstance(else_graph, ElseGraphInfo)
             with state.codegen.set_statements(orelse_stmts):
-                state.codegen.reset_inter_loop_barrier_state()
                 else_outputs = codegen_call_with_graph(
                     state.codegen, else_graph.graph, else_args
                 )

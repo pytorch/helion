@@ -31,7 +31,6 @@ from .helper_function import CodegenInterface
 from .inductor_lowering import CodegenState
 from .inductor_lowering import codegen_call_with_graph
 from .loop_dependency_checker import LoopDependencyChecker
-from .loop_dependency_checker import needs_inter_loop_debug_barrier_for_global_raw
 from .output_header import get_needed_import_lines
 from .program_id import ForEachProgramID
 from .tile_strategy import DeviceGridState
@@ -91,9 +90,6 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         self.next_else_block: list[ast.AST] | None = None
         self.store_transform = store_transform
         self.load_transform = load_transform
-        self._last_emitted_device_loop = False
-        self._inter_loop_prev_global_writes: set[str] = set()
-        self._inter_loop_prev_unknown: bool = False
 
         # Now create device function and initialize CodegenInterface
         self.device_function = DeviceFunction(
@@ -102,6 +98,10 @@ class GenerateAST(NodeVisitor, CodegenInterface):
             self,
         )
         CodegenInterface.__init__(self, self.device_function)
+
+        # Decide once which sibling for-loops need a tl.debug_barrier()
+        # to make global writes visible to subsequent reads.
+        self._compute_inter_loop_barriers()
 
     def get_graph(self, graph_id: int) -> GraphInfo:
         return self.codegen_graphs[graph_id]
@@ -121,11 +121,51 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         phase_idx = self.host_function.device_ir.phase_for_root(root_id)
         return self.host_function.device_ir.phases[phase_idx].loop_dependency_checker
 
-    def reset_inter_loop_barrier_state(self) -> None:
-        """Clear sequential device-loop barrier tracking (new grid root or if/else arm)."""
-        self._last_emitted_device_loop = False
-        self._inter_loop_prev_global_writes.clear()
-        self._inter_loop_prev_unknown = False
+    def _compute_inter_loop_barriers(self) -> None:
+        """Walk every codegen graph; for each pair of consecutive sibling
+        ``_for_loop`` / ``_for_loop_step`` nodes, set ``needs_barrier_before``
+        on the second loop's ``ForLoopGraphInfo`` when there is a global RAW
+        dependency.
+
+        TileIR shares Triton surface syntax but ``tl.debug_barrier()`` lowers
+        to ``ttg.barrier`` which the TileIR pass pipeline does not legalize,
+        so the analysis is a no-op there.
+        """
+        from ..language._tracing_ops import _for_loop
+        from ..language._tracing_ops import _for_loop_step
+        from .device_ir import ForLoopGraphInfo
+        from .loop_dependency_checker import (
+            needs_inter_loop_debug_barrier_for_global_raw,
+        )
+
+        env = CompileEnvironment.current()
+        if env.codegen_name != "triton" or env.backend.name == "tileir":
+            return
+
+        for graph_info in self.codegen_graphs:
+            prev_for: ForLoopGraphInfo | None = None
+            for node in graph_info.graph.nodes:
+                if node.op != "call_function":
+                    continue
+                if node.target not in (_for_loop, _for_loop_step):
+                    continue
+                cur_id = node.args[0]
+                cur_info = self.codegen_graphs[cur_id]
+                if not isinstance(cur_info, ForLoopGraphInfo):
+                    continue
+                if prev_for is not None:
+                    prev_global_writes = self._global_barrier_tensor_names(
+                        prev_for.host_loop_writes
+                    )
+                    cur_info.needs_barrier_before = (
+                        needs_inter_loop_debug_barrier_for_global_raw(
+                            prev_global_writes,
+                            cur_info.host_loop_reads,
+                            global_barrier_tensor_names=self._global_barrier_tensor_names,
+                            prev_metadata_unknown=prev_for.reduction_barrier_unknown,
+                        )
+                    )
+                prev_for = cur_info
 
     def _global_barrier_tensor_names(self, names: frozenset[str]) -> set[str]:
         """Names that may participate in cross-wavefront global (HBM) coherence."""
@@ -341,26 +381,8 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         self,
         device_loop: DeviceLoopState,
         *,
-        host_loop_reads: frozenset[str] = frozenset(),
-        host_loop_writes: frozenset[str] = frozenset(),
-        inter_loop_dep_metadata_unknown: bool = False,
+        needs_barrier_before: bool = False,
     ) -> Iterator[None]:
-        env = CompileEnvironment.current()
-        # TileIR reuses Triton surface syntax but ``tl.debug_barrier()`` lowers to
-        # ``ttg.barrier``, which the TileIR pass pipeline does not legalize
-        # (``PassManager::run failed`` / failed to legalize ttg.barrier).
-        use_triton_barrier = (
-            env.codegen_name == "triton" and env.backend.name != "tileir"
-        )
-        need_barrier = False
-        if use_triton_barrier and self._last_emitted_device_loop:
-            need_barrier = needs_inter_loop_debug_barrier_for_global_raw(
-                self._inter_loop_prev_global_writes,
-                host_loop_reads,
-                global_barrier_tensor_names=self._global_barrier_tensor_names,
-                prev_metadata_unknown=self._inter_loop_prev_unknown,
-            )
-
         with self.set_statements(device_loop.inner_statements):
             for idx in device_loop.block_ids:
                 active_loops = self.active_device_loops[idx]
@@ -374,19 +396,11 @@ class GenerateAST(NodeVisitor, CodegenInterface):
             finally:
                 for idx in device_loop.block_ids:
                     self.active_device_loops[idx].pop()
-        if need_barrier:
+        if needs_barrier_before:
             self.add_statement(statement_from_string("tl.debug_barrier()"))
         self.statements_stack[-1].extend(device_loop.outer_prefix)
         self.add_statement(device_loop.for_node)
         self.statements_stack[-1].extend(device_loop.outer_suffix)
-        self._last_emitted_device_loop = True
-        if inter_loop_dep_metadata_unknown:
-            self._inter_loop_prev_unknown = True
-        else:
-            self._inter_loop_prev_unknown = False
-            self._inter_loop_prev_global_writes = self._global_barrier_tensor_names(
-                host_loop_writes
-            )
 
     @contextlib.contextmanager
     def add_emit_pipeline_loop(
@@ -549,6 +563,37 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                             ) from None
                         bound = fn._signature.bind(*args, **kwargs)
                         bound.apply_defaults()
+                iter_node = node.iter
+                assert isinstance(iter_node, ExtendedAST)
+                with iter_node:
+                    assert isinstance(iter_node, ast.Call)
+                    args = []
+                    kwargs = {}
+                    for arg_node in iter_node.args:
+                        assert not isinstance(arg_node, ast.Starred)
+                        assert isinstance(arg_node, ExtendedAST)
+                        assert arg_node._type_info is not None
+                        args.append(arg_node._type_info.proxy())
+                    for kwarg_node in iter_node.keywords:
+                        assert kwarg_node.arg is not None
+                        assert isinstance(kwarg_node.value, ExtendedAST)
+                        assert kwarg_node.value._type_info is not None
+                        kwargs[kwarg_node.arg] = kwarg_node.value._type_info.proxy()
+                    fn_node = iter_node.func
+                    assert isinstance(fn_node, ExtendedAST)
+                    assert fn_node._type_info is not None
+                    fn = fn_node._type_info.proxy()
+                    assert is_api_func(fn)
+                    env = CompileEnvironment.current()
+                    try:
+                        codegen_fn = fn._codegen[env.codegen_name]
+                    except KeyError:
+                        raise exc.BackendImplementationMissing(
+                            env.backend_name,
+                            f"codegen for API function {fn.__qualname__}",
+                        ) from None
+                    bound = fn._signature.bind(*args, **kwargs)
+                    bound.apply_defaults()
 
                         from .inductor_lowering import CodegenState
 
