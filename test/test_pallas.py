@@ -778,6 +778,7 @@ class TestPallas(TestCase):
             pallas_bmm_subrange_k,
             (a, b, k_start, k_end),
             block_sizes=[4, 128, 128, 256],
+            pallas_loop_type="unroll",
         )
         expected = torch.bmm(
             a[:, :, k_start:k_end].float(), b[:, k_start:k_end, :].float()
