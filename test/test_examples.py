@@ -8,6 +8,8 @@ from packaging import version
 import pytest
 import torch
 import torch.nn.functional as F
+from torch.testing._internal.common_utils import instantiate_parametrized_tests
+from torch.testing._internal.common_utils import parametrize
 
 import helion
 from helion import _compat
@@ -698,14 +700,20 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
 
     @xfailIfCute("CuTe RMSNorm backward example still returns incorrect results")
-    def test_rms_norm_bwd(self):
+    @parametrize("variant", ("fp32", "bf16"))
+    def test_rms_norm_bwd(self, variant):
         """Test backward pass for rms norm weight gradient."""
+        if variant == "fp32":
+            dtype = torch.float32
+            atol = 1e-2
+        else:
+            dtype = HALF_DTYPE
+            atol = 5e-2
+
         batch_size, dim = 2048, 2048
-        x = torch.randn([batch_size, dim], device=DEVICE, dtype=torch.float32)
-        weight = torch.randn(
-            [dim], device=DEVICE, dtype=torch.float32, requires_grad=True
-        )
-        grad_out = torch.randn([batch_size, dim], device=DEVICE, dtype=torch.float32)
+        x = torch.randn([batch_size, dim], device=DEVICE, dtype=dtype)
+        weight = torch.randn([dim], device=DEVICE, dtype=dtype, requires_grad=True)
+        grad_out = torch.randn([batch_size, dim], device=DEVICE, dtype=dtype)
         eps = 1e-5
 
         # Compute forward pass to get rms
@@ -740,7 +748,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             num_warps=4,
             num_stages=3,
             rtol=1e-2,
-            atol=1e-2,
+            atol=atol,
         )
 
     def test_embedding_pointers(self):
@@ -2474,6 +2482,9 @@ class TestExamples(RefEagerTestBase, TestCase):
             num_stages=3,
             rtol=1e-2,
         )
+
+
+instantiate_parametrized_tests(TestExamples)
 
 
 if __name__ == "__main__":
