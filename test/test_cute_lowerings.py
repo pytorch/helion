@@ -1530,8 +1530,8 @@ class TestCuteLowerings(unittest.TestCase):
             return out
 
         args = (
-            torch.randn(256, 32, device=DEVICE, dtype=torch.float16),
-            torch.randn(32, 256, device=DEVICE, dtype=torch.float16),
+            torch.randn(256, 32, device=DEVICE, dtype=torch.bfloat16),
+            torch.randn(32, 256, device=DEVICE, dtype=torch.bfloat16),
         )
         from helion._compiler.program_id import Tcgen05PersistentProgramIDs
 
@@ -1540,6 +1540,10 @@ class TestCuteLowerings(unittest.TestCase):
             bound.env.config_spec.cute_tcgen05_search_enabled = True
             cfg = _make_tcgen05_persistent_config(
                 block_sizes=[256, 256, 16],
+                # Grouped PID decomposition leaves pure scalar setup in the
+                # omitted shared view; the host guard should still compile
+                # and raise instead of tripping the omit-safety assertion.
+                l2_groupings=[4],
                 pid_type="persistent_blocked",
                 tcgen05_cluster_m=2,
             )
@@ -5534,6 +5538,7 @@ class TestPersistentLoopSplitter(unittest.TestCase):
             "cute.copy(src, dst)",
             "tmp = cute.copy(src, dst)",
             "tmp = some_pipeline_call(src)",
+            "tmp = min(num_pid_m, 4, key=some_callable)",
             "if side_effecting_call():\n    tmp = 1",
             "for idx in side_effecting_call():\n    tmp = idx",
         ]
@@ -5586,6 +5591,34 @@ class TestPersistentLoopSplitter(unittest.TestCase):
         loop_src = "\n".join(ast.unparse(s) for s in while_stmt.body)
         self.assertIn("pid_0 = __test_virtual_pid__", loop_src)
         self.assertIn("role_value = pid_0", loop_src)
+
+    def test_omit_shared_loop_allows_grouped_pid_scalar_setup(self) -> None:
+        """Grouped PID decomposition and scalar fallback remnants are pure.
+
+        Explicit guarded CtaGroup.TWO configs can still use grouped PID
+        decomposition before the host guard raises. The omit-shared-loop
+        safety check must allow these dependency-only expressions while
+        still rejecting observable calls.
+        """
+        from helion._compiler.program_id import Tcgen05PersistentProgramIDs
+
+        splitter, _ = self._make_helper()
+        partition = Tcgen05PersistentProgramIDs._PartitionedRoleBody(
+            role_blocks_inline=[],
+            role_blocks_extracted=[],
+            shared_body_extracted=[
+                self._stmt("group_size_m = min(num_pid_m - first_pid_m, 4)"),
+                self._stmt(
+                    "for offset_2 in range(cutlass.Int32(0), "
+                    "cutlass.Int32(16), cutlass.Int32(_BLOCK_SIZE_2)):\n"
+                    "    indices_2 = offset_2\n"
+                    "    mask_2 = indices_2 < 16\n"
+                    "    load = cutlass.BFloat16(0)"
+                ),
+            ],
+        )
+
+        splitter._assert_tcgen05_omit_shared_loop_safe(partition)
 
     def test_role_local_tile_body_builder_returns_two_lists(self) -> None:
         """``_build_tcgen05_persistent_tile_body_role_local`` returns
