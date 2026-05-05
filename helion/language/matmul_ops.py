@@ -23,6 +23,9 @@ from .._compiler.cute.matmul_utils import cute_outer_accumulator_out_dtype
 from .._compiler.cute.matmul_utils import cute_resolve_active_block_id
 from .._compiler.cute.matmul_utils import cute_resolve_active_matmul_k_block_id
 from .._compiler.cute.matmul_utils import cute_static_k_invariant_extent
+from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
+from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
+from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_MAX_K_TILES
 from .._compiler.matmul_utils import _compute_out_dtype
 from .._compiler.matmul_utils import _emit_pallas_matmul
 from .._compiler.matmul_utils import _emit_tl_dot_scaled
@@ -313,19 +316,35 @@ def enforce_dot_requirements(lhs: torch.Tensor, rhs: torch.Tensor) -> None:
                 and static_n % max_search_n == 0
                 and static_k % max_search_k == 0
             )
+            # ``tcgen05_cluster_m`` is searched independently from bk. Expose
+            # 2 when at least the largest searched bk fits the cap; smaller
+            # invalid bk samples fall back to cluster_m=1 during normalization.
+            max_cluster_m2_search_k = TCGEN05_TWO_CTA_MAX_K_TILES * max_search_k
+            allow_cluster_m2_search = (
+                allow_persistent_pid_types
+                and max_search_m >= TCGEN05_TWO_CTA_BLOCK_M
+                and max_search_n >= TCGEN05_TWO_CTA_BLOCK_N
+                and static_k <= max_cluster_m2_search_k
+            )
             # Narrow the autotune search to tcgen05 configs that have been
             # validated to compile and run correctly on B200. Static full-tile
             # single-root role-local persistent kernels have coverage, so the
             # helper keeps persistent pid types when all search block sizes
-            # are full tiles. It always excludes ``cluster_m=2`` (CUDA launch
-            # fails) and ``num_epi_warps != 4`` (only 4 is validated correct;
-            # 1 and 2 are directly verified to produce wrong output and 3 is
-            # unsafe by extension). The num_epi_warps restriction also
-            # tightens normalize() so an explicit user config that bypasses
-            # autotune raises ``InvalidConfig`` rather than silently
-            # miscomputing — there is no loud crash for this failure mode.
+            # are full tiles. ``cluster_m=2`` re-enters search only for
+            # static-full CtaGroup.TWO problems whose search space can form
+            # validated 256x256 tiles within the K-tile cap. Search-time
+            # normalization projects cluster_m=2 products onto that validated
+            # tile/pid shape. ``num_epi_warps != 4`` remains excluded because
+            # only 4 is validated correct; 1 and 2 are directly verified to
+            # produce wrong output and 3 is unsafe by extension.
+            # The num_epi_warps restriction also tightens normalize() so an
+            # explicit user config that bypasses autotune raises
+            # ``InvalidConfig`` rather than silently miscomputing — there is
+            # no loud crash for this failure mode.
             spec.narrow_tcgen05_autotune_to_validated_configs(
-                allow_persistent_pid_types=allow_persistent_pid_types
+                allow_persistent_pid_types=allow_persistent_pid_types,
+                allow_cluster_m2_search=allow_cluster_m2_search,
+                cluster_m2_static_k=static_k if allow_cluster_m2_search else None,
             )
             for axis_name, shape, max_size in (
                 ("m", m, max_search_m),

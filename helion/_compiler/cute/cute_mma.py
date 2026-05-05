@@ -44,6 +44,7 @@ from .layout import MatmulExecutionKind
 from .layout import MatmulExecutionPlan
 from .matmul_utils import analyze_direct_grouped_n_loads
 from .mma_support import get_cute_mma_support
+from .tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -2927,7 +2928,7 @@ def _tcgen05_use_2cta_instrs(*, bm: int, cluster_m: int) -> bool:
     # tcgen05 "CTA pair" instruction family. The special 2-CTA instructions only
     # apply to the 256-wide M tiler. Our current legal Helion family still uses
     # CTA-local M=128 tiles, even when the cluster shape is (2, 1, 1).
-    return cluster_m == 2 and bm == 256
+    return cluster_m == 2 and bm == TCGEN05_TWO_CTA_BLOCK_M
 
 
 def _tcgen05_epi_warp_count(config: object, *, cta_thread_count: int) -> int:
@@ -2991,7 +2992,7 @@ def _mma_impl_matches_problem_shape(
             return False
         if bm in (64, 128):
             return True
-        return bm == 256 and tcgen05_cluster_m == 2
+        return bm == TCGEN05_TWO_CTA_BLOCK_M and tcgen05_cluster_m == 2
     return False
 
 
