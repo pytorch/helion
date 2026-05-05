@@ -32,12 +32,14 @@ from helion._compiler.backend import _loop_contains_matmul
 from helion._compiler.backend import _loop_may_use_mma
 from helion._compiler.compile_environment import CompileEnvironment
 from helion._compiler.cute.argreduce import codegen_cute_tile_argreduce
+from helion._compiler.cute.cute_mma import _TCGEN05_CLUSTER_LEADER_PREDICATE
 from helion._compiler.cute.cute_mma import _build_initial_prefetch_if
 from helion._compiler.cute.cute_mma import _build_kloop_non_pipeline_producer_if
 from helion._compiler.cute.cute_mma import _build_kloop_non_pipeline_release_if
 from helion._compiler.cute.cute_mma import _build_kloop_pipeline_consumer_if
 from helion._compiler.cute.cute_mma import _build_kloop_pipeline_producer_if
 from helion._compiler.cute.cute_mma import _build_kloop_pipeline_release_if
+from helion._compiler.cute.cute_mma import _build_tcgen05_mma_issue_stmt
 from helion._compiler.cute.cute_mma import _choose_mma_impl
 from helion._compiler.cute.cute_mma import _get_mma_k_loop_info
 from helion._compiler.cute.cute_mma import _InitialPrefetchTmaArgs
@@ -1485,6 +1487,19 @@ class TestCuteLowerings(unittest.TestCase):
             bound.set_config(cfg)
             code = bound.to_triton_code(cfg)
             self.assertNotIn("tcgen05_role_local", code)
+            self.assertIn("cute.nvgpu.tcgen05.CtaGroup.ONE", code)
+            self.assertIn(
+                "tcgen05_ab_pipeline_consumer_group = "
+                "cutlass.pipeline.CooperativeGroup("
+                "cutlass.pipeline.Agent.Thread, cutlass.Int32(1))",
+                code,
+            )
+            self.assertNotIn(
+                "tcgen05_ab_pipeline_consumer_group = "
+                "cutlass.pipeline.CooperativeGroup("
+                "cutlass.pipeline.Agent.Thread, cutlass.Int32(2))",
+                code,
+            )
             self.assertIn(Tcgen05PersistentProgramIDs._MULTI_TILE_GUARD_TOTAL_VAR, code)
             with self.assertRaisesRegex(
                 RuntimeError,
@@ -1530,9 +1545,53 @@ class TestCuteLowerings(unittest.TestCase):
             )
             bound.set_config(cfg)
             code = bound.to_triton_code(cfg)
+            owner_predicate = (
+                "if tcgen05_exec_active and "
+                "cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster()) "
+                "== cutlass.Int32(0):"
+            )
             self.assertIn("cute.nvgpu.tcgen05.CtaGroup.TWO", code)
             self.assertIn(
                 "virtual_pid = tcgen05_work_tile_idx_0 // cutlass.Int32(2)",
+                code,
+            )
+            self.assertIn(
+                "tcgen05_ab_pipeline_consumer_group = "
+                "cutlass.pipeline.CooperativeGroup("
+                "cutlass.pipeline.Agent.Thread, cutlass.Int32(2))",
+                code,
+            )
+            self.assertIn(
+                "if tcgen05_tma_initial_full_tile and tcgen05_tma_warp:\n"
+                "            tcgen05_ab_pipeline.producer_acquire",
+                code,
+            )
+            self.assertIn(
+                "if cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster()) "
+                "== cutlass.Int32(0):\n"
+                "                cute.copy(tma_atom_a",
+                code,
+            )
+            self.assertIn(owner_predicate, code)
+            self.assertIn(
+                "tcgen05_ab_pipeline.consumer_release(tcgen05_ab_consumer_state)",
+                code,
+            )
+            self.assertIn(
+                "if tcgen05_exec_active:\n"
+                "                    tcgen05_ab_consumer_state.advance()",
+                code,
+            )
+            self.assertIn(
+                f"{owner_predicate}\n"
+                "            tcgen05_acc_pipeline.producer_acquire("
+                "tcgen05_acc_producer_state)",
+                code,
+            )
+            self.assertIn(
+                f"{owner_predicate}\n"
+                "            tcgen05_acc_pipeline.producer_commit("
+                "tcgen05_acc_producer_state)",
                 code,
             )
             self.assertIn(Tcgen05PersistentProgramIDs._MULTI_TILE_GUARD_TOTAL_VAR, code)
@@ -4231,8 +4290,20 @@ class TestCuteLowerings(unittest.TestCase):
             code,
         )
         self.assertIn(
-            "tcgen05_tma_warp and (cute.arch.make_warp_uniform("
-            "cute.arch.block_idx_in_cluster()) == cutlass.Int32(0))",
+            "if tcgen05_tma_initial_full_tile and tcgen05_tma_warp:\n"
+            "            tcgen05_ab_pipeline.producer_acquire",
+            code,
+        )
+        self.assertIn(
+            "if cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster()) "
+            "== cutlass.Int32(0):\n"
+            "                cute.copy(tma_atom_a",
+            code,
+        )
+        self.assertIn(
+            "if tcgen05_exec_active and "
+            "cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster()) "
+            "== cutlass.Int32(0):",
             code,
         )
         self.assertNotIn("'kind': 'tcgen05_d_tma'", code)
@@ -5615,6 +5686,32 @@ class TestPerKiterTmaBuilders(unittest.TestCase):
         body_src = ast.unparse(ast.Module(body=node.body, type_ignores=[]))
         self.assertNotIn("tma_warp", body_src)
 
+    def test_pipeline_producer_two_cta_gates_copies_not_pipeline_state(
+        self,
+    ) -> None:
+        args = self._make_args(cluster_m=2, is_two_cta=True)
+        node = _build_kloop_pipeline_producer_if(args)
+        self.assertIsInstance(node, ast.If)
+        self.assertEqual(
+            ast.unparse(node.test),
+            "full_tile and tma_warp and next_full_tile",
+        )
+        self.assertEqual(
+            self._stmt_kinds(node.body),
+            [
+                "=producer_try_acquire",
+                "producer_acquire",
+                "=producer_get_barrier",
+                "If",
+                "producer_commit",
+                "advance",
+            ],
+        )
+        copy_gate = node.body[3]
+        self.assertIsInstance(copy_gate, ast.If)
+        self.assertEqual(ast.unparse(copy_gate.test), _TCGEN05_CLUSTER_LEADER_PREDICATE)
+        self.assertEqual(self._stmt_kinds(copy_gate.body), ["copy", "copy"])
+
     def test_non_pipeline_producer_if_can_drop_inline_tma_warp_gate(self) -> None:
         args = self._make_args()
         node = _build_kloop_non_pipeline_producer_if(args, gate_tma_warp=False)
@@ -5656,6 +5753,23 @@ class TestPerKiterTmaBuilders(unittest.TestCase):
         self.assertNotIn("exec_active", body_src)
         self.assertEqual(node.orelse, [])
 
+    def test_pipeline_consumer_two_cta_gates_wait_to_leader(self) -> None:
+        args = self._make_args(cluster_m=2, is_two_cta=True)
+        node = _build_kloop_pipeline_consumer_if(args)
+        self.assertIsInstance(node, ast.If)
+        self.assertEqual(ast.unparse(node.test), "full_tile")
+        self.assertEqual(len(node.body), 1)
+        inner = node.body[0]
+        self.assertIsInstance(inner, ast.If)
+        self.assertEqual(
+            ast.unparse(inner.test),
+            f"exec_active and {_TCGEN05_CLUSTER_LEADER_PREDICATE}",
+        )
+        self.assertEqual(
+            self._stmt_kinds(inner.body),
+            ["=consumer_try_wait", "consumer_wait"],
+        )
+
     def test_pipeline_release_if_predicate_and_body(self) -> None:
         args = self._make_args()
         node = _build_kloop_pipeline_release_if(args)
@@ -5685,6 +5799,45 @@ class TestPerKiterTmaBuilders(unittest.TestCase):
         self.assertIn("ab_consumer_state.advance", body_src)
         self.assertNotIn("exec_active", body_src)
         self.assertEqual(node.orelse, [])
+
+    def test_pipeline_release_two_cta_gates_release_not_state_advance(
+        self,
+    ) -> None:
+        args = self._make_args(cluster_m=2, is_two_cta=True)
+        node = _build_kloop_pipeline_release_if(args)
+        self.assertIsInstance(node, ast.If)
+        self.assertEqual(ast.unparse(node.test), "full_tile")
+        self.assertEqual(self._stmt_kinds(node.body), ["If", "If"])
+        release_gate, advance_gate = node.body
+        self.assertIsInstance(release_gate, ast.If)
+        self.assertEqual(
+            ast.unparse(release_gate.test),
+            f"exec_active and {_TCGEN05_CLUSTER_LEADER_PREDICATE}",
+        )
+        self.assertEqual(self._stmt_kinds(release_gate.body), ["consumer_release"])
+        self.assertIsInstance(advance_gate, ast.If)
+        self.assertEqual(ast.unparse(advance_gate.test), "exec_active")
+        self.assertEqual(self._stmt_kinds(advance_gate.body), ["advance"])
+
+    def test_tcgen05_mma_issue_two_cta_gates_gemm_to_leader(self) -> None:
+        node = _build_tcgen05_mma_issue_stmt(
+            exec_active="exec_active",
+            tiled_mma="tiled_mma",
+            acc_frag="acc_frag",
+            tcgen05_frag_a="tCrA",
+            tcgen05_frag_b="tCrB",
+            mma_stage="mma_stage",
+            k_offset_var="offset_2",
+            k_loop_begin_expr="cutlass.Int32(0)",
+            is_two_cta=True,
+        )
+        self.assertIsInstance(node, ast.If)
+        self.assertEqual(
+            ast.unparse(node.test),
+            f"exec_active and {_TCGEN05_CLUSTER_LEADER_PREDICATE}",
+        )
+        body_src = ast.unparse(ast.Module(body=node.body, type_ignores=[]))
+        self.assertIn("cute.gemm", body_src)
 
     def test_non_pipeline_release_advances_both_states(self) -> None:
         args = self._make_args()
@@ -5873,6 +6026,30 @@ class TestInitialPrefetchTmaBuilder(unittest.TestCase):
         # The non-stage-0 prefetch reads from gA[None, Int32(stage-1)] /
         # gB[None, Int32(stage-1)], not Int32(0).
         self.assertNotIn("None, cutlass.Int32(0)", body_src)
+
+    def test_two_cta_prefetch_gates_copies_not_pipeline_state(self) -> None:
+        args = self._make_args(cluster_m=2, is_two_cta=True)
+        node = _build_initial_prefetch_if(
+            args,
+            full_tile_gates=["initial_full_tile"],
+            k_offset="cutlass.Int32(0)",
+        )
+        self.assertIsInstance(node, ast.If)
+        self.assertEqual(ast.unparse(node.test), "initial_full_tile and tma_warp")
+        self.assertEqual(
+            self._stmt_kinds(node.body),
+            [
+                "producer_acquire",
+                "=producer_get_barrier",
+                "If",
+                "producer_commit",
+                "advance",
+            ],
+        )
+        copy_gate = node.body[2]
+        self.assertIsInstance(copy_gate, ast.If)
+        self.assertEqual(ast.unparse(copy_gate.test), _TCGEN05_CLUSTER_LEADER_PREDICATE)
+        self.assertEqual(self._stmt_kinds(copy_gate.body), ["copy", "copy"])
 
     def test_mcast_mask_asymmetry_matches_per_kiter(self) -> None:
         """A only multicasts in 2-CTA mode; B multicasts on
