@@ -27,7 +27,6 @@ from helion._testing import skipIfXPU
 from helion.autotuner.base_search import PopulationBasedSearch
 from helion.autotuner.base_search import PopulationMember
 from helion.autotuner.benchmark_job import BenchmarkJob
-from helion.autotuner.benchmark_job import RebenchmarkJob
 from helion.autotuner.benchmark_job import _load_args
 from helion.autotuner.benchmark_pool import PoolBenchmarkManager
 from helion.autotuner.benchmark_provider import LocalBenchmarkProvider
@@ -306,27 +305,23 @@ class TestWorkerPoolPrecompile(unittest.TestCase):
             self.assertEqual(job.warmup, 25)
             self.assertEqual(job.rep, 100)
 
-    def test_rebenchmark_uses_worker_pool(self) -> None:
-        # Full-effort rebenchmarking should run on the worker that precompiled the config.
+    def test_rebenchmark_uses_owner_isolated_worker_pool(self) -> None:
+        # Pool rebenchmarking should isolate each candidate on its owner worker.
         class FakePoolManager:
             def __init__(self) -> None:
-                self.worker_index: int | None = None
-                self.job: object | None = None
-                self.timeout: float | None = None
+                self.calls: list[tuple[int, object, float]] = []
 
-            def worker_index_for_fn(self, _fn: object) -> int:
-                return 3
+            def worker_index_for_fn(self, fn: object) -> int:
+                return 3 if fn is fake_fn_a else 4
 
             def run_on(
                 self,
                 worker_index: int,
                 job: object,
                 timeout: float,
-            ) -> list[float]:
-                self.worker_index = worker_index
-                self.job = job
-                self.timeout = timeout
-                return [1.0, 2.0]
+            ) -> float:
+                self.calls.append((worker_index, job, timeout))
+                return float(worker_index)
 
         class FakeLog:
             def warning(self, *_args: object, **_kwargs: object) -> None:
@@ -335,7 +330,10 @@ class TestWorkerPoolPrecompile(unittest.TestCase):
             def debug(self, *_args: object, **_kwargs: object) -> None:
                 pass
 
-        def fake_fn() -> None:
+        def fake_fn_a() -> None:
+            pass
+
+        def fake_fn_b() -> None:
             pass
 
         pool = FakePoolManager()
@@ -358,15 +356,12 @@ class TestWorkerPoolPrecompile(unittest.TestCase):
             module_name=None,
         )
 
-        result = provider.rebenchmark([fake_fn, fake_fn], repeat=7, desc="verify")
+        result = provider.rebenchmark([fake_fn_a, fake_fn_b], repeat=7, desc="verify")
 
-        self.assertEqual(result, [1.0, 2.0])
-        self.assertEqual(pool.worker_index, 3)
-        self.assertIsInstance(pool.job, RebenchmarkJob)
-        assert isinstance(pool.job, RebenchmarkJob)
-        self.assertEqual(pool.job.repeat, 7)
-        self.assertEqual(len(pool.job.fn_specs), 2)
-        self.assertEqual(pool.timeout, 20.0)
+        self.assertEqual(result, [3.0, 4.0])
+        self.assertEqual([call[0] for call in pool.calls], [3, 4])
+        self.assertTrue(all(isinstance(call[1], BenchmarkJob) for call in pool.calls))
+        self.assertTrue(all(call[2] == 10.0 for call in pool.calls))
 
     def test_population_rebenchmark_uses_provider_timings(self) -> None:
         # BaseSearch should use provider rebenchmark timings when available.

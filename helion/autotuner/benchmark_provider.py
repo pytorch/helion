@@ -1213,6 +1213,14 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         if self._precompile_args_path is None:
             return None
 
+        if self._pool_manager is not None:
+            return self.benchmark_isolated(
+                fns,
+                warmup=25,
+                rep=100,
+                desc=desc,
+            )
+
         fn_specs: list[SerializedCompiledFunction] = []
         for fn in fns:
             fn_spec = self._serialize_fn_for_worker(cast("CompiledConfig", fn))
@@ -1296,9 +1304,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                 if match_unrecoverable_runtime_error(e):
                     self.log.warning(f"{desc} sticky CUDA error skipped: {e}")
                 else:
-                    self.log.debug(
-                        f"{desc} subprocess raised: {type(e).__name__}: {e}"
-                    )
+                    self.log.debug(f"{desc} subprocess raised: {type(e).__name__}: {e}")
                 self._autotune_metrics.num_compile_failures += 1
                 timing = inf
             timings.append(float(timing))
