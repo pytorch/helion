@@ -119,7 +119,7 @@ class TestGrid(RefEagerTestBase, TestCase):
         code, result = code_and_output(
             grid_2d_idx_list,
             args,
-            block_sizes=[64, 32, 16],
+            block_sizes=[64, 16, 16],
             indexing="tensor_descriptor",
         )
         torch.testing.assert_close(result, grid_2d_pytorch(args[0], args[1]))
