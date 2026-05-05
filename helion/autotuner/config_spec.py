@@ -454,7 +454,9 @@ class ConfigSpec:
         assert choices, "tcgen05_num_epi_warps validation must allow at least one value"
         self._tcgen05_num_epi_warps_validation_choices = choices
 
-    def narrow_tcgen05_autotune_to_validated_configs(self) -> None:
+    def narrow_tcgen05_autotune_to_validated_configs(
+        self, *, allow_persistent_pid_types: bool = False
+    ) -> None:
         """Narrow the tcgen05 autotune search to combinations validated on B200.
 
         Three structural limitations bound the safe autotune space today.
@@ -466,20 +468,18 @@ class ConfigSpec:
         num_epi_warps restriction additionally tightens validation
         because the underlying failure mode is silent wrong output.
 
-        * **Persistent autotune gating.** Static full-tile tcgen05
-          persistent kernels now use role-local loops and have multi-tile
-          runtime coverage. Autotune still explores shapes/block sizes that
-          can fall back to the legacy non-role-local persistent path, which
-          remains guarded because partial multi-tile kernels launch-fail or
-          miscompute. Drop ``persistent_blocked`` and
-          ``persistent_interleaved`` from the autotune pid_type search until
-          the search space can admit only validated single-root static
-          full-tile role-local ``cluster_m=1`` configs. Fixing the legacy
-          fallback is separate cleanup, not the next autotune re-entry
-          criterion. The host-side guard
-          (``Tcgen05PersistentProgramIDs._emit_host_multi_tile_guard``)
-          converts explicit unsafe user configs into a loud
-          ``RuntimeError``.
+        * **Persistent autotune gating.** Static full-tile single-root
+          tcgen05 persistent kernels now use role-local loops and have
+          multi-tile runtime coverage for ``cluster_m=1``. Callers may pass
+          ``allow_persistent_pid_types=True`` only after proving every
+          candidate M/N/K block size in the search space divides the static
+          problem extent. Otherwise, drop ``persistent_blocked`` and
+          ``persistent_interleaved`` from the autotune pid_type search so
+          partial-tile, multi-root, or otherwise unvalidated persistent
+          configs cannot be sampled. Explicit unsafe user configs still go
+          through the host-side guard
+          (``Tcgen05PersistentProgramIDs._emit_host_multi_tile_guard``),
+          which raises a loud ``RuntimeError``.
 
         * **2-CTA cluster.** ``cluster_m=2`` (2-CTA tcgen05 instructions)
           currently CUDA-launch-fails on B200 across the matmul block-size
@@ -504,8 +504,9 @@ class ConfigSpec:
           actual unblocker for item 2 (multi-warp epilogue with
           c_pipeline SMEM ring + TMA bulk store).
         """
-        self.disallow_pid_type("persistent_blocked")
-        self.disallow_pid_type("persistent_interleaved")
+        if not allow_persistent_pid_types:
+            self.disallow_pid_type("persistent_blocked")
+            self.disallow_pid_type("persistent_interleaved")
         self.restrict_tcgen05_cluster_m_search((1,))
         self.restrict_tcgen05_num_epi_warps_search((4,))
         self.restrict_tcgen05_num_epi_warps_validation((4,))
@@ -1100,6 +1101,11 @@ class ConfigSpec:
             if self.cute_tcgen05_search_enabled:
                 fields["l2_groupings"] = self.l2_groupings
                 fields.update(self._tcgen05_optional_fragments(for_search=True))
+                if (
+                    self.supports_config_key("pid_type")
+                    and len(self.allowed_pid_types) > 1
+                ):
+                    fields["pid_type"] = EnumFragment(self.allowed_pid_types)
             if self.supports_config_key("num_threads"):
                 fields["num_threads"] = self.num_threads
             fields.update(self.user_defined_tunables)
