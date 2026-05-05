@@ -130,6 +130,16 @@ def pallas_sum_reduce_dim0(x: torch.Tensor) -> torch.Tensor:
 
 
 @helion.kernel(backend="pallas", static_shapes=True)
+def pallas_new_zeros_full_dim(x: torch.Tensor) -> torch.Tensor:
+    m, n = x.size()
+    out = torch.empty_like(x)
+    for tile_m in hl.tile(m):
+        zeros = x.new_zeros([n], dtype=x.dtype)
+        out[tile_m, :] = x[tile_m, :] + zeros[None, :]
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
 def pallas_sum_reduce_middle(x: torch.Tensor) -> torch.Tensor:
     b, _n, m = x.size()
     out = torch.empty([b, m], dtype=x.dtype, device=x.device)
@@ -487,6 +497,24 @@ class TestPallas(TestCase):
         code, result = code_and_output(pallas_inplace_add, (x, y), block_size=1024)
         # x should be mutated in place
         torch.testing.assert_close(x, expected)
+
+    def test_new_zeros_non_pow2_full_dim(self) -> None:
+        """Tensor factories inside a tile loop must size buffers to the exact
+        dim, not next_power_of_2, when the dim is non-power-of-2.
+
+        Regression test: a 1D ``new_zeros([n])`` allocated inside ``hl.tile``
+        used to be silently rounded up to ``next_power_of_2(n)`` for all
+        backends. On Pallas this produced scratch shapes that did not match
+        the actual tensor extent, raising a JAX broadcast error like
+        ``add got incompatible shapes for broadcasting: (block, n), (1, pow2)``
+        at trace time.
+        """
+        n = 10240  # not a power of 2; next_power_of_2(10240) == 16384
+        x = torch.randn(4096, n, device=DEVICE, dtype=torch.bfloat16)
+        code, result = code_and_output(pallas_new_zeros_full_dim, (x,))
+        torch.testing.assert_close(result, x)
+        # Generated code should reference the exact dim, not its pow-2 padding.
+        self.assertNotIn("16384", code)
 
     def test_pointwise_mul(self) -> None:
         args = (
