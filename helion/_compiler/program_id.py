@@ -836,6 +836,15 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             dims[0] = f"(({dims[0]}) + {cluster_m} - 1) // {cluster_m}"
         return " * ".join(f"({dim})" for dim in dims[:3])
 
+    def _tcgen05_max_persistent_work_clusters_expr(self, cluster_m: int) -> str:
+        """Return the launch-grid persistent work-cluster capacity."""
+        if cluster_m == 1:
+            return self.grid_size_expr
+        # ``grid_size_expr`` is expressed in CTAs. CtaGroup.TWO currently
+        # uses cluster_n=1, so dividing the CTA budget by cluster_m matches
+        # the scheduler persistent work-cluster capacity.
+        return f"max(1, ({self.grid_size_expr}) // {cluster_m})"
+
     def codegen_grid(self) -> ast.AST:
         # Tcgen05 persistent kernels, including guarded legacy fallback
         # shapes, use CUTLASS' z-indexed scheduler instead of the parent
@@ -843,15 +852,9 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         # because this grid is derived from this case's pid_info only.
         cluster_m = self._tcgen05_cluster_m()
         total_clusters = self._tcgen05_num_work_clusters_expr(is_device=False)
-        if cluster_m == 1:
-            max_persistent_clusters = self.grid_size_expr
-        else:
-            # ``grid_size_expr`` is expressed in CTAs. A tcgen05 scheduler
-            # work cluster owns ``cluster_m`` CTAs along M, so z may contain
-            # at most the CTA budget divided by that cluster size. Explicit
-            # cluster_m > 1 configs still codegen, but multi-tile runtime is
-            # guarded until that lowering is validated.
-            max_persistent_clusters = f"max(1, ({self.grid_size_expr}) // {cluster_m})"
+        max_persistent_clusters = self._tcgen05_max_persistent_work_clusters_expr(
+            cluster_m
+        )
         return expr_from_string(
             f"({cluster_m}, 1, min(({total_clusters}), ({max_persistent_clusters})))"
         )
@@ -1306,35 +1309,38 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
     # runtime with the bound total-tile count.
     _MULTI_TILE_GUARD_MESSAGE: ClassVar[str] = (
         "Helion CuTe persistent + tcgen05 currently supports multi-tile "
-        "execution only for single-root static full tiles with "
-        "tcgen05_cluster_m=1. Partial K/M/N tile fallback shapes, "
-        "multi-root kernels, and unvalidated cluster_m settings can "
-        "produce wrong output, hang, or launch-fail. The kernel was launched "
+        "execution only for validated single-root static full tiles: "
+        "tcgen05_cluster_m=1 or non-recycling CtaGroup.TWO "
+        "tcgen05_cluster_m=2. Partial K/M/N tile fallback shapes, "
+        "multi-root kernels, scheduler-recycling CtaGroup.TWO kernels, "
+        "and unvalidated cluster_m settings can produce wrong output, hang, "
+        "or launch-fail. The kernel was launched "
         "with total_tiles=%d, which is outside the validated persistent "
         "scheduler set for this path. "
         'Use a non-persistent pid_type (e.g. "flat"), pick a single-root '
-        "static-full-tile kernel with tcgen05_cluster_m=1, or pick the "
-        "validated single-root static-full CtaGroup.TWO shape with block "
-        "sizes that keep total_tiles == 1."
+        "static-full-tile kernel with tcgen05_cluster_m=1, or pick a "
+        "validated single-root static-full CtaGroup.TWO shape whose work "
+        "tiles fit within the non-recycling persistent cluster capacity."
     )
 
     def _emit_host_multi_tile_guard(
         self,
         device_function: DeviceFunction,
         host_total_pids_expr: str | None = None,
-        guard_threshold: int = 1,
+        guard_threshold: int | str = 1,
     ) -> None:
         """Emit a host-side guard against multi-tile execution.
 
         The single-root static full-tile role-local path has multi-tile
-        runtime coverage only for ``tcgen05_cluster_m == 1``. Legacy
-        non-role-local tcgen05 persistent kernels, multi-root kernels,
-        cluster_m > 1 fallback configs, and cluster_m > 1 multi-tile configs
-        still hit, or lack coverage for, wrong-output / hang / launch-failure
-        modes, so this guard remains for those paths. Single-tile cluster_m=1
-        fallback shapes and the validated static-full CtaGroup.TWO shape
-        continue to run because they do not exercise scheduler tile-to-tile
-        transitions.
+        runtime coverage for ``tcgen05_cluster_m == 1`` and for static-full
+        CtaGroup.TWO shapes that fit inside one persistent scheduler wave.
+        Legacy non-role-local tcgen05 persistent kernels, multi-root kernels,
+        cluster_m > 1 fallback configs, and cluster_m > 1 scheduler-recycling
+        configs still hit, or lack coverage for, wrong-output / hang /
+        launch-failure modes, so this guard remains for those paths.
+        Single-tile cluster_m=1 fallback shapes and validated static-full
+        CtaGroup.TWO non-recycling shapes continue to run because they do not
+        recycle a CTA through multiple work tiles.
 
         The autotuner narrowing in
         ``ConfigSpec.narrow_tcgen05_autotune_to_validated_configs`` removes
@@ -1343,13 +1349,14 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         explicit user configs that bypass autotune.
 
         The threshold is intentionally ``total_tiles > 1`` for guarded
-        validated single-root paths. For cluster_m > 1 fallback and multi-tile
-        shapes this converts known launch, timeout, and wrong-output failures
-        into a host error while allowing the validated single-output-tile
-        CtaGroup.TWO path only when role-local static-full codegen was
-        extracted. Multi-root kernels use ``total_tiles > 0`` because the
-        scheduler grid is derived from only the first root case; even one tile
-        in a later case is unsafe.
+        cluster_m=1 single-root fallback paths. For static-full CtaGroup.TWO,
+        the threshold is the same persistent work-cluster capacity used by the
+        launch grid, so only non-recycling multi-tile shapes are admitted. For
+        cluster_m > 1 fallback and scheduler-recycling shapes this converts
+        known launch, timeout, and wrong-output failures into a host error.
+        Multi-root kernels use ``total_tiles > 0`` because the scheduler grid
+        is derived from only the first root case; even one tile in a later case
+        is unsafe.
         """
         host_total_pids = host_total_pids_expr
         if host_total_pids is None:
@@ -1425,14 +1432,24 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             # Retarget even for guarded cluster_m>1 / multi-root codegen so
             # compile-only inspection still sees the role-local scheduler shape.
             self._retarget_tcgen05_shared_scheduler_to_exec(layout)
-        allow_single_tile_guarded_path = not is_multi_root and (
-            layout.cluster_m == 1 or (layout.cluster_m == 2 and full_role_local_body)
-        )
         if not use_validated_role_local_body:
+            guard_threshold: int | str
+            if is_multi_root:
+                guard_threshold = 0
+            elif layout.cluster_m == 1:
+                guard_threshold = 1
+            elif layout.cluster_m == 2 and full_role_local_body:
+                guard_threshold = self._tcgen05_max_persistent_work_clusters_expr(
+                    layout.cluster_m
+                )
+            else:
+                # cluster_m > 2 is not validated; cluster_m=2 without the
+                # full role-local body uses the strict guard.
+                guard_threshold = 0
             self._emit_host_multi_tile_guard(
                 device_function,
                 host_guard_total_pids,
-                guard_threshold=1 if allow_single_tile_guarded_path else 0,
+                guard_threshold=guard_threshold,
             )
 
         setup: list[ast.stmt] = []
@@ -2316,11 +2333,12 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
 
         **Current limitation.** The TMA-load, MMA-exec, and TMA-store
         epilogue roles are extracted today. Single-root static full-tile
-        multi-tile correctness is validated for ``cluster_m == 1``. Partial
-        fallback shapes, multi-root ForEach kernels, and cluster_m > 1
-        configs remain guarded for runtime execution, and autotune keeps
-        cluster_m=2 out of the search until the G3 ownership path is
-        runtime-correct and benchmarked.
+        multi-tile correctness is validated for ``cluster_m == 1`` and for
+        non-recycling static-full CtaGroup.TWO ``cluster_m == 2`` shapes.
+        Partial fallback shapes, multi-root ForEach kernels, and
+        scheduler-recycling ``cluster_m > 1`` configs remain guarded for
+        runtime execution, and autotune keeps cluster_m=2 out of the search
+        until the G3 ownership path is runtime-correct and benchmarked.
         """
         if build_shared_tile_body:
             # Wrap the shared body's tagged-removed view in the standard

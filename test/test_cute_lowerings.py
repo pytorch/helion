@@ -1449,7 +1449,7 @@ class TestCuteLowerings(unittest.TestCase):
                 bound(*args)
 
     def test_tcgen05_persistent_cluster_m2_multi_tile_runtime_guard(self) -> None:
-        """Static full-tile cluster_m=2 remains guarded for multi-tile shapes."""
+        """CtaGroup.ONE cluster_m=2 fallback remains guarded."""
 
         from helion._compiler.cute.mma_support import get_cute_mma_support
 
@@ -1560,9 +1560,9 @@ class TestCuteLowerings(unittest.TestCase):
     ) -> None:
         """Single-output-tile CtaGroup.TWO codegen runs correctly.
 
-        Multi-tile cluster_m=2 is still guarded separately, but the
-        single-output-tile path now has runtime coverage for the AB
-        TMA/UMMA ownership and tail-drain sequence.
+        Scheduler-recycling cluster_m=2 is still guarded separately, but
+        this path now has runtime coverage for the AB TMA/UMMA ownership
+        and tail-drain sequence.
         """
 
         from helion._compiler.cute.mma_support import get_cute_mma_support
@@ -1814,12 +1814,175 @@ class TestCuteLowerings(unittest.TestCase):
             )
             self.assertIn(Tcgen05PersistentProgramIDs._MULTI_TILE_GUARD_TOTAL_VAR, code)
             self.assertIn(
-                f"if {Tcgen05PersistentProgramIDs._MULTI_TILE_GUARD_TOTAL_VAR} > 1:",
+                f"if {Tcgen05PersistentProgramIDs._MULTI_TILE_GUARD_TOTAL_VAR} > "
+                "max(1, _NUM_SM // 2):",
                 code,
             )
             out = bound(*args)
         expected = args[0] @ args[1]
         torch.testing.assert_close(out, expected, atol=2e-1, rtol=1e-2)
+
+    def test_tcgen05_persistent_cluster_m2_two_cta_multi_tile_runtime_correctness(
+        self,
+    ) -> None:
+        """Small multi-tile CtaGroup.TWO codegen runs correctly."""
+
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_cluster_m2_two_cta_multi_tile(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        from helion._compiler.program_id import Tcgen05PersistentProgramIDs
+
+        for pid_type in ("persistent_blocked", "persistent_interleaved"):
+            with self.subTest(pid_type=pid_type):
+                torch.manual_seed(0)
+                args = (
+                    torch.randn(512, 32, device=DEVICE, dtype=torch.bfloat16),
+                    torch.randn(32, 512, device=DEVICE, dtype=torch.bfloat16),
+                )
+                with patch_cute_mma_support():
+                    bound = cute_matmul_cluster_m2_two_cta_multi_tile.bind(args)
+                    bound.env.config_spec.cute_tcgen05_search_enabled = True
+                    cfg = _make_tcgen05_persistent_config(
+                        block_sizes=[256, 256, 16],
+                        l2_groupings=[4],
+                        pid_type=pid_type,
+                        tcgen05_cluster_m=2,
+                    )
+                    bound.set_config(cfg)
+                    code = bound.to_triton_code(cfg)
+                    self.assertIn("cute.nvgpu.tcgen05.CtaGroup.TWO", code)
+                    self.assertIn("while tcgen05_role_local_0_work_tile", code)
+                    self.assertIn(
+                        "tcgen05_role_local_0_tile_sched.advance_to_next_work()",
+                        code,
+                    )
+                    self.assertIn(
+                        Tcgen05PersistentProgramIDs._MULTI_TILE_GUARD_TOTAL_VAR,
+                        code,
+                    )
+                    self.assertIn(
+                        f"if {Tcgen05PersistentProgramIDs._MULTI_TILE_GUARD_TOTAL_VAR} > "
+                        "max(1, _NUM_SM // 2):",
+                        code,
+                    )
+                    out = bound(*args)
+                expected = args[0] @ args[1]
+                torch.testing.assert_close(out, expected, atol=2e-1, rtol=1e-2)
+
+    def test_tcgen05_persistent_cluster_m2_two_cta_guard_uses_num_sm_multiplier(
+        self,
+    ) -> None:
+        """CtaGroup.TWO non-recycling guard follows the actual launch grid."""
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_cluster_m2_two_cta_multiplier_guard(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        args = (
+            torch.randn(512, 32, device=DEVICE, dtype=torch.bfloat16),
+            torch.randn(32, 512, device=DEVICE, dtype=torch.bfloat16),
+        )
+        from helion._compiler.program_id import Tcgen05PersistentProgramIDs
+
+        with patch_cute_mma_support():
+            bound = cute_matmul_cluster_m2_two_cta_multiplier_guard.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            cfg = _make_tcgen05_persistent_config(
+                block_sizes=[256, 256, 16],
+                l2_groupings=[4],
+                num_sm_multiplier=2,
+                pid_type="persistent_blocked",
+                tcgen05_cluster_m=2,
+            )
+            bound.set_config(cfg)
+            code = bound.to_triton_code(cfg)
+            self.assertIn("cute.nvgpu.tcgen05.CtaGroup.TWO", code)
+            self.assertIn(
+                f"if {Tcgen05PersistentProgramIDs._MULTI_TILE_GUARD_TOTAL_VAR} > "
+                "max(1, _NUM_SM * 2 // 2):",
+                code,
+            )
+            self.assertNotIn(
+                f"if {Tcgen05PersistentProgramIDs._MULTI_TILE_GUARD_TOTAL_VAR} > "
+                "max(1, _NUM_SM // 2):",
+                code,
+            )
+
+    def test_tcgen05_persistent_cluster_m2_two_cta_recycling_runtime_guard(
+        self,
+    ) -> None:
+        """CtaGroup.TWO remains guarded once persistent CTAs recycle work."""
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_cluster_m2_two_cta_recycling(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        args = (
+            torch.randn(4096, 32, device=DEVICE, dtype=torch.bfloat16),
+            torch.randn(32, 2048, device=DEVICE, dtype=torch.bfloat16),
+        )
+        from helion._compiler.program_id import Tcgen05PersistentProgramIDs
+
+        with patch_cute_mma_support():
+            bound = cute_matmul_cluster_m2_two_cta_recycling.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            cfg = _make_tcgen05_persistent_config(
+                block_sizes=[256, 256, 16],
+                l2_groupings=[4],
+                pid_type="persistent_blocked",
+                tcgen05_cluster_m=2,
+            )
+            bound.set_config(cfg)
+            code = bound.to_triton_code(cfg)
+            self.assertIn("cute.nvgpu.tcgen05.CtaGroup.TWO", code)
+            self.assertIn("while tcgen05_role_local_0_work_tile", code)
+            self.assertIn(Tcgen05PersistentProgramIDs._MULTI_TILE_GUARD_TOTAL_VAR, code)
+            self.assertIn(
+                f"if {Tcgen05PersistentProgramIDs._MULTI_TILE_GUARD_TOTAL_VAR} > "
+                "max(1, _NUM_SM // 2):",
+                code,
+            )
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "supports multi-tile execution only",
+            ):
+                bound(*args)
 
     def test_tcgen05_flat_cluster_m2_two_cta_rejected(self) -> None:
         """Flat CtaGroup.TWO configs do not have the persistent host guard."""
