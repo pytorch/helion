@@ -865,8 +865,18 @@ class SubscriptIndexing(NamedTuple):
                 slice_size = compute_slice_size(k, size)
 
                 if slice_size != 1:
-                    rdim = env.allocate_reduction_dimension(slice_size)
-                    output_size.append(rdim.var)
+                    if (
+                        isinstance(slice_size, int)
+                        and not env.backend.pad_factory_tensors_to_power_of_2
+                    ):
+                        # On backends that don't pad factory ops to
+                        # power-of-2, keep concrete dims concrete so shape
+                        # inference can prove equality with concretely-sized
+                        # buffers (matches _device_indexing_size).
+                        output_size.append(slice_size)
+                    else:
+                        rdim = env.allocate_reduction_dimension(slice_size)
+                        output_size.append(rdim.var)
                 else:
                     output_size.append(1)
             elif isinstance(k, torch.Tensor):

@@ -1209,7 +1209,10 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
 
     @xfailIfCute("CuTe LayerNorm backward example still returns incorrect results")
-    @xfailIfPallas("InductorLoweringError")
+    @xfailIfPallas(
+        "block_sizes=[32, 1] violates TPU 128-alignment for 1D fp32 mean/rstd; "
+        "shapes also have dim < 128 (escape hatch needs full-dim coverage)"
+    )
     @skipIfA10G("accuracy check fails on A10G GPUs")
     def test_layernorm_bwd(self):
         """Test combined backward pass for layer norm with bias, including regression coverage."""
@@ -1278,6 +1281,53 @@ class TestExamples(RefEagerTestBase, TestCase):
                 rtol=rtol,
                 atol=atol,
             )
+
+    def test_layernorm_bwd_non_pow2_dim(self):
+        """layer_norm_bwd traces and runs when the feature dim is not a power of 2.
+
+        Regression test: full-dim slices like ``x[mb, :]`` used to allocate a
+        fresh unbacked symbol for the trailing extent, while host-side
+        accumulators allocated via ``new_zeros([n])`` stayed concrete. The two
+        sides could not be unified at trace time, raising a shape-broadcast
+        error at ``grad_w_acc += torch.sum(...)``.
+        """
+        if _get_backend() != "pallas":
+            self.skipTest(
+                "Pallas-only regression: u1 mismatch on non-pow2 trailing dim"
+            )
+
+        batch_size, dim = 512, 384  # dim=384 is not a power of 2
+        eps = 1e-4
+        torch.manual_seed(0)
+        x = -2.3 + 0.5 * torch.randn([batch_size, dim], device=DEVICE, dtype=HALF_DTYPE)
+        weight = torch.randn([dim], device=DEVICE, dtype=HALF_DTYPE)
+        bias = torch.randn([dim], device=DEVICE, dtype=HALF_DTYPE)
+        grad_out = torch.randn([batch_size, dim], device=DEVICE, dtype=HALF_DTYPE)
+
+        x_fp32 = x.to(torch.float32)
+        mean = x_fp32.mean(dim=-1)
+        rstd = torch.rsqrt(x_fp32.var(dim=-1, unbiased=False) + eps)
+
+        x_ref = x.clone().detach().requires_grad_(True)
+        w_ref = weight.clone().detach().requires_grad_(True)
+        b_ref = bias.clone().detach().requires_grad_(True)
+        torch.nn.functional.layer_norm(x_ref, [dim], w_ref, b_ref, eps).backward(
+            grad_out
+        )
+        expected = (x_ref.grad.detach(), w_ref.grad.detach(), b_ref.grad.detach())
+
+        # Tolerances are loose because the M-axis reduction in bf16 is
+        # inherently noisy at this batch size; this test guards trace-time
+        # shape inference for non-pow2 trailing dims, not numerical fidelity.
+        check_example(
+            "layer_norm",
+            (grad_out, x, mean, rstd, weight, True),
+            expected,
+            fn_name="layer_norm_bwd",
+            block_sizes=[128, 128],
+            rtol=1.0,
+            atol=1.0,
+        )
 
     def test_softmax_bwd(self):
         m, n = 2048, 2048
