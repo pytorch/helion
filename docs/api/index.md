@@ -87,6 +87,7 @@ runtime
    full
    arange
    rand
+   rand4x
    randint
    subscript
    split

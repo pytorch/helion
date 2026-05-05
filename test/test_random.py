@@ -7,6 +7,7 @@ import unittest
 import torch
 
 import helion
+from helion._compiler.rng_utils import philox_rand4x_ref
 from helion._compiler.rng_utils import philox_rand_ref
 from helion._compiler.rng_utils import philox_randint_ref
 from helion._testing import DEVICE
@@ -140,6 +141,26 @@ if triton is not None and tl is not None:
         tl.store(out_ptr + idx, values, mask=mask)
 
     @triton.jit
+    def _triton_rand4x_from_offsets(
+        seed,
+        offsets_ptr,
+        out0_ptr,
+        out1_ptr,
+        out2_ptr,
+        out3_ptr,
+        n_elements,
+        BLOCK: tl.constexpr,
+    ):
+        idx = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        mask = idx < n_elements
+        offsets = tl.load(offsets_ptr + idx, mask=mask, other=0)
+        r0, r1, r2, r3 = tl.rand4x(seed, offsets)
+        tl.store(out0_ptr + idx, r0, mask=mask)
+        tl.store(out1_ptr + idx, r1, mask=mask)
+        tl.store(out2_ptr + idx, r2, mask=mask)
+        tl.store(out3_ptr + idx, r3, mask=mask)
+
+    @triton.jit
     def _triton_randint_from_offsets(
         seed,
         offsets_ptr,
@@ -166,6 +187,26 @@ if triton is not None and tl is not None:
         )
         return out
 
+    def _triton_rand4x_reference(
+        seed: int, offsets: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        n = offsets.numel()
+        out0 = torch.empty(n, device=offsets.device, dtype=torch.float32)
+        out1 = torch.empty(n, device=offsets.device, dtype=torch.float32)
+        out2 = torch.empty(n, device=offsets.device, dtype=torch.float32)
+        out3 = torch.empty(n, device=offsets.device, dtype=torch.float32)
+        _triton_rand4x_from_offsets[(triton.cdiv(n, 256),)](
+            seed,
+            offsets,
+            out0,
+            out1,
+            out2,
+            out3,
+            n,
+            BLOCK=256,
+        )
+        return out0, out1, out2, out3
+
     def _triton_randint_reference(
         seed: int,
         offsets: torch.Tensor,
@@ -187,6 +228,11 @@ if triton is not None and tl is not None:
 else:
 
     def _triton_rand_reference(seed: int, offsets: torch.Tensor) -> torch.Tensor:
+        raise unittest.SkipTest("requires Triton")
+
+    def _triton_rand4x_reference(
+        seed: int, offsets: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         raise unittest.SkipTest("requires Triton")
 
     def _triton_randint_reference(
@@ -593,6 +639,39 @@ class TestRandom(RefEagerTestBase, TestCase):
         expected_b = _triton_rand_reference(seed, ref_offsets_b).reshape_as(x)
         _assert_bitwise_equal_float(self, a, expected_a)
         _assert_bitwise_equal_float(self, b, expected_b)
+
+    @skipIfRefEager("compile_config is not supported in ref eager mode")
+    def test_hl_rand4x_dropout_pattern(self):
+        """Generate three sibling dropout masks per element with a single rand4x call."""
+
+        @helion.kernel(static_shapes=False, autotune_effort="none")
+        def triple_dropout_kernel(x: torch.Tensor, seed: int) -> torch.Tensor:
+            m = x.size(0)
+            output = torch.zeros((3, m), device=x.device, dtype=x.dtype)
+            for tile_m in hl.tile(m):
+                idx = hl.tile_index(tile_m).to(torch.int64)
+                r0, r1, r2, _ = hl.rand4x(seed, idx)
+                output[0, tile_m] = (r0 > 0.1).to(x.dtype) * x[tile_m]
+                output[1, tile_m] = (r1 > 0.2).to(x.dtype) * x[tile_m]
+                output[2, tile_m] = (r2 > 0.3).to(x.dtype) * x[tile_m]
+            return output
+
+        x = torch.ones(256, device=DEVICE, dtype=torch.float32)
+        seed = 9999
+        code, compiled = _compile_once(
+            triple_dropout_kernel, (x, seed), block_sizes=[64]
+        )
+        out = compiled(x, seed)
+
+        ref_offsets = torch.arange(x.numel(), device=DEVICE, dtype=torch.int64)
+        r0, r1, r2, _ = _triton_rand4x_reference(seed, ref_offsets)
+        expected_0 = ((r0 > 0.1).to(x.dtype) * x).reshape(x.shape)
+        expected_1 = ((r1 > 0.2).to(x.dtype) * x).reshape(x.shape)
+        expected_2 = ((r2 > 0.3).to(x.dtype) * x).reshape(x.shape)
+        _assert_bitwise_equal_float(self, out[0], expected_0)
+        _assert_bitwise_equal_float(self, out[1], expected_1)
+        _assert_bitwise_equal_float(self, out[2], expected_2)
+        _assert_uses_philox(self, code)
 
     def test_hl_randint_1d(self):
         """Test hl.randint with 1D output."""
@@ -1115,6 +1194,80 @@ class TestRandomPhiloxParity(TestCase):
         )
         compiled_out = compiled(x, seed)
         ref_out = rand_offsets_kernel_ref(x, seed)
+        _assert_bitwise_equal_float(self, compiled_out, ref_out)
+
+    def test_hl_rand4x_matches_triton_reference(self):
+        @helion.kernel(static_shapes=False, autotune_effort="none")
+        def rand4x_kernel(x: torch.Tensor, seed: int) -> torch.Tensor:
+            (m,) = x.shape
+            out = torch.zeros((4, m), device=x.device, dtype=torch.float32)
+            for tile_m in hl.tile(m):
+                idx = hl.tile_index(tile_m).to(torch.int64)
+                r0, r1, r2, r3 = hl.rand4x(seed, idx)
+                out[0, tile_m] = r0
+                out[1, tile_m] = r1
+                out[2, tile_m] = r2
+                out[3, tile_m] = r3
+            return out
+
+        x = torch.empty(123, device=DEVICE, dtype=torch.float32)
+        seed = 271828
+        code, out = code_and_output(rand4x_kernel, (x, seed), block_sizes=[16])
+        offsets = torch.arange(x.numel(), device=DEVICE, dtype=torch.int64)
+        e0, e1, e2, e3 = _triton_rand4x_reference(seed, offsets)
+        _assert_bitwise_equal_float(self, out[0], e0.reshape_as(x))
+        _assert_bitwise_equal_float(self, out[1], e1.reshape_as(x))
+        _assert_bitwise_equal_float(self, out[2], e2.reshape_as(x))
+        _assert_bitwise_equal_float(self, out[3], e3.reshape_as(x))
+        _assert_uses_philox(self, code)
+
+    def test_hl_rand4x_ref_matches_triton(self):
+        seed = 54321
+        offsets = torch.arange(96, device=DEVICE, dtype=torch.int64) * 4
+        t0, t1, t2, t3 = _triton_rand4x_reference(seed, offsets)
+        r0, r1, r2, r3 = philox_rand4x_ref(seed, offsets)
+        _assert_bitwise_equal_float(self, t0, r0)
+        _assert_bitwise_equal_float(self, t1, r1)
+        _assert_bitwise_equal_float(self, t2, r2)
+        _assert_bitwise_equal_float(self, t3, r3)
+
+    @skipIfRefEager("compile_config is not supported in ref eager mode")
+    def test_hl_rand4x_ref_mode_matches_compiled(self):
+        @helion.kernel(static_shapes=False, autotune_effort="none")
+        def rand4x_kernel(x: torch.Tensor, seed: int) -> torch.Tensor:
+            (m,) = x.shape
+            out = torch.zeros((4, m), device=x.device, dtype=torch.float32)
+            for tile_m in hl.tile(m):
+                idx = hl.tile_index(tile_m).to(torch.int64)
+                r0, r1, r2, r3 = hl.rand4x(seed, idx)
+                out[0, tile_m] = r0
+                out[1, tile_m] = r1
+                out[2, tile_m] = r2
+                out[3, tile_m] = r3
+            return out
+
+        @helion.kernel(
+            static_shapes=False,
+            autotune_effort="none",
+            ref_mode=helion.RefMode.EAGER,
+        )
+        def rand4x_kernel_ref(x: torch.Tensor, seed: int) -> torch.Tensor:
+            (m,) = x.shape
+            out = torch.zeros((4, m), device=x.device, dtype=torch.float32)
+            for tile_m in hl.tile(m):
+                idx = hl.tile_index(tile_m).to(torch.int64)
+                r0, r1, r2, r3 = hl.rand4x(seed, idx)
+                out[0, tile_m] = r0
+                out[1, tile_m] = r1
+                out[2, tile_m] = r2
+                out[3, tile_m] = r3
+            return out
+
+        x = torch.empty(96, device=DEVICE, dtype=torch.float32)
+        seed = 999
+        _code, compiled = _compile_once(rand4x_kernel, (x, seed), block_sizes=[16])
+        compiled_out = compiled(x, seed)
+        ref_out = rand4x_kernel_ref(x, seed)
         _assert_bitwise_equal_float(self, compiled_out, ref_out)
 
 

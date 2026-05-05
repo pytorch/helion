@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import operator
 from typing import TYPE_CHECKING
 from typing import cast
 
@@ -18,6 +19,7 @@ from .._compiler.rng_utils import PHILOX_ROUNDS
 from .._compiler.rng_utils import TWO_PI
 from .._compiler.rng_utils import UINT32_TO_UNIFORM_SCALE
 from .._compiler.rng_utils import codegen_rng_seed_expr
+from .._compiler.rng_utils import philox_rand4x_ref
 from .._compiler.rng_utils import philox_rand_ref
 from .._compiler.rng_utils import philox_randint_ref
 from ..exc import NotInsideKernel
@@ -33,7 +35,7 @@ if TYPE_CHECKING:
     from .._compiler.inductor_lowering import CodegenState
     from .tile_interface import TileInterface
 
-__all__ = ["rand", "randint"]
+__all__ = ["rand", "rand4x", "randint"]
 
 _ShapeDim = int | torch.SymInt
 _ArgDesc = tuple[bool, object]
@@ -333,6 +335,19 @@ def decompose_rand(
     return _philox_rand_from_seed_and_offset(seed, offsets)
 
 
+def decompose_rand4x(
+    seed: int | torch.SymInt | torch.Tensor,
+    offsets: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    c0, c1, c2, c3 = _philox_uint32x4(seed, offsets)
+    return (
+        _uint32_to_uniform_float(c0),
+        _uint32_to_uniform_float(c1),
+        _uint32_to_uniform_float(c2),
+        _uint32_to_uniform_float(c3),
+    )
+
+
 def decompose_randint(
     shape: list[int | torch.SymInt],
     *,
@@ -496,7 +511,7 @@ def _copy_rewrite_subgraph(
     *,
     before: Node,
     runtime_args: list[Node],
-) -> Node:
+) -> Node | tuple[Node, ...]:
     helper_placeholders = list(helper_graph.find_nodes(op="placeholder"))
     helper_getattrs = list(helper_graph.find_nodes(op="get_attr"))
     if helper_getattrs:
@@ -508,6 +523,9 @@ def _copy_rewrite_subgraph(
             helper_graph,
             dict(zip(helper_placeholders, runtime_args, strict=True)),
         )
+    if isinstance(copied, tuple):
+        assert all(isinstance(item, Node) for item in copied)
+        return cast("tuple[Node, ...]", copied)  # pyrefly: ignore[redundant-cast]
     assert isinstance(copied, Node)
     return copied
 
@@ -515,9 +533,9 @@ def _copy_rewrite_subgraph(
 def _trace_rewrite_subgraph(
     graph: torch.fx.Graph,
     node: Node,
-    helper: Callable[..., torch.Tensor],
+    helper: Callable[..., object],
     descriptors: list[_ArgDesc],
-) -> Node:
+) -> Node | tuple[Node, ...]:
     from .._compiler.device_ir import _make_fx
 
     runtime_args, example_args = _rewrite_runtime_args(descriptors)
@@ -583,6 +601,7 @@ def _resolve_offsets_desc(
 def _random_rewrite_nodes(graph: torch.fx.Graph) -> list[Node]:
     targets = (
         rand,
+        rand4x,
         randint,
         torch.ops.aten.rand.default,
         torch.ops.aten.randn.default,
@@ -625,6 +644,42 @@ def rewrite_implicit_random_ops(graph: torch.fx.Graph) -> None:
                 return decompose_rand(shape, seed=seed, offsets=offsets)
 
             replacement = _trace_rewrite_subgraph(graph, node, helper, descriptors)
+        elif node.target is rand4x:
+            descriptors: list[_ArgDesc] = []
+            seed_desc = _add_rewrite_desc(descriptors, node.args[0])
+            offsets_desc = _add_rewrite_desc(descriptors, node.args[1])
+
+            def helper(
+                *flat_args: object,
+                seed_desc: _ArgDesc = seed_desc,
+                offsets_desc: _ArgDesc = offsets_desc,
+            ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+                seed = _resolve_seed_desc(flat_args, seed_desc)
+                offsets = _resolve_offsets_desc(flat_args, offsets_desc)
+                assert offsets is not None
+                return decompose_rand4x(seed, offsets)
+
+            replacement_tuple = _trace_rewrite_subgraph(
+                graph, node, helper, descriptors
+            )
+            assert isinstance(replacement_tuple, tuple)
+            assert len(replacement_tuple) == 4
+            for user in list(node.users):
+                if (
+                    user.op == "call_function"
+                    and user.target is operator.getitem
+                    and len(user.args) == 2
+                ):
+                    idx = user.args[1]
+                    assert isinstance(idx, int) and 0 <= idx < 4
+                    user.replace_all_uses_with(replacement_tuple[idx])
+                    graph.erase_node(user)
+                else:
+                    raise NotImplementedError(
+                        f"unexpected non-getitem user of hl.rand4x: {user}"
+                    )
+            graph.erase_node(node)
+            continue
         elif node.target is randint:
             shape_arg = node.args[0]
             descriptors, shape_desc = _shape_rewrite_desc(shape_arg)
@@ -727,6 +782,7 @@ def rewrite_implicit_random_ops(graph: torch.fx.Graph) -> None:
         else:
             continue
 
+        assert isinstance(replacement, Node)
         node.replace_all_uses_with(replacement)
         graph.erase_node(node)
 
@@ -836,6 +892,91 @@ def _(
         return philox_rand_ref(seed, offsets).to(device=rng_device)
     processed_shape, offset = _ref_rng_shape_and_offset(shape, device=rng_device)
     return philox_rand_ref(seed, offset).reshape(processed_shape).to(device=rng_device)
+
+
+@_decorators.api(tiles_as_sizes=False)
+def rand4x(
+    seed: int | torch.Tensor,
+    offsets: torch.Tensor,
+    device: torch.device | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    hl.rand4x returns four independent uniform float32 tensors in ``[0, 1)``
+    per offset from a single Philox round (~4× cheaper than four separate
+    :func:`hl.rand` calls). Mirrors Triton's ``tl.rand4x``.
+
+    Args:
+        seed: A single element int64 tensor or int literal
+        offsets: Int64 offset tensor fed into the Philox RNG. The output
+            tensors have shape equal to ``offsets.shape``.
+        device: Device must match the current compile environment device
+
+    Returns:
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        Four float32 tensors, each with shape ``offsets.shape`` and values in
+        [0, 1).
+
+    Examples:
+        Three sibling dropout masks per element with a single Philox call:
+
+        .. code-block:: python
+
+            @helion.kernel
+            def triple_dropout_kernel(x: torch.Tensor) -> torch.Tensor:
+                out = torch.empty_like(x)
+                (n,) = x.shape
+                for tile in hl.tile(n):
+                    base = hl.tile_index(tile).to(torch.int64)
+                    r0, r1, r2, _ = hl.rand4x(seed=42, offsets=base)
+                    keep = (r0 > 0.1) & (r1 > 0.2) & (r2 > 0.3)
+                    out[tile] = x[tile] * keep.to(x.dtype)
+                return out
+    """
+    raise NotInsideKernel
+
+
+@_decorators.register_fake(rand4x)
+def _rand4x_fake(
+    seed: int | torch.Tensor,
+    offsets: torch.Tensor,
+    device: torch.device | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    if not isinstance(offsets, torch.Tensor):
+        raise TypeError(
+            f"Expected torch.Tensor for offsets, got {type(offsets).__name__}"
+        )
+    env = CompileEnvironment.current()
+    rng_device = env.device if device is None else device
+    for _ in range(4):
+        env.add_kernel_tensor_size(offsets.shape)
+    return (
+        torch.empty([*offsets.shape], dtype=torch.float32, device=rng_device),
+        torch.empty([*offsets.shape], dtype=torch.float32, device=rng_device),
+        torch.empty([*offsets.shape], dtype=torch.float32, device=rng_device),
+        torch.empty([*offsets.shape], dtype=torch.float32, device=rng_device),
+    )
+
+
+@_decorators.get_masked_value(rand4x)
+def _(node: torch.fx.Node) -> float:
+    return 0
+
+
+@_decorators.ref(rand4x)
+def _(
+    seed: int | torch.Tensor,
+    offsets: torch.Tensor,
+    device: torch.device | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    env = CompileEnvironment.current()
+    rng_device = env.device if device is None else device
+    r0, r1, r2, r3 = philox_rand4x_ref(seed, offsets)
+    return (
+        r0.to(device=rng_device),
+        r1.to(device=rng_device),
+        r2.to(device=rng_device),
+        r3.to(device=rng_device),
+    )
 
 
 @_decorators.api(tiles_as_sizes=True)
