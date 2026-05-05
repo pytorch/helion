@@ -872,27 +872,37 @@ def run_kernel_inner(name: str) -> KernelResult:
 
 
 def write_results_json(output: str, results: list[KernelResult]) -> None:
-    """Write results in the same JSON format as benchmarks/run.py for pytorch benchmark hub."""
-    device = os.environ.get("HELION_BACKEND", "pallas")
+    """Write results in the dashboard-compatible JSON format.
+
+    Emits one record per (kernel, metric) with parallel `shape` /
+    `benchmark_values` arrays — the same shape benchmarks/run.py produces, so
+    .github/dashboard/build_dashboard_data.py can ingest TPU runs alongside
+    GPU runs without a dedicated parser.
+    """
+    device = "TPU v7"
     records: list[dict[str, Any]] = []
+
+    def add_metric(
+        kernel: str, metric_name: str, shapes: list[str], values: list[float]
+    ) -> None:
+        if not shapes or not values:
+            return
+        records.append(
+            {
+                "benchmark": {
+                    "name": "Helion TPU Benchmark",
+                    "extra_info": {"device": device},
+                },
+                "model": {"name": kernel},
+                "metric": {"name": metric_name, "benchmark_values": values},
+                "shape": shapes,
+            }
+        )
+
     for result in results:
-        if result.shape_results:
-            for sr in result.shape_results:
-                records.append(
-                    {
-                        "benchmark": {
-                            "name": "Helion TPU Benchmark",
-                            "extra_info": {"device": device},
-                        },
-                        "model": {"name": result.name},
-                        "metric": {
-                            "name": "accuracy",
-                            "benchmark_values": [1.0 if sr.passed else 0.0],
-                        },
-                        "shape": [sr.shape],
-                    }
-                )
-        else:
+        if not result.shape_results:
+            # Kernel-level pass/fail only (e.g. baseline-less kernels run via
+            # mod.main()). Emit a single zero-shape accuracy record.
             records.append(
                 {
                     "benchmark": {
@@ -901,27 +911,39 @@ def write_results_json(output: str, results: list[KernelResult]) -> None:
                     },
                     "model": {"name": result.name},
                     "metric": {
-                        "name": "accuracy",
+                        "name": "helion_accuracy",
                         "benchmark_values": [1.0 if result.passed else 0.0],
                     },
                     "shape": [],
                 }
             )
-        if result.kernel_time_ms > 0:
-            records.append(
-                {
-                    "benchmark": {
-                        "name": "Helion TPU Benchmark",
-                        "extra_info": {"device": device},
-                    },
-                    "model": {"name": result.name},
-                    "metric": {
-                        "name": "kernel_time_ms",
-                        "benchmark_values": [result.kernel_time_ms],
-                    },
-                    "shape": [],
-                }
-            )
+            continue
+
+        shapes = [sr.shape for sr in result.shape_results]
+        add_metric(
+            result.name,
+            "helion_accuracy",
+            shapes,
+            [1.0 if sr.passed else 0.0 for sr in result.shape_results],
+        )
+        add_metric(
+            result.name,
+            "helion_latency_ms",
+            shapes,
+            [sr.kernel_time_ms for sr in result.shape_results],
+        )
+        add_metric(
+            result.name,
+            "helion_speedup",
+            shapes,
+            [sr.speedup for sr in result.shape_results],
+        )
+        add_metric(
+            result.name,
+            "torch_compile_speedup",
+            shapes,
+            [sr.compile_vs_default for sr in result.shape_results],
+        )
 
     if os.path.exists(output):
         try:
