@@ -779,7 +779,6 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
     # max-K runtime test. Re-verify that test plus the guard-boundary test
     # before raising this threshold.
     _VALIDATED_TWO_CTA_MAX_K_TILES: ClassVar[int] = 256
-    _CUDA_GRID_DIM_Z_LIMIT: ClassVar[int] = 65535
 
     def __init__(self, *, is_blocked: bool) -> None:
         super().__init__(is_blocked=is_blocked)
@@ -864,12 +863,6 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         self, total_clusters: str, cluster_m: int
     ) -> str:
         """Return the scheduler z dimension for the persistent launch grid."""
-        if self._tcgen05_has_validated_role_local_two_cta_runtime():
-            # The role-local CtaGroup.TWO body is correct when a CTA cluster
-            # handles one validated static-full logical work tile. Launch every
-            # work tile directly and avoid the scheduler state-reuse path until
-            # G3 validates it.
-            return total_clusters
         max_persistent_clusters = self._tcgen05_max_persistent_work_clusters_expr(
             cluster_m
         )
@@ -878,10 +871,11 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
     def codegen_grid(self) -> ast.AST:
         # Tcgen05 persistent kernels use CUTLASS' z-indexed scheduler instead
         # of the parent virtual-PID loop. Validated role-local CtaGroup.TWO
-        # launches one scheduler work cluster per logical tile for the
-        # static-full shapes covered by runtime tests, avoiding recycling
-        # CTA-local pipeline/TMEM state. Guarded legacy fallback, K-over-cap
-        # CtaGroup.TWO, and cluster_m=1 paths keep the persistent-capacity cap.
+        # caps the launch at persistent work-cluster capacity. Validated
+        # role-local CtaGroup.TWO uses per-role scheduler loops over this same
+        # capped grid, so it can recycle CTA-local pipeline/TMEM state across
+        # logical work tiles. Guarded legacy fallback and K-over-cap
+        # CtaGroup.TWO use the same capped grid but still raise before launch.
         # Multi-root ForEach kernels are still host-guarded because this grid
         # is derived from this case's pid_info only.
         cluster_m = self._tcgen05_cluster_m()
@@ -1343,17 +1337,16 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         "Helion CuTe persistent + tcgen05 currently supports runtime "
         "execution only for validated single-root static full tiles: "
         "tcgen05_cluster_m=1 or role-local CtaGroup.TWO "
-        "tcgen05_cluster_m=2 with at most 256 K tiles and no more than 65535 "
-        "output tiles. Partial K/M/N tile fallback shapes, CtaGroup.TWO shapes "
-        "above the validated K-tile limit, oversized direct-grid CtaGroup.TWO "
-        "shapes, multi-root kernels, and unvalidated cluster_m settings can "
+        "tcgen05_cluster_m=2 with at most 256 K tiles. Partial K/M/N tile "
+        "fallback shapes, CtaGroup.TWO shapes above the validated K-tile "
+        "limit, multi-root kernels, and unvalidated cluster_m settings can "
         "produce wrong output, hang, or launch-fail. The kernel was launched "
         "with total_tiles=%d, which is outside the validated persistent "
         "scheduler set for this path. "
         'Use a non-persistent pid_type (e.g. "flat"), pick a single-root '
         "static-full-tile kernel with tcgen05_cluster_m=1, or pick a "
         "validated single-root static-full CtaGroup.TWO shape with at most "
-        "256 K tiles and no more than 65535 output tiles."
+        "256 K tiles."
     )
 
     def _emit_host_multi_tile_guard(
@@ -1366,8 +1359,8 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
 
         The single-root static full-tile role-local path has multi-tile
         runtime coverage for ``tcgen05_cluster_m == 1``. Validated static-full
-        CtaGroup.TWO launches one scheduler work cluster per logical tile and
-        keeps this guard only for CUDA's z-grid limit and the K-tile-count cap.
+        CtaGroup.TWO uses role-local scheduler loops over the capped persistent
+        grid, so no multi-tile host guard is emitted for that set.
         Legacy non-role-local tcgen05 persistent kernels, multi-root kernels,
         cluster_m > 1 fallback configs, and CtaGroup.TWO configs above the
         validated K-tile cap still hit, or lack coverage for, wrong-output /
@@ -1381,10 +1374,9 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         explicit user configs that bypass autotune.
 
         The threshold is intentionally ``total_tiles > 1`` for guarded
-        cluster_m=1 single-root fallback paths. For cluster_m > 1 fallback,
-        CtaGroup.TWO shapes above the K-tile cap, and oversized direct-grid
-        CtaGroup.TWO shapes this converts known launch, timeout, and
-        wrong-output failures into a host error. Multi-root kernels use
+        cluster_m=1 single-root fallback paths. For cluster_m > 1 fallback and
+        CtaGroup.TWO shapes above the K-tile cap this converts known launch,
+        timeout, and wrong-output failures into a host error. Multi-root kernels use
         ``total_tiles > 0`` because the scheduler grid is derived from only the
         first root case; even one tile in a later case is unsafe.
         """
@@ -1472,13 +1464,7 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             # Retarget even for guarded cluster_m>1 / multi-root codegen so
             # compile-only inspection still sees the role-local scheduler shape.
             self._retarget_tcgen05_shared_scheduler_to_exec(layout)
-        if use_validated_two_cta_role_local_body:
-            self._emit_host_multi_tile_guard(
-                device_function,
-                host_guard_total_pids,
-                guard_threshold=self._CUDA_GRID_DIM_Z_LIMIT,
-            )
-        elif not use_validated_role_local_body:
+        if not use_validated_role_local_body:
             guard_threshold: int | str
             if is_multi_root:
                 guard_threshold = 0
@@ -1497,9 +1483,8 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
 
         setup: list[ast.stmt] = []
         # Fully role-local CtaGroup.TWO does not consume the shared work-tile
-        # SMEM handoff. Validated direct-grid CtaGroup.TWO also skips the
-        # per-role StaticPersistentTileScheduler because grid.z already names
-        # the one logical work tile this CTA cluster owns.
+        # SMEM handoff. Validated CtaGroup.TWO skips the shared scheduler;
+        # each role owns a scheduler loop over the capped persistent grid.
         if not omit_shared_loop:
             setup.extend(self._build_tcgen05_persistent_prelude(layout))
         setup.extend(hoisted_setup)
@@ -1511,7 +1496,6 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                         layout,
                         partition,
                         build_shared_tile_body=False,
-                        use_direct_grid=use_validated_two_cta_role_local_body,
                     )
                 )
             else:
@@ -2141,106 +2125,6 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             orelse=[],
         )
 
-    def _direct_grid_work_tile_coord_stmts(
-        self,
-        device_function: DeviceFunction,
-        layout: _Tcgen05PersistentLayout,
-        scheduler_var_prefix: str,
-    ) -> tuple[list[ast.stmt], list[str]]:
-        """Bind scheduler tile coordinates directly from the launch grid.
-
-        Validated role-local CtaGroup.TWO launches one CTA cluster per logical
-        output tile. The scheduler work-cluster index is therefore exactly
-        ``block_idx.z`` and does not need a ``StaticPersistentTileScheduler``.
-        The M coordinate is still expressed in scheduler CTA slots, so the
-        local CTA rank is folded into coordinate 0 and the existing
-        ``virtual_pid`` collapse maps both peer CTAs back to one logical tile.
-        """
-        assert layout.cluster_m > 1
-        dims = self._tcgen05_output_tile_dims_expr(is_device=True)
-        work_tile_linear = device_function.new_var(
-            f"{scheduler_var_prefix}_work_tile_linear"
-        )
-        cta_rank = device_function.new_var(f"{scheduler_var_prefix}_cta_rank")
-        stmts: list[ast.stmt] = [
-            statement_from_string(f"{work_tile_linear} = cute.arch.block_idx()[2]"),
-            statement_from_string(
-                f"{cta_rank} = "
-                "cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())"
-            ),
-        ]
-        remainder = work_tile_linear
-        logical_coords: list[str] = []
-        for i in range(len(self.pid_info)):
-            coord = device_function.new_var(f"{scheduler_var_prefix}_work_tile_idx_{i}")
-            logical_coords.append(coord)
-            if i + 1 < len(self.pid_info):
-                dim = dims[i]
-                stmts.append(
-                    statement_from_string(f"{coord} = ({remainder}) % ({dim})")
-                )
-                next_remainder = device_function.new_var(
-                    f"{scheduler_var_prefix}_work_tile_remainder_{i}"
-                )
-                stmts.append(
-                    statement_from_string(
-                        f"{next_remainder} = ({remainder}) // ({dim})"
-                    )
-                )
-                remainder = next_remainder
-            else:
-                stmts.append(statement_from_string(f"{coord} = {remainder}"))
-
-        coord_terms = list(logical_coords)
-        coord_terms[0] = (
-            f"{logical_coords[0]} * cutlass.Int32({layout.cluster_m}) + {cta_rank}"
-        )
-        return stmts, coord_terms
-
-    def _build_role_local_direct_grid_body(
-        self,
-        device_function: DeviceFunction,
-        layout: _Tcgen05PersistentLayout,
-        role_block: Tcgen05PersistentProgramIDs._PersistentRoleBlock,
-        scheduler_var_prefix: str,
-        dependency_stmts: list[ast.stmt] | None = None,
-    ) -> ast.stmt:
-        """Build one direct-grid role body without a persistent scheduler loop."""
-        assert role_block.role_predicate is not None, (
-            "_build_role_local_direct_grid_body requires a non-shared role block"
-        )
-        prelude, coord_terms = self._direct_grid_work_tile_coord_stmts(
-            device_function, layout, scheduler_var_prefix
-        )
-        linear_pid_expr = self._tcgen05_linear_virtual_pid_from_coords_expr(coord_terms)
-
-        body: list[ast.stmt] = [
-            *prelude,
-            statement_from_string(f"{self.virtual_pid_var} = {linear_pid_expr}"),
-        ]
-        if dependency_stmts is not None:
-            body.extend(dependency_stmts)
-        body.extend(role_block.stmts)
-
-        if (
-            role_block.role_predicate == self._tcgen05_epi_role_predicate()
-            and device_function.cute_tcgen05_epi_role_tile_counter_var is not None
-        ):
-            body.insert(
-                len(prelude),
-                statement_from_string(
-                    f"{device_function.cute_tcgen05_epi_role_tile_counter_var} = "
-                    "cutlass.Int32(0)"
-                ),
-            )
-
-        return create(
-            ast.If,
-            test=expr_from_string(role_block.role_predicate),
-            body=body,
-            orelse=[],
-        )
-
     def _role_local_dependency_stmts(
         self, shared_body: list[ast.stmt], role_stmts: list[ast.stmt]
     ) -> list[ast.stmt]:
@@ -2447,7 +2331,6 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         partition: Tcgen05PersistentProgramIDs._PartitionedRoleBody,
         *,
         build_shared_tile_body: bool = True,
-        use_direct_grid: bool = False,
     ) -> tuple[list[ast.stmt], list[ast.stmt]]:
         """Build the per-tile body in role-local-while form.
 
@@ -2475,20 +2358,17 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
 
         Caller wires both into the persistent kernel as siblings of
         each other inside the same setup list when the residual shared loop
-        is needed. Each role-local ``while`` or direct-grid body runs only on
-        its predicated warps.
+        is needed. Each role-local ``while`` runs only on its predicated warps.
 
         **Current limitation.** The TMA-load, MMA-exec, and TMA-store
         epilogue roles are extracted today. Single-root static full-tile
         multi-tile correctness is validated for ``cluster_m == 1`` and for
         role-local CtaGroup.TWO ``cluster_m == 2`` up to the validated K-tile
-        cap, launched with one scheduler work cluster per logical tile. The
-        validated direct-grid path can pass ``use_direct_grid=True`` to bind
-        work-tile coordinates directly from ``block_idx.z``. Partial
-        fallback shapes, CtaGroup.TWO shapes above the K-tile cap, and
+        cap, using role-local scheduler loops over the capped persistent grid.
+        Partial fallback shapes, CtaGroup.TWO shapes above the K-tile cap, and
         multi-root ForEach kernels remain guarded for runtime execution, and
-        autotune keeps cluster_m=2 out of the search until the G3 ownership
-        path is benchmarked.
+        autotune keeps cluster_m=2 out of the search until the G3 ownership path
+        is benchmarked.
         """
         if build_shared_tile_body:
             # Wrap the shared body's tagged-removed view in the standard
@@ -2539,11 +2419,7 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                 partition.shared_body_extracted, stmts
             )
             role_local_whiles.append(
-                (
-                    self._build_role_local_direct_grid_body
-                    if use_direct_grid
-                    else self._build_role_local_while
-                )(
+                self._build_role_local_while(
                     device_function,
                     layout,
                     merged_block,
