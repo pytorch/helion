@@ -207,7 +207,7 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         }
         spec.normalize(valid_config, _fix_invalid=True)
         self.assertEqual(valid_config["tcgen05_cluster_m"], 2)
-        self.assertEqual(valid_config["pid_type"], "persistent_blocked")
+        self.assertEqual(valid_config["pid_type"], "persistent_interleaved")
         self.assertEqual(valid_config["block_sizes"][:3], [256, 256, 32])
         self.assertIn("persistent_blocked", spec.allowed_pid_types)
         self.assertIn("persistent_interleaved", spec.allowed_pid_types)
@@ -296,7 +296,7 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
                 spec.normalize(config, _fix_invalid=True)
                 expected_l2_groupings = override.get("l2_groupings", [1])
                 self.assertEqual(config["tcgen05_cluster_m"], 2)
-                self.assertEqual(config["pid_type"], "persistent_blocked")
+                self.assertEqual(config["pid_type"], "persistent_interleaved")
                 self.assertEqual(config["block_sizes"][:3], [256, 256, 16])
                 self.assertEqual(config["l2_groupings"], expected_l2_groupings)
 
@@ -354,7 +354,7 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         }
         spec.normalize(two_cta_config, _fix_invalid=True)
         self.assertEqual(two_cta_config["tcgen05_cluster_m"], 2)
-        self.assertEqual(two_cta_config["pid_type"], "persistent_blocked")
+        self.assertEqual(two_cta_config["pid_type"], "persistent_interleaved")
         self.assertEqual(two_cta_config["block_sizes"][:3], [256, 256, 16])
 
     @onlyBackends(["cute"])
@@ -395,7 +395,7 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
                 ["tensor_descriptor", "tensor_descriptor", "tensor_descriptor"],
             )
             self.assertEqual(seed["l2_groupings"], [TCGEN05_TWO_CTA_SEED_L2_GROUPING])
-            self.assertEqual(seed["pid_type"], "persistent_blocked")
+            self.assertEqual(seed["pid_type"], "persistent_interleaved")
             self.assertEqual(seed["tcgen05_num_epi_warps"], 4)
 
         config_gen = bound.config_spec.create_config_generation()

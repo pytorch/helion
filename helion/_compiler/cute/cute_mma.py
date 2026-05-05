@@ -712,6 +712,7 @@ class _PerKiterTmaArgs:
     tma_barrier_ptr: str
     tma_full_tile: str
     tma_next_full_tile: str
+    tma_next_consumer_tile: str
     tma_warp: str
     tma_atom_a: str
     tma_atom_b: str
@@ -832,11 +833,16 @@ def _build_kloop_pipeline_consumer_if(
     *,
     gate_exec_warp: bool = True,
     include_scalar_fallback: bool = True,
+    use_existing_try_token: bool = False,
 ) -> ast.stmt:
     """Per-K-iter TMA consumer / scalar-fallback ``if`` for the pipelined branch."""
-    consumer_src = (
-        f"{args.tma_consumer_try_token} = "
-        f"{args.tma_pipeline}.consumer_try_wait({args.tma_consumer_state})\n"
+    consumer_src = ""
+    if not use_existing_try_token:
+        consumer_src = (
+            f"{args.tma_consumer_try_token} = "
+            f"{args.tma_pipeline}.consumer_try_wait({args.tma_consumer_state})\n"
+        )
+    consumer_src += (
         f"{args.tma_pipeline}.consumer_wait("
         f"{args.tma_consumer_state}, {args.tma_consumer_try_token})"
     )
@@ -861,6 +867,29 @@ def _build_kloop_pipeline_consumer_if(
         )
     src = f"if {args.tma_full_tile}:\n{full_tile_src}{fallback_src}"
     return statement_from_string(src)
+
+
+def _build_kloop_pipeline_consumer_prefetch_stmts(
+    args: _PerKiterTmaArgs,
+    *,
+    gate_exec_warp: bool = True,
+) -> list[ast.stmt]:
+    """Peek the next AB full barrier after advancing the consumer state."""
+    assert args.is_two_cta, "AB consumer prefetch is validated for CtaGroup.TWO"
+    predicate = args.tma_next_consumer_tile
+    owner_predicate = _tcgen05_two_cta_owner_predicate(
+        args.exec_active, is_two_cta=args.is_two_cta, gate_exec_warp=gate_exec_warp
+    )
+    if owner_predicate is not None:
+        predicate = f"{predicate} and {owner_predicate}"
+    return [
+        statement_from_string(f"{args.tma_consumer_try_token} = cutlass.Boolean(1)"),
+        statement_from_string(
+            f"if {predicate}:\n"
+            f"    {args.tma_consumer_try_token} = "
+            f"{args.tma_pipeline}.consumer_try_wait({args.tma_consumer_state})"
+        ),
+    ]
 
 
 def _build_kloop_pipeline_release_if(
@@ -915,6 +944,22 @@ def _build_tcgen05_mma_fence_stmt(
     return statement_from_string(f"if {predicate}:\n    {fence_src}")
 
 
+def _build_tcgen05_mma_accumulate_reset_stmt(
+    exec_active: str,
+    *,
+    tiled_mma: str,
+    gate_exec_warp: bool = True,
+    is_two_cta: bool = False,
+) -> ast.stmt:
+    reset_src = f"{tiled_mma}.set(cute.nvgpu.tcgen05.Field.ACCUMULATE, False)"
+    predicate = _tcgen05_two_cta_owner_predicate(
+        exec_active, is_two_cta=is_two_cta, gate_exec_warp=gate_exec_warp
+    )
+    if predicate is None:
+        return statement_from_string(reset_src)
+    return statement_from_string(f"if {predicate}:\n    {reset_src}")
+
+
 def _build_tcgen05_mma_issue_stmt(
     *,
     exec_active: str,
@@ -923,24 +968,19 @@ def _build_tcgen05_mma_issue_stmt(
     tcgen05_frag_a: str,
     tcgen05_frag_b: str,
     mma_stage: str,
-    k_offset_var: str,
-    k_loop_begin_expr: str,
     gate_exec_warp: bool = True,
     is_two_cta: bool = False,
 ) -> ast.stmt:
     issue_src = (
         f"for _tcgen05_kblk_idx in range(cute.size({tcgen05_frag_a}, mode=[2])):\n"
-        f"    {tiled_mma}.set(\n"
-        f"        cute.nvgpu.tcgen05.Field.ACCUMULATE,\n"
-        f"        {k_offset_var} != {k_loop_begin_expr} or cutlass.Int32(_tcgen05_kblk_idx) != cutlass.Int32(0),\n"
-        "    )\n"
         f"    cute.gemm(\n"
         f"        {tiled_mma},\n"
         f"        {acc_frag},\n"
         f"        [{tcgen05_frag_a}[None, None, cutlass.Int32(_tcgen05_kblk_idx), {mma_stage}]],\n"
         f"        [{tcgen05_frag_b}[None, None, cutlass.Int32(_tcgen05_kblk_idx), {mma_stage}]],\n"
         f"        {acc_frag},\n"
-        "    )"
+        "    )\n"
+        f"    {tiled_mma}.set(cute.nvgpu.tcgen05.Field.ACCUMULATE, True)"
     )
     predicate = _tcgen05_two_cta_owner_predicate(
         exec_active, is_two_cta=is_two_cta, gate_exec_warp=gate_exec_warp
@@ -1357,6 +1397,14 @@ def _emit_mma_pipeline(
     )
     # Keep a distinct name so future MMA-exec gating changes are localized.
     tcgen05_use_role_local_mma_exec = tcgen05_use_role_local_tma_producer
+    # Static-full CtaGroup.TWO keeps a prefetched AB consumer token live
+    # across the accumulator acquire and each K-loop issue. CtaGroup.ONE
+    # keeps the older adjacent try-wait/wait sequence.
+    tcgen05_use_role_local_ab_consumer_prefetch = (
+        tcgen05_use_role_local_mma_exec
+        and tcgen05_is_two_cta
+        and tcgen05_use_tma_pipeline
+    )
     # Keep a distinct name so future epi-role gating changes are localized.
     tcgen05_use_role_local_epi = tcgen05_use_role_local_tma_producer
     # This is the kernel-wide contract ProgramID consumes. Today the TMA
@@ -1532,6 +1580,23 @@ def _emit_mma_pipeline(
             f"{tcgen05_plan.acc_producer_state}.index]",
             mma_exec=tcgen05_use_role_local_mma_exec,
         )
+        if tcgen05_use_role_local_ab_consumer_prefetch:
+            ab_consumer_prefetch_owner_predicate = _tcgen05_two_cta_owner_predicate(
+                tcgen05_plan.exec_active,
+                is_two_cta=tcgen05_is_two_cta,
+                gate_exec_warp=False,
+            )
+            assert ab_consumer_prefetch_owner_predicate is not None
+            _emit_per_tile(
+                f"{tma_consumer_try_token} = cutlass.Boolean(1)",
+                mma_exec=tcgen05_use_role_local_mma_exec,
+            )
+            _emit_per_tile(
+                f"if {ab_consumer_prefetch_owner_predicate}:\n"
+                f"    {tma_consumer_try_token} = "
+                f"{tma_pipeline}.consumer_try_wait({tma_consumer_state})",
+                mma_exec=tcgen05_use_role_local_mma_exec,
+            )
         prefix.append(
             statement_from_string(
                 f"{tcgen05_epi_acc_frag_base} = cute.make_tensor("
@@ -1550,6 +1615,15 @@ def _emit_mma_pipeline(
             f"{tcgen05_plan.acc_producer_state})",
             mma_exec=tcgen05_use_role_local_mma_exec,
         )
+        reset_accumulate_stmt = _build_tcgen05_mma_accumulate_reset_stmt(
+            tcgen05_plan.exec_active,
+            tiled_mma=tiled_mma,
+            is_two_cta=tcgen05_is_two_cta,
+        )
+        prefix.append(reset_accumulate_stmt)
+        per_tile_stmts.append(reset_accumulate_stmt)
+        if tcgen05_use_role_local_mma_exec:
+            mma_exec_role_stmts.append(reset_accumulate_stmt)
 
     mma_participant_linear: str | None = None
     mma_slice_linear: str | None = None
@@ -1941,6 +2015,7 @@ def _emit_mma_pipeline(
     tma_initial_next_full_tile = df.new_var("tcgen05_tma_initial_next_full_tile")
     tma_full_tile = df.new_var("tcgen05_tma_full_tile")
     tma_next_full_tile = df.new_var("tcgen05_tma_next_full_tile")
+    tma_next_consumer_tile = df.new_var("tcgen05_tma_next_consumer_tile")
     tma_k_tile = df.new_var("tcgen05_tma_k_tile")
     tma_barrier_ptr = df.new_var("tcgen05_tma_barrier")
     tma_producer_try_token = df.new_var("tcgen05_ab_producer_try_token")
@@ -2478,6 +2553,7 @@ def _emit_mma_pipeline(
                 tma_barrier_ptr=tma_barrier_ptr,
                 tma_full_tile=tma_full_tile,
                 tma_next_full_tile=tma_next_full_tile,
+                tma_next_consumer_tile=tma_next_consumer_tile,
                 tma_warp=tma_warp,
                 tma_atom_a=tma_atom_a,
                 tma_atom_b=tma_atom_b,
@@ -2538,37 +2614,59 @@ def _emit_mma_pipeline(
                         smem_a_mma_stmt,
                         smem_b_mma_stmt,
                         tma_full_tile_stmt,
-                        statement_from_string(
-                            f"{tma_consumer_try_token} = cutlass.Boolean(0)"
-                        ),
+                    ]
+                    if tcgen05_use_role_local_ab_consumer_prefetch:
+                        exec_loop_body.append(
+                            statement_from_string(
+                                f"{tma_next_consumer_tile} = "
+                                f"{k_offset_var} + cutlass.Int32({bk * 2}) <= cutlass.Int32({k_total_size})"
+                            )
+                        )
+                    else:
+                        exec_loop_body.append(
+                            statement_from_string(
+                                f"{tma_consumer_try_token} = cutlass.Boolean(0)"
+                            )
+                        )
+                    exec_loop_body.append(
                         _build_kloop_pipeline_consumer_if(
                             tma_kloop_args,
                             gate_exec_warp=False,
                             include_scalar_fallback=False,
-                        ),
-                        _build_tcgen05_mma_fence_stmt(
-                            tcgen05_plan.exec_active,
-                            gate_exec_warp=False,
-                            is_two_cta=tcgen05_is_two_cta,
-                        ),
-                        _build_tcgen05_mma_issue_stmt(
-                            exec_active=tcgen05_plan.exec_active,
-                            tiled_mma=tiled_mma,
-                            acc_frag=acc_frag,
-                            tcgen05_frag_a=tcgen05_frag_a,
-                            tcgen05_frag_b=tcgen05_frag_b,
-                            mma_stage=mma_stage,
-                            k_offset_var=k_offset_var,
-                            k_loop_begin_expr=k_loop_begin_expr,
-                            gate_exec_warp=False,
-                            is_two_cta=tcgen05_is_two_cta,
-                        ),
-                        _build_kloop_pipeline_release_if(
-                            tma_kloop_args,
-                            gate_exec_warp=False,
-                            include_scalar_fallback=False,
-                        ),
-                    ]
+                            use_existing_try_token=tcgen05_use_role_local_ab_consumer_prefetch,
+                        )
+                    )
+                    exec_loop_body.extend(
+                        [
+                            _build_tcgen05_mma_fence_stmt(
+                                tcgen05_plan.exec_active,
+                                gate_exec_warp=False,
+                                is_two_cta=tcgen05_is_two_cta,
+                            ),
+                            _build_tcgen05_mma_issue_stmt(
+                                exec_active=tcgen05_plan.exec_active,
+                                tiled_mma=tiled_mma,
+                                acc_frag=acc_frag,
+                                tcgen05_frag_a=tcgen05_frag_a,
+                                tcgen05_frag_b=tcgen05_frag_b,
+                                mma_stage=mma_stage,
+                                gate_exec_warp=False,
+                                is_two_cta=tcgen05_is_two_cta,
+                            ),
+                            _build_kloop_pipeline_release_if(
+                                tma_kloop_args,
+                                gate_exec_warp=False,
+                                include_scalar_fallback=False,
+                            ),
+                        ]
+                    )
+                    if tcgen05_use_role_local_ab_consumer_prefetch:
+                        exec_loop_body.extend(
+                            _build_kloop_pipeline_consumer_prefetch_stmts(
+                                tma_kloop_args,
+                                gate_exec_warp=False,
+                            )
+                        )
                     exec_loop = _clone_k_loop_with_body(device_loop, exec_loop_body)
                     prefix.append(exec_loop)
                     per_tile_stmts.append(exec_loop)
@@ -2683,8 +2781,6 @@ def _emit_mma_pipeline(
                         tcgen05_frag_a=tcgen05_frag_a,
                         tcgen05_frag_b=tcgen05_frag_b,
                         mma_stage=mma_stage,
-                        k_offset_var=k_offset_var,
-                        k_loop_begin_expr=k_loop_begin_expr,
                         is_two_cta=tcgen05_is_two_cta,
                     )
                 )

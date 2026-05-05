@@ -37,8 +37,10 @@ from helion._compiler.cute.cute_mma import _build_initial_prefetch_if
 from helion._compiler.cute.cute_mma import _build_kloop_non_pipeline_producer_if
 from helion._compiler.cute.cute_mma import _build_kloop_non_pipeline_release_if
 from helion._compiler.cute.cute_mma import _build_kloop_pipeline_consumer_if
+from helion._compiler.cute.cute_mma import _build_kloop_pipeline_consumer_prefetch_stmts
 from helion._compiler.cute.cute_mma import _build_kloop_pipeline_producer_if
 from helion._compiler.cute.cute_mma import _build_kloop_pipeline_release_if
+from helion._compiler.cute.cute_mma import _build_tcgen05_mma_accumulate_reset_stmt
 from helion._compiler.cute.cute_mma import _build_tcgen05_mma_issue_stmt
 from helion._compiler.cute.cute_mma import _choose_mma_impl
 from helion._compiler.cute.cute_mma import _get_mma_k_loop_info
@@ -1966,10 +1968,53 @@ class TestCuteLowerings(unittest.TestCase):
                     )
                     found_role_local_tma = True
                 elif test_src == exec_role_predicate:
+                    first_ab_peek_pos = role_src.index(
+                        "tcgen05_ab_pipeline.consumer_try_wait"
+                    )
+                    acc_acquire_pos = role_src.index(
+                        "tcgen05_acc_pipeline.producer_acquire"
+                    )
+                    accumulate_reset_pos = role_src.index(
+                        "tiled_mma.set(cute.nvgpu.tcgen05.Field.ACCUMULATE, False)"
+                    )
+                    self.assertLess(first_ab_peek_pos, acc_acquire_pos)
+                    self.assertLess(acc_acquire_pos, accumulate_reset_pos)
+                    self.assertLess(
+                        accumulate_reset_pos,
+                        role_src.index("tcgen05_ab_pipeline.consumer_wait"),
+                    )
                     self.assertIn("tcgen05_ab_pipeline.consumer_wait", role_src)
                     self.assertIn("cute.gemm(", role_src)
+                    self.assertIn(
+                        "tiled_mma.set(cute.nvgpu.tcgen05.Field.ACCUMULATE, True)",
+                        role_src,
+                    )
                     self.assertIn("tcgen05_ab_pipeline.consumer_release", role_src)
                     self.assertIn("tcgen05_ab_consumer_state.advance()", role_src)
+                    release_pos = role_src.index("tcgen05_ab_pipeline.consumer_release")
+                    advance_pos = role_src.index("tcgen05_ab_consumer_state.advance()")
+                    next_ab_peek_blocks = [
+                        ast.unparse(child)
+                        for child in ast.walk(node)
+                        if isinstance(child, ast.If)
+                        and "tcgen05_tma_next_consumer_tile" in ast.unparse(child.test)
+                        and _TCGEN05_CLUSTER_LEADER_PREDICATE in ast.unparse(child.test)
+                    ]
+                    self.assertTrue(
+                        next_ab_peek_blocks,
+                        "Expected a leader-gated AB consumer next-token peek. "
+                        "Generated role code:\n" + role_src,
+                    )
+                    next_ab_peek_pos = role_src.index(
+                        "tcgen05_tma_next_consumer_tile", advance_pos
+                    )
+                    next_ab_try_pos = role_src.index(
+                        "tcgen05_ab_pipeline.consumer_try_wait",
+                        next_ab_peek_pos,
+                    )
+                    self.assertLess(release_pos, advance_pos)
+                    self.assertLess(advance_pos, next_ab_peek_pos)
+                    self.assertLess(next_ab_peek_pos, next_ab_try_pos)
                     leader_blocks = [
                         ast.unparse(child)
                         for child in ast.walk(node)
@@ -6660,6 +6705,7 @@ class TestPerKiterTmaBuilders(unittest.TestCase):
             tma_barrier_ptr="tma_barrier_ptr",
             tma_full_tile="full_tile",
             tma_next_full_tile="next_full_tile",
+            tma_next_consumer_tile="next_consumer_tile",
             tma_warp="tma_warp",
             tma_atom_a="tma_atom_a",
             tma_atom_b="tma_atom_b",
@@ -6804,6 +6850,44 @@ class TestPerKiterTmaBuilders(unittest.TestCase):
         self.assertNotIn("exec_active", body_src)
         self.assertEqual(node.orelse, [])
 
+    def test_pipeline_consumer_if_can_reuse_prefetched_try_token(self) -> None:
+        args = self._make_args()
+        node = _build_kloop_pipeline_consumer_if(
+            args,
+            gate_exec_warp=False,
+            include_scalar_fallback=False,
+            use_existing_try_token=True,
+        )
+
+        body_src = ast.unparse(ast.Module(body=node.body, type_ignores=[]))
+        self.assertNotIn("consumer_try_wait", body_src)
+        self.assertIn(
+            "ab_pipeline.consumer_wait(ab_consumer_state, ab_consumer_try_token)",
+            body_src,
+        )
+
+    def test_pipeline_consumer_prefetch_two_cta_gates_try_wait_to_leader(
+        self,
+    ) -> None:
+        args = self._make_args(cluster_m=2, is_two_cta=True)
+        stmts = _build_kloop_pipeline_consumer_prefetch_stmts(
+            args, gate_exec_warp=False
+        )
+
+        self.assertEqual(self._stmt_kinds(stmts), ["=Boolean", "If"])
+        peek = stmts[1]
+        self.assertIsInstance(peek, ast.If)
+        self.assertEqual(
+            ast.unparse(peek.test),
+            f"next_consumer_tile and {_TCGEN05_CLUSTER_LEADER_PREDICATE}",
+        )
+        self.assertEqual(self._stmt_kinds(peek.body), ["=consumer_try_wait"])
+
+    def test_pipeline_consumer_prefetch_requires_two_cta(self) -> None:
+        args = self._make_args()
+        with self.assertRaisesRegex(AssertionError, "CtaGroup.TWO"):
+            _build_kloop_pipeline_consumer_prefetch_stmts(args)
+
     def test_pipeline_consumer_two_cta_gates_wait_to_leader(self) -> None:
         args = self._make_args(cluster_m=2, is_two_cta=True)
         node = _build_kloop_pipeline_consumer_if(args)
@@ -6878,8 +6962,6 @@ class TestPerKiterTmaBuilders(unittest.TestCase):
             tcgen05_frag_a="tCrA",
             tcgen05_frag_b="tCrB",
             mma_stage="mma_stage",
-            k_offset_var="offset_2",
-            k_loop_begin_expr="cutlass.Int32(0)",
             is_two_cta=True,
         )
         self.assertIsInstance(node, ast.If)
@@ -6889,6 +6971,28 @@ class TestPerKiterTmaBuilders(unittest.TestCase):
         )
         body_src = ast.unparse(ast.Module(body=node.body, type_ignores=[]))
         self.assertIn("cute.gemm", body_src)
+        self.assertNotIn("offset_2 != cutlass.Int32(0)", body_src)
+        self.assertNotIn("Field.ACCUMULATE, offset_2", body_src)
+        self.assertIn(
+            "tiled_mma.set(cute.nvgpu.tcgen05.Field.ACCUMULATE, True)",
+            body_src,
+        )
+
+    def test_tcgen05_mma_accumulate_reset_two_cta_gates_to_leader(self) -> None:
+        node = _build_tcgen05_mma_accumulate_reset_stmt(
+            "exec_active", tiled_mma="tiled_mma", is_two_cta=True
+        )
+
+        self.assertIsInstance(node, ast.If)
+        self.assertEqual(
+            ast.unparse(node.test),
+            f"exec_active and {_TCGEN05_CLUSTER_LEADER_PREDICATE}",
+        )
+        body_src = ast.unparse(ast.Module(body=node.body, type_ignores=[]))
+        self.assertIn(
+            "tiled_mma.set(cute.nvgpu.tcgen05.Field.ACCUMULATE, False)",
+            body_src,
+        )
 
     def test_non_pipeline_release_advances_both_states(self) -> None:
         args = self._make_args()

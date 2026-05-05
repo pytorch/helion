@@ -27,6 +27,7 @@ from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
 from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
 from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_MAX_K_TILES
 from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_SEED_L2_GROUPING
+from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_SEED_PID_TYPE
 from ..exc import InvalidConfig
 from .block_id_sequence import BlockIdSequence
 from .block_id_sequence import _BlockIdItem
@@ -455,7 +456,7 @@ class ConfigSpec:
         The search space cannot express cross-field constraints directly.
         This helper exposes ``tcgen05_cluster_m=2`` but records enough context
         for search-time normalization to project ``cluster_m=2`` products onto
-        the validated ``persistent_blocked`` + ``256x256`` CtaGroup.TWO block
+        the validated seed pid order + ``256x256`` CtaGroup.TWO block
         tile within the K-tile cap. Problems outside this envelope keep
         ``tcgen05_cluster_m`` narrowed to ``(1,)``.
         """
@@ -472,7 +473,10 @@ class ConfigSpec:
 
     def _tcgen05_cluster_m2_seed_config(self) -> helion.Config | None:
         constraints = self._tcgen05_cluster_m2_search_constraints
-        if constraints is None or "persistent_blocked" not in self.allowed_pid_types:
+        if (
+            constraints is None
+            or TCGEN05_TWO_CTA_SEED_PID_TYPE not in self.allowed_pid_types
+        ):
             return None
         if len(self.block_sizes) != 3:
             return None
@@ -496,7 +500,7 @@ class ConfigSpec:
                         bk,
                     ],
                     "l2_groupings": [TCGEN05_TWO_CTA_SEED_L2_GROUPING],
-                    "pid_type": "persistent_blocked",
+                    "pid_type": TCGEN05_TWO_CTA_SEED_PID_TYPE,
                     "tcgen05_cluster_m": 2,
                     # Matches the validated tcgen05 search restriction.
                     "tcgen05_num_epi_warps": 4,
@@ -536,7 +540,10 @@ class ConfigSpec:
         ):
             return
         constraints = self._tcgen05_cluster_m2_search_constraints
-        if constraints is None or "persistent_blocked" not in self.allowed_pid_types:
+        if (
+            constraints is None
+            or TCGEN05_TWO_CTA_SEED_PID_TYPE not in self.allowed_pid_types
+        ):
             config["tcgen05_cluster_m"] = 1
             return
         block_sizes = config.get("block_sizes")
@@ -550,7 +557,7 @@ class ConfigSpec:
         if not self._tcgen05_cluster_m2_bk_is_valid(bk, constraints):
             config["tcgen05_cluster_m"] = 1
             return
-        config["pid_type"] = "persistent_blocked"
+        config["pid_type"] = TCGEN05_TWO_CTA_SEED_PID_TYPE
         block_sizes[0] = TCGEN05_TWO_CTA_BLOCK_M
         block_sizes[1] = TCGEN05_TWO_CTA_BLOCK_N
 
@@ -634,7 +641,7 @@ class ConfigSpec:
           caller proves the static problem can form validated role-local
           CtaGroup.TWO candidates. The search view may expose ``(1, 2)``,
           but search-time normalization projects ``cluster_m=2`` products
-          onto the validated ``persistent_blocked`` + ``256x256`` tile shape
+          onto the validated seed pid order + ``256x256`` tile shape
           with ``K / bk`` at or below the validated K-tile cap. CUDA launch
           failures are loud, so user-supplied ``cluster_m=2`` is still legal
           and handled by the runtime guard when outside the validated
