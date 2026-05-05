@@ -1555,6 +1555,47 @@ class TestPallas(TestCase):
         self.assertIn("pl.ds(", code)
         torch.testing.assert_close(result, x * r)
 
+    def test_emit_pipeline_no_pipeline_outer_inner_shared_dim(self) -> None:
+        """Don't pipeline a tensor whose dim is shared between outer and inner tiles.
+
+        Regression test: when a kernel reads a tensor at outer scope using
+        an outer block_id (e.g. ``T[tile_m, tile_n]``) and *also* inside an
+        inner emit_pipeline using a different inner block_id on the same
+        dim (e.g. ``T[tile_m, tile_k]``), the kernel needs outer ``pl.ds``
+        slicing for the shared dim.  Pipelining the tensor turns it into
+        an HBM ref, which can't be sliced with ``pl.ds`` -- emit_pipeline
+        then either crashes (HBM read not allowed) or generates the wrong
+        offset.  The classifier must keep such tensors on the outer
+        BlockSpec (no ``_pipeline_arg_indices`` entry).
+        """
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            m, n = x.shape
+            out = torch.empty_like(x)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = x[tile_m, tile_n].to(torch.float32)  # outer-scope use of n
+                # inner emit_pipeline shares x's n dim with the outer tile
+                # via a different block_id -> x's n dim has both
+                # tile_n_bid (outer) and tile_k_bid (inner).
+                for tile_k in hl.tile(n):
+                    acc += x[tile_m, tile_k].to(torch.float32).sum(dim=-1, keepdim=True)
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        x = torch.randn(128, 128, device=DEVICE, dtype=torch.float32)
+        code, _result = code_and_output(
+            fn,
+            (x,),
+            block_sizes=[32, 128, 128],
+            pallas_loop_type="emit_pipeline",
+        )
+        # x's n dim is shared (tile_n outer, tile_k inner), so x must NOT
+        # be pipelined.  The body should use ``pl.ds`` on x at outer scope
+        # rather than emit a pipeline arg for it.
+        self.assertIn("pltpu.emit_pipeline", code)
+        self.assertNotIn("_pipeline_arg_indices=[0", code)
+
     def test_fori_loop_per_tensor_dma_mixed(self) -> None:
         """A fori_loop body can mix DMA-aligned and DMA-unaligned tensors.
 
