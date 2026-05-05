@@ -211,6 +211,7 @@ def is_cuda() -> bool:
 
 PROJECT_ROOT: Path = Path(__file__).parent.parent
 EXAMPLES_DIR: Path = PROJECT_ROOT / "examples"
+TUTORIALS_DIR: Path = PROJECT_ROOT / "tutorials"
 DEVICE = None
 
 
