@@ -1361,10 +1361,10 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
         state, block_ids, block_size_vars
     )
 
-    # Aligned tensors flow through emit_pipeline's per-iter Buffered
-    # BlockSpec; unaligned ones stay on the outer pallas_call BlockSpec
+    # Pipelined tensors flow through emit_pipeline's per-iter Buffered
+    # BlockSpec; the rest stay on the outer pallas_call BlockSpec
     # (escape clause `bs == as`) and are closure-read from the body.
-    all_tensor_info, _vmem_shapes, aligned_tensor_ids = _classify_pipelined_tensors(
+    all_tensor_info, _vmem_shapes, pipelined_tensor_ids = _classify_pipelined_tensors(
         loaded_tensors, stored_tensors, block_ids, slice_size_exprs, env, state
     )
 
@@ -1509,16 +1509,16 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
     from .._compiler.device_function import PallasMemorySpace
 
     for fake, _tensor_node, _sub_meta in loaded_tensors.values():
-        if id(fake) in aligned_tensor_ids:
+        if id(fake) in pipelined_tensor_ids:
             state.device_function.pallas_memory_space[id(fake)] = PallasMemorySpace.HBM
     for fake, _tensor_node, _sub_meta in stored_tensors.values():
-        if id(fake) in aligned_tensor_ids:
+        if id(fake) in pipelined_tensor_ids:
             state.device_function.pallas_memory_space[id(fake)] = PallasMemorySpace.HBM
 
     for key, (fake, _tensor_node, sub_meta) in loaded_tensors.items():
         if key in stored_tensors:
             continue  # Handle as output instead
-        if id(fake) not in aligned_tensor_ids:
+        if id(fake) not in pipelined_tensor_ids:
             continue
         hbm_name = state.device_function.tensor_arg(fake).name
         vmem_name = state.device_function.new_var(
@@ -1530,7 +1530,7 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
         pipeline_in_args.append(hbm_name)
 
     for fake, _tensor_node, sub_meta in stored_tensors.values():
-        if id(fake) not in aligned_tensor_ids:
+        if id(fake) not in pipelined_tensor_ids:
             continue
         hbm_name = state.device_function.tensor_arg(fake).name
         vmem_name = state.device_function.new_var(
@@ -1588,7 +1588,7 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
     # sliced via pl.ds against a VMEM ref whose extent is the whole
     # outer-block window.  Pipelined tensors ignore these offsets and
     # use the ``:`` full-slice inside their VMEM scratches.
-    any_non_pipelined = len(aligned_tensor_ids) < len(all_tensor_info)
+    any_non_pipelined = len(pipelined_tensor_ids) < len(all_tensor_info)
     if any_non_pipelined:
         _needs_explicit_indices = True
         for i, bid in enumerate(block_ids):
@@ -1749,12 +1749,22 @@ def _classify_pipelined_tensors(
 ) -> tuple[
     list[tuple[torch.Tensor, list[object], str]], list[tuple[int, ...]], set[int]
 ]:
-    """Build (all_tensor_info, vmem_shapes, aligned_ids) for an inner loop.
+    """Build (all_tensor_info, vmem_shapes, pipelined_ids) for an inner loop.
 
-    Tensors whose ``vmem_shape`` passes ``_check_dma_alignment`` are eligible
-    for the inner-DMA path (HBM ref + small VMEM scratch in fori_loop, or
-    ``pl.Buffered`` BlockSpec in emit_pipeline); the rest stay on their
-    outer ``pallas_call`` BlockSpec and are closure-read from the body.
+    A tensor is eligible for the inner-DMA path (HBM ref + small VMEM scratch
+    in fori_loop, or ``pl.Buffered`` BlockSpec in emit_pipeline) when:
+
+    * Its inner-block ``vmem_shape`` passes ``_check_dma_alignment`` -- a TPU
+      DMA hardware constraint.
+    * No dim is shared between an *inner-loop* block_id and an *outer*
+      block_id.  When a dim is indexed by both (e.g. the kernel reads
+      ``T[tile_m, tile_n]`` at outer scope and ``T[tile_m, tile_k]`` inside
+      the inner loop), the kernel needs outer ``pl.ds`` slicing for that
+      dim, which only works when the tensor stays on its outer BlockSpec.
+      HBM refs (the pipelined path) can't be sliced directly with ``pl.ds``.
+
+    Tensors that fail either check stay on their outer BlockSpec and are
+    closure-read from the body.
     """
     all_tensor_info: list[tuple[torch.Tensor, list[object], str]] = []
     for key, (fake, _tensor_node, sub_meta) in loaded_tensors.items():
@@ -1765,14 +1775,23 @@ def _classify_pipelined_tensors(
     vmem_shapes = _compute_vmem_shapes(
         all_tensor_info, block_ids, slice_size_exprs, env, state
     )
-    aligned_ids = {
-        id(fake)
-        for (fake, _sub_meta, _direction), vmem_shape in zip(
-            all_tensor_info, vmem_shapes, strict=True
-        )
-        if _check_dma_alignment(vmem_shape)
-    }
-    return all_tensor_info, vmem_shapes, aligned_ids
+    inner_block_id_set = set(block_ids)
+    dim_tilings_map = state.device_function.pallas_tensor_dim_tilings
+    pipelined_ids: set[int] = set()
+    for (fake, _sub_meta, _direction), vmem_shape in zip(
+        all_tensor_info, vmem_shapes, strict=True
+    ):
+        if not _check_dma_alignment(vmem_shape):
+            continue
+        dim_tilings = dim_tilings_map.get(id(fake))
+        if dim_tilings is not None and any(
+            len(d.block_ids) > 1
+            and any(bid not in inner_block_id_set for bid in d.block_ids)
+            for d in dim_tilings
+        ):
+            continue
+        pipelined_ids.add(id(fake))
+    return all_tensor_info, vmem_shapes, pipelined_ids
 
 
 def _codegen_fori_loop(state: CodegenState) -> object:
@@ -1833,13 +1852,13 @@ def _codegen_fori_loop(state: CodegenState) -> object:
             env,
         )
 
-    # Aligned tensors get HBM refs (no outer BlockSpec) + VMEM scratch +
-    # semaphore; unaligned tensors keep their outer BlockSpec and are
-    # accessed via pl.ds() in the body.  Mixing both paths inside a single
-    # fori_loop avoids forcing every tensor onto the non-DMA path when a
-    # lone unaligned tensor is present (which would load full outer-block
+    # Pipelined tensors get HBM refs (no outer BlockSpec) + VMEM scratch +
+    # semaphore; the rest keep their outer BlockSpec and are accessed via
+    # pl.ds() in the body.  Mixing both paths inside a single fori_loop
+    # avoids forcing every tensor onto the non-DMA path when a lone
+    # non-pipelined tensor is present (which would load full outer-block
     # tiles into VMEM and may OOM at large shapes).
-    all_tensor_info, vmem_shapes, aligned_tensor_ids = _classify_pipelined_tensors(
+    all_tensor_info, vmem_shapes, pipelined_tensor_ids = _classify_pipelined_tensors(
         loaded_tensors, stored_tensors, block_ids, slice_size_exprs, env, state
     )
 
@@ -1850,7 +1869,7 @@ def _codegen_fori_loop(state: CodegenState) -> object:
     for (fake, _sub_meta, _direction), vmem_shape in zip(
         all_tensor_info, vmem_shapes, strict=True
     ):
-        if id(fake) not in aligned_tensor_ids:
+        if id(fake) not in pipelined_tensor_ids:
             continue
         state.device_function.pallas_memory_space[id(fake)] = PallasMemorySpace.HBM
         hbm_name = state.device_function.tensor_arg(fake).name
