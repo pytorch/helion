@@ -195,6 +195,32 @@ def codegen_where(ctx: LoweringContext, node: Node) -> object:
     )
 
 
+@where_lowering.register_codegen("cute")
+def codegen_where_cute(ctx: LoweringContext, node: Node) -> object:
+    env = CompileEnvironment.current()
+    cond, x, y = map_arg(node.args, lambda arg: _env_arg(ctx, arg))
+
+    def ensure_ast(value: object) -> ast.AST:
+        if isinstance(value, ast.AST):
+            return value
+        if isinstance(value, (int, float, bool)):
+            return expr_from_string(constant_repr(value))
+        raise AssertionError(f"unsupported where operand: {type(value)!r}")
+
+    output = node.meta.get("val")
+    x_ast = ensure_ast(x)
+    y_ast = ensure_ast(y)
+    if isinstance(output, torch.Tensor):
+        x_ast = env.backend.cast_ast(x_ast, output.dtype)
+        y_ast = env.backend.cast_ast(y_ast, output.dtype)
+    return expr_from_string(
+        env.backend.where_expr("{cond}", "{x}", "{y}"),
+        cond=ensure_ast(cond),
+        x=x_ast,
+        y=y_ast,
+    )
+
+
 @full_lowering.register_codegen("common")
 def codegen_full(ctx: LoweringContext, node: Node) -> object:
     env = CompileEnvironment.current()
