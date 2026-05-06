@@ -606,14 +606,14 @@ KernelMapping = (
         str,
         str,
         Callable[..., Any] | None,
-        Callable[[], list[tuple[str, tuple[Any, ...]]]] | None,
+        Callable[..., list[tuple[str, tuple[Any, ...]]]] | None,
         float | None,
     ]
     | tuple[
         str,
         str,
         Callable[..., Any] | None,
-        Callable[[], list[tuple[str, tuple[Any, ...]]]] | None,
+        Callable[..., list[tuple[str, tuple[Any, ...]]]] | None,
         float | None,
         bool,
     ]
