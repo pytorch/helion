@@ -45,6 +45,44 @@ from .variable_origin import TensorSizeOrigin
 
 log = logging.getLogger(__name__)
 
+TensorDescriptorLayoutSignature = tuple[int | None, tuple[bool, ...]]
+
+
+def _default_tensor_descriptor_size_hint(n: int | torch.SymInt) -> int:
+    return int(n)
+
+
+def tensor_descriptor_layout_signature_from_strides(
+    strides: typing.Sequence[int | torch.SymInt | sympy.Integer],
+    element_size: int,
+    size_hint: typing.Callable[
+        [int | torch.SymInt], int
+    ] = _default_tensor_descriptor_size_hint,
+) -> TensorDescriptorLayoutSignature:
+    """Return the stride layout facts tensor descriptors depend on.
+
+    The signature intentionally records predicates rather than exact strides so
+    dynamic-shape kernels can share code across sizes that have the same tensor
+    descriptor eligibility.
+    """
+    stride_one_dim: int | None = None
+    has_multiple_stride_one_dims = False
+    aligned_dims = []
+    for dim, raw_stride in enumerate(strides):
+        if isinstance(raw_stride, sympy.Integer):
+            stride = int(raw_stride)
+        else:
+            stride = size_hint(raw_stride)
+        if stride == 1:
+            if stride_one_dim is None:
+                stride_one_dim = dim
+            else:
+                has_multiple_stride_one_dims = True
+        aligned_dims.append((stride * element_size) % 16 == 0)
+    if has_multiple_stride_one_dims:
+        stride_one_dim = None
+    return stride_one_dim, tuple(aligned_dims)
+
 
 def _make_numel_check(
     symbols: list[sympy.Basic], expr: sympy.Basic
@@ -163,6 +201,7 @@ class CompileEnvironment:
         self.kernel_min_element_bits: int = 32  # smallest dtype bits across all tensors
         self.specialized_vars: set[sympy.Symbol] = set()
         self.specialized_strides: set[tuple[str, int]] = set()
+        self.tensor_descriptor_layout_guards: dict[str, tuple[int, int]] = {}
         self.jagged_tile_parent_ids: dict[int, list[int]] = {}
         self.jagged_tile_mask_shapes: dict[int, list[torch.SymInt]] = {}
         self._symint_cache: dict[object, torch.SymInt] = {}
@@ -210,6 +249,51 @@ class CompileEnvironment:
             # pyrefly: ignore [bad-assignment]
             expr = expr.xreplace(subs)
         return expr
+
+    def register_tensor_descriptor_layout_guard(
+        self, fake_tensor: torch.Tensor
+    ) -> None:
+        """Specialize dynamic kernels on TD-relevant stride layout predicates."""
+        if self.settings.static_shapes:
+            return
+        source = self.input_sources.get(fake_tensor)
+        if not isinstance(source, LocalSource):
+            return
+        self.tensor_descriptor_layout_guards[source.local_name] = (
+            fake_tensor.ndim,
+            fake_tensor.element_size(),
+        )
+
+    def has_tensor_descriptor_layout_guard(self, fake_tensor: torch.Tensor) -> bool:
+        if self.settings.static_shapes:
+            return True
+        source = self.input_sources.get(fake_tensor)
+        return (
+            isinstance(source, LocalSource)
+            and source.local_name in self.tensor_descriptor_layout_guards
+        )
+
+    def tensor_descriptor_layout_signature(
+        self, fake_tensor: torch.Tensor
+    ) -> TensorDescriptorLayoutSignature | None:
+        has_symbolic_stride = False
+        for stride in fake_tensor.stride():
+            if isinstance(stride, int):
+                continue
+            expr = _to_sympy(stride)
+            expr = self.specialize_expr(self.shape_env.replace(expr))
+            if expr.free_symbols:
+                has_symbolic_stride = True
+                break
+        if has_symbolic_stride and not self.has_tensor_descriptor_layout_guard(
+            fake_tensor
+        ):
+            return None
+        return tensor_descriptor_layout_signature_from_strides(
+            fake_tensor.stride(),
+            fake_tensor.element_size(),
+            self.size_hint,
+        )
 
     def add_kernel_tensor_size(
         self,

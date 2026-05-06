@@ -41,6 +41,9 @@ from .._compile_time import measure
 from .._compiler.ast_extension import unparse
 from .._compiler.backend import TritonBackend
 from .._compiler.compile_environment import CompileEnvironment
+from .._compiler.compile_environment import (
+    tensor_descriptor_layout_signature_from_strides,
+)
 from .._compiler.generate_ast import generate_ast
 from .._compiler.host_function import HostFunction
 from .._compiler.inductor_lowering_extra import patch_inductor_lowerings
@@ -818,7 +821,10 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         Returns:
             list[Callable[[Sequence[object]], Hashable]]: A list of functions that generate extra specialization keys.
         """
-        if not self.env.specialized_vars:
+        if (
+            not self.env.specialized_vars
+            and not self.env.tensor_descriptor_layout_guards
+        ):
             return []
 
         def make_extractor(v: Source) -> Callable[[Sequence[object]], Hashable]:
@@ -867,10 +873,30 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         arg_name_to_index: dict[str, int] = {
             n: i for i, n in enumerate(self.kernel.signature.parameters.keys())
         }
-        extractors = []
+        extractors: list[Callable[[Sequence[object]], Hashable]] = []
         for v in sorted(self.env.specialized_vars, key=lambda v: v.name):
             source = self.env.shape_env.var_to_sources[v][0]
             extractors.append(make_extractor(source))
+        for local_name, (ndim, element_size) in sorted(
+            self.env.tensor_descriptor_layout_guards.items()
+        ):
+            index = arg_name_to_index[local_name]
+
+            def td_layout_extractor(
+                args: Sequence[object],
+                _index: int = index,
+                _ndim: int = ndim,
+                _element_size: int = element_size,
+            ) -> Hashable:
+                tensor = cast("torch.Tensor", args[_index])
+                if tensor.ndim != _ndim:
+                    return tensor.ndim
+                return tensor_descriptor_layout_signature_from_strides(
+                    tensor.stride(),
+                    _element_size,
+                )
+
+            extractors.append(td_layout_extractor)
         return extractors
 
     def _user_provided_config(self) -> Config | None:

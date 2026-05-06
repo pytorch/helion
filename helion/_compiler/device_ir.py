@@ -1900,6 +1900,39 @@ def _register_atomic_tunables(atomic_count: int) -> None:
     )
 
 
+def _register_tensor_descriptor_layout_guards(device_ir: DeviceIR) -> None:
+    env = CompileEnvironment.current()
+    if env.settings.static_shapes:
+        return
+
+    from .._compat import supports_tensor_descriptor
+    from ..language import atomic_ops
+    from ..language import memory_ops
+
+    if not supports_tensor_descriptor():
+        return
+
+    atomic_targets = tuple(getattr(atomic_ops, name) for name in atomic_ops.__all__)
+
+    def tensor_arg_value(arg: object) -> object:
+        if isinstance(arg, torch.fx.Node):
+            return arg.meta.get("val")
+        return arg
+
+    for graph_info in device_ir.graphs:
+        for node in graph_info.graph.nodes:
+            if node.op != "call_function":
+                continue
+            if not (
+                node.target in (memory_ops.load, memory_ops.store)
+                or node.target in atomic_targets
+            ):
+                continue
+            tensor = tensor_arg_value(node.args[0])
+            if isinstance(tensor, torch.Tensor) and 2 <= tensor.ndim <= 5:
+                env.register_tensor_descriptor_layout_guard(tensor)
+
+
 def lower_to_device_ir(func: HostFunction) -> DeviceIR:
     device_ir = DeviceIR()
     with func, device_ir, compile_lock:
@@ -1992,6 +2025,7 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
             store_indices,
         )
         _register_atomic_tunables(_count_device_atomics(device_ir))
+        _register_tensor_descriptor_layout_guards(device_ir)
 
         return device_ir
 

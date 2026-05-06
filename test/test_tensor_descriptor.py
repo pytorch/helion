@@ -513,13 +513,82 @@ class TestTensorDescriptor(RefEagerTestBase, TestCase):
 
         # D=1024 bf16: stride(0)=1024, byte_stride=2048, 16-byte aligned
         x_aligned = torch.randn(64, 1024, device=DEVICE, dtype=torch.bfloat16)
-        result_aligned = add_one(x_aligned)
+        code_aligned, result_aligned = code_and_output(add_one, (x_aligned,))
         torch.testing.assert_close(result_aligned, x_aligned + 1.0)
+        self.assertIn(f"x_desc = {get_tensor_descriptor_fn_name()}", code_aligned)
 
         # D=2047 bf16: stride(0)=2047, byte_stride=4094, NOT 16-byte aligned
         x_unaligned = torch.randn(64, 2047, device=DEVICE, dtype=torch.bfloat16)
-        result_unaligned = add_one(x_unaligned)
+        code_unaligned, result_unaligned = code_and_output(add_one, (x_unaligned,))
         torch.testing.assert_close(result_unaligned, x_unaligned + 1.0)
+        self.assertNotIn(f"x_desc = {get_tensor_descriptor_fn_name()}", code_unaligned)
+
+        @helion.kernel(
+            static_shapes=False,
+            autotune_effort="none",
+            config=helion.Config(
+                block_sizes=[32, 32],
+                indexing="tensor_descriptor",
+            ),
+        )
+        def add_one_reverse_order(x: torch.Tensor) -> torch.Tensor:
+            result = torch.zeros_like(x)
+            for tile in hl.tile(x.size()):
+                result[tile] = x[tile] + 1.0
+            return result
+
+        code_unaligned_first, result_unaligned_first = code_and_output(
+            add_one_reverse_order, (x_unaligned,)
+        )
+        torch.testing.assert_close(result_unaligned_first, x_unaligned + 1.0)
+        self.assertNotIn(
+            f"x_desc = {get_tensor_descriptor_fn_name()}", code_unaligned_first
+        )
+
+        code_aligned_second, result_aligned_second = code_and_output(
+            add_one_reverse_order, (x_aligned,)
+        )
+        torch.testing.assert_close(result_aligned_second, x_aligned + 1.0)
+        self.assertIn(
+            f"x_desc = {get_tensor_descriptor_fn_name()}", code_aligned_second
+        )
+
+    @skipUnlessTensorDescriptor("Tensor descriptor support is required")
+    def test_dynamic_shape_stride_one_dim_guard(self):
+        """Changing stride-one dim within a shape bucket should recompile TD code."""
+
+        @helion.kernel(
+            static_shapes=False,
+            autotune_effort="none",
+            config=helion.Config(
+                block_sizes=[8, 8],
+                indexing=["tensor_descriptor", "pointer"],
+            ),
+        )
+        def copy_input(x: torch.Tensor) -> torch.Tensor:
+            result = torch.empty_like(x)
+            for tile in hl.tile(x.size()):
+                result[tile] = x[tile]
+            return result
+
+        x_contiguous = torch.randn([16, 8], device=DEVICE, dtype=torch.float32)
+        x_transposed = torch.randn([8, 16], device=DEVICE, dtype=torch.float32).t()
+        self.assertEqual(x_contiguous.stride(), (8, 1))
+        self.assertEqual(x_transposed.stride(), (1, 16))
+
+        code_contiguous, result_contiguous = code_and_output(
+            copy_input, (x_contiguous,)
+        )
+        torch.testing.assert_close(result_contiguous, x_contiguous)
+        self.assertIn(f"x_desc = {get_tensor_descriptor_fn_name()}", code_contiguous)
+        self.assertNotIn("tl.permute", code_contiguous)
+
+        code_transposed, result_transposed = code_and_output(
+            copy_input, (x_transposed,)
+        )
+        torch.testing.assert_close(result_transposed, x_transposed)
+        self.assertIn(f"x_desc = {get_tensor_descriptor_fn_name()}", code_transposed)
+        self.assertIn("tl.permute", code_transposed)
 
     def assert_uses_tensor_descriptors(self, code: str) -> None:
         self.assertIn(get_tensor_descriptor_fn_name(), code)
