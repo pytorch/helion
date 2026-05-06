@@ -546,6 +546,27 @@ def _setup_loop_carried_state(
     return scratch_names, result_vars, carried
 
 
+def _emit_nonlocal_scratch_declarations(
+    state: CodegenState,
+    body_stmts: list[ast.AST],
+) -> None:
+    """Insert ``nonlocal <scratch>`` at the top of the closure body.
+
+    Without ``nonlocal``, an assignment like ``scratch = scratch[...]`` inside
+    a fori_loop/emit_pipeline closure makes ``scratch`` local to the entire
+    function, causing an UnboundLocalError on the RHS read.
+
+    We emit nonlocal for *all* VMEM scratch args, not just the current loop's
+    carried state, because an outer loop body may contain ``scratch = scratch[...]``
+    from a nested inner loop's ``_read_final_loop_state``.
+    """
+    names = [
+        s.name for s in state.device_function._scratch_args if s.scratch_type == "vmem"
+    ]
+    if names:
+        body_stmts.insert(0, ast.Nonlocal(names=names))
+
+
 def _remap_args_to_scratch(
     args: list[ast.AST],
     scratch_names: list[str],
@@ -1615,6 +1636,8 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
         if has_loop_state:
             _write_back_loop_carried(state, scratch_names, carried, graph_results)
 
+    _emit_nonlocal_scratch_declarations(state, body_stmts)
+
     all_body_params = body_params
     # emit_pipeline passes indices as a single tuple argument; the prologue
     # always references _pipeline_indices, so the body always takes it.
@@ -2015,6 +2038,8 @@ def _codegen_fori_loop(state: CodegenState) -> object:
                 statement_from_string(f"{copy_out_var}.start()")
             )
             state.codegen.add_statement(statement_from_string(f"{copy_out_var}.wait()"))
+
+    _emit_nonlocal_scratch_declarations(state, body_stmts)
 
     # Emit nested fori_loop calls — one per dimension.
     # Build inside-out: innermost function wraps body_stmts, each outer
@@ -2541,12 +2566,15 @@ def _(state: CodegenState) -> ast.AST:
             mask_var := state.codegen.mask_var(index)
         ) is not None:
             expand = state.tile_strategy.expand_str(input_sizes, dim)
-            expr = f"({mask_var}{expand})"
+            # Cast bool mask to float before expanding — Mosaic cannot
+            # reshape bool vectors (e.g. vector<32xi1> → vector<32x1xi1>).
+            expr = f"({mask_var}.astype(jnp.float32){expand})"
             if expr not in mask_exprs:
                 mask_exprs.append(expr)
     if not mask_exprs:
         return state.ast_arg(0)
-    mask_expr = "&".join(mask_exprs)
+    # Combine float masks via multiplication (equivalent to bool AND).
+    mask_expr = " * ".join(mask_exprs)
     if len(mask_exprs) < len(input_sizes):
         mask_expr = backend.broadcast_to_expr(
             mask_expr, state.tile_strategy.shape_str(input_sizes)

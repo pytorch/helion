@@ -866,7 +866,6 @@ class TestExamples(RefEagerTestBase, TestCase):
         lambda: _get_backend() == "cute",
         "CuTe dynamic attention destabilizes later cute tests when it fails in-process",
     )
-    @xfailIfPallas("JAX tracer error with dynamic shapes")
     def test_attention_dynamic(self):
         args = (
             torch.randn(1, 32, 512, 64, dtype=torch.float32, device=DEVICE),

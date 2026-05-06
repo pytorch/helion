@@ -112,6 +112,26 @@ def pallas_bmm(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
 
 
 @helion.kernel(backend="pallas", static_shapes=True)
+def pallas_bmm_subrange_k(
+    A: torch.Tensor, B: torch.Tensor, k_start: int, k_end: int
+) -> torch.Tensor:
+    """BMM where the K reduction only covers [k_start, k_end)."""
+    b, m, k = A.size()
+    b2, k2, n = B.size()
+    out = torch.zeros(
+        [b, m, n], device=A.device, dtype=torch.promote_types(A.dtype, B.dtype)
+    )
+    for tile_b, tile_m, tile_n in hl.tile([b, m, n]):
+        acc = hl.zeros([tile_b, tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k_start, k_end):
+            acc = torch.baddbmm(
+                acc, A[tile_b, tile_m, tile_k], B[tile_b, tile_k, tile_n]
+            )
+        out[tile_b, tile_m, tile_n] = acc
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
 def pallas_sum_reduction(x: torch.Tensor) -> torch.Tensor:
     n, _m = x.size()
     out = torch.empty([n], dtype=x.dtype, device=x.device)
@@ -713,6 +733,25 @@ class TestPallas(TestCase):
         )
         expected = torch.bmm(a.float(), b.float()).to(torch.bfloat16)
         torch.testing.assert_close(result, expected, rtol=1e-2, atol=1e-2)
+
+    @xfailIfPallas("Non-zero begin K reduction: DMA offset not tile-aligned")
+    def test_bmm_nonzero_k_begin(self) -> None:
+        """BMM with K reduction starting at non-zero offset, across all loop types."""
+        a = torch.randn(4, 128, 384, device=DEVICE, dtype=torch.bfloat16)
+        b = torch.randn(4, 384, 128, device=DEVICE, dtype=torch.bfloat16)
+        k_start, k_end = 128, 384
+        expected = torch.bmm(
+            a[:, :, k_start:k_end].float(), b[:, k_start:k_end, :].float()
+        ).to(torch.bfloat16)
+        for loop_type in ("unroll", "fori_loop", "emit_pipeline"):
+            with self.subTest(pallas_loop_type=loop_type):
+                _code, result = code_and_output(
+                    pallas_bmm_subrange_k,
+                    (a, b, k_start, k_end),
+                    block_sizes=[4, 128, 128, 256],
+                    pallas_loop_type=loop_type,
+                )
+                torch.testing.assert_close(result, expected, rtol=1e-2, atol=1e-2)
 
     def test_emit_pipeline_codegen(self) -> None:
         """Test that pallas_loop_type='emit_pipeline' generates correct emit_pipeline code."""
@@ -2061,6 +2100,52 @@ class TestPallas(TestCase):
         _code2, result2 = code_and_output(sum_with_dynamic_offset, (data, offsets))
         torch.testing.assert_close(result2, ref, rtol=1e-3, atol=1e-3)
 
+    def test_dma_buffer_offset_nested_tile(self) -> None:
+        """Inner loop reading outer-tiled tensor must use ':' not absolute offset."""
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def outer_in_inner(
+            x: torch.Tensor, y: torch.Tensor, offsets: torch.Tensor
+        ) -> torch.Tensor:
+            A = hl.specialize(x.size(1))
+            B = hl.specialize(x.size(2))
+            num_segs = offsets.size(0) - 1
+            out = torch.zeros([num_segs, A, B], dtype=x.dtype, device=x.device)
+            for seg in hl.grid(num_segs):
+                start = offsets[seg]
+                end = offsets[seg + 1]
+                for tile_i in hl.tile(start, end):
+                    for tile_j in hl.tile(start, end):
+                        out[seg, :, :] = (
+                            out[seg, :, :]
+                            + x[tile_i, :, :].sum(dim=0)
+                            + y[tile_j, :, :].sum(dim=0)
+                        )
+            return out
+
+        N, A, B = 128, 8, 256
+        x = torch.randn(N, A, B, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(N, A, B, device=DEVICE, dtype=torch.float32)
+        offsets = torch.tensor([0, 64, 128], device=DEVICE, dtype=torch.int32)
+
+        _code, result = code_and_output(
+            outer_in_inner,
+            (x, y, offsets),
+            block_sizes=[32, 32],
+            pallas_loop_type="fori_loop",
+        )
+
+        block = 32
+        ref = torch.zeros(offsets.size(0) - 1, A, B, device=DEVICE, dtype=x.dtype)
+        for seg in range(offsets.size(0) - 1):
+            s, e = int(offsets[seg]), int(offsets[seg + 1])
+            for i in range(0, e - s, block):
+                for j in range(0, e - s, block):
+                    ref[seg] += x[s + i : s + i + block].sum(dim=0) + y[
+                        s + j : s + j + block
+                    ].sum(dim=0)
+        torch.testing.assert_close(result, ref, rtol=1e-3, atol=1e-3)
+
     def test_jagged_sum_3d(self) -> None:
         """3D jagged sum with load-time masking for out-of-bounds data."""
 
@@ -2105,6 +2190,94 @@ class TestPallas(TestCase):
             ]
         )
         torch.testing.assert_close(result, ref, rtol=1e-3, atol=1e-3)
+
+    def test_nested_fori_loop_scratch_scoping(self) -> None:
+        """Nested hl.tile(start, end) with inner accumulator"""
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def nested_tile_sum(
+            x: torch.Tensor, y: torch.Tensor, offsets: torch.Tensor
+        ) -> torch.Tensor:
+            A = hl.specialize(x.size(1))
+            B = hl.specialize(x.size(2))
+            num_segs = offsets.size(0) - 1
+            out = torch.zeros([num_segs, A, B], dtype=x.dtype, device=x.device)
+            for seg in hl.grid(num_segs):
+                start = offsets[seg]
+                end = offsets[seg + 1]
+                acc = hl.zeros([1, A, B], dtype=x.dtype)
+                for tile_i in hl.tile(start, end):
+                    inner_acc = hl.zeros([1, A, B], dtype=x.dtype)
+                    for tile_j in hl.tile(start, end):
+                        inner_acc = inner_acc + (x[tile_i, :, :] * y[tile_j, :, :]).sum(
+                            dim=0
+                        ).unsqueeze(0)
+                    acc = acc + inner_acc
+                out[seg, :, :] = acc.squeeze(0)
+            return out
+
+        N, A, B = 128, 8, 256
+        x = torch.randn(N, A, B, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(N, A, B, device=DEVICE, dtype=torch.float32)
+        offsets = torch.tensor([0, 64, 128], device=DEVICE, dtype=torch.int32)
+
+        _code, result = code_and_output(
+            nested_tile_sum,
+            (x, y, offsets),
+            block_sizes=[32, 32],
+            pallas_loop_type="fori_loop",
+        )
+
+        block = 32
+        ref = torch.zeros(offsets.size(0) - 1, A, B, device=DEVICE, dtype=x.dtype)
+        for seg in range(offsets.size(0) - 1):
+            s, e = int(offsets[seg]), int(offsets[seg + 1])
+            for i in range(0, e - s, block):
+                for j in range(0, e - s, block):
+                    ref[seg] += (
+                        x[s + i : s + i + block] * y[s + j : s + j + block]
+                    ).sum(dim=0)
+        torch.testing.assert_close(result, ref, rtol=1e-3, atol=1e-3)
+
+    def test_nested_tile_matmul_mask_cast(self) -> None:
+        """Two nested data-dependent tiles with matmul need float mask expansion."""
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def jagged_kernel(
+            x: torch.Tensor, y: torch.Tensor, offsets: torch.Tensor
+        ) -> torch.Tensor:
+            num_segs = offsets.size(0) - 1
+            out = torch.zeros([num_segs], dtype=x.dtype, device=x.device)
+            for seg in hl.grid(num_segs):
+                start = offsets[seg]
+                end = offsets[seg + 1]
+                acc = hl.zeros([1], dtype=x.dtype)
+                for tile_i in hl.tile(start, end):
+                    for tile_j in hl.tile(start, end):
+                        gram = torch.matmul(
+                            x[tile_i, :], y[tile_j, :].transpose(-2, -1)
+                        )
+                        acc = acc + gram.sum(dim=0).sum(dim=0).unsqueeze(0)
+                out[seg] = acc.squeeze(0)
+            return out
+
+        N, D = 128, 128
+        x = torch.randn(N, D, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(N, D, device=DEVICE, dtype=torch.float32)
+        offsets = torch.tensor([0, 64, 128], device=DEVICE, dtype=torch.int32)
+
+        _code, result = code_and_output(
+            jagged_kernel,
+            (x, y, offsets),
+            block_sizes=[32, 32],
+            pallas_loop_type="fori_loop",
+        )
+
+        ref = torch.zeros(offsets.size(0) - 1, device=DEVICE, dtype=x.dtype)
+        for i in range(offsets.size(0) - 1):
+            s, e = int(offsets[i]), int(offsets[i + 1])
+            ref[i] = (x[s:e] @ y[s:e].T).sum()
+        torch.testing.assert_close(result, ref, rtol=1e-2, atol=1e-2)
 
 
 @skipUnlessPallas("JAX/Pallas TPU not available")

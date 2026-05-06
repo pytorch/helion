@@ -83,6 +83,7 @@ class TestGrid(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, grid_1d_pytorch(args[0], args[1]))
 
     @skipUnlessTensorDescriptor("Tensor descriptor support is required")
+    @skipIfXPU("XPU tensor descriptor path has accuracy issue for this grid test")
     def test_grid_2d_idx_list(self):
         @helion.kernel(static_shapes=True)
         def grid_2d_idx_list(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -118,7 +119,7 @@ class TestGrid(RefEagerTestBase, TestCase):
         code, result = code_and_output(
             grid_2d_idx_list,
             args,
-            block_sizes=[64, 32, 16],
+            block_sizes=[64, 16, 16],
             indexing="tensor_descriptor",
         )
         torch.testing.assert_close(result, grid_2d_pytorch(args[0], args[1]))

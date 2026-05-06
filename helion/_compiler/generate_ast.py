@@ -784,7 +784,7 @@ def generate_ast(
                 resolved_wrapper_plans: list[dict[str, object]] = []
                 for plan in codegen.cute_wrapper_plans:
                     resolved = dict(plan)
-                    for key in ("lhs_name", "rhs_name", "c_name"):
+                    for key in ("lhs_name", "rhs_name", "c_name", "d_name"):
                         if key in resolved:
                             resolved[key[:-5] + "_idx"] = launcher_arg_positions[
                                 str(resolved.pop(key))
