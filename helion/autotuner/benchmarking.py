@@ -19,30 +19,9 @@ T = TypeVar("T")
 
 
 def synchronize_device(result: object = None) -> None:
-    """Wait for device computation to complete.
-
-    For TPU tensors, uses ``torch_tpu``'s tensor-level sync which truly
-    blocks until the device finishes (``torch.accelerator.synchronize()``
-    does not reliably wait on ``torch_tpu``).  For all other cases, falls
-    back to ``torch.accelerator.synchronize()``.
-    """
-    if isinstance(result, torch.Tensor) and result.device.type == "tpu":
-        try:
-            from torch_tpu._internal.sync import (  # pyrefly: ignore[missing-import]
-                synchronize as tpu_sync,
-            )
-
-            tpu_sync(result, wait=True)
-            return
-        except ImportError:
-            raise ImportError(
-                "torch_tpu is required for reliable device synchronization on TPU. "
-                "Install torch_tpu or torch.accelerator.synchronize() will return "
-                "before device computation finishes, producing incorrect benchmarks."
-            ) from None
+    """Wait for device computation to complete."""
     if (
         not is_pallas_interpret()
-        and _get_backend() != "pallas"
         and torch.accelerator.is_available()
     ):
         torch.accelerator.synchronize()
