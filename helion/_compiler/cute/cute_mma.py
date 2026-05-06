@@ -66,6 +66,11 @@ from .tcgen05_constants import TCGEN05_ACC_PRODUCER_MODE_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_ACC_PRODUCER_MODE_NORMAL
 from .tcgen05_constants import TCGEN05_ACC_PRODUCER_MODE_SKIP_UMMA
 from .tcgen05_constants import TCGEN05_CLUSTER_M2_ONE_CTA_ROLE_LOCAL_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_BLOCK_SIZES
+from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_CLUSTER_M
+from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_PID_TYPE
+from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_PROBLEM_SHAPE
 from .tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
 
 if TYPE_CHECKING:
@@ -1391,6 +1396,33 @@ def _emit_mma_pipeline(
     m_size = int(lhs_fake.shape[0])
     n_size = int(rhs_fake.shape[1])
 
+    tcgen05_cluster_m = _tcgen05_cluster_m(df.config)
+    tcgen05_large_bn_proof = _tcgen05_large_bn_proof_enabled(df.config)
+    if tcgen05_large_bn_proof and (
+        not _tcgen05_large_bn_proof_shape(
+            bm=bm,
+            bn=bn,
+            bk=bk,
+            tcgen05_cluster_m=tcgen05_cluster_m,
+        )
+        or (m_size, n_size, k_total_size) != TCGEN05_LARGE_BN_PROOF_PROBLEM_SHAPE
+        or cast("_ConfigLike", df.config).get("pid_type", "flat")
+        != TCGEN05_LARGE_BN_PROOF_PID_TYPE
+    ):
+        raise exc.BackendUnsupported(
+            "cute",
+            f"{TCGEN05_LARGE_BN_PROOF_CONFIG_KEY}=True requires the guarded "
+            "G4 proof envelope "
+            f"M={TCGEN05_LARGE_BN_PROOF_PROBLEM_SHAPE[0]},"
+            f"N={TCGEN05_LARGE_BN_PROOF_PROBLEM_SHAPE[1]},"
+            f"K={TCGEN05_LARGE_BN_PROOF_PROBLEM_SHAPE[2]},"
+            f"bm={TCGEN05_LARGE_BN_PROOF_BLOCK_SIZES[0]},"
+            f"bn={TCGEN05_LARGE_BN_PROOF_BLOCK_SIZES[1]},"
+            f"bk={TCGEN05_LARGE_BN_PROOF_BLOCK_SIZES[2]},"
+            f"tcgen05_cluster_m={TCGEN05_LARGE_BN_PROOF_CLUSTER_M},"
+            f"pid_type={TCGEN05_LARGE_BN_PROOF_PID_TYPE!r}",
+        )
+
     mma_impl = _choose_mma_impl(input_dtype, bm=bm, bn=bn, bk=bk, config=df.config)
     zero_acc_expr = acc_expr is not None and _is_zero_acc_expr(acc_expr)
     if (
@@ -1410,7 +1442,6 @@ def _emit_mma_pipeline(
         m_size % bm == 0 and n_size % bn == 0 and k_total_size % bk == 0
     )
     tcgen05_pid_is_persistent = _is_persistent_pid_config(df.config)
-    tcgen05_cluster_m = _tcgen05_cluster_m(df.config)
     tcgen05_requested_two_cta = _tcgen05_use_2cta_instrs(
         bm=bm, cluster_m=tcgen05_cluster_m
     )
@@ -1628,6 +1659,18 @@ def _emit_mma_pipeline(
         and tcgen05_role_local_codegen_allowed
         and (not _is_persistent_pid_config(df.config) or tcgen05_use_role_local_epi)
     )
+    if tcgen05_large_bn_proof and (
+        mma_impl != "tcgen05"
+        or tcgen05_is_two_cta
+        or not tcgen05_use_tma_pipeline
+        or not tcgen05_static_full_tiles
+        or not tcgen05_use_tma_store_epilogue
+    ):
+        raise exc.BackendUnsupported(
+            "cute",
+            f"{TCGEN05_LARGE_BN_PROOF_CONFIG_KEY}=True requires final tcgen05 "
+            "CtaGroup.ONE TMA-load and TMA-store lowering for the G4 proof",
+        )
     tcgen05_collective_handles_operand_loads = (
         mma_impl == "tcgen05"
         and fx_node is not None
@@ -3267,6 +3310,22 @@ def _tcgen05_cluster_m(config: object) -> int:
     return max(1, min(2, _tcgen05_config_int(config, "tcgen05_cluster_m", 1)))
 
 
+def _tcgen05_large_bn_proof_enabled(config: object | None) -> bool:
+    return config is not None and (
+        cast("_ConfigLike", config).get(TCGEN05_LARGE_BN_PROOF_CONFIG_KEY, False)
+        is True
+    )
+
+
+def _tcgen05_large_bn_proof_shape(
+    *, bm: int, bn: int, bk: int, tcgen05_cluster_m: int
+) -> bool:
+    return (
+        (bm, bn, bk) == TCGEN05_LARGE_BN_PROOF_BLOCK_SIZES
+        and tcgen05_cluster_m == TCGEN05_LARGE_BN_PROOF_CLUSTER_M
+    )
+
+
 def _tcgen05_use_2cta_instrs(*, bm: int, cluster_m: int) -> bool:
     # Match Quack/CUTLASS SM100: clustered kernels are not automatically the
     # tcgen05 "CTA pair" instruction family. The special 2-CTA instructions only
@@ -3313,14 +3372,21 @@ def _mma_impl_matches_problem_shape(
     bn: int,
     bk: int,
     tcgen05_cluster_m: int = 1,
+    tcgen05_large_bn_proof: bool = False,
 ) -> bool:
     if mma_impl == "universal":
         return True
-    if (
-        input_dtype not in (torch.float16, torch.bfloat16)
-        or bn < 8
-        or bn > 256
-        or bn % 8 != 0
+    if input_dtype not in (torch.float16, torch.bfloat16) or bn < 8 or bn % 8 != 0:
+        return False
+    if bn > 256 and (
+        mma_impl != "tcgen05"
+        or not tcgen05_large_bn_proof
+        or not _tcgen05_large_bn_proof_shape(
+            bm=bm,
+            bn=bn,
+            bk=bk,
+            tcgen05_cluster_m=tcgen05_cluster_m,
+        )
     ):
         return False
     if mma_impl == "warp":
@@ -3330,8 +3396,9 @@ def _mma_impl_matches_problem_shape(
         # tcgen05 mma instruction K is 16 elements for BF16/FP16, but the
         # tile's K can be any positive multiple of that (the inner cute.gemm
         # loop just runs more instructions per K iteration). Larger tile_k
-        # roughly halves the per-K-iter overhead per doubling. Capped at 256
-        # to keep AB SMEM staging budget sane.
+        # roughly halves the per-K-iter overhead per doubling. Production
+        # remains capped at block_n=256 to keep AB SMEM staging budget sane;
+        # the explicit G4 proof key admits only the smallest 512-N candidate.
         if bk < 16 or bk > 256 or bk % 16 != 0:
             return False
         if bm in (64, 128):
@@ -3393,6 +3460,7 @@ def _choose_mma_impl(
     tcgen05_cluster_m = 1
     if config is not None:
         tcgen05_cluster_m = _tcgen05_cluster_m(config)
+    tcgen05_large_bn_proof = _tcgen05_large_bn_proof_enabled(config)
     env_choice = os.environ.get("HELION_CUTE_MMA_IMPL", "auto").strip().lower()
     support = get_cute_mma_support()
     if env_choice != "auto":
@@ -3411,6 +3479,7 @@ def _choose_mma_impl(
             bn=bn,
             bk=bk,
             tcgen05_cluster_m=tcgen05_cluster_m,
+            tcgen05_large_bn_proof=tcgen05_large_bn_proof,
         ):
             return env_choice
         return "universal"
@@ -3421,6 +3490,7 @@ def _choose_mma_impl(
         bn=bn,
         bk=bk,
         tcgen05_cluster_m=tcgen05_cluster_m,
+        tcgen05_large_bn_proof=tcgen05_large_bn_proof,
     ):
         if support.tcgen05_f16bf16:
             return "tcgen05"

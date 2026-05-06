@@ -109,6 +109,11 @@ from helion._compiler.cute.tcgen05_constants import (
 from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_DIAGNOSTIC_INVALID_OUTPUT_CONFIG_KEY,
 )
+from helion._compiler.cute.tcgen05_constants import TCGEN05_LARGE_BN_PROOF_BLOCK_SIZES
+from helion._compiler.cute.tcgen05_constants import TCGEN05_LARGE_BN_PROOF_CLUSTER_M
+from helion._compiler.cute.tcgen05_constants import TCGEN05_LARGE_BN_PROOF_CONFIG_KEY
+from helion._compiler.cute.tcgen05_constants import TCGEN05_LARGE_BN_PROOF_PID_TYPE
+from helion._compiler.cute.tcgen05_constants import TCGEN05_LARGE_BN_PROOF_STAGE_CONFIGS
 from helion._compiler.device_ir import ForLoopGraphInfo
 from helion._compiler.device_ir import RootGraphInfo
 from helion._compiler.device_ir import collect_cute_half_atomic_output_promotions
@@ -124,6 +129,7 @@ from helion._testing import DEVICE
 from helion._testing import default_cute_mma_support
 from helion._testing import onlyBackends
 from helion._testing import patch_cute_mma_support
+from helion.autotuner.config_spec import BlockSizeSpec
 from helion.autotuner.config_spec import ConfigSpec
 import helion.language as hl
 from helion.language import _tracing_ops
@@ -182,6 +188,27 @@ def _make_tcgen05_cluster_m2_cta_group_one_bridge_config(
         "range_warp_specializes": [None, None],
         "range_num_stages": [0, 0],
         "range_unroll_factors": [0, 0],
+    }
+    defaults.update(overrides)
+    return _make_tcgen05_persistent_config(**defaults)
+
+
+def _make_tcgen05_large_bn_proof_config(**overrides: object) -> helion.Config:
+    """Build the first G4 larger-BN admission proof config."""
+    defaults: dict[str, object] = {
+        "block_sizes": list(TCGEN05_LARGE_BN_PROOF_BLOCK_SIZES),
+        "l2_groupings": [1],
+        "num_warps": 4,
+        "pid_type": TCGEN05_LARGE_BN_PROOF_PID_TYPE,
+        "indexing": [
+            "tensor_descriptor",
+            "tensor_descriptor",
+            "tensor_descriptor",
+        ],
+        "tcgen05_cluster_m": TCGEN05_LARGE_BN_PROOF_CLUSTER_M,
+        **dict(TCGEN05_LARGE_BN_PROOF_STAGE_CONFIGS),
+        "tcgen05_num_epi_warps": 4,
+        TCGEN05_LARGE_BN_PROOF_CONFIG_KEY: True,
     }
     defaults.update(overrides)
     return _make_tcgen05_persistent_config(**defaults)
@@ -822,6 +849,98 @@ class TestCuteLowerings(unittest.TestCase):
             "if tcgen05_epi_active:",
             code,
         )
+
+    def test_tcgen05_large_bn_proof_admits_minimal_codegen(self) -> None:
+        from helion._compiler.program_id import Tcgen05PersistentProgramIDs
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_large_bn_proof(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        args = (
+            torch.randn(64, 16, device=DEVICE, dtype=torch.float16),
+            torch.randn(16, 512, device=DEVICE, dtype=torch.float16),
+        )
+        config = _make_tcgen05_large_bn_proof_config()
+
+        with patch_cute_mma_support():
+            bound = cute_matmul_large_bn_proof.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            code = bound.to_triton_code(config)
+
+        self.assertIn("cutlass.utils.blackwell_helpers.make_trivial_tiled_mma", code)
+        self.assertIn("cute.nvgpu.tcgen05.CtaGroup.ONE", code)
+        self.assertIn("(64, 512)", code)
+        self.assertIn(
+            "tcgen05_gC = cute.local_tile(tcgen05_tma_store_tensor, (64, 512),",
+            code,
+        )
+        self.assertIn("cutlass.pipeline.PipelineTmaStore.create", code)
+        self.assertNotIn("_helion_cute_cluster_shape = (2, 1, 1)", code)
+        self.assertNotIn(Tcgen05PersistentProgramIDs._MULTI_TILE_GUARD_TOTAL_VAR, code)
+
+    def test_tcgen05_large_bn_proof_rejects_non_proof_shapes(self) -> None:
+        @helion.kernel(backend="cute")
+        def cute_matmul_large_bn_wrong_shape(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        args = (
+            torch.randn(128, 16, device=DEVICE, dtype=torch.float16),
+            torch.randn(16, 512, device=DEVICE, dtype=torch.float16),
+        )
+        config = _make_tcgen05_large_bn_proof_config(block_sizes=[128, 512, 16])
+
+        with patch_cute_mma_support():
+            bound = cute_matmul_large_bn_wrong_shape.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            with self.assertRaisesRegex(
+                exc.InvalidConfig,
+                "tcgen05_ab_stages=2, tcgen05_acc_stages=1, and tcgen05_c_stages=2",
+            ):
+                bound.to_triton_code(config)
+
+        config = _make_tcgen05_large_bn_proof_config()
+        with patch_cute_mma_support():
+            bound = cute_matmul_large_bn_wrong_shape.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            with self.assertRaisesRegex(
+                exc.BackendUnsupported,
+                "M=64,N=512,K=16",
+            ):
+                bound.to_triton_code(config)
+
+        noncontiguous_args = (
+            torch.randn(16, 64, device=DEVICE, dtype=torch.float16).t(),
+            torch.randn(16, 512, device=DEVICE, dtype=torch.float16),
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_large_bn_wrong_shape.bind(noncontiguous_args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            with self.assertRaisesRegex(
+                exc.BackendUnsupported,
+                "final tcgen05 CtaGroup.ONE TMA-load and TMA-store lowering",
+            ):
+                bound.to_triton_code(config)
 
     def test_tcgen05_dot_codegen_preregisters_collective_loads(self) -> None:
         @helion.kernel(backend="cute")
@@ -3097,6 +3216,83 @@ class TestCuteLowerings(unittest.TestCase):
         self.assertEqual(code.count("tcgen05_ab_pipeline.producer_try_acquire("), 1)
         self.assertIn("tcgen05_ab_producer_state.advance()", code)
         self.assertIn("tcgen05_ab_pipeline.producer_tail(", code)
+
+    def test_tcgen05_large_bn_proof_config_validation(self) -> None:
+        """Larger-BN proof flag is explicit and tcgen05-only."""
+
+        config_spec = ConfigSpec(backend=CuteBackend())
+        with self.assertRaisesRegex(
+            exc.InvalidConfig,
+            "tcgen05-enabled CuTe matmul kernels",
+        ):
+            config_spec.normalize({TCGEN05_LARGE_BN_PROOF_CONFIG_KEY: True})
+
+        config_spec.cute_tcgen05_search_enabled = True
+        for block_id, size_hint in enumerate(TCGEN05_LARGE_BN_PROOF_BLOCK_SIZES):
+            config_spec.block_sizes.append(
+                BlockSizeSpec(
+                    block_id=block_id,
+                    size_hint=size_hint,
+                    max_size=size_hint,
+                )
+            )
+        with self.assertRaisesRegex(exc.InvalidConfig, "must be a boolean"):
+            config_spec.normalize(
+                {
+                    "block_sizes": list(TCGEN05_LARGE_BN_PROOF_BLOCK_SIZES),
+                    "tcgen05_cluster_m": TCGEN05_LARGE_BN_PROOF_CLUSTER_M,
+                    **dict(TCGEN05_LARGE_BN_PROOF_STAGE_CONFIGS),
+                    TCGEN05_LARGE_BN_PROOF_CONFIG_KEY: "yes",
+                }
+            )
+
+        config = {
+            "block_sizes": list(TCGEN05_LARGE_BN_PROOF_BLOCK_SIZES),
+            "tcgen05_cluster_m": TCGEN05_LARGE_BN_PROOF_CLUSTER_M,
+            **dict(TCGEN05_LARGE_BN_PROOF_STAGE_CONFIGS),
+            TCGEN05_LARGE_BN_PROOF_CONFIG_KEY: True,
+        }
+        config_spec.normalize(config)
+        self.assertIs(config[TCGEN05_LARGE_BN_PROOF_CONFIG_KEY], True)
+        with self.assertRaisesRegex(
+            exc.InvalidConfig,
+            "tcgen05_ab_stages=2, tcgen05_acc_stages=1, and tcgen05_c_stages=2",
+        ):
+            config_spec.normalize(
+                {
+                    "block_sizes": list(TCGEN05_LARGE_BN_PROOF_BLOCK_SIZES),
+                    "tcgen05_cluster_m": 2,
+                    **dict(TCGEN05_LARGE_BN_PROOF_STAGE_CONFIGS),
+                    TCGEN05_LARGE_BN_PROOF_CONFIG_KEY: True,
+                }
+            )
+        with self.assertRaisesRegex(
+            exc.InvalidConfig,
+            "tcgen05_ab_stages=2, tcgen05_acc_stages=1, and tcgen05_c_stages=2",
+        ):
+            config_spec.normalize(
+                {
+                    "block_sizes": list(TCGEN05_LARGE_BN_PROOF_BLOCK_SIZES),
+                    "tcgen05_cluster_m": TCGEN05_LARGE_BN_PROOF_CLUSTER_M,
+                    "pid_type": "persistent_blocked",
+                    **dict(TCGEN05_LARGE_BN_PROOF_STAGE_CONFIGS),
+                    TCGEN05_LARGE_BN_PROOF_CONFIG_KEY: True,
+                }
+            )
+        with self.assertRaisesRegex(
+            exc.InvalidConfig,
+            "tcgen05_ab_stages=2, tcgen05_acc_stages=1, and tcgen05_c_stages=2",
+        ):
+            config_spec.normalize(
+                {
+                    "block_sizes": list(TCGEN05_LARGE_BN_PROOF_BLOCK_SIZES),
+                    "tcgen05_cluster_m": TCGEN05_LARGE_BN_PROOF_CLUSTER_M,
+                    "tcgen05_ab_stages": 2,
+                    "tcgen05_acc_stages": 2,
+                    "tcgen05_c_stages": 2,
+                    TCGEN05_LARGE_BN_PROOF_CONFIG_KEY: True,
+                }
+            )
 
     def test_tcgen05_ab_initial_producer_acquire_mode_config_validation(
         self,
@@ -6704,6 +6900,38 @@ class TestCuteLowerings(unittest.TestCase):
                 )
                 self.assertEqual(
                     _choose_mma_impl(torch.float16, bm=32, bn=16, bk=16),
+                    "universal",
+                )
+                self.assertEqual(
+                    _choose_mma_impl(torch.float16, bm=64, bn=512, bk=16),
+                    "universal",
+                )
+                self.assertEqual(
+                    _choose_mma_impl(
+                        torch.float16,
+                        bm=64,
+                        bn=512,
+                        bk=16,
+                        config=helion.Config(
+                            block_sizes=[64, 512, 16],
+                            tcgen05_cluster_m=1,
+                            **{TCGEN05_LARGE_BN_PROOF_CONFIG_KEY: True},
+                        ),
+                    ),
+                    "tcgen05",
+                )
+                self.assertEqual(
+                    _choose_mma_impl(
+                        torch.float16,
+                        bm=128,
+                        bn=512,
+                        bk=16,
+                        config=helion.Config(
+                            block_sizes=[128, 512, 16],
+                            tcgen05_cluster_m=1,
+                            **{TCGEN05_LARGE_BN_PROOF_CONFIG_KEY: True},
+                        ),
+                    ),
                     "universal",
                 )
 

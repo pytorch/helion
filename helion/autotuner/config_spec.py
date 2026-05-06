@@ -69,6 +69,11 @@ from .._compiler.cute.tcgen05_constants import (
 )
 from .._compiler.cute.tcgen05_constants import TCGEN05_EPILOGUE_LAYOUT_CONFIG_KEY
 from .._compiler.cute.tcgen05_constants import TCGEN05_EPILOGUE_LAYOUTS
+from .._compiler.cute.tcgen05_constants import TCGEN05_LARGE_BN_PROOF_BLOCK_SIZES
+from .._compiler.cute.tcgen05_constants import TCGEN05_LARGE_BN_PROOF_CLUSTER_M
+from .._compiler.cute.tcgen05_constants import TCGEN05_LARGE_BN_PROOF_CONFIG_KEY
+from .._compiler.cute.tcgen05_constants import TCGEN05_LARGE_BN_PROOF_PID_TYPE
+from .._compiler.cute.tcgen05_constants import TCGEN05_LARGE_BN_PROOF_STAGE_CONFIGS
 from .._compiler.cute.tcgen05_constants import TCGEN05_ONE_CTA_MAX_BLOCK_M
 from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
 from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
@@ -191,6 +196,7 @@ _BACKEND_DIAGNOSTIC_CONFIG_KEYS: frozenset[str] = frozenset(
         TCGEN05_CUBIN_LINEINFO_CONFIG_KEY,
         TCGEN05_DIAGNOSTIC_INVALID_OUTPUT_CONFIG_KEY,
         TCGEN05_EPILOGUE_LAYOUT_CONFIG_KEY,
+        TCGEN05_LARGE_BN_PROOF_CONFIG_KEY,
     }
 )
 
@@ -1211,6 +1217,47 @@ class ConfigSpec:
                     raise InvalidConfig(
                         f"{TCGEN05_CUBIN_LINEINFO_CONFIG_KEY} must be a boolean"
                     )
+        if TCGEN05_LARGE_BN_PROOF_CONFIG_KEY in config:
+            if not self.cute_tcgen05_search_enabled:
+                if _fix_invalid:
+                    config.pop(TCGEN05_LARGE_BN_PROOF_CONFIG_KEY, None)
+                else:
+                    raise InvalidConfig(
+                        f"{TCGEN05_LARGE_BN_PROOF_CONFIG_KEY} is only "
+                        "supported for tcgen05-enabled CuTe matmul kernels"
+                    )
+            elif not isinstance(config[TCGEN05_LARGE_BN_PROOF_CONFIG_KEY], bool):
+                if _fix_invalid:
+                    config.pop(TCGEN05_LARGE_BN_PROOF_CONFIG_KEY, None)
+                else:
+                    raise InvalidConfig(
+                        f"{TCGEN05_LARGE_BN_PROOF_CONFIG_KEY} must be a boolean"
+                    )
+            elif config[TCGEN05_LARGE_BN_PROOF_CONFIG_KEY] is True:
+                proof_envelope_matches = (
+                    tuple(cast("list[int]", config.get("block_sizes", [])))
+                    == TCGEN05_LARGE_BN_PROOF_BLOCK_SIZES
+                    and config.get("tcgen05_cluster_m", 1)
+                    == TCGEN05_LARGE_BN_PROOF_CLUSTER_M
+                    and config.get("pid_type", "flat")
+                    == TCGEN05_LARGE_BN_PROOF_PID_TYPE
+                    and all(
+                        config.get(key) == expected
+                        for key, expected in TCGEN05_LARGE_BN_PROOF_STAGE_CONFIGS
+                    )
+                )
+                if not proof_envelope_matches:
+                    if _fix_invalid:
+                        config.pop(TCGEN05_LARGE_BN_PROOF_CONFIG_KEY, None)
+                    else:
+                        raise InvalidConfig(
+                            f"{TCGEN05_LARGE_BN_PROOF_CONFIG_KEY}=True requires "
+                            f"block_sizes={list(TCGEN05_LARGE_BN_PROOF_BLOCK_SIZES)}, "
+                            f"tcgen05_cluster_m={TCGEN05_LARGE_BN_PROOF_CLUSTER_M}, "
+                            f"pid_type={TCGEN05_LARGE_BN_PROOF_PID_TYPE!r}, "
+                            "tcgen05_ab_stages=2, tcgen05_acc_stages=1, "
+                            "and tcgen05_c_stages=2"
+                        )
         if TCGEN05_CLUSTER_M2_ONE_CTA_ROLE_LOCAL_CONFIG_KEY in config:
             if not self.cute_tcgen05_search_enabled:
                 if _fix_invalid:

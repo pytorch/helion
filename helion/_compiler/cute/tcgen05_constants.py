@@ -119,6 +119,19 @@ TCGEN05_AB_CONSUMER_PHASE_MODES = (
     TCGEN05_AB_CONSUMER_PHASE_MODE_PHASE1,
 )
 TCGEN05_CUBIN_LINEINFO_CONFIG_KEY = "tcgen05_cubin_lineinfo"
+# Diagnostic-only G4 admission proof. This key lets tests exercise the
+# smallest larger-BN tcgen05 codegen candidate without broadening production
+# selector/search defaults.
+TCGEN05_LARGE_BN_PROOF_CONFIG_KEY = "tcgen05_large_bn_proof"
+TCGEN05_LARGE_BN_PROOF_PROBLEM_SHAPE = (64, 512, 16)
+TCGEN05_LARGE_BN_PROOF_BLOCK_SIZES = (64, 512, 16)
+TCGEN05_LARGE_BN_PROOF_CLUSTER_M = 1
+TCGEN05_LARGE_BN_PROOF_PID_TYPE = "flat"
+TCGEN05_LARGE_BN_PROOF_STAGE_CONFIGS = (
+    ("tcgen05_ab_stages", 2),
+    ("tcgen05_acc_stages", 1),
+    ("tcgen05_c_stages", 2),
+)
 # Diagnostic-only codegen proof for the guarded clustered CtaGroup.ONE bridge.
 TCGEN05_CLUSTER_M2_ONE_CTA_ROLE_LOCAL_CONFIG_KEY = (
     "tcgen05_cluster_m2_one_cta_role_local"
