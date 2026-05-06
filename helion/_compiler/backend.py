@@ -2269,21 +2269,11 @@ def _loop_contains_atomic(
     fn: DeviceFunction,
     block_ids: list[int],
 ) -> bool:
-    from ..language import atomic_ops
     from ..language._decorators import is_api_func
+    from ..language.atomic_ops import ATOMIC_OPS as atomic_targets
     from .device_ir import RootGraphInfo
     from .host_function import HostFunction
 
-    atomic_targets = {
-        atomic_ops.atomic_add,
-        atomic_ops.atomic_and,
-        atomic_ops.atomic_cas,
-        atomic_ops.atomic_max,
-        atomic_ops.atomic_min,
-        atomic_ops.atomic_or,
-        atomic_ops.atomic_xchg,
-        atomic_ops.atomic_xor,
-    }
     device_ir = HostFunction.current().device_ir
     graph_by_id = {
         graph_info.graph_id: graph_info

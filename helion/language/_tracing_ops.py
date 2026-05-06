@@ -1840,8 +1840,11 @@ def _classify_pipelined_tensors(
     Tensors that fail any check stay on their outer BlockSpec and are
     closure-read from the body.
     """
+    from .atomic_ops import ATOMIC_OPS
     from .memory_ops import load as _load_op
     from .memory_ops import store as _store_op
+
+    outer_access_targets = ATOMIC_OPS | {_load_op, _store_op}
 
     all_tensor_info: list[tuple[torch.Tensor, list[object], str]] = []
     for key, (fake, _tensor_node, sub_meta) in loaded_tensors.items():
@@ -1856,14 +1859,16 @@ def _classify_pipelined_tensors(
     inner_block_id_set = set(block_ids)
     grid_block_id_set = {bid for ids in device_ir.grid_block_ids for bid in ids}
 
-    # Walk all root graphs (outer pallas_call body) for load/store nodes.
-    # Anything indexed there is read/written outside the inner loop and
-    # must stay on the outer BlockSpec.
+    # Walk all root graphs (outer pallas_call body) for load/store/atomic
+    # nodes.  Pallas lowers atomics as load-compute-store on the same ref,
+    # so an outer-scope atomic on T is also an outer-scope memory access
+    # that breaks pipelining (HBM ref can't be pl.ds'd outside the inner
+    # emit_pipeline / fori_loop body).
     outer_access_tensor_ids: set[int] = set()
     for root_id in device_ir.root_ids:
         root_graph = device_ir.graphs[root_id].graph
         for node in root_graph.nodes:
-            if node.op != "call_function" or node.target not in (_load_op, _store_op):
+            if node.op != "call_function" or node.target not in outer_access_targets:
                 continue
             tensor_node = node.args[0]
             if not isinstance(tensor_node, torch.fx.Node):
