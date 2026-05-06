@@ -126,7 +126,11 @@ class PatternSearch(PopulationBasedSearch):
                 n_random = max(0, self.initial_population - len(pop))
                 pop.extend(self.config_gen.random_flat() for _ in range(n_random))
             return pop
-        return self.config_gen.random_population_flat(self.initial_population)
+        return self.config_gen.random_population_flat(
+            self.initial_population,
+            user_seed_configs=self._autotune_seed_configs(),
+            log_func=self.log,
+        )
 
     def _autotune(self) -> Config:
         initial_population_name = self.initial_population_strategy.name

@@ -65,6 +65,7 @@ from helion.autotuner.local_cache import LocalAutotuneCache
 from helion.autotuner.local_cache import StrictLocalAutotuneCache
 from helion.autotuner.logger import AutotuneLogEntry
 from helion.autotuner.logger import AutotuningLogger
+from helion.autotuner.pattern_search import InitialPopulationStrategy
 from helion.autotuner.random_search import RandomSearch
 import helion.language as hl
 from helion.language import loops
@@ -2653,6 +2654,80 @@ class TestAutotuneCacheSelection(TestCase):
                     ValueError, "Unknown HELION_AUTOTUNE_CACHE"
                 ):
                     bound.settings.autotuner_fn(bound, args)
+
+
+@onlyBackends(["triton"])
+class TestAutotuneSeedConfigs(TestCase):
+    """Tests for seeding initial autotune populations with user configs."""
+
+    def _make_kernel_and_args(self, **kernel_kwargs):
+        @helion.kernel(autotune_log_level=0, **kernel_kwargs)
+        def add(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(a)
+            for tile in hl.tile(out.size()):
+                out[tile] = a[tile] + b[tile]
+            return out
+
+        args = (
+            torch.randn([128], device=DEVICE),
+            torch.randn([128], device=DEVICE),
+        )
+        return add, args
+
+    def _population_configs(self, search: PatternSearch) -> list[helion.Config]:
+        return [
+            search.config_gen.unflatten(flat)
+            for flat in search._generate_initial_population_flat()
+        ]
+
+    def test_decorator_accepts_single_seed_config(self) -> None:
+        seed_config = helion.Config(block_sizes=[16], num_warps=8)
+        add, _args = self._make_kernel_and_args(autotune_seed_configs=seed_config)
+
+        self.assertEqual(add.settings.autotune_seed_configs, seed_config)
+        self.assertEqual(add.configs, [])
+
+    def test_random_initial_population_includes_seed_configs(self) -> None:
+        seed_config = helion.Config(num_warps=8)
+        add, args = self._make_kernel_and_args(autotune_seed_configs=[seed_config])
+        bound = add.bind(args)
+        search = PatternSearch(bound, args, initial_population=3)
+
+        configs = self._population_configs(search)
+
+        self.assertGreaterEqual(len(configs), 3)
+        self.assertTrue(any(config.num_warps == 8 for config in configs))
+
+    def test_best_available_initial_population_includes_seed_configs(self) -> None:
+        seed_config = helion.Config(num_warps=8)
+        add, args = self._make_kernel_and_args(autotune_seed_configs=[seed_config])
+        bound = add.bind(args)
+        search = PatternSearch(
+            bound,
+            args,
+            initial_population_strategy=InitialPopulationStrategy.FROM_BEST_AVAILABLE,
+        )
+
+        with patch.object(BaseSearch, "_find_similar_cached_configs", return_value=[]):
+            configs = self._population_configs(search)
+
+        self.assertGreaterEqual(len(configs), 2)
+        self.assertTrue(any(config.num_warps == 8 for config in configs))
+
+    def test_random_initial_population_logs_invalid_seed_configs(self) -> None:
+        seed_config = helion.Config.from_dict({"block_sizes": ["bad"]})
+        add, args = self._make_kernel_and_args(autotune_seed_configs=[seed_config])
+        bound = add.bind(args)
+        search = PatternSearch(bound, args, initial_population=3)
+        search.log = Mock()
+
+        configs = self._population_configs(search)
+
+        self.assertGreaterEqual(len(configs), 3)
+        search.log.assert_called_once()
+        self.assertIn(
+            "Failed to transfer autotune seed config 1", search.log.call_args[0][0]
+        )
 
 
 @skipIfRefEager("Autotuning requires compilation, not supported in ref eager mode")

@@ -7,6 +7,7 @@ import itertools
 import operator
 import random
 from typing import TYPE_CHECKING
+from typing import Callable
 from typing import cast
 
 from .._compat import warps_to_threads
@@ -20,6 +21,7 @@ from helion._dist_utils import sync_seed
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
+    from collections.abc import Sequence
 
     from .. import Config
     from . import ConfigSpec
@@ -401,6 +403,34 @@ class ConfigGeneration:
             result.append((flat, normalized))
         return result
 
+    def user_seed_flat_config_pairs(
+        self,
+        user_seed_configs: Sequence[Config],
+        log_func: Callable[[str], None] | None = None,
+    ) -> list[tuple[FlatConfig, Config]]:
+        """Return user-provided seed configs as flat and normalized configs."""
+        result: list[tuple[FlatConfig, Config]] = []
+        seen: set[Config] = set()
+        for i, config in enumerate(user_seed_configs):
+            try:
+                flat = self.flatten(config)
+                normalized = self.unflatten(flat)
+            except (
+                InvalidConfig,
+                ValueError,
+                TypeError,
+                KeyError,
+                AssertionError,
+            ) as e:
+                if log_func is not None:
+                    log_func(f"Failed to transfer autotune seed config {i + 1}: {e}")
+                continue
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            result.append((flat, normalized))
+        return result
+
     def random_flat(self) -> FlatConfig:
         """
         Generate a random flat configuration.
@@ -429,26 +459,52 @@ class ConfigGeneration:
             f"failed to generate a valid random config after 64 attempts: {summary}"
         )
 
-    def random_population_flat(self, n: int) -> list[FlatConfig]:
+    def random_population_flat(
+        self,
+        n: int,
+        *,
+        user_seed_configs: Sequence[Config] = (),
+        log_func: Callable[[str], None] | None = None,
+    ) -> list[FlatConfig]:
         if n <= 0:
             return [self.default_flat()]
         default_flat = self.default_flat()
         result = [default_flat]
-        if len(result) >= n:
-            return result[:n]
+
+        # Initial population order is default -> user seed configs -> compiler seeds
+        # -> random.  This preserves user seed priority without dropping built-in
+        # backend/compiler seeds from ConfigSpec.autotune_seed_configs().
+        for flat, _config in self.user_seed_flat_config_pairs(
+            user_seed_configs, log_func
+        ):
+            if any(flat == existing for existing in result):
+                continue
+            result.append(flat)
+            if len(result) >= n:
+                return result[:n]
+
         for flat, _config in self.seed_flat_config_pairs():
             if any(flat == existing for existing in result):
                 continue
             result.append(flat)
             if len(result) >= n:
                 return result[:n]
+
         result.extend(self.random_flat() for _ in range(n - len(result)))
         return result
 
-    def random_population(self, n: int) -> list[Config]:
+    def random_population(
+        self,
+        n: int,
+        *,
+        user_seed_configs: Sequence[Config] = (),
+        log_func: Callable[[str], None] | None = None,
+    ) -> list[Config]:
         result: list[Config] = []
         attempts = 0
-        for flat in self.random_population_flat(n):
+        for flat in self.random_population_flat(
+            n, user_seed_configs=user_seed_configs, log_func=log_func
+        ):
             try:
                 result.append(self.unflatten(flat))
             except InvalidConfig:

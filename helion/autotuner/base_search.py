@@ -145,6 +145,23 @@ class _CodeSentinel:
 _CODE_SENTINEL = _CodeSentinel()
 
 
+def normalize_autotune_seed_configs(settings: Settings) -> tuple[Config, ...]:
+    """Return user-provided autotune seed configs from settings as concrete Configs."""
+    from ..runtime.config import Config
+
+    seed_configs = settings.autotune_seed_configs
+    if seed_configs is None:
+        return ()
+    if isinstance(seed_configs, Config):
+        return (seed_configs,)
+    if isinstance(seed_configs, dict):
+        return (Config.from_dict(seed_configs),)
+    return tuple(
+        Config.from_dict(seed_config) if isinstance(seed_config, dict) else seed_config
+        for seed_config in seed_configs
+    )
+
+
 def _normalize_spec_key(key: object) -> object:
     """Replace types.CodeType with a stable sentinel in a spec key tree."""
     return tree_map_only(types.CodeType, lambda _: _CODE_SENTINEL, key)
@@ -535,6 +552,10 @@ class BaseSearch(BaseAutotuner):
         """
         raise NotImplementedError
 
+    def _autotune_seed_configs(self) -> Sequence[Config]:
+        """Return user-provided autotune seed configs normalized from settings."""
+        return normalize_autotune_seed_configs(self.settings)
+
     def set_generation(self, generation: int) -> None:
         self._autotune_metrics.num_generations = generation
 
@@ -765,6 +786,17 @@ class PopulationBasedSearch(BaseSearch):
         result: list[FlatConfig] = [default_flat]
         self.log("Starting with default config")
 
+        # User seed configs are explicit requests, so try them before compiler-owned
+        # seeds and cached configs while still deduplicating normalized configs.
+        for flat, transferred_config in self.config_gen.user_seed_flat_config_pairs(
+            self._autotune_seed_configs(), self.log
+        ):
+            if transferred_config not in seen:
+                seen.add(transferred_config)
+                result.append(flat)
+
+        # Compiler-owned seeds come from ConfigSpec.autotune_seed_configs();
+        # they encode backend/compiler heuristics and complement user seed configs.
         for flat, transferred_config in self.config_gen.seed_flat_config_pairs():
             if transferred_config not in seen:
                 seen.add(transferred_config)
