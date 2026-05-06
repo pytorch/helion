@@ -2,6 +2,12 @@ from __future__ import annotations
 
 from functools import lru_cache
 import inspect
+from typing import TYPE_CHECKING
+from typing import Any
+from typing import cast
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 
 @lru_cache(maxsize=1)
@@ -54,7 +60,7 @@ def cutedsl_tmem_allocator_has_dealloc_init_kwarg() -> bool:
     except Exception:
         return True
     init = TmemAllocator.__init__
-    inner = getattr(init, "__wrapped__", init)
+    inner = cast("Callable[..., Any]", getattr(init, "__wrapped__", init))
     try:
         sig = inspect.signature(inner)
     except (TypeError, ValueError):

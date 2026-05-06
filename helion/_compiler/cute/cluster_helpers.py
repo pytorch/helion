@@ -64,10 +64,10 @@ def store_shared_remote_x4(
         [
             remote_smem_ptr_i32,
             remote_mbar_ptr_i32,
-            dtype(val0).ir_value(loc=loc, ip=ip),
-            dtype(val1).ir_value(loc=loc, ip=ip),
-            dtype(val2).ir_value(loc=loc, ip=ip),
-            dtype(val3).ir_value(loc=loc, ip=ip),
+            dtype(val0).ir_value(loc=loc, ip=ip),  # pyrefly: ignore [bad-argument-type]
+            dtype(val1).ir_value(loc=loc, ip=ip),  # pyrefly: ignore [bad-argument-type]
+            dtype(val2).ir_value(loc=loc, ip=ip),  # pyrefly: ignore [bad-argument-type]
+            dtype(val3).ir_value(loc=loc, ip=ip),  # pyrefly: ignore [bad-argument-type]
         ],
         "{\n\t"
         f".reg .v4 .{suffix} abcd;\n\t"
