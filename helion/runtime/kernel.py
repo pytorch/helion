@@ -42,8 +42,8 @@ from .._compiler.ast_extension import unparse
 from .._compiler.backend import TritonBackend
 from .._compiler.compile_environment import CompileEnvironment
 from .._compiler.generate_ast import generate_ast
-from .._compiler.host_function import HostFunction
 from .._compiler.inductor_lowering_extra import patch_inductor_lowerings
+from .._compiler.kernel_compiler import KernelCompiler
 from .._compiler.output_header import assert_no_conflicts
 from .._compiler.variable_origin import ArgumentOrigin
 from .._dist_utils import _find_process_group_name
@@ -64,6 +64,7 @@ if TYPE_CHECKING:
 
     from torch._guards import Source
 
+    from .._compiler.host_function import HostFunction
     from ..autotuner import ConfigSpec
     from ..autotuner.base_cache import BoundKernelInMemoryCacheKey
 
@@ -451,9 +452,8 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                 measure("BoundKernel.create_host_function"),
             ):
                 try:
-                    # pyrefly: ignore [bad-assignment]
-                    self.host_function: HostFunction = HostFunction(
-                        # pyrefly: ignore [bad-argument-type]
+                    compiler = KernelCompiler(self.env)
+                    self.host_function: HostFunction = compiler.compile(
                         self.kernel.fn,
                         self.fake_args,
                         constexpr_args,

@@ -2,9 +2,8 @@ from __future__ import annotations
 
 import ast
 import contextlib
-import inspect
+import dataclasses
 import sys
-import textwrap
 import threading
 import typing
 from typing import TYPE_CHECKING
@@ -17,8 +16,6 @@ from torch._inductor.codegen.wrapper import pexpr
 from torch.utils._sympy.symbol import SymT
 from torch.utils._sympy.symbol import symbol_is_type
 
-from .. import exc
-from .._compile_time import measure
 from . import ast_extension
 from .ast_extension import expr_from_string
 from .ast_extension import statement_from_string
@@ -26,7 +23,6 @@ from .compile_environment import CompileEnvironment
 from .output_header import SOURCE_MODULE
 from .source_location import SourceLocation
 from .source_location import UnknownLocation
-from .tensor_utils import patch_tensor_factories
 from .type_printer import print_ast
 from .variable_origin import AttributeOrigin
 from .variable_origin import GlobalOrigin
@@ -34,8 +30,10 @@ from .variable_origin import NameOrigin
 from .variable_origin import Origin
 
 if TYPE_CHECKING:
+    import inspect
     import types
 
+    from .device_ir import DeviceIR
     from .type_propagation import TypeInfo
 
     class _TLS(Protocol):
@@ -72,90 +70,143 @@ class SymbolOrigin(NamedTuple):
         return self.origin.depth()
 
 
+@dataclasses.dataclass
+class KernelDef:
+    """The kernel's structural definition.
+
+    Holds the function, its AST, and parameter bindings. Populated by
+    KernelCompiler.parse(). The AST body may be mutated by subsequent
+    compilation passes (e.g. static loop unrolling).
+    """
+
+    fn: types.FunctionType
+    constexpr_args: dict[str, object]
+    name: str
+    args: ast.arguments
+    body: list[ast.stmt]
+    params: inspect.BoundArguments
+
+
+@dataclasses.dataclass
+class CompilerState:
+    """Mutable state accumulated during compilation passes.
+
+    Tracks symbol and tensor provenance, import requirements, and
+    resource allocation. Populated progressively during compilation,
+    consumed by code generation.
+    """
+
+    expr_to_origin: dict[sympy.Expr, SymbolOrigin] = dataclasses.field(
+        default_factory=dict
+    )
+    tensor_to_origin: dict[torch.Tensor, Origin] = dataclasses.field(
+        default_factory=dict
+    )
+    global_imports: dict[str, GlobalImport] = dataclasses.field(default_factory=dict)
+    rng_seed_slot_count: int = 0
+
+
 class HostFunction:
-    """Parsed and lowered representation of a @helion.kernel function.
+    """Mutable compilation state for a @helion.kernel function.
 
-    Constructed once per specialization during BoundKernel initialization.
-    Parses kernel source into an ExtendedAST, then runs config-independent
-    frontend passes to produce a DeviceIR:
+    Composed of structured sub-states:
 
-      1. Static loop unrolling (pure AST rewrite)
-      2. Type propagation (annotates AST, builds origin tracking
-         and config spec)
-      3. Config spec finalization
-      4. Device IR lowering (traces annotated AST into FX graphs)
+      - definition: KernelDef — function, AST, and parameter bindings
+      - compiler_state: CompilerState — provenance tracking and imports
+      - device_ir: DeviceIR — FX graphs from lowering
 
-    These passes share mutable state across this object and
-    CompileEnvironment; the config spec in particular accumulates
-    contributions from passes 2-4.
-
-    The DeviceIR is later consumed by generate_ast() once per Config
-    to produce backend-specific output code. Accessed by compiler
-    passes via HostFunction.current() (thread-local stack).
+    Created and driven through the pipeline by KernelCompiler.
+    Accessed by compiler passes via HostFunction.current().
     """
 
     def __init__(
         self,
         fn: types.FunctionType,
-        fake_args: list[object],
-        constexpr_args: dict[str, object],
     ) -> None:
         super().__init__()
-        env = CompileEnvironment.current()
         # pyrefly: ignore [read-only]
-        self.fn = fn
-        self.constexpr_args = constexpr_args
+        self._fn = fn
         self.location: SourceLocation = UnknownLocation()
-        self.local_types: dict[str, TypeInfo] | None = None
-        self.expr_to_origin: dict[sympy.Expr, SymbolOrigin] = {}
-        self.tensor_to_origin: dict[torch.Tensor, Origin] = {}
-        self.global_imports: dict[str, GlobalImport] = {}
-        self.rng_seed_slot_count = 0
-        with self:
-            with measure("HostFunction.parse_ast"):
-                source_indented = inspect.getsource(fn)
-                source = textwrap.dedent(source_indented)
-                self.column_offset: int = source_indented.index(source[0])
+        self.definition: KernelDef | None = None
+        self.compiler_state: CompilerState = CompilerState()
+        self._device_ir: DeviceIR | None = None
+        # TODO(hinriksnaer): could be a local in KernelCompiler.parse()
+        # if SourceLocation.from_ast() took code/column_offset explicitly.
+        self._column_offset: int = 0
 
-                self.params: inspect.BoundArguments = inspect.signature(fn).bind(
-                    *fake_args
-                )
-                self.params.apply_defaults()
+    # Backward-compatible accessors
 
-                root: ast.FunctionDef = HostFunction._parse_source(source)
-                self.name: str = root.name
-                self.args: ast.arguments = root.args
-                self.body: list[ast.stmt] = root.body
-                assert isinstance(root, ast_extension.ExtendedAST)
-                self.location = root._location
+    # TODO(hinriksnaer): migrate call sites to hf.definition.* and
+    # hf.compiler_state.* directly, then remove these properties.
 
-            from .device_ir import lower_to_device_ir
-            from .static_loop_unroller import unroll_static_loops
-            from .type_propagation import propagate_types
+    @property
+    def fn(self) -> types.FunctionType:
+        if self.definition is not None:
+            return self.definition.fn
+        return self._fn
 
-            with (
-                # Disable autocast so that compilation reflects the actual dtypes
-                # written in the kernel, not the caller's mixed-precision context.
-                torch._C._DisableAutocast(),
-                # When the PyTorch profiler is active, it may call guard_int()
-                # on unbacked SymInts which adds entries to
-                # shape_env.replacements, concretizing block-size variables.
-                # suppress_guards() prevents this by skipping guard
-                # installation (including replacements) in evaluate_expr.
-                self._suppress_guards_if_profiler_enabled(env),
-                torch.device(env.device),
-            ):
-                with measure("HostFunction.unroll_static_loops"):
-                    unroll_static_loops(self)
-                with measure("HostFunction.propagate_types"):
-                    propagate_types(self)
-                with measure("HostFunction.finalize_config_spec"):
-                    env.finalize_config_spec()
-                with (
-                    measure("HostFunction.lower_to_device_ir"),
-                    patch_tensor_factories(),
-                ):
-                    self.device_ir = lower_to_device_ir(self)
+    @property
+    def constexpr_args(self) -> dict[str, object]:
+        assert self.definition is not None
+        return self.definition.constexpr_args
+
+    @property
+    def name(self) -> str:
+        assert self.definition is not None
+        return self.definition.name
+
+    @property
+    def args(self) -> ast.arguments:
+        assert self.definition is not None
+        return self.definition.args
+
+    @property
+    def body(self) -> list[ast.stmt]:
+        assert self.definition is not None
+        return self.definition.body
+
+    @body.setter
+    def body(self, value: list[ast.stmt]) -> None:
+        assert self.definition is not None
+        self.definition.body = value
+
+    @property
+    def params(self) -> inspect.BoundArguments:
+        assert self.definition is not None
+        return self.definition.params
+
+    @property
+    def column_offset(self) -> int:
+        return self._column_offset
+
+    @property
+    def device_ir(self) -> DeviceIR:
+        assert self._device_ir is not None
+        return self._device_ir
+
+    @device_ir.setter
+    def device_ir(self, value: DeviceIR) -> None:
+        self._device_ir = value
+
+    @property
+    def expr_to_origin(self) -> dict[sympy.Expr, SymbolOrigin]:
+        return self.compiler_state.expr_to_origin
+
+    @property
+    def tensor_to_origin(self) -> dict[torch.Tensor, Origin]:
+        return self.compiler_state.tensor_to_origin
+
+    @property
+    def global_imports(self) -> dict[str, GlobalImport]:
+        return self.compiler_state.global_imports
+
+    @property
+    def rng_seed_slot_count(self) -> int:
+        return self.compiler_state.rng_seed_slot_count
+
+    @rng_seed_slot_count.setter
+    def rng_seed_slot_count(self, value: int) -> None:
+        self.compiler_state.rng_seed_slot_count = value
 
     @staticmethod
     def _suppress_guards_if_profiler_enabled(
@@ -164,45 +215,6 @@ class HostFunction:
         if torch.autograd.profiler._is_profiler_enabled:
             return env.shape_env.suppress_guards()
         return contextlib.nullcontext()
-
-    @staticmethod
-    def _parse_source(source: str) -> ast.FunctionDef:
-        """Parse dedented source into a validated ExtendedAST FunctionDef."""
-        root = ast.parse(source)
-        assert isinstance(root, ast.Module)
-        function_defs = [
-            stmt for stmt in root.body if isinstance(stmt, ast.FunctionDef)
-        ]
-        assert len(function_defs) == 1, (
-            f"expected one function definition in parsed source, got "
-            f"{[type(stmt).__name__ for stmt in root.body]}"
-        )
-        (root,) = function_defs
-        root = ast_extension.convert(root)
-        assert isinstance(root, ast.FunctionDef)
-        HostFunction.validate_ast(root)
-        return root
-
-    @staticmethod
-    def validate_ast(root: ast.FunctionDef) -> None:
-        # There must always be at least one decorator otherwise we would not have gotten this far
-        if len(root.decorator_list) > 1:
-            # Decorators are allowed before the helion kernel decorator
-            # but are not allowed after
-            def get_decorator_name(decorator: ast.expr) -> str:
-                if isinstance(decorator, ast.Name):
-                    return decorator.id
-                if isinstance(decorator, ast.Attribute):
-                    return get_decorator_name(decorator.value)
-                if isinstance(decorator, ast.Call):
-                    return get_decorator_name(decorator.func)
-                raise AssertionError(f"Unknown decorator: {decorator}")
-
-            for idx, decorator in enumerate(root.decorator_list):
-                # TODO(oulgen): this can break if someone did `import helion as helion2`
-                if get_decorator_name(decorator) == "helion":
-                    if idx != len(root.decorator_list) - 1:
-                        raise exc.DecoratorAfterHelionKernelDecorator
 
     def global_scope_origin(self, name: str) -> AttributeOrigin:
         if SOURCE_MODULE not in self.global_imports:
@@ -256,10 +268,8 @@ class HostFunction:
         return seed_slot
 
     def set_local_types(self, local_types: dict[str, TypeInfo]) -> None:
-        fn = HostFunction.current()
-        self.local_types = local_types
         for name, type_info in local_types.items():
-            type_info.populate_symbol_origins(NameOrigin(name, fn))
+            type_info.populate_symbol_origins(NameOrigin(name, self))
 
     def sympy_expr(self, expr: sympy.Expr) -> str:
         env = CompileEnvironment.current()
@@ -296,8 +306,9 @@ class HostFunction:
                     ast.FunctionDef(self.name, self.args, self.body, [], None)
                 )
             ),
-            self.device_ir.debug_str(),
         ]
+        if self._device_ir is not None:
+            result.append(self._device_ir.debug_str())
         return "\n\n".join(result)
 
     def codegen_function_def(
