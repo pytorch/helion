@@ -35,6 +35,12 @@ from .._compiler.cute.tcgen05_constants import TCGEN05_C_STORE_MODE_CONFIG_KEY
 from .._compiler.cute.tcgen05_constants import TCGEN05_C_STORE_MODE_NORMAL
 from .._compiler.cute.tcgen05_constants import TCGEN05_C_STORE_MODE_SKIP_EPILOGUE_STORE
 from .._compiler.cute.tcgen05_constants import TCGEN05_EPILOGUE_LAYOUT_CONFIG_KEY
+from .._compiler.cute.tcgen05_constants import (
+    TCGEN05_EPILOGUE_LAYOUT_MODULE_HELPER_ACC_T2R,
+)
+from .._compiler.cute.tcgen05_constants import (
+    TCGEN05_EPILOGUE_LAYOUT_MODULE_HELPER_STORE_TAIL,
+)
 from .._compiler.cute.tcgen05_constants import TCGEN05_EPILOGUE_LAYOUT_NORMAL
 from .._compiler.cute.tcgen05_constants import (
     TCGEN05_EPILOGUE_LAYOUT_SPLIT_ACC_T2R_STORE_TAIL,
@@ -1532,8 +1538,17 @@ def _codegen_cute_store_tcgen05_tile(
     diagnose_split_acc_t2r_store_tail = (
         epilogue_layout == TCGEN05_EPILOGUE_LAYOUT_SPLIT_ACC_T2R_STORE_TAIL
     )
+    diagnose_module_helper_acc_t2r = (
+        epilogue_layout == TCGEN05_EPILOGUE_LAYOUT_MODULE_HELPER_ACC_T2R
+    )
+    diagnose_module_helper_store_tail = (
+        epilogue_layout == TCGEN05_EPILOGUE_LAYOUT_MODULE_HELPER_STORE_TAIL
+    )
     diagnose_split_epilogue_layout = (
-        diagnose_split_first_t2r or diagnose_split_acc_t2r_store_tail
+        diagnose_split_first_t2r
+        or diagnose_split_acc_t2r_store_tail
+        or diagnose_module_helper_acc_t2r
+        or diagnose_module_helper_store_tail
     )
     if diagnose_split_epilogue_layout:
         if not (
@@ -1727,6 +1742,127 @@ def _codegen_cute_store_tcgen05_tile(
             f"{indented_diagnostic_region(tail_region)}"
         )
 
+    module_acc_t2r_helper_name = (
+        df.unique_name("tcgen05_acc_t2r_region")
+        if diagnose_module_helper_acc_t2r
+        else ""
+    )
+    module_store_tail_helper_name = (
+        df.unique_name("tcgen05_store_tail_region")
+        if diagnose_module_helper_store_tail
+        else ""
+    )
+
+    def tma_store_module_acc_t2r_helper_source(*, acc_wait: str) -> str:
+        return (
+            "@cute.jit\n"
+            f"def {module_acc_t2r_helper_name}("
+            "_tcgen05_subtile, "
+            "tcgen05_acc_pipeline, "
+            "tcgen05_acc_consumer_state, "
+            "tcgen05_tTR_tAcc, "
+            "tcgen05_tiled_copy_t2r, "
+            "tcgen05_tTR_rAcc, "
+            "tcgen05_tRS_rAcc, "
+            "tcgen05_tRS_rD, "
+            "tcgen05_subtile_count"
+            "):\n"
+            f"{acc_wait}"
+            "    tcgen05_tTR_tAcc_mn = tcgen05_tTR_tAcc[(None, None, None, cutlass.Int32(_tcgen05_subtile))]\n"
+            "    cute.copy(tcgen05_tiled_copy_t2r, tcgen05_tTR_tAcc_mn, tcgen05_tTR_rAcc)\n"
+            f"    tcgen05_acc_vec = tcgen05_tRS_rAcc.load().to({target_dtype})\n"
+            "    if _tcgen05_subtile == tcgen05_subtile_count - 1:\n"
+            "        cute.arch.fence_view_async_tmem_load()\n"
+            "        with cute.arch.elect_one():\n"
+            "            tcgen05_acc_pipeline.consumer_release(tcgen05_acc_consumer_state)\n"
+            "    tcgen05_tRS_rD.store(tcgen05_acc_vec)"
+        )
+
+    def tma_store_module_acc_t2r_helper_call() -> str:
+        return (
+            f"        {module_acc_t2r_helper_name}("
+            f"_tcgen05_subtile, "
+            f"{tcgen05_acc_pipeline}, "
+            f"{tcgen05_acc_consumer_state}, "
+            f"{ttr_tacc}, "
+            f"{tiled_copy_t2r}, "
+            f"{ttr_racc}, "
+            f"{trs_racc}, "
+            f"{trs_rd}, "
+            f"{subtile_count})\n"
+        )
+
+    def tma_store_module_helper_subtile_body(
+        *,
+        first_subtile_acquire: str,
+        later_subtile_acquire: str,
+        late_later_subtile_acquire: str,
+    ) -> str:
+        return (
+            f"    if {tcgen05_epi_active}:\n"
+            f"{first_subtile_acquire}"
+            f"{later_subtile_acquire}"
+            f"{tma_store_module_acc_t2r_helper_call()}"
+            f"{tma_store_tail_region(late_later_subtile_acquire=late_later_subtile_acquire)}"
+        )
+
+    def tma_store_module_tail_helper_source(*, late_later_subtile_acquire: str) -> str:
+        return (
+            "@cute.jit\n"
+            f"def {module_store_tail_helper_name}("
+            "_tcgen05_subtile, "
+            "tcgen05_tma_c_buffer_index, "
+            "tcgen05_epilog_sync_barrier, "
+            "tcgen05_tiled_copy_r2s, "
+            "tcgen05_tRS_rD, "
+            "tcgen05_tRS_sD, "
+            "tcgen05_tma_store_atom, "
+            "tcgen05_bSG_sD, "
+            "tcgen05_bSG_gD, "
+            "tcgen05_c_pipeline, "
+            "tcgen05_warp_idx"
+            "):\n"
+            f"{late_later_subtile_acquire}"
+            "    tcgen05_epilog_sync_barrier.arrive_and_wait()\n"
+            f"    tcgen05_c_buffer = tcgen05_tma_c_buffer_index % cutlass.Int32({tcgen05_c_stage_count})\n"
+            "    cute.copy(tcgen05_tiled_copy_r2s, tcgen05_tRS_rD, tcgen05_tRS_sD[(None, None, None, tcgen05_c_buffer)])\n"
+            "    cute.arch.fence_view_async_shared()\n"
+            "    tcgen05_epilog_sync_barrier.arrive_and_wait()\n"
+            "    if tcgen05_warp_idx == cutlass.Int32(0):\n"
+            "        cute.copy(tcgen05_tma_store_atom, tcgen05_bSG_sD[(None, tcgen05_c_buffer)], tcgen05_bSG_gD[(None, cutlass.Int32(_tcgen05_subtile))])\n"
+            "        tcgen05_c_pipeline.producer_commit()"
+        )
+
+    def tma_store_module_tail_helper_call() -> str:
+        return (
+            f"        {module_store_tail_helper_name}("
+            f"_tcgen05_subtile, "
+            f"{tma_c_buffer_expr}, "
+            f"{epilog_sync_barrier}, "
+            f"{tiled_copy_r2s}, "
+            f"{trs_rd}, "
+            f"{trs_sd}, "
+            f"{tcgen05_tma_store_atom}, "
+            f"{bsg_sd}, "
+            f"{bsg_gd}, "
+            f"{c_pipeline}, "
+            f"{tcgen05_warp_idx})\n"
+        )
+
+    def tma_store_module_tail_subtile_body(
+        *,
+        first_subtile_acquire: str,
+        later_subtile_acquire: str,
+        acc_wait: str,
+    ) -> str:
+        return (
+            f"    if {tcgen05_epi_active}:\n"
+            f"{first_subtile_acquire}"
+            f"{later_subtile_acquire}"
+            f"{tma_store_acc_t2r_region(acc_wait=acc_wait)}"
+            f"{tma_store_module_tail_helper_call()}"
+        )
+
     if diagnose_split_first_t2r:
         tma_store_split_first_subtile_body = tma_store_subtile_body(
             first_subtile_acquire=tma_store_split_first_subtile_acquire,
@@ -1764,6 +1900,55 @@ def _codegen_cute_store_tcgen05_tile(
         tma_store_subtile_loop = (
             f"for _tcgen05_subtile in cutlass.range({subtile_count}, unroll_full=True):\n"
             f"{tma_store_helper_boundary_body}"
+        )
+    elif diagnose_module_helper_acc_t2r:
+        module_helper_acc_wait = (
+            ""
+            if diagnose_acc_wait_before_subtile_loop
+            else (
+                "    if _tcgen05_subtile == 0:\n"
+                "        tcgen05_acc_pipeline.consumer_wait(tcgen05_acc_consumer_state)\n"
+            )
+        )
+        state.codegen.module_statements.append(
+            statement_from_string(
+                tma_store_module_acc_t2r_helper_source(acc_wait=module_helper_acc_wait)
+            )
+        )
+        tma_store_module_helper_body = tma_store_module_helper_subtile_body(
+            first_subtile_acquire=tma_store_loop_first_subtile_acquire,
+            later_subtile_acquire=tma_store_loop_later_subtile_acquire,
+            late_later_subtile_acquire=tma_store_loop_late_later_subtile_acquire,
+        )
+        tma_store_subtile_loop = (
+            f"for _tcgen05_subtile in cutlass.range({subtile_count}, unroll_full=True):\n"
+            f"{tma_store_module_helper_body}"
+        )
+    elif diagnose_module_helper_store_tail:
+        module_tail_late_later_subtile_acquire = (
+            (
+                "    if _tcgen05_subtile != 0 and "
+                "tcgen05_warp_idx == cutlass.Int32(0):\n"
+                "        tcgen05_c_pipeline.producer_acquire()\n"
+            )
+            if diagnose_later_c_acquire_before_barrier
+            else ""
+        )
+        state.codegen.module_statements.append(
+            statement_from_string(
+                tma_store_module_tail_helper_source(
+                    late_later_subtile_acquire=module_tail_late_later_subtile_acquire
+                )
+            )
+        )
+        tma_store_module_tail_body = tma_store_module_tail_subtile_body(
+            first_subtile_acquire=tma_store_loop_first_subtile_acquire,
+            later_subtile_acquire=tma_store_loop_later_subtile_acquire,
+            acc_wait=tma_store_loop_acc_wait,
+        )
+        tma_store_subtile_loop = (
+            f"for _tcgen05_subtile in cutlass.range({subtile_count}, unroll_full=True):\n"
+            f"{tma_store_module_tail_body}"
         )
     else:
         tma_store_default_subtile_body = tma_store_subtile_body(

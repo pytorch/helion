@@ -1871,6 +1871,184 @@ class TestCuteLowerings(unittest.TestCase):
         self.assertEqual(role_src.count("if True:"), 4, role_src)
         self.assertNotIn("_tcgen05_split_subtile", role_src)
 
+    def test_tcgen05_diagnostic_module_helper_acc_t2r_layout_uses_module_helper(
+        self,
+    ) -> None:
+        @helion.kernel(backend="cute")
+        def cute_matmul_persistent_role(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        torch.manual_seed(0)
+        args = (
+            torch.randn(512, 32, device=DEVICE, dtype=torch.float16),
+            torch.randn(32, 256, device=DEVICE, dtype=torch.float16),
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_persistent_role.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            cfg = _make_tcgen05_persistent_config(
+                block_sizes=[256, 256, 16],
+                l2_groupings=[4],
+                pid_type="persistent_interleaved",
+                tcgen05_cluster_m=2,
+                tcgen05_epilogue_layout="module_helper_acc_t2r",
+            )
+            code = bound.to_triton_code(cfg)
+
+        tree = ast.parse(code)
+        helper_defs = [
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name.startswith("tcgen05_acc_t2r_region")
+        ]
+        self.assertEqual(len(helper_defs), 1, code)
+        helper_name = helper_defs[0].name
+        helper_src = ast.get_source_segment(code, helper_defs[0])
+        self.assertIsNotNone(helper_src)
+        assert helper_src is not None
+        self.assertIn(f"@cute.jit\ndef {helper_name}(", code)
+        helper_def_pos = code.find(f"def {helper_name}(")
+        kernel_pos = code.find("@cute.kernel")
+        self.assertLess(helper_def_pos, kernel_pos, code)
+
+        epi_role_predicate = (
+            "cute.arch.make_warp_uniform(cute.arch.warp_idx()) < cutlass.Int32(4)"
+        )
+        role_src, _, _ = self._role_local_while_source_for_predicate(
+            code,
+            tree,
+            epi_role_predicate,
+        )
+        helper_call_pos = role_src.find(f"{helper_name}(")
+        first_barrier = "tcgen05_epilog_sync_barrier.arrive_and_wait()"
+        first_barrier_pos = role_src.find(first_barrier, helper_call_pos)
+        c_commit_pos = role_src.find(
+            "tcgen05_c_pipeline.producer_commit()",
+            first_barrier_pos,
+        )
+        for needle, pos in (
+            (f"def {helper_name}(", helper_def_pos),
+            (f"{helper_name}(", helper_call_pos),
+            (first_barrier, first_barrier_pos),
+            ("tcgen05_c_pipeline.producer_commit()", c_commit_pos),
+        ):
+            self.assertGreaterEqual(pos, 0, f"Missing {needle!r} in:\n{code}")
+        self.assertIn(
+            "tcgen05_acc_pipeline.consumer_wait(tcgen05_acc_consumer_state)",
+            helper_src,
+        )
+        self.assertIn("cute.copy(tcgen05_tiled_copy_t2r", helper_src)
+        self.assertIn(
+            "tcgen05_acc_pipeline.consumer_release(tcgen05_acc_consumer_state)",
+            helper_src,
+        )
+        self.assertIn("tcgen05_tRS_rD.store(tcgen05_acc_vec)", helper_src)
+        self.assertLess(helper_call_pos, first_barrier_pos, role_src)
+        self.assertLess(first_barrier_pos, c_commit_pos, role_src)
+        self.assertNotIn(
+            "tcgen05_acc_pipeline.consumer_wait(tcgen05_acc_consumer_state)",
+            role_src,
+        )
+        self.assertNotIn("cute.copy(tcgen05_tiled_copy_t2r", role_src)
+
+    def test_tcgen05_diagnostic_module_helper_store_tail_layout_uses_module_helper(
+        self,
+    ) -> None:
+        @helion.kernel(backend="cute")
+        def cute_matmul_persistent_role(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        torch.manual_seed(0)
+        args = (
+            torch.randn(512, 32, device=DEVICE, dtype=torch.float16),
+            torch.randn(32, 256, device=DEVICE, dtype=torch.float16),
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_persistent_role.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            cfg = _make_tcgen05_persistent_config(
+                block_sizes=[256, 256, 16],
+                l2_groupings=[4],
+                pid_type="persistent_interleaved",
+                tcgen05_cluster_m=2,
+                tcgen05_epilogue_layout="module_helper_store_tail",
+            )
+            code = bound.to_triton_code(cfg)
+
+        tree = ast.parse(code)
+        helper_defs = [
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name.startswith("tcgen05_store_tail_region")
+        ]
+        self.assertEqual(len(helper_defs), 1, code)
+        helper_name = helper_defs[0].name
+        helper_src = ast.get_source_segment(code, helper_defs[0])
+        self.assertIsNotNone(helper_src)
+        assert helper_src is not None
+        self.assertIn(f"@cute.jit\ndef {helper_name}(", code)
+        helper_def_pos = code.find(f"def {helper_name}(")
+        kernel_pos = code.find("@cute.kernel")
+        self.assertLess(helper_def_pos, kernel_pos, code)
+
+        epi_role_predicate = (
+            "cute.arch.make_warp_uniform(cute.arch.warp_idx()) < cutlass.Int32(4)"
+        )
+        role_src, _, _ = self._role_local_while_source_for_predicate(
+            code,
+            tree,
+            epi_role_predicate,
+        )
+        acc_wait = "tcgen05_acc_pipeline.consumer_wait(tcgen05_acc_consumer_state)"
+        t2r_copy = "cute.copy(tcgen05_tiled_copy_t2r"
+        r2s_source_store = "tcgen05_tRS_rD.store(tcgen05_acc_vec)"
+        helper_call_pos = role_src.find(f"{helper_name}(")
+        acc_wait_pos = role_src.find(acc_wait)
+        t2r_copy_pos = role_src.find(t2r_copy, acc_wait_pos)
+        r2s_source_store_pos = role_src.find(r2s_source_store, t2r_copy_pos)
+
+        for needle, pos in (
+            (f"def {helper_name}(", helper_def_pos),
+            (acc_wait, acc_wait_pos),
+            (t2r_copy, t2r_copy_pos),
+            (r2s_source_store, r2s_source_store_pos),
+            (f"{helper_name}(", helper_call_pos),
+        ):
+            self.assertGreaterEqual(pos, 0, f"Missing {needle!r} in:\n{code}")
+        self.assertIn("tcgen05_epilog_sync_barrier.arrive_and_wait()", helper_src)
+        self.assertIn("cute.copy(tcgen05_tiled_copy_r2s", helper_src)
+        self.assertIn("cute.arch.fence_view_async_shared()", helper_src)
+        self.assertIn("cute.copy(tcgen05_tma_store_atom", helper_src)
+        self.assertIn("tcgen05_c_pipeline.producer_commit()", helper_src)
+        self.assertLess(acc_wait_pos, t2r_copy_pos, role_src)
+        self.assertLess(t2r_copy_pos, r2s_source_store_pos, role_src)
+        self.assertLess(r2s_source_store_pos, helper_call_pos, role_src)
+        self.assertNotIn("tcgen05_epilog_sync_barrier.arrive_and_wait()", role_src)
+        self.assertNotIn("cute.copy(tcgen05_tiled_copy_r2s", role_src)
+        self.assertNotIn("cute.copy(tcgen05_tma_store_atom", role_src)
+
     def test_tcgen05_diagnostic_split_first_t2r_rejects_flat_epilogue(
         self,
     ) -> None:
@@ -2077,6 +2255,96 @@ class TestCuteLowerings(unittest.TestCase):
                 "                                tcgen05_acc_pipeline.consumer_wait",
                 code,
             )
+            out = bound(*args)
+
+        expected = args[0] @ args[1]
+        torch.testing.assert_close(out, expected, atol=2e-1, rtol=1e-2)
+
+    def test_tcgen05_diagnostic_module_helper_acc_t2r_runtime_correctness(
+        self,
+    ) -> None:
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_cluster_m2_module_helper_acc_t2r(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        torch.manual_seed(0)
+        args = (
+            torch.randn(256, 16, device=DEVICE, dtype=torch.bfloat16),
+            torch.randn(16, 256, device=DEVICE, dtype=torch.bfloat16),
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_cluster_m2_module_helper_acc_t2r.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            cfg = _make_tcgen05_persistent_config(
+                block_sizes=[256, 256, 16],
+                l2_groupings=[4],
+                pid_type="persistent_interleaved",
+                tcgen05_cluster_m=2,
+                tcgen05_epilogue_layout="module_helper_acc_t2r",
+            )
+            bound.set_config(cfg)
+            code = bound.to_triton_code(cfg)
+            self.assertIn("def tcgen05_acc_t2r_region", code)
+            out = bound(*args)
+
+        expected = args[0] @ args[1]
+        torch.testing.assert_close(out, expected, atol=2e-1, rtol=1e-2)
+
+    def test_tcgen05_diagnostic_module_helper_store_tail_runtime_correctness(
+        self,
+    ) -> None:
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_cluster_m2_module_helper_store_tail(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        torch.manual_seed(0)
+        args = (
+            torch.randn(256, 16, device=DEVICE, dtype=torch.bfloat16),
+            torch.randn(16, 256, device=DEVICE, dtype=torch.bfloat16),
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_cluster_m2_module_helper_store_tail.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            cfg = _make_tcgen05_persistent_config(
+                block_sizes=[256, 256, 16],
+                l2_groupings=[4],
+                pid_type="persistent_interleaved",
+                tcgen05_cluster_m=2,
+                tcgen05_epilogue_layout="module_helper_store_tail",
+            )
+            bound.set_config(cfg)
+            code = bound.to_triton_code(cfg)
+            self.assertIn("def tcgen05_store_tail_region", code)
             out = bound(*args)
 
         expected = args[0] @ args[1]
