@@ -32,6 +32,9 @@ from .._compiler.cute.tcgen05_constants import TCGEN05_C_ACQUIRE_PLACEMENTS
 from .._compiler.cute.tcgen05_constants import TCGEN05_C_STORE_MODE_CONFIG_KEY
 from .._compiler.cute.tcgen05_constants import TCGEN05_C_STORE_MODE_NORMAL
 from .._compiler.cute.tcgen05_constants import TCGEN05_C_STORE_MODES
+from .._compiler.cute.tcgen05_constants import (
+    TCGEN05_CLUSTER_M2_ONE_CTA_ROLE_LOCAL_CONFIG_KEY,
+)
 from .._compiler.cute.tcgen05_constants import TCGEN05_CUBIN_LINEINFO_CONFIG_KEY
 from .._compiler.cute.tcgen05_constants import (
     TCGEN05_DIAGNOSTIC_INVALID_OUTPUT_CONFIG_KEY,
@@ -150,6 +153,7 @@ _BASE_BACKEND_TUNABLE_KEYS: frozenset[str] = frozenset(
 _BACKEND_DIAGNOSTIC_CONFIG_KEYS: frozenset[str] = frozenset(
     {
         TCGEN05_ACC_PRODUCER_MODE_CONFIG_KEY,
+        TCGEN05_CLUSTER_M2_ONE_CTA_ROLE_LOCAL_CONFIG_KEY,
         TCGEN05_CUBIN_LINEINFO_CONFIG_KEY,
         TCGEN05_DIAGNOSTIC_INVALID_OUTPUT_CONFIG_KEY,
         TCGEN05_EPILOGUE_LAYOUT_CONFIG_KEY,
@@ -1164,6 +1168,32 @@ class ConfigSpec:
                 else:
                     raise InvalidConfig(
                         f"{TCGEN05_CUBIN_LINEINFO_CONFIG_KEY} must be a boolean"
+                    )
+        if TCGEN05_CLUSTER_M2_ONE_CTA_ROLE_LOCAL_CONFIG_KEY in config:
+            if not self.cute_tcgen05_search_enabled:
+                if _fix_invalid:
+                    config.pop(
+                        TCGEN05_CLUSTER_M2_ONE_CTA_ROLE_LOCAL_CONFIG_KEY,
+                        None,
+                    )
+                else:
+                    raise InvalidConfig(
+                        f"{TCGEN05_CLUSTER_M2_ONE_CTA_ROLE_LOCAL_CONFIG_KEY} is "
+                        "only supported for tcgen05-enabled CuTe matmul kernels"
+                    )
+            elif not isinstance(
+                config[TCGEN05_CLUSTER_M2_ONE_CTA_ROLE_LOCAL_CONFIG_KEY],
+                bool,
+            ):
+                if _fix_invalid:
+                    config.pop(
+                        TCGEN05_CLUSTER_M2_ONE_CTA_ROLE_LOCAL_CONFIG_KEY,
+                        None,
+                    )
+                else:
+                    raise InvalidConfig(
+                        f"{TCGEN05_CLUSTER_M2_ONE_CTA_ROLE_LOCAL_CONFIG_KEY} "
+                        "must be a boolean"
                     )
         if TCGEN05_EPILOGUE_LAYOUT_CONFIG_KEY in config:
             if not self.cute_tcgen05_search_enabled:

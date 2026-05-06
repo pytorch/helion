@@ -63,6 +63,10 @@ TCGEN05_ACC_PRODUCER_MODES = (
     TCGEN05_ACC_PRODUCER_MODE_SKIP_UMMA,
 )
 TCGEN05_CUBIN_LINEINFO_CONFIG_KEY = "tcgen05_cubin_lineinfo"
+# Diagnostic-only codegen proof for the guarded clustered CtaGroup.ONE bridge.
+TCGEN05_CLUSTER_M2_ONE_CTA_ROLE_LOCAL_CONFIG_KEY = (
+    "tcgen05_cluster_m2_one_cta_role_local"
+)
 
 # CtaGroup.ONE tcgen05 MMA covers 64/128 M tiles; 256 M tiles are validated only
 # after projecting onto the CtaGroup.TWO path.

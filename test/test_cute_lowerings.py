@@ -69,6 +69,9 @@ from helion._compiler.cute.matmul_utils import cute_resolve_active_block_id
 from helion._compiler.cute.matmul_utils import cute_resolve_active_matmul_k_block_id
 from helion._compiler.cute.matmul_utils import cute_static_k_invariant_extent
 from helion._compiler.cute.matmul_utils import cute_supports_scalar_matmul_fallback
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_CLUSTER_M2_ONE_CTA_ROLE_LOCAL_CONFIG_KEY,
+)
 from helion._compiler.device_ir import ForLoopGraphInfo
 from helion._compiler.device_ir import RootGraphInfo
 from helion._compiler.device_ir import collect_cute_half_atomic_output_promotions
@@ -114,6 +117,36 @@ def _make_tcgen05_persistent_config(**overrides: object) -> helion.Config:
     }
     defaults.update(overrides)
     return helion.Config(**defaults)  # type: ignore[arg-type]
+
+
+def _make_tcgen05_cluster_m2_cta_group_one_bridge_config(
+    **overrides: object,
+) -> helion.Config:
+    """Build the selected clustered CtaGroup.ONE bridge proof config."""
+    defaults: dict[str, object] = {
+        "block_sizes": [128, 256, 128],
+        "l2_groupings": [4],
+        "num_warps": 4,
+        "num_sm_multiplier": 1,
+        "pid_type": "persistent_interleaved",
+        "indexing": [
+            "tensor_descriptor",
+            "tensor_descriptor",
+            "tensor_descriptor",
+        ],
+        "tcgen05_cluster_m": 2,
+        "tcgen05_ab_stages": 2,
+        "tcgen05_acc_stages": 1,
+        "tcgen05_c_stages": 4,
+        "tcgen05_num_epi_warps": 4,
+        "range_flattens": [None, None],
+        "range_multi_buffers": [None, None],
+        "range_warp_specializes": [None, None],
+        "range_num_stages": [0, 0],
+        "range_unroll_factors": [0, 0],
+    }
+    defaults.update(overrides)
+    return _make_tcgen05_persistent_config(**defaults)
 
 
 class _FakeBlockSize:
@@ -2694,6 +2727,161 @@ class TestCuteLowerings(unittest.TestCase):
                 "supports runtime execution only",
             ):
                 bound(*args)
+
+    def test_tcgen05_cluster_m2_cta_group_one_bridge_shape_codegen(self) -> None:
+        """Pin the selected clustered CtaGroup.ONE bridge target.
+
+        The explicit 128x256x128 cluster_m=2 config must stay clustered and
+        use CtaGroup.ONE, not demote to cluster_m=1 or switch to CtaGroup.TWO.
+        Runtime remains guarded until this clustered shape is validated.
+        """
+
+        from helion._compiler.program_id import Tcgen05PersistentProgramIDs
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_cluster_m2_cta_group_one(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        args = (
+            torch.randn(256, 128, device=DEVICE, dtype=torch.float16),
+            torch.randn(128, 256, device=DEVICE, dtype=torch.float16),
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_cluster_m2_cta_group_one.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            cfg = _make_tcgen05_cluster_m2_cta_group_one_bridge_config()
+            bound.set_config(cfg)
+            code = bound.to_triton_code(cfg)
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "supports runtime execution only",
+            ):
+                bound(*args)
+
+        self.assertEqual(
+            cfg.config["indexing"],
+            ["tensor_descriptor", "tensor_descriptor", "tensor_descriptor"],
+        )
+        self.assertEqual(cfg.config["range_flattens"], [None, None])
+        self.assertEqual(cfg.config["range_multi_buffers"], [None, None])
+        self.assertEqual(cfg.config["range_warp_specializes"], [None, None])
+        self.assertEqual(cfg.config["range_num_stages"], [0, 0])
+        self.assertEqual(cfg.config["range_unroll_factors"], [0, 0])
+        self.assertIn("_helion_cute_cluster_shape = (2, 1, 1)", code)
+        self.assertIn("cute.nvgpu.tcgen05.CtaGroup.ONE", code)
+        self.assertNotIn("cute.nvgpu.tcgen05.CtaGroup.TWO", code)
+        self.assertIn(
+            "tcgen05_cluster_layout_vmnk = cute.tiled_divide("
+            "cute.make_layout((2, 1, 1))",
+            code,
+        )
+        self.assertIn(
+            "tcgen05_ab_pipeline_consumer_group = "
+            "cutlass.pipeline.CooperativeGroup("
+            "cutlass.pipeline.Agent.Thread, cutlass.Int32(1))",
+            code,
+        )
+        self.assertNotIn(
+            "tcgen05_ab_pipeline_consumer_group = "
+            "cutlass.pipeline.CooperativeGroup("
+            "cutlass.pipeline.Agent.Thread, cutlass.Int32(2))",
+            code,
+        )
+        self.assertIn(Tcgen05PersistentProgramIDs._MULTI_TILE_GUARD_TOTAL_VAR, code)
+
+    def test_tcgen05_cluster_m2_cta_group_one_bridge_role_local_codegen(
+        self,
+    ) -> None:
+        """Diagnostic bridge mode emits role-local CtaGroup.ONE codegen only."""
+
+        from helion._compiler.program_id import Tcgen05PersistentProgramIDs
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_cluster_m2_cta_group_one_role_local(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        args = (
+            torch.randn(256, 128, device=DEVICE, dtype=torch.float16),
+            torch.randn(128, 256, device=DEVICE, dtype=torch.float16),
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_cluster_m2_cta_group_one_role_local.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            cfg = _make_tcgen05_cluster_m2_cta_group_one_bridge_config(
+                **{TCGEN05_CLUSTER_M2_ONE_CTA_ROLE_LOCAL_CONFIG_KEY: True}
+            )
+            bound.set_config(cfg)
+            code = bound.to_triton_code(cfg)
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "supports runtime execution only",
+            ):
+                bound(*args)
+
+        self.assertIn("_helion_cute_cluster_shape = (2, 1, 1)", code)
+        self.assertIn("cute.nvgpu.tcgen05.CtaGroup.ONE", code)
+        self.assertNotIn("cute.nvgpu.tcgen05.CtaGroup.TWO", code)
+        self.assertIn("tcgen05_role_local_0_work_tile", code)
+        self.assertIn("tcgen05_role_local_1_work_tile", code)
+        self.assertIn("tcgen05_role_local_2_work_tile", code)
+        self.assertNotIn("while tcgen05_work_tile_valid", code)
+        self.assertIn(Tcgen05PersistentProgramIDs._MULTI_TILE_GUARD_TOTAL_VAR, code)
+
+    def test_tcgen05_cluster_m2_cta_group_one_bridge_role_local_shape_guard(
+        self,
+    ) -> None:
+        """The bridge diagnostic fails loudly outside its exact shape."""
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_cluster_m2_cta_group_one_wrong_shape(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        args = (
+            torch.randn(256, 128, device=DEVICE, dtype=torch.float16),
+            torch.randn(128, 128, device=DEVICE, dtype=torch.float16),
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_cluster_m2_cta_group_one_wrong_shape.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            cfg = _make_tcgen05_cluster_m2_cta_group_one_bridge_config(
+                block_sizes=[128, 128, 128],
+                **{TCGEN05_CLUSTER_M2_ONE_CTA_ROLE_LOCAL_CONFIG_KEY: True},
+            )
+            with self.assertRaisesRegex(
+                exc.BackendUnsupported,
+                "128x256x128 bridge shape",
+            ):
+                bound.to_triton_code(cfg)
 
     def test_tcgen05_persistent_cluster_m2_partial_single_tile_runtime_guard(
         self,

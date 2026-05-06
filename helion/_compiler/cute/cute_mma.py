@@ -47,6 +47,7 @@ from .mma_support import get_cute_mma_support
 from .tcgen05_constants import TCGEN05_ACC_PRODUCER_MODE_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_ACC_PRODUCER_MODE_NORMAL
 from .tcgen05_constants import TCGEN05_ACC_PRODUCER_MODE_SKIP_UMMA
+from .tcgen05_constants import TCGEN05_CLUSTER_M2_ONE_CTA_ROLE_LOCAL_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
 
 if TYPE_CHECKING:
@@ -1391,11 +1392,43 @@ def _emit_mma_pipeline(
             tcgen05_cluster_m = 1
     assert tcgen05_cluster_m == 1 or bm >= 128
     tcgen05_is_two_cta = tcgen05_requested_two_cta and tcgen05_cluster_m > 1
+    tcgen05_diagnose_cluster_m2_one_cta_role_local = bool(
+        df.config.get(TCGEN05_CLUSTER_M2_ONE_CTA_ROLE_LOCAL_CONFIG_KEY, False)
+    )
+    tcgen05_cluster_m2_one_cta_role_local_bridge = (
+        tcgen05_diagnose_cluster_m2_one_cta_role_local
+        and mma_impl == "tcgen05"
+        and tcgen05_use_tma_pipeline
+        and tcgen05_static_full_tiles
+        and tcgen05_pid_is_persistent
+        and tcgen05_cluster_m == 2
+        and not tcgen05_is_two_cta
+        and bm == 128
+        and bn == 256
+        and bk == 128
+    )
+    if (
+        tcgen05_diagnose_cluster_m2_one_cta_role_local
+        and not tcgen05_cluster_m2_one_cta_role_local_bridge
+    ):
+        raise exc.BackendUnsupported(
+            "cute",
+            f"{TCGEN05_CLUSTER_M2_ONE_CTA_ROLE_LOCAL_CONFIG_KEY}=True requires "
+            "static-full persistent tcgen05 TMA codegen for the guarded "
+            "cluster_m=2, CtaGroup.ONE, 128x256x128 bridge shape",
+        )
+    tcgen05_role_local_codegen_allowed = (
+        tcgen05_cluster_m == 1
+        or tcgen05_is_two_cta
+        or tcgen05_cluster_m2_one_cta_role_local_bridge
+    )
+    # The clustered CtaGroup.ONE bridge flag is compile-proof only: ProgramID
+    # still emits the host guard because this runtime path is not validated.
     tcgen05_use_role_local_tma_producer = (
         mma_impl == "tcgen05"
         and tcgen05_use_tma_pipeline
         and tcgen05_static_full_tiles
-        and (tcgen05_cluster_m == 1 or tcgen05_is_two_cta)
+        and tcgen05_role_local_codegen_allowed
         and tcgen05_pid_is_persistent
     )
     # Keep a distinct name so future MMA-exec gating changes are localized.
@@ -1435,7 +1468,7 @@ def _emit_mma_pipeline(
         mma_impl == "tcgen05"
         and tcgen05_use_tma_pipeline
         and tcgen05_static_full_tiles
-        and (tcgen05_cluster_m == 1 or tcgen05_is_two_cta)
+        and tcgen05_role_local_codegen_allowed
         and (not _is_persistent_pid_config(df.config) or tcgen05_use_role_local_epi)
     )
     tcgen05_collective_handles_operand_loads = (
