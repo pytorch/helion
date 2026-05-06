@@ -710,6 +710,11 @@ class KernelResult:
     kernel_time_ms: float = 0.0
     error: str | None = None
     shape_results: list[ShapeResult] = field(default_factory=list)
+    # False when the baseline accepts arbitrary outputs (max_mismatch_pct >= 1.0).
+    # In that case `passed=True` only means the kernel ran without raising — there
+    # was no real numerical check, so we drop helion_accuracy from the dashboard
+    # JSON instead of falsely reporting 1.0.
+    accuracy_verified: bool = True
 
 
 def import_example(module_file: str) -> types.ModuleType:
@@ -795,6 +800,7 @@ def run_kernel_inner(name: str) -> KernelResult:
             shapes = shapes[:NUM_SHAPES]
         all_passed = True
         shape_results: list[ShapeResult] = []
+        accuracy_verified = max_mismatch_pct is None or max_mismatch_pct < 1.0
 
         # Some kernels (e.g. rms_norm_fwd) return (primary, aux) but their
         # baseline returns only the primary tensor; in that case unwrap the
@@ -865,7 +871,12 @@ def run_kernel_inner(name: str) -> KernelResult:
                 )
                 all_passed = False
 
-        return KernelResult(name=name, passed=all_passed, shape_results=shape_results)
+        return KernelResult(
+            name=name,
+            passed=all_passed,
+            shape_results=shape_results,
+            accuracy_verified=accuracy_verified,
+        )
 
     except Exception as e:
         return KernelResult(name=name, passed=False, error=str(e))
@@ -902,30 +913,35 @@ def write_results_json(output: str, results: list[KernelResult]) -> None:
     for result in results:
         if not result.shape_results:
             # Kernel-level pass/fail only (e.g. baseline-less kernels run via
-            # mod.main()). Emit a single zero-shape accuracy record.
-            records.append(
-                {
-                    "benchmark": {
-                        "name": "Helion TPU Benchmark",
-                        "extra_info": {"device": device},
-                    },
-                    "model": {"name": result.name},
-                    "metric": {
-                        "name": "helion_accuracy",
-                        "benchmark_values": [1.0 if result.passed else 0.0],
-                    },
-                    "shape": [],
-                }
-            )
+            # mod.main()). Emit a single zero-shape accuracy record — but only
+            # when the kernel actually exercises a meaningful baseline check;
+            # otherwise we'd report a green "1.0" for runs that never compared
+            # against anything.
+            if result.accuracy_verified:
+                records.append(
+                    {
+                        "benchmark": {
+                            "name": "Helion TPU Benchmark",
+                            "extra_info": {"device": device},
+                        },
+                        "model": {"name": result.name},
+                        "metric": {
+                            "name": "helion_accuracy",
+                            "benchmark_values": [1.0 if result.passed else 0.0],
+                        },
+                        "shape": [],
+                    }
+                )
             continue
 
         shapes = [sr.shape for sr in result.shape_results]
-        add_metric(
-            result.name,
-            "helion_accuracy",
-            shapes,
-            [1.0 if sr.passed else 0.0 for sr in result.shape_results],
-        )
+        if result.accuracy_verified:
+            add_metric(
+                result.name,
+                "helion_accuracy",
+                shapes,
+                [1.0 if sr.passed else 0.0 for sr in result.shape_results],
+            )
         add_metric(
             result.name,
             "helion_latency_ms",
