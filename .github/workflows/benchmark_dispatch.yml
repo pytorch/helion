@@ -29,10 +29,10 @@ on:
         type: string
         default: "softmax,jsd,welford,kl_div,int4_gemm,layer_norm,layer_norm-bwd,rms_norm,rms_norm-bwd,cross_entropy,flash_attention,gemm,grouped_gemm"
       kernels_tpu:
-        description: 'Comma-separated list of kernels to benchmark on TPU (examples-based; disjoint from `kernels`)'
+        description: 'Comma-separated list of kernels to benchmark on TPU (examples-based; disjoint from `kernels`). Default is the dashboard-tracked subset; pass an explicit list for ad-hoc full-coverage runs.'
         required: false
         type: string
-        default: "exp,add,softmax_two_pass,welford,attention,bmm,matmul,matmul_layernorm,cross_entropy,embedding,broadcast_matmul,geglu,low_mem_dropout,swiglu,batch_softmax,sum,rms_norm,layer_norm,softmax,long_sum_naive,long_sum_loop,long_sum_manual,se_block,squeeze_and_excitation_net,rms_norm_bwd"
+        default: "attention,bmm,matmul,welford,softmax,layer_norm,rms_norm,cross_entropy"
       env_vars:
         description: 'Environment variables for benchmark runner'
         required: false
