@@ -112,6 +112,26 @@ def pallas_bmm(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
 
 
 @helion.kernel(backend="pallas", static_shapes=True)
+def pallas_bmm_subrange_k(
+    A: torch.Tensor, B: torch.Tensor, k_start: int, k_end: int
+) -> torch.Tensor:
+    """BMM where the K reduction only covers [k_start, k_end)."""
+    b, m, k = A.size()
+    b2, k2, n = B.size()
+    out = torch.zeros(
+        [b, m, n], device=A.device, dtype=torch.promote_types(A.dtype, B.dtype)
+    )
+    for tile_b, tile_m, tile_n in hl.tile([b, m, n]):
+        acc = hl.zeros([tile_b, tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k_start, k_end):
+            acc = torch.baddbmm(
+                acc, A[tile_b, tile_m, tile_k], B[tile_b, tile_k, tile_n]
+            )
+        out[tile_b, tile_m, tile_n] = acc
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
 def pallas_sum_reduction(x: torch.Tensor) -> torch.Tensor:
     n, _m = x.size()
     out = torch.empty([n], dtype=x.dtype, device=x.device)
@@ -713,6 +733,25 @@ class TestPallas(TestCase):
         )
         expected = torch.bmm(a.float(), b.float()).to(torch.bfloat16)
         torch.testing.assert_close(result, expected, rtol=1e-2, atol=1e-2)
+
+    @xfailIfPallas("Non-zero begin K reduction: DMA offset not tile-aligned")
+    def test_bmm_nonzero_k_begin(self) -> None:
+        """BMM with K reduction starting at non-zero offset, across all loop types."""
+        a = torch.randn(4, 128, 384, device=DEVICE, dtype=torch.bfloat16)
+        b = torch.randn(4, 384, 128, device=DEVICE, dtype=torch.bfloat16)
+        k_start, k_end = 128, 384
+        expected = torch.bmm(
+            a[:, :, k_start:k_end].float(), b[:, k_start:k_end, :].float()
+        ).to(torch.bfloat16)
+        for loop_type in ("unroll", "fori_loop", "emit_pipeline"):
+            with self.subTest(pallas_loop_type=loop_type):
+                _code, result = code_and_output(
+                    pallas_bmm_subrange_k,
+                    (a, b, k_start, k_end),
+                    block_sizes=[4, 128, 128, 256],
+                    pallas_loop_type=loop_type,
+                )
+                torch.testing.assert_close(result, expected, rtol=1e-2, atol=1e-2)
 
     def test_emit_pipeline_codegen(self) -> None:
         """Test that pallas_loop_type='emit_pipeline' generates correct emit_pipeline code."""
