@@ -145,8 +145,11 @@ def my_kernel(x: torch.Tensor) -> torch.Tensor:
    Select the autotuner precompile mode, which adds parallelism and
    checks for errors/timeouts. ``"fork"`` (default) is faster but does
    not include the error check run, ``"spawn"`` runs kernel warm-up in a
-   fresh process including running to check for errors, or None to
-   disables precompile checks altogether. Controlled by
+   fresh process including running to check for errors, ``"pool"`` uses
+   long-lived worker processes and implies subprocess benchmarking. Pool
+   rebenchmarking also runs on the worker that compiled each config, keeping
+   CUDA execution out of the autotune parent process. None disables
+   precompile checks altogether. Controlled by
    ``HELION_AUTOTUNE_PRECOMPILE``.
 
 .. autoattribute:: Settings.autotune_random_seed
@@ -192,6 +195,10 @@ def my_kernel(x: torch.Tensor) -> torch.Tensor:
 .. autoattribute:: Settings.autotune_rebenchmark_threshold
 
    Controls how aggressively Helion re-runs promising configs to avoid outliers. Default is ``1.5`` (re-benchmark anything within 1.5x of the best).
+
+.. autoattribute:: Settings.autotune_suspicious_rebenchmark_ratio
+
+   Rechecks suspiciously fast rebenchmark timings when they are below ``ratio * previous_timing``. Defaults to ``0.9`` for ``autotune_precompile="pool"`` and disabled otherwise. Set ``HELION_AUTOTUNE_SUSPICIOUS_REBENCHMARK_RATIO=0`` to disable.
 
 .. autoattribute:: Settings.autotune_progress_bar
 
@@ -313,8 +320,9 @@ Built-in values for ``HELION_AUTOTUNER`` include ``"LFBOTreeSearch"`` (default),
 | ``HELION_AUTOTUNE_COMPILE_TIMEOUT`` | ``autotune_compile_timeout`` | Maximum seconds to wait for Triton compilation during autotuning. |
 | ``HELION_AUTOTUNE_LOG_LEVEL`` | ``autotune_log_level`` | Adjust logging verbosity; accepts names like ``INFO`` or numeric levels. |
 | ``HELION_AUTOTUNE_LOG`` | ``autotune_log`` | Base filename for per-config CSV telemetry and mirrored autotune logs. |
-| ``HELION_AUTOTUNE_PRECOMPILE`` | ``autotune_precompile`` | Select the autotuner precompile mode (``"fork"`` (default), ``"spawn"``, or disable when empty). |
+| ``HELION_AUTOTUNE_PRECOMPILE`` | ``autotune_precompile`` | Select the autotuner precompile mode (``"fork"`` (default), ``"spawn"``, ``"pool"``, or disable when empty). |
 | ``HELION_AUTOTUNE_PRECOMPILE_JOBS`` | ``autotune_precompile_jobs`` | Cap the number of concurrent Triton precompile subprocesses. |
+| ``HELION_AUTOTUNE_PRECOMPILE_WORKERS_CAP`` | ``autotune_precompile_workers_cap`` | Cap the auto-decided worker-pool size. Default is ``32``. |
 | ``HELION_AUTOTUNE_RANDOM_SEED`` | ``autotune_random_seed`` | Seed used for randomized autotuning searches. |
 | ``HELION_AUTOTUNE_MAX_GENERATIONS`` | ``autotune_max_generations`` | Upper bound on generations for Pattern Search and Differential Evolution. |
 | ``HELION_AUTOTUNE_BUDGET_SECONDS`` | ``autotune_budget_seconds`` | Wall-clock budget for an autotune run. |
@@ -325,6 +333,7 @@ Built-in values for ``HELION_AUTOTUNER`` include ``"LFBOTreeSearch"`` (default),
 | ``HELION_BEST_AVAILABLE_MAX_CONFIGS`` | ``autotune_best_available_max_configs`` | Maximum cached configs to seed when using ``from_best_available`` strategy. |
 | ``HELION_BEST_AVAILABLE_MAX_CACHE_SCAN`` | ``autotune_best_available_max_cache_scan`` | Maximum cache files to scan when using ``from_best_available`` strategy. |
 | ``HELION_REBENCHMARK_THRESHOLD`` | ``autotune_rebenchmark_threshold`` | Re-run configs whose performance is within a multiplier of the current best. |
+| ``HELION_AUTOTUNE_SUSPICIOUS_REBENCHMARK_RATIO`` | ``autotune_suspicious_rebenchmark_ratio`` | Recheck suspiciously fast rebenchmark timings; defaults to ``0.9`` for pool mode and disabled otherwise. |
 | ``HELION_AUTOTUNE_PROGRESS_BAR`` | ``autotune_progress_bar`` | Enable or disable the progress bar UI during autotuning. |
 | ``HELION_AUTOTUNE_IGNORE_ERRORS`` | ``autotune_ignore_errors`` | Continue autotuning even when recoverable runtime errors occur. |
 | ``HELION_AUTOTUNE_CONFIG_OVERRIDES`` | ``autotune_config_overrides`` | Supply JSON forcing particular autotuner config key/value pairs. |
