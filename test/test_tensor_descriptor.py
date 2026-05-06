@@ -671,6 +671,13 @@ class TestTensorDescriptor(RefEagerTestBase, TestCase):
                 False,
                 True,
             ),
+            (
+                "y_unaligned",
+                torch.randn([32, 64], device=DEVICE, dtype=HALF_DTYPE),
+                torch.randn([64, 31], device=DEVICE, dtype=HALF_DTYPE),
+                True,
+                False,
+            ),
         ]
 
         for static_shapes in (True, False):
@@ -693,6 +700,31 @@ class TestTensorDescriptor(RefEagerTestBase, TestCase):
                     else:
                         self.assert_tensor_descriptor_not_used_for(code, "y")
                     self.assertIn("tl.dot", code)
+
+    @skipUnlessTensorDescriptor("Tensor descriptor support is required")
+    def test_dynamic_shape_stride_zero_input(self):
+        """Expanded stride-0 dimensions should be TD-eligible with dynamic shapes."""
+
+        @helion.kernel(
+            static_shapes=False,
+            autotune_effort="none",
+            config=helion.Config(
+                block_sizes=[16, 16],
+                indexing=["tensor_descriptor", "pointer"],
+            ),
+        )
+        def copy_expanded(x: torch.Tensor) -> torch.Tensor:
+            result = torch.empty(x.size(), device=x.device, dtype=x.dtype)
+            for tile in hl.tile(x.size()):
+                result[tile] = x[tile]
+            return result
+
+        x = torch.randn([1, 64], device=DEVICE, dtype=HALF_DTYPE).expand(32, 64)
+        self.assertEqual(x.stride(), (0, 1))
+
+        code, result = code_and_output(copy_expanded, (x,))
+        torch.testing.assert_close(result, x)
+        self.assert_tensor_descriptor_used_for(code, "x")
 
     def assert_uses_tensor_descriptors(self, code: str) -> None:
         self.assertIn(get_tensor_descriptor_fn_name(), code)
