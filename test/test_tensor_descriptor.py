@@ -590,6 +590,116 @@ class TestTensorDescriptor(RefEagerTestBase, TestCase):
         self.assertIn(f"x_desc = {get_tensor_descriptor_fn_name()}", code_transposed)
         self.assertIn("tl.permute", code_transposed)
 
+    @staticmethod
+    def _make_td_matmul(static_shapes: bool):
+        @helion.kernel(
+            static_shapes=static_shapes,
+            autotune_effort="none",
+            config=helion.Config(
+                block_sizes=[16, 16, 16],
+                indexing="tensor_descriptor",
+            ),
+        )
+        def matmul(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            k2, n = y.size()
+            assert k == k2
+            out = torch.empty([m, n], device=x.device, dtype=x.dtype)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(out.dtype)
+            return out
+
+        return matmul
+
+    @skipUnlessTensorDescriptor("Tensor descriptor support is required")
+    def test_matmul_tensor_descriptor_static_and_dynamic(self):
+        """Matmul should use TD loads and tl.dot in static and dynamic modes."""
+
+        y = torch.randn([64, 32], device=DEVICE, dtype=HALF_DTYPE)
+        cases = [
+            (
+                "contiguous",
+                torch.randn([32, 64], device=DEVICE, dtype=HALF_DTYPE),
+                False,
+            ),
+            (
+                "transposed",
+                torch.randn([64, 32], device=DEVICE, dtype=HALF_DTYPE).t(),
+                True,
+            ),
+        ]
+
+        for static_shapes in (True, False):
+            matmul = self._make_td_matmul(static_shapes)
+            for name, x, expect_permute in cases:
+                with self.subTest(static_shapes=static_shapes, layout=name):
+                    code, result = code_and_output(matmul, (x, y))
+                    torch.testing.assert_close(
+                        result,
+                        x @ y,
+                        atol=1e-1,
+                        rtol=1e-2,
+                    )
+                    self.assertIn(f"x_desc = {get_tensor_descriptor_fn_name()}", code)
+                    self.assertIn(f"y_desc = {get_tensor_descriptor_fn_name()}", code)
+                    self.assertIn("tl.dot", code)
+                    if expect_permute:
+                        self.assertIn("tl.permute", code)
+                    else:
+                        self.assertNotIn("tl.permute", code)
+
+    @skipUnlessTensorDescriptor("Tensor descriptor support is required")
+    def test_matmul_tensor_descriptor_mixed_fallback_static_and_dynamic(self):
+        """Matmul should fall back per input when only one stride layout is valid."""
+
+        for static_shapes in (True, False):
+            matmul = self._make_td_matmul(static_shapes)
+
+            x_aligned = torch.randn([32, 64], device=DEVICE, dtype=HALF_DTYPE)
+            y_aligned = torch.randn([64, 32], device=DEVICE, dtype=HALF_DTYPE)
+            with self.subTest(static_shapes=static_shapes, layout="aligned"):
+                code_aligned, result_aligned = code_and_output(
+                    matmul, (x_aligned, y_aligned)
+                )
+                torch.testing.assert_close(
+                    result_aligned,
+                    x_aligned @ y_aligned,
+                    atol=1e-1,
+                    rtol=1e-2,
+                )
+                self.assertIn(
+                    f"x_desc = {get_tensor_descriptor_fn_name()}", code_aligned
+                )
+                self.assertIn(
+                    f"y_desc = {get_tensor_descriptor_fn_name()}", code_aligned
+                )
+                self.assertIn("tl.dot", code_aligned)
+
+            # x.stride(0) == 63, so x's non-contiguous byte stride is not
+            # 16-byte aligned for 2-byte dtypes. y remains TD-eligible.
+            x_unaligned = torch.randn([32, 63], device=DEVICE, dtype=HALF_DTYPE)
+            y_still_aligned = torch.randn([63, 32], device=DEVICE, dtype=HALF_DTYPE)
+            with self.subTest(static_shapes=static_shapes, layout="x_unaligned"):
+                code_unaligned, result_unaligned = code_and_output(
+                    matmul, (x_unaligned, y_still_aligned)
+                )
+                torch.testing.assert_close(
+                    result_unaligned,
+                    x_unaligned @ y_still_aligned,
+                    atol=1e-1,
+                    rtol=1e-2,
+                )
+                self.assertNotIn(
+                    f"x_desc = {get_tensor_descriptor_fn_name()}", code_unaligned
+                )
+                self.assertIn(
+                    f"y_desc = {get_tensor_descriptor_fn_name()}", code_unaligned
+                )
+                self.assertIn("tl.dot", code_unaligned)
+
     def assert_uses_tensor_descriptors(self, code: str) -> None:
         self.assertIn(get_tensor_descriptor_fn_name(), code)
         self.assertNotIn("tl.load(", code)
