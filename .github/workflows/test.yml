@@ -156,7 +156,7 @@ jobs:
           uv pip install -r python/requirements.txt
           # Disable proton on XPU: proton's NVIDIA sources (CuptiApi.cpp, NvtxApi.cpp)
           # require CUDA headers that are not present on Intel XPU runners.
-          if [ "${{ matrix.alias }}" = "xpu" ]; then
+          if [ "${{ matrix.alias }}" == "xpu" ]; then
             export TRITON_BUILD_PROTON=OFF
           fi
           MAX_JOBS=$(nproc) TRITON_PARALLEL_LINK_JOBS=2 uv pip install .
