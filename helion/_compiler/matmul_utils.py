@@ -138,15 +138,16 @@ def _emit_pallas_matmul(
     acc: ast.AST | None = None,
     need_f32_acc: bool = False,
     out_dtype: torch.dtype | None = None,
+    lhs_ndim: int = 2,
 ) -> ast.AST:
-    """Build a ``jnp.matmul`` AST node for the Pallas backend.
+    """Build a ``lax.dot_general`` AST node for the Pallas backend.
 
     Parameters
     ----------
     lhs, rhs:
         AST nodes for the left / right operands.
     acc:
-        Optional AST node for the accumulator (``acc + matmul(...)``).
+        Optional AST node for the accumulator (``acc + dot_general(...)``).
     need_f32_acc:
         When True, emit ``preferred_element_type=jnp.float32`` and, if
         *out_dtype* is narrower than f32, append a
@@ -154,15 +155,28 @@ def _emit_pallas_matmul(
     out_dtype:
         Desired output dtype.  Only used when *need_f32_acc* is True to
         decide whether a cast-back is required.
+    lhs_ndim:
+        Number of dimensions in the left operand (2 for mm, 3 for bmm).
     """
+    if lhs_ndim == 3:
+        dim_numbers = "(((2,), (1,)), ((0,), (0,)))"
+    elif lhs_ndim == 2:
+        dim_numbers = "(((1,), (0,)), ((), ()))"
+    else:
+        raise ValueError(f"lhs_ndim must be 2 or 3, got {lhs_ndim}")
+
     if need_f32_acc:
         dot_expr = expr_from_string(
-            "jnp.matmul({lhs}, {rhs}, preferred_element_type=jnp.float32)",
+            f"lax.dot_general({{lhs}}, {{rhs}}, dimension_numbers={dim_numbers}, preferred_element_type=jnp.float32)",
             lhs=lhs,
             rhs=rhs,
         )
     else:
-        dot_expr = expr_from_string("jnp.matmul({lhs}, {rhs})", lhs=lhs, rhs=rhs)
+        dot_expr = expr_from_string(
+            f"lax.dot_general({{lhs}}, {{rhs}}, dimension_numbers={dim_numbers})",
+            lhs=lhs,
+            rhs=rhs,
+        )
 
     if acc is not None:
         dot_expr = expr_from_string("{acc} + {dot}", acc=acc, dot=dot_expr)
