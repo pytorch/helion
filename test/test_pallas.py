@@ -1027,8 +1027,8 @@ class TestPallas(TestCase):
         self.assertIn(
             "_scratch_shapes=["
             "((4, 128, 128), 'jnp.float32', 'vmem'), "
-            "((4, 128, 256), 'jnp.float32', 'vmem'), "
-            "((4, 128, 128), 'jnp.float32', 'vmem')]",
+            "((4, 128, 128), 'jnp.float32', 'vmem'), "
+            "((4, 128, 256), 'jnp.float32', 'vmem')]",
             code,
         )
         self.assertIn("jnp.tile(", code)
@@ -1056,8 +1056,8 @@ class TestPallas(TestCase):
         self.assertIn(
             "_scratch_shapes=["
             "((4, 128, 128), 'jnp.float32', 'vmem'), "
-            "((4, 128, 256), 'jnp.float32', 'vmem'), "
             "((4, 128, 128), 'jnp.float32', 'vmem'), "
+            "((4, 128, 256), 'jnp.float32', 'vmem'), "
             "((4, 256, 128), 'jnp.float32', 'vmem'), "
             "((), None, 'dma_semaphore'), "
             "((4, 128, 256), 'jnp.float32', 'vmem'), "
