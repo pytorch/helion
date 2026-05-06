@@ -141,11 +141,11 @@ jobs:
               --num-shapes 2 \
               --output "$TEST_REPORTS_DIR/helionbench.json"
 
-          if [[ -s "$TEST_REPORTS_DIR/helionbench.json" ]]; then
-            cat "$TEST_REPORTS_DIR/helionbench.json"
-          else
-            echo "helionbench.json is missing or empty (some kernels may have failed)"
+          if [[ ! -s "$TEST_REPORTS_DIR/helionbench.json" ]]; then
+            echo "❌ helionbench.json is missing or empty"
+            exit 1
           fi
+          cat "$TEST_REPORTS_DIR/helionbench.json"
 
       - name: Upload the benchmark results to GitHub
         uses: actions/upload-artifact@v7
