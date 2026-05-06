@@ -1657,6 +1657,431 @@ class TestCuteLowerings(unittest.TestCase):
         self.assertLess(later_subtile_guard_pos, later_acquire_pos, code)
         self.assertLess(later_acquire_pos, t2r_copy_pos, code)
 
+    def test_tcgen05_diagnostic_split_first_t2r_layout_splits_subtile_loop(
+        self,
+    ) -> None:
+        @helion.kernel(backend="cute")
+        def cute_matmul_persistent_role(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        torch.manual_seed(0)
+        args = (
+            torch.randn(512, 32, device=DEVICE, dtype=torch.float16),
+            torch.randn(32, 256, device=DEVICE, dtype=torch.float16),
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_persistent_role.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            cfg = _make_tcgen05_persistent_config(
+                block_sizes=[256, 256, 16],
+                l2_groupings=[4],
+                pid_type="persistent_interleaved",
+                tcgen05_cluster_m=2,
+                tcgen05_c_acquire_placement="first_in_loop",
+                tcgen05_epilogue_layout="split_first_t2r",
+            )
+            code = bound.to_triton_code(cfg)
+
+        epi_role_predicate = (
+            "cute.arch.make_warp_uniform(cute.arch.warp_idx()) < cutlass.Int32(4)"
+        )
+        role_src, _, _ = self._role_local_while_source_for_predicate(
+            code,
+            ast.parse(code),
+            epi_role_predicate,
+        )
+        first_subtile_assign = "_tcgen05_subtile = 0"
+        split_loop = (
+            "for _tcgen05_split_subtile in cutlass.range("
+            "tcgen05_subtile_count - 1, unroll_full=True):"
+        )
+        tail_subtile_assign = "_tcgen05_subtile = _tcgen05_split_subtile + 1"
+        acc_wait = "tcgen05_acc_pipeline.consumer_wait(tcgen05_acc_consumer_state)"
+        t2r_copy = "cute.copy(tcgen05_tiled_copy_t2r"
+        r2s_source_store = "tcgen05_tRS_rD.store(tcgen05_acc_vec)"
+        first_barrier = "tcgen05_epilog_sync_barrier.arrive_and_wait()"
+        c_acquire = "tcgen05_c_pipeline.producer_acquire()"
+        c_commit = "tcgen05_c_pipeline.producer_commit()"
+        acc_release = (
+            "tcgen05_acc_pipeline.consumer_release(tcgen05_acc_consumer_state)"
+        )
+
+        first_assign_pos = role_src.find(first_subtile_assign)
+        acc_wait_pos = role_src.find(acc_wait, first_assign_pos)
+        first_t2r_pos = role_src.find(t2r_copy, acc_wait_pos)
+        first_r2s_store_pos = role_src.find(r2s_source_store, first_t2r_pos)
+        first_barrier_pos = role_src.find(first_barrier, first_r2s_store_pos)
+        first_commit_pos = role_src.find(c_commit, first_barrier_pos)
+        split_loop_pos = role_src.find(split_loop, first_commit_pos)
+        tail_assign_pos = role_src.find(tail_subtile_assign, split_loop_pos)
+        tail_t2r_pos = role_src.find(t2r_copy, tail_assign_pos)
+        first_acquire_pos = role_src.find(c_acquire)
+        first_release_pos = role_src.find(acc_release, first_t2r_pos)
+
+        for needle, pos in (
+            (first_subtile_assign, first_assign_pos),
+            (acc_wait, acc_wait_pos),
+            (t2r_copy, first_t2r_pos),
+            (r2s_source_store, first_r2s_store_pos),
+            (first_barrier, first_barrier_pos),
+            (c_commit, first_commit_pos),
+            (split_loop, split_loop_pos),
+            (tail_subtile_assign, tail_assign_pos),
+            ("tail T2R copy", tail_t2r_pos),
+            ("first C acquire", first_acquire_pos),
+            (acc_release, first_release_pos),
+        ):
+            self.assertGreaterEqual(pos, 0, f"Missing {needle!r} in:\n{role_src}")
+        self.assertLess(first_acquire_pos, first_r2s_store_pos, role_src)
+        self.assertLess(first_assign_pos, acc_wait_pos, role_src)
+        self.assertLess(acc_wait_pos, first_t2r_pos, role_src)
+        self.assertLess(first_t2r_pos, first_release_pos, role_src)
+        self.assertLess(first_release_pos, first_barrier_pos, role_src)
+        self.assertLess(first_barrier_pos, first_commit_pos, role_src)
+        self.assertLess(first_commit_pos, split_loop_pos, role_src)
+        self.assertLess(split_loop_pos, tail_assign_pos, role_src)
+        self.assertLess(tail_assign_pos, tail_t2r_pos, role_src)
+        self.assertEqual(role_src.count(acc_wait), 1, role_src)
+        self.assertNotIn("if _tcgen05_subtile == 0 and", role_src)
+
+    def test_tcgen05_diagnostic_split_acc_t2r_store_tail_layout_splits_regions(
+        self,
+    ) -> None:
+        @helion.kernel(backend="cute")
+        def cute_matmul_persistent_role(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        torch.manual_seed(0)
+        args = (
+            torch.randn(512, 32, device=DEVICE, dtype=torch.float16),
+            torch.randn(32, 256, device=DEVICE, dtype=torch.float16),
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_persistent_role.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            cfg = _make_tcgen05_persistent_config(
+                block_sizes=[256, 256, 16],
+                l2_groupings=[4],
+                pid_type="persistent_interleaved",
+                tcgen05_cluster_m=2,
+                tcgen05_epilogue_layout="split_acc_t2r_store_tail",
+            )
+            code = bound.to_triton_code(cfg)
+
+        epi_role_predicate = (
+            "cute.arch.make_warp_uniform(cute.arch.warp_idx()) < cutlass.Int32(4)"
+        )
+        role_src, _, _ = self._role_local_while_source_for_predicate(
+            code,
+            ast.parse(code),
+            epi_role_predicate,
+        )
+        subtile_loop = (
+            "for _tcgen05_subtile in cutlass.range("
+            "tcgen05_subtile_count, unroll_full=True):"
+        )
+        later_guard = "if _tcgen05_subtile != 0 and"
+        c_acquire = "tcgen05_c_pipeline.producer_acquire()"
+        acc_wait = "tcgen05_acc_pipeline.consumer_wait(tcgen05_acc_consumer_state)"
+        t2r_copy = "cute.copy(tcgen05_tiled_copy_t2r"
+        acc_release = (
+            "tcgen05_acc_pipeline.consumer_release(tcgen05_acc_consumer_state)"
+        )
+        r2s_source_store = "tcgen05_tRS_rD.store(tcgen05_acc_vec)"
+        first_barrier = "tcgen05_epilog_sync_barrier.arrive_and_wait()"
+        r2s_copy = "cute.copy(tcgen05_tiled_copy_r2s"
+        shared_fence = "cute.arch.fence_view_async_shared()"
+        tma_store_copy = "cute.copy(tcgen05_tma_store_atom"
+        c_commit = "tcgen05_c_pipeline.producer_commit()"
+
+        subtile_loop_pos = role_src.find(subtile_loop)
+        epi_active_pos = role_src.find("if tcgen05_epi_active:", subtile_loop_pos)
+        c_region_pos = role_src.find("if True:", epi_active_pos)
+        later_guard_pos = role_src.find(later_guard, c_region_pos)
+        later_acquire_pos = role_src.find(c_acquire, later_guard_pos)
+        acc_region_pos = role_src.find("if True:", later_acquire_pos)
+        acc_wait_pos = role_src.find(acc_wait, acc_region_pos)
+        t2r_copy_pos = role_src.find(t2r_copy, acc_wait_pos)
+        acc_release_pos = role_src.find(acc_release, t2r_copy_pos)
+        r2s_source_store_pos = role_src.find(r2s_source_store, t2r_copy_pos)
+        tail_region_pos = role_src.find("if True:", r2s_source_store_pos)
+        first_barrier_pos = role_src.find(first_barrier, tail_region_pos)
+        r2s_copy_pos = role_src.find(r2s_copy, first_barrier_pos)
+        shared_fence_pos = role_src.find(shared_fence, r2s_copy_pos)
+        second_barrier_pos = role_src.find(first_barrier, shared_fence_pos)
+        tma_store_copy_pos = role_src.find(tma_store_copy, second_barrier_pos)
+        c_commit_pos = role_src.find(c_commit, tma_store_copy_pos)
+
+        for needle, pos in (
+            (subtile_loop, subtile_loop_pos),
+            ("epilogue active guard", epi_active_pos),
+            ("C-stage acquire source boundary", c_region_pos),
+            (later_guard, later_guard_pos),
+            (c_acquire, later_acquire_pos),
+            ("accumulator wait / T2R source boundary", acc_region_pos),
+            (acc_wait, acc_wait_pos),
+            (t2r_copy, t2r_copy_pos),
+            (acc_release, acc_release_pos),
+            (r2s_source_store, r2s_source_store_pos),
+            ("C-store barrier / TMA tail source boundary", tail_region_pos),
+            (first_barrier, first_barrier_pos),
+            (r2s_copy, r2s_copy_pos),
+            (shared_fence, shared_fence_pos),
+            ("second epilogue barrier", second_barrier_pos),
+            (tma_store_copy, tma_store_copy_pos),
+            (c_commit, c_commit_pos),
+        ):
+            self.assertGreaterEqual(pos, 0, f"Missing {needle!r} in:\n{role_src}")
+        self.assertLess(subtile_loop_pos, c_region_pos, role_src)
+        self.assertLess(c_region_pos, later_guard_pos, role_src)
+        self.assertLess(later_guard_pos, later_acquire_pos, role_src)
+        self.assertLess(later_acquire_pos, acc_region_pos, role_src)
+        self.assertLess(acc_region_pos, acc_wait_pos, role_src)
+        self.assertLess(acc_wait_pos, t2r_copy_pos, role_src)
+        self.assertLess(t2r_copy_pos, acc_release_pos, role_src)
+        self.assertLess(acc_release_pos, first_barrier_pos, role_src)
+        self.assertLess(t2r_copy_pos, r2s_source_store_pos, role_src)
+        self.assertLess(r2s_source_store_pos, tail_region_pos, role_src)
+        self.assertLess(tail_region_pos, first_barrier_pos, role_src)
+        self.assertLess(first_barrier_pos, r2s_copy_pos, role_src)
+        self.assertLess(r2s_copy_pos, shared_fence_pos, role_src)
+        self.assertLess(shared_fence_pos, second_barrier_pos, role_src)
+        self.assertLess(second_barrier_pos, tma_store_copy_pos, role_src)
+        self.assertLess(tma_store_copy_pos, c_commit_pos, role_src)
+        self.assertEqual(role_src.count("if True:"), 4, role_src)
+        self.assertNotIn("_tcgen05_split_subtile", role_src)
+
+    def test_tcgen05_diagnostic_split_first_t2r_rejects_flat_epilogue(
+        self,
+    ) -> None:
+        @helion.kernel(backend="cute")
+        def cute_matmul_flat_tma_store(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        torch.manual_seed(0)
+        args = (
+            torch.randn(256, 32, device=DEVICE, dtype=torch.float16),
+            torch.randn(32, 256, device=DEVICE, dtype=torch.float16),
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_flat_tma_store.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            cfg = _make_tcgen05_persistent_config(
+                block_sizes=[128, 128, 16],
+                pid_type="flat",
+                tcgen05_epilogue_layout="split_first_t2r",
+            )
+            with self.assertRaisesRegex(
+                exc.BackendUnsupported,
+                "requires the role-local TMA-store tcgen05 epilogue",
+            ):
+                bound.to_triton_code(cfg)
+
+    def test_tcgen05_diagnostic_split_first_t2r_rejects_one_subtile_epilogue(
+        self,
+    ) -> None:
+        @helion.kernel(backend="cute")
+        def cute_matmul_cluster_m2_one_subtile(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        torch.manual_seed(0)
+        args = (
+            torch.randn(256, 32, device=DEVICE, dtype=torch.float16),
+            torch.randn(32, 128, device=DEVICE, dtype=torch.float16),
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_cluster_m2_one_subtile.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            cfg = _make_tcgen05_persistent_config(
+                block_sizes=[256, 128, 16],
+                l2_groupings=[4],
+                pid_type="persistent_interleaved",
+                tcgen05_cluster_m=2,
+                tcgen05_epilogue_layout="split_first_t2r",
+            )
+            with self.assertRaisesRegex(
+                exc.BackendUnsupported,
+                "CtaGroup.TWO block_n >= 256",
+            ):
+                bound.to_triton_code(cfg)
+
+    def test_tcgen05_diagnostic_split_first_t2r_rejects_one_cta_epilogue(
+        self,
+    ) -> None:
+        @helion.kernel(backend="cute")
+        def cute_matmul_cluster_m1_role_local(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        torch.manual_seed(0)
+        args = (
+            torch.randn(256, 32, device=DEVICE, dtype=torch.float16),
+            torch.randn(32, 256, device=DEVICE, dtype=torch.float16),
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_cluster_m1_role_local.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            cfg = _make_tcgen05_persistent_config(
+                block_sizes=[128, 256, 16],
+                l2_groupings=[4],
+                pid_type="persistent_interleaved",
+                tcgen05_cluster_m=1,
+                tcgen05_epilogue_layout="split_first_t2r",
+            )
+            with self.assertRaisesRegex(
+                exc.BackendUnsupported,
+                "requires CtaGroup.TWO",
+            ):
+                bound.to_triton_code(cfg)
+
+    def test_tcgen05_diagnostic_split_first_t2r_runtime_correctness(
+        self,
+    ) -> None:
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_cluster_m2_split_first_t2r(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        torch.manual_seed(0)
+        args = (
+            torch.randn(256, 16, device=DEVICE, dtype=torch.bfloat16),
+            torch.randn(16, 256, device=DEVICE, dtype=torch.bfloat16),
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_cluster_m2_split_first_t2r.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            cfg = _make_tcgen05_persistent_config(
+                block_sizes=[256, 256, 16],
+                l2_groupings=[4],
+                pid_type="persistent_interleaved",
+                tcgen05_cluster_m=2,
+                tcgen05_epilogue_layout="split_first_t2r",
+            )
+            bound.set_config(cfg)
+            code = bound.to_triton_code(cfg)
+            self.assertIn(
+                "for _tcgen05_split_subtile in cutlass.range("
+                "tcgen05_subtile_count - 1, unroll_full=True):",
+                code,
+            )
+            out = bound(*args)
+
+        expected = args[0] @ args[1]
+        torch.testing.assert_close(out, expected, atol=2e-1, rtol=1e-2)
+
+    def test_tcgen05_diagnostic_split_acc_t2r_store_tail_runtime_correctness(
+        self,
+    ) -> None:
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_cluster_m2_split_acc_t2r_store_tail(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        torch.manual_seed(0)
+        args = (
+            torch.randn(256, 16, device=DEVICE, dtype=torch.bfloat16),
+            torch.randn(16, 256, device=DEVICE, dtype=torch.bfloat16),
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_cluster_m2_split_acc_t2r_store_tail.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            cfg = _make_tcgen05_persistent_config(
+                block_sizes=[256, 256, 16],
+                l2_groupings=[4],
+                pid_type="persistent_interleaved",
+                tcgen05_cluster_m=2,
+                tcgen05_epilogue_layout="split_acc_t2r_store_tail",
+            )
+            bound.set_config(cfg)
+            code = bound.to_triton_code(cfg)
+            self.assertIn(
+                "if True:\n"
+                "                            if _tcgen05_subtile == 0:\n"
+                "                                tcgen05_acc_pipeline.consumer_wait",
+                code,
+            )
+            out = bound(*args)
+
+        expected = args[0] @ args[1]
+        torch.testing.assert_close(out, expected, atol=2e-1, rtol=1e-2)
+
     def test_tcgen05_diagnostic_skip_epilogue_store_drains_acc_pipeline(
         self,
     ) -> None:
