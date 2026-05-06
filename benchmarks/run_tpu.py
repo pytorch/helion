@@ -48,9 +48,11 @@ EXAMPLES_DIR = Path(__file__).parent.parent / "examples"
 
 # Shape generators for multi-shape benchmarking.
 # Each returns a list of (label, args_tuple) pairs.
-def _exp_shapes() -> list[tuple[str, tuple[Any, ...]]]:
+def _exp_shapes(num_shapes: int | None = None) -> list[tuple[str, tuple[Any, ...]]]:
     # First entry matches examples/exp.py main() (10240*10240 = ~105M elems).
     sizes = [10240 * 10240, 16384 * 16384, 1048576, 262144, 65536, 16384, 4096, 1024]
+    if num_shapes is not None:
+        sizes = sizes[:num_shapes]
     return [
         (
             f"[{n}]",
@@ -60,11 +62,13 @@ def _exp_shapes() -> list[tuple[str, tuple[Any, ...]]]:
     ]
 
 
-def _add_shapes() -> list[tuple[str, tuple[Any, ...]]]:
+def _add_shapes(num_shapes: int | None = None) -> list[tuple[str, tuple[Any, ...]]]:
     # First entry matches examples/add.py main() (1024x1024).
     # 1st = canonical small (matches main()); 2nd = very large (escape the
     # ~180 µs torch_tpu sync overhead floor and exercise memory-bandwidth).
     sizes = [(1024, 1024), (16384, 16384), (2048, 2048), (512, 512), (128, 128)]
+    if num_shapes is not None:
+        sizes = sizes[:num_shapes]
     return [
         (
             f"[{m},{n}]",
@@ -77,9 +81,11 @@ def _add_shapes() -> list[tuple[str, tuple[Any, ...]]]:
     ]
 
 
-def _softmax_shapes() -> list[tuple[str, tuple[Any, ...]]]:
+def _softmax_shapes(num_shapes: int | None = None) -> list[tuple[str, tuple[Any, ...]]]:
     # 1st small/canonical; 2nd very large to be memory-bound.
     shapes = [(1024, 256), (8192, 8192), (1024, 512), (1024, 2048), (1024, 4096)]
+    if num_shapes is not None:
+        shapes = shapes[:num_shapes]
     return [
         (
             f"[{m},{n}]",
@@ -89,12 +95,14 @@ def _softmax_shapes() -> list[tuple[str, tuple[Any, ...]]]:
     ]
 
 
-def _welford_shapes() -> list[tuple[str, tuple[Any, ...]]]:
+def _welford_shapes(num_shapes: int | None = None) -> list[tuple[str, tuple[Any, ...]]]:
     # 1st canonical; 2nd is 2x rows but half D (vs 1st) so total memory
     # traffic stays similar. welford's autotune is expensive (~16 min/shape
     # at full effort), so (524288, 4096) and (524288, 1024) both timed out
     # past the 60-min cap in earlier runs — back off to (524288, 512).
     configs = [(262144, 1024), (524288, 512), (262144, 1536), (262144, 2048)]
+    if num_shapes is not None:
+        configs = configs[:num_shapes]
     return [
         (
             f"[{s},{d}]",
@@ -116,7 +124,9 @@ def _welford_baseline(
     )
 
 
-def _attention_shapes() -> list[tuple[str, tuple[Any, ...]]]:
+def _attention_shapes(
+    num_shapes: int | None = None,
+) -> list[tuple[str, tuple[Any, ...]]]:
     # First entry matches examples/attention.py main() so --num-shapes 1 gives
     # the canonical example config.
     # First entry mirrors examples/attention.py main(); second is the
@@ -132,6 +142,8 @@ def _attention_shapes() -> list[tuple[str, tuple[Any, ...]]]:
         (1, 4, 1024, 64),
         (2, 8, 512, 64),
     ]
+    if num_shapes is not None:
+        configs = configs[:num_shapes]
     return [
         (
             f"[{z},{h},{n},{d}]",
@@ -144,13 +156,15 @@ def _attention_shapes() -> list[tuple[str, tuple[Any, ...]]]:
     ]
 
 
-def _bmm_shapes() -> list[tuple[str, tuple[Any, ...]]]:
+def _bmm_shapes(num_shapes: int | None = None) -> list[tuple[str, tuple[Any, ...]]]:
     configs = [
         (16, 512, 768, 1024),
         (64, 2048, 2048, 2048),
         (8, 256, 512, 256),
         (4, 1024, 512, 512),
     ]
+    if num_shapes is not None:
+        configs = configs[:num_shapes]
     return [
         (
             f"[{b},{m},{k},{n}]",
@@ -163,9 +177,11 @@ def _bmm_shapes() -> list[tuple[str, tuple[Any, ...]]]:
     ]
 
 
-def _matmul_shapes() -> list[tuple[str, tuple[Any, ...]]]:
+def _matmul_shapes(num_shapes: int | None = None) -> list[tuple[str, tuple[Any, ...]]]:
     # First entry matches examples/matmul.py main()'s check(1024, 1024, 1024).
     configs = [(1024, 1024, 1024), (8192, 8192, 8192), (1024, 2048, 2048)]
+    if num_shapes is not None:
+        configs = configs[:num_shapes]
     return [
         (
             f"[{m},{k},{n}]",
@@ -193,12 +209,16 @@ def _matmul_layernorm_baseline(
     ).to(matmul_out.dtype)
 
 
-def _matmul_layernorm_shapes() -> list[tuple[str, tuple[Any, ...]]]:
+def _matmul_layernorm_shapes(
+    num_shapes: int | None = None,
+) -> list[tuple[str, tuple[Any, ...]]]:
     # Use larger, regular shapes than examples/matmul_layernorm.py main()
     # (which uses small/odd n=200,400 to dodge an unrelated power-of-2 bug).
     # (4096,4096,4096) hit "Default config failed while computing baseline"
     # — autotuner default OOMs before search starts.
     configs = [(1024, 1024, 1024), (2048, 2048, 2048)]
+    if num_shapes is not None:
+        configs = configs[:num_shapes]
     return [
         (
             f"[{m},{k},{n}]",
@@ -213,13 +233,17 @@ def _matmul_layernorm_shapes() -> list[tuple[str, tuple[Any, ...]]]:
     ]
 
 
-def _broadcast_matmul_shapes() -> list[tuple[str, tuple[Any, ...]]]:
+def _broadcast_matmul_shapes(
+    num_shapes: int | None = None,
+) -> list[tuple[str, tuple[Any, ...]]]:
     configs = [
         (16, 512, 768, 1024),
         (64, 2048, 2048, 2048),
         (8, 256, 512, 256),
         (4, 1024, 512, 512),
     ]
+    if num_shapes is not None:
+        configs = configs[:num_shapes]
     return [
         (
             f"[{b},{m},{k},{n}]",
@@ -232,7 +256,7 @@ def _broadcast_matmul_shapes() -> list[tuple[str, tuple[Any, ...]]]:
     ]
 
 
-def _geglu_shapes() -> list[tuple[str, tuple[Any, ...]]]:
+def _geglu_shapes(num_shapes: int | None = None) -> list[tuple[str, tuple[Any, ...]]]:
     # First entry matches examples/geglu.py main()'s first kernel_test_shape.
     shapes = [
         (8, 2048, 4096),
@@ -241,6 +265,8 @@ def _geglu_shapes() -> list[tuple[str, tuple[Any, ...]]]:
         (2048, 1024),
         (1024, 512),
     ]
+    if num_shapes is not None:
+        shapes = shapes[:num_shapes]
     return [
         (
             "[" + ",".join(str(d) for d in s) + "]",
@@ -257,7 +283,7 @@ def _geglu_baseline(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     return nn.functional.gelu(a, approximate="tanh").to(b.dtype) * b
 
 
-def _swiglu_shapes() -> list[tuple[str, tuple[Any, ...]]]:
+def _swiglu_shapes(num_shapes: int | None = None) -> list[tuple[str, tuple[Any, ...]]]:
     # First entry matches examples/swiglu.py main()'s first kernel_test_shape.
     shapes = [
         (4, 8192, 4096),
@@ -266,6 +292,8 @@ def _swiglu_shapes() -> list[tuple[str, tuple[Any, ...]]]:
         (4096, 2048),
         (1024, 512),
     ]
+    if num_shapes is not None:
+        shapes = shapes[:num_shapes]
     return [
         (
             "[" + ",".join(str(d) for d in s) + "]",
@@ -278,9 +306,13 @@ def _swiglu_shapes() -> list[tuple[str, tuple[Any, ...]]]:
     ]
 
 
-def _low_mem_dropout_shapes() -> list[tuple[str, tuple[Any, ...]]]:
+def _low_mem_dropout_shapes(
+    num_shapes: int | None = None,
+) -> list[tuple[str, tuple[Any, ...]]]:
     # First entry matches examples/low_mem_dropout.py main()'s first check call.
     sizes = [8192, 33554432, 32768, 262144, 65536, 16384, 4096]
+    if num_shapes is not None:
+        sizes = sizes[:num_shapes]
     return [
         (
             f"[{n}]",
@@ -298,9 +330,13 @@ def _swiglu_baseline(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     return nn.functional.silu(a).to(b.dtype) * b
 
 
-def _se_block_shapes() -> list[tuple[str, tuple[Any, ...]]]:
+def _se_block_shapes(
+    num_shapes: int | None = None,
+) -> list[tuple[str, tuple[Any, ...]]]:
     # 1st matches examples/se_block.py main() (1024, 1024); 2nd very large.
     configs = [(1024, 1024), (8192, 8192)]
+    if num_shapes is not None:
+        configs = configs[:num_shapes]
     return [
         (
             f"[{m},{n}]",
@@ -317,10 +353,14 @@ def _se_block_baseline(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
     return 2 * x * torch.sigmoid(x @ w)
 
 
-def _squeeze_and_excitation_net_shapes() -> list[tuple[str, tuple[Any, ...]]]:
+def _squeeze_and_excitation_net_shapes(
+    num_shapes: int | None = None,
+) -> list[tuple[str, tuple[Any, ...]]]:
     # 1st matches examples/squeeze_and_excitation_net.py main() (1024,1024,1024);
     # 2nd very large.
     configs = [(1024, 1024, 1024), (4096, 4096, 4096)]
+    if num_shapes is not None:
+        configs = configs[:num_shapes]
     return [
         (
             f"[{m},{n},{k}]",
@@ -340,10 +380,14 @@ def _squeeze_and_excitation_net_baseline(
     return torch.mul(x, torch.sigmoid(torch.relu(x @ a) @ b))
 
 
-def _rms_norm_bwd_shapes() -> list[tuple[str, tuple[Any, ...]]]:
+def _rms_norm_bwd_shapes(
+    num_shapes: int | None = None,
+) -> list[tuple[str, tuple[Any, ...]]]:
     # 1st small canonical; 2nd very large to exercise scaling.
     # rsqrt is computed from x via the fwd kernel.
     configs = [(2048, 4096), (8192, 8192)]
+    if num_shapes is not None:
+        configs = configs[:num_shapes]
     out: list[tuple[str, tuple[Any, ...]]] = []
     eps = 1e-5
     for m, n in configs:
@@ -373,7 +417,9 @@ def _rms_norm_bwd_baseline(
     return dx, dw
 
 
-def _cross_entropy_shapes() -> list[tuple[str, tuple[Any, ...]]]:
+def _cross_entropy_shapes(
+    num_shapes: int | None = None,
+) -> list[tuple[str, tuple[Any, ...]]]:
     # Pallas constrains shapes here for two reasons:
     # 1. PR #2054's gather strategy caps the logits table at 16 MiB VMEM.
     # 2. The kernel reads a full [tile_n, V] row into VMEM, so V drives the
@@ -383,6 +429,8 @@ def _cross_entropy_shapes() -> list[tuple[str, tuple[Any, ...]]]:
     # Only one shape fits comfortably under TPU VMEM at fp32; (256, 2048)
     # already OOMs (75 MB > 64 MB cap), so we don't add a "larger" 2nd shape.
     configs = [(128, 2048)]
+    if num_shapes is not None:
+        configs = configs[:num_shapes]
     return [
         (
             f"[{n},{v}]",
@@ -401,13 +449,17 @@ def _cross_entropy_baseline(logits: torch.Tensor, labels: torch.Tensor) -> torch
     return nn.functional.cross_entropy(logits, labels.long())
 
 
-def _embedding_shapes() -> list[tuple[str, tuple[Any, ...]]]:
+def _embedding_shapes(
+    num_shapes: int | None = None,
+) -> list[tuple[str, tuple[Any, ...]]]:
     # First entry mirrors examples/embedding.py main() (16x64 weights, [256,32]
     # indices). PR #2054's gather strategy keeps the weight table in VMEM
     # (16 MiB threshold), so we cap the larger shapes accordingly.
     # 2nd shape kept modestly larger than the 1st; (1024,128,4096,256) made
     # autotune take >30 min, exceeding the per-kernel budget.
     configs = [(256, 32, 16, 64), (512, 64, 32, 64), (1024, 128, 4096, 256)]
+    if num_shapes is not None:
+        configs = configs[:num_shapes]
     return [
         (
             f"[{a},{b},{ne},{ed}]",
@@ -420,8 +472,12 @@ def _embedding_shapes() -> list[tuple[str, tuple[Any, ...]]]:
     ]
 
 
-def _batch_softmax_shapes() -> list[tuple[str, tuple[Any, ...]]]:
+def _batch_softmax_shapes(
+    num_shapes: int | None = None,
+) -> list[tuple[str, tuple[Any, ...]]]:
     configs = [(16, 512, 1024), (64, 2048, 4096), (32, 512, 1024), (4, 1024, 512)]
+    if num_shapes is not None:
+        configs = configs[:num_shapes]
     return [
         (
             f"[{b},{m},{n}]",
@@ -431,10 +487,14 @@ def _batch_softmax_shapes() -> list[tuple[str, tuple[Any, ...]]]:
     ]
 
 
-def _rms_norm_shapes() -> list[tuple[str, tuple[Any, ...]]]:
+def _rms_norm_shapes(
+    num_shapes: int | None = None,
+) -> list[tuple[str, tuple[Any, ...]]]:
     # (8192,16384) hit "No working config found" — search space exhausted at
     # 16384 trailing dim. Step back to (8192,8192).
     configs = [(2048, 4096), (8192, 8192), (2048, 8192), (4096, 4096)]
+    if num_shapes is not None:
+        configs = configs[:num_shapes]
     return [
         (
             f"[{m},{n}]",
@@ -453,9 +513,13 @@ def _rms_norm_baseline(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     return (weight * (hidden * torch.rsqrt(variance + 1e-5))).to(x.dtype)
 
 
-def _layer_norm_shapes() -> list[tuple[str, tuple[Any, ...]]]:
+def _layer_norm_shapes(
+    num_shapes: int | None = None,
+) -> list[tuple[str, tuple[Any, ...]]]:
     # First entry matches examples/layer_norm.py main() (4096, 10240).
     configs = [(4096, 10240), (16384, 16384), (2048, 4096), (2048, 8192), (4096, 4096)]
+    if num_shapes is not None:
+        configs = configs[:num_shapes]
     return [
         (
             f"[{m},{n}]",
@@ -471,12 +535,16 @@ def _layer_norm_shapes() -> list[tuple[str, tuple[Any, ...]]]:
     ]
 
 
-def _softmax_shapes_basic() -> list[tuple[str, tuple[Any, ...]]]:
+def _softmax_shapes_basic(
+    num_shapes: int | None = None,
+) -> list[tuple[str, tuple[Any, ...]]]:
     # The kernel specializes on the trailing dim, so changing it across the
     # 2nd shape produces a shape-mismatch failure. Scale M instead for the 2nd.
     # Kernel specializes on the trailing dim, so keep N=2560 across shapes.
     # Scale M to grow memory traffic for the 2nd shape.
     shapes = [(4096, 2560), (65536, 2560), (8192, 2560), (1024, 8192)]
+    if num_shapes is not None:
+        shapes = shapes[:num_shapes]
     return [
         (
             f"[{m},{n}]",
@@ -486,10 +554,12 @@ def _softmax_shapes_basic() -> list[tuple[str, tuple[Any, ...]]]:
     ]
 
 
-def _sum_shapes() -> list[tuple[str, tuple[Any, ...]]]:
+def _sum_shapes(num_shapes: int | None = None) -> list[tuple[str, tuple[Any, ...]]]:
     # First entry matches examples/sum.py main() so --num-shapes 1 gives the
     # canonical example config (fp32).
     shapes = [(5120, 2560), (16384, 16384), (2048, 8192)]
+    if num_shapes is not None:
+        shapes = shapes[:num_shapes]
     return [
         (
             f"[{m},{n}]",
@@ -499,12 +569,16 @@ def _sum_shapes() -> list[tuple[str, tuple[Any, ...]]]:
     ]
 
 
-def _long_sum_shapes() -> list[tuple[str, tuple[Any, ...]]]:
+def _long_sum_shapes(
+    num_shapes: int | None = None,
+) -> list[tuple[str, tuple[Any, ...]]]:
     # Long reduction dim: 131072 = 4x the 32768 block size used by the
     # looped variants, so they actually loop.
     # (64, 524288) fp32 is 128 MB just for the input — VMEM OOM (cap is 64 MB).
     # Keep the reduction dim 524288 to test long reductions, but smaller batch.
     shapes = [(4, 131072), (8, 524288)]
+    if num_shapes is not None:
+        shapes = shapes[:num_shapes]
     return [
         (
             f"[{m},{n}]",
@@ -795,9 +869,11 @@ def run_kernel_inner(name: str) -> KernelResult:
                 kernel_time_ms=elapsed * 1000,
             )
 
-        shapes = shapes_fn()
-        if NUM_SHAPES is not None:
-            shapes = shapes[:NUM_SHAPES]
+        # Pass NUM_SHAPES so the helper can slice its spec list before
+        # materializing tensors — without this we'd allocate every candidate
+        # shape on TPU first and only then drop the unused tail, which can
+        # OOM during shape construction with --num-shapes 2.
+        shapes = shapes_fn(NUM_SHAPES)
         all_passed = True
         shape_results: list[ShapeResult] = []
         accuracy_verified = max_mismatch_pct is None or max_mismatch_pct < 1.0
