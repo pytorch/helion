@@ -1081,8 +1081,11 @@ def run_example(
     trace_path: str | None = None,
     process_group_name: str | None = None,
     interleaved: bool = True,
-) -> None:
+) -> dict[str, float]:
     """Run complete example: correctness check + benchmark.
+
+    Returns:
+        Dictionary mapping implementation names to their benchmark times in ms.
 
     Args:
         kernel_fn: Single kernel function, or dict of {name: function} for multiple kernel variants
@@ -1273,6 +1276,8 @@ def run_example(
             print(f"{name:<20} {time:<12.4f} {speedup_str:<15}", file=sys.stderr)
 
         print(f"{'=' * 65}\n", file=sys.stderr)
+
+    return all_times
 
 
 def _assert_example_result_close(

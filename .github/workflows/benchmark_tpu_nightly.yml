@@ -1,0 +1,37 @@
+name: Benchmark TPU Nightly
+
+# TODO: delete this file before merging.
+# Nightly TPU runs are dispatched from benchmark_nightly.yml (run_tpu: 'true').
+# This file only exists to give the PR branch its own push-triggered TPU run
+# while iterating on the dashboard integration. After merge, manual TPU runs
+# go through benchmark_dispatch.yml directly (run_tpu=true).
+
+on:
+  push:
+    branches:
+      - yifeixu/tpu-nightly-benchmark
+
+jobs:
+  dispatch-benchmark:
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - name: Dispatch benchmark_dispatch workflow (TPU only)
+        uses: actions/github-script@v9
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'benchmark_dispatch.yml',
+              ref: context.ref.replace('refs/heads/', ''),
+              inputs: {
+                run_h100: 'false',
+                run_b200: 'false',
+                run_mi350x: 'false',
+                run_tpu: 'true',
+              },
+            })
