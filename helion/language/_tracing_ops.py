@@ -1093,12 +1093,89 @@ def _rewrite_outer_subscripts_for_pre_broadcast(
                 )
                 reshaped.append(node)
 
+    # Insert _pre_broadcast_tile where pre-broadcast outer nodes feed wider-dim ops.
+    # First, propagate pre-broadcast status transitively through indirect consumers.
+    # After rewriting subscript[:, :, None] → subscript[:, :], downstream nodes
+    # (e.g. add, rsqrt) may still have stale meta shapes (u0, u1, 1) from trace
+    # time. We identify them by checking if any arg is pre-broadcast — if so,
+    # the node is also pre-broadcast (its real last dim is PRE_BROADCAST_SIZE).
+    all_pre_broadcast_outer: set[str] = set(pre_broadcast_outer_nodes)
+    all_pre_broadcast_outer.update(node.name for node in reshaped)
+    for node in outer_graph.nodes:
+        if node.op != "call_function" or node.name in all_pre_broadcast_outer:
+            continue
+        node_val = node.meta.get("val", None)
+        if not isinstance(node_val, torch.Tensor) or len(node_val.shape) < 2:
+            continue
+        last_dim = node_val.shape[-1]
+        if isinstance(last_dim, torch.SymInt):
+            continue
+        last_dim_int = int(last_dim)
+        if last_dim_int > PRE_BROADCAST_SIZE:
+            continue
+        has_pre_broadcast_arg = False
+        for arg in node.args:
+            if isinstance(arg, torch.fx.Node) and arg.name in all_pre_broadcast_outer:
+                arg_val = arg.meta.get("val", None)
+                if isinstance(arg_val, torch.Tensor) and len(arg_val.shape) >= 2:
+                    arg_last = arg_val.shape[-1]
+                    if isinstance(arg_last, int) and arg_last == PRE_BROADCAST_SIZE:
+                        has_pre_broadcast_arg = True
+                        break
+        if has_pre_broadcast_arg:
+            new_shape = [*node_val.shape[:-1], PRE_BROADCAST_SIZE]
+            node.meta["val"] = node_val.new_empty(new_shape)
+            all_pre_broadcast_outer.add(node.name)
+            reshaped.append(node)
+
+    new_nodes: list[torch.fx.Node] = []
+    for node in list(outer_graph.nodes):
+        if node.op != "call_function" or node.name in all_pre_broadcast_outer:
+            continue
+        node_val = node.meta.get("val", None)
+        if not isinstance(node_val, torch.Tensor) or len(node_val.shape) < 2:
+            continue
+        last_dim = node_val.shape[-1]
+        last_dim_is_sym = isinstance(last_dim, torch.SymInt)
+        if not last_dim_is_sym and int(last_dim) <= PRE_BROADCAST_SIZE:
+            continue
+        args_list = list(node.args)
+        changed = False
+        for ai, arg in enumerate(args_list):
+            if not isinstance(arg, torch.fx.Node):
+                continue
+            if arg.name not in all_pre_broadcast_outer:
+                continue
+            arg_val = arg.meta.get("val", None)
+            if not isinstance(arg_val, torch.Tensor):
+                continue
+            if not (
+                isinstance(arg_val.shape[-1], int)
+                and arg_val.shape[-1] == PRE_BROADCAST_SIZE
+            ):
+                continue
+            with outer_graph.inserting_before(node):
+                tiled = outer_graph.call_function(
+                    _pre_broadcast_tile,
+                    args=(arg, last_dim),
+                )
+            tiled.meta = {
+                **arg.meta,
+                "val": arg_val.new_empty([*arg_val.shape[:-1], last_dim]),
+            }
+            new_nodes.append(tiled)
+            args_list[ai] = tiled
+            changed = True
+        if changed:
+            node.args = tuple(args_list)
+
     # Re-prepare lowerings for modified outer nodes
-    if reshaped:
+    all_to_prepare = reshaped + new_nodes
+    if all_to_prepare:
         with compile_lock:
             graph_lowering = FakeGraphLowering()
             with V.set_graph_handler(graph_lowering):
-                for node in reshaped:
+                for node in all_to_prepare:
                     if node.op == "call_function":
                         with node.meta["location"]:
                             prepare_node_lowering(graph_lowering, node)

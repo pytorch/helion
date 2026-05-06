@@ -971,6 +971,111 @@ class TestPallas(TestCase):
         ).to(device=DEVICE)
         torch.testing.assert_close(result, ref, rtol=1e-2, atol=1e-2)
 
+    def test_attention_emit_pipeline_correctness_head_dim_256(self) -> None:
+        """Test emit_pipeline attention pre-broadcast with head_dim > PRE_BROADCAST_SIZE."""
+        query = torch.randn(2, 2, 128, 256, dtype=torch.float32, device=DEVICE)
+        key = torch.randn(2, 2, 128, 256, dtype=torch.float32, device=DEVICE)
+        val = torch.randn(2, 2, 128, 256, dtype=torch.float32, device=DEVICE)
+        code, result = code_and_output(
+            pallas_attention,
+            (query, key, val),
+            block_sizes=[4, 128, 128],
+            pallas_loop_type="emit_pipeline",
+            pallas_pre_broadcast=True,
+        )
+        # m_i and l_i scratches get pre-broadcast trailing dim 128;
+        # acc scratch keeps head_dim=256
+        self.assertIn(
+            "_scratch_shapes=["
+            "((4, 128, 128), 'jnp.float32', 'vmem'), "
+            "((4, 128, 256), 'jnp.float32', 'vmem'), "
+            "((4, 128, 128), 'jnp.float32', 'vmem')]",
+            code,
+        )
+        self.assertIn("jnp.tile(", code)
+        ref = torch.nn.functional.scaled_dot_product_attention(
+            query.float().cpu(), key.float().cpu(), val.float().cpu()
+        ).to(device=DEVICE)
+        torch.testing.assert_close(result, ref, rtol=1e-2, atol=1e-2)
+
+    def test_attention_fori_loop_correctness_head_dim_256(self) -> None:
+        """Test fori_loop attention pre-broadcast with head_dim > PRE_BROADCAST_SIZE."""
+        query = torch.randn(2, 2, 128, 256, dtype=torch.float32, device=DEVICE)
+        key = torch.randn(2, 2, 128, 256, dtype=torch.float32, device=DEVICE)
+        val = torch.randn(2, 2, 128, 256, dtype=torch.float32, device=DEVICE)
+        args = (query, key, val)
+        code, result = code_and_output(
+            pallas_attention,
+            args,
+            block_sizes=[4, 128, 128],
+            pallas_loop_type="fori_loop",
+            pallas_pre_broadcast=True,
+        )
+        self.assertIn("jax.lax.fori_loop", code)
+        # m_i and l_i scratches get pre-broadcast trailing dim 128;
+        # acc scratch keeps head_dim=256; extra entries are DMA buffers/semaphores
+        self.assertIn(
+            "_scratch_shapes=["
+            "((4, 128, 128), 'jnp.float32', 'vmem'), "
+            "((4, 128, 256), 'jnp.float32', 'vmem'), "
+            "((4, 128, 128), 'jnp.float32', 'vmem'), "
+            "((4, 256, 128), 'jnp.float32', 'vmem'), "
+            "((), None, 'dma_semaphore'), "
+            "((4, 128, 256), 'jnp.float32', 'vmem'), "
+            "((), None, 'dma_semaphore')]",
+            code,
+        )
+        self.assertIn("jnp.tile(", code)
+        ref = torch.nn.functional.scaled_dot_product_attention(
+            query.float().cpu(), key.float().cpu(), val.float().cpu()
+        ).to(device=DEVICE)
+        torch.testing.assert_close(result, ref, rtol=1e-2, atol=1e-2)
+
+    def test_pre_broadcast_indirect_consumer(self) -> None:
+        """Pre-broadcast tile must propagate through indirect consumers.
+
+        When a pre-broadcast node (2D, trailing dim 128) feeds an intermediate
+        op (e.g. running + 1.0, rsqrt) before reaching a wider-dim consumer
+        (e.g. acc * scale where acc has head_dim=256), the tile-insertion pass
+        must tile the intermediate result, not just direct pre-broadcast nodes.
+        """
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def outer_chain_scale(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            batch, m, k = a.size()
+            head_dim = hl.specialize(b.size(-1))
+            out = torch.empty([batch, m, head_dim], device=a.device, dtype=a.dtype)
+            for tile_b, tile_m in hl.tile([batch, m]):
+                running = hl.zeros([tile_b, tile_m], dtype=torch.float32)
+                acc = hl.zeros([tile_b, tile_m, head_dim], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    chunk = a[tile_b, tile_m, tile_k]
+                    running = running + torch.sum(chunk, -1)
+                    acc = acc + running[:, :, None]
+                scale = torch.rsqrt(running[:, :, None] + 1.0)
+                out[tile_b, tile_m, :] = (acc * scale).to(out.dtype)
+            return out
+
+        def ref_outer_chain_scale(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            # With k=128 and block_k=128, there's 1 tile iteration:
+            # running = sum(a, dim=-1), acc = running[:,:,None] (broadcast to 256)
+            running = a.sum(-1)
+            acc = running[:, :, None].expand(-1, -1, b.shape[-1]).clone()
+            scale = torch.rsqrt(running[:, :, None] + 1.0)
+            return (acc * scale).to(a.dtype)
+
+        a = torch.rand(4, 64, 128, dtype=torch.float32, device=DEVICE)
+        b = torch.rand(4, 64, 256, dtype=torch.float32, device=DEVICE)
+        code, result = code_and_output(
+            outer_chain_scale,
+            (a, b),
+            block_sizes=[4, 64, 128],
+            pallas_loop_type="fori_loop",
+            pallas_pre_broadcast=True,
+        )
+        ref = ref_outer_chain_scale(a, b)
+        torch.testing.assert_close(result, ref, rtol=1e-2, atol=1e-2)
+
     def test_attention_emit_pipeline_non_divisible(self) -> None:
         """Test emit_pipeline with seq_kv not divisible by block_k.
 
