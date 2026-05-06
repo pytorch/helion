@@ -52,7 +52,10 @@ jobs:
       - name: Install PyTorch (CPU nightly)
         run: |
           source .venv/bin/activate
-          uv pip install -U --pre torch --index-url https://download.pytorch.org/whl/nightly/cpu
+          # TODO: we should be using nightly pytorch, but currently this is failing when used with our pinned torch_tpu
+          # uv pip install -U --pre torch --index-url https://download.pytorch.org/whl/nightly/cpu
+          # so for now, just install the last nightly pytorch which we know works with our pinned torch_tpu
+          uv pip install -U --pre "torch==2.13.0.dev20260502" --index-url https://download.pytorch.org/whl/nightly/cpu
 
       - name: Install Helion
         run: |
