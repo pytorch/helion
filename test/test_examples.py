@@ -1425,6 +1425,59 @@ class TestExamples(RefEagerTestBase, TestCase):
                 rtol=1e-2,
             )
 
+    @onlyBackends(["pallas"])
+    def test_jagged_hstu_attn_2(self):
+        torch.manual_seed(0)
+        num_sequnces = 4
+        heads = 4
+        head_dim = 64
+        max_seq_len = 128
+        alpha = 1.23
+        attn_scale = 4.56
+
+        lengths = torch.randint(
+            max_seq_len // 2,
+            max_seq_len + 1,
+            (num_sequnces,),
+            dtype=torch.int32,
+        )
+        seq_offsets = torch.cat(
+            [
+                torch.zeros(1, dtype=torch.int32),
+                torch.cumsum(lengths, dim=0).to(torch.int32),
+            ]
+        ).to(DEVICE)
+        L = int(seq_offsets[-1].item())
+
+        q = torch.randn(L, heads, head_dim, dtype=torch.float32, device=DEVICE)
+        k = torch.randn(L, heads, head_dim, dtype=torch.float32, device=DEVICE)
+        v = torch.randn(L, heads, head_dim, dtype=torch.float32, device=DEVICE)
+
+        args = (max_seq_len, alpha, attn_scale, q, k, v, seq_offsets)
+
+        mod = import_path(EXAMPLES_DIR / "jagged_hstu_attn_2.py")
+        expected = mod.reference_jagged_hstu_attention(*args)
+
+        # Patch to use core silu decomposition instead of inductor's custom decomposition from pytorch PR #171723.
+        # This ensures consistent codegen across torch 2.9 (stable) and nightly versions.
+        from torch._decomp.decompositions import silu
+        import torch._inductor.decomposition as inductor_decomp
+
+        if hasattr(inductor_decomp.fast_random_decomps, "cache_clear"):
+            inductor_decomp.fast_random_decomps.cache_clear()
+        with patch.dict(
+            inductor_decomp.decompositions, {torch.ops.aten.silu.default: silu}
+        ):
+            check_example(
+                "jagged_hstu_attn_2",
+                args,
+                expected,
+                fn_name="jagged_hstu_attention",
+                block_sizes=[32, 32],
+                atol=1e-2,
+                rtol=1e-2,
+            )
+
     @xfailIfPallas("tensor-derived if-predicates not supported")
     def test_grouped_gemm_jagged(self):
         # Build small jagged grouped GEMM inputs
