@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
 from typing import Any
 from typing import cast
 
@@ -10,14 +11,18 @@ import cutlass.cute as cute
 from cutlass.cutlass_dsl import T
 from cutlass.cutlass_dsl import dsl_user_op
 
+if TYPE_CHECKING:
+    from cutlass._mlir.ir import InsertionPoint
+    from cutlass._mlir.ir import Location
+
 
 @dsl_user_op
 def _set_block_rank(
     smem_ptr: cute.Pointer,
     peer_cta_rank_in_cluster: Int32,
     *,
-    loc: object | None = None,
-    ip: object | None = None,
+    loc: Location | None = None,
+    ip: InsertionPoint | None = None,
 ) -> Int32:
     """Map an SMEM pointer to the address at another CTA rank in the cluster."""
 
@@ -44,8 +49,8 @@ def store_shared_remote_x4(
     smem_ptr: cute.Pointer,
     mbar_ptr: cute.Pointer,
     peer_cta_rank_in_cluster: Int32,
-    loc: object | None = None,
-    ip: object | None = None,
+    loc: Location | None = None,
+    ip: InsertionPoint | None = None,
 ) -> None:
     """Store four scalars into another CTA's SMEM and complete the async tx."""
 
@@ -64,10 +69,10 @@ def store_shared_remote_x4(
         [
             remote_smem_ptr_i32,
             remote_mbar_ptr_i32,
-            dtype(val0).ir_value(loc=loc, ip=ip),  # pyrefly: ignore [bad-argument-type]
-            dtype(val1).ir_value(loc=loc, ip=ip),  # pyrefly: ignore [bad-argument-type]
-            dtype(val2).ir_value(loc=loc, ip=ip),  # pyrefly: ignore [bad-argument-type]
-            dtype(val3).ir_value(loc=loc, ip=ip),  # pyrefly: ignore [bad-argument-type]
+            dtype(val0).ir_value(loc=loc, ip=ip),
+            dtype(val1).ir_value(loc=loc, ip=ip),
+            dtype(val2).ir_value(loc=loc, ip=ip),
+            dtype(val3).ir_value(loc=loc, ip=ip),
         ],
         "{\n\t"
         f".reg .v4 .{suffix} abcd;\n\t"
