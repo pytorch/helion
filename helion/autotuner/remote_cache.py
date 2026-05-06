@@ -35,21 +35,23 @@ class RemoteCacheBackend(abc.ABC):
         """Store a JSON string under *key*."""
 
 
+_ENV_VAR = "HELION_REMOTE_CACHE_BACKEND"
+
+
 def _load_remote_backend() -> RemoteCacheBackend:
-    class_path = os.environ.get("HELION_REMOTE_CACHE_BACKEND")
-    if not class_path:
+    value = os.environ.get(_ENV_VAR)
+    if value is None or (value := value.strip()) == "":
         raise ValueError(
-            "HELION_REMOTE_CACHE_BACKEND must be set when using "
+            f"{_ENV_VAR} must be set when using "
             "RemoteAutotuneCache or StrictRemoteAutotuneCache "
             "(e.g. 'mypackage.module.MyBackend')"
         )
-    module_path, class_name = class_path.rsplit(".", 1)
+    module_path, class_name = value.rsplit(".", 1)
     module = importlib.import_module(module_path)
     cls = getattr(module, class_name)
     if not (isinstance(cls, type) and issubclass(cls, RemoteCacheBackend)):
         raise TypeError(
-            f"HELION_REMOTE_CACHE_BACKEND must point to a RemoteCacheBackend "
-            f"subclass, got {cls!r}"
+            f"{_ENV_VAR} must point to a RemoteCacheBackend subclass, got {cls!r}"
         )
     return cls()
 
