@@ -92,7 +92,7 @@ def cute_pointwise_chain(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     return out
 
 
-@helion.kernel(backend="cute")
+@helion.kernel(backend="cute", autotune_effort="none")
 def cute_affine_scalar_args(
     x: torch.Tensor,
     scale: int,
@@ -944,8 +944,20 @@ class TestCuteBackend(TestCase):
         self.assertIn("cutlass.utils.blackwell_helpers.make_trivial_tiled_mma", code)
         self.assertIn("cute.nvgpu.tcgen05", code)
         self.assertIn("cute.gemm(", code)
-        self.assertIn("tcgen05_acc_pipeline_arrive_count", code)
-        self.assertIn("tcgen05_ab_pipeline_arrive_count", code)
+        # ``tcgen05_acc_pipeline_arrive_count`` / ``tcgen05_ab_pipeline_arrive_count``
+        # are no longer materialized as named compile-time constants -- they
+        # were always literal ints, so codegen now passes the values inline.
+        # Pin the inline form instead: the acc consumer group must be sized to
+        # the epi warp count (4) and the AB pipeline still uses one TMA arriver.
+        self.assertIn(
+            "cutlass.pipeline.CooperativeGroup("
+            "cutlass.pipeline.Agent.Thread, cutlass.Int32(4))",
+            code,
+        )
+        self.assertIn(
+            "cutlass.pipeline.CooperativeGroup(cutlass.pipeline.Agent.Thread, 1)",
+            code,
+        )
         self.assertIn("cutlass.pipeline.NamedBarrier(barrier_id=1", code)
 
     def test_matmul_mma_tcgen05_128x8_uses_full_cta_barrier(self) -> None:
@@ -961,7 +973,12 @@ class TestCuteBackend(TestCase):
             code, out = code_and_output(cute_matmul_mma, args, block_sizes=[128, 8, 16])
         torch.testing.assert_close(out, args[0] @ args[1], atol=1e-1, rtol=1e-2)
         self.assertIn("cute.nvgpu.tcgen05", code)
-        self.assertIn("tcgen05_acc_pipeline_arrive_count", code)
+        # Pin the inline arrive-count form (cf. ``test_matmul_mma_tcgen05``).
+        self.assertIn(
+            "cutlass.pipeline.CooperativeGroup("
+            "cutlass.pipeline.Agent.Thread, cutlass.Int32(4))",
+            code,
+        )
         self.assertIn("cutlass.pipeline.NamedBarrier(barrier_id=1", code)
 
     def test_matmul_dot_out_dtype_falls_back_from_mma(self) -> None:
@@ -1459,6 +1476,35 @@ class TestCuteBackend(TestCase):
             wrapper_b = _get_compiled_cute_launcher(cute_kernel, schema_key, block)
 
         self.assertNotEqual(wrapper_a, wrapper_b)
+
+    def test_cute_launcher_reuses_compiled_wrapper(self) -> None:
+        cute_kernel = type("DummyCuteKernel", (), {})()
+        schema_key = (("tensor", 2, "float32"),)
+        block = (32, 1, 1)
+        compiled_calls: list[tuple[object, tuple[object, ...]]] = []
+        launched_args: list[tuple[object, ...]] = []
+
+        class FakeCompiled:
+            def __call__(self, *args: object) -> tuple[str, tuple[object, ...]]:
+                launched_args.append(args)
+                return ("launched", args)
+
+        def fake_compile(jit_func: object, *args: object) -> FakeCompiled:
+            compiled_calls.append((jit_func, args))
+            return FakeCompiled()
+
+        with (
+            patch("helion.runtime._create_cute_wrapper", return_value="jit-wrapper"),
+            patch("cutlass.cute.compile", side_effect=fake_compile),
+        ):
+            launcher = _get_compiled_cute_launcher(cute_kernel, schema_key, block)
+            first = launcher(1, 2, 3)
+            second = launcher(4, 5, 6)
+
+        self.assertEqual(compiled_calls, [("jit-wrapper", (1, 2, 3))])
+        self.assertEqual(launched_args, [(1, 2, 3), (4, 5, 6)])
+        self.assertEqual(first, ("launched", (1, 2, 3)))
+        self.assertEqual(second, ("launched", (4, 5, 6)))
 
     def test_cute_cluster_shape_from_wrapper_plans(self) -> None:
         self.assertIsNone(_cute_cluster_shape_from_wrapper_plans([]))

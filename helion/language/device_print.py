@@ -92,6 +92,32 @@ def _(state: CodegenState) -> None:
     state.add_statement(stmt)
 
 
+@_decorators.codegen(device_print, "cute")
+def _(state: CodegenState) -> None:
+    prefix = state.proxy_arg(0)
+    assert isinstance(prefix, str)
+
+    value_asts: list[ast.AST] = []
+    if len(state.proxy_args) > 1:
+        assert len(state.ast_args) > 1
+        ast_varargs = state.ast_args[1]
+        assert isinstance(ast_varargs, (tuple, list)), (
+            f"Expected tuple for varargs, got {type(ast_varargs)}"
+        )
+        value_asts.extend(ast_varargs[0])
+
+    fmt = prefix + " ".join(["{}"] * len(value_asts))
+    call_args: list[ast.AST] = [create(ast.Constant, value=fmt), *value_asts]
+    call_expr = create(
+        ast.Call,
+        func=expr_from_string("cute.printf"),
+        args=call_args,
+        keywords=[],
+    )
+    stmt = create(ast.Expr, value=call_expr)
+    state.add_statement(stmt)
+
+
 @_decorators.ref(device_print)
 def _(prefix: str, *values: object) -> None:
     print(prefix, *values)

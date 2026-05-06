@@ -18,6 +18,7 @@ import torch
 from helion._testing import DEVICE
 from helion._testing import RefEagerTestDisabled
 from helion._testing import import_path
+from helion._testing import onlyBackends
 from helion._testing import skipIfXPU
 from helion.autotuner.benchmark_provider import LocalBenchmarkProvider
 from helion.autotuner.benchmark_worker import BenchmarkTimeout
@@ -103,6 +104,9 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
             worker.shutdown()
 
 
+# Subprocess benchmarking depends on Backend.supports_precompile(); only the
+# Triton backend supports it (Pallas/CuTe return False).
+@onlyBackends(["triton"])
 class TestSubprocessBenchmarkIntegration(RefEagerTestDisabled, unittest.TestCase):
     @skipIfXPU("matmul config space includes maxnreg, unsupported on XPU")
     def test_autotune_with_subprocess_bench(self) -> None:

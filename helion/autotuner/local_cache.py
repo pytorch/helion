@@ -160,7 +160,9 @@ class LocalAutotuneCache(AutotuneCacheBase):
                 runtime_name = "unknown"
 
         assert hardware is not None and runtime_name is not None
-        config_spec_hash = self.kernel.config_spec.structural_fingerprint_hash()
+        config_spec_hash = self.kernel.config_spec.structural_fingerprint_hash(
+            advanced_controls_files=self.autotuner.settings.autotune_search_acf or None
+        )
         return LooseAutotuneCacheKey(
             specialization_key=in_memory_cache_key.specialization_key,
             extra_results=in_memory_cache_key.extra_results,
@@ -199,7 +201,9 @@ class LocalAutotuneCache(AutotuneCacheBase):
             "key": key_dict,
         }
 
-        config_gen = self.kernel.config_spec.create_config_generation()
+        config_gen = self.kernel.config_spec.create_config_generation(
+            advanced_controls_files=self.autotuner.settings.autotune_search_acf or None
+        )
         data["flat_config"] = json.dumps(config_gen.flatten(config))
 
         backend_cache_key = self.kernel.backend_cache_key(config)

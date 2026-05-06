@@ -5,6 +5,7 @@ import contextvars
 import linecache
 import os
 import sys
+from typing import TYPE_CHECKING
 from typing import Any
 from typing import cast
 
@@ -16,6 +17,9 @@ from .._utils import triton_is_available
 from .config import Config as Config
 from .kernel import Kernel as Kernel
 from .kernel import kernel as kernel
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 _CUTLASS_SHUTDOWN_PATCHED = False
 
@@ -609,7 +613,7 @@ def _pallas_make_reordered_kernel(
 def _pallas_build_callable(
     pallas_kernel: object,
     grid: tuple[int, ...],
-    jit_fn: object,
+    jit_fn: Callable[..., object],
     _output_indices: list[int],
     arg_to_tensor_pos: dict[int, int],
     tensor_arg_indices: list[int],
@@ -656,9 +660,7 @@ def _pallas_build_callable(
 
     jax_callable = JaxCallable(
         name=kernel_name,
-        jit_fn=jax.jit(
-            jit_fn  # pyrefly: ignore[bad-argument-type]
-        ),  # pyrefly: ignore[no-matching-overload]
+        jit_fn=jax.jit(jit_fn),
         trace_key=f"{kernel_name}_{id(pallas_kernel)}_{grid}{trace_key_suffix}",
         input_output_aliases=call_aliases,
     )
@@ -689,7 +691,7 @@ class _PallasInterpretCallable:
 
     def __init__(
         self,
-        jit_fn: object,
+        jit_fn: Callable[..., object],
         inplace_output_mapping: list[tuple[int, int]],
     ) -> None:
         self._jit_fn = jit_fn
@@ -746,7 +748,7 @@ def _pallas_invoke_and_return(
     tensor_arg_indices: list[int],
     arg_to_tensor_pos: dict[int, int],
     _output_indices: list[int],
-    _ds_pad_dims: list[tuple[int, int, int]] | None = None,
+    _ds_pad_dims: list[tuple[int, int, int, int]] | None = None,
     _orig_output_tensors: dict[int, torch.Tensor] | None = None,
 ) -> object:
     """Run the JaxCallable and return output-only results.
@@ -790,10 +792,10 @@ def _pallas_invoke_and_return(
 
     # Handle padding copy-back and result slicing
     if _ds_pad_dims and _orig_output_tensors:
-        # _ds_pad_dims contains (arg_idx, dim, block_size).
+        # _ds_pad_dims contains (arg_idx, dim, block_size, extra_pad).
         # Build a map from arg_idx → [(dim, ...)] for padded output args.
         padded_dims_by_arg: dict[int, list[int]] = {}
-        for arg_idx, dim, _bs in _ds_pad_dims:
+        for arg_idx, dim, _bs, _extra in _ds_pad_dims:
             if arg_idx in _orig_output_tensors:
                 padded_dims_by_arg.setdefault(arg_idx, []).append(dim)
 
@@ -840,12 +842,13 @@ def _pallas_invoke_and_return(
 def _pallas_apply_ds_padding(
     args: tuple[object, ...],
     _output_indices: list[int],
-    _ds_pad_dims: list[tuple[int, int, int]],
+    _ds_pad_dims: list[tuple[int, int, int, int]],
 ) -> tuple[tuple[object, ...], dict[int, torch.Tensor]]:
-    """Pad tensor args along non-divisible pl.ds() dimensions.
+    """Pad tensor args so ``pl.ds(offset, block_size)`` never reads OOB.
 
-    ``_ds_pad_dims`` contains ``(arg_index, dim, block_size)`` tuples.
-    The pad amount is computed at runtime as ``(-tensor.shape[dim]) % block_size``.
+    ``_ds_pad_dims`` contains ``(arg_index, dim, block_size, extra_pad)``
+    tuples.  The pad amount is ``(-tensor.shape[dim]) % block_size +
+    extra_pad``, where *extra_pad* accounts for non-zero loop begins.
 
     Returns the padded args tuple and a dict mapping output arg indices
     to their original (unpadded) tensors for post-call copy-back.
@@ -853,17 +856,15 @@ def _pallas_apply_ds_padding(
     args_list = list(args)
     orig_output_tensors: dict[int, torch.Tensor] = {}
     output_set = set(_output_indices)
-    for arg_idx, dim, block_size in _ds_pad_dims:
+    for arg_idx, dim, block_size, extra_pad in _ds_pad_dims:
         a = args_list[arg_idx]
         if not isinstance(a, torch.Tensor):
             continue
-        pad_amount = (-a.shape[dim]) % block_size
+        pad_amount = (-a.shape[dim]) % block_size + extra_pad
         if pad_amount == 0:
             continue
         if arg_idx in output_set and arg_idx not in orig_output_tensors:
             orig_output_tensors[arg_idx] = a
-        # F.pad takes (last_dim_left, last_dim_right, ..., first_dim_left, first_dim_right).
-        # To right-pad dimension `dim`, set index 2*(ndim-1-dim) + 1.
         pad_widths = [0] * (2 * a.ndim)
         pad_widths[2 * (a.ndim - 1 - dim) + 1] = pad_amount
         args_list[arg_idx] = torch.nn.functional.pad(a, pad_widths)
@@ -878,7 +879,7 @@ def default_pallas_launcher(
     _inplace_indices: list[int] | None = None,
     _block_spec_info: _BlockSpecInfo | None = None,
     _smem_arg_indices: list[int] | None = None,
-    _ds_pad_dims: list[tuple[int, int, int]] | None = None,
+    _ds_pad_dims: list[tuple[int, int, int, int]] | None = None,
     **kwargs: object,
 ) -> object:
     """Default launcher for Pallas kernels on TPU (or CPU with interpret=True).
@@ -1019,7 +1020,7 @@ def default_pallas_pipeline_launcher(
     _block_spec_info: _BlockSpecInfo | None = None,
     _scratch_shapes: list[tuple[tuple[int, ...], str]] | None = None,
     _pipeline_arg_indices: list[int] | None = None,
-    _ds_pad_dims: list[tuple[int, int, int]] | None = None,
+    _ds_pad_dims: list[tuple[int, int, int, int]] | None = None,
     _smem_arg_indices: list[int] | None = None,
     **kwargs: object,
 ) -> object:
@@ -1189,7 +1190,7 @@ def default_pallas_fori_launcher(
     _inplace_indices: list[int] | None = None,
     _block_spec_info: _BlockSpecInfo | None = None,
     _scratch_shapes: list[tuple[tuple[int, ...], str | None, str]] | None = None,
-    _ds_pad_dims: list[tuple[int, int, int]] | None = None,
+    _ds_pad_dims: list[tuple[int, int, int, int]] | None = None,
     _smem_arg_indices: list[int] | None = None,
     **kwargs: object,
 ) -> object:
@@ -1378,6 +1379,10 @@ def _torch_dtype_to_cutlass(dtype: torch.dtype) -> object:
         torch.float32: cutlass.Float32,
         torch.float64: cutlass.Float64,
         torch.bfloat16: cutlass.BFloat16,
+        # CuTe does not support i1 global-memory tensors; torch.bool is stored
+        # as one byte, so pass bool tensor pointers as uint8 and let load
+        # lowering convert nonzero bytes back to cutlass.Boolean registers.
+        torch.bool: cutlass.Uint8,
         torch.int8: cutlass.Int8,
         torch.int16: cutlass.Int16,
         torch.int32: cutlass.Int32,
@@ -1419,6 +1424,51 @@ def _append_cute_wrapper_plan(
         return value
 
     kind = plan["kind"]
+    if kind == "tcgen05_d_tma":
+        d_idx = plan_int("d_idx")
+        bm = plan_int("bm")
+        bn = plan_int("bn")
+        c_stage_count = plan_int("c_stage_count")
+        output_dtype = str(plan["output_dtype"])
+        kernel_args = [str(arg) for arg in cast("list[object]", plan["kernel_args"])]
+        assert len(kernel_args) == 2
+        tma_atom_d, tma_tensor_d = kernel_args
+        epi_tile = f"{tma_atom_d}_epi_tile"
+        smem_layout = f"{tma_atom_d}_smem_layout"
+        cta_v_layout = f"{tma_atom_d}_cta_v_layout"
+        # Keep these layout arguments in sync with the device-side
+        # `make_smem_layout_epi` call in `_codegen_cute_store_tcgen05_tile`;
+        # the TMA atom slices the same SMEM stage that the kernel allocates.
+        body.extend(
+            (
+                (
+                    f"    {epi_tile} = "
+                    "cutlass.utils.blackwell_helpers.compute_epilogue_tile_shape("
+                    f"({bm}, {bn}), False, "
+                    "cutlass.utils.layout.LayoutEnum.ROW_MAJOR, "
+                    f"{output_dtype})"
+                ),
+                (
+                    f"    {smem_layout} = cutlass.utils.blackwell_helpers."
+                    "make_smem_layout_epi("
+                    f"{output_dtype}, cutlass.utils.layout.LayoutEnum.ROW_MAJOR, "
+                    f"{epi_tile}, {c_stage_count})"
+                ),
+                (
+                    f"    {cta_v_layout} = cute.composition("
+                    f"cute.make_identity_layout(arg{d_idx}.shape), {epi_tile})"
+                ),
+                (
+                    f"    {tma_atom_d}, {tma_tensor_d} = "
+                    "cute.nvgpu.cpasync.make_tiled_tma_atom("
+                    "cute.nvgpu.cpasync.CopyBulkTensorTileS2GOp(), "
+                    f"arg{d_idx}, cute.slice_({smem_layout}, (None, None, 0)), "
+                    f"{cta_v_layout})"
+                ),
+            )
+        )
+        call_args.extend(kernel_args)
+        return
     if kind != "tcgen05_ab_tma":
         raise exc.BackendUnsupported("cute", f"wrapper plan kind: {kind}")
 
@@ -1637,6 +1687,32 @@ def _create_cute_wrapper(
     return namespace[func_name]
 
 
+class _CompiledCuteLauncher:
+    """Lazily compile a Helion ``@cute.jit`` wrapper via ``cute.compile``.
+
+    The first call uses ``cute.compile(jit_func, *args)`` to produce a compiled
+    callable; subsequent calls invoke the compiled callable directly. This
+    bypasses the per-launch ``@cute.jit`` argument-handling/dispatch path,
+    matching Quack's pattern (see ``gemm_tvm_ffi_utils.py``). On B200 this
+    collapses ~200ms of per-launch host overhead into ~0.1ms.
+    """
+
+    __slots__ = ("_compiled", "_jit_func")
+
+    def __init__(self, jit_func: object) -> None:
+        self._jit_func = jit_func
+        self._compiled: object = None
+
+    def __call__(self, *args: object) -> object:
+        compiled = self._compiled
+        if compiled is None:
+            import cutlass.cute as cute
+
+            compiled = cute.compile(self._jit_func, *args)
+            self._compiled = compiled
+        return cast("Any", compiled)(*args)
+
+
 def _get_compiled_cute_launcher(
     cute_kernel: object,
     schema_key: tuple[tuple[object, ...], ...],
@@ -1661,9 +1737,10 @@ def _get_compiled_cute_launcher(
     if cached is not None:
         return cached
 
-    wrapper = _create_cute_wrapper(cute_kernel, schema_key, block)
-    cache[cache_key] = wrapper
-    return wrapper
+    jit_func = _create_cute_wrapper(cute_kernel, schema_key, block)
+    launcher = _CompiledCuteLauncher(jit_func)
+    cache[cache_key] = launcher
+    return launcher
 
 
 def _build_cute_schema_and_args(

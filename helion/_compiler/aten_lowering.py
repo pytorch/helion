@@ -989,15 +989,7 @@ def codegen_baddbmm(ctx: LoweringContext, node: Node) -> ast.AST:
 
 
 def _pallas_dot(ctx: LoweringContext, node: Node, with_acc: bool) -> ast.AST:
-    """Generate jnp.matmul for Pallas backend.
-
-    Uses ``jnp.matmul`` instead of ``jnp.dot`` for correct batch matmul
-    semantics (``jnp.dot`` on 3D tensors produces 4D output).
-
-    When either operand is sub-32-bit (bf16, f16, fp8, int8), we pass
-    ``preferred_element_type=jnp.float32`` so TPU uses a 32-bit accumulator.
-    If the FX-level output dtype is narrower than f32 we cast back afterwards.
-    """
+    """Generate jnp.dot_general for Pallas backend."""
     if with_acc:
         acc_node_arg, lhs_node_arg, rhs_node_arg = node.args[:3]
         acc, lhs, rhs = map_arg(node.args, lambda arg: _env_arg(ctx, arg))
@@ -1015,6 +1007,7 @@ def _pallas_dot(ctx: LoweringContext, node: Node, with_acc: bool) -> ast.AST:
     assert isinstance(rhs_node_arg, Node)
     lhs_dtype = lhs_node_arg.meta["val"].dtype
     rhs_dtype = rhs_node_arg.meta["val"].dtype
+    lhs_ndim = lhs_node_arg.meta["val"].ndim
     need_f32_acc = _needs_f32_accumulator(lhs_dtype, rhs_dtype)
     out_dtype = node.meta["val"].dtype if "val" in node.meta else None
 
@@ -1024,6 +1017,7 @@ def _pallas_dot(ctx: LoweringContext, node: Node, with_acc: bool) -> ast.AST:
         acc=acc if with_acc else None,
         need_f32_acc=need_f32_acc,
         out_dtype=out_dtype,
+        lhs_ndim=lhs_ndim,
     )
 
 
@@ -1926,7 +1920,11 @@ def codegen_sort_cute(ctx: LoweringContext, node: Node) -> object:
     input_tensor = input_node.meta["val"]
     load = _env_arg(ctx, input_node)
     if not isinstance(load, CuteSortableLoad):
+        load = input_node.meta.get("cute_sortable_load")
+    if not isinstance(load, CuteSortableLoad):
         raise exc.BackendUnsupported("cute", "torch.sort input")
+    node.meta["cute_sort_load"] = load
+    node.meta["cute_sort_descending"] = descending
     return _emit_cute_rank_sort(ctx, load, input_tensor, descending=descending)
 
 
@@ -1996,6 +1994,82 @@ def codegen_gather(ctx: LoweringContext, node: Node) -> object:
     )
 
     return expr_from_string(result_var)
+
+
+@gather_lowering.register_codegen("cute")
+def codegen_gather_cute(ctx: LoweringContext, node: Node) -> object:
+    assert not node.kwargs, "gather does not support keyword arguments"
+    assert len(node.args) == 3, f"gather expects 3 arguments, got {len(node.args)}"
+
+    input_node = node.args[0]
+    dim = node.args[1]
+    index_node = node.args[2]
+    assert isinstance(input_node, Node)
+    assert isinstance(dim, int)
+    assert isinstance(index_node, Node)
+
+    from ..language.memory_ops import _cute_combined_mask
+    from ..language.memory_ops import _cute_index_exprs
+    from ..language.memory_ops import load
+    from .inductor_lowering import CodegenState
+
+    if input_node.target is not load:
+        raise exc.BackendUnsupported("cute", "torch.gather input")
+    tensor_node = input_node.args[0]
+    if not isinstance(tensor_node, Node):
+        raise exc.BackendUnsupported("cute", "torch.gather tensor input")
+    tensor = tensor_node.meta["val"]
+    if not isinstance(tensor, torch.Tensor):
+        raise exc.BackendUnsupported("cute", "torch.gather tensor input")
+    input_subscript = input_node.args[1]
+    if not isinstance(input_subscript, (list, tuple)):
+        raise exc.BackendUnsupported("cute", "torch.gather input subscript")
+
+    ndim = len(input_subscript)
+    if dim < 0:
+        dim += ndim
+    if not (0 <= dim < ndim):
+        raise exc.InvalidReductionDim(dim)
+
+    proxy_subscript = cast(
+        "list[object]",
+        list(map_arg(tuple(input_subscript), lambda arg: arg.meta["val"])),
+    )
+    ast_subscript = cast(
+        "list[object]",
+        list(map_arg(tuple(input_subscript), lambda arg: _env_arg(ctx, arg))),
+    )
+    index_ast = _env_arg(ctx, index_node)
+    assert isinstance(index_ast, ast.AST)
+    proxy_subscript[dim] = index_node.meta["val"]
+    ast_subscript[dim] = index_ast
+
+    from .generate_ast import GenerateAST
+
+    if not isinstance(ctx.cg, GenerateAST):
+        raise exc.NotAllowedInHelperFunction
+
+    state = CodegenState(ctx.cg, fx_node=node, env=ctx.env)
+    index_exprs = _cute_index_exprs(
+        state,
+        proxy_subscript,
+        ast_subscript,
+        tensor=tensor,
+        inactive_slice_expr="None",
+        inactive_singleton_slice_expr="0",
+    )
+    tensor_name = ctx.cg.device_function.tensor_arg(tensor).name
+    load_expr = f"{tensor_name}[{', '.join(index_exprs)}]"
+    mask_expr = _cute_combined_mask(state, proxy_subscript, None, tensor=tensor)
+    if tensor.dtype is torch.bool:
+        load_expr = f"({load_expr} != cutlass.Uint8(0))"
+        if mask_expr is None:
+            return expr_from_string(load_expr)
+        return expr_from_string(f"({load_expr} if {mask_expr} else cutlass.Boolean(0))")
+    if mask_expr is None:
+        return expr_from_string(load_expr)
+    zero = CompileEnvironment.current().backend.dtype_str(tensor.dtype)
+    return expr_from_string(f"({load_expr} if {mask_expr} else {zero}(0))")
 
 
 topk_lowering = register_lowering(torch.ops.aten.topk.default)
@@ -2180,6 +2254,8 @@ def codegen_topk_cute(ctx: LoweringContext, node: Node) -> object:
     assert isinstance(input_node, Node)
     input_tensor = input_node.meta["val"]
     load = _env_arg(ctx, input_node)
+    if not isinstance(load, CuteSortableLoad):
+        load = input_node.meta.get("cute_sortable_load")
     if not isinstance(load, CuteSortableLoad):
         raise exc.BackendUnsupported("cute", "torch.topk input")
     node.meta["cute_topk_lane_expr"] = load.index_exprs[load.sort_index_pos]

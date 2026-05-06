@@ -9,6 +9,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+from typing import cast
 import unittest
 from unittest.mock import patch
 
@@ -33,7 +34,6 @@ from helion._testing import skipIfPyTorchBaseVerLessThan
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfTileIR
 from helion._testing import skipUnlessTensorDescriptor
-from helion._testing import xfailIfCute
 import helion.language as hl
 from helion.runtime.settings import _get_backend
 
@@ -129,6 +129,7 @@ class TestMisc(RefEagerTestBase, TestCase):
             out = x.new_empty([m])
             block_size_n = hl.register_block_size(n)
             for tile_m in hl.tile(m):
+                # pyrefly: ignore [no-matching-overload]
                 acc = x.new_zeros([tile_m, block_size_n])
                 for tile_n in hl.tile(n, block_size=block_size_n):
                     acc += x[tile_m, tile_n]
@@ -461,6 +462,7 @@ class TestMisc(RefEagerTestBase, TestCase):
         bound_kernel_no_config = kernel_no_config.bind((x,))
 
         # Should raise RuntimeError when no implicit config available
+        # pyrefly: ignore [bad-context-manager]
         with self.assertRaises(RuntimeError) as cm:
             bound_kernel_no_config.to_triton_code()
         self.assertIn(
@@ -803,7 +805,6 @@ class TestMisc(RefEagerTestBase, TestCase):
         if _get_backend() == "triton":
             self.assertIn("tl.sort", code)
 
-    @xfailIfCute("CUTe does not lower associative scan yet")
     def test_torch_sort_then_cumsum(self):
         """Test that torch.sort result can be used as input to torch.cumsum.
 
@@ -885,7 +886,6 @@ class TestMisc(RefEagerTestBase, TestCase):
             # Argsort rank computation SHOULD be present when indices are used
             self.assertIn("tl.sum(tl.where(", code2)
 
-    @xfailIfCute("CUTe does not lower associative scan yet")
     def test_cumsum_does_not_alias_input(self):
         """Regression test: torch.cumsum output must not alias its input.
 
@@ -910,7 +910,8 @@ class TestMisc(RefEagerTestBase, TestCase):
 
         ref = torch.cumsum(x, dim=-1) - x
         torch.testing.assert_close(result, ref)
-        self.assertIn("tl.associative_scan", code)
+        if _get_backend() == "triton":
+            self.assertIn("tl.associative_scan", code)
 
     def test_torch_topk_in_kernel(self):
         """Test that torch.topk works inside Helion kernels.
@@ -1015,7 +1016,6 @@ class TestMisc(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, expected)
 
     @skipIfRefEager("Config tests not applicable in ref eager mode")
-    @xfailIfCute("CUTe supports up to three thread axes")
     def test_default_block_sizes_high_dim_with_reduction(self):
         """Regression test for issue #1354: default config hangs when indexing
         tensor with enough dims.
@@ -1082,7 +1082,7 @@ class TestMisc(RefEagerTestBase, TestCase):
         bound = helion_merge_attention_fwd.bind((a, lse_a, b, lse_b))
         config_spec = bound.env.config_spec
         default_config = config_spec.default_config()
-        block_sizes = default_config.config["block_sizes"]
+        block_sizes = cast("list[int]", default_config.config["block_sizes"])
         block_numel = 1
         for bs in block_sizes:
             block_numel *= bs

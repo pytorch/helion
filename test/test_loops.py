@@ -382,7 +382,6 @@ class TestLoops(RefEagerTestBase, TestCase):
         code, result = code_and_output(fn, args, block_sizes=[32, 32])
         torch.testing.assert_close(result, args[0][:, : args[1][0].item()].sum(-1))
 
-    @xfailIfPallas("uses block_ptr indexing not supported on pallas")
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfTileIR("TileIR does not support block_ptr indexing")
     def test_data_dependent_bounds2(self):

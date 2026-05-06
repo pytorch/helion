@@ -54,8 +54,31 @@ a:hover{text-decoration:underline}
 .kernel-card .kc-row .kc-label{color:var(--text-dim)}
 .kernel-card .kc-row .kc-val{font-weight:600}
 .kernel-card .kc-delta{font-size:13px;margin-bottom:3px}
-.kernel-card .sparkline-container{width:100%;min-height:80px;display:flex;align-items:center;position:relative}
-.kernel-card .sparkline-container svg{width:100%;height:100%;min-height:80px}
+.kernel-card .sparkline-container{position:relative;width:100%;min-height:130px}
+.kernel-card .sl-title{position:absolute;top:2px;left:44px;right:4px;font-size:12px;color:var(--text-dim);text-align:center;letter-spacing:0.3px;line-height:1.2}
+.kernel-card .sl-y-max,.kernel-card .sl-y-min{position:absolute;left:0;width:40px;font-size:11px;color:var(--text-dim);text-align:right;font-variant-numeric:tabular-nums;line-height:1}
+.kernel-card .sl-y-max{top:24px}
+.kernel-card .sl-y-min{bottom:18px}
+.kernel-card .sl-x-start,.kernel-card .sl-x-end{position:absolute;bottom:0;font-size:11px;color:var(--text-dim);font-variant-numeric:tabular-nums}
+.kernel-card .sl-x-start{left:44px}
+.kernel-card .sl-x-end{right:4px}
+.kernel-card .sl-svg-area{position:absolute;left:44px;right:4px;top:24px;bottom:18px}
+.kernel-card .sl-svg-area svg{width:100%;height:100%;display:block}
+/* Single-platform mode: only one column means each card is wide. Bump up
+   text but let the graph fill the remaining width. */
+.platform-grid.single-platform .kernel-card{padding:18px 22px}
+.platform-grid.single-platform .kernel-card .kc-name{font-size:17px}
+.platform-grid.single-platform .kernel-card .kc-row{font-size:14px;margin-bottom:5px}
+.platform-grid.single-platform .kernel-card .kc-row .kc-val{font-size:16px}
+.platform-grid.single-platform .kernel-card .kc-delta{font-size:14px;margin-bottom:5px}
+.platform-grid.single-platform .kernel-card .kc-left{min-width:340px;flex:0 0 340px}
+.platform-grid.single-platform .kernel-card .kc-right{flex:1}
+.platform-grid.single-platform .kernel-card .sparkline-container{min-height:150px}
+.platform-grid.single-platform .kernel-card .sl-title{font-size:14px}
+.platform-grid.single-platform .kernel-card .sl-y-max,
+.platform-grid.single-platform .kernel-card .sl-y-min,
+.platform-grid.single-platform .kernel-card .sl-x-start,
+.platform-grid.single-platform .kernel-card .sl-x-end{font-size:13px}
 .kernel-card .fail-overlay{position:absolute;inset:0;display:flex;flex-direction:column;justify-content:center;align-items:center;gap:4px;background:rgba(13,17,23,0.75);border-radius:6px;padding:8px;text-align:center}
 .kernel-card .fail-overlay .fail-line{font-size:14px;font-weight:600}
 .kernel-card .fail-overlay .fail-subline{font-size:11px;color:var(--text-dim)}
@@ -256,6 +279,15 @@ function makeSortable(table) {
 let kernelPlatMap = {};
 let _cmpImproved = [], _cmpRegressed = [];
 let activeFilters = { platform: 'all', search: '' };
+// Each tab renders its own platform dropdown. After activeFilters.platform
+// changes from any one of them, mirror the value to the others — without this,
+// the dropdown on a non-active tab stays stale until that tab is re-rendered.
+function syncPlatformDropdowns() {
+  ['ov-plat-filter', 'sp-plat-filter', 'cmp-plat-filter'].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.value = activeFilters.platform;
+  });
+}
 function buildMaps() {
   if (!DATA) return;
   DATA.summary.forEach(e => {
@@ -279,26 +311,68 @@ function getFailures() {
   });
   return { acc, run, infra };
 }
-// Prefer latency once a kernel has accumulated enough history; fall back to
-// speedup while latency recording is still ramping up.
-const LATENCY_MIN_POINTS = 14;
-function sparklineSvg(history, color) {
+// Pad y-range to mute noise: floor the half-range at fracFloor of center, so
+// a small ms-level wobble doesn't fill the chart vertically.
+function paddedRange(vals, fracFloor) {
+  const mn = Math.min(...vals), mx = Math.max(...vals);
+  const center = (mn + mx) / 2;
+  const half = Math.max((mx - mn) / 2, Math.abs(center) * fracFloor, 1e-9);
+  return { yMin: center - half, yMax: center + half };
+}
+// Plotly y-axis with the same noise muting; fracFloor=0.30 → ±10% reads as ~17% of chart.
+function trendYAxis(title, vals, fracFloor) {
+  const ya = Object.assign({}, plotlyDark.yaxis, { title });
+  const pos = vals.filter(v => v != null);
+  if (pos.length >= 2) {
+    const r = paddedRange(pos, fracFloor);
+    ya.range = [Math.max(0, r.yMin), r.yMax];
+    ya.autorange = false;
+  }
+  return ya;
+}
+function shortDate(d) {
+  if (!d) return '';
+  const dt = new Date(d);
+  const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+  return months[dt.getMonth()] + ' ' + dt.getDate();
+}
+function sparklineSvg(history) {
   if (!history || history.length < 2) return '';
   const mainHist = history.filter(h => (h.branch || 'main') === 'main');
-  const latency = mainHist.map(h => h.helion_latency_avg_ms).filter(v => v > 0);
-  const vals = latency.length >= LATENCY_MIN_POINTS
-    ? latency
-    : mainHist.map(h => h.helion_speedup_geomean).filter(v => v > 0);
-  if (vals.length < 2) return '';
-  const mn = Math.min(...vals), mx = Math.max(...vals);
-  const range = mx - mn || 1;
-  const w = 120, h = 28, pad = 2;
-  let pts = vals.map((v, i) => {
+  // Prefer latency (lower-is-better; absolute time is more interpretable than
+  // a derived speedup) and fall back to speedup only if no latency data yet.
+  const latency = mainHist.filter(h => h.helion_latency_avg_ms > 0);
+  const isLatency = latency.length >= 2;
+  const points = isLatency
+    ? latency.map(h => ({ v: h.helion_latency_avg_ms, date: h.date }))
+    : mainHist.filter(h => h.helion_speedup_geomean > 0).map(h => ({ v: h.helion_speedup_geomean, date: h.date }));
+  if (points.length < 2) return '';
+  const vals = points.map(p => p.v);
+  // 30% half-range floor: chart spans ≥60% of the metric's value, so a ±10%
+  // variation occupies ~17% of the chart — visible but clearly not "big".
+  const { yMin, yMax } = paddedRange(vals, 0.30);
+  const range = yMax - yMin || 1;
+  // Latency line is green: this metric's good direction is down, color it as
+  // the metric's "ideal" so the chart reads as a green trace going down.
+  const color = isLatency ? '#3fb950' : '#58a6ff';
+  const w = 200, h = 60, pad = 2;
+  const pts = vals.map((v, i) => {
     const x = pad + (i / (vals.length - 1)) * (w - 2*pad);
-    const y = h - pad - ((v - mn) / range) * (h - 2*pad);
+    const y = h - pad - ((v - yMin) / range) * (h - 2*pad);
     return `${x},${y}`;
-  });
-  return `<svg viewBox="0 0 ${w} ${h}" preserveAspectRatio="none"><polyline points="${pts.join(' ')}" fill="none" stroke="${color}" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
+  }).join(' ');
+  const title = isLatency ? 'Latency (ms)' : 'Speedup (×)';
+  const fmtVal = isLatency
+    ? v => v < 10 ? v.toFixed(2) : v.toFixed(1)
+    : v => v.toFixed(2) + 'x';
+  // vector-effect=non-scaling-stroke keeps the line a constant pixel width
+  // even though preserveAspectRatio=none stretches the SVG.
+  return `<div class="sl-title">${title}</div>` +
+    `<div class="sl-y-max">${fmtVal(yMax)}</div>` +
+    `<div class="sl-y-min">${fmtVal(yMin)}</div>` +
+    `<div class="sl-svg-area"><svg viewBox="0 0 ${w} ${h}" preserveAspectRatio="none"><polyline points="${pts}" fill="none" stroke="${color}" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" vector-effect="non-scaling-stroke"/></svg></div>` +
+    `<div class="sl-x-start">${shortDate(points[0].date)}</div>` +
+    `<div class="sl-x-end">${shortDate(points[points.length - 1].date)}</div>`;
 }
 // -------- Overview Tab --------
 function renderOverview() {
@@ -325,14 +399,18 @@ function renderOverview() {
   html += statusCard('Kernels', st.total_kernels, st.num_platforms + ' platforms');
   html += '</div>';
   html += '<div class="filter-bar">';
-  html += '<select id="ov-plat-filter"><option value="all">All Platforms</option>';
-  DATA.platform_shorts.forEach(p => { html += `<option value="${p}">${platName(p)}</option>`; });
+  html += `<select id="ov-plat-filter"><option value="all"${activeFilters.platform === 'all' ? ' selected' : ''}>All Platforms</option>`;
+  DATA.platform_shorts.forEach(p => { html += `<option value="${p}"${p === activeFilters.platform ? ' selected' : ''}>${platName(p)}</option>`; });
   html += '</select>';
   html += '<input type="text" id="ov-search" placeholder="Search kernels...">';
   html += '</div>';
   html += '<div class="platform-grid" id="ov-grid"></div>';
   document.getElementById('tab-overview').innerHTML = html;
-  document.getElementById('ov-plat-filter').addEventListener('change', e => { activeFilters.platform = e.target.value; renderOverviewGrid(); });
+  document.getElementById('ov-plat-filter').addEventListener('change', e => {
+    activeFilters.platform = e.target.value;
+    syncPlatformDropdowns();
+    renderOverviewGrid();
+  });
   document.getElementById('ov-search').addEventListener('input', e => { activeFilters.search = e.target.value; renderOverviewGrid(); });
   if (failCount > 0) {
     document.getElementById('ci-status-card').addEventListener('click', () => showFailuresModal(fails));
@@ -360,6 +438,7 @@ function renderOverviewGrid() {
   const grid = document.getElementById('ov-grid');
   let html = '';
   grid.style.gridTemplateColumns = `repeat(${platforms.length}, 1fr)`;
+  grid.classList.toggle('single-platform', platforms.length === 1);
   platforms.forEach(ps => {
     const color = platColor(ps);
     html += `<div class="platform-col-header" style="background:${color}18;color:${color};border:1px solid ${color}44">${platName(ps)}</div>`;
@@ -404,7 +483,7 @@ function renderOverviewGrid() {
         } else if (e.accuracy_failures?.length) {
           overlay = `<div class="accuracy-badge">${e.accuracy_failures.length} accuracy fail</div>`;
         }
-        html += `<div class="kc-right"><div class="sparkline-container">${sparklineSvg(e.history, color)}${overlay}</div></div>`;
+        html += `<div class="kc-right"><div class="sparkline-container">${sparklineSvg(e.history)}${overlay}</div></div>`;
         html += '</div></div>';
       }
     });
@@ -533,6 +612,7 @@ function renderSpeedup() {
   document.querySelectorAll('#tab-speedup .data-table').forEach(makeSortable);
   document.getElementById('sp-plat-filter').addEventListener('change', e => {
     activeFilters.platform = e.target.value;
+    syncPlatformDropdowns();
     renderSpeedup();
     renderOverviewGrid();
   });
@@ -574,26 +654,29 @@ function renderCompare(baseRunIdOverride, cmpRunIdOverride, baseBranchOverride, 
       const cmpCompile = cmpH ? cmpH.compile_time_geomean_s : null;
       const baseLatency = baseH ? baseH.helion_latency_avg_ms : null;
       const cmpLatency = cmpH ? cmpH.helion_latency_avg_ms : null;
+      // Natural sign: positive = metric value increased.
+      // Speedup higher = better; latency / compile higher = worse.
       let speedupDelta = null;
       if (baseSpeedup && cmpSpeedup && baseSpeedup > 0) {
         speedupDelta = ((cmpSpeedup - baseSpeedup) / baseSpeedup) * 100;
       }
       let latencyDelta = null;
       if (baseLatency && cmpLatency && baseLatency > 0 && cmpLatency > 0) {
-        latencyDelta = ((baseLatency - cmpLatency) / cmpLatency) * 100;
-      }
-      const perfDelta = latencyDelta != null ? latencyDelta : speedupDelta;
-      if (perfDelta != null) {
-        allDeltas.push(perfDelta);
-        if (perfDelta > 10) improved++;
-        else if (perfDelta < -10) regressed++;
-        else unchanged++;
-      } else {
-        unchanged++;
+        latencyDelta = ((cmpLatency - baseLatency) / baseLatency) * 100;
       }
       let compileDelta = null;
       if (baseCompile && cmpCompile && baseCompile > 0) {
         compileDelta = ((cmpCompile - baseCompile) / baseCompile) * 100;
+      }
+      // Aggregate as "improvement %" so summary can use a single positive=good value.
+      const improvementPct = latencyDelta != null ? -latencyDelta : speedupDelta;
+      if (improvementPct != null) {
+        allDeltas.push(improvementPct);
+        if (improvementPct > 10) improved++;
+        else if (improvementPct < -10) regressed++;
+        else unchanged++;
+      } else {
+        unchanged++;
       }
       comparisons.push({
         kernel: k, platform_short: ps,
@@ -635,14 +718,9 @@ function renderCompare(baseRunIdOverride, cmpRunIdOverride, baseBranchOverride, 
   html += '<div class="filter-bar"><select id="cmp-plat-filter"><option value="all">All Platforms</option>';
   DATA.platform_shorts.forEach(p => { html += `<option value="${p}"${p === activeFilters.platform ? ' selected' : ''}>${platName(p)}</option>`; });
   html += '</select></div>';
-  const improvedList = comparisons.filter(c => {
-    const d = c.latencyDelta != null ? c.latencyDelta : c.speedupDelta;
-    return d != null && d > 10;
-  });
-  const regressedList = comparisons.filter(c => {
-    const d = c.latencyDelta != null ? c.latencyDelta : c.speedupDelta;
-    return d != null && d < -10;
-  });
+  const cmpImprovement = c => c.latencyDelta != null ? -c.latencyDelta : c.speedupDelta;
+  const improvedList = comparisons.filter(c => cmpImprovement(c) > 10);
+  const regressedList = comparisons.filter(c => cmpImprovement(c) < -10);
   _cmpImproved = improvedList;
   _cmpRegressed = regressedList;
   html += '<div class="summary-row">';
@@ -653,18 +731,14 @@ function renderCompare(baseRunIdOverride, cmpRunIdOverride, baseBranchOverride, 
   html += summaryCard('Unchanged', unchanged);
   html += summaryCard('Geomean Perf Delta', formatDelta(geomeanDelta, false));
   html += '</div>';
-  const changedComparisons = comparisons.filter(c => {
-    const d = c.latencyDelta != null ? c.latencyDelta : c.speedupDelta;
-    return d != null && (d > 10 || d < -10);
-  });
+  const changedComparisons = comparisons.filter(c => Math.abs(cmpImprovement(c) || 0) > 10);
   if (changedComparisons.length > 0) {
     html += `<div style="font-size:14px;font-weight:600;margin-bottom:8px">Changed Kernels (${changedComparisons.length})</div>`;
     html += '<div class="compare-grid">';
     const fmtLat = v => v && v > 0 ? v.toFixed(2) + ' ms' : '--';
     changedComparisons.forEach(c => {
       const color = platColor(c.platform_short);
-      const perfD = c.latencyDelta != null ? c.latencyDelta : c.speedupDelta;
-      const isImproved = perfD > 10;
+      const isImproved = cmpImprovement(c) > 10;
       const borderColor = isImproved ? 'var(--green)' : 'var(--red)';
       html += `<div class="compare-card" style="border-left:3px solid ${borderColor}">`;
       html += `<div class="cc-header"><span style="color:${color}">${escHtml(c.kernel)}</span> ${platBadge(c.platform_short)} <span class="kc-tag ${isImproved ? 'improved' : 'regressed'}">${isImproved ? 'improved' : 'regressed'} perf</span></div>`;
@@ -718,6 +792,7 @@ function renderCompare(baseRunIdOverride, cmpRunIdOverride, baseBranchOverride, 
   });
   document.getElementById('cmp-plat-filter').addEventListener('change', e => {
     activeFilters.platform = e.target.value;
+    syncPlatformDropdowns();
     cmpRerender();
     renderOverviewGrid();
   });
@@ -805,7 +880,7 @@ function showDetailModal(kernel, platform_short) {
         speedupDelta = ' ' + formatDelta(d, false);
       }
       if (prev.helion_latency_avg_ms > 0 && h.helion_latency_avg_ms > 0) {
-        const d = ((prev.helion_latency_avg_ms - h.helion_latency_avg_ms) / h.helion_latency_avg_ms) * 100;
+        const d = ((h.helion_latency_avg_ms - prev.helion_latency_avg_ms) / prev.helion_latency_avg_ms) * 100;
         latencyDelta = ' ' + formatDelta(d, true);
       }
     }
@@ -854,14 +929,14 @@ function showDetailModal(kernel, platform_short) {
         const latVals = histFwd.map(h => h.helion_latency_avg_ms > 0 ? h.helion_latency_avg_ms : null);
         Plotly.newPlot(latEl, [{
           x: xLabels, y: latVals, mode: 'lines+markers',
-          line: { color: color, width: 2 }, marker: { size: 6 },
+          line: { color: '#3fb950', width: 3 }, marker: { size: 6 },
           text: histFwd.map(h => h.sha), customdata: commitUrls,
           hovertemplate: '%{text}: %{y:.2f} ms<extra></extra>',
           connectgaps: false,
         }], Object.assign({}, plotlyDark, {
           height: 220,
           xaxis: Object.assign({}, plotlyDark.xaxis, { tickangle: -40 }),
-          yaxis: Object.assign({}, plotlyDark.yaxis, { title: 'Latency (ms)' }),
+          yaxis: trendYAxis('Latency (ms)', latVals, 0.30),
         }), { responsive: true, displayModeBar: false });
         latEl.on('plotly_click', clickHandler);
       }
@@ -883,23 +958,21 @@ function showDetailModal(kernel, platform_short) {
         }), { responsive: true, displayModeBar: false });
         spEl.on('plotly_click', clickHandler);
       }
-      // Compile time over time
+      // Compile time over time (same noise muting as latency chart)
       const ctVals = histFwd.map(h => h.compile_time_geomean_s > 0 ? h.compile_time_geomean_s : null);
-      const ctTrace = {
-        x: xLabels, y: ctVals,
-        mode: 'lines+markers', line: { color: '#f0883e', width: 2 }, marker: { size: 6 },
-        text: histFwd.map(h => h.sha), customdata: commitUrls,
-        hovertemplate: '%{text}: %{y:.1f}s<extra></extra>',
-        connectgaps: false
-      };
-      const ctLayout = Object.assign({}, plotlyDark, {
-        height: 220,
-        xaxis: Object.assign({}, plotlyDark.xaxis, { tickangle: -40 }),
-        yaxis: Object.assign({}, plotlyDark.yaxis, { title: 'Compile Time (s)' })
-      });
       const ctEl = document.getElementById('mc-compile');
       if (ctEl) {
-        Plotly.newPlot(ctEl, [ctTrace], ctLayout, { responsive: true, displayModeBar: false });
+        Plotly.newPlot(ctEl, [{
+          x: xLabels, y: ctVals,
+          mode: 'lines+markers', line: { color: '#f0883e', width: 3 }, marker: { size: 6 },
+          text: histFwd.map(h => h.sha), customdata: commitUrls,
+          hovertemplate: '%{text}: %{y:.1f}s<extra></extra>',
+          connectgaps: false,
+        }], Object.assign({}, plotlyDark, {
+          height: 220,
+          xaxis: Object.assign({}, plotlyDark.xaxis, { tickangle: -40 }),
+          yaxis: trendYAxis('Compile Time (s)', ctVals, 0.30),
+        }), { responsive: true, displayModeBar: false });
       }
     }
     // Per-shape bar charts

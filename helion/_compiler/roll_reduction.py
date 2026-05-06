@@ -158,31 +158,35 @@ class ReductionRoller:
         else:
             val = node.meta.get("val", None)
 
-        num_rdims = 0
-        if isinstance(val, torch.Tensor):
-            for size in val.size():
-                block_idx = CompileEnvironment.current().get_block_id(size)
-                num_rdims += block_idx == self.rdim.block_id
-            if num_rdims > 1:
-                raise NotImplementedError(
-                    "multiple reduction dims of same size not supported"
-                )
-        elif isinstance(val, (tuple, list)):
-            # Some operations like var_mean return tuples of tensors
-            for item in val:
-                if isinstance(item, torch.Tensor):
-                    for size in item.size():
-                        block_idx = CompileEnvironment.current().get_block_id(size)
-                        num_rdims += block_idx == self.rdim.block_id
-            if num_rdims > 1:
-                raise NotImplementedError(
-                    "multiple reduction dims of same size not supported"
-                )
-        else:
-            # For non-tensor values (e.g., scalars), they don't use reduction dims
-            num_rdims = 0
-
+        num_rdims = self._count_rdim_axes_in_val(val)
+        if num_rdims > 1:
+            raise NotImplementedError(
+                "multiple reduction dims of same size not supported"
+            )
         return num_rdims > 0
+
+    def _count_rdim_axes_in_val(self, val: object) -> int:
+        """Count how many tensor axes reference ``self.rdim``.
+
+        Handles single tensors and ``(tuple, list)`` of tensors (e.g. the
+        ``var_mean`` op returns two tensors). Non-tensor values (scalars)
+        contribute 0. The caller raises when the count exceeds 1, since
+        the roller's per-axis chunking only makes sense for one rdim per
+        node.
+        """
+        if not isinstance(val, (torch.Tensor, tuple, list)):
+            return 0
+        env = CompileEnvironment.current()
+        rdim_block_id = self.rdim.block_id
+
+        def count_for_tensor(t: torch.Tensor) -> int:
+            return sum(env.get_block_id(size) == rdim_block_id for size in t.size())
+
+        if isinstance(val, torch.Tensor):
+            return count_for_tensor(val)
+        return sum(
+            count_for_tensor(item) for item in val if isinstance(item, torch.Tensor)
+        )
 
     def size_node(self, meta: dict[str, object]) -> torch.fx.Node:
         """Create a node that represents the size of the reduction dimension"""

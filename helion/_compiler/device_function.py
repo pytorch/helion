@@ -201,16 +201,13 @@ class CuteTcgen05StoreValue:
     bm: int = 0
     bn: int = 0
     bk: int = 0
-    smem_name: str = ""
     thr_mma: str = ""
-    store_thr_mma: str = ""
     epi_warp_count: int = 0
     epi_acc_frag_base: str = ""
     epi_tidx: str = ""
     epi_active: str = ""
-    epi_leader: str = ""
     exec_active: str = ""
-    exec_leader: str = ""
+    warp_idx: str = ""
     epi_tile: str = ""
     c_stage_count: int = 0
     epilog_sync_barrier_id: int = 0
@@ -228,28 +225,58 @@ class CuteTcgen05StoreValue:
     tma_warp: str = ""
     tma_pipeline: str = ""
     tma_producer_state: str = ""
+    tma_store_atom: str = ""
+    tma_store_tensor: str = ""
+    role_local_tile_counter: str = ""
     is_two_cta: bool = False
     use_tma: bool = False
+    use_role_local_epi: bool = False
+    use_tma_store_epilogue: bool = False
+    ab_stage_count: int = 0
+    acc_stage_count: int = 0
 
 
 @dataclasses.dataclass(frozen=True)
 class CuteTcgen05MatmulPlan:
-    """Kernel-wide tcgen05 collective contract selected by CuTe matmul codegen."""
+    """Kernel-wide tcgen05 collective contract selected by CuTe matmul codegen.
+
+    Warp-role layout in the launched CTA:
+
+    - ``epi_warp_count`` epilogue warps starting at warp 0
+    - one MMA exec warp at ``exec_warp_id``
+    - one A/B load warp at ``tma_warp_id`` -- doubles as the TMA warp and,
+      in the persistent path, also owns the tile scheduler
+
+    ``ab_load_warp_count`` defaults to 1 -- the current lowering has a
+    single TMA / A-B load warp. The field is kept so the role layout /
+    launch shape continues to plumb through if a future role-local
+    persistent rewrite splits TMA load and A/B prefetch onto separate
+    warps.
+
+    Earlier revisions tracked separate ``has_scheduler_warp`` /
+    ``has_epi_load_warp`` flags. Neither role was wired to actual work --
+    the persistent scheduler always rode on the TMA warp, and the epilogue
+    load was folded into the consumer epi warps. Removing those flags drops
+    two dead warps from the launched block (saving register budget for the
+    real consumer warps) and simplifies the autotune search space. When
+    role-local persistent loops land, the dedicated roles can come back as
+    real launch dimensions instead of placeholders.
+    """
 
     bm: int
     bn: int
     bk: int
+    k_tile_count: int
     cluster_m: int
     is_two_cta: bool
+    uses_role_local_persistent_body: bool
     cta_thread_count: int
     physical_m_threads: int
     acc_stage_count: int
     ab_stage_count: int
     c_stage_count: int
     epi_warp_count: int
-    ab_load_warp_count: int
-    has_scheduler_warp: bool
-    has_epi_load_warp: bool
+    ab_load_warp_count: int = 1
 
     @property
     def exec_warp_id(self) -> int:
@@ -268,41 +295,21 @@ class CuteTcgen05MatmulPlan:
         return self.ab_load_warp_begin
 
     @property
-    def epi_load_warp_id(self) -> int | None:
-        if self.has_epi_load_warp:
-            return self.ab_load_warp_end
-        return None
-
-    @property
-    def scheduler_warp_id(self) -> int | None:
-        if self.has_scheduler_warp:
-            return self.ab_load_warp_end + int(self.has_epi_load_warp)
-        return None
-
-    @property
     def persistent_scheduler_owner_warp_id(self) -> int:
-        # The current persistent path still wraps the whole tcgen05 body, so the
-        # scheduler owner must also participate in CTA-wide producer syncs.
-        # Move this to scheduler_warp_id when role-local loops own scheduling.
+        # Persistent scheduling rides on the TMA warp because the current
+        # tcgen05 body still uses one CTA-wide ``while``: the scheduler owner
+        # has to be inside the same producer sync structure as the TMA load
+        # warp. Once role-local loops land this can move onto a dedicated
+        # scheduler warp.
         return self.tma_warp_id
 
     @property
     def role_warp_count(self) -> int:
-        return (
-            self.epi_warp_count
-            + 1
-            + self.ab_load_warp_count
-            + int(self.has_epi_load_warp)
-            + int(self.has_scheduler_warp)
-        )
-
-    @property
-    def compact_role_warp_count(self) -> int:
-        return 1 << max(self.role_warp_count - 1, 0).bit_length()
+        return self.epi_warp_count + 1 + self.ab_load_warp_count
 
     @property
     def block_shape(self) -> tuple[int, int, int]:
-        return (self.physical_m_threads, self.compact_role_warp_count, 1)
+        return (self.physical_m_threads, self.role_warp_count, 1)
 
 
 _sort_order: dict[type[Argument], int] = {
@@ -403,7 +410,12 @@ class DeviceFunction:
         self.deferred_rdim_defs: list[tuple[str, sympy.Expr]] = []
         self._cute_tcgen05_store_values: dict[str, CuteTcgen05StoreValue] = {}
         self.cute_tcgen05_matmul_plan: CuteTcgen05MatmulPlan | None = None
-        self._cute_tcgen05_invariant_setup_stmt_ids: set[int] = set()
+        self._cute_tcgen05_per_tile_stmt_ids: set[int] = set()
+        self._cute_tcgen05_post_loop_stmt_ids: set[int] = set()
+        self._cute_tcgen05_tma_load_role_stmt_ids: set[int] = set()
+        self._cute_tcgen05_mma_exec_role_stmt_ids: set[int] = set()
+        self._cute_tcgen05_epi_role_stmt_ids: set[int] = set()
+        self.cute_tcgen05_epi_role_tile_counter_var: str | None = None
         self._cute_collective_handled_loads: set[str] = set()
         self.cute_cluster_shape: tuple[int, int, int] | None = None
         self.cute_block_shape: tuple[int, int, int] | None = None
@@ -445,9 +457,9 @@ class DeviceFunction:
         # dict would then need to support multiple entries per tensor
         # or the tensor would get distinct arg IDs per memory space.
         self.pallas_memory_space: dict[int, PallasMemorySpace] = {}
-        # Pallas: id(fake_tensor) → {dim: block_id} for dims using pl.ds()
-        # that may need host-side padding when block size doesn't divide dim.
-        self.pallas_pad_info: dict[int, dict[int, int]] = {}
+        # Pallas: id(fake_tensor) → {dim: (block_id, extra_pad)} for dims
+        # using pl.ds() that may need host-side padding.
+        self.pallas_pad_info: dict[int, dict[int, tuple[int, int]]] = {}
 
     def allocate_store_index(self) -> int:
         """Bump store counters and return the indexing strategy slot."""
@@ -598,11 +610,153 @@ class DeviceFunction:
             return
         self.cute_tcgen05_matmul_plan = plan
 
-    def register_cute_tcgen05_invariant_setup(self, stmts: list[ast.AST]) -> None:
-        self._cute_tcgen05_invariant_setup_stmt_ids.update(id(stmt) for stmt in stmts)
+    def register_cute_tcgen05_per_tile_stmts(self, stmts: list[ast.AST]) -> None:
+        """Mark statements that depend on per-tile coordinates.
 
-    def is_cute_tcgen05_invariant_setup(self, stmt: ast.stmt) -> bool:
-        return id(stmt) in self._cute_tcgen05_invariant_setup_stmt_ids
+        When the persistent kernel splits the device-loop prefix into a
+        once-per-CTA setup and a per-tile body, statements registered here
+        stay inside the work-tile loop; everything else can be hoisted out.
+        Use for things like ``cute.local_tile`` over the per-tile (m, n)
+        offset, ``tma_partition`` of those per-tile tensors, and the initial
+        ``producer_acquire`` / TMA prefetch that warm the pipeline at the
+        start of each tile.
+        """
+        self._cute_tcgen05_per_tile_stmt_ids.update(id(stmt) for stmt in stmts)
+
+    def is_cute_tcgen05_per_tile(self, stmt: ast.stmt) -> bool:
+        return id(stmt) in self._cute_tcgen05_per_tile_stmt_ids
+
+    @property
+    def has_cute_tcgen05_per_tile_marks(self) -> bool:
+        return bool(self._cute_tcgen05_per_tile_stmt_ids)
+
+    def register_cute_tcgen05_post_loop_stmts(self, stmts: list[ast.AST]) -> None:
+        """Mark statements that should run AFTER the persistent work-tile loop.
+
+        This is the natural home for one-shot pipeline drains (``producer_tail``),
+        TMEM deallocation, and any other cleanup that conceptually runs once
+        the kernel has finished all its tiles. Without this tag, those
+        statements would remain inside the work-tile loop and execute on
+        every virtual tile, which is at best wasted work and at worst
+        incorrect (re-freeing a TMEM buffer the next tile still needs).
+
+        Non-persistent kernels skip the post-loop split entirely; the
+        statements stay where the codegen emitted them, which is already
+        the end of the device function.
+        """
+        self._cute_tcgen05_post_loop_stmt_ids.update(id(stmt) for stmt in stmts)
+
+    def is_cute_tcgen05_post_loop(self, stmt: ast.stmt) -> bool:
+        return id(stmt) in self._cute_tcgen05_post_loop_stmt_ids
+
+    @property
+    def has_cute_tcgen05_post_loop_marks(self) -> bool:
+        return bool(self._cute_tcgen05_post_loop_stmt_ids)
+
+    def register_cute_tcgen05_tma_load_role_stmts(self, stmts: list[ast.AST]) -> None:
+        """Mark statements that belong to the TMA-load warp's role block.
+
+        When the persistent kernel splits the work-tile body into role
+        blocks (see ``Tcgen05PersistentProgramIDs._collect_tcgen05_role_blocks``),
+        statements registered here are pulled into a TMA-load-specific
+        role block. The block is gated by the TMA-load warp predicate so
+        only that warp executes its body. Use for statements whose work
+        is conceptually owned by the TMA-load warp -- e.g. the initial
+        TMA prefetch ``producer_acquire`` / ``cute.copy`` /
+        ``producer_commit`` cycle that warms the AB pipeline at the
+        start of each tile.
+
+        Statements registered here must be reachable from the per-tile
+        wrapped body when the role partitioner runs. Two registration
+        shapes are valid:
+
+        - **Top-level statements** -- register the statement as per-tile
+          first via ``register_cute_tcgen05_per_tile_stmts``, otherwise
+          the splitter will hoist it out of the work-tile body before
+          the role partitioner ever sees it. The initial TMA prefetch
+          IF-blocks emitted from ``cute_mma.py`` take this shape.
+        - **Nested statements inside a per-tile container** (e.g. the
+          per-K-iter TMA producer block emitted inside the K-loop body
+          via ``cg.add_statement(...)``) -- the containing statement
+          stays in the work-tile body because it transitively depends
+          on per-tile names, and the role partitioner recurses into
+          top-level ``for`` / ``while`` loops to find tagged children.
+          These tagged children do NOT need to be per-tile-registered
+          themselves; the parent loop carries them.
+        """
+        self._cute_tcgen05_tma_load_role_stmt_ids.update(id(stmt) for stmt in stmts)
+
+    def is_cute_tcgen05_tma_load_role(self, stmt: ast.stmt) -> bool:
+        return id(stmt) in self._cute_tcgen05_tma_load_role_stmt_ids
+
+    @property
+    def has_cute_tcgen05_tma_load_role_marks(self) -> bool:
+        return bool(self._cute_tcgen05_tma_load_role_stmt_ids)
+
+    @property
+    def cute_tcgen05_tma_load_role_stmt_ids(self) -> frozenset[int]:
+        """Snapshot of every registered TMA-load role-tag id. The role
+        partitioner uses this to validate that every registered tag was
+        consumed (either at top level or via the one-level for/while
+        recursion) -- a registered tag that never gets visited indicates
+        a bad registration shape that would otherwise silently miscompile.
+        """
+        return frozenset(self._cute_tcgen05_tma_load_role_stmt_ids)
+
+    def register_cute_tcgen05_mma_exec_role_stmts(self, stmts: list[ast.AST]) -> None:
+        """Mark statements that belong to the MMA-exec warp's role block.
+
+        The persistent tcgen05 role partitioner pulls these statements into
+        an MMA-exec-specific role-local ``while``. Use for AB consumer wait /
+        release, UMMA issue, and acc-pipeline producer work that must advance
+        once per tile on the exec warp.
+        """
+        self._cute_tcgen05_mma_exec_role_stmt_ids.update(id(stmt) for stmt in stmts)
+
+    def is_cute_tcgen05_mma_exec_role(self, stmt: ast.stmt) -> bool:
+        return id(stmt) in self._cute_tcgen05_mma_exec_role_stmt_ids
+
+    @property
+    def has_cute_tcgen05_mma_exec_role_marks(self) -> bool:
+        return bool(self._cute_tcgen05_mma_exec_role_stmt_ids)
+
+    @property
+    def cute_tcgen05_mma_exec_role_stmt_ids(self) -> frozenset[int]:
+        """Snapshot of every registered MMA-exec role-tag id."""
+        return frozenset(self._cute_tcgen05_mma_exec_role_stmt_ids)
+
+    def register_cute_tcgen05_epi_role_stmts(self, stmts: list[ast.AST]) -> None:
+        """Mark statements that belong to the epilogue warp role block.
+
+        The persistent tcgen05 role partitioner pulls these statements into
+        an epi-warp-local ``while``. Use for acc-pipeline consumer work and
+        TMEM-to-GMEM store work that must advance once per tile on epi warps.
+        """
+        self._cute_tcgen05_epi_role_stmt_ids.update(id(stmt) for stmt in stmts)
+
+    def register_cute_tcgen05_epi_role_tile_counter(self, name: str) -> None:
+        """Publish the per-iteration tile counter used by the epi role.
+
+        Persistent TMA-store epilogues use this counter to rotate SMEM stages
+        across work tiles. The role-local while builder owns its lifetime; the
+        store body only reads it.
+        """
+        if self.cute_tcgen05_epi_role_tile_counter_var is None:
+            self.cute_tcgen05_epi_role_tile_counter_var = name
+            return
+        assert self.cute_tcgen05_epi_role_tile_counter_var == name
+
+    def is_cute_tcgen05_epi_role(self, stmt: ast.stmt) -> bool:
+        return id(stmt) in self._cute_tcgen05_epi_role_stmt_ids
+
+    @property
+    def has_cute_tcgen05_epi_role_marks(self) -> bool:
+        return bool(self._cute_tcgen05_epi_role_stmt_ids)
+
+    @property
+    def cute_tcgen05_epi_role_stmt_ids(self) -> frozenset[int]:
+        """Snapshot of every registered epilogue role-tag id."""
+        return frozenset(self._cute_tcgen05_epi_role_stmt_ids)
 
     def get_cute_tcgen05_store_value(self, name: str) -> CuteTcgen05StoreValue | None:
         for alias in self._variable_renames.get(name, [name]):

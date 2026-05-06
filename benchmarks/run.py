@@ -617,7 +617,7 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "helion_jagged_mean_tritonbench-latency": "helion_latency_ms",
     },
     "flash_attention": {
-        "aten": "baseline",
+        "sdpa": "baseline",
         "triton_tutorial_flash_v2_tma_ws_persistent-speedup": "triton_speedup",
         "triton_tutorial_flash_v2_tma_ws_persistent-accuracy": "triton_accuracy",
         "flex_attention-speedup": "torch_compile_speedup",
@@ -1288,7 +1288,12 @@ def run_kernel_variants(
 
                 if isinstance(kfunc, Kernel):
                     # Helion kernel - we call it in a lambda to delay execution until measurement
-                    measured_func_callable = lambda: kfunc(*args, **kwargs)  # noqa: E731
+                    if operator_name == "flash_attention":
+                        measured_func_callable = lambda: [  # noqa: E731
+                            kfunc(*args, **kwargs)
+                        ]
+                    else:
+                        measured_func_callable = lambda: kfunc(*args, **kwargs)  # noqa: E731
                 else:
                     # tritonbench integration wrapper - pass tritonbench operator instance as first argument
                     # The wrapper must return a callable that does the actual computation, for delayed execution

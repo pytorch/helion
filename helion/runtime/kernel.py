@@ -115,7 +115,7 @@ class Kernel(Generic[_R]):
         self,
         fn: Callable[..., _R],
         *,
-        configs: list[ConfigLike] | None = None,
+        configs: Sequence[ConfigLike] | None = None,
         settings: Settings | None,
         key: Callable[..., Hashable] | None = None,
     ) -> None:
@@ -139,8 +139,8 @@ class Kernel(Generic[_R]):
         self._key_fn: Callable[..., Hashable] | None = key
         self.configs: list[Config] = [
             # pyrefly: ignore [bad-argument-type]
-            Config(**c) if isinstance(c, dict) else c
-            for c in configs or []
+            Config(**config) if isinstance(config, dict) else config
+            for config in configs or []
         ]
         self._bound_kernels: dict[BoundKernelInMemoryCacheKey, BoundKernel] = {}
         self._specialize_extra: dict[
@@ -505,13 +505,14 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
 
     @property
     def configs(self) -> list[Config]:
-        """
-        Alias for `self.kernel.configs`.
-
-        Returns:
-            list[Config]: The list of configurations.
-        """
+        """Return the kernel's configured configs (alias for `self.kernel.configs`)."""
         return self.kernel.configs
+
+    def _normalize_config(self, config: ConfigLike) -> Config:
+        if isinstance(config, Config):
+            return config
+        # pyrefly: ignore [bad-argument-type]
+        return Config(**config)
 
     def format_kernel_decorator(self, config: Config, settings: Settings) -> str:
         """Return the @helion.kernel decorator snippet capturing configs and settings that influence Triton code generation."""
@@ -543,9 +544,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         if config is None:
             config = self._require_implicit_config()
         with self.env, measure("BoundKernel.to_code"):
-            if not isinstance(config, Config):
-                # pyrefly: ignore [bad-argument-type]
-                config = Config(**config)
+            config = self._normalize_config(config)
             # Work on a copy so the caller's Config is not mutated with
             # normalize defaults (e.g. indexing, load_eviction_policies)
             # specific to this BoundKernel's config_spec.  Without this,
@@ -610,11 +609,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         """
         if config is None:
             config = self._require_implicit_config()
-        if not isinstance(config, Config):
-            config = Config(
-                # pyrefly: ignore [bad-argument-type]
-                **config
-            )
+        config = self._normalize_config(config)
         dist_check_config_consistancy(
             config, process_group_name=self._env.process_group_name
         )
@@ -692,11 +687,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         """
         if config is None:
             config = self._require_implicit_config()
-        if not isinstance(config, Config):
-            config = Config(
-                # pyrefly: ignore [bad-argument-type]
-                **config
-            )
+        config = self._normalize_config(config)
         return self._cache_path_map.get(config, None)
 
     def _debug_str(self) -> str:
@@ -812,11 +803,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         Args:
             config: The configuration to set.
         """
-        if not isinstance(config, Config):
-            config = Config(
-                # pyrefly: ignore [bad-argument-type]
-                **config
-            )
+        config = self._normalize_config(config)
         self._run = self.compile_config(config)
         self._config = config
         counters["best_config_decorator"][
@@ -892,12 +879,10 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         Checks the kernel's config list and settings to determine if
         a config can be resolved without autotuning.
         """
-        if self.settings.force_autotune:
-            return None
         configs = self.kernel.configs
-        if len(configs) == 1:
-            return configs[0]
-        if len(configs) == 0 and self.kernel.settings.autotune_effort == "none":
+        if self.kernel.settings.autotune_effort == "none" and (
+            len(configs) == 0 or self.settings.force_autotune
+        ):
             config = self.config_spec.default_config()
             if not is_ref_mode_enabled(self.kernel.settings):
                 kernel_decorator = self.format_kernel_decorator(config, self.settings)
@@ -906,6 +891,10 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                     file=sys.stderr,
                 )
             return config
+        if self.settings.force_autotune:
+            return None
+        if len(configs) == 1:
+            return configs[0]
         return None
 
     def _implicit_config(self) -> Config | None:
@@ -996,8 +985,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
 
         if config is None:
             config = self._require_implicit_config()
-        if not isinstance(config, Config):
-            config = Config(**config)  # pyrefly: ignore [bad-argument-type]
+        config = self._normalize_config(config)
         compiled_fn = self._compile_cache.get(config)
         if compiled_fn is None:
             return None
@@ -1119,7 +1107,7 @@ def kernel(
     fn: Callable[..., _R],
     *,
     config: ConfigLike | None = None,
-    configs: list[ConfigLike] | None = None,
+    configs: Sequence[ConfigLike] | None = None,
     key: Callable[..., Hashable] | None = None,
     **settings: object,
 ) -> Kernel[_R]: ...
@@ -1130,7 +1118,7 @@ def kernel(
     fn: None = None,
     *,
     config: ConfigLike | None = None,
-    configs: list[ConfigLike] | None = None,
+    configs: Sequence[ConfigLike] | None = None,
     key: Callable[..., Hashable] | None = None,
     **settings: object,
 ) -> _KernelDecorator: ...
@@ -1140,7 +1128,7 @@ def kernel(
     fn: Callable[..., _R] | None = None,
     *,
     config: ConfigLike | None = None,
-    configs: list[ConfigLike] | None = None,
+    configs: Sequence[ConfigLike] | None = None,
     key: Callable[..., Hashable] | None = None,
     **settings: object,
 ) -> Kernel[_R] | _KernelDecorator:
@@ -1181,9 +1169,17 @@ def kernel(
 
     if fn is None:
         return functools.partial(
-            kernel, configs=configs, settings=settings_obj, key=key
+            kernel,
+            configs=configs,
+            settings=settings_obj,
+            key=key,
         )
-    return Kernel(fn, configs=configs, settings=settings_obj, key=key)
+    return Kernel(
+        fn,
+        configs=configs,
+        settings=settings_obj,
+        key=key,
+    )
 
 
 def _hashable_dim(s: int | torch.SymInt) -> Hashable:

@@ -86,6 +86,7 @@ Check for:
 - Opportunities for simplification or cleanups
 - Places that are hacky or overly narrow
 - Code duplication
+- Backend-specific tests or test files that should use `@onlyBackends([...])`
 - Too broad `try/except:` lines that could hide bugs
 - Overly defensive getattr/hasattr checks that should be base class schema updates
 - Comments that might go stale quickly (e.g. line numbers)

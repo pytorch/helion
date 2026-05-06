@@ -431,7 +431,7 @@ class LFBOPatternSearch(PatternSearch):
             for idx, m in enumerate(starting_points)
         ]
 
-        for generation in range(1, self.max_generations + 1):
+        for generation in self._budgeted_range(1, self.max_generations + 1):
             prior_best = self.best
             new_population = {id(prior_best): prior_best}
             num_neighbors = 0

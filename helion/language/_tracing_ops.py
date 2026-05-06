@@ -355,6 +355,28 @@ def _find_strategy(
     return strategy
 
 
+def _get_loop_begin_and_end(
+    state: CodegenState, loop_dim_index: int
+) -> tuple[str, str]:
+    """Extract the begin and end values from the _for_loop state args."""
+    ast_begins = state.ast_args[1]
+    ast_ends = state.ast_args[2]
+    begins = list(ast_begins) if isinstance(ast_begins, (list, tuple)) else [ast_begins]
+    ends = list(ast_ends) if isinstance(ast_ends, (list, tuple)) else [ast_ends]
+
+    def _to_str(value: object) -> str:
+        if isinstance(value, ast.AST):
+            return ast.unparse(value)
+        return str(value)
+
+    return _to_str(begins[loop_dim_index]), _to_str(ends[loop_dim_index])
+
+
+def _get_loop_numel(state: CodegenState, loop_dim_index: int) -> str:
+    begin, end = _get_loop_begin_and_end(state, loop_dim_index)
+    return f"(({end}) - ({begin}))"
+
+
 def _compute_grid_and_block_sizes(
     state: CodegenState,
     block_ids: list[int],
@@ -363,14 +385,14 @@ def _compute_grid_and_block_sizes(
     """Compute grid dimensions and block size vars for the given block_ids."""
     grid_parts: list[str] = []
     block_size_vars: list[str] = []
-    for block_id in block_ids:
+    for i, block_id in enumerate(block_ids):
         block_size_var = state.device_function.block_size_var(block_id)
         assert block_size_var is not None
         block_size_vars.append(block_size_var)
         block_value = env.block_sizes[block_id].from_config(state.config)
         if block_value is not None:
             state.device_function.constexpr_arg(block_size_var, block_value)
-        numel_expr = state.sympy_expr(env.block_sizes[block_id].numel)
+        numel_expr = _get_loop_numel(state, i)
         grid_parts.append(
             env.backend.cdiv_expr(numel_expr, block_size_var, is_device=True)
         )
@@ -383,11 +405,8 @@ def _pallas_loop_begin_and_step_exprs(
     block_size_vars: list[str],
 ) -> tuple[list[str], list[str], list[str]]:
     """Return begin, per-iteration step, and slice-size expressions for loop dims."""
-    begins = state.proxy_arg(1)
     steps = state.proxy_arg(4) if len(state.proxy_args) > 4 else None
 
-    if not isinstance(begins, (list, tuple)):
-        begins = [begins]
     if not isinstance(steps, (list, tuple)):
         steps = [steps] * len(block_ids)
 
@@ -396,9 +415,8 @@ def _pallas_loop_begin_and_step_exprs(
     slice_size_exprs: list[str] = []
 
     for i in range(len(block_ids)):
-        begin = begins[i]
         step = steps[i]
-        begin_expr = state.sympy_expr(sympy.sympify(begin))
+        begin_expr, _ = _get_loop_begin_and_end(state, i)
         if step is None or sympy.sympify(step) in (
             sympy.Integer(0),
             sympy.Integer(1),
@@ -413,6 +431,30 @@ def _pallas_loop_begin_and_step_exprs(
         slice_size_exprs.append(slice_size_expr)
 
     return begin_exprs, iter_step_exprs, slice_size_exprs
+
+
+def _compute_pipeline_or_dma_extra_pad(
+    begin_expr: str,
+    bid: int,
+    env: CompileEnvironment,
+    state: CodegenState,
+) -> int:
+    """Return extra host-side padding for a pipeline/DMA dim with a non-zero begin.
+
+    When ``pl.ds(offset, block_size)`` reads from a tensor whose loop starts
+    at a non-zero begin, the last block can overshoot the tensor boundary
+    beyond what ``(-shape) % block_size`` accounts for.  The worst case is
+    ``block_size - 1`` extra elements when the begin is data-dependent.
+
+    # TODO(dunfanlu): if begin isn't "0" but is another constexpr int,
+    # we should be able to use a smaller padding than bs-1?
+    """
+    if begin_expr == "0":
+        return 0
+    bs_val = env.block_sizes[bid].from_config(state.config)
+    if isinstance(bs_val, int):
+        return bs_val - 1
+    return 0
 
 
 def _scratch_read(state: CodegenState, sname: str) -> str:
@@ -477,21 +519,13 @@ def _setup_loop_carried_state(
             continue
         if isinstance(proxy, torch.Tensor):
             assert isinstance(arg_ast, ast.Name)
-            # Reuse existing scratch if the init value is already in one
-            # (e.g. from hl.full / hl.zeros). Otherwise allocate new.
-            existing = any(
-                s.name == arg_ast.id for s in state.device_function._scratch_args
+            shape = _resolve_shape(proxy, env, state.config)
+            dtype = proxy.dtype
+            scratch_name = state.device_function.register_scratch(
+                shape, dtype, name_hint=f"scratch_{i}"
             )
-            if existing:
-                scratch_name = arg_ast.id
-            else:
-                shape = _resolve_shape(proxy, env, state.config)
-                dtype = proxy.dtype
-                scratch_name = state.device_function.register_scratch(
-                    shape, dtype, name_hint=f"scratch_{i}"
-                )
-                # Initialize scratch with the arg value.
-                state.add_statement(_scratch_write_stmt(state, scratch_name, arg_ast))
+            # Initialize scratch with the arg value.
+            state.add_statement(_scratch_write_stmt(state, scratch_name, arg_ast))
             scratch_names.append(scratch_name)
 
             # Result will be read after loop
@@ -502,6 +536,27 @@ def _setup_loop_carried_state(
             result_vars.append(arg_ast)
 
     return scratch_names, result_vars, carried
+
+
+def _emit_nonlocal_scratch_declarations(
+    state: CodegenState,
+    body_stmts: list[ast.AST],
+) -> None:
+    """Insert ``nonlocal <scratch>`` at the top of the closure body.
+
+    Without ``nonlocal``, an assignment like ``scratch = scratch[...]`` inside
+    a fori_loop/emit_pipeline closure makes ``scratch`` local to the entire
+    function, causing an UnboundLocalError on the RHS read.
+
+    We emit nonlocal for *all* VMEM scratch args, not just the current loop's
+    carried state, because an outer loop body may contain ``scratch = scratch[...]``
+    from a nested inner loop's ``_read_final_loop_state``.
+    """
+    names = [
+        s.name for s in state.device_function._scratch_args if s.scratch_type == "vmem"
+    ]
+    if names:
+        body_stmts.insert(0, ast.Nonlocal(names=names))
 
 
 def _remap_args_to_scratch(
@@ -621,7 +676,7 @@ def _setup_inner_loop_masks(
         for i, bid in enumerate(block_ids):
             block_value = env.block_sizes[bid].from_config(state.config)
             assert isinstance(block_value, int)
-            numel_expr = state.sympy_expr(env.block_sizes[bid].numel)
+            numel_expr = _get_loop_numel(state, i)
             offset_var = state.device_function.new_var(f"offset_{bid}")
             mask_stmt = strategy._setup_mask(
                 state, bid, block_value, offset_var, numel_expr
@@ -1030,12 +1085,89 @@ def _rewrite_outer_subscripts_for_pre_broadcast(
                 )
                 reshaped.append(node)
 
+    # Insert _pre_broadcast_tile where pre-broadcast outer nodes feed wider-dim ops.
+    # First, propagate pre-broadcast status transitively through indirect consumers.
+    # After rewriting subscript[:, :, None] → subscript[:, :], downstream nodes
+    # (e.g. add, rsqrt) may still have stale meta shapes (u0, u1, 1) from trace
+    # time. We identify them by checking if any arg is pre-broadcast — if so,
+    # the node is also pre-broadcast (its real last dim is PRE_BROADCAST_SIZE).
+    all_pre_broadcast_outer: set[str] = set(pre_broadcast_outer_nodes)
+    all_pre_broadcast_outer.update(node.name for node in reshaped)
+    for node in outer_graph.nodes:
+        if node.op != "call_function" or node.name in all_pre_broadcast_outer:
+            continue
+        node_val = node.meta.get("val", None)
+        if not isinstance(node_val, torch.Tensor) or len(node_val.shape) < 2:
+            continue
+        last_dim = node_val.shape[-1]
+        if isinstance(last_dim, torch.SymInt):
+            continue
+        last_dim_int = int(last_dim)
+        if last_dim_int > PRE_BROADCAST_SIZE:
+            continue
+        has_pre_broadcast_arg = False
+        for arg in node.args:
+            if isinstance(arg, torch.fx.Node) and arg.name in all_pre_broadcast_outer:
+                arg_val = arg.meta.get("val", None)
+                if isinstance(arg_val, torch.Tensor) and len(arg_val.shape) >= 2:
+                    arg_last = arg_val.shape[-1]
+                    if isinstance(arg_last, int) and arg_last == PRE_BROADCAST_SIZE:
+                        has_pre_broadcast_arg = True
+                        break
+        if has_pre_broadcast_arg:
+            new_shape = [*node_val.shape[:-1], PRE_BROADCAST_SIZE]
+            node.meta["val"] = node_val.new_empty(new_shape)
+            all_pre_broadcast_outer.add(node.name)
+            reshaped.append(node)
+
+    new_nodes: list[torch.fx.Node] = []
+    for node in list(outer_graph.nodes):
+        if node.op != "call_function" or node.name in all_pre_broadcast_outer:
+            continue
+        node_val = node.meta.get("val", None)
+        if not isinstance(node_val, torch.Tensor) or len(node_val.shape) < 2:
+            continue
+        last_dim = node_val.shape[-1]
+        last_dim_is_sym = isinstance(last_dim, torch.SymInt)
+        if not last_dim_is_sym and int(last_dim) <= PRE_BROADCAST_SIZE:
+            continue
+        args_list = list(node.args)
+        changed = False
+        for ai, arg in enumerate(args_list):
+            if not isinstance(arg, torch.fx.Node):
+                continue
+            if arg.name not in all_pre_broadcast_outer:
+                continue
+            arg_val = arg.meta.get("val", None)
+            if not isinstance(arg_val, torch.Tensor):
+                continue
+            if not (
+                isinstance(arg_val.shape[-1], int)
+                and arg_val.shape[-1] == PRE_BROADCAST_SIZE
+            ):
+                continue
+            with outer_graph.inserting_before(node):
+                tiled = outer_graph.call_function(
+                    _pre_broadcast_tile,
+                    args=(arg, last_dim),
+                )
+            tiled.meta = {
+                **arg.meta,
+                "val": arg_val.new_empty([*arg_val.shape[:-1], last_dim]),
+            }
+            new_nodes.append(tiled)
+            args_list[ai] = tiled
+            changed = True
+        if changed:
+            node.args = tuple(args_list)
+
     # Re-prepare lowerings for modified outer nodes
-    if reshaped:
+    all_to_prepare = reshaped + new_nodes
+    if all_to_prepare:
         with compile_lock:
             graph_lowering = FakeGraphLowering()
             with V.set_graph_handler(graph_lowering):
-                for node in reshaped:
+                for node in all_to_prepare:
                     if node.op == "call_function":
                         with node.meta["location"]:
                             prepare_node_lowering(graph_lowering, node)
@@ -1360,7 +1492,10 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
                 block_shape_parts.append(slice_size_expr)
                 from .memory_ops import _record_pad_info
 
-                _record_pad_info(state, fake, dim_idx, bid)
+                extra_pad = _compute_pipeline_or_dma_extra_pad(
+                    begin_expr, bid, env, state
+                )
+                _record_pad_info(state, fake, dim_idx, bid, extra_pad)
                 if begin_expr == "0" and iter_step_expr == slice_size_expr:
                     lambda_parts.append(lambda_params[bid_idx])
                 else:
@@ -1482,9 +1617,12 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
     # Build block_id_to_info for the pipeline state
     block_id_to_info: dict[int, LoopDimInfo] = {}
     for block_id in block_ids:
+        block_size = env.block_sizes[block_id]
+        # when the block_size.size is None, we cannot form a SymPy expr for the numel
+        sympy_end_expr = block_size.numel if block_size.size is not None else None
         block_id_to_info[block_id] = LoopDimInfo(
             end_var_name=None,
-            end_expr=env.block_sizes[block_id].numel,
+            end_expr=sympy_end_expr,
         )
 
     strategy = _find_strategy(state, block_ids)
@@ -1566,6 +1704,8 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
         # Write updated loop-carried values back to scratch
         if has_loop_state:
             _write_back_loop_carried(state, scratch_names, carried, graph_results)
+
+    _emit_nonlocal_scratch_declarations(state, body_stmts)
 
     all_body_params = body_params
     # emit_pipeline passes indices as a single tuple argument; the prologue
@@ -1816,9 +1956,12 @@ def _codegen_fori_loop(state: CodegenState) -> object:
     # Build block_id_to_info
     block_id_to_info: dict[int, LoopDimInfo] = {}
     for block_id in block_ids:
+        block_size = env.block_sizes[block_id]
+        # when the block_size.size is None, we cannot form a SymPy expr for the numel
+        sympy_end_expr = block_size.numel if block_size.size is not None else None
         block_id_to_info[block_id] = LoopDimInfo(
             end_var_name=None,
-            end_expr=env.block_sizes[block_id].numel,
+            end_expr=sympy_end_expr,
         )
 
     # Emit offset_<bid>/indices_<bid> at the body prologue.
@@ -1879,7 +2022,10 @@ def _codegen_fori_loop(state: CodegenState) -> object:
                 needs_slice = True
                 from .memory_ops import _record_pad_info
 
-                _record_pad_info(state, fake, dim_idx, bid)
+                extra_pad = _compute_pipeline_or_dma_extra_pad(
+                    begin_expr, bid, env, state
+                )
+                _record_pad_info(state, fake, dim_idx, bid, extra_pad)
             elif bid is not None and bid not in block_ids:
                 # Outer grid dim: use grid offset
                 grid_loops = state.codegen.active_device_loops.get(bid)
@@ -1961,6 +2107,8 @@ def _codegen_fori_loop(state: CodegenState) -> object:
                 statement_from_string(f"{copy_out_var}.start()")
             )
             state.codegen.add_statement(statement_from_string(f"{copy_out_var}.wait()"))
+
+    _emit_nonlocal_scratch_declarations(state, body_stmts)
 
     # Emit nested fori_loop calls — one per dimension.
     # Build inside-out: innermost function wraps body_stmts, each outer
@@ -2487,12 +2635,15 @@ def _(state: CodegenState) -> ast.AST:
             mask_var := state.codegen.mask_var(index)
         ) is not None:
             expand = state.tile_strategy.expand_str(input_sizes, dim)
-            expr = f"({mask_var}{expand})"
+            # Cast bool mask to float before expanding — Mosaic cannot
+            # reshape bool vectors (e.g. vector<32xi1> → vector<32x1xi1>).
+            expr = f"({mask_var}.astype(jnp.float32){expand})"
             if expr not in mask_exprs:
                 mask_exprs.append(expr)
     if not mask_exprs:
         return state.ast_arg(0)
-    mask_expr = "&".join(mask_exprs)
+    # Combine float masks via multiplication (equivalent to bool AND).
+    mask_expr = " * ".join(mask_exprs)
     if len(mask_exprs) < len(input_sizes):
         mask_expr = backend.broadcast_to_expr(
             mask_expr, state.tile_strategy.shape_str(input_sizes)

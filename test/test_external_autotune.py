@@ -18,6 +18,7 @@ from helion._testing import onlyBackends
 from helion.autotuner import IntegerFragment
 from helion.autotuner import PowerOfTwoFragment
 from helion.autotuner.external import autotune
+from helion.autotuner.external import create_user_config_spec
 
 if TYPE_CHECKING:
     from helion.runtime.config import Config
@@ -71,6 +72,34 @@ class TestExternalAutotune(TestCase):
         assert config_keys == {"tile", "unroll"}, (
             f"Config should only have user keys, got {config_keys}"
         )
+
+    def test_user_config_spec_flatten_with_acf_keeps_user_key_layout(self):
+        spec = create_user_config_spec(
+            {
+                "tile": PowerOfTwoFragment(32, 256, 64),
+                "unroll": IntegerFragment(1, 4, 2),
+            }
+        )
+        config_gen = spec.create_config_generation(
+            advanced_controls_files=["/tmp/helion-test.acf"]
+        )
+        self.assertEqual(
+            spec.structural_fingerprint(),
+            spec.structural_fingerprint(
+                advanced_controls_files=["/tmp/helion-test.acf"]
+            ),
+        )
+
+        config = spec.flat_config(
+            lambda fragment: fragment.default(),
+            advanced_controls_files=["/tmp/helion-test.acf"],
+        )
+        flat = config_gen.flatten(config)
+        roundtripped = config_gen.unflatten(flat)
+
+        self.assertEqual(len(flat), len(config_gen.flat_spec))
+        self.assertEqual(set(roundtripped.config), {"tile", "unroll"})
+        self.assertNotIn("advanced_controls_file", roundtripped.config)
 
     def test_pattern_search(self):
         a = torch.randn(512, device=DEVICE)

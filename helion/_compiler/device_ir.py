@@ -1955,10 +1955,30 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
         config_spec.epilogue_subtile_autotune_choices = None
 
         device_ir.register_rollable_reductions()
-        CompileEnvironment.current().config_spec.raise_grid_block_minimums()
+        config_spec = CompileEnvironment.current().config_spec
+        config_spec.raise_grid_block_minimums()
         if len(device_ir.root_ids) > 1:
-            # xyz not supported with shared program IDs, but persistent kernels are allowed
-            CompileEnvironment.current().config_spec.disallow_pid_type("xyz")
+            # xyz is not supported with shared program IDs. Non-tcgen05
+            # persistent kernels are allowed; tcgen05 persistent has a
+            # single-root scheduler/grid contract today.
+            config_spec.disallow_pid_type("xyz")
+            if config_spec.cute_tcgen05_search_enabled:
+                # The tcgen05 persistent launch grid is derived from a single
+                # root's PID space today. Keep persistent pid types out of
+                # multi-root autotune until the scheduler/grid spans all cases.
+                non_persistent_pid_types = tuple(
+                    pid_type
+                    for pid_type in config_spec.allowed_pid_types
+                    if pid_type not in ("persistent_blocked", "persistent_interleaved")
+                )
+                if not non_persistent_pid_types:
+                    raise exc.InvalidConfig(
+                        "CuTe tcgen05 multi-root kernels do not support "
+                        "persistent pid types yet, and no non-persistent "
+                        "pid type is available. Disable forced/distributed "
+                        "persistent-only mode or use a single root loop."
+                    )
+                config_spec.allowed_pid_types = non_persistent_pid_types
 
         # Count all device loads and stores and register tunables
         (
@@ -2178,9 +2198,9 @@ def collect_cute_half_atomic_output_promotions(
             if not isinstance(value_node, torch.fx.Node):
                 return False
             value_val = value_node.meta.get("val")
-            if (
-                not isinstance(value_val, torch.Tensor)
-                or value_val.dtype != torch.float32
+            if not isinstance(value_val, torch.Tensor) or value_val.dtype not in (
+                torch.float16,
+                torch.float32,
             ):
                 return False
         return True
@@ -2196,10 +2216,38 @@ def rewrite_cute_half_atomic_output_allocations(
     host_fn: HostFunction,
     promotions: dict[str, torch.dtype],
 ) -> None:
+    torch_factory_names = {
+        "empty",
+        "empty_like",
+        "full",
+        "full_like",
+        "ones",
+        "ones_like",
+        "zeros",
+        "zeros_like",
+    }
+
     def dtype_expr(dtype: torch.dtype) -> ast.expr:
         expr = expr_from_string(f"torch.{str(dtype).split('.', 1)[1]}")
         assert isinstance(expr, ast.expr)
         return expr
+
+    def is_torch_factory_call(call: ast.Call) -> bool:
+        return (
+            isinstance(call.func, ast.Attribute)
+            and call.func.attr in torch_factory_names
+            and isinstance(call.func.value, ast.Name)
+            and call.func.value.id == "torch"
+        )
+
+    def rewrite_allocation_dtype(call: ast.Call) -> None:
+        dtype = dtype_expr(torch.float32)
+        for kwarg in call.keywords:
+            if kwarg.arg == "dtype":
+                kwarg.value = dtype
+                return
+        if is_torch_factory_call(call):
+            call.keywords.append(create(ast.keyword, arg="dtype", value=dtype))
 
     def rewrite_return_expr(expr: ast.expr) -> ast.expr:
         if isinstance(expr, ast.Name) and expr.id in promotions:
@@ -2211,12 +2259,14 @@ def rewrite_cute_half_atomic_output_allocations(
             assert isinstance(cast_expr, ast.expr)
             return cast_expr
         if isinstance(expr, ast.Tuple):
-            return ast.Tuple(
+            return create(
+                ast.Tuple,
                 elts=[rewrite_return_expr(elt) for elt in expr.elts],
                 ctx=expr.ctx,
             )
         if isinstance(expr, ast.List):
-            return ast.List(
+            return create(
+                ast.List,
                 elts=[rewrite_return_expr(elt) for elt in expr.elts],
                 ctx=expr.ctx,
             )
@@ -2230,10 +2280,7 @@ def rewrite_cute_half_atomic_output_allocations(
             and stmt.targets[0].id in promotions
             and isinstance(stmt.value, ast.Call)
         ):
-            for kwarg in stmt.value.keywords:
-                if kwarg.arg == "dtype":
-                    kwarg.value = dtype_expr(torch.float32)
-                    break
+            rewrite_allocation_dtype(stmt.value)
         elif isinstance(stmt, ast.Return) and stmt.value is not None:
             stmt.value = rewrite_return_expr(stmt.value)
 

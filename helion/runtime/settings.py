@@ -34,6 +34,7 @@ if TYPE_CHECKING:
     from .kernel import BoundKernel
 
     _T = TypeVar("_T")
+    ConfigLike = Config | dict[str, object]
 
     class AutotunerFunction(Protocol):
         def __call__(
@@ -438,6 +439,12 @@ class _Settings:
             "HELION_AUTOTUNE_MAX_GENERATIONS",
         )
     )
+    autotune_budget_seconds: int | None = dataclasses.field(
+        default_factory=functools.partial(
+            _env_get_optional_int,
+            "HELION_AUTOTUNE_BUDGET_SECONDS",
+        )
+    )
     autotune_ignore_errors: bool = dataclasses.field(
         default_factory=functools.partial(
             _env_get_bool, "HELION_AUTOTUNE_IGNORE_ERRORS", False
@@ -467,6 +474,7 @@ class _Settings:
     autotune_config_overrides: dict[str, object] = dataclasses.field(
         default_factory=_get_autotune_config_overrides
     )
+    autotune_seed_configs: ConfigLike | Sequence[ConfigLike] | None = None
     autotune_effort: AutotuneEffort = dataclasses.field(
         default_factory=functools.partial(
             _env_get_literal,
@@ -577,6 +585,13 @@ class Settings(_Settings):
         "autotune_search_acf": "List of PTXAS Advanced Controls Files (ACFs) to search during autotuning. ACFs are highly specialized configurations for specific hardware and use cases; when autotuning with ACFs, default -O3 is always considered. Empty list disables.",
         "autotune_progress_bar": "If True, show progress bar during autotuning. Default is True. Set HELION_AUTOTUNE_PROGRESS_BAR=0 to disable.",
         "autotune_max_generations": "Override the maximum number of generations for Pattern Search and Differential Evolution Search autotuning algorithms with HELION_AUTOTUNE_MAX_GENERATIONS=N or @helion.kernel(autotune_max_generations=N).",
+        "autotune_budget_seconds": (
+            "Wall-clock budget in seconds for the entire autotune. When the "
+            "budget is exceeded the search returns the best config found so "
+            "far. Set with HELION_AUTOTUNE_BUDGET_SECONDS=N or "
+            "@helion.kernel(autotune_budget_seconds=N). Default None "
+            "(no budget)."
+        ),
         "autotune_ignore_errors": (
             "If True, skip logging and raising autotune errors. "
             "Set HELION_AUTOTUNE_IGNORE_ERRORS=1 to enable globally."
@@ -601,6 +616,10 @@ class Settings(_Settings):
         "autotune_config_overrides": (
             "Dictionary of config key/value pairs forced during autotuning. "
             "Accepts HELION_AUTOTUNE_CONFIG_OVERRIDES='{\"num_warps\":4}'."
+        ),
+        "autotune_seed_configs": (
+            "A Config or sequence of Configs to seed the autotuner initial population "
+            "without constraining the search space."
         ),
         "allow_warp_specialize": "If True, allow warp specialization for tl.range calls on CUDA devices.",
         "debug_dtype_asserts": "If True, emit tl.static_assert checks for dtype after each device node.",
@@ -649,7 +668,8 @@ class Settings(_Settings):
             "If None (default), uses the built-in benchmark function."
         ),
         "autotune_best_available_max_configs": (
-            "Maximum number of cached configs to use for FROM_BEST_AVAILABLE initial population strategy. "
+            "Maximum number of cached configs to use for FROM_BEST_AVAILABLE initial population "
+            "and for helion.from_cache() warm-start in FiniteSearch. "
             "Set HELION_BEST_AVAILABLE_MAX_CONFIGS=N to override. Default is 20."
         ),
         "autotune_best_available_max_cache_scan": (
