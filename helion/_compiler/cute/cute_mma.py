@@ -728,8 +728,8 @@ class _PerKiterTmaArgs:
     tma_a_mcast_mask: str
     tma_b_mcast_mask: str
     ab_stage_count: int
-    cluster_m: int
     is_two_cta: bool
+    use_tma_b_mcast_mask: bool
     use_tma_a: bool
     use_tma_b: bool
     exec_active: str
@@ -740,8 +740,8 @@ class _PerKiterTmaArgs:
 def _kloop_tma_copy_a_src(args: _PerKiterTmaArgs, *, k_offset: str) -> str:
     """Per-K-iter TMA copy source for A; ``""`` when A is not TMA-loaded.
 
-    A only multicasts in 2-CTA mode (asymmetric vs. B, which also
-    multicasts across cluster CTAs).
+    A only multicasts in 2-CTA mode (asymmetric vs. B, which can also
+    multicast across cluster CTAs).
     """
     if not args.use_tma_a:
         return ""
@@ -757,16 +757,13 @@ def _kloop_tma_copy_a_src(args: _PerKiterTmaArgs, *, k_offset: str) -> str:
 def _kloop_tma_copy_b_src(args: _PerKiterTmaArgs, *, k_offset: str) -> str:
     """Per-K-iter TMA copy source for B; ``""`` when B is not TMA-loaded.
 
-    B multicasts on ``cluster_m > 1`` or 2-CTA; A only on 2-CTA, so the
-    two helpers are not folded together.
+    Callers pass a mask whenever the B TMA atom is multicast. The guarded
+    clustered CtaGroup.ONE bridge diagnostic uses a self-only mask so each CTA
+    duplicates local-B loads while satisfying CuTe's multicast-atom contract.
     """
     if not args.use_tma_b:
         return ""
-    mcast = (
-        f", mcast_mask={args.tma_b_mcast_mask}"
-        if args.cluster_m > 1 or args.is_two_cta
-        else ""
-    )
+    mcast = f", mcast_mask={args.tma_b_mcast_mask}" if args.use_tma_b_mcast_mask else ""
     return (
         f"    cute.copy({args.tma_atom_b}, "
         f"{args.tma_gB}[None, {k_offset}], "
@@ -1104,8 +1101,8 @@ class _InitialPrefetchTmaArgs:
     tma_sB: str
     tma_a_mcast_mask: str
     tma_b_mcast_mask: str
-    cluster_m: int
     is_two_cta: bool
+    use_tma_b_mcast_mask: bool
 
 
 def _initial_prefetch_copy_a_src(
@@ -1113,8 +1110,8 @@ def _initial_prefetch_copy_a_src(
 ) -> str:
     """Initial-prefetch TMA copy source for A.
 
-    A only multicasts in 2-CTA mode (asymmetric vs. B, which also
-    multicasts across cluster CTAs); matches the asymmetry pinned by
+    A only multicasts in 2-CTA mode (asymmetric vs. B, which can also
+    multicast across cluster CTAs); matches the asymmetry pinned by
     ``test_mcast_mask_asymmetry_between_a_and_b`` for the per-K-iter
     builders.
     """
@@ -1132,14 +1129,11 @@ def _initial_prefetch_copy_b_src(
 ) -> str:
     """Initial-prefetch TMA copy source for B.
 
-    B multicasts on ``cluster_m > 1`` or 2-CTA; A only on 2-CTA, so the
-    two helpers are not folded together.
+    Callers pass a mask whenever the B TMA atom is multicast. The guarded
+    clustered CtaGroup.ONE bridge diagnostic uses a self-only mask so each CTA
+    duplicates local-B loads while satisfying CuTe's multicast-atom contract.
     """
-    mcast = (
-        f", mcast_mask={args.tma_b_mcast_mask}"
-        if args.cluster_m > 1 or args.is_two_cta
-        else ""
-    )
+    mcast = f", mcast_mask={args.tma_b_mcast_mask}" if args.use_tma_b_mcast_mask else ""
     return (
         f"    cute.copy({args.tma_atom_b}, "
         f"{args.tma_gB}[None, {k_offset}], "
@@ -1422,6 +1416,12 @@ def _emit_mma_pipeline(
         or tcgen05_is_two_cta
         or tcgen05_cluster_m2_one_cta_role_local_bridge
     )
+    # The exact CtaGroup.ONE bridge duplicates A/B TMA production locally and
+    # remains runtime-guarded. Do not apply the CtaGroup.TWO deferred cluster
+    # pipeline protocol to that diagnostic shape.
+    tcgen05_use_cluster_deferred_pipelines = (
+        tcgen05_cluster_m > 1 and not tcgen05_cluster_m2_one_cta_role_local_bridge
+    )
     # The clustered CtaGroup.ONE bridge flag is compile-proof only: ProgramID
     # still emits the host guard because this runtime path is not validated.
     tcgen05_use_role_local_tma_producer = (
@@ -1557,7 +1557,7 @@ def _emit_mma_pipeline(
         assert epi_active is not None
         tcgen05_tmem_setup_emitted = True
 
-        if tcgen05_cluster_m > 1:
+        if tcgen05_use_cluster_deferred_pipelines:
             # Keep the two-CTA cluster rendezvous after the AB/acc pipeline
             # objects exist and before any role allocates or retrieves TMEM.
             prefix.append(
@@ -1717,7 +1717,7 @@ def _emit_mma_pipeline(
         2 if tcgen05_is_two_cta else 1
     )
     tcgen05_defer_pipeline_sync_arg = (
-        ", defer_sync=True" if tcgen05_cluster_m > 1 else ""
+        ", defer_sync=True" if tcgen05_use_cluster_deferred_pipelines else ""
     )
     tcgen05_matmul_plan: CuteTcgen05MatmulPlan | None = None
     tcgen05_mma_owner_active: str | None = None
@@ -1730,6 +1730,9 @@ def _emit_mma_pipeline(
             cluster_m=tcgen05_cluster_m,
             is_two_cta=tcgen05_is_two_cta,
             uses_role_local_persistent_body=tcgen05_use_role_local_persistent_body,
+            uses_cluster_m2_one_cta_role_local_bridge=(
+                tcgen05_cluster_m2_one_cta_role_local_bridge
+            ),
             cta_thread_count=tcgen05_cta_thread_count,
             physical_m_threads=mma_physical_m_threads,
             acc_stage_count=tcgen05_acc_stage_count_value,
@@ -2073,6 +2076,7 @@ def _emit_mma_pipeline(
     tma_block_in_cluster_coord_vmnk = df.new_var("tcgen05_block_in_cluster_coord_vmnk")
     tma_a_mcast_mask = df.new_var("tcgen05_a_mcast_mask")
     tma_b_mcast_mask = df.new_var("tcgen05_b_mcast_mask")
+    tcgen05_use_tma_b_mcast_mask = False
     tma_pipeline_mbars = df.new_var("tcgen05_ab_pipeline_mbars")
     tma_pipeline_producer_group = df.new_var("tcgen05_ab_pipeline_producer_group")
     tma_pipeline_consumer_group = df.new_var("tcgen05_ab_pipeline_consumer_group")
@@ -2196,6 +2200,17 @@ def _emit_mma_pipeline(
                 f"{gmem_b_tma_part} = {tma_thr_mma}.partition_B({gmem_b_tma})",
                 tma_load=tcgen05_use_role_local_tma_producer,
             )
+            # The guarded clustered CtaGroup.ONE bridge keeps one TMA producer
+            # transaction per CTA and duplicates B locally. The B atom is still
+            # a multicast TMA atom for cluster_m=2/CtaGroup.ONE, so feed it a
+            # self-only mask instead of the normal all-M peers mask.
+            tcgen05_use_tma_b_peer_mcast = (
+                tcgen05_cluster_m > 1 or tcgen05_is_two_cta
+            ) and not tcgen05_cluster_m2_one_cta_role_local_bridge
+            tcgen05_use_tma_b_self_mcast = tcgen05_cluster_m2_one_cta_role_local_bridge
+            tcgen05_use_tma_b_mcast_mask = (
+                tcgen05_use_tma_b_peer_mcast or tcgen05_use_tma_b_self_mcast
+            )
             if tcgen05_is_two_cta:
                 prefix.append(
                     statement_from_string(
@@ -2247,12 +2262,13 @@ def _emit_mma_pipeline(
                             "mcast_mode=2)"
                         )
                     )
-                if tcgen05_cluster_m > 1 or tcgen05_is_two_cta:
+                if tcgen05_use_tma_b_mcast_mask:
+                    tma_b_mcast_mode = 2 if tcgen05_use_tma_b_self_mcast else 1
                     prefix.append(
                         statement_from_string(
                             f"{tma_b_mcast_mask} = cute.nvgpu.cpasync.create_tma_multicast_mask("
                             f"{tcgen05_cluster_layout_vmnk}, {tma_block_in_cluster_coord_vmnk}, "
-                            "mcast_mode=1)"
+                            f"mcast_mode={tma_b_mcast_mode})"
                         )
                     )
             # tma_partition consumes the per-tile gA_part / gB_part, so the
@@ -2362,8 +2378,8 @@ def _emit_mma_pipeline(
                     tma_sB=tma_sB,
                     tma_a_mcast_mask=tma_a_mcast_mask,
                     tma_b_mcast_mask=tma_b_mcast_mask,
-                    cluster_m=tcgen05_cluster_m,
                     is_two_cta=tcgen05_is_two_cta,
+                    use_tma_b_mcast_mask=tcgen05_use_tma_b_mcast_mask,
                 )
                 _emit_per_tile(
                     f"{tma_initial_full_tile} = "
@@ -2614,8 +2630,8 @@ def _emit_mma_pipeline(
                 tma_a_mcast_mask=tma_a_mcast_mask,
                 tma_b_mcast_mask=tma_b_mcast_mask,
                 ab_stage_count=tcgen05_ab_stage_count_value,
-                cluster_m=tcgen05_cluster_m,
                 is_two_cta=tcgen05_is_two_cta,
+                use_tma_b_mcast_mask=tcgen05_use_tma_b_mcast_mask,
                 use_tma_a=tcgen05_use_tma_a,
                 use_tma_b=tcgen05_use_tma_b,
                 exec_active=tcgen05_plan.exec_active,

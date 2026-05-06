@@ -2802,7 +2802,7 @@ class TestCuteLowerings(unittest.TestCase):
     def test_tcgen05_cluster_m2_cta_group_one_bridge_role_local_codegen(
         self,
     ) -> None:
-        """Diagnostic bridge mode emits role-local CtaGroup.ONE codegen only."""
+        """Diagnostic bridge maps role-local PIDs by CTA rank but stays guarded."""
 
         from helion._compiler.program_id import Tcgen05PersistentProgramIDs
 
@@ -2844,6 +2844,87 @@ class TestCuteLowerings(unittest.TestCase):
         self.assertIn("tcgen05_role_local_0_work_tile", code)
         self.assertIn("tcgen05_role_local_1_work_tile", code)
         self.assertIn("tcgen05_role_local_2_work_tile", code)
+        cta_rank_expr = "cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())"
+        for role_idx in range(3):
+            self.assertIn(
+                "virtual_pid = "
+                f"tcgen05_role_local_{role_idx}_work_tile.tile_idx[0] + "
+                f"{cta_rank_expr}",
+                code,
+            )
+        tma_role_predicate = (
+            "cute.arch.make_warp_uniform(cute.arch.warp_idx()) == cutlass.Int32(5)"
+        )
+        code_ast = ast.parse(code)
+        kernel_def = None
+        tma_role_matches: list[str] = []
+        for node in ast.walk(code_ast):
+            if (
+                isinstance(node, ast.FunctionDef)
+                and node.name
+                == "_helion_cute_matmul_cluster_m2_cta_group_one_role_local"
+            ):
+                kernel_def = node
+            if (
+                isinstance(node, ast.If)
+                and ast.unparse(node.test) == tma_role_predicate
+            ):
+                tma_role_matches.append(ast.unparse(node))
+        self.assertIsNotNone(kernel_def, code)
+        assert kernel_def is not None
+        self.assertEqual(len(tma_role_matches), 1, code)
+        tma_role_src = tma_role_matches[0]
+        self.assertIn("cute.copy(tma_atom_a", tma_role_src)
+        self.assertIn("cute.copy(tma_atom_b", tma_role_src)
+        self.assertNotIn("mcast_mask=tcgen05_a_mcast_mask", tma_role_src)
+        self.assertIn("mcast_mask=tcgen05_b_mcast_mask", tma_role_src)
+        self.assertIn(
+            "tcgen05_b_mcast_mask = "
+            "cute.nvgpu.cpasync.create_tma_multicast_mask("
+            "tcgen05_cluster_layout_vmnk, "
+            "tcgen05_block_in_cluster_coord_vmnk, mcast_mode=2)",
+            code,
+        )
+        self.assertNotIn(_TCGEN05_CLUSTER_LEADER_PREDICATE, tma_role_src)
+        self.assertIn(
+            "tcgen05_ab_pipeline_producer_group = "
+            "cutlass.pipeline.CooperativeGroup("
+            "cutlass.pipeline.Agent.Thread, 1)",
+            code,
+        )
+        self.assertIn(
+            "tcgen05_ab_pipeline_consumer_group = "
+            "cutlass.pipeline.CooperativeGroup("
+            "cutlass.pipeline.Agent.Thread, cutlass.Int32(1))",
+            code,
+        )
+        self.assertIn(
+            "tcgen05_ab_pipeline_tx_count = "
+            "cute.size_in_bytes(cutlass.Float16, sA_tma_layout) + "
+            "cute.size_in_bytes(cutlass.Float16, sB_tma_layout)",
+            code,
+        )
+        self.assertNotIn("* cute.size(tiled_mma.thr_id.shape)", code)
+        self.assertIn(
+            "tcgen05_acc_pipeline = cutlass.pipeline.PipelineUmmaAsync.create("
+            "num_stages=1, producer_group=tcgen05_acc_pipeline_producer_group, "
+            "consumer_group=tcgen05_acc_pipeline_consumer_group, "
+            "barrier_storage=tcgen05_acc_pipeline_barriers, "
+            "cta_layout_vmnk=tcgen05_cluster_layout_vmnk)",
+            code,
+        )
+        self.assertIn(
+            "tcgen05_ab_pipeline = cutlass.pipeline.PipelineTmaUmma.create("
+            "num_stages=2, producer_group=tcgen05_ab_pipeline_producer_group, "
+            "consumer_group=tcgen05_ab_pipeline_consumer_group, "
+            "tx_count=tcgen05_ab_pipeline_tx_count, "
+            "barrier_storage=tcgen05_ab_pipeline_mbars, "
+            "cta_layout_vmnk=tcgen05_cluster_layout_vmnk)",
+            code,
+        )
+        self.assertNotIn("defer_sync=True", code)
+        self.assertNotIn("cutlass.pipeline.pipeline_init_arrive(", code)
+        self.assertNotIn("cutlass.pipeline.pipeline_init_wait(", code)
         self.assertNotIn("while tcgen05_work_tile_valid", code)
         self.assertIn(Tcgen05PersistentProgramIDs._MULTI_TILE_GUARD_TOTAL_VAR, code)
 
@@ -7916,9 +7997,12 @@ class TestPerKiterTmaBuilders(unittest.TestCase):
         *,
         cluster_m: int = 1,
         is_two_cta: bool = False,
+        use_tma_b_mcast_mask: bool | None = None,
         use_tma_a: bool = True,
         use_tma_b: bool = True,
     ) -> _PerKiterTmaArgs:
+        if use_tma_b_mcast_mask is None:
+            use_tma_b_mcast_mask = cluster_m > 1 or is_two_cta
         return _PerKiterTmaArgs(
             tma_pipeline="ab_pipeline",
             tma_producer_state="ab_producer_state",
@@ -7940,8 +8024,8 @@ class TestPerKiterTmaBuilders(unittest.TestCase):
             tma_a_mcast_mask="a_mcast_mask",
             tma_b_mcast_mask="b_mcast_mask",
             ab_stage_count=2,
-            cluster_m=cluster_m,
             is_two_cta=is_two_cta,
+            use_tma_b_mcast_mask=use_tma_b_mcast_mask,
             use_tma_a=use_tma_a,
             use_tma_b=use_tma_b,
             exec_active="exec_active",
@@ -8309,7 +8393,10 @@ class TestInitialPrefetchTmaBuilder(unittest.TestCase):
         *,
         cluster_m: int = 1,
         is_two_cta: bool = False,
+        use_tma_b_mcast_mask: bool | None = None,
     ) -> _InitialPrefetchTmaArgs:
+        if use_tma_b_mcast_mask is None:
+            use_tma_b_mcast_mask = cluster_m > 1 or is_two_cta
         return _InitialPrefetchTmaArgs(
             tma_pipeline="ab_pipeline",
             tma_producer_state="ab_producer_state",
@@ -8323,8 +8410,8 @@ class TestInitialPrefetchTmaBuilder(unittest.TestCase):
             tma_sB="sB",
             tma_a_mcast_mask="a_mcast_mask",
             tma_b_mcast_mask="b_mcast_mask",
-            cluster_m=cluster_m,
             is_two_cta=is_two_cta,
+            use_tma_b_mcast_mask=use_tma_b_mcast_mask,
         )
 
     @staticmethod

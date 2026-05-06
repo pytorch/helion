@@ -270,6 +270,7 @@ class CuteTcgen05MatmulPlan:
     cluster_m: int
     is_two_cta: bool
     uses_role_local_persistent_body: bool
+    uses_cluster_m2_one_cta_role_local_bridge: bool
     cta_thread_count: int
     physical_m_threads: int
     acc_stage_count: int
