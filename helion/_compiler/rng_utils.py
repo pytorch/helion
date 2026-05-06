@@ -118,6 +118,19 @@ def philox_rand_ref(
     return _uint32_to_uniform_float_ref(c0)
 
 
+def philox_rand4x_ref(
+    seed: int | torch.Tensor,
+    offset: int | torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    c0, c1, c2, c3 = philox_uint32_4_ref(seed, offset)
+    return (
+        _uint32_to_uniform_float_ref(c0),
+        _uint32_to_uniform_float_ref(c1),
+        _uint32_to_uniform_float_ref(c2),
+        _uint32_to_uniform_float_ref(c3),
+    )
+
+
 def philox_randint_ref(
     seed: int | torch.Tensor,
     offset: int | torch.Tensor,
