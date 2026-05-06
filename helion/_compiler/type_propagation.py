@@ -2428,7 +2428,10 @@ class TypePropagation(ast.NodeVisitor):
         self.device_loop_depth += device_loop
         _maybe_patch_tensor_factories = (
             patch_tensor_factories
-            if self.device_loop_depth > 0
+            if (
+                self.device_loop_depth > 0
+                and CompileEnvironment.current().backend.pad_factory_tensors_to_power_of_2
+            )
             else contextlib.nullcontext
         )
         with _maybe_patch_tensor_factories():
