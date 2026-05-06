@@ -146,7 +146,7 @@ class DifferentialEvolutionSearch(PopulationBasedSearch):
 
         return self.config_gen.random_population_flat(
             self.population_size * 2,
-            config_hints=self._autotune_hint_configs(),
+            user_seed_configs=self._autotune_seed_configs(),
             log_func=self.log,
         )
 

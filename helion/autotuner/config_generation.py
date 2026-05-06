@@ -403,15 +403,15 @@ class ConfigGeneration:
             result.append((flat, normalized))
         return result
 
-    def hint_flat_config_pairs(
+    def user_seed_flat_config_pairs(
         self,
-        config_hints: Sequence[Config],
+        user_seed_configs: Sequence[Config],
         log_func: Callable[[str], None] | None = None,
     ) -> list[tuple[FlatConfig, Config]]:
-        """Return user-provided hints as flat and normalized configs."""
+        """Return user-provided seed configs as flat and normalized configs."""
         result: list[tuple[FlatConfig, Config]] = []
         seen: set[Config] = set()
-        for i, config in enumerate(config_hints):
+        for i, config in enumerate(user_seed_configs):
             try:
                 flat = self.flatten(config)
                 normalized = self.unflatten(flat)
@@ -423,7 +423,7 @@ class ConfigGeneration:
                 AssertionError,
             ) as e:
                 if log_func is not None:
-                    log_func(f"Failed to transfer autotune hint {i + 1}: {e}")
+                    log_func(f"Failed to transfer autotune seed config {i + 1}: {e}")
                 continue
             if normalized in seen:
                 continue
@@ -463,7 +463,7 @@ class ConfigGeneration:
         self,
         n: int,
         *,
-        config_hints: Sequence[Config] = (),
+        user_seed_configs: Sequence[Config] = (),
         log_func: Callable[[str], None] | None = None,
     ) -> list[FlatConfig]:
         if n <= 0:
@@ -471,10 +471,12 @@ class ConfigGeneration:
         default_flat = self.default_flat()
         result = [default_flat]
 
-        # Initial population order is default -> user hints -> compiler seeds
-        # -> random.  This preserves hint priority without dropping built-in
+        # Initial population order is default -> user seed configs -> compiler seeds
+        # -> random.  This preserves user seed priority without dropping built-in
         # backend/compiler seeds from ConfigSpec.autotune_seed_configs().
-        for flat, _config in self.hint_flat_config_pairs(config_hints, log_func):
+        for flat, _config in self.user_seed_flat_config_pairs(
+            user_seed_configs, log_func
+        ):
             if any(flat == existing for existing in result):
                 continue
             result.append(flat)
@@ -495,13 +497,13 @@ class ConfigGeneration:
         self,
         n: int,
         *,
-        config_hints: Sequence[Config] = (),
+        user_seed_configs: Sequence[Config] = (),
         log_func: Callable[[str], None] | None = None,
     ) -> list[Config]:
         result: list[Config] = []
         attempts = 0
         for flat in self.random_population_flat(
-            n, config_hints=config_hints, log_func=log_func
+            n, user_seed_configs=user_seed_configs, log_func=log_func
         ):
             try:
                 result.append(self.unflatten(flat))

@@ -128,7 +128,7 @@ class PatternSearch(PopulationBasedSearch):
             return pop
         return self.config_gen.random_population_flat(
             self.initial_population,
-            config_hints=self._autotune_hint_configs(),
+            user_seed_configs=self._autotune_seed_configs(),
             log_func=self.log,
         )
 

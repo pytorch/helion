@@ -145,19 +145,20 @@ class _CodeSentinel:
 _CODE_SENTINEL = _CodeSentinel()
 
 
-def normalize_autotune_hints(settings: Settings) -> tuple[Config, ...]:
-    """Return user-provided autotune hints from settings as concrete Configs."""
+def normalize_autotune_seed_configs(settings: Settings) -> tuple[Config, ...]:
+    """Return user-provided autotune seed configs from settings as concrete Configs."""
     from ..runtime.config import Config
 
-    hints = settings.autotune_hints
-    if hints is None:
+    seed_configs = settings.autotune_seed_configs
+    if seed_configs is None:
         return ()
-    if isinstance(hints, Config):
-        return (hints,)
-    if isinstance(hints, dict):
-        return (Config.from_dict(hints),)
+    if isinstance(seed_configs, Config):
+        return (seed_configs,)
+    if isinstance(seed_configs, dict):
+        return (Config.from_dict(seed_configs),)
     return tuple(
-        Config.from_dict(hint) if isinstance(hint, dict) else hint for hint in hints
+        Config.from_dict(seed_config) if isinstance(seed_config, dict) else seed_config
+        for seed_config in seed_configs
     )
 
 
@@ -551,9 +552,9 @@ class BaseSearch(BaseAutotuner):
         """
         raise NotImplementedError
 
-    def _autotune_hint_configs(self) -> Sequence[Config]:
-        """Return user-provided autotune hints normalized from settings."""
-        return normalize_autotune_hints(self.settings)
+    def _autotune_seed_configs(self) -> Sequence[Config]:
+        """Return user-provided autotune seed configs normalized from settings."""
+        return normalize_autotune_seed_configs(self.settings)
 
     def set_generation(self, generation: int) -> None:
         self._autotune_metrics.num_generations = generation
@@ -785,17 +786,17 @@ class PopulationBasedSearch(BaseSearch):
         result: list[FlatConfig] = [default_flat]
         self.log("Starting with default config")
 
-        # User hints are explicit requests, so try them before compiler-owned
+        # User seed configs are explicit requests, so try them before compiler-owned
         # seeds and cached configs while still deduplicating normalized configs.
-        for flat, transferred_config in self.config_gen.hint_flat_config_pairs(
-            self._autotune_hint_configs(), self.log
+        for flat, transferred_config in self.config_gen.user_seed_flat_config_pairs(
+            self._autotune_seed_configs(), self.log
         ):
             if transferred_config not in seen:
                 seen.add(transferred_config)
                 result.append(flat)
 
         # Compiler-owned seeds come from ConfigSpec.autotune_seed_configs();
-        # they encode backend/compiler heuristics and complement user hints.
+        # they encode backend/compiler heuristics and complement user seed configs.
         for flat, transferred_config in self.config_gen.seed_flat_config_pairs():
             if transferred_config not in seen:
                 seen.add(transferred_config)
