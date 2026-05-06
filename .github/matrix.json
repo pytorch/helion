@@ -93,6 +93,19 @@
       "triton-pin": "0d9283bf49"
     },
     {
+      "runner": "linux.idc.xpu",
+      "python-version": "3.12",
+      "ref-eager": false,
+      "image": "intelgpu/ubuntu-24.04-lts2:2523.40",
+      "runtime-version": "xpu",
+      "container-options": "--group-add 109 --device=/dev/mem --device=/dev/dri -e ZE_AFFINITY_MASK",
+      "pytorch-version": "pytorch-nightly",
+      "alias": "xpu",
+      "backend": "triton",
+      "triton-repo": "https://github.com/intel/intel-xpu-backend-for-triton.git",
+      "triton-pin": "8997b14d4d6580c401c842ea4fded92cdf7adaa8"
+    },
+    {
       "runner": "linux.rocm.gpu.ecosystem.gfx950.1",
       "python-version": "3.12",
       "ref-eager": false,
