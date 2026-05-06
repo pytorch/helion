@@ -220,6 +220,12 @@ def k(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 .. autofunction:: rand
 ```
 
+### rand4x()
+
+```{eval-rst}
+.. autofunction:: rand4x
+```
+
 ### randint()
 
 ```{eval-rst}
