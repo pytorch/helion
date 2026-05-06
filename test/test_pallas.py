@@ -1767,7 +1767,7 @@ class TestPallas(TestCase):
             return out
 
         x = torch.randn(128, 128, device=DEVICE, dtype=torch.float32)
-        code, _result = code_and_output(
+        code, result = code_and_output(
             fn,
             (x,),
             block_sizes=[32, 128, 128],
@@ -1778,6 +1778,8 @@ class TestPallas(TestCase):
         # rather than emit a pipeline arg for it.
         self.assertIn("pltpu.emit_pipeline", code)
         self.assertNotIn("_pipeline_arg_indices=[0", code)
+        expected = x + x.sum(dim=1, keepdim=True)
+        torch.testing.assert_close(result, expected)
 
     def test_fori_loop_per_tensor_dma_mixed(self) -> None:
         """A fori_loop body can mix DMA-aligned and DMA-unaligned tensors.
