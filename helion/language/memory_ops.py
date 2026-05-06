@@ -2172,6 +2172,7 @@ def _codegen_cute_store_tcgen05_tile(
                 tcgen05_value.tma_producer_state,
                 num_stages=tcgen05_value.ab_stage_count,
                 indent="    ",
+                skip_advances=tcgen05_value.skip_ab_producer_advance,
             )
         )
     if tcgen05_value.is_two_cta:

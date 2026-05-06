@@ -70,7 +70,28 @@ from helion._compiler.cute.matmul_utils import cute_resolve_active_matmul_k_bloc
 from helion._compiler.cute.matmul_utils import cute_static_k_invariant_extent
 from helion._compiler.cute.matmul_utils import cute_supports_scalar_matmul_fallback
 from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_AB_PRODUCER_ACQUIRE_MODE_CONFIG_KEY,
+)
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_AB_PRODUCER_ACQUIRE_MODE_SKIP,
+)
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_AB_PRODUCER_ADVANCE_MODE_CONFIG_KEY,
+)
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_AB_PRODUCER_ADVANCE_MODE_SKIP,
+)
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_ACC_PRODUCER_ADVANCE_MODE_CONFIG_KEY,
+)
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_ACC_PRODUCER_ADVANCE_MODE_SKIP,
+)
+from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_CLUSTER_M2_ONE_CTA_ROLE_LOCAL_CONFIG_KEY,
+)
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_DIAGNOSTIC_INVALID_OUTPUT_CONFIG_KEY,
 )
 from helion._compiler.device_ir import ForLoopGraphInfo
 from helion._compiler.device_ir import RootGraphInfo
@@ -87,6 +108,7 @@ from helion._testing import DEVICE
 from helion._testing import default_cute_mma_support
 from helion._testing import onlyBackends
 from helion._testing import patch_cute_mma_support
+from helion.autotuner.config_spec import ConfigSpec
 import helion.language as hl
 from helion.language import _tracing_ops
 from helion.language._tracing_ops import _mask_to
@@ -2927,6 +2949,163 @@ class TestCuteLowerings(unittest.TestCase):
         self.assertNotIn("cutlass.pipeline.pipeline_init_wait(", code)
         self.assertNotIn("while tcgen05_work_tile_valid", code)
         self.assertIn(Tcgen05PersistentProgramIDs._MULTI_TILE_GUARD_TOTAL_VAR, code)
+
+    def _cluster_m2_cta_group_one_bridge_diagnostic_code(
+        self, mode_key: str, mode_value: str
+    ) -> str:
+        from helion._compiler.program_id import Tcgen05PersistentProgramIDs
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_cluster_m2_bridge_diagnostic(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        args = (
+            torch.randn(256, 128, device=DEVICE, dtype=torch.float16),
+            torch.randn(128, 256, device=DEVICE, dtype=torch.float16),
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_cluster_m2_bridge_diagnostic.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            unsafe_cfg = _make_tcgen05_cluster_m2_cta_group_one_bridge_config(
+                **{
+                    TCGEN05_CLUSTER_M2_ONE_CTA_ROLE_LOCAL_CONFIG_KEY: True,
+                    mode_key: mode_value,
+                }
+            )
+            with self.assertRaisesRegex(
+                exc.InvalidConfig,
+                "tcgen05_diagnostic_invalid_output",
+            ):
+                bound.to_triton_code(unsafe_cfg)
+            guarded_cfg = _make_tcgen05_cluster_m2_cta_group_one_bridge_config(
+                **{
+                    mode_key: mode_value,
+                    TCGEN05_DIAGNOSTIC_INVALID_OUTPUT_CONFIG_KEY: True,
+                }
+            )
+            with self.assertRaisesRegex(
+                exc.BackendUnsupported,
+                "128x256x128 bridge shape",
+            ):
+                bound.to_triton_code(guarded_cfg)
+            cfg = _make_tcgen05_cluster_m2_cta_group_one_bridge_config(
+                **{
+                    TCGEN05_CLUSTER_M2_ONE_CTA_ROLE_LOCAL_CONFIG_KEY: True,
+                    mode_key: mode_value,
+                    TCGEN05_DIAGNOSTIC_INVALID_OUTPUT_CONFIG_KEY: True,
+                }
+            )
+            bound.set_config(cfg)
+            code = bound.to_triton_code(cfg)
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "supports runtime execution only",
+            ):
+                bound(*args)
+
+        self.assertIn("_helion_cute_cluster_shape = (2, 1, 1)", code)
+        self.assertIn("cute.nvgpu.tcgen05.CtaGroup.ONE", code)
+        self.assertIn(Tcgen05PersistentProgramIDs._MULTI_TILE_GUARD_TOTAL_VAR, code)
+        return code
+
+    def test_tcgen05_cluster_m2_cta_group_one_bridge_can_skip_acc_advance(
+        self,
+    ) -> None:
+        """Bridge diagnostic removes only the acc producer advance edge."""
+
+        code = self._cluster_m2_cta_group_one_bridge_diagnostic_code(
+            TCGEN05_ACC_PRODUCER_ADVANCE_MODE_CONFIG_KEY,
+            TCGEN05_ACC_PRODUCER_ADVANCE_MODE_SKIP,
+        )
+        self.assertIn("tcgen05_role_local_1_work_tile", code)
+        self.assertIn(
+            "tcgen05_acc_pipeline.producer_commit(tcgen05_acc_producer_state)",
+            code,
+        )
+        self.assertNotIn("tcgen05_acc_producer_state.advance()", code)
+
+    def test_tcgen05_cluster_m2_cta_group_one_bridge_can_skip_ab_acquire(
+        self,
+    ) -> None:
+        """Bridge diagnostic removes only AB producer acquire edges."""
+
+        code = self._cluster_m2_cta_group_one_bridge_diagnostic_code(
+            TCGEN05_AB_PRODUCER_ACQUIRE_MODE_CONFIG_KEY,
+            TCGEN05_AB_PRODUCER_ACQUIRE_MODE_SKIP,
+        )
+        self.assertNotIn("tcgen05_ab_pipeline.producer_acquire(", code)
+        self.assertNotIn("tcgen05_ab_pipeline.producer_try_acquire(", code)
+        self.assertIn("tcgen05_ab_pipeline.producer_get_barrier(", code)
+        self.assertIn("tcgen05_ab_pipeline.producer_commit(", code)
+        self.assertIn("tcgen05_ab_producer_state.advance()", code)
+
+    def test_tcgen05_ab_producer_advance_mode_config_validation(self) -> None:
+        """Invalid-output AB advance diagnostic is rejected unless opted in."""
+
+        config_spec = ConfigSpec(backend=CuteBackend())
+        with self.assertRaisesRegex(
+            exc.InvalidConfig,
+            "tcgen05-enabled CuTe matmul kernels",
+        ):
+            config_spec.normalize(
+                {
+                    TCGEN05_AB_PRODUCER_ADVANCE_MODE_CONFIG_KEY: (
+                        TCGEN05_AB_PRODUCER_ADVANCE_MODE_SKIP
+                    ),
+                }
+            )
+
+        config_spec.cute_tcgen05_search_enabled = True
+        with self.assertRaisesRegex(exc.InvalidConfig, "must be one of"):
+            config_spec.normalize(
+                {
+                    TCGEN05_AB_PRODUCER_ADVANCE_MODE_CONFIG_KEY: "invalid",
+                    TCGEN05_DIAGNOSTIC_INVALID_OUTPUT_CONFIG_KEY: True,
+                }
+            )
+        with self.assertRaisesRegex(
+            exc.InvalidConfig,
+            "tcgen05_diagnostic_invalid_output",
+        ):
+            config_spec.normalize(
+                {
+                    TCGEN05_AB_PRODUCER_ADVANCE_MODE_CONFIG_KEY: (
+                        TCGEN05_AB_PRODUCER_ADVANCE_MODE_SKIP
+                    ),
+                }
+            )
+
+    def test_tcgen05_cluster_m2_cta_group_one_bridge_can_skip_ab_advance(
+        self,
+    ) -> None:
+        """Bridge diagnostic removes every AB producer advance edge."""
+
+        code = self._cluster_m2_cta_group_one_bridge_diagnostic_code(
+            TCGEN05_AB_PRODUCER_ADVANCE_MODE_CONFIG_KEY,
+            TCGEN05_AB_PRODUCER_ADVANCE_MODE_SKIP,
+        )
+        self.assertIn("tcgen05_ab_pipeline.producer_acquire(", code)
+        self.assertIn("tcgen05_ab_pipeline.producer_get_barrier(", code)
+        self.assertIn("tcgen05_ab_pipeline.producer_commit(", code)
+        self.assertNotIn("tcgen05_ab_producer_state.advance()", code)
+        self.assertNotIn(
+            "tcgen05_ab_pipeline.producer_tail(tcgen05_ab_producer_state)",
+            code,
+        )
+        self.assertNotIn("tcgen05_ab_producer_state._count", code)
+        self.assertNotIn("tcgen05_ab_producer_state._index", code)
+        self.assertNotIn("tcgen05_ab_producer_state._phase", code)
+        self.assertIn("tcgen05_acc_producer_state.advance()", code)
 
     def test_tcgen05_cluster_m2_cta_group_one_bridge_role_local_shape_guard(
         self,
@@ -6686,6 +6865,31 @@ class TestCuteDslCompat(unittest.TestCase):
         self.assertNotIn("if True", src)
         self.assertIn("ab_pipeline.producer_acquire(ab_state)", src)
 
+    def test_tma_umma_tail_can_skip_state_advances(self) -> None:
+        from helion._compiler.cute import cutedsl_compat
+
+        with (
+            patch.object(
+                cutedsl_compat, "cutedsl_has_opresultlist_fix", return_value=True
+            ),
+            patch.object(
+                cutedsl_compat,
+                "cutedsl_tma_umma_tail_has_peer_cta_semantics",
+                return_value=True,
+            ),
+        ):
+            src = cutedsl_compat.emit_producer_tail_tma_umma(
+                "ab_pipeline",
+                "ab_state",
+                num_stages=3,
+                skip_advances=True,
+            )
+
+        self.assertEqual(src, "ab_pipeline.producer_acquire(ab_state)")
+        self.assertNotIn("producer_tail", src)
+        self.assertNotIn("ab_state._count", src)
+        self.assertNotIn("ab_state.advance", src)
+
     def test_tma_umma_tail_detector_allows_state_rename(self) -> None:
         from helion._compiler.cute import cutedsl_compat
 
@@ -8028,6 +8232,8 @@ class TestPerKiterTmaBuilders(unittest.TestCase):
             use_tma_b_mcast_mask=use_tma_b_mcast_mask,
             use_tma_a=use_tma_a,
             use_tma_b=use_tma_b,
+            skip_producer_acquire=False,
+            skip_producer_advance=False,
             exec_active="exec_active",
             scalar_load_a=self._scalar_load_a(),
             scalar_load_b=self._scalar_load_b(),
@@ -8412,6 +8618,8 @@ class TestInitialPrefetchTmaBuilder(unittest.TestCase):
             tma_b_mcast_mask="b_mcast_mask",
             is_two_cta=is_two_cta,
             use_tma_b_mcast_mask=use_tma_b_mcast_mask,
+            skip_producer_acquire=False,
+            skip_producer_advance=False,
         )
 
     @staticmethod

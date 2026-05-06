@@ -44,6 +44,15 @@ from .layout import MatmulExecutionKind
 from .layout import MatmulExecutionPlan
 from .matmul_utils import analyze_direct_grouped_n_loads
 from .mma_support import get_cute_mma_support
+from .tcgen05_constants import TCGEN05_AB_PRODUCER_ACQUIRE_MODE_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_AB_PRODUCER_ACQUIRE_MODE_NORMAL
+from .tcgen05_constants import TCGEN05_AB_PRODUCER_ACQUIRE_MODE_SKIP
+from .tcgen05_constants import TCGEN05_AB_PRODUCER_ADVANCE_MODE_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_AB_PRODUCER_ADVANCE_MODE_NORMAL
+from .tcgen05_constants import TCGEN05_AB_PRODUCER_ADVANCE_MODE_SKIP
+from .tcgen05_constants import TCGEN05_ACC_PRODUCER_ADVANCE_MODE_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_ACC_PRODUCER_ADVANCE_MODE_NORMAL
+from .tcgen05_constants import TCGEN05_ACC_PRODUCER_ADVANCE_MODE_SKIP
 from .tcgen05_constants import TCGEN05_ACC_PRODUCER_MODE_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_ACC_PRODUCER_MODE_NORMAL
 from .tcgen05_constants import TCGEN05_ACC_PRODUCER_MODE_SKIP_UMMA
@@ -732,6 +741,8 @@ class _PerKiterTmaArgs:
     use_tma_b_mcast_mask: bool
     use_tma_a: bool
     use_tma_b: bool
+    skip_producer_acquire: bool
+    skip_producer_advance: bool
     exec_active: str
     scalar_load_a: ast.stmt
     scalar_load_b: ast.stmt
@@ -814,17 +825,25 @@ def _build_kloop_pipeline_producer_if(
     )
     # CtaGroup.TWO uses CTA-rank-specific TMA partitions, so both CTAs issue
     # these copies; PipelineTmaUmma gates the full-barrier tx setup internally.
-    src = (
-        f"if {' and '.join(predicate_terms)}:\n"
-        f"    {args.tma_producer_try_token} = "
-        f"{args.tma_pipeline}.producer_try_acquire({args.tma_producer_state})\n"
-        f"    {args.tma_pipeline}.producer_acquire("
-        f"{args.tma_producer_state}, {args.tma_producer_try_token})\n"
+    src = f"if {' and '.join(predicate_terms)}:\n"
+    producer_advance_src = (
+        emit_pipeline_advance(args.tma_producer_state, indent="    ")
+        if not args.skip_producer_advance
+        else ""
+    )
+    if not args.skip_producer_acquire:
+        src += (
+            f"    {args.tma_producer_try_token} = "
+            f"{args.tma_pipeline}.producer_try_acquire({args.tma_producer_state})\n"
+            f"    {args.tma_pipeline}.producer_acquire("
+            f"{args.tma_producer_state}, {args.tma_producer_try_token})\n"
+        )
+    src += (
         f"    {args.tma_barrier_ptr} = "
         f"{args.tma_pipeline}.producer_get_barrier({args.tma_producer_state})\n"
         + copy_src
         + f"    {args.tma_pipeline}.producer_commit({args.tma_producer_state})\n"
-        + emit_pipeline_advance(args.tma_producer_state, indent="    ")
+        + producer_advance_src
     )
     return statement_from_string(src)
 
@@ -1006,9 +1025,10 @@ def _build_kloop_non_pipeline_producer_if(
     copy_src = _kloop_tma_copy_a_src(
         args, k_offset=args.tma_k_tile
     ) + _kloop_tma_copy_b_src(args, k_offset=args.tma_k_tile)
-    src = (
-        f"if {' and '.join(predicate_terms)}:\n"
-        f"    {args.tma_pipeline}.producer_acquire({args.tma_producer_state})\n"
+    src = f"if {' and '.join(predicate_terms)}:\n"
+    if not args.skip_producer_acquire:
+        src += f"    {args.tma_pipeline}.producer_acquire({args.tma_producer_state})\n"
+    src += (
         f"    {args.tma_barrier_ptr} = "
         f"{args.tma_pipeline}.producer_get_barrier({args.tma_producer_state})\n"
         + copy_src
@@ -1057,17 +1077,22 @@ def _build_kloop_non_pipeline_release_if(args: _PerKiterTmaArgs) -> ast.stmt:
     """Per-K-iter consumer release ``if`` for the non-pipelined branch.
 
     CTA-wide ``sync_threads()`` runs first so every warp sees the
-    consumer wait completed; single-stage means BOTH producer and
-    consumer state must advance here.
+    consumer wait completed; single-stage means both producer and
+    consumer state normally advance here. The producer advance is omitted
+    only by the guarded invalid-output bridge diagnostic.
     """
+    producer_advance_src = (
+        emit_pipeline_advance(args.tma_producer_state, indent="    ") + "\n"
+        if not args.skip_producer_advance
+        else ""
+    )
     src = (
         f"if {args.tma_full_tile}:\n"
         "    cute.arch.sync_threads()\n"
         f"    if {args.exec_active}:\n"
         "        cute.arch.sync_warp()\n"
         f"        {args.tma_pipeline}.consumer_release({args.tma_consumer_state})\n"
-        + emit_pipeline_advance(args.tma_producer_state, indent="    ")
-        + "\n"
+        + producer_advance_src
         + emit_pipeline_advance(args.tma_consumer_state, indent="    ")
         + "\n"
         "else:\n"
@@ -1103,6 +1128,8 @@ class _InitialPrefetchTmaArgs:
     tma_b_mcast_mask: str
     is_two_cta: bool
     use_tma_b_mcast_mask: bool
+    skip_producer_acquire: bool
+    skip_producer_advance: bool
 
 
 def _initial_prefetch_copy_a_src(
@@ -1154,22 +1181,30 @@ def _build_initial_prefetch_if(
     {args.tma_warp}``: stage-0 callers pass
     ``[tma_initial_full_tile]``; stage-(N-1) callers (only when
     ``ab_stage_count > 1``) extend with ``tma_initial_next_full_tile``.
-    The body performs ``producer_acquire / get_barrier / copy A /
-    copy B / producer_commit / advance``. Caller passes a literal
+    The body performs optional ``producer_acquire``, then
+    ``get_barrier / copy A / copy B / producer_commit`` and optional
+    producer-state ``advance``. The optional edges are omitted only by
+    guarded invalid-output bridge diagnostics. Caller passes a literal
     ``cutlass.Int32(stage_idx)`` for ``k_offset``.
     """
     predicate = " and ".join([*full_tile_gates, args.tma_warp])
+    producer_advance_src = (
+        emit_pipeline_advance(args.tma_producer_state, indent="    ")
+        if not args.skip_producer_advance
+        else ""
+    )
     copy_src = _initial_prefetch_copy_a_src(
         args, k_offset=k_offset
     ) + _initial_prefetch_copy_b_src(args, k_offset=k_offset)
-    src = (
-        f"if {predicate}:\n"
-        f"    {args.tma_pipeline}.producer_acquire({args.tma_producer_state})\n"
+    src = f"if {predicate}:\n"
+    if not args.skip_producer_acquire:
+        src += f"    {args.tma_pipeline}.producer_acquire({args.tma_producer_state})\n"
+    src += (
         f"    {args.tma_barrier_ptr} = "
         f"{args.tma_pipeline}.producer_get_barrier({args.tma_producer_state})\n"
         + copy_src
         + f"    {args.tma_pipeline}.producer_commit({args.tma_producer_state})\n"
-        + emit_pipeline_advance(args.tma_producer_state, indent="    ")
+        + producer_advance_src
     )
     return statement_from_string(src)
 
@@ -1445,6 +1480,57 @@ def _emit_mma_pipeline(
             "cute",
             f"{TCGEN05_ACC_PRODUCER_MODE_CONFIG_KEY}="
             f"{TCGEN05_ACC_PRODUCER_MODE_SKIP_UMMA!r} requires tcgen05 MMA codegen",
+        )
+    tcgen05_acc_producer_advance_mode = df.config.get(
+        TCGEN05_ACC_PRODUCER_ADVANCE_MODE_CONFIG_KEY,
+        TCGEN05_ACC_PRODUCER_ADVANCE_MODE_NORMAL,
+    )
+    diagnose_skip_acc_producer_advance = (
+        tcgen05_acc_producer_advance_mode == TCGEN05_ACC_PRODUCER_ADVANCE_MODE_SKIP
+    )
+    if (
+        diagnose_skip_acc_producer_advance
+        and not tcgen05_cluster_m2_one_cta_role_local_bridge
+    ):
+        raise exc.BackendUnsupported(
+            "cute",
+            f"{TCGEN05_ACC_PRODUCER_ADVANCE_MODE_CONFIG_KEY}="
+            f"{TCGEN05_ACC_PRODUCER_ADVANCE_MODE_SKIP!r} requires the guarded "
+            "cluster_m=2, CtaGroup.ONE, 128x256x128 bridge shape",
+        )
+    tcgen05_ab_producer_acquire_mode = df.config.get(
+        TCGEN05_AB_PRODUCER_ACQUIRE_MODE_CONFIG_KEY,
+        TCGEN05_AB_PRODUCER_ACQUIRE_MODE_NORMAL,
+    )
+    diagnose_skip_ab_producer_acquire = (
+        tcgen05_ab_producer_acquire_mode == TCGEN05_AB_PRODUCER_ACQUIRE_MODE_SKIP
+    )
+    if (
+        diagnose_skip_ab_producer_acquire
+        and not tcgen05_cluster_m2_one_cta_role_local_bridge
+    ):
+        raise exc.BackendUnsupported(
+            "cute",
+            f"{TCGEN05_AB_PRODUCER_ACQUIRE_MODE_CONFIG_KEY}="
+            f"{TCGEN05_AB_PRODUCER_ACQUIRE_MODE_SKIP!r} requires the guarded "
+            "cluster_m=2, CtaGroup.ONE, 128x256x128 bridge shape",
+        )
+    tcgen05_ab_producer_advance_mode = df.config.get(
+        TCGEN05_AB_PRODUCER_ADVANCE_MODE_CONFIG_KEY,
+        TCGEN05_AB_PRODUCER_ADVANCE_MODE_NORMAL,
+    )
+    diagnose_skip_ab_producer_advance = (
+        tcgen05_ab_producer_advance_mode == TCGEN05_AB_PRODUCER_ADVANCE_MODE_SKIP
+    )
+    if (
+        diagnose_skip_ab_producer_advance
+        and not tcgen05_cluster_m2_one_cta_role_local_bridge
+    ):
+        raise exc.BackendUnsupported(
+            "cute",
+            f"{TCGEN05_AB_PRODUCER_ADVANCE_MODE_CONFIG_KEY}="
+            f"{TCGEN05_AB_PRODUCER_ADVANCE_MODE_SKIP!r} requires the guarded "
+            "cluster_m=2, CtaGroup.ONE, 128x256x128 bridge shape",
         )
     # Static-full CtaGroup.TWO keeps a prefetched AB consumer token live
     # across the accumulator acquire and each K-loop issue. CtaGroup.ONE
@@ -2380,6 +2466,8 @@ def _emit_mma_pipeline(
                     tma_b_mcast_mask=tma_b_mcast_mask,
                     is_two_cta=tcgen05_is_two_cta,
                     use_tma_b_mcast_mask=tcgen05_use_tma_b_mcast_mask,
+                    skip_producer_acquire=diagnose_skip_ab_producer_acquire,
+                    skip_producer_advance=diagnose_skip_ab_producer_advance,
                 )
                 _emit_per_tile(
                     f"{tma_initial_full_tile} = "
@@ -2634,6 +2722,8 @@ def _emit_mma_pipeline(
                 use_tma_b_mcast_mask=tcgen05_use_tma_b_mcast_mask,
                 use_tma_a=tcgen05_use_tma_a,
                 use_tma_b=tcgen05_use_tma_b,
+                skip_producer_acquire=diagnose_skip_ab_producer_acquire,
+                skip_producer_advance=diagnose_skip_ab_producer_advance,
                 exec_active=tcgen05_plan.exec_active,
                 scalar_load_a=scalar_load_a,
                 scalar_load_b=scalar_load_b,
@@ -2939,13 +3029,16 @@ def _emit_mma_pipeline(
             per_tile_stmts.append(suffix_stmt)
             if tcgen05_use_role_local_mma_exec:
                 mma_exec_role_stmts.append(suffix_stmt)
-            advance_stmt = statement_from_string(
-                emit_pipeline_advance(tcgen05_plan.acc_producer_state)
-            )
-            suffix.append(advance_stmt)
-            per_tile_stmts.append(advance_stmt)
-            if tcgen05_use_role_local_mma_exec:
-                mma_exec_role_stmts.append(advance_stmt)
+            # Bridge-only invalid-output diagnostic: preserve producer_commit
+            # while removing only the acc producer PipelineState advance edge.
+            if not diagnose_skip_acc_producer_advance:
+                advance_stmt = statement_from_string(
+                    emit_pipeline_advance(tcgen05_plan.acc_producer_state)
+                )
+                suffix.append(advance_stmt)
+                per_tile_stmts.append(advance_stmt)
+                if tcgen05_use_role_local_mma_exec:
+                    mma_exec_role_stmts.append(advance_stmt)
             # The tcgen05 epilogue + allocator teardown is emitted by
             # `_codegen_cute_store_tcgen05_tile` when the kernel stores
             # `out[tile_m, tile_n] = result`. Static-full flat and validated
@@ -3000,6 +3093,7 @@ def _emit_mma_pipeline(
                 use_tma_store_epilogue=tcgen05_use_tma_store_epilogue,
                 ab_stage_count=tcgen05_ab_stage_count_value,
                 acc_stage_count=tcgen05_acc_stage_count_value,
+                skip_ab_producer_advance=diagnose_skip_ab_producer_advance,
             ),
         )
     else:

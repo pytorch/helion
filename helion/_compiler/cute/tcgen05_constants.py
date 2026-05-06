@@ -62,6 +62,33 @@ TCGEN05_ACC_PRODUCER_MODES = (
     TCGEN05_ACC_PRODUCER_MODE_NORMAL,
     TCGEN05_ACC_PRODUCER_MODE_SKIP_UMMA,
 )
+TCGEN05_ACC_PRODUCER_ADVANCE_MODE_CONFIG_KEY = "tcgen05_acc_producer_advance_mode"
+TCGEN05_ACC_PRODUCER_ADVANCE_MODE_NORMAL = "normal"
+# Invalid-output diagnostic for the guarded clustered CtaGroup.ONE bridge:
+# removes only the accumulator producer PipelineState advance edge.
+TCGEN05_ACC_PRODUCER_ADVANCE_MODE_SKIP = "skip"
+TCGEN05_ACC_PRODUCER_ADVANCE_MODES = (
+    TCGEN05_ACC_PRODUCER_ADVANCE_MODE_NORMAL,
+    TCGEN05_ACC_PRODUCER_ADVANCE_MODE_SKIP,
+)
+TCGEN05_AB_PRODUCER_ACQUIRE_MODE_CONFIG_KEY = "tcgen05_ab_producer_acquire_mode"
+TCGEN05_AB_PRODUCER_ACQUIRE_MODE_NORMAL = "normal"
+# Invalid-output diagnostic for the guarded clustered CtaGroup.ONE bridge:
+# removes only AB producer acquire/try-acquire edges.
+TCGEN05_AB_PRODUCER_ACQUIRE_MODE_SKIP = "skip"
+TCGEN05_AB_PRODUCER_ACQUIRE_MODES = (
+    TCGEN05_AB_PRODUCER_ACQUIRE_MODE_NORMAL,
+    TCGEN05_AB_PRODUCER_ACQUIRE_MODE_SKIP,
+)
+TCGEN05_AB_PRODUCER_ADVANCE_MODE_CONFIG_KEY = "tcgen05_ab_producer_advance_mode"
+TCGEN05_AB_PRODUCER_ADVANCE_MODE_NORMAL = "normal"
+# Invalid-output diagnostic for the guarded clustered CtaGroup.ONE bridge:
+# removes only the AB producer PipelineState advance edge.
+TCGEN05_AB_PRODUCER_ADVANCE_MODE_SKIP = "skip"
+TCGEN05_AB_PRODUCER_ADVANCE_MODES = (
+    TCGEN05_AB_PRODUCER_ADVANCE_MODE_NORMAL,
+    TCGEN05_AB_PRODUCER_ADVANCE_MODE_SKIP,
+)
 TCGEN05_CUBIN_LINEINFO_CONFIG_KEY = "tcgen05_cubin_lineinfo"
 # Diagnostic-only codegen proof for the guarded clustered CtaGroup.ONE bridge.
 TCGEN05_CLUSTER_M2_ONE_CTA_ROLE_LOCAL_CONFIG_KEY = (

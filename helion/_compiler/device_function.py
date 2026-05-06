@@ -234,6 +234,7 @@ class CuteTcgen05StoreValue:
     use_tma_store_epilogue: bool = False
     ab_stage_count: int = 0
     acc_stage_count: int = 0
+    skip_ab_producer_advance: bool = False
 
 
 @dataclasses.dataclass(frozen=True)

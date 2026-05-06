@@ -22,6 +22,21 @@ from .._compat import supports_amd_cdna_tunables
 from .._compat import supports_maxnreg
 from .._compat import supports_tensor_descriptor
 from .._compat import warps_to_threads
+from .._compiler.cute.tcgen05_constants import (
+    TCGEN05_AB_PRODUCER_ACQUIRE_MODE_CONFIG_KEY,
+)
+from .._compiler.cute.tcgen05_constants import TCGEN05_AB_PRODUCER_ACQUIRE_MODE_NORMAL
+from .._compiler.cute.tcgen05_constants import TCGEN05_AB_PRODUCER_ACQUIRE_MODES
+from .._compiler.cute.tcgen05_constants import (
+    TCGEN05_AB_PRODUCER_ADVANCE_MODE_CONFIG_KEY,
+)
+from .._compiler.cute.tcgen05_constants import TCGEN05_AB_PRODUCER_ADVANCE_MODE_NORMAL
+from .._compiler.cute.tcgen05_constants import TCGEN05_AB_PRODUCER_ADVANCE_MODES
+from .._compiler.cute.tcgen05_constants import (
+    TCGEN05_ACC_PRODUCER_ADVANCE_MODE_CONFIG_KEY,
+)
+from .._compiler.cute.tcgen05_constants import TCGEN05_ACC_PRODUCER_ADVANCE_MODE_NORMAL
+from .._compiler.cute.tcgen05_constants import TCGEN05_ACC_PRODUCER_ADVANCE_MODES
 from .._compiler.cute.tcgen05_constants import TCGEN05_ACC_PRODUCER_MODE_CONFIG_KEY
 from .._compiler.cute.tcgen05_constants import TCGEN05_ACC_PRODUCER_MODE_NORMAL
 from .._compiler.cute.tcgen05_constants import TCGEN05_ACC_PRODUCER_MODES
@@ -152,6 +167,9 @@ _BASE_BACKEND_TUNABLE_KEYS: frozenset[str] = frozenset(
 )
 _BACKEND_DIAGNOSTIC_CONFIG_KEYS: frozenset[str] = frozenset(
     {
+        TCGEN05_AB_PRODUCER_ACQUIRE_MODE_CONFIG_KEY,
+        TCGEN05_AB_PRODUCER_ADVANCE_MODE_CONFIG_KEY,
+        TCGEN05_ACC_PRODUCER_ADVANCE_MODE_CONFIG_KEY,
         TCGEN05_ACC_PRODUCER_MODE_CONFIG_KEY,
         TCGEN05_CLUSTER_M2_ONE_CTA_ROLE_LOCAL_CONFIG_KEY,
         TCGEN05_CUBIN_LINEINFO_CONFIG_KEY,
@@ -1085,74 +1103,67 @@ class ConfigSpec:
                         f"{TCGEN05_DIAGNOSTIC_INVALID_OUTPUT_CONFIG_KEY} must be "
                         "a boolean"
                     )
-        if TCGEN05_C_STORE_MODE_CONFIG_KEY in config:
+
+        def validate_tcgen05_diagnostic_mode(
+            key: str,
+            modes: tuple[str, ...],
+            normal_mode: str,
+        ) -> None:
+            if key not in config:
+                return
             if not self.cute_tcgen05_search_enabled:
                 if _fix_invalid:
-                    config.pop(TCGEN05_C_STORE_MODE_CONFIG_KEY, None)
+                    config.pop(key, None)
                 else:
                     raise InvalidConfig(
-                        f"{TCGEN05_C_STORE_MODE_CONFIG_KEY} is only "
-                        "supported for tcgen05-enabled CuTe matmul kernels"
+                        f"{key} is only supported for tcgen05-enabled CuTe "
+                        "matmul kernels"
                     )
-            elif config[TCGEN05_C_STORE_MODE_CONFIG_KEY] not in TCGEN05_C_STORE_MODES:
+            elif config[key] not in modes:
                 if _fix_invalid:
-                    config.pop(TCGEN05_C_STORE_MODE_CONFIG_KEY, None)
+                    config.pop(key, None)
                 else:
                     raise InvalidConfig(
-                        f"{TCGEN05_C_STORE_MODE_CONFIG_KEY} must be one "
-                        f"of {TCGEN05_C_STORE_MODES!r}, got "
-                        f"{config[TCGEN05_C_STORE_MODE_CONFIG_KEY]!r}"
+                        f"{key} must be one of {modes!r}, got {config[key]!r}"
                     )
             elif (
-                config[TCGEN05_C_STORE_MODE_CONFIG_KEY] != TCGEN05_C_STORE_MODE_NORMAL
+                config[key] != normal_mode
                 and config.get(TCGEN05_DIAGNOSTIC_INVALID_OUTPUT_CONFIG_KEY) is not True
             ):
                 if _fix_invalid:
-                    config.pop(TCGEN05_C_STORE_MODE_CONFIG_KEY, None)
+                    config.pop(key, None)
                 else:
                     raise InvalidConfig(
-                        f"{TCGEN05_C_STORE_MODE_CONFIG_KEY}="
-                        f"{config[TCGEN05_C_STORE_MODE_CONFIG_KEY]!r} changes "
-                        "output correctness; set "
+                        f"{key}={config[key]!r} changes output correctness; set "
                         f"{TCGEN05_DIAGNOSTIC_INVALID_OUTPUT_CONFIG_KEY}=True "
                         "only for diagnostic invalid-output runs"
                     )
-        if TCGEN05_ACC_PRODUCER_MODE_CONFIG_KEY in config:
-            if not self.cute_tcgen05_search_enabled:
-                if _fix_invalid:
-                    config.pop(TCGEN05_ACC_PRODUCER_MODE_CONFIG_KEY, None)
-                else:
-                    raise InvalidConfig(
-                        f"{TCGEN05_ACC_PRODUCER_MODE_CONFIG_KEY} is only "
-                        "supported for tcgen05-enabled CuTe matmul kernels"
-                    )
-            elif (
-                config[TCGEN05_ACC_PRODUCER_MODE_CONFIG_KEY]
-                not in TCGEN05_ACC_PRODUCER_MODES
-            ):
-                if _fix_invalid:
-                    config.pop(TCGEN05_ACC_PRODUCER_MODE_CONFIG_KEY, None)
-                else:
-                    raise InvalidConfig(
-                        f"{TCGEN05_ACC_PRODUCER_MODE_CONFIG_KEY} must be one "
-                        f"of {TCGEN05_ACC_PRODUCER_MODES!r}, got "
-                        f"{config[TCGEN05_ACC_PRODUCER_MODE_CONFIG_KEY]!r}"
-                    )
-            elif (
-                config[TCGEN05_ACC_PRODUCER_MODE_CONFIG_KEY]
-                != TCGEN05_ACC_PRODUCER_MODE_NORMAL
-                and config.get(TCGEN05_DIAGNOSTIC_INVALID_OUTPUT_CONFIG_KEY) is not True
-            ):
-                if _fix_invalid:
-                    config.pop(TCGEN05_ACC_PRODUCER_MODE_CONFIG_KEY, None)
-                else:
-                    raise InvalidConfig(
-                        f"{TCGEN05_ACC_PRODUCER_MODE_CONFIG_KEY}="
-                        f"{config[TCGEN05_ACC_PRODUCER_MODE_CONFIG_KEY]!r} "
-                        "changes output correctness; set "
-                        f"{TCGEN05_DIAGNOSTIC_INVALID_OUTPUT_CONFIG_KEY}=True "
-                        "only for diagnostic invalid-output runs"
-                    )
+
+        validate_tcgen05_diagnostic_mode(
+            TCGEN05_C_STORE_MODE_CONFIG_KEY,
+            TCGEN05_C_STORE_MODES,
+            TCGEN05_C_STORE_MODE_NORMAL,
+        )
+        validate_tcgen05_diagnostic_mode(
+            TCGEN05_ACC_PRODUCER_MODE_CONFIG_KEY,
+            TCGEN05_ACC_PRODUCER_MODES,
+            TCGEN05_ACC_PRODUCER_MODE_NORMAL,
+        )
+        validate_tcgen05_diagnostic_mode(
+            TCGEN05_ACC_PRODUCER_ADVANCE_MODE_CONFIG_KEY,
+            TCGEN05_ACC_PRODUCER_ADVANCE_MODES,
+            TCGEN05_ACC_PRODUCER_ADVANCE_MODE_NORMAL,
+        )
+        validate_tcgen05_diagnostic_mode(
+            TCGEN05_AB_PRODUCER_ACQUIRE_MODE_CONFIG_KEY,
+            TCGEN05_AB_PRODUCER_ACQUIRE_MODES,
+            TCGEN05_AB_PRODUCER_ACQUIRE_MODE_NORMAL,
+        )
+        validate_tcgen05_diagnostic_mode(
+            TCGEN05_AB_PRODUCER_ADVANCE_MODE_CONFIG_KEY,
+            TCGEN05_AB_PRODUCER_ADVANCE_MODES,
+            TCGEN05_AB_PRODUCER_ADVANCE_MODE_NORMAL,
+        )
         if TCGEN05_CUBIN_LINEINFO_CONFIG_KEY in config:
             if not self.cute_tcgen05_search_enabled:
                 if _fix_invalid:
