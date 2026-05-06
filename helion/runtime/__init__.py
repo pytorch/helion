@@ -657,7 +657,7 @@ def _pallas_build_callable(
     for out_idx, orig_pos in enumerate(_output_indices):
         if orig_pos in arg_to_tensor_pos:
             call_aliases[arg_to_tensor_pos[orig_pos]] = out_idx
-
+    jax.config.update("jax_export_ignore_forward_compatibility", True)
     jax_callable = JaxCallable(
         name=kernel_name,
         jit_fn=jax.jit(jit_fn),
