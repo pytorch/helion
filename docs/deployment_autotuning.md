@@ -442,3 +442,21 @@ environment altogether, embedding the generated kernel in a custom
 runtime.  The Triton kernels could then be compiled down into PTX/cubins
 to further remove Python from the critical path, but details on this
 are beyond the scope of this document.
+
+## Ahead-of-Time Heuristic Tuning
+
+If your service handles many input shapes and you want zero-cost
+per-shape config selection at runtime — no autotuner, no benchmark
+sweep — Helion provides an offline workflow that distills a tuned shape
+sweep into a small decision-tree heuristic.  The heuristic file is
+committed alongside your kernel and loaded automatically at runtime
+based on the device's compute capability (with fallback to older
+compatible architectures).
+
+See {doc}`aot_autotuning` for the
+`@helion.experimental.aot_kernel` decorator, the three-phase
+`collect → measure → evaluate` runner, the heuristic file format and
+generated artifacts, and the runtime compute-capability fallback rules.
+The pretuned [`tutorials/`](https://github.com/pytorch/helion/tree/main/tutorials)
+kernels use this workflow end-to-end and ship `sm100` heuristic files
+that you can use as templates.
