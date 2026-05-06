@@ -929,6 +929,11 @@ class PopulationBasedSearch(BaseSearch):
             return
         else:
             new_timings = provider_timings
+        new_timings = self._confirm_suspicious_rebenchmark_timings(
+            members,
+            new_timings,
+            desc=desc,
+        )
         new_timings = sync_object(
             new_timings, process_group_name=self.kernel.env.process_group_name
         )
@@ -936,6 +941,38 @@ class PopulationBasedSearch(BaseSearch):
             m.perfs.append(t)
             if t < self.best_perf_so_far:
                 self.best_perf_so_far = t
+
+    def _confirm_suspicious_rebenchmark_timings(
+        self,
+        members: list[PopulationMember],
+        timings: list[float],
+        *,
+        desc: str,
+    ) -> list[float]:
+        ratio = self.settings.get_suspicious_rebenchmark_ratio()
+        if ratio is None or ratio <= 0:
+            return timings
+        suspicious = [
+            i
+            for i, (member, timing) in enumerate(zip(members, timings, strict=True))
+            if math.isfinite(timing)
+            and math.isfinite(member.perf)
+            and timing < ratio * member.perf
+        ]
+        if not suspicious:
+            return timings
+        provider_timings = self.benchmark_provider.benchmark_isolated(
+            [members[i].fn for i in suspicious],
+            warmup=25,
+            rep=100,
+            desc=f"{desc}: confirming suspicious timings",
+        )
+        if provider_timings is None:
+            return timings
+        updated = list(timings)
+        for i, timing in zip(suspicious, provider_timings, strict=True):
+            updated[i] = timing
+        return updated
 
     def rebenchmark_population(
         self,
