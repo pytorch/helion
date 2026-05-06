@@ -890,7 +890,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             ) -> Hashable:
                 tensor = cast("torch.Tensor", args[_index])
                 if tensor.ndim != _ndim:
-                    return tensor.ndim
+                    return ("ndim", tensor.ndim)
                 return tensor_descriptor_layout_signature_from_strides(
                     tensor.stride(),
                     _element_size,

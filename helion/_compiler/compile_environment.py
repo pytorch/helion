@@ -48,16 +48,10 @@ log = logging.getLogger(__name__)
 TensorDescriptorLayoutSignature = tuple[int | None, tuple[bool, ...]]
 
 
-def _default_tensor_descriptor_size_hint(n: int | torch.SymInt) -> int:
-    return int(n)
-
-
 def tensor_descriptor_layout_signature_from_strides(
     strides: typing.Sequence[int | torch.SymInt | sympy.Integer],
     element_size: int,
-    size_hint: typing.Callable[
-        [int | torch.SymInt], int
-    ] = _default_tensor_descriptor_size_hint,
+    size_hint: typing.Callable[[int | torch.SymInt], int] | None = None,
 ) -> TensorDescriptorLayoutSignature:
     """Return the stride layout facts tensor descriptors depend on.
 
@@ -71,7 +65,13 @@ def tensor_descriptor_layout_signature_from_strides(
     for dim, raw_stride in enumerate(strides):
         if isinstance(raw_stride, sympy.Integer):
             stride = int(raw_stride)
+        elif isinstance(raw_stride, int):
+            stride = raw_stride
         else:
+            if size_hint is None:
+                raise TypeError(
+                    "symbolic tensor descriptor strides require an explicit size_hint"
+                )
             stride = size_hint(raw_stride)
         if stride == 1:
             if stride_one_dim is None:
