@@ -538,11 +538,10 @@ def _layer_norm_shapes(
 def _softmax_shapes_basic(
     num_shapes: int | None = None,
 ) -> list[tuple[str, tuple[Any, ...]]]:
-    # The kernel specializes on the trailing dim, so changing it across the
-    # 2nd shape produces a shape-mismatch failure. Scale M instead for the 2nd.
-    # Kernel specializes on the trailing dim, so keep N=2560 across shapes.
-    # Scale M to grow memory traffic for the 2nd shape.
-    shapes = [(4096, 2560), (65536, 2560), (8192, 2560), (1024, 8192)]
+    # The kernel specializes on the trailing dim, so changing N across shapes
+    # in a single run produces a shape-mismatch failure. Keep N=2560 across
+    # all entries; scale M to grow memory traffic for later shapes.
+    shapes = [(4096, 2560), (65536, 2560), (8192, 2560)]
     if num_shapes is not None:
         shapes = shapes[:num_shapes]
     return [
