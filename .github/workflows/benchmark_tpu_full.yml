@@ -1,0 +1,41 @@
+name: Benchmark TPU (Full Pallas Coverage)
+
+# Manual-only trigger that fans Benchmark Dispatch out across every TPU
+# example currently registered in benchmarks/run_tpu.py. Useful for
+# end-to-end Pallas-backend smoke testing; NOT part of the nightly
+# dashboard signal (which intentionally tracks a slimmer kernel set).
+#
+# Usage:
+#   gh workflow run benchmark_tpu_full.yml -R pytorch/helion -r yifeixu/tpu-bench-full
+#
+# Or trigger from the Actions UI: select this workflow, pick the
+# yifeixu/tpu-bench-full branch, click "Run workflow".
+
+on:
+  workflow_dispatch:
+
+jobs:
+  dispatch-benchmark:
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - name: Dispatch benchmark_dispatch workflow (TPU, full kernel list)
+        uses: actions/github-script@v9
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'benchmark_dispatch.yml',
+              ref: context.ref.replace('refs/heads/', ''),
+              inputs: {
+                run_h100: 'false',
+                run_b200: 'false',
+                run_mi350x: 'false',
+                run_tpu: 'true',
+                kernels_tpu: 'exp,add,softmax_two_pass,welford,attention,bmm,matmul,matmul_layernorm,cross_entropy,embedding,broadcast_matmul,geglu,low_mem_dropout,swiglu,batch_softmax,sum,rms_norm,layer_norm,softmax,long_sum_naive,long_sum_loop,long_sum_manual,se_block,squeeze_and_excitation_net,rms_norm_bwd',
+              },
+            })
