@@ -1213,53 +1213,90 @@ class ConfigSpec:
                     max(min_block, spec.autotuner_min)
                 )
 
-    def lower_max_for_imbalanced_grid_dims(self) -> None:
+    def lower_max_for_imbalanced_grid_dims(
+        self, grid_root_block_ids: list[list[int]] | None = None
+    ) -> None:
         """Lower max_size for the large grid dimension when the shape is skinny.
 
-        Mirrors raise_grid_block_minimums: that method raises the minimum tile to
-        prevent too many blocks per dimension; this method lowers the maximum tile
-        to prevent too few blocks when one dimension is much larger than the other.
+        Mirrors the philosophy of raise_grid_block_minimums: that method raises
+        the minimum tile to prevent too many blocks per dimension; this method
+        lowers the maximum tile to prevent too few blocks when one dimension is
+        much larger than the other.
 
         The cap is derived from num_compute_units() so it naturally relaxes on
-        smaller GPUs (fewer SMs/CUs → fewer blocks needed → larger tiles OK).
+        smaller GPUs (fewer SMs/CUs -> fewer blocks needed -> larger tiles OK).
 
-        Only applied to 2-D grids where max(dim) >= 8 * min(dim).  The 8x threshold
-        is hardware-independent: below it the random sampler has a reasonable chance
-        of finding good balanced-tile configs on its own.
+        Only applied per-root to 2-D grids where max(dim) >= 8 * min(dim).  The
+        8x threshold is hardware-independent: below it the random sampler has a
+        reasonable chance of finding good balanced-tile configs on its own.
+
+        ``grid_root_block_ids`` is the per-root grouping from
+        ``DeviceIR.grid_block_ids`` (``list[list[int]]``).  Passing it avoids
+        misinterpreting the flat ``self.grid_block_ids`` union as a single 2-D
+        grid when the kernel actually has multiple independent 1-D grid roots.
         """
-        if len(self.grid_block_ids) != 2:
+        # Backend gating: num_compute_units() only inspects CUDA/ROCm and falls
+        # back to a hard-coded value otherwise.  Restrict to backends where the
+        # CU count is meaningful.
+        if self.backend_name not in ("triton", "cute"):
             return
 
-        specs = []
-        for bid in self.grid_block_ids:
-            try:
-                specs.append(self.block_sizes.block_id_lookup(bid))
-            except KeyError:
-                return
-        hints = [s.size_hint for s in specs]
-        if any(h <= 0 for h in hints):
-            return
+        # Fall back to the flat list for callers that don't pass per-root
+        # groups (e.g. unit tests constructing ConfigSpec directly).
+        if grid_root_block_ids is None:
+            grid_root_block_ids = (
+                [list(self.grid_block_ids)] if self.grid_block_ids else []
+            )
 
-        min_hint = min(hints)
-        max_hint = max(hints)
-        if max_hint < min_hint * 8:
-            return  # Not severely imbalanced — leave the search space alone
-
-        # Derive cap from actual hardware: require at least 1 block per compute unit
-        # per grid dimension (mirroring raise_grid_block_minimums which uses n_cus*64).
         n_cus = num_compute_units()
-        n_dims = len(self.grid_block_ids)
-        min_blocks_per_dim = math.ceil(n_cus ** (1.0 / n_dims))
 
-        for spec, hint in zip(specs, hints, strict=True):
-            if hint != max_hint:
+        for root_block_ids in grid_root_block_ids:
+            if len(root_block_ids) != 2:
                 continue
-            max_tile = hint // min_blocks_per_dim
-            if max_tile < 2:
+
+            specs = []
+            for bid in root_block_ids:
+                try:
+                    specs.append(self.block_sizes.block_id_lookup(bid))
+                except KeyError:
+                    specs = []
+                    break
+            if not specs:
                 continue
-            # Round down to power of two
-            max_tile = 1 << (max_tile.bit_length() - 1)
-            spec.update_max(min(spec.max_size, max_tile))
+
+            hints = [s.size_hint for s in specs]
+            if any(h <= 0 for h in hints):
+                continue
+
+            min_hint = min(hints)
+            max_hint = max(hints)
+            if max_hint < min_hint * 8:
+                continue  # Not severely imbalanced -- leave search space alone
+
+            # Require at least min_blocks_per_dim blocks on each grid dim so
+            # every CU gets work; scales with hardware via num_compute_units().
+            n_dims = len(root_block_ids)
+            min_blocks_per_dim = math.ceil(n_cus ** (1.0 / n_dims))
+
+            for spec, hint in zip(specs, hints, strict=True):
+                if hint != max_hint:
+                    continue
+                max_tile = hint // min_blocks_per_dim
+                # max_tile == 1 means the derived cap is already below any
+                # valid power-of-two tile; leave max_size untouched rather
+                # than collapsing the search range to a single value.
+                if max_tile < 2:
+                    continue
+                # Round down to power of two
+                max_tile = 1 << (max_tile.bit_length() - 1)
+                # Respect existing min_size / autotuner_min invariants.  If our
+                # cap would drop below the floor (e.g. raise_grid_block_minimums
+                # or matrix-instruction minimums set it above max_tile), skip
+                # the dim rather than inverting the search range.
+                floor = max(spec.min_size, spec.autotuner_min)
+                if max_tile < floor:
+                    continue
+                spec.update_max(max_tile)
 
     def create_config_generation(
         self,

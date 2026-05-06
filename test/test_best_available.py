@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import tempfile
@@ -1141,8 +1142,7 @@ class TestGenerateBestAvailablePopulation(unittest.TestCase):
         self.assertEqual(len(result), 2)  # 1 default + 1 good cached
 
 
-if __name__ == "__main__":
-    unittest.main()
+_FAKE_NUM_COMPUTE_UNITS = 128
 
 
 class TestLowerMaxForImbalancedGridDims(unittest.TestCase):
@@ -1151,48 +1151,66 @@ class TestLowerMaxForImbalancedGridDims(unittest.TestCase):
     def _make_spec(self, m, n, m_max=None, n_max=None):
         config_spec = ConfigSpec(backend=TritonBackend())
         config_spec.block_sizes.append(
-            BlockSizeSpec(block_id=0, size_hint=m, max_size=m_max or m)
+            BlockSizeSpec(
+                block_id=0,
+                size_hint=m,
+                max_size=m if m_max is None else m_max,
+            )
         )
         config_spec.block_sizes.append(
-            BlockSizeSpec(block_id=1, size_hint=n, max_size=n_max or n)
+            BlockSizeSpec(
+                block_id=1,
+                size_hint=n,
+                max_size=n if n_max is None else n_max,
+            )
         )
         config_spec.grid_block_ids = [0, 1]
         return config_spec
 
+    def _patched_call(self, spec, grid_root_block_ids=None):
+        """Invoke under a deterministic num_compute_units, so tests don't depend
+        on the host GPU's CU count (and so they pass on 1-CU devices)."""
+        with patch(
+            "helion.autotuner.config_spec.num_compute_units",
+            return_value=_FAKE_NUM_COMPUTE_UNITS,
+        ):
+            spec.lower_max_for_imbalanced_grid_dims(
+                grid_root_block_ids=grid_root_block_ids
+            )
+
     def test_skinny_n_caps_n_tile(self):
         """Skinny-N (M=1024, N=8192): N-tile max should be capped (hardware-derived cap)."""
-        import math
-
-        from helion._compat import num_compute_units
-
         spec = self._make_spec(m=1024, n=8192)
+        m_max_before = spec.block_sizes.block_id_lookup(0).max_size
         n_max_before = spec.block_sizes.block_id_lookup(1).max_size
-        spec.lower_max_for_imbalanced_grid_dims()
-        n_max_after = spec.block_sizes.block_id_lookup(1).max_size
+        self._patched_call(spec)
         m_max_after = spec.block_sizes.block_id_lookup(0).max_size
+        n_max_after = spec.block_sizes.block_id_lookup(1).max_size
         # N tile should be capped below its original max
         self.assertLess(n_max_after, n_max_before)
         # M tile (the smaller dim) should be unchanged
-        self.assertEqual(m_max_after, spec.block_sizes.block_id_lookup(0).max_size)
+        self.assertEqual(m_max_after, m_max_before)
         # Cap is hardware-derived: at least min_blocks_per_dim blocks on N dim
-        n_cus = num_compute_units()
-        min_blocks_per_dim = math.ceil(n_cus**0.5)
+        min_blocks_per_dim = math.ceil(_FAKE_NUM_COMPUTE_UNITS**0.5)
         self.assertGreaterEqual(8192 // n_max_after, min_blocks_per_dim)
 
     def test_skinny_m_caps_m_tile(self):
         """Skinny-M (M=8192, N=1024): M-tile max should be capped."""
         spec = self._make_spec(m=8192, n=1024)
         m_max_before = spec.block_sizes.block_id_lookup(0).max_size
-        spec.lower_max_for_imbalanced_grid_dims()
+        n_max_before = spec.block_sizes.block_id_lookup(1).max_size
+        self._patched_call(spec)
         m_max_after = spec.block_sizes.block_id_lookup(0).max_size
+        n_max_after = spec.block_sizes.block_id_lookup(1).max_size
         self.assertLess(m_max_after, m_max_before)
+        self.assertEqual(n_max_after, n_max_before)
 
     def test_square_shape_unchanged(self):
         """Square shape (M=4096, N=4096): no change to max sizes."""
         spec = self._make_spec(m=4096, n=4096)
         m_max_before = spec.block_sizes.block_id_lookup(0).max_size
         n_max_before = spec.block_sizes.block_id_lookup(1).max_size
-        spec.lower_max_for_imbalanced_grid_dims()
+        self._patched_call(spec)
         self.assertEqual(spec.block_sizes.block_id_lookup(0).max_size, m_max_before)
         self.assertEqual(spec.block_sizes.block_id_lookup(1).max_size, n_max_before)
 
@@ -1200,7 +1218,7 @@ class TestLowerMaxForImbalancedGridDims(unittest.TestCase):
         """6.4x ratio (M=1280, N=8192): below the 8x threshold, no change (covers int4_gemm regression)."""
         spec = self._make_spec(m=1280, n=8192)
         n_max_before = spec.block_sizes.block_id_lookup(1).max_size
-        spec.lower_max_for_imbalanced_grid_dims()
+        self._patched_call(spec)
         self.assertEqual(spec.block_sizes.block_id_lookup(1).max_size, n_max_before)
 
     def test_1d_grid_unchanged(self):
@@ -1209,7 +1227,11 @@ class TestLowerMaxForImbalancedGridDims(unittest.TestCase):
         config_spec.block_sizes.append(BlockSizeSpec(block_id=0, size_hint=8192))
         config_spec.grid_block_ids = [0]
         max_before = config_spec.block_sizes.block_id_lookup(0).max_size
-        config_spec.lower_max_for_imbalanced_grid_dims()
+        with patch(
+            "helion.autotuner.config_spec.num_compute_units",
+            return_value=_FAKE_NUM_COMPUTE_UNITS,
+        ):
+            config_spec.lower_max_for_imbalanced_grid_dims()
         self.assertEqual(
             config_spec.block_sizes.block_id_lookup(0).max_size, max_before
         )
@@ -1217,6 +1239,35 @@ class TestLowerMaxForImbalancedGridDims(unittest.TestCase):
     def test_cap_is_valid_power_of_two(self):
         """The cap applied to N-tile must be a power of two."""
         spec = self._make_spec(m=1024, n=8192)
-        spec.lower_max_for_imbalanced_grid_dims()
+        self._patched_call(spec)
         n_max = spec.block_sizes.block_id_lookup(1).max_size
         self.assertEqual(n_max & (n_max - 1), 0, f"{n_max} is not a power of two")
+
+    def test_two_independent_1d_grids_unchanged(self):
+        """Per-root grouping: two independent 1-D grid roots must NOT be treated
+        as a single skinny 2-D grid even though the flat union has length 2."""
+        spec = self._make_spec(m=1024, n=8192)
+        m_before = spec.block_sizes.block_id_lookup(0).max_size
+        n_before = spec.block_sizes.block_id_lookup(1).max_size
+        # Two separate 1-D grid roots, each of length 1
+        self._patched_call(spec, grid_root_block_ids=[[0], [1]])
+        self.assertEqual(spec.block_sizes.block_id_lookup(0).max_size, m_before)
+        self.assertEqual(spec.block_sizes.block_id_lookup(1).max_size, n_before)
+
+    def test_floor_invariant_respected(self):
+        """If autotuner_min is raised above the derived cap, skip the dim
+        rather than collapsing the search range below the floor."""
+        spec = self._make_spec(m=1024, n=8192)
+        n_spec = spec.block_sizes.block_id_lookup(1)
+        # Force a high floor via autotuner_min; cap must not fall below this.
+        n_spec.autotuner_min = 4096
+        n_max_before = n_spec.max_size
+        self._patched_call(spec)
+        n_max_after = spec.block_sizes.block_id_lookup(1).max_size
+        # Either unchanged (cap < floor → skip) or >= floor; never below.
+        self.assertGreaterEqual(n_max_after, 4096)
+        self.assertEqual(n_max_after, n_max_before)
+
+
+if __name__ == "__main__":
+    unittest.main()

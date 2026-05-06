@@ -1957,7 +1957,9 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
         device_ir.register_rollable_reductions()
         config_spec = CompileEnvironment.current().config_spec
         config_spec.raise_grid_block_minimums()
-        config_spec.lower_max_for_imbalanced_grid_dims()
+        config_spec.lower_max_for_imbalanced_grid_dims(
+            grid_root_block_ids=device_ir.grid_block_ids
+        )
 
         if len(device_ir.root_ids) > 1:
             # xyz is not supported with shared program IDs. Non-tcgen05
