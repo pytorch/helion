@@ -22,6 +22,19 @@ from .._compat import supports_amd_cdna_tunables
 from .._compat import supports_maxnreg
 from .._compat import supports_tensor_descriptor
 from .._compat import warps_to_threads
+from .._compiler.cute.tcgen05_constants import TCGEN05_AB_CONSUMER_PHASE_MODE_CONFIG_KEY
+from .._compiler.cute.tcgen05_constants import TCGEN05_AB_CONSUMER_PHASE_MODE_NORMAL
+from .._compiler.cute.tcgen05_constants import TCGEN05_AB_CONSUMER_PHASE_MODES
+from .._compiler.cute.tcgen05_constants import TCGEN05_AB_CONSUMER_WAIT_MODE_CONFIG_KEY
+from .._compiler.cute.tcgen05_constants import TCGEN05_AB_CONSUMER_WAIT_MODE_NORMAL
+from .._compiler.cute.tcgen05_constants import TCGEN05_AB_CONSUMER_WAIT_MODES
+from .._compiler.cute.tcgen05_constants import (
+    TCGEN05_AB_INITIAL_PRODUCER_ACQUIRE_MODE_CONFIG_KEY,
+)
+from .._compiler.cute.tcgen05_constants import (
+    TCGEN05_AB_INITIAL_PRODUCER_ACQUIRE_MODE_NORMAL,
+)
+from .._compiler.cute.tcgen05_constants import TCGEN05_AB_INITIAL_PRODUCER_ACQUIRE_MODES
 from .._compiler.cute.tcgen05_constants import (
     TCGEN05_AB_PRODUCER_ACQUIRE_MODE_CONFIG_KEY,
 )
@@ -167,6 +180,9 @@ _BASE_BACKEND_TUNABLE_KEYS: frozenset[str] = frozenset(
 )
 _BACKEND_DIAGNOSTIC_CONFIG_KEYS: frozenset[str] = frozenset(
     {
+        TCGEN05_AB_CONSUMER_PHASE_MODE_CONFIG_KEY,
+        TCGEN05_AB_CONSUMER_WAIT_MODE_CONFIG_KEY,
+        TCGEN05_AB_INITIAL_PRODUCER_ACQUIRE_MODE_CONFIG_KEY,
         TCGEN05_AB_PRODUCER_ACQUIRE_MODE_CONFIG_KEY,
         TCGEN05_AB_PRODUCER_ADVANCE_MODE_CONFIG_KEY,
         TCGEN05_ACC_PRODUCER_ADVANCE_MODE_CONFIG_KEY,
@@ -1160,9 +1176,24 @@ class ConfigSpec:
             TCGEN05_AB_PRODUCER_ACQUIRE_MODE_NORMAL,
         )
         validate_tcgen05_diagnostic_mode(
+            TCGEN05_AB_INITIAL_PRODUCER_ACQUIRE_MODE_CONFIG_KEY,
+            TCGEN05_AB_INITIAL_PRODUCER_ACQUIRE_MODES,
+            TCGEN05_AB_INITIAL_PRODUCER_ACQUIRE_MODE_NORMAL,
+        )
+        validate_tcgen05_diagnostic_mode(
             TCGEN05_AB_PRODUCER_ADVANCE_MODE_CONFIG_KEY,
             TCGEN05_AB_PRODUCER_ADVANCE_MODES,
             TCGEN05_AB_PRODUCER_ADVANCE_MODE_NORMAL,
+        )
+        validate_tcgen05_diagnostic_mode(
+            TCGEN05_AB_CONSUMER_WAIT_MODE_CONFIG_KEY,
+            TCGEN05_AB_CONSUMER_WAIT_MODES,
+            TCGEN05_AB_CONSUMER_WAIT_MODE_NORMAL,
+        )
+        validate_tcgen05_diagnostic_mode(
+            TCGEN05_AB_CONSUMER_PHASE_MODE_CONFIG_KEY,
+            TCGEN05_AB_CONSUMER_PHASE_MODES,
+            TCGEN05_AB_CONSUMER_PHASE_MODE_NORMAL,
         )
         if TCGEN05_CUBIN_LINEINFO_CONFIG_KEY in config:
             if not self.cute_tcgen05_search_enabled:

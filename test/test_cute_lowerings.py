@@ -70,6 +70,22 @@ from helion._compiler.cute.matmul_utils import cute_resolve_active_matmul_k_bloc
 from helion._compiler.cute.matmul_utils import cute_static_k_invariant_extent
 from helion._compiler.cute.matmul_utils import cute_supports_scalar_matmul_fallback
 from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_AB_CONSUMER_PHASE_MODE_CONFIG_KEY,
+)
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_AB_CONSUMER_PHASE_MODE_PHASE1,
+)
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_AB_CONSUMER_WAIT_MODE_CONFIG_KEY,
+)
+from helion._compiler.cute.tcgen05_constants import TCGEN05_AB_CONSUMER_WAIT_MODE_SKIP
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_AB_INITIAL_PRODUCER_ACQUIRE_MODE_CONFIG_KEY,
+)
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_AB_INITIAL_PRODUCER_ACQUIRE_MODE_SKIP_FIRST,
+)
+from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_AB_PRODUCER_ACQUIRE_MODE_CONFIG_KEY,
 )
 from helion._compiler.cute.tcgen05_constants import (
@@ -3049,6 +3065,77 @@ class TestCuteLowerings(unittest.TestCase):
         self.assertIn("tcgen05_ab_pipeline.producer_commit(", code)
         self.assertIn("tcgen05_ab_producer_state.advance()", code)
 
+    def test_tcgen05_cluster_m2_cta_group_one_bridge_can_skip_initial_ab_acquire(
+        self,
+    ) -> None:
+        """Bridge diagnostic removes only the first initial AB acquire."""
+
+        code = self._cluster_m2_cta_group_one_bridge_diagnostic_code(
+            TCGEN05_AB_INITIAL_PRODUCER_ACQUIRE_MODE_CONFIG_KEY,
+            TCGEN05_AB_INITIAL_PRODUCER_ACQUIRE_MODE_SKIP_FIRST,
+        )
+        tree = ast.parse(code)
+        stage0_blocks = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.If):
+                continue
+            test_src = ast.unparse(node.test)
+            if (
+                "tcgen05_tma_initial_full_tile" in test_src
+                and "tcgen05_tma_initial_next_full_tile" not in test_src
+                and "tcgen05_tma_warp" in test_src
+            ):
+                stage0_blocks.append(node)
+        self.assertEqual(len(stage0_blocks), 1, code)
+        stage0_src = ast.unparse(
+            ast.Module(body=stage0_blocks[0].body, type_ignores=[])
+        )
+        self.assertNotIn("tcgen05_ab_pipeline.producer_acquire(", stage0_src)
+        self.assertIn("tcgen05_ab_pipeline.producer_get_barrier(", stage0_src)
+        self.assertIn("tcgen05_ab_pipeline.producer_commit(", stage0_src)
+        self.assertEqual(code.count("tcgen05_ab_pipeline.producer_acquire("), 2)
+        self.assertEqual(code.count("tcgen05_ab_pipeline.producer_try_acquire("), 1)
+        self.assertIn("tcgen05_ab_producer_state.advance()", code)
+        self.assertIn("tcgen05_ab_pipeline.producer_tail(", code)
+
+    def test_tcgen05_ab_initial_producer_acquire_mode_config_validation(
+        self,
+    ) -> None:
+        """Invalid-output initial AB acquire diagnostic is rejected unless opted in."""
+
+        config_spec = ConfigSpec(backend=CuteBackend())
+        with self.assertRaisesRegex(
+            exc.InvalidConfig,
+            "tcgen05-enabled CuTe matmul kernels",
+        ):
+            config_spec.normalize(
+                {
+                    TCGEN05_AB_INITIAL_PRODUCER_ACQUIRE_MODE_CONFIG_KEY: (
+                        TCGEN05_AB_INITIAL_PRODUCER_ACQUIRE_MODE_SKIP_FIRST
+                    ),
+                }
+            )
+
+        config_spec.cute_tcgen05_search_enabled = True
+        with self.assertRaisesRegex(exc.InvalidConfig, "must be one of"):
+            config_spec.normalize(
+                {
+                    TCGEN05_AB_INITIAL_PRODUCER_ACQUIRE_MODE_CONFIG_KEY: "invalid",
+                    TCGEN05_DIAGNOSTIC_INVALID_OUTPUT_CONFIG_KEY: True,
+                }
+            )
+        with self.assertRaisesRegex(
+            exc.InvalidConfig,
+            "tcgen05_diagnostic_invalid_output",
+        ):
+            config_spec.normalize(
+                {
+                    TCGEN05_AB_INITIAL_PRODUCER_ACQUIRE_MODE_CONFIG_KEY: (
+                        TCGEN05_AB_INITIAL_PRODUCER_ACQUIRE_MODE_SKIP_FIRST
+                    ),
+                }
+            )
+
     def test_tcgen05_ab_producer_advance_mode_config_validation(self) -> None:
         """Invalid-output AB advance diagnostic is rejected unless opted in."""
 
@@ -3085,6 +3172,78 @@ class TestCuteLowerings(unittest.TestCase):
                 }
             )
 
+    def test_tcgen05_ab_consumer_wait_mode_config_validation(self) -> None:
+        """Invalid-output AB wait diagnostic is rejected unless opted in."""
+
+        config_spec = ConfigSpec(backend=CuteBackend())
+        with self.assertRaisesRegex(
+            exc.InvalidConfig,
+            "tcgen05-enabled CuTe matmul kernels",
+        ):
+            config_spec.normalize(
+                {
+                    TCGEN05_AB_CONSUMER_WAIT_MODE_CONFIG_KEY: (
+                        TCGEN05_AB_CONSUMER_WAIT_MODE_SKIP
+                    ),
+                }
+            )
+
+        config_spec.cute_tcgen05_search_enabled = True
+        with self.assertRaisesRegex(exc.InvalidConfig, "must be one of"):
+            config_spec.normalize(
+                {
+                    TCGEN05_AB_CONSUMER_WAIT_MODE_CONFIG_KEY: "invalid",
+                    TCGEN05_DIAGNOSTIC_INVALID_OUTPUT_CONFIG_KEY: True,
+                }
+            )
+        with self.assertRaisesRegex(
+            exc.InvalidConfig,
+            "tcgen05_diagnostic_invalid_output",
+        ):
+            config_spec.normalize(
+                {
+                    TCGEN05_AB_CONSUMER_WAIT_MODE_CONFIG_KEY: (
+                        TCGEN05_AB_CONSUMER_WAIT_MODE_SKIP
+                    ),
+                }
+            )
+
+    def test_tcgen05_ab_consumer_phase_mode_config_validation(self) -> None:
+        """Invalid-output AB phase diagnostic is rejected unless opted in."""
+
+        config_spec = ConfigSpec(backend=CuteBackend())
+        with self.assertRaisesRegex(
+            exc.InvalidConfig,
+            "tcgen05-enabled CuTe matmul kernels",
+        ):
+            config_spec.normalize(
+                {
+                    TCGEN05_AB_CONSUMER_PHASE_MODE_CONFIG_KEY: (
+                        TCGEN05_AB_CONSUMER_PHASE_MODE_PHASE1
+                    ),
+                }
+            )
+
+        config_spec.cute_tcgen05_search_enabled = True
+        with self.assertRaisesRegex(exc.InvalidConfig, "must be one of"):
+            config_spec.normalize(
+                {
+                    TCGEN05_AB_CONSUMER_PHASE_MODE_CONFIG_KEY: "invalid",
+                    TCGEN05_DIAGNOSTIC_INVALID_OUTPUT_CONFIG_KEY: True,
+                }
+            )
+        with self.assertRaisesRegex(
+            exc.InvalidConfig,
+            "tcgen05_diagnostic_invalid_output",
+        ):
+            config_spec.normalize(
+                {
+                    TCGEN05_AB_CONSUMER_PHASE_MODE_CONFIG_KEY: (
+                        TCGEN05_AB_CONSUMER_PHASE_MODE_PHASE1
+                    ),
+                }
+            )
+
     def test_tcgen05_cluster_m2_cta_group_one_bridge_can_skip_ab_advance(
         self,
     ) -> None:
@@ -3106,6 +3265,49 @@ class TestCuteLowerings(unittest.TestCase):
         self.assertNotIn("tcgen05_ab_producer_state._index", code)
         self.assertNotIn("tcgen05_ab_producer_state._phase", code)
         self.assertIn("tcgen05_acc_producer_state.advance()", code)
+
+    def test_tcgen05_cluster_m2_cta_group_one_bridge_can_skip_ab_wait(
+        self,
+    ) -> None:
+        """Bridge diagnostic removes only AB consumer try-wait/wait edges."""
+
+        code = self._cluster_m2_cta_group_one_bridge_diagnostic_code(
+            TCGEN05_AB_CONSUMER_WAIT_MODE_CONFIG_KEY,
+            TCGEN05_AB_CONSUMER_WAIT_MODE_SKIP,
+        )
+        self.assertIn("tcgen05_ab_pipeline.producer_commit(", code)
+        self.assertNotIn("tcgen05_ab_pipeline.consumer_try_wait(", code)
+        self.assertNotIn("tcgen05_ab_pipeline.consumer_wait(", code)
+        self.assertIn("tcgen05_ab_pipeline.consumer_release(", code)
+        self.assertIn("tcgen05_ab_consumer_state.advance()", code)
+        self.assertIn("tcgen05_ab_producer_state.advance()", code)
+
+    def test_tcgen05_cluster_m2_cta_group_one_bridge_can_init_ab_phase1(
+        self,
+    ) -> None:
+        """Bridge diagnostic initializes AB consumer state with phase 1."""
+
+        code = self._cluster_m2_cta_group_one_bridge_diagnostic_code(
+            TCGEN05_AB_CONSUMER_PHASE_MODE_CONFIG_KEY,
+            TCGEN05_AB_CONSUMER_PHASE_MODE_PHASE1,
+        )
+        self.assertNotIn(
+            "tcgen05_ab_consumer_state = "
+            "cutlass.pipeline.make_pipeline_state("
+            "cutlass.pipeline.PipelineUserType.Consumer, 2)",
+            code,
+        )
+        self.assertIn(
+            "tcgen05_ab_consumer_state = "
+            "cutlass.pipeline.PipelineState(2, cutlass.Int32(0), "
+            "cutlass.Int32(0), cutlass.Int32(1))",
+            code,
+        )
+        self.assertIn("tcgen05_ab_pipeline.consumer_try_wait(", code)
+        self.assertIn("tcgen05_ab_pipeline.consumer_wait(", code)
+        self.assertIn("tcgen05_ab_pipeline.consumer_release(", code)
+        self.assertIn("tcgen05_ab_consumer_state.advance()", code)
+        self.assertIn("tcgen05_ab_pipeline_tx_count = ", code)
 
     def test_tcgen05_cluster_m2_cta_group_one_bridge_role_local_shape_guard(
         self,
@@ -8234,6 +8436,7 @@ class TestPerKiterTmaBuilders(unittest.TestCase):
             use_tma_b=use_tma_b,
             skip_producer_acquire=False,
             skip_producer_advance=False,
+            skip_consumer_wait=False,
             exec_active="exec_active",
             scalar_load_a=self._scalar_load_a(),
             scalar_load_b=self._scalar_load_b(),
@@ -8699,6 +8902,29 @@ class TestInitialPrefetchTmaBuilder(unittest.TestCase):
         # The non-stage-0 prefetch reads from gA[None, Int32(stage-1)] /
         # gB[None, Int32(stage-1)], not Int32(0).
         self.assertNotIn("None, cutlass.Int32(0)", body_src)
+
+    def test_stage0_can_override_producer_acquire(self) -> None:
+        """Diagnostic call sites can skip a single initial acquire."""
+
+        node = _build_initial_prefetch_if(
+            self._make_args(),
+            full_tile_gates=["initial_full_tile"],
+            k_offset="cutlass.Int32(0)",
+            skip_producer_acquire=True,
+        )
+        self.assertEqual(
+            self._stmt_kinds(node.body),
+            [
+                "=producer_get_barrier",
+                "copy",
+                "copy",
+                "producer_commit",
+                "advance",
+            ],
+        )
+        body_src = ast.unparse(ast.Module(body=node.body, type_ignores=[]))
+        self.assertNotIn("producer_acquire", body_src)
+        self.assertIn("producer_get_barrier", body_src)
 
     def test_two_cta_prefetch_keeps_per_cta_copies(self) -> None:
         args = self._make_args(cluster_m=2, is_two_cta=True)

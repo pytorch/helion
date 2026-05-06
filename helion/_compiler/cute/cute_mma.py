@@ -44,6 +44,15 @@ from .layout import MatmulExecutionKind
 from .layout import MatmulExecutionPlan
 from .matmul_utils import analyze_direct_grouped_n_loads
 from .mma_support import get_cute_mma_support
+from .tcgen05_constants import TCGEN05_AB_CONSUMER_PHASE_MODE_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_AB_CONSUMER_PHASE_MODE_NORMAL
+from .tcgen05_constants import TCGEN05_AB_CONSUMER_PHASE_MODE_PHASE1
+from .tcgen05_constants import TCGEN05_AB_CONSUMER_WAIT_MODE_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_AB_CONSUMER_WAIT_MODE_NORMAL
+from .tcgen05_constants import TCGEN05_AB_CONSUMER_WAIT_MODE_SKIP
+from .tcgen05_constants import TCGEN05_AB_INITIAL_PRODUCER_ACQUIRE_MODE_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_AB_INITIAL_PRODUCER_ACQUIRE_MODE_NORMAL
+from .tcgen05_constants import TCGEN05_AB_INITIAL_PRODUCER_ACQUIRE_MODE_SKIP_FIRST
 from .tcgen05_constants import TCGEN05_AB_PRODUCER_ACQUIRE_MODE_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_AB_PRODUCER_ACQUIRE_MODE_NORMAL
 from .tcgen05_constants import TCGEN05_AB_PRODUCER_ACQUIRE_MODE_SKIP
@@ -743,6 +752,7 @@ class _PerKiterTmaArgs:
     use_tma_b: bool
     skip_producer_acquire: bool
     skip_producer_advance: bool
+    skip_consumer_wait: bool
     exec_active: str
     scalar_load_a: ast.stmt
     scalar_load_b: ast.stmt
@@ -856,16 +866,19 @@ def _build_kloop_pipeline_consumer_if(
     use_existing_try_token: bool = False,
 ) -> ast.stmt:
     """Per-K-iter TMA consumer / scalar-fallback ``if`` for the pipelined branch."""
-    consumer_src = ""
-    if not use_existing_try_token:
-        consumer_src = (
-            f"{args.tma_consumer_try_token} = "
-            f"{args.tma_pipeline}.consumer_try_wait({args.tma_consumer_state})\n"
+    if args.skip_consumer_wait:
+        consumer_src = "pass"
+    else:
+        consumer_src = ""
+        if not use_existing_try_token:
+            consumer_src = (
+                f"{args.tma_consumer_try_token} = "
+                f"{args.tma_pipeline}.consumer_try_wait({args.tma_consumer_state})\n"
+            )
+        consumer_src += (
+            f"{args.tma_pipeline}.consumer_wait("
+            f"{args.tma_consumer_state}, {args.tma_consumer_try_token})"
         )
-    consumer_src += (
-        f"{args.tma_pipeline}.consumer_wait("
-        f"{args.tma_consumer_state}, {args.tma_consumer_try_token})"
-    )
     full_tile_src = _tcgen05_emit_optional_gate(
         consumer_src,
         _tcgen05_two_cta_owner_predicate(
@@ -1062,13 +1075,19 @@ def _build_kloop_non_pipeline_consumer_if(args: _PerKiterTmaArgs) -> ast.stmt:
         f"{scalar_load_b_tma_src}"
         f"    if {args.exec_active}:\n"
         "        cute.arch.sync_warp()\n"
-        f"        {args.tma_pipeline}.consumer_wait("
-        f"{args.tma_consumer_state}, {args.tma_consumer_try_token})\n"
-        "    cute.arch.sync_threads()\n"
-        "else:\n"
-        f"{scalar_load_a_src}\n"
-        f"{scalar_load_b_src}\n"
-        "    cute.arch.sync_threads()"
+        + (
+            "        pass\n"
+            if args.skip_consumer_wait
+            else (
+                f"        {args.tma_pipeline}.consumer_wait("
+                f"{args.tma_consumer_state}, {args.tma_consumer_try_token})\n"
+            )
+        )
+        + "    cute.arch.sync_threads()\n"
+        + "else:\n"
+        + f"{scalar_load_a_src}\n"
+        + f"{scalar_load_b_src}\n"
+        + "    cute.arch.sync_threads()"
     )
     return statement_from_string(src)
 
@@ -1174,6 +1193,7 @@ def _build_initial_prefetch_if(
     *,
     full_tile_gates: list[str],
     k_offset: str,
+    skip_producer_acquire: bool | None = None,
 ) -> ast.stmt:
     """Initial-prefetch ``if`` block for stage ``k_offset``.
 
@@ -1188,6 +1208,8 @@ def _build_initial_prefetch_if(
     ``cutlass.Int32(stage_idx)`` for ``k_offset``.
     """
     predicate = " and ".join([*full_tile_gates, args.tma_warp])
+    if skip_producer_acquire is None:
+        skip_producer_acquire = args.skip_producer_acquire
     producer_advance_src = (
         emit_pipeline_advance(args.tma_producer_state, indent="    ")
         if not args.skip_producer_advance
@@ -1197,7 +1219,7 @@ def _build_initial_prefetch_if(
         args, k_offset=k_offset
     ) + _initial_prefetch_copy_b_src(args, k_offset=k_offset)
     src = f"if {predicate}:\n"
-    if not args.skip_producer_acquire:
+    if not skip_producer_acquire:
         src += f"    {args.tma_pipeline}.producer_acquire({args.tma_producer_state})\n"
     src += (
         f"    {args.tma_barrier_ptr} = "
@@ -1515,6 +1537,24 @@ def _emit_mma_pipeline(
             f"{TCGEN05_AB_PRODUCER_ACQUIRE_MODE_SKIP!r} requires the guarded "
             "cluster_m=2, CtaGroup.ONE, 128x256x128 bridge shape",
         )
+    tcgen05_ab_initial_producer_acquire_mode = df.config.get(
+        TCGEN05_AB_INITIAL_PRODUCER_ACQUIRE_MODE_CONFIG_KEY,
+        TCGEN05_AB_INITIAL_PRODUCER_ACQUIRE_MODE_NORMAL,
+    )
+    diagnose_skip_initial_ab_producer_acquire = (
+        tcgen05_ab_initial_producer_acquire_mode
+        == TCGEN05_AB_INITIAL_PRODUCER_ACQUIRE_MODE_SKIP_FIRST
+    )
+    if (
+        diagnose_skip_initial_ab_producer_acquire
+        and not tcgen05_cluster_m2_one_cta_role_local_bridge
+    ):
+        raise exc.BackendUnsupported(
+            "cute",
+            f"{TCGEN05_AB_INITIAL_PRODUCER_ACQUIRE_MODE_CONFIG_KEY}="
+            f"{TCGEN05_AB_INITIAL_PRODUCER_ACQUIRE_MODE_SKIP_FIRST!r} requires "
+            "the guarded cluster_m=2, CtaGroup.ONE, 128x256x128 bridge shape",
+        )
     tcgen05_ab_producer_advance_mode = df.config.get(
         TCGEN05_AB_PRODUCER_ADVANCE_MODE_CONFIG_KEY,
         TCGEN05_AB_PRODUCER_ADVANCE_MODE_NORMAL,
@@ -1530,6 +1570,37 @@ def _emit_mma_pipeline(
             "cute",
             f"{TCGEN05_AB_PRODUCER_ADVANCE_MODE_CONFIG_KEY}="
             f"{TCGEN05_AB_PRODUCER_ADVANCE_MODE_SKIP!r} requires the guarded "
+            "cluster_m=2, CtaGroup.ONE, 128x256x128 bridge shape",
+        )
+    tcgen05_ab_consumer_wait_mode = df.config.get(
+        TCGEN05_AB_CONSUMER_WAIT_MODE_CONFIG_KEY,
+        TCGEN05_AB_CONSUMER_WAIT_MODE_NORMAL,
+    )
+    diagnose_skip_ab_consumer_wait = (
+        tcgen05_ab_consumer_wait_mode == TCGEN05_AB_CONSUMER_WAIT_MODE_SKIP
+    )
+    if (
+        diagnose_skip_ab_consumer_wait
+        and not tcgen05_cluster_m2_one_cta_role_local_bridge
+    ):
+        raise exc.BackendUnsupported(
+            "cute",
+            f"{TCGEN05_AB_CONSUMER_WAIT_MODE_CONFIG_KEY}="
+            f"{TCGEN05_AB_CONSUMER_WAIT_MODE_SKIP!r} requires the guarded "
+            "cluster_m=2, CtaGroup.ONE, 128x256x128 bridge shape",
+        )
+    tcgen05_ab_consumer_phase_mode = df.config.get(
+        TCGEN05_AB_CONSUMER_PHASE_MODE_CONFIG_KEY,
+        TCGEN05_AB_CONSUMER_PHASE_MODE_NORMAL,
+    )
+    diagnose_ab_consumer_phase1 = (
+        tcgen05_ab_consumer_phase_mode == TCGEN05_AB_CONSUMER_PHASE_MODE_PHASE1
+    )
+    if diagnose_ab_consumer_phase1 and not tcgen05_cluster_m2_one_cta_role_local_bridge:
+        raise exc.BackendUnsupported(
+            "cute",
+            f"{TCGEN05_AB_CONSUMER_PHASE_MODE_CONFIG_KEY}="
+            f"{TCGEN05_AB_CONSUMER_PHASE_MODE_PHASE1!r} requires the guarded "
             "cluster_m=2, CtaGroup.ONE, 128x256x128 bridge shape",
         )
     # Static-full CtaGroup.TWO keeps a prefetched AB consumer token live
@@ -2431,10 +2502,19 @@ def _emit_mma_pipeline(
                     f"cutlass.pipeline.PipelineUserType.Producer, {tcgen05_ab_stage_count_value})"
                 )
             )
+            tma_consumer_state_init = (
+                f"cutlass.pipeline.PipelineState({tcgen05_ab_stage_count_value}, "
+                "cutlass.Int32(0), cutlass.Int32(0), cutlass.Int32(1))"
+                if diagnose_ab_consumer_phase1
+                else (
+                    "cutlass.pipeline.make_pipeline_state("
+                    "cutlass.pipeline.PipelineUserType.Consumer, "
+                    f"{tcgen05_ab_stage_count_value})"
+                )
+            )
             prefix.append(
                 statement_from_string(
-                    f"{tma_consumer_state} = cutlass.pipeline.make_pipeline_state("
-                    f"cutlass.pipeline.PipelineUserType.Consumer, {tcgen05_ab_stage_count_value})"
+                    f"{tma_consumer_state} = {tma_consumer_state_init}"
                 )
             )
             _emit_tcgen05_tmem_setup()
@@ -2480,6 +2560,10 @@ def _emit_mma_pipeline(
                     prefetch_args,
                     full_tile_gates=[tma_initial_full_tile],
                     k_offset="cutlass.Int32(0)",
+                    skip_producer_acquire=(
+                        diagnose_skip_ab_producer_acquire
+                        or diagnose_skip_initial_ab_producer_acquire
+                    ),
                 )
                 prefix.append(stage0_prefetch)
                 per_tile_stmts.append(stage0_prefetch)
@@ -2724,6 +2808,7 @@ def _emit_mma_pipeline(
                 use_tma_b=tcgen05_use_tma_b,
                 skip_producer_acquire=diagnose_skip_ab_producer_acquire,
                 skip_producer_advance=diagnose_skip_ab_producer_advance,
+                skip_consumer_wait=diagnose_skip_ab_consumer_wait,
                 exec_active=tcgen05_plan.exec_active,
                 scalar_load_a=scalar_load_a,
                 scalar_load_b=scalar_load_b,

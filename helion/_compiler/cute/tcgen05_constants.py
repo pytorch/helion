@@ -80,6 +80,17 @@ TCGEN05_AB_PRODUCER_ACQUIRE_MODES = (
     TCGEN05_AB_PRODUCER_ACQUIRE_MODE_NORMAL,
     TCGEN05_AB_PRODUCER_ACQUIRE_MODE_SKIP,
 )
+TCGEN05_AB_INITIAL_PRODUCER_ACQUIRE_MODE_CONFIG_KEY = (
+    "tcgen05_ab_initial_producer_acquire_mode"
+)
+TCGEN05_AB_INITIAL_PRODUCER_ACQUIRE_MODE_NORMAL = "normal"
+# Invalid-output diagnostic for the guarded clustered CtaGroup.ONE bridge:
+# removes only the first initial-prefetch AB producer acquire edge.
+TCGEN05_AB_INITIAL_PRODUCER_ACQUIRE_MODE_SKIP_FIRST = "skip_first"
+TCGEN05_AB_INITIAL_PRODUCER_ACQUIRE_MODES = (
+    TCGEN05_AB_INITIAL_PRODUCER_ACQUIRE_MODE_NORMAL,
+    TCGEN05_AB_INITIAL_PRODUCER_ACQUIRE_MODE_SKIP_FIRST,
+)
 TCGEN05_AB_PRODUCER_ADVANCE_MODE_CONFIG_KEY = "tcgen05_ab_producer_advance_mode"
 TCGEN05_AB_PRODUCER_ADVANCE_MODE_NORMAL = "normal"
 # Invalid-output diagnostic for the guarded clustered CtaGroup.ONE bridge:
@@ -88,6 +99,24 @@ TCGEN05_AB_PRODUCER_ADVANCE_MODE_SKIP = "skip"
 TCGEN05_AB_PRODUCER_ADVANCE_MODES = (
     TCGEN05_AB_PRODUCER_ADVANCE_MODE_NORMAL,
     TCGEN05_AB_PRODUCER_ADVANCE_MODE_SKIP,
+)
+TCGEN05_AB_CONSUMER_WAIT_MODE_CONFIG_KEY = "tcgen05_ab_consumer_wait_mode"
+TCGEN05_AB_CONSUMER_WAIT_MODE_NORMAL = "normal"
+# Invalid-output diagnostic for the guarded clustered CtaGroup.ONE bridge:
+# removes only AB consumer try-wait/wait edges.
+TCGEN05_AB_CONSUMER_WAIT_MODE_SKIP = "skip"
+TCGEN05_AB_CONSUMER_WAIT_MODES = (
+    TCGEN05_AB_CONSUMER_WAIT_MODE_NORMAL,
+    TCGEN05_AB_CONSUMER_WAIT_MODE_SKIP,
+)
+TCGEN05_AB_CONSUMER_PHASE_MODE_CONFIG_KEY = "tcgen05_ab_consumer_phase_mode"
+TCGEN05_AB_CONSUMER_PHASE_MODE_NORMAL = "normal"
+# Invalid-output diagnostic for the guarded clustered CtaGroup.ONE bridge:
+# initializes the AB consumer pipeline state with phase 1 instead of phase 0.
+TCGEN05_AB_CONSUMER_PHASE_MODE_PHASE1 = "phase1"
+TCGEN05_AB_CONSUMER_PHASE_MODES = (
+    TCGEN05_AB_CONSUMER_PHASE_MODE_NORMAL,
+    TCGEN05_AB_CONSUMER_PHASE_MODE_PHASE1,
 )
 TCGEN05_CUBIN_LINEINFO_CONFIG_KEY = "tcgen05_cubin_lineinfo"
 # Diagnostic-only codegen proof for the guarded clustered CtaGroup.ONE bridge.
