@@ -154,7 +154,10 @@ jobs:
           git -C triton checkout ${{ matrix.triton-pin }}
           cd triton/
           uv pip install -r python/requirements.txt
-          MAX_JOBS=$(nproc) TRITON_PARALLEL_LINK_JOBS=2 uv pip install .
+          # Disable proton on XPU: proton's NVIDIA sources (CuptiApi.cpp, NvtxApi.cpp)
+          # require CUDA headers that are not present on Intel XPU runners.
+          TRITON_BUILD_PROTON=${{ startsWith(matrix.image, 'intel') && 'OFF' || 'ON' }}
+          MAX_JOBS=$(nproc) TRITON_PARALLEL_LINK_JOBS=2 TRITON_BUILD_PROTON=$TRITON_BUILD_PROTON uv pip install .
           cd /tmp/$USER
           rm -rf triton/
           python -c "import triton; print(f'Triton version: {triton.__version__}')"
