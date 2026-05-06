@@ -912,6 +912,45 @@ class TestPallas(TestCase):
         self.assertIn("out = torch.empty_like(q_view, device='meta')", _code)
         self.assertIn("out = _launcher(", _code)
 
+    def test_hl_zeros_outer_arithmetic_emit_pipeline(self) -> None:
+        """``hl.zeros`` results must support arithmetic at outer (non-inner-loop) scope.
+
+        Regression test: ``acc = hl.zeros(...); acc += x`` written before an
+        inner emit_pipeline / fori_loop must work.  Previously, the Pallas
+        codegen for hl.zeros returned a bare VMEM scratch ref, so the outer
+        ``acc + x`` emitted ``scratch + x`` and JAX raised
+        ``'AbstractRef' object has no attribute '_add'`` at trace time.
+        Inner-loop bodies dodged the issue via ``_remap_args_to_scratch``;
+        outer scope had no equivalent remap.
+        """
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def kernel(x: torch.Tensor) -> torch.Tensor:
+            m, n = x.shape
+            out = torch.empty_like(x)
+            for tile_m in hl.tile(m):
+                acc = hl.zeros([tile_m, n], dtype=torch.float32)
+                # Outer-scope arithmetic on the hl.zeros result with a
+                # scalar.  Previously, this emitted ``scratch + 1.0`` and
+                # JAX raised the AbstractRef ``_add`` error.
+                acc += 1.0
+                # Inner emit_pipeline forces the previously-buggy scratch
+                # path inside ``hl.zeros`` codegen.
+                for tile_k in hl.tile(n):
+                    acc += x[tile_m, tile_k].to(torch.float32).sum(dim=-1, keepdim=True)
+                out[tile_m, :] = acc.to(x.dtype)
+            return out
+
+        x = torch.randn(128, 128, device=DEVICE, dtype=torch.float32)
+        _code, result = code_and_output(
+            kernel,
+            (x,),
+            block_sizes=[32, 128],
+            pallas_loop_type="emit_pipeline",
+        )
+        ref = 1.0 + x.sum(dim=-1, keepdim=True).expand(-1, 128)
+        torch.testing.assert_close(result, ref, rtol=1e-3, atol=1e-3)
+
     def test_attention_emit_pipeline_correctness(self) -> None:
         """Test emit_pipeline attention with loop-carried state and pre-broadcast."""
         query = torch.randn(2, 2, 128, 128, dtype=torch.float32, device=DEVICE)
