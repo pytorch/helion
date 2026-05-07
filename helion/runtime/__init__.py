@@ -668,8 +668,9 @@ def _pallas_build_callable(
         name=kernel_name,
         jit_fn=jax.jit(jit_fn),
         trace_key=f"{kernel_name}_{id(pallas_kernel)}_{grid}{trace_key_suffix}",
-        input_output_aliases=call_aliases,
+        donate_argnums=list(call_aliases.keys()),
     )
+    jax_callable._call_aliases = call_aliases
     setattr(
         pallas_kernel,
         cache_attr,
@@ -775,6 +776,12 @@ def _pallas_invoke_and_return(
         return None
     if not isinstance(results, (tuple, list)):
         results = (results,)
+
+    if not _pallas_interpret_flag():
+        call_aliases = getattr(jax_callable, "_call_aliases", {})
+        for in_idx, out_idx in call_aliases.items():
+            input_tensors[in_idx].copy_(results[out_idx])
+
     output_only_results = []
     for out_idx, orig_pos in enumerate(_output_indices):
         if orig_pos not in arg_to_tensor_pos:
