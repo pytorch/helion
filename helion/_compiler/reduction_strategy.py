@@ -410,28 +410,10 @@ class PersistentReductionStrategy(ReductionStrategy):
         # Tile strategies are added before reduction strategies, so they are
         # already on the dispatcher by the time we get here.
         tile_dispatch = getattr(fn, "tile_strategy", None)
-        if (
-            env.backend.name == "cute"
-            and self._thread_count > 1
-            and tile_dispatch is not None
-        ):
-            from .cute.thread_budget import MAX_THREADS_PER_BLOCK
-
-            other_threads = 1
-            for strategy in tile_dispatch.strategies:
-                if isinstance(strategy, ReductionStrategy):
-                    count = strategy._reduction_thread_count()
-                    if count > 0:
-                        other_threads *= count
-                else:
-                    for size in strategy.thread_block_sizes():
-                        if size > 1:
-                            other_threads *= size
-            while (
-                other_threads * self._thread_count > MAX_THREADS_PER_BLOCK
-                and self._thread_count > 1
-            ):
-                self._thread_count //= 2
+        if tile_dispatch is not None:
+            self._thread_count = env.backend.adjust_reduction_thread_count(
+                self._thread_count, tile_dispatch.strategies
+            )
         self._synthetic_cute_lane_var: str | None = None
         self._synthetic_cute_lane_extent = 1
         is_graph_reduction_dim = any(
@@ -608,27 +590,16 @@ class LoopedReductionStrategy(ReductionStrategy):
             self._thread_count = next_power_of_2(min(block_size, max_threads))
         else:
             self._thread_count = 0
-        if env.backend.name == "cute" and self._thread_count > 1:
-            from .cute.thread_budget import MAX_THREADS_PER_BLOCK
-
-            other_threads = 1
-            tile_dispatch = getattr(fn, "tile_strategy", None)
-            if tile_dispatch is not None:
-                for strategy in tile_dispatch.strategies:
-                    if isinstance(strategy, ReductionStrategy):
-                        count = strategy._reduction_thread_count()
-                        if count > 0:
-                            other_threads *= count
-                    else:
-                        for size in strategy.thread_block_sizes():
-                            if size > 1:
-                                other_threads *= size
-            while (
-                other_threads * self._thread_count > MAX_THREADS_PER_BLOCK
-                and self._thread_count > 1
-            ):
-                self._thread_count //= 2
-            self.block_size = min(self.block_size, self._thread_count)
+        tile_dispatch = getattr(fn, "tile_strategy", None)
+        if tile_dispatch is not None:
+            self._thread_count = env.backend.adjust_reduction_thread_count(
+                self._thread_count, tile_dispatch.strategies
+            )
+            self.block_size = (
+                min(self.block_size, self._thread_count)
+                if self._thread_count > 1
+                else self.block_size
+            )
 
     def _reduction_thread_count(self) -> int:
         return self._thread_count

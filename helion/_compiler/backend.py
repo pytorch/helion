@@ -161,6 +161,17 @@ class Backend(abc.ABC):
         """Maximum threads for a single warp-level reduction, or None if unlimited."""
         return None
 
+    def adjust_reduction_thread_count(
+        self, requested: int, existing_strategies: list[TileStrategy]
+    ) -> int:
+        """Adjust reduction thread count to fit within hardware thread limits.
+
+        Tile-level backends return the count unchanged. Thread-level backends
+        (e.g., CuTe) override this to cap against the per-block thread budget
+        shared across all tiled dimensions.
+        """
+        return requested
+
     def barrier_semaphore_dtype(self) -> torch.dtype:
         """Dtype used for persistent multi-phase barrier semaphore tensors."""
         return torch.uint32
@@ -555,6 +566,24 @@ class Backend(abc.ABC):
             loop_order=loop_order,
             l2_grouping=l2_grouping,
         )
+
+    def create_reduction_strategy(
+        self,
+        fn: DeviceFunction,
+        block_id: int,
+        reduction_loop: int | None,
+    ) -> TileStrategy:
+        """Create a reduction strategy for the given block dimension.
+
+        Analogous to create_loop_strategy() but for reduction dimensions.
+        Backends can override to return backend-specific strategy subclasses.
+        """
+        from .reduction_strategy import LoopedReductionStrategy
+        from .reduction_strategy import PersistentReductionStrategy
+
+        if reduction_loop is None:
+            return PersistentReductionStrategy(fn, block_id)
+        return LoopedReductionStrategy(fn, block_id, reduction_loop)
 
     def autotune(
         self,
@@ -2672,6 +2701,28 @@ class CuteBackend(Backend):
 
     def max_reduction_threads(self) -> int | None:
         return 32
+
+    def adjust_reduction_thread_count(
+        self, requested: int, existing_strategies: list[TileStrategy]
+    ) -> int:
+        from .cute.thread_budget import MAX_THREADS_PER_BLOCK
+        from .reduction_strategy import ReductionStrategy
+
+        if requested <= 1:
+            return requested
+        other_threads = 1
+        for strategy in existing_strategies:
+            if isinstance(strategy, ReductionStrategy):
+                count = strategy._reduction_thread_count()
+                if count > 0:
+                    other_threads *= count
+            else:
+                for size in strategy.thread_block_sizes():
+                    if size > 1:
+                        other_threads *= size
+        while other_threads * requested > MAX_THREADS_PER_BLOCK and requested > 1:
+            requested //= 2
+        return requested
 
     def reduction_axis_first(self) -> bool:
         return True
