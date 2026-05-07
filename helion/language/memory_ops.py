@@ -1350,6 +1350,16 @@ def _cute_combined_mask(
                     break
         elif isinstance(idx, torch.Tensor):
             if not include_tensor_index_masks:
+                for dim_size in idx.shape:
+                    for bid in _matching_block_ids(env, dim_size):
+                        if bid in seen or not env.is_jagged_tile(bid):
+                            continue
+                        mask_var = mask_var_for_block_id(bid)
+                        if mask_var is not None:
+                            seen.add(bid)
+                            if mask_var not in terms:
+                                terms.append(mask_var)
+                            break
                 tensor_dim += 1
                 continue
             for dim_size in idx.shape:
