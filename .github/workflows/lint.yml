@@ -43,7 +43,7 @@ jobs:
         run: |
           source .venv/bin/activate
           uv pip install pyrefly==0.63.1
-          uv pip install --prerelease=allow .'[dev,pallas-cpu]'
+          uv pip install .'[dev,pallas-cpu]'
           ./scripts/install_cute.sh
 
       - name: Run pre-commit

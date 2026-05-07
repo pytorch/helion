@@ -40,10 +40,10 @@ dev = [
 # truth — keep these extras in sync with that pin, and prefer
 # scripts/install_cute.sh in CI/dev environments.
 cute-cu12 = [
-    "nvidia-cutlass-dsl==4.5.0.dev0",
+    "nvidia-cutlass-dsl==4.5.0",
 ]
 cute-cu13 = [
-    "nvidia-cutlass-dsl[cu13]==4.5.0.dev0",
+    "nvidia-cutlass-dsl[cu13]==4.5.0",
 ]
 pallas-tpu = [
     "jax[tpu]",

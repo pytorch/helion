@@ -88,7 +88,7 @@ echo "==> Uninstalling any existing nvidia-cutlass-dsl* packages"
 
 if [[ "$VARIANT" == "cu13" ]]; then
   echo "==> Installing nvidia-cutlass-dsl[cu13]==$CUTE_VERSION"
-  "${PIP_INSTALL[@]}" --prerelease=allow \
+  "${PIP_INSTALL[@]}" \
     "nvidia-cutlass-dsl[cu13]==$CUTE_VERSION"
 
   # The PyPI nvidia-cutlass-dsl-libs-base and -libs-cu13 wheels ship several
@@ -100,11 +100,11 @@ if [[ "$VARIANT" == "cu13" ]]; then
   # cute test crashes. Force-reinstall cu13 *with --no-deps* so its files are
   # the last writers on disk.
   echo "==> Reinstalling nvidia-cutlass-dsl-libs-cu13 (no deps) so its files win"
-  "${PIP_INSTALL[@]}" --prerelease=allow --reinstall --no-deps \
+  "${PIP_INSTALL[@]}" --reinstall --no-deps \
     "nvidia-cutlass-dsl-libs-cu13==$CUTE_VERSION"
 else
   echo "==> Installing nvidia-cutlass-dsl==$CUTE_VERSION (cu12 / libs-base only)"
-  "${PIP_INSTALL[@]}" --prerelease=allow \
+  "${PIP_INSTALL[@]}" \
     "nvidia-cutlass-dsl==$CUTE_VERSION"
 fi
 

@@ -1409,7 +1409,7 @@ def _cute_scalar_annotation(kind: str) -> str:
     mapping = {
         "bool": "cutlass.Boolean",
         "int": "cutlass.Int64",
-        "float": "cutlass.Float64",
+        "float": "cutlass.Float32",
     }
     return mapping[kind]
 

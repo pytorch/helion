@@ -2700,7 +2700,12 @@ class CuteBackend(Backend):
         return f"({true_val}) if ({mask}) else ({false_val})"
 
     def minimum_expr(self, a: str, b: str) -> str:
-        return f"({a}) if ({a}) < ({b}) else ({b})"
+        from .compile_environment import CompileEnvironment
+
+        index_type = CompileEnvironment.current().index_type()
+        lhs = self.cast_expr(a, index_type)
+        rhs = self.cast_expr(b, index_type)
+        return f"({lhs}) if ({lhs}) < ({rhs}) else ({rhs})"
 
     def reduction_index_expr(
         self, block_size_var: str, dtype: str, block_idx: int, *, axis: int
