@@ -14,6 +14,7 @@ from helion._testing import onlyBackends
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfRocm
 from helion._testing import skipIfTileIR
+from helion._testing import skipUnlessTensorDescriptor
 from helion._testing import xfailIfPallas
 import helion.language as hl
 from helion.runtime.settings import _get_backend
@@ -687,6 +688,7 @@ class TestAtomicOperations(RefEagerTestBase, TestCase):
     @onlyBackends("triton")
     @skipIfRocm("Tensor descriptor not supported on ROCm")
     @skipIfTileIR("TileIR does not support descriptor atomics")
+    @skipUnlessTensorDescriptor("Tensor descriptor support is required")
     def test_atomic_add_per_op_indexing(self):
         """Test per-op atomic_indexing list: first op pointer, second op tensor_descriptor."""
 
@@ -725,6 +727,7 @@ class TestAtomicOperations(RefEagerTestBase, TestCase):
     @onlyBackends("triton")
     @skipIfRocm("Tensor descriptor not supported on ROCm")
     @skipIfTileIR("TileIR does not support descriptor atomics")
+    @skipUnlessTensorDescriptor("Tensor descriptor support is required")
     def test_atomic_ops_tensor_descriptor(self):
         """Test all TMA-supported atomic ops generate desc.atomic_{op} codegen."""
         M, N = 128, 64
@@ -801,6 +804,7 @@ class TestAtomicOperations(RefEagerTestBase, TestCase):
     @onlyBackends("triton")
     @skipIfRocm("Tensor descriptor not supported on ROCm")
     @skipIfTileIR("TileIR does not support descriptor atomics")
+    @skipUnlessTensorDescriptor("Tensor descriptor support is required")
     def test_dynamic_atomic_add_tensor_descriptor(self):
         """Dynamic shape atomics should register TD layout guards."""
 
@@ -827,6 +831,7 @@ class TestAtomicOperations(RefEagerTestBase, TestCase):
     @onlyBackends("triton")
     @skipIfRocm("Tensor descriptor not supported on ROCm")
     @skipIfTileIR("TileIR does not support descriptor atomics")
+    @skipUnlessTensorDescriptor("Tensor descriptor support is required")
     def test_atomic_td_scalar_symint(self):
         """Composite scalar SymInts should not prevent descriptor atomics."""
 
