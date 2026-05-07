@@ -139,8 +139,8 @@ class Kernel(Generic[_R]):
         self._key_fn: Callable[..., Hashable] | None = key
         self.configs: list[Config] = [
             # pyrefly: ignore [bad-argument-type]
-            Config(**c) if isinstance(c, dict) else c
-            for c in configs or []
+            Config(**config) if isinstance(config, dict) else config
+            for config in configs or []
         ]
         self._bound_kernels: dict[BoundKernelInMemoryCacheKey, BoundKernel] = {}
         self._specialize_extra: dict[
@@ -1169,9 +1169,17 @@ def kernel(
 
     if fn is None:
         return functools.partial(
-            kernel, configs=configs, settings=settings_obj, key=key
+            kernel,
+            configs=configs,
+            settings=settings_obj,
+            key=key,
         )
-    return Kernel(fn, configs=configs, settings=settings_obj, key=key)
+    return Kernel(
+        fn,
+        configs=configs,
+        settings=settings_obj,
+        key=key,
+    )
 
 
 def _hashable_dim(s: int | torch.SymInt) -> Hashable:

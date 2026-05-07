@@ -256,11 +256,13 @@ class ForEachProgramID(ProgramIDs):
     def codegen(self, state: CodegenState) -> None:
         blocks = self._get_cdiv_blocks(state, exclude_last=True)
         if blocks:
+            env = CompileEnvironment.current()
+            block_expr = env.backend.cast_expr(
+                f"({'+ '.join(blocks)})", env.index_type()
+            )
             state.codegen.statements_stack[-1].insert(
                 0,
-                statement_from_string(
-                    f"{self.shared_pid_var} -= ({'+ '.join(blocks)})"
-                ),
+                statement_from_string(f"{self.shared_pid_var} -= {block_expr}"),
             )
 
     def codegen_grid(self) -> ast.AST:
