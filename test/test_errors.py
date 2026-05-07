@@ -12,12 +12,14 @@ from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
+from helion._testing import skipIfCute
 from helion.autotuner.base_search import PopulationBasedSearch
 from helion.autotuner.base_search import PopulationMember
 from helion.autotuner.differential_evolution import DifferentialEvolutionSearch
 from helion.autotuner.external import _FakeEnv
 from helion.exc import InvalidConfig
 import helion.language as hl
+from helion.runtime.settings import _get_backend
 
 
 @helion.kernel()
@@ -36,7 +38,7 @@ def _test_outer_kernel_calling_inner(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
-@onlyBackends(["triton"])
+@onlyBackends(["triton", "cute"])
 class TestErrors(RefEagerTestDisabled, TestCase):
     def test_autotune_no_valid_configs(self):
         class FakeKernel:
@@ -100,6 +102,7 @@ class TestErrors(RefEagerTestDisabled, TestCase):
         ):
             search.autotune()
 
+    @skipIfCute("CuTe lowers the full-row reduction as a row-wise scalar")
     def test_shape_mismatch_missing_keepdims(self):
         """Binary op should detect broadcast shape mismatch from reduction without keep_dims.
 
@@ -145,7 +148,7 @@ class TestErrors(RefEagerTestDisabled, TestCase):
             return out
 
         code, result = code_and_output(fn, (torch.randn(128, 128, device=DEVICE),))
-        self.assertIn("tl.load", code)
+        self.assertIn(".load()" if _get_backend() == "cute" else "tl.load", code)
 
     def test_tile_invalid_range_unpack(self):
         @helion.kernel()
@@ -678,7 +681,7 @@ def _make_fake_kernel():
     return FakeKernel()
 
 
-@onlyBackends(["triton"])
+@onlyBackends(["triton", "cute"])
 class TestInvalidConfig(RefEagerTestDisabled, TestCase):
     """Tests for autotuner robustness to InvalidConfig exceptions."""
 
