@@ -1089,12 +1089,16 @@ def write_results_json(
     # Splice in prior-pass compile times if a side-channel input was given.
     # We DROP this run's helion_compile_time_s records first because the
     # cache-hit verification pass produces 0.0 values that would otherwise
-    # mask the autotune-pass measurements.
+    # mask the autotune-pass measurements. If the splice fails (file
+    # missing/malformed/non-list), we DON'T fall back to keeping the zeros —
+    # we drop them too, so the dashboard renders "absent" instead of a
+    # bogus "0s compile time".
+    splice_succeeded = False
     if compile_time_input:
         if not os.path.exists(compile_time_input):
             print(
                 f"Warning: compile-time input {compile_time_input} not found; "
-                "pass-2 helion_compile_time_s will be missing.",
+                "pass-2 helion_compile_time_s will be omitted.",
                 file=sys.stderr,
             )
         else:
@@ -1112,6 +1116,7 @@ def write_results_json(
                         for r in prior
                         if r.get("metric", {}).get("name") == "helion_compile_time_s"
                     )
+                    splice_succeeded = True
                 else:
                     print(
                         f"Warning: compile-time input {compile_time_input} is not "
@@ -1123,6 +1128,17 @@ def write_results_json(
                     f"Warning: could not splice compile times from {compile_time_input}: {e}",
                     file=sys.stderr,
                 )
+
+    # If we emitted records solely because --compile-time-input was set
+    # (i.e. this run did not measure compile time itself) and the splice
+    # didn't actually replace them, drop the zero-valued records rather
+    # than publishing them as real data.
+    if compile_time_input and not compile_time_measured and not splice_succeeded:
+        records = [
+            r
+            for r in records
+            if r.get("metric", {}).get("name") != "helion_compile_time_s"
+        ]
 
     if os.path.exists(output):
         try:
