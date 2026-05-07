@@ -12,12 +12,14 @@ from pathlib import Path
 import pickle
 import random
 import tempfile
+import time
 from types import SimpleNamespace
 from typing import Callable
 from typing import ClassVar
 from typing import Sequence
 import unittest
 from unittest import skip
+from unittest.mock import Mock
 from unittest.mock import patch
 
 import numpy as np
@@ -40,6 +42,7 @@ from helion._testing import skipIfRefEager
 from helion._testing import skipIfRocm
 from helion._testing import skipIfTileIR
 from helion._testing import skipIfXPU
+from helion._testing import skipUnlessCuteAvailable
 from helion.autotuner import DESurrogateHybrid
 from helion.autotuner import DifferentialEvolutionSearch
 from helion.autotuner import LFBOPatternSearch
@@ -52,6 +55,7 @@ from helion.autotuner.config_fragment import BooleanFragment
 from helion.autotuner.config_fragment import EnumFragment
 from helion.autotuner.config_fragment import IntegerFragment
 from helion.autotuner.config_fragment import ListOf
+from helion.autotuner.config_fragment import NumThreadsFragment
 from helion.autotuner.config_fragment import PermutationFragment
 from helion.autotuner.config_fragment import PowerOfTwoFragment
 from helion.autotuner.config_generation import ConfigGeneration
@@ -61,6 +65,7 @@ from helion.autotuner.local_cache import LocalAutotuneCache
 from helion.autotuner.local_cache import StrictLocalAutotuneCache
 from helion.autotuner.logger import AutotuneLogEntry
 from helion.autotuner.logger import AutotuningLogger
+from helion.autotuner.pattern_search import InitialPopulationStrategy
 from helion.autotuner.random_search import RandomSearch
 import helion.language as hl
 from helion.language import loops
@@ -1810,6 +1815,34 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         result = add(*args)
         torch.testing.assert_close(result, sum(args))
 
+    def test_env_autotune_effort_none_ignores_force_autotune(self):
+        autotuner_fn = Mock(
+            side_effect=AssertionError("autotuner should not run with effort=none")
+        )
+
+        with patch.dict(
+            os.environ,
+            {
+                "HELION_AUTOTUNE_EFFORT": "none",
+                "HELION_FORCE_AUTOTUNE": "1",
+            },
+        ):
+
+            @helion.kernel(autotuner_fn=autotuner_fn)
+            def add(a, b):
+                out = torch.empty_like(a)
+                for tile in hl.tile(out.size()):
+                    out[tile] = a[tile] + b[tile]
+                return out
+
+        args = (
+            torch.randn([8], device=DEVICE),
+            torch.randn([8], device=DEVICE),
+        )
+        result = add(*args)
+        torch.testing.assert_close(result, sum(args))
+        autotuner_fn.assert_not_called()
+
     def test_autotune_effort_quick(self):
         """Test that quick effort profile uses correct default values."""
         # Get the quick profile defaults
@@ -2016,6 +2049,12 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         self.assertEqual(pow2_frag.encode(8), [3.0])  # log2(8) = 3
         self.assertEqual(pow2_frag.encode(16), [4.0])  # log2(16) = 4
 
+        # Test NumThreadsFragment (0 is the CuTe auto-thread sentinel)
+        num_threads_frag = NumThreadsFragment(high=128)
+        self.assertEqual(num_threads_frag.dim(), 1)
+        self.assertEqual(num_threads_frag.encode(0), [0.0])
+        self.assertEqual(num_threads_frag.encode(8), [4.0])
+
         # Test EnumFragment (one-hot encoding)
         enum_frag = EnumFragment(choices=("a", "b", "c"))
         self.assertEqual(enum_frag.dim(), 3)
@@ -2038,11 +2077,27 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             (BooleanFragment(), True),
             (IntegerFragment(1, 10, 5), 5),
             (PowerOfTwoFragment(2, 128, 8), 16),
+            (NumThreadsFragment(128), 0),
             (EnumFragment(choices=("a", "b")), "b"),
         ]:
             dim = fragment.dim()
             encoded = fragment.encode(value)
             self.assertEqual(len(encoded), dim)
+
+    def test_block_size_fragment_autotuner_min_clamp(self):
+        """random_config() must not crash when autotuner_min > max_size."""
+        from examples.attention import attention
+
+        q, k, v = [
+            torch.randn(4, 48, 128, 128, dtype=torch.bfloat16, device=DEVICE)
+            for _ in range(3)
+        ]
+        bound = attention.bind((q, k, v))
+        config_spec = bound.config_spec
+        config_spec.raise_grid_block_minimums()
+        gen = ConfigGeneration(config_spec)
+        config = gen.random_config()
+        self.assertEqual(config["block_sizes"][0], 1)
 
     def test_autotune_benchmark_fn(self) -> None:
         """Test that custom benchmark function is used during rebenchmarking."""
@@ -2397,6 +2452,82 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         )
 
 
+@skipIfRefEager("Autotuning requires compilation, not supported in ref eager mode")
+@skipUnlessCuteAvailable("CUTLASS CuTe Python DSL is not available")
+@onlyBackends(["cute"])
+class TestCuteAutotuner(TestCase):
+    def test_implicit_call_uses_autotuner_fn(self) -> None:
+        calls: list[bool] = []
+
+        def autotuner_fn(bound_kernel, args, **kwargs):
+            class RecordingAutotuner:
+                def autotune(self, *, skip_cache: bool = False):
+                    calls.append(skip_cache)
+                    return bound_kernel.config_spec.default_config()
+
+            return RecordingAutotuner()
+
+        @helion.kernel(
+            backend="cute",
+            autotuner_fn=autotuner_fn,
+            autotune_log_level=0,
+        )
+        def add(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(a)
+            for tile in hl.tile(out.size()):
+                out[tile] = a[tile] + b[tile]
+            return out
+
+        args = (
+            torch.randn([8], device=DEVICE),
+            torch.randn([8], device=DEVICE),
+        )
+        torch.testing.assert_close(add(*args), sum(args))
+        self.assertEqual(calls, [False])
+
+    def test_cute_config_generation_repairs_num_threads(self) -> None:
+        @helion.kernel(backend="cute", autotune_log_level=0)
+        def add(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(a)
+            for tile in hl.tile(out.size()):
+                out[tile] = a[tile] + b[tile]
+            return out
+
+        args = (
+            torch.randn([16, 64], device=DEVICE),
+            torch.randn([16, 64], device=DEVICE),
+        )
+        bound = add.bind(args)
+        gen = ConfigGeneration(bound.config_spec)
+        flat_keys = {
+            key for key, _count, _is_sequence in gen.config_spec.flat_key_layout()
+        }
+        self.assertEqual(flat_keys, {"block_sizes", "num_threads"})
+
+        repaired = gen.unflatten(
+            gen.flatten(helion.Config(block_sizes=[16, 64], num_threads=[128, 128]))
+        )
+        self.assertEqual(repaired.block_sizes, [16, 64])
+        self.assertEqual(repaired.num_threads, [16, 64])
+
+        configs = [gen.random_config() for _ in range(20)]
+        self.assertTrue(any(config.num_threads for config in configs))
+        for config in configs:
+            self.assertLessEqual(set(config.config), {"block_sizes", "num_threads"})
+            self.assertNotIn("persistent", config.pid_type)
+            explicit_threads = [nt for nt in config.num_threads if nt > 0]
+            if explicit_threads:
+                self.assertLessEqual(math.prod(explicit_threads), 1024)
+            for block_size, num_threads in zip(
+                config.block_sizes,
+                config.num_threads,
+                strict=False,
+            ):
+                if num_threads > 0:
+                    self.assertLessEqual(num_threads, block_size)
+                    self.assertEqual(block_size % num_threads, 0)
+
+
 @onlyBackends(["triton"])
 class TestAutotuneRandomSeed(RefEagerTestDisabled, TestCase):
     def _autotune_and_record(self, **settings: object) -> float:
@@ -2525,6 +2656,80 @@ class TestAutotuneCacheSelection(TestCase):
                     bound.settings.autotuner_fn(bound, args)
 
 
+@onlyBackends(["triton"])
+class TestAutotuneSeedConfigs(TestCase):
+    """Tests for seeding initial autotune populations with user configs."""
+
+    def _make_kernel_and_args(self, **kernel_kwargs):
+        @helion.kernel(autotune_log_level=0, **kernel_kwargs)
+        def add(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(a)
+            for tile in hl.tile(out.size()):
+                out[tile] = a[tile] + b[tile]
+            return out
+
+        args = (
+            torch.randn([128], device=DEVICE),
+            torch.randn([128], device=DEVICE),
+        )
+        return add, args
+
+    def _population_configs(self, search: PatternSearch) -> list[helion.Config]:
+        return [
+            search.config_gen.unflatten(flat)
+            for flat in search._generate_initial_population_flat()
+        ]
+
+    def test_decorator_accepts_single_seed_config(self) -> None:
+        seed_config = helion.Config(block_sizes=[16], num_warps=8)
+        add, _args = self._make_kernel_and_args(autotune_seed_configs=seed_config)
+
+        self.assertEqual(add.settings.autotune_seed_configs, seed_config)
+        self.assertEqual(add.configs, [])
+
+    def test_random_initial_population_includes_seed_configs(self) -> None:
+        seed_config = helion.Config(num_warps=8)
+        add, args = self._make_kernel_and_args(autotune_seed_configs=[seed_config])
+        bound = add.bind(args)
+        search = PatternSearch(bound, args, initial_population=3)
+
+        configs = self._population_configs(search)
+
+        self.assertGreaterEqual(len(configs), 3)
+        self.assertTrue(any(config.num_warps == 8 for config in configs))
+
+    def test_best_available_initial_population_includes_seed_configs(self) -> None:
+        seed_config = helion.Config(num_warps=8)
+        add, args = self._make_kernel_and_args(autotune_seed_configs=[seed_config])
+        bound = add.bind(args)
+        search = PatternSearch(
+            bound,
+            args,
+            initial_population_strategy=InitialPopulationStrategy.FROM_BEST_AVAILABLE,
+        )
+
+        with patch.object(BaseSearch, "_find_similar_cached_configs", return_value=[]):
+            configs = self._population_configs(search)
+
+        self.assertGreaterEqual(len(configs), 2)
+        self.assertTrue(any(config.num_warps == 8 for config in configs))
+
+    def test_random_initial_population_logs_invalid_seed_configs(self) -> None:
+        seed_config = helion.Config.from_dict({"block_sizes": ["bad"]})
+        add, args = self._make_kernel_and_args(autotune_seed_configs=[seed_config])
+        bound = add.bind(args)
+        search = PatternSearch(bound, args, initial_population=3)
+        search.log = Mock()
+
+        configs = self._population_configs(search)
+
+        self.assertGreaterEqual(len(configs), 3)
+        search.log.assert_called_once()
+        self.assertIn(
+            "Failed to transfer autotune seed config 1", search.log.call_args[0][0]
+        )
+
+
 @skipIfRefEager("Autotuning requires compilation, not supported in ref eager mode")
 @onlyBackends(["triton"])
 class TestConfigFilter(TestCase):
@@ -2638,6 +2843,317 @@ class TestConfigFilter(TestCase):
         # The result configs should reflect the overridden values
         self.assertEqual(results[0].config.get("num_warps"), 2)
         self.assertEqual(results[1].config.get("num_warps"), 2)
+
+
+class TestFiniteSearchWarmStart(TestCase):
+    """Tests for helion.from_cache() — a CachedFiniteSearch autotuner_fn."""
+
+    def _make_kernel_and_args(self):
+        @helion.kernel(autotune_log_level=0)
+        def add(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(a)
+            for tile in hl.tile(out.size()):
+                out[tile] = a[tile] + b[tile]
+            return out
+
+        args = (
+            torch.randn([128], device=DEVICE),
+            torch.randn([128], device=DEVICE),
+        )
+        return add, args
+
+    @staticmethod
+    def _fake_cache_random(count):
+        """Patch _find_similar_cached_configs to return `count` distinct backend-agnostic flats."""
+        from helion.autotuner.local_cache import SavedBestConfig
+
+        def fake_find(search_self, max_configs):
+            distinct: list[tuple] = []
+            for _ in range(20):
+                if len(distinct) >= count:
+                    break
+                batch = search_self.config_gen.random_population_flat(
+                    max(count * 3, 10)
+                )
+                for flat in batch:
+                    t = tuple(flat)
+                    if t not in distinct:
+                        distinct.append(t)
+                        if len(distinct) >= count:
+                            break
+            out = []
+            for flat in distinct[:max_configs]:
+                out.append(
+                    SavedBestConfig(
+                        hardware="x",
+                        specialization_key="x",
+                        config=search_self.config_gen.unflatten(list(flat)),
+                        config_spec_hash="x",
+                        flat_config=flat,
+                    )
+                )
+            return out
+
+        return fake_find
+
+    def test_from_cache_factory(self):
+        """helion.from_cache() returns a callable that creates a CachedFiniteSearch."""
+
+        add, args = self._make_kernel_and_args()
+        bound = add.bind(args)
+        fn = helion.from_cache()
+        self.assertTrue(callable(fn))
+        with (
+            patch.object(BaseSearch, "_find_similar_cached_configs", return_value=[]),
+            self.assertRaises(exc.NotEnoughConfigs),
+        ):
+            fn(bound, args)
+
+    def test_from_cache_empty_cache_raises(self):
+        """CachedFiniteSearch with empty cache and no explicit configs raises NotEnoughConfigs."""
+        from helion.autotuner.finite_search import CachedFiniteSearch
+
+        add, args = self._make_kernel_and_args()
+        bound = add.bind(args)
+        with (
+            patch.object(BaseSearch, "_find_similar_cached_configs", return_value=[]),
+            self.assertRaises(exc.NotEnoughConfigs),
+        ):
+            CachedFiniteSearch(bound, args)
+
+    def test_from_cache_prepends_cached(self):
+        """Cached configs appear before explicit configs in CachedFiniteSearch.configs."""
+        from helion.autotuner.finite_search import CachedFiniteSearch
+
+        cfg1 = helion.Config(block_sizes=[16])
+        add, args = self._make_kernel_and_args()
+        bound = add.bind(args)
+        fake_fn = self._fake_cache_random(2)
+        fake_sizes: list[int] = []
+
+        def spy(search_self, max_configs):
+            result = fake_fn(search_self, max_configs)
+            fake_sizes.append(len(result))
+            return result
+
+        with patch.object(BaseSearch, "_find_similar_cached_configs", spy):
+            search = CachedFiniteSearch(bound, args, configs=[cfg1])
+        self.assertEqual(len(search.configs), fake_sizes[0] + 1)
+        self.assertEqual(search.configs[-1], cfg1)
+
+    def test_from_cache_respects_max_parameter(self):
+        """from_cache(max_configs=N) caps the number of cached configs."""
+        from helion.autotuner.finite_search import CachedFiniteSearch
+
+        cfg1 = helion.Config(block_sizes=[16])
+        add, args = self._make_kernel_and_args()
+        bound = add.bind(args)
+        observed_caps: list[int] = []
+        fake_sizes: list[int] = []
+        fake_fn = self._fake_cache_random(5)
+
+        def spy(search_self, max_configs):
+            observed_caps.append(max_configs)
+            result = fake_fn(search_self, max_configs)
+            fake_sizes.append(len(result))
+            return result
+
+        with patch.object(BaseSearch, "_find_similar_cached_configs", spy):
+            search = CachedFiniteSearch(bound, args, configs=[cfg1], max_configs=2)
+        self.assertEqual(observed_caps, [2])
+        self.assertLessEqual(fake_sizes[0], 2)
+        self.assertEqual(len(search.configs), fake_sizes[0] + 1)
+
+    def test_from_cache_uses_default_cap_from_settings(self):
+        """Without max_configs, the cap falls back to autotune_best_available_max_configs."""
+        from helion.autotuner.finite_search import CachedFiniteSearch
+
+        cfg1 = helion.Config(block_sizes=[16])
+        add, args = self._make_kernel_and_args()
+        bound = add.bind(args)
+        observed_caps: list[int] = []
+        fake_sizes: list[int] = []
+        fake_fn = self._fake_cache_random(5)
+
+        def spy(search_self, max_configs):
+            observed_caps.append(max_configs)
+            result = fake_fn(search_self, max_configs)
+            fake_sizes.append(len(result))
+            return result
+
+        with patch.object(BaseSearch, "_find_similar_cached_configs", spy):
+            search = CachedFiniteSearch(bound, args, configs=[cfg1])
+        cap_in_effect = search.settings.autotune_best_available_max_configs
+        self.assertEqual(observed_caps, [cap_in_effect])
+        self.assertLessEqual(fake_sizes[0], cap_in_effect)
+        self.assertEqual(len(search.configs), fake_sizes[0] + 1)
+
+    def test_kernel_autotuner_fn_accepts_from_cache(self):
+        """@helion.kernel(autotuner_fn=helion.from_cache()) stores the callable in settings."""
+        fn = helion.from_cache()
+
+        @helion.kernel(autotuner_fn=fn, autotune_log_level=0)
+        def add(a, b):
+            out = torch.empty_like(a)
+            for tile in hl.tile(out.size()):
+                out[tile] = a[tile] + b[tile]
+            return out
+
+        args = (
+            torch.randn([128], device=DEVICE),
+            torch.randn([128], device=DEVICE),
+        )
+        bound = add.bind(args)
+        self.assertIs(bound.settings.autotuner_fn, fn)
+
+
+@onlyBackends(["triton"])
+class TestAutotuneBudget(TestCase):
+    def _make_search(self, settings: Settings) -> BaseSearch:
+        search = BaseSearch.__new__(BaseSearch)
+        search.settings = settings
+        search.kernel = SimpleNamespace(
+            format_kernel_decorator=lambda config, s: "decorator",
+            to_triton_code=lambda config: "code",
+            maybe_log_repro=lambda log_func, args, config=None: None,
+        )
+        search.args = ()
+        search.log = AutotuningLogger(settings)
+        search.config_spec = SimpleNamespace(default_config=dict)
+        search._benchmark_provider_cls = LocalBenchmarkProvider
+        search.best_perf_so_far = float("inf")
+        search._prepared = False
+        with patch.object(
+            LocalBenchmarkProvider,
+            "_compute_baseline",
+            return_value=(None, [], None),
+        ):
+            search._prepare()
+        return search
+
+    def test_setting_default_is_none(self) -> None:
+        with without_env_var("HELION_AUTOTUNE_BUDGET_SECONDS"):
+            settings = Settings()
+        self.assertIsNone(settings.autotune_budget_seconds)
+
+    def test_setting_from_env_var(self) -> None:
+        with patch.dict(
+            os.environ,
+            {"HELION_AUTOTUNE_BUDGET_SECONDS": "300"},
+            clear=False,
+        ):
+            settings = Settings()
+        self.assertEqual(settings.autotune_budget_seconds, 300)
+
+    def test_setting_from_kwarg(self) -> None:
+        settings = Settings(autotune_budget_seconds=42)
+        self.assertEqual(settings.autotune_budget_seconds, 42)
+
+    def test_no_budget_yields_full_range(self) -> None:
+        settings = Settings(
+            autotune_budget_seconds=None,
+            autotune_log_level=logging.CRITICAL,
+        )
+        search = self._make_search(settings)
+        search._autotune_budget_start = time.perf_counter() - 1e9
+        self.assertEqual(list(search._budgeted_range(1, 4)), [1, 2, 3])
+
+    def test_budget_yields_while_time_remains(self) -> None:
+        settings = Settings(
+            autotune_budget_seconds=600,
+            autotune_log_level=logging.CRITICAL,
+        )
+        search = self._make_search(settings)
+        self.assertEqual(list(search._budgeted_range(1, 4)), [1, 2, 3])
+
+    def test_budget_stops_range_when_elapsed_exceeds(self) -> None:
+        settings = Settings(
+            autotune_budget_seconds=1,
+            autotune_log_level=logging.CRITICAL,
+        )
+        search = self._make_search(settings)
+        search._autotune_budget_start = time.perf_counter() - 2.0
+        search.log = Mock()
+        self.assertEqual(list(search._budgeted_range(10)), [])
+        search.log.assert_called_once()
+
+    def test_budget_unset_when_prepare_not_called(self) -> None:
+        settings = Settings(
+            autotune_budget_seconds=1,
+            autotune_log_level=logging.CRITICAL,
+        )
+        search = BaseSearch.__new__(BaseSearch)
+        search.settings = settings
+        search._autotune_budget_start = None
+        self.assertEqual(list(search._budgeted_range(3)), [0, 1, 2])
+
+    def test_budget_resets_when_prepare_called_again(self) -> None:
+        settings = Settings(
+            autotune_budget_seconds=60,
+            autotune_log_level=logging.CRITICAL,
+        )
+        search = self._make_search(settings)
+        search._autotune_budget_start = time.perf_counter() - 100.0
+        self.assertEqual(list(search._budgeted_range(1)), [])
+
+        search._prepared = False
+        with patch.object(
+            LocalBenchmarkProvider,
+            "_compute_baseline",
+            return_value=(None, [], None),
+        ):
+            search._prepare()
+        self.assertEqual(list(search._budgeted_range(1)), [0])
+
+    def test_budget_zero_immediately_exhausts(self) -> None:
+        settings = Settings(
+            autotune_budget_seconds=0,
+            autotune_log_level=logging.CRITICAL,
+        )
+        search = self._make_search(settings)
+        time.sleep(0.001)
+        self.assertEqual(list(search._budgeted_range(10)), [])
+
+    def test_setting_has_user_facing_description(self) -> None:
+        self.assertIn("autotune_budget_seconds", Settings.__slots__)
+        description = Settings.__slots__["autotune_budget_seconds"]
+        self.assertIn("HELION_AUTOTUNE_BUDGET_SECONDS", description)
+        self.assertIn("best", description.lower())
+
+    def test_generation_loops_use_budgeted_range(self) -> None:
+        import inspect
+
+        from helion.autotuner.de_surrogate_hybrid import DESurrogateHybrid
+        from helion.autotuner.differential_evolution import DifferentialEvolutionSearch
+        from helion.autotuner.llm_search import LLMGuidedSearch
+        from helion.autotuner.pattern_search import PatternSearch
+        from helion.autotuner.surrogate_pattern_search import LFBOPatternSearch
+
+        for cls in (
+            DESurrogateHybrid,
+            DifferentialEvolutionSearch,
+            LLMGuidedSearch,
+            PatternSearch,
+            LFBOPatternSearch,
+        ):
+            source = inspect.getsource(cls)
+            self.assertIn(
+                "_budgeted_range",
+                source,
+                f"{cls.__name__} should use _budgeted_range for generation loops",
+            )
+
+    def test_finishing_phase_respects_budget(self) -> None:
+        import inspect
+
+        from helion.autotuner.base_search import PopulationBasedSearch
+
+        source = inspect.getsource(PopulationBasedSearch.run_finishing_phase)
+        self.assertIn(
+            "_budgeted_range",
+            source,
+            "run_finishing_phase should stop when the autotune budget is exhausted",
+        )
 
 
 if __name__ == "__main__":

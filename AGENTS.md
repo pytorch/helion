@@ -50,7 +50,8 @@ This document explains how to work effectively in this repository.
 ## Agent-Specific Instructions
 
 - Do NOT run `pip install`, networked installs, or system package managers.
-- Do NOT run `git commit` or `git push`; users handle commits/branches.
+- Do NOT run `git commit` unless asked to directly.
+- Do NOT run `git push`; users handle updating PRs.
 - Do NOT `print()` inside kernels; use logging or host-side code.
 - Tile indexing preserves dimensions; `i = hl.tile(...); x[i]` keeps ranks.
 - Do NOT add unnecessary error checks via `hasattr`, `getattr`, `except`, etc.

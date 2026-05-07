@@ -238,12 +238,12 @@ def _(state: CodegenState) -> object:
     Otherwise falls through to the common ``ForLoopGraphInfo.codegen`` path.
     """
     config = state.config
-    pallas_loop_type = config.get("pallas_loop_type", "default")
+    pallas_loop_type = config.get("pallas_loop_type", "unroll")
     if pallas_loop_type == "emit_pipeline":
         return _codegen_emit_pipeline(state)
     if pallas_loop_type == "fori_loop":
         return _codegen_fori_loop(state)
-    # default: fall through to common codegen path
+    # unroll: fall through to common codegen path
     # pyrefly: ignore[bad-return]
     return state.get_graph(state.proxy_arg(0)).codegen(state)
 
@@ -252,7 +252,7 @@ def _(state: CodegenState) -> object:
 def _(state: CodegenState) -> None:
     """Emit inner stepped device loops for Pallas/TPU."""
     config = state.config
-    pallas_loop_type = config.get("pallas_loop_type", "default")
+    pallas_loop_type = config.get("pallas_loop_type", "unroll")
     if pallas_loop_type == "emit_pipeline":
         _codegen_emit_pipeline(state)
         return None
@@ -355,6 +355,28 @@ def _find_strategy(
     return strategy
 
 
+def _get_loop_begin_and_end(
+    state: CodegenState, loop_dim_index: int
+) -> tuple[str, str]:
+    """Extract the begin and end values from the _for_loop state args."""
+    ast_begins = state.ast_args[1]
+    ast_ends = state.ast_args[2]
+    begins = list(ast_begins) if isinstance(ast_begins, (list, tuple)) else [ast_begins]
+    ends = list(ast_ends) if isinstance(ast_ends, (list, tuple)) else [ast_ends]
+
+    def _to_str(value: object) -> str:
+        if isinstance(value, ast.AST):
+            return ast.unparse(value)
+        return str(value)
+
+    return _to_str(begins[loop_dim_index]), _to_str(ends[loop_dim_index])
+
+
+def _get_loop_numel(state: CodegenState, loop_dim_index: int) -> str:
+    begin, end = _get_loop_begin_and_end(state, loop_dim_index)
+    return f"(({end}) - ({begin}))"
+
+
 def _compute_grid_and_block_sizes(
     state: CodegenState,
     block_ids: list[int],
@@ -363,14 +385,14 @@ def _compute_grid_and_block_sizes(
     """Compute grid dimensions and block size vars for the given block_ids."""
     grid_parts: list[str] = []
     block_size_vars: list[str] = []
-    for block_id in block_ids:
+    for i, block_id in enumerate(block_ids):
         block_size_var = state.device_function.block_size_var(block_id)
         assert block_size_var is not None
         block_size_vars.append(block_size_var)
         block_value = env.block_sizes[block_id].from_config(state.config)
         if block_value is not None:
             state.device_function.constexpr_arg(block_size_var, block_value)
-        numel_expr = state.sympy_expr(env.block_sizes[block_id].numel)
+        numel_expr = _get_loop_numel(state, i)
         grid_parts.append(
             env.backend.cdiv_expr(numel_expr, block_size_var, is_device=True)
         )
@@ -383,11 +405,8 @@ def _pallas_loop_begin_and_step_exprs(
     block_size_vars: list[str],
 ) -> tuple[list[str], list[str], list[str]]:
     """Return begin, per-iteration step, and slice-size expressions for loop dims."""
-    begins = state.proxy_arg(1)
     steps = state.proxy_arg(4) if len(state.proxy_args) > 4 else None
 
-    if not isinstance(begins, (list, tuple)):
-        begins = [begins]
     if not isinstance(steps, (list, tuple)):
         steps = [steps] * len(block_ids)
 
@@ -396,9 +415,8 @@ def _pallas_loop_begin_and_step_exprs(
     slice_size_exprs: list[str] = []
 
     for i in range(len(block_ids)):
-        begin = begins[i]
         step = steps[i]
-        begin_expr = state.sympy_expr(sympy.sympify(begin))
+        begin_expr, _ = _get_loop_begin_and_end(state, i)
         if step is None or sympy.sympify(step) in (
             sympy.Integer(0),
             sympy.Integer(1),
@@ -413,6 +431,30 @@ def _pallas_loop_begin_and_step_exprs(
         slice_size_exprs.append(slice_size_expr)
 
     return begin_exprs, iter_step_exprs, slice_size_exprs
+
+
+def _compute_pipeline_or_dma_extra_pad(
+    begin_expr: str,
+    bid: int,
+    env: CompileEnvironment,
+    state: CodegenState,
+) -> int:
+    """Return extra host-side padding for a pipeline/DMA dim with a non-zero begin.
+
+    When ``pl.ds(offset, block_size)`` reads from a tensor whose loop starts
+    at a non-zero begin, the last block can overshoot the tensor boundary
+    beyond what ``(-shape) % block_size`` accounts for.  The worst case is
+    ``block_size - 1`` extra elements when the begin is data-dependent.
+
+    # TODO(dunfanlu): if begin isn't "0" but is another constexpr int,
+    # we should be able to use a smaller padding than bs-1?
+    """
+    if begin_expr == "0":
+        return 0
+    bs_val = env.block_sizes[bid].from_config(state.config)
+    if isinstance(bs_val, int):
+        return bs_val - 1
+    return 0
 
 
 def _scratch_read(state: CodegenState, sname: str) -> str:
@@ -477,21 +519,13 @@ def _setup_loop_carried_state(
             continue
         if isinstance(proxy, torch.Tensor):
             assert isinstance(arg_ast, ast.Name)
-            # Reuse existing scratch if the init value is already in one
-            # (e.g. from hl.full / hl.zeros). Otherwise allocate new.
-            existing = any(
-                s.name == arg_ast.id for s in state.device_function._scratch_args
+            shape = _resolve_shape(proxy, env, state.config)
+            dtype = proxy.dtype
+            scratch_name = state.device_function.register_scratch(
+                shape, dtype, name_hint=f"scratch_{i}"
             )
-            if existing:
-                scratch_name = arg_ast.id
-            else:
-                shape = _resolve_shape(proxy, env, state.config)
-                dtype = proxy.dtype
-                scratch_name = state.device_function.register_scratch(
-                    shape, dtype, name_hint=f"scratch_{i}"
-                )
-                # Initialize scratch with the arg value.
-                state.add_statement(_scratch_write_stmt(state, scratch_name, arg_ast))
+            # Initialize scratch with the arg value.
+            state.add_statement(_scratch_write_stmt(state, scratch_name, arg_ast))
             scratch_names.append(scratch_name)
 
             # Result will be read after loop
@@ -502,6 +536,27 @@ def _setup_loop_carried_state(
             result_vars.append(arg_ast)
 
     return scratch_names, result_vars, carried
+
+
+def _emit_nonlocal_scratch_declarations(
+    state: CodegenState,
+    body_stmts: list[ast.AST],
+) -> None:
+    """Insert ``nonlocal <scratch>`` at the top of the closure body.
+
+    Without ``nonlocal``, an assignment like ``scratch = scratch[...]`` inside
+    a fori_loop/emit_pipeline closure makes ``scratch`` local to the entire
+    function, causing an UnboundLocalError on the RHS read.
+
+    We emit nonlocal for *all* VMEM scratch args, not just the current loop's
+    carried state, because an outer loop body may contain ``scratch = scratch[...]``
+    from a nested inner loop's ``_read_final_loop_state``.
+    """
+    names = [
+        s.name for s in state.device_function._scratch_args if s.scratch_type == "vmem"
+    ]
+    if names:
+        body_stmts.insert(0, ast.Nonlocal(names=names))
 
 
 def _remap_args_to_scratch(
@@ -556,6 +611,49 @@ def _read_final_loop_state(
     return final_results
 
 
+def _emit_inner_loop_offset_indices(
+    state: CodegenState,
+    strategy: object,
+    block_ids: list[int],
+    block_size_vars: list[str],
+    begin_exprs: list[str],
+    iter_step_exprs: list[str],
+    loop_index_exprs: list[str],
+    env: CompileEnvironment,
+    body_stmts: list[ast.AST],
+) -> None:
+    """Emit ``offset_<bid> = …`` and ``indices_<bid> = …`` at the inner-loop
+    body prologue, using the canonical names from ``strategy``.
+
+    Used by ``_codegen_emit_pipeline`` and ``_codegen_fori_loop`` so kernel
+    code that references ``tile.index`` (lowered to ``indices_<bid>``) or
+    ``pl.ds`` offsets (``offset_<bid>``) sees defined symbols regardless of
+    whether the inner block is divisible.  Both vars are allocated
+    ``dce=True``, so unused emissions are pruned downstream.
+
+    Args:
+        loop_index_exprs: Per-block-id expression for the inner-loop iteration
+            index (``_pipeline_indices[i]`` for emit_pipeline; the fori_loop
+            variable like ``_j`` for fori_loop).  Combined with ``begin_exprs``
+            and ``iter_step_exprs`` to form the absolute start of the tile.
+    """
+    for i, bid in enumerate(block_ids):
+        offset_name = strategy.offset_var(bid)  # type: ignore[attr-defined]
+        index_name = strategy.index_var(bid)  # type: ignore[attr-defined]
+        idx_expr = env.backend.loop_index_expr(
+            offset_name, block_size_vars[i], env.index_type(), axis=0
+        )
+        body_stmts.extend(
+            [
+                statement_from_string(
+                    f"{offset_name} = ({begin_exprs[i]}) + "
+                    f"({loop_index_exprs[i]}) * ({iter_step_exprs[i]})"
+                ),
+                statement_from_string(f"{index_name} = {idx_expr}"),
+            ]
+        )
+
+
 def _setup_inner_loop_masks(
     state: CodegenState,
     strategy: object,
@@ -578,7 +676,7 @@ def _setup_inner_loop_masks(
         for i, bid in enumerate(block_ids):
             block_value = env.block_sizes[bid].from_config(state.config)
             assert isinstance(block_value, int)
-            numel_expr = state.sympy_expr(env.block_sizes[bid].numel)
+            numel_expr = _get_loop_numel(state, i)
             offset_var = state.device_function.new_var(f"offset_{bid}")
             mask_stmt = strategy._setup_mask(
                 state, bid, block_value, offset_var, numel_expr
@@ -987,12 +1085,89 @@ def _rewrite_outer_subscripts_for_pre_broadcast(
                 )
                 reshaped.append(node)
 
+    # Insert _pre_broadcast_tile where pre-broadcast outer nodes feed wider-dim ops.
+    # First, propagate pre-broadcast status transitively through indirect consumers.
+    # After rewriting subscript[:, :, None] → subscript[:, :], downstream nodes
+    # (e.g. add, rsqrt) may still have stale meta shapes (u0, u1, 1) from trace
+    # time. We identify them by checking if any arg is pre-broadcast — if so,
+    # the node is also pre-broadcast (its real last dim is PRE_BROADCAST_SIZE).
+    all_pre_broadcast_outer: set[str] = set(pre_broadcast_outer_nodes)
+    all_pre_broadcast_outer.update(node.name for node in reshaped)
+    for node in outer_graph.nodes:
+        if node.op != "call_function" or node.name in all_pre_broadcast_outer:
+            continue
+        node_val = node.meta.get("val", None)
+        if not isinstance(node_val, torch.Tensor) or len(node_val.shape) < 2:
+            continue
+        last_dim = node_val.shape[-1]
+        if isinstance(last_dim, torch.SymInt):
+            continue
+        last_dim_int = int(last_dim)
+        if last_dim_int > PRE_BROADCAST_SIZE:
+            continue
+        has_pre_broadcast_arg = False
+        for arg in node.args:
+            if isinstance(arg, torch.fx.Node) and arg.name in all_pre_broadcast_outer:
+                arg_val = arg.meta.get("val", None)
+                if isinstance(arg_val, torch.Tensor) and len(arg_val.shape) >= 2:
+                    arg_last = arg_val.shape[-1]
+                    if isinstance(arg_last, int) and arg_last == PRE_BROADCAST_SIZE:
+                        has_pre_broadcast_arg = True
+                        break
+        if has_pre_broadcast_arg:
+            new_shape = [*node_val.shape[:-1], PRE_BROADCAST_SIZE]
+            node.meta["val"] = node_val.new_empty(new_shape)
+            all_pre_broadcast_outer.add(node.name)
+            reshaped.append(node)
+
+    new_nodes: list[torch.fx.Node] = []
+    for node in list(outer_graph.nodes):
+        if node.op != "call_function" or node.name in all_pre_broadcast_outer:
+            continue
+        node_val = node.meta.get("val", None)
+        if not isinstance(node_val, torch.Tensor) or len(node_val.shape) < 2:
+            continue
+        last_dim = node_val.shape[-1]
+        last_dim_is_sym = isinstance(last_dim, torch.SymInt)
+        if not last_dim_is_sym and int(last_dim) <= PRE_BROADCAST_SIZE:
+            continue
+        args_list = list(node.args)
+        changed = False
+        for ai, arg in enumerate(args_list):
+            if not isinstance(arg, torch.fx.Node):
+                continue
+            if arg.name not in all_pre_broadcast_outer:
+                continue
+            arg_val = arg.meta.get("val", None)
+            if not isinstance(arg_val, torch.Tensor):
+                continue
+            if not (
+                isinstance(arg_val.shape[-1], int)
+                and arg_val.shape[-1] == PRE_BROADCAST_SIZE
+            ):
+                continue
+            with outer_graph.inserting_before(node):
+                tiled = outer_graph.call_function(
+                    _pre_broadcast_tile,
+                    args=(arg, last_dim),
+                )
+            tiled.meta = {
+                **arg.meta,
+                "val": arg_val.new_empty([*arg_val.shape[:-1], last_dim]),
+            }
+            new_nodes.append(tiled)
+            args_list[ai] = tiled
+            changed = True
+        if changed:
+            node.args = tuple(args_list)
+
     # Re-prepare lowerings for modified outer nodes
-    if reshaped:
+    all_to_prepare = reshaped + new_nodes
+    if all_to_prepare:
         with compile_lock:
             graph_lowering = FakeGraphLowering()
             with V.set_graph_handler(graph_lowering):
-                for node in reshaped:
+                for node in all_to_prepare:
                     if node.op == "call_function":
                         with node.meta["location"]:
                             prepare_node_lowering(graph_lowering, node)
@@ -1255,6 +1430,13 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
         state, block_ids, block_size_vars
     )
 
+    # Aligned tensors flow through emit_pipeline's per-iter Buffered
+    # BlockSpec; unaligned ones stay on the outer pallas_call BlockSpec
+    # (escape clause `bs == as`) and are closure-read from the body.
+    all_tensor_info, _vmem_shapes, aligned_tensor_ids = _classify_pipelined_tensors(
+        loaded_tensors, stored_tensors, block_ids, slice_size_exprs, env, state
+    )
+
     # Build in_specs and out_specs
     in_tensors: list[tuple[torch.Tensor, str]] = []
     out_tensors: list[tuple[torch.Tensor, str]] = []
@@ -1310,7 +1492,10 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
                 block_shape_parts.append(slice_size_expr)
                 from .memory_ops import _record_pad_info
 
-                _record_pad_info(state, fake, dim_idx, bid)
+                extra_pad = _compute_pipeline_or_dma_extra_pad(
+                    begin_expr, bid, env, state
+                )
+                _record_pad_info(state, fake, dim_idx, bid, extra_pad)
                 if begin_expr == "0" and iter_step_expr == slice_size_expr:
                     lambda_parts.append(lambda_params[bid_idx])
                 else:
@@ -1390,18 +1575,20 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
             env,
         )
 
-    # Record which tensors are in the pipeline body (need HBM refs)
     from .._compiler.device_function import PallasMemorySpace
 
     for fake, _tensor_node, _sub_meta in loaded_tensors.values():
-        state.device_function.pallas_memory_space[id(fake)] = PallasMemorySpace.HBM
+        if id(fake) in aligned_tensor_ids:
+            state.device_function.pallas_memory_space[id(fake)] = PallasMemorySpace.HBM
     for fake, _tensor_node, _sub_meta in stored_tensors.values():
-        state.device_function.pallas_memory_space[id(fake)] = PallasMemorySpace.HBM
+        if id(fake) in aligned_tensor_ids:
+            state.device_function.pallas_memory_space[id(fake)] = PallasMemorySpace.HBM
 
-    # Process loaded tensors (inputs to pipeline)
     for key, (fake, _tensor_node, sub_meta) in loaded_tensors.items():
         if key in stored_tensors:
             continue  # Handle as output instead
+        if id(fake) not in aligned_tensor_ids:
+            continue
         hbm_name = state.device_function.tensor_arg(fake).name
         vmem_name = state.device_function.new_var(
             hbm_name.replace("_hbm", "") + "_vmem"
@@ -1409,11 +1596,11 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
         in_tensors.append((fake, hbm_name))
         in_specs.append(_make_block_spec(fake, sub_meta))
         body_params.append(vmem_name)
-        # Pass full HBM ref -- BlockSpec lambda handles outer grid indexing
         pipeline_in_args.append(hbm_name)
 
-    # Process stored tensors (outputs of pipeline, may also be read)
     for fake, _tensor_node, sub_meta in stored_tensors.values():
+        if id(fake) not in aligned_tensor_ids:
+            continue
         hbm_name = state.device_function.tensor_arg(fake).name
         vmem_name = state.device_function.new_var(
             hbm_name.replace("_hbm", "") + "_vmem"
@@ -1421,7 +1608,6 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
         out_tensors.append((fake, hbm_name))
         out_specs.append(_make_block_spec(fake, sub_meta))
         body_params.append(vmem_name)
-        # Pass full HBM ref -- BlockSpec lambda handles outer grid indexing
         pipeline_out_args.append(hbm_name)
 
     # Build the body function
@@ -1431,14 +1617,29 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
     # Build block_id_to_info for the pipeline state
     block_id_to_info: dict[int, LoopDimInfo] = {}
     for block_id in block_ids:
+        block_size = env.block_sizes[block_id]
+        # when the block_size.size is None, we cannot form a SymPy expr for the numel
+        sympy_end_expr = block_size.numel if block_size.size is not None else None
         block_id_to_info[block_id] = LoopDimInfo(
             end_var_name=None,
-            end_expr=env.block_sizes[block_id].numel,
+            end_expr=sympy_end_expr,
         )
 
     strategy = _find_strategy(state, block_ids)
-    # Set up mask variables for inner-loop block_ids.
-    _needs_explicit_indices = _setup_inner_loop_masks(
+    # Emit offset_<bid>/indices_<bid> at the body prologue.
+    _emit_inner_loop_offset_indices(
+        state,
+        strategy,
+        block_ids,
+        block_size_vars,
+        begin_exprs,
+        iter_step_exprs,
+        [f"_pipeline_indices[{i}]" for i in range(len(block_ids))],
+        env,
+        body_stmts,
+    )
+    # Set up mask variables for inner-loop block_ids (non-divisible bounds).
+    _setup_inner_loop_masks(
         state,
         strategy,
         block_ids,
@@ -1450,14 +1651,32 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
             f"_pipeline_indices[{i}] * {bs} + jnp.arange({bs})"
         ),
     )
-    # Build tensor_to_vmem mapping
-    tensor_to_vmem: dict[str, str] = {}
+
+    # Emit absolute offset assignments inside the pipeline body so any
+    # non-pipelined tensors (those left on their outer BlockSpec) can be
+    # sliced via pl.ds against a VMEM ref whose extent is the whole
+    # outer-block window.  Pipelined tensors ignore these offsets and
+    # use the ``:`` full-slice inside their VMEM scratches.
+    any_non_pipelined = len(aligned_tensor_ids) < len(all_tensor_info)
+    if any_non_pipelined:
+        _needs_explicit_indices = True
+        for i, bid in enumerate(block_ids):
+            offset_name = strategy.offset_var(bid)
+            body_stmts.append(
+                statement_from_string(
+                    f"{offset_name} = ({begin_exprs[i]}) + "
+                    f"(_pipeline_indices[{i}]) * ({iter_step_exprs[i]})"
+                )
+            )
+
+    # Build tensor_to_dma_scratch mapping
+    tensor_to_dma_scratch: dict[str, str] = {}
     idx = 0
     for _fake, hbm_name in in_tensors:
-        tensor_to_vmem[hbm_name] = body_params[idx]
+        tensor_to_dma_scratch[hbm_name] = body_params[idx]
         idx += 1
     for _fake, hbm_name in out_tensors:
-        tensor_to_vmem[hbm_name] = body_params[idx]
+        tensor_to_dma_scratch[hbm_name] = body_params[idx]
         idx += 1
 
     # Create the pipeline loop state
@@ -1466,8 +1685,8 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
         block_id_to_info=block_id_to_info,
         body_fn_name=body_fn_name,
         inner_statements=body_stmts,
+        _tensor_to_dma_scratch=tensor_to_dma_scratch,
     )
-    pipeline_state._tensor_to_vmem = tensor_to_vmem  # type: ignore[attr-defined]
 
     # For loop-carried state, remap args to scratch reads inside the body
     body_args = (
@@ -1486,12 +1705,12 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
         if has_loop_state:
             _write_back_loop_carried(state, scratch_names, carried, graph_results)
 
+    _emit_nonlocal_scratch_declarations(state, body_stmts)
+
     all_body_params = body_params
-    if _needs_explicit_indices:
-        # emit_pipeline passes indices as a single tuple argument
-        fn_args = "_pipeline_indices, " + ", ".join(all_body_params)
-    else:
-        fn_args = ", ".join(all_body_params)
+    # emit_pipeline passes indices as a single tuple argument; the prologue
+    # always references _pipeline_indices, so the body always takes it.
+    fn_args = "_pipeline_indices, " + ", ".join(all_body_params)
     fn_def = statement_from_string(f"def {body_fn_name}({fn_args}): pass")
     assert isinstance(fn_def, ast.FunctionDef)
     fn_def.body = body_stmts or [ast.Pass()]  # pyrefly: ignore[bad-assignment]
@@ -1506,8 +1725,7 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
         spec_parts.append(f"in_specs=[{in_specs_str}]")
     if out_specs:
         spec_parts.append(f"out_specs=[{out_specs_str}]")
-    if _needs_explicit_indices:
-        spec_parts.append("_explicit_indices=True")
+    spec_parts.append("_explicit_indices=True")
     specs_str = ", ".join(spec_parts)
 
     all_pipeline_args = pipeline_in_args + pipeline_out_args
@@ -1533,8 +1751,8 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
     return None
 
 
-def _check_dma_alignment(vmem_shapes: list[tuple[int, ...]]) -> bool:
-    """Check if all VMEM buffer shapes satisfy TPU DMA alignment.
+def _check_dma_alignment(vmem_shape: tuple[int, ...]) -> bool:
+    """Check if a VMEM buffer shape satisfies TPU DMA alignment.
 
     DMA requires last dim % 128 == 0 and second-to-last dim % 8 == 0
     for 2D+ tensors. Note that these rules are currently optimized for
@@ -1546,15 +1764,10 @@ def _check_dma_alignment(vmem_shapes: list[tuple[int, ...]]) -> bool:
     emit_pipeline/fori_loop inner DMA does NOT have a ``block == tensor_dim``
     exception.
     """
-    for shape in vmem_shapes:
-        if len(shape) >= 2:
-            if shape[-1] % 128 != 0:
-                return False
-            if shape[-2] % 8 != 0:
-                return False
-        elif len(shape) == 1:
-            if shape[0] % 128 != 0:
-                return False
+    if len(vmem_shape) >= 2:
+        return vmem_shape[-1] % 128 == 0 and vmem_shape[-2] % 8 == 0
+    if len(vmem_shape) == 1:
+        return vmem_shape[0] % 128 == 0
     return True
 
 
@@ -1593,6 +1806,42 @@ def _compute_vmem_shapes(
                 parts.append(int(fake.shape[dim_idx]))
         vmem_shapes.append(tuple(parts))
     return vmem_shapes
+
+
+def _classify_pipelined_tensors(
+    loaded_tensors: dict[int, tuple[torch.Tensor, torch.fx.Node, list[object]]],
+    stored_tensors: dict[int, tuple[torch.Tensor, torch.fx.Node, list[object]]],
+    block_ids: list[int],
+    slice_size_exprs: list[str],
+    env: CompileEnvironment,
+    state: CodegenState,
+) -> tuple[
+    list[tuple[torch.Tensor, list[object], str]], list[tuple[int, ...]], set[int]
+]:
+    """Build (all_tensor_info, vmem_shapes, aligned_ids) for an inner loop.
+
+    Tensors whose ``vmem_shape`` passes ``_check_dma_alignment`` are eligible
+    for the inner-DMA path (HBM ref + small VMEM scratch in fori_loop, or
+    ``pl.Buffered`` BlockSpec in emit_pipeline); the rest stay on their
+    outer ``pallas_call`` BlockSpec and are closure-read from the body.
+    """
+    all_tensor_info: list[tuple[torch.Tensor, list[object], str]] = []
+    for key, (fake, _tensor_node, sub_meta) in loaded_tensors.items():
+        if key not in stored_tensors:
+            all_tensor_info.append((fake, sub_meta, "load"))
+    for fake, _tensor_node, sub_meta in stored_tensors.values():
+        all_tensor_info.append((fake, sub_meta, "store"))
+    vmem_shapes = _compute_vmem_shapes(
+        all_tensor_info, block_ids, slice_size_exprs, env, state
+    )
+    aligned_ids = {
+        id(fake)
+        for (fake, _sub_meta, _direction), vmem_shape in zip(
+            all_tensor_info, vmem_shapes, strict=True
+        )
+        if _check_dma_alignment(vmem_shape)
+    }
+    return all_tensor_info, vmem_shapes, aligned_ids
 
 
 def _codegen_fori_loop(state: CodegenState) -> object:
@@ -1653,47 +1902,37 @@ def _codegen_fori_loop(state: CodegenState) -> object:
             env,
         )
 
-    # Collect all tensors: load-only first, then stored (which may also be read)
-    all_tensor_info: list[tuple[torch.Tensor, list[object], str]] = []
-    for key, (fake, _tensor_node, sub_meta) in loaded_tensors.items():
-        if key not in stored_tensors:
-            all_tensor_info.append((fake, sub_meta, "load"))
-    for fake, _tensor_node, sub_meta in stored_tensors.values():
-        all_tensor_info.append((fake, sub_meta, "store"))
-
-    # Compute VMEM shapes and check DMA alignment
-    vmem_shapes = _compute_vmem_shapes(
-        all_tensor_info, block_ids, slice_size_exprs, env, state
+    # Aligned tensors get HBM refs (no outer BlockSpec) + VMEM scratch +
+    # semaphore; unaligned tensors keep their outer BlockSpec and are
+    # accessed via pl.ds() in the body.  Mixing both paths inside a single
+    # fori_loop avoids forcing every tensor onto the non-DMA path when a
+    # lone unaligned tensor is present (which would load full outer-block
+    # tiles into VMEM and may OOM at large shapes).
+    all_tensor_info, vmem_shapes, aligned_tensor_ids = _classify_pipelined_tensors(
+        loaded_tensors, stored_tensors, block_ids, slice_size_exprs, env, state
     )
-    use_dma = _check_dma_alignment(vmem_shapes)
 
-    # With DMA: tensors need HBM refs (no outer BlockSpec) because DMA
-    # handles all slicing, and we register VMEM scratch buffers +
-    # semaphores for each tensor.  Without DMA: outer BlockSpecs handle
-    # outer dims and inner dims use pl.ds(), so neither is needed.
-    tensor_to_vmem: dict[str, str] = {}
+    from .._compiler.device_function import PallasMemorySpace
+
+    tensor_to_dma_scratch: dict[str, str] = {}
     tensor_to_sem: dict[str, str] = {}
-    if use_dma:
-        from .._compiler.device_function import PallasMemorySpace
-
-        for fake, _tensor_node, _sub_meta in loaded_tensors.values():
-            state.device_function.pallas_memory_space[id(fake)] = PallasMemorySpace.HBM
-        for fake, _tensor_node, _sub_meta in stored_tensors.values():
-            state.device_function.pallas_memory_space[id(fake)] = PallasMemorySpace.HBM
-        for (fake, _sub_meta, _direction), vmem_shape in zip(
-            all_tensor_info, vmem_shapes, strict=True
-        ):
-            hbm_name = state.device_function.tensor_arg(fake).name
-            vmem_name = state.device_function.register_scratch(
-                vmem_shape,
-                fake.dtype,
-                name_hint=hbm_name.replace("_hbm", "") + "_buf",
-            )
-            sem_name = state.device_function.register_dma_semaphore(
-                name_hint=hbm_name.replace("_hbm", "") + "_sem",
-            )
-            tensor_to_vmem[hbm_name] = vmem_name
-            tensor_to_sem[hbm_name] = sem_name
+    for (fake, _sub_meta, _direction), vmem_shape in zip(
+        all_tensor_info, vmem_shapes, strict=True
+    ):
+        if id(fake) not in aligned_tensor_ids:
+            continue
+        state.device_function.pallas_memory_space[id(fake)] = PallasMemorySpace.HBM
+        hbm_name = state.device_function.tensor_arg(fake).name
+        vmem_name = state.device_function.register_scratch(
+            vmem_shape,
+            fake.dtype,
+            name_hint=hbm_name.replace("_hbm", "") + "_buf",
+        )
+        sem_name = state.device_function.register_dma_semaphore(
+            name_hint=hbm_name.replace("_hbm", "") + "_sem",
+        )
+        tensor_to_dma_scratch[hbm_name] = vmem_name
+        tensor_to_sem[hbm_name] = sem_name
 
     # Build the body function
     body_stmts: list[ast.AST] = []
@@ -1717,12 +1956,27 @@ def _codegen_fori_loop(state: CodegenState) -> object:
     # Build block_id_to_info
     block_id_to_info: dict[int, LoopDimInfo] = {}
     for block_id in block_ids:
+        block_size = env.block_sizes[block_id]
+        # when the block_size.size is None, we cannot form a SymPy expr for the numel
+        sympy_end_expr = block_size.numel if block_size.size is not None else None
         block_id_to_info[block_id] = LoopDimInfo(
             end_var_name=None,
-            end_expr=env.block_sizes[block_id].numel,
+            end_expr=sympy_end_expr,
         )
 
-    # Set up mask variables for inner-loop block_ids
+    # Emit offset_<bid>/indices_<bid> at the body prologue.
+    _emit_inner_loop_offset_indices(
+        state,
+        strategy,
+        block_ids,
+        block_size_vars,
+        begin_exprs,
+        iter_step_exprs,
+        dim_idx_exprs,
+        env,
+        body_stmts,
+    )
+    # Set up mask variables for inner-loop block_ids (non-divisible bounds).
     _setup_inner_loop_masks(
         state,
         strategy,
@@ -1741,9 +1995,8 @@ def _codegen_fori_loop(state: CodegenState) -> object:
         block_id_to_info=block_id_to_info,
         body_fn_name="_fori_body_0",
         loop_var_name=loop_vars[0],
-        use_dma=use_dma,
         inner_statements=body_stmts,
-        _tensor_to_vmem=tensor_to_vmem,
+        _tensor_to_dma_scratch=tensor_to_dma_scratch,
         _tensor_to_sem=tensor_to_sem,
     )
 
@@ -1769,7 +2022,10 @@ def _codegen_fori_loop(state: CodegenState) -> object:
                 needs_slice = True
                 from .memory_ops import _record_pad_info
 
-                _record_pad_info(state, fake, dim_idx, bid)
+                extra_pad = _compute_pipeline_or_dma_extra_pad(
+                    begin_expr, bid, env, state
+                )
+                _record_pad_info(state, fake, dim_idx, bid, extra_pad)
             elif bid is not None and bid not in block_ids:
                 # Outer grid dim: use grid offset
                 grid_loops = state.codegen.active_device_loops.get(bid)
@@ -1798,25 +2054,11 @@ def _codegen_fori_loop(state: CodegenState) -> object:
 
     # Generate body code within the fori_loop context
     with state.codegen.add_fori_loop(fori_state):
-        if use_dma:
-            # Emit DMA read copies at start of body
-            for fake, _tensor_node, sub_meta in loaded_tensors.values():
-                hbm_name = state.device_function.tensor_arg(fake).name
-                vmem_name = tensor_to_vmem[hbm_name]
-                sem_name = tensor_to_sem[hbm_name]
-                src_slice = _build_hbm_dma_slice(fake, hbm_name, sub_meta)
-                copy_var = state.device_function.new_var("_copy")
-                state.codegen.add_statement(
-                    statement_from_string(
-                        f"{copy_var} = pltpu.make_async_copy({src_slice}, {vmem_name}, {sem_name})"
-                    )
-                )
-                state.codegen.add_statement(
-                    statement_from_string(f"{copy_var}.start()")
-                )
-                state.codegen.add_statement(statement_from_string(f"{copy_var}.wait()"))
-        else:
-            # No DMA: emit offset assignments so pl.ds() indexing works
+        # Non-DMA tensors keep their outer BlockSpec (whole-shape VMEM ref)
+        # and need an absolute offset for ``pl.ds()`` indexing in the body.
+        # DMA copies build their own absolute slice via _build_hbm_dma_slice,
+        # so this offset is dead when every tensor is DMA'd.
+        if len(tensor_to_dma_scratch) < len(all_tensor_info):
             for i, bid in enumerate(block_ids):
                 offset_name = strategy.offset_var(bid)
                 state.codegen.add_statement(
@@ -1825,35 +2067,48 @@ def _codegen_fori_loop(state: CodegenState) -> object:
                     )
                 )
 
-        # Codegen the user's body (loads/stores remapped via _tensor_to_vmem
-        # when using DMA, or accessing HBM refs directly when not)
+        for fake, _tensor_node, sub_meta in loaded_tensors.values():
+            hbm_name = state.device_function.tensor_arg(fake).name
+            if hbm_name not in tensor_to_dma_scratch:
+                continue
+            vmem_name = tensor_to_dma_scratch[hbm_name]
+            sem_name = tensor_to_sem[hbm_name]
+            src_slice = _build_hbm_dma_slice(fake, hbm_name, sub_meta)
+            copy_var = state.device_function.new_var("_copy")
+            state.codegen.add_statement(
+                statement_from_string(
+                    f"{copy_var} = pltpu.make_async_copy({src_slice}, {vmem_name}, {sem_name})"
+                )
+            )
+            state.codegen.add_statement(statement_from_string(f"{copy_var}.start()"))
+            state.codegen.add_statement(statement_from_string(f"{copy_var}.wait()"))
+
         graph_results = codegen_call_with_graph(
             state.codegen, graph_info.graph, body_args
         )
 
-        # Write updated loop-carried values back to scratch
         if has_loop_state:
             _write_back_loop_carried(state, scratch_names, carried, graph_results)
 
-        if use_dma:
-            # Emit DMA write copies at end of body for stored tensors
-            for fake, _tensor_node, sub_meta in stored_tensors.values():
-                hbm_name = state.device_function.tensor_arg(fake).name
-                vmem_name = tensor_to_vmem[hbm_name]
-                sem_name = tensor_to_sem[hbm_name]
-                dst_slice = _build_hbm_dma_slice(fake, hbm_name, sub_meta)
-                copy_out_var = state.device_function.new_var("_copy_out")
-                state.codegen.add_statement(
-                    statement_from_string(
-                        f"{copy_out_var} = pltpu.make_async_copy({vmem_name}, {dst_slice}, {sem_name})"
-                    )
+        for fake, _tensor_node, sub_meta in stored_tensors.values():
+            hbm_name = state.device_function.tensor_arg(fake).name
+            if hbm_name not in tensor_to_dma_scratch:
+                continue
+            vmem_name = tensor_to_dma_scratch[hbm_name]
+            sem_name = tensor_to_sem[hbm_name]
+            dst_slice = _build_hbm_dma_slice(fake, hbm_name, sub_meta)
+            copy_out_var = state.device_function.new_var("_copy_out")
+            state.codegen.add_statement(
+                statement_from_string(
+                    f"{copy_out_var} = pltpu.make_async_copy({vmem_name}, {dst_slice}, {sem_name})"
                 )
-                state.codegen.add_statement(
-                    statement_from_string(f"{copy_out_var}.start()")
-                )
-                state.codegen.add_statement(
-                    statement_from_string(f"{copy_out_var}.wait()")
-                )
+            )
+            state.codegen.add_statement(
+                statement_from_string(f"{copy_out_var}.start()")
+            )
+            state.codegen.add_statement(statement_from_string(f"{copy_out_var}.wait()"))
+
+    _emit_nonlocal_scratch_declarations(state, body_stmts)
 
     # Emit nested fori_loop calls — one per dimension.
     # Build inside-out: innermost function wraps body_stmts, each outer
@@ -2052,6 +2307,81 @@ def _(state: CodegenState) -> list[object]:
         [expr_from_string(n) for n in if_return_names]
         + [expr_from_string(n) for n in else_return_names],
     )
+
+
+@_decorators.codegen(_if, "cute")
+def _(state: CodegenState) -> list[object]:
+    """Emit dynamic if-conditions for the CuTe DSL backend.
+
+    CuTe DSL forbids referencing a variable after a dynamic if/else when the
+    variable is first defined inside the branches. Pre-declare any such output
+    in the outer scope before emitting the if so both branches reassign it.
+    """
+    from .._compiler.ast_extension import create
+    from .._compiler.device_ir import ElseGraphInfo
+    from .._compiler.device_ir import IfGraphInfo
+    from .._compiler.generate_ast import GenerateAST
+    from .._compiler.inductor_lowering import codegen_call_with_graph
+
+    graph_info = state.get_graph(state.proxy_arg(1))
+    assert isinstance(graph_info, IfGraphInfo)
+    assert isinstance(state.codegen, GenerateAST)
+
+    test = state.ast_arg(0)
+    if_args = state.ast_args[3]
+    else_args = state.ast_args[4]
+    assert isinstance(if_args, list)
+    assert isinstance(else_args, list)
+    assert all(isinstance(x, ast.AST) for x in if_args)
+    assert all(isinstance(x, ast.AST) for x in else_args)
+
+    if_body_stmts: list[ast.AST] = []
+    with state.codegen.set_statements(if_body_stmts):
+        if_outputs = codegen_call_with_graph(
+            state.codegen, graph_info.graph, [*if_args]
+        )
+
+    assert graph_info.else_branch is not None
+    else_graph = state.get_graph(graph_info.else_branch)
+    assert isinstance(else_graph, ElseGraphInfo)
+    else_body_stmts: list[ast.AST] = []
+    with state.codegen.set_statements(else_body_stmts):
+        else_outputs = codegen_call_with_graph(
+            state.codegen, else_graph.graph, [*else_args]
+        )
+
+    # Pre-declare any variable that is first defined inside both branches in the
+    # outer scope so CuTe DSL can resolve it after the if/else. The phi pass
+    # later renames the else-branch's name to match the if-branch's name, so we
+    # use the if-branch output name as the canonical pre-declared name.
+    if graph_info.branches_outputs is not None:
+        if_output_node = graph_info.graph.find_nodes(op="output")[0]
+        if_graph_outputs = cast("tuple[object, ...]", if_output_node.args[0])
+        backend = CompileEnvironment.current().backend
+        for if_entry, else_entry in graph_info.branches_outputs:
+            if not (isinstance(if_entry, int) and isinstance(else_entry, int)):
+                continue
+            if_name_node = if_outputs[if_entry]
+            assert isinstance(if_name_node, ast.Name)
+            fx_out = if_graph_outputs[if_entry]
+            if not isinstance(fx_out, torch.fx.Node):
+                continue
+            val = fx_out.meta.get("val")
+            if not isinstance(val, torch.Tensor):
+                continue
+            dtype_str = backend.dtype_str(val.dtype)
+            state.add_statement(
+                statement_from_string(f"{if_name_node.id} = {dtype_str}(0)")
+            )
+
+    if not if_body_stmts:
+        if_body_stmts.append(ast.Pass())
+    if not else_body_stmts:
+        else_body_stmts.append(ast.Pass())
+    if_ast_node = create(ast.If, test=test, body=if_body_stmts, orelse=else_body_stmts)
+    state.add_statement(if_ast_node)
+
+    return if_outputs + else_outputs
 
 
 # Note we can't DCE phi nodes because there may be a loop carry dependency not captured in the outer graph
@@ -2305,12 +2635,15 @@ def _(state: CodegenState) -> ast.AST:
             mask_var := state.codegen.mask_var(index)
         ) is not None:
             expand = state.tile_strategy.expand_str(input_sizes, dim)
-            expr = f"({mask_var}{expand})"
+            # Cast bool mask to float before expanding — Mosaic cannot
+            # reshape bool vectors (e.g. vector<32xi1> → vector<32x1xi1>).
+            expr = f"({mask_var}.astype(jnp.float32){expand})"
             if expr not in mask_exprs:
                 mask_exprs.append(expr)
     if not mask_exprs:
         return state.ast_arg(0)
-    mask_expr = "&".join(mask_exprs)
+    # Combine float masks via multiplication (equivalent to bool AND).
+    mask_expr = " * ".join(mask_exprs)
     if len(mask_exprs) < len(input_sizes):
         mask_expr = backend.broadcast_to_expr(
             mask_expr, state.tile_strategy.shape_str(input_sizes)

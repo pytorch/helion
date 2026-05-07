@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import unittest
 
 import torch
@@ -12,8 +13,11 @@ from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
+from helion._testing import skipIfCute
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfRocm
+from helion._testing import skipIfXPU
+from helion._testing import xfailIfCute
 import helion.language as hl
 
 
@@ -485,7 +489,7 @@ def kernel_list_no_cache_layernorm(
     return output
 
 
-@onlyBackends(["triton"])
+@onlyBackends(["triton", "cute"])
 class TestUnrollTuples(RefEagerTestBase, TestCase):
     def test_basic_tuple_addition(self):
         """Test basic iteration over tuple of tensors with addition."""
@@ -926,6 +930,7 @@ class TestUnrollTuples(RefEagerTestBase, TestCase):
 
     @largeTensorTest("8GB", device=DEVICE)
     @skipIfRefEager("RuntimeError in ref eager mode")
+    @xfailIfCute("register-cache layernorm exceeds cute shared memory budget")
     def test_list_register_cache_layernorm(self):
         """Test two-pass layernorm with register-cached list elements."""
         M, D, G = 1024 * 1024, 32, 8
@@ -951,6 +956,7 @@ class TestUnrollTuples(RefEagerTestBase, TestCase):
 
     @largeTensorTest("8GB", device=DEVICE)
     @skipIfRefEager("RuntimeError in ref eager mode")
+    @xfailIfCute("no-cache layernorm exceeds cute shared memory budget")
     def test_list_no_cache_layernorm(self):
         """Test two-pass layernorm without register cache (re-gathers in pass 2)."""
         M, D, G = 1024 * 1024, 32, 8
@@ -977,6 +983,12 @@ class TestUnrollTuples(RefEagerTestBase, TestCase):
     @largeTensorTest("12GB", device=DEVICE)
     @skipIfRefEager("Benchmark not applicable in ref eager mode")
     @skipIfRocm("Benchmark timing unreliable on ROCm")
+    @skipIfXPU("Benchmark timing unreliable on XPU")
+    @unittest.skipIf(
+        "PYTEST_XDIST_WORKER" in os.environ,
+        "Benchmark timing unreliable under pytest-xdist",
+    )
+    @skipIfCute("register-cache layernorm exceeds cute shared memory budget")
     def test_register_cache_faster_than_no_cache(self):
         """Verify register-cached layernorm is faster than re-gathering."""
         from triton.testing import do_bench

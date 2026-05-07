@@ -24,6 +24,7 @@ from helion._testing import onlyBackends
 from helion._testing import skipIfCudaCapabilityLessThan
 from helion._testing import skipIfFn
 from helion._testing import skipIfLowVRAM
+from helion._testing import skipIfNotCUDA
 from helion._testing import skipIfNotTriton
 from helion._testing import skipIfPallas
 from helion._testing import skipIfRefEager
@@ -381,7 +382,6 @@ class TestLoops(RefEagerTestBase, TestCase):
         code, result = code_and_output(fn, args, block_sizes=[32, 32])
         torch.testing.assert_close(result, args[0][:, : args[1][0].item()].sum(-1))
 
-    @xfailIfPallas("uses block_ptr indexing not supported on pallas")
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfTileIR("TileIR does not support block_ptr indexing")
     def test_data_dependent_bounds2(self):
@@ -853,6 +853,7 @@ class TestLoops(RefEagerTestBase, TestCase):
         self.assertNotEqualCode(code0, code2)
         self.assertNotIn("loop_unroll_factor", code0)
 
+    @skipIfNotCUDA()
     @skipIfCudaCapabilityLessThan(
         (12, 0), reason="Warp specialization requires CUDA capability >= 12.0"
     )

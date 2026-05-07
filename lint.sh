@@ -33,18 +33,21 @@ PYREFLY="scripts/pyrefly_check.sh"
 if [ "$ACTION" = "fix" ]; then
   run ruff format
   run ruff check --fix
+  run pre-commit run codespell --all-files
   run $PYREFLY
 fi
 
 if [ "$ACTION" = "unsafe" ]; then
   run ruff format
   run ruff check --fix --unsafe-fixes
+  run pre-commit run codespell --all-files
   run $PYREFLY
 fi
 
 if [ "$ACTION" = "check" ]; then
   run ruff format --check --diff
   run ruff check --no-fix
+  run pre-commit run codespell --all-files
   run $PYREFLY
 fi
 

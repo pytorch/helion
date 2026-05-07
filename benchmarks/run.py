@@ -46,6 +46,7 @@ from torch.utils._pytree import tree_leaves
 from torch.utils._pytree import tree_map
 
 from helion._compat import get_device_name
+from helion._compile_time import enable as enable_compile_time
 from helion._compile_time import get_total_time as get_compile_total_time
 from helion._compile_time import reset as reset_compile_time
 from helion._testing import get_nvidia_gpu_model
@@ -616,7 +617,7 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "helion_jagged_mean_tritonbench-latency": "helion_latency_ms",
     },
     "flash_attention": {
-        "aten": "baseline",
+        "sdpa": "baseline",
         "triton_tutorial_flash_v2_tma_ws_persistent-speedup": "triton_speedup",
         "triton_tutorial_flash_v2_tma_ws_persistent-accuracy": "triton_accuracy",
         "flex_attention-speedup": "torch_compile_speedup",
@@ -1287,7 +1288,12 @@ def run_kernel_variants(
 
                 if isinstance(kfunc, Kernel):
                     # Helion kernel - we call it in a lambda to delay execution until measurement
-                    measured_func_callable = lambda: kfunc(*args, **kwargs)  # noqa: E731
+                    if operator_name == "flash_attention":
+                        measured_func_callable = lambda: [  # noqa: E731
+                            kfunc(*args, **kwargs)
+                        ]
+                    else:
+                        measured_func_callable = lambda: kfunc(*args, **kwargs)  # noqa: E731
                 else:
                     # tritonbench integration wrapper - pass tritonbench operator instance as first argument
                     # The wrapper must return a callable that does the actual computation, for delayed execution
@@ -1848,7 +1854,7 @@ def main() -> None:
     results: list[RunResult] = []
 
     if args.measure_compile_time:
-        os.environ["HELION_MEASURE_COMPILE_TIME"] = "1"
+        enable_compile_time()
 
     collected_metrics: list[AutotuneMetrics] = []
     if args.autotune_metrics or args.autotune_metrics_json:

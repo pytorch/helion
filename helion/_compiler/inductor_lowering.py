@@ -1358,6 +1358,9 @@ def codegen_call_with_graph(
     copy_named_args: bool = True,
 ) -> list[object]:
     with compile_lock:
+        from .cute.cute_mma import prepare_cute_collective_lane_loop_suppression
+
+        prepare_cute_collective_lane_loop_suppression(cg, graph)
         new_args = []
         placeholders = graph.find_nodes(op="placeholder")
         for arg, placeholder in zip(args, placeholders, strict=True):

@@ -291,11 +291,14 @@ def build_dashboard_data(cache_dir, runs_meta, existing_data=None, active_platfo
             if latest_main is not None and prev_data is not None:
                 break
 
+        # All deltas use natural sign: positive = metric value increased.
+        # Higher speedup = better; higher latency / compile time = worse.
         speedup_delta = fmt_delta(latest_data["helion_speedup_geomean"], prev_data["helion_speedup_geomean"]) if latest_data and prev_data else None
-        compile_delta = fmt_delta(prev_data["compile_time_geomean_s"], latest_data["compile_time_geomean_s"]) if latest_data and prev_data and latest_data["compile_time_geomean_s"] > 0 else None
-        latency_delta = fmt_delta(prev_data["helion_latency_avg_ms"], latest_data["helion_latency_avg_ms"]) if latest_data and prev_data and latest_data["helion_latency_avg_ms"] > 0 else None
+        compile_delta = fmt_delta(latest_data["compile_time_geomean_s"], prev_data["compile_time_geomean_s"]) if latest_data and prev_data and latest_data["compile_time_geomean_s"] > 0 else None
+        latency_delta = fmt_delta(latest_data["helion_latency_avg_ms"], prev_data["helion_latency_avg_ms"]) if latest_data and prev_data and latest_data["helion_latency_avg_ms"] > 0 else None
 
-        classify_delta = latency_delta if latency_delta is not None else speedup_delta
+        # Negate latency so >0 means improvement, matching speedup's direction.
+        classify_delta = -latency_delta if latency_delta is not None else speedup_delta
         status = "improved" if classify_delta and classify_delta > 10 else "regressed" if classify_delta and classify_delta < -10 else "unchanged"
 
         acc_failures = []

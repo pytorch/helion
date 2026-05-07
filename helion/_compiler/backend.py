@@ -3,6 +3,7 @@ from __future__ import annotations
 import abc
 import ast
 import functools
+from itertools import starmap
 import math
 import operator
 import os
@@ -634,7 +635,11 @@ class Backend(abc.ABC):
         if not self.supports_precompile():
             bound_kernel.settings.autotune_precompile = None
 
-        if not force and bound_kernel.kernel.configs:
+        if bound_kernel.settings.autotune_effort == "none" and (
+            force or not bound_kernel.kernel.configs
+        ):
+            config = bound_kernel.config_spec.default_config()
+        elif not force and bound_kernel.kernel.configs:
             if len(bound_kernel.kernel.configs) == 1:
                 (config,) = bound_kernel.kernel.configs
             else:
@@ -1621,15 +1626,19 @@ class PallasBackend(Backend):
         self,
         sorted_args: list[Argument] | None,
         config: Config,
-    ) -> list[tuple[int, int, int]] | None:
+    ) -> list[tuple[int, int, int, int]] | None:
         """Identify pl.ds() dims that may need padding and their block sizes.
 
         Uses ``pallas_pad_info`` recorded during codegen to identify which
         tensor dimensions use ``pl.ds()`` slicing.
 
-        Returns ``[(arg_index, tensor_dim, block_size), ...]`` or ``None``.
-        The launcher computes the actual pad amount at runtime as
-        ``(-tensor.shape[dim]) % block_size``.
+        Returns ``[(arg_index, tensor_dim, block_size, extra_pad), ...]``
+        or ``None``.  The launcher computes the actual pad amount at runtime
+        as ``(-tensor.shape[dim]) % block_size + extra_pad``.
+
+        ``extra_pad`` is 0 when the tile loop starts at offset 0,
+        ``begin % block_size`` for a constant begin offset, or
+        ``block_size - 1`` for a data-dependent begin.
         """
         if sorted_args is None:
             return None
@@ -1643,17 +1652,17 @@ class PallasBackend(Backend):
         if not device_fn.pallas_pad_info:
             return None
 
-        result: list[tuple[int, int, int]] = []
+        result: list[tuple[int, int, int, int]] = []
         for i, arg in enumerate(sorted_args):
             if not isinstance(arg, TensorArg):
                 continue
             dims_info = device_fn.pallas_pad_info.get(id(arg.fake_value))
             if dims_info is not None:
-                for dim, block_id in dims_info.items():
+                for dim, (block_id, extra_pad) in dims_info.items():
                     bsi = env.block_sizes[block_id]
                     bs = bsi.from_config(config)
                     if isinstance(bs, int) and bs > 1:
-                        result.append((i, dim, bs))
+                        result.append((i, dim, bs, extra_pad))
 
         return result or None
 
@@ -1771,7 +1780,7 @@ class PallasBackend(Backend):
                 launcher_args.append(f"_smem_arg_indices={smem_arg_indices!r}")
 
         # Pass scratch shapes for pipeline/fori_loop launcher
-        pallas_loop_type = config.get("pallas_loop_type", "default")
+        pallas_loop_type = config.get("pallas_loop_type", "unroll")
         if pallas_loop_type in ("emit_pipeline", "fori_loop"):
             scratch_shapes = [
                 (
@@ -1806,7 +1815,7 @@ class PallasBackend(Backend):
         """Return the launcher name to use based on ``pallas_loop_type``."""
         from ..autotuner.config_spec import VALID_PALLAS_LOOP_TYPES
 
-        pallas_loop_type = config.get("pallas_loop_type", "default")
+        pallas_loop_type = config.get("pallas_loop_type", "unroll")
         if pallas_loop_type not in VALID_PALLAS_LOOP_TYPES:
             raise ValueError(
                 f"Invalid pallas_loop_type {pallas_loop_type!r}. "
@@ -1921,6 +1930,8 @@ def _detect_specialized_mma_loop(
     from ..language._decorators import is_api_func
     from .compile_environment import CompileEnvironment
     from .cute.cute_mma import _choose_mma_impl
+    from .cute.cute_mma import _mma_active_n_threads
+    from .cute.cute_mma import _tcgen05_root_m_threads
     from .cute.cute_mma import can_codegen_cute_mma_aten
     from .cute.cute_mma import can_codegen_cute_mma_dot
     from .host_function import HostFunction
@@ -1936,6 +1947,8 @@ def _detect_specialized_mma_loop(
 
     env = CompileEnvironment.current()
     root_block_sizes: list[int] = []
+    root_thread_counts: list[int] = []
+    root_thread_auto: list[bool] = []
     for block_id in root_grid_ids:
         block_size = env.block_sizes[block_id].from_config(config)
         if not isinstance(block_size, int):
@@ -1945,13 +1958,64 @@ def _detect_specialized_mma_loop(
             config.num_threads, block_id, 0
         )
         resolved_threads = threads if threads > 0 else block_size
-        if 0 < resolved_threads < block_size:
-            return False
+        root_thread_counts.append(resolved_threads)
+        root_thread_auto.append(threads == 0)
+
+    if functools.reduce(operator.mul, root_thread_counts, 1) > 1024:
+
+        def _largest_divisor_at_most(size: int, limit: int) -> int:
+            for divisor in range(limit, 0, -1):
+                if size % divisor == 0:
+                    return divisor
+            return 1
+
+        for idx in sorted(
+            (i for i, is_auto in enumerate(root_thread_auto) if is_auto),
+            reverse=True,
+        ):
+            other_threads = functools.reduce(
+                operator.mul,
+                (
+                    root_thread_counts[j]
+                    for j in range(len(root_thread_counts))
+                    if j != idx
+                ),
+                1,
+            )
+            if other_threads <= 0:
+                continue
+            thread_budget = max(1024 // other_threads, 1)
+            next_threads = _largest_divisor_at_most(
+                root_block_sizes[idx], thread_budget
+            )
+            root_thread_counts[idx] = next_threads
+            if functools.reduce(operator.mul, root_thread_counts, 1) <= 1024:
+                break
 
     (bk,) = block_sizes
     if not isinstance(bk, int):
         return False
     bm, bn = root_block_sizes
+    root_m_threads, root_n_threads = root_thread_counts
+
+    def root_threads_support_impl(mma_impl: str) -> bool:
+        if mma_impl == "tcgen05":
+            mma_n_threads = _mma_active_n_threads("tcgen05")
+            min_root_m_threads = _tcgen05_root_m_threads(bm, bn)
+            if (
+                root_m_threads < min_root_m_threads
+                or root_m_threads > bm
+                or bm % root_m_threads != 0
+            ):
+                return False
+            if root_n_threads < mma_n_threads or root_n_threads > bn:
+                return False
+            if bn % root_n_threads != 0:
+                return False
+            return root_m_threads * root_n_threads <= 1024
+        if mma_impl == "warp":
+            return root_m_threads == bm and root_n_threads == bn
+        return False
 
     for graph_info in fn.codegen.codegen_graphs:
         if getattr(graph_info, "block_ids", None) != block_ids:
@@ -1969,7 +2033,10 @@ def _detect_specialized_mma_loop(
                 lhs_val = lhs_node.meta.get("val")
                 if not isinstance(lhs_val, torch.Tensor):
                     continue
-                if _choose_mma_impl(lhs_val.dtype, bm=bm, bn=bn, bk=bk) != "universal":
+                mma_impl = _choose_mma_impl(
+                    lhs_val.dtype, bm=bm, bn=bn, bk=bk, config=config
+                )
+                if mma_impl != "universal" and root_threads_support_impl(mma_impl):
                     return True
             if (
                 callable(node.target)
@@ -1983,7 +2050,10 @@ def _detect_specialized_mma_loop(
                 lhs_val = lhs_node.meta.get("val")
                 if not isinstance(lhs_val, torch.Tensor):
                     continue
-                if _choose_mma_impl(lhs_val.dtype, bm=bm, bn=bn, bk=bk) != "universal":
+                mma_impl = _choose_mma_impl(
+                    lhs_val.dtype, bm=bm, bn=bn, bk=bk, config=config
+                )
+                if mma_impl != "universal" and root_threads_support_impl(mma_impl):
                     return True
     return False
 
@@ -2077,6 +2147,117 @@ def _loop_may_use_mma(
         if graph_contains_mma(getattr(graph_info, "graph", None)):
             return True
     return False
+
+
+def _kernel_has_specialized_mma_path(
+    fn: DeviceFunction,
+    *,
+    config: Config,
+) -> bool:
+    from .compile_environment import CompileEnvironment
+    from .device_ir import ForLoopGraphInfo
+    from .host_function import HostFunction
+
+    env = CompileEnvironment.current()
+    grid_ids = {
+        bid for ids in HostFunction.current().device_ir.grid_block_ids for bid in ids
+    }
+    seen_block_ids: set[tuple[int, ...]] = set()
+    for graph_info in fn.codegen.codegen_graphs:
+        if not isinstance(graph_info, ForLoopGraphInfo):
+            continue
+        block_ids = tuple(graph_info.block_ids)
+        if block_ids in seen_block_ids or not any(
+            bid not in grid_ids for bid in block_ids
+        ):
+            continue
+        seen_block_ids.add(block_ids)
+        block_sizes: list[int | torch.SymInt] = []
+        for bid in block_ids:
+            size = env.block_sizes[bid].from_config(config)
+            if not isinstance(size, (int, torch.SymInt)):
+                break
+            block_sizes.append(size)
+        else:
+            if _detect_specialized_mma_loop(
+                fn,
+                list(block_ids),
+                block_sizes=block_sizes,
+                config=config,
+            ):
+                return True
+    return False
+
+
+def _kernel_specialized_mma_impl(
+    fn: DeviceFunction,
+    *,
+    config: Config,
+) -> str | None:
+    from ..language._decorators import is_api_func
+    from .compile_environment import CompileEnvironment
+    from .cute.cute_mma import _choose_mma_impl
+    from .cute.cute_mma import can_codegen_cute_mma_aten
+    from .cute.cute_mma import can_codegen_cute_mma_dot
+    from .device_ir import ForLoopGraphInfo
+    from .host_function import HostFunction
+
+    env = CompileEnvironment.current()
+    grid_ids = {
+        bid for ids in HostFunction.current().device_ir.grid_block_ids for bid in ids
+    }
+    seen_block_ids: set[tuple[int, ...]] = set()
+    for graph_info in fn.codegen.codegen_graphs:
+        if not isinstance(graph_info, ForLoopGraphInfo):
+            continue
+        block_ids = tuple(graph_info.block_ids)
+        if block_ids in seen_block_ids or not any(
+            bid not in grid_ids for bid in block_ids
+        ):
+            continue
+        seen_block_ids.add(block_ids)
+        block_sizes = [env.block_sizes[bid].from_config(config) for bid in block_ids]
+        if len(block_sizes) != 1 or not isinstance(block_sizes[0], int):
+            continue
+        bk = block_sizes[0]
+        host_device_ir = HostFunction.current().device_ir
+        if len(host_device_ir.grid_block_ids) != 1:
+            continue
+        root_grid_ids = host_device_ir.grid_block_ids[0]
+        if len(root_grid_ids) != 2:
+            continue
+        bm = env.block_sizes[root_grid_ids[0]].from_config(config)
+        bn = env.block_sizes[root_grid_ids[1]].from_config(config)
+        if not isinstance(bm, int) or not isinstance(bn, int):
+            continue
+        for node in graph_info.graph.nodes:
+            if node.op != "call_function":
+                continue
+            if node.target in (
+                torch.ops.aten.addmm.default,
+                torch.ops.aten.baddbmm.default,
+            ) and can_codegen_cute_mma_aten(node, with_acc=True):
+                lhs_node = node.args[1]
+            elif (
+                callable(node.target)
+                and is_api_func(node.target)
+                and getattr(node.target, "__name__", "") == "dot"
+                and can_codegen_cute_mma_dot(node)
+            ):
+                lhs_node = node.args[0]
+            else:
+                continue
+            if not isinstance(lhs_node, torch.fx.Node):
+                continue
+            lhs_val = lhs_node.meta.get("val")
+            if not isinstance(lhs_val, torch.Tensor):
+                continue
+            mma_impl = _choose_mma_impl(
+                lhs_val.dtype, bm=bm, bn=bn, bk=bk, config=config
+            )
+            if mma_impl != "universal":
+                return mma_impl
+    return None
 
 
 def _loop_contains_matmul(
@@ -2327,7 +2508,7 @@ class CuteBackend(Backend):
         plan_layouts(graphs, config, tile_strategy)
 
     def supports_config_key(self, key: str) -> bool:
-        if key == "num_threads":
+        if key == "num_threads" or key.startswith("tcgen05_"):
             return True
         return super().supports_config_key(key)
 
@@ -2347,6 +2528,54 @@ class CuteBackend(Backend):
         if dtype in (torch.float16, torch.bfloat16):
             return "cutlass.Float32"
         return self.dtype_str(dtype)
+
+    def supports_precompile(self) -> bool:
+        # The CuTe DSL does not expose a Triton-style precompile entry point;
+        # the autotuner has to compile + benchmark each config inline.
+        return False
+
+    def classify_autotune_exception(self, err: BaseException) -> str | None:
+        # Exceptions raised from inside the cute/cutlass DSL during compile or
+        # launch are expected when an invalid config is tried; treat them as
+        # benign so the autotuner moves on. Anything else (AssertionError,
+        # NameError/TypeError/AttributeError from generated code, ...) is
+        # almost certainly a real Helion bug and is surfaced at warn level so
+        # it gets noticed without terminating tuning.
+        cls = type(err)
+        module = getattr(cls, "__module__", "") or ""
+        if module.startswith(("cutlass", "cute")):
+            return "debug"
+        if isinstance(err, Exception):
+            return "warn"
+        return None
+
+    def get_do_bench(self) -> Callable[..., float | tuple[float, ...]]:
+        # The default Triton do_bench uses CUDA events that mis-time the CuTe
+        # path on Blackwell - launches show up as ~5ms when the kernel is
+        # actually 250ms+. Use synchronized wall-clock timing instead so
+        # autotune scores reflect real performance.
+        from ..autotuner.benchmarking import do_bench_generic
+
+        return do_bench_generic
+
+    def get_interleaved_bench(self) -> Callable[..., list[float]]:
+        # Same rationale as get_do_bench: the default interleaved bench uses
+        # CUDA events that mis-time the CuTe path. Use the synchronized
+        # wall-clock fallback so the autotuner's interleaved compare path
+        # produces real timings.
+        from ..autotuner.benchmarking import interleaved_bench_generic
+
+        return interleaved_bench_generic
+
+    def autotune(
+        self,
+        bound_kernel: BoundKernel[Any],
+        args: Sequence[object],
+        *,
+        force: bool = True,
+        **kwargs: object,
+    ) -> Config:
+        return super().autotune(bound_kernel, args, force=force, **kwargs)
 
     @property
     def function_decorator(self) -> str:
@@ -2379,10 +2608,11 @@ class CuteBackend(Backend):
             "_cute_grouped_reduce_shared_tree": "from helion._compiler.cute.reduce_helpers import _cute_grouped_reduce_shared_tree",
             "_cute_grouped_reduce_shared_two_stage": "from helion._compiler.cute.reduce_helpers import _cute_grouped_reduce_shared_two_stage",
             "_cute_grouped_reduce_warp": "from helion._compiler.cute.reduce_helpers import _cute_grouped_reduce_warp",
+            "_cute_store_shared_remote_x4": "from helion._compiler.cute.cluster_helpers import store_shared_remote_x4 as _cute_store_shared_remote_x4",
         }
 
     def program_id_expr(self, dim: int, *, index_dtype: str) -> str:
-        return f"cute.arch.block_idx()[{dim}]"
+        return f"{index_dtype}(cute.arch.block_idx()[{dim}])"
 
     def inductor_op_overrides(self) -> InductorOpOverrides:
         from torch._inductor.codegen.cutedsl.cutedsl_op_overrides import CuteDSLArg
@@ -2411,6 +2641,20 @@ class CuteBackend(Backend):
     def cast_expr(self, expr_str: str, dtype_str: str) -> str:
         return f"{dtype_str}({expr_str})"
 
+    def cast_ast(self, x: ast.AST, target_dtype: torch.dtype) -> ast.AST:
+        from .device_function import DeviceFunction
+        from .device_function import NoCurrentFunction
+
+        if isinstance(x, ast.Name):
+            try:
+                df = DeviceFunction.current()
+            except NoCurrentFunction:
+                pass
+            else:
+                if df.get_cute_tcgen05_store_value(x.id) is not None:
+                    return x
+        return super().cast_ast(x, target_dtype)
+
     def grid_barrier_stmt(self, sem_arg: str) -> str | None:
         del sem_arg
         raise exc.BackendUnsupported(self.name, "hl.barrier()")
@@ -2418,7 +2662,13 @@ class CuteBackend(Backend):
     def lane_index_expr(
         self, offset_var: str, elements_per_thread: int, *, axis: int
     ) -> str:
-        return f"{offset_var} + cutlass.Int32(cute.arch.thread_idx()[{axis}]) * {elements_per_thread}"
+        from .compile_environment import CompileEnvironment
+
+        index_dtype = CompileEnvironment.current().index_type()
+        return (
+            f"{offset_var} + {index_dtype}(cute.arch.thread_idx()[{axis}])"
+            f" * {elements_per_thread}"
+        )
 
     def lane_offset_expr(self, lane_var: str) -> str:
         return f"cutlass.Int32({lane_var})"
@@ -2453,7 +2703,7 @@ class CuteBackend(Backend):
     ) -> str:
         return (
             f"{offsets_var} = ({lid}) * ({block_size_var})"
-            f" + cutlass.Int32(cute.arch.thread_idx()[{axis}])"
+            f" + {dtype}(cute.arch.thread_idx()[{axis}])"
         )
 
     def grid_index_expr(
@@ -2463,7 +2713,7 @@ class CuteBackend(Backend):
             raise exc.BackendUnsupported(self.name, f"thread axis {axis}")
         if block_size_var == "1":
             return offset_var
-        return f"{offset_var} + cutlass.Int32(cute.arch.thread_idx()[{axis}])"
+        return f"{offset_var} + {dtype}(cute.arch.thread_idx()[{axis}])"
 
     def loop_index_expr(
         self, offset_var: str, block_size_var: str, dtype: str, *, axis: int
@@ -2505,7 +2755,12 @@ class CuteBackend(Backend):
         return f"({true_val}) if ({mask}) else ({false_val})"
 
     def minimum_expr(self, a: str, b: str) -> str:
-        return f"({a}) if ({a}) < ({b}) else ({b})"
+        from .compile_environment import CompileEnvironment
+
+        index_type = CompileEnvironment.current().index_type()
+        lhs = self.cast_expr(a, index_type)
+        rhs = self.cast_expr(b, index_type)
+        return f"({lhs}) if ({lhs}) < ({rhs}) else ({rhs})"
 
     def reduction_index_expr(
         self, block_size_var: str, dtype: str, block_idx: int, *, axis: int
@@ -2717,6 +2972,41 @@ class CuteBackend(Backend):
                 final_kernel_text,
             )
         }
+        block_size_values = {
+            name: int(value)
+            for name, value in re.findall(
+                r"^(_BLOCK_SIZE_\d+) = (\d+)$",
+                final_kernel_text,
+                flags=re.MULTILINE,
+            )
+        }
+        offset_block_sizes = dict(
+            re.findall(
+                r"^\s*offset_(\d+) = .* \* (_BLOCK_SIZE_\d+)$",
+                final_kernel_text,
+                flags=re.MULTILINE,
+            )
+        )
+        offset_thread_dims = [1, 1, 1]
+        for offset_id, axis_text in re.findall(
+            r"^\s*indices_\d+ = offset_(\d+) \+ .*cute\.arch\.thread_idx\(\)\[(\d+)\]",
+            final_kernel_text,
+            flags=re.MULTILINE,
+        ):
+            axis = int(axis_text)
+            block_name = offset_block_sizes.get(offset_id)
+            block_size = block_size_values.get(block_name or "")
+            if block_size is None and block_name is not None:
+                try:
+                    config_index = int(block_name.removeprefix("_BLOCK_SIZE_"))
+                except ValueError:
+                    config_index = -1
+                if 0 <= config_index < len(config.block_sizes):
+                    config_block_size = config.block_sizes[config_index]
+                    if isinstance(config_block_size, int):
+                        block_size = config_block_size
+            if block_size is not None and 0 <= axis < len(offset_thread_dims):
+                offset_thread_dims[axis] = max(offset_thread_dims[axis], block_size)
         dims = tuple(codegen.max_thread_block_dims)
         root_live_dims = tuple(codegen.root_thread_block_dims)
         referenced_dims = tuple(codegen.referenced_thread_block_dims)
@@ -2739,6 +3029,15 @@ class CuteBackend(Backend):
                     root_grid_dims[axis] = max(root_grid_dims[axis], size)
         root_static_dims = tuple(root_grid_dims)
         root_static_threads = functools.reduce(operator.mul, root_static_dims, 1)
+        specialized_root_tcgen05 = (
+            _kernel_specialized_mma_impl(device_function, config=device_function.config)
+            == "tcgen05"
+            and root_static_dims != (1, 1, 1)
+            and root_static_threads <= MAX_THREADS_PER_BLOCK
+        )
+        tcgen05_compact_dims = (
+            device_function.cute_block_shape if specialized_root_tcgen05 else None
+        )
         if referenced_dims != (1, 1, 1):
             dims = referenced_dims
         elif has_nested_device_loops:
@@ -2759,7 +3058,11 @@ class CuteBackend(Backend):
             )
             for axis in range(3)
         )
-        if final_thread_axes and (
+        if tcgen05_compact_dims is not None:
+            dims = tcgen05_compact_dims
+        elif specialized_root_tcgen05:
+            dims = root_static_dims
+        elif final_thread_axes and (
             referenced_dims != (1, 1, 1) or has_nested_device_loops
         ):
             dims = tuple(
@@ -2811,6 +3114,15 @@ class CuteBackend(Backend):
                     dims = expr_dims
             elif dims == (1, 1, 1):
                 return [f"block=({dim_exprs[0]}, {dim_exprs[1]}, {dim_exprs[2]})"]
+        if offset_thread_dims != [1, 1, 1]:
+            candidate_dims = tuple(
+                starmap(max, zip(dims, offset_thread_dims, strict=True))
+            )
+            if (
+                functools.reduce(operator.mul, candidate_dims, 1)
+                <= MAX_THREADS_PER_BLOCK
+            ):
+                dims = candidate_dims
         if dims == (1, 1, 1):
             dynamic_dims = tuple(codegen.max_thread_block_dims)
             if (
@@ -2997,13 +3309,78 @@ class CuteBackend(Backend):
                 for i, block_id in enumerate(block_ids):
                     if block_id in inactive_block_ids:
                         num_threads_config[i] = 1
+            is_device_loop = any(bid not in grid_ids for bid in block_ids)
+            reduction_axis_reserve = (
+                1
+                if any(info.reduction for info in env.block_sizes)
+                and self.reduction_axis_first()
+                else 0
+            )
+
+            def uses_thread_axis_for(
+                block_id: int, block_size: object, num_threads: int
+            ) -> bool:
+                if block_id in inactive_block_ids:
+                    return False
+                if num_threads > 0:
+                    return num_threads > 1
+                return not (isinstance(block_size, int) and block_size == 1)
+
+            consumed_grid_axes = 0
+            if is_device_loop:
+                for grid_block_id in grid_ids:
+                    grid_info = env.block_sizes[grid_block_id]
+                    grid_block_size = grid_info.from_config(config)
+                    grid_threads = int(
+                        env.config_spec.num_threads.config_get(
+                            config.num_threads,
+                            grid_block_id,
+                            0,
+                        )
+                    )
+                    if uses_thread_axis_for(
+                        grid_block_id,
+                        grid_block_size,
+                        grid_threads,
+                    ):
+                        consumed_grid_axes += 1
+            available_axes = max(0, 3 - reduction_axis_reserve - consumed_grid_axes)
+
+            def current_strategy_axes() -> int:
+                return sum(
+                    int(uses_thread_axis_for(block_id, block_size, threads))
+                    for block_id, block_size, threads in zip(
+                        block_ids,
+                        nd_block_size,
+                        num_threads_config,
+                        strict=True,
+                    )
+                )
+
+            while current_strategy_axes() > available_axes:
+                candidates = [
+                    i
+                    for i, (block_id, block_size, threads) in enumerate(
+                        zip(block_ids, nd_block_size, num_threads_config, strict=True)
+                    )
+                    if threads == 0
+                    and uses_thread_axis_for(block_id, block_size, threads)
+                    and (not is_device_loop or block_id not in grid_ids)
+                ]
+                if not candidates:
+                    break
+                num_threads_config[candidates[-1]] = 1
             thread_limit = MAX_THREADS_PER_BLOCK
             if len(block_ids) > 1 and _loop_contains_matmul(fn, block_ids):
                 forced_mma_impl = os.environ.get("HELION_CUTE_MMA_IMPL", "auto")
-                if mma_candidate or (
-                    _loop_may_use_mma(fn, block_ids)
-                    and not _loop_contains_atomic(fn, block_ids)
-                    and forced_mma_impl.strip().lower() != "auto"
+                if (
+                    mma_candidate
+                    or _kernel_has_specialized_mma_path(fn, config=config)
+                    or (
+                        _loop_may_use_mma(fn, block_ids)
+                        and not _loop_contains_atomic(fn, block_ids)
+                        and forced_mma_impl.strip().lower() != "auto"
+                    )
                 ):
                     thread_limit = MAX_THREADS_PER_BLOCK
                 else:
@@ -3027,7 +3404,6 @@ class CuteBackend(Backend):
             # Detect MMA-compatible K-loops: device loops containing
             # addmm/mm with float16/bfloat16 operands.
             mma_mode = False
-            is_device_loop = any(bid not in grid_ids for bid in block_ids)
             if is_device_loop:
                 mma_mode = _detect_specialized_mma_loop(
                     fn,
@@ -3035,6 +3411,32 @@ class CuteBackend(Backend):
                     block_sizes=nd_block_size,
                     config=config,
                 )
+            elif (
+                len(device_ir.grid_block_ids) == 1
+                and block_ids == device_ir.grid_block_ids[0]
+            ):
+                specialized_mma_impl = _kernel_specialized_mma_impl(fn, config=config)
+                if specialized_mma_impl == "tcgen05" and len(nd_block_size) == 2:
+                    from .cute.cute_mma import _tcgen05_root_m_threads
+
+                    root_m_threads = (
+                        _tcgen05_root_m_threads(
+                            int(nd_block_size[0]), int(nd_block_size[1])
+                        )
+                        if num_threads_config[0] == 0
+                        and isinstance(nd_block_size[0], int)
+                        and isinstance(nd_block_size[1], int)
+                        else num_threads_config[0]
+                    )
+                    root_n_threads = (
+                        min(int(nd_block_size[1]), 8)
+                        if num_threads_config[1] == 0
+                        and isinstance(nd_block_size[1], int)
+                        else num_threads_config[1]
+                    )
+                    num_threads_config[0] = root_m_threads
+                    num_threads_config[1] = root_n_threads
+                    static_threads = root_m_threads * root_n_threads
 
             check_thread_limit(static_threads, context=str(tuple(nd_block_size)))
             return CuteNDTileStrategy(
@@ -3069,16 +3471,6 @@ class CuteBackend(Backend):
             loop_order=loop_order,
             num_threads=flat_num_threads,
         )
-
-    def autotune(
-        self,
-        bound_kernel: BoundKernel[Any],
-        args: Sequence[object],
-        *,
-        force: bool = True,
-        **kwargs: object,
-    ) -> Config:
-        return bound_kernel.config_spec.default_config()
 
 
 class MetalBackend(Backend):

@@ -24,6 +24,8 @@ from .host_function import HostFunction
 from .tile_strategy import DeviceLoopState
 from .utils import compute_slice_size
 from .variable_origin import BlockSizeOrigin
+from .variable_origin import GridOrigin
+from .variable_origin import TileBeginOrigin
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -123,6 +125,47 @@ def _resolve_codegen_block_id(state: CodegenState, block_id: int) -> int:
     env = CompileEnvironment.current()
     graph = state.fx_node.graph if state.fx_node is not None else None
     return env.resolve_codegen_block_id(block_id, state.codegen, graph)
+
+
+def _scalar_symint_can_codegen_as_scalar(k: torch.SymInt) -> bool:
+    expr = _symint_expr(k)
+    if not isinstance(expr, sympy.Expr):
+        return False
+
+    # Constants, including SymInts simplified to constants, are scalar offsets.
+    if not expr.free_symbols:
+        return True
+
+    expr_to_origin = HostFunction.current().expr_to_origin
+    for symbol in expr.free_symbols:
+        if not isinstance(symbol, sympy.Symbol):
+            return False
+        # Every symbol must be known to DeviceFunction.sympy_expr(), otherwise
+        # tensor descriptor lowering would fail when printing the scalar offset.
+        origin_info = expr_to_origin.get(symbol)
+        if origin_info is None:
+            return False
+
+        origin = origin_info.origin
+        # BlockSizeOrigin represents a descriptor block extent, not a scalar
+        # offset. Those symbols must use the block-size validation path above.
+        if isinstance(origin, BlockSizeOrigin):
+            return False
+        if isinstance(origin, GridOrigin):
+            # Exact GridOrigin (hl.grid()) and TileBeginOrigin (tile.begin)
+            # already represent the loop offset. Other GridOrigin subclasses
+            # such as tile.end/count/id need different math, so fall back.
+            if type(origin) is GridOrigin or isinstance(origin, TileBeginOrigin):
+                continue
+            return False
+
+        # Host-derived values (scalar args, tensor sizes, attributes/items) can
+        # be lifted as scalar arguments. Device-derived values are not uniform
+        # descriptor offsets.
+        if not origin.is_host():
+            return False
+
+    return True
 
 
 def _has_active_codegen_block(state: CodegenState, block_idx: int) -> bool:
@@ -416,9 +459,11 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
         if not (2 <= fake_tensor.ndim <= 5):
             return False
 
-        # 2) Exactly 1 dimension should have stride==1
+        # 2) Exactly one dimension must be contiguous. Triton may permute the
+        # descriptor so this dimension is last, but support checks are easier
+        # to express in the original tensor dimension order.
         env = CompileEnvironment.current()
-        stride_one_count = 0
+        stride_one_dim = None
         element_size = fake_tensor.element_size()
         for dim in range(fake_tensor.ndim):
             raw_stride = fake_tensor.stride(dim)
@@ -432,17 +477,22 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
                 # it holds for all shapes in the specialization bucket.
                 hint = env.size_hint(raw_stride)
                 if hint == 1:
-                    stride_one_count += 1
+                    if stride_one_dim is not None:
+                        return False
+                    stride_one_dim = dim
                     continue
                 return False
             if stride == 1:
-                stride_one_count += 1
+                if stride_one_dim is not None:
+                    return False
+                stride_one_dim = dim
             else:
                 # 3) All other dimensions should have 16-byte aligned strides
+                # so the descriptor remains valid for the whole tensor layout.
                 byte_stride = stride * element_size
                 if byte_stride % 16 != 0:
                     return False
-        if stride_one_count != 1:
+        if stride_one_dim is None:
             # There should be exactly one dimension with stride==1
             return False
 
@@ -469,7 +519,11 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
             # generated stores stay aligned and avoid misaligned-address errors.
             return block_size * element_size >= 16
 
-        # 4) Check minimum 16 bytes in each dimension
+        # 4) Validate subscript forms and collect the descriptor block_shape in
+        # tensor-dimension order. Scalar indices become block_shape=1, which is
+        # fine for batch/head dimensions but invalid if it lands on the
+        # contiguous dimension checked below.
+        descriptor_block_shape: list[int | torch.SymInt] = []
         sizes = fake_tensor.size()
         strides = fake_tensor.stride()
         size_stride = collections.deque(zip(sizes, strides, strict=True))
@@ -478,13 +532,19 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
             if k is None:
                 continue
             size, stride = size_stride.popleft()
-            if isinstance(k, slice):
+            if isinstance(k, int):
+                # Python integer indexing collapses this tensor dimension to a
+                # scalar offset, so the descriptor block in that dimension is 1.
+                descriptor_block_shape.append(1)
+            elif isinstance(k, slice):
                 # Slices with steps are not supported in tensor descriptor mode
                 if k.step is not None and k.step != 1:
                     return False
                 block_size = env.allocate_reduction_dimension(size).from_config(config)
                 if not valid_block_size(block_size, stride, i):
                     return False
+                assert isinstance(block_size, int)
+                descriptor_block_shape.append(block_size)
             elif (
                 tile_info := _get_tile_with_offset_info(k, state.fx_node, i)
             ) is not None:
@@ -496,15 +556,41 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
                 )
                 if not valid_block_size(block_size, stride, i):
                     return False
+                assert isinstance(block_size, int)
+                descriptor_block_shape.append(block_size)
             elif isinstance(k, torch.SymInt):
-                block_id = env.get_block_id(k)
-                if block_id is None:
-                    return False
-                block_size = env.block_sizes[block_id].from_config(config)
-                if not valid_block_size(block_size, stride, i):
-                    return False
+                symbol = _symint_expr(k)
+                origin = None
+                if isinstance(symbol, sympy.Symbol):
+                    origin = HostFunction.current().expr_to_origin.get(symbol)
+                if origin and isinstance(origin.origin, BlockSizeOrigin):
+                    block_size = env.block_sizes[origin.origin.block_id].from_config(
+                        config
+                    )
+                    if not valid_block_size(block_size, stride, i):
+                        return False
+                    assert isinstance(block_size, int)
+                    descriptor_block_shape.append(block_size)
+                else:
+                    # Lowerable scalar SymInt offsets also collapse the tensor
+                    # dimension to block_shape=1. The final stride-one check
+                    # below decides whether that scalar dimension is legal for
+                    # tensor descriptors.
+                    descriptor_block_shape.append(1)
+                    if not _scalar_symint_can_codegen_as_scalar(k):
+                        return False
 
-        return True
+        if len(descriptor_block_shape) != fake_tensor.ndim:
+            return False
+        # Triton requires the descriptor's contiguous dimension to cover at
+        # least 16 bytes. This catches cases like g[batch, tile_t, head], where
+        # scalar head indexing would emit block_shape=[1, block_t, 1] and the
+        # stride-one dimension would move only one element.
+        return valid_block_size(
+            descriptor_block_shape[stride_one_dim],
+            fake_tensor.stride(stride_one_dim),
+            stride_one_dim,
+        )
 
     def codegen_load(
         self,

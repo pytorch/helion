@@ -88,6 +88,56 @@ def _get_tile_shape(
     return shape
 
 
+def _resolve_dim_block_id(
+    cg: GenerateAST,
+    fake_tensor: torch.Tensor,
+    dim: int,
+) -> int | None:
+    """Return the block_id active for a tile dimension, if any.
+
+    Falls back to searching ``env.block_sizes`` for matches with the same
+    extent when ``env.get_block_id`` cannot resolve a static int dim directly.
+    """
+    env = CompileEnvironment.current()
+    dim_size = fake_tensor.shape[dim]
+    block_id = env.get_block_id(dim_size)
+    if block_id is not None:
+        return block_id
+    if not isinstance(dim_size, (int, torch.SymInt)):
+        return None
+    grid_state = cg.current_grid_state
+    grid_axes = grid_state.block_thread_axes if grid_state is not None else {}
+    candidates: list[int] = []
+    for info in env.block_sizes:
+        if not isinstance(info.size, (int, torch.SymInt)):
+            continue
+        if not env.known_equal(info.size, dim_size):
+            continue
+        bid = info.block_id
+        if cg.active_device_loops.get(bid) or bid in grid_axes:
+            candidates.append(bid)
+    if len(candidates) == 1:
+        return candidates[0]
+    return None
+
+
+def _strategy_aliases_index_and_offset(strategy: object, block_id: int) -> bool:
+    """Return True when ``strategy`` produces an index var aliased to its offset.
+
+    ``CuteFlattenedTileStrategy`` (and ``FlattenedTileStrategy``) emit
+    ``indices_X = offsets_X`` when collapsing a single block id, so the
+    difference ``indices_X - offsets_X`` is always zero. We must derive the
+    per-thread coordinate from ``thread_idx`` instead.
+    """
+    from ..tile_strategy import FlattenedTileStrategy
+
+    if not isinstance(strategy, FlattenedTileStrategy):
+        return False
+    if len(strategy.block_ids) != 1:
+        return False
+    return strategy.block_ids[0] == block_id
+
+
 def _get_dim_local_coord(
     cg: GenerateAST,
     fake_tensor: torch.Tensor,
@@ -98,17 +148,26 @@ def _get_dim_local_coord(
     Uses the current block-local index when the dimension is active, which
     preserves lane-loop coordinates as well as CUDA thread coordinates.
     """
-    env = CompileEnvironment.current()
-    dim_size = fake_tensor.shape[dim]
-    block_id = env.get_block_id(dim_size)
+    block_id = _resolve_dim_block_id(cg, fake_tensor, dim)
 
     if block_id is None:
         return "cutlass.Int32(0)"
 
-    if cg.active_device_loops.get(block_id):
-        index_var = cg.index_var(block_id)
-        offset_var = cg.offset_var(block_id)
-        return f"(({index_var}) - ({offset_var}))"
+    loops = cg.active_device_loops.get(block_id)
+    if loops:
+        loop_state = loops[-1]
+        if _strategy_aliases_index_and_offset(loop_state.strategy, block_id):
+            thread_axis = _get_dim_thread_axis(cg, fake_tensor, dim)
+            if thread_axis is not None:
+                return _grid_local_coord_expr(cg, block_id, thread_axis)
+        try:
+            offset_var = cg.offset_var(block_id)
+        except NotImplementedError:
+            thread_axis = _get_dim_thread_axis(cg, fake_tensor, dim)
+            if thread_axis is not None:
+                return _grid_local_coord_expr(cg, block_id, thread_axis)
+            return f"({cg.index_var(block_id)})"
+        return f"(({cg.index_var(block_id)}) - ({offset_var}))"
 
     thread_axis = _get_dim_thread_axis(cg, fake_tensor, dim)
     if thread_axis is not None:
@@ -149,9 +208,7 @@ def _get_dim_thread_axis(
     dim: int,
 ) -> int | None:
     """Return the thread axis for a tile dimension, if one exists."""
-    env = CompileEnvironment.current()
-    dim_size = fake_tensor.shape[dim]
-    block_id = env.get_block_id(dim_size)
+    block_id = _resolve_dim_block_id(cg, fake_tensor, dim)
 
     if block_id is None:
         return None

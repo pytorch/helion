@@ -71,8 +71,11 @@ jobs:
         run: |
           set -eux
           SUDO=$(command -v sudo 2>/dev/null || true)
-          $SUDO apt-get update
-          $SUDO apt-get install -y libdw1 curl wget git pkg-config zlib1g-dev build-essential
+          retry () {
+            "$@" || (sleep 10 && "$@") || (sleep 20 && "$@") || (sleep 40 && "$@")
+          }
+          retry $SUDO apt-get update
+          retry $SUDO apt-get install -y --fix-missing libdw1 curl wget git pkg-config zlib1g-dev build-essential
 
       - name: Install NVSHMEM
         if: contains(matrix.alias, 'distributed')
@@ -109,7 +112,7 @@ jobs:
           path: |
             ~/.cache/uv
             ~/.venv
-          key: ${{ matrix.python-version }}-${{ matrix.runtime-version }}-${{ matrix.pytorch-version }}-${{ hashFiles('.github/workflows/test.yml') }}-${{ steps.date.outputs.month }}
+          key: ${{ matrix.python-version }}-${{ matrix.runtime-version }}-${{ matrix.pytorch-version }}-${{ matrix.backend }}-${{ hashFiles('.github/workflows/test.yml') }}-${{ steps.date.outputs.month }}
 
       - name: Install PyTorch
         run: |
@@ -148,6 +151,11 @@ jobs:
           git -C triton checkout ${{ matrix.triton-pin }}
           cd triton/
           uv pip install -r python/requirements.txt
+          # Disable proton on XPU: proton's NVIDIA sources (CuptiApi.cpp, NvtxApi.cpp)
+          # require CUDA headers that are not present on Intel XPU runners.
+          if [ "${{ matrix.alias }}" == "xpu" ]; then
+            export TRITON_BUILD_PROTON=OFF
+          fi
           MAX_JOBS=$(nproc) TRITON_PARALLEL_LINK_JOBS=2 uv pip install .
           cd /tmp/$USER
           rm -rf triton/
@@ -175,7 +183,7 @@ jobs:
             --extra-index-url https://us-python.pkg.dev/ml-oss-artifacts-published/jax/simple/ \
             --find-links https://storage.googleapis.com/jax-releases/libtpu_releases.html \
             --pre \
-            'jax==0.9.2' 'jaxlib==0.9.2' 'libtpu==0.0.40' 'tpu-info==0.7.1' 'jaxtyping' 'frozendict'
+            'jax==0.9.2' 'jaxlib==0.9.2' 'libtpu==0.0.40' 'tpu-info==0.7.1' 'jaxtyping' 'frozendict' 'immutabledict'
           # Install Bazel
           if ! command -v bazel &> /dev/null; then
             sudo curl -L https://github.com/bazelbuild/bazelisk/releases/download/v1.27.0/bazelisk-linux-amd64 -o /usr/local/bin/bazel
@@ -202,9 +210,13 @@ jobs:
           cd /tmp/torch_tpu
           git checkout "${TORCH_TPU_COMMIT}"
           # Build torch_tpu wheel
+          sudo apt-get install -y libpython3-dev
           export TORCH_SOURCE=$(python -c "import torch; import os; print(os.path.dirname(os.path.dirname(torch.__file__)))")
-          export SITE_PACKAGES=$(python -c "import site; print(site.getsitepackages()[0])")
-          bazel build -c opt //ci/wheel:torch_tpu_wheel --config=helion_public_caching_readwrite --define WHEEL_VERSION=0.1.0 --define TORCH_SOURCE=local --action_env=PYTHONPATH=$TORCH_SOURCE:$SITE_PACKAGES --action_env=JAX_PLATFORMS=cpu
+          bazel build -c opt //ci/wheel:torch_tpu_wheel \
+            --config=helion_public_caching_readwrite \
+            --define TORCH_SOURCE=local \
+            --repo_env=TORCH_SOURCE=$TORCH_SOURCE \
+            --action_env=JAX_PLATFORMS=cpu
           uv pip install bazel-bin/ci/wheel/*.whl
           # torch_tpu wheel is pinned to libtpu 0.0.38, but helion requires 0.0.40 to work
           # we can remove this step as soon as torch_tpu updates its libtpu pin
@@ -218,7 +230,7 @@ jobs:
         if: matrix.backend == 'cute'
         run: |
           source .venv/bin/activate
-          SETUPTOOLS_SCM_PRETEND_VERSION="0.0.0" uv pip install .'[cute-cu12]'
+          ./scripts/install_cute.sh
 
       - name: CUDA Compute Check
         if: startsWith(matrix.image, 'nvidia')
@@ -241,6 +253,43 @@ jobs:
           print(f'All {n} devices healthy')
           "
 
+      - name: Inductor Worker Check
+        if: startsWith(matrix.image, 'nvidia')
+        run: |
+          source .venv/bin/activate
+          python -c "
+          import torch
+
+          @torch.compile
+          def f(x):
+              return (x + 1).relu()
+
+          x = torch.randn(8, device='cuda')
+          f(x).sum().item()
+          print('Inductor worker subprocess: OK')
+          "
+
+      - name: XPU Compute Check
+        if: startsWith(matrix.image, 'intel')
+        run: |
+          source .venv/bin/activate
+          python -c "
+          import torch
+
+          assert torch.xpu.is_available(), 'FATAL: XPU not available'
+          n = torch.xpu.device_count()
+          assert n > 0, 'FATAL: No XPU devices found'
+          print(f'XPU devices: {n}')
+
+          for i in range(n):
+              dev = torch.device('xpu', i)
+              a = torch.randn(256, 256, device=dev)
+              b = (a @ a).sum().item()
+              print(f'  Device {i} ({torch.xpu.get_device_name(i)}): OK')
+
+          print(f'All {n} devices healthy')
+          "
+
       - name: MPS Availability Check
         if: matrix.backend == 'metal'
         run: |
@@ -259,6 +308,8 @@ jobs:
           if [[ "${{ matrix.ref-eager }}" == "true" ]]; then export HELION_INTERPRET=1; fi
           if [[ "${{ matrix.backend }}" == "tileir" ]]; then export ENABLE_TILE=1; fi
           export HELION_BACKEND=${{ matrix.backend }}
+          # Disable TorchTPU build cache to prevent running out of disk space.
+          export TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE=disabled
           # -rf: print failed tests
           # --timeout: max allowed time for each test
           PARALLEL="-n4"

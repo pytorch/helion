@@ -56,7 +56,7 @@ def backward_kernel(grad_out: torch.Tensor, x: torch.Tensor, y: torch.Tensor, *,
     # src[helion_bwd_6638b8a1210a.py:N]:     grad_out_tile = grad_out[tile]
     # src[helion_bwd_6638b8a1210a.py:N]:     x_tile = x[tile]
     # src[helion_bwd_6638b8a1210a.py:N-N]: ...
-    _launcher(_helion_backward_kernel, (triton.cdiv(128, _BLOCK_SIZE_0),), grad_out, grad_x, grad_y, num_warps=4, num_stages=1)
+    _launcher(_helion_backward_kernel, ((128 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0,), grad_out, grad_x, grad_y, num_warps=4, num_stages=1)
     # src[helion_bwd_6638b8a1210a.py:N]: return (grad_x, grad_y)
     return (grad_x, grad_y)
 
@@ -116,7 +116,7 @@ def backward_kernel(grad_out: torch.Tensor, x: torch.Tensor, *, _launcher=_defau
     # src[helion_bwd_2efef9e1e860.py:N]:     grad_out_tile = grad_out[tile]
     # src[helion_bwd_2efef9e1e860.py:N]:     x_tile = x[tile]
     # src[helion_bwd_2efef9e1e860.py:N-N]: ...
-    _launcher(_helion_backward_kernel, (triton.cdiv(128, _BLOCK_SIZE_0),), grad_out, x, grad_x, num_warps=4, num_stages=1)
+    _launcher(_helion_backward_kernel, ((128 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0,), grad_out, x, grad_x, num_warps=4, num_stages=1)
     # src[helion_bwd_2efef9e1e860.py:N]: return grad_x
     return grad_x
 
@@ -186,7 +186,7 @@ def backward_kernel(grad_out: torch.Tensor, x: torch.Tensor, *, _launcher=_defau
     # src[helion_bwd_64115e9471c9.py:N]:     grad_out_tile = grad_out[tile]
     # src[helion_bwd_64115e9471c9.py:N]:     x_tile = x[tile]
     # src[helion_bwd_64115e9471c9.py:N-N]: ...
-    _launcher(_helion_backward_kernel, (triton.cdiv(128, _BLOCK_SIZE_0),), grad_out, x, grad_x, num_warps=4, num_stages=1)
+    _launcher(_helion_backward_kernel, ((128 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0,), grad_out, x, grad_x, num_warps=4, num_stages=1)
     # src[helion_bwd_64115e9471c9.py:N]: return grad_x
     return grad_x
 
@@ -271,7 +271,7 @@ def backward_kernel(grad_out: torch.Tensor, x: torch.Tensor, y: torch.Tensor, *,
     # src[helion_bwd_517f1e244946.py:N]:     grad_out_tile = grad_out[tile]
     # src[helion_bwd_517f1e244946.py:N]:     x_tile = x[tile]
     # src[helion_bwd_517f1e244946.py:N-N]: ...
-    _launcher(_helion_backward_kernel, (triton.cdiv(128, _BLOCK_SIZE_0),), grad_out, x, y, grad_x, grad_y, num_warps=4, num_stages=1)
+    _launcher(_helion_backward_kernel, ((128 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0,), grad_out, x, y, grad_x, grad_y, num_warps=4, num_stages=1)
     # src[helion_bwd_517f1e244946.py:N]: return (grad_x, grad_y)
     return (grad_x, grad_y)
 
@@ -347,7 +347,7 @@ def backward_kernel(grad_out: torch.Tensor, x: torch.Tensor, y: torch.Tensor, z:
     # src[helion_bwd_3606c21e0beb.py:N]:     grad_out_tile = grad_out[tile]
     # src[helion_bwd_3606c21e0beb.py:N]:     x_tile = x[tile]
     # src[helion_bwd_3606c21e0beb.py:N-N]: ...
-    _launcher(_helion_backward_kernel, (triton.cdiv(128, _BLOCK_SIZE_0),), grad_out, x, y, grad_x, grad_y, grad_z, num_warps=4, num_stages=1)
+    _launcher(_helion_backward_kernel, ((128 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0,), grad_out, x, y, grad_x, grad_y, grad_z, num_warps=4, num_stages=1)
     # src[helion_bwd_3606c21e0beb.py:N]: return (grad_x, grad_y, grad_z)
     return (grad_x, grad_y, grad_z)
 
@@ -416,7 +416,7 @@ def backward_kernel(grad_out: torch.Tensor, x: torch.Tensor, *, _launcher=_defau
     # src[helion_bwd_dccc593adaf9.py:N]:     grad_out_tile = grad_out[tile]
     # src[helion_bwd_dccc593adaf9.py:N]:     x_tile = x[tile]
     # src[helion_bwd_dccc593adaf9.py:N-N]: ...
-    _launcher(_helion_backward_kernel, (triton.cdiv(128, _BLOCK_SIZE_0),), grad_out, x, grad_x, num_warps=4, num_stages=1)
+    _launcher(_helion_backward_kernel, ((128 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0,), grad_out, x, grad_x, num_warps=4, num_stages=1)
     # src[helion_bwd_dccc593adaf9.py:N]: return grad_x
     return grad_x
 
@@ -473,7 +473,7 @@ def backward_kernel(grad_out: torch.Tensor, x: torch.Tensor, *, _launcher=_defau
     # src[helion_bwd_dad46ce1a0b8.py:N]:     grad_out_tile = grad_out[tile]
     # src[helion_bwd_dad46ce1a0b8.py:N]:     x_tile = x[tile]
     # src[helion_bwd_dad46ce1a0b8.py:N-N]: ...
-    _launcher(_helion_backward_kernel, (triton.cdiv(128, _BLOCK_SIZE_0),), grad_out, x, grad_x, num_warps=4, num_stages=1)
+    _launcher(_helion_backward_kernel, ((128 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0,), grad_out, x, grad_x, num_warps=4, num_stages=1)
     # src[helion_bwd_dad46ce1a0b8.py:N]: return grad_x
     return grad_x
 
@@ -542,7 +542,7 @@ def backward_kernel(grad_out: torch.Tensor, x: torch.Tensor, y: torch.Tensor, *,
     # src[helion_bwd_7fc556f8295d.py:N]:     grad_out_tile = grad_out[tile]
     # src[helion_bwd_7fc556f8295d.py:N]:     x_tile = x[tile]
     # src[helion_bwd_7fc556f8295d.py:N-N]: ...
-    _launcher(_helion_backward_kernel, (triton.cdiv(128, _BLOCK_SIZE_0),), grad_out, x, y, grad_x, grad_y, num_warps=4, num_stages=1)
+    _launcher(_helion_backward_kernel, ((128 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0,), grad_out, x, y, grad_x, grad_y, num_warps=4, num_stages=1)
     # src[helion_bwd_7fc556f8295d.py:N]: return (grad_x, grad_y)
     return (grad_x, grad_y)
 
@@ -609,7 +609,7 @@ def backward_kernel(grad_out: torch.Tensor, x: torch.Tensor, *, _launcher=_defau
     # src[helion_bwd_cfb9b7eac08f.py:N]:     grad_out_tile = grad_out[tile]
     # src[helion_bwd_cfb9b7eac08f.py:N]:     x_tile = x[tile]
     # src[helion_bwd_cfb9b7eac08f.py:N-N]: ...
-    _launcher(_helion_backward_kernel, (triton.cdiv(128, _BLOCK_SIZE_0),), grad_out, x, grad_x, num_warps=4, num_stages=1)
+    _launcher(_helion_backward_kernel, ((128 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0,), grad_out, x, grad_x, num_warps=4, num_stages=1)
     # src[helion_bwd_cfb9b7eac08f.py:N]: return grad_x
     return grad_x
 
@@ -677,7 +677,7 @@ def backward_kernel(grad_out: torch.Tensor, x: torch.Tensor, *, _launcher=_defau
     # src[helion_bwd_b0edf9fb958a.py:N]:     grad_out_tile = grad_out[tile]
     # src[helion_bwd_b0edf9fb958a.py:N]:     x_tile = x[tile]
     # src[helion_bwd_b0edf9fb958a.py:N-N]: ...
-    _launcher(_helion_backward_kernel, (triton.cdiv(128, _BLOCK_SIZE_0),), grad_out, x, grad_x, num_warps=4, num_stages=1)
+    _launcher(_helion_backward_kernel, ((128 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0,), grad_out, x, grad_x, num_warps=4, num_stages=1)
     # src[helion_bwd_b0edf9fb958a.py:N]: return grad_x
     return grad_x
 
@@ -738,7 +738,7 @@ def backward_kernel(grad_out: torch.Tensor, x: torch.Tensor, *, _launcher=_defau
     # src[helion_bwd_dea87ece8316.py:N]:     grad_out_tile = grad_out[tile]
     # src[helion_bwd_dea87ece8316.py:N]:     x_tile = x[tile]
     # src[helion_bwd_dea87ece8316.py:N-N]: ...
-    _launcher(_helion_backward_kernel, (triton.cdiv(128, _BLOCK_SIZE_0),), grad_out, x, grad_x, num_warps=4, num_stages=1)
+    _launcher(_helion_backward_kernel, ((128 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0,), grad_out, x, grad_x, num_warps=4, num_stages=1)
     # src[helion_bwd_dea87ece8316.py:N]: return grad_x
     return grad_x
 
@@ -817,7 +817,7 @@ def backward_kernel(grad_out: torch.Tensor, x: torch.Tensor, *, _launcher=_defau
     # src[helion_bwd_974d4f6e8bcf.py:N]:     grad_out_tile = grad_out[tile]
     # src[helion_bwd_974d4f6e8bcf.py:N]:     x_tile = x[tile]
     # src[helion_bwd_974d4f6e8bcf.py:N-N]: ...
-    _launcher(_helion_backward_kernel, (triton.cdiv(128, _BLOCK_SIZE_0),), grad_out, x, grad_x, num_warps=4, num_stages=1)
+    _launcher(_helion_backward_kernel, ((128 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0,), grad_out, x, grad_x, num_warps=4, num_stages=1)
     # src[helion_bwd_974d4f6e8bcf.py:N]: return grad_x
     return grad_x
 
@@ -887,7 +887,7 @@ def backward_kernel(grad_out: torch.Tensor, x: torch.Tensor, *, _launcher=_defau
     # src[helion_bwd_92e2e9f95ba1.py:N]:     grad_out_tile = grad_out[tile]
     # src[helion_bwd_92e2e9f95ba1.py:N]:     x_tile = x[tile]
     # src[helion_bwd_92e2e9f95ba1.py:N-N]: ...
-    _launcher(_helion_backward_kernel, (triton.cdiv(128, _BLOCK_SIZE_0),), grad_out, x, grad_x, num_warps=4, num_stages=1)
+    _launcher(_helion_backward_kernel, ((128 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0,), grad_out, x, grad_x, num_warps=4, num_stages=1)
     # src[helion_bwd_92e2e9f95ba1.py:N]: return grad_x
     return grad_x
 
@@ -966,7 +966,7 @@ def backward_kernel(grad_out: torch.Tensor, x: torch.Tensor, y: torch.Tensor, *,
     # src[helion_bwd_128a52daef25.py:N]:     grad_out_tile = grad_out[tile]
     # src[helion_bwd_128a52daef25.py:N]:     x_tile = x[tile]
     # src[helion_bwd_128a52daef25.py:N-N]: ...
-    _launcher(_helion_backward_kernel, (triton.cdiv(128, _BLOCK_SIZE_0),), grad_out, x, y, grad_x, grad_y, num_warps=4, num_stages=1)
+    _launcher(_helion_backward_kernel, ((128 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0,), grad_out, x, y, grad_x, grad_y, num_warps=4, num_stages=1)
     # src[helion_bwd_128a52daef25.py:N]: return (grad_x, grad_y)
     return (grad_x, grad_y)
 
@@ -1033,7 +1033,7 @@ def backward_kernel(grad_out: torch.Tensor, x: torch.Tensor, *, _launcher=_defau
     # src[helion_bwd_032e6373b5b1.py:N]:     grad_out_tile = grad_out[tile]
     # src[helion_bwd_032e6373b5b1.py:N]:     x_tile = x[tile]
     # src[helion_bwd_032e6373b5b1.py:N-N]: ...
-    _launcher(_helion_backward_kernel, (triton.cdiv(128, _BLOCK_SIZE_0),), grad_out, x, grad_x, num_warps=4, num_stages=1)
+    _launcher(_helion_backward_kernel, ((128 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0,), grad_out, x, grad_x, num_warps=4, num_stages=1)
     # src[helion_bwd_032e6373b5b1.py:N]: return grad_x
     return grad_x
 
@@ -1095,7 +1095,7 @@ def backward_kernel(grad_out: torch.Tensor, x: torch.Tensor, y: torch.Tensor, *,
     # src[helion_bwd_2af11fa45f85.py:N]:     grad_out_tile = grad_out[tile]
     # src[helion_bwd_2af11fa45f85.py:N]:     x_tile = x[tile]
     # src[helion_bwd_2af11fa45f85.py:N-N]: ...
-    _launcher(_helion_backward_kernel, (triton.cdiv(128, _BLOCK_SIZE_0),), grad_out, grad_x, grad_y, num_warps=4, num_stages=1)
+    _launcher(_helion_backward_kernel, ((128 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0,), grad_out, grad_x, grad_y, num_warps=4, num_stages=1)
     # src[helion_bwd_2af11fa45f85.py:N]: return (grad_x, grad_y)
     return (grad_x, grad_y)
 
@@ -1182,7 +1182,7 @@ def backward_kernel(grad_out: torch.Tensor, x: torch.Tensor, y: torch.Tensor, z:
     # src[helion_bwd_8ec41d00243f.py:N]:     grad_out_tile = grad_out[tile]
     # src[helion_bwd_8ec41d00243f.py:N]:     x_tile = x[tile]
     # src[helion_bwd_8ec41d00243f.py:N-N]: ...
-    _launcher(_helion_backward_kernel, (triton.cdiv(128, _BLOCK_SIZE_0),), grad_out, x, y, z, grad_x, grad_y, grad_z, num_warps=4, num_stages=1)
+    _launcher(_helion_backward_kernel, ((128 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0,), grad_out, x, y, z, grad_x, grad_y, grad_z, num_warps=4, num_stages=1)
     # src[helion_bwd_8ec41d00243f.py:N]: return (grad_x, grad_y, grad_z)
     return (grad_x, grad_y, grad_z)
 
@@ -1249,7 +1249,7 @@ def backward_kernel(grad_out: torch.Tensor, x: torch.Tensor, *, _launcher=_defau
     # src[helion_bwd_817d58d2593f.py:N]:     grad_out_tile = grad_out[tile]
     # src[helion_bwd_817d58d2593f.py:N]:     x_tile = x[tile]
     # src[helion_bwd_817d58d2593f.py:N-N]: ...
-    _launcher(_helion_backward_kernel, (triton.cdiv(128, _BLOCK_SIZE_0),), grad_out, x, grad_x, num_warps=4, num_stages=1)
+    _launcher(_helion_backward_kernel, ((128 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0,), grad_out, x, grad_x, num_warps=4, num_stages=1)
     # src[helion_bwd_817d58d2593f.py:N]: return grad_x
     return grad_x
 
@@ -1336,7 +1336,7 @@ def backward_kernel(grad_out: torch.Tensor, x: torch.Tensor, y: torch.Tensor, z:
     # src[helion_bwd_685114fbd109.py:N]:     grad_out_tile = grad_out[tile]
     # src[helion_bwd_685114fbd109.py:N]:     x_tile = x[tile]
     # src[helion_bwd_685114fbd109.py:N-N]: ...
-    _launcher(_helion_backward_kernel, (triton.cdiv(128, _BLOCK_SIZE_0),), grad_out, x, y, z, grad_x, grad_y, grad_z, num_warps=4, num_stages=1)
+    _launcher(_helion_backward_kernel, ((128 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0,), grad_out, x, y, z, grad_x, grad_y, grad_z, num_warps=4, num_stages=1)
     # src[helion_bwd_685114fbd109.py:N]: return (grad_x, grad_y, grad_z)
     return (grad_x, grad_y, grad_z)
 
@@ -1396,7 +1396,7 @@ def backward_kernel(grad_out: torch.Tensor, x: torch.Tensor, *, _launcher=_defau
     # src[helion_bwd_5789a7e3e64f.py:N]:     grad_out_tile = grad_out[tile]
     # src[helion_bwd_5789a7e3e64f.py:N]:     x_tile = x[tile]
     # src[helion_bwd_5789a7e3e64f.py:N-N]: ...
-    _launcher(_helion_backward_kernel, (triton.cdiv(128, _BLOCK_SIZE_0),), grad_out, x, grad_x, num_warps=4, num_stages=1)
+    _launcher(_helion_backward_kernel, ((128 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0,), grad_out, x, grad_x, num_warps=4, num_stages=1)
     # src[helion_bwd_5789a7e3e64f.py:N]: return grad_x
     return grad_x
 
@@ -1469,6 +1469,6 @@ def backward_kernel(grad_out: torch.Tensor, x: torch.Tensor, *, _launcher=_defau
     # src[helion_bwd_bddf380a8245.py:N]:     grad_out_tile = grad_out[tile]
     # src[helion_bwd_bddf380a8245.py:N]:     x_tile = x[tile]
     # src[helion_bwd_bddf380a8245.py:N-N]: ...
-    _launcher(_helion_backward_kernel, (triton.cdiv(128, _BLOCK_SIZE_0),), grad_out, x, grad_x, num_warps=4, num_stages=1)
+    _launcher(_helion_backward_kernel, ((128 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0,), grad_out, x, grad_x, num_warps=4, num_stages=1)
     # src[helion_bwd_bddf380a8245.py:N]: return grad_x
     return grad_x

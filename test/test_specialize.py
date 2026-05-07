@@ -434,7 +434,7 @@ class TestSpecialize(RefEagerTestBase, TestCase):
         self.assertNotIn("x_stride_1", code)
 
 
-@onlyBackends(["triton"])
+@onlyBackends(["triton", "cute"])
 class TestMarkStatic(RefEagerTestBase, TestCase):
     """Tests for torch._dynamo.mark_static() external specialization API."""
 

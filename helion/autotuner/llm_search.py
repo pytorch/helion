@@ -626,7 +626,7 @@ class LLMGuidedSearch(PopulationBasedSearch):
         state = _SearchLoopState(seen_config_keys=set())
         self._run_initial_round(state)
 
-        for round_num in range(1, self.max_rounds):
+        for round_num in self._budgeted_range(1, self.max_rounds):
             if self._run_refinement_round(round_num, state):
                 break
 

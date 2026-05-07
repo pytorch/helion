@@ -12,12 +12,15 @@ import os
 from pathlib import Path
 import re
 import sys
+from types import SimpleNamespace
 from typing import TYPE_CHECKING
 from typing import Callable
 from typing import Generator
 from typing import Sequence
+from typing import TypeVar
 from typing import cast
 import unittest
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -57,6 +60,8 @@ if TYPE_CHECKING:
 
     from .runtime.kernel import BoundKernel
     from .runtime.kernel import Kernel
+
+_R = TypeVar("_R")
 
 
 def _strip_launcher_args(value: str) -> str:
@@ -220,22 +225,10 @@ def _has_mtia_runtime() -> bool:
         return False
 
 
-def _init_tpu_device() -> bool:
-    """Try to initialize the TPU device. Returns True if successful."""
-    try:
-        import torch_tpu.api  # type: ignore[import-not-found]
-
-        torch_tpu.api.tpu_device()
-        return True
-    except (ImportError, RuntimeError):
-        return False
-
-
 # Determine DEVICE without calling functions that initialize CUDA.
 if _get_backend() == "pallas" and is_pallas_interpret():
     DEVICE = torch.device("cpu")
 elif _get_backend() == "pallas":
-    _init_tpu_device()
     DEVICE = torch.device("tpu")
 elif torch.xpu.is_available():
     DEVICE = torch.device("xpu")
@@ -335,7 +328,7 @@ def skipUnlessTileIR(reason: str) -> Callable[[Callable], Callable]:
 def _has_cute_dsl() -> bool:
     try:
         import cutlass.cute as _cute  # noqa: F401
-    except ModuleNotFoundError:
+    except ImportError:
         return False
     return True
 
@@ -348,6 +341,48 @@ def skipUnlessCuteAvailable(reason: str) -> Callable[[Callable], Callable]:
 def xfailIfCute(reason: str) -> Callable[[Callable], Callable]:
     """Mark test xfail when CUTLASS CuTe backend is selected."""
     return xfailIfFn(lambda: _get_backend() == "cute", reason)
+
+
+def skipIfCute(reason: str) -> Callable[[Callable], Callable]:
+    """Skip test when CUTLASS CuTe backend is selected."""
+    return skipIfFn(lambda: _get_backend() == "cute", reason)
+
+
+def default_cute_mma_support(
+    *,
+    supported_impls: tuple[str, ...] = ("universal", "warp", "tcgen05"),
+    warp_f16bf16: bool = True,
+    tcgen05_f16bf16: bool = True,
+) -> SimpleNamespace:
+    """Return a ``get_cute_mma_support()`` mock with tcgen05-on defaults."""
+    return SimpleNamespace(
+        supported_impls=supported_impls,
+        warp_f16bf16=warp_f16bf16,
+        tcgen05_f16bf16=tcgen05_f16bf16,
+    )
+
+
+@contextlib.contextmanager
+def patch_cute_mma_support(
+    support: SimpleNamespace | None = None,
+) -> Generator[SimpleNamespace, None, None]:
+    """Patch both ``get_cute_mma_support`` bindings.
+
+    ``cute_mma`` re-binds the symbol from ``mma_support`` at import time.
+    """
+    if support is None:
+        support = default_cute_mma_support()
+    with (
+        patch(
+            "helion._compiler.cute.cute_mma.get_cute_mma_support",
+            return_value=support,
+        ),
+        patch(
+            "helion._compiler.cute.mma_support.get_cute_mma_support",
+            return_value=support,
+        ),
+    ):
+        yield support
 
 
 def skipIfNotTriton(reason: str) -> Callable[[Callable], Callable]:
@@ -451,11 +486,16 @@ def skipIfNotCUDA() -> Callable[[Callable], Callable]:
 def skipIfCudaCapabilityLessThan(
     min_capability: tuple[int, int], *, reason: str | None = None
 ) -> Callable[[Callable], Callable]:
-    """Skip test if not running on CUDA or capability is less than min_capability."""
+    """Skip test if running on CUDA with capability less than min_capability.
+
+    Pass-through on non-CUDA backends. Combine with `skipIfNotCUDA()` (or
+    `skipIfPallas`/`skipIfXPU`/etc.) at the call site if the test also
+    requires a specific platform.
+    """
 
     def cond() -> bool:
         if not is_cuda():
-            return True
+            return False
         return torch.cuda.get_device_capability() < min_capability
 
     # Defers check to test execution time to avoid CUDA init during pytest-xdist collection.
@@ -917,8 +957,8 @@ def _bound_test_config(bound: BoundKernel, **kwargs: object) -> Config:
             # pyrefly: ignore [bad-argument-type]
             **kwargs
         )
-    elif bound.kernel.configs:
-        (config,) = bound.kernel.configs
+    elif len(bound.kernel.configs) == 1:
+        config = bound.kernel.configs[0]
     else:
         config = bound.config_spec.default_config()
     # Strip config keys not supported by the current backend so that
@@ -968,10 +1008,10 @@ def _run_bound_kernel(
 
 
 def code_and_output(
-    fn: Kernel,
+    fn: Kernel[_R],
     args: tuple[object, ...],
     **kwargs: object,
-) -> tuple[str, object]:
+) -> tuple[str, _R]:
     bound = fn.bind(args)
     if is_ref_mode_enabled(bound.kernel.settings):
         if kwargs:
@@ -986,14 +1026,14 @@ def code_and_output(
     config = _bound_test_config(bound, **kwargs)
     code, result = _run_bound_kernel(bound, args, config, emit_code=True)
     assert code is not None
-    return code, result
+    return code, cast("_R", result)
 
 
 def output_only(
-    fn: Kernel,
+    fn: Kernel[_R],
     args: tuple[object, ...],
     **kwargs: object,
-) -> object:
+) -> _R:
     """Run a kernel for correctness checks without eagerly materializing code text."""
     bound = fn.bind(args)
     if is_ref_mode_enabled(bound.kernel.settings):
@@ -1005,7 +1045,7 @@ def output_only(
 
     config = _bound_test_config(bound, **kwargs)
     _code, result = _run_bound_kernel(bound, args, config, emit_code=False)
-    return result
+    return cast("_R", result)
 
 
 def _as_tensors(result: object) -> list[torch.Tensor]:
@@ -1029,8 +1069,11 @@ def run_example(
     trace_path: str | None = None,
     process_group_name: str | None = None,
     interleaved: bool = True,
-) -> None:
+) -> dict[str, float]:
     """Run complete example: correctness check + benchmark.
+
+    Returns:
+        Dictionary mapping implementation names to their benchmark times in ms.
 
     Args:
         kernel_fn: Single kernel function, or dict of {name: function} for multiple kernel variants
@@ -1221,6 +1264,8 @@ def run_example(
             print(f"{name:<20} {time:<12.4f} {speedup_str:<15}", file=sys.stderr)
 
         print(f"{'=' * 65}\n", file=sys.stderr)
+
+    return all_times
 
 
 def _assert_example_result_close(

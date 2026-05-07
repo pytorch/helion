@@ -10,7 +10,9 @@ from torch._subclasses.fake_tensor import FakeTensor
 from .. import exc
 from .._compat import min_dot_size
 from .._compiler.compile_environment import CompileEnvironment
+from .._compiler.compile_environment import _to_sympy
 from .._compiler.compile_environment import format_shape
+from .._compiler.compile_environment import shape_env_var_hints
 from .._compiler.cute.indexing import CutePackedAffineLoad
 from .._compiler.cute.indexing import CutePackedTerms
 from .._compiler.cute.matmul_fallback import _emit_cute_matmul
@@ -21,6 +23,9 @@ from .._compiler.cute.matmul_utils import cute_outer_accumulator_out_dtype
 from .._compiler.cute.matmul_utils import cute_resolve_active_block_id
 from .._compiler.cute.matmul_utils import cute_resolve_active_matmul_k_block_id
 from .._compiler.cute.matmul_utils import cute_static_k_invariant_extent
+from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
+from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
+from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_MAX_K_TILES
 from .._compiler.matmul_utils import _compute_out_dtype
 from .._compiler.matmul_utils import _emit_pallas_matmul
 from .._compiler.matmul_utils import _emit_tl_dot_scaled
@@ -30,6 +35,20 @@ from . import _decorators
 
 if TYPE_CHECKING:
     from .._compiler.inductor_lowering import CodegenState
+
+
+def _static_dim_value(env: CompileEnvironment, size: int | torch.SymInt) -> int | None:
+    if isinstance(size, int):
+        return size
+    expr = _to_sympy(size)
+    expr = env.specialize_expr(env.shape_env.replace(expr))
+    if expr.free_symbols:
+        if not env.settings.static_shapes:
+            return None
+        expr = expr.xreplace(shape_env_var_hints(env.shape_env))
+    if expr.free_symbols:
+        return None
+    return int(expr)
 
 
 def _cute_dot_outer_accumulates_result(fx_node: object, *, is_acc_none: bool) -> bool:
@@ -232,10 +251,126 @@ def enforce_dot_requirements(lhs: torch.Tensor, rhs: torch.Tensor) -> None:
                     pass
             env.block_sizes[block_idx].update_min_block(min_size, allow_flattened=True)
 
+    # Blackwell tcgen05 matmuls require an explicit MxNxK tile family that the
+    # generic power-of-two search space rarely reaches on its own. Reuse the
+    # same block-size constraint path as Triton/Pallas so CuTe matmul search
+    # space shaping lives in one place. On current B200 runs the stable family
+    # now scales well past N=8, with N=256 outperforming the earlier narrow
+    # clamp on large bf16/f16 GEMMs.
+    def static_problem_extent(size: int | torch.SymInt) -> int | None:
+        block_idx = env.get_block_id(size)
+        if block_idx is not None:
+            block_size = env.block_sizes[block_idx].size
+            if isinstance(block_size, (int, torch.SymInt)):
+                return _static_dim_value(env, block_size)
+        return _static_dim_value(env, size)
+
+    static_m = static_problem_extent(m)
+    static_n = static_problem_extent(n)
+    static_k = static_problem_extent(k)
+    if (
+        env.backend_name == "cute"
+        and lhs.ndim == 2
+        and rhs.ndim == 2
+        and lhs.dtype in (torch.float16, torch.bfloat16)
+        and rhs.dtype == lhs.dtype
+        and static_m is not None
+        and static_n is not None
+        and static_k is not None
+        and static_m >= 64
+        and static_n >= 8
+        and static_k >= 16
+        # The tcgen05 direct-store epilogue's predicated SIMT path
+        # CUDA-launch-fails for partial M tiles on B200. Gate the tcgen05
+        # specialization on M being a clean multiple of the minimum tcgen05
+        # M tile (64) so generated tiles are always full and the predicated
+        # branch is never taken.
+        and static_m % 64 == 0
+    ):
+        from .._compiler.cute.mma_support import get_cute_mma_support
+
+        if get_cute_mma_support().tcgen05_f16bf16:
+
+            def pow2_floor_at_least(value: int, minimum: int) -> int:
+                return 1 << (max(minimum, value).bit_length() - 1)
+
+            spec = env.config_spec
+            spec.cute_tcgen05_search_enabled = True
+            max_tcgen05_n = min(256, pow2_floor_at_least(static_n, 8))
+            max_tcgen05_m = 256 if max_tcgen05_n >= 128 and static_m >= 256 else 128
+            # Larger tile_k packs more cute.gemm instructions per K loop
+            # iteration on tcgen05 (mma instruction K is fixed at 16 for
+            # BF16/FP16). Cap at 128 to keep AB SMEM staging budget sane.
+            max_tcgen05_k = min(128, pow2_floor_at_least(static_k, 16))
+            max_search_m = min(max_tcgen05_m, pow2_floor_at_least(static_m, 64))
+            max_search_n = max_tcgen05_n
+            max_search_k = max_tcgen05_k
+            # Persistent pid types may re-enter autotune only if every
+            # power-of-two block-size candidate in the tcgen05 search space
+            # is a static full tile. Since each candidate divides the maximum
+            # power-of-two candidate, checking the maximum per axis is enough.
+            # Multi-root kernels are rejected later once device IR root count
+            # is known.
+            allow_persistent_pid_types = (
+                static_m % max_search_m == 0
+                and static_n % max_search_n == 0
+                and static_k % max_search_k == 0
+            )
+            # ``tcgen05_cluster_m`` is searched independently from bk. Expose
+            # 2 when at least the largest searched bk fits the cap; smaller
+            # invalid bk samples fall back to cluster_m=1 during normalization.
+            max_cluster_m2_search_k = TCGEN05_TWO_CTA_MAX_K_TILES * max_search_k
+            allow_cluster_m2_search = (
+                allow_persistent_pid_types
+                and max_search_m >= TCGEN05_TWO_CTA_BLOCK_M
+                and max_search_n >= TCGEN05_TWO_CTA_BLOCK_N
+                and static_k <= max_cluster_m2_search_k
+            )
+            # Narrow the autotune search to tcgen05 configs that have been
+            # validated to compile and run correctly on B200. Static full-tile
+            # single-root role-local persistent kernels have coverage, so the
+            # helper keeps persistent pid types when all search block sizes
+            # are full tiles. ``cluster_m=2`` re-enters search only for
+            # static-full CtaGroup.TWO problems whose search space can form
+            # validated 256x256 tiles within the K-tile cap. Search-time
+            # normalization projects cluster_m=2 products onto that validated
+            # tile/pid shape and caps cluster_m=1 persistent products at
+            # tcgen05-supported M tiles so search does not fall through the
+            # universal fallback. ``num_epi_warps != 4`` remains excluded
+            # because only 4 is validated correct; 1 and 2 are directly
+            # verified to produce wrong output and 3 is unsafe by extension.
+            # The num_epi_warps restriction also tightens normalize() so an
+            # explicit user config that bypasses autotune raises
+            # ``InvalidConfig`` rather than silently miscomputing — there is
+            # no loud crash for this failure mode.
+            spec.narrow_tcgen05_autotune_to_validated_configs(
+                allow_persistent_pid_types=allow_persistent_pid_types,
+                allow_cluster_m2_search=allow_cluster_m2_search,
+                cluster_m2_static_k=static_k if allow_cluster_m2_search else None,
+            )
+            for axis_name, shape, max_size in (
+                ("m", m, max_search_m),
+                ("n", n, max_search_n),
+                ("k", k, max_search_k),
+            ):
+                block_idx = env.get_block_id(shape)
+                if block_idx is None:
+                    continue
+                if axis_name == "k":
+                    min_size = 16
+                elif axis_name == "m":
+                    min_size = 128 if max_tcgen05_m >= 256 else 64
+                else:
+                    min_size = 8
+                env.block_sizes[block_idx].update_min_block(
+                    min_size, allow_flattened=True
+                )
+                env.block_sizes[block_idx].update_max_block(max_size)
+
     # Triton only supports 2D dot operations.  When the operands are 3D
     # (batched matmul), constrain the batch dimension block size to 1 so
     # the codegen can squeeze it away before emitting tl.dot.
-    # Pallas uses jnp.matmul which handles batched matmul natively.
+    # Pallas uses jnp.dot_general which handles batched matmul natively.
     if len(lshape) == 3 and env.backend_name != "pallas":
         for batch_dim in (lshape[0], rshape[0]):
             block_idx = env.get_block_id(batch_dim)
@@ -409,16 +544,9 @@ def _(state: CodegenState) -> object:
         if isinstance(lhs_node, torch.fx.Node) and isinstance(rhs_node, torch.fx.Node):
             static_k_extent = cute_static_k_invariant_extent(lhs_node, rhs_node)
     env = CompileEnvironment.current()
-    size_hint = getattr(env, "size_hint", None)
-
-    def hinted(size: int | torch.SymInt) -> int:
-        if callable(size_hint):
-            hinted_size = size_hint(size)
-            assert isinstance(hinted_size, int)
-            return hinted_size
-        return int(size)
-
-    k_is_one = hinted(lhs_proxy.shape[-1]) == 1 and hinted(rhs_proxy.shape[-2]) == 1
+    static_lhs_k = _static_dim_value(env, lhs_proxy.shape[-1])
+    static_rhs_k = _static_dim_value(env, rhs_proxy.shape[-2])
+    k_is_one = static_lhs_k == 1 and static_rhs_k == 1
     if static_k_extent is None and k_block_id is None and not k_is_one:
         raise exc.BackendUnsupported(
             "cute",
@@ -477,6 +605,7 @@ def _(state: CodegenState) -> object:
         acc=acc,
         need_f32_acc=need_f32_acc,
         out_dtype=out_dtype,
+        lhs_ndim=lhs_proxy.ndim,
     )
 
 
@@ -512,7 +641,17 @@ def _(
         )
     else:
         # For non-FP8 tensors, use regular matmul
-        result = torch.mm(mat1, mat2, out_dtype=resolved_out_dtype)
+        if mat1.ndim == 3 or mat2.ndim == 3:
+            mat1_batched = mat1 if mat1.ndim == 3 else mat1.unsqueeze(0)
+            mat2_batched = mat2 if mat2.ndim == 3 else mat2.unsqueeze(0)
+            batch = max(mat1_batched.shape[0], mat2_batched.shape[0])
+            result = torch.bmm(
+                mat1_batched.expand(batch, -1, -1),
+                mat2_batched.expand(batch, -1, -1),
+                out_dtype=resolved_out_dtype,
+            )
+        else:
+            result = torch.mm(mat1, mat2, out_dtype=resolved_out_dtype)
 
     if acc is not None:
         return acc + result

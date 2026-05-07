@@ -25,6 +25,7 @@ from .cute.argreduce import codegen_cute_tile_argreduce
 from .cute.cute_mma import codegen_cute_mma_direct_mm
 from .cute.indexing import CutePackedAffineLoad
 from .cute.indexing import CuteShapeChainView
+from .cute.indexing import CuteSortableLoad
 from .cute.indexing import is_cute_shape_chain_target
 from .cute.indexing import match_cute_affine_range_iota
 from .cute.iota_utils import cute_iota_has_atomic_tensor_index_only_users
@@ -191,6 +192,32 @@ def codegen_where(ctx: LoweringContext, node: Node) -> object:
         cond=ensure_ast(cond),
         x=ensure_ast(x),
         y=ensure_ast(y),
+    )
+
+
+@where_lowering.register_codegen("cute")
+def codegen_where_cute(ctx: LoweringContext, node: Node) -> object:
+    env = CompileEnvironment.current()
+    cond, x, y = map_arg(node.args, lambda arg: _env_arg(ctx, arg))
+
+    def ensure_ast(value: object) -> ast.AST:
+        if isinstance(value, ast.AST):
+            return value
+        if isinstance(value, (int, float, bool)):
+            return expr_from_string(constant_repr(value))
+        raise AssertionError(f"unsupported where operand: {type(value)!r}")
+
+    output = node.meta.get("val")
+    x_ast = ensure_ast(x)
+    y_ast = ensure_ast(y)
+    if isinstance(output, torch.Tensor):
+        x_ast = env.backend.cast_ast(x_ast, output.dtype)
+        y_ast = env.backend.cast_ast(y_ast, output.dtype)
+    return expr_from_string(
+        env.backend.where_expr("{cond}", "{x}", "{y}"),
+        cond=ensure_ast(cond),
+        x=x_ast,
+        y=y_ast,
     )
 
 
@@ -586,6 +613,85 @@ def codegen_view_dtype(ctx: LoweringContext, node: Node) -> object:
     )
 
 
+@view_dtype_lowering.register_codegen("cute")
+def codegen_view_dtype_cute(ctx: LoweringContext, node: Node) -> object:
+    """Per-element bitcast through shared memory ``cute.recast_tensor``.
+
+    CuTe DSL operates on per-thread scalars, so a dtype reinterpret has to
+    round-trip a value through shared memory: write as the source dtype, then
+    read the same memory through a recast view typed as the target dtype.
+    """
+    from .cute.cute_reshape import _flat_index_from_coords
+    from .cute.cute_reshape import _get_dim_local_coord
+    from .cute.cute_reshape import _get_tile_shape
+
+    tensor = map_arg(node.args[0], lambda arg: _env_arg(ctx, arg))
+    assert isinstance(tensor, ast.AST)
+    target_dtype = node.args[1]
+    assert isinstance(target_dtype, torch.dtype)
+
+    input_node = node.args[0]
+    assert isinstance(input_node, Node)
+    input_val = input_node.meta["val"]
+    assert isinstance(input_val, torch.Tensor)
+    if input_val.dtype.itemsize != target_dtype.itemsize:
+        raise exc.BackendUnsupported(
+            "cute",
+            f"view.dtype with mismatched widths: "
+            f"{input_val.dtype} ({input_val.dtype.itemsize} bytes) -> "
+            f"{target_dtype} ({target_dtype.itemsize} bytes)",
+        )
+
+    from .generate_ast import GenerateAST
+
+    cg = ctx.cg
+    assert isinstance(cg, GenerateAST)
+    df = cg.device_function
+    env = CompileEnvironment.current()
+    config = df.config
+
+    shape = _get_tile_shape(input_val, env, config)
+    if not shape:
+        shape = [1]
+    numel = 1
+    for s in shape:
+        numel *= s
+
+    src_dtype_str = env.backend.dtype_str(input_val.dtype)
+    tgt_dtype_str = env.backend.dtype_str(target_dtype)
+
+    smem_ptr = df.new_var("view_dtype_smem_ptr")
+    smem = df.new_var("view_dtype_smem")
+    smem_recast = df.new_var("view_dtype_smem_recast")
+
+    coords = [_get_dim_local_coord(cg, input_val, i) for i in range(len(shape))]
+    flat = _flat_index_from_coords(coords, shape) if coords else "cutlass.Int32(0)"
+
+    cg.add_statement(
+        statement_from_string(
+            f"{smem_ptr} = cute.arch.alloc_smem({src_dtype_str}, {numel})"
+        )
+    )
+    cg.add_statement(
+        statement_from_string(f"{smem} = cute.make_tensor({smem_ptr}, ({numel},))")
+    )
+    cg.add_statement(
+        statement_from_string(
+            f"{smem}[{flat}] = {src_dtype_str}({{_inp}})", _inp=tensor
+        )
+    )
+    cg.add_statement(statement_from_string("cute.arch.sync_threads()"))
+    cg.add_statement(
+        statement_from_string(
+            f"{smem_recast} = cute.recast_tensor({smem}, {tgt_dtype_str})"
+        )
+    )
+
+    result = df.new_var("view_dtype_value")
+    cg.add_statement(statement_from_string(f"{result} = {smem_recast}[{flat}]"))
+    return expr_from_string(result)
+
+
 alias_lowering = register_lowering(
     torch.ops.aten.alias.default,
     masked_value_fn=passthrough_masked_value,
@@ -909,15 +1015,7 @@ def codegen_baddbmm(ctx: LoweringContext, node: Node) -> ast.AST:
 
 
 def _pallas_dot(ctx: LoweringContext, node: Node, with_acc: bool) -> ast.AST:
-    """Generate jnp.matmul for Pallas backend.
-
-    Uses ``jnp.matmul`` instead of ``jnp.dot`` for correct batch matmul
-    semantics (``jnp.dot`` on 3D tensors produces 4D output).
-
-    When either operand is sub-32-bit (bf16, f16, fp8, int8), we pass
-    ``preferred_element_type=jnp.float32`` so TPU uses a 32-bit accumulator.
-    If the FX-level output dtype is narrower than f32 we cast back afterwards.
-    """
+    """Generate jnp.dot_general for Pallas backend."""
     if with_acc:
         acc_node_arg, lhs_node_arg, rhs_node_arg = node.args[:3]
         acc, lhs, rhs = map_arg(node.args, lambda arg: _env_arg(ctx, arg))
@@ -935,6 +1033,7 @@ def _pallas_dot(ctx: LoweringContext, node: Node, with_acc: bool) -> ast.AST:
     assert isinstance(rhs_node_arg, Node)
     lhs_dtype = lhs_node_arg.meta["val"].dtype
     rhs_dtype = rhs_node_arg.meta["val"].dtype
+    lhs_ndim = lhs_node_arg.meta["val"].ndim
     need_f32_acc = _needs_f32_accumulator(lhs_dtype, rhs_dtype)
     out_dtype = node.meta["val"].dtype if "val" in node.meta else None
 
@@ -944,6 +1043,7 @@ def _pallas_dot(ctx: LoweringContext, node: Node, with_acc: bool) -> ast.AST:
         acc=acc if with_acc else None,
         need_f32_acc=need_f32_acc,
         out_dtype=out_dtype,
+        lhs_ndim=lhs_ndim,
     )
 
 
@@ -1625,6 +1725,94 @@ def codegen_arange_default_cute(ctx: LoweringContext, node: Node) -> object:
 sort_lowering = register_lowering(torch.ops.aten.sort.default)
 
 
+def _sort_args(node: Node) -> tuple[int, bool]:
+    dim = node.args[1] if len(node.args) > 1 else node.kwargs.get("dim", -1)
+    descending = (
+        node.args[2] if len(node.args) > 2 else node.kwargs.get("descending", False)
+    )
+    assert isinstance(dim, int), f"sort dim must be int, got {type(dim)}"
+    assert isinstance(descending, bool), (
+        f"sort descending must be bool, got {type(descending)}"
+    )
+    input_val = node.args[0]
+    assert isinstance(input_val, Node)
+    input_tensor = input_val.meta["val"]
+    ndim = input_tensor.ndim
+    if dim < 0:
+        dim = ndim + dim
+    assert dim == ndim - 1, (
+        f"sort only supports sorting on last dimension, got dim={dim}"
+    )
+    return dim, descending
+
+
+def _emit_cute_rank_sort(
+    ctx: LoweringContext,
+    load: CuteSortableLoad,
+    input_tensor: torch.Tensor,
+    *,
+    descending: bool,
+    k: int | None = None,
+) -> tuple[ast.AST, ast.AST]:
+    env = CompileEnvironment.current()
+    fn = ctx.cg.device_function
+    n = input_tensor.shape[-1]
+    n_hint = env.size_hint(n) if isinstance(n, torch.SymInt) else n
+    if not isinstance(n_hint, int):
+        raise exc.BackendUnsupported("cute", "dynamic sort extent")
+    dtype_str = env.backend.dtype_str(load.dtype)
+    index_dtype = env.backend.dtype_str(env.index_dtype)
+    out_pos = fn.new_var("sort_out_pos")
+    sorted_vals = fn.new_var("sorted_vals")
+    sorted_indices = fn.new_var("sorted_indices")
+    candidate = fn.new_var("sort_k")
+    probe = fn.new_var("sort_j")
+    candidate_rank = fn.new_var("sort_rank")
+    candidate_value = fn.new_var("sort_candidate")
+    probe_value = fn.new_var("sort_probe")
+    before = fn.new_var("sort_before")
+    selected = fn.new_var("sort_selected")
+
+    ctx.cg.add_statement(
+        statement_from_string(
+            f"{out_pos} = {index_dtype}({load.index_exprs[load.sort_index_pos]})"
+        )
+    )
+    ctx.cg.add_statement(statement_from_string(f"{sorted_vals} = {dtype_str}(0)"))
+    ctx.cg.add_statement(statement_from_string(f"{sorted_indices} = {index_dtype}(0)"))
+
+    cmp_op = ">" if descending else "<"
+
+    def indexed_load(index: str) -> str:
+        index_exprs = list(load.index_exprs)
+        index_exprs[load.sort_index_pos] = index
+        expr = f"{load.tensor_name}[{', '.join(index_exprs)}]"
+        if load.mask_expr is not None:
+            return f"({expr} if {load.mask_expr} else {dtype_str}(0))"
+        return expr
+
+    mask_suffix = f" and {out_pos} < {k}" if k is not None else ""
+    ctx.cg.add_statement(
+        statement_from_string(
+            "\n".join(
+                [
+                    f"for {candidate} in range(cutlass.Int32(0), cutlass.Int32({n_hint}), cutlass.Int32(1)):",
+                    f"    {candidate_value} = {indexed_load(candidate)}",
+                    f"    {candidate_rank} = {index_dtype}(0)",
+                    f"    for {probe} in range(cutlass.Int32(0), cutlass.Int32({n_hint}), cutlass.Int32(1)):",
+                    f"        {probe_value} = {indexed_load(probe)}",
+                    f"        {before} = ({probe_value} {cmp_op} {candidate_value}) or (({probe_value} == {candidate_value}) and ({probe} < {candidate}))",
+                    f"        {candidate_rank} = {candidate_rank} + ({index_dtype}(1) if {before} else {index_dtype}(0))",
+                    f"    {selected} = ({candidate_rank} == {out_pos}{mask_suffix})",
+                    f"    {sorted_vals} = {candidate_value} if {selected} else {sorted_vals}",
+                    f"    {sorted_indices} = {index_dtype}({candidate}) if {selected} else {sorted_indices}",
+                ]
+            )
+        )
+    )
+    return expr_from_string(sorted_vals), expr_from_string(sorted_indices)
+
+
 @sort_lowering.register_codegen("triton")
 def codegen_sort(ctx: LoweringContext, node: Node) -> object:
     """Generate tl.sort-based sort implementation.
@@ -1750,6 +1938,22 @@ def codegen_sort(ctx: LoweringContext, node: Node) -> object:
     return (expr_from_string(sorted_vals), expr_from_string(sorted_indices))
 
 
+@sort_lowering.register_codegen("cute")
+def codegen_sort_cute(ctx: LoweringContext, node: Node) -> object:
+    _, descending = _sort_args(node)
+    input_node = node.args[0]
+    assert isinstance(input_node, Node)
+    input_tensor = input_node.meta["val"]
+    load = _env_arg(ctx, input_node)
+    if not isinstance(load, CuteSortableLoad):
+        load = input_node.meta.get("cute_sortable_load")
+    if not isinstance(load, CuteSortableLoad):
+        raise exc.BackendUnsupported("cute", "torch.sort input")
+    node.meta["cute_sort_load"] = load
+    node.meta["cute_sort_descending"] = descending
+    return _emit_cute_rank_sort(ctx, load, input_tensor, descending=descending)
+
+
 gather_lowering = register_lowering(
     torch.ops.aten.gather.default,
     masked_value_fn=passthrough_masked_value,
@@ -1818,7 +2022,100 @@ def codegen_gather(ctx: LoweringContext, node: Node) -> object:
     return expr_from_string(result_var)
 
 
+@gather_lowering.register_codegen("cute")
+def codegen_gather_cute(ctx: LoweringContext, node: Node) -> object:
+    assert not node.kwargs, "gather does not support keyword arguments"
+    assert len(node.args) == 3, f"gather expects 3 arguments, got {len(node.args)}"
+
+    input_node = node.args[0]
+    dim = node.args[1]
+    index_node = node.args[2]
+    assert isinstance(input_node, Node)
+    assert isinstance(dim, int)
+    assert isinstance(index_node, Node)
+
+    from ..language.memory_ops import _cute_combined_mask
+    from ..language.memory_ops import _cute_index_exprs
+    from ..language.memory_ops import load
+    from .inductor_lowering import CodegenState
+
+    if input_node.target is not load:
+        raise exc.BackendUnsupported("cute", "torch.gather input")
+    tensor_node = input_node.args[0]
+    if not isinstance(tensor_node, Node):
+        raise exc.BackendUnsupported("cute", "torch.gather tensor input")
+    tensor = tensor_node.meta["val"]
+    if not isinstance(tensor, torch.Tensor):
+        raise exc.BackendUnsupported("cute", "torch.gather tensor input")
+    input_subscript = input_node.args[1]
+    if not isinstance(input_subscript, (list, tuple)):
+        raise exc.BackendUnsupported("cute", "torch.gather input subscript")
+
+    ndim = len(input_subscript)
+    if dim < 0:
+        dim += ndim
+    if not (0 <= dim < ndim):
+        raise exc.InvalidReductionDim(dim)
+
+    proxy_subscript = cast(
+        "list[object]",
+        list(map_arg(tuple(input_subscript), lambda arg: arg.meta["val"])),
+    )
+    ast_subscript = cast(
+        "list[object]",
+        list(map_arg(tuple(input_subscript), lambda arg: _env_arg(ctx, arg))),
+    )
+    index_ast = _env_arg(ctx, index_node)
+    assert isinstance(index_ast, ast.AST)
+    proxy_subscript[dim] = index_node.meta["val"]
+    ast_subscript[dim] = index_ast
+
+    from .generate_ast import GenerateAST
+
+    if not isinstance(ctx.cg, GenerateAST):
+        raise exc.NotAllowedInHelperFunction
+
+    state = CodegenState(ctx.cg, fx_node=node, env=ctx.env)
+    index_exprs = _cute_index_exprs(
+        state,
+        proxy_subscript,
+        ast_subscript,
+        tensor=tensor,
+        inactive_slice_expr="None",
+        inactive_singleton_slice_expr="0",
+    )
+    tensor_name = ctx.cg.device_function.tensor_arg(tensor).name
+    load_expr = f"{tensor_name}[{', '.join(index_exprs)}]"
+    mask_expr = _cute_combined_mask(state, proxy_subscript, None, tensor=tensor)
+    if tensor.dtype is torch.bool:
+        load_expr = f"({load_expr} != cutlass.Uint8(0))"
+        if mask_expr is None:
+            return expr_from_string(load_expr)
+        return expr_from_string(f"({load_expr} if {mask_expr} else cutlass.Boolean(0))")
+    if mask_expr is None:
+        return expr_from_string(load_expr)
+    zero = CompileEnvironment.current().backend.dtype_str(tensor.dtype)
+    return expr_from_string(f"({load_expr} if {mask_expr} else {zero}(0))")
+
+
 topk_lowering = register_lowering(torch.ops.aten.topk.default)
+
+
+def _topk_args(node: Node) -> tuple[int, int, bool]:
+    k = node.args[1]
+    assert isinstance(k, int), f"topk k must be int, got {type(k)}"
+    dim = node.args[2] if len(node.args) > 2 else node.kwargs.get("dim", -1)
+    largest = node.args[3] if len(node.args) > 3 else node.kwargs.get("largest", True)
+    assert isinstance(dim, int), f"topk dim must be int, got {type(dim)}"
+    assert isinstance(largest, bool), f"topk largest must be bool, got {type(largest)}"
+    input_val = node.args[0]
+    assert isinstance(input_val, Node)
+    input_tensor = input_val.meta["val"]
+    ndim = input_tensor.ndim
+    if dim < 0:
+        dim = ndim + dim
+    assert dim == ndim - 1, f"topk only supports the last dimension, got dim={dim}"
+    return k, dim, largest
 
 
 @topk_lowering.register_codegen("triton")
@@ -1974,3 +2271,19 @@ def codegen_topk(ctx: LoweringContext, node: Node) -> object:
         )
 
     return (expr_from_string(topk_vals), expr_from_string(topk_indices))
+
+
+@topk_lowering.register_codegen("cute")
+def codegen_topk_cute(ctx: LoweringContext, node: Node) -> object:
+    k, _, largest = _topk_args(node)
+    input_node = node.args[0]
+    assert isinstance(input_node, Node)
+    input_tensor = input_node.meta["val"]
+    load = _env_arg(ctx, input_node)
+    if not isinstance(load, CuteSortableLoad):
+        load = input_node.meta.get("cute_sortable_load")
+    if not isinstance(load, CuteSortableLoad):
+        raise exc.BackendUnsupported("cute", "torch.topk input")
+    node.meta["cute_topk_lane_expr"] = load.index_exprs[load.sort_index_pos]
+    node.meta["cute_topk_k"] = k
+    return _emit_cute_rank_sort(ctx, load, input_tensor, descending=largest, k=k)

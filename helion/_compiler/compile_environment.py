@@ -166,12 +166,17 @@ class CompileEnvironment:
         self.jagged_tile_parent_ids: dict[int, list[int]] = {}
         self.jagged_tile_mask_shapes: dict[int, list[torch.SymInt]] = {}
         self._symint_cache: dict[object, torch.SymInt] = {}
-        self._foreign_symint_cache: dict[tuple[int, sympy.Expr], torch.SymInt] = {}
+        self._foreign_symint_cache: dict[
+            tuple[int, sympy.Expr], int | torch.SymInt
+        ] = {}
         self.device_load_count = (
             0  # Track number of loads in all device code for eviction policy tuning
         )
         if settings.autotune_force_persistent or dist.is_initialized():
-            for pid_type in ("flat", "xyz"):
+            for pid_type in (
+                "flat",
+                "xyz",
+            ):
                 self.config_spec.disallow_pid_type(pid_type)
 
         if dist.is_initialized():
@@ -186,7 +191,7 @@ class CompileEnvironment:
                 max_num_blocks_for_symm_mem() // num_sms,
                 self.config_spec.max_num_sm_multiplier,
             )
-            newmax = max(1, 1 << (raw_max.bit_length() - 1))
+            newmax = 1 << (raw_max.bit_length() - 1) if raw_max > 0 else 1
             if newmax < self.config_spec.max_num_sm_multiplier:
                 warnings.warn(
                     f"max_num_sm_multipler is reduced from {self.config_spec.max_num_sm_multiplier} to {newmax} due to the restriction of _SymmetricMemory.signal_pad_size={_SymmetricMemory.signal_pad_size}. Increase the signal pad size to allow autotuner to choose among all possible values in the range.",

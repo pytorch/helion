@@ -12,6 +12,7 @@ from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import import_path
 from helion._testing import onlyBackends
+from helion._testing import skipIfLowVRAM
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfTileIR
 import helion.language as hl
@@ -110,6 +111,10 @@ class TestGenerateAst(RefEagerTestBase, TestCase):
         )
         torch.testing.assert_close(result, args[0] + args[1])
 
+    @skipIfLowVRAM(
+        "Test requires sufficient free VRAM for [512, 512, 512] tensors",
+        required_bytes=3 * 1024**3,
+    )
     def test_add_tilend0(self):
         args = (
             torch.randn([512, 512, 512], device=DEVICE),
@@ -120,6 +125,10 @@ class TestGenerateAst(RefEagerTestBase, TestCase):
         )
         torch.testing.assert_close(result, args[0] + args[1])
 
+    @skipIfLowVRAM(
+        "Test requires sufficient free VRAM for [512, 512, 512] tensors",
+        required_bytes=3 * 1024**3,
+    )
     def test_add_tilend1(self):
         args = (
             torch.randn([512, 512, 512], device=DEVICE),
@@ -130,6 +139,10 @@ class TestGenerateAst(RefEagerTestBase, TestCase):
         )
         torch.testing.assert_close(result, args[0] + args[1])
 
+    @skipIfLowVRAM(
+        "Test requires sufficient free VRAM for [512, 512, 512] tensors",
+        required_bytes=3 * 1024**3,
+    )
     def test_add_tilend2(self):
         args = (
             torch.randn([512, 512, 512], device=DEVICE),
@@ -140,6 +153,10 @@ class TestGenerateAst(RefEagerTestBase, TestCase):
         )
         torch.testing.assert_close(result, args[0] + args[1])
 
+    @skipIfLowVRAM(
+        "Test requires sufficient free VRAM for [512, 512, 512] tensors",
+        required_bytes=3 * 1024**3,
+    )
     def test_add_tilend3(self):
         args = (
             torch.randn([512, 512, 512], device=DEVICE),

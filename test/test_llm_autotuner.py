@@ -160,7 +160,7 @@ class TestLLMGuidedSearch(TestCase):
                 self.assertEqual(context[1]["content"], "initial")
                 self.assertEqual(len(context), expected_len)
 
-    @onlyBackends(["triton"])
+    @onlyBackends(["triton", "cute"])
     def test_autotune_runs_full_llm_guided_loop_with_mocked_provider(self):
         """LLM-guided search runs the public round loop with mocked LLM and benchmark backends."""
         import concurrent.futures
@@ -758,7 +758,7 @@ class TestLLMSeededLFBOTreeSearch(TestCase):
             search.hybrid_stage_breakdown["second_stage_configs_tested"], 11
         )
 
-    @onlyBackends(["triton"])
+    @onlyBackends(["triton", "cute"])
     def test_autotune_runs_full_hybrid_loop_with_mocked_stages(self):
         """The public hybrid autotune entrypoint runs both stages and returns stage-2 best."""
         from helion.autotuner import InitialPopulationStrategy

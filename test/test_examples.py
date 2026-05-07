@@ -26,6 +26,7 @@ from helion._testing import skipIfA10G
 from helion._testing import skipIfCudaCapabilityLessThan
 from helion._testing import skipIfCudaSharedMemoryLessThan
 from helion._testing import skipIfFn
+from helion._testing import skipIfNotCUDA
 from helion._testing import skipIfPallas
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfRocm
@@ -268,6 +269,37 @@ class TestExamples(RefEagerTestBase, TestCase):
             static_shapes=True,
         )
 
+    @onlyBackends(["pallas"])
+    def test_matmul_layernorm_half_dtype_multi_k_tile(self):
+        """Guards K-loop accumulator precision when inputs are half-precision.
+
+        Across multiple K-tile iterations the partial-sum accumulator must
+        stay in fp32 to keep the layernorm output within tight tolerance;
+        regressions here surface as out-of-tolerance results on bf16/fp16.
+        """
+        m, k, n = 1024, 1024, 1024
+        args = (
+            torch.randn([m, k], device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn([k, n], device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn([n], device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn([n], device=DEVICE, dtype=HALF_DTYPE),
+        )
+        expected = torch.nn.functional.layer_norm(
+            (args[0] @ args[1]).to(torch.float32),
+            normalized_shape=(n,),
+            weight=args[2].to(torch.float32),
+            bias=args[3].to(torch.float32),
+        ).to(HALF_DTYPE)
+        check_example(
+            "matmul_layernorm",
+            args,
+            expected,
+            block_sizes=[32, 256],
+            static_shapes=True,
+            atol=1e-2,
+            rtol=1e-2,
+        )
+
     def test_matmul_layernorm_small_shapes_compile_on_cute(self):
         if _get_backend() != "cute":
             self.skipTest("CuTe-specific compile coverage")
@@ -338,6 +370,7 @@ class TestExamples(RefEagerTestBase, TestCase):
     @skipIfFn(
         lambda: _get_backend() == "cute", "CuTe FP8 GEMM example is not supported yet"
     )
+    @skipIfNotCUDA()
     @skipIfCudaCapabilityLessThan((9, 0), reason="FP8 requires CUDA capability >= 9.0")
     def test_fp8_gemm(self):
         # Create FP32 tensors and convert to FP8
@@ -414,6 +447,10 @@ class TestExamples(RefEagerTestBase, TestCase):
 
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfTileIR("TileIR does not support block_ptr indexing")
+    @xfailIfCute(
+        "CuTe tcgen05 MMA path does not yet emit indices/masks for the "
+        "user-level epilogue write that follows the MMA"
+    )
     def test_template_via_closure2(self):
         args = (
             torch.randn([512, 512], device=DEVICE, dtype=HALF_DTYPE),
@@ -663,7 +700,7 @@ class TestExamples(RefEagerTestBase, TestCase):
     @xfailIfCute("CuTe RMSNorm backward example still returns incorrect results")
     def test_rms_norm_bwd(self):
         """Test backward pass for rms norm weight gradient."""
-        batch_size, dim = 32, 64
+        batch_size, dim = 2048, 2048
         x = torch.randn([batch_size, dim], device=DEVICE, dtype=torch.float32)
         weight = torch.randn(
             [dim], device=DEVICE, dtype=torch.float32, requires_grad=True
@@ -737,6 +774,10 @@ class TestExamples(RefEagerTestBase, TestCase):
 
     @skipIfTileIR("PassManager::run failed")
     @skipIfPallas("JAX erf lowering incompatibility with gelu")
+    @xfailIfCute(
+        "CuTe tcgen05 MMA path does not yet emit indices/masks for the "
+        "user-level epilogue write that follows the MMA"
+    )
     def test_epilogue_subtiling_residual_gelu(self):
         m, k, n = 8192, 8192, 8192
         x = torch.randn([m, k], device=DEVICE, dtype=HALF_DTYPE)
@@ -758,6 +799,10 @@ class TestExamples(RefEagerTestBase, TestCase):
 
     @skipIfTileIR("PassManager::run failed")
     @skipIfPallas("JAX erf lowering incompatibility with gelu")
+    @xfailIfCute(
+        "CuTe tcgen05 MMA path does not yet emit indices/masks for the "
+        "user-level epilogue write that follows the MMA"
+    )
     def test_epilogue_subtiling_gelu_aux(self):
         m, k, n = 8192, 8192, 8192
         x = torch.randn([m, k], device=DEVICE, dtype=HALF_DTYPE)
@@ -821,7 +866,6 @@ class TestExamples(RefEagerTestBase, TestCase):
         lambda: _get_backend() == "cute",
         "CuTe dynamic attention destabilizes later cute tests when it fails in-process",
     )
-    @xfailIfPallas("JAX tracer error with dynamic shapes")
     def test_attention_dynamic(self):
         args = (
             torch.randn(1, 32, 512, 64, dtype=torch.float32, device=DEVICE),
@@ -1065,6 +1109,7 @@ class TestExamples(RefEagerTestBase, TestCase):
         lambda: _get_backend() == "cute",
         "CuTe FP8 attention destabilizes later cute tests when it fails in-process",
     )
+    @skipIfNotCUDA()
     @skipIfCudaCapabilityLessThan((9, 0), reason="FP8 requires CUDA capability >= 9.0")
     def test_fp8_attention(self):
         batch = 2
@@ -1307,7 +1352,6 @@ class TestExamples(RefEagerTestBase, TestCase):
             block_sizes=[16, 8, 16, 16],
         )
 
-    @xfailIfCute("CuTe jagged HSTU attention example is not supported yet")
     @xfailIfPallas("tensor-derived if-predicates not supported")
     @skipIfXPU("Jagged tensor operations not fully supported on XPU")
     def test_jagged_hstu_attn(self):
@@ -2348,7 +2392,7 @@ class TestExamples(RefEagerTestBase, TestCase):
 
     @skipIfRocm("failure on rocm")
     @skipIfA10G("failure on a10g")
-    @skipIfCudaCapabilityLessThan((9, 0), reason="se_block requires H100+")
+    @skipIfCudaCapabilityLessThan((9, 0), reason="se_block CUDA path requires H100+")
     def test_se_block_fwd(self):
         m, n = 128, 128
         x = torch.randn([m, n], device=DEVICE, dtype=torch.bfloat16)
@@ -2371,12 +2415,12 @@ class TestExamples(RefEagerTestBase, TestCase):
 
     @skipIfRocm("failure on rocm")
     @skipIfA10G("failure on a10g")
-    @skipIfCudaCapabilityLessThan((9, 0), reason="se_block requires H100+")
+    @skipIfCudaCapabilityLessThan((9, 0), reason="se_block CUDA path requires H100+")
     def test_se_block_bwd_dx(self):
         m, n = 128, 128
-        x = torch.randn([m, n], device=DEVICE, dtype=torch.float16, requires_grad=True)
-        w = torch.randn([n, n], device=DEVICE, dtype=torch.float16, requires_grad=True)
-        grad_out = torch.randn([m, n], device=DEVICE, dtype=torch.float16)
+        x = torch.randn([m, n], device=DEVICE, dtype=HALF_DTYPE, requires_grad=True)
+        w = torch.randn([n, n], device=DEVICE, dtype=HALF_DTYPE, requires_grad=True)
+        grad_out = torch.randn([m, n], device=DEVICE, dtype=HALF_DTYPE)
 
         # Compute expected gradients with PyTorch
         x_torch = x.detach().clone().requires_grad_(True)
@@ -2401,12 +2445,12 @@ class TestExamples(RefEagerTestBase, TestCase):
 
     @skipIfRocm("failure on rocm")
     @skipIfA10G("failure on a10g")
-    @skipIfCudaCapabilityLessThan((9, 0), reason="se_block requires H100+")
+    @skipIfCudaCapabilityLessThan((9, 0), reason="se_block CUDA path requires H100+")
     def test_se_block_bwd_dw(self):
         m, n = 128, 128
-        x = torch.randn([m, n], device=DEVICE, dtype=torch.float16, requires_grad=True)
-        w = torch.randn([n, n], device=DEVICE, dtype=torch.float16, requires_grad=True)
-        grad_out = torch.randn([m, n], device=DEVICE, dtype=torch.float16)
+        x = torch.randn([m, n], device=DEVICE, dtype=HALF_DTYPE, requires_grad=True)
+        w = torch.randn([n, n], device=DEVICE, dtype=HALF_DTYPE, requires_grad=True)
+        grad_out = torch.randn([m, n], device=DEVICE, dtype=HALF_DTYPE)
 
         # Compute expected gradients with PyTorch
         x_torch = x.detach().clone().requires_grad_(True)

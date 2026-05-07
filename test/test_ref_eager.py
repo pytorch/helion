@@ -15,7 +15,7 @@ from helion._testing import onlyBackends
 import helion.language as hl
 
 
-@onlyBackends(["triton"])
+@onlyBackends(["triton", "cute"])
 class TestRefEagerMisc(TestCase):
     def test_print_intermediate_tensor(self):
         @helion.kernel(ref_mode=helion.RefMode.EAGER)

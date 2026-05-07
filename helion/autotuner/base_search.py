@@ -44,6 +44,7 @@ from helion._dist_utils import is_master_rank
 from helion._dist_utils import sync_object
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
     from collections.abc import Sequence
 
     from ..runtime.config import Config
@@ -144,6 +145,23 @@ class _CodeSentinel:
 _CODE_SENTINEL = _CodeSentinel()
 
 
+def normalize_autotune_seed_configs(settings: Settings) -> tuple[Config, ...]:
+    """Return user-provided autotune seed configs from settings as concrete Configs."""
+    from ..runtime.config import Config
+
+    seed_configs = settings.autotune_seed_configs
+    if seed_configs is None:
+        return ()
+    if isinstance(seed_configs, Config):
+        return (seed_configs,)
+    if isinstance(seed_configs, dict):
+        return (Config.from_dict(seed_configs),)
+    return tuple(
+        Config.from_dict(seed_config) if isinstance(seed_config, dict) else seed_config
+        for seed_config in seed_configs
+    )
+
+
 def _normalize_spec_key(key: object) -> object:
     """Replace types.CodeType with a stable sentinel in a spec key tree."""
     return tree_map_only(types.CodeType, lambda _: _CODE_SENTINEL, key)
@@ -204,6 +222,8 @@ class BaseSearch(BaseAutotuner):
         self.best_perf_so_far = inf
         self._benchmark_provider_cls = benchmark_provider_cls
         self._prepared = False
+        self._skip_cache = False
+        self._autotune_budget_start: float | None = None
 
     def _prepare(self) -> None:
         """Some initialization deferred until autotuning actually runs.
@@ -213,9 +233,13 @@ class BaseSearch(BaseAutotuner):
         if self._prepared:
             return
         self._prepared = True
+        self._autotune_budget_start = time.perf_counter()
         seed = self.settings.autotune_random_seed
         random.seed(seed)
         self.log(f"Autotune random seed: {seed}")
+        budget = self.settings.autotune_budget_seconds
+        if budget is not None:
+            self.log(f"Autotune budget: {budget}s")
         self._autotune_metrics: AutotuneMetrics = AutotuneMetrics(
             kernel_name=getattr(getattr(self.kernel, "kernel", None), "name", ""),
             input_shapes=str(
@@ -233,6 +257,26 @@ class BaseSearch(BaseAutotuner):
             log=self.log,
             autotune_metrics=self._autotune_metrics,
         )
+
+    def _autotune_budget_exceeded(self) -> bool:
+        budget = self.settings.autotune_budget_seconds
+        if budget is None or self._autotune_budget_start is None:
+            return False
+        elapsed = time.perf_counter() - self._autotune_budget_start
+        if elapsed < budget:
+            return False
+        self.log(
+            f"Autotune budget {budget}s exceeded "
+            f"(elapsed {elapsed:.1f}s); returning best-so-far."
+        )
+        return True
+
+    def _budgeted_range(self, *args: int) -> Iterator[int]:
+        """Yield ``range(*args)`` until the autotune budget is exhausted."""
+        for value in range(*args):
+            if self._autotune_budget_exceeded():
+                return
+            yield value
 
     @classmethod
     def get_kwargs_from_profile(
@@ -441,6 +485,62 @@ class BaseSearch(BaseAutotuner):
                 print(triton_code, file=sys.stderr)
         return best
 
+    def _get_current_hardware_and_specialization(
+        self,
+    ) -> tuple[str | None, str | None]:
+        """Return (hardware, specialization_key) for matching cached configs."""
+        hardware = get_device_name(extract_device(self.args))
+
+        inner_kernel = getattr(self.kernel, "kernel", None)
+        if inner_kernel is None or not hasattr(
+            inner_kernel, "_base_specialization_key"
+        ):
+            return hardware, None
+        spec_key = inner_kernel._base_specialization_key(self.args)
+        specialization_key = str(_normalize_spec_key(spec_key))
+
+        return hardware, specialization_key
+
+    def _find_similar_cached_configs(self, max_configs: int) -> list[SavedBestConfig]:
+        """Return cached configs matching hardware, specialization_key, and config_spec_hash; empty if cache is skipped."""
+        from .base_cache import should_skip_cache
+
+        if self._skip_cache or should_skip_cache():
+            return []
+
+        from .local_cache import get_helion_cache_dir
+        from .local_cache import iter_cache_entries
+
+        current_hardware, current_spec_key = (
+            self._get_current_hardware_and_specialization()
+        )
+        if current_hardware is None or current_spec_key is None:
+            return []
+
+        current_fingerprint_hash = self.config_spec.structural_fingerprint_hash(
+            advanced_controls_files=self.settings.autotune_search_acf or None
+        )
+
+        matching: list[SavedBestConfig] = []
+        for entry in iter_cache_entries(
+            get_helion_cache_dir(),
+            max_scan=self.settings.autotune_best_available_max_cache_scan,
+        ):
+            if entry.hardware != current_hardware:
+                continue
+            if _normalize_spec_key_str(entry.specialization_key) != current_spec_key:
+                continue
+            # Skip entries without a matching structural fingerprint or flat_config.
+            if entry.config_spec_hash != current_fingerprint_hash:
+                continue
+            if entry.flat_config is None:
+                continue
+            matching.append(entry)
+            if len(matching) >= max_configs:
+                break
+
+        return matching
+
     def _autotune(self) -> Config:
         """
         Abstract method to perform the actual autotuning.
@@ -451,6 +551,10 @@ class BaseSearch(BaseAutotuner):
             NotImplementedError: If the method is not implemented.
         """
         raise NotImplementedError
+
+    def _autotune_seed_configs(self) -> Sequence[Config]:
+        """Return user-provided autotune seed configs normalized from settings."""
+        return normalize_autotune_seed_configs(self.settings)
 
     def set_generation(self, generation: int) -> None:
         self._autotune_metrics.num_generations = generation
@@ -658,78 +762,6 @@ class PopulationBasedSearch(BaseSearch):
             return None
         return PopulationMember(_unset_fn, [], flat_values, config)
 
-    def _get_current_hardware_and_specialization(
-        self,
-    ) -> tuple[str | None, str | None]:
-        """
-        Get the current hardware and specialization_key for matching cached configs.
-
-        Returns:
-            A tuple of (hardware, specialization_key) strings.
-        """
-        hardware = get_device_name(extract_device(self.args))
-
-        inner_kernel = getattr(self.kernel, "kernel", None)
-        if inner_kernel is None or not hasattr(
-            inner_kernel, "_base_specialization_key"
-        ):
-            return hardware, None
-        spec_key = inner_kernel._base_specialization_key(self.args)
-        specialization_key = str(_normalize_spec_key(spec_key))
-
-        return hardware, specialization_key
-
-    def _find_similar_cached_configs(self, max_configs: int) -> list[SavedBestConfig]:
-        """
-        Find cached configs that match hardware, specialization_key, and
-        structural fingerprint (config_spec_hash).
-
-        Returns an empty list when cache is skipped (via HELION_SKIP_CACHE
-        or the skip_cache parameter), so that "skip cache" consistently
-        means no cache reads of any kind.
-
-        Args:
-            max_configs: Maximum number of configs to return.
-
-        Returns:
-            List of matching SavedBestConfig objects, sorted by file modification time (most recent first).
-        """
-        from .base_cache import should_skip_cache
-
-        if self._skip_cache or should_skip_cache():
-            return []
-
-        from .local_cache import get_helion_cache_dir
-        from .local_cache import iter_cache_entries
-
-        current_hardware, current_spec_key = (
-            self._get_current_hardware_and_specialization()
-        )
-        if current_hardware is None or current_spec_key is None:
-            return []
-
-        current_fingerprint_hash = self.config_spec.structural_fingerprint_hash()
-
-        matching: list[SavedBestConfig] = []
-        for entry in iter_cache_entries(
-            get_helion_cache_dir(),
-            max_scan=self.settings.autotune_best_available_max_cache_scan,
-        ):
-            if entry.hardware != current_hardware:
-                continue
-            if _normalize_spec_key_str(entry.specialization_key) != current_spec_key:
-                continue
-            # Skip entries without a matching structural fingerprint or flat_config.
-            if entry.config_spec_hash != current_fingerprint_hash:
-                continue
-            if entry.flat_config is None:
-                continue
-            matching.append(entry)
-            if len(matching) >= max_configs:
-                break
-
-        return matching
-
     def _generate_best_available_population_flat(self) -> list[FlatConfig]:
         """
         Generate initial population using default config, explicit seed configs,
@@ -753,6 +785,22 @@ class PopulationBasedSearch(BaseSearch):
         seen: set[Config] = {default_config}
         result: list[FlatConfig] = [default_flat]
         self.log("Starting with default config")
+
+        # User seed configs are explicit requests, so try them before compiler-owned
+        # seeds and cached configs while still deduplicating normalized configs.
+        for flat, transferred_config in self.config_gen.user_seed_flat_config_pairs(
+            self._autotune_seed_configs(), self.log
+        ):
+            if transferred_config not in seen:
+                seen.add(transferred_config)
+                result.append(flat)
+
+        # Compiler-owned seeds come from ConfigSpec.autotune_seed_configs();
+        # they encode backend/compiler heuristics and complement user seed configs.
+        for flat, transferred_config in self.config_gen.seed_flat_config_pairs():
+            if transferred_config not in seen:
+                seen.add(transferred_config)
+                result.append(flat)
 
         for config in self._best_available_seed_configs:
             try:
@@ -962,7 +1010,7 @@ class PopulationBasedSearch(BaseSearch):
         default_flat = self.config_gen.default_flat()
         current = best
 
-        for round_num in range(1, rounds + 1):
+        for round_num in self._budgeted_range(1, rounds + 1):
             simplified = False
             candidates: list[PopulationMember] = [current]
 
