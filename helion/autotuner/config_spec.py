@@ -1226,8 +1226,7 @@ class GridFoldingSpec(_BlockIdItem):
     # Valid folding factor choices (order matters for EnumFragment default)
     VALID_FACTORS: tuple[int, ...] = (0, -1, 2, 4, 8, 16, 32, 64)
 
-    MIN_BLOCKS_FOR_PARTIAL = 4
-    MIN_GRID_SM_RATIO = 2
+    MIN_BLOCKS_FOR_PARTIAL = 8
 
     def _fragment(self, base: ConfigSpec) -> PerDimListOf | ListOf:
         from .._compiler.compile_environment import CompileEnvironment
@@ -1260,26 +1259,19 @@ class GridFoldingSpec(_BlockIdItem):
                     )
             dim_num_blocks.append(nb)
 
-        # Gate: disable partial folding when the total launch grid is small
-        # relative to the number of SMs — folding can only hurt occupancy.
-        total_grid = 1
-        all_known = True
-        for nb in dim_num_blocks:
-            if nb is not None:
-                total_grid *= nb
-            else:
-                all_known = False
-        n_cus = num_compute_units()
-        small_grid = all_known and total_grid < self.MIN_GRID_SM_RATIO * n_cus
-
         # Second pass: build per-dim fragments with heuristic gating.
+        # Per-dimension gating: only allow partial folding when the dimension
+        # has enough blocks, and cap the factor to preserve parallelism.
         fragments: list[ConfigSpecFragment] = []
         for nb in dim_num_blocks:
             if nb is not None:
-                max_factor = nb - 1
-                if small_grid or nb < self.MIN_BLOCKS_FOR_PARTIAL:
+                if nb < self.MIN_BLOCKS_FOR_PARTIAL:
+                    # Dimension too small for any partial folding.
                     choices = tuple(f for f in self.VALID_FACTORS if f <= 0)
                 else:
+                    # Cap max_factor aggressively: don't fold more than
+                    # half the blocks in a dimension to preserve parallelism.
+                    max_factor = max(0, nb // 2)
                     choices = tuple(
                         f for f in self.VALID_FACTORS if f <= 0 or f <= max_factor
                     )
