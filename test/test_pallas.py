@@ -1783,6 +1783,45 @@ class TestPallas(TestCase):
                 self.assertNotIn("_pipeline_arg_indices=[0", code)
                 torch.testing.assert_close(result, expected)
 
+    def test_no_pipeline_outer_redundant_read(self) -> None:
+        """Don't pipeline a tensor read at both outer scope and inner scope
+        with the same outer-grid index (no inner block_id on its dims).
+
+        Regression test for the case where the outer read uses some grid
+        block_id (e.g. ``T[tile_m, :]``) and inner code redundantly re-reads
+        T using the same grid block_id, with no inner block_id contributing
+        to T's dim_tilings.  Pipelining would replace T's outer BlockSpec
+        with HBM, and the outer-scope ``pl.load`` then fails with
+        "Loads are only allowed on VMEM and SMEM references."
+        """
+
+        @helion.kernel(
+            backend="pallas",
+            static_shapes=True,
+            config=helion.Config(
+                block_sizes=[128, 128, 128],
+                loop_orders=[[0, 1]],
+                pallas_loop_type="emit_pipeline",
+            ),
+        )
+        def fn(T: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+            m, n = x.shape
+            out = torch.empty_like(x)
+            for tile_m, tile_n in hl.tile([m, n]):
+                outer_sum = T[tile_m, :].to(torch.float32).sum(dim=-1, keepdim=True)
+                for _tile_k in hl.tile(n):
+                    inner_sum = T[tile_m, :].to(torch.float32).sum(dim=-1, keepdim=True)
+                    out[tile_m, tile_n] = (
+                        x[tile_m, tile_n].to(torch.float32) + outer_sum + inner_sum
+                    ).to(x.dtype)
+            return out
+
+        T = torch.randn(128, 128, device=DEVICE, dtype=torch.float32)
+        x = torch.randn(128, 128, device=DEVICE, dtype=torch.float32)
+        result = fn(T, x)
+        expected = (x.float() + 2 * T.float().sum(dim=1, keepdim=True)).to(x.dtype)
+        torch.testing.assert_close(result, expected, rtol=1e-3, atol=1e-3)
+
     def test_fori_loop_per_tensor_dma_mixed(self) -> None:
         """A fori_loop body can mix DMA-aligned and DMA-unaligned tensors.
 

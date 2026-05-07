@@ -1825,17 +1825,14 @@ def _classify_pipelined_tensors(
 
     * Its inner-block ``vmem_shape`` passes ``_check_dma_alignment`` -- a TPU
       DMA hardware constraint.
-    * The tensor is not also accessed at outer scope (i.e. in a root graph,
+    * It is not also accessed at outer scope (i.e. in a root graph,
       between/before/after inner loops).  Pipelining replaces the tensor's
       outer BlockSpec with ``pltpu.HBM`` so the inner loop's BlockSpec can
-      handle slicing; reads at outer scope would then have to ``pl.ds`` an
-      HBM ref, which isn't supported.
-    * No dim is shared between the *current inner loop* and an *outer/grid*
-      block_id.  Catches in-loop conflicting accesses (e.g. transposed
-      indexing) where a single inner BlockSpec can't serve both.  Sibling
-      inner-loop block_ids (other emit_pipeline / fori_loop bodies under
-      the same outer grid) don't trigger this -- they don't put the shared
-      dim on the outer BlockSpec.
+      handle slicing; reads/writes at outer scope would then have to
+      ``pl.ds`` an HBM ref, which Pallas rejects with "Loads are only
+      allowed on VMEM and SMEM references."  Pallas lowers atomics as
+      load-compute-store on the same ref, so outer-scope atomics count as
+      memory accesses too.
 
     Tensors that fail any check stay on their outer BlockSpec and are
     closure-read from the body.
@@ -1856,14 +1853,10 @@ def _classify_pipelined_tensors(
         all_tensor_info, block_ids, slice_size_exprs, env, state
     )
     device_ir = HostFunction.current().device_ir
-    inner_block_id_set = set(block_ids)
-    grid_block_id_set = {bid for ids in device_ir.grid_block_ids for bid in ids}
 
     # Walk all root graphs (outer pallas_call body) for load/store/atomic
-    # nodes.  Pallas lowers atomics as load-compute-store on the same ref,
-    # so an outer-scope atomic on T is also an outer-scope memory access
-    # that breaks pipelining (HBM ref can't be pl.ds'd outside the inner
-    # emit_pipeline / fori_loop body).
+    # nodes; any tensor accessed there is read/written outside the inner
+    # loop and must keep its outer BlockSpec.
     outer_access_tensor_ids: set[int] = set()
     for root_id in device_ir.root_ids:
         root_graph = device_ir.graphs[root_id].graph
@@ -1877,7 +1870,6 @@ def _classify_pipelined_tensors(
             if isinstance(val, torch.Tensor):
                 outer_access_tensor_ids.add(id(val))
 
-    dim_tilings_map = state.device_function.pallas_tensor_dim_tilings
     pipelined_ids: set[int] = set()
     for (fake, _sub_meta, _direction), vmem_shape in zip(
         all_tensor_info, vmem_shapes, strict=True
@@ -1885,13 +1877,6 @@ def _classify_pipelined_tensors(
         if not _check_dma_alignment(vmem_shape):
             continue
         if id(fake) in outer_access_tensor_ids:
-            continue
-        dim_tilings = dim_tilings_map.get(id(fake))
-        if dim_tilings is not None and any(
-            any(bid in inner_block_id_set for bid in d.block_ids)
-            and any(bid in grid_block_id_set for bid in d.block_ids)
-            for d in dim_tilings
-        ):
             continue
         pipelined_ids.add(id(fake))
     return all_tensor_info, vmem_shapes, pipelined_ids
