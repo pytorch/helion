@@ -237,8 +237,10 @@ class CompileEnvironment:
             warn_once(
                 f"The '{self._backend.name}' backend is experimental and may have limited functionality.",
             )
+        # For dynamic kernels, keep 0/1 tensor dimensions symbolic so a kernel
+        # first seen with size 0 or 1 can be reused for larger sizes.
         self.shape_env = ShapeEnv(
-            specialize_zero_one=True,
+            specialize_zero_one=settings.static_shapes,
             duck_shape=False,
             assume_static_by_default=settings.static_shapes,
         )

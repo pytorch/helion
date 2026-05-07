@@ -36,6 +36,19 @@ if TYPE_CHECKING:
     InductorOpOverrides = OpsHandler[Any]
 
 
+@functools.cache
+def _triton_jit_supports_do_not_specialize() -> bool:
+    try:
+        import inspect
+
+        import triton
+    except ImportError:
+        return False
+
+    params = inspect.signature(triton.jit).parameters
+    return "do_not_specialize" in params and "do_not_specialize_on_alignment" in params
+
+
 class Backend(abc.ABC):
     """Abstract base class for Helion code generation backends.
 
@@ -454,6 +467,14 @@ class Backend(abc.ABC):
         """
         ...
 
+    def function_decorator_for_args(self, args: Sequence[Argument]) -> str:
+        """Expression string for the kernel function decorator.
+
+        Backends can override this when the decorator needs to depend on the
+        generated function signature.
+        """
+        return self.function_decorator
+
     @property
     @abc.abstractmethod
     def constexpr_type(self) -> str:
@@ -777,6 +798,24 @@ class TritonBackend(Backend):
     @property
     def function_decorator(self) -> str:
         return "triton.jit"
+
+    def function_decorator_for_args(self, args: Sequence[Argument]) -> str:
+        from .device_function import SymbolArgument
+        from .device_function import TensorSizeArg
+        from .device_function import TensorStrideArg
+
+        do_not_specialize = [
+            arg.name
+            for arg in args
+            if isinstance(arg, (TensorSizeArg, TensorStrideArg, SymbolArgument))
+        ]
+        if not do_not_specialize or not _triton_jit_supports_do_not_specialize():
+            return self.function_decorator
+        return (
+            "triton.jit("
+            f"do_not_specialize={do_not_specialize!r}, "
+            f"do_not_specialize_on_alignment={do_not_specialize!r})"
+        )
 
     @property
     def constexpr_type(self) -> str:
