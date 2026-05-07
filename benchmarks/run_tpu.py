@@ -41,6 +41,7 @@ from helion._compile_time import get_total_time as _get_compile_total_time
 from helion._compile_time import reset as _reset_compile_time
 from helion._testing import DEVICE
 from helion._testing import run_example
+from helion.runtime.kernel import Kernel as _HelionKernel
 
 if TYPE_CHECKING:
     import types
@@ -937,6 +938,21 @@ def run_kernel_inner(name: str) -> KernelResult:
         for label, args in shapes:
             print(f"  Shape {label}:", file=sys.stderr)
             try:
+                # Reset every Helion kernel in `mod` so this shape autotunes
+                # cold. Mirrors benchmarks/run.py:1273-1287. Without it, a
+                # persistent LocalAutotuneCache (~/.cache/helion) on rerun-
+                # capable runners would short-circuit autotune on the second
+                # nightly and the captured helion_compile_time_s would
+                # collapse to a cache-hit cost.
+                for attr_name in dir(mod):
+                    attr = getattr(mod, attr_name)
+                    if isinstance(attr, _HelionKernel):
+                        attr.reset()
+                        if os.environ.get("HELION_AUTOTUNE_EFFORT", "") != "none":
+                            if not attr.configs:
+                                attr.settings.force_autotune = True
+                            attr.settings.static_shapes = True
+
                 # Build baselines dict. "torch" is the default kDefault path
                 # (lazy-eager); "torch_compile" runs the same baseline through
                 # torch.compile(backend="tpu") which uses kDeferAll / full graph.
