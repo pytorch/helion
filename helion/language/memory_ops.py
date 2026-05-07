@@ -1044,6 +1044,8 @@ def _cute_combined_mask(
     subscript: list[object] | tuple[object, ...],
     extra_mask: ast.AST | None,
     tensor: torch.Tensor | None = None,
+    *,
+    include_tensor_index_masks: bool = True,
 ) -> str | None:
     env = CompileEnvironment.current()
     terms: list[str] = []
@@ -1071,6 +1073,9 @@ def _cute_combined_mask(
                     block_id = bid
                     break
         elif isinstance(idx, torch.Tensor):
+            if not include_tensor_index_masks:
+                tensor_dim += 1
+                continue
             for dim_size in idx.shape:
                 for bid in _matching_block_ids(env, dim_size):
                     if bid in seen:
@@ -1083,6 +1088,8 @@ def _cute_combined_mask(
                         break
                 else:
                     continue
+            tensor_dim += 1
+            continue
         else:
             tensor_dim += 1
             continue
@@ -2558,7 +2565,13 @@ def _(state: CodegenState) -> object:
         inactive_singleton_slice_expr="0",
     )
     load_expr = _cute_scalar_load_expr(tensor_name, index_exprs)
-    mask_expr = _cute_combined_mask(state, subscript, extra_mask, tensor=tensor)
+    mask_expr = _cute_combined_mask(
+        state,
+        subscript,
+        extra_mask,
+        tensor=tensor,
+        include_tensor_index_masks=False,
+    )
     if tensor.dtype is torch.bool:
         load_expr = f"({load_expr} != cutlass.Uint8(0))"
         if mask_expr is None:
