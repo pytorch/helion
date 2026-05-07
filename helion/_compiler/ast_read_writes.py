@@ -78,6 +78,18 @@ class ReadWrites(typing.NamedTuple):
             visitor.visit(node)
         return visitor.rw
 
+    def read_and_write_name_frozensets(self) -> tuple[frozenset[str], frozenset[str]]:
+        """Pair of (read names, write names) for inter-loop / barrier metadata.
+
+        ``_ReadWriteVisitor.visit_Subscript`` and ``visit_Call`` already
+        increment ``writes`` for both Store-context subscripts and atomic
+        first-args, so ``inplace_writes`` is a strict subset of ``writes``
+        today and adding it explicitly would be redundant.
+        """
+        reads = frozenset(self.reads.keys())
+        writes = frozenset(self.writes.keys())
+        return reads, writes
+
     @staticmethod
     def from_ast(node: ast.AST) -> ReadWrites:
         """

@@ -262,12 +262,20 @@ class TestBarrier(RefEagerTestBase, TestCase):
             backend_name="triton",
         )
 
+        # The fake roller adds an empty subgraph (only an output node), so the
+        # FX walker in _reduction_fx_inter_loop_rw_names never dereferences the
+        # HostFunction; we just need HostFunction.current() not to raise.
+        fake_host = SimpleNamespace()
         with (
             patch(
                 "helion._compiler.device_ir.CompileEnvironment.current",
                 return_value=fake_env,
             ),
             patch("helion._compiler.device_ir.ReductionRoller", _FakeReductionRoller),
+            patch(
+                "helion._compiler.device_ir.HostFunction.current",
+                return_value=fake_host,
+            ),
         ):
             device_ir.register_rollable_reductions()
 
