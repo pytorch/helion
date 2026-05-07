@@ -13,7 +13,7 @@ from .. import exc
 from .._compile_time import measure
 from . import ast_extension
 from .host_function import HostFunction
-from .host_function import KernelDef
+from .host_function import KernelDefinition
 from .tensor_utils import patch_tensor_factories
 
 if TYPE_CHECKING:
@@ -105,7 +105,7 @@ class KernelCompiler:
             _validate_ast(root)
             params = inspect.signature(hf.fn).bind(*fake_args)
             params.apply_defaults()
-            hf.definition = KernelDef(
+            hf.definition = KernelDefinition(
                 fn=hf.fn,
                 constexpr_args=constexpr_args,
                 name=root.name,

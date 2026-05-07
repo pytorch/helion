@@ -71,7 +71,7 @@ class SymbolOrigin(NamedTuple):
 
 
 @dataclasses.dataclass
-class KernelDef:
+class KernelDefinition:
     """The kernel's structural definition.
 
     Holds the function, its AST, and parameter bindings. Populated by
@@ -111,7 +111,7 @@ class HostFunction:
 
     Composed of structured sub-states:
 
-      - definition: KernelDef — function, AST, and parameter bindings
+      - definition: KernelDefinition — function, AST, and parameter bindings
       - compiler_state: CompilerState — provenance tracking and imports
       - device_ir: DeviceIR — FX graphs from lowering
 
@@ -127,7 +127,7 @@ class HostFunction:
         # pyrefly: ignore [read-only]
         self._fn = fn
         self.location: SourceLocation = UnknownLocation()
-        self.definition: KernelDef | None = None
+        self.definition: KernelDefinition | None = None
         self.compiler_state: CompilerState = CompilerState()
         self._device_ir: DeviceIR | None = None
         # TODO(hinriksnaer): could be a local in KernelCompiler.parse()
