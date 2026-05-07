@@ -30,6 +30,7 @@ from helion.autotuner.local_cache import LocalAutotuneCache
 from helion.autotuner.local_cache import SavedBestConfig
 from helion.autotuner.local_cache import iter_cache_entries
 from helion.autotuner.pattern_search import InitialPopulationStrategy
+from helion.language.matmul_ops import _make_imbalanced_matmul_seed
 from helion.runtime.config import Config
 from helion.runtime.settings import Settings
 from helion.runtime.settings import _get_initial_population_strategy
@@ -1139,6 +1140,115 @@ class TestGenerateBestAvailablePopulation(unittest.TestCase):
         )
 
         self.assertEqual(len(result), 2)  # 1 default + 1 good cached
+
+
+class TestImbalancedMatmulSeed(unittest.TestCase):
+    """Tests for the imbalanced 2-D matmul seed-config heuristic.
+
+    The heuristic lives in ``helion.language.matmul_ops`` and registers a
+    shape-aware ``[<=64, <=64, <=256]`` seed on
+    ``ConfigSpec._imbalanced_matmul_seed_configs`` whenever a 2-D matmul has
+    static M/N with ``max(M, N) >= 8 * min(M, N)`` on the triton backend.
+    ``ConfigSpec.autotune_seed_configs()`` then surfaces those seeds to the
+    autotuner's initial population.
+    """
+
+    def _make_spec_with_block_sizes(self, m_max=8192, n_max=8192, k_max=8192):
+        spec = ConfigSpec(backend=TritonBackend())
+        spec.block_sizes.append(BlockSizeSpec(block_id=0, size_hint=m_max))
+        spec.block_sizes.append(BlockSizeSpec(block_id=1, size_hint=n_max))
+        spec.block_sizes.append(BlockSizeSpec(block_id=2, size_hint=k_max))
+        return spec
+
+    def test_seed_field_default_empty(self):
+        """A fresh ConfigSpec has no imbalanced-matmul seeds."""
+        spec = ConfigSpec(backend=TritonBackend())
+        self.assertEqual(spec._imbalanced_matmul_seed_configs, [])
+
+    def test_autotune_seed_configs_surfaces_registered_seeds(self):
+        """Registered seeds flow through ``autotune_seed_configs()``."""
+        spec = self._make_spec_with_block_sizes()
+        seed = Config(block_sizes=[64, 64, 256])
+        spec._imbalanced_matmul_seed_configs.append(seed)
+        out = spec.autotune_seed_configs()
+        self.assertIn(seed, out)
+
+    def test_autotune_seed_configs_empty_when_no_seeds_registered(self):
+        """Default ``autotune_seed_configs()`` returns an empty list when no
+        cluster_m2 seed and no imbalanced-matmul seed is registered."""
+        spec = self._make_spec_with_block_sizes()
+        self.assertEqual(spec.autotune_seed_configs(), [])
+
+    def test_helper_skinny_n_returns_target_blocks(self):
+        """Skinny-N (M=1024, N=8192, K=4096): seed picks targets [64, 64, 256]."""
+        spec = self._make_spec_with_block_sizes(m_max=1024, n_max=8192, k_max=4096)
+        env = MagicMock()
+        env.config_spec = spec
+        env.get_block_id.side_effect = [0, 1, 2]
+        seed = _make_imbalanced_matmul_seed(env, "m", "n", "k", 1024, 8192, 4096)
+        self.assertIsNotNone(seed)
+        self.assertEqual(seed.config["block_sizes"], [64, 64, 256])
+
+    def test_helper_skinny_m_returns_target_blocks(self):
+        """Skinny-M (M=8192, N=1024, K=4096): symmetric, same target blocks."""
+        spec = self._make_spec_with_block_sizes(m_max=8192, n_max=1024, k_max=4096)
+        env = MagicMock()
+        env.config_spec = spec
+        env.get_block_id.side_effect = [0, 1, 2]
+        seed = _make_imbalanced_matmul_seed(env, "m", "n", "k", 8192, 1024, 4096)
+        self.assertIsNotNone(seed)
+        self.assertEqual(seed.config["block_sizes"], [64, 64, 256])
+
+    def test_helper_caps_at_static_dim(self):
+        """Very-skinny (M=16, N=8192, K=128): blocks cap at static dim."""
+        spec = self._make_spec_with_block_sizes(m_max=16, n_max=8192, k_max=128)
+        env = MagicMock()
+        env.config_spec = spec
+        env.get_block_id.side_effect = [0, 1, 2]
+        seed = _make_imbalanced_matmul_seed(env, "m", "n", "k", 16, 8192, 128)
+        self.assertIsNotNone(seed)
+        # block_m clamped to static_m=16, block_k clamped to static_k=128
+        self.assertEqual(seed.config["block_sizes"], [16, 64, 128])
+
+    def test_helper_returns_none_when_floor_violated(self):
+        """If autotuner_min on M is raised above target=64, seed is dropped."""
+        spec = self._make_spec_with_block_sizes(m_max=1024, n_max=8192, k_max=4096)
+        spec.block_sizes.block_id_lookup(0).autotuner_min = 256
+        env = MagicMock()
+        env.config_spec = spec
+        env.get_block_id.side_effect = [0, 1, 2]
+        seed = _make_imbalanced_matmul_seed(env, "m", "n", "k", 1024, 8192, 4096)
+        self.assertIsNone(seed)
+
+    def test_helper_returns_none_when_block_id_missing(self):
+        """If a shape's block_id is unresolvable, seed is dropped."""
+        spec = self._make_spec_with_block_sizes()
+        env = MagicMock()
+        env.config_spec = spec
+        env.get_block_id.return_value = None
+        seed = _make_imbalanced_matmul_seed(env, "m", "n", "k", 1024, 8192, 4096)
+        self.assertIsNone(seed)
+
+    def test_register_dedupes_identical_seeds(self):
+        """register_imbalanced_matmul_seed() deduplicates equivalent seeds.
+
+        Multiple matmul calls in one kernel with the same imbalanced shape
+        should not over-bias the initial population by registering duplicates.
+        Calls the production API directly so removing the dedup guard would
+        fail this test.
+        """
+        spec = self._make_spec_with_block_sizes()
+        first = Config(block_sizes=[64, 64, 256])
+        second = Config(block_sizes=[64, 64, 256])  # equivalent to first
+        third = Config(block_sizes=[32, 64, 256])  # different -> should add
+        self.assertTrue(spec.register_imbalanced_matmul_seed(first))
+        self.assertFalse(spec.register_imbalanced_matmul_seed(second))
+        self.assertTrue(spec.register_imbalanced_matmul_seed(third))
+        self.assertEqual(len(spec._imbalanced_matmul_seed_configs), 2)
+        self.assertEqual(
+            [c.config["block_sizes"] for c in spec.autotune_seed_configs()],
+            [[64, 64, 256], [32, 64, 256]],
+        )
 
 
 if __name__ == "__main__":

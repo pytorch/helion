@@ -399,6 +399,14 @@ class ConfigSpec:
         # no loud crash to alert a user who bypasses autotune via an
         # explicit config, so normalize() must reject the unsafe values.
         self._tcgen05_num_epi_warps_validation_choices: tuple[int, ...] | None = None
+        # Compiler-owned seed configs for severely imbalanced 2-D matmul shapes
+        # (max(M, N) >= 8 * min(M, N)).  Populated by helion.language.matmul_ops
+        # at compile time when static shapes are known and the backend is
+        # triton.  These seeds bias the autotuner's initial population
+        # toward small-tile configs that the random sampler is unlikely to
+        # discover on its own.  See https://github.com/pytorch/helion/pull/2276
+        # for the validation experiment by @ethche on H100 skinny GEMM.
+        self._imbalanced_matmul_seed_configs: list[helion.Config] = []
         self.store_indices: list[int] = []
         self.backend_tunable_fragments = self.backend.tunable_fragments()
         unknown_tunables = set(self.backend_tunable_fragments) - BACKEND_TUNABLE_KEYS
@@ -607,10 +615,25 @@ class ConfigSpec:
 
     def autotune_seed_configs(self) -> list[helion.Config]:
         """Return validated extra configs that should be benchmarked early."""
+        seeds: list[helion.Config] = []
         cluster_m2_seed = self._tcgen05_cluster_m2_seed_config()
-        if cluster_m2_seed is None:
-            return []
-        return [cluster_m2_seed]
+        if cluster_m2_seed is not None:
+            seeds.append(cluster_m2_seed)
+        seeds.extend(self._imbalanced_matmul_seed_configs)
+        return seeds
+
+    def register_imbalanced_matmul_seed(self, seed: helion.Config) -> bool:
+        """Register a deduped imbalanced-matmul seed.
+
+        Returns True if the seed was added, False if an equivalent seed was
+        already present (multiple matmul calls in one kernel sharing the same
+        imbalanced shape would otherwise over-bias the initial population).
+        """
+        for existing in self._imbalanced_matmul_seed_configs:
+            if existing.config == seed.config:
+                return False
+        self._imbalanced_matmul_seed_configs.append(seed)
+        return True
 
     def _fix_tcgen05_cluster_m2_search_config(self, config: dict[str, object]) -> None:
         """Canonicalize unvalidated search-only ``cluster_m=2`` products."""

@@ -31,6 +31,7 @@ from .._compiler.matmul_utils import _emit_pallas_matmul
 from .._compiler.matmul_utils import _emit_tl_dot_scaled
 from .._compiler.matmul_utils import _needs_f32_accumulator
 from .._compiler.matmul_utils import emit_tl_dot_with_padding
+from ..runtime.config import Config
 from . import _decorators
 
 if TYPE_CHECKING:
@@ -376,6 +377,90 @@ def enforce_dot_requirements(lhs: torch.Tensor, rhs: torch.Tensor) -> None:
             block_idx = env.get_block_id(batch_dim)
             if block_idx is not None:
                 env.block_sizes[block_idx].update_max_block(1)
+
+    # Seed the autotuner with a balanced-tile config for severely imbalanced
+    # 2-D matmul shapes (M, N grid is skinny, ratio >= 8x). This biases the
+    # initial population toward small-tile configs that the random sampler is
+    # unlikely to discover on its own, without restricting the search space.
+    # See pytorch/helion#2102 for the cap-based approach this replaces, and
+    # https://github.com/pytorch/helion/pull/2276 for @ethche's validation
+    # experiment on H100 Triton skinny GEMM.
+    #
+    # Triton-only for now: the CuTe/tcgen05 path enforces m_min >= 64 (and 128
+    # when M >= 256), which would silently drop the target=64 seed for the
+    # common B200 shapes; CuTe needs its own seed family before opting in.
+    if (
+        env.backend_name == "triton"
+        and lhs.ndim == 2
+        and rhs.ndim == 2
+        and static_m is not None
+        and static_n is not None
+        and static_k is not None
+        and max(static_m, static_n) >= 8 * min(static_m, static_n)
+    ):
+        seed = _make_imbalanced_matmul_seed(env, m, n, k, static_m, static_n, static_k)
+        if seed is not None:
+            env.config_spec.register_imbalanced_matmul_seed(seed)
+
+
+# Balanced-tile family for imbalanced 2-D matmul.  See
+# https://github.com/pytorch/helion/pull/2276 for the H100 validation
+# experiment that motivated these targets.  Each axis of the seed is
+# shape-clamped to the static dim and respects the per-axis floor
+# (min_size, autotuner_min); these are the *targets* before clamping.
+_IMBALANCED_MATMUL_SEED_TARGETS: tuple[int, int, int] = (64, 64, 256)
+
+
+def _make_imbalanced_matmul_seed(
+    env: CompileEnvironment,
+    m: int | torch.SymInt,
+    n: int | torch.SymInt,
+    k: int | torch.SymInt,
+    static_m: int,
+    static_n: int,
+    static_k: int,
+) -> Config | None:
+    """Build a [block_m, block_n, block_k] seed Config for an imbalanced matmul.
+
+    Targets ``_IMBALANCED_MATMUL_SEED_TARGETS`` (the [64, 64, 256] family
+    motivated by @ethche's experiment in
+    https://github.com/pytorch/helion/pull/2276), but adapts each block to
+    the static dim and respects the per-axis floor (``min_size``,
+    ``autotuner_min``) so the seed survives normalization.  Returns None if
+    any axis cannot satisfy its constraints (in which case the seed would be
+    silently dropped anyway).
+
+    Only ``block_sizes`` is pinned; ``num_warps``, ``num_stages``, ``pid_type``
+    and other tunables fall back to the autotuner's defaults so the seed is a
+    soft hint rather than a fully-specified config.
+    """
+    targets = (
+        (m, static_m, _IMBALANCED_MATMUL_SEED_TARGETS[0]),
+        (n, static_n, _IMBALANCED_MATMUL_SEED_TARGETS[1]),
+        (k, static_k, _IMBALANCED_MATMUL_SEED_TARGETS[2]),
+    )
+    block_sizes: list[int] = []
+    for shape, static_dim, target in targets:
+        block_idx = env.get_block_id(shape)
+        if block_idx is None:
+            return None
+        try:
+            bspec = env.config_spec.block_sizes.block_id_lookup(block_idx)
+        except KeyError:
+            return None
+        # Largest power-of-two <= min(target, static_dim)
+        candidate = min(target, static_dim)
+        if candidate < 1:
+            return None
+        candidate = 1 << (candidate.bit_length() - 1)
+        # Respect floor: skip the seed entirely if the target falls below
+        # any pre-existing minimum (e.g. tcgen05 m_min = 64/128).
+        floor = max(bspec.min_size, bspec.autotuner_min)
+        if candidate < floor:
+            return None
+        candidate = min(candidate, bspec.max_size)
+        block_sizes.append(candidate)
+    return Config(block_sizes=block_sizes)
 
 
 @_decorators.register_fake(dot)
