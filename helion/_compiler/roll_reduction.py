@@ -150,15 +150,23 @@ class ReductionRoller:
 
         if node.target is store or node.target in _ATOMIC_OPS:
             # atomic_add(target, index, value, sem)
-            _, _, value, *_ = node.args
+            target, index_arg, value, *_ = node.args
             if isinstance(value, torch.fx.Node):
-                val = value.meta["val"]
+                num_rdims = self._count_rdim_axes_in_val(value.meta["val"])
             else:
-                val = value
+                # When the stored value is a Python scalar (broadcast across
+                # the indexed slice), it carries no shape, so the LHS
+                # subscript determines whether the op covers the rdim. Wrap
+                # the op in the reduction loop so the same rdim index_var is
+                # active here as for the corresponding load; otherwise on
+                # backends with looped reductions (e.g. cute), the slice
+                # resolves to the grid block_id and only one element per
+                # iteration is written.
+                num_rdims = self._count_rdim_axes_in_subscript(target, index_arg)
         else:
             val = node.meta.get("val", None)
+            num_rdims = self._count_rdim_axes_in_val(val)
 
-        num_rdims = self._count_rdim_axes_in_val(val)
         if num_rdims > 1:
             raise NotImplementedError(
                 "multiple reduction dims of same size not supported"
@@ -187,6 +195,34 @@ class ReductionRoller:
         return sum(
             count_for_tensor(item) for item in val if isinstance(item, torch.Tensor)
         )
+
+    def _count_rdim_axes_in_subscript(self, target: object, index: object) -> int:
+        """Count axes in the LHS indexing pattern that match ``self.rdim``.
+
+        Used for store/atomic ops with scalar values: their meta val carries
+        no shape, so axis counts have to come from the indexing pattern
+        itself. The shape is computed the same way as for loads, so the
+        store and load resolve their slices to the same block_id.
+        """
+        if not isinstance(target, torch.fx.Node):
+            return 0
+        target_val = target.meta.get("val")
+        if not isinstance(target_val, torch.Tensor) or not isinstance(
+            index, (list, tuple)
+        ):
+            return 0
+        from .indexing_strategy import SubscriptIndexing
+
+        # FX records traced SymInt/Tensor index args as torch.fx.Node references;
+        # compute_shape wants the underlying values, the same form it receives at
+        # register_fake time (memory_ops.load).
+        normalized = [
+            k.meta["val"] if isinstance(k, torch.fx.Node) else k for k in index
+        ]
+        shape = SubscriptIndexing.compute_shape(target_val, normalized)
+        env = CompileEnvironment.current()
+        rdim_block_id = self.rdim.block_id
+        return sum(env.get_block_id(s) == rdim_block_id for s in shape)
 
     def size_node(self, meta: dict[str, object]) -> torch.fx.Node:
         """Create a node that represents the size of the reduction dimension"""

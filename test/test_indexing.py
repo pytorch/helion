@@ -1223,13 +1223,31 @@ class TestIndexing(RefEagerTestBase, TestCase):
         src = torch.zeros([1, N], device=DEVICE)
         dst = torch.zeros([1, N], device=DEVICE)
 
-        src_result, dst_result = kernel(src, dst)
+        code, (src_result, dst_result) = code_and_output(kernel, (src, dst))
 
         # Both should be ones after the kernel
         expected_src = torch.ones([1, N], device=DEVICE)
         expected_dst = torch.ones([1, N], device=DEVICE)
         torch.testing.assert_close(src_result, expected_src)
         torch.testing.assert_close(dst_result, expected_dst)
+
+        if _get_backend() == "cute":
+            # Regression: the scalar store `dst[:, :] = 1.0` must be wrapped
+            # in the reduction loop alongside the matching load, so the slice
+            # resolves to the rdim index (`rindex_*`) and each iteration
+            # writes the full slice. Without that wrapping, the slice would
+            # bind to the grid index and only one element per block would be
+            # written, racing with the subsequent load.
+            store_line = next(
+                (
+                    line
+                    for line in code.split("\n")
+                    if ".store(cutlass.Float32(1.0))" in line
+                ),
+                None,
+            )
+            self.assertIsNotNone(store_line)
+            self.assertIn("rindex_", store_line)
 
     def test_1d_index(self):
         """Test both setter from scalar and getter for [i]"""
