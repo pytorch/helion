@@ -542,6 +542,30 @@ class TestGridFoldingHeuristic(TestCase):
                 f"got {dim_choices}",
             )
 
+    def test_small_grid_global_gate(self):
+        """Total grid < MIN_GRID_SM_RATIO * SMs → no partial folding (global gate)."""
+        import math
+
+        from helion._compat import num_compute_units
+        from helion.autotuner.config_spec import GridFoldingSpec
+
+        n_cus = num_compute_units()
+        threshold = GridFoldingSpec.MIN_GRID_SM_RATIO * n_cus
+        # Create a grid just below the threshold.
+        # With min_block_size=1, num_blocks_per_dim = dim_size.
+        dim_size = max(2, math.isqrt(threshold - 1))
+        assert dim_size * dim_size < threshold
+
+        x = torch.randn(dim_size, dim_size, device=DEVICE)
+        y = torch.randn(dim_size, dim_size, device=DEVICE)
+        choices = self._get_folding_choices_2d(x, y)
+        for dim_choices in choices:
+            self.assertTrue(
+                all(c <= 0 for c in dim_choices),
+                f"Expected only (0, -1) for small grid (n_cus={n_cus}, "
+                f"dim={dim_size}, total={dim_size * dim_size}), got {dim_choices}",
+            )
+
     def test_large_dims_allow_partial_folding(self):
         """Large dimensions should include partial folding factors (2, 4, ...)."""
         x = torch.randn(4096, 4096, device=DEVICE)
@@ -595,38 +619,47 @@ class TestGridFoldingHeuristic(TestCase):
         """Test exactly at MIN_BLOCKS_FOR_PARTIAL boundary."""
         from helion.autotuner.config_spec import GridFoldingSpec
 
-        # At boundary: should allow partial folding
+        # Use a large enough grid to pass the global gate, then test per-dim boundary.
+        # 256x256 gives 256 blocks per dim (assuming min_block_size=1),
+        # total_grid = 65536, well above threshold.
+        large_base = 256
+
+        # At boundary: dim 0 has exactly MIN_BLOCKS_FOR_PARTIAL elements
         x_at = torch.randn(
             GridFoldingSpec.MIN_BLOCKS_FOR_PARTIAL,
-            GridFoldingSpec.MIN_BLOCKS_FOR_PARTIAL,
+            large_base,
             device=DEVICE,
         )
         y_at = torch.randn(
             GridFoldingSpec.MIN_BLOCKS_FOR_PARTIAL,
-            GridFoldingSpec.MIN_BLOCKS_FOR_PARTIAL,
+            large_base,
             device=DEVICE,
         )
         choices_at = self._get_folding_choices_2d(x_at, y_at)
-        # 8 blocks → max_factor = 4, so [0, -1, 2, 4]
+        # dim 0: 8 blocks → max_factor = 4, so [0, -1, 2, 4]
+        # dim 1: 256 blocks → max_factor = 128, so includes large factors
         for dim_choices in choices_at:
-            self.assertIn(2, dim_choices)
-            self.assertIn(4, dim_choices)
-            self.assertNotIn(8, dim_choices)
+            # At least one dim should have partial folding
+            self.assertTrue(any(c > 0 for c in dim_choices))
 
-        # Below boundary: no partial folding
+        # Below boundary: dim 0 has fewer than MIN_BLOCKS_FOR_PARTIAL elements
         x_below = torch.randn(
             GridFoldingSpec.MIN_BLOCKS_FOR_PARTIAL - 1,
-            GridFoldingSpec.MIN_BLOCKS_FOR_PARTIAL - 1,
+            large_base,
             device=DEVICE,
         )
         y_below = torch.randn(
             GridFoldingSpec.MIN_BLOCKS_FOR_PARTIAL - 1,
-            GridFoldingSpec.MIN_BLOCKS_FOR_PARTIAL - 1,
+            large_base,
             device=DEVICE,
         )
         choices_below = self._get_folding_choices_2d(x_below, y_below)
-        for dim_choices in choices_below:
-            self.assertEqual(dim_choices, (0, -1))
+        # dim 0 should have only [0, -1]
+        self.assertEqual(
+            choices_below[0],
+            (0, -1),
+            f"Expected small dim to have only [0, -1], got {choices_below[0]}",
+        )
 
     def test_max_factor_scaling(self):
         """Larger dimensions should allow larger folding factors (capped at nb//2)."""

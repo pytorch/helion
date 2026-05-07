@@ -1598,9 +1598,7 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
                     adjusted_numel = f"(({numel}) + {factor} - 1) // {factor}"
                 else:
                     adjusted_numel = sympy.ceiling(sympy.Rational(numel, factor))
-                pid = PIDInfo(
-                    pid_var, block_size_var, adjusted_numel, block_idx
-                )  # pyrefly: ignore[bad-argument-type]
+                pid = PIDInfo(pid_var, block_size_var, adjusted_numel, block_idx)  # pyrefly: ignore[bad-argument-type]
                 # Save info for Phase 2 partial folding loop generation
                 partial_folding_dims.append(
                     (

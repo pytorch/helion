@@ -1708,6 +1708,7 @@ class GridFoldingSpec(_BlockIdItem):
     VALID_FACTORS: tuple[int, ...] = (0, -1, 2, 4, 8, 16, 32, 64)
 
     MIN_BLOCKS_FOR_PARTIAL = 8
+    MIN_GRID_SM_RATIO = 4
 
     def _fragment(self, base: ConfigSpec) -> PerDimListOf | ListOf:
         from .._compiler.compile_environment import CompileEnvironment
@@ -1740,14 +1741,25 @@ class GridFoldingSpec(_BlockIdItem):
                     )
             dim_num_blocks.append(nb)
 
-        # Second pass: build per-dim fragments with heuristic gating.
-        # Per-dimension gating: only allow partial folding when the dimension
-        # has enough blocks, and cap the factor to preserve parallelism.
+        # Global gate: disable partial folding when total grid is small
+        # relative to SM count—folding can only hurt occupancy.
+        total_grid = 1
+        all_known = True
+        for nb in dim_num_blocks:
+            if nb is not None:
+                total_grid *= nb
+            else:
+                all_known = False
+        n_cus = num_compute_units()
+        small_grid = all_known and total_grid < self.MIN_GRID_SM_RATIO * n_cus
+
+        # Second pass: build per-dim fragments with combined heuristics.
+        # Both global and per-dimension gating apply.
         fragments: list[ConfigSpecFragment] = []
         for nb in dim_num_blocks:
             if nb is not None:
-                if nb < self.MIN_BLOCKS_FOR_PARTIAL:
-                    # Dimension too small for any partial folding.
+                if small_grid or nb < self.MIN_BLOCKS_FOR_PARTIAL:
+                    # Global gate or per-dim gate: no partial folding.
                     choices = tuple(f for f in self.VALID_FACTORS if f <= 0)
                 else:
                     # Cap max_factor aggressively: don't fold more than
