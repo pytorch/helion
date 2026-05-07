@@ -1731,14 +1731,14 @@ def _emit_mma_pipeline(
                 statement_from_string(
                     f"if not ({consumer_predicate}):\n"
                     f"    cute.arch.setmaxregister_decrease("
-                    f"cutlass.Int32({_TCGEN05_PRODUCER_REGS}))"
+                    f"{_TCGEN05_PRODUCER_REGS})"
                 )
             )
             prefix.append(
                 statement_from_string(
                     f"if {consumer_predicate}:\n"
                     f"    cute.arch.setmaxregister_increase("
-                    f"cutlass.Int32({_TCGEN05_CONSUMER_REGS}))"
+                    f"{_TCGEN05_CONSUMER_REGS})"
                 )
             )
             prefix.append(

@@ -706,6 +706,30 @@ def _cute_index_tuple(index_exprs: list[str]) -> str:
     return f"({', '.join(index_exprs)})"
 
 
+def _cute_scalar_pointer_expr(tensor_name: str, index_exprs: list[str]) -> str:
+    env = CompileEnvironment.current()
+    index_dtype = env.index_type()
+    offset = " + ".join(
+        f"({index_dtype}({index}) * {index_dtype}({tensor_name}.layout.stride[{dim}]))"
+        for dim, index in enumerate(index_exprs)
+    )
+    return f"({tensor_name}.iterator + {offset})"
+
+
+def _cute_scalar_load_expr(tensor_name: str, index_exprs: list[str]) -> str:
+    if "None" in index_exprs:
+        return f"{tensor_name}[{', '.join(index_exprs)}]"
+    return f"{_cute_scalar_pointer_expr(tensor_name, index_exprs)}.load()"
+
+
+def _cute_scalar_store_expr(
+    tensor_name: str, index_exprs: list[str], value: str
+) -> str:
+    if "None" in index_exprs:
+        return f"{tensor_name}.__setitem__({_cute_index_tuple(index_exprs)}, {value})"
+    return f"{_cute_scalar_pointer_expr(tensor_name, index_exprs)}.store({value})"
+
+
 def _cute_affine_range_block_id(state: CodegenState, affine: object) -> int | None:
     from .._compiler.cute.indexing import CuteAffineRangeIndex
 
@@ -2155,10 +2179,9 @@ def _(state: CodegenState) -> ast.AST:
             topk_k = value_node.args[0].meta.get("cute_topk_k")
     if isinstance(topk_lane_expr, str) and isinstance(topk_k, int):
         index_exprs[-1] = topk_lane_expr
-    index_tuple = _cute_index_tuple(index_exprs)
-    assign_expr = expr_from_string(
-        f"{tensor_name}.__setitem__({index_tuple}, {{value}})", value=value
-    )
+    store_uses_pointer = "None" not in index_exprs
+    store_expr = _cute_scalar_store_expr(tensor_name, index_exprs, "{value}")
+    assign_expr = expr_from_string(store_expr, value=value)
 
     mask_expr = _cute_combined_mask(state, subscript, extra_mask, tensor=tensor)
     if isinstance(topk_lane_expr, str) and isinstance(topk_k, int):
@@ -2166,8 +2189,22 @@ def _(state: CodegenState) -> ast.AST:
         mask_expr = topk_mask if mask_expr is None else f"({mask_expr}) and {topk_mask}"
     if mask_expr is None:
         return assign_expr
+    if store_uses_pointer:
+        mask_ast = expr_from_string(mask_expr)
+        assert isinstance(mask_ast, ast.expr)
+        assert isinstance(assign_expr, ast.expr)
+        state.add_statement(
+            ast.fix_missing_locations(
+                ast.If(
+                    test=mask_ast,
+                    body=[ast.Expr(value=assign_expr)],
+                    orelse=[],
+                )
+            )
+        )
+        return ast.Constant(value=None)
     return expr_from_string(
-        f"({tensor_name}.__setitem__({index_tuple}, {{value}}) if {mask_expr} else None)",
+        f"({store_expr} if {mask_expr} else None)",
         value=value,
     )
 
@@ -2520,7 +2557,7 @@ def _(state: CodegenState) -> object:
         inactive_slice_expr="None",
         inactive_singleton_slice_expr="0",
     )
-    load_expr = f"{tensor_name}[{', '.join(index_exprs)}]"
+    load_expr = _cute_scalar_load_expr(tensor_name, index_exprs)
     mask_expr = _cute_combined_mask(state, subscript, extra_mask, tensor=tensor)
     if tensor.dtype is torch.bool:
         load_expr = f"({load_expr} != cutlass.Uint8(0))"

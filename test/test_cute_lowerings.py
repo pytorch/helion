@@ -746,7 +746,7 @@ class TestCuteLowerings(unittest.TestCase):
             code,
         )
         self.assertIn(
-            "cute.arch.setmaxregister_decrease(cutlass.Int32(120))",
+            "cute.arch.setmaxregister_decrease(120)",
             code,
         )
         # Consumer / epi warps raise to 256 regs.
@@ -755,18 +755,14 @@ class TestCuteLowerings(unittest.TestCase):
             code,
         )
         self.assertIn(
-            "cute.arch.setmaxregister_increase(cutlass.Int32(256))",
+            "cute.arch.setmaxregister_increase(256)",
             code,
         )
         # The setmaxregister calls land between the warp-role boolean
         # assignments and the MMA setup, so they sit in the registered
         # invariant block and do not get re-emitted per work-tile.
-        decrease_pos = code.find(
-            "cute.arch.setmaxregister_decrease(cutlass.Int32(120))"
-        )
-        increase_pos = code.find(
-            "cute.arch.setmaxregister_increase(cutlass.Int32(256))"
-        )
+        decrease_pos = code.find("cute.arch.setmaxregister_decrease(120)")
+        increase_pos = code.find("cute.arch.setmaxregister_increase(256)")
         epi_active_pos = code.find("tcgen05_epi_tidx = ")
         mma_slice_pos = code.find("mma_slice_tidx = ")
         self.assertGreater(decrease_pos, epi_active_pos)
@@ -2443,12 +2439,12 @@ class TestCuteLowerings(unittest.TestCase):
         self.assertEqual(code.count("tcgen05_tmem_allocator.free"), 1)
         # The post-loop ``TmemAllocator(...)`` is the second one (the
         # first is the in-prefix instance for ``allocate``); it must be
-        # the variant that passes ``dealloc_mbarrier_initialized=True``,
-        # which is the marker the runtime uses to skip a redundant init
-        # round.
-        self.assertIn(
-            "dealloc_mbarrier_initialized=True",
-            code,
+        # the variant that asks the runtime to skip the dealloc-mbarrier
+        # init that the prologue allocator already performed.
+        self.assertTrue(
+            "dealloc_mbarrier_initialized=True" in code
+            or "initialize_mbarrier=False" in code,
+            f"expected dealloc-mbarrier skip kwarg in code: {code!r}",
         )
 
     def test_tcgen05_store_rejects_num_epi_warps_not_four(self) -> None:
@@ -2591,9 +2587,12 @@ class TestCuteLowerings(unittest.TestCase):
 
         self.assertIn("if tcgen05_exec_active:", code)
         self.assertEqual(code.count("tcgen05_tmem_allocator.free("), 1)
-        self.assertIn(
-            "num_allocated_columns=tcgen05_acc_tmem_cols, dealloc_mbarrier_initialized=True)",
-            code,
+        self.assertTrue(
+            "num_allocated_columns=tcgen05_acc_tmem_cols, dealloc_mbarrier_initialized=True)"
+            in code
+            or "num_allocated_columns=tcgen05_acc_tmem_cols, initialize_mbarrier=False)"
+            in code,
+            f"expected dealloc-mbarrier skip kwarg in code: {code!r}",
         )
         # tcgen05 epilogue teardown: the exec warp signals
         # tcgen05_tmem_alloc_barrier.arrive() so allocator teardown can wait on
@@ -2789,9 +2788,12 @@ class TestCuteLowerings(unittest.TestCase):
         # intermediate generic `smem_c` allocation, so the float32 tile-wide
         # SMEM buffer is no longer materialized.
         self.assertNotIn("smem_c = cute.arch.alloc_smem", code)
-        self.assertIn(
-            "num_allocated_columns=tcgen05_acc_tmem_cols, dealloc_mbarrier_initialized=True)",
-            code,
+        self.assertTrue(
+            "num_allocated_columns=tcgen05_acc_tmem_cols, dealloc_mbarrier_initialized=True)"
+            in code
+            or "num_allocated_columns=tcgen05_acc_tmem_cols, initialize_mbarrier=False)"
+            in code,
+            f"expected dealloc-mbarrier skip kwarg in code: {code!r}",
         )
 
     def test_permute_codegen_materializes_non_store_use(self) -> None:
