@@ -171,6 +171,12 @@ def parse_run(run_dir, active_platforms=None):
 
 def build_history_entry(run, metrics, shapes):
     helion_lat = [v for v in metrics.get("helion_latency_ms", []) if v]
+    # `compile_time_geomean_s = None` (rather than 0.0) when no compile-time
+    # data was emitted, so index.html's `formatCompileTime(null)` renders as
+    # "--" instead of "0.0s". 0.0 is reserved for runs that genuinely had
+    # data but it averaged to zero.
+    compile_times = metrics.get("helion_compile_time_s", [])
+    compile_geomean = round(geo_mean(compile_times), 2) if compile_times else None
     return {
         "run_id": run["run_id"],
         "sha": run["sha"],
@@ -180,7 +186,7 @@ def build_history_entry(run, metrics, shapes):
         "helion_speedup_geomean": round(geo_mean(metrics.get("helion_speedup", [])), 4),
         "triton_speedup_geomean": round(geo_mean(metrics.get("triton_speedup", [])), 4),
         "torch_compile_speedup_geomean": round(geo_mean(metrics.get("torch_compile_speedup", [])), 4),
-        "compile_time_geomean_s": round(geo_mean(metrics.get("helion_compile_time_s", [])), 2),
+        "compile_time_geomean_s": compile_geomean,
         "helion_latency_avg_ms": round(avg(helion_lat), 4) if helion_lat else 0,
         "per_shape": {
             "shapes": shapes,
@@ -294,7 +300,7 @@ def build_dashboard_data(cache_dir, runs_meta, existing_data=None, active_platfo
         # All deltas use natural sign: positive = metric value increased.
         # Higher speedup = better; higher latency / compile time = worse.
         speedup_delta = fmt_delta(latest_data["helion_speedup_geomean"], prev_data["helion_speedup_geomean"]) if latest_data and prev_data else None
-        compile_delta = fmt_delta(latest_data["compile_time_geomean_s"], prev_data["compile_time_geomean_s"]) if latest_data and prev_data and latest_data["compile_time_geomean_s"] > 0 else None
+        compile_delta = fmt_delta(latest_data["compile_time_geomean_s"], prev_data["compile_time_geomean_s"]) if latest_data and prev_data and latest_data["compile_time_geomean_s"] and latest_data["compile_time_geomean_s"] > 0 else None
         latency_delta = fmt_delta(latest_data["helion_latency_avg_ms"], prev_data["helion_latency_avg_ms"]) if latest_data and prev_data and latest_data["helion_latency_avg_ms"] > 0 else None
 
         # Negate latency so >0 means improvement, matching speedup's direction.
