@@ -234,6 +234,7 @@ class CuteTcgen05StoreValue:
     use_tma_store_epilogue: bool = False
     ab_stage_count: int = 0
     acc_stage_count: int = 0
+    skip_ab_producer_advance: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -270,6 +271,7 @@ class CuteTcgen05MatmulPlan:
     cluster_m: int
     is_two_cta: bool
     uses_role_local_persistent_body: bool
+    uses_cluster_m2_one_cta_role_local_bridge: bool
     cta_thread_count: int
     physical_m_threads: int
     acc_stage_count: int

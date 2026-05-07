@@ -44,6 +44,33 @@ from .layout import MatmulExecutionKind
 from .layout import MatmulExecutionPlan
 from .matmul_utils import analyze_direct_grouped_n_loads
 from .mma_support import get_cute_mma_support
+from .tcgen05_constants import TCGEN05_AB_CONSUMER_PHASE_MODE_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_AB_CONSUMER_PHASE_MODE_NORMAL
+from .tcgen05_constants import TCGEN05_AB_CONSUMER_PHASE_MODE_PHASE1
+from .tcgen05_constants import TCGEN05_AB_CONSUMER_WAIT_MODE_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_AB_CONSUMER_WAIT_MODE_NORMAL
+from .tcgen05_constants import TCGEN05_AB_CONSUMER_WAIT_MODE_SKIP
+from .tcgen05_constants import TCGEN05_AB_INITIAL_PRODUCER_ACQUIRE_MODE_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_AB_INITIAL_PRODUCER_ACQUIRE_MODE_NORMAL
+from .tcgen05_constants import TCGEN05_AB_INITIAL_PRODUCER_ACQUIRE_MODE_SKIP_FIRST
+from .tcgen05_constants import TCGEN05_AB_PRODUCER_ACQUIRE_MODE_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_AB_PRODUCER_ACQUIRE_MODE_NORMAL
+from .tcgen05_constants import TCGEN05_AB_PRODUCER_ACQUIRE_MODE_SKIP
+from .tcgen05_constants import TCGEN05_AB_PRODUCER_ADVANCE_MODE_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_AB_PRODUCER_ADVANCE_MODE_NORMAL
+from .tcgen05_constants import TCGEN05_AB_PRODUCER_ADVANCE_MODE_SKIP
+from .tcgen05_constants import TCGEN05_ACC_PRODUCER_ADVANCE_MODE_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_ACC_PRODUCER_ADVANCE_MODE_NORMAL
+from .tcgen05_constants import TCGEN05_ACC_PRODUCER_ADVANCE_MODE_SKIP
+from .tcgen05_constants import TCGEN05_ACC_PRODUCER_MODE_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_ACC_PRODUCER_MODE_NORMAL
+from .tcgen05_constants import TCGEN05_ACC_PRODUCER_MODE_SKIP_UMMA
+from .tcgen05_constants import TCGEN05_CLUSTER_M2_ONE_CTA_ROLE_LOCAL_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_BLOCK_SIZES
+from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_CLUSTER_M
+from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_PID_TYPE
+from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_PROBLEM_SHAPE
 from .tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
 
 if TYPE_CHECKING:
@@ -712,6 +739,7 @@ class _PerKiterTmaArgs:
     tma_barrier_ptr: str
     tma_full_tile: str
     tma_next_full_tile: str
+    tma_next_consumer_tile: str
     tma_warp: str
     tma_atom_a: str
     tma_atom_b: str
@@ -723,10 +751,13 @@ class _PerKiterTmaArgs:
     tma_a_mcast_mask: str
     tma_b_mcast_mask: str
     ab_stage_count: int
-    cluster_m: int
     is_two_cta: bool
+    use_tma_b_mcast_mask: bool
     use_tma_a: bool
     use_tma_b: bool
+    skip_producer_acquire: bool
+    skip_producer_advance: bool
+    skip_consumer_wait: bool
     exec_active: str
     scalar_load_a: ast.stmt
     scalar_load_b: ast.stmt
@@ -735,8 +766,8 @@ class _PerKiterTmaArgs:
 def _kloop_tma_copy_a_src(args: _PerKiterTmaArgs, *, k_offset: str) -> str:
     """Per-K-iter TMA copy source for A; ``""`` when A is not TMA-loaded.
 
-    A only multicasts in 2-CTA mode (asymmetric vs. B, which also
-    multicasts across cluster CTAs).
+    A only multicasts in 2-CTA mode (asymmetric vs. B, which can also
+    multicast across cluster CTAs).
     """
     if not args.use_tma_a:
         return ""
@@ -752,16 +783,13 @@ def _kloop_tma_copy_a_src(args: _PerKiterTmaArgs, *, k_offset: str) -> str:
 def _kloop_tma_copy_b_src(args: _PerKiterTmaArgs, *, k_offset: str) -> str:
     """Per-K-iter TMA copy source for B; ``""`` when B is not TMA-loaded.
 
-    B multicasts on ``cluster_m > 1`` or 2-CTA; A only on 2-CTA, so the
-    two helpers are not folded together.
+    Callers pass a mask whenever the B TMA atom is multicast. The guarded
+    clustered CtaGroup.ONE bridge diagnostic uses a self-only mask so each CTA
+    duplicates local-B loads while satisfying CuTe's multicast-atom contract.
     """
     if not args.use_tma_b:
         return ""
-    mcast = (
-        f", mcast_mask={args.tma_b_mcast_mask}"
-        if args.cluster_m > 1 or args.is_two_cta
-        else ""
-    )
+    mcast = f", mcast_mask={args.tma_b_mcast_mask}" if args.use_tma_b_mcast_mask else ""
     return (
         f"    cute.copy({args.tma_atom_b}, "
         f"{args.tma_gB}[None, {k_offset}], "
@@ -812,17 +840,25 @@ def _build_kloop_pipeline_producer_if(
     )
     # CtaGroup.TWO uses CTA-rank-specific TMA partitions, so both CTAs issue
     # these copies; PipelineTmaUmma gates the full-barrier tx setup internally.
-    src = (
-        f"if {' and '.join(predicate_terms)}:\n"
-        f"    {args.tma_producer_try_token} = "
-        f"{args.tma_pipeline}.producer_try_acquire({args.tma_producer_state})\n"
-        f"    {args.tma_pipeline}.producer_acquire("
-        f"{args.tma_producer_state}, {args.tma_producer_try_token})\n"
+    src = f"if {' and '.join(predicate_terms)}:\n"
+    producer_advance_src = (
+        emit_pipeline_advance(args.tma_producer_state, indent="    ")
+        if not args.skip_producer_advance
+        else ""
+    )
+    if not args.skip_producer_acquire:
+        src += (
+            f"    {args.tma_producer_try_token} = "
+            f"{args.tma_pipeline}.producer_try_acquire({args.tma_producer_state})\n"
+            f"    {args.tma_pipeline}.producer_acquire("
+            f"{args.tma_producer_state}, {args.tma_producer_try_token})\n"
+        )
+    src += (
         f"    {args.tma_barrier_ptr} = "
         f"{args.tma_pipeline}.producer_get_barrier({args.tma_producer_state})\n"
         + copy_src
         + f"    {args.tma_pipeline}.producer_commit({args.tma_producer_state})\n"
-        + emit_pipeline_advance(args.tma_producer_state, indent="    ")
+        + producer_advance_src
     )
     return statement_from_string(src)
 
@@ -832,14 +868,22 @@ def _build_kloop_pipeline_consumer_if(
     *,
     gate_exec_warp: bool = True,
     include_scalar_fallback: bool = True,
+    use_existing_try_token: bool = False,
 ) -> ast.stmt:
     """Per-K-iter TMA consumer / scalar-fallback ``if`` for the pipelined branch."""
-    consumer_src = (
-        f"{args.tma_consumer_try_token} = "
-        f"{args.tma_pipeline}.consumer_try_wait({args.tma_consumer_state})\n"
-        f"{args.tma_pipeline}.consumer_wait("
-        f"{args.tma_consumer_state}, {args.tma_consumer_try_token})"
-    )
+    if args.skip_consumer_wait:
+        consumer_src = "pass"
+    else:
+        consumer_src = ""
+        if not use_existing_try_token:
+            consumer_src = (
+                f"{args.tma_consumer_try_token} = "
+                f"{args.tma_pipeline}.consumer_try_wait({args.tma_consumer_state})\n"
+            )
+        consumer_src += (
+            f"{args.tma_pipeline}.consumer_wait("
+            f"{args.tma_consumer_state}, {args.tma_consumer_try_token})"
+        )
     full_tile_src = _tcgen05_emit_optional_gate(
         consumer_src,
         _tcgen05_two_cta_owner_predicate(
@@ -861,6 +905,29 @@ def _build_kloop_pipeline_consumer_if(
         )
     src = f"if {args.tma_full_tile}:\n{full_tile_src}{fallback_src}"
     return statement_from_string(src)
+
+
+def _build_kloop_pipeline_consumer_prefetch_stmts(
+    args: _PerKiterTmaArgs,
+    *,
+    gate_exec_warp: bool = True,
+) -> list[ast.stmt]:
+    """Peek the next AB full barrier after advancing the consumer state."""
+    assert args.is_two_cta, "AB consumer prefetch is validated for CtaGroup.TWO"
+    predicate = args.tma_next_consumer_tile
+    owner_predicate = _tcgen05_two_cta_owner_predicate(
+        args.exec_active, is_two_cta=args.is_two_cta, gate_exec_warp=gate_exec_warp
+    )
+    if owner_predicate is not None:
+        predicate = f"{predicate} and {owner_predicate}"
+    return [
+        statement_from_string(f"{args.tma_consumer_try_token} = cutlass.Boolean(1)"),
+        statement_from_string(
+            f"if {predicate}:\n"
+            f"    {args.tma_consumer_try_token} = "
+            f"{args.tma_pipeline}.consumer_try_wait({args.tma_consumer_state})"
+        ),
+    ]
 
 
 def _build_kloop_pipeline_release_if(
@@ -915,6 +982,22 @@ def _build_tcgen05_mma_fence_stmt(
     return statement_from_string(f"if {predicate}:\n    {fence_src}")
 
 
+def _build_tcgen05_mma_accumulate_reset_stmt(
+    exec_active: str,
+    *,
+    tiled_mma: str,
+    gate_exec_warp: bool = True,
+    is_two_cta: bool = False,
+) -> ast.stmt:
+    reset_src = f"{tiled_mma}.set(cute.nvgpu.tcgen05.Field.ACCUMULATE, False)"
+    predicate = _tcgen05_two_cta_owner_predicate(
+        exec_active, is_two_cta=is_two_cta, gate_exec_warp=gate_exec_warp
+    )
+    if predicate is None:
+        return statement_from_string(reset_src)
+    return statement_from_string(f"if {predicate}:\n    {reset_src}")
+
+
 def _build_tcgen05_mma_issue_stmt(
     *,
     exec_active: str,
@@ -923,24 +1006,19 @@ def _build_tcgen05_mma_issue_stmt(
     tcgen05_frag_a: str,
     tcgen05_frag_b: str,
     mma_stage: str,
-    k_offset_var: str,
-    k_loop_begin_expr: str,
     gate_exec_warp: bool = True,
     is_two_cta: bool = False,
 ) -> ast.stmt:
     issue_src = (
         f"for _tcgen05_kblk_idx in range(cute.size({tcgen05_frag_a}, mode=[2])):\n"
-        f"    {tiled_mma}.set(\n"
-        f"        cute.nvgpu.tcgen05.Field.ACCUMULATE,\n"
-        f"        {k_offset_var} != {k_loop_begin_expr} or cutlass.Int32(_tcgen05_kblk_idx) != cutlass.Int32(0),\n"
-        "    )\n"
         f"    cute.gemm(\n"
         f"        {tiled_mma},\n"
         f"        {acc_frag},\n"
         f"        [{tcgen05_frag_a}[None, None, cutlass.Int32(_tcgen05_kblk_idx), {mma_stage}]],\n"
         f"        [{tcgen05_frag_b}[None, None, cutlass.Int32(_tcgen05_kblk_idx), {mma_stage}]],\n"
         f"        {acc_frag},\n"
-        "    )"
+        "    )\n"
+        f"    {tiled_mma}.set(cute.nvgpu.tcgen05.Field.ACCUMULATE, True)"
     )
     predicate = _tcgen05_two_cta_owner_predicate(
         exec_active, is_two_cta=is_two_cta, gate_exec_warp=gate_exec_warp
@@ -965,9 +1043,10 @@ def _build_kloop_non_pipeline_producer_if(
     copy_src = _kloop_tma_copy_a_src(
         args, k_offset=args.tma_k_tile
     ) + _kloop_tma_copy_b_src(args, k_offset=args.tma_k_tile)
-    src = (
-        f"if {' and '.join(predicate_terms)}:\n"
-        f"    {args.tma_pipeline}.producer_acquire({args.tma_producer_state})\n"
+    src = f"if {' and '.join(predicate_terms)}:\n"
+    if not args.skip_producer_acquire:
+        src += f"    {args.tma_pipeline}.producer_acquire({args.tma_producer_state})\n"
+    src += (
         f"    {args.tma_barrier_ptr} = "
         f"{args.tma_pipeline}.producer_get_barrier({args.tma_producer_state})\n"
         + copy_src
@@ -1001,13 +1080,19 @@ def _build_kloop_non_pipeline_consumer_if(args: _PerKiterTmaArgs) -> ast.stmt:
         f"{scalar_load_b_tma_src}"
         f"    if {args.exec_active}:\n"
         "        cute.arch.sync_warp()\n"
-        f"        {args.tma_pipeline}.consumer_wait("
-        f"{args.tma_consumer_state}, {args.tma_consumer_try_token})\n"
-        "    cute.arch.sync_threads()\n"
-        "else:\n"
-        f"{scalar_load_a_src}\n"
-        f"{scalar_load_b_src}\n"
-        "    cute.arch.sync_threads()"
+        + (
+            "        pass\n"
+            if args.skip_consumer_wait
+            else (
+                f"        {args.tma_pipeline}.consumer_wait("
+                f"{args.tma_consumer_state}, {args.tma_consumer_try_token})\n"
+            )
+        )
+        + "    cute.arch.sync_threads()\n"
+        + "else:\n"
+        + f"{scalar_load_a_src}\n"
+        + f"{scalar_load_b_src}\n"
+        + "    cute.arch.sync_threads()"
     )
     return statement_from_string(src)
 
@@ -1016,17 +1101,22 @@ def _build_kloop_non_pipeline_release_if(args: _PerKiterTmaArgs) -> ast.stmt:
     """Per-K-iter consumer release ``if`` for the non-pipelined branch.
 
     CTA-wide ``sync_threads()`` runs first so every warp sees the
-    consumer wait completed; single-stage means BOTH producer and
-    consumer state must advance here.
+    consumer wait completed; single-stage means both producer and
+    consumer state normally advance here. The producer advance is omitted
+    only by the guarded invalid-output bridge diagnostic.
     """
+    producer_advance_src = (
+        emit_pipeline_advance(args.tma_producer_state, indent="    ") + "\n"
+        if not args.skip_producer_advance
+        else ""
+    )
     src = (
         f"if {args.tma_full_tile}:\n"
         "    cute.arch.sync_threads()\n"
         f"    if {args.exec_active}:\n"
         "        cute.arch.sync_warp()\n"
         f"        {args.tma_pipeline}.consumer_release({args.tma_consumer_state})\n"
-        + emit_pipeline_advance(args.tma_producer_state, indent="    ")
-        + "\n"
+        + producer_advance_src
         + emit_pipeline_advance(args.tma_consumer_state, indent="    ")
         + "\n"
         "else:\n"
@@ -1060,8 +1150,10 @@ class _InitialPrefetchTmaArgs:
     tma_sB: str
     tma_a_mcast_mask: str
     tma_b_mcast_mask: str
-    cluster_m: int
     is_two_cta: bool
+    use_tma_b_mcast_mask: bool
+    skip_producer_acquire: bool
+    skip_producer_advance: bool
 
 
 def _initial_prefetch_copy_a_src(
@@ -1069,8 +1161,8 @@ def _initial_prefetch_copy_a_src(
 ) -> str:
     """Initial-prefetch TMA copy source for A.
 
-    A only multicasts in 2-CTA mode (asymmetric vs. B, which also
-    multicasts across cluster CTAs); matches the asymmetry pinned by
+    A only multicasts in 2-CTA mode (asymmetric vs. B, which can also
+    multicast across cluster CTAs); matches the asymmetry pinned by
     ``test_mcast_mask_asymmetry_between_a_and_b`` for the per-K-iter
     builders.
     """
@@ -1088,14 +1180,11 @@ def _initial_prefetch_copy_b_src(
 ) -> str:
     """Initial-prefetch TMA copy source for B.
 
-    B multicasts on ``cluster_m > 1`` or 2-CTA; A only on 2-CTA, so the
-    two helpers are not folded together.
+    Callers pass a mask whenever the B TMA atom is multicast. The guarded
+    clustered CtaGroup.ONE bridge diagnostic uses a self-only mask so each CTA
+    duplicates local-B loads while satisfying CuTe's multicast-atom contract.
     """
-    mcast = (
-        f", mcast_mask={args.tma_b_mcast_mask}"
-        if args.cluster_m > 1 or args.is_two_cta
-        else ""
-    )
+    mcast = f", mcast_mask={args.tma_b_mcast_mask}" if args.use_tma_b_mcast_mask else ""
     return (
         f"    cute.copy({args.tma_atom_b}, "
         f"{args.tma_gB}[None, {k_offset}], "
@@ -1109,6 +1198,7 @@ def _build_initial_prefetch_if(
     *,
     full_tile_gates: list[str],
     k_offset: str,
+    skip_producer_acquire: bool | None = None,
 ) -> ast.stmt:
     """Initial-prefetch ``if`` block for stage ``k_offset``.
 
@@ -1116,22 +1206,32 @@ def _build_initial_prefetch_if(
     {args.tma_warp}``: stage-0 callers pass
     ``[tma_initial_full_tile]``; stage-(N-1) callers (only when
     ``ab_stage_count > 1``) extend with ``tma_initial_next_full_tile``.
-    The body performs ``producer_acquire / get_barrier / copy A /
-    copy B / producer_commit / advance``. Caller passes a literal
+    The body performs optional ``producer_acquire``, then
+    ``get_barrier / copy A / copy B / producer_commit`` and optional
+    producer-state ``advance``. The optional edges are omitted only by
+    guarded invalid-output bridge diagnostics. Caller passes a literal
     ``cutlass.Int32(stage_idx)`` for ``k_offset``.
     """
     predicate = " and ".join([*full_tile_gates, args.tma_warp])
+    if skip_producer_acquire is None:
+        skip_producer_acquire = args.skip_producer_acquire
+    producer_advance_src = (
+        emit_pipeline_advance(args.tma_producer_state, indent="    ")
+        if not args.skip_producer_advance
+        else ""
+    )
     copy_src = _initial_prefetch_copy_a_src(
         args, k_offset=k_offset
     ) + _initial_prefetch_copy_b_src(args, k_offset=k_offset)
-    src = (
-        f"if {predicate}:\n"
-        f"    {args.tma_pipeline}.producer_acquire({args.tma_producer_state})\n"
+    src = f"if {predicate}:\n"
+    if not skip_producer_acquire:
+        src += f"    {args.tma_pipeline}.producer_acquire({args.tma_producer_state})\n"
+    src += (
         f"    {args.tma_barrier_ptr} = "
         f"{args.tma_pipeline}.producer_get_barrier({args.tma_producer_state})\n"
         + copy_src
         + f"    {args.tma_pipeline}.producer_commit({args.tma_producer_state})\n"
-        + emit_pipeline_advance(args.tma_producer_state, indent="    ")
+        + producer_advance_src
     )
     return statement_from_string(src)
 
@@ -1296,6 +1396,33 @@ def _emit_mma_pipeline(
     m_size = int(lhs_fake.shape[0])
     n_size = int(rhs_fake.shape[1])
 
+    tcgen05_cluster_m = _tcgen05_cluster_m(df.config)
+    tcgen05_large_bn_proof = _tcgen05_large_bn_proof_enabled(df.config)
+    if tcgen05_large_bn_proof and (
+        not _tcgen05_large_bn_proof_shape(
+            bm=bm,
+            bn=bn,
+            bk=bk,
+            tcgen05_cluster_m=tcgen05_cluster_m,
+        )
+        or (m_size, n_size, k_total_size) != TCGEN05_LARGE_BN_PROOF_PROBLEM_SHAPE
+        or cast("_ConfigLike", df.config).get("pid_type", "flat")
+        != TCGEN05_LARGE_BN_PROOF_PID_TYPE
+    ):
+        raise exc.BackendUnsupported(
+            "cute",
+            f"{TCGEN05_LARGE_BN_PROOF_CONFIG_KEY}=True requires the guarded "
+            "G4 proof envelope "
+            f"M={TCGEN05_LARGE_BN_PROOF_PROBLEM_SHAPE[0]},"
+            f"N={TCGEN05_LARGE_BN_PROOF_PROBLEM_SHAPE[1]},"
+            f"K={TCGEN05_LARGE_BN_PROOF_PROBLEM_SHAPE[2]},"
+            f"bm={TCGEN05_LARGE_BN_PROOF_BLOCK_SIZES[0]},"
+            f"bn={TCGEN05_LARGE_BN_PROOF_BLOCK_SIZES[1]},"
+            f"bk={TCGEN05_LARGE_BN_PROOF_BLOCK_SIZES[2]},"
+            f"tcgen05_cluster_m={TCGEN05_LARGE_BN_PROOF_CLUSTER_M},"
+            f"pid_type={TCGEN05_LARGE_BN_PROOF_PID_TYPE!r}",
+        )
+
     mma_impl = _choose_mma_impl(input_dtype, bm=bm, bn=bn, bk=bk, config=df.config)
     zero_acc_expr = acc_expr is not None and _is_zero_acc_expr(acc_expr)
     if (
@@ -1315,7 +1442,6 @@ def _emit_mma_pipeline(
         m_size % bm == 0 and n_size % bn == 0 and k_total_size % bk == 0
     )
     tcgen05_pid_is_persistent = _is_persistent_pid_config(df.config)
-    tcgen05_cluster_m = _tcgen05_cluster_m(df.config)
     tcgen05_requested_two_cta = _tcgen05_use_2cta_instrs(
         bm=bm, cluster_m=tcgen05_cluster_m
     )
@@ -1348,15 +1474,174 @@ def _emit_mma_pipeline(
             tcgen05_cluster_m = 1
     assert tcgen05_cluster_m == 1 or bm >= 128
     tcgen05_is_two_cta = tcgen05_requested_two_cta and tcgen05_cluster_m > 1
+    tcgen05_diagnose_cluster_m2_one_cta_role_local = bool(
+        df.config.get(TCGEN05_CLUSTER_M2_ONE_CTA_ROLE_LOCAL_CONFIG_KEY, False)
+    )
+    tcgen05_cluster_m2_one_cta_role_local_bridge = (
+        tcgen05_diagnose_cluster_m2_one_cta_role_local
+        and mma_impl == "tcgen05"
+        and tcgen05_use_tma_pipeline
+        and tcgen05_static_full_tiles
+        and tcgen05_pid_is_persistent
+        and tcgen05_cluster_m == 2
+        and not tcgen05_is_two_cta
+        and bm == 128
+        and bn == 256
+        and bk == 128
+    )
+    if (
+        tcgen05_diagnose_cluster_m2_one_cta_role_local
+        and not tcgen05_cluster_m2_one_cta_role_local_bridge
+    ):
+        raise exc.BackendUnsupported(
+            "cute",
+            f"{TCGEN05_CLUSTER_M2_ONE_CTA_ROLE_LOCAL_CONFIG_KEY}=True requires "
+            "static-full persistent tcgen05 TMA codegen for the guarded "
+            "cluster_m=2, CtaGroup.ONE, 128x256x128 bridge shape",
+        )
+    tcgen05_role_local_codegen_allowed = (
+        tcgen05_cluster_m == 1
+        or tcgen05_is_two_cta
+        or tcgen05_cluster_m2_one_cta_role_local_bridge
+    )
+    # The exact CtaGroup.ONE bridge duplicates A/B TMA production locally and
+    # remains runtime-guarded. Do not apply the CtaGroup.TWO deferred cluster
+    # pipeline protocol to that diagnostic shape.
+    tcgen05_use_cluster_deferred_pipelines = (
+        tcgen05_cluster_m > 1 and not tcgen05_cluster_m2_one_cta_role_local_bridge
+    )
+    # The clustered CtaGroup.ONE bridge flag is compile-proof only: ProgramID
+    # still emits the host guard because this runtime path is not validated.
     tcgen05_use_role_local_tma_producer = (
         mma_impl == "tcgen05"
         and tcgen05_use_tma_pipeline
         and tcgen05_static_full_tiles
-        and (tcgen05_cluster_m == 1 or tcgen05_is_two_cta)
+        and tcgen05_role_local_codegen_allowed
         and tcgen05_pid_is_persistent
     )
     # Keep a distinct name so future MMA-exec gating changes are localized.
     tcgen05_use_role_local_mma_exec = tcgen05_use_role_local_tma_producer
+    tcgen05_acc_producer_mode = df.config.get(
+        TCGEN05_ACC_PRODUCER_MODE_CONFIG_KEY,
+        TCGEN05_ACC_PRODUCER_MODE_NORMAL,
+    )
+    diagnose_skip_umma_issue = (
+        tcgen05_acc_producer_mode == TCGEN05_ACC_PRODUCER_MODE_SKIP_UMMA
+    )
+    if diagnose_skip_umma_issue and mma_impl != "tcgen05":
+        raise exc.BackendUnsupported(
+            "cute",
+            f"{TCGEN05_ACC_PRODUCER_MODE_CONFIG_KEY}="
+            f"{TCGEN05_ACC_PRODUCER_MODE_SKIP_UMMA!r} requires tcgen05 MMA codegen",
+        )
+    tcgen05_acc_producer_advance_mode = df.config.get(
+        TCGEN05_ACC_PRODUCER_ADVANCE_MODE_CONFIG_KEY,
+        TCGEN05_ACC_PRODUCER_ADVANCE_MODE_NORMAL,
+    )
+    diagnose_skip_acc_producer_advance = (
+        tcgen05_acc_producer_advance_mode == TCGEN05_ACC_PRODUCER_ADVANCE_MODE_SKIP
+    )
+    if (
+        diagnose_skip_acc_producer_advance
+        and not tcgen05_cluster_m2_one_cta_role_local_bridge
+    ):
+        raise exc.BackendUnsupported(
+            "cute",
+            f"{TCGEN05_ACC_PRODUCER_ADVANCE_MODE_CONFIG_KEY}="
+            f"{TCGEN05_ACC_PRODUCER_ADVANCE_MODE_SKIP!r} requires the guarded "
+            "cluster_m=2, CtaGroup.ONE, 128x256x128 bridge shape",
+        )
+    tcgen05_ab_producer_acquire_mode = df.config.get(
+        TCGEN05_AB_PRODUCER_ACQUIRE_MODE_CONFIG_KEY,
+        TCGEN05_AB_PRODUCER_ACQUIRE_MODE_NORMAL,
+    )
+    diagnose_skip_ab_producer_acquire = (
+        tcgen05_ab_producer_acquire_mode == TCGEN05_AB_PRODUCER_ACQUIRE_MODE_SKIP
+    )
+    if (
+        diagnose_skip_ab_producer_acquire
+        and not tcgen05_cluster_m2_one_cta_role_local_bridge
+    ):
+        raise exc.BackendUnsupported(
+            "cute",
+            f"{TCGEN05_AB_PRODUCER_ACQUIRE_MODE_CONFIG_KEY}="
+            f"{TCGEN05_AB_PRODUCER_ACQUIRE_MODE_SKIP!r} requires the guarded "
+            "cluster_m=2, CtaGroup.ONE, 128x256x128 bridge shape",
+        )
+    tcgen05_ab_initial_producer_acquire_mode = df.config.get(
+        TCGEN05_AB_INITIAL_PRODUCER_ACQUIRE_MODE_CONFIG_KEY,
+        TCGEN05_AB_INITIAL_PRODUCER_ACQUIRE_MODE_NORMAL,
+    )
+    diagnose_skip_initial_ab_producer_acquire = (
+        tcgen05_ab_initial_producer_acquire_mode
+        == TCGEN05_AB_INITIAL_PRODUCER_ACQUIRE_MODE_SKIP_FIRST
+    )
+    if (
+        diagnose_skip_initial_ab_producer_acquire
+        and not tcgen05_cluster_m2_one_cta_role_local_bridge
+    ):
+        raise exc.BackendUnsupported(
+            "cute",
+            f"{TCGEN05_AB_INITIAL_PRODUCER_ACQUIRE_MODE_CONFIG_KEY}="
+            f"{TCGEN05_AB_INITIAL_PRODUCER_ACQUIRE_MODE_SKIP_FIRST!r} requires "
+            "the guarded cluster_m=2, CtaGroup.ONE, 128x256x128 bridge shape",
+        )
+    tcgen05_ab_producer_advance_mode = df.config.get(
+        TCGEN05_AB_PRODUCER_ADVANCE_MODE_CONFIG_KEY,
+        TCGEN05_AB_PRODUCER_ADVANCE_MODE_NORMAL,
+    )
+    diagnose_skip_ab_producer_advance = (
+        tcgen05_ab_producer_advance_mode == TCGEN05_AB_PRODUCER_ADVANCE_MODE_SKIP
+    )
+    if (
+        diagnose_skip_ab_producer_advance
+        and not tcgen05_cluster_m2_one_cta_role_local_bridge
+    ):
+        raise exc.BackendUnsupported(
+            "cute",
+            f"{TCGEN05_AB_PRODUCER_ADVANCE_MODE_CONFIG_KEY}="
+            f"{TCGEN05_AB_PRODUCER_ADVANCE_MODE_SKIP!r} requires the guarded "
+            "cluster_m=2, CtaGroup.ONE, 128x256x128 bridge shape",
+        )
+    tcgen05_ab_consumer_wait_mode = df.config.get(
+        TCGEN05_AB_CONSUMER_WAIT_MODE_CONFIG_KEY,
+        TCGEN05_AB_CONSUMER_WAIT_MODE_NORMAL,
+    )
+    diagnose_skip_ab_consumer_wait = (
+        tcgen05_ab_consumer_wait_mode == TCGEN05_AB_CONSUMER_WAIT_MODE_SKIP
+    )
+    if (
+        diagnose_skip_ab_consumer_wait
+        and not tcgen05_cluster_m2_one_cta_role_local_bridge
+    ):
+        raise exc.BackendUnsupported(
+            "cute",
+            f"{TCGEN05_AB_CONSUMER_WAIT_MODE_CONFIG_KEY}="
+            f"{TCGEN05_AB_CONSUMER_WAIT_MODE_SKIP!r} requires the guarded "
+            "cluster_m=2, CtaGroup.ONE, 128x256x128 bridge shape",
+        )
+    tcgen05_ab_consumer_phase_mode = df.config.get(
+        TCGEN05_AB_CONSUMER_PHASE_MODE_CONFIG_KEY,
+        TCGEN05_AB_CONSUMER_PHASE_MODE_NORMAL,
+    )
+    diagnose_ab_consumer_phase1 = (
+        tcgen05_ab_consumer_phase_mode == TCGEN05_AB_CONSUMER_PHASE_MODE_PHASE1
+    )
+    if diagnose_ab_consumer_phase1 and not tcgen05_cluster_m2_one_cta_role_local_bridge:
+        raise exc.BackendUnsupported(
+            "cute",
+            f"{TCGEN05_AB_CONSUMER_PHASE_MODE_CONFIG_KEY}="
+            f"{TCGEN05_AB_CONSUMER_PHASE_MODE_PHASE1!r} requires the guarded "
+            "cluster_m=2, CtaGroup.ONE, 128x256x128 bridge shape",
+        )
+    # Static-full CtaGroup.TWO keeps a prefetched AB consumer token live
+    # across the accumulator acquire and each K-loop issue. CtaGroup.ONE
+    # keeps the older adjacent try-wait/wait sequence.
+    tcgen05_use_role_local_ab_consumer_prefetch = (
+        tcgen05_use_role_local_mma_exec
+        and tcgen05_is_two_cta
+        and tcgen05_use_tma_pipeline
+    )
     # Keep a distinct name so future epi-role gating changes are localized.
     tcgen05_use_role_local_epi = tcgen05_use_role_local_tma_producer
     # This is the kernel-wide contract ProgramID consumes. Today the TMA
@@ -1371,9 +1656,21 @@ def _emit_mma_pipeline(
         mma_impl == "tcgen05"
         and tcgen05_use_tma_pipeline
         and tcgen05_static_full_tiles
-        and (tcgen05_cluster_m == 1 or tcgen05_is_two_cta)
+        and tcgen05_role_local_codegen_allowed
         and (not _is_persistent_pid_config(df.config) or tcgen05_use_role_local_epi)
     )
+    if tcgen05_large_bn_proof and (
+        mma_impl != "tcgen05"
+        or tcgen05_is_two_cta
+        or not tcgen05_use_tma_pipeline
+        or not tcgen05_static_full_tiles
+        or not tcgen05_use_tma_store_epilogue
+    ):
+        raise exc.BackendUnsupported(
+            "cute",
+            f"{TCGEN05_LARGE_BN_PROOF_CONFIG_KEY}=True requires final tcgen05 "
+            "CtaGroup.ONE TMA-load and TMA-store lowering for the G4 proof",
+        )
     tcgen05_collective_handles_operand_loads = (
         mma_impl == "tcgen05"
         and fx_node is not None
@@ -1460,7 +1757,7 @@ def _emit_mma_pipeline(
         assert epi_active is not None
         tcgen05_tmem_setup_emitted = True
 
-        if tcgen05_cluster_m > 1:
+        if tcgen05_use_cluster_deferred_pipelines:
             # Keep the two-CTA cluster rendezvous after the AB/acc pipeline
             # objects exist and before any role allocates or retrieves TMEM.
             prefix.append(
@@ -1532,6 +1829,23 @@ def _emit_mma_pipeline(
             f"{tcgen05_plan.acc_producer_state}.index]",
             mma_exec=tcgen05_use_role_local_mma_exec,
         )
+        if tcgen05_use_role_local_ab_consumer_prefetch:
+            ab_consumer_prefetch_owner_predicate = _tcgen05_two_cta_owner_predicate(
+                tcgen05_plan.exec_active,
+                is_two_cta=tcgen05_is_two_cta,
+                gate_exec_warp=False,
+            )
+            assert ab_consumer_prefetch_owner_predicate is not None
+            _emit_per_tile(
+                f"{tma_consumer_try_token} = cutlass.Boolean(1)",
+                mma_exec=tcgen05_use_role_local_mma_exec,
+            )
+            _emit_per_tile(
+                f"if {ab_consumer_prefetch_owner_predicate}:\n"
+                f"    {tma_consumer_try_token} = "
+                f"{tma_pipeline}.consumer_try_wait({tma_consumer_state})",
+                mma_exec=tcgen05_use_role_local_mma_exec,
+            )
         prefix.append(
             statement_from_string(
                 f"{tcgen05_epi_acc_frag_base} = cute.make_tensor("
@@ -1550,6 +1864,15 @@ def _emit_mma_pipeline(
             f"{tcgen05_plan.acc_producer_state})",
             mma_exec=tcgen05_use_role_local_mma_exec,
         )
+        reset_accumulate_stmt = _build_tcgen05_mma_accumulate_reset_stmt(
+            tcgen05_plan.exec_active,
+            tiled_mma=tiled_mma,
+            is_two_cta=tcgen05_is_two_cta,
+        )
+        prefix.append(reset_accumulate_stmt)
+        per_tile_stmts.append(reset_accumulate_stmt)
+        if tcgen05_use_role_local_mma_exec:
+            mma_exec_role_stmts.append(reset_accumulate_stmt)
 
     mma_participant_linear: str | None = None
     mma_slice_linear: str | None = None
@@ -1594,7 +1917,7 @@ def _emit_mma_pipeline(
         2 if tcgen05_is_two_cta else 1
     )
     tcgen05_defer_pipeline_sync_arg = (
-        ", defer_sync=True" if tcgen05_cluster_m > 1 else ""
+        ", defer_sync=True" if tcgen05_use_cluster_deferred_pipelines else ""
     )
     tcgen05_matmul_plan: CuteTcgen05MatmulPlan | None = None
     tcgen05_mma_owner_active: str | None = None
@@ -1607,6 +1930,9 @@ def _emit_mma_pipeline(
             cluster_m=tcgen05_cluster_m,
             is_two_cta=tcgen05_is_two_cta,
             uses_role_local_persistent_body=tcgen05_use_role_local_persistent_body,
+            uses_cluster_m2_one_cta_role_local_bridge=(
+                tcgen05_cluster_m2_one_cta_role_local_bridge
+            ),
             cta_thread_count=tcgen05_cta_thread_count,
             physical_m_threads=mma_physical_m_threads,
             acc_stage_count=tcgen05_acc_stage_count_value,
@@ -1941,6 +2267,7 @@ def _emit_mma_pipeline(
     tma_initial_next_full_tile = df.new_var("tcgen05_tma_initial_next_full_tile")
     tma_full_tile = df.new_var("tcgen05_tma_full_tile")
     tma_next_full_tile = df.new_var("tcgen05_tma_next_full_tile")
+    tma_next_consumer_tile = df.new_var("tcgen05_tma_next_consumer_tile")
     tma_k_tile = df.new_var("tcgen05_tma_k_tile")
     tma_barrier_ptr = df.new_var("tcgen05_tma_barrier")
     tma_producer_try_token = df.new_var("tcgen05_ab_producer_try_token")
@@ -1949,6 +2276,7 @@ def _emit_mma_pipeline(
     tma_block_in_cluster_coord_vmnk = df.new_var("tcgen05_block_in_cluster_coord_vmnk")
     tma_a_mcast_mask = df.new_var("tcgen05_a_mcast_mask")
     tma_b_mcast_mask = df.new_var("tcgen05_b_mcast_mask")
+    tcgen05_use_tma_b_mcast_mask = False
     tma_pipeline_mbars = df.new_var("tcgen05_ab_pipeline_mbars")
     tma_pipeline_producer_group = df.new_var("tcgen05_ab_pipeline_producer_group")
     tma_pipeline_consumer_group = df.new_var("tcgen05_ab_pipeline_consumer_group")
@@ -2072,6 +2400,17 @@ def _emit_mma_pipeline(
                 f"{gmem_b_tma_part} = {tma_thr_mma}.partition_B({gmem_b_tma})",
                 tma_load=tcgen05_use_role_local_tma_producer,
             )
+            # The guarded clustered CtaGroup.ONE bridge keeps one TMA producer
+            # transaction per CTA and duplicates B locally. The B atom is still
+            # a multicast TMA atom for cluster_m=2/CtaGroup.ONE, so feed it a
+            # self-only mask instead of the normal all-M peers mask.
+            tcgen05_use_tma_b_peer_mcast = (
+                tcgen05_cluster_m > 1 or tcgen05_is_two_cta
+            ) and not tcgen05_cluster_m2_one_cta_role_local_bridge
+            tcgen05_use_tma_b_self_mcast = tcgen05_cluster_m2_one_cta_role_local_bridge
+            tcgen05_use_tma_b_mcast_mask = (
+                tcgen05_use_tma_b_peer_mcast or tcgen05_use_tma_b_self_mcast
+            )
             if tcgen05_is_two_cta:
                 prefix.append(
                     statement_from_string(
@@ -2123,12 +2462,13 @@ def _emit_mma_pipeline(
                             "mcast_mode=2)"
                         )
                     )
-                if tcgen05_cluster_m > 1 or tcgen05_is_two_cta:
+                if tcgen05_use_tma_b_mcast_mask:
+                    tma_b_mcast_mode = 2 if tcgen05_use_tma_b_self_mcast else 1
                     prefix.append(
                         statement_from_string(
                             f"{tma_b_mcast_mask} = cute.nvgpu.cpasync.create_tma_multicast_mask("
                             f"{tcgen05_cluster_layout_vmnk}, {tma_block_in_cluster_coord_vmnk}, "
-                            "mcast_mode=1)"
+                            f"mcast_mode={tma_b_mcast_mode})"
                         )
                     )
             # tma_partition consumes the per-tile gA_part / gB_part, so the
@@ -2205,10 +2545,19 @@ def _emit_mma_pipeline(
                     f"cutlass.pipeline.PipelineUserType.Producer, {tcgen05_ab_stage_count_value})"
                 )
             )
+            tma_consumer_state_init = (
+                f"cutlass.pipeline.PipelineState({tcgen05_ab_stage_count_value}, "
+                "cutlass.Int32(0), cutlass.Int32(0), cutlass.Int32(1))"
+                if diagnose_ab_consumer_phase1
+                else (
+                    "cutlass.pipeline.make_pipeline_state("
+                    "cutlass.pipeline.PipelineUserType.Consumer, "
+                    f"{tcgen05_ab_stage_count_value})"
+                )
+            )
             prefix.append(
                 statement_from_string(
-                    f"{tma_consumer_state} = cutlass.pipeline.make_pipeline_state("
-                    f"cutlass.pipeline.PipelineUserType.Consumer, {tcgen05_ab_stage_count_value})"
+                    f"{tma_consumer_state} = {tma_consumer_state_init}"
                 )
             )
             _emit_tcgen05_tmem_setup()
@@ -2238,8 +2587,10 @@ def _emit_mma_pipeline(
                     tma_sB=tma_sB,
                     tma_a_mcast_mask=tma_a_mcast_mask,
                     tma_b_mcast_mask=tma_b_mcast_mask,
-                    cluster_m=tcgen05_cluster_m,
                     is_two_cta=tcgen05_is_two_cta,
+                    use_tma_b_mcast_mask=tcgen05_use_tma_b_mcast_mask,
+                    skip_producer_acquire=diagnose_skip_ab_producer_acquire,
+                    skip_producer_advance=diagnose_skip_ab_producer_advance,
                 )
                 _emit_per_tile(
                     f"{tma_initial_full_tile} = "
@@ -2252,6 +2603,10 @@ def _emit_mma_pipeline(
                     prefetch_args,
                     full_tile_gates=[tma_initial_full_tile],
                     k_offset="cutlass.Int32(0)",
+                    skip_producer_acquire=(
+                        diagnose_skip_ab_producer_acquire
+                        or diagnose_skip_initial_ab_producer_acquire
+                    ),
                 )
                 prefix.append(stage0_prefetch)
                 per_tile_stmts.append(stage0_prefetch)
@@ -2478,6 +2833,7 @@ def _emit_mma_pipeline(
                 tma_barrier_ptr=tma_barrier_ptr,
                 tma_full_tile=tma_full_tile,
                 tma_next_full_tile=tma_next_full_tile,
+                tma_next_consumer_tile=tma_next_consumer_tile,
                 tma_warp=tma_warp,
                 tma_atom_a=tma_atom_a,
                 tma_atom_b=tma_atom_b,
@@ -2489,10 +2845,13 @@ def _emit_mma_pipeline(
                 tma_a_mcast_mask=tma_a_mcast_mask,
                 tma_b_mcast_mask=tma_b_mcast_mask,
                 ab_stage_count=tcgen05_ab_stage_count_value,
-                cluster_m=tcgen05_cluster_m,
                 is_two_cta=tcgen05_is_two_cta,
+                use_tma_b_mcast_mask=tcgen05_use_tma_b_mcast_mask,
                 use_tma_a=tcgen05_use_tma_a,
                 use_tma_b=tcgen05_use_tma_b,
+                skip_producer_acquire=diagnose_skip_ab_producer_acquire,
+                skip_producer_advance=diagnose_skip_ab_producer_advance,
+                skip_consumer_wait=diagnose_skip_ab_consumer_wait,
                 exec_active=tcgen05_plan.exec_active,
                 scalar_load_a=scalar_load_a,
                 scalar_load_b=scalar_load_b,
@@ -2538,37 +2897,62 @@ def _emit_mma_pipeline(
                         smem_a_mma_stmt,
                         smem_b_mma_stmt,
                         tma_full_tile_stmt,
-                        statement_from_string(
-                            f"{tma_consumer_try_token} = cutlass.Boolean(0)"
-                        ),
+                    ]
+                    if tcgen05_use_role_local_ab_consumer_prefetch:
+                        exec_loop_body.append(
+                            statement_from_string(
+                                f"{tma_next_consumer_tile} = "
+                                f"{k_offset_var} + cutlass.Int32({bk * 2}) <= cutlass.Int32({k_total_size})"
+                            )
+                        )
+                    else:
+                        exec_loop_body.append(
+                            statement_from_string(
+                                f"{tma_consumer_try_token} = cutlass.Boolean(0)"
+                            )
+                        )
+                    exec_loop_body.append(
                         _build_kloop_pipeline_consumer_if(
                             tma_kloop_args,
                             gate_exec_warp=False,
                             include_scalar_fallback=False,
-                        ),
-                        _build_tcgen05_mma_fence_stmt(
-                            tcgen05_plan.exec_active,
-                            gate_exec_warp=False,
-                            is_two_cta=tcgen05_is_two_cta,
-                        ),
-                        _build_tcgen05_mma_issue_stmt(
-                            exec_active=tcgen05_plan.exec_active,
-                            tiled_mma=tiled_mma,
-                            acc_frag=acc_frag,
-                            tcgen05_frag_a=tcgen05_frag_a,
-                            tcgen05_frag_b=tcgen05_frag_b,
-                            mma_stage=mma_stage,
-                            k_offset_var=k_offset_var,
-                            k_loop_begin_expr=k_loop_begin_expr,
-                            gate_exec_warp=False,
-                            is_two_cta=tcgen05_is_two_cta,
-                        ),
+                            use_existing_try_token=tcgen05_use_role_local_ab_consumer_prefetch,
+                        )
+                    )
+                    if not diagnose_skip_umma_issue:
+                        exec_loop_body.extend(
+                            [
+                                _build_tcgen05_mma_fence_stmt(
+                                    tcgen05_plan.exec_active,
+                                    gate_exec_warp=False,
+                                    is_two_cta=tcgen05_is_two_cta,
+                                ),
+                                _build_tcgen05_mma_issue_stmt(
+                                    exec_active=tcgen05_plan.exec_active,
+                                    tiled_mma=tiled_mma,
+                                    acc_frag=acc_frag,
+                                    tcgen05_frag_a=tcgen05_frag_a,
+                                    tcgen05_frag_b=tcgen05_frag_b,
+                                    mma_stage=mma_stage,
+                                    gate_exec_warp=False,
+                                    is_two_cta=tcgen05_is_two_cta,
+                                ),
+                            ]
+                        )
+                    exec_loop_body.append(
                         _build_kloop_pipeline_release_if(
                             tma_kloop_args,
                             gate_exec_warp=False,
                             include_scalar_fallback=False,
-                        ),
-                    ]
+                        )
+                    )
+                    if tcgen05_use_role_local_ab_consumer_prefetch:
+                        exec_loop_body.extend(
+                            _build_kloop_pipeline_consumer_prefetch_stmts(
+                                tma_kloop_args,
+                                gate_exec_warp=False,
+                            )
+                        )
                     exec_loop = _clone_k_loop_with_body(device_loop, exec_loop_body)
                     prefix.append(exec_loop)
                     per_tile_stmts.append(exec_loop)
@@ -2669,25 +3053,24 @@ def _emit_mma_pipeline(
         else:
             assert tcgen05_plan is not None
             if not tcgen05_use_role_local_mma_exec:
-                cg.add_statement(
-                    _build_tcgen05_mma_fence_stmt(
-                        tcgen05_plan.exec_active,
-                        is_two_cta=tcgen05_is_two_cta,
+                if not diagnose_skip_umma_issue:
+                    cg.add_statement(
+                        _build_tcgen05_mma_fence_stmt(
+                            tcgen05_plan.exec_active,
+                            is_two_cta=tcgen05_is_two_cta,
+                        )
                     )
-                )
-                cg.add_statement(
-                    _build_tcgen05_mma_issue_stmt(
-                        exec_active=tcgen05_plan.exec_active,
-                        tiled_mma=tiled_mma,
-                        acc_frag=acc_frag,
-                        tcgen05_frag_a=tcgen05_frag_a,
-                        tcgen05_frag_b=tcgen05_frag_b,
-                        mma_stage=mma_stage,
-                        k_offset_var=k_offset_var,
-                        k_loop_begin_expr=k_loop_begin_expr,
-                        is_two_cta=tcgen05_is_two_cta,
+                    cg.add_statement(
+                        _build_tcgen05_mma_issue_stmt(
+                            exec_active=tcgen05_plan.exec_active,
+                            tiled_mma=tiled_mma,
+                            acc_frag=acc_frag,
+                            tcgen05_frag_a=tcgen05_frag_a,
+                            tcgen05_frag_b=tcgen05_frag_b,
+                            mma_stage=mma_stage,
+                            is_two_cta=tcgen05_is_two_cta,
+                        )
                     )
-                )
                 if tcgen05_use_tma:
                     assert tma_kloop_args is not None
                     if tcgen05_use_tma_pipeline:
@@ -2774,13 +3157,16 @@ def _emit_mma_pipeline(
             per_tile_stmts.append(suffix_stmt)
             if tcgen05_use_role_local_mma_exec:
                 mma_exec_role_stmts.append(suffix_stmt)
-            advance_stmt = statement_from_string(
-                emit_pipeline_advance(tcgen05_plan.acc_producer_state)
-            )
-            suffix.append(advance_stmt)
-            per_tile_stmts.append(advance_stmt)
-            if tcgen05_use_role_local_mma_exec:
-                mma_exec_role_stmts.append(advance_stmt)
+            # Bridge-only invalid-output diagnostic: preserve producer_commit
+            # while removing only the acc producer PipelineState advance edge.
+            if not diagnose_skip_acc_producer_advance:
+                advance_stmt = statement_from_string(
+                    emit_pipeline_advance(tcgen05_plan.acc_producer_state)
+                )
+                suffix.append(advance_stmt)
+                per_tile_stmts.append(advance_stmt)
+                if tcgen05_use_role_local_mma_exec:
+                    mma_exec_role_stmts.append(advance_stmt)
             # The tcgen05 epilogue + allocator teardown is emitted by
             # `_codegen_cute_store_tcgen05_tile` when the kernel stores
             # `out[tile_m, tile_n] = result`. Static-full flat and validated
@@ -2835,6 +3221,7 @@ def _emit_mma_pipeline(
                 use_tma_store_epilogue=tcgen05_use_tma_store_epilogue,
                 ab_stage_count=tcgen05_ab_stage_count_value,
                 acc_stage_count=tcgen05_acc_stage_count_value,
+                skip_ab_producer_advance=diagnose_skip_ab_producer_advance,
             ),
         )
     else:
@@ -2923,6 +3310,22 @@ def _tcgen05_cluster_m(config: object) -> int:
     return max(1, min(2, _tcgen05_config_int(config, "tcgen05_cluster_m", 1)))
 
 
+def _tcgen05_large_bn_proof_enabled(config: object | None) -> bool:
+    return config is not None and (
+        cast("_ConfigLike", config).get(TCGEN05_LARGE_BN_PROOF_CONFIG_KEY, False)
+        is True
+    )
+
+
+def _tcgen05_large_bn_proof_shape(
+    *, bm: int, bn: int, bk: int, tcgen05_cluster_m: int
+) -> bool:
+    return (
+        (bm, bn, bk) == TCGEN05_LARGE_BN_PROOF_BLOCK_SIZES
+        and tcgen05_cluster_m == TCGEN05_LARGE_BN_PROOF_CLUSTER_M
+    )
+
+
 def _tcgen05_use_2cta_instrs(*, bm: int, cluster_m: int) -> bool:
     # Match Quack/CUTLASS SM100: clustered kernels are not automatically the
     # tcgen05 "CTA pair" instruction family. The special 2-CTA instructions only
@@ -2969,14 +3372,21 @@ def _mma_impl_matches_problem_shape(
     bn: int,
     bk: int,
     tcgen05_cluster_m: int = 1,
+    tcgen05_large_bn_proof: bool = False,
 ) -> bool:
     if mma_impl == "universal":
         return True
-    if (
-        input_dtype not in (torch.float16, torch.bfloat16)
-        or bn < 8
-        or bn > 256
-        or bn % 8 != 0
+    if input_dtype not in (torch.float16, torch.bfloat16) or bn < 8 or bn % 8 != 0:
+        return False
+    if bn > 256 and (
+        mma_impl != "tcgen05"
+        or not tcgen05_large_bn_proof
+        or not _tcgen05_large_bn_proof_shape(
+            bm=bm,
+            bn=bn,
+            bk=bk,
+            tcgen05_cluster_m=tcgen05_cluster_m,
+        )
     ):
         return False
     if mma_impl == "warp":
@@ -2986,8 +3396,9 @@ def _mma_impl_matches_problem_shape(
         # tcgen05 mma instruction K is 16 elements for BF16/FP16, but the
         # tile's K can be any positive multiple of that (the inner cute.gemm
         # loop just runs more instructions per K iteration). Larger tile_k
-        # roughly halves the per-K-iter overhead per doubling. Capped at 256
-        # to keep AB SMEM staging budget sane.
+        # roughly halves the per-K-iter overhead per doubling. Production
+        # remains capped at block_n=256 to keep AB SMEM staging budget sane;
+        # the explicit G4 proof key admits only the smallest 512-N candidate.
         if bk < 16 or bk > 256 or bk % 16 != 0:
             return False
         if bm in (64, 128):
@@ -3049,6 +3460,7 @@ def _choose_mma_impl(
     tcgen05_cluster_m = 1
     if config is not None:
         tcgen05_cluster_m = _tcgen05_cluster_m(config)
+    tcgen05_large_bn_proof = _tcgen05_large_bn_proof_enabled(config)
     env_choice = os.environ.get("HELION_CUTE_MMA_IMPL", "auto").strip().lower()
     support = get_cute_mma_support()
     if env_choice != "auto":
@@ -3067,6 +3479,7 @@ def _choose_mma_impl(
             bn=bn,
             bk=bk,
             tcgen05_cluster_m=tcgen05_cluster_m,
+            tcgen05_large_bn_proof=tcgen05_large_bn_proof,
         ):
             return env_choice
         return "universal"
@@ -3077,6 +3490,7 @@ def _choose_mma_impl(
         bn=bn,
         bk=bk,
         tcgen05_cluster_m=tcgen05_cluster_m,
+        tcgen05_large_bn_proof=tcgen05_large_bn_proof,
     ):
         if support.tcgen05_f16bf16:
             return "tcgen05"
