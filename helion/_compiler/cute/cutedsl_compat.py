@@ -31,41 +31,44 @@ def cutedsl_has_opresultlist_fix() -> bool:
 
 
 @lru_cache(maxsize=1)
-def cutedsl_tmem_allocator_has_dealloc_init_kwarg() -> bool:
-    """Detect whether ``cutlass.utils.TmemAllocator.__init__`` accepts the
-    ``dealloc_mbarrier_initialized`` keyword argument.
+def _tmem_allocator_init_signature() -> inspect.Signature | None:
+    """Resolve ``cutlass.utils.TmemAllocator.__init__``'s signature.
 
-    The PyPI ``nvidia-cutlass-dsl==4.5.0.dev0`` wheel unconditionally calls
-    ``self._init_dealloc_mbarrier`` in ``__init__`` whenever ``is_two_cta``
-    is True; newer builds add a ``dealloc_mbarrier_initialized`` flag that
-    short-circuits the init so a second allocator (e.g. one constructed in
-    the epilogue after the matmul prologue already initialized the
-    barrier) doesn't double-init the mbarrier. Helion emits the kwarg in
-    the epilogue path; we omit it on builds without the parameter.
-
-    Returns ``True`` when the kwarg is supported, ``False`` otherwise.
-
-    ``inspect.signature`` doesn't see kwargs that ``@dsl_user_op`` strips
-    from the wrapper, so we resolve the underlying ``__wrapped__`` first
-    and fall back to source scanning.
+    ``@dsl_user_op`` strips kwargs from the public wrapper, so we resolve the
+    underlying ``__wrapped__`` first.
     """
     try:
         from cutlass.utils import TmemAllocator
     except Exception:
-        return True
+        return None
     init = TmemAllocator.__init__
     inner = getattr(init, "__wrapped__", init)
     try:
-        sig = inspect.signature(inner)
+        return inspect.signature(inner)
     except (TypeError, ValueError):
-        sig = None
-    if sig is not None and "dealloc_mbarrier_initialized" in sig.parameters:
-        return True
-    try:
-        src = inspect.getsource(inner)
-    except (OSError, TypeError):
-        return True
-    return "dealloc_mbarrier_initialized" in src
+        return None
+
+
+@lru_cache(maxsize=1)
+def cutedsl_tmem_allocator_skip_dealloc_init_kwarg() -> str | None:
+    """Return the kwarg name (if any) that requests "skip dealloc-mbarrier init"
+    on ``TmemAllocator``, or ``None`` if no such kwarg exists on this build.
+
+    Older PyPI builds (``nvidia-cutlass-dsl==4.5.0.dev0``) had no skip path;
+    intermediate builds added ``dealloc_mbarrier_initialized: bool = False`` —
+    pass ``True`` to skip.  The current 4.5.0 release renamed the flag to
+    ``initialize_mbarrier: bool = True`` — pass ``False`` to skip.
+    Helion needs to skip on the epilogue allocator (the matmul prologue
+    already initialized the barrier).
+    """
+    sig = _tmem_allocator_init_signature()
+    if sig is None:
+        return None
+    if "dealloc_mbarrier_initialized" in sig.parameters:
+        return "dealloc_mbarrier_initialized"
+    if "initialize_mbarrier" in sig.parameters:
+        return "initialize_mbarrier"
+    return None
 
 
 @lru_cache(maxsize=1)
@@ -106,13 +109,19 @@ def cutedsl_tma_umma_tail_has_peer_cta_semantics() -> bool:
 
 
 def emit_dealloc_mbarrier_initialized_kwarg() -> str:
-    """Emit ``dealloc_mbarrier_initialized=True`` (with a leading comma) on
-    cutedsl builds that accept it, else an empty string. Designed to be
-    spliced into a ``TmemAllocator(...)`` argument list as the *last* arg
-    so the comma-prefix is always safe.
+    """Emit a kwarg telling ``TmemAllocator(...)`` to skip dealloc-mbarrier
+    init (because the prologue allocator already initialized it).
+
+    Returns the kwarg with a leading comma so it's safe to splice as the
+    *last* argument; returns ``""`` on builds without any skip kwarg.
+    Handles both spellings: the older ``dealloc_mbarrier_initialized=True``
+    and the newer ``initialize_mbarrier=False``.
     """
-    if cutedsl_tmem_allocator_has_dealloc_init_kwarg():
+    name = cutedsl_tmem_allocator_skip_dealloc_init_kwarg()
+    if name == "dealloc_mbarrier_initialized":
         return ", dealloc_mbarrier_initialized=True"
+    if name == "initialize_mbarrier":
+        return ", initialize_mbarrier=False"
     return ""
 
 

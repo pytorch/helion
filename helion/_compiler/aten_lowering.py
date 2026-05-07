@@ -989,15 +989,7 @@ def codegen_baddbmm(ctx: LoweringContext, node: Node) -> ast.AST:
 
 
 def _pallas_dot(ctx: LoweringContext, node: Node, with_acc: bool) -> ast.AST:
-    """Generate jnp.matmul for Pallas backend.
-
-    Uses ``jnp.matmul`` instead of ``jnp.dot`` for correct batch matmul
-    semantics (``jnp.dot`` on 3D tensors produces 4D output).
-
-    When either operand is sub-32-bit (bf16, f16, fp8, int8), we pass
-    ``preferred_element_type=jnp.float32`` so TPU uses a 32-bit accumulator.
-    If the FX-level output dtype is narrower than f32 we cast back afterwards.
-    """
+    """Generate jnp.dot_general for Pallas backend."""
     if with_acc:
         acc_node_arg, lhs_node_arg, rhs_node_arg = node.args[:3]
         acc, lhs, rhs = map_arg(node.args, lambda arg: _env_arg(ctx, arg))
@@ -1015,6 +1007,7 @@ def _pallas_dot(ctx: LoweringContext, node: Node, with_acc: bool) -> ast.AST:
     assert isinstance(rhs_node_arg, Node)
     lhs_dtype = lhs_node_arg.meta["val"].dtype
     rhs_dtype = rhs_node_arg.meta["val"].dtype
+    lhs_ndim = lhs_node_arg.meta["val"].ndim
     need_f32_acc = _needs_f32_accumulator(lhs_dtype, rhs_dtype)
     out_dtype = node.meta["val"].dtype if "val" in node.meta else None
 
@@ -1024,6 +1017,7 @@ def _pallas_dot(ctx: LoweringContext, node: Node, with_acc: bool) -> ast.AST:
         acc=acc if with_acc else None,
         need_f32_acc=need_f32_acc,
         out_dtype=out_dtype,
+        lhs_ndim=lhs_ndim,
     )
 
 
