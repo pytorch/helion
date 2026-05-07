@@ -813,6 +813,16 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             and plan.k_tile_count <= self._VALIDATED_TWO_CTA_MAX_K_TILES
         )
 
+    def _tcgen05_uses_cluster_m2_one_cta_role_local_bridge(self) -> bool:
+        plan = self._tcgen05_plan()
+        return bool(
+            plan is not None
+            and plan.uses_cluster_m2_one_cta_role_local_bridge
+            and plan.cluster_m == 2
+            and not plan.is_two_cta
+            and plan.uses_role_local_persistent_body
+        )
+
     def _tcgen05_output_tile_dims_expr(self, *, is_device: bool) -> list[str]:
         assert len(self.pid_info) <= 3, (
             "tcgen05 persistent scheduler supports at most 3 PID dimensions"
@@ -888,6 +898,15 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
     def _tcgen05_logical_m_coord_expr(self, coord: str) -> str:
         if self._tcgen05_is_two_cta():
             return f"({coord}) // cutlass.Int32({self._tcgen05_cluster_m()})"
+        if self._tcgen05_uses_cluster_m2_one_cta_role_local_bridge():
+            # The shared clustered scheduler publishes ``base_m + peer_rank``
+            # into each CTA's SMEM slot. The guarded role-local bridge omits
+            # that handoff, so bind each CTA's role-local PID to the same
+            # per-peer M coordinate directly.
+            return (
+                f"({coord}) + "
+                "cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())"
+            )
         return coord
 
     def _tcgen05_linear_virtual_pid_expr(self, work_tile_var: str) -> str:

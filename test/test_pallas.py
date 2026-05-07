@@ -1738,6 +1738,94 @@ class TestPallas(TestCase):
         self.assertIn("pl.ds(", code)
         torch.testing.assert_close(result, x * r)
 
+    def test_no_pipeline_outer_inner_shared_dim(self) -> None:
+        """Don't pipeline a tensor whose dim is shared between outer and inner tiles.
+
+        Regression test: when a kernel reads a tensor at outer scope using
+        an outer block_id (e.g. ``T[tile_m, tile_n]``) and *also* inside an
+        inner emit_pipeline / fori_loop using a different inner block_id on
+        the same dim (e.g. ``T[tile_m, tile_k]``), the kernel needs outer
+        ``pl.ds`` slicing for the shared dim.  Pipelining the tensor turns
+        it into an HBM ref, which can't be sliced with ``pl.ds`` -- the
+        body then either crashes or generates the wrong offset.  The
+        classifier (shared between both inner-loop codegens) must keep
+        such tensors on the outer BlockSpec.
+        """
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            m, n = x.shape
+            out = torch.empty_like(x)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = x[tile_m, tile_n].to(torch.float32)  # outer-scope use of n
+                # inner loop shares x's n dim with the outer tile via a
+                # different block_id -> x's n dim has both tile_n_bid
+                # (outer) and tile_k_bid (inner).
+                for tile_k in hl.tile(n):
+                    acc += x[tile_m, tile_k].to(torch.float32).sum(dim=-1, keepdim=True)
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        x = torch.randn(128, 128, device=DEVICE, dtype=torch.float32)
+        expected = x + x.sum(dim=1, keepdim=True)
+        for loop_type, loop_marker in (
+            ("emit_pipeline", "pltpu.emit_pipeline"),
+            ("fori_loop", "jax.lax.fori_loop"),
+        ):
+            with self.subTest(pallas_loop_type=loop_type):
+                code, result = code_and_output(
+                    fn,
+                    (x,),
+                    block_sizes=[32, 128, 128],
+                    pallas_loop_type=loop_type,
+                )
+                self.assertIn(loop_marker, code)
+                self.assertNotIn("_pipeline_arg_indices=[0", code)
+                torch.testing.assert_close(result, expected)
+
+    def test_no_pipeline_outer_summary_read(self) -> None:
+        """Don't pipeline a tensor that's read at outer scope as a per-row
+        summary, even when no inner block_id appears alongside an outer/grid
+        block_id on any dim of the tensor.
+
+        Outer scope reads ``T[tile_m, :]`` to compute a per-row summary;
+        inner loop reads ``T[tile_m, tile_k]`` for per-tile work.  Pipelining
+        T would replace its outer BlockSpec with HBM, and the outer-scope
+        ``T[tile_m, :]`` load then fails with ``"Loads are only allowed on
+        VMEM and SMEM references."``.  Companion to
+        ``test_no_pipeline_outer_inner_shared_dim`` -- both exercise the
+        outer-scope-access exclusion in ``_classify_pipelined_tensors`` but
+        through different access patterns (this one uses ``:`` on the inner
+        loop's dim; the other uses an outer-grid block_id on it).
+        """
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def fn(T: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+            m, n = x.shape
+            out = torch.empty_like(x)
+            aux = torch.empty([m], dtype=x.dtype, device=x.device)
+            for tile_m in hl.tile(m):
+                # outer-scope read of T -- a per-row summary
+                aux[tile_m] = T[tile_m, :].sum(dim=-1)
+                for tile_k in hl.tile(n):
+                    # inner-scope read of T -- per-tile elementwise work
+                    out[tile_m, tile_k] = T[tile_m, tile_k] * x[tile_m, tile_k]
+            return out
+
+        T = torch.randn(128, 128, device=DEVICE, dtype=torch.float32)
+        x = torch.randn(128, 128, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(
+            fn,
+            (T, x),
+            block_sizes=[128, 128],
+            pallas_loop_type="emit_pipeline",
+        )
+        # T (arg index 0) must NOT be pipelined — its outer-scope load
+        # would otherwise hit HBM after the BlockSpec is replaced.
+        self.assertIn("pltpu.emit_pipeline", code)
+        self.assertNotIn("_pipeline_arg_indices=[0", code)
+        torch.testing.assert_close(result, T * x, rtol=1e-3, atol=1e-3)
+
     def test_fori_loop_per_tensor_dma_mixed(self) -> None:
         """A fori_loop body can mix DMA-aligned and DMA-unaligned tensors.
 

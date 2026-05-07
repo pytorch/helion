@@ -211,6 +211,7 @@ def is_cuda() -> bool:
 
 PROJECT_ROOT: Path = Path(__file__).parent.parent
 EXAMPLES_DIR: Path = PROJECT_ROOT / "examples"
+PRETUNED_KERNELS_DIR: Path = PROJECT_ROOT / "pretuned_kernels"
 DEVICE = None
 
 

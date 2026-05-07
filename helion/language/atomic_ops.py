@@ -1660,3 +1660,17 @@ def _(state: CodegenState) -> ast.AST:
         )
     )
     return expr_from_string(prev_var)
+
+
+ATOMIC_OPS: frozenset[Callable[..., object]] = frozenset(
+    {
+        atomic_add,
+        atomic_and,
+        atomic_cas,
+        atomic_max,
+        atomic_min,
+        atomic_or,
+        atomic_xchg,
+        atomic_xor,
+    }
+)

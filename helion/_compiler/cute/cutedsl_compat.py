@@ -173,6 +173,7 @@ def emit_producer_tail_tma_umma(
     *,
     num_stages: int,
     indent: str = "",
+    skip_advances: bool = False,
 ) -> str:
     """Emit code equivalent to ``<pipeline>.producer_tail(<state>)`` for a
     ``PipelineTmaUmma`` (sm100 TMA→UMMA) pipeline.
@@ -193,7 +194,15 @@ def emit_producer_tail_tma_umma(
 
     ``num_stages`` is a compile-time constant from helion's tcgen05 plan
     (``ab_stage_count`` for the TMA pipeline).
+
+    ``skip_advances`` is only for guarded invalid-output diagnostics that
+    isolate AB producer state rollover. It preserves the tail acquire but
+    removes every state advance, including calls hidden inside upstream
+    ``producer_tail``.
     """
+    if skip_advances:
+        return f"{indent}{pipeline_expr}.producer_acquire({state_expr})"
+
     if (
         cutedsl_has_opresultlist_fix()
         and cutedsl_tma_umma_tail_has_peer_cta_semantics()

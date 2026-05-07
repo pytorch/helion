@@ -234,6 +234,7 @@ class CuteTcgen05StoreValue:
     use_tma_store_epilogue: bool = False
     ab_stage_count: int = 0
     acc_stage_count: int = 0
+    skip_ab_producer_advance: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -270,6 +271,7 @@ class CuteTcgen05MatmulPlan:
     cluster_m: int
     is_two_cta: bool
     uses_role_local_persistent_body: bool
+    uses_cluster_m2_one_cta_role_local_bridge: bool
     cta_thread_count: int
     physical_m_threads: int
     acc_stage_count: int
@@ -1249,8 +1251,8 @@ class DeviceFunction:
 
     def get_tensor_read_write_names(self) -> tuple[set[str], set[str]]:
         """Returns AST names of read and written tensors"""
-        from helion.language import atomic_ops
         from helion.language import memory_ops
+        from helion.language.atomic_ops import ATOMIC_OPS
 
         read_names: set[str] = set()
         write_names: set[str] = set()
@@ -1270,16 +1272,7 @@ class DeviceFunction:
                     read_names.add(_get_tensor_name(node))
                 elif node.target is memory_ops.store:
                     write_names.add(_get_tensor_name(node))
-                elif node.target in (
-                    atomic_ops.atomic_add,
-                    atomic_ops.atomic_cas,
-                    atomic_ops.atomic_or,
-                    atomic_ops.atomic_xor,
-                    atomic_ops.atomic_xchg,
-                    atomic_ops.atomic_min,
-                    atomic_ops.atomic_max,
-                    atomic_ops.atomic_and,
-                ):
+                elif node.target in ATOMIC_OPS:
                     read_names.add(_get_tensor_name(node))
                     write_names.add(_get_tensor_name(node))
         return read_names, write_names
