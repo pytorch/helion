@@ -10,8 +10,8 @@ The **AOT autotuning workflow** addresses both problems.  Offline, you
 sweep a kernel over a representative shape set, tune each shape, then
 distill the (shape → best-config) table into a small **decision-tree
 heuristic**.  At runtime, the heuristic picks a tuned config for the
-caller's shape in microseconds — no autotuner involved.  The tutorials
-under [`tutorials/`](https://github.com/pytorch/helion/tree/main/tutorials)
+caller's shape in microseconds — no autotuner involved.  The pretuned
+kernels under [`pretuned_kernels/`](https://github.com/pytorch/helion/tree/main/pretuned_kernels)
 ship pretuned heuristic files that demonstrate this end-to-end.
 
 This doc covers the user-facing API, the offline workflow, and how the
@@ -223,7 +223,7 @@ target.
 
    ```bash
    # Tutorial example: tune layer_norm on the current GPU.
-   python -m helion.experimental.aot_runner -- python tutorials/layer_norm/layer_norm.py
+   python -m helion.experimental.aot_runner -- python pretuned_kernels/layer_norm/layer_norm.py
 
    # User-authored kernel: same pattern.
    python -m helion.experimental.aot_runner -- python my_benchmark.py
@@ -235,7 +235,7 @@ target.
 
 4. **Locate the emitted heuristic file.**  See *Generated artifacts* —
    the heuristic file lands next to the kernel source (e.g.
-   `tutorials/layer_norm/_helion_aot_layer_norm_cuda_sm90.py`); the
+   `pretuned_kernels/layer_norm/_helion_aot_layer_norm_cuda_sm90.py`); the
    data dir holds disposable intermediates.
 
 5. **Commit the heuristic file.**  Keep the existing pretuned files
@@ -263,5 +263,5 @@ those bounds.
   runtime cache that consumes generated heuristics.
 - [`examples/aot_example.py`](https://github.com/pytorch/helion/blob/main/examples/aot_example.py)
   — runnable end-to-end example.
-- [`tutorials/`](https://github.com/pytorch/helion/tree/main/tutorials)
-  — pretuned tutorial kernels you can use as templates.
+- [`pretuned_kernels/`](https://github.com/pytorch/helion/tree/main/pretuned_kernels)
+  — pretuned kernels you can use as templates.
