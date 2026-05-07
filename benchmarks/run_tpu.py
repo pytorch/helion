@@ -37,6 +37,8 @@ from typing import Callable
 import torch
 from torch import nn
 
+from helion._compile_time import get_total_time as _get_compile_total_time
+from helion._compile_time import reset as _reset_compile_time
 from helion._testing import DEVICE
 from helion._testing import run_example
 
@@ -629,7 +631,10 @@ KERNEL_MAPPINGS: dict[str, KernelMapping] = {
         None,
     ),
     "welford": ("welford", "welford", _welford_baseline, _welford_shapes, None),
-    "attention": (
+    # Renamed from "attention" to "flash_attention" so this kernel shares the
+    # same dashboard row as the GPU `flash_attention` benchmark, which also
+    # measures examples.attention:attention against an SDPA baseline.
+    "flash_attention": (
         "attention",
         "attention",
         torch.nn.functional.scaled_dot_product_attention,
@@ -637,7 +642,10 @@ KERNEL_MAPPINGS: dict[str, KernelMapping] = {
         None,
     ),
     "bmm": ("bmm", "bmm", torch.bmm, _bmm_shapes, None),
-    "matmul": ("matmul", "matmul", torch.matmul, _matmul_shapes, None),
+    # Renamed from "matmul" to "gemm" so this kernel shares the same dashboard
+    # row as the GPU `gemm` benchmark (which uses examples.matmul via
+    # tritonbench's matmul_tritonbench wrapper).
+    "gemm": ("matmul", "matmul", torch.matmul, _matmul_shapes, None),
     "matmul_layernorm": (
         "matmul_layernorm",
         "matmul_layernorm",
@@ -740,7 +748,9 @@ KERNEL_MAPPINGS: dict[str, KernelMapping] = {
         _rms_norm_shapes,
         None,
     ),
-    "rms_norm_bwd": (
+    # Hyphenated key matches the GPU dashboard label (`rms_norm-bwd`) so both
+    # backends share a row.
+    "rms_norm-bwd": (
         "rms_norm",
         "rms_norm_bwd",
         _rms_norm_bwd_baseline,
@@ -773,6 +783,12 @@ class ShapeResult:
     compile_baseline_time_ms: float = 0.0
     speedup: float = 0.0  # Helion vs default torch (kDefault).
     compile_vs_default: float = 0.0  # default-torch / torch.compile (full-graph win).
+    # Helion compile (autotune+codegen) time captured around run_example. Only
+    # populated when HELION_MEASURE_COMPILE_TIME=1 is set in the env (typically
+    # the autotune pass; the cache-hit verification pass leaves this at 0.0
+    # because no recompilation happens). Pass 2 can splice values from pass 1's
+    # JSON via the --compile-time-input flag in main().
+    compile_time_s: float = 0.0
     error: str | None = None
 
 
@@ -916,9 +932,15 @@ def run_kernel_inner(name: str) -> KernelResult:
                             file=sys.stderr,
                         )
 
+                # Reset the helion compile-time tracker so get_total_time()
+                # below reports only what was spent compiling THIS shape's
+                # kernel(s). Returns 0.0 unless HELION_MEASURE_COMPILE_TIME=1
+                # is set in the env (otherwise the tracker is a no-op).
+                _reset_compile_time()
                 timings = run_example(
                     kernel_fn, baselines, args, max_mismatch_pct=max_mismatch_pct
                 )
+                compile_time_s = _get_compile_total_time()
                 kernel_ms = timings.get("helion", 0.0)
                 baseline_ms = timings.get("torch", 0.0)
                 compile_baseline_ms = timings.get("torch_compile", 0.0)
@@ -937,6 +959,7 @@ def run_kernel_inner(name: str) -> KernelResult:
                         compile_baseline_time_ms=compile_baseline_ms,
                         speedup=speedup,
                         compile_vs_default=compile_vs_default,
+                        compile_time_s=compile_time_s,
                     )
                 )
             except Exception as e:
@@ -957,13 +980,23 @@ def run_kernel_inner(name: str) -> KernelResult:
         return KernelResult(name=name, passed=False, error=str(e))
 
 
-def write_results_json(output: str, results: list[KernelResult]) -> None:
+def write_results_json(
+    output: str,
+    results: list[KernelResult],
+    compile_time_input: str | None = None,
+) -> None:
     """Write results in the dashboard-compatible JSON format.
 
     Emits one record per (kernel, metric) with parallel `shape` /
     `benchmark_values` arrays — the same shape benchmarks/run.py produces, so
     .github/dashboard/build_dashboard_data.py can ingest TPU runs alongside
     GPU runs without a dedicated parser.
+
+    `compile_time_input` (optional): path to a prior-pass JSON. When provided,
+    its `helion_compile_time_s` records replace this run's (which are typically
+    0.0 in a HELION_ASSERT_CACHE_HIT verification pass since no recompile
+    happens). This is the splice that lets the autotune pass own compile-time
+    measurement while the verification pass owns latency/accuracy.
     """
     device = "TPU v7"
     records: list[dict[str, Any]] = []
@@ -1035,6 +1068,37 @@ def write_results_json(output: str, results: list[KernelResult]) -> None:
             shapes,
             [sr.compile_vs_default for sr in result.shape_results],
         )
+        add_metric(
+            result.name,
+            "helion_compile_time_s",
+            shapes,
+            [sr.compile_time_s for sr in result.shape_results],
+        )
+
+    # Splice in prior-pass compile times if a side-channel input was given.
+    # We DROP this run's helion_compile_time_s records first because the
+    # cache-hit verification pass produces 0.0 values that would otherwise
+    # mask the autotune-pass measurements.
+    if compile_time_input and os.path.exists(compile_time_input):
+        try:
+            with open(compile_time_input) as f:
+                prior = json.load(f)
+            if isinstance(prior, list):
+                records = [
+                    r
+                    for r in records
+                    if r.get("metric", {}).get("name") != "helion_compile_time_s"
+                ]
+                records.extend(
+                    r
+                    for r in prior
+                    if r.get("metric", {}).get("name") == "helion_compile_time_s"
+                )
+        except (OSError, json.JSONDecodeError) as e:
+            print(
+                f"Warning: could not splice compile times from {compile_time_input}: {e}",
+                file=sys.stderr,
+            )
 
     if os.path.exists(output):
         try:
@@ -1077,6 +1141,17 @@ def main() -> None:
         "--list-kernels",
         action="store_true",
         help="List available kernel names and exit",
+    )
+    parser.add_argument(
+        "--compile-time-input",
+        type=str,
+        default=None,
+        help=(
+            "Path to a prior-pass JSON whose helion_compile_time_s records "
+            "should override this run's. Use this in the cache-hit "
+            "verification pass to splice in compile times from the autotune "
+            "pass (where HELION_MEASURE_COMPILE_TIME=1 was set)."
+        ),
     )
     args = parser.parse_args()
 
@@ -1189,7 +1264,9 @@ def main() -> None:
     print(f"{'=' * width}\n", file=sys.stderr)
 
     if args.output:
-        write_results_json(args.output, results)
+        write_results_json(
+            args.output, results, compile_time_input=args.compile_time_input
+        )
         print(f"Results written to {args.output}", file=sys.stderr)
 
 

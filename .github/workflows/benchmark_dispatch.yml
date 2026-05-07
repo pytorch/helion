@@ -32,7 +32,7 @@ on:
         description: 'Comma-separated list of kernels to benchmark on TPU (examples-based; disjoint from `kernels`). Default is the dashboard-tracked subset; pass an explicit list for ad-hoc full-coverage runs.'
         required: false
         type: string
-        default: "attention,bmm,matmul,welford,softmax,layer_norm,rms_norm,cross_entropy"
+        default: "flash_attention,bmm,gemm,welford,softmax,layer_norm,rms_norm,rms_norm-bwd,cross_entropy"
       env_vars:
         description: 'Environment variables for benchmark runner'
         required: false
