@@ -89,11 +89,100 @@ def _patched_inductor_config() -> contextlib.AbstractContextManager[None]:
     return inductor_config.patch(patch)
 
 
+def _propagate_pallas_matmul_dtypes(graph: torch.fx.Graph) -> None:
+    """On Pallas, mark matmul nodes and their dtype-preserving consumers as f32.
+
+    When a matmul uses an f32 accumulator (bf16 inputs), PyTorch semantics say
+    the output is bf16. But on TPU the accumulator is already f32, and
+    truncating to bf16 only to promote back for softmax ops wastes cycles.
+    This pass marks such nodes so the inductor creates InputBuffers with the
+    correct (f32) dtype, avoiding redundant convert_element_type chains.
+    """
+    from .matmul_utils import _needs_f32_accumulator
+
+    # Targets whose output dtype just follows their input dtype
+    dtype_preserving_targets = {
+        torch.ops.aten.unsqueeze.default,
+        torch.ops.aten.view.default,
+        torch.ops.aten.reshape.default,
+        torch.ops.aten.expand.default,
+        torch.ops.aten.permute.default,
+        torch.ops.aten.slice.Tensor,
+        torch.ops.aten.clone.default,
+    }
+
+    # Targets that are reductions preserving input dtype
+    dtype_preserving_reductions = {
+        torch.ops.aten.amax.default,
+        torch.ops.aten.amin.default,
+        torch.ops.aten.sum.dim_IntList,
+        torch.ops.aten.max.dim,
+        torch.ops.aten.min.dim,
+    }
+
+    matmul_targets = {
+        torch.ops.aten.bmm.default,
+        torch.ops.aten.mm.default,
+    }
+
+    for node in graph.nodes:
+        if node.op != "call_function":
+            continue
+        if node.target not in matmul_targets:
+            continue
+        val = node.meta.get("val")
+        if val is None or not isinstance(val, torch.Tensor):
+            continue
+        if val.dtype.itemsize >= 4:
+            continue
+        # Check if inputs are sub-32-bit (requiring f32 accumulator)
+        lhs_node, rhs_node = node.args[:2]
+        if not isinstance(lhs_node, torch.fx.Node) or not isinstance(
+            rhs_node, torch.fx.Node
+        ):
+            continue
+        lhs_val = lhs_node.meta.get("val")
+        rhs_val = rhs_node.meta.get("val")
+        if lhs_val is None or rhs_val is None:
+            continue
+        if not _needs_f32_accumulator(lhs_val.dtype, rhs_val.dtype):
+            continue
+
+        # Mark this matmul as producing f32
+        node.meta["pallas_actual_dtype"] = torch.float32
+
+        # Propagate to dtype-preserving consumers
+        worklist = list(node.users)
+        while worklist:
+            user = worklist.pop()
+            if user.op != "call_function":
+                continue
+            if "pallas_actual_dtype" in user.meta:
+                continue
+            user_val = user.meta.get("val")
+            if not isinstance(user_val, torch.Tensor):
+                continue
+            # Only propagate if the user's output dtype matches the matmul's
+            # (i.e., it's preserving the "wrong" bf16 dtype)
+            if user_val.dtype != val.dtype:
+                continue
+            if (
+                user.target in dtype_preserving_targets
+                or user.target in dtype_preserving_reductions
+            ):
+                user.meta["pallas_actual_dtype"] = torch.float32
+                worklist.extend(user.users)
+
+
 def prepare_graph_lowerings(graph: torch.fx.Graph) -> None:
     with compile_lock:
+        env = CompileEnvironment.current()
+        if env.backend.name == "pallas":
+            _propagate_pallas_matmul_dtypes(graph)
+
         graph_lowering = GraphLowering(
             _LazyGraphModule({}, graph),
-            shape_env=CompileEnvironment.current().shape_env,
+            shape_env=env.shape_env,
         )
 
         with V.set_graph_handler(graph_lowering):
@@ -168,12 +257,14 @@ def prepare_node_lowering(
             assert isinstance(example, torch.Tensor), (
                 f"Expected Tensor, got {type(example)}: {node.target}"
             )
+            # Use pallas_actual_dtype if set (e.g., matmul with f32 accumulator)
+            effective_dtype = arg.meta.get("pallas_actual_dtype", example.dtype)
             result = TensorBox.create(
                 InputBuffer(
                     name=name,
                     layout=FixedLayout(
                         example.device,
-                        example.dtype,
+                        effective_dtype,
                         [*map(_unpack_symint, example.size())],
                         [*map(_unpack_symint, example.stride())],
                     ),
@@ -845,7 +936,24 @@ class ReductionLowering(InductorLowering):
         # Non-looped reductions compute the value inline; cast now to ensure the
         # result dtype matches torch.* semantics reflected in meta["val"].dtype.
         desired_dtype = node.meta["val"].dtype
-        return CompileEnvironment.current().backend.cast_ast(result_ast, desired_dtype)
+        env2 = CompileEnvironment.current()
+
+        if env2.backend.name == "pallas":
+            # On Pallas, skip the cast when the input was promoted to f32 (e.g.,
+            # matmul with f32 accumulator) — the result is already f32.
+            for inp in node.all_input_nodes:
+                actual = inp.meta.get("pallas_actual_dtype")
+                if actual is not None and actual.itemsize >= desired_dtype.itemsize:
+                    node.meta["pallas_actual_dtype"] = actual
+                    return result_ast
+            # On Pallas, skip no-op casts where the input is already at least as
+            # wide as the desired dtype (reduction preserves input dtype).
+            for inp in node.all_input_nodes:
+                inp_val = inp.meta.get("val")
+                if isinstance(inp_val, torch.Tensor) and inp_val.dtype.itemsize >= desired_dtype.itemsize:
+                    return result_ast
+
+        return env2.backend.cast_ast(result_ast, desired_dtype)
 
     def get_masked_value(self, node: torch.fx.Node) -> float | bool | None:
         # reduction types that preserve zeroness
@@ -1043,6 +1151,12 @@ class GenerateASTFromInductor(DefaultHandler):
         device context during compute-type selection, and to guarantee a visible
         cast in generated code that matches PyTorch's dtype semantics.
         """
+        # On Pallas, skip no-op casts where src and target are the same dtype.
+        # This happens when pallas_actual_dtype promotion makes the inductor's
+        # src_dtype stale (e.g., inductor thinks src is bf16 but it's actually f32).
+        if src_dtype == dtype:
+            x_ast = self._to_ast(x)
+            return self._lift(x_ast)
         cast_expr = self._create_cast_expr(x, dtype)
         return self._lift(cast_expr)
 

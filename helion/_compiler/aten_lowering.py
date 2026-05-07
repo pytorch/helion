@@ -988,6 +988,12 @@ def codegen_baddbmm(ctx: LoweringContext, node: Node) -> ast.AST:
     return reduce_3d_dot(ctx, node, True)
 
 
+def _pallas_node_dtype(node: Node) -> torch.dtype:
+    """Return the effective dtype of a node on Pallas, respecting promotions."""
+    result: torch.dtype = node.meta.get("pallas_actual_dtype", node.meta["val"].dtype)
+    return result
+
+
 def _pallas_dot(ctx: LoweringContext, node: Node, with_acc: bool) -> ast.AST:
     """Generate jnp.dot_general for Pallas backend."""
     if with_acc:
@@ -1005,11 +1011,17 @@ def _pallas_dot(ctx: LoweringContext, node: Node, with_acc: bool) -> ast.AST:
 
     assert isinstance(lhs_node_arg, Node)
     assert isinstance(rhs_node_arg, Node)
-    lhs_dtype = lhs_node_arg.meta["val"].dtype
-    rhs_dtype = rhs_node_arg.meta["val"].dtype
+    lhs_dtype = _pallas_node_dtype(lhs_node_arg)
+    rhs_dtype = _pallas_node_dtype(rhs_node_arg)
     lhs_ndim = lhs_node_arg.meta["val"].ndim
     need_f32_acc = _needs_f32_accumulator(lhs_dtype, rhs_dtype)
     out_dtype = node.meta["val"].dtype if "val" in node.meta else None
+
+    # On Pallas, when we use an f32 accumulator and skip the cast-back,
+    # mark this node as actually producing f32 so downstream ops don't
+    # emit redundant convert_element_type calls.
+    if need_f32_acc and out_dtype is not None and out_dtype.itemsize < 4:
+        node.meta["pallas_actual_dtype"] = torch.float32
 
     return _emit_pallas_matmul(
         lhs,
