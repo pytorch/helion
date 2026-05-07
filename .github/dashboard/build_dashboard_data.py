@@ -82,12 +82,17 @@ def fetch_runs(repo, workflow_name, days):
                 past_cutoff = True
                 break
             if r.get("conclusion") in ("success", "failure", "cancelled"):
+                # Nightly runs are dispatched by benchmark_nightly.yml's cron via
+                # GITHUB_TOKEN, so triggering_actor is "github-actions[bot]".
+                # Manual user dispatches have the user's login.
+                trigger_login = (r.get("triggering_actor") or {}).get("login", "")
                 runs.append({
                     "run_id": str(r["id"]),
                     "sha": r["head_sha"][:8],
                     "full_sha": r["head_sha"],
                     "date": r["created_at"],
                     "branch": r.get("head_branch", "main"),
+                    "is_nightly": trigger_login == "github-actions[bot]",
                 })
         if past_cutoff:
             break
@@ -177,6 +182,7 @@ def build_history_entry(run, metrics, shapes):
         "full_sha": run["full_sha"],
         "date": run["date"],
         "branch": run.get("branch", "main"),
+        "is_nightly": bool(run.get("is_nightly")),
         "helion_speedup_geomean": round(geo_mean(metrics.get("helion_speedup", [])), 4),
         "triton_speedup_geomean": round(geo_mean(metrics.get("triton_speedup", [])), 4),
         "torch_compile_speedup_geomean": round(geo_mean(metrics.get("torch_compile_speedup", [])), 4),
@@ -213,6 +219,11 @@ def build_dashboard_data(cache_dir, runs_meta, existing_data=None, active_platfo
             continue
         key = e["kernel"] + "|" + e.get("platform_short", "")
         existing_summary[key] = e
+        # Back-fill is_nightly on legacy cached history (pre-nightly-tagging):
+        # treat any main-branch run as nightly so historical Overview data
+        # survives the schema bump.
+        for h in e.get("history", []):
+            h.setdefault("is_nightly", h.get("branch") == "main")
         existing_history.setdefault(key, {}).update({h["run_id"]: h for h in e.get("history", [])})
 
     # Parse each run's artifacts if present
@@ -264,22 +275,24 @@ def build_dashboard_data(cache_dir, runs_meta, existing_data=None, active_platfo
     for entry in kernel_index.values():
         entry["history"].sort(key=lambda h: h["date"])
 
-    # Global latest main run_id — used to detect kernels missing from the latest
-    # benchmark (likely CI infra issue vs. actual kernel crash).
-    latest_main_meta = next((r for r in reversed(runs_meta_sorted) if r.get("branch") == "main"), None)
-    latest_main_run_id = latest_main_meta["run_id"] if latest_main_meta else None
+    # Global latest nightly run_id — used to detect kernels missing from the
+    # latest benchmark (likely CI infra issue vs. actual kernel crash).
+    # Manual user dispatches are excluded so the Overview reflects only the
+    # scheduled nightly run.
+    latest_nightly_meta = next((r for r in reversed(runs_meta_sorted) if r.get("is_nightly")), None)
+    latest_nightly_run_id = latest_nightly_meta["run_id"] if latest_nightly_meta else None
 
-    # Build summary (Overview/Speedup tabs) based on main branch only.
-    # Entries with no main branch data are excluded from summary but their
-    # history is still preserved for the Compare tab.
+    # Build summary (Overview/Speedup tabs) from nightly runs only. Manual
+    # user dispatches still appear in entry["history"] for the Compare tab
+    # but never overwrite Overview perf numbers.
     summary = []
     for key, entry in sorted(kernel_index.items()):
-        # Single pass: latest_main is the most recent main entry (used for failure
-        # classification); latest_data/prev_data are the most recent with non-zero
-        # data (used for perf display and deltas).
+        # Single pass over nightly history: latest_main is the most recent
+        # nightly entry (used for failure classification); latest_data/prev_data
+        # are the most recent with non-zero data (used for perf display and deltas).
         latest_main = latest_data = prev_data = None
         for h in reversed(entry["history"]):
-            if h.get("branch") != "main":
+            if not h.get("is_nightly"):
                 continue
             if latest_main is None:
                 latest_main = h
@@ -303,8 +316,8 @@ def build_dashboard_data(cache_dir, runs_meta, existing_data=None, active_platfo
 
         acc_failures = []
         run_failures = []
-        # Kernel absent from the global latest main run → likely CI infra issue.
-        infra_missing = bool(latest_main_run_id) and (not latest_main or latest_main["run_id"] != latest_main_run_id)
+        # Kernel absent from the global latest nightly run → likely CI infra issue.
+        infra_missing = bool(latest_nightly_run_id) and (not latest_main or latest_main["run_id"] != latest_nightly_run_id)
         if not infra_missing and latest_main:
             latest_ps = latest_main.get("per_shape") or {}
             shapes = latest_ps.get("shapes", [])
@@ -323,13 +336,13 @@ def build_dashboard_data(cache_dir, runs_meta, existing_data=None, active_platfo
             if h["run_id"] != keep_run_id:
                 h.pop("per_shape", None)
 
-        # has_main_data flags entries for Overview/Speedup filtering in the UI.
-        # Non-main-only entries still appear in summary so Compare tab can use them.
+        # has_nightly_data flags entries for Overview/Speedup filtering.
+        # Manual-only kernels still appear in summary so Compare tab can use them.
         summary.append({
             "kernel": entry["kernel"],
             "platform": entry["platform"],
             "platform_short": entry["platform_short"],
-            "has_main_data": latest_data is not None,
+            "has_nightly_data": latest_data is not None,
             "status": status,
             "accuracy_failures": acc_failures,
             "run_failures": run_failures,
@@ -346,16 +359,16 @@ def build_dashboard_data(cache_dir, runs_meta, existing_data=None, active_platfo
             "history": entry["history"],
         })
 
-    # Stats and platform/kernel lists reflect only entries with main branch data
-    main_summary = [s for s in summary if s["has_main_data"]]
-    platforms = sorted({s["platform"] for s in main_summary})
-    platform_shorts = sorted({s["platform_short"] for s in main_summary})
-    unique_kernels = sorted({s["kernel"] for s in main_summary})
-    improved = sum(1 for s in main_summary if s["status"] == "improved")
-    regressed = sum(1 for s in main_summary if s["status"] == "regressed")
+    # Stats and platform/kernel lists reflect only entries with nightly data
+    nightly_summary = [s for s in summary if s["has_nightly_data"]]
+    platforms = sorted({s["platform"] for s in nightly_summary})
+    platform_shorts = sorted({s["platform_short"] for s in nightly_summary})
+    unique_kernels = sorted({s["kernel"] for s in nightly_summary})
+    improved = sum(1 for s in nightly_summary if s["status"] == "improved")
+    regressed = sum(1 for s in nightly_summary if s["status"] == "regressed")
 
-    main_runs = [r for r in runs_meta_sorted if r.get("branch") == "main"]
-    latest_main_run = main_runs[-1] if main_runs else {}
+    nightly_runs = [r for r in runs_meta_sorted if r.get("is_nightly")]
+    latest_nightly_run = nightly_runs[-1] if nightly_runs else {}
 
     # Drop runs whose artifacts expired and weren't previously cached; otherwise
     # they pad charts with no-data gaps.
@@ -363,25 +376,25 @@ def build_dashboard_data(cache_dir, runs_meta, existing_data=None, active_platfo
 
     return {
         "generated_at": runs[-1]["date"] if runs else "",
-        "latest_run": latest_main_run,
+        "latest_run": latest_nightly_run,
         "runs": [{k: v for k, v in r.items() if k != "kernels"} for r in output_runs],
         "platforms": platforms,
         "platform_shorts": platform_shorts,
         "unique_kernels": unique_kernels,
         "stats": {
             "total_kernels": len(unique_kernels),
-            "total_combos": len(main_summary),
+            "total_combos": len(nightly_summary),
             "num_platforms": len(platforms),
             "improved_count": improved,
             "regressed_count": regressed,
-            "unchanged_count": len(main_summary) - improved - regressed,
-            "accuracy_failures": sum(len(s["accuracy_failures"]) for s in main_summary),
-            "run_failures": sum(len(s["run_failures"]) for s in main_summary),
-            "infra_missing": sum(1 for s in main_summary if s["infra_missing"]),
-            "helion_geomean": round(geo_mean([s["helion_speedup_geomean"] for s in main_summary]), 4),
-            "triton_geomean": round(geo_mean([s["triton_speedup_geomean"] for s in main_summary]), 4),
-            "torch_compile_geomean": round(geo_mean([s["torch_compile_speedup_geomean"] for s in main_summary]), 4),
-            "helion_wins": sum(1 for s in main_summary if s["helion_speedup_geomean"] > max(s["triton_speedup_geomean"], s["torch_compile_speedup_geomean"])),
+            "unchanged_count": len(nightly_summary) - improved - regressed,
+            "accuracy_failures": sum(len(s["accuracy_failures"]) for s in nightly_summary),
+            "run_failures": sum(len(s["run_failures"]) for s in nightly_summary),
+            "infra_missing": sum(1 for s in nightly_summary if s["infra_missing"]),
+            "helion_geomean": round(geo_mean([s["helion_speedup_geomean"] for s in nightly_summary]), 4),
+            "triton_geomean": round(geo_mean([s["triton_speedup_geomean"] for s in nightly_summary]), 4),
+            "torch_compile_geomean": round(geo_mean([s["torch_compile_speedup_geomean"] for s in nightly_summary]), 4),
+            "helion_wins": sum(1 for s in nightly_summary if s["helion_speedup_geomean"] > max(s["triton_speedup_geomean"], s["torch_compile_speedup_geomean"])),
         },
         "summary": summary,
     }
