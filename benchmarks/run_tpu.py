@@ -48,6 +48,31 @@ if TYPE_CHECKING:
 EXAMPLES_DIR = Path(__file__).parent.parent / "examples"
 
 
+def _wrap_first_call_compile_time(
+    fn: Callable[..., Any], holder: list[float]
+) -> Callable[..., Any]:
+    """Wrap `fn` so the helion compile-time tracker is reset+read around the
+    FIRST invocation only, mirroring benchmarks/run.py's timed_callable. The
+    captured compile time is appended to `holder` once.
+
+    Subsequent calls bypass the tracker, so per-iteration `Kernel.bind` cache
+    lookups during the bench loop don't accumulate into the reported value.
+    """
+    state = {"first": True}
+
+    def wrapper(*args: object) -> object:
+        if state["first"]:
+            state["first"] = False
+            _reset_compile_time()
+            try:
+                return fn(*args)
+            finally:
+                holder.append(_get_compile_total_time())
+        return fn(*args)
+
+    return wrapper
+
+
 # Shape generators for multi-shape benchmarking.
 # Each returns a list of (label, args_tuple) pairs.
 def _exp_shapes(num_shapes: int | None = None) -> list[tuple[str, tuple[Any, ...]]]:
@@ -932,15 +957,23 @@ def run_kernel_inner(name: str) -> KernelResult:
                             file=sys.stderr,
                         )
 
-                # Reset the helion compile-time tracker so get_total_time()
-                # below reports only what was spent compiling THIS shape's
-                # kernel(s). Returns 0.0 unless HELION_MEASURE_COMPILE_TIME=1
-                # is set in the env (otherwise the tracker is a no-op).
-                _reset_compile_time()
+                # Wrap kernel_fn so the helion compile-time tracker is reset
+                # and read around the FIRST kernel invocation only — matching
+                # benchmarks/run.py's `timed_callable` shape. Without this
+                # gating, the tracker would also accumulate per-iteration
+                # `Kernel.bind` cache-hit time across run_example's warmup
+                # and bench loop, slightly inflating the reported value.
+                # Returns 0.0 unless HELION_MEASURE_COMPILE_TIME=1 is set
+                # (then the tracker is a no-op anyway).
+                ct_holder: list[float] = []
+                kernel_fn_timed = _wrap_first_call_compile_time(kernel_fn, ct_holder)
                 timings = run_example(
-                    kernel_fn, baselines, args, max_mismatch_pct=max_mismatch_pct
+                    kernel_fn_timed,
+                    baselines,
+                    args,
+                    max_mismatch_pct=max_mismatch_pct,
                 )
-                compile_time_s = _get_compile_total_time()
+                compile_time_s = ct_holder[0] if ct_holder else 0.0
                 kernel_ms = timings.get("helion", 0.0)
                 baseline_ms = timings.get("torch", 0.0)
                 compile_baseline_ms = timings.get("torch_compile", 0.0)
