@@ -200,6 +200,9 @@ class CompileEnvironment:
             self.config_spec.max_num_sm_multiplier = newmax
 
         self.has_barrier: bool = False
+        # Host names of ``hl.atomic_*`` first-arg targets; written by atomic
+        # codegen, read by the Pallas launcher prep.
+        self.atomic_target_host_names: set[str] = set()
 
     def specialize_expr(self, expr: sympy.Expr) -> sympy.Expr:
         """Substitute any specialized vars with their concrete values."""
