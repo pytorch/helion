@@ -36,6 +36,6 @@ jobs:
                 run_b200: 'false',
                 run_mi350x: 'false',
                 run_tpu: 'true',
-                kernels_tpu: 'exp,add,softmax_two_pass,welford,attention,bmm,matmul,matmul_layernorm,cross_entropy,embedding,broadcast_matmul,geglu,low_mem_dropout,swiglu,batch_softmax,sum,rms_norm,layer_norm,softmax,long_sum_naive,long_sum_loop,long_sum_manual,se_block,squeeze_and_excitation_net,rms_norm_bwd',
+                kernels_tpu: 'exp,add,softmax_two_pass,welford,flash_attention,bmm,gemm,matmul_layernorm,cross_entropy,embedding,broadcast_matmul,geglu,low_mem_dropout,swiglu,batch_softmax,sum,rms_norm,layer_norm,softmax,long_sum_naive,long_sum_loop,long_sum_manual,se_block,squeeze_and_excitation_net,rms_norm-bwd',
               },
             })
