@@ -211,14 +211,12 @@ class ReductionStrategy(TileStrategy):
                     return True
         return False
 
-    def _cute_reduction_needs_loop_carried_accumulator(self) -> bool:
-        """Return True when, on the cute backend, the surrounding loop
-        nest must perform the reduction via loop-carried accumulation
-        instead of a warp-level reduction across threads.
+    def _needs_loop_carried_accumulator(self) -> bool:
+        """Return True when the surrounding loop nest must perform the
+        reduction via loop-carried accumulation instead of a warp-level
+        reduction across threads.
 
-        This consolidates the three "no live thread axis" conditions
-        previously checked separately in
-        :meth:`BlockReductionStrategy.codegen_reduction`:
+        This consolidates the three "no live thread axis" conditions:
 
         * :meth:`_reduction_block_is_serial` — the block is iterated by
           a serial ``DeviceLoopState`` rather than a thread axis;
@@ -231,10 +229,10 @@ class ReductionStrategy(TileStrategy):
         thread axis to reduce across, so the surrounding loop must
         accumulate the partial values across iterations.
 
-        Always returns False for non-cute backends (Triton / Pallas /
-        TileIR all use their native warp / lane reductions).
+        Always returns False for tile-level backends (Triton / Pallas /
+        TileIR) which use their native reduction primitives.
         """
-        if CompileEnvironment.current().backend.name != "cute":
+        if CompileEnvironment.current().backend.max_reduction_threads() is None:
             return False
         return (
             self._reduction_block_is_serial()
@@ -420,24 +418,22 @@ class PersistentReductionStrategy(ReductionStrategy):
             isinstance(graph, ReductionLoopGraphInfo) and block_index in graph.block_ids
             for graph in fn.codegen.codegen_graphs
         )
-        if (
-            env.backend.name == "cute"
-            and not is_graph_reduction_dim
-            and self._thread_count > 0
-        ):
+        if not is_graph_reduction_dim and self._thread_count > 0:
             if isinstance(numel, (int, sympy.Integer)):
                 size_hint = int(numel)
             elif isinstance(numel, sympy.Expr):
                 size_hint = shape_env_size_hint(env.shape_env, numel)
             else:
                 size_hint = env.size_hint(numel)
-            padded_size = next_power_of_2(max(1, size_hint))
-            if padded_size > self._thread_count:
+            lane_extent = env.backend.create_synthetic_reduction_lanes(
+                self._thread_count, size_hint
+            )
+            if lane_extent is not None:
                 self._synthetic_cute_lane_var = fn.new_var(
                     f"synthetic_lane_{block_index}",
                     dce=False,
                 )
-                self._synthetic_cute_lane_extent = padded_size // self._thread_count
+                self._synthetic_cute_lane_extent = lane_extent
 
     def _reduction_thread_count(self) -> int:
         return self._thread_count
@@ -1382,7 +1378,7 @@ class BlockReductionStrategy(ReductionStrategy):
             )
         ) is not None:
             expr = strided_expr
-        elif self._cute_reduction_needs_loop_carried_accumulator():
+        elif self._needs_loop_carried_accumulator():
             # The reduction block is not backed by a live thread axis in the
             # active loop nest (it is iterated either by a serial device
             # loop, by a synthetic lane loop, or has no thread axis at
