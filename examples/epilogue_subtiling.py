@@ -40,7 +40,7 @@ def matmul_bias_residual_gelu_cast(
 ) -> torch.Tensor:
     m, k = x.size()
     _, n = w.size()
-    out = torch.empty([m, n], dtype=torch.float16, device=x.device)
+    out = torch.empty([m, n], dtype=HALF_DTYPE, device=x.device)
 
     for tile_m, tile_n in hl.tile([m, n]):
         acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
@@ -51,7 +51,7 @@ def matmul_bias_residual_gelu_cast(
         val = val + residual[tile_m, tile_n].to(torch.float32) * 0.5
         val = val + bias[tile_n]
         val = torch.nn.functional.gelu(val)
-        out[tile_m, tile_n] = val.to(torch.float16)
+        out[tile_m, tile_n] = val.to(HALF_DTYPE)
 
     return out
 
@@ -72,8 +72,8 @@ def matmul_bias_gelu_aux(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     m, k = x.size()
     _, n = w.size()
-    out = torch.empty([m, n], dtype=torch.float16, device=x.device)
-    aux = torch.empty([m, n], dtype=torch.float16, device=x.device)
+    out = torch.empty([m, n], dtype=HALF_DTYPE, device=x.device)
+    aux = torch.empty([m, n], dtype=HALF_DTYPE, device=x.device)
 
     for tile_m, tile_n in hl.tile([m, n]):
         acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
@@ -82,8 +82,8 @@ def matmul_bias_gelu_aux(
 
         pre = acc * 1.25
         pre = pre + bias[tile_n]
-        aux[tile_m, tile_n] = pre.to(torch.float16)
-        out[tile_m, tile_n] = torch.nn.functional.gelu(pre).to(torch.float16)
+        aux[tile_m, tile_n] = pre.to(HALF_DTYPE)
+        out[tile_m, tile_n] = torch.nn.functional.gelu(pre).to(HALF_DTYPE)
 
     return out, aux
 
@@ -108,7 +108,7 @@ def check(m: int, k: int, n: int) -> None:
     ) -> torch.Tensor:
         acc = x.float() @ w.float()
         val = acc * 1.25 + residual.float() * 0.5 + bias.float()
-        return torch.nn.functional.gelu(val).half()
+        return torch.nn.functional.gelu(val).to(HALF_DTYPE)
 
     run_example(
         matmul_bias_residual_gelu_cast,
@@ -123,7 +123,7 @@ def check(m: int, k: int, n: int) -> None:
     ) -> tuple[torch.Tensor, torch.Tensor]:
         acc = x.float() @ w.float()
         pre = acc * 1.25 + bias.float()
-        return torch.nn.functional.gelu(pre).half(), pre.half()
+        return torch.nn.functional.gelu(pre).to(HALF_DTYPE), pre.to(HALF_DTYPE)
 
     run_example(
         matmul_bias_gelu_aux,
