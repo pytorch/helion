@@ -937,6 +937,10 @@ def run_kernel_inner(name: str) -> KernelResult:
 
         for label, args in shapes:
             print(f"  Shape {label}:", file=sys.stderr)
+            # Hoist outside the try so the except path can read whatever the
+            # first-call wrapper captured (e.g. accuracy mismatch raised after
+            # autotune+codegen completed) instead of falling back to 0.0.
+            ct_holder: list[float] = []
             try:
                 # Reset every Helion kernel in `mod` so this shape autotunes
                 # cold. Mirrors benchmarks/run.py:1273-1287. Without it, a
@@ -981,7 +985,6 @@ def run_kernel_inner(name: str) -> KernelResult:
                 # and bench loop, slightly inflating the reported value.
                 # Returns 0.0 unless HELION_MEASURE_COMPILE_TIME=1 is set
                 # (then the tracker is a no-op anyway).
-                ct_holder: list[float] = []
                 kernel_fn_timed = _wrap_first_call_compile_time(kernel_fn, ct_holder)
                 timings = run_example(
                     kernel_fn_timed,
@@ -1013,8 +1016,17 @@ def run_kernel_inner(name: str) -> KernelResult:
                 )
             except Exception as e:
                 print(f"    FAIL: {e}", file=sys.stderr)
+                # If the first-call wrapper had time to capture before raising
+                # (autotune+codegen finished, but e.g. accuracy check failed),
+                # preserve that value. Otherwise it stays 0.0 and write_results_json
+                # only emits helion_compile_time_s if HELION_MEASURE_COMPILE_TIME=1.
                 shape_results.append(
-                    ShapeResult(shape=label, passed=False, error=str(e))
+                    ShapeResult(
+                        shape=label,
+                        passed=False,
+                        error=str(e),
+                        compile_time_s=ct_holder[0] if ct_holder else 0.0,
+                    )
                 )
                 all_passed = False
 
