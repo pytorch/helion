@@ -1000,6 +1000,10 @@ def write_results_json(
     """
     device = "TPU v7"
     records: list[dict[str, Any]] = []
+    # helion._compile_time is a no-op unless HELION_MEASURE_COMPILE_TIME=1 is
+    # set. Read the env directly here rather than introspecting the tracker —
+    # makes the gate self-contained and explicit.
+    compile_time_measured = os.environ.get("HELION_MEASURE_COMPILE_TIME", "0") == "1"
 
     def add_metric(
         kernel: str, metric_name: str, shapes: list[str], values: list[float]
@@ -1068,12 +1072,19 @@ def write_results_json(
             shapes,
             [sr.compile_vs_default for sr in result.shape_results],
         )
-        add_metric(
-            result.name,
-            "helion_compile_time_s",
-            shapes,
-            [sr.compile_time_s for sr in result.shape_results],
-        )
+        # Only emit helion_compile_time_s when timing was actually captured
+        # (HELION_MEASURE_COMPILE_TIME=1) or will be spliced in from a prior
+        # pass (--compile-time-input). Otherwise this run's compile_time_s
+        # values are all 0.0 and would render on the dashboard as a real
+        # "0s compile time" rather than absent data — misleading for ad-hoc
+        # local runs that don't enable timing.
+        if compile_time_measured or compile_time_input:
+            add_metric(
+                result.name,
+                "helion_compile_time_s",
+                shapes,
+                [sr.compile_time_s for sr in result.shape_results],
+            )
 
     # Splice in prior-pass compile times if a side-channel input was given.
     # We DROP this run's helion_compile_time_s records first because the
