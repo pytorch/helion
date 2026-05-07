@@ -70,6 +70,7 @@ from helion.autotuner.random_search import RandomSearch
 import helion.language as hl
 from helion.language import loops
 from helion.runtime.settings import Settings
+from helion.runtime.settings import _get_backend
 
 datadir = Path(__file__).parent / "data"
 basic_kernels = import_path(datadir / "basic_kernels.py")
@@ -2601,7 +2602,7 @@ class TestAutotuneRandomSeed(RefEagerTestDisabled, TestCase):
         self.assertNotEqual(first, second)
 
 
-@onlyBackends(["triton"])
+@onlyBackends(["triton", "cute"])
 class TestAutotuneCacheSelection(TestCase):
     """Selection of the autotune cache via HELION_AUTOTUNE_CACHE."""
 
@@ -2656,9 +2657,19 @@ class TestAutotuneCacheSelection(TestCase):
                     bound.settings.autotuner_fn(bound, args)
 
 
-@onlyBackends(["triton"])
+@onlyBackends(["triton", "cute"])
 class TestAutotuneSeedConfigs(TestCase):
     """Tests for seeding initial autotune populations with user configs."""
+
+    def _seed_config(self) -> helion.Config:
+        if _get_backend() == "cute":
+            return helion.Config(num_threads=[32])
+        return helion.Config(num_warps=8)
+
+    def _has_seed_config(self, configs: list[helion.Config]) -> bool:
+        if _get_backend() == "cute":
+            return any(config.num_threads == [32] for config in configs)
+        return any(config.num_warps == 8 for config in configs)
 
     def _make_kernel_and_args(self, **kernel_kwargs):
         @helion.kernel(autotune_log_level=0, **kernel_kwargs)
@@ -2681,14 +2692,14 @@ class TestAutotuneSeedConfigs(TestCase):
         ]
 
     def test_decorator_accepts_single_seed_config(self) -> None:
-        seed_config = helion.Config(block_sizes=[16], num_warps=8)
+        seed_config = self._seed_config()
         add, _args = self._make_kernel_and_args(autotune_seed_configs=seed_config)
 
         self.assertEqual(add.settings.autotune_seed_configs, seed_config)
         self.assertEqual(add.configs, [])
 
     def test_random_initial_population_includes_seed_configs(self) -> None:
-        seed_config = helion.Config(num_warps=8)
+        seed_config = self._seed_config()
         add, args = self._make_kernel_and_args(autotune_seed_configs=[seed_config])
         bound = add.bind(args)
         search = PatternSearch(bound, args, initial_population=3)
@@ -2696,10 +2707,10 @@ class TestAutotuneSeedConfigs(TestCase):
         configs = self._population_configs(search)
 
         self.assertGreaterEqual(len(configs), 3)
-        self.assertTrue(any(config.num_warps == 8 for config in configs))
+        self.assertTrue(self._has_seed_config(configs))
 
     def test_best_available_initial_population_includes_seed_configs(self) -> None:
-        seed_config = helion.Config(num_warps=8)
+        seed_config = self._seed_config()
         add, args = self._make_kernel_and_args(autotune_seed_configs=[seed_config])
         bound = add.bind(args)
         search = PatternSearch(
@@ -2712,7 +2723,7 @@ class TestAutotuneSeedConfigs(TestCase):
             configs = self._population_configs(search)
 
         self.assertGreaterEqual(len(configs), 2)
-        self.assertTrue(any(config.num_warps == 8 for config in configs))
+        self.assertTrue(self._has_seed_config(configs))
 
     def test_random_initial_population_logs_invalid_seed_configs(self) -> None:
         seed_config = helion.Config.from_dict({"block_sizes": ["bad"]})
@@ -3007,7 +3018,7 @@ class TestFiniteSearchWarmStart(TestCase):
         self.assertIs(bound.settings.autotuner_fn, fn)
 
 
-@onlyBackends(["triton"])
+@onlyBackends(["triton", "cute"])
 class TestAutotuneBudget(TestCase):
     def _make_search(self, settings: Settings) -> BaseSearch:
         search = BaseSearch.__new__(BaseSearch)
