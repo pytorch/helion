@@ -18,11 +18,21 @@ on:
         required: false
         type: boolean
         default: false
+      run_tpu:
+        description: 'Run benchmark on TPU v7'
+        required: false
+        type: boolean
+        default: false
       kernels:
-        description: 'Comma-separated list of kernels to benchmark'
+        description: 'Comma-separated list of kernels to benchmark on GPU runners'
         required: false
         type: string
         default: "softmax,jsd,welford,kl_div,int4_gemm,layer_norm,layer_norm-bwd,rms_norm,rms_norm-bwd,cross_entropy,flash_attention,gemm,grouped_gemm"
+      kernels_tpu:
+        description: 'Comma-separated list of kernels to benchmark on TPU (examples-based; disjoint from `kernels`). Default is the dashboard-tracked subset; pass an explicit list for ad-hoc full-coverage runs.'
+        required: false
+        type: string
+        default: "attention,bmm,matmul,welford,softmax,layer_norm,rms_norm,cross_entropy"
       env_vars:
         description: 'Environment variables for benchmark runner'
         required: false
@@ -116,9 +126,18 @@ jobs:
       env-vars: ${{ github.event.inputs.env_vars }}
       custom-args: ${{ github.event.inputs.custom_args }}
 
+  run-tpu:
+    if: ${{ github.event.inputs.run_tpu == 'true' }}
+    uses: ./.github/workflows/benchmark_tpu.yml
+    permissions:
+      contents: read
+    with:
+      alias: tpu
+      kernels: ${{ github.event.inputs.kernels_tpu }}
+
   trigger-docs-deploy:
     if: always()
-    needs: [run-b200, run-h100, run-mi350x]
+    needs: [run-b200, run-h100, run-mi350x, run-tpu]
     runs-on: ubuntu-latest
     permissions:
       actions: write

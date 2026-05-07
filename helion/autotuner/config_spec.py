@@ -1344,6 +1344,8 @@ class ConfigSpec:
                 # is set, to avoid wasted autotuning effort. See PR #1969 review discussion.
                 choices = ("fori_loop", "emit_pipeline")
             fields["pallas_loop_type"] = EnumFragment(choices=choices)
+            if self.supports_config_key("pallas_pre_broadcast"):
+                fields["pallas_pre_broadcast"] = BooleanFragment()
         # Only include maxnreg on CUDA devices (not supported on AMD and Intel GPU)
         if self.supports_config_key("maxnreg") and supports_maxnreg():
             fields["maxnreg"] = EnumFragment(VALID_MAXNREG)

@@ -225,22 +225,10 @@ def _has_mtia_runtime() -> bool:
         return False
 
 
-def _init_tpu_device() -> bool:
-    """Try to initialize the TPU device. Returns True if successful."""
-    try:
-        import torch_tpu.api  # type: ignore[import-not-found]
-
-        torch_tpu.api.tpu_device()
-        return True
-    except (ImportError, RuntimeError):
-        return False
-
-
 # Determine DEVICE without calling functions that initialize CUDA.
 if _get_backend() == "pallas" and is_pallas_interpret():
     DEVICE = torch.device("cpu")
 elif _get_backend() == "pallas":
-    _init_tpu_device()
     DEVICE = torch.device("tpu")
 elif torch.xpu.is_available():
     DEVICE = torch.device("xpu")
@@ -1081,8 +1069,11 @@ def run_example(
     trace_path: str | None = None,
     process_group_name: str | None = None,
     interleaved: bool = True,
-) -> None:
+) -> dict[str, float]:
     """Run complete example: correctness check + benchmark.
+
+    Returns:
+        Dictionary mapping implementation names to their benchmark times in ms.
 
     Args:
         kernel_fn: Single kernel function, or dict of {name: function} for multiple kernel variants
@@ -1273,6 +1264,8 @@ def run_example(
             print(f"{name:<20} {time:<12.4f} {speedup_str:<15}", file=sys.stderr)
 
         print(f"{'=' * 65}\n", file=sys.stderr)
+
+    return all_times
 
 
 def _assert_example_result_close(
