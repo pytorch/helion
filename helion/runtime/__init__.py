@@ -508,6 +508,7 @@ def _pallas_prepare_args(
     dict[int, int],
     set[int],
     tuple[object, ...],
+    dict[int, int],
 ]:
     """Extract and organize tensor/non-tensor args for Pallas launchers.
 
@@ -549,6 +550,12 @@ def _pallas_prepare_args(
     inplace_positions = output_set & set(tensor_arg_indices)
     out_shapes = tuple(placeholder_fn(args[i]) for i in _output_indices)  # type: ignore[arg-type]
 
+    pallas_aliases = {
+        arg_to_tensor_pos[orig_pos]: out_idx
+        for out_idx, orig_pos in enumerate(_output_indices)
+        if orig_pos in arg_to_tensor_pos
+    }
+
     return (
         tensor_arg_indices,
         output_only_indices,
@@ -557,6 +564,7 @@ def _pallas_prepare_args(
         arg_to_tensor_pos,
         inplace_positions,
         out_shapes,
+        pallas_aliases,
     )
 
 
@@ -619,6 +627,7 @@ def _pallas_build_callable(
     arg_to_tensor_pos: dict[int, int],
     tensor_arg_indices: list[int],
     cache_attr: str,
+    call_aliases: dict[int, int],
     trace_key_suffix: str = "",
 ) -> object:
     """Build a ``JaxCallable``, cache it on the kernel, and return it.
@@ -654,10 +663,6 @@ def _pallas_build_callable(
 
     kernel_name = getattr(pallas_kernel, "__name__", "pallas_kernel")
 
-    call_aliases: dict[int, int] = {}
-    for out_idx, orig_pos in enumerate(_output_indices):
-        if orig_pos in arg_to_tensor_pos:
-            call_aliases[arg_to_tensor_pos[orig_pos]] = out_idx
     jax.config.update("jax_export_ignore_forward_compatibility", True)
     jax_callable = JaxCallable(
         name=kernel_name,
@@ -922,6 +927,7 @@ def default_pallas_launcher(
             arg_to_tensor_pos,
             inplace_positions,
             out_shapes,
+            pallas_aliases,
         ) = _pallas_prepare_args(args, _output_indices, _inplace_indices)
 
         in_specs, out_specs = _pallas_build_block_specs(
@@ -951,12 +957,6 @@ def default_pallas_launcher(
 
         out_shape_arg = out_shapes if len(out_shapes) > 1 else out_shapes[0]
 
-        pallas_aliases = {
-            arg_to_tensor_pos[orig_pos]: out_idx
-            for out_idx, orig_pos in enumerate(_output_indices)
-            if orig_pos in arg_to_tensor_pos
-        }
-
         estimated_vmem = _estimate_pallas_vmem_bytes(
             pl,
             pltpu,
@@ -977,7 +977,6 @@ def default_pallas_launcher(
 
         pallas_call_kwargs: dict[str, object] = {
             "out_shape": out_shape_arg,
-            "input_output_aliases": pallas_aliases,
             "grid": grid,
         }
         if _pallas_interpret_flag():
@@ -999,6 +998,7 @@ def default_pallas_launcher(
             arg_to_tensor_pos,
             tensor_arg_indices,
             cache_attr="_pallas_cache",
+            call_aliases=pallas_aliases,
         )
 
     return _pallas_invoke_and_return(
@@ -1060,6 +1060,7 @@ def default_pallas_pipeline_launcher(
             arg_to_tensor_pos,
             inplace_positions,
             out_shapes,
+            pallas_aliases,
         ) = _pallas_prepare_args(args, _output_indices, _inplace_indices)
 
         # Build scratch shapes for VMEM
@@ -1113,12 +1114,6 @@ def default_pallas_pipeline_launcher(
 
         out_shape_arg = out_shapes if len(out_shapes) > 1 else out_shapes[0]
 
-        pallas_aliases = {
-            arg_to_tensor_pos[orig_pos]: out_idx
-            for out_idx, orig_pos in enumerate(_output_indices)
-            if orig_pos in arg_to_tensor_pos
-        }
-
         grid_spec = pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=0,
             in_specs=in_specs_list,
@@ -1147,7 +1142,6 @@ def default_pallas_pipeline_launcher(
 
         pallas_call_kwargs: dict[str, object] = {
             "out_shape": out_shape_arg,
-            "input_output_aliases": pallas_aliases,
             "grid_spec": grid_spec,
             "compiler_params": pltpu.CompilerParams(  # pyrefly: ignore[bad-instantiation]
                 dimension_semantics=tuple("parallel" for _ in grid),
@@ -1169,6 +1163,7 @@ def default_pallas_pipeline_launcher(
             arg_to_tensor_pos,
             tensor_arg_indices,
             cache_attr="_pallas_pipeline_cache",
+            call_aliases=pallas_aliases,
             trace_key_suffix="_pipeline",
         )
 
@@ -1232,6 +1227,7 @@ def default_pallas_fori_launcher(
             arg_to_tensor_pos,
             inplace_positions,
             out_shapes,
+            pallas_aliases,
         ) = _pallas_prepare_args(args, _output_indices, _inplace_indices)
 
         # Build scratch shapes: VMEM buffers + DMA semaphores
@@ -1284,12 +1280,6 @@ def default_pallas_fori_launcher(
 
         out_shape_arg = out_shapes if len(out_shapes) > 1 else out_shapes[0]
 
-        pallas_aliases = {
-            arg_to_tensor_pos[orig_pos]: out_idx
-            for out_idx, orig_pos in enumerate(_output_indices)
-            if orig_pos in arg_to_tensor_pos
-        }
-
         grid_spec = pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=0,
             in_specs=in_specs_list,
@@ -1318,7 +1308,6 @@ def default_pallas_fori_launcher(
 
         pallas_call_kwargs: dict[str, object] = {
             "out_shape": out_shape_arg,
-            "input_output_aliases": pallas_aliases,
             "grid_spec": grid_spec,
             "compiler_params": pltpu.CompilerParams(  # pyrefly: ignore[bad-instantiation]
                 dimension_semantics=tuple("parallel" for _ in grid),
@@ -1340,6 +1329,7 @@ def default_pallas_fori_launcher(
             arg_to_tensor_pos,
             tensor_arg_indices,
             cache_attr="_pallas_fori_cache",
+            call_aliases=pallas_aliases,
             trace_key_suffix="_fori",
         )
 
