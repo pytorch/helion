@@ -591,28 +591,42 @@ class TestGridFoldingHeuristic(TestCase):
 
     def test_max_factor_capped_at_half_blocks(self):
         """Partial folding factor should be capped at nb // 2."""
-        # 16 blocks: max_factor should be 8, so only factors <= 8 allowed.
-        dim_size = 16
+        import math
+
+        from helion._compat import num_compute_units
+        from helion.autotuner.config_spec import GridFoldingSpec
+
+        # Need a grid large enough to pass the global gate:
+        # total_grid >= MIN_GRID_SM_RATIO * n_sm
+        # For 2D grid: dim_size^2 >= MIN_GRID_SM_RATIO * n_sm
+        n_sm = num_compute_units()
+        min_total_grid = GridFoldingSpec.MIN_GRID_SM_RATIO * n_sm
+        dim_size = max(32, math.isqrt(min_total_grid) + 1)
+        # Ensure dim_size is a power of 2 for clean block counts
+        dim_size = 1 << (dim_size - 1).bit_length()
+
         x = torch.randn(dim_size, dim_size, device=DEVICE)
         y = torch.randn(dim_size, dim_size, device=DEVICE)
         choices = self._get_folding_choices_2d(x, y)
         for dim_choices in choices:
-            # Should include partial factors but cap at 8 (16 // 2).
-            self.assertIn(8, dim_choices, "Expected factor 8 (nb//2) to be allowed")
-            self.assertNotIn(
-                16,
+            # With dim_size blocks, max_factor = dim_size // 2
+            # Should include factors up to max_factor but not dim_size.
+            max_factor = dim_size // 2
+            self.assertIn(
+                max_factor,
                 dim_choices,
-                "Factor 16 should be capped (exceeds nb//2=8)",
+                f"Expected factor {max_factor} (nb//2) to be allowed",
             )
-            self.assertNotIn(
-                32,
+            self.assertIn(
+                max_factor // 2,
                 dim_choices,
-                "Factor 32 should be capped (exceeds nb//2=8)",
+                f"Expected factor {max_factor // 2} to be allowed",
             )
+            self.assertIn(8, dim_choices, "Expected factor 8 to be allowed")
             self.assertNotIn(
-                64,
+                dim_size,
                 dim_choices,
-                "Factor 64 should be capped (exceeds nb//2=8)",
+                f"Factor {dim_size} should be capped (exceeds nb//2={max_factor})",
             )
 
     def test_boundary_at_min_blocks_for_partial(self):
