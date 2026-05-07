@@ -117,37 +117,19 @@ jobs:
 
           KERNELS="${{ inputs.kernels }}"
           echo "=========================================="
-          echo "TPU Benchmark: autotuning pass"
+          echo "TPU Benchmark"
           echo "Kernels: $KERNELS"
           echo "=========================================="
 
-          # First pass: autotune (populates cache) and capture per-shape
-          # compile time. We set HELION_MEASURE_COMPILE_TIME=1 so helion's
-          # compile-time tracker is active, then dump partial results to a
-          # side-channel JSON. Pass 2 only consumes its helion_compile_time_s
-          # records — the latency/accuracy values from pass 1 are unstable
-          # because configs are still being tried.
-          HELION_MEASURE_COMPILE_TIME=1 \
+          # Single combined pass — same shape as benchmarks/run.py for GPU.
+          # HELION_MEASURE_COMPILE_TIME=1 has helion's compile-time tracker
+          # capture per-shape autotune+codegen cost; run_example does its own
+          # warmup so post-autotune latency measurements are stable.
+          HELION_PRINT_OUTPUT_CODE=1 HELION_MEASURE_COMPILE_TIME=1 \
             python benchmarks/run_tpu.py \
               --kernel "$KERNELS" \
               --num-shapes 2 \
-              --output "$TEST_REPORTS_DIR/helionbench_pass1.json"
-
-          # Let TPU cool down
-          sleep 1m
-
-          echo "=========================================="
-          echo "TPU Benchmark: cache-hit verification pass"
-          echo "=========================================="
-
-          # Second pass: verify cache hits, record stable timing/accuracy,
-          # and splice in compile times from pass 1.
-          HELION_PRINT_OUTPUT_CODE=1 HELION_ASSERT_CACHE_HIT=1 \
-            python benchmarks/run_tpu.py \
-              --kernel "$KERNELS" \
-              --num-shapes 2 \
-              --output "$TEST_REPORTS_DIR/helionbench.json" \
-              --compile-time-input "$TEST_REPORTS_DIR/helionbench_pass1.json"
+              --output "$TEST_REPORTS_DIR/helionbench.json"
 
           if [[ ! -s "$TEST_REPORTS_DIR/helionbench.json" ]]; then
             echo "❌ helionbench.json is missing or empty"

@@ -783,11 +783,11 @@ class ShapeResult:
     compile_baseline_time_ms: float = 0.0
     speedup: float = 0.0  # Helion vs default torch (kDefault).
     compile_vs_default: float = 0.0  # default-torch / torch.compile (full-graph win).
-    # Helion compile (autotune+codegen) time captured around run_example. Only
-    # populated when HELION_MEASURE_COMPILE_TIME=1 is set in the env (typically
-    # the autotune pass; the cache-hit verification pass leaves this at 0.0
-    # because no recompilation happens). Pass 2 can splice values from pass 1's
-    # JSON via the --compile-time-input flag in main().
+    # Helion compile (autotune+codegen) time captured around run_example.
+    # Only meaningful when HELION_MEASURE_COMPILE_TIME=1 is set in the env;
+    # otherwise the helion._compile_time tracker is a no-op and this stays
+    # at 0.0. write_results_json gates emission of helion_compile_time_s on
+    # that env so the dashboard never sees zero-valued records.
     compile_time_s: float = 0.0
     error: str | None = None
 
@@ -980,29 +980,22 @@ def run_kernel_inner(name: str) -> KernelResult:
         return KernelResult(name=name, passed=False, error=str(e))
 
 
-def write_results_json(
-    output: str,
-    results: list[KernelResult],
-    compile_time_input: str | None = None,
-) -> None:
+def write_results_json(output: str, results: list[KernelResult]) -> None:
     """Write results in the dashboard-compatible JSON format.
 
     Emits one record per (kernel, metric) with parallel `shape` /
     `benchmark_values` arrays — the same shape benchmarks/run.py produces, so
     .github/dashboard/build_dashboard_data.py can ingest TPU runs alongside
     GPU runs without a dedicated parser.
-
-    `compile_time_input` (optional): path to a prior-pass JSON. When provided,
-    its `helion_compile_time_s` records replace this run's (which are typically
-    0.0 in a HELION_ASSERT_CACHE_HIT verification pass since no recompile
-    happens). This is the splice that lets the autotune pass own compile-time
-    measurement while the verification pass owns latency/accuracy.
     """
     device = "TPU v7"
     records: list[dict[str, Any]] = []
     # helion._compile_time is a no-op unless HELION_MEASURE_COMPILE_TIME=1 is
     # set. Read the env directly here rather than introspecting the tracker —
-    # makes the gate self-contained and explicit.
+    # makes the gate self-contained and explicit. We only emit
+    # helion_compile_time_s when timing was actually captured; otherwise
+    # ad-hoc local runs would publish [0.0, ...] which the dashboard would
+    # render as "0s compile time" rather than absent data.
     compile_time_measured = os.environ.get("HELION_MEASURE_COMPILE_TIME", "0") == "1"
 
     def add_metric(
@@ -1072,73 +1065,13 @@ def write_results_json(
             shapes,
             [sr.compile_vs_default for sr in result.shape_results],
         )
-        # Only emit helion_compile_time_s when timing was actually captured
-        # (HELION_MEASURE_COMPILE_TIME=1) or will be spliced in from a prior
-        # pass (--compile-time-input). Otherwise this run's compile_time_s
-        # values are all 0.0 and would render on the dashboard as a real
-        # "0s compile time" rather than absent data — misleading for ad-hoc
-        # local runs that don't enable timing.
-        if compile_time_measured or compile_time_input:
+        if compile_time_measured:
             add_metric(
                 result.name,
                 "helion_compile_time_s",
                 shapes,
                 [sr.compile_time_s for sr in result.shape_results],
             )
-
-    # Splice in prior-pass compile times if a side-channel input was given.
-    # We DROP this run's helion_compile_time_s records first because the
-    # cache-hit verification pass produces 0.0 values that would otherwise
-    # mask the autotune-pass measurements. If the splice fails (file
-    # missing/malformed/non-list), we DON'T fall back to keeping the zeros —
-    # we drop them too, so the dashboard renders "absent" instead of a
-    # bogus "0s compile time".
-    splice_succeeded = False
-    if compile_time_input:
-        if not os.path.exists(compile_time_input):
-            print(
-                f"Warning: compile-time input {compile_time_input} not found; "
-                "pass-2 helion_compile_time_s will be omitted.",
-                file=sys.stderr,
-            )
-        else:
-            try:
-                with open(compile_time_input) as f:
-                    prior = json.load(f)
-                if isinstance(prior, list):
-                    records = [
-                        r
-                        for r in records
-                        if r.get("metric", {}).get("name") != "helion_compile_time_s"
-                    ]
-                    records.extend(
-                        r
-                        for r in prior
-                        if r.get("metric", {}).get("name") == "helion_compile_time_s"
-                    )
-                    splice_succeeded = True
-                else:
-                    print(
-                        f"Warning: compile-time input {compile_time_input} is not "
-                        "a JSON list; skipping splice.",
-                        file=sys.stderr,
-                    )
-            except (OSError, json.JSONDecodeError) as e:
-                print(
-                    f"Warning: could not splice compile times from {compile_time_input}: {e}",
-                    file=sys.stderr,
-                )
-
-    # If we emitted records solely because --compile-time-input was set
-    # (i.e. this run did not measure compile time itself) and the splice
-    # didn't actually replace them, drop the zero-valued records rather
-    # than publishing them as real data.
-    if compile_time_input and not compile_time_measured and not splice_succeeded:
-        records = [
-            r
-            for r in records
-            if r.get("metric", {}).get("name") != "helion_compile_time_s"
-        ]
 
     if os.path.exists(output):
         try:
@@ -1181,17 +1114,6 @@ def main() -> None:
         "--list-kernels",
         action="store_true",
         help="List available kernel names and exit",
-    )
-    parser.add_argument(
-        "--compile-time-input",
-        type=str,
-        default=None,
-        help=(
-            "Path to a prior-pass JSON whose helion_compile_time_s records "
-            "should override this run's. Use this in the cache-hit "
-            "verification pass to splice in compile times from the autotune "
-            "pass (where HELION_MEASURE_COMPILE_TIME=1 was set)."
-        ),
     )
     args = parser.parse_args()
 
@@ -1304,9 +1226,7 @@ def main() -> None:
     print(f"{'=' * width}\n", file=sys.stderr)
 
     if args.output:
-        write_results_json(
-            args.output, results, compile_time_input=args.compile_time_input
-        )
+        write_results_json(args.output, results)
         print(f"Results written to {args.output}", file=sys.stderr)
 
 
