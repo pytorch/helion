@@ -1389,6 +1389,7 @@ def _torch_dtype_to_cutlass(dtype: torch.dtype) -> object:
         torch.int32: cutlass.Int32,
         torch.int64: cutlass.Int64,
         torch.uint8: cutlass.Uint8,
+        torch.uint64: cutlass.Int64,
     }
     if dtype not in mapping:
         raise exc.BackendUnsupported("cute", f"dtype: {dtype}")

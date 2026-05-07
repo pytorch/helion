@@ -187,7 +187,7 @@ def _(state: CodegenState) -> ast.AST:
         stack_tensor_ast = state.ast_args[0]
         assert isinstance(stack_tensor_ast, tuple)
         assert len(stack_tensor_ast) == 2
-        tensor_like_ast, dev_ptrs_ast = stack_tensor_ast
+        _tensor_like_ast, dev_ptrs_ast = stack_tensor_ast
         return StackIndexingStrategy.codegen_store(
             state, tensor, dev_ptrs_ast, [*subscript], value, extra_mask
         )
@@ -755,6 +755,255 @@ def _cute_scalar_store_expr(
     if "None" in index_exprs:
         return f"{tensor_name}.__setitem__({_cute_index_tuple(index_exprs)}, {value})"
     return f"{_cute_scalar_pointer_expr(tensor_name, index_exprs)}.store({value})"
+
+
+def _cute_stack_tensor_offset_expr(
+    state: CodegenState,
+    tensor_like: torch.Tensor,
+    subscript: list[object],
+    ast_subscript: list[object] | tuple[object, ...],
+) -> str:
+    env = CompileEnvironment.current()
+    index_exprs = _cute_index_exprs(
+        state,
+        subscript,
+        ast_subscript,
+        tensor=tensor_like,
+        inactive_slice_expr="None",
+        inactive_singleton_slice_expr="0",
+    )
+    if "None" in index_exprs:
+        raise exc.BackendUnsupported("cute", "inactive stack tensor load dimension")
+    index_dtype = env.index_type()
+    terms = []
+    for dim, index in enumerate(index_exprs):
+        stride = tensor_like.stride(dim)
+        stride_expr = (
+            str(stride) if isinstance(stride, int) else state.sympy_expr(stride)
+        )
+        terms.append(f"({index_dtype}({index}) * {index_dtype}({stride_expr}))")
+    return " + ".join(terms) if terms else "0"
+
+
+def _cute_stack_tensor_mask_expr(
+    state: CodegenState,
+    tensor_like: torch.Tensor,
+    dev_ptrs: torch.Tensor,
+    subscript: list[object],
+    extra_mask: ast.AST | None,
+) -> str | None:
+    terms = []
+    tensor_mask = _cute_combined_mask(
+        state,
+        subscript,
+        extra_mask,
+        tensor=tensor_like,
+        include_tensor_index_masks=False,
+    )
+    if tensor_mask is not None:
+        terms.append(tensor_mask)
+    stack_mask = _cute_combined_mask(
+        state,
+        [slice(None)] * dev_ptrs.ndim,
+        None,
+        tensor=dev_ptrs,
+    )
+    if stack_mask is not None and stack_mask not in terms:
+        terms.append(stack_mask)
+    if not terms:
+        return None
+    return " and ".join(f"({term})" for term in terms)
+
+
+def _cute_stack_tensor_pointer_expr(
+    target_dtype: str,
+    dev_ptrs_ast: ast.AST,
+    offset_expr: str,
+) -> ast.AST:
+    return expr_from_string(
+        f"(cute.make_ptr({target_dtype}, cutlass.Int64({{base}}), "
+        f"cute.AddressSpace.gmem) + ({offset_expr}))",
+        base=dev_ptrs_ast,
+    )
+
+
+def _codegen_cute_store_stack_load(
+    state: CodegenState,
+    tensor: torch.Tensor,
+    subscript: tuple[object, ...] | list[object],
+    ast_subscript: tuple[object, ...] | list[object],
+    value: ast.AST,
+    extra_mask: ast.AST | None,
+    value_node: torch.fx.Node,
+) -> ast.AST | None:
+    if value_node.op != "call_function" or value_node.target is not load:
+        return None
+    stack_arg = value_node.args[0]
+    if not isinstance(stack_arg, tuple) or len(stack_arg) != 2:
+        return None
+    ptr_node = stack_arg[1]
+    if (
+        not isinstance(ptr_node, torch.fx.Node)
+        or ptr_node.op != "call_function"
+        or ptr_node.target is not load
+        or len(ptr_node.args) < 2
+    ):
+        return None
+    dev_ptrs = (
+        ptr_node.args[0].meta.get("val")
+        if isinstance(ptr_node.args[0], torch.fx.Node)
+        else None
+    )
+    ptr_subscript = ptr_node.args[1]
+    if not isinstance(dev_ptrs, torch.Tensor) or not isinstance(
+        ptr_subscript, (list, tuple)
+    ):
+        return None
+    tensor_like_node = stack_arg[0]
+    tensor_like = (
+        tensor_like_node.meta.get("val")
+        if isinstance(tensor_like_node, torch.fx.Node)
+        else tensor_like_node
+    )
+    if not isinstance(tensor_like, torch.Tensor):
+        return None
+
+    if (
+        dev_ptrs.ndim == 2
+        and len(ptr_subscript) == 2
+        and all(isinstance(idx, slice) and idx == slice(None) for idx in ptr_subscript)
+        and len(subscript) >= 3
+        and isinstance(subscript[0], slice)
+        and subscript[0] == slice(None)
+        and isinstance(subscript[1], slice)
+        and subscript[1] == slice(None)
+    ):
+        stack_value_subscript = value_node.args[1]
+        if not isinstance(stack_value_subscript, (list, tuple)):
+            return None
+        stack_value_subscript_proxy = map_arg(
+            stack_value_subscript, lambda arg: arg.meta["val"]
+        )
+        stack_value_subscript_ast = map_arg(
+            stack_value_subscript, lambda arg: state.env[arg]
+        )
+        tensor_offset_expr = _cute_stack_tensor_offset_expr(
+            state,
+            tensor_like,
+            [*stack_value_subscript_proxy],
+            [*stack_value_subscript_ast],
+        )
+        target_index_exprs = _cute_index_exprs(
+            state,
+            [*subscript],
+            ast_subscript,
+            tensor=tensor,
+            inactive_singleton_slice_expr="0",
+        )
+        if len(target_index_exprs) != tensor.ndim:
+            return None
+        first_stack_index = target_index_exprs[0]
+        target_tail = target_index_exprs[2:]
+        loop_var = state.device_function.new_var("stack_dim", dce=True)
+        env = CompileEnvironment.current()
+        index_dtype = env.index_type()
+        dev_ptrs_name = state.device_function.tensor_arg(dev_ptrs).name
+        tensor_name = state.device_function.tensor_arg(tensor).name
+        target_dtype = env.backend.dtype_str(tensor.dtype)
+        dev_ptr_offset = (
+            f"{index_dtype}({first_stack_index}) * "
+            f"{index_dtype}({dev_ptrs.stride(0)}) + "
+            f"{index_dtype}({loop_var}) * {index_dtype}({dev_ptrs.stride(1)})"
+        )
+        stack_ptr_expr = (
+            f"(cute.make_ptr({target_dtype}, "
+            f"cutlass.Int64(({dev_ptrs_name}.iterator + {dev_ptr_offset}).load()), "
+            f"cute.AddressSpace.gmem) + ({tensor_offset_expr}))"
+        )
+        target_indices = [first_stack_index, loop_var, *target_tail]
+        store_expr = _cute_scalar_store_expr(
+            tensor_name,
+            target_indices,
+            f"({stack_ptr_expr}).load()",
+        )
+        mask_expr = _cute_combined_mask(state, [*subscript], extra_mask, tensor=tensor)
+        if mask_expr is None:
+            body = f"    {store_expr}"
+        else:
+            body = f"    if {mask_expr}:\n        {store_expr}"
+        state.add_statement(
+            statement_from_string(
+                f"for {loop_var} in range({dev_ptrs.size(1)}):\n{body}"
+            )
+        )
+        return ast.Constant(value=None)
+
+    ptr_subscript_proxy = map_arg(ptr_subscript, lambda arg: arg.meta["val"])
+    ptr_subscript_ast = map_arg(ptr_subscript, lambda arg: state.env[arg])
+    ptr_index_exprs = _cute_index_exprs(
+        state,
+        [*ptr_subscript_proxy],
+        [*ptr_subscript_ast],
+        tensor=dev_ptrs,
+        inactive_slice_expr="None",
+        inactive_singleton_slice_expr="0",
+    )
+    if "None" in ptr_index_exprs:
+        return None
+
+    target_index_exprs = _cute_index_exprs(
+        state,
+        [*subscript],
+        ast_subscript,
+        tensor=tensor,
+        inactive_singleton_slice_expr="0",
+    )
+    ptr_pos = 0
+    rewritten_index_exprs = []
+    for idx, index_expr in zip(subscript, target_index_exprs, strict=True):
+        if isinstance(idx, slice) and idx == slice(None):
+            replacement = (
+                ptr_index_exprs[ptr_pos] if ptr_pos < len(ptr_index_exprs) else None
+            )
+            ptr_pos += 1
+            rewritten_index_exprs.append(
+                replacement if replacement is not None else index_expr
+            )
+        else:
+            if ptr_pos < len(ptr_subscript_proxy) and not (
+                isinstance(ptr_subscript_proxy[ptr_pos], slice)
+                and ptr_subscript_proxy[ptr_pos] == slice(None)
+            ):
+                ptr_pos += 1
+            rewritten_index_exprs.append(index_expr)
+
+    tensor_name = state.device_function.tensor_arg(tensor).name
+    backend = CompileEnvironment.current().backend
+    target_dtype = backend.dtype_str(tensor.dtype)
+    value = expr_from_string(
+        backend.ast_to_dtype_expr("{value}", target_dtype),
+        value=value,
+    )
+    store_expr = expr_from_string(
+        _cute_scalar_store_expr(tensor_name, rewritten_index_exprs, "{value}"),
+        value=value,
+    )
+    mask_expr = _cute_combined_mask(state, [*subscript], extra_mask, tensor=tensor)
+    if mask_expr is None:
+        return store_expr
+    mask_ast = expr_from_string(mask_expr)
+    assert isinstance(mask_ast, ast.expr)
+    assert isinstance(store_expr, ast.expr)
+    state.add_statement(
+        ast.fix_missing_locations(
+            ast.If(
+                test=mask_ast,
+                body=[ast.Expr(value=store_expr)],
+                orelse=[],
+            )
+        )
+    )
+    return ast.Constant(value=None)
 
 
 def _cute_affine_range_block_id(state: CodegenState, affine: object) -> int | None:
@@ -2665,6 +2914,17 @@ def _(state: CodegenState) -> ast.AST:
     if value_node is not None:
         if value_node.op == "call_function":
             if isinstance(tensor, torch.Tensor):
+                rewritten_stmt = _codegen_cute_store_stack_load(
+                    state,
+                    tensor,
+                    subscript,
+                    ast_subscript,
+                    value,
+                    extra_mask,
+                    value_node,
+                )
+                if rewritten_stmt is not None:
+                    return rewritten_stmt
                 rewritten_stmt = _codegen_cute_store_loaded_index_trailing_slices(
                     state,
                     tensor,
@@ -2693,7 +2953,52 @@ def _(state: CodegenState) -> ast.AST:
                 value = rewritten
 
     if isinstance(tensor, tuple):
-        raise exc.BackendUnsupported("cute", "stack tensor store")
+        stack_tensor_ast = state.ast_args[0]
+        assert isinstance(stack_tensor_ast, tuple)
+        assert len(stack_tensor_ast) == 2
+        _tensor_like_ast, dev_ptrs_ast = stack_tensor_ast
+        assert isinstance(dev_ptrs_ast, ast.AST)
+        tensor_like, dev_ptrs = tensor
+        offset_expr = _cute_stack_tensor_offset_expr(
+            state,
+            tensor_like,
+            [*subscript],
+            ast_subscript,
+        )
+        backend = CompileEnvironment.current().backend
+        target_dtype = backend.dtype_str(tensor_like.dtype)
+        value = expr_from_string(
+            backend.ast_to_dtype_expr("{value}", target_dtype),
+            value=value,
+        )
+        ptr_expr = _cute_stack_tensor_pointer_expr(
+            target_dtype, dev_ptrs_ast, offset_expr
+        )
+        store_expr = expr_from_string(
+            "({ptr}).store({value})", ptr=ptr_expr, value=value
+        )
+        mask_expr = _cute_stack_tensor_mask_expr(
+            state,
+            tensor_like,
+            dev_ptrs,
+            [*subscript],
+            extra_mask,
+        )
+        if mask_expr is None:
+            return store_expr
+        mask_ast = expr_from_string(mask_expr)
+        assert isinstance(mask_ast, ast.expr)
+        assert isinstance(store_expr, ast.expr)
+        state.add_statement(
+            ast.fix_missing_locations(
+                ast.If(
+                    test=mask_ast,
+                    body=[ast.Expr(value=store_expr)],
+                    orelse=[],
+                )
+            )
+        )
+        return ast.Constant(value=None)
     if not isinstance(tensor, torch.Tensor):
         raise exc.BackendUnsupported("cute", f"store target type: {type(tensor)}")
 
@@ -3058,7 +3363,41 @@ def _(state: CodegenState) -> object:
     assert isinstance(extra_mask, (type(None), ast.AST))
 
     if isinstance(tensor, tuple):
-        raise exc.BackendUnsupported("cute", "stack tensor load")
+        stack_tensor_ast = state.ast_args[0]
+        assert isinstance(stack_tensor_ast, tuple)
+        assert len(stack_tensor_ast) == 2
+        tensor_like_ast, dev_ptrs_ast = stack_tensor_ast
+        assert isinstance(dev_ptrs_ast, ast.AST)
+        tensor_like, dev_ptrs = tensor
+        offset_expr = _cute_stack_tensor_offset_expr(
+            state,
+            tensor_like,
+            [*subscript],
+            ast_subscript,
+        )
+        backend = CompileEnvironment.current().backend
+        target_dtype = backend.dtype_str(tensor_like.dtype)
+        ptr_expr = _cute_stack_tensor_pointer_expr(
+            target_dtype, dev_ptrs_ast, offset_expr
+        )
+        load_expr = f"({ast.unparse(ptr_expr)}).load()"
+        mask_expr = _cute_stack_tensor_mask_expr(
+            state,
+            tensor_like,
+            dev_ptrs,
+            [*subscript],
+            extra_mask,
+        )
+        if tensor_like.dtype is torch.bool:
+            load_expr = f"({load_expr} != cutlass.Uint8(0))"
+            if mask_expr is None:
+                return expr_from_string(load_expr)
+            return expr_from_string(
+                f"({load_expr} if {mask_expr} else cutlass.Boolean(0))"
+            )
+        if mask_expr is None:
+            return expr_from_string(load_expr)
+        return expr_from_string(f"({load_expr} if {mask_expr} else {target_dtype}(0))")
     if not isinstance(tensor, torch.Tensor):
         raise exc.BackendUnsupported("cute", f"load tensor type: {type(tensor)}")
 

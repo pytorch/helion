@@ -2467,6 +2467,8 @@ class CuteBackend(Backend):
             inductor_dtype := CuteDSLOpOverrides.TORCH_TO_CUTE_DTYPE.get(dtype)
         ) is not None:
             return inductor_dtype
+        if dtype is torch.uint64:
+            return "cutlass.Int64"
 
         raise ValueError(f"Unsupported dtype for Cute backend: {dtype}")
 
