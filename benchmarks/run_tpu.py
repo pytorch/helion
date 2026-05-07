@@ -1090,26 +1090,39 @@ def write_results_json(
     # We DROP this run's helion_compile_time_s records first because the
     # cache-hit verification pass produces 0.0 values that would otherwise
     # mask the autotune-pass measurements.
-    if compile_time_input and os.path.exists(compile_time_input):
-        try:
-            with open(compile_time_input) as f:
-                prior = json.load(f)
-            if isinstance(prior, list):
-                records = [
-                    r
-                    for r in records
-                    if r.get("metric", {}).get("name") != "helion_compile_time_s"
-                ]
-                records.extend(
-                    r
-                    for r in prior
-                    if r.get("metric", {}).get("name") == "helion_compile_time_s"
-                )
-        except (OSError, json.JSONDecodeError) as e:
+    if compile_time_input:
+        if not os.path.exists(compile_time_input):
             print(
-                f"Warning: could not splice compile times from {compile_time_input}: {e}",
+                f"Warning: compile-time input {compile_time_input} not found; "
+                "pass-2 helion_compile_time_s will be missing.",
                 file=sys.stderr,
             )
+        else:
+            try:
+                with open(compile_time_input) as f:
+                    prior = json.load(f)
+                if isinstance(prior, list):
+                    records = [
+                        r
+                        for r in records
+                        if r.get("metric", {}).get("name") != "helion_compile_time_s"
+                    ]
+                    records.extend(
+                        r
+                        for r in prior
+                        if r.get("metric", {}).get("name") == "helion_compile_time_s"
+                    )
+                else:
+                    print(
+                        f"Warning: compile-time input {compile_time_input} is not "
+                        "a JSON list; skipping splice.",
+                        file=sys.stderr,
+                    )
+            except (OSError, json.JSONDecodeError) as e:
+                print(
+                    f"Warning: could not splice compile times from {compile_time_input}: {e}",
+                    file=sys.stderr,
+                )
 
     if os.path.exists(output):
         try:
