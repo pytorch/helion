@@ -1919,18 +1919,27 @@ def _register_tensor_descriptor_layout_guards(device_ir: DeviceIR) -> None:
             return arg.meta.get("val")
         return arg
 
+    memory_op_index = 0
+    atomic_op_index = 0
     for graph_info in device_ir.graphs:
         for node in graph_info.graph.nodes:
             if node.op != "call_function":
                 continue
-            if not (
-                node.target in (memory_ops.load, memory_ops.store)
-                or node.target in atomic_targets
-            ):
+            if node.target in (memory_ops.load, memory_ops.store):
+                tensor = tensor_arg_value(node.args[0])
+                if isinstance(tensor, torch.Tensor) and 2 <= tensor.ndim <= 5:
+                    env.register_tensor_descriptor_layout_guard(
+                        tensor, memory_op_index=memory_op_index
+                    )
+                memory_op_index += 1
                 continue
-            tensor = tensor_arg_value(node.args[0])
-            if isinstance(tensor, torch.Tensor) and 2 <= tensor.ndim <= 5:
-                env.register_tensor_descriptor_layout_guard(tensor)
+            if node.target in atomic_targets:
+                tensor = tensor_arg_value(node.args[0])
+                if isinstance(tensor, torch.Tensor) and 2 <= tensor.ndim <= 5:
+                    env.register_tensor_descriptor_layout_guard(
+                        tensor, atomic_op_index=atomic_op_index
+                    )
+                atomic_op_index += 1
 
 
 def lower_to_device_ir(func: HostFunction) -> DeviceIR:

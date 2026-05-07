@@ -15,6 +15,7 @@ from helion._testing import TestCase
 from helion._testing import check_example
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
+from helion._testing import skipIfRefEager
 from helion._testing import skipIfTileIR
 from helion._testing import skipUnlessTensorDescriptor
 import helion.language as hl
@@ -589,6 +590,186 @@ class TestTensorDescriptor(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result_transposed, x_transposed)
         self.assertIn(f"x_desc = {get_tensor_descriptor_fn_name()}", code_transposed)
         self.assertIn("tl.permute", code_transposed)
+
+    @skipUnlessTensorDescriptor("Tensor descriptor support is required")
+    @skipIfRefEager("Test checks bound kernel specialization cache")
+    def test_dynamic_tensor_descriptor_reuses_specialization_across_batch_sizes(self):
+        """Changing only batch size should not trigger extra dynamic TD specializations."""
+
+        @helion.kernel(
+            static_shapes=False,
+            autotune_effort="none",
+            config=helion.Config(
+                block_sizes=[16, 16, 16],
+                indexing="tensor_descriptor",
+            ),
+        )
+        def linear(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+            batch, k = x.size()
+            k2, n = w.size()
+            assert k == k2
+            out = torch.empty([batch, n], device=x.device, dtype=x.dtype)
+            for tile_b, tile_n in hl.tile([batch, n]):
+                acc = hl.zeros([tile_b, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_b, tile_k], w[tile_k, tile_n])
+                out[tile_b, tile_n] = acc.to(out.dtype)
+            return out
+
+        w = torch.randn([64, 64], device=DEVICE, dtype=HALF_DTYPE)
+        xs = [
+            torch.randn([32, 64], device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn([64, 64], device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn([128, 64], device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn([32, 64], device=DEVICE, dtype=HALF_DTYPE),
+        ]
+
+        code, result = code_and_output(linear, (xs[0], w))
+        torch.testing.assert_close(result, xs[0] @ w, atol=1e-1, rtol=1e-2)
+        self.assert_tensor_descriptor_used_for(code, "x")
+        self.assert_tensor_descriptor_used_for(code, "w")
+        self.assertEqual(len(linear._bound_kernels), 1)
+
+        for x in xs[1:]:
+            result = linear(x, w)
+            torch.testing.assert_close(result, x @ w, atol=1e-1, rtol=1e-2)
+            self.assertEqual(len(linear._bound_kernels), 1)
+
+    @skipUnlessTensorDescriptor("Tensor descriptor support is required")
+    @skipIfRefEager("Test checks bound kernel specialization cache")
+    def test_pointer_indexing_ignores_tensor_descriptor_layout_specialization(self):
+        """Pointer-only configs should not specialize on TD layout predicates."""
+
+        @helion.kernel(
+            static_shapes=False,
+            autotune_effort="none",
+            config=helion.Config(
+                block_sizes=[32, 32],
+                indexing="pointer",
+            ),
+        )
+        def copy_input(x: torch.Tensor) -> torch.Tensor:
+            result = torch.empty(x.size(), device=x.device, dtype=x.dtype)
+            for tile in hl.tile(x.size()):
+                result[tile] = x[tile]
+            return result
+
+        x_aligned = torch.randn([64, 1024], device=DEVICE, dtype=HALF_DTYPE)
+        x_unaligned = torch.randn([64, 1025], device=DEVICE, dtype=HALF_DTYPE)[:, :1024]
+        self.assertEqual(x_aligned.stride(), (1024, 1))
+        self.assertEqual(x_unaligned.stride(), (1025, 1))
+
+        code_aligned, result_aligned = code_and_output(copy_input, (x_aligned,))
+        torch.testing.assert_close(result_aligned, x_aligned)
+        self.assert_tensor_descriptor_not_used_for(code_aligned, "x")
+        bound_aligned = copy_input.bind((x_aligned,))
+        self.assertEqual(len(copy_input._bound_kernels), 1)
+
+        result_unaligned = copy_input(x_unaligned)
+        torch.testing.assert_close(result_unaligned, x_unaligned)
+        self.assertIs(bound_aligned, copy_input.bind((x_unaligned,)))
+        self.assertEqual(len(copy_input._bound_kernels), 1)
+
+    @skipUnlessTensorDescriptor("Tensor descriptor support is required")
+    @skipIfRefEager("Test checks bound kernel specialization cache")
+    def test_mixed_indexing_only_specializes_tensor_descriptor_operands(self):
+        """Mixed configs should only guard tensors used by TD-indexed ops."""
+
+        @helion.kernel(
+            static_shapes=False,
+            autotune_effort="none",
+            config=helion.Config(
+                block_sizes=[32, 32],
+                indexing=["pointer", "tensor_descriptor", "pointer"],
+            ),
+        )
+        def add_inputs(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            result = torch.empty(x.size(), device=x.device, dtype=x.dtype)
+            for tile in hl.tile(x.size()):
+                result[tile] = x[tile] + y[tile]
+            return result
+
+        x_aligned = torch.randn([64, 1024], device=DEVICE, dtype=HALF_DTYPE)
+        x_unaligned = torch.randn([64, 1025], device=DEVICE, dtype=HALF_DTYPE)[:, :1024]
+        y_aligned = torch.randn([64, 1024], device=DEVICE, dtype=HALF_DTYPE)
+        y_unaligned = torch.randn([64, 1025], device=DEVICE, dtype=HALF_DTYPE)[:, :1024]
+        self.assertEqual(x_aligned.stride(), (1024, 1))
+        self.assertEqual(x_unaligned.stride(), (1025, 1))
+        self.assertEqual(y_aligned.stride(), (1024, 1))
+        self.assertEqual(y_unaligned.stride(), (1025, 1))
+
+        code_aligned, result_aligned = code_and_output(
+            add_inputs, (x_aligned, y_aligned)
+        )
+        torch.testing.assert_close(result_aligned, x_aligned + y_aligned)
+        self.assert_tensor_descriptor_not_used_for(code_aligned, "x")
+        self.assert_tensor_descriptor_used_for(code_aligned, "y")
+        bound_aligned = add_inputs.bind((x_aligned, y_aligned))
+        self.assertEqual(len(add_inputs._bound_kernels), 1)
+
+        result_x_unaligned = add_inputs(x_unaligned, y_aligned)
+        torch.testing.assert_close(result_x_unaligned, x_unaligned + y_aligned)
+        self.assertIs(bound_aligned, add_inputs.bind((x_unaligned, y_aligned)))
+        self.assertEqual(len(add_inputs._bound_kernels), 1)
+
+        code_y_unaligned, result_y_unaligned = code_and_output(
+            add_inputs, (x_aligned, y_unaligned)
+        )
+        torch.testing.assert_close(result_y_unaligned, x_aligned + y_unaligned)
+        self.assert_tensor_descriptor_not_used_for(code_y_unaligned, "y")
+        self.assertIsNot(bound_aligned, add_inputs.bind((x_aligned, y_unaligned)))
+        self.assertEqual(len(add_inputs._bound_kernels), 2)
+
+    @skipUnlessTensorDescriptor("Tensor descriptor support is required")
+    @skipIfRefEager("Test checks bound kernel specialization cache")
+    def test_dynamic_shape_layout_signature_controls_specialization(self):
+        """Dynamic TD should specialize on layout predicates but reuse matching layouts."""
+
+        @helion.kernel(
+            static_shapes=False,
+            autotune_effort="none",
+            config=helion.Config(
+                block_sizes=[32, 32],
+                indexing=["tensor_descriptor", "pointer"],
+            ),
+        )
+        def copy_input(x: torch.Tensor) -> torch.Tensor:
+            result = torch.empty(x.size(), device=x.device, dtype=x.dtype)
+            for tile in hl.tile(x.size()):
+                result[tile] = x[tile]
+            return result
+
+        x_aligned = torch.randn([64, 1024], device=DEVICE, dtype=HALF_DTYPE)
+        x_aligned_2 = torch.randn([64, 1024], device=DEVICE, dtype=HALF_DTYPE)
+        x_unaligned = torch.randn([64, 1025], device=DEVICE, dtype=HALF_DTYPE)[:, :1024]
+        x_aligned_3 = torch.randn([64, 1024], device=DEVICE, dtype=HALF_DTYPE)
+
+        self.assertEqual(x_aligned.stride(), (1024, 1))
+        self.assertEqual(x_aligned_2.stride(), (1024, 1))
+        self.assertEqual(x_unaligned.stride(), (1025, 1))
+        self.assertEqual(x_aligned_3.stride(), (1024, 1))
+
+        code_aligned, result_aligned = code_and_output(copy_input, (x_aligned,))
+        torch.testing.assert_close(result_aligned, x_aligned)
+        self.assert_tensor_descriptor_used_for(code_aligned, "x")
+        bound_aligned = copy_input.bind((x_aligned,))
+        self.assertEqual(len(copy_input._bound_kernels), 1)
+
+        result_aligned_2 = copy_input(x_aligned_2)
+        torch.testing.assert_close(result_aligned_2, x_aligned_2)
+        self.assertIs(bound_aligned, copy_input.bind((x_aligned_2,)))
+        self.assertEqual(len(copy_input._bound_kernels), 1)
+
+        code_unaligned, result_unaligned = code_and_output(copy_input, (x_unaligned,))
+        torch.testing.assert_close(result_unaligned, x_unaligned)
+        self.assert_tensor_descriptor_not_used_for(code_unaligned, "x")
+        self.assertIsNot(bound_aligned, copy_input.bind((x_unaligned,)))
+        self.assertEqual(len(copy_input._bound_kernels), 2)
+
+        result_aligned_3 = copy_input(x_aligned_3)
+        torch.testing.assert_close(result_aligned_3, x_aligned_3)
+        self.assertIs(bound_aligned, copy_input.bind((x_aligned_3,)))
+        self.assertEqual(len(copy_input._bound_kernels), 2)
 
     @staticmethod
     def _make_td_matmul(static_shapes: bool):

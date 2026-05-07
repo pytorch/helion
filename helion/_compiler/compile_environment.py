@@ -48,6 +48,14 @@ log = logging.getLogger(__name__)
 TensorDescriptorLayoutSignature = tuple[int | None, tuple[bool, ...]]
 
 
+@dataclasses.dataclass
+class TensorDescriptorLayoutGuard:
+    ndim: int
+    element_size: int
+    memory_op_indices: set[int] = dataclasses.field(default_factory=set)
+    atomic_op_indices: set[int] = dataclasses.field(default_factory=set)
+
+
 def tensor_descriptor_layout_signature_from_strides(
     strides: typing.Sequence[int | torch.SymInt | sympy.Integer],
     element_size: int,
@@ -201,7 +209,9 @@ class CompileEnvironment:
         self.kernel_min_element_bits: int = 32  # smallest dtype bits across all tensors
         self.specialized_vars: set[sympy.Symbol] = set()
         self.specialized_strides: set[tuple[str, int]] = set()
-        self.tensor_descriptor_layout_guards: dict[str, tuple[int, int]] = {}
+        self.tensor_descriptor_layout_guards: dict[
+            str, TensorDescriptorLayoutGuard
+        ] = {}
         self.jagged_tile_parent_ids: dict[int, list[int]] = {}
         self.jagged_tile_mask_shapes: dict[int, list[torch.SymInt]] = {}
         self._symint_cache: dict[object, torch.SymInt] = {}
@@ -251,7 +261,11 @@ class CompileEnvironment:
         return expr
 
     def register_tensor_descriptor_layout_guard(
-        self, fake_tensor: torch.Tensor
+        self,
+        fake_tensor: torch.Tensor,
+        *,
+        memory_op_index: int | None = None,
+        atomic_op_index: int | None = None,
     ) -> None:
         """Specialize dynamic kernels on TD-relevant stride layout predicates."""
         if self.settings.static_shapes:
@@ -259,10 +273,17 @@ class CompileEnvironment:
         source = self.input_sources.get(fake_tensor)
         if not isinstance(source, LocalSource):
             return
-        self.tensor_descriptor_layout_guards[source.local_name] = (
-            fake_tensor.ndim,
-            fake_tensor.element_size(),
+        guard = self.tensor_descriptor_layout_guards.setdefault(
+            source.local_name,
+            TensorDescriptorLayoutGuard(
+                ndim=fake_tensor.ndim,
+                element_size=fake_tensor.element_size(),
+            ),
         )
+        if memory_op_index is not None:
+            guard.memory_op_indices.add(memory_op_index)
+        if atomic_op_index is not None:
+            guard.atomic_op_indices.add(atomic_op_index)
 
     def has_tensor_descriptor_layout_guard(self, fake_tensor: torch.Tensor) -> bool:
         if self.settings.static_shapes:
