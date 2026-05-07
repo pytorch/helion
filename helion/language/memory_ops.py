@@ -49,6 +49,8 @@ from .._compiler.cute.tcgen05_constants import TCGEN05_EPILOGUE_LAYOUT_SPLIT_FIR
 from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
 from .._compiler.host_function import HostFunction
 from .._compiler.indexing_strategy import SubscriptIndexing
+from .._compiler.indexing_strategy import TileWithOffsetInfo
+from .._compiler.indexing_strategy import _get_tile_with_offset_info
 from .._compiler.pallas import codegen as pallas_codegen
 from .._compiler.variable_origin import GridOrigin
 from .._compiler.variable_origin import TileBeginOrigin
@@ -649,6 +651,28 @@ def _cute_index_exprs(
             ),
         )
 
+    def local_coord_for_block_id(block_id: int, begin_var: str) -> str | None:
+        if (local_coord := active_local_coord(block_id)) is not None:
+            return local_coord
+        if (idx_var := active_index_var(block_id)) is not None:
+            return f"({idx_var}) - ({begin_var})"
+        return None
+
+    def tile_with_offset_index_expr(tile_info: TileWithOffsetInfo) -> str:
+        block_id = tile_info.block_id
+        begin_var = tile_begin_expr(block_id, active_loop_info(block_id))
+        local_coord = local_coord_for_block_id(block_id, begin_var)
+        if local_coord is None:
+            raise exc.BackendUnsupported(
+                "cute",
+                (
+                    "indexing dimension is not active in this scope "
+                    f"(block_id={block_id})"
+                ),
+            )
+        offset_expr = state.device_function.literal_expr(tile_info.offset)
+        return f"({begin_var}) + cutlass.Int32({offset_expr}) + ({local_coord})"
+
     used_block_ids = {
         block_id
         for idx in subscript
@@ -670,6 +694,15 @@ def _cute_index_exprs(
             and not (isinstance(idx, slice) and idx == slice(None))
         ):
             result.append("0")
+            tensor_dim += 1
+            continue
+        if (
+            tile_info := _get_tile_with_offset_info(
+                idx, getattr(state, "fx_node", None), pos
+            )
+        ) is not None and tile_info.block_size is not None:
+            used_block_ids.add(tile_info.block_id)
+            result.append(tile_with_offset_index_expr(tile_info))
             tensor_dim += 1
             continue
         if isinstance(idx, torch.SymInt):
@@ -1332,14 +1365,96 @@ def _cute_combined_mask(
             return loops[-1].strategy.mask_var(block_id)
         return None
 
+    def active_index_var(block_id: int) -> str | None:
+        loops = state.codegen.active_device_loops.get(block_id)
+        if loops:
+            return loops[-1].strategy.index_var(block_id)
+        grid_state = state.codegen.current_grid_state
+        if grid_state is not None and block_id in grid_state.block_ids:
+            return grid_state.strategy.index_var(block_id)
+        return None
+
+    def active_local_coord(block_id: int) -> str | None:
+        from .._compiler.cute.cute_reshape import _grid_local_coord_expr
+
+        loops = state.codegen.active_device_loops.get(block_id)
+        if loops:
+            thread_axis = loops[-1].block_thread_axes.get(block_id)
+            if thread_axis is not None:
+                return _grid_local_coord_expr(state.codegen, block_id, thread_axis)
+        grid_state = state.codegen.current_grid_state
+        if grid_state is not None:
+            thread_axis = grid_state.block_thread_axes.get(block_id)
+            if thread_axis is not None:
+                return _grid_local_coord_expr(state.codegen, block_id, thread_axis)
+        return None
+
+    def tile_begin_expr(block_id: int) -> str:
+        loops = state.codegen.active_device_loops.get(block_id)
+        if loops:
+            return state.codegen.offset_var(block_id)
+        global_index = active_index_var(block_id)
+        local_coord = active_local_coord(block_id)
+        if global_index is not None and local_coord is not None:
+            return state.codegen.lift(
+                expr_from_string(f"({global_index}) - ({local_coord})"),
+                dce=True,
+                prefix="tile_begin",
+            ).id
+        if global_index is not None:
+            return global_index
+        return "0"
+
+    def tile_with_offset_mask_terms(
+        tile_info: TileWithOffsetInfo,
+        tensor_dim: int,
+    ) -> list[str]:
+        block_id = tile_info.block_id
+        local_coord = active_local_coord(block_id)
+        begin_var = tile_begin_expr(block_id)
+        if local_coord is None:
+            if (idx_var := active_index_var(block_id)) is None:
+                raise exc.BackendUnsupported(
+                    "cute",
+                    (
+                        "indexing dimension is not active in this scope "
+                        f"(block_id={block_id})"
+                    ),
+                )
+            local_coord = f"({idx_var}) - ({begin_var})"
+
+        tile_terms = []
+        if tile_info.block_size is not None:
+            block_size_expr = state.device_function.literal_expr(tile_info.block_size)
+            tile_terms.append(f"({local_coord}) < cutlass.Int32({block_size_expr})")
+        if tensor is not None and tensor_dim < tensor.ndim:
+            offset_expr = state.device_function.literal_expr(tile_info.offset)
+            dim_size = _cute_tensor_dim_size_expr(state, tensor, tensor_dim)
+            tile_terms.append(
+                f"(({begin_var}) + cutlass.Int32({offset_expr}) + "
+                f"({local_coord})) < {dim_size}"
+            )
+        return tile_terms
+
     if extra_mask is not None:
         terms.append(state.codegen.lift(extra_mask, dce=True, prefix="mask").id)
 
     seen: set[int] = set()
     tensor_dim = 0
-    for idx in subscript:
+    for pos, idx in enumerate(subscript):
         block_id: int | None = None
         if idx is None:
+            continue
+        if (
+            tile_info := _get_tile_with_offset_info(
+                idx, getattr(state, "fx_node", None), pos
+            )
+        ) is not None and tile_info.block_size is not None:
+            seen.add(tile_info.block_id)
+            for term in tile_with_offset_mask_terms(tile_info, tensor_dim):
+                if term not in terms:
+                    terms.append(term)
+            tensor_dim += 1
             continue
         if isinstance(idx, torch.SymInt):
             block_id = env.get_block_id(idx)

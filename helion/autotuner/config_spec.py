@@ -449,11 +449,6 @@ class ConfigSpec:
 
     def configure_epilogue_subtile_autotune(self, args: Sequence[object]) -> None:
         self.epilogue_subtile_k_hint = self._infer_epilogue_subtile_k_hint(args)
-        if self.backend_name == "cute":
-            # CuTe does not lower the hl.split()-based epilogue subtiling path yet.
-            # Keep it out of the autotune field set until that codegen exists.
-            self.epilogue_subtile_autotune_choices = None
-            return
         arch = _epilogue_subtile_autotune_arch()
         if arch is None:
             self.epilogue_subtile_autotune_choices = None
@@ -1600,6 +1595,10 @@ class ConfigSpec:
                     fields["indexing"] = self.indexing
             elif self.supports_config_key("num_threads"):
                 fields["num_threads"] = self.num_threads
+            if self.epilogue_subtile_autotune_choices is not None:
+                fields["epilogue_subtile"] = EnumFragment(
+                    choices=self.epilogue_subtile_autotune_choices
+                )
             fields.update(self.user_defined_tunables)
             return fields
 
