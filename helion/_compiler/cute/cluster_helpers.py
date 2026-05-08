@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
 from typing import Any
 from typing import cast
 
@@ -10,14 +11,17 @@ import cutlass.cute as cute
 from cutlass.cutlass_dsl import T
 from cutlass.cutlass_dsl import dsl_user_op
 
+if TYPE_CHECKING:
+    from cutlass._mlir import ir
+
 
 @dsl_user_op
 def _set_block_rank(
     smem_ptr: cute.Pointer,
     peer_cta_rank_in_cluster: Int32,
     *,
-    loc: object | None = None,
-    ip: object | None = None,
+    loc: ir.Location | None = None,
+    ip: ir.InsertionPoint | None = None,
 ) -> Int32:
     """Map an SMEM pointer to the address at another CTA rank in the cluster."""
 
@@ -44,8 +48,8 @@ def store_shared_remote_x4(
     smem_ptr: cute.Pointer,
     mbar_ptr: cute.Pointer,
     peer_cta_rank_in_cluster: Int32,
-    loc: object | None = None,
-    ip: object | None = None,
+    loc: ir.Location | None = None,
+    ip: ir.InsertionPoint | None = None,
 ) -> None:
     """Store four scalars into another CTA's SMEM and complete the async tx."""
 

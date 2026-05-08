@@ -99,24 +99,14 @@ def plan_tiling(
 
 
 def _analyze_indexing_expressions(graph_info: GraphInfo, config: Config) -> None:
-    from ...language import atomic_ops
     from ...language import memory_ops
+    from ...language.atomic_ops import ATOMIC_OPS
 
+    indexing_targets = ATOMIC_OPS | {memory_ops.load, memory_ops.store}
     for node in graph_info.graph.nodes:
         if node.op != "call_function":
             continue
-        if node.target in (
-            memory_ops.load,
-            memory_ops.store,
-            atomic_ops.atomic_add,
-            atomic_ops.atomic_cas,
-            atomic_ops.atomic_or,
-            atomic_ops.atomic_xor,
-            atomic_ops.atomic_xchg,
-            atomic_ops.atomic_min,
-            atomic_ops.atomic_max,
-            atomic_ops.atomic_and,
-        ):
+        if node.target in indexing_targets:
             _analyze_indexing(node, config)
 
 

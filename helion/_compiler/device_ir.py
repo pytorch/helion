@@ -1900,6 +1900,48 @@ def _register_atomic_tunables(atomic_count: int) -> None:
     )
 
 
+def _register_tensor_descriptor_layout_guards(device_ir: DeviceIR) -> None:
+    env = CompileEnvironment.current()
+    if env.settings.static_shapes:
+        return
+
+    from .._compat import supports_tensor_descriptor
+    from ..language import atomic_ops
+    from ..language import memory_ops
+
+    if not supports_tensor_descriptor():
+        return
+
+    atomic_targets = tuple(getattr(atomic_ops, name) for name in atomic_ops.__all__)
+
+    def tensor_arg_value(arg: object) -> object:
+        if isinstance(arg, torch.fx.Node):
+            return arg.meta.get("val")
+        return arg
+
+    memory_op_index = 0
+    atomic_op_index = 0
+    for graph_info in device_ir.graphs:
+        for node in graph_info.graph.nodes:
+            if node.op != "call_function":
+                continue
+            if node.target in (memory_ops.load, memory_ops.store):
+                tensor = tensor_arg_value(node.args[0])
+                if isinstance(tensor, torch.Tensor) and 2 <= tensor.ndim <= 5:
+                    env.register_tensor_descriptor_layout_guard(
+                        tensor, memory_op_index=memory_op_index
+                    )
+                memory_op_index += 1
+                continue
+            if node.target in atomic_targets:
+                tensor = tensor_arg_value(node.args[0])
+                if isinstance(tensor, torch.Tensor) and 2 <= tensor.ndim <= 5:
+                    env.register_tensor_descriptor_layout_guard(
+                        tensor, atomic_op_index=atomic_op_index
+                    )
+                atomic_op_index += 1
+
+
 def lower_to_device_ir(func: HostFunction) -> DeviceIR:
     device_ir = DeviceIR()
     with func, device_ir, compile_lock:
@@ -1940,6 +1982,8 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
             remove_unnecessary_tile_index(graph.graph)
             remove_unnecessary_masking(graph.graph)
 
+        # TODO(hinriksnaer): extract into a separate step? everything below
+        # is post-processing computed from the completed DeviceIR.
         from .epilogue_subtiling import has_epilogue_subtiling_candidate
 
         has_epilogue_subtile_candidate = False
@@ -1955,10 +1999,30 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
         config_spec.epilogue_subtile_autotune_choices = None
 
         device_ir.register_rollable_reductions()
-        CompileEnvironment.current().config_spec.raise_grid_block_minimums()
+        config_spec = CompileEnvironment.current().config_spec
+        config_spec.raise_grid_block_minimums()
         if len(device_ir.root_ids) > 1:
-            # xyz not supported with shared program IDs, but persistent kernels are allowed
-            CompileEnvironment.current().config_spec.disallow_pid_type("xyz")
+            # xyz is not supported with shared program IDs. Non-tcgen05
+            # persistent kernels are allowed; tcgen05 persistent has a
+            # single-root scheduler/grid contract today.
+            config_spec.disallow_pid_type("xyz")
+            if config_spec.cute_tcgen05_search_enabled:
+                # The tcgen05 persistent launch grid is derived from a single
+                # root's PID space today. Keep persistent pid types out of
+                # multi-root autotune until the scheduler/grid spans all cases.
+                non_persistent_pid_types = tuple(
+                    pid_type
+                    for pid_type in config_spec.allowed_pid_types
+                    if pid_type not in ("persistent_blocked", "persistent_interleaved")
+                )
+                if not non_persistent_pid_types:
+                    raise exc.InvalidConfig(
+                        "CuTe tcgen05 multi-root kernels do not support "
+                        "persistent pid types yet, and no non-persistent "
+                        "pid type is available. Disable forced/distributed "
+                        "persistent-only mode or use a single root loop."
+                    )
+                config_spec.allowed_pid_types = non_persistent_pid_types
 
         # Count all device loads and stores and register tunables
         (
@@ -1972,6 +2036,7 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
             store_indices,
         )
         _register_atomic_tunables(_count_device_atomics(device_ir))
+        _register_tensor_descriptor_layout_guards(device_ir)
 
         return device_ir
 

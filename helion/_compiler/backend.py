@@ -19,6 +19,7 @@ import torch
 
 from .. import exc
 from .ast_extension import expr_from_string
+from .cute.tcgen05_constants import TCGEN05_CUBIN_LINEINFO_CONFIG_KEY
 
 if TYPE_CHECKING:
     from torch._inductor.ops_handler import OpsHandler
@@ -2269,21 +2270,11 @@ def _loop_contains_atomic(
     fn: DeviceFunction,
     block_ids: list[int],
 ) -> bool:
-    from ..language import atomic_ops
     from ..language._decorators import is_api_func
+    from ..language.atomic_ops import ATOMIC_OPS as atomic_targets
     from .device_ir import RootGraphInfo
     from .host_function import HostFunction
 
-    atomic_targets = {
-        atomic_ops.atomic_add,
-        atomic_ops.atomic_and,
-        atomic_ops.atomic_cas,
-        atomic_ops.atomic_max,
-        atomic_ops.atomic_min,
-        atomic_ops.atomic_or,
-        atomic_ops.atomic_xchg,
-        atomic_ops.atomic_xor,
-    }
     device_ir = HostFunction.current().device_ir
     graph_by_id = {
         graph_info.graph_id: graph_info
@@ -2466,6 +2457,8 @@ class CuteBackend(Backend):
             inductor_dtype := CuteDSLOpOverrides.TORCH_TO_CUTE_DTYPE.get(dtype)
         ) is not None:
             return inductor_dtype
+        if dtype is torch.uint64:
+            return "cutlass.Int64"
 
         raise ValueError(f"Unsupported dtype for Cute backend: {dtype}")
 
@@ -2700,7 +2693,12 @@ class CuteBackend(Backend):
         return f"({true_val}) if ({mask}) else ({false_val})"
 
     def minimum_expr(self, a: str, b: str) -> str:
-        return f"({a}) if ({a}) < ({b}) else ({b})"
+        from .compile_environment import CompileEnvironment
+
+        index_type = CompileEnvironment.current().index_type()
+        lhs = self.cast_expr(a, index_type)
+        rhs = self.cast_expr(b, index_type)
+        return f"({lhs}) if ({lhs}) < ({rhs}) else ({rhs})"
 
     def reduction_index_expr(
         self, block_size_var: str, dtype: str, block_idx: int, *, axis: int
@@ -2912,6 +2910,13 @@ class CuteBackend(Backend):
                 final_kernel_text,
             )
         }
+
+        def launcher_args_with_compile_options(block_arg: str) -> list[str]:
+            launcher_args = [block_arg]
+            if config.get(TCGEN05_CUBIN_LINEINFO_CONFIG_KEY) is True:
+                launcher_args.append("cute_compile_options='--generate-line-info'")
+            return launcher_args
+
         block_size_values = {
             name: int(value)
             for name, value in re.findall(
@@ -3053,7 +3058,9 @@ class CuteBackend(Backend):
                 ):
                     dims = expr_dims
             elif dims == (1, 1, 1):
-                return [f"block=({dim_exprs[0]}, {dim_exprs[1]}, {dim_exprs[2]})"]
+                return launcher_args_with_compile_options(
+                    f"block=({dim_exprs[0]}, {dim_exprs[1]}, {dim_exprs[2]})"
+                )
         if offset_thread_dims != [1, 1, 1]:
             candidate_dims = tuple(
                 starmap(max, zip(dims, offset_thread_dims, strict=True))
@@ -3076,7 +3083,9 @@ class CuteBackend(Backend):
         from .cute.thread_budget import check_thread_limit
 
         check_thread_limit(dims[0] * dims[1] * dims[2], context=str(tuple(dims)))
-        return [f"block=({dims[0]}, {dims[1]}, {dims[2]})"]
+        return launcher_args_with_compile_options(
+            f"block=({dims[0]}, {dims[1]}, {dims[2]})"
+        )
 
     def build_launcher_args(
         self,

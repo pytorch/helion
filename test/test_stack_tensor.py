@@ -13,7 +13,7 @@ from helion._testing import onlyBackends
 import helion.language as hl
 
 
-@onlyBackends(["triton"])
+@onlyBackends(["triton", "cute"])
 class TestStackTensor(RefEagerTestDisabled, TestCase):
     def test_stack_load_grid(self):
         @helion.kernel

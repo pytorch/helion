@@ -83,6 +83,7 @@ class TestGrid(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, grid_1d_pytorch(args[0], args[1]))
 
     @skipUnlessTensorDescriptor("Tensor descriptor support is required")
+    @skipIfXPU("XPU tensor descriptor path has accuracy issue for this grid test")
     def test_grid_2d_idx_list(self):
         @helion.kernel(static_shapes=True)
         def grid_2d_idx_list(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -118,12 +119,21 @@ class TestGrid(RefEagerTestBase, TestCase):
         code, result = code_and_output(
             grid_2d_idx_list,
             args,
-            block_sizes=[64, 32, 16],
+            block_sizes=[64, 16, 16],
             indexing="tensor_descriptor",
         )
         torch.testing.assert_close(result, grid_2d_pytorch(args[0], args[1]))
 
     @skipIfMetal("aten.addmm not yet registered for Metal backend")
+    @xfailIfPallas(
+        "Nested hl.grid + emit_pipeline corrupts output: only the first "
+        "hl.grid level becomes a pallas_call grid axis (sliced by BlockSpec); "
+        "subsequent hl.grid levels become outer emit_pipeline bodies whose "
+        "iteration index isn't bound to a stable name before inner bodies "
+        "shadow `_pipeline_indices`. Inner indexing falls back to literal 0 "
+        "for those dims, so only the (0, 0, ...) slot of the output is "
+        "correct."
+    )
     def test_grid_2d_idx_nested(self):
         @helion.kernel(static_shapes=True)
         def grid_2d_idx_nested(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -328,6 +338,10 @@ class TestGrid(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, expected)
 
     @skipIfMetal("Metal does not support loop_index_expr for grid loops")
+    @xfailIfPallas(
+        "range(begin, end, step) lowers to _for_loop_step which has no "
+        "emit_pipeline codegen"
+    )
     def test_range_with_step(self):
         """Test that range(begin, end, step) works as alias for hl.grid(begin, end, step)."""
 

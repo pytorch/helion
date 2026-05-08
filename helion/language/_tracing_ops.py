@@ -519,21 +519,13 @@ def _setup_loop_carried_state(
             continue
         if isinstance(proxy, torch.Tensor):
             assert isinstance(arg_ast, ast.Name)
-            # Reuse existing scratch if the init value is already in one
-            # (e.g. from hl.full / hl.zeros). Otherwise allocate new.
-            existing = any(
-                s.name == arg_ast.id for s in state.device_function._scratch_args
+            shape = _resolve_shape(proxy, env, state.config)
+            dtype = proxy.dtype
+            scratch_name = state.device_function.register_scratch(
+                shape, dtype, name_hint=f"scratch_{i}"
             )
-            if existing:
-                scratch_name = arg_ast.id
-            else:
-                shape = _resolve_shape(proxy, env, state.config)
-                dtype = proxy.dtype
-                scratch_name = state.device_function.register_scratch(
-                    shape, dtype, name_hint=f"scratch_{i}"
-                )
-                # Initialize scratch with the arg value.
-                state.add_statement(_scratch_write_stmt(state, scratch_name, arg_ast))
+            # Initialize scratch with the arg value.
+            state.add_statement(_scratch_write_stmt(state, scratch_name, arg_ast))
             scratch_names.append(scratch_name)
 
             # Result will be read after loop
@@ -544,6 +536,27 @@ def _setup_loop_carried_state(
             result_vars.append(arg_ast)
 
     return scratch_names, result_vars, carried
+
+
+def _emit_nonlocal_scratch_declarations(
+    state: CodegenState,
+    body_stmts: list[ast.AST],
+) -> None:
+    """Insert ``nonlocal <scratch>`` at the top of the closure body.
+
+    Without ``nonlocal``, an assignment like ``scratch = scratch[...]`` inside
+    a fori_loop/emit_pipeline closure makes ``scratch`` local to the entire
+    function, causing an UnboundLocalError on the RHS read.
+
+    We emit nonlocal for *all* VMEM scratch args, not just the current loop's
+    carried state, because an outer loop body may contain ``scratch = scratch[...]``
+    from a nested inner loop's ``_read_final_loop_state``.
+    """
+    names = [
+        s.name for s in state.device_function._scratch_args if s.scratch_type == "vmem"
+    ]
+    if names:
+        body_stmts.insert(0, ast.Nonlocal(names=names))
 
 
 def _remap_args_to_scratch(
@@ -1072,12 +1085,89 @@ def _rewrite_outer_subscripts_for_pre_broadcast(
                 )
                 reshaped.append(node)
 
+    # Insert _pre_broadcast_tile where pre-broadcast outer nodes feed wider-dim ops.
+    # First, propagate pre-broadcast status transitively through indirect consumers.
+    # After rewriting subscript[:, :, None] → subscript[:, :], downstream nodes
+    # (e.g. add, rsqrt) may still have stale meta shapes (u0, u1, 1) from trace
+    # time. We identify them by checking if any arg is pre-broadcast — if so,
+    # the node is also pre-broadcast (its real last dim is PRE_BROADCAST_SIZE).
+    all_pre_broadcast_outer: set[str] = set(pre_broadcast_outer_nodes)
+    all_pre_broadcast_outer.update(node.name for node in reshaped)
+    for node in outer_graph.nodes:
+        if node.op != "call_function" or node.name in all_pre_broadcast_outer:
+            continue
+        node_val = node.meta.get("val", None)
+        if not isinstance(node_val, torch.Tensor) or len(node_val.shape) < 2:
+            continue
+        last_dim = node_val.shape[-1]
+        if isinstance(last_dim, torch.SymInt):
+            continue
+        last_dim_int = int(last_dim)
+        if last_dim_int > PRE_BROADCAST_SIZE:
+            continue
+        has_pre_broadcast_arg = False
+        for arg in node.args:
+            if isinstance(arg, torch.fx.Node) and arg.name in all_pre_broadcast_outer:
+                arg_val = arg.meta.get("val", None)
+                if isinstance(arg_val, torch.Tensor) and len(arg_val.shape) >= 2:
+                    arg_last = arg_val.shape[-1]
+                    if isinstance(arg_last, int) and arg_last == PRE_BROADCAST_SIZE:
+                        has_pre_broadcast_arg = True
+                        break
+        if has_pre_broadcast_arg:
+            new_shape = [*node_val.shape[:-1], PRE_BROADCAST_SIZE]
+            node.meta["val"] = node_val.new_empty(new_shape)
+            all_pre_broadcast_outer.add(node.name)
+            reshaped.append(node)
+
+    new_nodes: list[torch.fx.Node] = []
+    for node in list(outer_graph.nodes):
+        if node.op != "call_function" or node.name in all_pre_broadcast_outer:
+            continue
+        node_val = node.meta.get("val", None)
+        if not isinstance(node_val, torch.Tensor) or len(node_val.shape) < 2:
+            continue
+        last_dim = node_val.shape[-1]
+        last_dim_is_sym = isinstance(last_dim, torch.SymInt)
+        if not last_dim_is_sym and int(last_dim) <= PRE_BROADCAST_SIZE:
+            continue
+        args_list = list(node.args)
+        changed = False
+        for ai, arg in enumerate(args_list):
+            if not isinstance(arg, torch.fx.Node):
+                continue
+            if arg.name not in all_pre_broadcast_outer:
+                continue
+            arg_val = arg.meta.get("val", None)
+            if not isinstance(arg_val, torch.Tensor):
+                continue
+            if not (
+                isinstance(arg_val.shape[-1], int)
+                and arg_val.shape[-1] == PRE_BROADCAST_SIZE
+            ):
+                continue
+            with outer_graph.inserting_before(node):
+                tiled = outer_graph.call_function(
+                    _pre_broadcast_tile,
+                    args=(arg, last_dim),
+                )
+            tiled.meta = {
+                **arg.meta,
+                "val": arg_val.new_empty([*arg_val.shape[:-1], last_dim]),
+            }
+            new_nodes.append(tiled)
+            args_list[ai] = tiled
+            changed = True
+        if changed:
+            node.args = tuple(args_list)
+
     # Re-prepare lowerings for modified outer nodes
-    if reshaped:
+    all_to_prepare = reshaped + new_nodes
+    if all_to_prepare:
         with compile_lock:
             graph_lowering = FakeGraphLowering()
             with V.set_graph_handler(graph_lowering):
-                for node in reshaped:
+                for node in all_to_prepare:
                     if node.op == "call_function":
                         with node.meta["location"]:
                             prepare_node_lowering(graph_lowering, node)
@@ -1340,10 +1430,10 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
         state, block_ids, block_size_vars
     )
 
-    # Aligned tensors flow through emit_pipeline's per-iter Buffered
-    # BlockSpec; unaligned ones stay on the outer pallas_call BlockSpec
+    # Pipelined tensors flow through emit_pipeline's per-iter Buffered
+    # BlockSpec; the rest stay on the outer pallas_call BlockSpec
     # (escape clause `bs == as`) and are closure-read from the body.
-    all_tensor_info, _vmem_shapes, aligned_tensor_ids = _classify_pipelined_tensors(
+    all_tensor_info, _vmem_shapes, pipelined_tensor_ids = _classify_pipelined_tensors(
         loaded_tensors, stored_tensors, block_ids, slice_size_exprs, env, state
     )
 
@@ -1488,16 +1578,16 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
     from .._compiler.device_function import PallasMemorySpace
 
     for fake, _tensor_node, _sub_meta in loaded_tensors.values():
-        if id(fake) in aligned_tensor_ids:
+        if id(fake) in pipelined_tensor_ids:
             state.device_function.pallas_memory_space[id(fake)] = PallasMemorySpace.HBM
     for fake, _tensor_node, _sub_meta in stored_tensors.values():
-        if id(fake) in aligned_tensor_ids:
+        if id(fake) in pipelined_tensor_ids:
             state.device_function.pallas_memory_space[id(fake)] = PallasMemorySpace.HBM
 
     for key, (fake, _tensor_node, sub_meta) in loaded_tensors.items():
         if key in stored_tensors:
             continue  # Handle as output instead
-        if id(fake) not in aligned_tensor_ids:
+        if id(fake) not in pipelined_tensor_ids:
             continue
         hbm_name = state.device_function.tensor_arg(fake).name
         vmem_name = state.device_function.new_var(
@@ -1509,7 +1599,7 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
         pipeline_in_args.append(hbm_name)
 
     for fake, _tensor_node, sub_meta in stored_tensors.values():
-        if id(fake) not in aligned_tensor_ids:
+        if id(fake) not in pipelined_tensor_ids:
             continue
         hbm_name = state.device_function.tensor_arg(fake).name
         vmem_name = state.device_function.new_var(
@@ -1567,7 +1657,7 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
     # sliced via pl.ds against a VMEM ref whose extent is the whole
     # outer-block window.  Pipelined tensors ignore these offsets and
     # use the ``:`` full-slice inside their VMEM scratches.
-    any_non_pipelined = len(aligned_tensor_ids) < len(all_tensor_info)
+    any_non_pipelined = len(pipelined_tensor_ids) < len(all_tensor_info)
     if any_non_pipelined:
         _needs_explicit_indices = True
         for i, bid in enumerate(block_ids):
@@ -1614,6 +1704,8 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
         # Write updated loop-carried values back to scratch
         if has_loop_state:
             _write_back_loop_carried(state, scratch_names, carried, graph_results)
+
+    _emit_nonlocal_scratch_declarations(state, body_stmts)
 
     all_body_params = body_params
     # emit_pipeline passes indices as a single tuple argument; the prologue
@@ -1726,13 +1818,31 @@ def _classify_pipelined_tensors(
 ) -> tuple[
     list[tuple[torch.Tensor, list[object], str]], list[tuple[int, ...]], set[int]
 ]:
-    """Build (all_tensor_info, vmem_shapes, aligned_ids) for an inner loop.
+    """Build (all_tensor_info, vmem_shapes, pipelined_ids) for an inner loop.
 
-    Tensors whose ``vmem_shape`` passes ``_check_dma_alignment`` are eligible
-    for the inner-DMA path (HBM ref + small VMEM scratch in fori_loop, or
-    ``pl.Buffered`` BlockSpec in emit_pipeline); the rest stay on their
-    outer ``pallas_call`` BlockSpec and are closure-read from the body.
+    A tensor is eligible for the inner-DMA path (HBM ref + small VMEM scratch
+    in fori_loop, or ``pl.Buffered`` BlockSpec in emit_pipeline) when:
+
+    * Its inner-block ``vmem_shape`` passes ``_check_dma_alignment`` -- a TPU
+      DMA hardware constraint.
+    * It is not also accessed at outer scope (i.e. in a root graph,
+      between/before/after inner loops).  Pipelining replaces the tensor's
+      outer BlockSpec with ``pltpu.HBM`` so the inner loop's BlockSpec can
+      handle slicing; reads/writes at outer scope would then have to
+      ``pl.ds`` an HBM ref, which Pallas rejects with "Loads are only
+      allowed on VMEM and SMEM references."  Pallas lowers atomics as
+      load-compute-store on the same ref, so outer-scope atomics count as
+      memory accesses too.
+
+    Tensors that fail any check stay on their outer BlockSpec and are
+    closure-read from the body.
     """
+    from .atomic_ops import ATOMIC_OPS
+    from .memory_ops import load as _load_op
+    from .memory_ops import store as _store_op
+
+    outer_access_targets = ATOMIC_OPS | {_load_op, _store_op}
+
     all_tensor_info: list[tuple[torch.Tensor, list[object], str]] = []
     for key, (fake, _tensor_node, sub_meta) in loaded_tensors.items():
         if key not in stored_tensors:
@@ -1742,14 +1852,34 @@ def _classify_pipelined_tensors(
     vmem_shapes = _compute_vmem_shapes(
         all_tensor_info, block_ids, slice_size_exprs, env, state
     )
-    aligned_ids = {
-        id(fake)
-        for (fake, _sub_meta, _direction), vmem_shape in zip(
-            all_tensor_info, vmem_shapes, strict=True
-        )
-        if _check_dma_alignment(vmem_shape)
-    }
-    return all_tensor_info, vmem_shapes, aligned_ids
+    device_ir = HostFunction.current().device_ir
+
+    # Walk all root graphs (outer pallas_call body) for load/store/atomic
+    # nodes; any tensor accessed there is read/written outside the inner
+    # loop and must keep its outer BlockSpec.
+    outer_access_tensor_ids: set[int] = set()
+    for root_id in device_ir.root_ids:
+        root_graph = device_ir.graphs[root_id].graph
+        for node in root_graph.nodes:
+            if node.op != "call_function" or node.target not in outer_access_targets:
+                continue
+            tensor_node = node.args[0]
+            if not isinstance(tensor_node, torch.fx.Node):
+                continue
+            val = tensor_node.meta.get("val")
+            if isinstance(val, torch.Tensor):
+                outer_access_tensor_ids.add(id(val))
+
+    pipelined_ids: set[int] = set()
+    for (fake, _sub_meta, _direction), vmem_shape in zip(
+        all_tensor_info, vmem_shapes, strict=True
+    ):
+        if not _check_dma_alignment(vmem_shape):
+            continue
+        if id(fake) in outer_access_tensor_ids:
+            continue
+        pipelined_ids.add(id(fake))
+    return all_tensor_info, vmem_shapes, pipelined_ids
 
 
 def _codegen_fori_loop(state: CodegenState) -> object:
@@ -1810,13 +1940,13 @@ def _codegen_fori_loop(state: CodegenState) -> object:
             env,
         )
 
-    # Aligned tensors get HBM refs (no outer BlockSpec) + VMEM scratch +
-    # semaphore; unaligned tensors keep their outer BlockSpec and are
-    # accessed via pl.ds() in the body.  Mixing both paths inside a single
-    # fori_loop avoids forcing every tensor onto the non-DMA path when a
-    # lone unaligned tensor is present (which would load full outer-block
+    # Pipelined tensors get HBM refs (no outer BlockSpec) + VMEM scratch +
+    # semaphore; the rest keep their outer BlockSpec and are accessed via
+    # pl.ds() in the body.  Mixing both paths inside a single fori_loop
+    # avoids forcing every tensor onto the non-DMA path when a lone
+    # non-pipelined tensor is present (which would load full outer-block
     # tiles into VMEM and may OOM at large shapes).
-    all_tensor_info, vmem_shapes, aligned_tensor_ids = _classify_pipelined_tensors(
+    all_tensor_info, vmem_shapes, pipelined_tensor_ids = _classify_pipelined_tensors(
         loaded_tensors, stored_tensors, block_ids, slice_size_exprs, env, state
     )
 
@@ -1827,7 +1957,7 @@ def _codegen_fori_loop(state: CodegenState) -> object:
     for (fake, _sub_meta, _direction), vmem_shape in zip(
         all_tensor_info, vmem_shapes, strict=True
     ):
-        if id(fake) not in aligned_tensor_ids:
+        if id(fake) not in pipelined_tensor_ids:
             continue
         state.device_function.pallas_memory_space[id(fake)] = PallasMemorySpace.HBM
         hbm_name = state.device_function.tensor_arg(fake).name
@@ -2015,6 +2145,8 @@ def _codegen_fori_loop(state: CodegenState) -> object:
                 statement_from_string(f"{copy_out_var}.start()")
             )
             state.codegen.add_statement(statement_from_string(f"{copy_out_var}.wait()"))
+
+    _emit_nonlocal_scratch_declarations(state, body_stmts)
 
     # Emit nested fori_loop calls — one per dimension.
     # Build inside-out: innermost function wraps body_stmts, each outer
@@ -2541,12 +2673,15 @@ def _(state: CodegenState) -> ast.AST:
             mask_var := state.codegen.mask_var(index)
         ) is not None:
             expand = state.tile_strategy.expand_str(input_sizes, dim)
-            expr = f"({mask_var}{expand})"
+            # Cast bool mask to float before expanding — Mosaic cannot
+            # reshape bool vectors (e.g. vector<32xi1> → vector<32x1xi1>).
+            expr = f"({mask_var}.astype(jnp.float32){expand})"
             if expr not in mask_exprs:
                 mask_exprs.append(expr)
     if not mask_exprs:
         return state.ast_arg(0)
-    mask_expr = "&".join(mask_exprs)
+    # Combine float masks via multiplication (equivalent to bool AND).
+    mask_expr = " * ".join(mask_exprs)
     if len(mask_exprs) < len(input_sizes):
         mask_expr = backend.broadcast_to_expr(
             mask_expr, state.tile_strategy.shape_str(input_sizes)

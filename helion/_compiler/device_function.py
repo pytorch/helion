@@ -207,6 +207,7 @@ class CuteTcgen05StoreValue:
     epi_tidx: str = ""
     epi_active: str = ""
     exec_active: str = ""
+    warp_idx: str = ""
     epi_tile: str = ""
     c_stage_count: int = 0
     epilog_sync_barrier_id: int = 0
@@ -224,11 +225,16 @@ class CuteTcgen05StoreValue:
     tma_warp: str = ""
     tma_pipeline: str = ""
     tma_producer_state: str = ""
+    tma_store_atom: str = ""
+    tma_store_tensor: str = ""
+    role_local_tile_counter: str = ""
     is_two_cta: bool = False
     use_tma: bool = False
     use_role_local_epi: bool = False
+    use_tma_store_epilogue: bool = False
     ab_stage_count: int = 0
     acc_stage_count: int = 0
+    skip_ab_producer_advance: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -261,8 +267,11 @@ class CuteTcgen05MatmulPlan:
     bm: int
     bn: int
     bk: int
+    k_tile_count: int
     cluster_m: int
     is_two_cta: bool
+    uses_role_local_persistent_body: bool
+    uses_cluster_m2_one_cta_role_local_bridge: bool
     cta_thread_count: int
     physical_m_threads: int
     acc_stage_count: int
@@ -408,6 +417,7 @@ class DeviceFunction:
         self._cute_tcgen05_tma_load_role_stmt_ids: set[int] = set()
         self._cute_tcgen05_mma_exec_role_stmt_ids: set[int] = set()
         self._cute_tcgen05_epi_role_stmt_ids: set[int] = set()
+        self.cute_tcgen05_epi_role_tile_counter_var: str | None = None
         self._cute_collective_handled_loads: set[str] = set()
         self.cute_cluster_shape: tuple[int, int, int] | None = None
         self.cute_block_shape: tuple[int, int, int] | None = None
@@ -725,6 +735,18 @@ class DeviceFunction:
         TMEM-to-GMEM store work that must advance once per tile on epi warps.
         """
         self._cute_tcgen05_epi_role_stmt_ids.update(id(stmt) for stmt in stmts)
+
+    def register_cute_tcgen05_epi_role_tile_counter(self, name: str) -> None:
+        """Publish the per-iteration tile counter used by the epi role.
+
+        Persistent TMA-store epilogues use this counter to rotate SMEM stages
+        across work tiles. The role-local while builder owns its lifetime; the
+        store body only reads it.
+        """
+        if self.cute_tcgen05_epi_role_tile_counter_var is None:
+            self.cute_tcgen05_epi_role_tile_counter_var = name
+            return
+        assert self.cute_tcgen05_epi_role_tile_counter_var == name
 
     def is_cute_tcgen05_epi_role(self, stmt: ast.stmt) -> bool:
         return id(stmt) in self._cute_tcgen05_epi_role_stmt_ids
@@ -1229,8 +1251,8 @@ class DeviceFunction:
 
     def get_tensor_read_write_names(self) -> tuple[set[str], set[str]]:
         """Returns AST names of read and written tensors"""
-        from helion.language import atomic_ops
         from helion.language import memory_ops
+        from helion.language.atomic_ops import ATOMIC_OPS
 
         read_names: set[str] = set()
         write_names: set[str] = set()
@@ -1250,16 +1272,7 @@ class DeviceFunction:
                     read_names.add(_get_tensor_name(node))
                 elif node.target is memory_ops.store:
                     write_names.add(_get_tensor_name(node))
-                elif node.target in (
-                    atomic_ops.atomic_add,
-                    atomic_ops.atomic_cas,
-                    atomic_ops.atomic_or,
-                    atomic_ops.atomic_xor,
-                    atomic_ops.atomic_xchg,
-                    atomic_ops.atomic_min,
-                    atomic_ops.atomic_max,
-                    atomic_ops.atomic_and,
-                ):
+                elif node.target in ATOMIC_OPS:
                     read_names.add(_get_tensor_name(node))
                     write_names.add(_get_tensor_name(node))
         return read_names, write_names

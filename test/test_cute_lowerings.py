@@ -32,12 +32,16 @@ from helion._compiler.backend import _loop_contains_matmul
 from helion._compiler.backend import _loop_may_use_mma
 from helion._compiler.compile_environment import CompileEnvironment
 from helion._compiler.cute.argreduce import codegen_cute_tile_argreduce
+from helion._compiler.cute.cute_mma import _TCGEN05_CLUSTER_LEADER_PREDICATE
 from helion._compiler.cute.cute_mma import _build_initial_prefetch_if
 from helion._compiler.cute.cute_mma import _build_kloop_non_pipeline_producer_if
 from helion._compiler.cute.cute_mma import _build_kloop_non_pipeline_release_if
 from helion._compiler.cute.cute_mma import _build_kloop_pipeline_consumer_if
+from helion._compiler.cute.cute_mma import _build_kloop_pipeline_consumer_prefetch_stmts
 from helion._compiler.cute.cute_mma import _build_kloop_pipeline_producer_if
 from helion._compiler.cute.cute_mma import _build_kloop_pipeline_release_if
+from helion._compiler.cute.cute_mma import _build_tcgen05_mma_accumulate_reset_stmt
+from helion._compiler.cute.cute_mma import _build_tcgen05_mma_issue_stmt
 from helion._compiler.cute.cute_mma import _choose_mma_impl
 from helion._compiler.cute.cute_mma import _get_mma_k_loop_info
 from helion._compiler.cute.cute_mma import _InitialPrefetchTmaArgs
@@ -65,6 +69,51 @@ from helion._compiler.cute.matmul_utils import cute_resolve_active_block_id
 from helion._compiler.cute.matmul_utils import cute_resolve_active_matmul_k_block_id
 from helion._compiler.cute.matmul_utils import cute_static_k_invariant_extent
 from helion._compiler.cute.matmul_utils import cute_supports_scalar_matmul_fallback
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_AB_CONSUMER_PHASE_MODE_CONFIG_KEY,
+)
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_AB_CONSUMER_PHASE_MODE_PHASE1,
+)
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_AB_CONSUMER_WAIT_MODE_CONFIG_KEY,
+)
+from helion._compiler.cute.tcgen05_constants import TCGEN05_AB_CONSUMER_WAIT_MODE_SKIP
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_AB_INITIAL_PRODUCER_ACQUIRE_MODE_CONFIG_KEY,
+)
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_AB_INITIAL_PRODUCER_ACQUIRE_MODE_SKIP_FIRST,
+)
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_AB_PRODUCER_ACQUIRE_MODE_CONFIG_KEY,
+)
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_AB_PRODUCER_ACQUIRE_MODE_SKIP,
+)
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_AB_PRODUCER_ADVANCE_MODE_CONFIG_KEY,
+)
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_AB_PRODUCER_ADVANCE_MODE_SKIP,
+)
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_ACC_PRODUCER_ADVANCE_MODE_CONFIG_KEY,
+)
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_ACC_PRODUCER_ADVANCE_MODE_SKIP,
+)
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_CLUSTER_M2_ONE_CTA_ROLE_LOCAL_CONFIG_KEY,
+)
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_DIAGNOSTIC_INVALID_OUTPUT_CONFIG_KEY,
+)
+from helion._compiler.cute.tcgen05_constants import TCGEN05_LARGE_BN_PROOF_BLOCK_SIZES
+from helion._compiler.cute.tcgen05_constants import TCGEN05_LARGE_BN_PROOF_CLUSTER_M
+from helion._compiler.cute.tcgen05_constants import TCGEN05_LARGE_BN_PROOF_CONFIG_KEY
+from helion._compiler.cute.tcgen05_constants import TCGEN05_LARGE_BN_PROOF_PID_TYPE
+from helion._compiler.cute.tcgen05_constants import TCGEN05_LARGE_BN_PROOF_STAGE_CONFIGS
 from helion._compiler.device_ir import ForLoopGraphInfo
 from helion._compiler.device_ir import RootGraphInfo
 from helion._compiler.device_ir import collect_cute_half_atomic_output_promotions
@@ -80,6 +129,8 @@ from helion._testing import DEVICE
 from helion._testing import default_cute_mma_support
 from helion._testing import onlyBackends
 from helion._testing import patch_cute_mma_support
+from helion.autotuner.config_spec import BlockSizeSpec
+from helion.autotuner.config_spec import ConfigSpec
 import helion.language as hl
 from helion.language import _tracing_ops
 from helion.language._tracing_ops import _mask_to
@@ -110,6 +161,57 @@ def _make_tcgen05_persistent_config(**overrides: object) -> helion.Config:
     }
     defaults.update(overrides)
     return helion.Config(**defaults)  # type: ignore[arg-type]
+
+
+def _make_tcgen05_cluster_m2_cta_group_one_bridge_config(
+    **overrides: object,
+) -> helion.Config:
+    """Build the selected clustered CtaGroup.ONE bridge proof config."""
+    defaults: dict[str, object] = {
+        "block_sizes": [128, 256, 128],
+        "l2_groupings": [4],
+        "num_warps": 4,
+        "num_sm_multiplier": 1,
+        "pid_type": "persistent_interleaved",
+        "indexing": [
+            "tensor_descriptor",
+            "tensor_descriptor",
+            "tensor_descriptor",
+        ],
+        "tcgen05_cluster_m": 2,
+        "tcgen05_ab_stages": 2,
+        "tcgen05_acc_stages": 1,
+        "tcgen05_c_stages": 4,
+        "tcgen05_num_epi_warps": 4,
+        "range_flattens": [None, None],
+        "range_multi_buffers": [None, None],
+        "range_warp_specializes": [None, None],
+        "range_num_stages": [0, 0],
+        "range_unroll_factors": [0, 0],
+    }
+    defaults.update(overrides)
+    return _make_tcgen05_persistent_config(**defaults)
+
+
+def _make_tcgen05_large_bn_proof_config(**overrides: object) -> helion.Config:
+    """Build the first G4 larger-BN admission proof config."""
+    defaults: dict[str, object] = {
+        "block_sizes": list(TCGEN05_LARGE_BN_PROOF_BLOCK_SIZES),
+        "l2_groupings": [1],
+        "num_warps": 4,
+        "pid_type": TCGEN05_LARGE_BN_PROOF_PID_TYPE,
+        "indexing": [
+            "tensor_descriptor",
+            "tensor_descriptor",
+            "tensor_descriptor",
+        ],
+        "tcgen05_cluster_m": TCGEN05_LARGE_BN_PROOF_CLUSTER_M,
+        **dict(TCGEN05_LARGE_BN_PROOF_STAGE_CONFIGS),
+        "tcgen05_num_epi_warps": 4,
+        TCGEN05_LARGE_BN_PROOF_CONFIG_KEY: True,
+    }
+    defaults.update(overrides)
+    return _make_tcgen05_persistent_config(**defaults)
 
 
 class _FakeBlockSize:
@@ -306,6 +408,181 @@ class TestCuteLowerings(unittest.TestCase):
             ),
         )
 
+    def _assert_tma_store_epilogue_order(
+        self, code: str, *, require_tail: bool = True
+    ) -> None:
+        acquire = "tcgen05_c_pipeline.producer_acquire()"
+        t2r_copy = "cute.copy(tcgen05_tiled_copy_t2r"
+        c_buffer = "tcgen05_c_buffer = "
+        r2s_source_store = "tcgen05_tRS_rD.store(tcgen05_acc_vec)"
+        r2s_copy = "cute.copy(tcgen05_tiled_copy_r2s"
+        tma_copy = "cute.copy(tcgen05_tma_store_atom"
+        commit = "tcgen05_c_pipeline.producer_commit()"
+        acc_wait = "tcgen05_acc_pipeline.consumer_wait(tcgen05_acc_consumer_state)"
+        acc_release = (
+            "tcgen05_acc_pipeline.consumer_release(tcgen05_acc_consumer_state)"
+        )
+        acc_advance = "tcgen05_acc_consumer_state.advance()"
+        acc_advance_inline = (
+            "tcgen05_acc_consumer_state._count = "
+            "tcgen05_acc_consumer_state._count + cutlass.Int32(1)"
+        )
+        gmem_tile = "tcgen05_gC = cute.local_tile("
+        subtile_loop = "for _tcgen05_subtile in cutlass.range("
+        later_subtile_guard = "if _tcgen05_subtile != 0"
+        barrier = "tcgen05_epilog_sync_barrier.arrive_and_wait()"
+        shared_fence = "cute.arch.fence_view_async_shared()"
+        tail = "tcgen05_c_pipeline.producer_tail()"
+
+        self.assertEqual(code.count(acquire), 2, code)
+        self.assertEqual(code.count(acc_wait), 1, code)
+        self.assertEqual(code.count(acc_release), 1, code)
+        self.assertEqual(
+            code.count(acc_advance) + code.count(acc_advance_inline), 1, code
+        )
+        first_acquire_pos = code.find(acquire)
+        gmem_tile_pos = code.find(gmem_tile, first_acquire_pos)
+        subtile_loop_pos = code.find(subtile_loop, gmem_tile_pos)
+        later_subtile_guard_pos = code.find(later_subtile_guard, subtile_loop_pos)
+        acquire_pos = code.find(acquire, first_acquire_pos + len(acquire))
+        acc_wait_pos = code.find(acc_wait, acquire_pos)
+        t2r_pos = code.find(t2r_copy)
+        acc_release_pos = code.find(acc_release)
+        acc_advance_pos = code.find(acc_advance, acc_release_pos)
+        if acc_advance_pos < 0:
+            acc_advance_pos = code.find(acc_advance_inline, acc_release_pos)
+        r2s_source_store_pos = code.find(r2s_source_store, acc_release_pos)
+        c_buffer_pos = code.find(c_buffer, acquire_pos)
+        r2s_pos = code.find(r2s_copy)
+        tma_pos = code.find(tma_copy)
+        commit_pos = code.find(commit)
+        for needle, pos in (
+            (acquire, acquire_pos),
+            (acc_wait, acc_wait_pos),
+            (t2r_copy, t2r_pos),
+            (acc_release, acc_release_pos),
+            ("acc consumer state advance", acc_advance_pos),
+            (c_buffer, c_buffer_pos),
+            (r2s_source_store, r2s_source_store_pos),
+            (r2s_copy, r2s_pos),
+            (tma_copy, tma_pos),
+            (commit, commit_pos),
+        ):
+            self.assertGreaterEqual(pos, 0, f"Missing {needle!r} in:\n{code}")
+        for needle, pos in (
+            ("first C producer acquire", first_acquire_pos),
+            (gmem_tile, gmem_tile_pos),
+            (subtile_loop, subtile_loop_pos),
+            (later_subtile_guard, later_subtile_guard_pos),
+        ):
+            self.assertGreaterEqual(pos, 0, f"Missing {needle!r} in:\n{code}")
+        tail_pos = code.find(tail, commit_pos)
+        if require_tail:
+            self.assertGreaterEqual(tail_pos, 0, f"Missing {tail!r} in:\n{code}")
+        else:
+            # Callers pass a bounded role-local while source segment here; a
+            # tail in that segment would drain once per scheduler-recycled tile.
+            self.assertNotIn(tail, code)
+            tail_pos = len(code)
+        epilogue_slice = code[acquire_pos:tail_pos]
+        self.assertEqual(epilogue_slice.count(shared_fence), 1, code)
+        self.assertNotIn("cute.arch.fence_proxy('async.shared'", epilogue_slice)
+        first_barrier_pos = code.find(barrier, acquire_pos)
+        self.assertGreaterEqual(first_barrier_pos, 0, code)
+        second_barrier_pos = code.find(barrier, first_barrier_pos + len(barrier))
+        self.assertGreaterEqual(second_barrier_pos, 0, code)
+        shared_fence_pos = code.find(shared_fence, r2s_pos)
+        self.assertGreaterEqual(shared_fence_pos, 0, code)
+        self.assertLess(first_acquire_pos, gmem_tile_pos, code)
+        self.assertLess(gmem_tile_pos, subtile_loop_pos, code)
+        self.assertLess(subtile_loop_pos, later_subtile_guard_pos, code)
+        self.assertLess(later_subtile_guard_pos, acquire_pos, code)
+        self.assertLess(acquire_pos, acc_wait_pos, code)
+        self.assertLess(acc_wait_pos, t2r_pos, code)
+        self.assertLess(t2r_pos, acc_release_pos, code)
+        self.assertLess(acquire_pos, first_barrier_pos, code)
+        self.assertLess(acc_release_pos, first_barrier_pos, code)
+        self.assertLess(acc_release_pos, r2s_source_store_pos, code)
+        self.assertLess(r2s_source_store_pos, first_barrier_pos, code)
+        self.assertLess(first_barrier_pos, c_buffer_pos, code)
+        self.assertLess(c_buffer_pos, r2s_pos, code)
+        self.assertLess(r2s_pos, shared_fence_pos, code)
+        self.assertLess(shared_fence_pos, second_barrier_pos, code)
+        self.assertLess(second_barrier_pos, tma_pos, code)
+        self.assertLess(tma_pos, commit_pos, code)
+        self.assertLess(commit_pos, acc_advance_pos, code)
+        self.assertLess(acc_advance_pos, tail_pos, code)
+        loop_tail = code[commit_pos:tail_pos]
+        self.assertNotIn(barrier, loop_tail, code)
+        self.assertEqual(code[acquire_pos:tail_pos].count(barrier), 2, code)
+
+    def _role_local_while_source_for_predicate(
+        self, code: str, tree: ast.AST, role_predicate: str
+    ) -> tuple[str, int, int]:
+        matches: list[ast.While] = []
+        for node in ast.walk(tree):
+            if not (
+                isinstance(node, ast.If) and ast.unparse(node.test) == role_predicate
+            ):
+                continue
+            for role_child in ast.walk(node):
+                if isinstance(
+                    role_child, ast.While
+                ) and "tcgen05_role_local" in ast.unparse(role_child.test):
+                    matches.append(role_child)
+        self.assertEqual(
+            len(matches),
+            1,
+            "Expected exactly one role-local while for "
+            f"{role_predicate!r}. Generated code:\n{code}",
+        )
+        role_src = ast.get_source_segment(code, matches[0])
+        self.assertIsNotNone(
+            role_src,
+            "Expected parsed role-local while to preserve source extent. "
+            "Generated code:\n" + code,
+        )
+        assert role_src is not None
+        role_start = code.index(role_src)
+        return role_src, role_start, role_start + len(role_src)
+
+    def _assert_role_local_c_store_pipeline_lifetime(
+        self, code: str, tree: ast.AST, role_predicate: str
+    ) -> str:
+        create = "tcgen05_c_pipeline = cutlass.pipeline.PipelineTmaStore.create("
+        tail = "tcgen05_c_pipeline.producer_tail()"
+        dealloc = "num_allocated_columns=tcgen05_acc_tmem_cols"
+        invariant_setup = [
+            "tcgen05_kernel_desc = type('Tcgen05KernelDesc'",
+            (
+                "tcgen05_store_epi_tile = "
+                "cutlass.utils.blackwell_helpers.compute_epilogue_tile_shape("
+            ),
+            "tcgen05_sD_layout = cutlass.utils.blackwell_helpers.make_smem_layout_epi(",
+            "tcgen05_sD_ptr = cute.arch.alloc_smem(",
+            "tcgen05_sD = cute.make_tensor(",
+            (
+                "tcgen05_tAcc = "
+                "cutlass.utils.gemm.sm100.transform_partitioned_tensor_layout("
+            ),
+        ]
+
+        role_src, role_start, role_end = self._role_local_while_source_for_predicate(
+            code, tree, role_predicate
+        )
+        self.assertNotIn("PipelineTmaStore.create", role_src)
+        self.assertNotIn(tail, role_src)
+        create_pos = code.index(create)
+        tail_pos = code.index(tail)
+        dealloc_pos = code.index(dealloc)
+        self.assertLess(create_pos, role_start)
+        for needle in invariant_setup:
+            self.assertNotIn(needle, role_src)
+            self.assertLess(code.index(needle), role_start)
+        self.assertLess(role_end, tail_pos)
+        self.assertLess(tail_pos, dealloc_pos)
+        return role_src
+
     def test_mma_k_loop_selection_uses_reduction_block(self) -> None:
         env = _fake_env({32: 0, 64: 1, 16: 2, 7: 3})
         r_loop = _fake_device_loop(3)
@@ -501,7 +778,12 @@ class TestCuteLowerings(unittest.TestCase):
         )
         # 4 epi + 1 exec + 1 ab_load = 6 warps, no power-of-2 round-up.
         self.assertIn("block=(64, 6, 1)", code)
-        self.assertIn("tcgen05_gC = cute.local_tile(out, (64, 8),", code)
+        self.assertIn("'kind': 'tcgen05_d_tma'", code)
+        self.assertIn("cutlass.pipeline.PipelineTmaStore.create", code)
+        self.assertIn(
+            "tcgen05_gC = cute.local_tile(tcgen05_tma_store_tensor, (64, 8),",
+            code,
+        )
         self.assertIn("partition_C(tcgen05_gC)", code)
         self.assertNotIn("for _tcgen05_store_i in range(", code)
         self.assertNotIn("cute.arch.warp_reduction_sum", code)
@@ -528,15 +810,11 @@ class TestCuteLowerings(unittest.TestCase):
 
         with patch_cute_mma_support():
             bound = cute_matmul_mma_codegen_only.bind(args)
-            # matmul_ops narrows tcgen05_cluster_m to (1,) for the
-            # bf16/fp16 matmul because cluster_m=2 currently CUDA-launch
-            # fails; this codegen-only test still exercises the cluster=2
-            # path so widen the choices back so the default config picks
-            # cluster_m=2. tcgen05_num_epi_warps is already narrowed to
-            # (4,) by the matmul-side helper -- the only currently-correct
-            # value -- so no override is needed for that knob.
+            # Keep the narrowed cluster_m=1 search. Explicit flat
+            # cluster_m=2 configs are rejected until G3 runtime ownership is
+            # validated, and this auto-path test only needs to pin tcgen05.
             bound.env.config_spec.cute_tcgen05_search_enabled = True
-            bound.env.config_spec.restrict_tcgen05_cluster_m_search((2, 1))
+            bound.env.config_spec.restrict_tcgen05_cluster_m_search((1,))
             config = bound.config_spec.default_config()
             code = bound.to_triton_code(config)
 
@@ -565,14 +843,104 @@ class TestCuteLowerings(unittest.TestCase):
             "tcgen05_epi_tidx = tcgen05_lane_idx + tcgen05_warp_idx * cutlass.Int32(32) if tcgen05_epi_active else cutlass.Int32(0)",
             code,
         )
-        self.assertIn(
-            "mma_slice_tidx = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster()) % cutlass.Int32(2)",
-            code,
-        )
+        self.assertIn("mma_slice_tidx = cutlass.Int32(0)", code)
+        self.assertNotIn("_helion_cute_cluster_shape = (2, 1, 1)", code)
         self.assertIn(
             "if tcgen05_epi_active:",
             code,
         )
+
+    def test_tcgen05_large_bn_proof_admits_minimal_codegen(self) -> None:
+        from helion._compiler.program_id import Tcgen05PersistentProgramIDs
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_large_bn_proof(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        args = (
+            torch.randn(64, 16, device=DEVICE, dtype=torch.float16),
+            torch.randn(16, 512, device=DEVICE, dtype=torch.float16),
+        )
+        config = _make_tcgen05_large_bn_proof_config()
+
+        with patch_cute_mma_support():
+            bound = cute_matmul_large_bn_proof.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            code = bound.to_triton_code(config)
+
+        self.assertIn("cutlass.utils.blackwell_helpers.make_trivial_tiled_mma", code)
+        self.assertIn("cute.nvgpu.tcgen05.CtaGroup.ONE", code)
+        self.assertIn("(64, 512)", code)
+        self.assertIn(
+            "tcgen05_gC = cute.local_tile(tcgen05_tma_store_tensor, (64, 512),",
+            code,
+        )
+        self.assertIn("cutlass.pipeline.PipelineTmaStore.create", code)
+        self.assertNotIn("_helion_cute_cluster_shape = (2, 1, 1)", code)
+        self.assertNotIn(Tcgen05PersistentProgramIDs._MULTI_TILE_GUARD_TOTAL_VAR, code)
+
+    def test_tcgen05_large_bn_proof_rejects_non_proof_shapes(self) -> None:
+        @helion.kernel(backend="cute")
+        def cute_matmul_large_bn_wrong_shape(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        args = (
+            torch.randn(128, 16, device=DEVICE, dtype=torch.float16),
+            torch.randn(16, 512, device=DEVICE, dtype=torch.float16),
+        )
+        config = _make_tcgen05_large_bn_proof_config(block_sizes=[128, 512, 16])
+
+        with patch_cute_mma_support():
+            bound = cute_matmul_large_bn_wrong_shape.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            with self.assertRaisesRegex(
+                exc.InvalidConfig,
+                "tcgen05_ab_stages=2, tcgen05_acc_stages=1, and tcgen05_c_stages=2",
+            ):
+                bound.to_triton_code(config)
+
+        config = _make_tcgen05_large_bn_proof_config()
+        with patch_cute_mma_support():
+            bound = cute_matmul_large_bn_wrong_shape.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            with self.assertRaisesRegex(
+                exc.BackendUnsupported,
+                "M=64,N=512,K=16",
+            ):
+                bound.to_triton_code(config)
+
+        noncontiguous_args = (
+            torch.randn(16, 64, device=DEVICE, dtype=torch.float16).t(),
+            torch.randn(16, 512, device=DEVICE, dtype=torch.float16),
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_large_bn_wrong_shape.bind(noncontiguous_args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            with self.assertRaisesRegex(
+                exc.BackendUnsupported,
+                "final tcgen05 CtaGroup.ONE TMA-load and TMA-store lowering",
+            ):
+                bound.to_triton_code(config)
 
     def test_tcgen05_dot_codegen_preregisters_collective_loads(self) -> None:
         @helion.kernel(backend="cute")
@@ -716,7 +1084,7 @@ class TestCuteLowerings(unittest.TestCase):
             code,
         )
         self.assertIn(
-            "cute.arch.setmaxregister_decrease(cutlass.Int32(120))",
+            "cute.arch.setmaxregister_decrease(120)",
             code,
         )
         # Consumer / epi warps raise to 256 regs.
@@ -725,18 +1093,14 @@ class TestCuteLowerings(unittest.TestCase):
             code,
         )
         self.assertIn(
-            "cute.arch.setmaxregister_increase(cutlass.Int32(256))",
+            "cute.arch.setmaxregister_increase(256)",
             code,
         )
         # The setmaxregister calls land between the warp-role boolean
         # assignments and the MMA setup, so they sit in the registered
         # invariant block and do not get re-emitted per work-tile.
-        decrease_pos = code.find(
-            "cute.arch.setmaxregister_decrease(cutlass.Int32(120))"
-        )
-        increase_pos = code.find(
-            "cute.arch.setmaxregister_increase(cutlass.Int32(256))"
-        )
+        decrease_pos = code.find("cute.arch.setmaxregister_decrease(120)")
+        increase_pos = code.find("cute.arch.setmaxregister_increase(256)")
         epi_active_pos = code.find("tcgen05_epi_tidx = ")
         mma_slice_pos = code.find("mma_slice_tidx = ")
         self.assertGreater(decrease_pos, epi_active_pos)
@@ -981,8 +1345,8 @@ class TestCuteLowerings(unittest.TestCase):
         ``tcgen05_tma_warp`` gate because the enclosing role-local loop
         already restricts execution to that warp. The MMA-exec role owns
         AB consumer wait/release, UMMA issue, and acc producer state. The
-        epi role owns acc consumer wait/release and the SIMT TMEM->GMEM
-        store body."""
+        epi role owns acc consumer wait/release and the TMA-store epilogue
+        with a role-local tile counter for the SMEM ring."""
 
         @helion.kernel(backend="cute")
         def cute_matmul_persistent_role(
@@ -1010,6 +1374,11 @@ class TestCuteLowerings(unittest.TestCase):
                 pid_type="persistent_blocked",
             )
             code = bound.to_triton_code(cfg)
+        self.assertIn("'kind': 'tcgen05_d_tma'", code)
+        self.assertIn(
+            "tcgen05_tma_store_role_tile = tcgen05_tma_store_role_tile + cutlass.Int32(1)",
+            code,
+        )
         # The role predicates the partitioner uses for role gates. The
         # TMA-load warp id is 5 and the exec warp id is 4 for the 6-warp layout
         # (epi=warps 0..3, exec=4, tma=5).
@@ -1107,14 +1476,17 @@ class TestCuteLowerings(unittest.TestCase):
                     "tcgen05_acc_pipeline.consumer_wait(tcgen05_acc_consumer_state)",
                     role_src,
                 )
-                self.assertIn("cute.nvgpu.CopyUniversalOp()", role_src)
+                self.assertNotIn("PipelineTmaStore.create", role_src)
+                self.assertIn("cute.nvgpu.cpasync.tma_partition", role_src)
+                self.assertIn("cute.copy(tcgen05_tma_store_atom", role_src)
+                self.assertIn("tcgen05_tma_store_role_tile", role_src)
+                self.assertNotIn("cute.nvgpu.CopyUniversalOp()", role_src)
                 self.assertIn("cute.copy(tcgen05_tiled_copy_t2r", role_src)
-                self.assertIn("cute.copy(tcgen05_simt_atom", role_src)
+                self._assert_tma_store_epilogue_order(role_src, require_tail=False)
                 self.assertIn(
                     "tcgen05_acc_pipeline.consumer_release(tcgen05_acc_consumer_state)",
                     role_src,
                 )
-                self.assertIn("tcgen05_acc_consumer_state.advance()", role_src)
                 self.assertNotIn("cute.arch.sync_threads()", role_src)
                 found_role_local_epi_loop = True
 
@@ -1143,6 +1515,7 @@ class TestCuteLowerings(unittest.TestCase):
                 shared_src,
             )
             self.assertNotIn("cute.nvgpu.CopyUniversalOp()", shared_src)
+            self.assertNotIn("PipelineTmaStore.create", shared_src)
             shared_loop_preserves_barriers = "cute.arch.sync_threads()" in shared_src
             shared_scheduler_retargeted_to_exec = (
                 "cute.arch.make_warp_uniform(cute.arch.warp_idx()) == cutlass.Int32(4)"
@@ -1175,6 +1548,9 @@ class TestCuteLowerings(unittest.TestCase):
             "Expected a role-local epilogue while containing acc consumer "
             "and SIMT store work. Generated code:\n" + code,
         )
+        self._assert_role_local_c_store_pipeline_lifetime(
+            code, tree, epi_role_predicate
+        )
         self.assertTrue(
             shared_loop_preserves_barriers,
             "Shared persistent while must preserve CTA barriers so the "
@@ -1197,6 +1573,1097 @@ class TestCuteLowerings(unittest.TestCase):
             "Shared persistent while should not contain the TMA producer "
             "K-loop. Generated code:\n" + code,
         )
+
+    def test_tcgen05_flat_static_full_uses_tma_store_epilogue(self) -> None:
+        """Static-full flat tcgen05 lowers the first G2 TMA-store epilogue.
+
+        The flat fast path has one output tile per CTA, so its staged SMEM +
+        TMA bulk store path can use the subtile index directly as the ring
+        stage. Persistent kernels use a role-local tile counter instead.
+        """
+
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_flat_tma_store(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        torch.manual_seed(0)
+        args = (
+            torch.randn(256, 32, device=DEVICE, dtype=torch.float16),
+            torch.randn(32, 256, device=DEVICE, dtype=torch.float16),
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_flat_tma_store.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            cfg = _make_tcgen05_persistent_config(
+                block_sizes=[128, 128, 16],
+                pid_type="flat",
+            )
+            code = bound.to_triton_code(cfg)
+            self.assertIn("'kind': 'tcgen05_d_tma'", code)
+            self.assertIn("cutlass.pipeline.PipelineTmaStore.create", code)
+            self.assertIn(
+                "cutlass.utils.gemm.sm100.epilogue_smem_copy_and_partition",
+                code,
+            )
+            self.assertIn("cute.nvgpu.cpasync.tma_partition", code)
+            self.assertIn("cute.copy(tcgen05_tma_store_atom", code)
+            self.assertNotIn("cute.nvgpu.CopyUniversalOp()", code)
+            self._assert_tma_store_epilogue_order(code)
+            bound.set_config(cfg)
+            out = bound(*args)
+
+        expected = args[0] @ args[1]
+        torch.testing.assert_close(out, expected, atol=2e-1, rtol=1e-2)
+
+    def test_tcgen05_diagnostic_first_c_acquire_moves_into_subtile_loop(
+        self,
+    ) -> None:
+        """The first-C-acquire discriminator changes only that acquire site."""
+
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_flat_tma_store(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        torch.manual_seed(0)
+        args = (
+            torch.randn(256, 32, device=DEVICE, dtype=torch.float16),
+            torch.randn(32, 256, device=DEVICE, dtype=torch.float16),
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_flat_tma_store.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            cfg = _make_tcgen05_persistent_config(
+                block_sizes=[128, 128, 16],
+                pid_type="flat",
+                tcgen05_c_acquire_placement="first_in_loop",
+            )
+            code = bound.to_triton_code(cfg)
+
+        acquire = "tcgen05_c_pipeline.producer_acquire()"
+        gmem_tile = "tcgen05_gC = cute.local_tile("
+        subtile_loop = "for _tcgen05_subtile in cutlass.range("
+        first_subtile_guard = (
+            "if _tcgen05_subtile == 0 and tcgen05_warp_idx == cutlass.Int32(0):"
+        )
+        later_subtile_guard = (
+            "if _tcgen05_subtile != 0 and tcgen05_warp_idx == cutlass.Int32(0):"
+        )
+        acc_wait = "tcgen05_acc_pipeline.consumer_wait(tcgen05_acc_consumer_state)"
+
+        self.assertEqual(code.count(acquire), 2, code)
+        gmem_tile_pos = code.find(gmem_tile)
+        subtile_loop_pos = code.find(subtile_loop, gmem_tile_pos)
+        first_subtile_guard_pos = code.find(first_subtile_guard, subtile_loop_pos)
+        first_acquire_pos = code.find(acquire, first_subtile_guard_pos)
+        later_subtile_guard_pos = code.find(later_subtile_guard, first_acquire_pos)
+        later_acquire_pos = code.find(acquire, later_subtile_guard_pos)
+        acc_wait_pos = code.find(acc_wait, later_acquire_pos)
+        for needle, pos in (
+            (gmem_tile, gmem_tile_pos),
+            (subtile_loop, subtile_loop_pos),
+            (first_subtile_guard, first_subtile_guard_pos),
+            ("first in-loop C acquire", first_acquire_pos),
+            (later_subtile_guard, later_subtile_guard_pos),
+            ("later C acquire", later_acquire_pos),
+            (acc_wait, acc_wait_pos),
+        ):
+            self.assertGreaterEqual(pos, 0, f"Missing {needle!r} in:\n{code}")
+        self.assertLess(gmem_tile_pos, subtile_loop_pos, code)
+        self.assertLess(subtile_loop_pos, first_subtile_guard_pos, code)
+        self.assertLess(first_subtile_guard_pos, first_acquire_pos, code)
+        self.assertLess(first_acquire_pos, later_subtile_guard_pos, code)
+        self.assertLess(later_subtile_guard_pos, later_acquire_pos, code)
+        self.assertLess(later_acquire_pos, acc_wait_pos, code)
+
+    def test_tcgen05_diagnostic_later_c_acquire_moves_before_barrier(
+        self,
+    ) -> None:
+        @helion.kernel(backend="cute")
+        def cute_matmul_flat_tma_store(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        torch.manual_seed(0)
+        args = (
+            torch.randn(256, 32, device=DEVICE, dtype=torch.float16),
+            torch.randn(32, 256, device=DEVICE, dtype=torch.float16),
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_flat_tma_store.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            cfg = _make_tcgen05_persistent_config(
+                block_sizes=[128, 128, 16],
+                pid_type="flat",
+                tcgen05_c_acquire_placement="later_before_barrier",
+            )
+            code = bound.to_triton_code(cfg)
+
+        acquire = "tcgen05_c_pipeline.producer_acquire()"
+        gmem_tile = "tcgen05_gC = cute.local_tile("
+        subtile_loop = "for _tcgen05_subtile in cutlass.range("
+        later_subtile_guard = (
+            "if _tcgen05_subtile != 0 and tcgen05_warp_idx == cutlass.Int32(0):"
+        )
+        acc_wait = "tcgen05_acc_pipeline.consumer_wait(tcgen05_acc_consumer_state)"
+        rmem_store = "tcgen05_tRS_rD.store(tcgen05_acc_vec)"
+        first_barrier = "tcgen05_epilog_sync_barrier.arrive_and_wait()"
+
+        self.assertEqual(code.count(acquire), 2, code)
+        self.assertEqual(code.count(later_subtile_guard), 1, code)
+        first_acquire_pos = code.find(acquire)
+        gmem_tile_pos = code.find(gmem_tile)
+        subtile_loop_pos = code.find(subtile_loop, gmem_tile_pos)
+        acc_wait_pos = code.find(acc_wait, subtile_loop_pos)
+        rmem_store_pos = code.find(rmem_store, acc_wait_pos)
+        later_subtile_guard_pos = code.find(later_subtile_guard, rmem_store_pos)
+        later_acquire_pos = code.find(acquire, later_subtile_guard_pos)
+        first_barrier_pos = code.find(first_barrier, later_acquire_pos)
+        for needle, pos in (
+            ("pre-loop C acquire", first_acquire_pos),
+            (gmem_tile, gmem_tile_pos),
+            (subtile_loop, subtile_loop_pos),
+            (acc_wait, acc_wait_pos),
+            (rmem_store, rmem_store_pos),
+            (later_subtile_guard, later_subtile_guard_pos),
+            ("delayed later C acquire", later_acquire_pos),
+            (first_barrier, first_barrier_pos),
+        ):
+            self.assertGreaterEqual(pos, 0, f"Missing {needle!r} in:\n{code}")
+        self.assertLess(first_acquire_pos, gmem_tile_pos, code)
+        self.assertLess(gmem_tile_pos, subtile_loop_pos, code)
+        self.assertLess(subtile_loop_pos, acc_wait_pos, code)
+        self.assertLess(acc_wait_pos, rmem_store_pos, code)
+        self.assertLess(rmem_store_pos, later_subtile_guard_pos, code)
+        self.assertLess(later_subtile_guard_pos, later_acquire_pos, code)
+        self.assertLess(later_acquire_pos, first_barrier_pos, code)
+
+    def test_tcgen05_diagnostic_acc_wait_moves_before_subtile_loop(
+        self,
+    ) -> None:
+        @helion.kernel(backend="cute")
+        def cute_matmul_flat_tma_store(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        torch.manual_seed(0)
+        args = (
+            torch.randn(256, 32, device=DEVICE, dtype=torch.float16),
+            torch.randn(32, 256, device=DEVICE, dtype=torch.float16),
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_flat_tma_store.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            cfg = _make_tcgen05_persistent_config(
+                block_sizes=[128, 128, 16],
+                pid_type="flat",
+                tcgen05_acc_wait_placement="before_subtile_loop",
+            )
+            code = bound.to_triton_code(cfg)
+
+        acquire = "tcgen05_c_pipeline.producer_acquire()"
+        gmem_tile = "tcgen05_gC = cute.local_tile("
+        acc_wait = "tcgen05_acc_pipeline.consumer_wait(tcgen05_acc_consumer_state)"
+        subtile_loop = "for _tcgen05_subtile in cutlass.range("
+        subtile_acc_wait = (
+            "if _tcgen05_subtile == 0:\n"
+            "            tcgen05_acc_pipeline.consumer_wait(tcgen05_acc_consumer_state)"
+        )
+        later_subtile_guard = (
+            "if _tcgen05_subtile != 0 and tcgen05_warp_idx == cutlass.Int32(0):"
+        )
+        t2r_copy = "cute.copy(tcgen05_tiled_copy_t2r"
+
+        self.assertEqual(code.count(acc_wait), 1, code)
+        self.assertNotIn(subtile_acc_wait, code)
+        first_acquire_pos = code.find(acquire)
+        gmem_tile_pos = code.find(gmem_tile)
+        acc_wait_pos = code.find(acc_wait, gmem_tile_pos)
+        subtile_loop_pos = code.find(subtile_loop, acc_wait_pos)
+        later_subtile_guard_pos = code.find(later_subtile_guard, subtile_loop_pos)
+        later_acquire_pos = code.find(acquire, later_subtile_guard_pos)
+        t2r_copy_pos = code.find(t2r_copy, later_acquire_pos)
+        for needle, pos in (
+            ("pre-loop C acquire", first_acquire_pos),
+            (gmem_tile, gmem_tile_pos),
+            (acc_wait, acc_wait_pos),
+            (subtile_loop, subtile_loop_pos),
+            (later_subtile_guard, later_subtile_guard_pos),
+            ("later C acquire", later_acquire_pos),
+            (t2r_copy, t2r_copy_pos),
+        ):
+            self.assertGreaterEqual(pos, 0, f"Missing {needle!r} in:\n{code}")
+        self.assertLess(first_acquire_pos, gmem_tile_pos, code)
+        self.assertLess(gmem_tile_pos, acc_wait_pos, code)
+        self.assertLess(acc_wait_pos, subtile_loop_pos, code)
+        self.assertLess(subtile_loop_pos, later_subtile_guard_pos, code)
+        self.assertLess(later_subtile_guard_pos, later_acquire_pos, code)
+        self.assertLess(later_acquire_pos, t2r_copy_pos, code)
+
+    def test_tcgen05_diagnostic_split_first_t2r_layout_splits_subtile_loop(
+        self,
+    ) -> None:
+        @helion.kernel(backend="cute")
+        def cute_matmul_persistent_role(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        torch.manual_seed(0)
+        args = (
+            torch.randn(512, 32, device=DEVICE, dtype=torch.float16),
+            torch.randn(32, 256, device=DEVICE, dtype=torch.float16),
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_persistent_role.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            cfg = _make_tcgen05_persistent_config(
+                block_sizes=[256, 256, 16],
+                l2_groupings=[4],
+                pid_type="persistent_interleaved",
+                tcgen05_cluster_m=2,
+                tcgen05_c_acquire_placement="first_in_loop",
+                tcgen05_epilogue_layout="split_first_t2r",
+            )
+            code = bound.to_triton_code(cfg)
+
+        epi_role_predicate = (
+            "cute.arch.make_warp_uniform(cute.arch.warp_idx()) < cutlass.Int32(4)"
+        )
+        role_src, _, _ = self._role_local_while_source_for_predicate(
+            code,
+            ast.parse(code),
+            epi_role_predicate,
+        )
+        first_subtile_assign = "_tcgen05_subtile = 0"
+        split_loop = (
+            "for _tcgen05_split_subtile in cutlass.range("
+            "tcgen05_subtile_count - 1, unroll_full=True):"
+        )
+        tail_subtile_assign = "_tcgen05_subtile = _tcgen05_split_subtile + 1"
+        acc_wait = "tcgen05_acc_pipeline.consumer_wait(tcgen05_acc_consumer_state)"
+        t2r_copy = "cute.copy(tcgen05_tiled_copy_t2r"
+        r2s_source_store = "tcgen05_tRS_rD.store(tcgen05_acc_vec)"
+        first_barrier = "tcgen05_epilog_sync_barrier.arrive_and_wait()"
+        c_acquire = "tcgen05_c_pipeline.producer_acquire()"
+        c_commit = "tcgen05_c_pipeline.producer_commit()"
+        acc_release = (
+            "tcgen05_acc_pipeline.consumer_release(tcgen05_acc_consumer_state)"
+        )
+
+        first_assign_pos = role_src.find(first_subtile_assign)
+        acc_wait_pos = role_src.find(acc_wait, first_assign_pos)
+        first_t2r_pos = role_src.find(t2r_copy, acc_wait_pos)
+        first_r2s_store_pos = role_src.find(r2s_source_store, first_t2r_pos)
+        first_barrier_pos = role_src.find(first_barrier, first_r2s_store_pos)
+        first_commit_pos = role_src.find(c_commit, first_barrier_pos)
+        split_loop_pos = role_src.find(split_loop, first_commit_pos)
+        tail_assign_pos = role_src.find(tail_subtile_assign, split_loop_pos)
+        tail_t2r_pos = role_src.find(t2r_copy, tail_assign_pos)
+        first_acquire_pos = role_src.find(c_acquire)
+        first_release_pos = role_src.find(acc_release, first_t2r_pos)
+
+        for needle, pos in (
+            (first_subtile_assign, first_assign_pos),
+            (acc_wait, acc_wait_pos),
+            (t2r_copy, first_t2r_pos),
+            (r2s_source_store, first_r2s_store_pos),
+            (first_barrier, first_barrier_pos),
+            (c_commit, first_commit_pos),
+            (split_loop, split_loop_pos),
+            (tail_subtile_assign, tail_assign_pos),
+            ("tail T2R copy", tail_t2r_pos),
+            ("first C acquire", first_acquire_pos),
+            (acc_release, first_release_pos),
+        ):
+            self.assertGreaterEqual(pos, 0, f"Missing {needle!r} in:\n{role_src}")
+        self.assertLess(first_acquire_pos, first_r2s_store_pos, role_src)
+        self.assertLess(first_assign_pos, acc_wait_pos, role_src)
+        self.assertLess(acc_wait_pos, first_t2r_pos, role_src)
+        self.assertLess(first_t2r_pos, first_release_pos, role_src)
+        self.assertLess(first_release_pos, first_barrier_pos, role_src)
+        self.assertLess(first_barrier_pos, first_commit_pos, role_src)
+        self.assertLess(first_commit_pos, split_loop_pos, role_src)
+        self.assertLess(split_loop_pos, tail_assign_pos, role_src)
+        self.assertLess(tail_assign_pos, tail_t2r_pos, role_src)
+        self.assertEqual(role_src.count(acc_wait), 1, role_src)
+        self.assertNotIn("if _tcgen05_subtile == 0 and", role_src)
+
+    def test_tcgen05_diagnostic_split_acc_t2r_store_tail_layout_splits_regions(
+        self,
+    ) -> None:
+        @helion.kernel(backend="cute")
+        def cute_matmul_persistent_role(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        torch.manual_seed(0)
+        args = (
+            torch.randn(512, 32, device=DEVICE, dtype=torch.float16),
+            torch.randn(32, 256, device=DEVICE, dtype=torch.float16),
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_persistent_role.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            cfg = _make_tcgen05_persistent_config(
+                block_sizes=[256, 256, 16],
+                l2_groupings=[4],
+                pid_type="persistent_interleaved",
+                tcgen05_cluster_m=2,
+                tcgen05_epilogue_layout="split_acc_t2r_store_tail",
+            )
+            code = bound.to_triton_code(cfg)
+
+        epi_role_predicate = (
+            "cute.arch.make_warp_uniform(cute.arch.warp_idx()) < cutlass.Int32(4)"
+        )
+        role_src, _, _ = self._role_local_while_source_for_predicate(
+            code,
+            ast.parse(code),
+            epi_role_predicate,
+        )
+        subtile_loop = (
+            "for _tcgen05_subtile in cutlass.range("
+            "tcgen05_subtile_count, unroll_full=True):"
+        )
+        later_guard = "if _tcgen05_subtile != 0 and"
+        c_acquire = "tcgen05_c_pipeline.producer_acquire()"
+        acc_wait = "tcgen05_acc_pipeline.consumer_wait(tcgen05_acc_consumer_state)"
+        t2r_copy = "cute.copy(tcgen05_tiled_copy_t2r"
+        acc_release = (
+            "tcgen05_acc_pipeline.consumer_release(tcgen05_acc_consumer_state)"
+        )
+        r2s_source_store = "tcgen05_tRS_rD.store(tcgen05_acc_vec)"
+        first_barrier = "tcgen05_epilog_sync_barrier.arrive_and_wait()"
+        r2s_copy = "cute.copy(tcgen05_tiled_copy_r2s"
+        shared_fence = "cute.arch.fence_view_async_shared()"
+        tma_store_copy = "cute.copy(tcgen05_tma_store_atom"
+        c_commit = "tcgen05_c_pipeline.producer_commit()"
+
+        subtile_loop_pos = role_src.find(subtile_loop)
+        epi_active_pos = role_src.find("if tcgen05_epi_active:", subtile_loop_pos)
+        c_region_pos = role_src.find("if True:", epi_active_pos)
+        later_guard_pos = role_src.find(later_guard, c_region_pos)
+        later_acquire_pos = role_src.find(c_acquire, later_guard_pos)
+        acc_region_pos = role_src.find("if True:", later_acquire_pos)
+        acc_wait_pos = role_src.find(acc_wait, acc_region_pos)
+        t2r_copy_pos = role_src.find(t2r_copy, acc_wait_pos)
+        acc_release_pos = role_src.find(acc_release, t2r_copy_pos)
+        r2s_source_store_pos = role_src.find(r2s_source_store, t2r_copy_pos)
+        tail_region_pos = role_src.find("if True:", r2s_source_store_pos)
+        first_barrier_pos = role_src.find(first_barrier, tail_region_pos)
+        r2s_copy_pos = role_src.find(r2s_copy, first_barrier_pos)
+        shared_fence_pos = role_src.find(shared_fence, r2s_copy_pos)
+        second_barrier_pos = role_src.find(first_barrier, shared_fence_pos)
+        tma_store_copy_pos = role_src.find(tma_store_copy, second_barrier_pos)
+        c_commit_pos = role_src.find(c_commit, tma_store_copy_pos)
+
+        for needle, pos in (
+            (subtile_loop, subtile_loop_pos),
+            ("epilogue active guard", epi_active_pos),
+            ("C-stage acquire source boundary", c_region_pos),
+            (later_guard, later_guard_pos),
+            (c_acquire, later_acquire_pos),
+            ("accumulator wait / T2R source boundary", acc_region_pos),
+            (acc_wait, acc_wait_pos),
+            (t2r_copy, t2r_copy_pos),
+            (acc_release, acc_release_pos),
+            (r2s_source_store, r2s_source_store_pos),
+            ("C-store barrier / TMA tail source boundary", tail_region_pos),
+            (first_barrier, first_barrier_pos),
+            (r2s_copy, r2s_copy_pos),
+            (shared_fence, shared_fence_pos),
+            ("second epilogue barrier", second_barrier_pos),
+            (tma_store_copy, tma_store_copy_pos),
+            (c_commit, c_commit_pos),
+        ):
+            self.assertGreaterEqual(pos, 0, f"Missing {needle!r} in:\n{role_src}")
+        self.assertLess(subtile_loop_pos, c_region_pos, role_src)
+        self.assertLess(c_region_pos, later_guard_pos, role_src)
+        self.assertLess(later_guard_pos, later_acquire_pos, role_src)
+        self.assertLess(later_acquire_pos, acc_region_pos, role_src)
+        self.assertLess(acc_region_pos, acc_wait_pos, role_src)
+        self.assertLess(acc_wait_pos, t2r_copy_pos, role_src)
+        self.assertLess(t2r_copy_pos, acc_release_pos, role_src)
+        self.assertLess(acc_release_pos, first_barrier_pos, role_src)
+        self.assertLess(t2r_copy_pos, r2s_source_store_pos, role_src)
+        self.assertLess(r2s_source_store_pos, tail_region_pos, role_src)
+        self.assertLess(tail_region_pos, first_barrier_pos, role_src)
+        self.assertLess(first_barrier_pos, r2s_copy_pos, role_src)
+        self.assertLess(r2s_copy_pos, shared_fence_pos, role_src)
+        self.assertLess(shared_fence_pos, second_barrier_pos, role_src)
+        self.assertLess(second_barrier_pos, tma_store_copy_pos, role_src)
+        self.assertLess(tma_store_copy_pos, c_commit_pos, role_src)
+        self.assertEqual(role_src.count("if True:"), 4, role_src)
+        self.assertNotIn("_tcgen05_split_subtile", role_src)
+
+    def test_tcgen05_diagnostic_module_helper_acc_t2r_layout_uses_module_helper(
+        self,
+    ) -> None:
+        @helion.kernel(backend="cute")
+        def cute_matmul_persistent_role(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        torch.manual_seed(0)
+        args = (
+            torch.randn(512, 32, device=DEVICE, dtype=torch.float16),
+            torch.randn(32, 256, device=DEVICE, dtype=torch.float16),
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_persistent_role.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            cfg = _make_tcgen05_persistent_config(
+                block_sizes=[256, 256, 16],
+                l2_groupings=[4],
+                pid_type="persistent_interleaved",
+                tcgen05_cluster_m=2,
+                tcgen05_epilogue_layout="module_helper_acc_t2r",
+            )
+            code = bound.to_triton_code(cfg)
+
+        tree = ast.parse(code)
+        helper_defs = [
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name.startswith("tcgen05_acc_t2r_region")
+        ]
+        self.assertEqual(len(helper_defs), 1, code)
+        helper_name = helper_defs[0].name
+        helper_src = ast.get_source_segment(code, helper_defs[0])
+        self.assertIsNotNone(helper_src)
+        assert helper_src is not None
+        self.assertIn(f"@cute.jit\ndef {helper_name}(", code)
+        helper_def_pos = code.find(f"def {helper_name}(")
+        kernel_pos = code.find("@cute.kernel")
+        self.assertLess(helper_def_pos, kernel_pos, code)
+
+        epi_role_predicate = (
+            "cute.arch.make_warp_uniform(cute.arch.warp_idx()) < cutlass.Int32(4)"
+        )
+        role_src, _, _ = self._role_local_while_source_for_predicate(
+            code,
+            tree,
+            epi_role_predicate,
+        )
+        helper_call_pos = role_src.find(f"{helper_name}(")
+        first_barrier = "tcgen05_epilog_sync_barrier.arrive_and_wait()"
+        first_barrier_pos = role_src.find(first_barrier, helper_call_pos)
+        c_commit_pos = role_src.find(
+            "tcgen05_c_pipeline.producer_commit()",
+            first_barrier_pos,
+        )
+        for needle, pos in (
+            (f"def {helper_name}(", helper_def_pos),
+            (f"{helper_name}(", helper_call_pos),
+            (first_barrier, first_barrier_pos),
+            ("tcgen05_c_pipeline.producer_commit()", c_commit_pos),
+        ):
+            self.assertGreaterEqual(pos, 0, f"Missing {needle!r} in:\n{code}")
+        self.assertIn(
+            "tcgen05_acc_pipeline.consumer_wait(tcgen05_acc_consumer_state)",
+            helper_src,
+        )
+        self.assertIn("cute.copy(tcgen05_tiled_copy_t2r", helper_src)
+        self.assertIn(
+            "tcgen05_acc_pipeline.consumer_release(tcgen05_acc_consumer_state)",
+            helper_src,
+        )
+        self.assertIn("tcgen05_tRS_rD.store(tcgen05_acc_vec)", helper_src)
+        self.assertLess(helper_call_pos, first_barrier_pos, role_src)
+        self.assertLess(first_barrier_pos, c_commit_pos, role_src)
+        self.assertNotIn(
+            "tcgen05_acc_pipeline.consumer_wait(tcgen05_acc_consumer_state)",
+            role_src,
+        )
+        self.assertNotIn("cute.copy(tcgen05_tiled_copy_t2r", role_src)
+
+    def test_tcgen05_diagnostic_module_helper_store_tail_layout_uses_module_helper(
+        self,
+    ) -> None:
+        @helion.kernel(backend="cute")
+        def cute_matmul_persistent_role(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        torch.manual_seed(0)
+        args = (
+            torch.randn(512, 32, device=DEVICE, dtype=torch.float16),
+            torch.randn(32, 256, device=DEVICE, dtype=torch.float16),
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_persistent_role.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            cfg = _make_tcgen05_persistent_config(
+                block_sizes=[256, 256, 16],
+                l2_groupings=[4],
+                pid_type="persistent_interleaved",
+                tcgen05_cluster_m=2,
+                tcgen05_epilogue_layout="module_helper_store_tail",
+            )
+            code = bound.to_triton_code(cfg)
+
+        tree = ast.parse(code)
+        helper_defs = [
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name.startswith("tcgen05_store_tail_region")
+        ]
+        self.assertEqual(len(helper_defs), 1, code)
+        helper_name = helper_defs[0].name
+        helper_src = ast.get_source_segment(code, helper_defs[0])
+        self.assertIsNotNone(helper_src)
+        assert helper_src is not None
+        self.assertIn(f"@cute.jit\ndef {helper_name}(", code)
+        helper_def_pos = code.find(f"def {helper_name}(")
+        kernel_pos = code.find("@cute.kernel")
+        self.assertLess(helper_def_pos, kernel_pos, code)
+
+        epi_role_predicate = (
+            "cute.arch.make_warp_uniform(cute.arch.warp_idx()) < cutlass.Int32(4)"
+        )
+        role_src, _, _ = self._role_local_while_source_for_predicate(
+            code,
+            tree,
+            epi_role_predicate,
+        )
+        acc_wait = "tcgen05_acc_pipeline.consumer_wait(tcgen05_acc_consumer_state)"
+        t2r_copy = "cute.copy(tcgen05_tiled_copy_t2r"
+        r2s_source_store = "tcgen05_tRS_rD.store(tcgen05_acc_vec)"
+        helper_call_pos = role_src.find(f"{helper_name}(")
+        acc_wait_pos = role_src.find(acc_wait)
+        t2r_copy_pos = role_src.find(t2r_copy, acc_wait_pos)
+        r2s_source_store_pos = role_src.find(r2s_source_store, t2r_copy_pos)
+
+        for needle, pos in (
+            (f"def {helper_name}(", helper_def_pos),
+            (acc_wait, acc_wait_pos),
+            (t2r_copy, t2r_copy_pos),
+            (r2s_source_store, r2s_source_store_pos),
+            (f"{helper_name}(", helper_call_pos),
+        ):
+            self.assertGreaterEqual(pos, 0, f"Missing {needle!r} in:\n{code}")
+        self.assertIn("tcgen05_epilog_sync_barrier.arrive_and_wait()", helper_src)
+        self.assertIn("cute.copy(tcgen05_tiled_copy_r2s", helper_src)
+        self.assertIn("cute.arch.fence_view_async_shared()", helper_src)
+        self.assertIn("cute.copy(tcgen05_tma_store_atom", helper_src)
+        self.assertIn("tcgen05_c_pipeline.producer_commit()", helper_src)
+        self.assertLess(acc_wait_pos, t2r_copy_pos, role_src)
+        self.assertLess(t2r_copy_pos, r2s_source_store_pos, role_src)
+        self.assertLess(r2s_source_store_pos, helper_call_pos, role_src)
+        self.assertNotIn("tcgen05_epilog_sync_barrier.arrive_and_wait()", role_src)
+        self.assertNotIn("cute.copy(tcgen05_tiled_copy_r2s", role_src)
+        self.assertNotIn("cute.copy(tcgen05_tma_store_atom", role_src)
+
+    def test_tcgen05_diagnostic_split_first_t2r_rejects_flat_epilogue(
+        self,
+    ) -> None:
+        @helion.kernel(backend="cute")
+        def cute_matmul_flat_tma_store(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        torch.manual_seed(0)
+        args = (
+            torch.randn(256, 32, device=DEVICE, dtype=torch.float16),
+            torch.randn(32, 256, device=DEVICE, dtype=torch.float16),
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_flat_tma_store.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            cfg = _make_tcgen05_persistent_config(
+                block_sizes=[128, 128, 16],
+                pid_type="flat",
+                tcgen05_epilogue_layout="split_first_t2r",
+            )
+            with self.assertRaisesRegex(
+                exc.BackendUnsupported,
+                "requires the role-local TMA-store tcgen05 epilogue",
+            ):
+                bound.to_triton_code(cfg)
+
+    def test_tcgen05_diagnostic_split_first_t2r_rejects_one_subtile_epilogue(
+        self,
+    ) -> None:
+        @helion.kernel(backend="cute")
+        def cute_matmul_cluster_m2_one_subtile(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        torch.manual_seed(0)
+        args = (
+            torch.randn(256, 32, device=DEVICE, dtype=torch.float16),
+            torch.randn(32, 128, device=DEVICE, dtype=torch.float16),
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_cluster_m2_one_subtile.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            cfg = _make_tcgen05_persistent_config(
+                block_sizes=[256, 128, 16],
+                l2_groupings=[4],
+                pid_type="persistent_interleaved",
+                tcgen05_cluster_m=2,
+                tcgen05_epilogue_layout="split_first_t2r",
+            )
+            with self.assertRaisesRegex(
+                exc.BackendUnsupported,
+                "CtaGroup.TWO block_n >= 256",
+            ):
+                bound.to_triton_code(cfg)
+
+    def test_tcgen05_diagnostic_split_first_t2r_rejects_one_cta_epilogue(
+        self,
+    ) -> None:
+        @helion.kernel(backend="cute")
+        def cute_matmul_cluster_m1_role_local(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        torch.manual_seed(0)
+        args = (
+            torch.randn(256, 32, device=DEVICE, dtype=torch.float16),
+            torch.randn(32, 256, device=DEVICE, dtype=torch.float16),
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_cluster_m1_role_local.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            cfg = _make_tcgen05_persistent_config(
+                block_sizes=[128, 256, 16],
+                l2_groupings=[4],
+                pid_type="persistent_interleaved",
+                tcgen05_cluster_m=1,
+                tcgen05_epilogue_layout="split_first_t2r",
+            )
+            with self.assertRaisesRegex(
+                exc.BackendUnsupported,
+                "requires CtaGroup.TWO",
+            ):
+                bound.to_triton_code(cfg)
+
+    def test_tcgen05_diagnostic_split_first_t2r_runtime_correctness(
+        self,
+    ) -> None:
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_cluster_m2_split_first_t2r(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        torch.manual_seed(0)
+        args = (
+            torch.randn(256, 16, device=DEVICE, dtype=torch.bfloat16),
+            torch.randn(16, 256, device=DEVICE, dtype=torch.bfloat16),
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_cluster_m2_split_first_t2r.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            cfg = _make_tcgen05_persistent_config(
+                block_sizes=[256, 256, 16],
+                l2_groupings=[4],
+                pid_type="persistent_interleaved",
+                tcgen05_cluster_m=2,
+                tcgen05_epilogue_layout="split_first_t2r",
+            )
+            bound.set_config(cfg)
+            code = bound.to_triton_code(cfg)
+            self.assertIn(
+                "for _tcgen05_split_subtile in cutlass.range("
+                "tcgen05_subtile_count - 1, unroll_full=True):",
+                code,
+            )
+            out = bound(*args)
+
+        expected = args[0] @ args[1]
+        torch.testing.assert_close(out, expected, atol=2e-1, rtol=1e-2)
+
+    def test_tcgen05_diagnostic_split_acc_t2r_store_tail_runtime_correctness(
+        self,
+    ) -> None:
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_cluster_m2_split_acc_t2r_store_tail(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        torch.manual_seed(0)
+        args = (
+            torch.randn(256, 16, device=DEVICE, dtype=torch.bfloat16),
+            torch.randn(16, 256, device=DEVICE, dtype=torch.bfloat16),
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_cluster_m2_split_acc_t2r_store_tail.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            cfg = _make_tcgen05_persistent_config(
+                block_sizes=[256, 256, 16],
+                l2_groupings=[4],
+                pid_type="persistent_interleaved",
+                tcgen05_cluster_m=2,
+                tcgen05_epilogue_layout="split_acc_t2r_store_tail",
+            )
+            bound.set_config(cfg)
+            code = bound.to_triton_code(cfg)
+            self.assertIn(
+                "if True:\n"
+                "                            if _tcgen05_subtile == 0:\n"
+                "                                tcgen05_acc_pipeline.consumer_wait",
+                code,
+            )
+            out = bound(*args)
+
+        expected = args[0] @ args[1]
+        torch.testing.assert_close(out, expected, atol=2e-1, rtol=1e-2)
+
+    def test_tcgen05_diagnostic_module_helper_acc_t2r_runtime_correctness(
+        self,
+    ) -> None:
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_cluster_m2_module_helper_acc_t2r(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        torch.manual_seed(0)
+        args = (
+            torch.randn(256, 16, device=DEVICE, dtype=torch.bfloat16),
+            torch.randn(16, 256, device=DEVICE, dtype=torch.bfloat16),
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_cluster_m2_module_helper_acc_t2r.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            cfg = _make_tcgen05_persistent_config(
+                block_sizes=[256, 256, 16],
+                l2_groupings=[4],
+                pid_type="persistent_interleaved",
+                tcgen05_cluster_m=2,
+                tcgen05_epilogue_layout="module_helper_acc_t2r",
+            )
+            bound.set_config(cfg)
+            code = bound.to_triton_code(cfg)
+            self.assertIn("def tcgen05_acc_t2r_region", code)
+            out = bound(*args)
+
+        expected = args[0] @ args[1]
+        torch.testing.assert_close(out, expected, atol=2e-1, rtol=1e-2)
+
+    def test_tcgen05_diagnostic_module_helper_store_tail_runtime_correctness(
+        self,
+    ) -> None:
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_cluster_m2_module_helper_store_tail(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        torch.manual_seed(0)
+        args = (
+            torch.randn(256, 16, device=DEVICE, dtype=torch.bfloat16),
+            torch.randn(16, 256, device=DEVICE, dtype=torch.bfloat16),
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_cluster_m2_module_helper_store_tail.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            cfg = _make_tcgen05_persistent_config(
+                block_sizes=[256, 256, 16],
+                l2_groupings=[4],
+                pid_type="persistent_interleaved",
+                tcgen05_cluster_m=2,
+                tcgen05_epilogue_layout="module_helper_store_tail",
+            )
+            bound.set_config(cfg)
+            code = bound.to_triton_code(cfg)
+            self.assertIn("def tcgen05_store_tail_region", code)
+            out = bound(*args)
+
+        expected = args[0] @ args[1]
+        torch.testing.assert_close(out, expected, atol=2e-1, rtol=1e-2)
+
+    def test_tcgen05_diagnostic_skip_epilogue_store_drains_acc_pipeline(
+        self,
+    ) -> None:
+        @helion.kernel(backend="cute")
+        def cute_matmul_flat_tma_store(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        torch.manual_seed(0)
+        args = (
+            torch.randn(256, 32, device=DEVICE, dtype=torch.float16),
+            torch.randn(32, 256, device=DEVICE, dtype=torch.float16),
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_flat_tma_store.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            unsafe_cfg = _make_tcgen05_persistent_config(
+                block_sizes=[128, 128, 16],
+                pid_type="flat",
+                tcgen05_c_store_mode="skip_epilogue_store",
+            )
+            with self.assertRaisesRegex(
+                exc.InvalidConfig,
+                "tcgen05_diagnostic_invalid_output",
+            ):
+                bound.to_triton_code(unsafe_cfg)
+            cfg = _make_tcgen05_persistent_config(
+                block_sizes=[128, 128, 16],
+                pid_type="flat",
+                tcgen05_c_store_mode="skip_epilogue_store",
+                tcgen05_diagnostic_invalid_output=True,
+            )
+            code = bound.to_triton_code(cfg)
+
+        acc_wait = "tcgen05_acc_pipeline.consumer_wait(tcgen05_acc_consumer_state)"
+        acc_release = (
+            "tcgen05_acc_pipeline.consumer_release(tcgen05_acc_consumer_state)"
+        )
+        c_acquire = "tcgen05_c_pipeline.producer_acquire()"
+        c_commit = "tcgen05_c_pipeline.producer_commit()"
+        tma_store = "cute.copy(tcgen05_tma_store_atom"
+        r2s_copy = "cute.copy(tcgen05_tiled_copy_r2s"
+
+        self.assertIn(acc_wait, code)
+        self.assertIn(acc_release, code)
+        self.assertNotIn(c_acquire, code)
+        self.assertNotIn(c_commit, code)
+        self.assertNotIn(tma_store, code)
+        self.assertNotIn(r2s_copy, code)
+
+    def test_tcgen05_diagnostic_skip_umma_keeps_pipeline_handshakes(
+        self,
+    ) -> None:
+        @helion.kernel(backend="cute")
+        def cute_matmul_persistent_role(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        torch.manual_seed(0)
+        args = (
+            torch.randn(128, 32, device=DEVICE, dtype=torch.float16),
+            torch.randn(32, 128, device=DEVICE, dtype=torch.float16),
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_persistent_role.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            unsafe_cfg = _make_tcgen05_persistent_config(
+                block_sizes=[128, 128, 16],
+                pid_type="persistent_blocked",
+                tcgen05_acc_producer_mode="skip_umma",
+            )
+            with self.assertRaisesRegex(
+                exc.InvalidConfig,
+                "tcgen05_diagnostic_invalid_output",
+            ):
+                bound.to_triton_code(unsafe_cfg)
+            cfg = _make_tcgen05_persistent_config(
+                block_sizes=[128, 128, 16],
+                pid_type="persistent_blocked",
+                tcgen05_acc_producer_mode="skip_umma",
+                tcgen05_diagnostic_invalid_output=True,
+            )
+            code = bound.to_triton_code(cfg)
+
+        exec_role_predicate = (
+            "cute.arch.make_warp_uniform(cute.arch.warp_idx()) == cutlass.Int32(4)"
+        )
+        role_src, _, _ = self._role_local_while_source_for_predicate(
+            code,
+            ast.parse(code),
+            exec_role_predicate,
+        )
+        self.assertIn(
+            "tcgen05_acc_pipeline.producer_acquire(tcgen05_acc_producer_state)",
+            role_src,
+        )
+        self.assertIn("consumer_try_wait(tcgen05_ab_consumer_state)", role_src)
+        self.assertIn("consumer_release(tcgen05_ab_consumer_state)", role_src)
+        self.assertIn(
+            "tcgen05_acc_pipeline.producer_commit(tcgen05_acc_producer_state)",
+            role_src,
+        )
+        self.assertIn("tcgen05_acc_producer_state.advance()", role_src)
+        self.assertNotIn("cute.gemm(", role_src)
+        self.assertNotIn("cute.arch.fence_view_async_shared()", role_src)
+        self.assertNotIn("cute.nvgpu.tcgen05.Field.ACCUMULATE, True", role_src)
 
     def test_tcgen05_persistent_partial_single_tile_keeps_shared_tma_path(
         self,
@@ -1238,6 +2705,7 @@ class TestCuteLowerings(unittest.TestCase):
 
         self.assertIn("while tcgen05_work_tile_valid", code)
         self.assertNotIn("tcgen05_role_local", code)
+        self.assertNotIn("'kind': 'tcgen05_d_tma'", code)
         self.assertIn("tcgen05_tma_warp", code)
         self.assertIn("cute.arch.sync_threads()", code)
         self.assertIn("if tcgen05_tma_full_tile", code)
@@ -1297,6 +2765,8 @@ class TestCuteLowerings(unittest.TestCase):
                         code = bound.to_triton_code(cfg)
                         self.assertNotIn("_helion_tcgen05_persistent_total_tiles", code)
                         self.assertRegex(code, r"\(\s*1\s*,\s*1\s*,\s*min\s*\(")
+                        self.assertIn("cutlass.pipeline.PipelineTmaStore.create", code)
+                        self.assertNotIn("cute.nvgpu.CopyUniversalOp()", code)
                         out = bound(*args)
                     expected = args[0] @ args[1]
                     # Match the single-tile tcgen05 runtime test tolerance:
@@ -1352,12 +2822,12 @@ class TestCuteLowerings(unittest.TestCase):
             self.assertNotIn("tcgen05_role_local", code)
             with self.assertRaisesRegex(
                 RuntimeError,
-                "supports multi-tile execution only",
+                "supports runtime execution only",
             ):
                 bound(*args)
 
     def test_tcgen05_persistent_cluster_m2_multi_tile_runtime_guard(self) -> None:
-        """Static full-tile cluster_m=2 remains guarded for multi-tile shapes."""
+        """CtaGroup.ONE cluster_m=2 fallback remains guarded."""
 
         from helion._compiler.cute.mma_support import get_cute_mma_support
 
@@ -1394,13 +2864,1543 @@ class TestCuteLowerings(unittest.TestCase):
             )
             bound.set_config(cfg)
             code = bound.to_triton_code(cfg)
-            self.assertIn("tcgen05_role_local", code)
+            self.assertNotIn("tcgen05_role_local", code)
+            self.assertIn("cute.nvgpu.tcgen05.CtaGroup.ONE", code)
+            self.assertIn(
+                "tcgen05_ab_pipeline_consumer_group = "
+                "cutlass.pipeline.CooperativeGroup("
+                "cutlass.pipeline.Agent.Thread, cutlass.Int32(1))",
+                code,
+            )
+            self.assertNotIn(
+                "tcgen05_ab_pipeline_consumer_group = "
+                "cutlass.pipeline.CooperativeGroup("
+                "cutlass.pipeline.Agent.Thread, cutlass.Int32(2))",
+                code,
+            )
             self.assertIn(Tcgen05PersistentProgramIDs._MULTI_TILE_GUARD_TOTAL_VAR, code)
             with self.assertRaisesRegex(
                 RuntimeError,
-                "supports multi-tile execution only",
+                "supports runtime execution only",
             ):
                 bound(*args)
+
+    def test_tcgen05_cluster_m2_cta_group_one_bridge_shape_codegen(self) -> None:
+        """Pin the selected clustered CtaGroup.ONE bridge target.
+
+        The explicit 128x256x128 cluster_m=2 config must stay clustered and
+        use CtaGroup.ONE, not demote to cluster_m=1 or switch to CtaGroup.TWO.
+        Runtime remains guarded until this clustered shape is validated.
+        """
+
+        from helion._compiler.program_id import Tcgen05PersistentProgramIDs
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_cluster_m2_cta_group_one(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        args = (
+            torch.randn(256, 128, device=DEVICE, dtype=torch.float16),
+            torch.randn(128, 256, device=DEVICE, dtype=torch.float16),
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_cluster_m2_cta_group_one.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            cfg = _make_tcgen05_cluster_m2_cta_group_one_bridge_config()
+            bound.set_config(cfg)
+            code = bound.to_triton_code(cfg)
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "supports runtime execution only",
+            ):
+                bound(*args)
+
+        self.assertEqual(
+            cfg.config["indexing"],
+            ["tensor_descriptor", "tensor_descriptor", "tensor_descriptor"],
+        )
+        self.assertEqual(cfg.config["range_flattens"], [None, None])
+        self.assertEqual(cfg.config["range_multi_buffers"], [None, None])
+        self.assertEqual(cfg.config["range_warp_specializes"], [None, None])
+        self.assertEqual(cfg.config["range_num_stages"], [0, 0])
+        self.assertEqual(cfg.config["range_unroll_factors"], [0, 0])
+        self.assertIn("_helion_cute_cluster_shape = (2, 1, 1)", code)
+        self.assertIn("cute.nvgpu.tcgen05.CtaGroup.ONE", code)
+        self.assertNotIn("cute.nvgpu.tcgen05.CtaGroup.TWO", code)
+        self.assertIn(
+            "tcgen05_cluster_layout_vmnk = cute.tiled_divide("
+            "cute.make_layout((2, 1, 1))",
+            code,
+        )
+        self.assertIn(
+            "tcgen05_ab_pipeline_consumer_group = "
+            "cutlass.pipeline.CooperativeGroup("
+            "cutlass.pipeline.Agent.Thread, cutlass.Int32(1))",
+            code,
+        )
+        self.assertNotIn(
+            "tcgen05_ab_pipeline_consumer_group = "
+            "cutlass.pipeline.CooperativeGroup("
+            "cutlass.pipeline.Agent.Thread, cutlass.Int32(2))",
+            code,
+        )
+        self.assertIn(Tcgen05PersistentProgramIDs._MULTI_TILE_GUARD_TOTAL_VAR, code)
+
+    def test_tcgen05_cluster_m2_cta_group_one_bridge_role_local_codegen(
+        self,
+    ) -> None:
+        """Diagnostic bridge maps role-local PIDs by CTA rank but stays guarded."""
+
+        from helion._compiler.program_id import Tcgen05PersistentProgramIDs
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_cluster_m2_cta_group_one_role_local(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        args = (
+            torch.randn(256, 128, device=DEVICE, dtype=torch.float16),
+            torch.randn(128, 256, device=DEVICE, dtype=torch.float16),
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_cluster_m2_cta_group_one_role_local.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            cfg = _make_tcgen05_cluster_m2_cta_group_one_bridge_config(
+                **{TCGEN05_CLUSTER_M2_ONE_CTA_ROLE_LOCAL_CONFIG_KEY: True}
+            )
+            bound.set_config(cfg)
+            code = bound.to_triton_code(cfg)
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "supports runtime execution only",
+            ):
+                bound(*args)
+
+        self.assertIn("_helion_cute_cluster_shape = (2, 1, 1)", code)
+        self.assertIn("cute.nvgpu.tcgen05.CtaGroup.ONE", code)
+        self.assertNotIn("cute.nvgpu.tcgen05.CtaGroup.TWO", code)
+        self.assertIn("tcgen05_role_local_0_work_tile", code)
+        self.assertIn("tcgen05_role_local_1_work_tile", code)
+        self.assertIn("tcgen05_role_local_2_work_tile", code)
+        cta_rank_expr = "cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())"
+        for role_idx in range(3):
+            self.assertIn(
+                "virtual_pid = "
+                f"tcgen05_role_local_{role_idx}_work_tile.tile_idx[0] + "
+                f"{cta_rank_expr}",
+                code,
+            )
+        tma_role_predicate = (
+            "cute.arch.make_warp_uniform(cute.arch.warp_idx()) == cutlass.Int32(5)"
+        )
+        code_ast = ast.parse(code)
+        kernel_def = None
+        tma_role_matches: list[str] = []
+        for node in ast.walk(code_ast):
+            if (
+                isinstance(node, ast.FunctionDef)
+                and node.name
+                == "_helion_cute_matmul_cluster_m2_cta_group_one_role_local"
+            ):
+                kernel_def = node
+            if (
+                isinstance(node, ast.If)
+                and ast.unparse(node.test) == tma_role_predicate
+            ):
+                tma_role_matches.append(ast.unparse(node))
+        self.assertIsNotNone(kernel_def, code)
+        assert kernel_def is not None
+        self.assertEqual(len(tma_role_matches), 1, code)
+        tma_role_src = tma_role_matches[0]
+        self.assertIn("cute.copy(tma_atom_a", tma_role_src)
+        self.assertIn("cute.copy(tma_atom_b", tma_role_src)
+        self.assertNotIn("mcast_mask=tcgen05_a_mcast_mask", tma_role_src)
+        self.assertIn("mcast_mask=tcgen05_b_mcast_mask", tma_role_src)
+        self.assertIn(
+            "tcgen05_b_mcast_mask = "
+            "cute.nvgpu.cpasync.create_tma_multicast_mask("
+            "tcgen05_cluster_layout_vmnk, "
+            "tcgen05_block_in_cluster_coord_vmnk, mcast_mode=2)",
+            code,
+        )
+        self.assertNotIn(_TCGEN05_CLUSTER_LEADER_PREDICATE, tma_role_src)
+        self.assertIn(
+            "tcgen05_ab_pipeline_producer_group = "
+            "cutlass.pipeline.CooperativeGroup("
+            "cutlass.pipeline.Agent.Thread, 1)",
+            code,
+        )
+        self.assertIn(
+            "tcgen05_ab_pipeline_consumer_group = "
+            "cutlass.pipeline.CooperativeGroup("
+            "cutlass.pipeline.Agent.Thread, cutlass.Int32(1))",
+            code,
+        )
+        self.assertIn(
+            "tcgen05_ab_pipeline_tx_count = "
+            "cute.size_in_bytes(cutlass.Float16, sA_tma_layout) + "
+            "cute.size_in_bytes(cutlass.Float16, sB_tma_layout)",
+            code,
+        )
+        self.assertNotIn("* cute.size(tiled_mma.thr_id.shape)", code)
+        self.assertIn(
+            "tcgen05_acc_pipeline = cutlass.pipeline.PipelineUmmaAsync.create("
+            "num_stages=1, producer_group=tcgen05_acc_pipeline_producer_group, "
+            "consumer_group=tcgen05_acc_pipeline_consumer_group, "
+            "barrier_storage=tcgen05_acc_pipeline_barriers, "
+            "cta_layout_vmnk=tcgen05_cluster_layout_vmnk)",
+            code,
+        )
+        self.assertIn(
+            "tcgen05_ab_pipeline = cutlass.pipeline.PipelineTmaUmma.create("
+            "num_stages=2, producer_group=tcgen05_ab_pipeline_producer_group, "
+            "consumer_group=tcgen05_ab_pipeline_consumer_group, "
+            "tx_count=tcgen05_ab_pipeline_tx_count, "
+            "barrier_storage=tcgen05_ab_pipeline_mbars, "
+            "cta_layout_vmnk=tcgen05_cluster_layout_vmnk)",
+            code,
+        )
+        self.assertNotIn("defer_sync=True", code)
+        self.assertNotIn("cutlass.pipeline.pipeline_init_arrive(", code)
+        self.assertNotIn("cutlass.pipeline.pipeline_init_wait(", code)
+        self.assertNotIn("while tcgen05_work_tile_valid", code)
+        self.assertIn(Tcgen05PersistentProgramIDs._MULTI_TILE_GUARD_TOTAL_VAR, code)
+
+    def _cluster_m2_cta_group_one_bridge_diagnostic_code(
+        self, mode_key: str, mode_value: str
+    ) -> str:
+        from helion._compiler.program_id import Tcgen05PersistentProgramIDs
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_cluster_m2_bridge_diagnostic(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        args = (
+            torch.randn(256, 128, device=DEVICE, dtype=torch.float16),
+            torch.randn(128, 256, device=DEVICE, dtype=torch.float16),
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_cluster_m2_bridge_diagnostic.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            unsafe_cfg = _make_tcgen05_cluster_m2_cta_group_one_bridge_config(
+                **{
+                    TCGEN05_CLUSTER_M2_ONE_CTA_ROLE_LOCAL_CONFIG_KEY: True,
+                    mode_key: mode_value,
+                }
+            )
+            with self.assertRaisesRegex(
+                exc.InvalidConfig,
+                "tcgen05_diagnostic_invalid_output",
+            ):
+                bound.to_triton_code(unsafe_cfg)
+            guarded_cfg = _make_tcgen05_cluster_m2_cta_group_one_bridge_config(
+                **{
+                    mode_key: mode_value,
+                    TCGEN05_DIAGNOSTIC_INVALID_OUTPUT_CONFIG_KEY: True,
+                }
+            )
+            with self.assertRaisesRegex(
+                exc.BackendUnsupported,
+                "128x256x128 bridge shape",
+            ):
+                bound.to_triton_code(guarded_cfg)
+            cfg = _make_tcgen05_cluster_m2_cta_group_one_bridge_config(
+                **{
+                    TCGEN05_CLUSTER_M2_ONE_CTA_ROLE_LOCAL_CONFIG_KEY: True,
+                    mode_key: mode_value,
+                    TCGEN05_DIAGNOSTIC_INVALID_OUTPUT_CONFIG_KEY: True,
+                }
+            )
+            bound.set_config(cfg)
+            code = bound.to_triton_code(cfg)
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "supports runtime execution only",
+            ):
+                bound(*args)
+
+        self.assertIn("_helion_cute_cluster_shape = (2, 1, 1)", code)
+        self.assertIn("cute.nvgpu.tcgen05.CtaGroup.ONE", code)
+        self.assertIn(Tcgen05PersistentProgramIDs._MULTI_TILE_GUARD_TOTAL_VAR, code)
+        return code
+
+    def test_tcgen05_cluster_m2_cta_group_one_bridge_can_skip_acc_advance(
+        self,
+    ) -> None:
+        """Bridge diagnostic removes only the acc producer advance edge."""
+
+        code = self._cluster_m2_cta_group_one_bridge_diagnostic_code(
+            TCGEN05_ACC_PRODUCER_ADVANCE_MODE_CONFIG_KEY,
+            TCGEN05_ACC_PRODUCER_ADVANCE_MODE_SKIP,
+        )
+        self.assertIn("tcgen05_role_local_1_work_tile", code)
+        self.assertIn(
+            "tcgen05_acc_pipeline.producer_commit(tcgen05_acc_producer_state)",
+            code,
+        )
+        self.assertNotIn("tcgen05_acc_producer_state.advance()", code)
+
+    def test_tcgen05_cluster_m2_cta_group_one_bridge_can_skip_ab_acquire(
+        self,
+    ) -> None:
+        """Bridge diagnostic removes only AB producer acquire edges."""
+
+        code = self._cluster_m2_cta_group_one_bridge_diagnostic_code(
+            TCGEN05_AB_PRODUCER_ACQUIRE_MODE_CONFIG_KEY,
+            TCGEN05_AB_PRODUCER_ACQUIRE_MODE_SKIP,
+        )
+        self.assertNotIn("tcgen05_ab_pipeline.producer_acquire(", code)
+        self.assertNotIn("tcgen05_ab_pipeline.producer_try_acquire(", code)
+        self.assertIn("tcgen05_ab_pipeline.producer_get_barrier(", code)
+        self.assertIn("tcgen05_ab_pipeline.producer_commit(", code)
+        self.assertIn("tcgen05_ab_producer_state.advance()", code)
+
+    def test_tcgen05_cluster_m2_cta_group_one_bridge_can_skip_initial_ab_acquire(
+        self,
+    ) -> None:
+        """Bridge diagnostic removes only the first initial AB acquire."""
+
+        code = self._cluster_m2_cta_group_one_bridge_diagnostic_code(
+            TCGEN05_AB_INITIAL_PRODUCER_ACQUIRE_MODE_CONFIG_KEY,
+            TCGEN05_AB_INITIAL_PRODUCER_ACQUIRE_MODE_SKIP_FIRST,
+        )
+        tree = ast.parse(code)
+        stage0_blocks = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.If):
+                continue
+            test_src = ast.unparse(node.test)
+            if (
+                "tcgen05_tma_initial_full_tile" in test_src
+                and "tcgen05_tma_initial_next_full_tile" not in test_src
+                and "tcgen05_tma_warp" in test_src
+            ):
+                stage0_blocks.append(node)
+        self.assertEqual(len(stage0_blocks), 1, code)
+        stage0_src = ast.unparse(
+            ast.Module(body=stage0_blocks[0].body, type_ignores=[])
+        )
+        self.assertNotIn("tcgen05_ab_pipeline.producer_acquire(", stage0_src)
+        self.assertIn("tcgen05_ab_pipeline.producer_get_barrier(", stage0_src)
+        self.assertIn("tcgen05_ab_pipeline.producer_commit(", stage0_src)
+        self.assertEqual(code.count("tcgen05_ab_pipeline.producer_acquire("), 2)
+        self.assertEqual(code.count("tcgen05_ab_pipeline.producer_try_acquire("), 1)
+        self.assertIn("tcgen05_ab_producer_state.advance()", code)
+        self.assertIn("tcgen05_ab_pipeline.producer_tail(", code)
+
+    def test_tcgen05_large_bn_proof_config_validation(self) -> None:
+        """Larger-BN proof flag is explicit and tcgen05-only."""
+
+        config_spec = ConfigSpec(backend=CuteBackend())
+        with self.assertRaisesRegex(
+            exc.InvalidConfig,
+            "tcgen05-enabled CuTe matmul kernels",
+        ):
+            config_spec.normalize({TCGEN05_LARGE_BN_PROOF_CONFIG_KEY: True})
+
+        config_spec.cute_tcgen05_search_enabled = True
+        for block_id, size_hint in enumerate(TCGEN05_LARGE_BN_PROOF_BLOCK_SIZES):
+            config_spec.block_sizes.append(
+                BlockSizeSpec(
+                    block_id=block_id,
+                    size_hint=size_hint,
+                    max_size=size_hint,
+                )
+            )
+        with self.assertRaisesRegex(exc.InvalidConfig, "must be a boolean"):
+            config_spec.normalize(
+                {
+                    "block_sizes": list(TCGEN05_LARGE_BN_PROOF_BLOCK_SIZES),
+                    "tcgen05_cluster_m": TCGEN05_LARGE_BN_PROOF_CLUSTER_M,
+                    **dict(TCGEN05_LARGE_BN_PROOF_STAGE_CONFIGS),
+                    TCGEN05_LARGE_BN_PROOF_CONFIG_KEY: "yes",
+                }
+            )
+
+        config = {
+            "block_sizes": list(TCGEN05_LARGE_BN_PROOF_BLOCK_SIZES),
+            "tcgen05_cluster_m": TCGEN05_LARGE_BN_PROOF_CLUSTER_M,
+            **dict(TCGEN05_LARGE_BN_PROOF_STAGE_CONFIGS),
+            TCGEN05_LARGE_BN_PROOF_CONFIG_KEY: True,
+        }
+        config_spec.normalize(config)
+        self.assertIs(config[TCGEN05_LARGE_BN_PROOF_CONFIG_KEY], True)
+        with self.assertRaisesRegex(
+            exc.InvalidConfig,
+            "tcgen05_ab_stages=2, tcgen05_acc_stages=1, and tcgen05_c_stages=2",
+        ):
+            config_spec.normalize(
+                {
+                    "block_sizes": list(TCGEN05_LARGE_BN_PROOF_BLOCK_SIZES),
+                    "tcgen05_cluster_m": 2,
+                    **dict(TCGEN05_LARGE_BN_PROOF_STAGE_CONFIGS),
+                    TCGEN05_LARGE_BN_PROOF_CONFIG_KEY: True,
+                }
+            )
+        with self.assertRaisesRegex(
+            exc.InvalidConfig,
+            "tcgen05_ab_stages=2, tcgen05_acc_stages=1, and tcgen05_c_stages=2",
+        ):
+            config_spec.normalize(
+                {
+                    "block_sizes": list(TCGEN05_LARGE_BN_PROOF_BLOCK_SIZES),
+                    "tcgen05_cluster_m": TCGEN05_LARGE_BN_PROOF_CLUSTER_M,
+                    "pid_type": "persistent_blocked",
+                    **dict(TCGEN05_LARGE_BN_PROOF_STAGE_CONFIGS),
+                    TCGEN05_LARGE_BN_PROOF_CONFIG_KEY: True,
+                }
+            )
+        with self.assertRaisesRegex(
+            exc.InvalidConfig,
+            "tcgen05_ab_stages=2, tcgen05_acc_stages=1, and tcgen05_c_stages=2",
+        ):
+            config_spec.normalize(
+                {
+                    "block_sizes": list(TCGEN05_LARGE_BN_PROOF_BLOCK_SIZES),
+                    "tcgen05_cluster_m": TCGEN05_LARGE_BN_PROOF_CLUSTER_M,
+                    "tcgen05_ab_stages": 2,
+                    "tcgen05_acc_stages": 2,
+                    "tcgen05_c_stages": 2,
+                    TCGEN05_LARGE_BN_PROOF_CONFIG_KEY: True,
+                }
+            )
+
+    def test_tcgen05_ab_initial_producer_acquire_mode_config_validation(
+        self,
+    ) -> None:
+        """Invalid-output initial AB acquire diagnostic is rejected unless opted in."""
+
+        config_spec = ConfigSpec(backend=CuteBackend())
+        with self.assertRaisesRegex(
+            exc.InvalidConfig,
+            "tcgen05-enabled CuTe matmul kernels",
+        ):
+            config_spec.normalize(
+                {
+                    TCGEN05_AB_INITIAL_PRODUCER_ACQUIRE_MODE_CONFIG_KEY: (
+                        TCGEN05_AB_INITIAL_PRODUCER_ACQUIRE_MODE_SKIP_FIRST
+                    ),
+                }
+            )
+
+        config_spec.cute_tcgen05_search_enabled = True
+        with self.assertRaisesRegex(exc.InvalidConfig, "must be one of"):
+            config_spec.normalize(
+                {
+                    TCGEN05_AB_INITIAL_PRODUCER_ACQUIRE_MODE_CONFIG_KEY: "invalid",
+                    TCGEN05_DIAGNOSTIC_INVALID_OUTPUT_CONFIG_KEY: True,
+                }
+            )
+        with self.assertRaisesRegex(
+            exc.InvalidConfig,
+            "tcgen05_diagnostic_invalid_output",
+        ):
+            config_spec.normalize(
+                {
+                    TCGEN05_AB_INITIAL_PRODUCER_ACQUIRE_MODE_CONFIG_KEY: (
+                        TCGEN05_AB_INITIAL_PRODUCER_ACQUIRE_MODE_SKIP_FIRST
+                    ),
+                }
+            )
+
+    def test_tcgen05_ab_producer_advance_mode_config_validation(self) -> None:
+        """Invalid-output AB advance diagnostic is rejected unless opted in."""
+
+        config_spec = ConfigSpec(backend=CuteBackend())
+        with self.assertRaisesRegex(
+            exc.InvalidConfig,
+            "tcgen05-enabled CuTe matmul kernels",
+        ):
+            config_spec.normalize(
+                {
+                    TCGEN05_AB_PRODUCER_ADVANCE_MODE_CONFIG_KEY: (
+                        TCGEN05_AB_PRODUCER_ADVANCE_MODE_SKIP
+                    ),
+                }
+            )
+
+        config_spec.cute_tcgen05_search_enabled = True
+        with self.assertRaisesRegex(exc.InvalidConfig, "must be one of"):
+            config_spec.normalize(
+                {
+                    TCGEN05_AB_PRODUCER_ADVANCE_MODE_CONFIG_KEY: "invalid",
+                    TCGEN05_DIAGNOSTIC_INVALID_OUTPUT_CONFIG_KEY: True,
+                }
+            )
+        with self.assertRaisesRegex(
+            exc.InvalidConfig,
+            "tcgen05_diagnostic_invalid_output",
+        ):
+            config_spec.normalize(
+                {
+                    TCGEN05_AB_PRODUCER_ADVANCE_MODE_CONFIG_KEY: (
+                        TCGEN05_AB_PRODUCER_ADVANCE_MODE_SKIP
+                    ),
+                }
+            )
+
+    def test_tcgen05_ab_consumer_wait_mode_config_validation(self) -> None:
+        """Invalid-output AB wait diagnostic is rejected unless opted in."""
+
+        config_spec = ConfigSpec(backend=CuteBackend())
+        with self.assertRaisesRegex(
+            exc.InvalidConfig,
+            "tcgen05-enabled CuTe matmul kernels",
+        ):
+            config_spec.normalize(
+                {
+                    TCGEN05_AB_CONSUMER_WAIT_MODE_CONFIG_KEY: (
+                        TCGEN05_AB_CONSUMER_WAIT_MODE_SKIP
+                    ),
+                }
+            )
+
+        config_spec.cute_tcgen05_search_enabled = True
+        with self.assertRaisesRegex(exc.InvalidConfig, "must be one of"):
+            config_spec.normalize(
+                {
+                    TCGEN05_AB_CONSUMER_WAIT_MODE_CONFIG_KEY: "invalid",
+                    TCGEN05_DIAGNOSTIC_INVALID_OUTPUT_CONFIG_KEY: True,
+                }
+            )
+        with self.assertRaisesRegex(
+            exc.InvalidConfig,
+            "tcgen05_diagnostic_invalid_output",
+        ):
+            config_spec.normalize(
+                {
+                    TCGEN05_AB_CONSUMER_WAIT_MODE_CONFIG_KEY: (
+                        TCGEN05_AB_CONSUMER_WAIT_MODE_SKIP
+                    ),
+                }
+            )
+
+    def test_tcgen05_ab_consumer_phase_mode_config_validation(self) -> None:
+        """Invalid-output AB phase diagnostic is rejected unless opted in."""
+
+        config_spec = ConfigSpec(backend=CuteBackend())
+        with self.assertRaisesRegex(
+            exc.InvalidConfig,
+            "tcgen05-enabled CuTe matmul kernels",
+        ):
+            config_spec.normalize(
+                {
+                    TCGEN05_AB_CONSUMER_PHASE_MODE_CONFIG_KEY: (
+                        TCGEN05_AB_CONSUMER_PHASE_MODE_PHASE1
+                    ),
+                }
+            )
+
+        config_spec.cute_tcgen05_search_enabled = True
+        with self.assertRaisesRegex(exc.InvalidConfig, "must be one of"):
+            config_spec.normalize(
+                {
+                    TCGEN05_AB_CONSUMER_PHASE_MODE_CONFIG_KEY: "invalid",
+                    TCGEN05_DIAGNOSTIC_INVALID_OUTPUT_CONFIG_KEY: True,
+                }
+            )
+        with self.assertRaisesRegex(
+            exc.InvalidConfig,
+            "tcgen05_diagnostic_invalid_output",
+        ):
+            config_spec.normalize(
+                {
+                    TCGEN05_AB_CONSUMER_PHASE_MODE_CONFIG_KEY: (
+                        TCGEN05_AB_CONSUMER_PHASE_MODE_PHASE1
+                    ),
+                }
+            )
+
+    def test_tcgen05_cluster_m2_cta_group_one_bridge_can_skip_ab_advance(
+        self,
+    ) -> None:
+        """Bridge diagnostic removes every AB producer advance edge."""
+
+        code = self._cluster_m2_cta_group_one_bridge_diagnostic_code(
+            TCGEN05_AB_PRODUCER_ADVANCE_MODE_CONFIG_KEY,
+            TCGEN05_AB_PRODUCER_ADVANCE_MODE_SKIP,
+        )
+        self.assertIn("tcgen05_ab_pipeline.producer_acquire(", code)
+        self.assertIn("tcgen05_ab_pipeline.producer_get_barrier(", code)
+        self.assertIn("tcgen05_ab_pipeline.producer_commit(", code)
+        self.assertNotIn("tcgen05_ab_producer_state.advance()", code)
+        self.assertNotIn(
+            "tcgen05_ab_pipeline.producer_tail(tcgen05_ab_producer_state)",
+            code,
+        )
+        self.assertNotIn("tcgen05_ab_producer_state._count", code)
+        self.assertNotIn("tcgen05_ab_producer_state._index", code)
+        self.assertNotIn("tcgen05_ab_producer_state._phase", code)
+        self.assertIn("tcgen05_acc_producer_state.advance()", code)
+
+    def test_tcgen05_cluster_m2_cta_group_one_bridge_can_skip_ab_wait(
+        self,
+    ) -> None:
+        """Bridge diagnostic removes only AB consumer try-wait/wait edges."""
+
+        code = self._cluster_m2_cta_group_one_bridge_diagnostic_code(
+            TCGEN05_AB_CONSUMER_WAIT_MODE_CONFIG_KEY,
+            TCGEN05_AB_CONSUMER_WAIT_MODE_SKIP,
+        )
+        self.assertIn("tcgen05_ab_pipeline.producer_commit(", code)
+        self.assertNotIn("tcgen05_ab_pipeline.consumer_try_wait(", code)
+        self.assertNotIn("tcgen05_ab_pipeline.consumer_wait(", code)
+        self.assertIn("tcgen05_ab_pipeline.consumer_release(", code)
+        self.assertIn("tcgen05_ab_consumer_state.advance()", code)
+        self.assertIn("tcgen05_ab_producer_state.advance()", code)
+
+    def test_tcgen05_cluster_m2_cta_group_one_bridge_can_init_ab_phase1(
+        self,
+    ) -> None:
+        """Bridge diagnostic initializes AB consumer state with phase 1."""
+
+        code = self._cluster_m2_cta_group_one_bridge_diagnostic_code(
+            TCGEN05_AB_CONSUMER_PHASE_MODE_CONFIG_KEY,
+            TCGEN05_AB_CONSUMER_PHASE_MODE_PHASE1,
+        )
+        self.assertNotIn(
+            "tcgen05_ab_consumer_state = "
+            "cutlass.pipeline.make_pipeline_state("
+            "cutlass.pipeline.PipelineUserType.Consumer, 2)",
+            code,
+        )
+        self.assertIn(
+            "tcgen05_ab_consumer_state = "
+            "cutlass.pipeline.PipelineState(2, cutlass.Int32(0), "
+            "cutlass.Int32(0), cutlass.Int32(1))",
+            code,
+        )
+        self.assertIn("tcgen05_ab_pipeline.consumer_try_wait(", code)
+        self.assertIn("tcgen05_ab_pipeline.consumer_wait(", code)
+        self.assertIn("tcgen05_ab_pipeline.consumer_release(", code)
+        self.assertIn("tcgen05_ab_consumer_state.advance()", code)
+        self.assertIn("tcgen05_ab_pipeline_tx_count = ", code)
+
+    def test_tcgen05_cluster_m2_cta_group_one_bridge_role_local_shape_guard(
+        self,
+    ) -> None:
+        """The bridge diagnostic fails loudly outside its exact shape."""
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_cluster_m2_cta_group_one_wrong_shape(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        args = (
+            torch.randn(256, 128, device=DEVICE, dtype=torch.float16),
+            torch.randn(128, 128, device=DEVICE, dtype=torch.float16),
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_cluster_m2_cta_group_one_wrong_shape.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            cfg = _make_tcgen05_cluster_m2_cta_group_one_bridge_config(
+                block_sizes=[128, 128, 128],
+                **{TCGEN05_CLUSTER_M2_ONE_CTA_ROLE_LOCAL_CONFIG_KEY: True},
+            )
+            with self.assertRaisesRegex(
+                exc.BackendUnsupported,
+                "128x256x128 bridge shape",
+            ):
+                bound.to_triton_code(cfg)
+
+    def test_tcgen05_persistent_cluster_m2_partial_single_tile_runtime_guard(
+        self,
+    ) -> None:
+        """Partial single-tile cluster_m=2 fallback remains guarded."""
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_cluster_m2_partial_single_tile(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        args = (
+            torch.randn(256, 17, device=DEVICE, dtype=torch.float16),
+            torch.randn(17, 256, device=DEVICE, dtype=torch.float16),
+        )
+        from helion._compiler.program_id import Tcgen05PersistentProgramIDs
+
+        with patch_cute_mma_support():
+            bound = cute_matmul_cluster_m2_partial_single_tile.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            cfg = _make_tcgen05_persistent_config(
+                block_sizes=[256, 256, 16],
+                pid_type="persistent_blocked",
+                tcgen05_cluster_m=2,
+            )
+            bound.set_config(cfg)
+            code = bound.to_triton_code(cfg)
+            self.assertIn("cute.nvgpu.tcgen05.CtaGroup.TWO", code)
+            self.assertNotIn("tcgen05_role_local", code)
+            self.assertIn(Tcgen05PersistentProgramIDs._MULTI_TILE_GUARD_TOTAL_VAR, code)
+            self.assertIn(
+                f"if {Tcgen05PersistentProgramIDs._MULTI_TILE_GUARD_TOTAL_VAR} > 0:",
+                code,
+            )
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "supports runtime execution only",
+            ):
+                bound(*args)
+
+    def test_tcgen05_persistent_cluster_m2_two_cta_pdl_codegen(self) -> None:
+        """CtaGroup.TWO emits Quack-aligned PDL markers in validated codegen."""
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_cluster_m2_two_cta_pdl(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        torch.manual_seed(0)
+        args = (
+            torch.randn(256, 16, device=DEVICE, dtype=torch.bfloat16),
+            torch.randn(16, 256, device=DEVICE, dtype=torch.bfloat16),
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_cluster_m2_two_cta_pdl.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            cfg = _make_tcgen05_persistent_config(
+                block_sizes=[256, 256, 16],
+                l2_groupings=[4],
+                pid_type="persistent_blocked",
+                tcgen05_cluster_m=2,
+            )
+            bound.set_config(cfg)
+            code = bound.to_triton_code(cfg)
+
+        self.assertEqual(code.count("cute.arch.griddepcontrol_wait()"), 1)
+        self.assertEqual(code.count("cute.arch.griddepcontrol_launch_dependents()"), 1)
+        tma_role_pos = code.index(
+            "if cute.arch.make_warp_uniform(cute.arch.warp_idx()) == cutlass.Int32(5):"
+        )
+        wait_pos = code.index("cute.arch.griddepcontrol_wait()", tma_role_pos)
+        tma_sched_pos = code.index(
+            "StaticPersistentTileScheduler.create(", tma_role_pos
+        )
+        tma_acquire_pos = code.index(
+            "tcgen05_ab_pipeline.producer_acquire", tma_role_pos
+        )
+        pdl_launch_pos = code.index("cute.arch.griddepcontrol_launch_dependents()")
+        tmem_arrive_pos = code.index("tcgen05_tmem_alloc_barrier.arrive()")
+
+        self.assertLess(wait_pos, tma_sched_pos)
+        self.assertLess(wait_pos, tma_acquire_pos)
+        self.assertLess(pdl_launch_pos, tmem_arrive_pos)
+
+    def test_tcgen05_persistent_cluster_m2_two_cta_single_tile_runtime_correctness(
+        self,
+    ) -> None:
+        """Single-output-tile CtaGroup.TWO codegen runs correctly.
+
+        The same role-local scheduler path is used for single-tile and
+        scheduler-recycling CtaGroup.TWO; this case covers the AB TMA/UMMA
+        ownership and tail-drain sequence with one logical tile.
+        """
+
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_cluster_m2_two_cta(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        torch.manual_seed(0)
+        args = (
+            torch.randn(256, 16, device=DEVICE, dtype=torch.bfloat16),
+            torch.randn(16, 256, device=DEVICE, dtype=torch.bfloat16),
+        )
+        from helion._compiler.program_id import Tcgen05PersistentProgramIDs
+
+        with patch_cute_mma_support():
+            bound = cute_matmul_cluster_m2_two_cta.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            cfg = _make_tcgen05_persistent_config(
+                block_sizes=[256, 256, 16],
+                # Grouped PID decomposition leaves pure scalar setup in the
+                # omitted shared view; single-tile runtime should compile and
+                # run instead of tripping the omit-safety assertion.
+                l2_groupings=[4],
+                pid_type="persistent_blocked",
+                tcgen05_cluster_m=2,
+            )
+            bound.set_config(cfg)
+            code = bound.to_triton_code(cfg)
+            self.assertIn("cute.nvgpu.tcgen05.CtaGroup.TWO", code)
+            self.assertEqual(code.count("cute.arch.griddepcontrol_wait()"), 1)
+            self.assertEqual(
+                code.count("cute.arch.griddepcontrol_launch_dependents()"), 1
+            )
+            self.assertIn(
+                "tcgen05_role_local_0_tile_sched = "
+                "cutlass.utils.StaticPersistentTileScheduler.create(",
+                code,
+            )
+            self.assertIn(
+                "virtual_pid = tcgen05_role_local_0_work_tile.tile_idx[0] "
+                "// cutlass.Int32(2)",
+                code,
+            )
+            self.assertIn("StaticPersistentTileScheduler.create", code)
+            self.assertIn(
+                "while tcgen05_role_local_0_work_tile.is_valid_tile",
+                code,
+            )
+            self.assertIn(
+                "tcgen05_ab_pipeline_consumer_group = "
+                "cutlass.pipeline.CooperativeGroup("
+                "cutlass.pipeline.Agent.Thread, cutlass.Int32(1))",
+                code,
+            )
+            self.assertIn(
+                "tcgen05_acc_pipeline_consumer_group = "
+                "cutlass.pipeline.CooperativeGroup("
+                "cutlass.pipeline.Agent.Thread, cutlass.Int32(8))",
+                code,
+            )
+            self.assertIn(
+                "tcgen05_acc_pipeline = "
+                "cutlass.pipeline.PipelineUmmaAsync.create("
+                "num_stages=2, "
+                "producer_group=tcgen05_acc_pipeline_producer_group, "
+                "consumer_group=tcgen05_acc_pipeline_consumer_group, "
+                "barrier_storage=tcgen05_acc_pipeline_barriers, "
+                "cta_layout_vmnk=tcgen05_cluster_layout_vmnk, "
+                "defer_sync=True)",
+                code,
+            )
+            self.assertIn(
+                "tcgen05_ab_pipeline_tx_count = "
+                "(cute.size_in_bytes(cutlass.BFloat16, sA_tma_layout) + "
+                "cute.size_in_bytes(cutlass.BFloat16, sB_tma_layout)) * "
+                "cute.size(tiled_mma.thr_id.shape)",
+                code,
+            )
+            self.assertIn(
+                "tcgen05_ab_pipeline = "
+                "cutlass.pipeline.PipelineTmaUmma.create("
+                "num_stages=2, "
+                "producer_group=tcgen05_ab_pipeline_producer_group, "
+                "consumer_group=tcgen05_ab_pipeline_consumer_group, "
+                "tx_count=tcgen05_ab_pipeline_tx_count, "
+                "barrier_storage=tcgen05_ab_pipeline_mbars, "
+                "cta_layout_vmnk=tcgen05_cluster_layout_vmnk, "
+                "defer_sync=True)",
+                code,
+            )
+            tmem_arrive_pos = code.index("tcgen05_tmem_alloc_barrier.arrive()")
+            pdl_launch_pos = code.index("cute.arch.griddepcontrol_launch_dependents()")
+            acc_tail_marker = (
+                "tcgen05_acc_pipeline.producer_tail"
+                if "tcgen05_acc_pipeline.producer_tail" in code
+                else "tcgen05_acc_pipeline.producer_acquire(tcgen05_acc_producer_state)"
+            )
+            acc_tail_pos = code.index(acc_tail_marker)
+            tmem_dealloc_allocator_pos = code.index(
+                "num_allocated_columns=tcgen05_acc_tmem_cols"
+            )
+            relinquish_pos = code.index(
+                "tcgen05_tmem_allocator.relinquish_alloc_permit()"
+            )
+            tmem_wait_pos = code.index("tcgen05_tmem_alloc_barrier.arrive_and_wait()")
+            tmem_free_pos = code.index("tcgen05_tmem_allocator.free(")
+            self.assertLess(pdl_launch_pos, tmem_arrive_pos)
+            self.assertLess(tmem_arrive_pos, acc_tail_pos)
+            self.assertLess(acc_tail_pos, tmem_dealloc_allocator_pos)
+            self.assertLess(tmem_dealloc_allocator_pos, relinquish_pos)
+            self.assertLess(relinquish_pos, tmem_wait_pos)
+            self.assertLess(tmem_wait_pos, tmem_free_pos)
+            self.assertNotIn(
+                "cute.arch.sync_threads()",
+                code[tmem_dealloc_allocator_pos:relinquish_pos],
+            )
+            init_arrive = "cutlass.pipeline.pipeline_init_arrive("
+            init_wait = "cutlass.pipeline.pipeline_init_wait("
+            self.assertLess(
+                code.index(
+                    "tcgen05_acc_pipeline = cutlass.pipeline.PipelineUmmaAsync.create("
+                ),
+                code.index(init_arrive),
+            )
+            self.assertLess(
+                code.index(
+                    "tcgen05_ab_pipeline = cutlass.pipeline.PipelineTmaUmma.create("
+                ),
+                code.index(init_arrive),
+            )
+            self.assertLess(code.index(init_arrive), code.index(init_wait))
+            self.assertLess(
+                code.index(init_wait),
+                code.index("tcgen05_tmem_allocator.allocate("),
+            )
+            self.assertNotIn("tcgen05_sched_pipeline", code)
+            self.assertNotIn("tcgen05_work_tile_smem", code)
+            self.assertNotIn("tcgen05_tile_sched.advance_to_next_work()", code)
+            tma_role_predicate = (
+                "cute.arch.make_warp_uniform(cute.arch.warp_idx()) == cutlass.Int32(5)"
+            )
+            exec_role_predicate = (
+                "cute.arch.make_warp_uniform(cute.arch.warp_idx()) == cutlass.Int32(4)"
+            )
+            epi_role_predicate = (
+                "cute.arch.make_warp_uniform(cute.arch.warp_idx()) < cutlass.Int32(4)"
+            )
+            tree = ast.parse(code)
+            self._assert_role_local_c_store_pipeline_lifetime(
+                code, tree, epi_role_predicate
+            )
+            found_role_local_tma = False
+            found_role_local_exec = False
+            found_role_local_epi = False
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.If):
+                    continue
+                test_src = ast.unparse(node.test)
+                role_src = ast.unparse(node)
+                if test_src == tma_role_predicate:
+                    self.assertLess(
+                        role_src.index("cute.arch.griddepcontrol_wait()"),
+                        role_src.index("StaticPersistentTileScheduler.create("),
+                    )
+                    self.assertLess(
+                        role_src.index("cute.arch.griddepcontrol_wait()"),
+                        role_src.index("tcgen05_ab_pipeline.producer_acquire"),
+                    )
+                    self.assertIn("tcgen05_ab_pipeline.producer_acquire", role_src)
+                    self.assertIn(
+                        "cute.nvgpu.cpasync.tma_partition("
+                        "tma_atom_a, tma_a_cta_coord, tma_a_cta_layout",
+                        role_src,
+                    )
+                    self.assertIn(
+                        "cute.nvgpu.cpasync.tma_partition("
+                        "tma_atom_b, tma_b_cta_coord, tma_b_cta_layout",
+                        role_src,
+                    )
+                    self.assertIn("cute.copy(tma_atom_a", role_src)
+                    self.assertNotIn(
+                        f"if {_TCGEN05_CLUSTER_LEADER_PREDICATE}", role_src
+                    )
+                    found_role_local_tma = True
+                elif test_src == exec_role_predicate:
+                    first_ab_peek_pos = role_src.index(
+                        "tcgen05_ab_pipeline.consumer_try_wait"
+                    )
+                    acc_acquire_pos = role_src.index(
+                        "tcgen05_acc_pipeline.producer_acquire"
+                    )
+                    accumulate_reset_pos = role_src.index(
+                        "tiled_mma.set(cute.nvgpu.tcgen05.Field.ACCUMULATE, False)"
+                    )
+                    self.assertLess(first_ab_peek_pos, acc_acquire_pos)
+                    self.assertLess(acc_acquire_pos, accumulate_reset_pos)
+                    self.assertLess(
+                        accumulate_reset_pos,
+                        role_src.index("tcgen05_ab_pipeline.consumer_wait"),
+                    )
+                    self.assertIn("tcgen05_ab_pipeline.consumer_wait", role_src)
+                    self.assertIn("cute.gemm(", role_src)
+                    self.assertIn(
+                        "tiled_mma.set(cute.nvgpu.tcgen05.Field.ACCUMULATE, True)",
+                        role_src,
+                    )
+                    self.assertIn("tcgen05_ab_pipeline.consumer_release", role_src)
+                    self.assertIn("tcgen05_ab_consumer_state.advance()", role_src)
+                    release_pos = role_src.index("tcgen05_ab_pipeline.consumer_release")
+                    advance_pos = role_src.index("tcgen05_ab_consumer_state.advance()")
+                    next_ab_peek_blocks = [
+                        ast.unparse(child)
+                        for child in ast.walk(node)
+                        if isinstance(child, ast.If)
+                        and "tcgen05_tma_next_consumer_tile" in ast.unparse(child.test)
+                        and _TCGEN05_CLUSTER_LEADER_PREDICATE in ast.unparse(child.test)
+                    ]
+                    self.assertTrue(
+                        next_ab_peek_blocks,
+                        "Expected a leader-gated AB consumer next-token peek. "
+                        "Generated role code:\n" + role_src,
+                    )
+                    next_ab_peek_pos = role_src.index(
+                        "tcgen05_tma_next_consumer_tile", advance_pos
+                    )
+                    next_ab_try_pos = role_src.index(
+                        "tcgen05_ab_pipeline.consumer_try_wait",
+                        next_ab_peek_pos,
+                    )
+                    self.assertLess(release_pos, advance_pos)
+                    self.assertLess(advance_pos, next_ab_peek_pos)
+                    self.assertLess(next_ab_peek_pos, next_ab_try_pos)
+                    leader_blocks = [
+                        ast.unparse(child)
+                        for child in ast.walk(node)
+                        if isinstance(child, ast.If)
+                        and _TCGEN05_CLUSTER_LEADER_PREDICATE in ast.unparse(child.test)
+                    ]
+                    self.assertTrue(
+                        any(
+                            "tcgen05_acc_pipeline.producer_acquire("
+                            "tcgen05_acc_producer_state)" in block
+                            for block in leader_blocks
+                        ),
+                        "Expected the CtaGroup.TWO exec owner to acquire "
+                        "the acc producer state. Generated role code:\n" + role_src,
+                    )
+                    self.assertTrue(
+                        any(
+                            "tcgen05_acc_pipeline.producer_commit("
+                            "tcgen05_acc_producer_state)" in block
+                            for block in leader_blocks
+                        ),
+                        "Expected the CtaGroup.TWO exec owner to commit "
+                        "the acc producer state. Generated role code:\n" + role_src,
+                    )
+                    self.assertTrue(
+                        any(
+                            "tcgen05_ab_pipeline.consumer_release("
+                            "tcgen05_ab_consumer_state)" in block
+                            for block in leader_blocks
+                        ),
+                        "AB empty release must be leader-owned so the "
+                        "PipelineTmaUmma multicast mask supplies the peer "
+                        "CTA's empty signal exactly once. Generated "
+                        "role code:\n" + role_src,
+                    )
+                    self.assertIn("tcgen05_acc_producer_state.advance()", role_src)
+                    found_role_local_exec = True
+                elif test_src == epi_role_predicate:
+                    self.assertIn("tcgen05_acc_pipeline.consumer_wait", role_src)
+                    self.assertNotIn("PipelineTmaStore.create", role_src)
+                    self.assertIn("cute.nvgpu.cpasync.tma_partition", role_src)
+                    self.assertIn("cute.copy(tcgen05_tma_store_atom", role_src)
+                    self.assertIn("tcgen05_tma_store_role_tile", role_src)
+                    self.assertNotIn("cute.nvgpu.CopyUniversalOp()", role_src)
+                    self._assert_tma_store_epilogue_order(role_src, require_tail=False)
+                    found_role_local_epi = True
+            for node in ast.walk(tree):
+                if not (
+                    isinstance(node, ast.While)
+                    and ast.unparse(node.test) == "tcgen05_work_tile_valid"
+                ):
+                    continue
+                self.fail(
+                    "Fully role-local CtaGroup.TWO codegen should not emit "
+                    "the residual shared scheduler loop. Generated code:\n" + code
+                )
+            self.assertTrue(
+                found_role_local_tma,
+                "Expected role-local TMA-load work in CtaGroup.TWO codegen. "
+                "Generated code:\n" + code,
+            )
+            self.assertTrue(
+                found_role_local_exec,
+                "Expected role-local MMA-exec work in CtaGroup.TWO codegen. "
+                "Generated code:\n" + code,
+            )
+            self.assertTrue(
+                found_role_local_epi,
+                "Expected role-local TMA-store epilogue work in CtaGroup.TWO "
+                "codegen. Generated code:\n" + code,
+            )
+            total_var = Tcgen05PersistentProgramIDs._MULTI_TILE_GUARD_TOTAL_VAR
+            self.assertNotIn(total_var, code)
+            out = bound(*args)
+        expected = args[0] @ args[1]
+        torch.testing.assert_close(out, expected, atol=2e-1, rtol=1e-2)
+
+    def test_tcgen05_persistent_cluster_m2_two_cta_multi_tile_runtime_correctness(
+        self,
+    ) -> None:
+        """Small multi-tile CtaGroup.TWO codegen runs correctly."""
+
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_cluster_m2_two_cta_multi_tile(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        from helion._compiler.program_id import Tcgen05PersistentProgramIDs
+
+        for pid_type in ("persistent_blocked", "persistent_interleaved"):
+            with self.subTest(pid_type=pid_type):
+                torch.manual_seed(0)
+                args = (
+                    torch.randn(512, 32, device=DEVICE, dtype=torch.bfloat16),
+                    torch.randn(32, 512, device=DEVICE, dtype=torch.bfloat16),
+                )
+                with patch_cute_mma_support():
+                    bound = cute_matmul_cluster_m2_two_cta_multi_tile.bind(args)
+                    bound.env.config_spec.cute_tcgen05_search_enabled = True
+                    cfg = _make_tcgen05_persistent_config(
+                        block_sizes=[256, 256, 16],
+                        l2_groupings=[4],
+                        pid_type=pid_type,
+                        tcgen05_cluster_m=2,
+                    )
+                    bound.set_config(cfg)
+                    code = bound.to_triton_code(cfg)
+                    self.assertIn("cute.nvgpu.tcgen05.CtaGroup.TWO", code)
+                    self.assertIn(
+                        "tcgen05_role_local_0_tile_sched = "
+                        "cutlass.utils.StaticPersistentTileScheduler.create(",
+                        code,
+                    )
+                    self.assertIn(
+                        "while tcgen05_role_local_0_work_tile.is_valid_tile",
+                        code,
+                    )
+                    self.assertIn("StaticPersistentTileScheduler.create", code)
+                    total_var = Tcgen05PersistentProgramIDs._MULTI_TILE_GUARD_TOTAL_VAR
+                    self.assertNotIn(total_var, code)
+                    out = bound(*args)
+                expected = args[0] @ args[1]
+                torch.testing.assert_close(out, expected, atol=2e-1, rtol=1e-2)
+
+    def test_tcgen05_persistent_cluster_m2_two_cta_grid_caps_for_recycling(
+        self,
+    ) -> None:
+        """CtaGroup.TWO launch grid caps at persistent work-cluster capacity."""
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_cluster_m2_two_cta_grid(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        args = (
+            torch.randn(512, 32, device=DEVICE, dtype=torch.bfloat16),
+            torch.randn(32, 512, device=DEVICE, dtype=torch.bfloat16),
+        )
+        from helion._compiler.program_id import Tcgen05PersistentProgramIDs
+
+        with patch_cute_mma_support():
+            bound = cute_matmul_cluster_m2_two_cta_grid.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            cfg = _make_tcgen05_persistent_config(
+                block_sizes=[256, 256, 16],
+                l2_groupings=[4],
+                num_sm_multiplier=2,
+                pid_type="persistent_blocked",
+                tcgen05_cluster_m=2,
+            )
+            bound.set_config(cfg)
+            code = bound.to_triton_code(cfg)
+            self.assertIn("cute.nvgpu.tcgen05.CtaGroup.TWO", code)
+            self.assertIn(
+                "tcgen05_role_local_0_tile_sched = "
+                "cutlass.utils.StaticPersistentTileScheduler.create(",
+                code,
+            )
+            self.assertIn("StaticPersistentTileScheduler.create", code)
+            self.assertIn(
+                "while tcgen05_role_local_0_work_tile.is_valid_tile",
+                code,
+            )
+            total_var = Tcgen05PersistentProgramIDs._MULTI_TILE_GUARD_TOTAL_VAR
+            self.assertNotIn(total_var, code)
+            launcher_lines = [
+                line
+                for line in code.splitlines()
+                if "_launcher(" in line and "_helion_cute" in line
+            ]
+            self.assertEqual(len(launcher_lines), 1, code)
+            self.assertRegex(launcher_lines[0], r"_launcher\([^,]+,\s*\(2,\s*1,")
+            self.assertIn("_NUM_SM", launcher_lines[0])
+            self.assertRegex(launcher_lines[0], r"//\s*2")
+            self.assertIn("min(", launcher_lines[0])
+
+    def test_tcgen05_persistent_cluster_m2_two_cta_grid_z_limit_uses_recycling(
+        self,
+    ) -> None:
+        """CtaGroup.TWO recycling avoids direct-grid z-limit launches."""
+
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_cluster_m2_two_cta_grid_z_limit(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        torch.manual_seed(0)
+        args = (
+            torch.randn(3072, 32, device=DEVICE, dtype=torch.bfloat16),
+            torch.randn(32, 3072, device=DEVICE, dtype=torch.bfloat16),
+        )
+        from helion._compiler.program_id import Tcgen05PersistentProgramIDs
+
+        with patch_cute_mma_support():
+            bound = cute_matmul_cluster_m2_two_cta_grid_z_limit.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            cfg = _make_tcgen05_persistent_config(
+                block_sizes=[256, 256, 16],
+                pid_type="persistent_blocked",
+                tcgen05_cluster_m=2,
+            )
+            bound.set_config(cfg)
+            code = bound.to_triton_code(cfg)
+            total_var = Tcgen05PersistentProgramIDs._MULTI_TILE_GUARD_TOTAL_VAR
+            self.assertIn("cute.nvgpu.tcgen05.CtaGroup.TWO", code)
+            self.assertNotIn(total_var, code)
+            self.assertNotIn("no more than 65535 output tiles", code)
+            self.assertIn(
+                "tcgen05_role_local_0_tile_sched = "
+                "cutlass.utils.StaticPersistentTileScheduler.create(",
+                code,
+            )
+            self.assertIn("StaticPersistentTileScheduler.create", code)
+            launcher_lines = [
+                line
+                for line in code.splitlines()
+                if "_launcher(" in line and "_helion_cute" in line
+            ]
+            self.assertEqual(len(launcher_lines), 1, code)
+            self.assertIn("_NUM_SM // 2", launcher_lines[0])
+            self.assertIn("min(", launcher_lines[0])
+            out = bound(*args)
+        expected = args[0] @ args[1]
+        torch.testing.assert_close(out, expected, atol=2e-1, rtol=1e-2)
+
+    def test_tcgen05_persistent_cluster_m2_two_cta_large_runtime_correctness(
+        self,
+    ) -> None:
+        """Large CtaGroup.TWO multi-tile codegen recycles scheduler state."""
+
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_cluster_m2_two_cta_large_multi_tile(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        torch.manual_seed(0)
+        args = (
+            torch.randn(4096, 32, device=DEVICE, dtype=torch.bfloat16),
+            torch.randn(32, 2048, device=DEVICE, dtype=torch.bfloat16),
+        )
+        from helion._compiler.program_id import Tcgen05PersistentProgramIDs
+
+        with patch_cute_mma_support():
+            bound = cute_matmul_cluster_m2_two_cta_large_multi_tile.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            cfg = _make_tcgen05_persistent_config(
+                block_sizes=[256, 256, 16],
+                l2_groupings=[4],
+                pid_type="persistent_blocked",
+                tcgen05_cluster_m=2,
+            )
+            bound.set_config(cfg)
+            code = bound.to_triton_code(cfg)
+            self.assertIn("cute.nvgpu.tcgen05.CtaGroup.TWO", code)
+            self.assertIn(
+                "tcgen05_role_local_0_tile_sched = "
+                "cutlass.utils.StaticPersistentTileScheduler.create(",
+                code,
+            )
+            self.assertIn(
+                "while tcgen05_role_local_0_work_tile.is_valid_tile",
+                code,
+            )
+            self.assertIn("StaticPersistentTileScheduler.create", code)
+            total_var = Tcgen05PersistentProgramIDs._MULTI_TILE_GUARD_TOTAL_VAR
+            self.assertNotIn(total_var, code)
+            first = bound(*args)
+            second = bound(*args)
+        expected = args[0] @ args[1]
+        torch.testing.assert_close(first, expected, atol=2e-1, rtol=1e-2)
+        torch.testing.assert_close(second, expected, atol=2e-1, rtol=1e-2)
+
+    def test_tcgen05_persistent_cluster_m2_two_cta_k_cap_runtime_correctness(
+        self,
+    ) -> None:
+        """CtaGroup.TWO codegen runs correctly at the validated K cap."""
+
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_cluster_m2_two_cta_long_k(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        from helion._compiler.program_id import Tcgen05PersistentProgramIDs
+
+        for k_size in (64, 256, 4096):
+            with self.subTest(k_size=k_size):
+                torch.manual_seed(0)
+                args = (
+                    torch.randn(256, k_size, device=DEVICE, dtype=torch.bfloat16),
+                    torch.randn(k_size, 256, device=DEVICE, dtype=torch.bfloat16),
+                )
+                with patch_cute_mma_support():
+                    bound = cute_matmul_cluster_m2_two_cta_long_k.bind(args)
+                    bound.env.config_spec.cute_tcgen05_search_enabled = True
+                    cfg = _make_tcgen05_persistent_config(
+                        block_sizes=[256, 256, 16],
+                        pid_type="persistent_blocked",
+                        tcgen05_cluster_m=2,
+                    )
+                    bound.set_config(cfg)
+                    code = bound.to_triton_code(cfg)
+                    self.assertIn("cute.nvgpu.tcgen05.CtaGroup.TWO", code)
+                    self.assertIn(
+                        "tcgen05_role_local_0_tile_sched = "
+                        "cutlass.utils.StaticPersistentTileScheduler.create(",
+                        code,
+                    )
+                    self.assertIn(
+                        "while tcgen05_role_local_0_work_tile.is_valid_tile",
+                        code,
+                    )
+                    self.assertIn("StaticPersistentTileScheduler.create", code)
+                    total_var = Tcgen05PersistentProgramIDs._MULTI_TILE_GUARD_TOTAL_VAR
+                    self.assertNotIn(total_var, code)
+                    self.assertNotIn(
+                        f"if {Tcgen05PersistentProgramIDs._MULTI_TILE_GUARD_TOTAL_VAR} > 0:",
+                        code,
+                    )
+                    out = bound(*args)
+                expected = args[0] @ args[1]
+                torch.testing.assert_close(out, expected, atol=2e-1, rtol=1e-2)
+
+    def test_tcgen05_persistent_cluster_m2_two_cta_k_tile_limit_guard(
+        self,
+    ) -> None:
+        """CtaGroup.TWO shapes above the validated K-tile cap stay guarded."""
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_cluster_m2_two_cta_k_tile_limit(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        args = (
+            torch.randn(256, 4112, device=DEVICE, dtype=torch.bfloat16),
+            torch.randn(4112, 256, device=DEVICE, dtype=torch.bfloat16),
+        )
+        from helion._compiler.program_id import Tcgen05PersistentProgramIDs
+
+        with patch_cute_mma_support():
+            bound = cute_matmul_cluster_m2_two_cta_k_tile_limit.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            cfg = _make_tcgen05_persistent_config(
+                block_sizes=[256, 256, 16],
+                pid_type="persistent_blocked",
+                tcgen05_cluster_m=2,
+            )
+            bound.set_config(cfg)
+            code = bound.to_triton_code(cfg)
+            self.assertIn("cute.nvgpu.tcgen05.CtaGroup.TWO", code)
+            self.assertIn(
+                f"if {Tcgen05PersistentProgramIDs._MULTI_TILE_GUARD_TOTAL_VAR} > 0:",
+                code,
+            )
+            self.assertIn("above the validated K-tile limit", code)
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "above the validated K-tile limit",
+            ):
+                bound(*args)
+
+    def test_tcgen05_flat_cluster_m2_two_cta_rejected(self) -> None:
+        """Flat CtaGroup.TWO configs do not have the persistent host guard."""
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_flat_cluster_m2(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        args = (
+            torch.randn(256, 32, device=DEVICE, dtype=torch.float16),
+            torch.randn(32, 256, device=DEVICE, dtype=torch.float16),
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_flat_cluster_m2.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            bound.env.config_spec.restrict_tcgen05_cluster_m_search((2, 1))
+            cfg = _make_tcgen05_persistent_config(
+                block_sizes=[256, 256, 16],
+                pid_type="flat",
+                tcgen05_cluster_m=2,
+            )
+            with self.assertRaisesRegex(
+                exc.BackendUnsupported,
+                "tcgen05_cluster_m > 1",
+            ):
+                bound.to_triton_code(cfg)
+
+    def test_non_tcgen05_flat_cluster_m2_fallback_is_allowed(self) -> None:
+        """tcgen05_cluster_m is irrelevant after falling back from tcgen05."""
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_float32_cluster_m2(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        args = (
+            torch.randn(256, 32, device=DEVICE, dtype=torch.float32),
+            torch.randn(32, 256, device=DEVICE, dtype=torch.float32),
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_float32_cluster_m2.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            bound.env.config_spec.restrict_tcgen05_cluster_m_search((2, 1))
+            cfg = _make_tcgen05_persistent_config(
+                block_sizes=[256, 256, 16],
+                pid_type="flat",
+                tcgen05_cluster_m=2,
+            )
+            code = bound.to_triton_code(cfg)
+
+        self.assertIn("_launcher(_helion_cute_matmul_float32_cluster_m2", code)
+        self.assertNotIn("cute.nvgpu.tcgen05.CtaGroup.TWO", code)
+        self.assertNotIn("_helion_cute_cluster_shape = (2, 1, 1)", code)
 
     def test_tcgen05_persistent_single_tile_runtime_correctness(self) -> None:
         """Persistent + tcgen05 produces correct output for single-tile shapes.
@@ -1516,12 +4516,12 @@ class TestCuteLowerings(unittest.TestCase):
         self.assertEqual(code.count("tcgen05_tmem_allocator.free"), 1)
         # The post-loop ``TmemAllocator(...)`` is the second one (the
         # first is the in-prefix instance for ``allocate``); it must be
-        # the variant that passes ``dealloc_mbarrier_initialized=True``,
-        # which is the marker the runtime uses to skip a redundant init
-        # round.
-        self.assertIn(
-            "dealloc_mbarrier_initialized=True",
-            code,
+        # the variant that asks the runtime to skip the dealloc-mbarrier
+        # init that the prologue allocator already performed.
+        self.assertTrue(
+            "dealloc_mbarrier_initialized=True" in code
+            or "initialize_mbarrier=False" in code,
+            f"expected dealloc-mbarrier skip kwarg in code: {code!r}",
         )
 
     def test_tcgen05_store_rejects_num_epi_warps_not_four(self) -> None:
@@ -1664,16 +4664,18 @@ class TestCuteLowerings(unittest.TestCase):
 
         self.assertIn("if tcgen05_exec_active:", code)
         self.assertEqual(code.count("tcgen05_tmem_allocator.free("), 1)
-        self.assertIn(
-            "num_allocated_columns=tcgen05_acc_tmem_cols, dealloc_mbarrier_initialized=True)",
-            code,
+        self.assertTrue(
+            "num_allocated_columns=tcgen05_acc_tmem_cols, dealloc_mbarrier_initialized=True)"
+            in code
+            or "num_allocated_columns=tcgen05_acc_tmem_cols, initialize_mbarrier=False)"
+            in code,
+            f"expected dealloc-mbarrier skip kwarg in code: {code!r}",
         )
-        # Direct TMEM->reg->GMEM SIMT epilogue (now used for all bn): the exec
-        # warp signals tcgen05_tmem_alloc_barrier.arrive() so the allocator
-        # teardown can wait on TMEM consumers, and the epi warps
-        # arrive_and_wait before freeing. The previous staged-via-smem_c
-        # epilogue used a different teardown sequence; the assertion below
-        # locks in the direct-store flow.
+        # tcgen05 epilogue teardown: the exec warp signals
+        # tcgen05_tmem_alloc_barrier.arrive() so allocator teardown can wait on
+        # TMEM consumers, and epi warps arrive_and_wait before freeing. The
+        # previous staged-via-smem_c epilogue used a different sequence; the
+        # assertion below locks in the current teardown flow.
         self.assertIn("tcgen05_tmem_alloc_barrier.arrive()", code)
         self.assertIn("tcgen05_tmem_alloc_barrier.arrive_and_wait()", code)
 
@@ -1721,8 +4723,9 @@ class TestCuteLowerings(unittest.TestCase):
             "tcgen05_tmem_alloc_barrier = cutlass.pipeline.NamedBarrier(barrier_id=1, num_threads=160)",
             code,
         )
+        self.assertIn("tcgen05_epi_tidx", code)
         self.assertIn(
-            ".get_slice(tcgen05_epi_tidx)",
+            "cutlass.utils.gemm.sm100.epilogue_tmem_copy_and_partition",
             code,
         )
         self.assertIn("block=(128, 2, 1)", code)
@@ -1820,7 +4823,7 @@ class TestCuteLowerings(unittest.TestCase):
             block_sizes=[128, 128, 16],
             loop_orders=[[0, 1]],
             num_stages=1,
-            pid_type="flat",
+            pid_type="persistent_blocked",
             tcgen05_cluster_m=2,
             tcgen05_num_epi_warps=4,
         )
@@ -1830,8 +4833,9 @@ class TestCuteLowerings(unittest.TestCase):
             patch_cute_mma_support(),
         ):
             bound = cute_matmul_mma_codegen_only.bind(args)
-            # See note above: widen cluster_m back to include 2 for the
-            # codegen-only test, since matmul_ops restricts it for runtime.
+            # This CtaGroup.ONE cluster_m=2 fallback remains host-guarded
+            # before launch, but the structural codegen path is still useful
+            # to inspect.
             bound.env.config_spec.cute_tcgen05_search_enabled = True
             bound.env.config_spec.restrict_tcgen05_cluster_m_search((2, 1))
             code = bound.to_triton_code(config)
@@ -1856,14 +4860,17 @@ class TestCuteLowerings(unittest.TestCase):
         self.assertNotIn("load = x[indices_0, indices_2]", code)
         self.assertNotIn("load_1 = y[indices_2, indices_1]", code)
         self.assertNotIn("tcgen05_store_tmem_load_atom", code)
-        # The wide tcgen05 epilogue now uses the direct TMEM->reg->GMEM SIMT
-        # path (`_codegen_cute_store_tcgen05_tile`) instead of staging through
-        # an intermediate `smem_c` allocation, so the float32 tile-wide SMEM
-        # buffer is no longer materialized.
+        # The wide tcgen05 epilogue is emitted by
+        # `_codegen_cute_store_tcgen05_tile` instead of staging through an
+        # intermediate generic `smem_c` allocation, so the float32 tile-wide
+        # SMEM buffer is no longer materialized.
         self.assertNotIn("smem_c = cute.arch.alloc_smem", code)
-        self.assertIn(
-            "num_allocated_columns=tcgen05_acc_tmem_cols, dealloc_mbarrier_initialized=True)",
-            code,
+        self.assertTrue(
+            "num_allocated_columns=tcgen05_acc_tmem_cols, dealloc_mbarrier_initialized=True)"
+            in code
+            or "num_allocated_columns=tcgen05_acc_tmem_cols, initialize_mbarrier=False)"
+            in code,
+            f"expected dealloc-mbarrier skip kwarg in code: {code!r}",
         )
 
     def test_permute_codegen_materializes_non_store_use(self) -> None:
@@ -3895,6 +6902,38 @@ class TestCuteLowerings(unittest.TestCase):
                     _choose_mma_impl(torch.float16, bm=32, bn=16, bk=16),
                     "universal",
                 )
+                self.assertEqual(
+                    _choose_mma_impl(torch.float16, bm=64, bn=512, bk=16),
+                    "universal",
+                )
+                self.assertEqual(
+                    _choose_mma_impl(
+                        torch.float16,
+                        bm=64,
+                        bn=512,
+                        bk=16,
+                        config=helion.Config(
+                            block_sizes=[64, 512, 16],
+                            tcgen05_cluster_m=1,
+                            **{TCGEN05_LARGE_BN_PROOF_CONFIG_KEY: True},
+                        ),
+                    ),
+                    "tcgen05",
+                )
+                self.assertEqual(
+                    _choose_mma_impl(
+                        torch.float16,
+                        bm=128,
+                        bn=512,
+                        bk=16,
+                        config=helion.Config(
+                            block_sizes=[128, 512, 16],
+                            tcgen05_cluster_m=1,
+                            **{TCGEN05_LARGE_BN_PROOF_CONFIG_KEY: True},
+                        ),
+                    ),
+                    "universal",
+                )
 
     def test_tcgen05_thread_counts_match_participants_and_cta(self) -> None:
         self.assertEqual(_tcgen05_ab_stage_count(0), 1)
@@ -3992,9 +7031,9 @@ class TestCuteLowerings(unittest.TestCase):
         ):
             bound = cute_matmul_mma_codegen_only.bind(args)
             # matmul_ops narrows tcgen05_cluster_m to (1,) when binding the
-            # bf16/fp16 matmul because cluster_m=2 currently crashes the
-            # launch; this codegen-only test still exercises the cluster=2
-            # path so widen the choices back to (2, 1).
+            # bf16/fp16 matmul until the cluster=2 path is benchmarked. This
+            # K-over-cap codegen-only test still exercises the guarded
+            # cluster=2 structure, so widen the choices back to (2, 1).
             bound.env.config_spec.cute_tcgen05_search_enabled = True
             bound.env.config_spec.restrict_tcgen05_cluster_m_search((2, 1))
             code = bound.to_triton_code(config)
@@ -4008,6 +7047,33 @@ class TestCuteLowerings(unittest.TestCase):
             code,
         )
         self.assertIn("cute.nvgpu.tcgen05.CtaGroup.TWO", code)
+        self.assertIn("_helion_tcgen05_persistent_total_tiles", code)
+        self.assertIn("above the validated K-tile limit", code)
+        self.assertIn(
+            "PersistentTileSchedulerParams(((8192 + _BLOCK_SIZE_0 - 1) // "
+            "_BLOCK_SIZE_0 * 2",
+            code,
+        )
+        self.assertIn(
+            "virtual_pid = tcgen05_role_local_0_work_tile.tile_idx[0] "
+            "// cutlass.Int32(2)",
+            code,
+        )
+        self.assertIn("tcgen05_role_local_0_tile_sched_params", code)
+        self.assertIn("tcgen05_role_local_1_tile_sched_params", code)
+        self.assertIn("tcgen05_role_local_2_tile_sched_params", code)
+        self.assertIn("tcgen05_ab_pipeline.producer_acquire", code)
+        self.assertIn(f"if {_TCGEN05_CLUSTER_LEADER_PREDICATE}:", code)
+        self.assertIn("cute.copy(tma_atom_a", code)
+        self.assertIn(
+            "if tcgen05_exec_active and "
+            "cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster()) "
+            "== cutlass.Int32(0):",
+            code,
+        )
+        self.assertIn("'kind': 'tcgen05_d_tma'", code)
+        self.assertIn("cutlass.pipeline.PipelineTmaStore.create", code)
+        self.assertNotIn("cute.nvgpu.CopyUniversalOp()", code)
         self.assertIn("_BLOCK_SIZE_0 = 256", code)
         self.assertIn("_BLOCK_SIZE_1 = 256", code)
         self.assertIn("cute.arch.block_idx_in_cluster()", code)
@@ -4039,7 +7105,8 @@ class TestCuteLowerings(unittest.TestCase):
             "cutlass.pipeline.pipeline_init_wait(cluster_shape_mn=tcgen05_cluster_layout_vmnk)",
             code,
         )
-        self.assertIn("while tcgen05_work_tile", code)
+        self.assertIn("while tcgen05_role_local_0_work_tile.is_valid_tile", code)
+        self.assertNotIn("while tcgen05_work_tile_valid", code)
         self.assertNotIn("for virtual_pid in ", code)
 
     def test_cute_grouped_sum_reduction_uses_tree_for_non_warp_multiple_groups(
@@ -4134,6 +7201,145 @@ class TestCuteLowerings(unittest.TestCase):
 
 
 @onlyBackends(["cute"])
+class TestCuteDslCompat(unittest.TestCase):
+    def test_umma_async_tail_workaround_preserves_leader_cta_guard(self) -> None:
+        from helion._compiler.cute import cutedsl_compat
+
+        with patch.object(
+            cutedsl_compat, "cutedsl_has_opresultlist_fix", return_value=False
+        ):
+            src = cutedsl_compat.emit_producer_tail_umma_async(
+                "acc_pipeline", "acc_state", num_stages=3
+            )
+
+        self.assertIn("cute.arch.block_idx_in_cluster()", src)
+        self.assertIn("cute.arch.make_warp_uniform(_pt_bidx)", src)
+        leader_guard = "if _pt_cta_rank % cutlass.Int32(2) == cutlass.Int32(0):"
+        self.assertIn(leader_guard, src)
+        self.assertLess(
+            src.index(leader_guard),
+            src.index("acc_state._count = acc_state._count + cutlass.Int32(1)"),
+        )
+        self.assertLess(
+            src.index("acc_state._count = acc_state._count + cutlass.Int32(1)"),
+            src.index("acc_pipeline.producer_acquire(acc_state)"),
+        )
+        self.assertEqual(
+            src.count("acc_state._count = acc_state._count + cutlass.Int32(1)"),
+            2,
+        )
+        self.assertNotIn("acc_pipeline.sync_object_empty.wait", src)
+        self.assertIn("acc_pipeline.producer_acquire(acc_state)", src)
+
+    def test_tma_umma_tail_uses_upstream_when_advance_and_tail_safe(self) -> None:
+        from helion._compiler.cute import cutedsl_compat
+
+        with (
+            patch.object(
+                cutedsl_compat, "cutedsl_has_opresultlist_fix", return_value=True
+            ),
+            patch.object(
+                cutedsl_compat,
+                "cutedsl_tma_umma_tail_has_peer_cta_semantics",
+                return_value=True,
+            ),
+        ):
+            self.assertEqual(
+                cutedsl_compat.emit_producer_tail_tma_umma(
+                    "ab_pipeline", "ab_state", num_stages=3
+                ),
+                "ab_pipeline.producer_tail(ab_state)",
+            )
+
+    def test_tma_umma_tail_inlines_when_tail_semantics_unsafe(self) -> None:
+        from helion._compiler.cute import cutedsl_compat
+
+        with (
+            patch.object(
+                cutedsl_compat, "cutedsl_has_opresultlist_fix", return_value=True
+            ),
+            patch.object(
+                cutedsl_compat,
+                "cutedsl_tma_umma_tail_has_peer_cta_semantics",
+                return_value=False,
+            ),
+        ):
+            src = cutedsl_compat.emit_producer_tail_tma_umma(
+                "ab_pipeline", "ab_state", num_stages=3
+            )
+
+        self.assertNotIn("block_idx_in_cluster", src)
+        self.assertNotIn("_pt_cta_rank", src)
+        self.assertNotIn("if True", src)
+        self.assertLess(
+            src.index("ab_state._count = ab_state._count + cutlass.Int32(1)"),
+            src.index("ab_pipeline.producer_acquire(ab_state)"),
+        )
+        self.assertEqual(
+            src.count("ab_state._count = ab_state._count + cutlass.Int32(1)"),
+            2,
+        )
+        self.assertIn("ab_pipeline.producer_acquire(ab_state)", src)
+
+    def test_tma_umma_tail_inlines_when_advance_workaround_needed(self) -> None:
+        from helion._compiler.cute import cutedsl_compat
+
+        with patch.object(
+            cutedsl_compat, "cutedsl_has_opresultlist_fix", return_value=False
+        ):
+            src = cutedsl_compat.emit_producer_tail_tma_umma(
+                "ab_pipeline", "ab_state", num_stages=3
+            )
+
+        self.assertNotIn("block_idx_in_cluster", src)
+        self.assertNotIn("if True", src)
+        self.assertIn("ab_pipeline.producer_acquire(ab_state)", src)
+
+    def test_tma_umma_tail_can_skip_state_advances(self) -> None:
+        from helion._compiler.cute import cutedsl_compat
+
+        with (
+            patch.object(
+                cutedsl_compat, "cutedsl_has_opresultlist_fix", return_value=True
+            ),
+            patch.object(
+                cutedsl_compat,
+                "cutedsl_tma_umma_tail_has_peer_cta_semantics",
+                return_value=True,
+            ),
+        ):
+            src = cutedsl_compat.emit_producer_tail_tma_umma(
+                "ab_pipeline",
+                "ab_state",
+                num_stages=3,
+                skip_advances=True,
+            )
+
+        self.assertEqual(src, "ab_pipeline.producer_acquire(ab_state)")
+        self.assertNotIn("producer_tail", src)
+        self.assertNotIn("ab_state._count", src)
+        self.assertNotIn("ab_state.advance", src)
+
+    def test_tma_umma_tail_detector_allows_state_rename(self) -> None:
+        from helion._compiler.cute import cutedsl_compat
+
+        cutedsl_compat.cutedsl_tma_umma_tail_has_peer_cta_semantics.cache_clear()
+        src = """
+def producer_tail(self, producer_state):
+    for i in range(self.num_stages - 1):
+        producer_state.advance()
+    self.producer_acquire(producer_state)
+"""
+        try:
+            with patch.object(cutedsl_compat.inspect, "getsource", return_value=src):
+                self.assertTrue(
+                    cutedsl_compat.cutedsl_tma_umma_tail_has_peer_cta_semantics()
+                )
+        finally:
+            cutedsl_compat.cutedsl_tma_umma_tail_has_peer_cta_semantics.cache_clear()
+
+
+@onlyBackends(["cute"])
 class TestPersistentLoopSplitter(unittest.TestCase):
     """Unit tests for the per-tile / post-loop splitters and the
     role-block partitioner on ``Tcgen05PersistentProgramIDs``.
@@ -4170,6 +7376,7 @@ class TestPersistentLoopSplitter(unittest.TestCase):
                 self._tma_load_role_ids: set[int] = set()
                 self._mma_exec_role_ids: set[int] = set()
                 self._epi_role_ids: set[int] = set()
+                self.cute_tcgen05_epi_role_tile_counter_var: str | None = None
 
             def register_cute_tcgen05_per_tile_stmts(
                 self, stmts: list[ast.AST]
@@ -4290,6 +7497,7 @@ class TestPersistentLoopSplitter(unittest.TestCase):
                 self._tma_load_role_ids: set[int] = set()
                 self._mma_exec_role_ids: set[int] = set()
                 self._epi_role_ids: set[int] = set()
+                self.cute_tcgen05_epi_role_tile_counter_var: str | None = None
 
             def new_var(self, name: str) -> str:
                 self._counter += 1
@@ -4478,7 +7686,7 @@ class TestPersistentLoopSplitter(unittest.TestCase):
         )
         self.assertIn(f"{total_var} = 0 + 1", host_src)
         self.assertIn(f"if {total_var} > 0", host_src)
-        self.assertIn("supports multi-tile execution only", host_src)
+        self.assertIn("supports runtime execution only", host_src)
 
     def test_unmarked_statements_are_hoisted(self) -> None:
         splitter, df = self._make_helper()
@@ -5143,6 +8351,99 @@ class TestPersistentLoopSplitter(unittest.TestCase):
         self.assertLess(loop_src.find("offset_0 ="), loop_src.find("for offset_2"))
         self.assertNotIn("consumer_wait", loop_src)
 
+    def test_omit_shared_loop_rejects_observable_shared_stmt(self) -> None:
+        """Fully role-local CtaGroup.TWO codegen omits the residual shared
+        loop. If the tagged-removed shared view ever contains an observable
+        operation, the omission must fail loudly instead of dropping it."""
+        from helion._compiler.program_id import Tcgen05PersistentProgramIDs
+
+        splitter, _ = self._make_helper()
+        unsafe_stmts = [
+            "cute.copy(src, dst)",
+            "tmp = cute.copy(src, dst)",
+            "tmp = some_pipeline_call(src)",
+            "tmp = min(num_pid_m, 4, key=some_callable)",
+            "if side_effecting_call():\n    tmp = 1",
+            "for idx in side_effecting_call():\n    tmp = idx",
+        ]
+        for stmt_src in unsafe_stmts:
+            with self.subTest(stmt_src=stmt_src):
+                partition = Tcgen05PersistentProgramIDs._PartitionedRoleBody(
+                    role_blocks_inline=[],
+                    role_blocks_extracted=[],
+                    shared_body_extracted=[self._stmt(stmt_src)],
+                )
+
+                with self.assertRaisesRegex(
+                    AssertionError, "discard observable shared statement"
+                ):
+                    splitter._assert_tcgen05_omit_shared_loop_safe(partition)
+
+    def test_role_local_tile_body_can_skip_shared_body_build(self) -> None:
+        """When the caller omits the residual shared loop, the role-local
+        builder should not construct and discard that body. Dependency-only
+        scalar setup is still allowed because role-local loops clone it."""
+        from helion._compiler.program_id import Tcgen05PersistentProgramIDs
+
+        stub_df, splitter = self._make_role_local_stubs(num_pid_dims=1)
+        layout = self._make_minimal_layout(cluster_m=2)
+        shared_stmt = self._stmt("pid_0 = __test_virtual_pid__")
+        role_stmt = self._stmt("role_value = pid_0")
+        role_block = Tcgen05PersistentProgramIDs._PersistentRoleBlock(
+            role_predicate="__test_tma_load_warp__", stmts=[role_stmt]
+        )
+        partition = Tcgen05PersistentProgramIDs._PartitionedRoleBody(
+            role_blocks_inline=[],
+            role_blocks_extracted=[role_block],
+            shared_body_extracted=[shared_stmt],
+        )
+
+        def fail_shared_builder(layout_arg: object, role_blocks_arg: object) -> None:
+            self.fail("omitted shared loop should not build shared_tile_body")
+
+        splitter._build_tcgen05_persistent_tile_body = fail_shared_builder  # type: ignore[method-assign]
+
+        role_local_whiles, shared_tile_body = (
+            splitter._build_tcgen05_persistent_tile_body_role_local(
+                stub_df, layout, partition, build_shared_tile_body=False
+            )
+        )
+
+        self.assertEqual(shared_tile_body, [])
+        self.assertEqual(len(role_local_whiles), 1)
+        while_stmt = role_local_whiles[0].body[-1]
+        loop_src = "\n".join(ast.unparse(s) for s in while_stmt.body)
+        self.assertIn("pid_0 = __test_virtual_pid__", loop_src)
+        self.assertIn("role_value = pid_0", loop_src)
+
+    def test_omit_shared_loop_allows_grouped_pid_scalar_setup(self) -> None:
+        """Grouped PID decomposition and scalar fallback remnants are pure.
+
+        Explicit guarded CtaGroup.TWO configs can still use grouped PID
+        decomposition before the host guard raises. The omit-shared-loop
+        safety check must allow these dependency-only expressions while
+        still rejecting observable calls.
+        """
+        from helion._compiler.program_id import Tcgen05PersistentProgramIDs
+
+        splitter, _ = self._make_helper()
+        partition = Tcgen05PersistentProgramIDs._PartitionedRoleBody(
+            role_blocks_inline=[],
+            role_blocks_extracted=[],
+            shared_body_extracted=[
+                self._stmt("group_size_m = min(num_pid_m - first_pid_m, 4)"),
+                self._stmt(
+                    "for offset_2 in range(cutlass.Int32(0), "
+                    "cutlass.Int32(16), cutlass.Int32(_BLOCK_SIZE_2)):\n"
+                    "    indices_2 = offset_2\n"
+                    "    mask_2 = indices_2 < 16\n"
+                    "    load = cutlass.BFloat16(0)"
+                ),
+            ],
+        )
+
+        splitter._assert_tcgen05_omit_shared_loop_safe(partition)
+
     def test_role_local_tile_body_builder_returns_two_lists(self) -> None:
         """``_build_tcgen05_persistent_tile_body_role_local`` returns
         ``(role_local_whiles, shared_tile_body)``. The role-local
@@ -5276,8 +8577,43 @@ class TestPersistentLoopSplitter(unittest.TestCase):
         )
         # The PersistentTileSchedulerParams call site must reference
         # cluster_m=2 in the cluster shape tuple.
-        params_src = ast.unparse(emitted.body[0])
-        self.assertIn("(2, 1, 1)", params_src)
+        body_srcs = [ast.unparse(stmt) for stmt in emitted.body]
+        params_srcs = [
+            src for src in body_srcs if "PersistentTileSchedulerParams" in src
+        ]
+        self.assertEqual(len(params_srcs), 1)
+        self.assertIn("(2, 1, 1)", params_srcs[0])
+
+    def test_role_local_while_skips_pdl_wait_without_two_cta(self) -> None:
+        """The Quack PDL wait is paired with the two-CTA launch-dependents."""
+        from helion._compiler.program_id import Tcgen05PersistentProgramIDs
+
+        stub_df, splitter = self._make_role_local_stubs(num_pid_dims=1)
+        layout = self._make_minimal_layout(cluster_m=2)
+        prefetch = self._stmt("tma_pipeline.producer_acquire(state)")
+        role_block = Tcgen05PersistentProgramIDs._PersistentRoleBlock(
+            role_predicate="__test_tma_load_warp__", stmts=[prefetch]
+        )
+        with (
+            patch.object(
+                Tcgen05PersistentProgramIDs,
+                "_tcgen05_is_two_cta",
+                return_value=False,
+            ),
+            patch.object(
+                Tcgen05PersistentProgramIDs,
+                "_tcgen05_tma_load_role_predicate",
+                return_value="__test_tma_load_warp__",
+            ),
+        ):
+            emitted = splitter._build_role_local_while(
+                stub_df,
+                layout,
+                role_block,
+                scheduler_var_prefix="rl_non_two_cta_pdl",
+            )
+
+        self.assertNotIn("cute.arch.griddepcontrol_wait()", ast.unparse(emitted))
 
 
 @onlyBackends(["cute"])
@@ -5295,9 +8631,12 @@ class TestPerKiterTmaBuilders(unittest.TestCase):
         *,
         cluster_m: int = 1,
         is_two_cta: bool = False,
+        use_tma_b_mcast_mask: bool | None = None,
         use_tma_a: bool = True,
         use_tma_b: bool = True,
     ) -> _PerKiterTmaArgs:
+        if use_tma_b_mcast_mask is None:
+            use_tma_b_mcast_mask = cluster_m > 1 or is_two_cta
         return _PerKiterTmaArgs(
             tma_pipeline="ab_pipeline",
             tma_producer_state="ab_producer_state",
@@ -5307,6 +8646,7 @@ class TestPerKiterTmaBuilders(unittest.TestCase):
             tma_barrier_ptr="tma_barrier_ptr",
             tma_full_tile="full_tile",
             tma_next_full_tile="next_full_tile",
+            tma_next_consumer_tile="next_consumer_tile",
             tma_warp="tma_warp",
             tma_atom_a="tma_atom_a",
             tma_atom_b="tma_atom_b",
@@ -5318,10 +8658,13 @@ class TestPerKiterTmaBuilders(unittest.TestCase):
             tma_a_mcast_mask="a_mcast_mask",
             tma_b_mcast_mask="b_mcast_mask",
             ab_stage_count=2,
-            cluster_m=cluster_m,
             is_two_cta=is_two_cta,
+            use_tma_b_mcast_mask=use_tma_b_mcast_mask,
             use_tma_a=use_tma_a,
             use_tma_b=use_tma_b,
+            skip_producer_acquire=False,
+            skip_producer_advance=False,
+            skip_consumer_wait=False,
             exec_active="exec_active",
             scalar_load_a=self._scalar_load_a(),
             scalar_load_b=self._scalar_load_b(),
@@ -5385,6 +8728,31 @@ class TestPerKiterTmaBuilders(unittest.TestCase):
         body_src = ast.unparse(ast.Module(body=node.body, type_ignores=[]))
         self.assertNotIn("tma_warp", body_src)
 
+    def test_pipeline_producer_two_cta_keeps_per_cta_copies(
+        self,
+    ) -> None:
+        args = self._make_args(cluster_m=2, is_two_cta=True)
+        node = _build_kloop_pipeline_producer_if(args)
+        self.assertIsInstance(node, ast.If)
+        self.assertEqual(
+            ast.unparse(node.test),
+            "full_tile and tma_warp and next_full_tile",
+        )
+        self.assertEqual(
+            self._stmt_kinds(node.body),
+            [
+                "=producer_try_acquire",
+                "producer_acquire",
+                "=producer_get_barrier",
+                "copy",
+                "copy",
+                "producer_commit",
+                "advance",
+            ],
+        )
+        body_src = ast.unparse(ast.Module(body=node.body, type_ignores=[]))
+        self.assertNotIn(_TCGEN05_CLUSTER_LEADER_PREDICATE, body_src)
+
     def test_non_pipeline_producer_if_can_drop_inline_tma_warp_gate(self) -> None:
         args = self._make_args()
         node = _build_kloop_non_pipeline_producer_if(args, gate_tma_warp=False)
@@ -5426,6 +8794,61 @@ class TestPerKiterTmaBuilders(unittest.TestCase):
         self.assertNotIn("exec_active", body_src)
         self.assertEqual(node.orelse, [])
 
+    def test_pipeline_consumer_if_can_reuse_prefetched_try_token(self) -> None:
+        args = self._make_args()
+        node = _build_kloop_pipeline_consumer_if(
+            args,
+            gate_exec_warp=False,
+            include_scalar_fallback=False,
+            use_existing_try_token=True,
+        )
+
+        body_src = ast.unparse(ast.Module(body=node.body, type_ignores=[]))
+        self.assertNotIn("consumer_try_wait", body_src)
+        self.assertIn(
+            "ab_pipeline.consumer_wait(ab_consumer_state, ab_consumer_try_token)",
+            body_src,
+        )
+
+    def test_pipeline_consumer_prefetch_two_cta_gates_try_wait_to_leader(
+        self,
+    ) -> None:
+        args = self._make_args(cluster_m=2, is_two_cta=True)
+        stmts = _build_kloop_pipeline_consumer_prefetch_stmts(
+            args, gate_exec_warp=False
+        )
+
+        self.assertEqual(self._stmt_kinds(stmts), ["=Boolean", "If"])
+        peek = stmts[1]
+        self.assertIsInstance(peek, ast.If)
+        self.assertEqual(
+            ast.unparse(peek.test),
+            f"next_consumer_tile and {_TCGEN05_CLUSTER_LEADER_PREDICATE}",
+        )
+        self.assertEqual(self._stmt_kinds(peek.body), ["=consumer_try_wait"])
+
+    def test_pipeline_consumer_prefetch_requires_two_cta(self) -> None:
+        args = self._make_args()
+        with self.assertRaisesRegex(AssertionError, "CtaGroup.TWO"):
+            _build_kloop_pipeline_consumer_prefetch_stmts(args)
+
+    def test_pipeline_consumer_two_cta_gates_wait_to_leader(self) -> None:
+        args = self._make_args(cluster_m=2, is_two_cta=True)
+        node = _build_kloop_pipeline_consumer_if(args)
+        self.assertIsInstance(node, ast.If)
+        self.assertEqual(ast.unparse(node.test), "full_tile")
+        self.assertEqual(len(node.body), 1)
+        inner = node.body[0]
+        self.assertIsInstance(inner, ast.If)
+        self.assertEqual(
+            ast.unparse(inner.test),
+            f"exec_active and {_TCGEN05_CLUSTER_LEADER_PREDICATE}",
+        )
+        self.assertEqual(
+            self._stmt_kinds(inner.body),
+            ["=consumer_try_wait", "consumer_wait"],
+        )
+
     def test_pipeline_release_if_predicate_and_body(self) -> None:
         args = self._make_args()
         node = _build_kloop_pipeline_release_if(args)
@@ -5455,6 +8878,65 @@ class TestPerKiterTmaBuilders(unittest.TestCase):
         self.assertIn("ab_consumer_state.advance", body_src)
         self.assertNotIn("exec_active", body_src)
         self.assertEqual(node.orelse, [])
+
+    def test_pipeline_release_two_cta_releases_from_leader_and_advances_both(
+        self,
+    ) -> None:
+        args = self._make_args(cluster_m=2, is_two_cta=True)
+        node = _build_kloop_pipeline_release_if(args)
+        self.assertIsInstance(node, ast.If)
+        self.assertEqual(ast.unparse(node.test), "full_tile")
+        self.assertEqual(self._stmt_kinds(node.body), ["If", "If"])
+        release_gate, advance_gate = node.body
+        self.assertIsInstance(release_gate, ast.If)
+        self.assertEqual(
+            ast.unparse(release_gate.test),
+            f"exec_active and {_TCGEN05_CLUSTER_LEADER_PREDICATE}",
+        )
+        self.assertEqual(self._stmt_kinds(release_gate.body), ["consumer_release"])
+        self.assertIsInstance(advance_gate, ast.If)
+        self.assertEqual(ast.unparse(advance_gate.test), "exec_active")
+        self.assertEqual(self._stmt_kinds(advance_gate.body), ["advance"])
+
+    def test_tcgen05_mma_issue_two_cta_gates_gemm_to_leader(self) -> None:
+        node = _build_tcgen05_mma_issue_stmt(
+            exec_active="exec_active",
+            tiled_mma="tiled_mma",
+            acc_frag="acc_frag",
+            tcgen05_frag_a="tCrA",
+            tcgen05_frag_b="tCrB",
+            mma_stage="mma_stage",
+            is_two_cta=True,
+        )
+        self.assertIsInstance(node, ast.If)
+        self.assertEqual(
+            ast.unparse(node.test),
+            f"exec_active and {_TCGEN05_CLUSTER_LEADER_PREDICATE}",
+        )
+        body_src = ast.unparse(ast.Module(body=node.body, type_ignores=[]))
+        self.assertIn("cute.gemm", body_src)
+        self.assertNotIn("offset_2 != cutlass.Int32(0)", body_src)
+        self.assertNotIn("Field.ACCUMULATE, offset_2", body_src)
+        self.assertIn(
+            "tiled_mma.set(cute.nvgpu.tcgen05.Field.ACCUMULATE, True)",
+            body_src,
+        )
+
+    def test_tcgen05_mma_accumulate_reset_two_cta_gates_to_leader(self) -> None:
+        node = _build_tcgen05_mma_accumulate_reset_stmt(
+            "exec_active", tiled_mma="tiled_mma", is_two_cta=True
+        )
+
+        self.assertIsInstance(node, ast.If)
+        self.assertEqual(
+            ast.unparse(node.test),
+            f"exec_active and {_TCGEN05_CLUSTER_LEADER_PREDICATE}",
+        )
+        body_src = ast.unparse(ast.Module(body=node.body, type_ignores=[]))
+        self.assertIn(
+            "tiled_mma.set(cute.nvgpu.tcgen05.Field.ACCUMULATE, False)",
+            body_src,
+        )
 
     def test_non_pipeline_release_advances_both_states(self) -> None:
         args = self._make_args()
@@ -5548,7 +9030,10 @@ class TestInitialPrefetchTmaBuilder(unittest.TestCase):
         *,
         cluster_m: int = 1,
         is_two_cta: bool = False,
+        use_tma_b_mcast_mask: bool | None = None,
     ) -> _InitialPrefetchTmaArgs:
+        if use_tma_b_mcast_mask is None:
+            use_tma_b_mcast_mask = cluster_m > 1 or is_two_cta
         return _InitialPrefetchTmaArgs(
             tma_pipeline="ab_pipeline",
             tma_producer_state="ab_producer_state",
@@ -5562,8 +9047,10 @@ class TestInitialPrefetchTmaBuilder(unittest.TestCase):
             tma_sB="sB",
             tma_a_mcast_mask="a_mcast_mask",
             tma_b_mcast_mask="b_mcast_mask",
-            cluster_m=cluster_m,
             is_two_cta=is_two_cta,
+            use_tma_b_mcast_mask=use_tma_b_mcast_mask,
+            skip_producer_acquire=False,
+            skip_producer_advance=False,
         )
 
     @staticmethod
@@ -5643,6 +9130,52 @@ class TestInitialPrefetchTmaBuilder(unittest.TestCase):
         # The non-stage-0 prefetch reads from gA[None, Int32(stage-1)] /
         # gB[None, Int32(stage-1)], not Int32(0).
         self.assertNotIn("None, cutlass.Int32(0)", body_src)
+
+    def test_stage0_can_override_producer_acquire(self) -> None:
+        """Diagnostic call sites can skip a single initial acquire."""
+
+        node = _build_initial_prefetch_if(
+            self._make_args(),
+            full_tile_gates=["initial_full_tile"],
+            k_offset="cutlass.Int32(0)",
+            skip_producer_acquire=True,
+        )
+        self.assertEqual(
+            self._stmt_kinds(node.body),
+            [
+                "=producer_get_barrier",
+                "copy",
+                "copy",
+                "producer_commit",
+                "advance",
+            ],
+        )
+        body_src = ast.unparse(ast.Module(body=node.body, type_ignores=[]))
+        self.assertNotIn("producer_acquire", body_src)
+        self.assertIn("producer_get_barrier", body_src)
+
+    def test_two_cta_prefetch_keeps_per_cta_copies(self) -> None:
+        args = self._make_args(cluster_m=2, is_two_cta=True)
+        node = _build_initial_prefetch_if(
+            args,
+            full_tile_gates=["initial_full_tile"],
+            k_offset="cutlass.Int32(0)",
+        )
+        self.assertIsInstance(node, ast.If)
+        self.assertEqual(ast.unparse(node.test), "initial_full_tile and tma_warp")
+        self.assertEqual(
+            self._stmt_kinds(node.body),
+            [
+                "producer_acquire",
+                "=producer_get_barrier",
+                "copy",
+                "copy",
+                "producer_commit",
+                "advance",
+            ],
+        )
+        body_src = ast.unparse(ast.Module(body=node.body, type_ignores=[]))
+        self.assertNotIn(_TCGEN05_CLUSTER_LEADER_PREDICATE, body_src)
 
     def test_mcast_mask_asymmetry_matches_per_kiter(self) -> None:
         """A only multicasts in 2-CTA mode; B multicasts on

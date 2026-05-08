@@ -1744,6 +1744,11 @@ class NDTileStrategy(_BaseNDTileStrategy):
                 *parent_dims,
                 jagged_tile_block_size,
             ]
+            if not self.supports_index_rank_expansion():
+                return statement_from_string(
+                    f"{mask_var} = ({index_var}) < {{parent}}",
+                    parent=self._to_ast(jagged_tile_parent),
+                )
             k = len(parent_dims)
             child_expand = "[" + ", ".join(["None"] * k + [":"]) + "]"
             parent_expand = "[" + ", ".join([":"] * k + ["None"]) + "]"

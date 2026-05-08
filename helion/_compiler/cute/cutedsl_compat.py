@@ -31,51 +31,97 @@ def cutedsl_has_opresultlist_fix() -> bool:
 
 
 @lru_cache(maxsize=1)
-def cutedsl_tmem_allocator_has_dealloc_init_kwarg() -> bool:
-    """Detect whether ``cutlass.utils.TmemAllocator.__init__`` accepts the
-    ``dealloc_mbarrier_initialized`` keyword argument.
+def _tmem_allocator_init_signature() -> inspect.Signature | None:
+    """Resolve ``cutlass.utils.TmemAllocator.__init__``'s signature.
 
-    The PyPI ``nvidia-cutlass-dsl==4.5.0.dev0`` wheel unconditionally calls
-    ``self._init_dealloc_mbarrier`` in ``__init__`` whenever ``is_two_cta``
-    is True; newer builds add a ``dealloc_mbarrier_initialized`` flag that
-    short-circuits the init so a second allocator (e.g. one constructed in
-    the epilogue after the matmul prologue already initialized the
-    barrier) doesn't double-init the mbarrier. Helion emits the kwarg in
-    the epilogue path; we omit it on builds without the parameter.
-
-    Returns ``True`` when the kwarg is supported, ``False`` otherwise.
-
-    ``inspect.signature`` doesn't see kwargs that ``@dsl_user_op`` strips
-    from the wrapper, so we resolve the underlying ``__wrapped__`` first
-    and fall back to source scanning.
+    ``@dsl_user_op`` strips kwargs from the public wrapper, so we resolve the
+    underlying ``__wrapped__`` first.
     """
     try:
         from cutlass.utils import TmemAllocator
     except Exception:
-        return True
+        return None
     init = TmemAllocator.__init__
     inner = getattr(init, "__wrapped__", init)
     try:
-        sig = inspect.signature(inner)
+        return inspect.signature(inner)
     except (TypeError, ValueError):
-        sig = None
-    if sig is not None and "dealloc_mbarrier_initialized" in sig.parameters:
-        return True
+        return None
+
+
+@lru_cache(maxsize=1)
+def cutedsl_tmem_allocator_skip_dealloc_init_kwarg() -> str | None:
+    """Return the kwarg name (if any) that requests "skip dealloc-mbarrier init"
+    on ``TmemAllocator``, or ``None`` if no such kwarg exists on this build.
+
+    Older PyPI builds (``nvidia-cutlass-dsl==4.5.0.dev0``) had no skip path;
+    intermediate builds added ``dealloc_mbarrier_initialized: bool = False`` —
+    pass ``True`` to skip.  The current 4.5.0 release renamed the flag to
+    ``initialize_mbarrier: bool = True`` — pass ``False`` to skip.
+    Helion needs to skip on the epilogue allocator (the matmul prologue
+    already initialized the barrier).
+    """
+    sig = _tmem_allocator_init_signature()
+    if sig is None:
+        return None
+    if "dealloc_mbarrier_initialized" in sig.parameters:
+        return "dealloc_mbarrier_initialized"
+    if "initialize_mbarrier" in sig.parameters:
+        return "initialize_mbarrier"
+    return None
+
+
+@lru_cache(maxsize=1)
+def cutedsl_tma_umma_tail_has_peer_cta_semantics() -> bool:
+    """Detect whether ``PipelineTmaUmma.producer_tail`` lets peer CTAs wait.
+
+    ``cutedsl_has_opresultlist_fix`` only answers whether nested
+    ``PipelineState.advance()`` can be called safely. It does not prove that
+    the installed ``PipelineTmaUmma.producer_tail`` has the current upstream
+    semantics where every CTA advances and calls ``producer_acquire``. Older
+    source shapes that gate the whole tail to the leader CTA skip peer CTA
+    empty-barrier participation, so Helion must inline the tail for them even
+    if the ``advance`` bug is fixed.
+
+    Returns ``True`` when the source looks like the current peer-CTA-safe
+    implementation, ``False`` when it is leader-gated or cannot be inspected.
+    """
     try:
-        src = inspect.getsource(inner)
+        from cutlass.pipeline import PipelineTmaUmma
+    except ImportError:
+        return False
+    try:
+        src = inspect.getsource(PipelineTmaUmma.producer_tail)
     except (OSError, TypeError):
-        return True
-    return "dealloc_mbarrier_initialized" in src
+        return False
+    # Deliberately fail closed: if upstream reshapes this function in a way
+    # this text probe no longer recognizes, Helion inlines its known-good tail.
+    leader_markers = (
+        "block_idx_in_cluster",
+        "cta_rank",
+        "cluster_rank",
+        "rank_in_cluster",
+        "is_leader_cta",
+    )
+    return "producer_acquire(" in src and not any(
+        marker in src for marker in leader_markers
+    )
 
 
 def emit_dealloc_mbarrier_initialized_kwarg() -> str:
-    """Emit ``dealloc_mbarrier_initialized=True`` (with a leading comma) on
-    cutedsl builds that accept it, else an empty string. Designed to be
-    spliced into a ``TmemAllocator(...)`` argument list as the *last* arg
-    so the comma-prefix is always safe.
+    """Emit a kwarg telling ``TmemAllocator(...)`` to skip dealloc-mbarrier
+    init (because the prologue allocator already initialized it).
+
+    Returns the kwarg with a leading comma so it's safe to splice as the
+    *last* argument; returns ``""`` on builds without any skip kwarg.
+    Handles both spellings: the older ``dealloc_mbarrier_initialized=True``
+    and the newer ``initialize_mbarrier=False``.
     """
-    if cutedsl_tmem_allocator_has_dealloc_init_kwarg():
+    name = cutedsl_tmem_allocator_skip_dealloc_init_kwarg()
+    if name == "dealloc_mbarrier_initialized":
         return ", dealloc_mbarrier_initialized=True"
+    if name == "initialize_mbarrier":
+        return ", initialize_mbarrier=False"
     return ""
 
 
@@ -127,38 +173,46 @@ def emit_producer_tail_tma_umma(
     *,
     num_stages: int,
     indent: str = "",
+    skip_advances: bool = False,
 ) -> str:
     """Emit code equivalent to ``<pipeline>.producer_tail(<state>)`` for a
     ``PipelineTmaUmma`` (sm100 TMA→UMMA) pipeline.
 
-    The cutedsl implementation calls ``state.advance()`` ``num_stages-1``
-    times and then ``producer_acquire``. On the buggy PyPI build that
-    inner ``advance`` raises the OpResultList ``DSLRuntimeError`` —
-    helion's user-level ``state.advance()`` workaround can't reach those
-    nested calls, so we inline the whole tail here using the same
-    advance workaround for each stage hop. The leader-CTA fast path
-    (``cta_rank_in_cluster % 2 == 0``) is preserved so 2-CTA matmuls
-    still drain only the leader.
+    The current cutedsl implementation calls ``state.advance()``
+    ``num_stages-1`` times and then ``producer_acquire``. On the buggy PyPI
+    build that inner ``advance`` raises the OpResultList ``DSLRuntimeError``;
+    some intermediate builds also had the advance fix but still gated the
+    whole tail to the leader CTA. Helion's user-level ``state.advance()``
+    workaround can't reach nested calls, so we inline the whole tail unless
+    both the advance bug and the TMA tail ownership shape are known-good.
+
+    Unlike ``PipelineUmmaAsync``, ``PipelineTmaUmma.producer_tail`` is
+    intentionally not leader-CTA gated. Peer CTAs still need to advance
+    their local producer state and wait for the empty barrier; the inner
+    ``producer_acquire`` implementation gates only the full-barrier arrive
+    to the leader CTA.
 
     ``num_stages`` is a compile-time constant from helion's tcgen05 plan
     (``ab_stage_count`` for the TMA pipeline).
+
+    ``skip_advances`` is only for guarded invalid-output diagnostics that
+    isolate AB producer state rollover. It preserves the tail acquire but
+    removes every state advance, including calls hidden inside upstream
+    ``producer_tail``.
     """
-    if cutedsl_has_opresultlist_fix():
+    if skip_advances:
+        return f"{indent}{pipeline_expr}.producer_acquire({state_expr})"
+
+    if (
+        cutedsl_has_opresultlist_fix()
+        and cutedsl_tma_umma_tail_has_peer_cta_semantics()
+    ):
         return f"{indent}{pipeline_expr}.producer_tail({state_expr})"
 
-    inner = indent + "    "
-    inner2 = inner + "    "
-    advance_blocks: list[str] = []
+    body_lines: list[str] = []
     for _ in range(num_stages - 1):
-        advance_blocks.append(f"{inner}if True:")
-        advance_blocks.extend(_advance_lines(state_expr, inner2))
-    body_lines = [
-        f"{indent}_pt_bidx = cute.arch.block_idx_in_cluster()",
-        f"{indent}_pt_cta_rank = cute.arch.make_warp_uniform(_pt_bidx)",
-        f"{indent}if _pt_cta_rank % cutlass.Int32(2) == cutlass.Int32(0):",
-        *advance_blocks,
-        f"{inner}{pipeline_expr}.producer_acquire({state_expr})",
-    ]
+        body_lines.extend(_advance_lines(state_expr, indent))
+    body_lines.append(f"{indent}{pipeline_expr}.producer_acquire({state_expr})")
     return "\n".join(body_lines)
 
 
@@ -172,10 +226,10 @@ def emit_producer_tail_umma_async(
     """Emit code equivalent to ``<pipeline>.producer_tail(<state>)`` for a
     ``PipelineUmmaAsync`` (sm100 UMMA→async-consumer) pipeline.
 
-    The cutedsl implementation loops ``num_stages`` times, doing
-    ``sync_object_empty.wait`` followed by ``state.advance()`` per
-    iteration. We inline the wait + advance so each ``advance`` becomes
-    the same single-result-ternary workaround used by
+    The cutedsl implementation gates the drain to the leader CTA, advances
+    ``num_stages - 1`` times, then calls ``producer_acquire``. We inline
+    the same leader guard plus advances so each ``advance`` becomes the
+    same single-result-ternary workaround used by
     :func:`emit_pipeline_advance`. ``num_stages`` is the compile-time
     ``acc_stage_count`` from helion's tcgen05 plan.
     """
@@ -183,17 +237,19 @@ def emit_producer_tail_umma_async(
         return f"{indent}{pipeline_expr}.producer_tail({state_expr})"
 
     inner = indent + "    "
-    body_lines = [f"{indent}if True:"]
-    wait_line = (
-        f"{inner}{pipeline_expr}.sync_object_empty.wait("
-        f"{state_expr}.index, {state_expr}.phase)"
-    )
-    for _ in range(num_stages):
+    leader_inner = inner + "    "
+    body_lines = [
+        f"{indent}if True:",
+        f"{inner}_pt_bidx = cute.arch.block_idx_in_cluster()",
+        f"{inner}_pt_cta_rank = cute.arch.make_warp_uniform(_pt_bidx)",
+        f"{inner}if _pt_cta_rank % cutlass.Int32(2) == cutlass.Int32(0):",
+    ]
+    for _ in range(num_stages - 1):
         body_lines.extend(
             (
-                wait_line,
-                f"{inner}if True:",
-                *_advance_lines(state_expr, inner + "    "),
+                f"{leader_inner}if True:",
+                *_advance_lines(state_expr, leader_inner + "    "),
             )
         )
+    body_lines.append(f"{leader_inner}{pipeline_expr}.producer_acquire({state_expr})")
     return "\n".join(body_lines)

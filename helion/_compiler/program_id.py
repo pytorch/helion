@@ -15,9 +15,11 @@ from .ast_extension import expr_from_string
 from .ast_extension import statement_from_string
 from .compile_environment import CompileEnvironment
 from .cute.cutedsl_compat import emit_pipeline_advance
+from .cute.tcgen05_constants import TCGEN05_TWO_CTA_MAX_K_TILES
 from .device_function import DeviceFunction
 from .device_function import TensorArg
 from .host_function import HostFunction
+from .host_function import NoCurrentFunction
 
 
 def typed_program_id(dim: int = 0) -> str:
@@ -254,11 +256,13 @@ class ForEachProgramID(ProgramIDs):
     def codegen(self, state: CodegenState) -> None:
         blocks = self._get_cdiv_blocks(state, exclude_last=True)
         if blocks:
+            env = CompileEnvironment.current()
+            block_expr = env.backend.cast_expr(
+                f"({'+ '.join(blocks)})", env.index_type()
+            )
             state.codegen.statements_stack[-1].insert(
                 0,
-                statement_from_string(
-                    f"{self.shared_pid_var} -= ({'+ '.join(blocks)})"
-                ),
+                statement_from_string(f"{self.shared_pid_var} -= {block_expr}"),
             )
 
     def codegen_grid(self) -> ast.AST:
@@ -774,11 +778,19 @@ class PersistentInterleavedProgramIDs(PersistentProgramIDs):
 class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
     """tcgen05 persistent scheduler for blocked and interleaved PID orders."""
 
+    _VALIDATED_TWO_CTA_MAX_K_TILES: ClassVar[int] = TCGEN05_TWO_CTA_MAX_K_TILES
+
     def __init__(self, *, is_blocked: bool) -> None:
         super().__init__(is_blocked=is_blocked)
 
     def _tcgen05_plan(self) -> CuteTcgen05MatmulPlan | None:
-        return DeviceFunction.current().cute_tcgen05_matmul_plan
+        try:
+            return DeviceFunction.current().cute_tcgen05_matmul_plan
+        except NoCurrentFunction:
+            # Unit tests exercise builder helpers without entering a
+            # DeviceFunction; in that context the tcgen05 plan-dependent
+            # branches should behave like the legacy 1-CTA path.
+            return None
 
     def _tcgen05_cluster_m(self) -> int:
         if (plan := self._tcgen05_plan()) is not None:
@@ -787,10 +799,50 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         cluster_m = int(str(config.get("tcgen05_cluster_m", 1)))
         return max(1, min(cluster_m, 2))
 
-    def _tcgen05_num_tiles_expr(self, *, is_device: bool) -> str:
+    def _tcgen05_is_two_cta(self) -> bool:
+        if (plan := self._tcgen05_plan()) is not None:
+            return plan.is_two_cta
+        return False
+
+    def _tcgen05_has_validated_role_local_two_cta_runtime(self) -> bool:
+        plan = self._tcgen05_plan()
+        return bool(
+            plan is not None
+            and plan.is_two_cta
+            and plan.uses_role_local_persistent_body
+            and plan.k_tile_count <= self._VALIDATED_TWO_CTA_MAX_K_TILES
+        )
+
+    def _tcgen05_uses_cluster_m2_one_cta_role_local_bridge(self) -> bool:
+        plan = self._tcgen05_plan()
+        return bool(
+            plan is not None
+            and plan.uses_cluster_m2_one_cta_role_local_bridge
+            and plan.cluster_m == 2
+            and not plan.is_two_cta
+            and plan.uses_role_local_persistent_body
+        )
+
+    def _tcgen05_output_tile_dims_expr(self, *, is_device: bool) -> list[str]:
+        assert len(self.pid_info) <= 3, (
+            "tcgen05 persistent scheduler supports at most 3 PID dimensions"
+        )
         dims = [pid.num_pids_expr(is_device=is_device) for pid in self.pid_info]
         while len(dims) < 3:
             dims.append("1")
+        return dims
+
+    def _tcgen05_scheduler_tile_dims_expr(self, *, is_device: bool) -> list[str]:
+        dims = self._tcgen05_output_tile_dims_expr(is_device=is_device)
+        if self._tcgen05_is_two_cta():
+            # CtaGroup.TWO uses two CTAs to produce one logical M tile. Model
+            # scheduler M as CTA slots, then collapse back to logical M when
+            # binding virtual_pid for PID decomposition.
+            dims[0] = f"({dims[0]}) * {self._tcgen05_cluster_m()}"
+        return dims
+
+    def _tcgen05_num_tiles_expr(self, *, is_device: bool) -> str:
+        dims = self._tcgen05_scheduler_tile_dims_expr(is_device=is_device)
         return f"({', '.join(dims[:3])})"
 
     def _tcgen05_num_work_clusters_expr(self, *, is_device: bool) -> str:
@@ -802,40 +854,67 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         needs one z block per persistent work cluster, not a flat x-only
         ``(_NUM_SM,)`` grid.
         """
-        dims = [pid.num_pids_expr(is_device=is_device) for pid in self.pid_info]
-        while len(dims) < 3:
-            dims.append("1")
+        dims = self._tcgen05_scheduler_tile_dims_expr(is_device=is_device)
         cluster_m = self._tcgen05_cluster_m()
         if cluster_m > 1:
             dims[0] = f"(({dims[0]}) + {cluster_m} - 1) // {cluster_m}"
         return " * ".join(f"({dim})" for dim in dims[:3])
 
+    def _tcgen05_max_persistent_work_clusters_expr(self, cluster_m: int) -> str:
+        """Return the launch-grid persistent work-cluster capacity."""
+        if cluster_m == 1:
+            return self.grid_size_expr
+        # ``grid_size_expr`` is expressed in CTAs. CtaGroup.TWO currently
+        # uses cluster_n=1, so dividing the CTA budget by cluster_m matches
+        # the scheduler persistent work-cluster capacity.
+        return f"max(1, ({self.grid_size_expr}) // {cluster_m})"
+
+    def _tcgen05_grid_work_clusters_expr(
+        self, total_clusters: str, cluster_m: int
+    ) -> str:
+        """Return the scheduler z dimension for the persistent launch grid."""
+        max_persistent_clusters = self._tcgen05_max_persistent_work_clusters_expr(
+            cluster_m
+        )
+        return f"min(({total_clusters}), ({max_persistent_clusters}))"
+
     def codegen_grid(self) -> ast.AST:
-        # Tcgen05 persistent kernels, including guarded legacy fallback
-        # shapes, use CUTLASS' z-indexed scheduler instead of the parent
-        # virtual-PID loop. Multi-root ForEach kernels are still host-guarded
-        # because this grid is derived from this case's pid_info only.
+        # Tcgen05 persistent kernels use CUTLASS' z-indexed scheduler instead
+        # of the parent virtual-PID loop. Validated role-local CtaGroup.TWO
+        # caps the launch at persistent work-cluster capacity. Validated
+        # role-local CtaGroup.TWO uses per-role scheduler loops over this same
+        # capped grid, so it can recycle CTA-local pipeline/TMEM state across
+        # logical work tiles. Guarded legacy fallback and K-over-cap
+        # CtaGroup.TWO use the same capped grid but still raise before launch.
+        # Multi-root ForEach kernels are still host-guarded because this grid
+        # is derived from this case's pid_info only.
         cluster_m = self._tcgen05_cluster_m()
         total_clusters = self._tcgen05_num_work_clusters_expr(is_device=False)
-        if cluster_m == 1:
-            max_persistent_clusters = self.grid_size_expr
-        else:
-            # ``grid_size_expr`` is expressed in CTAs. A tcgen05 scheduler
-            # work cluster owns ``cluster_m`` CTAs along M, so z may contain
-            # at most the CTA budget divided by that cluster size. Explicit
-            # cluster_m > 1 configs still codegen, but multi-tile runtime is
-            # guarded until that lowering is validated.
-            max_persistent_clusters = f"max(1, ({self.grid_size_expr}) // {cluster_m})"
-        return expr_from_string(
-            f"({cluster_m}, 1, min(({total_clusters}), ({max_persistent_clusters})))"
+        grid_work_clusters = self._tcgen05_grid_work_clusters_expr(
+            total_clusters, cluster_m
         )
+        return expr_from_string(f"({cluster_m}, 1, {grid_work_clusters})")
+
+    def _tcgen05_logical_m_coord_expr(self, coord: str) -> str:
+        if self._tcgen05_is_two_cta():
+            return f"({coord}) // cutlass.Int32({self._tcgen05_cluster_m()})"
+        if self._tcgen05_uses_cluster_m2_one_cta_role_local_bridge():
+            # The shared clustered scheduler publishes ``base_m + peer_rank``
+            # into each CTA's SMEM slot. The guarded role-local bridge omits
+            # that handoff, so bind each CTA's role-local PID to the same
+            # per-peer M coordinate directly.
+            return (
+                f"({coord}) + "
+                "cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())"
+            )
+        return coord
 
     def _tcgen05_linear_virtual_pid_expr(self, work_tile_var: str) -> str:
         terms: list[str] = []
         for i, _pid in enumerate(self.pid_info):
             coord = f"{work_tile_var}.tile_idx[{i}]"
             if i == 0:
-                terms.append(coord)
+                terms.append(self._tcgen05_logical_m_coord_expr(coord))
                 continue
             stride = " * ".join(
                 f"({pid.num_pids_expr(is_device=True)})" for pid in self.pid_info[:i]
@@ -847,7 +926,7 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         terms: list[str] = []
         for i, coord in enumerate(coords[: len(self.pid_info)]):
             if i == 0:
-                terms.append(coord)
+                terms.append(self._tcgen05_logical_m_coord_expr(coord))
                 continue
             stride = " * ".join(
                 f"({pid.num_pids_expr(is_device=True)})" for pid in self.pid_info[:i]
@@ -896,9 +975,9 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
 
         Once the TMA-load warp is lifted into a role-local sibling loop, the
         scheduler should not ride on that producer role. The exec warp remains
-        a single, always-launched warp that rejoins the shared loop after any
-        role-local work, making it a stable owner for the intermediate G1
-        shapes until a dedicated scheduler or fully role-local epilogue lands.
+        a single, always-launched warp, so it is a stable owner for the shared
+        scheduler prelude and for any residual shared loop kept by validated
+        cluster_m=1 or guarded fallback shapes.
         """
         exec_warp = self._tcgen05_exec_warp_expr()
         layout.scheduler_owner_warp = exec_warp
@@ -1274,34 +1353,38 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
     # the test pin and the error path stay in sync. ``%d`` is filled in at
     # runtime with the bound total-tile count.
     _MULTI_TILE_GUARD_MESSAGE: ClassVar[str] = (
-        "Helion CuTe persistent + tcgen05 currently supports multi-tile "
-        "execution only for single-root static full tiles with "
-        "tcgen05_cluster_m=1. Partial K/M/N tile fallback shapes, "
-        "multi-root kernels, and unvalidated cluster_m settings can "
-        "produce wrong output or launch failures. The kernel was launched "
+        "Helion CuTe persistent + tcgen05 currently supports runtime "
+        "execution only for validated single-root static full tiles: "
+        "tcgen05_cluster_m=1 or role-local CtaGroup.TWO "
+        "tcgen05_cluster_m=2 with at most 256 K tiles. Partial K/M/N tile "
+        "fallback shapes, CtaGroup.TWO shapes above the validated K-tile "
+        "limit, multi-root kernels, and unvalidated cluster_m settings can "
+        "produce wrong output, hang, or launch-fail. The kernel was launched "
         "with total_tiles=%d, which is outside the validated persistent "
         "scheduler set for this path. "
         'Use a non-persistent pid_type (e.g. "flat"), pick a single-root '
-        "static-full-tile kernel with tcgen05_cluster_m=1, or, for "
-        "single-root fallback paths, pick block sizes that keep "
-        "total_tiles == 1."
+        "static-full-tile kernel with tcgen05_cluster_m=1, or pick a "
+        "validated single-root static-full CtaGroup.TWO shape with at most "
+        "256 K tiles."
     )
 
     def _emit_host_multi_tile_guard(
         self,
         device_function: DeviceFunction,
         host_total_pids_expr: str | None = None,
-        guard_threshold: int = 1,
+        guard_threshold: int | str = 1,
     ) -> None:
         """Emit a host-side guard against multi-tile execution.
 
         The single-root static full-tile role-local path has multi-tile
-        runtime coverage only for ``tcgen05_cluster_m == 1``. Legacy
-        non-role-local tcgen05 persistent kernels, multi-root kernels, and
-        explicit cluster_m > 1 configs still hit, or lack coverage for,
-        wrong-output / launch-failure modes in multi-tile shapes, so this
-        guard remains for those paths. Single-tile shapes continue to run
-        because they do not exercise scheduler tile-to-tile transitions.
+        runtime coverage for ``tcgen05_cluster_m == 1``. Validated static-full
+        CtaGroup.TWO uses role-local scheduler loops over the capped persistent
+        grid, so no multi-tile host guard is emitted for that set.
+        Legacy non-role-local tcgen05 persistent kernels, multi-root kernels,
+        cluster_m > 1 fallback configs, and CtaGroup.TWO configs above the
+        validated K-tile cap still hit, or lack coverage for, wrong-output /
+        hang / launch-failure modes, so this guard remains for those paths.
+        Single-tile cluster_m=1 fallback shapes continue to run.
 
         The autotuner narrowing in
         ``ConfigSpec.narrow_tcgen05_autotune_to_validated_configs`` removes
@@ -1310,12 +1393,11 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         explicit user configs that bypass autotune.
 
         The threshold is intentionally ``total_tiles > 1`` for guarded
-        single-root paths. For partial fallback shapes this converts known
-        launch and wrong-output failures into a host error. Multi-root
-        kernels use ``total_tiles > 0`` because the scheduler grid is
-        derived from only the first root case; even one tile in a later case
-        is unsafe. For cluster_m > 1 this keeps unvalidated multi-tile
-        execution disabled until 2-CTA runtime coverage lands.
+        cluster_m=1 single-root fallback paths. For cluster_m > 1 fallback and
+        CtaGroup.TWO shapes above the K-tile cap this converts known launch,
+        timeout, and wrong-output failures into a host error. Multi-root kernels use
+        ``total_tiles > 0`` because the scheduler grid is derived from only the
+        first root case; even one tile in a later case is unsafe.
         """
         host_total_pids = host_total_pids_expr
         if host_total_pids is None:
@@ -1371,41 +1453,91 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         layout = self._build_tcgen05_persistent_layout(device_function)
         partition = self._partition_tcgen05_role_blocks(device_function, wrapped_body)
         use_role_local_body = bool(partition.role_blocks_extracted)
-        use_validated_role_local_body = (
+        role_local_predicates = {
+            role_block.role_predicate
+            for role_block in partition.role_blocks_extracted
+            if role_block.role_predicate is not None
+        }
+        full_role_local_body = {
+            self._tcgen05_tma_load_role_predicate(),
+            self._tcgen05_mma_exec_role_predicate(),
+            self._tcgen05_epi_role_predicate(),
+        }.issubset(role_local_predicates)
+        use_validated_cluster_m1_role_local_body = (
             use_role_local_body and layout.cluster_m == 1 and not is_multi_root
+        )
+        use_validated_two_cta_role_local_body = (
+            full_role_local_body
+            and layout.cluster_m == 2
+            and self._tcgen05_has_validated_role_local_two_cta_runtime()
+            and not is_multi_root
+        )
+        use_validated_role_local_body = (
+            use_validated_cluster_m1_role_local_body
+            or use_validated_two_cta_role_local_body
+        )
+        omit_shared_loop = (
+            full_role_local_body and layout.cluster_m > 1 and not is_multi_root
         )
         if use_role_local_body:
             # Retarget even for guarded cluster_m>1 / multi-root codegen so
             # compile-only inspection still sees the role-local scheduler shape.
             self._retarget_tcgen05_shared_scheduler_to_exec(layout)
         if not use_validated_role_local_body:
+            guard_threshold: int | str
+            if is_multi_root:
+                guard_threshold = 0
+            elif layout.cluster_m == 1:
+                guard_threshold = 1
+            else:
+                # cluster_m > 2, cluster_m=2 without the full role-local body,
+                # and role-local CtaGroup.TWO above the K-tile cap all use the
+                # strict guard.
+                guard_threshold = 0
             self._emit_host_multi_tile_guard(
                 device_function,
                 host_guard_total_pids,
-                guard_threshold=0 if is_multi_root else 1,
+                guard_threshold=guard_threshold,
             )
 
         setup: list[ast.stmt] = []
-        setup.extend(self._build_tcgen05_persistent_prelude(layout))
+        # Fully role-local CtaGroup.TWO does not consume the shared work-tile
+        # SMEM handoff. Validated CtaGroup.TWO skips the shared scheduler;
+        # each role owns a scheduler loop over the capped persistent grid.
+        if not omit_shared_loop:
+            setup.extend(self._build_tcgen05_persistent_prelude(layout))
         setup.extend(hoisted_setup)
         if use_role_local_body:
-            role_local_whiles, shared_tile_body = (
-                self._build_tcgen05_persistent_tile_body_role_local(
-                    device_function, layout, partition
+            if omit_shared_loop:
+                role_local_whiles, shared_tile_body = (
+                    self._build_tcgen05_persistent_tile_body_role_local(
+                        device_function,
+                        layout,
+                        partition,
+                        build_shared_tile_body=False,
+                    )
                 )
-            )
+            else:
+                role_local_whiles, shared_tile_body = (
+                    self._build_tcgen05_persistent_tile_body_role_local(
+                        device_function, layout, partition
+                    )
+                )
             setup.extend(role_local_whiles)
-            # All warps still enter the shared loop after any role-local
-            # mainloop work so existing CTA-wide barriers remain valid for
-            # epilogue synchronization and work-tile metadata publication.
-            setup.append(
-                create(
-                    ast.While,
-                    test=expr_from_string(layout.work_tile_valid_var),
-                    body=shared_tile_body,
-                    orelse=[],
+            if not omit_shared_loop:
+                # Validated cluster_m=1 and guarded partial/multi-root
+                # role-local shapes still rejoin the shared loop so existing
+                # CTA-wide barriers remain valid. Fully role-local CtaGroup.TWO
+                # codegen skips this residual loop; its work is already owned
+                # by role-local schedulers and cross-role pipelines.
+                setup.append(
+                    create(
+                        ast.While,
+                        test=expr_from_string(layout.work_tile_valid_var),
+                        body=shared_tile_body,
+                        orelse=[],
+                    )
                 )
-            )
         else:
             setup.append(
                 create(
@@ -1596,8 +1728,12 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                 statement_from_string(
                     f"{sched_pipeline}.producer_acquire({sched_producer_state})"
                 ),
+                # The scheduler pipeline is intentionally one-stage. Match
+                # Quack by arming the consumer-state full mbarrier before the
+                # async remote stores; if this pipeline gains more stages,
+                # producer/consumer state pairing must be revisited together.
                 statement_from_string(
-                    f"{sched_barrier_ptr} = {sched_pipeline}.producer_get_barrier({sched_producer_state})"
+                    f"{sched_barrier_ptr} = {sched_pipeline}.producer_get_barrier({sched_consumer_state})"
                 ),
                 statement_from_string(f"{sched_peer_rank} = cute.arch.lane_idx()"),
                 create(
@@ -1608,6 +1744,13 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                     body=[
                         statement_from_string(
                             f"{sched_peer_m} = {sched_peer_rank} % cutlass.Int32({cluster_m})"
+                        ),
+                        # _cute_store_shared_remote_x4 writes four Int32
+                        # values, so each remote async transaction expects
+                        # 16 bytes.
+                        statement_from_string(
+                            "cute.arch.mbarrier_arrive_and_expect_tx("
+                            f"{sched_barrier_ptr}, 16, {sched_peer_rank})"
                         ),
                         statement_from_string(
                             f"_cute_store_shared_remote_x4("
@@ -1621,9 +1764,6 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                         ),
                     ],
                     orelse=[],
-                ),
-                statement_from_string(
-                    f"{sched_pipeline}.producer_commit({sched_producer_state})"
                 ),
                 statement_from_string(emit_pipeline_advance(sched_producer_state)),
             ]
@@ -1711,9 +1851,12 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                     statement_from_string(
                         f"{layout.sched_pipeline_mbars} = cute.arch.alloc_smem(cutlass.Int64, cutlass.Int32(2))"
                     ),
+                    # Only the scheduler leader CTA publishes each remote
+                    # work tile, so every peer full barrier receives one
+                    # arrive-and-expect-tx, not one arrival per cluster CTA.
                     statement_from_string(
                         f"{layout.sched_pipeline_producer_group} = cutlass.pipeline.CooperativeGroup("
-                        "cutlass.pipeline.Agent.Thread, cute.arch.WARP_SIZE)"
+                        "cutlass.pipeline.Agent.Thread, 1)"
                     ),
                     statement_from_string(
                         f"{layout.sched_pipeline_consumer_group} = cutlass.pipeline.CooperativeGroup("
@@ -1896,15 +2039,15 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         Cross-role producer-consumer synchronization is via the AB /
         acc pipelines (the existing pipeline barriers carry the data
         dependency); no ``cute.arch.sync_threads()`` is emitted inside
-        the role-local loop. The role-local warp still enters the shared
-        loop afterwards so the shared loop's existing CTA-wide barriers
-        remain valid.
+        the role-local loop. The caller decides whether to append a residual
+        shared loop after these role-local loops; validated cluster_m=1 keeps
+        it for existing CTA-wide barriers, while guarded fully role-local
+        CtaGroup.TWO omits it.
 
         The returned statement is the role-local ``while`` itself,
         wrapped in ``if {role_predicate}:`` so only the matching warps
-        enter the loop. The caller appends this statement as a sibling
-        of the shared ``while`` inside the persistent kernel's setup
-        list.
+        enter the loop. The caller appends this statement inside the
+        persistent kernel's setup list.
 
         ``scheduler_var_prefix`` selects the prefix for every variable
         name allocated in the role-local while (e.g.
@@ -1927,20 +2070,39 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         sched_var = device_function.new_var(f"{scheduler_var_prefix}_tile_sched")
         work_tile_var = device_function.new_var(f"{scheduler_var_prefix}_work_tile")
 
-        prelude: list[ast.stmt] = [
-            statement_from_string(
-                f"{sched_params_var} = cutlass.utils.PersistentTileSchedulerParams("
-                f"{self._tcgen05_num_tiles_expr(is_device=True)}, "
-                f"({layout.cluster_m}, 1, 1))"
-            ),
-            statement_from_string(
-                f"{sched_var} = cutlass.utils.StaticPersistentTileScheduler.create("
-                f"{sched_params_var}, cute.arch.block_idx(), cute.arch.grid_dim())"
-            ),
-            statement_from_string(
-                f"{work_tile_var} = {sched_var}.initial_work_tile_info()"
-            ),
-        ]
+        prelude: list[ast.stmt] = []
+        if (
+            self._tcgen05_is_two_cta()
+            and role_block.role_predicate == self._tcgen05_tma_load_role_predicate()
+        ):
+            # PDL parity with Quack/CUTLASS: TMA producers wait before
+            # touching scheduler state or issuing global-memory TMA work.
+            prelude.append(statement_from_string("cute.arch.griddepcontrol_wait()"))
+        prelude.extend(
+            [
+                statement_from_string(
+                    f"{sched_params_var} = cutlass.utils.PersistentTileSchedulerParams("
+                    f"{self._tcgen05_num_tiles_expr(is_device=True)}, "
+                    f"({layout.cluster_m}, 1, 1))"
+                ),
+                statement_from_string(
+                    f"{sched_var} = cutlass.utils.StaticPersistentTileScheduler.create("
+                    f"{sched_params_var}, cute.arch.block_idx(), cute.arch.grid_dim())"
+                ),
+                statement_from_string(
+                    f"{work_tile_var} = {sched_var}.initial_work_tile_info()"
+                ),
+            ]
+        )
+        tile_counter_var = None
+        if (
+            role_block.role_predicate == self._tcgen05_epi_role_predicate()
+            and device_function.cute_tcgen05_epi_role_tile_counter_var is not None
+        ):
+            tile_counter_var = device_function.cute_tcgen05_epi_role_tile_counter_var
+            prelude.append(
+                statement_from_string(f"{tile_counter_var} = cutlass.Int32(0)")
+            )
 
         # Per-iteration refresh of role-local work-tile coordinates.
         # The role block's statements reference ``self.virtual_pid_var``
@@ -1961,6 +2123,12 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         if dependency_stmts is not None:
             per_tile_body.extend(dependency_stmts)
         per_tile_body.extend(role_block.stmts)
+        if tile_counter_var is not None:
+            per_tile_body.append(
+                statement_from_string(
+                    f"{tile_counter_var} = {tile_counter_var} + cutlass.Int32(1)"
+                )
+            )
         per_tile_body.extend(
             [
                 statement_from_string(f"{sched_var}.advance_to_next_work()"),
@@ -2023,11 +2191,175 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         selected_reversed.reverse()
         return selected_reversed
 
+    @staticmethod
+    def _tcgen05_is_local_assignment_target(target: ast.AST) -> bool:
+        if isinstance(target, ast.Name):
+            return isinstance(target.ctx, ast.Store)
+        if isinstance(target, ast.Tuple | ast.List):
+            return all(
+                Tcgen05PersistentProgramIDs._tcgen05_is_local_assignment_target(elt)
+                for elt in target.elts
+            )
+        return False
+
+    _TCGEN05_OMIT_SHARED_PURE_CALLS: ClassVar[frozenset[str]] = frozenset(
+        {
+            "range",
+            "max",
+            "min",
+            "cutlass.BFloat16",
+            "cutlass.Boolean",
+            "cutlass.Float16",
+            "cutlass.Float32",
+            "cutlass.Int32",
+        }
+    )
+
+    @staticmethod
+    def _tcgen05_call_path(func: ast.AST) -> str | None:
+        if isinstance(func, ast.Name):
+            return func.id
+        if isinstance(func, ast.Attribute):
+            base = Tcgen05PersistentProgramIDs._tcgen05_call_path(func.value)
+            if base is None:
+                return None
+            return f"{base}.{func.attr}"
+        return None
+
+    @classmethod
+    def _tcgen05_expr_safe_to_omit(cls, expr: ast.AST) -> bool:
+        if isinstance(expr, ast.Constant):
+            return True
+        if isinstance(expr, ast.Name):
+            return isinstance(expr.ctx, ast.Load)
+        if isinstance(expr, ast.Attribute):
+            return cls._tcgen05_expr_safe_to_omit(expr.value)
+        if isinstance(expr, ast.BinOp):
+            return cls._tcgen05_expr_safe_to_omit(
+                expr.left
+            ) and cls._tcgen05_expr_safe_to_omit(expr.right)
+        if isinstance(expr, ast.UnaryOp):
+            return cls._tcgen05_expr_safe_to_omit(expr.operand)
+        if isinstance(expr, ast.BoolOp):
+            return all(cls._tcgen05_expr_safe_to_omit(value) for value in expr.values)
+        if isinstance(expr, ast.Compare):
+            return cls._tcgen05_expr_safe_to_omit(expr.left) and all(
+                cls._tcgen05_expr_safe_to_omit(comparator)
+                for comparator in expr.comparators
+            )
+        if isinstance(expr, ast.IfExp):
+            return (
+                cls._tcgen05_expr_safe_to_omit(expr.test)
+                and cls._tcgen05_expr_safe_to_omit(expr.body)
+                and cls._tcgen05_expr_safe_to_omit(expr.orelse)
+            )
+        if isinstance(expr, ast.Tuple | ast.List | ast.Set):
+            return all(cls._tcgen05_expr_safe_to_omit(elt) for elt in expr.elts)
+        if isinstance(expr, ast.Dict):
+            return all(
+                key is not None and cls._tcgen05_expr_safe_to_omit(key)
+                for key in expr.keys
+            ) and all(cls._tcgen05_expr_safe_to_omit(value) for value in expr.values)
+        if isinstance(expr, ast.Subscript):
+            return cls._tcgen05_expr_safe_to_omit(
+                expr.value
+            ) and cls._tcgen05_expr_safe_to_omit(expr.slice)
+        if isinstance(expr, ast.Slice):
+            return all(
+                part is None or cls._tcgen05_expr_safe_to_omit(part)
+                for part in (expr.lower, expr.upper, expr.step)
+            )
+        if isinstance(expr, ast.Call):
+            call_path = cls._tcgen05_call_path(expr.func)
+            if call_path in {"max", "min"} and expr.keywords:
+                return False
+            return (
+                call_path in cls._TCGEN05_OMIT_SHARED_PURE_CALLS
+                and all(cls._tcgen05_expr_safe_to_omit(arg) for arg in expr.args)
+                and all(
+                    keyword.arg is not None
+                    and cls._tcgen05_expr_safe_to_omit(keyword.value)
+                    for keyword in expr.keywords
+                )
+            )
+        return False
+
+    @classmethod
+    def _tcgen05_is_bare_sync_threads_call(cls, expr: ast.AST) -> bool:
+        return (
+            isinstance(expr, ast.Call)
+            and cls._tcgen05_call_path(expr.func) == "cute.arch.sync_threads"
+            and not expr.args
+            and not expr.keywords
+        )
+
+    @classmethod
+    def _tcgen05_shared_stmt_safe_to_omit(cls, stmt: ast.stmt) -> bool:
+        """Return whether a removed shared stmt is dependency-only setup.
+
+        Fully role-local CtaGroup.TWO codegen intentionally omits the residual
+        shared ``while``. The remaining shared view may still contain scalar
+        PID/offset/view setup that role-local loops clone through dependency
+        extraction, plus legacy bare ``sync_threads`` barriers that no longer
+        bracket shared work after every role has moved out. Other observable
+        operations such as copies, pipeline calls, or stores must remain
+        rejected so future shared-body work is not silently discarded.
+        """
+        if isinstance(stmt, ast.Assign):
+            return all(
+                cls._tcgen05_is_local_assignment_target(t) for t in stmt.targets
+            ) and cls._tcgen05_expr_safe_to_omit(stmt.value)
+        if isinstance(stmt, ast.AnnAssign):
+            return cls._tcgen05_is_local_assignment_target(stmt.target) and (
+                stmt.value is None or cls._tcgen05_expr_safe_to_omit(stmt.value)
+            )
+        if isinstance(stmt, ast.For):
+            return (
+                cls._tcgen05_is_local_assignment_target(stmt.target)
+                and cls._tcgen05_expr_safe_to_omit(stmt.iter)
+                and all(
+                    cls._tcgen05_shared_stmt_safe_to_omit(child) for child in stmt.body
+                )
+                and all(
+                    cls._tcgen05_shared_stmt_safe_to_omit(child)
+                    for child in stmt.orelse
+                )
+            )
+        if isinstance(stmt, ast.If):
+            return (
+                cls._tcgen05_expr_safe_to_omit(stmt.test)
+                and all(
+                    cls._tcgen05_shared_stmt_safe_to_omit(child) for child in stmt.body
+                )
+                and all(
+                    cls._tcgen05_shared_stmt_safe_to_omit(child)
+                    for child in stmt.orelse
+                )
+            )
+        if isinstance(stmt, ast.Expr):
+            return cls._tcgen05_is_bare_sync_threads_call(stmt.value)
+        return isinstance(stmt, ast.Pass)
+
+    def _assert_tcgen05_omit_shared_loop_safe(
+        self, partition: Tcgen05PersistentProgramIDs._PartitionedRoleBody
+    ) -> None:
+        unsafe = [
+            ast.unparse(stmt)
+            for stmt in partition.shared_body_extracted
+            if not self._tcgen05_shared_stmt_safe_to_omit(stmt)
+        ]
+        assert not unsafe, (
+            "tcgen05 fully role-local codegen would discard observable shared "
+            "statement(s) while omitting the residual shared loop: " + "; ".join(unsafe)
+        )
+
     def _build_tcgen05_persistent_tile_body_role_local(
         self,
         device_function: DeviceFunction,
         layout: _Tcgen05PersistentLayout,
         partition: Tcgen05PersistentProgramIDs._PartitionedRoleBody,
+        *,
+        build_shared_tile_body: bool = True,
     ) -> tuple[list[ast.stmt], list[ast.stmt]]:
         """Build the per-tile body in role-local-while form.
 
@@ -2037,48 +2369,53 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
           -- one per unique ``role_predicate`` in
           ``partition.role_blocks_extracted``. Multiple extracted role
           blocks sharing the same predicate are merged into a single
-          role-local loop with their statements concatenated in the
+          role-local loop/body with their statements concatenated in the
           order they appear in the source body, so per-tile ordering
           across the role's statements is preserved (otherwise tile 0's
           first chunk would run for every tile before tile 0's second
           chunk ran, breaking the AB-pipeline ordering). Each loop is
           wrapped in ``if {role_predicate}:`` so only the matching
           warps enter.
-        - ``shared_tile_body`` is the per-tile body for the shared
-          ``while`` (the work-tile body without the extracted role
-          blocks). Built via :meth:`_build_tcgen05_persistent_tile_body`
-          with existing ``cute.arch.sync_threads()`` calls preserved. In
-          this intermediate all warps still enter the shared ``while`` after
-          any role-local mainloop work, so those CTA-wide barriers remain
-          valid for epilogue synchronization and work-tile metadata
-          publication.
+        - ``shared_tile_body`` is the optional per-tile body for the shared
+          ``while`` (the work-tile body without the extracted role blocks).
+          Built via :meth:`_build_tcgen05_persistent_tile_body` with existing
+          ``cute.arch.sync_threads()`` calls preserved. Validated cluster_m=1
+          role-local kernels still append this loop after role-local work so
+          those CTA-wide barriers remain valid for epilogue synchronization
+          and work-tile metadata publication. Guarded fully role-local
+          CtaGroup.TWO codegen omits the residual shared loop in the caller.
 
         Caller wires both into the persistent kernel as siblings of
-        each other inside the same setup list. Each role-local ``while``
-        runs only on its predicated warps, then every warp enters the shared
-        ``while`` so existing CTA-wide barriers remain valid.
+        each other inside the same setup list when the residual shared loop
+        is needed. Each role-local ``while`` runs only on its predicated warps.
 
-        **Current limitation.** The TMA-load, MMA-exec, and SIMT epilogue
-        roles are extracted today. Single-root static full-tile multi-tile
-        correctness is validated for ``cluster_m == 1``. Partial fallback
-        shapes, multi-root ForEach kernels, and ``cluster_m > 1`` configs
-        remain guarded for multi-tile execution, and persistent pid types
-        stay out of autotune until the search can admit only the validated
-        role-local subset.
+        **Current limitation.** The TMA-load, MMA-exec, and TMA-store
+        epilogue roles are extracted today. Single-root static full-tile
+        multi-tile correctness is validated for ``cluster_m == 1`` and for
+        role-local CtaGroup.TWO ``cluster_m == 2`` up to the validated K-tile
+        cap, using role-local scheduler loops over the capped persistent grid.
+        Partial fallback shapes, CtaGroup.TWO shapes above the K-tile cap, and
+        multi-root ForEach kernels remain guarded for runtime execution, and
+        autotune keeps cluster_m=2 out of the search until the G3 ownership path
+        is benchmarked.
         """
-        # Wrap the shared body's tagged-removed view in the standard
-        # per-tile shape. ``shared_role_blocks`` reuses the
-        # inline-weave block structure but only over the
-        # extracted-shared statements; tagged stmts have been pulled
-        # out into ``role_blocks_extracted``.
-        shared_role_blocks = [
-            self._PersistentRoleBlock(
-                role_predicate=None, stmts=list(partition.shared_body_extracted)
+        if build_shared_tile_body:
+            # Wrap the shared body's tagged-removed view in the standard
+            # per-tile shape. ``shared_role_blocks`` reuses the
+            # inline-weave block structure but only over the
+            # extracted-shared statements; tagged stmts have been pulled
+            # out into ``role_blocks_extracted``.
+            shared_role_blocks = [
+                self._PersistentRoleBlock(
+                    role_predicate=None, stmts=list(partition.shared_body_extracted)
+                )
+            ]
+            shared_tile_body = self._build_tcgen05_persistent_tile_body(
+                layout, shared_role_blocks
             )
-        ]
-        shared_tile_body = self._build_tcgen05_persistent_tile_body(
-            layout, shared_role_blocks
-        )
+        else:
+            self._assert_tcgen05_omit_shared_loop_safe(partition)
+            shared_tile_body = []
         # Merge extracted blocks by ``role_predicate`` so each predicate
         # gets one role-local loop carrying all of its per-tile
         # statements in source order. Emit the loops in explicit role
@@ -2107,15 +2444,16 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             merged_block = self._PersistentRoleBlock(
                 role_predicate=predicate, stmts=stmts
             )
+            dependency_stmts = self._role_local_dependency_stmts(
+                partition.shared_body_extracted, stmts
+            )
             role_local_whiles.append(
                 self._build_role_local_while(
                     device_function,
                     layout,
                     merged_block,
                     scheduler_var_prefix=f"tcgen05_role_local_{i}",
-                    dependency_stmts=self._role_local_dependency_stmts(
-                        partition.shared_body_extracted, stmts
-                    ),
+                    dependency_stmts=dependency_stmts,
                 )
             )
         return role_local_whiles, shared_tile_body

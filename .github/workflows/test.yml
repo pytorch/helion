@@ -151,6 +151,11 @@ jobs:
           git -C triton checkout ${{ matrix.triton-pin }}
           cd triton/
           uv pip install -r python/requirements.txt
+          # Disable proton on XPU: proton's NVIDIA sources (CuptiApi.cpp, NvtxApi.cpp)
+          # require CUDA headers that are not present on Intel XPU runners.
+          if [ "${{ matrix.alias }}" == "xpu" ]; then
+            export TRITON_BUILD_PROTON=OFF
+          fi
           MAX_JOBS=$(nproc) TRITON_PARALLEL_LINK_JOBS=2 uv pip install .
           cd /tmp/$USER
           rm -rf triton/
@@ -205,9 +210,13 @@ jobs:
           cd /tmp/torch_tpu
           git checkout "${TORCH_TPU_COMMIT}"
           # Build torch_tpu wheel
+          sudo apt-get install -y libpython3-dev
           export TORCH_SOURCE=$(python -c "import torch; import os; print(os.path.dirname(os.path.dirname(torch.__file__)))")
-          export SITE_PACKAGES=$(python -c "import site; print(site.getsitepackages()[0])")
-          bazel build -c opt //ci/wheel:torch_tpu_wheel --config=helion_public_caching_readwrite --define WHEEL_VERSION=0.1.0 --define TORCH_SOURCE=local --action_env=PYTHONPATH=$TORCH_SOURCE:$SITE_PACKAGES --action_env=JAX_PLATFORMS=cpu
+          bazel build -c opt //ci/wheel:torch_tpu_wheel \
+            --config=helion_public_caching_readwrite \
+            --define TORCH_SOURCE=local \
+            --repo_env=TORCH_SOURCE=$TORCH_SOURCE \
+            --action_env=JAX_PLATFORMS=cpu
           uv pip install bazel-bin/ci/wheel/*.whl
           # torch_tpu wheel is pinned to libtpu 0.0.38, but helion requires 0.0.40 to work
           # we can remove this step as soon as torch_tpu updates its libtpu pin
@@ -221,21 +230,7 @@ jobs:
         if: matrix.backend == 'cute'
         run: |
           source .venv/bin/activate
-          SETUPTOOLS_SCM_PRETEND_VERSION="0.0.0" uv pip install --prerelease=allow .'[cute-cu13]'
-          # The PyPI nvidia-cutlass-dsl-libs-base and -libs-cu13 wheels ship
-          # several Python files (tensor.py, algorithm.py, _nvvm_enum_gen.py,
-          # nvvm_wrappers.py, ...) at the same install path with conflicting
-          # content. cu13's versions are the ones that actually match the
-          # cu13 binary; libs-base's versions either reference symbols
-          # missing from cu13's arch (cvt_f4e2m1_f16_intrinsic) or use the
-          # pre-list-API ``cute.gemm`` signature. When uv's first pass
-          # resolves both in non-deterministic order and libs-base wins on
-          # disk, every cute test crashes (ImportError, AttributeError on
-          # nvvm.VoteSyncKind, AttributeError on ``a.shape`` from gemm).
-          # Force-reinstall cu13 *with --no-deps* so uv doesn't drag
-          # libs-base back in afterwards — that cu13-only step is the last
-          # writer, so its files win on disk.
-          uv pip install --prerelease=allow --reinstall --no-deps nvidia-cutlass-dsl-libs-cu13
+          ./scripts/install_cute.sh
 
       - name: CUDA Compute Check
         if: startsWith(matrix.image, 'nvidia')

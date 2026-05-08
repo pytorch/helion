@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import suppress
 import contextvars
+import inspect
 import linecache
 import os
 import sys
@@ -507,6 +508,7 @@ def _pallas_prepare_args(
     dict[int, int],
     set[int],
     tuple[object, ...],
+    dict[int, int],
 ]:
     """Extract and organize tensor/non-tensor args for Pallas launchers.
 
@@ -548,6 +550,12 @@ def _pallas_prepare_args(
     inplace_positions = output_set & set(tensor_arg_indices)
     out_shapes = tuple(placeholder_fn(args[i]) for i in _output_indices)  # type: ignore[arg-type]
 
+    pallas_aliases = {
+        arg_to_tensor_pos[orig_pos]: out_idx
+        for out_idx, orig_pos in enumerate(_output_indices)
+        if orig_pos in arg_to_tensor_pos
+    }
+
     return (
         tensor_arg_indices,
         output_only_indices,
@@ -556,6 +564,7 @@ def _pallas_prepare_args(
         arg_to_tensor_pos,
         inplace_positions,
         out_shapes,
+        pallas_aliases,
     )
 
 
@@ -618,6 +627,7 @@ def _pallas_build_callable(
     arg_to_tensor_pos: dict[int, int],
     tensor_arg_indices: list[int],
     cache_attr: str,
+    call_aliases: dict[int, int],
     trace_key_suffix: str = "",
 ) -> object:
     """Build a ``JaxCallable``, cache it on the kernel, and return it.
@@ -653,11 +663,7 @@ def _pallas_build_callable(
 
     kernel_name = getattr(pallas_kernel, "__name__", "pallas_kernel")
 
-    call_aliases: dict[int, int] = {}
-    for out_idx, orig_pos in enumerate(_output_indices):
-        if orig_pos in arg_to_tensor_pos:
-            call_aliases[arg_to_tensor_pos[orig_pos]] = out_idx
-
+    jax.config.update("jax_export_ignore_forward_compatibility", True)
     jax_callable = JaxCallable(
         name=kernel_name,
         jit_fn=jax.jit(jit_fn),
@@ -921,6 +927,7 @@ def default_pallas_launcher(
             arg_to_tensor_pos,
             inplace_positions,
             out_shapes,
+            pallas_aliases,
         ) = _pallas_prepare_args(args, _output_indices, _inplace_indices)
 
         in_specs, out_specs = _pallas_build_block_specs(
@@ -950,12 +957,6 @@ def default_pallas_launcher(
 
         out_shape_arg = out_shapes if len(out_shapes) > 1 else out_shapes[0]
 
-        pallas_aliases = {
-            arg_to_tensor_pos[orig_pos]: out_idx
-            for out_idx, orig_pos in enumerate(_output_indices)
-            if orig_pos in arg_to_tensor_pos
-        }
-
         estimated_vmem = _estimate_pallas_vmem_bytes(
             pl,
             pltpu,
@@ -976,7 +977,6 @@ def default_pallas_launcher(
 
         pallas_call_kwargs: dict[str, object] = {
             "out_shape": out_shape_arg,
-            "input_output_aliases": pallas_aliases,
             "grid": grid,
         }
         if _pallas_interpret_flag():
@@ -998,6 +998,7 @@ def default_pallas_launcher(
             arg_to_tensor_pos,
             tensor_arg_indices,
             cache_attr="_pallas_cache",
+            call_aliases=pallas_aliases,
         )
 
     return _pallas_invoke_and_return(
@@ -1059,6 +1060,7 @@ def default_pallas_pipeline_launcher(
             arg_to_tensor_pos,
             inplace_positions,
             out_shapes,
+            pallas_aliases,
         ) = _pallas_prepare_args(args, _output_indices, _inplace_indices)
 
         # Build scratch shapes for VMEM
@@ -1112,12 +1114,6 @@ def default_pallas_pipeline_launcher(
 
         out_shape_arg = out_shapes if len(out_shapes) > 1 else out_shapes[0]
 
-        pallas_aliases = {
-            arg_to_tensor_pos[orig_pos]: out_idx
-            for out_idx, orig_pos in enumerate(_output_indices)
-            if orig_pos in arg_to_tensor_pos
-        }
-
         grid_spec = pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=0,
             in_specs=in_specs_list,
@@ -1146,7 +1142,6 @@ def default_pallas_pipeline_launcher(
 
         pallas_call_kwargs: dict[str, object] = {
             "out_shape": out_shape_arg,
-            "input_output_aliases": pallas_aliases,
             "grid_spec": grid_spec,
             "compiler_params": pltpu.CompilerParams(  # pyrefly: ignore[bad-instantiation]
                 dimension_semantics=tuple("parallel" for _ in grid),
@@ -1168,6 +1163,7 @@ def default_pallas_pipeline_launcher(
             arg_to_tensor_pos,
             tensor_arg_indices,
             cache_attr="_pallas_pipeline_cache",
+            call_aliases=pallas_aliases,
             trace_key_suffix="_pipeline",
         )
 
@@ -1231,6 +1227,7 @@ def default_pallas_fori_launcher(
             arg_to_tensor_pos,
             inplace_positions,
             out_shapes,
+            pallas_aliases,
         ) = _pallas_prepare_args(args, _output_indices, _inplace_indices)
 
         # Build scratch shapes: VMEM buffers + DMA semaphores
@@ -1283,12 +1280,6 @@ def default_pallas_fori_launcher(
 
         out_shape_arg = out_shapes if len(out_shapes) > 1 else out_shapes[0]
 
-        pallas_aliases = {
-            arg_to_tensor_pos[orig_pos]: out_idx
-            for out_idx, orig_pos in enumerate(_output_indices)
-            if orig_pos in arg_to_tensor_pos
-        }
-
         grid_spec = pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=0,
             in_specs=in_specs_list,
@@ -1317,7 +1308,6 @@ def default_pallas_fori_launcher(
 
         pallas_call_kwargs: dict[str, object] = {
             "out_shape": out_shape_arg,
-            "input_output_aliases": pallas_aliases,
             "grid_spec": grid_spec,
             "compiler_params": pltpu.CompilerParams(  # pyrefly: ignore[bad-instantiation]
                 dimension_semantics=tuple("parallel" for _ in grid),
@@ -1339,6 +1329,7 @@ def default_pallas_fori_launcher(
             arg_to_tensor_pos,
             tensor_arg_indices,
             cache_attr="_pallas_fori_cache",
+            call_aliases=pallas_aliases,
             trace_key_suffix="_fori",
         )
 
@@ -1388,6 +1379,7 @@ def _torch_dtype_to_cutlass(dtype: torch.dtype) -> object:
         torch.int32: cutlass.Int32,
         torch.int64: cutlass.Int64,
         torch.uint8: cutlass.Uint8,
+        torch.uint64: cutlass.Int64,
     }
     if dtype not in mapping:
         raise exc.BackendUnsupported("cute", f"dtype: {dtype}")
@@ -1408,9 +1400,53 @@ def _cute_scalar_annotation(kind: str) -> str:
     mapping = {
         "bool": "cutlass.Boolean",
         "int": "cutlass.Int64",
-        "float": "cutlass.Float64",
+        "float": "cutlass.Float32",
     }
     return mapping[kind]
+
+
+def _cute_kernel_param_is_constexpr(cute_kernel: object) -> tuple[bool, ...]:
+    """Return per-parameter Constexpr flags for a ``@cute.kernel``.
+
+    Cached on the kernel object to avoid repeated signature inspection.
+    The newer cutlass DSL (>=4.5) enforces region isolation: a runtime scalar
+    passed through the wrapper cannot satisfy a kernel parameter declared as
+    ``cutlass.Constexpr``.  When the wrapper sees a Constexpr-typed kernel
+    parameter, it must propagate the value as a Constexpr (i.e., baked into
+    the compiled wrapper) rather than as a runtime ``cutlass.Int64``.
+    """
+    cached = getattr(cast("Any", cute_kernel), "_helion_cute_param_constexpr", None)
+    if cached is not None:
+        return cast("tuple[bool, ...]", cached)
+    import cutlass
+
+    try:
+        sig = inspect.signature(cute_kernel)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        flags: tuple[bool, ...] = ()
+    else:
+        from typing import get_origin
+        from typing import get_type_hints
+
+        # Helion-emitted kernels use ``from __future__ import annotations`` so
+        # ``param.annotation`` is the source string. ``get_type_hints`` resolves
+        # those strings against the function's globals (which include
+        # ``cutlass``).
+        try:
+            hints = get_type_hints(cute_kernel)  # type: ignore[arg-type]
+        except Exception:
+            hints = {}
+        flags_list: list[bool] = []
+        for name, param in sig.parameters.items():
+            ann = hints.get(name, param.annotation)
+            is_constexpr = ann is cutlass.Constexpr or get_origin(ann) is (
+                cutlass.Constexpr
+            )
+            flags_list.append(is_constexpr)
+        flags = tuple(flags_list)
+    with suppress(AttributeError, TypeError):
+        cast("Any", cute_kernel)._helion_cute_param_constexpr = flags
+    return flags
 
 
 def _append_cute_wrapper_plan(
@@ -1424,6 +1460,51 @@ def _append_cute_wrapper_plan(
         return value
 
     kind = plan["kind"]
+    if kind == "tcgen05_d_tma":
+        d_idx = plan_int("d_idx")
+        bm = plan_int("bm")
+        bn = plan_int("bn")
+        c_stage_count = plan_int("c_stage_count")
+        output_dtype = str(plan["output_dtype"])
+        kernel_args = [str(arg) for arg in cast("list[object]", plan["kernel_args"])]
+        assert len(kernel_args) == 2
+        tma_atom_d, tma_tensor_d = kernel_args
+        epi_tile = f"{tma_atom_d}_epi_tile"
+        smem_layout = f"{tma_atom_d}_smem_layout"
+        cta_v_layout = f"{tma_atom_d}_cta_v_layout"
+        # Keep these layout arguments in sync with the device-side
+        # `make_smem_layout_epi` call in `_codegen_cute_store_tcgen05_tile`;
+        # the TMA atom slices the same SMEM stage that the kernel allocates.
+        body.extend(
+            (
+                (
+                    f"    {epi_tile} = "
+                    "cutlass.utils.blackwell_helpers.compute_epilogue_tile_shape("
+                    f"({bm}, {bn}), False, "
+                    "cutlass.utils.layout.LayoutEnum.ROW_MAJOR, "
+                    f"{output_dtype})"
+                ),
+                (
+                    f"    {smem_layout} = cutlass.utils.blackwell_helpers."
+                    "make_smem_layout_epi("
+                    f"{output_dtype}, cutlass.utils.layout.LayoutEnum.ROW_MAJOR, "
+                    f"{epi_tile}, {c_stage_count})"
+                ),
+                (
+                    f"    {cta_v_layout} = cute.composition("
+                    f"cute.make_identity_layout(arg{d_idx}.shape), {epi_tile})"
+                ),
+                (
+                    f"    {tma_atom_d}, {tma_tensor_d} = "
+                    "cute.nvgpu.cpasync.make_tiled_tma_atom("
+                    "cute.nvgpu.cpasync.CopyBulkTensorTileS2GOp(), "
+                    f"arg{d_idx}, cute.slice_({smem_layout}, (None, None, 0)), "
+                    f"{cta_v_layout})"
+                ),
+            )
+        )
+        call_args.extend(kernel_args)
+        return
     if kind != "tcgen05_ab_tma":
         raise exc.BackendUnsupported("cute", f"wrapper plan kind: {kind}")
 
@@ -1585,6 +1666,14 @@ def _create_cute_wrapper(
             call_args.append(f"arg{i}")
             continue
 
+        if kind == "scalar_constexpr":
+            (_, scalar_kind, scalar_value) = entry
+            assert isinstance(scalar_kind, str)
+            literal = repr(scalar_value)
+            body.append(f"    arg{i} = {literal}")
+            call_args.append(f"arg{i}")
+            continue
+
         assert kind == "scalar"
         (_, scalar_kind) = entry
         assert isinstance(scalar_kind, str)
@@ -1652,10 +1741,11 @@ class _CompiledCuteLauncher:
     collapses ~200ms of per-launch host overhead into ~0.1ms.
     """
 
-    __slots__ = ("_compiled", "_jit_func")
+    __slots__ = ("_compile_options", "_compiled", "_jit_func")
 
-    def __init__(self, jit_func: object) -> None:
+    def __init__(self, jit_func: object, compile_options: str | None) -> None:
         self._jit_func = jit_func
+        self._compile_options = compile_options
         self._compiled: object = None
 
     def __call__(self, *args: object) -> object:
@@ -1663,7 +1753,14 @@ class _CompiledCuteLauncher:
         if compiled is None:
             import cutlass.cute as cute
 
-            compiled = cute.compile(self._jit_func, *args)
+            if self._compile_options is None:
+                compiled = cute.compile(self._jit_func, *args)
+            else:
+                compiled = cute.compile(
+                    self._jit_func,
+                    *args,
+                    options=self._compile_options,
+                )
             self._compiled = compiled
         return cast("Any", compiled)(*args)
 
@@ -1672,6 +1769,7 @@ def _get_compiled_cute_launcher(
     cute_kernel: object,
     schema_key: tuple[tuple[object, ...], ...],
     block: tuple[int, int, int],
+    compile_options: str | None = None,
 ) -> object:
     try:
         # pyrefly: ignore [missing-attribute]
@@ -1687,18 +1785,25 @@ def _get_compiled_cute_launcher(
     cluster_shape = getattr(
         cast("Any", cute_kernel), "_helion_cute_cluster_shape", None
     )
-    cache_key = (schema_key, block, wrapper_plans, repr(cluster_shape))
+    cache_key = (
+        schema_key,
+        block,
+        wrapper_plans,
+        repr(cluster_shape),
+        compile_options,
+    )
     cached = cache.get(cache_key)
     if cached is not None:
         return cached
 
     jit_func = _create_cute_wrapper(cute_kernel, schema_key, block)
-    launcher = _CompiledCuteLauncher(jit_func)
+    launcher = _CompiledCuteLauncher(jit_func, compile_options)
     cache[cache_key] = launcher
     return launcher
 
 
 def _build_cute_schema_and_args(
+    cute_kernel: object,
     args: tuple[object, ...],
     grid: tuple[int, int, int],
 ) -> tuple[tuple[tuple[object, ...], ...], tuple[object, ...]]:
@@ -1707,9 +1812,10 @@ def _build_cute_schema_and_args(
     from cutlass.cute.runtime import make_ptr
 
     _ensure_cute_dsl_arch_env(args)
+    constexpr_flags = _cute_kernel_param_is_constexpr(cute_kernel)
     schema: list[tuple[object, ...]] = []
     launch_args: list[object] = []
-    for arg in args:
+    for i, arg in enumerate(args):
         if isinstance(arg, torch.Tensor):
             if arg.device.type != "cuda":
                 raise exc.BackendUnsupported("cute", "launcher requires CUDA tensors")
@@ -1731,8 +1837,16 @@ def _build_cute_schema_and_args(
             continue
 
         scalar_kind, scalar_value = _normalize_cute_scalar(arg)
-        schema.append(("scalar", scalar_kind))
-        launch_args.append(scalar_value)
+        is_constexpr = i < len(constexpr_flags) and constexpr_flags[i]
+        if is_constexpr:
+            # Bake Constexpr values into the wrapper / cache key. cutlass DSL
+            # >=4.5 fails IR verification ("value defined outside the region")
+            # if a runtime scalar is fed to a kernel parameter declared as
+            # ``cutlass.Constexpr``.
+            schema.append(("scalar_constexpr", scalar_kind, scalar_value))
+        else:
+            schema.append(("scalar", scalar_kind))
+            launch_args.append(scalar_value)
 
     launch_args.extend(grid)
     return tuple(schema), tuple(launch_args)
@@ -1765,6 +1879,9 @@ def default_cute_launcher(
     **kwargs: object,
 ) -> object:
     block = kwargs.pop("block", (256, 1, 1))
+    cute_compile_options = kwargs.pop("cute_compile_options", None)
+    if cute_compile_options is not None and not isinstance(cute_compile_options, str):
+        raise ValueError(f"Invalid CuTe compile options: {cute_compile_options!r}")
     if not isinstance(block, tuple) or len(block) < 1:
         raise ValueError(f"Invalid block specification: {block}")
     if not isinstance(grid, tuple) or len(grid) < 1:
@@ -1786,8 +1903,15 @@ def default_cute_launcher(
     if any(dim <= 0 for dim in grid_xyz):
         return None
 
-    schema_key, launch_args = _build_cute_schema_and_args(tuple(args), grid_xyz)
-    compiled = _get_compiled_cute_launcher(cute_kernel, schema_key, block_xyz)
+    schema_key, launch_args = _build_cute_schema_and_args(
+        cute_kernel, tuple(args), grid_xyz
+    )
+    compiled = _get_compiled_cute_launcher(
+        cute_kernel,
+        schema_key,
+        block_xyz,
+        compile_options=cute_compile_options,
+    )
     return cast("Any", compiled)(*launch_args)
 
 
