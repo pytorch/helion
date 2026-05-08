@@ -921,7 +921,9 @@ class TestTensorDescriptor(RefEagerTestBase, TestCase):
         self.assertNotIn(f"{name}_desc = {get_tensor_descriptor_fn_name()}", code)
 
     @skipUnlessTensorDescriptor("Tensor descriptor support is required")
-    @skipIfXPU("XPU tensor descriptor path has accuracy issue for scalar SymInt subscripts")
+    @skipIfXPU(
+        "XPU tensor descriptor path has accuracy issue for scalar SymInt subscripts"
+    )
     def test_scalar_symint_subscript_allowlist(self):
         """Known scalar SymInt expressions should still use tensor descriptors."""
 
