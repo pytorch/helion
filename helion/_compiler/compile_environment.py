@@ -15,6 +15,7 @@ import warnings
 import sympy
 import torch
 from torch._dynamo.source import EphemeralSource
+from torch._dynamo.source import GetItemSource
 from torch._dynamo.source import LocalSource
 from torch._dynamo.source import TensorProperty
 from torch._dynamo.source import TensorPropertySource
@@ -54,6 +55,52 @@ class TensorDescriptorLayoutGuard:
     element_size: int
     memory_op_indices: set[int] = dataclasses.field(default_factory=set)
     atomic_op_indices: set[int] = dataclasses.field(default_factory=set)
+
+
+def _is_supported_tensor_descriptor_layout_guard_source(source: Source) -> bool:
+    if isinstance(source, LocalSource):
+        return True
+    if isinstance(source, GetItemSource):
+        return (
+            isinstance(source.index, int)
+            and not source.index_is_slice
+            and _is_supported_tensor_descriptor_layout_guard_source(source.base)
+        )
+    return False
+
+
+def _replay_tensor_descriptor_layout_guard_source(
+    source: Source,
+    root_values: typing.Mapping[str, object],
+) -> object:
+    if isinstance(source, LocalSource):
+        return root_values.get(source.local_name)
+    if isinstance(source, GetItemSource):
+        if not isinstance(source.index, int) or source.index_is_slice:
+            return None
+        base = _replay_tensor_descriptor_layout_guard_source(source.base, root_values)
+        if isinstance(base, (list, tuple)) and 0 <= source.index < len(base):
+            return base[source.index]
+    return None
+
+
+def _find_tensor_descriptor_layout_guard_source(
+    target: torch.Tensor,
+    value: object,
+    source: Source,
+) -> Source | None:
+    if value is target:
+        return source
+    if isinstance(value, (list, tuple)):
+        for index, item in enumerate(value):
+            result = _find_tensor_descriptor_layout_guard_source(
+                target,
+                item,
+                GetItemSource(source, index),
+            )
+            if result is not None:
+                return result
+    return None
 
 
 def tensor_descriptor_layout_signature_from_strides(
@@ -212,8 +259,9 @@ class CompileEnvironment:
         self.specialized_vars: set[sympy.Symbol] = set()
         self.specialized_strides: set[tuple[str, int]] = set()
         self.tensor_descriptor_layout_guards: dict[
-            str, TensorDescriptorLayoutGuard
+            Source, TensorDescriptorLayoutGuard
         ] = {}
+        self._tensor_descriptor_layout_guard_source_cache: dict[int, Source | None] = {}
         self.jagged_tile_parent_ids: dict[int, list[int]] = {}
         self.jagged_tile_mask_shapes: dict[int, list[torch.SymInt]] = {}
         self._symint_cache: dict[object, torch.SymInt] = {}
@@ -274,11 +322,11 @@ class CompileEnvironment:
         """Specialize dynamic kernels on TD-relevant stride layout predicates."""
         if self.settings.static_shapes:
             return
-        source = self.input_sources.get(fake_tensor)
-        if not isinstance(source, LocalSource):
+        source = self._tensor_descriptor_layout_guard_source(fake_tensor)
+        if source is None:
             return
         guard = self.tensor_descriptor_layout_guards.setdefault(
-            source.local_name,
+            source,
             TensorDescriptorLayoutGuard(
                 ndim=fake_tensor.ndim,
                 element_size=fake_tensor.element_size(),
@@ -292,11 +340,41 @@ class CompileEnvironment:
     def has_tensor_descriptor_layout_guard(self, fake_tensor: torch.Tensor) -> bool:
         if self.settings.static_shapes:
             return True
+        source = self._tensor_descriptor_layout_guard_source(fake_tensor)
+        return source is not None and source in self.tensor_descriptor_layout_guards
+
+    def _tensor_descriptor_layout_guard_source(
+        self, fake_tensor: torch.Tensor
+    ) -> Source | None:
+        cache_key = id(fake_tensor)
+        if cache_key in self._tensor_descriptor_layout_guard_source_cache:
+            return self._tensor_descriptor_layout_guard_source_cache[cache_key]
+
         source = self.input_sources.get(fake_tensor)
-        return (
-            isinstance(source, LocalSource)
-            and source.local_name in self.tensor_descriptor_layout_guards
-        )
+        from .host_function import HostFunction
+
+        root_values = HostFunction.current().params.arguments
+        if (
+            source is not None
+            and _is_supported_tensor_descriptor_layout_guard_source(source)
+            and _replay_tensor_descriptor_layout_guard_source(source, root_values)
+            is fake_tensor
+        ):
+            result = source
+        else:
+            result = None
+            for local_name, value in root_values.items():
+                candidate = _find_tensor_descriptor_layout_guard_source(
+                    fake_tensor,
+                    value,
+                    LocalSource(local_name, is_input=True),
+                )
+                if candidate is not None:
+                    result = candidate
+                    break
+
+        self._tensor_descriptor_layout_guard_source_cache[cache_key] = result
+        return result
 
     def tensor_descriptor_layout_signature(
         self, fake_tensor: torch.Tensor
