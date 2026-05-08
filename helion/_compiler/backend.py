@@ -173,6 +173,20 @@ class Backend(abc.ABC):
         """
         return requested
 
+    def create_synthetic_reduction_lanes(
+        self,
+        thread_count: int,
+        size_hint: int,
+    ) -> int | None:
+        """Determine if a synthetic lane loop is needed for a persistent reduction.
+
+        Returns the lane extent when lanes are needed, or None if not.
+        Tile-level backends never need lanes. Thread-level backends
+        (e.g., CuTe) override this to create lanes when the padded
+        reduction size exceeds the thread count.
+        """
+        return None
+
     def barrier_semaphore_dtype(self) -> torch.dtype:
         """Dtype used for persistent multi-phase barrier semaphore tensors."""
         return torch.uint32
@@ -2716,6 +2730,20 @@ class CuteBackend(Backend):
         while other_threads * requested > MAX_THREADS_PER_BLOCK and requested > 1:
             requested //= 2
         return requested
+
+    def create_synthetic_reduction_lanes(
+        self,
+        thread_count: int,
+        size_hint: int,
+    ) -> int | None:
+        from torch._inductor.runtime.runtime_utils import next_power_of_2
+
+        if thread_count <= 0:
+            return None
+        padded_size = next_power_of_2(max(1, size_hint))
+        if padded_size > thread_count:
+            return padded_size // thread_count
+        return None
 
     def reduction_axis_first(self) -> bool:
         return True
