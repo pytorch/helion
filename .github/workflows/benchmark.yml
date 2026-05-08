@@ -39,10 +39,13 @@ jobs:
 
     env:
       HELION_AUTOTUNE_LOG_LEVEL: INFO
-      # Run perf CI through the long-lived worker pool so CUDA sticky errors
-      # stay isolated from the autotune parent process.
-      HELION_AUTOTUNE_PRECOMPILE: "pool"
-      HELION_AUTOTUNE_POOL_REUSE_PROCESS: "1"
+      # Keep fork precompile for B200 compile time, but route benchmark timing
+      # through an isolated pool worker so CUDA sticky errors stay out of the
+      # autotune parent process.
+      HELION_AUTOTUNE_PRECOMPILE: "fork"
+      HELION_AUTOTUNE_BENCHMARK_SUBPROCESS: "pool"
+      HELION_AUTOTUNE_POOL_REUSE_PROCESS: "0"
+      HELION_AUTOTUNE_POOL_REBENCHMARK_MODE: "grouped"
 
     container:
       image: ${{ inputs.image }}
