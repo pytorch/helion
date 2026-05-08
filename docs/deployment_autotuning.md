@@ -457,6 +457,6 @@ See {doc}`aot_autotuning` for the
 `@helion.experimental.aot_kernel` decorator, the three-phase
 `collect → measure → evaluate` runner, the heuristic file format and
 generated artifacts, and the runtime compute-capability fallback rules.
-The pretuned [`tutorials/`](https://github.com/pytorch/helion/tree/main/tutorials)
-kernels use this workflow end-to-end and ship `sm100` heuristic files
+The [`pretuned_kernels/`](https://github.com/pytorch/helion/tree/main/pretuned_kernels)
+use this workflow end-to-end and ship `sm100` heuristic files
 that you can use as templates.
