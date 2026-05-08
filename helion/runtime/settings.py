@@ -45,6 +45,7 @@ if TYPE_CHECKING:
 DotPrecision = Literal["tf32", "tf32x3", "ieee"]
 PrecompileMode = Literal["spawn", "fork", "pool"] | None
 PoolRebenchmarkMode = Literal["grouped", "owner_isolated"]
+BenchmarkSubprocessMode = Literal["off", "single", "pool"] | bool
 _TRUE_LITERALS = frozenset({"1", "true", "yes", "on"})
 _FALSE_LITERALS = frozenset({"0", "false", "no", "off"})
 
@@ -381,9 +382,25 @@ class _Settings:
             _env_get_int, "HELION_AUTOTUNE_COMPILE_TIMEOUT", 60
         )
     )
-    autotune_benchmark_subprocess: bool = dataclasses.field(
+    autotune_benchmark_subprocess: BenchmarkSubprocessMode = dataclasses.field(
         default_factory=functools.partial(
-            _env_get_bool, "HELION_AUTOTUNE_BENCHMARK_SUBPROCESS", False
+            _env_get_literal,
+            "HELION_AUTOTUNE_BENCHMARK_SUBPROCESS",
+            cast("BenchmarkSubprocessMode", "off"),
+            mapping={
+                # Back-compat: bool-style env values keep their old meanings.
+                "0": "off",
+                "false": "off",
+                "no": "off",
+                "": "off",
+                "off": "off",
+                "1": "single",
+                "true": "single",
+                "yes": "single",
+                "on": "single",
+                "single": "single",
+                "pool": "pool",
+            },
         )
     )
     autotune_benchmark_timeout: int = dataclasses.field(
@@ -609,7 +626,7 @@ class Settings(_Settings):
             "/tmp/run.csv and /tmp/run.log with per-config metrics and debug logs."
         ),
         "autotune_compile_timeout": "Timeout for Triton compilation in seconds used for autotuning. Default is 60 seconds.",
-        "autotune_benchmark_subprocess": "Run the autotune benchmark phase in a long-lived spawn subprocess so a hung/slow kernel can be killed without losing autotune progress. Opt-in via HELION_AUTOTUNE_BENCHMARK_SUBPROCESS=1, or enabled implicitly by HELION_AUTOTUNE_PRECOMPILE=pool. Default disabled.",
+        "autotune_benchmark_subprocess": "How the autotune benchmark phase is dispatched. 'off' (default) runs in-process; 'single' (or HELION_AUTOTUNE_BENCHMARK_SUBPROCESS=1) launches a long-lived single benchmark subprocess; 'pool' routes timing through the worker pool. Implicitly 'pool' when HELION_AUTOTUNE_PRECOMPILE=pool.",
         "autotune_benchmark_timeout": "Per-config wall-clock timeout in seconds for the subprocess benchmark phase. Applies when autotune_benchmark_subprocess is enabled or autotune_precompile='pool'. Default 30 seconds.",
         "autotune_precompile": "Autotuner precompile mode: 'fork', 'spawn', 'pool', or falsy/None to disable. 'pool' uses long-lived spawn workers and implies subprocess benchmarking. Defaults to 'fork' on non-Windows platforms.",
         "autotune_precompile_jobs": "Maximum concurrent Triton precompile processes, default to cpu count.",

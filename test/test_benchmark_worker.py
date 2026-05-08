@@ -220,6 +220,15 @@ class TestWorkerPoolPrecompile(unittest.TestCase):
         with patch.dict(os.environ, {"HELION_AUTOTUNE_PRECOMPILE": "pool"}):
             self.assertEqual(Settings().autotune_precompile, "pool")
 
+    def test_benchmark_subprocess_pool_env_value_is_supported(self) -> None:
+        # Benchmark subprocess mode accepts bool-style values plus explicit pool.
+        with patch.dict(os.environ, {"HELION_AUTOTUNE_BENCHMARK_SUBPROCESS": "pool"}):
+            self.assertEqual(Settings().autotune_benchmark_subprocess, "pool")
+        with patch.dict(os.environ, {"HELION_AUTOTUNE_BENCHMARK_SUBPROCESS": "1"}):
+            self.assertEqual(Settings().autotune_benchmark_subprocess, "single")
+        with patch.dict(os.environ, {"HELION_AUTOTUNE_BENCHMARK_SUBPROCESS": "0"}):
+            self.assertEqual(Settings().autotune_benchmark_subprocess, "off")
+
     def test_pool_owner_rebenchmark_env_value_is_supported(self) -> None:
         # Owner-isolated pool rebenchmarking should stay opt-in behind its env flag.
         with patch.dict(
@@ -326,6 +335,28 @@ class TestWorkerPoolPrecompile(unittest.TestCase):
         provider.mutated_arg_indices = []
 
         self.assertTrue(provider._subprocess_benchmark_enabled())
+
+    def test_fork_precompile_can_request_pool_benchmarking(self) -> None:
+        # Hybrid mode keeps fork precompile but routes benchmark jobs to the pool.
+        provider = cast("Any", LocalBenchmarkProvider.__new__(LocalBenchmarkProvider))
+        provider.settings = Settings(
+            autotune_precompile="fork",
+            autotune_benchmark_subprocess="pool",
+        )
+        provider.config_spec = SimpleNamespace(backend=None)
+        provider.mutated_arg_indices = []
+
+        self.assertTrue(provider._subprocess_benchmark_enabled())
+        self.assertTrue(provider._benchmark_via_pool())
+
+    def test_bool_benchmark_subprocess_values_keep_old_meaning(self) -> None:
+        provider = cast("Any", LocalBenchmarkProvider.__new__(LocalBenchmarkProvider))
+        provider.settings = Settings(
+            autotune_precompile="fork",
+            autotune_benchmark_subprocess=False,
+        )
+
+        self.assertFalse(provider._subprocess_benchmark_requested())
 
     def test_pool_mode_reports_disabled_worker_reason(self) -> None:
         # Explicitly disabled pool workers should fail with an actionable reason.

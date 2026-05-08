@@ -569,6 +569,12 @@ class LocalBenchmarkProvider(BenchmarkProvider):
             args_path = os.path.join(self._precompile_tmpdir.name, "args.pt")
             torch.save(self.args, args_path)
             self._precompile_args_path = args_path
+        if (
+            self._benchmark_via_pool()
+            and self.settings.autotune_precompile != "pool"
+            and self._pool_mode_unavailable_reason() is None
+        ):
+            self._ensure_pool_manager()
 
     def _next_precompile_result_path(self) -> str:
         """Return a fresh path for a precompile result file."""
@@ -606,9 +612,22 @@ class LocalBenchmarkProvider(BenchmarkProvider):
 
     def _subprocess_benchmark_requested(self) -> bool:
         return (
-            self.settings.autotune_benchmark_subprocess
+            self._benchmark_subprocess_mode() != "off"
             or self.settings.autotune_precompile == "pool"
         )
+
+    def _benchmark_subprocess_mode(self) -> Literal["off", "single", "pool"]:
+        mode = self.settings.autotune_benchmark_subprocess
+        if mode is True:
+            return "single"
+        if mode is False:
+            return "off"
+        return mode
+
+    def _benchmark_via_pool(self) -> bool:
+        if self.settings.autotune_precompile == "pool":
+            return True
+        return self._benchmark_subprocess_mode() == "pool"
 
     def _subprocess_benchmark_unsupported_reason(self) -> str | None:
         if dist.is_initialized():
