@@ -17,6 +17,7 @@ from helion._testing import code_and_output
 from helion._testing import onlyBackends
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfTileIR
+from helion._testing import skipIfXPU
 from helion._testing import skipUnlessTensorDescriptor
 import helion.language as hl
 
@@ -883,6 +884,7 @@ class TestTensorDescriptor(RefEagerTestBase, TestCase):
                     self.assertIn("tl.dot", code)
 
     @skipUnlessTensorDescriptor("Tensor descriptor support is required")
+    @skipIfXPU("XPU tensor descriptor path has issue with stride-0 input")
     def test_dynamic_shape_stride_zero_input(self):
         """Expanded stride-0 dimensions should be TD-eligible with dynamic shapes."""
 
@@ -919,6 +921,7 @@ class TestTensorDescriptor(RefEagerTestBase, TestCase):
         self.assertNotIn(f"{name}_desc = {get_tensor_descriptor_fn_name()}", code)
 
     @skipUnlessTensorDescriptor("Tensor descriptor support is required")
+    @skipIfXPU("XPU tensor descriptor path has accuracy issue for scalar SymInt subscripts")
     def test_scalar_symint_subscript_allowlist(self):
         """Known scalar SymInt expressions should still use tensor descriptors."""
 
