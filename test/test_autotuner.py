@@ -2514,7 +2514,9 @@ class TestCuteAutotuner(TestCase):
         configs = [gen.random_config() for _ in range(20)]
         self.assertTrue(any(config.num_threads for config in configs))
         for config in configs:
-            self.assertLessEqual(set(config.config), {"block_sizes", "num_threads", "grid_foldings"})
+            self.assertLessEqual(
+                set(config.config), {"block_sizes", "num_threads", "grid_foldings"}
+            )
             self.assertNotIn("persistent", config.pid_type)
             explicit_threads = [nt for nt in config.num_threads if nt > 0]
             if explicit_threads:
