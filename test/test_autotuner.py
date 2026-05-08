@@ -2503,7 +2503,7 @@ class TestCuteAutotuner(TestCase):
         flat_keys = {
             key for key, _count, _is_sequence in gen.config_spec.flat_key_layout()
         }
-        self.assertEqual(flat_keys, {"block_sizes", "num_threads"})
+        self.assertEqual(flat_keys, {"block_sizes", "num_threads", "grid_foldings"})
 
         repaired = gen.unflatten(
             gen.flatten(helion.Config(block_sizes=[16, 64], num_threads=[128, 128]))
@@ -2514,7 +2514,7 @@ class TestCuteAutotuner(TestCase):
         configs = [gen.random_config() for _ in range(20)]
         self.assertTrue(any(config.num_threads for config in configs))
         for config in configs:
-            self.assertLessEqual(set(config.config), {"block_sizes", "num_threads"})
+            self.assertLessEqual(set(config.config), {"block_sizes", "num_threads", "grid_foldings"})
             self.assertNotIn("persistent", config.pid_type)
             explicit_threads = [nt for nt in config.num_threads if nt > 0]
             if explicit_threads:
