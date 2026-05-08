@@ -41,9 +41,13 @@ from .._compile_time import measure
 from .._compiler.ast_extension import unparse
 from .._compiler.backend import TritonBackend
 from .._compiler.compile_environment import CompileEnvironment
+from .._compiler.compile_environment import TensorDescriptorLayoutGuard
+from .._compiler.compile_environment import (
+    tensor_descriptor_layout_signature_from_strides,
+)
 from .._compiler.generate_ast import generate_ast
-from .._compiler.host_function import HostFunction
 from .._compiler.inductor_lowering_extra import patch_inductor_lowerings
+from .._compiler.kernel_compiler import KernelCompiler
 from .._compiler.output_header import assert_no_conflicts
 from .._compiler.variable_origin import ArgumentOrigin
 from .._dist_utils import _find_process_group_name
@@ -64,12 +68,35 @@ if TYPE_CHECKING:
 
     from torch._guards import Source
 
+    from .._compiler.host_function import HostFunction
     from ..autotuner import ConfigSpec
     from ..autotuner.base_cache import BoundKernelInMemoryCacheKey
 
     ConfigLike = Config | dict[str, object]
 
 log: logging.Logger = logging.getLogger(__name__)
+
+
+def _indexing_config_uses_tensor_descriptor(indexing: object, index: int) -> bool:
+    if indexing == "tensor_descriptor":
+        return True
+    if isinstance(indexing, list):
+        return index < len(indexing) and indexing[index] == "tensor_descriptor"
+    return False
+
+
+def _td_layout_guard_active_for_config(
+    guard: TensorDescriptorLayoutGuard, config: Config
+) -> bool:
+    return any(
+        _indexing_config_uses_tensor_descriptor(config.indexing, index)
+        for index in guard.memory_op_indices
+    ) or any(
+        _indexing_config_uses_tensor_descriptor(config.atomic_indexing, index)
+        for index in guard.atomic_op_indices
+    )
+
+
 _R = TypeVar("_R")
 CompiledConfig = Callable[..., _R]
 
@@ -451,9 +478,8 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                 measure("BoundKernel.create_host_function"),
             ):
                 try:
-                    # pyrefly: ignore [bad-assignment]
-                    self.host_function: HostFunction = HostFunction(
-                        # pyrefly: ignore [bad-argument-type]
+                    compiler = KernelCompiler(self.env)
+                    self.host_function: HostFunction = compiler.compile(
                         self.kernel.fn,
                         self.fake_args,
                         constexpr_args,
@@ -818,7 +844,10 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         Returns:
             list[Callable[[Sequence[object]], Hashable]]: A list of functions that generate extra specialization keys.
         """
-        if not self.env.specialized_vars:
+        if (
+            not self.env.specialized_vars
+            and not self.env.tensor_descriptor_layout_guards
+        ):
             return []
 
         def make_extractor(v: Source) -> Callable[[Sequence[object]], Hashable]:
@@ -867,11 +896,50 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         arg_name_to_index: dict[str, int] = {
             n: i for i, n in enumerate(self.kernel.signature.parameters.keys())
         }
-        extractors = []
+        extractors: list[Callable[[Sequence[object]], Hashable]] = []
         for v in sorted(self.env.specialized_vars, key=lambda v: v.name):
             source = self.env.shape_env.var_to_sources[v][0]
             extractors.append(make_extractor(source))
+        implicit_config = self._fixed_config_for_td_layout_guards()
+        for local_name, guard in sorted(
+            self.env.tensor_descriptor_layout_guards.items()
+        ):
+            if implicit_config is not None and not _td_layout_guard_active_for_config(
+                guard, implicit_config
+            ):
+                continue
+            index = arg_name_to_index[local_name]
+
+            def td_layout_extractor(
+                args: Sequence[object],
+                _index: int = index,
+                _ndim: int = guard.ndim,
+                _element_size: int = guard.element_size,
+            ) -> Hashable:
+                tensor = cast("torch.Tensor", args[_index])
+                if tensor.ndim != _ndim:
+                    return ("ndim", tensor.ndim)
+                return tensor_descriptor_layout_signature_from_strides(
+                    tensor.stride(),
+                    _element_size,
+                )
+
+            extractors.append(td_layout_extractor)
         return extractors
+
+    def _fixed_config_for_td_layout_guards(self) -> Config | None:
+        """Return the fixed config if TD layout guards can be filtered safely."""
+        if self._config is not None:
+            return self._config
+        if self.kernel.settings.autotune_effort == "none" and (
+            len(self.kernel.configs) == 0 or self.settings.force_autotune
+        ):
+            return self.config_spec.default_config()
+        if self.settings.force_autotune:
+            return None
+        if len(self.kernel.configs) == 1:
+            return self.kernel.configs[0]
+        return None
 
     def _user_provided_config(self) -> Config | None:
         """Return a config if the user explicitly provided one, else None.

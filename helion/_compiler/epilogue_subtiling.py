@@ -38,6 +38,8 @@ if TYPE_CHECKING:
     from collections.abc import Callable
     from collections.abc import Iterator
 
+CUTE_DIM_LOCAL_COORD_META = "cute_dim_local_coords"
+
 
 class EpilogueSubtilingCandidate(NamedTuple):
     store_node: torch.fx.Node
@@ -143,7 +145,7 @@ def _rewrite_chain(
     )
 
     with graph.inserting_before(candidate.pointwise_nodes[0]):
-        pieces = _reshape_and_split(graph, boundary, split_dim, split_factor)
+        pieces = _reshape_and_split(graph, boundary, split_dim, split_factor, block_id)
 
     # Clone pointwise ops for each piece and split broadcasted inputs as needed.
     node_pieces: dict[torch.fx.Node, list[torch.fx.Node]] = {boundary: pieces}
@@ -243,7 +245,7 @@ def _split_node_for_block(
     if split_dim is None:
         return None
 
-    return _reshape_and_split(graph, node, split_dim, split_factor)
+    return _reshape_and_split(graph, node, split_dim, split_factor, block_id)
 
 
 def _rewrite_store(
@@ -321,6 +323,7 @@ def _reshape_and_split(
     node: torch.fx.Node,
     split_dim: int,
     split_factor: int,
+    block_id: int,
 ) -> list[torch.fx.Node]:
     """Reshape [... N ...] -> [... S, N//S ...] at split_dim and recursively split."""
     val = node.meta["val"]
@@ -335,6 +338,16 @@ def _reshape_and_split(
         (node, reshape_shape),
         node.meta,
         reshaped_val,
+    )
+    _set_dim_coord_meta(
+        reshape_node,
+        _initial_subtile_dim_coord_meta(
+            node,
+            split_dim,
+            split_factor,
+            piece_size,
+            block_id,
+        ),
     )
     return _recursive_split(
         graph,
@@ -358,6 +371,7 @@ def _split_dim_2(
     # hl.split requires the split dim to be last
     if dim != ndim - 1:
         perm = [i for i in range(ndim) if i != dim] + [dim]
+        input_node = node
         val = val.permute(perm)
         node = _new_node(
             graph,
@@ -366,6 +380,7 @@ def _split_dim_2(
             base_meta,
             val,
         )
+        _set_dim_coord_meta(node, _permute_dim_coord_meta(input_node, perm))
 
     out_shape = val.shape[:-1]
     half_vals = [val.new_empty(out_shape) for _ in range(2)]
@@ -380,6 +395,7 @@ def _split_dim_2(
     for i in range(2):
         gi = graph.call_function(operator.getitem, (split_node, i))
         gi.meta = {**base_meta, "val": half_vals[i]}
+        _set_dim_coord_meta(gi, _drop_last_dim_coord_meta(node))
         _set_lowering(gi)
         halves.append(gi)
     return halves
@@ -413,6 +429,10 @@ def _recursive_split(
         base_meta,
         reshaped_val,
     )
+    _set_dim_coord_meta(
+        reshaped,
+        _reshape_split_factor_dim_coord_meta(node, dim, factor),
+    )
 
     halves = _split_dim_2(graph, reshaped, reshaped_val, dim, base_meta)
     result: list[torch.fx.Node] = []
@@ -428,6 +448,91 @@ def _recursive_split(
             )
         )
     return result
+
+
+def _get_dim_coord_meta(node: torch.fx.Node) -> list[object | None]:
+    meta = node.meta.get(CUTE_DIM_LOCAL_COORD_META)
+    if isinstance(meta, (list, tuple)):
+        return [*meta]
+    val = node.meta.get("val")
+    return [None] * val.dim() if isinstance(val, torch.Tensor) else []
+
+
+def _set_dim_coord_meta(
+    node: torch.fx.Node,
+    meta: list[object | None] | None,
+) -> None:
+    if meta is not None and any(item is not None for item in meta):
+        node.meta[CUTE_DIM_LOCAL_COORD_META] = meta
+
+
+def _initial_subtile_dim_coord_meta(
+    node: torch.fx.Node,
+    split_dim: int,
+    split_factor: int,
+    piece_size: int | torch.SymInt,
+    block_id: int,
+) -> list[object | None]:
+    meta = _get_dim_coord_meta(node)
+    return [
+        *meta[:split_dim],
+        {
+            "block_id": block_id,
+            "divisor": piece_size,
+            "modulus": split_factor,
+        },
+        {
+            "block_id": block_id,
+            "divisor": 1,
+            "modulus": piece_size,
+        },
+        *meta[split_dim + 1 :],
+    ]
+
+
+def _permute_dim_coord_meta(
+    node: torch.fx.Node,
+    perm: list[int],
+) -> list[object | None] | None:
+    meta = _get_dim_coord_meta(node)
+    if not meta:
+        return None
+    return [meta[i] if i < len(meta) else None for i in perm]
+
+
+def _drop_last_dim_coord_meta(node: torch.fx.Node) -> list[object | None] | None:
+    meta = _get_dim_coord_meta(node)
+    if not meta:
+        return None
+    return meta[:-1]
+
+
+def _reshape_split_factor_dim_coord_meta(
+    node: torch.fx.Node,
+    dim: int,
+    factor: int,
+) -> list[object | None] | None:
+    meta = _get_dim_coord_meta(node)
+    if dim >= len(meta):
+        return None
+    old = meta[dim]
+    if not isinstance(old, dict) or not isinstance(old.get("block_id"), int):
+        return None
+    divisor = old.get("divisor", 1)
+    return [
+        *meta[:dim],
+        {
+            "block_id": old["block_id"],
+            "divisor": divisor * (factor // 2),
+            "modulus": 2,
+        },
+        {
+            "block_id": old["block_id"],
+            "divisor": divisor,
+            "modulus": factor // 2,
+        },
+        *meta[dim + 1 :],
+    ]
 
 
 def _trace_pointwise_chain(

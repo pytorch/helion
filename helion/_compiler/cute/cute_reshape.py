@@ -33,6 +33,8 @@ if TYPE_CHECKING:
     from ..generate_ast import GenerateAST
     from ..inductor_lowering import CodegenState
 
+CUTE_DIM_LOCAL_COORD_META = "cute_dim_local_coords"
+
 
 def _env_arg(ctx: LoweringContext, node: Node) -> object:
     return ctx.env[node]
@@ -174,6 +176,70 @@ def _get_dim_local_coord(
         return _grid_local_coord_expr(cg, block_id, thread_axis)
 
     return "cutlass.Int32(0)"
+
+
+def _get_node_dim_local_coord(
+    cg: GenerateAST,
+    node: Node,
+    fake_tensor: torch.Tensor,
+    dim: int,
+) -> str:
+    """Get a local coordinate, honoring explicit metadata on shape-chain nodes."""
+    coord_meta = node.meta.get(CUTE_DIM_LOCAL_COORD_META)
+    if isinstance(coord_meta, (list, tuple)) and dim < len(coord_meta):
+        info = coord_meta[dim]
+        if isinstance(info, dict):
+            coord = _subtile_coord_expr(cg, info)
+            if coord is not None:
+                return coord
+    return _get_dim_local_coord(cg, fake_tensor, dim)
+
+
+def _subtile_coord_expr(cg: GenerateAST, info: dict[object, object]) -> str | None:
+    block_id = info.get("block_id")
+    if not isinstance(block_id, int):
+        return None
+    local_coord = _get_block_local_coord(cg, block_id)
+    if local_coord is None:
+        return None
+
+    env = CompileEnvironment.current()
+    expr = local_coord
+    divisor = info.get("divisor", 1)
+    if not (isinstance(divisor, (int, torch.SymInt)) and env.known_equal(divisor, 1)):
+        divisor_expr = cg.device_function.literal_expr(divisor)
+        expr = f"({expr}) // cutlass.Int32({divisor_expr})"
+
+    modulus = info.get("modulus")
+    if modulus is not None:
+        modulus_expr = cg.device_function.literal_expr(modulus)
+        expr = f"({expr}) % cutlass.Int32({modulus_expr})"
+    return expr
+
+
+def _get_block_local_coord(cg: GenerateAST, block_id: int) -> str | None:
+    loops = cg.active_device_loops.get(block_id)
+    if loops:
+        loop_state = loops[-1]
+        if _strategy_aliases_index_and_offset(loop_state.strategy, block_id):
+            thread_axis = loop_state.block_thread_axes.get(block_id)
+            if thread_axis is not None:
+                return _grid_local_coord_expr(cg, block_id, thread_axis)
+        try:
+            offset_var = cg.offset_var(block_id)
+        except NotImplementedError:
+            thread_axis = loop_state.block_thread_axes.get(block_id)
+            if thread_axis is not None:
+                return _grid_local_coord_expr(cg, block_id, thread_axis)
+            return f"({cg.index_var(block_id)})"
+        return f"(({cg.index_var(block_id)}) - ({offset_var}))"
+
+    if cg.current_grid_state is not None:
+        thread_axis = cg.current_grid_state.block_thread_axes.get(block_id)
+        if thread_axis is not None:
+            return _grid_local_coord_expr(cg, block_id, thread_axis)
+
+    return None
 
 
 def _grid_local_coord_expr(

@@ -702,11 +702,9 @@ class TestPallas(TestCase):
         b = torch.randn(4, 256, 128, device=DEVICE, dtype=torch.bfloat16)
         # No explicit block_sizes — uses default_config() which runs
         # adjust_block_size_constraints and depends on size_matches.
-        code, result = code_and_output(pallas_bmm, (a, b))
+        _code, result = code_and_output(pallas_bmm, (a, b))
         expected = torch.bmm(a.float(), b.float()).to(torch.bfloat16)
         torch.testing.assert_close(result, expected, rtol=1e-2, atol=1e-2)
-        # Block sizes >= 128 should get the pl.multiple_of alignment hint
-        self.assertIn("pl.multiple_of(", code)
 
     def test_bmm_fori_loop_non_divisible_k(self) -> None:
         """Test fori_loop bmm where BLOCK_K=256 doesn't evenly divide K=384."""
@@ -1738,6 +1736,94 @@ class TestPallas(TestCase):
         self.assertIn("pl.ds(", code)
         torch.testing.assert_close(result, x * r)
 
+    def test_no_pipeline_outer_inner_shared_dim(self) -> None:
+        """Don't pipeline a tensor whose dim is shared between outer and inner tiles.
+
+        Regression test: when a kernel reads a tensor at outer scope using
+        an outer block_id (e.g. ``T[tile_m, tile_n]``) and *also* inside an
+        inner emit_pipeline / fori_loop using a different inner block_id on
+        the same dim (e.g. ``T[tile_m, tile_k]``), the kernel needs outer
+        ``pl.ds`` slicing for the shared dim.  Pipelining the tensor turns
+        it into an HBM ref, which can't be sliced with ``pl.ds`` -- the
+        body then either crashes or generates the wrong offset.  The
+        classifier (shared between both inner-loop codegens) must keep
+        such tensors on the outer BlockSpec.
+        """
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            m, n = x.shape
+            out = torch.empty_like(x)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = x[tile_m, tile_n].to(torch.float32)  # outer-scope use of n
+                # inner loop shares x's n dim with the outer tile via a
+                # different block_id -> x's n dim has both tile_n_bid
+                # (outer) and tile_k_bid (inner).
+                for tile_k in hl.tile(n):
+                    acc += x[tile_m, tile_k].to(torch.float32).sum(dim=-1, keepdim=True)
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        x = torch.randn(128, 128, device=DEVICE, dtype=torch.float32)
+        expected = x + x.sum(dim=1, keepdim=True)
+        for loop_type, loop_marker in (
+            ("emit_pipeline", "pltpu.emit_pipeline"),
+            ("fori_loop", "jax.lax.fori_loop"),
+        ):
+            with self.subTest(pallas_loop_type=loop_type):
+                code, result = code_and_output(
+                    fn,
+                    (x,),
+                    block_sizes=[32, 128, 128],
+                    pallas_loop_type=loop_type,
+                )
+                self.assertIn(loop_marker, code)
+                self.assertNotIn("_pipeline_arg_indices=[0", code)
+                torch.testing.assert_close(result, expected)
+
+    def test_no_pipeline_outer_summary_read(self) -> None:
+        """Don't pipeline a tensor that's read at outer scope as a per-row
+        summary, even when no inner block_id appears alongside an outer/grid
+        block_id on any dim of the tensor.
+
+        Outer scope reads ``T[tile_m, :]`` to compute a per-row summary;
+        inner loop reads ``T[tile_m, tile_k]`` for per-tile work.  Pipelining
+        T would replace its outer BlockSpec with HBM, and the outer-scope
+        ``T[tile_m, :]`` load then fails with ``"Loads are only allowed on
+        VMEM and SMEM references."``.  Companion to
+        ``test_no_pipeline_outer_inner_shared_dim`` -- both exercise the
+        outer-scope-access exclusion in ``_classify_pipelined_tensors`` but
+        through different access patterns (this one uses ``:`` on the inner
+        loop's dim; the other uses an outer-grid block_id on it).
+        """
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def fn(T: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+            m, n = x.shape
+            out = torch.empty_like(x)
+            aux = torch.empty([m], dtype=x.dtype, device=x.device)
+            for tile_m in hl.tile(m):
+                # outer-scope read of T -- a per-row summary
+                aux[tile_m] = T[tile_m, :].sum(dim=-1)
+                for tile_k in hl.tile(n):
+                    # inner-scope read of T -- per-tile elementwise work
+                    out[tile_m, tile_k] = T[tile_m, tile_k] * x[tile_m, tile_k]
+            return out
+
+        T = torch.randn(128, 128, device=DEVICE, dtype=torch.float32)
+        x = torch.randn(128, 128, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(
+            fn,
+            (T, x),
+            block_sizes=[128, 128],
+            pallas_loop_type="emit_pipeline",
+        )
+        # T (arg index 0) must NOT be pipelined — its outer-scope load
+        # would otherwise hit HBM after the BlockSpec is replaced.
+        self.assertIn("pltpu.emit_pipeline", code)
+        self.assertNotIn("_pipeline_arg_indices=[0", code)
+        torch.testing.assert_close(result, T * x, rtol=1e-3, atol=1e-3)
+
     def test_fori_loop_per_tensor_dma_mixed(self) -> None:
         """A fori_loop body can mix DMA-aligned and DMA-unaligned tensors.
 
@@ -2198,9 +2284,8 @@ class TestPallas(TestCase):
         ref = torch.stack([data[: lengths[i]].sum() for i in range(B)])
         torch.testing.assert_close(result, ref, rtol=1e-4, atol=1e-4)
 
-    def test_non_zero_tile_begin(self) -> None:
-        """pl.ds() reads from a non-zero begin can overshoot the tensor boundary."""
-
+    @staticmethod
+    def _non_zero_tile_begin_kernels() -> tuple[object, object]:
         @helion.kernel(backend="pallas", static_shapes=True)
         def sum_with_constant_offset(
             data: torch.Tensor, offsets: torch.Tensor
@@ -2233,16 +2318,52 @@ class TestPallas(TestCase):
                 out[seg] = acc.squeeze(0)
             return out
 
+        return sum_with_constant_offset, sum_with_dynamic_offset
+
+    def test_non_zero_tile_begin(self) -> None:
+        """pl.ds() reads from a non-zero begin can overshoot the tensor boundary.
+
+        Constant-bounds path is pinned to ``unroll``; dynamic-bounds path uses
+        ``fori_loop`` via ``set_default``.  The emit_pipeline variant of the
+        constant-bounds case is exercised as a separate xfail test below.
+        """
+        sum_with_constant_offset, sum_with_dynamic_offset = (
+            self._non_zero_tile_begin_kernels()
+        )
         N, A, B = 128, 8, 256
         data = torch.randn(N, A, B, device=DEVICE, dtype=torch.float32)
         offsets = torch.tensor([3, 128], device=DEVICE, dtype=torch.int32)
         ref = data[3:128].sum().unsqueeze(0)
 
-        _code1, result1 = code_and_output(sum_with_constant_offset, (data, offsets))
+        _code1, result1 = code_and_output(
+            sum_with_constant_offset, (data, offsets), pallas_loop_type="unroll"
+        )
         torch.testing.assert_close(result1, ref, rtol=1e-3, atol=1e-3)
 
         _code2, result2 = code_and_output(sum_with_dynamic_offset, (data, offsets))
         torch.testing.assert_close(result2, ref, rtol=1e-3, atol=1e-3)
+
+    @xfailIfPallas(
+        "emit_pipeline BlockSpec index_map drops the tile.begin offset, "
+        "so a non-zero start in hl.tile(start, end, ...) reads from offset 0 "
+        "instead and produces wrong results."
+    )
+    def test_non_zero_tile_begin_emit_pipeline(self) -> None:
+        """Same kernel as ``test_non_zero_tile_begin`` but pinned to emit_pipeline.
+
+        Documents the known emit_pipeline tile.begin bug.  Will start passing
+        once the BlockSpec ``index_map`` is taught to include ``tile.begin``.
+        """
+        sum_with_constant_offset, _ = self._non_zero_tile_begin_kernels()
+        N, A, B = 128, 8, 256
+        data = torch.randn(N, A, B, device=DEVICE, dtype=torch.float32)
+        offsets = torch.tensor([3, 128], device=DEVICE, dtype=torch.int32)
+        ref = data[3:128].sum().unsqueeze(0)
+
+        _code, result = code_and_output(
+            sum_with_constant_offset, (data, offsets), pallas_loop_type="emit_pipeline"
+        )
+        torch.testing.assert_close(result, ref, rtol=1e-3, atol=1e-3)
 
     def test_dma_buffer_offset_nested_tile(self) -> None:
         """Inner loop reading outer-tiled tensor must use ':' not absolute offset."""

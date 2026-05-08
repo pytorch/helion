@@ -37,13 +37,41 @@ from typing import Callable
 import torch
 from torch import nn
 
+from helion._compile_time import get_total_time as _get_compile_total_time
+from helion._compile_time import reset as _reset_compile_time
 from helion._testing import DEVICE
 from helion._testing import run_example
+from helion.runtime.kernel import Kernel as _HelionKernel
 
 if TYPE_CHECKING:
     import types
 
 EXAMPLES_DIR = Path(__file__).parent.parent / "examples"
+
+
+def _wrap_first_call_compile_time(
+    fn: Callable[..., Any], holder: list[float]
+) -> Callable[..., Any]:
+    """Wrap `fn` so the helion compile-time tracker is reset+read around the
+    FIRST invocation only, mirroring benchmarks/run.py's timed_callable. The
+    captured compile time is appended to `holder` once.
+
+    Subsequent calls bypass the tracker, so per-iteration `Kernel.bind` cache
+    lookups during the bench loop don't accumulate into the reported value.
+    """
+    state = {"first": True}
+
+    def wrapper(*args: object) -> object:
+        if state["first"]:
+            state["first"] = False
+            _reset_compile_time()
+            try:
+                return fn(*args)
+            finally:
+                holder.append(_get_compile_total_time())
+        return fn(*args)
+
+    return wrapper
 
 
 # Shape generators for multi-shape benchmarking.
@@ -629,7 +657,10 @@ KERNEL_MAPPINGS: dict[str, KernelMapping] = {
         None,
     ),
     "welford": ("welford", "welford", _welford_baseline, _welford_shapes, None),
-    "attention": (
+    # Renamed from "attention" to "flash_attention" so this kernel shares the
+    # same dashboard row as the GPU `flash_attention` benchmark, which also
+    # measures examples.attention:attention against an SDPA baseline.
+    "flash_attention": (
         "attention",
         "attention",
         torch.nn.functional.scaled_dot_product_attention,
@@ -637,7 +668,10 @@ KERNEL_MAPPINGS: dict[str, KernelMapping] = {
         None,
     ),
     "bmm": ("bmm", "bmm", torch.bmm, _bmm_shapes, None),
-    "matmul": ("matmul", "matmul", torch.matmul, _matmul_shapes, None),
+    # Renamed from "matmul" to "gemm" so this kernel shares the same dashboard
+    # row as the GPU `gemm` benchmark (which uses examples.matmul via
+    # tritonbench's matmul_tritonbench wrapper).
+    "gemm": ("matmul", "matmul", torch.matmul, _matmul_shapes, None),
     "matmul_layernorm": (
         "matmul_layernorm",
         "matmul_layernorm",
@@ -740,7 +774,9 @@ KERNEL_MAPPINGS: dict[str, KernelMapping] = {
         _rms_norm_shapes,
         None,
     ),
-    "rms_norm_bwd": (
+    # Hyphenated key matches the GPU dashboard label (`rms_norm-bwd`) so both
+    # backends share a row.
+    "rms_norm-bwd": (
         "rms_norm",
         "rms_norm_bwd",
         _rms_norm_bwd_baseline,
@@ -773,6 +809,12 @@ class ShapeResult:
     compile_baseline_time_ms: float = 0.0
     speedup: float = 0.0  # Helion vs default torch (kDefault).
     compile_vs_default: float = 0.0  # default-torch / torch.compile (full-graph win).
+    # Helion compile (autotune+codegen) time captured around run_example.
+    # Only meaningful when HELION_MEASURE_COMPILE_TIME=1 is set in the env;
+    # otherwise the helion._compile_time tracker is a no-op and this stays
+    # at 0.0. write_results_json gates emission of helion_compile_time_s on
+    # that env so the dashboard never sees zero-valued records.
+    compile_time_s: float = 0.0
     error: str | None = None
 
 
@@ -895,7 +937,26 @@ def run_kernel_inner(name: str) -> KernelResult:
 
         for label, args in shapes:
             print(f"  Shape {label}:", file=sys.stderr)
+            # Hoist outside the try so the except path can read whatever the
+            # first-call wrapper captured (e.g. accuracy mismatch raised after
+            # autotune+codegen completed) instead of falling back to 0.0.
+            ct_holder: list[float] = []
             try:
+                # Reset every Helion kernel in `mod` so this shape autotunes
+                # cold. Mirrors benchmarks/run.py:1273-1287. Without it, a
+                # persistent LocalAutotuneCache (~/.cache/helion) on rerun-
+                # capable runners would short-circuit autotune on the second
+                # nightly and the captured helion_compile_time_s would
+                # collapse to a cache-hit cost.
+                for attr_name in dir(mod):
+                    attr = getattr(mod, attr_name)
+                    if isinstance(attr, _HelionKernel):
+                        attr.reset()
+                        if os.environ.get("HELION_AUTOTUNE_EFFORT", "") != "none":
+                            if not attr.configs:
+                                attr.settings.force_autotune = True
+                            attr.settings.static_shapes = True
+
                 # Build baselines dict. "torch" is the default kDefault path
                 # (lazy-eager); "torch_compile" runs the same baseline through
                 # torch.compile(backend="tpu") which uses kDeferAll / full graph.
@@ -916,9 +977,22 @@ def run_kernel_inner(name: str) -> KernelResult:
                             file=sys.stderr,
                         )
 
+                # Wrap kernel_fn so the helion compile-time tracker is reset
+                # and read around the FIRST kernel invocation only — matching
+                # benchmarks/run.py's `timed_callable` shape. Without this
+                # gating, the tracker would also accumulate per-iteration
+                # `Kernel.bind` cache-hit time across run_example's warmup
+                # and bench loop, slightly inflating the reported value.
+                # Returns 0.0 unless HELION_MEASURE_COMPILE_TIME=1 is set
+                # (then the tracker is a no-op anyway).
+                kernel_fn_timed = _wrap_first_call_compile_time(kernel_fn, ct_holder)
                 timings = run_example(
-                    kernel_fn, baselines, args, max_mismatch_pct=max_mismatch_pct
+                    kernel_fn_timed,
+                    baselines,
+                    args,
+                    max_mismatch_pct=max_mismatch_pct,
                 )
+                compile_time_s = ct_holder[0] if ct_holder else 0.0
                 kernel_ms = timings.get("helion", 0.0)
                 baseline_ms = timings.get("torch", 0.0)
                 compile_baseline_ms = timings.get("torch_compile", 0.0)
@@ -937,12 +1011,22 @@ def run_kernel_inner(name: str) -> KernelResult:
                         compile_baseline_time_ms=compile_baseline_ms,
                         speedup=speedup,
                         compile_vs_default=compile_vs_default,
+                        compile_time_s=compile_time_s,
                     )
                 )
             except Exception as e:
                 print(f"    FAIL: {e}", file=sys.stderr)
+                # If the first-call wrapper had time to capture before raising
+                # (autotune+codegen finished, but e.g. accuracy check failed),
+                # preserve that value. Otherwise it stays 0.0 and write_results_json
+                # only emits helion_compile_time_s if HELION_MEASURE_COMPILE_TIME=1.
                 shape_results.append(
-                    ShapeResult(shape=label, passed=False, error=str(e))
+                    ShapeResult(
+                        shape=label,
+                        passed=False,
+                        error=str(e),
+                        compile_time_s=ct_holder[0] if ct_holder else 0.0,
+                    )
                 )
                 all_passed = False
 
@@ -967,6 +1051,13 @@ def write_results_json(output: str, results: list[KernelResult]) -> None:
     """
     device = "TPU v7"
     records: list[dict[str, Any]] = []
+    # helion._compile_time is a no-op unless HELION_MEASURE_COMPILE_TIME=1 is
+    # set. Read the env directly here rather than introspecting the tracker —
+    # makes the gate self-contained and explicit. We only emit
+    # helion_compile_time_s when timing was actually captured; otherwise
+    # ad-hoc local runs would publish [0.0, ...] which the dashboard would
+    # render as "0s compile time" rather than absent data.
+    compile_time_measured = os.environ.get("HELION_MEASURE_COMPILE_TIME", "0") == "1"
 
     def add_metric(
         kernel: str, metric_name: str, shapes: list[str], values: list[float]
@@ -1035,6 +1126,13 @@ def write_results_json(output: str, results: list[KernelResult]) -> None:
             shapes,
             [sr.compile_vs_default for sr in result.shape_results],
         )
+        if compile_time_measured:
+            add_metric(
+                result.name,
+                "helion_compile_time_s",
+                shapes,
+                [sr.compile_time_s for sr in result.shape_results],
+            )
 
     if os.path.exists(output):
         try:

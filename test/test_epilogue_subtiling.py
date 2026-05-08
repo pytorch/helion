@@ -14,6 +14,7 @@ from helion._testing import skipIfRefEager
 from helion._testing import skipIfXPU
 from helion.autotuner.config_fragment import EnumFragment
 import helion.language as hl
+from helion.runtime.settings import _get_backend
 
 
 def _supports_epilogue_subtile_autotune() -> bool:
@@ -21,6 +22,25 @@ def _supports_epilogue_subtile_autotune() -> bool:
         10,
         0,
     )
+
+
+def _assert_split_codegen(test_case: TestCase, code: str, store_count: int) -> None:
+    if _get_backend() == "cute":
+        test_case.assertIn("split_smem", code)
+        test_case.assertEqual(code.count(".store("), store_count)
+        return
+
+    test_case.assertIn("tl.split", code)
+    test_case.assertEqual(code.count("tl.store("), store_count)
+    test_case.assertNotIn("tl.join", code)
+
+
+def _assert_no_split_codegen(test_case: TestCase, code: str) -> None:
+    if _get_backend() == "cute":
+        test_case.assertNotIn("split_smem", code)
+        return
+
+    test_case.assertNotIn("tl.split", code)
 
 
 @helion.kernel
@@ -68,11 +88,11 @@ def matmul_with_cast(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     return out
 
 
-@onlyBackends(["triton"])
+@onlyBackends(["triton", "cute"])
 class TestEpilogueSubtiling(TestCase):
-    @skipIfRefEager("test checks generated Triton code")
+    @skipIfRefEager("test checks generated backend code")
     def test_codegen_s2(self):
-        """S=2 produces tl.split and 2 stores for both bias-add and cast epilogues."""
+        """S=2 produces backend split code and 2 stores for bias/cast epilogues."""
         bias_args = (
             torch.randn([128, 128], device=DEVICE, dtype=torch.float32),
             torch.randn([128, 128], device=DEVICE, dtype=torch.float32),
@@ -84,9 +104,7 @@ class TestEpilogueSubtiling(TestCase):
         torch.testing.assert_close(
             output, bias_args[0] @ bias_args[1] + bias_args[2], atol=1e-1, rtol=1e-2
         )
-        self.assertIn("tl.split", code)
-        self.assertEqual(code.count("tl.store("), 2)
-        self.assertNotIn("tl.join", code)
+        _assert_split_codegen(self, code, 2)
 
         cast_args = (
             torch.randn([128, 128], device=DEVICE, dtype=torch.float32),
@@ -101,12 +119,11 @@ class TestEpilogueSubtiling(TestCase):
             atol=1e-1,
             rtol=1e-2,
         )
-        self.assertIn("tl.split", code)
-        self.assertEqual(code.count("tl.store("), 2)
+        _assert_split_codegen(self, code, 2)
 
-    @skipIfRefEager("test checks generated Triton code")
+    @skipIfRefEager("test checks generated backend code")
     def test_codegen_s4(self):
-        """S=4 produces multiple tl.split calls and 4 stores."""
+        """S=4 produces multiple backend split steps and 4 stores."""
         bias_args = (
             torch.randn([128, 128], device=DEVICE, dtype=torch.float32),
             torch.randn([128, 128], device=DEVICE, dtype=torch.float32),
@@ -118,9 +135,7 @@ class TestEpilogueSubtiling(TestCase):
         torch.testing.assert_close(
             output, bias_args[0] @ bias_args[1] + bias_args[2], atol=1e-1, rtol=1e-2
         )
-        self.assertGreater(code.count("tl.split"), 1)
-        self.assertEqual(code.count("tl.store("), 4)
-        self.assertNotIn("tl.join", code)
+        _assert_split_codegen(self, code, 4)
 
         cast_args = (
             torch.randn([128, 128], device=DEVICE, dtype=torch.float32),
@@ -135,8 +150,7 @@ class TestEpilogueSubtiling(TestCase):
             atol=1e-1,
             rtol=1e-2,
         )
-        self.assertGreater(code.count("tl.split"), 1)
-        self.assertEqual(code.count("tl.store("), 4)
+        _assert_split_codegen(self, code, 4)
 
     def test_disabled_by_default(self):
         args = (
@@ -145,9 +159,9 @@ class TestEpilogueSubtiling(TestCase):
         )
         code, output = code_and_output(matmul_simple, args, block_sizes=[64, 64, 64])
         torch.testing.assert_close(output, args[0] @ args[1], atol=1e-1, rtol=1e-2)
-        self.assertNotIn("tl.split", code)
+        _assert_no_split_codegen(self, code)
 
-    @skipIfRefEager("test checks generated Triton code")
+    @skipIfRefEager("test checks generated backend code")
     def test_bool_true_normalizes_to_s2(self):
         args = (
             torch.randn([128, 128], device=DEVICE, dtype=torch.float32),
@@ -160,7 +174,7 @@ class TestEpilogueSubtiling(TestCase):
         torch.testing.assert_close(
             output, args[0] @ args[1] + args[2], atol=1e-1, rtol=1e-2
         )
-        self.assertIn("tl.split", code)
+        _assert_split_codegen(self, code, 2)
 
     def test_numerical_correctness_s2_vs_s4(self):
         args = (

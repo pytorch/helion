@@ -702,7 +702,7 @@ function renderCompare(baseRunIdOverride, cmpRunIdOverride, baseBranchOverride, 
   allBranches.forEach(b => { html += `<option value="${b}"${b === baseBranch ? ' selected' : ''}>${escHtml(b)}</option>`; });
   html += '</select>';
   html += '<select id="cmp-base-commit">';
-  baseRuns.forEach(r => { html += `<option value="${r.run_id}"${r.run_id === baseRunId ? ' selected' : ''}>${r.sha} (${formatDate(r.date)})</option>`; });
+  baseRuns.forEach(r => { html += `<option value="${r.run_id}"${r.run_id === baseRunId ? ' selected' : ''}>${r.sha} (${formatDate(r.date)})${r.is_nightly ? '' : ' [manual]'}</option>`; });
   html += '</select>';
   html += baseRun ? `<div class="run-link">Run: <a href="${runUrl(baseRun.run_id)}" target="_blank">#${baseRun.run_id}</a></div>` : '';
   html += '</div>';
@@ -711,7 +711,7 @@ function renderCompare(baseRunIdOverride, cmpRunIdOverride, baseBranchOverride, 
   allBranches.forEach(b => { html += `<option value="${b}"${b === cmpBranch ? ' selected' : ''}>${escHtml(b)}</option>`; });
   html += '</select>';
   html += '<select id="cmp-compare-commit">';
-  cmpRuns.forEach(r => { html += `<option value="${r.run_id}"${r.run_id === cmpRunId ? ' selected' : ''}>${r.sha} (${formatDate(r.date)})</option>`; });
+  cmpRuns.forEach(r => { html += `<option value="${r.run_id}"${r.run_id === cmpRunId ? ' selected' : ''}>${r.sha} (${formatDate(r.date)})${r.is_nightly ? '' : ' [manual]'}</option>`; });
   html += '</select>';
   html += cmpRun ? `<div class="run-link">Run: <a href="${runUrl(cmpRun.run_id)}" target="_blank">#${cmpRun.run_id}</a></div>` : '';
   html += '</div></div>';

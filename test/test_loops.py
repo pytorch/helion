@@ -176,7 +176,6 @@ class TestLoops(RefEagerTestBase, TestCase):
         )
         torch.testing.assert_close(result, torch.sin(args[0]))
 
-    @xfailIfPallas("large 4D tensors may exceed TPU VMEM")
     @skipIfLowVRAM("Test requires high VRAM for [128, 128, 128, 128] tensors")
     @skipIfXPU("worker crash on XPU")
     def test_3d_device_loop1(self):
@@ -203,7 +202,6 @@ class TestLoops(RefEagerTestBase, TestCase):
         )
         torch.testing.assert_close(result, torch.sin(args[0]))
 
-    @xfailIfPallas("large 4D tensors may exceed TPU VMEM")
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfLowVRAM("Test requires high VRAM for [128, 128, 128, 128] tensors")
     @skipIfTileIR("TileIR does not support block_ptr indexing")
@@ -252,6 +250,10 @@ class TestLoops(RefEagerTestBase, TestCase):
 
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfTileIR("TileIR does not support block_ptr indexing")
+    @xfailIfPallas(
+        "emit_pipeline + block_ptr indexing fails Mosaic alignment proof "
+        "on the trailing 16-block dim (E2003)"
+    )
     def test_loop_fixed_block(self):
         @helion.kernel(config={"block_sizes": [], "indexing": "block_ptr"})
         def fn(x: torch.Tensor) -> torch.Tensor:

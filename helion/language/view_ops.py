@@ -168,7 +168,7 @@ def _(state: CodegenState) -> list[ast.AST]:
 def _(state: CodegenState) -> list[ast.AST]:
     from .._compiler.ast_extension import statement_from_string
     from .._compiler.cute.cute_reshape import _flat_index_from_coords
-    from .._compiler.cute.cute_reshape import _get_dim_local_coord
+    from .._compiler.cute.cute_reshape import _get_node_dim_local_coord
     from .._compiler.cute.cute_reshape import _get_tile_shape
     from .._compiler.generate_ast import GenerateAST
 
@@ -199,13 +199,15 @@ def _(state: CodegenState) -> list[ast.AST]:
     smem = df.new_var("split_smem")
 
     src_coords = [
-        _get_dim_local_coord(cg, input_val, i) for i in range(len(input_shape))
+        _get_node_dim_local_coord(cg, input_node, input_val, i)
+        for i in range(len(input_shape))
     ]
     src_flat = _flat_index_from_coords(src_coords, input_shape)
 
     if output_shape:
         output_coords = [
-            _get_dim_local_coord(cg, output_val, i) for i in range(len(output_shape))
+            _get_node_dim_local_coord(cg, input_node, output_val, i)
+            for i in range(len(output_shape))
         ]
         out_flat_base = _flat_index_from_coords(output_coords, output_shape)
     else:

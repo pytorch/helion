@@ -117,22 +117,15 @@ jobs:
 
           KERNELS="${{ inputs.kernels }}"
           echo "=========================================="
-          echo "TPU Benchmark: autotuning pass"
+          echo "TPU Benchmark"
           echo "Kernels: $KERNELS"
           echo "=========================================="
 
-          # First pass: autotune (populates cache)
-          python benchmarks/run_tpu.py --kernel "$KERNELS" --num-shapes 2
-
-          # Let TPU cool down
-          sleep 1m
-
-          echo "=========================================="
-          echo "TPU Benchmark: cache-hit verification pass"
-          echo "=========================================="
-
-          # Second pass: verify cache hits and record results
-          HELION_PRINT_OUTPUT_CODE=1 HELION_ASSERT_CACHE_HIT=1 \
+          # Single combined pass — same shape as benchmarks/run.py for GPU.
+          # HELION_MEASURE_COMPILE_TIME=1 has helion's compile-time tracker
+          # capture per-shape autotune+codegen cost; run_example does its own
+          # warmup so post-autotune latency measurements are stable.
+          HELION_PRINT_OUTPUT_CODE=1 HELION_MEASURE_COMPILE_TIME=1 \
             python benchmarks/run_tpu.py \
               --kernel "$KERNELS" \
               --num-shapes 2 \

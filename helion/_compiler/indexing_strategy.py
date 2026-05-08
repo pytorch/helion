@@ -463,38 +463,17 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
         # descriptor so this dimension is last, but support checks are easier
         # to express in the original tensor dimension order.
         env = CompileEnvironment.current()
-        stride_one_dim = None
         element_size = fake_tensor.element_size()
-        for dim in range(fake_tensor.ndim):
-            raw_stride = fake_tensor.stride(dim)
-            if isinstance(raw_stride, (int, sympy.Integer)):
-                stride = raw_stride
-            else:
-                # Symbolic stride: size_hint gives the value from one concrete
-                # shape, but other shapes sharing this BoundKernel may have
-                # different alignment.  Only trust it for the stride==1 check;
-                # reject for the 16-byte alignment check since we cannot prove
-                # it holds for all shapes in the specialization bucket.
-                hint = env.size_hint(raw_stride)
-                if hint == 1:
-                    if stride_one_dim is not None:
-                        return False
-                    stride_one_dim = dim
-                    continue
-                return False
-            if stride == 1:
-                if stride_one_dim is not None:
-                    return False
-                stride_one_dim = dim
-            else:
-                # 3) All other dimensions should have 16-byte aligned strides
-                # so the descriptor remains valid for the whole tensor layout.
-                byte_stride = stride * element_size
-                if byte_stride % 16 != 0:
-                    return False
+        layout_signature = env.tensor_descriptor_layout_signature(fake_tensor)
+        if layout_signature is None:
+            return False
+        stride_one_dim, stride_aligned_dims = layout_signature
         if stride_one_dim is None:
             # There should be exactly one dimension with stride==1
             return False
+        for dim, is_aligned in enumerate(stride_aligned_dims):
+            if dim != stride_one_dim and not is_aligned:
+                return False
 
         def valid_block_size(
             block_size: int | torch.SymInt | None, stride: int | torch.SymInt, idx: int
