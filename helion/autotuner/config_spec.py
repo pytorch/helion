@@ -1685,6 +1685,8 @@ class ConfigSpec:
                     fields["indexing"] = self.indexing
             elif self.supports_config_key("num_threads"):
                 fields["num_threads"] = self.num_threads
+            if self.supports_config_key("grid_foldings"):
+                fields["grid_foldings"] = self.grid_foldings
             fields.update(self.user_defined_tunables)
             return fields
 
