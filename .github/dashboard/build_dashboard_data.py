@@ -83,16 +83,18 @@ def fetch_runs(repo, workflow_name, days):
                 break
             if r.get("conclusion") in ("success", "failure", "cancelled"):
                 # Nightly runs are dispatched by benchmark_nightly.yml's cron via
-                # GITHUB_TOKEN, so triggering_actor is "github-actions[bot]".
-                # Manual user dispatches have the user's login.
-                trigger_login = (r.get("triggering_actor") or {}).get("login", "")
+                # GITHUB_TOKEN, so actor is "github-actions[bot]". Manual user
+                # dispatches have the user's login. Use actor (not triggering_actor):
+                # triggering_actor occasionally returns "pytorch-bot[bot]" on cron
+                # runs, presumably a re-run side effect, which mis-tags them.
+                actor_login = (r.get("actor") or {}).get("login", "")
                 runs.append({
                     "run_id": str(r["id"]),
                     "sha": r["head_sha"][:8],
                     "full_sha": r["head_sha"],
                     "date": r["created_at"],
                     "branch": r.get("head_branch", "main"),
-                    "is_nightly": trigger_login == "github-actions[bot]",
+                    "is_nightly": actor_login == "github-actions[bot]",
                 })
         if past_cutoff:
             break
@@ -281,24 +283,28 @@ def build_dashboard_data(cache_dir, runs_meta, existing_data=None, active_platfo
     for entry in kernel_index.values():
         entry["history"].sort(key=lambda h: h["date"])
 
-    # Global latest nightly run_id — used to detect kernels missing from the
-    # latest benchmark (likely CI infra issue vs. actual kernel crash).
-    # Manual user dispatches are excluded so the Overview reflects only the
-    # scheduled nightly run.
-    latest_nightly_meta = next((r for r in reversed(runs_meta_sorted) if r.get("is_nightly")), None)
+    # Overview only reflects the main-branch nightly cron. Side-branch nightly
+    # workflows (e.g., Benchmark TPU Nightly on yifeixu/tpu-nightly-benchmark)
+    # also pass is_nightly but shouldn't drive the Overview's "Latest Commit"
+    # card or the per-kernel infra-missing classification.
+    is_overview_run = lambda r: r.get("is_nightly") and r.get("branch") == "main"
+
+    # Global latest nightly main run_id — used to detect kernels missing from
+    # the latest benchmark (likely CI infra issue vs. actual kernel crash).
+    latest_nightly_meta = next((r for r in reversed(runs_meta_sorted) if is_overview_run(r)), None)
     latest_nightly_run_id = latest_nightly_meta["run_id"] if latest_nightly_meta else None
 
-    # Build summary (Overview/Speedup tabs) from nightly runs only. Manual
-    # user dispatches still appear in entry["history"] for the Compare tab
-    # but never overwrite Overview perf numbers.
+    # Build summary (Overview/Speedup tabs) from main-branch nightly runs only.
+    # Manual user dispatches and side-branch nightly workflows still appear in
+    # entry["history"] for the Compare tab but never overwrite Overview perf.
     summary = []
     for key, entry in sorted(kernel_index.items()):
-        # Single pass over nightly history: latest_main is the most recent
-        # nightly entry (used for failure classification); latest_data/prev_data
-        # are the most recent with non-zero data (used for perf display and deltas).
+        # Single pass: latest_main is the most recent nightly main entry (used
+        # for failure classification); latest_data/prev_data are the most recent
+        # with non-zero data (used for perf display and deltas).
         latest_main = latest_data = prev_data = None
         for h in reversed(entry["history"]):
-            if not h.get("is_nightly"):
+            if not is_overview_run(h):
                 continue
             if latest_main is None:
                 latest_main = h
@@ -373,8 +379,8 @@ def build_dashboard_data(cache_dir, runs_meta, existing_data=None, active_platfo
     improved = sum(1 for s in nightly_summary if s["status"] == "improved")
     regressed = sum(1 for s in nightly_summary if s["status"] == "regressed")
 
-    nightly_runs = [r for r in runs_meta_sorted if r.get("is_nightly")]
-    latest_nightly_run = nightly_runs[-1] if nightly_runs else {}
+    overview_runs = [r for r in runs_meta_sorted if is_overview_run(r)]
+    latest_nightly_run = overview_runs[-1] if overview_runs else {}
 
     # Drop runs whose artifacts expired and weren't previously cached; otherwise
     # they pad charts with no-data gaps.
