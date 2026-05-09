@@ -26,6 +26,7 @@ from typing import overload
 from typing_extensions import Protocol
 
 import torch
+from torch._dynamo.source import GetItemSource
 from torch._dynamo.source import LocalSource
 from torch._dynamo.source import TensorProperty
 from torch._dynamo.source import TensorPropertySource
@@ -891,6 +892,19 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
 
                     return stride_extractor
                 raise exc.SpecializeArgType(v)
+            if isinstance(v, GetItemSource):
+                if not isinstance(v.index, int) or v.index_is_slice:
+                    raise exc.SpecializeArgType(v)
+                inner = make_extractor(v.base)
+
+                def getitem_extractor(
+                    args: Sequence[object],
+                    _inner: Callable[[Sequence[object]], Hashable] = inner,
+                    _index: int = v.index,
+                ) -> Hashable:
+                    return cast("Sequence[object]", _inner(args))[_index]
+
+                return getitem_extractor
             if isinstance(v, LocalSource):
                 index = arg_name_to_index[v.local_name]
                 return operator.itemgetter(index)
@@ -904,22 +918,25 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             source = self.env.shape_env.var_to_sources[v][0]
             extractors.append(make_extractor(source))
         implicit_config = self._fixed_config_for_td_layout_guards()
-        for local_name, guard in sorted(
-            self.env.tensor_descriptor_layout_guards.items()
+        for source, guard in sorted(
+            self.env.tensor_descriptor_layout_guards.items(),
+            key=lambda item: repr(item[0]),
         ):
             if implicit_config is not None and not _td_layout_guard_active_for_config(
                 guard, implicit_config
             ):
                 continue
-            index = arg_name_to_index[local_name]
+            extract_tensor = make_extractor(source)
 
             def td_layout_extractor(
                 args: Sequence[object],
-                _index: int = index,
+                _extract_tensor: Callable[
+                    [Sequence[object]], Hashable
+                ] = extract_tensor,
                 _ndim: int = guard.ndim,
                 _element_size: int = guard.element_size,
             ) -> Hashable:
-                tensor = cast("torch.Tensor", args[_index])
+                tensor = cast("torch.Tensor", _extract_tensor(args))
                 if tensor.ndim != _ndim:
                     return ("ndim", tensor.ndim)
                 return tensor_descriptor_layout_signature_from_strides(

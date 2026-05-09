@@ -777,6 +777,25 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                 )
         return results
 
+    def _clear_jit_fast_path_caches(self, fn: CompiledConfig) -> None:
+        """Clear Triton JIT fast-path caches for this generated wrapper.
+
+        Without this, tensors passed to the companion Triton JIT function can
+        remain pinned in GPU memory by its _last_call cache across config
+        benchmarks.
+        """
+        try:
+            fn_name = getattr(fn, "__name__", None)
+            fn_globals = getattr(fn, "__globals__", None)
+            if fn_name is None or fn_globals is None:
+                return
+            triton_jit_fn = fn_globals.get(f"_helion_{fn_name}")
+            clear = getattr(triton_jit_fn, "clear_fast_path_caches", None)
+            if clear is not None:
+                clear()
+        except Exception:
+            self.log.debug("Failed to clear Triton JIT fast-path cache.", exc_info=True)
+
     def _benchmark_function(self, config: Config, fn: CompiledConfig) -> float:
         """Benchmark a single compiled function.  Returns time in ms or inf."""
         self._autotune_metrics.num_configs_tested += 1
@@ -955,6 +974,8 @@ class LocalBenchmarkProvider(BenchmarkProvider):
 
             self._autotune_metrics.num_compile_failures += 1
             return inf
+        finally:
+            self._clear_jit_fast_path_caches(fn)
 
     def _benchmark_function_subprocess(
         self, config: Config, fn: CompiledConfig

@@ -206,6 +206,133 @@ class TestAutotuneIgnoreErrors(TestCase):
         self.assertEqual(result, float("inf"))
         warn.assert_not_called()
 
+    def test_clear_jit_fast_path_caches(self):
+        settings = Settings(
+            autotune_precompile=None,
+            autotune_log_level=logging.CRITICAL,
+        )
+        search = self._make_search(settings)
+        calls = []
+
+        class FakeJITFunction:
+            def clear_fast_path_caches(self) -> None:
+                calls.append("cleared")
+
+        def generated_kernel() -> None:
+            return None
+
+        globals_key = f"_helion_{generated_kernel.__name__}"
+        generated_kernel.__globals__[globals_key] = FakeJITFunction()
+        try:
+            search.benchmark_provider._clear_jit_fast_path_caches(generated_kernel)
+        finally:
+            del generated_kernel.__globals__[globals_key]
+
+        self.assertEqual(calls, ["cleared"])
+
+    def test_clear_jit_fast_path_caches_does_not_clear_device_caches(self):
+        settings = Settings(
+            autotune_precompile=None,
+            autotune_log_level=logging.CRITICAL,
+        )
+        search = self._make_search(settings)
+
+        class FakeJITFunction:
+            def __init__(self) -> None:
+                self.device_caches = {"compiled": object()}
+
+            def clear_fast_path_caches(self) -> None:
+                return None
+
+        def generated_kernel() -> None:
+            return None
+
+        jit_fn = FakeJITFunction()
+        device_caches = jit_fn.device_caches
+        globals_key = f"_helion_{generated_kernel.__name__}"
+        generated_kernel.__globals__[globals_key] = jit_fn
+        try:
+            search.benchmark_provider._clear_jit_fast_path_caches(generated_kernel)
+        finally:
+            del generated_kernel.__globals__[globals_key]
+
+        self.assertIs(jit_fn.device_caches, device_caches)
+        self.assertEqual(list(jit_fn.device_caches), ["compiled"])
+
+    def test_clear_jit_fast_path_caches_ignores_cleanup_errors(self):
+        settings = Settings(
+            autotune_precompile=None,
+            autotune_log_level=logging.CRITICAL,
+        )
+        search = self._make_search(settings)
+
+        class FakeJITFunction:
+            def clear_fast_path_caches(self) -> None:
+                raise RuntimeError("cleanup failed")
+
+        def generated_kernel() -> None:
+            return None
+
+        globals_key = f"_helion_{generated_kernel.__name__}"
+        generated_kernel.__globals__[globals_key] = FakeJITFunction()
+        try:
+            search.benchmark_provider._clear_jit_fast_path_caches(generated_kernel)
+        finally:
+            del generated_kernel.__globals__[globals_key]
+
+    def test_benchmark_function_clears_jit_fast_path_caches_on_success(self):
+        settings = Settings(
+            autotune_accuracy_check=False,
+            autotune_precompile=None,
+            autotune_log_level=logging.CRITICAL,
+        )
+        search = self._make_search(settings, args=("arg0",))
+
+        def compiled_fn(*_args):
+            return None
+
+        bench_fn = Mock(return_value=None)
+        search.kernel.env = SimpleNamespace(process_group_name=None)
+        search.kernel.bench_compile_config = Mock(return_value=bench_fn)
+
+        with (
+            patch("torch.accelerator.synchronize", autospec=True) as sync,
+            patch(
+                "helion.autotuner.benchmark_provider.do_bench",
+                return_value=1.25,
+            ),
+            patch.object(
+                search.benchmark_provider, "_clear_jit_fast_path_caches"
+            ) as clear,
+        ):
+            sync.return_value = None
+            result = search.benchmark_provider._benchmark_function("cfg", compiled_fn)
+
+        self.assertEqual(result, 1.25)
+        clear.assert_called_once_with(compiled_fn)
+
+    def test_benchmark_function_clears_jit_fast_path_caches_on_error(self):
+        settings = Settings(
+            autotune_ignore_errors=True,
+            autotune_log_level=logging.CRITICAL,
+        )
+        search = self._make_search(settings)
+
+        def bad_fn(*_args):
+            raise RuntimeError("boom")
+
+        with (
+            patch("torch.accelerator.synchronize", autospec=True) as sync,
+            patch.object(
+                search.benchmark_provider, "_clear_jit_fast_path_caches"
+            ) as clear,
+        ):
+            sync.return_value = None
+            result = search.benchmark_provider._benchmark_function("cfg", bad_fn)
+
+        self.assertEqual(result, float("inf"))
+        clear.assert_called_once_with(bad_fn)
+
     def test_traceback_cleared_str(self):
         """Test that str(e) still has meaningful content after e.__traceback__ = None."""
         settings = Settings(

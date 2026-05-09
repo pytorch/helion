@@ -773,7 +773,6 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
 
     @skipIfTileIR("PassManager::run failed")
-    @skipIfPallas("JAX erf lowering incompatibility with gelu")
     @xfailIfCute(
         "CuTe tcgen05 MMA path does not yet emit indices/masks for the "
         "user-level epilogue write that follows the MMA"
@@ -798,7 +797,6 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
 
     @skipIfTileIR("PassManager::run failed")
-    @skipIfPallas("JAX erf lowering incompatibility with gelu")
     @xfailIfCute(
         "CuTe tcgen05 MMA path does not yet emit indices/masks for the "
         "user-level epilogue write that follows the MMA"
