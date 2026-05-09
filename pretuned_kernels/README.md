@@ -68,7 +68,7 @@ you commit alongside the existing one(s).  Helion picks the right one at
 runtime based on the running GPU's compute capability (with fallback to
 older compatible capabilities, e.g. `sm120` → `sm100`).
 
-See [`docs/aot_autotuning.md`](../docs/aot_autotuning.md) for the
-end-to-end workflow, runner CLI, generated artifacts, and runtime
-fallback rules — including a worked "Pretuning a kernel for new
-hardware" walkthrough.
+See the [Ahead-of-Time (AOT) Heuristic Tuning](../docs/deployment_autotuning.md#ahead-of-time-aot-heuristic-tuning)
+section of `docs/deployment_autotuning.md` for the end-to-end workflow,
+runner CLI, generated artifacts, and runtime fallback rules — including
+a worked "Pretuning a kernel for new hardware" walkthrough.
