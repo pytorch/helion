@@ -38,6 +38,7 @@ from .benchmarking import interleaved_bench
 from .logger import AutotuningLogger
 from .metrics import AutotuneMetrics
 from .metrics import _run_post_autotune_hooks
+from .observed_heuristics import observed_heuristic_seed_configs_for_kernel
 from .precompile_future import PrecompileFuture as PrecompileFuture
 from helion._dist_utils import all_gather_object
 from helion._dist_utils import is_master_rank
@@ -741,27 +742,25 @@ class PopulationBasedSearch(BaseSearch):
 
     def _generate_best_available_population_flat(self) -> list[FlatConfig]:
         """
-        Generate initial population using default config, explicit seed configs,
-        and cached configs.
+        Generate initial population using explicit seed configs, observed
+        heuristic seeds, default fallback, and cached configs.
 
-        Always starts with the default configuration, then adds up to
-        MAX_BEST_AVAILABLE_CONFIGS matching cached configs from previous runs.
-        Explicit seed configs provided by the caller are added ahead of cached
-        configs and are not suppressed by cache-skip settings. No random configs
-        are added. Duplicate configs are discarded.
+        Exact observed heuristic matches replace the default slot. If there are
+        no explicit or observed seeds, the default configuration is used as the
+        fallback. Then up to MAX_BEST_AVAILABLE_CONFIGS matching cached configs
+        from previous runs are added. Explicit seed configs provided by the
+        caller are added ahead of observed heuristic and cached configs and are
+        not suppressed by cache-skip settings.
+        No random configs are added. Duplicate configs are discarded.
 
         Returns:
             A list of unique FlatConfig values for the initial population.
-            Minimum size is 1 (just default), plus any valid unique explicit
-            seed configs and up to autotune_best_available_max_configs cached
-            configs.
+            Minimum size is 1, either from an explicit/observed seed or from the
+            default fallback, plus up to autotune_best_available_max_configs
+            cached configs.
         """
-        # Always start with the default config
-        default_flat = self.config_gen.default_flat()
-        default_config = self.config_gen.unflatten(default_flat)
-        seen: set[Config] = {default_config}
-        result: list[FlatConfig] = [default_flat]
-        self.log("Starting with default config")
+        seen: set[Config] = set()
+        result: list[FlatConfig] = []
 
         for config in self._best_available_seed_configs:
             try:
@@ -774,6 +773,30 @@ class PopulationBasedSearch(BaseSearch):
                 self.log(f"Failed to transfer explicit seed config: {e}")
 
         max_configs = self.settings.autotune_best_available_max_configs
+        observed_configs = observed_heuristic_seed_configs_for_kernel(
+            self.kernel,
+            self.args,
+            config_spec=self.config_spec,
+            max_configs=max_configs,
+        )
+
+        for i, config in enumerate(observed_configs):
+            flat = self.config_gen.flatten(config)
+            transferred_config = self.config_gen.unflatten(flat)
+            if transferred_config not in seen:
+                seen.add(transferred_config)
+                result.append(flat)
+                self.log.debug(
+                    f"Observed heuristic seed config {i + 1}: {transferred_config}"
+                )
+
+        if not result:
+            default_flat = self.config_gen.default_flat()
+            default_config = self.config_gen.unflatten(default_flat)
+            seen.add(default_config)
+            result.append(default_flat)
+            self.log("Starting with default config")
+
         cached_entries = self._find_similar_cached_configs(max_configs)
 
         if cached_entries:

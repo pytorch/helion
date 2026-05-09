@@ -120,6 +120,7 @@ packages = ["helion"]
 include = [
   "helion/**/*.py",
   "helion/**/*.pyi",
+  "helion/**/*.json",
   "LICENSE",
 ]
 exclude = [

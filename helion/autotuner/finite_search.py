@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING
 
 from .. import exc
 from .base_search import BaseSearch
+from .observed_heuristics import observed_heuristic_seed_configs_for_kernel
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -71,8 +72,15 @@ class CachedFiniteSearch(FiniteSearch):
             if max_configs is not None
             else self.settings.autotune_best_available_max_configs
         )
+        observed = observed_heuristic_seed_configs_for_kernel(
+            kernel,
+            args,
+            config_spec=self.config_spec,
+            max_configs=cap,
+        )
         cached: list[Config] = []
-        for i, entry in enumerate(self._find_similar_cached_configs(cap)):
+        cached_cap = max(0, cap - len(observed))
+        for i, entry in enumerate(self._find_similar_cached_configs(cached_cap)):
             try:
                 cached.append(self.config_gen.unflatten(entry.to_mutable_flat_config()))
             except (
@@ -83,8 +91,11 @@ class CachedFiniteSearch(FiniteSearch):
                 exc.InvalidConfig,
             ) as e:
                 self.log(f"from_cache: failed to transfer cached config {i + 1}: {e}")
-        self.log(f"from_cache: resolved {len(cached)} cached config(s) (cap={cap})")
-        self.configs: list[Config] = [*cached, *list(configs)]
+        self.log(
+            f"from_cache: resolved {len(observed)} observed config(s) "
+            f"and {len(cached)} cached config(s) (cap={cap})"
+        )
+        self.configs: list[Config] = [*observed, *cached, *list(configs)]
         if len(self.configs) < 2:
             raise exc.NotEnoughConfigs(len(self.configs))
 

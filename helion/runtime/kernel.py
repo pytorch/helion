@@ -51,6 +51,7 @@ from .._dist_utils import check_config_consistancy as dist_check_config_consista
 from .._logging import LazyString
 from .._utils import counters
 from ..autotuner.base_search import _AutotunableKernel
+from ..autotuner.observed_heuristics import observed_heuristic_default_config
 from ..language.constexpr import ConstExpr
 from .config import Config
 from .ref_mode import RefModeContext
@@ -873,7 +874,22 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             extractors.append(make_extractor(source))
         return extractors
 
-    def _user_provided_config(self) -> Config | None:
+    def _observed_heuristic_config(
+        self, args: Sequence[object] | None = None
+    ) -> Config | None:
+        # Some codegen paths ask for an implicit config before real runtime args
+        # are available; fake_args carry the same specialized shape/dtype data.
+        runtime_args = args if args is not None else self.fake_args
+
+        return observed_heuristic_default_config(
+            self,
+            runtime_args,
+            config_spec=self.config_spec,
+        )
+
+    def _user_provided_config(
+        self, args: Sequence[object] | None = None
+    ) -> Config | None:
         """Return a config if the user explicitly provided one, else None.
 
         Checks the kernel's config list and settings to determine if
@@ -885,29 +901,35 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         if len(configs) == 1:
             return configs[0]
         if len(configs) == 0 and self.kernel.settings.autotune_effort == "none":
-            config = self.config_spec.default_config()
+            config_source = "observed heuristic"
+            config = self._observed_heuristic_config(args)
+            if config is None:
+                config_source = "default"
+                config = self.config_spec.default_config()
             if not is_ref_mode_enabled(self.kernel.settings):
                 kernel_decorator = self.format_kernel_decorator(config, self.settings)
                 print(
-                    f"Using default config: {kernel_decorator}",
+                    f"Using {config_source} config: {kernel_decorator}",
                     file=sys.stderr,
                 )
             return config
         return None
 
-    def _implicit_config(self) -> Config | None:
+    def _implicit_config(self, args: Sequence[object] | None = None) -> Config | None:
         """
         Returns a single config that is implicitly used by this kernel, if any.
         """
         if self._config is not None:
             return self._config
-        return self._user_provided_config()
+        return self._user_provided_config(args)
 
-    def _require_implicit_config(self) -> Config:
+    def _require_implicit_config(
+        self, args: Sequence[object] | None = None
+    ) -> Config:
         """
         Returns the implicit config for this kernel, or raises an error if no implicit config is available.
         """
-        if (config := self._implicit_config()) is None:
+        if (config := self._implicit_config(args)) is None:
             raise RuntimeError("no config provided and no implicit config available")
         return config
 
@@ -920,7 +942,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         """
         if self._config is not None:
             return  # Already have a config
-        if (config := self._implicit_config()) is not None:
+        if (config := self._implicit_config(args)) is not None:
             with measure("BoundKernel.set_config"):
                 self.set_config(config)
         else:
@@ -954,7 +976,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         """
         if self._run is None:
             if is_ref_mode_enabled(self.kernel.settings):
-                if (config := self._implicit_config()) is not None:
+                if (config := self._implicit_config(args)) is not None:
                     self._config = config
                 return self.run_ref(*args)
             self.ensure_config_exists(args)

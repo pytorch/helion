@@ -5,8 +5,8 @@ High-level flow:
    config so the first LLM call sees both the workload description and the
    available tuning knobs.
 2. Round 0 launches the first LLM call immediately, then benchmarks the
-   default config plus a few random seed configs while that request is in
-   flight.
+   default config plus observed heuristic and random seed configs while that
+   request is in flight.
 3. When the round-0 LLM response arrives, the search benchmarks its new unique
    configs and folds those results into the running set of top configs.
 4. The top configs are then rebenchmarked before the next prompt is built, so each
@@ -60,6 +60,7 @@ from .llm.prompting import build_system_prompt
 from .llm.transport import DEFAULT_REQUEST_TIMEOUT_S
 from .llm.transport import call_provider as _call_provider
 from .llm.transport import infer_provider as _infer_provider
+from .observed_heuristics import observed_heuristic_seed_configs_for_kernel
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -364,10 +365,33 @@ class LLMGuidedSearch(PopulationBasedSearch):
         ]
 
     def _build_seed_configs(self) -> list[Config]:
-        """Build the initial benchmark set: default plus a few random seeds."""
-        # Start from default and add only distinct random configs that unflatten cleanly.
-        seed_configs: list[Config] = [self.config_spec.default_config()]
-        seen_config_keys = {self._config_key(seed_configs[0])}
+        """Build the initial benchmark set: observed/default seed, then random seeds."""
+        # Exact observed heuristic matches replace the default slot. Unsupported
+        # kernels keep the old default-plus-random seed behavior.
+        target_count = 1 + self.initial_random_configs
+        seed_configs: list[Config] = []
+        seen_config_keys: set[str] = set()
+
+        heuristic_configs = observed_heuristic_seed_configs_for_kernel(
+            self.kernel,
+            self.args,
+            config_spec=self.config_spec,
+            max_configs=target_count,
+        )
+        for cfg in heuristic_configs:
+            key = self._config_key(cfg)
+            if key in seen_config_keys:
+                continue
+            seen_config_keys.add(key)
+            seed_configs.append(cfg)
+            if len(seed_configs) >= target_count:
+                return seed_configs
+
+        if not seed_configs:
+            default_config = self.config_spec.default_config()
+            seed_configs.append(default_config)
+            seen_config_keys.add(self._config_key(default_config))
+
         for flat in self.config_gen.random_population_flat(
             self.initial_random_configs + 1
         )[1:]:
@@ -380,13 +404,15 @@ class LLMGuidedSearch(PopulationBasedSearch):
                 continue
             seen_config_keys.add(key)
             seed_configs.append(cfg)
+            if len(seed_configs) >= target_count:
+                break
         return seed_configs
 
     def _dedupe_new_configs(
         self, configs: list[Config], seen_config_keys: set[str]
     ) -> list[Config]:
         """Filter out configs that have already been seen in earlier rounds."""
-        # Drop configs that were already benchmarked or queued in prior rounds.
+        # Drop configs that were already benchmarked or queued in earlier rounds.
         new_configs: list[Config] = []
         for cfg in configs:
             key = self._config_key(cfg)
@@ -531,14 +557,12 @@ class LLMGuidedSearch(PopulationBasedSearch):
     def _run_initial_round(self, state: _SearchLoopState) -> None:
         """Run round 0 by overlapping the initial LLM request with seed benchmarking."""
         # Launch the first request before benchmarking because round 0 does not need
-        # any prior search feedback to build its prompt.
+        # any search feedback to build its prompt.
         seed_configs = self._build_seed_configs()
         state.seen_config_keys.update(self._config_key(cfg) for cfg in seed_configs)
-
         self.log(
             f"Round 0: starting initial LLM call while benchmarking "
-            f"{len(seed_configs)} seed configs (1 default + "
-            f"{max(0, len(seed_configs) - 1)} random)"
+            f"{len(seed_configs)} seed configs"
         )
 
         llm_future: concurrent.futures.Future[str] | None = None
@@ -546,7 +570,8 @@ class LLMGuidedSearch(PopulationBasedSearch):
             llm_future = self._call_llm_async(self._build_llm_messages())
         except Exception:
             self.log.warning(
-                "Round 0: could not start initial LLM call, continuing with seed configs"
+                "Round 0: could not start initial LLM call, continuing with "
+                "seed configs"
             )
 
         if seed_configs:
@@ -573,7 +598,7 @@ class LLMGuidedSearch(PopulationBasedSearch):
 
     def _run_refinement_round(self, round_num: int, state: _SearchLoopState) -> bool:
         """Run one post-seed refinement round and report whether search should stop."""
-        # Build the next prompt from the stabilized prior round, then benchmark new configs.
+        # Build the next prompt from the stabilized search round, then benchmark new configs.
         prompt = self._build_refinement_prompt(round_num)
         try:
             llm_response = self._call_llm(self._build_llm_messages(prompt))

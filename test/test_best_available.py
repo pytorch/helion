@@ -987,9 +987,13 @@ class TestGenerateBestAvailablePopulation(unittest.TestCase):
                 )
         mock_search = MagicMock()
         mock_search.config_gen = config_gen
+        mock_search.config_spec = config_gen.config_spec
+        mock_search.kernel = MagicMock()
+        mock_search.args = ()
         mock_search.settings = Settings()
         mock_search.log = MagicMock()
         mock_search.log.debug = MagicMock()
+        mock_search._best_available_seed_configs = []
         mock_search._find_similar_cached_configs = MagicMock(return_value=entries)
         return mock_search
 
@@ -1024,6 +1028,26 @@ class TestGenerateBestAvailablePopulation(unittest.TestCase):
         num_warps_idx = config_gen._key_to_flat_indices["num_warps"][0][0]
         self.assertEqual(result[1][num_warps_idx], 8)
         self.assertEqual(result[2][num_warps_idx], 2)
+
+    def test_observed_heuristic_configs_replace_default_slot_before_cache(self):
+        """Observed heuristic seeds replace default and run before cache."""
+        config_gen = self._make_config_gen()
+        observed = [Config(block_sizes=[32, 64], num_warps=8, num_stages=2)]
+        cached = [Config(block_sizes=[128, 256], num_warps=2, num_stages=4)]
+        mock_search = self._make_mock_search(config_gen, cached)
+
+        with patch(
+            "helion.autotuner.base_search.observed_heuristic_seed_configs_for_kernel",
+            return_value=observed,
+        ):
+            result = PopulationBasedSearch._generate_best_available_population_flat(
+                mock_search
+            )
+
+        self.assertEqual(len(result), 2)
+        num_warps_idx = config_gen._key_to_flat_indices["num_warps"][0][0]
+        self.assertEqual(result[0][num_warps_idx], 8)
+        self.assertEqual(result[1][num_warps_idx], 2)
 
     def test_duplicate_configs_deduplicated(self):
         """Duplicate cached configs are discarded."""

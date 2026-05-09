@@ -5,12 +5,12 @@ from __future__ import annotations
 import textwrap
 from typing import TYPE_CHECKING
 
+from ..workload import detect_workload_traits
 from .configs import describe_config_space
 from .feedback import MAX_CHANGED_FIELDS_PER_CONFIG
 from .feedback import format_config_for_prompt
 from .workload import compute_workload_hints
 from .workload import describe_kernel
-from .workload import detect_workload_traits
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
