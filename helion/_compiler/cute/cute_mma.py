@@ -44,7 +44,12 @@ from .layout import MatmulExecutionKind
 from .layout import MatmulExecutionPlan
 from .matmul_utils import analyze_direct_grouped_n_loads
 from .mma_support import get_cute_mma_support
+from .strategies import TCGEN05_LEGAL_SMEM_SWIZZLE_BYTES
 from .strategies import Tcgen05PersistenceModel
+from .strategies import l2_swizzle_size_from_config
+from .strategies import layout_overrides_from_config
+from .strategies import smem_swizzle_min_major_mode_bytes
+from .strategies import tcgen05_smem_layout_expr
 from .strategies import warp_spec_from_config
 from .tcgen05_constants import TCGEN05_AB_CONSUMER_PHASE_MODE_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_AB_CONSUMER_PHASE_MODE_NORMAL
@@ -2165,11 +2170,47 @@ def _emit_mma_pipeline(
     tcgen05_epi_warp_count_value = 0
     tcgen05_tmem_barrier_thread_count_value = 0
     tcgen05_acc_consumer_arrive_count_value = 0
+    # Layout-override values are read by separate later
+    # ``if mma_impl == "tcgen05":`` blocks (the function has multiple
+    # gated emission sites). Initialize to ``None`` outside the
+    # branch so pyrefly's flow analysis sees a definition along every
+    # control path; the values are pulled from the active config
+    # below when the branch is entered.
+    tcgen05_smem_swizzle_a: int | None = None
+    tcgen05_smem_swizzle_b: int | None = None
     if mma_impl == "tcgen05":
         # Use ``warp_spec.ab_load_warps`` so the strategy data model
         # stays the source of truth for warp role IDs; ``epi_warps``
         # flows the same way via ``_tcgen05_epi_warp_count`` below.
         tcgen05_warp_spec = warp_spec_from_config(df.config)
+        # Pull swizzle overrides off the config and validate the
+        # bytes-per-row contract before constructing the matmul plan
+        # so a bad config raises ``BackendUnsupported`` here rather
+        # than silently inducing a CuTe ``ValueError`` at atom-build
+        # time. ``layout_overrides_from_config`` returns ``None`` for
+        # absent keys, which preserves the no-override byte-identity
+        # path.
+        _tcgen05_layout_overrides = layout_overrides_from_config(df.config)
+        tcgen05_smem_swizzle_a = _tcgen05_layout_overrides.smem_swizzle_a
+        tcgen05_smem_swizzle_b = _tcgen05_layout_overrides.smem_swizzle_b
+        if tcgen05_smem_swizzle_a is not None:
+            _validate_tcgen05_smem_swizzle_override(
+                operand="a",
+                swizzle_bytes=tcgen05_smem_swizzle_a,
+                bm=bm,
+                bn=bn,
+                bk=bk,
+                input_dtype=input_dtype,
+            )
+        if tcgen05_smem_swizzle_b is not None:
+            _validate_tcgen05_smem_swizzle_override(
+                operand="b",
+                swizzle_bytes=tcgen05_smem_swizzle_b,
+                bm=bm,
+                bn=bn,
+                bk=bk,
+                input_dtype=input_dtype,
+            )
         tcgen05_epi_warp_count_value = _tcgen05_epi_warp_count(
             tcgen05_warp_spec, cta_thread_count=tcgen05_cta_thread_count
         )
@@ -2215,6 +2256,15 @@ def _emit_mma_pipeline(
             "Tcgen05PersistenceModel enum's .value); got "
             f"{type(tcgen05_persistence_model_str).__name__}"
         )
+        # ``tcgen05_l2_swizzle_size``: L2 tile-scheduler grouping factor
+        # (Quack ``max_swizzle_size`` equivalent). Default 1 keeps the
+        # cycle 41 byte-identity path; concrete values flow into the
+        # ``cutlass.utils.PersistentTileSchedulerParams(swizzle_size=...)``
+        # kwarg at every prelude site in ``program_id.py``. The value
+        # is validated upstream by ``ConfigSpec.normalize`` against
+        # ``TCGEN05_LEGAL_L2_SWIZZLE_SIZES`` so it is always a positive
+        # integer here.
+        tcgen05_l2_swizzle_size_value = l2_swizzle_size_from_config(df.config)
         tcgen05_matmul_plan = CuteTcgen05MatmulPlan(
             bm=bm,
             bn=bn,
@@ -2237,6 +2287,7 @@ def _emit_mma_pipeline(
             sched_stage_count=tcgen05_sched_stage_count_value,
             persistence_model=tcgen05_persistence_model_str,
             cluster_n=tcgen05_cluster_n,
+            l2_swizzle_size=tcgen05_l2_swizzle_size_value,
         )
         assert tcgen05_plan is not None
         tcgen05_mma_owner_active = _tcgen05_two_cta_owner_predicate(
@@ -2479,6 +2530,8 @@ def _emit_mma_pipeline(
                 input_dtype_str=input_dtype_str,
                 acc_dtype_str=acc_dtype_str,
                 epi_elem_dtype_str=epi_elem_dtype_str,
+                smem_swizzle_a=tcgen05_smem_swizzle_a,
+                smem_swizzle_b=tcgen05_smem_swizzle_b,
             )
         )
         prefix.append(
@@ -2760,6 +2813,17 @@ def _emit_mma_pipeline(
                 "acc_dtype": acc_dtype_str,
                 "kernel_args": [tma_atom_a, tma_tensor_a, tma_atom_b, tma_tensor_b],
             }
+            # ``smem_swizzle_*`` overrides are recorded only when the
+            # user opts in. Keeping the keys absent on the default path
+            # preserves the no-override wrapper-plan literal so
+            # byte-identity with the canonical 4096³ seed holds. The
+            # wrapper-side ``_append_cute_wrapper_plan`` reads
+            # ``plan.get(..., None)`` and emits the override-aware SMEM
+            # atom expression only when an explicit value is present.
+            if tcgen05_smem_swizzle_a is not None:
+                ab_tma_plan["smem_swizzle_a"] = tcgen05_smem_swizzle_a
+            if tcgen05_smem_swizzle_b is not None:
+                ab_tma_plan["smem_swizzle_b"] = tcgen05_smem_swizzle_b
             # G2-H (cute_plan.md): CLC kernels need PDL enabled at
             # the host launch so ``nvvm.clusterlaunchcontrol_try_cancel``
             # returns valid responses (without PDL the very first
@@ -4109,6 +4173,8 @@ def _make_tcgen05_layout_plan_setup(
     input_dtype_str: str,
     acc_dtype_str: str,
     epi_elem_dtype_str: str | None = None,
+    smem_swizzle_a: int | None = None,
+    smem_swizzle_b: int | None = None,
 ) -> list[ast.AST]:
     # `compute_epilogue_tile_shape` must receive `elem_ty_d` and `elem_ty_c`
     # equal to the eventual D-output dtype so the helper takes the
@@ -4125,11 +4191,11 @@ def _make_tcgen05_layout_plan_setup(
     return [
         statement_from_string(
             f"{plan.smem_a_layout} = "
-            f"{_tcgen05_smem_layout_expr(tiled_mma, bm, bn, bk, input_dtype_str, ab_stage_count, operand='a')}"
+            f"{tcgen05_smem_layout_expr(tiled_mma=tiled_mma, bm=bm, bn=bn, bk=bk, dtype_str=input_dtype_str, num_stages=ab_stage_count, operand='a', swizzle_override=smem_swizzle_a)}"
         ),
         statement_from_string(
             f"{plan.smem_b_layout} = "
-            f"{_tcgen05_smem_layout_expr(tiled_mma, bm, bn, bk, input_dtype_str, ab_stage_count, operand='b')}"
+            f"{tcgen05_smem_layout_expr(tiled_mma=tiled_mma, bm=bm, bn=bn, bk=bk, dtype_str=input_dtype_str, num_stages=ab_stage_count, operand='b', swizzle_override=smem_swizzle_b)}"
         ),
         statement_from_string(
             f"{plan.c_layout} = cutlass.utils.layout.LayoutEnum.ROW_MAJOR"
@@ -4367,26 +4433,68 @@ def _tcgen05_epilogue_dest_expr(plan: _Tcgen05LayoutPlan, tensor: str) -> str:
     return f"cute.make_tensor({tensor}.iterator, {planned_layout})"
 
 
-def _tcgen05_smem_layout_expr(
-    tiled_mma: str,
+def _validate_tcgen05_smem_swizzle_override(
+    *,
+    operand: str,
+    swizzle_bytes: int,
     bm: int,
     bn: int,
     bk: int,
-    dtype_str: str,
-    num_stages: int,
-    *,
-    operand: str,
-) -> str:
-    if operand == "a":
-        return (
-            "cutlass.utils.blackwell_helpers.make_smem_layout_a("
-            f"{tiled_mma}, ({bm}, {bn}, {bk}), {dtype_str}, {num_stages})"
-        )
-    assert operand == "b"
-    return (
-        "cutlass.utils.blackwell_helpers.make_smem_layout_b("
-        f"{tiled_mma}, ({bm}, {bn}, {bk}), {dtype_str}, {num_stages})"
+    input_dtype: torch.dtype,
+) -> None:
+    """Reject illegal ``smem_swizzle_a/b`` overrides at codegen time.
+
+    CuTe's ``make_smem_layout_atom`` requires the major-mode bytes-per-row
+    to be a multiple of the swizzle pattern's contiguous bytes. For
+    Helion's tcgen05 lowering:
+
+    - A is K-major: major-mode = K dimension; bytes-per-row =
+      ``bk * dtype_width_bits / 8``.
+    - B is MN-major: major-mode = N dimension; bytes-per-row =
+      ``bn * dtype_width_bits / 8``.
+
+    This helper computes the active bytes-per-row from the live tile
+    shape + dtype and rejects swizzle overrides that violate the atom
+    contract with a structured ``BackendUnsupported`` error so the
+    autotune surface drops the bad config rather than crashing inside
+    CuTe at runtime.
+
+    Caller has already verified ``swizzle_bytes`` is a member of
+    ``TCGEN05_LEGAL_SMEM_SWIZZLE_BYTES`` (the data-model validator
+    in ``strategies.validate_tcgen05_strategy_invariants`` does that).
+    Here we layer the *contract* check (does the active tile fit the
+    requested swizzle?) on top of the *value* check.
+    """
+    assert swizzle_bytes in TCGEN05_LEGAL_SMEM_SWIZZLE_BYTES, (
+        f"_validate_tcgen05_smem_swizzle_override: invalid swizzle byte "
+        f"{swizzle_bytes!r}; expected one of {TCGEN05_LEGAL_SMEM_SWIZZLE_BYTES!r}"
     )
+    # ``torch.dtype.itemsize`` is bytes; the major-mode size in bytes is
+    # the major-mode tile extent times the dtype width in bytes. (We
+    # could equivalently express this in bits to mirror CuTe's
+    # ``num_contiguous_bits`` constants — bytes is more readable and
+    # the comparison is exact since dtype widths divide 8 for every
+    # MMA-supported dtype.)
+    dtype_bytes = input_dtype.itemsize
+    if operand == "a":
+        major_mode_extent = bk
+        major_mode_axis = "K"
+    else:
+        assert operand == "b", f"unexpected operand {operand!r}"
+        major_mode_extent = bn
+        major_mode_axis = "N"
+    major_mode_bytes = major_mode_extent * dtype_bytes
+    min_required = smem_swizzle_min_major_mode_bytes(swizzle_bytes)
+    if major_mode_bytes % min_required != 0:
+        raise exc.BackendUnsupported(
+            "cute",
+            f"tcgen05 smem_swizzle_{operand}={swizzle_bytes} requires "
+            f"the {major_mode_axis}-axis bytes-per-row to be a multiple "
+            f"of {min_required} (CuTe SmemLayoutAtom contract); active "
+            f"tile shape (bm={bm}, bn={bn}, bk={bk}) with dtype "
+            f"{input_dtype!s} ({dtype_bytes}B) yields "
+            f"{major_mode_axis}-axis bytes={major_mode_bytes}",
+        )
 
 
 # ---- Aten lowering entry point (addmm/mm/bmm/baddbmm) ----

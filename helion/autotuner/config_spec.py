@@ -23,8 +23,13 @@ from .._compat import supports_maxnreg
 from .._compat import supports_tensor_descriptor
 from .._compat import warps_to_threads
 from .._compiler.cute.strategies import ROLE_LOCAL_MONOLITHIC_DEFAULT_WARP_SPEC
+from .._compiler.cute.strategies import TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY
 from .._compiler.cute.strategies import TCGEN05_LAYOUT_OVERRIDES_KEYS
+from .._compiler.cute.strategies import TCGEN05_LAYOUT_OVERRIDES_SWIZZLE_A_KEY
+from .._compiler.cute.strategies import TCGEN05_LAYOUT_OVERRIDES_SWIZZLE_B_KEY
 from .._compiler.cute.strategies import TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY
+from .._compiler.cute.strategies import TCGEN05_LEGAL_L2_SWIZZLE_SIZES
+from .._compiler.cute.strategies import TCGEN05_LEGAL_SMEM_SWIZZLE_BYTES
 from .._compiler.cute.strategies import TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY
 from .._compiler.cute.strategies import TCGEN05_STRATEGY_CONFIG_KEY
 from .._compiler.cute.strategies import TCGEN05_STRATEGY_CONFIG_KEYS
@@ -203,6 +208,7 @@ _BASE_BACKEND_TUNABLE_KEYS: frozenset[str] = frozenset(
         TCGEN05_C_ACQUIRE_PLACEMENT_CONFIG_KEY,
         TCGEN05_C_STORE_MODE_CONFIG_KEY,
         "tcgen05_num_epi_warps",
+        TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY,
     }
 )
 _BACKEND_DIAGNOSTIC_CONFIG_KEYS: frozenset[str] = frozenset(
@@ -310,6 +316,7 @@ CUTE_TCGEN05_TUNABLE_KEYS: tuple[str, ...] = (
     TCGEN05_C_ACQUIRE_PLACEMENT_CONFIG_KEY,
     TCGEN05_C_STORE_MODE_CONFIG_KEY,
     "tcgen05_num_epi_warps",
+    TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY,
 )
 _CUTE_IMPLICIT_DEFAULT_KEYS: frozenset[str] = frozenset(
     {
@@ -863,6 +870,22 @@ class ConfigSpec:
         # explicitly per-shape until a tile-shape-aware budget check
         # lands.
         ab_stages_max = 3 if not for_search else 2
+        # ``tcgen05_l2_swizzle_size`` (Quack ``max_swizzle_size``
+        # equivalent): autotune surface is narrowed to ``{1, 2, 4, 8}``
+        # so the search budget covers the practical envelope without
+        # spending wall-clock on values whose grouping math degrades on
+        # B200's 148-SM grid (16 / 32 round up to entire raster axes
+        # for the 4096³ canonical seed). The validation surface accepts
+        # the full ``TCGEN05_LEGAL_L2_SWIZZLE_SIZES`` so explicit
+        # ``helion.Config(tcgen05_l2_swizzle_size=16)`` round-trips.
+        # Default ``1`` keeps the cycle 41 byte-identity baseline.
+        l2_swizzle_choices: tuple[int, ...]
+        if for_search:
+            l2_swizzle_choices = tuple(
+                v for v in TCGEN05_LEGAL_L2_SWIZZLE_SIZES if v <= 8
+            )
+        else:
+            l2_swizzle_choices = TCGEN05_LEGAL_L2_SWIZZLE_SIZES
         return {
             "tcgen05_cluster_m": EnumFragment(cluster_m_choices),
             "tcgen05_cluster_n": EnumFragment(cluster_n_choices),
@@ -870,6 +893,7 @@ class ConfigSpec:
             "tcgen05_acc_stages": IntegerFragment(1, 2, 2),
             "tcgen05_c_stages": EnumFragment((2, 4)),
             "tcgen05_num_epi_warps": num_epi_warps_fragment,
+            TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY: EnumFragment(l2_swizzle_choices),
         }
 
     def _tcgen05_strategy_autotune_fragments(
@@ -1152,6 +1176,62 @@ class ConfigSpec:
             return value
         raise InvalidConfig(f"Unsupported optional fragment type for {name}")
 
+    def _clamp_tcgen05_l2_swizzle_size_to_shape(
+        self, config: dict[str, object]
+    ) -> None:
+        """Snap ``tcgen05_l2_swizzle_size`` to ``<= ncluster_n``.
+
+        CuTe's ``PersistentTileSchedulerParams`` rewrites the problem
+        shape when ``swizzle_size > 1``; if ``swizzle_size > ncluster_n``
+        the rewritten shape has ``ncluster_n // swizzle_size = 0`` and
+        the layout construction crashes at runtime. Documented in
+        cute_plan.md §7.6.7.2.
+
+        ``ncluster_n`` is the cluster-grid count along the N axis:
+        ``(N + bn - 1) // bn // cluster_n``. The N hint comes from the
+        block-size spec; the per-config ``bn`` and ``cluster_n`` are
+        read from the in-flight config (the optional-fragment defaulting
+        above guarantees ``tcgen05_cluster_n`` is present whenever
+        ``cute_tcgen05_search_enabled`` is True). When the shape data
+        is unavailable (block_sizes not yet normalized to the matmul
+        layout) the clamp is a no-op — the validation surface still
+        rejects out-of-range values via the EnumFragment check upstream.
+        """
+        swizzle_value = config.get(TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY)
+        if swizzle_value is None or swizzle_value == 1:
+            return
+        if len(self.block_sizes) < 2:
+            return
+        block_sizes = config.get("block_sizes")
+        if not isinstance(block_sizes, list) or len(block_sizes) < 2:
+            return
+        bn = block_sizes[1]
+        if not isinstance(bn, int) or isinstance(bn, bool) or bn <= 0:
+            return
+        n_hint = self.block_sizes[1].size_hint
+        if n_hint <= 0:
+            return
+        cluster_n_raw = config.get("tcgen05_cluster_n", 1)
+        cluster_n = (
+            cluster_n_raw
+            if isinstance(cluster_n_raw, int) and not isinstance(cluster_n_raw, bool)
+            else 1
+        )
+        cluster_n = max(cluster_n, 1)
+        ncluster_n = max(((n_hint + bn - 1) // bn) // cluster_n, 1)
+        if not isinstance(swizzle_value, int) or isinstance(swizzle_value, bool):
+            return
+        if swizzle_value <= ncluster_n:
+            return
+        # Snap to the largest legal swizzle ``<= ncluster_n``. ``1`` is
+        # always legal (the no-swizzle path) so the clamp always lands
+        # on a valid value.
+        clamped = max(
+            (v for v in TCGEN05_LEGAL_L2_SWIZZLE_SIZES if v <= ncluster_n),
+            default=1,
+        )
+        config[TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY] = clamped
+
     def unsupported_config_keys(self, config: Mapping[str, object]) -> list[str]:
         return sorted(
             key
@@ -1356,6 +1436,21 @@ class ConfigSpec:
                     # validation view above is still used to validate
                     # user-supplied values against the full legal range.
                     config[key] = tcgen05_optional_search_fragments[key].default()
+            # Shape-aware clamp for ``tcgen05_l2_swizzle_size``. CuTe's
+            # tile-scheduler layout construction requires
+            # ``swizzle_size <= ncluster_n``; otherwise the rewritten
+            # ``problem_shape`` has ``ncluster_n // swizzle_size = 0``
+            # and the layout crashes at runtime (see cute_plan.md
+            # §7.6.7.2). The autotuner samples ``{1, 2, 4, 8}`` from
+            # ``_tcgen05_optional_fragments(for_search=True)`` regardless
+            # of shape, so without this clamp a small-N shape (e.g.
+            # ``N=1024 / bn=256 / cluster_n=1 → ncluster_n = 4``) would
+            # see ``swizzle_size=8`` sampled and crash mid-tuning. Snap
+            # to the largest legal value ``<= ncluster_n`` (with
+            # ``swizzle_size = 1`` always legal). Runs after the
+            # validation pass so explicit user values are preserved
+            # whenever they are legal for the active shape.
+            self._clamp_tcgen05_l2_swizzle_size_to_shape(config)
         else:
             for key in tcgen05_optional_fragments:
                 if key not in config:
@@ -1700,15 +1795,43 @@ class ConfigSpec:
             # via fragments (an explicit None value cannot pass
             # IntegerFragment validation). Validate types only — the
             # accept-set is "non-negative int or None" rather than
-            # ">0 or None" because ``smem_swizzle_*`` fields plausibly
-            # encode "no swizzle" as ``0`` once codegen consumes them
-            # in G2-E. Atom-contract checks (e.g. valid epi-tile
-            # divisibility against the active problem shape) run in
-            # lowering, not here.
+            # ">0 or None" because ``smem_swizzle_*`` fields encode
+            # "no swizzle" as ``0`` (the codegen-side override accepts
+            # ``TCGEN05_LEGAL_SMEM_SWIZZLE_BYTES``). Atom-contract
+            # checks against the active tile shape run in lowering
+            # (``cute_mma._validate_tcgen05_smem_swizzle_override``),
+            # not here.
+            _swizzle_keys = {
+                TCGEN05_LAYOUT_OVERRIDES_SWIZZLE_A_KEY,
+                TCGEN05_LAYOUT_OVERRIDES_SWIZZLE_B_KEY,
+            }
             for key in TCGEN05_LAYOUT_OVERRIDES_KEYS:
                 if key in config:
                     value = config[key]
-                    if value is not None and not (type(value) is int and value >= 0):
+                    if value is None:
+                        continue
+                    if key in _swizzle_keys:
+                        # ``smem_swizzle_*``: legal values are
+                        # ``TCGEN05_LEGAL_SMEM_SWIZZLE_BYTES`` (0/32/64/128).
+                        # The strategy invariants validator
+                        # (``validate_tcgen05_strategy_invariants``)
+                        # also enforces this; the duplicate here keeps
+                        # the user-facing error fired close to the
+                        # input rather than waiting for the cross-
+                        # fragment pass.
+                        if (
+                            type(value) is not int
+                            or value not in TCGEN05_LEGAL_SMEM_SWIZZLE_BYTES
+                        ):
+                            if _fix_invalid:
+                                config[key] = None
+                            else:
+                                raise InvalidConfig(
+                                    f"{key} must be one of "
+                                    f"{TCGEN05_LEGAL_SMEM_SWIZZLE_BYTES!r} "
+                                    f"or None, got {value!r}"
+                                )
+                    elif not (type(value) is int and value >= 0):
                         if _fix_invalid:
                             config[key] = None
                         else:

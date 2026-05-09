@@ -15,6 +15,8 @@ from .ast_extension import expr_from_string
 from .ast_extension import statement_from_string
 from .compile_environment import CompileEnvironment
 from .cute.cutedsl_compat import emit_pipeline_advance
+from .cute.strategies import TCGEN05_L2_SWIZZLE_SIZE_DEFAULT
+from .cute.strategies import l2_swizzle_size_from_config
 from .cute.tcgen05_constants import TCGEN05_TWO_CTA_MAX_K_TILES
 from .device_function import DeviceFunction
 from .device_function import TensorArg
@@ -810,6 +812,55 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         config = DeviceFunction.current().config
         cluster_n = int(str(config.get("tcgen05_cluster_n", 1)))
         return max(1, min(cluster_n, 2))
+
+    def _tcgen05_l2_swizzle_size(self) -> int:
+        """Return the L2 tile-scheduler swizzle size (Quack ``max_swizzle_size``).
+
+        Returned value is the integer that will be threaded into
+        ``cutlass.utils.PersistentTileSchedulerParams(swizzle_size=...)``.
+        Default ``TCGEN05_L2_SWIZZLE_SIZE_DEFAULT`` (= ``1``) means no
+        swizzle (preserves byte-identity vs the cycle 41 baseline).
+        Larger values group consecutive cluster linear-IDs along the
+        slow raster axis to promote L2 reuse on bandwidth-bound shapes.
+
+        Mirrors ``_tcgen05_cluster_m`` / ``_tcgen05_cluster_n``: fall
+        back to the legacy default when no matmul plan and no
+        ``DeviceFunction`` are registered. Unit tests exercise the
+        scheduler-prelude builders without a registered plan and
+        expect the no-swizzle byte-identity path. Reads via the
+        canonical ``l2_swizzle_size_from_config`` helper so
+        codegen and the strategies layer share one decode.
+        """
+        if (plan := self._tcgen05_plan()) is not None:
+            return plan.l2_swizzle_size
+        try:
+            config = DeviceFunction.current().config
+        except NoCurrentFunction:
+            return TCGEN05_L2_SWIZZLE_SIZE_DEFAULT
+        return l2_swizzle_size_from_config(config)
+
+    def _tcgen05_persistent_tile_sched_params_args(
+        self, *, cluster_m: int, cluster_n: int
+    ) -> str:
+        """Format the constructor args for ``PersistentTileSchedulerParams``.
+
+        Always passes the problem shape and cluster shape. When
+        ``l2_swizzle_size > 1`` also passes the ``swizzle_size=`` kwarg
+        so the CuTe scheduler folds in the L2 grouping math; when the
+        size is ``1`` the kwarg is omitted to keep the no-swizzle path
+        byte-identical to pre-cycle-42.
+
+        Caller passes ``cluster_m`` / ``cluster_n`` so unit tests that
+        exercise scheduler-prelude builders without a registered
+        ``CuteTcgen05MatmulPlan`` (and without an active
+        ``DeviceFunction``) can drive the helper from the
+        ``_Tcgen05PersistentLayout`` they constructed locally.
+        """
+        problem = self._tcgen05_num_tiles_expr(is_device=True)
+        l2_swizzle = self._tcgen05_l2_swizzle_size()
+        if l2_swizzle <= 1:
+            return f"{problem}, ({cluster_m}, {cluster_n}, 1)"
+        return f"{problem}, ({cluster_m}, {cluster_n}, 1), swizzle_size={l2_swizzle}"
 
     def _tcgen05_is_two_cta(self) -> bool:
         if (plan := self._tcgen05_plan()) is not None:
@@ -1937,8 +1988,7 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         prelude: list[ast.stmt] = [
             statement_from_string(
                 f"{layout.tile_sched_params_var} = cutlass.utils.PersistentTileSchedulerParams("
-                f"{self._tcgen05_num_tiles_expr(is_device=True)}, "
-                f"({layout.cluster_m}, {layout.cluster_n}, 1))"
+                f"{self._tcgen05_persistent_tile_sched_params_args(cluster_m=layout.cluster_m, cluster_n=layout.cluster_n)})"
             ),
             statement_from_string(
                 f"{layout.tile_sched_var} = cutlass.utils.StaticPersistentTileScheduler.create("
@@ -2200,8 +2250,7 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             [
                 statement_from_string(
                     f"{sched_params_var} = cutlass.utils.PersistentTileSchedulerParams("
-                    f"{self._tcgen05_num_tiles_expr(is_device=True)}, "
-                    f"({layout.cluster_m}, {layout.cluster_n}, 1))"
+                    f"{self._tcgen05_persistent_tile_sched_params_args(cluster_m=layout.cluster_m, cluster_n=layout.cluster_n)})"
                 ),
                 statement_from_string(
                     f"{sched_var} = cutlass.utils.StaticPersistentTileScheduler.create("
@@ -2552,8 +2601,7 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         prelude: list[ast.stmt] = [
             statement_from_string(
                 f"{sched_params_var} = cutlass.utils.PersistentTileSchedulerParams("
-                f"{self._tcgen05_num_tiles_expr(is_device=True)}, "
-                f"({layout.cluster_m}, {layout.cluster_n}, 1))"
+                f"{self._tcgen05_persistent_tile_sched_params_args(cluster_m=layout.cluster_m, cluster_n=layout.cluster_n)})"
             ),
             statement_from_string(
                 f"{sched_var} = cutlass.utils.StaticPersistentTileScheduler.create("
@@ -2737,19 +2785,16 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         # ``valid_var`` is Int32 because ``cute.arch.clc_response``
         # returns Int32 for the valid flag. The CuTe DSL's while-region
         # type-checker rejects type changes between iterations.
-        cluster_m = layout.cluster_m
-        cluster_n = layout.cluster_n
         sched_params_var = device_function.new_var("tcgen05_clc_initial_sched_params")
         sched_var = device_function.new_var("tcgen05_clc_initial_sched")
         work_tile_var = device_function.new_var("tcgen05_clc_initial_work_tile")
         clc_initial_block: list[ast.stmt] = [
             # Build the persistent tile-scheduler params for the
-            # initial decode. Cluster shape matches the launch grid's
-            # cluster shape (``(cluster_m, cluster_n, 1)``).
+            # initial decode. ``layout.cluster_m/n`` agrees with the
+            # launch grid's cluster shape ``(cluster_m, cluster_n, 1)``.
             statement_from_string(
                 f"{sched_params_var} = cutlass.utils.PersistentTileSchedulerParams("
-                f"{self._tcgen05_num_tiles_expr(is_device=True)}, "
-                f"({cluster_m}, {cluster_n}, 1))"
+                f"{self._tcgen05_persistent_tile_sched_params_args(cluster_m=layout.cluster_m, cluster_n=layout.cluster_n)})"
             ),
             statement_from_string(
                 f"{sched_var} = cutlass.utils.StaticPersistentTileScheduler.create("

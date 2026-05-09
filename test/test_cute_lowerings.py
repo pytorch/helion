@@ -1484,6 +1484,381 @@ class TestCuteLowerings(unittest.TestCase):
                 f"--- diff ---\n{diff}"
             )
 
+    def test_tcgen05_smem_swizzle_override_consumed_by_codegen(self) -> None:
+        """The ``Tcgen05LayoutOverrides.smem_swizzle_a/b`` data-model
+        slots are consumed by codegen.
+
+        Three pins, in order of strictness:
+
+        1. **Default-path byte-identity.** When neither override is
+           set, the generated CuTe must contain the legacy
+           ``make_smem_layout_a(...) / make_smem_layout_b(...)``
+           expressions exactly. The wider 4096³ golden
+           (``test_tcgen05_role_local_monolithic_byte_identical_golden``)
+           pins the full kernel — this test pins just the SMEM atom
+           lines so a future codegen refactor that accidentally drops
+           the default branch is caught even when the larger golden
+           file legitimately changes for unrelated reasons.
+
+        2. **Override-path expression shape.** When ``swizzle_a=64`` /
+           ``swizzle_b=64`` is set, the generated CuTe must contain
+           ``cute.nvgpu.tcgen05.SmemLayoutAtomKind.K_SW64`` and
+           ``...MN_SW64`` and the ``tile_to_mma_shape`` /
+           ``make_smem_layout_atom`` call shape Helion emits to mirror
+           CuTe's helper. This catches a partial revert that would
+           silently fall back to the legacy expression.
+
+        3. **Override differs from default.** The two generated
+           kernels (no-override vs ``swizzle=64``) must differ on at
+           least the SMEM atom lines. This is a coarse "the override
+           did something" pin: paired with #1 / #2 it ensures the
+           feature is not a no-op.
+        """
+
+        from test.golden._tcgen05_role_local_monolithic_4096_bf16_kernel import (
+            cute_matmul_role_local_monolithic_4096_bf16,
+        )
+
+        args = (
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+        )
+
+        def _emit(swizzle_a: int | None, swizzle_b: int | None) -> str:
+            cfg_kwargs: dict[str, object] = {
+                "block_sizes": [256, 256, 128],
+                "l2_groupings": [1],
+                "pid_type": "persistent_interleaved",
+                "tcgen05_cluster_m": 2,
+                "tcgen05_ab_stages": 2,
+                "tcgen05_acc_stages": 2,
+                "tcgen05_c_stages": 2,
+                "tcgen05_num_epi_warps": 4,
+            }
+            if swizzle_a is not None:
+                cfg_kwargs["tcgen05_layout_overrides_smem_swizzle_a"] = swizzle_a
+            if swizzle_b is not None:
+                cfg_kwargs["tcgen05_layout_overrides_smem_swizzle_b"] = swizzle_b
+            cfg = helion.Config(**cfg_kwargs)
+            with patch_cute_mma_support():
+                bound = cute_matmul_role_local_monolithic_4096_bf16.bind(args)
+                bound.env.config_spec.cute_tcgen05_search_enabled = True
+                return bound.to_triton_code(cfg)
+
+        # Pin #1: default path emits the legacy ``make_smem_layout_a/b``
+        # call; the override-aware expression must NOT appear.
+        default_code = _emit(None, None)
+        self.assertIn(
+            "cutlass.utils.blackwell_helpers.make_smem_layout_a(", default_code
+        )
+        self.assertIn(
+            "cutlass.utils.blackwell_helpers.make_smem_layout_b(", default_code
+        )
+        self.assertNotIn("SmemLayoutAtomKind.K_SW", default_code)
+        self.assertNotIn("SmemLayoutAtomKind.MN_SW", default_code)
+
+        # Pin #2: override path emits the explicit atom-kind expression.
+        override_code = _emit(64, 64)
+        self.assertIn("cute.nvgpu.tcgen05.SmemLayoutAtomKind.K_SW64", override_code)
+        self.assertIn("cute.nvgpu.tcgen05.SmemLayoutAtomKind.MN_SW64", override_code)
+        self.assertIn("cute.nvgpu.tcgen05.tile_to_mma_shape(", override_code)
+        self.assertIn("cute.nvgpu.tcgen05.make_smem_layout_atom(", override_code)
+        # The override path replaces the helper calls — they must NOT
+        # appear on the device-side SMEM-A/B lines (they may still
+        # appear on the wrapper side and on the epilogue path).
+        for line in override_code.splitlines():
+            line_s = line.strip()
+            if line_s.startswith(("sA_layout = ", "sB_layout = ")):
+                self.assertIn("tile_to_mma_shape", line_s)
+                self.assertIn("make_smem_layout_atom", line_s)
+                self.assertNotIn("blackwell_helpers.make_smem_layout_a", line_s)
+                self.assertNotIn("blackwell_helpers.make_smem_layout_b", line_s)
+
+        # Pin #3: override path differs from default. Compute a
+        # focused diff over the SMEM-A/B lines only so the test pins
+        # the precise location of the difference rather than the
+        # whole-kernel diff (which can churn for unrelated reasons).
+        def _smem_lines(code: str) -> list[str]:
+            return [
+                line.strip()
+                for line in code.splitlines()
+                if line.strip().startswith(("sA_layout = ", "sB_layout = "))
+            ]
+
+        default_smem = _smem_lines(default_code)
+        override_smem = _smem_lines(override_code)
+        self.assertNotEqual(default_smem, override_smem)
+        # Sanity: neither side is empty (otherwise the diff would be
+        # vacuously different — e.g. a refactor that moved the SMEM
+        # atom emission to a different location).
+        self.assertEqual(len(default_smem), 2, msg=str(default_smem))
+        self.assertEqual(len(override_smem), 2, msg=str(override_smem))
+
+        # Pin #4: a different swizzle (128) emits a different
+        # ``SmemLayoutAtomKind`` literal, confirming the byte value is
+        # threaded into the emitted expression rather than being
+        # silently mapped to a single override sentinel.
+        override_code_128 = _emit(128, 128)
+        self.assertIn(
+            "cute.nvgpu.tcgen05.SmemLayoutAtomKind.K_SW128", override_code_128
+        )
+        self.assertIn(
+            "cute.nvgpu.tcgen05.SmemLayoutAtomKind.MN_SW128", override_code_128
+        )
+        self.assertNotEqual(_smem_lines(override_code), _smem_lines(override_code_128))
+
+    def test_tcgen05_smem_swizzle_override_runtime_correctness(self) -> None:
+        """Explicit ``smem_swizzle_*`` overrides produce numerically-
+        correct output.
+
+        The codegen-only test pins the emitted CuTe expression shape;
+        this test pins that the chosen swizzle actually compiles into
+        a working kernel. Two override values are exercised
+        (``swizzle_a/b=64`` and ``swizzle_a/b=128``) on a small
+        bf16 matmul; both must agree with a torch reference within
+        the documented matmul tolerance.
+
+        ``swizzle=32`` would be legal for the canonical
+        ``bk * dtype_width / 8 ≥ 32`` contract on the chosen tile
+        shape but is intentionally skipped here: per CuTe's
+        ``get_smem_layout_atom_ab`` the auto-inferred default for K-
+        major bf16 with ``bk=64`` is already SW128, and the codegen
+        path mirrors CuTe's helper exactly so the ``=32`` and ``=64``
+        variants exercise the same code path modulo the atom-kind
+        literal. The two values picked here (64, 128) are the
+        perf-relevant ones (Quack autotunes the equivalent surface
+        across two non-trivial values).
+        """
+
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_swizzle_override(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        for swizzle in (64, 128):
+            with self.subTest(swizzle=swizzle):
+                torch.manual_seed(0)
+                args = (
+                    torch.randn(256, 64, device=DEVICE, dtype=torch.bfloat16),
+                    torch.randn(64, 256, device=DEVICE, dtype=torch.bfloat16),
+                )
+                with patch_cute_mma_support():
+                    bound = cute_matmul_swizzle_override.bind(args)
+                    bound.env.config_spec.cute_tcgen05_search_enabled = True
+                    cfg = _make_tcgen05_persistent_config(
+                        block_sizes=[128, 128, 64],
+                        pid_type="persistent_interleaved",
+                        tcgen05_layout_overrides_smem_swizzle_a=swizzle,
+                        tcgen05_layout_overrides_smem_swizzle_b=swizzle,
+                    )
+                    bound.set_config(cfg)
+                    out = bound(*args)
+                expected = args[0] @ args[1]
+                torch.testing.assert_close(out, expected, atol=2e-1, rtol=1e-2)
+
+    def test_tcgen05_l2_swizzle_size_consumed_by_codegen(self) -> None:
+        """The ``tcgen05_l2_swizzle_size`` knob is threaded into every
+        ``cutlass.utils.PersistentTileSchedulerParams(...)`` call site.
+
+        Three pins:
+
+        1. **Default-path byte-identity.** When the knob is absent (or
+           set to ``1``), the generated CuTe must NOT contain
+           ``swizzle_size=`` so the call signature matches the cycle
+           41 baseline byte-for-byte. The wider 4096³ golden
+           (``test_tcgen05_role_local_monolithic_byte_identical_golden``)
+           pins the full kernel; this test isolates the scheduler
+           prelude lines so a future codegen refactor that always
+           emits the kwarg is caught even if the larger golden file
+           changes for unrelated reasons.
+
+        2. **Override-path expression shape.** When ``=8`` is set, the
+           generated CuTe contains ``swizzle_size=8`` on every
+           scheduler-prelude line. Quack's tile-scheduler defaults to
+           ``max_swizzle_size=8`` so this is the perf-relevant value.
+
+        3. **Knob value flows into the kwarg literal.** When ``=4`` is
+           set the kwarg literal is ``swizzle_size=4`` (different from
+           ``=8``), confirming the integer is threaded through rather
+           than being silently mapped to a single sentinel.
+        """
+
+        from test.golden._tcgen05_role_local_monolithic_4096_bf16_kernel import (
+            cute_matmul_role_local_monolithic_4096_bf16,
+        )
+
+        args = (
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+        )
+
+        def _emit(l2_swizzle_size: int | None) -> str:
+            cfg_kwargs: dict[str, object] = {
+                "block_sizes": [256, 256, 128],
+                "l2_groupings": [1],
+                "pid_type": "persistent_interleaved",
+                "tcgen05_cluster_m": 2,
+                "tcgen05_ab_stages": 2,
+                "tcgen05_acc_stages": 2,
+                "tcgen05_c_stages": 2,
+                "tcgen05_num_epi_warps": 4,
+            }
+            if l2_swizzle_size is not None:
+                cfg_kwargs["tcgen05_l2_swizzle_size"] = l2_swizzle_size
+            cfg = helion.Config(**cfg_kwargs)
+            with patch_cute_mma_support():
+                bound = cute_matmul_role_local_monolithic_4096_bf16.bind(args)
+                bound.env.config_spec.cute_tcgen05_search_enabled = True
+                return bound.to_triton_code(cfg)
+
+        def _sched_param_lines(code: str) -> list[str]:
+            return [
+                line
+                for line in code.splitlines()
+                if "PersistentTileSchedulerParams(" in line
+            ]
+
+        # Pin #1: default path emits NO ``swizzle_size=`` kwarg.
+        default_code = _emit(None)
+        default_lines = _sched_param_lines(default_code)
+        # The role-local persistent kernel emits one scheduler params
+        # construction per role (TMA-load / MMA-exec / epi). Pin a
+        # lower bound so a future codegen refactor that consolidates
+        # the role schedulers does not silently break this test.
+        self.assertGreaterEqual(len(default_lines), 1, msg=str(default_lines))
+        for line in default_lines:
+            self.assertNotIn("swizzle_size=", line)
+
+        # Pin #1b: explicit ``=1`` is also byte-identical (the kwarg
+        # is suppressed when the value is the no-swizzle default).
+        explicit_one_code = _emit(1)
+        for line in _sched_param_lines(explicit_one_code):
+            self.assertNotIn("swizzle_size=", line)
+
+        # Pin #2: ``=8`` emits ``swizzle_size=8`` on every scheduler
+        # prelude line.
+        sw8_code = _emit(8)
+        sw8_lines = _sched_param_lines(sw8_code)
+        self.assertEqual(len(sw8_lines), len(default_lines))
+        for line in sw8_lines:
+            self.assertIn("swizzle_size=8", line)
+
+        # Pin #3: ``=4`` emits ``swizzle_size=4`` (different literal)
+        # so the integer flows through.
+        sw4_code = _emit(4)
+        sw4_lines = _sched_param_lines(sw4_code)
+        self.assertEqual(len(sw4_lines), len(default_lines))
+        for line in sw4_lines:
+            self.assertIn("swizzle_size=4", line)
+            self.assertNotIn("swizzle_size=8", line)
+
+    def test_tcgen05_l2_swizzle_size_runtime_correctness(self) -> None:
+        """Explicit ``tcgen05_l2_swizzle_size`` produces numerically-
+        correct output that matches the no-swizzle baseline.
+
+        L2 grouping is purely a scheduling rewrite — the same set of
+        work tiles is processed, just in a different order — so the
+        matmul output must agree with the baseline (no-swizzle) kernel
+        bit-for-bit. This kernel has no reduction across PIDs (each
+        output tile is owned by exactly one PID, the only reduction
+        is the K-loop within that PID), so a different traversal
+        schedule produces bit-identical D values; the test pins each
+        swizzle output against the no-swizzle baseline at strict
+        ``atol=0.0, rtol=0.0``.
+
+        Shape is ``M=4096, N=1024, K=256`` bf16 with ``block_n=256``
+        and ``cluster_n=1`` (``ncluster_n = 1024/256 = 4``). The
+        swizzle sweep is ``{2, 4}`` only because
+        ``swizzle_size > ncluster_n`` produces a ``problem_shape``
+        where ``ncluster_n // swizzle_size = 0`` and CuTe's layout
+        construction crashes at runtime (see cute_plan.md §7.6.7.2);
+        ``=8`` and ``=16`` would hit exactly that crash on this shape.
+        Larger swizzle values are exercised at runtime by the
+        autotune-driven 4096³ / 8192³ benches in the plan.
+        """
+
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_l2_swizzle(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        torch.manual_seed(0)
+        # 4096x1024x256 with block_n=256, cluster_n=1 gives
+        # ``ncluster_n = 4``; the swizzle loop below is therefore
+        # bounded to ``{2, 4}`` (values ``≤ ncluster_n``) — see
+        # docstring for the runtime-crash rationale.
+        args = (
+            torch.randn(4096, 256, device=DEVICE, dtype=torch.bfloat16),
+            torch.randn(256, 1024, device=DEVICE, dtype=torch.bfloat16),
+        )
+
+        def _run(l2_swizzle: int | None) -> torch.Tensor:
+            with patch_cute_mma_support():
+                bound = cute_matmul_l2_swizzle.bind(args)
+                bound.env.config_spec.cute_tcgen05_search_enabled = True
+                cfg_kwargs: dict[str, object] = {
+                    "block_sizes": [256, 256, 128],
+                    "pid_type": "persistent_interleaved",
+                    "tcgen05_cluster_m": 2,
+                    "tcgen05_ab_stages": 2,
+                    "tcgen05_acc_stages": 2,
+                    "tcgen05_c_stages": 2,
+                    "tcgen05_num_epi_warps": 4,
+                }
+                if l2_swizzle is not None:
+                    cfg_kwargs["tcgen05_l2_swizzle_size"] = l2_swizzle
+                cfg = _make_tcgen05_persistent_config(**cfg_kwargs)
+                bound.set_config(cfg)
+                return bound(*args)
+
+        baseline = _run(None)
+        # Baseline must agree with torch reference within the documented
+        # matmul tolerance — sanity check that the kernel is correct
+        # before pinning swizzle outputs against the baseline.
+        expected = args[0] @ args[1]
+        torch.testing.assert_close(baseline, expected, atol=2e-1, rtol=1e-2)
+
+        # Each swizzle output must agree with the baseline at strict
+        # ``atol=0.0, rtol=0.0`` (bit-identity). The kernel has no
+        # reduction across PIDs (each output tile is owned by exactly
+        # one PID; the only reduction is the K-loop within that PID),
+        # so a different traversal schedule produces bit-identical D
+        # values. A regression that *did* introduce a cross-PID
+        # accumulation step would surface here as a non-zero diff.
+        # Swizzle values are clamped to those compatible with the
+        # ``ncluster_n = 4`` cluster grid above; ``=8`` / ``=16``
+        # would crash at CuTe layout construction.
+        for swizzle in (2, 4):
+            with self.subTest(swizzle=swizzle):
+                out = _run(swizzle)
+                torch.testing.assert_close(out, baseline, atol=0.0, rtol=0.0)
+
     def test_tcgen05_codegen_consumes_warp_spec(self) -> None:
         """G2-B data-flow pin: ``Tcgen05WarpSpec`` is consumed by
         codegen as the source of truth for warp role IDs.
@@ -2138,8 +2513,8 @@ class TestCuteLowerings(unittest.TestCase):
                     continue
                 role_src = ast.unparse(role_child)
                 self.assertIn("pid_0 = virtual_pid % num_blocks_0", role_src)
-                self.assertIn("offset_0 = pid_0 * _BLOCK_SIZE_0", role_src)
-                self.assertIn("for offset_2 in range", role_src)
+                self.assertIn("tile_offset_0 = pid_0 * _BLOCK_SIZE_0", role_src)
+                self.assertIn("for tile_offset_2 in range", role_src)
                 self.assertIn(
                     "if tcgen05_tma_full_tile and tcgen05_tma_next_full_tile",
                     role_src,
@@ -3570,6 +3945,64 @@ class TestCuteLowerings(unittest.TestCase):
                 # If the deadlock regresses, the kernel hangs (CI test
                 # timeout fires); if it returns, correctness must hold.
                 expected = args[0] @ args[1]
+                torch.testing.assert_close(out, expected, atol=2e-1, rtol=1e-2)
+
+    def test_skinny_m_persistent_simt_runtime_correctness(self) -> None:
+        """Skinny-M shapes (M ∈ {1, 8, 32}) compile + run on the CuTe
+        backend with ``persistent_interleaved`` pid_type.
+
+        These shapes do not satisfy the tcgen05 ``M % 64 == 0`` gate in
+        ``enforce_dot_requirements`` so they route to the SIMT matmul
+        fallback. The SIMT path used to crash at CuTe DSL trace time
+        with ``UnboundLocalError: cannot access local variable
+        'offset_<n>'`` because Helion's tile-offset names collided with
+        the CuTe DSL preprocessor's auto-generated ``offset_<counter>``
+        identifiers (emitted by ``_handle_negative_step`` for K-loops
+        whose step is not a positive Python literal). This test pins
+        the post-rename behaviour: the kernel compiles, the renamed
+        ``tile_offset_`` namespace is present in the emitted source,
+        and runtime output is close to eager ``x @ y`` for all three
+        skinny-M shapes.
+        """
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_skinny_m(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        # block_m chosen to land in the SIMT fallback ranges where the
+        # collision used to crash at CuTe DSL trace time. Any of
+        # M=1/8/32 with persistent_interleaved is sufficient.
+        for m, block_m in ((1, 16), (8, 16), (32, 32)):
+            with self.subTest(m=m, block_m=block_m):
+                torch.manual_seed(0)
+                x = torch.randn(m, 512, dtype=torch.bfloat16, device=DEVICE)
+                y = torch.randn(512, 256, dtype=torch.bfloat16, device=DEVICE)
+                bound = cute_matmul_skinny_m.bind((x, y))
+                cfg = helion.Config(
+                    block_sizes=[block_m, 256, 128],
+                    pid_type="persistent_interleaved",
+                )
+                code = bound.to_triton_code(cfg)
+                # Positive control: the renamed namespace is emitted.
+                self.assertIn("tile_offset_", code)
+                # Negative control: no bare ``offset_<digit>`` free
+                # variable on the SIMT path — that was the failure
+                # mode (Python's name-binding rule promoted the late
+                # ``offset_<n>`` reassignment from CuTe DSL's
+                # negative-step rewrite to function-local scope,
+                # turning earlier reads into UnboundLocalError).
+                self.assertNotRegex(code, r"\boffset_\d")
+                bound.set_config(cfg)
+                out = bound(x, y)
+                expected = x @ y
                 torch.testing.assert_close(out, expected, atol=2e-1, rtol=1e-2)
 
     def test_tcgen05_fused_epilogue_store_raises_backend_unsupported(self) -> None:
@@ -8188,6 +8621,7 @@ class TestCuteLowerings(unittest.TestCase):
             ]
         )
         env = SimpleNamespace(
+            backend=SimpleNamespace(name="cute"),
             block_sizes=[
                 _FakeBlockSize(128, block_id=0),
                 _FakeBlockSize(8, block_id=1),

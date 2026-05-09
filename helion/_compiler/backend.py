@@ -3026,16 +3026,23 @@ class CuteBackend(Backend):
                 flags=re.MULTILINE,
             )
         }
+        # Accept both the historical ``offset_<n>`` prefix (non-CuTe backends)
+        # and the post-rename ``tile_offset_<n>`` prefix (CuTe backend, see the
+        # CuTe DSL preprocessor counter-collision note in
+        # ``tile_strategy.py``). The launch-dim recovery walks the generated
+        # source to pair Helion's per-axis offsets with their thread axes; if
+        # the regex misses, we fall back to ``[1, 1, 1]`` and any kernel that
+        # depends on the recovery launches with too-small dims.
         offset_block_sizes = dict(
             re.findall(
-                r"^\s*offset_(\d+) = .* \* (_BLOCK_SIZE_\d+)$",
+                r"^\s*(?:tile_)?offset_(\d+) = .* \* (_BLOCK_SIZE_\d+)$",
                 final_kernel_text,
                 flags=re.MULTILINE,
             )
         )
         offset_thread_dims = [1, 1, 1]
         for offset_id, axis_text in re.findall(
-            r"^\s*indices_\d+ = offset_(\d+) \+ .*cute\.arch\.thread_idx\(\)\[(\d+)\]",
+            r"^\s*indices_\d+ = (?:tile_)?offset_(\d+) \+ .*cute\.arch\.thread_idx\(\)\[(\d+)\]",
             final_kernel_text,
             flags=re.MULTILINE,
         ):

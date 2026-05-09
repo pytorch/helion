@@ -14,6 +14,7 @@ import torch
 
 from .. import _compat as _compat  # ensure Triton compatibility patches run
 from .. import exc
+from .._compiler.cute.strategies import tcgen05_smem_layout_expr
 from .._utils import triton_is_available
 from .config import Config as Config
 from .kernel import Kernel as Kernel
@@ -1525,6 +1526,19 @@ def _append_cute_wrapper_plan(
     input_dtype = str(plan["input_dtype"])
     acc_dtype = str(plan["acc_dtype"])
     ab_stage_count = plan_int("ab_stage_count", 2)
+    # Optional ``smem_swizzle_*`` overrides recorded by the device-side
+    # codegen when the user opts into a non-default A/B SMEM atom
+    # swizzle. When absent the wrapper emits the legacy
+    # ``make_smem_layout_a/b`` calls so the canonical 4096³
+    # byte-identity golden (no override) stays valid.
+    smem_swizzle_a_raw = plan.get("smem_swizzle_a")
+    smem_swizzle_b_raw = plan.get("smem_swizzle_b")
+    smem_swizzle_a: int | None = (
+        int(smem_swizzle_a_raw) if isinstance(smem_swizzle_a_raw, int) else None
+    )
+    smem_swizzle_b: int | None = (
+        int(smem_swizzle_b_raw) if isinstance(smem_swizzle_b_raw, int) else None
+    )
     kernel_args = [str(arg) for arg in cast("list[object]", plan["kernel_args"])]
     assert len(kernel_args) == 4
     tma_atom_a, tma_tensor_a, tma_atom_b, tma_tensor_b = kernel_args
@@ -1547,6 +1561,26 @@ def _append_cute_wrapper_plan(
     smem_a_layout = f"{tma_atom_a}_smem_layout"
     smem_b_layout = f"{tma_atom_b}_smem_layout"
     rhs_tma = f"{tma_atom_b}_rhs_tma"
+    smem_a_layout_expr = tcgen05_smem_layout_expr(
+        tiled_mma=tiled_mma,
+        bm=bm,
+        bn=bn,
+        bk=bk,
+        dtype_str=input_dtype,
+        num_stages=ab_stage_count,
+        operand="a",
+        swizzle_override=smem_swizzle_a,
+    )
+    smem_b_layout_expr = tcgen05_smem_layout_expr(
+        tiled_mma=tiled_mma,
+        bm=bm,
+        bn=bn,
+        bk=bk,
+        dtype_str=input_dtype,
+        num_stages=ab_stage_count,
+        operand="b",
+        swizzle_override=smem_swizzle_b,
+    )
     body.extend(
         (
             (
@@ -1563,14 +1597,8 @@ def _append_cute_wrapper_plan(
                 f"    {cluster_layout_vmnk} = cute.tiled_divide("
                 f"cute.make_layout({cluster_shape}), ({tiled_mma}.thr_id.shape,))"
             ),
-            (
-                f"    {smem_a_layout} = cutlass.utils.blackwell_helpers.make_smem_layout_a("
-                f"{tiled_mma}, ({bm}, {bn}, {bk}), {input_dtype}, {ab_stage_count})"
-            ),
-            (
-                f"    {smem_b_layout} = cutlass.utils.blackwell_helpers.make_smem_layout_b("
-                f"{tiled_mma}, ({bm}, {bn}, {bk}), {input_dtype}, {ab_stage_count})"
-            ),
+            f"    {smem_a_layout} = {smem_a_layout_expr}",
+            f"    {smem_b_layout} = {smem_b_layout_expr}",
             (
                 f"    {rhs_tma} = cute.make_tensor("
                 f"arg{rhs_idx}.iterator, "

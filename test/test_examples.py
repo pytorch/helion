@@ -356,7 +356,6 @@ class TestExamples(RefEagerTestBase, TestCase):
             block_sizes=[16, 16, 16, 16],
         )
 
-    @xfailIfCute("CuTE IR build error with non-divisible K block sizes")
     def test_bmm_non_divisible_k(self):
         args = (
             torch.randn([4, 128, 384], device=DEVICE, dtype=HALF_DTYPE),

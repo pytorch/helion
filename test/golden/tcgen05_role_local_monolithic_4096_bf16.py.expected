@@ -114,16 +114,16 @@ def _helion_cute_matmul_role_local_monolithic_4096_bf16(x, y, out, tma_atom_a, t
             # src[_tcgen05_role_local_monolithic_4096_bf16_kernel.py:32]: for tile_m, tile_n in hl.tile([m, n]):
             pid_0 = virtual_pid % num_blocks_0
             pid_1 = virtual_pid // num_blocks_0
-            offset_0 = pid_0 * _BLOCK_SIZE_0
-            offset_1 = pid_1 * _BLOCK_SIZE_1
+            tile_offset_0 = pid_0 * _BLOCK_SIZE_0
+            tile_offset_1 = pid_1 * _BLOCK_SIZE_1
             # src[_tcgen05_role_local_monolithic_4096_bf16_kernel.py:35]: acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
-            gA_tma = cute.local_tile(tma_tensor_a, (256, 128), (offset_0 // cutlass.Int32(256), None))
-            gB_tma = cute.local_tile(tma_tensor_b, (256, 128), (offset_1 // cutlass.Int32(256), None))
+            gA_tma = cute.local_tile(tma_tensor_a, (256, 128), (tile_offset_0 // cutlass.Int32(256), None))
+            gB_tma = cute.local_tile(tma_tensor_b, (256, 128), (tile_offset_1 // cutlass.Int32(256), None))
             gA_tma_part = tma_thr_mma.partition_A(gA_tma)
             gB_tma_part = tma_thr_mma.partition_B(gB_tma)
             tma_sA, tma_gA = cute.nvgpu.cpasync.tma_partition(tma_atom_a, tma_a_cta_coord, tma_a_cta_layout, cute.group_modes(sA, 0, cute.rank(sA) - 1), cute.group_modes(gA_tma_part, 0, cute.rank(gA_tma_part) - 1))
             tma_sB, tma_gB = cute.nvgpu.cpasync.tma_partition(tma_atom_b, tma_b_cta_coord, tma_b_cta_layout, cute.group_modes(sB, 0, cute.rank(sB) - 1), cute.group_modes(gB_tma_part, 0, cute.rank(gB_tma_part) - 1))
-            tcgen05_tma_initial_full_tile = offset_0 + cutlass.Int32(256) <= cutlass.Int32(4096) and offset_1 + cutlass.Int32(256) <= cutlass.Int32(4096) and (cutlass.Int32(128) <= cutlass.Int32(4096))
+            tcgen05_tma_initial_full_tile = tile_offset_0 + cutlass.Int32(256) <= cutlass.Int32(4096) and tile_offset_1 + cutlass.Int32(256) <= cutlass.Int32(4096) and (cutlass.Int32(128) <= cutlass.Int32(4096))
             if tcgen05_tma_initial_full_tile and tcgen05_tma_warp:
                 tcgen05_ab_pipeline.producer_acquire(tcgen05_ab_producer_state)
                 tcgen05_tma_barrier = tcgen05_ab_pipeline.producer_get_barrier(tcgen05_ab_producer_state)
@@ -131,7 +131,7 @@ def _helion_cute_matmul_role_local_monolithic_4096_bf16(x, y, out, tma_atom_a, t
                 cute.copy(tma_atom_b, tma_gB[None, cutlass.Int32(0)], tma_sB[None, tcgen05_ab_producer_state.index], tma_bar_ptr=tcgen05_tma_barrier, mcast_mask=tcgen05_b_mcast_mask)
                 tcgen05_ab_pipeline.producer_commit(tcgen05_ab_producer_state)
                 tcgen05_ab_producer_state.advance()
-            tcgen05_tma_initial_next_full_tile = offset_0 + cutlass.Int32(256) <= cutlass.Int32(4096) and offset_1 + cutlass.Int32(256) <= cutlass.Int32(4096) and (cutlass.Int32(256) <= cutlass.Int32(4096))
+            tcgen05_tma_initial_next_full_tile = tile_offset_0 + cutlass.Int32(256) <= cutlass.Int32(4096) and tile_offset_1 + cutlass.Int32(256) <= cutlass.Int32(4096) and (cutlass.Int32(256) <= cutlass.Int32(4096))
             if tcgen05_tma_initial_full_tile and tcgen05_tma_initial_next_full_tile and tcgen05_tma_warp:
                 tcgen05_ab_pipeline.producer_acquire(tcgen05_ab_producer_state)
                 tcgen05_tma_barrier = tcgen05_ab_pipeline.producer_get_barrier(tcgen05_ab_producer_state)
@@ -139,10 +139,10 @@ def _helion_cute_matmul_role_local_monolithic_4096_bf16(x, y, out, tma_atom_a, t
                 cute.copy(tma_atom_b, tma_gB[None, cutlass.Int32(1)], tma_sB[None, tcgen05_ab_producer_state.index], tma_bar_ptr=tcgen05_tma_barrier, mcast_mask=tcgen05_b_mcast_mask)
                 tcgen05_ab_pipeline.producer_commit(tcgen05_ab_producer_state)
                 tcgen05_ab_producer_state.advance()
-            for offset_2 in range(cutlass.Int32(0), cutlass.Int32(4096), cutlass.Int32(_BLOCK_SIZE_2)):
-                tcgen05_tma_k_tile = offset_2 // cutlass.Int32(128)
-                tcgen05_tma_full_tile = offset_0 + cutlass.Int32(256) <= cutlass.Int32(4096) and offset_1 + cutlass.Int32(256) <= cutlass.Int32(4096) and (offset_2 + cutlass.Int32(128) <= cutlass.Int32(4096))
-                tcgen05_tma_next_full_tile = offset_0 + cutlass.Int32(256) <= cutlass.Int32(4096) and offset_1 + cutlass.Int32(256) <= cutlass.Int32(4096) and (offset_2 + cutlass.Int32(384) <= cutlass.Int32(4096))
+            for tile_offset_2 in range(cutlass.Int32(0), cutlass.Int32(4096), cutlass.Int32(_BLOCK_SIZE_2)):
+                tcgen05_tma_k_tile = tile_offset_2 // cutlass.Int32(128)
+                tcgen05_tma_full_tile = tile_offset_0 + cutlass.Int32(256) <= cutlass.Int32(4096) and tile_offset_1 + cutlass.Int32(256) <= cutlass.Int32(4096) and (tile_offset_2 + cutlass.Int32(128) <= cutlass.Int32(4096))
+                tcgen05_tma_next_full_tile = tile_offset_0 + cutlass.Int32(256) <= cutlass.Int32(4096) and tile_offset_1 + cutlass.Int32(256) <= cutlass.Int32(4096) and (tile_offset_2 + cutlass.Int32(384) <= cutlass.Int32(4096))
                 tcgen05_ab_producer_try_token = cutlass.Boolean(0)
                 if tcgen05_tma_full_tile and tcgen05_tma_next_full_tile:
                     tcgen05_ab_producer_try_token = tcgen05_ab_pipeline.producer_try_acquire(tcgen05_ab_producer_state)
@@ -167,8 +167,8 @@ def _helion_cute_matmul_role_local_monolithic_4096_bf16(x, y, out, tma_atom_a, t
             # src[_tcgen05_role_local_monolithic_4096_bf16_kernel.py:32]: for tile_m, tile_n in hl.tile([m, n]):
             pid_0 = virtual_pid % num_blocks_0
             pid_1 = virtual_pid // num_blocks_0
-            offset_0 = pid_0 * _BLOCK_SIZE_0
-            offset_1 = pid_1 * _BLOCK_SIZE_1
+            tile_offset_0 = pid_0 * _BLOCK_SIZE_0
+            tile_offset_1 = pid_1 * _BLOCK_SIZE_1
             # src[_tcgen05_role_local_monolithic_4096_bf16_kernel.py:35]: acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
             acc_frag = tcgen05_exec_acc_frag_base[None, None, None, tcgen05_acc_producer_state.index]
             tcgen05_ab_consumer_try_token = cutlass.Boolean(1)
@@ -178,12 +178,12 @@ def _helion_cute_matmul_role_local_monolithic_4096_bf16(x, y, out, tma_atom_a, t
                 tcgen05_acc_pipeline.producer_acquire(tcgen05_acc_producer_state)
             if tcgen05_exec_active and cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster()) == cutlass.Int32(0):
                 tiled_mma.set(cute.nvgpu.tcgen05.Field.ACCUMULATE, False)
-            for offset_2 in range(cutlass.Int32(0), cutlass.Int32(4096), cutlass.Int32(_BLOCK_SIZE_2)):
+            for tile_offset_2 in range(cutlass.Int32(0), cutlass.Int32(4096), cutlass.Int32(_BLOCK_SIZE_2)):
                 mma_stage = tcgen05_ab_consumer_state.index
                 sA_mma = sA[None, 0, 0, mma_stage]
                 sB_mma = sB[None, 0, 0, mma_stage]
-                tcgen05_tma_full_tile = offset_0 + cutlass.Int32(256) <= cutlass.Int32(4096) and offset_1 + cutlass.Int32(256) <= cutlass.Int32(4096) and (offset_2 + cutlass.Int32(128) <= cutlass.Int32(4096))
-                tcgen05_tma_next_consumer_tile = offset_2 + cutlass.Int32(256) <= cutlass.Int32(4096)
+                tcgen05_tma_full_tile = tile_offset_0 + cutlass.Int32(256) <= cutlass.Int32(4096) and tile_offset_1 + cutlass.Int32(256) <= cutlass.Int32(4096) and (tile_offset_2 + cutlass.Int32(128) <= cutlass.Int32(4096))
+                tcgen05_tma_next_consumer_tile = tile_offset_2 + cutlass.Int32(256) <= cutlass.Int32(4096)
                 if tcgen05_tma_full_tile:
                     if cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster()) == cutlass.Int32(0):
                         tcgen05_ab_pipeline.consumer_wait(tcgen05_ab_consumer_state, tcgen05_ab_consumer_try_token)
@@ -217,13 +217,13 @@ def _helion_cute_matmul_role_local_monolithic_4096_bf16(x, y, out, tma_atom_a, t
             # src[_tcgen05_role_local_monolithic_4096_bf16_kernel.py:32]: for tile_m, tile_n in hl.tile([m, n]):
             pid_0 = virtual_pid % num_blocks_0
             pid_1 = virtual_pid // num_blocks_0
-            offset_0 = pid_0 * _BLOCK_SIZE_0
-            offset_1 = pid_1 * _BLOCK_SIZE_1
+            tile_offset_0 = pid_0 * _BLOCK_SIZE_0
+            tile_offset_1 = pid_1 * _BLOCK_SIZE_1
             # src[_tcgen05_role_local_monolithic_4096_bf16_kernel.py:36]: out[tile_m, tile_n] = acc.to(x.dtype)
             if True:
                 if tcgen05_epi_active and tcgen05_warp_idx == cutlass.Int32(0):
                     tcgen05_c_pipeline.producer_acquire()
-                tcgen05_gC = cute.local_tile(tcgen05_tma_store_tensor, (256, 256), (offset_0 // cutlass.Int32(256), offset_1 // cutlass.Int32(256)))
+                tcgen05_gC = cute.local_tile(tcgen05_tma_store_tensor, (256, 256), (tile_offset_0 // cutlass.Int32(256), tile_offset_1 // cutlass.Int32(256)))
                 tcgen05_tCgC_base = thr_mma.partition_C(tcgen05_gC)
                 tcgen05_tCgC = cutlass.utils.gemm.sm100.transform_partitioned_tensor_layout(tcgen05_tCgC_base)
                 tcgen05_tCgC_planned = cute.make_tensor(tcgen05_tCgC.iterator, cute.append(cute.append(cute.append(tcgen05_tCgC.layout, tcgen05_epilogue_rest_mode), tcgen05_epilogue_rest_mode), tcgen05_epilogue_rest_mode))

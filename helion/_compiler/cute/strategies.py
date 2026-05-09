@@ -234,6 +234,22 @@ class Tcgen05LayoutOverrides:
     only the structural shape (types + ranges) — atom-contract checks
     against the active problem shape happen in lowering once the
     strategy is consumed there.
+
+    ``smem_swizzle_a`` / ``smem_swizzle_b`` (user-config exposure only):
+        Selects the A/B operand SMEM atom kind
+        (``cute.nvgpu.tcgen05.SmemLayoutAtomKind``) by byte value
+        (one of ``TCGEN05_LEGAL_SMEM_SWIZZLE_BYTES``: ``0`` /
+        ``32`` / ``64`` / ``128``). ``None`` ⇒ delegate to CuTe's
+        ``get_smem_layout_atom_ab`` greedy auto-inference (the
+        canonical-seed byte-identity path).
+
+        **The autotuner does not sample swizzle overrides.** The
+        canonical seed's auto-inference picks ``SW128`` (the
+        optimal value), so adding the swizzle to the autotune
+        fragment surface would only sample regressions. A future
+        cycle that finds a per-shape win (e.g. tiny ``bk`` shapes
+        where ``major_mode_bytes < 128`` gates ``SW128``) can lift
+        this and add the swizzle to the autotune fragment surface.
     """
 
     epi_tile_m: int | None = None
@@ -241,6 +257,154 @@ class Tcgen05LayoutOverrides:
     smem_swizzle_a: int | None = None
     smem_swizzle_b: int | None = None
     d_store_box_n: int | None = None
+
+
+# Legal SMEM atom swizzle byte values for ``Tcgen05LayoutOverrides.smem_swizzle_*``.
+# Maps to ``cutlass.cute.nvgpu.tcgen05.SmemLayoutAtomKind`` as follows:
+#
+# - ``0``  → ``{K|MN}_INTER`` (no swizzle, 16-byte interleave atom)
+# - ``32`` → ``{K|MN}_SW32``  (32-byte swizzle pattern)
+# - ``64`` → ``{K|MN}_SW64``  (64-byte swizzle pattern)
+# - ``128``→ ``{K|MN}_SW128`` (128-byte swizzle pattern)
+#
+# The K/MN prefix is determined by the operand's major mode (A is K-major,
+# B is MN-major in Helion's tcgen05 lowering today). ``MN_SW128_32B``
+# (a fp32-only variant) is intentionally not exposed: Helion's tcgen05
+# path only runs on bf16/fp16 today, and exposing the variant without a
+# matching dtype gate would produce ``ValueError`` at codegen time.
+TCGEN05_LEGAL_SMEM_SWIZZLE_BYTES: tuple[int, ...] = (0, 32, 64, 128)
+
+# Mapping from the swizzle byte choice to the smallest legal major-mode
+# bytes-per-row. CuTe's auto-inference (``get_smem_layout_atom_ab``)
+# requires ``major_mode_size_bits % num_contiguous_bits == 0`` where
+# ``num_contiguous_bits`` is ``128 / 256 / 512 / 1024`` for INTER /
+# SW32 / SW64 / SW128. We expose the bytes equivalent so the codegen
+# validator can compute ``major_mode_bytes`` from the active tile shape
+# + dtype and reject illegal user overrides with a clean error.
+_TCGEN05_SMEM_SWIZZLE_BYTE_TO_MIN_MAJOR_BYTES: dict[int, int] = {
+    0: 16,  # INTER: 128 contiguous bits = 16 bytes
+    32: 32,  # SW32: 256 contiguous bits = 32 bytes
+    64: 64,  # SW64: 512 contiguous bits = 64 bytes
+    128: 128,  # SW128: 1024 contiguous bits = 128 bytes
+}
+
+
+def smem_swizzle_min_major_mode_bytes(swizzle_bytes: int) -> int:
+    """Smallest legal major-mode bytes-per-row for the given swizzle.
+
+    Used by ``cute_mma.py`` codegen-time validation: a user-provided
+    ``smem_swizzle_a/b`` override must agree with the active tile
+    shape + dtype's major-mode bytes-per-row, otherwise CuTe's
+    ``make_smem_layout_atom`` would build a layout that the TMA
+    contract rejects at runtime.
+    """
+    if swizzle_bytes not in _TCGEN05_SMEM_SWIZZLE_BYTE_TO_MIN_MAJOR_BYTES:
+        raise ValueError(
+            f"smem_swizzle_min_major_mode_bytes: {swizzle_bytes!r} is not "
+            f"a legal swizzle byte choice; expected one of "
+            f"{TCGEN05_LEGAL_SMEM_SWIZZLE_BYTES!r}"
+        )
+    return _TCGEN05_SMEM_SWIZZLE_BYTE_TO_MIN_MAJOR_BYTES[swizzle_bytes]
+
+
+def smem_swizzle_atom_kind_suffix(swizzle_bytes: int) -> str:
+    """Map swizzle bytes to the SmemLayoutAtomKind suffix.
+
+    Returns ``"INTER"``, ``"SW32"``, ``"SW64"``, or ``"SW128"`` so the
+    codegen call site can build ``cute.nvgpu.tcgen05.SmemLayoutAtomKind.K_<suffix>``
+    or ``...MN_<suffix>``. Caller picks the K/MN prefix from the operand's
+    major mode.
+    """
+    if swizzle_bytes not in _TCGEN05_SMEM_SWIZZLE_BYTE_TO_MIN_MAJOR_BYTES:
+        raise ValueError(
+            f"smem_swizzle_atom_kind_suffix: {swizzle_bytes!r} is not "
+            f"a legal swizzle byte choice; expected one of "
+            f"{TCGEN05_LEGAL_SMEM_SWIZZLE_BYTES!r}"
+        )
+    if swizzle_bytes == 0:
+        return "INTER"
+    return f"SW{swizzle_bytes}"
+
+
+def tcgen05_smem_layout_expr(
+    *,
+    tiled_mma: str,
+    bm: int,
+    bn: int,
+    bk: int,
+    dtype_str: str,
+    num_stages: int,
+    operand: str,
+    swizzle_override: int | None,
+) -> str:
+    """Emit the CuTe expression that builds the staged SMEM layout for A or B.
+
+    Single source of truth for the device-side
+    (``cute_mma._make_tcgen05_layout_plan_setup``) and host-side
+    (``runtime._append_cute_wrapper_plan``) atom expression: the two
+    sides must agree byte-for-byte or the TMA descriptor mismatches
+    the SMEM staging at runtime, so both codegen paths call this
+    helper rather than emitting their own strings.
+
+    With ``swizzle_override=None`` (the default) we delegate the atom
+    kind selection to CuTe's ``make_smem_layout_a`` / ``make_smem_layout_b``
+    helpers — that is the byte-identity behavior, kept unchanged on
+    the canonical 4096³ seed.
+
+    With an explicit ``swizzle_override`` (one of
+    ``TCGEN05_LEGAL_SMEM_SWIZZLE_BYTES`` — 0/32/64/128) we inline the
+    body of ``make_smem_layout_a/b`` and substitute the chosen
+    ``SmemLayoutAtomKind`` so the user-facing
+    ``Tcgen05LayoutOverrides.smem_swizzle_*`` knob becomes load-bearing.
+    The path mirrors CuTe's helper exactly except for the atom-kind
+    selection: partition_shape → append num_stages → make atom →
+    tile_to_mma_shape with the major-mode-determined ``order``.
+
+    Helion's tcgen05 lowering wires ``OperandMajorMode.K`` for A and
+    ``OperandMajorMode.MN`` for B (see ``make_trivial_tiled_mma``
+    call in ``runtime._append_cute_wrapper_plan``), so the ``order``
+    and atom-kind prefix below are hard-coded to that contract.
+    """
+    if operand == "a":
+        if swizzle_override is None:
+            return (
+                "cutlass.utils.blackwell_helpers.make_smem_layout_a("
+                f"{tiled_mma}, ({bm}, {bn}, {bk}), {dtype_str}, {num_stages})"
+            )
+        atom_kind = (
+            f"cute.nvgpu.tcgen05.SmemLayoutAtomKind.K_"
+            f"{smem_swizzle_atom_kind_suffix(swizzle_override)}"
+        )
+        # A is K-major: partition shape uses dice (1, None, 1); the
+        # tile_to_mma_shape ``order`` is (1, 2, 3) (matches the
+        # is_k_major=True branch of ``make_smem_layout_a``).
+        return (
+            "cute.nvgpu.tcgen05.tile_to_mma_shape("
+            f"cute.nvgpu.tcgen05.make_smem_layout_atom({atom_kind}, {dtype_str}), "
+            f"cute.append({tiled_mma}.partition_shape_A("
+            f"cute.dice(({bm}, {bn}, {bk}), (1, None, 1))), {num_stages}), "
+            "order=(1, 2, 3))"
+        )
+    assert operand == "b", f"unexpected operand {operand!r}"
+    if swizzle_override is None:
+        return (
+            "cutlass.utils.blackwell_helpers.make_smem_layout_b("
+            f"{tiled_mma}, ({bm}, {bn}, {bk}), {dtype_str}, {num_stages})"
+        )
+    atom_kind = (
+        f"cute.nvgpu.tcgen05.SmemLayoutAtomKind.MN_"
+        f"{smem_swizzle_atom_kind_suffix(swizzle_override)}"
+    )
+    # B is MN-major: partition shape uses dice (None, 1, 1); the
+    # tile_to_mma_shape ``order`` is (2, 1, 3) (matches the
+    # is_k_major=False branch of ``make_smem_layout_b``).
+    return (
+        "cute.nvgpu.tcgen05.tile_to_mma_shape("
+        f"cute.nvgpu.tcgen05.make_smem_layout_atom({atom_kind}, {dtype_str}), "
+        f"cute.append({tiled_mma}.partition_shape_B("
+        f"cute.dice(({bm}, {bn}, {bk}), (None, 1, 1))), {num_stages}), "
+        "order=(2, 1, 3))"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -286,6 +450,28 @@ TCGEN05_WARP_SPEC_REGISTER_INCREASE_KEY = "tcgen05_warp_spec_register_increase"
 # time by ``narrow_tcgen05_autotune_to_validated_configs``.
 TCGEN05_NUM_EPI_WARPS_CONFIG_KEY = "tcgen05_num_epi_warps"
 
+# L2 tile-scheduler swizzle size (Quack ``max_swizzle_size`` equivalent).
+# Threaded into ``cutlass.utils.PersistentTileSchedulerParams`` as the
+# ``swizzle_size`` kwarg. ``1`` means no swizzle (current default,
+# byte-identity-pinned); larger values group consecutive cluster
+# linear-IDs along the slow raster axis to improve L2 reuse on
+# bandwidth-bound shapes. The CuTe-DSL scheduler already implements the
+# grouping math; this knob just routes the user/autotuner choice into
+# the constructor instead of relying on the ``swizzle_size=1`` default.
+TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY = "tcgen05_l2_swizzle_size"
+
+# Legal L2 tile-scheduler swizzle sizes. ``1`` means no swizzle (current
+# default), the others mirror Quack's ``max_swizzle_size`` envelope (the
+# upstream knob accepts powers of two from ``1`` up). The accept set is
+# intentionally narrowed to powers of two ``<= 32`` so the autotuner
+# does not waste budget exploring values that exceed any practical
+# raster cluster count on B200; users who need a larger value can
+# extend this set explicitly.
+TCGEN05_LEGAL_L2_SWIZZLE_SIZES: tuple[int, ...] = (1, 2, 4, 8, 16, 32)
+
+# Default L2 swizzle size (no swizzle = byte-identity-preserved).
+TCGEN05_L2_SWIZZLE_SIZE_DEFAULT: int = 1
+
 TCGEN05_WARP_SPEC_KEYS: tuple[str, ...] = (
     TCGEN05_WARP_SPEC_AB_LOAD_WARPS_KEY,
     TCGEN05_WARP_SPEC_MMA_WARPS_KEY,
@@ -323,6 +509,25 @@ TCGEN05_STRATEGY_CONFIG_KEYS: tuple[str, ...] = (
     *TCGEN05_WARP_SPEC_KEYS,
     *TCGEN05_LAYOUT_OVERRIDES_KEYS,
 )
+
+
+def l2_swizzle_size_from_config(config: Mapping[str, object]) -> int:
+    """Read ``tcgen05_l2_swizzle_size`` out of a normalized config.
+
+    Defaults to ``TCGEN05_L2_SWIZZLE_SIZE_DEFAULT`` (= ``1`` = no
+    swizzle). Returns the raw integer; the codegen call site is
+    responsible for emitting ``swizzle_size=`` as a kwarg to
+    ``cutlass.utils.PersistentTileSchedulerParams(...)`` and for
+    suppressing the kwarg when the value is ``1`` so the no-swizzle
+    path stays byte-identical to pre-cycle-42. ``ConfigSpec.normalize``
+    has already validated this knob against ``EnumFragment(int)`` so
+    the value is guaranteed to be a positive integer at this point.
+    """
+    value = config.get(
+        TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY, TCGEN05_L2_SWIZZLE_SIZE_DEFAULT
+    )
+    return int(value)  # type: ignore[arg-type]
+
 
 # Default values for the role-local-monolithic warp spec, keyed for
 # config insertion. ``epi_warps`` is sourced from
@@ -803,17 +1008,52 @@ def validate_tcgen05_strategy_invariants(
         )
 
     # Layout overrides may only carry concrete values under the
-    # explicit-epi-tile layout strategy. Today only the DEFAULT
-    # strategy is wired through codegen, so any non-None override
-    # under DEFAULT would silently be ignored — surface that loudly.
+    # explicit-epi-tile layout strategy *for fields that depend on the
+    # epi-tile shape*. ``smem_swizzle_a`` / ``smem_swizzle_b`` are
+    # orthogonal to ``compute_epilogue_tile_shape`` — they control the
+    # A/B operand SMEM atom selection, not the D-output epilogue tile —
+    # so the swizzle codegen wiring accepts the swizzle overrides under
+    # both ``DEFAULT`` and ``EXPLICIT_EPI_TILE``. Other override fields
+    # (``epi_tile_m``, ``epi_tile_n``, ``d_store_box_n``) still gate on
+    # ``EXPLICIT_EPI_TILE`` because they only have meaning when the
+    # explicit-epi-tile codegen path consumes them; under ``DEFAULT``
+    # they would be silently ignored.
+    _SWIZZLE_OVERRIDE_FIELDS = frozenset({"smem_swizzle_a", "smem_swizzle_b"})
     if layout_strategy is Tcgen05LayoutStrategy.DEFAULT:
         for field_name, value in dataclasses.asdict(layout_overrides).items():
-            if value is not None:
+            if value is None:
+                continue
+            if field_name in _SWIZZLE_OVERRIDE_FIELDS:
+                # Swizzle override is wired under DEFAULT. Validate the
+                # value is a legal swizzle byte choice here so
+                # user-facing errors fire at config-time rather than
+                # crashing inside CuTe's atom builder.
+                if value not in TCGEN05_LEGAL_SMEM_SWIZZLE_BYTES:
+                    errors.append(
+                        f"layout_overrides.{field_name}={value!r} must be "
+                        f"one of {TCGEN05_LEGAL_SMEM_SWIZZLE_BYTES!r} "
+                        "(swizzle bytes; 0 = no swizzle / INTER)"
+                    )
+                continue
+            errors.append(
+                f"layout_overrides.{field_name}={value!r} requires "
+                f"tcgen05_layout_strategy="
+                f"{Tcgen05LayoutStrategy.EXPLICIT_EPI_TILE.value!r}; "
+                f"got {layout_strategy.value!r}"
+            )
+    else:
+        # ``EXPLICIT_EPI_TILE``: still validate the swizzle byte choice.
+        # The atom-contract check against the active tile shape happens
+        # in lowering once codegen consumes the value.
+        for field_name in _SWIZZLE_OVERRIDE_FIELDS:
+            value = getattr(layout_overrides, field_name)
+            if value is None:
+                continue
+            if value not in TCGEN05_LEGAL_SMEM_SWIZZLE_BYTES:
                 errors.append(
-                    f"layout_overrides.{field_name}={value!r} requires "
-                    f"tcgen05_layout_strategy="
-                    f"{Tcgen05LayoutStrategy.EXPLICIT_EPI_TILE.value!r}; "
-                    f"got {layout_strategy.value!r}"
+                    f"layout_overrides.{field_name}={value!r} must be "
+                    f"one of {TCGEN05_LEGAL_SMEM_SWIZZLE_BYTES!r} "
+                    "(swizzle bytes; 0 = no swizzle / INTER)"
                 )
 
     return errors

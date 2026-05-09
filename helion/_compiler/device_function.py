@@ -319,6 +319,14 @@ class CuteTcgen05MatmulPlan:
     # See cute_plan.md §6.12 for the V-leader gate / mcast_size derivation
     # that lets cluster_n=2 close the G2 perf gap.
     cluster_n: int = 1
+    # ``l2_swizzle_size`` is the L2 tile-scheduler grouping factor (Quack's
+    # ``max_swizzle_size`` equivalent). Default 1 means no swizzle (the
+    # cycle 41 byte-identity path); concrete values map onto
+    # ``cutlass.utils.PersistentTileSchedulerParams(swizzle_size=...)``,
+    # which groups consecutive cluster linear-IDs along the slow raster
+    # axis to promote L2 reuse on bandwidth-bound shapes.
+    # See ``cute_plan.md`` §7.6.7 (cycle 42 wiring + bench).
+    l2_swizzle_size: int = 1
 
     @property
     def is_clc_persistent(self) -> bool:
