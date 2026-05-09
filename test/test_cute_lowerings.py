@@ -4736,6 +4736,186 @@ class TestCuteLowerings(unittest.TestCase):
                 expected = args[0] @ args[1]
                 torch.testing.assert_close(out, expected, atol=2e-1, rtol=1e-2)
 
+    def test_tcgen05_persistent_cluster_n2_codegen_emits_4cta_cluster(
+        self,
+    ) -> None:
+        """G2 cluster_n=2 codegen markers (cute_plan.md §6.12.7).
+
+        Pins the codegen surface for the canonical Quack-best 4-CTA
+        cluster: ``cluster_m=2 cluster_n=2 use_2cta=True``. Asserts:
+
+        - ``cluster_layout_vmnk`` shape becomes ``(2, 2, 1)``.
+        - The launch grid x/y dims become ``(2, 2, ...)`` (not
+          ``(2, 1, ...)``).
+        - The PersistentTileSchedulerParams cluster shape is
+          ``(2, 2, 1)``.
+        - The AB consumer arrive count becomes 2 (mcast_size formula at
+          V=2: ``num_mcast_ctas_a + num_mcast_ctas_b - 1 = 2 + 1 - 1``).
+        - The V-leader gate emits ``% cutlass.Int32(2) == cutlass.Int32(0)``
+          for AB consumer-release / MMA issue (instead of the cluster_n=1
+          ``== cutlass.Int32(0)`` form).
+        - The plan persists ``cluster_n=2``.
+
+        This is a *codegen* test only — the runtime correctness test is
+        ``test_tcgen05_persistent_cluster_n2_two_cta_runtime_correctness``.
+        """
+
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_cluster_n2(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        torch.manual_seed(0)
+        # Use a problem big enough that both M and N divide by
+        # cluster_m * bm = 512 and cluster_n * bn = 512 respectively.
+        args = (
+            torch.randn(1024, 128, device=DEVICE, dtype=torch.bfloat16),
+            torch.randn(128, 1024, device=DEVICE, dtype=torch.bfloat16),
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_cluster_n2.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            cfg = _make_tcgen05_persistent_config(
+                block_sizes=[256, 256, 128],
+                l2_groupings=[1],
+                pid_type="persistent_interleaved",
+                tcgen05_cluster_m=2,
+                tcgen05_cluster_n=2,
+                tcgen05_ab_stages=2,
+                tcgen05_acc_stages=2,
+                tcgen05_c_stages=2,
+            )
+            bound.set_config(cfg)
+            code = bound.to_triton_code(cfg)
+
+        # CtaGroup.TWO selection still applies (cluster_m=2 + bm=256).
+        self.assertIn("cute.nvgpu.tcgen05.CtaGroup.TWO", code)
+        # cluster_layout_vmnk shape is (2, 2, 1).
+        self.assertIn(
+            "tcgen05_cluster_layout_vmnk = cute.tiled_divide("
+            "cute.make_layout((2, 2, 1)), (tiled_mma.thr_id.shape,))",
+            code,
+        )
+        # PersistentTileSchedulerParams cluster shape is (2, 2, 1).
+        # Anchor the cluster-shape literal on the trailing call closer
+        # ``(2, 2, 1))`` so a regression that swaps two of the three
+        # (2, 2, 1) literal sites (cluster_layout_vmnk, scheduler params,
+        # launch grid) still fails this assertion individually.
+        self.assertIn(
+            "cutlass.utils.PersistentTileSchedulerParams(",
+            code,
+        )
+        self.assertIn(", (2, 2, 1))", code)
+        # AB consumer arrive count is 2 (mcast_size formula at V=2
+        # cluster_n=2: 2 + 1 - 1).
+        self.assertIn(
+            "tcgen05_ab_pipeline_consumer_group = "
+            "cutlass.pipeline.CooperativeGroup("
+            "cutlass.pipeline.Agent.Thread, cutlass.Int32(2))",
+            code,
+        )
+        # V-leader gate uses ``% Int32(2) == Int32(0)`` (not bare
+        # ``== Int32(0)``) for AB-pair / MMA owner predicates.
+        self.assertIn(
+            "cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster()) "
+            "% cutlass.Int32(2) == cutlass.Int32(0)",
+            code,
+        )
+        # Launch-grid x/y match the cluster shape ``(2, 2, ...)``;
+        # anchor on the launcher signature so a regression of the
+        # cluster_n axis in ``codegen_grid`` fails loudly.
+        self.assertRegex(code, r"_launcher\([^,]+,\s*\(2,\s*2,\s*")
+        # Launch-grid persistent-capacity divisor is ``_NUM_SM // 2``
+        # (cluster_m), NOT ``_NUM_SM // 4`` (cluster_size = cluster_m
+        # * cluster_n). The latter caps cluster_n=2 at one wave of
+        # 37 cluster slots × 4 CTAs and starves the GPU of wave-overlap
+        # parallelism; the cluster_m divisor matches the cluster_n=1
+        # baseline so each cluster slot still consumes one SM. Anchor
+        # on the ``max(1, _NUM_SM // 2)`` envelope (the launcher emits
+        # ``min(total_clusters, max(1, _NUM_SM // cluster_m))`` for
+        # this seed) so a regression of either branch (``// 4``
+        # re-introduced or ``// 2`` lost) fails this assertion.
+        self.assertIn("max(1, _NUM_SM // 2)", code)
+        self.assertNotIn("_NUM_SM // 4", code)
+        # cluster_n=2 plumbing is exercised end-to-end by the codegen
+        # markers above (no plan-field round-trip is asserted here —
+        # the validator-surface coverage lives in
+        # ``test_cute_tcgen05_strategy_invariants_cluster_n``).
+
+    def test_tcgen05_persistent_cluster_n2_two_cta_runtime_correctness(
+        self,
+    ) -> None:
+        """G2 cluster_n=2 runtime correctness (cute_plan.md §6.12.7 step 5).
+
+        Smoke test for the canonical Quack-best 4-CTA cluster
+        ``cluster_m=2 cluster_n=2 use_2cta=True`` at a small shape so
+        the test runs in CI: 1024x1024x128 bf16. The V-leader gate
+        (cute_plan.md §6.12.3) is the load-bearing fix; without it the
+        kernel hangs (cycle 26 reproducer).
+
+        If this test hangs, the V-leader gate / arrive-count plumbing
+        is wrong somewhere. This is the *only* end-to-end gate that
+        catches a regression of the hang fix.
+        """
+
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_cluster_n2_runtime(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        torch.manual_seed(0)
+        # 1024x1024x128 with bm=256 bn=256 bk=128 → 4x4 logical tiles,
+        # which the 4-CTA cluster splits into 2x2 cluster slots × 4 K
+        # tiles. Big enough to exercise multiple K iterations and
+        # multiple cluster work tiles.
+        args = (
+            torch.randn(1024, 128, device=DEVICE, dtype=torch.bfloat16),
+            torch.randn(128, 1024, device=DEVICE, dtype=torch.bfloat16),
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_cluster_n2_runtime.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            cfg = _make_tcgen05_persistent_config(
+                block_sizes=[256, 256, 128],
+                l2_groupings=[1],
+                pid_type="persistent_interleaved",
+                tcgen05_cluster_m=2,
+                tcgen05_cluster_n=2,
+                tcgen05_ab_stages=2,
+                tcgen05_acc_stages=2,
+                tcgen05_c_stages=2,
+            )
+            bound.set_config(cfg)
+            out = bound(*args)
+        expected = args[0] @ args[1]
+        torch.testing.assert_close(out, expected, atol=2e-1, rtol=1e-2)
+
     def test_tcgen05_persistent_cluster_m2_two_cta_grid_caps_for_recycling(
         self,
     ) -> None:

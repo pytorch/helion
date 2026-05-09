@@ -102,8 +102,23 @@ _TRACE_THROUGH_TARGETS = {
 # reference (`gemm_sm100.py`).
 _TCGEN05_PRODUCER_REGS = 120
 _TCGEN05_CONSUMER_REGS = 256
+# Cluster-leader (cta_rank == 0) form. Used only when V-leader semantics
+# degenerate to cluster-leader -- i.e. cluster_size == V (no V-non-leader
+# CTAs), today's cluster_m=2 cluster_n=1 use_2cta=True path. Preserves the
+# cluster_n=1 byte-identity golden.
 _TCGEN05_CLUSTER_LEADER_PREDICATE = (
     "cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster()) == cutlass.Int32(0)"
+)
+# V-leader form: ``cta_rank % V == 0``. Required for cluster_m=2 cluster_n=2
+# use_2cta=True (V=2) where V-leaders are ranks {0, 2} but the cluster-leader
+# is only {0}. The V-non-leaders {1, 3} hold their V-pair's TMEM allocation
+# and *do not* commit on the AB consumer-release barrier — only V-leaders
+# {0, 2} do. See cute_plan.md §6.12.3 for the full diagnosis: cycle 26's hang
+# at cluster_n=2 was caused by Helion using the cluster-leader form here,
+# which only fires from rank 0 and races ranks {2, 3}.
+_TCGEN05_V_LEADER_PREDICATE = (
+    "cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster()) "
+    "% cutlass.Int32(2) == cutlass.Int32(0)"
 )
 
 # Named-barrier ids reserved by Helion's tcgen05 codegen. Kept as module
@@ -796,6 +811,11 @@ class _PerKiterTmaArgs:
     exec_active: str
     scalar_load_a: ast.stmt
     scalar_load_b: ast.stmt
+    # ``cluster_n`` is only consulted when ``is_two_cta=True`` to pick the
+    # V-leader vs cluster-leader form for the AB consumer-release predicate
+    # (cute_plan.md §6.12.7). Default 1 preserves byte-identity for the
+    # validated cluster_m=2 cluster_n=1 path.
+    cluster_n: int = 1
 
 
 def _kloop_tma_copy_a_src(args: _PerKiterTmaArgs, *, k_offset: str) -> str:
@@ -834,13 +854,32 @@ def _kloop_tma_copy_b_src(args: _PerKiterTmaArgs, *, k_offset: str) -> str:
 
 
 def _tcgen05_two_cta_owner_predicate(
-    exec_active: str, *, is_two_cta: bool, gate_exec_warp: bool
+    exec_active: str,
+    *,
+    is_two_cta: bool,
+    gate_exec_warp: bool,
+    cluster_n: int = 1,
 ) -> str | None:
+    """Owner-of-the-V-pair predicate for AB consumer release / MMA issuance.
+
+    At ``is_two_cta=True`` V=2; the predicate must fire only on the V-leader
+    of each V-pair so the AB consumer-release barrier and MMA issuance are
+    *not* duplicated by the V-non-leader CTA. With ``cluster_n=1`` the only
+    V-pair has V-leader rank 0 (cluster-leader), so the cheaper ``rank == 0``
+    spelling is used to preserve the validated cluster_n=1 byte-identity
+    golden. With ``cluster_n=2`` there are two V-pairs (V-leaders {0, 2})
+    so the predicate must use ``rank % 2 == 0``; rank 2 must commit on its
+    own V-pair's empty barrier or the cluster races (cycle-26 hang root
+    cause; see cute_plan.md §6.12.3).
+    """
     predicate_terms = []
     if gate_exec_warp:
         predicate_terms.append(exec_active)
     if is_two_cta:
-        predicate_terms.append(_TCGEN05_CLUSTER_LEADER_PREDICATE)
+        if cluster_n > 1:
+            predicate_terms.append(_TCGEN05_V_LEADER_PREDICATE)
+        else:
+            predicate_terms.append(_TCGEN05_CLUSTER_LEADER_PREDICATE)
     if not predicate_terms:
         return None
     return " and ".join(predicate_terms)
@@ -925,6 +964,7 @@ def _build_kloop_pipeline_consumer_if(
             args.exec_active,
             is_two_cta=args.is_two_cta,
             gate_exec_warp=gate_exec_warp,
+            cluster_n=args.cluster_n,
         ),
         indent="    ",
     )
@@ -951,7 +991,10 @@ def _build_kloop_pipeline_consumer_prefetch_stmts(
     assert args.is_two_cta, "AB consumer prefetch is validated for CtaGroup.TWO"
     predicate = args.tma_next_consumer_tile
     owner_predicate = _tcgen05_two_cta_owner_predicate(
-        args.exec_active, is_two_cta=args.is_two_cta, gate_exec_warp=gate_exec_warp
+        args.exec_active,
+        is_two_cta=args.is_two_cta,
+        gate_exec_warp=gate_exec_warp,
+        cluster_n=args.cluster_n,
     )
     if owner_predicate is not None:
         predicate = f"{predicate} and {owner_predicate}"
@@ -982,7 +1025,10 @@ def _build_kloop_pipeline_release_if(
     """
     release_src = f"{args.tma_pipeline}.consumer_release({args.tma_consumer_state})"
     release_gate = _tcgen05_two_cta_owner_predicate(
-        args.exec_active, is_two_cta=args.is_two_cta, gate_exec_warp=gate_exec_warp
+        args.exec_active,
+        is_two_cta=args.is_two_cta,
+        gate_exec_warp=gate_exec_warp,
+        cluster_n=args.cluster_n,
     )
     advance_src = emit_pipeline_advance(args.tma_consumer_state)
     if args.is_two_cta:
@@ -1011,10 +1057,14 @@ def _build_tcgen05_mma_accumulate_reset_stmt(
     tiled_mma: str,
     gate_exec_warp: bool = True,
     is_two_cta: bool = False,
+    cluster_n: int = 1,
 ) -> ast.stmt:
     reset_src = f"{tiled_mma}.set(cute.nvgpu.tcgen05.Field.ACCUMULATE, False)"
     predicate = _tcgen05_two_cta_owner_predicate(
-        exec_active, is_two_cta=is_two_cta, gate_exec_warp=gate_exec_warp
+        exec_active,
+        is_two_cta=is_two_cta,
+        gate_exec_warp=gate_exec_warp,
+        cluster_n=cluster_n,
     )
     if predicate is None:
         return statement_from_string(reset_src)
@@ -1031,6 +1081,7 @@ def _build_tcgen05_mma_issue_stmt(
     mma_stage: str,
     gate_exec_warp: bool = True,
     is_two_cta: bool = False,
+    cluster_n: int = 1,
 ) -> ast.stmt:
     issue_src = (
         f"for _tcgen05_kblk_idx in range(cute.size({tcgen05_frag_a}, mode=[2])):\n"
@@ -1044,7 +1095,10 @@ def _build_tcgen05_mma_issue_stmt(
         f"    {tiled_mma}.set(cute.nvgpu.tcgen05.Field.ACCUMULATE, True)"
     )
     predicate = _tcgen05_two_cta_owner_predicate(
-        exec_active, is_two_cta=is_two_cta, gate_exec_warp=gate_exec_warp
+        exec_active,
+        is_two_cta=is_two_cta,
+        gate_exec_warp=gate_exec_warp,
+        cluster_n=cluster_n,
     )
     if predicate is not None:
         issue_src = f"if {predicate}:\n{textwrap.indent(issue_src, '    ')}"
@@ -1623,6 +1677,30 @@ def _emit_mma_pipeline(
             tcgen05_cluster_m = 1
     assert tcgen05_cluster_m == 1 or bm >= 128
     tcgen05_is_two_cta = tcgen05_requested_two_cta and tcgen05_cluster_m > 1
+    # ``tcgen05_cluster_n`` is the multicast factor along the cluster's N
+    # axis. cluster_n=2 builds the canonical Quack-best 4-CTA cluster
+    # ``(cluster_m=2, cluster_n=2, 1)`` and only runs under
+    # ``use_2cta=True`` (V=2). At V=2 cluster_n=2 the V-leader gate
+    # (cute_plan.md §6.12.7) and ``mcast_size`` arrive count
+    # (``num_mcast_ctas_a + num_mcast_ctas_b - 1 = 2 + 1 - 1 = 2``) replace
+    # the cluster_n=1 cluster-leader / arrive_count=1 spelling. Outside
+    # this validated pairing demote to cluster_n=1 instead of throwing —
+    # explicit user configs hit the BackendUnsupported gate, and autotune
+    # stays narrowed to the validated subset.
+    tcgen05_cluster_n_requested = _tcgen05_cluster_n(df.config)
+    if tcgen05_cluster_n_requested > 1 and not (
+        mma_impl == "tcgen05" and tcgen05_is_two_cta and tcgen05_cluster_m == 2
+    ):
+        if mma_impl == "tcgen05" and tcgen05_cluster_n_requested == 2:
+            raise exc.BackendUnsupported(
+                "cute",
+                "tcgen05_cluster_n=2 requires tcgen05_cluster_m=2 with "
+                "use_2cta=True (bm=256). See cute_plan.md §6.12 for the "
+                "validated 4-CTA cluster envelope.",
+            )
+        tcgen05_cluster_n = 1
+    else:
+        tcgen05_cluster_n = tcgen05_cluster_n_requested
     tcgen05_diagnose_cluster_m2_one_cta_role_local = bool(
         df.config.get(TCGEN05_CLUSTER_M2_ONE_CTA_ROLE_LOCAL_CONFIG_KEY, False)
     )
@@ -1983,6 +2061,7 @@ def _emit_mma_pipeline(
                 tcgen05_plan.exec_active,
                 is_two_cta=tcgen05_is_two_cta,
                 gate_exec_warp=False,
+                cluster_n=tcgen05_cluster_n,
             )
             assert ab_consumer_prefetch_owner_predicate is not None
             _emit_per_tile(
@@ -2017,6 +2096,7 @@ def _emit_mma_pipeline(
             tcgen05_plan.exec_active,
             tiled_mma=tiled_mma,
             is_two_cta=tcgen05_is_two_cta,
+            cluster_n=tcgen05_cluster_n,
         )
         prefix.append(reset_accumulate_stmt)
         per_tile_stmts.append(reset_accumulate_stmt)
@@ -2035,8 +2115,8 @@ def _emit_mma_pipeline(
     mma_phys_n = _mma_active_n_threads(mma_impl)
     mma_physical_m_threads = _grid_thread_extent(cg, m_block_id)
     tcgen05_cta_thread_count = _grid_cta_thread_count(cg)
-    if mma_impl == "tcgen05" and tcgen05_cluster_m > 1:
-        df.cute_cluster_shape = (tcgen05_cluster_m, 1, 1)
+    if mma_impl == "tcgen05" and tcgen05_cluster_m * tcgen05_cluster_n > 1:
+        df.cute_cluster_shape = (tcgen05_cluster_m, tcgen05_cluster_n, 1)
     tcgen05_acc_stage_count_value = _tcgen05_config_int(
         df.config, "tcgen05_acc_stages", _tcgen05_acc_stage_count(bn)
     )
@@ -2048,7 +2128,28 @@ def _emit_mma_pipeline(
     # but they must not add a second empty-barrier arrival: doing so lets the
     # TMA producer reuse an AB stage before the leader's ordered release when
     # the K loop has more than two tiles.
-    tcgen05_ab_consumer_arrive_count_value = 1
+    #
+    # ``mcast_size`` formula matches Quack's
+    # ``num_mcast_ctas_a + num_mcast_ctas_b - 1``
+    # (gemm_sm100.py:1839-1840). For Helion's V=2 path,
+    # ``num_mcast_ctas_a = cluster_layout_vmnk.shape[2] = cluster_n`` and
+    # ``num_mcast_ctas_b = cluster_layout_vmnk.shape[1] = cluster_m / V``.
+    #
+    # Concrete table (cute_plan.md §6.12.7 step 3):
+    #   - cluster_m=2 cluster_n=1 V=2: 1 + 1 - 1 = 1 (today's value)
+    #   - cluster_m=2 cluster_n=2 V=2: 2 + 1 - 1 = 2 (the cluster_n=2 fix)
+    #   - cluster_m=1 cluster_n=1 V=1 (no use_2cta): 1 (collapses to single
+    #     CTA; no multicast)
+    if tcgen05_is_two_cta and tcgen05_cluster_n > 1:
+        # V=2 absorbs cluster_m into the cluster_layout_vmnk V dim; the
+        # post-V CTAs along M (= cluster_m // V) carry the B multicast,
+        # while cluster_n CTAs along N carry the A multicast.
+        v_for_mcast = 2 if tcgen05_is_two_cta else 1
+        num_mcast_ctas_a = tcgen05_cluster_n
+        num_mcast_ctas_b = max(1, tcgen05_cluster_m // v_for_mcast)
+        tcgen05_ab_consumer_arrive_count_value = num_mcast_ctas_a + num_mcast_ctas_b - 1
+    else:
+        tcgen05_ab_consumer_arrive_count_value = 1
     tcgen05_c_stage_count_value = _tcgen05_config_int(
         df.config, "tcgen05_c_stages", _tcgen05_c_stage_count(bn)
     )
@@ -2135,12 +2236,14 @@ def _emit_mma_pipeline(
             scheduler_warp_count=tcgen05_warp_spec.scheduler_warps,
             sched_stage_count=tcgen05_sched_stage_count_value,
             persistence_model=tcgen05_persistence_model_str,
+            cluster_n=tcgen05_cluster_n,
         )
         assert tcgen05_plan is not None
         tcgen05_mma_owner_active = _tcgen05_two_cta_owner_predicate(
             tcgen05_plan.exec_active,
             is_two_cta=tcgen05_is_two_cta,
             gate_exec_warp=True,
+            cluster_n=tcgen05_cluster_n,
         )
         candidate_block_shape = tcgen05_matmul_plan.block_shape
         df.register_cute_tcgen05_matmul_plan(tcgen05_matmul_plan)
@@ -2342,7 +2445,7 @@ def _emit_mma_pipeline(
         prefix.append(
             statement_from_string(
                 f"{tcgen05_cluster_layout_vmnk} = cute.tiled_divide("
-                f"cute.make_layout(({tcgen05_cluster_m}, 1, 1)), "
+                f"cute.make_layout(({tcgen05_cluster_m}, {tcgen05_cluster_n}, 1)), "
                 f"({tiled_mma}.thr_id.shape,))"
             )
         )
@@ -2618,7 +2721,7 @@ def _emit_mma_pipeline(
                 "bn": bn,
                 "bk": bk,
                 "cluster_m": tcgen05_cluster_m,
-                "cluster_n": 1,
+                "cluster_n": tcgen05_cluster_n,
                 "ab_stage_count": tcgen05_ab_stage_count_value,
                 "input_dtype": input_dtype_str,
                 "acc_dtype": acc_dtype_str,
@@ -3196,6 +3299,7 @@ def _emit_mma_pipeline(
                 exec_active=tcgen05_plan.exec_active,
                 scalar_load_a=scalar_load_a,
                 scalar_load_b=scalar_load_b,
+                cluster_n=tcgen05_cluster_n,
             )
             if tcgen05_use_tma_pipeline:
                 if tcgen05_use_role_local_tma_producer:
@@ -3277,6 +3381,7 @@ def _emit_mma_pipeline(
                                 mma_stage=mma_stage,
                                 gate_exec_warp=False,
                                 is_two_cta=tcgen05_is_two_cta,
+                                cluster_n=tcgen05_cluster_n,
                             )
                         )
                     exec_loop_body.append(
@@ -3410,6 +3515,7 @@ def _emit_mma_pipeline(
                             tcgen05_frag_b=tcgen05_frag_b,
                             mma_stage=mma_stage,
                             is_two_cta=tcgen05_is_two_cta,
+                            cluster_n=tcgen05_cluster_n,
                         )
                     )
                 if tcgen05_use_tma:
@@ -3654,6 +3760,17 @@ def _tcgen05_config_int(config: object, key: str, default: int) -> int:
 
 def _tcgen05_cluster_m(config: object) -> int:
     return max(1, min(2, _tcgen05_config_int(config, "tcgen05_cluster_m", 1)))
+
+
+def _tcgen05_cluster_n(config: object) -> int:
+    """Read the validated ``tcgen05_cluster_n`` knob (default 1).
+
+    cluster_n=2 only runs under the canonical Quack-best 4-CTA cluster
+    (``cluster_m=2 use_2cta=True``); the ``cluster_n>1`` capability gate
+    in ``_codegen_cute_mma`` rejects unsupported pairings so this helper
+    returns the *requested* value and lets the caller demote.
+    """
+    return max(1, min(2, _tcgen05_config_int(config, "tcgen05_cluster_n", 1)))
 
 
 def _tcgen05_large_bn_proof_enabled(config: object | None) -> bool:

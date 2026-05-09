@@ -501,6 +501,17 @@ _STRATEGY_SUPPORTED_CLUSTER_M: dict[Tcgen05Strategy, frozenset[int]] = {
     Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER: frozenset({1, 2}),
 }
 
+# Strategy-conditional cluster_n capability. cluster_n=2 is only validated
+# for ``ROLE_LOCAL_MONOLITHIC`` today (the Quack-canonical 4-CTA cluster
+# is the perf target for G2; ``ROLE_LOCAL_WITH_SCHEDULER`` would also
+# require fixing the broadcast topology for cluster_n>1, which is out
+# of scope for cycle 27). Set outside the supported set is rejected so
+# user configs cannot reach an untested cluster shape.
+_STRATEGY_SUPPORTED_CLUSTER_N: dict[Tcgen05Strategy, frozenset[int]] = {
+    Tcgen05Strategy.ROLE_LOCAL_MONOLITHIC: frozenset({1, 2}),
+    Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER: frozenset({1}),
+}
+
 
 def validate_tcgen05_strategy_invariants(
     *,
@@ -511,6 +522,7 @@ def validate_tcgen05_strategy_invariants(
     layout_overrides: Tcgen05LayoutOverrides,
     pid_type: object,
     cluster_m: int,
+    cluster_n: int = 1,
     arch_major: int | None = None,
 ) -> list[str]:
     """Cross-fragment invariants for the tcgen05 strategy data model.
@@ -642,6 +654,26 @@ def validate_tcgen05_strategy_invariants(
             f"tcgen05 strategy {strategy.value!r} only runs correctly "
             f"at tcgen05_cluster_m in {sorted(supported_cluster_m)!r}; "
             f"got tcgen05_cluster_m={cluster_m}"
+        )
+
+    # Active cluster_n must be in the strategy's supported set.
+    # See ``_STRATEGY_SUPPORTED_CLUSTER_N`` for per-strategy
+    # capability. cluster_n=2 also requires cluster_m=2 (the V=2
+    # 4-CTA cluster); enforce both checks since a config that sets
+    # cluster_n=2 on cluster_m=1 would silently drop in codegen and
+    # mislead the user.
+    supported_cluster_n = _STRATEGY_SUPPORTED_CLUSTER_N.get(strategy, frozenset())
+    if supported_cluster_n and cluster_n not in supported_cluster_n:
+        errors.append(
+            f"tcgen05 strategy {strategy.value!r} only runs correctly "
+            f"at tcgen05_cluster_n in {sorted(supported_cluster_n)!r}; "
+            f"got tcgen05_cluster_n={cluster_n}"
+        )
+    if cluster_n > 1 and cluster_m != 2:
+        errors.append(
+            f"tcgen05_cluster_n={cluster_n} requires tcgen05_cluster_m=2 "
+            f"with use_2cta=True (the validated 4-CTA cluster envelope; "
+            f"cute_plan.md §6.12); got tcgen05_cluster_m={cluster_m}"
         )
 
     # Layout overrides may only carry concrete values under the

@@ -799,6 +799,18 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         cluster_m = int(str(config.get("tcgen05_cluster_m", 1)))
         return max(1, min(cluster_m, 2))
 
+    def _tcgen05_cluster_n(self) -> int:
+        # The tcgen05 plan owns ``cluster_n`` once the matmul plan has been
+        # registered (cute_mma derives the validated value and stores it on
+        # the plan). Outside the matmul codegen path the helper falls back
+        # to the config knob; non-tcgen05 paths see cluster_n=1 from the
+        # config default and never reach this method's result anyway.
+        if (plan := self._tcgen05_plan()) is not None:
+            return plan.cluster_n
+        config = DeviceFunction.current().config
+        cluster_n = int(str(config.get("tcgen05_cluster_n", 1)))
+        return max(1, min(cluster_n, 2))
+
     def _tcgen05_is_two_cta(self) -> bool:
         if (plan := self._tcgen05_plan()) is not None:
             return plan.is_two_cta
@@ -849,6 +861,13 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             # scheduler M as CTA slots, then collapse back to logical M when
             # binding virtual_pid for PID decomposition.
             dims[0] = f"({dims[0]}) * {self._tcgen05_cluster_m()}"
+        # cluster_n>1 leaves the scheduler N dim equal to the logical N
+        # tile count; the cluster_shape ``(cluster_m, cluster_n, 1)``
+        # passed to ``PersistentTileSchedulerParams`` allocates one
+        # cluster per ``cluster_n`` consecutive N tiles. Each CTA in the
+        # cluster's N axis sees a distinct ``tile_idx[1]`` so the
+        # virtual_pid mapping uses the raw scheduler tile_idx[1] as the
+        # logical N coordinate.
         return dims
 
     def _tcgen05_num_tiles_expr(self, *, is_device: bool) -> str:
@@ -866,26 +885,31 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         """
         dims = self._tcgen05_scheduler_tile_dims_expr(is_device=is_device)
         cluster_m = self._tcgen05_cluster_m()
+        cluster_n = self._tcgen05_cluster_n()
         if cluster_m > 1:
             dims[0] = f"(({dims[0]}) + {cluster_m} - 1) // {cluster_m}"
+        if cluster_n > 1:
+            # Each cluster covers ``cluster_n`` consecutive logical N tiles.
+            dims[1] = f"(({dims[1]}) + {cluster_n} - 1) // {cluster_n}"
         return " * ".join(f"({dim})" for dim in dims[:3])
 
-    def _tcgen05_max_persistent_work_clusters_expr(self, cluster_m: int) -> str:
-        """Return the launch-grid persistent work-cluster capacity."""
-        if cluster_m == 1:
+    def _tcgen05_max_persistent_work_clusters_expr(self) -> str:
+        """Return the launch-grid persistent work-cluster capacity.
+
+        Capacity is in cluster slots; divide by ``cluster_m`` (V-pair
+        size) so each cluster slot consumes one SM regardless of
+        ``cluster_n``. Independent of ``cluster_n`` so cluster_n=2
+        does not collapse the launch to one wave.
+        """
+        cluster_m = self._tcgen05_cluster_m()
+        cluster_n = self._tcgen05_cluster_n()
+        if cluster_m * cluster_n == 1:
             return self.grid_size_expr
-        # ``grid_size_expr`` is expressed in CTAs. CtaGroup.TWO currently
-        # uses cluster_n=1, so dividing the CTA budget by cluster_m matches
-        # the scheduler persistent work-cluster capacity.
         return f"max(1, ({self.grid_size_expr}) // {cluster_m})"
 
-    def _tcgen05_grid_work_clusters_expr(
-        self, total_clusters: str, cluster_m: int
-    ) -> str:
+    def _tcgen05_grid_work_clusters_expr(self, total_clusters: str) -> str:
         """Return the scheduler z dimension for the persistent launch grid."""
-        max_persistent_clusters = self._tcgen05_max_persistent_work_clusters_expr(
-            cluster_m
-        )
+        max_persistent_clusters = self._tcgen05_max_persistent_work_clusters_expr()
         return f"min(({total_clusters}), ({max_persistent_clusters}))"
 
     def codegen_grid(self) -> ast.AST:
@@ -899,6 +923,7 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         # Multi-root ForEach kernels are still host-guarded because this grid
         # is derived from this case's pid_info only.
         cluster_m = self._tcgen05_cluster_m()
+        cluster_n = self._tcgen05_cluster_n()
         total_clusters = self._tcgen05_num_work_clusters_expr(is_device=False)
         plan = self._tcgen05_plan()
         if plan is not None and plan.is_clc_persistent:
@@ -916,11 +941,9 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             # clusters and causes CLC to immediately return ``valid=0``
             # on the first query, terminating the persistent loop
             # after iteration 0 (verified via ``cute.printf``).
-            return expr_from_string(f"({cluster_m}, 1, {total_clusters})")
-        grid_work_clusters = self._tcgen05_grid_work_clusters_expr(
-            total_clusters, cluster_m
-        )
-        return expr_from_string(f"({cluster_m}, 1, {grid_work_clusters})")
+            return expr_from_string(f"({cluster_m}, {cluster_n}, {total_clusters})")
+        grid_work_clusters = self._tcgen05_grid_work_clusters_expr(total_clusters)
+        return expr_from_string(f"({cluster_m}, {cluster_n}, {grid_work_clusters})")
 
     def _tcgen05_logical_m_coord_expr(self, coord: str) -> str:
         if self._tcgen05_is_two_cta():
@@ -1724,6 +1747,11 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         work_tile_publish_stmts: list[ast.stmt]
         work_tile_consume_stmts: list[ast.stmt]
         work_tile_release_stmts: list[ast.stmt]
+        # ``cluster_n`` is the multicast factor along the cluster N axis;
+        # default 1 keeps every existing test (and the cluster_n=1 byte-
+        # identity golden) unchanged. Threaded through to the launch grid
+        # / scheduler params when cluster_n>1 (cute_plan.md §6.12.7).
+        cluster_n: int = 1
 
     def _build_tcgen05_persistent_layout(
         self, device_function: DeviceFunction
@@ -1843,6 +1871,7 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
 
         return self._Tcgen05PersistentLayout(
             cluster_m=cluster_m,
+            cluster_n=self._tcgen05_cluster_n(),
             scheduler_owner_warp=scheduler_owner_warp,
             cluster_scheduler_leader=cluster_scheduler_leader,
             consumer_leader_var=consumer_leader_var,
@@ -1909,7 +1938,7 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             statement_from_string(
                 f"{layout.tile_sched_params_var} = cutlass.utils.PersistentTileSchedulerParams("
                 f"{self._tcgen05_num_tiles_expr(is_device=True)}, "
-                f"({layout.cluster_m}, 1, 1))"
+                f"({layout.cluster_m}, {layout.cluster_n}, 1))"
             ),
             statement_from_string(
                 f"{layout.tile_sched_var} = cutlass.utils.StaticPersistentTileScheduler.create("
@@ -2172,7 +2201,7 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                 statement_from_string(
                     f"{sched_params_var} = cutlass.utils.PersistentTileSchedulerParams("
                     f"{self._tcgen05_num_tiles_expr(is_device=True)}, "
-                    f"({layout.cluster_m}, 1, 1))"
+                    f"({layout.cluster_m}, {layout.cluster_n}, 1))"
                 ),
                 statement_from_string(
                     f"{sched_var} = cutlass.utils.StaticPersistentTileScheduler.create("
@@ -2524,7 +2553,7 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             statement_from_string(
                 f"{sched_params_var} = cutlass.utils.PersistentTileSchedulerParams("
                 f"{self._tcgen05_num_tiles_expr(is_device=True)}, "
-                f"({layout.cluster_m}, 1, 1))"
+                f"({layout.cluster_m}, {layout.cluster_n}, 1))"
             ),
             statement_from_string(
                 f"{sched_var} = cutlass.utils.StaticPersistentTileScheduler.create("
@@ -2709,17 +2738,18 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         # returns Int32 for the valid flag. The CuTe DSL's while-region
         # type-checker rejects type changes between iterations.
         cluster_m = layout.cluster_m
+        cluster_n = layout.cluster_n
         sched_params_var = device_function.new_var("tcgen05_clc_initial_sched_params")
         sched_var = device_function.new_var("tcgen05_clc_initial_sched")
         work_tile_var = device_function.new_var("tcgen05_clc_initial_work_tile")
         clc_initial_block: list[ast.stmt] = [
             # Build the persistent tile-scheduler params for the
             # initial decode. Cluster shape matches the launch grid's
-            # cluster shape (``(cluster_m, 1, 1)``).
+            # cluster shape (``(cluster_m, cluster_n, 1)``).
             statement_from_string(
                 f"{sched_params_var} = cutlass.utils.PersistentTileSchedulerParams("
                 f"{self._tcgen05_num_tiles_expr(is_device=True)}, "
-                f"({cluster_m}, 1, 1))"
+                f"({cluster_m}, {cluster_n}, 1))"
             ),
             statement_from_string(
                 f"{sched_var} = cutlass.utils.StaticPersistentTileScheduler.create("

@@ -312,6 +312,13 @@ class CuteTcgen05MatmulPlan:
     # arch >= 100. Stored as the enum value (string) so the dataclass
     # stays free of cute-internal imports.
     persistence_model: str = "static_persistent"
+    # ``cluster_n`` is the multicast factor along the N axis of the cluster
+    # layout. Default 1 preserves byte-identity for every cluster_m=1 and
+    # cluster_m=2/cluster_n=1 path. ``cluster_n=2`` only runs under the
+    # validated ``cluster_m=2 use_2cta=True`` Quack-canonical 4-CTA cluster.
+    # See cute_plan.md §6.12 for the V-leader gate / mcast_size derivation
+    # that lets cluster_n=2 close the G2 perf gap.
+    cluster_n: int = 1
 
     @property
     def is_clc_persistent(self) -> bool:

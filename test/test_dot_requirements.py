@@ -1504,6 +1504,69 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         self.assertEqual(errors, [])
 
     @onlyBackends(["cute"])
+    def test_cute_tcgen05_strategy_invariants_cluster_n(self) -> None:
+        """G2 cluster_n=2 validator coverage (cute_plan.md §6.12.7).
+
+        ``cluster_n=2`` only runs under ``ROLE_LOCAL_MONOLITHIC`` with
+        ``cluster_m=2`` (the validated 4-CTA cluster envelope). The
+        validator rejects:
+          - ``cluster_n=2`` with ``cluster_m=1`` (V=1 has no 4-CTA path)
+          - ``cluster_n=2`` under ``ROLE_LOCAL_WITH_SCHEDULER`` (the
+            scheduler-broadcast topology is not validated for cluster_n>1)
+        and accepts ``cluster_n=2`` under ``ROLE_LOCAL_MONOLITHIC`` +
+        ``cluster_m=2``.
+        """
+        # Positive control: cluster_n=2 + ROLE_LOCAL_MONOLITHIC + cluster_m=2.
+        errors = validate_tcgen05_strategy_invariants(
+            strategy=Tcgen05Strategy.ROLE_LOCAL_MONOLITHIC,
+            persistence_model=Tcgen05PersistenceModel.STATIC_PERSISTENT,
+            layout_strategy=Tcgen05LayoutStrategy.DEFAULT,
+            warp_spec=ROLE_LOCAL_MONOLITHIC_DEFAULT_WARP_SPEC,
+            layout_overrides=Tcgen05LayoutOverrides(),
+            pid_type="persistent_blocked",
+            cluster_m=2,
+            cluster_n=2,
+        )
+        self.assertEqual(errors, [], msg=str(errors))
+
+        # cluster_n=2 with cluster_m=1: rejected (requires the 4-CTA
+        # V=2 cluster).
+        errors = validate_tcgen05_strategy_invariants(
+            strategy=Tcgen05Strategy.ROLE_LOCAL_MONOLITHIC,
+            persistence_model=Tcgen05PersistenceModel.STATIC_PERSISTENT,
+            layout_strategy=Tcgen05LayoutStrategy.DEFAULT,
+            warp_spec=ROLE_LOCAL_MONOLITHIC_DEFAULT_WARP_SPEC,
+            layout_overrides=Tcgen05LayoutOverrides(),
+            pid_type="persistent_blocked",
+            cluster_m=1,
+            cluster_n=2,
+        )
+        self.assertTrue(
+            any("requires tcgen05_cluster_m=2" in e for e in errors),
+            msg=str(errors),
+        )
+
+        # cluster_n=2 under ROLE_LOCAL_WITH_SCHEDULER: rejected
+        # (scheduler-broadcast topology is not validated for cluster_n>1).
+        with_sched = dataclasses.replace(
+            ROLE_LOCAL_MONOLITHIC_DEFAULT_WARP_SPEC, scheduler_warps=1
+        )
+        errors = validate_tcgen05_strategy_invariants(
+            strategy=Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER,
+            persistence_model=Tcgen05PersistenceModel.STATIC_PERSISTENT,
+            layout_strategy=Tcgen05LayoutStrategy.DEFAULT,
+            warp_spec=with_sched,
+            layout_overrides=Tcgen05LayoutOverrides(),
+            pid_type="persistent_blocked",
+            cluster_m=2,
+            cluster_n=2,
+        )
+        self.assertTrue(
+            any("tcgen05_cluster_n in [1]" in e for e in errors),
+            msg=str(errors),
+        )
+
+    @onlyBackends(["cute"])
     def test_cute_tcgen05_strategy_invariants_clc_persistent(self) -> None:
         """G2-H (cute_plan.md): ``Tcgen05PersistenceModel.CLC_PERSISTENT``
         is only valid under ``ROLE_LOCAL_WITH_SCHEDULER`` on arch >= 100.

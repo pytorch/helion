@@ -194,6 +194,7 @@ _BASE_BACKEND_TUNABLE_KEYS: frozenset[str] = frozenset(
         "pallas_loop_type",
         "pallas_pre_broadcast",
         "tcgen05_cluster_m",
+        "tcgen05_cluster_n",
         "tcgen05_ab_stages",
         "tcgen05_acc_stages",
         "tcgen05_c_stages",
@@ -300,6 +301,7 @@ VALID_MAXNREG = (None, 32, 64, 128, 256)
 DEFAULT_MAXNREG = None
 CUTE_TCGEN05_TUNABLE_KEYS: tuple[str, ...] = (
     "tcgen05_cluster_m",
+    "tcgen05_cluster_n",
     "tcgen05_ab_stages",
     "tcgen05_acc_stages",
     "tcgen05_c_stages",
@@ -826,6 +828,14 @@ class ConfigSpec:
             cluster_m_choices = self._tcgen05_cluster_m_search_choices
         else:
             cluster_m_choices = (1, 2)
+        # ``tcgen05_cluster_n``: validation surface accepts {1, 2} so an
+        # explicit ``helion.Config(tcgen05_cluster_n=2)`` round-trips. The
+        # search surface stays narrowed to (1,) until the cluster_n=2
+        # path is perf-validated; cycle 27 G2 closure may flip the search
+        # surface but the autotune broadening is intentionally separate
+        # from the codegen plumbing landed here. Mirrors the cluster_m
+        # split-search pattern.
+        cluster_n_choices: tuple[int, ...] = (1,) if for_search else (1, 2)
         if for_search and self._tcgen05_num_epi_warps_search_choices is not None:
             num_epi_warps_fragment: ConfigSpecFragment = EnumFragment(
                 self._tcgen05_num_epi_warps_search_choices
@@ -854,6 +864,7 @@ class ConfigSpec:
         ab_stages_max = 3 if not for_search else 2
         return {
             "tcgen05_cluster_m": EnumFragment(cluster_m_choices),
+            "tcgen05_cluster_n": EnumFragment(cluster_n_choices),
             "tcgen05_ab_stages": IntegerFragment(1, ab_stages_max, 2),
             "tcgen05_acc_stages": IntegerFragment(1, 2, 2),
             "tcgen05_c_stages": EnumFragment((2, 4)),
@@ -1053,6 +1064,8 @@ class ConfigSpec:
         # lowering can't run correctly today.
         cluster_m_raw = config.get("tcgen05_cluster_m", 1)
         cluster_m = int(cluster_m_raw) if isinstance(cluster_m_raw, int) else 1
+        cluster_n_raw = config.get("tcgen05_cluster_n", 1)
+        cluster_n = int(cluster_n_raw) if isinstance(cluster_n_raw, int) else 1
         # Source arch major from the live device when CUDA is
         # available; the unit-test path (no GPU) keeps None so
         # arch-gated models like ``CLC_PERSISTENT`` still validate
@@ -1071,6 +1084,7 @@ class ConfigSpec:
             layout_overrides=layout_overrides,
             pid_type=config.get("pid_type"),
             cluster_m=cluster_m,
+            cluster_n=cluster_n,
             arch_major=arch_major,
         )
         if not errors:

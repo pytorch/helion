@@ -1529,9 +1529,16 @@ def _append_cute_wrapper_plan(
     assert len(kernel_args) == 4
     tma_atom_a, tma_tensor_a, tma_atom_b, tma_tensor_b = kernel_args
 
+    # CtaGroup.TWO is selected when ``cluster_m == 2 and bm == 256`` —
+    # the V=2 path. ``cluster_n`` extends the cluster along the N axis
+    # but does not change the V dimension. Cycle 26's
+    # ``cluster_m * cluster_n == 2`` test happened to work for
+    # cluster_m=2 cluster_n=1 but rejects the canonical Quack-best
+    # cluster_m=2 cluster_n=2 4-CTA cluster (product=4). Use
+    # ``cluster_m == 2`` directly so cluster_n=2 keeps CtaGroup.TWO.
     cta_group = (
         "cute.nvgpu.tcgen05.CtaGroup.TWO"
-        if cluster_m * cluster_n == 2 and bm == 256
+        if cluster_m == 2 and bm == 256
         else "cute.nvgpu.tcgen05.CtaGroup.ONE"
     )
     cluster_shape = f"({cluster_m}, {cluster_n}, 1)"
@@ -1572,14 +1579,33 @@ def _append_cute_wrapper_plan(
                 f"stride=(arg{rhs_idx}_stride1, arg{rhs_idx}_stride0)))"
             ),
             f"    {rhs_tma}.mark_layout_dynamic(leading_dim=0)",
+            # ``make_tiled_tma_atom_A`` vs ``_B`` asymmetry:
+            # - ``_B`` always passes ``cluster_layout_vmnk.shape`` as
+            #   its trailing arg (CuTe's signature for B requires the
+            #   cluster shape; the cluster_m=1 cluster_n=1 case still
+            #   passes the 1×1×1 shape harmlessly).
+            # - ``_A`` only adds the same trailing arg when
+            #   ``cluster_n > 1``. Adding it unconditionally would
+            #   change the byte-identity golden for the validated
+            #   cluster_m∈{1,2} cluster_n=1 paths
+            #   (``test_tcgen05_role_local_monolithic_byte_identical_golden``)
+            #   because A's atom is otherwise constructed from the
+            #   3-arg form on those paths. The asymmetry is
+            #   intentional: A only needs the cluster shape when N
+            #   multicast is active (cluster_n>1).
             (
                 f"    {tma_atom_a}, {tma_tensor_a} = cute.nvgpu.make_tiled_tma_atom_A("
                 "cutlass.utils.blackwell_helpers.cluster_shape_to_tma_atom_A("
                 f"{cluster_shape}, {tiled_mma}.thr_id), "
                 f"arg{lhs_idx}, "
                 f"cute.slice_({smem_a_layout}, (None, None, None, 0)), "
-                f"({bm}, {bn}, {bk}), {tiled_mma})"
+                f"({bm}, {bn}, {bk}), {tiled_mma}"
+                + (f", {cluster_layout_vmnk}.shape" if cluster_n > 1 else "")
+                + ")"
             ),
+            # See the asymmetry comment above ``make_tiled_tma_atom_A``
+            # for why ``_B`` always passes the cluster shape and ``_A``
+            # only does at cluster_n>1.
             (
                 f"    {tma_atom_b}, {tma_tensor_b} = cute.nvgpu.make_tiled_tma_atom_B("
                 "cutlass.utils.blackwell_helpers.cluster_shape_to_tma_atom_B("
