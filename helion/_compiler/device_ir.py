@@ -97,6 +97,8 @@ def _lerp_scalar_decomp(
 
 
 def _get_custom_decomp_table() -> dict[torch._ops.OpOverload, Callable[..., object]]:
+    from ..language._gelu_tanh_approx import install_gelu_decomp
+
     decomp_table = select_decomp_table().copy()
     # Normally, aten.stack is decomposed to aten.unsqueeze + aten.cat, but it's difficult to
     # figure out the right Triton implementation for aten.cat. As a workaround, we disable
@@ -104,6 +106,10 @@ def _get_custom_decomp_table() -> dict[torch._ops.OpOverload, Callable[..., obje
     decomp_table.pop(torch.ops.aten.stack.default, None)
     # Override lerp.Scalar to avoid data-dependent guard on the weight parameter.
     decomp_table[torch.ops.aten.lerp.Scalar] = _lerp_scalar_decomp
+    # Map F.gelu(x, approximate="tanh") to a single _gelu_tanh_approx FX
+    # node so the cute epilogue chain analyzer can fuse it; the inductor
+    # default decomp expands the polynomial form and breaks the chain.
+    install_gelu_decomp(decomp_table)
     return decomp_table
 
 

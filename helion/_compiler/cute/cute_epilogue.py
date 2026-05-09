@@ -51,6 +51,9 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from ...language._gelu_tanh_approx import GELU_TANH_APPROX_INNER_REF_COUNT
+from ...language._gelu_tanh_approx import _gelu_tanh_approx
+from ...language._gelu_tanh_approx import epilogue_unary_step_template
 from .cute_fx_walk import aux_tensor_load_kind
 from .cute_fx_walk import build_inner_outputs_index
 from .cute_fx_walk import walk_carrier_to_tcgen05_matmul
@@ -210,6 +213,19 @@ def _rdiv_const_template(scalar: float) -> str:
 # classifier looks the row up at match time and emits it directly;
 # binary scalar ops are handled separately below since their template
 # depends on the extracted constant.
+#
+# ``_gelu_tanh_approx`` is keyed on the helion-API wrapper itself
+# (the FX target the ``aten.gelu.default`` decomp materializes for
+# the ``approximate="tanh"`` overload), not an aten op. The wrapper
+# is the same object every FX traced kernel sees, so identity-keying
+# off it is stable across kernels. The template renders the standard
+# tanh-approximation GELU polynomial inline (``0.5 * x * (1 +
+# cute.math.tanh(x * (kappa + lambda * x * x)))``); see
+# ``helion/language/_gelu_tanh_approx.py`` for constants and
+# motivation. With ``inner_ref_count = 4`` the chain renderer hoists
+# ``{inner}`` to a single local first so the rendered expression
+# references the carrier exactly once even though the polynomial has
+# four occurrences of ``x``.
 _ZERO_ARG_TARGETS: dict[object, _UnaryStep] = {
     torch.ops.aten.relu.default: _UnaryStep(
         op_name="relu",
@@ -222,6 +238,16 @@ _ZERO_ARG_TARGETS: dict[object, _UnaryStep] = {
     torch.ops.aten.exp.default: _UnaryStep(op_name="exp", template=_EXP_TEMPLATE),
     torch.ops.aten.log.default: _UnaryStep(op_name="log", template=_LOG_TEMPLATE),
     torch.ops.aten.sqrt.default: _UnaryStep(op_name="sqrt", template=_SQRT_TEMPLATE),
+    # ``F.gelu(x, approximate="tanh")`` (mapped to ``_gelu_tanh_approx``
+    # by the device_ir decomp) — single FX node folding the polynomial
+    # which references ``x`` 4 times. The chain renderer hoists
+    # ``{inner}`` to a single local so the rendered expression has one
+    # carrier reference.
+    _gelu_tanh_approx: _UnaryStep(
+        op_name="gelu_tanh_approx",
+        template=epilogue_unary_step_template(),
+        inner_ref_count=GELU_TANH_APPROX_INNER_REF_COUNT,
+    ),
     # NOTE: ``prims.convert_element_type.default`` is intentionally
     # absent. A user-explicit intermediate cast (e.g.,
     # ``out[tile] = relu(acc).to(d_inter)`` written to a

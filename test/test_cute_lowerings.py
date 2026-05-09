@@ -5260,6 +5260,259 @@ class TestCuteLowerings(unittest.TestCase):
         expected = torch.relu((x @ y).float() * 0.5 + 1.0).to(x.dtype)
         torch.testing.assert_close(out, expected, atol=2e-1, rtol=1e-2)
 
+    def test_tcgen05_fused_gelu_tanh_approx_runtime_correctness(self) -> None:
+        """``out[tile] = F.gelu(acc, approximate="tanh").to(x.dtype)``
+        after a tcgen05 matmul splices the standard tanh-approximation
+        GELU polynomial inline at the per-thread T2R register and
+        produces output bit-comparable with eager
+        ``F.gelu(x @ y, approximate="tanh").to(...)``.
+
+        Entrance test for the ``F.gelu(approximate="tanh")`` -> single
+        FX node mapping. The eager Python form
+        ``0.5 * acc * (1 + torch.tanh(acc * (a + b * acc * acc)))``
+        references ``acc`` four times and is rejected by the chain
+        analyzer's linear-chain assumption (negative pinned by
+        ``test_tcgen05_fused_gelu_tanh_approx_eager_polynomial_rejected``);
+        the device_ir decomp folds the whole expression into a single
+        ``_UnaryStep`` row so the splice site emits the polynomial
+        with one hoisted carrier reference.
+        """
+
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_gelu_tanh_approx(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = torch.nn.functional.gelu(
+                    acc, approximate="tanh"
+                ).to(x.dtype)
+            return out
+
+        x = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
+        y = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
+        bound = cute_matmul_gelu_tanh_approx.bind((x, y))
+        bound.env.config_spec.cute_tcgen05_search_enabled = True
+        bound.set_config(
+            _make_tcgen05_persistent_config(
+                block_sizes=[128, 128, 32],
+                pid_type="persistent_interleaved",
+            )
+        )
+        out = bound(x, y)
+        expected = torch.nn.functional.gelu((x @ y).float(), approximate="tanh").to(
+            x.dtype
+        )
+        # bf16 GELU has slightly larger tolerance than relu because the
+        # polynomial introduces extra rounding from the multiply +
+        # tanh; matches the tolerance used by the unary-chain runtime
+        # tests.
+        torch.testing.assert_close(out, expected, atol=2e-1, rtol=1e-2)
+
+    def test_tcgen05_fused_gelu_tanh_approx_codegen_marker(self) -> None:
+        """The spliced ``F.gelu(approximate="tanh")`` chain step renders
+        the polynomial inline with the canonical tanh-approx constants
+        and a single hoisted ``tcgen05_chain_step_in`` local.
+
+        Pins the chain analyzer's ``inner_ref_count = 4`` hoist for the
+        ``_gelu_tanh_approx`` row in
+        ``_ZERO_ARG_TARGETS`` (``cute_epilogue.py``): without the
+        hoist, the rendered template would textually duplicate the
+        carrier expression four times; with the hoist, the rendered
+        polynomial references one local. Also pins that the constants
+        are baked in as Python literals (``0.7978845608028654 =
+        sqrt(2/pi)`` and ``0.035677408136300125 = sqrt(2/pi) *
+        0.044715``) so a future refactor that re-derives them from a
+        different source cannot silently drift the rounded values.
+        """
+
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_gelu_tanh_approx_marker(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = torch.nn.functional.gelu(
+                    acc, approximate="tanh"
+                ).to(x.dtype)
+            return out
+
+        x = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
+        y = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
+        with patch_cute_mma_support():
+            bound = cute_matmul_gelu_tanh_approx_marker.bind((x, y))
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            cfg = _make_tcgen05_persistent_config(
+                block_sizes=[128, 128, 32],
+                pid_type="persistent_interleaved",
+            )
+            bound.set_config(cfg)
+            code = bound.to_triton_code(cfg)
+        # The chain analyzer must accept the decomp-mapped
+        # ``_gelu_tanh_approx`` op and the splice site must emit the
+        # polynomial with the single hoisted local pattern. The
+        # constants must appear verbatim in the rendered source.
+        self.assertIn("cute.math.tanh", code)
+        self.assertIn("tcgen05_acc_loaded", code)
+        self.assertIn("tcgen05_chain_step", code)
+        self.assertIn("0.7978845608028654", code)
+        self.assertIn("0.035677408136300125", code)
+        # Per-step binding hoist: ``inner_ref_count = 4`` introduces a
+        # single ``tcgen05_chain_step_in`` local that the rendered
+        # polynomial references in place of the carrier expression.
+        self.assertIn("tcgen05_chain_step_in", code)
+
+    def test_tcgen05_fused_gelu_tanh_approx_eager_polynomial_rejected(
+        self,
+    ) -> None:
+        """The eager Python form of the tanh-approx GELU polynomial
+        (``0.5 * acc * (1 + torch.tanh(acc * (a + b * acc * acc)))``)
+        is rejected by the chain analyzer's linear-chain assumption
+        and bails to the loud-failure ``BackendUnsupported`` backstop.
+
+        Pins the chain analyzer's reuse limitation: the carrier
+        ``acc`` appears four times in the FX graph for the eager
+        form, but each chain step consumes exactly one tensor input
+        (the previous step's output). Folding the polynomial behind
+        the ``_gelu_tanh_approx`` decomp (driven by
+        ``F.gelu(approximate="tanh")``) is the load-bearing reason
+        this test exists — without it, the user cannot fuse the
+        tanh-approx GELU into a tcgen05 epilogue.
+        """
+
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_gelu_eager(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                # Eager polynomial — references ``acc`` 4 times.
+                out[tile_m, tile_n] = (
+                    0.5
+                    * acc
+                    * (
+                        1.0
+                        + torch.tanh(acc * (0.7978845608 + 0.0356774081 * acc * acc))
+                    )
+                ).to(x.dtype)
+            return out
+
+        x = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
+        y = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
+        with (
+            self.assertRaises(exc.BackendUnsupported) as cm,
+            patch_cute_mma_support(),
+        ):
+            bound = cute_matmul_gelu_eager.bind((x, y))
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            cfg = _make_tcgen05_persistent_config(
+                block_sizes=[128, 128, 32],
+                pid_type="persistent_interleaved",
+            )
+            bound.set_config(cfg)
+            bound(x, y)
+        msg = str(cm.exception)
+        # Pin the loud-failure backstop wording so an unrelated
+        # rejection path (e.g. an aux load misclassification) cannot
+        # accidentally satisfy this assertion. The backstop fires
+        # because the eager ``acc * acc`` multiply has two tensor
+        # operands (both reach the matmul carrier), which the
+        # whitelist rejects as a non-scalar binary op.
+        self.assertIn(
+            "non-whitelisted fused epilogues",
+            msg,
+        )
+        self.assertIn(
+            "non-scalar binary ops",
+            msg,
+        )
+
+    def test_tcgen05_fused_bias_gelu_tanh_approx_runtime_correctness(
+        self,
+    ) -> None:
+        """``out[tile] = F.gelu(acc + bias[tile_n], approximate="tanh").to(x.dtype)``
+        composes the rank-1 bias broadcast aux step with the
+        ``_gelu_tanh_approx`` unary step in a single chain.
+
+        With the bias-broadcast aux fusion already landed, the
+        decomp mapping lets users write the canonical
+        bias+gelu_tanh_approx pattern as a single epilogue chain
+        without breaking the linear-chain assumption. This is the
+        ``bias_gelu_tanh_approx`` workload Quack's bench recorded as
+        ``n/a`` (its harness used the erf-based GELU as the
+        reference).
+        """
+
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_bias_gelu(
+            x: torch.Tensor, y: torch.Tensor, bias: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = torch.nn.functional.gelu(
+                    acc + bias[tile_n], approximate="tanh"
+                ).to(x.dtype)
+            return out
+
+        x = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
+        y = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
+        bias = torch.randn(128, dtype=torch.bfloat16, device=DEVICE)
+        bound = cute_matmul_bias_gelu.bind((x, y, bias))
+        bound.env.config_spec.cute_tcgen05_search_enabled = True
+        bound.set_config(
+            _make_tcgen05_persistent_config(
+                block_sizes=[128, 128, 32],
+                pid_type="persistent_interleaved",
+            )
+        )
+        out = bound(x, y, bias)
+        expected = torch.nn.functional.gelu(
+            ((x @ y) + bias).float(), approximate="tanh"
+        ).to(x.dtype)
+        # bf16 + accumulated bias + GELU rounding: the tolerance is
+        # the same as the cycle-37 bias_relu test because the
+        # bias-broadcast aux step is identical, only the unary
+        # follow-up differs.
+        torch.testing.assert_close(out, expected, atol=3e-1, rtol=2e-2)
+
     def test_tcgen05_persistent_partial_multi_tile_runtime_guard(self) -> None:
         """Partial legacy persistent + tcgen05 still raises ``RuntimeError``.
 
