@@ -31,16 +31,26 @@ class Tcgen05Strategy(str, enum.Enum):
     a chosen strategy the autotuner explores records (warp split,
     layout overrides) that the strategy declares.
 
-    - ``ROLE_LOCAL_MONOLITHIC`` (default, current). 6 specialized
-      warps (1 TMA-load + 1 MMA-exec + 4 epilogue). Each role-local
-      ``while`` loop carries its own ``StaticPersistentTileScheduler``.
-    - ``ROLE_LOCAL_WITH_SCHEDULER``. 8 specialized warps: adds a
-      dedicated scheduler warp that broadcasts ``(virtual_pid,
-      tile_coord_mnkl, is_valid)`` over a ``PipelineAsync`` and a
-      dedicated epilogue-load warp for C input. Targets Quack-best
-      shape parity. Not yet implemented in codegen (G2-C); the enum
-      slot exists so the data model can be exercised end-to-end at
-      G2-A.
+    - ``ROLE_LOCAL_MONOLITHIC`` (default, byte-identity-pinned).
+      6 specialized warps (1 TMA-load + 1 MMA-exec + 4 epilogue).
+      Each role-local ``while`` loop carries its own
+      ``StaticPersistentTileScheduler``.
+    - ``ROLE_LOCAL_WITH_SCHEDULER``. 7 specialized warps: adds a
+      dedicated scheduler warp that publishes ``(virtual_pid,
+      tile_coord_mnkl, is_valid)`` into a per-CTA SMEM mailbox via
+      a ``PipelineAsync``. The C-input epilogue-load warp Quack
+      uses (Quack's 8th warp) is not present because Helion does
+      not yet have C-input fusion;
+      ``CuteTcgen05MatmulPlan.launched_warp_count`` rounds to 8
+      launched warps (one inert padding warp) so warpgroup
+      ``setmaxregister`` semantics are uniform. Validated at
+      ``cluster_m`` ∈ {1, 2}: each CTA in the cluster runs its
+      own scheduler that publishes locally and each CTA's
+      consumers release locally (no peer-CTA broadcast). Both
+      CTAs converge on the same cluster-level virtual_pid because
+      the consumer ``virtual_pid = work_tile_smem[0] // cluster_m
+      + ...`` formula collapses the per-CTA ``cta_id_in_cluster``
+      offset.
     """
 
     ROLE_LOCAL_MONOLITHIC = "role_local_monolithic"
@@ -411,18 +421,35 @@ _STRATEGY_REQUIRED_SCHEDULER_WARPS: dict[Tcgen05Strategy, int] = {
 
 # When the strategy demands warpgroup-aligned splits (every 4 warps
 # == one warpgroup, ``setmaxregister`` is warpgroup-uniform), the
-# total warp count must be a multiple of 4. Today's
-# ``ROLE_LOCAL_MONOLITHIC`` uses 6 warps (1+1+4) so it intentionally
-# does not require warpgroup alignment — the existing role-local
-# lowering tolerates a non-warpgroup total. ``ROLE_LOCAL_WITH_SCHEDULER``
-# uses 8 warps (2 warpgroups) and depends on warpgroup-uniform
-# ``setmaxregister`` semantics (cute_plan.md §2). Adding a future
-# strategy is a deliberate edit here.
-_STRATEGY_REQUIRES_WARPGROUP_ALIGNED_TOTAL: frozenset[Tcgen05Strategy] = frozenset(
-    {
-        Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER,
-    }
-)
+# total warp count must be a multiple of 4. ``ROLE_LOCAL_MONOLITHIC``
+# (1+1+4 = 6 role warps) and ``ROLE_LOCAL_WITH_SCHEDULER`` (1+1+4+1 =
+# 7 role warps) both rely on the launched-warp padding in
+# ``CuteTcgen05MatmulPlan.launched_warp_count`` to round to a
+# multiple of 4 at the launch boundary, so neither strategy needs
+# this validator-level check today. The set is intentionally empty
+# but the branch below stays live: a future strategy whose role
+# count *itself* must be a multiple of 4 (e.g. when ``register_split``
+# becomes per-warpgroup and the role assignment is rigid) can opt
+# in by adding itself to this set, and the validator will reject
+# misconfigured ``Tcgen05WarpSpec`` records loudly.
+_STRATEGY_REQUIRES_WARPGROUP_ALIGNED_TOTAL: frozenset[Tcgen05Strategy] = frozenset()
+
+# Strategy-conditional cluster-shape capability. Each entry lists
+# the cluster_m values the strategy's lowering is currently known
+# to run correctly. ``ROLE_LOCAL_MONOLITHIC`` runs at cluster_m 1
+# and 2 (the validated cluster_m=2 ONE-CTA bridge plus the
+# default cluster_m=1 path). ``ROLE_LOCAL_WITH_SCHEDULER`` runs
+# correctly at cluster_m 1 and 2 — both CTAs in the cluster run
+# their own scheduler that publishes locally and consumers
+# release locally (see ``cute_mma._codegen_cute_mma`` for the
+# ``consumer_mask_to_leader=False`` justification). Setting
+# ``cluster_m`` outside the supported set is rejected by the
+# cross-fragment validator so a user config can't reach a
+# hanging runtime.
+_STRATEGY_SUPPORTED_CLUSTER_M: dict[Tcgen05Strategy, frozenset[int]] = {
+    Tcgen05Strategy.ROLE_LOCAL_MONOLITHIC: frozenset({1, 2}),
+    Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER: frozenset({1, 2}),
+}
 
 
 def validate_tcgen05_strategy_invariants(
@@ -433,6 +460,7 @@ def validate_tcgen05_strategy_invariants(
     warp_spec: Tcgen05WarpSpec,
     layout_overrides: Tcgen05LayoutOverrides,
     pid_type: object,
+    cluster_m: int,
 ) -> list[str]:
     """Cross-fragment invariants for the tcgen05 strategy data model.
 
@@ -458,6 +486,8 @@ def validate_tcgen05_strategy_invariants(
     - scheduler-warp count is strategy-determined;
     - the total warp count must be warpgroup-aligned when the
       strategy demands it;
+    - the active ``cluster_m`` must be in the strategy's supported
+      cluster-shape set;
     - layout-override values are only legal under
       ``Tcgen05LayoutStrategy.EXPLICIT_EPI_TILE``.
 
@@ -518,6 +548,21 @@ def validate_tcgen05_strategy_invariants(
             f"tcgen05 strategy {strategy.value!r} requires the total "
             f"warp count to be a multiple of 4 (warpgroup-aligned); "
             f"got total_warps={warp_spec.total_warps}"
+        )
+
+    # Active cluster_m must be in the strategy's supported set.
+    # See ``_STRATEGY_SUPPORTED_CLUSTER_M`` for per-strategy
+    # capability and the dict-level comment for the topology
+    # rationale. Rejecting unsupported values here keeps a user-set
+    # ``helion.Config(tcgen05_strategy=..., tcgen05_cluster_m=...)``
+    # from compiling onto a runtime path that has not been
+    # validated.
+    supported_cluster_m = _STRATEGY_SUPPORTED_CLUSTER_M.get(strategy, frozenset())
+    if supported_cluster_m and cluster_m not in supported_cluster_m:
+        errors.append(
+            f"tcgen05 strategy {strategy.value!r} only runs correctly "
+            f"at tcgen05_cluster_m in {sorted(supported_cluster_m)!r}; "
+            f"got tcgen05_cluster_m={cluster_m}"
         )
 
     # Layout overrides may only carry concrete values under the

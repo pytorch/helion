@@ -804,6 +804,16 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             return plan.is_two_cta
         return False
 
+    def _tcgen05_has_scheduler_warp(self) -> bool:
+        plan = self._tcgen05_plan()
+        return plan is not None and plan.has_scheduler_warp
+
+    def _tcgen05_sched_pipeline_plan(self) -> object | None:
+        try:
+            return DeviceFunction.current().cute_tcgen05_sched_pipeline_plan
+        except NoCurrentFunction:
+            return None
+
     def _tcgen05_has_validated_role_local_two_cta_runtime(self) -> bool:
         plan = self._tcgen05_plan()
         return bool(
@@ -1054,6 +1064,25 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         return (
             "cute.arch.make_warp_uniform(cute.arch.warp_idx()) "
             f"< cutlass.Int32({plan.epi_warp_count})"
+        )
+
+    def _tcgen05_scheduler_role_predicate(self) -> str:
+        """Boolean expression that gates the scheduler warp's role block.
+
+        Active under ``ROLE_LOCAL_WITH_SCHEDULER`` only; gating is
+        ``warp_idx == scheduler_warp_id`` against the dedicated warp
+        the matmul plan reserves for centralized tile scheduling.
+        """
+        plan = self._tcgen05_plan()
+        assert plan is not None and plan.has_scheduler_warp, (
+            "tcgen05 scheduler role predicate requires a matmul plan "
+            "with has_scheduler_warp=True"
+        )
+        return (
+            "cute.arch.make_warp_uniform(cute.arch.warp_idx()) "
+            "== cutlass.Int32(plan.scheduler_warp_id)".replace(
+                "plan.scheduler_warp_id", str(plan.scheduler_warp_id)
+            )
         )
 
     def _split_tcgen05_invariant_setup(
@@ -1477,7 +1506,9 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             or use_validated_two_cta_role_local_body
         )
         omit_shared_loop = (
-            full_role_local_body and layout.cluster_m > 1 and not is_multi_root
+            full_role_local_body
+            and not is_multi_root
+            and (layout.cluster_m > 1 or self._tcgen05_has_scheduler_warp())
         )
         if use_role_local_body:
             # Retarget even for guarded cluster_m>1 / multi-root codegen so
@@ -1506,6 +1537,12 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         # each role owns a scheduler loop over the capped persistent grid.
         if not omit_shared_loop:
             setup.extend(self._build_tcgen05_persistent_prelude(layout))
+        elif self._tcgen05_has_scheduler_warp():
+            # ``ROLE_LOCAL_WITH_SCHEDULER`` skips the shared loop but
+            # *does* need the per-CTA work-tile SMEM mailbox: the
+            # scheduler warp publishes per-tile coords there and
+            # consumer warps read them after ``consumer_wait``.
+            setup.extend(self._build_tcgen05_work_tile_smem_alloc(layout))
         setup.extend(hoisted_setup)
         if use_role_local_body:
             if omit_shared_loop:
@@ -1817,6 +1854,33 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             work_tile_release_stmts=work_tile_release,
         )
 
+    def _build_tcgen05_work_tile_smem_alloc(
+        self, layout: _Tcgen05PersistentLayout
+    ) -> list[ast.stmt]:
+        """Allocate the per-CTA work-tile SMEM mailbox.
+
+        This is the 4-element Int32 array used to broadcast tile
+        coordinates + an is-valid sentinel. Both the cluster_m=2
+        ONE-CTA bridge path and ``ROLE_LOCAL_WITH_SCHEDULER`` use
+        this storage, so the allocation is pulled out of
+        ``_build_tcgen05_persistent_prelude`` (which is conditionally
+        skipped when the residual shared loop is omitted) into its
+        own helper that always runs when the work-tile mailbox is
+        needed.
+        """
+        return [
+            statement_from_string(
+                f"{layout.work_tile_smem_ptr} = cute.arch.alloc_smem(cutlass.Int32, 4, alignment=16)"
+            ),
+            statement_from_string(
+                f"{layout.work_tile_smem_tensor} = cute.make_tensor("
+                f"{layout.work_tile_smem_ptr}, cute.make_layout((4,), stride=(1,)))"
+            ),
+            statement_from_string(
+                f"{layout.work_tile_smem} = {layout.work_tile_smem_tensor}"
+            ),
+        ]
+
     def _build_tcgen05_persistent_prelude(
         self, layout: _Tcgen05PersistentLayout
     ) -> list[ast.stmt]:
@@ -1834,16 +1898,7 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                 f"{layout.tile_sched_var} = cutlass.utils.StaticPersistentTileScheduler.create("
                 f"{layout.tile_sched_params_var}, cute.arch.block_idx(), cute.arch.grid_dim())"
             ),
-            statement_from_string(
-                f"{layout.work_tile_smem_ptr} = cute.arch.alloc_smem(cutlass.Int32, 4, alignment=16)"
-            ),
-            statement_from_string(
-                f"{layout.work_tile_smem_tensor} = cute.make_tensor("
-                f"{layout.work_tile_smem_ptr}, cute.make_layout((4,), stride=(1,)))"
-            ),
-            statement_from_string(
-                f"{layout.work_tile_smem} = {layout.work_tile_smem_tensor}"
-            ),
+            *self._build_tcgen05_work_tile_smem_alloc(layout),
         ]
         if layout.cluster_m > 1:
             prelude.extend(
@@ -2059,6 +2114,23 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             "_build_role_local_while requires a non-shared role block; "
             "shared blocks live in the shared while"
         )
+
+        # ``ROLE_LOCAL_WITH_SCHEDULER`` reroutes the per-role body
+        # through the broadcast pipeline. When active, the consumer
+        # warp waits on the sched_pipeline, reads the published tile
+        # metadata from SMEM, runs its role block, then releases.
+        # The per-role ``StaticPersistentTileScheduler.create`` is
+        # *not* emitted in this mode — the scheduler warp owns the
+        # only tile scheduler.
+        if self._tcgen05_has_scheduler_warp():
+            return self._build_role_local_while_with_scheduler(
+                device_function,
+                layout,
+                role_block,
+                scheduler_var_prefix=scheduler_var_prefix,
+                dependency_stmts=dependency_stmts,
+            )
+
         # Match the shared scheduler's cluster shape so the role-local
         # scheduler visits the same tile sequence in the same order.
         # The shared scheduler uses (layout.cluster_m, 1, 1); diverging
@@ -2150,6 +2222,333 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         return create(
             ast.If,
             test=expr_from_string(role_block.role_predicate),
+            body=prelude,
+            orelse=[],
+        )
+
+    def _build_role_local_while_with_scheduler(
+        self,
+        device_function: DeviceFunction,
+        layout: Tcgen05PersistentProgramIDs._Tcgen05PersistentLayout,
+        role_block: Tcgen05PersistentProgramIDs._PersistentRoleBlock,
+        *,
+        scheduler_var_prefix: str,
+        dependency_stmts: list[ast.stmt] | None,
+    ) -> ast.stmt:
+        """``ROLE_LOCAL_WITH_SCHEDULER`` consumer-side role-local while.
+
+        Each consumer role waits on the sched_pipeline, reads the
+        published tile metadata from ``layout.work_tile_smem``, runs
+        its role block, then releases. The scheduler-warp role
+        (built by ``_build_scheduler_warp_role_local_while``) owns
+        the producer side: it runs ``StaticPersistentTileScheduler``
+        and publishes per-tile metadata into the same SMEM mailbox.
+
+        Cross-role producer-consumer synchronization for the *AB*
+        and *acc* pipelines stays unchanged — those barriers carry
+        the operand / accumulator data dependencies between the
+        TMA-load, MMA-exec, and epi roles. The sched_pipeline is
+        *only* used to broadcast per-tile coordinates.
+        """
+        assert role_block.role_predicate is not None
+        sched_pipeline_plan = self._tcgen05_sched_pipeline_plan()
+        assert sched_pipeline_plan is not None, (
+            "ROLE_LOCAL_WITH_SCHEDULER requires a registered "
+            "sched_pipeline plan; was register_cute_tcgen05_sched_pipeline_plan "
+            "called by _codegen_cute_mma?"
+        )
+
+        plan = self._tcgen05_plan()
+        assert plan is not None and plan.has_scheduler_warp
+
+        # Local handles for sched_pipeline variable names. The
+        # ``object`` type here is the
+        # ``cute_mma._Tcgen05SchedPipelinePlan`` dataclass — we
+        # access fields by name without importing the type to
+        # avoid a cycle.
+        sched_pipeline = sched_pipeline_plan.pipeline  # type: ignore[attr-defined]
+        sched_consumer_state = sched_pipeline_plan.consumer_state  # type: ignore[attr-defined]
+        # Per-role variable for the linearized virtual pid read out
+        # of the SMEM mailbox each iteration.
+        valid_var = device_function.new_var(f"{scheduler_var_prefix}_valid")
+
+        prelude: list[ast.stmt] = []
+        if (
+            self._tcgen05_is_two_cta()
+            and role_block.role_predicate == self._tcgen05_tma_load_role_predicate()
+        ):
+            # Same PDL hand-off as the MONOLITHIC path.
+            prelude.append(statement_from_string("cute.arch.griddepcontrol_wait()"))
+
+        tile_counter_var = None
+        if (
+            role_block.role_predicate == self._tcgen05_epi_role_predicate()
+            and device_function.cute_tcgen05_epi_role_tile_counter_var is not None
+        ):
+            tile_counter_var = device_function.cute_tcgen05_epi_role_tile_counter_var
+            prelude.append(
+                statement_from_string(f"{tile_counter_var} = cutlass.Int32(0)")
+            )
+
+        # Linear virtual pid expression: the scheduler warp publishes
+        # work-tile coordinates into ``layout.work_tile_smem``; we
+        # reconstruct the linear pid the same way the MONOLITHIC path
+        # does, just sourcing from SMEM coords instead of the
+        # work_tile object.
+        coord_terms = [
+            f"{layout.work_tile_smem}[cutlass.Int32({i})]"
+            for i in range(len(self.pid_info))
+        ]
+        linear_pid_expr = self._tcgen05_linear_virtual_pid_from_coords_expr(coord_terms)
+
+        # ``PipelineAsync.consumer_wait`` and ``consumer_release``
+        # call into ``mbarrier`` ops that are *per-thread*: every
+        # thread that runs them counts as an arrival on the barrier.
+        # The per-CTA topology used by ``ROLE_LOCAL_WITH_SCHEDULER``
+        # initializes the empty barrier with one arrival per consumer
+        # *warp* (no ``× cluster_size`` multiplier — see
+        # ``cute_mma._codegen_cute_mma`` ``consumer_mask_to_leader``
+        # branch), so we must gate ``consumer_release`` on a single
+        # thread per warp (lane 0). The other 31 lanes synchronize
+        # via ``sync_warp`` after. Same for ``consumer_wait`` —
+        # gating it on lane 0 alone would leave the other 31 lanes
+        # racing ahead, but ``mbarrier.wait`` PTX is documented to
+        # stall the issuing thread until the phase flips, so all 32
+        # threads can call it; the ``sync_warp`` after the read of
+        # SMEM keeps the warp lanes consistent.
+        #
+        # Mirrors the consumer pattern in
+        # ``_build_tcgen05_persistent_prelude`` for the
+        # cluster_m=2 ONE-CTA bridge (work_tile_consume_stmts +
+        # work_tile_release_stmts gated on consumer_leader_var).
+        # Build the wait/release blocks via factories per insertion
+        # point so each prelude/body/sentinel site gets fresh AST
+        # nodes — sharing nodes across multiple parents corrupts
+        # downstream AST passes.
+        def _consumer_wait_block() -> list[ast.stmt]:
+            return [
+                statement_from_string(
+                    f"{sched_pipeline}.consumer_wait({sched_consumer_state})"
+                ),
+                # async-shared fence: ensures the scheduler-warp's
+                # SMEM writes are visible in the consumer's proxy
+                # view before reading the work-tile mailbox.
+                statement_from_string("cute.arch.fence_view_async_shared()"),
+                statement_from_string("cute.arch.sync_warp()"),
+                statement_from_string(
+                    f"{valid_var} = "
+                    f"{layout.work_tile_smem}[cutlass.Int32(3)] != cutlass.Int32(0)"
+                ),
+            ]
+
+        def _consumer_release_block() -> list[ast.stmt]:
+            return [
+                create(
+                    ast.If,
+                    test=expr_from_string("cute.arch.lane_idx() == cutlass.Int32(0)"),
+                    body=[
+                        statement_from_string(
+                            f"{sched_pipeline}.consumer_release({sched_consumer_state})"
+                        ),
+                    ],
+                    orelse=[],
+                ),
+                statement_from_string(emit_pipeline_advance(sched_consumer_state)),
+                statement_from_string("cute.arch.sync_warp()"),
+            ]
+
+        # Initial wait + valid-flag read happens in the prelude so the
+        # ``while`` test can be a simple condition (CuTe DSL forbids
+        # ``break`` inside ``@cute.kernel``).
+        prelude.extend(_consumer_wait_block())
+        per_tile_body: list[ast.stmt] = [
+            statement_from_string(f"{self.virtual_pid_var} = {linear_pid_expr}"),
+        ]
+        if dependency_stmts is not None:
+            per_tile_body.extend(dependency_stmts)
+        per_tile_body.extend(role_block.stmts)
+        if tile_counter_var is not None:
+            per_tile_body.append(
+                statement_from_string(
+                    f"{tile_counter_var} = {tile_counter_var} + cutlass.Int32(1)"
+                )
+            )
+        per_tile_body.extend(_consumer_release_block())
+        per_tile_body.extend(_consumer_wait_block())
+        prelude.append(
+            create(
+                ast.While,
+                test=expr_from_string(valid_var),
+                body=per_tile_body,
+                orelse=[],
+            )
+        )
+        # Final release + advance for the sentinel publish (lane-0
+        # gate matches the per-iteration release inside the loop).
+        prelude.extend(_consumer_release_block())
+
+        return create(
+            ast.If,
+            test=expr_from_string(role_block.role_predicate),
+            body=prelude,
+            orelse=[],
+        )
+
+    def _build_scheduler_warp_role_local_while(
+        self,
+        device_function: DeviceFunction,
+        layout: Tcgen05PersistentProgramIDs._Tcgen05PersistentLayout,
+    ) -> ast.stmt:
+        """Build the scheduler-warp's role-local while.
+
+        Active only under ``ROLE_LOCAL_WITH_SCHEDULER``. The scheduler
+        warp owns the persistent tile scheduler and publishes
+        per-tile metadata + a sentinel via the broadcast pipeline.
+        Consumer warps (TMA-load, MMA-exec, epi) wait on the same
+        pipeline and read from ``layout.work_tile_smem``.
+
+        The body is constructed *here* rather than extracted from
+        device IR because the scheduler-warp work has no source
+        statements in the user kernel — it is pure scheduling
+        infrastructure.
+        """
+        plan = self._tcgen05_plan()
+        assert plan is not None and plan.has_scheduler_warp
+        sched_plan = self._tcgen05_sched_pipeline_plan()
+        assert sched_plan is not None
+        sched_pipeline = sched_plan.pipeline  # type: ignore[attr-defined]
+        sched_producer_state = sched_plan.producer_state  # type: ignore[attr-defined]
+
+        sched_params_var = device_function.new_var(
+            "tcgen05_scheduler_warp_tile_sched_params"
+        )
+        sched_var = device_function.new_var("tcgen05_scheduler_warp_tile_sched")
+        work_tile_var = device_function.new_var("tcgen05_scheduler_warp_work_tile")
+
+        # ``PipelineAsync`` producer/consumer mbarrier ops are
+        # per-thread; with ``producer_arrive_count = 1`` only one
+        # thread should arrive on the full barrier per stage.
+        # Gate the producer ops + SMEM writes on lane 0 of the
+        # scheduler warp. ``mbarrier.wait`` (used by
+        # ``producer_acquire``) is fine to call from any thread —
+        # PTX semantics stall the thread until the phase flips —
+        # but I keep the leader-only gate for it too, paired with
+        # a ``sync_warp`` after, so the SMEM write order vs the
+        # warp's other 31 lanes is well-defined. The 31 non-leader
+        # lanes do nothing per iteration; ``advance_to_next_work``
+        # mutates register-resident state that all 32 threads
+        # share via warp-uniform reads.
+        leader_predicate = "cute.arch.lane_idx() == cutlass.Int32(0)"
+        per_tile_body_leader: list[ast.stmt] = [
+            statement_from_string(
+                f"{sched_pipeline}.producer_acquire({sched_producer_state})"
+            ),
+            statement_from_string(
+                f"{layout.work_tile_smem}[cutlass.Int32(0)] = {work_tile_var}.tile_idx[0]"
+            ),
+            statement_from_string(
+                f"{layout.work_tile_smem}[cutlass.Int32(1)] = {work_tile_var}.tile_idx[1]"
+            ),
+            statement_from_string(
+                f"{layout.work_tile_smem}[cutlass.Int32(2)] = {work_tile_var}.tile_idx[2]"
+            ),
+            statement_from_string(
+                f"{layout.work_tile_smem}[cutlass.Int32(3)] = "
+                f"(cutlass.Int32(1) if {work_tile_var}.is_valid_tile "
+                f"else cutlass.Int32(0))"
+            ),
+            statement_from_string(
+                f"{sched_pipeline}.producer_commit({sched_producer_state})"
+            ),
+        ]
+        per_tile_body: list[ast.stmt] = [
+            create(
+                ast.If,
+                test=expr_from_string(leader_predicate),
+                body=per_tile_body_leader,
+                orelse=[],
+            ),
+            # Advance state on every lane so all 32 threads stay in
+            # sync on the producer state register. Then sync_warp
+            # so the leader's SMEM writes are observable to lanes
+            # 1-31 (defensive — they don't read this SMEM, but it
+            # keeps the warp's view of memory uniform for any
+            # future reads).
+            statement_from_string(emit_pipeline_advance(sched_producer_state)),
+            statement_from_string(f"{sched_var}.advance_to_next_work()"),
+            statement_from_string(f"{work_tile_var} = {sched_var}.get_current_work()"),
+            statement_from_string("cute.arch.sync_warp()"),
+        ]
+
+        # Producer loop: while the current work tile is valid, publish
+        # it and advance to the next. The final sentinel publish (with
+        # ``is_valid=False``) happens *outside* the loop so the
+        # consumer warps see exactly one trailing invalid arrival
+        # after the last valid tile. CuTe DSL forbids ``break`` inside
+        # ``@cute.kernel`` so the loop test runs on the
+        # freshly-fetched ``work_tile_var``.
+        prelude: list[ast.stmt] = [
+            statement_from_string(
+                f"{sched_params_var} = cutlass.utils.PersistentTileSchedulerParams("
+                f"{self._tcgen05_num_tiles_expr(is_device=True)}, "
+                f"({layout.cluster_m}, 1, 1))"
+            ),
+            statement_from_string(
+                f"{sched_var} = cutlass.utils.StaticPersistentTileScheduler.create("
+                f"{sched_params_var}, cute.arch.block_idx(), cute.arch.grid_dim())"
+            ),
+            statement_from_string(
+                f"{work_tile_var} = {sched_var}.initial_work_tile_info()"
+            ),
+        ]
+        prelude.append(
+            create(
+                ast.While,
+                test=expr_from_string(f"{work_tile_var}.is_valid_tile"),
+                body=per_tile_body,
+                orelse=[],
+            )
+        )
+        # Sentinel publish after the loop exits: producer-only writes
+        # gated on lane 0, then the producer arrive on the full
+        # barrier (so the last consumer iteration sees an invalid
+        # tile and exits the consumer loop).
+        sentinel_leader = [
+            statement_from_string(
+                f"{sched_pipeline}.producer_acquire({sched_producer_state})"
+            ),
+            statement_from_string(
+                f"{layout.work_tile_smem}[cutlass.Int32(0)] = cutlass.Int32(0)"
+            ),
+            statement_from_string(
+                f"{layout.work_tile_smem}[cutlass.Int32(1)] = cutlass.Int32(0)"
+            ),
+            statement_from_string(
+                f"{layout.work_tile_smem}[cutlass.Int32(2)] = cutlass.Int32(0)"
+            ),
+            statement_from_string(
+                f"{layout.work_tile_smem}[cutlass.Int32(3)] = cutlass.Int32(0)"
+            ),
+            statement_from_string(
+                f"{sched_pipeline}.producer_commit({sched_producer_state})"
+            ),
+        ]
+        prelude.extend(
+            [
+                create(
+                    ast.If,
+                    test=expr_from_string(leader_predicate),
+                    body=sentinel_leader,
+                    orelse=[],
+                ),
+                statement_from_string(emit_pipeline_advance(sched_producer_state)),
+                statement_from_string("cute.arch.sync_warp()"),
+            ]
+        )
+
+        return create(
+            ast.If,
+            test=expr_from_string(self._tcgen05_scheduler_role_predicate()),
             body=prelude,
             orelse=[],
         )
@@ -2455,6 +2854,18 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                     scheduler_var_prefix=f"tcgen05_role_local_{i}",
                     dependency_stmts=dependency_stmts,
                 )
+            )
+        # ``ROLE_LOCAL_WITH_SCHEDULER`` adds a fourth role-local while
+        # for the dedicated scheduler warp. Its body is constructed
+        # in-place (no source statements to extract from device IR).
+        # Append after the consumer roles so the scheduler-warp
+        # loop sits at the end of the per-tile setup; the
+        # producer/consumer pipeline pairing is order-independent
+        # because the consumers wait on a barrier the scheduler
+        # arms.
+        if self._tcgen05_has_scheduler_warp():
+            role_local_whiles.append(
+                self._build_scheduler_warp_role_local_while(device_function, layout)
             )
         return role_local_whiles, shared_tile_body
 

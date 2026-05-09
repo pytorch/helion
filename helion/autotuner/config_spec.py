@@ -880,6 +880,16 @@ class ConfigSpec:
         ``warp_spec_from_config`` for the read site.
         """
         return {
+            # ``ROLE_LOCAL_WITH_SCHEDULER`` is implemented and runs
+            # correctly on cluster_m=1 (validated by direct user
+            # config). The autotune surface stays narrowed to
+            # ``ROLE_LOCAL_MONOLITHIC`` until the cluster_m=2 path
+            # is also stable so autotune can't pick a hanging
+            # configuration mid-search. The validation surface
+            # accepts both strategies (see
+            # ``_tcgen05_strategy_validation_fragments``) so an
+            # explicit ``helion.Config(tcgen05_strategy=...)``
+            # round-trips through normalize.
             TCGEN05_STRATEGY_CONFIG_KEY: EnumFragment(
                 (Tcgen05Strategy.ROLE_LOCAL_MONOLITHIC.value,)
             ),
@@ -890,16 +900,17 @@ class ConfigSpec:
             # today; broaden when a strategy needs more.
             TCGEN05_WARP_SPEC_MMA_WARPS_KEY: EnumFragment((1,)),
             # ``ab_load_warps`` and ``epi_load_warps`` are knobs that
-            # G2-C will exercise. Until then, narrow to the value the
-            # implemented strategy uses.
+            # future strategies will exercise. Until then, narrow to
+            # the value the implemented strategies use.
             TCGEN05_WARP_SPEC_AB_LOAD_WARPS_KEY: EnumFragment((1,)),
             TCGEN05_WARP_SPEC_EPI_LOAD_WARPS_KEY: EnumFragment((0,)),
-            # ``scheduler_warps`` mirrors the strategy: 0 under
-            # MONOLITHIC, 1 under WITH_SCHEDULER. Until G2-C lands the
-            # second strategy, narrow to 0.
+            # ``scheduler_warps``: matches the autotune-surface
+            # narrowing of ``tcgen05_strategy`` above. Under
+            # MONOLITHIC, scheduler_warps must be 0; the validator
+            # rejects 1 with a MONOLITHIC strategy.
             TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY: EnumFragment((0,)),
             # Register split is currently fixed at the role-local
-            # MONOLITHIC values. G2-C/G2-E may broaden.
+            # MONOLITHIC values. G2-E may broaden.
             TCGEN05_WARP_SPEC_REGISTER_DECREASE_KEY: EnumFragment(
                 (ROLE_LOCAL_MONOLITHIC_DEFAULT_WARP_SPEC.register_split[0],)
             ),
@@ -942,6 +953,21 @@ class ConfigSpec:
                 Tcgen05PersistenceModel.STATIC_PERSISTENT.value,
             )
         )
+        # Strategy + scheduler_warps: the validation surface
+        # accepts both ``ROLE_LOCAL_MONOLITHIC`` and
+        # ``ROLE_LOCAL_WITH_SCHEDULER`` so users can opt in to the
+        # latter via explicit ``helion.Config(...)``. The autotune
+        # surface stays narrowed to MONOLITHIC until the WITH_SCHEDULER
+        # cluster_m=2 path is stable; mismatched pairs (e.g.
+        # MONOLITHIC + scheduler_warps=1) are still rejected by the
+        # cross-fragment validator.
+        fragments[TCGEN05_STRATEGY_CONFIG_KEY] = EnumFragment(
+            (
+                Tcgen05Strategy.ROLE_LOCAL_MONOLITHIC.value,
+                Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER.value,
+            )
+        )
+        fragments[TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY] = EnumFragment((0, 1))
         return fragments
 
     @staticmethod
@@ -1000,6 +1026,12 @@ class ConfigSpec:
         warp_spec = warp_spec_from_config(config)
         layout_overrides = layout_overrides_from_config(config)
 
+        # ``cluster_m`` is sourced from the existing
+        # ``tcgen05_cluster_m`` knob (default 1 if absent). The
+        # validator rejects strategy/cluster_m pairs that the
+        # lowering can't run correctly today.
+        cluster_m_raw = config.get("tcgen05_cluster_m", 1)
+        cluster_m = int(cluster_m_raw) if isinstance(cluster_m_raw, int) else 1
         errors = validate_tcgen05_strategy_invariants(
             strategy=strategy,
             persistence_model=persistence_model,
@@ -1007,6 +1039,7 @@ class ConfigSpec:
             warp_spec=warp_spec,
             layout_overrides=layout_overrides,
             pid_type=config.get("pid_type"),
+            cluster_m=cluster_m,
         )
         if not errors:
             return

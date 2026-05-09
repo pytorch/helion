@@ -254,14 +254,13 @@ class CuteTcgen05MatmulPlan:
     persistent rewrite splits TMA load and A/B prefetch onto separate
     warps.
 
-    Earlier revisions tracked separate ``has_scheduler_warp`` /
-    ``has_epi_load_warp`` flags. Neither role was wired to actual work --
-    the persistent scheduler always rode on the TMA warp, and the epilogue
-    load was folded into the consumer epi warps. Removing those flags drops
-    two dead warps from the launched block (saving register budget for the
-    real consumer warps) and simplifies the autotune search space. When
-    role-local persistent loops land, the dedicated roles can come back as
-    real launch dimensions instead of placeholders.
+    The scheduler-warp role came back via ``scheduler_warp_count``
+    once ``Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER`` was wired —
+    when set to 1, the scheduler warp owns a centralized
+    ``StaticPersistentTileScheduler`` and broadcasts work-tile
+    metadata through ``cute_tcgen05_sched_pipeline_plan`` to the
+    consumer warps. The epi-load warp slot Quack uses for C input
+    is not yet present in Helion (no C-input fusion).
     """
 
     bm: int
@@ -279,6 +278,23 @@ class CuteTcgen05MatmulPlan:
     c_stage_count: int
     epi_warp_count: int
     ab_load_warp_count: int = 1
+    # Scheduler-warp count for ``Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER``.
+    # Default 0 matches ``ROLE_LOCAL_MONOLITHIC`` (the byte-identity-pinned
+    # path) where persistent scheduling rides on the TMA warp; 1 dedicates
+    # one warp to centralized scheduling that broadcasts via a
+    # ``PipelineAsync`` to the consumer warps. The scheduler warp sits
+    # *after* the AB-load warps in the launched-CTA layout when present so
+    # all ``MONOLITHIC`` warp IDs are unchanged by the addition.
+    scheduler_warp_count: int = 0
+    # ``sched_stage_count`` is meaningful only when
+    # ``scheduler_warp_count > 0``; controls the depth of the scheduler
+    # broadcast pipeline. Today's value is 1 (single SMEM mailbox
+    # shared across consumer warps requires the producer to wait
+    # for *all* consumers to release before the next publish); see
+    # the comment at the ``tcgen05_sched_stage_count_value =`` site
+    # in ``cute_mma._codegen_cute_mma`` for why Helion does not
+    # mirror Quack's depth-2.
+    sched_stage_count: int = 0
 
     @property
     def exec_warp_id(self) -> int:
@@ -297,21 +313,61 @@ class CuteTcgen05MatmulPlan:
         return self.ab_load_warp_begin
 
     @property
+    def has_scheduler_warp(self) -> bool:
+        return self.scheduler_warp_count > 0
+
+    @property
+    def scheduler_warp_id(self) -> int:
+        # Dedicated scheduler warp sits after the AB-load warps. Reading
+        # this when ``scheduler_warp_count == 0`` is a contract violation —
+        # callers must guard on ``has_scheduler_warp``.
+        assert self.has_scheduler_warp, (
+            "scheduler_warp_id is only valid when scheduler_warp_count > 0"
+        )
+        return self.ab_load_warp_end
+
+    @property
     def persistent_scheduler_owner_warp_id(self) -> int:
-        # Persistent scheduling rides on the TMA warp because the current
-        # tcgen05 body still uses one CTA-wide ``while``: the scheduler owner
-        # has to be inside the same producer sync structure as the TMA load
-        # warp. Once role-local loops land this can move onto a dedicated
-        # scheduler warp.
+        # ``ROLE_LOCAL_MONOLITHIC``: persistent scheduling rides on the
+        # TMA warp because the role-local body uses one producer sync
+        # structure shared between TMA load and scheduler state.
+        # ``ROLE_LOCAL_WITH_SCHEDULER``: a dedicated warp owns the
+        # scheduler; consumers wait on its broadcast pipeline.
+        if self.has_scheduler_warp:
+            return self.scheduler_warp_id
         return self.tma_warp_id
 
     @property
     def role_warp_count(self) -> int:
-        return self.epi_warp_count + 1 + self.ab_load_warp_count
+        return (
+            self.epi_warp_count
+            + 1
+            + self.ab_load_warp_count
+            + self.scheduler_warp_count
+        )
+
+    @property
+    def launched_warp_count(self) -> int:
+        # ``setmaxregister`` is warpgroup-uniform on sm_100a (all 4
+        # warps of a warpgroup must request the same register
+        # budget). For ``WITH_SCHEDULER`` the 7 role warps split as
+        # 4 epi (consumers) + 3 producer warps; padding to 8
+        # launched warps moves the partial producer warpgroup back
+        # to a clean 4-warp warpgroup that uniformly decreases.
+        # ``MONOLITHIC`` keeps 6 launched warps because byte-identity
+        # against the recorded golden is load-bearing and the
+        # 6-warp shape happens to work in practice (mma+tma alone
+        # produces a 2-warp partial warpgroup that only the exec
+        # warp inside increases — empirically tolerated by the
+        # hardware on the validated cluster_m=1/2 paths).
+        if self.has_scheduler_warp:
+            warpgroup = 4
+            return (self.role_warp_count + warpgroup - 1) // warpgroup * warpgroup
+        return self.role_warp_count
 
     @property
     def block_shape(self) -> tuple[int, int, int]:
-        return (self.physical_m_threads, self.role_warp_count, 1)
+        return (self.physical_m_threads, self.launched_warp_count, 1)
 
 
 _sort_order: dict[type[Argument], int] = {
@@ -412,6 +468,12 @@ class DeviceFunction:
         self.deferred_rdim_defs: list[tuple[str, sympy.Expr]] = []
         self._cute_tcgen05_store_values: dict[str, CuteTcgen05StoreValue] = {}
         self.cute_tcgen05_matmul_plan: CuteTcgen05MatmulPlan | None = None
+        # Variable names for the ``ROLE_LOCAL_WITH_SCHEDULER`` broadcast
+        # pipeline. Set in ``_codegen_cute_mma`` when the strategy is
+        # active; ``program_id.py`` reads them when emitting the
+        # consumer-side ``consumer_wait``/``consumer_release`` and the
+        # scheduler-warp role-local while.
+        self.cute_tcgen05_sched_pipeline_plan: object | None = None
         self._cute_tcgen05_per_tile_stmt_ids: set[int] = set()
         self._cute_tcgen05_post_loop_stmt_ids: set[int] = set()
         self._cute_tcgen05_tma_load_role_stmt_ids: set[int] = set()
@@ -611,6 +673,17 @@ class DeviceFunction:
                 )
             return
         self.cute_tcgen05_matmul_plan = plan
+
+    def register_cute_tcgen05_sched_pipeline_plan(self, plan: object) -> None:
+        """Register the scheduler-broadcast ``PipelineAsync`` plan.
+
+        Set by ``cute_mma._codegen_cute_mma`` when the active strategy
+        is ``ROLE_LOCAL_WITH_SCHEDULER`` so ``program_id.py`` can
+        reach the variable names for the consumer-side
+        ``consumer_wait`` / ``consumer_release`` emissions and for
+        the scheduler-warp role-local while.
+        """
+        self.cute_tcgen05_sched_pipeline_plan = plan
 
     def register_cute_tcgen05_per_tile_stmts(self, stmts: list[ast.AST]) -> None:
         """Mark statements that depend on per-tile coordinates.

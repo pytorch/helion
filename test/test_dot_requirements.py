@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import unittest
 from unittest.mock import patch
 
@@ -1282,11 +1283,13 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
             "tcgen05_cluster_m": 2,
         }
 
-        # Unimplemented strategy values are rejected at the autotune
-        # fragment level — the user surface mirrors the implemented
-        # set so a kernel built today cannot accidentally select a
-        # codegen path that does not exist.
+        # ``ROLE_LOCAL_WITH_SCHEDULER`` is now an implemented
+        # strategy; explicit user configs that select it must
+        # *also* set ``scheduler_warps=1`` to satisfy the
+        # cross-fragment invariant.
         with self.assertRaises(InvalidConfig):
+            # WITH_SCHEDULER + scheduler_warps=0 (the default) is
+            # rejected by the cross-fragment validator.
             spec.normalize(
                 helion.Config(**base, tcgen05_strategy="role_local_with_scheduler")
             )
@@ -1295,11 +1298,54 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
                 helion.Config(**base, tcgen05_layout_strategy="explicit_epi_tile")
             )
         with self.assertRaises(InvalidConfig):
+            # MONOLITHIC + scheduler_warps=1 is rejected: MONOLITHIC
+            # requires scheduler_warps=0.
             spec.normalize(helion.Config(**base, tcgen05_warp_spec_scheduler_warps=1))
         with self.assertRaises(InvalidConfig):
             spec.normalize(helion.Config(**base, tcgen05_warp_spec_ab_load_warps=2))
         with self.assertRaises(InvalidConfig):
             spec.normalize(helion.Config(**base, tcgen05_warp_spec_mma_warps=2))
+
+        # ``WITH_SCHEDULER`` + ``cluster_m=2`` is accepted. Each
+        # CTA in the cluster runs its own scheduler that publishes
+        # locally and consumers release locally; both CTAs converge
+        # on the same cluster-level virtual_pid via the
+        # ``// cluster_m`` collapse in the consumer. See
+        # ``cute_mma._codegen_cute_mma`` ``consumer_mask_to_leader``
+        # comment for the full topology.
+        with_scheduler_cluster_m2 = helion.Config(
+            **base,
+            tcgen05_strategy="role_local_with_scheduler",
+            tcgen05_warp_spec_scheduler_warps=1,
+        )
+        spec.normalize(with_scheduler_cluster_m2)
+        self.assertEqual(
+            with_scheduler_cluster_m2.config["tcgen05_strategy"],
+            "role_local_with_scheduler",
+        )
+        self.assertEqual(with_scheduler_cluster_m2.config["tcgen05_cluster_m"], 2)
+
+        # WITH_SCHEDULER + scheduler_warps=1 + cluster_m=1 is also
+        # valid and round-trips cleanly.
+        cluster_m1_base = {
+            **base,
+            "tcgen05_cluster_m": 1,
+        }
+        with_scheduler_cfg = helion.Config(
+            **cluster_m1_base,
+            tcgen05_num_epi_warps=4,
+            tcgen05_strategy="role_local_with_scheduler",
+            tcgen05_warp_spec_scheduler_warps=1,
+        )
+        spec.normalize(with_scheduler_cfg)
+        self.assertEqual(
+            with_scheduler_cfg.config["tcgen05_strategy"],
+            "role_local_with_scheduler",
+        )
+        self.assertEqual(
+            with_scheduler_cfg.config["tcgen05_warp_spec_scheduler_warps"], 1
+        )
+        self.assertEqual(with_scheduler_cfg.config["tcgen05_cluster_m"], 1)
 
         # ``DYNAMIC_PERSISTENT`` is not in the persistence-model
         # fragment surface today (no codegen supports it).
@@ -1348,33 +1394,40 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
 
     @onlyBackends(["cute"])
     def test_cute_tcgen05_strategy_invariants_helper_unit(self) -> None:
-        """G2-A: ``validate_tcgen05_strategy_invariants`` covers the
+        """``validate_tcgen05_strategy_invariants`` covers the
         cross-fragment cases the autotune narrowing makes unreachable
-        from the user surface today (warpgroup-misaligned totals under
-        ``ROLE_LOCAL_WITH_SCHEDULER``, persistence model not supported
-        by the chosen strategy) plus the positive case where
-        ``EXPLICIT_EPI_TILE`` accepts non-None layout overrides.
-        Pin the helper directly so the data model stays correct
-        independent of which strategies the autotune surface exposes.
+        from the user surface today (persistence model not supported
+        by the chosen strategy, scheduler_warps mismatching the
+        strategy) plus the positive case where ``EXPLICIT_EPI_TILE``
+        accepts non-None layout overrides.
+
+        The earlier warpgroup-alignment requirement on
+        ``ROLE_LOCAL_WITH_SCHEDULER`` was relaxed once the initial
+        7-warp implementation landed (1 ab_load + 1 mma + 4 epi + 1
+        scheduler = 7). The eventual 8-warp variant with a C-input
+        epi-load warp will re-introduce the alignment requirement
+        when register-split tuning becomes warpgroup-uniform.
         """
-        # ROLE_LOCAL_WITH_SCHEDULER + warp totals not warpgroup-aligned.
-        misaligned = Tcgen05WarpSpec(
-            ab_load_warps=2,
+        # scheduler_warps=0 under WITH_SCHEDULER is rejected (the
+        # strategy demands one scheduler warp).
+        wrong_scheduler_count = Tcgen05WarpSpec(
+            ab_load_warps=1,
             mma_warps=1,
             epi_warps=4,
-            epi_load_warps=2,
-            scheduler_warps=1,
+            epi_load_warps=0,
+            scheduler_warps=0,
             register_split=(120, 256),
         )
         errors = validate_tcgen05_strategy_invariants(
             strategy=Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER,
             persistence_model=Tcgen05PersistenceModel.STATIC_PERSISTENT,
             layout_strategy=Tcgen05LayoutStrategy.DEFAULT,
-            warp_spec=misaligned,
+            warp_spec=wrong_scheduler_count,
             layout_overrides=Tcgen05LayoutOverrides(),
             pid_type="persistent_blocked",
+            cluster_m=1,
         )
-        self.assertTrue(any("warpgroup-aligned" in e for e in errors))
+        self.assertTrue(any("scheduler_warps=1" in e for e in errors))
 
         # DYNAMIC_PERSISTENT under a strategy that does not support it.
         errors = validate_tcgen05_strategy_invariants(
@@ -1384,8 +1437,44 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
             warp_spec=ROLE_LOCAL_MONOLITHIC_DEFAULT_WARP_SPEC,
             layout_overrides=Tcgen05LayoutOverrides(),
             pid_type="persistent_blocked",
+            cluster_m=1,
         )
         self.assertTrue(any("dynamic_persistent" in e for e in errors))
+
+        # ``ROLE_LOCAL_WITH_SCHEDULER`` runs at cluster_m ∈ {1, 2}.
+        # cluster_m=3+ falls outside the supported set; the
+        # validator must reject so a user config can't reach an
+        # untested cluster shape.
+        errors = validate_tcgen05_strategy_invariants(
+            strategy=Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER,
+            persistence_model=Tcgen05PersistenceModel.STATIC_PERSISTENT,
+            layout_strategy=Tcgen05LayoutStrategy.DEFAULT,
+            warp_spec=dataclasses.replace(
+                ROLE_LOCAL_MONOLITHIC_DEFAULT_WARP_SPEC, scheduler_warps=1
+            ),
+            layout_overrides=Tcgen05LayoutOverrides(),
+            pid_type="persistent_blocked",
+            cluster_m=4,
+        )
+        self.assertTrue(
+            any("tcgen05_cluster_m=4" in e for e in errors), msg=str(errors)
+        )
+
+        # Positive control: ROLE_LOCAL_WITH_SCHEDULER + cluster_m=2
+        # is now accepted (the per-CTA scheduler-warp topology is
+        # cluster-correct).
+        errors = validate_tcgen05_strategy_invariants(
+            strategy=Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER,
+            persistence_model=Tcgen05PersistenceModel.STATIC_PERSISTENT,
+            layout_strategy=Tcgen05LayoutStrategy.DEFAULT,
+            warp_spec=dataclasses.replace(
+                ROLE_LOCAL_MONOLITHIC_DEFAULT_WARP_SPEC, scheduler_warps=1
+            ),
+            layout_overrides=Tcgen05LayoutOverrides(),
+            pid_type="persistent_blocked",
+            cluster_m=2,
+        )
+        self.assertEqual(errors, [], msg=str(errors))
 
         # Positive case: EXPLICIT_EPI_TILE + non-None overrides is
         # accepted — the validator must not drift into rejecting all
@@ -1397,6 +1486,7 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
             warp_spec=ROLE_LOCAL_MONOLITHIC_DEFAULT_WARP_SPEC,
             layout_overrides=Tcgen05LayoutOverrides(epi_tile_m=64, epi_tile_n=32),
             pid_type="persistent_blocked",
+            cluster_m=1,
         )
         self.assertEqual(errors, [])
 
@@ -1409,8 +1499,50 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
             warp_spec=ROLE_LOCAL_MONOLITHIC_DEFAULT_WARP_SPEC,
             layout_overrides=Tcgen05LayoutOverrides(),
             pid_type="persistent_blocked",
+            cluster_m=1,
         )
         self.assertEqual(errors, [])
+
+    @onlyBackends(["cute"])
+    def test_cute_tcgen05_strategy_invariants_warpgroup_alignment_branch(
+        self,
+    ) -> None:
+        """The warpgroup-alignment branch of
+        ``validate_tcgen05_strategy_invariants`` is currently dead
+        code (``_STRATEGY_REQUIRES_WARPGROUP_ALIGNED_TOTAL`` is
+        empty) because today's two strategies tolerate non-aligned
+        role-warp totals via ``CuteTcgen05MatmulPlan.launched_warp_count``
+        rounding at the launch boundary. Patch the set to include
+        an existing strategy enum and pass a misaligned warp_spec
+        to confirm the validator's alignment check still fires —
+        so a future strategy that opts in catches misconfigured
+        warp counts loudly.
+        """
+        from helion._compiler.cute import strategies as strategies_module
+
+        misaligned = Tcgen05WarpSpec(
+            ab_load_warps=1,
+            mma_warps=1,
+            epi_warps=4,
+            epi_load_warps=0,
+            scheduler_warps=1,  # 1+1+4+1 = 7, not warpgroup-aligned
+            register_split=(120, 256),
+        )
+        with patch.object(
+            strategies_module,
+            "_STRATEGY_REQUIRES_WARPGROUP_ALIGNED_TOTAL",
+            frozenset({Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER}),
+        ):
+            errors = validate_tcgen05_strategy_invariants(
+                strategy=Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER,
+                persistence_model=Tcgen05PersistenceModel.STATIC_PERSISTENT,
+                layout_strategy=Tcgen05LayoutStrategy.DEFAULT,
+                warp_spec=misaligned,
+                layout_overrides=Tcgen05LayoutOverrides(),
+                pid_type="persistent_blocked",
+                cluster_m=1,
+            )
+        self.assertTrue(any("warpgroup-aligned" in e for e in errors), msg=str(errors))
 
     @onlyBackends(["cute"])
     def test_cute_tcgen05_strategy_fix_invalid_resets_to_defaults(self) -> None:

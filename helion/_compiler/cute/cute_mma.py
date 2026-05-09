@@ -1953,6 +1953,19 @@ def _emit_mma_pipeline(
         tcgen05_acc_consumer_arrive_count_value = tcgen05_epi_warp_count_value * (
             2 if tcgen05_is_two_cta else 1
         )
+        # Scheduler-warp pipeline depth. Use 1 stage for now: with
+        # a single SMEM mailbox shared across all consumer warps,
+        # each consumer warp must see the same tile per iteration.
+        # Multiple stages would let the producer overwrite the
+        # mailbox while a slower consumer is still reading the
+        # previous tile (each consumer has its own register-state
+        # advancement, so they can drift). Quack uses 2 stages
+        # because Quack's design has the mailbox sized num_stages
+        # entries; if we widen the SMEM mailbox to per-stage
+        # entries that change can come later.
+        tcgen05_sched_stage_count_value = (
+            1 if tcgen05_warp_spec.scheduler_warps > 0 else 0
+        )
         tcgen05_matmul_plan = CuteTcgen05MatmulPlan(
             bm=bm,
             bn=bn,
@@ -1971,6 +1984,8 @@ def _emit_mma_pipeline(
             c_stage_count=tcgen05_c_stage_count_value,
             epi_warp_count=tcgen05_epi_warp_count_value,
             ab_load_warp_count=tcgen05_warp_spec.ab_load_warps,
+            scheduler_warp_count=tcgen05_warp_spec.scheduler_warps,
+            sched_stage_count=tcgen05_sched_stage_count_value,
         )
         assert tcgen05_plan is not None
         tcgen05_mma_owner_active = _tcgen05_two_cta_owner_predicate(
@@ -2084,7 +2099,34 @@ def _emit_mma_pipeline(
             # calls are warp-uniform and must precede the first pipeline
             # op of each role; placing them with the role-gate invariants
             # keeps them out of the per-tile work loop.
-            consumer_predicate = f"{tcgen05_plan.exec_active} or {epi_active}"
+            #
+            # ``setmaxregister`` is *warpgroup-uniform* (every warp in
+            # the same 4-warp warpgroup must call the same value) on
+            # sm_100a. Under ``ROLE_LOCAL_MONOLITHIC`` the 6 launched
+            # warps are 4 epi + 1 exec + 1 tma_load; the consumer
+            # predicate ``exec_active or epi_active`` covers warps
+            # 0-4 (warpgroup 0 + warp 4 of warpgroup 1) and the
+            # producer covers warp 5. Warpgroup 1 is partially
+            # populated (warps 4 + 5; warps 6-7 absent), and the
+            # mixed setmaxregister within warpgroup 1 happens to be
+            # tolerated by hardware because the CTA shape has only
+            # warps 4 and 5 (no warps 6/7 to disagree with).
+            #
+            # Under ``ROLE_LOCAL_WITH_SCHEDULER`` the launched CTA
+            # has 7 warps (4 epi + 1 exec + 1 tma_load + 1 sched).
+            # If we kept the MONOLITHIC consumer predicate the
+            # warpgroup-1 warps would split as
+            # exec=increase / tma=decrease / sched=decrease, which
+            # is a real warpgroup-uniformity violation that triggers
+            # ``CUDA_ERROR_LAUNCH_FAILED`` at launch on sm_100a.
+            # Match Quack's pattern: only the 4 epi warps are
+            # consumers; exec joins the producer warpgroup (lower
+            # register budget) so warpgroup 1 is uniformly
+            # decrease.
+            if tcgen05_matmul_plan.has_scheduler_warp:
+                consumer_predicate = epi_active
+            else:
+                consumer_predicate = f"{tcgen05_plan.exec_active} or {epi_active}"
             prefix.append(
                 statement_from_string(
                     f"if not ({consumer_predicate}):\n"
@@ -2250,6 +2292,59 @@ def _emit_mma_pipeline(
                 f"cutlass.pipeline.PipelineUserType.Consumer, {tcgen05_acc_stage_count_value})"
             )
         )
+        # ``ROLE_LOCAL_WITH_SCHEDULER`` allocates a scheduler-broadcast
+        # ``PipelineAsync`` here. The plan and emission helpers live in
+        # this file (``_new_tcgen05_sched_pipeline_plan`` /
+        # ``_emit_sched_pipeline_setup``); the variable names are
+        # registered on ``DeviceFunction`` so ``program_id.py`` can
+        # emit consumer-side ``consumer_wait`` / ``consumer_release``
+        # against the same plan. The ``MONOLITHIC`` byte-identity
+        # path is preserved because this branch is gated on
+        # ``has_scheduler_warp`` and emits no ``df.new_var`` when
+        # scheduler_warps == 0.
+        assert tcgen05_matmul_plan is not None
+        if tcgen05_matmul_plan.has_scheduler_warp:
+            tcgen05_sched_plan = _new_tcgen05_sched_pipeline_plan(df)
+            df.register_cute_tcgen05_sched_pipeline_plan(tcgen05_sched_plan)
+            # WITH_SCHEDULER's scheduler-warp topology: every CTA in
+            # the cluster runs its own scheduler warp, publishing to
+            # its own SMEM mailbox. Both CTAs converge on the same
+            # cluster-level virtual_pid because the consumer's
+            # ``virtual_pid = work_tile_smem[0] // cluster_m + ...``
+            # formula collapses the per-CTA ``cta_id_in_cluster``
+            # offset that ``StaticPersistentTileScheduler.create``
+            # bakes into ``tile_idx[0]``. So each CTA's scheduler
+            # publishes locally and each CTA's consumers release
+            # locally — no peer-CTA broadcast needed. The
+            # ``consumer_arrive_count`` is therefore *per-CTA*
+            # (no ``× cluster_size`` multiplier), and
+            # ``consumer_mask_to_leader=False`` keeps releases on
+            # the local empty barrier. Quack's
+            # ``make_sched_pipeline`` uses a different topology —
+            # single cluster-leader scheduler with peer-CTA
+            # broadcast — and consequently sets the cluster-wide
+            # arrive count and ``consumer_mask=Int32(0)``. Picking
+            # the wrong pair for the active topology starves
+            # non-leader CTAs of empty-barrier arrivals and hangs
+            # the kernel.
+            tcgen05_sched_consumer_arrive_count = (
+                tcgen05_matmul_plan.role_warp_count
+                - tcgen05_matmul_plan.scheduler_warp_count
+            )
+            prefix.extend(
+                _emit_sched_pipeline_setup(
+                    tcgen05_sched_plan,
+                    sched_stage_count=tcgen05_matmul_plan.sched_stage_count,
+                    consumer_arrive_count=tcgen05_sched_consumer_arrive_count,
+                    cluster_size=tcgen05_cluster_m,
+                    defer_sync=tcgen05_use_cluster_deferred_pipelines,
+                    consumer_mask_to_leader=False,
+                    # One leader thread (lane 0 of the scheduler
+                    # warp) arrives on the full barrier per stage
+                    # via ``producer_commit``.
+                    producer_arrive_count=1,
+                )
+            )
         if not tcgen05_use_tma:
             _emit_tcgen05_tmem_setup()
     else:
@@ -3695,6 +3790,8 @@ def _emit_sched_pipeline_setup(
     consumer_arrive_count: int,
     cluster_size: int,
     defer_sync: bool,
+    producer_arrive_count: int,
+    consumer_mask_to_leader: bool = True,
 ) -> list[ast.AST]:
     """Emit the prefix statements that construct the sched pipeline.
 
@@ -3711,17 +3808,29 @@ def _emit_sched_pipeline_setup(
     Parameters:
 
     - ``consumer_arrive_count``: caller-supplied total number of
-      consumer arrivals per stage. Quack's ``make_sched_pipeline``
-      uses ``warps_per_cta * cluster_size`` *including* the
-      scheduler warp itself; the bridge diagnostic in
-      ``program_id.py`` uses ``cluster_m`` (one peer CTA per
-      arrival).
-    - ``cluster_size``: cluster-multicast factor. ``> 1`` causes
-      ``consumer_mask=cutlass.Int32(0)`` to be emitted, matching
-      the wrapping convention of the existing scheduler emission;
-      ``== 1`` omits the mask. Assumes the leader CTA sits at
-      cluster index 0 — the helper does not parameterize a
-      different leader.
+      consumer arrivals per stage on the empty barrier. With
+      ``consumer_mask_to_leader=True`` (Quack pattern) every CTA's
+      consumer release routes to the leader CTA's empty barrier so
+      this is the cluster-wide total
+      (``warps_per_cta * cluster_size``). With
+      ``consumer_mask_to_leader=False`` releases stay local so this
+      is the per-CTA count (``warps_per_cta``).
+    - ``cluster_size``: cluster-multicast factor. ``> 1`` lets
+      ``defer_sync`` participate in cluster-wide barrier init.
+    - ``consumer_mask_to_leader``: ``True`` emits
+      ``consumer_mask=cutlass.Int32(0)`` so every consumer release
+      arrives on the leader CTA's empty barrier (matches Quack's
+      single-cluster-leader scheduler topology where only the
+      leader runs the producer side and broadcasts via peer-CTA
+      writes). ``False`` omits the mask so each CTA's empty
+      barrier collects its own consumers' arrivals (matches the
+      "every CTA runs its own scheduler that publishes to its own
+      consumers" topology used by the WITH_SCHEDULER strategy).
+      Picking the wrong topology for the actual scheduler
+      placement causes a clean-on-cluster_m=1 / hang-on-cluster_m>1
+      regression because the asymmetric arrival counts mismatch.
+      Ignored when ``cluster_size <= 1`` (no mask is emitted in
+      either case).
     - ``defer_sync``: emits ``defer_sync=True`` so the pipeline
       participates in the cluster-wide deferred-init protocol
       coordinated via ``pipeline_init_arrive`` /
@@ -3742,7 +3851,7 @@ def _emit_sched_pipeline_setup(
     ``_make_tcgen05_layout_plan_setup``.
     """
     extra_args = ""
-    if cluster_size > 1:
+    if cluster_size > 1 and consumer_mask_to_leader:
         extra_args += ", consumer_mask=cutlass.Int32(0)"
     if defer_sync:
         extra_args += ", defer_sync=True"
@@ -3754,7 +3863,7 @@ def _emit_sched_pipeline_setup(
         statement_from_string(
             f"{plan.producer_group} = "
             "cutlass.pipeline.CooperativeGroup("
-            "cutlass.pipeline.Agent.Thread)"
+            f"cutlass.pipeline.Agent.Thread, {producer_arrive_count})"
         ),
         statement_from_string(
             f"{plan.consumer_group} = "

@@ -1669,6 +1669,113 @@ class TestCuteLowerings(unittest.TestCase):
         self.assertEqual(len(observed_plans), 1, msg="plan was never constructed")
         self.assertEqual(observed_plans[0].ab_load_warp_count, 2)
 
+    def test_tcgen05_with_scheduler_cluster_m2_per_cta_topology_codegen(
+        self,
+    ) -> None:
+        """G2-C cluster_m=2 codegen pin (cute_plan.md §6.3.1).
+
+        ``ROLE_LOCAL_WITH_SCHEDULER`` at ``cluster_m=2`` uses a
+        per-CTA scheduler topology: every CTA in the cluster runs its
+        own scheduler that publishes locally and consumers release
+        locally. The sched_pipeline emission therefore must NOT carry
+        ``consumer_mask=cutlass.Int32(0)`` (which would route every
+        CTA's consumer release to the leader CTA's empty barrier and
+        starve non-leader CTAs of arrivals — the cluster_m=2 hang the
+        prior cycle reproduced). The consumer arrive count must also
+        be per-CTA (``role_warp_count - scheduler_warp_count``)
+        without the ``× cluster_size`` Quack-style multiplier.
+
+        Pin both invariants on the captured generated code so a
+        future refactor that reintroduces the leader-only mask or
+        the cluster-wide arrive count fails this test loudly rather
+        than silently regressing to the hang at runtime.
+        """
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_with_scheduler_c2(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        args = (
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+        )
+        config = helion.Config(
+            block_sizes=[256, 256, 128],
+            l2_groupings=[1],
+            num_warps=4,
+            num_sm_multiplier=1,
+            pid_type="persistent_interleaved",
+            tcgen05_cluster_m=2,
+            tcgen05_ab_stages=2,
+            tcgen05_acc_stages=2,
+            tcgen05_c_stages=2,
+            tcgen05_num_epi_warps=4,
+            tcgen05_strategy="role_local_with_scheduler",
+            tcgen05_warp_spec_scheduler_warps=1,
+            indexing=[
+                "tensor_descriptor",
+                "tensor_descriptor",
+                "tensor_descriptor",
+            ],
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_with_scheduler_c2.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            code = bound.to_triton_code(config)
+
+        # The sched_pipeline.create call must omit consumer_mask. A
+        # bare assertNotIn("consumer_mask", code) would also catch
+        # ``mcast_mask`` / ``producer_mask`` etc. — narrow to the
+        # specific Quack-style literal that the prior implementation
+        # emitted.
+        self.assertNotIn("consumer_mask=cutlass.Int32(0)", code)
+        # Locate the sched_pipeline create call and assert the
+        # specific kwargs that should NOT appear on it.
+        sched_create_idx = code.find("tcgen05_sched_pipeline = ")
+        self.assertGreater(
+            sched_create_idx,
+            -1,
+            msg="WITH_SCHEDULER kernel did not emit a sched_pipeline.create",
+        )
+        sched_create_end = code.find(")", sched_create_idx)
+        sched_create_call = code[sched_create_idx:sched_create_end]
+        self.assertNotIn("consumer_mask", sched_create_call)
+        # ``defer_sync=True`` must still appear so the sched_pipeline
+        # init coordinates with the AB / acc / c pipelines under the
+        # cluster-deferred protocol.
+        self.assertIn("defer_sync=True", sched_create_call)
+
+        # Per-CTA consumer arrive count = role_warps - scheduler_warps =
+        # 1 (ab_load) + 1 (mma) + 4 (epi) + 0 (epi_load) = 6.
+        # Multiplying by cluster_size (=2) would re-introduce the hang.
+        self.assertIn(
+            "tcgen05_sched_pipeline_consumer_group = "
+            "cutlass.pipeline.CooperativeGroup("
+            "cutlass.pipeline.Agent.Thread, cutlass.Int32(6))",
+            code,
+        )
+        # Negative pin: the cluster-wide count (6 * 2 = 12) must NOT
+        # appear in the sched_pipeline consumer group. Anchor on the
+        # full ``CooperativeGroup(... cutlass.Int32(12))`` literal so
+        # an unrelated 12 elsewhere in the kernel does not flake the
+        # test.
+        self.assertNotIn(
+            "tcgen05_sched_pipeline_consumer_group = "
+            "cutlass.pipeline.CooperativeGroup("
+            "cutlass.pipeline.Agent.Thread, cutlass.Int32(12))",
+            code,
+        )
+
     def test_tcgen05_persistent_kloop_producer_lifts_to_role_local_while(
         self,
     ) -> None:
@@ -7343,17 +7450,26 @@ class TestCuteLowerings(unittest.TestCase):
         and the existing inline scheduler emission in
         ``program_id._build_tcgen05_persistent_layout``.
 
-        Three configurations are exercised:
+        Four configurations are exercised:
 
         - Single-CTA, no defer-sync: ``consumer_mask`` and
           ``defer_sync`` are both omitted from the
           ``PipelineAsync.create`` call.
-        - Cluster + defer-sync: both ``consumer_mask=cutlass.Int32(0)``
-          and ``defer_sync=True`` appear, matching the wrapping
-          convention of the existing scheduler emission.
-        - Same ``DeviceFunction`` reused: the suffix on the second
-          plan's ``new_var`` outputs advances to ``_2``, confirming
-          the helper does not memoize state on the device function.
+        - Cluster + defer-sync, ``consumer_mask_to_leader=True``: both
+          ``consumer_mask=cutlass.Int32(0)`` and ``defer_sync=True``
+          appear, matching the Quack ``make_sched_pipeline`` shape used
+          by the cluster_m=2 ONE-CTA bridge.
+        - Cluster + defer-sync, ``consumer_mask_to_leader=False``:
+          ``defer_sync=True`` still appears (the pipeline still
+          participates in the cluster-wide deferred-init protocol) but
+          ``consumer_mask=`` is *omitted* — each CTA's empty barrier
+          collects its own consumer arrivals. This is the
+          ``ROLE_LOCAL_WITH_SCHEDULER`` shape; mismatching the topology
+          and the cooperative-group arrive count causes a
+          clean-on-cluster_m=1 / hang-on-cluster_m=2 regression.
+        - Same ``DeviceFunction`` reused: the suffix on each subsequent
+          plan's ``new_var`` outputs advances, confirming the helper
+          does not memoize state on the device function.
         """
         df = _FakeDeviceFunction()
         plan = _new_tcgen05_sched_pipeline_plan(df)
@@ -7366,6 +7482,7 @@ class TestCuteLowerings(unittest.TestCase):
             consumer_arrive_count=15,
             cluster_size=1,
             defer_sync=False,
+            producer_arrive_count=1,
         )
         emitted = "\n".join(ast.unparse(stmt) for stmt in stmts)
 
@@ -7379,11 +7496,16 @@ class TestCuteLowerings(unittest.TestCase):
             "cutlass.Int64, cutlass.Int32(4))",
             emitted,
         )
-        # Producer group: single thread, no count (consistent with
-        # the existing acc-pipeline producer group).
+        # Producer group: caller-supplied arrive count (default 1
+        # mirrors the existing scheduler emission in
+        # ``program_id._build_tcgen05_persistent_prelude`` for the
+        # cluster_m=2 ONE-CTA bridge — the producer warp leader
+        # arrives once per stage). Bare ``Agent.Thread`` with no
+        # count differs from that established shape and was a
+        # pipeline-init misconfiguration source.
         self.assertIn(
             "tcgen05_sched_pipeline_producer_group_1 = "
-            "cutlass.pipeline.CooperativeGroup(cutlass.pipeline.Agent.Thread)",
+            "cutlass.pipeline.CooperativeGroup(cutlass.pipeline.Agent.Thread, 1)",
             emitted,
         )
         # Consumer group: caller-supplied arrive count wrapped in
@@ -7434,6 +7556,7 @@ class TestCuteLowerings(unittest.TestCase):
             consumer_arrive_count=16,
             cluster_size=2,
             defer_sync=True,
+            producer_arrive_count=1,
         )
         cluster_emitted = "\n".join(ast.unparse(s) for s in cluster_stmts)
         # PipelineAsync.create now carries both consumer_mask
@@ -7451,6 +7574,32 @@ class TestCuteLowerings(unittest.TestCase):
         )
         self.assertIn("cutlass.Int32(16)", cluster_emitted)
         self.assertEqual(len(cluster_stmts), 6)
+
+        # Per-CTA topology (``consumer_mask_to_leader=False``):
+        # cluster_size > 1 + defer_sync=True keeps the cluster-wide
+        # init protocol but each CTA's empty barrier collects its own
+        # arrivals. ``ROLE_LOCAL_WITH_SCHEDULER`` uses this shape.
+        plan_per_cta = _new_tcgen05_sched_pipeline_plan(df)
+        self.assertEqual(plan_per_cta.barriers, "tcgen05_sched_pipeline_mbars_3")
+        per_cta_stmts = _emit_sched_pipeline_setup(
+            plan_per_cta,
+            sched_stage_count=1,
+            consumer_arrive_count=6,
+            cluster_size=2,
+            defer_sync=True,
+            producer_arrive_count=1,
+            consumer_mask_to_leader=False,
+        )
+        per_cta_emitted = "\n".join(ast.unparse(s) for s in per_cta_stmts)
+        # ``defer_sync=True`` still appears so the pipeline init
+        # coordinates with the AB / acc / c pipelines.
+        self.assertIn("defer_sync=True", per_cta_emitted)
+        # ``consumer_mask=`` must NOT appear — empty-barrier arrivals
+        # stay local to each CTA. Asserting on the literal substring
+        # avoids matching the ``mcast_mask`` family used elsewhere.
+        self.assertNotIn("consumer_mask=", per_cta_emitted)
+        self.assertIn("cutlass.Int32(6)", per_cta_emitted)
+        self.assertEqual(len(per_cta_stmts), 6)
 
     def test_tcgen05_codegen_emits_cluster_and_role_split_knobs(self) -> None:
         @helion.kernel(backend="cute")
