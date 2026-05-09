@@ -188,8 +188,6 @@ def _helion_cute_matmul_role_local_monolithic_4096_bf16(x, y, out, tma_atom_a, t
                     if cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster()) == cutlass.Int32(0):
                         tcgen05_ab_pipeline.consumer_wait(tcgen05_ab_consumer_state, tcgen05_ab_consumer_try_token)
                 if cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster()) == cutlass.Int32(0):
-                    cute.arch.fence_view_async_shared()
-                if cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster()) == cutlass.Int32(0):
                     for _tcgen05_kblk_idx in range(cute.size(tcgen05_tCrA, mode=[2])):
                         cute.gemm(tiled_mma, acc_frag, [tcgen05_tCrA[None, None, cutlass.Int32(_tcgen05_kblk_idx), mma_stage]], [tcgen05_tCrB[None, None, cutlass.Int32(_tcgen05_kblk_idx), mma_stage]], acc_frag)
                         tiled_mma.set(cute.nvgpu.tcgen05.Field.ACCUMULATE, True)

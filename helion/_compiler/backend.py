@@ -2611,6 +2611,7 @@ class CuteBackend(Backend):
             "_cute_grouped_reduce_shared_two_stage": "from helion._compiler.cute.reduce_helpers import _cute_grouped_reduce_shared_two_stage",
             "_cute_grouped_reduce_warp": "from helion._compiler.cute.reduce_helpers import _cute_grouped_reduce_warp",
             "_cute_store_shared_remote_x4": "from helion._compiler.cute.cluster_helpers import store_shared_remote_x4 as _cute_store_shared_remote_x4",
+            "_cute_issue_clc_query_nomulticast": "from helion._compiler.cute.clc_helpers import issue_clc_query_nomulticast as _cute_issue_clc_query_nomulticast",
         }
 
     def program_id_expr(self, dim: int, *, index_dtype: str) -> str:

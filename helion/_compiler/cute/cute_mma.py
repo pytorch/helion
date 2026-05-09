@@ -44,6 +44,7 @@ from .layout import MatmulExecutionKind
 from .layout import MatmulExecutionPlan
 from .matmul_utils import analyze_direct_grouped_n_loads
 from .mma_support import get_cute_mma_support
+from .strategies import Tcgen05PersistenceModel
 from .strategies import warp_spec_from_config
 from .tcgen05_constants import TCGEN05_AB_CONSUMER_PHASE_MODE_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_AB_CONSUMER_PHASE_MODE_NORMAL
@@ -151,6 +152,14 @@ class _Tcgen05SchedPipelinePlan:
     Pure name container, mirroring ``_Tcgen05LayoutPlan``: each field
     is the textual identifier of a value materialized in the kernel
     prefix when ``_emit_sched_pipeline_setup`` runs.
+
+    The ``clc_*`` fields are populated only under
+    ``Tcgen05PersistenceModel.CLC_PERSISTENT`` (G2-H, cute_plan.md);
+    empty strings on the static path. They name SMEM storage
+    + an mbarrier that the scheduler-warp loop body uses to issue
+    ``nvvm.clusterlaunchcontrol_try_cancel`` and read back the next
+    cluster's CTA id (or a "canceled" sentinel) per persistent-loop
+    iteration.
     """
 
     barriers: str
@@ -159,6 +168,12 @@ class _Tcgen05SchedPipelinePlan:
     pipeline: str
     producer_state: str
     consumer_state: str
+    # CLC SMEM/mbarrier handles. Only emitted/used on the CLC path.
+    clc_response_smem_ptr: str = ""
+    clc_response_tensor: str = ""
+    clc_mbar_smem_ptr: str = ""
+    clc_mbar_tensor: str = ""
+    clc_mbar_phase: str = ""
 
 
 class _ConfigLike(Protocol):
@@ -988,18 +1003,6 @@ def _build_kloop_pipeline_release_if(
     )
     src = f"if {args.tma_full_tile}:\n{full_tile_src}{fallback_src}"
     return statement_from_string(src)
-
-
-def _build_tcgen05_mma_fence_stmt(
-    exec_active: str, *, gate_exec_warp: bool = True, is_two_cta: bool = False
-) -> ast.stmt:
-    fence_src = "cute.arch.fence_view_async_shared()"
-    predicate = _tcgen05_two_cta_owner_predicate(
-        exec_active, is_two_cta=is_two_cta, gate_exec_warp=gate_exec_warp
-    )
-    if predicate is None:
-        return statement_from_string(fence_src)
-    return statement_from_string(f"if {predicate}:\n    {fence_src}")
 
 
 def _build_tcgen05_mma_accumulate_reset_stmt(
@@ -2093,6 +2096,24 @@ def _emit_mma_pipeline(
         tcgen05_sched_stage_count_value = (
             1 if tcgen05_warp_spec.scheduler_warps > 0 else 0
         )
+        # Persistence model from the active config. Default
+        # ``static_persistent`` keeps the existing path; G2-H
+        # ``clc_persistent`` (cute_plan.md, see plan: G2-H CLC)
+        # selects CLC issuance in the scheduler-warp role.
+        # Validation in ``ConfigSpec.normalize`` has already ensured
+        # the value is consistent with the chosen strategy + arch
+        # (rejecting CLC under MONOLITHIC or on arch < 100), so a
+        # missing field falls back to the static default rather
+        # than raising.
+        tcgen05_persistence_model_str = df.config.get(
+            "tcgen05_persistence_model",
+            Tcgen05PersistenceModel.STATIC_PERSISTENT.value,
+        )
+        assert isinstance(tcgen05_persistence_model_str, str), (
+            "tcgen05_persistence_model must be a string (the "
+            "Tcgen05PersistenceModel enum's .value); got "
+            f"{type(tcgen05_persistence_model_str).__name__}"
+        )
         tcgen05_matmul_plan = CuteTcgen05MatmulPlan(
             bm=bm,
             bn=bn,
@@ -2113,6 +2134,7 @@ def _emit_mma_pipeline(
             ab_load_warp_count=tcgen05_warp_spec.ab_load_warps,
             scheduler_warp_count=tcgen05_warp_spec.scheduler_warps,
             sched_stage_count=tcgen05_sched_stage_count_value,
+            persistence_model=tcgen05_persistence_model_str,
         )
         assert tcgen05_plan is not None
         tcgen05_mma_owner_active = _tcgen05_two_cta_owner_predicate(
@@ -2432,7 +2454,9 @@ def _emit_mma_pipeline(
         # scheduler_warps == 0.
         assert tcgen05_matmul_plan is not None
         if tcgen05_matmul_plan.has_scheduler_warp:
-            tcgen05_sched_plan = _new_tcgen05_sched_pipeline_plan(df)
+            tcgen05_sched_plan = _new_tcgen05_sched_pipeline_plan(
+                df, use_clc=tcgen05_matmul_plan.is_clc_persistent
+            )
             df.register_cute_tcgen05_sched_pipeline_plan(tcgen05_sched_plan)
             # WITH_SCHEDULER's scheduler-warp topology: every CTA in
             # the cluster runs its own scheduler warp, publishing to
@@ -2455,10 +2479,23 @@ def _emit_mma_pipeline(
             # the wrong pair for the active topology starves
             # non-leader CTAs of empty-barrier arrivals and hangs
             # the kernel.
-            tcgen05_sched_consumer_arrive_count = (
-                tcgen05_matmul_plan.role_warp_count
-                - tcgen05_matmul_plan.scheduler_warp_count
-            )
+            # CLC overlays a different sched_pipeline topology than
+            # the static path: leader-only producer + cluster-routed
+            # empty mbar (mirrors Quack's ``make_sched_pipeline`` for
+            # ``cluster_size > 1``). For cluster_size == 1 the two
+            # topologies degenerate to the same per-CTA shape.
+            if tcgen05_matmul_plan.is_clc_persistent and tcgen05_cluster_m > 1:
+                tcgen05_sched_consumer_arrive_count = (
+                    tcgen05_matmul_plan.role_warp_count
+                    - tcgen05_matmul_plan.scheduler_warp_count
+                ) * tcgen05_cluster_m
+                tcgen05_sched_consumer_mask_to_leader = True
+            else:
+                tcgen05_sched_consumer_arrive_count = (
+                    tcgen05_matmul_plan.role_warp_count
+                    - tcgen05_matmul_plan.scheduler_warp_count
+                )
+                tcgen05_sched_consumer_mask_to_leader = False
             prefix.extend(
                 _emit_sched_pipeline_setup(
                     tcgen05_sched_plan,
@@ -2466,13 +2503,22 @@ def _emit_mma_pipeline(
                     consumer_arrive_count=tcgen05_sched_consumer_arrive_count,
                     cluster_size=tcgen05_cluster_m,
                     defer_sync=tcgen05_use_cluster_deferred_pipelines,
-                    consumer_mask_to_leader=False,
+                    consumer_mask_to_leader=tcgen05_sched_consumer_mask_to_leader,
                     # One leader thread (lane 0 of the scheduler
                     # warp) arrives on the full barrier per stage
                     # via ``producer_commit``.
                     producer_arrive_count=1,
                 )
             )
+            # G2-H (cute_plan.md): allocate the CLC response
+            # buffer + mbarrier on the CLC path. The mbarrier-init
+            # call inside the scheduler-warp body (gated on
+            # lane 0 of the scheduler warp) follows in
+            # ``program_id._build_scheduler_warp_role_local_while_clc``.
+            # The SMEM allocations themselves are warp-uniform and
+            # safe to emit at the kernel prefix.
+            if tcgen05_matmul_plan.is_clc_persistent:
+                prefix.extend(_emit_clc_smem_setup(tcgen05_sched_plan))
         if not tcgen05_use_tma:
             _emit_tcgen05_tmem_setup()
     else:
@@ -2549,6 +2595,12 @@ def _emit_mma_pipeline(
     mma_stage = df.new_var("mma_stage")
     if mma_impl == "tcgen05":
         assert tcgen05_plan is not None
+        # ``tcgen05_matmul_plan`` is initialized in the same
+        # ``mma_impl == "tcgen05"`` branch upstream; the assert
+        # narrows the type for pyrefly so the ``is_clc_persistent``
+        # property access below doesn't trip a missing-attribute
+        # check on the ``Optional[CuteTcgen05MatmulPlan]`` annotation.
+        assert tcgen05_matmul_plan is not None
         if tcgen05_use_tma:
             # Applied for every tcgen05 TMA path even though only the role-local
             # path strictly needs it: TMA wrapper plans consume the original
@@ -2558,22 +2610,34 @@ def _emit_mma_pipeline(
             df.wrapper_only_params.extend(
                 [tma_atom_a, tma_tensor_a, tma_atom_b, tma_tensor_b]
             )
-            cg.cute_wrapper_plans.append(
-                {
-                    "kind": "tcgen05_ab_tma",
-                    "lhs_name": lhs_arg_name,
-                    "rhs_name": rhs_arg_name,
-                    "bm": bm,
-                    "bn": bn,
-                    "bk": bk,
-                    "cluster_m": tcgen05_cluster_m,
-                    "cluster_n": 1,
-                    "ab_stage_count": tcgen05_ab_stage_count_value,
-                    "input_dtype": input_dtype_str,
-                    "acc_dtype": acc_dtype_str,
-                    "kernel_args": [tma_atom_a, tma_tensor_a, tma_atom_b, tma_tensor_b],
-                }
-            )
+            ab_tma_plan: dict[str, object] = {
+                "kind": "tcgen05_ab_tma",
+                "lhs_name": lhs_arg_name,
+                "rhs_name": rhs_arg_name,
+                "bm": bm,
+                "bn": bn,
+                "bk": bk,
+                "cluster_m": tcgen05_cluster_m,
+                "cluster_n": 1,
+                "ab_stage_count": tcgen05_ab_stage_count_value,
+                "input_dtype": input_dtype_str,
+                "acc_dtype": acc_dtype_str,
+                "kernel_args": [tma_atom_a, tma_tensor_a, tma_atom_b, tma_tensor_b],
+            }
+            # G2-H (cute_plan.md): CLC kernels need PDL enabled at
+            # the host launch so ``nvvm.clusterlaunchcontrol_try_cancel``
+            # returns valid responses (without PDL the very first
+            # ``cute.arch.clc_response`` returns ``valid=0``).
+            # Threaded through the wrapper plan rather than a
+            # side-channel attribute on the kernel object so the
+            # launch flag's provenance is the same as the cluster
+            # shape and other plan-level launch metadata.
+            # ``use_pdl`` only added to the dict when True so the
+            # static-path kernels' wrapper-plan literals stay
+            # byte-identical to the pre-G2-H golden.
+            if tcgen05_matmul_plan.is_clc_persistent:
+                ab_tma_plan["use_pdl"] = True
+            cg.cute_wrapper_plans.append(ab_tma_plan)
         prefix.append(
             statement_from_string(
                 f"{smem_a_ptr} = cute.arch.alloc_smem("
@@ -2868,6 +2932,13 @@ def _emit_mma_pipeline(
                 if tcgen05_use_role_local_tma_producer:
                     tma_load_role_stmts.append(stage0_prefetch)
                 if tcgen05_ab_stage_count_value > 1:
+                    # Warm every stage 1..ab_stage_count-1; each gated by
+                    # an ``i+1``-k_tile fits-in-K predicate. The old
+                    # two-call pattern only covered stages 0 and N-1
+                    # (sufficient for ab=2 where they're the same set);
+                    # ab>=3 leaves intermediate stages unarmed and the
+                    # consumer ``consumer_wait`` deadlocks on stage 1
+                    # phase 0. See cute_plan.md §6.9.1.
                     _emit_per_tile(
                         f"{tma_initial_next_full_tile} = "
                         f"{m_offset_var} + cutlass.Int32({bm}) <= cutlass.Int32({m_size}) "
@@ -2875,18 +2946,33 @@ def _emit_mma_pipeline(
                         f"and cutlass.Int32({bk * tcgen05_ab_stage_count_value}) <= cutlass.Int32({k_total_size})",
                         tma_load=tcgen05_use_role_local_tma_producer,
                     )
-                    stage_n_prefetch = _build_initial_prefetch_if(
-                        prefetch_args,
-                        full_tile_gates=[
-                            tma_initial_full_tile,
-                            tma_initial_next_full_tile,
-                        ],
-                        k_offset=f"cutlass.Int32({tcgen05_ab_stage_count_value - 1})",
-                    )
-                    prefix.append(stage_n_prefetch)
-                    per_tile_stmts.append(stage_n_prefetch)
-                    if tcgen05_use_role_local_tma_producer:
-                        tma_load_role_stmts.append(stage_n_prefetch)
+                    for stage_idx in range(1, tcgen05_ab_stage_count_value):
+                        if stage_idx == tcgen05_ab_stage_count_value - 1:
+                            stage_gates = [
+                                tma_initial_full_tile,
+                                tma_initial_next_full_tile,
+                            ]
+                        else:
+                            stage_gate_var = df.new_var(
+                                f"tcgen05_tma_initial_stage_{stage_idx}_full_tile"
+                            )
+                            _emit_per_tile(
+                                f"{stage_gate_var} = "
+                                f"{m_offset_var} + cutlass.Int32({bm}) <= cutlass.Int32({m_size}) "
+                                f"and {n_offset_var} + cutlass.Int32({bn}) <= cutlass.Int32({n_size}) "
+                                f"and cutlass.Int32({bk * (stage_idx + 1)}) <= cutlass.Int32({k_total_size})",
+                                tma_load=tcgen05_use_role_local_tma_producer,
+                            )
+                            stage_gates = [tma_initial_full_tile, stage_gate_var]
+                        stage_prefetch = _build_initial_prefetch_if(
+                            prefetch_args,
+                            full_tile_gates=stage_gates,
+                            k_offset=f"cutlass.Int32({stage_idx})",
+                        )
+                        prefix.append(stage_prefetch)
+                        per_tile_stmts.append(stage_prefetch)
+                        if tcgen05_use_role_local_tma_producer:
+                            tma_load_role_stmts.append(stage_prefetch)
     else:
         prefix.append(
             statement_from_string(
@@ -3175,24 +3261,23 @@ def _emit_mma_pipeline(
                         )
                     )
                     if not diagnose_skip_umma_issue:
-                        exec_loop_body.extend(
-                            [
-                                _build_tcgen05_mma_fence_stmt(
-                                    tcgen05_plan.exec_active,
-                                    gate_exec_warp=False,
-                                    is_two_cta=tcgen05_is_two_cta,
-                                ),
-                                _build_tcgen05_mma_issue_stmt(
-                                    exec_active=tcgen05_plan.exec_active,
-                                    tiled_mma=tiled_mma,
-                                    acc_frag=acc_frag,
-                                    tcgen05_frag_a=tcgen05_frag_a,
-                                    tcgen05_frag_b=tcgen05_frag_b,
-                                    mma_stage=mma_stage,
-                                    gate_exec_warp=False,
-                                    is_two_cta=tcgen05_is_two_cta,
-                                ),
-                            ]
+                        # The AB pipeline's ``consumer_wait`` is a
+                        # transaction-count ``mbarrier_try_wait`` that already
+                        # orders the TMA shared stores before the UMMA load,
+                        # so an extra ``fence_view_async_shared()`` is
+                        # redundant on this pipelined path. See cute_plan.md
+                        # §6.9.2 for the cycle's bench/NCU write-up.
+                        exec_loop_body.append(
+                            _build_tcgen05_mma_issue_stmt(
+                                exec_active=tcgen05_plan.exec_active,
+                                tiled_mma=tiled_mma,
+                                acc_frag=acc_frag,
+                                tcgen05_frag_a=tcgen05_frag_a,
+                                tcgen05_frag_b=tcgen05_frag_b,
+                                mma_stage=mma_stage,
+                                gate_exec_warp=False,
+                                is_two_cta=tcgen05_is_two_cta,
+                            )
                         )
                     exec_loop_body.append(
                         _build_kloop_pipeline_release_if(
@@ -3309,12 +3394,13 @@ def _emit_mma_pipeline(
             assert tcgen05_plan is not None
             if not tcgen05_use_role_local_mma_exec:
                 if not diagnose_skip_umma_issue:
-                    cg.add_statement(
-                        _build_tcgen05_mma_fence_stmt(
-                            tcgen05_plan.exec_active,
-                            is_two_cta=tcgen05_is_two_cta,
-                        )
-                    )
+                    # No async-shared fence: the pipelined AB consumer_wait
+                    # is a transaction-count ``mbarrier_try_wait`` and the
+                    # non-pipelined branch follows ``consumer_wait`` with a
+                    # CTA-wide ``sync_threads()`` (see
+                    # ``_build_kloop_non_pipeline_consumer_if``); both
+                    # already order the TMA shared stores before the UMMA
+                    # load. Mirrors the role-local path above.
                     cg.add_statement(
                         _build_tcgen05_mma_issue_stmt(
                             exec_active=tcgen05_plan.exec_active,
@@ -3910,6 +3996,8 @@ def _make_tcgen05_layout_plan_setup(
 
 def _new_tcgen05_sched_pipeline_plan(
     df: DeviceFunction,
+    *,
+    use_clc: bool = False,
 ) -> _Tcgen05SchedPipelinePlan:
     """Allocate variable names for the scheduler-broadcast pipeline.
 
@@ -3919,7 +4007,23 @@ def _new_tcgen05_sched_pipeline_plan(
     appends an incrementing suffix so the two emissions cannot
     actually collide, but a future cycle that consolidates the two
     paths should drive both call sites through this allocator.
+
+    ``use_clc=True`` additionally allocates the CLC response buffer
+    + mbarrier variable names (G2-H, cute_plan.md). Static path
+    leaves them empty so consumers can detect via simple string
+    truthiness.
     """
+    clc_response_smem_ptr = ""
+    clc_response_tensor = ""
+    clc_mbar_smem_ptr = ""
+    clc_mbar_tensor = ""
+    clc_mbar_phase = ""
+    if use_clc:
+        clc_response_smem_ptr = df.new_var("tcgen05_clc_response_smem_ptr")
+        clc_response_tensor = df.new_var("tcgen05_clc_response_tensor")
+        clc_mbar_smem_ptr = df.new_var("tcgen05_clc_mbar_smem_ptr")
+        clc_mbar_tensor = df.new_var("tcgen05_clc_mbar_tensor")
+        clc_mbar_phase = df.new_var("tcgen05_clc_mbar_phase")
     return _Tcgen05SchedPipelinePlan(
         barriers=df.new_var("tcgen05_sched_pipeline_mbars"),
         producer_group=df.new_var("tcgen05_sched_pipeline_producer_group"),
@@ -3927,7 +4031,70 @@ def _new_tcgen05_sched_pipeline_plan(
         pipeline=df.new_var("tcgen05_sched_pipeline"),
         producer_state=df.new_var("tcgen05_sched_pipeline_producer_state"),
         consumer_state=df.new_var("tcgen05_sched_pipeline_consumer_state"),
+        clc_response_smem_ptr=clc_response_smem_ptr,
+        clc_response_tensor=clc_response_tensor,
+        clc_mbar_smem_ptr=clc_mbar_smem_ptr,
+        clc_mbar_tensor=clc_mbar_tensor,
+        clc_mbar_phase=clc_mbar_phase,
     )
+
+
+def _emit_clc_smem_setup(plan: _Tcgen05SchedPipelinePlan) -> list[ast.AST]:
+    """Emit the SMEM allocation + CLC mbarrier-init for the CLC path.
+
+    Mirrors Quack's ``TileScheduler._init_clc_mbarrier``: allocate a
+    SMEM tile sized for the CLC response (4 Int32 = 16 bytes) and a
+    one-arrival mbarrier that the scheduler warp uses with
+    ``nvvm.clusterlaunchcontrol_try_cancel``. Quack packs the
+    mbarrier next to the response in a single SMEM tile keyed by
+    pipeline index; Helion's CLC path uses the simpler one-stage
+    layout (the broadcast pipeline already serializes the consumer
+    handoff), so a single 4-Int32 response buffer + a 2-Int32
+    mbarrier (one Int64 cell) is enough.
+
+    The mbarrier itself is initialized with ``mbarrier_init(addr,
+    1)`` — only the single CLC issuer (lane 0 of the scheduler warp)
+    arrives — and a phase counter is materialized so the wait
+    flips between 0/1 each iteration. ``mbarrier_init_fence`` +
+    ``sync_warp`` follow Quack's pattern; both are warp-uniform and
+    happen before the persistent loop begins.
+
+    Caller wires this into the prefix immediately after the
+    ``_emit_sched_pipeline_setup`` block so the alloc / init pair
+    sits where the existing pipeline init lives.
+    """
+    assert plan.clc_response_smem_ptr, (
+        "CLC SMEM setup requires plan.clc_response_smem_ptr; was "
+        "_new_tcgen05_sched_pipeline_plan called with use_clc=True?"
+    )
+    return [
+        # CLC response buffer: 4 Int32 (bidx, bidy, bidz, valid).
+        # ``cute.arch.clc_response`` reads the 16-byte block back
+        # into 4 register values.
+        statement_from_string(
+            f"{plan.clc_response_smem_ptr} = cute.arch.alloc_smem("
+            f"cutlass.Int32, cutlass.Int32(4), alignment=16)"
+        ),
+        statement_from_string(
+            f"{plan.clc_response_tensor} = cute.make_tensor("
+            f"{plan.clc_response_smem_ptr}, cute.make_layout((4,), stride=(1,)))"
+        ),
+        # CLC mbarrier: one Int64 cell. ``mbarrier_init`` arms it
+        # with arrival count 1 (only the CLC issuer arrives via
+        # ``mbarrier_arrive_and_expect_tx``).
+        statement_from_string(
+            f"{plan.clc_mbar_smem_ptr} = cute.arch.alloc_smem("
+            f"cutlass.Int64, cutlass.Int32(1), alignment=8)"
+        ),
+        statement_from_string(
+            f"{plan.clc_mbar_tensor} = cute.make_tensor("
+            f"{plan.clc_mbar_smem_ptr}, cute.make_layout((1,), stride=(1,)))"
+        ),
+        # Phase counter for the CLC mbarrier wait. The scheduler-warp
+        # body flips this each iteration; initialized to 0 so the
+        # first wait pairs with the first arrival's phase.
+        statement_from_string(f"{plan.clc_mbar_phase} = cutlass.Int32(0)"),
+    ]
 
 
 def _emit_sched_pipeline_setup(

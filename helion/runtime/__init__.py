@@ -1703,6 +1703,15 @@ def _create_cute_wrapper(
     cluster_shape = _cute_cluster_shape(cute_kernel, wrapper_plans)
     if cluster_shape is not None:
         launch_suffix += f", cluster={list(cluster_shape)!r}"
+    # G2-H (cute_plan.md, see plan: G2-H CLC): CLC kernels need PDL
+    # enabled at the host launch so ``nvvm.clusterlaunchcontrol_try_cancel``
+    # returns valid responses. ``use_pdl`` is set on the per-matmul
+    # wrapper plan in ``cute_mma._codegen_cute_mma`` when
+    # ``Tcgen05PersistenceModel.CLC_PERSISTENT`` is active. Reading
+    # from the plan rather than a kernel-level side-channel attribute
+    # mirrors how ``cluster_m``/``cluster_n`` flow through this layer.
+    if any(plan.get("use_pdl") for plan in wrapper_plans):
+        launch_suffix += ", use_pdl=True"
     body.extend(
         (
             f"    _helion_cute_kernel_tag = {kernel_tag!r}",

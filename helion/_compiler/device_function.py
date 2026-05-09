@@ -303,6 +303,27 @@ class CuteTcgen05MatmulPlan:
     # in ``cute_mma._codegen_cute_mma`` for why Helion does not
     # mirror Quack's depth-2.
     sched_stage_count: int = 0
+    # ``persistence_model`` selects the persistence axis of the
+    # generated kernel. ``STATIC_PERSISTENT`` (default) keeps the
+    # existing ``StaticPersistentTileScheduler`` path. ``CLC_PERSISTENT``
+    # (G2-H, cute_plan.md) emits ``nvvm.clusterlaunchcontrol_try_cancel``
+    # from the dedicated scheduler warp instead — only valid under
+    # ``ROLE_LOCAL_WITH_SCHEDULER`` (scheduler_warp_count == 1) on
+    # arch >= 100. Stored as the enum value (string) so the dataclass
+    # stays free of cute-internal imports.
+    persistence_model: str = "static_persistent"
+
+    @property
+    def is_clc_persistent(self) -> bool:
+        # Lazy enum import to avoid a top-level cycle (cute.strategies
+        # imports from this module's siblings) and to keep the enum
+        # value the single source of truth — a rename of
+        # ``Tcgen05PersistenceModel.CLC_PERSISTENT`` would propagate
+        # via the ``.value`` lookup instead of silently degrading to
+        # always-False against a stale string literal.
+        from .cute.strategies import Tcgen05PersistenceModel
+
+        return self.persistence_model == Tcgen05PersistenceModel.CLC_PERSISTENT.value
 
     @property
     def exec_warp_id(self) -> int:

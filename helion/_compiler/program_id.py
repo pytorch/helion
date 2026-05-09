@@ -900,6 +900,23 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         # is derived from this case's pid_info only.
         cluster_m = self._tcgen05_cluster_m()
         total_clusters = self._tcgen05_num_work_clusters_expr(is_device=False)
+        plan = self._tcgen05_plan()
+        if plan is not None and plan.is_clc_persistent:
+            # G2-H (cute_plan.md): CLC mode launches the *full*
+            # problem grid (one cluster slot per problem cluster),
+            # not the persistent sub-grid. The hardware tile-scheduler
+            # then controls which clusters actually run; CLC's
+            # ``try_cancel`` lets a running cluster cancel and steal
+            # work from a not-yet-started cluster. Mirrors Quack's
+            # ``get_grid_shape`` for ``PersistenceMode.CLC`` and
+            # cutlass-DSL's ``ClcDynamicPersistentTileScheduler.get_grid_shape``
+            # which both return the full problem grid for CLC mode.
+            # Capping the launch like the static path does (``min(total,
+            # max_persistent)``) starves the hardware of pending
+            # clusters and causes CLC to immediately return ``valid=0``
+            # on the first query, terminating the persistent loop
+            # after iteration 0 (verified via ``cute.printf``).
+            return expr_from_string(f"({cluster_m}, 1, {total_clusters})")
         grid_work_clusters = self._tcgen05_grid_work_clusters_expr(
             total_clusters, cluster_m
         )
@@ -2411,9 +2428,25 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         device IR because the scheduler-warp work has no source
         statements in the user kernel — it is pure scheduling
         infrastructure.
+
+        Dispatches by persistence model:
+
+        - ``STATIC_PERSISTENT`` (default): emits
+          ``StaticPersistentTileScheduler.create`` + the static
+          persistent loop.
+        - ``CLC_PERSISTENT`` (G2-H, cute_plan.md): emits
+          ``nvvm.clusterlaunchcontrol_try_cancel`` per persistent-loop
+          iteration; the response decoder unpacks the next cluster's
+          CTA id (or a "canceled" sentinel) into the SMEM mailbox the
+          consumer warps already read from. Active only on arch >= 100
+          per ``validate_tcgen05_strategy_invariants``.
         """
         plan = self._tcgen05_plan()
         assert plan is not None and plan.has_scheduler_warp
+        if plan.is_clc_persistent:
+            return self._build_scheduler_warp_role_local_while_clc(
+                device_function, layout
+            )
         sched_plan = self._tcgen05_sched_pipeline_plan()
         assert sched_plan is not None
         sched_pipeline = sched_plan.pipeline  # type: ignore[attr-defined]
@@ -2549,6 +2582,504 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         return create(
             ast.If,
             test=expr_from_string(self._tcgen05_scheduler_role_predicate()),
+            body=prelude,
+            orelse=[],
+        )
+
+    def _build_scheduler_warp_role_local_while_clc(
+        self,
+        device_function: DeviceFunction,
+        layout: Tcgen05PersistentProgramIDs._Tcgen05PersistentLayout,
+    ) -> ast.stmt:
+        """G2-H: CLC-driven scheduler-warp body (cute_plan.md).
+
+        Replaces the ``StaticPersistentTileScheduler.create`` +
+        ``advance_to_next_work``/``get_current_work`` pattern with a
+        ``nvvm.clusterlaunchcontrol_try_cancel`` query per
+        persistent-loop iteration. The CLC instruction asynchronously
+        writes a 4 × Int32 response to the SMEM buffer allocated by
+        ``_emit_clc_smem_setup`` (in ``cute_mma._codegen_cute_mma``);
+        each response slot decodes to ``(bidx, bidy, bidz, valid)``
+        via ``cute.arch.clc_response``.
+
+        Topology (mirrors Quack's ``_fetch_next_work_idx`` CLC branch
+        in ``quack/quack/tile_scheduler.py``):
+
+        - cluster_m == 1: each CTA is its own cluster, so each CTA's
+          scheduler warp issues an independent ``nomulticast``
+          ``try_cancel`` against its own local SMEM and publishes
+          locally.
+        - cluster_m > 1: only the cluster leader CTA's scheduler
+          warp issues the CLC query (matches Quack's
+          ``is_scheduler_warp = block_idx_in_cluster() == 0``).
+          Non-leader CTAs receive the response indirectly because
+          the leader broadcasts the resulting work tile to every
+          peer CTA's SMEM mailbox via ``_cute_store_shared_remote_x4``.
+          Each peer CTA's consumer warps still wait/release on the
+          per-CTA ``sched_pipeline``, so the per-CTA empty-barrier
+          arrival counts the static WITH_SCHEDULER path validates
+          stay unchanged.
+
+        cluster_m collapse: the publish writes the per-CTA M
+        coordinate into each peer's mailbox by adding
+        ``peer_cta_rank_in_cluster_m`` to the CLC response's
+        ``bidx`` (which encodes the *first* CTA of the next
+        cluster). The consumer's ``// cluster_m`` collapse in
+        ``_tcgen05_logical_m_coord_expr`` then converts back to
+        the cluster-level virtual_pid for tile distribution.
+        """
+        plan = self._tcgen05_plan()
+        assert plan is not None and plan.has_scheduler_warp and plan.is_clc_persistent
+        sched_plan = self._tcgen05_sched_pipeline_plan()
+        assert sched_plan is not None
+        sched_pipeline = sched_plan.pipeline  # type: ignore[attr-defined]
+        sched_producer_state = sched_plan.producer_state  # type: ignore[attr-defined]
+        clc_response_smem_ptr = sched_plan.clc_response_smem_ptr  # type: ignore[attr-defined]
+        clc_mbar_smem_ptr = sched_plan.clc_mbar_smem_ptr  # type: ignore[attr-defined]
+        clc_mbar_phase = sched_plan.clc_mbar_phase  # type: ignore[attr-defined]
+        assert clc_response_smem_ptr and clc_mbar_smem_ptr and clc_mbar_phase, (
+            "CLC scheduler-warp body requires sched plan SMEM/mbarrier "
+            "names; was _new_tcgen05_sched_pipeline_plan called with "
+            "use_clc=True?"
+        )
+
+        # Per-iteration response decoded into named locals so the
+        # publish writes are linear and easy to read in generated
+        # code.
+        bidx_var = device_function.new_var("tcgen05_clc_bidx")
+        bidy_var = device_function.new_var("tcgen05_clc_bidy")
+        bidz_var = device_function.new_var("tcgen05_clc_bidz")
+        valid_var = device_function.new_var("tcgen05_clc_valid")
+        # Per-CTA cluster offsets read once at the kernel prefix.
+        # ``clusterlaunchcontrol.try_cancel`` returns the CTA id of
+        # the *first* CTA of the next cluster (e.g. cluster_m=2 ->
+        # bidx = cluster_id_m * 2). Each CTA's scheduler warp must
+        # add its own ``block_idx_in_cluster()`` so the published
+        # ``tile_idx[0]`` stays in lockstep with what the static path
+        # publishes (per-CTA M coordinate). For cluster_m=1 the
+        # offset is always 0.
+        cta_in_cluster_m_var = device_function.new_var("tcgen05_clc_cta_in_cluster_m")
+        cta_in_cluster_n_var = device_function.new_var("tcgen05_clc_cta_in_cluster_n")
+        # Initial work-tile coordinates come from the launcher's
+        # ``block_idx()`` so the first iteration runs the cluster
+        # the launcher placed this CTA in. Subsequent iterations
+        # come from the CLC response, with the per-CTA offset added
+        # back in the publish step.
+        cluster_bidx_var = device_function.new_var("tcgen05_clc_cluster_bidx")
+        cluster_bidy_var = device_function.new_var("tcgen05_clc_cluster_bidy")
+        cluster_bidz_var = device_function.new_var("tcgen05_clc_cluster_bidz")
+
+        leader_predicate = "cute.arch.lane_idx() == cutlass.Int32(0)"
+
+        # CLC mbarrier init: ``mbarrier_init(addr, 1)`` arms the
+        # barrier with arrival count 1 (only the CLC issuer arrives).
+        # Followed by ``mbarrier_init_fence`` + ``sync_warp`` per
+        # Quack's ``_init_clc_mbarrier`` pattern. Gate on lane 0 so
+        # only one thread runs the init op; the fence/sync make the
+        # init visible to the other 31 lanes.
+        clc_init_block: list[ast.stmt] = [
+            create(
+                ast.If,
+                test=expr_from_string(leader_predicate),
+                body=[
+                    statement_from_string(
+                        f"cute.arch.mbarrier_init({clc_mbar_smem_ptr}, 1)"
+                    ),
+                ],
+                orelse=[],
+            ),
+            statement_from_string("cute.arch.mbarrier_init_fence()"),
+            statement_from_string("cute.arch.sync_warp()"),
+        ]
+
+        # Initial cluster coordinates: decode block_idx[2] -> tile_idx
+        # via ``StaticPersistentTileScheduler.create``. This matches
+        # the persistent-grid encoding the launch grid uses
+        # (``(cluster_m, 1, num_clusters)``) — block_idx[0] is the
+        # CTA-in-cluster offset and block_idx[2] is the linear
+        # cluster id, so the static scheduler's
+        # ``_get_current_work_for_linear_idx`` is the right decoder.
+        # CLC's response also returns CTAIDs in this coordinate
+        # system (``bidz`` is the cluster id, ``bidx`` is the CTA
+        # within cluster), so we can use the same decoder for
+        # subsequent CLC responses by setting up a fresh
+        # ``StaticPersistentTileScheduler`` from the CLC bidx/bidy/bidz.
+        #
+        # ``valid_var`` is Int32 because ``cute.arch.clc_response``
+        # returns Int32 for the valid flag. The CuTe DSL's while-region
+        # type-checker rejects type changes between iterations.
+        cluster_m = layout.cluster_m
+        sched_params_var = device_function.new_var("tcgen05_clc_initial_sched_params")
+        sched_var = device_function.new_var("tcgen05_clc_initial_sched")
+        work_tile_var = device_function.new_var("tcgen05_clc_initial_work_tile")
+        clc_initial_block: list[ast.stmt] = [
+            # Build the persistent tile-scheduler params for the
+            # initial decode. Cluster shape matches the launch grid's
+            # cluster shape (``(cluster_m, 1, 1)``).
+            statement_from_string(
+                f"{sched_params_var} = cutlass.utils.PersistentTileSchedulerParams("
+                f"{self._tcgen05_num_tiles_expr(is_device=True)}, "
+                f"({cluster_m}, 1, 1))"
+            ),
+            statement_from_string(
+                f"{sched_var} = cutlass.utils.StaticPersistentTileScheduler.create("
+                f"{sched_params_var}, cute.arch.block_idx(), cute.arch.grid_dim())"
+            ),
+            statement_from_string(
+                f"{work_tile_var} = {sched_var}.initial_work_tile_info()"
+            ),
+            # Cache cta-in-cluster offset for later CLC response
+            # decode (CLC returns the cluster's first-CTA ctaid,
+            # so each peer CTA's per-CTA M coordinate adds back the
+            # offset). For cluster_m=1 the offset is always 0.
+            # For cluster_m>1, only the leader CTA's scheduler warp
+            # runs the body so its offset is always 0; for cluster_m=1
+            # each CTA is its own cluster so the offset is also 0.
+            # Keeping the variable for symmetry with the cluster_m>1
+            # broadcast that adds peer_m back per peer.
+            statement_from_string(f"{cta_in_cluster_m_var} = cutlass.Int32(0)"),
+            statement_from_string(f"{cta_in_cluster_n_var} = cutlass.Int32(0)"),
+            # Bind the initial cluster coords from the static
+            # scheduler's decode. ``tile_idx[0]`` is already the
+            # per-CTA M coordinate (= cluster_id_m * cluster_m +
+            # cta_in_cluster_m) since the static scheduler folds the
+            # cta_in_cluster offset in via
+            # ``_get_current_work_for_linear_idx``.
+            statement_from_string(f"{cluster_bidx_var} = {work_tile_var}.tile_idx[0]"),
+            statement_from_string(f"{cluster_bidy_var} = {work_tile_var}.tile_idx[1]"),
+            statement_from_string(f"{cluster_bidz_var} = {work_tile_var}.tile_idx[2]"),
+            # Initial valid flag: the scheduler warp only runs if
+            # the launcher placed it on a valid cluster. The CLC
+            # query handles invalidation for subsequent waves.
+            statement_from_string(
+                f"{valid_var} = cutlass.Int32(1) "
+                f"if {work_tile_var}.is_valid_tile else cutlass.Int32(0)"
+            ),
+        ]
+
+        # Per-tile publish: write (bidx, bidy, bidz, valid) into the
+        # work-tile mailbox.
+        #
+        # cluster_m == 1: leader writes its own local mailbox; consumer
+        # waits on local empty mbar (per-CTA pipeline).
+        # cluster_m  > 1: leader broadcasts to every peer CTA's mailbox
+        # via ``_cute_store_shared_remote_x4`` and arms each peer's
+        # full mbar with ``mbarrier_arrive_and_expect_tx``. Consumer
+        # arrivals are routed to leader's empty mbar via
+        # ``consumer_mask=Int32(0)`` (the cluster-leader topology set
+        # up in ``cute_mma._codegen_cute_mma`` for the CLC path).
+        #
+        # ``producer_acquire`` is **per-thread** (its underlying
+        # ``mbarrier.wait`` PTX stalls each issuing thread until the
+        # phase flips), so every lane of the scheduler warp must call
+        # it; gating it under a ``if lane_idx == 0`` would only stall
+        # lane 0 and let the other 31 lanes race ahead, breaking the
+        # producer/consumer handshake. Mirrors Quack's
+        # ``write_work_tile_to_smem`` in
+        # ``quack/quack/tile_scheduler.py`` which calls
+        # ``producer_acquire`` on the full warp before the per-lane
+        # ``if lane_idx < cluster_size`` branch.
+        # Pre-declare the cluster-broadcast variable names so pyrefly
+        # sees them defined unconditionally; their usage stays inside
+        # ``if layout.cluster_m > 1`` branches below.
+        sched_barrier_ptr = ""
+        sched_peer_rank = ""
+        sched_peer_m = ""
+        if layout.cluster_m > 1:
+            sched_barrier_ptr = device_function.new_var("tcgen05_clc_sched_barrier_ptr")
+            sched_peer_rank = device_function.new_var("tcgen05_clc_sched_peer_rank")
+            sched_peer_m = device_function.new_var("tcgen05_clc_sched_peer_m")
+            # Whole-warp prelude: every lane runs ``producer_acquire``
+            # (mbarrier wait) and computes the warp-uniform barrier
+            # pointer + lane id. Lanes ``cluster_m..31`` no-op past
+            # the per-peer broadcast branch.
+            per_tile_publish_warp: list[ast.stmt] = [
+                statement_from_string(
+                    f"{sched_pipeline}.producer_acquire({sched_producer_state})"
+                ),
+                statement_from_string(
+                    f"{sched_barrier_ptr} = "
+                    f"{sched_pipeline}.producer_get_barrier({sched_producer_state})"
+                ),
+                statement_from_string(f"{sched_peer_rank} = cute.arch.lane_idx()"),
+                create(
+                    ast.If,
+                    test=expr_from_string(
+                        f"{sched_peer_rank} < cutlass.Int32({layout.cluster_m})"
+                    ),
+                    body=[
+                        statement_from_string(
+                            f"{sched_peer_m} = "
+                            f"{sched_peer_rank} % cutlass.Int32({layout.cluster_m})"
+                        ),
+                        statement_from_string(
+                            "cute.arch.mbarrier_arrive_and_expect_tx("
+                            f"{sched_barrier_ptr}, 16, {sched_peer_rank})"
+                        ),
+                        statement_from_string(
+                            f"_cute_store_shared_remote_x4("
+                            f"{cluster_bidx_var} + {sched_peer_m}, "
+                            f"{cluster_bidy_var}, "
+                            f"{cluster_bidz_var}, "
+                            f"{valid_var}, "
+                            f"smem_ptr={layout.work_tile_smem_ptr}, "
+                            f"mbar_ptr={sched_barrier_ptr}, "
+                            f"peer_cta_rank_in_cluster={sched_peer_rank})"
+                        ),
+                    ],
+                    orelse=[],
+                ),
+            ]
+        else:
+            # cluster_m == 1: lane-0-only local publish + commit. Still
+            # call ``producer_acquire`` on every lane (the mbarrier wait
+            # must stall the whole warp), then the leader gate writes +
+            # commits.
+            per_tile_publish_warp = [
+                statement_from_string(
+                    f"{sched_pipeline}.producer_acquire({sched_producer_state})"
+                ),
+                create(
+                    ast.If,
+                    test=expr_from_string(leader_predicate),
+                    body=[
+                        statement_from_string(
+                            f"{layout.work_tile_smem}[cutlass.Int32(0)] = "
+                            f"{cluster_bidx_var}"
+                        ),
+                        statement_from_string(
+                            f"{layout.work_tile_smem}[cutlass.Int32(1)] = "
+                            f"{cluster_bidy_var}"
+                        ),
+                        statement_from_string(
+                            f"{layout.work_tile_smem}[cutlass.Int32(2)] = "
+                            f"{cluster_bidz_var}"
+                        ),
+                        statement_from_string(
+                            f"{layout.work_tile_smem}[cutlass.Int32(3)] = {valid_var}"
+                        ),
+                        statement_from_string(
+                            f"{sched_pipeline}.producer_commit({sched_producer_state})"
+                        ),
+                    ],
+                    orelse=[],
+                ),
+            ]
+
+        # CLC query block: arm + issue + wait + decode. Quack's
+        # pattern: lane 0 of the leader CTA's scheduler warp issues
+        # the query, all 32 lanes of that warp wait, then
+        # ``cute.arch.clc_response`` reads back from SMEM. ``try_cancel``
+        # cancels exactly one cluster per call, so issuance is gated
+        # to leader CTA only for ``cluster_m > 1``.
+        clc_helper_call = "_cute_issue_clc_query_nomulticast"
+        clc_query_block: list[ast.stmt] = [
+            statement_from_string("cute.arch.sync_warp()"),
+            create(
+                ast.If,
+                test=expr_from_string(leader_predicate),
+                body=[
+                    statement_from_string(
+                        f"cute.arch.mbarrier_arrive_and_expect_tx("
+                        f"{clc_mbar_smem_ptr}, 16)"
+                    ),
+                    statement_from_string(
+                        f"{clc_helper_call}("
+                        f"{clc_mbar_smem_ptr}, {clc_response_smem_ptr})"
+                    ),
+                ],
+                orelse=[],
+            ),
+            statement_from_string("cute.arch.sync_warp()"),
+            statement_from_string(
+                f"cute.arch.mbarrier_wait({clc_mbar_smem_ptr}, {clc_mbar_phase})"
+            ),
+            statement_from_string(
+                f"{clc_mbar_phase} = {clc_mbar_phase} ^ cutlass.Int32(1)"
+            ),
+            statement_from_string(
+                f"({bidx_var}, {bidy_var}, {bidz_var}, {valid_var}) = "
+                f"cute.arch.clc_response({clc_response_smem_ptr})"
+            ),
+            statement_from_string("cute.arch.fence_view_async_shared()"),
+        ]
+        # Update cluster coordinate locals so the next iteration's
+        # publish uses the just-decoded response.
+        #
+        # CLC returns the CTAID of the canceled cluster's first CTA
+        # in (bidx, bidy, bidz). With Helion's launch grid
+        # ``(cluster_m, 1, num_clusters)`` the first CTA of cluster N
+        # has CTAID ``(0, 0, N)``, so ``bidz`` IS the cluster id.
+        # Reuse the existing ``StaticPersistentTileScheduler`` to
+        # decode that cluster id back to per-CTA tile coordinates by
+        # writing ``_current_work_linear_idx`` and calling
+        # ``get_current_work()``. This matches what the static path
+        # would have computed for the same cluster id, so the
+        # consumer's ``virtual_pid = work_tile_smem[0] // cluster_m``
+        # collapse continues to work.
+        next_work_tile_var = device_function.new_var("tcgen05_clc_next_work_tile")
+        clc_query_block.extend(
+            [
+                statement_from_string(
+                    f"{sched_var}._current_work_linear_idx = {bidz_var}"
+                ),
+                statement_from_string(
+                    f"{next_work_tile_var} = {sched_var}.get_current_work()"
+                ),
+                statement_from_string(
+                    f"{cluster_bidx_var} = {next_work_tile_var}.tile_idx[0]"
+                ),
+                statement_from_string(
+                    f"{cluster_bidy_var} = {next_work_tile_var}.tile_idx[1]"
+                ),
+                statement_from_string(
+                    f"{cluster_bidz_var} = {next_work_tile_var}.tile_idx[2]"
+                ),
+            ]
+        )
+
+        # ``per_tile_publish_warp`` already does its own per-lane
+        # gating internally (lane-0-only commit for cluster_m=1, the
+        # ``lane_idx < cluster_m`` per-peer broadcast for cluster_m>1).
+        # Inserting another leader-only ``if`` around it would gate
+        # the entire publish to lane 0 and either skip the broadcast
+        # to peer CTAs or stall only lane 0 on ``producer_acquire``.
+        per_tile_body: list[ast.stmt] = [
+            *per_tile_publish_warp,
+            statement_from_string(emit_pipeline_advance(sched_producer_state)),
+            *clc_query_block,
+            statement_from_string("cute.arch.sync_warp()"),
+        ]
+
+        prelude: list[ast.stmt] = []
+        # PDL (programmatic dependent launch) hand-off: the scheduler
+        # warp must wait for the prior kernel before reading CLC state.
+        # ``cute.arch.clc_response`` returns ``valid=0`` if the
+        # ``griddepcontrol`` chain isn't established. Quack calls this
+        # in the scheduler-warp body (see
+        # ``quack/quack/gemm_sm100.py``: ``if const_expr(self.use_pdl):
+        # cute.arch.griddepcontrol_wait()`` inside
+        # ``if warp_idx == self.scheduler_warp_id:``). Without this the
+        # CLC query reliably returns invalid on the very first call,
+        # so the persistent loop terminates after iteration 0 and the
+        # kernel produces only the initial-tile output.
+        prelude.append(statement_from_string("cute.arch.griddepcontrol_wait()"))
+        prelude.extend(clc_init_block)
+        prelude.extend(clc_initial_block)
+        # Producer loop: while the current valid flag is set, publish
+        # the tile + run a CLC query for the next one. CuTe DSL forbids
+        # ``break`` so the loop test is on the dynamically-updated
+        # ``valid_var``; the final invalid response triggers loop exit
+        # and falls through to the sentinel publish below.
+        # ``valid_var`` is Int32 because ``cute.arch.clc_response``
+        # returns Int32 for the valid flag — comparing against 0
+        # keeps the test type-stable across iterations.
+        prelude.append(
+            create(
+                ast.While,
+                test=expr_from_string(f"{valid_var} != cutlass.Int32(0)"),
+                body=per_tile_body,
+                orelse=[],
+            )
+        )
+        # Sentinel publish after the loop exits so the consumer warps'
+        # last-iteration wait sees an invalid tile and exits. The
+        # sentinel mirrors the in-loop publish exactly: cluster_m>1
+        # broadcasts ``(0, 0, 0, valid=0)`` to every peer CTA via
+        # ``_cute_store_shared_remote_x4``; cluster_m=1 writes
+        # locally. ``producer_acquire`` runs on every lane.
+        if layout.cluster_m > 1:
+            sentinel_warp: list[ast.stmt] = [
+                statement_from_string(
+                    f"{sched_pipeline}.producer_acquire({sched_producer_state})"
+                ),
+                statement_from_string(
+                    f"{sched_barrier_ptr} = "
+                    f"{sched_pipeline}.producer_get_barrier({sched_producer_state})"
+                ),
+                statement_from_string(f"{sched_peer_rank} = cute.arch.lane_idx()"),
+                create(
+                    ast.If,
+                    test=expr_from_string(
+                        f"{sched_peer_rank} < cutlass.Int32({layout.cluster_m})"
+                    ),
+                    body=[
+                        statement_from_string(
+                            "cute.arch.mbarrier_arrive_and_expect_tx("
+                            f"{sched_barrier_ptr}, 16, {sched_peer_rank})"
+                        ),
+                        statement_from_string(
+                            f"_cute_store_shared_remote_x4("
+                            "cutlass.Int32(0), cutlass.Int32(0), "
+                            "cutlass.Int32(0), cutlass.Int32(0), "
+                            f"smem_ptr={layout.work_tile_smem_ptr}, "
+                            f"mbar_ptr={sched_barrier_ptr}, "
+                            f"peer_cta_rank_in_cluster={sched_peer_rank})"
+                        ),
+                    ],
+                    orelse=[],
+                ),
+            ]
+        else:
+            sentinel_warp = [
+                statement_from_string(
+                    f"{sched_pipeline}.producer_acquire({sched_producer_state})"
+                ),
+                create(
+                    ast.If,
+                    test=expr_from_string(leader_predicate),
+                    body=[
+                        statement_from_string(
+                            f"{layout.work_tile_smem}[cutlass.Int32(0)] = "
+                            "cutlass.Int32(0)"
+                        ),
+                        statement_from_string(
+                            f"{layout.work_tile_smem}[cutlass.Int32(1)] = "
+                            "cutlass.Int32(0)"
+                        ),
+                        statement_from_string(
+                            f"{layout.work_tile_smem}[cutlass.Int32(2)] = "
+                            "cutlass.Int32(0)"
+                        ),
+                        statement_from_string(
+                            f"{layout.work_tile_smem}[cutlass.Int32(3)] = "
+                            "cutlass.Int32(0)"
+                        ),
+                        statement_from_string(
+                            f"{sched_pipeline}.producer_commit({sched_producer_state})"
+                        ),
+                    ],
+                    orelse=[],
+                ),
+            ]
+        prelude.extend(
+            [
+                *sentinel_warp,
+                statement_from_string(emit_pipeline_advance(sched_producer_state)),
+                statement_from_string("cute.arch.sync_warp()"),
+            ]
+        )
+
+        # cluster_m>1: gate the CLC body to leader CTA only (Quack
+        # pattern). Non-leader CTAs' scheduler warps idle while the
+        # leader broadcasts to every peer's mailbox via
+        # ``_cute_store_shared_remote_x4``. The non-leader scheduler
+        # warps' consumer-side wait/release is unaffected because the
+        # leader's broadcast arms each peer's full mbar via cross-CTA
+        # ``mbarrier_arrive_and_expect_tx``, and the leader's
+        # ``producer_acquire`` waits on the cluster-routed empty mbar
+        # (set up via ``consumer_mask_to_leader=True`` in
+        # ``cute_mma._codegen_cute_mma`` for the CLC path).
+        scheduler_predicate = self._tcgen05_scheduler_role_predicate()
+        if layout.cluster_m > 1:
+            scheduler_predicate = (
+                f"({scheduler_predicate}) "
+                "and cute.arch.make_warp_uniform("
+                "cute.arch.block_idx_in_cluster()) == cutlass.Int32(0)"
+            )
+        return create(
+            ast.If,
+            test=expr_from_string(scheduler_predicate),
             body=prelude,
             orelse=[],
         )

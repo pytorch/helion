@@ -7,6 +7,7 @@ import difflib
 import operator
 import os
 from pathlib import Path
+import re
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -1003,7 +1004,11 @@ class TestCuteLowerings(unittest.TestCase):
             "                tcgen05_ab_pipeline.consumer_wait(tcgen05_ab_consumer_state, tcgen05_ab_consumer_try_token)",
             code,
         )
-        self.assertIn(
+        # The legacy K-loop no longer emits a ``fence_view_async_shared()``
+        # between AB ``consumer_wait`` and ``cute.gemm`` (cute_plan.md
+        # §6.9.2): the AB pipeline's transaction-count ``mbarrier_try_wait``
+        # already orders the TMA shared stores ahead of the UMMA load.
+        self.assertNotIn(
             "if tcgen05_exec_active:\n            cute.arch.fence_view_async_shared()",
             code,
         )
@@ -1777,6 +1782,187 @@ class TestCuteLowerings(unittest.TestCase):
             "cutlass.pipeline.Agent.Thread, cutlass.Int32(12))",
             code,
         )
+
+    def test_tcgen05_clc_persistent_codegen(self) -> None:
+        """G2-H CLC scheduler-warp body codegen pin (cute_plan.md).
+
+        Under ``Tcgen05PersistenceModel.CLC_PERSISTENT +
+        ROLE_LOCAL_WITH_SCHEDULER``, the scheduler-warp role must
+        emit ``nvvm.clusterlaunchcontrol_try_cancel`` (via the
+        ``_cute_issue_clc_query_nomulticast`` wrapper from
+        ``helion._compiler.cute.clc_helpers``) exactly once on the
+        scheduler-warp path. ``StaticPersistentTileScheduler.create``
+        is *also* present in the CLC scheduler-warp body — we reuse
+        its ``_get_current_work_for_linear_idx`` decoder for both
+        the initial ``block_idx`` and each subsequent CLC ``bidz``
+        response so tile-coord arithmetic stays identical to the
+        static path. The CLC SMEM response buffer + mbarrier are
+        allocated alongside the existing ``sched_pipeline`` mbars.
+
+        cluster_m=2 keeps the leader-CTA-only gating (Quack pattern)
+        plus the cluster-broadcast publish via
+        ``_cute_store_shared_remote_x4`` so non-leader CTAs receive
+        the work-tile via cross-CTA SMEM stores.
+        """
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_clc(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        args = (
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+        )
+        config = helion.Config(
+            block_sizes=[256, 256, 128],
+            l2_groupings=[1],
+            num_warps=4,
+            num_sm_multiplier=1,
+            pid_type="persistent_interleaved",
+            tcgen05_cluster_m=2,
+            tcgen05_ab_stages=2,
+            tcgen05_acc_stages=2,
+            tcgen05_c_stages=2,
+            tcgen05_num_epi_warps=4,
+            tcgen05_strategy="role_local_with_scheduler",
+            tcgen05_warp_spec_scheduler_warps=1,
+            tcgen05_persistence_model="clc_persistent",
+            indexing=[
+                "tensor_descriptor",
+                "tensor_descriptor",
+                "tensor_descriptor",
+            ],
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_clc.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            code = bound.to_triton_code(config)
+
+        # CLC issuance helper: appears exactly twice in the generated
+        # module (one import line at the top + one call inside the
+        # scheduler-warp body). A second call site would suggest the
+        # scheduler warp issued CLC twice per iteration, which would
+        # double-cancel pending clusters and corrupt scheduling.
+        self.assertEqual(
+            code.count("_cute_issue_clc_query_nomulticast"),
+            2,
+            msg=(
+                "expected 1 import + 1 kernel-body call of "
+                "_cute_issue_clc_query_nomulticast; "
+                f"actual occurrences = {code.count('_cute_issue_clc_query_nomulticast')}"
+            ),
+        )
+        # ``StaticPersistentTileScheduler.create`` IS present in the
+        # CLC scheduler-warp body: we reuse the static scheduler's
+        # ``_get_current_work_for_linear_idx`` to decode both the
+        # initial ``block_idx`` and each subsequent CLC ``bidz``
+        # response back to per-CTA tile coordinates. The decode
+        # arithmetic stays identical to the static path so the
+        # consumer's ``virtual_pid = work_tile_smem[0] // cluster_m``
+        # collapse formula doesn't need to fork. The CLC-specific
+        # markers below (``_cute_issue_clc_query_nomulticast``,
+        # ``cute.arch.clc_response``, ``cute.arch.mbarrier_init``)
+        # pin the actual CLC emission so a regression to a pure
+        # static path would still fail the test loudly.
+        self.assertIn("StaticPersistentTileScheduler.create", code)
+        # CLC SMEM allocations (response buffer + mbarrier).
+        self.assertIn("tcgen05_clc_response_smem_ptr", code)
+        self.assertIn("tcgen05_clc_mbar_smem_ptr", code)
+        # cute.arch.clc_response decoder reads the response buffer.
+        self.assertIn("cute.arch.clc_response", code)
+        # mbarrier_init for the CLC mbar (arrival count 1, only
+        # the CLC issuer arrives).
+        self.assertIn("cute.arch.mbarrier_init(tcgen05_clc_mbar_smem_ptr, 1)", code)
+        # cluster_m=2: leader-CTA-only gate on the scheduler body
+        # plus the cluster-broadcast publish via _cute_store_shared_remote_x4.
+        self.assertIn("cute.arch.block_idx_in_cluster()) == cutlass.Int32(0)", code)
+        self.assertIn("_cute_store_shared_remote_x4", code)
+        # CLC sched_pipeline uses cluster-routed empty mbar
+        # (consumer_mask=Int32(0)) for cluster_m>1, mirroring Quack's
+        # make_sched_pipeline pattern. Anchor on the
+        # ``PipelineAsync.create(...)`` call structure: we look for
+        # the open-paren after ``tcgen05_sched_pipeline = ...`` and
+        # match balanced parens to capture the full call. A naive
+        # ``find("\n\n")`` reliance silently degrades to
+        # ``code[idx:-1]`` if the formatter reflows the call; this
+        # explicit balanced-paren scan is robust to that.
+        sched_create_match = re.search(
+            r"tcgen05_sched_pipeline = "
+            r"cutlass\.pipeline\.PipelineAsync\.create\(",
+            code,
+        )
+        self.assertIsNotNone(
+            sched_create_match,
+            msg="CLC kernel did not emit a sched_pipeline.create call",
+        )
+        # Walk forward from the open paren matching nested parens
+        # so the captured slice ends at the call's closing paren.
+        open_idx = sched_create_match.end() - 1
+        depth = 0
+        close_idx = None
+        for i in range(open_idx, len(code)):
+            ch = code[i]
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    close_idx = i
+                    break
+        self.assertIsNotNone(
+            close_idx, msg="unbalanced parens in sched_pipeline.create call"
+        )
+        sched_create_call = code[sched_create_match.start() : close_idx + 1]
+        self.assertIn("consumer_mask=cutlass.Int32(0)", sched_create_call)
+
+    def test_tcgen05_clc_persistent_does_not_perturb_monolithic(self) -> None:
+        """G2-H: ``ROLE_LOCAL_MONOLITHIC`` codegen must be byte-
+        identical pre/post G2-H. The byte-identity golden test
+        (``test_tcgen05_role_local_monolithic_byte_identical_golden``)
+        already pins the MONOLITHIC kernel; this test additionally
+        confirms that the MONOLITHIC path emits no CLC markers
+        regardless of the new persistence-model field.
+        """
+
+        from test.golden._tcgen05_role_local_monolithic_4096_bf16_kernel import (
+            cute_matmul_role_local_monolithic_4096_bf16,
+        )
+
+        args = (
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+        )
+        seed_config = helion.Config(
+            block_sizes=[256, 256, 128],
+            l2_groupings=[1],
+            pid_type="persistent_interleaved",
+            tcgen05_cluster_m=2,
+            tcgen05_ab_stages=2,
+            tcgen05_acc_stages=2,
+            tcgen05_c_stages=2,
+            tcgen05_num_epi_warps=4,
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_role_local_monolithic_4096_bf16.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            code = bound.to_triton_code(seed_config)
+
+        # MONOLITHIC must NOT emit any of the CLC markers.
+        self.assertNotIn("nvvm.clusterlaunchcontrol_try_cancel", code)
+        self.assertNotIn("_cute_issue_clc_query_nomulticast", code)
+        self.assertNotIn("tcgen05_clc_response_smem_ptr", code)
+        self.assertNotIn("tcgen05_clc_mbar_smem_ptr", code)
+        self.assertNotIn("cute.arch.clc_response", code)
+        # MONOLITHIC keeps the static-persistent emitter.
+        self.assertIn("StaticPersistentTileScheduler.create", code)
 
     def test_tcgen05_persistent_kloop_producer_lifts_to_role_local_while(
         self,
@@ -3216,6 +3402,79 @@ class TestCuteLowerings(unittest.TestCase):
                     # this test targets persistent scheduler state, not a
                     # new accumulator-precision contract.
                     torch.testing.assert_close(out, expected, atol=2e-1, rtol=1e-2)
+
+    def test_tcgen05_ab_stages_three_runtime_correctness(self) -> None:
+        """``tcgen05_ab_stages=3`` runs end-to-end without deadlock.
+
+        Pre-cycle-17 the initial-prefetch emission only filled stage 0
+        and stage ``ab_stage_count - 1``. For ``ab_stages=3`` that left
+        stage 1 empty; the K-loop's consumer ``consumer_wait`` on stage
+        1 phase 0 deadlocked on the first iteration. This runtime test
+        defends directly against the deadlock regression by binding
+        seeded inputs, executing the kernel, and asserting closeness
+        against the torch reference. See ``cute_plan.md §6.9.1``.
+
+        Pinned codegen markers (``num_stages=3``, intermediate-stage
+        gate variable, per-stage prefetch ``k_offset=0,1,2``) are also
+        checked so a producer-side regression that codegens fine but
+        re-introduces the prefetch gap fails fast at the codegen layer
+        before consuming the runtime budget.
+        """
+
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_ab3(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        # K=384 = 3 * bk so the K loop iterates exactly ab_stages times,
+        # guaranteeing the consumer_wait reaches every prefetched stage.
+        # M=N=256 matches the validated CtaGroup.TWO seed tile.
+        m, n, k = 256, 256, 384
+        for dtype in (torch.float16, torch.bfloat16):
+            with self.subTest(dtype=str(dtype)):
+                torch.manual_seed(0)
+                args = (
+                    torch.randn(m, k, device=DEVICE, dtype=dtype),
+                    torch.randn(k, n, device=DEVICE, dtype=dtype),
+                )
+                with patch_cute_mma_support():
+                    bound = cute_matmul_ab3.bind(args)
+                    bound.env.config_spec.cute_tcgen05_search_enabled = True
+                    cfg = _make_tcgen05_persistent_config(
+                        block_sizes=[256, 256, 128],
+                        pid_type="persistent_interleaved",
+                        tcgen05_cluster_m=2,
+                        tcgen05_ab_stages=3,
+                    )
+                    code = bound.to_triton_code(cfg)
+                    # Codegen markers: pipeline depth + per-stage prefetch.
+                    self.assertIn("PipelineTmaUmma.create(num_stages=3", code)
+                    for k_offset in (0, 1, 2):
+                        self.assertIn(f"tma_gA[None, cutlass.Int32({k_offset})]", code)
+                        self.assertIn(f"tma_gB[None, cutlass.Int32({k_offset})]", code)
+                    self.assertIn(
+                        "tma_gA[None, tcgen05_tma_k_tile + cutlass.Int32(3)]",
+                        code,
+                    )
+                    self.assertIn("tcgen05_tma_initial_stage_1_full_tile", code)
+                    bound.set_config(cfg)
+                    out = bound(*args)
+                # If the deadlock regresses, the kernel hangs (CI test
+                # timeout fires); if it returns, correctness must hold.
+                expected = args[0] @ args[1]
+                torch.testing.assert_close(out, expected, atol=2e-1, rtol=1e-2)
 
     def test_tcgen05_persistent_partial_multi_tile_runtime_guard(self) -> None:
         """Partial legacy persistent + tcgen05 still raises ``RuntimeError``.

@@ -1504,6 +1504,134 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         self.assertEqual(errors, [])
 
     @onlyBackends(["cute"])
+    def test_cute_tcgen05_strategy_invariants_clc_persistent(self) -> None:
+        """G2-H (cute_plan.md): ``Tcgen05PersistenceModel.CLC_PERSISTENT``
+        is only valid under ``ROLE_LOCAL_WITH_SCHEDULER`` on arch >= 100.
+
+        The validator must reject the model under MONOLITHIC (the
+        scheduler-warp role only exists in WITH_SCHEDULER) and on
+        arch < 100 (CLC is a Blackwell sm_100+ instruction). The
+        positive control: WITH_SCHEDULER + arch_major=10 +
+        scheduler_warps=1 + persistent_* pid_type accepts cleanly.
+        """
+        # Positive control: CLC + WITH_SCHEDULER + sm_100 (arch=10).
+        with_sched = dataclasses.replace(
+            ROLE_LOCAL_MONOLITHIC_DEFAULT_WARP_SPEC, scheduler_warps=1
+        )
+        errors = validate_tcgen05_strategy_invariants(
+            strategy=Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER,
+            persistence_model=Tcgen05PersistenceModel.CLC_PERSISTENT,
+            layout_strategy=Tcgen05LayoutStrategy.DEFAULT,
+            warp_spec=with_sched,
+            layout_overrides=Tcgen05LayoutOverrides(),
+            pid_type="persistent_blocked",
+            cluster_m=2,
+            arch_major=10,
+        )
+        self.assertEqual(errors, [], msg=str(errors))
+
+        # CLC under MONOLITHIC: rejected (the strategy doesn't
+        # support CLC because it has no scheduler warp to issue
+        # the query).
+        errors = validate_tcgen05_strategy_invariants(
+            strategy=Tcgen05Strategy.ROLE_LOCAL_MONOLITHIC,
+            persistence_model=Tcgen05PersistenceModel.CLC_PERSISTENT,
+            layout_strategy=Tcgen05LayoutStrategy.DEFAULT,
+            warp_spec=ROLE_LOCAL_MONOLITHIC_DEFAULT_WARP_SPEC,
+            layout_overrides=Tcgen05LayoutOverrides(),
+            pid_type="persistent_blocked",
+            cluster_m=1,
+            arch_major=10,
+        )
+        self.assertTrue(any("clc_persistent" in e for e in errors), msg=str(errors))
+
+        # CLC on arch < 100: rejected.
+        errors = validate_tcgen05_strategy_invariants(
+            strategy=Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER,
+            persistence_model=Tcgen05PersistenceModel.CLC_PERSISTENT,
+            layout_strategy=Tcgen05LayoutStrategy.DEFAULT,
+            warp_spec=with_sched,
+            layout_overrides=Tcgen05LayoutOverrides(),
+            pid_type="persistent_blocked",
+            cluster_m=2,
+            arch_major=9,
+        )
+        self.assertTrue(
+            any("requires CUDA compute capability major >= 10" in e for e in errors),
+            msg=str(errors),
+        )
+
+        # CLC overlays a runtime cancel on the persistent-grid
+        # launch, so it must agree with ``pid_type=persistent_*``;
+        # CLC paired with ``pid_type=flat`` is rejected with the
+        # contradiction error (validator asks user to set both
+        # consistently).
+        errors = validate_tcgen05_strategy_invariants(
+            strategy=Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER,
+            persistence_model=Tcgen05PersistenceModel.CLC_PERSISTENT,
+            layout_strategy=Tcgen05LayoutStrategy.DEFAULT,
+            warp_spec=with_sched,
+            layout_overrides=Tcgen05LayoutOverrides(),
+            pid_type="flat",
+            cluster_m=1,
+            arch_major=10,
+        )
+        self.assertTrue(
+            any("contradicts pid_type" in e for e in errors), msg=str(errors)
+        )
+
+    @onlyBackends(["cute"])
+    def test_cute_tcgen05_persistence_model_enum_value_pin(self) -> None:
+        """Pin the string literal that ``CuteTcgen05MatmulPlan.is_clc_persistent``
+        compares against to the actual enum's ``.value``.
+
+        ``CuteTcgen05MatmulPlan.persistence_model`` is stored as a
+        ``str`` (the enum's ``.value``) so the dataclass stays free
+        of cute-internal imports. The ``is_clc_persistent`` property
+        reads the enum value lazily and compares — this test pins
+        that the canonical value is ``"clc_persistent"`` so a rename
+        of the enum member would either propagate via the lazy
+        import or trip this test loudly. Without it a renamed enum
+        could silently degrade ``is_clc_persistent`` to always-False
+        because all the comparisons would be against a stale string
+        literal in serialized configs.
+        """
+        self.assertEqual(Tcgen05PersistenceModel.CLC_PERSISTENT.value, "clc_persistent")
+        self.assertEqual(
+            Tcgen05PersistenceModel.STATIC_PERSISTENT.value, "static_persistent"
+        )
+        # Round-trip via ``CuteTcgen05MatmulPlan`` to confirm the
+        # property tracks the enum value.
+        from helion._compiler.device_function import CuteTcgen05MatmulPlan
+
+        plan_clc = CuteTcgen05MatmulPlan(
+            bm=256,
+            bn=256,
+            bk=128,
+            k_tile_count=4,
+            cluster_m=2,
+            is_two_cta=True,
+            uses_role_local_persistent_body=True,
+            uses_cluster_m2_one_cta_role_local_bridge=False,
+            cta_thread_count=256,
+            physical_m_threads=32,
+            acc_stage_count=2,
+            ab_stage_count=2,
+            c_stage_count=2,
+            epi_warp_count=4,
+            ab_load_warp_count=1,
+            scheduler_warp_count=1,
+            sched_stage_count=1,
+            persistence_model=Tcgen05PersistenceModel.CLC_PERSISTENT.value,
+        )
+        self.assertTrue(plan_clc.is_clc_persistent)
+        plan_static = dataclasses.replace(
+            plan_clc,
+            persistence_model=Tcgen05PersistenceModel.STATIC_PERSISTENT.value,
+        )
+        self.assertFalse(plan_static.is_clc_persistent)
+
+    @onlyBackends(["cute"])
     def test_cute_tcgen05_strategy_invariants_warpgroup_alignment_branch(
         self,
     ) -> None:

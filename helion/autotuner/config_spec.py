@@ -839,9 +839,22 @@ class ConfigSpec:
             )
         else:
             num_epi_warps_fragment = IntegerFragment(1, 4, 4)
+        # ``tcgen05_ab_stages``: the validation view exposes 3 so explicit
+        # ``helion.Config(tcgen05_ab_stages=3)`` round-trips through
+        # ``normalize()`` and runs at the canonical 4096³ bf16 seed
+        # (~+12% over ab=2; see cute_plan.md §6.9.1). The search view is
+        # kept at max=2 because the SMEM cost at ab=3 depends on
+        # ``(bm, bn, bk, cluster_m, dtype)`` in ways the autotuner cannot
+        # cheaply pre-validate — sampling combinations like ``bk=128 +
+        # cluster_m=1 + ab=3`` ICEs at ptxas with ``shared > 232KB``,
+        # which is bad UX during tuning. Modeling the cute_dsl SMEM
+        # layout in Helion to gate this is brittle; users opt into ab=3
+        # explicitly per-shape until a tile-shape-aware budget check
+        # lands.
+        ab_stages_max = 3 if not for_search else 2
         return {
             "tcgen05_cluster_m": EnumFragment(cluster_m_choices),
-            "tcgen05_ab_stages": IntegerFragment(1, 2, 2),
+            "tcgen05_ab_stages": IntegerFragment(1, ab_stages_max, 2),
             "tcgen05_acc_stages": IntegerFragment(1, 2, 2),
             "tcgen05_c_stages": EnumFragment((2, 4)),
             "tcgen05_num_epi_warps": num_epi_warps_fragment,
@@ -947,10 +960,18 @@ class ConfigSpec:
         # never in the autotune surface (no codegen) so a user
         # explicit value is the only way to reach the contradiction
         # invariant, which the validator then rejects.
+        # ``CLC_PERSISTENT`` (G2-H, cute_plan.md) is accepted
+        # via this validation surface so an explicit
+        # ``helion.Config(..., tcgen05_persistence_model="clc_persistent")``
+        # round-trips, but kept out of the autotune surface
+        # (``_tcgen05_strategy_autotune_fragments``) until perf is
+        # characterized — mirrors the WITH_SCHEDULER narrowing
+        # pattern.
         fragments[TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY] = EnumFragment(
             (
                 Tcgen05PersistenceModel.NON_PERSISTENT.value,
                 Tcgen05PersistenceModel.STATIC_PERSISTENT.value,
+                Tcgen05PersistenceModel.CLC_PERSISTENT.value,
             )
         )
         # Strategy + scheduler_warps: the validation surface
@@ -1032,6 +1053,16 @@ class ConfigSpec:
         # lowering can't run correctly today.
         cluster_m_raw = config.get("tcgen05_cluster_m", 1)
         cluster_m = int(cluster_m_raw) if isinstance(cluster_m_raw, int) else 1
+        # Source arch major from the live device when CUDA is
+        # available; the unit-test path (no GPU) keeps None so
+        # arch-gated models like ``CLC_PERSISTENT`` still validate
+        # via the strategy/pid_type axes. Runtime kernel compilation
+        # always sees a real value.
+        arch_major: int | None = None
+        if torch.cuda.is_available():
+            arch_major = torch.cuda.get_device_capability(torch.cuda.current_device())[
+                0
+            ]
         errors = validate_tcgen05_strategy_invariants(
             strategy=strategy,
             persistence_model=persistence_model,
@@ -1040,6 +1071,7 @@ class ConfigSpec:
             layout_overrides=layout_overrides,
             pid_type=config.get("pid_type"),
             cluster_m=cluster_m,
+            arch_major=arch_major,
         )
         if not errors:
             return

@@ -62,15 +62,27 @@ class Tcgen05PersistenceModel(str, enum.Enum):
 
     Orthogonal to ``Tcgen05Strategy`` — the same warp-spec shape can
     run static or dynamic persistent. Today's ``pid_type=persistent_*``
-    Helion config maps to ``STATIC_PERSISTENT``. ``DYNAMIC_PERSISTENT``
-    (atomic-increment driven tile distribution from a global counter)
-    is the Quack-best path; Helion has no codegen for it today and
-    the strategy validation rejects it until a strategy that supports
-    it lands (G2-F if needed).
+    Helion config maps to ``STATIC_PERSISTENT`` by default.
+
+    - ``CLC_PERSISTENT``: Blackwell sm_100+ hardware tile-scheduler
+      driven persistent kernel via ``nvvm.clusterlaunchcontrol_try_cancel``
+      (CLC). Quack-best uses this path whenever
+      ``arch >= 100 and use_clc_persistence``; the CLC instruction is
+      issued from a dedicated scheduler warp and writes the next
+      cluster's CTA id into a SMEM response buffer (or a "canceled"
+      sentinel when the wave finishes). G2-H (cute_plan.md) wires
+      this through ``ROLE_LOCAL_WITH_SCHEDULER`` so the existing
+      sched-warp role becomes the CLC issuer. Validator requires
+      ``arch >= 100`` AND ``ROLE_LOCAL_WITH_SCHEDULER``.
+    - ``DYNAMIC_PERSISTENT``: atomic-counter / ``tile_count_semaphore``
+      driven dynamic persistent. Quack's fallback when CLC is
+      unavailable. Helion has no codegen for this today; validator
+      rejects it until a strategy consumes it.
     """
 
     NON_PERSISTENT = "non_persistent"
     STATIC_PERSISTENT = "static_persistent"
+    CLC_PERSISTENT = "clc_persistent"
     DYNAMIC_PERSISTENT = "dynamic_persistent"
 
 
@@ -365,9 +377,12 @@ def derive_persistence_model_from_pid_type(
     Used during ``ConfigSpec.normalize`` when the user did not supply
     an explicit ``tcgen05_persistence_model``. The mapping is
     intentionally conservative: only the existing knob values are
-    recognized, and ``DYNAMIC_PERSISTENT`` never falls out of this
-    function — it is reachable only via an explicit user opt-in,
-    because Helion has no codegen for dynamic persistence today.
+    recognized, and ``DYNAMIC_PERSISTENT`` / ``CLC_PERSISTENT`` never
+    fall out of this function — they are reachable only via an
+    explicit user opt-in. Helion has no codegen for dynamic
+    persistence today, and CLC requires explicit user opt-in so the
+    benchmarking surface stays under explicit control until perf is
+    characterized.
 
     ``pid_type`` is validated upstream by ``ConfigSpec.normalize``
     against ``VALID_PID_TYPES`` so this helper never sees an unknown
@@ -385,6 +400,26 @@ def derive_persistence_model_from_pid_type(
     if pid_type in ("persistent_blocked", "persistent_interleaved"):
         return Tcgen05PersistenceModel.STATIC_PERSISTENT
     return Tcgen05PersistenceModel.NON_PERSISTENT
+
+
+def _persistence_model_pid_type_compatible(
+    persistence_model: Tcgen05PersistenceModel, pid_type: object
+) -> bool:
+    """Return whether ``persistence_model`` is consistent with ``pid_type``.
+
+    ``CLC_PERSISTENT`` overlays a runtime CLC query on a
+    ``pid_type=persistent_*`` launch (the kernel still runs in
+    persistent-grid mode; CLC just replaces the static launch-grid
+    distribution with a hardware-driven canceller). So the agreement
+    is "CLC and STATIC both require ``pid_type=persistent_*``", not
+    "the persistence model derived from pid_type matches exactly".
+    """
+    derived = derive_persistence_model_from_pid_type(pid_type)
+    if persistence_model == derived:
+        return True
+    if persistence_model is Tcgen05PersistenceModel.CLC_PERSISTENT:
+        return derived is Tcgen05PersistenceModel.STATIC_PERSISTENT
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -407,8 +442,23 @@ _STRATEGY_SUPPORTED_PERSISTENCE: dict[
         {
             Tcgen05PersistenceModel.NON_PERSISTENT,
             Tcgen05PersistenceModel.STATIC_PERSISTENT,
+            # G2-H: CLC-based dynamic persistent scheduling. The
+            # sched-warp role doubles as the CLC query issuer; the
+            # consumer warps receive the next cluster's CTA id via
+            # the same SMEM mailbox + ``PipelineAsync`` topology as
+            # the static path. Arch-gated separately.
+            Tcgen05PersistenceModel.CLC_PERSISTENT,
         }
     ),
+}
+
+# Minimum CUDA compute capability (major version) for each persistence
+# model. Used by the validator to reject CLC selection on architectures
+# without the ``clusterlaunchcontrol`` family of instructions. Only
+# ``CLC_PERSISTENT`` is gated today; the static / non-persistent paths
+# work on every supported arch.
+_PERSISTENCE_MIN_ARCH_MAJOR: dict[Tcgen05PersistenceModel, int] = {
+    Tcgen05PersistenceModel.CLC_PERSISTENT: 10,
 }
 
 # Strategy-conditional warp-count requirements. Keys are strategy
@@ -461,6 +511,7 @@ def validate_tcgen05_strategy_invariants(
     layout_overrides: Tcgen05LayoutOverrides,
     pid_type: object,
     cluster_m: int,
+    arch_major: int | None = None,
 ) -> list[str]:
     """Cross-fragment invariants for the tcgen05 strategy data model.
 
@@ -483,6 +534,8 @@ def validate_tcgen05_strategy_invariants(
 
     - persistence model must be supported by the chosen strategy,
       and must agree with the active ``pid_type`` knob;
+    - persistence model arch gate (e.g. ``CLC_PERSISTENT`` requires
+      ``arch_major >= 10``);
     - scheduler-warp count is strategy-determined;
     - the total warp count must be warpgroup-aligned when the
       strategy demands it;
@@ -490,6 +543,18 @@ def validate_tcgen05_strategy_invariants(
       cluster-shape set;
     - layout-override values are only legal under
       ``Tcgen05LayoutStrategy.EXPLICIT_EPI_TILE``.
+
+    ``arch_major`` is the major compute capability (e.g. 10 for
+    sm_100). The runtime call site (``ConfigSpec.normalize`` when
+    CUDA is available) is the only one that supplies a real value;
+    the unit-test / serialization round-trip paths that have no GPU
+    pass ``None`` so the arch-gate check skips and the rest of the
+    invariants still validate. A CPU-only CI replay would therefore
+    accept ``CLC_PERSISTENT`` without rejection — that's intentional
+    so config serialization round-trips don't depend on the host
+    GPU, but it also means CPU CI never catches an arch-gated
+    misconfiguration on its own; the runtime path catches it on
+    first compile.
 
     Mirrors the pattern of
     ``narrow_tcgen05_autotune_to_validated_configs`` — call from
@@ -509,16 +574,30 @@ def validate_tcgen05_strategy_invariants(
     # The persistence model must agree with the active pid_type so
     # that serialized configs do not carry contradictory state. Today
     # ``pid_type=flat|xyz`` implies ``NON_PERSISTENT`` and
-    # ``pid_type=persistent_*`` implies ``STATIC_PERSISTENT``;
-    # ``DYNAMIC_PERSISTENT`` has no codegen path so it never agrees
-    # with any current ``pid_type`` value.
-    derived = derive_persistence_model_from_pid_type(pid_type)
-    if persistence_model != derived:
+    # ``pid_type=persistent_*`` implies ``STATIC_PERSISTENT`` (or
+    # ``CLC_PERSISTENT`` when the user explicitly opts in — CLC
+    # overlays the same persistent-grid launch with a runtime CLC
+    # query). ``DYNAMIC_PERSISTENT`` has no codegen path so it never
+    # agrees with any current ``pid_type`` value.
+    if not _persistence_model_pid_type_compatible(persistence_model, pid_type):
+        derived = derive_persistence_model_from_pid_type(pid_type)
         errors.append(
             f"tcgen05_persistence_model={persistence_model.value!r} "
             f"contradicts pid_type={pid_type!r} (which implies "
             f"{derived.value!r}); set both consistently or drop one "
             "to take the derived default"
+        )
+
+    # Arch-gated persistence models. ``CLC_PERSISTENT`` requires
+    # sm_100+ because ``nvvm.clusterlaunchcontrol_try_cancel`` is a
+    # Blackwell hardware feature.
+    min_arch = _PERSISTENCE_MIN_ARCH_MAJOR.get(persistence_model)
+    if min_arch is not None and arch_major is not None and arch_major < min_arch:
+        errors.append(
+            f"tcgen05_persistence_model={persistence_model.value!r} "
+            f"requires CUDA compute capability major >= {min_arch} "
+            f"(arch sm_{min_arch}0+); current arch major is "
+            f"{arch_major}"
         )
 
     # scheduler_warps is strategy-determined.
