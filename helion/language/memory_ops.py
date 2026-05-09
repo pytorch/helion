@@ -1608,6 +1608,24 @@ def _codegen_cute_store_tcgen05_tile(
     df = state.device_function
     tensor_name = df.tensor_arg(tensor).name
     target_dtype = backend.dtype_str(tensor.dtype)
+    # The matmul plan computed `tcgen05_epi_tile` (role-local t2r
+    # partition) with `epi_elem_dtype_str`; the store path below
+    # recomputes `tcgen05_store_epi_tile` with `target_dtype`. They must
+    # match or `compute_epilogue_tile_shape` selects different `tile_n`
+    # values on the two sides and the t2r / r2s SMEM staging silently
+    # corrupts. The loud-failure backstop covers cases where MMA-codegen-
+    # time forward-tracing of the matmul fx_node could not pin a unique
+    # store target dtype.
+    if (
+        tcgen05_value.epi_elem_dtype_str
+        and tcgen05_value.epi_elem_dtype_str != target_dtype
+    ):
+        raise exc.BackendUnsupported(
+            "cute",
+            "tcgen05 epilogue element-type mismatch: matmul plan was set "
+            f"up with epi_elem_dtype_str={tcgen05_value.epi_elem_dtype_str!r} "
+            f"but the store target tensor dtype is {target_dtype!r}.",
+        )
     base_indices = [_cute_tile_begin_expr(state, idx) for idx in subscript]
     if len(base_indices) != 2:
         return None
@@ -1719,9 +1737,15 @@ def _codegen_cute_store_tcgen05_tile(
                 "})()"
             ),
             (
+                # `layout_c=` / `elem_ty_c=` match the D-output dtype so the
+                # helper picks the with-source branch; the matmul-plan
+                # `tcgen05_epi_tile` and the wrapper-side TMA atom must use
+                # the same call shape (see `_make_tcgen05_layout_plan_setup`).
                 f"{epi_tile} = cutlass.utils.blackwell_helpers.compute_epilogue_tile_shape("
                 f"({tcgen05_bm}, {tcgen05_bn}), False, "
-                f"cutlass.utils.layout.LayoutEnum.ROW_MAJOR, {target_dtype})"
+                f"cutlass.utils.layout.LayoutEnum.ROW_MAJOR, {target_dtype}, "
+                f"layout_c=cutlass.utils.layout.LayoutEnum.ROW_MAJOR, "
+                f"elem_ty_c={target_dtype})"
             ),
         ]
         tile_setup: list[str] = []

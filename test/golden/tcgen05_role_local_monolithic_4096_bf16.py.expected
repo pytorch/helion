@@ -37,7 +37,7 @@ def _helion_cute_matmul_role_local_monolithic_4096_bf16(x, y, out, tma_atom_a, t
     sA_layout = cutlass.utils.blackwell_helpers.make_smem_layout_a(tiled_mma, (256, 256, 128), cutlass.BFloat16, 2)
     sB_layout = cutlass.utils.blackwell_helpers.make_smem_layout_b(tiled_mma, (256, 256, 128), cutlass.BFloat16, 2)
     tcgen05_c_layout = cutlass.utils.layout.LayoutEnum.ROW_MAJOR
-    tcgen05_epi_tile = cutlass.utils.blackwell_helpers.compute_epilogue_tile_shape((256, 256), False, tcgen05_c_layout, cutlass.Float32)
+    tcgen05_epi_tile = cutlass.utils.blackwell_helpers.compute_epilogue_tile_shape((256, 256), False, tcgen05_c_layout, cutlass.BFloat16, layout_c=tcgen05_c_layout, elem_ty_c=cutlass.BFloat16)
     tcgen05_tmem_load_atom = cutlass.utils.blackwell_helpers.get_tmem_load_op((256, 256, 128), tcgen05_c_layout, cutlass.Float32, cutlass.Float32, tcgen05_epi_tile, True)
     tcgen05_epilogue_rest_mode = cute.make_layout(1, stride=0)
     acc_frag_base = tiled_mma.make_fragment_C(cute.append(tiled_mma.partition_shape_C((256, 256)), 2))
@@ -95,7 +95,7 @@ def _helion_cute_matmul_role_local_monolithic_4096_bf16(x, y, out, tma_atom_a, t
     tcgen05_c_pipeline_producer_group = cutlass.pipeline.CooperativeGroup(cutlass.pipeline.Agent.Thread, cutlass.Int32(128))
     tcgen05_c_pipeline = cutlass.pipeline.PipelineTmaStore.create(num_stages=2, producer_group=tcgen05_c_pipeline_producer_group)
     tcgen05_kernel_desc = type('Tcgen05KernelDesc', (), {'cta_tile_shape_mnk': (256, 256, 128), 'c_layout': cutlass.utils.layout.LayoutEnum.ROW_MAJOR, 'c_dtype': cutlass.BFloat16, 'acc_dtype': cutlass.Float32, 'epilog_sync_bar_id': cutlass.Int32(2), 'epilogue_warp_id': (cutlass.Int32(0), cutlass.Int32(1), cutlass.Int32(2), cutlass.Int32(3)), 'num_c_stage': cutlass.Int32(2), 'use_2cta_instrs': True})()
-    tcgen05_store_epi_tile = cutlass.utils.blackwell_helpers.compute_epilogue_tile_shape((256, 256), False, cutlass.utils.layout.LayoutEnum.ROW_MAJOR, cutlass.BFloat16)
+    tcgen05_store_epi_tile = cutlass.utils.blackwell_helpers.compute_epilogue_tile_shape((256, 256), False, cutlass.utils.layout.LayoutEnum.ROW_MAJOR, cutlass.BFloat16, layout_c=cutlass.utils.layout.LayoutEnum.ROW_MAJOR, elem_ty_c=cutlass.BFloat16)
     tcgen05_sD_layout = cutlass.utils.blackwell_helpers.make_smem_layout_epi(cutlass.BFloat16, cutlass.utils.layout.LayoutEnum.ROW_MAJOR, tcgen05_store_epi_tile, 2)
     tcgen05_sD_ptr = cute.arch.alloc_smem(cutlass.BFloat16, cute.cosize(tcgen05_sD_layout.outer), alignment=1024)
     tcgen05_sD = cute.make_tensor(cute.recast_ptr(tcgen05_sD_ptr, tcgen05_sD_layout.inner, dtype=cutlass.BFloat16), tcgen05_sD_layout.outer)

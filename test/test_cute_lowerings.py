@@ -59,6 +59,7 @@ from helion._compiler.cute.cute_mma import _tcgen05_ab_stage_count
 from helion._compiler.cute.cute_mma import _tcgen05_epi_warp_count
 from helion._compiler.cute.cute_mma import _tcgen05_root_m_threads
 from helion._compiler.cute.cute_mma import _tcgen05_tmem_barrier_thread_count
+from helion._compiler.cute.cute_mma import _trace_mma_to_store_dtype
 from helion._compiler.cute.cute_mma import can_codegen_cute_mma_aten
 from helion._compiler.cute.cute_reshape import _get_dim_local_coord
 from helion._compiler.cute.cute_reshape import codegen_cute_permute
@@ -123,6 +124,7 @@ from helion._compiler.cute.tcgen05_constants import TCGEN05_LARGE_BN_PROOF_CONFI
 from helion._compiler.cute.tcgen05_constants import TCGEN05_LARGE_BN_PROOF_PID_TYPE
 from helion._compiler.cute.tcgen05_constants import TCGEN05_LARGE_BN_PROOF_STAGE_CONFIGS
 from helion._compiler.device_ir import ForLoopGraphInfo
+from helion._compiler.device_ir import GraphInfo
 from helion._compiler.device_ir import RootGraphInfo
 from helion._compiler.device_ir import collect_cute_half_atomic_output_promotions
 from helion._compiler.host_function import HostFunction
@@ -7441,6 +7443,262 @@ class TestCuteLowerings(unittest.TestCase):
             "tcgen05_epilogue_rest_mode_1 = cute.make_layout(1, stride=0)",
             emitted,
         )
+        # `compute_epilogue_tile_shape` must receive `elem_ty_d` and
+        # `elem_ty_c` matching the D-output element type so the helper
+        # takes the with-source branch (e.g. bf16/fp16 → `tile_n=64`)
+        # rather than the `disable_source=True` branch (`tile_n=32`).
+        # The kernel-side, store-side, and wrapper-side calls must all
+        # agree on `tile_n`; a regression that drops the kwargs, swaps
+        # them to the accumulator dtype, or mismatches the `elem_ty_d`
+        # positional must fail one of these assertions.
+        self.assertIn(
+            (
+                "compute_epilogue_tile_shape((128, 8), False, "
+                "tcgen05_c_layout_1, cutlass.Float16, "
+                "layout_c=tcgen05_c_layout_1, elem_ty_c=cutlass.Float16)"
+            ),
+            emitted,
+        )
+        self.assertNotIn(
+            "compute_epilogue_tile_shape((128, 8), False, "
+            "tcgen05_c_layout_1, cutlass.Float32",
+            emitted,
+        )
+
+    def test_tcgen05_layout_plan_setup_threads_mixed_input_output_dtype(
+        self,
+    ) -> None:
+        """`_make_tcgen05_layout_plan_setup` honors
+        ``epi_elem_dtype_str`` when the caller supplies an output dtype
+        that differs from ``input_dtype_str``.
+
+        For bf16/fp16-input matmuls that store directly to fp32 (no
+        ``acc.to(x.dtype)`` cast), the matmul plan's
+        ``compute_epilogue_tile_shape`` must use the *output* dtype (not
+        the input dtype) so the kernel-side ``tile_n`` matches the
+        store-side ``tile_n`` and the SMEM staging stays consistent.
+        Pin the kwargs explicitly: ``elem_ty_d`` / ``elem_ty_c`` are
+        ``cutlass.Float32`` (output), ``smem_layout_a`` / ``smem_layout_b``
+        keep ``cutlass.Float16`` (input).
+        """
+        df = _FakeDeviceFunction()
+        plan = _new_tcgen05_layout_plan(df)
+        stmts = _make_tcgen05_layout_plan_setup(
+            plan,
+            "tiled_mma",
+            bm=128,
+            bn=8,
+            bk=16,
+            ab_stage_count=1,
+            is_two_cta=False,
+            input_dtype_str="cutlass.Float16",
+            acc_dtype_str="cutlass.Float32",
+            epi_elem_dtype_str="cutlass.Float32",
+        )
+        emitted = "\n".join(ast.unparse(stmt) for stmt in stmts)
+        # SMEM-A/B layouts still use the input dtype.
+        self.assertIn(
+            "make_smem_layout_a(tiled_mma, (128, 8, 16), cutlass.Float16, 1)",
+            emitted,
+        )
+        self.assertIn(
+            "make_smem_layout_b(tiled_mma, (128, 8, 16), cutlass.Float16, 1)",
+            emitted,
+        )
+        # `compute_epilogue_tile_shape` uses the *output* dtype.
+        self.assertIn(
+            (
+                "compute_epilogue_tile_shape((128, 8), False, "
+                "tcgen05_c_layout_1, cutlass.Float32, "
+                "layout_c=tcgen05_c_layout_1, elem_ty_c=cutlass.Float32)"
+            ),
+            emitted,
+        )
+        # And explicitly NOT the input dtype.
+        self.assertNotIn(
+            "compute_epilogue_tile_shape((128, 8), False, "
+            "tcgen05_c_layout_1, cutlass.Float16",
+            emitted,
+        )
+
+    def _build_matmul_store_graphs(
+        self,
+        *,
+        store_dtypes: list[torch.dtype],
+        cast_dtype: torch.dtype | None = None,
+    ) -> tuple[torch.fx.Node, list[GraphInfo]]:
+        """Build synthetic FX graphs that mimic the
+        ``for tile_m, tile_n: ... for tile_k: acc = hl.dot(...)
+        out[...] = acc[.to(...)]`` shape.
+
+        Returns the matmul fx_node (in the K-loop body) and a
+        ``codegen_graphs`` list pairing one ``ForLoopGraphInfo`` for the
+        K-loop body with one ``RootGraphInfo`` for the outer store
+        body. ``store_dtypes`` controls how many store ops the outer
+        graph emits and what tensor dtype each store targets.
+        ``cast_dtype`` optionally inserts a ``convert_element_type``
+        between the for-loop output and the store's value (mirroring
+        ``acc.to(x.dtype)``).
+        """
+        from helion.language import memory_ops
+
+        body_graph = Graph()
+        body_acc_in = body_graph.placeholder("acc_in")
+        body_acc_in.meta["val"] = torch.empty(4, 4, dtype=torch.float32)
+        mma_node = body_graph.call_function(hl.dot, args=(body_acc_in,))
+        mma_node.meta["val"] = torch.empty(4, 4, dtype=torch.float32)
+        body_graph.output((mma_node,))
+
+        root_graph = Graph()
+        acc_init = root_graph.call_function(_tracing_ops._new_var, args=())
+        acc_init.meta["val"] = torch.empty(4, 4, dtype=torch.float32)
+        for_loop_node = root_graph.call_function(
+            _tracing_ops._for_loop,
+            args=(0, [0], [4], [acc_init]),
+        )
+        getitem_node = root_graph.call_function(
+            operator.getitem, args=(for_loop_node, 0)
+        )
+        getitem_node.meta["val"] = torch.empty(4, 4, dtype=torch.float32)
+        phi_node = root_graph.call_function(
+            _tracing_ops._phi, args=(acc_init, getitem_node)
+        )
+        phi_node.meta["val"] = torch.empty(4, 4, dtype=torch.float32)
+        if cast_dtype is not None:
+            cast_node = root_graph.call_function(
+                torch.ops.prims.convert_element_type.default,
+                args=(phi_node, cast_dtype),
+            )
+            cast_node.meta["val"] = torch.empty(4, 4, dtype=cast_dtype)
+            store_value = cast_node
+        else:
+            store_value = phi_node
+        for store_dtype in store_dtypes:
+            out_tensor = root_graph.call_function(_tracing_ops._new_var, args=())
+            out_tensor.meta["val"] = torch.empty(4, 4, dtype=store_dtype)
+            root_graph.call_function(
+                memory_ops.store,
+                args=(out_tensor, [0, 0], store_value, None),
+            )
+        root_graph.output(())
+
+        graphs: list[GraphInfo] = [
+            ForLoopGraphInfo(
+                graph_id=0, graph=body_graph, node_args=[acc_init], block_ids=[1]
+            ),
+            RootGraphInfo(graph_id=1, graph=root_graph, phase_index=0),
+        ]
+        return mma_node, graphs
+
+    def test_trace_mma_to_store_dtype_with_cast_returns_cast_dtype(self) -> None:
+        """``acc.to(x.dtype)`` pattern: trace returns the post-cast dtype."""
+        mma_node, graphs = self._build_matmul_store_graphs(
+            store_dtypes=[torch.bfloat16],
+            cast_dtype=torch.bfloat16,
+        )
+        self.assertEqual(_trace_mma_to_store_dtype(mma_node, graphs), torch.bfloat16)
+
+    def test_trace_mma_to_store_dtype_direct_fp32_store(self) -> None:
+        """Direct ``out[...] = acc`` (no cast): trace returns the
+        store target dtype, not the matmul accumulator dtype."""
+        mma_node, graphs = self._build_matmul_store_graphs(
+            store_dtypes=[torch.float32],
+            cast_dtype=None,
+        )
+        self.assertEqual(_trace_mma_to_store_dtype(mma_node, graphs), torch.float32)
+
+    def test_trace_mma_to_store_dtype_multi_store_fan_out_returns_none(
+        self,
+    ) -> None:
+        """The matmul value feeds two stores with different dtypes: the
+        trace can't pin a unique target and must return ``None`` so the
+        caller falls back and the cross-site assertion is the
+        loud-failure backstop."""
+        mma_node, graphs = self._build_matmul_store_graphs(
+            store_dtypes=[torch.bfloat16, torch.float32],
+            cast_dtype=None,
+        )
+        self.assertIsNone(_trace_mma_to_store_dtype(mma_node, graphs))
+
+    def test_trace_mma_to_store_dtype_signature_collision_uses_correct_subgraph(
+        self,
+    ) -> None:
+        """Two structurally identical K-loop bodies (e.g., a kernel with
+        two distinct matmuls feeding different stores) collide on
+        ``_graph_signature``. The tracer must disambiguate via codegen-
+        graph identity (``mma_node.graph is gi.graph``) so each matmul
+        sees the dtype of ITS consuming store, not the other matmul's.
+        """
+        from helion.language import memory_ops
+
+        # Build two identical-shaped K-loop bodies; each has its own
+        # matmul fx_node.
+        def _make_body() -> tuple[Graph, torch.fx.Node, torch.fx.Node]:
+            g = Graph()
+            acc_in = g.placeholder("acc_in")
+            acc_in.meta["val"] = torch.empty(4, 4, dtype=torch.float32)
+            mma = g.call_function(hl.dot, args=(acc_in,))
+            mma.meta["val"] = torch.empty(4, 4, dtype=torch.float32)
+            g.output((mma,))
+            return g, acc_in, mma
+
+        body_a, acc_in_a, mma_a = _make_body()
+        body_b, acc_in_b, mma_b = _make_body()
+
+        root_graph = Graph()
+        acc_init_a = root_graph.call_function(_tracing_ops._new_var, args=())
+        acc_init_a.meta["val"] = torch.empty(4, 4, dtype=torch.float32)
+        for_loop_a = root_graph.call_function(
+            _tracing_ops._for_loop, args=(0, [0], [4], [acc_init_a])
+        )
+        getitem_a = root_graph.call_function(operator.getitem, args=(for_loop_a, 0))
+        getitem_a.meta["val"] = torch.empty(4, 4, dtype=torch.float32)
+        phi_a = root_graph.call_function(
+            _tracing_ops._phi, args=(acc_init_a, getitem_a)
+        )
+        phi_a.meta["val"] = torch.empty(4, 4, dtype=torch.float32)
+        out_a = root_graph.call_function(_tracing_ops._new_var, args=())
+        out_a.meta["val"] = torch.empty(4, 4, dtype=torch.bfloat16)
+        root_graph.call_function(memory_ops.store, args=(out_a, [0, 0], phi_a, None))
+
+        acc_init_b = root_graph.call_function(_tracing_ops._new_var, args=())
+        acc_init_b.meta["val"] = torch.empty(4, 4, dtype=torch.float32)
+        for_loop_b = root_graph.call_function(
+            _tracing_ops._for_loop, args=(1, [0], [4], [acc_init_b])
+        )
+        getitem_b = root_graph.call_function(operator.getitem, args=(for_loop_b, 0))
+        getitem_b.meta["val"] = torch.empty(4, 4, dtype=torch.float32)
+        phi_b = root_graph.call_function(
+            _tracing_ops._phi, args=(acc_init_b, getitem_b)
+        )
+        phi_b.meta["val"] = torch.empty(4, 4, dtype=torch.float32)
+        out_b = root_graph.call_function(_tracing_ops._new_var, args=())
+        out_b.meta["val"] = torch.empty(4, 4, dtype=torch.float32)
+        root_graph.call_function(memory_ops.store, args=(out_b, [0, 0], phi_b, None))
+        root_graph.output(())
+
+        graphs: list[GraphInfo] = [
+            ForLoopGraphInfo(
+                graph_id=0, graph=body_a, node_args=[acc_init_a], block_ids=[2]
+            ),
+            ForLoopGraphInfo(
+                graph_id=1, graph=body_b, node_args=[acc_init_b], block_ids=[3]
+            ),
+            RootGraphInfo(graph_id=2, graph=root_graph, phase_index=0),
+        ]
+
+        # Despite identical body signatures, mma_a's user chain leads
+        # to the bf16 store and mma_b's leads to the fp32 store.
+        self.assertEqual(_trace_mma_to_store_dtype(mma_a, graphs), torch.bfloat16)
+        self.assertEqual(_trace_mma_to_store_dtype(mma_b, graphs), torch.float32)
+
+    def test_trace_mma_to_store_dtype_unknown_graph_returns_none(self) -> None:
+        """When ``mma_node.graph`` is not in the supplied codegen graph
+        list, the trace cannot proceed and must return ``None``."""
+        mma_node, _ = self._build_matmul_store_graphs(
+            store_dtypes=[torch.bfloat16], cast_dtype=None
+        )
+        self.assertIsNone(_trace_mma_to_store_dtype(mma_node, []))
 
     def test_emit_sched_pipeline_setup_round_trips_pipeline_async(self) -> None:
         """``_emit_sched_pipeline_setup`` emits the

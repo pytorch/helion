@@ -235,6 +235,14 @@ class CuteTcgen05StoreValue:
     ab_stage_count: int = 0
     acc_stage_count: int = 0
     skip_ab_producer_advance: bool = False
+    # Output element dtype (cutlass type-string, e.g. "cutlass.BFloat16") that
+    # the matmul plan used when computing `epi_tile` /
+    # `tcgen05_tmem_load_atom`. The store path
+    # (`_codegen_cute_store_tcgen05_tile`) asserts the runtime D-tensor dtype
+    # agrees with this so the role-local `tcgen05_epi_tile` and the
+    # store-side `tcgen05_store_epi_tile` cannot silently disagree on
+    # `compute_epilogue_tile_shape`.
+    epi_elem_dtype_str: str = ""
 
 
 @dataclasses.dataclass(frozen=True)

@@ -80,6 +80,7 @@ if TYPE_CHECKING:
     from ..aten_lowering import LoweringContext
     from ..compile_environment import CompileEnvironment
     from ..device_function import DeviceFunction
+    from ..device_ir import GraphInfo
     from ..generate_ast import GenerateAST
     from ..inductor_lowering import CodegenState
     from .strategies import Tcgen05WarpSpec
@@ -1287,6 +1288,109 @@ def _clone_k_loop_with_body(
     )
 
 
+def _trace_mma_to_store_dtype(
+    mma_node: Node,
+    graphs: list[GraphInfo],
+) -> torch.dtype | None:
+    """Forward-trace ``mma_node`` to the unique consuming store target dtype.
+
+    Walks ``_phi`` / ``_new_var`` / ``convert_element_type`` /
+    ``operator.getitem`` chains and crosses subgraph boundaries via the
+    inner ``output`` node and the matching outer-graph
+    ``operator.getitem(_for_loop_node, idx)``. Returns ``None`` when the
+    trace cannot pin a unique store target — multiple stores with
+    different dtypes, an op the trace cannot safely follow, no reachable
+    store, or ``mma_node.graph`` not present in ``graphs``. The caller
+    must treat ``None`` as "fall back; the cross-site assertion catches
+    real mismatches".
+
+    ``graphs`` must be the live codegen graph list the
+    ``GraphInterpreter`` is walking so ``mma_node.graph`` matches a
+    ``GraphInfo.graph`` by identity — that's the disambiguator across
+    structurally-identical subgraphs (e.g., a kernel with two distinct
+    matmuls would otherwise collide on ``_graph_signature``).
+    """
+    import operator
+
+    from ...language import _tracing_ops
+    from ...language import memory_ops
+
+    graph_id_of: dict[torch.fx.Graph, int] = {}
+    for_loop_calls_by_graph_id: dict[int, list[Node]] = {}
+    for graph_info in graphs:
+        graph_id_of[graph_info.graph] = graph_info.graph_id
+        for node in graph_info.graph.nodes:
+            if node.op != "call_function":
+                continue
+            if not _tracing_ops.is_for_loop_target(node.target):
+                continue
+            graph_id_arg = node.args[0] if node.args else None
+            if not isinstance(graph_id_arg, int):
+                continue
+            for_loop_calls_by_graph_id.setdefault(graph_id_arg, []).append(node)
+
+    if mma_node.graph not in graph_id_of:
+        return None
+
+    discovered: set[torch.dtype] = set()
+    visited: set[Node] = set()
+    stack: list[Node] = [mma_node]
+    while stack:
+        cur = stack.pop()
+        if cur in visited:
+            continue
+        visited.add(cur)
+        for user in cur.users:
+            if user.op == "output":
+                graph_id = graph_id_of.get(cur.graph)
+                if graph_id is None:
+                    return None
+                output_args = user.args[0] if user.args else None
+                if not isinstance(output_args, (list, tuple)):
+                    return None
+                out_indices = [i for i, arg in enumerate(output_args) if arg is cur]
+                if not out_indices:
+                    return None
+                for outer_call in for_loop_calls_by_graph_id.get(graph_id, []):
+                    for outer_user in outer_call.users:
+                        if (
+                            outer_user.op == "call_function"
+                            and outer_user.target is operator.getitem
+                            and len(outer_user.args) >= 2
+                            and outer_user.args[1] in out_indices
+                            and outer_user not in visited
+                        ):
+                            stack.append(outer_user)
+                continue
+            if user.op != "call_function":
+                continue
+            target = user.target
+            if target is memory_ops.store:
+                tensor_node = user.args[0] if user.args else None
+                if not isinstance(tensor_node, Node):
+                    return None
+                fake = tensor_node.meta.get("val")
+                if not isinstance(fake, torch.Tensor):
+                    return None
+                discovered.add(fake.dtype)
+                if len(discovered) > 1:
+                    return None
+                continue
+            if (
+                target is _tracing_ops._phi
+                or target is _tracing_ops._new_var
+                or target is operator.getitem
+                or target in _TRACE_THROUGH_TARGETS
+            ):
+                stack.append(user)
+                continue
+            return None
+
+    if len(discovered) == 1:
+        return next(iter(discovered))
+    return None
+
+
 def _emit_mma_pipeline(
     cg: GenerateAST,
     lhs_node: Node,
@@ -1326,6 +1430,29 @@ def _emit_mma_pipeline(
     }
     input_dtype_str = _dtype_map[input_dtype]
     acc_dtype_str = "cutlass.Float32"
+    # The kernel-side `tcgen05_epi_tile` (built in
+    # `_make_tcgen05_layout_plan_setup`) and the store-side
+    # `tcgen05_store_epi_tile` (built in `_codegen_cute_store_tcgen05_tile`)
+    # must agree on the `elem_ty_d` / `elem_ty_c` passed to
+    # `compute_epilogue_tile_shape` — `tile_n` differs between the
+    # with-source bf16/fp16 `n_perf=64` branch and the fp32-with-source
+    # `n_perf=32` branch, and a mismatch silently corrupts SMEM staging.
+    # Forward-trace the matmul fx_node to its consuming store target so
+    # both sides see the same dtype. When the trace fails (no fx_node,
+    # multi-store fan-out, opaque op) or returns a dtype outside the
+    # known matmul output family, we fall back to the input dtype here;
+    # the store-side equality check on the registered
+    # `CuteTcgen05StoreValue` is the loud-failure backstop and
+    # surfaces `BackendUnsupported` if the runtime D-tensor dtype
+    # disagrees with the matmul plan's assumption.
+    epi_elem_dtype: torch.dtype | None = None
+    if fx_node is not None:
+        traced = _trace_mma_to_store_dtype(fx_node, cg.codegen_graphs)
+        if traced in _dtype_map:
+            epi_elem_dtype = traced
+    epi_elem_dtype_str = (
+        _dtype_map[epi_elem_dtype] if epi_elem_dtype is not None else input_dtype_str
+    )
     tcgen05_use_tma = (
         input_dtype in (torch.float16, torch.bfloat16)
         and lhs_fake.is_contiguous()
@@ -2208,6 +2335,7 @@ def _emit_mma_pipeline(
                 is_two_cta=tcgen05_is_two_cta,
                 input_dtype_str=input_dtype_str,
                 acc_dtype_str=acc_dtype_str,
+                epi_elem_dtype_str=epi_elem_dtype_str,
             )
         )
         prefix.append(
@@ -3349,6 +3477,11 @@ def _emit_mma_pipeline(
                 ab_stage_count=tcgen05_ab_stage_count_value,
                 acc_stage_count=tcgen05_acc_stage_count_value,
                 skip_ab_producer_advance=diagnose_skip_ab_producer_advance,
+                # Mirror the value passed to `_make_tcgen05_layout_plan_setup`
+                # above; the store path compares this against `target_dtype`
+                # to enforce the kernel/store equality contract on
+                # `compute_epilogue_tile_shape`'s dtype kwargs.
+                epi_elem_dtype_str=epi_elem_dtype_str,
             ),
         )
     else:
@@ -3732,7 +3865,20 @@ def _make_tcgen05_layout_plan_setup(
     is_two_cta: bool,
     input_dtype_str: str,
     acc_dtype_str: str,
+    epi_elem_dtype_str: str | None = None,
 ) -> list[ast.AST]:
+    # `compute_epilogue_tile_shape` must receive `elem_ty_d` and `elem_ty_c`
+    # equal to the eventual D-output dtype so the helper takes the
+    # with-source branch (e.g. bf16 → `tile_n=64`) rather than the
+    # `disable_source=True` branch (`tile_n=32`); the matmul-plan epi_tile
+    # built here, the store-side epi_tile in
+    # `_codegen_cute_store_tcgen05_tile`, and the wrapper-side TMA atom in
+    # `helion/runtime/__init__.py` must all see the same `tile_n`. When
+    # `epi_elem_dtype_str` is omitted the input dtype is used as a fallback;
+    # the store-side equality check on the registered `CuteTcgen05StoreValue`
+    # is the loud-failure backstop for any mismatch.
+    if epi_elem_dtype_str is None:
+        epi_elem_dtype_str = input_dtype_str
     return [
         statement_from_string(
             f"{plan.smem_a_layout} = "
@@ -3748,7 +3894,8 @@ def _make_tcgen05_layout_plan_setup(
         statement_from_string(
             f"{plan.epi_tile} = cutlass.utils.blackwell_helpers.compute_epilogue_tile_shape("
             f"({bm}, {bn}), False, {plan.c_layout}, "
-            f"{acc_dtype_str})"
+            f"{epi_elem_dtype_str}, layout_c={plan.c_layout}, "
+            f"elem_ty_c={epi_elem_dtype_str})"
         ),
         statement_from_string(
             f"{plan.tmem_load_atom} = cutlass.utils.blackwell_helpers.get_tmem_load_op("

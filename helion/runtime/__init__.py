@@ -1475,6 +1475,9 @@ def _append_cute_wrapper_plan(
         # Keep these layout arguments in sync with the device-side
         # `make_smem_layout_epi` call in `_codegen_cute_store_tcgen05_tile`;
         # the TMA atom slices the same SMEM stage that the kernel allocates.
+        # `elem_ty_c=` matches the D-output dtype so the wrapper's TMA atom
+        # and the kernel's SMEM staging pick the same `tile_n` from
+        # `compute_epilogue_tile_shape`.
         body.extend(
             (
                 (
@@ -1482,7 +1485,9 @@ def _append_cute_wrapper_plan(
                     "cutlass.utils.blackwell_helpers.compute_epilogue_tile_shape("
                     f"({bm}, {bn}), False, "
                     "cutlass.utils.layout.LayoutEnum.ROW_MAJOR, "
-                    f"{output_dtype})"
+                    f"{output_dtype}, "
+                    "layout_c=cutlass.utils.layout.LayoutEnum.ROW_MAJOR, "
+                    f"elem_ty_c={output_dtype})"
                 ),
                 (
                     f"    {smem_layout} = cutlass.utils.blackwell_helpers."
