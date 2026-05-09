@@ -22,6 +22,26 @@ from .._compat import supports_amd_cdna_tunables
 from .._compat import supports_maxnreg
 from .._compat import supports_tensor_descriptor
 from .._compat import warps_to_threads
+from .._compiler.cute.strategies import ROLE_LOCAL_MONOLITHIC_DEFAULT_WARP_SPEC
+from .._compiler.cute.strategies import TCGEN05_LAYOUT_OVERRIDES_KEYS
+from .._compiler.cute.strategies import TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY
+from .._compiler.cute.strategies import TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY
+from .._compiler.cute.strategies import TCGEN05_STRATEGY_CONFIG_KEY
+from .._compiler.cute.strategies import TCGEN05_STRATEGY_CONFIG_KEYS
+from .._compiler.cute.strategies import TCGEN05_WARP_SPEC_AB_LOAD_WARPS_KEY
+from .._compiler.cute.strategies import TCGEN05_WARP_SPEC_DEFAULTS_BY_KEY
+from .._compiler.cute.strategies import TCGEN05_WARP_SPEC_EPI_LOAD_WARPS_KEY
+from .._compiler.cute.strategies import TCGEN05_WARP_SPEC_MMA_WARPS_KEY
+from .._compiler.cute.strategies import TCGEN05_WARP_SPEC_REGISTER_DECREASE_KEY
+from .._compiler.cute.strategies import TCGEN05_WARP_SPEC_REGISTER_INCREASE_KEY
+from .._compiler.cute.strategies import TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY
+from .._compiler.cute.strategies import Tcgen05LayoutStrategy
+from .._compiler.cute.strategies import Tcgen05PersistenceModel
+from .._compiler.cute.strategies import Tcgen05Strategy
+from .._compiler.cute.strategies import derive_persistence_model_from_pid_type
+from .._compiler.cute.strategies import layout_overrides_from_config
+from .._compiler.cute.strategies import validate_tcgen05_strategy_invariants
+from .._compiler.cute.strategies import warp_spec_from_config
 from .._compiler.cute.tcgen05_constants import TCGEN05_AB_CONSUMER_PHASE_MODE_CONFIG_KEY
 from .._compiler.cute.tcgen05_constants import TCGEN05_AB_CONSUMER_PHASE_MODE_NORMAL
 from .._compiler.cute.tcgen05_constants import TCGEN05_AB_CONSUMER_PHASE_MODES
@@ -212,11 +232,17 @@ def _get_backend_tunable_keys() -> frozenset[str]:
 
 
 BACKEND_TUNABLE_KEYS: frozenset[str] = _get_backend_tunable_keys()
+# Strategy/warp-spec/layout-overrides keys: G2-A's data-model knobs.
+# These are CuTe-specific and live alongside the existing tcgen05 keys.
+# Validation runs in ``ConfigSpec.normalize`` (cross-fragment) and is gated
+# by ``cute_tcgen05_search_enabled`` like the other tcgen05 fields.
+_BACKEND_STRATEGY_CONFIG_KEYS: frozenset[str] = frozenset(TCGEN05_STRATEGY_CONFIG_KEYS)
 # All config keys whose support depends on the backend.  The base Backend
 # class rejects these by default; each backend subclass opts in selectively.
 BACKEND_SPECIFIC_KEYS: frozenset[str] = (
     BACKEND_TUNABLE_KEYS
     | _BACKEND_DIAGNOSTIC_CONFIG_KEYS
+    | _BACKEND_STRATEGY_CONFIG_KEYS
     | {
         "num_threads",
         "pallas_loop_type",
@@ -251,6 +277,7 @@ VALID_KEYS: frozenset[str] = frozenset(
         "advanced_controls_file",
         "epilogue_subtile",
         *_BACKEND_DIAGNOSTIC_CONFIG_KEYS,
+        *_BACKEND_STRATEGY_CONFIG_KEYS,
     ]
 )
 VALID_PALLAS_LOOP_TYPES = ("emit_pipeline", "unroll", "fori_loop")
@@ -820,6 +847,189 @@ class ConfigSpec:
             "tcgen05_num_epi_warps": num_epi_warps_fragment,
         }
 
+    def _tcgen05_strategy_autotune_fragments(
+        self,
+    ) -> dict[str, ConfigSpecFragment]:
+        """Per-fragment validators included in ``_flat_fields()``.
+
+        These are the strategy keys the autotuner *searches* over.
+        ``tcgen05_persistence_model`` is intentionally **not** here —
+        it is fully derived from ``pid_type`` (see
+        ``derive_persistence_model_from_pid_type``) so giving it its
+        own flat-config slot would mean a default-flat with
+        ``non_persistent`` paired with ``pid_type=persistent_blocked``
+        (e.g. when ``autotune_force_persistent`` removes ``flat`` /
+        ``xyz`` from ``allowed_pid_types``), which the cross-fragment
+        validator would then rewrite via ``_fix_invalid``, breaking
+        ``flatten(unflatten(default_flat())) == default_flat()``.
+        Until a strategy decouples persistence from ``pid_type`` it
+        stays a derived field in the validation surface only.
+
+        The autotune surface is narrowed to *implemented* values
+        today: only ``ROLE_LOCAL_MONOLITHIC`` is wired through codegen
+        (G2-C lifts to ``ROLE_LOCAL_WITH_SCHEDULER``); only ``DEFAULT``
+        layout strategy is wired (G2-E broadens to
+        ``EXPLICIT_EPI_TILE``). Allowing wider values would silently
+        steer the autotuner onto the same monolithic kernel and
+        produce benchmark noise unrelated to the strategy choice —
+        same loud-failure principle as
+        ``restrict_tcgen05_num_epi_warps_*``.
+
+        ``epi_warps`` is *not* a separate fragment here — it lives in
+        the existing ``tcgen05_num_epi_warps`` field. See
+        ``warp_spec_from_config`` for the read site.
+        """
+        return {
+            TCGEN05_STRATEGY_CONFIG_KEY: EnumFragment(
+                (Tcgen05Strategy.ROLE_LOCAL_MONOLITHIC.value,)
+            ),
+            TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY: EnumFragment(
+                (Tcgen05LayoutStrategy.DEFAULT.value,)
+            ),
+            # ``mma_warps`` is forced to 1 by the tcgen05 atom contract
+            # today; broaden when a strategy needs more.
+            TCGEN05_WARP_SPEC_MMA_WARPS_KEY: EnumFragment((1,)),
+            # ``ab_load_warps`` and ``epi_load_warps`` are knobs that
+            # G2-C will exercise. Until then, narrow to the value the
+            # implemented strategy uses.
+            TCGEN05_WARP_SPEC_AB_LOAD_WARPS_KEY: EnumFragment((1,)),
+            TCGEN05_WARP_SPEC_EPI_LOAD_WARPS_KEY: EnumFragment((0,)),
+            # ``scheduler_warps`` mirrors the strategy: 0 under
+            # MONOLITHIC, 1 under WITH_SCHEDULER. Until G2-C lands the
+            # second strategy, narrow to 0.
+            TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY: EnumFragment((0,)),
+            # Register split is currently fixed at the role-local
+            # MONOLITHIC values. G2-C/G2-E may broaden.
+            TCGEN05_WARP_SPEC_REGISTER_DECREASE_KEY: EnumFragment(
+                (ROLE_LOCAL_MONOLITHIC_DEFAULT_WARP_SPEC.register_split[0],)
+            ),
+            TCGEN05_WARP_SPEC_REGISTER_INCREASE_KEY: EnumFragment(
+                (ROLE_LOCAL_MONOLITHIC_DEFAULT_WARP_SPEC.register_split[1],)
+            ),
+        }
+
+    def _tcgen05_strategy_validation_fragments(
+        self,
+    ) -> dict[str, ConfigSpecFragment]:
+        """Per-fragment validators applied to the *user-config surface*.
+
+        Superset of ``_tcgen05_strategy_autotune_fragments``: adds the
+        derived-but-still-validated ``tcgen05_persistence_model`` key.
+        A user-supplied ``helion.Config(..., tcgen05_persistence_model=N)``
+        is rejected via this entry if N is not in the implemented set,
+        even though the autotune surface never samples the field —
+        the validation here is a defensive guard against contract
+        drift between user configs and codegen.
+
+        Strategy-conditional invariants that span multiple fragments
+        (e.g. ``scheduler_warps=1`` only legal under
+        ``ROLE_LOCAL_WITH_SCHEDULER``, total warp counts forming
+        clean warpgroups, persistence model contradicting ``pid_type``)
+        are checked separately by
+        ``_validate_tcgen05_strategy_invariants_in_normalize``,
+        mirroring the pattern of
+        ``narrow_tcgen05_autotune_to_validated_configs``.
+        """
+        fragments = self._tcgen05_strategy_autotune_fragments()
+        # Persistence model: validation accepts the same set the
+        # cross-fragment invariant accepts. ``DYNAMIC_PERSISTENT`` is
+        # never in the autotune surface (no codegen) so a user
+        # explicit value is the only way to reach the contradiction
+        # invariant, which the validator then rejects.
+        fragments[TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY] = EnumFragment(
+            (
+                Tcgen05PersistenceModel.NON_PERSISTENT.value,
+                Tcgen05PersistenceModel.STATIC_PERSISTENT.value,
+            )
+        )
+        return fragments
+
+    @staticmethod
+    def _tcgen05_strategy_field_default(key: str, *, pid_type: object = None) -> object:
+        """Default value for a strategy data-model field.
+
+        ``ROLE_LOCAL_MONOLITHIC`` is the strategy default; the warp
+        spec defaults match today's 6-warp role-local lowering. Layout
+        strategy defaults to ``DEFAULT``. The persistence model
+        default is *derived* from the active ``pid_type`` so that
+        serialized configs cannot carry contradictory state (e.g.
+        ``pid_type=flat`` paired with ``static_persistent``); the
+        cross-fragment validator separately enforces the same
+        agreement when the user supplies an explicit value. Keep this
+        mapping aligned with the constants in
+        ``helion/_compiler/cute/strategies.py``.
+        """
+        if key == TCGEN05_STRATEGY_CONFIG_KEY:
+            return Tcgen05Strategy.ROLE_LOCAL_MONOLITHIC.value
+        if key == TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY:
+            return derive_persistence_model_from_pid_type(pid_type).value
+        if key == TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY:
+            return Tcgen05LayoutStrategy.DEFAULT.value
+        if key in TCGEN05_WARP_SPEC_DEFAULTS_BY_KEY:
+            return TCGEN05_WARP_SPEC_DEFAULTS_BY_KEY[key]
+        raise KeyError(f"Unknown tcgen05 strategy field: {key!r}")
+
+    def _validate_tcgen05_strategy_invariants_in_normalize(
+        self,
+        config: dict[str, object],
+        *,
+        _fix_invalid: bool,
+    ) -> None:
+        """Cross-fragment invariants for the tcgen05 strategy data model.
+
+        Mirrors ``narrow_tcgen05_autotune_to_validated_configs``: a
+        single helper called from ``normalize`` with the rationale
+        documented in one place. Today's
+        ``_tcgen05_optional_fragments`` only validates each fragment
+        independently; strategy-conditional invariants
+        (``scheduler_warps=1`` only legal under
+        ``ROLE_LOCAL_WITH_SCHEDULER``, total warps must form clean
+        warpgroups, persistence model must agree with ``pid_type``)
+        span multiple fragments and live here.
+        """
+        # Resolve enums from string config values. Per-fragment
+        # validation has already accepted these so the lookups cannot
+        # raise ValueError unless the caller bypassed normalization.
+        strategy = Tcgen05Strategy(config[TCGEN05_STRATEGY_CONFIG_KEY])
+        persistence_model = Tcgen05PersistenceModel(
+            config[TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY]
+        )
+        layout_strategy = Tcgen05LayoutStrategy(
+            config[TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY]
+        )
+        warp_spec = warp_spec_from_config(config)
+        layout_overrides = layout_overrides_from_config(config)
+
+        errors = validate_tcgen05_strategy_invariants(
+            strategy=strategy,
+            persistence_model=persistence_model,
+            layout_strategy=layout_strategy,
+            warp_spec=warp_spec,
+            layout_overrides=layout_overrides,
+            pid_type=config.get("pid_type"),
+        )
+        if not errors:
+            return
+        if _fix_invalid:
+            # Reset every strategy field to its documented default so a
+            # later pass converges. Mirrors the silent-fix path used by
+            # other tcgen05 validators (e.g. cluster_m=2 search
+            # canonicalization) which roll back to the validated seed
+            # rather than try to repair partial states. ``pid_type`` is
+            # forwarded so the persistence-model default agrees with
+            # the active pid_type.
+            pid_type = config.get("pid_type")
+            for key in TCGEN05_STRATEGY_CONFIG_KEYS:
+                if key in TCGEN05_LAYOUT_OVERRIDES_KEYS:
+                    config[key] = None
+                else:
+                    config[key] = self._tcgen05_strategy_field_default(
+                        key, pid_type=pid_type
+                    )
+            return
+        message = "; ".join(errors)
+        raise InvalidConfig(f"tcgen05 strategy invariants violated: {message}")
+
     @staticmethod
     def _validate_optional_fragment_value(
         name: str, fragment: ConfigSpecFragment, value: object
@@ -1050,6 +1260,28 @@ class ConfigSpec:
                     config[key] = tcgen05_optional_search_fragments[key].default()
         else:
             for key in tcgen05_optional_fragments:
+                if key not in config:
+                    continue
+                if _fix_invalid:
+                    config.pop(key, None)
+                else:
+                    raise InvalidConfig(
+                        f"{key} is only supported for tcgen05-enabled CuTe matmul kernels"
+                    )
+
+        # Strategy data-model defaulting + cross-fragment validation
+        # is deferred until after ``pid_type`` has been defaulted and
+        # the cluster_m fixups have rewritten it. Reject the keys
+        # eagerly when ``cute_tcgen05_search_enabled`` is False so
+        # other-backend users get the loud error early; the
+        # search-enabled defaulting/validation runs below the
+        # ``pid_type`` canonicalization.
+        strategy_validation_fragments = self._tcgen05_strategy_validation_fragments()
+        if not self.cute_tcgen05_search_enabled:
+            for key in (
+                *strategy_validation_fragments.keys(),
+                *TCGEN05_LAYOUT_OVERRIDES_KEYS,
+            ):
                 if key not in config:
                     continue
                 if _fix_invalid:
@@ -1323,6 +1555,77 @@ class ConfigSpec:
             self._fix_tcgen05_cluster_m2_search_config(config)
             self._fix_tcgen05_cluster_m1_persistent_search_config(config)
 
+        # Strategy data-model fragments (G2-A). Each per-fragment
+        # validator runs first (type/range checks); cross-fragment
+        # invariants run afterwards via
+        # ``_validate_tcgen05_strategy_invariants_in_normalize``. This
+        # block runs *after* the ``pid_type`` default is set and after
+        # ``_fix_tcgen05_cluster_m{1,2}_*_search_config`` may have
+        # rewritten ``pid_type`` — so the persistence-model default
+        # tracks the *final* ``pid_type`` and re-normalizing a
+        # normalized config is idempotent (the contradiction-with-
+        # pid_type invariant cannot trip on a config produced by
+        # this function).
+        if self.cute_tcgen05_search_enabled:
+            pid_type_for_default = config.get("pid_type")
+            # Validate every key in the *validation* surface (which
+            # includes ``tcgen05_persistence_model``); user-explicit
+            # values for any of these still go through fragment
+            # checks. The narrower *autotune* surface controls only
+            # which fields land in ``_flat_fields()``.
+            #
+            # ``_validate_optional_fragment_value`` raises
+            # ``InvalidConfig`` regardless of ``_fix_invalid`` —
+            # consistent with the equivalent
+            # ``tcgen05_optional_fragments`` block above. The
+            # autotuner only samples values from
+            # ``_tcgen05_strategy_autotune_fragments`` (which is the
+            # validation set minus ``tcgen05_persistence_model``), so
+            # fragment-level rejection is unreachable from autotune in
+            # practice — only an explicit user config can land here
+            # with a bad value, and we want that to fail loudly.
+            for key, fragment in strategy_validation_fragments.items():
+                if key in config:
+                    config[key] = self._validate_optional_fragment_value(
+                        key, fragment, config[key]
+                    )
+                else:
+                    # ``ROLE_LOCAL_MONOLITHIC`` and the pinned 6-warp
+                    # spec are the documented G2-A defaults
+                    # (cute_plan.md §6.1); the persistence-model
+                    # default is derived from ``pid_type`` so
+                    # serialized configs cannot encode contradictions.
+                    config[key] = self._tcgen05_strategy_field_default(
+                        key, pid_type=pid_type_for_default
+                    )
+            # Layout-overrides default to None and are not normalized
+            # via fragments (an explicit None value cannot pass
+            # IntegerFragment validation). Validate types only — the
+            # accept-set is "non-negative int or None" rather than
+            # ">0 or None" because ``smem_swizzle_*`` fields plausibly
+            # encode "no swizzle" as ``0`` once codegen consumes them
+            # in G2-E. Atom-contract checks (e.g. valid epi-tile
+            # divisibility against the active problem shape) run in
+            # lowering, not here.
+            for key in TCGEN05_LAYOUT_OVERRIDES_KEYS:
+                if key in config:
+                    value = config[key]
+                    if value is not None and not (type(value) is int and value >= 0):
+                        if _fix_invalid:
+                            config[key] = None
+                        else:
+                            raise InvalidConfig(
+                                f"{key} must be a non-negative integer or None, "
+                                f"got {value!r}"
+                            )
+                else:
+                    config[key] = None
+            # Cross-fragment invariants. Run after every field has been
+            # filled in so the validator sees the full picture.
+            self._validate_tcgen05_strategy_invariants_in_normalize(
+                config, _fix_invalid=_fix_invalid
+            )
+
         if self.supports_config_key("num_sm_multiplier"):
             # Validate num_sm_multiplier is a power of two in range
             if "num_sm_multiplier" in config:
@@ -1589,6 +1892,15 @@ class ConfigSpec:
             if self.cute_tcgen05_search_enabled:
                 fields["l2_groupings"] = self.l2_groupings
                 fields.update(self._tcgen05_optional_fragments(for_search=True))
+                # Strategy data-model knobs (G2-A). The autotune
+                # surface is narrowed to the implemented set so the
+                # autotuner samples only kernel shapes that codegen
+                # can produce. ``tcgen05_persistence_model`` is
+                # excluded — it is fully derived from ``pid_type``
+                # and including it would break flat round-trip
+                # idempotence (see
+                # ``_tcgen05_strategy_autotune_fragments`` docstring).
+                fields.update(self._tcgen05_strategy_autotune_fragments())
                 if self.supports_config_key("pid_type"):
                     fields["pid_type"] = EnumFragment(self.allowed_pid_types)
                 if self.supports_config_key("indexing") and self.indexing.length > 0:
