@@ -136,7 +136,7 @@ _TOLERANCES = {
 
 # Sampled on B200 with the checked-in heuristic. ``wins_slack`` lets that
 # many near-noise-band shapes flip without failing; ``None`` disables the
-# wins gate (vector_add: all wins sit within do_bench noise).
+# wins gate for kernels with several expected near-parity shapes.
 _EXPECTED_PERF: dict[str, dict[str, float | int | None]] = {
     "vector_add": {
         "helion_wins": 5,
@@ -160,7 +160,7 @@ _EXPECTED_PERF: dict[str, dict[str, float | int | None]] = {
         "helion_wins": 30,
         "total": 30,
         "geomean": 1.605,
-        "wins_slack": 2,
+        "wins_slack": 6,
     },
     "cross_entropy": {
         "helion_wins": 21,

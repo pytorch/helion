@@ -114,6 +114,7 @@ class TestAutotuneIgnoreErrors(TestCase):
             format_kernel_decorator=lambda config, s: "decorator",
             to_triton_code=lambda config: "code",
             maybe_log_repro=lambda log_func, args, config=None: None,
+            supports_subprocess_benchmark=lambda: False,
         )
         search.args = args
         search.log = AutotuningLogger(settings)
@@ -3027,6 +3028,7 @@ class TestAutotuneBudget(TestCase):
             format_kernel_decorator=lambda config, s: "decorator",
             to_triton_code=lambda config: "code",
             maybe_log_repro=lambda log_func, args, config=None: None,
+            supports_subprocess_benchmark=lambda: False,
         )
         search.args = ()
         search.log = AutotuningLogger(settings)

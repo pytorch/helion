@@ -134,6 +134,9 @@ class _FusionAutotuneAdapter:
     def extra_cache_key(self) -> str:
         return self._fusion_context_hash
 
+    def supports_subprocess_benchmark(self) -> bool:
+        return False
+
 
 class HelionTemplateBuffer(TemplateBuffer):
     """Inductor template buffer for Helion kernel."""

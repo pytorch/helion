@@ -71,6 +71,9 @@ class TestErrors(RefEagerTestDisabled, TestCase):
             ) -> str:
                 return ""
 
+            def supports_subprocess_benchmark(self) -> bool:
+                return False
+
             @property
             def env(self):
                 return _FakeEnv(device=DEVICE)
@@ -673,6 +676,9 @@ def _make_fake_kernel():
             output_origin_lines: bool | None = None,
         ) -> str:
             return ""
+
+        def supports_subprocess_benchmark(self) -> bool:
+            return False
 
         @property
         def env(self):
