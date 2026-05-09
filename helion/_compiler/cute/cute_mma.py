@@ -2247,6 +2247,24 @@ def _emit_mma_pipeline(
         )
         candidate_block_shape = tcgen05_matmul_plan.block_shape
         df.register_cute_tcgen05_matmul_plan(tcgen05_matmul_plan)
+        if fx_node is not None:
+            # Invariant: the registered matmul fx_node lives inside a
+            # K-loop body subgraph (one of the registered codegen
+            # graphs), so the cute_fx_walk carrier walker reaches it
+            # via ``_phi.args[1]`` (body branch), never
+            # ``_phi.args[0]`` (init value, e.g. ``hl.zeros``). This
+            # holds structurally because ``_emit_mma_pipeline`` only
+            # emits the MMA into the loop body — there is no path
+            # where the matmul appears as the phi's init value. The
+            # walker's ``_phi.args[1]``-only descent depends on this
+            # invariant; pinning it here prevents a future
+            # ``_emit_mma_pipeline`` refactor from registering an
+            # off-graph node and silently breaking the walker's
+            # fast-path.
+            assert any(fx_node.graph is gi.graph for gi in cg.codegen_graphs), (
+                "matmul fx_node graph must be a registered codegen graph"
+            )
+            df.cute_tcgen05_matmul_fx_nodes.add(fx_node)
         if (
             candidate_block_shape[0]
             * candidate_block_shape[1]
@@ -3676,6 +3694,13 @@ def _emit_mma_pipeline(
                 epi_elem_dtype_str=epi_elem_dtype_str,
             ),
         )
+        if fx_node is not None:
+            # Map the matmul fx_node -> result_var so the G3.1.1 fused
+            # epilogue splice path can reuse the existing
+            # `CuteTcgen05StoreValue` registration via a backward FX
+            # walk from the user's store value through a whitelisted
+            # unary chain to this matmul fx_node.
+            df.cute_tcgen05_matmul_fx_node_result_vars[fx_node] = result_var
     else:
         # Each thread reads its own (m, n) element from shared memory.
         suffix.append(

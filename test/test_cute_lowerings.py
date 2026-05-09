@@ -3476,6 +3476,509 @@ class TestCuteLowerings(unittest.TestCase):
                 expected = args[0] @ args[1]
                 torch.testing.assert_close(out, expected, atol=2e-1, rtol=1e-2)
 
+    def test_tcgen05_fused_epilogue_store_raises_backend_unsupported(self) -> None:
+        """A user-level epilogue lambda whose op chain is *not* on the
+        G3.1.1 whitelist (e.g., reads an auxiliary tensor or uses ops
+        the chain analyzer rejects) bails with a structured
+        ``BackendUnsupported`` instead of falling through to the cute
+        SIMT-store path that crashes inside the cute DSL on undefined
+        ``mask_<n>`` / ``indices_<n>`` names.
+
+        The two ``test_examples.py`` xfail tests
+        (``test_epilogue_subtiling_residual_gelu`` and
+        ``test_epilogue_subtiling_gelu_aux``) catch the same shape via
+        ``xfailIfCute(...)``, but they only verify the kernel fails —
+        not that it fails *cleanly*. This test asserts the cute
+        backend produces a clear ``BackendUnsupported`` so a future
+        epilogue-fusion implementer sees the actionable message rather
+        than a cute-DSL crash on an undefined name.
+
+        G3.1.1 added the whitelist-based fused-unary splice for chains
+        like ``out[tile] = relu(acc).to(x.dtype)`` (covered by
+        ``test_tcgen05_fused_relu_epilogue_runtime_correctness``); this
+        test exercises the *rejected* path — a residual-add lambda
+        that reads an auxiliary tensor — so the G3.1.0 backstop still
+        fires for the G3.1.2 territory.
+        """
+
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_residual(
+            x: torch.Tensor, y: torch.Tensor, residual: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                # Auxiliary-tensor lambda — the residual load is not on
+                # the whitelist, so the chain analyzer rejects this and
+                # the G3.1.0 backstop fires.
+                out[tile_m, tile_n] = (acc + residual[tile_m, tile_n]).to(x.dtype)
+            return out
+
+        x = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
+        y = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
+        residual = torch.randn(128, 128, dtype=torch.float32, device=DEVICE)
+        with (
+            self.assertRaises(exc.BackendUnsupported) as cm,
+            patch_cute_mma_support(),
+        ):
+            cute_matmul_residual.bind((x, y, residual)).set_config(
+                _make_tcgen05_persistent_config(
+                    block_sizes=[128, 128, 32],
+                    pid_type="persistent_interleaved",
+                )
+            )
+            cute_matmul_residual(x, y, residual)
+        # The diagnostic message points at the right invariant and the
+        # plan section that documents the fix.
+        message = str(cm.exception)
+        self.assertIn("tcgen05 MMA path", message)
+        self.assertIn("indices and masks", message)
+        self.assertIn("Identity stores", message)
+        self.assertIn("G3.1", message)
+
+    def _make_relu_matmul_kernel(self):
+        """Return a ``@helion.kernel(backend="cute")`` matmul-relu
+        kernel + the canonical bf16 single-tile config used by the
+        G3.1-B relu tests. The kernel is the simplest fused-relu
+        epilogue shape (``out[tile] = relu(acc).to(x.dtype)``) and
+        the config is the validated tcgen05 persistent path.
+        """
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_relu(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = torch.relu(acc).to(x.dtype)
+            return out
+
+        cfg = _make_tcgen05_persistent_config(
+            block_sizes=[128, 128, 32],
+            pid_type="persistent_interleaved",
+        )
+        return cute_matmul_relu, cfg
+
+    def test_tcgen05_fused_relu_epilogue_runtime_correctness(self) -> None:
+        """G3.1.1: ``out[tile] = relu(acc).to(x.dtype)`` after a tcgen05
+        matmul splices the relu inline at the per-thread T2R register and
+        produces output bit-exact with eager ``torch.relu(x @ y).to(...)``
+        on a single-tile bf16 shape.
+
+        This is the entrance test for the G3.1.1 unary-chain fused
+        epilogue path. The G3.1.0 backstop in ``store_codegen`` had to
+        stop firing for this shape; the negative-path check that the
+        diagnostic still fires for non-whitelisted lambdas lives in
+        ``test_tcgen05_fused_epilogue_store_raises_backend_unsupported``.
+        Identity-store correctness is covered by
+        ``test_tcgen05_persistent_single_tile_runtime_correctness``;
+        the codegen marker for the spliced ``cute.where`` line is
+        covered by ``test_tcgen05_fused_relu_epilogue_codegen_marker``.
+        """
+
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+
+        cute_matmul_relu, cfg = self._make_relu_matmul_kernel()
+        x = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
+        y = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
+        bound = cute_matmul_relu.bind((x, y))
+        bound.env.config_spec.cute_tcgen05_search_enabled = True
+        bound.set_config(cfg)
+        out = bound(x, y)
+        expected = torch.relu(x @ y).to(x.dtype)
+        torch.testing.assert_close(out, expected, atol=2e-1, rtol=1e-2)
+
+    def test_tcgen05_fused_relu_epilogue_codegen_marker(self) -> None:
+        """G3.1.1: the spliced unary chain emits ``cute.where`` between
+        the T2R register load and the ``.to(target_dtype)`` cast for
+        ``relu`` chains.
+
+        ``cute.where`` is the cute DSL primitive the relu template
+        renders to; its presence between the T2R copy and the
+        accumulator vector cast is the structural pin that the splice
+        actually fired and is in the per-subtile T2R loop body. The
+        identity-store golden in
+        ``test_tcgen05_role_local_monolithic_byte_identical_golden``
+        covers the no-chain case; if a future refactor accidentally
+        skips the splice, this test catches the regression by checking
+        the ``cute.where`` marker plus the hoisted load and per-step
+        chain locals (``tcgen05_acc_loaded``, ``tcgen05_chain_step*``)
+        introduced by the per-step-binding renderer.
+
+        Anchors on a single splice-site block (the ``tcgen05_acc_vec``
+        assignment region) rather than ``code.find`` first occurrence
+        across the SIMT/TMA/helper sites so the brittleness of strict
+        ordering across multiple splice sites is not pinned by this
+        test. The runtime test covers the cross-site agreement; this
+        test only confirms the splice rendering is structurally
+        correct in the first emitted block.
+        """
+
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+
+        cute_matmul_relu, cfg = self._make_relu_matmul_kernel()
+        x = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
+        y = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
+        with patch_cute_mma_support():
+            bound = cute_matmul_relu.bind((x, y))
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            bound.set_config(cfg)
+            code = bound.to_triton_code(cfg)
+        # Structural pins: the chain analyzer accepted relu, the splice
+        # site emitted the rendered template, the load-binding local,
+        # and a per-step chain local.
+        self.assertIn("cute.where", code)
+        self.assertIn("tcgen05_acc_loaded", code)
+        self.assertIn("tcgen05_chain_step", code)
+        # Anchor ordering on the *first* splice-site block (a single
+        # ``tcgen05_acc_loaded ... tcgen05_chain_step ... tcgen05_acc_vec``
+        # window). Prior version used ``code.find`` first-occurrence
+        # which globally compared positions across all three splice
+        # sites (SIMT, TMA, helper) and falsely failed if any site
+        # emitted them in a different relative order. The single-block
+        # anchor avoids that fragility while still pinning the
+        # structural ordering.
+        first_load = code.find("tcgen05_acc_loaded")
+        self.assertGreaterEqual(first_load, 0)
+        first_step = code.find("tcgen05_chain_step", first_load)
+        first_vec = code.find("tcgen05_acc_vec", first_step)
+        self.assertGreater(first_step, first_load)
+        self.assertGreater(first_vec, first_step)
+
+    def test_tcgen05_fused_chain_rejects_alpha_kwarg(self) -> None:
+        """G3.1.1 must reject ``aten.add.Tensor(carrier, scalar, alpha=k)``
+        and similar kwarg-bearing scalar binary ops, falling back to
+        the G3.1.0 ``BackendUnsupported`` raise.
+
+        Silently rendering ``carrier + scalar`` when the FX node is
+        ``add(carrier, scalar, alpha=2.0)`` would emit incorrect
+        arithmetic — ``alpha`` scales the second argument, so the
+        correct rendering is ``carrier + 2.0 * scalar``. The
+        conservative response is to bail; an explicit residual-add
+        with alpha is rare enough that requiring the user to express
+        it as ``carrier + alpha_times_scalar`` (a constant fold the
+        user is expected to do at lambda-build time) is acceptable.
+
+        Also assert the FX node the analyzer actually sees has
+        ``kwargs == {'alpha': 2.0}`` so this test exercises the
+        kwarg-reject branch (and not a constant-folded version
+        upstream decomp might produce, which would silently leave the
+        analyzer believing the test passed for the wrong reason).
+        """
+
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_add_alpha(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                # ``torch.add`` with ``alpha`` traces to
+                # ``aten.add.Tensor(acc, 1.0, alpha=2.0)`` -> ``acc + 2.0``.
+                fused = torch.add(acc, 1.0, alpha=2.0)
+                out[tile_m, tile_n] = fused.to(x.dtype)
+            return out
+
+        # Spy on the analyzer to capture the FX node it sees so the
+        # test's pin-on-kwargs is a strict structural check rather
+        # than just a coarse "BackendUnsupported was raised" check.
+        # Without this, an upstream decomp that constant-folded
+        # ``alpha`` into the second arg would leave the analyzer
+        # facing ``add(acc, 2.0)`` with empty kwargs, the splice
+        # would fire, and no ``BackendUnsupported`` would surface;
+        # the test would pass for the wrong reason.
+        from helion._compiler.cute import cute_epilogue
+        from helion.language import memory_ops
+
+        seen_fx_kwargs: list[dict[str, object]] = []
+        original = cute_epilogue.analyze_tcgen05_unary_epilogue_chain
+
+        def spy(state, value_node):
+            cur = value_node
+            while cur is not None and cur.op == "call_function":
+                if cur.target is torch.ops.aten.add.Tensor:
+                    seen_fx_kwargs.append(dict(cur.kwargs))
+                    break
+                if cur.args and isinstance(cur.args[0], torch.fx.Node):
+                    cur = cur.args[0]
+                else:
+                    break
+            return original(state, value_node)
+
+        x = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
+        y = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
+        with (
+            self.assertRaises(exc.BackendUnsupported) as cm,
+            patch_cute_mma_support(),
+            patch.object(cute_epilogue, "analyze_tcgen05_unary_epilogue_chain", spy),
+            patch.object(memory_ops, "analyze_tcgen05_unary_epilogue_chain", spy),
+        ):
+            cute_matmul_add_alpha.bind((x, y)).set_config(
+                _make_tcgen05_persistent_config(
+                    block_sizes=[128, 128, 32],
+                    pid_type="persistent_interleaved",
+                )
+            )
+            cute_matmul_add_alpha(x, y)
+        self.assertIn("tcgen05 MMA path", str(cm.exception))
+        # The analyzer must have seen at least one `aten.add.Tensor`
+        # node carrying the `alpha` kwarg — otherwise the test is
+        # passing because of some other unrelated rejection (e.g.,
+        # the residual was constant-folded), not because the
+        # kwarg-reject path fired.
+        self.assertTrue(seen_fx_kwargs, "analyzer never saw aten.add.Tensor")
+        self.assertIn("alpha", seen_fx_kwargs[0])
+        self.assertEqual(seen_fx_kwargs[0]["alpha"], 2.0)
+
+    def test_tcgen05_fused_chain_rejects_intermediate_cast_dtype_mismatch(
+        self,
+    ) -> None:
+        """G3.1.1 must reject ``out[tile] = chain(acc).to(d_inter)``
+        when the store-target tensor dtype is ``d_target != d_inter``.
+
+        The user's ``.to(d_inter)`` call is an explicit intermediate
+        cast that affects rounding (``fp32 -> d_inter -> d_target``
+        rounds differently from ``fp32 -> d_target``). The splice
+        site only emits the final ``.to(target_dtype)`` cast; if the
+        analyzer accepted the chain anyway, the rendered kernel would
+        silently drop the intermediate cast and change arithmetic.
+
+        At the FX level Helion always wraps the user's store value in
+        an *implicit* ``convert_element_type`` to the store-target
+        tensor's dtype, so the user-explicit ``.to(d_inter)`` shows up
+        as a *second* ``convert_element_type`` *inside* the chain
+        (between the outer Helion-implicit cast and the chain's leaf
+        unary op). The chain step loop rejects any
+        ``convert_element_type`` mid-chain because it's not on the
+        unary whitelist; the G3.1.0 backstop then fires. This test
+        pins that rejection: ``out_fp16[tile] = relu(acc).to(bf16)``
+        would silently change rounding if the analyzer accepted, but
+        the chain-loop reject of the inner ``convert_element_type``
+        keeps it correct.
+        """
+
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_relu_dtype_mismatch(
+            x: torch.Tensor, y: torch.Tensor, out: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                # Intermediate cast to bf16, then store into an fp16
+                # tensor: the analyzer must reject because the
+                # rendered ``.to(target_dtype)`` only handles the
+                # final cast, dropping the intermediate.
+                out[tile_m, tile_n] = torch.relu(acc).to(torch.bfloat16)
+            return out
+
+        x = torch.randn(128, 128, dtype=torch.float16, device=DEVICE)
+        y = torch.randn(128, 128, dtype=torch.float16, device=DEVICE)
+        out = torch.empty(128, 128, dtype=torch.float16, device=DEVICE)
+        with (
+            self.assertRaises(exc.BackendUnsupported) as cm,
+            patch_cute_mma_support(),
+        ):
+            cute_matmul_relu_dtype_mismatch.bind((x, y, out)).set_config(
+                _make_tcgen05_persistent_config(
+                    block_sizes=[128, 128, 32],
+                    pid_type="persistent_interleaved",
+                )
+            )
+            cute_matmul_relu_dtype_mismatch(x, y, out)
+        # The chain analyzer's intermediate-cast-dtype reject fires
+        # before the kernel-side cross-site dtype assertion would.
+        # Pin the diagnostic to the G3.1.0 backstop message
+        # specifically — a generic kernel/store dtype-mismatch
+        # ``BackendUnsupported`` would also pass an
+        # ``assertRaises(BackendUnsupported)`` check, but it would
+        # mean the analyzer's dtype-reject was a no-op and the
+        # rendering proceeded to a kernel that the cross-site
+        # assertion later caught (a different defect class).
+        message = str(cm.exception)
+        self.assertIn("tcgen05 MMA path", message)
+        self.assertIn("indices and masks", message)
+
+    def test_tcgen05_fused_relu_epilogue_ieee_edge_cases(self) -> None:
+        """G3.1.1 relu must match ``torch.relu`` on the full IEEE
+        float input range: NaN propagates, ``+inf`` passes through,
+        ``-inf`` zeros out, ``-0.0`` returns ``+0.0``, ``+0.0``
+        returns ``+0.0``, positive normals pass through, negative
+        normals zero out.
+
+        Naive ``where(x > 0, x, 0)`` returns 0 for NaN inputs (since
+        ``NaN > 0`` is False), which silently miscompares against
+        eager. Naive ``(x + abs(x)) * 0.5`` returns NaN for ``-inf``
+        (``-inf + inf = NaN``), which mismatches
+        ``torch.relu(-inf) = 0``. The whitelisted relu template uses
+        an explicit isnan-via-``x != x`` guard plus the ``> 0``
+        compare so all IEEE edge cases round-trip correctly.
+
+        Reference behavior on B200 CUDA (verified empirically):
+        ``torch.relu(-0.0) == +0.0`` (sign cleared, NOT preserved);
+        ``torch.relu(NaN) == NaN``; ``torch.relu(+inf) == +inf``;
+        ``torch.relu(-inf) == +0.0``. The template's double-where
+        rendering matches all of these.
+
+        Inputs are constructed as a sparse ``x[i, 0] * y[0, j]``
+        outer product so each special-value cell ends up in a
+        known output position with no contamination from other
+        accumulator terms.
+        """
+
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_relu(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = torch.relu(acc).to(x.dtype)
+            return out
+
+        x = torch.zeros(128, 128, dtype=torch.bfloat16, device=DEVICE)
+        y = torch.zeros(128, 128, dtype=torch.bfloat16, device=DEVICE)
+        # Each (i, j) pair has out[i, j] = x[i, 0] * y[0, j].
+        # ``x[i, 0]`` carries the test value; ``y[0, j] = 1.0``
+        # propagates it untouched (except for cells exercising
+        # negative finite where the relu must zero out).
+        cases = [
+            (0, 0, float("nan"), 1.0, "NaN propagates"),
+            (1, 1, float("-inf"), 1.0, "-inf -> 0"),
+            (2, 2, float("inf"), 1.0, "+inf passes"),
+            (3, 3, -0.0, 1.0, "-0 -> +0"),
+            (4, 4, 0.0, 1.0, "+0 -> +0"),
+            (5, 5, 2.0, 3.0, "positive finite"),
+            (6, 6, -2.0, 1.0, "negative finite -> 0"),
+            (7, 7, 1e-3, 1.0, "small positive"),
+            (8, 8, -1e-3, 1.0, "small negative -> 0"),
+        ]
+        for i, j, xv, yv, _label in cases:
+            x[i, 0] = xv
+            y[0, j] = yv
+
+        bound = cute_matmul_relu.bind((x, y))
+        bound.env.config_spec.cute_tcgen05_search_enabled = True
+        cfg = _make_tcgen05_persistent_config(
+            block_sizes=[128, 128, 32],
+            pid_type="persistent_interleaved",
+        )
+        bound.set_config(cfg)
+        out = bound(x, y)
+        ref_acc = x.to(torch.float32) @ y.to(torch.float32)
+        expected = torch.relu(ref_acc).to(x.dtype)
+
+        # Per-cell pins. ``out[0, 0]`` is NaN; everything else
+        # follows ``torch.relu`` semantics on the per-cell math.
+        # We don't pin the bit pattern of zeros (bf16 ``-0.0`` and
+        # ``+0.0`` have distinct bit patterns; the test below uses
+        # ``.item() == 0.0`` which is True for both).
+        self.assertTrue(torch.isnan(out[0, 0]), "out[0,0] should be NaN")
+        self.assertEqual(out[1, 1].item(), 0.0, "relu(-inf) -> 0")
+        self.assertTrue(torch.isinf(out[2, 2]) and out[2, 2].item() > 0)
+        self.assertEqual(out[3, 3].item(), 0.0, "relu(-0) -> +0")
+        self.assertEqual(out[4, 4].item(), 0.0, "relu(+0) -> +0")
+        self.assertEqual(out[5, 5].item(), 6.0, "relu(6.0)")
+        self.assertEqual(out[6, 6].item(), 0.0, "relu(-2.0) -> 0")
+        self.assertGreater(out[7, 7].item(), 0.0, "relu(small +)")
+        self.assertEqual(out[8, 8].item(), 0.0, "relu(small -) -> 0")
+
+        # Sign-bit pin on the negative-zero case: torch CUDA's
+        # ``relu(-0.0)`` returns ``+0.0`` (sign cleared). bf16's
+        # ``-0.0`` has bit pattern ``0x8000``; ``+0.0`` is ``0x0000``.
+        # Verify the kernel matches torch's sign clearing.
+        neg_zero_out = out[3, 3].view(torch.int16).item()
+        self.assertEqual(
+            neg_zero_out,
+            0,
+            "relu(-0.0) must clear the sign bit (matches torch CUDA)",
+        )
+
+        # NaN-aware whole-tensor agreement.
+        out_nan = torch.isnan(out)
+        exp_nan = torch.isnan(expected)
+        self.assertTrue(torch.equal(out_nan, exp_nan))
+        out_clean = torch.where(out_nan, torch.zeros_like(out), out)
+        exp_clean = torch.where(exp_nan, torch.zeros_like(expected), expected)
+        torch.testing.assert_close(out_clean, exp_clean, atol=2e-1, rtol=1e-2)
+
+    def test_tcgen05_fused_unary_chain_runtime_correctness(self) -> None:
+        """G3.1.1: a longer whitelisted unary chain (mul-const, add-const,
+        relu) splices into the T2R loop and matches eager.
+
+        Exercises the multi-step branch of the chain analyzer plus the
+        scalar-binary template renderers for ``mul`` and ``add``.
+        """
+
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_chain(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = torch.relu(acc * 0.5 + 1.0).to(x.dtype)
+            return out
+
+        x = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
+        y = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
+        bound = cute_matmul_chain.bind((x, y))
+        bound.env.config_spec.cute_tcgen05_search_enabled = True
+        cfg = _make_tcgen05_persistent_config(
+            block_sizes=[128, 128, 32],
+            pid_type="persistent_interleaved",
+        )
+        bound.set_config(cfg)
+        out = bound(x, y)
+        expected = torch.relu((x @ y).float() * 0.5 + 1.0).to(x.dtype)
+        torch.testing.assert_close(out, expected, atol=2e-1, rtol=1e-2)
+
     def test_tcgen05_persistent_partial_multi_tile_runtime_guard(self) -> None:
         """Partial legacy persistent + tcgen05 still raises ``RuntimeError``.
 

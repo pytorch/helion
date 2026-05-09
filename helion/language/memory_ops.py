@@ -16,6 +16,9 @@ from .._compiler.ast_extension import expr_from_string
 from .._compiler.ast_extension import statement_from_string
 from .._compiler.compile_environment import CompileEnvironment
 from .._compiler.compile_environment import _symint_expr
+from .._compiler.cute.cute_epilogue import Tcgen05UnaryEpilogueChain
+from .._compiler.cute.cute_epilogue import analyze_tcgen05_unary_epilogue_chain
+from .._compiler.cute.cute_fx_walk import reach_tcgen05_matmul_anchors
 from .._compiler.cute.cutedsl_compat import emit_dealloc_mbarrier_initialized_kwarg
 from .._compiler.cute.cutedsl_compat import emit_pipeline_advance
 from .._compiler.cute.cutedsl_compat import emit_producer_tail_tma_umma
@@ -1582,6 +1585,7 @@ def _codegen_cute_store_tcgen05_tile(
     ast_subscript: list[object] | tuple[object, ...],
     extra_mask: ast.AST | None,
     value_name: str,
+    epilogue_chain: Tcgen05UnaryEpilogueChain | None = None,
 ) -> list[ast.AST] | ast.AST | None:
     if extra_mask is not None or tensor.ndim != 2:
         return None
@@ -1688,6 +1692,43 @@ def _codegen_cute_store_tcgen05_tile(
     )
     if tcgen05_value.epi_warp_count == 1:
         epi_warp_ids += ","
+
+    # G3.1.1: render the per-thread carrier expression for the
+    # accumulator vector. The identity epilogue (no chain or empty
+    # chain) emits the original `rAcc.load().to(target_dtype)` line.
+    # When a whitelisted unary chain is present, hoist `rAcc.load()` to
+    # a local TensorSSA so a chain like `cute.where(x > 0, x, 0)` reads
+    # the loaded vector once. Each splice site below uses the
+    # appropriate carrier name (`ttr_racc` for the SIMT path,
+    # `trs_racc` for the TMA path, and `tcgen05_tRS_rAcc` for the
+    # @cute.jit module helper). The returned snippet is a sequence of
+    # zero-or-one prelude statements (each newline-terminated, indented
+    # with `prelude_indent`) plus the assignment expression for
+    # `tcgen05_acc_vec`.
+    def _splice_acc_vec(carrier_name: str, prelude_indent: str) -> tuple[str, str]:
+        """Return ``(prelude, assignment_rhs)``. ``prelude`` is empty
+        for the identity epilogue. ``assignment_rhs`` is the right-hand
+        side of ``acc_vec = ...`` (without leading whitespace or the
+        trailing newline).
+
+        Each chain step renders into a fresh ``tcgen05_chain_step*``
+        local so chain composition stays linear in source size — the
+        relu template duplicates ``{inner}`` 5 times, so without per-
+        step binding a 3-deep relu chain would emit 125x duplication
+        and pessimize parse / IR-build time. Per-step locals keep
+        the rendered source O(N) in chain depth and CuTe CSEs the
+        loads at compile.
+        """
+        load_expr = f"{carrier_name}.load()"
+        if epilogue_chain is None or not epilogue_chain.steps:
+            return ("", f"{load_expr}.to({target_dtype})")
+        loaded = df.new_var("tcgen05_acc_loaded")
+        prelude_load = f"{prelude_indent}{loaded} = {load_expr}\n"
+        chain_prelude, final_expr = epilogue_chain.render_prelude_and_expr(
+            loaded, df.new_var, prelude_indent
+        )
+        return (prelude_load + chain_prelude, f"({final_expr}).to({target_dtype})")
+
     if tcgen05_value.use_tma_store_epilogue:
         df.placeholder_args.add(tensor_name)
         df.wrapper_only_params.extend(
@@ -1770,6 +1811,7 @@ def _codegen_cute_store_tcgen05_tile(
     simt_static_store_setup, simt_tile_store_setup = store_common_setup(
         tensor_name, include_full_tile=True
     )
+    simt_acc_vec_prelude, simt_acc_vec_rhs = _splice_acc_vec(ttr_racc, "        ")
     tma_static_store_setup, tma_tile_store_setup = store_common_setup(
         tcgen05_value.tma_store_tensor, include_full_tile=False
     )
@@ -1854,7 +1896,8 @@ def _codegen_cute_store_tcgen05_tile(
             f"        {ttr_tacc_mn} = {ttr_tacc}[(None, None, None, cutlass.Int32(_tcgen05_subtile))]\n"
             f"        {ttr_gc_subtile} = {ttr_gc_grouped}[(None, None, None, cutlass.Int32(_tcgen05_subtile))]\n"
             f"        cute.copy({tiled_copy_t2r}, {ttr_tacc_mn}, {ttr_racc})\n"
-            f"        {acc_vec} = {ttr_racc}.load().to({target_dtype})\n"
+            f"{simt_acc_vec_prelude}"
+            f"        {acc_vec} = {simt_acc_vec_rhs}\n"
             f"        {ttr_rd}.store({acc_vec})\n"
             f"        if _tcgen05_subtile == {subtile_count} - 1:\n"
             # `cute.copy(t2r, ...)` issues async TMEM->reg loads. Releasing
@@ -2077,11 +2120,13 @@ def _codegen_cute_store_tcgen05_tile(
     tcgen05_tma_store_atom = tcgen05_value.tma_store_atom
 
     def tma_store_acc_t2r_region(*, acc_wait: str) -> str:
+        prelude, rhs = _splice_acc_vec(trs_racc, "        ")
         return (
             f"{acc_wait}"
             f"        {ttr_tacc_mn} = {ttr_tacc}[(None, None, None, cutlass.Int32(_tcgen05_subtile))]\n"
             f"        cute.copy({tiled_copy_t2r}, {ttr_tacc_mn}, {ttr_racc})\n"
-            f"        {acc_vec} = {trs_racc}.load().to({target_dtype})\n"
+            f"{prelude}"
+            f"        {acc_vec} = {rhs}\n"
             f"        if _tcgen05_subtile == {subtile_count} - 1:\n"
             f"            cute.arch.fence_view_async_tmem_load()\n"
             f"            with cute.arch.elect_one():\n"
@@ -2159,6 +2204,7 @@ def _codegen_cute_store_tcgen05_tile(
     )
 
     def tma_store_module_acc_t2r_helper_source(*, acc_wait: str) -> str:
+        prelude, rhs = _splice_acc_vec("tcgen05_tRS_rAcc", "    ")
         return (
             "@cute.jit\n"
             f"def {module_acc_t2r_helper_name}("
@@ -2175,7 +2221,8 @@ def _codegen_cute_store_tcgen05_tile(
             f"{acc_wait}"
             "    tcgen05_tTR_tAcc_mn = tcgen05_tTR_tAcc[(None, None, None, cutlass.Int32(_tcgen05_subtile))]\n"
             "    cute.copy(tcgen05_tiled_copy_t2r, tcgen05_tTR_tAcc_mn, tcgen05_tTR_rAcc)\n"
-            f"    tcgen05_acc_vec = tcgen05_tRS_rAcc.load().to({target_dtype})\n"
+            f"{prelude}"
+            f"    tcgen05_acc_vec = {rhs}\n"
             "    if _tcgen05_subtile == tcgen05_subtile_count - 1:\n"
             "        cute.arch.fence_view_async_tmem_load()\n"
             "        with cute.arch.elect_one():\n"
@@ -3017,6 +3064,71 @@ def _(state: CodegenState) -> ast.AST:
     raise exc.BackendUnsupported("metal", f"store target type: {type(tensor)}")
 
 
+def _try_splice_tcgen05_unary_epilogue(
+    state: CodegenState,
+    tensor: object,
+    subscript: list[object] | tuple[object, ...],
+    ast_subscript: list[object] | tuple[object, ...],
+    extra_mask: ast.AST | None,
+    value_node: torch.fx.Node | None,
+) -> ast.AST | None:
+    """G3.1-B splice attempt for ``out[tile] = unary_chain(acc).to(x.dtype)``.
+
+    Returns the splice-completion sentinel (``ast.Constant(value=None)``)
+    on a successful splice (the caller should return it directly), and
+    ``None`` if the splice did not fire — the caller should continue to
+    the G3.1.0 backstop or the SIMT fallback.
+
+    Splice is attempted only when the kernel has a tcgen05-registered
+    matmul fx_node (``cute_tcgen05_matmul_fx_nodes`` non-empty), the
+    store value has a backing FX node, the store target is a 2-D
+    ``torch.Tensor``, and the chain analyzer accepts the value chain
+    (returning ``(chain, anchor)`` for a non-empty unary chain rooted
+    at a tcgen05 matmul). Chains the whitelist rejects (auxiliary-
+    tensor lambdas, reductions, kwarg-bearing scalar binaries, etc.)
+    leave the analyzer returning ``None`` and the splice does not
+    fire — the G3.1.0 backstop then catches them.
+    """
+    if not state.device_function.cute_tcgen05_matmul_fx_nodes:
+        return None
+    if value_node is None:
+        return None
+    if not isinstance(tensor, torch.Tensor):
+        return None
+    analyzed = analyze_tcgen05_unary_epilogue_chain(state, value_node)
+    if analyzed is None:
+        return None
+    chain, anchor = analyzed
+    # Defensive: the analyzer contract is to return ``None`` for
+    # identity stores (no chain steps), so a non-None return here
+    # always carries a non-empty chain. Pin the invariant.
+    assert chain.steps, (
+        "analyze_tcgen05_unary_epilogue_chain must return None for "
+        "identity stores (no chain steps); reaching the splice site "
+        "with an empty chain indicates a contract violation"
+    )
+    anchor_result_var = (
+        state.device_function.cute_tcgen05_matmul_fx_node_result_vars.get(anchor)
+    )
+    if anchor_result_var is None:
+        return None
+    rewritten_stmt = _codegen_cute_store_tcgen05_tile(
+        state,
+        tensor,
+        subscript,
+        ast_subscript,
+        extra_mask,
+        anchor_result_var,
+        epilogue_chain=chain,
+    )
+    if rewritten_stmt is None:
+        return None
+    stmts = rewritten_stmt if isinstance(rewritten_stmt, list) else [rewritten_stmt]
+    for stmt in stmts:
+        state.add_statement(stmt)
+    return ast.Constant(value=None)
+
+
 @_decorators.codegen(store, "cute")
 def _(state: CodegenState) -> ast.AST:
     tensor = state.proxy_arg(0)
@@ -3169,6 +3281,53 @@ def _(state: CodegenState) -> ast.AST:
             for stmt in stmts:
                 state.add_statement(stmt)
             return ast.Constant(value=None)
+
+    # G3.1.1: try to splice a whitelisted unary-chain epilogue
+    # (`out[tile] = unary_chain(acc).to(x.dtype)`) into the role-local
+    # tcgen05 epilogue's per-thread T2R loop. Implementation in
+    # ``_try_splice_tcgen05_unary_epilogue``. Chains the whitelist
+    # rejects (auxiliary-tensor lambdas, reductions, etc.) leave the
+    # splice off and fall through to the G3.1.0 backstop below.
+    spliced = _try_splice_tcgen05_unary_epilogue(
+        state, tensor, subscript, ast_subscript, extra_mask, value_node
+    )
+    if spliced is not None:
+        return spliced
+
+    # Loud-failure backstop for fused-epilogue stores that follow a
+    # tcgen05 matmul. The tcgen05 grid-emission path (in `program_id.py`)
+    # does not bind the per-block-id `indices_<n>` / `mask_<n>` variable
+    # names that the SIMT-fallback store path expects, so falling through
+    # here would emit a kernel that crashes inside the cute DSL with
+    # `name 'mask_0' is not defined`. Detect the pattern here — any
+    # store value whose FX user chain transitively reaches a
+    # tcgen05-registered matmul fx node — and raise a structured error
+    # so the caller sees the actionable message instead of a cute-DSL
+    # crash. Fixing this requires either (a) extending the tcgen05 grid
+    # to emit per-block-id index/mask vars, or (b) per-subtile lambda
+    # emission in `_codegen_cute_store_tcgen05_tile`.
+    if (
+        state.device_function.cute_tcgen05_matmul_fx_nodes
+        and value_node is not None
+        and reach_tcgen05_matmul_anchors(state, value_node)
+    ):
+        raise exc.BackendUnsupported(
+            "cute",
+            "tcgen05 MMA path does not yet emit per-block-id indices "
+            "and masks for non-whitelisted or auxiliary-input fused "
+            "epilogues that follow the MMA. The store target's value "
+            "chain depends on a tcgen05 matmul result through ops the "
+            "G3.1-B chain analyzer rejects (e.g. auxiliary tensor loads "
+            "such as `acc + bias[tile_n]` or `acc + residual[tile]`, "
+            "non-scalar binary ops, `aten.add.Tensor` with `alpha=k`, "
+            "or an intermediate `.to(d_inter)` cast where `d_inter` "
+            "differs from the store-target dtype). Identity stores "
+            "(`out[tile] = acc.to(x.dtype)`) and whitelisted unary "
+            "chains (relu/tanh/exp/log/sqrt/abs/neg + scalar "
+            "add/sub/mul/div on the accumulator carrier) do work via "
+            "the G3.1-B fused-unary splice path. Auxiliary-tensor "
+            "fusion is queued as G3.1-C. See cute_plan.md §7.5.",
+        )
 
     tensor_name = state.device_function.tensor_arg(tensor).name
     backend = CompileEnvironment.current().backend

@@ -503,6 +503,34 @@ class DeviceFunction:
         self.expr_to_var_info: dict[sympy.Expr, VarInfo] = {}
         self.deferred_rdim_defs: list[tuple[str, sympy.Expr]] = []
         self._cute_tcgen05_store_values: dict[str, CuteTcgen05StoreValue] = {}
+        # FX nodes (matmul / hl.dot / addmm) that were lowered to the tcgen05
+        # MMA path. The cute store codegen consults this set to detect the
+        # "fused-epilogue store after a tcgen05 matmul" pattern (the FX
+        # chain from the store value reaches a tcgen05-lowered matmul) and
+        # raise a structured `BackendUnsupported` instead of falling
+        # through to the SIMT-fallback store path, which would crash inside
+        # the cute DSL on undefined `indices_<n>` / `mask_<n>` names.
+        self.cute_tcgen05_matmul_fx_nodes: set[torch.fx.Node] = set()
+        # Mapping from a tcgen05-lowered matmul fx_node to the AST variable
+        # name (registered in ``_cute_tcgen05_store_values``) that holds
+        # the per-thread MMA result. The G3.1.1 fused-epilogue splice
+        # path walks back from the store value's FX chain to the matmul
+        # fx_node, then looks the result var up here so the splice can
+        # reuse the existing ``CuteTcgen05StoreValue`` registered under
+        # the matmul's result var (the user's chained value-name was
+        # registered to the cast result, not the matmul). Populated in
+        # ``_codegen_cute_mma`` at the
+        # ``register_cute_tcgen05_store_value`` call site, which is
+        # where ``result_var`` is finalized — the
+        # ``cute_tcgen05_matmul_fx_nodes.add(fx_node)`` line earlier in
+        # the same function happens before ``result_var`` exists.
+        # Lifetime is one-to-one with ``cute_tcgen05_matmul_fx_nodes``:
+        # both live for the duration of one ``DeviceFunction`` (i.e.
+        # one ``to_triton_code`` call) and are repopulated on each
+        # compile. There is no eviction logic; relying on the
+        # ``DeviceFunction`` instance going out of scope is the
+        # cleanup model.
+        self.cute_tcgen05_matmul_fx_node_result_vars: dict[torch.fx.Node, str] = {}
         self.cute_tcgen05_matmul_plan: CuteTcgen05MatmulPlan | None = None
         # Variable names for the ``ROLE_LOCAL_WITH_SCHEDULER`` broadcast
         # pipeline. Set in ``_codegen_cute_mma`` when the strategy is

@@ -449,10 +449,6 @@ class TestExamples(RefEagerTestBase, TestCase):
 
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfTileIR("TileIR does not support block_ptr indexing")
-    @xfailIfCute(
-        "CuTe tcgen05 MMA path does not yet emit indices/masks for the "
-        "user-level epilogue write that follows the MMA"
-    )
     def test_template_via_closure2(self):
         args = (
             torch.randn([512, 512], device=DEVICE, dtype=HALF_DTYPE),
