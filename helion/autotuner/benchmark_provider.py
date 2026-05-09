@@ -301,6 +301,22 @@ class BenchmarkProvider(abc.ABC):
         """
         ...
 
+    def benchmark_isolated(
+        self,
+        fns: list[Callable[..., object]],
+        *,
+        warmup: int,
+        rep: int,
+        desc: str = "Benchmarking",
+    ) -> list[float | None] | None:
+        """Benchmark already-validated functions in an isolated subprocess.
+
+        Return ``None`` when the provider cannot support the isolated path or
+        per-function ``None`` when a timing could not be confirmed and callers
+        should keep the prior timing for that function.
+        """
+        return None
+
     @abc.abstractmethod
     def setup(self) -> None:
         """Prepare resources needed before benchmarking begins (e.g. tmpdir)."""
@@ -985,26 +1001,10 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         we classified and handled, or ``None`` if the subprocess path cannot
         handle this config and the caller should fall back to in-process.
         """
-        if self._precompile_args_path is None:
-            return None
         try:
-            fn_spec = _serialize_compiled_fn(fn)
-        except RuntimeError:
-            return None
-
-        if self._benchmark_worker is None:
-            self._benchmark_worker = BenchmarkWorker(device=None)
-
-        job = BenchmarkJob(
-            fn_spec=fn_spec,
-            args_path=self._precompile_args_path,
-            warmup=1,
-            rep=50,
-        )
-        timeout = float(self.settings.autotune_benchmark_timeout)
-
-        try:
-            latency = self._benchmark_worker.run(job, timeout=timeout)
+            latency = self._run_subprocess_benchmark_job(fn, warmup=1, rep=50)
+            if latency is None:
+                return None
         except BenchmarkSubprocessError as e:
             # Timeout or unexpected worker exit; skip config and continue.
             self.log.warning(f"Benchmark subprocess failed for {config!r}: {e}")
@@ -1046,3 +1046,71 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                 return inf
 
         return float(latency)
+
+    def _run_subprocess_benchmark_job(
+        self,
+        fn: CompiledConfig,
+        *,
+        warmup: int,
+        rep: int,
+    ) -> float | None:
+        if self._precompile_args_path is None:
+            return None
+        try:
+            fn_spec = _serialize_compiled_fn(fn)
+        except RuntimeError:
+            return None
+
+        if self._benchmark_worker is None:
+            self._benchmark_worker = BenchmarkWorker(device=None)
+
+        job = BenchmarkJob(
+            fn_spec=fn_spec,
+            args_path=self._precompile_args_path,
+            warmup=warmup,
+            rep=rep,
+        )
+        return float(
+            self._benchmark_worker.run(
+                job,
+                timeout=float(self.settings.autotune_benchmark_timeout),
+            )
+        )
+
+    def benchmark_isolated(
+        self,
+        fns: list[Callable[..., object]],
+        *,
+        warmup: int,
+        rep: int,
+        desc: str = "Benchmarking",
+    ) -> list[float | None] | None:
+        if not self._subprocess_benchmark_enabled():
+            return None
+        if self.settings.autotune_benchmark_fn is not None:
+            return None
+
+        timings: list[float | None] = []
+        for fn in fns:
+            try:
+                timing = self._run_subprocess_benchmark_job(
+                    cast("CompiledConfig", fn),
+                    warmup=warmup,
+                    rep=rep,
+                )
+            except BenchmarkSubprocessError as e:
+                self.log.warning(f"{desc} subprocess failed: {e}")
+                timing = None
+            except Exception as e:
+                e.__traceback__ = None
+                if match_unrecoverable_runtime_error(e):
+                    self.log.warning(f"{desc} sticky CUDA error skipped: {e}")
+                    # The confirmation re-ran a previously accepted candidate in
+                    # an isolated worker; a sticky CUDA error means that config is
+                    # still unsafe, so remove it from contention.
+                    timing = inf
+                else:
+                    self.log.debug(f"{desc} subprocess raised: {type(e).__name__}: {e}")
+                    timing = None
+            timings.append(None if timing is None else float(timing))
+        return timings

@@ -423,6 +423,12 @@ class _Settings:
             "HELION_REBENCHMARK_THRESHOLD",
         )
     )
+    autotune_suspicious_rebenchmark_ratio: float | None = dataclasses.field(
+        default_factory=functools.partial(
+            _env_get_optional_float,
+            "HELION_AUTOTUNE_SUSPICIOUS_REBENCHMARK_RATIO",
+        )
+    )
     autotune_search_acf: list[str] = dataclasses.field(
         default_factory=functools.partial(
             _env_get_str_list, "HELION_AUTOTUNE_SEARCH_ACF"
@@ -582,6 +588,7 @@ class Settings(_Settings):
         "autotune_random_seed": "Seed used for autotuner random number generation. Defaults to HELION_AUTOTUNE_RANDOM_SEED or a time-based seed.",
         "autotune_accuracy_check": "If True, validate candidate configs against the baseline kernel output before accepting them during autotuning.",
         "autotune_rebenchmark_threshold": "If a config is within threshold*best_perf, re-benchmark it to avoid outliers. Defaults to effort profile value. Set HELION_REBENCHMARK_THRESHOLD to override.",
+        "autotune_suspicious_rebenchmark_ratio": "When subprocess benchmarking is enabled, recheck rebenchmark timings below ratio*previous_timing before accepting them. Defaults to 0.9. Set HELION_AUTOTUNE_SUSPICIOUS_REBENCHMARK_RATIO=0 to disable.",
         "autotune_search_acf": "List of PTXAS Advanced Controls Files (ACFs) to search during autotuning. ACFs are highly specialized configurations for specific hardware and use cases; when autotuning with ACFs, default -O3 is always considered. Empty list disables.",
         "autotune_progress_bar": "If True, show progress bar during autotuning. Default is True. Set HELION_AUTOTUNE_PROGRESS_BAR=0 to disable.",
         "autotune_max_generations": "Override the maximum number of generations for Pattern Search and Differential Evolution Search autotuning algorithms with HELION_AUTOTUNE_MAX_GENERATIONS=N or @helion.kernel(autotune_max_generations=N).",
@@ -762,6 +769,13 @@ class Settings(_Settings):
             return self.autotune_rebenchmark_threshold
 
         return get_effort_profile(self.autotune_effort).rebenchmark_threshold
+
+    def get_suspicious_rebenchmark_ratio(self) -> float | None:
+        if self.autotune_suspicious_rebenchmark_ratio is not None:
+            return self.autotune_suspicious_rebenchmark_ratio
+        if self.autotune_benchmark_subprocess:
+            return 0.9
+        return None
 
     def _check_ref_eager_mode_before_print_output_code(self) -> None:
         """
