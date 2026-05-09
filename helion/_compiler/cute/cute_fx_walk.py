@@ -7,8 +7,8 @@ consumes the body via ``operator.getitem(_for_loop_node, idx)``), so
 the inner-outputs index and the getitem-subgraph-hop logic live here:
 
 - :func:`reach_tcgen05_matmul_anchors` is a broad reachability walk
-  used by the G3.1.0 diagnostic and the G3.1.1 store-codegen
-  splice site. It descends through every input node (``_phi`` is
+  used by the loud-failure diagnostic and the store-codegen splice
+  site. It descends through every input node (``_phi`` is
   transparent, both branches walked) so a value that depends on a
   tcgen05 matmul through *any* path is detected. Returns the set
   of matmul fx_nodes reached. Empty set means no matmul anchor.
@@ -83,8 +83,8 @@ def _resolve_for_loop_getitem(
     The narrow shape is the only safe subgraph hop for both walks:
     descending into other inputs of the ``_for_loop`` call (begin / end /
     args list) would push the entire loop-arg tuple and re-enter all
-    body outputs unconditionally, which is the false-positive the
-    G3.1.0 cycle-9 review flagged.
+    body outputs unconditionally, which would false-positive on
+    stores that consume a different loop-output mode.
     """
     from ...language import _tracing_ops
 
@@ -122,13 +122,13 @@ def reach_tcgen05_matmul_anchors(
     re-enter every body output and false-positive on stores that
     consume a different loop-output mode.
 
-    Used by the G3.1.0 diagnostic backstop in
+    Used by the loud-failure diagnostic backstop in
     :mod:`memory_ops` (the ``cute_tcgen05_matmul_fx_nodes`` reach
-    check at the cute store-codegen entry point) and by the G3.1.1
-    splice site to recover the unique matmul anchor for the
-    accepted unary chain. The classifier in :mod:`cute_epilogue` uses
-    a separate :func:`walk_carrier_to_tcgen05_matmul` walker because
-    it needs to commit to a single carrier path.
+    check at the cute store-codegen entry point) and by the splice
+    site to recover the unique matmul anchor for the accepted
+    chain. The classifier in :mod:`cute_epilogue` uses a separate
+    :func:`walk_carrier_to_tcgen05_matmul` walker because it needs
+    to commit to a single carrier path.
     """
     df = state.device_function
     target_fx_nodes = df.cute_tcgen05_matmul_fx_nodes
@@ -169,6 +169,98 @@ def reach_tcgen05_matmul_anchors(
             if arg not in visited:
                 stack.append(arg)
     return found
+
+
+def is_aux_tensor_load_node(
+    node: torch.fx.Node,
+    *,
+    carrier_tile_shape: tuple[object, ...] | None,
+    carrier_tile_index_nodes: tuple[torch.fx.Node, ...] | None = None,
+) -> bool:
+    """Return whether ``node`` is a recognized auxiliary-tensor load
+    eligible for fusion.
+
+    Only accepts the exact ``aux_tensor[tile_m, tile_n]`` form: the
+    underlying tensor's rank must equal the carrier rank, the load's
+    index list must be exactly the carrier's tile-id symbol nodes
+    (no offsets, no static indices, no slices), and the load result
+    shape must equal the carrier shape dim-by-dim. This rules out
+    1-D broadcast (``bias[tile_n]``), 3-D loads with a static
+    collapse (``aux3d[tile_m, tile_n, 0]``), and any rank mismatch
+    where ``cute.local_tile(aux, (bm, bn), (coord_m, coord_n))``
+    would receive a tensor whose rank does not match the tile shape
+    rank.
+
+    Strict on ``kwargs`` (must be empty) and on the ``extra_mask``
+    / ``eviction_policy`` argument positions — both must be
+    ``None`` because the splice emits a plain
+    ``aux_tile[indices].load()`` without forwarding either knob.
+
+    ``carrier_tile_shape`` is the carrier's tile shape (sympy
+    symbols / ints from ``meta['val'].shape``).
+    ``carrier_tile_index_nodes`` is the tuple of FX symint nodes
+    that index the carrier (one per tile axis) — when provided, the
+    load's index list must match these node-by-node.
+    """
+    from ...language.memory_ops import load as helion_load
+
+    if node.op != "call_function" or node.target is not helion_load:
+        return False
+    if node.kwargs:
+        return False
+    args = node.args
+    if len(args) < 2:
+        return False
+    tensor_node = args[0]
+    if not isinstance(tensor_node, torch.fx.Node):
+        return False
+    index_list = args[1]
+    if not isinstance(index_list, (list, tuple)):
+        return False
+    if len(args) >= 3 and args[2] is not None:
+        return False  # extra_mask present.
+    if len(args) >= 4 and args[3] is not None:
+        return False  # eviction_policy present.
+    aux_val = node.meta.get("val")
+    if aux_val is None:
+        return False
+    aux_shape = tuple(aux_val.shape)
+    if carrier_tile_shape is None:
+        return len(aux_shape) == 2
+    if len(aux_shape) != len(carrier_tile_shape):
+        return False
+    for aux_dim, carrier_dim in zip(aux_shape, carrier_tile_shape, strict=True):
+        if aux_dim != carrier_dim:
+            return False
+    # The underlying tensor's rank must equal the carrier rank — a
+    # rank-3 tensor sliced to a rank-2 result via a static index
+    # (``aux3d[tile_m, tile_n, 0]``) would otherwise pass the result-
+    # shape check and reach codegen that hands ``cute.local_tile`` a
+    # rank-3 tensor with a rank-2 tile shape (invalid).
+    aux_tensor_val = tensor_node.meta.get("val")
+    if aux_tensor_val is None:
+        return False
+    if len(aux_tensor_val.shape) != len(carrier_tile_shape):
+        return False
+    # The index list must be exactly the carrier's tile-id nodes,
+    # in order. This rejects offsets, scalar collapses
+    # (``aux3d[tile_m, tile_n, 0]``), and any reordering. When the
+    # caller does not supply the carrier's tile index nodes, fall
+    # back to checking each entry is an FX symint node (used by
+    # defensive callers; the chain analyzer always supplies them).
+    if len(index_list) != len(carrier_tile_shape):
+        return False
+    if carrier_tile_index_nodes is not None:
+        if len(carrier_tile_index_nodes) != len(index_list):
+            return False
+        for idx, expected in zip(index_list, carrier_tile_index_nodes, strict=True):
+            if idx is not expected:
+                return False
+    else:
+        for idx in index_list:
+            if not isinstance(idx, torch.fx.Node):
+                return False
+    return True
 
 
 def walk_carrier_to_tcgen05_matmul(

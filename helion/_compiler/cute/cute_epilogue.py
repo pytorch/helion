@@ -1,30 +1,41 @@
-"""Whitelisted unary-chain detector for tcgen05 fused epilogues (G3.1.1).
+"""Whitelisted chain detector for tcgen05 fused epilogues.
 
 A user-level epilogue lambda over a tcgen05 matmul result, e.g.
 
     out[tile_m, tile_n] = relu(acc).to(x.dtype)
+    out[tile_m, tile_n] = (acc + residual[tile_m, tile_n]).to(x.dtype)
 
 is structurally an *identity-style* store the role-local tcgen05 epilogue
-*could* emit if we splice the unary chain inline at the per-thread T2R
-register. The G3.1.0 reachability check
+*could* emit if we splice the chain inline at the per-thread T2R
+register. The reachability check
 (``reach_tcgen05_matmul_anchors`` in :mod:`cute_fx_walk`) only proves
 *reachability* — that the value depends on a tcgen05-registered matmul
 fx_node — and is the loud-failure backstop. This module owns the
 *narrower* whitelist-based classifier that produces a renderable inline
-expression for the simplest case: the value chain is purely
+expression for two cases:
 
-    matmul -> [whitelisted unary op]* -> convert_element_type -> store
+- Unary chains: ``matmul -> [whitelisted unary op]* ->
+  convert_element_type -> store``, where every op in the chain has
+  exactly one tensor input (the prior tensor result) and zero or more
+  compile-time scalar arguments.
+- Auxiliary-tensor binary ops: same shape as above, but one or more
+  steps are ``add/sub/mul/div`` with the chain carrier as one
+  operand and a ``helion.language.load(aux_tensor, [tile_m, tile_n])``
+  call as the other. The auxiliary tensor must match the output
+  tile's 2-D shape exactly (no broadcast); 1-D / broadcast forms are
+  rejected to the loud-failure backstop.
 
-where every op in the chain has exactly one tensor input (the prior
-tensor result) and zero or more compile-time scalar arguments. Any op
-outside the whitelist (including unary ops that read auxiliary tensors,
-reductions, or shape changes) bails to ``None`` so the G3.1.0 diagnostic
-keeps firing for those shapes — they are G3.1.2 territory.
+Any op outside the whitelist (reductions, shape changes,
+auxiliary-tensor loads with unsupported indexing, etc.) bails to
+``None`` so the loud-failure diagnostic keeps firing for those shapes.
 
 The classifier is intentionally side-effect-free; the splice site in
 ``_codegen_cute_store_tcgen05_tile`` is responsible for substituting the
 rendered expression in place of the existing
-``tRS_rAcc.load().to(target_dtype)`` line.
+``tRS_rAcc.load().to(target_dtype)`` line. Auxiliary-tensor steps carry
+the FX node of their ``load`` call so the splice site can recover the
+auxiliary tensor + index expressions and emit the per-thread GMEM read
+inline.
 """
 
 from __future__ import annotations
@@ -36,6 +47,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from .cute_fx_walk import build_inner_outputs_index
+from .cute_fx_walk import is_aux_tensor_load_node
 from .cute_fx_walk import walk_carrier_to_tcgen05_matmul
 
 if TYPE_CHECKING:
@@ -69,6 +81,46 @@ class _UnaryStep:
     op_name: str
     template: str
     inner_ref_count: int = 1
+
+
+@dataclasses.dataclass(frozen=True)
+class _AuxiliaryTensorStep:
+    """A binary scalar op fused as ``carrier <op> aux_load``.
+
+    Unlike ``_UnaryStep`` (whose other operand is a compile-time
+    scalar literal), this step's other operand is the result of a
+    ``helion.language.load`` call against an auxiliary GMEM tensor.
+    The splice site is responsible for emitting per-thread aux load
+    code from the ``load_node`` data captured here — including the
+    auxiliary tensor name, the index expressions, and the dtype.
+
+    ``op_name`` is the user-visible op name (``"add"`` / ``"sub"`` /
+    ``"mul"`` / ``"div"``) used in test diagnostics. ``op_template``
+    is the binary-op Python expression the splice renders, with
+    placeholders ``{carrier}`` (the chain carrier identifier) and
+    ``{aux}`` (the per-thread auxiliary load expression). Renderers
+    do **not** parenthesize ``{aux}`` because the splice site emits
+    ``aux`` as a bound local first — there is no precedence
+    ambiguity inside the rendered binary expression.
+
+    ``forward_form`` is ``True`` when the carrier is the *left*
+    operand (``carrier <op> aux``) and ``False`` when it is the
+    right (``aux <op> carrier``). Commutative ops (``add`` / ``mul``)
+    only need one form; non-commutative ones (``sub`` / ``div``)
+    use the flag to render the correct direction.
+
+    ``load_node`` is the FX node for the ``helion.language.load``
+    call. The splice site reads ``load_node.args[0]`` (the auxiliary
+    tensor's host tensor FX node) and ``load_node.args[1]`` (the
+    index list, which the analyzer pins to exactly the carrier's
+    tile-id symbol nodes — broader index shapes are rejected at
+    classify time).
+    """
+
+    op_name: str
+    op_template: str
+    forward_form: bool
+    load_node: torch.fx.Node
 
 
 # The cute DSL surface for whitelisted unary operations. Renderings are
@@ -150,23 +202,25 @@ _ZERO_ARG_TARGETS: dict[object, _UnaryStep] = {
     # ``out[tile] = relu(acc).to(d_inter)`` written to a
     # ``d_target != d_inter`` tensor) shows up as a second
     # ``convert_element_type`` mid-chain; rejecting it by whitelist
-    # falls through to the G3.1.0 backstop and prevents silently
-    # dropping the intermediate cast (which would change rounding).
-    # Pinned by
+    # falls through to the loud-failure backstop and prevents
+    # silently dropping the intermediate cast (which would change
+    # rounding). Pinned by
     # ``test_tcgen05_fused_chain_rejects_intermediate_cast_dtype_mismatch``.
 }
 
 
-# Scalar binary ops where one of the two FX args is the chain carrier
-# and the other is a compile-time constant (``int`` / ``float``,
-# possibly arriving as a 0-d tensor). The renderer folds the constant
-# into the Python expression. Both arg positions are checked so
-# ``acc * 2.0`` and ``2.0 * acc`` both fuse; for non-commutative ops
-# (``sub``, ``div``) we render ``acc - c`` vs ``c - acc`` separately.
-# These targets are also rejected if any unexpected ``kwargs`` are
-# present (e.g. ``aten.add.Tensor`` accepts ``alpha=k`` which would
-# silently change the rendered scalar — see the
-# ``_has_only_default_kwargs`` filter at the call site).
+# Binary ops that the chain analyzer accepts. Both scalar (the
+# other operand is a compile-time literal int/float) and
+# auxiliary-tensor (the other operand is a
+# ``helion.language.load`` of a 2-D auxiliary GMEM tensor matching
+# the output tile shape) forms are routed through ``_classify_binary``
+# below. Both arg positions are checked so ``acc <op> other`` and
+# ``other <op> acc`` both fuse; for non-commutative ops
+# (``sub``, ``div``) the renderer picks the correct direction. These
+# targets are also rejected if any unexpected ``kwargs`` are present
+# (e.g. ``aten.add.Tensor`` accepts ``alpha=k`` which would silently
+# change the rendered expression — see the kwarg-rejection branch in
+# ``_classify_binary``).
 _SCALAR_BINARY_TARGETS: frozenset[object] = frozenset(
     {
         torch.ops.aten.add.Tensor,
@@ -175,6 +229,29 @@ _SCALAR_BINARY_TARGETS: frozenset[object] = frozenset(
         torch.ops.aten.div.Tensor,
     }
 )
+
+
+# Per-target ``op_template`` for the auxiliary-tensor renderer. The
+# placeholders ``{carrier}`` and ``{aux}`` are bound to splice-site
+# locals (the chain carrier and the per-thread aux load
+# respectively). The classifier picks ``_AUX_FORWARD_OP_TEMPLATES``
+# when the carrier is the *left* operand (``carrier <op> aux``) and
+# ``_AUX_REVERSE_OP_TEMPLATES`` when it is the right (``aux <op>
+# carrier``). For commutative ``add`` / ``mul`` the two tables are
+# value-equivalent; the symmetric handling keeps non-commutative
+# ``sub`` / ``div`` correct without a per-step branch.
+_AUX_FORWARD_OP_TEMPLATES: dict[object, str] = {
+    torch.ops.aten.add.Tensor: "(({carrier}) + ({aux}))",
+    torch.ops.aten.mul.Tensor: "(({carrier}) * ({aux}))",
+    torch.ops.aten.sub.Tensor: "(({carrier}) - ({aux}))",
+    torch.ops.aten.div.Tensor: "(({carrier}) / ({aux}))",
+}
+_AUX_REVERSE_OP_TEMPLATES: dict[object, str] = {
+    torch.ops.aten.add.Tensor: "(({aux}) + ({carrier}))",
+    torch.ops.aten.mul.Tensor: "(({aux}) * ({carrier}))",
+    torch.ops.aten.sub.Tensor: "(({aux}) - ({carrier}))",
+    torch.ops.aten.div.Tensor: "(({aux}) / ({carrier}))",
+}
 
 
 def _extract_scalar(arg: object) -> float | None:
@@ -187,8 +264,8 @@ def _extract_scalar(arg: object) -> float | None:
     ``nan``) that are not valid Python expressions in the rendered
     cute DSL source — a whitelisted ``acc + float("inf")`` would
     splice into invalid code. Users wanting non-finite arithmetic
-    can pass it through an aux-tensor lambda (G3.1-C territory)
-    where the value is materialized as a tensor element.
+    can pass it through an aux-tensor lambda where the value is
+    materialized as a tensor element.
 
     Helion's host-tensor guard
     (:class:`exc.HostTensorDirectUsage`) prevents 0-d tensor scalars
@@ -209,7 +286,7 @@ def _extract_scalar(arg: object) -> float | None:
         if not math.isfinite(val):
             # ``repr(float("inf")) == "inf"`` is a bare identifier
             # in Python; rendering it as a literal in the splice
-            # site emits invalid source. Bail to the G3.1.0
+            # site emits invalid source. Bail to the loud-failure
             # backstop so the user sees a structured error.
             return None
         return val
@@ -218,11 +295,18 @@ def _extract_scalar(arg: object) -> float | None:
 
 @dataclasses.dataclass(frozen=True)
 class Tcgen05UnaryEpilogueChain:
-    """A renderable whitelisted unary chain rooted at a tcgen05 matmul.
+    """A renderable whitelisted chain rooted at a tcgen05 matmul.
 
     ``steps`` is in *application order*: ``steps[0]`` is the op closest
     to the matmul; ``steps[-1]`` is the op closest to the
-    ``convert_element_type`` cast at the store.
+    ``convert_element_type`` cast at the store. A step is either a
+    ``_UnaryStep`` (zero-arg unary or scalar binary) or an
+    ``_AuxiliaryTensorStep`` (binary op with the chain carrier +
+    a ``helion.language.load`` of an auxiliary GMEM tensor). The
+    classname (``Tcgen05UnaryEpilogueChain``) is preserved from the
+    earlier unary-only implementation for byte-identity in goldens;
+    conceptually the type is now a "tcgen05 epilogue chain" that
+    may include auxiliary-tensor steps.
 
     :meth:`render_prelude_and_expr` emits one bound local per step so
     chain composition uses single-name references at each level. This
@@ -234,15 +318,34 @@ class Tcgen05UnaryEpilogueChain:
     time and the cute-DSL JIT IR build, both of which scan the source
     text linearly. Per-step locals keep generated source size O(N) in
     the chain depth.
+
+    For auxiliary-tensor steps, the renderer expects the splice site
+    to provide a per-step pre-bound local for the ``aux`` operand;
+    the renderer just emits ``carrier <op> aux_local``. The aux load
+    code (cute partition + per-thread read) is the splice site's
+    responsibility because it depends on the per-subtile loop layout
+    and the partitioned tile, neither of which this module knows about.
     """
 
-    steps: tuple[_UnaryStep, ...]
+    steps: tuple[_UnaryStep | _AuxiliaryTensorStep, ...]
+
+    @property
+    def auxiliary_tensor_steps(self) -> tuple[_AuxiliaryTensorStep, ...]:
+        """All auxiliary-tensor steps in application order.
+
+        Used by the splice site to request per-step ``aux_local``
+        locals before calling :meth:`render_prelude_and_expr` so the
+        per-thread aux load setup runs once per output tile (outside
+        the per-subtile chain rendering).
+        """
+        return tuple(s for s in self.steps if isinstance(s, _AuxiliaryTensorStep))
 
     def render_prelude_and_expr(
         self,
         carrier_name: str,
         local_name_factory: object,
         prelude_indent: str,
+        aux_locals_by_step: tuple[str, ...] | None = None,
     ) -> tuple[str, str]:
         """Return ``(prelude, final_expr)``.
 
@@ -256,6 +359,12 @@ class Tcgen05UnaryEpilogueChain:
         practice the splice site passes ``df.new_var`` so each chain
         step gets a unique name even across multiple kernels.
 
+        ``aux_locals_by_step`` is required when any step is an
+        ``_AuxiliaryTensorStep`` and supplies, per-aux-step in
+        application order, the splice-side pre-bound local that
+        carries the per-thread auxiliary load value. Pure unary
+        chains pass ``None``.
+
         Identity epilogues do not reach this method: the analyzer in
         :func:`analyze_tcgen05_unary_epilogue_chain` returns ``None``
         for the no-step case so the splice site stays out of the
@@ -268,10 +377,42 @@ class Tcgen05UnaryEpilogueChain:
             "splice site (the analyzer returns None for them so the "
             "ast.Name fast path handles them)"
         )
+        aux_steps = self.auxiliary_tensor_steps
+        if aux_steps:
+            assert aux_locals_by_step is not None and len(aux_locals_by_step) == len(
+                aux_steps
+            ), (
+                "auxiliary-tensor chain steps require one aux local per "
+                f"aux step; got {len(aux_locals_by_step) if aux_locals_by_step is not None else None} "
+                f"aux_locals for {len(aux_steps)} aux steps"
+            )
+        else:
+            assert aux_locals_by_step is None or aux_locals_by_step == (), (
+                "non-auxiliary chains must not be passed aux_locals_by_step"
+            )
+        aux_local_iter = iter(aux_locals_by_step or ())
         prelude_lines: list[str] = []
         cur_expr = carrier_name
         local = carrier_name
         for step in self.steps:
+            if isinstance(step, _AuxiliaryTensorStep):
+                # Auxiliary-tensor binary op. The splice site has
+                # already bound the per-thread aux load to a local
+                # (so the renderer's job is just substituting the
+                # binary expression). The carrier is bound here as
+                # well, even though templates only reference it once
+                # — the symmetric handling with the unary path keeps
+                # the prelude shape uniform and CuTe CSEs the load
+                # reference at compile time.
+                aux_local = next(aux_local_iter)
+                local = local_name_factory(  # type: ignore[operator]
+                    "tcgen05_chain_step"
+                )
+                assert isinstance(local, str)
+                step_expr = step.op_template.format(carrier=cur_expr, aux=aux_local)
+                prelude_lines.append(f"{prelude_indent}{local} = {step_expr}\n")
+                cur_expr = local
+                continue
             # Hoist ``{inner}`` to a fresh local when the template
             # references it more than once (e.g. relu's double-where
             # rendering with 5 inner refs). This keeps the template
@@ -298,21 +439,31 @@ class Tcgen05UnaryEpilogueChain:
         return ("".join(prelude_lines), local)
 
 
-def _classify_scalar_binary(
+def _classify_binary(
     cur: torch.fx.Node,
-) -> tuple[_UnaryStep, torch.fx.Node] | None:
+    *,
+    carrier_tile_shape: tuple[object, ...] | None,
+    carrier_tile_index_nodes: tuple[torch.fx.Node, ...] | None = None,
+) -> tuple[_UnaryStep | _AuxiliaryTensorStep, torch.fx.Node] | None:
     """Classify ``cur`` (a ``call_function`` node whose target is on the
-    scalar-binary whitelist) as a single ``_UnaryStep`` plus its FX
-    carrier node. Returns ``None`` if the node cannot be folded into a
-    scalar-binary step (unexpected kwargs, both args are tensors, both
-    args are scalars, etc.).
+    binary whitelist) as a single chain step plus its FX carrier node.
+
+    Returns ``None`` if the node cannot be folded — unexpected
+    kwargs, multiple chain inputs, both args are scalars, both args
+    are tensors but neither is a recognized auxiliary load, etc. The
+    ``_AuxiliaryTensorStep`` branch is gated on ``carrier_tile_shape``
+    being available *and* matching the auxiliary load's tile shape;
+    pass ``None`` when no carrier tile shape is known (e.g. the
+    chain entry point) and the auxiliary branch will be skipped.
 
     Reject any non-empty kwargs: ``aten.add.Tensor`` and
     ``aten.sub.Tensor`` accept an ``alpha`` kwarg whose default is ``1``
     and that scales the second argument; silently rendering
-    ``carrier + scalar`` when the FX node is ``add(carrier, scalar,
+    ``carrier + other`` when the FX node is ``add(carrier, other,
     alpha=2.0)`` would emit incorrect arithmetic. The conservative
-    response is to bail to ``None`` so the G3.1.0 backstop fires.
+    response is to bail to ``None`` so the loud-failure backstop
+    fires. Pinned for both scalar and auxiliary-tensor forms by
+    ``test_tcgen05_fused_chain_rejects_alpha_kwarg``.
     """
     if cur.kwargs:
         return None
@@ -321,50 +472,186 @@ def _classify_scalar_binary(
     target = cur.target
     lhs = cur.args[0]
     rhs = cur.args[1]
+    # Determine which arg is the chain carrier. The carrier is the
+    # FX node that walks back to the matmul anchor; the other is
+    # either a Python scalar literal or a recognized aux load FX
+    # node. We branch on the arg shapes here and let the caller's
+    # subsequent ``walk_carrier_to_tcgen05_matmul`` confirm the
+    # chosen carrier reaches the matmul.
+    lhs_is_node = isinstance(lhs, torch.fx.Node)
+    rhs_is_node = isinstance(rhs, torch.fx.Node)
+    if lhs_is_node and rhs_is_node:
+        assert isinstance(lhs, torch.fx.Node) and isinstance(rhs, torch.fx.Node)
+        # Both args are FX nodes. One must be a recognized auxiliary
+        # tensor load; the other is the chain carrier. If both look
+        # like aux loads or neither does, bail — the chain has no
+        # unique carrier.
+        lhs_aux = is_aux_tensor_load_node(
+            lhs,
+            carrier_tile_shape=carrier_tile_shape,
+            carrier_tile_index_nodes=carrier_tile_index_nodes,
+        )
+        rhs_aux = is_aux_tensor_load_node(
+            rhs,
+            carrier_tile_shape=carrier_tile_shape,
+            carrier_tile_index_nodes=carrier_tile_index_nodes,
+        )
+        aux_load: torch.fx.Node
+        carrier: torch.fx.Node
+        forward_form: bool
+        if lhs_aux and not rhs_aux:
+            aux_load = lhs
+            carrier = rhs
+            forward_form = False  # carrier is the right operand
+        elif rhs_aux and not lhs_aux:
+            aux_load = rhs
+            carrier = lhs
+            forward_form = True  # carrier is the left operand
+        else:
+            return None
+        op_template_table: dict[object, str] = (
+            _AUX_FORWARD_OP_TEMPLATES if forward_form else _AUX_REVERSE_OP_TEMPLATES
+        )
+        op_template = op_template_table[target]
+        op_name_table: dict[object, str] = {
+            torch.ops.aten.add.Tensor: "add",
+            torch.ops.aten.mul.Tensor: "mul",
+            torch.ops.aten.sub.Tensor: "sub",
+            torch.ops.aten.div.Tensor: "div",
+        }
+        op_name = op_name_table[target]
+        return (
+            _AuxiliaryTensorStep(
+                op_name=op_name,
+                op_template=op_template,
+                forward_form=forward_form,
+                load_node=aux_load,
+            ),
+            carrier,
+        )
+    # One arg is a tensor and the other a scalar literal. Extract
+    # the scalar and render a ``_UnaryStep`` row.
     scalar: float | None
-    carrier: torch.fx.Node
-    forward_form: bool  # True => `carrier <op> scalar`
-    if isinstance(lhs, torch.fx.Node) and not isinstance(rhs, torch.fx.Node):
+    forward_form_scalar: bool  # True => `carrier <op> scalar`
+    scalar_carrier: torch.fx.Node
+    if lhs_is_node and not rhs_is_node:
+        assert isinstance(lhs, torch.fx.Node)
         scalar = _extract_scalar(rhs)
-        carrier = lhs
-        forward_form = True
-    elif isinstance(rhs, torch.fx.Node) and not isinstance(lhs, torch.fx.Node):
+        scalar_carrier = lhs
+        forward_form_scalar = True
+    elif rhs_is_node and not lhs_is_node:
+        assert isinstance(rhs, torch.fx.Node)
         scalar = _extract_scalar(lhs)
-        carrier = rhs
-        forward_form = False
+        scalar_carrier = rhs
+        forward_form_scalar = False
     else:
-        # Both args are FX nodes (auxiliary-tensor lambda — G3.1.2
-        # territory) or neither is (would mean a constant binary op
-        # that should have been folded upstream — shouldn't reach
-        # us). Either way, bail.
+        # Neither is an FX node — would mean a constant binary op
+        # that should have been folded upstream. Bail.
         return None
     if scalar is None:
         return None
     if target is torch.ops.aten.add.Tensor:
-        return _UnaryStep(op_name="add", template=_add_const_template(scalar)), carrier
+        return (
+            _UnaryStep(op_name="add", template=_add_const_template(scalar)),
+            scalar_carrier,
+        )
     if target is torch.ops.aten.mul.Tensor:
-        return _UnaryStep(op_name="mul", template=_mul_const_template(scalar)), carrier
+        return (
+            _UnaryStep(op_name="mul", template=_mul_const_template(scalar)),
+            scalar_carrier,
+        )
     if target is torch.ops.aten.sub.Tensor:
         template = (
             _sub_const_template(scalar)
-            if forward_form
+            if forward_form_scalar
             else _rsub_const_template(scalar)
         )
-        return _UnaryStep(op_name="sub", template=template), carrier
+        return _UnaryStep(op_name="sub", template=template), scalar_carrier
     if target is torch.ops.aten.div.Tensor:
         template = (
             _div_const_template(scalar)
-            if forward_form
+            if forward_form_scalar
             else _rdiv_const_template(scalar)
         )
-        return _UnaryStep(op_name="div", template=template), carrier
+        return _UnaryStep(op_name="div", template=template), scalar_carrier
+    return None
+
+
+def _carrier_tile_shape(node: torch.fx.Node) -> tuple[object, ...] | None:
+    """Extract the carrier's tile shape from ``meta['val'].shape``.
+
+    Returns ``None`` when the meta is missing. The classifier uses
+    this shape to decide whether an auxiliary-tensor load matches
+    the carrier's rank/extents — only exact-shape aux loads are
+    accepted; broadcast / rank mismatches drop to the loud-failure
+    backstop.
+    """
+    val = node.meta.get("val")
+    if val is None:
+        return None
+    return tuple(val.shape)
+
+
+def _carrier_tile_index_nodes(
+    cast_input: torch.fx.Node,
+) -> tuple[torch.fx.Node, ...] | None:
+    """Extract the tile-id symbol FX nodes that index the chain carrier.
+
+    Walks back from the post-matmul chain entry to the ``hl.zeros``
+    initial-value node and reads its tile-shape list. Returns the
+    tuple of FX symint nodes (one per tile axis), or ``None`` when
+    the walk cannot recover them — the classifier then falls back
+    to the looser shape-only check.
+    """
+    import operator
+
+    from ...language import _tracing_ops
+
+    cur: torch.fx.Node | None = cast_input
+    visited: set[torch.fx.Node] = set()
+    # Walk through identity-shape passthroughs to the loop entry,
+    # then take the ``_phi`` initial-value branch to the
+    # ``hl.zeros`` (``full``) node whose ``args[0]`` is the tile-
+    # shape list.
+    while cur is not None and cur not in visited:
+        visited.add(cur)
+        if cur.op != "call_function":
+            return None
+        target = cur.target
+        if target is _tracing_ops._phi:
+            init = cur.args[0] if cur.args else None
+            if not isinstance(init, torch.fx.Node):
+                return None
+            shape_arg = init.args[0] if init.args else None
+            if not isinstance(shape_arg, (list, tuple)):
+                return None
+            nodes: list[torch.fx.Node] = []
+            for entry in shape_arg:
+                if not isinstance(entry, torch.fx.Node):
+                    return None
+                nodes.append(entry)
+            return tuple(nodes)
+        if target is _tracing_ops._new_var or target is operator.getitem:
+            arg = cur.args[0] if cur.args else None
+            if not isinstance(arg, torch.fx.Node):
+                return None
+            cur = arg
+            continue
+        # The chain may carry a binary op whose carrier we want to
+        # follow back. Use the FX node walk: descend the first
+        # tensor-typed input and continue.
+        for inp in cur.all_input_nodes:
+            cur = inp
+            break
+        else:
+            return None
     return None
 
 
 def analyze_tcgen05_unary_epilogue_chain(
     state: CodegenState, value_node: torch.fx.Node
 ) -> tuple[Tcgen05UnaryEpilogueChain, torch.fx.Node] | None:
-    """Classify ``value_node``'s producer chain as a whitelisted unary
+    """Classify ``value_node``'s producer chain as a whitelisted
     epilogue rooted at a tcgen05 matmul.
 
     Expected shape: ``value_node`` is the user-side store value, which
@@ -373,18 +660,28 @@ def analyze_tcgen05_unary_epilogue_chain(
     upstream from ``value_node``:
 
         convert_element_type (the implicit cast) ->
-        [whitelisted unary op]* ->
+        [whitelisted op]* ->
         accumulator carrier (phi / getitem on for_loop output ->
         registered tcgen05 matmul fx_node).
+
+    Whitelisted ops are zero-arg unary (``relu`` / ``tanh`` / ``exp``
+    / ``log`` / ``sqrt`` / ``abs`` / ``neg``), scalar binary
+    (``add`` / ``sub`` / ``mul`` / ``div`` against a compile-time
+    Python literal), and exact-shape auxiliary-tensor binary:
+    scalar binary against a ``helion.language.load`` of an
+    auxiliary GMEM tensor whose ``meta['val'].shape`` and rank
+    match the carrier's tile shape. Rank mismatches and 1-D
+    broadcast forms (``bias[tile_n]``) are rejected so the
+    loud-failure backstop fires.
 
     A user-written intermediate cast like
     ``out[tile] = relu(acc).to(d_inter)`` with ``d_inter`` not equal
     to the store target's dtype shows up as a *second*
     ``convert_element_type`` inside the chain. The chain step loop
     rejects that because ``convert_element_type`` is not on the
-    whitelist; the G3.1.0 backstop then fires. This means the splice
-    cannot silently drop a user-explicit intermediate cast — pinned
-    by ``test_tcgen05_fused_chain_rejects_intermediate_cast_dtype_mismatch``.
+    whitelist; the loud-failure backstop then fires. This means the
+    splice cannot silently drop a user-explicit intermediate cast —
+    pinned by ``test_tcgen05_fused_chain_rejects_intermediate_cast_dtype_mismatch``.
 
     Returns ``(chain, matmul_anchor)`` on success — the rendered chain
     excludes the trailing ``convert_element_type`` (the splice site
@@ -393,9 +690,9 @@ def analyze_tcgen05_unary_epilogue_chain(
     tcgen05 matmul fx_node whose ``result_var`` the splice should
     target. Returns ``None`` if the chain is not in the whitelist or
     multiple matmul anchors are reachable along the carrier path
-    (multi-input epilogues are G3.1.2 territory). The caller falls back
-    to the G3.1.0 ``BackendUnsupported`` raise on ``None`` so the
-    diagnostic keeps firing for non-whitelisted shapes.
+    (multi-input epilogues are deferred). The caller falls back
+    to the loud-failure ``BackendUnsupported`` raise on ``None`` so
+    the diagnostic keeps firing for non-whitelisted shapes.
 
     The chain may have ``steps == ()`` — i.e. ``out[tile] =
     acc.to(x.dtype)`` — in which case the splice site emits the
@@ -437,10 +734,19 @@ def analyze_tcgen05_unary_epilogue_chain(
         # would emit a no-op prelude + identical RHS, but the
         # contract that identity stores never see an
         # ``epilogue_chain`` keeps the no-chain code path
-        # byte-identical to the pre-G3.1-B golden.
+        # byte-identical to the unary-only golden.
         return None
 
-    steps: list[_UnaryStep] = []
+    # The chain carrier's expected tile shape and tile-id symbol
+    # nodes, used to validate auxiliary-tensor loads. Read once at
+    # the top — both are invariant along the chain because every
+    # accepted op preserves shape (zero-arg unary, scalar-binary,
+    # and exact-shape aux-binary all produce the same shape as
+    # their input).
+    carrier_tile_shape = _carrier_tile_shape(cast_input)
+    carrier_tile_index_nodes = _carrier_tile_index_nodes(cast_input)
+
+    steps: list[_UnaryStep | _AuxiliaryTensorStep] = []
     cur: torch.fx.Node = cast_input
     # Bound the walk so a pathological FX graph cannot loop forever.
     # 32 unary ops between the matmul and the cast is an absurd upper
@@ -465,9 +771,16 @@ def analyze_tcgen05_unary_epilogue_chain(
                 return Tcgen05UnaryEpilogueChain(steps=tuple(steps)), anchor
             cur = arg
             continue
-        # Scalar binary ops (commutative + non-commutative).
+        # Binary ops (scalar literal *or* aux-tensor load on the
+        # other side). The classifier rejects multi-tensor cases
+        # where neither operand is a recognized aux load and any
+        # kwarg-bearing form (``alpha=k``, etc.).
         if target in _SCALAR_BINARY_TARGETS:
-            classified = _classify_scalar_binary(cur)
+            classified = _classify_binary(
+                cur,
+                carrier_tile_shape=carrier_tile_shape,
+                carrier_tile_index_nodes=carrier_tile_index_nodes,
+            )
             if classified is None:
                 return None
             step, carrier = classified
@@ -480,7 +793,8 @@ def analyze_tcgen05_unary_epilogue_chain(
                 return Tcgen05UnaryEpilogueChain(steps=tuple(steps)), anchor
             cur = carrier
             continue
-        # Op not on the whitelist. Surfacing None lets the G3.1.0
-        # diagnostic raise so the user sees the actionable message.
+        # Op not on the whitelist. Surfacing None lets the
+        # loud-failure diagnostic raise so the user sees the
+        # actionable message.
         return None
     return None

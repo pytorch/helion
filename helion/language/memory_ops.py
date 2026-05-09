@@ -17,6 +17,7 @@ from .._compiler.ast_extension import statement_from_string
 from .._compiler.compile_environment import CompileEnvironment
 from .._compiler.compile_environment import _symint_expr
 from .._compiler.cute.cute_epilogue import Tcgen05UnaryEpilogueChain
+from .._compiler.cute.cute_epilogue import _AuxiliaryTensorStep
 from .._compiler.cute.cute_epilogue import analyze_tcgen05_unary_epilogue_chain
 from .._compiler.cute.cute_fx_walk import reach_tcgen05_matmul_anchors
 from .._compiler.cute.cutedsl_compat import emit_dealloc_mbarrier_initialized_kwarg
@@ -1693,17 +1694,183 @@ def _codegen_cute_store_tcgen05_tile(
     if tcgen05_value.epi_warp_count == 1:
         epi_warp_ids += ","
 
-    # G3.1.1: render the per-thread carrier expression for the
-    # accumulator vector. The identity epilogue (no chain or empty
-    # chain) emits the original `rAcc.load().to(target_dtype)` line.
-    # When a whitelisted unary chain is present, hoist `rAcc.load()` to
-    # a local TensorSSA so a chain like `cute.where(x > 0, x, 0)` reads
-    # the loaded vector once. Each splice site below uses the
-    # appropriate carrier name (`ttr_racc` for the SIMT path,
-    # `trs_racc` for the TMA path, and `tcgen05_tRS_rAcc` for the
-    # @cute.jit module helper). The returned snippet is a sequence of
-    # zero-or-one prelude statements (each newline-terminated, indented
-    # with `prelude_indent`) plus the assignment expression for
+    # Per-aux-step plumbing: per-thread auxiliary tensor reads at
+    # the splice site. For each ``_AuxiliaryTensorStep`` in the
+    # chain we register the auxiliary tensor as a kernel arg,
+    # allocate fresh AST var names for the partitioning chain, and
+    # later (inside each per-thread splice site) emit per-subtile
+    # ``aux_loaded = ttr_aux_subtile.load()`` lines that the chain
+    # renderer references.
+    #
+    # The aux load is unpredicated, so it is correct only when every
+    # tile in the launch is a full tile (the full-tile predicate is a
+    # no-op). The TMA-store epilogue is selected exclusively under
+    # ``static_full_tiles=True``, so gating on
+    # ``use_tma_store_epilogue`` keeps the aux fusion off the SIMT
+    # fallback path where edge tiles run a runtime-predicated copy.
+    # Reject the chain loudly when an aux step would otherwise reach
+    # the SIMT fallback so a user does not silently get out-of-bounds
+    # aux reads on edge tiles.
+    aux_steps_in_chain: tuple[_AuxiliaryTensorStep, ...] = (
+        epilogue_chain.auxiliary_tensor_steps if epilogue_chain is not None else ()
+    )
+    if aux_steps_in_chain and not tcgen05_value.use_tma_store_epilogue:
+        raise exc.BackendUnsupported(
+            "cute",
+            "auxiliary-tensor epilogue fusion (e.g. "
+            "`out[tile] = (acc + residual[tile]).to(dtype)`) requires "
+            "the static-full-tiles TMA-store epilogue. The active "
+            "tcgen05 lowering selected the SIMT-store fallback, where "
+            "edge tiles use a runtime predicate the splice does not "
+            "forward to the per-thread aux load. Adjust block sizes "
+            "so the problem dimensions are divisible by them, or drop "
+            "the auxiliary-tensor epilogue.",
+        )
+    aux_step_records: list[dict[str, str]] = []
+    for aux_idx, aux_step in enumerate(aux_steps_in_chain):
+        aux_tensor_node = aux_step.load_node.args[0]
+        assert isinstance(aux_tensor_node, torch.fx.Node)
+        aux_torch_tensor = aux_tensor_node.meta.get("val")
+        assert isinstance(aux_torch_tensor, torch.Tensor)
+        aux_tensor_name = df.tensor_arg(aux_torch_tensor).name
+        # Aux tensors must be passed through to the device function as
+        # placeholder args so the wrapper plumbs them into the cute
+        # kernel signature (the role-local persistent path otherwise
+        # treats unreferenced tensors as captures, which doesn't work
+        # for tensors only read inside a per-subtile loop body).
+        df.placeholder_args.add(aux_tensor_name)
+        aux_step_records.append(
+            {
+                "aux_tensor_name": aux_tensor_name,
+                "aux_tile": df.new_var(f"tcgen05_aux_tile_{aux_idx}"),
+                "aux_part_base": df.new_var(f"tcgen05_tCgAux_base_{aux_idx}"),
+                "aux_xfm": df.new_var(f"tcgen05_tCgAux_xfm_{aux_idx}"),
+                "aux_planned": df.new_var(f"tcgen05_tCgAux_planned_{aux_idx}"),
+                "aux_epi": df.new_var(f"tcgen05_tCgAux_epi_{aux_idx}"),
+                "ttr_aux": df.new_var(f"tcgen05_tTR_gAux_{aux_idx}"),
+                "ttr_aux_grouped": df.new_var(f"tcgen05_tTR_gAux_grouped_{aux_idx}"),
+                "ttr_aux_subtile": df.new_var(f"tcgen05_tTR_gAux_subtile_{aux_idx}"),
+                "aux_loaded": df.new_var(f"tcgen05_aux_loaded_{aux_idx}"),
+            }
+        )
+
+    # Pyrefly does not preserve the non-None ``tcgen05_value`` narrowing
+    # inside the nested source-formatter closures, so keep local
+    # string aliases for attributes the closures read.
+    tcgen05_aux_epi_tidx = tcgen05_value.epi_tidx
+    tcgen05_aux_epilogue_rest_mode = tcgen05_value.epilogue_rest_mode
+
+    def _aux_tile_setup_lines(
+        *, thr_copy_t2r_var: str, define_thr_copy_t2r: bool
+    ) -> list[str]:
+        """Emit the per-output-tile aux partitioning lines.
+
+        Each line goes once per output tile, before the per-subtile
+        loop. Mirrors the existing ``tcgc -> tcgc_planned -> tcgc_epi
+        -> ttr_gc -> ttr_gc_grouped`` pipeline used for the result D
+        tensor, but partitions a separate auxiliary GMEM tensor per
+        chain step. Calls ``thr_mma.partition_C`` and
+        ``thr_copy_t2r.partition_D`` against the aux tile so the
+        per-thread layout matches D's layout exactly — this is
+        correct for the exact-shape (``residual[tile_m, tile_n]``)
+        form step-1 supports.
+
+        When ``define_thr_copy_t2r`` is True the helper emits the
+        ``thr_copy_t2r = tiled_copy_t2r.get_slice(...)`` line first
+        (the TMA-store path does not otherwise create
+        ``thr_copy_t2r``); the SIMT path passes False because it
+        already creates the slice as part of its existing partition
+        pipeline.
+        """
+        lines: list[str] = []
+        if not aux_step_records:
+            return lines
+        if define_thr_copy_t2r:
+            lines.append(
+                f"{thr_copy_t2r_var} = "
+                f"{tiled_copy_t2r}.get_slice({tcgen05_aux_epi_tidx})"
+            )
+        for rec in aux_step_records:
+            lines.extend(
+                [
+                    (
+                        f"{rec['aux_tile']} = cute.local_tile("
+                        f"{rec['aux_tensor_name']}, ({tcgen05_bm}, {tcgen05_bn}), "
+                        f"({tile_coord_m}, {tile_coord_n}))"
+                    ),
+                    (
+                        f"{rec['aux_part_base']} = "
+                        f"{tcgen05_thr_mma}.partition_C({rec['aux_tile']})"
+                    ),
+                    (
+                        f"{rec['aux_xfm']} = "
+                        "cutlass.utils.gemm.sm100.transform_partitioned_tensor_layout("
+                        f"{rec['aux_part_base']})"
+                    ),
+                    (
+                        f"{rec['aux_planned']} = cute.make_tensor("
+                        f"{rec['aux_xfm']}.iterator, "
+                        f"cute.append(cute.append(cute.append({rec['aux_xfm']}.layout, "
+                        f"{tcgen05_aux_epilogue_rest_mode}), "
+                        f"{tcgen05_aux_epilogue_rest_mode}), "
+                        f"{tcgen05_aux_epilogue_rest_mode}))"
+                    ),
+                    (
+                        f"{rec['aux_epi']} = cute.flat_divide("
+                        f"{rec['aux_planned']}, {epi_tile})"
+                    ),
+                    (
+                        f"{rec['ttr_aux']} = "
+                        f"{thr_copy_t2r_var}.partition_D({rec['aux_epi']})"
+                    ),
+                    (
+                        f"{rec['ttr_aux_grouped']} = cute.group_modes("
+                        f"{rec['ttr_aux']}, 3, cute.rank({rec['ttr_aux']}))"
+                    ),
+                ]
+            )
+        return lines
+
+    def _aux_subtile_load_source(prelude_indent: str) -> str:
+        """Per-subtile aux-load source lines (one per aux step).
+
+        Each step emits the per-thread subtile slice + ``.load()``
+        call into a dedicated ``tcgen05_aux_loaded_*`` local. Goes
+        inside the per-subtile loop body, before the chain-rendering
+        prelude that consumes these locals.
+        """
+        if not aux_step_records:
+            return ""
+        lines: list[str] = []
+        for rec in aux_step_records:
+            lines.extend(
+                [
+                    (
+                        f"{prelude_indent}{rec['ttr_aux_subtile']} = "
+                        f"{rec['ttr_aux_grouped']}"
+                        f"[(None, None, None, cutlass.Int32(_tcgen05_subtile))]\n"
+                    ),
+                    (
+                        f"{prelude_indent}{rec['aux_loaded']} = "
+                        f"{rec['ttr_aux_subtile']}.load()\n"
+                    ),
+                ]
+            )
+        return "".join(lines)
+
+    # Render the per-thread carrier expression for the accumulator
+    # vector. The identity epilogue (no chain or empty chain) emits
+    # the original `rAcc.load().to(target_dtype)` line. When a
+    # chain is present, hoist `rAcc.load()` to a local TensorSSA so
+    # the chain reads the loaded vector once; for chains with
+    # auxiliary-tensor steps, also emit per-subtile aux-load lines
+    # that bind the aux locals the chain references. Each splice
+    # site below uses the appropriate carrier name (`ttr_racc` for
+    # the SIMT path, `trs_racc` for the TMA path, and
+    # `tcgen05_tRS_rAcc` for the @cute.jit module helper). The
+    # returned snippet is a sequence of zero-or-more prelude
+    # statements (each newline-terminated, indented with
+    # `prelude_indent`) plus the assignment expression for
     # `tcgen05_acc_vec`.
     def _splice_acc_vec(carrier_name: str, prelude_indent: str) -> tuple[str, str]:
         """Return ``(prelude, assignment_rhs)``. ``prelude`` is empty
@@ -1718,16 +1885,31 @@ def _codegen_cute_store_tcgen05_tile(
         and pessimize parse / IR-build time. Per-step locals keep
         the rendered source O(N) in chain depth and CuTe CSEs the
         loads at compile.
+
+        Auxiliary-tensor chain steps additionally emit a per-aux-step
+        ``ttr_aux_subtile = ...`` slice + ``aux_loaded = .load()``
+        line inside the prelude (so the chain renderer can reference
+        the bound local). The aux tile-level setup runs once per
+        output tile and is emitted by the splice site's surrounding
+        scaffolding via ``_aux_tile_setup_lines()``.
         """
         load_expr = f"{carrier_name}.load()"
         if epilogue_chain is None or not epilogue_chain.steps:
             return ("", f"{load_expr}.to({target_dtype})")
         loaded = df.new_var("tcgen05_acc_loaded")
         prelude_load = f"{prelude_indent}{loaded} = {load_expr}\n"
+        aux_load_lines = _aux_subtile_load_source(prelude_indent)
+        aux_locals = tuple(rec["aux_loaded"] for rec in aux_step_records)
         chain_prelude, final_expr = epilogue_chain.render_prelude_and_expr(
-            loaded, df.new_var, prelude_indent
+            loaded,
+            df.new_var,
+            prelude_indent,
+            aux_locals_by_step=aux_locals or None,
         )
-        return (prelude_load + chain_prelude, f"({final_expr}).to({target_dtype})")
+        return (
+            prelude_load + aux_load_lines + chain_prelude,
+            f"({final_expr}).to({target_dtype})",
+        )
 
     if tcgen05_value.use_tma_store_epilogue:
         df.placeholder_args.add(tensor_name)
@@ -1855,6 +2037,15 @@ def _codegen_cute_store_tcgen05_tile(
         ),
         f"{ttr_tacc} = cute.group_modes({ttr_tacc_stage}, 3, cute.rank({ttr_tacc_stage}))",
         f"{ttr_gc_grouped} = cute.group_modes({ttr_gc}, 3, cute.rank({ttr_gc}))",
+        # Per-aux-step partitioning lines (one chain per auxiliary
+        # tensor). No-op when the chain has no aux steps; generated
+        # source is byte-identical to the unary-chain shape for
+        # unary chains and to the identity-store golden for identity
+        # stores.
+        *_aux_tile_setup_lines(
+            thr_copy_t2r_var=thr_copy_t2r,
+            define_thr_copy_t2r=False,
+        ),
         (
             f"{ttr_racc} = cute.make_rmem_tensor("
             f"{ttr_gc_grouped}[(None, None, None, 0)].shape, cutlass.Float32)"
@@ -2023,6 +2214,31 @@ def _codegen_cute_store_tcgen05_tile(
                 f"{TCGEN05_EPILOGUE_LAYOUT_CONFIG_KEY}={epilogue_layout!r} is only "
                 f"validated for CtaGroup.TWO block_n >= {TCGEN05_TWO_CTA_BLOCK_N}",
             )
+        # The diagnostic split-epilogue layouts emit the per-thread
+        # chain into separate ``@cute.jit`` helpers (module-helper
+        # layouts) or split source boundaries; the auxiliary-tensor
+        # splice site needs per-tile aux setup that is not currently
+        # plumbed into those helper signatures. Reject the
+        # combination loudly so a user does not silently get a
+        # kernel that drops the aux read. The diagnostic layouts
+        # are only used for source-boundary investigation and do not
+        # block any production path.
+        if (
+            diagnose_module_helper_acc_t2r
+            or diagnose_module_helper_store_tail
+            or diagnose_split_first_t2r
+            or diagnose_split_acc_t2r_store_tail
+        ) and aux_steps_in_chain:
+            raise exc.BackendUnsupported(
+                "cute",
+                "auxiliary-tensor epilogue (e.g. "
+                "`out[tile] = (acc + residual[tile]).to(dtype)`) is "
+                f"not plumbed through {TCGEN05_EPILOGUE_LAYOUT_CONFIG_KEY}="
+                f"{epilogue_layout!r}. The diagnostic split-epilogue "
+                "layouts are only used for source-boundary "
+                "investigation; drop the layout config to use the "
+                "default production layout.",
+            )
     tma_store_first_subtile_acquire = (
         []
         if diagnose_first_c_acquire_in_loop
@@ -2120,7 +2336,27 @@ def _codegen_cute_store_tcgen05_tile(
     tcgen05_tma_store_atom = tcgen05_value.tma_store_atom
 
     def tma_store_acc_t2r_region(*, acc_wait: str) -> str:
-        prelude, rhs = _splice_acc_vec(trs_racc, "        ")
+        # When the chain has auxiliary-tensor steps, render the
+        # chain (and the destination store) in the ``ttr_*``
+        # (t2r-fragment) layout instead of the ``trs_*`` (r2s-
+        # retile) layout. The aux load is partitioned via
+        # ``thr_copy_t2r.partition_D`` so it lives in the t2r
+        # layout; the chain's binary ops require both operands in
+        # the same layout, and forcing the carrier to ``ttr_*``
+        # avoids an extra register-stage retile that would
+        # otherwise be needed for the GMEM-loaded aux. ``ttr_rd``
+        # and ``trs_rd`` share register storage (``trs_rd`` is
+        # ``epilogue_smem_copy_and_partition``'s retiled view of
+        # ``ttr_rd``), so storing into ``ttr_rd`` here makes the
+        # downstream ``cute.copy(tiled_copy_r2s, trs_rd, trs_sd)``
+        # see the same data.
+        if aux_steps_in_chain:
+            carrier = ttr_racc
+            store_target = ttr_rd
+        else:
+            carrier = trs_racc
+            store_target = trs_rd
+        prelude, rhs = _splice_acc_vec(carrier, "        ")
         return (
             f"{acc_wait}"
             f"        {ttr_tacc_mn} = {ttr_tacc}[(None, None, None, cutlass.Int32(_tcgen05_subtile))]\n"
@@ -2131,7 +2367,7 @@ def _codegen_cute_store_tcgen05_tile(
             f"            cute.arch.fence_view_async_tmem_load()\n"
             f"            with cute.arch.elect_one():\n"
             f"                {tcgen05_acc_pipeline}.consumer_release({tcgen05_acc_consumer_state})\n"
-            f"        {trs_rd}.store({acc_vec})\n"
+            f"        {store_target}.store({acc_vec})\n"
         )
 
     def tma_store_tail_region(*, late_later_subtile_acquire: str) -> str:
@@ -2491,6 +2727,18 @@ def _codegen_cute_store_tcgen05_tile(
         ),
         f"{trs_racc} = {tiled_copy_r2s}.retile({ttr_racc})",
         f"{tcgc_epi} = cute.flat_divide({tcgc_planned}, {epi_tile})",
+        # Per-aux-step partitioning lines (one chain per auxiliary
+        # tensor). No-op when the chain has no aux steps; the TMA
+        # path requires an explicit ``thr_copy_t2r`` slice because
+        # (unlike the SIMT path) the TMA path does not otherwise
+        # create one — the t2r partition is consumed directly by
+        # the SMEM-staged store, never via partition_D. The aux
+        # load needs partition_D to compute a per-thread GMEM read
+        # for the auxiliary tile so we create the slice here.
+        *_aux_tile_setup_lines(
+            thr_copy_t2r_var=thr_copy_t2r,
+            define_thr_copy_t2r=True,
+        ),
         (
             f"{bsg_sd}, {bsg_gd_partitioned} = cute.nvgpu.cpasync.tma_partition("
             f"{tcgen05_value.tma_store_atom}, 0, cute.make_layout(1), "
@@ -3072,22 +3320,22 @@ def _try_splice_tcgen05_unary_epilogue(
     extra_mask: ast.AST | None,
     value_node: torch.fx.Node | None,
 ) -> ast.AST | None:
-    """G3.1-B splice attempt for ``out[tile] = unary_chain(acc).to(x.dtype)``.
+    """Splice attempt for ``out[tile] = chain(acc).to(x.dtype)``.
 
     Returns the splice-completion sentinel (``ast.Constant(value=None)``)
     on a successful splice (the caller should return it directly), and
     ``None`` if the splice did not fire — the caller should continue to
-    the G3.1.0 backstop or the SIMT fallback.
+    the loud-failure backstop or the SIMT fallback.
 
     Splice is attempted only when the kernel has a tcgen05-registered
     matmul fx_node (``cute_tcgen05_matmul_fx_nodes`` non-empty), the
     store value has a backing FX node, the store target is a 2-D
     ``torch.Tensor``, and the chain analyzer accepts the value chain
-    (returning ``(chain, anchor)`` for a non-empty unary chain rooted
-    at a tcgen05 matmul). Chains the whitelist rejects (auxiliary-
-    tensor lambdas, reductions, kwarg-bearing scalar binaries, etc.)
-    leave the analyzer returning ``None`` and the splice does not
-    fire — the G3.1.0 backstop then catches them.
+    (returning ``(chain, anchor)`` for a non-empty chain rooted at
+    a tcgen05 matmul). Chains the whitelist rejects (broadcast aux
+    loads, reductions, kwarg-bearing binaries, etc.) leave the
+    analyzer returning ``None`` and the splice does not fire — the
+    loud-failure backstop then catches them.
     """
     if not state.device_function.cute_tcgen05_matmul_fx_nodes:
         return None
@@ -3099,14 +3347,7 @@ def _try_splice_tcgen05_unary_epilogue(
     if analyzed is None:
         return None
     chain, anchor = analyzed
-    # Defensive: the analyzer contract is to return ``None`` for
-    # identity stores (no chain steps), so a non-None return here
-    # always carries a non-empty chain. Pin the invariant.
-    assert chain.steps, (
-        "analyze_tcgen05_unary_epilogue_chain must return None for "
-        "identity stores (no chain steps); reaching the splice site "
-        "with an empty chain indicates a contract violation"
-    )
+    assert chain.steps
     anchor_result_var = (
         state.device_function.cute_tcgen05_matmul_fx_node_result_vars.get(anchor)
     )
@@ -3282,12 +3523,13 @@ def _(state: CodegenState) -> ast.AST:
                 state.add_statement(stmt)
             return ast.Constant(value=None)
 
-    # G3.1.1: try to splice a whitelisted unary-chain epilogue
-    # (`out[tile] = unary_chain(acc).to(x.dtype)`) into the role-local
+    # Try to splice a whitelisted chain epilogue
+    # (`out[tile] = chain(acc).to(x.dtype)`) into the role-local
     # tcgen05 epilogue's per-thread T2R loop. Implementation in
     # ``_try_splice_tcgen05_unary_epilogue``. Chains the whitelist
-    # rejects (auxiliary-tensor lambdas, reductions, etc.) leave the
-    # splice off and fall through to the G3.1.0 backstop below.
+    # rejects (broadcast aux loads, reductions, etc.) leave the
+    # splice off and fall through to the loud-failure backstop
+    # below.
     spliced = _try_splice_tcgen05_unary_epilogue(
         state, tensor, subscript, ast_subscript, extra_mask, value_node
     )
@@ -3314,19 +3556,22 @@ def _(state: CodegenState) -> ast.AST:
         raise exc.BackendUnsupported(
             "cute",
             "tcgen05 MMA path does not yet emit per-block-id indices "
-            "and masks for non-whitelisted or auxiliary-input fused "
-            "epilogues that follow the MMA. The store target's value "
-            "chain depends on a tcgen05 matmul result through ops the "
-            "G3.1-B chain analyzer rejects (e.g. auxiliary tensor loads "
-            "such as `acc + bias[tile_n]` or `acc + residual[tile]`, "
-            "non-scalar binary ops, `aten.add.Tensor` with `alpha=k`, "
-            "or an intermediate `.to(d_inter)` cast where `d_inter` "
-            "differs from the store-target dtype). Identity stores "
-            "(`out[tile] = acc.to(x.dtype)`) and whitelisted unary "
-            "chains (relu/tanh/exp/log/sqrt/abs/neg + scalar "
-            "add/sub/mul/div on the accumulator carrier) do work via "
-            "the G3.1-B fused-unary splice path. Auxiliary-tensor "
-            "fusion is queued as G3.1-C. See cute_plan.md §7.5.",
+            "and masks for non-whitelisted fused epilogues that follow "
+            "the MMA. The store target's value chain depends on a "
+            "tcgen05 matmul result through ops the chain analyzer "
+            "rejects (e.g. broadcast aux loads such as "
+            "`acc + bias[tile_n]`, aux tensors whose rank does not "
+            "match the carrier tile rank, non-scalar binary ops, "
+            "`aten.add.Tensor` with `alpha=k`, or an intermediate "
+            "`.to(d_inter)` cast where `d_inter` differs from the "
+            "store-target dtype). Identity stores "
+            "(`out[tile] = acc.to(x.dtype)`), whitelisted unary chains "
+            "(relu/tanh/exp/log/sqrt/abs/neg + scalar add/sub/mul/div "
+            "on the accumulator carrier), and exact-shape 2-D "
+            "auxiliary-tensor binary ops (`acc + residual[tile_m, "
+            "tile_n]`) do work via the fused-epilogue splice path. "
+            "Broadcast / rank-mismatch aux fusion is queued as the "
+            "next epilogue-fusion slice. See cute_plan.md §7.5.",
         )
 
     tensor_name = state.device_function.tensor_arg(tensor).name

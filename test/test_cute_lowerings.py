@@ -3478,27 +3478,93 @@ class TestCuteLowerings(unittest.TestCase):
 
     def test_tcgen05_fused_epilogue_store_raises_backend_unsupported(self) -> None:
         """A user-level epilogue lambda whose op chain is *not* on the
-        G3.1.1 whitelist (e.g., reads an auxiliary tensor or uses ops
-        the chain analyzer rejects) bails with a structured
-        ``BackendUnsupported`` instead of falling through to the cute
-        SIMT-store path that crashes inside the cute DSL on undefined
-        ``mask_<n>`` / ``indices_<n>`` names.
+        chain-analyzer whitelist (e.g., reads an auxiliary tensor
+        with a broadcast shape that the analyzer does not support,
+        or uses ops the analyzer rejects) bails with a structured
+        ``BackendUnsupported`` instead of falling through to the
+        cute SIMT-store path that crashes inside the cute DSL on
+        undefined ``mask_<n>`` / ``indices_<n>`` names.
 
         The two ``test_examples.py`` xfail tests
         (``test_epilogue_subtiling_residual_gelu`` and
-        ``test_epilogue_subtiling_gelu_aux``) catch the same shape via
-        ``xfailIfCute(...)``, but they only verify the kernel fails —
-        not that it fails *cleanly*. This test asserts the cute
-        backend produces a clear ``BackendUnsupported`` so a future
-        epilogue-fusion implementer sees the actionable message rather
-        than a cute-DSL crash on an undefined name.
+        ``test_epilogue_subtiling_gelu_aux``) catch the same shape
+        via ``xfailIfCute(...)``, but they only verify the kernel
+        fails — not that it fails *cleanly*. This test asserts the
+        cute backend produces a clear ``BackendUnsupported`` so a
+        future epilogue-fusion implementer sees the actionable
+        message rather than a cute-DSL crash on an undefined name.
 
-        G3.1.1 added the whitelist-based fused-unary splice for chains
-        like ``out[tile] = relu(acc).to(x.dtype)`` (covered by
-        ``test_tcgen05_fused_relu_epilogue_runtime_correctness``); this
-        test exercises the *rejected* path — a residual-add lambda
-        that reads an auxiliary tensor — so the G3.1.0 backstop still
-        fires for the G3.1.2 territory.
+        Exercises a still-rejected path — a 1-D bias broadcast
+        (``acc + bias[tile_n]``) which the analyzer rejects because
+        the aux load shape ``(tile_n,)`` does not match the carrier
+        tile shape ``(tile_m, tile_n)``. 1-D broadcast aux loads
+        are queued for the next epilogue-fusion slice (which adds a
+        dedicated C-input warp pipeline).
+        """
+
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_bias_broadcast(
+            x: torch.Tensor, y: torch.Tensor, bias: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                # 1-D broadcast aux tensor — the analyzer rejects this
+                # because the aux shape ``(tile_n,)`` does not match
+                # the carrier tile shape ``(tile_m, tile_n)``.
+                out[tile_m, tile_n] = (acc + bias[tile_n]).to(x.dtype)
+            return out
+
+        x = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
+        y = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
+        bias = torch.randn(128, dtype=torch.float32, device=DEVICE)
+        with (
+            self.assertRaises(exc.BackendUnsupported) as cm,
+            patch_cute_mma_support(),
+        ):
+            cute_matmul_bias_broadcast.bind((x, y, bias)).set_config(
+                _make_tcgen05_persistent_config(
+                    block_sizes=[128, 128, 32],
+                    pid_type="persistent_interleaved",
+                )
+            )
+            cute_matmul_bias_broadcast(x, y, bias)
+        # The diagnostic message points at the right invariant and the
+        # plan section that documents the fix.
+        message = str(cm.exception)
+        self.assertIn("tcgen05 MMA path", message)
+        self.assertIn("indices and masks", message)
+        self.assertIn("Identity stores", message)
+        self.assertIn("§7.5", message)
+
+    def test_tcgen05_fused_residual_epilogue_runtime_correctness(self) -> None:
+        """``out[tile] = (acc + residual[tile_m, tile_n]).to(x.dtype)``
+        after a tcgen05 matmul splices the residual load inline at the
+        per-thread T2R register and produces output bit-exact with
+        eager ``(x @ y + residual).to(...)`` on a single-tile bf16
+        shape.
+
+        Entrance test for the auxiliary-tensor fused-epilogue path.
+        The chain analyzer accepts the ``add`` op with a 2-D
+        residual load (matching the carrier tile shape) and renders
+        a per-thread aux read inline; the diagnostic backstop in
+        ``test_tcgen05_fused_epilogue_store_raises_backend_unsupported``
+        still fires for unsupported broadcast / multi-input forms.
+        Identity-store correctness is covered by
+        ``test_tcgen05_persistent_single_tile_runtime_correctness``;
+        the codegen marker pinning the new
+        ``tcgen05_aux_loaded_*``/``tcgen05_tCgAux_*`` partition
+        lines lives in
+        ``test_tcgen05_fused_residual_epilogue_codegen_marker``.
         """
 
         from helion._compiler.cute.mma_support import get_cute_mma_support
@@ -3517,33 +3583,252 @@ class TestCuteLowerings(unittest.TestCase):
                 acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
                 for tile_k in hl.tile(k):
                     acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
-                # Auxiliary-tensor lambda — the residual load is not on
-                # the whitelist, so the chain analyzer rejects this and
-                # the G3.1.0 backstop fires.
                 out[tile_m, tile_n] = (acc + residual[tile_m, tile_n]).to(x.dtype)
             return out
 
         x = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
         y = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
-        residual = torch.randn(128, 128, dtype=torch.float32, device=DEVICE)
+        # Residual is bf16 so the FX trace shows a single
+        # ``add`` op (no implicit dtype upcast); float32 residual
+        # would also be accepted by the analyzer but exercises a
+        # different decomp path. Use bf16 here for the simplest
+        # entrance test.
+        residual = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
+        bound = cute_matmul_residual.bind((x, y, residual))
+        bound.env.config_spec.cute_tcgen05_search_enabled = True
+        bound.set_config(
+            _make_tcgen05_persistent_config(
+                block_sizes=[128, 128, 32],
+                pid_type="persistent_interleaved",
+            )
+        )
+        out = bound(x, y, residual)
+        expected = (x @ y + residual).to(x.dtype)
+        torch.testing.assert_close(out, expected, atol=2e-1, rtol=1e-2)
+
+    def test_tcgen05_fused_residual_epilogue_codegen_marker(self) -> None:
+        """The spliced aux chain emits per-aux-step partition lines
+        (``tcgen05_aux_tile_*``, ``tcgen05_tCgAux_*``,
+        ``tcgen05_tTR_gAux_*``) plus per-subtile
+        ``tcgen05_aux_loaded_* = ttr_aux_subtile.load()`` lines that
+        the chain renderer references.
+
+        Anchors on the per-subtile loop body: the aux load + binary
+        chain step lines must appear after the T2R copy and before the
+        ``tcgen05_acc_vec`` cast. This pins the splice's structural
+        ordering without locking in line-by-line text — a future
+        refactor that adds another step or renames a local can move
+        text around but must keep the rendering shape intact.
+        """
+
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_residual(
+            x: torch.Tensor, y: torch.Tensor, residual: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = (acc + residual[tile_m, tile_n]).to(x.dtype)
+            return out
+
+        x = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
+        y = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
+        residual = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
+        with patch_cute_mma_support():
+            bound = cute_matmul_residual.bind((x, y, residual))
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            cfg = _make_tcgen05_persistent_config(
+                block_sizes=[128, 128, 32],
+                pid_type="persistent_interleaved",
+            )
+            bound.set_config(cfg)
+            code = bound.to_triton_code(cfg)
+        # Structural pins: the aux setup pipeline emitted at least
+        # one of each per-aux-step var, and the per-subtile body
+        # produced ``aux_loaded`` + ``chain_step`` locals before
+        # ``acc_vec``.
+        self.assertIn("tcgen05_aux_tile_0", code)
+        self.assertIn("tcgen05_tCgAux_base_0", code)
+        self.assertIn("tcgen05_tTR_gAux_0", code)
+        self.assertIn("tcgen05_aux_loaded_0", code)
+        self.assertIn("tcgen05_chain_step", code)
+        # The chain renderer must produce
+        # ``aux_loaded ... chain_step ... acc_vec`` in that order
+        # (inside the per-subtile loop body).
+        first_aux_loaded = code.find("tcgen05_aux_loaded_0")
+        self.assertGreaterEqual(first_aux_loaded, 0)
+        first_step = code.find("tcgen05_chain_step", first_aux_loaded)
+        first_vec = code.find("tcgen05_acc_vec", first_step)
+        self.assertGreater(first_step, first_aux_loaded)
+        self.assertGreater(first_vec, first_step)
+
+    def test_tcgen05_fused_aux_rejects_extra_mask(self) -> None:
+        """Reject auxiliary loads with non-default ``extra_mask``
+        arguments. ``hl.load(aux, [...], extra_mask=...)`` carries
+        user-defined masking semantics that the per-thread splice
+        does not forward; silently dropping the mask would change
+        runtime semantics. The loud-failure backstop fires instead
+        so the user sees the actionable diagnostic.
+        """
+
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_residual_masked(
+            x: torch.Tensor,
+            y: torch.Tensor,
+            residual: torch.Tensor,
+            mask: torch.Tensor,
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                # `extra_mask` is non-default — the analyzer must
+                # bail to the G3.1.0 backstop rather than silently
+                # drop the mask.
+                aux = hl.load(
+                    residual,
+                    [tile_m, tile_n],
+                    extra_mask=mask[tile_m, tile_n],
+                )
+                out[tile_m, tile_n] = (acc + aux).to(x.dtype)
+            return out
+
+        x = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
+        y = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
+        residual = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
+        mask = torch.ones(128, 128, dtype=torch.bool, device=DEVICE)
         with (
             self.assertRaises(exc.BackendUnsupported) as cm,
             patch_cute_mma_support(),
         ):
-            cute_matmul_residual.bind((x, y, residual)).set_config(
+            cute_matmul_residual_masked.bind((x, y, residual, mask)).set_config(
                 _make_tcgen05_persistent_config(
                     block_sizes=[128, 128, 32],
                     pid_type="persistent_interleaved",
                 )
             )
-            cute_matmul_residual(x, y, residual)
-        # The diagnostic message points at the right invariant and the
-        # plan section that documents the fix.
+            cute_matmul_residual_masked(x, y, residual, mask)
+        # The diagnostic must point at the cute MMA path (the
+        # loud-failure backstop message).
+        self.assertIn("tcgen05 MMA path", str(cm.exception))
+
+    def test_tcgen05_fused_aux_rejects_rank_mismatch(self) -> None:
+        """Reject 2-D aux loads whose underlying tensor is rank-3
+        with a static collapse (``aux3d[tile_m, tile_n, 0]``). The
+        load result shape is 2-D and would pass the result-shape
+        check, but ``cute.local_tile(aux_tensor, (bm, bn),
+        (coord_m, coord_n))`` would receive a rank-3 tensor with a
+        rank-2 tile shape — invalid codegen. The classifier also
+        requires the underlying tensor rank to match the carrier
+        rank, so the loud-failure backstop fires.
+        """
+
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_residual_3d(
+            x: torch.Tensor, y: torch.Tensor, residual3d: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                # 3-D underlying tensor with a static collapse on
+                # the trailing axis. The 2-D result shape matches
+                # the carrier, but the underlying rank does not.
+                out[tile_m, tile_n] = (acc + residual3d[tile_m, tile_n, 0]).to(x.dtype)
+            return out
+
+        x = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
+        y = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
+        residual3d = torch.randn(128, 128, 1, dtype=torch.bfloat16, device=DEVICE)
+        with (
+            self.assertRaises(exc.BackendUnsupported) as cm,
+            patch_cute_mma_support(),
+        ):
+            cute_matmul_residual_3d.bind((x, y, residual3d)).set_config(
+                _make_tcgen05_persistent_config(
+                    block_sizes=[128, 128, 32],
+                    pid_type="persistent_interleaved",
+                )
+            )
+            cute_matmul_residual_3d(x, y, residual3d)
+        self.assertIn("tcgen05 MMA path", str(cm.exception))
+
+    def test_tcgen05_fused_aux_rejects_non_static_full_shape(self) -> None:
+        """Reject aux fusion when the active lowering selects the
+        SIMT-store fallback (``static_full_tiles=False``). On the
+        SIMT path edge tiles run a runtime-predicated copy; the
+        unpredicated aux load would otherwise read past the aux
+        tensor on edge tiles. The classifier still accepts the
+        chain, but the splice-site gate raises
+        ``BackendUnsupported`` so a user does not silently get
+        out-of-bounds aux reads.
+        """
+
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_residual_partial(
+            x: torch.Tensor, y: torch.Tensor, residual: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = (acc + residual[tile_m, tile_n]).to(x.dtype)
+            return out
+
+        # Problem-size NOT divisible by block size on the M axis
+        # (M=192, block_m=128 → 1 full tile + 1 partial tile),
+        # so ``static_full_tiles`` is False and the kernel selects
+        # the SIMT-store fallback.
+        x = torch.randn(192, 128, dtype=torch.bfloat16, device=DEVICE)
+        y = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
+        residual = torch.randn(192, 128, dtype=torch.bfloat16, device=DEVICE)
+        with (
+            self.assertRaises(exc.BackendUnsupported) as cm,
+            patch_cute_mma_support(),
+        ):
+            cute_matmul_residual_partial.bind((x, y, residual)).set_config(
+                _make_tcgen05_persistent_config(
+                    block_sizes=[128, 128, 32],
+                    pid_type="persistent_interleaved",
+                )
+            )
+            cute_matmul_residual_partial(x, y, residual)
         message = str(cm.exception)
-        self.assertIn("tcgen05 MMA path", message)
-        self.assertIn("indices and masks", message)
-        self.assertIn("Identity stores", message)
-        self.assertIn("G3.1", message)
+        self.assertIn("auxiliary-tensor", message)
+        self.assertIn("static-full-tiles", message)
 
     def _make_relu_matmul_kernel(self):
         """Return a ``@helion.kernel(backend="cute")`` matmul-relu
