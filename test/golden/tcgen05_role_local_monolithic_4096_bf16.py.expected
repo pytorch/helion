@@ -1,0 +1,316 @@
+from __future__ import annotations
+
+import torch
+import helion
+import cutlass
+import cutlass.cute as cute
+from helion.runtime import default_cute_launcher as _default_cute_launcher
+
+_BLOCK_SIZE_0 = 256
+_BLOCK_SIZE_1 = 256
+_BLOCK_SIZE_2 = 128
+
+@cute.kernel
+def _helion_cute_matmul_role_local_monolithic_4096_bf16(x, y, out, tma_atom_a, tma_tensor_a, tma_atom_b, tma_tensor_b, tcgen05_tma_store_atom, tcgen05_tma_store_tensor):
+    # src[_tcgen05_role_local_monolithic_4096_bf16_kernel.py:32]: for tile_m, tile_n in hl.tile([m, n]):
+    num_blocks_0 = (4096 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0
+    # src[_tcgen05_role_local_monolithic_4096_bf16_kernel.py:33]: acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+    acc = cutlass.Float32(0.0)
+    # src[_tcgen05_role_local_monolithic_4096_bf16_kernel.py:35]: acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+    tcgen05_warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+    tcgen05_lane_idx = cute.arch.lane_idx()
+    mma_tidx = cutlass.Int32(cute.arch.thread_idx()[0]) + cutlass.Int32(cute.arch.thread_idx()[1]) * cutlass.Int32(32)
+    mma_copy_tidx = mma_tidx
+    mma_active = cutlass.Int32(cute.arch.thread_idx()[1]) < cutlass.Int32(2)
+    tcgen05_tma_warp = tcgen05_warp_idx == cutlass.Int32(5)
+    tcgen05_exec_active = tcgen05_warp_idx == cutlass.Int32(4)
+    tcgen05_epi_active = tcgen05_warp_idx < cutlass.Int32(4)
+    tcgen05_epi_tidx = tcgen05_lane_idx + tcgen05_warp_idx * cutlass.Int32(32) if tcgen05_epi_active else cutlass.Int32(0)
+    if not (tcgen05_exec_active or tcgen05_epi_active):
+        cute.arch.setmaxregister_decrease(120)
+    if tcgen05_exec_active or tcgen05_epi_active:
+        cute.arch.setmaxregister_increase(256)
+    mma_slice_tidx = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster()) % cutlass.Int32(2)
+    tiled_mma = cutlass.utils.blackwell_helpers.make_trivial_tiled_mma(cutlass.BFloat16, cute.nvgpu.tcgen05.OperandMajorMode.K, cute.nvgpu.tcgen05.OperandMajorMode.MN, cutlass.Float32, cute.nvgpu.tcgen05.CtaGroup.TWO, (256, 256), cute.nvgpu.tcgen05.OperandSource.SMEM)
+    thr_mma = tiled_mma.get_slice(mma_slice_tidx)
+    tcgen05_cluster_layout_vmnk = cute.tiled_divide(cute.make_layout((2, 1, 1)), (tiled_mma.thr_id.shape,))
+    sA_layout = cutlass.utils.blackwell_helpers.make_smem_layout_a(tiled_mma, (256, 256, 128), cutlass.BFloat16, 2)
+    sB_layout = cutlass.utils.blackwell_helpers.make_smem_layout_b(tiled_mma, (256, 256, 128), cutlass.BFloat16, 2)
+    tcgen05_c_layout = cutlass.utils.layout.LayoutEnum.ROW_MAJOR
+    tcgen05_epi_tile = cutlass.utils.blackwell_helpers.compute_epilogue_tile_shape((256, 256), False, tcgen05_c_layout, cutlass.Float32)
+    tcgen05_tmem_load_atom = cutlass.utils.blackwell_helpers.get_tmem_load_op((256, 256, 128), tcgen05_c_layout, cutlass.Float32, cutlass.Float32, tcgen05_epi_tile, True)
+    tcgen05_epilogue_rest_mode = cute.make_layout(1, stride=0)
+    acc_frag_base = tiled_mma.make_fragment_C(cute.append(tiled_mma.partition_shape_C((256, 256)), 2))
+    tcgen05_acc_tmem_cols = cutlass.utils.get_num_tmem_alloc_cols(acc_frag_base, arch='sm_100')
+    tcgen05_tmem_holding_buf = cute.arch.alloc_smem(cutlass.Int32, 1)
+    tcgen05_tmem_dealloc_mbar_ptr = cute.arch.alloc_smem(cutlass.Int64, 1)
+    tcgen05_tmem_alloc_barrier = cutlass.pipeline.NamedBarrier(barrier_id=1, num_threads=160)
+    tcgen05_tmem_allocator = cutlass.utils.TmemAllocator(tcgen05_tmem_holding_buf, barrier_for_retrieve=tcgen05_tmem_alloc_barrier, allocator_warp_id=0, is_two_cta=True, two_cta_tmem_dealloc_mbar_ptr=tcgen05_tmem_dealloc_mbar_ptr)
+    tcgen05_acc_pipeline_barriers = cute.arch.alloc_smem(cutlass.Int64, cutlass.Int32(4))
+    tcgen05_acc_pipeline_producer_group = cutlass.pipeline.CooperativeGroup(cutlass.pipeline.Agent.Thread)
+    tcgen05_acc_pipeline_consumer_group = cutlass.pipeline.CooperativeGroup(cutlass.pipeline.Agent.Thread, cutlass.Int32(8))
+    tcgen05_acc_pipeline = cutlass.pipeline.PipelineUmmaAsync.create(num_stages=2, producer_group=tcgen05_acc_pipeline_producer_group, consumer_group=tcgen05_acc_pipeline_consumer_group, barrier_storage=tcgen05_acc_pipeline_barriers, cta_layout_vmnk=tcgen05_cluster_layout_vmnk, defer_sync=True)
+    tcgen05_acc_producer_state = cutlass.pipeline.make_pipeline_state(cutlass.pipeline.PipelineUserType.Producer, 2)
+    tcgen05_acc_consumer_state = cutlass.pipeline.make_pipeline_state(cutlass.pipeline.PipelineUserType.Consumer, 2)
+    smem_a = cute.arch.alloc_smem(cutlass.BFloat16, cute.cosize(sA_layout.outer), alignment=128)
+    sA = cute.make_tensor(cute.recast_ptr(smem_a, sA_layout.inner, dtype=cutlass.BFloat16), sA_layout.outer)
+    smem_b = cute.arch.alloc_smem(cutlass.BFloat16, cute.cosize(sB_layout.outer), alignment=128)
+    sB = cute.make_tensor(cute.recast_ptr(smem_b, sB_layout.inner, dtype=cutlass.BFloat16), sB_layout.outer)
+    tcgen05_tCrA = tiled_mma.make_fragment_A(sA)
+    tcgen05_tCrB = tiled_mma.make_fragment_B(sB)
+    sA_tma_layout = cute.slice_(sA_layout, (None, None, None, 0))
+    sB_tma_layout = cute.slice_(sB_layout, (None, None, None, 0))
+    tma_thr_mma = tiled_mma.get_slice(mma_slice_tidx)
+    tma_a_cta_layout = cute.make_layout(cute.slice_(tcgen05_cluster_layout_vmnk, (0, 0, None, 0)).shape)
+    tma_b_cta_layout = cute.make_layout(cute.slice_(tcgen05_cluster_layout_vmnk, (0, None, 0, 0)).shape)
+    tcgen05_cta_rank_in_cluster = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
+    tcgen05_block_in_cluster_coord_vmnk = tcgen05_cluster_layout_vmnk.get_flat_coord(tcgen05_cta_rank_in_cluster)
+    tma_a_cta_coord = tcgen05_block_in_cluster_coord_vmnk[2]
+    tma_b_cta_coord = tcgen05_block_in_cluster_coord_vmnk[1]
+    tcgen05_a_mcast_mask = cute.nvgpu.cpasync.create_tma_multicast_mask(tcgen05_cluster_layout_vmnk, tcgen05_block_in_cluster_coord_vmnk, mcast_mode=2)
+    tcgen05_b_mcast_mask = cute.nvgpu.cpasync.create_tma_multicast_mask(tcgen05_cluster_layout_vmnk, tcgen05_block_in_cluster_coord_vmnk, mcast_mode=1)
+    tcgen05_ab_pipeline_mbars = cute.arch.alloc_smem(cutlass.Int64, cutlass.Int32(2))
+    tcgen05_ab_pipeline_producer_group = cutlass.pipeline.CooperativeGroup(cutlass.pipeline.Agent.Thread, 1)
+    tcgen05_ab_pipeline_consumer_group = cutlass.pipeline.CooperativeGroup(cutlass.pipeline.Agent.Thread, cutlass.Int32(1))
+    tcgen05_ab_pipeline_tx_count = (cute.size_in_bytes(cutlass.BFloat16, sA_tma_layout) + cute.size_in_bytes(cutlass.BFloat16, sB_tma_layout)) * cute.size(tiled_mma.thr_id.shape)
+    tcgen05_ab_pipeline = cutlass.pipeline.PipelineTmaUmma.create(num_stages=2, producer_group=tcgen05_ab_pipeline_producer_group, consumer_group=tcgen05_ab_pipeline_consumer_group, tx_count=tcgen05_ab_pipeline_tx_count, barrier_storage=tcgen05_ab_pipeline_mbars, cta_layout_vmnk=tcgen05_cluster_layout_vmnk, defer_sync=True)
+    tcgen05_ab_producer_state = cutlass.pipeline.make_pipeline_state(cutlass.pipeline.PipelineUserType.Producer, 2)
+    tcgen05_ab_consumer_state = cutlass.pipeline.make_pipeline_state(cutlass.pipeline.PipelineUserType.Consumer, 2)
+    cutlass.pipeline.pipeline_init_arrive(cluster_shape_mn=tcgen05_cluster_layout_vmnk, is_relaxed=True)
+    cutlass.pipeline.pipeline_init_wait(cluster_shape_mn=tcgen05_cluster_layout_vmnk)
+    if tcgen05_epi_active:
+        tcgen05_tmem_allocator.allocate(tcgen05_acc_tmem_cols)
+    tcgen05_exec_acc_tmem_ptr = cute.make_ptr(cutlass.Float32, 0, cute.AddressSpace.tmem, assumed_align=16)
+    tcgen05_epi_acc_tmem_ptr = cute.make_ptr(cutlass.Float32, 0, cute.AddressSpace.tmem, assumed_align=16)
+    if tcgen05_exec_active:
+        tcgen05_tmem_allocator.wait_for_alloc()
+        tcgen05_exec_acc_tmem_ptr = tcgen05_tmem_allocator.retrieve_ptr(cutlass.Float32)
+    if tcgen05_epi_active:
+        tcgen05_tmem_allocator.wait_for_alloc()
+        tcgen05_epi_acc_tmem_ptr = tcgen05_tmem_allocator.retrieve_ptr(cutlass.Float32)
+    tcgen05_exec_acc_frag_base = cute.make_tensor(tcgen05_exec_acc_tmem_ptr, acc_frag_base.layout)
+    tcgen05_epi_acc_frag_base = cute.make_tensor(tcgen05_epi_acc_tmem_ptr, acc_frag_base.layout)
+    # src[_tcgen05_role_local_monolithic_4096_bf16_kernel.py:36]: out[tile_m, tile_n] = acc.to(x.dtype)
+    tcgen05_epilog_sync_barrier = cutlass.pipeline.NamedBarrier(barrier_id=cutlass.Int32(2), num_threads=cutlass.Int32(128))
+    tcgen05_c_pipeline_producer_group = cutlass.pipeline.CooperativeGroup(cutlass.pipeline.Agent.Thread, cutlass.Int32(128))
+    tcgen05_c_pipeline = cutlass.pipeline.PipelineTmaStore.create(num_stages=2, producer_group=tcgen05_c_pipeline_producer_group)
+    tcgen05_kernel_desc = type('Tcgen05KernelDesc', (), {'cta_tile_shape_mnk': (256, 256, 128), 'c_layout': cutlass.utils.layout.LayoutEnum.ROW_MAJOR, 'c_dtype': cutlass.BFloat16, 'acc_dtype': cutlass.Float32, 'epilog_sync_bar_id': cutlass.Int32(2), 'epilogue_warp_id': (cutlass.Int32(0), cutlass.Int32(1), cutlass.Int32(2), cutlass.Int32(3)), 'num_c_stage': cutlass.Int32(2), 'use_2cta_instrs': True})()
+    tcgen05_store_epi_tile = cutlass.utils.blackwell_helpers.compute_epilogue_tile_shape((256, 256), False, cutlass.utils.layout.LayoutEnum.ROW_MAJOR, cutlass.BFloat16)
+    tcgen05_sD_layout = cutlass.utils.blackwell_helpers.make_smem_layout_epi(cutlass.BFloat16, cutlass.utils.layout.LayoutEnum.ROW_MAJOR, tcgen05_store_epi_tile, 2)
+    tcgen05_sD_ptr = cute.arch.alloc_smem(cutlass.BFloat16, cute.cosize(tcgen05_sD_layout.outer), alignment=1024)
+    tcgen05_sD = cute.make_tensor(cute.recast_ptr(tcgen05_sD_ptr, tcgen05_sD_layout.inner, dtype=cutlass.BFloat16), tcgen05_sD_layout.outer)
+    tcgen05_tAcc = cutlass.utils.gemm.sm100.transform_partitioned_tensor_layout(tcgen05_epi_acc_frag_base)
+    # src[_tcgen05_role_local_monolithic_4096_bf16_kernel.py:32]: for tile_m, tile_n in hl.tile([m, n]):
+    # src[_tcgen05_role_local_monolithic_4096_bf16_kernel.py:33]:     acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+    # src[_tcgen05_role_local_monolithic_4096_bf16_kernel.py:34]:     for tile_k in hl.tile(k):
+    # src[_tcgen05_role_local_monolithic_4096_bf16_kernel.py:32-36]: ...
+    if cute.arch.make_warp_uniform(cute.arch.warp_idx()) == cutlass.Int32(5):
+        cute.arch.griddepcontrol_wait()
+        tcgen05_role_local_0_tile_sched_params = cutlass.utils.PersistentTileSchedulerParams(((4096 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0 * 2, (4096 + _BLOCK_SIZE_1 - 1) // _BLOCK_SIZE_1, 1), (2, 1, 1))
+        tcgen05_role_local_0_tile_sched = cutlass.utils.StaticPersistentTileScheduler.create(tcgen05_role_local_0_tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim())
+        tcgen05_role_local_0_work_tile = tcgen05_role_local_0_tile_sched.initial_work_tile_info()
+        while tcgen05_role_local_0_work_tile.is_valid_tile:
+            virtual_pid = tcgen05_role_local_0_work_tile.tile_idx[0] // cutlass.Int32(2) + tcgen05_role_local_0_work_tile.tile_idx[1] * ((4096 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0)
+            # src[_tcgen05_role_local_monolithic_4096_bf16_kernel.py:32]: for tile_m, tile_n in hl.tile([m, n]):
+            pid_0 = virtual_pid % num_blocks_0
+            pid_1 = virtual_pid // num_blocks_0
+            offset_0 = pid_0 * _BLOCK_SIZE_0
+            offset_1 = pid_1 * _BLOCK_SIZE_1
+            # src[_tcgen05_role_local_monolithic_4096_bf16_kernel.py:35]: acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+            gA_tma = cute.local_tile(tma_tensor_a, (256, 128), (offset_0 // cutlass.Int32(256), None))
+            gB_tma = cute.local_tile(tma_tensor_b, (256, 128), (offset_1 // cutlass.Int32(256), None))
+            gA_tma_part = tma_thr_mma.partition_A(gA_tma)
+            gB_tma_part = tma_thr_mma.partition_B(gB_tma)
+            tma_sA, tma_gA = cute.nvgpu.cpasync.tma_partition(tma_atom_a, tma_a_cta_coord, tma_a_cta_layout, cute.group_modes(sA, 0, cute.rank(sA) - 1), cute.group_modes(gA_tma_part, 0, cute.rank(gA_tma_part) - 1))
+            tma_sB, tma_gB = cute.nvgpu.cpasync.tma_partition(tma_atom_b, tma_b_cta_coord, tma_b_cta_layout, cute.group_modes(sB, 0, cute.rank(sB) - 1), cute.group_modes(gB_tma_part, 0, cute.rank(gB_tma_part) - 1))
+            tcgen05_tma_initial_full_tile = offset_0 + cutlass.Int32(256) <= cutlass.Int32(4096) and offset_1 + cutlass.Int32(256) <= cutlass.Int32(4096) and (cutlass.Int32(128) <= cutlass.Int32(4096))
+            if tcgen05_tma_initial_full_tile and tcgen05_tma_warp:
+                tcgen05_ab_pipeline.producer_acquire(tcgen05_ab_producer_state)
+                tcgen05_tma_barrier = tcgen05_ab_pipeline.producer_get_barrier(tcgen05_ab_producer_state)
+                cute.copy(tma_atom_a, tma_gA[None, cutlass.Int32(0)], tma_sA[None, tcgen05_ab_producer_state.index], tma_bar_ptr=tcgen05_tma_barrier, mcast_mask=tcgen05_a_mcast_mask)
+                cute.copy(tma_atom_b, tma_gB[None, cutlass.Int32(0)], tma_sB[None, tcgen05_ab_producer_state.index], tma_bar_ptr=tcgen05_tma_barrier, mcast_mask=tcgen05_b_mcast_mask)
+                tcgen05_ab_pipeline.producer_commit(tcgen05_ab_producer_state)
+                tcgen05_ab_producer_state.advance()
+            tcgen05_tma_initial_next_full_tile = offset_0 + cutlass.Int32(256) <= cutlass.Int32(4096) and offset_1 + cutlass.Int32(256) <= cutlass.Int32(4096) and (cutlass.Int32(256) <= cutlass.Int32(4096))
+            if tcgen05_tma_initial_full_tile and tcgen05_tma_initial_next_full_tile and tcgen05_tma_warp:
+                tcgen05_ab_pipeline.producer_acquire(tcgen05_ab_producer_state)
+                tcgen05_tma_barrier = tcgen05_ab_pipeline.producer_get_barrier(tcgen05_ab_producer_state)
+                cute.copy(tma_atom_a, tma_gA[None, cutlass.Int32(1)], tma_sA[None, tcgen05_ab_producer_state.index], tma_bar_ptr=tcgen05_tma_barrier, mcast_mask=tcgen05_a_mcast_mask)
+                cute.copy(tma_atom_b, tma_gB[None, cutlass.Int32(1)], tma_sB[None, tcgen05_ab_producer_state.index], tma_bar_ptr=tcgen05_tma_barrier, mcast_mask=tcgen05_b_mcast_mask)
+                tcgen05_ab_pipeline.producer_commit(tcgen05_ab_producer_state)
+                tcgen05_ab_producer_state.advance()
+            for offset_2 in range(cutlass.Int32(0), cutlass.Int32(4096), cutlass.Int32(_BLOCK_SIZE_2)):
+                tcgen05_tma_k_tile = offset_2 // cutlass.Int32(128)
+                tcgen05_tma_full_tile = offset_0 + cutlass.Int32(256) <= cutlass.Int32(4096) and offset_1 + cutlass.Int32(256) <= cutlass.Int32(4096) and (offset_2 + cutlass.Int32(128) <= cutlass.Int32(4096))
+                tcgen05_tma_next_full_tile = offset_0 + cutlass.Int32(256) <= cutlass.Int32(4096) and offset_1 + cutlass.Int32(256) <= cutlass.Int32(4096) and (offset_2 + cutlass.Int32(384) <= cutlass.Int32(4096))
+                tcgen05_ab_producer_try_token = cutlass.Boolean(0)
+                if tcgen05_tma_full_tile and tcgen05_tma_next_full_tile:
+                    tcgen05_ab_producer_try_token = tcgen05_ab_pipeline.producer_try_acquire(tcgen05_ab_producer_state)
+                    tcgen05_ab_pipeline.producer_acquire(tcgen05_ab_producer_state, tcgen05_ab_producer_try_token)
+                    tcgen05_tma_barrier = tcgen05_ab_pipeline.producer_get_barrier(tcgen05_ab_producer_state)
+                    cute.copy(tma_atom_a, tma_gA[None, tcgen05_tma_k_tile + cutlass.Int32(2)], tma_sA[None, tcgen05_ab_producer_state.index], tma_bar_ptr=tcgen05_tma_barrier, mcast_mask=tcgen05_a_mcast_mask)
+                    cute.copy(tma_atom_b, tma_gB[None, tcgen05_tma_k_tile + cutlass.Int32(2)], tma_sB[None, tcgen05_ab_producer_state.index], tma_bar_ptr=tcgen05_tma_barrier, mcast_mask=tcgen05_b_mcast_mask)
+                    tcgen05_ab_pipeline.producer_commit(tcgen05_ab_producer_state)
+                    tcgen05_ab_producer_state.advance()
+            # src[_tcgen05_role_local_monolithic_4096_bf16_kernel.py:32]: for tile_m, tile_n in hl.tile([m, n]):
+            # src[_tcgen05_role_local_monolithic_4096_bf16_kernel.py:33]:     acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+            # src[_tcgen05_role_local_monolithic_4096_bf16_kernel.py:34]:     for tile_k in hl.tile(k):
+            # src[_tcgen05_role_local_monolithic_4096_bf16_kernel.py:32-36]: ...
+            tcgen05_role_local_0_tile_sched.advance_to_next_work()
+            tcgen05_role_local_0_work_tile = tcgen05_role_local_0_tile_sched.get_current_work()
+    if cute.arch.make_warp_uniform(cute.arch.warp_idx()) == cutlass.Int32(4):
+        tcgen05_role_local_1_tile_sched_params = cutlass.utils.PersistentTileSchedulerParams(((4096 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0 * 2, (4096 + _BLOCK_SIZE_1 - 1) // _BLOCK_SIZE_1, 1), (2, 1, 1))
+        tcgen05_role_local_1_tile_sched = cutlass.utils.StaticPersistentTileScheduler.create(tcgen05_role_local_1_tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim())
+        tcgen05_role_local_1_work_tile = tcgen05_role_local_1_tile_sched.initial_work_tile_info()
+        while tcgen05_role_local_1_work_tile.is_valid_tile:
+            virtual_pid = tcgen05_role_local_1_work_tile.tile_idx[0] // cutlass.Int32(2) + tcgen05_role_local_1_work_tile.tile_idx[1] * ((4096 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0)
+            # src[_tcgen05_role_local_monolithic_4096_bf16_kernel.py:32]: for tile_m, tile_n in hl.tile([m, n]):
+            pid_0 = virtual_pid % num_blocks_0
+            pid_1 = virtual_pid // num_blocks_0
+            offset_0 = pid_0 * _BLOCK_SIZE_0
+            offset_1 = pid_1 * _BLOCK_SIZE_1
+            # src[_tcgen05_role_local_monolithic_4096_bf16_kernel.py:35]: acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+            acc_frag = tcgen05_exec_acc_frag_base[None, None, None, tcgen05_acc_producer_state.index]
+            tcgen05_ab_consumer_try_token = cutlass.Boolean(1)
+            if cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster()) == cutlass.Int32(0):
+                tcgen05_ab_consumer_try_token = tcgen05_ab_pipeline.consumer_try_wait(tcgen05_ab_consumer_state)
+            if tcgen05_exec_active and cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster()) == cutlass.Int32(0):
+                tcgen05_acc_pipeline.producer_acquire(tcgen05_acc_producer_state)
+            if tcgen05_exec_active and cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster()) == cutlass.Int32(0):
+                tiled_mma.set(cute.nvgpu.tcgen05.Field.ACCUMULATE, False)
+            for offset_2 in range(cutlass.Int32(0), cutlass.Int32(4096), cutlass.Int32(_BLOCK_SIZE_2)):
+                mma_stage = tcgen05_ab_consumer_state.index
+                sA_mma = sA[None, 0, 0, mma_stage]
+                sB_mma = sB[None, 0, 0, mma_stage]
+                tcgen05_tma_full_tile = offset_0 + cutlass.Int32(256) <= cutlass.Int32(4096) and offset_1 + cutlass.Int32(256) <= cutlass.Int32(4096) and (offset_2 + cutlass.Int32(128) <= cutlass.Int32(4096))
+                tcgen05_tma_next_consumer_tile = offset_2 + cutlass.Int32(256) <= cutlass.Int32(4096)
+                if tcgen05_tma_full_tile:
+                    if cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster()) == cutlass.Int32(0):
+                        tcgen05_ab_pipeline.consumer_wait(tcgen05_ab_consumer_state, tcgen05_ab_consumer_try_token)
+                if cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster()) == cutlass.Int32(0):
+                    cute.arch.fence_view_async_shared()
+                if cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster()) == cutlass.Int32(0):
+                    for _tcgen05_kblk_idx in range(cute.size(tcgen05_tCrA, mode=[2])):
+                        cute.gemm(tiled_mma, acc_frag, [tcgen05_tCrA[None, None, cutlass.Int32(_tcgen05_kblk_idx), mma_stage]], [tcgen05_tCrB[None, None, cutlass.Int32(_tcgen05_kblk_idx), mma_stage]], acc_frag)
+                        tiled_mma.set(cute.nvgpu.tcgen05.Field.ACCUMULATE, True)
+                if tcgen05_tma_full_tile:
+                    if cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster()) == cutlass.Int32(0):
+                        tcgen05_ab_pipeline.consumer_release(tcgen05_ab_consumer_state)
+                    tcgen05_ab_consumer_state.advance()
+                tcgen05_ab_consumer_try_token = cutlass.Boolean(1)
+                if tcgen05_tma_next_consumer_tile and cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster()) == cutlass.Int32(0):
+                    tcgen05_ab_consumer_try_token = tcgen05_ab_pipeline.consumer_try_wait(tcgen05_ab_consumer_state)
+            if tcgen05_exec_active and cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster()) == cutlass.Int32(0):
+                tcgen05_acc_pipeline.producer_commit(tcgen05_acc_producer_state)
+            tcgen05_acc_producer_state.advance()
+            # src[_tcgen05_role_local_monolithic_4096_bf16_kernel.py:32]: for tile_m, tile_n in hl.tile([m, n]):
+            # src[_tcgen05_role_local_monolithic_4096_bf16_kernel.py:33]:     acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+            # src[_tcgen05_role_local_monolithic_4096_bf16_kernel.py:34]:     for tile_k in hl.tile(k):
+            # src[_tcgen05_role_local_monolithic_4096_bf16_kernel.py:32-36]: ...
+            tcgen05_role_local_1_tile_sched.advance_to_next_work()
+            tcgen05_role_local_1_work_tile = tcgen05_role_local_1_tile_sched.get_current_work()
+    if cute.arch.make_warp_uniform(cute.arch.warp_idx()) < cutlass.Int32(4):
+        tcgen05_role_local_2_tile_sched_params = cutlass.utils.PersistentTileSchedulerParams(((4096 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0 * 2, (4096 + _BLOCK_SIZE_1 - 1) // _BLOCK_SIZE_1, 1), (2, 1, 1))
+        tcgen05_role_local_2_tile_sched = cutlass.utils.StaticPersistentTileScheduler.create(tcgen05_role_local_2_tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim())
+        tcgen05_role_local_2_work_tile = tcgen05_role_local_2_tile_sched.initial_work_tile_info()
+        tcgen05_tma_store_role_tile = cutlass.Int32(0)
+        while tcgen05_role_local_2_work_tile.is_valid_tile:
+            virtual_pid = tcgen05_role_local_2_work_tile.tile_idx[0] // cutlass.Int32(2) + tcgen05_role_local_2_work_tile.tile_idx[1] * ((4096 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0)
+            # src[_tcgen05_role_local_monolithic_4096_bf16_kernel.py:32]: for tile_m, tile_n in hl.tile([m, n]):
+            pid_0 = virtual_pid % num_blocks_0
+            pid_1 = virtual_pid // num_blocks_0
+            offset_0 = pid_0 * _BLOCK_SIZE_0
+            offset_1 = pid_1 * _BLOCK_SIZE_1
+            # src[_tcgen05_role_local_monolithic_4096_bf16_kernel.py:36]: out[tile_m, tile_n] = acc.to(x.dtype)
+            if True:
+                if tcgen05_epi_active and tcgen05_warp_idx == cutlass.Int32(0):
+                    tcgen05_c_pipeline.producer_acquire()
+                tcgen05_gC = cute.local_tile(tcgen05_tma_store_tensor, (256, 256), (offset_0 // cutlass.Int32(256), offset_1 // cutlass.Int32(256)))
+                tcgen05_tCgC_base = thr_mma.partition_C(tcgen05_gC)
+                tcgen05_tCgC = cutlass.utils.gemm.sm100.transform_partitioned_tensor_layout(tcgen05_tCgC_base)
+                tcgen05_tCgC_planned = cute.make_tensor(tcgen05_tCgC.iterator, cute.append(cute.append(cute.append(tcgen05_tCgC.layout, tcgen05_epilogue_rest_mode), tcgen05_epilogue_rest_mode), tcgen05_epilogue_rest_mode))
+                tcgen05_tiled_copy_t2r, tcgen05_tTR_tAcc_base, tcgen05_tTR_rAcc = cutlass.utils.gemm.sm100.epilogue_tmem_copy_and_partition(tcgen05_kernel_desc, tcgen05_epi_tidx, tcgen05_tAcc, tcgen05_tCgC_planned, tcgen05_store_epi_tile, True)
+                tcgen05_tTR_rD = cute.make_rmem_tensor(tcgen05_tTR_rAcc.shape, cutlass.BFloat16)
+                tcgen05_tiled_copy_r2s, tcgen05_tRS_rD, tcgen05_tRS_sD = cutlass.utils.gemm.sm100.epilogue_smem_copy_and_partition(tcgen05_kernel_desc, tcgen05_tiled_copy_t2r, tcgen05_tTR_rD, tcgen05_epi_tidx, tcgen05_sD)
+                tcgen05_tRS_rAcc = tcgen05_tiled_copy_r2s.retile(tcgen05_tTR_rAcc)
+                tcgen05_tCgC_epi = cute.flat_divide(tcgen05_tCgC_planned, tcgen05_store_epi_tile)
+                tcgen05_bSG_sD, tcgen05_bSG_gD_partitioned = cute.nvgpu.cpasync.tma_partition(tcgen05_tma_store_atom, 0, cute.make_layout(1), cute.group_modes(tcgen05_sD, 0, 2), cute.group_modes(tcgen05_tCgC_epi, 0, 2))
+                tcgen05_bSG_gD = tcgen05_bSG_gD_partitioned[None, None, None, cutlass.Int32(0), cutlass.Int32(0), cutlass.Int32(0)]
+                tcgen05_bSG_gD = cute.group_modes(tcgen05_bSG_gD, 1, cute.rank(tcgen05_bSG_gD))
+                tcgen05_tTR_tAcc_stage = tcgen05_tTR_tAcc_base[None, None, None, None, None, tcgen05_acc_consumer_state.index]
+                tcgen05_tTR_tAcc = cute.group_modes(tcgen05_tTR_tAcc_stage, 3, cute.rank(tcgen05_tTR_tAcc_stage))
+                tcgen05_subtile_count = cutlass.const_expr(cute.size(tcgen05_tTR_tAcc.shape, mode=[3]))
+                for _tcgen05_subtile in cutlass.range(tcgen05_subtile_count, unroll_full=True):
+                    if tcgen05_epi_active:
+                        if _tcgen05_subtile != 0 and tcgen05_warp_idx == cutlass.Int32(0):
+                            tcgen05_c_pipeline.producer_acquire()
+                        if _tcgen05_subtile == 0:
+                            tcgen05_acc_pipeline.consumer_wait(tcgen05_acc_consumer_state)
+                        tcgen05_tTR_tAcc_mn = tcgen05_tTR_tAcc[None, None, None, cutlass.Int32(_tcgen05_subtile)]
+                        cute.copy(tcgen05_tiled_copy_t2r, tcgen05_tTR_tAcc_mn, tcgen05_tTR_rAcc)
+                        tcgen05_acc_vec = tcgen05_tRS_rAcc.load().to(cutlass.BFloat16)
+                        if _tcgen05_subtile == tcgen05_subtile_count - 1:
+                            cute.arch.fence_view_async_tmem_load()
+                            with cute.arch.elect_one():
+                                tcgen05_acc_pipeline.consumer_release(tcgen05_acc_consumer_state)
+                        tcgen05_tRS_rD.store(tcgen05_acc_vec)
+                        tcgen05_epilog_sync_barrier.arrive_and_wait()
+                        tcgen05_c_buffer = (tcgen05_tma_store_role_tile * cutlass.Int32(tcgen05_subtile_count) + cutlass.Int32(_tcgen05_subtile)) % cutlass.Int32(2)
+                        cute.copy(tcgen05_tiled_copy_r2s, tcgen05_tRS_rD, tcgen05_tRS_sD[None, None, None, tcgen05_c_buffer])
+                        cute.arch.fence_view_async_shared()
+                        tcgen05_epilog_sync_barrier.arrive_and_wait()
+                        if tcgen05_warp_idx == cutlass.Int32(0):
+                            cute.copy(tcgen05_tma_store_atom, tcgen05_bSG_sD[None, tcgen05_c_buffer], tcgen05_bSG_gD[None, cutlass.Int32(_tcgen05_subtile)])
+                            tcgen05_c_pipeline.producer_commit()
+                if tcgen05_epi_active:
+                    tcgen05_acc_consumer_state.advance()
+            # src[_tcgen05_role_local_monolithic_4096_bf16_kernel.py:32]: for tile_m, tile_n in hl.tile([m, n]):
+            # src[_tcgen05_role_local_monolithic_4096_bf16_kernel.py:33]:     acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+            # src[_tcgen05_role_local_monolithic_4096_bf16_kernel.py:34]:     for tile_k in hl.tile(k):
+            # src[_tcgen05_role_local_monolithic_4096_bf16_kernel.py:32-36]: ...
+            tcgen05_tma_store_role_tile = tcgen05_tma_store_role_tile + cutlass.Int32(1)
+            tcgen05_role_local_2_tile_sched.advance_to_next_work()
+            tcgen05_role_local_2_work_tile = tcgen05_role_local_2_tile_sched.get_current_work()
+    # src[_tcgen05_role_local_monolithic_4096_bf16_kernel.py:36]: out[tile_m, tile_n] = acc.to(x.dtype)
+    if tcgen05_warp_idx == cutlass.Int32(0):
+        tcgen05_c_pipeline.producer_tail()
+    if tcgen05_tma_warp:
+        tcgen05_ab_pipeline.producer_tail(tcgen05_ab_producer_state)
+    if tcgen05_exec_active:
+        cute.arch.griddepcontrol_launch_dependents()
+    if tcgen05_exec_active:
+        tcgen05_tmem_alloc_barrier.arrive()
+    if tcgen05_exec_active:
+        tcgen05_acc_pipeline.producer_tail(tcgen05_acc_producer_state)
+    tcgen05_tmem_allocator = cutlass.utils.TmemAllocator(tcgen05_tmem_holding_buf, barrier_for_retrieve=tcgen05_tmem_alloc_barrier, allocator_warp_id=0, is_two_cta=True, two_cta_tmem_dealloc_mbar_ptr=tcgen05_tmem_dealloc_mbar_ptr, num_allocated_columns=tcgen05_acc_tmem_cols, initialize_mbarrier=False)
+    if tcgen05_epi_active:
+        tcgen05_tmem_allocator.relinquish_alloc_permit()
+    if tcgen05_epi_active:
+        tcgen05_tmem_alloc_barrier.arrive_and_wait()
+    if tcgen05_epi_active:
+        tcgen05_tmem_allocator.free(tcgen05_epi_acc_tmem_ptr)
+
+def cute_matmul_role_local_monolithic_4096_bf16(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_cute_launcher):
+    # src[_tcgen05_role_local_monolithic_4096_bf16_kernel.py:26]: def cute_matmul_role_local_monolithic_4096_bf16(
+    # src[_tcgen05_role_local_monolithic_4096_bf16_kernel.py:27]:     x: torch.Tensor, y: torch.Tensor
+    # src[_tcgen05_role_local_monolithic_4096_bf16_kernel.py:28]: ) -> torch.Tensor:
+    # src[_tcgen05_role_local_monolithic_4096_bf16_kernel.py:26-37]: ...
+    _helion_cute_matmul_role_local_monolithic_4096_bf16._helion_cute_cluster_shape = (2, 1, 1)
+    _helion_cute_matmul_role_local_monolithic_4096_bf16._helion_cute_wrapper_plans = [{'kind': 'tcgen05_ab_tma', 'bm': 256, 'bn': 256, 'bk': 128, 'cluster_m': 2, 'cluster_n': 1, 'ab_stage_count': 2, 'input_dtype': 'cutlass.BFloat16', 'acc_dtype': 'cutlass.Float32', 'kernel_args': ['tma_atom_a', 'tma_tensor_a', 'tma_atom_b', 'tma_tensor_b'], 'lhs_idx': 0, 'rhs_idx': 1}, {'kind': 'tcgen05_d_tma', 'bm': 256, 'bn': 256, 'c_stage_count': 2, 'output_dtype': 'cutlass.BFloat16', 'kernel_args': ['tcgen05_tma_store_atom', 'tcgen05_tma_store_tensor'], 'd_idx': 2}]
+    # src[_tcgen05_role_local_monolithic_4096_bf16_kernel.py:29]: m, k = x.size()
+    m, k = x.size()
+    # src[_tcgen05_role_local_monolithic_4096_bf16_kernel.py:30]: _, n = y.size()
+    _, n = y.size()
+    # src[_tcgen05_role_local_monolithic_4096_bf16_kernel.py:31]: out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+    out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+    # src[_tcgen05_role_local_monolithic_4096_bf16_kernel.py:32]: for tile_m, tile_n in hl.tile([m, n]):
+    _NUM_SM = helion.runtime.get_num_sm(x.device)
+    _BLOCK_SIZE_0 = 256
+    _BLOCK_SIZE_1 = 256
+    # src[_tcgen05_role_local_monolithic_4096_bf16_kernel.py:32]: for tile_m, tile_n in hl.tile([m, n]):
+    # src[_tcgen05_role_local_monolithic_4096_bf16_kernel.py:33]:     acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+    # src[_tcgen05_role_local_monolithic_4096_bf16_kernel.py:34]:     for tile_k in hl.tile(k):
+    # src[_tcgen05_role_local_monolithic_4096_bf16_kernel.py:32-36]: ...
+    _launcher(_helion_cute_matmul_role_local_monolithic_4096_bf16, (2, 1, min(((4096 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0 * 2 + 2 - 1) // 2 * ((4096 + _BLOCK_SIZE_1 - 1) // _BLOCK_SIZE_1) * 1, max(1, _NUM_SM // 2))), x, y, out, block=(32, 6, 1))
+    # src[_tcgen05_role_local_monolithic_4096_bf16_kernel.py:37]: return out
+    return out

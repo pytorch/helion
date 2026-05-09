@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import ast
 import contextlib
+import dataclasses
+import difflib
 import operator
+import os
+from pathlib import Path
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -43,11 +47,13 @@ from helion._compiler.cute.cute_mma import _build_kloop_pipeline_release_if
 from helion._compiler.cute.cute_mma import _build_tcgen05_mma_accumulate_reset_stmt
 from helion._compiler.cute.cute_mma import _build_tcgen05_mma_issue_stmt
 from helion._compiler.cute.cute_mma import _choose_mma_impl
+from helion._compiler.cute.cute_mma import _emit_sched_pipeline_setup
 from helion._compiler.cute.cute_mma import _get_mma_k_loop_info
 from helion._compiler.cute.cute_mma import _InitialPrefetchTmaArgs
 from helion._compiler.cute.cute_mma import _make_tcgen05_layout_plan_setup
 from helion._compiler.cute.cute_mma import _mma_result_can_be_deferred
 from helion._compiler.cute.cute_mma import _new_tcgen05_layout_plan
+from helion._compiler.cute.cute_mma import _new_tcgen05_sched_pipeline_plan
 from helion._compiler.cute.cute_mma import _PerKiterTmaArgs
 from helion._compiler.cute.cute_mma import _tcgen05_ab_stage_count
 from helion._compiler.cute.cute_mma import _tcgen05_epi_warp_count
@@ -69,6 +75,8 @@ from helion._compiler.cute.matmul_utils import cute_resolve_active_block_id
 from helion._compiler.cute.matmul_utils import cute_resolve_active_matmul_k_block_id
 from helion._compiler.cute.matmul_utils import cute_static_k_invariant_extent
 from helion._compiler.cute.matmul_utils import cute_supports_scalar_matmul_fallback
+from helion._compiler.cute.strategies import ROLE_LOCAL_MONOLITHIC_DEFAULT_WARP_SPEC
+from helion._compiler.cute.strategies import Tcgen05WarpSpec
 from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_AB_CONSUMER_PHASE_MODE_CONFIG_KEY,
 )
@@ -142,6 +150,21 @@ from helion.language.memory_ops import _cute_index_exprs
 from helion.language.memory_ops import _maybe_codegen_cute_packed_affine_lhs_load
 from helion.language.memory_ops import load
 from helion.runtime import _append_cute_wrapper_plan
+
+# Golden file pinning the byte-identical generated CuTe for the
+# retained ROLE_LOCAL_MONOLITHIC seed (cute_plan.md §6.2 pin test #1
+# and §10.1 canonical benchmark seed). Lives at
+# ``test/golden/tcgen05_role_local_monolithic_4096_bf16.py.expected``.
+# The kernel definition is in
+# ``test/golden/_tcgen05_role_local_monolithic_4096_bf16_kernel.py``;
+# its file path appears in ``src[<file>:<line>]`` comments embedded
+# in the generated kernel, so both files must move together if
+# either is renamed.
+TCGEN05_ROLE_LOCAL_MONOLITHIC_GOLDEN_PATH = (
+    Path(__file__).parent
+    / "golden"
+    / "tcgen05_role_local_monolithic_4096_bf16.py.expected"
+)
 
 
 def _make_tcgen05_persistent_config(**overrides: object) -> helion.Config:
@@ -1334,6 +1357,317 @@ class TestCuteLowerings(unittest.TestCase):
                 code,
             )
             self.assertRegex(code, r"\(\s*1\s*,\s*1\s*,\s*min\s*\(")
+
+    def test_tcgen05_role_local_monolithic_byte_identical_golden(self) -> None:
+        """G2-B byte-identity pin (cute_plan.md §6.2 pin tests #1, #2).
+
+        The retained ``ROLE_LOCAL_MONOLITHIC`` seed (cute_plan.md
+        §10.1: 4096³ bf16, ``block_sizes=[256, 256, 128]``,
+        ``cluster_m=2``, ``pid_type=persistent_interleaved``,
+        ``ab/acc/c_stages=2/2/2``, ``num_epi_warps=4``) must
+        generate byte-identical CuTe across G2 refactors. The kernel
+        is hosted at a stable file path
+        (``test/golden/_tcgen05_role_local_monolithic_4096_bf16_kernel.py``)
+        so the embedded ``src[<file>:<line>]`` comments do not drift
+        when ``test_cute_lowerings.py`` itself changes.
+
+        Why a separate ``.py.expected`` file rather than
+        ``helion._testing.AssertExpectedJournal``: the journal stores
+        all expected outputs in one shared
+        ``test_cute_lowerings.expected`` file under
+        ``--- assertExpectedJournal(...)`` section markers, and
+        requires the test class to inherit from
+        ``helion._testing.TestCase``. ``TestCuteLowerings`` currently
+        inherits from ``unittest.TestCase`` (line 400 of this file) —
+        switching the base class would change setUp/tearDown
+        semantics for ~200 unrelated tests and is out of scope for
+        a byte-identity pin. A standalone 315-line ``.py.expected``
+        file is also more inspectable than a section inside the
+        shared journal. If a second golden test lands here, factor
+        the read/write/diff plumbing into a small helper alongside
+        the journal class in ``helion/_testing.py`` rather than
+        copy-pasting this block.
+
+        Update protocol: when an intentional codegen change makes
+        this test fail, regenerate the golden by setting
+        ``EXPECTTEST_ACCEPT=1`` (or by running
+        ``EXPECTTEST_ACCEPT=1 pytest -k
+        test_tcgen05_role_local_monolithic_byte_identical_golden``).
+        Reviewers diff the regenerated golden against the previous
+        version; only intentional codegen deltas should land.
+        """
+
+        from test.golden._tcgen05_role_local_monolithic_4096_bf16_kernel import (
+            cute_matmul_role_local_monolithic_4096_bf16,
+        )
+
+        args = (
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+        )
+        seed_config = helion.Config(
+            block_sizes=[256, 256, 128],
+            l2_groupings=[1],
+            pid_type="persistent_interleaved",
+            tcgen05_cluster_m=2,
+            tcgen05_ab_stages=2,
+            tcgen05_acc_stages=2,
+            tcgen05_c_stages=2,
+            tcgen05_num_epi_warps=4,
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_role_local_monolithic_4096_bf16.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            actual = bound.to_triton_code(seed_config)
+
+        # Sanity: confirm the generated kernel is on the
+        # retained-seed tcgen05 path (a fallback path would diff
+        # against the golden but the ``make_trivial_tiled_mma`` /
+        # ``PipelineUmmaAsync`` markers below catch a regression to
+        # a non-tcgen05 fallback even before the golden compare
+        # runs, so the failure points at a real shape change rather
+        # than a host-detect regression).
+        self.assertIn("make_trivial_tiled_mma", actual)
+        self.assertIn("PipelineUmmaAsync.create", actual)
+        self.assertIn("PipelineTmaUmma.create", actual)
+        self.assertIn("PipelineTmaStore.create", actual)
+
+        # ``EXPECTTEST_ACCEPT=1`` is a *local-regeneration* hook
+        # (mirrors helion's ``AssertExpectedJournal`` machinery in
+        # ``helion/_testing.py``); CI runs the test without that
+        # env var so the golden file always exists and any drift
+        # fails. The "missing golden" path below also writes the
+        # file but fails the test so a bare ``pytest`` invocation
+        # in a fresh checkout produces a useful error rather than
+        # silently passing. Set ``EXPECTTEST_ACCEPT=1`` only when
+        # intentionally regenerating after a deliberate codegen
+        # change, and review the resulting diff in your PR.
+        accept = os.environ.get("EXPECTTEST_ACCEPT") == "1"
+        if accept or not TCGEN05_ROLE_LOCAL_MONOLITHIC_GOLDEN_PATH.exists():
+            TCGEN05_ROLE_LOCAL_MONOLITHIC_GOLDEN_PATH.parent.mkdir(
+                parents=True, exist_ok=True
+            )
+            TCGEN05_ROLE_LOCAL_MONOLITHIC_GOLDEN_PATH.write_text(actual)
+            if not accept:
+                self.fail(
+                    "golden file was missing; wrote initial version. "
+                    "Re-run the test to verify."
+                )
+            return
+        expected = TCGEN05_ROLE_LOCAL_MONOLITHIC_GOLDEN_PATH.read_text()
+        if actual != expected:
+            diff = "".join(
+                difflib.unified_diff(
+                    expected.splitlines(keepends=True),
+                    actual.splitlines(keepends=True),
+                    fromfile="golden",
+                    tofile="actual",
+                    n=3,
+                )
+            )
+            self.fail(
+                "Generated CuTe differs from the golden — "
+                "byte-identity for ROLE_LOCAL_MONOLITHIC seed broken. "
+                "If this is an intentional codegen change, regenerate "
+                "the golden via "
+                "EXPECTTEST_ACCEPT=1 pytest -k "
+                "test_tcgen05_role_local_monolithic_byte_identical_golden, "
+                "diff the regenerated file against the prior version, "
+                "and confirm every delta in your PR description.\n"
+                f"--- diff ---\n{diff}"
+            )
+
+    def test_tcgen05_codegen_consumes_warp_spec(self) -> None:
+        """G2-B data-flow pin: ``Tcgen05WarpSpec`` is consumed by
+        codegen as the source of truth for warp role IDs.
+
+        Two distinct call sites must route through the strategy
+        layer: ``_tcgen05_epi_warp_count`` (which now takes a
+        ``Tcgen05WarpSpec`` argument) and the ``CuteTcgen05MatmulPlan``
+        construction (which reads ``ab_load_warp_count`` from the
+        spec). Before G2-B both read ``tcgen05_num_epi_warps``
+        directly. The test pins both:
+
+        - ``warp_spec_from_config`` is invoked at least once during
+          ``to_triton_code``. Today it is invoked exactly once (item
+          4 of the G2-B review hoisted the build inside the
+          tcgen05 branch); the lower bound is kept loose so a
+          future cycle can route additional codegen sites through
+          the helper without a test-only edit.
+        - The constructed ``CuteTcgen05MatmulPlan`` carries
+          ``ab_load_warp_count`` and ``epi_warp_count`` derived from
+          the observed spec. A partial revert that hard-coded
+          either field would still pass the call-count check; this
+          object-shape pin catches that.
+
+        ``register_split`` is also asserted on the observed spec so
+        a drift in the (120, 256) decrease/increase pair is caught
+        as part of this test rather than waiting for the byte-
+        identity golden to flag it.
+        """
+
+        from test.golden._tcgen05_role_local_monolithic_4096_bf16_kernel import (
+            cute_matmul_role_local_monolithic_4096_bf16,
+        )
+
+        from helion._compiler.cute import cute_mma as cute_mma_module
+        from helion._compiler.cute import strategies as strategies_module
+        from helion._compiler.device_function import (
+            CuteTcgen05MatmulPlan as _CuteTcgen05MatmulPlan,
+        )
+
+        args = (
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+        )
+        seed_config = helion.Config(
+            block_sizes=[256, 256, 128],
+            l2_groupings=[1],
+            pid_type="persistent_interleaved",
+            tcgen05_cluster_m=2,
+            tcgen05_ab_stages=2,
+            tcgen05_acc_stages=2,
+            tcgen05_c_stages=2,
+            tcgen05_num_epi_warps=4,
+        )
+
+        original_warp_spec = strategies_module.warp_spec_from_config
+        observed_specs: list[Tcgen05WarpSpec] = []
+
+        def sniffing_warp_spec_from_config(config):  # type: ignore[no-untyped-def]
+            spec = original_warp_spec(config)
+            observed_specs.append(spec)
+            return spec
+
+        observed_plans: list[_CuteTcgen05MatmulPlan] = []
+
+        def sniffing_matmul_plan(*args, **kwargs):  # type: ignore[no-untyped-def]
+            plan = _CuteTcgen05MatmulPlan(*args, **kwargs)
+            observed_plans.append(plan)
+            return plan
+
+        with patch_cute_mma_support():
+            bound = cute_matmul_role_local_monolithic_4096_bf16.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            with (
+                patch.object(
+                    cute_mma_module,
+                    "warp_spec_from_config",
+                    sniffing_warp_spec_from_config,
+                ),
+                patch.object(
+                    cute_mma_module,
+                    "CuteTcgen05MatmulPlan",
+                    sniffing_matmul_plan,
+                ),
+            ):
+                bound.to_triton_code(seed_config)
+
+        # warp_spec_from_config is reached at least once. The hoist
+        # in item 4 of the G2-B review collapsed two reads into one,
+        # so today this is exactly 1 — keep the assertion loose so
+        # future per-strategy split work can add reads without a
+        # test-only edit.
+        self.assertGreaterEqual(
+            len(observed_specs), 1, msg=f"calls={len(observed_specs)}"
+        )
+        # Documented G2-A defaults for ROLE_LOCAL_MONOLITHIC:
+        # 1 ab_load + 1 mma + 4 epi + 0 epi_load + 0 scheduler = 6
+        # warps; register_split = (120, 256).
+        for spec in observed_specs:
+            self.assertEqual(spec.ab_load_warps, 1)
+            self.assertEqual(spec.mma_warps, 1)
+            self.assertEqual(spec.epi_warps, 4)
+            self.assertEqual(spec.epi_load_warps, 0)
+            self.assertEqual(spec.scheduler_warps, 0)
+            self.assertEqual(spec.total_warps, 6)
+            self.assertEqual(spec.register_split, (120, 256))
+        # The constructed matmul plan carries warp-role counts
+        # derived from the spec — a partial revert of the G2-B
+        # refactor that hard-coded ``ab_load_warp_count=1`` directly
+        # in the ``CuteTcgen05MatmulPlan(...)`` call would still
+        # pass the call-count check above, so pin the field
+        # directly on the observed plan object.
+        self.assertEqual(len(observed_plans), 1, msg=f"plans={len(observed_plans)}")
+        plan = observed_plans[0]
+        spec = observed_specs[0]
+        self.assertEqual(plan.ab_load_warp_count, spec.ab_load_warps)
+        # ``epi_warp_count`` is the cap-applied value (limited by
+        # ``cta_thread_count // 32``), but for the seed config the
+        # cap is loose and the spec's epi_warps flows through.
+        self.assertEqual(plan.epi_warp_count, spec.epi_warps)
+
+        # Strong dataflow pin: rerun codegen with a forced spec
+        # whose ``ab_load_warps`` differs from the autotune-pinned
+        # value (``1``). The plan's ``ab_load_warp_count`` must
+        # follow the forced spec, not the original config key. A
+        # partial revert that hard-coded ``ab_load_warp_count=1``
+        # in the ``CuteTcgen05MatmulPlan(...)`` call would fail this
+        # assertion (the plan would carry ``1`` while the forced
+        # spec carries the substituted value).
+        forced_spec = dataclasses.replace(
+            ROLE_LOCAL_MONOLITHIC_DEFAULT_WARP_SPEC, ab_load_warps=2
+        )
+        observed_plans.clear()
+
+        # Sentinel raised by the spy immediately after the plan is
+        # captured. Short-circuiting codegen here keeps the test
+        # focused on the dataflow check and avoids depending on
+        # whatever downstream emission would do with a non-default
+        # ``ab_load_warps`` (today: explode in epi-warp accounting).
+        # The sentinel is plain ``Exception`` and gets wrapped by
+        # ``inductor_lowering.run_node`` into ``InductorLoweringError``;
+        # we suppress *only* that specific helion exception type, so
+        # an unrelated failure (e.g. a future rename of
+        # ``warp_spec_from_config`` causing ``patch.object`` to
+        # raise ``AttributeError`` at context entry, or a real
+        # ``TypeError`` thrown elsewhere in ``to_triton_code``)
+        # still surfaces as a test failure pointing at the actual
+        # regression instead of being silently eaten.
+        class _CapturedPlan(Exception):
+            """Sentinel raised once the plan is captured."""
+
+        def short_circuiting_matmul_plan(*args, **kwargs):  # type: ignore[no-untyped-def]
+            plan = _CuteTcgen05MatmulPlan(*args, **kwargs)
+            observed_plans.append(plan)
+            raise _CapturedPlan
+
+        captured_plan_seen = False
+        with patch_cute_mma_support():
+            bound = cute_matmul_role_local_monolithic_4096_bf16.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            with (
+                patch.object(
+                    cute_mma_module,
+                    "warp_spec_from_config",
+                    lambda _config: forced_spec,
+                ),
+                patch.object(
+                    cute_mma_module,
+                    "CuteTcgen05MatmulPlan",
+                    short_circuiting_matmul_plan,
+                ),
+            ):
+                try:
+                    bound.to_triton_code(seed_config)
+                except exc.InductorLoweringError as wrapped:
+                    # Confirm the suppression was triggered by *our*
+                    # sentinel, not by some other codegen failure
+                    # that happens to surface as InductorLoweringError.
+                    chain: BaseException | None = wrapped
+                    while chain is not None:
+                        if isinstance(chain, _CapturedPlan):
+                            captured_plan_seen = True
+                            break
+                        chain = chain.__cause__ or chain.__context__
+                    if not captured_plan_seen:
+                        raise
+        self.assertTrue(
+            captured_plan_seen,
+            msg="forced-spec rerun did not raise the _CapturedPlan sentinel",
+        )
+        self.assertEqual(len(observed_plans), 1, msg="plan was never constructed")
+        self.assertEqual(observed_plans[0].ab_load_warp_count, 2)
 
     def test_tcgen05_persistent_kloop_producer_lifts_to_role_local_while(
         self,
@@ -6936,20 +7270,22 @@ class TestCuteLowerings(unittest.TestCase):
                 )
 
     def test_tcgen05_thread_counts_match_participants_and_cta(self) -> None:
+        # ``_tcgen05_epi_warp_count`` takes a ``Tcgen05WarpSpec`` (G2-B);
+        # build one from the documented monolithic defaults and only
+        # override ``epi_warps`` to exercise the cap behavior.
+        def _spec(epi_warps: int) -> Tcgen05WarpSpec:
+            return dataclasses.replace(
+                ROLE_LOCAL_MONOLITHIC_DEFAULT_WARP_SPEC, epi_warps=epi_warps
+            )
+
         self.assertEqual(_tcgen05_ab_stage_count(0), 1)
         self.assertEqual(_tcgen05_ab_stage_count(1), 1)
         self.assertEqual(_tcgen05_ab_stage_count(2), 2)
         self.assertEqual(_tcgen05_ab_stage_count(4), 2)
-        self.assertEqual(_tcgen05_epi_warp_count({}, cta_thread_count=32), 1)
-        self.assertEqual(_tcgen05_epi_warp_count({}, cta_thread_count=128), 4)
-        self.assertEqual(
-            _tcgen05_epi_warp_count({"tcgen05_num_epi_warps": 2}, cta_thread_count=256),
-            2,
-        )
-        self.assertEqual(
-            _tcgen05_epi_warp_count({"tcgen05_num_epi_warps": 8}, cta_thread_count=128),
-            4,
-        )
+        self.assertEqual(_tcgen05_epi_warp_count(_spec(4), cta_thread_count=32), 1)
+        self.assertEqual(_tcgen05_epi_warp_count(_spec(4), cta_thread_count=128), 4)
+        self.assertEqual(_tcgen05_epi_warp_count(_spec(2), cta_thread_count=256), 2)
+        self.assertEqual(_tcgen05_epi_warp_count(_spec(8), cta_thread_count=128), 4)
         self.assertEqual(_tcgen05_root_m_threads(64, 8), 64)
         self.assertEqual(_tcgen05_root_m_threads(64, 16), 32)
         self.assertEqual(_tcgen05_root_m_threads(128, 256), 32)
@@ -6998,6 +7334,123 @@ class TestCuteLowerings(unittest.TestCase):
             "tcgen05_epilogue_rest_mode_1 = cute.make_layout(1, stride=0)",
             emitted,
         )
+
+    def test_emit_sched_pipeline_setup_round_trips_pipeline_async(self) -> None:
+        """``_emit_sched_pipeline_setup`` emits the
+        ``cutlass.pipeline.PipelineAsync.create`` wrapper used to
+        broadcast tile coordinates from a scheduler warp to consumer
+        warps. Mirrors the shape of Quack's ``make_sched_pipeline``
+        and the existing inline scheduler emission in
+        ``program_id._build_tcgen05_persistent_layout``.
+
+        Three configurations are exercised:
+
+        - Single-CTA, no defer-sync: ``consumer_mask`` and
+          ``defer_sync`` are both omitted from the
+          ``PipelineAsync.create`` call.
+        - Cluster + defer-sync: both ``consumer_mask=cutlass.Int32(0)``
+          and ``defer_sync=True`` appear, matching the wrapping
+          convention of the existing scheduler emission.
+        - Same ``DeviceFunction`` reused: the suffix on the second
+          plan's ``new_var`` outputs advances to ``_2``, confirming
+          the helper does not memoize state on the device function.
+        """
+        df = _FakeDeviceFunction()
+        plan = _new_tcgen05_sched_pipeline_plan(df)
+        self.assertEqual(plan.barriers, "tcgen05_sched_pipeline_mbars_1")
+        self.assertEqual(plan.pipeline, "tcgen05_sched_pipeline_1")
+
+        stmts = _emit_sched_pipeline_setup(
+            plan,
+            sched_stage_count=2,
+            consumer_arrive_count=15,
+            cluster_size=1,
+            defer_sync=False,
+        )
+        emitted = "\n".join(ast.unparse(stmt) for stmt in stmts)
+
+        self.assertEqual(len(stmts), 6)
+        # mbar size is `2 * num_stages` Int64 slots, wrapped in
+        # cutlass.Int32(...) — matches the existing acc-pipeline
+        # barrier-storage shape and program_id.py's scheduler
+        # emission.
+        self.assertIn(
+            "tcgen05_sched_pipeline_mbars_1 = cute.arch.alloc_smem("
+            "cutlass.Int64, cutlass.Int32(4))",
+            emitted,
+        )
+        # Producer group: single thread, no count (consistent with
+        # the existing acc-pipeline producer group).
+        self.assertIn(
+            "tcgen05_sched_pipeline_producer_group_1 = "
+            "cutlass.pipeline.CooperativeGroup(cutlass.pipeline.Agent.Thread)",
+            emitted,
+        )
+        # Consumer group: caller-supplied arrive count wrapped in
+        # cutlass.Int32(...).
+        self.assertIn(
+            "tcgen05_sched_pipeline_consumer_group_1 = "
+            "cutlass.pipeline.CooperativeGroup("
+            "cutlass.pipeline.Agent.Thread, cutlass.Int32(15))",
+            emitted,
+        )
+        # PipelineAsync.create appears exactly once with neither
+        # consumer_mask nor defer_sync — single-CTA, eager-init
+        # path.
+        self.assertEqual(emitted.count("cutlass.pipeline.PipelineAsync.create"), 1)
+        self.assertIn(
+            "cutlass.pipeline.PipelineAsync.create(num_stages=2, "
+            "producer_group=tcgen05_sched_pipeline_producer_group_1, "
+            "consumer_group=tcgen05_sched_pipeline_consumer_group_1, "
+            "barrier_storage=tcgen05_sched_pipeline_mbars_1)",
+            emitted,
+        )
+        self.assertNotIn("consumer_mask", emitted)
+        self.assertNotIn("defer_sync", emitted)
+        # Producer / consumer pipeline-state initializers.
+        self.assertIn(
+            "tcgen05_sched_pipeline_producer_state_1 = "
+            "cutlass.pipeline.make_pipeline_state("
+            "cutlass.pipeline.PipelineUserType.Producer, 2)",
+            emitted,
+        )
+        self.assertIn(
+            "tcgen05_sched_pipeline_consumer_state_1 = "
+            "cutlass.pipeline.make_pipeline_state("
+            "cutlass.pipeline.PipelineUserType.Consumer, 2)",
+            emitted,
+        )
+
+        # Cluster + defer-sync path. Reuse the same DeviceFunction so
+        # the suffix on the second plan advances to ``_2`` —
+        # validates that ``_new_tcgen05_sched_pipeline_plan`` is a
+        # pure allocator with no memoization.
+        plan_cluster = _new_tcgen05_sched_pipeline_plan(df)
+        self.assertEqual(plan_cluster.barriers, "tcgen05_sched_pipeline_mbars_2")
+        self.assertEqual(plan_cluster.pipeline, "tcgen05_sched_pipeline_2")
+        cluster_stmts = _emit_sched_pipeline_setup(
+            plan_cluster,
+            sched_stage_count=2,
+            consumer_arrive_count=16,
+            cluster_size=2,
+            defer_sync=True,
+        )
+        cluster_emitted = "\n".join(ast.unparse(s) for s in cluster_stmts)
+        # PipelineAsync.create now carries both consumer_mask
+        # (wrapped via cutlass.Int32 to match the existing scheduler
+        # emission in program_id.py) and defer_sync=True so the
+        # pipeline participates in the cluster-wide deferred-init
+        # protocol.
+        self.assertIn(
+            "cutlass.pipeline.PipelineAsync.create(num_stages=2, "
+            "producer_group=tcgen05_sched_pipeline_producer_group_2, "
+            "consumer_group=tcgen05_sched_pipeline_consumer_group_2, "
+            "barrier_storage=tcgen05_sched_pipeline_mbars_2, "
+            "consumer_mask=cutlass.Int32(0), defer_sync=True)",
+            cluster_emitted,
+        )
+        self.assertIn("cutlass.Int32(16)", cluster_emitted)
+        self.assertEqual(len(cluster_stmts), 6)
 
     def test_tcgen05_codegen_emits_cluster_and_role_split_knobs(self) -> None:
         @helion.kernel(backend="cute")

@@ -44,6 +44,7 @@ from .layout import MatmulExecutionKind
 from .layout import MatmulExecutionPlan
 from .matmul_utils import analyze_direct_grouped_n_loads
 from .mma_support import get_cute_mma_support
+from .strategies import warp_spec_from_config
 from .tcgen05_constants import TCGEN05_AB_CONSUMER_PHASE_MODE_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_AB_CONSUMER_PHASE_MODE_NORMAL
 from .tcgen05_constants import TCGEN05_AB_CONSUMER_PHASE_MODE_PHASE1
@@ -81,6 +82,7 @@ if TYPE_CHECKING:
     from ..device_function import DeviceFunction
     from ..generate_ast import GenerateAST
     from ..inductor_lowering import CodegenState
+    from .strategies import Tcgen05WarpSpec
 
 
 _TRACE_THROUGH_TARGETS = {
@@ -139,6 +141,23 @@ class _Tcgen05LayoutPlan:
     acc_producer_state: str
     acc_consumer_state: str
     epilogue_rest_mode: str
+
+
+@dataclass(frozen=True)
+class _Tcgen05SchedPipelinePlan:
+    """Generated CuTe variable names for the scheduler-broadcast pipeline.
+
+    Pure name container, mirroring ``_Tcgen05LayoutPlan``: each field
+    is the textual identifier of a value materialized in the kernel
+    prefix when ``_emit_sched_pipeline_setup`` runs.
+    """
+
+    barriers: str
+    producer_group: str
+    consumer_group: str
+    pipeline: str
+    producer_state: str
+    consumer_state: str
 
 
 class _ConfigLike(Protocol):
@@ -1903,25 +1922,37 @@ def _emit_mma_pipeline(
     tcgen05_c_stage_count_value = _tcgen05_config_int(
         df.config, "tcgen05_c_stages", _tcgen05_c_stage_count(bn)
     )
-    tcgen05_epi_warp_count_value = _tcgen05_epi_warp_count(
-        df.config, cta_thread_count=tcgen05_cta_thread_count
-    )
-    tcgen05_tmem_barrier_thread_count_value = _tcgen05_tmem_barrier_thread_count(
-        tcgen05_epi_warp_count_value
-    )
-    # Each CtaGroup.TWO CTA has its own epilogue warps consuming the
-    # distributed accumulator slot, so the acc empty barrier expects each
-    # CTA's epi warp leaders. The CtaGroup.ONE clustered fallback remains
-    # on the single-CTA count until it has separate runtime coverage.
-    tcgen05_acc_consumer_arrive_count_value = tcgen05_epi_warp_count_value * (
-        2 if tcgen05_is_two_cta else 1
-    )
     tcgen05_defer_pipeline_sync_arg = (
         ", defer_sync=True" if tcgen05_use_cluster_deferred_pipelines else ""
     )
     tcgen05_matmul_plan: CuteTcgen05MatmulPlan | None = None
     tcgen05_mma_owner_active: str | None = None
+    # Initialized inside the ``mma_impl == "tcgen05"`` branch so the
+    # non-tcgen05 path doesn't pay for warp-spec / barrier-count work
+    # it never uses; consumed only at later tcgen05-gated emission
+    # sites that share this `if mma_impl == "tcgen05":` predicate.
+    tcgen05_epi_warp_count_value = 0
+    tcgen05_tmem_barrier_thread_count_value = 0
+    tcgen05_acc_consumer_arrive_count_value = 0
     if mma_impl == "tcgen05":
+        # Use ``warp_spec.ab_load_warps`` so the strategy data model
+        # stays the source of truth for warp role IDs; ``epi_warps``
+        # flows the same way via ``_tcgen05_epi_warp_count`` below.
+        tcgen05_warp_spec = warp_spec_from_config(df.config)
+        tcgen05_epi_warp_count_value = _tcgen05_epi_warp_count(
+            tcgen05_warp_spec, cta_thread_count=tcgen05_cta_thread_count
+        )
+        tcgen05_tmem_barrier_thread_count_value = _tcgen05_tmem_barrier_thread_count(
+            tcgen05_epi_warp_count_value
+        )
+        # Each CtaGroup.TWO CTA has its own epilogue warps consuming
+        # the distributed accumulator slot, so the acc empty barrier
+        # expects each CTA's epi warp leaders. The CtaGroup.ONE
+        # clustered fallback remains on the single-CTA count until
+        # it has separate runtime coverage.
+        tcgen05_acc_consumer_arrive_count_value = tcgen05_epi_warp_count_value * (
+            2 if tcgen05_is_two_cta else 1
+        )
         tcgen05_matmul_plan = CuteTcgen05MatmulPlan(
             bm=bm,
             bn=bn,
@@ -1939,6 +1970,7 @@ def _emit_mma_pipeline(
             ab_stage_count=tcgen05_ab_stage_count_value,
             c_stage_count=tcgen05_c_stage_count_value,
             epi_warp_count=tcgen05_epi_warp_count_value,
+            ab_load_warp_count=tcgen05_warp_spec.ab_load_warps,
         )
         assert tcgen05_plan is not None
         tcgen05_mma_owner_active = _tcgen05_two_cta_owner_predicate(
@@ -3334,12 +3366,16 @@ def _tcgen05_use_2cta_instrs(*, bm: int, cluster_m: int) -> bool:
     return cluster_m == 2 and bm == TCGEN05_TWO_CTA_BLOCK_M
 
 
-def _tcgen05_epi_warp_count(config: object, *, cta_thread_count: int) -> int:
+def _tcgen05_epi_warp_count(
+    warp_spec: Tcgen05WarpSpec, *, cta_thread_count: int
+) -> int:
     """Pick the epilogue warp count for a tcgen05 matmul kernel.
 
-    Returns at most ``cta_thread_count // 32`` warps, capped by the
-    ``tcgen05_num_epi_warps`` autotune knob (default 4). The other roles
-    (one MMA exec warp + one A/B load warp) are added on top of this in
+    Returns at most ``cta_thread_count // 32`` warps, capped by
+    ``warp_spec.epi_warps`` (the strategy data model's source of
+    truth, sourced from the ``tcgen05_num_epi_warps`` autotune
+    knob, default 4). The other roles (one MMA exec warp + one A/B
+    load warp) are added on top of this in
     ``CuteTcgen05MatmulPlan.role_warp_count``.
 
     Today the only correct value for the SIMT-store epilogue is 4: the
@@ -3358,10 +3394,7 @@ def _tcgen05_epi_warp_count(config: object, *, cta_thread_count: int) -> int:
     the GMEM store. See ``cute_plan.md`` Section 2.
     """
     cta_warp_count = max(1, cta_thread_count // 32)
-    return min(
-        cta_warp_count,
-        max(1, _tcgen05_config_int(config, "tcgen05_num_epi_warps", 4)),
-    )
+    return min(cta_warp_count, max(1, warp_spec.epi_warps))
 
 
 def _mma_impl_matches_problem_shape(
@@ -3629,6 +3662,120 @@ def _make_tcgen05_layout_plan_setup(
         ),
         statement_from_string(
             f"{plan.epilogue_rest_mode} = cute.make_layout(1, stride=0)"
+        ),
+    ]
+
+
+def _new_tcgen05_sched_pipeline_plan(
+    df: DeviceFunction,
+) -> _Tcgen05SchedPipelinePlan:
+    """Allocate variable names for the scheduler-broadcast pipeline.
+
+    The ``tcgen05_sched_pipeline_*`` prefix family is shared with
+    the existing cluster_m=2 ONE-CTA bridge emission in
+    ``program_id._build_tcgen05_persistent_layout``: ``df.new_var``
+    appends an incrementing suffix so the two emissions cannot
+    actually collide, but a future cycle that consolidates the two
+    paths should drive both call sites through this allocator.
+    """
+    return _Tcgen05SchedPipelinePlan(
+        barriers=df.new_var("tcgen05_sched_pipeline_mbars"),
+        producer_group=df.new_var("tcgen05_sched_pipeline_producer_group"),
+        consumer_group=df.new_var("tcgen05_sched_pipeline_consumer_group"),
+        pipeline=df.new_var("tcgen05_sched_pipeline"),
+        producer_state=df.new_var("tcgen05_sched_pipeline_producer_state"),
+        consumer_state=df.new_var("tcgen05_sched_pipeline_consumer_state"),
+    )
+
+
+def _emit_sched_pipeline_setup(
+    plan: _Tcgen05SchedPipelinePlan,
+    *,
+    sched_stage_count: int,
+    consumer_arrive_count: int,
+    cluster_size: int,
+    defer_sync: bool,
+) -> list[ast.AST]:
+    """Emit the prefix statements that construct the sched pipeline.
+
+    Mirrors Quack's ``make_sched_pipeline`` in
+    ``quack/quack/gemm_sm100.py``. The cluster_m=2 ONE-CTA bridge
+    diagnostic in
+    ``program_id.Tcgen05PersistentProgramIDs._build_tcgen05_persistent_layout``
+    already inlines an equivalent emission for a different role
+    topology (peer-CTA work-tile publish via
+    ``_cute_store_shared_remote_x4``); G2-C should consider
+    consolidating that path onto this helper rather than carrying
+    two parallel emitters.
+
+    Parameters:
+
+    - ``consumer_arrive_count``: caller-supplied total number of
+      consumer arrivals per stage. Quack's ``make_sched_pipeline``
+      uses ``warps_per_cta * cluster_size`` *including* the
+      scheduler warp itself; the bridge diagnostic in
+      ``program_id.py`` uses ``cluster_m`` (one peer CTA per
+      arrival).
+    - ``cluster_size``: cluster-multicast factor. ``> 1`` causes
+      ``consumer_mask=cutlass.Int32(0)`` to be emitted, matching
+      the wrapping convention of the existing scheduler emission;
+      ``== 1`` omits the mask. Assumes the leader CTA sits at
+      cluster index 0 — the helper does not parameterize a
+      different leader.
+    - ``defer_sync``: emits ``defer_sync=True`` so the pipeline
+      participates in the cluster-wide deferred-init protocol
+      coordinated via ``pipeline_init_arrive`` /
+      ``pipeline_init_wait``. The caller threads
+      ``tcgen05_use_cluster_deferred_pipelines`` (see
+      ``cute_mma._codegen_cute_mma``) the same way the AB / acc
+      pipelines do via ``tcgen05_defer_pipeline_sync_arg``;
+      forgetting this on a clustered call site risks barrier-init
+      ordering hangs.
+
+    ``num_stages`` and ``make_pipeline_state`` count arguments are
+    bare ints (matching the existing AB / acc / c pipeline
+    emissions), but the SMEM mbar size and the consumer-arrive
+    count are wrapped in ``cutlass.Int32(...)`` literals (also
+    matching the existing emissions and the established pattern in
+    ``program_id.py``'s scheduler emission). No named compile-time
+    constants are materialized — same convention as
+    ``_make_tcgen05_layout_plan_setup``.
+    """
+    extra_args = ""
+    if cluster_size > 1:
+        extra_args += ", consumer_mask=cutlass.Int32(0)"
+    if defer_sync:
+        extra_args += ", defer_sync=True"
+    return [
+        statement_from_string(
+            f"{plan.barriers} = cute.arch.alloc_smem("
+            f"cutlass.Int64, cutlass.Int32({sched_stage_count * 2}))"
+        ),
+        statement_from_string(
+            f"{plan.producer_group} = "
+            "cutlass.pipeline.CooperativeGroup("
+            "cutlass.pipeline.Agent.Thread)"
+        ),
+        statement_from_string(
+            f"{plan.consumer_group} = "
+            "cutlass.pipeline.CooperativeGroup("
+            f"cutlass.pipeline.Agent.Thread, cutlass.Int32({consumer_arrive_count}))"
+        ),
+        statement_from_string(
+            f"{plan.pipeline} = cutlass.pipeline.PipelineAsync.create("
+            f"num_stages={sched_stage_count}, "
+            f"producer_group={plan.producer_group}, "
+            f"consumer_group={plan.consumer_group}, "
+            f"barrier_storage={plan.barriers}"
+            f"{extra_args})"
+        ),
+        statement_from_string(
+            f"{plan.producer_state} = cutlass.pipeline.make_pipeline_state("
+            f"cutlass.pipeline.PipelineUserType.Producer, {sched_stage_count})"
+        ),
+        statement_from_string(
+            f"{plan.consumer_state} = cutlass.pipeline.make_pipeline_state("
+            f"cutlass.pipeline.PipelineUserType.Consumer, {sched_stage_count})"
         ),
     ]
 

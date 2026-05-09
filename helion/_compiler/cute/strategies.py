@@ -17,6 +17,10 @@ from __future__ import annotations
 
 import dataclasses
 import enum
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping
 
 
 class Tcgen05Strategy(str, enum.Enum):
@@ -272,8 +276,12 @@ TCGEN05_WARP_SPEC_DEFAULTS_BY_KEY: dict[str, int] = {
 }
 
 
-def warp_spec_from_config(config: dict[str, object]) -> Tcgen05WarpSpec:
+def warp_spec_from_config(config: Mapping[str, object]) -> Tcgen05WarpSpec:
     """Read warp-spec fields out of a normalized config.
+
+    Accepts any ``Mapping[str, object]`` (e.g. ``dict`` or
+    ``helion.Config``) so the codegen path can pass ``df.config``
+    directly without unwrapping its inner dict.
 
     ``epi_warps`` is sourced from ``tcgen05_num_epi_warps`` — the
     existing single source of truth — so a user cannot simultaneously
@@ -302,7 +310,7 @@ def warp_spec_from_config(config: dict[str, object]) -> Tcgen05WarpSpec:
 
 
 def layout_overrides_from_config(
-    config: dict[str, object],
+    config: Mapping[str, object],
 ) -> Tcgen05LayoutOverrides:
     """Read layout-override fields out of a normalized config."""
 
