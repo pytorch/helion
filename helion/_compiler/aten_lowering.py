@@ -982,6 +982,18 @@ mm_lowering = register_lowering(
 )
 
 
+def _apply_bmm_dot_dtype_requirements(_lowering: AtenLowering, node: Node) -> Lowering:
+    """Handle bmm.dtype by stripping the ScalarType arg and reusing bmm_lowering."""
+    node.args = tuple(a for a in node.args if isinstance(a, Node))
+    return apply_dot_requirements(bmm_lowering, node)
+
+
+register_lowering(
+    torch.ops.aten.bmm.dtype,
+    _apply_bmm_dot_dtype_requirements,
+)
+
+
 @bmm_lowering.register_codegen("triton")
 @mm_lowering.register_codegen("triton")
 def codegen_mm(ctx: LoweringContext, node: Node) -> ast.AST:

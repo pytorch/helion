@@ -772,6 +772,139 @@ class TestTensorDescriptor(RefEagerTestBase, TestCase):
         self.assertIs(bound_aligned, copy_input.bind((x_aligned_3,)))
         self.assertEqual(len(copy_input._bound_kernels), 2)
 
+    @skipUnlessTensorDescriptor("Tensor descriptor support is required")
+    def test_tensor_descriptor_container_inputs_static_and_dynamic(self):
+        """List/tuple element source paths should preserve TD eligibility."""
+
+        def td_config() -> helion.Config:
+            return helion.Config(
+                block_sizes=[32, 32],
+                indexing=["tensor_descriptor", "pointer"],
+            )
+
+        @helion.kernel(
+            static_shapes=True,
+            autotune_effort="none",
+            config=td_config(),
+        )
+        def copy_first_static(xs: list[torch.Tensor]) -> torch.Tensor:
+            x = xs[0]
+            result = torch.empty(x.size(), device=x.device, dtype=x.dtype)
+            for tile in hl.tile(x.size()):
+                result[tile] = x[tile]
+            return result
+
+        @helion.kernel(
+            static_shapes=False,
+            autotune_effort="none",
+            config=td_config(),
+        )
+        def copy_first_dynamic(xs: list[torch.Tensor]) -> torch.Tensor:
+            x = xs[0]
+            result = torch.empty(x.size(), device=x.device, dtype=x.dtype)
+            for tile in hl.tile(x.size()):
+                result[tile] = x[tile]
+            return result
+
+        @helion.kernel(
+            static_shapes=False,
+            autotune_effort="none",
+            config=td_config(),
+        )
+        def copy_second_dynamic(xs: tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
+            x = xs[1]
+            result = torch.empty(x.size(), device=x.device, dtype=x.dtype)
+            for tile in hl.tile(x.size()):
+                result[tile] = x[tile]
+            return result
+
+        x = torch.randn([64, 1024], device=DEVICE, dtype=HALF_DTYPE)
+        unused = torch.randn([64, 1024], device=DEVICE, dtype=HALF_DTYPE)
+        cases = [
+            ("static_list", copy_first_static, ([x, unused],), x),
+            ("dynamic_list", copy_first_dynamic, ([x, unused],), x),
+            ("dynamic_tuple", copy_second_dynamic, ((unused, x),), x),
+        ]
+
+        for name, kernel, args, expected in cases:
+            with self.subTest(case=name):
+                code, result = code_and_output(kernel, args)
+                torch.testing.assert_close(result, expected)
+                self.assertIn(get_tensor_descriptor_fn_name(), code)
+
+    @skipUnlessTensorDescriptor("Tensor descriptor support is required")
+    def test_dynamic_tensor_descriptor_dict_input_falls_back_to_pointer(self):
+        """Unsupported container sources should not crash TD layout extraction."""
+
+        @helion.kernel(
+            static_shapes=False,
+            autotune_effort="none",
+            config=helion.Config(
+                block_sizes=[32, 32],
+                indexing=["tensor_descriptor", "pointer"],
+            ),
+        )
+        def copy_dict(xs: dict[str, torch.Tensor]) -> torch.Tensor:
+            x = xs["x"]
+            result = torch.empty(x.size(), device=x.device, dtype=x.dtype)
+            for tile in hl.tile(x.size()):
+                result[tile] = x[tile]
+            return result
+
+        x = torch.randn([64, 1024], device=DEVICE, dtype=HALF_DTYPE)
+        code, result = code_and_output(copy_dict, ({"x": x},))
+        torch.testing.assert_close(result, x)
+        self.assertNotIn(get_tensor_descriptor_fn_name(), code)
+
+    @skipUnlessTensorDescriptor("Tensor descriptor support is required")
+    @skipIfRefEager("Test checks bound kernel specialization cache")
+    def test_dynamic_tensor_descriptor_list_element_layout_specialization(self):
+        """Only TD-accessed list elements should contribute layout cache keys."""
+
+        @helion.kernel(
+            static_shapes=False,
+            autotune_effort="none",
+            config=helion.Config(
+                block_sizes=[32, 32],
+                indexing=["tensor_descriptor", "pointer"],
+            ),
+        )
+        def copy_first(xs: list[torch.Tensor]) -> torch.Tensor:
+            x = xs[0]
+            result = torch.empty(x.size(), device=x.device, dtype=x.dtype)
+            for tile in hl.tile(x.size()):
+                result[tile] = x[tile]
+            return result
+
+        x_aligned = torch.randn([64, 1024], device=DEVICE, dtype=HALF_DTYPE)
+        x_aligned_2 = torch.randn([64, 1024], device=DEVICE, dtype=HALF_DTYPE)
+        x_unaligned = torch.randn([64, 1025], device=DEVICE, dtype=HALF_DTYPE)[:, :1024]
+        unused_aligned = torch.randn([64, 1024], device=DEVICE, dtype=HALF_DTYPE)
+        unused_unaligned = torch.randn([64, 1025], device=DEVICE, dtype=HALF_DTYPE)[
+            :, :1024
+        ]
+
+        code_aligned, result_aligned = code_and_output(
+            copy_first, ([x_aligned, unused_aligned],)
+        )
+        torch.testing.assert_close(result_aligned, x_aligned)
+        self.assertIn(get_tensor_descriptor_fn_name(), code_aligned)
+        bound_aligned = copy_first.bind(([x_aligned, unused_aligned],))
+        self.assertEqual(len(copy_first._bound_kernels), 1)
+
+        bound_unused_unaligned = copy_first.bind(([x_aligned_2, unused_unaligned],))
+        self.assertIs(bound_aligned, bound_unused_unaligned)
+        self.assertEqual(len(copy_first._bound_kernels), 1)
+
+        code_unaligned, result_unaligned = code_and_output(
+            copy_first, ([x_unaligned, unused_aligned],)
+        )
+        torch.testing.assert_close(result_unaligned, x_unaligned)
+        self.assertNotIn(get_tensor_descriptor_fn_name(), code_unaligned)
+        bound_unaligned = copy_first.bind(([x_unaligned, unused_aligned],))
+        self.assertIsNot(bound_aligned, bound_unaligned)
+        self.assertEqual(len(copy_first._bound_kernels), 2)
+
     @staticmethod
     def _make_td_matmul(static_shapes: bool):
         @helion.kernel(

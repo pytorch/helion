@@ -111,6 +111,8 @@ a:hover{text-decoration:underline}
 .data-table th.sort-desc::after{content:' ▼';font-size:9px}
 .data-table td{padding:8px 10px;border-bottom:1px solid var(--border)}
 .data-table tbody tr:hover{background:rgba(88,166,255,0.04)}
+.data-table tfoot td{background:var(--surface2);font-weight:600;border-top:2px solid var(--border);border-bottom:none;position:sticky;bottom:0}
+.data-table tfoot .gm-label{color:var(--text-dim);font-size:11px;text-transform:uppercase;letter-spacing:0.3px}
 .table-scroll{overflow-x:auto;max-height:600px;overflow-y:auto;border-radius:8px;border:1px solid var(--border);background:var(--surface)}
 .table-wrap{overflow-x:auto;border-radius:8px;border:1px solid var(--border);background:var(--surface)}
 .summary-row{display:flex;gap:12px;margin-bottom:20px;flex-wrap:wrap}
@@ -587,6 +589,8 @@ function renderSpeedup() {
     html += '</div>';
   }
   entries.sort((a, b) => a.platform_short.localeCompare(b.platform_short) || a.kernel.localeCompare(b.kernel));
+  const ctVals = entries.map(e => e.compile_time_geomean_s).filter(v => v > 0);
+  const ctGM = geomean(ctVals);
   html += '<div class="table-wrap"><table class="data-table"><thead><tr><th>Kernel</th><th>Platform</th><th>Commit</th><th>Helion</th><th>torch.compile</th><th>Triton</th><th>Compile Time</th><th>Best</th></tr></thead><tbody>';
   entries.forEach(e => {
     const vals = [e.helion_speedup_geomean, e.torch_compile_speedup_geomean, e.triton_speedup_geomean];
@@ -607,7 +611,14 @@ function renderSpeedup() {
       <td style="color:${colors[bestIdx]}">${names[bestIdx]}</td>
     </tr>`;
   });
-  html += '</tbody></table></div>';
+  html += `</tbody><tfoot><tr>
+    <td colspan="3" class="gm-label">Geomean (${entries.length} kernels)</td>
+    <td style="color:var(--green)">${formatSpeedup(helionGM)}</td>
+    <td style="color:var(--blue)">${formatSpeedup(tcGM)}</td>
+    <td style="color:var(--purple)">${formatSpeedup(tritonGM)}</td>
+    <td>${formatCompileTime(ctGM)}</td>
+    <td></td>
+  </tr></tfoot></table></div>`;
   document.getElementById('tab-speedup').innerHTML = html;
   document.querySelectorAll('#tab-speedup .data-table').forEach(makeSortable);
   document.getElementById('sp-plat-filter').addEventListener('change', e => {
@@ -753,8 +764,8 @@ function renderCompare(baseRunIdOverride, cmpRunIdOverride, baseBranchOverride, 
   }
   html += '<div style="font-size:14px;font-weight:600;margin-bottom:8px">All Kernels</div>';
   html += '<div class="table-wrap"><table class="data-table"><thead><tr><th>Kernel</th><th>Platform</th><th>Base Latency</th><th>Target Latency</th><th>Latency Delta</th><th>Base Speedup</th><th>Target Speedup</th><th>Speedup Delta</th><th>Base Compile Time</th><th>Target Compile Time</th><th>Compile Time Delta</th></tr></thead><tbody>';
+  const fmtLat = v => v && v > 0 ? v.toFixed(2) + ' ms' : '--';
   comparisons.forEach(c => {
-    const fmtLat = v => v && v > 0 ? v.toFixed(2) + ' ms' : '--';
     html += `<tr>
       <td>${escHtml(c.kernel)}</td>
       <td>${platBadge(c.platform_short)}</td>
@@ -769,7 +780,29 @@ function renderCompare(baseRunIdOverride, cmpRunIdOverride, baseBranchOverride, 
       <td>${formatDelta(c.compileDelta, true)}</td>
     </tr>`;
   });
-  html += '</tbody></table></div>';
+  // Geomeans across the filtered set; deltas are taken on the geomeans
+  // themselves so the footer's % matches the geomean ratio.
+  const baseLatGM = geomean(comparisons.map(c => c.baseLatency).filter(v => v > 0));
+  const cmpLatGM = geomean(comparisons.map(c => c.cmpLatency).filter(v => v > 0));
+  const baseSpGM = geomean(comparisons.map(c => c.baseSpeedup).filter(v => v > 0));
+  const cmpSpGM = geomean(comparisons.map(c => c.cmpSpeedup).filter(v => v > 0));
+  const baseCtGM = geomean(comparisons.map(c => c.baseCompile).filter(v => v > 0));
+  const cmpCtGM = geomean(comparisons.map(c => c.cmpCompile).filter(v => v > 0));
+  const latDeltaGM = baseLatGM > 0 && cmpLatGM > 0 ? ((cmpLatGM - baseLatGM) / baseLatGM) * 100 : null;
+  const spDeltaGM = baseSpGM > 0 && cmpSpGM > 0 ? ((cmpSpGM - baseSpGM) / baseSpGM) * 100 : null;
+  const ctDeltaGM = baseCtGM > 0 && cmpCtGM > 0 ? ((cmpCtGM - baseCtGM) / baseCtGM) * 100 : null;
+  html += `</tbody><tfoot><tr>
+    <td colspan="2" class="gm-label">Geomean (${comparisons.length} kernels)</td>
+    <td>${fmtLat(baseLatGM)}</td>
+    <td>${fmtLat(cmpLatGM)}</td>
+    <td>${formatDelta(latDeltaGM, true)}</td>
+    <td>${formatSpeedup(baseSpGM)}</td>
+    <td>${formatSpeedup(cmpSpGM)}</td>
+    <td>${formatDelta(spDeltaGM, false)}</td>
+    <td>${formatCompileTime(baseCtGM)}</td>
+    <td>${formatCompileTime(cmpCtGM)}</td>
+    <td>${formatDelta(ctDeltaGM, true)}</td>
+  </tr></tfoot></table></div>`;
   document.getElementById('tab-compare').innerHTML = html;
   document.querySelectorAll('#tab-compare .data-table').forEach(makeSortable);
   const cmpRerender = () => renderCompare(

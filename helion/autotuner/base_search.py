@@ -125,6 +125,10 @@ class _AutotunableKernel(Protocol):
         """
         ...
 
+    def supports_subprocess_benchmark(self) -> bool:
+        """Whether autotuning may benchmark compiled configs in a subprocess."""
+        ...
+
     def is_cacheable(self) -> bool:
         """Whether this kernel supports the autotuning disk cache."""
         ...
