@@ -118,18 +118,21 @@ def _cute_strategy_matmul_force_persistent_kernel(
 def _bind_cute_strategy_kernel():
     """Shared bind helper for the G2-A strategy data-model tests.
 
-    The G2-A tests all need the same 256x256 cute_tcgen05-enabled
-    ``config_spec``; hoisting the bind avoids repeating the inline
-    kernel definition in every test. The size is the smallest tile
-    family that activates the cute_tcgen05 search path
-    (``enforce_dot_requirements`` requires ``static_m % 64 == 0`` and
-    ``min_dot_size`` of 64x8x16 on B200), so 256 squared is more
-    than enough; using the canonical 4096³ benchmark shape here is
-    wasteful for what is purely a metadata round-trip test.
+    The G2-A tests all need a cute_tcgen05-enabled ``config_spec`` with
+    the cluster_m=2 search arm exposed (otherwise the cluster_m=2
+    fixup / invariant tests below would not have a search arm to
+    exercise); hoisting the bind avoids repeating the inline kernel
+    definition in every test. The 256² shape would normally fall
+    below the cycle-38 small-shape wave-quantization gate
+    (cute_plan.md §7.6.3.2), so we mock ``_cuda_num_sms_or_zero``
+    to return 0 — that fallback keeps cluster_m=2 search live for
+    configuration round-trip tests without depending on the host
+    GPU. Tests that intend to exercise the gate live in
+    ``test_cute_tcgen05_small_shape_wave_quantization_gate*`` and
+    bind their own kernel.
 
-    For tests that exercise codegen (``to_triton_code()``), use
-    ``_bind_cute_strategy_kernel_with_patch`` so the
-    ``patch_cute_mma_support`` context stays active across the
+    For tests that exercise codegen (``to_triton_code()``), keep
+    the ``patch_cute_mma_support`` context active across the
     codegen call — ``cute_mma.py`` consults
     ``get_cute_mma_support()`` during codegen, and a bare bind
     followed by a codegen call would silently hit the non-tcgen05
@@ -139,7 +142,13 @@ def _bind_cute_strategy_kernel():
         torch.empty([256, 256], device=DEVICE, dtype=HALF_DTYPE),
         torch.empty([256, 256], device=DEVICE, dtype=HALF_DTYPE),
     )
-    with patch_cute_mma_support():
+    with (
+        patch_cute_mma_support(),
+        patch(
+            "helion.language.matmul_ops._cuda_num_sms_or_zero",
+            return_value=0,
+        ),
+    ):
         return _cute_strategy_matmul_kernel.bind(args)
 
 
@@ -364,6 +373,69 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
                 self.assertEqual(config["pid_type"], "persistent_interleaved")
                 self.assertEqual(config["block_sizes"][:3], [256, 256, 16])
                 self.assertEqual(config["l2_groupings"], expected_l2_groupings)
+
+    @onlyBackends(["cute"])
+    def test_cute_tcgen05_small_shape_wave_quantization_gate(self) -> None:
+        """Cycle 38 (cute_plan.md §7.6.3.2): the cluster_m=2 search arm
+        is narrowed for shapes whose cluster_m=2 work-cluster count
+        cannot saturate even one wave of cluster slots.
+
+        The gate measures ``(M / 256) * (N / 256)`` cluster_m=2 work
+        clusters and compares against ``num_sms // 2`` (one wave of
+        cluster slots when each cluster occupies two SMs). With the
+        SM count mocked to B200's 148 the threshold is 74 cluster
+        slots; the §7.6.1.1 boost-target shapes 1024^3 and 2048^3
+        sit at 16 and 64 cluster slots respectively and therefore
+        narrow to ``cluster_m=1`` only. The 4096^3 G2 closure
+        baseline sits at 256 cluster slots > 74 and keeps
+        cluster_m=2 search exposed (positive control covered by
+        ``test_cute_tcgen05_two_cta_enters_validated_search_space``).
+
+        Mocking ``_cuda_num_sms_or_zero`` keeps the test hermetic:
+        the gate logic is exercised on any host regardless of the
+        live GPU's SM count.
+        """
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_mma(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        for size in (1024, 2048):
+            with self.subTest(size=size):
+                args = (
+                    torch.empty([size, size], device=DEVICE, dtype=HALF_DTYPE),
+                    torch.empty([size, size], device=DEVICE, dtype=HALF_DTYPE),
+                )
+                with (
+                    patch_cute_mma_support(),
+                    patch(
+                        "helion.language.matmul_ops._cuda_num_sms_or_zero",
+                        return_value=148,
+                    ),
+                ):
+                    bound = cute_matmul_mma.bind(args)
+                spec = bound.config_spec
+                # Below the one-wave SM-slot threshold: cluster_m=2
+                # search is suppressed and the cluster_m2 seed
+                # / fixup machinery is disabled so the autotuner
+                # never spends budget on the cluster_m=2 seed for a
+                # shape where it has no productive lever.
+                self.assertEqual(spec._tcgen05_cluster_m_search_choices, (1,))
+                self.assertIsNone(spec._tcgen05_cluster_m2_search_constraints)
+                self.assertEqual(spec.autotune_seed_configs(), [])
+                # Persistent pid types are still allowed (the static-
+                # full-tile gate above this is unaffected) — only the
+                # cluster_m search arm narrows.
+                self.assertIn("persistent_interleaved", spec.allowed_pid_types)
+                self.assertIn("persistent_blocked", spec.allowed_pid_types)
 
     @onlyBackends(["cute"])
     def test_cute_tcgen05_cluster_m1_persistent_search_caps_m_tile(self) -> None:

@@ -59,6 +59,26 @@ def _cute_dot_outer_accumulates_result(fx_node: object, *, is_acc_none: bool) ->
     return cute_outer_accumulates_result(fx_node, is_acc_none=is_acc_none)
 
 
+def _cuda_num_sms_or_zero(device: torch.device) -> int:
+    """Return the device SM count, or 0 on devices ``get_num_sm`` does not support.
+
+    Used by the cluster_m=2 small-shape wave-quantization gate in
+    ``enforce_dot_requirements`` (cute_plan.md §7.6.3.2). The 0 fallback
+    keeps cluster_m=2 search live for configuration round-trip tests
+    that bind on CPU or other unsupported device types.
+    """
+    if device.type != "cuda":
+        return 0
+    # Local import: ``helion.runtime`` is in the import chain that loads
+    # this module, so a top-level import would be circular.
+    from ..runtime import get_num_sm
+
+    try:
+        return get_num_sm(device)
+    except (AssertionError, NotImplementedError):
+        return 0
+
+
 @_decorators.api(is_device_only=True)
 def dot(
     mat1: torch.Tensor,
@@ -326,6 +346,21 @@ def enforce_dot_requirements(lhs: torch.Tensor, rhs: torch.Tensor) -> None:
                 and max_search_n >= TCGEN05_TWO_CTA_BLOCK_N
                 and static_k <= max_cluster_m2_search_k
             )
+            # Small-shape wave-quantization gate. Suppress cluster_m=2
+            # search when the cluster_m=2 work-cluster count cannot fill
+            # one wave of cluster slots (``num_sms // 2``); the persistent
+            # warp-spec prologue dominates and cluster_m=1 wins. ``num_sms
+            # == 0`` (non-CUDA / mocked) keeps search live. See
+            # cute_plan.md §7.6.3.2 for the NCU rationale and B200 numbers.
+            if allow_cluster_m2_search:
+                num_sms_for_cm2_threshold = _cuda_num_sms_or_zero(lhs.device)
+                if num_sms_for_cm2_threshold > 0:
+                    cm2_work_clusters = (static_m // TCGEN05_TWO_CTA_BLOCK_M) * (
+                        static_n // TCGEN05_TWO_CTA_BLOCK_N
+                    )
+                    cm2_one_wave_slots = num_sms_for_cm2_threshold // 2
+                    if cm2_work_clusters < cm2_one_wave_slots:
+                        allow_cluster_m2_search = False
             # Narrow the autotune search to tcgen05 configs that have been
             # validated to compile and run correctly on B200. Static full-tile
             # single-root role-local persistent kernels have coverage, so the

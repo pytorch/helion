@@ -20,10 +20,15 @@ expression for two cases:
   compile-time scalar arguments.
 - Auxiliary-tensor binary ops: same shape as above, but one or more
   steps are ``add/sub/mul/div`` with the chain carrier as one
-  operand and a ``helion.language.load(aux_tensor, [tile_m, tile_n])``
-  call as the other. The auxiliary tensor must match the output
-  tile's 2-D shape exactly (no broadcast); 1-D / broadcast forms are
-  rejected to the loud-failure backstop.
+  operand and a ``helion.language.load(aux_tensor, [...])``
+  call as the other. Two aux load shapes are accepted: the
+  exact-shape rank-2 form (``residual[tile_m, tile_n]``) and the
+  rank-1 trailing-axis (rowvec) broadcast form (``bias[tile_n]``).
+  See :class:`_AuxiliaryTensorStep` for the canonical contract.
+  Forms outside these two — 3-D underlying tensors with a static
+  collapse, mismatched indices, leading-axis rank-1
+  (``bias[tile_m]``), kwargs — are rejected to the loud-failure
+  backstop.
 
 Any op outside the whitelist (reductions, shape changes,
 auxiliary-tensor loads with unsupported indexing, etc.) bails to
@@ -46,8 +51,8 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from .cute_fx_walk import aux_tensor_load_kind
 from .cute_fx_walk import build_inner_outputs_index
-from .cute_fx_walk import is_aux_tensor_load_node
 from .cute_fx_walk import walk_carrier_to_tcgen05_matmul
 
 if TYPE_CHECKING:
@@ -115,12 +120,32 @@ class _AuxiliaryTensorStep:
     index list, which the analyzer pins to exactly the carrier's
     tile-id symbol nodes — broader index shapes are rejected at
     classify time).
+
+    ``broadcast_axis`` is ``None`` when the aux tensor matches the
+    carrier rank exactly (``residual[tile_m, tile_n]``) or ``1`` for
+    a trailing-axis (rowvec) broadcast aux load (``bias[tile_n]``
+    with shape ``(N,)``). The leading-axis (colvec / M-axis) form is
+    not accepted: a bare rank-1 operand on the RHS aligns to the
+    *last* dimension under PyTorch broadcasting rules
+    (``acc + bias[tile_m]`` is either a shape error when BM ≠ BN
+    or a rowvec broadcast when BM == BN), so accepting the colvec
+    pattern would silently rewrite the user's broadcast direction.
+    Users wanting an explicit colvec broadcast must spell it out
+    with ``[:, None]`` / ``.unsqueeze(-1)``; that is a separate
+    pattern handler not yet wired up. The splice site
+    (``memory_ops._codegen_cute_store_tcgen05_tile``) owns the
+    canonical broadcast-view contract — it builds a 2-D logical
+    view of the rank-1 tensor with stride 0 on the orthogonal axis
+    so the existing ``partition_C → flat_divide → partition_D``
+    pipeline can run unchanged. Mirrors Quack's ``RowVecLoad``
+    epilogue (``quack/quack/epi_ops.py``).
     """
 
     op_name: str
     op_template: str
     forward_form: bool
     load_node: torch.fx.Node
+    broadcast_axis: int | None = None
 
 
 # The cute DSL surface for whitelisted unary operations. Renderings are
@@ -444,6 +469,7 @@ def _classify_binary(
     *,
     carrier_tile_shape: tuple[object, ...] | None,
     carrier_tile_index_nodes: tuple[torch.fx.Node, ...] | None = None,
+    carrier_global_shape: tuple[object, ...] | None = None,
 ) -> tuple[_UnaryStep | _AuxiliaryTensorStep, torch.fx.Node] | None:
     """Classify ``cur`` (a ``call_function`` node whose target is on the
     binary whitelist) as a single chain step plus its FX carrier node.
@@ -486,27 +512,31 @@ def _classify_binary(
         # tensor load; the other is the chain carrier. If both look
         # like aux loads or neither does, bail — the chain has no
         # unique carrier.
-        lhs_aux = is_aux_tensor_load_node(
+        lhs_kind = aux_tensor_load_kind(
             lhs,
             carrier_tile_shape=carrier_tile_shape,
             carrier_tile_index_nodes=carrier_tile_index_nodes,
+            carrier_global_shape=carrier_global_shape,
         )
-        rhs_aux = is_aux_tensor_load_node(
+        rhs_kind = aux_tensor_load_kind(
             rhs,
             carrier_tile_shape=carrier_tile_shape,
             carrier_tile_index_nodes=carrier_tile_index_nodes,
+            carrier_global_shape=carrier_global_shape,
         )
         aux_load: torch.fx.Node
         carrier: torch.fx.Node
         forward_form: bool
-        if lhs_aux and not rhs_aux:
+        if lhs_kind is not None and rhs_kind is None:
             aux_load = lhs
             carrier = rhs
             forward_form = False  # carrier is the right operand
-        elif rhs_aux and not lhs_aux:
+            aux_kind = lhs_kind
+        elif rhs_kind is not None and lhs_kind is None:
             aux_load = rhs
             carrier = lhs
             forward_form = True  # carrier is the left operand
+            aux_kind = rhs_kind
         else:
             return None
         op_template_table: dict[object, str] = (
@@ -520,12 +550,14 @@ def _classify_binary(
             torch.ops.aten.div.Tensor: "div",
         }
         op_name = op_name_table[target]
+        broadcast_axis = aux_kind[1] if aux_kind[0] == "broadcast" else None
         return (
             _AuxiliaryTensorStep(
                 op_name=op_name,
                 op_template=op_template,
                 forward_form=forward_form,
                 load_node=aux_load,
+                broadcast_axis=broadcast_axis,
             ),
             carrier,
         )
@@ -602,10 +634,27 @@ def _carrier_tile_index_nodes(
     tuple of FX symint nodes (one per tile axis), or ``None`` when
     the walk cannot recover them — the classifier then falls back
     to the looser shape-only check.
+
+    For binary chain steps the walk picks the first
+    ``all_input_nodes`` entry that is *not* a ``helion.language.load``
+    call. The chain analyzer accepts both ``add(carrier, aux_load)``
+    and ``add(aux_load, carrier)``; descending into the aux load side
+    breaks the walk-back to ``hl.zeros``. Skipping aux load nodes
+    keeps the walk on the carrier side regardless of operand order,
+    so the reverse-form chain (``aux + carrier``) recovers the tile
+    index symbols just like the forward form.
+
+    Invariant: any ``hl.load`` input encountered during the walk is
+    necessarily an aux load (never a carrier passthrough), because
+    the carrier always originates at ``hl.zeros`` and is propagated
+    through ``_phi`` / ``_new_var`` / ``getitem`` plus the accepted
+    chain ops — none of which produces a load node along the
+    carrier side.
     """
     import operator
 
     from ...language import _tracing_ops
+    from ...language.memory_ops import load as helion_load
 
     cur: torch.fx.Node | None = cast_input
     visited: set[torch.fx.Node] = set()
@@ -638,18 +687,29 @@ def _carrier_tile_index_nodes(
             cur = arg
             continue
         # The chain may carry a binary op whose carrier we want to
-        # follow back. Use the FX node walk: descend the first
-        # tensor-typed input and continue.
+        # follow back. Pick the first ``all_input_nodes`` entry that
+        # is not a ``helion.language.load`` call so we descend into
+        # the carrier side regardless of operand order. Reverse-form
+        # binaries (``aux_load <op> carrier``) put the aux load
+        # first; without this skip the walk would descend into the
+        # aux tensor and never find ``hl.zeros``.
+        chosen: torch.fx.Node | None = None
         for inp in cur.all_input_nodes:
-            cur = inp
+            if inp.op == "call_function" and inp.target is helion_load:
+                continue
+            chosen = inp
             break
-        else:
+        if chosen is None:
             return None
+        cur = chosen
     return None
 
 
 def analyze_tcgen05_unary_epilogue_chain(
-    state: CodegenState, value_node: torch.fx.Node
+    state: CodegenState,
+    value_node: torch.fx.Node,
+    *,
+    output_global_shape: tuple[object, ...] | None = None,
 ) -> tuple[Tcgen05UnaryEpilogueChain, torch.fx.Node] | None:
     """Classify ``value_node``'s producer chain as a whitelisted
     epilogue rooted at a tcgen05 matmul.
@@ -667,12 +727,15 @@ def analyze_tcgen05_unary_epilogue_chain(
     Whitelisted ops are zero-arg unary (``relu`` / ``tanh`` / ``exp``
     / ``log`` / ``sqrt`` / ``abs`` / ``neg``), scalar binary
     (``add`` / ``sub`` / ``mul`` / ``div`` against a compile-time
-    Python literal), and exact-shape auxiliary-tensor binary:
-    scalar binary against a ``helion.language.load`` of an
-    auxiliary GMEM tensor whose ``meta['val'].shape`` and rank
-    match the carrier's tile shape. Rank mismatches and 1-D
-    broadcast forms (``bias[tile_n]``) are rejected so the
-    loud-failure backstop fires.
+    Python literal), and auxiliary-tensor binary in two forms:
+    exact-shape (``residual[tile_m, tile_n]``, rank-2 aux matching
+    the carrier tile shape) and rank-1 trailing-axis (rowvec)
+    broadcast (``bias[tile_n]``, where the single load index
+    symbol matches the carrier's trailing tile-id symbol). Other
+    shapes — 3-D collapsed loads, indices that are not exactly the
+    carrier trailing tile-id symbol, leading-axis rank-1
+    (``bias[tile_m]``), kwargs — are rejected so the loud-failure
+    backstop fires.
 
     A user-written intermediate cast like
     ``out[tile] = relu(acc).to(d_inter)`` with ``d_inter`` not equal
@@ -700,6 +763,11 @@ def analyze_tcgen05_unary_epilogue_chain(
     path ``ast.Name``-matching code in ``store_codegen`` handles the
     identity case earlier; the empty-chain return from this function
     is a defensive belt-and-suspenders.
+
+    ``output_global_shape`` is the user-side store target tensor's
+    full (non-tile) shape, threaded into the rank-1 broadcast aux
+    classifier so an aux whose extent only happens to match the
+    tile but not the global axis is rejected at classify time.
     """
     df = state.device_function
     target_fx_nodes = df.cute_tcgen05_matmul_fx_nodes
@@ -780,6 +848,7 @@ def analyze_tcgen05_unary_epilogue_chain(
                 cur,
                 carrier_tile_shape=carrier_tile_shape,
                 carrier_tile_index_nodes=carrier_tile_index_nodes,
+                carrier_global_shape=output_global_shape,
             )
             if classified is None:
                 return None

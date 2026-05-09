@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import contextlib
+import dataclasses
 import logging
 import operator
 import textwrap
@@ -83,6 +84,33 @@ _EVICTION_POLICY_MAP = {
     "first": "evict_first",
     "last": "evict_last",
 }
+
+
+@dataclasses.dataclass(frozen=True)
+class _AuxStepRecord:
+    """Per-step splice-side AST locals for one auxiliary chain step.
+
+    Holds the underlying aux tensor name, broadcast axis (None for
+    exact-shape rank-2 aux), and the AST var names allocated for
+    the partition pipeline. ``aux_view2d`` is set only for
+    broadcast aux steps; exact-shape steps leave it ``None``. Used
+    by ``_codegen_cute_store_tcgen05_tile`` to thread per-aux
+    locals through the per-output-tile setup helper and the
+    per-subtile load source helper.
+    """
+
+    aux_tensor_name: str
+    broadcast_axis: int | None
+    aux_tile: str
+    aux_part_base: str
+    aux_xfm: str
+    aux_planned: str
+    aux_epi: str
+    ttr_aux: str
+    ttr_aux_grouped: str
+    ttr_aux_subtile: str
+    aux_loaded: str
+    aux_view2d: str | None
 
 
 @has_side_effect
@@ -1726,7 +1754,8 @@ def _codegen_cute_store_tcgen05_tile(
             "so the problem dimensions are divisible by them, or drop "
             "the auxiliary-tensor epilogue.",
         )
-    aux_step_records: list[dict[str, str]] = []
+
+    aux_step_records: list[_AuxStepRecord] = []
     for aux_idx, aux_step in enumerate(aux_steps_in_chain):
         aux_tensor_node = aux_step.load_node.args[0]
         assert isinstance(aux_tensor_node, torch.fx.Node)
@@ -1739,19 +1768,29 @@ def _codegen_cute_store_tcgen05_tile(
         # treats unreferenced tensors as captures, which doesn't work
         # for tensors only read inside a per-subtile loop body).
         df.placeholder_args.add(aux_tensor_name)
+        # Broadcast aux steps need a fresh AST var for the 2-D view
+        # of the rank-1 underlying tensor (stride 0 on the orthogonal
+        # axis). Exact-shape aux steps leave ``aux_view2d`` as None.
+        aux_view2d = (
+            df.new_var(f"tcgen05_aux_view2d_{aux_idx}")
+            if aux_step.broadcast_axis is not None
+            else None
+        )
         aux_step_records.append(
-            {
-                "aux_tensor_name": aux_tensor_name,
-                "aux_tile": df.new_var(f"tcgen05_aux_tile_{aux_idx}"),
-                "aux_part_base": df.new_var(f"tcgen05_tCgAux_base_{aux_idx}"),
-                "aux_xfm": df.new_var(f"tcgen05_tCgAux_xfm_{aux_idx}"),
-                "aux_planned": df.new_var(f"tcgen05_tCgAux_planned_{aux_idx}"),
-                "aux_epi": df.new_var(f"tcgen05_tCgAux_epi_{aux_idx}"),
-                "ttr_aux": df.new_var(f"tcgen05_tTR_gAux_{aux_idx}"),
-                "ttr_aux_grouped": df.new_var(f"tcgen05_tTR_gAux_grouped_{aux_idx}"),
-                "ttr_aux_subtile": df.new_var(f"tcgen05_tTR_gAux_subtile_{aux_idx}"),
-                "aux_loaded": df.new_var(f"tcgen05_aux_loaded_{aux_idx}"),
-            }
+            _AuxStepRecord(
+                aux_tensor_name=aux_tensor_name,
+                broadcast_axis=aux_step.broadcast_axis,
+                aux_tile=df.new_var(f"tcgen05_aux_tile_{aux_idx}"),
+                aux_part_base=df.new_var(f"tcgen05_tCgAux_base_{aux_idx}"),
+                aux_xfm=df.new_var(f"tcgen05_tCgAux_xfm_{aux_idx}"),
+                aux_planned=df.new_var(f"tcgen05_tCgAux_planned_{aux_idx}"),
+                aux_epi=df.new_var(f"tcgen05_tCgAux_epi_{aux_idx}"),
+                ttr_aux=df.new_var(f"tcgen05_tTR_gAux_{aux_idx}"),
+                ttr_aux_grouped=df.new_var(f"tcgen05_tTR_gAux_grouped_{aux_idx}"),
+                ttr_aux_subtile=df.new_var(f"tcgen05_tTR_gAux_subtile_{aux_idx}"),
+                aux_loaded=df.new_var(f"tcgen05_aux_loaded_{aux_idx}"),
+                aux_view2d=aux_view2d,
+            )
         )
 
     # Pyrefly does not preserve the non-None ``tcgen05_value`` narrowing
@@ -1771,9 +1810,15 @@ def _codegen_cute_store_tcgen05_tile(
         tensor, but partitions a separate auxiliary GMEM tensor per
         chain step. Calls ``thr_mma.partition_C`` and
         ``thr_copy_t2r.partition_D`` against the aux tile so the
-        per-thread layout matches D's layout exactly — this is
-        correct for the exact-shape (``residual[tile_m, tile_n]``)
-        form step-1 supports.
+        per-thread layout matches D's layout exactly — both the
+        exact-shape (``residual[tile_m, tile_n]``) and rank-1
+        broadcast (``bias[tile_n]`` / ``bias[tile_m]``) forms feed
+        the same downstream pipeline.
+
+        For the broadcast form the helper first builds a 2-D view
+        of the underlying rank-1 tensor with stride 0 on the
+        orthogonal axis (see :class:`_AuxiliaryTensorStep` for the
+        canonical contract).
 
         When ``define_thr_copy_t2r`` is True the helper emits the
         ``thr_copy_t2r = tiled_copy_t2r.get_slice(...)`` line first
@@ -1791,53 +1836,107 @@ def _codegen_cute_store_tcgen05_tile(
                 f"{tiled_copy_t2r}.get_slice({tcgen05_aux_epi_tidx})"
             )
         for rec in aux_step_records:
+            if rec.broadcast_axis is None:
+                # Exact-shape rank-2 aux: slice the per-tile region
+                # of the underlying 2-D tensor directly.
+                source_for_local_tile = rec.aux_tensor_name
+            else:
+                # Rank-1 trailing-axis (rowvec) broadcast aux: build a
+                # 2-D logical view of the rank-1 underlying tensor with
+                # stride 0 on the leading (M) axis and stride 1 on the
+                # trailing (N) axis. Stride 0 on M causes every lane
+                # "owning" output ``(m, n)`` to read the same source
+                # element regardless of m, which is the rowvec
+                # broadcast semantic that matches PyTorch's
+                # ``acc + bias[tile_n]`` (rank-1 RHS aligns to the
+                # trailing axis). The view feeds the same
+                # ``partition_C → flat_divide → partition_D`` pipeline
+                # used by exact-shape aux. Mirrors Quack's
+                # ``RowVecLoad`` epilogue (``quack/quack/epi_ops.py``).
+                # Only the trailing axis (``broadcast_axis == 1``)
+                # form is accepted at classify time — see
+                # ``aux_tensor_load_kind`` /
+                # ``_AuxiliaryTensorStep.broadcast_axis`` for the
+                # rejection of the leading-axis form.
+                assert rec.broadcast_axis == 1
+                assert rec.aux_view2d is not None
+                lines.append(
+                    f"{rec.aux_view2d} = cute.make_tensor("
+                    f"{rec.aux_tensor_name}.iterator, "
+                    f"cute.make_layout(({m_size}, {n_size}), "
+                    f"stride=(0, 1)))"
+                )
+                source_for_local_tile = rec.aux_view2d
             lines.extend(
                 [
                     (
-                        f"{rec['aux_tile']} = cute.local_tile("
-                        f"{rec['aux_tensor_name']}, ({tcgen05_bm}, {tcgen05_bn}), "
+                        f"{rec.aux_tile} = cute.local_tile("
+                        f"{source_for_local_tile}, ({tcgen05_bm}, {tcgen05_bn}), "
                         f"({tile_coord_m}, {tile_coord_n}))"
                     ),
                     (
-                        f"{rec['aux_part_base']} = "
-                        f"{tcgen05_thr_mma}.partition_C({rec['aux_tile']})"
+                        f"{rec.aux_part_base} = "
+                        f"{tcgen05_thr_mma}.partition_C({rec.aux_tile})"
                     ),
                     (
-                        f"{rec['aux_xfm']} = "
+                        f"{rec.aux_xfm} = "
                         "cutlass.utils.gemm.sm100.transform_partitioned_tensor_layout("
-                        f"{rec['aux_part_base']})"
+                        f"{rec.aux_part_base})"
                     ),
                     (
-                        f"{rec['aux_planned']} = cute.make_tensor("
-                        f"{rec['aux_xfm']}.iterator, "
-                        f"cute.append(cute.append(cute.append({rec['aux_xfm']}.layout, "
+                        f"{rec.aux_planned} = cute.make_tensor("
+                        f"{rec.aux_xfm}.iterator, "
+                        f"cute.append(cute.append(cute.append({rec.aux_xfm}.layout, "
                         f"{tcgen05_aux_epilogue_rest_mode}), "
                         f"{tcgen05_aux_epilogue_rest_mode}), "
                         f"{tcgen05_aux_epilogue_rest_mode}))"
                     ),
                     (
-                        f"{rec['aux_epi']} = cute.flat_divide("
-                        f"{rec['aux_planned']}, {epi_tile})"
+                        f"{rec.aux_epi} = cute.flat_divide("
+                        f"{rec.aux_planned}, {epi_tile})"
                     ),
+                    (f"{rec.ttr_aux} = {thr_copy_t2r_var}.partition_D({rec.aux_epi})"),
                     (
-                        f"{rec['ttr_aux']} = "
-                        f"{thr_copy_t2r_var}.partition_D({rec['aux_epi']})"
-                    ),
-                    (
-                        f"{rec['ttr_aux_grouped']} = cute.group_modes("
-                        f"{rec['ttr_aux']}, 3, cute.rank({rec['ttr_aux']}))"
+                        f"{rec.ttr_aux_grouped} = cute.group_modes("
+                        f"{rec.ttr_aux}, 3, cute.rank({rec.ttr_aux}))"
                     ),
                 ]
             )
         return lines
 
     def _aux_subtile_load_source(prelude_indent: str) -> str:
-        """Per-subtile aux-load source lines (one per aux step).
+        """Per-subtile aux GMEM-load source lines (one per aux step).
 
-        Each step emits the per-thread subtile slice + ``.load()``
-        call into a dedicated ``tcgen05_aux_loaded_*`` local. Goes
-        inside the per-subtile loop body, before the chain-rendering
-        prelude that consumes these locals.
+        Each step emits the per-thread GMEM subtile slice of
+        ``tTR_gAux_grouped_<idx>`` followed by a ``.load()`` call
+        into the per-subtile ``tcgen05_aux_loaded_*`` local. Goes
+        inside the per-subtile loop body. Splice sites with aux
+        chains arrange the call so the slice + LDG fires at the
+        top of the per-subtile loop body — before the in-loop
+        c_pipeline ``producer_acquire`` for the later-subtile
+        path (``_tcgen05_subtile != 0``), the in-loop acc
+        ``consumer_wait``, and the t2r async TMEM→reg copy on the
+        same subtile. The first c_pipeline ``producer_acquire``
+        for subtile 0 is emitted outside the per-subtile loop and
+        therefore precedes the aux LDG; the slice depends on
+        ``_tcgen05_subtile`` so it cannot be hoisted out of the
+        loop entirely. The hoist still gives the long-scoreboard
+        L1TEX wait the in-loop acc ``consumer_wait`` and the t2r
+        async copy to overlap with on every subtile, plus the
+        later-subtile c_pipeline acquire on subtile != 0.
+
+        Cycle 39 (GPU 6) replan note: an alternative form that
+        pre-loads all subtile aux into a per-thread register
+        tensor outside the per-subtile loop (``cute.autovec_copy``
+        from ``tTR_gAux_grouped_<idx>`` into a fresh
+        ``tTR_rAux_<idx>``) was tested. The single cooperative
+        LDG fired before the per-subtile loop, but the multi-
+        subtile register tensor pushed local-memory spills from
+        356k to 1.17M and grew kernel duration from 308 µs to
+        332 µs. The per-subtile GMEM load form below pays one
+        LDG per chain-add but the compiler IR / SASS scheduler
+        already lifts the LDG ahead of the chain-add given the
+        independent dependency graph.
         """
         if not aux_step_records:
             return ""
@@ -1846,13 +1945,13 @@ def _codegen_cute_store_tcgen05_tile(
             lines.extend(
                 [
                     (
-                        f"{prelude_indent}{rec['ttr_aux_subtile']} = "
-                        f"{rec['ttr_aux_grouped']}"
+                        f"{prelude_indent}{rec.ttr_aux_subtile} = "
+                        f"{rec.ttr_aux_grouped}"
                         f"[(None, None, None, cutlass.Int32(_tcgen05_subtile))]\n"
                     ),
                     (
-                        f"{prelude_indent}{rec['aux_loaded']} = "
-                        f"{rec['ttr_aux_subtile']}.load()\n"
+                        f"{prelude_indent}{rec.aux_loaded} = "
+                        f"{rec.ttr_aux_subtile}.load()\n"
                     ),
                 ]
             )
@@ -1872,11 +1971,18 @@ def _codegen_cute_store_tcgen05_tile(
     # statements (each newline-terminated, indented with
     # `prelude_indent`) plus the assignment expression for
     # `tcgen05_acc_vec`.
-    def _splice_acc_vec(carrier_name: str, prelude_indent: str) -> tuple[str, str]:
-        """Return ``(prelude, assignment_rhs)``. ``prelude`` is empty
-        for the identity epilogue. ``assignment_rhs`` is the right-hand
-        side of ``acc_vec = ...`` (without leading whitespace or the
-        trailing newline).
+    def _splice_acc_vec(carrier_name: str, prelude_indent: str) -> tuple[str, str, str]:
+        """Return ``(early_aux_prelude, late_prelude, assignment_rhs)``.
+
+        ``early_aux_prelude`` is the per-subtile auxiliary-tensor LDG
+        block (``ttr_aux_subtile = ...``; ``aux_loaded = .load()``) and
+        is empty when the chain has no aux steps. ``late_prelude``
+        holds the ``acc_loaded = carrier.load()`` and the chain-step
+        renderings. ``assignment_rhs`` is the right-hand side of
+        ``acc_vec = ...`` (without leading whitespace or the trailing
+        newline). Both preludes are empty for the identity epilogue
+        (no chain) — in that case ``assignment_rhs`` is the original
+        ``carrier.load().to(target_dtype)`` expression.
 
         Each chain step renders into a fresh ``tcgen05_chain_step*``
         local so chain composition stays linear in source size — the
@@ -1886,20 +1992,31 @@ def _codegen_cute_store_tcgen05_tile(
         the rendered source O(N) in chain depth and CuTe CSEs the
         loads at compile.
 
-        Auxiliary-tensor chain steps additionally emit a per-aux-step
+        Auxiliary-tensor chain steps additionally emit per-aux-step
         ``ttr_aux_subtile = ...`` slice + ``aux_loaded = .load()``
-        line inside the prelude (so the chain renderer can reference
-        the bound local). The aux tile-level setup runs once per
-        output tile and is emitted by the splice site's surrounding
-        scaffolding via ``_aux_tile_setup_lines()``.
+        lines (the per-tile aux setup runs once per output tile and
+        is emitted by the splice site's surrounding scaffolding via
+        ``_aux_tile_setup_lines()``). Splitting the aux LDG out of
+        the chain prelude lets the TMA-store splice issue the GMEM
+        load as the first operation in the per-subtile loop body,
+        so the long-scoreboard L1TEX wait overlaps with the in-loop
+        acc ``consumer_wait``, the t2r async TMEM→reg copy, and the
+        later-subtile c_pipeline ``producer_acquire`` (the in-loop
+        ``_tcgen05_subtile != 0`` path; the first c_pipeline acquire
+        for subtile 0 is emitted outside the loop and therefore
+        precedes the aux LDG). The SIMT-store splice rejects aux at
+        validate time, so for that path ``early_aux_prelude`` is
+        always empty and the caller can safely concatenate
+        ``early_aux_prelude + late_prelude`` to recover the previous
+        flat prelude shape.
         """
         load_expr = f"{carrier_name}.load()"
         if epilogue_chain is None or not epilogue_chain.steps:
-            return ("", f"{load_expr}.to({target_dtype})")
+            return ("", "", f"{load_expr}.to({target_dtype})")
         loaded = df.new_var("tcgen05_acc_loaded")
         prelude_load = f"{prelude_indent}{loaded} = {load_expr}\n"
-        aux_load_lines = _aux_subtile_load_source(prelude_indent)
-        aux_locals = tuple(rec["aux_loaded"] for rec in aux_step_records)
+        early_aux_prelude = _aux_subtile_load_source(prelude_indent)
+        aux_locals: tuple[str, ...] = tuple(rec.aux_loaded for rec in aux_step_records)
         chain_prelude, final_expr = epilogue_chain.render_prelude_and_expr(
             loaded,
             df.new_var,
@@ -1907,7 +2024,8 @@ def _codegen_cute_store_tcgen05_tile(
             aux_locals_by_step=aux_locals or None,
         )
         return (
-            prelude_load + aux_load_lines + chain_prelude,
+            early_aux_prelude,
+            prelude_load + chain_prelude,
             f"({final_expr}).to({target_dtype})",
         )
 
@@ -1993,7 +2111,15 @@ def _codegen_cute_store_tcgen05_tile(
     simt_static_store_setup, simt_tile_store_setup = store_common_setup(
         tensor_name, include_full_tile=True
     )
-    simt_acc_vec_prelude, simt_acc_vec_rhs = _splice_acc_vec(ttr_racc, "        ")
+    # The SIMT-store splice rejects aux-tensor chains at validate time
+    # (see ``aux_steps_in_chain and not use_tma_store_epilogue`` above),
+    # so ``simt_early_aux`` is always empty here. Concatenating preserves
+    # the prior flat-prelude source order for unary chains and identity
+    # stores.
+    simt_early_aux, simt_late_prelude, simt_acc_vec_rhs = _splice_acc_vec(
+        ttr_racc, "        "
+    )
+    simt_acc_vec_prelude = simt_early_aux + simt_late_prelude
     tma_static_store_setup, tma_tile_store_setup = store_common_setup(
         tcgen05_value.tma_store_tensor, include_full_tile=False
     )
@@ -2335,33 +2461,68 @@ def _codegen_cute_store_tcgen05_tile(
     tcgen05_warp_idx = tcgen05_value.warp_idx
     tcgen05_tma_store_atom = tcgen05_value.tma_store_atom
 
-    def tma_store_acc_t2r_region(*, acc_wait: str) -> str:
-        # When the chain has auxiliary-tensor steps, render the
-        # chain (and the destination store) in the ``ttr_*``
-        # (t2r-fragment) layout instead of the ``trs_*`` (r2s-
-        # retile) layout. The aux load is partitioned via
-        # ``thr_copy_t2r.partition_D`` so it lives in the t2r
-        # layout; the chain's binary ops require both operands in
-        # the same layout, and forcing the carrier to ``ttr_*``
-        # avoids an extra register-stage retile that would
-        # otherwise be needed for the GMEM-loaded aux. ``ttr_rd``
-        # and ``trs_rd`` share register storage (``trs_rd`` is
-        # ``epilogue_smem_copy_and_partition``'s retiled view of
-        # ``ttr_rd``), so storing into ``ttr_rd`` here makes the
-        # downstream ``cute.copy(tiled_copy_r2s, trs_rd, trs_sd)``
-        # see the same data.
+    def tma_store_acc_t2r_region_split(*, acc_wait: str) -> tuple[str, str]:
+        """Return ``(early_aux_prelude, body)`` for the t2r region.
+
+        ``early_aux_prelude`` is the per-subtile auxiliary-tensor LDG
+        block (empty for identity / unary-only chains). The caller is
+        expected to emit it at the top of the per-subtile loop body so
+        the GMEM LDG fires before the in-loop c_pipeline acquires (the
+        ``_tcgen05_subtile != 0`` later-subtile acquires) and the
+        in-loop acc ``consumer_wait`` and t2r async TMEM→reg copy. The
+        aux LDG depends on ``_tcgen05_subtile`` (it slices a per-
+        subtile view of ``ttr_gAux_grouped_*``), so it cannot be
+        hoisted out of the per-subtile loop entirely; the **first**
+        c_pipeline ``producer_acquire`` for subtile 0 is emitted
+        outside the loop (warp-0 arms the ring once before any subtile
+        work) and so structurally precedes the aux LDG for subtile 0.
+        The hoist still removes the L1TEX serialization for every
+        chain-add because the warp scheduler can issue the aux LDG
+        before the in-loop acc ``consumer_wait`` and the t2r async
+        copy on the same subtile, and before the in-loop later-
+        subtile c_pipeline acquire on subtile != 0. ``body`` is the
+        rest of the t2r region (acc consumer_wait, t2r copy, chain
+        combine, store_target store) at the existing 8-space indent.
+
+        When the chain has auxiliary-tensor steps, render the chain
+        (and the destination store) in the ``ttr_*`` (t2r-fragment)
+        layout instead of the ``trs_*`` (r2s-retile) layout. The aux
+        load is partitioned via ``thr_copy_t2r.partition_D`` so it
+        lives in the t2r layout; the chain's binary ops require both
+        operands in the same layout, and forcing the carrier to
+        ``ttr_*`` avoids an extra register-stage retile that would
+        otherwise be needed for the GMEM-loaded aux. ``ttr_rd`` and
+        ``trs_rd`` share register storage (``trs_rd`` is
+        ``epilogue_smem_copy_and_partition``'s retiled view of
+        ``ttr_rd``), so storing into ``ttr_rd`` here makes the
+        downstream ``cute.copy(tiled_copy_r2s, trs_rd, trs_sd)`` see
+        the same data.
+
+        NCU diagnosis on 4096³ residual (cycle 39, GPU 6): Helion
+        paid 26.7 cycles per warp on long-scoreboard L1TEX wait
+        vs Quack's 15.7 — Helion's per-thread aux GMEM load was
+        issued after the t2r async TMEM→reg copy and the
+        ``acc.load()`` call, so the chain-add waited for the LDG
+        with no overlap. Quack overlaps the residual ``C`` load via
+        a TMA SMEM ring (8th producer warp). A cheaper structural
+        fix at the splice level (without a new SMEM ring) is to
+        hoist the GMEM LDG to the top of the per-subtile body so
+        the warp scheduler has the in-loop acc ``consumer_wait``,
+        the t2r async copy, and the later-subtile c_pipeline
+        ``producer_acquire`` to overlap with the LDG.
+        """
         if aux_steps_in_chain:
             carrier = ttr_racc
             store_target = ttr_rd
         else:
             carrier = trs_racc
             store_target = trs_rd
-        prelude, rhs = _splice_acc_vec(carrier, "        ")
-        return (
+        early_aux_prelude, late_prelude, rhs = _splice_acc_vec(carrier, "        ")
+        body = (
             f"{acc_wait}"
             f"        {ttr_tacc_mn} = {ttr_tacc}[(None, None, None, cutlass.Int32(_tcgen05_subtile))]\n"
             f"        cute.copy({tiled_copy_t2r}, {ttr_tacc_mn}, {ttr_racc})\n"
-            f"{prelude}"
+            f"{late_prelude}"
             f"        {acc_vec} = {rhs}\n"
             f"        if _tcgen05_subtile == {subtile_count} - 1:\n"
             f"            cute.arch.fence_view_async_tmem_load()\n"
@@ -2369,6 +2530,27 @@ def _codegen_cute_store_tcgen05_tile(
             f"                {tcgen05_acc_pipeline}.consumer_release({tcgen05_acc_consumer_state})\n"
             f"        {store_target}.store({acc_vec})\n"
         )
+        return early_aux_prelude, body
+
+    def tma_store_acc_t2r_region(*, acc_wait: str) -> str:
+        # Diagnostic / non-default callers (split-first-t2r,
+        # split-acc-t2r-store-tail, module-helper variants) all reject
+        # aux-tensor chains at validate time, so the early aux block
+        # is always empty for them. The assertion below makes that
+        # contract enforceable: a future caller that forgets to
+        # validate would silently produce non-hoisted output if it
+        # routed an aux-tensor chain through this wrapper, so we
+        # refuse to render rather than degrade. The default subtile
+        # body uses ``tma_store_acc_t2r_region_split`` directly to
+        # hoist the aux LDG to the top of the per-subtile loop body.
+        early_aux_prelude, body = tma_store_acc_t2r_region_split(acc_wait=acc_wait)
+        assert not early_aux_prelude, (
+            "tma_store_acc_t2r_region must not be reached with an aux-tensor "
+            "chain; diagnostic / module-helper layouts reject aux at validate "
+            "time. Use tma_store_acc_t2r_region_split for paths that need to "
+            "hoist the aux LDG above the per-subtile c_pipeline / acc-wait."
+        )
+        return body
 
     def tma_store_tail_region(*, late_later_subtile_acquire: str) -> str:
         return (
@@ -2390,11 +2572,31 @@ def _codegen_cute_store_tcgen05_tile(
         acc_wait: str,
         late_later_subtile_acquire: str,
     ) -> str:
+        # Hoist the per-subtile aux LDG block to the top of the
+        # ``if epi_active:`` body — first thing inside the per-subtile
+        # loop. Note that ``first_subtile_acquire`` is empty here: the
+        # **first** c_pipeline ``producer_acquire`` for subtile 0 is
+        # emitted **outside** the per-subtile loop (see
+        # ``tma_store_first_subtile_acquire`` and ``tma_store_body_core``
+        # — warp-0 arms the c_pipeline ring once before any subtile work
+        # starts). The aux LDG depends on ``_tcgen05_subtile`` (it
+        # slices a per-subtile view of ``ttr_gAux_grouped_*``), so it
+        # cannot be hoisted out of the loop entirely. For subtile 0 the
+        # pre-loop acquire therefore structurally precedes the aux LDG;
+        # for subtile != 0 the in-loop ``later_subtile_acquire`` follows
+        # the aux LDG. Either way the long-scoreboard L1TEX wait gets
+        # the in-loop acc ``consumer_wait`` and the t2r async TMEM→reg
+        # copy to overlap with on every subtile, and the later-subtile
+        # c_pipeline acquire to overlap with on subtile != 0. Empty for
+        # identity / unary-only chains so the generated source for
+        # those cases is byte-identical with the pre-cycle-39 shape.
+        early_aux_prelude, t2r_body = tma_store_acc_t2r_region_split(acc_wait=acc_wait)
         return (
             f"    if {tcgen05_epi_active}:\n"
+            f"{early_aux_prelude}"
             f"{first_subtile_acquire}"
             f"{later_subtile_acquire}"
-            f"{tma_store_acc_t2r_region(acc_wait=acc_wait)}"
+            f"{t2r_body}"
             f"{tma_store_tail_region(late_later_subtile_acquire=late_later_subtile_acquire)}"
         )
 
@@ -2440,7 +2642,16 @@ def _codegen_cute_store_tcgen05_tile(
     )
 
     def tma_store_module_acc_t2r_helper_source(*, acc_wait: str) -> str:
-        prelude, rhs = _splice_acc_vec("tcgen05_tRS_rAcc", "    ")
+        # Aux-tensor chains are rejected for the diagnostic module-helper
+        # layouts (see the ``BackendUnsupported`` raise above), so
+        # ``module_early_aux`` is always empty here. Concatenating it
+        # with ``module_late_prelude`` preserves the prior flat-prelude
+        # source order for unary chains and identity stores in this
+        # diagnostic layout.
+        module_early_aux, module_late_prelude, rhs = _splice_acc_vec(
+            "tcgen05_tRS_rAcc", "    "
+        )
+        prelude = module_early_aux + module_late_prelude
         return (
             "@cute.jit\n"
             f"def {module_acc_t2r_helper_name}("
@@ -3343,7 +3554,9 @@ def _try_splice_tcgen05_unary_epilogue(
         return None
     if not isinstance(tensor, torch.Tensor):
         return None
-    analyzed = analyze_tcgen05_unary_epilogue_chain(state, value_node)
+    analyzed = analyze_tcgen05_unary_epilogue_chain(
+        state, value_node, output_global_shape=tuple(tensor.shape)
+    )
     if analyzed is None:
         return None
     chain, anchor = analyzed
@@ -3559,19 +3772,25 @@ def _(state: CodegenState) -> ast.AST:
             "and masks for non-whitelisted fused epilogues that follow "
             "the MMA. The store target's value chain depends on a "
             "tcgen05 matmul result through ops the chain analyzer "
-            "rejects (e.g. broadcast aux loads such as "
-            "`acc + bias[tile_n]`, aux tensors whose rank does not "
-            "match the carrier tile rank, non-scalar binary ops, "
+            "rejects (e.g. aux tensors with a 3-D underlying shape "
+            "and a static collapse like `aux3d[tile_m, tile_n, 0]`, "
+            "loads whose index expression is not exactly the "
+            "carrier tile-id symbol, non-scalar binary ops, "
             "`aten.add.Tensor` with `alpha=k`, or an intermediate "
             "`.to(d_inter)` cast where `d_inter` differs from the "
             "store-target dtype). Identity stores "
             "(`out[tile] = acc.to(x.dtype)`), whitelisted unary chains "
             "(relu/tanh/exp/log/sqrt/abs/neg + scalar add/sub/mul/div "
-            "on the accumulator carrier), and exact-shape 2-D "
+            "on the accumulator carrier), exact-shape 2-D "
             "auxiliary-tensor binary ops (`acc + residual[tile_m, "
-            "tile_n]`) do work via the fused-epilogue splice path. "
-            "Broadcast / rank-mismatch aux fusion is queued as the "
-            "next epilogue-fusion slice. See cute_plan.md §7.5.",
+            "tile_n]`), and rank-1 trailing-axis (rowvec) broadcast "
+            "aux loads (`acc + bias[tile_n]`) all work via the "
+            "fused-epilogue splice path. The leading-axis rank-1 "
+            "form (`acc + bias[tile_m]`) is rejected because a bare "
+            "rank-1 RHS aligns to the trailing axis under PyTorch "
+            "broadcasting; an explicit colvec broadcast must be "
+            "written with `bias[tile_m][:, None]` / "
+            "`.unsqueeze(-1)`.",
         )
 
     tensor_name = state.device_function.tensor_arg(tensor).name

@@ -3575,8 +3575,8 @@ class TestCuteLowerings(unittest.TestCase):
     def test_tcgen05_fused_epilogue_store_raises_backend_unsupported(self) -> None:
         """A user-level epilogue lambda whose op chain is *not* on the
         chain-analyzer whitelist (e.g., reads an auxiliary tensor
-        with a broadcast shape that the analyzer does not support,
-        or uses ops the analyzer rejects) bails with a structured
+        with a non-whitelisted indexing shape, or uses ops the
+        analyzer rejects) bails with a structured
         ``BackendUnsupported`` instead of falling through to the
         cute SIMT-store path that crashes inside the cute DSL on
         undefined ``mask_<n>`` / ``indices_<n>`` names.
@@ -3590,12 +3590,17 @@ class TestCuteLowerings(unittest.TestCase):
         future epilogue-fusion implementer sees the actionable
         message rather than a cute-DSL crash on an undefined name.
 
-        Exercises a still-rejected path — a 1-D bias broadcast
-        (``acc + bias[tile_n]``) which the analyzer rejects because
-        the aux load shape ``(tile_n,)`` does not match the carrier
-        tile shape ``(tile_m, tile_n)``. 1-D broadcast aux loads
-        are queued for the next epilogue-fusion slice (which adds a
-        dedicated C-input warp pipeline).
+        Exercises a still-rejected path — a 2-D aux tensor whose
+        load index reorders the carrier tile-id symbols
+        (``residual[tile_n, tile_m]`` against carrier
+        ``[tile_m, tile_n]``). The aux *shape* matches the carrier
+        but the index symbols are out of order, so the classifier
+        rejects it. The 1-D broadcast aux load (``bias[tile_n]``)
+        and exact-shape 2-D aux load
+        (``residual[tile_m, tile_n]``) shapes are both supported
+        by the splice path; the still-rejected forms cover index
+        reorderings, 3-D static collapses, and non-whitelisted
+        op chains.
         """
 
         from helion._compiler.cute.mma_support import get_cute_mma_support
@@ -3604,8 +3609,8 @@ class TestCuteLowerings(unittest.TestCase):
             self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
 
         @helion.kernel(backend="cute")
-        def cute_matmul_bias_broadcast(
-            x: torch.Tensor, y: torch.Tensor, bias: torch.Tensor
+        def cute_matmul_residual_transposed(
+            x: torch.Tensor, y: torch.Tensor, residual: torch.Tensor
         ) -> torch.Tensor:
             m, k = x.size()
             _, n = y.size()
@@ -3614,33 +3619,43 @@ class TestCuteLowerings(unittest.TestCase):
                 acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
                 for tile_k in hl.tile(k):
                     acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
-                # 1-D broadcast aux tensor — the analyzer rejects this
-                # because the aux shape ``(tile_n,)`` does not match
-                # the carrier tile shape ``(tile_m, tile_n)``.
-                out[tile_m, tile_n] = (acc + bias[tile_n]).to(x.dtype)
+                # 2-D aux with the index symbols reordered relative
+                # to the carrier (``[tile_n, tile_m]`` rather than
+                # ``[tile_m, tile_n]``). The shape happens to match
+                # the carrier when M == N, but the indices do not,
+                # so the classifier rejects this.
+                out[tile_m, tile_n] = (acc + residual[tile_n, tile_m]).to(x.dtype)
             return out
 
         x = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
         y = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
-        bias = torch.randn(128, dtype=torch.float32, device=DEVICE)
+        residual = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
         with (
             self.assertRaises(exc.BackendUnsupported) as cm,
             patch_cute_mma_support(),
         ):
-            cute_matmul_bias_broadcast.bind((x, y, bias)).set_config(
+            cute_matmul_residual_transposed.bind((x, y, residual)).set_config(
                 _make_tcgen05_persistent_config(
                     block_sizes=[128, 128, 32],
                     pid_type="persistent_interleaved",
                 )
             )
-            cute_matmul_bias_broadcast(x, y, bias)
-        # The diagnostic message points at the right invariant and the
-        # plan section that documents the fix.
+            cute_matmul_residual_transposed(x, y, residual)
+        # The diagnostic message points at the right invariant and
+        # specifically calls out the index-reordering rejection so
+        # the test pins which classifier branch fired (the input
+        # uses M == N == 128, so a non-square shape mismatch could
+        # not have triggered the rejection — without this message
+        # text assertion, a future change that flipped the rejection
+        # to "rank mismatch" or another path would silently pass).
         message = str(cm.exception)
         self.assertIn("tcgen05 MMA path", message)
         self.assertIn("indices and masks", message)
         self.assertIn("Identity stores", message)
-        self.assertIn("§7.5", message)
+        self.assertIn(
+            "loads whose index expression is not exactly the carrier tile-id symbol",
+            message,
+        )
 
     def test_tcgen05_fused_residual_epilogue_runtime_correctness(self) -> None:
         """``out[tile] = (acc + residual[tile_m, tile_n]).to(x.dtype)``
@@ -3654,7 +3669,11 @@ class TestCuteLowerings(unittest.TestCase):
         residual load (matching the carrier tile shape) and renders
         a per-thread aux read inline; the diagnostic backstop in
         ``test_tcgen05_fused_epilogue_store_raises_backend_unsupported``
-        still fires for unsupported broadcast / multi-input forms.
+        still fires for non-whitelisted forms (3-D static collapses,
+        index reorderings, etc.). Rank-1 broadcast aux loads
+        (``bias[tile_n]`` / ``bias[tile_m]``) are also accepted via
+        the splice path — see
+        ``test_tcgen05_fused_bias_broadcast_runtime_correctness``.
         Identity-store correctness is covered by
         ``test_tcgen05_persistent_single_tile_runtime_correctness``;
         the codegen marker pinning the new
@@ -3709,9 +3728,13 @@ class TestCuteLowerings(unittest.TestCase):
         ``tcgen05_aux_loaded_* = ttr_aux_subtile.load()`` lines that
         the chain renderer references.
 
-        Anchors on the per-subtile loop body: the aux load + binary
-        chain step lines must appear after the T2R copy and before the
-        ``tcgen05_acc_vec`` cast. This pins the splice's structural
+        Anchors on the per-subtile loop body: the chain step lines
+        and the ``tcgen05_acc_vec`` cast must appear after the aux
+        load locals are bound. (Cycle 39 hoisted the aux LDG to the
+        top of the per-subtile loop body, so the aux ``.load()``
+        line itself now appears **before** the T2R copy — see
+        ``test_tcgen05_fused_residual_epilogue_aux_load_hoist_marker``
+        for the source-order pin.) This pins the splice's structural
         ordering without locking in line-by-line text — a future
         refactor that adds another step or renames a local can move
         text around but must keep the rendering shape intact.
@@ -3766,6 +3789,450 @@ class TestCuteLowerings(unittest.TestCase):
         first_vec = code.find("tcgen05_acc_vec", first_step)
         self.assertGreater(first_step, first_aux_loaded)
         self.assertGreater(first_vec, first_step)
+
+    def test_tcgen05_fused_residual_epilogue_aux_load_hoist_marker(self) -> None:
+        """Cycle-39 source-order pin: the per-thread aux LDG fires
+        at the top of the per-subtile loop body — before the in-loop
+        later-subtile c_pipeline ``producer_acquire``
+        (``_tcgen05_subtile != 0`` path), before the in-loop acc
+        ``consumer_wait``, and before the t2r async TMEM→reg copy on
+        the same subtile.
+
+        Note that the **first** c_pipeline ``producer_acquire`` (for
+        subtile 0) is emitted **outside** the per-subtile loop —
+        warp-0 arms the c_pipeline ring once before any subtile
+        work starts — so the aux LDG cannot precede that first
+        acquire. The aux slice depends on ``_tcgen05_subtile``, so
+        it cannot be hoisted out of the loop entirely. The hoist
+        still removes the L1TEX serialization for every chain-add
+        because the in-loop acc ``consumer_wait`` and the t2r async
+        copy fire on every subtile and now overlap with the LDG.
+
+        Pre-cycle-39 the aux GMEM ``.load()`` was emitted after the
+        t2r async TMEM→reg copy and after ``acc.load()``; the chain-
+        add then waited on the LDG with no overlap. NCU on 4096³
+        residual showed Helion paid 26.7 cycles per warp on long-
+        scoreboard L1TEX wait vs Quack's 15.7. Cycle 39 hoisted
+        the aux subtile slice + ``.load()`` to the top of the
+        ``if epi_active:`` body inside the loop so the LDG overlaps
+        with the in-loop acc ``consumer_wait``, the t2r async copy,
+        and the later-subtile c_pipeline acquire.
+
+        This pin asserts the structural ordering inside the per-
+        subtile loop body so a future refactor cannot regress the
+        hoist back into the chain prelude.
+        """
+
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_residual(
+            x: torch.Tensor, y: torch.Tensor, residual: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = (acc + residual[tile_m, tile_n]).to(x.dtype)
+            return out
+
+        x = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
+        y = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
+        residual = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
+        with patch_cute_mma_support():
+            bound = cute_matmul_residual.bind((x, y, residual))
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            cfg = _make_tcgen05_persistent_config(
+                block_sizes=[128, 128, 32],
+                pid_type="persistent_interleaved",
+            )
+            bound.set_config(cfg)
+            code = bound.to_triton_code(cfg)
+        # Locate the per-subtile loop body and the first aux LDG
+        # within it. Use the per-subtile loop header as the anchor
+        # so the assertion is robust to var renumbering / unrelated
+        # epilogue scaffolding changes.
+        loop_marker = "for _tcgen05_subtile in cutlass.range"
+        loop_pos = code.find(loop_marker)
+        self.assertGreaterEqual(loop_pos, 0)
+        # Find the first aux load inside the per-subtile loop body.
+        aux_load_pos = code.find("tcgen05_aux_loaded_0", loop_pos)
+        self.assertGreater(aux_load_pos, loop_pos)
+        # For the default config exercised by this test:
+        #  - the later-subtile c_pipeline ``producer_acquire`` is
+        #    emitted **inside** the loop, gated by
+        #    ``_tcgen05_subtile != 0``
+        #  - the acc ``consumer_wait`` is emitted **inside** the
+        #    loop, gated by ``_tcgen05_subtile == 0``
+        # so both markers are present in the loop body and the
+        # ordering check is unconditional. (The first-subtile
+        # c_pipeline acquire is emitted outside the loop — warp-0
+        # arms the ring once before any subtile work starts — and
+        # therefore is **not** searched for here.)
+        c_acquire_pos = code.find("tcgen05_c_pipeline.producer_acquire", loop_pos)
+        self.assertGreater(
+            c_acquire_pos,
+            loop_pos,
+            "default config must emit a later-subtile c_pipeline acquire "
+            "inside the per-subtile loop body",
+        )
+        self.assertLess(
+            aux_load_pos,
+            c_acquire_pos,
+            "aux LDG must be hoisted above the later-subtile c_pipeline "
+            "producer_acquire",
+        )
+        acc_wait_pos = code.find("tcgen05_acc_pipeline.consumer_wait", loop_pos)
+        self.assertGreater(
+            acc_wait_pos,
+            loop_pos,
+            "default config must emit acc consumer_wait inside the "
+            "per-subtile loop body",
+        )
+        self.assertLess(
+            aux_load_pos,
+            acc_wait_pos,
+            "aux LDG must be hoisted above acc consumer_wait",
+        )
+        # The t2r async TMEM→reg copy must come after the aux LDG
+        # so the LDG latency overlaps with the t2r async copy.
+        t2r_copy_pos = code.find("cute.copy(tcgen05_tiled_copy_t2r,", loop_pos)
+        self.assertGreater(t2r_copy_pos, aux_load_pos)
+
+    def test_tcgen05_fused_bias_broadcast_runtime_correctness(self) -> None:
+        """``out[tile] = (acc + bias[tile_n]).to(x.dtype)`` after a
+        tcgen05 matmul splices the rank-1 bias load inline at the
+        per-thread T2R register, broadcasting the rowvec across the
+        M axis via a stride-0 layout view, and produces output
+        bit-exact with eager ``(x @ y + bias).to(...)`` on a
+        single-tile bf16 shape.
+
+        Entrance test for the rank-1 broadcast aux-tensor path
+        (G3.1-D / cycle 37). Mirrors Quack's ``RowVecLoad`` epilogue
+        (``quack/epi_ops.py``). The exact-shape rank-2 residual
+        path is exercised by
+        ``test_tcgen05_fused_residual_epilogue_runtime_correctness``;
+        the codegen-marker pin for the bias broadcast view lives in
+        ``test_tcgen05_fused_bias_broadcast_codegen_marker``.
+        """
+
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_bias(
+            x: torch.Tensor, y: torch.Tensor, bias: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = (acc + bias[tile_n]).to(x.dtype)
+            return out
+
+        x = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
+        y = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
+        bias = torch.randn(128, dtype=torch.bfloat16, device=DEVICE)
+        bound = cute_matmul_bias.bind((x, y, bias))
+        bound.env.config_spec.cute_tcgen05_search_enabled = True
+        bound.set_config(
+            _make_tcgen05_persistent_config(
+                block_sizes=[128, 128, 32],
+                pid_type="persistent_interleaved",
+            )
+        )
+        out = bound(x, y, bias)
+        expected = (x @ y + bias).to(x.dtype)
+        torch.testing.assert_close(out, expected, atol=2e-1, rtol=1e-2)
+
+    def test_tcgen05_fused_bias_relu_broadcast_runtime_correctness(self) -> None:
+        """Compose the rank-1 bias broadcast with a unary relu step:
+        ``out[tile] = relu(acc + bias[tile_n]).to(x.dtype)``.
+
+        Pins that the chain analyzer accepts a broadcast aux step
+        followed by a whitelisted unary op, and the output matches
+        eager ``relu(x @ y + bias).to(...)``. This is the canonical
+        bias+relu pattern referenced by the 2026-05-09 user
+        directive (``cute_plan.md`` §7).
+        """
+
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_bias_relu(
+            x: torch.Tensor, y: torch.Tensor, bias: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = torch.relu(acc + bias[tile_n]).to(x.dtype)
+            return out
+
+        x = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
+        y = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
+        bias = torch.randn(128, dtype=torch.bfloat16, device=DEVICE)
+        bound = cute_matmul_bias_relu.bind((x, y, bias))
+        bound.env.config_spec.cute_tcgen05_search_enabled = True
+        bound.set_config(
+            _make_tcgen05_persistent_config(
+                block_sizes=[128, 128, 32],
+                pid_type="persistent_interleaved",
+            )
+        )
+        out = bound(x, y, bias)
+        expected = torch.relu(x @ y + bias).to(x.dtype)
+        torch.testing.assert_close(out, expected, atol=2e-1, rtol=1e-2)
+
+    def test_tcgen05_fused_bias_broadcast_reverse_form_runtime_correctness(
+        self,
+    ) -> None:
+        """``out[tile] = (bias[tile_n] + acc).to(x.dtype)`` (reverse-
+        form add: aux load on the *left*, carrier on the right) is
+        accepted by the chain analyzer and produces output bit-exact
+        with eager ``(bias + x @ y).to(...)``.
+
+        Pins the ``_carrier_tile_index_nodes`` walker's reverse-form
+        skip — when the binary's first operand is the aux load,
+        descending into ``all_input_nodes[0]`` would walk into the
+        bias tensor and lose the carrier path. The walker explicitly
+        skips ``hl.load`` nodes when picking the descent target so
+        the carrier-side walk-back to ``hl.zeros`` recovers the
+        tile-id symbols regardless of operand order.
+        """
+
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_bias_reverse(
+            x: torch.Tensor, y: torch.Tensor, bias: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                # Reverse-form: aux load is the *left* operand of the
+                # binary add, carrier is on the right.
+                out[tile_m, tile_n] = (bias[tile_n] + acc).to(x.dtype)
+            return out
+
+        x = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
+        y = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
+        bias = torch.randn(128, dtype=torch.bfloat16, device=DEVICE)
+        bound = cute_matmul_bias_reverse.bind((x, y, bias))
+        bound.env.config_spec.cute_tcgen05_search_enabled = True
+        bound.set_config(
+            _make_tcgen05_persistent_config(
+                block_sizes=[128, 128, 32],
+                pid_type="persistent_interleaved",
+            )
+        )
+        out = bound(x, y, bias)
+        expected = (bias + x @ y).to(x.dtype)
+        torch.testing.assert_close(out, expected, atol=2e-1, rtol=1e-2)
+
+    def test_tcgen05_fused_colvec_broadcast_rejected_at_classify_time(
+        self,
+    ) -> None:
+        """``out[tile] = (acc + colvec[tile_m]).to(x.dtype)`` is
+        rejected at classify time and bails to the loud-failure
+        backstop with a ``BackendUnsupported`` raise.
+
+        A bare rank-1 RHS aligns to the *last* dimension under
+        PyTorch broadcasting rules: ``(BM, BN) + (BM,)`` is either
+        a shape error (BM != BN) or a *rowvec* broadcast on the
+        trailing axis (BM == BN), never a column-vector broadcast.
+        Accepting ``bias[tile_m]`` would silently rewrite the
+        user's broadcast direction. Classifier rejection lands at
+        ``aux_tensor_load_kind`` (``cute_fx_walk.py``) where the
+        single load index symbol must equal
+        ``carrier_tile_index_nodes[1]`` (the trailing axis).
+
+        Users wanting an explicit colvec broadcast must spell it
+        out (``bias[tile_m][:, None]`` / ``.unsqueeze(-1)`` /
+        ``.expand(...)``); that is a separate, deferred pattern
+        handler.
+        """
+
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_colvec(
+            x: torch.Tensor, y: torch.Tensor, colvec: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = (acc + colvec[tile_m]).to(x.dtype)
+            return out
+
+        # BM == BN == 128 is the only square case where PyTorch
+        # would not error on the broadcast; the classifier still
+        # rejects the leading-axis index pattern.
+        x = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
+        y = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
+        colvec = torch.randn(128, dtype=torch.bfloat16, device=DEVICE)
+        with (
+            self.assertRaises(exc.BackendUnsupported) as cm,
+            patch_cute_mma_support(),
+        ):
+            cute_matmul_colvec.bind((x, y, colvec)).set_config(
+                _make_tcgen05_persistent_config(
+                    block_sizes=[128, 128, 32],
+                    pid_type="persistent_interleaved",
+                )
+            )
+            cute_matmul_colvec(x, y, colvec)
+        # The diagnostic message points at the loud-failure backstop
+        # for non-whitelisted fused epilogues.
+        message = str(cm.exception)
+        self.assertIn("tcgen05 MMA path", message)
+        self.assertIn("rowvec", message)
+
+    def test_tcgen05_fused_bias_broadcast_codegen_marker(self) -> None:
+        """The spliced rowvec broadcast emits an ``aux_view2d`` local
+        bound to ``cute.make_tensor(bias.iterator,
+        cute.make_layout((m_size, n_size), stride=(0, 1)))``, and
+        ``cute.local_tile`` slices the per-tile region of the 2-D
+        view rather than the underlying 1-D bias tensor.
+
+        Anchors on the per-output-tile setup pipeline: the
+        ``stride=(0, 1)`` literal must appear in the same source
+        block as the aux tile setup, before the ``aux_loaded``
+        per-subtile load lines. This pins the broadcast-view
+        construction shape without locking in line-by-line text —
+        a future refactor that renames the broadcast view local
+        can move text around but must keep the stride-0
+        broadcast layout intact.
+        """
+
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_bias(
+            x: torch.Tensor, y: torch.Tensor, bias: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = (acc + bias[tile_n]).to(x.dtype)
+            return out
+
+        x = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
+        y = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
+        bias = torch.randn(128, dtype=torch.bfloat16, device=DEVICE)
+        with patch_cute_mma_support():
+            bound = cute_matmul_bias.bind((x, y, bias))
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            cfg = _make_tcgen05_persistent_config(
+                block_sizes=[128, 128, 32],
+                pid_type="persistent_interleaved",
+            )
+            bound.set_config(cfg)
+            code = bound.to_triton_code(cfg)
+        # Structural pins: the broadcast view is named, has a
+        # ``cute.make_layout`` with ``stride=(0, 1)``, and the
+        # per-tile ``cute.local_tile`` slices the 2-D view rather
+        # than the underlying 1-D bias tensor. The generic aux
+        # pipeline locals (``aux_tile_0``, ``aux_loaded_0``, ...)
+        # are still present.
+        self.assertIn("tcgen05_aux_view2d_0", code)
+        self.assertIn("stride=(0, 1)", code)
+        self.assertIn("tcgen05_aux_tile_0 = cute.local_tile(tcgen05_aux_view2d_0", code)
+        self.assertIn("tcgen05_aux_loaded_0", code)
+        # The broadcast view setup must appear before the per-
+        # subtile aux load (it is per-output-tile setup).
+        view_pos = code.find("tcgen05_aux_view2d_0")
+        load_pos = code.find("tcgen05_aux_loaded_0")
+        self.assertGreaterEqual(view_pos, 0)
+        self.assertGreater(load_pos, view_pos)
+
+    def test_tcgen05_fused_bias_broadcast_rejects_non_contiguous(self) -> None:
+        """Reject rank-1 broadcast aux loads whose underlying tensor
+        is non-contiguous (stride != 1).
+
+        The splice site emits ``cute.make_layout((m, n), stride=(0, 1))``
+        / ``stride=(1, 0)`` with stride 1 hard-coded on the data axis.
+        A non-contiguous bias (e.g. ``bias[::2]``) would otherwise be
+        silently read as if it were contiguous, producing wrong output.
+        The classifier rejects non-stride-1 broadcast aux at compile
+        time and the loud-failure backstop fires.
+        """
+
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_bias_strided(
+            x: torch.Tensor, y: torch.Tensor, bias: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = (acc + bias[tile_n]).to(x.dtype)
+            return out
+
+        x = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
+        y = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
+        # Build a non-contiguous bias by slicing every other element
+        # of a length-256 tensor; the resulting view has stride 2.
+        bias_full = torch.randn(256, dtype=torch.bfloat16, device=DEVICE)
+        bias = bias_full[::2]  # shape (128,), stride (2,)
+        assert bias.stride() == (2,), f"unexpected stride: {bias.stride()}"
+        with (
+            self.assertRaises(exc.BackendUnsupported),
+            patch_cute_mma_support(),
+        ):
+            cute_matmul_bias_strided.bind((x, y, bias)).set_config(
+                _make_tcgen05_persistent_config(
+                    block_sizes=[128, 128, 32],
+                    pid_type="persistent_interleaved",
+                )
+            )
+            cute_matmul_bias_strided(x, y, bias)
 
     def test_tcgen05_fused_aux_rejects_extra_mask(self) -> None:
         """Reject auxiliary loads with non-default ``extra_mask``
@@ -4099,7 +4566,7 @@ class TestCuteLowerings(unittest.TestCase):
         seen_fx_kwargs: list[dict[str, object]] = []
         original = cute_epilogue.analyze_tcgen05_unary_epilogue_chain
 
-        def spy(state, value_node):
+        def spy(state, value_node, **kwargs):
             cur = value_node
             while cur is not None and cur.op == "call_function":
                 if cur.target is torch.ops.aten.add.Tensor:
@@ -4109,7 +4576,7 @@ class TestCuteLowerings(unittest.TestCase):
                     cur = cur.args[0]
                 else:
                     break
-            return original(state, value_node)
+            return original(state, value_node, **kwargs)
 
         x = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
         y = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
