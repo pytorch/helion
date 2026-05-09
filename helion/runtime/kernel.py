@@ -699,6 +699,9 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         """
         return ""
 
+    def supports_subprocess_benchmark(self) -> bool:
+        return True
+
     def is_cacheable(self) -> bool:
         return True
 

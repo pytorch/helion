@@ -581,6 +581,8 @@ class LocalBenchmarkProvider(BenchmarkProvider):
             return False
         if len(self.mutated_arg_indices) > 0:
             return False
+        if not self.kernel.supports_subprocess_benchmark():
+            return False
         # Custom do_bench implementations are not shipped to the worker.
         _backend = getattr(self.config_spec, "backend", None)
         return not (_backend is not None and _backend.get_do_bench() is not None)
