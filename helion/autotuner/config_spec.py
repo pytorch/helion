@@ -29,6 +29,7 @@ from .._compiler.cute.strategies import TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY
 from .._compiler.cute.strategies import TCGEN05_STRATEGY_CONFIG_KEY
 from .._compiler.cute.strategies import TCGEN05_STRATEGY_CONFIG_KEYS
 from .._compiler.cute.strategies import TCGEN05_WARP_SPEC_AB_LOAD_WARPS_KEY
+from .._compiler.cute.strategies import TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY
 from .._compiler.cute.strategies import TCGEN05_WARP_SPEC_DEFAULTS_BY_KEY
 from .._compiler.cute.strategies import TCGEN05_WARP_SPEC_EPI_LOAD_WARPS_KEY
 from .._compiler.cute.strategies import TCGEN05_WARP_SPEC_MMA_WARPS_KEY
@@ -933,6 +934,13 @@ class ConfigSpec:
             # MONOLITHIC, scheduler_warps must be 0; the validator
             # rejects 1 with a MONOLITHIC strategy.
             TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY: EnumFragment((0,)),
+            # ``c_input_warps``: G3.1-C step-2 (``cute_plan.md``
+            # §7.5.3.2) lifts this to ``{0, 1}`` under
+            # ``ROLE_LOCAL_WITH_SCHEDULER`` once the dedicated TMA
+            # producer + SMEM ring + role-local while loop land. The
+            # autotune surface stays narrowed to ``(0,)`` until
+            # cycle 34 perf-validates the productive C-input warp.
+            TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY: EnumFragment((0,)),
             # Register split is currently fixed at the role-local
             # MONOLITHIC values. G2-E may broaden.
             TCGEN05_WARP_SPEC_REGISTER_DECREASE_KEY: EnumFragment(
@@ -1000,6 +1008,17 @@ class ConfigSpec:
             )
         )
         fragments[TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY] = EnumFragment((0, 1))
+        # ``c_input_warps`` validation surface: accept ``{0, 1}`` so
+        # explicit user configs can opt in to the productive C-input
+        # warp slot via ``helion.Config(tcgen05_warp_spec_c_input_warps=1)``.
+        # The cross-fragment validator
+        # (``validate_tcgen05_strategy_invariants``) further narrows
+        # the value per-strategy: today both strategies reject nonzero
+        # until the dedicated TMA producer + SMEM ring + role-local
+        # while loop land; the accept set widens to ``{0, 1}`` for
+        # ``ROLE_LOCAL_WITH_SCHEDULER`` once that codegen path lands
+        # (``cute_plan.md`` §7.5.3.2).
+        fragments[TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY] = EnumFragment((0, 1))
         return fragments
 
     @staticmethod

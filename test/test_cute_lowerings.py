@@ -1783,6 +1783,102 @@ class TestCuteLowerings(unittest.TestCase):
             code,
         )
 
+    def test_tcgen05_with_scheduler_cluster_n2_codegen(
+        self,
+    ) -> None:
+        """G3.1-C step-2 precursor (cute_plan.md §7.5.3.2, cycle 33).
+
+        ``ROLE_LOCAL_WITH_SCHEDULER`` + ``cluster_n=2`` is now a
+        validated codegen path: the strategy validator's per-strategy
+        ``cluster_n`` accept set widens to ``{1, 2}`` so the
+        Quack-canonical ``(cluster_m=2, cluster_n=2, 1)`` 4-CTA
+        cluster is reachable from explicit user configs. The
+        per-CTA-local scheduler topology stays the same shape as
+        cluster_m=2 (every CTA in the cluster runs its own scheduler
+        publishing locally; consumers release locally) so the
+        ``consumer_mask=cutlass.Int32(0)`` literal must NOT appear,
+        matching the cluster_m=2 codegen pin in
+        ``test_tcgen05_with_scheduler_cluster_m2_per_cta_topology_codegen``.
+
+        The cluster envelope ``cluster_m * cluster_n = 4`` participates
+        in the deferred-init protocol (``defer_sync=True`` still
+        emitted), and the cluster_layout shape pins to ``(2, 2, 1)``.
+        """
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_with_scheduler_c2_n2(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        args = (
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+        )
+        config = helion.Config(
+            block_sizes=[256, 256, 128],
+            l2_groupings=[1],
+            num_warps=4,
+            num_sm_multiplier=1,
+            pid_type="persistent_interleaved",
+            tcgen05_cluster_m=2,
+            tcgen05_cluster_n=2,
+            tcgen05_ab_stages=2,
+            tcgen05_acc_stages=2,
+            tcgen05_c_stages=2,
+            tcgen05_num_epi_warps=4,
+            tcgen05_strategy="role_local_with_scheduler",
+            tcgen05_warp_spec_scheduler_warps=1,
+            indexing=[
+                "tensor_descriptor",
+                "tensor_descriptor",
+                "tensor_descriptor",
+            ],
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_with_scheduler_c2_n2.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            code = bound.to_triton_code(config)
+
+        # Cluster shape is (2, 2, 1) — the canonical 4-CTA cluster.
+        self.assertIn("cute.make_layout((2, 2, 1))", code)
+        # Per-CTA scheduler topology preserved at cluster_n=2: no
+        # consumer_mask=Int32(0) literal (which would route every
+        # CTA's release to the cluster leader and starve non-leaders).
+        self.assertNotIn("consumer_mask=cutlass.Int32(0)", code)
+        sched_create_idx = code.find("tcgen05_sched_pipeline = ")
+        self.assertGreater(
+            sched_create_idx,
+            -1,
+            msg="WITH_SCHEDULER + cluster_n=2 kernel did not emit a "
+            "sched_pipeline.create",
+        )
+        sched_create_end = code.find(")", sched_create_idx)
+        sched_create_call = code[sched_create_idx:sched_create_end]
+        self.assertNotIn("consumer_mask", sched_create_call)
+        # ``defer_sync=True`` still appears so the sched_pipeline
+        # init coordinates with the AB / acc / c pipelines under the
+        # cluster-deferred protocol; the cluster envelope is now 4
+        # (cluster_m * cluster_n).
+        self.assertIn("defer_sync=True", sched_create_call)
+        # Per-CTA consumer arrive count = role_warps - scheduler_warps
+        # = 1 + 1 + 4 + 0 = 6 (unchanged from cluster_n=1: each CTA
+        # in the cluster still runs its own scheduler).
+        self.assertIn(
+            "tcgen05_sched_pipeline_consumer_group = "
+            "cutlass.pipeline.CooperativeGroup("
+            "cutlass.pipeline.Agent.Thread, cutlass.Int32(6))",
+            code,
+        )
+
     def test_tcgen05_clc_persistent_codegen(self) -> None:
         """G2-H CLC scheduler-warp body codegen pin (cute_plan.md).
 

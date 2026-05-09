@@ -1216,6 +1216,12 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         self.assertNotIn("tcgen05_warp_spec_epi_warps", default_cfg.config)
         self.assertEqual(default_cfg.config["tcgen05_warp_spec_epi_load_warps"], 0)
         self.assertEqual(default_cfg.config["tcgen05_warp_spec_scheduler_warps"], 0)
+        # ``c_input_warps`` was added in cycle 33 as the foundation for
+        # G3.1-C step-2 (``cute_plan.md`` §7.5.3.2). Default is 0 so
+        # serialized configs round-trip cleanly; the value 1 will be
+        # accepted under ``ROLE_LOCAL_WITH_SCHEDULER`` once cycle 34
+        # lands the dedicated TMA producer + SMEM ring.
+        self.assertEqual(default_cfg.config["tcgen05_warp_spec_c_input_warps"], 0)
         self.assertEqual(default_cfg.config["tcgen05_warp_spec_register_decrease"], 120)
         self.assertEqual(default_cfg.config["tcgen05_warp_spec_register_increase"], 256)
         for key in (
@@ -1505,16 +1511,17 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
 
     @onlyBackends(["cute"])
     def test_cute_tcgen05_strategy_invariants_cluster_n(self) -> None:
-        """G2 cluster_n=2 validator coverage (cute_plan.md §6.12.7).
+        """G2 cluster_n=2 validator coverage (cute_plan.md §6.12.7,
+        cycle 33 widening for ``ROLE_LOCAL_WITH_SCHEDULER``).
 
-        ``cluster_n=2`` only runs under ``ROLE_LOCAL_MONOLITHIC`` with
-        ``cluster_m=2`` (the validated 4-CTA cluster envelope). The
-        validator rejects:
+        ``cluster_n=2`` requires the 4-CTA V=2 cluster (``cluster_m=2``
+        with ``use_2cta=True``). The validator now accepts cluster_n=2
+        under both ``ROLE_LOCAL_MONOLITHIC`` and
+        ``ROLE_LOCAL_WITH_SCHEDULER`` (cycle 33 lifted the
+        WITH_SCHEDULER restriction so the cluster_n=2 lever exposes
+        the G3.1-C step-2 productive C-input warp opportunity); it
+        still rejects:
           - ``cluster_n=2`` with ``cluster_m=1`` (V=1 has no 4-CTA path)
-          - ``cluster_n=2`` under ``ROLE_LOCAL_WITH_SCHEDULER`` (the
-            scheduler-broadcast topology is not validated for cluster_n>1)
-        and accepts ``cluster_n=2`` under ``ROLE_LOCAL_MONOLITHIC`` +
-        ``cluster_m=2``.
         """
         # Positive control: cluster_n=2 + ROLE_LOCAL_MONOLITHIC + cluster_m=2.
         errors = validate_tcgen05_strategy_invariants(
@@ -1546,8 +1553,11 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
             msg=str(errors),
         )
 
-        # cluster_n=2 under ROLE_LOCAL_WITH_SCHEDULER: rejected
-        # (scheduler-broadcast topology is not validated for cluster_n>1).
+        # cluster_n=2 under ROLE_LOCAL_WITH_SCHEDULER: ACCEPTED
+        # in cycle 33 (the scheduler-broadcast topology generalizes
+        # to cluster_n=2 with the per-CTA-local pattern preserved
+        # and the cluster envelope ``cluster_m * cluster_n`` wired
+        # through the deferred-init protocol).
         with_sched = dataclasses.replace(
             ROLE_LOCAL_MONOLITHIC_DEFAULT_WARP_SPEC, scheduler_warps=1
         )
@@ -1561,8 +1571,176 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
             cluster_m=2,
             cluster_n=2,
         )
+        self.assertEqual(errors, [], msg=str(errors))
+
+        # cluster_n=2 with cluster_m=1 still rejected under
+        # ROLE_LOCAL_WITH_SCHEDULER (V=1 has no 4-CTA path).
+        errors = validate_tcgen05_strategy_invariants(
+            strategy=Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER,
+            persistence_model=Tcgen05PersistenceModel.STATIC_PERSISTENT,
+            layout_strategy=Tcgen05LayoutStrategy.DEFAULT,
+            warp_spec=with_sched,
+            layout_overrides=Tcgen05LayoutOverrides(),
+            pid_type="persistent_blocked",
+            cluster_m=1,
+            cluster_n=2,
+        )
         self.assertTrue(
-            any("tcgen05_cluster_n in [1]" in e for e in errors),
+            any("requires tcgen05_cluster_m=2" in e for e in errors),
+            msg=str(errors),
+        )
+
+    @onlyBackends(["cute"])
+    def test_cute_tcgen05_strategy_invariants_c_input_warps(self) -> None:
+        """G3.1-C step-2 (cute_plan.md §7.5.3.2) data-model entrance:
+        ``c_input_warps`` is plumbed through the dataclass + validator,
+        and cycle 33's narrowing rejects nonzero for both strategies
+        until cycle 34 lands the dedicated TMA producer + SMEM ring.
+
+        - Positive control: ``c_input_warps=0`` accepted under both
+          ``ROLE_LOCAL_MONOLITHIC`` and ``ROLE_LOCAL_WITH_SCHEDULER``
+          (the field is plumbed through normalize / round-trip and
+          defaults to 0 for legacy configs).
+        - Negative control: ``c_input_warps=1`` is rejected under
+          both strategies in cycle 33; cycle 34 widens the
+          ``ROLE_LOCAL_WITH_SCHEDULER`` accept set to ``{0, 1}`` once
+          the productive C-input warp implementation lands.
+        """
+        # Positive control: c_input_warps=0 under MONOLITHIC.
+        errors = validate_tcgen05_strategy_invariants(
+            strategy=Tcgen05Strategy.ROLE_LOCAL_MONOLITHIC,
+            persistence_model=Tcgen05PersistenceModel.STATIC_PERSISTENT,
+            layout_strategy=Tcgen05LayoutStrategy.DEFAULT,
+            warp_spec=ROLE_LOCAL_MONOLITHIC_DEFAULT_WARP_SPEC,
+            layout_overrides=Tcgen05LayoutOverrides(),
+            pid_type="persistent_blocked",
+            cluster_m=1,
+        )
+        self.assertEqual(errors, [], msg=str(errors))
+
+        # Positive control: c_input_warps=0 under WITH_SCHEDULER.
+        with_sched = dataclasses.replace(
+            ROLE_LOCAL_MONOLITHIC_DEFAULT_WARP_SPEC, scheduler_warps=1
+        )
+        errors = validate_tcgen05_strategy_invariants(
+            strategy=Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER,
+            persistence_model=Tcgen05PersistenceModel.STATIC_PERSISTENT,
+            layout_strategy=Tcgen05LayoutStrategy.DEFAULT,
+            warp_spec=with_sched,
+            layout_overrides=Tcgen05LayoutOverrides(),
+            pid_type="persistent_blocked",
+            cluster_m=1,
+        )
+        self.assertEqual(errors, [], msg=str(errors))
+
+        # Negative control: c_input_warps=1 under MONOLITHIC.
+        c_input_monolithic = dataclasses.replace(
+            ROLE_LOCAL_MONOLITHIC_DEFAULT_WARP_SPEC, c_input_warps=1
+        )
+        errors = validate_tcgen05_strategy_invariants(
+            strategy=Tcgen05Strategy.ROLE_LOCAL_MONOLITHIC,
+            persistence_model=Tcgen05PersistenceModel.STATIC_PERSISTENT,
+            layout_strategy=Tcgen05LayoutStrategy.DEFAULT,
+            warp_spec=c_input_monolithic,
+            layout_overrides=Tcgen05LayoutOverrides(),
+            pid_type="persistent_blocked",
+            cluster_m=1,
+        )
+        self.assertTrue(
+            any("c_input_warps in [0]" in e for e in errors),
+            msg=str(errors),
+        )
+
+        # Negative control: c_input_warps=1 under WITH_SCHEDULER
+        # (cycle 33). Cycle 34 widens this accept set to ``{0, 1}``.
+        c_input_with_sched = dataclasses.replace(with_sched, c_input_warps=1)
+        errors = validate_tcgen05_strategy_invariants(
+            strategy=Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER,
+            persistence_model=Tcgen05PersistenceModel.STATIC_PERSISTENT,
+            layout_strategy=Tcgen05LayoutStrategy.DEFAULT,
+            warp_spec=c_input_with_sched,
+            layout_overrides=Tcgen05LayoutOverrides(),
+            pid_type="persistent_blocked",
+            cluster_m=1,
+        )
+        self.assertTrue(
+            any("c_input_warps in [0]" in e for e in errors),
+            msg=str(errors),
+        )
+
+        # The dataclass total_warps reflects the c_input_warps slot
+        # so a future cycle-34 lift to c_input_warps=1 transparently
+        # adjusts the warp count without further data-model churn.
+        self.assertEqual(c_input_with_sched.total_warps, 8)
+
+    @onlyBackends(["cute"])
+    def test_cute_tcgen05_strategy_invariants_clc_persistent_cluster_n(
+        self,
+    ) -> None:
+        """``CLC_PERSISTENT`` + ``cluster_n>1`` is rejected.
+
+        The CLC scheduler-warp body in
+        ``program_id._build_scheduler_warp_role_local_while_clc``
+        publishes the work tile to peer CTAs by iterating lanes
+        ``< cluster_m``; cluster_n>1 CTAs would never receive the
+        CLC mailbox publish and would hang at ``producer_acquire``.
+        The paired ``(strategy, persistence_model)`` invariant
+        rejects this combination at validate time so the runtime
+        path is unreachable.
+        """
+        with_sched = dataclasses.replace(
+            ROLE_LOCAL_MONOLITHIC_DEFAULT_WARP_SPEC, scheduler_warps=1
+        )
+
+        # Positive control: CLC + cluster_n=1 still accepts.
+        errors = validate_tcgen05_strategy_invariants(
+            strategy=Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER,
+            persistence_model=Tcgen05PersistenceModel.CLC_PERSISTENT,
+            layout_strategy=Tcgen05LayoutStrategy.DEFAULT,
+            warp_spec=with_sched,
+            layout_overrides=Tcgen05LayoutOverrides(),
+            pid_type="persistent_blocked",
+            cluster_m=2,
+            cluster_n=1,
+            arch_major=10,
+        )
+        self.assertEqual(errors, [], msg=str(errors))
+
+        # Positive control: STATIC_PERSISTENT + cluster_n=2 accepts
+        # (the static path's per-CTA-local scheduler topology
+        # generalizes to cluster_n=2).
+        errors = validate_tcgen05_strategy_invariants(
+            strategy=Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER,
+            persistence_model=Tcgen05PersistenceModel.STATIC_PERSISTENT,
+            layout_strategy=Tcgen05LayoutStrategy.DEFAULT,
+            warp_spec=with_sched,
+            layout_overrides=Tcgen05LayoutOverrides(),
+            pid_type="persistent_blocked",
+            cluster_m=2,
+            cluster_n=2,
+            arch_major=10,
+        )
+        self.assertEqual(errors, [], msg=str(errors))
+
+        # Negative control: CLC + cluster_n=2 rejected. The CLC
+        # broadcast is cluster_m-only; second-N-lane CTAs never
+        # receive the mailbox publish.
+        errors = validate_tcgen05_strategy_invariants(
+            strategy=Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER,
+            persistence_model=Tcgen05PersistenceModel.CLC_PERSISTENT,
+            layout_strategy=Tcgen05LayoutStrategy.DEFAULT,
+            warp_spec=with_sched,
+            layout_overrides=Tcgen05LayoutOverrides(),
+            pid_type="persistent_blocked",
+            cluster_m=2,
+            cluster_n=2,
+            arch_major=10,
+        )
+        self.assertTrue(
+            any(
+                "clc_persistent" in e and "tcgen05_cluster_n in [1]" in e
+                for e in errors
+            ),
             msg=str(errors),
         )
 

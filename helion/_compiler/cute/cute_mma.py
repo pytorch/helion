@@ -2605,11 +2605,26 @@ def _emit_mma_pipeline(
             # empty mbar (mirrors Quack's ``make_sched_pipeline`` for
             # ``cluster_size > 1``). For cluster_size == 1 the two
             # topologies degenerate to the same per-CTA shape.
-            if tcgen05_matmul_plan.is_clc_persistent and tcgen05_cluster_m > 1:
+            # ``cluster_size`` is the full cluster envelope
+            # (``cluster_m * cluster_n``) so the cluster-wide arrive
+            # count under cluster_n=2 spans the full 4-CTA cluster
+            # AND the deferred-init protocol participates in the same
+            # cluster-wide barrier init as the AB / acc pipelines.
+            # For cluster_n=2 under ``ROLE_LOCAL_WITH_SCHEDULER`` the
+            # per-CTA-local scheduler topology is preserved (each CTA
+            # in the 4-CTA cluster runs its own scheduler that
+            # publishes locally and consumers release locally — see
+            # the ``consumer_mask_to_leader=False`` branch below);
+            # only the deferred-init participation needs the full
+            # cluster envelope so every CTA in the cluster contributes
+            # its arrival to the cluster-wide ``pipeline_init``
+            # barrier.
+            tcgen05_sched_cluster_size = tcgen05_cluster_m * tcgen05_cluster_n
+            if tcgen05_matmul_plan.is_clc_persistent and tcgen05_sched_cluster_size > 1:
                 tcgen05_sched_consumer_arrive_count = (
                     tcgen05_matmul_plan.role_warp_count
                     - tcgen05_matmul_plan.scheduler_warp_count
-                ) * tcgen05_cluster_m
+                ) * tcgen05_sched_cluster_size
                 tcgen05_sched_consumer_mask_to_leader = True
             else:
                 tcgen05_sched_consumer_arrive_count = (
@@ -2622,7 +2637,7 @@ def _emit_mma_pipeline(
                     tcgen05_sched_plan,
                     sched_stage_count=tcgen05_matmul_plan.sched_stage_count,
                     consumer_arrive_count=tcgen05_sched_consumer_arrive_count,
-                    cluster_size=tcgen05_cluster_m,
+                    cluster_size=tcgen05_sched_cluster_size,
                     defer_sync=tcgen05_use_cluster_deferred_pipelines,
                     consumer_mask_to_leader=tcgen05_sched_consumer_mask_to_leader,
                     # One leader thread (lane 0 of the scheduler

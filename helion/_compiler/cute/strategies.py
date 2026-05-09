@@ -39,18 +39,23 @@ class Tcgen05Strategy(str, enum.Enum):
       dedicated scheduler warp that publishes ``(virtual_pid,
       tile_coord_mnkl, is_valid)`` into a per-CTA SMEM mailbox via
       a ``PipelineAsync``. The C-input epilogue-load warp Quack
-      uses (Quack's 8th warp) is not present because Helion does
-      not yet have C-input fusion;
-      ``CuteTcgen05MatmulPlan.launched_warp_count`` rounds to 8
-      launched warps (one inert padding warp) so warpgroup
-      ``setmaxregister`` semantics are uniform. Validated at
-      ``cluster_m`` ∈ {1, 2}: each CTA in the cluster runs its
-      own scheduler that publishes locally and each CTA's
-      consumers release locally (no peer-CTA broadcast). Both
-      CTAs converge on the same cluster-level virtual_pid because
-      the consumer ``virtual_pid = work_tile_smem[0] // cluster_m
-      + ...`` formula collapses the per-CTA ``cta_id_in_cluster``
-      offset.
+      uses (Quack's 8th warp) is not present in cycle 33 because
+      Helion does not yet have a productive C-input warp (cycle
+      34 widens ``Tcgen05WarpSpec.c_input_warps`` to 1 to occupy
+      the slot); ``CuteTcgen05MatmulPlan.launched_warp_count``
+      rounds to 8 launched warps (one inert padding warp) so
+      warpgroup ``setmaxregister`` semantics are uniform.
+      Validated at ``cluster_m`` ∈ {1, 2} and ``cluster_n``
+      ∈ {1, 2}: each CTA in the cluster runs its own scheduler
+      that publishes locally and each CTA's consumers release
+      locally (no peer-CTA broadcast). Both CTAs converge on the
+      same cluster-level virtual_pid because the consumer
+      ``virtual_pid = work_tile_smem[0] // cluster_m + ...``
+      formula collapses the per-CTA ``cta_id_in_cluster`` offset.
+      cycle 33 lifted the cluster_n=2 restriction by widening the
+      sched_pipeline ``cluster_size`` argument to the full
+      ``cluster_m * cluster_n`` envelope so the deferred-init
+      protocol participates in the cluster-wide barrier-init.
     """
 
     ROLE_LOCAL_MONOLITHIC = "role_local_monolithic"
@@ -118,6 +123,14 @@ ROLE_LOCAL_MONOLITHIC_MMA_WARPS = 1
 ROLE_LOCAL_MONOLITHIC_EPI_WARPS = 4
 ROLE_LOCAL_MONOLITHIC_EPI_LOAD_WARPS = 0
 ROLE_LOCAL_MONOLITHIC_SCHEDULER_WARPS = 0
+# ``c_input_warps`` slot for the dedicated C-input / auxiliary-tensor warp
+# that drives a TMA-loaded SMEM-ring producer pipeline (G3.1-C step-2 in
+# ``cute_plan.md`` §7.5.3.2). Default 0 keeps the historical inert-padding
+# behavior under ``ROLE_LOCAL_WITH_SCHEDULER``; the validator allows the
+# value 1 only under ``ROLE_LOCAL_WITH_SCHEDULER`` once the TMA producer +
+# SMEM ring + role-local while loop land. The autotune surface stays
+# narrowed to 0 until perf is characterized.
+ROLE_LOCAL_MONOLITHIC_C_INPUT_WARPS = 0
 # Today's role-local lowering uses a (decrease, increase) register split of
 # (120, 256). The decrease side runs on TMA-load + scheduler warps; the
 # increase side runs on MMA-exec + epilogue + epilogue-load warps.
@@ -148,6 +161,18 @@ class Tcgen05WarpSpec:
     - ``scheduler_warps``: 0 in ``ROLE_LOCAL_MONOLITHIC`` (each role
       runs its own scheduler), 1 in ``ROLE_LOCAL_WITH_SCHEDULER``
       (dedicated scheduler warp drives a broadcasting pipeline).
+    - ``c_input_warps``: dedicated C-input warp count. Currently
+      narrowed to ``{0}`` for both strategies (the data-model slot
+      is plumbed through normalize / round-trip but the validator
+      rejects nonzero); cycle 34 widens
+      ``ROLE_LOCAL_WITH_SCHEDULER`` to ``{0, 1}`` once the dedicated
+      TMA producer + SMEM ring + role-local while loop land
+      (``cute_plan.md`` §7.5.3.2). Setting this to 1 is intended
+      to convert the 8-warp shape's currently-inert padding warp
+      under ``ROLE_LOCAL_WITH_SCHEDULER`` into a productive
+      C-input TMA producer; ``ROLE_LOCAL_MONOLITHIC`` has no such
+      warp slot to occupy. The autotune surface stays narrowed to
+      0 until cycle 34 perf-validates the productive C-input warp.
     - ``register_split``: ``(decrease, increase)`` ``setmaxregister``
       counts. The current 6-warp shape uses ``(120, 256)``. Each
       entry's range is enforced by its per-field fragment in
@@ -163,6 +188,12 @@ class Tcgen05WarpSpec:
     epi_load_warps: int
     scheduler_warps: int
     register_split: tuple[int, int]
+    # ``c_input_warps`` is keyword-only (via ``KW_ONLY``) so adding
+    # the field after ``register_split`` doesn't shift positional
+    # constructors that existing callers rely on; the validator and
+    # lowering use the field name, not position.
+    _: dataclasses.KW_ONLY
+    c_input_warps: int = 0
 
     @property
     def total_warps(self) -> int:
@@ -172,6 +203,7 @@ class Tcgen05WarpSpec:
             + self.epi_warps
             + self.epi_load_warps
             + self.scheduler_warps
+            + self.c_input_warps
         )
 
 
@@ -185,6 +217,7 @@ ROLE_LOCAL_MONOLITHIC_DEFAULT_WARP_SPEC = Tcgen05WarpSpec(
     epi_load_warps=ROLE_LOCAL_MONOLITHIC_EPI_LOAD_WARPS,
     scheduler_warps=ROLE_LOCAL_MONOLITHIC_SCHEDULER_WARPS,
     register_split=ROLE_LOCAL_MONOLITHIC_REGISTER_SPLIT,
+    c_input_warps=ROLE_LOCAL_MONOLITHIC_C_INPUT_WARPS,
 )
 
 
@@ -238,6 +271,11 @@ TCGEN05_WARP_SPEC_AB_LOAD_WARPS_KEY = "tcgen05_warp_spec_ab_load_warps"
 TCGEN05_WARP_SPEC_MMA_WARPS_KEY = "tcgen05_warp_spec_mma_warps"
 TCGEN05_WARP_SPEC_EPI_LOAD_WARPS_KEY = "tcgen05_warp_spec_epi_load_warps"
 TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY = "tcgen05_warp_spec_scheduler_warps"
+# ``c_input_warps``: dedicated C-input / auxiliary-tensor warp count.
+# G3.1-C step-2 in ``cute_plan.md`` §7.5.3.2; today narrowed to 0 in
+# the autotune surface, validated to ``{0, 1}`` only under
+# ``ROLE_LOCAL_WITH_SCHEDULER`` in the user-config validation surface.
+TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY = "tcgen05_warp_spec_c_input_warps"
 # Register-split is exposed as two scalar keys (decrease, increase)
 # rather than a tuple value because flat config values are scalars.
 TCGEN05_WARP_SPEC_REGISTER_DECREASE_KEY = "tcgen05_warp_spec_register_decrease"
@@ -253,6 +291,7 @@ TCGEN05_WARP_SPEC_KEYS: tuple[str, ...] = (
     TCGEN05_WARP_SPEC_MMA_WARPS_KEY,
     TCGEN05_WARP_SPEC_EPI_LOAD_WARPS_KEY,
     TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY,
+    TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY,
     TCGEN05_WARP_SPEC_REGISTER_DECREASE_KEY,
     TCGEN05_WARP_SPEC_REGISTER_INCREASE_KEY,
 )
@@ -293,6 +332,7 @@ TCGEN05_WARP_SPEC_DEFAULTS_BY_KEY: dict[str, int] = {
     TCGEN05_WARP_SPEC_MMA_WARPS_KEY: ROLE_LOCAL_MONOLITHIC_MMA_WARPS,
     TCGEN05_WARP_SPEC_EPI_LOAD_WARPS_KEY: ROLE_LOCAL_MONOLITHIC_EPI_LOAD_WARPS,
     TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY: ROLE_LOCAL_MONOLITHIC_SCHEDULER_WARPS,
+    TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY: ROLE_LOCAL_MONOLITHIC_C_INPUT_WARPS,
     TCGEN05_WARP_SPEC_REGISTER_DECREASE_KEY: ROLE_LOCAL_MONOLITHIC_REGISTER_SPLIT[0],
     TCGEN05_WARP_SPEC_REGISTER_INCREASE_KEY: ROLE_LOCAL_MONOLITHIC_REGISTER_SPLIT[1],
 }
@@ -328,6 +368,13 @@ def warp_spec_from_config(config: Mapping[str, object]) -> Tcgen05WarpSpec:
             _as_int(config[TCGEN05_WARP_SPEC_REGISTER_DECREASE_KEY]),
             _as_int(config[TCGEN05_WARP_SPEC_REGISTER_INCREASE_KEY]),
         ),
+        # ``c_input_warps`` was added in cycle 33 as the foundation
+        # for G3.1-C step-2 (``cute_plan.md`` §7.5.3.2). The
+        # validator below restricts its accept set per-strategy; the
+        # default is 0 so configs serialized before cycle 33 (which
+        # never carry the key) round-trip via ``ConfigSpec.normalize``
+        # picking up ``ROLE_LOCAL_MONOLITHIC_C_INPUT_WARPS``.
+        c_input_warps=_as_int(config[TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY]),
     )
 
 
@@ -469,6 +516,24 @@ _STRATEGY_REQUIRED_SCHEDULER_WARPS: dict[Tcgen05Strategy, int] = {
     Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER: 1,
 }
 
+# Strategy-conditional ``c_input_warps`` accept set. Per ``cute_plan.md``
+# §7.5.3.2, only ``ROLE_LOCAL_WITH_SCHEDULER`` can host a productive
+# C-input warp (the inert padding warp under the WITH_SCHEDULER 8-warp
+# shape becomes the C-input TMA producer). ``ROLE_LOCAL_MONOLITHIC``
+# has no such warp slot — its 6-warp shape is fully populated by the
+# TMA-load + MMA-exec + 4 epi warps. Values outside the per-strategy
+# accept set are rejected so user configs cannot reach an unsupported
+# combination silently. cycle 33: validator accepts ``{0}`` for both
+# strategies; cycle 34 widens ``ROLE_LOCAL_WITH_SCHEDULER`` to ``{0, 1}``
+# once the dedicated TMA producer + SMEM ring + role-local while
+# loop land. This staging keeps the data-model slot stable for
+# config serialization round-trips while keeping user configs from
+# reaching a not-yet-implemented codegen path.
+_STRATEGY_SUPPORTED_C_INPUT_WARPS: dict[Tcgen05Strategy, frozenset[int]] = {
+    Tcgen05Strategy.ROLE_LOCAL_MONOLITHIC: frozenset({0}),
+    Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER: frozenset({0}),
+}
+
 # When the strategy demands warpgroup-aligned splits (every 4 warps
 # == one warpgroup, ``setmaxregister`` is warpgroup-uniform), the
 # total warp count must be a multiple of 4. ``ROLE_LOCAL_MONOLITHIC``
@@ -501,15 +566,44 @@ _STRATEGY_SUPPORTED_CLUSTER_M: dict[Tcgen05Strategy, frozenset[int]] = {
     Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER: frozenset({1, 2}),
 }
 
-# Strategy-conditional cluster_n capability. cluster_n=2 is only validated
-# for ``ROLE_LOCAL_MONOLITHIC`` today (the Quack-canonical 4-CTA cluster
-# is the perf target for G2; ``ROLE_LOCAL_WITH_SCHEDULER`` would also
-# require fixing the broadcast topology for cluster_n>1, which is out
-# of scope for cycle 27). Set outside the supported set is rejected so
-# user configs cannot reach an untested cluster shape.
+# Strategy-conditional cluster_n capability. cluster_n=2 is now validated
+# under both ``ROLE_LOCAL_MONOLITHIC`` (the existing Quack-canonical 4-CTA
+# cluster path) and ``ROLE_LOCAL_WITH_SCHEDULER`` (cycle 33: the precursor
+# for G3.1-C step-2's productive C-input warp). The WITH_SCHEDULER
+# scheduler topology is "every CTA in the cluster runs its own scheduler
+# that publishes locally" (see ``cute_mma._codegen_cute_mma`` ``consumer
+# _mask_to_leader=False`` branch); generalizing to cluster_n=2 keeps the
+# per-CTA-local pattern with the cluster_size at the sched_pipeline level
+# updated to ``cluster_m * cluster_n`` so the deferred-pipeline cluster-
+# barrier sync still spans the full V=2 cluster_n=2 4-CTA cluster envelope.
+# Setting outside the supported set is rejected so user configs cannot
+# reach an untested cluster shape.
 _STRATEGY_SUPPORTED_CLUSTER_N: dict[Tcgen05Strategy, frozenset[int]] = {
     Tcgen05Strategy.ROLE_LOCAL_MONOLITHIC: frozenset({1, 2}),
-    Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER: frozenset({1}),
+    Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER: frozenset({1, 2}),
+}
+
+# (strategy, persistence_model)-conditional cluster_n accept set. Used to
+# reject combinations where the (strategy, persistence) pair has a
+# cluster-broadcast topology that has not been generalized to cluster_n>1.
+# Today's only entry: ``CLC_PERSISTENT`` under ``ROLE_LOCAL_WITH_SCHEDULER``
+# is cluster_m-only — the CLC scheduler-warp body iterates lanes
+# ``< cluster_m`` to publish to peer CTAs (see ``program_id.py``
+# ``_build_scheduler_warp_role_local_while_clc``); cluster_n>1 CTAs would
+# never receive the CLC mailbox publish and would hang on the
+# ``producer_acquire`` wait. Generalizing the CLC broadcast to cluster_n>1
+# is out of scope for cycle 33 (deferred to a future cycle alongside the
+# ``cluster_n>1`` C-input pipeline work). When a (strategy, persistence)
+# pair appears here, it overrides the per-strategy
+# ``_STRATEGY_SUPPORTED_CLUSTER_N`` entry; missing entries fall back to
+# the per-strategy capability.
+_STRATEGY_PERSISTENCE_SUPPORTED_CLUSTER_N: dict[
+    tuple[Tcgen05Strategy, Tcgen05PersistenceModel], frozenset[int]
+] = {
+    (
+        Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER,
+        Tcgen05PersistenceModel.CLC_PERSISTENT,
+    ): frozenset({1}),
 }
 
 
@@ -624,6 +718,19 @@ def validate_tcgen05_strategy_invariants(
             f"{warp_spec.scheduler_warps}"
         )
 
+    # ``c_input_warps`` accept set is per-strategy; today narrows
+    # both strategies to ``{0}`` until the dedicated TMA producer +
+    # SMEM ring + role-local while loop lands. The data-model slot
+    # is plumbed through normalize / round-trip paths so the
+    # accept set can widen without further config-shape churn.
+    supported_c_input = _STRATEGY_SUPPORTED_C_INPUT_WARPS.get(strategy, frozenset())
+    if supported_c_input and warp_spec.c_input_warps not in supported_c_input:
+        errors.append(
+            f"tcgen05 strategy {strategy.value!r} only accepts "
+            f"c_input_warps in {sorted(supported_c_input)!r}; got "
+            f"c_input_warps={warp_spec.c_input_warps}"
+        )
+
     # ``epi_warps`` is intentionally NOT checked here — its accept-
     # set is owned by ``tcgen05_num_epi_warps`` validation
     # (``restrict_tcgen05_num_epi_warps_validation``) so there is one
@@ -674,6 +781,25 @@ def validate_tcgen05_strategy_invariants(
             f"tcgen05_cluster_n={cluster_n} requires tcgen05_cluster_m=2 "
             f"with use_2cta=True (the validated 4-CTA cluster envelope; "
             f"cute_plan.md §6.12); got tcgen05_cluster_m={cluster_m}"
+        )
+
+    # (strategy, persistence_model) paired cluster_n accept set.
+    # Some persistence models have cluster-broadcast topology that
+    # has not been generalized to cluster_n>1; they must reject
+    # cluster_n>1 even when the per-strategy capability allows it.
+    # See ``_STRATEGY_PERSISTENCE_SUPPORTED_CLUSTER_N`` for the rationale.
+    paired_supported_cluster_n = _STRATEGY_PERSISTENCE_SUPPORTED_CLUSTER_N.get(
+        (strategy, persistence_model)
+    )
+    if (
+        paired_supported_cluster_n is not None
+        and cluster_n not in paired_supported_cluster_n
+    ):
+        errors.append(
+            f"tcgen05 strategy {strategy.value!r} with persistence model "
+            f"{persistence_model.value!r} only runs correctly at "
+            f"tcgen05_cluster_n in {sorted(paired_supported_cluster_n)!r}; "
+            f"got tcgen05_cluster_n={cluster_n}"
         )
 
     # Layout overrides may only carry concrete values under the
