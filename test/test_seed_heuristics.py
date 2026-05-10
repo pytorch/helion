@@ -40,6 +40,12 @@ MI350_HARDWARE = HardwareInfo(
     runtime_version="7.0",
     compute_capability="gfx950",
 )
+BLACKWELL_HARDWARE = HardwareInfo(
+    device_kind="cuda",
+    hardware_name="NVIDIA B200",
+    runtime_version="12.8",
+    compute_capability="sm100",
+)
 
 
 class TestSeedHeuristic(TestCase):
@@ -252,14 +258,20 @@ class TestTritonSkinnyGemmHeuristic(TestCase):
         heuristic = TritonSkinnyGemmHeuristic
 
         self.assertEqual(env.config_spec.matmul_facts, [])
-        self.assertFalse(heuristic.is_eligible(env, MagicMock()))
+        with patch(
+            "helion._hardware.get_hardware_info",
+            return_value=HOPPER_HARDWARE,
+        ):
+            self.assertFalse(heuristic.is_eligible(env, MagicMock()))
 
-    def test_triton_skinny_gemm_seed_surfaces_through_compiler_seed_configs(
+    def test_triton_skinny_gemm_seed_dedupes_configs_and_records_heuristics(
         self,
     ) -> None:
         env = self._make_triton_env_with_block_sizes()
         env.config_spec.matmul_facts.append(self._matmul_fact())
 
+        # Same config, different heuristic name: the config should dedupe, but
+        # both successful heuristic applications should remain visible.
         class DuplicateTritonSkinnyGemmHeuristic(TritonSkinnyGemmHeuristic):
             name = "triton_skinny_gemm_duplicate"
 
@@ -267,7 +279,26 @@ class TestTritonSkinnyGemmHeuristic(TestCase):
             TritonSkinnyGemmHeuristic,
             DuplicateTritonSkinnyGemmHeuristic,
         )
-        for hardware in (HOPPER_HARDWARE, MI350_HARDWARE):
+        cases = (
+            (
+                HOPPER_HARDWARE,
+                [[64, 64, 256]],
+                [
+                    TritonSkinnyGemmHeuristic.name,
+                    DuplicateTritonSkinnyGemmHeuristic.name,
+                ],
+            ),
+            (
+                MI350_HARDWARE,
+                [[64, 64, 256]],
+                [
+                    TritonSkinnyGemmHeuristic.name,
+                    DuplicateTritonSkinnyGemmHeuristic.name,
+                ],
+            ),
+            (BLACKWELL_HARDWARE, [], []),
+        )
+        for hardware, expected_block_sizes, expected_heuristics in cases:
             with (
                 self.subTest(hardware=hardware.compute_capability),
                 patch(
@@ -283,14 +314,11 @@ class TestTritonSkinnyGemmHeuristic(TestCase):
 
             self.assertEqual(
                 [config.config["block_sizes"] for config in configs],
-                [[64, 64, 256]],
+                expected_block_sizes,
             )
             self.assertEqual(
                 env.config_spec.compiler_seed_heuristics,
-                [
-                    TritonSkinnyGemmHeuristic.name,
-                    DuplicateTritonSkinnyGemmHeuristic.name,
-                ],
+                expected_heuristics,
             )
 
     def test_triton_skinny_gemm_seed_skinny_n_returns_target_blocks(self) -> None:
