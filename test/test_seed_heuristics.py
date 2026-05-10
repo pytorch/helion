@@ -21,6 +21,7 @@ from helion._testing import TestCase
 from helion._testing import default_cute_mma_support
 from helion._testing import onlyBackends
 from helion._testing import patch_cute_mma_support
+from helion._testing import skipIfRefEager
 from helion.autotuner.config_spec import BlockSizeSpec
 from helion.autotuner.config_spec import ConfigSpec
 from helion.autotuner.config_spec import MatmulFact
@@ -118,6 +119,7 @@ class TestSeedHeuristic(TestCase):
 
 class TestMatmulFacts(TestCase):
     @onlyBackends(["triton"])
+    @skipIfRefEager("Compiler matmul facts are not collected in ref eager mode")
     def test_matmul_facts_record_kernel_structure(self) -> None:
         @helion.kernel(backend="triton")
         def triton_matmul(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -416,6 +418,7 @@ class TestTritonSkinnyGemmHeuristic(TestCase):
             self.assertEqual(env.config_spec.compiler_seed_heuristics, [])
 
     @onlyBackends(["triton"])
+    @skipIfRefEager("Compiler seed configs are not generated in ref eager mode")
     def test_triton_skinny_gemm_seed_in_initial_population(self) -> None:
         @helion.kernel(backend="triton")
         def triton_matmul(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
