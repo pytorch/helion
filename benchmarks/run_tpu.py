@@ -156,15 +156,10 @@ def _attention_shapes(
     num_shapes: int | None = None,
 ) -> list[tuple[str, tuple[Any, ...]]]:
     # First entry matches examples/attention.py main() so --num-shapes 1 gives
-    # the canonical example config.
-    # First entry mirrors examples/attention.py main(); second is the
-    # reviewer's flagship shape — much larger seq_len + head_dim so the
-    # bench exercises real LM-scale attention.
-    # 2nd shape doubles seq_len. Tried (4,32,4096,128) and (8,32,8192,128)
-    # but the autotuner default OOMs at d=128 + larger seq before the search
-    # can compute its baseline. (2,32,2048,64) is the largest that fits.
+    # the canonical example config.  Second is an LM-scale flagship shape.
     configs = [
         (2, 32, 1024, 64),
+        (8, 32, 8192, 256),
         (2, 32, 2048, 64),
         (1, 4, 512, 64),
         (1, 4, 1024, 64),
@@ -242,9 +237,7 @@ def _matmul_layernorm_shapes(
 ) -> list[tuple[str, tuple[Any, ...]]]:
     # Use larger, regular shapes than examples/matmul_layernorm.py main()
     # (which uses small/odd n=200,400 to dodge an unrelated power-of-2 bug).
-    # (4096,4096,4096) hit "Default config failed while computing baseline"
-    # — autotuner default OOMs before search starts.
-    configs = [(1024, 1024, 1024), (2048, 2048, 2048)]
+    configs = [(1024, 1024, 1024), (4096, 4096, 4096), (2048, 2048, 2048)]
     if num_shapes is not None:
         configs = configs[:num_shapes]
     return [

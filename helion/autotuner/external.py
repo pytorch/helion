@@ -183,6 +183,9 @@ class _ExternalKernelAdapter(_AutotunableKernel):
     def extra_cache_key(self) -> str:
         return ""
 
+    def supports_subprocess_benchmark(self) -> bool:
+        return True
+
     def is_cacheable(self) -> bool:
         return False
 

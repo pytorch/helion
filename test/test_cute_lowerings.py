@@ -9227,7 +9227,7 @@ class TestInitialPrefetchTmaBuilder(unittest.TestCase):
 
 @onlyBackends(["cute"])
 class TestReductionLoopCarriedAccumulatorCheck(unittest.TestCase):
-    """Unit tests for ``_cute_reduction_needs_loop_carried_accumulator``.
+    """Unit tests for ``_needs_loop_carried_accumulator``.
 
     The helper consolidates the three cute-specific "no live thread axis"
     conditions in :meth:`BlockReductionStrategy.codegen_reduction`. Each
@@ -9296,7 +9296,12 @@ class TestReductionLoopCarriedAccumulatorCheck(unittest.TestCase):
         return grid
 
     def _patch_backend(self, name: str) -> contextlib.AbstractContextManager:
-        env = SimpleNamespace(backend=SimpleNamespace(name=name))
+        max_threads = 32 if name == "cute" else None
+        env = SimpleNamespace(
+            backend=SimpleNamespace(
+                name=name, max_reduction_threads=lambda: max_threads
+            )
+        )
         return patch.object(CompileEnvironment, "current", return_value=env)
 
     def test_returns_false_when_block_has_live_thread_axis_in_grid(self) -> None:
@@ -9305,13 +9310,13 @@ class TestReductionLoopCarriedAccumulatorCheck(unittest.TestCase):
         grid = self._make_grid_state(block_thread_axes={0: 0})
         strategy = self._make_strategy(current_grid_state=grid)
         with self._patch_backend("cute"):
-            self.assertFalse(strategy._cute_reduction_needs_loop_carried_accumulator())
+            self.assertFalse(strategy._needs_loop_carried_accumulator())
 
     def test_returns_false_when_block_has_live_thread_axis_in_loop(self) -> None:
         loop = self._make_loop_state(0, threaded=True)
         strategy = self._make_strategy(active_device_loops={0: [loop]})
         with self._patch_backend("cute"):
-            self.assertFalse(strategy._cute_reduction_needs_loop_carried_accumulator())
+            self.assertFalse(strategy._needs_loop_carried_accumulator())
 
     def test_returns_true_when_block_serial_loop_no_thread(self) -> None:
         # A serial DeviceLoopState exists for the reduction block but no
@@ -9319,7 +9324,7 @@ class TestReductionLoopCarriedAccumulatorCheck(unittest.TestCase):
         loop = self._make_loop_state(0, threaded=False)
         strategy = self._make_strategy(active_device_loops={0: [loop]})
         with self._patch_backend("cute"):
-            self.assertTrue(strategy._cute_reduction_needs_loop_carried_accumulator())
+            self.assertTrue(strategy._needs_loop_carried_accumulator())
 
     def test_returns_true_when_block_has_lane_loops(self) -> None:
         # A lane loop iterates the reduction block; the synthetic per-thread
@@ -9327,14 +9332,14 @@ class TestReductionLoopCarriedAccumulatorCheck(unittest.TestCase):
         grid = self._make_grid_state(lane_loop_blocks={0})
         strategy = self._make_strategy(current_grid_state=grid)
         with self._patch_backend("cute"):
-            self.assertTrue(strategy._cute_reduction_needs_loop_carried_accumulator())
+            self.assertTrue(strategy._needs_loop_carried_accumulator())
 
     def test_returns_true_when_no_active_loop_or_grid(self) -> None:
         # No live thread axis at all -> let the surrounding loop
         # accumulate.
         strategy = self._make_strategy()
         with self._patch_backend("cute"):
-            self.assertTrue(strategy._cute_reduction_needs_loop_carried_accumulator())
+            self.assertTrue(strategy._needs_loop_carried_accumulator())
 
     def test_returns_false_for_non_cute_backend(self) -> None:
         # The helper short-circuits to False on backends other than cute,
@@ -9343,7 +9348,7 @@ class TestReductionLoopCarriedAccumulatorCheck(unittest.TestCase):
         for backend_name in ("triton", "pallas", "tileir"):
             with self._patch_backend(backend_name):
                 self.assertFalse(
-                    strategy._cute_reduction_needs_loop_carried_accumulator(),
+                    strategy._needs_loop_carried_accumulator(),
                     f"backend {backend_name!r} should not need loop-carried accumulator",
                 )
 
@@ -9356,7 +9361,7 @@ class TestReductionLoopCarriedAccumulatorCheck(unittest.TestCase):
         )
         strategy = self._make_strategy(current_grid_state=grid)
         with self._patch_backend("cute"):
-            self.assertFalse(strategy._cute_reduction_needs_loop_carried_accumulator())
+            self.assertFalse(strategy._needs_loop_carried_accumulator())
 
     def test_returns_true_when_lane_loop_overrides_thread_axis(self) -> None:
         # When the reduction block has BOTH a lane loop AND a thread axis
@@ -9370,7 +9375,7 @@ class TestReductionLoopCarriedAccumulatorCheck(unittest.TestCase):
         )
         strategy = self._make_strategy(current_grid_state=grid)
         with self._patch_backend("cute"):
-            self.assertTrue(strategy._cute_reduction_needs_loop_carried_accumulator())
+            self.assertTrue(strategy._needs_loop_carried_accumulator())
 
     def test_returns_true_when_serial_loop_overrides_global_thread_axis(self) -> None:
         # When the reduction block is iterated by a serial DeviceLoopState
@@ -9393,7 +9398,7 @@ class TestReductionLoopCarriedAccumulatorCheck(unittest.TestCase):
             active_device_loops={0: [local_loop], 9: [other_loop]},
         )
         with self._patch_backend("cute"):
-            self.assertTrue(strategy._cute_reduction_needs_loop_carried_accumulator())
+            self.assertTrue(strategy._needs_loop_carried_accumulator())
 
     def test_block_index_property_drives_check(self) -> None:
         # The helper consults ``self.block_index`` (== block_ids[0])
@@ -9406,16 +9411,12 @@ class TestReductionLoopCarriedAccumulatorCheck(unittest.TestCase):
             strategy_with_axis = self._make_strategy(
                 block_index=5, current_grid_state=grid
             )
-            self.assertFalse(
-                strategy_with_axis._cute_reduction_needs_loop_carried_accumulator()
-            )
+            self.assertFalse(strategy_with_axis._needs_loop_carried_accumulator())
             # block_index=7: thread axis absent for this block -> True
             strategy_without_axis = self._make_strategy(
                 block_index=7, current_grid_state=grid
             )
-            self.assertTrue(
-                strategy_without_axis._cute_reduction_needs_loop_carried_accumulator()
-            )
+            self.assertTrue(strategy_without_axis._needs_loop_carried_accumulator())
 
 
 @onlyBackends(["cute"])
@@ -9424,7 +9425,7 @@ class TestReductionBlockClassifiers(unittest.TestCase):
     (``_reduction_block_is_serial`` / ``_reduction_block_has_lane_loops`` /
     ``_reduction_block_has_live_thread_axis``) on ``ReductionStrategy``.
 
-    The consolidated ``_cute_reduction_needs_loop_carried_accumulator``
+    The consolidated ``_needs_loop_carried_accumulator``
     helper is OR-combined from these three predicates plus a backend
     guard. These tests pin each predicate individually so future changes
     to the OR composition can be validated against the building blocks.

@@ -511,10 +511,15 @@ function renderSpeedupTrendChart() {
     const hValsRun = [], tValsRun = [], rValsRun = [];
     entries.forEach(e => {
       const h = (e.history || []).find(x => x.run_id === r.run_id);
-      if (h) {
-        if (h.helion_speedup_geomean > 0) hValsRun.push(h.helion_speedup_geomean);
-        if (h.torch_compile_speedup_geomean > 0) tValsRun.push(h.torch_compile_speedup_geomean);
-        if (h.triton_speedup_geomean > 0) rValsRun.push(h.triton_speedup_geomean);
+      if (
+        h &&
+        h.helion_speedup_geomean > 0 &&
+        h.torch_compile_speedup_geomean > 0 &&
+        h.triton_speedup_geomean > 0
+      ) {
+        hValsRun.push(h.helion_speedup_geomean);
+        tValsRun.push(h.torch_compile_speedup_geomean);
+        rValsRun.push(h.triton_speedup_geomean);
       }
     });
     helionTrend.push(geomean(hValsRun, null));
@@ -563,11 +568,17 @@ function renderSpeedup() {
       if (e) entries.push(e);
     });
   });
-  const hVals = entries.map(e => e.helion_speedup_geomean).filter(v => v > 0);
-  const tVals = entries.map(e => e.torch_compile_speedup_geomean).filter(v => v > 0);
-  const rVals = entries.map(e => e.triton_speedup_geomean).filter(v => v > 0);
-  const helionGM = geomean(hVals), tcGM = geomean(tVals), tritonGM = geomean(rVals);
-  const helionWins = entries.filter(e => e.helion_speedup_geomean > Math.max(e.torch_compile_speedup_geomean || 0, e.triton_speedup_geomean || 0)).length;
+  const commonSpeedupEntries = entries.filter(e =>
+    e.helion_speedup_geomean > 0 &&
+    e.torch_compile_speedup_geomean > 0 &&
+    e.triton_speedup_geomean > 0
+  );
+  const hVals = commonSpeedupEntries.map(e => e.helion_speedup_geomean);
+  const tVals = commonSpeedupEntries.map(e => e.torch_compile_speedup_geomean);
+  const rVals = commonSpeedupEntries.map(e => e.triton_speedup_geomean);
+  const helionGM = geomean(hVals, null), tcGM = geomean(tVals, null), tritonGM = geomean(rVals, null);
+  const helionWins = commonSpeedupEntries.filter(e => e.helion_speedup_geomean > Math.max(e.torch_compile_speedup_geomean, e.triton_speedup_geomean)).length;
+  const pairedSpeedupSub = `${commonSpeedupEntries.length} paired kernel/platform combos`;
   let html = '';
   html += '<h2 style="margin-bottom:4px">Speedup vs Eager Execution</h2>';
   html += '<p style="font-size:13px;color:var(--text-dim);margin-bottom:16px">Higher values = faster than PyTorch eager. Values &lt; 1.0 are slower than eager.</p>';
@@ -575,10 +586,10 @@ function renderSpeedup() {
   DATA.platform_shorts.forEach(p => { html += `<option value="${p}"${p === activeFilters.platform ? ' selected' : ''}>${platName(p)}</option>`; });
   html += '</select></div>';
   html += '<div class="summary-row">';
-  html += summaryCard('Helion Geomean', formatSpeedup(helionGM), null, { valueColor: 'var(--green)' });
-  html += summaryCard('torch.compile Geomean', formatSpeedup(tcGM), null, { valueColor: 'var(--blue)' });
-  html += summaryCard('Triton Geomean', formatSpeedup(tritonGM), null, { valueColor: 'var(--purple)' });
-  html += summaryCard('Helion Wins', helionWins, `of ${entries.length} kernel/platform combos`, { valueColor: 'var(--green)' });
+  html += summaryCard('Helion Geomean', formatSpeedup(helionGM), pairedSpeedupSub, { valueColor: 'var(--green)' });
+  html += summaryCard('torch.compile Geomean', formatSpeedup(tcGM), pairedSpeedupSub, { valueColor: 'var(--blue)' });
+  html += summaryCard('Triton Geomean', formatSpeedup(tritonGM), pairedSpeedupSub, { valueColor: 'var(--purple)' });
+  html += summaryCard('Helion Wins', helionWins, `of ${commonSpeedupEntries.length} paired combos`, { valueColor: 'var(--green)' });
   html += '</div>';
   // Speedup trend over time (Plotly)
   const runs = DATA.runs;
@@ -591,6 +602,7 @@ function renderSpeedup() {
   entries.sort((a, b) => a.platform_short.localeCompare(b.platform_short) || a.kernel.localeCompare(b.kernel));
   const ctVals = entries.map(e => e.compile_time_geomean_s).filter(v => v > 0);
   const ctGM = geomean(ctVals);
+  const speedupGmLabel = `${commonSpeedupEntries.length} paired speedup rows`;
   html += '<div class="table-wrap"><table class="data-table"><thead><tr><th>Kernel</th><th>Platform</th><th>Commit</th><th>Helion</th><th>torch.compile</th><th>Triton</th><th>Compile Time</th><th>Best</th></tr></thead><tbody>';
   entries.forEach(e => {
     const vals = [e.helion_speedup_geomean, e.torch_compile_speedup_geomean, e.triton_speedup_geomean];
@@ -612,7 +624,7 @@ function renderSpeedup() {
     </tr>`;
   });
   html += `</tbody><tfoot><tr>
-    <td colspan="3" class="gm-label">Geomean (${entries.length} kernels)</td>
+    <td colspan="3" class="gm-label" title="Compile time geomean uses ${ctVals.length} Helion rows">${speedupGmLabel}</td>
     <td style="color:var(--green)">${formatSpeedup(helionGM)}</td>
     <td style="color:var(--blue)">${formatSpeedup(tcGM)}</td>
     <td style="color:var(--purple)">${formatSpeedup(tritonGM)}</td>
@@ -762,9 +774,28 @@ function renderCompare(baseRunIdOverride, cmpRunIdOverride, baseBranchOverride, 
   } else {
     html += '<div style="padding:16px;background:var(--bg);border-radius:8px;margin-bottom:20px;text-align:center;color:var(--text-dim);font-size:13px">No kernels changed &gt;10% between selected commits</div>';
   }
+  const pairedGeomean = (baseKey, cmpKey) => {
+    const pairs = comparisons
+      .map(c => [c[baseKey], c[cmpKey]])
+      .filter(([base, cmp]) => base != null && cmp != null && base > 0 && cmp > 0);
+    if (pairs.length === 0) return { base: null, cmp: null, delta: null, count: 0 };
+    const base = geomean(pairs.map(([v]) => v));
+    const cmp = geomean(pairs.map(([, v]) => v));
+    return {
+      base,
+      cmp,
+      delta: ((cmp - base) / base) * 100,
+      count: pairs.length,
+    };
+  };
+  const latencyGm = pairedGeomean('baseLatency', 'cmpLatency');
+  const speedupGm = pairedGeomean('baseSpeedup', 'cmpSpeedup');
+  const compileGm = pairedGeomean('baseCompile', 'cmpCompile');
+  const fmtLat = v => v && v > 0 ? v.toFixed(2) + ' ms' : '--';
+  const gmCounts = `lat ${latencyGm.count}, speed ${speedupGm.count}, compile ${compileGm.count}`;
+
   html += '<div style="font-size:14px;font-weight:600;margin-bottom:8px">All Kernels</div>';
   html += '<div class="table-wrap"><table class="data-table"><thead><tr><th>Kernel</th><th>Platform</th><th>Base Latency</th><th>Target Latency</th><th>Latency Delta</th><th>Base Speedup</th><th>Target Speedup</th><th>Speedup Delta</th><th>Base Compile Time</th><th>Target Compile Time</th><th>Compile Time Delta</th></tr></thead><tbody>';
-  const fmtLat = v => v && v > 0 ? v.toFixed(2) + ' ms' : '--';
   comparisons.forEach(c => {
     html += `<tr>
       <td>${escHtml(c.kernel)}</td>
@@ -780,28 +811,18 @@ function renderCompare(baseRunIdOverride, cmpRunIdOverride, baseBranchOverride, 
       <td>${formatDelta(c.compileDelta, true)}</td>
     </tr>`;
   });
-  // Geomeans across the filtered set; deltas are taken on the geomeans
-  // themselves so the footer's % matches the geomean ratio.
-  const baseLatGM = geomean(comparisons.map(c => c.baseLatency).filter(v => v > 0));
-  const cmpLatGM = geomean(comparisons.map(c => c.cmpLatency).filter(v => v > 0));
-  const baseSpGM = geomean(comparisons.map(c => c.baseSpeedup).filter(v => v > 0));
-  const cmpSpGM = geomean(comparisons.map(c => c.cmpSpeedup).filter(v => v > 0));
-  const baseCtGM = geomean(comparisons.map(c => c.baseCompile).filter(v => v > 0));
-  const cmpCtGM = geomean(comparisons.map(c => c.cmpCompile).filter(v => v > 0));
-  const latDeltaGM = baseLatGM > 0 && cmpLatGM > 0 ? ((cmpLatGM - baseLatGM) / baseLatGM) * 100 : null;
-  const spDeltaGM = baseSpGM > 0 && cmpSpGM > 0 ? ((cmpSpGM - baseSpGM) / baseSpGM) * 100 : null;
-  const ctDeltaGM = baseCtGM > 0 && cmpCtGM > 0 ? ((cmpCtGM - baseCtGM) / baseCtGM) * 100 : null;
   html += `</tbody><tfoot><tr>
-    <td colspan="2" class="gm-label">Geomean (${comparisons.length} kernels)</td>
-    <td>${fmtLat(baseLatGM)}</td>
-    <td>${fmtLat(cmpLatGM)}</td>
-    <td>${formatDelta(latDeltaGM, true)}</td>
-    <td>${formatSpeedup(baseSpGM)}</td>
-    <td>${formatSpeedup(cmpSpGM)}</td>
-    <td>${formatDelta(spDeltaGM, false)}</td>
-    <td>${formatCompileTime(baseCtGM)}</td>
-    <td>${formatCompileTime(cmpCtGM)}</td>
-    <td>${formatDelta(ctDeltaGM, true)}</td>
+    <td class="gm-label">Geomean (paired)</td>
+    <td title="Paired row counts used per metric">${gmCounts}</td>
+    <td>${fmtLat(latencyGm.base)}</td>
+    <td>${fmtLat(latencyGm.cmp)}</td>
+    <td>${formatDelta(latencyGm.delta, true)}</td>
+    <td>${formatSpeedup(speedupGm.base)}</td>
+    <td>${formatSpeedup(speedupGm.cmp)}</td>
+    <td>${formatDelta(speedupGm.delta, false)}</td>
+    <td>${formatCompileTime(compileGm.base)}</td>
+    <td>${formatCompileTime(compileGm.cmp)}</td>
+    <td>${formatDelta(compileGm.delta, true)}</td>
   </tr></tfoot></table></div>`;
   document.getElementById('tab-compare').innerHTML = html;
   document.querySelectorAll('#tab-compare .data-table').forEach(makeSortable);

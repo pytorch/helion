@@ -328,8 +328,11 @@ def build_dashboard_data(cache_dir, runs_meta, existing_data=None, active_platfo
 
         acc_failures = []
         run_failures = []
-        # Kernel absent from the global latest nightly run → likely CI infra issue.
-        infra_missing = bool(latest_nightly_run_id) and (not latest_main or latest_main["run_id"] != latest_nightly_run_id)
+        # Kernel had nightly history but is absent from the global latest
+        # nightly run → likely CI infra issue. Kernels that have never had a
+        # nightly entry (e.g., only seen via manual workflow_dispatch or
+        # ad-hoc full-coverage runs) are not flagged.
+        infra_missing = bool(latest_nightly_run_id) and latest_main is not None and latest_main["run_id"] != latest_nightly_run_id
         if not infra_missing and latest_main:
             latest_ps = latest_main.get("per_shape") or {}
             shapes = latest_ps.get("shapes", [])
