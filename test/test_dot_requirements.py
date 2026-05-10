@@ -831,6 +831,118 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         self.assertEqual(seed["tcgen05_cluster_m"], 2)
         self.assertEqual(seed["tcgen05_ab_stages"], 3)
 
+    @onlyBackends(["cute"])
+    def test_cute_universal_matmul_lane_loop_correctness(self) -> None:
+        """Universal-MMA SMEM-load guards stay correct under a lane loop.
+
+        Binds a CuTe matmul with a lane-loop configuration
+        (``elements_per_thread=2``) on either the M or the N axis and
+        asserts both the launch dim (recovery must divide by ``epT``)
+        and ``allclose`` against ``x @ y`` (SMEM-load guards must use
+        the physical thread coord so every lane iteration re-populates
+        sA / sB). The fix is symmetric across M and N — see the
+        ``_local_mma_coord_expr`` → ``_physical_mma_coord_expr``
+        switch in ``cute_mma._codegen_cute_mma``.
+        """
+        torch.manual_seed(0)
+        x = torch.randn([1024, 1024], device=DEVICE, dtype=torch.float32)
+        y = torch.randn([1024, 1024], device=DEVICE, dtype=torch.float32)
+        # Both variants force the universal MMA path (fp32 inputs) with
+        # a 2-element lane loop on the named axis. Expected launch dim
+        # is ``block=(16, 16, 1)`` in both cases: the non-laned axis
+        # carries its ``num_threads`` value directly, the laned axis
+        # carries ``block_size // elements_per_thread``.
+        cases = (
+            (
+                "n_axis_lane",
+                helion.Config(block_sizes=[16, 32, 32], num_threads=[16, 16, 32]),
+            ),
+            (
+                "m_axis_lane",
+                helion.Config(block_sizes=[32, 16, 32], num_threads=[16, 16, 32]),
+            ),
+        )
+        for case_name, config in cases:
+            with self.subTest(case=case_name):
+                # Fresh bind cache: the in-memory bind cache is keyed
+                # by args and other subTest iterations populate it.
+                _cute_strategy_matmul_kernel._bound_kernels.clear()
+                # ``patch_cute_mma_support`` makes the lowering
+                # decision deterministic across hosts — on a
+                # tcgen05-capable host these shapes fall to universal
+                # MMA via the precondition-check path anyway, but
+                # wrapping matches the convention used by every other
+                # ``_cute_strategy_matmul_kernel`` binding in this
+                # class.
+                with patch_cute_mma_support():
+                    bound = _cute_strategy_matmul_kernel.bind((x, y))
+                bound.set_config(config)
+                result = bound(x, y)
+                torch.testing.assert_close(result, x @ y, atol=1e-1, rtol=1e-2)
+
+                code = bound.to_triton_code(config)
+                for ln in code.splitlines():
+                    if "_launcher(" in ln and "block=(" in ln:
+                        self.assertIn("block=(16, 16, 1)", ln)
+                        break
+                else:
+                    self.fail("could not locate launcher block=(...) in generated code")
+
+    @onlyBackends(["cute"])
+    def test_cute_inactive_grid_block_id_does_not_claim_thread_axis(self) -> None:
+        """Grid codegen for an inactive block_id must skip its thread axis.
+
+        Binds ``examples.matmul_split_k`` with a config that places the
+        outer K block_id in ``inactive_block_ids`` (the K coordinate is
+        only referenced through the inner device-loop's range bounds, so
+        the static-analysis pass marks the outer block_id unused inside
+        the graph). If the grid emits ``indices_<n> = tile_offset_<n> +
+        thread_idx[axis]`` for an inactive block_id, the inner device
+        loop's ``_compute_thread_axis_offset`` will reuse that axis (it
+        counts only active axes) and produce a ``cudaErrorIllegalAddress``
+        at runtime.
+        """
+        from helion._testing import EXAMPLES_DIR
+        from helion._testing import import_path
+
+        torch.manual_seed(0)
+        x = torch.randn(64, 1024, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(1024, 64, device=DEVICE, dtype=torch.float32)
+
+        mod = import_path(EXAMPLES_DIR / "matmul_split_k.py")
+        config = helion.Config(
+            block_sizes=[16, 2, 16],
+            num_threads=[0, 2, 8],
+            split_k=32,
+        )
+        # Force a fresh bind so other tests in this class do not poison
+        # the in-memory bind cache.
+        mod.matmul_split_k._bound_kernels.clear()
+        bound = mod.matmul_split_k.bind((x, y))
+        bound.set_config(config)
+
+        code = bound.to_triton_code(config)
+        # ``indices_2`` corresponds to the inactive outer-K block_id. It
+        # must be plain ``tile_offset_2`` — no ``thread_idx`` term —
+        # otherwise the launch dim is shared with the inner block_id and
+        # the inner indices line addresses past the tile.
+        for ln in code.splitlines():
+            if ln.strip().startswith("indices_2 = "):
+                self.assertNotIn("thread_idx", ln, msg=ln)
+                self.assertIn("tile_offset_2", ln, msg=ln)
+                break
+        else:
+            self.fail("could not locate indices_2 = ... in generated code")
+
+        # Crash-survival regression check: the kernel must run without a
+        # CUDA illegal memory access so the GPU context survives. This
+        # test does NOT assert numerical correctness against
+        # ``torch.matmul``: the autotuner-picked config can still
+        # produce wrong output on this fp32 split-K path, which is a
+        # separate known follow-up.
+        bound(x, y)
+        torch.cuda.synchronize()
+
     @skipIfMTIA("MTIA requires tl.dot initial value stride >= 128 bytes")
     def test_matmul_smaller_than_min_dot_size(self) -> None:
         """Test matmul where K and N are smaller than min_dot_size (16 on CUDA).
