@@ -12,6 +12,8 @@ if TYPE_CHECKING:
     from ..device_ir import DeviceIR
 
 
+# Heuristic was originally contributed by @umechand-amd
+# in https://github.com/pytorch/helion/pull/2357.
 class TritonSkinnyGemmHeuristic(SeedHeuristic):
     name = "triton_skinny_gemm"
     backend = "triton"
