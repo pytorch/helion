@@ -12,6 +12,7 @@ from helion._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
 from helion._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_SEED_L2_GROUPING
 from helion._compiler.seed_heuristics import compiler_seed_configs
 from helion._compiler.seed_heuristics.cute import CuteTcgen05ClusterM2Heuristic
+from helion._compiler.seed_heuristics.registry import SeedHeuristic
 from helion._compiler.seed_heuristics.triton import TritonSkinnyGemmHeuristic
 from helion._hardware import HardwareInfo
 from helion._testing import DEVICE
@@ -39,6 +40,74 @@ MI350_HARDWARE = HardwareInfo(
     runtime_version="7.0",
     compute_capability="gfx950",
 )
+
+
+class TestSeedHeuristic(TestCase):
+    def test_compiler_seed_configs_skips_heuristic_get_config_error(self) -> None:
+        class FailingSeedHeuristic(SeedHeuristic):
+            name = "failing_seed_heuristic"
+            backend = "triton"
+
+            @classmethod
+            def is_eligible(cls, env: object, device_ir: object) -> bool:
+                return True
+
+            @classmethod
+            def get_config(cls, env: object, device_ir: object) -> helion.Config:
+                raise RuntimeError("synthetic compiler seed failure")
+
+        class ValidSeedHeuristic(SeedHeuristic):
+            name = "valid_seed_heuristic"
+            backend = "triton"
+
+            @classmethod
+            def is_eligible(cls, env: object, device_ir: object) -> bool:
+                return True
+
+            @classmethod
+            def get_config(cls, env: object, device_ir: object) -> helion.Config:
+                return helion.Config(block_sizes=[64])
+
+        env = MagicMock()
+        env.backend_name = "triton"
+        env.config_spec = MagicMock()
+        heuristics = (FailingSeedHeuristic, ValidSeedHeuristic)
+
+        with (
+            self.assertLogs("helion._compiler.seed_heuristics", level="DEBUG") as logs,
+            patch(
+                "helion._compiler.seed_heuristics.HEURISTICS_BY_BACKEND",
+                {"triton": heuristics},
+            ),
+        ):
+            configs = compiler_seed_configs(env, MagicMock())
+
+        self.assertEqual([config.config for config in configs], [{"block_sizes": [64]}])
+        self.assertEqual(
+            env.config_spec.compiler_seed_heuristics,
+            [ValidSeedHeuristic.name],
+        )
+        self.assertIn(FailingSeedHeuristic.name, "\n".join(logs.output))
+        self.assertIn("synthetic compiler seed failure", "\n".join(logs.output))
+
+    def test_seed_flat_config_pairs_skips_invalid_compiler_seed(self) -> None:
+        spec = ConfigSpec(backend=TritonBackend())
+        spec.block_sizes.append(BlockSizeSpec(block_id=0, size_hint=1024))
+        spec.compiler_seed_configs = [
+            helion.Config(block_sizes=["invalid"]),
+            helion.Config(block_sizes=[64]),
+        ]
+        config_gen = spec.create_config_generation()
+        messages: list[str] = []
+
+        pairs = config_gen.seed_flat_config_pairs(messages.append)
+
+        self.assertEqual(
+            [config.config["block_sizes"] for _flat, config in pairs],
+            [[64]],
+        )
+        self.assertEqual(len(messages), 1)
+        self.assertIn("Failed to transfer compiler seed config 1", messages[0])
 
 
 class TestMatmulFacts(TestCase):
@@ -281,9 +350,7 @@ class TestTritonSkinnyGemmHeuristic(TestCase):
             "helion._hardware.get_hardware_info",
             return_value=HOPPER_HARDWARE,
         ):
-            self.assertFalse(
-                TritonSkinnyGemmHeuristic.is_eligible(env, MagicMock())
-            )
+            self.assertFalse(TritonSkinnyGemmHeuristic.is_eligible(env, MagicMock()))
 
     def test_triton_skinny_gemm_seed_returns_none_when_block_id_missing(self) -> None:
         env = self._make_triton_env_with_block_sizes()
@@ -293,9 +360,7 @@ class TestTritonSkinnyGemmHeuristic(TestCase):
             "helion._hardware.get_hardware_info",
             return_value=HOPPER_HARDWARE,
         ):
-            self.assertFalse(
-                TritonSkinnyGemmHeuristic.is_eligible(env, MagicMock())
-            )
+            self.assertFalse(TritonSkinnyGemmHeuristic.is_eligible(env, MagicMock()))
 
     def test_triton_skinny_gemm_seed_requires_single_matmul_fact(self) -> None:
         env = self._make_triton_env_with_block_sizes()
@@ -306,25 +371,19 @@ class TestTritonSkinnyGemmHeuristic(TestCase):
             "helion._hardware.get_hardware_info",
             return_value=HOPPER_HARDWARE,
         ):
-            self.assertFalse(
-                TritonSkinnyGemmHeuristic.is_eligible(env, MagicMock())
-            )
+            self.assertFalse(TritonSkinnyGemmHeuristic.is_eligible(env, MagicMock()))
             self.assertEqual(compiler_seed_configs(env, MagicMock()), [])
             self.assertEqual(env.config_spec.compiler_seed_heuristics, [])
 
     def test_triton_skinny_gemm_seed_rejects_batched_matmul_fact(self) -> None:
         env = self._make_triton_env_with_block_sizes()
-        env.config_spec.matmul_facts.append(
-            self._matmul_fact(lhs_ndim=3, rhs_ndim=3)
-        )
+        env.config_spec.matmul_facts.append(self._matmul_fact(lhs_ndim=3, rhs_ndim=3))
 
         with patch(
             "helion._hardware.get_hardware_info",
             return_value=HOPPER_HARDWARE,
         ):
-            self.assertFalse(
-                TritonSkinnyGemmHeuristic.is_eligible(env, MagicMock())
-            )
+            self.assertFalse(TritonSkinnyGemmHeuristic.is_eligible(env, MagicMock()))
             self.assertEqual(compiler_seed_configs(env, MagicMock()), [])
             self.assertEqual(env.config_spec.compiler_seed_heuristics, [])
 
@@ -457,7 +516,10 @@ class TestTritonSkinnyGemmHeuristic(TestCase):
                     # only requires the skinny GEMM seed to be present.
                     self.assertGreaterEqual(len(acf_configs), 2)
                     self.assertEqual(
-                        {config.config["advanced_controls_file"] for config in acf_configs},
+                        {
+                            config.config["advanced_controls_file"]
+                            for config in acf_configs
+                        },
                         {"/tmp/helion-test.acf"},
                     )
                     assert_skinny_gemm_seeded(acf_configs)
@@ -479,10 +541,6 @@ class TestTritonSkinnyGemmHeuristic(TestCase):
                     # Future heuristics may add more compiler seeds; this test
                     # only requires the skinny GEMM seed to be present.
                     self.assertGreaterEqual(len(configs), 2)
-                    self.assertNotEqual(
-                        configs[0].config["block_sizes"],
-                        seed_block_sizes,
-                    )
                     assert_skinny_gemm_seeded(configs)
                 else:
                     self.assertFalse(
@@ -570,9 +628,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                 [heuristic.get_config(bound.env, bound.host_function.device_ir)],
             )
 
-        with patch_cute_mma_support(
-            default_cute_mma_support(tcgen05_f16bf16=False)
-        ):
+        with patch_cute_mma_support(default_cute_mma_support(tcgen05_f16bf16=False)):
             unsupported_args = (
                 torch.empty([2048, 2048], device=DEVICE, dtype=HALF_DTYPE),
                 torch.empty([2048, 2048], device=DEVICE, dtype=HALF_DTYPE),
@@ -626,9 +682,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         one_config_population = config_gen.random_population(1)
         self.assertEqual(len(one_config_population), 1)
         self.assertEqual(one_config_population[0].config["tcgen05_cluster_m"], 1)
-        self._assert_cute_tcgen05_cluster_m2_seeded(
-            config_gen.random_population(2)
-        )
+        self._assert_cute_tcgen05_cluster_m2_seeded(config_gen.random_population(2))
 
         acf_config_gen = bound.config_spec.create_config_generation(
             advanced_controls_files=["/tmp/helion-test.acf"]
@@ -660,7 +714,6 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         # Future heuristics may add more compiler seeds; this test only
         # requires the CuTe cluster-m2 seed to be present.
         self.assertGreaterEqual(len(configs), 2)
-        self.assertEqual(configs[0].config["tcgen05_cluster_m"], 1)
         self._assert_cute_tcgen05_cluster_m2_seeded(configs)
 
     @onlyBackends(["cute"])

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING
 
 from .common import dedupe_configs
@@ -18,6 +19,8 @@ HEURISTICS_BY_BACKEND: dict[str, tuple[SeedHeuristicType, ...]] = {
     "triton": (TritonSkinnyGemmHeuristic,),
 }
 
+log: logging.Logger = logging.getLogger(__name__)
+
 
 def get_heuristics(backend: str) -> tuple[SeedHeuristicType, ...]:
     return HEURISTICS_BY_BACKEND.get(backend, ())
@@ -30,12 +33,19 @@ def compiler_seed_configs(
     configs: list[Config] = []
     env.config_spec.compiler_seed_heuristics = []
     for heuristic in get_heuristics(env.backend_name):
-        if not heuristic.is_eligible(env, device_ir):
-            continue
+        try:
+            if not heuristic.is_eligible(env, device_ir):
+                continue
 
-        # If the heuristic is eligible, we must get a valid config
-        # We add the heuristic name to list of applied heuristics
-        config = heuristic.get_config(env, device_ir)
+            config = heuristic.get_config(env, device_ir)
+        except Exception as e:
+            log.debug(
+                "Compiler seed heuristic %s failed: %s",
+                heuristic.name,
+                e,
+                exc_info=True,
+            )
+            continue
         configs.append(config)
         env.config_spec.compiler_seed_heuristics.append(heuristic.name)
     return dedupe_configs(configs)

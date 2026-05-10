@@ -31,10 +31,10 @@ def matches_hardware(
     from ..._hardware import get_hardware_info
 
     hardware = get_hardware_info(env.device)
-    return (
-        (hardware.device_kind, hardware.compute_capability) in targets
-        or (hardware.device_kind, None) in targets
-    )
+    return (hardware.device_kind, hardware.compute_capability) in targets or (
+        hardware.device_kind,
+        None,
+    ) in targets
 
 
 def clamp_block_size_targets(
