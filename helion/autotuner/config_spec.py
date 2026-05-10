@@ -72,6 +72,12 @@ from .._compiler.cute.tcgen05_constants import (
 from .._compiler.cute.tcgen05_constants import TCGEN05_AB_PRODUCER_ADVANCE_MODE_NORMAL
 from .._compiler.cute.tcgen05_constants import TCGEN05_AB_PRODUCER_ADVANCE_MODES
 from .._compiler.cute.tcgen05_constants import (
+    TCGEN05_AB_STAGES_THREE_MIN_DEVICE_SMEM_OPTIN,
+)
+from .._compiler.cute.tcgen05_constants import (
+    TCGEN05_AB_STAGES_THREE_RESERVED_SMEM_BYTES,
+)
+from .._compiler.cute.tcgen05_constants import (
     TCGEN05_ACC_PRODUCER_ADVANCE_MODE_CONFIG_KEY,
 )
 from .._compiler.cute.tcgen05_constants import TCGEN05_ACC_PRODUCER_ADVANCE_MODE_NORMAL
@@ -105,6 +111,7 @@ from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
 from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
 from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_MAX_K_TILES
 from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_SEED_PID_TYPE
+from .._compiler.cute.tcgen05_constants import tcgen05_ab_smem_bytes_per_cta
 from ..exc import InvalidConfig
 from .block_id_sequence import BlockIdSequence
 from .block_id_sequence import _BlockIdItem
@@ -163,6 +170,30 @@ class MatmulFact(NamedTuple):
     static_k: int | None
     lhs_dtype: torch.dtype
     rhs_dtype: torch.dtype
+
+
+class Tcgen05AbStagesThreeSearchConstraints(NamedTuple):
+    """Search-only envelope where ``tcgen05_ab_stages=3`` is admitted.
+
+    Built by the matmul path when binding a static-shape BF16/FP16 tcgen05
+    candidate. ``per_cta_smem_budget_bytes`` is the per-CTA SMEM budget the
+    SMEM gate may consume for the AB pipeline staging — the matmul lowering
+    also pays for accumulator stages, pipeline mailboxes, and TMEM
+    bookkeeping (~24 KiB measured for the canonical 256x256x128 cluster_m=2
+    ab=3 path; reserved at the call site as
+    ``TCGEN05_AB_STAGES_THREE_RESERVED_SMEM_BYTES = 28 KiB`` so the gate
+    keeps a small margin against ptxas's hard limit).
+
+    The autotune search-time fixup (``_fix_tcgen05_ab_stages_three_search_config``)
+    consults these constraints to demote ``ab=3`` candidates whose tile
+    shape, dtype, or cluster shape exceeds the budget. The validation
+    surface remains independent so ``helion.Config(tcgen05_ab_stages=3)``
+    still round-trips for explicit user configs (the cute_dsl path has its
+    own loud ptxas failure for over-budget user configs).
+    """
+
+    dtype_bytes: int
+    per_cta_smem_budget_bytes: int
 
 
 def shrink_block_sizes_for_numel_constraints(
@@ -436,6 +467,18 @@ class ConfigSpec:
         self._tcgen05_cluster_m2_search_constraints: (
             Tcgen05ClusterM2SearchConstraints | None
         ) = None
+        # Search-only envelope for ``tcgen05_ab_stages=3``. ``None`` means the
+        # search surface keeps the conservative ``max=2`` cap (default before
+        # G3.0). The matmul path sets this via
+        # ``allow_tcgen05_ab_stages_three_search`` after proving the device
+        # SMEM optin cap can host at least the smallest ``ab=3`` candidate
+        # for the active dtype. Per-config legality (after a flat sample
+        # has materialized ``(bm, bn, bk, cluster_m)``) is then checked by
+        # ``_tcgen05_ab_stages_three_fits`` and any over-budget sample is
+        # demoted in ``_fix_tcgen05_ab_stages_three_search_config``.
+        self._tcgen05_ab_stages_three_search_constraints: (
+            Tcgen05AbStagesThreeSearchConstraints | None
+        ) = None
         # Allowed values of tcgen05_num_epi_warps the autotuner is allowed
         # to *search* over. ``None`` means "use the default IntegerFragment
         # range defined by _tcgen05_optional_fragments". This is consulted by
@@ -635,6 +678,177 @@ class ConfigSpec:
         block_sizes[0] = TCGEN05_TWO_CTA_BLOCK_M
         block_sizes[1] = TCGEN05_TWO_CTA_BLOCK_N
 
+    def allow_tcgen05_ab_stages_three_search(
+        self,
+        *,
+        dtype_bytes: int,
+        device: torch.device,
+    ) -> None:
+        """Admit ``tcgen05_ab_stages=3`` into the autotune search surface.
+
+        ``dtype_bytes`` is the AB operand element size (2 for BF16/FP16).
+        ``device`` is the operand's CUDA device — the SMEM-budget query
+        consults that exact device's ``shared_memory_per_block_optin``
+        rather than the host process's *current* CUDA device, so a
+        multi-GPU / heterogeneous setup cannot accidentally enable an
+        over-budget config (current device has more SMEM than the
+        target) or suppress the canonical seed (current device is below
+        the B200 floor while the target is B200).
+
+        The recorded budget is then consulted by:
+
+        * ``_tcgen05_optional_fragments(for_search=True)`` — lifts
+          ``ab_stages_max`` from 2 to 3 so the autotuner samples the
+          ``ab=3`` arm.
+        * ``_fix_tcgen05_ab_stages_three_search_config`` — demotes any
+          sampled ``ab=3`` configuration whose ``(bm, bn, bk, cluster_m)``
+          per-CTA AB-SMEM cost exceeds the budget back to ``ab=2`` so an
+          unsafe candidate cannot reach ptxas.
+        * ``CuteTcgen05ClusterM2Heuristic.get_seed_config`` — seeds the
+          canonical fast config (256x256x128 cluster_m=2 ab=3) when the
+          budget allows.
+
+        Validation surface is unchanged: ``helion.Config(tcgen05_ab_stages=3)``
+        still round-trips for explicit user configs (the cute_dsl path has
+        its own loud ptxas failure for over-budget user configs). Disable
+        with ``self._tcgen05_ab_stages_three_search_constraints = None``.
+
+        Refuses to admit ``ab=3`` when the spec has more than the
+        single-matmul 3-block-size triple. ``tcgen05_ab_stages`` is a
+        global config knob across the whole bound kernel, but the
+        per-config search-time fixup
+        (``_fix_tcgen05_ab_stages_three_search_config``) only inspects
+        ``block_sizes[0:3]``. A multi-dot or multi-root kernel could
+        otherwise sit at ``ab=3`` for a later over-budget triple — that
+        path would survive the fixup and abort at ptxas mid-tuning.
+        Mirrors the single-triple assumption used by
+        ``CuteTcgen05ClusterM2Heuristic`` (``len(self.block_sizes) != 3``).
+        """
+        assert dtype_bytes > 0, "dtype_bytes must be positive"
+        if len(self.block_sizes) != 3:
+            self._tcgen05_ab_stages_three_search_constraints = None
+            return
+        budget_bytes = self._cute_per_cta_ab_smem_budget_bytes(device)
+        if budget_bytes <= 0:
+            # Device SMEM optin cap is below the B200 envelope (or
+            # unavailable on a non-CUDA host). Keep ``ab=3`` search off so
+            # we never broaden the autotune surface past the hardware's
+            # known-good envelope.
+            self._tcgen05_ab_stages_three_search_constraints = None
+            return
+        self._tcgen05_ab_stages_three_search_constraints = (
+            Tcgen05AbStagesThreeSearchConstraints(
+                dtype_bytes=dtype_bytes,
+                per_cta_smem_budget_bytes=budget_bytes,
+            )
+        )
+
+    @staticmethod
+    def _cute_per_cta_ab_smem_budget_bytes(device: torch.device) -> int:
+        """Per-CTA SMEM budget the AB pipeline staging may consume.
+
+        Returns 0 when ``device`` is non-CUDA or its optin SMEM cap is
+        below the B200 envelope — keeps ``ab=3`` search off until the
+        target device can prove there is room to host it. Reads
+        ``shared_memory_per_block_optin`` so the budget tracks the
+        device's actual cap rather than the more conservative default.
+        Subtracts ``TCGEN05_AB_STAGES_THREE_RESERVED_SMEM_BYTES`` to
+        leave room for the role-local lowering's non-AB SMEM
+        (accumulator stages, pipeline mailboxes, TMEM bookkeeping).
+
+        ``shared_memory_per_block_optin`` is read with ``getattr``
+        because the HIP runtime does not expose it on CUDA device
+        properties — see ``torch/cuda/_utils.py``'s own ``getattr``
+        with a 49152 fallback, plus the existing ``getattr`` usage in
+        ``helion/_compiler/reduction_strategy.py`` and
+        ``helion/_testing.py``. ``shared_memory_per_block`` is the
+        stable attribute and is read directly.
+        """
+        if device.type != "cuda" or not torch.cuda.is_available():
+            return 0
+        props = torch.cuda.get_device_properties(device)
+        # ``getattr`` because HIP / non-CUDA runtimes may not expose
+        # ``shared_memory_per_block_optin``; see docstring above.
+        optin_shared = int(getattr(props, "shared_memory_per_block_optin", 0) or 0)
+        device_cap = max(props.shared_memory_per_block, optin_shared)
+        if device_cap < TCGEN05_AB_STAGES_THREE_MIN_DEVICE_SMEM_OPTIN:
+            return 0
+        return device_cap - TCGEN05_AB_STAGES_THREE_RESERVED_SMEM_BYTES
+
+    def _tcgen05_ab_stages_three_fits(
+        self,
+        *,
+        bm: int,
+        bn: int,
+        bk: int,
+        cluster_m: int,
+    ) -> bool:
+        """True when ``ab=3`` per-CTA AB-SMEM cost fits the budget.
+
+        Uses ``tcgen05_ab_smem_bytes_per_cta`` to compute the per-CTA cost
+        for the active dtype. Returns False whenever ``ab=3`` search is
+        not admitted, the cluster shape is unsupported, or the cost
+        exceeds the recorded budget. Used by both the fix-up
+        (``_fix_tcgen05_ab_stages_three_search_config``) and the canonical
+        seed (``CuteTcgen05ClusterM2Heuristic.get_seed_config``).
+        """
+        constraints = self._tcgen05_ab_stages_three_search_constraints
+        if constraints is None:
+            return False
+        if cluster_m not in (1, 2):
+            return False
+        if bm <= 0 or bn <= 0 or bk <= 0:
+            return False
+        bytes_per_cta = tcgen05_ab_smem_bytes_per_cta(
+            bm=bm,
+            bn=bn,
+            bk=bk,
+            dtype_bytes=constraints.dtype_bytes,
+            ab_stages=3,
+            cluster_m=cluster_m,
+        )
+        return bytes_per_cta <= constraints.per_cta_smem_budget_bytes
+
+    def _fix_tcgen05_ab_stages_three_search_config(
+        self, config: dict[str, object]
+    ) -> None:
+        """Demote search-only ``ab=3`` candidates that overflow SMEM.
+
+        The autotune search samples ``tcgen05_ab_stages`` independently of
+        ``(bm, bn, bk, cluster_m)``. Many sampled tile shapes do not fit
+        the per-CTA AB-SMEM budget at ``ab=3``; without this fixup those
+        samples would reach ptxas and abort with ``shared > 232KB``,
+        wasting tuning time and risking GPU-context teardown.
+
+        Runs only when the ``ab=3`` search arm is enabled (no-op
+        otherwise) and only on configs that already passed the search
+        normalization for ``cluster_m`` and ``block_sizes`` (so the
+        post-fixup ``cluster_m`` agrees with the cluster_m2 projection).
+        """
+        if self._tcgen05_ab_stages_three_search_constraints is None:
+            return
+        if not self.cute_tcgen05_search_enabled:
+            return
+        ab_stages = config.get("tcgen05_ab_stages")
+        if ab_stages != 3:
+            return
+        # Trust the per-fragment validators and the cluster_m fixups
+        # that ran immediately above (see ``normalize`` ordering): by
+        # this point ``block_sizes`` is the validated 3-tuple of ints
+        # produced by ``BlockIdSequence._normalize`` and
+        # ``tcgen05_cluster_m`` is a validated ``1`` or ``2``. Mirrors
+        # ``_fix_tcgen05_cluster_m2_search_config`` which also trusts
+        # the post-normalize structural form.
+        block_sizes = cast("list[int]", config["block_sizes"])
+        cluster_m = cast("int", config.get("tcgen05_cluster_m", 1))
+        if not self._tcgen05_ab_stages_three_fits(
+            bm=block_sizes[0],
+            bn=block_sizes[1],
+            bk=block_sizes[2],
+            cluster_m=cluster_m,
+        ):
+            config["tcgen05_ab_stages"] = 2
+
     def _fix_tcgen05_cluster_m1_persistent_search_config(
         self, config: dict[str, object]
     ) -> None:
@@ -686,6 +900,8 @@ class ConfigSpec:
         allow_persistent_pid_types: bool = False,
         allow_cluster_m2_search: bool = False,
         cluster_m2_static_k: int | None = None,
+        ab_stages_three_dtype_bytes: int | None = None,
+        ab_stages_three_device: torch.device | None = None,
     ) -> None:
         """Narrow the tcgen05 autotune search to combinations validated on B200.
 
@@ -736,6 +952,20 @@ class ConfigSpec:
           ``num_epi_warps != 4`` from being usable; fixing it is the
           actual unblocker for item 2 (multi-warp epilogue with
           c_pipeline SMEM ring + TMA bulk store).
+
+        * **AB-stages-3 SMEM-budget gate.** Pass
+          ``ab_stages_three_dtype_bytes`` (the AB operand element size,
+          2 for BF16/FP16) and ``ab_stages_three_device`` (the operand
+          device — multi-GPU / heterogeneous setups must consult the
+          target device, not the host's current CUDA device) to admit
+          the ``tcgen05_ab_stages=3`` search arm via
+          ``allow_tcgen05_ab_stages_three_search``. Per-config legality
+          is enforced by ``_fix_tcgen05_ab_stages_three_search_config``
+          using ``tcgen05_ab_smem_bytes_per_cta`` against the device's
+          per-CTA SMEM optin cap minus a fixed reservation for non-AB
+          allocations. The cute_dsl path's loud ptxas failure remains
+          the backstop for explicit user configs that bypass autotune
+          with an over-budget ``ab=3`` shape.
         """
         if not allow_persistent_pid_types:
             self.disallow_pid_type("persistent_blocked")
@@ -752,6 +982,16 @@ class ConfigSpec:
             self.restrict_tcgen05_cluster_m_search((1,))
         self.restrict_tcgen05_num_epi_warps_search((4,))
         self.restrict_tcgen05_num_epi_warps_validation((4,))
+        if ab_stages_three_dtype_bytes is not None:
+            assert ab_stages_three_device is not None, (
+                "ab_stages_three_dtype_bytes requires ab_stages_three_device "
+                "so the SMEM-budget gate consults the operand's device, not "
+                "the host's current CUDA device"
+            )
+            self.allow_tcgen05_ab_stages_three_search(
+                dtype_bytes=ab_stages_three_dtype_bytes,
+                device=ab_stages_three_device,
+            )
 
     def supports_config_key(self, key: str) -> bool:
         return self.backend.supports_config_key(key)
@@ -820,19 +1060,28 @@ class ConfigSpec:
             )
         else:
             num_epi_warps_fragment = IntegerFragment(1, 4, 4)
-        # ``tcgen05_ab_stages``: the validation view exposes 3 so explicit
-        # ``helion.Config(tcgen05_ab_stages=3)`` round-trips through
-        # ``normalize()`` and runs at the canonical 4096³ bf16 seed
-        # (~+12% over ab=2; see cute_plan.md §6.9.1). The search view is
-        # kept at max=2 because the SMEM cost at ab=3 depends on
-        # ``(bm, bn, bk, cluster_m, dtype)`` in ways the autotuner cannot
-        # cheaply pre-validate — sampling combinations like ``bk=128 +
-        # cluster_m=1 + ab=3`` ICEs at ptxas with ``shared > 232KB``,
-        # which is bad UX during tuning. Modeling the cute_dsl SMEM
-        # layout in Helion to gate this is brittle; users opt into ab=3
-        # explicitly per-shape until a tile-shape-aware budget check
-        # lands.
-        ab_stages_max = 3 if not for_search else 2
+        # ``tcgen05_ab_stages``: the validation view always exposes 3 so
+        # explicit ``helion.Config(tcgen05_ab_stages=3)`` round-trips
+        # through ``normalize()`` and runs at the canonical 4096³ bf16
+        # seed (~+12% over ab=2; see cute_plan.md §6.9.1). The search
+        # view exposes ``max=3`` only when ``allow_tcgen05_ab_stages_three_search``
+        # has admitted it — the matmul path turns it on after capturing
+        # the device SMEM budget. ``_fix_tcgen05_ab_stages_three_search_config``
+        # then demotes individual ``ab=3`` samples whose
+        # ``(bm, bn, bk, cluster_m)`` per-CTA AB-SMEM cost exceeds the
+        # budget so an over-budget candidate cannot reach ptxas.
+        # Modeling the cute_dsl SMEM layout cost is the load-bearing
+        # decision (see ``tcgen05_ab_smem_bytes_per_cta``); it is
+        # cross-checked against ``cute.cosize`` for the canonical tile
+        # shapes so the gate cannot silently drift away from the
+        # cute_dsl-allocated cost.
+        if (
+            not for_search
+            or self._tcgen05_ab_stages_three_search_constraints is not None
+        ):
+            ab_stages_max = 3
+        else:
+            ab_stages_max = 2
         # ``tcgen05_l2_swizzle_size`` (Quack ``max_swizzle_size``
         # equivalent): autotune surface is narrowed to ``{1, 2, 4, 8}``
         # so the search budget covers the practical envelope without
@@ -1710,6 +1959,9 @@ class ConfigSpec:
         if _fix_invalid:
             self._fix_tcgen05_cluster_m2_search_config(config)
             self._fix_tcgen05_cluster_m1_persistent_search_config(config)
+            # Run after the cluster_m fixups so the SMEM budget check
+            # sees the post-projection ``cluster_m`` and ``block_sizes``.
+            self._fix_tcgen05_ab_stages_three_search_config(config)
 
         # Strategy data-model fragments (G2-A). Each per-fragment
         # validator runs first (type/range checks); cross-fragment
