@@ -384,14 +384,14 @@ class ConfigGeneration:
     def seed_flat_config_pairs(self) -> list[tuple[FlatConfig, Config]]:
         """Return ConfigSpec-provided seeds as flat and normalized configs.
 
-        ``ConfigSpec.autotune_seed_configs()`` is compiler-owned and must
-        return configs that match the live spec structurally. ``InvalidConfig``
+        ``ConfigSpec.compiler_seed_configs`` is compiler-owned and must
+        contain configs that match the live spec structurally. ``InvalidConfig``
         means overrides make a seed inapplicable; other flatten/unflatten
         exceptions are programming errors and intentionally surface.
         """
         result: list[tuple[FlatConfig, Config]] = []
         seen: set[Config] = set()
-        for config in self.config_spec.autotune_seed_configs():
+        for config in self.config_spec.compiler_seed_configs:
             try:
                 flat = self.flatten(config)
                 normalized = self.unflatten(flat)
@@ -473,7 +473,7 @@ class ConfigGeneration:
 
         # Initial population order is default -> user seed configs -> compiler seeds
         # -> random.  This preserves user seed priority without dropping built-in
-        # backend/compiler seeds from ConfigSpec.autotune_seed_configs().
+        # backend/compiler seeds from ConfigSpec.compiler_seed_configs.
         for flat, _config in self.user_seed_flat_config_pairs(
             user_seed_configs, log_func
         ):

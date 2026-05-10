@@ -78,7 +78,6 @@ from .._compiler.cute.tcgen05_constants import TCGEN05_ONE_CTA_MAX_BLOCK_M
 from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
 from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
 from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_MAX_K_TILES
-from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_SEED_L2_GROUPING
 from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_SEED_PID_TYPE
 from ..exc import InvalidConfig
 from .block_id_sequence import BlockIdSequence
@@ -123,6 +122,21 @@ class Tcgen05ClusterM2SearchConstraints(NamedTuple):
 
     static_k: int
     max_k_tiles: int
+
+
+class MatmulFact(NamedTuple):
+    """Shape facts recorded when matmul requirements are applied."""
+
+    lhs_ndim: int
+    rhs_ndim: int
+    m_block_id: int | None
+    n_block_id: int | None
+    k_block_id: int | None
+    static_m: int | None
+    static_n: int | None
+    static_k: int | None
+    lhs_dtype: torch.dtype
+    rhs_dtype: torch.dtype
 
 
 def shrink_block_sizes_for_numel_constraints(
@@ -399,6 +413,9 @@ class ConfigSpec:
         # no loud crash to alert a user who bypasses autotune via an
         # explicit config, so normalize() must reject the unsafe values.
         self._tcgen05_num_epi_warps_validation_choices: tuple[int, ...] | None = None
+        self.compiler_seed_configs: list[helion.Config] = []
+        self.compiler_seed_heuristics: list[str] = []
+        self.matmul_facts: list[MatmulFact] = []
         self.store_indices: list[int] = []
         self.backend_tunable_fragments = self.backend.tunable_fragments()
         unknown_tunables = set(self.backend_tunable_fragments) - BACKEND_TUNABLE_KEYS
@@ -545,53 +562,6 @@ class ConfigSpec:
         # reopening the search choices.
         self.restrict_tcgen05_cluster_m_search((1, 2))
 
-    def _tcgen05_cluster_m2_seed_config(self) -> helion.Config | None:
-        constraints = self._tcgen05_cluster_m2_search_constraints
-        if (
-            constraints is None
-            or TCGEN05_TWO_CTA_SEED_PID_TYPE not in self.allowed_pid_types
-        ):
-            return None
-        if len(self.block_sizes) != 3:
-            return None
-
-        bm_fragment = cast("BlockSizeFragment", self.block_sizes[0]._fragment(self))
-        bn_fragment = cast("BlockSizeFragment", self.block_sizes[1]._fragment(self))
-        bk_fragment = cast("BlockSizeFragment", self.block_sizes[2]._fragment(self))
-        if not (
-            bm_fragment.low <= TCGEN05_TWO_CTA_BLOCK_M <= bm_fragment.high
-            and bn_fragment.low <= TCGEN05_TWO_CTA_BLOCK_N <= bn_fragment.high
-        ):
-            return None
-
-        bk = bk_fragment.high
-        while bk >= bk_fragment.low:
-            if self._tcgen05_cluster_m2_bk_is_valid(bk, constraints):
-                seed_config: dict[str, Any] = {
-                    "block_sizes": [
-                        TCGEN05_TWO_CTA_BLOCK_M,
-                        TCGEN05_TWO_CTA_BLOCK_N,
-                        bk,
-                    ],
-                    "l2_groupings": [TCGEN05_TWO_CTA_SEED_L2_GROUPING],
-                    "pid_type": TCGEN05_TWO_CTA_SEED_PID_TYPE,
-                    "tcgen05_cluster_m": 2,
-                    # Matches the validated tcgen05 search restriction.
-                    "tcgen05_num_epi_warps": 4,
-                }
-                # Pure matmul has exactly the A/B/C indexing slots. Fused
-                # epilogues add more memory ops, so leave those seeds to the
-                # spec default rather than constructing a partial list.
-                if self.indexing.length == 3:
-                    seed_config["indexing"] = [
-                        "tensor_descriptor",
-                        "tensor_descriptor",
-                        "tensor_descriptor",
-                    ]
-                return helion.Config(**seed_config)
-            bk //= 2
-        return None
-
     @staticmethod
     def _tcgen05_cluster_m2_bk_is_valid(
         bk: int, constraints: Tcgen05ClusterM2SearchConstraints
@@ -599,13 +569,6 @@ class ConfigSpec:
         return constraints.static_k % bk == 0 and (
             constraints.static_k // bk <= constraints.max_k_tiles
         )
-
-    def autotune_seed_configs(self) -> list[helion.Config]:
-        """Return validated extra configs that should be benchmarked early."""
-        cluster_m2_seed = self._tcgen05_cluster_m2_seed_config()
-        if cluster_m2_seed is None:
-            return []
-        return [cluster_m2_seed]
 
     def _fix_tcgen05_cluster_m2_search_config(self, config: dict[str, object]) -> None:
         """Canonicalize unvalidated search-only ``cluster_m=2`` products."""

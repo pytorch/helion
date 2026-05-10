@@ -795,7 +795,7 @@ class PopulationBasedSearch(BaseSearch):
                 seen.add(transferred_config)
                 result.append(flat)
 
-        # Compiler-owned seeds come from ConfigSpec.autotune_seed_configs();
+        # Compiler-owned seeds come from ConfigSpec.compiler_seed_configs;
         # they encode backend/compiler heuristics and complement user seed configs.
         for flat, transferred_config in self.config_gen.seed_flat_config_pairs():
             if transferred_config not in seen:

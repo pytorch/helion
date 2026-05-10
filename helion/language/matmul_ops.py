@@ -31,6 +31,7 @@ from .._compiler.matmul_utils import _emit_pallas_matmul
 from .._compiler.matmul_utils import _emit_tl_dot_scaled
 from .._compiler.matmul_utils import _needs_f32_accumulator
 from .._compiler.matmul_utils import emit_tl_dot_with_padding
+from ..autotuner.config_spec import MatmulFact
 from . import _decorators
 
 if TYPE_CHECKING:
@@ -268,6 +269,20 @@ def enforce_dot_requirements(lhs: torch.Tensor, rhs: torch.Tensor) -> None:
     static_m = static_problem_extent(m)
     static_n = static_problem_extent(n)
     static_k = static_problem_extent(k)
+    env.config_spec.matmul_facts.append(
+        MatmulFact(
+            lhs_ndim=lhs.ndim,
+            rhs_ndim=rhs.ndim,
+            m_block_id=env.get_block_id(m),
+            n_block_id=env.get_block_id(n),
+            k_block_id=env.get_block_id(k),
+            static_m=static_m,
+            static_n=static_n,
+            static_k=static_k,
+            lhs_dtype=lhs.dtype,
+            rhs_dtype=rhs.dtype,
+        )
+    )
     if (
         env.backend_name == "cute"
         and lhs.ndim == 2

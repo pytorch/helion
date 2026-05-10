@@ -49,6 +49,7 @@ from .._compiler.generate_ast import generate_ast
 from .._compiler.inductor_lowering_extra import patch_inductor_lowerings
 from .._compiler.kernel_compiler import KernelCompiler
 from .._compiler.output_header import assert_no_conflicts
+from .._compiler.seed_heuristics import compiler_seed_configs
 from .._compiler.variable_origin import ArgumentOrigin
 from .._dist_utils import _find_process_group_name
 from .._dist_utils import check_config_consistancy as dist_check_config_consistancy
@@ -490,6 +491,9 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                     raise
 
                 self.env.config_spec.configure_epilogue_subtile_autotune(args)
+                self.env.config_spec.compiler_seed_configs = compiler_seed_configs(
+                    self.env, self.host_function.device_ir
+                )
 
     def _apply_mark_static(self, args: tuple[object, ...]) -> None:
         """
