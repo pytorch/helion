@@ -46,6 +46,83 @@ def _stmt_name_uses(stmt: ast.AST) -> tuple[set[str], set[str]]:
     return reads, writes
 
 
+def _build_sched_pipeline_consumer_wait_block(
+    *,
+    sched_pipeline: str,
+    sched_consumer_state: str,
+    work_tile_smem: str,
+    valid_var: str,
+) -> list[ast.stmt]:
+    """Emit the consumer-side wait block for the ``ROLE_LOCAL_WITH_SCHEDULER``
+    sched_pipeline: ``consumer_wait`` → ``fence_view_async_shared``
+    → ``sync_warp`` → read the work-tile valid flag.
+
+    Shared between ``_build_role_local_while_with_scheduler`` (the
+    TMA-load / MMA-exec / epi consumer roles) and
+    ``_build_c_input_warp_role_local_while`` (the C-input warp role
+    introduced in ``cute_plan.md`` §7.5.3.2's producer-body split).
+    Each call site supplies a fresh ``valid_var`` so the per-role
+    valid flag has its own SMEM name; the other three arguments
+    are pipeline-level and identical across roles.
+
+    ``mbarrier.wait`` PTX stalls the issuing thread until the phase
+    flips, so all 32 threads in the warp can call ``consumer_wait``
+    safely (no lane-0 gate needed). The async-shared fence
+    serializes the scheduler-warp's SMEM writes against the
+    consumer's proxy view of SMEM, and ``sync_warp`` keeps the warp
+    lanes consistent before they read the valid flag from SMEM.
+
+    Each call returns *fresh* AST nodes — caller-supplied factory
+    pattern (insertion-point-specific copies of the same shape)
+    so downstream AST passes are not corrupted by sharing nodes
+    across multiple parents.
+    """
+    return [
+        statement_from_string(
+            f"{sched_pipeline}.consumer_wait({sched_consumer_state})"
+        ),
+        statement_from_string("cute.arch.fence_view_async_shared()"),
+        statement_from_string("cute.arch.sync_warp()"),
+        statement_from_string(
+            f"{valid_var} = {work_tile_smem}[cutlass.Int32(3)] != cutlass.Int32(0)"
+        ),
+    ]
+
+
+def _build_sched_pipeline_consumer_release_block(
+    *,
+    sched_pipeline: str,
+    sched_consumer_state: str,
+) -> list[ast.stmt]:
+    """Emit the consumer-side release block for the
+    ``ROLE_LOCAL_WITH_SCHEDULER`` sched_pipeline: lane-0-gated
+    ``consumer_release`` → ``advance_state`` → ``sync_warp``.
+
+    Companion to ``_build_sched_pipeline_consumer_wait_block``.
+    ``consumer_release`` is gated on ``lane_idx == 0`` because the
+    per-CTA sched-pipeline empty barrier is initialized with one
+    arrival per consumer *warp* (not per-thread) — see
+    ``cute_mma._codegen_cute_mma``'s
+    ``consumer_mask_to_leader=False`` branch. The ``sync_warp``
+    after the advance keeps the warp lanes' view of the
+    register-resident consumer state consistent.
+    """
+    return [
+        create(
+            ast.If,
+            test=expr_from_string("cute.arch.lane_idx() == cutlass.Int32(0)"),
+            body=[
+                statement_from_string(
+                    f"{sched_pipeline}.consumer_release({sched_consumer_state})"
+                ),
+            ],
+            orelse=[],
+        ),
+        statement_from_string(emit_pipeline_advance(sched_consumer_state)),
+        statement_from_string("cute.arch.sync_warp()"),
+    ]
+
+
 if TYPE_CHECKING:
     import sympy
 
@@ -1174,6 +1251,29 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             "== cutlass.Int32(plan.scheduler_warp_id)".replace(
                 "plan.scheduler_warp_id", str(plan.scheduler_warp_id)
             )
+        )
+
+    def _tcgen05_c_input_role_predicate(self) -> str:
+        """Boolean expression that gates the C-input warp's role block.
+
+        Active when the matmul plan has ``c_input_warp_count > 0``
+        (``cute_plan.md`` §7.5.3.2). The C-input warp sits at warp
+        id ``scheduler_warp_id + scheduler_warp_count`` — directly
+        after the scheduler warp in the launched-CTA layout. Cycle 1
+        of the producer-body split: the role-local while body is
+        empty (consumer side still reads from GMEM in
+        ``memory_ops._aux_subtile_load_source``); cycle 2 fills in
+        the producer GMEM→SMEM cooperative copy, cycle 3 the
+        consumer-side SMEM read flip.
+        """
+        plan = self._tcgen05_plan()
+        assert plan is not None and plan.has_c_input_warp, (
+            "tcgen05 C-input role predicate requires a matmul plan "
+            "with has_c_input_warp=True"
+        )
+        return (
+            "cute.arch.make_warp_uniform(cute.arch.warp_idx()) "
+            f"== cutlass.Int32({plan.c_input_warp_id})"
         )
 
     def _split_tcgen05_invariant_setup(
@@ -2397,60 +2497,26 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         linear_pid_expr = self._tcgen05_linear_virtual_pid_from_coords_expr(coord_terms)
 
         # ``PipelineAsync.consumer_wait`` and ``consumer_release``
-        # call into ``mbarrier`` ops that are *per-thread*: every
-        # thread that runs them counts as an arrival on the barrier.
-        # The per-CTA topology used by ``ROLE_LOCAL_WITH_SCHEDULER``
-        # initializes the empty barrier with one arrival per consumer
-        # *warp* (no ``× cluster_size`` multiplier — see
-        # ``cute_mma._codegen_cute_mma`` ``consumer_mask_to_leader``
-        # branch), so we must gate ``consumer_release`` on a single
-        # thread per warp (lane 0). The other 31 lanes synchronize
-        # via ``sync_warp`` after. Same for ``consumer_wait`` —
-        # gating it on lane 0 alone would leave the other 31 lanes
-        # racing ahead, but ``mbarrier.wait`` PTX is documented to
-        # stall the issuing thread until the phase flips, so all 32
-        # threads can call it; the ``sync_warp`` after the read of
-        # SMEM keeps the warp lanes consistent.
-        #
-        # Mirrors the consumer pattern in
-        # ``_build_tcgen05_persistent_prelude`` for the
-        # cluster_m=2 ONE-CTA bridge (work_tile_consume_stmts +
-        # work_tile_release_stmts gated on consumer_leader_var).
-        # Build the wait/release blocks via factories per insertion
-        # point so each prelude/body/sentinel site gets fresh AST
-        # nodes — sharing nodes across multiple parents corrupts
-        # downstream AST passes.
+        # use the shared sched-pipeline factories at module scope —
+        # see ``_build_sched_pipeline_consumer_wait_block`` and
+        # ``_build_sched_pipeline_consumer_release_block`` for the
+        # per-thread vs per-warp arrival count rationale. The
+        # closures here just thread the per-role variables (the
+        # role's ``valid_var`` plus the shared pipeline/state) into
+        # fresh AST nodes per insertion point.
         def _consumer_wait_block() -> list[ast.stmt]:
-            return [
-                statement_from_string(
-                    f"{sched_pipeline}.consumer_wait({sched_consumer_state})"
-                ),
-                # async-shared fence: ensures the scheduler-warp's
-                # SMEM writes are visible in the consumer's proxy
-                # view before reading the work-tile mailbox.
-                statement_from_string("cute.arch.fence_view_async_shared()"),
-                statement_from_string("cute.arch.sync_warp()"),
-                statement_from_string(
-                    f"{valid_var} = "
-                    f"{layout.work_tile_smem}[cutlass.Int32(3)] != cutlass.Int32(0)"
-                ),
-            ]
+            return _build_sched_pipeline_consumer_wait_block(
+                sched_pipeline=sched_pipeline,
+                sched_consumer_state=sched_consumer_state,
+                work_tile_smem=layout.work_tile_smem,
+                valid_var=valid_var,
+            )
 
         def _consumer_release_block() -> list[ast.stmt]:
-            return [
-                create(
-                    ast.If,
-                    test=expr_from_string("cute.arch.lane_idx() == cutlass.Int32(0)"),
-                    body=[
-                        statement_from_string(
-                            f"{sched_pipeline}.consumer_release({sched_consumer_state})"
-                        ),
-                    ],
-                    orelse=[],
-                ),
-                statement_from_string(emit_pipeline_advance(sched_consumer_state)),
-                statement_from_string("cute.arch.sync_warp()"),
-            ]
+            return _build_sched_pipeline_consumer_release_block(
+                sched_pipeline=sched_pipeline,
+                sched_consumer_state=sched_consumer_state,
+            )
 
         # Initial wait + valid-flag read happens in the prelude so the
         # ``while`` test can be a simple condition (CuTe DSL forbids
@@ -3159,6 +3225,121 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             orelse=[],
         )
 
+    def _build_c_input_warp_role_local_while(
+        self,
+        device_function: DeviceFunction,
+        layout: Tcgen05PersistentProgramIDs._Tcgen05PersistentLayout,
+    ) -> ast.stmt:
+        """Build the C-input warp's role-local while
+        (``cute_plan.md`` §7.5.3.2 cycle 1 of the producer-body
+        split).
+
+        Active when the matmul plan has ``c_input_warp_count > 0``
+        AND the forward FX walker discovered one or more
+        auxiliary-tensor descriptors. The C-input warp participates
+        in the scheduler-broadcast pipeline as a *consumer*: each
+        iteration it consumer-waits on ``sched_pipeline``, reads
+        the published per-tile coords from the SMEM mailbox, runs
+        its role body, then consumer-releases. Cycle 1's role body
+        is empty apart from the ``virtual_pid_var`` write — the
+        warp waits / releases each iteration to keep the
+        sched-pipeline arrive count balanced. Cycle 2 fills in the
+        producer-side aux GMEM→SMEM cooperative copy (allocates
+        SMEM ring + ``PipelineAsync.create`` for ``c_pipeline_aux``,
+        emits ``producer_acquire`` → ``cute.copy`` → ``producer_commit``
+        per descriptor); cycle 3 wires the consumer-side SMEM read
+        flip in ``memory_ops._aux_subtile_load_source``.
+
+        Mirrors the consumer-side pattern in
+        ``_build_role_local_while_with_scheduler`` — both route
+        through ``_build_sched_pipeline_consumer_wait_block`` and
+        ``_build_sched_pipeline_consumer_release_block`` at module
+        scope so the two consumer-role builders share one source
+        of truth for the wait/release shape.
+
+        The ``virtual_pid_var`` write is *load-bearing for cycle 2*:
+        the producer body's aux GMEM tile is built by decomposing
+        the linear pid into ``(tile_m, tile_n)`` (same decomposition
+        the existing consumer roles already perform). Emitting it
+        in cycle 1 establishes the producer body's entry point so
+        the cycle-2 landing site can drop the per-descriptor
+        ``producer_acquire`` / ``cute.copy`` / ``producer_commit``
+        sequence in directly after this statement without a
+        structural rewrite. Cycle 2 also lifts the producer-arrive
+        contract on the C-input warp's lane-0 gate; the wait/release
+        shape stays unchanged.
+        """
+        plan = self._tcgen05_plan()
+        assert plan is not None and plan.has_c_input_warp, (
+            "C-input role-local while requires a matmul plan with has_c_input_warp=True"
+        )
+        sched_pipeline_plan = self._tcgen05_sched_pipeline_plan()
+        assert sched_pipeline_plan is not None, (
+            "C-input role-local while requires a registered "
+            "sched_pipeline plan; was register_cute_tcgen05_sched_pipeline_plan "
+            "called by _codegen_cute_mma?"
+        )
+        sched_pipeline = sched_pipeline_plan.pipeline  # type: ignore[attr-defined]
+        sched_consumer_state = (
+            sched_pipeline_plan.consumer_state  # type: ignore[attr-defined]
+        )
+
+        valid_var = device_function.new_var("tcgen05_c_input_warp_valid")
+
+        coord_terms = [
+            f"{layout.work_tile_smem}[cutlass.Int32({i})]"
+            for i in range(len(self.pid_info))
+        ]
+        linear_pid_expr = self._tcgen05_linear_virtual_pid_from_coords_expr(coord_terms)
+
+        # Factories mirror the consumer-side pattern in
+        # ``_build_role_local_while_with_scheduler`` — both go
+        # through the shared module-scope helpers
+        # (``_build_sched_pipeline_consumer_{wait,release}_block``)
+        # so the wait/release shape has one source of truth.
+        def _consumer_wait_block() -> list[ast.stmt]:
+            return _build_sched_pipeline_consumer_wait_block(
+                sched_pipeline=sched_pipeline,
+                sched_consumer_state=sched_consumer_state,
+                work_tile_smem=layout.work_tile_smem,
+                valid_var=valid_var,
+            )
+
+        def _consumer_release_block() -> list[ast.stmt]:
+            return _build_sched_pipeline_consumer_release_block(
+                sched_pipeline=sched_pipeline,
+                sched_consumer_state=sched_consumer_state,
+            )
+
+        prelude: list[ast.stmt] = []
+        prelude.extend(_consumer_wait_block())
+        per_tile_body: list[ast.stmt] = [
+            # Load-bearing for cycle 2: the producer body
+            # (``producer_acquire`` → cooperative GMEM→SMEM
+            # ``cute.copy`` → ``producer_commit`` per descriptor)
+            # will land immediately after this line, using
+            # ``virtual_pid_var`` to decompose the aux tile coords.
+            statement_from_string(f"{self.virtual_pid_var} = {linear_pid_expr}"),
+        ]
+        per_tile_body.extend(_consumer_release_block())
+        per_tile_body.extend(_consumer_wait_block())
+        prelude.append(
+            create(
+                ast.While,
+                test=expr_from_string(valid_var),
+                body=per_tile_body,
+                orelse=[],
+            )
+        )
+        prelude.extend(_consumer_release_block())
+
+        return create(
+            ast.If,
+            test=expr_from_string(self._tcgen05_c_input_role_predicate()),
+            body=prelude,
+            orelse=[],
+        )
+
     def _role_local_dependency_stmts(
         self, shared_body: list[ast.stmt], role_stmts: list[ast.stmt]
     ) -> list[ast.stmt]:
@@ -3472,6 +3653,23 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         if self._tcgen05_has_scheduler_warp():
             role_local_whiles.append(
                 self._build_scheduler_warp_role_local_while(device_function, layout)
+            )
+        # ``c_input_warp_count > 0`` AND a non-empty
+        # ``aux_tensor_descriptors`` adds a fifth role-local while for
+        # the C-input warp (``cute_plan.md`` §7.5.3.2 cycle 1 of the
+        # producer-body split). Cycle 1's role body is empty (just
+        # the consumer_wait / valid-read / release machinery so the
+        # warp participates as a sched-pipeline consumer); cycles 2
+        # and 3 fill in the producer GMEM→SMEM copy and the
+        # consumer-side SMEM read flip. Gating on the descriptors
+        # being non-empty preserves byte identity for every
+        # ``c_input_warps=0`` config (today's default) and for
+        # ``c_input_warps=1`` configs that don't have a residual
+        # epilogue (the walker returns an empty tuple in that case).
+        plan = self._tcgen05_plan()
+        if plan is not None and plan.has_c_input_warp and plan.aux_tensor_descriptors:
+            role_local_whiles.append(
+                self._build_c_input_warp_role_local_while(device_function, layout)
             )
         return role_local_whiles, shared_tile_body
 

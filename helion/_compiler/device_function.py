@@ -317,12 +317,27 @@ class CuteTcgen05MatmulPlan:
     # previously the inert padding slot (sitting after the scheduler
     # warp in the launched-CTA layout). ``launched_warp_count`` stays
     # at 8 either way because ``role_warp_count`` (8 with the slot
-    # lifted) already matches the warpgroup-aligned envelope. The
-    # codegen body of the C-input warp is inert today — it does not
-    # arrive on the scheduler broadcast pipeline, so the consumer
-    # arrive count in ``cute_mma._codegen_cute_mma`` subtracts
-    # ``c_input_warp_count`` to compensate. MONOLITHIC keeps this at
-    # 0 by validator; only WITH_SCHEDULER hosts the slot.
+    # lifted) already matches the warpgroup-aligned envelope.
+    #
+    # The C-input warp's sched-pipeline participation depends on
+    # whether the productive-body gate fires (``c_input_warp_count
+    # > 0`` AND non-empty ``aux_tensor_descriptors``):
+    #
+    # - Gate fires: ``program_id._build_c_input_warp_role_local_while``
+    #   emits a consumer-side role-local while that calls
+    #   ``consumer_wait`` / ``consumer_release`` on the
+    #   sched_pipeline every iteration. The sched-pipeline consumer
+    #   arrive count in ``cute_mma._codegen_cute_mma`` includes the
+    #   C-input warp.
+    #
+    # - Gate closed (no aux residual, or ``c_input_warps=0``): the
+    #   C-input warp body is fully inert and never calls
+    #   ``consumer_arrive`` on the sched_pipeline. The arrive count
+    #   subtracts ``c_input_warp_count`` to compensate so
+    #   ``producer_commit`` does not block on a missing arrival.
+    #
+    # MONOLITHIC keeps this at 0 by validator; only WITH_SCHEDULER
+    # hosts the slot.
     c_input_warp_count: int = 0
     # ``persistence_model`` selects the persistence axis of the
     # generated kernel. ``STATIC_PERSISTENT`` (default) keeps the
@@ -434,6 +449,24 @@ class CuteTcgen05MatmulPlan:
         if self.has_scheduler_warp:
             return self.scheduler_warp_id
         return self.tma_warp_id
+
+    @property
+    def has_c_input_warp(self) -> bool:
+        return self.c_input_warp_count > 0
+
+    @property
+    def c_input_warp_id(self) -> int:
+        # Dedicated C-input warp sits after the scheduler warp. The
+        # validator rejects ``c_input_warps>0`` under ``MONOLITHIC``
+        # (which has no scheduler warp), so the read implies
+        # ``has_scheduler_warp`` in practice; callers must guard on
+        # ``has_c_input_warp`` before reading. Consumed by the C-input
+        # role-local while builder in ``program_id.py`` to gate the
+        # producer body on the matching warp predicate.
+        assert self.has_c_input_warp, (
+            "c_input_warp_id is only valid when c_input_warp_count > 0"
+        )
+        return self.scheduler_warp_id + self.scheduler_warp_count
 
     @property
     def role_warp_count(self) -> int:
