@@ -33,6 +33,7 @@ if TYPE_CHECKING:
     import ast
 
     from ..aten_lowering import LoweringContext
+    from ..inductor_lowering import CodegenState
 
 
 # ---------------------------------------------------------------------------
@@ -175,8 +176,15 @@ def can_codegen_metal_mma_aten(node: Node, with_acc: bool) -> bool:
     )
 
 
+def can_codegen_metal_mma_dot(node: Node) -> bool:
+    """Return True when hl.dot can use Metal MMA."""
+    if not _is_mma_compatible(node, lhs_idx=0, rhs_idx=1, acc_idx=2):
+        return False
+    return _mma_result_can_be_deferred(node) and _mma_loop_is_exclusive(node)
+
+
 # ---------------------------------------------------------------------------
-# Entry point (called from aten_lowering.py)
+# Entry points (called from aten_lowering.py and matmul_ops.py)
 # ---------------------------------------------------------------------------
 
 
@@ -194,4 +202,19 @@ def codegen_metal_mma(
         "patterns must load canonical 2D A[M,K] and B[K,N] tiles, reduce "
         "over one K tile loop, optionally apply a fusible pointwise epilogue, "
         "and store C[M,N].",
+    )
+
+
+def codegen_metal_mma_dot(state: CodegenState) -> object | None:
+    """Reject MPP-compatible hl.dot outside an owning MPPGraph."""
+    if state.fx_node is None:
+        return None
+    if not can_codegen_metal_mma_dot(state.fx_node):
+        return None
+    raise exc.BackendUnsupported(
+        "metal",
+        "Metal MPP dot requires an owning MPPGraph. Supported dot patterns "
+        "must load canonical 2D A[M,K] and B[K,N] tiles, reduce over one K "
+        "tile loop, optionally apply a fusible pointwise epilogue, and store "
+        "C[M,N].",
     )

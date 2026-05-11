@@ -674,6 +674,16 @@ def _(state: CodegenState) -> object:
     )
 
 
+@_decorators.codegen(dot, "metal")
+def _(state: CodegenState) -> object:
+    from .._compiler.metal.metal_mma import codegen_metal_mma_dot
+
+    result = codegen_metal_mma_dot(state)
+    if result is not None:
+        return result
+    raise exc.BackendUnsupported("metal", "hl.dot not supported by MPP for this config")
+
+
 @_decorators.ref(dot)
 def _(
     mat1: torch.Tensor,

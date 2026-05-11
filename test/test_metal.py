@@ -1098,5 +1098,62 @@ class TestMetalMatmul(unittest.TestCase):
         self.assertNotIn("auto _C =", msl)
         self.assertNotIn("matmul2d<_desc", msl)
 
+    def test_matmul_via_hl_dot(self) -> None:
+        """``hl.dot`` reaches the same MPP MMA pipeline as ``torch.addmm``.
+
+        Exercises the ``hl.dot`` codegen path (``codegen_metal_mma_dot``)
+        which is structurally distinct from the aten addmm/mm path
+        (``codegen_metal_mma``) but reuses the same compatibility predicate
+        (``_is_mma_compatible`` with hl.dot operand layout) and lowers to
+        the same ``_metal_mpp_*`` pseudo-call sequence.
+        """
+        cfg = [helion.Config(block_sizes=[32, 32, 32], num_warps=4)]
+
+        @helion.kernel(backend="metal", configs=cfg)
+        def matmul_dot(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            _k2, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        x = torch.randn(64, 64, device=DEVICE)
+        y = torch.randn(64, 64, device=DEVICE)
+        result = matmul_dot(x, y)
+        torch.testing.assert_close(result, torch.mm(x, y), atol=1e-4, rtol=1e-4)
+
+        msl = _get_msl(matmul_dot, (x, y))
+        self.assertIn("matmul2d", msl, "MPP matmul2d not found in MSL (hl.dot)")
+        self.assertIn("_op.run", msl, "MPP run call not found in MSL (hl.dot)")
+
+    def test_matmul_via_hl_dot_with_relu(self) -> None:
+        cfg = [helion.Config(block_sizes=[32, 32, 32], num_warps=4)]
+
+        @helion.kernel(backend="metal", configs=cfg)
+        def matmul_dot_relu(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            _k2, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
+                out[tile_m, tile_n] = acc.relu()
+            return out
+
+        x = torch.randn(64, 64, device=DEVICE)
+        y = torch.randn(64, 64, device=DEVICE)
+        result = matmul_dot_relu(x, y)
+        torch.testing.assert_close(result, torch.mm(x, y).relu(), atol=1e-4, rtol=1e-4)
+
+        msl = _get_msl(matmul_dot_relu, (x, y))
+        self.assertIn("matmul2d", msl, "MPP matmul2d not found in MSL (hl.dot)")
+        self.assertIn("_coop.begin()", msl, "Epilogue loop not found in MSL (hl.dot)")
+
+
 if __name__ == "__main__":
     unittest.main()

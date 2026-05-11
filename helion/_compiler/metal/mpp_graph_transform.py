@@ -66,6 +66,7 @@ from ..inductor_lowering import CodegenState
 from ..inductor_lowering import codegen_call_with_graph
 from .metal_mma import _MppKStep
 from .metal_mma import _MppSetup
+import helion.language as hl
 from helion.language import _decorators
 from helion.language import _tracing_ops
 from helion.language import memory_ops
@@ -551,6 +552,7 @@ def _mma_output_for_getitem(
 
 def _is_mpp_matmul_node(node: Node) -> bool:
     return node.op == "call_function" and node.target in {
+        hl.dot,
         torch.ops.aten.mm.default,
         torch.ops.aten.addmm.default,
     }
