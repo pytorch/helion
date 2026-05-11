@@ -39,6 +39,7 @@ from ..device_function import CuteTcgen05StoreValue
 from ..dtype_utils import cast_ast
 from ..matmul_utils import _needs_f32_accumulator
 from ..tile_strategy import DeviceLoopState
+from .aux_tensor import discover_tcgen05_aux_tensor_descriptors
 from .cutedsl_compat import emit_pipeline_advance
 from .layout import MatmulExecutionKind
 from .layout import MatmulExecutionPlan
@@ -2273,6 +2274,49 @@ def _emit_mma_pipeline(
         # ``TCGEN05_LEGAL_L2_SWIZZLE_SIZES`` so it is always a positive
         # integer here.
         tcgen05_l2_swizzle_size_value = l2_swizzle_size_from_config(df.config)
+        # Both production callers of ``_emit_mma_pipeline`` propagate
+        # an FX node into this codepath (``codegen_cute_mma_dot``
+        # passes ``state.fx_node``; the aten-style site passes the
+        # call node directly), so the tcgen05 branch requires an
+        # ``fx_node``. The default-``None`` signature is a leftover
+        # that the once-future-tcgen05 callers may set; assert it
+        # here so a future caller that forgets to thread the FX node
+        # fails loudly rather than silently producing an empty
+        # ``aux_tensor_descriptors`` tuple and breaking the
+        # productive-body codegen (which sizes the SMEM ring by
+        # descriptor count).
+        assert fx_node is not None, (
+            "tcgen05 MMA codegen requires a non-None fx_node so the "
+            "aux-tensor walker can identify downstream stores"
+        )
+        # Register the matmul fx_node in
+        # ``cute_tcgen05_matmul_fx_nodes`` before the aux-tensor
+        # walker runs. The walker's analyzer reads the same set to
+        # know where to stop, so the fx_node must be present
+        # *before* the walk. The registered-graph invariant: the
+        # matmul fx_node lives inside a K-loop body subgraph (one
+        # of the registered codegen graphs), so the cute_fx_walk
+        # carrier walker reaches it via ``_phi.args[1]`` (body
+        # branch), never ``_phi.args[0]`` (init value, e.g.
+        # ``hl.zeros``). This holds structurally because
+        # ``_emit_mma_pipeline`` only emits the MMA into the loop
+        # body — there is no path where the matmul appears as the
+        # phi's init value. The walker's ``_phi.args[1]``-only
+        # descent depends on this invariant; pinning it here
+        # prevents a future ``_emit_mma_pipeline`` refactor from
+        # registering an off-graph node and silently breaking the
+        # walker's fast-path. For non-residual kernels — and every
+        # kernel until the productive C-input body lands — the
+        # walker returns an empty tuple and the plan field defaults
+        # to ``()``, preserving byte identity for every existing
+        # config.
+        assert any(fx_node.graph is gi.graph for gi in cg.codegen_graphs), (
+            "matmul fx_node graph must be a registered codegen graph"
+        )
+        df.cute_tcgen05_matmul_fx_nodes.add(fx_node)
+        aux_tensor_descriptors_value = discover_tcgen05_aux_tensor_descriptors(
+            cg, fx_node
+        )
         tcgen05_matmul_plan = CuteTcgen05MatmulPlan(
             bm=bm,
             bn=bn,
@@ -2302,6 +2346,7 @@ def _emit_mma_pipeline(
             persistence_model=tcgen05_persistence_model_str,
             cluster_n=tcgen05_cluster_n,
             l2_swizzle_size=tcgen05_l2_swizzle_size_value,
+            aux_tensor_descriptors=aux_tensor_descriptors_value,
         )
         assert tcgen05_plan is not None
         tcgen05_mma_owner_active = _tcgen05_two_cta_owner_predicate(
@@ -2312,24 +2357,6 @@ def _emit_mma_pipeline(
         )
         candidate_block_shape = tcgen05_matmul_plan.block_shape
         df.register_cute_tcgen05_matmul_plan(tcgen05_matmul_plan)
-        if fx_node is not None:
-            # Invariant: the registered matmul fx_node lives inside a
-            # K-loop body subgraph (one of the registered codegen
-            # graphs), so the cute_fx_walk carrier walker reaches it
-            # via ``_phi.args[1]`` (body branch), never
-            # ``_phi.args[0]`` (init value, e.g. ``hl.zeros``). This
-            # holds structurally because ``_emit_mma_pipeline`` only
-            # emits the MMA into the loop body — there is no path
-            # where the matmul appears as the phi's init value. The
-            # walker's ``_phi.args[1]``-only descent depends on this
-            # invariant; pinning it here prevents a future
-            # ``_emit_mma_pipeline`` refactor from registering an
-            # off-graph node and silently breaking the walker's
-            # fast-path.
-            assert any(fx_node.graph is gi.graph for gi in cg.codegen_graphs), (
-                "matmul fx_node graph must be a registered codegen graph"
-            )
-            df.cute_tcgen05_matmul_fx_nodes.add(fx_node)
         if (
             candidate_block_shape[0]
             * candidate_block_shape[1]

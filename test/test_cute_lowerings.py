@@ -10718,6 +10718,462 @@ class TestCuteLowerings(unittest.TestCase):
 
 
 @onlyBackends(["cute"])
+class TestCuteTcgen05AuxTensorWalker(unittest.TestCase):
+    """Pin the forward FX walker that discovers auxiliary-tensor
+    descriptors for a tcgen05 matmul anchor (``cute_plan.md``
+    §7.5.3.2 productive C-input warp prerequisite).
+
+    The walker enumerates downstream stores' epilogue chains and
+    extracts a :class:`Tcgen05AuxTensorDescriptor` per aux tensor
+    visible in those chains. The plan field
+    ``aux_tensor_descriptors`` carries the result so the producer
+    body has the aux identity at MMA-codegen time. These tests pin
+    walker correctness across the four shapes the productive
+    body will care about (no-aux, exact-shape aux, rowvec
+    broadcast aux, chained residual+bias) plus the for-loop
+    subgraph boundary, and pin plan-level byte identity for the
+    no-aux path.
+    """
+
+    def _bind_and_capture_plans(self, kernel, args, config):  # type: ignore[no-untyped-def]
+        """Bind ``kernel`` and run ``to_triton_code``, intercepting
+        every ``CuteTcgen05MatmulPlan(...)`` constructed during the
+        codegen. Returns ``(observed_plans, store_value_nodes)``
+        where ``store_value_nodes`` is the set of FX nodes that
+        appear as ``args[2]`` on any ``memory_ops.store`` call in
+        any codegen graph after lowering — used by the per-test
+        identity check for ``descriptor.store_value_node``.
+        Mirrors the pattern used by
+        ``test_tcgen05_codegen_consumes_warp_spec``.
+        """
+        from helion._compiler.cute import cute_mma as cute_mma_module
+        from helion._compiler.cute.aux_tensor import (
+            _store_value_pairs as _aux_store_value_pairs,
+        )
+        from helion._compiler.device_function import (
+            CuteTcgen05MatmulPlan as _CuteTcgen05MatmulPlan,
+        )
+
+        observed_plans: list[_CuteTcgen05MatmulPlan] = []
+        store_value_nodes: set[torch.fx.Node] = set()
+
+        def sniffing_matmul_plan(*p_args, **p_kwargs):  # type: ignore[no-untyped-def]
+            plan = _CuteTcgen05MatmulPlan(*p_args, **p_kwargs)
+            observed_plans.append(plan)
+            return plan
+
+        # Snapshot the live codegen graphs' store value-nodes at the
+        # time the walker actually runs. The walker is the only
+        # caller that consults ``cg.codegen_graphs`` for stores, so
+        # invoking ``_store_value_pairs`` on every walker call gives
+        # the test the same enumeration the walker saw — without
+        # depending on internal codegen state surviving past
+        # ``to_triton_code``.
+        from helion._compiler.cute import aux_tensor as aux_tensor_module
+
+        original_discover = aux_tensor_module.discover_tcgen05_aux_tensor_descriptors
+
+        def sniffing_discover(cg, matmul_fx_node):  # type: ignore[no-untyped-def]
+            store_value_nodes.update(value for _, value in _aux_store_value_pairs(cg))
+            return original_discover(cg, matmul_fx_node)
+
+        with patch_cute_mma_support():
+            bound = kernel.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            with (
+                patch.object(
+                    cute_mma_module,
+                    "CuteTcgen05MatmulPlan",
+                    sniffing_matmul_plan,
+                ),
+                patch.object(
+                    cute_mma_module,
+                    "discover_tcgen05_aux_tensor_descriptors",
+                    sniffing_discover,
+                ),
+            ):
+                bound.to_triton_code(config)
+        return observed_plans, store_value_nodes
+
+    def test_walker_returns_empty_for_pure_matmul(self) -> None:
+        """A pure matmul (no aux fusion) produces an empty descriptor
+        tuple. The plan field defaults to ``()`` so non-residual
+        kernels remain byte-identical to the pre-walker baseline.
+        """
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_pure(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        args = (
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+        )
+        config = helion.Config(
+            block_sizes=[256, 256, 128],
+            l2_groupings=[1],
+            pid_type="persistent_interleaved",
+            tcgen05_cluster_m=2,
+            tcgen05_ab_stages=2,
+            tcgen05_acc_stages=2,
+            tcgen05_c_stages=2,
+            tcgen05_num_epi_warps=4,
+        )
+        plans, _ = self._bind_and_capture_plans(cute_matmul_pure, args, config)
+        self.assertEqual(len(plans), 1, msg=f"plans={len(plans)}")
+        self.assertEqual(plans[0].aux_tensor_descriptors, ())
+
+    def test_walker_discovers_exact_shape_residual_aux(self) -> None:
+        """A residual epilogue (``out[tile] = (acc + residual[tile])``)
+        registers exactly one ``Tcgen05AuxTensorDescriptor`` with
+        ``broadcast_axis is None`` (exact-shape, rank-2 aux). The
+        descriptor's host-tensor val matches the residual operand's
+        shape and dtype. The walker reaches the aux load through
+        the for-loop subgraph boundary that wraps the matmul.
+        """
+        from helion._compiler.cute.aux_tensor import Tcgen05AuxTensorDescriptor
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_residual(
+            x: torch.Tensor, y: torch.Tensor, residual: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = (acc + residual[tile_m, tile_n]).to(x.dtype)
+            return out
+
+        args = (
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+        )
+        config = helion.Config(
+            block_sizes=[256, 256, 128],
+            l2_groupings=[1],
+            pid_type="persistent_interleaved",
+            tcgen05_cluster_m=2,
+            tcgen05_ab_stages=2,
+            tcgen05_acc_stages=2,
+            tcgen05_c_stages=2,
+            tcgen05_num_epi_warps=4,
+        )
+        plans, store_value_nodes = self._bind_and_capture_plans(
+            cute_matmul_residual, args, config
+        )
+        self.assertEqual(len(plans), 1, msg=f"plans={len(plans)}")
+        descriptors = plans[0].aux_tensor_descriptors
+        self.assertEqual(len(descriptors), 1, msg=f"descriptors={descriptors!r}")
+        descriptor = descriptors[0]
+        self.assertIsInstance(descriptor, Tcgen05AuxTensorDescriptor)
+        self.assertIsNone(descriptor.broadcast_axis)
+        self.assertEqual(descriptor.host_tensor_val.shape, torch.Size([4096, 4096]))
+        self.assertEqual(descriptor.host_tensor_val.dtype, torch.bfloat16)
+        # The descriptor's load_node and host_tensor_fx_node are
+        # genuine FX nodes (not None / not a non-FX value); the
+        # store-codegen splice will dereference them, so a partial
+        # implementation that returned descriptors with broken
+        # node identity would surface here rather than as a confusing
+        # downstream codegen error.
+        self.assertIsInstance(descriptor.load_node, torch.fx.Node)
+        self.assertIsInstance(descriptor.host_tensor_fx_node, torch.fx.Node)
+        # ``store_value_node`` must be one of the FX nodes the walker
+        # saw as ``args[2]`` on a ``memory_ops.store`` call — the
+        # productive-body codegen pairs the aux SMEM ring with the
+        # right store-splice consumer via this identity, so an
+        # incidentally-matching node (e.g. an unrelated
+        # ``convert_element_type``) would silently break the
+        # producer/consumer pairing.
+        self.assertIn(descriptor.store_value_node, store_value_nodes)
+
+    def test_walker_discovers_rowvec_broadcast_aux(self) -> None:
+        """A rowvec-broadcast epilogue (``out[tile] = (acc + bias[tile_n])``)
+        registers exactly one descriptor with ``broadcast_axis == 1``.
+        Pins that the walker accepts the rowvec form (the existing
+        analyzer surface) and threads ``broadcast_axis`` through to
+        the descriptor, so the productive-body codegen can build a
+        rank-1-with-stride-zero view at the producer side.
+        """
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_bias(
+            x: torch.Tensor, y: torch.Tensor, bias: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = (acc + bias[tile_n]).to(x.dtype)
+            return out
+
+        args = (
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([4096], device=DEVICE, dtype=torch.bfloat16),
+        )
+        config = helion.Config(
+            block_sizes=[256, 256, 128],
+            l2_groupings=[1],
+            pid_type="persistent_interleaved",
+            tcgen05_cluster_m=2,
+            tcgen05_ab_stages=2,
+            tcgen05_acc_stages=2,
+            tcgen05_c_stages=2,
+            tcgen05_num_epi_warps=4,
+        )
+        plans, _ = self._bind_and_capture_plans(cute_matmul_bias, args, config)
+        self.assertEqual(len(plans), 1, msg=f"plans={len(plans)}")
+        descriptors = plans[0].aux_tensor_descriptors
+        self.assertEqual(len(descriptors), 1, msg=f"descriptors={descriptors!r}")
+        descriptor = descriptors[0]
+        self.assertEqual(descriptor.broadcast_axis, 1)
+        # Rank-1 bias underlying tensor — pins the shape so a
+        # future analyzer change that silently accepts a rank-2
+        # broadcast (which would not match the existing per-thread
+        # splice's stride-0 view contract) would fail loudly.
+        self.assertEqual(descriptor.host_tensor_val.shape, torch.Size([4096]))
+        self.assertEqual(descriptor.host_tensor_val.dtype, torch.bfloat16)
+
+    def test_walker_discovers_two_aux_steps_in_chain(self) -> None:
+        """A chain with two aux operands (``acc + residual + bias``)
+        registers two descriptors per matmul anchor — one per aux
+        step in iteration order. The productive body indexes the
+        per-aux SMEM ring by descriptor position, so a partial
+        implementation that collapsed duplicates or dropped one
+        step would surface here.
+        """
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_residual_bias(
+            x: torch.Tensor,
+            y: torch.Tensor,
+            residual: torch.Tensor,
+            bias: torch.Tensor,
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = (
+                    acc + residual[tile_m, tile_n] + bias[tile_n]
+                ).to(x.dtype)
+            return out
+
+        args = (
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([4096], device=DEVICE, dtype=torch.bfloat16),
+        )
+        config = helion.Config(
+            block_sizes=[256, 256, 128],
+            l2_groupings=[1],
+            pid_type="persistent_interleaved",
+            tcgen05_cluster_m=2,
+            tcgen05_ab_stages=2,
+            tcgen05_acc_stages=2,
+            tcgen05_c_stages=2,
+            tcgen05_num_epi_warps=4,
+        )
+        plans, _ = self._bind_and_capture_plans(cute_matmul_residual_bias, args, config)
+        self.assertEqual(len(plans), 1, msg=f"plans={len(plans)}")
+        descriptors = plans[0].aux_tensor_descriptors
+        self.assertEqual(len(descriptors), 2, msg=f"descriptors={descriptors!r}")
+        # Iteration order matches the chain step order — residual
+        # (rank-2 exact-shape) first, bias (rank-1 rowvec) second.
+        self.assertIsNone(descriptors[0].broadcast_axis)
+        self.assertEqual(descriptors[0].host_tensor_val.shape, torch.Size([4096, 4096]))
+        self.assertEqual(descriptors[1].broadcast_axis, 1)
+        self.assertEqual(descriptors[1].host_tensor_val.shape, torch.Size([4096]))
+
+    def test_plan_equality_excludes_aux_tensor_descriptors(self) -> None:
+        """``CuteTcgen05MatmulPlan.aux_tensor_descriptors`` is
+        per-anchor data and must NOT participate in plan equality.
+
+        Two matmuls with identical collective parameters (cluster
+        shape, stages, warp roles, etc.) but distinct downstream
+        aux tensors would otherwise be rejected by
+        ``register_cute_tcgen05_matmul_plan``'s
+        "mixed tcgen05 matmul collective plans" guard. The
+        ``Tcgen05AuxTensorDescriptor`` dataclass also embeds a
+        ``torch.Tensor`` field whose ``==`` returns a non-scalar
+        tensor; including it in plan ``__eq__`` would crash when
+        Python tries to reduce that to a bool.
+
+        Direct construction of two plans differing only in the
+        ``aux_tensor_descriptors`` field is the cleanest pin: it
+        exercises the dataclass equality path the registration
+        guard relies on without needing a multi-matmul kernel that
+        depends on the rest of the lowering pipeline. The
+        ``compare=False`` field marker is the only mechanism that
+        makes the assertion hold.
+        """
+        from helion._compiler.cute.aux_tensor import Tcgen05AuxTensorDescriptor
+        from helion._compiler.device_function import (
+            CuteTcgen05MatmulPlan as _CuteTcgen05MatmulPlan,
+        )
+
+        base_kwargs = {
+            "bm": 256,
+            "bn": 256,
+            "bk": 128,
+            "k_tile_count": 16,
+            "cluster_m": 2,
+            "is_two_cta": True,
+            "uses_role_local_persistent_body": True,
+            "uses_cluster_m2_one_cta_role_local_bridge": False,
+            "cta_thread_count": 256,
+            "physical_m_threads": 128,
+            "acc_stage_count": 2,
+            "ab_stage_count": 2,
+            "c_stage_count": 2,
+            "epi_warp_count": 4,
+        }
+
+        # Build two fake descriptors that differ. Use placeholder
+        # FX nodes from a tiny graph — the equality check only
+        # inspects the descriptor field membership, not the field
+        # values. (If the field IS included in __eq__, the
+        # ``host_tensor_val`` ``torch.Tensor ==`` raises
+        # ``RuntimeError: Boolean value of Tensor with more than
+        # one element is ambiguous`` before any comparison even
+        # finishes — the failure mode is loud rather than silent.)
+        graph = torch.fx.Graph()
+        placeholder_load = graph.placeholder("aux_load_a")
+        placeholder_host = graph.placeholder("aux_host_a")
+        placeholder_store = graph.placeholder("store_value_a")
+        descriptor_a = Tcgen05AuxTensorDescriptor(
+            load_node=placeholder_load,
+            host_tensor_fx_node=placeholder_host,
+            host_tensor_val=torch.zeros(4096, 4096, dtype=torch.bfloat16),
+            broadcast_axis=None,
+            store_value_node=placeholder_store,
+        )
+        descriptor_b = Tcgen05AuxTensorDescriptor(
+            load_node=placeholder_load,
+            host_tensor_fx_node=placeholder_host,
+            host_tensor_val=torch.ones(4096, 4096, dtype=torch.bfloat16),
+            broadcast_axis=None,
+            store_value_node=placeholder_store,
+        )
+        plan_a = _CuteTcgen05MatmulPlan(
+            **base_kwargs, aux_tensor_descriptors=(descriptor_a,)
+        )
+        plan_b = _CuteTcgen05MatmulPlan(
+            **base_kwargs, aux_tensor_descriptors=(descriptor_b,)
+        )
+        # Plans are equal under the collective-parameter contract:
+        # the auto-generated ``__eq__`` skips the descriptors field
+        # because of its ``compare=False`` declaration.
+        self.assertEqual(plan_a, plan_b)
+        # Sanity: the descriptors themselves are different objects
+        # (so a future change that flipped the field's
+        # ``compare=False`` would break this test loudly).
+        self.assertIsNot(descriptor_a, descriptor_b)
+
+    def test_register_plan_accepts_two_matmuls_with_different_aux(self) -> None:
+        """End-to-end pin for the per-anchor descriptor design:
+        a kernel with two matmuls that share collective parameters
+        but reference different aux tensors must register both
+        plans without tripping the "mixed tcgen05 matmul collective
+        plans" guard in ``register_cute_tcgen05_matmul_plan``.
+
+        Hits the registration site directly with two real
+        ``CuteTcgen05MatmulPlan`` instances rather than a
+        two-matmul kernel: the kernel-level pattern is hard to
+        express in pure Helion (the typical
+        ``hl.tile(...)``-rooted matmul produces a single grid
+        loop), and the registration site is the precise place
+        where the bug would manifest. A future cycle that
+        accidentally moves the descriptors back into the equality
+        path would re-introduce the "mixed collective plans" raise
+        here.
+        """
+        from helion._compiler.cute.aux_tensor import Tcgen05AuxTensorDescriptor
+        from helion._compiler.device_function import DeviceFunction
+
+        # Real ``DeviceFunction`` registration site. The two
+        # plans below share every collective parameter and differ
+        # only in their aux-tensor descriptors; the registration
+        # guard must accept the second plan as compatible.
+        df = DeviceFunction.__new__(DeviceFunction)
+        df.cute_tcgen05_matmul_plan = None
+        base_kwargs = {
+            "bm": 256,
+            "bn": 256,
+            "bk": 128,
+            "k_tile_count": 16,
+            "cluster_m": 2,
+            "is_two_cta": True,
+            "uses_role_local_persistent_body": True,
+            "uses_cluster_m2_one_cta_role_local_bridge": False,
+            "cta_thread_count": 256,
+            "physical_m_threads": 128,
+            "acc_stage_count": 2,
+            "ab_stage_count": 2,
+            "c_stage_count": 2,
+            "epi_warp_count": 4,
+        }
+        graph = torch.fx.Graph()
+        ph_load_a = graph.placeholder("aux_load_a")
+        ph_host_a = graph.placeholder("aux_host_a")
+        ph_store_a = graph.placeholder("store_value_a")
+        ph_load_b = graph.placeholder("aux_load_b")
+        ph_host_b = graph.placeholder("aux_host_b")
+        ph_store_b = graph.placeholder("store_value_b")
+        descriptor_a = Tcgen05AuxTensorDescriptor(
+            load_node=ph_load_a,
+            host_tensor_fx_node=ph_host_a,
+            host_tensor_val=torch.zeros(4096, 4096, dtype=torch.bfloat16),
+            broadcast_axis=None,
+            store_value_node=ph_store_a,
+        )
+        descriptor_b = Tcgen05AuxTensorDescriptor(
+            load_node=ph_load_b,
+            host_tensor_fx_node=ph_host_b,
+            host_tensor_val=torch.zeros(4096, dtype=torch.bfloat16),
+            broadcast_axis=1,
+            store_value_node=ph_store_b,
+        )
+        from helion._compiler.device_function import (
+            CuteTcgen05MatmulPlan as _CuteTcgen05MatmulPlan,
+        )
+
+        plan_a = _CuteTcgen05MatmulPlan(
+            **base_kwargs, aux_tensor_descriptors=(descriptor_a,)
+        )
+        plan_b = _CuteTcgen05MatmulPlan(
+            **base_kwargs, aux_tensor_descriptors=(descriptor_b,)
+        )
+        df.register_cute_tcgen05_matmul_plan(plan_a)
+        # Must not raise: the second matmul's distinct aux tensor
+        # is per-anchor data, not a collective-plan difference.
+        df.register_cute_tcgen05_matmul_plan(plan_b)
+        # The registered plan is the first one (the guard is
+        # idempotent on equal plans), confirming the field is
+        # excluded from equality.
+        self.assertIs(df.cute_tcgen05_matmul_plan, plan_a)
+
+
+@onlyBackends(["cute"])
 class TestCuteDslCompat(unittest.TestCase):
     def test_umma_async_tail_workaround_preserves_leader_cta_guard(self) -> None:
         from helion._compiler.cute import cutedsl_compat
