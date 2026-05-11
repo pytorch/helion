@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import re
 import unittest
 
 import torch
@@ -303,14 +302,6 @@ class TestTensorDescriptor(RefEagerTestBase, TestCase):
 
         torch.testing.assert_close(loss, baseline_loss, rtol=5e-2, atol=5e-3)
         self.assertIn(get_tensor_descriptor_fn_name(), code)
-        range_stage_values = [
-            int(match)
-            for line in code.splitlines()
-            if "tl.range" in line
-            for match in re.findall(r"num_stages=(\d+)", line)
-        ]
-        # range_num_stages=4 is clamped to 0, so doesn't show up as num_stages in the tl.range call
-        self.assertEqual(len(range_stage_values), 0)
 
     @skipUnlessTensorDescriptor("Tensor descriptor support is required")
     def test_tiny_matmul_tile_fallback(self) -> None:

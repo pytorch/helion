@@ -5,7 +5,6 @@ import collections
 import dataclasses
 import functools
 import itertools
-import math
 import operator
 from typing import TYPE_CHECKING
 from typing import NamedTuple
@@ -297,31 +296,6 @@ class TileStrategy:
         range_num_stages = env.config_spec.range_num_stages.config_get(
             config.range_num_stages, block_idx, 0
         )
-        num_stages = config.num_stages
-
-        if "tensor_descriptor" in config.indexing:
-            # Tensor descriptor + multi-stage pipelines in addition to unrolling tend to cause
-            # CUDA "misaligned address" or "unspecified launch failure" errors.
-            if range_num_stages > 0:
-                range_num_stages = 0
-            if range_unroll_factor > 0 and num_stages > 1:
-                range_unroll_factor = 0
-        elif (
-            range_num_stages > 1
-            and range_unroll_factor > 1
-            and env.block_sizes[block_idx].size
-            and env.block_sizes[block_idx].numel.is_number
-        ):
-            # Unrolling can cause CUDA IMA with pipelining
-            # We want to ensure new step size + pipeline is within bounds
-            loop_numel = int(env.block_sizes[block_idx].numel)
-            block_size = int(env.block_sizes[block_idx].from_config_assert(config))
-            step = range_unroll_factor * block_size
-            last_offset = ((loop_numel - 1) // block_size) * block_size
-            remainder = loop_numel - last_offset
-            range_num_stages = min(
-                max(1, int(math.ceil(remainder / step))), range_num_stages
-            )
 
         if range_unroll_factor > 0:
             kwargs.append(f"loop_unroll_factor={range_unroll_factor}")
