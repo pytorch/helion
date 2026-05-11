@@ -2631,7 +2631,12 @@ class TestCuteAutotuner(TestCase):
         flat_keys = {
             key for key, _count, _is_sequence in gen.config_spec.flat_key_layout()
         }
-        self.assertEqual(flat_keys, {"block_sizes", "num_threads"})
+        # ``loop_orders`` is exposed for the cute non-tcgen05 search
+        # surface (audited fp32 1024^3 matmul finds ~3x bench-time wins
+        # from ``[[1, 0]]`` over the default ``[[0, 1]]`` — see
+        # ``cute_plan.md`` §7.0). The set still excludes Triton-style
+        # knobs that the cute path does not consume.
+        self.assertEqual(flat_keys, {"block_sizes", "num_threads", "loop_orders"})
 
         repaired = gen.unflatten(
             gen.flatten(helion.Config(block_sizes=[16, 64], num_threads=[128, 128]))
@@ -2642,7 +2647,9 @@ class TestCuteAutotuner(TestCase):
         configs = [gen.random_config() for _ in range(20)]
         self.assertTrue(any(config.num_threads for config in configs))
         for config in configs:
-            self.assertLessEqual(set(config.config), {"block_sizes", "num_threads"})
+            self.assertLessEqual(
+                set(config.config), {"block_sizes", "num_threads", "loop_orders"}
+            )
             self.assertNotIn("persistent", config.pid_type)
             explicit_threads = [nt for nt in config.num_threads if nt > 0]
             if explicit_threads:
@@ -2655,6 +2662,41 @@ class TestCuteAutotuner(TestCase):
                 if num_threads > 0:
                     self.assertLessEqual(num_threads, block_size)
                     self.assertEqual(block_size % num_threads, 0)
+        # Deterministic round-trip pins the widened surface: a config
+        # explicitly built with ``loop_orders=[[1, 0]]`` must survive
+        # flatten/unflatten unchanged (otherwise the autotuner cannot
+        # actually explore the alternate order).
+        round_tripped = gen.unflatten(
+            gen.flatten(
+                helion.Config(
+                    block_sizes=[16, 64],
+                    num_threads=[16, 64],
+                    loop_orders=[[1, 0]],
+                )
+            )
+        )
+        self.assertEqual(round_tripped.loop_orders, [[1, 0]])
+
+    def test_cute_tcgen05_search_surface_excludes_loop_orders(self) -> None:
+        """tcgen05 persistent scheduler relies on a fixed
+        ``pid_info[0]=M, pid_info[1]=N`` mapping (``cluster_m`` and
+        virtual-PID logic). Sampling ``loop_orders=[[1, 0]]`` for a
+        tcgen05 config would steer cluster logic onto the wrong axis.
+        The cute non-tcgen05 widening must not leak into the tcgen05
+        branch.
+        """
+        bound = _get_examples_matmul().bind(
+            (
+                torch.randn([1024, 1024], device=DEVICE, dtype=torch.bfloat16),
+                torch.randn([1024, 1024], device=DEVICE, dtype=torch.bfloat16),
+            )
+        )
+        # Confirm we are on the tcgen05 search branch.
+        self.assertTrue(bound.config_spec.cute_tcgen05_search_enabled)
+        flat_keys = {
+            key for key, _count, _is_sequence in bound.config_spec.flat_key_layout()
+        }
+        self.assertNotIn("loop_orders", flat_keys)
 
 
 @onlyBackends(["triton"])

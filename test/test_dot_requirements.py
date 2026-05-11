@@ -1702,11 +1702,13 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         self.assertNotIn("tcgen05_warp_spec_epi_warps", default_cfg.config)
         self.assertEqual(default_cfg.config["tcgen05_warp_spec_epi_load_warps"], 0)
         self.assertEqual(default_cfg.config["tcgen05_warp_spec_scheduler_warps"], 0)
-        # ``c_input_warps`` was added in cycle 33 as the foundation for
-        # G3.1-C step-2 (``cute_plan.md`` §7.5.3.2). Default is 0 so
-        # serialized configs round-trip cleanly; the value 1 will be
-        # accepted under ``ROLE_LOCAL_WITH_SCHEDULER`` once cycle 34
-        # lands the dedicated TMA producer + SMEM ring.
+        # ``c_input_warps`` is the dedicated C-input / auxiliary-tensor
+        # warp slot (``cute_plan.md`` §7.5.3.2). Default is 0 so
+        # serialized configs round-trip cleanly; the validator widens
+        # the accept set to ``{0, 1}`` under ``ROLE_LOCAL_WITH_SCHEDULER``
+        # (inert-body slot) and stays at ``{0}`` under
+        # ``ROLE_LOCAL_MONOLITHIC``. The productive TMA producer body
+        # is a follow-up.
         self.assertEqual(default_cfg.config["tcgen05_warp_spec_c_input_warps"], 0)
         self.assertEqual(default_cfg.config["tcgen05_warp_spec_register_decrease"], 120)
         self.assertEqual(default_cfg.config["tcgen05_warp_spec_register_increase"], 256)
@@ -1884,6 +1886,36 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         spec.normalize(cfg)
         self.assertEqual(cfg.config["tcgen05_strategy"], "role_local_monolithic")
 
+        # G3.1 first slice (``cute_plan.md`` §7.5.3.2, cycle 34):
+        # ``tcgen05_warp_spec_c_input_warps=1`` under WITH_SCHEDULER
+        # round-trips end-to-end. The validator's accept set now
+        # admits the value; the codegen body stays inert until the
+        # productive TMA producer body lands.
+        c_input_cfg = helion.Config(
+            **base,
+            tcgen05_num_epi_warps=4,
+            tcgen05_strategy="role_local_with_scheduler",
+            tcgen05_warp_spec_scheduler_warps=1,
+            tcgen05_warp_spec_c_input_warps=1,
+        )
+        spec.normalize(c_input_cfg)
+        self.assertEqual(
+            c_input_cfg.config["tcgen05_strategy"], "role_local_with_scheduler"
+        )
+        self.assertEqual(c_input_cfg.config["tcgen05_warp_spec_c_input_warps"], 1)
+
+        # MONOLITHIC + c_input_warps=1 is still rejected (no slot in
+        # the 6-warp shape for an 8th role warp). Pin the negative
+        # path so the per-strategy gate cannot drift.
+        with self.assertRaises(InvalidConfig):
+            spec.normalize(
+                helion.Config(
+                    **base,
+                    tcgen05_strategy="role_local_monolithic",
+                    tcgen05_warp_spec_c_input_warps=1,
+                )
+            )
+
     @onlyBackends(["cute"])
     def test_cute_tcgen05_strategy_invariants_helper_unit(self) -> None:
         """``validate_tcgen05_strategy_invariants`` covers the
@@ -1896,9 +1928,11 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         The earlier warpgroup-alignment requirement on
         ``ROLE_LOCAL_WITH_SCHEDULER`` was relaxed once the initial
         7-warp implementation landed (1 ab_load + 1 mma + 4 epi + 1
-        scheduler = 7). The eventual 8-warp variant with a C-input
-        epi-load warp will re-introduce the alignment requirement
-        when register-split tuning becomes warpgroup-uniform.
+        scheduler = 7). Cycle 34's c_input lift makes the 8-warp
+        variant reachable end-to-end (8 role warps exactly match
+        the launched envelope, no padding); the alignment branch
+        stays dead-code-tested via patching since neither variant
+        triggers it organically today.
         """
         # scheduler_warps=0 under WITH_SCHEDULER is rejected (the
         # strategy demands one scheduler warp).
@@ -2078,19 +2112,24 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
 
     @onlyBackends(["cute"])
     def test_cute_tcgen05_strategy_invariants_c_input_warps(self) -> None:
-        """G3.1-C step-2 (cute_plan.md §7.5.3.2) data-model entrance:
+        """G3.1 first slice (cute_plan.md §7.5.3.2) data-model lift:
         ``c_input_warps`` is plumbed through the dataclass + validator,
-        and cycle 33's narrowing rejects nonzero for both strategies
-        until cycle 34 lands the dedicated TMA producer + SMEM ring.
+        and cycle 34 widens the ``ROLE_LOCAL_WITH_SCHEDULER`` accept
+        set to ``{0, 1}`` so explicit user configs can opt in to the
+        productive C-input warp slot. The codegen body remains inert
+        in cycle 34; the productive TMA producer body lands in a
+        follow-up cycle.
 
         - Positive control: ``c_input_warps=0`` accepted under both
           ``ROLE_LOCAL_MONOLITHIC`` and ``ROLE_LOCAL_WITH_SCHEDULER``
           (the field is plumbed through normalize / round-trip and
           defaults to 0 for legacy configs).
-        - Negative control: ``c_input_warps=1`` is rejected under
-          both strategies in cycle 33; cycle 34 widens the
-          ``ROLE_LOCAL_WITH_SCHEDULER`` accept set to ``{0, 1}`` once
-          the productive C-input warp implementation lands.
+        - Positive control (cycle 34): ``c_input_warps=1`` accepted
+          under ``ROLE_LOCAL_WITH_SCHEDULER`` — the slot occupies
+          what was previously the inert padding warp.
+        - Negative control: ``c_input_warps=1`` rejected under
+          ``ROLE_LOCAL_MONOLITHIC`` (the 6-warp shape has no slot
+          for an 8th role warp).
         """
         # Positive control: c_input_warps=0 under MONOLITHIC.
         errors = validate_tcgen05_strategy_invariants(
@@ -2137,8 +2176,11 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
             msg=str(errors),
         )
 
-        # Negative control: c_input_warps=1 under WITH_SCHEDULER
-        # (cycle 33). Cycle 34 widens this accept set to ``{0, 1}``.
+        # Positive control: c_input_warps=1 accepted under
+        # WITH_SCHEDULER. The slot is reachable end-to-end and the
+        # launched-warp accounting recognizes it (see the matching
+        # matmul-plan accounting test below); the codegen body
+        # stays inert until the productive TMA producer body lands.
         c_input_with_sched = dataclasses.replace(with_sched, c_input_warps=1)
         errors = validate_tcgen05_strategy_invariants(
             strategy=Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER,
@@ -2149,15 +2191,76 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
             pid_type="persistent_blocked",
             cluster_m=1,
         )
-        self.assertTrue(
-            any("c_input_warps in [0]" in e for e in errors),
-            msg=str(errors),
-        )
+        self.assertEqual(errors, [], msg=str(errors))
 
-        # The dataclass total_warps reflects the c_input_warps slot
-        # so a future cycle-34 lift to c_input_warps=1 transparently
-        # adjusts the warp count without further data-model churn.
+        # The dataclass total_warps reflects the c_input_warps slot:
+        # 4 epi + 1 mma + 1 ab_load + 1 sched + 1 c_input = 8.
         self.assertEqual(c_input_with_sched.total_warps, 8)
+
+    @onlyBackends(["cute"])
+    def test_cute_tcgen05_matmul_plan_c_input_warp_accounting(self) -> None:
+        """``CuteTcgen05MatmulPlan`` carries ``c_input_warp_count``
+        and the launched-warp accounting is invariant under the
+        c_input lift because the slot occupies what was previously
+        the inert padding warp under ``ROLE_LOCAL_WITH_SCHEDULER``
+        (``cute_plan.md`` §7.5.3.2):
+
+        - ``c_input_warp_count=0``: 7 role warps, 8 launched (1 pad).
+        - ``c_input_warp_count=1``: 8 role warps, 8 launched (0 pad).
+
+        Existing role warp ids (``exec_warp_id``, ``tma_warp_id``,
+        ``scheduler_warp_id``) are unaffected by the lift — codegen
+        sites that gate on those ids stay byte-identical.
+        """
+        from helion._compiler.device_function import CuteTcgen05MatmulPlan
+
+        base_kwargs: dict[str, object] = {
+            "bm": 256,
+            "bn": 256,
+            "bk": 128,
+            "k_tile_count": 32,
+            "cluster_m": 1,
+            "is_two_cta": False,
+            "uses_role_local_persistent_body": True,
+            "uses_cluster_m2_one_cta_role_local_bridge": False,
+            "cta_thread_count": 256,
+            "physical_m_threads": 128,
+            "acc_stage_count": 2,
+            "ab_stage_count": 2,
+            "c_stage_count": 2,
+            "epi_warp_count": 4,
+            "ab_load_warp_count": 1,
+            "scheduler_warp_count": 1,
+            "sched_stage_count": 1,
+        }
+
+        # c_input_warp_count=0 baseline: 7 role warps, 8 launched
+        # (one inert padding warp).
+        plan_c0 = CuteTcgen05MatmulPlan(**base_kwargs)
+        self.assertEqual(plan_c0.c_input_warp_count, 0)
+        self.assertEqual(plan_c0.role_warp_count, 7)
+        self.assertEqual(plan_c0.launched_warp_count, 8)
+        # All existing role warp ids stay pinned regardless of the
+        # c_input lift below.
+        self.assertEqual(plan_c0.exec_warp_id, 4)
+        self.assertEqual(plan_c0.tma_warp_id, 5)
+        self.assertEqual(plan_c0.scheduler_warp_id, 6)
+        self.assertEqual(plan_c0.persistent_scheduler_owner_warp_id, 6)
+
+        # c_input_warp_count=1 lift: 8 role warps, 8 launched (no
+        # padding).
+        plan_c1 = CuteTcgen05MatmulPlan(**base_kwargs, c_input_warp_count=1)
+        self.assertEqual(plan_c1.c_input_warp_count, 1)
+        self.assertEqual(plan_c1.role_warp_count, 8)
+        self.assertEqual(plan_c1.launched_warp_count, 8)
+        # Existing role warp ids are unaffected by the lift.
+        self.assertEqual(plan_c1.exec_warp_id, 4)
+        self.assertEqual(plan_c1.tma_warp_id, 5)
+        self.assertEqual(plan_c1.scheduler_warp_id, 6)
+        self.assertEqual(plan_c1.persistent_scheduler_owner_warp_id, 6)
+        # Block shape is invariant in both cases (256 mma threads
+        # × 8 launched warps × 1 = the same launch envelope).
+        self.assertEqual(plan_c0.block_shape, plan_c1.block_shape)
 
     @onlyBackends(["cute"])
     def test_cute_tcgen05_strategy_invariants_clc_persistent_cluster_n(

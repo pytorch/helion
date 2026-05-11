@@ -2293,6 +2293,12 @@ def _emit_mma_pipeline(
             ab_load_warp_count=tcgen05_warp_spec.ab_load_warps,
             scheduler_warp_count=tcgen05_warp_spec.scheduler_warps,
             sched_stage_count=tcgen05_sched_stage_count_value,
+            # ``c_input_warp_count`` plumbs the warp-spec slot
+            # through the matmul plan (``cute_plan.md`` §7.5.3.2).
+            # Validator restricts the value to ``{0, 1}`` under
+            # WITH_SCHEDULER and ``{0}`` under MONOLITHIC; codegen
+            # body for the C-input warp is inert today.
+            c_input_warp_count=tcgen05_warp_spec.c_input_warps,
             persistence_model=tcgen05_persistence_model_str,
             cluster_n=tcgen05_cluster_n,
             l2_swizzle_size=tcgen05_l2_swizzle_size_value,
@@ -2681,17 +2687,27 @@ def _emit_mma_pipeline(
             # its arrival to the cluster-wide ``pipeline_init``
             # barrier.
             tcgen05_sched_cluster_size = tcgen05_cluster_m * tcgen05_cluster_n
+            # Consumer arrive count excludes the scheduler warp (the
+            # producer of this pipeline) AND the C-input warp
+            # (``cute_plan.md`` §7.5.3.2): the C-input warp body is
+            # inert today and does not call ``consumer_arrive`` on
+            # the scheduler broadcast pipeline, so counting it would
+            # leave ``producer_commit`` blocked on a missing arrival.
+            # With ``c_input_warp_count=0`` (the default) the
+            # subtraction is a no-op and the byte-identity path is
+            # preserved exactly.
+            tcgen05_sched_consumer_role_count = (
+                tcgen05_matmul_plan.role_warp_count
+                - tcgen05_matmul_plan.scheduler_warp_count
+                - tcgen05_matmul_plan.c_input_warp_count
+            )
             if tcgen05_matmul_plan.is_clc_persistent and tcgen05_sched_cluster_size > 1:
                 tcgen05_sched_consumer_arrive_count = (
-                    tcgen05_matmul_plan.role_warp_count
-                    - tcgen05_matmul_plan.scheduler_warp_count
-                ) * tcgen05_sched_cluster_size
+                    tcgen05_sched_consumer_role_count * tcgen05_sched_cluster_size
+                )
                 tcgen05_sched_consumer_mask_to_leader = True
             else:
-                tcgen05_sched_consumer_arrive_count = (
-                    tcgen05_matmul_plan.role_warp_count
-                    - tcgen05_matmul_plan.scheduler_warp_count
-                )
+                tcgen05_sched_consumer_arrive_count = tcgen05_sched_consumer_role_count
                 tcgen05_sched_consumer_mask_to_leader = False
             prefix.extend(
                 _emit_sched_pipeline_setup(
