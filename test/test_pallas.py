@@ -315,10 +315,9 @@ def pallas_attention(
         m_i = hl.full([tile_b, tile_m], float("-inf"), dtype=torch.float32)
         l_i = torch.full_like(m_i, 1.0)
         acc = hl.zeros([tile_b, tile_m, head_dim], dtype=torch.float32)
-        q = q_view[tile_b, tile_m, :]
         for tile_n in hl.tile(v_view.size(1)):
-            # scaling Q in-loop on-demand reduces spillage, faster than keeping pre-scaled Q
-            q_scaled = q * qk_scale
+            # load and scale Q in-loop on-demand reduces spillage
+            q_scaled = q_view[tile_b, tile_m, :] * qk_scale
             k = k_view[tile_b, tile_n, :]
             # Keep scores in fp32 to match SDPA tolerances on bf16/fp16 inputs.
             # same as hl.dot(q, k, out_dtype=torch.float32)
