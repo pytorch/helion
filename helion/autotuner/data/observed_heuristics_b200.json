@@ -1,11 +1,13 @@
 {
   "schema_version": 2,
-  "description": "B200 observed seed heuristics for generic autotune seed configs. Rules are exact-bucket only and limited to buckets with validated seed-over-baseline improvement.",
+  "description": "B200 observed seed heuristics for generic autotune seed configs. Rules are exact-bucket only and limited to buckets with validated seed-over-baseline improvement. Extended with quantized-GEMM rules (matmul_int4, matmul_int16, matmul_fp4) derived from 120 fully-tuned B200 archive shapes (run 20260509_q2_llmseeded) and live-validated against a 12-shape grid per kernel (Q5/Q6 experiments). Plus per-(kernel_class, shape-group) fallbacks used when exact bucket lookup misses (5 groups for matmul family: small_m/n/k + balanced + rect).",
   "policy": {
     "target": "seed-only round0_best_geo <= 0.80 versus non-heuristic baseline per promoted workload",
     "device": "NVIDIA B200 sm100",
     "matching": "exact shape bucket only",
-    "validation": "h56_clean_policy_opus47_seed_validation_20260509_101149; promoted geomean 0.732x over 3 repeats; attention+GEMV geomean 0.720x; softmax_2k_8k geomean 0.839x with one neutral repeat"
+    "validation": "h56_clean_policy_opus47_seed_validation_20260509_101149; promoted geomean 0.732x over 3 repeats; attention+GEMV geomean 0.720x; softmax_2k_8k geomean 0.839x with one neutral repeat",
+    "quantized_validation": "Q5 (no-autotune baseline): family heldout 0.142 (~7x vs Helion default). Q6 (LLMGuidedSearch max_rounds=1, Opus 4.7 via Bedrock): family heldout 0.663 (~34% over LLM-alone round-0). Per-rule validation blocks use q5_* and q6_* keys.",
+    "fallbacks": "Each fallback is the median-perf winning config for its shape group in the archive. Used only when no exact-bucket rule matches; acts as a coarse safety net between the strict rule lookup and Helion default."
   },
   "rules": [
     {
@@ -925,6 +927,2192 @@
           "win_count": 3
         }
       ]
+    },
+    {
+      "kernel_class": "matmul_fp4",
+      "shape_bucket": {
+        "aspect": "balanced",
+        "dtype": "fp16_bf16",
+        "k_bin": "<=4096",
+        "m_bin": "<=4096",
+        "n_bin": "<=4096"
+      },
+      "match_exact_only": true,
+      "source": {
+        "source_measurement": "20260509_q2_llmseeded",
+        "source_n_archive_shapes": 5,
+        "live_validation_workloads": [
+          "FP4_004",
+          "FP4_005",
+          "FP4_006",
+          "FP4_007",
+          "FP4_008"
+        ]
+      },
+      "validation": {
+        "q5_exp1_seed_over_baseline_geo": 0.12,
+        "q5_repeat_range": [
+          0.102,
+          0.166
+        ],
+        "q5_n_pairs": 15,
+        "q6_exp2_seed_over_baseline_geo": 0.46,
+        "q6_repeat_range": [
+          0.339,
+          0.688
+        ],
+        "q6_n_pairs": 15
+      },
+      "templates": [
+        {
+          "template": {
+            "block_sizes": [
+              8,
+              128,
+              128
+            ],
+            "l2_groupings": [
+              1
+            ],
+            "num_stages": 5,
+            "num_warps": 4,
+            "pid_type": "flat"
+          }
+        },
+        {
+          "template": {
+            "block_sizes": [
+              16,
+              128,
+              256
+            ],
+            "l2_groupings": [
+              1
+            ],
+            "num_stages": 4,
+            "num_warps": 4,
+            "pid_type": "flat"
+          }
+        },
+        {
+          "template": {
+            "block_sizes": [
+              8,
+              256,
+              128
+            ],
+            "l2_groupings": [
+              1
+            ],
+            "num_stages": 7,
+            "num_warps": 4,
+            "pid_type": "flat"
+          }
+        }
+      ]
+    },
+    {
+      "kernel_class": "matmul_fp4",
+      "shape_bucket": {
+        "aspect": "skinny_m",
+        "dtype": "fp16_bf16",
+        "k_bin": "<=4096",
+        "m_bin": "<=1024",
+        "n_bin": "<=4096"
+      },
+      "match_exact_only": true,
+      "source": {
+        "source_measurement": "20260509_q2_llmseeded",
+        "source_n_archive_shapes": 1,
+        "live_validation_workloads": [
+          "FP4_010"
+        ]
+      },
+      "validation": {
+        "q5_exp1_seed_over_baseline_geo": 0.205,
+        "q5_repeat_range": [
+          0.205,
+          0.205
+        ],
+        "q5_n_pairs": 3,
+        "q6_exp2_seed_over_baseline_geo": 0.706,
+        "q6_repeat_range": [
+          0.628,
+          0.764
+        ],
+        "q6_n_pairs": 3
+      },
+      "templates": [
+        {
+          "template": {
+            "block_sizes": [
+              16,
+              128,
+              256
+            ],
+            "l2_groupings": [
+              2
+            ],
+            "num_stages": 3,
+            "num_warps": 4,
+            "pid_type": "flat"
+          }
+        }
+      ]
+    },
+    {
+      "kernel_class": "matmul_fp4",
+      "shape_bucket": {
+        "aspect": "balanced",
+        "dtype": "fp16_bf16",
+        "k_bin": "<=1024",
+        "m_bin": "<=1024",
+        "n_bin": "<=1024"
+      },
+      "match_exact_only": true,
+      "source": {
+        "source_measurement": "20260509_q2_llmseeded",
+        "source_n_archive_shapes": 2,
+        "live_validation_workloads": [
+          "FP4_003"
+        ]
+      },
+      "validation": {
+        "q5_exp1_seed_over_baseline_geo": 0.238,
+        "q5_repeat_range": [
+          0.238,
+          0.238
+        ],
+        "q5_n_pairs": 3,
+        "q6_exp2_seed_over_baseline_geo": 0.628,
+        "q6_repeat_range": [
+          0.614,
+          0.658
+        ],
+        "q6_n_pairs": 3
+      },
+      "templates": [
+        {
+          "template": {
+            "block_sizes": [
+              64,
+              128,
+              32
+            ],
+            "l2_groupings": [
+              1
+            ],
+            "num_stages": 1,
+            "num_warps": 8,
+            "pid_type": "flat"
+          }
+        },
+        {
+          "template": {
+            "block_sizes": [
+              128,
+              128,
+              32
+            ],
+            "l2_groupings": [
+              4
+            ],
+            "num_stages": 1,
+            "num_warps": 8,
+            "pid_type": "flat"
+          }
+        }
+      ]
+    },
+    {
+      "kernel_class": "matmul_fp4",
+      "shape_bucket": {
+        "aspect": "skinny_n",
+        "dtype": "fp16_bf16",
+        "k_bin": "<=4096",
+        "m_bin": "<=4096",
+        "n_bin": "<=128"
+      },
+      "match_exact_only": true,
+      "source": {
+        "source_measurement": "20260509_q2_llmseeded",
+        "source_n_archive_shapes": 2,
+        "live_validation_workloads": [
+          "FP4_012"
+        ]
+      },
+      "validation": {
+        "q5_exp1_seed_over_baseline_geo": 0.282,
+        "q5_repeat_range": [
+          0.28,
+          0.286
+        ],
+        "q5_n_pairs": 3,
+        "q6_exp2_seed_over_baseline_geo": 0.921,
+        "q6_repeat_range": [
+          0.851,
+          0.958
+        ],
+        "q6_n_pairs": 3
+      },
+      "templates": [
+        {
+          "template": {
+            "block_sizes": [
+              64,
+              64,
+              16
+            ],
+            "l2_groupings": [
+              4
+            ],
+            "num_stages": 3,
+            "num_warps": 2,
+            "pid_type": "flat"
+          }
+        },
+        {
+          "template": {
+            "block_sizes": [
+              128,
+              128,
+              32
+            ],
+            "l2_groupings": [
+              1
+            ],
+            "num_sm_multiplier": 1,
+            "num_stages": 1,
+            "num_warps": 8,
+            "pid_type": "persistent_blocked"
+          }
+        }
+      ]
+    },
+    {
+      "kernel_class": "matmul_fp4",
+      "shape_bucket": {
+        "aspect": "skinny_m",
+        "dtype": "fp16_bf16",
+        "k_bin": "<=4096",
+        "m_bin": "<=128",
+        "n_bin": "<=4096"
+      },
+      "match_exact_only": true,
+      "source": {
+        "source_measurement": "20260509_q2_llmseeded",
+        "source_n_archive_shapes": 1,
+        "live_validation_workloads": [
+          "FP4_011"
+        ]
+      },
+      "validation": {
+        "q5_exp1_seed_over_baseline_geo": 0.403,
+        "q5_repeat_range": [
+          0.403,
+          0.403
+        ],
+        "q5_n_pairs": 3,
+        "q6_exp2_seed_over_baseline_geo": 0.728,
+        "q6_repeat_range": [
+          0.686,
+          0.787
+        ],
+        "q6_n_pairs": 3
+      },
+      "templates": [
+        {
+          "template": {
+            "block_sizes": [
+              64,
+              64,
+              16
+            ],
+            "l2_groupings": [
+              1
+            ],
+            "num_stages": 3,
+            "num_warps": 2,
+            "pid_type": "flat"
+          }
+        }
+      ]
+    },
+    {
+      "kernel_class": "matmul_fp4",
+      "shape_bucket": {
+        "aspect": "balanced",
+        "dtype": "fp16_bf16",
+        "k_bin": "<=512",
+        "m_bin": "<=512",
+        "n_bin": "<=512"
+      },
+      "match_exact_only": true,
+      "source": {
+        "source_measurement": "20260509_q2_llmseeded",
+        "source_n_archive_shapes": 2,
+        "live_validation_workloads": [
+          "FP4_002"
+        ]
+      },
+      "validation": {
+        "q5_exp1_seed_over_baseline_geo": 0.52,
+        "q5_repeat_range": [
+          0.52,
+          0.52
+        ],
+        "q5_n_pairs": 3,
+        "q6_exp2_seed_over_baseline_geo": 0.793,
+        "q6_repeat_range": [
+          0.793,
+          0.793
+        ],
+        "q6_n_pairs": 3
+      },
+      "templates": [
+        {
+          "template": {
+            "block_sizes": [
+              64,
+              64,
+              16
+            ],
+            "l2_groupings": [
+              1
+            ],
+            "num_stages": 1,
+            "num_warps": 8,
+            "pid_type": "flat"
+          }
+        },
+        {
+          "template": {
+            "block_sizes": [
+              128,
+              128,
+              16
+            ],
+            "l2_groupings": [
+              1
+            ],
+            "num_stages": 1,
+            "num_warps": 8,
+            "pid_type": "flat"
+          }
+        }
+      ]
+    },
+    {
+      "kernel_class": "matmul_fp4",
+      "shape_bucket": {
+        "aspect": "balanced",
+        "dtype": "fp16_bf16",
+        "k_bin": "<=256",
+        "m_bin": "<=256",
+        "n_bin": "<=256"
+      },
+      "match_exact_only": true,
+      "source": {
+        "source_measurement": "20260509_q2_llmseeded",
+        "source_n_archive_shapes": 1,
+        "live_validation_workloads": [
+          "FP4_001"
+        ]
+      },
+      "validation": {
+        "q5_exp1_seed_over_baseline_geo": 0.648,
+        "q5_repeat_range": [
+          0.647,
+          0.649
+        ],
+        "q5_n_pairs": 3,
+        "q6_exp2_seed_over_baseline_geo": 0.807,
+        "q6_repeat_range": [
+          0.732,
+          0.849
+        ],
+        "q6_n_pairs": 3
+      },
+      "templates": [
+        {
+          "template": {
+            "block_sizes": [
+              128,
+              32,
+              16
+            ],
+            "l2_groupings": [
+              1
+            ],
+            "num_sm_multiplier": 1,
+            "num_stages": 3,
+            "num_warps": 4,
+            "pid_type": "persistent_blocked"
+          }
+        }
+      ]
+    },
+    {
+      "kernel_class": "matmul_int16",
+      "shape_bucket": {
+        "aspect": "skinny_m",
+        "dtype": "fp16_bf16",
+        "k_bin": "<=4096",
+        "m_bin": "<=1024",
+        "n_bin": "<=4096"
+      },
+      "match_exact_only": true,
+      "source": {
+        "source_measurement": "20260509_q2_llmseeded",
+        "source_n_archive_shapes": 1,
+        "live_validation_workloads": [
+          "I16_010"
+        ]
+      },
+      "validation": {
+        "q5_exp1_seed_over_baseline_geo": 0.058,
+        "q5_repeat_range": [
+          0.058,
+          0.058
+        ],
+        "q5_n_pairs": 3,
+        "q6_exp2_seed_over_baseline_geo": 0.813,
+        "q6_repeat_range": [
+          0.813,
+          0.813
+        ],
+        "q6_n_pairs": 3
+      },
+      "templates": [
+        {
+          "template": {
+            "block_sizes": [
+              256,
+              128,
+              64
+            ],
+            "l2_groupings": [
+              8
+            ],
+            "num_sm_multiplier": 1,
+            "num_stages": 3,
+            "num_warps": 8,
+            "pid_type": "persistent_blocked"
+          }
+        }
+      ]
+    },
+    {
+      "kernel_class": "matmul_int16",
+      "shape_bucket": {
+        "aspect": "balanced",
+        "dtype": "fp16_bf16",
+        "k_bin": "<=4096",
+        "m_bin": "<=4096",
+        "n_bin": "<=4096"
+      },
+      "match_exact_only": true,
+      "source": {
+        "source_measurement": "20260509_q2_llmseeded",
+        "source_n_archive_shapes": 5,
+        "live_validation_workloads": [
+          "I16_004",
+          "I16_005",
+          "I16_006",
+          "I16_007",
+          "I16_008"
+        ]
+      },
+      "validation": {
+        "q5_exp1_seed_over_baseline_geo": 0.069,
+        "q5_repeat_range": [
+          0.044,
+          0.171
+        ],
+        "q5_n_pairs": 15,
+        "q6_exp2_seed_over_baseline_geo": 0.847,
+        "q6_repeat_range": [
+          0.694,
+          1.001
+        ],
+        "q6_n_pairs": 15
+      },
+      "templates": [
+        {
+          "template": {
+            "block_sizes": [
+              256,
+              128,
+              64
+            ],
+            "l2_groupings": [
+              1
+            ],
+            "num_stages": 3,
+            "num_warps": 4,
+            "pid_type": "flat"
+          }
+        },
+        {
+          "template": {
+            "block_sizes": [
+              128,
+              128,
+              64
+            ],
+            "l2_groupings": [
+              4
+            ],
+            "num_sm_multiplier": 1,
+            "num_stages": 4,
+            "num_warps": 8,
+            "pid_type": "persistent_blocked"
+          }
+        },
+        {
+          "template": {
+            "block_sizes": [
+              256,
+              256,
+              64
+            ],
+            "l2_groupings": [
+              1
+            ],
+            "num_stages": 3,
+            "num_warps": 4,
+            "pid_type": "flat"
+          }
+        }
+      ]
+    },
+    {
+      "kernel_class": "matmul_int16",
+      "shape_bucket": {
+        "aspect": "balanced",
+        "dtype": "fp16_bf16",
+        "k_bin": "<=1024",
+        "m_bin": "<=1024",
+        "n_bin": "<=1024"
+      },
+      "match_exact_only": true,
+      "source": {
+        "source_measurement": "20260509_q2_llmseeded",
+        "source_n_archive_shapes": 2,
+        "live_validation_workloads": [
+          "I16_003"
+        ]
+      },
+      "validation": {
+        "q5_exp1_seed_over_baseline_geo": 0.187,
+        "q5_repeat_range": [
+          0.187,
+          0.187
+        ],
+        "q5_n_pairs": 3,
+        "q6_exp2_seed_over_baseline_geo": 0.962,
+        "q6_repeat_range": [
+          0.895,
+          0.998
+        ],
+        "q6_n_pairs": 3
+      },
+      "templates": [
+        {
+          "template": {
+            "block_sizes": [
+              128,
+              64,
+              64
+            ],
+            "l2_groupings": [
+              4
+            ],
+            "num_stages": 3,
+            "num_warps": 8,
+            "pid_type": "flat"
+          }
+        },
+        {
+          "template": {
+            "block_sizes": [
+              128,
+              32,
+              128
+            ],
+            "l2_groupings": [
+              1
+            ],
+            "num_sm_multiplier": 1,
+            "num_stages": 4,
+            "num_warps": 8,
+            "pid_type": "persistent_interleaved"
+          }
+        }
+      ]
+    },
+    {
+      "kernel_class": "matmul_int16",
+      "shape_bucket": {
+        "aspect": "skinny_m",
+        "dtype": "fp16_bf16",
+        "k_bin": "<=4096",
+        "m_bin": "<=128",
+        "n_bin": "<=4096"
+      },
+      "match_exact_only": true,
+      "source": {
+        "source_measurement": "20260509_q2_llmseeded",
+        "source_n_archive_shapes": 1,
+        "live_validation_workloads": [
+          "I16_011"
+        ]
+      },
+      "validation": {
+        "q5_exp1_seed_over_baseline_geo": 0.2,
+        "q5_repeat_range": [
+          0.2,
+          0.2
+        ],
+        "q5_n_pairs": 3,
+        "q6_exp2_seed_over_baseline_geo": 0.669,
+        "q6_repeat_range": [
+          0.587,
+          0.81
+        ],
+        "q6_n_pairs": 3
+      },
+      "templates": [
+        {
+          "template": {
+            "block_sizes": [
+              64,
+              32,
+              128
+            ],
+            "l2_groupings": [
+              1
+            ],
+            "num_stages": 4,
+            "num_warps": 8,
+            "pid_type": "flat"
+          }
+        }
+      ]
+    },
+    {
+      "kernel_class": "matmul_int16",
+      "shape_bucket": {
+        "aspect": "skinny_n",
+        "dtype": "fp16_bf16",
+        "k_bin": "<=4096",
+        "m_bin": "<=4096",
+        "n_bin": "<=128"
+      },
+      "match_exact_only": true,
+      "source": {
+        "source_measurement": "20260509_q2_llmseeded",
+        "source_n_archive_shapes": 2,
+        "live_validation_workloads": [
+          "I16_012"
+        ]
+      },
+      "validation": {
+        "q5_exp1_seed_over_baseline_geo": 0.264,
+        "q5_repeat_range": [
+          0.264,
+          0.264
+        ],
+        "q5_n_pairs": 3,
+        "q6_exp2_seed_over_baseline_geo": 0.912,
+        "q6_repeat_range": [
+          0.703,
+          1.239
+        ],
+        "q6_n_pairs": 3
+      },
+      "templates": [
+        {
+          "template": {
+            "block_sizes": [
+              128,
+              32,
+              128
+            ],
+            "l2_groupings": [
+              1
+            ],
+            "num_stages": 4,
+            "num_warps": 2,
+            "pid_type": "flat"
+          }
+        },
+        {
+          "template": {
+            "block_sizes": [
+              64,
+              32,
+              256
+            ],
+            "l2_groupings": [
+              16
+            ],
+            "num_stages": 3,
+            "num_warps": 8,
+            "pid_type": "flat"
+          }
+        }
+      ]
+    },
+    {
+      "kernel_class": "matmul_int16",
+      "shape_bucket": {
+        "aspect": "balanced",
+        "dtype": "fp16_bf16",
+        "k_bin": "<=512",
+        "m_bin": "<=512",
+        "n_bin": "<=512"
+      },
+      "match_exact_only": true,
+      "source": {
+        "source_measurement": "20260509_q2_llmseeded",
+        "source_n_archive_shapes": 2,
+        "live_validation_workloads": [
+          "I16_002"
+        ]
+      },
+      "validation": {
+        "q5_exp1_seed_over_baseline_geo": 0.36,
+        "q5_repeat_range": [
+          0.36,
+          0.36
+        ],
+        "q5_n_pairs": 3,
+        "q6_exp2_seed_over_baseline_geo": 0.693,
+        "q6_repeat_range": [
+          0.692,
+          0.693
+        ],
+        "q6_n_pairs": 3
+      },
+      "templates": [
+        {
+          "template": {
+            "block_sizes": [
+              32,
+              32,
+              128
+            ],
+            "l2_groupings": [
+              1
+            ],
+            "num_sm_multiplier": 1,
+            "num_stages": 3,
+            "num_warps": 8,
+            "pid_type": "persistent_blocked"
+          }
+        },
+        {
+          "template": {
+            "block_sizes": [
+              32,
+              64,
+              128
+            ],
+            "l2_groupings": [
+              1
+            ],
+            "num_stages": 4,
+            "num_warps": 4,
+            "pid_type": "flat"
+          }
+        }
+      ]
+    },
+    {
+      "kernel_class": "matmul_int16",
+      "shape_bucket": {
+        "aspect": "balanced",
+        "dtype": "fp16_bf16",
+        "k_bin": "<=256",
+        "m_bin": "<=256",
+        "n_bin": "<=256"
+      },
+      "match_exact_only": true,
+      "source": {
+        "source_measurement": "20260509_q2_llmseeded",
+        "source_n_archive_shapes": 1,
+        "live_validation_workloads": [
+          "I16_001"
+        ]
+      },
+      "validation": {
+        "q5_exp1_seed_over_baseline_geo": 0.474,
+        "q5_repeat_range": [
+          0.472,
+          0.475
+        ],
+        "q5_n_pairs": 3,
+        "q6_exp2_seed_over_baseline_geo": 0.686,
+        "q6_repeat_range": [
+          0.64,
+          0.782
+        ],
+        "q6_n_pairs": 3
+      },
+      "templates": [
+        {
+          "template": {
+            "block_sizes": [
+              16,
+              32,
+              256
+            ],
+            "l2_groupings": [
+              2
+            ],
+            "num_sm_multiplier": 1,
+            "num_stages": 1,
+            "num_warps": 8,
+            "pid_type": "persistent_blocked"
+          }
+        }
+      ]
+    },
+    {
+      "kernel_class": "matmul_int4",
+      "shape_bucket": {
+        "aspect": "balanced",
+        "dtype": "fp16_bf16",
+        "k_bin": "<=4096",
+        "m_bin": "<=4096",
+        "n_bin": "<=4096"
+      },
+      "match_exact_only": true,
+      "source": {
+        "source_measurement": "20260509_q2_llmseeded",
+        "source_n_archive_shapes": 5,
+        "live_validation_workloads": [
+          "I4_004",
+          "I4_005",
+          "I4_006",
+          "I4_007",
+          "I4_008"
+        ]
+      },
+      "validation": {
+        "q5_exp1_seed_over_baseline_geo": 0.065,
+        "q5_repeat_range": [
+          0.052,
+          0.098
+        ],
+        "q5_n_pairs": 15,
+        "q6_exp2_seed_over_baseline_geo": 0.391,
+        "q6_repeat_range": [
+          0.284,
+          0.577
+        ],
+        "q6_n_pairs": 15
+      },
+      "templates": [
+        {
+          "template": {
+            "block_sizes": [
+              16,
+              128,
+              128
+            ],
+            "l2_groupings": [
+              2
+            ],
+            "num_stages": 6,
+            "num_warps": 4,
+            "pid_type": "flat"
+          }
+        },
+        {
+          "template": {
+            "block_sizes": [
+              16,
+              128,
+              128
+            ],
+            "l2_groupings": [
+              2
+            ],
+            "num_stages": 3,
+            "num_warps": 4,
+            "pid_type": "flat"
+          }
+        },
+        {
+          "template": {
+            "block_sizes": [
+              16,
+              128,
+              256
+            ],
+            "l2_groupings": [
+              1
+            ],
+            "num_stages": 8,
+            "num_warps": 8,
+            "pid_type": "flat"
+          }
+        }
+      ]
+    },
+    {
+      "kernel_class": "matmul_int4",
+      "shape_bucket": {
+        "aspect": "skinny_m",
+        "dtype": "fp16_bf16",
+        "k_bin": "<=4096",
+        "m_bin": "<=1024",
+        "n_bin": "<=4096"
+      },
+      "match_exact_only": true,
+      "source": {
+        "source_measurement": "20260509_q2_llmseeded",
+        "source_n_archive_shapes": 1,
+        "live_validation_workloads": [
+          "I4_010"
+        ]
+      },
+      "validation": {
+        "q5_exp1_seed_over_baseline_geo": 0.116,
+        "q5_repeat_range": [
+          0.116,
+          0.116
+        ],
+        "q5_n_pairs": 3,
+        "q6_exp2_seed_over_baseline_geo": 0.66,
+        "q6_repeat_range": [
+          0.573,
+          0.758
+        ],
+        "q6_n_pairs": 3
+      },
+      "templates": [
+        {
+          "template": {
+            "block_sizes": [
+              16,
+              256,
+              128
+            ],
+            "l2_groupings": [
+              1
+            ],
+            "num_stages": 2,
+            "num_warps": 8,
+            "pid_type": "flat"
+          }
+        }
+      ]
+    },
+    {
+      "kernel_class": "matmul_int4",
+      "shape_bucket": {
+        "aspect": "skinny_n",
+        "dtype": "fp16_bf16",
+        "k_bin": "<=4096",
+        "m_bin": "<=4096",
+        "n_bin": "<=128"
+      },
+      "match_exact_only": true,
+      "source": {
+        "source_measurement": "20260509_q2_llmseeded",
+        "source_n_archive_shapes": 2,
+        "live_validation_workloads": [
+          "I4_012"
+        ]
+      },
+      "validation": {
+        "q5_exp1_seed_over_baseline_geo": 0.232,
+        "q5_repeat_range": [
+          0.232,
+          0.232
+        ],
+        "q5_n_pairs": 3,
+        "q6_exp2_seed_over_baseline_geo": 0.964,
+        "q6_repeat_range": [
+          0.947,
+          0.972
+        ],
+        "q6_n_pairs": 3
+      },
+      "templates": [
+        {
+          "template": {
+            "block_sizes": [
+              64,
+              64,
+              16
+            ],
+            "l2_groupings": [
+              1
+            ],
+            "num_stages": 3,
+            "num_warps": 2,
+            "pid_type": "flat"
+          }
+        },
+        {
+          "template": {
+            "block_sizes": [
+              64,
+              64,
+              32
+            ],
+            "l2_groupings": [
+              1
+            ],
+            "num_stages": 3,
+            "num_warps": 2,
+            "pid_type": "flat"
+          }
+        }
+      ]
+    },
+    {
+      "kernel_class": "matmul_int4",
+      "shape_bucket": {
+        "aspect": "balanced",
+        "dtype": "fp16_bf16",
+        "k_bin": "<=1024",
+        "m_bin": "<=1024",
+        "n_bin": "<=1024"
+      },
+      "match_exact_only": true,
+      "source": {
+        "source_measurement": "20260509_q2_llmseeded",
+        "source_n_archive_shapes": 2,
+        "live_validation_workloads": [
+          "I4_003"
+        ]
+      },
+      "validation": {
+        "q5_exp1_seed_over_baseline_geo": 0.282,
+        "q5_repeat_range": [
+          0.281,
+          0.284
+        ],
+        "q5_n_pairs": 3,
+        "q6_exp2_seed_over_baseline_geo": 0.958,
+        "q6_repeat_range": [
+          0.744,
+          1.181
+        ],
+        "q6_n_pairs": 3
+      },
+      "templates": [
+        {
+          "template": {
+            "block_sizes": [
+              16,
+              128,
+              64
+            ],
+            "l2_groupings": [
+              1
+            ],
+            "num_stages": 3,
+            "num_warps": 4,
+            "pid_type": "flat"
+          }
+        },
+        {
+          "template": {
+            "block_sizes": [
+              64,
+              64,
+              64
+            ],
+            "l2_groupings": [
+              16
+            ],
+            "num_sm_multiplier": 1,
+            "num_stages": 3,
+            "num_warps": 8,
+            "pid_type": "persistent_interleaved"
+          }
+        }
+      ]
+    },
+    {
+      "kernel_class": "matmul_int4",
+      "shape_bucket": {
+        "aspect": "skinny_m",
+        "dtype": "fp16_bf16",
+        "k_bin": "<=4096",
+        "m_bin": "<=128",
+        "n_bin": "<=4096"
+      },
+      "match_exact_only": true,
+      "source": {
+        "source_measurement": "20260509_q2_llmseeded",
+        "source_n_archive_shapes": 1,
+        "live_validation_workloads": [
+          "I4_011"
+        ]
+      },
+      "validation": {
+        "q5_exp1_seed_over_baseline_geo": 0.367,
+        "q5_repeat_range": [
+          0.367,
+          0.367
+        ],
+        "q5_n_pairs": 3,
+        "q6_exp2_seed_over_baseline_geo": 0.826,
+        "q6_repeat_range": [
+          0.645,
+          0.935
+        ],
+        "q6_n_pairs": 3
+      },
+      "templates": [
+        {
+          "template": {
+            "block_sizes": [
+              128,
+              64,
+              32
+            ],
+            "l2_groupings": [
+              1
+            ],
+            "num_stages": 3,
+            "num_warps": 8,
+            "pid_type": "flat"
+          }
+        }
+      ]
+    },
+    {
+      "kernel_class": "matmul_int4",
+      "shape_bucket": {
+        "aspect": "balanced",
+        "dtype": "fp16_bf16",
+        "k_bin": "<=256",
+        "m_bin": "<=256",
+        "n_bin": "<=256"
+      },
+      "match_exact_only": true,
+      "source": {
+        "source_measurement": "20260509_q2_llmseeded",
+        "source_n_archive_shapes": 1,
+        "live_validation_workloads": [
+          "I4_001"
+        ]
+      },
+      "validation": {
+        "q5_exp1_seed_over_baseline_geo": 0.601,
+        "q5_repeat_range": [
+          0.601,
+          0.601
+        ],
+        "q5_n_pairs": 3,
+        "q6_exp2_seed_over_baseline_geo": 0.819,
+        "q6_repeat_range": [
+          0.819,
+          0.819
+        ],
+        "q6_n_pairs": 3
+      },
+      "templates": [
+        {
+          "template": {
+            "block_sizes": [
+              128,
+              32,
+              16
+            ],
+            "l2_groupings": [
+              1
+            ],
+            "num_sm_multiplier": 1,
+            "num_stages": 2,
+            "num_warps": 4,
+            "pid_type": "persistent_interleaved"
+          }
+        }
+      ]
+    },
+    {
+      "kernel_class": "matmul_int4",
+      "shape_bucket": {
+        "aspect": "balanced",
+        "dtype": "fp16_bf16",
+        "k_bin": "<=512",
+        "m_bin": "<=512",
+        "n_bin": "<=512"
+      },
+      "match_exact_only": true,
+      "source": {
+        "source_measurement": "20260509_q2_llmseeded",
+        "source_n_archive_shapes": 2,
+        "live_validation_workloads": [
+          "I4_002"
+        ]
+      },
+      "validation": {
+        "q5_exp1_seed_over_baseline_geo": 0.629,
+        "q5_repeat_range": [
+          0.628,
+          0.63
+        ],
+        "q5_n_pairs": 3,
+        "q6_exp2_seed_over_baseline_geo": 1.001,
+        "q6_repeat_range": [
+          1.0,
+          1.002
+        ],
+        "q6_n_pairs": 3
+      },
+      "templates": [
+        {
+          "template": {
+            "block_sizes": [
+              64,
+              32,
+              32
+            ],
+            "l2_groupings": [
+              1
+            ],
+            "num_sm_multiplier": 1,
+            "num_stages": 3,
+            "num_warps": 4,
+            "pid_type": "persistent_interleaved"
+          }
+        },
+        {
+          "template": {
+            "block_sizes": [
+              32,
+              32,
+              32
+            ],
+            "l2_groupings": [
+              1
+            ],
+            "num_stages": 3,
+            "num_warps": 2,
+            "pid_type": "flat"
+          }
+        }
+      ]
     }
-  ]
+  ],
+  "fallbacks": {
+    "matmul_int4": {
+      "small_m": {
+        "template": {
+          "atomic_indexing": [],
+          "block_sizes": [
+            128,
+            16,
+            32
+          ],
+          "indexing": [
+            "pointer",
+            "pointer",
+            "pointer"
+          ],
+          "l2_groupings": [
+            4
+          ],
+          "load_eviction_policies": [
+            "last",
+            ""
+          ],
+          "loop_orders": [
+            [
+              0,
+              1
+            ]
+          ],
+          "num_stages": 5,
+          "num_warps": 4,
+          "pid_type": "flat",
+          "range_flattens": [
+            null,
+            null
+          ],
+          "range_multi_buffers": [
+            null,
+            null
+          ],
+          "range_num_stages": [
+            0,
+            0
+          ],
+          "range_unroll_factors": [
+            0,
+            0
+          ],
+          "range_warp_specializes": [
+            null,
+            null
+          ]
+        },
+        "source": {
+          "archive_shape": {
+            "M": 16,
+            "K": 4096,
+            "N": 4096
+          },
+          "archive_perf_ms": 0.027648000046610832,
+          "n_archive_shapes": 9
+        }
+      },
+      "balanced": {
+        "template": {
+          "atomic_indexing": [],
+          "block_sizes": [
+            64,
+            128,
+            64
+          ],
+          "indexing": [
+            "tensor_descriptor",
+            "pointer",
+            "tensor_descriptor"
+          ],
+          "l2_groupings": [
+            1
+          ],
+          "load_eviction_policies": [
+            "",
+            ""
+          ],
+          "loop_orders": [
+            [
+              0,
+              1
+            ]
+          ],
+          "num_stages": 3,
+          "num_warps": 8,
+          "pid_type": "flat",
+          "range_flattens": [
+            null,
+            null
+          ],
+          "range_multi_buffers": [
+            null,
+            false
+          ],
+          "range_num_stages": [
+            0,
+            2
+          ],
+          "range_unroll_factors": [
+            0,
+            0
+          ],
+          "range_warp_specializes": [
+            null,
+            null
+          ]
+        },
+        "source": {
+          "archive_shape": {
+            "M": 1024,
+            "K": 1024,
+            "N": 1024
+          },
+          "archive_perf_ms": 0.02969600073993206,
+          "n_archive_shapes": 7
+        }
+      },
+      "small_n": {
+        "template": {
+          "atomic_indexing": [],
+          "block_sizes": [
+            64,
+            64,
+            16
+          ],
+          "indexing": [
+            "pointer",
+            "tensor_descriptor",
+            "pointer"
+          ],
+          "l2_groupings": [
+            1
+          ],
+          "load_eviction_policies": [
+            "",
+            ""
+          ],
+          "loop_orders": [
+            [
+              0,
+              1
+            ]
+          ],
+          "num_stages": 3,
+          "num_warps": 2,
+          "pid_type": "flat",
+          "range_flattens": [
+            null,
+            null
+          ],
+          "range_multi_buffers": [
+            null,
+            null
+          ],
+          "range_num_stages": [
+            0,
+            0
+          ],
+          "range_unroll_factors": [
+            0,
+            3
+          ],
+          "range_warp_specializes": [
+            null,
+            null
+          ]
+        },
+        "source": {
+          "archive_shape": {
+            "M": 4096,
+            "K": 4096,
+            "N": 32
+          },
+          "archive_perf_ms": 0.03379200026392937,
+          "n_archive_shapes": 8
+        }
+      },
+      "small_k": {
+        "template": {
+          "atomic_indexing": [],
+          "block_sizes": [
+            16,
+            128,
+            256
+          ],
+          "indexing": [
+            "pointer",
+            "tensor_descriptor",
+            "tensor_descriptor"
+          ],
+          "l2_groupings": [
+            1
+          ],
+          "load_eviction_policies": [
+            "",
+            ""
+          ],
+          "loop_orders": [
+            [
+              1,
+              0
+            ]
+          ],
+          "num_stages": 4,
+          "num_warps": 8,
+          "pid_type": "flat",
+          "range_flattens": [
+            null,
+            null
+          ],
+          "range_multi_buffers": [
+            null,
+            true
+          ],
+          "range_num_stages": [
+            0,
+            0
+          ],
+          "range_unroll_factors": [
+            0,
+            2
+          ],
+          "range_warp_specializes": [
+            null,
+            null
+          ]
+        },
+        "source": {
+          "archive_shape": {
+            "M": 2048,
+            "K": 256,
+            "N": 2048
+          },
+          "archive_perf_ms": 0.01945599913597107,
+          "n_archive_shapes": 6
+        }
+      },
+      "rect": {
+        "template": {
+          "atomic_indexing": [],
+          "block_sizes": [
+            16,
+            128,
+            128
+          ],
+          "indexing": [
+            "pointer",
+            "tensor_descriptor",
+            "tensor_descriptor"
+          ],
+          "l2_groupings": [
+            2
+          ],
+          "load_eviction_policies": [
+            "",
+            "first"
+          ],
+          "loop_orders": [
+            [
+              0,
+              1
+            ]
+          ],
+          "num_stages": 3,
+          "num_warps": 4,
+          "pid_type": "flat",
+          "range_flattens": [
+            null,
+            null
+          ],
+          "range_multi_buffers": [
+            null,
+            null
+          ],
+          "range_num_stages": [
+            0,
+            0
+          ],
+          "range_unroll_factors": [
+            0,
+            3
+          ],
+          "range_warp_specializes": [
+            null,
+            null
+          ]
+        },
+        "source": {
+          "archive_shape": {
+            "M": 1536,
+            "K": 3072,
+            "N": 1536
+          },
+          "archive_perf_ms": 0.07280000299215317,
+          "n_archive_shapes": 10
+        }
+      }
+    },
+    "matmul_int16": {
+      "small_m": {
+        "template": {
+          "atomic_indexing": [],
+          "block_sizes": [
+            64,
+            32,
+            256
+          ],
+          "indexing": [
+            "pointer",
+            "pointer",
+            "pointer"
+          ],
+          "l2_groupings": [
+            1
+          ],
+          "load_eviction_policies": [
+            "",
+            ""
+          ],
+          "loop_orders": [
+            [
+              0,
+              1
+            ]
+          ],
+          "num_stages": 3,
+          "num_warps": 8,
+          "pid_type": "flat",
+          "range_flattens": [
+            null,
+            false
+          ],
+          "range_multi_buffers": [
+            null,
+            null
+          ],
+          "range_num_stages": [
+            0,
+            0
+          ],
+          "range_unroll_factors": [
+            0,
+            0
+          ],
+          "range_warp_specializes": [
+            null,
+            null
+          ]
+        },
+        "source": {
+          "archive_shape": {
+            "M": 128,
+            "K": 2048,
+            "N": 2048
+          },
+          "archive_perf_ms": 0.01539199985563755,
+          "n_archive_shapes": 9
+        }
+      },
+      "balanced": {
+        "template": {
+          "atomic_indexing": [],
+          "block_sizes": [
+            128,
+            64,
+            64
+          ],
+          "indexing": [
+            "pointer",
+            "pointer",
+            "tensor_descriptor"
+          ],
+          "l2_groupings": [
+            4
+          ],
+          "load_eviction_policies": [
+            "",
+            ""
+          ],
+          "loop_orders": [
+            [
+              0,
+              1
+            ]
+          ],
+          "num_stages": 3,
+          "num_warps": 8,
+          "pid_type": "flat",
+          "range_flattens": [
+            null,
+            null
+          ],
+          "range_multi_buffers": [
+            null,
+            null
+          ],
+          "range_num_stages": [
+            0,
+            0
+          ],
+          "range_unroll_factors": [
+            0,
+            0
+          ],
+          "range_warp_specializes": [
+            null,
+            null
+          ]
+        },
+        "source": {
+          "archive_shape": {
+            "M": 1024,
+            "K": 1024,
+            "N": 1024
+          },
+          "archive_perf_ms": 0.015359999611973763,
+          "n_archive_shapes": 7
+        }
+      },
+      "small_n": {
+        "template": {
+          "atomic_indexing": [],
+          "block_sizes": [
+            128,
+            32,
+            128
+          ],
+          "indexing": [
+            "pointer",
+            "pointer",
+            "tensor_descriptor"
+          ],
+          "l2_groupings": [
+            2
+          ],
+          "load_eviction_policies": [
+            "last",
+            "first"
+          ],
+          "loop_orders": [
+            [
+              0,
+              1
+            ]
+          ],
+          "num_stages": 3,
+          "num_warps": 8,
+          "pid_type": "flat",
+          "range_flattens": [
+            null,
+            null
+          ],
+          "range_multi_buffers": [
+            null,
+            null
+          ],
+          "range_num_stages": [
+            0,
+            0
+          ],
+          "range_unroll_factors": [
+            0,
+            0
+          ],
+          "range_warp_specializes": [
+            null,
+            null
+          ]
+        },
+        "source": {
+          "archive_shape": {
+            "M": 2048,
+            "K": 2048,
+            "N": 256
+          },
+          "archive_perf_ms": 0.019392000511288643,
+          "n_archive_shapes": 8
+        }
+      },
+      "small_k": {
+        "template": {
+          "atomic_indexing": [],
+          "block_sizes": [
+            256,
+            128,
+            64
+          ],
+          "indexing": [
+            "pointer",
+            "pointer",
+            "tensor_descriptor"
+          ],
+          "l2_groupings": [
+            8
+          ],
+          "load_eviction_policies": [
+            "",
+            ""
+          ],
+          "loop_orders": [
+            [
+              0,
+              1
+            ]
+          ],
+          "maxnreg": 256,
+          "num_sm_multiplier": 1,
+          "num_stages": 3,
+          "num_warps": 8,
+          "pid_type": "persistent_blocked",
+          "range_flattens": [
+            null,
+            null
+          ],
+          "range_multi_buffers": [
+            null,
+            null
+          ],
+          "range_num_stages": [
+            0,
+            0
+          ],
+          "range_unroll_factors": [
+            0,
+            0
+          ],
+          "range_warp_specializes": [
+            null,
+            null
+          ]
+        },
+        "source": {
+          "archive_shape": {
+            "M": 2048,
+            "K": 256,
+            "N": 2048
+          },
+          "archive_perf_ms": 0.013279999606311321,
+          "n_archive_shapes": 6
+        }
+      },
+      "rect": {
+        "template": {
+          "atomic_indexing": [],
+          "block_sizes": [
+            256,
+            256,
+            64
+          ],
+          "indexing": [
+            "pointer",
+            "pointer",
+            "tensor_descriptor"
+          ],
+          "l2_groupings": [
+            8
+          ],
+          "load_eviction_policies": [
+            "last",
+            "last"
+          ],
+          "loop_orders": [
+            [
+              0,
+              1
+            ]
+          ],
+          "num_stages": 3,
+          "num_warps": 8,
+          "pid_type": "flat",
+          "range_flattens": [
+            null,
+            null
+          ],
+          "range_multi_buffers": [
+            null,
+            false
+          ],
+          "range_num_stages": [
+            0,
+            0
+          ],
+          "range_unroll_factors": [
+            0,
+            0
+          ],
+          "range_warp_specializes": [
+            null,
+            null
+          ]
+        },
+        "source": {
+          "archive_shape": {
+            "M": 4096,
+            "K": 512,
+            "N": 4096
+          },
+          "archive_perf_ms": 0.03788800165057182,
+          "n_archive_shapes": 10
+        }
+      }
+    },
+    "matmul_fp4": {
+      "small_m": {
+        "template": {
+          "atomic_indexing": [],
+          "block_sizes": [
+            64,
+            64,
+            16
+          ],
+          "indexing": [
+            "pointer",
+            "tensor_descriptor",
+            "tensor_descriptor"
+          ],
+          "l2_groupings": [
+            1
+          ],
+          "load_eviction_policies": [
+            "",
+            "first"
+          ],
+          "loop_orders": [
+            [
+              0,
+              1
+            ]
+          ],
+          "num_stages": 3,
+          "num_warps": 2,
+          "pid_type": "flat",
+          "range_flattens": [
+            null,
+            null
+          ],
+          "range_multi_buffers": [
+            null,
+            null
+          ],
+          "range_num_stages": [
+            0,
+            0
+          ],
+          "range_unroll_factors": [
+            0,
+            0
+          ],
+          "range_warp_specializes": [
+            null,
+            null
+          ]
+        },
+        "source": {
+          "archive_shape": {
+            "M": 128,
+            "K": 2048,
+            "N": 2048
+          },
+          "archive_perf_ms": 0.035840000957250595,
+          "n_archive_shapes": 9
+        }
+      },
+      "balanced": {
+        "template": {
+          "atomic_indexing": [],
+          "block_sizes": [
+            64,
+            128,
+            32
+          ],
+          "indexing": [
+            "pointer",
+            "pointer",
+            "tensor_descriptor"
+          ],
+          "l2_groupings": [
+            1
+          ],
+          "load_eviction_policies": [
+            "last",
+            ""
+          ],
+          "loop_orders": [
+            [
+              0,
+              1
+            ]
+          ],
+          "num_stages": 1,
+          "num_warps": 8,
+          "pid_type": "flat",
+          "range_flattens": [
+            null,
+            null
+          ],
+          "range_multi_buffers": [
+            null,
+            true
+          ],
+          "range_num_stages": [
+            0,
+            0
+          ],
+          "range_unroll_factors": [
+            0,
+            0
+          ],
+          "range_warp_specializes": [
+            null,
+            false
+          ]
+        },
+        "source": {
+          "archive_shape": {
+            "M": 1024,
+            "K": 1024,
+            "N": 1024
+          },
+          "archive_perf_ms": 0.035840000957250595,
+          "n_archive_shapes": 7
+        }
+      },
+      "small_n": {
+        "template": {
+          "atomic_indexing": [],
+          "block_sizes": [
+            64,
+            128,
+            16
+          ],
+          "indexing": [
+            "pointer",
+            "pointer",
+            "pointer"
+          ],
+          "l2_groupings": [
+            4
+          ],
+          "load_eviction_policies": [
+            "last",
+            "last"
+          ],
+          "loop_orders": [
+            [
+              0,
+              1
+            ]
+          ],
+          "num_stages": 3,
+          "num_warps": 8,
+          "pid_type": "flat",
+          "range_flattens": [
+            null,
+            null
+          ],
+          "range_multi_buffers": [
+            null,
+            null
+          ],
+          "range_num_stages": [
+            0,
+            1
+          ],
+          "range_unroll_factors": [
+            0,
+            0
+          ],
+          "range_warp_specializes": [
+            null,
+            null
+          ]
+        },
+        "source": {
+          "archive_shape": {
+            "M": 2048,
+            "K": 2048,
+            "N": 256
+          },
+          "archive_perf_ms": 0.04608000069856644,
+          "n_archive_shapes": 8
+        }
+      },
+      "small_k": {
+        "template": {
+          "atomic_indexing": [],
+          "block_sizes": [
+            8,
+            128,
+            128
+          ],
+          "indexing": [
+            "tensor_descriptor",
+            "tensor_descriptor",
+            "tensor_descriptor"
+          ],
+          "l2_groupings": [
+            1
+          ],
+          "load_eviction_policies": [
+            "",
+            "first"
+          ],
+          "loop_orders": [
+            [
+              0,
+              1
+            ]
+          ],
+          "num_stages": 3,
+          "num_warps": 4,
+          "pid_type": "flat",
+          "range_flattens": [
+            null,
+            null
+          ],
+          "range_multi_buffers": [
+            null,
+            null
+          ],
+          "range_num_stages": [
+            0,
+            0
+          ],
+          "range_unroll_factors": [
+            0,
+            1
+          ],
+          "range_warp_specializes": [
+            null,
+            null
+          ]
+        },
+        "source": {
+          "archive_shape": {
+            "M": 2048,
+            "K": 256,
+            "N": 2048
+          },
+          "archive_perf_ms": 0.025599999353289604,
+          "n_archive_shapes": 6
+        }
+      },
+      "rect": {
+        "template": {
+          "atomic_indexing": [],
+          "block_sizes": [
+            8,
+            256,
+            128
+          ],
+          "indexing": [
+            "tensor_descriptor",
+            "pointer",
+            "tensor_descriptor"
+          ],
+          "l2_groupings": [
+            16
+          ],
+          "load_eviction_policies": [
+            "",
+            ""
+          ],
+          "loop_orders": [
+            [
+              0,
+              1
+            ]
+          ],
+          "num_stages": 6,
+          "num_warps": 4,
+          "pid_type": "flat",
+          "range_flattens": [
+            null,
+            false
+          ],
+          "range_multi_buffers": [
+            null,
+            true
+          ],
+          "range_num_stages": [
+            0,
+            4
+          ],
+          "range_unroll_factors": [
+            0,
+            3
+          ],
+          "range_warp_specializes": [
+            null,
+            false
+          ]
+        },
+        "source": {
+          "archive_shape": {
+            "M": 2048,
+            "K": 1024,
+            "N": 4096
+          },
+          "archive_perf_ms": 0.11363200098276138,
+          "n_archive_shapes": 10
+        }
+      }
+    }
+  }
 }

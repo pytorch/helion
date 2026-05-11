@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING
 
 from .config_validation import validate_sparse_config_shape
 from .workload import detect_workload_traits
+from .workload import kernel_source_text
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -238,6 +239,48 @@ def _is_fp8_matmul(args: Sequence[object]) -> bool:
     return any("float8" in dtype for dtype in _tensor_dtypes(args)[:2])
 
 
+_QUANTIZED_KERNEL_FINGERPRINTS: tuple[tuple[str, frozenset[str]], ...] = (
+    ("matmul_fp4", frozenset({"e2m1", "fp4", "nvfp4"})),
+    ("matmul_int4", frozenset({"int4", "pack_int4", "unpack_int4"})),
+)
+
+
+def _infer_quantized_matmul_class(
+    kernel: _AutotunableKernel | None,
+    args: Sequence[object],
+) -> str | None:
+    """Return a quantized-matmul sub-class if the kernel is one of int4/int16/fp4.
+
+    int16 is unambiguous from arg1 dtype. int4 vs fp4 share the packed-int8
+    signature, so we fall back to scanning the kernel source for the
+    distinguishing term. Order matters: check fp4 before int4 (the fp4 source
+    can mention "int4" only in comments that refer to nibbles).
+    """
+    dtypes = _tensor_dtypes(args)
+    if len(dtypes) < 2:
+        return None
+    if "int16" in dtypes[1]:
+        return "matmul_int16"
+    if "int8" not in dtypes[1]:
+        return None
+    # Packed-int8 shape signature: arg1 dim0 is K//2 of arg0 dim1.
+    shapes = _tensor_shapes(args)
+    if len(shapes) < 2 or len(shapes[0]) < 2 or len(shapes[1]) < 2:
+        return None
+    if shapes[0][-1] != shapes[1][-2] * 2:
+        return None
+    if kernel is None:
+        return None
+    try:
+        source = kernel_source_text(kernel).lower()
+    except Exception:  # noqa: BLE001
+        return None
+    for class_name, markers in _QUANTIZED_KERNEL_FINGERPRINTS:
+        if any(marker in source for marker in markers):
+            return class_name
+    return None
+
+
 def _matmul_shape(shapes: Sequence[tuple[int, ...]]) -> tuple[int, int, int] | None:
     if len(shapes) < 2 or len(shapes[0]) < 2 or len(shapes[1]) < 2:
         return None
@@ -331,8 +374,15 @@ def classify_runtime_kernel(
     *,
     workload_traits: frozenset[str],
     config_spec: ConfigSpec,
+    kernel: _AutotunableKernel | None = None,
 ) -> str | None:
-    """Classify the runtime kernel into the CSV-derived workload taxonomy."""
+    """Classify the runtime kernel into the CSV-derived workload taxonomy.
+
+    ``kernel`` is optional and used only for fingerprinting specific quantized
+    matmul variants (int4 vs fp4, which are otherwise indistinguishable from
+    arg shapes/dtypes alone). Classification works without it for every class
+    except ``matmul_int4``/``matmul_fp4``, which will fall back to ``matmul``.
+    """
     block_rank = _default_block_rank(config_spec)
     shapes = _tensor_shapes(args)
     if "attention_reduction" in workload_traits and block_rank == 3:
@@ -344,7 +394,24 @@ def classify_runtime_kernel(
             return "batched_matmul"
         return "grouped_matmul"
     if "matmul" in workload_traits and block_rank == 3:
-        return "matmul_fp8" if _is_fp8_matmul(args) else "matmul"
+        if _is_fp8_matmul(args):
+            return "matmul_fp8"
+        quantized = _infer_quantized_matmul_class(kernel, args)
+        if quantized is not None:
+            return quantized
+        return "matmul"
+    # Quantized matmuls (int4/fp4) don't call hl.dot directly — they do a
+    # manual outer-product + sum-reduction over unpacked weights — so they
+    # emit {"reduction", "sum_reduction"} instead of {"matmul"}. Classify by
+    # shape signature + source fingerprint.
+    if (
+        block_rank == 3
+        and "sum_reduction" in workload_traits
+        and "reduction" in workload_traits
+    ):
+        quantized = _infer_quantized_matmul_class(kernel, args)
+        if quantized is not None:
+            return quantized
     if _has_reduction(config_spec) and block_rank == 1:
         return _rank1_reduction_class(shapes, _tensor_dtypes(args), workload_traits)
     if (
@@ -377,7 +444,14 @@ def _shape_bucket_for_class(
         if q_seq != kv_seq:
             bucket["kv_seq_bin"] = _bin_le(kv_seq, [1024, 2048, 4096, 8192, 16384])
         return bucket
-    if kernel_class in {"matmul", "matmul_fp8", "grouped_matmul"}:
+    if kernel_class in {
+        "matmul",
+        "matmul_fp8",
+        "grouped_matmul",
+        "matmul_int4",
+        "matmul_int16",
+        "matmul_fp4",
+    }:
         matmul_shape = _matmul_shape(shapes)
         m, n, k = matmul_shape if matmul_shape is not None else (None, None, None)
         return {
@@ -401,6 +475,82 @@ def _shape_bucket_for_class(
             "numel_bin": _bin_le(numel, [4096, 65536, 1048576, 16777216, 134217728]),
         }
     return {"dtype": dtype_family}
+
+
+def _fallback_group_for_class(
+    kernel_class: str, args: Sequence[object]
+) -> str | None:
+    """Coarse shape-group label for fallback lookup.
+
+    Used only when exact-bucket rule lookup misses. The grouping is
+    deliberately much coarser than ``_shape_bucket_for_class`` —
+    enough partitions to capture the dominant config-shape
+    correlation (skinny axes, balanced-vs-rect), not fine enough
+    to need many archive shapes per group.
+
+    Returns None for kernel classes without a defined grouping. The
+    lookup will simply skip fallbacks in that case (safe default).
+    """
+    shapes = _tensor_shapes(args)
+    if kernel_class in {
+        "matmul",
+        "matmul_fp8",
+        "grouped_matmul",
+        "matmul_int4",
+        "matmul_int16",
+        "matmul_fp4",
+    }:
+        matmul_shape = _matmul_shape(shapes)
+        if matmul_shape is None:
+            return None
+        m, n, k = matmul_shape
+        if m is None or n is None or k is None:
+            return None
+        if m <= 256:
+            return "small_m"
+        if n <= 256:
+            return "small_n"
+        if k <= 256:
+            return "small_k"
+        dims = [m, n, k]
+        if max(dims) / max(1, min(dims)) < 2:
+            return "balanced"
+        return "rect"
+    if kernel_class.startswith("row_"):
+        rows, cols = _row_shape(shapes)
+        if rows is None or cols is None:
+            return None
+        if rows <= 512:
+            return "short"
+        if cols <= 1024:
+            return "narrow"
+        if cols >= 8192:
+            return "wide"
+        return "square"
+    if kernel_class == "elementwise":
+        numel = _numel(shapes[0]) if shapes else None
+        if numel is None:
+            return None
+        if numel <= 65536:
+            return "tiny"
+        if numel <= 1048576:
+            return "mid"
+        return "huge"
+    if kernel_class == "attention":
+        attention_shape = _attention_shape(shapes)
+        if attention_shape is None:
+            return None
+        batch_heads, q_seq, _kv_seq, head_dim = attention_shape
+        if q_seq is None or head_dim is None:
+            return None
+        if q_seq <= 1024:
+            return "short_seq"
+        if q_seq >= 8192:
+            return "long_seq"
+        if head_dim is not None and head_dim <= 64:
+            return "small_head"
+        return "mid_seq"
+    return None
 
 
 @functools.cache
@@ -430,16 +580,54 @@ def _find_rule(
     return _rules_by_key().get(f"{kernel_class}:{_stable_json(shape_bucket)}")
 
 
+@functools.cache
+def _fallbacks_by_class() -> dict[str, dict[str, dict[str, object]]]:
+    """Return the ``fallbacks`` map from the loaded JSON, or empty."""
+    data = _runtime_heuristics()
+    raw = data.get("fallbacks", {})
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, dict[str, dict[str, object]]] = {}
+    for kernel_class, group_map in raw.items():
+        if not isinstance(kernel_class, str) or not isinstance(group_map, dict):
+            continue
+        clean_groups: dict[str, dict[str, object]] = {}
+        for group, entry in group_map.items():
+            if isinstance(group, str) and isinstance(entry, dict):
+                clean_groups[group] = entry
+        if clean_groups:
+            out[kernel_class] = clean_groups
+    return out
+
+
+def _find_fallback(
+    kernel_class: str,
+    group: str | None,
+) -> dict[str, object] | None:
+    """Look up the fallback entry for a (kernel_class, group) pair.
+
+    Returns the raw entry (same shape as a rule's ``templates[i]``)
+    or None if no fallback is defined.
+    """
+    if group is None:
+        return None
+    if kernel_class in _disabled_kernel_classes():
+        return None
+    return _fallbacks_by_class().get(kernel_class, {}).get(group)
+
+
 def _matched_rule(
     args: Sequence[object],
     *,
     workload_traits: frozenset[str],
     config_spec: ConfigSpec,
+    kernel: _AutotunableKernel | None = None,
 ) -> tuple[str | None, dict[str, object], dict[str, object] | None]:
     kernel_class = classify_runtime_kernel(
         args,
         workload_traits=workload_traits,
         config_spec=config_spec,
+        kernel=kernel,
     )
     if kernel_class is None:
         return None, {}, None
@@ -483,19 +671,30 @@ def observed_heuristic_seed_configs(
     workload_traits: frozenset[str],
     config_spec: ConfigSpec,
     max_configs: int,
+    kernel: _AutotunableKernel | None = None,
 ) -> list[Config]:
     """Return valid CSV-derived seed configs for this config space."""
     if max_configs <= 0 or not observed_heuristic_seeds_enabled():
         return []
 
-    _kernel_class, _shape_bucket, rule = _matched_rule(
+    kernel_class, _shape_bucket, rule = _matched_rule(
         args,
         workload_traits=workload_traits,
         config_spec=config_spec,
+        kernel=kernel,
     )
-    if rule is None:
+    templates: list[dict[str, object]]
+    if rule is not None:
+        templates = _selected_templates(rule)
+    elif kernel_class is not None:
+        # Exact-bucket lookup missed — try the per-kernel-class fallback.
+        group = _fallback_group_for_class(kernel_class, args)
+        fallback_entry = _find_fallback(kernel_class, group)
+        if fallback_entry is None:
+            return []
+        templates = [fallback_entry]
+    else:
         return []
-    templates = _selected_templates(rule)
 
     seeds: list[Config] = []
     seen: set[str] = set()
@@ -532,6 +731,7 @@ def observed_heuristic_seed_configs_for_kernel(
         workload_traits=detect_workload_traits(kernel, config_spec=config_spec),
         config_spec=config_spec,
         max_configs=max_configs,
+        kernel=kernel,
     )
 
 
