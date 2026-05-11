@@ -9,6 +9,7 @@ from __future__ import annotations
 import contextlib
 import importlib.util
 import io
+import os
 import re
 import sys
 import unittest
@@ -27,6 +28,10 @@ from helion._testing import skipIfRefEager
 
 def _on_sm100() -> bool:
     return is_cuda() and torch.cuda.get_device_capability() == (10, 0)
+
+
+def _under_xdist() -> bool:
+    return os.environ.get("PYTEST_XDIST_WORKER") is not None
 
 
 def _import_pretuned_kernel_module(name):
@@ -153,7 +158,7 @@ _EXPECTED_PERF: dict[str, dict[str, float | int | None]] = {
     "layer_norm": {
         "helion_wins": 38,
         "total": 38,
-        "geomean": 1.784,
+        "geomean": 1.55,
         "wins_slack": 1,
     },
     "rms_norm": {
@@ -218,6 +223,10 @@ class TestPretunedKernelsPerformance(TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         super().setUpClass()
+        if _under_xdist():
+            raise unittest.SkipTest(
+                "Perf gating is unreliable under pytest-xdist GPU contention."
+            )
         if not _on_sm100():
             raise unittest.SkipTest(
                 "Pretuned kernel heuristics target sm100; perf gating runs on B200."

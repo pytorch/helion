@@ -226,8 +226,30 @@ class TileStrategy:
             block_idx: self.fn.new_var(f"indices_{block_idx}", dce=True)
             for block_idx in block_ids
         }
+        # CuTe DSL preprocessor counter collision: the preprocessor's
+        # negative-step machinery (``_handle_negative_step`` in
+        # ``cutlass.base_dsl.ast_preprocessor.DSLPreprocessor``) emits
+        # ``offset_<counter>`` / ``start_<counter>`` / ``stop_<counter>`` /
+        # ``step_<counter>`` / ``isNegative_<counter>`` helpers at the enclosing
+        # scope of every for-loop whose step is not a positive Python literal.
+        # Helion's tile-offset names share the same ``offset_<n>`` namespace —
+        # Python's name-binding rule sees the late preprocessor assignment and
+        # treats the variable as local for the whole function body, turning
+        # earlier reads into ``UnboundLocalError``. The ``tile_`` prefix moves
+        # Helion's names out of the reserved CuTe DSL namespace. Of the five
+        # reserved suffixes, only ``offset_`` and ``step_`` are emitted by
+        # Helion (``offset_<bid>`` here; ``step_<n>`` via ``codegen.lift(...,
+        # prefix='step')`` in ``codegen_grid_loops`` / ``codegen_lane_loops``);
+        # both are renamed on cute. ``start_/stop_/isNegative_`` collisions are
+        # not currently emitted by Helion. Non-CuTe backends keep the
+        # historical short name to preserve existing goldens — this is a
+        # deliberate trade-off (see ``cute_plan.md`` §7.6.5.2 for the trade-off
+        # rationale; search "CuTe DSL preprocessor counter collision" for the
+        # diagnosis).
+        env = CompileEnvironment.current()
+        offset_prefix = "tile_offset" if env.backend.name == "cute" else "offset"
         self.offset_vars: dict[int, str] = {
-            block_idx: self.fn.new_var(f"offset_{block_idx}", dce=True)
+            block_idx: self.fn.new_var(f"{offset_prefix}_{block_idx}", dce=True)
             for block_idx in block_ids
         }
 
@@ -1492,7 +1514,11 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
 
             if step not in (None, 1):
                 step_ast = self._to_ast(step, to_dtype=dtype)
-                step_var = state.codegen.lift(step_ast, dce=True, prefix="step").id
+                # CuTe DSL preprocessor reserves ``step_<counter>`` (see comment
+                # in ``TileStrategy.__init__``) — rename our lifted step var to
+                # avoid the same UnboundLocalError that drove the offset rename.
+                step_prefix = "tile_step" if env.backend.name == "cute" else "step"
+                step_var = state.codegen.lift(step_ast, dce=True, prefix=step_prefix).id
                 block_size_var = "1"
                 state.add_statement(
                     f"{offset_var} = {begin_offset_expr}({pid_var}) * {step_var}"
@@ -2002,7 +2028,11 @@ class CuteNDTileStrategy(NDTileStrategy):
 
             if step not in (None, 1):
                 step_ast = self._to_ast(step, to_dtype=dtype)
-                step_var = state.codegen.lift(step_ast, dce=True, prefix="step").id
+                # CuTe DSL preprocessor reserves ``step_<counter>`` (see comment
+                # in ``TileStrategy.__init__``) — rename our lifted step var to
+                # avoid the same UnboundLocalError that drove the offset rename.
+                step_prefix = "tile_step" if env.backend.name == "cute" else "step"
+                step_var = state.codegen.lift(step_ast, dce=True, prefix=step_prefix).id
                 block_size_var = "1"
                 state.add_statement(
                     f"{offset_var} = {begin_offset_expr}({pid_var}) * {step_var}"

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import unittest
 from unittest.mock import patch
 
@@ -7,6 +8,13 @@ import torch
 
 import helion
 from helion import _compat
+from helion._compiler.cute.strategies import ROLE_LOCAL_MONOLITHIC_DEFAULT_WARP_SPEC
+from helion._compiler.cute.strategies import Tcgen05LayoutOverrides
+from helion._compiler.cute.strategies import Tcgen05LayoutStrategy
+from helion._compiler.cute.strategies import Tcgen05PersistenceModel
+from helion._compiler.cute.strategies import Tcgen05Strategy
+from helion._compiler.cute.strategies import Tcgen05WarpSpec
+from helion._compiler.cute.strategies import validate_tcgen05_strategy_invariants
 from helion._compiler.cute.tcgen05_constants import TCGEN05_ONE_CTA_MAX_BLOCK_M
 from helion._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
 from helion._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
@@ -18,6 +26,7 @@ from helion._testing import code_and_output
 from helion._testing import onlyBackends
 from helion._testing import patch_cute_mma_support
 from helion._testing import skipIfMTIA
+from helion.autotuner.config_generation import ConfigGeneration
 from helion.exc import InvalidConfig
 import helion.language as hl
 
@@ -73,6 +82,71 @@ _cute_two_matmuls_force_persistent_kernel = helion.kernel(
     backend="cute",
     autotune_force_persistent=True,
 )
+
+
+@helion.kernel(backend="cute")
+def _cute_strategy_matmul_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    m, k = x.size()
+    _, n = y.size()
+    out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+        out[tile_m, tile_n] = acc.to(x.dtype)
+    return out
+
+
+@helion.kernel(backend="cute", autotune_force_persistent=True)
+def _cute_strategy_matmul_force_persistent_kernel(
+    x: torch.Tensor, y: torch.Tensor
+) -> torch.Tensor:
+    m, k = x.size()
+    _, n = y.size()
+    out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+        out[tile_m, tile_n] = acc.to(x.dtype)
+    return out
+
+
+def _bind_cute_strategy_kernel():
+    """Shared bind helper for the G2-A strategy data-model tests.
+
+    The G2-A tests all need a cute_tcgen05-enabled ``config_spec`` with
+    the cluster_m=2 search arm exposed (otherwise the cluster_m=2
+    fixup / invariant tests below would not have a search arm to
+    exercise); hoisting the bind avoids repeating the inline kernel
+    definition in every test. The 256² shape would normally fall
+    below the cycle-38 small-shape wave-quantization gate
+    (cute_plan.md §7.6.3.2), so we mock ``_cuda_num_sms_or_zero``
+    to return 0 — that fallback keeps cluster_m=2 search live for
+    configuration round-trip tests without depending on the host
+    GPU. Tests that intend to exercise the gate live in
+    ``test_cute_tcgen05_small_shape_wave_quantization_gate*`` and
+    bind their own kernel.
+
+    For tests that exercise codegen (``to_triton_code()``), keep
+    the ``patch_cute_mma_support`` context active across the
+    codegen call — ``cute_mma.py`` consults
+    ``get_cute_mma_support()`` during codegen, and a bare bind
+    followed by a codegen call would silently hit the non-tcgen05
+    fallback on a host without native tcgen05.
+    """
+    args = (
+        torch.empty([256, 256], device=DEVICE, dtype=HALF_DTYPE),
+        torch.empty([256, 256], device=DEVICE, dtype=HALF_DTYPE),
+    )
+    with (
+        patch_cute_mma_support(),
+        patch(
+            "helion.language.matmul_ops._cuda_num_sms_or_zero",
+            return_value=0,
+        ),
+    ):
+        return _cute_strategy_matmul_kernel.bind(args)
 
 
 @onlyBackends(["triton", "cute"])
@@ -296,6 +370,69 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
                 self.assertEqual(config["pid_type"], "persistent_interleaved")
                 self.assertEqual(config["block_sizes"][:3], [256, 256, 16])
                 self.assertEqual(config["l2_groupings"], expected_l2_groupings)
+
+    @onlyBackends(["cute"])
+    def test_cute_tcgen05_small_shape_wave_quantization_gate(self) -> None:
+        """Cycle 38 (cute_plan.md §7.6.3.2): the cluster_m=2 search arm
+        is narrowed for shapes whose cluster_m=2 work-cluster count
+        cannot saturate even one wave of cluster slots.
+
+        The gate measures ``(M / 256) * (N / 256)`` cluster_m=2 work
+        clusters and compares against ``num_sms // 2`` (one wave of
+        cluster slots when each cluster occupies two SMs). With the
+        SM count mocked to B200's 148 the threshold is 74 cluster
+        slots; the §7.6.1.1 boost-target shapes 1024^3 and 2048^3
+        sit at 16 and 64 cluster slots respectively and therefore
+        narrow to ``cluster_m=1`` only. The 4096^3 G2 closure
+        baseline sits at 256 cluster slots > 74 and keeps
+        cluster_m=2 search exposed (positive control covered by
+        ``test_cute_tcgen05_two_cta_enters_validated_search_space``).
+
+        Mocking ``_cuda_num_sms_or_zero`` keeps the test hermetic:
+        the gate logic is exercised on any host regardless of the
+        live GPU's SM count.
+        """
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_mma(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        for size in (1024, 2048):
+            with self.subTest(size=size):
+                args = (
+                    torch.empty([size, size], device=DEVICE, dtype=HALF_DTYPE),
+                    torch.empty([size, size], device=DEVICE, dtype=HALF_DTYPE),
+                )
+                with (
+                    patch_cute_mma_support(),
+                    patch(
+                        "helion.language.matmul_ops._cuda_num_sms_or_zero",
+                        return_value=148,
+                    ),
+                ):
+                    bound = cute_matmul_mma.bind(args)
+                spec = bound.config_spec
+                # Below the one-wave SM-slot threshold: cluster_m=2
+                # search is suppressed and the cluster_m2 seed
+                # / fixup machinery is disabled so the autotuner
+                # never spends budget on the cluster_m=2 seed for a
+                # shape where it has no productive lever.
+                self.assertEqual(spec._tcgen05_cluster_m_search_choices, (1,))
+                self.assertIsNone(spec._tcgen05_cluster_m2_search_constraints)
+                self.assertEqual(spec.autotune_seed_configs(), [])
+                # Persistent pid types are still allowed (the static-
+                # full-tile gate above this is unaffected) — only the
+                # cluster_m search arm narrows.
+                self.assertIn("persistent_interleaved", spec.allowed_pid_types)
+                self.assertIn("persistent_blocked", spec.allowed_pid_types)
 
     @onlyBackends(["cute"])
     def test_cute_tcgen05_cluster_m1_persistent_search_caps_m_tile(self) -> None:
@@ -992,6 +1129,921 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         self.assertNotIn("tcgen05_num_epi_warps", minimized_2.config)
         spec.normalize(minimized_2)
         self.assertEqual(minimized_2.config["tcgen05_num_epi_warps"], 2)
+
+    @onlyBackends(["cute"])
+    def test_cute_tcgen05_strategy_data_model_round_trip(self) -> None:
+        """G2-A: ``Tcgen05Strategy`` / ``Tcgen05PersistenceModel`` /
+        ``Tcgen05LayoutStrategy`` / ``Tcgen05WarpSpec`` /
+        ``Tcgen05LayoutOverrides`` are wired through ``ConfigSpec`` so
+        that ``helion.Config(...)`` round-trips them and
+        ``default_config()`` exposes the documented defaults
+        (``ROLE_LOCAL_MONOLITHIC`` strategy with the pinned 6-warp
+        spec; ``epi_warps`` lives in the existing
+        ``tcgen05_num_epi_warps`` field).
+        """
+
+        spec = _bind_cute_strategy_kernel().config_spec
+
+        # Defaults match the documented G2-A pin: ROLE_LOCAL_MONOLITHIC
+        # strategy with the existing 6-warp role-local spec. Persistence
+        # model is derived from the active pid_type ("flat" -> non-
+        # persistent) so serialized configs cannot encode contradictions.
+        default_cfg = spec.default_config()
+        self.assertEqual(
+            default_cfg.config["tcgen05_strategy"], "role_local_monolithic"
+        )
+        self.assertEqual(default_cfg.config["pid_type"], "flat")
+        self.assertEqual(
+            default_cfg.config["tcgen05_persistence_model"], "non_persistent"
+        )
+        self.assertEqual(default_cfg.config["tcgen05_layout_strategy"], "default")
+        self.assertEqual(default_cfg.config["tcgen05_warp_spec_ab_load_warps"], 1)
+        self.assertEqual(default_cfg.config["tcgen05_warp_spec_mma_warps"], 1)
+        # ``epi_warps`` is the existing tcgen05_num_epi_warps knob.
+        self.assertEqual(default_cfg.config["tcgen05_num_epi_warps"], 4)
+        self.assertNotIn("tcgen05_warp_spec_epi_warps", default_cfg.config)
+        self.assertEqual(default_cfg.config["tcgen05_warp_spec_epi_load_warps"], 0)
+        self.assertEqual(default_cfg.config["tcgen05_warp_spec_scheduler_warps"], 0)
+        # ``c_input_warps`` was added in cycle 33 as the foundation for
+        # G3.1-C step-2 (``cute_plan.md`` §7.5.3.2). Default is 0 so
+        # serialized configs round-trip cleanly; the value 1 will be
+        # accepted under ``ROLE_LOCAL_WITH_SCHEDULER`` once cycle 34
+        # lands the dedicated TMA producer + SMEM ring.
+        self.assertEqual(default_cfg.config["tcgen05_warp_spec_c_input_warps"], 0)
+        self.assertEqual(default_cfg.config["tcgen05_warp_spec_register_decrease"], 120)
+        self.assertEqual(default_cfg.config["tcgen05_warp_spec_register_increase"], 256)
+        for key in (
+            "tcgen05_layout_overrides_epi_tile_m",
+            "tcgen05_layout_overrides_epi_tile_n",
+            "tcgen05_layout_overrides_smem_swizzle_a",
+            "tcgen05_layout_overrides_smem_swizzle_b",
+            "tcgen05_layout_overrides_d_store_box_n",
+        ):
+            self.assertIsNone(default_cfg.config[key])
+
+        # JSON round-trip preserves every strategy field exactly.
+        replayed = helion.Config.from_json(default_cfg.to_json())
+        self.assertEqual(replayed, default_cfg)
+
+        # An explicit user-supplied config round-trips through
+        # normalize. Use persistent pid_type so the explicit
+        # ``static_persistent`` agrees.
+        cfg = helion.Config(
+            block_sizes=[256, 256, 16],
+            l2_groupings=[1],
+            pid_type="persistent_blocked",
+            tcgen05_cluster_m=2,
+            tcgen05_num_epi_warps=4,
+            tcgen05_strategy="role_local_monolithic",
+            tcgen05_persistence_model="static_persistent",
+            tcgen05_layout_strategy="default",
+            tcgen05_warp_spec_ab_load_warps=1,
+            tcgen05_warp_spec_mma_warps=1,
+            tcgen05_warp_spec_epi_load_warps=0,
+            tcgen05_warp_spec_scheduler_warps=0,
+            tcgen05_warp_spec_register_decrease=120,
+            tcgen05_warp_spec_register_increase=256,
+        )
+        spec.normalize(cfg)
+        self.assertEqual(cfg.config["tcgen05_strategy"], "role_local_monolithic")
+        self.assertEqual(cfg.config["tcgen05_persistence_model"], "static_persistent")
+        self.assertEqual(cfg.config["tcgen05_num_epi_warps"], 4)
+        self.assertEqual(cfg.config["tcgen05_warp_spec_register_decrease"], 120)
+
+    @onlyBackends(["cute"])
+    def test_cute_tcgen05_strategy_invariants_reject_illegal(self) -> None:
+        """G2-A: validation rejects illegal combinations.
+
+        - ``tcgen05_strategy`` and ``tcgen05_layout_strategy`` are
+          narrowed at the autotune fragment to the implemented set so
+          unimplemented strategies are loudly rejected at the user
+          surface (matches ``restrict_tcgen05_num_epi_warps_*``).
+        - ``tcgen05_warp_spec_*`` knobs are narrowed similarly until
+          G2-B/C reads them.
+        - The cross-fragment validator catches strategy-conditional
+          violations that span multiple fragments — exercised
+          directly in
+          ``test_cute_tcgen05_strategy_invariants_helper_unit``
+          for the strategies the autotune fragment narrowing makes
+          unreachable from the user surface today.
+        """
+
+        spec = _bind_cute_strategy_kernel().config_spec
+
+        base = {
+            "block_sizes": [256, 256, 16],
+            "l2_groupings": [1],
+            "pid_type": "persistent_blocked",
+            "tcgen05_cluster_m": 2,
+        }
+
+        # ``ROLE_LOCAL_WITH_SCHEDULER`` is now an implemented
+        # strategy; explicit user configs that select it must
+        # *also* set ``scheduler_warps=1`` to satisfy the
+        # cross-fragment invariant.
+        with self.assertRaises(InvalidConfig):
+            # WITH_SCHEDULER + scheduler_warps=0 (the default) is
+            # rejected by the cross-fragment validator.
+            spec.normalize(
+                helion.Config(**base, tcgen05_strategy="role_local_with_scheduler")
+            )
+        with self.assertRaises(InvalidConfig):
+            spec.normalize(
+                helion.Config(**base, tcgen05_layout_strategy="explicit_epi_tile")
+            )
+        with self.assertRaises(InvalidConfig):
+            # MONOLITHIC + scheduler_warps=1 is rejected: MONOLITHIC
+            # requires scheduler_warps=0.
+            spec.normalize(helion.Config(**base, tcgen05_warp_spec_scheduler_warps=1))
+        with self.assertRaises(InvalidConfig):
+            spec.normalize(helion.Config(**base, tcgen05_warp_spec_ab_load_warps=2))
+        with self.assertRaises(InvalidConfig):
+            spec.normalize(helion.Config(**base, tcgen05_warp_spec_mma_warps=2))
+
+        # ``WITH_SCHEDULER`` + ``cluster_m=2`` is accepted. Each
+        # CTA in the cluster runs its own scheduler that publishes
+        # locally and consumers release locally; both CTAs converge
+        # on the same cluster-level virtual_pid via the
+        # ``// cluster_m`` collapse in the consumer. See
+        # ``cute_mma._codegen_cute_mma`` ``consumer_mask_to_leader``
+        # comment for the full topology.
+        with_scheduler_cluster_m2 = helion.Config(
+            **base,
+            tcgen05_strategy="role_local_with_scheduler",
+            tcgen05_warp_spec_scheduler_warps=1,
+        )
+        spec.normalize(with_scheduler_cluster_m2)
+        self.assertEqual(
+            with_scheduler_cluster_m2.config["tcgen05_strategy"],
+            "role_local_with_scheduler",
+        )
+        self.assertEqual(with_scheduler_cluster_m2.config["tcgen05_cluster_m"], 2)
+
+        # WITH_SCHEDULER + scheduler_warps=1 + cluster_m=1 is also
+        # valid and round-trips cleanly.
+        cluster_m1_base = {
+            **base,
+            "tcgen05_cluster_m": 1,
+        }
+        with_scheduler_cfg = helion.Config(
+            **cluster_m1_base,
+            tcgen05_num_epi_warps=4,
+            tcgen05_strategy="role_local_with_scheduler",
+            tcgen05_warp_spec_scheduler_warps=1,
+        )
+        spec.normalize(with_scheduler_cfg)
+        self.assertEqual(
+            with_scheduler_cfg.config["tcgen05_strategy"],
+            "role_local_with_scheduler",
+        )
+        self.assertEqual(
+            with_scheduler_cfg.config["tcgen05_warp_spec_scheduler_warps"], 1
+        )
+        self.assertEqual(with_scheduler_cfg.config["tcgen05_cluster_m"], 1)
+
+        # ``DYNAMIC_PERSISTENT`` is not in the persistence-model
+        # fragment surface today (no codegen supports it).
+        with self.assertRaises(InvalidConfig):
+            spec.normalize(
+                helion.Config(**base, tcgen05_persistence_model="dynamic_persistent")
+            )
+
+        # ``epi_warps != 4`` -> rejected via ``tcgen05_num_epi_warps``
+        # validation (single source of truth).
+        with self.assertRaises(InvalidConfig):
+            spec.normalize(helion.Config(**base, tcgen05_num_epi_warps=2))
+
+        # Persistence model must agree with pid_type. The explicit
+        # ``static_persistent`` contradicts ``pid_type=flat``.
+        flat_base = {**base, "pid_type": "flat", "tcgen05_cluster_m": 1}
+        with self.assertRaises(InvalidConfig) as ctx:
+            spec.normalize(
+                helion.Config(
+                    **flat_base, tcgen05_persistence_model="static_persistent"
+                )
+            )
+        self.assertIn("contradicts pid_type", str(ctx.exception))
+
+        # Layout overrides with a concrete value under DEFAULT layout
+        # strategy must be rejected — the override would be silently
+        # ignored otherwise.
+        with self.assertRaises(InvalidConfig):
+            spec.normalize(
+                helion.Config(
+                    **base,
+                    tcgen05_layout_strategy="default",
+                    tcgen05_layout_overrides_epi_tile_m=64,
+                )
+            )
+
+        # The pinned ROLE_LOCAL_MONOLITHIC config still normalizes
+        # cleanly so the rejection paths are not over-broad.
+        cfg = helion.Config(
+            **base,
+            tcgen05_num_epi_warps=4,
+            tcgen05_strategy="role_local_monolithic",
+        )
+        spec.normalize(cfg)
+        self.assertEqual(cfg.config["tcgen05_strategy"], "role_local_monolithic")
+
+    @onlyBackends(["cute"])
+    def test_cute_tcgen05_strategy_invariants_helper_unit(self) -> None:
+        """``validate_tcgen05_strategy_invariants`` covers the
+        cross-fragment cases the autotune narrowing makes unreachable
+        from the user surface today (persistence model not supported
+        by the chosen strategy, scheduler_warps mismatching the
+        strategy) plus the positive case where ``EXPLICIT_EPI_TILE``
+        accepts non-None layout overrides.
+
+        The earlier warpgroup-alignment requirement on
+        ``ROLE_LOCAL_WITH_SCHEDULER`` was relaxed once the initial
+        7-warp implementation landed (1 ab_load + 1 mma + 4 epi + 1
+        scheduler = 7). The eventual 8-warp variant with a C-input
+        epi-load warp will re-introduce the alignment requirement
+        when register-split tuning becomes warpgroup-uniform.
+        """
+        # scheduler_warps=0 under WITH_SCHEDULER is rejected (the
+        # strategy demands one scheduler warp).
+        wrong_scheduler_count = Tcgen05WarpSpec(
+            ab_load_warps=1,
+            mma_warps=1,
+            epi_warps=4,
+            epi_load_warps=0,
+            scheduler_warps=0,
+            register_split=(120, 256),
+        )
+        errors = validate_tcgen05_strategy_invariants(
+            strategy=Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER,
+            persistence_model=Tcgen05PersistenceModel.STATIC_PERSISTENT,
+            layout_strategy=Tcgen05LayoutStrategy.DEFAULT,
+            warp_spec=wrong_scheduler_count,
+            layout_overrides=Tcgen05LayoutOverrides(),
+            pid_type="persistent_blocked",
+            cluster_m=1,
+        )
+        self.assertTrue(any("scheduler_warps=1" in e for e in errors))
+
+        # DYNAMIC_PERSISTENT under a strategy that does not support it.
+        errors = validate_tcgen05_strategy_invariants(
+            strategy=Tcgen05Strategy.ROLE_LOCAL_MONOLITHIC,
+            persistence_model=Tcgen05PersistenceModel.DYNAMIC_PERSISTENT,
+            layout_strategy=Tcgen05LayoutStrategy.DEFAULT,
+            warp_spec=ROLE_LOCAL_MONOLITHIC_DEFAULT_WARP_SPEC,
+            layout_overrides=Tcgen05LayoutOverrides(),
+            pid_type="persistent_blocked",
+            cluster_m=1,
+        )
+        self.assertTrue(any("dynamic_persistent" in e for e in errors))
+
+        # ``ROLE_LOCAL_WITH_SCHEDULER`` runs at cluster_m ∈ {1, 2}.
+        # cluster_m=3+ falls outside the supported set; the
+        # validator must reject so a user config can't reach an
+        # untested cluster shape.
+        errors = validate_tcgen05_strategy_invariants(
+            strategy=Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER,
+            persistence_model=Tcgen05PersistenceModel.STATIC_PERSISTENT,
+            layout_strategy=Tcgen05LayoutStrategy.DEFAULT,
+            warp_spec=dataclasses.replace(
+                ROLE_LOCAL_MONOLITHIC_DEFAULT_WARP_SPEC, scheduler_warps=1
+            ),
+            layout_overrides=Tcgen05LayoutOverrides(),
+            pid_type="persistent_blocked",
+            cluster_m=4,
+        )
+        self.assertTrue(
+            any("tcgen05_cluster_m=4" in e for e in errors), msg=str(errors)
+        )
+
+        # Positive control: ROLE_LOCAL_WITH_SCHEDULER + cluster_m=2
+        # is now accepted (the per-CTA scheduler-warp topology is
+        # cluster-correct).
+        errors = validate_tcgen05_strategy_invariants(
+            strategy=Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER,
+            persistence_model=Tcgen05PersistenceModel.STATIC_PERSISTENT,
+            layout_strategy=Tcgen05LayoutStrategy.DEFAULT,
+            warp_spec=dataclasses.replace(
+                ROLE_LOCAL_MONOLITHIC_DEFAULT_WARP_SPEC, scheduler_warps=1
+            ),
+            layout_overrides=Tcgen05LayoutOverrides(),
+            pid_type="persistent_blocked",
+            cluster_m=2,
+        )
+        self.assertEqual(errors, [], msg=str(errors))
+
+        # Positive case: EXPLICIT_EPI_TILE + non-None overrides is
+        # accepted — the validator must not drift into rejecting all
+        # override values regardless of layout strategy.
+        errors = validate_tcgen05_strategy_invariants(
+            strategy=Tcgen05Strategy.ROLE_LOCAL_MONOLITHIC,
+            persistence_model=Tcgen05PersistenceModel.STATIC_PERSISTENT,
+            layout_strategy=Tcgen05LayoutStrategy.EXPLICIT_EPI_TILE,
+            warp_spec=ROLE_LOCAL_MONOLITHIC_DEFAULT_WARP_SPEC,
+            layout_overrides=Tcgen05LayoutOverrides(epi_tile_m=64, epi_tile_n=32),
+            pid_type="persistent_blocked",
+            cluster_m=1,
+        )
+        self.assertEqual(errors, [])
+
+        # Negative control: clean ROLE_LOCAL_MONOLITHIC default is
+        # always accepted.
+        errors = validate_tcgen05_strategy_invariants(
+            strategy=Tcgen05Strategy.ROLE_LOCAL_MONOLITHIC,
+            persistence_model=Tcgen05PersistenceModel.STATIC_PERSISTENT,
+            layout_strategy=Tcgen05LayoutStrategy.DEFAULT,
+            warp_spec=ROLE_LOCAL_MONOLITHIC_DEFAULT_WARP_SPEC,
+            layout_overrides=Tcgen05LayoutOverrides(),
+            pid_type="persistent_blocked",
+            cluster_m=1,
+        )
+        self.assertEqual(errors, [])
+
+    @onlyBackends(["cute"])
+    def test_cute_tcgen05_strategy_invariants_cluster_n(self) -> None:
+        """G2 cluster_n=2 validator coverage (cute_plan.md §6.12.7,
+        cycle 33 widening for ``ROLE_LOCAL_WITH_SCHEDULER``).
+
+        ``cluster_n=2`` requires the 4-CTA V=2 cluster (``cluster_m=2``
+        with ``use_2cta=True``). The validator now accepts cluster_n=2
+        under both ``ROLE_LOCAL_MONOLITHIC`` and
+        ``ROLE_LOCAL_WITH_SCHEDULER`` (cycle 33 lifted the
+        WITH_SCHEDULER restriction so the cluster_n=2 lever exposes
+        the G3.1-C step-2 productive C-input warp opportunity); it
+        still rejects:
+          - ``cluster_n=2`` with ``cluster_m=1`` (V=1 has no 4-CTA path)
+        """
+        # Positive control: cluster_n=2 + ROLE_LOCAL_MONOLITHIC + cluster_m=2.
+        errors = validate_tcgen05_strategy_invariants(
+            strategy=Tcgen05Strategy.ROLE_LOCAL_MONOLITHIC,
+            persistence_model=Tcgen05PersistenceModel.STATIC_PERSISTENT,
+            layout_strategy=Tcgen05LayoutStrategy.DEFAULT,
+            warp_spec=ROLE_LOCAL_MONOLITHIC_DEFAULT_WARP_SPEC,
+            layout_overrides=Tcgen05LayoutOverrides(),
+            pid_type="persistent_blocked",
+            cluster_m=2,
+            cluster_n=2,
+        )
+        self.assertEqual(errors, [], msg=str(errors))
+
+        # cluster_n=2 with cluster_m=1: rejected (requires the 4-CTA
+        # V=2 cluster).
+        errors = validate_tcgen05_strategy_invariants(
+            strategy=Tcgen05Strategy.ROLE_LOCAL_MONOLITHIC,
+            persistence_model=Tcgen05PersistenceModel.STATIC_PERSISTENT,
+            layout_strategy=Tcgen05LayoutStrategy.DEFAULT,
+            warp_spec=ROLE_LOCAL_MONOLITHIC_DEFAULT_WARP_SPEC,
+            layout_overrides=Tcgen05LayoutOverrides(),
+            pid_type="persistent_blocked",
+            cluster_m=1,
+            cluster_n=2,
+        )
+        self.assertTrue(
+            any("requires tcgen05_cluster_m=2" in e for e in errors),
+            msg=str(errors),
+        )
+
+        # cluster_n=2 under ROLE_LOCAL_WITH_SCHEDULER: ACCEPTED
+        # in cycle 33 (the scheduler-broadcast topology generalizes
+        # to cluster_n=2 with the per-CTA-local pattern preserved
+        # and the cluster envelope ``cluster_m * cluster_n`` wired
+        # through the deferred-init protocol).
+        with_sched = dataclasses.replace(
+            ROLE_LOCAL_MONOLITHIC_DEFAULT_WARP_SPEC, scheduler_warps=1
+        )
+        errors = validate_tcgen05_strategy_invariants(
+            strategy=Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER,
+            persistence_model=Tcgen05PersistenceModel.STATIC_PERSISTENT,
+            layout_strategy=Tcgen05LayoutStrategy.DEFAULT,
+            warp_spec=with_sched,
+            layout_overrides=Tcgen05LayoutOverrides(),
+            pid_type="persistent_blocked",
+            cluster_m=2,
+            cluster_n=2,
+        )
+        self.assertEqual(errors, [], msg=str(errors))
+
+        # cluster_n=2 with cluster_m=1 still rejected under
+        # ROLE_LOCAL_WITH_SCHEDULER (V=1 has no 4-CTA path).
+        errors = validate_tcgen05_strategy_invariants(
+            strategy=Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER,
+            persistence_model=Tcgen05PersistenceModel.STATIC_PERSISTENT,
+            layout_strategy=Tcgen05LayoutStrategy.DEFAULT,
+            warp_spec=with_sched,
+            layout_overrides=Tcgen05LayoutOverrides(),
+            pid_type="persistent_blocked",
+            cluster_m=1,
+            cluster_n=2,
+        )
+        self.assertTrue(
+            any("requires tcgen05_cluster_m=2" in e for e in errors),
+            msg=str(errors),
+        )
+
+    @onlyBackends(["cute"])
+    def test_cute_tcgen05_strategy_invariants_c_input_warps(self) -> None:
+        """G3.1-C step-2 (cute_plan.md §7.5.3.2) data-model entrance:
+        ``c_input_warps`` is plumbed through the dataclass + validator,
+        and cycle 33's narrowing rejects nonzero for both strategies
+        until cycle 34 lands the dedicated TMA producer + SMEM ring.
+
+        - Positive control: ``c_input_warps=0`` accepted under both
+          ``ROLE_LOCAL_MONOLITHIC`` and ``ROLE_LOCAL_WITH_SCHEDULER``
+          (the field is plumbed through normalize / round-trip and
+          defaults to 0 for legacy configs).
+        - Negative control: ``c_input_warps=1`` is rejected under
+          both strategies in cycle 33; cycle 34 widens the
+          ``ROLE_LOCAL_WITH_SCHEDULER`` accept set to ``{0, 1}`` once
+          the productive C-input warp implementation lands.
+        """
+        # Positive control: c_input_warps=0 under MONOLITHIC.
+        errors = validate_tcgen05_strategy_invariants(
+            strategy=Tcgen05Strategy.ROLE_LOCAL_MONOLITHIC,
+            persistence_model=Tcgen05PersistenceModel.STATIC_PERSISTENT,
+            layout_strategy=Tcgen05LayoutStrategy.DEFAULT,
+            warp_spec=ROLE_LOCAL_MONOLITHIC_DEFAULT_WARP_SPEC,
+            layout_overrides=Tcgen05LayoutOverrides(),
+            pid_type="persistent_blocked",
+            cluster_m=1,
+        )
+        self.assertEqual(errors, [], msg=str(errors))
+
+        # Positive control: c_input_warps=0 under WITH_SCHEDULER.
+        with_sched = dataclasses.replace(
+            ROLE_LOCAL_MONOLITHIC_DEFAULT_WARP_SPEC, scheduler_warps=1
+        )
+        errors = validate_tcgen05_strategy_invariants(
+            strategy=Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER,
+            persistence_model=Tcgen05PersistenceModel.STATIC_PERSISTENT,
+            layout_strategy=Tcgen05LayoutStrategy.DEFAULT,
+            warp_spec=with_sched,
+            layout_overrides=Tcgen05LayoutOverrides(),
+            pid_type="persistent_blocked",
+            cluster_m=1,
+        )
+        self.assertEqual(errors, [], msg=str(errors))
+
+        # Negative control: c_input_warps=1 under MONOLITHIC.
+        c_input_monolithic = dataclasses.replace(
+            ROLE_LOCAL_MONOLITHIC_DEFAULT_WARP_SPEC, c_input_warps=1
+        )
+        errors = validate_tcgen05_strategy_invariants(
+            strategy=Tcgen05Strategy.ROLE_LOCAL_MONOLITHIC,
+            persistence_model=Tcgen05PersistenceModel.STATIC_PERSISTENT,
+            layout_strategy=Tcgen05LayoutStrategy.DEFAULT,
+            warp_spec=c_input_monolithic,
+            layout_overrides=Tcgen05LayoutOverrides(),
+            pid_type="persistent_blocked",
+            cluster_m=1,
+        )
+        self.assertTrue(
+            any("c_input_warps in [0]" in e for e in errors),
+            msg=str(errors),
+        )
+
+        # Negative control: c_input_warps=1 under WITH_SCHEDULER
+        # (cycle 33). Cycle 34 widens this accept set to ``{0, 1}``.
+        c_input_with_sched = dataclasses.replace(with_sched, c_input_warps=1)
+        errors = validate_tcgen05_strategy_invariants(
+            strategy=Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER,
+            persistence_model=Tcgen05PersistenceModel.STATIC_PERSISTENT,
+            layout_strategy=Tcgen05LayoutStrategy.DEFAULT,
+            warp_spec=c_input_with_sched,
+            layout_overrides=Tcgen05LayoutOverrides(),
+            pid_type="persistent_blocked",
+            cluster_m=1,
+        )
+        self.assertTrue(
+            any("c_input_warps in [0]" in e for e in errors),
+            msg=str(errors),
+        )
+
+        # The dataclass total_warps reflects the c_input_warps slot
+        # so a future cycle-34 lift to c_input_warps=1 transparently
+        # adjusts the warp count without further data-model churn.
+        self.assertEqual(c_input_with_sched.total_warps, 8)
+
+    @onlyBackends(["cute"])
+    def test_cute_tcgen05_strategy_invariants_clc_persistent_cluster_n(
+        self,
+    ) -> None:
+        """``CLC_PERSISTENT`` + ``cluster_n>1`` is rejected.
+
+        The CLC scheduler-warp body in
+        ``program_id._build_scheduler_warp_role_local_while_clc``
+        publishes the work tile to peer CTAs by iterating lanes
+        ``< cluster_m``; cluster_n>1 CTAs would never receive the
+        CLC mailbox publish and would hang at ``producer_acquire``.
+        The paired ``(strategy, persistence_model)`` invariant
+        rejects this combination at validate time so the runtime
+        path is unreachable.
+        """
+        with_sched = dataclasses.replace(
+            ROLE_LOCAL_MONOLITHIC_DEFAULT_WARP_SPEC, scheduler_warps=1
+        )
+
+        # Positive control: CLC + cluster_n=1 still accepts.
+        errors = validate_tcgen05_strategy_invariants(
+            strategy=Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER,
+            persistence_model=Tcgen05PersistenceModel.CLC_PERSISTENT,
+            layout_strategy=Tcgen05LayoutStrategy.DEFAULT,
+            warp_spec=with_sched,
+            layout_overrides=Tcgen05LayoutOverrides(),
+            pid_type="persistent_blocked",
+            cluster_m=2,
+            cluster_n=1,
+            arch_major=10,
+        )
+        self.assertEqual(errors, [], msg=str(errors))
+
+        # Positive control: STATIC_PERSISTENT + cluster_n=2 accepts
+        # (the static path's per-CTA-local scheduler topology
+        # generalizes to cluster_n=2).
+        errors = validate_tcgen05_strategy_invariants(
+            strategy=Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER,
+            persistence_model=Tcgen05PersistenceModel.STATIC_PERSISTENT,
+            layout_strategy=Tcgen05LayoutStrategy.DEFAULT,
+            warp_spec=with_sched,
+            layout_overrides=Tcgen05LayoutOverrides(),
+            pid_type="persistent_blocked",
+            cluster_m=2,
+            cluster_n=2,
+            arch_major=10,
+        )
+        self.assertEqual(errors, [], msg=str(errors))
+
+        # Negative control: CLC + cluster_n=2 rejected. The CLC
+        # broadcast is cluster_m-only; second-N-lane CTAs never
+        # receive the mailbox publish.
+        errors = validate_tcgen05_strategy_invariants(
+            strategy=Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER,
+            persistence_model=Tcgen05PersistenceModel.CLC_PERSISTENT,
+            layout_strategy=Tcgen05LayoutStrategy.DEFAULT,
+            warp_spec=with_sched,
+            layout_overrides=Tcgen05LayoutOverrides(),
+            pid_type="persistent_blocked",
+            cluster_m=2,
+            cluster_n=2,
+            arch_major=10,
+        )
+        self.assertTrue(
+            any(
+                "clc_persistent" in e and "tcgen05_cluster_n in [1]" in e
+                for e in errors
+            ),
+            msg=str(errors),
+        )
+
+    @onlyBackends(["cute"])
+    def test_cute_tcgen05_strategy_invariants_clc_persistent(self) -> None:
+        """G2-H (cute_plan.md): ``Tcgen05PersistenceModel.CLC_PERSISTENT``
+        is only valid under ``ROLE_LOCAL_WITH_SCHEDULER`` on arch >= 100.
+
+        The validator must reject the model under MONOLITHIC (the
+        scheduler-warp role only exists in WITH_SCHEDULER) and on
+        arch < 100 (CLC is a Blackwell sm_100+ instruction). The
+        positive control: WITH_SCHEDULER + arch_major=10 +
+        scheduler_warps=1 + persistent_* pid_type accepts cleanly.
+        """
+        # Positive control: CLC + WITH_SCHEDULER + sm_100 (arch=10).
+        with_sched = dataclasses.replace(
+            ROLE_LOCAL_MONOLITHIC_DEFAULT_WARP_SPEC, scheduler_warps=1
+        )
+        errors = validate_tcgen05_strategy_invariants(
+            strategy=Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER,
+            persistence_model=Tcgen05PersistenceModel.CLC_PERSISTENT,
+            layout_strategy=Tcgen05LayoutStrategy.DEFAULT,
+            warp_spec=with_sched,
+            layout_overrides=Tcgen05LayoutOverrides(),
+            pid_type="persistent_blocked",
+            cluster_m=2,
+            arch_major=10,
+        )
+        self.assertEqual(errors, [], msg=str(errors))
+
+        # CLC under MONOLITHIC: rejected (the strategy doesn't
+        # support CLC because it has no scheduler warp to issue
+        # the query).
+        errors = validate_tcgen05_strategy_invariants(
+            strategy=Tcgen05Strategy.ROLE_LOCAL_MONOLITHIC,
+            persistence_model=Tcgen05PersistenceModel.CLC_PERSISTENT,
+            layout_strategy=Tcgen05LayoutStrategy.DEFAULT,
+            warp_spec=ROLE_LOCAL_MONOLITHIC_DEFAULT_WARP_SPEC,
+            layout_overrides=Tcgen05LayoutOverrides(),
+            pid_type="persistent_blocked",
+            cluster_m=1,
+            arch_major=10,
+        )
+        self.assertTrue(any("clc_persistent" in e for e in errors), msg=str(errors))
+
+        # CLC on arch < 100: rejected.
+        errors = validate_tcgen05_strategy_invariants(
+            strategy=Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER,
+            persistence_model=Tcgen05PersistenceModel.CLC_PERSISTENT,
+            layout_strategy=Tcgen05LayoutStrategy.DEFAULT,
+            warp_spec=with_sched,
+            layout_overrides=Tcgen05LayoutOverrides(),
+            pid_type="persistent_blocked",
+            cluster_m=2,
+            arch_major=9,
+        )
+        self.assertTrue(
+            any("requires CUDA compute capability major >= 10" in e for e in errors),
+            msg=str(errors),
+        )
+
+        # CLC overlays a runtime cancel on the persistent-grid
+        # launch, so it must agree with ``pid_type=persistent_*``;
+        # CLC paired with ``pid_type=flat`` is rejected with the
+        # contradiction error (validator asks user to set both
+        # consistently).
+        errors = validate_tcgen05_strategy_invariants(
+            strategy=Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER,
+            persistence_model=Tcgen05PersistenceModel.CLC_PERSISTENT,
+            layout_strategy=Tcgen05LayoutStrategy.DEFAULT,
+            warp_spec=with_sched,
+            layout_overrides=Tcgen05LayoutOverrides(),
+            pid_type="flat",
+            cluster_m=1,
+            arch_major=10,
+        )
+        self.assertTrue(
+            any("contradicts pid_type" in e for e in errors), msg=str(errors)
+        )
+
+    @onlyBackends(["cute"])
+    def test_cute_tcgen05_persistence_model_enum_value_pin(self) -> None:
+        """Pin the string literal that ``CuteTcgen05MatmulPlan.is_clc_persistent``
+        compares against to the actual enum's ``.value``.
+
+        ``CuteTcgen05MatmulPlan.persistence_model`` is stored as a
+        ``str`` (the enum's ``.value``) so the dataclass stays free
+        of cute-internal imports. The ``is_clc_persistent`` property
+        reads the enum value lazily and compares — this test pins
+        that the canonical value is ``"clc_persistent"`` so a rename
+        of the enum member would either propagate via the lazy
+        import or trip this test loudly. Without it a renamed enum
+        could silently degrade ``is_clc_persistent`` to always-False
+        because all the comparisons would be against a stale string
+        literal in serialized configs.
+        """
+        self.assertEqual(Tcgen05PersistenceModel.CLC_PERSISTENT.value, "clc_persistent")
+        self.assertEqual(
+            Tcgen05PersistenceModel.STATIC_PERSISTENT.value, "static_persistent"
+        )
+        # Round-trip via ``CuteTcgen05MatmulPlan`` to confirm the
+        # property tracks the enum value.
+        from helion._compiler.device_function import CuteTcgen05MatmulPlan
+
+        plan_clc = CuteTcgen05MatmulPlan(
+            bm=256,
+            bn=256,
+            bk=128,
+            k_tile_count=4,
+            cluster_m=2,
+            is_two_cta=True,
+            uses_role_local_persistent_body=True,
+            uses_cluster_m2_one_cta_role_local_bridge=False,
+            cta_thread_count=256,
+            physical_m_threads=32,
+            acc_stage_count=2,
+            ab_stage_count=2,
+            c_stage_count=2,
+            epi_warp_count=4,
+            ab_load_warp_count=1,
+            scheduler_warp_count=1,
+            sched_stage_count=1,
+            persistence_model=Tcgen05PersistenceModel.CLC_PERSISTENT.value,
+        )
+        self.assertTrue(plan_clc.is_clc_persistent)
+        plan_static = dataclasses.replace(
+            plan_clc,
+            persistence_model=Tcgen05PersistenceModel.STATIC_PERSISTENT.value,
+        )
+        self.assertFalse(plan_static.is_clc_persistent)
+
+    @onlyBackends(["cute"])
+    def test_cute_tcgen05_strategy_invariants_warpgroup_alignment_branch(
+        self,
+    ) -> None:
+        """The warpgroup-alignment branch of
+        ``validate_tcgen05_strategy_invariants`` is currently dead
+        code (``_STRATEGY_REQUIRES_WARPGROUP_ALIGNED_TOTAL`` is
+        empty) because today's two strategies tolerate non-aligned
+        role-warp totals via ``CuteTcgen05MatmulPlan.launched_warp_count``
+        rounding at the launch boundary. Patch the set to include
+        an existing strategy enum and pass a misaligned warp_spec
+        to confirm the validator's alignment check still fires —
+        so a future strategy that opts in catches misconfigured
+        warp counts loudly.
+        """
+        from helion._compiler.cute import strategies as strategies_module
+
+        misaligned = Tcgen05WarpSpec(
+            ab_load_warps=1,
+            mma_warps=1,
+            epi_warps=4,
+            epi_load_warps=0,
+            scheduler_warps=1,  # 1+1+4+1 = 7, not warpgroup-aligned
+            register_split=(120, 256),
+        )
+        with patch.object(
+            strategies_module,
+            "_STRATEGY_REQUIRES_WARPGROUP_ALIGNED_TOTAL",
+            frozenset({Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER}),
+        ):
+            errors = validate_tcgen05_strategy_invariants(
+                strategy=Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER,
+                persistence_model=Tcgen05PersistenceModel.STATIC_PERSISTENT,
+                layout_strategy=Tcgen05LayoutStrategy.DEFAULT,
+                warp_spec=misaligned,
+                layout_overrides=Tcgen05LayoutOverrides(),
+                pid_type="persistent_blocked",
+                cluster_m=1,
+            )
+        self.assertTrue(any("warpgroup-aligned" in e for e in errors), msg=str(errors))
+
+    @onlyBackends(["cute"])
+    def test_cute_tcgen05_strategy_fix_invalid_resets_to_defaults(self) -> None:
+        """G2-A: ``normalize(_fix_invalid=True)`` silently rolls a
+        broken strategy record back to the documented defaults rather
+        than raising. Mirrors the cluster_m=2 search canonicalization
+        path used by ``_fix_tcgen05_cluster_m2_search_config``.
+        Layout-override values are silently dropped to ``None``.
+        """
+
+        spec = _bind_cute_strategy_kernel().config_spec
+
+        # A user-supplied config that hits the cross-fragment
+        # validator (DEFAULT layout + concrete override). Without
+        # ``_fix_invalid`` this raises; with it, the strategy fields
+        # reset to defaults derived from the active pid_type.
+        config = {
+            "block_sizes": [256, 256, 16],
+            "l2_groupings": [1],
+            "pid_type": "persistent_blocked",
+            "tcgen05_cluster_m": 2,
+            "tcgen05_layout_strategy": "default",
+            "tcgen05_layout_overrides_epi_tile_m": 64,
+        }
+        spec.normalize(config, _fix_invalid=True)
+        self.assertEqual(config["tcgen05_strategy"], "role_local_monolithic")
+        self.assertEqual(config["tcgen05_persistence_model"], "static_persistent")
+        self.assertEqual(config["tcgen05_layout_strategy"], "default")
+        # Override that triggered the rollback is now None.
+        self.assertIsNone(config["tcgen05_layout_overrides_epi_tile_m"])
+
+        # An out-of-range override under DEFAULT also fixes silently.
+        config2 = {
+            "block_sizes": [256, 256, 16],
+            "l2_groupings": [1],
+            "pid_type": "persistent_blocked",
+            "tcgen05_cluster_m": 2,
+            "tcgen05_layout_overrides_epi_tile_n": "not-an-int",
+        }
+        spec.normalize(config2, _fix_invalid=True)
+        self.assertIsNone(config2["tcgen05_layout_overrides_epi_tile_n"])
+
+    @onlyBackends(["cute"])
+    def test_cute_tcgen05_strategy_normalize_idempotent_after_pid_type_fixup(
+        self,
+    ) -> None:
+        """G2-A regression: the strategy default/invariant pass must
+        run *after* ``pid_type`` canonicalization and the
+        ``_fix_tcgen05_cluster_m{1,2}_*_search_config`` rewrites,
+        otherwise ``tcgen05_persistence_model`` is derived from the
+        pre-fixup ``pid_type`` and a re-``normalize()`` over the
+        already-normalized config trips the
+        ``contradicts pid_type`` invariant.
+
+        The path: a search config with ``pid_type="flat"`` and
+        ``tcgen05_cluster_m=2`` lands in ``_fix_tcgen05_cluster_m2_search_config``,
+        which rewrites ``pid_type`` to ``persistent_interleaved``. The
+        derived persistence model must follow that rewrite.
+        """
+
+        spec = _bind_cute_strategy_kernel().config_spec
+
+        config: dict[str, object] = {
+            "block_sizes": [256, 256, 16],
+            "l2_groupings": [1],
+            "pid_type": "flat",
+            "tcgen05_cluster_m": 2,
+        }
+        spec.normalize(config, _fix_invalid=True)
+        # The cluster_m2 fixup rewrote pid_type; the persistence-model
+        # default agrees with the post-fixup pid_type.
+        self.assertEqual(config["pid_type"], "persistent_interleaved")
+        self.assertEqual(config["tcgen05_persistence_model"], "static_persistent")
+
+        # Re-normalize on the already-normalized config is idempotent
+        # — it does not raise and does not change any field.
+        snapshot = dict(config)
+        spec.normalize(config, _fix_invalid=False)
+        self.assertEqual(config, snapshot)
+
+    @onlyBackends(["cute"])
+    def test_cute_tcgen05_strategy_flat_round_trip_with_force_persistent(
+        self,
+    ) -> None:
+        """G2-A regression: ``flatten(unflatten(default_flat())) ==
+        default_flat()`` even when ``autotune_force_persistent`` has
+        narrowed ``allowed_pid_types`` so the default ``pid_type``
+        is ``persistent_blocked`` rather than ``flat``.
+
+        ``tcgen05_persistence_model`` is fully derived from
+        ``pid_type`` (see ``derive_persistence_model_from_pid_type``)
+        so giving it its own slot in ``_flat_fields()`` would mean
+        the flat default carries ``non_persistent`` (the
+        ``EnumFragment`` default) while the post-normalize value is
+        ``static_persistent`` (derived from the persistent
+        ``pid_type``). The ``flatten``/``unflatten`` round trip would
+        then stabilize on the post-normalize value and the
+        autotuner's ``default_flat()`` baseline would diverge from
+        every other flat config it generates. Pin the round-trip so
+        the field stays out of the autotune surface until a strategy
+        decouples it.
+        """
+
+        args = (
+            torch.empty([256, 256], device=DEVICE, dtype=HALF_DTYPE),
+            torch.empty([256, 256], device=DEVICE, dtype=HALF_DTYPE),
+        )
+        with patch_cute_mma_support():
+            bound = _cute_strategy_matmul_force_persistent_kernel.bind(args)
+        spec = bound.config_spec
+        # autotune_force_persistent removes flat/xyz from the
+        # allowed pid_types, so the EnumFragment(pid_type) default
+        # is "persistent_blocked".
+        self.assertEqual(
+            spec.allowed_pid_types,
+            ("persistent_blocked", "persistent_interleaved"),
+        )
+        cg = ConfigGeneration(spec)
+        default_flat = cg.default_flat()
+        round_tripped = cg.flatten(cg.unflatten(default_flat))
+        self.assertEqual(default_flat, round_tripped)
+        # Cross-check: the unflattened config's persistence model is
+        # the derived value (static_persistent), and the autotune
+        # surface (``_flat_fields``) excludes the field so it does
+        # not carry a stale flat-config default.
+        config = cg.unflatten(default_flat)
+        self.assertEqual(
+            config.config["tcgen05_persistence_model"], "static_persistent"
+        )
+        self.assertNotIn("tcgen05_persistence_model", spec._flat_fields())
+
+    @onlyBackends(["cute"])
+    def test_cute_tcgen05_strategy_default_lowering_byte_identical(
+        self,
+    ) -> None:
+        """G2-A pins generated code byte-identity: the strategy data
+        model is plumbed through ``ConfigSpec`` but no codegen path
+        reads it yet. The retained role-local seed produces the same
+        kernel source whether the strategy fields are explicitly set
+        to their documented defaults or omitted entirely.
+        """
+
+        # ``cute_mma.py`` consults ``get_cute_mma_support()`` during
+        # codegen, so the patch must remain active across both
+        # ``to_triton_code()`` calls — without it, on a host without
+        # native tcgen05 support both kernels silently fall through to
+        # the non-tcgen05 path and the byte-identity check still
+        # passes vacuously. The ``make_trivial_tiled_mma`` assert is a
+        # tcgen05-specific marker that catches this regression.
+        args = (
+            torch.empty([256, 256], device=DEVICE, dtype=HALF_DTYPE),
+            torch.empty([256, 256], device=DEVICE, dtype=HALF_DTYPE),
+        )
+        with patch_cute_mma_support():
+            bound = _cute_strategy_matmul_kernel.bind(args)
+            baseline_seed = {
+                "block_sizes": [256, 256, 16],
+                "l2_groupings": [1],
+                "pid_type": "persistent_interleaved",
+                "tcgen05_cluster_m": 2,
+                "tcgen05_ab_stages": 2,
+                "tcgen05_acc_stages": 2,
+                "tcgen05_c_stages": 2,
+                "tcgen05_num_epi_warps": 4,
+            }
+            baseline = helion.Config(**baseline_seed)
+            with_strategy = helion.Config(
+                **baseline_seed,
+                tcgen05_strategy="role_local_monolithic",
+                tcgen05_persistence_model="static_persistent",
+                tcgen05_layout_strategy="default",
+                tcgen05_warp_spec_ab_load_warps=1,
+                tcgen05_warp_spec_mma_warps=1,
+                tcgen05_warp_spec_epi_load_warps=0,
+                tcgen05_warp_spec_scheduler_warps=0,
+                tcgen05_warp_spec_register_decrease=120,
+                tcgen05_warp_spec_register_increase=256,
+            )
+
+            baseline_code = bound.to_triton_code(baseline)
+            with_strategy_code = bound.to_triton_code(with_strategy)
+        self.assertIn("make_trivial_tiled_mma", baseline_code)
+        self.assertIn("make_trivial_tiled_mma", with_strategy_code)
+        self.assertEqual(baseline_code, with_strategy_code)
 
 
 @onlyBackends(["pallas"])
