@@ -32,6 +32,9 @@ def compiler_seed_configs(
 ) -> list[Config]:
     configs: list[Config] = []
     env.config_spec.autotuner_heuristics = []
+    if env.settings.disable_autotuner_heuristics:
+        return configs
+
     for heuristic in get_heuristics(env.backend_name):
         try:
             if not heuristic.is_eligible(env, device_ir):

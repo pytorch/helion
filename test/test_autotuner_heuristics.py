@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from unittest.mock import MagicMock
 from unittest.mock import patch
 
@@ -28,6 +29,7 @@ from helion.autotuner.config_spec import MatmulFact
 from helion.autotuner.pattern_search import InitialPopulationStrategy
 from helion.autotuner.pattern_search import PatternSearch
 import helion.language as hl
+from helion.runtime.settings import Settings
 
 HOPPER_HARDWARE = HardwareInfo(
     device_kind="cuda",
@@ -50,6 +52,17 @@ BLACKWELL_HARDWARE = HardwareInfo(
 
 
 class TestAutotunerHeuristic(TestCase):
+    def test_disable_autotuner_heuristics_setting_env(self) -> None:
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("HELION_DISABLE_AUTOTUNER_HEURISTICS", None)
+            self.assertFalse(Settings().disable_autotuner_heuristics)
+
+        with patch.dict(
+            os.environ,
+            {"HELION_DISABLE_AUTOTUNER_HEURISTICS": "1"},
+        ):
+            self.assertTrue(Settings().disable_autotuner_heuristics)
+
     def test_compiler_seed_configs_handles_failed_optional_and_duplicate_seeds(
         self,
     ) -> None:
@@ -91,6 +104,7 @@ class TestAutotunerHeuristic(TestCase):
         env = MagicMock()
         env.backend_name = "triton"
         env.config_spec = MagicMock()
+        env.settings = Settings()
         heuristics = (
             FailingAutotunerHeuristic,
             NoSeedAutotunerHeuristic,
@@ -116,6 +130,30 @@ class TestAutotunerHeuristic(TestCase):
         )
         self.assertIn(FailingAutotunerHeuristic.name, "\n".join(logs.output))
         self.assertIn("synthetic compiler seed failure", "\n".join(logs.output))
+
+    def test_compiler_seed_configs_respects_disable_setting(self) -> None:
+        class EnabledAutotunerHeuristic(AutotunerHeuristic):
+            name = "enabled_autotuner_heuristic"
+            backend = "triton"
+
+            @classmethod
+            def is_eligible(cls, env: object, device_ir: object) -> bool:
+                raise AssertionError("disabled heuristics should not be queried")
+
+        env = MagicMock()
+        env.backend_name = "triton"
+        env.config_spec = MagicMock()
+        env.config_spec.autotuner_heuristics = ["stale"]
+        env.settings = Settings(disable_autotuner_heuristics=True)
+
+        with patch(
+            "helion._compiler.autotuner_heuristics.HEURISTICS_BY_BACKEND",
+            {"triton": (EnabledAutotunerHeuristic,)},
+        ):
+            configs = compiler_seed_configs(env, MagicMock())
+
+        self.assertEqual(configs, [])
+        self.assertEqual(env.config_spec.autotuner_heuristics, [])
 
     def test_seed_flat_config_pairs_skips_invalid_compiler_seed(self) -> None:
         spec = ConfigSpec(backend=TritonBackend())
@@ -248,6 +286,7 @@ class TestTritonSkinnyGemmHeuristic(TestCase):
         env.backend_name = "triton"
         env.config_spec = spec
         env.device = DEVICE
+        env.settings = Settings()
         return env
 
     def _matmul_fact(
