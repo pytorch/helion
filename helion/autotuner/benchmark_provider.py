@@ -250,6 +250,10 @@ def _unset_fn(*args: object) -> NoReturn:
     raise RuntimeError("Uninitialized function")
 
 
+def _never_exceeded() -> bool:
+    return False
+
+
 class BenchmarkProvider(abc.ABC):
     """Abstract interface for benchmarking kernel configurations.
 
@@ -267,9 +271,21 @@ class BenchmarkProvider(abc.ABC):
             provider.cleanup()
 
     ``BaseSearch`` manages this lifecycle automatically.
+
+    ``budget_exceeded_fn`` is the local wall-clock budget check that
+    ``BaseSearch._prepare`` installs via ``set_budget_exceeded_fn``.
+    Subclasses should not call this hook directly inside loops that
+    participate in distributed collectives; use a sync wrapper that
+    agrees the cutoff across the process group so peers do not deadlock
+    on an unmatched collective. Default no-op so providers built before
+    the search installs the hook stay unchanged.
     """
 
     mutated_arg_indices: Sequence[int]
+    # ``staticmethod`` prevents Python from binding the class-level
+    # default to ``self`` when an instance reads it before any caller
+    # has installed a real hook via ``set_budget_exceeded_fn``.
+    budget_exceeded_fn: Callable[[], bool] = staticmethod(_never_exceeded)
 
     @abc.abstractmethod
     def __init__(
@@ -283,6 +299,10 @@ class BenchmarkProvider(abc.ABC):
     ) -> None:
         """Initialize the provider with kernel context and benchmarking state."""
         ...
+
+    def set_budget_exceeded_fn(self, fn: Callable[[], bool]) -> None:
+        """Install the search's budget-check hook on this provider."""
+        self.budget_exceeded_fn = fn
 
     @abc.abstractmethod
     def benchmark(
@@ -355,6 +375,8 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         self._precompile_args_path: str | None = None
         self._precompile_result_counter: count[int] = count()
         self._benchmark_worker: BenchmarkWorker | None = None
+        # budget_exceeded_fn inherits the class-level _never_exceeded default
+        # until BaseSearch._prepare installs the search's real hook.
 
         # TODO(hinriksnaer): baseline computation is expensive (compiles and runs
         # the kernel). Currently safe because the provider is only constructed
@@ -666,19 +688,57 @@ class LocalBenchmarkProvider(BenchmarkProvider):
             args_path=self._precompile_args_path,
         )
 
+    def _budget_exceeded_synced(self) -> bool:
+        """Return whether any rank reports the autotune budget exhausted.
+
+        The compile and benchmark loops below participate in distributed
+        collectives. The cutoff decision must be agreed across the
+        process group; otherwise one rank breaks early while peers keep
+        entering collectives and the group deadlocks. Single-process
+        autotune skips the all-gather because
+        ``all_gather_object`` returns ``[obj]`` when distributed is not
+        initialized.
+        """
+        local = self.budget_exceeded_fn()
+        return any(
+            all_gather_object(
+                local,
+                process_group_name=self.kernel.env.process_group_name,
+            )
+        )
+
     def benchmark(
         self,
         configs: list[Config],
         *,
         desc: str = "Benchmarking",
     ) -> list[BenchmarkResult]:
-        """Compile, precompile, validate, and time a batch of configs."""
+        """Compile, precompile, validate, and time a batch of configs.
+
+        When ``budget_exceeded_fn`` reports the autotune wall-clock
+        budget exhausted, the compile and benchmark loops short-circuit
+        and leave any not-yet-handled slots at the default
+        ``perf=inf, status="error"`` so the caller still receives one
+        ``BenchmarkResult`` per input config in positional order. The
+        cutoff is synchronized across the process group via
+        ``_budget_exceeded_synced``.
+
+        The precompile-phase wait (``PrecompileFuture.wait_for_all``)
+        is not budget-aware: once the compile loop has queued
+        precompile futures it drains all of them, so the effective
+        wall-clock may overrun the configured budget by up to
+        ``len(queued) * autotune_compile_timeout`` seconds. Backends
+        that disable ``autotune_precompile`` (e.g. cute) skip that
+        wait entirely.
+        """
         all_configs = configs
         compiled: dict[int, Callable[..., object]] = {}
         futures: list[PrecompileFuture] | None = None
 
         # Compilation phase
         for i, config in enumerate(all_configs):
+            if self._budget_exceeded_synced():
+                break
             try:
                 compiled[i] = self.kernel.compile_config(config, allow_print=False)
             except Exception:
@@ -734,6 +794,8 @@ class LocalBenchmarkProvider(BenchmarkProvider):
             enabled=self.settings.autotune_progress_bar,
         )
         for index, (fn, is_working, reason) in iterator:
+            if self._budget_exceeded_synced():
+                break
             config = configs[index]
             if futures is not None:
                 future = futures[index]

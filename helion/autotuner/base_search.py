@@ -267,6 +267,7 @@ class BaseSearch(BaseAutotuner):
             log=self.log,
             autotune_metrics=self._autotune_metrics,
         )
+        self.benchmark_provider.set_budget_exceeded_fn(self._autotune_budget_exceeded)
 
     def _autotune_budget_exceeded(self) -> bool:
         budget = self.settings.autotune_budget_seconds

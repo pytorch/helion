@@ -191,6 +191,9 @@ class TestLLMGuidedSearch(TestCase):
             def cleanup(self) -> None:
                 self.cleanup_called = True
 
+            def set_budget_exceeded_fn(self, fn) -> None:
+                pass
+
         args = (
             torch.randn([128, 128], device=DEVICE, dtype=torch.float16),
             torch.randn([128, 128], device=DEVICE, dtype=torch.float16),
@@ -661,6 +664,9 @@ class TestLLMSeededLFBOTreeSearch(TestCase):
             def __init__(self, **kwargs) -> None:
                 self.kwargs = kwargs
 
+            def set_budget_exceeded_fn(self, fn) -> None:
+                pass
+
         class FakeLLMSearch:
             def __init__(self, kernel, args, **kwargs) -> None:
                 self.kernel = kernel
@@ -791,6 +797,9 @@ class TestLLMSeededLFBOTreeSearch(TestCase):
             def cleanup(self) -> None:
                 self.cleanup_called = True
 
+            def set_budget_exceeded_fn(self, fn) -> None:
+                pass
+
         class FakeLLMSearch:
             def __init__(self, kernel, args, **kwargs) -> None:
                 self.kernel = kernel
@@ -896,6 +905,9 @@ class TestLLMSeededLFBOTreeSearch(TestCase):
         class FakeBenchmarkProvider:
             def __init__(self, **kwargs) -> None:
                 self.kwargs = kwargs
+
+            def set_budget_exceeded_fn(self, fn) -> None:
+                pass
 
         class FailIfLLMConstructed:
             def __init__(self, *args, **kwargs) -> None:
