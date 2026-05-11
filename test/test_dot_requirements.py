@@ -8,6 +8,7 @@ import torch
 
 import helion
 from helion import _compat
+from helion._compiler.autotuner_heuristics.cute import CuteTcgen05ClusterM2Heuristic
 from helion._compiler.cute.strategies import ROLE_LOCAL_MONOLITHIC_DEFAULT_WARP_SPEC
 from helion._compiler.cute.strategies import Tcgen05LayoutOverrides
 from helion._compiler.cute.strategies import Tcgen05LayoutStrategy
@@ -427,9 +428,12 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
                 # shape where it has no productive lever.
                 self.assertEqual(spec._tcgen05_cluster_m_search_choices, (1,))
                 self.assertIsNone(spec._tcgen05_cluster_m2_search_constraints)
-                self.assertEqual(spec.compiler_seed_configs, [])
-                self.assertEqual(spec.autotuner_heuristics, [])
-                self.assertEqual(ConfigGeneration(spec).seed_flat_config_pairs(), [])
+                # Keep this assertion scoped to the cluster_m=2 seed heuristic:
+                # future unrelated heuristics may still apply to these shapes.
+                self.assertNotIn(
+                    CuteTcgen05ClusterM2Heuristic.name,
+                    spec.autotuner_heuristics,
+                )
                 # Persistent pid types are still allowed (the static-
                 # full-tile gate above this is unaffected) — only the
                 # cluster_m search arm narrows.
