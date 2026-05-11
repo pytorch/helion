@@ -793,6 +793,10 @@ class DeviceIR:
         temp.graphs = [g.copy() for g in self.graphs]
         temp._apply_rolling(config)
         temp._apply_epilogue_subtiling(config)
+        if CompileEnvironment.current().backend_name == "metal":
+            from .metal.mpp_graph_transform import rewrite_mpp_graphs
+
+            rewrite_mpp_graphs(temp)
         return temp.graphs
 
     def _apply_rolling(self, config: Config) -> None:

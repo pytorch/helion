@@ -1026,6 +1026,25 @@ def codegen_baddbmm(ctx: LoweringContext, node: Node) -> ast.AST:
     return reduce_3d_dot(ctx, node, True)
 
 
+@mm_lowering.register_codegen("metal")
+@addmm_lowering.register_codegen("metal")
+def codegen_matmul_metal(ctx: LoweringContext, node: Node) -> ast.AST:
+    """Metal backend codegen for 2D matmul ops (mm, addmm)."""
+    # Metal backend doesn't support matmul kwargs (e.g. alpha/beta scaling).
+    assert not node.kwargs, "matmul kwargs not supported by Metal backend"
+    from .metal.metal_mma import codegen_metal_mma
+
+    with_acc = node.target is torch.ops.aten.addmm.default
+    result = codegen_metal_mma(ctx, node, with_acc=with_acc)
+    if result is not None:
+        return result
+    raise exc.BackendUnsupported(
+        "metal",
+        "Metal MPP supports only canonical 2D mm/addmm today: "
+        "load A[M,K] and B[K,N], reduce over one K tile loop, then store C[M,N]",
+    )
+
+
 def _pallas_dot(ctx: LoweringContext, node: Node, with_acc: bool) -> ast.AST:
     """Generate jnp.dot_general for Pallas backend."""
     if with_acc:

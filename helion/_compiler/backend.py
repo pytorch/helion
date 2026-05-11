@@ -1978,6 +1978,13 @@ def _detect_mma_loop(
     return False
 
 
+def _kernel_has_mpp_graph(fn: DeviceFunction) -> bool:
+    return any(
+        type(graph_info).__name__ == "MPPGraphInfo"
+        for graph_info in fn.codegen.codegen_graphs
+    )
+
+
 def _detect_specialized_mma_loop(
     fn: DeviceFunction,
     block_ids: list[int],
@@ -3913,5 +3920,77 @@ class MetalBackend(Backend):
         Metal inherits this behavior for now; users hitting the error
         should pick a smaller ``block_sizes`` value.
         """
+        config = self._config_with_mpp_thread_budget(fn, block_ids, config)
         # pyrefly: ignore[bad-argument-type]
         return CuteBackend.create_loop_strategy(self, fn, block_ids, config)
+
+    def _config_with_mpp_thread_budget(
+        self, fn: DeviceFunction, block_ids: list[int], config: Config
+    ) -> Config:
+        """Reserve root-grid thread budget for MPPGraph cooperative lanes."""
+        if not _kernel_has_mpp_graph(fn):
+            return config
+
+        from ..runtime.config import Config
+        from .compile_environment import CompileEnvironment
+        from .cute.thread_budget import MAX_THREADS_PER_BLOCK
+        from .host_function import HostFunction
+
+        device_ir = HostFunction.current().device_ir
+        if not device_ir.grid_block_ids or block_ids != device_ir.grid_block_ids[0]:
+            return config
+        if len(block_ids) < 2:
+            return config
+
+        env = CompileEnvironment.current()
+
+        def largest_divisor_at_most(size: int, limit: int) -> int:
+            for divisor in range(limit, 0, -1):
+                if size % divisor == 0:
+                    return divisor
+            return 1
+
+        def resolved_threads_for_position(pos: int) -> int | None:
+            block_id = block_ids[pos]
+            block_size = env.block_sizes[block_id].from_config(config)
+            if not isinstance(block_size, int):
+                return None
+            configured = int(
+                env.config_spec.num_threads.config_get(config.num_threads, block_id, 0)
+            )
+            return configured if configured > 0 else block_size
+
+        first_axis_threads = resolved_threads_for_position(0)
+        if first_axis_threads is None:
+            return config
+
+        num_threads = list(config.num_threads)
+        if len(num_threads) < len(env.config_spec.num_threads):
+            num_threads.extend(
+                [0] * (len(env.config_spec.num_threads) - len(num_threads))
+            )
+
+        used_threads = max(config.num_warps * 32, first_axis_threads)
+        changed = False
+        for pos in range(1, len(block_ids)):
+            block_id = block_ids[pos]
+            configured = int(
+                env.config_spec.num_threads.config_get(config.num_threads, block_id, 0)
+            )
+            if configured > 0:
+                used_threads *= configured
+                continue
+            axis_threads = resolved_threads_for_position(pos)
+            if axis_threads is None:
+                continue
+            budget = max(1, MAX_THREADS_PER_BLOCK // max(1, used_threads))
+            chosen = largest_divisor_at_most(axis_threads, budget)
+            config_index = env.config_spec.num_threads.block_id_to_index(block_id)
+            if num_threads[config_index] != chosen:
+                num_threads[config_index] = chosen
+                changed = True
+            used_threads *= chosen
+
+        if not changed:
+            return config
+        return Config.from_dict({**config.config, "num_threads": num_threads})

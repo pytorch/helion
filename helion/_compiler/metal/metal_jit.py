@@ -30,6 +30,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from .msl_ast_walker import EmitState
 from .msl_ast_walker import _emit_stmts
 
 if TYPE_CHECKING:
@@ -97,8 +98,28 @@ def _generate_msl(
         "#include <c10/metal/utils.h>",
         "#include <c10/metal/special_math.h>",
         "using namespace metal;",
-        "",
     ]
+    if _uses_mpp_markers(body_stmts):
+        msl_parts.extend(
+            [
+                "#if !__has_include(<metal_tensor>)",
+                '#error "Helion Metal MPP lowering requires <metal_tensor>"',
+                "#endif",
+                (
+                    "#if !__has_include("
+                    "<MetalPerformancePrimitives/MPPTensorOpsMatMul2d.h>)"
+                ),
+                (
+                    '#error "Helion Metal MPP lowering requires '
+                    '<MetalPerformancePrimitives/MPPTensorOpsMatMul2d.h>"'
+                ),
+                "#endif",
+                "#include <metal_tensor>",
+                "#include <MetalPerformancePrimitives/MPPTensorOpsMatMul2d.h>",
+                "using namespace mpp::tensor_ops;",
+            ]
+        )
+    msl_parts.append("")
 
     params: list[str] = []
     scalar_preamble: list[str] = []
@@ -137,8 +158,19 @@ def _generate_msl(
     for name in sorted(block_sizes):
         msl_parts.append(f"    constexpr int {name} = {block_sizes[name]};")
 
-    declared: set[str] = set(block_sizes)
-    _emit_stmts(body_stmts, msl_parts, indent=4, declared=declared)
+    state = EmitState(declared=set(block_sizes))
+
+    _emit_stmts(body_stmts, msl_parts, indent=4, state=state)
 
     msl_parts.append("}")
     return "\n".join(msl_parts)
+
+
+def _uses_mpp_markers(body_stmts: list[ast.stmt]) -> bool:
+    for node in ast.walk(ast.Module(body=body_stmts, type_ignores=[])):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if isinstance(func, ast.Name) and func.id.startswith("_metal_mpp_"):
+            return True
+    return False
