@@ -427,7 +427,9 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
                 # shape where it has no productive lever.
                 self.assertEqual(spec._tcgen05_cluster_m_search_choices, (1,))
                 self.assertIsNone(spec._tcgen05_cluster_m2_search_constraints)
-                self.assertEqual(spec.autotune_seed_configs(), [])
+                self.assertEqual(spec.compiler_seed_configs, [])
+                self.assertEqual(spec.autotuner_heuristics, [])
+                self.assertEqual(ConfigGeneration(spec).seed_flat_config_pairs(), [])
                 # Persistent pid types are still allowed (the static-
                 # full-tile gate above this is unaffected) — only the
                 # cluster_m search arm narrows.
