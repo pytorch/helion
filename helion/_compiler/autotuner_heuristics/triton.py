@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING
 from ...runtime.config import Config
 from .common import clamp_block_size_targets
 from .common import matches_hardware
-from .registry import SeedHeuristic
+from .registry import AutotunerHeuristic
 
 if TYPE_CHECKING:
     from ..compile_environment import CompileEnvironment
@@ -14,7 +14,7 @@ if TYPE_CHECKING:
 
 # Heuristic was originally contributed by @umechand-amd
 # in https://github.com/pytorch/helion/pull/2357.
-class TritonSkinnyGemmHeuristic(SeedHeuristic):
+class TritonSkinnyGemmHeuristic(AutotunerHeuristic):
     name = "triton_skinny_gemm"
     backend = "triton"
     MIN_ASPECT_RATIO = 8
@@ -57,7 +57,7 @@ class TritonSkinnyGemmHeuristic(SeedHeuristic):
         )
 
     @classmethod
-    def get_config(cls, env: CompileEnvironment, device_ir: DeviceIR) -> Config:
+    def get_seed_config(cls, env: CompileEnvironment, device_ir: DeviceIR) -> Config:
         assert len(env.config_spec.matmul_facts) == 1
         fact = env.config_spec.matmul_facts[0]
         assert fact.static_m is not None

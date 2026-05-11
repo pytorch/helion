@@ -9,8 +9,8 @@ if TYPE_CHECKING:
     from ..device_ir import DeviceIR
 
 
-class SeedHeuristic:
-    """Base class for compiler-owned autotune seed heuristics."""
+class AutotunerHeuristic:
+    """Base class for compiler-owned autotuner heuristics."""
 
     name: ClassVar[str]
     backend: ClassVar[str]
@@ -20,8 +20,10 @@ class SeedHeuristic:
         raise NotImplementedError
 
     @classmethod
-    def get_config(cls, env: CompileEnvironment, device_ir: DeviceIR) -> Config:
-        raise NotImplementedError
+    def get_seed_config(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> Config | None:
+        return None
 
 
-SeedHeuristicType = type[SeedHeuristic]
+AutotunerHeuristicType = type[AutotunerHeuristic]

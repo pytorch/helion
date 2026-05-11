@@ -8,7 +8,7 @@ from ..cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
 from ..cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
 from ..cute.tcgen05_constants import TCGEN05_TWO_CTA_SEED_L2_GROUPING
 from ..cute.tcgen05_constants import TCGEN05_TWO_CTA_SEED_PID_TYPE
-from .registry import SeedHeuristic
+from .registry import AutotunerHeuristic
 
 if TYPE_CHECKING:
     from ...autotuner.config_fragment import BlockSizeFragment
@@ -16,7 +16,7 @@ if TYPE_CHECKING:
     from ..device_ir import DeviceIR
 
 
-class CuteTcgen05ClusterM2Heuristic(SeedHeuristic):
+class CuteTcgen05ClusterM2Heuristic(AutotunerHeuristic):
     name = "cute_tcgen05_cluster_m2"
     backend = "cute"
 
@@ -41,11 +41,11 @@ class CuteTcgen05ClusterM2Heuristic(SeedHeuristic):
         )
 
     @classmethod
-    def get_config(cls, env: CompileEnvironment, device_ir: DeviceIR) -> Config:
+    def get_seed_config(cls, env: CompileEnvironment, device_ir: DeviceIR) -> Config:
         spec = env.config_spec
         bk = cls._select_bk(env)
         if bk is None:
-            raise AssertionError(f"{cls.name} get_config called while ineligible")
+            raise AssertionError(f"{cls.name} get_seed_config called while ineligible")
 
         block_sizes = [
             TCGEN05_TWO_CTA_BLOCK_M,

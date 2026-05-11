@@ -40,6 +40,7 @@ from torch.utils.weak import WeakIdKeyDictionary
 from .. import exc
 from .._compile_time import measure
 from .._compiler.ast_extension import unparse
+from .._compiler.autotuner_heuristics import compiler_seed_configs
 from .._compiler.backend import TritonBackend
 from .._compiler.compile_environment import CompileEnvironment
 from .._compiler.compile_environment import TensorDescriptorLayoutGuard
@@ -50,7 +51,6 @@ from .._compiler.generate_ast import generate_ast
 from .._compiler.inductor_lowering_extra import patch_inductor_lowerings
 from .._compiler.kernel_compiler import KernelCompiler
 from .._compiler.output_header import assert_no_conflicts
-from .._compiler.seed_heuristics import compiler_seed_configs
 from .._compiler.variable_origin import ArgumentOrigin
 from .._dist_utils import _find_process_group_name
 from .._dist_utils import check_config_consistancy as dist_check_config_consistancy

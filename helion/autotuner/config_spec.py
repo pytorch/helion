@@ -414,7 +414,7 @@ class ConfigSpec:
         # explicit config, so normalize() must reject the unsafe values.
         self._tcgen05_num_epi_warps_validation_choices: tuple[int, ...] | None = None
         self.compiler_seed_configs: list[helion.Config] = []
-        self.compiler_seed_heuristics: list[str] = []
+        self.autotuner_heuristics: list[str] = []
         self.matmul_facts: list[MatmulFact] = []
         self.store_indices: list[int] = []
         self.backend_tunable_fragments = self.backend.tunable_fragments()
