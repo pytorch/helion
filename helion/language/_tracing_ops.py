@@ -1871,12 +1871,20 @@ def _classify_pipelined_tensors(
                 outer_access_tensor_ids.add(id(val))
 
     pipelined_ids: set[int] = set()
+    inner_block_id_set = set(block_ids)
     for (fake, _sub_meta, _direction), vmem_shape in zip(
         all_tensor_info, vmem_shapes, strict=True
     ):
         if not _check_dma_alignment(vmem_shape):
             continue
         if id(fake) in outer_access_tensor_ids:
+            continue
+        # Skip loop-invariant tensors: if none of the tensor's subscript
+        # dimensions correspond to an inner pipeline block_id, it doesn't
+        # vary with the pipeline iteration and should stay on its outer
+        # VMEM BlockSpec (single buffer, no redundant DMA).
+        dim_to_bid = _get_dim_block_ids(_sub_meta, env)
+        if not (set(dim_to_bid.values()) & inner_block_id_set):
             continue
         pipelined_ids.add(id(fake))
     return all_tensor_info, vmem_shapes, pipelined_ids
