@@ -268,10 +268,6 @@ class CompileEnvironment:
         self._foreign_symint_cache: dict[
             tuple[int, sympy.Expr], int | torch.SymInt
         ] = {}
-        # TODO(hinriksnaer): tracing state, not env config. move to CompilerState?
-        self.device_load_count = (
-            0  # Track number of loads in all device code for eviction policy tuning
-        )
         if settings.autotune_force_persistent or dist.is_initialized():
             for pid_type in (
                 "flat",

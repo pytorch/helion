@@ -1880,7 +1880,6 @@ def _register_load_store_tunables(
             EnumFragment(choices=get_valid_eviction_policies(env.backend_name)),
             length=loads_without_eviction_policy,
         )
-        env.device_load_count = loads_without_eviction_policy
 
     # Indexing applies to ALL loads and stores
     total_count = total_load_count + store_count
