@@ -27,6 +27,7 @@ from helion._testing import code_and_output
 from helion._testing import onlyBackends
 from helion._testing import patch_cute_mma_support
 from helion._testing import skipIfMTIA
+from helion.autotuner import PowerOfTwoFragment
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.autotuner.config_spec import ConfigSpec
 from helion.exc import InvalidConfig
@@ -44,6 +45,38 @@ def _matmul_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
         for tile_k in hl.tile(k):
             acc += torch.matmul(x[tile_m, tile_k], y[tile_k, tile_n])
         out[tile_m, tile_n] = acc
+    return out
+
+
+@helion.kernel(static_shapes=True)
+def _split_k_offset_index_atomic(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """Split-K reduction whose atomic_add index mixes an offset-constant
+    (``tile_m.begin // block_m``) with a tile coord (``tile_n``).
+
+    The non-``BlockSizeOrigin`` first index would short-circuit the
+    prior cycle's gated ghost-axis predicate before the cycle that
+    lifted the scan above the gate; the inner-K thread axis remains
+    live in this scope and causes ``blockDim.z``-multiplier
+    over-counting without the ghost-axis leader predicate.
+    """
+    m, k = x.size()
+    _, n = y.size()
+    block_m = hl.register_block_size(m)
+    out = torch.zeros(
+        [(m + 15) // 16, n],
+        dtype=torch.promote_types(x.dtype, y.dtype),
+        device=x.device,
+    )
+    split_k = hl.register_tunable("split_k", PowerOfTwoFragment(1, 256))
+    k_block = helion.next_power_of_2(helion.cdiv(k, split_k))
+    for tile_m, tile_n, outer_k in hl.tile(
+        [m, n, k], block_size=[block_m, None, k_block]
+    ):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for inner_k in hl.tile(outer_k.begin, outer_k.end):
+            acc = torch.addmm(acc, x[tile_m, inner_k], y[inner_k, tile_n])
+        m_block_idx = tile_m.begin // block_m
+        hl.atomic_add(out, [m_block_idx, tile_n], acc.sum(dim=0))
     return out
 
 
@@ -937,11 +970,134 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         # Crash-survival regression check: the kernel must run without a
         # CUDA illegal memory access so the GPU context survives. This
         # test does NOT assert numerical correctness against
-        # ``torch.matmul``: the autotuner-picked config can still
-        # produce wrong output on this fp32 split-K path, which is a
-        # separate known follow-up.
+        # ``torch.matmul``: that is pinned separately by
+        # ``test_cute_atomic_add_predicates_cta_resident_thread_axis``
+        # below, which guards against atomic_add over-counting when the
+        # inner-K loop's thread axis remains live in the surrounding
+        # scope.
         bound(x, y)
         torch.cuda.synchronize()
+
+    @onlyBackends(["cute"])
+    def test_cute_atomic_add_predicates_cta_resident_thread_axis(self) -> None:
+        """``hl.atomic_add`` outside an inner device loop must predicate
+        on the loop's CTA-resident thread axis.
+
+        ``examples.matmul_split_k`` issues ``hl.atomic_add(out, [tile_m,
+        tile_n], acc)`` outside an inner ``for inner_k in hl.tile(...)``
+        device loop. When the autotuner picks a config that maps the
+        inner-K block_id onto a thread axis (here ``thread_idx[2]``),
+        every axis-2 thread continues to execute the post-inner-loop
+        code with the same broadcast reduction value. Without a
+        ``thread_idx[axis] == 0`` predicate on the atomic, each output
+        cell is accumulated ``blockDim.z`` times, producing a result
+        that is ``blockDim.z``-x too large.
+        """
+        from helion._testing import EXAMPLES_DIR
+        from helion._testing import import_path
+
+        torch.manual_seed(0)
+        x = torch.randn(64, 1024, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(1024, 64, device=DEVICE, dtype=torch.float32)
+        expected = torch.matmul(x, y)
+
+        mod = import_path(EXAMPLES_DIR / "matmul_split_k.py")
+        config = helion.Config(
+            block_sizes=[16, 2, 16],
+            num_threads=[0, 2, 8],
+            split_k=32,
+        )
+        mod.matmul_split_k._bound_kernels.clear()
+        bound = mod.matmul_split_k.bind((x, y))
+        bound.set_config(config)
+
+        code = bound.to_triton_code(config)
+        # The atomic_add must be guarded by a CTA-resident leader
+        # predicate on axis 2 (the inner-K loop's thread axis). The
+        # predicate is emitted on the surrounding ``if`` statement, not
+        # on the atomic call itself.
+        lines = code.splitlines()
+        found = False
+        for idx, ln in enumerate(lines):
+            if "cute.arch.atomic_add" in ln:
+                # Walk back through the enclosing context (a small fixed
+                # window is enough; the predicate is the immediately
+                # preceding ``if`` statement).
+                for prior in reversed(lines[max(0, idx - 4) : idx]):
+                    if prior.lstrip().startswith("if "):
+                        self.assertIn(
+                            "cute.arch.thread_idx()[2] == 0", prior, msg=prior
+                        )
+                        found = True
+                        break
+                self.assertTrue(found, msg=f"no enclosing if for: {ln}")
+                break
+        if not found:
+            self.fail("could not locate cute.arch.atomic_add in generated code")
+
+        out = bound(x, y)
+        torch.cuda.synchronize()
+        # fp32 split-K with 32-way K split + atomic-add over 1024 K
+        # elements per output. Loose atol matches the existing
+        # ``test_matmul_split_k`` accuracy bar in ``test_examples.py``.
+        torch.testing.assert_close(out, expected, atol=1, rtol=0.01)
+
+    @onlyBackends(["cute"])
+    def test_cute_atomic_add_predicates_ghost_axis_for_offset_constant_index(
+        self,
+    ) -> None:
+        """Ghost-axis predicate must fire even when the atomic index
+        does not flow through a ``BlockSizeOrigin`` symbol.
+
+        The fix is required for index forms beyond
+        ``[tile_m, tile_n]`` — e.g. an offset-constant
+        ``tile.begin // block_size`` paired with another tile coord.
+        The prior cycle's predicate gated the ghost-axis scan behind
+        ``has_block_size_index``; if every index were offset-constant
+        the gate would return early and miss the ghost axis. This test
+        uses a mixed index ``[m_block_idx, tile_n]`` so axis 1 still
+        triggers the gate while axis 0 is offset-constant and axis 2
+        is a ghost from the exited inner-K device loop. Pre-fix the
+        old code only predicated axis 0 (non-indexed active block_m)
+        and missed axis 2, producing an 8× over-count.
+        """
+        torch.manual_seed(0)
+        m, k, n = 16, 1024, 64
+        x = torch.randn(m, k, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(k, n, device=DEVICE, dtype=torch.float32)
+        expected = torch.matmul(x, y).sum(dim=0).unsqueeze(0)
+
+        _split_k_offset_index_atomic._bound_kernels.clear()
+        bound = _split_k_offset_index_atomic.bind((x, y))
+        config = helion.Config(
+            block_sizes=[16, 2, 16],
+            num_threads=[0, 2, 8],
+            split_k=32,
+            indexing="block_ptr",
+        )
+        bound.set_config(config)
+
+        code = bound.to_triton_code(config)
+        # The ghost-axis predicate on axis 2 (inner-K loop's thread
+        # axis after exit) must appear on the atomic_add's enclosing
+        # ``if``.
+        lines = code.splitlines()
+        found_axis_2 = False
+        for idx, ln in enumerate(lines):
+            if "cute.arch.atomic_add" in ln:
+                for prior in reversed(lines[max(0, idx - 4) : idx]):
+                    if prior.lstrip().startswith("if "):
+                        self.assertIn(
+                            "cute.arch.thread_idx()[2] == 0", prior, msg=prior
+                        )
+                        found_axis_2 = True
+                        break
+                break
+        self.assertTrue(found_axis_2, msg="ghost-axis predicate missing")
+
+        out = bound(x, y)
+        torch.cuda.synchronize()
+        torch.testing.assert_close(out, expected, atol=1, rtol=0.01)
 
     @skipIfMTIA("MTIA requires tl.dot initial value stride >= 128 bytes")
     def test_matmul_smaller_than_min_dot_size(self) -> None:
