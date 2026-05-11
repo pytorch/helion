@@ -69,26 +69,25 @@ class KernelCompiler:
         constexpr_args: dict[str, object],
     ) -> HostFunction:
         """Run the full compilation pipeline and return the compiled HostFunction."""
-        hf = HostFunction(fn)
-        with hf:
-            self.parse(hf, fake_args, constexpr_args)
-            with self._compilation_context():
-                self.unroll(hf)
-                self.propagate_types(hf)
-                self.finalize_config()
-                self.lower(hf)
+        hf = self.parse(fn, fake_args, constexpr_args)
+        with hf, self._compilation_context():
+            self.unroll(hf)
+            self.propagate_types(hf)
+            self.finalize_config()
+            self.lower(hf)
         return hf
 
     def parse(
         self,
-        hf: HostFunction,
+        fn: types.FunctionType,
         fake_args: list[object],
         constexpr_args: dict[str, object],
-    ) -> None:
+    ) -> HostFunction:
         with measure("HostFunction.parse_ast"):
-            source_indented = inspect.getsource(hf.fn)
+            source_indented = inspect.getsource(fn)
             source = textwrap.dedent(source_indented)
-            hf._column_offset = source_indented.index(source[0])
+            column_offset = source_indented.index(source[0])
+            code = fn.__code__
             root = ast.parse(source)
             assert isinstance(root, ast.Module)
             function_defs = [
@@ -99,21 +98,22 @@ class KernelCompiler:
                 f"{[type(stmt).__name__ for stmt in root.body]}"
             )
             (root,) = function_defs
-            root = ast_extension.convert(root)
+            root = ast_extension.convert(root, code, column_offset)
             assert isinstance(root, ast.FunctionDef)
             assert isinstance(root, ast_extension.ExtendedAST)
             _validate_ast(root)
-            params = inspect.signature(hf.fn).bind(*fake_args)
+            params = inspect.signature(fn).bind(*fake_args)
             params.apply_defaults()
-            hf.definition = KernelDefinition(
-                fn=hf.fn,
+
+            definition = KernelDefinition(
+                fn=fn,
                 constexpr_args=constexpr_args,
                 name=root.name,
                 args=root.args,
                 body=root.body,
                 params=params,
             )
-            hf.location = root._location
+            return HostFunction(definition, root._location)
 
     def unroll(self, hf: HostFunction) -> None:
         from .static_loop_unroller import unroll_static_loops

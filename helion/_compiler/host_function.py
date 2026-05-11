@@ -21,8 +21,6 @@ from .ast_extension import expr_from_string
 from .ast_extension import statement_from_string
 from .compile_environment import CompileEnvironment
 from .output_header import SOURCE_MODULE
-from .source_location import SourceLocation
-from .source_location import UnknownLocation
 from .type_printer import print_ast
 from .variable_origin import AttributeOrigin
 from .variable_origin import GlobalOrigin
@@ -34,6 +32,7 @@ if TYPE_CHECKING:
     import types
 
     from .device_ir import DeviceIR
+    from .source_location import SourceLocation
     from .type_propagation import TypeInfo
 
     class _TLS(Protocol):
@@ -121,18 +120,14 @@ class HostFunction:
 
     def __init__(
         self,
-        fn: types.FunctionType,
+        definition: KernelDefinition,
+        location: SourceLocation,
     ) -> None:
         super().__init__()
-        # pyrefly: ignore [read-only]
-        self._fn = fn
-        self.location: SourceLocation = UnknownLocation()
-        self.definition: KernelDefinition | None = None
+        self.definition = definition
+        self.location = location
         self.compiler_state: CompilerState = CompilerState()
         self._device_ir: DeviceIR | None = None
-        # TODO(hinriksnaer): could be a local in KernelCompiler.parse()
-        # if SourceLocation.from_ast() took code/column_offset explicitly.
-        self._column_offset: int = 0
 
     # Backward-compatible accessors
 
@@ -141,43 +136,31 @@ class HostFunction:
 
     @property
     def fn(self) -> types.FunctionType:
-        if self.definition is not None:
-            return self.definition.fn
-        return self._fn
+        return self.definition.fn
 
     @property
     def constexpr_args(self) -> dict[str, object]:
-        assert self.definition is not None
         return self.definition.constexpr_args
 
     @property
     def name(self) -> str:
-        assert self.definition is not None
         return self.definition.name
 
     @property
     def args(self) -> ast.arguments:
-        assert self.definition is not None
         return self.definition.args
 
     @property
     def body(self) -> list[ast.stmt]:
-        assert self.definition is not None
         return self.definition.body
 
     @body.setter
     def body(self, value: list[ast.stmt]) -> None:
-        assert self.definition is not None
         self.definition.body = value
 
     @property
     def params(self) -> inspect.BoundArguments:
-        assert self.definition is not None
         return self.definition.params
-
-    @property
-    def column_offset(self) -> int:
-        return self._column_offset
 
     @property
     def device_ir(self) -> DeviceIR:
