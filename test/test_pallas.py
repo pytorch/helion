@@ -493,6 +493,68 @@ class TestPallas(TestCase):
         code, result = code_and_output(add_kernel, args, block_size=512)
         torch.testing.assert_close(result, args[0] + args[1])
 
+    def test_store_slice_1d(self) -> None:
+        """Store value sliced when block_size > tensor dim (1D)."""
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def fill_kernel(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size(0)):
+                out[tile] = hl.full([tile], 1.0, dtype=x.dtype)
+            return out
+
+        x = torch.randn(1024, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(fill_kernel, (x,), block_size=4096)
+        self.assertIn("[:1024]", code)
+        torch.testing.assert_close(result, torch.ones_like(x))
+
+    def test_store_slice_2d(self) -> None:
+        """Store value sliced on the dim where block_size > tensor dim (2D)."""
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def fill_2d(x: torch.Tensor) -> torch.Tensor:
+            m, n = x.size()
+            out = torch.empty_like(x)
+            for tile_m, tile_n in hl.tile([m, n]):
+                out[tile_m, tile_n] = hl.full([tile_m, tile_n], 1.0, dtype=x.dtype)
+            return out
+
+        # 100 < 128, 256 == 256 → only dim 0 needs slicing
+        x = torch.randn(100, 256, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(fill_2d, (x,), block_size=[128, 256])
+        self.assertIn("[:100, :]", code)
+        torch.testing.assert_close(result, torch.ones_like(x))
+
+        # 100 < 128, 200 < 256 → both dims need slicing
+        x2 = torch.randn(100, 200, device=DEVICE, dtype=torch.float32)
+        code2, result2 = code_and_output(fill_2d, (x2,), block_size=[128, 256])
+        self.assertIn("[:100, :200]", code2)
+        torch.testing.assert_close(result2, torch.ones_like(x2))
+
+    def test_store_slice_skips_pl_ds_dim(self) -> None:
+        """Store value is not sliced on dimensions indexed with pl.ds()."""
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def fill_inner_loop(x: torch.Tensor) -> torch.Tensor:
+            m, n = x.size()
+            out = torch.empty_like(x)
+            for tile_m in hl.tile(m):
+                for tile_n in hl.tile(n):
+                    out[tile_m, tile_n] = hl.full([tile_m, tile_n], 1.0, dtype=x.dtype)
+            return out
+
+        x = torch.randn(64, 32, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(
+            fill_inner_loop,
+            (x,),
+            block_size=[128, 64],
+            pallas_loop_type="fori_loop",
+        )
+        self.assertIn("pl.ds(", code)
+        self.assertIn("[:64, :]", code)
+        self.assertNotIn("[:64, :32]", code)
+        torch.testing.assert_close(result, torch.ones_like(x))
+
     def test_add_does_not_donate_inputs(self) -> None:
         """Verify that read-only inputs are not donated by the kernel.
 

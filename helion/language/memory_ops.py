@@ -274,7 +274,12 @@ def _(state: CodegenState) -> None:
     device_fn = state.device_function
     device_fn.device_store_index += 1
     device_fn.device_memory_op_index += 1
-    index_str, _ = pallas_codegen.index_str(state, subscript, tensor)
+    index_str, _, index_parts = pallas_codegen.index_components(
+        state, subscript, tensor
+    )
+    value = pallas_codegen.store_slice_value(
+        state, tensor, subscript, index_parts, value
+    )
     state.codegen.add_statement(
         statement_from_string(f"{name}[{index_str}] = {{value}}", value=value)
     )
