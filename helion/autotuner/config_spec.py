@@ -457,6 +457,27 @@ class ConfigSpec:
         self.has_pallas_inner_loops: bool = False
         self.has_symbolic_or_data_dependent_bounds: bool = False
         self.cute_tcgen05_search_enabled: bool = False
+        # Post-compile bind-time flag: True when the host function's
+        # FX graphs contain a tcgen05 matmul AND at least one
+        # ``memory_ops.load`` whose target is not one of the
+        # matmul's operands (the productive C-input warp's
+        # trigger condition). Set by ``BoundKernel`` after
+        # ``KernelCompiler.compile`` via
+        # ``host_function_has_tcgen05_aux_kernel_pattern`` before
+        # any autotune sampling. Used by
+        # ``_tcgen05_strategy_autotune_fragments`` to widen the
+        # ``tcgen05_strategy`` and
+        # ``tcgen05_warp_spec_c_input_warps`` search surfaces to
+        # ``(MONOLITHIC, WITH_SCHEDULER)`` and ``(0, 1)``
+        # respectively when the productive C-input warp can be
+        # productive — pure-matmul kernels (no aux) keep the
+        # narrow ``(0,)`` autotune surface so the inert C-input
+        # warp is not sampled as a strict resource cost. The
+        # default ``False`` matches non-tcgen05 paths and bind
+        # contexts that have not run post-compile detection (the
+        # explicit-config validation surface accepts
+        # ``c_input_warps=1`` regardless of this flag).
+        self.cute_tcgen05_aux_kernel_detected: bool = False
         # Allowed values of tcgen05_cluster_m the autotuner is allowed to
         # *search* over. None means "use the default set defined by
         # _tcgen05_optional_fragments". This is consulted by _flat_fields()
@@ -649,6 +670,123 @@ class ConfigSpec:
         return constraints.static_k % bk == 0 and (
             constraints.static_k // bk <= constraints.max_k_tiles
         )
+
+    def _tcgen05_c_input_seed_config(self) -> helion.Config | None:
+        """Seed the canonical productive C-input warp config for aux kernels.
+
+        Cycle 2f finding: the autotune surface widening landed in cycle
+        2e admits ``c_input_warps=1`` but the random initial population
+        draw misses it on residual cells where the
+        ``WITH_SCHEDULER + scheduler_warps=1 + c_input_warps=1`` corner
+        is a small intersection of the search space (zero of 44 configs
+        sampled on 8192x4096x2048 quick-effort autotune). The forced
+        c_input=1 perf class wins by +33% there, so leaving the corner
+        un-seeded leaves the headline residual win unreachable through
+        normal autotune.
+
+        This seed mirrors ``_tcgen05_cluster_m2_seed_config`` (same
+        ``[256, 256, 128]`` tile, ``cluster_m=2``, ``persistent_interleaved``
+        pid order) but stamps the WITH_SCHEDULER strategy + the
+        ``c_input_warps=1`` productive body. ``ab_stages`` is held at 2
+        because the ``ab=3 + c_input=1`` combination is unconditionally
+        over the per-CTA SMEM budget on B200 (see
+        ``_fix_tcgen05_with_scheduler_search_config`` for the demotion
+        path and the MMA-codegen-time ``BackendUnsupported`` rejection).
+
+        Gated on ``cute_tcgen05_aux_kernel_detected`` so the seed only
+        fires for kernels whose post-compile FX scan identified an aux
+        load. Pure-matmul kernels keep the narrow autotune surface and
+        do not receive this seed — the inert C-input warp would occupy
+        an SM slot without delivering work and regress pure-matmul perf.
+
+        Returns ``None`` whenever the cluster_m=2 seed envelope is not
+        admitted (same structural checks: validated 3-block-size triple,
+        ``persistent_interleaved`` allowed, ``[256, 256, 128]`` falls
+        inside the block-size fragment ranges, and at least one bk in
+        the fragment range satisfies the cluster_m=2 K-tile cap).
+        """
+        if not self.cute_tcgen05_aux_kernel_detected:
+            return None
+        constraints = self._tcgen05_cluster_m2_search_constraints
+        if (
+            constraints is None
+            or TCGEN05_TWO_CTA_SEED_PID_TYPE not in self.allowed_pid_types
+        ):
+            return None
+        if len(self.block_sizes) != 3:
+            return None
+
+        bm_fragment = cast("BlockSizeFragment", self.block_sizes[0]._fragment(self))
+        bn_fragment = cast("BlockSizeFragment", self.block_sizes[1]._fragment(self))
+        bk_fragment = cast("BlockSizeFragment", self.block_sizes[2]._fragment(self))
+        if not (
+            bm_fragment.low <= TCGEN05_TWO_CTA_BLOCK_M <= bm_fragment.high
+            and bn_fragment.low <= TCGEN05_TWO_CTA_BLOCK_N <= bn_fragment.high
+        ):
+            return None
+
+        bk = bk_fragment.high
+        while bk >= bk_fragment.low:
+            if self._tcgen05_cluster_m2_bk_is_valid(bk, constraints):
+                seed_config: dict[str, Any] = {
+                    "block_sizes": [
+                        TCGEN05_TWO_CTA_BLOCK_M,
+                        TCGEN05_TWO_CTA_BLOCK_N,
+                        bk,
+                    ],
+                    # ``l2_groupings=[1]`` (NOT the cluster_m2 seed's
+                    # ``TCGEN05_TWO_CTA_SEED_L2_GROUPING=4``). Direct
+                    # verification on 4096^3 and 8192x4096x2048 bf16
+                    # residual: ``c_input_warps=1 + cluster_m=2 +
+                    # l2_groupings=[g]`` produces ~60-69% mismatched
+                    # elements vs the eager reference for every g > 1
+                    # tested ({2, 4, 8}); only ``g=1`` is correct.
+                    # The matched-shape cycle 2c forced c_input=1
+                    # baselines (765 / 880 / 803 mom-median TFLOP/s)
+                    # all run at ``l2_groupings=[1]`` so the perf
+                    # class the seed targets is the
+                    # ``g=1``-validated one. The autotune-rejected
+                    # ``g=4`` seed observed in cycle 2g is the
+                    # same codegen bug surfaced at the canonical
+                    # config — a separate fix follow-up.
+                    "l2_groupings": [1],
+                    "pid_type": TCGEN05_TWO_CTA_SEED_PID_TYPE,
+                    "tcgen05_cluster_m": 2,
+                    "tcgen05_num_epi_warps": 4,
+                    # The c_input productive body is unconditionally
+                    # paired with ``ab_stages=2``. The ``ab=3 +
+                    # c_input=1`` combo overshoots the 232 KB B200 SMEM
+                    # cap; ``_fix_tcgen05_with_scheduler_search_config``
+                    # also demotes search-time samples that carry both.
+                    "tcgen05_ab_stages": 2,
+                    TCGEN05_STRATEGY_CONFIG_KEY: (
+                        Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER.value
+                    ),
+                    TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY: 1,
+                    TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY: 1,
+                }
+                # Mirror the cluster_m2 seed: pure-matmul has exactly
+                # the A/B/C indexing slots, so stamp the validated
+                # tensor_descriptor triple. Fused epilogues add more
+                # memory ops, so leave those seeds to the spec default
+                # rather than constructing a partial list.
+                if self.indexing.length == 3:
+                    seed_config["indexing"] = [
+                        "tensor_descriptor",
+                        "tensor_descriptor",
+                        "tensor_descriptor",
+                    ]
+                return helion.Config(**seed_config)
+            bk //= 2
+        return None
+
+    def autotune_seed_configs(self) -> list[helion.Config]:
+        """Return validated extra configs that should be benchmarked early."""
+        seeds: list[helion.Config] = []
+        c_input_seed = self._tcgen05_c_input_seed_config()
+        if c_input_seed is not None:
+            seeds.append(c_input_seed)
+        return seeds
 
     def _fix_tcgen05_cluster_m2_search_config(self, config: dict[str, object]) -> None:
         """Canonicalize unvalidated search-only ``cluster_m=2`` products."""
@@ -848,6 +986,83 @@ class ConfigSpec:
             cluster_m=cluster_m,
         ):
             config["tcgen05_ab_stages"] = 2
+
+    def _fix_tcgen05_with_scheduler_search_config(
+        self, config: dict[str, object]
+    ) -> None:
+        """Pair WITH_SCHEDULER-only knobs and demote the
+        ``ab=3 + c_input_warps=1`` SMEM-over-budget combo.
+
+        Two adjustments tied to the aux-kernel-detected
+        autotune-surface widening (see
+        ``cute_tcgen05_aux_kernel_detected`` for the gate):
+
+        1. ``scheduler_warps`` and ``c_input_warps`` are gated by
+           ``tcgen05_strategy``: under ``ROLE_LOCAL_MONOLITHIC``
+           both must be 0 (the 6-warp role-local shape has no
+           slot for a scheduler or c_input warp); under
+           ``ROLE_LOCAL_WITH_SCHEDULER`` ``scheduler_warps`` must
+           be 1 (the strategy's definition). The cross-fragment
+           validator
+           (``validate_tcgen05_strategy_invariants``) rejects
+           mismatched pairs at codegen time; this fixup demotes
+           the mismatched samples before they reach codegen so
+           autotune does not spend cycles on doomed compiles.
+        2. The MMA-codegen-time rejection in
+           ``cute_mma._emit_mma_pipeline`` raises
+           ``BackendUnsupported`` for
+           ``ab_stages=3 + c_input_warps=1 + non-empty
+           single-store aux`` (the aux SMEM ring + AB pipeline
+           overshoot the 232 KB B200 SMEM cap by 30+ KB at every
+           validated tile shape). The autotuner would otherwise
+           sample this combo, hit the raise, and waste a
+           compile slot per sample. Demote
+           ``c_input_warps=1`` to ``c_input_warps=0`` when the
+           sample carries ``ab_stages=3`` so the sample still
+           produces a legal kernel (autotune compares
+           ``ab=3 + c_input=0`` against ``ab=2 + c_input=1``
+           via separate samples rather than the rejected combo).
+
+        Runs only when the aux-kernel-detected widening is
+        active (``cute_tcgen05_aux_kernel_detected`` is True
+        AND ``cute_tcgen05_search_enabled`` is True). For
+        non-aux kernels the autotune surface only samples
+        ``MONOLITHIC + scheduler_warps=0 + c_input_warps=0``
+        so the fixup is a no-op.
+        """
+        if not (
+            self.cute_tcgen05_search_enabled and self.cute_tcgen05_aux_kernel_detected
+        ):
+            return
+        strategy = config.get(TCGEN05_STRATEGY_CONFIG_KEY)
+        scheduler_warps = config.get(TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY)
+        c_input_warps = config.get(TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY)
+        ab_stages = config.get("tcgen05_ab_stages")
+        # Pair scheduler_warps + c_input_warps with strategy. The
+        # cross-fragment validator's rules:
+        # - MONOLITHIC: scheduler_warps must be 0, c_input_warps
+        #   must be 0.
+        # - WITH_SCHEDULER: scheduler_warps must be 1,
+        #   c_input_warps in {0, 1}.
+        if strategy == Tcgen05Strategy.ROLE_LOCAL_MONOLITHIC.value:
+            if scheduler_warps != 0:
+                config[TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY] = 0
+            if c_input_warps != 0:
+                config[TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY] = 0
+        elif strategy == Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER.value:
+            if scheduler_warps != 1:
+                config[TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY] = 1
+            # ``c_input_warps`` is allowed at ``{0, 1}`` —
+            # leave the sampled value unless the
+            # ``ab=3 + c_input=1`` SMEM-budget rejection
+            # below forces demotion.
+        # SMEM-budget demotion: ``ab=3 + c_input=1`` is
+        # unconditionally over-budget (see
+        # ``cute_mma._emit_mma_pipeline`` rejection). Demote
+        # c_input_warps to 0 so the sample still produces a
+        # legal kernel.
+        if ab_stages == 3 and config.get(TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY) == 1:
+            config[TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY] = 0
 
     def _fix_tcgen05_cluster_m1_persistent_search_config(
         self, config: dict[str, object]
@@ -1140,20 +1355,52 @@ class ConfigSpec:
         the existing ``tcgen05_num_epi_warps`` field. See
         ``warp_spec_from_config`` for the read site.
         """
+        # When the bind-time detector identified the kernel as
+        # tcgen05-matmul-with-aux (a residual / bias-residual /
+        # chained-residual epilogue), widen the strategy +
+        # scheduler_warps + c_input_warps fragments so autotune
+        # can discover the productive C-input warp
+        # configuration. Detection runs post-compile in
+        # ``BoundKernel`` via
+        # ``host_function_has_tcgen05_aux_kernel_pattern``. For
+        # pure-matmul kernels the flag stays False and the
+        # surface remains narrowed to
+        # ``MONOLITHIC + c_input_warps=0`` so autotune cannot
+        # pick the strictly-worse
+        # ``WITH_SCHEDULER + c_input_warps=1`` shape on a
+        # kernel where the C-input warp would be inert (the
+        # inert warp occupies an SM slot without delivering
+        # work).
+        if self.cute_tcgen05_aux_kernel_detected:
+            strategy_choices: tuple[str, ...] = (
+                Tcgen05Strategy.ROLE_LOCAL_MONOLITHIC.value,
+                Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER.value,
+            )
+            # WITH_SCHEDULER requires exactly one scheduler
+            # warp; MONOLITHIC has none. The cross-fragment
+            # invariant validator
+            # (``validate_tcgen05_strategy_invariants``) rejects
+            # mismatched pairs at codegen time, and
+            # ``_fix_tcgen05_with_scheduler_search_config``
+            # pairs the values so autotune samples only valid
+            # combinations.
+            scheduler_warps_choices: tuple[int, ...] = (0, 1)
+            c_input_warps_choices: tuple[int, ...] = (0, 1)
+        else:
+            strategy_choices = (Tcgen05Strategy.ROLE_LOCAL_MONOLITHIC.value,)
+            scheduler_warps_choices = (0,)
+            c_input_warps_choices = (0,)
         return {
-            # ``ROLE_LOCAL_WITH_SCHEDULER`` is implemented and runs
-            # correctly on cluster_m=1 (validated by direct user
-            # config). The autotune surface stays narrowed to
-            # ``ROLE_LOCAL_MONOLITHIC`` until the cluster_m=2 path
-            # is also stable so autotune can't pick a hanging
-            # configuration mid-search. The validation surface
-            # accepts both strategies (see
+            # ``ROLE_LOCAL_WITH_SCHEDULER`` is implemented and
+            # runs correctly on cluster_m=1 / cluster_m=2. The
+            # autotune surface broadens when the bind-time
+            # detector identified an aux kernel (see
+            # ``cute_tcgen05_aux_kernel_detected`` above). The
+            # validation surface accepts both strategies (see
             # ``_tcgen05_strategy_validation_fragments``) so an
             # explicit ``helion.Config(tcgen05_strategy=...)``
             # round-trips through normalize.
-            TCGEN05_STRATEGY_CONFIG_KEY: EnumFragment(
-                (Tcgen05Strategy.ROLE_LOCAL_MONOLITHIC.value,)
-            ),
+            TCGEN05_STRATEGY_CONFIG_KEY: EnumFragment(strategy_choices),
             TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY: EnumFragment(
                 (Tcgen05LayoutStrategy.DEFAULT.value,)
             ),
@@ -1165,18 +1412,29 @@ class ConfigSpec:
             # the value the implemented strategies use.
             TCGEN05_WARP_SPEC_AB_LOAD_WARPS_KEY: EnumFragment((1,)),
             TCGEN05_WARP_SPEC_EPI_LOAD_WARPS_KEY: EnumFragment((0,)),
-            # ``scheduler_warps``: matches the autotune-surface
-            # narrowing of ``tcgen05_strategy`` above. Under
-            # MONOLITHIC, scheduler_warps must be 0; the validator
-            # rejects 1 with a MONOLITHIC strategy.
-            TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY: EnumFragment((0,)),
-            # ``c_input_warps``: G3.1-C step-2 (``cute_plan.md``
-            # §7.5.3.2) lifts this to ``{0, 1}`` under
-            # ``ROLE_LOCAL_WITH_SCHEDULER`` once the dedicated TMA
-            # producer + SMEM ring + role-local while loop land. The
-            # autotune surface stays narrowed to ``(0,)`` until
-            # cycle 34 perf-validates the productive C-input warp.
-            TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY: EnumFragment((0,)),
+            # ``scheduler_warps``: tracked with ``tcgen05_strategy``
+            # — must be 0 under MONOLITHIC and 1 under
+            # WITH_SCHEDULER. The cross-fragment validator
+            # rejects mismatched pairs; the
+            # ``_fix_tcgen05_with_scheduler_search_config`` fixup
+            # below pairs the values so autotune samples the
+            # valid (strategy, scheduler_warps) combinations.
+            TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY: EnumFragment(
+                scheduler_warps_choices
+            ),
+            # ``c_input_warps``: widening routed through the
+            # per-bind ``cute_tcgen05_aux_kernel_detected``
+            # flag so the autotune surface only samples
+            # ``c_input_warps=1`` when the kernel actually
+            # has an aux load. Under MONOLITHIC the
+            # cross-fragment validator forces
+            # ``c_input_warps=0`` (the MONOLITHIC 6-warp
+            # shape has no slot for the c_input warp); the
+            # ``_fix_tcgen05_with_scheduler_search_config``
+            # fixup demotes ``c_input_warps=1`` under
+            # MONOLITHIC samples so autotune does not spend
+            # cycles on the cross-fragment-rejected combo.
+            TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY: EnumFragment(c_input_warps_choices),
             # Register split is currently fixed at the role-local
             # MONOLITHIC values. G2-E may broaden.
             TCGEN05_WARP_SPEC_REGISTER_DECREASE_KEY: EnumFragment(
@@ -1966,6 +2224,16 @@ class ConfigSpec:
             # Run after the cluster_m fixups so the SMEM budget check
             # sees the post-projection ``cluster_m`` and ``block_sizes``.
             self._fix_tcgen05_ab_stages_three_search_config(config)
+            # Pair WITH_SCHEDULER-only knobs (strategy /
+            # scheduler_warps / c_input_warps) and demote the
+            # ``ab=3 + c_input=1`` SMEM-over-budget combo. Run
+            # AFTER the ab_stages_three fixup so the final
+            # ``ab_stages`` is what the c_input_warps demotion
+            # check sees: if ab_stages got demoted from 3 to 2
+            # above, c_input=1 is once again legal under
+            # WITH_SCHEDULER and the demotion below does not
+            # fire.
+            self._fix_tcgen05_with_scheduler_search_config(config)
 
         # Strategy data-model fragments (G2-A). Each per-fragment
         # validator runs first (type/range checks); cross-fragment

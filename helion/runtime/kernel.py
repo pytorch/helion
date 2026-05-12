@@ -496,6 +496,31 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                     self.env, self.host_function.device_ir
                 )
 
+                # Post-compile FX-graph scan to detect kernels
+                # whose tcgen05 matmul is followed by an
+                # aux-fused store
+                # (``out[tile] = (acc + residual[tile]).to(...)``
+                # and variants — see
+                # ``host_function_has_tcgen05_aux_kernel_pattern``
+                # for the accepted shapes). When detected, the
+                # autotune surface widens to admit
+                # ``tcgen05_strategy=ROLE_LOCAL_WITH_SCHEDULER``
+                # + ``tcgen05_warp_spec_c_input_warps=1`` so the
+                # productive C-input warp lift is reachable from
+                # the normal autotune path. For pure-matmul
+                # kernels the detector returns False and the
+                # autotune surface keeps the narrow
+                # ``MONOLITHIC + c_input_warps=0`` shape so
+                # autotune cannot sample the strictly-worse
+                # inert C-input warp configuration.
+                from .._compiler.cute.aux_tensor import (
+                    host_function_has_tcgen05_aux_kernel_pattern,
+                )
+
+                self.env.config_spec.cute_tcgen05_aux_kernel_detected = (
+                    host_function_has_tcgen05_aux_kernel_pattern(self.host_function)
+                )
+
     def _apply_mark_static(self, args: tuple[object, ...]) -> None:
         """
         Apply torch._dynamo.mark_static() markings from input tensors.
