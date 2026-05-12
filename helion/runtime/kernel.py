@@ -1283,7 +1283,10 @@ def _hashable_dim(s: int | torch.SymInt) -> Hashable:
 def _safe_bucket_dim(s: int | torch.SymInt) -> Hashable:
     if isinstance(s, torch.SymInt):
         return (id(s.node.shape_env), s.node.expr)
-    return min(s, 2)
+    # Dynamic-shape kernels should not get separate bound kernels for sizes
+    # 0 or 1.  Keep 2 as the canonical "dynamic dimension" bucket that was
+    # already used for all concrete sizes >= 2.
+    return 2
 
 
 _EMPTY_FROZENSET: frozenset[int] = frozenset()

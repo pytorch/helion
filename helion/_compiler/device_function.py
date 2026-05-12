@@ -1034,7 +1034,10 @@ class DeviceFunction:
             env = CompileEnvironment.current()
 
             # Find which dimension has stride==1
-            stride_one_dim = [*map(env.size_hint, fake_value.stride())].index(1)
+            layout_signature = env.tensor_descriptor_layout_signature(fake_value)
+            assert layout_signature is not None
+            stride_one_dim = layout_signature[0]
+            assert stride_one_dim is not None
 
             # Determine if we need permutation (stride==1 dimension is not last)
             permutation = None
@@ -1060,6 +1063,16 @@ class DeviceFunction:
                 block_size = [block_size[i] for i in permutation]
                 # Update block_size_expr for the permuted order
                 block_size_expr = ", ".join(map(self.literal_expr, block_size))
+
+            descriptor_dims = (
+                permutation if permutation is not None else [*range(fake_value.ndim)]
+            )
+            assert descriptor_dims[-1] == stride_one_dim
+            # The descriptor permutation above makes the last descriptor
+            # dimension the proven stride-one dimension. Triton checks this
+            # predicate at JIT time, so emit it as a literal even when other
+            # dynamic strides are runtime scalars.
+            stride_args[-1] = StaticShape(1)
 
             # Add tl.make_tensor_descriptor call to preamble
             sizes = ", ".join([arg.name for arg in size_args])
@@ -1225,6 +1238,7 @@ class DeviceFunction:
         for arg in param_args:
             scalar_preamble.extend(backend.scalar_arg_preamble(arg))
 
+        function_decorator = backend.function_decorator_for_args(param_args)
         return [
             *prefix,
             ast_rename(
@@ -1237,8 +1251,8 @@ class DeviceFunction:
                         *self.preamble,
                         *self.body,
                     ],
-                    decorator_list=[expr_from_string(backend.function_decorator)]
-                    if backend.function_decorator
+                    decorator_list=[expr_from_string(function_decorator)]
+                    if function_decorator
                     else [],
                     type_params=[],
                 ),
