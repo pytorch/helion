@@ -640,6 +640,18 @@ class DeviceFunction:
         # consumer-side ``consumer_wait``/``consumer_release`` and the
         # scheduler-warp role-local while.
         self.cute_tcgen05_sched_pipeline_plan: object | None = None
+        # ``_Tcgen05AuxPipelinePlan`` for the C-input warp's
+        # auxiliary-tensor SMEM-ring pipeline (``cute_plan.md``
+        # §7.5.3.2 cycle 2). Set in ``_codegen_cute_mma`` when the
+        # productive-body gate fires (``c_input_warp_count > 0`` AND
+        # non-empty ``aux_tensor_descriptors``); ``program_id.py``
+        # reads it when emitting the C-input warp role-local while
+        # body (per-descriptor ``producer_acquire`` → cooperative
+        # ``cute.copy(GMEM, SMEM_ring[stage])`` → ``producer_commit``),
+        # and ``memory_ops._aux_subtile_load_source`` reads the
+        # per-descriptor SMEM ring when cycle 3's consumer flip
+        # lands.
+        self.cute_tcgen05_aux_pipeline_plan: object | None = None
         self._cute_tcgen05_per_tile_stmt_ids: set[int] = set()
         self._cute_tcgen05_post_loop_stmt_ids: set[int] = set()
         self._cute_tcgen05_tma_load_role_stmt_ids: set[int] = set()
@@ -850,6 +862,21 @@ class DeviceFunction:
         the scheduler-warp role-local while.
         """
         self.cute_tcgen05_sched_pipeline_plan = plan
+
+    def register_cute_tcgen05_aux_pipeline_plan(self, plan: object) -> None:
+        """Register the C-input warp's auxiliary-tensor SMEM-ring
+        ``PipelineAsync`` plan (``cute_plan.md`` §7.5.3.2 cycle 2).
+
+        Set by ``cute_mma._codegen_cute_mma`` when the productive-body
+        gate fires (``c_input_warp_count > 0`` AND non-empty
+        ``aux_tensor_descriptors``). ``program_id.py`` reads it when
+        emitting the C-input warp's role-local while body
+        (per-descriptor ``producer_acquire`` → cooperative
+        ``cute.copy(GMEM, SMEM_ring[stage])`` → ``producer_commit``),
+        and ``memory_ops._aux_subtile_load_source`` reads the
+        per-descriptor SMEM ring when cycle 3's consumer flip lands.
+        """
+        self.cute_tcgen05_aux_pipeline_plan = plan
 
     def register_cute_tcgen05_per_tile_stmts(self, stmts: list[ast.AST]) -> None:
         """Mark statements that depend on per-tile coordinates.

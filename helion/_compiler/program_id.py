@@ -3231,8 +3231,7 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         layout: Tcgen05PersistentProgramIDs._Tcgen05PersistentLayout,
     ) -> ast.stmt:
         """Build the C-input warp's role-local while
-        (``cute_plan.md`` §7.5.3.2 cycle 1 of the producer-body
-        split).
+        (``cute_plan.md`` §7.5.3.2 producer-body split).
 
         Active when the matmul plan has ``c_input_warp_count > 0``
         AND the forward FX walker discovered one or more
@@ -3240,15 +3239,30 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         in the scheduler-broadcast pipeline as a *consumer*: each
         iteration it consumer-waits on ``sched_pipeline``, reads
         the published per-tile coords from the SMEM mailbox, runs
-        its role body, then consumer-releases. Cycle 1's role body
-        is empty apart from the ``virtual_pid_var`` write — the
-        warp waits / releases each iteration to keep the
-        sched-pipeline arrive count balanced. Cycle 2 fills in the
-        producer-side aux GMEM→SMEM cooperative copy (allocates
-        SMEM ring + ``PipelineAsync.create`` for ``c_pipeline_aux``,
-        emits ``producer_acquire`` → ``cute.copy`` → ``producer_commit``
-        per descriptor); cycle 3 wires the consumer-side SMEM read
-        flip in ``memory_ops._aux_subtile_load_source``.
+        its role body, then consumer-releases.
+
+        Per-tile body (post-cycle-2a):
+
+        1. ``virtual_pid_var`` write (decomposed from
+           ``work_tile_smem`` coords). Cycle 2b will use this to
+           build the aux GMEM tile for the cooperative copy.
+        2. No producer-side barrier ops fire this cycle. Cycle 2b
+           lands the complete producer handshake — the
+           ``c_pipeline_aux.producer_acquire(producer_state)`` /
+           cooperative ``cute.copy(GMEM, SMEM)`` /
+           ``c_pipeline_aux.producer_commit(producer_state)`` /
+           ``producer_state`` advance — and cycle 3 wires the
+           consumer-side SMEM read flip
+           (``c_pipeline_aux.consumer_wait`` /
+           ``consumer_release``) in
+           ``memory_ops._aux_subtile_load_source``. The producer
+           and consumer barrier ops *must* land in the same cycle
+           or a partial-handshake deadlock results (an early-2a
+           variant of this builder emitted producer barriers
+           without consumer releases; with ``num_stages=2`` the
+           third ``producer_acquire`` blocks forever once a CTA
+           wraps the pipeline depth — see the deadlock-regression
+           pin in ``TestCuteTcgen05AuxPipelineCycle2a``).
 
         Mirrors the consumer-side pattern in
         ``_build_role_local_while_with_scheduler`` — both route
@@ -3257,17 +3271,17 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         scope so the two consumer-role builders share one source
         of truth for the wait/release shape.
 
-        The ``virtual_pid_var`` write is *load-bearing for cycle 2*:
-        the producer body's aux GMEM tile is built by decomposing
-        the linear pid into ``(tile_m, tile_n)`` (same decomposition
-        the existing consumer roles already perform). Emitting it
-        in cycle 1 establishes the producer body's entry point so
-        the cycle-2 landing site can drop the per-descriptor
-        ``producer_acquire`` / ``cute.copy`` / ``producer_commit``
-        sequence in directly after this statement without a
-        structural rewrite. Cycle 2 also lifts the producer-arrive
-        contract on the C-input warp's lane-0 gate; the wait/release
-        shape stays unchanged.
+        Cycle 2a (this slice): the data-model + SMEM ring +
+        ``c_pipeline_aux`` ``PipelineAsync.create`` +
+        producer/consumer ``make_pipeline_state`` lands in
+        ``cute_mma._codegen_cute_mma``; the producer body does NOT
+        fire any barrier ops. The pipeline storage exists but the
+        producer/consumer handshake is dormant until cycle 2b
+        lands the producer ops + cooperative copy and cycle 3
+        lands the consumer-side flip. The pre-allocated
+        ``producer_state`` / ``consumer_state`` are unused this
+        cycle but reserved so cycle 2b / cycle 3 can wire them in
+        place without revisiting the allocator.
         """
         plan = self._tcgen05_plan()
         assert plan is not None and plan.has_c_input_warp, (
@@ -3282,6 +3296,23 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         sched_pipeline = sched_pipeline_plan.pipeline  # type: ignore[attr-defined]
         sched_consumer_state = (
             sched_pipeline_plan.consumer_state  # type: ignore[attr-defined]
+        )
+        # Aux pipeline plan (cycle 2a). The matmul-plan gate that
+        # admits this builder also fires the pipeline allocation
+        # in ``cute_mma._codegen_cute_mma``, so a non-None plan
+        # is the invariant we rely on once the gate is open.
+        # ``producer_state`` / ``consumer_state`` are reserved by
+        # the allocator but unused this cycle — cycle 2b wires the
+        # producer side and cycle 3 wires the consumer side. We
+        # keep the assert so a future gate-skew between
+        # ``has_c_input_warp + aux_tensor_descriptors`` and the
+        # cute_mma allocator fires here rather than producing a
+        # half-allocated kernel.
+        aux_pipeline_plan = device_function.cute_tcgen05_aux_pipeline_plan
+        assert aux_pipeline_plan is not None, (
+            "C-input role-local while requires a registered "
+            "aux pipeline plan; was register_cute_tcgen05_aux_pipeline_plan "
+            "called by _codegen_cute_mma?"
         )
 
         valid_var = device_function.new_var("tcgen05_c_input_warp_valid")
@@ -3311,14 +3342,18 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                 sched_consumer_state=sched_consumer_state,
             )
 
+        # Cycle 2a producer body: NO barrier ops. The aux pipeline
+        # storage is allocated up front but the
+        # ``producer_acquire`` / ``producer_commit`` handshake
+        # lands in cycle 2b paired with the cooperative
+        # GMEM→SMEM copy and the cycle-3 consumer side. Wiring
+        # producer barriers here without a matching consumer
+        # release would deadlock after ``num_stages`` iterations
+        # per CTA (the third ``producer_acquire`` blocks waiting
+        # for an empty-mbar arrival the consumer never issues).
         prelude: list[ast.stmt] = []
         prelude.extend(_consumer_wait_block())
         per_tile_body: list[ast.stmt] = [
-            # Load-bearing for cycle 2: the producer body
-            # (``producer_acquire`` → cooperative GMEM→SMEM
-            # ``cute.copy`` → ``producer_commit`` per descriptor)
-            # will land immediately after this line, using
-            # ``virtual_pid_var`` to decompose the aux tile coords.
             statement_from_string(f"{self.virtual_pid_var} = {linear_pid_expr}"),
         ]
         per_tile_body.extend(_consumer_release_block())
@@ -3656,16 +3691,21 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             )
         # ``c_input_warp_count > 0`` AND a non-empty
         # ``aux_tensor_descriptors`` adds a fifth role-local while for
-        # the C-input warp (``cute_plan.md`` §7.5.3.2 cycle 1 of the
-        # producer-body split). Cycle 1's role body is empty (just
-        # the consumer_wait / valid-read / release machinery so the
-        # warp participates as a sched-pipeline consumer); cycles 2
-        # and 3 fill in the producer GMEM→SMEM copy and the
-        # consumer-side SMEM read flip. Gating on the descriptors
-        # being non-empty preserves byte identity for every
-        # ``c_input_warps=0`` config (today's default) and for
-        # ``c_input_warps=1`` configs that don't have a residual
-        # epilogue (the walker returns an empty tuple in that case).
+        # the C-input warp (``cute_plan.md`` §7.5.3.2 producer-body
+        # split). Post-cycle-2a the role body has the
+        # consumer_wait / valid-read / release machinery so the
+        # warp participates as a sched-pipeline consumer and
+        # publishes ``virtual_pid_var`` for cycle 2b. The aux
+        # pipeline storage (SMEM ring + ``c_pipeline_aux``) is
+        # allocated alongside but the
+        # producer/consumer barrier handshake stays dormant until
+        # cycle 2b (producer side + cooperative copy) and cycle 3
+        # (consumer-side SMEM read flip) land together. Gating on
+        # the descriptors being non-empty preserves byte identity
+        # for every ``c_input_warps=0`` config (today's default)
+        # and for ``c_input_warps=1`` configs that don't have a
+        # residual epilogue (the walker returns an empty tuple in
+        # that case).
         plan = self._tcgen05_plan()
         if plan is not None and plan.has_c_input_warp and plan.aux_tensor_descriptors:
             role_local_whiles.append(

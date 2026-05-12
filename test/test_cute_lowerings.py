@@ -11174,31 +11174,34 @@ class TestCuteTcgen05AuxTensorWalker(unittest.TestCase):
 
 
 @onlyBackends(["cute"])
-class TestCuteTcgen05AuxPipelineCycle1(unittest.TestCase):
-    """Pin cycle 1 of the C-input warp producer-body split
-    (``cute_plan.md`` §7.5.3.2): the empty C-input warp role-local
-    while emitted by ``program_id._build_c_input_warp_role_local_while``
-    plus the conditional sched-pipeline arrive-count revert.
+class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
+    """Pin cycle 2a of the C-input warp producer-body split
+    (``cute_plan.md`` §7.5.3.2): SMEM aux ring + ``c_pipeline_aux``
+    ``PipelineAsync`` allocation at MMA-codegen time, plus the
+    C-input warp role-local while body that consumer-waits on the
+    sched_pipeline and publishes ``virtual_pid_var`` for cycle 2b.
+    No producer/consumer barrier ops fire on ``c_pipeline_aux``
+    this cycle — the producer side (``producer_acquire`` +
+    cooperative ``cute.copy(GMEM, SMEM)`` + ``producer_commit``)
+    lands in cycle 2b paired with the consumer-side flip in
+    cycle 3. Wiring producer barriers here without a matching
+    consumer release would deadlock once a CTA wraps the
+    pipeline depth — the
+    ``test_aux_pipeline_no_producer_barrier_ops_emitted`` pin
+    below guards against that regression.
 
     Gate: fires only when ``c_input_warp_count > 0`` AND the
     aux-tensor identity walker discovered one or more descriptors
     on the matmul plan. For every other config the role-local
-    while is omitted and the codegen is byte-identical to the
-    pre-cycle-1 baseline.
+    while is omitted, the SMEM ring + pipeline allocation skip,
+    and the codegen is byte-identical to the pre-cycle-1
+    baseline.
 
-    Cycle 1 emits the role-local while with the linear-pid write
-    as the only per-tile body statement (load-bearing entry point
-    for cycle 2's producer body). The SMEM aux ring +
-    ``c_pipeline_aux`` ``PipelineAsync`` allocation land in cycle
-    2 alongside the ``producer_acquire`` / ``cute.copy`` /
-    ``producer_commit`` body — bundling them together (rather
-    than allocating empty barriers in cycle 1) avoids the
-    cluster-init overhead and ~16 KB SMEM-per-descriptor cost
-    that would otherwise push c_input_warps=1 configs near the
-    228 KB B200 SMEM cap on the canonical 256×256×128 ab=3
-    layout. The runtime-correctness pin below confirms the role-local
-    while + arrive-count change compose without deadlock or
-    wrong-output on a small canonical-fast-config residual kernel.
+    The runtime-correctness pin below confirms the SMEM ring +
+    pipeline + role-local while compose without deadlock or
+    wrong-output on a small canonical-fast-config residual kernel
+    — the consumer still reads from GMEM and the producer side
+    is dormant, so output equivalence is preserved.
     """
 
     def _residual_kernel(self):  # type: ignore[no-untyped-def]
@@ -11264,12 +11267,15 @@ class TestCuteTcgen05AuxPipelineCycle1(unittest.TestCase):
         consumer-waits on the sched_pipeline every iteration so
         the warp participates in the sched-pipeline arrive count.
 
-        Cycle 1's body has the consumer wait/release machinery +
-        the linear-pid expression (load-bearing entry point for
-        cycle 2's producer body). The SMEM aux ring +
-        ``c_pipeline_aux`` allocation arrive in cycle 2, so this
-        cycle's codegen does not yet contain ``producer_acquire``
-        or ``producer_commit`` on any aux pipeline.
+        Cycle 2a's body has the consumer wait/release machinery
+        and the linear-pid expression (consumed by cycle 2b's
+        cooperative GMEM→SMEM copy). The producer-side handshake
+        on ``c_pipeline_aux`` (``producer_acquire`` / cooperative
+        ``cute.copy`` / ``producer_commit``) lands in cycle 2b
+        paired with the cycle-3 consumer-side flip — see
+        ``test_aux_pipeline_no_producer_barrier_ops_emitted``
+        for the deadlock-regression pin that guards against
+        landing producer barriers without consumer releases.
         """
         kernel = self._residual_kernel()
         args = (
@@ -11294,12 +11300,10 @@ class TestCuteTcgen05AuxPipelineCycle1(unittest.TestCase):
             f"cutlass.Int32({expected_warp_id})",
             code,
         )
-        # The SMEM aux ring + c_pipeline_aux land in cycle 2;
-        # cycle 1's codegen does not emit any aux-pipeline
-        # allocation. Pin the absence so a future leak from cycle
-        # 2 lands intentionally.
-        self.assertNotIn("tcgen05_aux_pipeline", code)
-        self.assertNotIn("tcgen05_aux_smem_layout_", code)
+        # Cycle 2a does NOT yet emit a cooperative GMEM→SMEM
+        # ``cute.copy`` between any acquire/commit pair. Pin the
+        # absence so cycle 2b lands intentionally.
+        self.assertNotIn("cute.autovec_copy", code)
         # Sched-pipeline arrive count under the productive-body
         # gate includes the C-input warp: 4 epi + 1 mma + 1
         # ab_load + 1 c_input = 7 consumers.
@@ -11318,13 +11322,87 @@ class TestCuteTcgen05AuxPipelineCycle1(unittest.TestCase):
             code,
         )
 
+    def test_aux_pipeline_smem_ring_allocation_codegen(self) -> None:
+        """The aux SMEM ring + ``c_pipeline_aux`` materialize when
+        the productive-body gate fires (``c_input_warp_count > 0``
+        AND non-empty ``aux_tensor_descriptors``).
+
+        Pin the SMEM layout helper name (``make_smem_layout_epi``),
+        the per-descriptor SMEM ring variable names, the
+        producer cooperative group size (per-thread = 32 lanes,
+        matching the C-input warp's 32 threads), the consumer
+        cooperative group size (per-warp = ``epi_warp_count``,
+        NOT per-thread, so cycle 3's lane-0-gated
+        ``consumer_release`` does not hang on missing per-warp
+        arrivals), and the ``defer_sync=True`` flag (so the
+        cluster-deferred-init protocol coordinates with the
+        AB / acc / sched pipelines).
+        """
+        kernel = self._residual_kernel()
+        args = (
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+        )
+        config = self._canonical_c_input_config()
+        with patch_cute_mma_support():
+            bound = kernel.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            code = bound.to_triton_code(config)
+
+        # Per-descriptor SMEM ring vars (one descriptor for the
+        # canonical exact-shape residual aux). Layout helper +
+        # alloc_smem + make_tensor view.
+        self.assertIn("tcgen05_aux_smem_layout_0", code)
+        self.assertIn("tcgen05_aux_smem_ptr_0", code)
+        self.assertIn("tcgen05_aux_smem_0", code)
+        self.assertIn("cutlass.utils.blackwell_helpers.make_smem_layout_epi(", code)
+        # ``c_pipeline_aux`` ``PipelineAsync.create`` site.
+        self.assertIn("tcgen05_aux_pipeline_mbars", code)
+        self.assertIn(
+            "tcgen05_aux_pipeline = cutlass.pipeline.PipelineAsync.create(",
+            code,
+        )
+        # Producer cooperative group: 32 lanes (single C-input
+        # warp).
+        self.assertIn(
+            "tcgen05_aux_pipeline_producer_group = "
+            "cutlass.pipeline.CooperativeGroup("
+            "cutlass.pipeline.Agent.Thread, cutlass.Int32(32))",
+            code,
+        )
+        # Consumer cooperative group: per-warp (epi_warp_count,
+        # NOT epi_warp_count * 32). Cycle 3's lane-0-gated
+        # ``consumer_release`` arrives once per warp.
+        cfg = config.config
+        expected_consumer = int(cfg.get("tcgen05_num_epi_warps", 4))
+        self.assertIn(
+            "tcgen05_aux_pipeline_consumer_group = "
+            "cutlass.pipeline.CooperativeGroup("
+            "cutlass.pipeline.Agent.Thread, "
+            f"cutlass.Int32({expected_consumer}))",
+            code,
+        )
+        # Cluster-deferred-init participation: ``defer_sync=True``
+        # on the ``c_pipeline_aux`` create site (matches AB /
+        # acc / sched pipelines under the cluster envelope).
+        aux_create_idx = code.find(
+            "tcgen05_aux_pipeline = cutlass.pipeline.PipelineAsync.create("
+        )
+        self.assertGreater(aux_create_idx, -1)
+        aux_create_end = code.find(")", aux_create_idx)
+        aux_create_call = code[aux_create_idx:aux_create_end]
+        self.assertIn("defer_sync=True", aux_create_call)
+
     def test_c_input_role_local_while_not_emitted_without_residual(self) -> None:
         """``c_input_warps=1`` without any aux residual leaves the
         productive-body gate closed: the walker returns an empty
-        descriptor tuple and the C-input warp role-local while is
-        not emitted. The C-input warp falls back to the
-        inert-padding slot the foundation cycle established and
-        the sched-pipeline arrive-count subtraction compensates.
+        descriptor tuple, the C-input warp role-local while is
+        not emitted, AND the SMEM aux ring + ``c_pipeline_aux``
+        allocation skip (cycle 2a fires both together). The
+        C-input warp falls back to the inert-padding slot the
+        foundation cycle established and the sched-pipeline
+        arrive-count subtraction compensates.
         """
 
         @helion.kernel(backend="cute")
@@ -11353,6 +11431,12 @@ class TestCuteTcgen05AuxPipelineCycle1(unittest.TestCase):
         # the warp inert and falls back to the
         # consumer-arrive-count subtraction.
         self.assertNotIn("tcgen05_c_input_warp_valid", code)
+        # Gate-closed: SMEM ring + pipeline allocation skipped.
+        # Pin the absence of the aux pipeline variable names so
+        # a future leak that allocates dead barriers without a
+        # production caller lands intentionally.
+        self.assertNotIn("tcgen05_aux_pipeline", code)
+        self.assertNotIn("tcgen05_aux_smem_layout_", code)
         # Sched-pipeline arrive count subtracts the inert C-input
         # warp: 4 epi + 1 mma + 1 ab_load = 6 consumers (matches
         # the foundation-cycle pin).
@@ -11368,13 +11452,19 @@ class TestCuteTcgen05AuxPipelineCycle1(unittest.TestCase):
         and produces output within bf16 tolerance of the eager
         reference under the cluster_m=2 canonical fast config.
 
-        Cycle 1's consumer side still reads from GMEM, so this is
-        not a perf test — it confirms the C-input warp role-local
-        while + sched-pipeline consumer arrive-count change
-        compose without deadlock or wrong-output. The 1024^3 size
-        keeps the test under the typical per-test wall-clock
-        budget while still exercising ~16 tile iterations under
-        the persistent grid.
+        Cycle 2a's consumer side still reads from GMEM (the
+        cooperative GMEM→SMEM copy is cycle 2b; the consumer
+        flip is cycle 3) and the producer side is dormant
+        (no ``producer_acquire`` / ``producer_commit`` fire on
+        ``c_pipeline_aux``), so this is not a perf test — it
+        confirms the SMEM aux ring + ``c_pipeline_aux`` +
+        role-local while compose without wrong-output. The
+        1024^3 size keeps the test under the typical per-test
+        wall-clock budget while still exercising ~16 tile
+        iterations under the persistent grid; the multi-tile
+        deadlock-regression pin lives in
+        ``test_aux_pipeline_no_producer_barrier_ops_emitted``
+        + the 4096^3 runtime cross-check below.
         """
         from helion._compiler.cute.mma_support import get_cute_mma_support
 
@@ -11393,6 +11483,118 @@ class TestCuteTcgen05AuxPipelineCycle1(unittest.TestCase):
         out = bound(x, y, residual)
         expected = (x @ y + residual).to(x.dtype)
         torch.testing.assert_close(out, expected, atol=2e-1, rtol=1e-2)
+
+    def test_aux_pipeline_no_producer_barrier_ops_emitted(self) -> None:
+        """Deadlock-regression pin: cycle 2a must NOT emit any
+        ``c_pipeline_aux.producer_acquire`` / ``producer_commit``
+        calls.
+
+        An early-2a variant of the role-local-while builder
+        emitted producer barrier-arrival framing every iteration
+        in the hope of "keeping the per-stage phases balanced".
+        That's a deadlock — the consumer-side flip lands in
+        cycle 3, so cycle 2a has *no consumer that ever
+        releases* the aux pipeline. With
+        ``_TCGEN05_AUX_PIPELINE_STAGE_COUNT = 2``, the first two
+        ``producer_acquire`` calls drain the pre-signaled empty
+        barriers; the third blocks forever. The runtime path
+        only stalls if a CTA wraps the pipeline depth (more than
+        ``num_stages`` tile iterations per CTA), which the
+        1024^3 + 256x256 + persistent-blocked grid can miss when
+        the tile count (~16) is smaller than the SM count
+        (~148). Pin codegen-level absence so the regression
+        catches without needing a worst-case shape.
+
+        Once cycle 2b lands the matching producer ops + cycle 3
+        the consumer side, this pin moves to the cycle-2b suite
+        with the inverse assertions (``assertIn`` on the
+        producer ops).
+        """
+        kernel = self._residual_kernel()
+        args = (
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+        )
+        config = self._canonical_c_input_config()
+        with patch_cute_mma_support():
+            bound = kernel.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            code = bound.to_triton_code(config)
+
+        self.assertNotIn("tcgen05_aux_pipeline.producer_acquire(", code)
+        self.assertNotIn("tcgen05_aux_pipeline.producer_commit(", code)
+        # The aux pipeline state itself is allocated (cycle 2a
+        # data-model + ``make_pipeline_state`` initializer); only
+        # the in-loop barrier ops are forbidden. Pin the
+        # allocator to make the negative pins meaningful — a
+        # future regression that *also* drops the allocator
+        # should fail one of the sibling positive pins, not just
+        # silently nullify both negative pins here.
+        self.assertIn("tcgen05_aux_pipeline_producer_state", code)
+        self.assertIn(
+            "tcgen05_aux_pipeline = cutlass.pipeline.PipelineAsync.create(",
+            code,
+        )
+
+    def test_aux_pipeline_smem_budget_canonical_ab_stages_3(self) -> None:
+        """Compile-only SMEM-budget pin for the canonical
+        cluster_m=2 ``tcgen05_ab_stages=3`` config.
+
+        B200 caps per-CTA SMEM at 228 KB. The canonical
+        cluster_m=2 [256,256,128] config with ``ab_stages=3``
+        already consumes ~220 KB; cycle 2a's aux SMEM ring adds
+        ~16 KB per descriptor (256x128 bf16 with
+        ``num_stages=2``). Compiling this config must not raise
+        a ptxas SMEM-over-budget error — if cycle 2a's
+        allocator ever inflates the per-descriptor footprint
+        (e.g. by raising ``num_stages`` or widening the epi tile
+        beyond the staged-D layout), the validator pass should
+        reject the config at autotune time rather than letting
+        ptxas crash. This pin guards the happy path.
+
+        Cycle 2b's cooperative copy + cycle 3's consumer flip
+        do NOT increase per-stage SMEM (they consume the same
+        ring), so this is the right cycle to land the
+        compile-only budget pin.
+        """
+        kernel = self._residual_kernel()
+        args = (
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+        )
+        config = helion.Config(
+            block_sizes=[256, 256, 128],
+            l2_groupings=[1],
+            num_warps=4,
+            num_sm_multiplier=1,
+            pid_type="persistent_interleaved",
+            tcgen05_cluster_m=2,
+            tcgen05_ab_stages=3,
+            tcgen05_acc_stages=2,
+            tcgen05_c_stages=2,
+            tcgen05_num_epi_warps=4,
+            tcgen05_strategy="role_local_with_scheduler",
+            tcgen05_warp_spec_scheduler_warps=1,
+            tcgen05_warp_spec_c_input_warps=1,
+            indexing=[
+                "tensor_descriptor",
+                "tensor_descriptor",
+                "tensor_descriptor",
+            ],
+        )
+        with patch_cute_mma_support():
+            bound = kernel.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            code = bound.to_triton_code(config)
+        # Sanity check: the cycle 2a aux pipeline + canonical
+        # ab_stages=3 both made it into the kernel.
+        self.assertIn(
+            "tcgen05_aux_pipeline = cutlass.pipeline.PipelineAsync.create(",
+            code,
+        )
+        self.assertIn("num_stages=3", code)
 
 
 @onlyBackends(["cute"])
