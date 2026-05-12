@@ -11175,20 +11175,17 @@ class TestCuteTcgen05AuxTensorWalker(unittest.TestCase):
 
 @onlyBackends(["cute"])
 class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
-    """Pin cycle 2a of the C-input warp producer-body split
+    """Pin cycle 2a + 2b of the C-input warp producer-body split
     (``cute_plan.md`` §7.5.3.2): SMEM aux ring + ``c_pipeline_aux``
     ``PipelineAsync`` allocation at MMA-codegen time, plus the
-    C-input warp role-local while body that consumer-waits on the
-    sched_pipeline and publishes ``virtual_pid_var`` for cycle 2b.
-    No producer/consumer barrier ops fire on ``c_pipeline_aux``
-    this cycle — the producer side (``producer_acquire`` +
-    cooperative ``cute.copy(GMEM, SMEM)`` + ``producer_commit``)
-    lands in cycle 2b paired with the consumer-side flip in
-    cycle 3. Wiring producer barriers here without a matching
-    consumer release would deadlock once a CTA wraps the
-    pipeline depth — the
-    ``test_aux_pipeline_no_producer_barrier_ops_emitted`` pin
-    below guards against that regression.
+    C-input warp role-local while body that publishes
+    ``virtual_pid_var`` AND issues the per-subtile producer
+    cooperative GMEM→SMEM copy (``producer_acquire`` /
+    ``cute.copy`` / ``producer_commit``), paired with the
+    consumer-side per-subtile SMEM read flip (``consumer_wait`` /
+    Quack-style ``tiled_copy_s2r`` / ``cute.copy(s2r)`` /
+    ``tRS_rC.load()`` / ``consumer_release``) in
+    ``memory_ops._aux_subtile_load_source``.
 
     Gate: fires only when ``c_input_warp_count > 0`` AND the
     aux-tensor identity walker discovered one or more descriptors
@@ -11197,11 +11194,14 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
     and the codegen is byte-identical to the pre-cycle-1
     baseline.
 
-    The runtime-correctness pin below confirms the SMEM ring +
-    pipeline + role-local while compose without deadlock or
-    wrong-output on a small canonical-fast-config residual kernel
-    — the consumer still reads from GMEM and the producer side
-    is dormant, so output equivalence is preserved.
+    The runtime-correctness pins below confirm the SMEM ring +
+    pipeline + role-local while + producer body + consumer flip
+    compose without deadlock or wrong-output at both 1024^3
+    (single-tile-per-CTA grid) and 4096^3 (multi-tile-per-CTA
+    grid, where the producer wraps the pipeline depth and any
+    subtile-count mismatch between producer and consumer would
+    deadlock). The class name is preserved for git-blame
+    continuity with the cycle 2a landing.
     """
 
     def _residual_kernel(self):  # type: ignore[no-untyped-def]
@@ -11267,15 +11267,16 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
         consumer-waits on the sched_pipeline every iteration so
         the warp participates in the sched-pipeline arrive count.
 
-        Cycle 2a's body has the consumer wait/release machinery
-        and the linear-pid expression (consumed by cycle 2b's
-        cooperative GMEM→SMEM copy). The producer-side handshake
-        on ``c_pipeline_aux`` (``producer_acquire`` / cooperative
-        ``cute.copy`` / ``producer_commit``) lands in cycle 2b
-        paired with the cycle-3 consumer-side flip — see
-        ``test_aux_pipeline_no_producer_barrier_ops_emitted``
-        for the deadlock-regression pin that guards against
-        landing producer barriers without consumer releases.
+        Post-cycle-2b: the body publishes ``virtual_pid_var``,
+        fires the producer cooperative GMEM→SMEM
+        ``cute.copy(make_tiled_copy_tv, ...)`` framed by
+        ``producer_acquire`` / ``producer_commit`` per subtile,
+        then ``sched_pipeline.consumer_release`` at the bottom of
+        each tile. This pin guards the warp predicate + sched
+        consumer-group arrive count under the productive-body
+        gate; the producer cooperative-copy + consumer flip
+        pins live in
+        ``test_aux_pipeline_producer_and_consumer_flip_emitted``.
         """
         kernel = self._residual_kernel()
         args = (
@@ -11300,10 +11301,6 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
             f"cutlass.Int32({expected_warp_id})",
             code,
         )
-        # Cycle 2a does NOT yet emit a cooperative GMEM→SMEM
-        # ``cute.copy`` between any acquire/commit pair. Pin the
-        # absence so cycle 2b lands intentionally.
-        self.assertNotIn("cute.autovec_copy", code)
         # Sched-pipeline arrive count under the productive-body
         # gate includes the C-input warp: 4 epi + 1 mma + 1
         # ab_load + 1 c_input = 7 consumers.
@@ -11452,19 +11449,17 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
         and produces output within bf16 tolerance of the eager
         reference under the cluster_m=2 canonical fast config.
 
-        Cycle 2a's consumer side still reads from GMEM (the
-        cooperative GMEM→SMEM copy is cycle 2b; the consumer
-        flip is cycle 3) and the producer side is dormant
-        (no ``producer_acquire`` / ``producer_commit`` fire on
-        ``c_pipeline_aux``), so this is not a perf test — it
-        confirms the SMEM aux ring + ``c_pipeline_aux`` +
-        role-local while compose without wrong-output. The
-        1024^3 size keeps the test under the typical per-test
-        wall-clock budget while still exercising ~16 tile
-        iterations under the persistent grid; the multi-tile
-        deadlock-regression pin lives in
-        ``test_aux_pipeline_no_producer_barrier_ops_emitted``
-        + the 4096^3 runtime cross-check below.
+        Post-cycle-2b: the producer body fires
+        ``producer_acquire`` / cooperative ``cute.copy(GMEM,
+        SMEM)`` / ``producer_commit`` per subtile, and the
+        consumer side reads from the SMEM ring via Quack's
+        ``tiled_copy_s2r`` flow with ``consumer_wait`` /
+        ``cute.copy(s2r)`` / lane-0 ``consumer_release`` per
+        subtile. This test guards the small-grid path (1024^3
+        ≈ ~16 tiles ≤1 tile per CTA, no pipeline wrap); the
+        multi-tile / pipeline-wrap deadlock-regression pin
+        lives in
+        ``test_aux_pipeline_multi_tile_runtime_correctness_cluster_m2``.
         """
         from helion._compiler.cute.mma_support import get_cute_mma_support
 
@@ -11484,31 +11479,39 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
         expected = (x @ y + residual).to(x.dtype)
         torch.testing.assert_close(out, expected, atol=2e-1, rtol=1e-2)
 
-    def test_aux_pipeline_no_producer_barrier_ops_emitted(self) -> None:
-        """Deadlock-regression pin: cycle 2a must NOT emit any
+    def test_aux_pipeline_producer_and_consumer_flip_emitted(self) -> None:
+        """Cycle 2b pin: the bundled C-input producer
+        cooperative GMEM→SMEM copy + epi-warp consumer SMEM-read
+        flip emit together. Both sides must land in the same
+        codegen pass — a partial-handshake state deadlocks once
+        a CTA wraps the pipeline depth.
+
+        Producer-side: per-output-tile aux GMEM partition
+        (``cute.local_tile`` against the per-CTA ``(bm/cluster_m,
+        bn)`` region for 2cta, ``(bm, bn)`` otherwise), per-
+        subtile cooperative ``cute.copy(tiled_copy_tv, gmem,
+        smem_ring[stage])`` framed by
         ``c_pipeline_aux.producer_acquire`` / ``producer_commit``
-        calls.
+        / state advance. The per-CTA tile shape is load-bearing
+        for cluster_m=2 — using the cluster-level ``(bm, bn)``
+        produces a producer subtile count that's 2× the
+        consumer's per-CTA count and deadlocks the mbar
+        handshake once the producer wraps the stage count.
 
-        An early-2a variant of the role-local-while builder
-        emitted producer barrier-arrival framing every iteration
-        in the hope of "keeping the per-stage phases balanced".
-        That's a deadlock — the consumer-side flip lands in
-        cycle 3, so cycle 2a has *no consumer that ever
-        releases* the aux pipeline. With
-        ``_TCGEN05_AUX_PIPELINE_STAGE_COUNT = 2``, the first two
-        ``producer_acquire`` calls drain the pre-signaled empty
-        barriers; the third blocks forever. The runtime path
-        only stalls if a CTA wraps the pipeline depth (more than
-        ``num_stages`` tile iterations per CTA), which the
-        1024^3 + 256x256 + persistent-blocked grid can miss when
-        the tile count (~16) is smaller than the SM count
-        (~148). Pin codegen-level absence so the regression
-        catches without needing a worst-case shape.
-
-        Once cycle 2b lands the matching producer ops + cycle 3
-        the consumer side, this pin moves to the cycle-2b suite
-        with the inverse assertions (``assertIn`` on the
-        producer ops).
+        Consumer-side: per-output-tile ``tiled_copy_s2r =
+        make_tiled_copy_D(make_copy_atom(CopyUniversalOp(),
+        aux_dtype), tiled_copy_t2r)`` (Quack's
+        ``epilog_smem_load_and_partition`` pattern from
+        ``quack/gemm_sm100.py``); per-subtile
+        ``c_pipeline_aux.consumer_wait`` →
+        ``cute.copy(tiled_copy_s2r, tSR_sC[..., stage],
+        tSR_rC)`` → ``tRS_rC.load()`` → lane-0-gated
+        ``consumer_release`` + state advance. The
+        ``partition_D(smem_stage).load()`` form on
+        ``thr_copy_t2r`` does not compose with the producer's
+        ``make_tiled_copy_tv`` cooperative copy — that's the
+        canonical S2R partition path the prior subagent
+        incorrectly took, leading to a deadlock-on-load.
         """
         kernel = self._residual_kernel()
         args = (
@@ -11522,41 +11525,301 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
             bound.env.config_spec.cute_tcgen05_search_enabled = True
             code = bound.to_triton_code(config)
 
-        self.assertNotIn("tcgen05_aux_pipeline.producer_acquire(", code)
-        self.assertNotIn("tcgen05_aux_pipeline.producer_commit(", code)
-        # The aux pipeline state itself is allocated (cycle 2a
-        # data-model + ``make_pipeline_state`` initializer); only
-        # the in-loop barrier ops are forbidden. Pin the
-        # allocator to make the negative pins meaningful — a
-        # future regression that *also* drops the allocator
-        # should fail one of the sibling positive pins, not just
-        # silently nullify both negative pins here.
-        self.assertIn("tcgen05_aux_pipeline_producer_state", code)
+        # Producer-side: ``producer_acquire`` →
+        # cooperative ``cute.copy(GMEM, SMEM)`` →
+        # ``producer_commit`` per subtile. The
+        # ``make_tiled_copy_tv`` builder produces a per-thread
+        # partition over the C-input warp's 32 lanes.
         self.assertIn(
-            "tcgen05_aux_pipeline = cutlass.pipeline.PipelineAsync.create(",
+            "tcgen05_aux_pipeline.producer_acquire(",
+            code,
+        )
+        self.assertIn(
+            "tcgen05_aux_pipeline.producer_commit(",
+            code,
+        )
+        self.assertIn(
+            "cute.make_tiled_copy_tv(",
+            code,
+        )
+        # Producer's per-CTA tile shape for cluster_m=2 is
+        # ``(bm/2, bn)`` = ``(128, 256)`` — pin the literal so
+        # a future regression that reverts to ``(256, 256)``
+        # (cluster-level, 2× the consumer subtile count, hangs
+        # the mbar handshake) fails here.
+        self.assertIn(
+            "cute.local_tile(tcgen05_aux_gmem_view_0, (128, 256),",
             code,
         )
 
-    def test_aux_pipeline_smem_budget_canonical_ab_stages_3(self) -> None:
-        """Compile-only SMEM-budget pin for the canonical
-        cluster_m=2 ``tcgen05_ab_stages=3`` config.
+        # Consumer-side: ``make_tiled_copy_D`` + ``partition_S``
+        # + per-subtile ``cute.copy`` + ``tRS_rC.load()`` per
+        # Quack's ``epilog_smem_load_and_partition`` pattern.
+        # Plus lane-0-gated ``consumer_release`` and state
+        # advance.
+        self.assertIn(
+            "cute.make_tiled_copy_D(cute.make_copy_atom(",
+            code,
+        )
+        self.assertIn(
+            ".partition_S(tcgen05_aux_smem_0)",
+            code,
+        )
+        self.assertIn(
+            "tcgen05_aux_pipeline.consumer_wait(",
+            code,
+        )
+        self.assertIn(
+            "tcgen05_aux_pipeline.consumer_release(",
+            code,
+        )
 
-        B200 caps per-CTA SMEM at 228 KB. The canonical
+    def test_aux_pipeline_multi_tile_runtime_correctness_cluster_m2(self) -> None:
+        """Multi-tile runtime regression: 4096^3 residual with
+        cluster_m=2 + ``c_input_warps=1`` must run to completion
+        and produce bit-correct output.
+
+        The prior 1024^3 ``test_residual_c_input_runtime_correctness``
+        pin had a tile count (~16) less than the SM count (~148)
+        and ≤1 tile per CTA, so a deadlock that triggers on
+        wrap-around of the aux pipeline depth would silently
+        slip through (the cycle 2b prior-subagent
+        ``partition_D(smem).load()`` form deadlocked at 1024^3
+        only with cluster_m=2 with more tiles per CTA). 4096^3
+        gives 16x16 = 256 tiles → ~ceil(256/2/148) ≈ 1-2 tiles
+        per CTA at cluster_m=2; the producer wraps the stage
+        count on the third subtile of each tile (so the
+        producer goes through ≥3 stage cycles per CTA),
+        triggering the deadlock if the per-CTA producer/consumer
+        subtile counts disagree.
+        """
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+
+        torch.manual_seed(0)
+        x = torch.randn(4096, 4096, dtype=torch.bfloat16, device=DEVICE)
+        y = torch.randn(4096, 4096, dtype=torch.bfloat16, device=DEVICE)
+        residual = torch.randn(4096, 4096, dtype=torch.bfloat16, device=DEVICE)
+        kernel = self._residual_kernel()
+        config = self._canonical_c_input_config()
+        bound = kernel.bind((x, y, residual))
+        bound.env.config_spec.cute_tcgen05_search_enabled = True
+        bound.set_config(config)
+        out = bound(x, y, residual)
+        expected = (x @ y + residual).to(x.dtype)
+        torch.testing.assert_close(out, expected, atol=2e-1, rtol=1e-2)
+
+    def test_aux_pipeline_producer_advance_indent_fallback_path(self) -> None:
+        """Producer-body indent regression for the fallback
+        ``emit_pipeline_advance`` path: when
+        ``cutedsl_has_opresultlist_fix()`` returns False (PyPI
+        4.5.0.dev0 build), ``emit_pipeline_advance`` returns a
+        multi-line ``if True: \\n    <line1> \\n    <line2>``
+        block rather than a single
+        ``state.advance()`` call. The producer-body
+        subtile-loop emitter must indent every line of that
+        block to the loop body's indent (``    `` for the
+        ``for _tcgen05_aux_subtile in ...:`` loop), not just
+        the first — otherwise the inner lines under-indent
+        and produce a SyntaxError when ``statement_from_string``
+        parses the loop source.
+        """
+        from helion._compiler.cute import cutedsl_compat
+
+        kernel = self._residual_kernel()
+        args = (
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+        )
+        config = self._canonical_c_input_config()
+        with (
+            patch_cute_mma_support(),
+            patch.object(
+                cutedsl_compat, "cutedsl_has_opresultlist_fix", return_value=False
+            ),
+        ):
+            bound = kernel.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            code = bound.to_triton_code(config)
+
+        # The fallback ``emit_pipeline_advance`` body contains
+        # the ``state._count = state._count + cutlass.Int32(1)``
+        # update wrapped in ``if True: ...``. Pin that every
+        # such line under the producer subtile-loop body is
+        # indented at least to the loop's ``    `` body
+        # indent. The producer subtile loop is the
+        # ``for _tcgen05_aux_subtile in cutlass.range(...):``
+        # in the C-input warp role-local while body. Find the
+        # producer advance lines (those that update
+        # ``tcgen05_aux_pipeline_producer_state``) and verify
+        # each line carries a leading "    " indent.
+        producer_state_count_lines = [
+            line
+            for line in code.split("\n")
+            if (
+                "tcgen05_aux_pipeline_producer_state._count" in line
+                or "tcgen05_aux_pipeline_producer_state._index" in line
+                or "tcgen05_aux_pipeline_producer_state._phase" in line
+            )
+        ]
+        # Each producer-state update line lives inside the
+        # subtile loop body (which itself nests inside the
+        # role-local while + cluster-init prefix). The loop
+        # body indent is at least ``        `` (8 spaces) —
+        # role-local-while body indent + per-iter body indent.
+        # Pin a minimum of 8-space indent so an under-indented
+        # ``if True:\n``-then-flat-body emission would fail.
+        self.assertTrue(
+            producer_state_count_lines,
+            "expected at least one producer_state update line "
+            "in the fallback advance body; the fallback path "
+            "must emit explicit count/index/phase updates",
+        )
+        for line in producer_state_count_lines:
+            stripped = line.lstrip(" ")
+            indent_width = len(line) - len(stripped)
+            self.assertGreaterEqual(
+                indent_width,
+                8,
+                f"producer-state update line under-indented "
+                f"({indent_width} spaces): {line!r}. The "
+                f"subtile loop body requires ≥8-space indent; "
+                f"under-indentation indicates the multi-line "
+                f"``emit_pipeline_advance`` block was spliced "
+                f"without per-line reflow.",
+            )
+
+    def test_aux_pipeline_multi_store_fanout_gate_closes(self) -> None:
+        """Multi-store fan-out regression: a kernel that consumes
+        one matmul result into multiple stores with different aux
+        operands must NOT enable the productive C-input warp body.
+
+        Without the multi-store fan-out gate, the matmul plan
+        would aggregate aux descriptors across both stores'
+        chains. The producer-body codegen iterates the full
+        descriptor tuple per subtile (firing ``producer_commit``
+        on every ring), but each store-codegen splice only emits
+        the per-subtile ``consumer_release`` for its own chain's
+        records — so the rings owned by the "other" store would
+        be committed but never released, deadlocking the
+        producer once a CTA wraps the pipeline depth.
+
+        The fix: the productive-body gate in
+        ``cute_mma._emit_mma_pipeline``,
+        ``program_id`` role-local-while admission, and
+        ``memory_ops`` consumer all require a single
+        ``store_value_node`` across the descriptor set. With
+        fan-out, the gate closes — no SMEM aux ring, no
+        ``c_pipeline_aux`` pipeline, no producer-body role-local
+        while, and the consumer path falls back to GMEM aux
+        reads.
+
+        Pin codegen-level absence rather than runtime: multi-
+        store TMA emission has a separate pre-existing
+        limitation (duplicate ``tcgen05_tma_store_atom`` kernel
+        args) that surfaces before any runtime can exercise the
+        producer/consumer mbar handshake. The gate-closure
+        codegen check here verifies the deadlock-regression fix
+        directly.
+        """
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_residual_fanout(
+            x: torch.Tensor,
+            y: torch.Tensor,
+            residual_a: torch.Tensor,
+            residual_b: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            m, k = x.size()
+            _, n = y.size()
+            out_a = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            out_b = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out_a[tile_m, tile_n] = (acc + residual_a[tile_m, tile_n]).to(x.dtype)
+                out_b[tile_m, tile_n] = (acc + residual_b[tile_m, tile_n]).to(x.dtype)
+            return out_a, out_b
+
+        args = (
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+        )
+        config = self._canonical_c_input_config()
+        with patch_cute_mma_support():
+            bound = cute_matmul_residual_fanout.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            code = bound.to_triton_code(config)
+
+        # Multi-store fan-out: productive body must NOT emit.
+        # The SMEM aux ring, ``c_pipeline_aux`` create, the
+        # C-input role-local while valid flag, and the
+        # producer-side cooperative copy all skip.
+        self.assertNotIn("tcgen05_aux_smem_layout_", code)
+        self.assertNotIn("tcgen05_aux_pipeline = cutlass.pipeline.PipelineAsync", code)
+        self.assertNotIn("tcgen05_aux_pipeline.producer_acquire(", code)
+        self.assertNotIn("tcgen05_aux_pipeline.producer_commit(", code)
+        self.assertNotIn("tcgen05_aux_pipeline.consumer_wait(", code)
+        self.assertNotIn("tcgen05_c_input_warp_valid", code)
+        # Sched-pipeline arrive count under the gate-closed
+        # path subtracts the inert C-input warp:
+        # 4 epi + 1 mma + 1 ab_load = 6 consumers.
+        self.assertIn(
+            "tcgen05_sched_pipeline_consumer_group = "
+            "cutlass.pipeline.CooperativeGroup("
+            "cutlass.pipeline.Agent.Thread, cutlass.Int32(6))",
+            code,
+        )
+
+    def test_aux_pipeline_ab_stages_3_with_c_input_rejected(self) -> None:
+        """SMEM-budget rejection pin for ``tcgen05_ab_stages=3`` +
+        productive C-input warp
+        (``tcgen05_warp_spec_c_input_warps=1`` + non-empty aux
+        tensors + single-store fan-out gate open).
+
+        B200 caps per-CTA SMEM at 232 KB. The canonical
         cluster_m=2 [256,256,128] config with ``ab_stages=3``
-        already consumes ~220 KB; cycle 2a's aux SMEM ring adds
-        ~16 KB per descriptor (256x128 bf16 with
-        ``num_stages=2``). Compiling this config must not raise
-        a ptxas SMEM-over-budget error — if cycle 2a's
-        allocator ever inflates the per-descriptor footprint
-        (e.g. by raising ``num_stages`` or widening the epi tile
-        beyond the staged-D layout), the validator pass should
-        reject the config at autotune time rather than letting
-        ptxas crash. This pin guards the happy path.
+        already consumes ~220 KB without c_input; the cycle 2b
+        aux SMEM ring + ``c_pipeline_aux`` mbars push the total
+        to 263 KB (measured by ptxas, cycle 2c). Reducing the
+        aux ring to ``num_stages=1`` only drops it to 246 KB,
+        still 14 KB over the cap. There is no validated tile
+        shape where the combination fits.
 
-        Cycle 2b's cooperative copy + cycle 3's consumer flip
-        do NOT increase per-stage SMEM (they consume the same
-        ring), so this is the right cycle to land the
-        compile-only budget pin.
+        The MMA-codegen-time gate in
+        ``cute_mma._emit_mma_pipeline`` rejects this combo with
+        a structured ``BackendUnsupported`` so:
+          - explicit user configs fail with a clear message
+            instead of a deep ``ptxas: uses too much shared
+            data`` raise; and
+          - the autotune search-time fixup
+            (``_fix_tcgen05_ab_stages_three_search_config``)
+            can demote affected ``ab=3`` candidates rather
+            than aborting tuning at ptxas.
+
+        The rejection predicate mirrors the productive-body
+        aux-pipeline allocation gate exactly (cycle 2d P1):
+        ``has_c_input_warp AND aux_tensor_descriptors AND
+        aux_single_store_value AND ab_stage_count >= 3``. The
+        single-store-fan-out condition is load-bearing — under
+        multi-store fan-out the productive body is suppressed
+        and the kernel falls back to GMEM-aux reads with no
+        extra SMEM cost, so the combination fits and the
+        rejection must NOT fire (see
+        ``test_aux_pipeline_ab_stages_3_with_c_input_fanout_not_rejected``).
+
+        The previous cycle-2a pin (``compile via
+        patch_cute_mma_support`` to confirm ab=3+c_input=1
+        appeared in codegen) was misleading because the patch
+        bypasses real ptxas; cycle 2c discovered the runtime
+        over-budget failure. This pin replaces that one with an
+        explicit rejection assertion.
         """
         kernel = self._residual_kernel()
         args = (
@@ -11587,14 +11850,163 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
         with patch_cute_mma_support():
             bound = kernel.bind(args)
             bound.env.config_spec.cute_tcgen05_search_enabled = True
+            with self.assertRaises(exc.BackendUnsupported) as cm:
+                bound.to_triton_code(config)
+        msg = str(cm.exception)
+        # The rejection message names both knobs by their full
+        # ``helion.Config(...)`` field spelling so a user
+        # dropping into the message can grep their config for
+        # the exact key names.
+        self.assertIn("tcgen05_ab_stages=3", msg)
+        self.assertIn("tcgen05_warp_spec_c_input_warps=1", msg)
+        self.assertIn("tcgen05_ab_stages=2", msg)
+        self.assertIn("tcgen05_warp_spec_c_input_warps=0", msg)
+
+    def test_aux_pipeline_ab_stages_2_with_c_input_compiles(self) -> None:
+        """Companion positive pin:
+        ``tcgen05_ab_stages=2`` +
+        ``tcgen05_warp_spec_c_input_warps=1`` (the cycle 2b
+        productive shape) does NOT trip the SMEM-budget
+        rejection.
+
+        Without this pin, the rejection above could over-fire
+        (e.g. a future regression that gates on
+        ``c_input_warps=1`` alone, regardless of ``ab_stages``)
+        and silently disable the cycle 2b productive body.
+        """
+        kernel = self._residual_kernel()
+        args = (
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+        )
+        # The canonical cycle 2b config from
+        # ``_canonical_c_input_config`` already uses
+        # ``ab_stages=2`` + ``c_input_warps=1``.
+        config = self._canonical_c_input_config()
+        with patch_cute_mma_support():
+            bound = kernel.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
             code = bound.to_triton_code(config)
-        # Sanity check: the cycle 2a aux pipeline + canonical
-        # ab_stages=3 both made it into the kernel.
+        # Sanity-check: cycle 2b productive body emitted.
+        self.assertIn("tcgen05_aux_pipeline.producer_acquire(", code)
         self.assertIn(
             "tcgen05_aux_pipeline = cutlass.pipeline.PipelineAsync.create(",
             code,
         )
-        self.assertIn("num_stages=3", code)
+        # AB pipeline specifically pinned to num_stages=2 — the
+        # non-rejected combination. Scoping to
+        # ``PipelineTmaUmma.create(num_stages=2`` keeps this
+        # assertion from accidentally matching the acc / sched
+        # / aux pipelines (all of which also use
+        # ``num_stages=2`` and would mask a regression that
+        # silently demoted just the AB pipeline).
+        self.assertIn(
+            "tcgen05_ab_pipeline = cutlass.pipeline.PipelineTmaUmma.create("
+            "num_stages=2",
+            code,
+        )
+
+    def test_aux_pipeline_ab_stages_3_with_c_input_fanout_not_rejected(
+        self,
+    ) -> None:
+        """Companion negative-rejection pin for the cycle 2d P1
+        fix: multi-store fan-out closes the productive-body
+        gate, so ``tcgen05_ab_stages=3`` +
+        ``tcgen05_warp_spec_c_input_warps=1`` + multi-store
+        fan-out MUST NOT trip the SMEM-budget rejection.
+
+        Under multi-store fan-out the cycle 2b safety gate
+        suppresses the aux SMEM ring + ``c_pipeline_aux``
+        allocation entirely (the kernel falls back to per-
+        thread GMEM aux reads); the +43 KB aux overhead
+        motivating the rejection does not exist, so ab=3 fits
+        the 232 KB SMEM cap exactly as the no-c_input ab=3
+        path does. The rejection predicate must mirror the
+        allocation predicate (cycle 2d P1) — without the
+        single-store fan-out condition, this test would fail
+        because the rejection would over-fire on a path the
+        SMEM budget can accommodate.
+
+        Codegen-only pin: multi-store TMA emission has a
+        separate pre-existing kernel-arg-duplication
+        limitation (see
+        ``test_aux_pipeline_multi_store_fanout_gate_closes``)
+        that surfaces before any runtime can exercise the
+        kernel; we verify the codegen reaches
+        ``to_triton_code`` without a ``BackendUnsupported`` and
+        confirm the productive body is suppressed (so the
+        rejection cannot have fired on this path).
+        """
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_residual_fanout(
+            x: torch.Tensor,
+            y: torch.Tensor,
+            residual_a: torch.Tensor,
+            residual_b: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            m, k = x.size()
+            _, n = y.size()
+            out_a = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            out_b = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out_a[tile_m, tile_n] = (acc + residual_a[tile_m, tile_n]).to(x.dtype)
+                out_b[tile_m, tile_n] = (acc + residual_b[tile_m, tile_n]).to(x.dtype)
+            return out_a, out_b
+
+        args = (
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+        )
+        # Same canonical config as
+        # ``test_aux_pipeline_ab_stages_3_with_c_input_rejected``
+        # — only difference is the fan-out kernel shape, which
+        # should close the productive-body gate and prevent
+        # the rejection from firing.
+        config = helion.Config(
+            block_sizes=[256, 256, 128],
+            l2_groupings=[1],
+            num_warps=4,
+            num_sm_multiplier=1,
+            pid_type="persistent_interleaved",
+            tcgen05_cluster_m=2,
+            tcgen05_ab_stages=3,
+            tcgen05_acc_stages=2,
+            tcgen05_c_stages=2,
+            tcgen05_num_epi_warps=4,
+            tcgen05_strategy="role_local_with_scheduler",
+            tcgen05_warp_spec_scheduler_warps=1,
+            tcgen05_warp_spec_c_input_warps=1,
+            indexing=[
+                "tensor_descriptor",
+                "tensor_descriptor",
+                "tensor_descriptor",
+            ],
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_residual_fanout.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            # Must not raise BackendUnsupported on the fan-out
+            # path despite carrying ``ab_stages=3`` +
+            # ``c_input_warps=1``.
+            code = bound.to_triton_code(config)
+        # Productive body is suppressed under multi-store
+        # fan-out: no aux ring, no c_pipeline_aux, no producer
+        # cooperative copy. AB pipeline is still ab_stages=3.
+        self.assertNotIn("tcgen05_aux_smem_layout_", code)
+        self.assertNotIn("tcgen05_aux_pipeline = cutlass.pipeline.PipelineAsync", code)
+        self.assertNotIn("tcgen05_aux_pipeline.producer_acquire(", code)
+        self.assertIn(
+            "tcgen05_ab_pipeline = cutlass.pipeline.PipelineTmaUmma.create("
+            "num_stages=3",
+            code,
+        )
 
 
 @onlyBackends(["cute"])
