@@ -393,10 +393,25 @@ def enforce_dot_requirements(lhs: torch.Tensor, rhs: torch.Tensor) -> None:
             # explicit user config that bypasses autotune raises
             # ``InvalidConfig`` rather than silently miscomputing — there is
             # no loud crash for this failure mode.
+            # Admit ``tcgen05_ab_stages=3`` into search whenever the
+            # active dtype is BF16/FP16 — the matmul path's outer guard
+            # already proved that. The per-CTA SMEM-budget gate inside
+            # ``allow_tcgen05_ab_stages_three_search`` queries
+            # ``lhs.device`` (not the host's current CUDA device) so a
+            # multi-GPU / heterogeneous setup cannot accidentally enable
+            # an over-budget config or suppress the canonical seed. If
+            # the target device's SMEM optin cap is below the B200
+            # envelope the gate keeps search at ``max=2``, and the
+            # per-config search-time fixup demotes over-budget ``ab=3``
+            # samples back to ``ab=2``. cute_plan.md §7.0 documents the
+            # canonical 4096^3 acceptance criterion.
+            ab_dtype_bytes = lhs.dtype.itemsize
             spec.narrow_tcgen05_autotune_to_validated_configs(
                 allow_persistent_pid_types=allow_persistent_pid_types,
                 allow_cluster_m2_search=allow_cluster_m2_search,
                 cluster_m2_static_k=static_k if allow_cluster_m2_search else None,
+                ab_stages_three_dtype_bytes=ab_dtype_bytes,
+                ab_stages_three_device=lhs.device,
             )
             for axis_name, shape, max_size in (
                 ("m", m, max_search_m),

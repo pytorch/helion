@@ -28,6 +28,7 @@ from helion._testing import onlyBackends
 from helion._testing import patch_cute_mma_support
 from helion._testing import skipIfMTIA
 from helion.autotuner.config_generation import ConfigGeneration
+from helion.autotuner.config_spec import ConfigSpec
 from helion.exc import InvalidConfig
 import helion.language as hl
 
@@ -111,6 +112,51 @@ def _cute_strategy_matmul_force_persistent_kernel(
             acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
         out[tile_m, tile_n] = acc.to(x.dtype)
     return out
+
+
+@helion.kernel(backend="cute")
+def _cute_4096_matmul_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """Plain BF16 4096^3 cute matmul; shared by the SMEM-gate tests below."""
+    m, k = x.size()
+    _, n = y.size()
+    out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+        out[tile_m, tile_n] = acc.to(x.dtype)
+    return out
+
+
+def _bind_cute_4096_matmul_kernel_with_mocked_smem_budget(budget_bytes: int):
+    """Bind the 4096^3 matmul with the per-CTA AB-SMEM budget mocked.
+
+    The SMEM-budget gate is purely deterministic given a budget value
+    (see ``ConfigSpec._cute_per_cta_ab_smem_budget_bytes``). Mocking
+    that helper lets the demote/keep/seed unit tests exercise the gate
+    on any device, not just hosts that report a B200-sized opt-in
+    SMEM cap. ``budget_bytes`` is the per-CTA AB-SMEM budget in bytes
+    the gate should treat as available for the AB pipeline staging.
+
+    Clears ``_bound_kernels`` before binding so two tests in the same
+    process that mock different budget values do not collide on the
+    in-memory bind cache (the cache is keyed by args and would
+    otherwise replay the first test's recorded spec).
+    """
+    args = (
+        torch.empty([4096, 4096], device=DEVICE, dtype=HALF_DTYPE),
+        torch.empty([4096, 4096], device=DEVICE, dtype=HALF_DTYPE),
+    )
+    _cute_4096_matmul_kernel._bound_kernels.clear()
+    with (
+        patch_cute_mma_support(),
+        patch.object(
+            ConfigSpec,
+            "_cute_per_cta_ab_smem_budget_bytes",
+            staticmethod(lambda device: budget_bytes),
+        ),
+    ):
+        return _cute_4096_matmul_kernel.bind(args)
 
 
 def _bind_cute_strategy_kernel():
@@ -566,6 +612,224 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
             [TCGEN05_TWO_CTA_BLOCK_M, TCGEN05_TWO_CTA_BLOCK_N, 16],
         )
         self.assertEqual(config["l2_groupings"], [1])
+
+    @onlyBackends(["cute"])
+    def test_cute_tcgen05_ab_stages_three_smem_budget_gate(self) -> None:
+        """SMEM-budget gate admits ``tcgen05_ab_stages=3`` into search.
+
+        The 4096^3 BF16 matmul binding admits ``ab=3`` into the autotune
+        search arm via the SMEM-budget gate so the canonical fast config
+        family (``cluster_m=2`` ``ab=3``) reaches the autotuner without a
+        hand-forced override. Search-time normalization demotes ``ab=3``
+        candidates whose ``(bm, bn, bk, cluster_m)`` per-CTA AB-SMEM cost
+        exceeds the device's optin SMEM cap minus the non-AB reservation
+        (see ``cute_plan.md`` §7.0). The validation surface stays
+        unchanged: explicit ``helion.Config(tcgen05_ab_stages=3)`` always
+        round-trips for explicit user configs.
+
+        The gate is purely deterministic given a budget value, so we
+        pin the per-CTA AB-SMEM budget to B200's nominal value via
+        ``_bind_cute_4096_matmul_kernel_with_mocked_smem_budget`` —
+        that keeps coverage live on any host regardless of the live
+        GPU's optin SMEM cap.
+        """
+        # B200's optin reports 232 448 bytes = 227 KiB; subtract the
+        # 28 KiB non-AB reservation to match what
+        # ``_cute_per_cta_ab_smem_budget_bytes`` produces in production
+        # (203 776 bytes). Tracking the production value exactly is
+        # what makes the over-budget vs in-budget boundary in this
+        # test mirror the running gate.
+        b200_budget_bytes = 227 * 1024 - 28 * 1024
+        bound = _bind_cute_4096_matmul_kernel_with_mocked_smem_budget(b200_budget_bytes)
+        spec = bound.config_spec
+
+        constraints = spec._tcgen05_ab_stages_three_search_constraints
+        self.assertIsNotNone(constraints)
+        # ``itemsize`` for BF16/FP16 is 2 bytes — matches the matmul
+        # binding's ``lhs.dtype.itemsize`` argument.
+        self.assertEqual(constraints.dtype_bytes, HALF_DTYPE.itemsize)
+        self.assertEqual(constraints.per_cta_smem_budget_bytes, b200_budget_bytes)
+
+        search_fragments = spec._tcgen05_optional_fragments(for_search=True)
+        # Search surface lifts ab_stages cap from 2 to 3 once the gate
+        # admits the arm. The validation surface is independently 3.
+        self.assertEqual(search_fragments["tcgen05_ab_stages"].high, 3)
+        validation_fragments = spec._tcgen05_optional_fragments(for_search=False)
+        self.assertEqual(validation_fragments["tcgen05_ab_stages"].high, 3)
+
+        # cluster_m=2 256x256x128 ab=3: the canonical 4096^3 fast config —
+        # fits the per-CTA budget (196 608 bytes vs B200's 203 776-byte
+        # budget). Search-time fixup keeps it.
+        keep_config = {
+            "block_sizes": [256, 256, 128],
+            "l2_groupings": [4],
+            "pid_type": "persistent_interleaved",
+            "tcgen05_cluster_m": 2,
+            "tcgen05_ab_stages": 3,
+        }
+        spec.normalize(keep_config, _fix_invalid=True)
+        self.assertEqual(keep_config["tcgen05_ab_stages"], 3)
+        self.assertEqual(keep_config["tcgen05_cluster_m"], 2)
+
+        # ab=3 over-budget shapes get demoted to ab=2. The cute_dsl
+        # ptxas failure is the loud backstop for explicit user configs
+        # that bypass autotune; the search-side fixup keeps the
+        # autotuner from blowing the GPU context mid-tuning. The two
+        # cases below exercise distinct post-fixup shapes:
+        #   * persistent + cluster_m=1 with bm=128: 294 912 bytes — the
+        #     ``_fix_tcgen05_cluster_m1_persistent_search_config`` path
+        #     already clamps bm to ``TCGEN05_ONE_CTA_MAX_BLOCK_M``;
+        #     bm=128 is at the cap, so it survives unchanged.
+        #   * flat + cluster_m=1 with bm=256: 393 216 bytes — flat
+        #     pid_type bypasses the cluster_m1 cap (the cap only
+        #     applies under persistent pid_types) so the unmolested
+        #     256x256x128 single-CTA path reaches the new fixup.
+        over_budget_cases = (
+            ("persistent_interleaved", [128, 256, 128]),  # 294 912 bytes
+            ("flat", [256, 256, 128]),  # 393 216 bytes
+        )
+        for pid_type, over_budget_block_sizes in over_budget_cases:
+            with self.subTest(pid_type=pid_type, block_sizes=over_budget_block_sizes):
+                config = {
+                    "block_sizes": list(over_budget_block_sizes),
+                    "pid_type": pid_type,
+                    "tcgen05_cluster_m": 1,
+                    "tcgen05_ab_stages": 3,
+                }
+                spec.normalize(config, _fix_invalid=True)
+                self.assertEqual(config["tcgen05_ab_stages"], 2)
+
+        # cluster_m=1 ab=3 in-budget shape stays at ab=3.
+        in_budget = {
+            "block_sizes": [128, 128, 128],
+            "pid_type": "persistent_interleaved",
+            "tcgen05_cluster_m": 1,
+            "tcgen05_ab_stages": 3,
+        }
+        spec.normalize(in_budget, _fix_invalid=True)
+        self.assertEqual(in_budget["tcgen05_ab_stages"], 3)
+
+        # Validation surface always accepts ab=3 (no _fix_invalid).
+        user_config = {
+            "block_sizes": [128, 256, 128],
+            "pid_type": "persistent_interleaved",
+            "tcgen05_cluster_m": 1,
+            "tcgen05_ab_stages": 3,
+        }
+        spec.normalize(user_config)
+        self.assertEqual(user_config["tcgen05_ab_stages"], 3)
+
+    @onlyBackends(["cute"])
+    def test_cute_tcgen05_ab_stages_three_gate_off_below_b200(self) -> None:
+        """Gate stays off when target device's SMEM optin is sub-B200.
+
+        Mocking the budget helper to return 0 — the value the helper
+        produces for non-CUDA hosts and any device whose optin cap sits
+        below ``TCGEN05_AB_STAGES_THREE_MIN_DEVICE_SMEM_OPTIN`` — must
+        keep ``_tcgen05_ab_stages_three_search_constraints`` ``None`` so
+        the search surface stays at ``ab_stages_max=2`` and the
+        canonical seed does not carry ``ab=3``. This guards against
+        broadening the search past the hardware's known-good envelope
+        on heterogeneous / multi-GPU setups.
+        """
+        bound = _bind_cute_4096_matmul_kernel_with_mocked_smem_budget(0)
+        spec = bound.config_spec
+
+        self.assertIsNone(spec._tcgen05_ab_stages_three_search_constraints)
+        search_fragments = spec._tcgen05_optional_fragments(for_search=True)
+        self.assertEqual(search_fragments["tcgen05_ab_stages"].high, 2)
+        # Validation surface stays at 3 so explicit user configs still
+        # round-trip even on a device the gate is off for.
+        validation_fragments = spec._tcgen05_optional_fragments(for_search=False)
+        self.assertEqual(validation_fragments["tcgen05_ab_stages"].high, 3)
+        # The cluster_m2 seed exists but does *not* carry ab=3.
+        seeds = spec.compiler_seed_configs
+        self.assertEqual(len(seeds), 1)
+        self.assertNotIn("tcgen05_ab_stages", seeds[0].config)
+
+    @onlyBackends(["cute"])
+    def test_cute_tcgen05_ab_stages_three_refused_for_multi_block_size_triple(
+        self,
+    ) -> None:
+        """Gate refuses ``ab=3`` when the spec has more than one (M,N,K) triple.
+
+        ``tcgen05_ab_stages`` is a global config knob across the whole
+        bound kernel, but the per-config search-time fixup
+        (``_fix_tcgen05_ab_stages_three_search_config``) only inspects
+        ``block_sizes[0:3]``. A multi-dot or multi-root kernel with
+        more than the single-matmul 3-block-size triple could otherwise
+        sit at ``ab=3`` for a later over-budget triple — that path
+        would survive the fixup and abort at ptxas mid-tuning. Verify
+        ``allow_tcgen05_ab_stages_three_search`` clears the recorded
+        constraints whenever the spec's block-size sequence is not the
+        validated 3-tuple.
+        """
+        b200_budget_bytes = 227 * 1024 - 28 * 1024
+        bound = _bind_cute_4096_matmul_kernel_with_mocked_smem_budget(b200_budget_bytes)
+        spec = bound.config_spec
+
+        # Sanity: the matmul-bound spec with a 3-block-size triple
+        # already admits the arm (this is the standard production path).
+        self.assertIsNotNone(spec._tcgen05_ab_stages_three_search_constraints)
+
+        # Simulate a spec with more than the single-matmul 3-block-size
+        # triple (e.g. a multi-dot or multi-root kernel) and re-invoke
+        # the gate. The recorded constraints must be cleared so the
+        # search surface stays at ``ab_stages_max=2`` — otherwise a
+        # later over-budget triple would survive the per-config fixup
+        # (which inspects only ``block_sizes[0:3]``) and abort at ptxas.
+        # The gate's only check on ``block_sizes`` is its length, so
+        # re-running ``allow_tcgen05_ab_stages_three_search`` against
+        # a spec whose ``block_sizes`` reports a non-3 length is enough
+        # to validate the refusal.
+        with patch.object(type(spec.block_sizes), "__len__", lambda self: 9):
+            self.assertEqual(len(spec.block_sizes), 9)
+            with patch.object(
+                ConfigSpec,
+                "_cute_per_cta_ab_smem_budget_bytes",
+                staticmethod(lambda device: b200_budget_bytes),
+            ):
+                spec.allow_tcgen05_ab_stages_three_search(
+                    dtype_bytes=2,
+                    device=torch.device("cuda:0"),
+                )
+            self.assertIsNone(spec._tcgen05_ab_stages_three_search_constraints)
+            search_fragments = spec._tcgen05_optional_fragments(for_search=True)
+            self.assertEqual(search_fragments["tcgen05_ab_stages"].high, 2)
+
+    @onlyBackends(["cute"])
+    def test_cute_tcgen05_ab_stages_three_seeded_in_initial_population(
+        self,
+    ) -> None:
+        """Canonical ``ab=3`` fast config is in the initial autotune seed.
+
+        Acceptance: when the SMEM gate admits ``ab=3`` for the canonical
+        ``256x256x128 cluster_m=2`` shape, the cluster_m=2 seed config
+        carries ``tcgen05_ab_stages=3`` so the autotuner's initial
+        population includes the retained 4096^3 fast config family
+        (``cute_plan.md`` §1.1). Without this seed the normal autotune
+        would have to discover ``ab=3`` via random mutation, which is
+        unreliable across short search budgets.
+
+        Pins the per-CTA AB-SMEM budget to B200's nominal value so the
+        seed-path coverage runs on any host (see
+        ``test_cute_tcgen05_ab_stages_three_smem_budget_gate``).
+        """
+        # B200 production value: 227 KiB optin minus 28 KiB non-AB
+        # reservation (see _cute_per_cta_ab_smem_budget_bytes).
+        b200_budget_bytes = 227 * 1024 - 28 * 1024
+        bound = _bind_cute_4096_matmul_kernel_with_mocked_smem_budget(b200_budget_bytes)
+        spec = bound.config_spec
+
+        seed_configs = spec.compiler_seed_configs
+        self.assertEqual(len(seed_configs), 1)
+        seed = seed_configs[0].config
+        self.assertEqual(
+            seed["block_sizes"][:3],
+            [TCGEN05_TWO_CTA_BLOCK_M, TCGEN05_TWO_CTA_BLOCK_N, 128],
+        )
+        self.assertEqual(seed["tcgen05_cluster_m"], 2)
+        self.assertEqual(seed["tcgen05_ab_stages"], 3)
 
     @skipIfMTIA("MTIA requires tl.dot initial value stride >= 128 bytes")
     def test_matmul_smaller_than_min_dot_size(self) -> None:

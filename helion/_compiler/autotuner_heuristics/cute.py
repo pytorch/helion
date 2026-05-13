@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
+from typing import Any
 from typing import cast
 
 from ...runtime.config import Config
@@ -47,40 +48,39 @@ class CuteTcgen05ClusterM2Heuristic(AutotunerHeuristic):
         if bk is None:
             raise AssertionError(f"{cls.name} get_seed_config called while ineligible")
 
-        block_sizes = [
-            TCGEN05_TWO_CTA_BLOCK_M,
-            TCGEN05_TWO_CTA_BLOCK_N,
-            bk,
-        ]
-        if spec.indexing.length == 3:
-            # Pure matmul has exactly the A/B/C indexing slots. Fused epilogues
-            # add more memory ops, so leave those seeds to the spec default
-            # rather than constructing a partial list.
-            return Config(
-                block_sizes=block_sizes,
-                l2_groupings=[TCGEN05_TWO_CTA_SEED_L2_GROUPING],
-                pid_type=TCGEN05_TWO_CTA_SEED_PID_TYPE,
-                tcgen05_cluster_m=2,
-                tcgen05_num_epi_warps=4,
-                indexing=[
-                    "tensor_descriptor",
-                    "tensor_descriptor",
-                    "tensor_descriptor",
-                ],
-            )
-
-        return Config(
-            block_sizes=[
+        seed: dict[str, Any] = {
+            "block_sizes": [
                 TCGEN05_TWO_CTA_BLOCK_M,
                 TCGEN05_TWO_CTA_BLOCK_N,
                 bk,
             ],
-            l2_groupings=[TCGEN05_TWO_CTA_SEED_L2_GROUPING],
-            pid_type=TCGEN05_TWO_CTA_SEED_PID_TYPE,
-            tcgen05_cluster_m=2,
+            "l2_groupings": [TCGEN05_TWO_CTA_SEED_L2_GROUPING],
+            "pid_type": TCGEN05_TWO_CTA_SEED_PID_TYPE,
+            "tcgen05_cluster_m": 2,
             # Matches the validated tcgen05 search restriction.
-            tcgen05_num_epi_warps=4,
-        )
+            "tcgen05_num_epi_warps": 4,
+        }
+        # When the SMEM-budget gate admits ``ab=3`` for this seed tile shape,
+        # seed the canonical 4096^3 fast config family directly so it reaches
+        # the autotuner's initial population without depending on a search-
+        # stage mutation.
+        if spec._tcgen05_ab_stages_three_fits(
+            bm=TCGEN05_TWO_CTA_BLOCK_M,
+            bn=TCGEN05_TWO_CTA_BLOCK_N,
+            bk=bk,
+            cluster_m=2,
+        ):
+            seed["tcgen05_ab_stages"] = 3
+        if spec.indexing.length == 3:
+            # Pure matmul has exactly the A/B/C indexing slots. Fused epilogues
+            # add more memory ops, so leave those seeds to the spec default
+            # rather than constructing a partial list.
+            seed["indexing"] = [
+                "tensor_descriptor",
+                "tensor_descriptor",
+                "tensor_descriptor",
+            ]
+        return Config(**seed)
 
     @staticmethod
     def _select_bk(env: CompileEnvironment) -> int | None:
