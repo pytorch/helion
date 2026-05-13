@@ -581,6 +581,7 @@ class TestRandom(RefEagerTestBase, TestCase):
         )
 
     @skipIfRefEager("compile_config is not supported in ref eager mode")
+    @skipIfMTIA("MTIA tl.rand bit patterns differ from Helion Philox lowering")
     def test_hl_rand_with_explicit_offsets(self):
         @helion.kernel(static_shapes=False, autotune_effort="none")
         def rand_explicit_offsets_kernel(x: torch.Tensor, seed: int) -> torch.Tensor:
@@ -605,6 +606,7 @@ class TestRandom(RefEagerTestBase, TestCase):
         _assert_uses_philox(self, code)
 
     @skipIfRefEager("compile_config is not supported in ref eager mode")
+    @skipIfMTIA("MTIA tl.rand bit patterns differ from Helion Philox lowering")
     def test_hl_rand_offsets_independence(self):
         """Two hl.rand calls with different offset expressions are different but deterministic."""
 
@@ -643,6 +645,7 @@ class TestRandom(RefEagerTestBase, TestCase):
         _assert_bitwise_equal_float(self, b, expected_b)
 
     @skipIfRefEager("compile_config is not supported in ref eager mode")
+    @skipIfMTIA("MTIA tl.rand4x bit patterns differ from Helion Philox lowering")
     def test_hl_rand4x_dropout_pattern(self):
         """Generate three sibling dropout masks per element with a single rand4x call."""
 
