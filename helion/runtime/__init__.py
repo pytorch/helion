@@ -1577,8 +1577,8 @@ def _append_cute_wrapper_plan(
     # Optional ``smem_swizzle_*`` overrides recorded by the device-side
     # codegen when the user opts into a non-default A/B SMEM atom
     # swizzle. When absent the wrapper emits the legacy
-    # ``make_smem_layout_a/b`` calls so the canonical 4096³
-    # byte-identity golden (no override) stays valid.
+    # ``make_smem_layout_a/b`` calls. The no-override wrapper markers
+    # are covered by the focused tcgen05 SMEM-swizzle codegen test.
     smem_swizzle_a_raw = plan.get("smem_swizzle_a")
     smem_swizzle_b_raw = plan.get("smem_swizzle_b")
     smem_swizzle_a: int | None = (
@@ -1661,14 +1661,13 @@ def _append_cute_wrapper_plan(
             #   cluster shape; the cluster_m=1 cluster_n=1 case still
             #   passes the 1×1×1 shape harmlessly).
             # - ``_A`` only adds the same trailing arg when
-            #   ``cluster_n > 1``. Adding it unconditionally would
-            #   change the byte-identity golden for the validated
-            #   cluster_m∈{1,2} cluster_n=1 paths
-            #   (``test_tcgen05_role_local_monolithic_byte_identical_golden``)
-            #   because A's atom is otherwise constructed from the
-            #   3-arg form on those paths. The asymmetry is
+            #   ``cluster_n > 1``. For the validated cluster_n=1
+            #   paths, A's atom is constructed without the cluster
+            #   shape while B still receives it. The asymmetry is
             #   intentional: A only needs the cluster shape when N
-            #   multicast is active (cluster_n>1).
+            #   multicast is active (cluster_n>1). The cluster_n=1
+            #   form is pinned by
+            #   ``test_tcgen05_role_local_monolithic_codegen_markers``.
             (
                 f"    {tma_atom_a}, {tma_tensor_a} = cute.nvgpu.make_tiled_tma_atom_A("
                 "cutlass.utils.blackwell_helpers.cluster_shape_to_tma_atom_A("

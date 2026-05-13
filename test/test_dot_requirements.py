@@ -2210,7 +2210,7 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
 
         Existing role warp ids (``exec_warp_id``, ``tma_warp_id``,
         ``scheduler_warp_id``) are unaffected by the lift — codegen
-        sites that gate on those ids stay byte-identical.
+        sites that gate on those ids keep the same role assignments.
         """
         from helion._compiler.cute.device_state import CuteTcgen05MatmulPlan
 
@@ -2633,29 +2633,30 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         self.assertNotIn("tcgen05_persistence_model", spec._flat_fields())
 
     @onlyBackends(["cute"])
-    def test_cute_tcgen05_strategy_default_lowering_byte_identical(
+    def test_cute_tcgen05_strategy_defaults_normalize_and_codegen(
         self,
     ) -> None:
-        """G2-A pins generated code byte-identity: the strategy data
-        model is plumbed through ``ConfigSpec`` but no codegen path
-        reads it yet. The retained role-local seed produces the same
-        kernel source whether the strategy fields are explicitly set
-        to their documented defaults or omitted entirely.
+        """Documented tcgen05 strategy defaults normalize correctly
+        and still select the retained role-local codegen path.
+
+        The old coverage compared two complete generated source
+        strings. This version checks the config contract directly and
+        uses small structural markers for the generated kernels.
         """
 
         # ``cute_mma.py`` consults ``get_cute_mma_support()`` during
         # codegen, so the patch must remain active across both
         # ``to_triton_code()`` calls — without it, on a host without
         # native tcgen05 support both kernels silently fall through to
-        # the non-tcgen05 path and the byte-identity check still
-        # passes vacuously. The ``make_trivial_tiled_mma`` assert is a
-        # tcgen05-specific marker that catches this regression.
+        # the non-tcgen05 path. The marker assertions below catch this
+        # regression.
         args = (
             torch.empty([256, 256], device=DEVICE, dtype=HALF_DTYPE),
             torch.empty([256, 256], device=DEVICE, dtype=HALF_DTYPE),
         )
         with patch_cute_mma_support():
             bound = _cute_strategy_matmul_kernel.bind(args)
+            spec = bound.config_spec
             baseline_seed = {
                 "block_sizes": [256, 256, 16],
                 "l2_groupings": [1],
@@ -2680,11 +2681,67 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
                 tcgen05_warp_spec_register_increase=256,
             )
 
+            baseline_normalized = dict(baseline_seed)
+            explicit_normalized = dict(with_strategy.config)
+            spec.normalize(baseline_normalized, _fix_invalid=False)
+            spec.normalize(explicit_normalized, _fix_invalid=False)
+            for key in (
+                "tcgen05_strategy",
+                "tcgen05_persistence_model",
+                "tcgen05_layout_strategy",
+                "tcgen05_warp_spec_ab_load_warps",
+                "tcgen05_warp_spec_mma_warps",
+                "tcgen05_warp_spec_epi_load_warps",
+                "tcgen05_warp_spec_scheduler_warps",
+                "tcgen05_warp_spec_register_decrease",
+                "tcgen05_warp_spec_register_increase",
+            ):
+                self.assertEqual(baseline_normalized[key], explicit_normalized[key])
+
             baseline_code = bound.to_triton_code(baseline)
             with_strategy_code = bound.to_triton_code(with_strategy)
-        self.assertIn("make_trivial_tiled_mma", baseline_code)
-        self.assertIn("make_trivial_tiled_mma", with_strategy_code)
-        self.assertEqual(baseline_code, with_strategy_code)
+
+        strategy_markers = (
+            "cute.arch.setmaxregister_decrease",
+            "cute.arch.setmaxregister_increase",
+            "tcgen05_tma_warp =",
+            "tcgen05_exec_active =",
+            "tcgen05_epi_active =",
+            "cute.nvgpu.tcgen05.CtaGroup.TWO",
+            "make_trivial_tiled_mma",
+            "tcgen05_ab_pipeline_consumer_group =",
+            "tcgen05_acc_pipeline_consumer_group =",
+            "PipelineUmmaAsync.create",
+            "PipelineTmaUmma.create",
+            "PipelineTmaStore.create",
+            "PersistentTileSchedulerParams",
+            "StaticPersistentTileScheduler.create",
+            "tcgen05_role_local_0_work_tile",
+            "while tcgen05_role_local_0_work_tile.is_valid_tile",
+            "_helion_cute_cluster_shape",
+            "_helion_cute_wrapper_plans",
+        )
+
+        def _strategy_lines(code: str) -> list[str]:
+            return [
+                line.strip()
+                for line in code.splitlines()
+                if any(marker in line for marker in strategy_markers)
+            ]
+
+        baseline_strategy_lines = _strategy_lines(baseline_code)
+        explicit_strategy_lines = _strategy_lines(with_strategy_code)
+        self.assertGreaterEqual(
+            len(baseline_strategy_lines), 16, msg="\n".join(baseline_strategy_lines)
+        )
+        self.assertEqual(baseline_strategy_lines, explicit_strategy_lines)
+
+        for code in (baseline_code, with_strategy_code):
+            self.assertIn("make_trivial_tiled_mma", code)
+            self.assertIn("cute.nvgpu.tcgen05.CtaGroup.TWO", code)
+            self.assertIn("PipelineUmmaAsync.create", code)
+            self.assertIn("PipelineTmaUmma.create", code)
+            self.assertIn("PipelineTmaStore.create", code)
 
 
 @onlyBackends(["pallas"])
