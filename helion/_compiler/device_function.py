@@ -800,6 +800,11 @@ class DeviceFunction:
 
         return self.block_size_var_cache[key]
 
+    def resolved_block_size(self, block_id: int) -> int | torch.SymInt | None:
+        """Resolve a block_id to its concrete size for the current config."""
+        env = CompileEnvironment.current()
+        return env.block_sizes[block_id].from_config(self.config)
+
     def try_map_block_symbols_to_vars(self, expr: sympy.Expr) -> sympy.Expr | None:
         """Try to map all block size symbols in expression to their variable names.
 
