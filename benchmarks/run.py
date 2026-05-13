@@ -397,13 +397,17 @@ KERNEL_MAPPINGS: dict[str, tuple[str, ...]] = {
     ),
     "rope": (
         "tritonbench.operators.rope.operator",
-        "examples.rope",
-        "rope_tritonbench",
+        [
+            ("examples.rope", "rope_tritonbench"),
+            ("pretuned_kernels.rope.rope", "pretuned_rope_tritonbench"),
+        ],
     ),
     "rope-bwd": (
         "tritonbench.operators.rope.operator",
-        "examples.rope",
-        "rope_tritonbench",
+        [
+            ("examples.rope", "rope_tritonbench"),
+            ("pretuned_kernels.rope.rope", "pretuned_rope_tritonbench"),
+        ],
         {
             # tritonbench's torch_compile rope-bwd recompiles during CUDA graph
             # capture, causing "Offset increment outside graph capture" errors.
@@ -691,6 +695,9 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "helion_rope_tritonbench-speedup": "helion_speedup",
         "helion_rope_tritonbench-accuracy": "helion_accuracy",
         "helion_rope_tritonbench-latency": "helion_latency_ms",
+        "helion_pretuned_rope_tritonbench-speedup": "helion_pretuned_speedup",
+        "helion_pretuned_rope_tritonbench-accuracy": "helion_pretuned_accuracy",
+        "helion_pretuned_rope_tritonbench-latency": "helion_pretuned_latency_ms",
     },
     "rope-bwd": {
         "apply_rotary_pos_emb": "baseline",
@@ -701,6 +708,9 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "helion_rope_tritonbench-speedup": "helion_speedup",
         "helion_rope_tritonbench-accuracy": "helion_accuracy",
         "helion_rope_tritonbench-latency": "helion_latency_ms",
+        "helion_pretuned_rope_tritonbench-speedup": "helion_pretuned_speedup",
+        "helion_pretuned_rope_tritonbench-accuracy": "helion_pretuned_accuracy",
+        "helion_pretuned_rope_tritonbench-latency": "helion_pretuned_latency_ms",
     },
     "cross_entropy": {
         "cross_entropy_loss": "baseline",
