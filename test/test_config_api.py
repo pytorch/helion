@@ -569,5 +569,123 @@ class TestHardwareConfigSpecRanges(TestCase):
         )
 
 
+class TestCuteTcgen05ConfigSpecSplit(TestCase):
+    @staticmethod
+    def _make_cute_tcgen05_spec():
+        from helion._compiler.backend import CuteBackend
+        from helion.autotuner.config_spec import BlockSizeSpec
+        from helion.autotuner.config_spec import ConfigSpec
+
+        spec = ConfigSpec(backend=CuteBackend())
+        spec.cute_tcgen05_search_enabled = True
+        for block_id, size_hint in enumerate((4096, 4096, 4096)):
+            spec.block_sizes.append(
+                BlockSizeSpec(
+                    block_id=block_id,
+                    size_hint=size_hint,
+                    max_size=256 if block_id < 2 else 128,
+                )
+            )
+        return spec
+
+    def test_cute_tcgen05_search_fields_and_default_flat_roundtrip(self) -> None:
+        from helion.autotuner.config_generation import ConfigGeneration
+
+        spec = self._make_cute_tcgen05_spec()
+        flat_keys = [key for key, _count, _is_sequence in spec.flat_key_layout()]
+
+        self.assertIn("tcgen05_cluster_m", flat_keys)
+        self.assertIn("tcgen05_ab_stages", flat_keys)
+        self.assertIn("tcgen05_strategy", flat_keys)
+        self.assertIn("tcgen05_warp_spec_c_input_warps", flat_keys)
+
+        gen = ConfigGeneration(spec)
+        default_flat = gen.default_flat()
+        self.assertEqual(
+            gen.flatten(gen.unflatten([*default_flat])),
+            default_flat,
+        )
+
+    def test_tcgen05_search_fields_do_not_leak_to_other_backends(self) -> None:
+        from helion._compiler.backend import MetalBackend
+        from helion._compiler.backend import PallasBackend
+        from helion._compiler.backend import TileIRBackend
+        from helion._compiler.backend import TritonBackend
+        from helion.autotuner.config_generation import ConfigGeneration
+        from helion.autotuner.config_spec import BlockSizeSpec
+        from helion.autotuner.config_spec import ConfigSpec
+
+        for backend in (
+            TritonBackend(),
+            PallasBackend(),
+            TileIRBackend(),
+            MetalBackend(),
+        ):
+            spec = ConfigSpec(backend=backend)
+            spec.cute_tcgen05_search_enabled = True
+            spec.block_sizes.append(
+                BlockSizeSpec(block_id=0, size_hint=128, max_size=128)
+            )
+            flat_keys = {key for key, _count, _is_sequence in spec.flat_key_layout()}
+            self.assertFalse(
+                any(key.startswith("tcgen05_") for key in flat_keys),
+                f"{backend.name} search surface leaked tcgen05 keys: {flat_keys}",
+            )
+            default_config = spec.default_config()
+            self.assertFalse(
+                any(key.startswith("tcgen05_") for key in default_config.config),
+                f"{backend.name} default config leaked tcgen05 keys: "
+                f"{default_config.config}",
+            )
+            gen = ConfigGeneration(spec)
+            generated_config = gen.unflatten(gen.default_flat())
+            self.assertFalse(
+                any(key.startswith("tcgen05_") for key in generated_config.config),
+                f"{backend.name} generated config leaked tcgen05 keys: "
+                f"{generated_config.config}",
+            )
+
+    def test_explicit_tcgen05_strategy_config_validation(self) -> None:
+        spec = self._make_cute_tcgen05_spec()
+
+        with self.assertRaisesRegex(
+            exc.InvalidConfig,
+            "tcgen05 strategy invariants violated",
+        ):
+            spec.normalize(
+                helion.Config(
+                    block_sizes=[128, 128, 64],
+                    tcgen05_strategy="role_local_monolithic",
+                    tcgen05_warp_spec_c_input_warps=1,
+                )
+            )
+
+        config = helion.Config(
+            block_sizes=[128, 128, 64],
+            tcgen05_strategy="role_local_with_scheduler",
+            tcgen05_warp_spec_scheduler_warps=1,
+            tcgen05_warp_spec_c_input_warps=1,
+        )
+        spec.normalize(config)
+        self.assertEqual(config.config["tcgen05_strategy"], "role_local_with_scheduler")
+        self.assertEqual(config.config["tcgen05_warp_spec_c_input_warps"], 1)
+
+    def test_aux_kernel_detection_routes_strategy_search_surface(self) -> None:
+        spec = self._make_cute_tcgen05_spec()
+        tcgen05_config = spec._cute_tcgen05_config
+
+        narrow = tcgen05_config.strategy_autotune_fragments()
+        self.assertEqual(narrow["tcgen05_strategy"].choices, ("role_local_monolithic",))
+        self.assertEqual(narrow["tcgen05_warp_spec_c_input_warps"].choices, (0,))
+
+        tcgen05_config.aux_kernel_detected = True
+        widened = tcgen05_config.strategy_autotune_fragments()
+        self.assertEqual(
+            widened["tcgen05_strategy"].choices,
+            ("role_local_monolithic", "role_local_with_scheduler"),
+        )
+        self.assertEqual(widened["tcgen05_warp_spec_c_input_warps"].choices, (0, 1))
+
+
 if __name__ == "__main__":
     unittest.main()

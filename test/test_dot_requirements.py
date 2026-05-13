@@ -16,6 +16,7 @@ from helion._compiler.cute.strategies import Tcgen05PersistenceModel
 from helion._compiler.cute.strategies import Tcgen05Strategy
 from helion._compiler.cute.strategies import Tcgen05WarpSpec
 from helion._compiler.cute.strategies import validate_tcgen05_strategy_invariants
+from helion._compiler.cute.tcgen05_config import CuteTcgen05Config
 from helion._compiler.cute.tcgen05_constants import TCGEN05_ONE_CTA_MAX_BLOCK_M
 from helion._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
 from helion._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
@@ -29,7 +30,6 @@ from helion._testing import patch_cute_mma_support
 from helion._testing import skipIfMTIA
 from helion.autotuner import PowerOfTwoFragment
 from helion.autotuner.config_generation import ConfigGeneration
-from helion.autotuner.config_spec import ConfigSpec
 from helion.exc import InvalidConfig
 import helion.language as hl
 
@@ -165,7 +165,7 @@ def _bind_cute_4096_matmul_kernel_with_mocked_smem_budget(budget_bytes: int):
     """Bind the 4096^3 matmul with the per-CTA AB-SMEM budget mocked.
 
     The SMEM-budget gate is purely deterministic given a budget value
-    (see ``ConfigSpec._cute_per_cta_ab_smem_budget_bytes``). Mocking
+    (see ``CuteTcgen05Config.per_cta_ab_smem_budget_bytes``). Mocking
     that helper lets the demote/keep/seed unit tests exercise the gate
     on any device, not just hosts that report a B200-sized opt-in
     SMEM cap. ``budget_bytes`` is the per-CTA AB-SMEM budget in bytes
@@ -184,8 +184,8 @@ def _bind_cute_4096_matmul_kernel_with_mocked_smem_budget(budget_bytes: int):
     with (
         patch_cute_mma_support(),
         patch.object(
-            ConfigSpec,
-            "_cute_per_cta_ab_smem_budget_bytes",
+            CuteTcgen05Config,
+            "per_cta_ab_smem_budget_bytes",
             staticmethod(lambda device: budget_bytes),
         ),
     ):
@@ -668,7 +668,7 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         """
         # B200's optin reports 232 448 bytes = 227 KiB; subtract the
         # 28 KiB non-AB reservation to match what
-        # ``_cute_per_cta_ab_smem_budget_bytes`` produces in production
+        # ``CuteTcgen05Config.per_cta_ab_smem_budget_bytes`` produces in production
         # (203 776 bytes). Tracking the production value exactly is
         # what makes the over-budget vs in-budget boundary in this
         # test mirror the running gate.
@@ -818,8 +818,8 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         with patch.object(type(spec.block_sizes), "__len__", lambda self: 9):
             self.assertEqual(len(spec.block_sizes), 9)
             with patch.object(
-                ConfigSpec,
-                "_cute_per_cta_ab_smem_budget_bytes",
+                CuteTcgen05Config,
+                "per_cta_ab_smem_budget_bytes",
                 staticmethod(lambda device: b200_budget_bytes),
             ):
                 spec.allow_tcgen05_ab_stages_three_search(
@@ -849,7 +849,7 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         ``test_cute_tcgen05_ab_stages_three_smem_budget_gate``).
         """
         # B200 production value: 227 KiB optin minus 28 KiB non-AB
-        # reservation (see _cute_per_cta_ab_smem_budget_bytes).
+        # reservation (see CuteTcgen05Config.per_cta_ab_smem_budget_bytes).
         b200_budget_bytes = 227 * 1024 - 28 * 1024
         bound = _bind_cute_4096_matmul_kernel_with_mocked_smem_budget(b200_budget_bytes)
         spec = bound.config_spec
