@@ -9,8 +9,6 @@ from .ast_extension import create
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
-    from .host_function import HostFunction
-
 
 class CannotUnrollLoop(Exception):
     pass
@@ -269,10 +267,18 @@ class StaticLoopUnroller(ast.NodeTransformer):
                 env.pop(stmt.target.id, None)
 
 
-def unroll_static_loops(func: HostFunction) -> None:
+def unroll_static_loops(body: list[ast.stmt]) -> list[ast.stmt]:
+    """Unroll static loops in a list of statements.
+
+    Runs in two phases:
+      1. Visit each statement to unroll for-loops over literal lists/tuples.
+      2. A final pass of unroll_counted_whiles on the result to catch
+         top-level counted while-loops that weren't nested inside other
+         constructs (nested ones are handled during phase 1).
+    """
     unroller = StaticLoopUnroller()
     new_body = []
-    for stmt in func.body:
+    for stmt in body:
         try:
             unrolled_stmts = unroller.visit(stmt)
         except CannotUnrollLoop:
@@ -282,4 +288,4 @@ def unroll_static_loops(func: HostFunction) -> None:
                 new_body.extend(unrolled_stmts)
             else:
                 new_body.append(unrolled_stmts)
-    func.body = unroller.unroll_counted_whiles(new_body)
+    return unroller.unroll_counted_whiles(new_body)

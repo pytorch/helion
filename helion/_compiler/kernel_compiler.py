@@ -45,12 +45,13 @@ def _validate_ast(root: ast.FunctionDef) -> None:
 
 
 class KernelCompiler:
-    """Orchestrates the frontend compilation pipeline.
+    """Orchestrates the compilation pipeline.
 
-    Creates a HostFunction and drives it through the compilation steps:
-
+    AST preparation (no compilation context needed):
       1. Parse source into ExtendedAST
       2. Static loop unrolling
+
+    Analysis and lowering (needs CompileEnvironment + torch runtime context):
       3. Type propagation
       4. Config spec finalization
       5. Device IR lowering
@@ -70,8 +71,8 @@ class KernelCompiler:
     ) -> HostFunction:
         """Run the full compilation pipeline and return the compiled HostFunction."""
         hf = self.parse(fn, fake_args, constexpr_args)
+        self.unroll(hf)
         with hf, self._compilation_context():
-            self.unroll(hf)
             self.propagate_types(hf)
             self.finalize_config()
             self.lower(hf)
@@ -119,7 +120,7 @@ class KernelCompiler:
         from .static_loop_unroller import unroll_static_loops
 
         with measure("HostFunction.unroll_static_loops"):
-            unroll_static_loops(hf)
+            hf.definition.body = unroll_static_loops(hf.definition.body)
 
     def propagate_types(self, hf: HostFunction) -> None:
         from .type_propagation import propagate_types
