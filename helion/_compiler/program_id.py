@@ -3229,6 +3229,8 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         self,
         device_function: DeviceFunction,
         layout: Tcgen05PersistentProgramIDs._Tcgen05PersistentLayout,
+        *,
+        shared_body_extracted: list[ast.stmt] | None = None,
     ) -> ast.stmt:
         """Build the C-input warp's role-local while
         (``cute_plan.md`` §7.5.3.2 producer-body split).
@@ -3360,18 +3362,135 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         bm_per_cta = bm // cluster_m if is_two_cta else bm
         tile_m_var = device_function.new_var("tcgen05_aux_tile_m")
         tile_n_var = device_function.new_var("tcgen05_aux_tile_n")
-        m_coord_raw = f"{layout.work_tile_smem}[cutlass.Int32(0)]"
-        n_coord_raw = f"{layout.work_tile_smem}[cutlass.Int32(1)]"
-        # Per-CTA M tile coord: under 2cta the global M-coord
-        # already indexes into per-CTA M stripes (the scheduler
-        # publishes global M tiles, two per cluster step). Use the
-        # global coord directly; the local_tile shape ``bm_per_cta``
-        # handles the per-CTA slicing.
-        if is_two_cta:
-            tile_m_expr = m_coord_raw
+        # Bring the L2-grouping PID-decomposition chain (the
+        # ``inner_2d_pid`` → ``pid_0`` / ``pid_1`` →
+        # ``tile_offset_0`` / ``tile_offset_1`` line) into this
+        # role-local while body so the producer's per-CTA aux
+        # GMEM tile aligns with the consumer's post-L2-remap
+        # logical tile coords. Without it the producer would
+        # build its per-CTA aux GMEM tile from the raw
+        # ``work_tile_smem`` coords (which equal the consumer's
+        # only under ``l2_groupings=[1]``); under
+        # ``l2_groupings=[g>1]`` the consumer's post-L2-remap
+        # ``pid_0`` / ``pid_1`` no longer equal ``work_tile_smem[0,1]``
+        # and the producer fetches a misaligned aux tile.
+        # ``_role_local_dependency_stmts`` walks the shared body
+        # backward from a synthetic read of ``tile_offset_0`` /
+        # ``tile_offset_1`` and returns the smallest set of
+        # statements that define them. The walker is the same
+        # one the consumer role-local whiles use; this keeps the
+        # producer and consumer in lockstep on whatever the
+        # L2-grouping decomposition emits.
+        #
+        # ``tile_offset_0`` / ``tile_offset_1`` are emitted
+        # unconditionally by the standard ``NDTileStrategy``
+        # decomposition (see ``tile_strategy.py:_strategy_codegen``
+        # — ``tile_offset_<i> = pid_<i> * BS`` is part of every
+        # tile body). They are therefore always present in
+        # ``shared_body_extracted`` for any real kernel binding,
+        # regardless of whether ``L2GroupingProgramIDs.codegen``
+        # wraps the strategy (l2_grp=[g>1]) or not (l2_grp=[1]
+        # passes the names through directly with the identity
+        # remap). The branch on ``has_post_l2_coords`` below is
+        # purely defensive — it preserves the pre-cycle-2i
+        # ``work_tile_smem`` fallback for the hypothetical case
+        # where a future strategy emits the role-local while
+        # without these names, so the cycle 2b correctness
+        # baseline at ``l2_grp=[1]`` cannot regress silently.
+        synthetic_reads_for_l2 = [
+            statement_from_string(
+                "_tcgen05_aux_l2_anchor = tile_offset_0 + tile_offset_1"
+            )
+        ]
+        l2_dependency_stmts: list[ast.stmt] = []
+        if shared_body_extracted is not None:
+            l2_dependency_stmts = self._role_local_dependency_stmts(
+                shared_body_extracted, synthetic_reads_for_l2
+            )
+        l2_dependency_writes: set[str] = set()
+        for stmt in l2_dependency_stmts:
+            _, writes = _stmt_name_uses(stmt)
+            l2_dependency_writes.update(writes)
+        has_post_l2_coords = (
+            "tile_offset_0" in l2_dependency_writes
+            and "tile_offset_1" in l2_dependency_writes
+        )
+        # ``peer_m`` is this CTA's rank along the M axis of the
+        # cluster: ``block_idx_in_cluster() % cluster_m``. The
+        # modulo is load-bearing for ``cluster_n > 1`` — for
+        # ``cluster_m=2 + cluster_n=2 + use_2cta=True`` (a
+        # validated 4-CTA cluster shape, see
+        # ``cute_mma.py:_TCGEN05_V_LEADER_PREDICATE``) ranks
+        # {0, 1, 2, 3} have M peer ranks {0, 1, 0, 1}, NOT
+        # the raw rank-in-cluster. Mirrors the scheduler's
+        # per-CTA publish at the ``_cute_store_shared_remote_x4``
+        # call sites (``program_id.py`` lines 1979 and 2954)
+        # which use the same modulo on the lane-idx form.
+        peer_m_expr = (
+            f"(cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster()) "
+            f"% cutlass.Int32({cluster_m}))"
+        )
+        if has_post_l2_coords:
+            # Post-L2 path. ``tile_offset_0 // bm`` is the
+            # post-L2-remap logical M tile index (== ``pid_0``
+            # in the decomposition emitted right above this
+            # body); ``tile_offset_1 // bn`` is ``pid_1``.
+            #
+            # Note that under ``cluster_n=1 + l2_groupings=[1]``
+            # the post-L2 expression ``pid_0 * cluster_m +
+            # peer_m`` is numerically equal to the pre-cycle-2i
+            # ``work_tile_smem[0]`` because (a) the L2 remap is
+            # identity and (b) the scheduler publishes
+            # ``tile_idx[0] + peer_m = pid_0 * cluster_m +
+            # peer_m`` into each CTA's slot. Outside that
+            # narrow case the two forms diverge: under
+            # ``l2_grp=[g>1]`` because L2 remap is non-identity,
+            # and under ``cluster_n=2`` because the raw
+            # rank-in-cluster ≠ peer_m.
+            m_source = f"(tile_offset_0 // cutlass.Int32({bm}))"
+            n_source = f"(tile_offset_1 // cutlass.Int32({bn}))"
+            if is_two_cta:
+                tile_m_expr = (
+                    f"({m_source}) * cutlass.Int32({cluster_m}) + {peer_m_expr}"
+                )
+            elif self._tcgen05_uses_cluster_m2_one_cta_role_local_bridge():
+                # Bridge: cluster has ``cluster_m`` CTAs each
+                # handling its own logical M tile (no V-pair
+                # striping); add peer_m to step from the
+                # cluster-leader CTA's logical tile to this
+                # CTA's. Bridge requires ``cluster_n=1`` (see
+                # ``cute_mma._tcgen05_cluster_m2_one_cta_role_local_bridge``)
+                # so ``peer_m == block_idx_in_cluster()``; using
+                # ``peer_m`` form keeps the expression
+                # robust if that constraint widens later.
+                tile_m_expr = f"({m_source}) + {peer_m_expr}"
+            else:
+                tile_m_expr = m_source
+            tile_n_expr = n_source
         else:
-            tile_m_expr = self._tcgen05_logical_m_coord_expr(m_coord_raw)
-        tile_n_expr = n_coord_raw
+            # Pre-cycle-2i raw scheduler coords. Unreachable in
+            # production today: ``tile_offset_0`` /
+            # ``tile_offset_1`` are emitted unconditionally by
+            # the standard ``NDTileStrategy`` decomposition,
+            # which runs for every real kernel binding
+            # regardless of ``l2_groupings``. Purely defensive —
+            # preserves the pre-cycle-2i correctness baseline
+            # if a future strategy emits the role-local while
+            # without those names. Under ``is_two_cta`` the
+            # scheduler-published ``work_tile_smem[0]`` already
+            # carries the per-CTA peer_m baked in (the
+            # scheduler publish is
+            # ``tile_idx[0] + peer_m`` per CTA); under non-2cta
+            # ``_tcgen05_logical_m_coord_expr`` adds the bridge
+            # adjustment when applicable. So no extra peer_m
+            # is applied here.
+            m_source = f"{layout.work_tile_smem}[cutlass.Int32(0)]"
+            n_source = f"{layout.work_tile_smem}[cutlass.Int32(1)]"
+            if is_two_cta:
+                tile_m_expr = m_source
+            else:
+                tile_m_expr = self._tcgen05_logical_m_coord_expr(m_source)
+            tile_n_expr = n_source
 
         # Cooperative-copy thread layout. Single C-input warp has
         # 32 lanes; lay them out row-major as (M_threads, N_threads)
@@ -3701,6 +3820,13 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         per_tile_body: list[ast.stmt] = [
             statement_from_string(f"{self.virtual_pid_var} = {linear_pid_expr}"),
         ]
+        # Emit the L2-grouping decomposition chain right after
+        # ``virtual_pid`` is bound, so ``_aux_copy_lines()`` can
+        # reference the post-L2 ``tile_offset_0`` / ``tile_offset_1``
+        # names. Mirrors the consumer role-local while body's
+        # placement of ``dependency_stmts`` (see
+        # ``_build_role_local_while_with_scheduler``).
+        per_tile_body.extend(l2_dependency_stmts)
         per_tile_body.extend(_aux_copy_lines())
         per_tile_body.extend(_sched_consumer_release_block())
         per_tile_body.extend(_sched_consumer_wait_block())
@@ -4068,7 +4194,23 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             and len({d.store_value_node for d in plan.aux_tensor_descriptors}) <= 1
         ):
             role_local_whiles.append(
-                self._build_c_input_warp_role_local_while(device_function, layout)
+                self._build_c_input_warp_role_local_while(
+                    device_function,
+                    layout,
+                    # ``shared_body_extracted`` carries the post-PID-
+                    # decomposition statements (incl. the L2-grouping
+                    # ``pid_0`` / ``pid_1`` / ``tile_offset_0`` /
+                    # ``tile_offset_1`` chain). The C-input producer
+                    # body needs the same chain so its per-CTA aux
+                    # GMEM tile coords match the consumer's
+                    # post-L2-remapped tile coords — without this
+                    # the producer fetches a misaligned aux tile
+                    # under ``l2_groupings=[g>1]`` and the residual
+                    # add reads wrong rows / columns of the
+                    # auxiliary tensor (cycle 2i: 60-69% mismatched
+                    # elements vs eager).
+                    shared_body_extracted=partition.shared_body_extracted,
+                )
             )
         return role_local_whiles, shared_tile_body
 

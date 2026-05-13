@@ -11611,6 +11611,222 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
         expected = (x @ y + residual).to(x.dtype)
         torch.testing.assert_close(out, expected, atol=2e-1, rtol=1e-2)
 
+    def test_aux_pipeline_runtime_correctness_with_l2_groupings(self) -> None:
+        """Cycle 2i fix: the C-input producer body must apply the
+        same L2-grouping decomposition as the consumer roles, so
+        the producer's per-CTA aux GMEM tile is aligned with the
+        consumer's post-L2-remapped tile coords.
+
+        Pre-cycle-2i, the producer's
+        ``cute.local_tile(host_aux, (bm_per_cta, bn),
+        (work_tile_smem[0], work_tile_smem[1]))`` used the raw
+        scheduler-published coords (NOT remapped by
+        ``L2GroupingProgramIDs``). The consumer's matmul +
+        aux-add machinery used the post-L2 ``pid_0`` / ``pid_1``
+        (via ``tile_offset_0`` / ``tile_offset_1``). Under
+        ``l2_groupings=[g]`` with ``g > 1`` the two diverged
+        and the residual epilogue read from the wrong rows /
+        columns of the auxiliary tensor — direct verification
+        on 4096^3 bf16 residual at
+        ``cluster_m=2 + c_input_warps=1 + ab_stages=2``
+        produced 60-69% mismatched elements vs eager for every
+        ``g in {2, 4, 8}`` tested; only ``g=1`` was correct.
+
+        The cycle 2i fix passes ``shared_body_extracted`` to
+        ``_build_c_input_warp_role_local_while`` and calls
+        ``_role_local_dependency_stmts`` with a synthetic read of
+        ``tile_offset_0`` / ``tile_offset_1`` so the L2-grouping
+        chain is re-emitted in the producer body. The producer
+        then derives its per-CTA M tile coord from the post-L2
+        logical M tile index plus ``peer_m =
+        block_idx_in_cluster() %% cluster_m`` (mirroring the
+        scheduler's per-CTA publish at
+        ``program_id.py:1979 / 2954``).
+
+        The ``cluster_n=2`` arm of the sweep is the autoreview
+        P1 follow-up: a 4-CTA cluster
+        (``cluster_m=2 + cluster_n=2 + use_2cta=True``) has
+        ranks {0, 1, 2, 3} with M peer ranks {0, 1, 0, 1}, so
+        the producer's per-CTA M coord must use the
+        ``rank %% cluster_m`` modulo form rather than the raw
+        rank (which would emit ``pid_m * 2 + 2/3`` for ranks
+        2/3 and produce wrong output on the cluster_n=2 path
+        that was otherwise validated by the cute_mma V-leader
+        logic).
+
+        Pin: ``c_input_warps=1 + cluster_m=2 + ab_stages=2``
+        runs correctness-clean across the sweep
+        ``l2_groupings ∈ {1, 2, 4, 8} × cluster_n ∈ {1, 2}``.
+        The non-trivial ``g`` values are the load-bearing
+        regression for the original cycle 2i fix; the
+        ``cluster_n=2`` values are the load-bearing
+        regression for the autoreview P1 fix.
+        """
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+
+        torch.manual_seed(0)
+        x = torch.randn(4096, 4096, dtype=torch.bfloat16, device=DEVICE)
+        y = torch.randn(4096, 4096, dtype=torch.bfloat16, device=DEVICE)
+        residual = torch.randn(4096, 4096, dtype=torch.bfloat16, device=DEVICE)
+        expected = (x @ y + residual).to(x.dtype)
+        kernel = self._residual_kernel()
+        # Bind once — args don't change across the sweep, only
+        # the config. ``set_config`` swaps the config without
+        # re-tracing the fx graph.
+        bound = kernel.bind((x, y, residual))
+        bound.env.config_spec.cute_tcgen05_search_enabled = True
+        # Sweep covers both cluster_n=1 (2-CTA cluster, the
+        # cycle 2b validated baseline shape) and cluster_n=2
+        # (4-CTA cluster, validated by cute_mma.py's V-leader
+        # logic; ranks {0,1,2,3} have M peer ranks {0,1,0,1},
+        # so the producer's per-CTA M tile coord must use
+        # ``peer_m = block_idx_in_cluster() %% cluster_m``
+        # rather than the raw rank — see the P1 autoreview
+        # fix in cycle 2i). ``g > 1`` is the load-bearing
+        # regression for the original cycle 2i fix; ``g=1``
+        # is included to keep the cycle 2b correctness
+        # baseline pinned.
+        sweep_configs: list[tuple[int, int]] = [
+            (l2_grouping, cluster_n)
+            for cluster_n in (1, 2)
+            for l2_grouping in (1, 2, 4, 8)
+        ]
+        for l2_grouping, cluster_n in sweep_configs:
+            config = helion.Config(
+                block_sizes=[256, 256, 128],
+                l2_groupings=[l2_grouping],
+                num_warps=4,
+                num_sm_multiplier=1,
+                pid_type="persistent_interleaved",
+                tcgen05_cluster_m=2,
+                tcgen05_cluster_n=cluster_n,
+                tcgen05_ab_stages=2,
+                tcgen05_acc_stages=2,
+                tcgen05_c_stages=2,
+                tcgen05_num_epi_warps=4,
+                tcgen05_strategy="role_local_with_scheduler",
+                tcgen05_warp_spec_scheduler_warps=1,
+                tcgen05_warp_spec_c_input_warps=1,
+                indexing=[
+                    "tensor_descriptor",
+                    "tensor_descriptor",
+                    "tensor_descriptor",
+                ],
+            )
+            bound.set_config(config)
+            out = bound(x, y, residual)
+            torch.testing.assert_close(
+                out,
+                expected,
+                atol=2e-1,
+                rtol=1e-2,
+                msg=(
+                    f"residual c_input=1 cluster_m=2 cluster_n={cluster_n} "
+                    f"l2_groupings=[{l2_grouping}] output mismatch"
+                ),
+            )
+
+    def test_aux_pipeline_producer_post_l2_tile_coords_emitted(self) -> None:
+        """Cycle 2i codegen pin: the C-input producer body emits
+        the L2-grouping decomposition chain (``inner_2d_pid`` /
+        ``pid_0`` / ``pid_1`` / ``tile_offset_0`` /
+        ``tile_offset_1``) and derives its per-CTA aux tile
+        coords from the post-L2 ``tile_offset_0/1 // bm/bn``
+        plus ``block_idx_in_cluster()`` under ``is_two_cta``.
+
+        This pin guards against a regression that drops the
+        ``shared_body_extracted`` plumb to
+        ``_build_c_input_warp_role_local_while`` or stops
+        invoking ``_role_local_dependency_stmts`` for the
+        producer. Without those, the producer falls back to
+        the raw ``work_tile_smem`` coords and the
+        ``l2_groupings=[g>1]`` correctness pin above breaks.
+        """
+        kernel = self._residual_kernel()
+        args = (
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+        )
+        config = helion.Config(
+            block_sizes=[256, 256, 128],
+            l2_groupings=[4],
+            num_warps=4,
+            num_sm_multiplier=1,
+            pid_type="persistent_interleaved",
+            tcgen05_cluster_m=2,
+            tcgen05_ab_stages=2,
+            tcgen05_acc_stages=2,
+            tcgen05_c_stages=2,
+            tcgen05_num_epi_warps=4,
+            tcgen05_strategy="role_local_with_scheduler",
+            tcgen05_warp_spec_scheduler_warps=1,
+            tcgen05_warp_spec_c_input_warps=1,
+            indexing=[
+                "tensor_descriptor",
+                "tensor_descriptor",
+                "tensor_descriptor",
+            ],
+        )
+        with patch_cute_mma_support():
+            bound = kernel.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            code = bound.to_triton_code(config)
+
+        # The producer body re-emits the L2-grouping
+        # decomposition chain. ``tile_offset_0`` and
+        # ``tile_offset_1`` must both appear inside the
+        # producer body (they are scope-local to each
+        # role-local while; the consumer roles re-emit them
+        # too).
+        c_input_marker = "while tcgen05_c_input_warp_valid:"
+        assert c_input_marker in code, (
+            "expected the C-input producer while loop in codegen"
+        )
+        producer_body = code.split(c_input_marker, 1)[1]
+        # The dependency walker brings in ``inner_2d_pid``,
+        # ``group_id``, ``first_pid_m``, ``group_size_m``,
+        # ``pid_0``, ``pid_1``, ``tile_offset_0``,
+        # ``tile_offset_1``.
+        for name in (
+            "inner_2d_pid",
+            "group_id",
+            "first_pid_m",
+            "group_size_m",
+            "pid_0",
+            "pid_1",
+            "tile_offset_0",
+            "tile_offset_1",
+        ):
+            self.assertIn(
+                f"{name} = ",
+                producer_body,
+                f"expected L2-grouping decomposition var {name!r} "
+                f"defined inside the C-input producer body",
+            )
+        # The producer's per-CTA aux M tile coord must derive
+        # from post-L2 ``tile_offset_0 // bm * cluster_m`` plus
+        # ``peer_m = block_idx_in_cluster() %% cluster_m``
+        # under is_two_cta. ``bm=256`` for this config;
+        # ``cluster_m=2``. The modulo form is load-bearing for
+        # ``cluster_n=2`` (autoreview P1 fix; see the runtime
+        # correctness sweep above). Python's expression
+        # rendering strips redundant outer parens, so the
+        # match below is on the canonical post-rendering form.
+        self.assertIn(
+            "tcgen05_aux_tile_m = tile_offset_0 // cutlass.Int32(256) "
+            "* cutlass.Int32(2) + cute.arch.make_warp_uniform"
+            "(cute.arch.block_idx_in_cluster()) % cutlass.Int32(2)",
+            producer_body,
+        )
+        self.assertIn(
+            "tcgen05_aux_tile_n = tile_offset_1 // cutlass.Int32(256)",
+            producer_body,
+        )
+
     def test_aux_pipeline_producer_advance_indent_fallback_path(self) -> None:
         """Producer-body indent regression for the fallback
         ``emit_pipeline_advance`` path: when
