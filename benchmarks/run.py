@@ -185,6 +185,20 @@ KERNEL_MAPPINGS: dict[str, tuple[str, ...]] = {
             "remove_flags": ["--cudagraph"],
         },
     ),
+    "rope": (
+        "tritonbench.operators.rope.operator",
+        [
+            ("examples.rope", "rope_tritonbench"),
+            ("pretuned_kernels.rope.rope", "pretuned_rope_tritonbench"),
+        ],
+    ),
+    "rope-bwd": (
+        "tritonbench.operators.rope.operator",
+        [
+            ("examples.rope", "rope_tritonbench"),
+            ("pretuned_kernels.rope.rope", "pretuned_rope_tritonbench"),
+        ],
+    ),
     "sum": ("tritonbench.operators.sum.operator", "examples.sum", "sum_tritonbench"),
     "softmax": (
         "tritonbench.operators.softmax.operator",
@@ -451,6 +465,32 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "helion_rms_norm_tritonbench-speedup": "helion_speedup",
         "helion_rms_norm_tritonbench-accuracy": "helion_accuracy",
         "helion_rms_norm_tritonbench-latency": "helion_latency_ms",
+    },
+    "rope": {
+        "apply_rotary_pos_emb": "baseline",
+        "liger_rotary_pos_emb-speedup": "triton_speedup",
+        "liger_rotary_pos_emb-accuracy": "triton_accuracy",
+        "torch_compile_rotary_pos_emb_full_op-speedup": "torch_compile_speedup",
+        "torch_compile_rotary_pos_emb_full_op-accuracy": "torch_compile_accuracy",
+        "helion_rope_tritonbench-speedup": "helion_speedup",
+        "helion_rope_tritonbench-accuracy": "helion_accuracy",
+        "helion_rope_tritonbench-latency": "helion_latency_ms",
+        "helion_pretuned_rope_tritonbench-speedup": "helion_pretuned_speedup",
+        "helion_pretuned_rope_tritonbench-accuracy": "helion_pretuned_accuracy",
+        "helion_pretuned_rope_tritonbench-latency": "helion_pretuned_latency_ms",
+    },
+    "rope-bwd": {
+        "apply_rotary_pos_emb": "baseline",
+        "liger_rotary_pos_emb-speedup": "triton_speedup",
+        "liger_rotary_pos_emb-accuracy": "triton_accuracy",
+        "torch_compile_rotary_pos_emb_full_op-speedup": "torch_compile_speedup",
+        "torch_compile_rotary_pos_emb_full_op-accuracy": "torch_compile_accuracy",
+        "helion_rope_tritonbench-speedup": "helion_speedup",
+        "helion_rope_tritonbench-accuracy": "helion_accuracy",
+        "helion_rope_tritonbench-latency": "helion_latency_ms",
+        "helion_pretuned_rope_tritonbench-speedup": "helion_pretuned_speedup",
+        "helion_pretuned_rope_tritonbench-accuracy": "helion_pretuned_accuracy",
+        "helion_pretuned_rope_tritonbench-latency": "helion_pretuned_latency_ms",
     },
     "cross_entropy": {
         "cross_entropy_loss": "baseline",
@@ -1278,6 +1318,9 @@ def run_kernel_variants(
                     attr = getattr(mod, attr_name)
                     if isinstance(attr, Kernel):
                         attr.reset()
+                        if attr.settings.autotune_cache == "AOTAutotuneCache":
+                            attr.settings.force_autotune = False
+                            continue
                         # Force autotuning unless HELION_AUTOTUNE_EFFORT=none is set
                         # This ensures we run autotuning even if the kernel has pre-specified configs
                         if os.environ.get("HELION_AUTOTUNE_EFFORT", "") != "none":
