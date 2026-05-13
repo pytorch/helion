@@ -2254,6 +2254,186 @@ class TestCuteLowerings(unittest.TestCase):
             code,
         )
 
+    def test_tcgen05_with_scheduler_c_input_warp_inert_codegen(
+        self,
+    ) -> None:
+        """``cute_plan.md`` §7.5.3.2 data-model lift codegen pin.
+
+        The validator under ``ROLE_LOCAL_WITH_SCHEDULER`` accepts
+        ``tcgen05_warp_spec_c_input_warps=1``. The C-input warp body
+        is inert today (no role-local while loop consumes it); the
+        slot occupies what was previously the inert padding warp
+        under the 7-role-warp / 8-launched layout. The
+        scheduler-pipeline consumer-arrive count subtracts
+        ``c_input_warp_count`` so ``producer_commit`` is not blocked
+        on a missing arrival.
+
+        Pin:
+
+        - The sched_pipeline consumer arrive count stays at 6 (4 epi
+          + 1 mma + 1 ab_load = 6 consumer warps; the C-input warp
+          is excluded so the count is identical to the
+          ``c_input_warps=0`` baseline).
+        - The cluster_layout pin (2, 1, 1) for cluster_m=2 is
+          preserved so the launch envelope shape is unchanged.
+        - The kernel emits the tcgen05 codegen markers
+          (``cute.nvgpu.tcgen05`` operand-mode + ``PipelineTmaUmma``)
+          so the path is exercised end-to-end on the role-local
+          tcgen05 lowering, not the universal lane-loop fallback.
+        """
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_with_scheduler_c_input(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        args = (
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+        )
+        # Use the cluster_m=2 path because it is the persistent-grid
+        # shape that the existing WITH_SCHEDULER codegen pins (see
+        # ``test_tcgen05_with_scheduler_cluster_m2_per_cta_topology_codegen``)
+        # use to reach the role-local tcgen05 lowering deterministically.
+        config = helion.Config(
+            block_sizes=[256, 256, 128],
+            l2_groupings=[1],
+            num_warps=4,
+            num_sm_multiplier=1,
+            pid_type="persistent_interleaved",
+            tcgen05_cluster_m=2,
+            tcgen05_ab_stages=2,
+            tcgen05_acc_stages=2,
+            tcgen05_c_stages=2,
+            tcgen05_num_epi_warps=4,
+            tcgen05_strategy="role_local_with_scheduler",
+            tcgen05_warp_spec_scheduler_warps=1,
+            tcgen05_warp_spec_c_input_warps=1,
+            indexing=[
+                "tensor_descriptor",
+                "tensor_descriptor",
+                "tensor_descriptor",
+            ],
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_with_scheduler_c_input.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            code = bound.to_triton_code(config)
+
+        # Sched_pipeline consumer arrive count excludes the C-input
+        # warp: 4 epi + 1 mma + 1 ab_load = 6 (same as c_input=0).
+        # If the subtraction in
+        # ``cute_mma._codegen_cute_mma`` were missing, the count would
+        # become 7 (counting the inert C-input warp as a consumer)
+        # and ``producer_commit`` would block forever on the missing
+        # arrival.
+        self.assertIn(
+            "tcgen05_sched_pipeline_consumer_group = "
+            "cutlass.pipeline.CooperativeGroup("
+            "cutlass.pipeline.Agent.Thread, cutlass.Int32(6))",
+            code,
+        )
+        # Negative pin: a count of 7 (or higher) must not appear on
+        # the sched_pipeline consumer group; that would indicate the
+        # C-input subtraction was missed.
+        self.assertNotIn(
+            "tcgen05_sched_pipeline_consumer_group = "
+            "cutlass.pipeline.CooperativeGroup("
+            "cutlass.pipeline.Agent.Thread, cutlass.Int32(7))",
+            code,
+        )
+        # The role-local TMA producer path is exercised: these
+        # strings appear only when the lowering reaches the tcgen05
+        # codegen (they do not appear in the universal lane-loop
+        # fallback).
+        self.assertIn("tcgen05_sched_pipeline = ", code)
+        # Cluster_layout pin for cluster_m=2 / cluster_n=1: shape
+        # (2, 1, 1). Preserved by the C-input lift (launched-warp
+        # envelope is unchanged: 8 warps either way).
+        self.assertIn("cute.make_layout((2, 1, 1))", code)
+        # tcgen05 codegen marker: the operand-mode reference appears
+        # only when the lowering selects the tcgen05 path (the
+        # universal lane-loop fallback uses scalar ops, no tcgen05
+        # symbols).
+        self.assertIn("cute.nvgpu.tcgen05.OperandMajorMode", code)
+        # PipelineTmaUmma marker: pins the role-local TMA + UMMA
+        # pipeline pairing, present only on the tcgen05 path.
+        self.assertIn("PipelineTmaUmma", code)
+
+    def test_tcgen05_with_scheduler_c_input_warp_inert_runtime_correctness(
+        self,
+    ) -> None:
+        """Runtime-correctness companion to
+        ``test_tcgen05_with_scheduler_c_input_warp_inert_codegen``.
+
+        Asserts: the matmul kernel under
+        ``tcgen05_warp_spec_c_input_warps=1`` (with
+        ``ROLE_LOCAL_WITH_SCHEDULER`` + the cluster_m=2 canonical
+        fast config) launches and produces output within bf16
+        tolerance of the eager reference.
+        """
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_with_scheduler_c_input_rt(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        # Canonical fast config family; the cluster_m=2 path is what
+        # the matched WITH_SCHEDULER runtime tests use, scaled down
+        # to 1024^3 so the kernel exercises ~32 tile launches under
+        # the persistent grid without spending full 4096-shape time.
+        torch.manual_seed(0)
+        x = torch.randn(1024, 1024, dtype=torch.bfloat16, device=DEVICE)
+        y = torch.randn(1024, 1024, dtype=torch.bfloat16, device=DEVICE)
+        config = helion.Config(
+            block_sizes=[256, 256, 128],
+            l2_groupings=[1],
+            num_warps=4,
+            num_sm_multiplier=1,
+            pid_type="persistent_interleaved",
+            tcgen05_cluster_m=2,
+            tcgen05_ab_stages=2,
+            tcgen05_acc_stages=2,
+            tcgen05_c_stages=2,
+            tcgen05_num_epi_warps=4,
+            tcgen05_strategy="role_local_with_scheduler",
+            tcgen05_warp_spec_scheduler_warps=1,
+            tcgen05_warp_spec_c_input_warps=1,
+            indexing=[
+                "tensor_descriptor",
+                "tensor_descriptor",
+                "tensor_descriptor",
+            ],
+        )
+        bound = cute_matmul_with_scheduler_c_input_rt.bind((x, y))
+        bound.env.config_spec.cute_tcgen05_search_enabled = True
+        bound.set_config(config)
+        out = bound(x, y)
+        expected = (x @ y).to(x.dtype)
+        torch.testing.assert_close(out, expected, atol=2e-1, rtol=1e-2)
+
     def test_tcgen05_clc_persistent_codegen(self) -> None:
         """G2-H CLC scheduler-warp body codegen pin (cute_plan.md).
 

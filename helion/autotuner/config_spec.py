@@ -1245,14 +1245,18 @@ class ConfigSpec:
         )
         fragments[TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY] = EnumFragment((0, 1))
         # ``c_input_warps`` validation surface: accept ``{0, 1}`` so
-        # explicit user configs can opt in to the productive C-input
-        # warp slot via ``helion.Config(tcgen05_warp_spec_c_input_warps=1)``.
+        # explicit user configs can opt in to the C-input warp slot
+        # via ``helion.Config(tcgen05_warp_spec_c_input_warps=1)``.
         # The cross-fragment validator
         # (``validate_tcgen05_strategy_invariants``) further narrows
-        # the value per-strategy: today both strategies reject nonzero
-        # until the dedicated TMA producer + SMEM ring + role-local
-        # while loop land; the accept set widens to ``{0, 1}`` for
-        # ``ROLE_LOCAL_WITH_SCHEDULER`` once that codegen path lands
+        # the value per-strategy: ``ROLE_LOCAL_MONOLITHIC`` rejects
+        # nonzero (its 6-warp shape has no slot for an 8th role
+        # warp); ``ROLE_LOCAL_WITH_SCHEDULER`` accepts ``{0, 1}``,
+        # with the value 1 occupying the slot that was previously
+        # the inert padding warp. The codegen body of the C-input
+        # warp is inert today (no role-local while loop consumes
+        # it); the productive TMA producer body that actually
+        # overlaps the aux load with mainloop work is a follow-up
         # (``cute_plan.md`` §7.5.3.2).
         fragments[TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY] = EnumFragment((0, 1))
         return fragments
@@ -2343,6 +2347,22 @@ class ConfigSpec:
                     fields["indexing"] = self.indexing
             elif self.supports_config_key("num_threads"):
                 fields["num_threads"] = self.num_threads
+                # Universal pid emission honors ``loop_orders`` (the
+                # launch grid swaps which tile axis is outer), and the
+                # better order is shape-dependent. Expose only on the
+                # non-tcgen05 branch — the tcgen05 persistent
+                # scheduler relies on a fixed
+                # ``pid_info[0]=M, pid_info[1]=N`` mapping for
+                # ``cluster_m`` / virtual-PID logic, so sampling
+                # ``loop_orders=[[1, 0]]`` there would steer cluster
+                # logic onto the wrong axis. Measured evidence for
+                # the non-tcgen05 widening lives in ``cute_plan.md``
+                # §7.0 "Recent landed work".
+                if (
+                    self.supports_config_key("loop_orders")
+                    and len(self.loop_orders) > 0
+                ):
+                    fields["loop_orders"] = self.loop_orders
             if self.epilogue_subtile_autotune_choices is not None:
                 fields["epilogue_subtile"] = EnumFragment(
                     choices=self.epilogue_subtile_autotune_choices

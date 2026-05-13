@@ -267,8 +267,13 @@ class CuteTcgen05MatmulPlan:
     when set to 1, the scheduler warp owns a centralized
     ``StaticPersistentTileScheduler`` and broadcasts work-tile
     metadata through ``cute_tcgen05_sched_pipeline_plan`` to the
-    consumer warps. The epi-load warp slot Quack uses for C input
-    is not yet present in Helion (no C-input fusion).
+    consumer warps. The C-input epi-load warp slot Quack uses for
+    C input became reachable in cycle 34 (G3.1 first slice,
+    ``cute_plan.md`` §7.5.3.2) via ``c_input_warp_count`` — when
+    set to 1 under WITH_SCHEDULER the role-warp layout grows to
+    8 role warps that exactly matches the warpgroup-aligned launch
+    envelope (no inert padding). The C-input warp body is inert
+    in cycle 34; the productive TMA-prefetch body is deferred.
     """
 
     bm: int
@@ -303,6 +308,21 @@ class CuteTcgen05MatmulPlan:
     # in ``cute_mma._codegen_cute_mma`` for why Helion does not
     # mirror Quack's depth-2.
     sched_stage_count: int = 0
+    # ``c_input_warp_count`` is the dedicated C-input / auxiliary-tensor
+    # warp count for the role-local layout (``cute_plan.md`` §7.5.3.2).
+    # Default 0 keeps the historical ``WITH_SCHEDULER`` 7-role-warp +
+    # 1-inert-padding layout. The validator accepts the value 1 under
+    # WITH_SCHEDULER — the C-input warp then occupies what was
+    # previously the inert padding slot (sitting after the scheduler
+    # warp in the launched-CTA layout). ``launched_warp_count`` stays
+    # at 8 either way because ``role_warp_count`` (8 with the slot
+    # lifted) already matches the warpgroup-aligned envelope. The
+    # codegen body of the C-input warp is inert today — it does not
+    # arrive on the scheduler broadcast pipeline, so the consumer
+    # arrive count in ``cute_mma._codegen_cute_mma`` subtracts
+    # ``c_input_warp_count`` to compensate. MONOLITHIC keeps this at
+    # 0 by validator; only WITH_SCHEDULER hosts the slot.
+    c_input_warp_count: int = 0
     # ``persistence_model`` selects the persistence axis of the
     # generated kernel. ``STATIC_PERSISTENT`` (default) keeps the
     # existing ``StaticPersistentTileScheduler`` path. ``CLC_PERSISTENT``
@@ -388,16 +408,23 @@ class CuteTcgen05MatmulPlan:
             + 1
             + self.ab_load_warp_count
             + self.scheduler_warp_count
+            + self.c_input_warp_count
         )
 
     @property
     def launched_warp_count(self) -> int:
         # ``setmaxregister`` is warpgroup-uniform on sm_100a (all 4
         # warps of a warpgroup must request the same register
-        # budget). For ``WITH_SCHEDULER`` the 7 role warps split as
-        # 4 epi (consumers) + 3 producer warps; padding to 8
-        # launched warps moves the partial producer warpgroup back
-        # to a clean 4-warp warpgroup that uniformly decreases.
+        # budget). For ``WITH_SCHEDULER`` with the default
+        # ``c_input_warp_count=0`` the 7 role warps split as 4 epi
+        # (consumers) + 3 producer warps; padding to 8 launched
+        # warps moves the partial producer warpgroup back to a
+        # clean 4-warp warpgroup that uniformly decreases. With
+        # ``c_input_warp_count=1`` the 8 role warps already match
+        # the warpgroup-aligned launch envelope so no padding is
+        # needed — the launched-warp count stays at 8 and the
+        # C-input warp simply occupies what was previously the
+        # inert padding slot.
         # ``MONOLITHIC`` keeps 6 launched warps because byte-identity
         # against the recorded golden is load-bearing and the
         # 6-warp shape happens to work in practice (mma+tma alone
