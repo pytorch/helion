@@ -315,12 +315,6 @@ def enforce_dot_requirements(lhs: torch.Tensor, rhs: torch.Tensor) -> None:
         and static_m >= 64
         and static_n >= 8
         and static_k >= 16
-        # The tcgen05 direct-store epilogue's predicated SIMT path
-        # CUDA-launch-fails for partial M tiles on B200. Gate the tcgen05
-        # specialization on M being a clean multiple of the minimum tcgen05
-        # M tile (64) so generated tiles are always full and the predicated
-        # branch is never taken.
-        and static_m % 64 == 0
     ):
         from .._compiler.cute.mma_support import get_cute_mma_support
 
@@ -329,8 +323,16 @@ def enforce_dot_requirements(lhs: torch.Tensor, rhs: torch.Tensor) -> None:
             def pow2_floor_at_least(value: int, minimum: int) -> int:
                 return 1 << (max(minimum, value).bit_length() - 1)
 
-            spec = env.config_spec
-            spec.cute_tcgen05_search_enabled = True
+            def pow2_divisor_at_most(
+                *, value: int, limit: int, minimum: int
+            ) -> int | None:
+                candidate = min(limit, pow2_floor_at_least(value, minimum))
+                while candidate >= minimum:
+                    if value % candidate == 0:
+                        return candidate
+                    candidate //= 2
+                return None
+
             max_tcgen05_n = min(256, pow2_floor_at_least(static_n, 8))
             max_tcgen05_m = 256 if max_tcgen05_n >= 128 and static_m >= 256 else 128
             # Larger tile_k packs more cute.gemm instructions per K loop
@@ -340,6 +342,30 @@ def enforce_dot_requirements(lhs: torch.Tensor, rhs: torch.Tensor) -> None:
             max_search_m = min(max_tcgen05_m, pow2_floor_at_least(static_m, 64))
             max_search_n = max_tcgen05_n
             max_search_k = max_tcgen05_k
+            min_search_m = 128 if max_tcgen05_m >= 256 else 64
+            if static_m % max_search_m != 0 and static_n % max_search_n != 0:
+                # The tcgen05 SIMT edge epilogue is validated for one output
+                # edge axis at a time. Prefer keeping M wide and narrowing N
+                # to a power-of-two divisor; if N has no valid divisor, try
+                # the symmetric M narrowing before disabling tcgen05 search.
+                narrowed_search_n = pow2_divisor_at_most(
+                    value=static_n,
+                    limit=max_search_n,
+                    minimum=8,
+                )
+                if narrowed_search_n is not None:
+                    max_search_n = narrowed_search_n
+                else:
+                    narrowed_search_m = pow2_divisor_at_most(
+                        value=static_m,
+                        limit=max_search_m,
+                        minimum=min_search_m,
+                    )
+                    if narrowed_search_m is None:
+                        return
+                    max_search_m = narrowed_search_m
+            spec = env.config_spec
+            spec.cute_tcgen05_search_enabled = True
             # Persistent pid types may re-enter autotune only if every
             # power-of-two block-size candidate in the tcgen05 search space
             # is a static full tile. Since each candidate divides the maximum
@@ -424,7 +450,7 @@ def enforce_dot_requirements(lhs: torch.Tensor, rhs: torch.Tensor) -> None:
                 if axis_name == "k":
                     min_size = 16
                 elif axis_name == "m":
-                    min_size = 128 if max_tcgen05_m >= 256 else 64
+                    min_size = min_search_m
                 else:
                     min_size = 8
                 env.block_sizes[block_idx].update_min_block(

@@ -1152,6 +1152,30 @@ instantiate_parametrized_tests(TestMisc)
 
 
 @onlyBackends(["triton"])
+class TestTritonExactGelu(RefEagerTestBase, TestCase):
+    @skipIfRefEager("Codegen inspection not applicable in ref eager mode")
+    def test_gelu_exact_bf16_triton_dtype_cast(self):
+        """Default ``F.gelu`` lowers through the exact erf path and
+        preserves bf16 dtype for the Triton backend."""
+
+        @helion.kernel(autotune_effort="none")
+        def gelu_exact_kernel(x: torch.Tensor) -> torch.Tensor:
+            result = torch.empty_like(x)
+            for tile in hl.tile(x.size(0)):
+                result[tile] = torch.nn.functional.gelu(x[tile])
+            return result
+
+        x = torch.randn([32], device=DEVICE, dtype=torch.bfloat16)
+        code, result = code_and_output(gelu_exact_kernel, (x,))
+        self.assertEqual(result.dtype, torch.bfloat16)
+        expected = torch.nn.functional.gelu(x)
+        torch.testing.assert_close(result, expected, atol=2e-2, rtol=2e-2)
+        self.assertIn("libdevice.erf", code)
+        self.assertIn("tl.float32", code)
+        self.assertIn("tl.bfloat16", code)
+
+
+@onlyBackends(["triton"])
 class TestHelionTritonPrinter(TestCase):
     """Tests for the HelionTritonPrinter class."""
 

@@ -2591,6 +2591,12 @@ def _active_loop_block_ids(fn: DeviceFunction) -> set[int]:
     return active
 
 
+# Leave broad headroom below the G1 sweep's 3600s subprocess timeout: budget
+# checks happen between inline CuTe compile/benchmark units, then the selected
+# config still has to compile, pass correctness, and run the final benchmark.
+_CUTE_DEFAULT_AUTOTUNE_BUDGET_SECONDS = 600
+
+
 class CuteBackend(Backend):
     """CuTe DSL (CUTLASS Python DSL) code generation backend."""
 
@@ -2683,7 +2689,15 @@ class CuteBackend(Backend):
         force: bool = True,
         **kwargs: object,
     ) -> Config:
-        return super().autotune(bound_kernel, args, force=force, **kwargs)
+        original_budget = bound_kernel.settings.autotune_budget_seconds
+        if bound_kernel.settings.autotune_budget_seconds is None:
+            bound_kernel.settings.autotune_budget_seconds = (
+                _CUTE_DEFAULT_AUTOTUNE_BUDGET_SECONDS
+            )
+        try:
+            return super().autotune(bound_kernel, args, force=force, **kwargs)
+        finally:
+            bound_kernel.settings.autotune_budget_seconds = original_budget
 
     @property
     def function_decorator(self) -> str:

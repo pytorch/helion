@@ -1205,7 +1205,7 @@ class TestCuteLowerings(unittest.TestCase):
         self.assertNotIn("acc_frag = acc_frag_base", code)
 
     def test_tcgen05_mma_stage_uses_pipeline_consumer_state(self) -> None:
-        """tcgen05 + TMA picks the AB SMEM stage from
+        """Role-local tcgen05 + TMA picks the AB SMEM stage from
         ``tma_consumer_state.index`` rather than the local
         ``(k_offset // bk) % stage_count`` modular form.
 
@@ -1232,13 +1232,13 @@ class TestCuteLowerings(unittest.TestCase):
             return out
 
         args = (
-            torch.randn(128, 16, device=DEVICE, dtype=torch.float16),
-            torch.randn(16, 256, device=DEVICE, dtype=torch.float16),
+            torch.empty(256, 128, device=DEVICE, dtype=torch.bfloat16),
+            torch.empty(128, 256, device=DEVICE, dtype=torch.bfloat16),
         )
         with patch_cute_mma_support():
             bound = cute_matmul_mma_stage.bind(args)
             bound.env.config_spec.cute_tcgen05_search_enabled = True
-            config = _make_tcgen05_persistent_config(l2_groupings=[4])
+            config = _make_tcgen05_role_local_monolithic_seed_config()
             code = bound.to_triton_code(config)
 
         # The new form: mma_stage tracks the pipeline state directly.
@@ -3864,15 +3864,15 @@ class TestCuteLowerings(unittest.TestCase):
         self.assertNotIn("cute.arch.fence_view_async_shared()", role_src)
         self.assertNotIn("cute.nvgpu.tcgen05.Field.ACCUMULATE, True", role_src)
 
-    def test_tcgen05_persistent_partial_single_tile_keeps_shared_tma_path(
+    def test_tcgen05_persistent_partial_single_tile_keeps_shared_scalar_path(
         self,
     ) -> None:
-        """Partial-tile TMA fallback keeps the legacy shared-loop shape.
+        """Partial-tile scalar fallback keeps the legacy shared-loop shape.
 
-        The role-local mainloop path assumes static full tiles and drops
-        scalar fallback from the extracted producer/exec K-loops. Partial
-        tiles still need the scalar fallback barriers in the shared loop, so
-        static edge shapes must not opt into the role-local path.
+        The role-local mainloop path assumes static full tiles and edge shapes
+        now disable AB TMA loads so every K iteration follows the scalar SMEM
+        fill path. Partial tiles still need the fallback barriers in the shared
+        loop, so static edge shapes must not opt into the role-local path.
         """
 
         @helion.kernel(backend="cute")
@@ -3891,7 +3891,7 @@ class TestCuteLowerings(unittest.TestCase):
 
         args = (
             torch.randn(96, 32, device=DEVICE, dtype=torch.float16),
-            torch.randn(32, 96, device=DEVICE, dtype=torch.float16),
+            torch.randn(32, 128, device=DEVICE, dtype=torch.float16),
         )
         with patch_cute_mma_support():
             bound = cute_matmul_persistent_partial.bind(args)
@@ -3904,10 +3904,13 @@ class TestCuteLowerings(unittest.TestCase):
 
         self.assertIn("while tcgen05_work_tile_valid", code)
         self.assertNotIn("tcgen05_role_local", code)
+        self.assertNotIn("'kind': 'tcgen05_ab_tma'", code)
         self.assertNotIn("'kind': 'tcgen05_d_tma'", code)
-        self.assertIn("tcgen05_tma_warp", code)
+        self.assertNotIn("PipelineTmaUmma", code)
+        self.assertNotIn("cute.nvgpu.cpasync.tma_partition", code)
+        self.assertIn("sA_mma", code)
+        self.assertIn("sB_mma", code)
         self.assertIn("cute.arch.sync_threads()", code)
-        self.assertIn("if tcgen05_tma_full_tile", code)
 
     def test_tcgen05_persistent_multi_tile_runtime_correctness(self) -> None:
         """Static full-tile persistent + tcgen05 is correct for multi-tile shapes.
@@ -4545,7 +4548,7 @@ class TestCuteLowerings(unittest.TestCase):
         skip — when the binary's first operand is the aux load,
         descending into ``all_input_nodes[0]`` would walk into the
         bias tensor and lose the carrier path. The walker explicitly
-        skips ``hl.load`` nodes when picking the descent target so
+        skips accepted aux-load operands when picking the descent target so
         the carrier-side walk-back to ``hl.zeros`` recovers the
         tile-id symbols regardless of operand order.
         """
@@ -4585,6 +4588,88 @@ class TestCuteLowerings(unittest.TestCase):
         out = bound(x, y, bias)
         expected = (bias + x @ y).to(x.dtype)
         torch.testing.assert_close(out, expected, atol=2e-1, rtol=1e-2)
+
+    def test_tcgen05_fused_scaled_aux_reverse_form_runtime_correctness(
+        self,
+    ) -> None:
+        """Reverse-form scaled/wrapped residual aux operands keep the
+        carrier tile symbols and load the residual with the user's
+        original ``[tile_m, tile_n]`` indices."""
+
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_scaled_residual_reverse(
+            x: torch.Tensor, y: torch.Tensor, residual: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = (
+                    0.5 * residual[tile_m, tile_n].to(torch.float32) + acc
+                ).to(x.dtype)
+            return out
+
+        x = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
+        y = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
+        residual = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
+        bound = cute_matmul_scaled_residual_reverse.bind((x, y, residual))
+        bound.env.config_spec.cute_tcgen05_search_enabled = True
+        bound.set_config(
+            _make_tcgen05_persistent_config(
+                block_sizes=[128, 128, 32],
+                pid_type="persistent_interleaved",
+            )
+        )
+        out = bound(x, y, residual)
+        expected = ((x @ y).float() + 0.5 * residual.float()).to(x.dtype)
+        torch.testing.assert_close(out, expected, atol=2e-1, rtol=1e-2)
+
+    def test_tcgen05_fused_scaled_aux_reverse_form_rejects_swapped_indices(
+        self,
+    ) -> None:
+        """A scaled/wrapped aux operand on the left still pins exact
+        aux indices to the carrier order; square shapes cannot fall
+        back to shape-only acceptance."""
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_scaled_residual_swapped(
+            x: torch.Tensor, y: torch.Tensor, residual: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = (
+                    0.5 * residual[tile_n, tile_m].to(torch.float32) + acc
+                ).to(x.dtype)
+            return out
+
+        x = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
+        y = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
+        residual = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
+        with (
+            self.assertRaises(exc.BackendUnsupported) as cm,
+            patch_cute_mma_support(),
+        ):
+            bound = cute_matmul_scaled_residual_swapped.bind((x, y, residual))
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            cfg = _make_tcgen05_persistent_config(
+                block_sizes=[128, 128, 32],
+                pid_type="persistent_interleaved",
+            )
+            bound.to_triton_code(cfg)
+        self.assertIn("tcgen05 MMA path", str(cm.exception))
 
     def test_tcgen05_fused_colvec_broadcast_rejected_at_classify_time(
         self,
@@ -4873,15 +4958,13 @@ class TestCuteLowerings(unittest.TestCase):
             cute_matmul_residual_3d(x, y, residual3d)
         self.assertIn("tcgen05 MMA path", str(cm.exception))
 
-    def test_tcgen05_fused_aux_rejects_non_static_full_shape(self) -> None:
-        """Reject aux fusion when the active lowering selects the
-        SIMT-store fallback (``static_full_tiles=False``). On the
-        SIMT path edge tiles run a runtime-predicated copy; the
-        unpredicated aux load would otherwise read past the aux
-        tensor on edge tiles. The classifier still accepts the
-        chain, but the splice-site gate raises
-        ``BackendUnsupported`` so a user does not silently get
-        out-of-bounds aux reads.
+    def test_tcgen05_fused_aux_partial_single_edge_runtime_correctness(self) -> None:
+        """Aux fusion on the SIMT-store fallback predicates aux loads too.
+
+        Static-full tiles still use the TMA-store epilogue, but edge tiles
+        route the aux tensor through a predicated GMEM-to-register copy before
+        rendering the epilogue chain. This pins the single-output-edge pattern
+        used when search narrows one output tile axis to avoid double edges.
         """
 
         from helion._compiler.cute.mma_support import get_cute_mma_support
@@ -4904,26 +4987,57 @@ class TestCuteLowerings(unittest.TestCase):
             return out
 
         # Problem-size NOT divisible by block size on the M axis
-        # (M=192, block_m=128 → 1 full tile + 1 partial tile),
+        # (M=192, block_m=128 -> 1 full tile + 1 partial tile),
         # so ``static_full_tiles`` is False and the kernel selects
         # the SIMT-store fallback.
         x = torch.randn(192, 128, dtype=torch.bfloat16, device=DEVICE)
         y = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
         residual = torch.randn(192, 128, dtype=torch.bfloat16, device=DEVICE)
-        with (
-            self.assertRaises(exc.BackendUnsupported) as cm,
-            patch_cute_mma_support(),
-        ):
-            cute_matmul_residual_partial.bind((x, y, residual)).set_config(
+        bound = cute_matmul_residual_partial.bind((x, y, residual))
+        bound.set_config(
+            _make_tcgen05_persistent_config(
+                block_sizes=[128, 128, 64],
+                pid_type="flat",
+            )
+        )
+        out = bound(x, y, residual)
+        expected = ((x @ y).float() + residual.float()).to(x.dtype)
+        torch.testing.assert_close(out, expected, atol=2e-1, rtol=1e-2)
+
+    def test_tcgen05_fused_aux_double_edge_guard(self) -> None:
+        """The SIMT-store fallback rejects configs with partial M and N tiles."""
+
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_residual_double_edge(
+            x: torch.Tensor, y: torch.Tensor, residual: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = (acc + residual[tile_m, tile_n]).to(x.dtype)
+            return out
+
+        x = torch.randn(136, 128, dtype=torch.bfloat16, device=DEVICE)
+        y = torch.randn(128, 136, dtype=torch.bfloat16, device=DEVICE)
+        residual = torch.randn(136, 136, dtype=torch.bfloat16, device=DEVICE)
+        with self.assertRaises(exc.BackendUnsupported) as cm:
+            cute_matmul_residual_double_edge.bind((x, y, residual)).set_config(
                 _make_tcgen05_persistent_config(
-                    block_sizes=[128, 128, 32],
-                    pid_type="persistent_interleaved",
+                    block_sizes=[128, 128, 64],
+                    pid_type="flat",
                 )
             )
-            cute_matmul_residual_partial(x, y, residual)
-        message = str(cm.exception)
-        self.assertIn("auxiliary-tensor", message)
-        self.assertIn("static-full-tiles", message)
+            cute_matmul_residual_double_edge(x, y, residual)
+        self.assertIn("one partial output tile axis", str(cm.exception))
 
     def _make_relu_matmul_kernel(self):
         """Return a ``@helion.kernel(backend="cute")`` matmul-relu
@@ -5416,6 +5530,72 @@ class TestCuteLowerings(unittest.TestCase):
         # tanh; matches the tolerance used by the unary-chain runtime
         # tests.
         torch.testing.assert_close(out, expected, atol=2e-1, rtol=1e-2)
+
+    def test_tcgen05_fused_gelu_exact_runtime_correctness(self) -> None:
+        """Default ``F.gelu`` maps to the exact erf-based CuTe epilogue step."""
+
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_gelu_exact(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = torch.nn.functional.gelu(acc).to(x.dtype)
+            return out
+
+        x = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
+        y = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
+        bound = cute_matmul_gelu_exact.bind((x, y))
+        bound.env.config_spec.cute_tcgen05_search_enabled = True
+        cfg = _make_tcgen05_persistent_config(
+            block_sizes=[128, 128, 32],
+            pid_type="persistent_interleaved",
+        )
+        bound.set_config(cfg)
+        out = bound(x, y)
+        expected = torch.nn.functional.gelu((x @ y).float()).to(x.dtype)
+        torch.testing.assert_close(out, expected, atol=2e-1, rtol=1e-2)
+
+    def test_tcgen05_fused_gelu_exact_codegen_marker(self) -> None:
+        """The exact GELU splice renders ``erf(x / sqrt(2))``, not tanh."""
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_gelu_exact_marker(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = torch.nn.functional.gelu(acc).to(x.dtype)
+            return out
+
+        x = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
+        y = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
+        with patch_cute_mma_support():
+            bound = cute_matmul_gelu_exact_marker.bind((x, y))
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            cfg = _make_tcgen05_persistent_config(
+                block_sizes=[128, 128, 32],
+                pid_type="persistent_interleaved",
+            )
+            bound.set_config(cfg)
+            code = bound.to_triton_code(cfg)
+
+        self.assertIn("cute.math.erf", code)
+        self.assertIn("0.7071067811865476", code)
+        self.assertNotIn("cute.math.tanh", code)
 
     def test_tcgen05_fused_gelu_tanh_approx_codegen_marker(self) -> None:
         """The spliced ``F.gelu(approximate="tanh")`` chain step renders
@@ -12367,6 +12547,59 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
         # Fixup demoted c_input_warps to 0; ab_stages=3 stays.
         self.assertEqual(config_dict["tcgen05_warp_spec_c_input_warps"], 0)
         self.assertEqual(config_dict["tcgen05_ab_stages"], 3)
+
+    def test_aux_edge_autotune_fixup_uses_monolithic_path(self) -> None:
+        """Aux kernels with partial tcgen05 tiles avoid unvalidated c-input search."""
+
+        from helion._compiler.cute.strategies import Tcgen05Strategy
+
+        kernel = self._residual_kernel()
+        args = (
+            torch.empty([5000, 5000], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([5000, 5000], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([5000, 5000], device=DEVICE, dtype=torch.bfloat16),
+        )
+        with patch_cute_mma_support():
+            bound = kernel.bind(args)
+        spec = bound.env.config_spec
+        self.assertTrue(spec.cute_tcgen05_aux_kernel_detected)
+        self.assertEqual([item.max_size for item in spec.block_sizes], [256, 8, 128])
+
+        config_dict: dict[str, object] = {
+            "block_sizes": [256, 8, 128],
+            "indexing": [
+                "tensor_descriptor",
+                "pointer",
+                "tensor_descriptor",
+                "pointer",
+                "tensor_descriptor",
+            ],
+            "l2_groupings": [32],
+            "epilogue_subtile": 2,
+            "tcgen05_l2_swizzle_size": 8,
+            "tcgen05_strategy": Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER.value,
+            "tcgen05_warp_spec_scheduler_warps": 1,
+            "tcgen05_warp_spec_c_input_warps": 1,
+            "tcgen05_ab_stages": 3,
+            "tcgen05_acc_stages": 1,
+            "tcgen05_c_stages": 2,
+        }
+        spec._cute_tcgen05_config.fix_search_config(config_dict)
+
+        self.assertEqual(
+            config_dict["tcgen05_strategy"],
+            Tcgen05Strategy.ROLE_LOCAL_MONOLITHIC.value,
+        )
+        self.assertEqual(config_dict["tcgen05_warp_spec_scheduler_warps"], 0)
+        self.assertEqual(config_dict["tcgen05_warp_spec_c_input_warps"], 0)
+        self.assertEqual(config_dict["tcgen05_ab_stages"], 2)
+        self.assertEqual(config_dict["tcgen05_acc_stages"], 2)
+        self.assertEqual(config_dict["tcgen05_c_stages"], 4)
+        self.assertEqual(config_dict["tcgen05_l2_swizzle_size"], 1)
+        self.assertEqual(config_dict["l2_groupings"], [1])
+        self.assertEqual(config_dict["indexing"], ["pointer"] * 5)
+        self.assertEqual(config_dict["block_sizes"], [128, 8, 64])
+        self.assertNotIn("epilogue_subtile", config_dict)
 
     def test_aux_autotune_surface_widens_for_hldot_residual_kernel(self) -> None:
         """Detector recognizes ``hl.dot`` MMA anchors in

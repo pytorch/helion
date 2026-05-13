@@ -3218,6 +3218,76 @@ class TestAutotuneBudget(TestCase):
             settings = Settings()
         self.assertIsNone(settings.autotune_budget_seconds)
 
+    def test_cute_backend_uses_default_autotune_budget_without_mutating(self) -> None:
+        from helion._compiler.backend import _CUTE_DEFAULT_AUTOTUNE_BUDGET_SECONDS
+        from helion._compiler.backend import Backend
+        from helion._compiler.backend import CuteBackend
+
+        settings = Settings(
+            autotune_budget_seconds=None,
+            autotune_log_level=logging.CRITICAL,
+        )
+        bound_kernel = SimpleNamespace(settings=settings)
+        observed_budgets: list[int | None] = []
+
+        def fake_autotune(self_, bound_kernel_, args, **kwargs):
+            observed_budgets.append(bound_kernel_.settings.autotune_budget_seconds)
+            return helion.Config()
+
+        with patch.object(
+            Backend, "autotune", autospec=True, side_effect=fake_autotune
+        ):
+            CuteBackend().autotune(bound_kernel, ())
+
+        self.assertEqual(observed_budgets, [_CUTE_DEFAULT_AUTOTUNE_BUDGET_SECONDS])
+        self.assertIsNone(bound_kernel.settings.autotune_budget_seconds)
+
+    def test_cute_backend_restores_default_autotune_budget_on_error(self) -> None:
+        from helion._compiler.backend import Backend
+        from helion._compiler.backend import CuteBackend
+
+        settings = Settings(
+            autotune_budget_seconds=None,
+            autotune_log_level=logging.CRITICAL,
+        )
+        bound_kernel = SimpleNamespace(settings=settings)
+
+        with (
+            patch.object(
+                Backend,
+                "autotune",
+                autospec=True,
+                side_effect=RuntimeError("boom"),
+            ),
+            self.assertRaisesRegex(RuntimeError, "boom"),
+        ):
+            CuteBackend().autotune(bound_kernel, ())
+
+        self.assertIsNone(bound_kernel.settings.autotune_budget_seconds)
+
+    def test_cute_backend_preserves_explicit_autotune_budget(self) -> None:
+        from helion._compiler.backend import Backend
+        from helion._compiler.backend import CuteBackend
+
+        settings = Settings(
+            autotune_budget_seconds=42,
+            autotune_log_level=logging.CRITICAL,
+        )
+        bound_kernel = SimpleNamespace(settings=settings)
+        observed_budgets: list[int | None] = []
+
+        def fake_autotune(self_, bound_kernel_, args, **kwargs):
+            observed_budgets.append(bound_kernel_.settings.autotune_budget_seconds)
+            return helion.Config()
+
+        with patch.object(
+            Backend, "autotune", autospec=True, side_effect=fake_autotune
+        ):
+            CuteBackend().autotune(bound_kernel, ())
+
+        self.assertEqual(observed_budgets, [42])
+        self.assertEqual(bound_kernel.settings.autotune_budget_seconds, 42)
+
     def test_setting_from_env_var(self) -> None:
         with patch.dict(
             os.environ,
@@ -3499,6 +3569,34 @@ class TestAutotuneBudget(TestCase):
         # default via class-level descriptor.
         provider = LocalBenchmarkProvider.__new__(LocalBenchmarkProvider)
         self.assertFalse(provider.budget_exceeded_fn())
+
+    def test_cute_wall_clock_benchmark_uses_subprocess_worker(self) -> None:
+        from helion._compiler.backend import CuteBackend
+
+        provider = self._make_stub_provider()
+        provider.kernel.supports_subprocess_benchmark = lambda: True
+        provider.config_spec = SimpleNamespace(backend=CuteBackend())
+
+        self.assertTrue(provider._subprocess_benchmark_enabled())
+        self.assertTrue(provider._subprocess_benchmark_uses_wall_clock())
+
+    def test_non_cute_custom_benchmark_stays_in_process(self) -> None:
+        from helion.autotuner.benchmarking import do_bench_generic
+
+        class OtherBackend:
+            @property
+            def name(self) -> str:
+                return "other"
+
+            def get_do_bench(self):
+                return do_bench_generic
+
+        provider = self._make_stub_provider()
+        provider.kernel.supports_subprocess_benchmark = lambda: True
+        provider.config_spec = SimpleNamespace(backend=OtherBackend())
+
+        self.assertFalse(provider._subprocess_benchmark_enabled())
+        self.assertFalse(provider._subprocess_benchmark_uses_wall_clock())
 
 
 if __name__ == "__main__":

@@ -405,6 +405,100 @@ class CuteTcgen05Config:
         if ab_stages == 3 and config.get(TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY) == 1:
             config[TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY] = 0
 
+    def _matmul_fact_has_edge_tile(
+        self, config: dict[str, object], *, fact_index: int
+    ) -> bool:
+        block_sizes = config.get("block_sizes")
+        if not isinstance(block_sizes, list):
+            return False
+        fact = self.config_spec.matmul_facts[fact_index]
+        for static_size, block_id in (
+            (fact.static_m, fact.m_block_id),
+            (fact.static_n, fact.n_block_id),
+            (fact.static_k, fact.k_block_id),
+        ):
+            if static_size is None or block_id is None:
+                continue
+            try:
+                block_idx = self.config_spec.block_sizes.block_id_to_index(block_id)
+            except KeyError:
+                continue
+            if block_idx >= len(block_sizes):
+                continue
+            block_size = block_sizes[block_idx]
+            if (
+                not isinstance(block_size, int)
+                or isinstance(block_size, bool)
+                or block_size <= 0
+            ):
+                continue
+            if static_size % block_size != 0:
+                return True
+        return False
+
+    def _fix_aux_edge_search_config(self, config: dict[str, object]) -> None:
+        if not (self.search_enabled and self.aux_kernel_detected):
+            return
+        if not any(
+            self._matmul_fact_has_edge_tile(config, fact_index=i)
+            for i in range(len(self.config_spec.matmul_facts))
+        ):
+            return
+
+        config[TCGEN05_STRATEGY_CONFIG_KEY] = (
+            Tcgen05Strategy.ROLE_LOCAL_MONOLITHIC.value
+        )
+        config[TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY] = 0
+        config[TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY] = 0
+        config["tcgen05_ab_stages"] = 2
+        config["tcgen05_acc_stages"] = 2
+        config["tcgen05_c_stages"] = 4
+        config[TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY] = 1
+        if isinstance(config.get("l2_groupings"), list):
+            config["l2_groupings"] = [1]
+        if isinstance(config.get("indexing"), list):
+            indexing = cast("list[object]", config["indexing"])
+            for i in range(len(indexing)):
+                indexing[i] = "pointer"
+        config.pop("epilogue_subtile", None)
+
+        block_sizes = config.get("block_sizes")
+        if not isinstance(block_sizes, list):
+            return
+        for fact in self.config_spec.matmul_facts:
+            if fact.static_m is not None and fact.m_block_id is not None:
+                try:
+                    m_idx = self.config_spec.block_sizes.block_id_to_index(
+                        fact.m_block_id
+                    )
+                except KeyError:
+                    m_idx = -1
+                if 0 <= m_idx < len(block_sizes):
+                    bm = block_sizes[m_idx]
+                    if (
+                        isinstance(bm, int)
+                        and not isinstance(bm, bool)
+                        and bm > 128
+                        and fact.static_m % bm != 0
+                    ):
+                        block_sizes[m_idx] = 128
+            if fact.static_k is None or fact.k_block_id is None:
+                continue
+            try:
+                k_idx = self.config_spec.block_sizes.block_id_to_index(fact.k_block_id)
+            except KeyError:
+                continue
+            if k_idx >= len(block_sizes):
+                continue
+            bk = block_sizes[k_idx]
+            if (
+                isinstance(bk, int)
+                and not isinstance(bk, bool)
+                and bk > 64
+                and fact.static_k % bk != 0
+            ):
+                block_sizes[k_idx] = 64
+
     def _fix_cluster_m1_persistent_search_config(
         self, config: dict[str, object]
     ) -> None:
@@ -889,6 +983,7 @@ class CuteTcgen05Config:
         self._fix_cluster_m1_persistent_search_config(config)
         self._fix_ab_stages_three_search_config(config)
         self._fix_with_scheduler_search_config(config)
+        self._fix_aux_edge_search_config(config)
 
     def normalize_strategy(
         self, config: dict[str, object], *, fix_invalid: bool

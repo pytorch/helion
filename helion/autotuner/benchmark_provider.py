@@ -32,6 +32,7 @@ from .benchmark_job import BenchmarkJob
 from .benchmark_worker import BenchmarkSubprocessError
 from .benchmark_worker import BenchmarkWorker
 from .benchmarking import do_bench
+from .benchmarking import do_bench_generic
 from .benchmarking import synchronize_device
 from .logger import SUPPRESSED_TRITON_CODE_MSG
 from .logger import AutotuneLogEntry
@@ -610,6 +611,13 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         self._precompile_args_path = None
         self._precompile_result_counter = count()
 
+    def _subprocess_benchmark_uses_wall_clock(self) -> bool:
+        backend = getattr(self.config_spec, "backend", None)
+        if backend is None:
+            return False
+        custom_bench = backend.get_do_bench()
+        return backend.name == "cute" and custom_bench is do_bench_generic
+
     def _subprocess_benchmark_enabled(self) -> bool:
         """Subprocess benchmark path is opt-in and skipped for distributed /
         mutated-arg kernels where the worker's simple job shape doesn't fit."""
@@ -621,9 +629,10 @@ class LocalBenchmarkProvider(BenchmarkProvider):
             return False
         if not self.kernel.supports_subprocess_benchmark():
             return False
-        # Custom do_bench implementations are not shipped to the worker.
-        _backend = getattr(self.config_spec, "backend", None)
-        return not (_backend is not None and _backend.get_do_bench() is not None)
+        backend = getattr(self.config_spec, "backend", None)
+        if backend is None or backend.get_do_bench() is None:
+            return True
+        return self._subprocess_benchmark_uses_wall_clock()
 
     def _validate_against_baseline(
         self, config: Config, output: object, args: Sequence[object]
@@ -1133,6 +1142,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
             args_path=self._precompile_args_path,
             warmup=warmup,
             rep=rep,
+            use_wall_clock=self._subprocess_benchmark_uses_wall_clock(),
         )
         return float(
             self._benchmark_worker.run(

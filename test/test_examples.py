@@ -126,6 +126,51 @@ class TestExamples(RefEagerTestBase, TestCase):
             args[0] @ args[1],
         )
 
+    @xfailIfPallas(
+        "Pallas TPU clamps the N block to the lane width (128) which does"
+        " not match the test's N=96 bias dimension"
+    )
+    def test_matmul_bias_epilogue_wrapper(self):
+        from typing import Any
+        from typing import Callable
+        from typing import NamedTuple
+
+        class BiasEpilogue(NamedTuple):
+            bias: torch.Tensor
+
+            @property
+            def fn(
+                self,
+            ) -> Callable[[torch.Tensor, tuple[torch.Tensor, ...]], torch.Tensor]:
+                bias = self.bias
+
+                def epilogue(
+                    acc: torch.Tensor, tile: tuple[torch.Tensor, ...]
+                ) -> torch.Tensor:
+                    return acc + bias[tile[1]]
+
+                return epilogue
+
+            def __call__(
+                self, acc: torch.Tensor, tile: tuple[torch.Tensor, ...]
+            ) -> torch.Tensor:
+                return self.fn(acc, tile)
+
+            @property
+            def __closure__(self) -> tuple[Any, ...] | None:
+                return self.fn.__closure__
+
+        a = torch.randn([128, 64], device=DEVICE, dtype=torch.float32)
+        b = torch.randn([64, 96], device=DEVICE, dtype=torch.float32)
+        bias = torch.randn([96], device=DEVICE, dtype=torch.float32)
+
+        check_example(
+            "matmul",
+            (a, b, BiasEpilogue(bias)),
+            a @ b + bias,
+            block_sizes=[32, 32, 32],
+        )
+
     def test_matmul_bf16_tcgen05(self):
         """Matmul at 256^3 bf16 — fixture sized just above the cute
         tcgen05 admission floor (M >= 64 divisible by 64) so the cute
@@ -787,10 +832,6 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
 
     @skipIfTileIR("PassManager::run failed")
-    @xfailIfCute(
-        "CuTe tcgen05 MMA path does not yet emit indices/masks for the "
-        "user-level epilogue write that follows the MMA"
-    )
     def test_epilogue_subtiling_residual_gelu(self):
         m, k, n = 8192, 8192, 8192
         x = torch.randn([m, k], device=DEVICE, dtype=HALF_DTYPE)
