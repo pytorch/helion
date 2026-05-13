@@ -36,6 +36,8 @@ if TYPE_CHECKING:
 REPO_ROOT = Path(__file__).resolve().parents[1]
 LOGS_BASE = REPO_ROOT / ".logs" / "autoreview"
 META_MARKER = Path("/usr/local/bin/claude_code/api-key-helper")
+CLAUDE_EFFORT = "max"
+CODEX_REASONING_EFFORT = "xhigh"
 
 
 def _meta_default() -> bool:
@@ -315,6 +317,8 @@ class ClaudeSession:
             cmd.append("--dangerously-enable-internet-mode")
         cmd += [
             "--dangerously-skip-permissions",
+            "--effort",
+            CLAUDE_EFFORT,
             "-p",
             prompt,
             "--output-format",
@@ -364,7 +368,13 @@ def run_codex_review(prompt: str, log_path: Path, meta: bool) -> str:
     cmd = ["codex"]
     if meta:
         cmd.append("--dangerously-enable-internet-mode")
-    cmd += ["exec", "-s", "read-only"]
+    cmd += [
+        "-c",
+        f'model_reasoning_effort="{CODEX_REASONING_EFFORT}"',
+        "exec",
+        "-s",
+        "read-only",
+    ]
     with tempfile.NamedTemporaryFile(suffix=".txt", delete=False) as tf:
         out_path = Path(tf.name)
     try:
@@ -542,8 +552,10 @@ def main() -> int:
         spinner.stop()
         if claude.session_id:
             meta_flag = "--dangerously-enable-internet-mode " if args.meta else ""
+            effort_flag = f"--effort {CLAUDE_EFFORT} "
             sys.stderr.write(
-                f"\nresume session: claude {meta_flag}--resume {claude.session_id}\n"
+                f"\nresume session: claude "
+                f"{meta_flag}{effort_flag}--resume {claude.session_id}\n"
             )
 
     return 0

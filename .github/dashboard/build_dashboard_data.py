@@ -82,12 +82,19 @@ def fetch_runs(repo, workflow_name, days):
                 past_cutoff = True
                 break
             if r.get("conclusion") in ("success", "failure", "cancelled"):
+                # Nightly runs are dispatched by benchmark_nightly.yml's cron via
+                # GITHUB_TOKEN, so actor is "github-actions[bot]". Manual user
+                # dispatches have the user's login. Use actor (not triggering_actor):
+                # triggering_actor occasionally returns "pytorch-bot[bot]" on cron
+                # runs, presumably a re-run side effect, which mis-tags them.
+                actor_login = (r.get("actor") or {}).get("login", "")
                 runs.append({
                     "run_id": str(r["id"]),
                     "sha": r["head_sha"][:8],
                     "full_sha": r["head_sha"],
                     "date": r["created_at"],
                     "branch": r.get("head_branch", "main"),
+                    "is_nightly": actor_login == "github-actions[bot]",
                 })
         if past_cutoff:
             break
@@ -171,16 +178,23 @@ def parse_run(run_dir, active_platforms=None):
 
 def build_history_entry(run, metrics, shapes):
     helion_lat = [v for v in metrics.get("helion_latency_ms", []) if v]
+    # `compile_time_geomean_s = None` (rather than 0.0) when no compile-time
+    # data was emitted, so index.html's `formatCompileTime(null)` renders as
+    # "--" instead of "0.0s". 0.0 is reserved for runs that genuinely had
+    # data but it averaged to zero.
+    compile_times = metrics.get("helion_compile_time_s", [])
+    compile_geomean = round(geo_mean(compile_times), 2) if compile_times else None
     return {
         "run_id": run["run_id"],
         "sha": run["sha"],
         "full_sha": run["full_sha"],
         "date": run["date"],
         "branch": run.get("branch", "main"),
+        "is_nightly": bool(run.get("is_nightly")),
         "helion_speedup_geomean": round(geo_mean(metrics.get("helion_speedup", [])), 4),
         "triton_speedup_geomean": round(geo_mean(metrics.get("triton_speedup", [])), 4),
         "torch_compile_speedup_geomean": round(geo_mean(metrics.get("torch_compile_speedup", [])), 4),
-        "compile_time_geomean_s": round(geo_mean(metrics.get("helion_compile_time_s", [])), 2),
+        "compile_time_geomean_s": compile_geomean,
         "helion_latency_avg_ms": round(avg(helion_lat), 4) if helion_lat else 0,
         "per_shape": {
             "shapes": shapes,
@@ -213,6 +227,11 @@ def build_dashboard_data(cache_dir, runs_meta, existing_data=None, active_platfo
             continue
         key = e["kernel"] + "|" + e.get("platform_short", "")
         existing_summary[key] = e
+        # Back-fill is_nightly on legacy cached history (pre-nightly-tagging):
+        # treat any main-branch run as nightly so historical Overview data
+        # survives the schema bump.
+        for h in e.get("history", []):
+            h.setdefault("is_nightly", h.get("branch") == "main")
         existing_history.setdefault(key, {}).update({h["run_id"]: h for h in e.get("history", [])})
 
     # Parse each run's artifacts if present
@@ -264,22 +283,28 @@ def build_dashboard_data(cache_dir, runs_meta, existing_data=None, active_platfo
     for entry in kernel_index.values():
         entry["history"].sort(key=lambda h: h["date"])
 
-    # Global latest main run_id — used to detect kernels missing from the latest
-    # benchmark (likely CI infra issue vs. actual kernel crash).
-    latest_main_meta = next((r for r in reversed(runs_meta_sorted) if r.get("branch") == "main"), None)
-    latest_main_run_id = latest_main_meta["run_id"] if latest_main_meta else None
+    # Overview only reflects the main-branch nightly cron. Side-branch nightly
+    # workflows (e.g., Benchmark TPU Nightly on yifeixu/tpu-nightly-benchmark)
+    # also pass is_nightly but shouldn't drive the Overview's "Latest Commit"
+    # card or the per-kernel infra-missing classification.
+    is_overview_run = lambda r: r.get("is_nightly") and r.get("branch") == "main"
 
-    # Build summary (Overview/Speedup tabs) based on main branch only.
-    # Entries with no main branch data are excluded from summary but their
-    # history is still preserved for the Compare tab.
+    # Global latest nightly main run_id — used to detect kernels missing from
+    # the latest benchmark (likely CI infra issue vs. actual kernel crash).
+    latest_nightly_meta = next((r for r in reversed(runs_meta_sorted) if is_overview_run(r)), None)
+    latest_nightly_run_id = latest_nightly_meta["run_id"] if latest_nightly_meta else None
+
+    # Build summary (Overview/Speedup tabs) from main-branch nightly runs only.
+    # Manual user dispatches and side-branch nightly workflows still appear in
+    # entry["history"] for the Compare tab but never overwrite Overview perf.
     summary = []
     for key, entry in sorted(kernel_index.items()):
-        # Single pass: latest_main is the most recent main entry (used for failure
-        # classification); latest_data/prev_data are the most recent with non-zero
-        # data (used for perf display and deltas).
+        # Single pass: latest_main is the most recent nightly main entry (used
+        # for failure classification); latest_data/prev_data are the most recent
+        # with non-zero data (used for perf display and deltas).
         latest_main = latest_data = prev_data = None
         for h in reversed(entry["history"]):
-            if h.get("branch") != "main":
+            if not is_overview_run(h):
                 continue
             if latest_main is None:
                 latest_main = h
@@ -294,7 +319,7 @@ def build_dashboard_data(cache_dir, runs_meta, existing_data=None, active_platfo
         # All deltas use natural sign: positive = metric value increased.
         # Higher speedup = better; higher latency / compile time = worse.
         speedup_delta = fmt_delta(latest_data["helion_speedup_geomean"], prev_data["helion_speedup_geomean"]) if latest_data and prev_data else None
-        compile_delta = fmt_delta(latest_data["compile_time_geomean_s"], prev_data["compile_time_geomean_s"]) if latest_data and prev_data and latest_data["compile_time_geomean_s"] > 0 else None
+        compile_delta = fmt_delta(latest_data["compile_time_geomean_s"], prev_data["compile_time_geomean_s"]) if latest_data and prev_data and latest_data["compile_time_geomean_s"] and latest_data["compile_time_geomean_s"] > 0 else None
         latency_delta = fmt_delta(latest_data["helion_latency_avg_ms"], prev_data["helion_latency_avg_ms"]) if latest_data and prev_data and latest_data["helion_latency_avg_ms"] > 0 else None
 
         # Negate latency so >0 means improvement, matching speedup's direction.
@@ -303,8 +328,11 @@ def build_dashboard_data(cache_dir, runs_meta, existing_data=None, active_platfo
 
         acc_failures = []
         run_failures = []
-        # Kernel absent from the global latest main run → likely CI infra issue.
-        infra_missing = bool(latest_main_run_id) and (not latest_main or latest_main["run_id"] != latest_main_run_id)
+        # Kernel had nightly history but is absent from the global latest
+        # nightly run → likely CI infra issue. Kernels that have never had a
+        # nightly entry (e.g., only seen via manual workflow_dispatch or
+        # ad-hoc full-coverage runs) are not flagged.
+        infra_missing = bool(latest_nightly_run_id) and latest_main is not None and latest_main["run_id"] != latest_nightly_run_id
         if not infra_missing and latest_main:
             latest_ps = latest_main.get("per_shape") or {}
             shapes = latest_ps.get("shapes", [])
@@ -323,13 +351,13 @@ def build_dashboard_data(cache_dir, runs_meta, existing_data=None, active_platfo
             if h["run_id"] != keep_run_id:
                 h.pop("per_shape", None)
 
-        # has_main_data flags entries for Overview/Speedup filtering in the UI.
-        # Non-main-only entries still appear in summary so Compare tab can use them.
+        # has_nightly_data flags entries for Overview/Speedup filtering.
+        # Manual-only kernels still appear in summary so Compare tab can use them.
         summary.append({
             "kernel": entry["kernel"],
             "platform": entry["platform"],
             "platform_short": entry["platform_short"],
-            "has_main_data": latest_data is not None,
+            "has_nightly_data": latest_data is not None,
             "status": status,
             "accuracy_failures": acc_failures,
             "run_failures": run_failures,
@@ -346,16 +374,16 @@ def build_dashboard_data(cache_dir, runs_meta, existing_data=None, active_platfo
             "history": entry["history"],
         })
 
-    # Stats and platform/kernel lists reflect only entries with main branch data
-    main_summary = [s for s in summary if s["has_main_data"]]
-    platforms = sorted({s["platform"] for s in main_summary})
-    platform_shorts = sorted({s["platform_short"] for s in main_summary})
-    unique_kernels = sorted({s["kernel"] for s in main_summary})
-    improved = sum(1 for s in main_summary if s["status"] == "improved")
-    regressed = sum(1 for s in main_summary if s["status"] == "regressed")
+    # Stats and platform/kernel lists reflect only entries with nightly data
+    nightly_summary = [s for s in summary if s["has_nightly_data"]]
+    platforms = sorted({s["platform"] for s in nightly_summary})
+    platform_shorts = sorted({s["platform_short"] for s in nightly_summary})
+    unique_kernels = sorted({s["kernel"] for s in nightly_summary})
+    improved = sum(1 for s in nightly_summary if s["status"] == "improved")
+    regressed = sum(1 for s in nightly_summary if s["status"] == "regressed")
 
-    main_runs = [r for r in runs_meta_sorted if r.get("branch") == "main"]
-    latest_main_run = main_runs[-1] if main_runs else {}
+    overview_runs = [r for r in runs_meta_sorted if is_overview_run(r)]
+    latest_nightly_run = overview_runs[-1] if overview_runs else {}
 
     # Drop runs whose artifacts expired and weren't previously cached; otherwise
     # they pad charts with no-data gaps.
@@ -363,25 +391,25 @@ def build_dashboard_data(cache_dir, runs_meta, existing_data=None, active_platfo
 
     return {
         "generated_at": runs[-1]["date"] if runs else "",
-        "latest_run": latest_main_run,
+        "latest_run": latest_nightly_run,
         "runs": [{k: v for k, v in r.items() if k != "kernels"} for r in output_runs],
         "platforms": platforms,
         "platform_shorts": platform_shorts,
         "unique_kernels": unique_kernels,
         "stats": {
             "total_kernels": len(unique_kernels),
-            "total_combos": len(main_summary),
+            "total_combos": len(nightly_summary),
             "num_platforms": len(platforms),
             "improved_count": improved,
             "regressed_count": regressed,
-            "unchanged_count": len(main_summary) - improved - regressed,
-            "accuracy_failures": sum(len(s["accuracy_failures"]) for s in main_summary),
-            "run_failures": sum(len(s["run_failures"]) for s in main_summary),
-            "infra_missing": sum(1 for s in main_summary if s["infra_missing"]),
-            "helion_geomean": round(geo_mean([s["helion_speedup_geomean"] for s in main_summary]), 4),
-            "triton_geomean": round(geo_mean([s["triton_speedup_geomean"] for s in main_summary]), 4),
-            "torch_compile_geomean": round(geo_mean([s["torch_compile_speedup_geomean"] for s in main_summary]), 4),
-            "helion_wins": sum(1 for s in main_summary if s["helion_speedup_geomean"] > max(s["triton_speedup_geomean"], s["torch_compile_speedup_geomean"])),
+            "unchanged_count": len(nightly_summary) - improved - regressed,
+            "accuracy_failures": sum(len(s["accuracy_failures"]) for s in nightly_summary),
+            "run_failures": sum(len(s["run_failures"]) for s in nightly_summary),
+            "infra_missing": sum(1 for s in nightly_summary if s["infra_missing"]),
+            "helion_geomean": round(geo_mean([s["helion_speedup_geomean"] for s in nightly_summary]), 4),
+            "triton_geomean": round(geo_mean([s["triton_speedup_geomean"] for s in nightly_summary]), 4),
+            "torch_compile_geomean": round(geo_mean([s["torch_compile_speedup_geomean"] for s in nightly_summary]), 4),
+            "helion_wins": sum(1 for s in nightly_summary if s["helion_speedup_geomean"] > max(s["triton_speedup_geomean"], s["torch_compile_speedup_geomean"])),
         },
         "summary": summary,
     }

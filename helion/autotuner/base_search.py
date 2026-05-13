@@ -56,6 +56,12 @@ if TYPE_CHECKING:
     from helion.autotuner.effort_profile import AutotuneEffortProfile
 
 
+# Use the standard do_bench effort for confirmation instead of the adaptive
+# rebenchmark repeat, which can amplify a single optimistic subprocess timing.
+_SUSPICIOUS_REBENCHMARK_WARMUP = 25
+_SUSPICIOUS_REBENCHMARK_REP = 100
+
+
 class _HasDeviceAndProcessGroupName(Protocol):
     device: torch.device
     process_group_name: str | None
@@ -123,6 +129,10 @@ class _AutotunableKernel(Protocol):
         unchanged, or a non-empty string to differentiate cache entries
         for the same kernel source and args.
         """
+        ...
+
+    def supports_subprocess_benchmark(self) -> bool:
+        """Whether autotuning may benchmark compiled configs in a subprocess."""
         ...
 
     def is_cacheable(self) -> bool:
@@ -257,6 +267,7 @@ class BaseSearch(BaseAutotuner):
             log=self.log,
             autotune_metrics=self._autotune_metrics,
         )
+        self.benchmark_provider.set_budget_exceeded_fn(self._autotune_budget_exceeded)
 
     def _autotune_budget_exceeded(self) -> bool:
         budget = self.settings.autotune_budget_seconds
@@ -795,9 +806,11 @@ class PopulationBasedSearch(BaseSearch):
                 seen.add(transferred_config)
                 result.append(flat)
 
-        # Compiler-owned seeds come from ConfigSpec.autotune_seed_configs();
+        # Compiler-owned seeds come from ConfigSpec.compiler_seed_configs;
         # they encode backend/compiler heuristics and complement user seed configs.
-        for flat, transferred_config in self.config_gen.seed_flat_config_pairs():
+        for flat, transferred_config in self.config_gen.seed_flat_config_pairs(
+            self.log
+        ):
             if transferred_config not in seen:
                 seen.add(transferred_config)
                 result.append(flat)
@@ -951,6 +964,11 @@ class PopulationBasedSearch(BaseSearch):
             new_timings = bench_fn(iterator, repeat=repeat, desc=desc)
         else:
             new_timings = bench_fn(iterator, repeat=repeat)
+        new_timings = self._confirm_suspicious_rebenchmark_timings(
+            members,
+            new_timings,
+            desc=desc,
+        )
         new_timings = sync_object(
             new_timings, process_group_name=self.kernel.env.process_group_name
         )
@@ -958,6 +976,42 @@ class PopulationBasedSearch(BaseSearch):
             m.perfs.append(t)
             if t < self.best_perf_so_far:
                 self.best_perf_so_far = t
+
+    def _confirm_suspicious_rebenchmark_timings(
+        self,
+        members: list[PopulationMember],
+        timings: list[float],
+        *,
+        desc: str,
+    ) -> list[float]:
+        ratio = self.settings.get_suspicious_rebenchmark_ratio()
+        if ratio is None or ratio <= 0:
+            return timings
+
+        suspicious = [
+            i
+            for i, (member, timing) in enumerate(zip(members, timings, strict=True))
+            if math.isfinite(timing)
+            and math.isfinite(member.perf)
+            and timing < ratio * member.perf
+        ]
+        if not suspicious:
+            return timings
+
+        confirmed = self.benchmark_provider.benchmark_isolated(
+            [members[i].fn for i in suspicious],
+            warmup=_SUSPICIOUS_REBENCHMARK_WARMUP,
+            rep=_SUSPICIOUS_REBENCHMARK_REP,
+            desc=f"{desc}: confirming suspicious timings",
+        )
+        if confirmed is None:
+            return timings
+
+        updated = list(timings)
+        for i, timing in zip(suspicious, confirmed, strict=True):
+            if timing is not None:
+                updated[i] = timing
+        return updated
 
     def rebenchmark_population(
         self,

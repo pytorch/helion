@@ -31,6 +31,7 @@ from .._compiler.matmul_utils import _emit_pallas_matmul
 from .._compiler.matmul_utils import _emit_tl_dot_scaled
 from .._compiler.matmul_utils import _needs_f32_accumulator
 from .._compiler.matmul_utils import emit_tl_dot_with_padding
+from ..autotuner.config_spec import MatmulFact
 from . import _decorators
 
 if TYPE_CHECKING:
@@ -57,6 +58,26 @@ def _cute_dot_outer_accumulates_result(fx_node: object, *, is_acc_none: bool) ->
     if not isinstance(fx_node, torch.fx.Node):
         fx_node = None
     return cute_outer_accumulates_result(fx_node, is_acc_none=is_acc_none)
+
+
+def _cuda_num_sms_or_zero(device: torch.device) -> int:
+    """Return the device SM count, or 0 on devices ``get_num_sm`` does not support.
+
+    Used by the cluster_m=2 small-shape wave-quantization gate in
+    ``enforce_dot_requirements`` (cute_plan.md §7.6.3.2). The 0 fallback
+    keeps cluster_m=2 search live for configuration round-trip tests
+    that bind on CPU or other unsupported device types.
+    """
+    if device.type != "cuda":
+        return 0
+    # Local import: ``helion.runtime`` is in the import chain that loads
+    # this module, so a top-level import would be circular.
+    from ..runtime import get_num_sm
+
+    try:
+        return get_num_sm(device)
+    except (AssertionError, NotImplementedError):
+        return 0
 
 
 @_decorators.api(is_device_only=True)
@@ -268,6 +289,20 @@ def enforce_dot_requirements(lhs: torch.Tensor, rhs: torch.Tensor) -> None:
     static_m = static_problem_extent(m)
     static_n = static_problem_extent(n)
     static_k = static_problem_extent(k)
+    env.config_spec.matmul_facts.append(
+        MatmulFact(
+            lhs_ndim=lhs.ndim,
+            rhs_ndim=rhs.ndim,
+            m_block_id=env.get_block_id(m),
+            n_block_id=env.get_block_id(n),
+            k_block_id=env.get_block_id(k),
+            static_m=static_m,
+            static_n=static_n,
+            static_k=static_k,
+            lhs_dtype=lhs.dtype,
+            rhs_dtype=rhs.dtype,
+        )
+    )
     if (
         env.backend_name == "cute"
         and lhs.ndim == 2
@@ -326,6 +361,21 @@ def enforce_dot_requirements(lhs: torch.Tensor, rhs: torch.Tensor) -> None:
                 and max_search_n >= TCGEN05_TWO_CTA_BLOCK_N
                 and static_k <= max_cluster_m2_search_k
             )
+            # Small-shape wave-quantization gate. Suppress cluster_m=2
+            # search when the cluster_m=2 work-cluster count cannot fill
+            # one wave of cluster slots (``num_sms // 2``); the persistent
+            # warp-spec prologue dominates and cluster_m=1 wins. ``num_sms
+            # == 0`` (non-CUDA / mocked) keeps search live. See
+            # cute_plan.md §7.6.3.2 for the NCU rationale and B200 numbers.
+            if allow_cluster_m2_search:
+                num_sms_for_cm2_threshold = _cuda_num_sms_or_zero(lhs.device)
+                if num_sms_for_cm2_threshold > 0:
+                    cm2_work_clusters = (static_m // TCGEN05_TWO_CTA_BLOCK_M) * (
+                        static_n // TCGEN05_TWO_CTA_BLOCK_N
+                    )
+                    cm2_one_wave_slots = num_sms_for_cm2_threshold // 2
+                    if cm2_work_clusters < cm2_one_wave_slots:
+                        allow_cluster_m2_search = False
             # Narrow the autotune search to tcgen05 configs that have been
             # validated to compile and run correctly on B200. Static full-tile
             # single-root role-local persistent kernels have coverage, so the
@@ -343,10 +393,25 @@ def enforce_dot_requirements(lhs: torch.Tensor, rhs: torch.Tensor) -> None:
             # explicit user config that bypasses autotune raises
             # ``InvalidConfig`` rather than silently miscomputing — there is
             # no loud crash for this failure mode.
+            # Admit ``tcgen05_ab_stages=3`` into search whenever the
+            # active dtype is BF16/FP16 — the matmul path's outer guard
+            # already proved that. The per-CTA SMEM-budget gate inside
+            # ``allow_tcgen05_ab_stages_three_search`` queries
+            # ``lhs.device`` (not the host's current CUDA device) so a
+            # multi-GPU / heterogeneous setup cannot accidentally enable
+            # an over-budget config or suppress the canonical seed. If
+            # the target device's SMEM optin cap is below the B200
+            # envelope the gate keeps search at ``max=2``, and the
+            # per-config search-time fixup demotes over-budget ``ab=3``
+            # samples back to ``ab=2``. cute_plan.md §7.0 documents the
+            # canonical 4096^3 acceptance criterion.
+            ab_dtype_bytes = lhs.dtype.itemsize
             spec.narrow_tcgen05_autotune_to_validated_configs(
                 allow_persistent_pid_types=allow_persistent_pid_types,
                 allow_cluster_m2_search=allow_cluster_m2_search,
                 cluster_m2_static_k=static_k if allow_cluster_m2_search else None,
+                ab_stages_three_dtype_bytes=ab_dtype_bytes,
+                ab_stages_three_device=lhs.device,
             )
             for axis_name, shape, max_size in (
                 ("m", m, max_search_m),

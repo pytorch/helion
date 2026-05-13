@@ -97,6 +97,8 @@ def _lerp_scalar_decomp(
 
 
 def _get_custom_decomp_table() -> dict[torch._ops.OpOverload, Callable[..., object]]:
+    from ..language._gelu_tanh_approx import install_gelu_decomp
+
     decomp_table = select_decomp_table().copy()
     # Normally, aten.stack is decomposed to aten.unsqueeze + aten.cat, but it's difficult to
     # figure out the right Triton implementation for aten.cat. As a workaround, we disable
@@ -104,6 +106,10 @@ def _get_custom_decomp_table() -> dict[torch._ops.OpOverload, Callable[..., obje
     decomp_table.pop(torch.ops.aten.stack.default, None)
     # Override lerp.Scalar to avoid data-dependent guard on the weight parameter.
     decomp_table[torch.ops.aten.lerp.Scalar] = _lerp_scalar_decomp
+    # Map F.gelu(x, approximate="tanh") to a single _gelu_tanh_approx FX
+    # node so the cute epilogue chain analyzer can fuse it; the inductor
+    # default decomp expands the polynomial form and breaks the chain.
+    install_gelu_decomp(decomp_table)
     return decomp_table
 
 
@@ -1874,7 +1880,6 @@ def _register_load_store_tunables(
             EnumFragment(choices=get_valid_eviction_policies(env.backend_name)),
             length=loads_without_eviction_policy,
         )
-        env.device_load_count = loads_without_eviction_policy
 
     # Indexing applies to ALL loads and stores
     total_count = total_load_count + store_count
@@ -1898,6 +1903,48 @@ def _register_atomic_tunables(atomic_count: int) -> None:
         EnumFragment(choices=env.config_spec.valid_atomic_indexing_types()),
         length=atomic_count,
     )
+
+
+def _register_tensor_descriptor_layout_guards(device_ir: DeviceIR) -> None:
+    env = CompileEnvironment.current()
+    if env.settings.static_shapes:
+        return
+
+    from .._compat import supports_tensor_descriptor
+    from ..language import atomic_ops
+    from ..language import memory_ops
+
+    if not supports_tensor_descriptor():
+        return
+
+    atomic_targets = tuple(getattr(atomic_ops, name) for name in atomic_ops.__all__)
+
+    def tensor_arg_value(arg: object) -> object:
+        if isinstance(arg, torch.fx.Node):
+            return arg.meta.get("val")
+        return arg
+
+    memory_op_index = 0
+    atomic_op_index = 0
+    for graph_info in device_ir.graphs:
+        for node in graph_info.graph.nodes:
+            if node.op != "call_function":
+                continue
+            if node.target in (memory_ops.load, memory_ops.store):
+                tensor = tensor_arg_value(node.args[0])
+                if isinstance(tensor, torch.Tensor) and 2 <= tensor.ndim <= 5:
+                    env.register_tensor_descriptor_layout_guard(
+                        tensor, memory_op_index=memory_op_index
+                    )
+                memory_op_index += 1
+                continue
+            if node.target in atomic_targets:
+                tensor = tensor_arg_value(node.args[0])
+                if isinstance(tensor, torch.Tensor) and 2 <= tensor.ndim <= 5:
+                    env.register_tensor_descriptor_layout_guard(
+                        tensor, atomic_op_index=atomic_op_index
+                    )
+                atomic_op_index += 1
 
 
 def lower_to_device_ir(func: HostFunction) -> DeviceIR:
@@ -1940,6 +1987,8 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
             remove_unnecessary_tile_index(graph.graph)
             remove_unnecessary_masking(graph.graph)
 
+        # TODO(hinriksnaer): extract into a separate step? everything below
+        # is post-processing computed from the completed DeviceIR.
         from .epilogue_subtiling import has_epilogue_subtiling_candidate
 
         has_epilogue_subtile_candidate = False
@@ -1992,6 +2041,7 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
             store_indices,
         )
         _register_atomic_tunables(_count_device_atomics(device_ir))
+        _register_tensor_descriptor_layout_guards(device_ir)
 
         return device_ir
 

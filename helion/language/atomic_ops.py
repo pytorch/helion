@@ -345,12 +345,29 @@ def _cute_unindexed_axis_leader_predicate(
 ) -> str | None:
     """Return predicate restricting atomics to one thread per unindexed parallel axis.
 
-    When an atomic op is invoked inside ``hl.tile([m, n])`` but the index only
-    covers a subset of the tile dimensions (e.g. ``hl.atomic_add(dy, [tile_i],
-    reduced)`` after a reduction across ``tile_j``), every thread on the
-    unindexed axis would otherwise re-issue the atomic with the same value.
-    Restrict those axes to ``thread_idx[axis] == 0`` so the op fires once per
-    unique (indexed) coordinate.
+    Two complementary mechanisms:
+
+    1. **Active-axis leaders (block-size-index form):** When an atomic op
+       is invoked inside ``hl.tile([m, n])`` but the index only covers a
+       subset of the tile dimensions (e.g. ``hl.atomic_add(dy, [tile_i],
+       reduced)`` after a reduction across ``tile_j``), every thread on
+       the unindexed axis would otherwise re-issue the atomic with the
+       same value. This mechanism uses ``BlockSizeOrigin`` symbols in the
+       index to decide which currently-active thread axes are indexed,
+       and restricts the rest to ``thread_idx[axis] == 0``.
+
+    2. **Ghost-axis leaders (any index form):** A CTA-resident thread
+       axis whose owning device loop has exited cannot be referenced by
+       any current expression — including gather (``idxs[tile]``) or
+       offset-constant (``[tile.begin]``) index forms whose index does
+       not flow through a ``BlockSizeOrigin``. Threads on a ghost axis
+       still exist (the CUDA ``blockDim`` is fixed for the kernel) and
+       would re-issue the atomic with whatever value the surviving
+       expression resolved to, multiplying the result by the ghost
+       axis's size. Predicate the ghost axis to leader unconditionally.
+       The canonical case is ``examples.matmul_split_k`` under
+       autotune-picked configs that pack the inner-K loop onto a CTA
+       thread axis.
     """
     from .._compiler.compile_environment import CompileEnvironment
     from .._compiler.variable_origin import BlockSizeOrigin
@@ -377,15 +394,20 @@ def _cute_unindexed_axis_leader_predicate(
             )
         )
 
-    if not has_block_size_index:
-        return None
-    assert state.fx_node is not None
-    fx_graph = state.fx_node.graph
+    fx_graph = state.fx_node.graph if state.fx_node is not None else None
 
     leader_axes: set[int] = set()
+    active_thread_axes: set[int] = set()
 
     def collect(thread_axes: dict[int, int]) -> None:
         for candidate_block_id, thread_axis in thread_axes.items():
+            active_thread_axes.add(thread_axis)
+            if not has_block_size_index or fx_graph is None:
+                # Without a block-size index there is no reliable mapping
+                # from "block_id indexed by this atomic" to a thread axis,
+                # so skip the active-axis mechanism. Ghost-axis predicates
+                # below still fire.
+                continue
             resolved = env.resolve_codegen_block_id(
                 candidate_block_id, state.codegen, fx_graph
             )
@@ -399,6 +421,15 @@ def _cute_unindexed_axis_leader_predicate(
     for loops in state.codegen.active_device_loops.values():
         for loop_state in loops:
             collect(loop_state.block_thread_axes)
+
+    # Ghost-axis leaders: any CTA-resident thread axis (size > 1) that
+    # no active loop currently owns. ``max_thread_block_dims`` tracks the
+    # per-axis CTA size accumulated as device loops are entered and is
+    # never decremented on exit, so it correctly captures axes whose
+    # owning loop has finished but whose threads remain live.
+    for axis, size in enumerate(state.codegen.max_thread_block_dims):
+        if size > 1 and axis not in active_thread_axes:
+            leader_axes.add(axis)
 
     if not leader_axes:
         return None
@@ -1660,3 +1691,17 @@ def _(state: CodegenState) -> ast.AST:
         )
     )
     return expr_from_string(prev_var)
+
+
+ATOMIC_OPS: frozenset[Callable[..., object]] = frozenset(
+    {
+        atomic_add,
+        atomic_and,
+        atomic_cas,
+        atomic_max,
+        atomic_min,
+        atomic_or,
+        atomic_xchg,
+        atomic_xor,
+    }
+)

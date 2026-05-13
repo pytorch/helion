@@ -11,9 +11,10 @@ from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
 import helion.language as hl
+from helion.runtime.settings import _get_backend
 
 
-@onlyBackends(["triton"])
+@onlyBackends(["triton", "cute"])
 class TestJaggedTile(RefEagerTestDisabled, TestCase):
     def test_jagged_tile_jagged_sum(self):
         @helion.kernel(autotune_effort="none")
@@ -85,7 +86,11 @@ class TestJaggedTile(RefEagerTestDisabled, TestCase):
             return out
 
         code, result = code_and_output(jagged_row_sum, (x, offsets))
-        self.assertIn("tl.where", code)
+        if _get_backend() == "cute":
+            self.assertIn("mask_1 = indices_1 < v_2", code)
+            self.assertIn("if mask_1 else cutlass.Float32(0)", code)
+        else:
+            self.assertIn("tl.where", code)
         torch.testing.assert_close(result, ref(x, offsets))
 
     def test_jagged_tile_blocksize_1(self):
@@ -122,8 +127,12 @@ class TestJaggedTile(RefEagerTestDisabled, TestCase):
             return out
 
         code, result = code_and_output(jagged_row_sum, (x, offsets))
-        self.assertIn("mask_1 = indices_1[None, :] < v_2[:, None]", code)
-        self.assertIn("mask_0[:, None] & mask_1", code)
+        if _get_backend() == "cute":
+            self.assertIn("mask_1 = indices_1 < v_2", code)
+            self.assertIn("if mask_1 else cutlass.Float32(0)", code)
+        else:
+            self.assertIn("mask_1 = indices_1[None, :] < v_2[:, None]", code)
+            self.assertIn("mask_0[:, None] & mask_1", code)
         torch.testing.assert_close(result, ref(x, offsets))
 
     def test_nested_jagged_tile(self):
@@ -179,12 +188,22 @@ class TestJaggedTile(RefEagerTestDisabled, TestCase):
             return out
 
         code, result = code_and_output(dense_jagged_mean, (x, lengths, feature_counts))
-        self.assertIn("mask_1 = indices_1[None, :] < row_feature_counts[:, None]", code)
-        self.assertIn("mask_2 = indices_2[None, :] < row_lengths_copy_0[:, None]", code)
-        self.assertIn(
-            "mask_0[:, None, None] & mask_2[:, :, None] & mask_1[:, None, :]", code
-        )
-        self.assertIn("mask_0[:, None] & mask_1", code)
+        if _get_backend() == "cute":
+            self.assertIn("mask_1 = indices_1 < row_feature_counts", code)
+            self.assertIn("mask_2 = indices_2 < row_lengths_copy_0", code)
+            self.assertIn("if mask_0 and mask_2 and mask_1 else", code)
+        else:
+            self.assertIn(
+                "mask_1 = indices_1[None, :] < row_feature_counts[:, None]", code
+            )
+            self.assertIn(
+                "mask_2 = indices_2[None, :] < row_lengths_copy_0[:, None]", code
+            )
+            self.assertIn(
+                "mask_0[:, None, None] & mask_2[:, :, None] & mask_1[:, None, :]",
+                code,
+            )
+            self.assertIn("mask_0[:, None] & mask_1", code)
 
         torch.testing.assert_close(result, ref(x, lengths, feature_counts))
 
@@ -313,9 +332,13 @@ class TestJaggedTile(RefEagerTestDisabled, TestCase):
             return out
 
         code, result = code_and_output(jagged_tile_2d_parent, (x, lengths))
-        self.assertIn(
-            "mask_2 = indices_2[None, None, :] < row_lengths[:, :, None]", code
-        )
+        if _get_backend() == "cute":
+            self.assertIn("mask_2 = indices_2 < row_lengths", code)
+        else:
+            self.assertIn(
+                "mask_2 = indices_2[None, None, :] < row_lengths[:, :, None]",
+                code,
+            )
         torch.testing.assert_close(result, ref(x, lengths))
 
     def test_jagged_tile_tensor_index_parent_blocksize_1(self):

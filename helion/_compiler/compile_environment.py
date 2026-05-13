@@ -15,6 +15,7 @@ import warnings
 import sympy
 import torch
 from torch._dynamo.source import EphemeralSource
+from torch._dynamo.source import GetItemSource
 from torch._dynamo.source import LocalSource
 from torch._dynamo.source import TensorProperty
 from torch._dynamo.source import TensorPropertySource
@@ -44,6 +45,98 @@ from .variable_origin import Origin
 from .variable_origin import TensorSizeOrigin
 
 log = logging.getLogger(__name__)
+
+TensorDescriptorLayoutSignature = tuple[int | None, tuple[bool, ...]]
+
+
+@dataclasses.dataclass
+class TensorDescriptorLayoutGuard:
+    ndim: int
+    element_size: int
+    memory_op_indices: set[int] = dataclasses.field(default_factory=set)
+    atomic_op_indices: set[int] = dataclasses.field(default_factory=set)
+
+
+def _is_supported_tensor_descriptor_layout_guard_source(source: Source) -> bool:
+    if isinstance(source, LocalSource):
+        return True
+    if isinstance(source, GetItemSource):
+        return (
+            isinstance(source.index, int)
+            and not source.index_is_slice
+            and _is_supported_tensor_descriptor_layout_guard_source(source.base)
+        )
+    return False
+
+
+def _replay_tensor_descriptor_layout_guard_source(
+    source: Source,
+    root_values: typing.Mapping[str, object],
+) -> object:
+    if isinstance(source, LocalSource):
+        return root_values.get(source.local_name)
+    if isinstance(source, GetItemSource):
+        if not isinstance(source.index, int) or source.index_is_slice:
+            return None
+        base = _replay_tensor_descriptor_layout_guard_source(source.base, root_values)
+        if isinstance(base, (list, tuple)) and 0 <= source.index < len(base):
+            return base[source.index]
+    return None
+
+
+def _find_tensor_descriptor_layout_guard_source(
+    target: torch.Tensor,
+    value: object,
+    source: Source,
+) -> Source | None:
+    if value is target:
+        return source
+    if isinstance(value, (list, tuple)):
+        for index, item in enumerate(value):
+            result = _find_tensor_descriptor_layout_guard_source(
+                target,
+                item,
+                GetItemSource(source, index),
+            )
+            if result is not None:
+                return result
+    return None
+
+
+def tensor_descriptor_layout_signature_from_strides(
+    strides: typing.Sequence[int | torch.SymInt | sympy.Integer],
+    element_size: int,
+    size_hint: typing.Callable[[int | torch.SymInt], int] | None = None,
+) -> TensorDescriptorLayoutSignature:
+    """Return the stride layout facts tensor descriptors depend on.
+
+    The signature intentionally records predicates rather than exact strides so
+    dynamic-shape kernels can share code across sizes that have the same tensor
+    descriptor eligibility.
+    """
+    stride_one_dim: int | None = None
+    has_multiple_stride_one_dims = False
+    aligned_dims = []
+    for dim, raw_stride in enumerate(strides):
+        if isinstance(raw_stride, sympy.Integer):
+            stride = int(raw_stride)
+        elif isinstance(raw_stride, int):
+            stride = raw_stride
+        else:
+            if size_hint is None:
+                raise TypeError(
+                    "symbolic tensor descriptor strides require an explicit size_hint"
+                )
+            stride = size_hint(raw_stride)
+        if stride == 1:
+            if stride_one_dim is None:
+                stride_one_dim = dim
+            else:
+                has_multiple_stride_one_dims = True
+        aligned_dims.append((stride * element_size) % 16 == 0)
+    if has_multiple_stride_one_dims:
+        stride_one_dim = None
+    return stride_one_dim, tuple(aligned_dims)
 
 
 def _make_numel_check(
@@ -144,8 +237,10 @@ class CompileEnvironment:
             warn_once(
                 f"The '{self._backend.name}' backend is experimental and may have limited functionality.",
             )
+        # For dynamic kernels, keep 0/1 tensor dimensions symbolic so a kernel
+        # first seen with size 0 or 1 can be reused for larger sizes.
         self.shape_env = ShapeEnv(
-            specialize_zero_one=True,
+            specialize_zero_one=settings.static_shapes,
             duck_shape=False,
             assume_static_by_default=settings.static_shapes,
         )
@@ -157,21 +252,24 @@ class CompileEnvironment:
         self.config_spec = ConfigSpec(
             backend=self.backend,
         )
+        # TODO(hinriksnaer): tracing state, not env config. move to CompilerState?
         self.kernel_tensor_sizes: dict[tuple[sympy.Expr, ...], int] = (
             collections.Counter()
         )
+        # TODO(hinriksnaer): tracing state, not env config. move to CompilerState?
         self.kernel_min_element_bits: int = 32  # smallest dtype bits across all tensors
         self.specialized_vars: set[sympy.Symbol] = set()
         self.specialized_strides: set[tuple[str, int]] = set()
+        self.tensor_descriptor_layout_guards: dict[
+            Source, TensorDescriptorLayoutGuard
+        ] = {}
+        self._tensor_descriptor_layout_guard_source_cache: dict[int, Source | None] = {}
         self.jagged_tile_parent_ids: dict[int, list[int]] = {}
         self.jagged_tile_mask_shapes: dict[int, list[torch.SymInt]] = {}
         self._symint_cache: dict[object, torch.SymInt] = {}
         self._foreign_symint_cache: dict[
             tuple[int, sympy.Expr], int | torch.SymInt
         ] = {}
-        self.device_load_count = (
-            0  # Track number of loads in all device code for eviction policy tuning
-        )
         if settings.autotune_force_persistent or dist.is_initialized():
             for pid_type in (
                 "flat",
@@ -199,6 +297,7 @@ class CompileEnvironment:
                 )
             self.config_spec.max_num_sm_multiplier = newmax
 
+        # TODO(hinriksnaer): tracing flag, not env config. move to CompilerState?
         self.has_barrier: bool = False
 
     def specialize_expr(self, expr: sympy.Expr) -> sympy.Expr:
@@ -210,6 +309,92 @@ class CompileEnvironment:
             # pyrefly: ignore [bad-assignment]
             expr = expr.xreplace(subs)
         return expr
+
+    def register_tensor_descriptor_layout_guard(
+        self,
+        fake_tensor: torch.Tensor,
+        *,
+        memory_op_index: int | None = None,
+        atomic_op_index: int | None = None,
+    ) -> None:
+        """Specialize dynamic kernels on TD-relevant stride layout predicates."""
+        if self.settings.static_shapes:
+            return
+        source = self._tensor_descriptor_layout_guard_source(fake_tensor)
+        if source is None:
+            return
+        guard = self.tensor_descriptor_layout_guards.setdefault(
+            source,
+            TensorDescriptorLayoutGuard(
+                ndim=fake_tensor.ndim,
+                element_size=fake_tensor.element_size(),
+            ),
+        )
+        if memory_op_index is not None:
+            guard.memory_op_indices.add(memory_op_index)
+        if atomic_op_index is not None:
+            guard.atomic_op_indices.add(atomic_op_index)
+
+    def has_tensor_descriptor_layout_guard(self, fake_tensor: torch.Tensor) -> bool:
+        if self.settings.static_shapes:
+            return True
+        source = self._tensor_descriptor_layout_guard_source(fake_tensor)
+        return source is not None and source in self.tensor_descriptor_layout_guards
+
+    def _tensor_descriptor_layout_guard_source(
+        self, fake_tensor: torch.Tensor
+    ) -> Source | None:
+        cache_key = id(fake_tensor)
+        if cache_key in self._tensor_descriptor_layout_guard_source_cache:
+            return self._tensor_descriptor_layout_guard_source_cache[cache_key]
+
+        source = self.input_sources.get(fake_tensor)
+        from .host_function import HostFunction
+
+        root_values = HostFunction.current().params.arguments
+        if (
+            source is not None
+            and _is_supported_tensor_descriptor_layout_guard_source(source)
+            and _replay_tensor_descriptor_layout_guard_source(source, root_values)
+            is fake_tensor
+        ):
+            result = source
+        else:
+            result = None
+            for local_name, value in root_values.items():
+                candidate = _find_tensor_descriptor_layout_guard_source(
+                    fake_tensor,
+                    value,
+                    LocalSource(local_name, is_input=True),
+                )
+                if candidate is not None:
+                    result = candidate
+                    break
+
+        self._tensor_descriptor_layout_guard_source_cache[cache_key] = result
+        return result
+
+    def tensor_descriptor_layout_signature(
+        self, fake_tensor: torch.Tensor
+    ) -> TensorDescriptorLayoutSignature | None:
+        has_symbolic_stride = False
+        for stride in fake_tensor.stride():
+            if isinstance(stride, int):
+                continue
+            expr = _to_sympy(stride)
+            expr = self.specialize_expr(self.shape_env.replace(expr))
+            if expr.free_symbols:
+                has_symbolic_stride = True
+                break
+        if has_symbolic_stride and not self.has_tensor_descriptor_layout_guard(
+            fake_tensor
+        ):
+            return None
+        return tensor_descriptor_layout_signature_from_strides(
+            fake_tensor.stride(),
+            fake_tensor.element_size(),
+            self.size_hint,
+        )
 
     def add_kernel_tensor_size(
         self,
@@ -272,8 +457,13 @@ class CompileEnvironment:
 
     def _extract_tensor_numel_constraints(self) -> None:
         """Compile per-tensor numel constraints from kernel_tensor_sizes."""
-        from ..autotuner.config_generation import TRITON_MAX_TENSOR_NUMEL
         from ..autotuner.config_spec import TensorNumelConstraint
+
+        max_numel = self.backend.max_tensor_numel
+        if max_numel is None:
+            # Backend (e.g. Pallas) has no compile-time per-tile element cap;
+            # VMEM byte budget is enforced separately at runtime.
+            return None
 
         block_sym_to_id: dict[sympy.Symbol, int] = {}
         for bs in self.block_sizes:
@@ -316,7 +506,7 @@ class CompileEnvironment:
             ordered = sorted(involved_syms, key=lambda s: sym_to_cs_idx[s])
             indices = tuple(sym_to_cs_idx[s] for s in ordered)
             # pyrefly: ignore[unsupported-operation]
-            constraint_expr = numel_expr <= TRITON_MAX_TENSOR_NUMEL
+            constraint_expr = numel_expr <= max_numel
             # srepr is more canonical than str() for dedup; a false
             # negative only causes a harmless duplicate, not a missed one.
             dedup_key = sympy.srepr(constraint_expr)

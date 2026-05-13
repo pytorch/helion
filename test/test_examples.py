@@ -8,6 +8,8 @@ from packaging import version
 import pytest
 import torch
 import torch.nn.functional as F
+from torch.testing._internal.common_utils import instantiate_parametrized_tests
+from torch.testing._internal.common_utils import parametrize
 
 import helion
 from helion import _compat
@@ -120,6 +122,22 @@ class TestExamples(RefEagerTestBase, TestCase):
             "matmul",
             args,
             args[0] @ args[1],
+        )
+
+    def test_matmul_bf16_tcgen05(self):
+        """Matmul at 256^3 bf16 — fixture sized just above the cute
+        tcgen05 admission floor (M >= 64 divisible by 64) so the cute
+        autotune sub-sweep fires the ``uses_tcgen05`` codegen marker.
+        """
+        args = (
+            torch.randn([256, 256], device=DEVICE, dtype=torch.bfloat16),
+            torch.randn([256, 256], device=DEVICE, dtype=torch.bfloat16),
+        )
+        check_example(
+            "matmul",
+            args,
+            args[0] @ args[1],
+            block_sizes=[64, 64, 32],
         )
 
     @xfailIfCute("CuTe barrier-based split-K example is still unsupported")
@@ -354,7 +372,6 @@ class TestExamples(RefEagerTestBase, TestCase):
             block_sizes=[16, 16, 16, 16],
         )
 
-    @xfailIfCute("CuTE IR build error with non-divisible K block sizes")
     def test_bmm_non_divisible_k(self):
         args = (
             torch.randn([4, 128, 384], device=DEVICE, dtype=HALF_DTYPE),
@@ -447,10 +464,6 @@ class TestExamples(RefEagerTestBase, TestCase):
 
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfTileIR("TileIR does not support block_ptr indexing")
-    @xfailIfCute(
-        "CuTe tcgen05 MMA path does not yet emit indices/masks for the "
-        "user-level epilogue write that follows the MMA"
-    )
     def test_template_via_closure2(self):
         args = (
             torch.randn([512, 512], device=DEVICE, dtype=HALF_DTYPE),
@@ -698,14 +711,13 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
 
     @xfailIfCute("CuTe RMSNorm backward example still returns incorrect results")
-    def test_rms_norm_bwd(self):
+    @parametrize("dtype", (torch.float32, HALF_DTYPE))
+    def test_rms_norm_bwd(self, dtype):
         """Test backward pass for rms norm weight gradient."""
         batch_size, dim = 2048, 2048
-        x = torch.randn([batch_size, dim], device=DEVICE, dtype=torch.float32)
-        weight = torch.randn(
-            [dim], device=DEVICE, dtype=torch.float32, requires_grad=True
-        )
-        grad_out = torch.randn([batch_size, dim], device=DEVICE, dtype=torch.float32)
+        x = torch.randn([batch_size, dim], device=DEVICE, dtype=dtype)
+        weight = torch.randn([dim], device=DEVICE, dtype=dtype, requires_grad=True)
+        grad_out = torch.randn([batch_size, dim], device=DEVICE, dtype=dtype)
         eps = 1e-5
 
         # Compute forward pass to get rms
@@ -773,7 +785,6 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
 
     @skipIfTileIR("PassManager::run failed")
-    @skipIfPallas("JAX erf lowering incompatibility with gelu")
     @xfailIfCute(
         "CuTe tcgen05 MMA path does not yet emit indices/masks for the "
         "user-level epilogue write that follows the MMA"
@@ -798,7 +809,6 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
 
     @skipIfTileIR("PassManager::run failed")
-    @skipIfPallas("JAX erf lowering incompatibility with gelu")
     @xfailIfCute(
         "CuTe tcgen05 MMA path does not yet emit indices/masks for the "
         "user-level epilogue write that follows the MMA"
@@ -924,7 +934,6 @@ class TestExamples(RefEagerTestBase, TestCase):
             fn_name="jagged_dense_add_2d",
         )
 
-    @xfailIfCute("CuTe jagged dense bmm example still returns incorrect results")
     @xfailIfPallas("Pallas rejects int64 inputs (jagged offsets)")
     @skipIfXPU("Jagged tensor operations not fully supported on XPU")
     @skipIfRefEager("hl.jagged_tile does not support ref mode yet")
@@ -1021,7 +1030,6 @@ class TestExamples(RefEagerTestBase, TestCase):
                 block_sizes=[32768, 1],
             )
 
-    @xfailIfCute("CuTe jagged mean example still fails lowering/runtime")
     @xfailIfPallas("JAX tracer error with dynamic shapes")
     @skipIfRefEager("hl.jagged_tile does not support ref mode yet")
     def test_jagged_mean(self):
@@ -1323,7 +1331,6 @@ class TestExamples(RefEagerTestBase, TestCase):
             num_stages=3,
         )
 
-    @xfailIfCute("CuTe jagged softmax example still fails lowering/runtime")
     @xfailIfPallas("JAX tracer error with dynamic shapes")
     @skipIfRefEager("hl.jagged_tile does not support ref mode yet")
     def test_jagged_softmax(self):
@@ -1689,7 +1696,6 @@ class TestExamples(RefEagerTestBase, TestCase):
             atol=1.0,
         )
 
-    @xfailIfCute("CuTe jagged sum example still returns incorrect results")
     @xfailIfPallas("JAX tracer error")
     @skipIfRefEager("hl.jagged_tile does not support ref mode yet")
     def test_jagged_sum(self):
@@ -1762,7 +1768,6 @@ class TestExamples(RefEagerTestBase, TestCase):
             block_sizes=[64],
         )
 
-    @xfailIfCute("CuTe jagged layer norm example still fails lowering/runtime")
     @xfailIfPallas("JAX tracer error")
     @skipIfRefEager("hl.jagged_tile does not support ref mode yet")
     def test_jagged_layer_norm(self):
@@ -1952,6 +1957,11 @@ class TestExamples(RefEagerTestBase, TestCase):
     @skipIfA10G("failure on a10g")
     @skipIfTileIR("accuracy failure")
     @skipIfXPU("ocloc compilation failure with 256-GRF kernel on XPU backend")
+    @xfailIfPallas(
+        "Pallas codegen broadcasts the matmul result to the wrong shape "
+        "((16, 128) vs (16, 256)) -- separate shape-propagation bug in the "
+        "outer accumulator."
+    )
     def test_squeeze_and_excitation_net_bwd_db(self):
         m, n, k = 256, 256, 256
         x = torch.randn([m, n], device=DEVICE, dtype=HALF_DTYPE)
@@ -2473,6 +2483,9 @@ class TestExamples(RefEagerTestBase, TestCase):
             num_stages=3,
             rtol=1e-2,
         )
+
+
+instantiate_parametrized_tests(TestExamples)
 
 
 if __name__ == "__main__":

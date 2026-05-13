@@ -1108,6 +1108,45 @@ class TestMisc(RefEagerTestBase, TestCase):
         code, result = code_and_output(helion_merge_attention_fwd, (a, lse_a, b, lse_b))
         self.assertEqual(result.shape, a.shape)
 
+    @skipIfRefEager("Codegen inspection not applicable in ref eager mode")
+    def test_gelu_tanh_approx_bf16_triton_dtype_cast(self):
+        """``F.gelu(x, approximate="tanh")`` on a bf16 input renders the
+        fp32 round-trip *and* the trailing cast back to ``tl.bfloat16``.
+
+        Pins the triton lowering's same-dtype contract: the
+        ``aten.gelu.default`` decomp routes the tanh form to the
+        internal ``_gelu_tanh_approx`` op whose ``register_fake`` is
+        ``torch.empty_like(x)``, so the rendered expression must end
+        with a ``.to(tl.bfloat16)`` (or equivalent) when the input is
+        bf16. Without the trailing cast, the result would leak fp32
+        from ``libdevice.tanh`` and break callers that rely on the
+        FX-level dtype.
+        """
+        if _get_backend() == "cute":
+            self.skipTest(
+                "cute backend has its own splice path; this is a "
+                "triton-only dtype contract test"
+            )
+
+        @helion.kernel(autotune_effort="none")
+        def gelu_tanh_approx_kernel(x: torch.Tensor) -> torch.Tensor:
+            result = torch.empty_like(x)
+            for tile in hl.tile(x.size(0)):
+                result[tile] = torch.nn.functional.gelu(x[tile], approximate="tanh")
+            return result
+
+        x = torch.randn([32], device=DEVICE, dtype=torch.bfloat16)
+        code, result = code_and_output(gelu_tanh_approx_kernel, (x,))
+        # Result must preserve the input dtype.
+        self.assertEqual(result.dtype, torch.bfloat16)
+        expected = torch.nn.functional.gelu(x, approximate="tanh")
+        torch.testing.assert_close(result, expected, atol=2e-2, rtol=2e-2)
+        # Pin the rendered fp32 round-trip + final narrowing cast so a
+        # future refactor can't drop either half of the contract.
+        self.assertIn("libdevice.tanh", code)
+        self.assertIn("tl.float32", code)
+        self.assertIn("tl.bfloat16", code)
+
 
 instantiate_parametrized_tests(TestMisc)
 

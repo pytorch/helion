@@ -61,7 +61,7 @@ def attention(
     assert head_dim == k_in.size(-1) == v_in.size(-1)
     q_view = q_in.reshape([-1, m_dim, head_dim])
     v_view = v_in.reshape([-1, n_dim, head_dim])
-    k_view = k_in.reshape([-1, n_dim, head_dim]).transpose(1, 2)
+    k_view = k_in.reshape([-1, n_dim, head_dim])
     out = torch.empty_like(q_view)
     sm_scale = 1.0 / math.sqrt(head_dim)
     qk_scale = sm_scale * 1.44269504  # 1/log(2)
@@ -69,11 +69,14 @@ def attention(
         m_i = hl.full([tile_b, tile_m], float("-inf"), dtype=torch.float32)
         l_i = torch.full_like(m_i, 1.0)
         acc = hl.zeros([tile_b, tile_m, head_dim], dtype=torch.float32)
-        q = q_view[tile_b, tile_m, :] * qk_scale
+        q = q_view[tile_b, tile_m, :]
         for tile_n in hl.tile(v_view.size(1)):
-            k = k_view[tile_b, :, tile_n]
+            # scaling Q in-loop on-demand reduces spillage, faster than keeping pre-scaled Q
+            q_scaled = q * qk_scale
+            k = k_view[tile_b, tile_n, :]
             # Keep scores in fp32 to match SDPA tolerances on bf16/fp16 inputs.
-            qk = hl.dot(q, k, out_dtype=torch.float32)
+            # same as hl.dot(q, k, out_dtype=torch.float32)
+            qk = torch.bmm(q_scaled, k.transpose(1, 2), torch.float32)
             m_ij = torch.maximum(m_i, torch.amax(qk, -1))
             qk = qk - m_ij[:, :, None]
             p = torch.exp2(qk)

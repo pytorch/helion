@@ -33,7 +33,7 @@ import sys
 from typing import Any
 import uuid
 
-from ..autotuner.aot_cache import get_hardware_info
+from .._hardware import get_hardware_info
 from ..autotuner.heuristic_generator import PerformanceTarget
 from ..autotuner.heuristic_generator import evaluate_heuristic
 from ..autotuner.heuristic_generator import generate_heuristic

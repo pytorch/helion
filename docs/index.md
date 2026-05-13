@@ -7,8 +7,8 @@
 
 installation
 Examples <./examples/index>
-api/index
 Tutorials <helion_tutorials>
+api/index
 Deployment <deployment_autotuning>
 TileIR Backend <tileir_backend>
 events

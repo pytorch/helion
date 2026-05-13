@@ -26,6 +26,7 @@ from typing import overload
 from typing_extensions import Protocol
 
 import torch
+from torch._dynamo.source import GetItemSource
 from torch._dynamo.source import LocalSource
 from torch._dynamo.source import TensorProperty
 from torch._dynamo.source import TensorPropertySource
@@ -39,11 +40,16 @@ from torch.utils.weak import WeakIdKeyDictionary
 from .. import exc
 from .._compile_time import measure
 from .._compiler.ast_extension import unparse
+from .._compiler.autotuner_heuristics import compiler_seed_configs
 from .._compiler.backend import TritonBackend
 from .._compiler.compile_environment import CompileEnvironment
+from .._compiler.compile_environment import TensorDescriptorLayoutGuard
+from .._compiler.compile_environment import (
+    tensor_descriptor_layout_signature_from_strides,
+)
 from .._compiler.generate_ast import generate_ast
-from .._compiler.host_function import HostFunction
 from .._compiler.inductor_lowering_extra import patch_inductor_lowerings
+from .._compiler.kernel_compiler import KernelCompiler
 from .._compiler.output_header import assert_no_conflicts
 from .._compiler.variable_origin import ArgumentOrigin
 from .._dist_utils import _find_process_group_name
@@ -64,12 +70,35 @@ if TYPE_CHECKING:
 
     from torch._guards import Source
 
+    from .._compiler.host_function import HostFunction
     from ..autotuner import ConfigSpec
     from ..autotuner.base_cache import BoundKernelInMemoryCacheKey
 
     ConfigLike = Config | dict[str, object]
 
 log: logging.Logger = logging.getLogger(__name__)
+
+
+def _indexing_config_uses_tensor_descriptor(indexing: object, index: int) -> bool:
+    if indexing == "tensor_descriptor":
+        return True
+    if isinstance(indexing, list):
+        return index < len(indexing) and indexing[index] == "tensor_descriptor"
+    return False
+
+
+def _td_layout_guard_active_for_config(
+    guard: TensorDescriptorLayoutGuard, config: Config
+) -> bool:
+    return any(
+        _indexing_config_uses_tensor_descriptor(config.indexing, index)
+        for index in guard.memory_op_indices
+    ) or any(
+        _indexing_config_uses_tensor_descriptor(config.atomic_indexing, index)
+        for index in guard.atomic_op_indices
+    )
+
+
 _R = TypeVar("_R")
 CompiledConfig = Callable[..., _R]
 
@@ -451,9 +480,8 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                 measure("BoundKernel.create_host_function"),
             ):
                 try:
-                    # pyrefly: ignore [bad-assignment]
-                    self.host_function: HostFunction = HostFunction(
-                        # pyrefly: ignore [bad-argument-type]
+                    compiler = KernelCompiler(self.env)
+                    self.host_function: HostFunction = compiler.compile(
                         self.kernel.fn,
                         self.fake_args,
                         constexpr_args,
@@ -464,6 +492,34 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                     raise
 
                 self.env.config_spec.configure_epilogue_subtile_autotune(args)
+                self.env.config_spec.compiler_seed_configs = compiler_seed_configs(
+                    self.env, self.host_function.device_ir
+                )
+
+                # Post-compile FX-graph scan to detect kernels
+                # whose tcgen05 matmul is followed by an
+                # aux-fused store
+                # (``out[tile] = (acc + residual[tile]).to(...)``
+                # and variants — see
+                # ``host_function_has_tcgen05_aux_kernel_pattern``
+                # for the accepted shapes). When detected, the
+                # autotune surface widens to admit
+                # ``tcgen05_strategy=ROLE_LOCAL_WITH_SCHEDULER``
+                # + ``tcgen05_warp_spec_c_input_warps=1`` so the
+                # productive C-input warp lift is reachable from
+                # the normal autotune path. For pure-matmul
+                # kernels the detector returns False and the
+                # autotune surface keeps the narrow
+                # ``MONOLITHIC + c_input_warps=0`` shape so
+                # autotune cannot sample the strictly-worse
+                # inert C-input warp configuration.
+                from .._compiler.cute.aux_tensor import (
+                    host_function_has_tcgen05_aux_kernel_pattern,
+                )
+
+                self.env.config_spec.cute_tcgen05_aux_kernel_detected = (
+                    host_function_has_tcgen05_aux_kernel_pattern(self.host_function)
+                )
 
     def _apply_mark_static(self, args: tuple[object, ...]) -> None:
         """
@@ -673,6 +729,9 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         """
         return ""
 
+    def supports_subprocess_benchmark(self) -> bool:
+        return True
+
     def is_cacheable(self) -> bool:
         return True
 
@@ -818,7 +877,10 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         Returns:
             list[Callable[[Sequence[object]], Hashable]]: A list of functions that generate extra specialization keys.
         """
-        if not self.env.specialized_vars:
+        if (
+            not self.env.specialized_vars
+            and not self.env.tensor_descriptor_layout_guards
+        ):
             return []
 
         def make_extractor(v: Source) -> Callable[[Sequence[object]], Hashable]:
@@ -859,6 +921,19 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
 
                     return stride_extractor
                 raise exc.SpecializeArgType(v)
+            if isinstance(v, GetItemSource):
+                if not isinstance(v.index, int) or v.index_is_slice:
+                    raise exc.SpecializeArgType(v)
+                inner = make_extractor(v.base)
+
+                def getitem_extractor(
+                    args: Sequence[object],
+                    _inner: Callable[[Sequence[object]], Hashable] = inner,
+                    _index: int = v.index,
+                ) -> Hashable:
+                    return cast("Sequence[object]", _inner(args))[_index]
+
+                return getitem_extractor
             if isinstance(v, LocalSource):
                 index = arg_name_to_index[v.local_name]
                 return operator.itemgetter(index)
@@ -867,11 +942,53 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         arg_name_to_index: dict[str, int] = {
             n: i for i, n in enumerate(self.kernel.signature.parameters.keys())
         }
-        extractors = []
+        extractors: list[Callable[[Sequence[object]], Hashable]] = []
         for v in sorted(self.env.specialized_vars, key=lambda v: v.name):
             source = self.env.shape_env.var_to_sources[v][0]
             extractors.append(make_extractor(source))
+        implicit_config = self._fixed_config_for_td_layout_guards()
+        for source, guard in sorted(
+            self.env.tensor_descriptor_layout_guards.items(),
+            key=lambda item: repr(item[0]),
+        ):
+            if implicit_config is not None and not _td_layout_guard_active_for_config(
+                guard, implicit_config
+            ):
+                continue
+            extract_tensor = make_extractor(source)
+
+            def td_layout_extractor(
+                args: Sequence[object],
+                _extract_tensor: Callable[
+                    [Sequence[object]], Hashable
+                ] = extract_tensor,
+                _ndim: int = guard.ndim,
+                _element_size: int = guard.element_size,
+            ) -> Hashable:
+                tensor = cast("torch.Tensor", _extract_tensor(args))
+                if tensor.ndim != _ndim:
+                    return ("ndim", tensor.ndim)
+                return tensor_descriptor_layout_signature_from_strides(
+                    tensor.stride(),
+                    _element_size,
+                )
+
+            extractors.append(td_layout_extractor)
         return extractors
+
+    def _fixed_config_for_td_layout_guards(self) -> Config | None:
+        """Return the fixed config if TD layout guards can be filtered safely."""
+        if self._config is not None:
+            return self._config
+        if self.kernel.settings.autotune_effort == "none" and (
+            len(self.kernel.configs) == 0 or self.settings.force_autotune
+        ):
+            return self.config_spec.default_config()
+        if self.settings.force_autotune:
+            return None
+        if len(self.kernel.configs) == 1:
+            return self.kernel.configs[0]
+        return None
 
     def _user_provided_config(self) -> Config | None:
         """Return a config if the user explicitly provided one, else None.
@@ -1191,7 +1308,10 @@ def _hashable_dim(s: int | torch.SymInt) -> Hashable:
 def _safe_bucket_dim(s: int | torch.SymInt) -> Hashable:
     if isinstance(s, torch.SymInt):
         return (id(s.node.shape_env), s.node.expr)
-    return min(s, 2)
+    # Dynamic-shape kernels should not get separate bound kernels for sizes
+    # 0 or 1.  Keep 2 as the canonical "dynamic dimension" bucket that was
+    # already used for all concrete sizes >= 2.
+    return 2
 
 
 _EMPTY_FROZENSET: frozenset[int] = frozenset()
