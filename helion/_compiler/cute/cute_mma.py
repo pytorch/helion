@@ -177,9 +177,11 @@ class _Tcgen05AuxPerDescriptorRingNames:
     ``make_smem_layout_epi``-based SMEM layout, ``alloc_smem`` ptr,
     and ``make_tensor`` view; the producer body in
     ``program_id._build_c_input_warp_role_local_while`` indexes the
-    ring by descriptor position, and cycle 3's consumer-side flip
+    ring by descriptor position, and the consumer-side flip
     in ``memory_ops._aux_subtile_load_source`` reads from the same
-    SMEM tensor in descriptor-list order.
+    SMEM tensor by looking up each
+    ``_AuxStepRecord.load_node`` in the matmul plan's
+    descriptor list to find its ring position.
     """
 
     smem_layout: str
@@ -203,16 +205,20 @@ class _Tcgen05AuxPipelinePlan:
     descriptor-list order — the same order
     ``CuteTcgen05MatmulPlan.aux_tensor_descriptors`` exposes them.
     The producer body indexes by position; the consumer side
-    (cycle 3) consumes the same ordering.
+    looks up by ``load_node`` identity (see
+    ``memory_ops._codegen_cute_store_tcgen05_tile``'s
+    ``aux_ring_index_by_step``) so multi-step chains within one
+    store map cleanly onto the descriptor order.
 
     Consumer cooperative group: **``epi_warp_count`` (per-warp,
-    NOT per-thread)**. Cycle 3's consumer-side flip in
-    ``memory_ops._aux_subtile_load_source`` will gate
-    ``consumer_release(c_pipeline_aux)`` on ``lane_idx() == 0``
+    NOT per-thread)**. The consumer-side flip in
+    ``memory_ops._aux_subtile_load_source`` gates
+    ``consumer_release(c_pipeline_aux)`` on ``elect_one()``
     (matching the sched-pipeline pattern from
     ``_build_role_local_while_with_scheduler``), so the consumer
-    arrive count is per-warp. Setting per-thread would hang cycle
-    3 waiting for 31 missing per-warp arrivals per stage.
+    arrive count is per-warp. Setting per-thread would hang the
+    handshake waiting for 31 missing per-warp arrivals per
+    stage.
     """
 
     barriers: str
@@ -220,14 +226,23 @@ class _Tcgen05AuxPipelinePlan:
     consumer_group: str
     pipeline: str
     producer_state: str
-    # Pre-allocated for cycle 3: the consumer-side flip in
-    # ``memory_ops._aux_subtile_load_source`` will issue
+    # The consumer-side flip in
+    # ``memory_ops._aux_subtile_load_source`` issues
     # ``c_pipeline_aux.consumer_wait`` / ``consumer_release`` keyed
-    # off this state. Cycle 2a allocates the name + the
-    # ``make_pipeline_state(...)`` initializer so cycle 3 can wire
-    # it in place without revisiting the allocator.
+    # off this state per subtile of the per-output-tile aux region.
     consumer_state: str
     rings: tuple[_Tcgen05AuxPerDescriptorRingNames, ...]
+    # ``epi_tile_var`` is the matmul-plan ``epi_tile`` variable
+    # name. The producer body in
+    # ``program_id._build_c_input_warp_role_local_while`` uses it
+    # to compute the per-subtile GMEM slice that gets cooperative-
+    # copied into a SMEM ring stage. Each stage holds one
+    # ``epi_tile`` worth of aux data so per-subtile staging keeps
+    # the SMEM footprint small (one stage = one subtile). The
+    # producer-body codegen reads ``(bm, bn)`` directly from the
+    # matmul plan so no block-shape fields are plumbed through
+    # this dataclass.
+    epi_tile_var: str
 
 
 @dataclass(frozen=True)
@@ -2431,6 +2446,62 @@ def _emit_mma_pipeline(
                 "cute",
                 f"tcgen05 launch block shape {candidate_block_shape} exceeds 1024 threads",
             )
+        # SMEM-budget rejection: ``tcgen05_ab_stages=3`` +
+        # productive C-input warp
+        # (``tcgen05_warp_spec_c_input_warps=1`` AND non-empty
+        # ``aux_tensor_descriptors`` AND single-store fan-out
+        # gate open) is over the 232 KB B200 SMEM cap at every
+        # validated tcgen05 tile shape (canonical
+        # ``(bm=bn=256, bk=128, cluster_m=2)`` measured 263 KB
+        # used vs 232 KB cap; reducing the aux ring to
+        # ``num_stages=1`` only drops it to 246 KB, still 14 KB
+        # over). Reject loudly at MMA-codegen time so:
+        #   - explicit user configs fail with a clear message
+        #     instead of an opaque ``ptxas: uses too much
+        #     shared data`` deep inside the cute_dsl invocation;
+        #   - the autotune search-time fixup can demote
+        #     ``tcgen05_ab_stages=3`` candidates that would
+        #     otherwise trigger this raise mid-tuning (see
+        #     ``_fix_tcgen05_ab_stages_three_search_config``).
+        # The predicate mirrors the productive-body aux-pipeline
+        # allocation gate at ``_emit_mma_pipeline`` below
+        # (``has_c_input_warp AND aux_tensor_descriptors AND
+        # aux_single_store_value``). When the multi-store
+        # fan-out gate closes the productive body, the aux SMEM
+        # ring + ``c_pipeline_aux`` are NOT allocated and the
+        # kernel falls back to GMEM-aux reads with no extra
+        # SMEM cost, so the rejection must NOT fire — fan-out
+        # ``ab=3 + c_input=1`` paths are legal and pinned by
+        # ``test_aux_pipeline_ab_stages_3_with_c_input_fanout_not_rejected``.
+        aux_single_store_value = (
+            len(
+                {d.store_value_node for d in tcgen05_matmul_plan.aux_tensor_descriptors}
+            )
+            <= 1
+        )
+        if (
+            tcgen05_matmul_plan.has_c_input_warp
+            and tcgen05_matmul_plan.aux_tensor_descriptors
+            and aux_single_store_value
+            and tcgen05_matmul_plan.ab_stage_count >= 3
+        ):
+            raise exc.BackendUnsupported(
+                "cute",
+                "tcgen05 ``tcgen05_ab_stages=3`` is incompatible "
+                "with the productive C-input warp "
+                "(``tcgen05_warp_spec_c_input_warps=1`` + "
+                "non-empty aux tensors from the epilogue chain): "
+                "the aux SMEM ring + AB pipeline together "
+                "overshoot the 232 KB B200 SMEM cap at every "
+                "validated tile shape (the canonical "
+                "``(bm=bn=256, bk=128, cluster_m=2)`` shape uses "
+                "263 KB vs 232 KB cap). Drop to "
+                "``tcgen05_ab_stages=2`` for residual epilogues "
+                "with ``tcgen05_warp_spec_c_input_warps=1``, or "
+                "drop ``tcgen05_warp_spec_c_input_warps=0`` to "
+                "keep ``tcgen05_ab_stages=3``. See "
+                "``cute_plan.md`` §1.3 / §7.5.3.2.",
+            )
         df.cute_block_shape = candidate_block_shape
     if mma_impl == "universal":
         prefix.extend(
@@ -2801,8 +2872,24 @@ def _emit_mma_pipeline(
             #
             # With ``c_input_warps=0`` the subtraction is a no-op
             # and the byte-identity path is preserved exactly.
-            c_input_is_sched_consumer = tcgen05_matmul_plan.has_c_input_warp and bool(
-                tcgen05_matmul_plan.aux_tensor_descriptors
+            # Mirror the multi-store fan-out gate from
+            # ``_build_c_input_warp_role_local_while`` /
+            # the aux pipeline allocation below: the C-input
+            # warp only participates as a sched consumer when
+            # the productive body actually fires.
+            _aux_single_store_value = (
+                len(
+                    {
+                        d.store_value_node
+                        for d in tcgen05_matmul_plan.aux_tensor_descriptors
+                    }
+                )
+                <= 1
+            )
+            c_input_is_sched_consumer = (
+                tcgen05_matmul_plan.has_c_input_warp
+                and bool(tcgen05_matmul_plan.aux_tensor_descriptors)
+                and _aux_single_store_value
             )
             tcgen05_sched_consumer_role_count = (
                 tcgen05_matmul_plan.role_warp_count
@@ -2854,16 +2941,38 @@ def _emit_mma_pipeline(
             # emits the per-descriptor producer body that issues
             # ``producer_acquire`` → cooperative
             # ``cute.copy(GMEM, SMEM_ring[stage])`` →
-            # ``producer_commit`` against the same plan; cycle 3 will
-            # flip the consumer-side splice in
-            # ``memory_ops._aux_subtile_load_source`` to read from
+            # ``producer_commit`` against the same plan; the
+            # consumer-side splice in
+            # ``memory_ops._aux_subtile_load_source`` reads from
             # the SMEM ring under ``consumer_wait`` /
             # ``consumer_release`` gating. Gate-closed configs
             # (``c_input_warps=0`` or no aux residual) skip this
             # allocation entirely and preserve byte identity.
+            # Multi-store fan-out safety gate: the productive body
+            # only fires when every aux descriptor for this matmul
+            # comes from a single store_value_node. With fan-out
+            # (one matmul → multiple stores with different aux
+            # operands), the producer would fire
+            # ``producer_commit`` on every ring per subtile while
+            # each store's per-store-codegen consumer covers only
+            # a subset of rings — leaving the unmatched rings
+            # uncommitted and deadlocking the producer once a CTA
+            # wraps the pipeline depth. The ``store_value_node``
+            # field on ``Tcgen05AuxTensorDescriptor`` is the
+            # discriminator; the descriptor walker dedups by it
+            # already, so single-store fan-out into multiple
+            # writes of the same value gives one ``store_value_node``
+            # in the descriptor set (and the GMEM fallback path
+            # remains byte-identical to the pre-cycle-2b shape).
+            aux_store_value_nodes = {
+                desc.store_value_node
+                for desc in tcgen05_matmul_plan.aux_tensor_descriptors
+            }
+            aux_single_store_value = len(aux_store_value_nodes) <= 1
             if (
                 tcgen05_matmul_plan.has_c_input_warp
                 and tcgen05_matmul_plan.aux_tensor_descriptors
+                and aux_single_store_value
             ):
                 aux_descriptor_dtype_strs = tuple(
                     env.backend.dtype_str(desc.host_tensor_val.dtype)
@@ -2872,13 +2981,32 @@ def _emit_mma_pipeline(
                 tcgen05_aux_plan = _new_tcgen05_aux_pipeline_plan(
                     df,
                     num_rings=len(tcgen05_matmul_plan.aux_tensor_descriptors),
+                    epi_tile_var=tcgen05_plan.epi_tile,
                 )
                 df.register_cute_tcgen05_aux_pipeline_plan(tcgen05_aux_plan)
                 prefix.extend(
                     _emit_tcgen05_aux_pipeline_setup(
                         tcgen05_aux_plan,
                         descriptor_dtype_strs=aux_descriptor_dtype_strs,
-                        epi_tile_var=tcgen05_plan.epi_tile,
+                        # Each SMEM ring stage holds one ``epi_tile``
+                        # worth of aux data (one subtile of the
+                        # per-output-tile aux region). The producer
+                        # body in
+                        # ``program_id._build_c_input_warp_role_local_while``
+                        # loops over the matmul's subtile axis once
+                        # per output tile and cooperative-copies one
+                        # epi-tile into each ring stage; the
+                        # consumer's per-subtile loop waits, reads
+                        # the active stage with the existing
+                        # ``partition_C → flat_divide(epi_tile) →
+                        # partition_D`` pipeline, then lane-0
+                        # releases. Per-subtile staging keeps the
+                        # SMEM footprint small enough that
+                        # cluster_m=2 + ``tcgen05_ab_stages=3`` still
+                        # fits the 228 KB B200 cap (cycle 2b of the
+                        # producer-body split,
+                        # ``cute_plan.md`` §7.5.3.2).
+                        tile_shape_expr=tcgen05_plan.epi_tile,
                         # Single C-input warp = 32 lanes (validator
                         # pins ``c_input_warp_count`` to ``{0, 1}``
                         # under WITH_SCHEDULER); all 32 lanes
@@ -2887,9 +3015,9 @@ def _emit_mma_pipeline(
                         c_input_warp_thread_count=(
                             tcgen05_matmul_plan.c_input_warp_count * 32
                         ),
-                        # Per-warp consumer arrive count for cycle
-                        # 3's lane-0-gated release — see the
-                        # emitter docstring.
+                        # Per-warp consumer arrive count for the
+                        # lane-0-gated release — see the emitter
+                        # docstring.
                         epi_warp_count=tcgen05_matmul_plan.epi_warp_count,
                         defer_sync=tcgen05_use_cluster_deferred_pipelines,
                     )
@@ -4642,14 +4770,23 @@ def _new_tcgen05_aux_pipeline_plan(
     df: DeviceFunction,
     *,
     num_rings: int,
+    epi_tile_var: str,
 ) -> _Tcgen05AuxPipelinePlan:
     """Allocate variable names for the C-input warp's aux-tensor
     SMEM-ring pipeline (``cute_plan.md`` §7.5.3.2).
 
     ``num_rings`` is the number of aux-tensor descriptors registered
     on the matmul plan; the producer body indexes the rings by
-    descriptor position, and cycle 3's consumer-side flip consumes
-    the same ordering.
+    descriptor position, and the consumer-side flip in
+    ``memory_ops._aux_subtile_load_source`` consumes the same
+    ordering.
+
+    ``epi_tile_var`` is the matmul-plan ``epi_tile`` variable name;
+    the producer body uses it to subdivide the per-output-tile aux
+    GMEM region into epi-tile-sized chunks. The ``(bm, bn)`` block
+    shape is read directly from the matmul plan by the
+    producer-body codegen, so no block-shape fields are plumbed
+    through the aux pipeline plan.
     """
     assert num_rings >= 1, (
         "aux pipeline plan requires at least one descriptor; the gate "
@@ -4672,6 +4809,7 @@ def _new_tcgen05_aux_pipeline_plan(
         producer_state=df.new_var("tcgen05_aux_pipeline_producer_state"),
         consumer_state=df.new_var("tcgen05_aux_pipeline_consumer_state"),
         rings=rings,
+        epi_tile_var=epi_tile_var,
     )
 
 
@@ -4679,7 +4817,7 @@ def _emit_tcgen05_aux_pipeline_setup(
     plan: _Tcgen05AuxPipelinePlan,
     *,
     descriptor_dtype_strs: tuple[str, ...],
-    epi_tile_var: str,
+    tile_shape_expr: str,
     c_input_warp_thread_count: int,
     epi_warp_count: int,
     defer_sync: bool,
@@ -4690,13 +4828,22 @@ def _emit_tcgen05_aux_pipeline_setup(
 
     Per descriptor, allocates a SMEM ring sized by
     ``make_smem_layout_epi(<aux_dtype>, ROW_MAJOR, epi_tile,
-    _TCGEN05_AUX_PIPELINE_STAGE_COUNT)`` — the same staged-epilogue
-    layout the D-output uses. Cycle 3's consumer-side flip in
-    ``memory_ops._aux_subtile_load_source`` consumes the SMEM
-    tensor via the same ``partition_C → transform → flat_divide(epi_tile)
-    → partition_D`` pipeline the existing GMEM path already uses,
-    so the layout choice keeps cycle 3 a localized GMEM→SMEM
-    operand swap.
+    _TCGEN05_AUX_PIPELINE_STAGE_COUNT)`` — each ring stage holds
+    ONE subtile (``epi_tile``-shaped slice) of the per-output-tile
+    aux region, not the full ``(bm, bn)`` tile. Per-subtile
+    staging keeps the SMEM ring footprint at one ``epi_tile``
+    chunk per stage rather than one ``(bm, bn)`` chunk, which is
+    essential to fit cluster_m=2 + ``tcgen05_ab_stages=3`` in the
+    228 KB B200 SMEM cap. The producer issues one cooperative
+    ``cute.copy(GMEM_aux_subtile, SMEM_aux_ring[stage])`` *per
+    subtile* (looping over the per-output-tile subtile axis),
+    framed by ``producer_acquire`` / ``producer_commit`` / state
+    advance; the consumer issues one ``consumer_wait`` / Quack-
+    style ``tiled_copy_s2r`` ``cute.copy(SMEM_ring[stage], rmem)``
+    / lane-0 ``consumer_release`` / state advance per subtile.
+    ``tile_shape_expr`` is the ``epi_tile`` variable name so the
+    SMEM ring sizing matches the producer-side subtile copy
+    extent.
 
     Pipeline parameters:
 
@@ -4705,12 +4852,13 @@ def _emit_tcgen05_aux_pipeline_setup(
       ``producer_acquire`` / ``producer_commit`` per-thread, so
       the cooperative-group arrive count is per-thread.
     - ``consumer_arrive_count = epi_warp_count`` (per-warp, NOT
-      per-thread). Cycle 3's consumer-side flip will gate
-      ``consumer_release(c_pipeline_aux)`` on ``lane_idx() == 0``
+      per-thread). The consumer-side flip in
+      ``memory_ops._aux_subtile_load_source`` gates
+      ``consumer_release(c_pipeline_aux)`` on ``elect_one()``
       (matching the sched-pipeline pattern from
       ``_build_role_local_while_with_scheduler``). Setting
-      per-thread would hang cycle 3 waiting for 31 missing
-      per-warp arrivals per stage.
+      per-thread would hang the handshake waiting for 31
+      missing per-warp arrivals per stage.
     - ``defer_sync`` mirrors the AB / acc / sched pipelines'
       cluster-deferred-init participation so the
       ``pipeline_init_arrive`` / ``pipeline_init_wait`` rendezvous
@@ -4726,7 +4874,7 @@ def _emit_tcgen05_aux_pipeline_setup(
                     f"{ring.smem_layout} = "
                     f"cutlass.utils.blackwell_helpers.make_smem_layout_epi("
                     f"{dtype_str}, cutlass.utils.layout.LayoutEnum.ROW_MAJOR, "
-                    f"{epi_tile_var}, {stage_count})"
+                    f"{tile_shape_expr}, {stage_count})"
                 ),
                 statement_from_string(
                     f"{ring.smem_ptr} = cute.arch.alloc_smem("

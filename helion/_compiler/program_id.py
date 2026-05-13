@@ -3236,56 +3236,68 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         Active when the matmul plan has ``c_input_warp_count > 0``
         AND the forward FX walker discovered one or more
         auxiliary-tensor descriptors. The C-input warp participates
-        in the scheduler-broadcast pipeline as a *consumer*: each
-        iteration it consumer-waits on ``sched_pipeline``, reads
-        the published per-tile coords from the SMEM mailbox, runs
-        its role body, then consumer-releases.
+        in the scheduler-broadcast pipeline as a *consumer* of
+        ``sched_pipeline`` (per-tile coord broadcast) and as a
+        *producer* of the ``c_pipeline_aux`` SMEM aux ring
+        (one cooperative ``cute.copy(GMEM_aux, SMEM_aux[stage])``
+        per output tile per descriptor).
 
-        Per-tile body (post-cycle-2a):
+        Per-tile body:
 
-        1. ``virtual_pid_var`` write (decomposed from
-           ``work_tile_smem`` coords). Cycle 2b will use this to
-           build the aux GMEM tile for the cooperative copy.
-        2. No producer-side barrier ops fire this cycle. Cycle 2b
-           lands the complete producer handshake — the
-           ``c_pipeline_aux.producer_acquire(producer_state)`` /
-           cooperative ``cute.copy(GMEM, SMEM)`` /
-           ``c_pipeline_aux.producer_commit(producer_state)`` /
-           ``producer_state`` advance — and cycle 3 wires the
-           consumer-side SMEM read flip
-           (``c_pipeline_aux.consumer_wait`` /
-           ``consumer_release``) in
-           ``memory_ops._aux_subtile_load_source``. The producer
-           and consumer barrier ops *must* land in the same cycle
-           or a partial-handshake deadlock results (an early-2a
-           variant of this builder emitted producer barriers
-           without consumer releases; with ``num_stages=2`` the
-           third ``producer_acquire`` blocks forever once a CTA
-           wraps the pipeline depth — see the deadlock-regression
-           pin in ``TestCuteTcgen05AuxPipelineCycle2a``).
+        1. ``sched_pipeline.consumer_wait`` + valid-flag read
+           (shared with ``_build_role_local_while_with_scheduler``
+           via ``_build_sched_pipeline_consumer_{wait,release}_block``).
+        2. ``virtual_pid_var`` write decomposed from
+           ``work_tile_smem`` (downstream M / N tile coords used
+           by the per-descriptor aux GMEM-tile builder).
+        3. Per output tile, build the per-CTA aux GMEM region:
+           ``cute.local_tile(host_aux, (bm_per_cta, bn),
+           (tile_m, tile_n))`` where
+           ``bm_per_cta = bm // cluster_m`` under
+           ``use_2cta_instrs`` (otherwise ``bm``). For rank-1
+           trailing-axis broadcast aux the M extent is also
+           ``bm_per_cta``. ``flat_divide(epi_tile)`` +
+           ``group_modes(2, rank)`` to expose a flat subtile
+           axis whose extent matches the consumer's per-CTA
+           subtile count.
+        4. Build the cooperative ``TiledCopy`` once per
+           descriptor: ``make_tiled_copy_tv`` with a
+           ``(M_threads=4, N_threads=8)`` ordered layout × a
+           ``(1, 128 / dtype_bits)`` val layout and a
+           ``CopyUniversalOp`` atom. ``get_slice(lane_idx)``
+           per lane.
+        5. Per subtile (``cutlass.range(subtile_count,
+           unroll_full=True)``): ``producer_acquire(state)`` →
+           per descriptor build the per-subtile GMEM slice and
+           SMEM stage slice and issue
+           ``cute.copy(tiled_copy, gmem_part, smem_part)`` →
+           ``cute.arch.sync_warp()`` → ``cute.arch.fence_acq_rel_cta()``
+           (so the consumer's generic SMEM reads after
+           ``consumer_wait`` see the producer's stores —
+           ``mbarrier.arrive`` from ``AsyncThread`` has relaxed
+           memory semantics and does not fence by itself) →
+           ``c_pipeline_aux.producer_commit(state)`` →
+           ``state.advance()``.
+        6. ``sched_pipeline.consumer_release`` + sentinel-publish
+           wait at the bottom of the per-tile body.
 
-        Mirrors the consumer-side pattern in
-        ``_build_role_local_while_with_scheduler`` — both route
-        through ``_build_sched_pipeline_consumer_wait_block`` and
-        ``_build_sched_pipeline_consumer_release_block`` at module
-        scope so the two consumer-role builders share one source
-        of truth for the wait/release shape.
-
-        Cycle 2a (this slice): the data-model + SMEM ring +
-        ``c_pipeline_aux`` ``PipelineAsync.create`` +
-        producer/consumer ``make_pipeline_state`` lands in
-        ``cute_mma._codegen_cute_mma``; the producer body does NOT
-        fire any barrier ops. The pipeline storage exists but the
-        producer/consumer handshake is dormant until cycle 2b
-        lands the producer ops + cooperative copy and cycle 3
-        lands the consumer-side flip. The pre-allocated
-        ``producer_state`` / ``consumer_state`` are unused this
-        cycle but reserved so cycle 2b / cycle 3 can wire them in
-        place without revisiting the allocator.
+        The producer-side and consumer-side flip
+        (in ``memory_ops._aux_subtile_load_source`` /
+        ``_aux_tile_setup_lines``) MUST land in the same commit:
+        a partial-handshake state deadlocks once a CTA wraps the
+        pipeline depth (an early-2a variant of this builder
+        emitted producer barriers without consumer releases; with
+        ``num_stages=2`` the third ``producer_acquire`` blocks
+        forever — see the cycle-2a docstring in
+        ``TestCuteTcgen05AuxPipelineCycle2a``).
         """
         plan = self._tcgen05_plan()
         assert plan is not None and plan.has_c_input_warp, (
             "C-input role-local while requires a matmul plan with has_c_input_warp=True"
+        )
+        assert plan.aux_tensor_descriptors, (
+            "C-input role-local while requires non-empty aux_tensor_descriptors "
+            "(producer-body split gate must be open)"
         )
         sched_pipeline_plan = self._tcgen05_sched_pipeline_plan()
         assert sched_pipeline_plan is not None, (
@@ -3297,22 +3309,23 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         sched_consumer_state = (
             sched_pipeline_plan.consumer_state  # type: ignore[attr-defined]
         )
-        # Aux pipeline plan (cycle 2a). The matmul-plan gate that
-        # admits this builder also fires the pipeline allocation
-        # in ``cute_mma._codegen_cute_mma``, so a non-None plan
-        # is the invariant we rely on once the gate is open.
-        # ``producer_state`` / ``consumer_state`` are reserved by
-        # the allocator but unused this cycle — cycle 2b wires the
-        # producer side and cycle 3 wires the consumer side. We
-        # keep the assert so a future gate-skew between
+        # Aux pipeline plan: the matmul-plan gate that admits this
+        # builder also fires the pipeline allocation in
+        # ``cute_mma._codegen_cute_mma``, so a non-None plan is
+        # the invariant we rely on once the gate is open. The
+        # assert catches a future gate-skew between
         # ``has_c_input_warp + aux_tensor_descriptors`` and the
-        # cute_mma allocator fires here rather than producing a
-        # half-allocated kernel.
+        # cute_mma allocator rather than producing a half-allocated
+        # kernel.
         aux_pipeline_plan = device_function.cute_tcgen05_aux_pipeline_plan
         assert aux_pipeline_plan is not None, (
             "C-input role-local while requires a registered "
             "aux pipeline plan; was register_cute_tcgen05_aux_pipeline_plan "
             "called by _codegen_cute_mma?"
+        )
+        assert len(aux_pipeline_plan.rings) == len(plan.aux_tensor_descriptors), (  # type: ignore[attr-defined]
+            "C-input role-local while: aux pipeline plan must have one "
+            "ring per matmul-plan aux descriptor"
         )
 
         valid_var = device_function.new_var("tcgen05_c_input_warp_valid")
@@ -3323,12 +3336,61 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         ]
         linear_pid_expr = self._tcgen05_linear_virtual_pid_from_coords_expr(coord_terms)
 
+        # M / N tile coords for the cooperative copy. Each CTA's
+        # C-input warp loads only its own per-CTA portion of the
+        # aux region. Under cluster_m=2 ``use_2cta_instrs`` the
+        # per-CTA aux tile shape is ``(bm/2, bn)`` and the per-CTA
+        # M tile coord is the global M tile (without the cluster
+        # ``// 2`` reduction — each CTA in the cluster handles its
+        # own row stripe). The N coord is shared across cluster
+        # (cluster_n=1 is the only validated runtime).
+        #
+        # Critical correctness invariant: the consumer-side per-CTA
+        # subtile count is
+        # ``(bm_per_cta * bn) / (epi_m * epi_n)``; the producer's
+        # subtile count must match or the mbar handshake deadlocks
+        # once the producer wraps the stage count and the consumer
+        # has already exited (cluster_m=2 yields producer=2× the
+        # consumer count when the producer mistakenly uses the
+        # cluster-level (bm, bn)).
+        bm = plan.bm
+        bn = plan.bn
+        cluster_m = self._tcgen05_cluster_m()
+        is_two_cta = self._tcgen05_is_two_cta()
+        bm_per_cta = bm // cluster_m if is_two_cta else bm
+        tile_m_var = device_function.new_var("tcgen05_aux_tile_m")
+        tile_n_var = device_function.new_var("tcgen05_aux_tile_n")
+        m_coord_raw = f"{layout.work_tile_smem}[cutlass.Int32(0)]"
+        n_coord_raw = f"{layout.work_tile_smem}[cutlass.Int32(1)]"
+        # Per-CTA M tile coord: under 2cta the global M-coord
+        # already indexes into per-CTA M stripes (the scheduler
+        # publishes global M tiles, two per cluster step). Use the
+        # global coord directly; the local_tile shape ``bm_per_cta``
+        # handles the per-CTA slicing.
+        if is_two_cta:
+            tile_m_expr = m_coord_raw
+        else:
+            tile_m_expr = self._tcgen05_logical_m_coord_expr(m_coord_raw)
+        tile_n_expr = n_coord_raw
+
+        # Cooperative-copy thread layout. Single C-input warp has
+        # 32 lanes; lay them out row-major as (M_threads, N_threads)
+        # = (4, 8) so each lane reads a contiguous N chunk
+        # (innermost dim) and 8 lanes cover the N axis. The val
+        # layout pulls 128 bits per copy atom — the largest power
+        # of two that divides both ``bn * dtype_bits`` and 128. For
+        # bf16 with bn=256 that's 128 bits = 8 elements.
+        # ``make_tiled_copy_tv`` lifts the per-lane chunk to a
+        # ``(thr_layout × val_layout)`` partition and ``cute.copy``
+        # iterates the tile under the lane's get_slice(lane_idx).
+        cute_lane_idx_var = device_function.new_var("tcgen05_aux_lane_idx")
+
         # Factories mirror the consumer-side pattern in
         # ``_build_role_local_while_with_scheduler`` — both go
         # through the shared module-scope helpers
         # (``_build_sched_pipeline_consumer_{wait,release}_block``)
         # so the wait/release shape has one source of truth.
-        def _consumer_wait_block() -> list[ast.stmt]:
+        def _sched_consumer_wait_block() -> list[ast.stmt]:
             return _build_sched_pipeline_consumer_wait_block(
                 sched_pipeline=sched_pipeline,
                 sched_consumer_state=sched_consumer_state,
@@ -3336,28 +3398,312 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                 valid_var=valid_var,
             )
 
-        def _consumer_release_block() -> list[ast.stmt]:
+        def _sched_consumer_release_block() -> list[ast.stmt]:
             return _build_sched_pipeline_consumer_release_block(
                 sched_pipeline=sched_pipeline,
                 sched_consumer_state=sched_consumer_state,
             )
 
-        # Cycle 2a producer body: NO barrier ops. The aux pipeline
-        # storage is allocated up front but the
-        # ``producer_acquire`` / ``producer_commit`` handshake
-        # lands in cycle 2b paired with the cooperative
-        # GMEM→SMEM copy and the cycle-3 consumer side. Wiring
-        # producer barriers here without a matching consumer
-        # release would deadlock after ``num_stages`` iterations
-        # per CTA (the third ``producer_acquire`` blocks waiting
-        # for an empty-mbar arrival the consumer never issues).
+        # Pull aux pipeline names from the plan. The plan is the
+        # ``_Tcgen05AuxPipelinePlan`` dataclass; access by name
+        # without importing the type to avoid a module cycle.
+        aux_pipeline_name = aux_pipeline_plan.pipeline  # type: ignore[attr-defined]
+        aux_producer_state_name = (
+            aux_pipeline_plan.producer_state  # type: ignore[attr-defined]
+        )
+        aux_rings = aux_pipeline_plan.rings  # type: ignore[attr-defined]
+        aux_epi_tile_var = aux_pipeline_plan.epi_tile_var  # type: ignore[attr-defined]
+
+        env_backend = CompileEnvironment.current().backend
+
+        # Per-descriptor partitioning that runs once per output tile:
+        # builds the source 2-D GMEM tensor, slices the per-output-
+        # tile ``(bm, bn)`` region, and flat-divides it into
+        # epi-tile-sized subtiles. The subtile-loop body further
+        # slices one subtile of GMEM and one stage of SMEM per
+        # iteration. Each per-descriptor partition uses fresh AST
+        # var names so multiple aux descriptors compose linearly.
+        per_descriptor_setup_blocks: list[list[ast.stmt]] = []
+        per_descriptor_subtile_blocks: list[list[str]] = []
+        per_descriptor_grouped_names: list[str] = []
+        # Same N-threads = 8 / M-threads = 4 layout the producer uses
+        # for the cooperative copy. For the matmul-plan epi tile (a
+        # rectangular sub-tile of the (bm, bn) region) the lane
+        # layout is constexpr and shared across descriptors.
+        n_threads = 8
+        m_threads = 32 // n_threads
+        for desc_idx, (desc, ring) in enumerate(
+            zip(plan.aux_tensor_descriptors, aux_rings, strict=True)  # type: ignore[arg-type]
+        ):
+            aux_tensor_name = device_function.tensor_arg(desc.host_tensor_val).name
+            aux_dtype_str = env_backend.dtype_str(desc.host_tensor_val.dtype)
+            dtype_bits = desc.host_tensor_val.dtype.itemsize * 8
+            copy_bits = 128
+            num_copy_elems = max(1, copy_bits // dtype_bits)
+            gmem_aux_view_var = device_function.new_var(
+                f"tcgen05_aux_gmem_view_{desc_idx}"
+            )
+            gmem_aux_tile_var = device_function.new_var(
+                f"tcgen05_aux_gmem_tile_{desc_idx}"
+            )
+            gmem_aux_subtiles_var = device_function.new_var(
+                f"tcgen05_aux_gmem_subtiles_{desc_idx}"
+            )
+            gmem_subtiles_grouped_var = device_function.new_var(
+                f"tcgen05_aux_gmem_subtiles_grouped_{desc_idx}"
+            )
+            tiled_copy_var = device_function.new_var(
+                f"tcgen05_aux_tiled_copy_{desc_idx}"
+            )
+            thr_copy_var = device_function.new_var(f"tcgen05_aux_thr_copy_{desc_idx}")
+            gmem_subtile_var = device_function.new_var(
+                f"tcgen05_aux_gmem_subtile_{desc_idx}"
+            )
+            smem_stage_var = device_function.new_var(
+                f"tcgen05_aux_smem_stage_{desc_idx}"
+            )
+            gmem_part_var = device_function.new_var(f"tcgen05_aux_gmem_part_{desc_idx}")
+            smem_part_var = device_function.new_var(f"tcgen05_aux_smem_part_{desc_idx}")
+            setup: list[ast.stmt] = []
+            # Build the source 2-D GMEM tensor. Exact-shape rank-2
+            # aux passes through ``aux_tensor`` directly; rank-1
+            # trailing-axis broadcast aux builds a stride-0-on-M
+            # view with M-extent ``bm_per_cta`` and N-extent = the
+            # rank-1 size. Under cluster_m=2 ``use_2cta_instrs``
+            # the per-CTA aux tile is ``(bm/2, bn)``; the global M
+            # tile coord directly indexes per-CTA M stripes (the
+            # scheduler publishes 2 global tiles per cluster
+            # step). For non-2cta the per-CTA tile shape collapses
+            # to the full ``(bm, bn)``.
+            if desc.broadcast_axis is None:
+                setup.extend(
+                    [
+                        statement_from_string(
+                            f"{gmem_aux_view_var} = {aux_tensor_name}"
+                        ),
+                        statement_from_string(
+                            f"{gmem_aux_tile_var} = cute.local_tile("
+                            f"{gmem_aux_view_var}, ({bm_per_cta}, {bn}), "
+                            f"({tile_m_var}, {tile_n_var}))"
+                        ),
+                    ]
+                )
+            else:
+                assert desc.broadcast_axis == 1, (
+                    "C-input warp aux producer expects "
+                    "broadcast_axis in {None, 1}; the chain "
+                    "analyzer rejects other forms"
+                )
+                n_global = int(desc.host_tensor_val.shape[0])
+                setup.extend(
+                    [
+                        statement_from_string(
+                            f"{gmem_aux_view_var} = cute.make_tensor("
+                            f"{aux_tensor_name}.iterator, "
+                            f"cute.make_layout(({bm_per_cta}, {n_global}), "
+                            "stride=(0, 1)))"
+                        ),
+                        statement_from_string(
+                            f"{gmem_aux_tile_var} = cute.local_tile("
+                            f"{gmem_aux_view_var}, ({bm_per_cta}, {bn}), "
+                            f"(cutlass.Int32(0), {tile_n_var}))"
+                        ),
+                    ]
+                )
+            # Subdivide the per-output-tile aux region into epi-tile-
+            # sized subtiles using ``flat_divide(epi_tile)`` —
+            # mirrors the consumer-side ``flat_divide`` so the
+            # producer and consumer iterate the same subtile
+            # ordering. ``group_modes(..., 2, rank)`` collapses the
+            # outer (subtile_m, subtile_n) modes into one linear
+            # subtile axis so the producer's subtile loop sees a
+            # flat ``subtile_count`` extent (matches the consumer's
+            # post-``group_modes`` shape used inside
+            # ``_aux_subtile_load_source``).
+            setup.extend(
+                [
+                    statement_from_string(
+                        f"{gmem_aux_subtiles_var} = cute.flat_divide("
+                        f"{gmem_aux_tile_var}, {aux_epi_tile_var})"
+                    ),
+                    statement_from_string(
+                        f"{gmem_subtiles_grouped_var} = cute.group_modes("
+                        f"{gmem_aux_subtiles_var}, 2, "
+                        f"cute.rank({gmem_aux_subtiles_var}))"
+                    ),
+                ]
+            )
+            # Cooperative-copy ``TiledCopy`` for the C-input warp's
+            # 32 lanes. The atom uses ``CopyUniversalOp`` (regular
+            # SIMT ld+st): cp.async would impose a 128-bit
+            # source-iterator alignment check that the layout-
+            # implied stride alignment cannot satisfy at IR-build
+            # time (the host pointer is 16-byte aligned, but the
+            # minimum row stride is 1 element = 16 bits for bf16).
+            # ``CopyUniversalOp`` lowers to a SIMT ld/st pair whose
+            # vectorization is driven at runtime by the host
+            # pointer's actual alignment.
+            setup.extend(
+                [
+                    statement_from_string(
+                        f"{tiled_copy_var} = cute.make_tiled_copy_tv("
+                        f"cute.make_copy_atom("
+                        f"cute.nvgpu.CopyUniversalOp(), {aux_dtype_str}, "
+                        f"num_bits_per_copy={copy_bits}), "
+                        f"cute.make_ordered_layout("
+                        f"({m_threads}, {n_threads}), order=(1, 0)), "
+                        f"cute.make_layout((1, {num_copy_elems})))"
+                    ),
+                    statement_from_string(
+                        f"{thr_copy_var} = {tiled_copy_var}.get_slice("
+                        f"{cute_lane_idx_var})"
+                    ),
+                ]
+            )
+            per_descriptor_setup_blocks.append(setup)
+            per_descriptor_grouped_names.append(gmem_subtiles_grouped_var)
+
+            # Per-subtile body source: builds the per-stage GMEM
+            # slice + SMEM stage slice and issues one cooperative
+            # ``cute.copy``. The loop variable
+            # ``_tcgen05_aux_subtile`` indexes the flat subtile
+            # axis (collapsed via ``group_modes(..., 2, rank)``);
+            # the consumer's per-subtile loop indexes the same
+            # axis identically.
+            subtile_lines = [
+                (
+                    f"{gmem_subtile_var} = "
+                    f"{gmem_subtiles_grouped_var}[None, None, "
+                    f"cutlass.Int32(_tcgen05_aux_subtile)]"
+                ),
+                (
+                    f"{smem_stage_var} = {ring.smem}[None, None, "
+                    f"{aux_producer_state_name}.index]"
+                ),
+                (f"{gmem_part_var} = {thr_copy_var}.partition_S({gmem_subtile_var})"),
+                (f"{smem_part_var} = {thr_copy_var}.partition_D({smem_stage_var})"),
+                (f"cute.copy({tiled_copy_var}, {gmem_part_var}, {smem_part_var})"),
+            ]
+            per_descriptor_subtile_blocks.append(subtile_lines)
+
+        def _aux_copy_lines() -> list[ast.stmt]:
+            """Emit the per-output-tile producer body.
+
+            The body computes per-output-tile aux GMEM partitions,
+            flat-divides each into epi-tile-sized subtiles, then
+            loops over the subtile axis. Each subtile iteration
+            acquires one SMEM ring stage, cooperative-copies the
+            subtile of every descriptor into the stage, fences the
+            SMEM proxy, commits the producer barrier, and advances
+            the producer state. Iteration order matches the
+            consumer's per-subtile loop in
+            ``memory_ops._aux_subtile_load_source``.
+            """
+            lines: list[ast.stmt] = []
+            lines.extend(
+                [
+                    statement_from_string(
+                        f"{cute_lane_idx_var} = cute.arch.lane_idx()"
+                    ),
+                    statement_from_string(f"{tile_m_var} = {tile_m_expr}"),
+                    statement_from_string(f"{tile_n_var} = {tile_n_expr}"),
+                ]
+            )
+            # Per-descriptor partition setup runs once per output
+            # tile, before the subtile loop. The setup builds the
+            # ``flat_divide(epi_tile) → group_modes(2, rank)``
+            # tensor whose third mode is the subtile axis the
+            # producer iterates against.
+            for block in per_descriptor_setup_blocks:
+                lines.extend(block)
+
+            # Determine the subtile count from any descriptor's
+            # grouped tensor (all descriptors share the same
+            # subtile axis because they're all sliced from the
+            # same ``(bm, bn)`` region with the same ``epi_tile``).
+            # Use the first descriptor's grouped name — pulled
+            # from ``per_descriptor_grouped_names`` so the
+            # ``device_function.new_var`` namespace suffix
+            # (if any) is honored.
+            first_grouped = per_descriptor_grouped_names[0]
+            subtile_count_var = device_function.new_var(
+                "tcgen05_aux_producer_subtile_count"
+            )
+            lines.append(
+                statement_from_string(
+                    f"{subtile_count_var} = cutlass.const_expr("
+                    f"cute.size({first_grouped}.shape, mode=[2]))"
+                )
+            )
+
+            # Build the per-subtile loop body. Per iteration:
+            # acquire one SMEM stage, copy every descriptor's
+            # subtile into the stage, sync the warp + fence the
+            # SMEM proxy so the consumer's
+            # ``consumer_wait`` sees a fully populated stage,
+            # commit, advance. Lane-uniform code throughout (every
+            # lane runs the same per-iteration body; the cooperative
+            # copy partitions inside).
+            # Build the per-iteration body as a single
+            # already-indented source string. Each entry in
+            # ``inner_chunks`` is a top-level statement (or block)
+            # carrying its own ``    `` indent for the surrounding
+            # ``for ...:`` loop. ``emit_pipeline_advance`` may
+            # return a multi-line ``if True: ...`` block on
+            # cutedsl builds without the OpResultList fix; we
+            # pass ``indent="    "`` so the whole block is
+            # already indented for the loop body and no caller-
+            # side reflow is needed (the prior single-line
+            # ``\n.join(f"    {line}" ...)`` pattern only
+            # indented the first line of the advance block,
+            # under-indenting its body and causing a SyntaxError
+            # on the fallback path).
+            loop_indent = "    "
+            inner_chunks: list[str] = []
+            inner_chunks.append(
+                f"{loop_indent}{aux_pipeline_name}.producer_acquire("
+                f"{aux_producer_state_name})"
+            )
+            for block in per_descriptor_subtile_blocks:
+                inner_chunks.extend(f"{loop_indent}{line}" for line in block)
+            # ``CopyUniversalOp`` issues regular ld+st pairs that
+            # complete in program order per thread; ``sync_warp``
+            # ensures all 32 lanes of the producer warp finish
+            # their SMEM stores. ``fence_acq_rel_cta`` provides
+            # cross-warp visibility through the CTA-scope generic
+            # SMEM proxy — the consumer warps' generic SMEM reads
+            # after their ``consumer_wait`` would otherwise be
+            # free to bypass the producer's writes since the
+            # AsyncThread ``mbarrier.arrive`` PTX emission has
+            # relaxed memory semantics by default.
+            inner_chunks.extend(
+                [
+                    f"{loop_indent}cute.arch.sync_warp()",
+                    f"{loop_indent}cute.arch.fence_acq_rel_cta()",
+                    (
+                        f"{loop_indent}{aux_pipeline_name}.producer_commit("
+                        f"{aux_producer_state_name})"
+                    ),
+                    emit_pipeline_advance(aux_producer_state_name, indent=loop_indent),
+                ]
+            )
+            inner_body = "\n".join(inner_chunks)
+            loop_src = (
+                f"for _tcgen05_aux_subtile in cutlass.range("
+                f"{subtile_count_var}, unroll_full=True):\n"
+                f"{inner_body}"
+            )
+            lines.append(statement_from_string(loop_src))
+            return lines
+
         prelude: list[ast.stmt] = []
-        prelude.extend(_consumer_wait_block())
+        prelude.extend(_sched_consumer_wait_block())
         per_tile_body: list[ast.stmt] = [
             statement_from_string(f"{self.virtual_pid_var} = {linear_pid_expr}"),
         ]
-        per_tile_body.extend(_consumer_release_block())
-        per_tile_body.extend(_consumer_wait_block())
+        per_tile_body.extend(_aux_copy_lines())
+        per_tile_body.extend(_sched_consumer_release_block())
+        per_tile_body.extend(_sched_consumer_wait_block())
         prelude.append(
             create(
                 ast.While,
@@ -3366,7 +3712,7 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                 orelse=[],
             )
         )
-        prelude.extend(_consumer_release_block())
+        prelude.extend(_sched_consumer_release_block())
 
         return create(
             ast.If,
@@ -3707,7 +4053,20 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         # residual epilogue (the walker returns an empty tuple in
         # that case).
         plan = self._tcgen05_plan()
-        if plan is not None and plan.has_c_input_warp and plan.aux_tensor_descriptors:
+        # Multi-store fan-out guard mirrors the same check in
+        # ``cute_mma._emit_mma_pipeline``: the productive body
+        # only emits when every aux descriptor for this matmul
+        # comes from a single ``store_value_node``. The
+        # cute_mma path uses the same predicate to gate the
+        # ``c_pipeline_aux`` allocation; both must agree or the
+        # role-local while will try to access a missing
+        # pipeline plan.
+        if (
+            plan is not None
+            and plan.has_c_input_warp
+            and plan.aux_tensor_descriptors
+            and len({d.store_value_node for d in plan.aux_tensor_descriptors}) <= 1
+        ):
             role_local_whiles.append(
                 self._build_c_input_warp_role_local_while(device_function, layout)
             )
