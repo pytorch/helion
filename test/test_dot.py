@@ -501,6 +501,29 @@ class TestDot(RefEagerTestBase, TestCase):
 
     # torch.baddbmm codegen shape is covered indirectly by broader matmul tests; skipping a brittle code-inspection here
 
+    def test_addmm_mixed_dtype_acc_fp32_mats_fp16(self):
+        # Regression: torch.addmm(fp32_acc, fp16_x, fp16_y) is the canonical
+        # Helion matmul pattern (see examples/matmul.py). Some PyTorch
+        # nightlies regressed the FakeTensor meta to return mat1's dtype;
+        # Helion's compiler pins the output to `self` instead.
+        @helion.kernel(autotune_effort="none", static_shapes=True)
+        def matmul_fp32_acc(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        x = torch.randn(64, 64, device=DEVICE, dtype=torch.float16)
+        y = torch.randn(64, 64, device=DEVICE, dtype=torch.float16)
+        _, result = code_and_output(matmul_fp32_acc, (x, y))
+        expected = (x.float() @ y.float()).to(torch.float16)
+        torch.testing.assert_close(result, expected, rtol=1e-2, atol=1e-2)
+
     @skipIfNotTriton("triton-specific codegen assertions")
     @skipIfRefEager("Debug dtype codegen checks rely on compiled code")
     @skipIfXPU("Failed on XPU - https://github.com/pytorch/helion/issues/772")

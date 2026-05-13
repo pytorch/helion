@@ -881,6 +881,20 @@ class CallableType(LiteralType):
                     ),
                     origin,
                 )
+            # Pin addmm/baddbmm output dtype to `self`: Helion's lowering
+            # treats it as authoritative, and PyTorch's FakeTensor meta has
+            # flip-flopped on whether to follow `self` or `mat1`.
+            if (
+                self.value in (torch.addmm, torch.baddbmm)
+                and isinstance(output_type, TensorType)
+                and args
+                and isinstance(args[0], TensorType)
+                and output_type.fake_value.dtype != args[0].fake_value.dtype
+            ):
+                output_type = TensorType(
+                    output_type.origin,
+                    output_type.fake_value.to(args[0].fake_value.dtype),
+                )
             output_type.tree_map(warn_wrong_device)
             if (
                 origin.is_host()

@@ -96,6 +96,24 @@ def _lerp_scalar_decomp(
     return start + weight * (end - start)
 
 
+def _fixup_addmm_result_dtype(
+    result: torch.Tensor, target_dtype: torch.dtype
+) -> torch.Tensor:
+    # Rewrite this FX node's meta["val"] dtype in place. Helion's addmm
+    # lowering (aten_lowering.reduce_3d_dot) reads node.meta["val"].dtype
+    # to choose the tl.dot out_dtype, so a trailing .to() cast would leave
+    # the dot output truncated and the cast unable to recover precision.
+    fixed = result.new_empty(result.shape, dtype=target_dtype)
+    mode = proxy_tensor.get_proxy_mode()
+    if isinstance(mode, proxy_tensor.ProxyTorchDispatchMode):
+        tracer = mode.tracer
+        slot = proxy_tensor.get_proxy_slot(result, tracer, None)
+        if slot is not None:
+            slot.proxy.node.meta["val"] = fixed
+            proxy_tensor.set_proxy_slot(fixed, tracer, slot)
+    return fixed
+
+
 def _get_custom_decomp_table() -> dict[torch._ops.OpOverload, Callable[..., object]]:
     from ..language._gelu_tanh_approx import install_gelu_decomp
 
@@ -1672,7 +1690,17 @@ class WalkDeviceAST(NodeVisitor):
             func = self.visit(node.func)
 
         # pyrefly: ignore [bad-argument-type]
-        return _CheckForIndexCalls.retry_call(func, args, kwargs)
+        result = _CheckForIndexCalls.retry_call(func, args, kwargs)
+        # Pin addmm/baddbmm output dtype to `self`: see type_propagation.
+        if (
+            func in (torch.addmm, torch.baddbmm)
+            and isinstance(result, torch.Tensor)
+            and args
+            and isinstance(args[0], torch.Tensor)
+            and result.dtype != args[0].dtype
+        ):
+            result = _fixup_addmm_result_dtype(result, args[0].dtype)
+        return result
 
     def visit_Attribute(self, node: ast.Attribute) -> object:
         return getattr(self.visit(node.value), node.attr)
