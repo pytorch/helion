@@ -126,7 +126,8 @@ def _build_sched_pipeline_consumer_release_block(
 if TYPE_CHECKING:
     import sympy
 
-    from .device_function import CuteTcgen05MatmulPlan
+    from .cute.cute_mma import _Tcgen05SchedPipelinePlan
+    from .cute.device_state import CuteTcgen05MatmulPlan
     from .inductor_lowering import CodegenState
 
 NUM_SM_VAR = "_NUM_SM"
@@ -864,7 +865,7 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
 
     def _tcgen05_plan(self) -> CuteTcgen05MatmulPlan | None:
         try:
-            return DeviceFunction.current().cute_tcgen05_matmul_plan
+            return DeviceFunction.current().cute_state.matmul_plan
         except NoCurrentFunction:
             # Unit tests exercise builder helpers without entering a
             # DeviceFunction; in that context the tcgen05 plan-dependent
@@ -948,9 +949,9 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         plan = self._tcgen05_plan()
         return plan is not None and plan.has_scheduler_warp
 
-    def _tcgen05_sched_pipeline_plan(self) -> object | None:
+    def _tcgen05_sched_pipeline_plan(self) -> _Tcgen05SchedPipelinePlan | None:
         try:
-            return DeviceFunction.current().cute_tcgen05_sched_pipeline_plan
+            return DeviceFunction.current().cute_state.sched_pipeline_plan
         except NoCurrentFunction:
             return None
 
@@ -1282,7 +1283,7 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         """Split the device-function prefix into hoisted setup vs per-tile body.
 
         Codegen has explicitly tagged the per-tile statements via
-        ``register_cute_tcgen05_per_tile_stmts``. Everything else can be
+        ``cute_state.register_tcgen05_per_tile_stmts``. Everything else can be
         hoisted out of the work-tile loop. This matches Quack's pattern of
         building pipelines once per kernel and replaying state per tile.
 
@@ -1296,7 +1297,8 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         name is itself per-tile, and any names it assigns become per-tile
         too.
         """
-        if not device_function.has_cute_tcgen05_per_tile_marks:
+        cute_state = device_function.cute_state
+        if not cute_state.has_tcgen05_per_tile_marks:
             return [], body
 
         per_tile_names: set[str] = {self.virtual_pid_var}
@@ -1305,7 +1307,7 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         for stmt in body:
             reads, writes = _stmt_name_uses(stmt)
             is_per_tile = (
-                device_function.is_cute_tcgen05_per_tile(stmt)
+                cute_state.is_tcgen05_per_tile(stmt)
                 or bool(reads & per_tile_names)
                 or bool(writes & per_tile_names)
             )
@@ -1402,15 +1404,16 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         tma_load_predicate = self._tcgen05_tma_load_role_predicate()
         mma_exec_predicate = self._tcgen05_mma_exec_role_predicate()
         epi_predicate = self._tcgen05_epi_role_predicate()
+        cute_state = device_function.cute_state
         role_predicates_by_id: dict[int, str] = {}
-        for stmt_id in device_function.cute_tcgen05_tma_load_role_stmt_ids:
+        for stmt_id in cute_state.tcgen05_tma_load_role_stmt_ids:
             role_predicates_by_id[stmt_id] = tma_load_predicate
-        for stmt_id in device_function.cute_tcgen05_mma_exec_role_stmt_ids:
+        for stmt_id in cute_state.tcgen05_mma_exec_role_stmt_ids:
             assert stmt_id not in role_predicates_by_id, (
                 "tcgen05 role statement registered for multiple warp roles"
             )
             role_predicates_by_id[stmt_id] = mma_exec_predicate
-        for stmt_id in device_function.cute_tcgen05_epi_role_stmt_ids:
+        for stmt_id in cute_state.tcgen05_epi_role_stmt_ids:
             assert stmt_id not in role_predicates_by_id, (
                 "tcgen05 role statement registered for multiple warp roles"
             )
@@ -1546,18 +1549,19 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
 
         Returns ``(remaining, post_loop)`` preserving relative order.
 
-        Statements registered via ``register_cute_tcgen05_post_loop_stmts``
+        Statements registered via ``cute_state.register_tcgen05_post_loop_stmts``
         belong after the persistent work-tile loop (one-shot drains:
         ``producer_tail``, TMEM dealloc, allocator setup). Without this
         extraction they would execute every tile, which wastes work and
         can corrupt pipeline state.
         """
-        if not device_function.has_cute_tcgen05_post_loop_marks:
+        cute_state = device_function.cute_state
+        if not cute_state.has_tcgen05_post_loop_marks:
             return body, []
         remaining: list[ast.stmt] = []
         post_loop: list[ast.stmt] = []
         for stmt in body:
-            if device_function.is_cute_tcgen05_post_loop(stmt):
+            if cute_state.is_tcgen05_post_loop(stmt):
                 post_loop.append(stmt)
             else:
                 remaining.append(stmt)
@@ -2364,9 +2368,9 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         tile_counter_var = None
         if (
             role_block.role_predicate == self._tcgen05_epi_role_predicate()
-            and device_function.cute_tcgen05_epi_role_tile_counter_var is not None
+            and device_function.cute_state.epi_role_tile_counter_var is not None
         ):
-            tile_counter_var = device_function.cute_tcgen05_epi_role_tile_counter_var
+            tile_counter_var = device_function.cute_state.epi_role_tile_counter_var
             prelude.append(
                 statement_from_string(f"{tile_counter_var} = cutlass.Int32(0)")
             )
@@ -2449,20 +2453,16 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         sched_pipeline_plan = self._tcgen05_sched_pipeline_plan()
         assert sched_pipeline_plan is not None, (
             "ROLE_LOCAL_WITH_SCHEDULER requires a registered "
-            "sched_pipeline plan; was register_cute_tcgen05_sched_pipeline_plan "
+            "sched_pipeline plan; was cute_state.register_tcgen05_sched_pipeline_plan "
             "called by _codegen_cute_mma?"
         )
 
         plan = self._tcgen05_plan()
         assert plan is not None and plan.has_scheduler_warp
 
-        # Local handles for sched_pipeline variable names. The
-        # ``object`` type here is the
-        # ``cute_mma._Tcgen05SchedPipelinePlan`` dataclass — we
-        # access fields by name without importing the type to
-        # avoid a cycle.
-        sched_pipeline = sched_pipeline_plan.pipeline  # type: ignore[attr-defined]
-        sched_consumer_state = sched_pipeline_plan.consumer_state  # type: ignore[attr-defined]
+        # Local handles for sched_pipeline variable names.
+        sched_pipeline = sched_pipeline_plan.pipeline
+        sched_consumer_state = sched_pipeline_plan.consumer_state
         # Per-role variable for the linearized virtual pid read out
         # of the SMEM mailbox each iteration.
         valid_var = device_function.new_var(f"{scheduler_var_prefix}_valid")
@@ -2478,9 +2478,9 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         tile_counter_var = None
         if (
             role_block.role_predicate == self._tcgen05_epi_role_predicate()
-            and device_function.cute_tcgen05_epi_role_tile_counter_var is not None
+            and device_function.cute_state.epi_role_tile_counter_var is not None
         ):
-            tile_counter_var = device_function.cute_tcgen05_epi_role_tile_counter_var
+            tile_counter_var = device_function.cute_state.epi_role_tile_counter_var
             prelude.append(
                 statement_from_string(f"{tile_counter_var} = cutlass.Int32(0)")
             )
@@ -2593,8 +2593,8 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             )
         sched_plan = self._tcgen05_sched_pipeline_plan()
         assert sched_plan is not None
-        sched_pipeline = sched_plan.pipeline  # type: ignore[attr-defined]
-        sched_producer_state = sched_plan.producer_state  # type: ignore[attr-defined]
+        sched_pipeline = sched_plan.pipeline
+        sched_producer_state = sched_plan.producer_state
 
         sched_params_var = device_function.new_var(
             "tcgen05_scheduler_warp_tile_sched_params"
@@ -2775,11 +2775,11 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         assert plan is not None and plan.has_scheduler_warp and plan.is_clc_persistent
         sched_plan = self._tcgen05_sched_pipeline_plan()
         assert sched_plan is not None
-        sched_pipeline = sched_plan.pipeline  # type: ignore[attr-defined]
-        sched_producer_state = sched_plan.producer_state  # type: ignore[attr-defined]
-        clc_response_smem_ptr = sched_plan.clc_response_smem_ptr  # type: ignore[attr-defined]
-        clc_mbar_smem_ptr = sched_plan.clc_mbar_smem_ptr  # type: ignore[attr-defined]
-        clc_mbar_phase = sched_plan.clc_mbar_phase  # type: ignore[attr-defined]
+        sched_pipeline = sched_plan.pipeline
+        sched_producer_state = sched_plan.producer_state
+        clc_response_smem_ptr = sched_plan.clc_response_smem_ptr
+        clc_mbar_smem_ptr = sched_plan.clc_mbar_smem_ptr
+        clc_mbar_phase = sched_plan.clc_mbar_phase
         assert clc_response_smem_ptr and clc_mbar_smem_ptr and clc_mbar_phase, (
             "CLC scheduler-warp body requires sched plan SMEM/mbarrier "
             "names; was _new_tcgen05_sched_pipeline_plan called with "
@@ -3304,13 +3304,11 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         sched_pipeline_plan = self._tcgen05_sched_pipeline_plan()
         assert sched_pipeline_plan is not None, (
             "C-input role-local while requires a registered "
-            "sched_pipeline plan; was register_cute_tcgen05_sched_pipeline_plan "
+            "sched_pipeline plan; was cute_state.register_tcgen05_sched_pipeline_plan "
             "called by _codegen_cute_mma?"
         )
-        sched_pipeline = sched_pipeline_plan.pipeline  # type: ignore[attr-defined]
-        sched_consumer_state = (
-            sched_pipeline_plan.consumer_state  # type: ignore[attr-defined]
-        )
+        sched_pipeline = sched_pipeline_plan.pipeline
+        sched_consumer_state = sched_pipeline_plan.consumer_state
         # Aux pipeline plan: the matmul-plan gate that admits this
         # builder also fires the pipeline allocation in
         # ``cute_mma._codegen_cute_mma``, so a non-None plan is
@@ -3319,13 +3317,13 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         # ``has_c_input_warp + aux_tensor_descriptors`` and the
         # cute_mma allocator rather than producing a half-allocated
         # kernel.
-        aux_pipeline_plan = device_function.cute_tcgen05_aux_pipeline_plan
+        aux_pipeline_plan = device_function.cute_state.aux_pipeline_plan
         assert aux_pipeline_plan is not None, (
             "C-input role-local while requires a registered "
-            "aux pipeline plan; was register_cute_tcgen05_aux_pipeline_plan "
+            "aux pipeline plan; was cute_state.register_tcgen05_aux_pipeline_plan "
             "called by _codegen_cute_mma?"
         )
-        assert len(aux_pipeline_plan.rings) == len(plan.aux_tensor_descriptors), (  # type: ignore[attr-defined]
+        assert len(aux_pipeline_plan.rings) == len(plan.aux_tensor_descriptors), (
             "C-input role-local while: aux pipeline plan must have one "
             "ring per matmul-plan aux descriptor"
         )
@@ -3526,12 +3524,10 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         # Pull aux pipeline names from the plan. The plan is the
         # ``_Tcgen05AuxPipelinePlan`` dataclass; access by name
         # without importing the type to avoid a module cycle.
-        aux_pipeline_name = aux_pipeline_plan.pipeline  # type: ignore[attr-defined]
-        aux_producer_state_name = (
-            aux_pipeline_plan.producer_state  # type: ignore[attr-defined]
-        )
-        aux_rings = aux_pipeline_plan.rings  # type: ignore[attr-defined]
-        aux_epi_tile_var = aux_pipeline_plan.epi_tile_var  # type: ignore[attr-defined]
+        aux_pipeline_name = aux_pipeline_plan.pipeline
+        aux_producer_state_name = aux_pipeline_plan.producer_state
+        aux_rings = aux_pipeline_plan.rings
+        aux_epi_tile_var = aux_pipeline_plan.epi_tile_var
 
         env_backend = CompileEnvironment.current().backend
 

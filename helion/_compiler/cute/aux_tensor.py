@@ -222,7 +222,7 @@ def discover_tcgen05_aux_tensor_descriptors(
     enumeration of stores, which is trivial across the live graphs.
 
     The matmul fx_node *must* be registered in
-    ``DeviceFunction.cute_tcgen05_matmul_fx_nodes`` before the
+    ``DeviceFunction.cute_state.matmul_fx_nodes`` before the
     walker is called — the analyzer's carrier walker
     (:func:`walk_carrier_to_tcgen05_matmul`) reads that set to know
     where to stop. The MMA-codegen call site registers the fx_node
@@ -251,7 +251,7 @@ def discover_tcgen05_aux_tensor_descriptors(
     ``_AuxStepRecord``-per-aux-step indexing in
     ``memory_ops._codegen_cute_store_tcgen05_tile``).
     """
-    if matmul_fx_node not in cg.device_function.cute_tcgen05_matmul_fx_nodes:
+    if matmul_fx_node not in cg.device_function.cute_state.matmul_fx_nodes:
         return ()
 
     # Local import for ``CodegenState``: the natural top-level
@@ -310,7 +310,7 @@ def host_function_has_tcgen05_aux_kernel_pattern(
     build, pre-autotune-sample) where the
     :func:`discover_tcgen05_aux_tensor_descriptors` walker is
     unavailable — that walker requires a populated
-    ``DeviceFunction.cute_tcgen05_matmul_fx_nodes`` set, which
+    ``DeviceFunction.cute_state.matmul_fx_nodes`` set, which
     is only registered at MMA-codegen time per config sample.
     The aux pipeline only fires when the productive-body gate
     sees aux descriptors, so the autotune surface only needs

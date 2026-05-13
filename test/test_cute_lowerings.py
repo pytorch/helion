@@ -69,6 +69,7 @@ from helion._compiler.cute.cute_mma import can_codegen_cute_mma_aten
 from helion._compiler.cute.cute_reshape import _get_dim_local_coord
 from helion._compiler.cute.cute_reshape import codegen_cute_permute
 from helion._compiler.cute.cute_reshape import codegen_cute_reshape
+from helion._compiler.cute.device_state import CuteDeviceFunctionState
 from helion._compiler.cute.indexing import CutePackedAffineLoad
 from helion._compiler.cute.indexing import CutePackedTerms
 from helion._compiler.cute.indexing import CuteShapeChainView
@@ -1898,7 +1899,7 @@ class TestCuteLowerings(unittest.TestCase):
 
         from helion._compiler.cute import cute_mma as cute_mma_module
         from helion._compiler.cute import strategies as strategies_module
-        from helion._compiler.device_function import (
+        from helion._compiler.cute.device_state import (
             CuteTcgen05MatmulPlan as _CuteTcgen05MatmulPlan,
         )
 
@@ -7581,7 +7582,7 @@ class TestCuteLowerings(unittest.TestCase):
     def test_tcgen05_codegen_registers_post_loop_cleanup(self) -> None:
         """``_codegen_cute_store_tcgen05_tile`` returns a list whose tail
         is the one-shot cleanup (TMA / acc producer_tail, TMEM allocator
-        setup + free) tagged via ``register_cute_tcgen05_post_loop_stmts``.
+        setup + free) tagged via ``cute_state.register_tcgen05_post_loop_stmts``.
 
         This is what lets the persistent splitter pull those statements
         out of the work-tile loop. Without the registration the
@@ -10801,7 +10802,7 @@ class TestCuteTcgen05AuxTensorWalker(unittest.TestCase):
         from helion._compiler.cute.aux_tensor import (
             _store_value_pairs as _aux_store_value_pairs,
         )
-        from helion._compiler.device_function import (
+        from helion._compiler.cute.device_state import (
             CuteTcgen05MatmulPlan as _CuteTcgen05MatmulPlan,
         )
 
@@ -11062,7 +11063,7 @@ class TestCuteTcgen05AuxTensorWalker(unittest.TestCase):
         Two matmuls with identical collective parameters (cluster
         shape, stages, warp roles, etc.) but distinct downstream
         aux tensors would otherwise be rejected by
-        ``register_cute_tcgen05_matmul_plan``'s
+        ``cute_state.register_tcgen05_matmul_plan``'s
         "mixed tcgen05 matmul collective plans" guard. The
         ``Tcgen05AuxTensorDescriptor`` dataclass also embeds a
         ``torch.Tensor`` field whose ``==`` returns a non-scalar
@@ -11078,7 +11079,7 @@ class TestCuteTcgen05AuxTensorWalker(unittest.TestCase):
         makes the assertion hold.
         """
         from helion._compiler.cute.aux_tensor import Tcgen05AuxTensorDescriptor
-        from helion._compiler.device_function import (
+        from helion._compiler.cute.device_state import (
             CuteTcgen05MatmulPlan as _CuteTcgen05MatmulPlan,
         )
 
@@ -11145,7 +11146,7 @@ class TestCuteTcgen05AuxTensorWalker(unittest.TestCase):
         a kernel with two matmuls that share collective parameters
         but reference different aux tensors must register both
         plans without tripping the "mixed tcgen05 matmul collective
-        plans" guard in ``register_cute_tcgen05_matmul_plan``.
+        plans" guard in ``cute_state.register_tcgen05_matmul_plan``.
 
         Hits the registration site directly with two real
         ``CuteTcgen05MatmulPlan`` instances rather than a
@@ -11159,14 +11160,14 @@ class TestCuteTcgen05AuxTensorWalker(unittest.TestCase):
         here.
         """
         from helion._compiler.cute.aux_tensor import Tcgen05AuxTensorDescriptor
-        from helion._compiler.device_function import DeviceFunction
+        from helion._compiler.cute.device_state import (
+            CuteTcgen05MatmulPlan as _CuteTcgen05MatmulPlan,
+        )
 
-        # Real ``DeviceFunction`` registration site. The two
-        # plans below share every collective parameter and differ
-        # only in their aux-tensor descriptors; the registration
+        # Real CuTe state registration site. The two plans below share every
+        # collective parameter and differ only in their aux descriptors; the
         # guard must accept the second plan as compatible.
-        df = DeviceFunction.__new__(DeviceFunction)
-        df.cute_tcgen05_matmul_plan = None
+        cute_state = CuteDeviceFunctionState()
         base_kwargs = {
             "bm": 256,
             "bn": 256,
@@ -11204,24 +11205,20 @@ class TestCuteTcgen05AuxTensorWalker(unittest.TestCase):
             broadcast_axis=1,
             store_value_node=ph_store_b,
         )
-        from helion._compiler.device_function import (
-            CuteTcgen05MatmulPlan as _CuteTcgen05MatmulPlan,
-        )
-
         plan_a = _CuteTcgen05MatmulPlan(
             **base_kwargs, aux_tensor_descriptors=(descriptor_a,)
         )
         plan_b = _CuteTcgen05MatmulPlan(
             **base_kwargs, aux_tensor_descriptors=(descriptor_b,)
         )
-        df.register_cute_tcgen05_matmul_plan(plan_a)
+        cute_state.register_tcgen05_matmul_plan(plan_a)
         # Must not raise: the second matmul's distinct aux tensor
         # is per-anchor data, not a collective-plan difference.
-        df.register_cute_tcgen05_matmul_plan(plan_b)
+        cute_state.register_tcgen05_matmul_plan(plan_b)
         # The registered plan is the first one (the guard is
         # idempotent on equal plans), confirming the field is
         # excluded from equality.
-        self.assertIs(df.cute_tcgen05_matmul_plan, plan_a)
+        self.assertIs(cute_state.matmul_plan, plan_a)
 
 
 @onlyBackends(["cute"])
@@ -12821,7 +12818,7 @@ class TestPersistentLoopSplitter(unittest.TestCase):
     role-block partitioner on ``Tcgen05PersistentProgramIDs``.
 
     Codegen tags every statement that depends on per-tile coordinates via
-    ``register_cute_tcgen05_per_tile_stmts``. The splitter then hoists the
+    ``cute_state.register_tcgen05_per_tile_stmts``. The splitter then hoists the
     rest. Statements that read or write a per-tile name (transitively
     seeded from ``virtual_pid_var``) are also kept in the wrapped body, so
     the PID decomposition emitted by ``_decompose_virtual_pid`` doesn't
@@ -12837,99 +12834,16 @@ class TestPersistentLoopSplitter(unittest.TestCase):
     def _make_helper(self) -> tuple[object, object]:
         """Construct a real splitter and a minimal device-function stand-in.
 
-        The splitter only needs the predicate methods from device function
-        (``has_cute_tcgen05_per_tile_marks``, ``is_cute_tcgen05_per_tile``,
-        and the post-loop equivalents). ``Tcgen05PersistentProgramIDs`` is
-        a concrete subclass of ``ProgramIDs`` with the splitter; instantiate
-        it without ``__init__`` to skip the device-function plumbing."""
+        The splitter only needs ``device_function.cute_state``.
+        ``Tcgen05PersistentProgramIDs`` is a concrete subclass of
+        ``ProgramIDs`` with the splitter; instantiate it without ``__init__``
+        to skip the device-function plumbing."""
 
         from helion._compiler.program_id import Tcgen05PersistentProgramIDs
 
         class _MinimalDeviceFunction:
             def __init__(self) -> None:
-                self._per_tile_ids: set[int] = set()
-                self._post_loop_ids: set[int] = set()
-                self._tma_load_role_ids: set[int] = set()
-                self._mma_exec_role_ids: set[int] = set()
-                self._epi_role_ids: set[int] = set()
-                self.cute_tcgen05_epi_role_tile_counter_var: str | None = None
-
-            def register_cute_tcgen05_per_tile_stmts(
-                self, stmts: list[ast.AST]
-            ) -> None:
-                self._per_tile_ids.update(id(s) for s in stmts)
-
-            def is_cute_tcgen05_per_tile(self, stmt: ast.AST) -> bool:
-                return id(stmt) in self._per_tile_ids
-
-            @property
-            def has_cute_tcgen05_per_tile_marks(self) -> bool:
-                return bool(self._per_tile_ids)
-
-            def register_cute_tcgen05_post_loop_stmts(
-                self, stmts: list[ast.AST]
-            ) -> None:
-                self._post_loop_ids.update(id(s) for s in stmts)
-
-            def is_cute_tcgen05_post_loop(self, stmt: ast.AST) -> bool:
-                return id(stmt) in self._post_loop_ids
-
-            @property
-            def has_cute_tcgen05_post_loop_marks(self) -> bool:
-                return bool(self._post_loop_ids)
-
-            def register_cute_tcgen05_tma_load_role_stmts(
-                self, stmts: list[ast.AST]
-            ) -> None:
-                # The real ``DeviceFunction`` accepts both top-level
-                # tagged statements (which must also be per-tile-registered)
-                # and tagged children inside a per-tile container (e.g.
-                # the K-loop body). The unit suite mirrors that: tag any
-                # statement, whether or not it's per-tile-registered.
-                self._tma_load_role_ids.update(id(s) for s in stmts)
-
-            def is_cute_tcgen05_tma_load_role(self, stmt: ast.AST) -> bool:
-                return id(stmt) in self._tma_load_role_ids
-
-            @property
-            def has_cute_tcgen05_tma_load_role_marks(self) -> bool:
-                return bool(self._tma_load_role_ids)
-
-            @property
-            def cute_tcgen05_tma_load_role_stmt_ids(self) -> frozenset[int]:
-                return frozenset(self._tma_load_role_ids)
-
-            def register_cute_tcgen05_mma_exec_role_stmts(
-                self, stmts: list[ast.AST]
-            ) -> None:
-                self._mma_exec_role_ids.update(id(s) for s in stmts)
-
-            def is_cute_tcgen05_mma_exec_role(self, stmt: ast.AST) -> bool:
-                return id(stmt) in self._mma_exec_role_ids
-
-            @property
-            def has_cute_tcgen05_mma_exec_role_marks(self) -> bool:
-                return bool(self._mma_exec_role_ids)
-
-            @property
-            def cute_tcgen05_mma_exec_role_stmt_ids(self) -> frozenset[int]:
-                return frozenset(self._mma_exec_role_ids)
-
-            def register_cute_tcgen05_epi_role_stmts(
-                self, stmts: list[ast.AST]
-            ) -> None:
-                self._epi_role_ids.update(id(s) for s in stmts)
-
-            def is_cute_tcgen05_epi_role(self, stmt: ast.AST) -> bool:
-                return id(stmt) in self._epi_role_ids
-
-            @property
-            def has_cute_tcgen05_epi_role_marks(self) -> bool:
-                return bool(self._epi_role_ids)
-
-            @property
-            def cute_tcgen05_epi_role_stmt_ids(self) -> frozenset[int]:
-                return frozenset(self._epi_role_ids)
+                self.cute_state = CuteDeviceFunctionState()
 
         splitter = Tcgen05PersistentProgramIDs.__new__(Tcgen05PersistentProgramIDs)
         # The splitter walks ASTs looking for references to the
@@ -12938,7 +12852,7 @@ class TestPersistentLoopSplitter(unittest.TestCase):
         splitter.virtual_pid_var = "__test_virtual_pid__"  # type: ignore[attr-defined]
         # ``_collect_tcgen05_role_blocks`` calls
         # ``_tcgen05_tma_load_role_predicate`` which would normally hit
-        # ``DeviceFunction.current().cute_tcgen05_matmul_plan``. Replace
+        # ``DeviceFunction.current().cute_state.matmul_plan``. Replace
         # with a sentinel string the tests can match against, so this
         # unit suite stays decoupled from the real DeviceFunction stack.
         splitter._tcgen05_tma_load_role_predicate = (  # type: ignore[attr-defined]
@@ -12959,7 +12873,7 @@ class TestPersistentLoopSplitter(unittest.TestCase):
         """Build a richer device-function stub plus per-pid stubs that
         the role-local-while builders need (``new_var`` for variable
         allocation, ``num_pids_expr`` for scheduler tile counts, and
-        the per-tile / TMA-load registration methods used by
+        the per-tile / TMA-load state registrations used by
         ``_partition_tcgen05_role_blocks``).
 
         Returns ``(stub_device_function, splitter)``. The splitter is
@@ -12969,75 +12883,11 @@ class TestPersistentLoopSplitter(unittest.TestCase):
         class _StubDeviceFunction:
             def __init__(self) -> None:
                 self._counter = 0
-                self._per_tile_ids: set[int] = set()
-                self._tma_load_role_ids: set[int] = set()
-                self._mma_exec_role_ids: set[int] = set()
-                self._epi_role_ids: set[int] = set()
-                self.cute_tcgen05_epi_role_tile_counter_var: str | None = None
+                self.cute_state = CuteDeviceFunctionState()
 
             def new_var(self, name: str) -> str:
                 self._counter += 1
                 return f"{name}__{self._counter}"
-
-            def register_cute_tcgen05_per_tile_stmts(
-                self, stmts: list[ast.AST]
-            ) -> None:
-                self._per_tile_ids.update(id(s) for s in stmts)
-
-            def is_cute_tcgen05_per_tile(self, stmt: ast.AST) -> bool:
-                return id(stmt) in self._per_tile_ids
-
-            @property
-            def has_cute_tcgen05_per_tile_marks(self) -> bool:
-                return bool(self._per_tile_ids)
-
-            def register_cute_tcgen05_tma_load_role_stmts(
-                self, stmts: list[ast.AST]
-            ) -> None:
-                self._tma_load_role_ids.update(id(s) for s in stmts)
-
-            def is_cute_tcgen05_tma_load_role(self, stmt: ast.AST) -> bool:
-                return id(stmt) in self._tma_load_role_ids
-
-            @property
-            def has_cute_tcgen05_tma_load_role_marks(self) -> bool:
-                return bool(self._tma_load_role_ids)
-
-            @property
-            def cute_tcgen05_tma_load_role_stmt_ids(self) -> frozenset[int]:
-                return frozenset(self._tma_load_role_ids)
-
-            def register_cute_tcgen05_mma_exec_role_stmts(
-                self, stmts: list[ast.AST]
-            ) -> None:
-                self._mma_exec_role_ids.update(id(s) for s in stmts)
-
-            def is_cute_tcgen05_mma_exec_role(self, stmt: ast.AST) -> bool:
-                return id(stmt) in self._mma_exec_role_ids
-
-            @property
-            def has_cute_tcgen05_mma_exec_role_marks(self) -> bool:
-                return bool(self._mma_exec_role_ids)
-
-            @property
-            def cute_tcgen05_mma_exec_role_stmt_ids(self) -> frozenset[int]:
-                return frozenset(self._mma_exec_role_ids)
-
-            def register_cute_tcgen05_epi_role_stmts(
-                self, stmts: list[ast.AST]
-            ) -> None:
-                self._epi_role_ids.update(id(s) for s in stmts)
-
-            def is_cute_tcgen05_epi_role(self, stmt: ast.AST) -> bool:
-                return id(stmt) in self._epi_role_ids
-
-            @property
-            def has_cute_tcgen05_epi_role_marks(self) -> bool:
-                return bool(self._epi_role_ids)
-
-            @property
-            def cute_tcgen05_epi_role_stmt_ids(self) -> frozenset[int]:
-                return frozenset(self._epi_role_ids)
 
         class _PidStub:
             def num_pids_expr(self, *, is_device: bool) -> str:
@@ -13171,7 +13021,7 @@ class TestPersistentLoopSplitter(unittest.TestCase):
         per_tile_a = self._stmt("gA = cute.local_tile(tA, (128, 16), (m // 128, None))")
         per_tile_b = self._stmt("acc_pipeline.producer_acquire(state)")
         body = [invariant_a, invariant_b, per_tile_a, per_tile_b]
-        df.register_cute_tcgen05_per_tile_stmts([per_tile_a, per_tile_b])
+        df.cute_state.register_tcgen05_per_tile_stmts([per_tile_a, per_tile_b])
         hoisted, wrapped = splitter._split_tcgen05_invariant_setup(df, body)
         self.assertEqual(hoisted, [invariant_a, invariant_b])
         self.assertEqual(wrapped, [per_tile_a, per_tile_b])
@@ -13186,7 +13036,7 @@ class TestPersistentLoopSplitter(unittest.TestCase):
         a = self._stmt("a = 1")
         per_tile = self._stmt("g = local_tile(t, (128, 16), (m, None))")
         b = self._stmt("b = 2")
-        df.register_cute_tcgen05_per_tile_stmts([per_tile])
+        df.cute_state.register_tcgen05_per_tile_stmts([per_tile])
         hoisted, wrapped = splitter._split_tcgen05_invariant_setup(df, [a, per_tile, b])
         self.assertEqual(hoisted, [a, b])
         self.assertEqual(wrapped, [per_tile])
@@ -13213,8 +13063,8 @@ class TestPersistentLoopSplitter(unittest.TestCase):
         per_tile = self._stmt("g = local_tile(t, (128, 16), (m, None))")
         post_a = self._stmt("acc_pipeline.producer_tail(state)")
         post_b = self._stmt("tmem_alloc.free(ptr)")
-        df.register_cute_tcgen05_per_tile_stmts([per_tile])
-        df.register_cute_tcgen05_post_loop_stmts([post_a, post_b])
+        df.cute_state.register_tcgen05_per_tile_stmts([per_tile])
+        df.cute_state.register_tcgen05_post_loop_stmts([post_a, post_b])
         body = [per_tile, post_a, post_b]
         remaining, post_loop = splitter._extract_tcgen05_post_loop_stmts(df, body)
         self.assertEqual(remaining, [per_tile])
@@ -13242,7 +13092,7 @@ class TestPersistentLoopSplitter(unittest.TestCase):
         b = self._stmt("b = 2")
         post_b = self._stmt("tmem_alloc.free(ptr)")
         c = self._stmt("c = 3")
-        df.register_cute_tcgen05_post_loop_stmts([post_a, post_b])
+        df.cute_state.register_tcgen05_post_loop_stmts([post_a, post_b])
         body = [a, post_a, b, post_b, c]
         remaining, post_loop = splitter._extract_tcgen05_post_loop_stmts(df, body)
         self.assertEqual(remaining, [a, b, c])
@@ -13275,8 +13125,10 @@ class TestPersistentLoopSplitter(unittest.TestCase):
         tma_load_y = self._stmt("cute.copy(t, s)")
         shared_b = self._stmt("b = 2")
         tma_load_z = self._stmt("tma_pipeline.producer_commit(s)")
-        df.register_cute_tcgen05_per_tile_stmts([tma_load_x, tma_load_y, tma_load_z])
-        df.register_cute_tcgen05_tma_load_role_stmts(
+        df.cute_state.register_tcgen05_per_tile_stmts(
+            [tma_load_x, tma_load_y, tma_load_z]
+        )
+        df.cute_state.register_tcgen05_tma_load_role_stmts(
             [tma_load_x, tma_load_y, tma_load_z]
         )
         body = [shared_a, tma_load_x, tma_load_y, shared_b, tma_load_z]
@@ -13301,10 +13153,10 @@ class TestPersistentLoopSplitter(unittest.TestCase):
         tma_load = self._stmt("tma_pipeline.producer_acquire(s)")
         mma_exec = self._stmt("acc_pipeline.producer_acquire(s)")
         epi = self._stmt("acc_pipeline.consumer_wait(s)")
-        df.register_cute_tcgen05_per_tile_stmts([tma_load, mma_exec, epi])
-        df.register_cute_tcgen05_tma_load_role_stmts([tma_load])
-        df.register_cute_tcgen05_mma_exec_role_stmts([mma_exec])
-        df.register_cute_tcgen05_epi_role_stmts([epi])
+        df.cute_state.register_tcgen05_per_tile_stmts([tma_load, mma_exec, epi])
+        df.cute_state.register_tcgen05_tma_load_role_stmts([tma_load])
+        df.cute_state.register_tcgen05_mma_exec_role_stmts([mma_exec])
+        df.cute_state.register_tcgen05_epi_role_stmts([epi])
 
         blocks = splitter._collect_tcgen05_role_blocks(
             df, [shared, tma_load, mma_exec, epi]
@@ -13333,8 +13185,8 @@ class TestPersistentLoopSplitter(unittest.TestCase):
         splitter, df = self._make_helper()
         define_bool = self._stmt("ready = True")
         prefetch = self._stmt("if ready and tma_warp:\n    tma_pipeline.acquire()")
-        df.register_cute_tcgen05_per_tile_stmts([prefetch])
-        df.register_cute_tcgen05_tma_load_role_stmts([prefetch])
+        df.cute_state.register_tcgen05_per_tile_stmts([prefetch])
+        df.cute_state.register_tcgen05_tma_load_role_stmts([prefetch])
         body = [define_bool, prefetch]
         blocks = splitter._collect_tcgen05_role_blocks(df, body)
         # define_bool must appear in the FIRST emitted block; prefetch in
@@ -13402,7 +13254,7 @@ class TestPersistentLoopSplitter(unittest.TestCase):
         # Tag only the producer; the consumer stays shared inside the
         # loop body. The K-loop itself is not tagged -- it's a shared
         # statement that contains a tagged child.
-        df.register_cute_tcgen05_tma_load_role_stmts([producer])
+        df.cute_state.register_tcgen05_tma_load_role_stmts([producer])
         body = [kloop]
         blocks = splitter._collect_tcgen05_role_blocks(df, body)
         # Single shared block carrying the (mutated) K-loop.
@@ -13427,7 +13279,7 @@ class TestPersistentLoopSplitter(unittest.TestCase):
         producer = self._stmt("tma_pipeline.producer_acquire(state)")
         wloop = ast.parse("while True:\n    pass").body[0]
         wloop.body = [producer]
-        df.register_cute_tcgen05_tma_load_role_stmts([producer])
+        df.cute_state.register_tcgen05_tma_load_role_stmts([producer])
         body = [wloop]
         blocks = splitter._collect_tcgen05_role_blocks(df, body)
         self.assertEqual(len(blocks), 1)
@@ -13451,7 +13303,7 @@ class TestPersistentLoopSplitter(unittest.TestCase):
         inner = self._stmt("tma_pipeline.producer_acquire(state)")
         outer_if = self._stmt("if some_predicate:\n    pass")
         outer_if.body = [inner]
-        df.register_cute_tcgen05_tma_load_role_stmts([inner])
+        df.cute_state.register_tcgen05_tma_load_role_stmts([inner])
         body = [outer_if]
         with self.assertRaises(AssertionError):
             splitter._collect_tcgen05_role_blocks(df, body)
@@ -13467,7 +13319,7 @@ class TestPersistentLoopSplitter(unittest.TestCase):
         splitter, df = self._make_helper()
         # Pretend cute_mma marked just one statement explicitly per-tile.
         marked = self._stmt("g = cute.local_tile(t, (128, 16), (m, None))")
-        df.register_cute_tcgen05_per_tile_stmts([marked])
+        df.cute_state.register_tcgen05_per_tile_stmts([marked])
 
         # Statements that use virtual_pid_var should fall on the
         # wrapped side; downstream statements that consume their
@@ -13528,8 +13380,8 @@ class TestPersistentLoopSplitter(unittest.TestCase):
         shared_b = self._stmt("b = 2")
         tma_load_y = self._stmt("cute.copy(t, s)")
         shared_c = self._stmt("c = 3")
-        df.register_cute_tcgen05_per_tile_stmts([tma_load_x, tma_load_y])
-        df.register_cute_tcgen05_tma_load_role_stmts([tma_load_x, tma_load_y])
+        df.cute_state.register_tcgen05_per_tile_stmts([tma_load_x, tma_load_y])
+        df.cute_state.register_tcgen05_tma_load_role_stmts([tma_load_x, tma_load_y])
         body = [shared_a, tma_load_x, shared_b, tma_load_y, shared_c]
         partition = splitter._partition_tcgen05_role_blocks(df, body)
         # Inline view: shared_a / tma_load_x / shared_b / tma_load_y /
@@ -13577,8 +13429,8 @@ class TestPersistentLoopSplitter(unittest.TestCase):
         splitter, df = self._make_helper()
         tma_load_x = self._stmt("tma_pipeline.producer_acquire(s)")
         shared_a = self._stmt("a = 1")
-        df.register_cute_tcgen05_per_tile_stmts([tma_load_x])
-        df.register_cute_tcgen05_tma_load_role_stmts([tma_load_x])
+        df.cute_state.register_tcgen05_per_tile_stmts([tma_load_x])
+        df.cute_state.register_tcgen05_tma_load_role_stmts([tma_load_x])
         body = [tma_load_x, shared_a]
         partition = splitter._partition_tcgen05_role_blocks(df, body)
         # Mutate the extracted view's stmts list and confirm the
@@ -13626,7 +13478,7 @@ class TestPersistentLoopSplitter(unittest.TestCase):
         )
         kloop = ast.parse("for k in range(K):\n    pass").body[0]
         kloop.body = [producer]
-        df.register_cute_tcgen05_tma_load_role_stmts([producer])
+        df.cute_state.register_tcgen05_tma_load_role_stmts([producer])
         body = [kloop]
         partition = splitter._partition_tcgen05_role_blocks(df, body)
         # No top-level tagged stmts -> no extracted role blocks.
@@ -13763,8 +13615,8 @@ class TestPersistentLoopSplitter(unittest.TestCase):
             "gA = cute.local_tile(tensor_a, (128, 16), (offset_0, None))"
         )
         body = [pid_0, pid_1, offset_0, offset_1, unrelated, tma_load]
-        stub_df.register_cute_tcgen05_per_tile_stmts([tma_load])
-        stub_df.register_cute_tcgen05_tma_load_role_stmts([tma_load])
+        stub_df.cute_state.register_tcgen05_per_tile_stmts([tma_load])
+        stub_df.cute_state.register_tcgen05_tma_load_role_stmts([tma_load])
         partition = splitter._partition_tcgen05_role_blocks(stub_df, body)
 
         role_local_whiles, _ = splitter._build_tcgen05_persistent_tile_body_role_local(
@@ -13811,8 +13663,8 @@ class TestPersistentLoopSplitter(unittest.TestCase):
             "        tma_tile = offset_0"
         )
         body = [pid_0, offset_0, shared_kloop, producer_kloop]
-        stub_df.register_cute_tcgen05_per_tile_stmts([producer_kloop])
-        stub_df.register_cute_tcgen05_tma_load_role_stmts([producer_kloop])
+        stub_df.cute_state.register_tcgen05_per_tile_stmts([producer_kloop])
+        stub_df.cute_state.register_tcgen05_tma_load_role_stmts([producer_kloop])
         partition = splitter._partition_tcgen05_role_blocks(stub_df, body)
 
         role_local_whiles, _ = splitter._build_tcgen05_persistent_tile_body_role_local(
@@ -13936,8 +13788,8 @@ class TestPersistentLoopSplitter(unittest.TestCase):
         tma_load_x = self._stmt("tma_pipeline.producer_acquire(s)")
         shared_b = self._stmt("b = 2")
         body = [shared_a, shared_sync, tma_load_x, shared_b]
-        stub_df.register_cute_tcgen05_per_tile_stmts([tma_load_x])
-        stub_df.register_cute_tcgen05_tma_load_role_stmts([tma_load_x])
+        stub_df.cute_state.register_tcgen05_per_tile_stmts([tma_load_x])
+        stub_df.cute_state.register_tcgen05_tma_load_role_stmts([tma_load_x])
         partition = splitter._partition_tcgen05_role_blocks(stub_df, body)
         role_local_whiles, shared_tile_body = (
             splitter._build_tcgen05_persistent_tile_body_role_local(
@@ -13980,8 +13832,10 @@ class TestPersistentLoopSplitter(unittest.TestCase):
         tma_load_y = self._stmt("tma_pipeline.producer_acquire(s_y)")
         shared_c = self._stmt("c = 3")
         body = [shared_a, tma_load_x, shared_b, tma_load_y, shared_c]
-        stub_df.register_cute_tcgen05_per_tile_stmts([tma_load_x, tma_load_y])
-        stub_df.register_cute_tcgen05_tma_load_role_stmts([tma_load_x, tma_load_y])
+        stub_df.cute_state.register_tcgen05_per_tile_stmts([tma_load_x, tma_load_y])
+        stub_df.cute_state.register_tcgen05_tma_load_role_stmts(
+            [tma_load_x, tma_load_y]
+        )
         partition = splitter._partition_tcgen05_role_blocks(stub_df, body)
         # Sanity: partitioner produced two extracted blocks.
         self.assertEqual(len(partition.role_blocks_extracted), 2)
@@ -14013,10 +13867,10 @@ class TestPersistentLoopSplitter(unittest.TestCase):
         tma_load = self._stmt("tma_pipeline.producer_acquire(s_tma)")
         epi = self._stmt("acc_pipeline.consumer_wait(s_epi)")
         body = [epi, mma_exec, tma_load]
-        stub_df.register_cute_tcgen05_per_tile_stmts([epi, mma_exec, tma_load])
-        stub_df.register_cute_tcgen05_epi_role_stmts([epi])
-        stub_df.register_cute_tcgen05_mma_exec_role_stmts([mma_exec])
-        stub_df.register_cute_tcgen05_tma_load_role_stmts([tma_load])
+        stub_df.cute_state.register_tcgen05_per_tile_stmts([epi, mma_exec, tma_load])
+        stub_df.cute_state.register_tcgen05_epi_role_stmts([epi])
+        stub_df.cute_state.register_tcgen05_mma_exec_role_stmts([mma_exec])
+        stub_df.cute_state.register_tcgen05_tma_load_role_stmts([tma_load])
         partition = splitter._partition_tcgen05_role_blocks(stub_df, body)
 
         role_local_whiles, _ = splitter._build_tcgen05_persistent_tile_body_role_local(

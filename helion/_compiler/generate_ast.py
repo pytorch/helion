@@ -602,9 +602,8 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                         with self.set_statements(wrapped_body):
                             codegen_call_with_graph(self, root, [])
                         self.statements_stack[-1].extend(grid_state.outer_prefix)
-                        if self.device_function.suppress_cute_root_lane_loops:
+                        if self.device_function.cute_state.consume_root_lane_loop_suppression():
                             self.statements_stack[-1].extend(wrapped_body)
-                            self.device_function.suppress_cute_root_lane_loops = False
                         else:
                             self.statements_stack[-1].extend(
                                 grid_state.wrap_body(wrapped_body)
@@ -898,10 +897,10 @@ def generate_ast(
                     ),
                     *final_host_statements,
                 ]
-            if codegen.device_function.cute_cluster_shape is not None:
+            if codegen.device_function.cute_state.cluster_shape is not None:
                 final_host_statements = [
                     statement_from_string(
-                        f"{codegen.device_function.name}._helion_cute_cluster_shape = {codegen.device_function.cute_cluster_shape!r}"
+                        f"{codegen.device_function.name}._helion_cute_cluster_shape = {codegen.device_function.cute_state.cluster_shape!r}"
                     ),
                     *final_host_statements,
                 ]

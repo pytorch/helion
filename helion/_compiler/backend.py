@@ -2758,7 +2758,10 @@ class CuteBackend(Backend):
             except NoCurrentFunction:
                 pass
             else:
-                if df.get_cute_tcgen05_store_value(x.id) is not None:
+                if (
+                    df.cute_state.get_tcgen05_store_value(df.variable_aliases(x.id))
+                    is not None
+                ):
                     return x
         return super().cast_ast(x, target_dtype)
 
@@ -3296,7 +3299,7 @@ class CuteBackend(Backend):
             and root_static_threads <= MAX_THREADS_PER_BLOCK
         )
         tcgen05_compact_dims = (
-            device_function.cute_block_shape if specialized_root_tcgen05 else None
+            device_function.cute_state.block_shape if specialized_root_tcgen05 else None
         )
         if referenced_dims != (1, 1, 1):
             dims = referenced_dims

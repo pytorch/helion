@@ -1638,7 +1638,10 @@ def _codegen_cute_store_tcgen05_tile(
     if extra_mask is not None or tensor.ndim != 2:
         return None
 
-    tcgen05_value = state.device_function.get_cute_tcgen05_store_value(value_name)
+    df = state.device_function
+    tcgen05_value = df.cute_state.get_tcgen05_store_value(
+        df.variable_aliases(value_name)
+    )
     if tcgen05_value is None:
         return None
 
@@ -1657,7 +1660,6 @@ def _codegen_cute_store_tcgen05_tile(
         )
 
     backend = CompileEnvironment.current().backend
-    df = state.device_function
     tensor_name = df.tensor_arg(tensor).name
     target_dtype = backend.dtype_str(tensor.dtype)
     # The matmul plan computed `tcgen05_epi_tile` (role-local t2r
@@ -1838,8 +1840,8 @@ def _codegen_cute_store_tcgen05_tile(
     # subtile ``cute.copy(s2r, sC[..., stage], rmem)`` →
     # ``rmem.load()``). Gate-closed configs keep the historical
     # GMEM path byte-identical.
-    aux_matmul_plan = df.cute_tcgen05_matmul_plan
-    aux_pipeline_plan_obj = df.cute_tcgen05_aux_pipeline_plan
+    aux_matmul_plan = df.cute_state.matmul_plan
+    aux_pipeline_plan_obj = df.cute_state.aux_pipeline_plan
     # Match each store-side record to its descriptor by
     # ``load_node`` FX-node identity rather than positional
     # index. The descriptor walker dedups by ``store_value_node``
@@ -1897,9 +1899,10 @@ def _codegen_cute_store_tcgen05_tile(
         <= 1
     )
     if use_aux_smem_source:
-        aux_pipeline_name = aux_pipeline_plan_obj.pipeline  # type: ignore[attr-defined,union-attr]
-        aux_consumer_state_name = aux_pipeline_plan_obj.consumer_state  # type: ignore[attr-defined,union-attr]
-        all_rings = aux_pipeline_plan_obj.rings  # type: ignore[attr-defined,union-attr]
+        assert aux_pipeline_plan_obj is not None
+        aux_pipeline_name = aux_pipeline_plan_obj.pipeline
+        aux_consumer_state_name = aux_pipeline_plan_obj.consumer_state
+        all_rings = aux_pipeline_plan_obj.rings
         aux_ring_smem_names: tuple[str, ...] = tuple(
             all_rings[ring_idx].smem for ring_idx in aux_ring_index_by_step
         )
@@ -2278,7 +2281,7 @@ def _codegen_cute_store_tcgen05_tile(
             [tcgen05_value.tma_store_atom, tcgen05_value.tma_store_tensor]
         )
         if tcgen05_value.use_role_local_epi:
-            df.register_cute_tcgen05_epi_role_tile_counter(
+            df.cute_state.register_tcgen05_epi_role_tile_counter(
                 tcgen05_value.role_local_tile_counter
             )
         state.codegen.cute_wrapper_plans.append(
@@ -3307,10 +3310,10 @@ def _codegen_cute_store_tcgen05_tile(
             "if True:\n" + textwrap.indent("\n".join(store_body_core), "    ")
         )
         sync_after_stmt = statement_from_string("cute.arch.sync_threads()")
-        df.register_cute_tcgen05_per_tile_stmts(
+        df.cute_state.register_tcgen05_per_tile_stmts(
             [sync_before_stmt, main_stmt, sync_after_stmt]
         )
-        df.register_cute_tcgen05_epi_role_stmts([main_stmt])
+        df.cute_state.register_tcgen05_epi_role_stmts([main_stmt])
         main_stmts = [
             *tma_store_hoisted_stmts,
             sync_before_stmt,
@@ -3411,7 +3414,7 @@ def _codegen_cute_store_tcgen05_tile(
     post_loop_stmts: list[ast.AST] = [
         statement_from_string(line) for line in post_loop_lines
     ]
-    df.register_cute_tcgen05_post_loop_stmts(post_loop_stmts)
+    df.cute_state.register_tcgen05_post_loop_stmts(post_loop_stmts)
     return [*main_stmts, *post_loop_stmts]
 
 
@@ -3807,7 +3810,7 @@ def _try_splice_tcgen05_unary_epilogue(
     the loud-failure backstop or the SIMT fallback.
 
     Splice is attempted only when the kernel has a tcgen05-registered
-    matmul fx_node (``cute_tcgen05_matmul_fx_nodes`` non-empty), the
+    matmul fx_node (``cute_state.matmul_fx_nodes`` non-empty), the
     store value has a backing FX node, the store target is a 2-D
     ``torch.Tensor``, and the chain analyzer accepts the value chain
     (returning ``(chain, anchor)`` for a non-empty chain rooted at
@@ -3816,7 +3819,8 @@ def _try_splice_tcgen05_unary_epilogue(
     analyzer returning ``None`` and the splice does not fire — the
     loud-failure backstop then catches them.
     """
-    if not state.device_function.cute_tcgen05_matmul_fx_nodes:
+    cute_state = state.device_function.cute_state
+    if not cute_state.matmul_fx_nodes:
         return None
     if value_node is None:
         return None
@@ -3829,9 +3833,7 @@ def _try_splice_tcgen05_unary_epilogue(
         return None
     chain, anchor = analyzed
     assert chain.steps
-    anchor_result_var = (
-        state.device_function.cute_tcgen05_matmul_fx_node_result_vars.get(anchor)
-    )
+    anchor_result_var = cute_state.matmul_fx_node_result_vars.get(anchor)
     if anchor_result_var is None:
         return None
     rewritten_stmt = _codegen_cute_store_tcgen05_tile(
@@ -4030,7 +4032,7 @@ def _(state: CodegenState) -> ast.AST:
     # to emit per-block-id index/mask vars, or (b) per-subtile lambda
     # emission in `_codegen_cute_store_tcgen05_tile`.
     if (
-        state.device_function.cute_tcgen05_matmul_fx_nodes
+        state.device_function.cute_state.matmul_fx_nodes
         and value_node is not None
         and reach_tcgen05_matmul_anchors(state, value_node)
     ):
@@ -4487,9 +4489,10 @@ def _(state: CodegenState) -> object:
             )
         return expr_from_string(index_var)
 
-    if state.device_function.suppress_cute_root_lane_loops or (
+    cute_state = state.device_function.cute_state
+    if cute_state.suppress_root_lane_loops or (
         state.fx_node is not None
-        and state.device_function.is_cute_collective_handled_load(state.fx_node.name)
+        and cute_state.is_collective_handled_load(state.fx_node.name)
     ):
         zero = CompileEnvironment.current().backend.dtype_str(tensor.dtype)
         return expr_from_string(f"{zero}(0)")

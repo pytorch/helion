@@ -2212,7 +2212,7 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         ``scheduler_warp_id``) are unaffected by the lift — codegen
         sites that gate on those ids stay byte-identical.
         """
-        from helion._compiler.device_function import CuteTcgen05MatmulPlan
+        from helion._compiler.cute.device_state import CuteTcgen05MatmulPlan
 
         base_kwargs: dict[str, object] = {
             "bm": 256,
@@ -2432,7 +2432,7 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         )
         # Round-trip via ``CuteTcgen05MatmulPlan`` to confirm the
         # property tracks the enum value.
-        from helion._compiler.device_function import CuteTcgen05MatmulPlan
+        from helion._compiler.cute.device_state import CuteTcgen05MatmulPlan
 
         plan_clc = CuteTcgen05MatmulPlan(
             bm=256,
