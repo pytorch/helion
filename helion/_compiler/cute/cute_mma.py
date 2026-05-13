@@ -2715,18 +2715,39 @@ def _emit_mma_pipeline(
             # barrier.
             tcgen05_sched_cluster_size = tcgen05_cluster_m * tcgen05_cluster_n
             # Consumer arrive count excludes the scheduler warp (the
-            # producer of this pipeline) AND the C-input warp
-            # (``cute_plan.md`` §7.5.3.2): the C-input warp body is
-            # inert today and does not call ``consumer_arrive`` on
-            # the scheduler broadcast pipeline, so counting it would
-            # leave ``producer_commit`` blocked on a missing arrival.
-            # With ``c_input_warp_count=0`` (the default) the
-            # subtraction is a no-op and the byte-identity path is
-            # preserved exactly.
+            # producer of this pipeline). The C-input warp's
+            # participation depends on whether the productive-body
+            # gate fires (``has_c_input_warp AND
+            # aux_tensor_descriptors``):
+            #
+            # - Gate fires: the C-input role-local while emitted by
+            #   ``program_id._build_c_input_warp_role_local_while``
+            #   consumer-waits on the sched_pipeline every iteration
+            #   (``cute_plan.md`` §7.5.3.2 cycle 1: empty body, but
+            #   the wait/release runs to receive the per-tile work
+            #   coords for cycles 2/3). Include the C-input warp in
+            #   the arrive count.
+            #
+            # - Gate does not fire (``c_input_warps=1`` without an
+            #   aux residual, or ``c_input_warps=0``): the C-input
+            #   warp body is fully inert and never calls
+            #   ``consumer_arrive`` on the sched_pipeline. Subtract
+            #   ``c_input_warp_count`` so ``producer_commit`` is not
+            #   blocked on a missing arrival.
+            #
+            # With ``c_input_warps=0`` the subtraction is a no-op
+            # and the byte-identity path is preserved exactly.
+            c_input_is_sched_consumer = tcgen05_matmul_plan.has_c_input_warp and bool(
+                tcgen05_matmul_plan.aux_tensor_descriptors
+            )
             tcgen05_sched_consumer_role_count = (
                 tcgen05_matmul_plan.role_warp_count
                 - tcgen05_matmul_plan.scheduler_warp_count
-                - tcgen05_matmul_plan.c_input_warp_count
+                - (
+                    0
+                    if c_input_is_sched_consumer
+                    else tcgen05_matmul_plan.c_input_warp_count
+                )
             )
             if tcgen05_matmul_plan.is_clc_persistent and tcgen05_sched_cluster_size > 1:
                 tcgen05_sched_consumer_arrive_count = (

@@ -11174,6 +11174,228 @@ class TestCuteTcgen05AuxTensorWalker(unittest.TestCase):
 
 
 @onlyBackends(["cute"])
+class TestCuteTcgen05AuxPipelineCycle1(unittest.TestCase):
+    """Pin cycle 1 of the C-input warp producer-body split
+    (``cute_plan.md`` §7.5.3.2): the empty C-input warp role-local
+    while emitted by ``program_id._build_c_input_warp_role_local_while``
+    plus the conditional sched-pipeline arrive-count revert.
+
+    Gate: fires only when ``c_input_warp_count > 0`` AND the
+    aux-tensor identity walker discovered one or more descriptors
+    on the matmul plan. For every other config the role-local
+    while is omitted and the codegen is byte-identical to the
+    pre-cycle-1 baseline.
+
+    Cycle 1 emits the role-local while with the linear-pid write
+    as the only per-tile body statement (load-bearing entry point
+    for cycle 2's producer body). The SMEM aux ring +
+    ``c_pipeline_aux`` ``PipelineAsync`` allocation land in cycle
+    2 alongside the ``producer_acquire`` / ``cute.copy`` /
+    ``producer_commit`` body — bundling them together (rather
+    than allocating empty barriers in cycle 1) avoids the
+    cluster-init overhead and ~16 KB SMEM-per-descriptor cost
+    that would otherwise push c_input_warps=1 configs near the
+    228 KB B200 SMEM cap on the canonical 256×256×128 ab=3
+    layout. The runtime-correctness pin below confirms the role-local
+    while + arrive-count change compose without deadlock or
+    wrong-output on a small canonical-fast-config residual kernel.
+    """
+
+    def _residual_kernel(self):  # type: ignore[no-untyped-def]
+        @helion.kernel(backend="cute")
+        def cute_matmul_residual_c_input(
+            x: torch.Tensor, y: torch.Tensor, residual: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = (acc + residual[tile_m, tile_n]).to(x.dtype)
+            return out
+
+        return cute_matmul_residual_c_input
+
+    def _canonical_c_input_config(self) -> helion.Config:
+        return helion.Config(
+            block_sizes=[256, 256, 128],
+            l2_groupings=[1],
+            num_warps=4,
+            num_sm_multiplier=1,
+            pid_type="persistent_interleaved",
+            tcgen05_cluster_m=2,
+            tcgen05_ab_stages=2,
+            tcgen05_acc_stages=2,
+            tcgen05_c_stages=2,
+            tcgen05_num_epi_warps=4,
+            tcgen05_strategy="role_local_with_scheduler",
+            tcgen05_warp_spec_scheduler_warps=1,
+            tcgen05_warp_spec_c_input_warps=1,
+            indexing=[
+                "tensor_descriptor",
+                "tensor_descriptor",
+                "tensor_descriptor",
+            ],
+        )
+
+    def _expected_c_input_warp_id(self, config: helion.Config) -> int:
+        """Compute the expected ``c_input_warp_id`` from the config
+        rather than hardcoding a numeric literal. The id sits after
+        the scheduler warp: 4 epi + 1 exec + 1 ab_load +
+        scheduler_warp_count = 7 under the canonical cluster_m=2
+        config (scheduler_warp_count=1). Computing it here keeps
+        the assertion tied to the matmul-plan accounting so a
+        future role-layout change (e.g. wider mma_warps) updates
+        the test alongside the plan.
+        """
+        cfg = config.config
+        epi = int(cfg.get("tcgen05_num_epi_warps", 4))
+        mma = int(cfg.get("tcgen05_warp_spec_mma_warps", 1))
+        ab_load = int(cfg.get("tcgen05_warp_spec_ab_load_warps", 1))
+        scheduler = int(cfg.get("tcgen05_warp_spec_scheduler_warps", 1))
+        return epi + mma + ab_load + scheduler
+
+    def test_c_input_role_local_while_emits_with_sched_pipeline_wait(self) -> None:
+        """The C-input warp's role-local while is emitted under
+        the productive-body gate, gated on the C-input warp
+        predicate (``warp_idx == c_input_warp_id``), and the body
+        consumer-waits on the sched_pipeline every iteration so
+        the warp participates in the sched-pipeline arrive count.
+
+        Cycle 1's body has the consumer wait/release machinery +
+        the linear-pid expression (load-bearing entry point for
+        cycle 2's producer body). The SMEM aux ring +
+        ``c_pipeline_aux`` allocation arrive in cycle 2, so this
+        cycle's codegen does not yet contain ``producer_acquire``
+        or ``producer_commit`` on any aux pipeline.
+        """
+        kernel = self._residual_kernel()
+        args = (
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+        )
+        config = self._canonical_c_input_config()
+        with patch_cute_mma_support():
+            bound = kernel.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            code = bound.to_triton_code(config)
+
+        # The C-input warp role-local while emits its own valid
+        # flag and gates on ``warp_idx == c_input_warp_id``. The
+        # id sits at scheduler_warp_id + scheduler_warp_count —
+        # computed from the config rather than hardcoded.
+        self.assertIn("tcgen05_c_input_warp_valid", code)
+        expected_warp_id = self._expected_c_input_warp_id(config)
+        self.assertIn(
+            "cute.arch.make_warp_uniform(cute.arch.warp_idx()) == "
+            f"cutlass.Int32({expected_warp_id})",
+            code,
+        )
+        # The SMEM aux ring + c_pipeline_aux land in cycle 2;
+        # cycle 1's codegen does not emit any aux-pipeline
+        # allocation. Pin the absence so a future leak from cycle
+        # 2 lands intentionally.
+        self.assertNotIn("tcgen05_aux_pipeline", code)
+        self.assertNotIn("tcgen05_aux_smem_layout_", code)
+        # Sched-pipeline arrive count under the productive-body
+        # gate includes the C-input warp: 4 epi + 1 mma + 1
+        # ab_load + 1 c_input = 7 consumers.
+        cfg = config.config
+        expected_arrive = (
+            int(cfg.get("tcgen05_num_epi_warps", 4))
+            + int(cfg.get("tcgen05_warp_spec_mma_warps", 1))
+            + int(cfg.get("tcgen05_warp_spec_ab_load_warps", 1))
+            + int(cfg.get("tcgen05_warp_spec_c_input_warps", 1))
+        )
+        self.assertIn(
+            "tcgen05_sched_pipeline_consumer_group = "
+            "cutlass.pipeline.CooperativeGroup("
+            "cutlass.pipeline.Agent.Thread, "
+            f"cutlass.Int32({expected_arrive}))",
+            code,
+        )
+
+    def test_c_input_role_local_while_not_emitted_without_residual(self) -> None:
+        """``c_input_warps=1`` without any aux residual leaves the
+        productive-body gate closed: the walker returns an empty
+        descriptor tuple and the C-input warp role-local while is
+        not emitted. The C-input warp falls back to the
+        inert-padding slot the foundation cycle established and
+        the sched-pipeline arrive-count subtraction compensates.
+        """
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_pure_c_input(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        args = (
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+        )
+        config = self._canonical_c_input_config()
+        with patch_cute_mma_support():
+            bound = cute_matmul_pure_c_input.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            code = bound.to_triton_code(config)
+
+        # No C-input role-local while: the gate-closed path keeps
+        # the warp inert and falls back to the
+        # consumer-arrive-count subtraction.
+        self.assertNotIn("tcgen05_c_input_warp_valid", code)
+        # Sched-pipeline arrive count subtracts the inert C-input
+        # warp: 4 epi + 1 mma + 1 ab_load = 6 consumers (matches
+        # the foundation-cycle pin).
+        self.assertIn(
+            "tcgen05_sched_pipeline_consumer_group = "
+            "cutlass.pipeline.CooperativeGroup("
+            "cutlass.pipeline.Agent.Thread, cutlass.Int32(6))",
+            code,
+        )
+
+    def test_residual_c_input_runtime_correctness(self) -> None:
+        """The c_input=1 + residual lowering compiles, launches,
+        and produces output within bf16 tolerance of the eager
+        reference under the cluster_m=2 canonical fast config.
+
+        Cycle 1's consumer side still reads from GMEM, so this is
+        not a perf test — it confirms the C-input warp role-local
+        while + sched-pipeline consumer arrive-count change
+        compose without deadlock or wrong-output. The 1024^3 size
+        keeps the test under the typical per-test wall-clock
+        budget while still exercising ~16 tile iterations under
+        the persistent grid.
+        """
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+
+        torch.manual_seed(0)
+        x = torch.randn(1024, 1024, dtype=torch.bfloat16, device=DEVICE)
+        y = torch.randn(1024, 1024, dtype=torch.bfloat16, device=DEVICE)
+        residual = torch.randn(1024, 1024, dtype=torch.bfloat16, device=DEVICE)
+        kernel = self._residual_kernel()
+        config = self._canonical_c_input_config()
+        bound = kernel.bind((x, y, residual))
+        bound.env.config_spec.cute_tcgen05_search_enabled = True
+        bound.set_config(config)
+        out = bound(x, y, residual)
+        expected = (x @ y + residual).to(x.dtype)
+        torch.testing.assert_close(out, expected, atol=2e-1, rtol=1e-2)
+
+
+@onlyBackends(["cute"])
 class TestCuteDslCompat(unittest.TestCase):
     def test_umma_async_tail_workaround_preserves_leader_cta_guard(self) -> None:
         from helion._compiler.cute import cutedsl_compat
