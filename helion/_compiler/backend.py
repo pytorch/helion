@@ -3080,12 +3080,64 @@ class CuteBackend(Backend):
             )
         )
         offset_thread_dims = [1, 1, 1]
-        for offset_id, axis_text in re.findall(
-            r"^\s*indices_\d+ = (?:tile_)?offset_(\d+) \+ .*cute\.arch\.thread_idx\(\)\[(\d+)\]",
-            final_kernel_text,
+        # When a lane loop is active for an axis the generated index expression
+        # has the form
+        #   ``indices_<n> = tile_offset_<n> + Int32(thread_idx()[<axis>]) * <epT> + Int32(lane_<n>)``
+        # where ``<epT>`` is ``elements_per_thread`` for that axis and the
+        # outer ``for lane_<n> in range(<epT>):`` covers the residual. In
+        # that case the launch-time thread extent for the axis is
+        # ``block_size / <epT>``, not ``block_size``. Without dividing by
+        # ``<epT>`` here the launch dim ends up at ``block_size`` while the
+        # generated tile arithmetic only spans ``block_size / <epT>`` threads,
+        # which means ``thread_idx[axis] >= block_size / <epT>`` writes past
+        # the tile and triggers ``cudaErrorIllegalAddress`` mid-search. The
+        # ``cutlass.Int32(...)`` wrapper around ``thread_idx`` is closed
+        # before the ``* <epT>`` multiplier, so the closing ``)`` between
+        # ``[axis]`` and ``*`` is part of the line we have to skip over.
+        #
+        # The launch dim along ``axis`` has to serve **every** indices line
+        # that uses that axis. If two lines on the same axis emit different
+        # multipliers (e.g. one block_id with ``epT=1`` and another with
+        # ``epT=2``), the line with the larger ``thread_idx[axis]`` range
+        # is the binding one — so we compute ``block_size // epT`` *per
+        # line* and take the ``max`` across lines, rather than combining
+        # multipliers across lines and dividing once. ``re.findall`` over
+        # the optional-multiplier alternation cannot be made to populate
+        # the multiplier group reliably (the optional ``(?:...)?`` form
+        # prefers the empty match), so we scan the lines once in Python
+        # to keep the per-line ``(block_size, epT)`` pair intact.
+        # ``indices_line_re`` anchors on the
+        # ``cutlass.Int32(cute.arch.thread_idx()[<axis>])`` form the CuTe
+        # backend emits via ``lane_index_expr`` (see backend.py:2666).
+        # The trailing ``\)`` after ``\]`` is the close of the
+        # ``cutlass.Int32(...)`` wrapper around ``thread_idx``; if a
+        # future codegen path drops the wrapper, the regex will
+        # silently fail to match and the launch dim under-dimensions
+        # without a signal. ``indices_line_assert_re`` below detects
+        # the "wrapper-dropped" form so we can fail loudly instead.
+        indices_line_re = re.compile(
+            r"^\s*indices_\d+ = (?:tile_)?offset_(\d+) \+ "
+            r"[^\n]*?cute\.arch\.thread_idx\(\)\[(\d+)\]\)"
+            r"(?:\s*\*\s*(?:cutlass\.Int32\()?(\d+))?",
             flags=re.MULTILINE,
-        ):
+        )
+        # Loose form: any ``indices_<n>`` line containing ``thread_idx``
+        # under any wrapping. Used only for the wrapper-invariant
+        # assertion below — never consulted for launch-dim values.
+        indices_line_loose_re = re.compile(
+            r"^\s*indices_\d+ = (?:tile_)?offset_\d+ \+ "
+            r"[^\n]*?cute\.arch\.thread_idx\(\)",
+            flags=re.MULTILINE,
+        )
+        matched_lines = 0
+        for line_match in indices_line_re.finditer(final_kernel_text):
+            matched_lines += 1
+            offset_id = line_match.group(1)
+            axis_text = line_match.group(2)
+            multiplier_text = line_match.group(3)
             axis = int(axis_text)
+            if not (0 <= axis < len(offset_thread_dims)):
+                continue
             block_name = offset_block_sizes.get(offset_id)
             block_size = block_size_values.get(block_name or "")
             if block_size is None and block_name is not None:
@@ -3097,8 +3149,59 @@ class CuteBackend(Backend):
                     config_block_size = config.block_sizes[config_index]
                     if isinstance(config_block_size, int):
                         block_size = config_block_size
-            if block_size is not None and 0 <= axis < len(offset_thread_dims):
-                offset_thread_dims[axis] = max(offset_thread_dims[axis], block_size)
+            if block_size is None:
+                continue
+            elements_per_thread = int(multiplier_text) if multiplier_text else 1
+            if elements_per_thread <= 0:
+                # ``lane_index_expr`` only emits ``* <n>`` for ``n >= 1``;
+                # a ``* 0`` multiplier would mean the index expression is
+                # already invalid (every thread maps to offset 0), so
+                # silently falling back to ``block_size`` here would
+                # mask the very class of bug this recovery exists to
+                # catch. Surface it loudly.
+                raise AssertionError(
+                    f"launch-dim recovery: non-positive "
+                    f"elements_per_thread={elements_per_thread} for axis="
+                    f"{axis}"
+                )
+            if block_size % elements_per_thread != 0:
+                # The strategy invariant ``_thread_extent_for_axis``
+                # rejects non-divisible ``block_size / nt`` at
+                # construction, so the regex should never see a line
+                # whose ``epT`` does not divide ``block_size`` evenly.
+                # If a future codegen regression breaks that invariant,
+                # surface it loudly here rather than silently
+                # under-dimensioning the launch.
+                raise AssertionError(
+                    f"launch-dim recovery: block_size={block_size} not "
+                    f"divisible by elements_per_thread={elements_per_thread} "
+                    f"for axis={axis}"
+                )
+            line_extent = block_size // elements_per_thread
+            offset_thread_dims[axis] = max(offset_thread_dims[axis], line_extent)
+        # Wrapper-invariant assertion: when there is at least one
+        # ``indices_<n> = ... thread_idx() ...`` line and we have
+        # ``_BLOCK_SIZE_<n>`` constants to consume, the strict regex
+        # above must have matched at least one of them. A loose match
+        # without a strict match means the codegen emitted
+        # ``thread_idx[axis]`` outside the ``cutlass.Int32(...)``
+        # wrapper the strict regex anchors on; in that case the
+        # launch dim would silently fall back to ``[1, 1, 1]`` and
+        # under-dimension every kernel that uses a thread axis.
+        if (
+            offset_block_sizes
+            and indices_line_loose_re.search(final_kernel_text)
+            and matched_lines == 0
+        ):
+            raise AssertionError(
+                "launch-dim recovery: indices_<n> lines reference "
+                "cute.arch.thread_idx() but none matched the "
+                "cutlass.Int32(...)-wrapped form. The strict regex in "
+                "_launcher_block_arg is anchored on the wrapper emitted "
+                "by lane_index_expr; if the codegen producer was changed "
+                "to drop the wrapper, update the regex to match the new "
+                "form."
+            )
         dims = tuple(codegen.max_thread_block_dims)
         root_live_dims = tuple(codegen.root_thread_block_dims)
         referenced_dims = tuple(codegen.referenced_thread_block_dims)

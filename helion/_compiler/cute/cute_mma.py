@@ -1598,6 +1598,14 @@ def _emit_mma_pipeline(
     assert grid_state is not None
     m_local = _local_mma_coord_expr(cg, m_block_id)
     n_local = _local_mma_coord_expr(cg, n_block_id)
+    # ``m_physical`` / ``n_physical`` strip the lane-var offset so SMEM-load
+    # guards select the same hardware thread across every iteration of an
+    # outer ``for lane_<n> in range(elements_per_thread):`` loop. The
+    # universal-MMA SMEM load below would otherwise gate on ``n_local == 0``
+    # which is only true on the lane=0 iteration when ``n`` has a lane var,
+    # leaving ``sA`` stale from the previous lane iteration and producing
+    # wrong-output for the entire post-lane-0 accumulator.
+    m_physical = _physical_mma_coord_expr(cg, m_block_id)
     n_physical = _physical_mma_coord_expr(cg, n_block_id)
     m_global = f"cutlass.Int32({m_index_var})"
     n_global = f"cutlass.Int32({n_index_var})"
@@ -3238,9 +3246,28 @@ def _emit_mma_pipeline(
     else:
         raise AssertionError("non-universal MMA with acc_expr should fall back")
     if mma_impl == "universal":
+        # Guards select the hardware thread that loads each row/column of
+        # the A/B SMEM cache. Use the *physical* thread coord (not the
+        # lane-aware local coord) so the same hardware threads load on
+        # every iteration of an outer ``for lane_<n> in range(epT):`` loop
+        # when ``elements_per_thread > 1``. ``n_local == 0`` only matches
+        # ``(thread_y, lane) == (0, 0)`` — fine for the no-lane case but
+        # leaves sA stale on ``lane > 0`` iterations because the guard
+        # never fires. ``n_physical == 0`` matches ``thread_y == 0`` on
+        # every lane iteration so sA is re-populated for the current K
+        # tile. The store target is still ``sA[m_local, _k]`` so different
+        # lane iterations naturally write to different rows of sA / sB if
+        # the m-axis has its own lane var.
+        #
+        # Local invariant: because the K loop is nested INSIDE the
+        # lane loop in the current scheduler, skipping the A/B load
+        # on lane>0 iterations would reuse the previous K tile's sA
+        # (overwritten by the previous K iteration) — incorrect.
+        # Deferred hoist would require K/lane interchange. See
+        # cute_plan.md for the deferred-restructure paths.
         cg.add_statement(
             statement_from_string(
-                f"if {n_local} == cutlass.Int32(0):\n"
+                f"if {n_physical} == cutlass.Int32(0):\n"
                 f"    for _k in range({bk}):\n"
                 f"        _gk = {k_offset_var} + cutlass.Int32(_k)\n"
                 f"        {smem_a}[{m_local}, cutlass.Int32(_k)] = ("
@@ -3252,7 +3279,7 @@ def _emit_mma_pipeline(
         )
         cg.add_statement(
             statement_from_string(
-                f"if {m_local} == cutlass.Int32(0):\n"
+                f"if {m_physical} == cutlass.Int32(0):\n"
                 f"    for _k in range({bk}):\n"
                 f"        _gk = {k_offset_var} + cutlass.Int32(_k)\n"
                 f"        {smem_b}[{n_local}, cutlass.Int32(_k)] = ("
