@@ -12008,6 +12008,406 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
             code,
         )
 
+    def test_aux_autotune_surface_widens_for_residual_kernel(self) -> None:
+        """Autotune-surface routing pin (residual case).
+
+        The productive C-input warp is reachable from the
+        normal Helion autotune path when the bound kernel's
+        FX graphs contain a tcgen05 matmul AND at least one
+        ``memory_ops.load`` whose target isn't one of the
+        matmul operands (the residual / bias / chained
+        residual_relu pattern). Pin:
+          - ``cute_tcgen05_aux_kernel_detected`` is True after
+            bind.
+          - ``tcgen05_strategy`` autotune fragment widens to
+            ``(MONOLITHIC, WITH_SCHEDULER)``.
+          - ``tcgen05_warp_spec_scheduler_warps`` widens to
+            ``(0, 1)`` so it can be paired with the strategy.
+          - ``tcgen05_warp_spec_c_input_warps`` widens to
+            ``(0, 1)``.
+        """
+        from helion._compiler.cute.strategies import Tcgen05Strategy
+
+        kernel = self._residual_kernel()
+        args = (
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+        )
+        with patch_cute_mma_support():
+            bound = kernel.bind(args)
+        self.assertTrue(bound.env.config_spec.cute_tcgen05_aux_kernel_detected)
+        frags = bound.env.config_spec._tcgen05_strategy_autotune_fragments()
+        self.assertEqual(
+            frags["tcgen05_strategy"].choices,
+            (
+                Tcgen05Strategy.ROLE_LOCAL_MONOLITHIC.value,
+                Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER.value,
+            ),
+        )
+        self.assertEqual(frags["tcgen05_warp_spec_scheduler_warps"].choices, (0, 1))
+        self.assertEqual(frags["tcgen05_warp_spec_c_input_warps"].choices, (0, 1))
+
+    def test_aux_autotune_surface_stays_narrow_for_pure_matmul(self) -> None:
+        """Autotune-surface routing pin (pure-matmul case).
+
+        Pure-matmul kernels (no aux load) keep the narrow
+        autotune surface so autotune cannot sample the
+        strictly-worse inert C-input warp configuration —
+        the inert warp regresses pure-matmul perf because it
+        takes up an SM slot without delivering work.
+
+        Pin:
+          - ``cute_tcgen05_aux_kernel_detected`` is False
+            after bind.
+          - ``tcgen05_strategy`` stays at MONOLITHIC only.
+          - ``tcgen05_warp_spec_scheduler_warps`` stays at 0
+            only.
+          - ``tcgen05_warp_spec_c_input_warps`` stays at 0
+            only.
+        """
+        from helion._compiler.cute.strategies import Tcgen05Strategy
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_pure(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        args = (
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_pure.bind(args)
+        self.assertFalse(bound.env.config_spec.cute_tcgen05_aux_kernel_detected)
+        frags = bound.env.config_spec._tcgen05_strategy_autotune_fragments()
+        self.assertEqual(
+            frags["tcgen05_strategy"].choices,
+            (Tcgen05Strategy.ROLE_LOCAL_MONOLITHIC.value,),
+        )
+        self.assertEqual(frags["tcgen05_warp_spec_scheduler_warps"].choices, (0,))
+        self.assertEqual(frags["tcgen05_warp_spec_c_input_warps"].choices, (0,))
+
+    def test_aux_autotune_surface_does_not_narrow_for_multistore_fanout(
+        self,
+    ) -> None:
+        """Autotune-surface routing pin (multi-store fan-out
+        case).
+
+        Multi-store fan-out kernels (one matmul → two distinct
+        stores with different aux operands) carry aux loads,
+        so the bind-time detector flags them as aux kernels
+        and the autotune surface widens (does NOT narrow to
+        the pure-matmul ``(0,)`` shape). Compile-time the
+        productive-body safety gate then suppresses the
+        productive body (per
+        ``test_aux_pipeline_multi_store_fanout_gate_closes``)
+        and falls back to GMEM aux reads — so sampling
+        ``c_input_warps=1`` is a wasted compile slot but does
+        not deadlock. The detector intentionally does NOT
+        distinguish fan-out from single-store (the productive
+        body's own safety gate is the authoritative check),
+        so the autotune surface still admits
+        ``c_input_warps=1`` here. This is a documented over-
+        approximation: a follow-up could prune the fan-out
+        case at autotune-surface time, but the safety gate at
+        codegen already prevents the over-budget compile.
+        """
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_residual_fanout(
+            x: torch.Tensor,
+            y: torch.Tensor,
+            residual_a: torch.Tensor,
+            residual_b: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            m, k = x.size()
+            _, n = y.size()
+            out_a = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            out_b = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out_a[tile_m, tile_n] = (acc + residual_a[tile_m, tile_n]).to(x.dtype)
+                out_b[tile_m, tile_n] = (acc + residual_b[tile_m, tile_n]).to(x.dtype)
+            return out_a, out_b
+
+        args = (
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_residual_fanout.bind(args)
+        # Detector is intentionally coarse and DOES flag
+        # fan-out as aux (it has aux loads). The
+        # productive-body safety gate at codegen suppresses
+        # the productive body for fan-out specifically.
+        self.assertTrue(bound.env.config_spec.cute_tcgen05_aux_kernel_detected)
+
+    def test_aux_autotune_fixup_demotes_ab3_c_input1(self) -> None:
+        """Search-time fixup pin: a sampled
+        ``ab_stages=3 + c_input_warps=1`` combination under
+        WITH_SCHEDULER is demoted to ``c_input_warps=0`` by
+        ``_fix_tcgen05_with_scheduler_search_config`` so the
+        autotuner doesn't waste a compile on a sample that
+        would hit the MMA-codegen-time SMEM-budget
+        ``BackendUnsupported`` rejection.
+
+        Note: a config carrying ``ab_stages=3 +
+        c_input_warps=1`` is normally unreachable through
+        normalize because the autotune-surface fragment
+        widening + cross-fragment validator interaction
+        produces only valid combinations. This test exercises
+        the fixup directly to confirm the safety net is in
+        place if a future surface change exposes the combo.
+        """
+        from helion._compiler.cute.strategies import Tcgen05Strategy
+
+        kernel = self._residual_kernel()
+        args = (
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+        )
+        with patch_cute_mma_support():
+            bound = kernel.bind(args)
+        # Manually craft the over-budget combo.
+        config_dict: dict[str, object] = {
+            "tcgen05_strategy": Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER.value,
+            "tcgen05_warp_spec_scheduler_warps": 1,
+            "tcgen05_warp_spec_c_input_warps": 1,
+            "tcgen05_ab_stages": 3,
+        }
+        bound.env.config_spec._fix_tcgen05_with_scheduler_search_config(config_dict)
+        # Fixup demoted c_input_warps to 0; ab_stages=3 stays.
+        self.assertEqual(config_dict["tcgen05_warp_spec_c_input_warps"], 0)
+        self.assertEqual(config_dict["tcgen05_ab_stages"], 3)
+
+    def test_aux_autotune_surface_widens_for_hldot_residual_kernel(self) -> None:
+        """Detector recognizes ``hl.dot`` MMA anchors in
+        addition to the aten paths.
+
+        The canonical Helion API for matmul is ``hl.dot``;
+        kernels written with it lower through
+        ``codegen_cute_mma_dot`` to the tcgen05 MMA path the
+        same way ``torch.addmm`` / ``torch.matmul`` do. Without
+        treating ``hl.dot`` as an MMA anchor, the detector
+        would flag ``hl.dot`` + residual kernels as non-MMA
+        (no matched anchor in any graph) and the autotune
+        surface would never widen — the headline residual
+        c_input_warps=1 win would silently not apply to
+        ``hl.dot`` kernels.
+
+        Pin: a residual kernel written with ``hl.dot`` sets the
+        detector flag True and the three fragments widen,
+        matching the ``torch.addmm`` path.
+        """
+        from helion._compiler.cute.strategies import Tcgen05Strategy
+
+        @helion.kernel(backend="cute")
+        def hldot_residual(
+            x: torch.Tensor, y: torch.Tensor, residual: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
+                out[tile_m, tile_n] = (acc + residual[tile_m, tile_n]).to(x.dtype)
+            return out
+
+        args = (
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+        )
+        with patch_cute_mma_support():
+            bound = hldot_residual.bind(args)
+        self.assertTrue(bound.env.config_spec.cute_tcgen05_aux_kernel_detected)
+        frags = bound.env.config_spec._tcgen05_strategy_autotune_fragments()
+        self.assertEqual(
+            frags["tcgen05_strategy"].choices,
+            (
+                Tcgen05Strategy.ROLE_LOCAL_MONOLITHIC.value,
+                Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER.value,
+            ),
+        )
+        self.assertEqual(frags["tcgen05_warp_spec_c_input_warps"].choices, (0, 1))
+
+    def test_aux_autotune_surface_stays_narrow_for_wrapped_cast_pure_matmul(
+        self,
+    ) -> None:
+        """Operand-cast wrappers (``lhs.to(dtype) @ rhs.to(dtype)``)
+        are traced through to the underlying ``memory_ops.load``
+        nodes so the detector classifies them as MMA-operand
+        loads, not aux loads.
+
+        Without operand-trace, the detector's "every
+        ``memory_ops.load`` that isn't the exact node arg of
+        the MMA call is aux" rule misclassifies the underlying
+        load behind a ``convert_element_type`` wrapper as aux
+        and the autotune surface widens on a kernel where no
+        true aux load exists — autotune then samples the
+        strictly-worse inert C-input warp on pure matmul.
+
+        Pin: a pure matmul with explicit operand casts (fp32
+        operand tensors cast to bf16 before the dot) keeps
+        the detector flag False — the cast wrapper is walked
+        through to the underlying load via
+        ``_trace_to_load_through_casts`` and the load is
+        classified as an MMA operand, not an aux load.
+        """
+        from helion._compiler.cute.strategies import Tcgen05Strategy
+
+        @helion.kernel(backend="cute")
+        def matmul_wrapped_cast_pure(
+            x_fp32: torch.Tensor, y_fp32: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x_fp32.size()
+            _, n = y_fp32.size()
+            out = torch.empty([m, n], dtype=torch.bfloat16, device=x_fp32.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    x_tile = x_fp32[tile_m, tile_k].to(torch.bfloat16)
+                    y_tile = y_fp32[tile_k, tile_n].to(torch.bfloat16)
+                    acc = torch.addmm(acc, x_tile, y_tile)
+                out[tile_m, tile_n] = acc.to(torch.bfloat16)
+            return out
+
+        args = (
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.float32),
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.float32),
+        )
+        with patch_cute_mma_support():
+            bound = matmul_wrapped_cast_pure.bind(args)
+        self.assertFalse(bound.env.config_spec.cute_tcgen05_aux_kernel_detected)
+        frags = bound.env.config_spec._tcgen05_strategy_autotune_fragments()
+        self.assertEqual(
+            frags["tcgen05_strategy"].choices,
+            (Tcgen05Strategy.ROLE_LOCAL_MONOLITHIC.value,),
+        )
+        self.assertEqual(frags["tcgen05_warp_spec_c_input_warps"].choices, (0,))
+
+    def test_aux_autotune_seeds_c_input_config_for_residual_kernel(self) -> None:
+        """Autotune seed pin (residual case).
+
+        Cycle 2f finding: quick-effort autotune missed
+        ``c_input_warps=1`` entirely on residual cells (zero of
+        44 configs sampled on 8192x4096x2048) because the
+        ``WITH_SCHEDULER + scheduler_warps=1 + c_input_warps=1``
+        corner is a small intersection of the search space. The
+        cycle 2g fix is to seed the canonical productive C-input
+        warp config directly into the autotuner's initial
+        population for aux-detected kernels.
+
+        Pin: an aux-detected residual kernel's
+        ``autotune_seed_configs()`` list contains a config with
+        the productive C-input warp shape:
+            - ``tcgen05_strategy = ROLE_LOCAL_WITH_SCHEDULER``
+            - ``tcgen05_warp_spec_scheduler_warps = 1``
+            - ``tcgen05_warp_spec_c_input_warps = 1``
+            - ``tcgen05_ab_stages = 2``
+            - ``block_sizes = [256, 256, 128]``
+            - ``tcgen05_cluster_m = 2``
+            - ``pid_type = persistent_interleaved``
+        """
+        from helion._compiler.cute.strategies import Tcgen05Strategy
+
+        kernel = self._residual_kernel()
+        args = (
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+        )
+        with patch_cute_mma_support():
+            bound = kernel.bind(args)
+        seeds = bound.env.config_spec.autotune_seed_configs()
+        c_input_seeds = [
+            s for s in seeds if s.config.get("tcgen05_warp_spec_c_input_warps") == 1
+        ]
+        self.assertEqual(
+            len(c_input_seeds),
+            1,
+            f"expected exactly one c_input=1 seed, got {len(c_input_seeds)} "
+            f"out of {len(seeds)} seeds: {[s.config for s in seeds]}",
+        )
+        seed = c_input_seeds[0].config
+        self.assertEqual(
+            seed["tcgen05_strategy"],
+            Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER.value,
+        )
+        self.assertEqual(seed["tcgen05_warp_spec_scheduler_warps"], 1)
+        self.assertEqual(seed["tcgen05_warp_spec_c_input_warps"], 1)
+        self.assertEqual(seed["tcgen05_ab_stages"], 2)
+        self.assertEqual(seed["block_sizes"][0], 256)
+        self.assertEqual(seed["block_sizes"][1], 256)
+        self.assertEqual(seed["tcgen05_cluster_m"], 2)
+        self.assertEqual(seed["pid_type"], "persistent_interleaved")
+        # Pin ``l2_groupings=[1]``: direct verification on 4096^3
+        # and 8192x4096x2048 shows ``c_input_warps=1 +
+        # cluster_m=2 + l2_groupings=[g]`` produces 60-69%
+        # mismatched elements for every ``g > 1``. The matched
+        # cycle 2c forced c_input=1 baselines all run at
+        # ``g=1``. The cluster_m2 seed's
+        # ``TCGEN05_TWO_CTA_SEED_L2_GROUPING=4`` is intentionally
+        # NOT mirrored here (would defeat the purpose of the
+        # seed by producing wrong output).
+        self.assertEqual(seed["l2_groupings"], [1])
+
+    def test_aux_autotune_seeds_omit_c_input_config_for_pure_matmul(self) -> None:
+        """Autotune seed pin (pure-matmul case).
+
+        Pure-matmul kernels (detector flag False) do NOT receive
+        the c_input=1 seed. Seeding the inert C-input warp on a
+        pure-matmul kernel would waste a compile slot on a
+        config the autotune-surface widening explicitly avoids
+        (the inert warp occupies an SM slot without delivering
+        work).
+        """
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_pure(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        args = (
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_pure.bind(args)
+        self.assertFalse(bound.env.config_spec.cute_tcgen05_aux_kernel_detected)
+        seeds = bound.env.config_spec.autotune_seed_configs()
+        c_input_seeds = [
+            s for s in seeds if s.config.get("tcgen05_warp_spec_c_input_warps") == 1
+        ]
+        self.assertEqual(
+            len(c_input_seeds),
+            0,
+            f"pure matmul must not get a c_input=1 seed; got "
+            f"{[s.config for s in c_input_seeds]}",
+        )
+
 
 @onlyBackends(["cute"])
 class TestCuteDslCompat(unittest.TestCase):

@@ -29,12 +29,26 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from ...language import matmul_ops
 from ...language import memory_ops
 from .cute_epilogue import _AuxiliaryTensorStep
 from .cute_epilogue import analyze_tcgen05_unary_epilogue_chain
 
 if TYPE_CHECKING:
     from ..generate_ast import GenerateAST
+    from ..host_function import HostFunction
+
+
+# Mirrors ``cute_mma._TRACE_THROUGH_TARGETS`` — the data-preserving
+# wrappers the MMA codegen walks through when resolving operand
+# loads (``_trace_to_load`` in ``cute_mma``). Duplicated here
+# rather than imported because ``cute_mma`` imports from this
+# module, creating a circular dependency. The single
+# ``convert_element_type`` target is the canonical operand-cast
+# wrapper Helion emits for ``lhs.to(dtype) @ rhs.to(dtype)``
+# patterns; keep this set in sync with ``cute_mma`` if either
+# side adds a new wrapper.
+_MMA_OPERAND_TRACE_THROUGH_TARGETS = (torch.ops.prims.convert_element_type.default,)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -281,3 +295,155 @@ def discover_tcgen05_aux_tensor_descriptors(
         for step in chain.auxiliary_tensor_steps:
             descriptors.append(_aux_descriptor_from_step(step, store_value))
     return tuple(descriptors)
+
+
+def host_function_has_tcgen05_aux_kernel_pattern(
+    host_function: HostFunction,
+) -> bool:
+    """Conservative pre-codegen detector for kernels whose tcgen05
+    matmul is followed by an aux-fused store
+    (``out[tile] = (acc + residual[tile]).to(...)`` and the
+    bias / rowvec variants — see :class:`_AuxiliaryTensorStep`
+    for the accepted forms).
+
+    Runs at autotune-surface configuration time (post-FX-graph
+    build, pre-autotune-sample) where the
+    :func:`discover_tcgen05_aux_tensor_descriptors` walker is
+    unavailable — that walker requires a populated
+    ``DeviceFunction.cute_tcgen05_matmul_fx_nodes`` set, which
+    is only registered at MMA-codegen time per config sample.
+    The aux pipeline only fires when the productive-body gate
+    sees aux descriptors, so the autotune surface only needs
+    to widen ``tcgen05_warp_spec_c_input_warps`` when this
+    detector returns True; otherwise the C-input warp is
+    inert and sampling ``c_input_warps=1`` would be a strict
+    resource cost for pure-matmul kernels (the inert warp
+    occupies an SM slot without delivering work).
+
+    Implementation: walk every FX graph in
+    ``host_function.device_ir.graphs`` and look for the
+    coarse pattern "the kernel has at least one MMA-anchor
+    call AND at least one ``memory_ops.load`` call whose
+    result is NOT used as one of the MMA operands". MMA
+    anchors include both the aten paths
+    (``aten.addmm`` / ``aten.baddbmm`` / ``aten.mm`` /
+    ``aten.bmm``) AND the ``hl.dot`` HOP — both ends up
+    in the tcgen05 MMA lowering, and the canonical Helion
+    residual kernel uses ``hl.dot``. Operand resolution
+    traces through the same ``convert_element_type``
+    wrappers the MMA codegen accepts
+    (``cute_mma._trace_to_load`` /
+    ``_TRACE_THROUGH_TARGETS``); without this trace,
+    kernels written as ``lhs.to(dtype) @ rhs.to(dtype)``
+    would have their operand loads classified as aux and
+    the detector would over-fire on pure matmul.
+
+    The detector is **conservative**: a false positive
+    only widens the autotune search by one enum value
+    (the productive-body safety gates handle the resulting
+    invalid combinations at codegen time and the
+    inert-body fallback handles invalid runs); a false
+    negative would miss the residual c_input=1 win. The
+    chain analyzer at codegen time
+    (``analyze_tcgen05_unary_epilogue_chain``) remains the
+    source of truth for which aux shapes are *accepted*
+    by the productive-body codegen; this detector
+    intentionally over-approximates so the autotune surface
+    admits the productive shape whenever any aux load is
+    plausibly involved.
+
+    Caught patterns include:
+
+    - exact-shape residual: ``out[tile] = (acc + residual[tile]).to(...)``
+    - rowvec broadcast: ``out[tile] = (acc + bias[tile_n]).to(...)``
+    - chained: ``(acc + residual)*bias``, ``relu(acc + residual)``, etc.
+    - any of the above using ``hl.dot(...)`` instead of
+      ``torch.addmm`` / ``torch.matmul``.
+    """
+    device_ir = host_function.device_ir
+    graphs = device_ir.graphs
+    if not graphs:
+        return False
+
+    # MMA anchor targets: both the aten paths and the
+    # ``hl.dot`` HOP (the canonical Helion API entrypoint —
+    # the FX target is the ``dot`` Python function from
+    # ``matmul_ops`` itself; see ``backend.py`` which
+    # identifies ``hl.dot`` via
+    # ``getattr(node.target, "__name__", "") == "dot"``).
+    mma_targets = (
+        torch.ops.aten.addmm.default,
+        torch.ops.aten.mm.default,
+        torch.ops.aten.bmm.default,
+        torch.ops.aten.baddbmm.default,
+        matmul_ops.dot,
+    )
+    has_mma = False
+    operand_load_nodes: set[torch.fx.Node] = set()
+    for graph_info in graphs:
+        for node in graph_info.graph.nodes:
+            if node.op != "call_function" or node.target not in mma_targets:
+                continue
+            has_mma = True
+            # ``aten.addmm`` / ``aten.baddbmm`` /
+            # ``aten.mm`` / ``aten.bmm``: lhs and rhs are
+            # the last two positional args.
+            # ``hl.dot(mat1, mat2, acc=..., out_dtype=...)``:
+            # mat1/mat2 are the first two positional args.
+            # Both layouts collapse to "the two MMA operand
+            # nodes are positional args 0/1 or N-2/N-1
+            # depending on whether an accumulator is the
+            # first arg" — pick by checking which of the
+            # first three positional args produced data
+            # tensors. Simpler heuristic: every positional
+            # arg that is an FX node and resolves through
+            # the operand-trace to a ``memory_ops.load`` is
+            # treated as a candidate MMA operand load.
+            for arg in node.args:
+                if isinstance(arg, torch.fx.Node):
+                    load_node = _trace_to_load_through_casts(arg)
+                    if load_node is not None:
+                        operand_load_nodes.add(load_node)
+    if not has_mma:
+        return False
+    # Second pass: any ``memory_ops.load`` call whose result
+    # is NOT a resolved MMA-operand load is treated as aux.
+    # Operand loads feed the dot directly (after optional
+    # casts); aux loads feed an arithmetic op that combines
+    # with the dot's result on the way to a store.
+    for graph_info in graphs:
+        for node in graph_info.graph.nodes:
+            if (
+                node.op == "call_function"
+                and node.target is memory_ops.load
+                and node not in operand_load_nodes
+            ):
+                return True
+    return False
+
+
+def _trace_to_load_through_casts(node: torch.fx.Node) -> torch.fx.Node | None:
+    """Walk backward from ``node`` through accepted operand-cast
+    wrappers to the underlying ``memory_ops.load``.
+
+    Mirrors ``cute_mma._trace_to_load`` for the operand-trace
+    contract: only data-preserving ops in
+    ``_MMA_OPERAND_TRACE_THROUGH_TARGETS`` are walked
+    through, matching the MMA codegen's own operand-resolution
+    behavior. Returns the resolved ``memory_ops.load`` node, or
+    ``None`` if a non-wrapper op (e.g. arithmetic) is
+    encountered before the load — in that case the operand is
+    not a pure load chain and we conservatively decline to
+    treat it as an MMA operand load.
+    """
+    cur = node
+    while cur.op == "call_function" and cur.target is not memory_ops.load:
+        if cur.target not in _MMA_OPERAND_TRACE_THROUGH_TARGETS:
+            return None
+        input_nodes = [a for a in cur.args if isinstance(a, torch.fx.Node)]
+        if len(input_nodes) != 1:
+            return None
+        cur = input_nodes[0]
+    if cur.op != "call_function" or cur.target is not memory_ops.load:
+        return None
+    return cur
