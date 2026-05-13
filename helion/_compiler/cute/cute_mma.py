@@ -1024,6 +1024,7 @@ def _build_kloop_pipeline_consumer_if(
     gate_exec_warp: bool = True,
     include_scalar_fallback: bool = True,
     use_existing_try_token: bool = False,
+    sync_before_scalar_fallback: bool = False,
 ) -> ast.stmt:
     """Per-K-iter TMA consumer / scalar-fallback ``if`` for the pipelined branch."""
     if args.skip_consumer_wait:
@@ -1053,8 +1054,12 @@ def _build_kloop_pipeline_consumer_if(
     if include_scalar_fallback:
         scalar_load_a_src = textwrap.indent(ast.unparse(args.scalar_load_a), "    ")
         scalar_load_b_src = textwrap.indent(ast.unparse(args.scalar_load_b), "    ")
+        leading_sync_src = (
+            "    cute.arch.sync_threads()\n" if sync_before_scalar_fallback else ""
+        )
         fallback_src = (
             "\nelse:\n"
+            f"{leading_sync_src}"
             f"{scalar_load_a_src}\n"
             f"{scalar_load_b_src}\n"
             "    cute.arch.sync_threads()"
@@ -1730,27 +1735,50 @@ def _emit_mma_pipeline(
         mma_impl = "universal"
     if mma_impl != "universal" and zero_acc_expr:
         acc_expr = None
+    tcgen05_pid_is_persistent = _is_persistent_pid_config(df.config)
     tcgen05_static_full_tiles = (
         m_size % bm == 0 and n_size % bn == 0 and k_total_size % bk == 0
     )
-    if mma_impl == "tcgen05" and m_size % bm != 0 and n_size % bn != 0:
+    tcgen05_double_edge_output = m_size % bm != 0 and n_size % bn != 0
+    if (
+        mma_impl == "tcgen05"
+        and tcgen05_double_edge_output
+        and (tcgen05_pid_is_persistent or tcgen05_cluster_m != 1)
+    ):
         raise exc.BackendUnsupported(
             "cute",
-            "tcgen05 SIMT edge epilogue currently supports only one partial "
-            "output tile axis at a time. Choose a block_n that divides the "
-            "static N extent, or use a "
-            "non-tcgen05 fallback for double-edge output tiles.",
+            "tcgen05 SIMT edge epilogue double-edge output tiles are currently "
+            "validated only for flat tcgen05_cluster_m=1 kernels. Choose a "
+            "block_m or block_n that divides the static output extent, or use "
+            "a non-tcgen05 fallback for this persistent/clustered config.",
         )
-    if mma_impl == "tcgen05" and not tcgen05_static_full_tiles:
-        # Mixing TMA-loaded full K tiles with scalar-filled K tails requires
-        # cross-warp agreement on the AB pipeline stage. That transition is not
-        # validated yet; use the scalar SMEM fill for every K tile on edge
-        # shapes so full and partial K iterations follow one path.
+    tcgen05_mixed_tma_scalar_fallback = (
+        mma_impl == "tcgen05"
+        and tcgen05_use_tma_pipeline
+        and not tcgen05_static_full_tiles
+        and not tcgen05_pid_is_persistent
+        and tcgen05_cluster_m == 1
+    )
+    tcgen05_edge_scalar_fallback_needs_inter_smem_a = (
+        tcgen05_mixed_tma_scalar_fallback
+        and bk >= 128
+        and (m_size % bm != 0 or n_size % bn != 0)
+    )
+    tcgen05_sync_before_scalar_fallback = (
+        tcgen05_mixed_tma_scalar_fallback and k_total_size % bk != 0
+    )
+    if (
+        mma_impl == "tcgen05"
+        and not tcgen05_static_full_tiles
+        and not tcgen05_mixed_tma_scalar_fallback
+    ):
+        # Mixed TMA full K tiles + scalar fallback tails are currently
+        # validated only for flat one-CTA kernels. Persistent or clustered
+        # partial-output kernels keep the shared scalar path.
         tcgen05_use_tma_a = False
         tcgen05_use_tma_b = False
         tcgen05_use_tma = False
         tcgen05_use_tma_pipeline = False
-    tcgen05_pid_is_persistent = _is_persistent_pid_config(df.config)
     tcgen05_requested_two_cta = _tcgen05_use_2cta_instrs(
         bm=bm, cluster_m=tcgen05_cluster_m
     )
@@ -2294,6 +2322,21 @@ def _emit_mma_pipeline(
         _tcgen05_layout_overrides = layout_overrides_from_config(df.config)
         tcgen05_smem_swizzle_a = _tcgen05_layout_overrides.smem_swizzle_a
         tcgen05_smem_swizzle_b = _tcgen05_layout_overrides.smem_swizzle_b
+        if tcgen05_edge_scalar_fallback_needs_inter_smem_a:
+            # The mixed TMA/scalar edge path writes logical (_row, _col)
+            # coordinates into the tcgen05 A SMEM view. With bk=128,
+            # CuTe's default SW128 A atom is correct for TMA-filled full
+            # tiles but corrupts scalar-filled output-edge tiles. Force
+            # the explicit INTER atom so fallback writes and the wrapper
+            # descriptor agree on the same layout.
+            if tcgen05_smem_swizzle_a not in (None, 0):
+                raise exc.BackendUnsupported(
+                    "cute",
+                    "tcgen05 output-edge scalar fallback with bk >= 128 "
+                    "requires smem_swizzle_a=0 (INTER); nonzero "
+                    "A swizzle overrides are not validated for this path.",
+                )
+            tcgen05_smem_swizzle_a = 0
         if tcgen05_smem_swizzle_a is not None:
             _validate_tcgen05_smem_swizzle_override(
                 operand="a",
@@ -3140,13 +3183,14 @@ def _emit_mma_pipeline(
                 "acc_dtype": acc_dtype_str,
                 "kernel_args": [tma_atom_a, tma_tensor_a, tma_atom_b, tma_tensor_b],
             }
-            # ``smem_swizzle_*`` overrides are recorded only when the
-            # user opts in. Keeping the keys absent on the default path
-            # keeps the no-override wrapper-plan literal free of
-            # override-only state. The wrapper-side
-            # ``_append_cute_wrapper_plan`` reads
-            # ``plan.get(..., None)`` and emits the override-aware SMEM
-            # atom expression only when an explicit value is present.
+            # ``smem_swizzle_*`` overrides are recorded only when codegen
+            # selected an explicit SMEM atom kind (either from a user
+            # override or the scalar-edge fallback workaround). Keeping
+            # the keys absent on the default path preserves the legacy
+            # wrapper-plan literal. The wrapper-side
+            # ``_append_cute_wrapper_plan`` reads ``plan.get(..., None)``
+            # and emits the override-aware SMEM atom expression only
+            # when an explicit value is present.
             if tcgen05_smem_swizzle_a is not None:
                 ab_tma_plan["smem_swizzle_a"] = tcgen05_smem_swizzle_a
             if tcgen05_smem_swizzle_b is not None:
@@ -3882,7 +3926,14 @@ def _emit_mma_pipeline(
                             tma_kloop_args
                         )
                         cg.add_statement(pipeline_producer_stmt)
-                    cg.add_statement(_build_kloop_pipeline_consumer_if(tma_kloop_args))
+                    cg.add_statement(
+                        _build_kloop_pipeline_consumer_if(
+                            tma_kloop_args,
+                            sync_before_scalar_fallback=(
+                                tcgen05_sync_before_scalar_fallback
+                            ),
+                        )
+                    )
             else:
                 non_pipeline_producer_stmt = _build_kloop_non_pipeline_producer_if(
                     tma_kloop_args
