@@ -3295,6 +3295,169 @@ class TestAutotuneBudget(TestCase):
             "run_finishing_phase should stop when the autotune budget is exhausted",
         )
 
+    def test_prepare_wires_budget_hook_into_provider(self) -> None:
+        """``BaseSearch._prepare`` should install the budget-check hook on
+        the benchmark provider so the initial-population
+        compile/benchmark phase can short-circuit once the wall-clock
+        budget is exhausted.
+        """
+        settings = Settings(
+            autotune_budget_seconds=1,
+            autotune_log_level=logging.CRITICAL,
+        )
+        search = self._make_search(settings)
+        self.assertEqual(
+            search.benchmark_provider.budget_exceeded_fn,
+            search._autotune_budget_exceeded,
+        )
+
+    def _make_stub_provider(self):
+        """Construct a minimal ``LocalBenchmarkProvider`` for budget-loop
+        tests without standing up a real kernel/config_spec.
+        """
+        from helion.autotuner.benchmark_provider import LocalBenchmarkProvider
+
+        provider = LocalBenchmarkProvider.__new__(LocalBenchmarkProvider)
+        provider.kernel = SimpleNamespace(
+            compile_config=lambda config, allow_print: lambda *a, **kw: None,
+            format_kernel_decorator=lambda config, s: "decorator",
+            env=SimpleNamespace(process_group_name=None),
+        )
+        provider.settings = Settings(autotune_log_level=logging.CRITICAL)
+        # Match the cute backend's path: CuteBackend.supports_precompile()
+        # is False, which clears autotune_precompile in autotune setup.
+        provider.settings.autotune_precompile = None
+        provider.config_spec = SimpleNamespace()
+        provider.args = ()
+        provider.log = AutotuningLogger(provider.settings)
+        provider._autotune_metrics = SimpleNamespace(
+            num_configs_tested=0,
+            num_compile_failures=0,
+            num_accuracy_failures=0,
+            num_generations=0,
+        )
+        provider.mutated_arg_indices = ()
+        provider._benchmark_worker = None
+        provider._precompile_args_path = None
+        provider._precompile_tmpdir = None
+        return provider
+
+    def test_benchmark_provider_short_circuits_compile_loop(self) -> None:
+        """``LocalBenchmarkProvider.benchmark`` must stop compiling
+        configs once ``budget_exceeded_fn`` returns ``True`` from inside
+        the compile loop, and still return one ``BenchmarkResult`` per
+        input config so callers receive a positionally-aligned list.
+        """
+        from helion.autotuner.benchmark_provider import BenchmarkResult
+        from helion.autotuner.benchmark_provider import LocalBenchmarkProvider
+
+        provider = self._make_stub_provider()
+
+        compiled_count = [0]
+        budget_calls = [0]
+
+        original_compile = provider.kernel.compile_config
+
+        def counting_compile(config, allow_print):
+            compiled_count[0] += 1
+            return original_compile(config, allow_print)
+
+        provider.kernel.compile_config = counting_compile
+
+        def budget_check():
+            budget_calls[0] += 1
+            return compiled_count[0] >= 2
+
+        provider.set_budget_exceeded_fn(budget_check)
+
+        from helion.runtime.config import Config
+
+        configs = [Config() for _ in range(5)]
+
+        with patch.object(
+            LocalBenchmarkProvider,
+            "_benchmark_function",
+            return_value=0.001,
+        ):
+            results = provider.benchmark(configs)
+
+        self.assertEqual(len(results), len(configs))
+        compiled_finite = sum(1 for r in results if math.isfinite(r.perf))
+        self.assertLessEqual(compiled_count[0], 2)
+        self.assertLessEqual(compiled_finite, compiled_count[0])
+        for r in results[compiled_count[0] :]:
+            self.assertEqual(r.status, "error")
+            self.assertEqual(r.perf, float("inf"))
+        for r in results:
+            self.assertIsInstance(r, BenchmarkResult)
+        # The hook must actually fire; without it the loop wouldn't break.
+        self.assertGreater(budget_calls[0], 0)
+
+    def test_benchmark_provider_short_circuits_benchmark_loop(self) -> None:
+        """If compilation finishes cleanly and the budget only fires
+        partway through the benchmark loop, remaining configs must be
+        left at the default ``perf=inf, status="error"`` slots while the
+        earlier benchmarked configs keep their measured perf.
+        """
+        from helion.autotuner.benchmark_provider import BenchmarkResult
+        from helion.autotuner.benchmark_provider import LocalBenchmarkProvider
+
+        provider = self._make_stub_provider()
+
+        # All compiles succeed; budget stays clear during compilation.
+        benchmark_count = [0]
+
+        def budget_check():
+            # Trip the budget after 2 benchmark calls.
+            return benchmark_count[0] >= 2
+
+        provider.set_budget_exceeded_fn(budget_check)
+
+        def counting_benchmark(self_, config, fn):
+            benchmark_count[0] += 1
+            return 0.001
+
+        from helion.runtime.config import Config
+
+        configs = [Config() for _ in range(5)]
+
+        with patch.object(
+            LocalBenchmarkProvider,
+            "_benchmark_function",
+            new=counting_benchmark,
+        ):
+            results = provider.benchmark(configs)
+
+        self.assertEqual(len(results), len(configs))
+        # At most 2 benchmarks ran (the loop checks before each call).
+        self.assertLessEqual(benchmark_count[0], 2)
+        # First few entries have finite measured perf.
+        finite_count = sum(1 for r in results if math.isfinite(r.perf))
+        self.assertEqual(finite_count, benchmark_count[0])
+        # The tail entries must be the inf/error defaults.
+        for r in results[benchmark_count[0] :]:
+            self.assertEqual(r.status, "error")
+            self.assertEqual(r.perf, float("inf"))
+        for r in results:
+            self.assertIsInstance(r, BenchmarkResult)
+
+    def test_benchmark_provider_default_hook_is_no_op(self) -> None:
+        """A provider that never had its hook installed must read the
+        class-level no-op default rather than raising ``AttributeError``
+        on the first ``budget_exceeded_fn()`` call.
+        """
+        from helion.autotuner.benchmark_provider import BenchmarkProvider
+        from helion.autotuner.benchmark_provider import LocalBenchmarkProvider
+        from helion.autotuner.benchmark_provider import _never_exceeded
+
+        # Class-level default lives on the abstract base so any subclass
+        # picks it up even if it forgets to call super().__init__.
+        self.assertIs(BenchmarkProvider.budget_exceeded_fn, _never_exceeded)
+        # Subclass instance with no __init__ work still resolves the
+        # default via class-level descriptor.
+        provider = LocalBenchmarkProvider.__new__(LocalBenchmarkProvider)
+        self.assertFalse(provider.budget_exceeded_fn())
+
 
 if __name__ == "__main__":
     unittest.main()
