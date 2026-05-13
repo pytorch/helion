@@ -21,6 +21,7 @@ from helion._compiler.cute.tcgen05_config import CuteTcgen05Config
 from helion._compiler.cute.tcgen05_constants import TCGEN05_ONE_CTA_MAX_BLOCK_M
 from helion._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
 from helion._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
+from helion._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K
 from helion._testing import DEVICE
 from helion._testing import HALF_DTYPE
 from helion._testing import RefEagerTestDisabled
@@ -221,6 +222,9 @@ def _bind_cute_strategy_kernel():
         torch.empty([256, 256], device=DEVICE, dtype=HALF_DTYPE),
         torch.empty([256, 256], device=DEVICE, dtype=HALF_DTYPE),
     )
+    # The strategy tests mutate the returned config_spec; avoid sharing that
+    # state through the bound-kernel cache across test methods.
+    _cute_strategy_matmul_kernel._bound_kernels.clear()
     with (
         patch_cute_mma_support(),
         patch(
@@ -1344,6 +1348,48 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         self.assertTrue(spec.cute_tcgen05_search_enabled)
         self.assertEqual([x.max_size for x in spec.block_sizes], [128, 256, 64])
 
+    @onlyBackends(["cute"])
+    def test_cute_tcgen05_edge_k_tail_family_admits_cluster_m2_search(self) -> None:
+        """The large double-edge + K-tail family exposes CtaGroup.TWO search."""
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_mma(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        args = (
+            torch.empty([5000, 5000], device=DEVICE, dtype=HALF_DTYPE),
+            torch.empty([5000, 5000], device=DEVICE, dtype=HALF_DTYPE),
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_mma.bind(args)
+        spec = bound.config_spec
+        self.assertTrue(spec.cute_tcgen05_search_enabled)
+        self.assertEqual([x.max_size for x in spec.block_sizes], [128, 256, 128])
+        self.assertEqual(spec._tcgen05_cluster_m_search_choices, (1, 2))
+        self.assertNotIn("persistent_blocked", spec.allowed_pid_types)
+        self.assertIn("persistent_interleaved", spec.allowed_pid_types)
+        flat_fields = spec._flat_fields()
+        self.assertIn("pid_type", flat_fields)
+        self.assertIn("persistent_interleaved", flat_fields["pid_type"].choices)
+        constraints = spec._tcgen05_cluster_m2_search_constraints
+        assert constraints is not None
+        self.assertTrue(constraints.allow_edge_k_tail_family)
+        self.assertTrue(
+            spec._tcgen05_cluster_m2_bk_is_valid(
+                TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K,
+                constraints,
+            )
+        )
+        self.assertFalse(spec._tcgen05_cluster_m2_bk_is_valid(64, constraints))
+
     def test_tcgen05_edge_tile_detection_skips_unknown_dims(self) -> None:
         config_spec = SimpleNamespace(
             block_sizes=SimpleNamespace(
@@ -1525,6 +1571,52 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         self.assertEqual(spec._tcgen05_cluster_m_search_choices, (1, 2))
         self.assertEqual(spec._tcgen05_num_epi_warps_search_choices, (4,))
         self.assertEqual(spec._tcgen05_num_epi_warps_validation_choices, (4,))
+
+        spec = stub.bind(args).config_spec
+        with self.assertRaisesRegex(
+            AssertionError,
+            "cluster_m=2 search requires persistent pid types",
+        ):
+            spec.narrow_tcgen05_autotune_to_validated_configs(
+                allow_cluster_m2_search=True,
+                cluster_m2_static_k=5000,
+            )
+
+        spec = stub.bind(args).config_spec
+        with self.assertRaisesRegex(
+            AssertionError,
+            "edge/K-tail admission requires cluster_m=2 search",
+        ):
+            spec.narrow_tcgen05_autotune_to_validated_configs(
+                cluster_m2_static_k=5000,
+                allow_cluster_m2_edge_k_tail_family=True,
+            )
+
+        spec = stub.bind(args).config_spec
+        spec.allowed_pid_types = (
+            "flat",
+            "xyz",
+            "persistent_blocked",
+            "persistent_interleaved",
+        )
+        spec.narrow_tcgen05_autotune_to_validated_configs(
+            allow_cluster_m2_search=True,
+            cluster_m2_static_k=5000,
+            allow_cluster_m2_edge_k_tail_family=True,
+        )
+        self.assertNotIn("persistent_blocked", spec.allowed_pid_types)
+        self.assertIn("persistent_interleaved", spec.allowed_pid_types)
+        self.assertEqual(spec._tcgen05_cluster_m_search_choices, (1, 2))
+        constraints = spec._tcgen05_cluster_m2_search_constraints
+        assert constraints is not None
+        self.assertTrue(constraints.allow_edge_k_tail_family)
+        self.assertTrue(
+            spec._tcgen05_cluster_m2_bk_is_valid(
+                TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K,
+                constraints,
+            )
+        )
+        self.assertFalse(spec._tcgen05_cluster_m2_bk_is_valid(64, constraints))
 
     def test_restrict_tcgen05_num_epi_warps_search_helper(self) -> None:
         """Direct unit test for ``restrict_tcgen05_num_epi_warps_search``.

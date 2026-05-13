@@ -6,10 +6,19 @@ from __future__ import annotations
 TCGEN05_TWO_CTA_BLOCK_M = 256
 TCGEN05_TWO_CTA_BLOCK_N = 256
 TCGEN05_TWO_CTA_MAX_K_TILES = 256
-# Best measured seed L2 grouping for the validated 4096^3 CtaGroup.TWO row.
+# The double-output-edge + K-tail CtaGroup.TWO search family is validated
+# only for large square-ish GEMMs where persistent clustered scheduling has
+# enough work to amortize its edge handling.
+TCGEN05_TWO_CTA_EDGE_K_TAIL_MIN_DIM = 4096
+# That same family is validated only at this K/stage point.
+TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K = 128
+TCGEN05_TWO_CTA_EDGE_K_TAIL_AB_STAGES = 3
+TCGEN05_TWO_CTA_EDGE_K_TAIL_ACC_STAGES = 1
+TCGEN05_TWO_CTA_EDGE_K_TAIL_C_STAGES = 4
+# Best measured seed L2 grouping for the full-tile CtaGroup.TWO row.
 TCGEN05_TWO_CTA_SEED_L2_GROUPING = 4
-# Same-session forced 4096^3 sweeps keep this pid order slightly ahead of
-# persistent_blocked while staying in the validated CtaGroup.TWO envelope.
+# This pid order stays slightly ahead of persistent_blocked in the validated
+# CtaGroup.TWO envelope.
 TCGEN05_TWO_CTA_SEED_PID_TYPE = "persistent_interleaved"
 
 # SMEM budget reserved for non-AB allocations on B200 when sampling the
