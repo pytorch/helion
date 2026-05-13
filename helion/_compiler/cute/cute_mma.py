@@ -167,6 +167,70 @@ class _Tcgen05LayoutPlan:
 
 
 @dataclass(frozen=True)
+class _Tcgen05AuxPerDescriptorRingNames:
+    """Generated CuTe variable names for one auxiliary-tensor SMEM ring.
+
+    One instance per :class:`Tcgen05AuxTensorDescriptor` registered on
+    the matmul plan when the productive-body gate fires
+    (``c_input_warp_count > 0`` AND non-empty
+    ``aux_tensor_descriptors``). Each ring has its own
+    ``make_smem_layout_epi``-based SMEM layout, ``alloc_smem`` ptr,
+    and ``make_tensor`` view; the producer body in
+    ``program_id._build_c_input_warp_role_local_while`` indexes the
+    ring by descriptor position, and cycle 3's consumer-side flip
+    in ``memory_ops._aux_subtile_load_source`` reads from the same
+    SMEM tensor in descriptor-list order.
+    """
+
+    smem_layout: str
+    smem_ptr: str
+    smem: str
+
+
+@dataclass(frozen=True)
+class _Tcgen05AuxPipelinePlan:
+    """Generated CuTe variable names for the C-input warp's
+    auxiliary-tensor SMEM-ring pipeline (``cute_plan.md`` §7.5.3.2).
+
+    Pure name container, mirroring ``_Tcgen05SchedPipelinePlan``.
+    Each field is the textual identifier of a value materialized in
+    the kernel prefix when ``_emit_tcgen05_aux_pipeline_setup``
+    runs. The pipeline is allocated only when the productive-body
+    gate fires (``c_input_warp_count > 0`` AND non-empty
+    ``aux_tensor_descriptors``).
+
+    ``rings`` carries the per-descriptor SMEM ring names in
+    descriptor-list order — the same order
+    ``CuteTcgen05MatmulPlan.aux_tensor_descriptors`` exposes them.
+    The producer body indexes by position; the consumer side
+    (cycle 3) consumes the same ordering.
+
+    Consumer cooperative group: **``epi_warp_count`` (per-warp,
+    NOT per-thread)**. Cycle 3's consumer-side flip in
+    ``memory_ops._aux_subtile_load_source`` will gate
+    ``consumer_release(c_pipeline_aux)`` on ``lane_idx() == 0``
+    (matching the sched-pipeline pattern from
+    ``_build_role_local_while_with_scheduler``), so the consumer
+    arrive count is per-warp. Setting per-thread would hang cycle
+    3 waiting for 31 missing per-warp arrivals per stage.
+    """
+
+    barriers: str
+    producer_group: str
+    consumer_group: str
+    pipeline: str
+    producer_state: str
+    # Pre-allocated for cycle 3: the consumer-side flip in
+    # ``memory_ops._aux_subtile_load_source`` will issue
+    # ``c_pipeline_aux.consumer_wait`` / ``consumer_release`` keyed
+    # off this state. Cycle 2a allocates the name + the
+    # ``make_pipeline_state(...)`` initializer so cycle 3 can wire
+    # it in place without revisiting the allocator.
+    consumer_state: str
+    rings: tuple[_Tcgen05AuxPerDescriptorRingNames, ...]
+
+
+@dataclass(frozen=True)
 class _Tcgen05SchedPipelinePlan:
     """Generated CuTe variable names for the scheduler-broadcast pipeline.
 
@@ -2780,6 +2844,56 @@ def _emit_mma_pipeline(
             # safe to emit at the kernel prefix.
             if tcgen05_matmul_plan.is_clc_persistent:
                 prefix.extend(_emit_clc_smem_setup(tcgen05_sched_plan))
+            # C-input warp aux SMEM ring + ``c_pipeline_aux``
+            # ``PipelineAsync`` (``cute_plan.md`` §7.5.3.2 cycle 2
+            # of the producer-body split). Fires only when the
+            # productive-body gate is open: ``c_input_warp_count > 0``
+            # AND a non-empty ``aux_tensor_descriptors`` tuple. The
+            # role-local while builder in
+            # ``program_id._build_c_input_warp_role_local_while``
+            # emits the per-descriptor producer body that issues
+            # ``producer_acquire`` → cooperative
+            # ``cute.copy(GMEM, SMEM_ring[stage])`` →
+            # ``producer_commit`` against the same plan; cycle 3 will
+            # flip the consumer-side splice in
+            # ``memory_ops._aux_subtile_load_source`` to read from
+            # the SMEM ring under ``consumer_wait`` /
+            # ``consumer_release`` gating. Gate-closed configs
+            # (``c_input_warps=0`` or no aux residual) skip this
+            # allocation entirely and preserve byte identity.
+            if (
+                tcgen05_matmul_plan.has_c_input_warp
+                and tcgen05_matmul_plan.aux_tensor_descriptors
+            ):
+                aux_descriptor_dtype_strs = tuple(
+                    env.backend.dtype_str(desc.host_tensor_val.dtype)
+                    for desc in tcgen05_matmul_plan.aux_tensor_descriptors
+                )
+                tcgen05_aux_plan = _new_tcgen05_aux_pipeline_plan(
+                    df,
+                    num_rings=len(tcgen05_matmul_plan.aux_tensor_descriptors),
+                )
+                df.register_cute_tcgen05_aux_pipeline_plan(tcgen05_aux_plan)
+                prefix.extend(
+                    _emit_tcgen05_aux_pipeline_setup(
+                        tcgen05_aux_plan,
+                        descriptor_dtype_strs=aux_descriptor_dtype_strs,
+                        epi_tile_var=tcgen05_plan.epi_tile,
+                        # Single C-input warp = 32 lanes (validator
+                        # pins ``c_input_warp_count`` to ``{0, 1}``
+                        # under WITH_SCHEDULER); all 32 lanes
+                        # participate in the producer-side
+                        # cooperative copy.
+                        c_input_warp_thread_count=(
+                            tcgen05_matmul_plan.c_input_warp_count * 32
+                        ),
+                        # Per-warp consumer arrive count for cycle
+                        # 3's lane-0-gated release — see the
+                        # emitter docstring.
+                        epi_warp_count=tcgen05_matmul_plan.epi_warp_count,
+                        defer_sync=tcgen05_use_cluster_deferred_pipelines,
+                    )
+                )
         if not tcgen05_use_tma:
             _emit_tcgen05_tmem_setup()
     else:
@@ -4515,6 +4629,155 @@ def _emit_sched_pipeline_setup(
             f"cutlass.pipeline.PipelineUserType.Consumer, {sched_stage_count})"
         ),
     ]
+
+
+#: Fixed stage count for the aux SMEM-ring pipeline (cycle 2 of the
+#: producer-body split, ``cute_plan.md`` §7.5.3.2). Matches the
+#: existing D-store ``c_pipeline`` 2-stage default. Future cycles
+#: may make this autotunable once the producer body lands.
+_TCGEN05_AUX_PIPELINE_STAGE_COUNT = 2
+
+
+def _new_tcgen05_aux_pipeline_plan(
+    df: DeviceFunction,
+    *,
+    num_rings: int,
+) -> _Tcgen05AuxPipelinePlan:
+    """Allocate variable names for the C-input warp's aux-tensor
+    SMEM-ring pipeline (``cute_plan.md`` §7.5.3.2).
+
+    ``num_rings`` is the number of aux-tensor descriptors registered
+    on the matmul plan; the producer body indexes the rings by
+    descriptor position, and cycle 3's consumer-side flip consumes
+    the same ordering.
+    """
+    assert num_rings >= 1, (
+        "aux pipeline plan requires at least one descriptor; the gate "
+        "in ``_codegen_cute_mma`` should not call this with an empty "
+        "descriptor tuple"
+    )
+    rings = tuple(
+        _Tcgen05AuxPerDescriptorRingNames(
+            smem_layout=df.new_var(f"tcgen05_aux_smem_layout_{idx}"),
+            smem_ptr=df.new_var(f"tcgen05_aux_smem_ptr_{idx}"),
+            smem=df.new_var(f"tcgen05_aux_smem_{idx}"),
+        )
+        for idx in range(num_rings)
+    )
+    return _Tcgen05AuxPipelinePlan(
+        barriers=df.new_var("tcgen05_aux_pipeline_mbars"),
+        producer_group=df.new_var("tcgen05_aux_pipeline_producer_group"),
+        consumer_group=df.new_var("tcgen05_aux_pipeline_consumer_group"),
+        pipeline=df.new_var("tcgen05_aux_pipeline"),
+        producer_state=df.new_var("tcgen05_aux_pipeline_producer_state"),
+        consumer_state=df.new_var("tcgen05_aux_pipeline_consumer_state"),
+        rings=rings,
+    )
+
+
+def _emit_tcgen05_aux_pipeline_setup(
+    plan: _Tcgen05AuxPipelinePlan,
+    *,
+    descriptor_dtype_strs: tuple[str, ...],
+    epi_tile_var: str,
+    c_input_warp_thread_count: int,
+    epi_warp_count: int,
+    defer_sync: bool,
+) -> list[ast.AST]:
+    """Emit the prefix statements that construct the aux SMEM rings
+    + ``c_pipeline_aux`` ``PipelineAsync`` for cycle 2 of the
+    producer-body split (``cute_plan.md`` §7.5.3.2).
+
+    Per descriptor, allocates a SMEM ring sized by
+    ``make_smem_layout_epi(<aux_dtype>, ROW_MAJOR, epi_tile,
+    _TCGEN05_AUX_PIPELINE_STAGE_COUNT)`` — the same staged-epilogue
+    layout the D-output uses. Cycle 3's consumer-side flip in
+    ``memory_ops._aux_subtile_load_source`` consumes the SMEM
+    tensor via the same ``partition_C → transform → flat_divide(epi_tile)
+    → partition_D`` pipeline the existing GMEM path already uses,
+    so the layout choice keeps cycle 3 a localized GMEM→SMEM
+    operand swap.
+
+    Pipeline parameters:
+
+    - ``producer_arrive_count = c_input_warp_thread_count`` (32 for
+      the single C-input warp). The producer body issues
+      ``producer_acquire`` / ``producer_commit`` per-thread, so
+      the cooperative-group arrive count is per-thread.
+    - ``consumer_arrive_count = epi_warp_count`` (per-warp, NOT
+      per-thread). Cycle 3's consumer-side flip will gate
+      ``consumer_release(c_pipeline_aux)`` on ``lane_idx() == 0``
+      (matching the sched-pipeline pattern from
+      ``_build_role_local_while_with_scheduler``). Setting
+      per-thread would hang cycle 3 waiting for 31 missing
+      per-warp arrivals per stage.
+    - ``defer_sync`` mirrors the AB / acc / sched pipelines'
+      cluster-deferred-init participation so the
+      ``pipeline_init_arrive`` / ``pipeline_init_wait`` rendezvous
+      spans every pipeline.
+    """
+    extra_args = ", defer_sync=True" if defer_sync else ""
+    stage_count = _TCGEN05_AUX_PIPELINE_STAGE_COUNT
+    lines: list[ast.AST] = []
+    for ring, dtype_str in zip(plan.rings, descriptor_dtype_strs, strict=True):
+        lines.extend(
+            [
+                statement_from_string(
+                    f"{ring.smem_layout} = "
+                    f"cutlass.utils.blackwell_helpers.make_smem_layout_epi("
+                    f"{dtype_str}, cutlass.utils.layout.LayoutEnum.ROW_MAJOR, "
+                    f"{epi_tile_var}, {stage_count})"
+                ),
+                statement_from_string(
+                    f"{ring.smem_ptr} = cute.arch.alloc_smem("
+                    f"{dtype_str}, cute.cosize({ring.smem_layout}.outer), "
+                    "alignment=1024)"
+                ),
+                statement_from_string(
+                    f"{ring.smem} = cute.make_tensor("
+                    f"cute.recast_ptr({ring.smem_ptr}, "
+                    f"{ring.smem_layout}.inner, dtype={dtype_str}), "
+                    f"{ring.smem_layout}.outer)"
+                ),
+            ]
+        )
+    lines.extend(
+        [
+            statement_from_string(
+                f"{plan.barriers} = cute.arch.alloc_smem("
+                f"cutlass.Int64, cutlass.Int32({stage_count * 2}))"
+            ),
+            statement_from_string(
+                f"{plan.producer_group} = "
+                "cutlass.pipeline.CooperativeGroup("
+                "cutlass.pipeline.Agent.Thread, "
+                f"cutlass.Int32({c_input_warp_thread_count}))"
+            ),
+            statement_from_string(
+                f"{plan.consumer_group} = "
+                "cutlass.pipeline.CooperativeGroup("
+                "cutlass.pipeline.Agent.Thread, "
+                f"cutlass.Int32({epi_warp_count}))"
+            ),
+            statement_from_string(
+                f"{plan.pipeline} = cutlass.pipeline.PipelineAsync.create("
+                f"num_stages={stage_count}, "
+                f"producer_group={plan.producer_group}, "
+                f"consumer_group={plan.consumer_group}, "
+                f"barrier_storage={plan.barriers}"
+                f"{extra_args})"
+            ),
+            statement_from_string(
+                f"{plan.producer_state} = cutlass.pipeline.make_pipeline_state("
+                f"cutlass.pipeline.PipelineUserType.Producer, {stage_count})"
+            ),
+            statement_from_string(
+                f"{plan.consumer_state} = cutlass.pipeline.make_pipeline_state("
+                f"cutlass.pipeline.PipelineUserType.Consumer, {stage_count})"
+            ),
+        ]
+    )
+    return lines
 
 
 def _tcgen05_epilogue_dest_expr(plan: _Tcgen05LayoutPlan, tensor: str) -> str:
