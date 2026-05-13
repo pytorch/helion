@@ -44,6 +44,7 @@ from .variable_origin import TensorSizeOrigin
 
 if TYPE_CHECKING:
     from ..runtime.config import Config
+    from .cute.aux_tensor import Tcgen05AuxTensorDescriptor
     from .device_ir import HelperFunctionGraphInfo
     from .generate_ast import GenerateAST
     from .indexing_strategy import IndexingStrategy
@@ -347,6 +348,39 @@ class CuteTcgen05MatmulPlan:
     # axis to promote L2 reuse on bandwidth-bound shapes.
     # See ``cute_plan.md`` §7.6.7 (cycle 42 wiring + bench).
     l2_swizzle_size: int = 1
+    # ``aux_tensor_descriptors`` is the set of auxiliary-tensor
+    # descriptors discovered by the forward FX walker
+    # (``cute.aux_tensor.discover_tcgen05_aux_tensor_descriptors``)
+    # at MMA-codegen time. Each descriptor carries the FX node
+    # identity, shape, dtype, and broadcast axis of one aux tensor
+    # consumed by a downstream store's epilogue chain (e.g. the
+    # ``residual[tile_m, tile_n]`` operand in
+    # ``out[tile] = (acc + residual[tile]).to(dtype)``). The
+    # productive C-input warp (``cute_plan.md`` §7.5.3.2) uses these
+    # to allocate the SMEM ring + TMA atom for the aux load at the
+    # same point where the matmul plan is constructed, well before
+    # the store-codegen splice runs and discovers the same chains
+    # backward. Default empty tuple keeps the field optional so
+    # non-residual kernels — and every kernel until the productive
+    # body lands — preserve byte identity (the codegen consumers
+    # gate on ``aux_tensor_descriptors`` being non-empty, which is
+    # only true on chains the walker actually accepts).
+    #
+    # ``compare=False``: the descriptors are *per-anchor* data —
+    # two matmuls with identical collective parameters (cluster
+    # shape, stages, warp roles, …) but distinct downstream aux
+    # tensors must not be rejected as "mixed collective plans" by
+    # ``register_cute_tcgen05_matmul_plan``'s equality gate, and
+    # ``Tcgen05AuxTensorDescriptor.host_tensor_val: torch.Tensor``
+    # would otherwise drive the auto-generated ``__eq__`` through a
+    # tensor ``==`` that does not reduce to ``bool`` for non-scalar
+    # tensors. Excluding the field from ``__eq__`` keeps the plan
+    # equality semantics strictly about collective parameters; the
+    # descriptors are read by their per-anchor consumers without
+    # going through the equality path.
+    aux_tensor_descriptors: tuple[Tcgen05AuxTensorDescriptor, ...] = dataclasses.field(
+        default=(), compare=False
+    )
 
     @property
     def is_clc_persistent(self) -> bool:
