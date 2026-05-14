@@ -119,6 +119,8 @@ from .block_id_sequence import _PowerOfTwoBlockIdItem
 from .config_fragment import BlockSizeFragment
 from .config_fragment import BooleanFragment
 from .config_fragment import ConfigSpecFragment
+from .config_fragment import DefaultBiasedEnumFragment
+from .config_fragment import DefaultBiasedIntegerFragment
 from .config_fragment import EnumFragment
 from .config_fragment import IntegerFragment
 from .config_fragment import ListOf
@@ -347,6 +349,8 @@ EPILOGUE_SUBTILE_EXTENDED_CHOICES = (None, 2, 4)
 EPILOGUE_SUBTILE_DEFAULT_CHOICES = (None, 2)
 EPILOGUE_SUBTILE_MIN_K_HINT = 1024
 EPILOGUE_SUBTILE_MIN_K_HINT_EXTENDED = 16384
+RANGE_INT_RANDOM_DEFAULT_PROBABILITY = 0.95
+RANGE_WARP_SPECIALIZE_RANDOM_DEFAULT_PROBABILITY = 0.90
 # maxnreg values: None means no limit, otherwise limit to this many registers per thread
 # Lower values allow higher occupancy but may hurt performance for register-heavy kernels
 VALID_MAXNREG = (None, 32, 64, 128, 256)
@@ -3056,16 +3060,30 @@ class _OptionalBoolSpec(_BlockIdItem):
 
 class RangeUnrollFactorSpec(_OptionalIntSpec):
     def _fragment(self, base: ConfigSpec) -> IntegerFragment:
-        return IntegerFragment(0, 4, 0)
+        return DefaultBiasedIntegerFragment(
+            0,
+            4,
+            0,
+            default_probability=RANGE_INT_RANDOM_DEFAULT_PROBABILITY,
+        )
 
 
 class RangeWarpSpecializeSpec(_OptionalBoolSpec):
-    pass
+    def _fragment(self, base: ConfigSpec) -> EnumFragment:
+        return DefaultBiasedEnumFragment(
+            (None, False, True),
+            default_probability=RANGE_WARP_SPECIALIZE_RANDOM_DEFAULT_PROBABILITY,
+        )
 
 
 class RangeNumStagesSpec(_OptionalIntSpec):
     def _fragment(self, base: ConfigSpec) -> IntegerFragment:
-        return IntegerFragment(0, 4, 0)
+        return DefaultBiasedIntegerFragment(
+            0,
+            4,
+            0,
+            default_probability=RANGE_INT_RANDOM_DEFAULT_PROBABILITY,
+        )
 
 
 class RangeMultiBufferSpec(_OptionalBoolSpec):
