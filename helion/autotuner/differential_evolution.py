@@ -144,11 +144,7 @@ class DifferentialEvolutionSearch(PopulationBasedSearch):
                 return pop[:target]
             return pop
 
-        return self.config_gen.random_population_flat(
-            self.population_size * 2,
-            user_seed_configs=self._autotune_seed_configs(),
-            log_func=self.log,
-        )
+        return self._random_population_flat_with_heuristics(self.population_size * 2)
 
     def initial_two_generations(self) -> None:
         # The initial population is 2x larger so we can throw out the slowest half and give the tuning process a head start

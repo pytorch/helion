@@ -5,6 +5,8 @@ from typing import TYPE_CHECKING
 from .base_search import normalize_autotune_seed_configs
 from .effort_profile import RANDOM_SEARCH_DEFAULTS
 from .finite_search import FiniteSearch
+from .matmul_heuristics import matmul_heuristic_seed_configs_for_kernel
+from .matmul_heuristics import matmul_heuristics_supported_on_args
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -36,16 +38,28 @@ class RandomSearch(FiniteSearch):
         args: Sequence[object],
         count: int = RANDOM_SEARCH_DEFAULTS.count,
     ) -> None:
+        config_gen = kernel.config_spec.create_config_generation(
+            overrides=kernel.settings.autotune_config_overrides or None,
+            advanced_controls_files=kernel.settings.autotune_search_acf or None,
+            process_group_name=kernel.env.process_group_name,
+        )
+        seed_configs = list(normalize_autotune_seed_configs(kernel.settings))
+        if matmul_heuristics_supported_on_args(args):
+            seed_configs = [
+                *matmul_heuristic_seed_configs_for_kernel(
+                    kernel,
+                    args,
+                    config_spec=config_gen.config_spec,
+                    max_configs=1,
+                ),
+                *seed_configs,
+            ]
         super().__init__(
             kernel,
             args,
-            configs=kernel.config_spec.create_config_generation(
-                overrides=kernel.settings.autotune_config_overrides or None,
-                advanced_controls_files=kernel.settings.autotune_search_acf or None,
-                process_group_name=kernel.env.process_group_name,
-            ).random_population(
+            configs=config_gen.random_population(
                 count,
-                user_seed_configs=normalize_autotune_seed_configs(kernel.settings),
+                user_seed_configs=seed_configs,
             ),
         )
 
