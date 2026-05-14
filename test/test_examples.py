@@ -1543,7 +1543,135 @@ class TestExamples(RefEagerTestBase, TestCase):
                 rtol=1e-2,
             )
 
-    @xfailIfPallasTpu("tensor-derived if-predicates not supported")
+    def _jagged_gdpa_inputs(self):
+        torch.manual_seed(0)
+        num_sequences = 4
+        heads = 4
+        head_dim = 64
+        max_seq_len_q = 128
+        max_seq_len_kv = 128
+        qk_scale = 1.0
+
+        lengths_q = torch.randint(
+            max_seq_len_q // 2,
+            max_seq_len_q + 1,
+            (num_sequences,),
+            dtype=torch.int32,
+        )
+        lengths_kv = torch.randint(
+            max_seq_len_kv // 2,
+            max_seq_len_kv + 1,
+            (num_sequences,),
+            dtype=torch.int32,
+        )
+        q_offsets = torch.cat(
+            [
+                torch.zeros(1, dtype=torch.int32),
+                torch.cumsum(lengths_q, dim=0).to(torch.int32),
+            ]
+        ).to(DEVICE)
+        kv_offsets = torch.cat(
+            [
+                torch.zeros(1, dtype=torch.int32),
+                torch.cumsum(lengths_kv, dim=0).to(torch.int32),
+            ]
+        ).to(DEVICE)
+        L_q = int(q_offsets[-1].item())
+        L_kv = int(kv_offsets[-1].item())
+
+        q = torch.randn(L_q, heads, head_dim, dtype=torch.float32, device=DEVICE)
+        k = torch.randn(L_kv, heads, head_dim, dtype=torch.float32, device=DEVICE)
+        v = torch.randn(L_kv, heads, head_dim, dtype=torch.float32, device=DEVICE)
+        dO = torch.randn(L_q, heads, head_dim, dtype=torch.float32, device=DEVICE)
+
+        return q, k, v, dO, q_offsets, kv_offsets, max_seq_len_q, max_seq_len_kv, qk_scale
+
+    def test_jagged_gdpa_fwd(self):
+        q, k, v, dO, q_offsets, kv_offsets, max_seq_len_q, max_seq_len_kv, qk_scale = (
+            self._jagged_gdpa_inputs()
+        )
+        args = (q, k, v, q_offsets, kv_offsets, max_seq_len_q, max_seq_len_kv, qk_scale)
+
+        mod = import_path(EXAMPLES_DIR / "jagged_gdpa.py")
+        expected = mod.reference_jagged_gdpa_fwd(*args)
+
+        check_example(
+            "jagged_gdpa",
+            args,
+            expected,
+            fn_name="jagged_gdpa_fwd",
+            block_sizes=[32, 32],
+            atol=1e-4,
+            rtol=1e-4,
+        )
+
+    def test_jagged_gdpa_bwd_dk(self):
+        q, k, v, dO, q_offsets, kv_offsets, max_seq_len_q, max_seq_len_kv, qk_scale = (
+            self._jagged_gdpa_inputs()
+        )
+        args = (
+            q, k, v, dO, q_offsets, kv_offsets, max_seq_len_q, max_seq_len_kv, qk_scale,
+        )
+
+        mod = import_path(EXAMPLES_DIR / "jagged_gdpa.py")
+        _, dk_expected, _ = mod.reference_jagged_gdpa_bwd(*args)
+
+        check_example(
+            "jagged_gdpa",
+            args,
+            dk_expected,
+            fn_name="jagged_gdpa_bwd_dk",
+            block_sizes=[32, 32],
+            atol=1e-4,
+            rtol=1e-4,
+        )
+
+    def test_jagged_gdpa_bwd_dv(self):
+        q, k, v, dO, q_offsets, kv_offsets, max_seq_len_q, max_seq_len_kv, qk_scale = (
+            self._jagged_gdpa_inputs()
+        )
+        bwd_args = (
+            q, k, v, dO, q_offsets, kv_offsets, max_seq_len_q, max_seq_len_kv, qk_scale,
+        )
+        dv_args = (
+            q, k, dO, q_offsets, kv_offsets, max_seq_len_q, max_seq_len_kv, qk_scale,
+        )
+
+        mod = import_path(EXAMPLES_DIR / "jagged_gdpa.py")
+        _, _, dv_expected = mod.reference_jagged_gdpa_bwd(*bwd_args)
+
+        check_example(
+            "jagged_gdpa",
+            dv_args,
+            dv_expected,
+            fn_name="jagged_gdpa_bwd_dv",
+            block_sizes=[32, 32],
+            atol=1e-4,
+            rtol=1e-4,
+        )
+
+    def test_jagged_gdpa_bwd_dq(self):
+        q, k, v, dO, q_offsets, kv_offsets, max_seq_len_q, max_seq_len_kv, qk_scale = (
+            self._jagged_gdpa_inputs()
+        )
+        args = (
+            q, k, v, dO, q_offsets, kv_offsets, max_seq_len_q, max_seq_len_kv, qk_scale,
+        )
+
+        mod = import_path(EXAMPLES_DIR / "jagged_gdpa.py")
+        dq_expected, _, _ = mod.reference_jagged_gdpa_bwd(*args)
+
+        check_example(
+            "jagged_gdpa",
+            args,
+            dq_expected,
+            fn_name="jagged_gdpa_bwd_dq",
+            block_sizes=[32, 32],
+            atol=1e-4,
+            rtol=1e-4,
+        )
+
+    @xfailIfPallas("tensor-derived if-predicates not supported")
     def test_grouped_gemm_jagged(self):
         # Build small jagged grouped GEMM inputs
         torch.manual_seed(0)
