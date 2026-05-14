@@ -32,7 +32,7 @@ class CuteMmaSupport:
             impls.append("warp")
         if self.warpgroup_f16bf16:
             impls.append("warpgroup")
-        if self.tcgen05_f16bf16 or self.tcgen05_f8f6f4:
+        if self.tcgen05_f16bf16:
             impls.append("tcgen05")
         return tuple(impls)
 
