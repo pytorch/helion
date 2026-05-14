@@ -800,9 +800,18 @@ class TritonBackend(Backend):
         return "triton.jit"
 
     def function_decorator_for_args(self, args: Sequence[Argument]) -> str:
+        from .compile_environment import CompileEnvironment
         from .device_function import SymbolArgument
         from .device_function import TensorSizeArg
         from .device_function import TensorStrideArg
+
+        # Default to Triton's own behavior: let Triton specialize on values and
+        # alignment.  This enables vectorized loads (constexpr 1 for inner
+        # strides, divisibility-by-16 hint for sizes) at the cost of an
+        # occasional Triton recompile when a value crosses a specialization
+        # boundary (e.g. size 1 -> 2, alignment changes).
+        if not CompileEnvironment.current().settings.triton_do_not_specialize:
+            return self.function_decorator
 
         do_not_specialize = [
             arg.name

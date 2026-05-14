@@ -538,6 +538,11 @@ class _Settings:
         )
     )
     autotune_config_filter: Callable[[Config], Config | None] | None = None
+    triton_do_not_specialize: bool = dataclasses.field(
+        default_factory=functools.partial(
+            _env_get_bool, "HELION_TRITON_DO_NOT_SPECIALIZE", False
+        )
+    )
 
 
 class Settings(_Settings):
@@ -612,6 +617,15 @@ class Settings(_Settings):
             "If True, set the compile timeout threshold to be smaller for Triton compilation,"
             "based on a quantile of initial compile times (with a lower bound). Lower bound and quantile "
             "are set by the effort profile. Set HELION_AUTOTUNE_ADAPTIVE_TIMEOUT=0 to disable."
+        ),
+        "triton_do_not_specialize": (
+            "If True, pass do_not_specialize for every dynamic size/stride/symbol "
+            "arg so a single Triton binary handles any value, avoiding Triton-level "
+            "recompiles when shapes cross 0/1 or alignment boundaries. Disables "
+            "Triton's value/alignment specializations and can significantly slow "
+            "memory-bound kernels (vectorized loads rely on inner stride being "
+            "specialized to constexpr 1). Only takes effect when static_shapes=False. "
+            "Set HELION_TRITON_DO_NOT_SPECIALIZE=1 to enable globally."
         ),
         "print_output_code": "If True, print the output code of the kernel to stderr.",
         "print_repro": "If True, print Helion kernel code, config, and caller code to stderr as a standalone repro script.",
