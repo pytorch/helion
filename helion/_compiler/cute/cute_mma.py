@@ -1603,8 +1603,21 @@ def _emit_mma_pipeline(
     epi_elem_dtype_str = (
         _dtype_map[epi_elem_dtype] if epi_elem_dtype is not None else input_dtype_str
     )
+    # TMA producer/consumer staging is admissible for f16/bf16 and for fp8
+    # (e4m3fn / e5m2). fp8 needs the same staged accumulator pipeline f16/bf16
+    # uses; without it the t2r epilogue reads sparse TMEM output for
+    # MmaF8F6F4Op. The downstream byte-budget helpers (e.g.
+    # tcgen05_ab_smem_bytes_per_cta) already accept dtype_bytes and callers
+    # source it from ``lhs.dtype.itemsize`` so the 1-byte fp8 path computes
+    # correct SMEM budgets when this gate opens.
     tcgen05_use_tma = (
-        input_dtype in (torch.float16, torch.bfloat16)
+        input_dtype
+        in (
+            torch.float16,
+            torch.bfloat16,
+            torch.float8_e4m3fn,
+            torch.float8_e5m2,
+        )
         and lhs_fake.is_contiguous()
         and rhs_fake.is_contiguous()
     )
