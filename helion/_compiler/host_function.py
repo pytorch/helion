@@ -128,6 +128,7 @@ class HostFunction:
         self.location = location
         self.compiler_state: CompilerState = CompilerState()
         self._device_ir: DeviceIR | None = None
+        self.local_types: dict[str, TypeInfo] | None = None
 
     # Backward-compatible accessors
 
@@ -251,6 +252,7 @@ class HostFunction:
         return seed_slot
 
     def set_local_types(self, local_types: dict[str, TypeInfo]) -> None:
+        self.local_types = local_types
         for name, type_info in local_types.items():
             type_info.populate_symbol_origins(NameOrigin(name, self))
 
