@@ -30,6 +30,16 @@ class CutePackedAffineLoad:
 
 
 @dataclasses.dataclass(frozen=True)
+class CuteSortableLoad:
+    expr: ast.AST
+    tensor_name: str
+    index_exprs: tuple[str, ...]
+    sort_index_pos: int
+    mask_expr: str | None
+    dtype: torch.dtype
+
+
+@dataclasses.dataclass(frozen=True)
 class CutePackedTerms:
     terms: tuple[ast.AST, ...]
 

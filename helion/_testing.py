@@ -12,12 +12,15 @@ import os
 from pathlib import Path
 import re
 import sys
+from types import SimpleNamespace
 from typing import TYPE_CHECKING
 from typing import Callable
 from typing import Generator
 from typing import Sequence
+from typing import TypeVar
 from typing import cast
 import unittest
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -30,10 +33,12 @@ from ._compat import requires_torch_version
 from ._compat import supports_amd_cdna_tunables
 from ._compat import supports_tensor_descriptor
 from ._dist_utils import is_master_rank
+from ._dist_utils import sync_object as sync_object
 from ._utils import counters
-from .autotuner.benchmarking import sync_object as sync_object
+from .autotuner.benchmarking import synchronize_device
 from .runtime.settings import _get_backend
-from helion.autotuner.base_search import _clone_args
+from .runtime.settings import is_pallas_interpret
+from helion.autotuner.benchmark_provider import _clone_args
 
 if _get_backend() == "pallas":
     from .autotuner.benchmarking import compute_repeat_generic as compute_repeat
@@ -44,6 +49,8 @@ else:
     from .autotuner.benchmarking import do_bench as do_bench
     from .autotuner.benchmarking import interleaved_bench
 
+import typing
+
 from .runtime.config import Config
 from .runtime.ref_mode import is_ref_mode_enabled
 from .runtime.settings import RefMode
@@ -51,7 +58,10 @@ from .runtime.settings import RefMode
 if TYPE_CHECKING:
     import types
 
+    from .runtime.kernel import BoundKernel
     from .runtime.kernel import Kernel
+
+_R = TypeVar("_R")
 
 
 def _strip_launcher_args(value: str) -> str:
@@ -201,6 +211,7 @@ def is_cuda() -> bool:
 
 PROJECT_ROOT: Path = Path(__file__).parent.parent
 EXAMPLES_DIR: Path = PROJECT_ROOT / "examples"
+PRETUNED_KERNELS_DIR: Path = PROJECT_ROOT / "pretuned_kernels"
 DEVICE = None
 
 
@@ -215,33 +226,31 @@ def _has_mtia_runtime() -> bool:
         return False
 
 
-def _init_tpu_device() -> bool:
-    """Try to initialize the TPU device. Returns True if successful."""
-    try:
-        import torch_tpu.api  # type: ignore[import-not-found]
-
-        torch_tpu.api.tpu_device()
-        return True
-    except (ImportError, RuntimeError):
-        return False
-
-
 # Determine DEVICE without calling functions that initialize CUDA.
-if _get_backend() == "pallas":
-    _init_tpu_device()
+if _get_backend() == "pallas" and is_pallas_interpret():
+    DEVICE = torch.device("cpu")
+elif _get_backend() == "pallas":
     DEVICE = torch.device("tpu")
 elif torch.xpu.is_available():
     DEVICE = torch.device("xpu")
 elif _has_mtia_runtime():
     DEVICE = torch.device("mtia")
+elif _get_backend() == "metal" and torch.backends.mps.is_available():
+    DEVICE = torch.device("mps")
 else:
     DEVICE = torch.device("cuda")
 
 # Half-precision dtype: bfloat16 on TPU (float16 not supported), float16 elsewhere
-if _get_backend() == "pallas":
+if _get_backend() == "pallas" and not is_pallas_interpret():
     HALF_DTYPE = torch.bfloat16
 else:
     HALF_DTYPE = torch.float16
+
+# Long integer dtype: int32 on TPU (64-bit types not supported), int64 elsewhere
+if _get_backend() == "pallas":
+    LONG_INT_TYPE = torch.int32
+else:
+    LONG_INT_TYPE = torch.int64
 
 
 def get_nvidia_gpu_model() -> str:
@@ -276,6 +285,11 @@ def skipIfTileIR(reason: str) -> Callable[[Callable], Callable]:
     """Skip test if running with tileir"""
     # Defers check to test execution time to avoid CUDA init during pytest-xdist collection.
     return skipIfFn(lambda: _get_backend() == "tileir", reason)
+
+
+def skipIfMetal(reason: str) -> Callable[[Callable], Callable]:
+    """Skip test if running with metal"""
+    return skipIfFn(lambda: _get_backend() == "metal", reason)
 
 
 def skipIfPallas(reason: str) -> Callable[[Callable], Callable]:
@@ -315,7 +329,7 @@ def skipUnlessTileIR(reason: str) -> Callable[[Callable], Callable]:
 def _has_cute_dsl() -> bool:
     try:
         import cutlass.cute as _cute  # noqa: F401
-    except ModuleNotFoundError:
+    except ImportError:
         return False
     return True
 
@@ -328,6 +342,48 @@ def skipUnlessCuteAvailable(reason: str) -> Callable[[Callable], Callable]:
 def xfailIfCute(reason: str) -> Callable[[Callable], Callable]:
     """Mark test xfail when CUTLASS CuTe backend is selected."""
     return xfailIfFn(lambda: _get_backend() == "cute", reason)
+
+
+def skipIfCute(reason: str) -> Callable[[Callable], Callable]:
+    """Skip test when CUTLASS CuTe backend is selected."""
+    return skipIfFn(lambda: _get_backend() == "cute", reason)
+
+
+def default_cute_mma_support(
+    *,
+    supported_impls: tuple[str, ...] = ("universal", "warp", "tcgen05"),
+    warp_f16bf16: bool = True,
+    tcgen05_f16bf16: bool = True,
+) -> SimpleNamespace:
+    """Return a ``get_cute_mma_support()`` mock with tcgen05-on defaults."""
+    return SimpleNamespace(
+        supported_impls=supported_impls,
+        warp_f16bf16=warp_f16bf16,
+        tcgen05_f16bf16=tcgen05_f16bf16,
+    )
+
+
+@contextlib.contextmanager
+def patch_cute_mma_support(
+    support: SimpleNamespace | None = None,
+) -> Generator[SimpleNamespace, None, None]:
+    """Patch both ``get_cute_mma_support`` bindings.
+
+    ``cute_mma`` re-binds the symbol from ``mma_support`` at import time.
+    """
+    if support is None:
+        support = default_cute_mma_support()
+    with (
+        patch(
+            "helion._compiler.cute.cute_mma.get_cute_mma_support",
+            return_value=support,
+        ),
+        patch(
+            "helion._compiler.cute.mma_support.get_cute_mma_support",
+            return_value=support,
+        ),
+    ):
+        yield support
 
 
 def skipIfNotTriton(reason: str) -> Callable[[Callable], Callable]:
@@ -391,15 +447,20 @@ def skipIfXPU(reason: str) -> Callable[[Callable], Callable]:
 
 
 def skipUnlessPallas(reason: str) -> Callable[[Callable], Callable]:
-    """Skip test unless JAX Pallas TPU backend is available."""
+    """Skip test unless JAX Pallas TPU backend or interpret mode is available."""
 
     def _has_tpu_pallas() -> bool:
+        if is_pallas_interpret():
+            try:
+                from jax.experimental import pallas
+
+                return True
+            except Exception:
+                return False
         try:
             from jax.experimental import pallas  # noqa: F401
-            import torch_tpu.api  # type: ignore[import-not-found]
 
-            torch_tpu.api.tpu_device()
-            return True
+            return hasattr(torch, "tpu") and torch.tpu.is_available()
         except Exception:
             return False
 
@@ -424,11 +485,16 @@ def skipIfNotCUDA() -> Callable[[Callable], Callable]:
 def skipIfCudaCapabilityLessThan(
     min_capability: tuple[int, int], *, reason: str | None = None
 ) -> Callable[[Callable], Callable]:
-    """Skip test if not running on CUDA or capability is less than min_capability."""
+    """Skip test if running on CUDA with capability less than min_capability.
+
+    Pass-through on non-CUDA backends. Combine with `skipIfNotCUDA()` (or
+    `skipIfPallas`/`skipIfXPU`/etc.) at the call site if the test also
+    requires a specific platform.
+    """
 
     def cond() -> bool:
         if not is_cuda():
-            return True
+            return False
         return torch.cuda.get_device_capability() < min_capability
 
     # Defers check to test execution time to avoid CUDA init during pytest-xdist collection.
@@ -884,14 +950,67 @@ def import_path(filename: Path) -> types.ModuleType:
     return sys.modules[module_name]
 
 
-def code_and_output(
-    fn: Kernel,
+def _bound_test_config(bound: BoundKernel, **kwargs: object) -> Config:
+    if kwargs:
+        config = Config(
+            # pyrefly: ignore [bad-argument-type]
+            **kwargs
+        )
+    elif len(bound.kernel.configs) == 1:
+        config = bound.kernel.configs[0]
+    else:
+        config = bound.config_spec.default_config()
+    # Strip config keys not supported by the current backend so that
+    # tests with Triton-specific keys (num_warps, num_stages, indexing, etc.)
+    # can run on other backends like Pallas/TPU.
+    config_spec = bound.config_spec
+    for key in config_spec.unsupported_config_keys(config.config):
+        config.config.pop(key, None)
+    return config
+
+
+def _run_bound_kernel(
+    bound: BoundKernel,
     args: tuple[object, ...],
-    **kwargs: object,
-) -> tuple[str, object]:
+    config: Config,
+    *,
+    emit_code: bool,
+) -> tuple[str | None, object]:
     has_device_tensor = any(
         isinstance(value, torch.Tensor) and value.device.type != "cpu" for value in args
     )
+    code = bound.to_triton_code(config) if emit_code else None
+    compiled_kernel = bound.compile_config(config)
+    try:
+        result = compiled_kernel(*args)
+        if has_device_tensor or (
+            isinstance(result, torch.Tensor) and result.device.type != "cpu"
+        ):
+            synchronize_device(result)
+    except Exception as exc:
+        if code is None:
+            try:
+                code = bound.to_triton_code(config)
+            except Exception:
+                code = None
+        if code is not None:
+            sys.stderr.write(f"Failed to run kernel:\n{code}\n")
+        else:
+            sys.stderr.write("Failed to run kernel.\n")
+        if has_device_tensor:
+            try:
+                synchronize_device(None)
+            except Exception as sync_error:
+                raise exc from sync_error
+        raise
+    return code, result
+
+
+def code_and_output(
+    fn: Kernel[_R],
+    args: tuple[object, ...],
+    **kwargs: object,
+) -> tuple[str, _R]:
     bound = fn.bind(args)
     if is_ref_mode_enabled(bound.kernel.settings):
         if kwargs:
@@ -903,38 +1022,37 @@ def code_and_output(
         code = inspect.getsource(fn.fn)
         return code, result
 
-    if kwargs:
-        config = Config(
+    config = _bound_test_config(bound, **kwargs)
+    code, result = _run_bound_kernel(bound, args, config, emit_code=True)
+    assert code is not None
+    return code, cast("_R", result)
+
+
+def output_only(
+    fn: Kernel[_R],
+    args: tuple[object, ...],
+    **kwargs: object,
+) -> _R:
+    """Run a kernel for correctness checks without eagerly materializing code text."""
+    bound = fn.bind(args)
+    if is_ref_mode_enabled(bound.kernel.settings):
+        if kwargs:
             # pyrefly: ignore [bad-argument-type]
-            **kwargs
-        )
-    elif fn.configs:
-        (config,) = fn.configs
-    else:
-        config = fn.bind(args).config_spec.default_config()
-    # Strip config keys not supported by the current backend so that
-    # tests with Triton-specific keys (num_warps, num_stages, indexing, etc.)
-    # can run on other backends like Pallas/TPU.
-    config_spec = fn.bind(args).config_spec
-    for key in config_spec.unsupported_config_keys(config.config):
-        config.config.pop(key, None)
-    code = fn.bind(args).to_triton_code(config)
-    compiled_kernel = fn.bind(args).compile_config(config)
-    try:
-        result = compiled_kernel(*args)
-        if has_device_tensor or (
-            isinstance(result, torch.Tensor) and result.device.type != "cpu"
-        ):
-            torch.accelerator.synchronize()
-    except Exception as exc:
-        sys.stderr.write(f"Failed to run kernel:\n{code}\n")
-        if has_device_tensor:
-            try:
-                torch.accelerator.synchronize()
-            except Exception as sync_error:
-                raise exc from sync_error
-        raise
-    return code, result
+            config = Config(**kwargs)
+            bound._config = config
+        return fn(*args)
+
+    config = _bound_test_config(bound, **kwargs)
+    _code, result = _run_bound_kernel(bound, args, config, emit_code=False)
+    return cast("_R", result)
+
+
+def _as_tensors(result: object) -> list[torch.Tensor]:
+    """Normalize a single tensor or tuple of tensors to a flat list."""
+    if isinstance(result, tuple):
+        return [t.clone() for t in result]
+    assert isinstance(result, torch.Tensor)
+    return [result.clone()]
 
 
 def run_example(
@@ -945,10 +1063,16 @@ def run_example(
     baseline_name: str = "torch",
     rtol: float = 1e-2,
     atol: float = 1e-1,
+    max_mismatch_pct: float | None = None,
     bwd: bool = False,
     trace_path: str | None = None,
-) -> None:
+    process_group_name: str | None = None,
+    interleaved: bool = True,
+) -> dict[str, float]:
     """Run complete example: correctness check + benchmark.
+
+    Returns:
+        Dictionary mapping implementation names to their benchmark times in ms.
 
     Args:
         kernel_fn: Single kernel function, or dict of {name: function} for multiple kernel variants
@@ -958,9 +1082,15 @@ def run_example(
         baseline_name: Name for single baseline in output (default: "torch")
         rtol: Relative tolerance for correctness check (default: 1e-2)
         atol: Absolute tolerance for correctness check (default: 1e-1)
+        max_mismatch_pct: If set, use assert_close_with_mismatch_tolerance with this mismatch
+            fraction tolerance instead of strict assert_close (default: None)
         bwd: Whether to also test backward pass (default: False)
         trace_path: if not None, do profiling and save trace to this path
     """
+
+    if dist.is_initialized() and process_group_name is None:
+        assert dist.group.WORLD is not None
+        process_group_name = dist.group.WORLD.group_name
     try:
         torch.backends.cuda.matmul.fp32_precision = "tf32"
         torch.backends.cudnn.conv.fp32_precision = "tf32"  # type: ignore[reportAttributeAccessIssue]
@@ -975,20 +1105,31 @@ def run_example(
 
     # Check correctness against first baseline
     first_baseline_name, first_baseline_func = next(iter(baselines.items()))
-    expected = first_baseline_func(*args).clone()
+    expected = _as_tensors(first_baseline_func(*args))
 
     for name, func in {**kernels, **baselines}.items():
         if name != first_baseline_name:
             print(f"Testing {name} correctness...", file=sys.stderr)
             # Clone args to avoid buffer donation issues (e.g., Pallas/TPU)
-            cloned_args = _clone_args(args)
-            result = func(*cloned_args).clone()
-            torch.testing.assert_close(
-                result.to(torch.float32),
-                expected.to(torch.float32),
-                rtol=rtol,
-                atol=atol,
-            )
+            cloned_args = _clone_args(args, process_group_name=process_group_name)
+            result = _as_tensors(func(*cloned_args))
+            assert len(result) == len(expected)
+            for r, e in zip(result, expected, strict=True):
+                if max_mismatch_pct is not None:
+                    assert_close_with_mismatch_tolerance(
+                        r.to(torch.float32),
+                        e.to(torch.float32),
+                        atol=atol,
+                        rtol=rtol,
+                        max_mismatch_pct=max_mismatch_pct,
+                    )
+                else:
+                    torch.testing.assert_close(
+                        r.to(torch.float32),
+                        e.to(torch.float32),
+                        rtol=rtol,
+                        atol=atol,
+                    )
 
     # Test backward pass
     if bwd:
@@ -1066,7 +1207,7 @@ def run_example(
                     t.grad = None
 
     # Benchmark all functions — clone args to avoid buffer donation issues
-    cloned_args = _clone_args(args)
+    cloned_args = _clone_args(args, process_group_name=process_group_name)
     all_benchmarks = {**kernels, **baselines}
     bench_fns = [functools.partial(fn, *cloned_args) for fn in all_benchmarks.values()]
     repeat = compute_repeat(bench_fns[0])
@@ -1076,7 +1217,7 @@ def run_example(
     # Running different number of times on different ranks may cause
     # stuck processes.
     if dist.is_initialized():
-        repeat = sync_object(repeat)
+        repeat = sync_object(repeat, process_group_name=process_group_name)
 
     # pyrefly: ignore [bad-argument-type]
     profile_context = contextlib.nullcontext()
@@ -1084,8 +1225,17 @@ def run_example(
         profile_context = torch.profiler.profile()
 
     with profile_context:
-        # pyrefly: ignore[bad-argument-type]
-        timings = interleaved_bench(bench_fns, repeat=repeat, desc="Benchmarking")
+        if interleaved:
+            # pyrefly: ignore[bad-argument-type]
+            timings = interleaved_bench(bench_fns, repeat=repeat, desc="Benchmarking")
+        else:
+            timings = typing.cast(
+                "list[float]",
+                [
+                    do_bench(bench_fn, process_group_name=process_group_name)
+                    for bench_fn in bench_fns
+                ],
+            )
 
     if trace_path is not None and is_master_rank():
         print(f"Write profile to {trace_path}")
@@ -1114,6 +1264,52 @@ def run_example(
 
         print(f"{'=' * 65}\n", file=sys.stderr)
 
+    return all_times
+
+
+def _assert_example_result_close(
+    result: object,
+    expected: object,
+    *,
+    skip_accuracy: bool,
+    atol: float,
+    rtol: float,
+) -> None:
+    if skip_accuracy:
+        return
+
+    # Use tree_map to apply assert_close to all tensor pairs
+    def assert_close_fn(got: object, exp: object) -> None:
+        # Skip if expected is None (i.e. we don't care what the actual value is)
+        if exp is None:
+            return
+        # Both None is OK
+        if got is None and exp is None:
+            return
+        assert isinstance(got, torch.Tensor) and isinstance(exp, torch.Tensor), (
+            f"Type mismatch: got {type(got)}, expected {type(exp)}"
+        )
+        torch.testing.assert_close(
+            got.to(torch.float32),
+            exp.to(torch.float32),
+            atol=atol,
+            rtol=rtol,
+        )
+
+    tree_map(assert_close_fn, result, expected)
+
+
+def _example_kernel(
+    name: str,
+    fn_name: str | None = None,
+    static_shapes: bool | None = None,
+) -> Kernel:
+    kernel_fn = getattr(import_path(EXAMPLES_DIR / f"{name}.py"), fn_name or name)
+    if static_shapes is not None:
+        assert static_shapes in (True, False)
+        kernel_fn.settings.static_shapes = static_shapes
+    return kernel_fn
+
 
 def check_example(
     name: str,
@@ -1124,40 +1320,28 @@ def check_example(
     static_shapes: bool | None = None,
     atol: float = 1e-1,
     rtol: float = 1e-2,
+    emit_code: bool = True,
     **kwargs: object,
 ) -> str:
     """Helper used in unit tests to run a single example kernel and check its output."""
-    kernel_fn = getattr(import_path(EXAMPLES_DIR / f"{name}.py"), fn_name or name)
-    if static_shapes is not None:
-        assert static_shapes in (True, False)
-        kernel_fn.settings.static_shapes = static_shapes
+    kernel_fn = _example_kernel(name, fn_name=fn_name, static_shapes=static_shapes)
 
-    code, result = code_and_output(
-        kernel_fn,
-        args,
-        **kwargs,
+    if emit_code:
+        code, result = code_and_output(
+            kernel_fn,
+            args,
+            **kwargs,
+        )
+    else:
+        code = ""
+        result = output_only(
+            kernel_fn,
+            args,
+            **kwargs,
+        )
+    _assert_example_result_close(
+        result, expected, skip_accuracy=skip_accuracy, atol=atol, rtol=rtol
     )
-
-    if not skip_accuracy:
-        # Use tree_map to apply assert_close to all tensor pairs
-        def assert_close_fn(got: object, exp: object) -> None:
-            # Skip if expected is None (i.e. we don't care what the actual value is)
-            if exp is None:
-                return
-            # Both None is OK
-            if got is None and exp is None:
-                return
-            assert isinstance(got, torch.Tensor) and isinstance(exp, torch.Tensor), (
-                f"Type mismatch: got {type(got)}, expected {type(exp)}"
-            )
-            torch.testing.assert_close(
-                got.to(torch.float32),
-                exp.to(torch.float32),
-                atol=atol,
-                rtol=rtol,
-            )
-
-        tree_map(assert_close_fn, result, expected)
     return code
 
 

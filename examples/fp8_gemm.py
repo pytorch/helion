@@ -10,6 +10,7 @@ torch._scaled_mm for correctness comparison, and a test function to validate the
 # %%
 from __future__ import annotations
 
+import functools
 import os
 from typing import Callable
 
@@ -62,22 +63,28 @@ def fp8_gemm(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 
 # %%
 def reference_fp8_gemm_pytorch(
-    x_fp8: torch.Tensor, y_fp8: torch.Tensor
+    x_fp8: torch.Tensor,
+    y_fp8: torch.Tensor,
+    scale_a: torch.Tensor,
+    scale_b: torch.Tensor,
 ) -> torch.Tensor:
     """
     Reference implementation using torch._scaled_mm.
     Args:
         x_fp8 (torch.Tensor): Input tensor in FP8 format.
         y_fp8 (torch.Tensor): Input tensor in FP8 format.
+        scale_a (torch.Tensor): Scale factor for x_fp8.
+        scale_b (torch.Tensor): Scale factor for y_fp8.
     Returns:
         torch.Tensor: Output tensor in half-precision format.
     """
     # torch._scaled_mm requires column-major for second operand
-    y_fp8_t = y_fp8.T.contiguous().T
-    scale_a = torch.tensor(1.0, device=x_fp8.device)
-    scale_b = torch.tensor(1.0, device=x_fp8.device)
+    if y_fp8.stride(0) == 1 and y_fp8.stride(1) > 1:
+        y_col_major = y_fp8
+    else:
+        y_col_major = y_fp8.T.contiguous().T
     return torch._scaled_mm(
-        x_fp8, y_fp8_t, scale_a, scale_b, use_fast_accum=False, out_dtype=HALF_DTYPE
+        x_fp8, y_col_major, scale_a, scale_b, use_fast_accum=False, out_dtype=HALF_DTYPE
     )
 
 
@@ -104,21 +111,41 @@ def fp8_gemm_tritonbench(
 
 
 # %%
-def check(m: int, k: int, n: int) -> None:
+def check(m: int, k: int, n: int, b_col_major: bool = True) -> None:
     """
     Test the FP8 GEMM implementation against the PyTorch reference.
     Args:
         m (int): Number of rows in the left input matrix.
         k (int): Shared dimension.
         n (int): Number of columns in the right input matrix.
+        b_col_major (bool): If True, use column-major layout for B; otherwise row-major.
     """
     # Create FP8 tensors
     x = torch.randn([m, k], device=DEVICE, dtype=torch.float32)
     y = torch.randn([k, n], device=DEVICE, dtype=torch.float32)
     # Convert to FP8 format (e4m3fn is commonly used for forward pass)
     x_fp8 = x.to(torch.float8_e4m3fn)
-    y_fp8 = y.to(torch.float8_e4m3fn)
-    run_example(fp8_gemm, reference_fp8_gemm_pytorch, (x_fp8, y_fp8))
+    if b_col_major:
+        y_fp8 = y.to(torch.float8_e4m3fn).T.contiguous().T
+    else:
+        y_fp8 = y.to(torch.float8_e4m3fn)
+
+    scale_a = torch.tensor(1.0, device=x_fp8.device)
+    scale_b = torch.tensor(1.0, device=x_fp8.device)
+
+    run_example(
+        fp8_gemm,
+        functools.partial(reference_fp8_gemm_pytorch, scale_a=scale_a, scale_b=scale_b),
+        (x_fp8, y_fp8),
+    )
+
+
+# %%
+shapes = [  # m, k, n
+    (256, 256, 256),
+    (512, 512, 512),
+    (1024, 1024, 1024),
+]
 
 
 # %%
@@ -126,9 +153,11 @@ def main() -> None:
     """
     Main function to run tests with different matrix sizes.
     """
-    check(256, 256, 256)
-    check(512, 512, 512)
-    check(1024, 1024, 1024)
+    for b_col_major in (True, False):
+        for m, k, n in shapes:
+            layout = "col_major" if b_col_major else "row_major"
+            print(f"Testing B={layout}, shape=({m}, {k}, {n})")
+            check(m, k, n, b_col_major=b_col_major)
 
 
 # %%

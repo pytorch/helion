@@ -21,6 +21,7 @@ if TYPE_CHECKING:
     import helion
     from helion.autotuner.block_id_sequence import BlockIdSequence
     from helion.autotuner.config_fragment import ConfigSpecFragment
+    from helion.autotuner.config_fragment import EnumFragment
 
 
 class UserConfigSpec(ConfigSpec):
@@ -36,6 +37,11 @@ class UserConfigSpec(ConfigSpec):
         self,
     ) -> dict[str, BlockIdSequence[Any] | ConfigSpecFragment]:
         return dict(self.user_defined_tunables)
+
+    def _advanced_controls_file_fragment(
+        self, advanced_controls_files: list[str] | None
+    ) -> EnumFragment | None:
+        return None
 
     def flat_config(
         self,
@@ -70,6 +76,7 @@ def create_user_config_spec(
 @dataclasses.dataclass
 class _FakeEnv:
     device: torch.device
+    process_group_name: str | None = None
 
 
 class _ExternalKernelAdapter(_AutotunableKernel):
@@ -172,6 +179,15 @@ class _ExternalKernelAdapter(_AutotunableKernel):
         config: Config | None = None,
     ) -> None:
         pass
+
+    def extra_cache_key(self) -> str:
+        return ""
+
+    def supports_subprocess_benchmark(self) -> bool:
+        return True
+
+    def is_cacheable(self) -> bool:
+        return False
 
 
 SETTINGS_KWARGS = {
@@ -291,5 +307,5 @@ def autotune(
             **settings_kw,
         ),
         args,
-        **search_kw,
+        **search_kw,  # pyrefly: ignore[bad-argument-type]
     ).autotune()

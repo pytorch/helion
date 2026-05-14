@@ -10,6 +10,7 @@ from typing import Protocol
 from typing import cast
 
 import torch
+from torch._inductor import inductor_prims
 from torch._prims_common import is_integer_dtype
 from torch.overrides import BaseTorchFunctionMode
 
@@ -22,7 +23,10 @@ from .._utils import create_shape_matching_slices
 if TYPE_CHECKING:
     from typing_extensions import Self
 
+    from torch._prims_common import DeviceLikeType
+
     from .. import Config
+    from ..language.ref_tile import RefTile
     from .settings import Settings
 
     class _RefModeTLS(Protocol):
@@ -71,6 +75,9 @@ class RefModeContext:
         self.func_mode = RefModeTorchFunctionMode()
         self.device_ctx = torch.device(env.device)  # pyrefly: ignore[read-only]
         self.config = config
+        self.rng_seed_slot_count = 0
+        self._initial_rng_state: torch.Tensor | None = None
+        self._rng_seed_buffer: torch.Tensor | None = None
 
     def __enter__(self) -> Self:
         assert getattr(ref_mode_tls, "context", None) is None, (
@@ -79,6 +86,7 @@ class RefModeContext:
         ce_tls.env = self.env
         ref_mode_tls.context = self
         self.device_ctx.__enter__()
+        self._initial_rng_state = self._get_rng_state().clone()
         self.func_mode.__enter__()
         return self
 
@@ -115,6 +123,42 @@ class RefModeContext:
         except NoCurrentRefModeContext:
             return False
 
+    def allocate_rng_seed_slot(self) -> int:
+        seed_slot = self.rng_seed_slot_count
+        self.rng_seed_slot_count += 1
+        return seed_slot
+
+    def lookup_rng_seed(self, index: int) -> torch.Tensor:
+        if self._rng_seed_buffer is None or index >= len(self._rng_seed_buffer):
+            self._rng_seed_buffer = self._replay_rng_seed_buffer(index + 1)
+        return self._rng_seed_buffer[index].clone()
+
+    def _get_rng_state(self) -> torch.Tensor:
+        if self.device_ctx.type == "cpu":
+            return torch.random.get_rng_state()
+        device_mod = torch.get_device_module(self.device_ctx)
+        return device_mod.get_rng_state(self.device_ctx)
+
+    def _set_rng_state(self, state: torch.Tensor) -> None:
+        if self.device_ctx.type == "cpu":
+            torch.random.set_rng_state(state)
+            return
+        device_mod = torch.get_device_module(self.device_ctx)
+        device_mod.set_rng_state(state, self.device_ctx)
+
+    def _replay_rng_seed_buffer(self, count: int) -> torch.Tensor:
+        assert self._initial_rng_state is not None
+        current_state = self._get_rng_state().clone()
+        self._set_rng_state(self._initial_rng_state)
+        try:
+            seeds = inductor_prims.seeds(count, self.device_ctx)
+            next_state = self._get_rng_state().clone()
+        except Exception:
+            self._set_rng_state(current_state)
+            raise
+        self._set_rng_state(next_state)
+        return seeds
+
 
 class RefModeTorchFunctionMode(BaseTorchFunctionMode):
     """Torch function mode for Helion ref mode operations."""
@@ -128,6 +172,18 @@ class RefModeTorchFunctionMode(BaseTorchFunctionMode):
             ),
             torch.baddbmm: lambda args, kwargs: self._handle_mm_with_bias(
                 args, kwargs, torch.bmm, "baddbmm"
+            ),
+            torch.rand: lambda args, kwargs: self._handle_implicit_random_factory(
+                args, kwargs, normal=False
+            ),
+            torch.randn: lambda args, kwargs: self._handle_implicit_random_factory(
+                args, kwargs, normal=True
+            ),
+            torch.rand_like: lambda args, kwargs: self._handle_implicit_random_like(
+                args, kwargs, normal=False
+            ),
+            torch.randn_like: lambda args, kwargs: self._handle_implicit_random_like(
+                args, kwargs, normal=True
             ),
             torch.Tensor.expand: lambda args, kwargs: self._handle_size_arg_method(
                 args, kwargs, "expand"
@@ -285,6 +341,60 @@ class RefModeTorchFunctionMode(BaseTorchFunctionMode):
         method = getattr(tensor, method_name)
         extra_args = args[2:]
         return method(size, *extra_args, **kwargs)
+
+    def _handle_implicit_random_factory(
+        self,
+        args: tuple[object, ...],
+        kwargs: dict[str, object],
+        *,
+        normal: bool,
+    ) -> torch.Tensor:
+        from ..language.random_ops import ref_implicit_random
+
+        shape: list[int | RefTile]
+        if "size" in kwargs:
+            shape_arg = kwargs["size"]
+            assert not args
+        elif len(args) == 1 and isinstance(args[0], (list, tuple, torch.Size)):
+            shape_arg = args[0]
+        else:
+            shape_arg = args
+
+        if isinstance(shape_arg, list):
+            shape = cast("list[int | RefTile]", shape_arg)
+        else:
+            shape = list(cast("tuple[int | RefTile, ...] | torch.Size", shape_arg))
+        device = cast("DeviceLikeType | None", kwargs.get("device"))
+
+        return ref_implicit_random(
+            shape,
+            dtype=cast("torch.dtype | None", kwargs.get("dtype")),
+            default_dtype=torch.float32,
+            device=device,
+            requires_grad=kwargs.get("requires_grad", False),
+            normal=normal,
+        )
+
+    def _handle_implicit_random_like(
+        self,
+        args: tuple[object, ...],
+        kwargs: dict[str, object],
+        *,
+        normal: bool,
+    ) -> torch.Tensor:
+        from ..language.random_ops import ref_implicit_random
+
+        assert args
+        input_tensor = cast("torch.Tensor", args[0])
+        device = cast("DeviceLikeType | None", kwargs.get("device"))
+        return ref_implicit_random(
+            list(input_tensor.shape),
+            dtype=cast("torch.dtype | None", kwargs.get("dtype")),
+            default_dtype=input_tensor.dtype,
+            device=device,
+            requires_grad=kwargs.get("requires_grad", False),
+            normal=normal,
+        )
 
     def _handle_binary_op(
         self,

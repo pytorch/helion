@@ -445,6 +445,10 @@ class TensorOperationInWrapper(BaseWarning):
     )
 
 
+class ProcessGroupNameNotFound(BaseWarning):
+    message = "No process group name argument found in kernel arguments. Default to use dist.group.WORLD.group_name. This may not be the correct behavior espectially in multi-dimension parallelism. Use hl.ProcessGroupName to annotate the argument for process group name to fix the warning."
+
+
 class TensorOperationsInHostCall(TensorOperationInWrapper):
     message = (
         "A tensor operation outside of the `hl.tile` or `hl.grid` loop will not be fused "

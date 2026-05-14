@@ -64,6 +64,8 @@ if TYPE_CHECKING:
 
     from .. import Config
     from .backend import InductorOpOverrides
+    from .cute.layout import MatmulAxisModel
+    from .cute.layout import MatmulExecutionPlan
     from .cute.layout import ThreadLayout
     from .device_function import DeviceFunction
     from .device_ir import GraphInfo
@@ -211,6 +213,7 @@ def prepare_node_lowering(
             buffer_name_to_output_index[buffer.get_name()] = i
 
     new_buffers = graph_lowering.buffers[prior_buffers:]
+    # pyrefly: ignore [unbound-name]
     assert buffer in new_buffers
     nodes = []
     extra_input_names = []
@@ -588,6 +591,16 @@ class PointwiseLowering(InductorLowering):
 
         # Check each dimension independently
         for dim in range(max_rank):
+            non_one_sizes = [s[dim] for s in shapes if not is_one(s[dim])]
+            if non_one_sizes:
+                base_size = non_one_sizes[0]
+                if all(
+                    isinstance(size_i, (int, torch.SymInt))
+                    and env.known_equal(base_size, size_i)
+                    for size_i in non_one_sizes[1:]
+                ):
+                    continue
+
             # First, see if multiple distinct block-ids appear in this dim
             block_ids: set[int] = set()
             for s in shapes:
@@ -622,16 +635,6 @@ class PointwiseLowering(InductorLowering):
                 else:
                     exprs.add(size_i)
             if len(exprs) >= 2:
-                non_one_sizes = [
-                    size_i for s in shapes for size_i in [s[dim]] if not is_one(size_i)
-                ]
-                base_size = non_one_sizes[0]
-                if all(
-                    isinstance(size_i, (int, torch.SymInt))
-                    and env.known_equal(base_size, size_i)
-                    for size_i in non_one_sizes[1:]
-                ):
-                    continue
                 raise exc.ShapeMismatch(
                     str(shapes[0]),
                     ", ".join(map(str, shapes[1:])),
@@ -900,14 +903,13 @@ class APIFuncLowering(Lowering):
         proxy_args = [*map_arg(node.args, lambda arg: arg.meta["val"])]
 
         env = CompileEnvironment.current()
-        codegen_fn = self.api_func._codegen.get(env.codegen_name)
-        if codegen_fn is None:
-            codegen_fn = self.api_func._codegen.get("common")
-        if codegen_fn is None:
+        try:
+            codegen_fn = self.api_func._codegen[env.codegen_name]
+        except KeyError:
             raise exc.BackendImplementationMissing(
                 env.backend_name,
                 f"codegen for API function {self.api_func.__qualname__}",
-            )
+            ) from None
         from .generate_ast import GenerateAST
 
         if not isinstance(ctx.cg, GenerateAST):
@@ -1022,6 +1024,10 @@ class GenerateASTFromInductor(DefaultHandler):
         result_str = _unpack_opsvalue(
             getattr(self.parent_handler, name)(*args, **kwargs)
         )
+        # C++ namespace syntax (::) is not valid Python.  Replace with dot
+        # notation so expr_from_string can parse it as attribute access.
+        if CompileEnvironment.current().backend_name == "metal" and "::" in result_str:
+            result_str = result_str.replace("::", ".")
         return self._lift(expr_from_string(result_str))
 
     def to_dtype(
@@ -1142,6 +1148,39 @@ class GraphInterpreter(LoweringContext, Interpreter):
         if isinstance(value, ast.AST):
             return value
         raise TypeError(f"Unsupported value type for AST conversion: {type(value)}")
+
+    @property
+    def cute_layout(self) -> ThreadLayout | None:
+        if V.current_node is None:
+            return None
+        from .cute.layout_propagation import META_KEY
+
+        constraint = V.current_node.meta.get(META_KEY)
+        if constraint is None:
+            return None
+        return constraint.primary_layout()
+
+    @property
+    def cute_matmul_axes(self) -> MatmulAxisModel | None:
+        if V.current_node is None:
+            return None
+        from .cute.layout_propagation import META_KEY
+
+        constraint = V.current_node.meta.get(META_KEY)
+        if constraint is None:
+            return None
+        return constraint.matmul_axes
+
+    @property
+    def cute_matmul_plan(self) -> MatmulExecutionPlan | None:
+        if V.current_node is None:
+            return None
+        from .cute.layout_propagation import META_KEY
+
+        constraint = V.current_node.meta.get(META_KEY)
+        if constraint is None:
+            return None
+        return constraint.matmul_plan
 
     def _create_named_result(self, node: Node, result: ast.expr) -> str:
         """Create a named variable for a node result, handling block-size-only expressions as constexpr."""
@@ -1319,6 +1358,9 @@ def codegen_call_with_graph(
     copy_named_args: bool = True,
 ) -> list[object]:
     with compile_lock:
+        from .cute.cute_mma import prepare_cute_collective_lane_loop_suppression
+
+        prepare_cute_collective_lane_loop_suppression(cg, graph)
         new_args = []
         placeholders = graph.find_nodes(op="placeholder")
         for arg, placeholder in zip(args, placeholders, strict=True):
@@ -1395,4 +1437,28 @@ class CodegenState(NamedTuple):
         constraint = self.fx_node.meta.get(META_KEY)
         if constraint is None:
             return None
-        return constraint.layout  # type: ignore[return-value]
+        return constraint.primary_layout()  # type: ignore[return-value]
+
+    @property
+    def cute_matmul_axes(self) -> MatmulAxisModel | None:
+        """Return the planner-owned CuTe matmul axis model for the current FX node."""
+        if self.fx_node is None:
+            return None
+        from .cute.layout_propagation import META_KEY
+
+        constraint = self.fx_node.meta.get(META_KEY)
+        if constraint is None:
+            return None
+        return constraint.matmul_axes
+
+    @property
+    def cute_matmul_plan(self) -> MatmulExecutionPlan | None:
+        """Return the planner-owned CuTe matmul execution plan for the node."""
+        if self.fx_node is None:
+            return None
+        from .cute.layout_propagation import META_KEY
+
+        constraint = self.fx_node.meta.get(META_KEY)
+        if constraint is None:
+            return None
+        return constraint.matmul_plan

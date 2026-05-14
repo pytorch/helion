@@ -7,6 +7,7 @@ from . import language
 from . import runtime
 from ._utils import cdiv
 from ._utils import next_power_of_2
+from .autotuner import from_cache
 from .runtime import Config
 from .runtime import Kernel
 from .runtime import kernel
@@ -21,6 +22,7 @@ __all__ = [
     "Settings",
     "cdiv",
     "exc",
+    "from_cache",
     "jit",
     "kernel",
     "language",

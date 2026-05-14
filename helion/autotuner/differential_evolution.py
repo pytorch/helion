@@ -111,7 +111,7 @@ class DifferentialEvolutionSearch(PopulationBasedSearch):
         }
 
     def mutate(self, x_index: int) -> FlatConfig:
-        with sync_seed():
+        with sync_seed(process_group_name=self.kernel.env.process_group_name):
             a, b, c, *_ = [
                 self.population[p]
                 for p in random.sample(range(len(self.population)), 4)
@@ -144,13 +144,17 @@ class DifferentialEvolutionSearch(PopulationBasedSearch):
                 return pop[:target]
             return pop
 
-        return self.config_gen.random_population_flat(self.population_size * 2)
+        return self.config_gen.random_population_flat(
+            self.population_size * 2,
+            user_seed_configs=self._autotune_seed_configs(),
+            log_func=self.log,
+        )
 
     def initial_two_generations(self) -> None:
         # The initial population is 2x larger so we can throw out the slowest half and give the tuning process a head start
         initial_population_name = self.initial_population_strategy.name
         oversized_population = sorted(
-            self.parallel_benchmark_flat(
+            self.benchmark_flat_batch(
                 self._generate_initial_population_flat(),
             ),
             key=performance,
@@ -167,7 +171,7 @@ class DifferentialEvolutionSearch(PopulationBasedSearch):
         if not indices:
             return []
         flat_configs = [self.mutate(i) for i in indices]
-        return self.parallel_benchmark_flat(flat_configs)
+        return self.benchmark_flat_batch(flat_configs)
 
     def iter_candidates(self) -> Iterator[tuple[int, PopulationMember]]:
         if self.immediate_update:
@@ -265,7 +269,7 @@ class DifferentialEvolutionSearch(PopulationBasedSearch):
             self.best_perf_history = [self.best.perf]
             self.generations_without_improvement = 0
 
-        for i in range(2, self.max_generations):
+        for i in self._budgeted_range(2, self.max_generations):
             self.set_generation(i)
             self.log(f"Generation {i} starting")
             replaced = self.evolve_population()

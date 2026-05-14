@@ -116,7 +116,7 @@ class LocalAutotuneCache(AutotuneCacheBase):
         in_memory_cache_key = self.kernel.kernel._create_bound_kernel_cache_key(
             self.kernel,
             tuple(self.args),
-            self.kernel.kernel.specialization_key(self.args),
+            self.kernel.kernel._base_specialization_key(self.args),
         )
         kernel_source = textwrap.dedent(inspect.getsource(self.kernel.kernel.fn))
         kernel_source_hash = hashlib.sha256(kernel_source.encode("utf-8")).hexdigest()
@@ -149,9 +149,20 @@ class LocalAutotuneCache(AutotuneCacheBase):
                 runtime_name = getattr(torch_tpu, "__version__", "unknown")
             except ImportError:
                 runtime_name = "unknown"
+        elif dev.type == "cpu" and self.kernel.kernel.settings.backend == "pallas":
+            hardware = "pallas_interpret"
+            runtime_name = "interpret"
+        elif dev.type == "mtia":
+            hardware = hardware or "mtia"
+            try:
+                runtime_name = str(torch.mtia.get_device_properties(dev))
+            except Exception:
+                runtime_name = "unknown"
 
         assert hardware is not None and runtime_name is not None
-        config_spec_hash = self.kernel.config_spec.structural_fingerprint_hash()
+        config_spec_hash = self.kernel.config_spec.structural_fingerprint_hash(
+            advanced_controls_files=self.autotuner.settings.autotune_search_acf or None
+        )
         return LooseAutotuneCacheKey(
             specialization_key=in_memory_cache_key.specialization_key,
             extra_results=in_memory_cache_key.extra_results,
@@ -160,6 +171,7 @@ class LocalAutotuneCache(AutotuneCacheBase):
             runtime_name=runtime_name,
             backend=self.kernel.env.backend.name,
             config_spec_hash=config_spec_hash,
+            extra_cache_key=self.kernel.extra_cache_key(),
         )
 
     def _get_local_cache_path(self) -> Path:
@@ -189,7 +201,9 @@ class LocalAutotuneCache(AutotuneCacheBase):
             "key": key_dict,
         }
 
-        config_gen = self.kernel.config_spec.create_config_generation()
+        config_gen = self.kernel.config_spec.create_config_generation(
+            advanced_controls_files=self.autotuner.settings.autotune_search_acf or None
+        )
         data["flat_config"] = json.dumps(config_gen.flatten(config))
 
         backend_cache_key = self.kernel.backend_cache_key(config)

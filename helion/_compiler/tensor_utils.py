@@ -35,8 +35,18 @@ class _PadTensorFactoryMode(TorchDispatchMode):
         def _pad_shape(shape: object) -> object:
             """Pad positive integer dimension sizes to the next power of 2."""
 
+            leaves: list[object] = []
+            tree_map(lambda leaf: leaves.append(leaf), shape)
+            fully_concrete = bool(leaves) and all(
+                isinstance(leaf, int) for leaf in leaves
+            )
+
             def _pad_dim(dim_size: object) -> object:
-                if isinstance(dim_size, int) and dim_size > 0:
+                if (
+                    isinstance(dim_size, int)
+                    and dim_size > 0
+                    and (fully_concrete or dim_size >= 16)
+                ):
                     return next_power_of_2(dim_size)
                 return dim_size
 

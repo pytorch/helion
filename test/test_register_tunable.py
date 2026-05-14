@@ -14,7 +14,6 @@ from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
 from helion._testing import skipIfSharedMemoryLessThan
-from helion._testing import xfailIfCute
 from helion.autotuner import EnumFragment
 from helion.autotuner import IntegerFragment
 from helion.autotuner import PowerOfTwoFragment
@@ -112,10 +111,6 @@ class TestRegisterTunable(RefEagerTestBase, TestCase):
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfSharedMemoryLessThan(
         86016, reason="num_stages=8 requires 86016 bytes of shared memory"
-    )
-    @xfailIfCute(
-        "cute: split-k matmul register_tunable path exceeds CuTe thread-block "
-        "layout limits and scalar float16 atomic_add is not supported"
     )
     def test_matmul_split_k(self):
         """Test matmul_split_k kernel with register_tunable"""

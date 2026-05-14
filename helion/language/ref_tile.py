@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 from typing import TypeVar
+from typing_extensions import Self
 
 import torch
 from torch.utils._pytree import tree_map_only
@@ -42,8 +43,21 @@ except AttributeError:  # pragma: no cover - aten fallback not always defined
 class RefTile(TileInterface, torch.Tensor):
     _slice: slice
     _block_size: int
+    _extent_begin: int
+    _extent_end: int
 
-    def __init__(self, begin: int, end: int, block_size: int) -> None:
+    @classmethod
+    def __new__(cls: type[Self], *args: object, **kwargs: object) -> Self:
+        return torch.empty(0).as_subclass(cls)
+
+    def __init__(
+        self,
+        begin: int,
+        end: int,
+        block_size: int,
+        extent_begin: int,
+        extent_end: int,
+    ) -> None:
         super().__init__()
 
         from ..runtime.ref_mode import is_in_ref_mode_context
@@ -51,6 +65,8 @@ class RefTile(TileInterface, torch.Tensor):
         assert is_in_ref_mode_context()
         self._slice = slice(begin, end, None)
         self._block_size = block_size
+        self._extent_begin = extent_begin
+        self._extent_end = extent_end
 
     @classmethod
     def __torch_function__(

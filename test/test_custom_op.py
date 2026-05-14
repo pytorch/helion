@@ -10,6 +10,7 @@ from helion._testing import DEVICE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import onlyBackends
+from helion._testing import skipIfPallas
 from helion._testing import skipIfRefEager
 import helion.language as hl
 
@@ -115,6 +116,7 @@ def _make_backed_fake_tensors(*shapes):
 
 class TestInferFakeImpl(TestCase):
     @skipIfRefEager("compile_config requires host_function")
+    @skipIfPallas("fake launcher incompatible with output-only return capture")
     def test_static_shapes(self):
         k = helion.kernel(static_shapes=True, autotune_effort="none")(_k_add)
         x, y, mode = _make_fake_tensors((4, 8))
@@ -124,6 +126,7 @@ class TestInferFakeImpl(TestCase):
             self.assertEqual(result.dtype, x.dtype)
 
     @skipIfRefEager("compile_config requires host_function")
+    @skipIfPallas("fake launcher incompatible with output-only return capture")
     def test_unbacked_symints(self):
         k = helion.kernel(static_shapes=False, autotune_effort="none")(_k_add)
         x, y, mode = _make_fake_tensors((4, 8))
@@ -133,6 +136,7 @@ class TestInferFakeImpl(TestCase):
             self.assertEqual(result.dtype, x.dtype)
 
     @skipIfRefEager("compile_config requires host_function")
+    @skipIfPallas("fake launcher incompatible with output-only return capture")
     def test_backed_symints(self):
         k = helion.kernel(static_shapes=False, autotune_effort="none")(_k_add)
         (x, y), mode = _make_backed_fake_tensors((7, 13), (7, 13))
@@ -142,6 +146,7 @@ class TestInferFakeImpl(TestCase):
             self.assertEqual(result.dtype, x.dtype)
 
     @skipIfRefEager("compile_config requires host_function")
+    @skipIfPallas("fake launcher incompatible with output-only return capture")
     def test_backed_symints_shared_dim(self):
         @helion.kernel(static_shapes=False, autotune_effort="none")
         def k_square(x: torch.Tensor) -> torch.Tensor:

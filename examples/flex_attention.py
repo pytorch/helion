@@ -84,11 +84,9 @@ def helion_flex_attention_kernel(
 
         # iterate through full tiles (no mask needed)
         if block_mask_full_kv_indices is not None:
-            sparse_num_blocks = (
-                block_mask_full_kv_num_blocks[  # pyrefly: ignore[unsupported-operation]
-                    b_idx, h_idx, sparse_row
-                ]
-            )
+            sparse_num_blocks = block_mask_full_kv_num_blocks[  # pyrefly: ignore[unsupported-operation]
+                b_idx, h_idx, sparse_row
+            ]
 
             for block_idx in hl.tile(sparse_num_blocks, block_size=1):
                 start_n = block_mask_full_kv_indices[

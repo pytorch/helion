@@ -13,6 +13,7 @@ from helion._testing import code_and_output
 from helion._testing import onlyBackends
 from helion._testing import skipIfRocm
 from helion._testing import skipIfTileIR
+from helion._testing import skipIfXPU
 import helion.language as hl
 
 
@@ -227,6 +228,7 @@ class TestInlineAsmElementwise(RefEagerTestDisabled, TestCase):
 
     @skipIfRocm("only works on cuda")
     @skipIfTileIR("TileIR does not support inline_asm_elementwise")
+    @skipIfXPU("PTX inline assembly (mov.u32) not supported on XPU backend")
     def test_inline_asm_basic_compilation(self):
         """Test that inline_asm_elementwise compiles without errors (no CUDA requirement)"""
 

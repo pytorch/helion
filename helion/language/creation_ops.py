@@ -153,41 +153,18 @@ def _full_codegen(state: CodegenState) -> ast.AST:
 def _full_codegen_pallas(state: CodegenState) -> ast.AST:
     """Pallas codegen for hl.full / hl.zeros.
 
-    When ``pallas_loop_type`` is ``"emit_pipeline"`` or ``"fori_loop"``,
-    device tensors created at grid scope
-    (before any pipeline loop) are registered as scratch memory. The
-    scratch ref is initialized in the kernel and later captured by the
-    pipeline body closure.
+    Always lowers to a plain ``jnp.full`` bound to a fresh local, regardless
+    of pallas_loop_type.  The previous emit_pipeline/fori_loop path returned
+    a bare scratch ref AST, which broke any downstream arithmetic on the
+    result outside the inner loop -- e.g. ``acc = hl.zeros(...); acc += x``
+    emitted ``scratch + x`` and JAX raised
+    ``'AbstractRef' object has no attribute '_add'`` at trace time
+    (``Refs`` don't support arithmetic; only ``ref[...]`` reads).
+
+    When the result is loop-carried, ``_setup_loop_carried_state`` allocates
+    a scratch buffer at the loop boundary and copies the init value in --
+    no scratch needed at the ``hl.zeros`` site itself.
     """
-    from .._compiler.ast_extension import statement_from_string
-
-    config = state.config
-    pallas_loop_type = config.get("pallas_loop_type", "default")
-
-    if pallas_loop_type in ("emit_pipeline", "fori_loop"):
-        fake_value = state.fake_value
-        assert isinstance(fake_value, torch.Tensor)
-        shape = tuple(int(s) for s in fake_value.size())
-        dtype = fake_value.dtype
-
-        # Register as scratch memory
-        scratch_name = state.device_function.register_scratch(shape, dtype)
-
-        # Emit initialization: scratch_ref[...] = jnp.full(scratch_ref.shape, value, dtype)
-        proxy_value = state.proxy_arg(1)
-        if isinstance(proxy_value, (int, float, bool)):
-            value_str = state.device_function.literal_expr(proxy_value)
-        else:
-            value_str = str(proxy_value)
-        jnp_dtype = CompileEnvironment.current().backend.dtype_str(dtype)
-        state.add_statement(
-            statement_from_string(
-                f"{scratch_name}[...] = jnp.full({scratch_name}.shape, {value_str}, {jnp_dtype})"
-            )
-        )
-        return expr_from_string(scratch_name)
-
-    # Fall through to common codegen
     return full._codegen["common"](state)  # pyrefly: ignore[missing-attribute]
 
 

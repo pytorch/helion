@@ -31,9 +31,16 @@ from helion._testing import skipIfRefEager
 from helion._testing import skipIfTileIR
 from helion._testing import skipUnlessTensorDescriptor
 import helion.language as hl
+from helion.runtime.settings import _get_backend
 
 
-@onlyBackends(["triton"])
+def _int64_codegen_type() -> str:
+    if _get_backend() == "cute":
+        return "cutlass.Int64"
+    return "tl.int64"
+
+
+@onlyBackends(["triton", "cute"])
 class TestInt64Indexing(RefEagerTestBase, TestCase):
     """Test int64 indexing with different indexing strategies."""
 
@@ -59,7 +66,7 @@ class TestInt64Indexing(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, expected)
 
         # Verify int64 type is used in generated code
-        self.assertIn("tl.int64", code)
+        self.assertIn(_int64_codegen_type(), code)
 
     @skipIfRefEager("Test checks generated code")
     @skipIfTileIR("TileIR does not support block_ptr indexing")
@@ -91,7 +98,7 @@ class TestInt64Indexing(RefEagerTestBase, TestCase):
         # Verify block_ptr is NOT used (falls back to pointer)
         self.assertNotIn("tl.make_block_ptr", code)
         # Verify int64 type is used
-        self.assertIn("tl.int64", code)
+        self.assertIn(_int64_codegen_type(), code)
 
     @skipIfRefEager("Test checks generated code")
     @skipUnlessTensorDescriptor("Tensor descriptor support is required")
@@ -123,7 +130,7 @@ class TestInt64Indexing(RefEagerTestBase, TestCase):
         self.assertNotIn("make_tensor_descriptor", code)
         self.assertNotIn("_experimental_make_tensor_descriptor", code)
         # Verify int64 type is used
-        self.assertIn("tl.int64", code)
+        self.assertIn(_int64_codegen_type(), code)
 
     @skipIfRefEager("Test checks generated code")
     @skipIfTileIR("TileIR does not support block_ptr indexing")
@@ -148,7 +155,7 @@ class TestInt64Indexing(RefEagerTestBase, TestCase):
 
         # Verify block_ptr is NOT used (falls back to pointer)
         self.assertNotIn("tl.make_block_ptr", code)
-        self.assertIn("tl.int64", code)
+        self.assertIn(_int64_codegen_type(), code)
 
     @skipIfRefEager("Test checks generated code")
     @skipUnlessTensorDescriptor("Tensor descriptor support is required")
@@ -178,7 +185,7 @@ class TestInt64Indexing(RefEagerTestBase, TestCase):
 
         # Verify tensor_descriptor is NOT used (falls back to pointer)
         self.assertNotIn("make_tensor_descriptor", code)
-        self.assertIn("tl.int64", code)
+        self.assertIn(_int64_codegen_type(), code)
 
     @skipIfRefEager("Test checks generated code")
     @skipIfTileIR("TileIR does not support block_ptr indexing")
@@ -205,7 +212,7 @@ class TestInt64Indexing(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, expected)
         # Falls back to pointer, should still use int64
         self.assertNotIn("tl.make_block_ptr", code)
-        self.assertIn("tl.int64", code)
+        self.assertIn(_int64_codegen_type(), code)
 
     @skipIfRefEager("Test checks generated code")
     def test_int64_with_loaded_indices(self):
@@ -240,7 +247,7 @@ class TestInt64Indexing(RefEagerTestBase, TestCase):
 
         expected = torch.gather(input_tensor, 1, index_tensor)
         torch.testing.assert_close(result, expected)
-        self.assertIn("tl.int64", code)
+        self.assertIn(_int64_codegen_type(), code)
 
     @skipIfRefEager("Test checks generated code")
     @skipIfTileIR("TileIR does not support block_ptr indexing")
@@ -269,7 +276,7 @@ class TestInt64Indexing(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, expected)
         # Verify block_ptr is NOT used (falls back to pointer)
         self.assertNotIn("tl.make_block_ptr", code)
-        self.assertIn("tl.int64", code)
+        self.assertIn(_int64_codegen_type(), code)
 
     @skipIfRefEager("Test checks generated code")
     @skipUnlessTensorDescriptor("Tensor descriptor support is required")
@@ -297,7 +304,7 @@ class TestInt64Indexing(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, expected)
         # Verify tensor_descriptor is NOT used (falls back to pointer)
         self.assertNotIn("make_tensor_descriptor", code)
-        self.assertIn("tl.int64", code)
+        self.assertIn(_int64_codegen_type(), code)
 
     @skipIfRefEager("Test checks generated code")
     @skipIfTileIR("TileIR does not support block_ptr indexing")
@@ -333,7 +340,7 @@ class TestInt64Indexing(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, expected, atol=1e-2, rtol=1e-2)
         # Verify block_ptr is NOT used (falls back to pointer)
         self.assertNotIn("tl.make_block_ptr", code)
-        self.assertIn("tl.int64", code)
+        self.assertIn(_int64_codegen_type(), code)
 
     @skipIfRefEager("Test checks generated code")
     @skipUnlessTensorDescriptor("Tensor descriptor support is required")
@@ -368,7 +375,7 @@ class TestInt64Indexing(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, expected, atol=1e-2, rtol=1e-2)
         # Verify tensor_descriptor is NOT used (falls back to pointer)
         self.assertNotIn("make_tensor_descriptor", code)
-        self.assertIn("tl.int64", code)
+        self.assertIn(_int64_codegen_type(), code)
 
     @skipIfRefEager("Test checks generated code")
     @skipIfTileIR("TileIR does not support block_ptr indexing")
@@ -393,10 +400,13 @@ class TestInt64Indexing(RefEagerTestBase, TestCase):
         expected = x + y
         torch.testing.assert_close(result, expected)
 
-        # Verify block_ptr IS used with int32
-        self.assertIn("tl.make_block_ptr", code)
-        # Should NOT have int64 cast
-        self.assertNotIn("tl.int64", code)
+        # Verify block_ptr IS used with int32 on Triton. CuTe uses its own scalar
+        # pointer arithmetic path for this config.
+        if _get_backend() == "triton":
+            self.assertIn("tl.make_block_ptr", code)
+            self.assertNotIn("tl.int64", code)
+        else:
+            self.assertNotIn("cutlass.Int64", code)
 
 
 if __name__ == "__main__":

@@ -1,22 +1,77 @@
 from __future__ import annotations
 
 import ast
+import contextlib
+import dataclasses
 import logging
+import operator
+import textwrap
 from typing import TYPE_CHECKING
 
 import torch
 from torch.fx import has_side_effect
+from torch.fx.node import map_arg
 
 from .. import exc
 from .._compiler.ast_extension import expr_from_string
 from .._compiler.ast_extension import statement_from_string
 from .._compiler.compile_environment import CompileEnvironment
+from .._compiler.compile_environment import _symint_expr
+from .._compiler.cute.cute_epilogue import Tcgen05UnaryEpilogueChain
+from .._compiler.cute.cute_epilogue import _AuxiliaryTensorStep
+from .._compiler.cute.cute_epilogue import analyze_tcgen05_unary_epilogue_chain
+from .._compiler.cute.cute_fx_walk import reach_tcgen05_matmul_anchors
+from .._compiler.cute.cutedsl_compat import emit_dealloc_mbarrier_initialized_kwarg
+from .._compiler.cute.cutedsl_compat import emit_pipeline_advance
+from .._compiler.cute.cutedsl_compat import emit_producer_tail_tma_umma
+from .._compiler.cute.cutedsl_compat import emit_producer_tail_umma_async
+from .._compiler.cute.tcgen05_constants import (
+    TCGEN05_ACC_WAIT_PLACEMENT_BEFORE_SUBTILE_LOOP,
+)
+from .._compiler.cute.tcgen05_constants import TCGEN05_ACC_WAIT_PLACEMENT_CONFIG_KEY
+from .._compiler.cute.tcgen05_constants import TCGEN05_ACC_WAIT_PLACEMENT_SUBTILE_LOOP
+from .._compiler.cute.tcgen05_constants import TCGEN05_C_ACQUIRE_PLACEMENT_CONFIG_KEY
+from .._compiler.cute.tcgen05_constants import TCGEN05_C_ACQUIRE_PLACEMENT_FIRST_IN_LOOP
+from .._compiler.cute.tcgen05_constants import (
+    TCGEN05_C_ACQUIRE_PLACEMENT_LATER_BEFORE_BARRIER,
+)
+from .._compiler.cute.tcgen05_constants import TCGEN05_C_ACQUIRE_PLACEMENT_PRE_LOOP
+from .._compiler.cute.tcgen05_constants import TCGEN05_C_STORE_MODE_CONFIG_KEY
+from .._compiler.cute.tcgen05_constants import TCGEN05_C_STORE_MODE_NORMAL
+from .._compiler.cute.tcgen05_constants import TCGEN05_C_STORE_MODE_SKIP_EPILOGUE_STORE
+from .._compiler.cute.tcgen05_constants import TCGEN05_EPILOGUE_LAYOUT_CONFIG_KEY
+from .._compiler.cute.tcgen05_constants import (
+    TCGEN05_EPILOGUE_LAYOUT_MODULE_HELPER_ACC_T2R,
+)
+from .._compiler.cute.tcgen05_constants import (
+    TCGEN05_EPILOGUE_LAYOUT_MODULE_HELPER_STORE_TAIL,
+)
+from .._compiler.cute.tcgen05_constants import TCGEN05_EPILOGUE_LAYOUT_NORMAL
+from .._compiler.cute.tcgen05_constants import (
+    TCGEN05_EPILOGUE_LAYOUT_SPLIT_ACC_T2R_STORE_TAIL,
+)
+from .._compiler.cute.tcgen05_constants import TCGEN05_EPILOGUE_LAYOUT_SPLIT_FIRST_T2R
+from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
+from .._compiler.host_function import HostFunction
 from .._compiler.indexing_strategy import SubscriptIndexing
+from .._compiler.indexing_strategy import TileWithOffsetInfo
+from .._compiler.indexing_strategy import _get_tile_with_offset_info
+from .._compiler.pallas import codegen as pallas_codegen
+from .._compiler.variable_origin import GridOrigin
+from .._compiler.variable_origin import TileBeginOrigin
+from .._compiler.variable_origin import TileCountOrigin
+from .._compiler.variable_origin import TileEndOrigin
+from .._compiler.variable_origin import TileIdOrigin
 from . import _decorators
 from .stack_tensor import StackTensor
 
 if TYPE_CHECKING:
     from .._compiler.inductor_lowering import CodegenState
+    from .._compiler.tile_strategy import LoopDimInfo
+
+from .._compiler.host_function import SymbolOrigin
+
+# TileBeginWithOffset removed - using TileBeginWithOffsetPattern instead
 
 __all__ = ["load", "store"]
 
@@ -29,6 +84,33 @@ _EVICTION_POLICY_MAP = {
     "first": "evict_first",
     "last": "evict_last",
 }
+
+
+@dataclasses.dataclass(frozen=True)
+class _AuxStepRecord:
+    """Per-step splice-side AST locals for one auxiliary chain step.
+
+    Holds the underlying aux tensor name, broadcast axis (None for
+    exact-shape rank-2 aux), and the AST var names allocated for
+    the partition pipeline. ``aux_view2d`` is set only for
+    broadcast aux steps; exact-shape steps leave it ``None``. Used
+    by ``_codegen_cute_store_tcgen05_tile`` to thread per-aux
+    locals through the per-output-tile setup helper and the
+    per-subtile load source helper.
+    """
+
+    aux_tensor_name: str
+    broadcast_axis: int | None
+    aux_tile: str
+    aux_part_base: str
+    aux_xfm: str
+    aux_planned: str
+    aux_epi: str
+    ttr_aux: str
+    ttr_aux_grouped: str
+    ttr_aux_subtile: str
+    aux_loaded: str
+    aux_view2d: str | None
 
 
 @has_side_effect
@@ -139,123 +221,44 @@ def _(state: CodegenState) -> ast.AST:
         stack_tensor_ast = state.ast_args[0]
         assert isinstance(stack_tensor_ast, tuple)
         assert len(stack_tensor_ast) == 2
-        tensor_like_ast, dev_ptrs_ast = stack_tensor_ast
+        _tensor_like_ast, dev_ptrs_ast = stack_tensor_ast
         return StackIndexingStrategy.codegen_store(
             state, tensor, dev_ptrs_ast, [*subscript], value, extra_mask
         )
     raise NotImplementedError(f"Cannot store to type: {type(tensor)}")
 
 
-def _pallas_index_str(
+def _record_pad_info(
     state: CodegenState,
-    subscript: list[object] | tuple[object, ...],
     tensor: torch.Tensor,
-) -> tuple[str, list[int]]:
-    """Build a JAX/Pallas index string from a Helion subscript list.
+    tensor_dim: int,
+    block_id: int,
+    extra_pad: int = 0,
+) -> None:
+    """Record that a tensor dimension uses pl.ds() and may need host-side padding.
 
-    Uses ``pl.ds(offset, block_size)`` only for dimensions inside a looped
-    reduction (``DeviceLoopState``).  Grid dimensions and persistent
-    reduction dimensions use ``...`` — Pallas BlockSpecs in the launcher
-    handle the grid-level tiling.
+    *extra_pad* accounts for non-zero loop begins: 0 when the loop starts
+    at offset 0, ``begin % block_size`` for a constant begin, or
+    ``block_size - 1`` for a data-dependent begin.
 
-    For ``EmitPipelineLoopState`` or ``ForiLoopState``, pipeline-tiled
-    dimensions also use ``...`` since the pipeline handles that tiling
-    (via BlockSpecs or DMA copies respectively).
-
-    Also returns positions of ``None`` indices so the caller can apply
-    ``jnp.expand_dims`` after loading.
+    Note: stores one entry per (tensor, dim).  If two inner loops tile the
+    same dim with different block_ids, the last one wins.  This is fine when
+    both loops use the same block size (the common case).
     """
-    from .._compiler.tile_strategy import DeviceLoopState
-    from .._compiler.tile_strategy import EmitPipelineLoopState
-    from .._compiler.tile_strategy import ForiLoopState
-
-    env = CompileEnvironment.current()
-
-    if not subscript:
-        return "...", []
-
-    # Check if we're inside an emit_pipeline or fori_loop
-    in_pipeline = False
-    pipeline_block_ids: set[int] = set()
-    for loops in state.codegen.active_device_loops.values():
-        for loop in loops:
-            if isinstance(loop, (EmitPipelineLoopState, ForiLoopState)):
-                in_pipeline = True
-                pipeline_block_ids.update(loop.block_ids)
-
-    # Record grid-level dim→block_id for block spec generation.
-    dim_map = state.device_function.pallas_tensor_dim_block_ids.setdefault(
-        id(tensor), {}
-    )
-
-    # Build parts, using pl.ds() only for looped reduction dims.
-    parts: list[str] = []
-    none_dims: list[int] = []
-    out_pos = 0
-    tensor_dim = 0  # tracks which tensor dimension we're at (skips None)
-    for idx in subscript:
-        if idx is None:
-            none_dims.append(out_pos)
-            out_pos += 1
-            continue
-        block_id = _resolve_block_id(env, idx, tensor, tensor_dim)
-        if block_id is not None:
-            is_device_loop = False
-            if in_pipeline and block_id in pipeline_block_ids:
-                parts.append(":")
-            else:
-                loops = state.codegen.active_device_loops.get(block_id)
-                if loops and any(isinstance(loop, DeviceLoopState) for loop in loops):
-                    parts.append(_pallas_ds_expr(state, block_id))
-                else:
-                    parts.append(":")
-            if not is_device_loop and isinstance(idx, torch.SymInt):
-                dim_map.setdefault(tensor_dim, block_id)
-        elif isinstance(idx, int):
-            parts.append(str(idx))
-        else:
-            parts.append(":")
-        out_pos += 1
-        tensor_dim += 1
-
-    return ", ".join(parts), none_dims
+    pad_info = state.device_function.pallas_pad_info
+    tensor_id = id(tensor)
+    if tensor_id not in pad_info:
+        pad_info[tensor_id] = {}
+    pad_info[tensor_id][tensor_dim] = (block_id, extra_pad)
 
 
-def _resolve_block_id(
-    env: CompileEnvironment,
-    idx: object,
-    tensor: torch.Tensor,
-    pos: int,
-) -> int | None:
-    """Resolve a subscript element to its block_id, if any."""
-    if isinstance(idx, torch.SymInt):
-        return env.get_block_id(idx)
-    if isinstance(idx, slice) and idx == slice(None):
-        return env.resolve_block_id(tensor.shape[pos])
-    return None
-
-
-def _pallas_ds_expr(state: CodegenState, block_id: int) -> str:
-    """Return a ``pl.ds(offset, block_size)`` expression for *block_id*."""
-    offset = state.codegen.offset_var(block_id)
-    block_size = state.device_function.block_size_var(block_id)
-    if block_size is None:
-        return ":"
-    return f"pl.ds({offset}, {block_size})"
-
-
-def _pallas_vmem_name(state: CodegenState, name: str) -> str:
-    """Remap a tensor name to its VMEM ref name when inside emit_pipeline or fori_loop."""
-    from .._compiler.tile_strategy import EmitPipelineLoopState
-    from .._compiler.tile_strategy import ForiLoopState
-
-    for loops in state.codegen.active_device_loops.values():
-        for loop in loops:
-            if isinstance(loop, (EmitPipelineLoopState, ForiLoopState)):
-                mapping = getattr(loop, "_tensor_to_vmem", None)
-                if mapping and name in mapping:
-                    return mapping[name]
-    return name
+def _maybe_get_symbol_origin(idx: object) -> SymbolOrigin | None:
+    if not isinstance(idx, torch.SymInt):
+        return None
+    expr = _symint_expr(idx)
+    if expr is None:
+        return None
+    return HostFunction.current().expr_to_origin.get(expr)
 
 
 @_decorators.codegen(store, "pallas")
@@ -266,12 +269,12 @@ def _(state: CodegenState) -> None:
     value = state.ast_arg(2)
     assert isinstance(tensor, torch.Tensor)
     name = state.device_function.tensor_arg(tensor).name
-    name = _pallas_vmem_name(state, name)
+    name = pallas_codegen.vmem_name(state, name)
     # Increment memory op index to stay in sync with triton backend
     device_fn = state.device_function
     device_fn.device_store_index += 1
     device_fn.device_memory_op_index += 1
-    index_str, _ = _pallas_index_str(state, subscript, tensor)
+    index_str, _ = pallas_codegen.index_str(state, subscript, tensor)
     state.codegen.add_statement(
         statement_from_string(f"{name}[{index_str}] = {{value}}", value=value)
     )
@@ -536,6 +539,94 @@ def _cute_index_exprs(
 ) -> list[str]:
     env = CompileEnvironment.current()
 
+    def symint_index_expr(idx: torch.SymInt, used_block_ids: set[int]) -> str:
+        expr = _symint_expr(idx)
+        if expr is not None:
+            origin_info = HostFunction.current().expr_to_origin.get(expr)
+            if origin_info is not None and isinstance(origin_info.origin, GridOrigin):
+                if type(origin_info.origin) is not GridOrigin:
+                    block_id = origin_info.origin.block_id
+                    loop_info = active_loop_info(block_id)
+                    begin_var = tile_begin_expr(block_id, loop_info)
+                    block_size_var = (
+                        state.device_function.block_size_var(block_id) or "1"
+                    )
+                    if isinstance(origin_info.origin, TileBeginOrigin):
+                        return begin_var
+                    if isinstance(origin_info.origin, TileEndOrigin):
+                        if loop_info is not None and loop_info.end_var_name is not None:
+                            return env.backend.minimum_expr(
+                                f"({begin_var}) + ({block_size_var})",
+                                loop_info.end_var_name,
+                            )
+                        return f"({begin_var}) + ({block_size_var})"
+                    if isinstance(origin_info.origin, TileCountOrigin):
+                        end_var = (
+                            loop_info.end_var_name
+                            if loop_info is not None
+                            and loop_info.end_var_name is not None
+                            else f"({begin_var}) + ({block_size_var})"
+                        )
+                        extent = f"({end_var}) - ({begin_var})"
+                        return env.backend.cdiv_expr(
+                            extent, block_size_var, is_device=True
+                        )
+                    if isinstance(origin_info.origin, TileIdOrigin):
+                        if block_size_var == "1":
+                            return begin_var
+                        return f"({begin_var}) // ({block_size_var})"
+                    return state.sympy_expr(expr)
+        block_id = env.get_block_id(idx)
+        if block_id is not None:
+            used_block_ids.add(block_id)
+            return index_var_for_block_id(block_id, idx)
+        if expr is not None:
+            return state.sympy_expr(expr)
+        raise exc.BackendUnsupported("cute", f"unlowerable symbolic index: {idx}")
+
+    def active_loop_info(block_id: int) -> LoopDimInfo | None:
+        loops = state.codegen.active_device_loops.get(block_id)
+        if loops:
+            return loops[-1].block_id_to_info.get(block_id)
+        grid_state = state.codegen.current_grid_state
+        if grid_state is not None:
+            return grid_state.block_id_to_info.get(block_id)
+        return None
+
+    def active_local_coord(block_id: int) -> str | None:
+        from .._compiler.cute.cute_reshape import _grid_local_coord_expr
+
+        loops = state.codegen.active_device_loops.get(block_id)
+        if loops:
+            thread_axis = loops[-1].block_thread_axes.get(block_id)
+            if thread_axis is not None:
+                return _grid_local_coord_expr(state.codegen, block_id, thread_axis)
+        grid_state = state.codegen.current_grid_state
+        if grid_state is not None:
+            thread_axis = grid_state.block_thread_axes.get(block_id)
+            if thread_axis is not None:
+                return _grid_local_coord_expr(state.codegen, block_id, thread_axis)
+        return None
+
+    def tile_begin_expr(block_id: int, loop_info: LoopDimInfo | None) -> str:
+        loops = state.codegen.active_device_loops.get(block_id)
+        if loops:
+            return state.codegen.offset_var(block_id)
+        begin_var = "0"
+        if loop_info is not None and loop_info.begin_var_name is not None:
+            begin_var = loop_info.begin_var_name
+        global_index = active_index_var(block_id)
+        local_coord = active_local_coord(block_id)
+        if global_index is not None and local_coord is not None:
+            return state.codegen.lift(
+                expr_from_string(f"({global_index}) - ({local_coord})"),
+                dce=True,
+                prefix="tile_begin",
+            ).id
+        if global_index is not None:
+            return global_index
+        return begin_var
+
     def active_index_var(block_id: int) -> str | None:
         loops = state.codegen.active_device_loops.get(block_id)
         if loops:
@@ -592,6 +683,28 @@ def _cute_index_exprs(
             ),
         )
 
+    def local_coord_for_block_id(block_id: int, begin_var: str) -> str | None:
+        if (local_coord := active_local_coord(block_id)) is not None:
+            return local_coord
+        if (idx_var := active_index_var(block_id)) is not None:
+            return f"({idx_var}) - ({begin_var})"
+        return None
+
+    def tile_with_offset_index_expr(tile_info: TileWithOffsetInfo) -> str:
+        block_id = tile_info.block_id
+        begin_var = tile_begin_expr(block_id, active_loop_info(block_id))
+        local_coord = local_coord_for_block_id(block_id, begin_var)
+        if local_coord is None:
+            raise exc.BackendUnsupported(
+                "cute",
+                (
+                    "indexing dimension is not active in this scope "
+                    f"(block_id={block_id})"
+                ),
+            )
+        offset_expr = state.device_function.literal_expr(tile_info.offset)
+        return f"({begin_var}) + cutlass.Int32({offset_expr}) + ({local_coord})"
+
     used_block_ids = {
         block_id
         for idx in subscript
@@ -606,13 +719,26 @@ def _cute_index_exprs(
             ast_idx = ast_subscript[pos]
         if idx is None:
             continue
+        if (
+            tensor is not None
+            and tensor_dim < tensor.ndim
+            and env.known_equal(tensor.shape[tensor_dim], 1)
+            and not (isinstance(idx, slice) and idx == slice(None))
+        ):
+            result.append("0")
+            tensor_dim += 1
+            continue
+        if (
+            tile_info := _get_tile_with_offset_info(
+                idx, getattr(state, "fx_node", None), pos
+            )
+        ) is not None and tile_info.block_size is not None:
+            used_block_ids.add(tile_info.block_id)
+            result.append(tile_with_offset_index_expr(tile_info))
+            tensor_dim += 1
+            continue
         if isinstance(idx, torch.SymInt):
-            block_id = env.get_block_id(idx)
-            if block_id is not None:
-                used_block_ids.add(block_id)
-                result.append(index_var_for_block_id(block_id, idx))
-            else:
-                result.append(state.sympy_expr(idx._sympy_()))
+            result.append(symint_index_expr(idx, used_block_ids))
             tensor_dim += 1
         elif isinstance(idx, int):
             result.append(str(idx))
@@ -630,7 +756,8 @@ def _cute_index_exprs(
                     "cute", f"tensor index without AST at position {pos}"
                 )
             lifted = state.codegen.lift(ast_idx, dce=True, prefix="index")
-            result.append(lifted.id)
+            index_dtype = env.backend.dtype_str(env.index_dtype)
+            result.append(f"{index_dtype}({lifted.id})")
             tensor_dim += 1
         elif isinstance(idx, slice) and idx == slice(None):
             if tensor is None:
@@ -671,11 +798,595 @@ def _cute_index_tuple(index_exprs: list[str]) -> str:
     return f"({', '.join(index_exprs)})"
 
 
+def _cute_scalar_pointer_expr(tensor_name: str, index_exprs: list[str]) -> str:
+    env = CompileEnvironment.current()
+    index_dtype = env.index_type()
+    offset = " + ".join(
+        f"({index_dtype}({index}) * {index_dtype}({tensor_name}.layout.stride[{dim}]))"
+        for dim, index in enumerate(index_exprs)
+    )
+    return f"({tensor_name}.iterator + {offset})"
+
+
+def _cute_scalar_load_expr(tensor_name: str, index_exprs: list[str]) -> str:
+    if "None" in index_exprs:
+        return f"{tensor_name}[{', '.join(index_exprs)}]"
+    return f"{_cute_scalar_pointer_expr(tensor_name, index_exprs)}.load()"
+
+
+def _cute_scalar_store_expr(
+    tensor_name: str, index_exprs: list[str], value: str
+) -> str:
+    if "None" in index_exprs:
+        return f"{tensor_name}.__setitem__({_cute_index_tuple(index_exprs)}, {value})"
+    return f"{_cute_scalar_pointer_expr(tensor_name, index_exprs)}.store({value})"
+
+
+def _cute_stack_tensor_offset_expr(
+    state: CodegenState,
+    tensor_like: torch.Tensor,
+    subscript: list[object],
+    ast_subscript: list[object] | tuple[object, ...],
+) -> str:
+    env = CompileEnvironment.current()
+    index_exprs = _cute_index_exprs(
+        state,
+        subscript,
+        ast_subscript,
+        tensor=tensor_like,
+        inactive_slice_expr="None",
+        inactive_singleton_slice_expr="0",
+    )
+    if "None" in index_exprs:
+        raise exc.BackendUnsupported("cute", "inactive stack tensor load dimension")
+    index_dtype = env.index_type()
+    terms = []
+    for dim, index in enumerate(index_exprs):
+        stride = tensor_like.stride(dim)
+        stride_expr = (
+            str(stride) if isinstance(stride, int) else state.sympy_expr(stride)
+        )
+        terms.append(f"({index_dtype}({index}) * {index_dtype}({stride_expr}))")
+    return " + ".join(terms) if terms else "0"
+
+
+def _cute_stack_tensor_mask_expr(
+    state: CodegenState,
+    tensor_like: torch.Tensor,
+    dev_ptrs: torch.Tensor,
+    subscript: list[object],
+    extra_mask: ast.AST | None,
+) -> str | None:
+    terms = []
+    tensor_mask = _cute_combined_mask(
+        state,
+        subscript,
+        extra_mask,
+        tensor=tensor_like,
+        include_tensor_index_masks=False,
+    )
+    if tensor_mask is not None:
+        terms.append(tensor_mask)
+    stack_mask = _cute_combined_mask(
+        state,
+        [slice(None)] * dev_ptrs.ndim,
+        None,
+        tensor=dev_ptrs,
+    )
+    if stack_mask is not None and stack_mask not in terms:
+        terms.append(stack_mask)
+    if not terms:
+        return None
+    return " and ".join(f"({term})" for term in terms)
+
+
+def _cute_stack_tensor_pointer_expr(
+    target_dtype: str,
+    dev_ptrs_ast: ast.AST,
+    offset_expr: str,
+) -> ast.AST:
+    return expr_from_string(
+        f"(cute.make_ptr({target_dtype}, cutlass.Int64({{base}}), "
+        f"cute.AddressSpace.gmem) + ({offset_expr}))",
+        base=dev_ptrs_ast,
+    )
+
+
+def _codegen_cute_store_stack_load(
+    state: CodegenState,
+    tensor: torch.Tensor,
+    subscript: tuple[object, ...] | list[object],
+    ast_subscript: tuple[object, ...] | list[object],
+    value: ast.AST,
+    extra_mask: ast.AST | None,
+    value_node: torch.fx.Node,
+) -> ast.AST | None:
+    if value_node.op != "call_function" or value_node.target is not load:
+        return None
+    stack_arg = value_node.args[0]
+    if not isinstance(stack_arg, tuple) or len(stack_arg) != 2:
+        return None
+    ptr_node = stack_arg[1]
+    if (
+        not isinstance(ptr_node, torch.fx.Node)
+        or ptr_node.op != "call_function"
+        or ptr_node.target is not load
+        or len(ptr_node.args) < 2
+    ):
+        return None
+    dev_ptrs = (
+        ptr_node.args[0].meta.get("val")
+        if isinstance(ptr_node.args[0], torch.fx.Node)
+        else None
+    )
+    ptr_subscript = ptr_node.args[1]
+    if not isinstance(dev_ptrs, torch.Tensor) or not isinstance(
+        ptr_subscript, (list, tuple)
+    ):
+        return None
+    tensor_like_node = stack_arg[0]
+    tensor_like = (
+        tensor_like_node.meta.get("val")
+        if isinstance(tensor_like_node, torch.fx.Node)
+        else tensor_like_node
+    )
+    if not isinstance(tensor_like, torch.Tensor):
+        return None
+
+    if (
+        dev_ptrs.ndim == 2
+        and len(ptr_subscript) == 2
+        and all(isinstance(idx, slice) and idx == slice(None) for idx in ptr_subscript)
+        and len(subscript) >= 3
+        and isinstance(subscript[0], slice)
+        and subscript[0] == slice(None)
+        and isinstance(subscript[1], slice)
+        and subscript[1] == slice(None)
+    ):
+        stack_value_subscript = value_node.args[1]
+        if not isinstance(stack_value_subscript, (list, tuple)):
+            return None
+        stack_value_subscript_proxy = map_arg(
+            stack_value_subscript, lambda arg: arg.meta["val"]
+        )
+        stack_value_subscript_ast = map_arg(
+            stack_value_subscript, lambda arg: state.env[arg]
+        )
+        tensor_offset_expr = _cute_stack_tensor_offset_expr(
+            state,
+            tensor_like,
+            [*stack_value_subscript_proxy],
+            [*stack_value_subscript_ast],
+        )
+        target_index_exprs = _cute_index_exprs(
+            state,
+            [*subscript],
+            ast_subscript,
+            tensor=tensor,
+            inactive_singleton_slice_expr="0",
+        )
+        if len(target_index_exprs) != tensor.ndim:
+            return None
+        first_stack_index = target_index_exprs[0]
+        target_tail = target_index_exprs[2:]
+        loop_var = state.device_function.new_var("stack_dim", dce=True)
+        env = CompileEnvironment.current()
+        index_dtype = env.index_type()
+        dev_ptrs_name = state.device_function.tensor_arg(dev_ptrs).name
+        tensor_name = state.device_function.tensor_arg(tensor).name
+        target_dtype = env.backend.dtype_str(tensor.dtype)
+        dev_ptr_offset = (
+            f"{index_dtype}({first_stack_index}) * "
+            f"{index_dtype}({dev_ptrs.stride(0)}) + "
+            f"{index_dtype}({loop_var}) * {index_dtype}({dev_ptrs.stride(1)})"
+        )
+        stack_ptr_expr = (
+            f"(cute.make_ptr({target_dtype}, "
+            f"cutlass.Int64(({dev_ptrs_name}.iterator + {dev_ptr_offset}).load()), "
+            f"cute.AddressSpace.gmem) + ({tensor_offset_expr}))"
+        )
+        target_indices = [first_stack_index, loop_var, *target_tail]
+        store_expr = _cute_scalar_store_expr(
+            tensor_name,
+            target_indices,
+            f"({stack_ptr_expr}).load()",
+        )
+        mask_expr = _cute_combined_mask(state, [*subscript], extra_mask, tensor=tensor)
+        if mask_expr is None:
+            body = f"    {store_expr}"
+        else:
+            body = f"    if {mask_expr}:\n        {store_expr}"
+        state.add_statement(
+            statement_from_string(
+                f"for {loop_var} in range({dev_ptrs.size(1)}):\n{body}"
+            )
+        )
+        return ast.Constant(value=None)
+
+    ptr_subscript_proxy = map_arg(ptr_subscript, lambda arg: arg.meta["val"])
+    ptr_subscript_ast = map_arg(ptr_subscript, lambda arg: state.env[arg])
+    ptr_index_exprs = _cute_index_exprs(
+        state,
+        [*ptr_subscript_proxy],
+        [*ptr_subscript_ast],
+        tensor=dev_ptrs,
+        inactive_slice_expr="None",
+        inactive_singleton_slice_expr="0",
+    )
+    if "None" in ptr_index_exprs:
+        return None
+
+    target_index_exprs = _cute_index_exprs(
+        state,
+        [*subscript],
+        ast_subscript,
+        tensor=tensor,
+        inactive_singleton_slice_expr="0",
+    )
+    ptr_pos = 0
+    rewritten_index_exprs = []
+    for idx, index_expr in zip(subscript, target_index_exprs, strict=True):
+        if isinstance(idx, slice) and idx == slice(None):
+            replacement = (
+                ptr_index_exprs[ptr_pos] if ptr_pos < len(ptr_index_exprs) else None
+            )
+            ptr_pos += 1
+            rewritten_index_exprs.append(
+                replacement if replacement is not None else index_expr
+            )
+        else:
+            if ptr_pos < len(ptr_subscript_proxy) and not (
+                isinstance(ptr_subscript_proxy[ptr_pos], slice)
+                and ptr_subscript_proxy[ptr_pos] == slice(None)
+            ):
+                ptr_pos += 1
+            rewritten_index_exprs.append(index_expr)
+
+    tensor_name = state.device_function.tensor_arg(tensor).name
+    backend = CompileEnvironment.current().backend
+    target_dtype = backend.dtype_str(tensor.dtype)
+    value = expr_from_string(
+        backend.ast_to_dtype_expr("{value}", target_dtype),
+        value=value,
+    )
+    store_expr = expr_from_string(
+        _cute_scalar_store_expr(tensor_name, rewritten_index_exprs, "{value}"),
+        value=value,
+    )
+    mask_expr = _cute_combined_mask(state, [*subscript], extra_mask, tensor=tensor)
+    if mask_expr is None:
+        return store_expr
+    mask_ast = expr_from_string(mask_expr)
+    assert isinstance(mask_ast, ast.expr)
+    assert isinstance(store_expr, ast.expr)
+    state.add_statement(
+        ast.fix_missing_locations(
+            ast.If(
+                test=mask_ast,
+                body=[ast.Expr(value=store_expr)],
+                orelse=[],
+            )
+        )
+    )
+    return ast.Constant(value=None)
+
+
+def _cute_affine_range_block_id(state: CodegenState, affine: object) -> int | None:
+    from .._compiler.cute.indexing import CuteAffineRangeIndex
+
+    if not isinstance(affine, CuteAffineRangeIndex):
+        return None
+    env = CompileEnvironment.current()
+    base_meta = getattr(affine.base, "meta", {})
+    base_val = base_meta.get("val") if isinstance(base_meta, dict) else None
+    block_id = env.resolve_block_id(base_val) if base_val is not None else None
+    if block_id is None:
+        codegen = base_meta.get("codegen") if isinstance(base_meta, dict) else None
+        if isinstance(codegen, ast.Name) and codegen.id.startswith("_BLOCK_SIZE_"):
+            with contextlib.suppress(ValueError):
+                block_id = int(codegen.id.removeprefix("_BLOCK_SIZE_"))
+    if block_id is None:
+        return None
+    if state.fx_node is not None:
+        return env.resolve_codegen_block_id(
+            block_id, state.codegen, state.fx_node.graph
+        )
+    return block_id
+
+
+def _cute_affine_range_expr(
+    state: CodegenState,
+    affine: object,
+    lane_var: str,
+    *,
+    dtype: torch.dtype | None = None,
+) -> str | None:
+    from .._compiler.cute.indexing import CuteAffineRangeIndex
+
+    if not isinstance(affine, CuteAffineRangeIndex):
+        return None
+    if affine.step != 1 or affine.factor <= 0:
+        return None
+    block_id = _cute_affine_range_block_id(state, affine)
+    if block_id is None:
+        return None
+    index_var = _cute_active_index_var(state, block_id)
+    if index_var is None:
+        return None
+    expr = f"({affine.factor}) * ({index_var}) + cutlass.Int32({lane_var})"
+    if dtype is not None:
+        expr = f"{CompileEnvironment.current().backend.dtype_str(dtype)}({expr})"
+    return expr
+
+
+def _codegen_cute_affine_range_store(
+    state: CodegenState,
+    tensor: torch.Tensor,
+    subscript: list[object] | tuple[object, ...],
+    ast_subscript: list[object] | tuple[object, ...],
+    value: object,
+    extra_mask: ast.AST | None,
+    value_node: torch.fx.Node | None = None,
+) -> ast.AST | None:
+    from .._compiler.ast_extension import create
+    from .._compiler.cute.indexing import CuteAffineRangeIndex
+
+    affine_positions = [
+        (pos, idx)
+        for pos, idx in enumerate(ast_subscript)
+        if isinstance(idx, CuteAffineRangeIndex)
+    ]
+    if len(affine_positions) != 1 or len(subscript) != 1 or extra_mask is not None:
+        return None
+    _pos, affine = affine_positions[0]
+    block_id = _cute_affine_range_block_id(state, affine)
+    if block_id is None:
+        return None
+
+    lane_var = state.device_function.new_var("affine_lane", dce=True)
+    index_expr = _cute_affine_range_expr(
+        state, affine, lane_var, dtype=CompileEnvironment.current().index_dtype
+    )
+    if index_expr is None:
+        return None
+    backend = CompileEnvironment.current().backend
+    if (
+        value_node is not None
+        and value_node.op == "call_function"
+        and value_node.target is load
+    ):
+        source_tensor_node = value_node.args[0]
+        if not isinstance(source_tensor_node, torch.fx.Node):
+            return None
+        source_tensor = source_tensor_node.meta.get("val")
+        if not isinstance(source_tensor, torch.Tensor):
+            return None
+        source_subscript = value_node.args[1]
+        if (
+            not isinstance(source_subscript, (list, tuple))
+            or len(source_subscript) != 1
+        ):
+            return None
+        ast_source_subscript = list(
+            map_arg(tuple(source_subscript), lambda arg: state.env[arg])
+        )
+        (source_affine,) = ast_source_subscript
+        if not isinstance(source_affine, CuteAffineRangeIndex):
+            return None
+        if source_affine.factor != affine.factor:
+            return None
+        source_index_expr = _cute_affine_range_expr(
+            state,
+            source_affine,
+            lane_var,
+            dtype=CompileEnvironment.current().index_dtype,
+        )
+        if source_index_expr is None:
+            return None
+        source_name = state.device_function.tensor_arg(source_tensor).name
+        value_expr = f"{source_name}[{source_index_expr}]"
+        if source_tensor.dtype is torch.bool:
+            value_expr = f"({value_expr} != cutlass.Uint8(0))"
+    elif isinstance(value, CuteAffineRangeIndex):
+        value_expr = _cute_affine_range_expr(state, value, lane_var, dtype=value.dtype)
+        if value_expr is None:
+            return None
+    elif isinstance(value, ast.AST):
+        value_expr = ast.unparse(value)
+    elif isinstance(value, (int, float, bool)):
+        value_expr = repr(value)
+    else:
+        return None
+
+    target_dtype = backend.dtype_str(tensor.dtype)
+    value_expr = backend.ast_to_dtype_expr(value_expr, target_dtype)
+    tensor_name = state.device_function.tensor_arg(tensor).name
+    store_expr = (
+        f"{tensor_name}.__setitem__({_cute_index_tuple([index_expr])}, {value_expr})"
+    )
+    mask_var = _cute_active_mask_var(state, block_id)
+    if mask_var is not None:
+        store_expr = f"{store_expr} if {mask_var} else None"
+
+    return create(
+        ast.For,
+        target=create(ast.Name, id=lane_var, ctx=ast.Store()),
+        iter=expr_from_string(f"range({affine.factor})"),
+        body=[create(ast.Expr, value=expr_from_string(store_expr))],
+        orelse=[],
+        type_comment=None,
+    )
+
+
+def _is_cute_affine_range_load_for_store(
+    state: CodegenState,
+    subscript: list[object] | tuple[object, ...],
+    ast_subscript: list[object] | tuple[object, ...],
+) -> bool:
+    from .._compiler.cute.indexing import CuteAffineRangeIndex
+    from .._compiler.cute.indexing import match_cute_affine_range_iota
+
+    def compatible_store_user(user: torch.fx.Node) -> bool:
+        if (
+            user.op != "call_function"
+            or user.target is not store
+            or len(user.args) < 4
+            or user.args[2] is not state.fx_node
+            or user.args[3] is not None
+        ):
+            return False
+        store_subscript = user.args[1]
+        return (
+            isinstance(store_subscript, (list, tuple))
+            and len(store_subscript) == 1
+            and isinstance(store_subscript[0], torch.fx.Node)
+            and match_cute_affine_range_iota(store_subscript[0]) is not None
+        )
+
+    return (
+        state.fx_node is not None
+        and len(state.fx_node.users) > 0
+        and all(compatible_store_user(user) for user in state.fx_node.users)
+        and len(subscript) == 1
+        and len(ast_subscript) == 1
+        and isinstance(ast_subscript[0], CuteAffineRangeIndex)
+    )
+
+
+def _cute_positive_1d_slice_bounds(
+    tensor: torch.Tensor, index: object
+) -> tuple[int, int, int, int] | None:
+    if not isinstance(index, slice) or index == slice(None):
+        return None
+    with contextlib.suppress(TypeError):
+        dim_size = int(tensor.shape[0])
+        start, stop, step = index.indices(dim_size)
+        if step <= 0:
+            return None
+        length = max(0, (stop - start + step - 1) // step)
+        return start, stop, step, length
+    return None
+
+
+def _is_cute_strided_slice_load_for_store(
+    state: CodegenState,
+    tensor: torch.Tensor,
+    subscript: list[object] | tuple[object, ...],
+) -> bool:
+    def compatible_store_user(user: torch.fx.Node) -> bool:
+        if (
+            user.op != "call_function"
+            or user.target is not store
+            or len(user.args) < 4
+            or user.args[2] is not state.fx_node
+            or user.args[3] is not None
+        ):
+            return False
+        target_node = user.args[0]
+        if not isinstance(target_node, torch.fx.Node):
+            return False
+        target_tensor = target_node.meta.get("val")
+        if not isinstance(target_tensor, torch.Tensor) or target_tensor.ndim != 1:
+            return False
+        store_subscript = user.args[1]
+        return (
+            isinstance(store_subscript, (list, tuple))
+            and len(store_subscript) == 1
+            and _cute_positive_1d_slice_bounds(target_tensor, store_subscript[0])
+            is not None
+        )
+
+    return (
+        state.fx_node is not None
+        and len(state.fx_node.users) > 0
+        and all(compatible_store_user(user) for user in state.fx_node.users)
+        and tensor.ndim == 1
+        and len(subscript) == 1
+        and _cute_positive_1d_slice_bounds(tensor, subscript[0]) is not None
+    )
+
+
+def _codegen_cute_strided_slice_store(
+    state: CodegenState,
+    tensor: torch.Tensor,
+    subscript: list[object] | tuple[object, ...],
+    value: object,
+    extra_mask: ast.AST | None,
+    value_node: torch.fx.Node | None = None,
+) -> ast.AST | None:
+    from .._compiler.ast_extension import create
+
+    if tensor.ndim != 1 or len(subscript) != 1 or extra_mask is not None:
+        return None
+    target_bounds = _cute_positive_1d_slice_bounds(tensor, subscript[0])
+    if target_bounds is None:
+        return None
+    target_start, _target_stop, target_step, target_length = target_bounds
+
+    env = CompileEnvironment.current()
+    backend = env.backend
+    index_dtype = backend.dtype_str(env.index_dtype)
+    loop_var = state.device_function.new_var("slice_idx", dce=True)
+    target_index = f"{index_dtype}({target_start} + {loop_var} * {target_step})"
+
+    if (
+        value_node is not None
+        and value_node.op == "call_function"
+        and value_node.target is load
+    ):
+        source_tensor_node = value_node.args[0]
+        if not isinstance(source_tensor_node, torch.fx.Node):
+            return None
+        source_tensor = source_tensor_node.meta.get("val")
+        if not isinstance(source_tensor, torch.Tensor) or source_tensor.ndim != 1:
+            return None
+        source_subscript = value_node.args[1]
+        if (
+            not isinstance(source_subscript, (list, tuple))
+            or len(source_subscript) != 1
+        ):
+            return None
+        source_bounds = _cute_positive_1d_slice_bounds(
+            source_tensor, source_subscript[0]
+        )
+        if source_bounds is None:
+            return None
+        source_start, _source_stop, source_step, source_length = source_bounds
+        if source_length != target_length:
+            return None
+        source_index = f"{index_dtype}({source_start} + {loop_var} * {source_step})"
+        source_name = state.device_function.tensor_arg(source_tensor).name
+        value_expr = f"{source_name}[{source_index}]"
+        if source_tensor.dtype is torch.bool:
+            value_expr = f"({value_expr} != cutlass.Uint8(0))"
+    elif isinstance(value, ast.AST):
+        value_expr = ast.unparse(value)
+    elif isinstance(value, (int, float, bool)):
+        value_expr = repr(value)
+    else:
+        return None
+
+    target_name = state.device_function.tensor_arg(tensor).name
+    target_dtype = backend.dtype_str(tensor.dtype)
+    value_expr = backend.ast_to_dtype_expr(value_expr, target_dtype)
+    store_expr = f"{target_name}.__setitem__(({target_index},), {value_expr})"
+    return create(
+        ast.For,
+        target=create(ast.Name, id=loop_var, ctx=ast.Store()),
+        iter=expr_from_string(f"range({target_length})"),
+        body=[create(ast.Expr, value=expr_from_string(store_expr))],
+        orelse=[],
+        type_comment=None,
+    )
+
+
 def _cute_combined_mask(
     state: CodegenState,
     subscript: list[object] | tuple[object, ...],
     extra_mask: ast.AST | None,
     tensor: torch.Tensor | None = None,
+    *,
+    include_tensor_index_masks: bool = True,
 ) -> str | None:
     env = CompileEnvironment.current()
     terms: list[str] = []
@@ -686,14 +1397,96 @@ def _cute_combined_mask(
             return loops[-1].strategy.mask_var(block_id)
         return None
 
+    def active_index_var(block_id: int) -> str | None:
+        loops = state.codegen.active_device_loops.get(block_id)
+        if loops:
+            return loops[-1].strategy.index_var(block_id)
+        grid_state = state.codegen.current_grid_state
+        if grid_state is not None and block_id in grid_state.block_ids:
+            return grid_state.strategy.index_var(block_id)
+        return None
+
+    def active_local_coord(block_id: int) -> str | None:
+        from .._compiler.cute.cute_reshape import _grid_local_coord_expr
+
+        loops = state.codegen.active_device_loops.get(block_id)
+        if loops:
+            thread_axis = loops[-1].block_thread_axes.get(block_id)
+            if thread_axis is not None:
+                return _grid_local_coord_expr(state.codegen, block_id, thread_axis)
+        grid_state = state.codegen.current_grid_state
+        if grid_state is not None:
+            thread_axis = grid_state.block_thread_axes.get(block_id)
+            if thread_axis is not None:
+                return _grid_local_coord_expr(state.codegen, block_id, thread_axis)
+        return None
+
+    def tile_begin_expr(block_id: int) -> str:
+        loops = state.codegen.active_device_loops.get(block_id)
+        if loops:
+            return state.codegen.offset_var(block_id)
+        global_index = active_index_var(block_id)
+        local_coord = active_local_coord(block_id)
+        if global_index is not None and local_coord is not None:
+            return state.codegen.lift(
+                expr_from_string(f"({global_index}) - ({local_coord})"),
+                dce=True,
+                prefix="tile_begin",
+            ).id
+        if global_index is not None:
+            return global_index
+        return "0"
+
+    def tile_with_offset_mask_terms(
+        tile_info: TileWithOffsetInfo,
+        tensor_dim: int,
+    ) -> list[str]:
+        block_id = tile_info.block_id
+        local_coord = active_local_coord(block_id)
+        begin_var = tile_begin_expr(block_id)
+        if local_coord is None:
+            if (idx_var := active_index_var(block_id)) is None:
+                raise exc.BackendUnsupported(
+                    "cute",
+                    (
+                        "indexing dimension is not active in this scope "
+                        f"(block_id={block_id})"
+                    ),
+                )
+            local_coord = f"({idx_var}) - ({begin_var})"
+
+        tile_terms = []
+        if tile_info.block_size is not None:
+            block_size_expr = state.device_function.literal_expr(tile_info.block_size)
+            tile_terms.append(f"({local_coord}) < cutlass.Int32({block_size_expr})")
+        if tensor is not None and tensor_dim < tensor.ndim:
+            offset_expr = state.device_function.literal_expr(tile_info.offset)
+            dim_size = _cute_tensor_dim_size_expr(state, tensor, tensor_dim)
+            tile_terms.append(
+                f"(({begin_var}) + cutlass.Int32({offset_expr}) + "
+                f"({local_coord})) < {dim_size}"
+            )
+        return tile_terms
+
     if extra_mask is not None:
         terms.append(state.codegen.lift(extra_mask, dce=True, prefix="mask").id)
 
     seen: set[int] = set()
     tensor_dim = 0
-    for idx in subscript:
+    for pos, idx in enumerate(subscript):
         block_id: int | None = None
         if idx is None:
+            continue
+        if (
+            tile_info := _get_tile_with_offset_info(
+                idx, getattr(state, "fx_node", None), pos
+            )
+        ) is not None and tile_info.block_size is not None:
+            seen.add(tile_info.block_id)
+            for term in tile_with_offset_mask_terms(tile_info, tensor_dim):
+                if term not in terms:
+                    terms.append(term)
+            tensor_dim += 1
             continue
         if isinstance(idx, torch.SymInt):
             block_id = env.get_block_id(idx)
@@ -702,6 +1495,34 @@ def _cute_combined_mask(
                 if bid not in seen and mask_var_for_block_id(bid) is not None:
                     block_id = bid
                     break
+        elif isinstance(idx, torch.Tensor):
+            if not include_tensor_index_masks:
+                for dim_size in idx.shape:
+                    for bid in _matching_block_ids(env, dim_size):
+                        if bid in seen or not env.is_jagged_tile(bid):
+                            continue
+                        mask_var = mask_var_for_block_id(bid)
+                        if mask_var is not None:
+                            seen.add(bid)
+                            if mask_var not in terms:
+                                terms.append(mask_var)
+                            break
+                tensor_dim += 1
+                continue
+            for dim_size in idx.shape:
+                for bid in _matching_block_ids(env, dim_size):
+                    if bid in seen:
+                        continue
+                    mask_var = mask_var_for_block_id(bid)
+                    if mask_var is not None:
+                        seen.add(bid)
+                        if mask_var not in terms:
+                            terms.append(mask_var)
+                        break
+                else:
+                    continue
+            tensor_dim += 1
+            continue
         else:
             tensor_dim += 1
             continue
@@ -717,6 +1538,2023 @@ def _cute_combined_mask(
     if not terms:
         return None
     return " and ".join(f"({term})" for term in terms)
+
+
+def _cute_tensor_dim_size_expr(
+    state: CodegenState, tensor: torch.Tensor, dim: int
+) -> str:
+    return state.device_function.tensor_size(tensor, dim).name
+
+
+def _cute_tile_begin_expr(state: CodegenState, idx: object) -> str:
+    env = CompileEnvironment.current()
+
+    def active_index_var(block_id: int) -> str | None:
+        loops = state.codegen.active_device_loops.get(block_id)
+        if loops:
+            return loops[-1].strategy.index_var(block_id)
+        grid_state = state.codegen.current_grid_state
+        if grid_state is not None and block_id in grid_state.block_ids:
+            return grid_state.strategy.index_var(block_id)
+        return None
+
+    def active_local_coord(block_id: int) -> str | None:
+        from .._compiler.cute.cute_reshape import _grid_local_coord_expr
+
+        loops = state.codegen.active_device_loops.get(block_id)
+        if loops:
+            thread_axis = loops[-1].block_thread_axes.get(block_id)
+            if thread_axis is not None:
+                return _grid_local_coord_expr(state.codegen, block_id, thread_axis)
+        grid_state = state.codegen.current_grid_state
+        if grid_state is not None:
+            thread_axis = grid_state.block_thread_axes.get(block_id)
+            if thread_axis is not None:
+                return _grid_local_coord_expr(state.codegen, block_id, thread_axis)
+        return None
+
+    def tile_begin_from_block_id(block_id: int) -> str:
+        loops = state.codegen.active_device_loops.get(block_id)
+        if loops:
+            return state.codegen.offset_var(block_id)
+        global_index = active_index_var(block_id)
+        local_coord = active_local_coord(block_id)
+        if global_index is not None and local_coord is not None:
+            return state.codegen.lift(
+                expr_from_string(f"({global_index}) - ({local_coord})"),
+                dce=True,
+                prefix="tile_begin",
+            ).id
+        if global_index is not None:
+            return global_index
+        return "0"
+
+    if isinstance(idx, int):
+        return str(idx)
+    if not isinstance(idx, torch.SymInt):
+        raise exc.BackendUnsupported("cute", f"tile base index type: {type(idx)}")
+
+    expr = _symint_expr(idx)
+    if expr is not None:
+        origin_info = HostFunction.current().expr_to_origin.get(expr)
+        if origin_info is not None and isinstance(origin_info.origin, TileBeginOrigin):
+            return tile_begin_from_block_id(origin_info.origin.block_id)
+    block_id = env.get_block_id(idx)
+    if block_id is not None:
+        return tile_begin_from_block_id(block_id)
+    if expr is not None:
+        return state.sympy_expr(expr)
+    raise exc.BackendUnsupported("cute", f"unlowerable tile base index: {idx}")
+
+
+def _codegen_cute_store_tcgen05_tile(
+    state: CodegenState,
+    tensor: torch.Tensor,
+    subscript: list[object] | tuple[object, ...],
+    ast_subscript: list[object] | tuple[object, ...],
+    extra_mask: ast.AST | None,
+    value_name: str,
+    epilogue_chain: Tcgen05UnaryEpilogueChain | None = None,
+) -> list[ast.AST] | ast.AST | None:
+    if extra_mask is not None or tensor.ndim != 2:
+        return None
+
+    tcgen05_value = state.device_function.get_cute_tcgen05_store_value(value_name)
+    if tcgen05_value is None:
+        return None
+
+    # Backstop for callers that bypass Config.normalize() validation;
+    # see _tcgen05_epi_warp_count docstring and cute_plan.md.
+    if tcgen05_value.epi_warp_count != 4:
+        raise exc.BackendUnsupported(
+            "cute",
+            f"tcgen05 SIMT-store epilogue requires "
+            f"tcgen05_num_epi_warps=4 (got {tcgen05_value.epi_warp_count}). "
+            "CUTLASS tmem_warp_shape_mn=(4,1) hard-codes a 4-warp t2r "
+            "partition for the supported tcgen05 path; per-warp "
+            "tcgen05.ld semantics make the partition uncoverable by "
+            "fewer warps. Lifts when the c_pipeline-driven multi-warp "
+            "epilogue lands (see cute_plan.md).",
+        )
+
+    backend = CompileEnvironment.current().backend
+    df = state.device_function
+    tensor_name = df.tensor_arg(tensor).name
+    target_dtype = backend.dtype_str(tensor.dtype)
+    # The matmul plan computed `tcgen05_epi_tile` (role-local t2r
+    # partition) with `epi_elem_dtype_str`; the store path below
+    # recomputes `tcgen05_store_epi_tile` with `target_dtype`. They must
+    # match or `compute_epilogue_tile_shape` selects different `tile_n`
+    # values on the two sides and the t2r / r2s SMEM staging silently
+    # corrupts. The loud-failure backstop covers cases where MMA-codegen-
+    # time forward-tracing of the matmul fx_node could not pin a unique
+    # store target dtype.
+    if (
+        tcgen05_value.epi_elem_dtype_str
+        and tcgen05_value.epi_elem_dtype_str != target_dtype
+    ):
+        raise exc.BackendUnsupported(
+            "cute",
+            "tcgen05 epilogue element-type mismatch: matmul plan was set "
+            f"up with epi_elem_dtype_str={tcgen05_value.epi_elem_dtype_str!r} "
+            f"but the store target tensor dtype is {target_dtype!r}.",
+        )
+    base_indices = [_cute_tile_begin_expr(state, idx) for idx in subscript]
+    if len(base_indices) != 2:
+        return None
+
+    m_size = _cute_tensor_dim_size_expr(state, tensor, 0)
+    n_size = _cute_tensor_dim_size_expr(state, tensor, 1)
+    tile_coord_m = f"({base_indices[0]}) // cutlass.Int32({tcgen05_value.bm})"
+    tile_coord_n = f"({base_indices[1]}) // cutlass.Int32({tcgen05_value.bn})"
+    full_tile = df.new_var("tcgen05_full_tile")
+
+    gmem_tile = df.new_var("tcgen05_gC")
+    coord_tile = df.new_var("tcgen05_cC")
+    tcgc_base = df.new_var("tcgen05_tCgC_base")
+    tccc_base = df.new_var("tcgen05_tCcC_base")
+    tcgc = df.new_var("tcgen05_tCgC")
+    tcgc_planned = df.new_var("tcgen05_tCgC_planned")
+    tccc = df.new_var("tcgen05_tCcC")
+    tacc = df.new_var("tcgen05_tAcc")
+    epi_tile = df.new_var("tcgen05_store_epi_tile")
+    tiled_copy_t2r = df.new_var("tcgen05_tiled_copy_t2r")
+    thr_copy_t2r = df.new_var("tcgen05_thr_copy_t2r")
+    ttr_tacc_base = df.new_var("tcgen05_tTR_tAcc_base")
+    tcgc_epi = df.new_var("tcgen05_tCgC_epi")
+    tccc_epi = df.new_var("tcgen05_tCcC_epi")
+    ttr_gc = df.new_var("tcgen05_tTR_gC")
+    ttr_cc = df.new_var("tcgen05_tTR_cC")
+    ttr_racc = df.new_var("tcgen05_tTR_rAcc")
+    ttr_rd = df.new_var("tcgen05_tTR_rD")
+    ttr_tacc_stage = df.new_var("tcgen05_tTR_tAcc_stage")
+    ttr_tacc = df.new_var("tcgen05_tTR_tAcc")
+    ttr_gc_grouped = df.new_var("tcgen05_tTR_gC_grouped")
+    ttr_cc_grouped = df.new_var("tcgen05_tTR_cC_grouped")
+    ttr_tacc_mn = df.new_var("tcgen05_tTR_tAcc_mn")
+    ttr_gc_subtile = df.new_var("tcgen05_tTR_gC_subtile")
+    ttr_cc_subtile = df.new_var("tcgen05_tTR_cC_subtile")
+    pred_c = df.new_var("tcgen05_pred_C")
+    pred_c_shape = df.new_var("tcgen05_pred_C_shape")
+    acc_vec = df.new_var("tcgen05_acc_vec")
+    kernel_desc = df.new_var("tcgen05_kernel_desc")
+    mcld = df.new_var("tcgen05_mcld")
+    num_bits = df.new_var("tcgen05_num_bits")
+    simt_atom = df.new_var("tcgen05_simt_atom")
+    smem_d_layout = df.new_var("tcgen05_sD_layout")
+    smem_d_ptr = df.new_var("tcgen05_sD_ptr")
+    smem_d = df.new_var("tcgen05_sD")
+    tiled_copy_r2s = df.new_var("tcgen05_tiled_copy_r2s")
+    trs_rd = df.new_var("tcgen05_tRS_rD")
+    trs_racc = df.new_var("tcgen05_tRS_rAcc")
+    trs_sd = df.new_var("tcgen05_tRS_sD")
+    bsg_sd = df.new_var("tcgen05_bSG_sD")
+    bsg_gd_partitioned = df.new_var("tcgen05_bSG_gD_partitioned")
+    bsg_gd = df.new_var("tcgen05_bSG_gD")
+    c_buffer = df.new_var("tcgen05_c_buffer")
+    epilog_sync_barrier = df.new_var("tcgen05_epilog_sync_barrier")
+    c_pipeline_producer_group = df.new_var("tcgen05_c_pipeline_producer_group")
+    c_pipeline = df.new_var("tcgen05_c_pipeline")
+    subtile_count = df.new_var("tcgen05_subtile_count")
+    epi_warp_ids = ", ".join(
+        f"cutlass.Int32({i})" for i in range(tcgen05_value.epi_warp_count)
+    )
+    if tcgen05_value.epi_warp_count == 1:
+        epi_warp_ids += ","
+
+    # Per-aux-step plumbing: per-thread auxiliary tensor reads at
+    # the splice site. For each ``_AuxiliaryTensorStep`` in the
+    # chain we register the auxiliary tensor as a kernel arg,
+    # allocate fresh AST var names for the partitioning chain, and
+    # later (inside each per-thread splice site) emit per-subtile
+    # ``aux_loaded = ttr_aux_subtile.load()`` lines that the chain
+    # renderer references.
+    #
+    # The aux load is unpredicated, so it is correct only when every
+    # tile in the launch is a full tile (the full-tile predicate is a
+    # no-op). The TMA-store epilogue is selected exclusively under
+    # ``static_full_tiles=True``, so gating on
+    # ``use_tma_store_epilogue`` keeps the aux fusion off the SIMT
+    # fallback path where edge tiles run a runtime-predicated copy.
+    # Reject the chain loudly when an aux step would otherwise reach
+    # the SIMT fallback so a user does not silently get out-of-bounds
+    # aux reads on edge tiles.
+    aux_steps_in_chain: tuple[_AuxiliaryTensorStep, ...] = (
+        epilogue_chain.auxiliary_tensor_steps if epilogue_chain is not None else ()
+    )
+    if aux_steps_in_chain and not tcgen05_value.use_tma_store_epilogue:
+        raise exc.BackendUnsupported(
+            "cute",
+            "auxiliary-tensor epilogue fusion (e.g. "
+            "`out[tile] = (acc + residual[tile]).to(dtype)`) requires "
+            "the static-full-tiles TMA-store epilogue. The active "
+            "tcgen05 lowering selected the SIMT-store fallback, where "
+            "edge tiles use a runtime predicate the splice does not "
+            "forward to the per-thread aux load. Adjust block sizes "
+            "so the problem dimensions are divisible by them, or drop "
+            "the auxiliary-tensor epilogue.",
+        )
+
+    aux_step_records: list[_AuxStepRecord] = []
+    for aux_idx, aux_step in enumerate(aux_steps_in_chain):
+        aux_tensor_node = aux_step.load_node.args[0]
+        assert isinstance(aux_tensor_node, torch.fx.Node)
+        aux_torch_tensor = aux_tensor_node.meta.get("val")
+        assert isinstance(aux_torch_tensor, torch.Tensor)
+        aux_tensor_name = df.tensor_arg(aux_torch_tensor).name
+        # Aux tensors must be passed through to the device function as
+        # placeholder args so the wrapper plumbs them into the cute
+        # kernel signature (the role-local persistent path otherwise
+        # treats unreferenced tensors as captures, which doesn't work
+        # for tensors only read inside a per-subtile loop body).
+        df.placeholder_args.add(aux_tensor_name)
+        # Broadcast aux steps need a fresh AST var for the 2-D view
+        # of the rank-1 underlying tensor (stride 0 on the orthogonal
+        # axis). Exact-shape aux steps leave ``aux_view2d`` as None.
+        aux_view2d = (
+            df.new_var(f"tcgen05_aux_view2d_{aux_idx}")
+            if aux_step.broadcast_axis is not None
+            else None
+        )
+        aux_step_records.append(
+            _AuxStepRecord(
+                aux_tensor_name=aux_tensor_name,
+                broadcast_axis=aux_step.broadcast_axis,
+                aux_tile=df.new_var(f"tcgen05_aux_tile_{aux_idx}"),
+                aux_part_base=df.new_var(f"tcgen05_tCgAux_base_{aux_idx}"),
+                aux_xfm=df.new_var(f"tcgen05_tCgAux_xfm_{aux_idx}"),
+                aux_planned=df.new_var(f"tcgen05_tCgAux_planned_{aux_idx}"),
+                aux_epi=df.new_var(f"tcgen05_tCgAux_epi_{aux_idx}"),
+                ttr_aux=df.new_var(f"tcgen05_tTR_gAux_{aux_idx}"),
+                ttr_aux_grouped=df.new_var(f"tcgen05_tTR_gAux_grouped_{aux_idx}"),
+                ttr_aux_subtile=df.new_var(f"tcgen05_tTR_gAux_subtile_{aux_idx}"),
+                aux_loaded=df.new_var(f"tcgen05_aux_loaded_{aux_idx}"),
+                aux_view2d=aux_view2d,
+            )
+        )
+
+    # Pyrefly does not preserve the non-None ``tcgen05_value`` narrowing
+    # inside the nested source-formatter closures, so keep local
+    # string aliases for attributes the closures read.
+    tcgen05_aux_epi_tidx = tcgen05_value.epi_tidx
+    tcgen05_aux_epilogue_rest_mode = tcgen05_value.epilogue_rest_mode
+
+    # C-input warp productive-body gate (``cute_plan.md`` §7.5.3.2
+    # cycle 2b producer + consumer flip). When the matmul plan has
+    # ``has_c_input_warp`` AND a non-empty ``aux_tensor_descriptors``
+    # tuple AND the aux pipeline plan was registered by
+    # ``cute_mma._codegen_cute_mma``, the consumer-side per-thread
+    # GMEM aux LDG flips to an SMEM read from the
+    # ``c_pipeline_aux``-staged ring populated by the C-input warp's
+    # cooperative copy. The producer body in
+    # ``program_id._build_c_input_warp_role_local_while`` writes
+    # ONE ``epi_tile`` subtile of the per-CTA aux region
+    # (``(bm_per_cta, bn)`` under 2cta; ``(bm, bn)`` otherwise) per
+    # stage per subtile iteration under ``producer_acquire`` /
+    # ``producer_commit`` framing; the consumer issues one
+    # ``consumer_wait`` / lane-0-gated ``consumer_release`` pair
+    # per subtile and feeds the SMEM stage into Quack's
+    # ``tiled_copy_s2r`` flow (``make_tiled_copy_D`` against
+    # ``tiled_copy_t2r`` →  ``partition_S(sC_ring)`` → per-
+    # subtile ``cute.copy(s2r, sC[..., stage], rmem)`` →
+    # ``rmem.load()``). Gate-closed configs keep the historical
+    # GMEM path byte-identical.
+    aux_matmul_plan = df.cute_tcgen05_matmul_plan
+    aux_pipeline_plan_obj = df.cute_tcgen05_aux_pipeline_plan
+    # Match each store-side record to its descriptor by
+    # ``load_node`` FX-node identity rather than positional
+    # index. The descriptor walker dedups by ``store_value_node``
+    # at MMA-codegen time, so a single-store kernel's
+    # descriptors and records share the same ``load_node``
+    # values in some permutation. The matmul plan's
+    # ``aux_single_store_value`` gate (in ``cute_mma`` and the
+    # ``program_id`` role-local-while admission) only allocates
+    # the producer-side pipeline when every descriptor shares
+    # one ``store_value_node``, so the multi-store fan-out
+    # wedge (producer commits to rings the per-store consumer
+    # never releases) cannot occur — the productive body
+    # closes its gate at MMA-codegen time and the consumer
+    # path here falls back to GMEM. The per-record lookup
+    # below is a belt-and-suspenders identity check: if any
+    # record's ``load_node`` is absent from the descriptors,
+    # the SMEM path is disabled for this store.
+    aux_step_load_nodes: tuple = (
+        tuple(rec_step.load_node for rec_step in aux_steps_in_chain)
+        if aux_step_records
+        else ()
+    )
+    aux_ring_index_by_step: list[int] = []
+    aux_descriptor_load_nodes: tuple = (
+        tuple(d.load_node for d in aux_matmul_plan.aux_tensor_descriptors)
+        if aux_matmul_plan is not None
+        else ()
+    )
+    aux_step_load_nodes_match = True
+    for step_load_node in aux_step_load_nodes:
+        try:
+            aux_ring_index_by_step.append(
+                aux_descriptor_load_nodes.index(step_load_node)
+            )
+        except ValueError:
+            aux_step_load_nodes_match = False
+            break
+    use_aux_smem_source = (
+        aux_step_records
+        and aux_matmul_plan is not None
+        and aux_matmul_plan.has_c_input_warp
+        and bool(aux_matmul_plan.aux_tensor_descriptors)
+        and aux_pipeline_plan_obj is not None
+        and aux_step_load_nodes_match
+        # Multi-store fan-out gate (same predicate as the
+        # producer-side allocator + role-local-while
+        # admission). Without this guard the producer fires
+        # ``producer_commit`` on rings whose only matching
+        # consumer-store is a different per-store-codegen
+        # invocation — the per-store splice site here only
+        # releases its own subset, leaving the unmatched rings
+        # uncommitted and deadlocking the producer once a CTA
+        # wraps the pipeline depth.
+        and len({d.store_value_node for d in aux_matmul_plan.aux_tensor_descriptors})
+        <= 1
+    )
+    if use_aux_smem_source:
+        aux_pipeline_name = aux_pipeline_plan_obj.pipeline  # type: ignore[attr-defined,union-attr]
+        aux_consumer_state_name = aux_pipeline_plan_obj.consumer_state  # type: ignore[attr-defined,union-attr]
+        all_rings = aux_pipeline_plan_obj.rings  # type: ignore[attr-defined,union-attr]
+        aux_ring_smem_names: tuple[str, ...] = tuple(
+            all_rings[ring_idx].smem for ring_idx in aux_ring_index_by_step
+        )
+    else:
+        aux_pipeline_name = ""
+        aux_consumer_state_name = ""
+        aux_ring_smem_names = ()
+
+    def _aux_tile_setup_lines(
+        *, thr_copy_t2r_var: str, define_thr_copy_t2r: bool
+    ) -> list[str]:
+        """Emit the per-output-tile aux partitioning lines.
+
+        Each line goes once per output tile, before the per-subtile
+        loop. Mirrors the existing ``tcgc -> tcgc_planned -> tcgc_epi
+        -> ttr_gc -> ttr_gc_grouped`` pipeline used for the result D
+        tensor, but partitions a separate auxiliary GMEM tensor per
+        chain step. Calls ``thr_mma.partition_C`` and
+        ``thr_copy_t2r.partition_D`` against the aux tile so the
+        per-thread layout matches D's layout exactly — both the
+        exact-shape (``residual[tile_m, tile_n]``) and rank-1
+        broadcast (``bias[tile_n]`` / ``bias[tile_m]``) forms feed
+        the same downstream pipeline.
+
+        For the broadcast form the helper first builds a 2-D view
+        of the underlying rank-1 tensor with stride 0 on the
+        orthogonal axis (see :class:`_AuxiliaryTensorStep` for the
+        canonical contract).
+
+        When ``define_thr_copy_t2r`` is True the helper emits the
+        ``thr_copy_t2r = tiled_copy_t2r.get_slice(...)`` line first
+        (the TMA-store path does not otherwise create
+        ``thr_copy_t2r``); the SIMT path passes False because it
+        already creates the slice as part of its existing partition
+        pipeline.
+        """
+        lines: list[str] = []
+        if not aux_step_records:
+            return lines
+        if define_thr_copy_t2r:
+            lines.append(
+                f"{thr_copy_t2r_var} = "
+                f"{tiled_copy_t2r}.get_slice({tcgen05_aux_epi_tidx})"
+            )
+        if use_aux_smem_source:
+            # C-input warp productive-body gate is open: per-subtile
+            # SMEM ring staging. Per-output-tile setup builds one
+            # ``tiled_copy_s2r`` per descriptor (Quack's
+            # ``epilog_smem_load_and_partition`` pattern from
+            # ``quack/gemm_sm100.py``):
+            #
+            #   tiled_copy_s2r = make_tiled_copy_D(
+            #       make_copy_atom(CopyUniversalOp(), aux_dtype),
+            #       tiled_copy_t2r)
+            #   thr_copy_s2r = tiled_copy_s2r.get_slice(epi_tidx)
+            #   tSR_sC = thr_copy_s2r.partition_S(aux_smem_ring)
+            #   tRS_rC = make_rmem_tensor(ttr_racc.shape, aux_dtype)
+            #   tSR_rC = tiled_copy_s2r.retile(tRS_rC)
+            #
+            # ``tSR_sC`` carries the full SMEM ring partition (its
+            # last mode is the PIPE/stage axis). Per-subtile body
+            # in ``_aux_subtile_load_source`` slices
+            # ``tSR_sC[None, None, None, consumer_state.index]``
+            # and issues a single ``cute.copy(tiled_copy_s2r, ...)``
+            # into ``tSR_rC`` (a re-layout of the same registers as
+            # ``tRS_rC``). The chain consumes ``tRS_rC.load()``.
+            #
+            # The broadcast-aux rank-1 → rank-2 view is absorbed on
+            # the producer side (the producer's GMEM-side view is
+            # stride-0-on-M), so the consumer reads the same shape
+            # for exact-shape and broadcast aux. The "_aux_part_*"
+            # / "ttr_aux_grouped" GMEM partition pipeline is not
+            # built on this path.
+            for aux_idx, rec in enumerate(aux_step_records):
+                assert aux_matmul_plan is not None
+                aux_dtype_str = backend.dtype_str(
+                    aux_matmul_plan.aux_tensor_descriptors[
+                        aux_idx
+                    ].host_tensor_val.dtype
+                )
+                tiled_copy_s2r_var = f"{rec.aux_tile}_tiled_copy_s2r"
+                thr_copy_s2r_var = f"{rec.aux_tile}_thr_copy_s2r"
+                tsr_sc_var = f"{rec.aux_tile}_tSR_sC"
+                trs_rc_var = f"{rec.aux_tile}_tRS_rC"
+                tsr_rc_var = f"{rec.aux_tile}_tSR_rC"
+                lines.extend(
+                    [
+                        (
+                            f"{tiled_copy_s2r_var} = "
+                            f"cute.make_tiled_copy_D("
+                            f"cute.make_copy_atom("
+                            f"cute.nvgpu.CopyUniversalOp(), "
+                            f"{aux_dtype_str}), "
+                            f"{tiled_copy_t2r})"
+                        ),
+                        (
+                            f"{thr_copy_s2r_var} = "
+                            f"{tiled_copy_s2r_var}.get_slice("
+                            f"{tcgen05_aux_epi_tidx})"
+                        ),
+                        (
+                            f"{tsr_sc_var} = "
+                            f"{thr_copy_s2r_var}.partition_S("
+                            f"{aux_ring_smem_names[aux_idx]})"
+                        ),
+                        (
+                            f"{trs_rc_var} = cute.make_rmem_tensor("
+                            f"{ttr_racc}.shape, {aux_dtype_str})"
+                        ),
+                        (f"{tsr_rc_var} = {tiled_copy_s2r_var}.retile({trs_rc_var})"),
+                    ]
+                )
+            return lines
+        for rec in aux_step_records:
+            if rec.broadcast_axis is None:
+                # Exact-shape rank-2 aux: slice the per-tile region
+                # of the underlying 2-D tensor directly.
+                source_for_local_tile = rec.aux_tensor_name
+            else:
+                # Rank-1 trailing-axis (rowvec) broadcast aux: build a
+                # 2-D logical view of the rank-1 underlying tensor with
+                # stride 0 on the leading (M) axis and stride 1 on the
+                # trailing (N) axis. Stride 0 on M causes every lane
+                # "owning" output ``(m, n)`` to read the same source
+                # element regardless of m, which is the rowvec
+                # broadcast semantic that matches PyTorch's
+                # ``acc + bias[tile_n]`` (rank-1 RHS aligns to the
+                # trailing axis). The view feeds the same
+                # ``partition_C → flat_divide → partition_D`` pipeline
+                # used by exact-shape aux. Mirrors Quack's
+                # ``RowVecLoad`` epilogue (``quack/quack/epi_ops.py``).
+                # Only the trailing axis (``broadcast_axis == 1``)
+                # form is accepted at classify time — see
+                # ``aux_tensor_load_kind`` /
+                # ``_AuxiliaryTensorStep.broadcast_axis`` for the
+                # rejection of the leading-axis form.
+                assert rec.broadcast_axis == 1
+                assert rec.aux_view2d is not None
+                lines.append(
+                    f"{rec.aux_view2d} = cute.make_tensor("
+                    f"{rec.aux_tensor_name}.iterator, "
+                    f"cute.make_layout(({m_size}, {n_size}), "
+                    f"stride=(0, 1)))"
+                )
+                source_for_local_tile = rec.aux_view2d
+            lines.append(
+                f"{rec.aux_tile} = cute.local_tile("
+                f"{source_for_local_tile}, ({tcgen05_bm}, {tcgen05_bn}), "
+                f"({tile_coord_m}, {tile_coord_n}))"
+            )
+            lines.extend(
+                [
+                    (
+                        f"{rec.aux_part_base} = "
+                        f"{tcgen05_thr_mma}.partition_C({rec.aux_tile})"
+                    ),
+                    (
+                        f"{rec.aux_xfm} = "
+                        "cutlass.utils.gemm.sm100.transform_partitioned_tensor_layout("
+                        f"{rec.aux_part_base})"
+                    ),
+                    (
+                        f"{rec.aux_planned} = cute.make_tensor("
+                        f"{rec.aux_xfm}.iterator, "
+                        f"cute.append(cute.append(cute.append({rec.aux_xfm}.layout, "
+                        f"{tcgen05_aux_epilogue_rest_mode}), "
+                        f"{tcgen05_aux_epilogue_rest_mode}), "
+                        f"{tcgen05_aux_epilogue_rest_mode}))"
+                    ),
+                    (
+                        f"{rec.aux_epi} = cute.flat_divide("
+                        f"{rec.aux_planned}, {epi_tile})"
+                    ),
+                    (f"{rec.ttr_aux} = {thr_copy_t2r_var}.partition_D({rec.aux_epi})"),
+                    (
+                        f"{rec.ttr_aux_grouped} = cute.group_modes("
+                        f"{rec.ttr_aux}, 3, cute.rank({rec.ttr_aux}))"
+                    ),
+                ]
+            )
+        return lines
+
+    def _aux_subtile_load_source(prelude_indent: str) -> str:
+        """Per-subtile aux GMEM-load source lines (one per aux step).
+
+        Each step emits the per-thread GMEM subtile slice of
+        ``tTR_gAux_grouped_<idx>`` followed by a ``.load()`` call
+        into the per-subtile ``tcgen05_aux_loaded_*`` local. Goes
+        inside the per-subtile loop body. Splice sites with aux
+        chains arrange the call so the slice + LDG fires at the
+        top of the per-subtile loop body — before the in-loop
+        c_pipeline ``producer_acquire`` for the later-subtile
+        path (``_tcgen05_subtile != 0``), the in-loop acc
+        ``consumer_wait``, and the t2r async TMEM→reg copy on the
+        same subtile. The first c_pipeline ``producer_acquire``
+        for subtile 0 is emitted outside the per-subtile loop and
+        therefore precedes the aux LDG; the slice depends on
+        ``_tcgen05_subtile`` so it cannot be hoisted out of the
+        loop entirely. The hoist still gives the long-scoreboard
+        L1TEX wait the in-loop acc ``consumer_wait`` and the t2r
+        async copy to overlap with on every subtile, plus the
+        later-subtile c_pipeline acquire on subtile != 0.
+
+        Cycle 39 (GPU 6) replan note: an alternative form that
+        pre-loads all subtile aux into a per-thread register
+        tensor outside the per-subtile loop (``cute.autovec_copy``
+        from ``tTR_gAux_grouped_<idx>`` into a fresh
+        ``tTR_rAux_<idx>``) was tested. The single cooperative
+        LDG fired before the per-subtile loop, but the multi-
+        subtile register tensor pushed local-memory spills from
+        356k to 1.17M and grew kernel duration from 308 µs to
+        332 µs. The per-subtile GMEM load form below pays one
+        LDG per chain-add but the compiler IR / SASS scheduler
+        already lifts the LDG ahead of the chain-add given the
+        independent dependency graph.
+        """
+        if not aux_step_records:
+            return ""
+        lines: list[str] = []
+        if use_aux_smem_source:
+            # C-input warp productive-body gate is open: per-subtile
+            # SMEM ring staging. Each subtile iteration waits on
+            # ``c_pipeline_aux`` for the producer warp to fill the
+            # active stage, then issues one ``cute.copy(tiled_copy_s2r,
+            # tSR_sC[None, None, None, stage], tSR_rC)`` per descriptor
+            # to load the active stage into the per-thread register
+            # tensor (Quack's ``epilog_smem_load_and_partition`` flow
+            # from ``quack/gemm_sm100.py``: ``tiled_copy_s2r`` is
+            # built via ``make_tiled_copy_D`` against ``tiled_copy_t2r``;
+            # ``tSR_sC = thr_copy_s2r.partition_S(sC_ring)`` selects
+            # the SMEM source; ``tSR_rC`` is a re-layout view of the
+            # same register memory as ``tRS_rC``). The chain reads
+            # ``tRS_rC.load()`` (== ``aux_loaded``). The post-copy
+            # lane-0-gated release plus state advance run in the
+            # same per-subtile iteration so the producer can refill
+            # the same stage on the very next persistent tile
+            # (matches the consumer cooperative-group arrive count
+            # of ``epi_warp_count`` set by
+            # ``_emit_tcgen05_aux_pipeline_setup``).
+            #
+            # Note: ``partition_D(smem_stage).load()`` on
+            # ``thr_copy_t2r`` (an earlier prior-subagent variant)
+            # produced a deadlocking SMEM read — TMEM→reg-shaped
+            # partition_D applied to a SMEM tensor does not
+            # compose with the producer's
+            # ``make_tiled_copy_tv`` cooperative copy in a way the
+            # mbarrier handshake recognizes. The Quack-style
+            # ``tiled_copy_s2r`` flow is the canonical CUTLASS-DSL
+            # pattern.
+            lines.append(
+                f"{prelude_indent}{aux_pipeline_name}.consumer_wait("
+                f"{aux_consumer_state_name})\n"
+            )
+            for rec in aux_step_records:
+                tiled_copy_s2r_var = f"{rec.aux_tile}_tiled_copy_s2r"
+                tsr_sc_var = f"{rec.aux_tile}_tSR_sC"
+                trs_rc_var = f"{rec.aux_tile}_tRS_rC"
+                tsr_rc_var = f"{rec.aux_tile}_tSR_rC"
+                lines.extend(
+                    [
+                        (
+                            f"{prelude_indent}cute.copy("
+                            f"{tiled_copy_s2r_var}, "
+                            f"{tsr_sc_var}[None, None, None, "
+                            f"{aux_consumer_state_name}.index], "
+                            f"{tsr_rc_var})\n"
+                        ),
+                        (f"{prelude_indent}{rec.aux_loaded} = {trs_rc_var}.load()\n"),
+                    ]
+                )
+            lines.extend(
+                [
+                    (
+                        f"{prelude_indent}with cute.arch.elect_one():\n"
+                        f"{prelude_indent}    {aux_pipeline_name}.consumer_release("
+                        f"{aux_consumer_state_name})\n"
+                    ),
+                    emit_pipeline_advance(
+                        aux_consumer_state_name, indent=prelude_indent
+                    )
+                    + "\n",
+                ]
+            )
+            return "".join(lines)
+        for rec in aux_step_records:
+            lines.extend(
+                [
+                    (
+                        f"{prelude_indent}{rec.ttr_aux_subtile} = "
+                        f"{rec.ttr_aux_grouped}"
+                        f"[(None, None, None, cutlass.Int32(_tcgen05_subtile))]\n"
+                    ),
+                    (
+                        f"{prelude_indent}{rec.aux_loaded} = "
+                        f"{rec.ttr_aux_subtile}.load()\n"
+                    ),
+                ]
+            )
+        return "".join(lines)
+
+    # Render the per-thread carrier expression for the accumulator
+    # vector. The identity epilogue (no chain or empty chain) emits
+    # the original `rAcc.load().to(target_dtype)` line. When a
+    # chain is present, hoist `rAcc.load()` to a local TensorSSA so
+    # the chain reads the loaded vector once; for chains with
+    # auxiliary-tensor steps, also emit per-subtile aux-load lines
+    # that bind the aux locals the chain references. Each splice
+    # site below uses the appropriate carrier name (`ttr_racc` for
+    # the SIMT path, `trs_racc` for the TMA path, and
+    # `tcgen05_tRS_rAcc` for the @cute.jit module helper). The
+    # returned snippet is a sequence of zero-or-more prelude
+    # statements (each newline-terminated, indented with
+    # `prelude_indent`) plus the assignment expression for
+    # `tcgen05_acc_vec`.
+    def _splice_acc_vec(carrier_name: str, prelude_indent: str) -> tuple[str, str, str]:
+        """Return ``(early_aux_prelude, late_prelude, assignment_rhs)``.
+
+        ``early_aux_prelude`` is the per-subtile auxiliary-tensor LDG
+        block (``ttr_aux_subtile = ...``; ``aux_loaded = .load()``) and
+        is empty when the chain has no aux steps. ``late_prelude``
+        holds the ``acc_loaded = carrier.load()`` and the chain-step
+        renderings. ``assignment_rhs`` is the right-hand side of
+        ``acc_vec = ...`` (without leading whitespace or the trailing
+        newline). Both preludes are empty for the identity epilogue
+        (no chain) — in that case ``assignment_rhs`` is the original
+        ``carrier.load().to(target_dtype)`` expression.
+
+        Each chain step renders into a fresh ``tcgen05_chain_step*``
+        local so chain composition stays linear in source size — the
+        relu template duplicates ``{inner}`` 5 times, so without per-
+        step binding a 3-deep relu chain would emit 125x duplication
+        and pessimize parse / IR-build time. Per-step locals keep
+        the rendered source O(N) in chain depth and CuTe CSEs the
+        loads at compile.
+
+        Auxiliary-tensor chain steps additionally emit per-aux-step
+        ``ttr_aux_subtile = ...`` slice + ``aux_loaded = .load()``
+        lines (the per-tile aux setup runs once per output tile and
+        is emitted by the splice site's surrounding scaffolding via
+        ``_aux_tile_setup_lines()``). Splitting the aux LDG out of
+        the chain prelude lets the TMA-store splice issue the GMEM
+        load as the first operation in the per-subtile loop body,
+        so the long-scoreboard L1TEX wait overlaps with the in-loop
+        acc ``consumer_wait``, the t2r async TMEM→reg copy, and the
+        later-subtile c_pipeline ``producer_acquire`` (the in-loop
+        ``_tcgen05_subtile != 0`` path; the first c_pipeline acquire
+        for subtile 0 is emitted outside the loop and therefore
+        precedes the aux LDG). The SIMT-store splice rejects aux at
+        validate time, so for that path ``early_aux_prelude`` is
+        always empty and the caller can safely concatenate
+        ``early_aux_prelude + late_prelude`` to recover the previous
+        flat prelude shape.
+        """
+        load_expr = f"{carrier_name}.load()"
+        if epilogue_chain is None or not epilogue_chain.steps:
+            return ("", "", f"{load_expr}.to({target_dtype})")
+        loaded = df.new_var("tcgen05_acc_loaded")
+        prelude_load = f"{prelude_indent}{loaded} = {load_expr}\n"
+        early_aux_prelude = _aux_subtile_load_source(prelude_indent)
+        aux_locals: tuple[str, ...] = tuple(rec.aux_loaded for rec in aux_step_records)
+        chain_prelude, final_expr = epilogue_chain.render_prelude_and_expr(
+            loaded,
+            df.new_var,
+            prelude_indent,
+            aux_locals_by_step=aux_locals or None,
+        )
+        return (
+            early_aux_prelude,
+            prelude_load + chain_prelude,
+            f"({final_expr}).to({target_dtype})",
+        )
+
+    if tcgen05_value.use_tma_store_epilogue:
+        df.placeholder_args.add(tensor_name)
+        df.wrapper_only_params.extend(
+            [tcgen05_value.tma_store_atom, tcgen05_value.tma_store_tensor]
+        )
+        if tcgen05_value.use_role_local_epi:
+            df.register_cute_tcgen05_epi_role_tile_counter(
+                tcgen05_value.role_local_tile_counter
+            )
+        state.codegen.cute_wrapper_plans.append(
+            {
+                "kind": "tcgen05_d_tma",
+                "d_name": tensor_name,
+                "bm": tcgen05_value.bm,
+                "bn": tcgen05_value.bn,
+                "c_stage_count": tcgen05_value.c_stage_count,
+                "output_dtype": target_dtype,
+                "kernel_args": [
+                    tcgen05_value.tma_store_atom,
+                    tcgen05_value.tma_store_tensor,
+                ],
+            }
+        )
+
+    tcgen05_bm = tcgen05_value.bm
+    tcgen05_bn = tcgen05_value.bn
+    tcgen05_bk = tcgen05_value.bk
+    tcgen05_epilog_sync_barrier_id = tcgen05_value.epilog_sync_barrier_id
+    tcgen05_c_stage_count = tcgen05_value.c_stage_count
+    tcgen05_is_two_cta = tcgen05_value.is_two_cta
+    tcgen05_thr_mma = tcgen05_value.thr_mma
+
+    def store_common_setup(
+        gmem_tensor: str, *, include_full_tile: bool
+    ) -> tuple[list[str], list[str]]:
+        static_setup = [
+            (
+                f"{kernel_desc} = type('Tcgen05KernelDesc', (), {{"
+                f"'cta_tile_shape_mnk': ({tcgen05_bm}, {tcgen05_bn}, {tcgen05_bk}), "
+                "'c_layout': cutlass.utils.layout.LayoutEnum.ROW_MAJOR, "
+                f"'c_dtype': {target_dtype}, "
+                "'acc_dtype': cutlass.Float32, "
+                f"'epilog_sync_bar_id': cutlass.Int32({tcgen05_epilog_sync_barrier_id}), "
+                f"'epilogue_warp_id': ({epi_warp_ids}), "
+                f"'num_c_stage': cutlass.Int32({tcgen05_c_stage_count}), "
+                f"'use_2cta_instrs': {tcgen05_is_two_cta!s}"
+                "})()"
+            ),
+            (
+                # `layout_c=` / `elem_ty_c=` match the D-output dtype so the
+                # helper picks the with-source branch; the matmul-plan
+                # `tcgen05_epi_tile` and the wrapper-side TMA atom must use
+                # the same call shape (see `_make_tcgen05_layout_plan_setup`).
+                f"{epi_tile} = cutlass.utils.blackwell_helpers.compute_epilogue_tile_shape("
+                f"({tcgen05_bm}, {tcgen05_bn}), False, "
+                f"cutlass.utils.layout.LayoutEnum.ROW_MAJOR, {target_dtype}, "
+                f"layout_c=cutlass.utils.layout.LayoutEnum.ROW_MAJOR, "
+                f"elem_ty_c={target_dtype})"
+            ),
+        ]
+        tile_setup: list[str] = []
+        if include_full_tile:
+            tile_setup.append(
+                f"{full_tile} = "
+                f"({base_indices[0]}) + cutlass.Int32({tcgen05_bm}) <= {m_size} "
+                f"and ({base_indices[1]}) + cutlass.Int32({tcgen05_bn}) <= {n_size}"
+            )
+        tile_setup.extend(
+            [
+                (
+                    f"{gmem_tile} = cute.local_tile("
+                    f"{gmem_tensor}, ({tcgen05_bm}, {tcgen05_bn}), "
+                    f"({tile_coord_m}, {tile_coord_n}))"
+                ),
+                f"{tcgc_base} = {tcgen05_thr_mma}.partition_C({gmem_tile})",
+            ]
+        )
+        return static_setup, tile_setup
+
+    simt_static_store_setup, simt_tile_store_setup = store_common_setup(
+        tensor_name, include_full_tile=True
+    )
+    # The SIMT-store splice rejects aux-tensor chains at validate time
+    # (see ``aux_steps_in_chain and not use_tma_store_epilogue`` above),
+    # so ``simt_early_aux`` is always empty here. Concatenating preserves
+    # the prior flat-prelude source order for unary chains and identity
+    # stores.
+    simt_early_aux, simt_late_prelude, simt_acc_vec_rhs = _splice_acc_vec(
+        ttr_racc, "        "
+    )
+    simt_acc_vec_prelude = simt_early_aux + simt_late_prelude
+    tma_static_store_setup, tma_tile_store_setup = store_common_setup(
+        tcgen05_value.tma_store_tensor, include_full_tile=False
+    )
+    tma_c_buffer_expr = "cutlass.Int32(_tcgen05_subtile)"
+    if tcgen05_value.role_local_tile_counter:
+        tma_c_buffer_expr = (
+            f"{tcgen05_value.role_local_tile_counter} * "
+            f"cutlass.Int32({subtile_count}) + cutlass.Int32(_tcgen05_subtile)"
+        )
+    simt_store_body_core = [
+        *simt_static_store_setup,
+        *simt_tile_store_setup,
+        (
+            f"{tcgc} = cutlass.utils.gemm.sm100.transform_partitioned_tensor_layout("
+            f"{tcgc_base})"
+        ),
+        (
+            f"{tcgc_planned} = cute.make_tensor("
+            f"{tcgc}.iterator, "
+            f"cute.append(cute.append(cute.append({tcgc}.layout, {tcgen05_value.epilogue_rest_mode}), {tcgen05_value.epilogue_rest_mode}), {tcgen05_value.epilogue_rest_mode}))"
+        ),
+        (
+            f"{tacc} = cutlass.utils.gemm.sm100.transform_partitioned_tensor_layout("
+            f"{tcgen05_value.epi_acc_frag_base})"
+        ),
+        (
+            f"{tiled_copy_t2r}, {ttr_tacc_base}, {ttr_racc} = "
+            "cutlass.utils.gemm.sm100.epilogue_tmem_copy_and_partition("
+            f"{kernel_desc}, {tcgen05_value.epi_tidx}, {tacc}, {tcgc_planned}, {epi_tile}, {tcgen05_value.is_two_cta!s})"
+        ),
+        f"{thr_copy_t2r} = {tiled_copy_t2r}.get_slice({tcgen05_value.epi_tidx})",
+        f"{tcgc_epi} = cute.flat_divide({tcgc_planned}, {epi_tile})",
+        f"{ttr_gc} = {thr_copy_t2r}.partition_D({tcgc_epi})",
+        (
+            f"{ttr_tacc_stage} = {ttr_tacc_base}["
+            f"(None, None, None, None, None, {tcgen05_value.acc_consumer_state}.index)]"
+        ),
+        (
+            f"if {tcgen05_value.epi_active}:\n"
+            f"    {tcgen05_value.acc_pipeline}.consumer_wait({tcgen05_value.acc_consumer_state})"
+        ),
+        f"{ttr_tacc} = cute.group_modes({ttr_tacc_stage}, 3, cute.rank({ttr_tacc_stage}))",
+        f"{ttr_gc_grouped} = cute.group_modes({ttr_gc}, 3, cute.rank({ttr_gc}))",
+        # Per-aux-step partitioning lines (one chain per auxiliary
+        # tensor). No-op when the chain has no aux steps; generated
+        # source is byte-identical to the unary-chain shape for
+        # unary chains and to the identity-store golden for identity
+        # stores.
+        *_aux_tile_setup_lines(
+            thr_copy_t2r_var=thr_copy_t2r,
+            define_thr_copy_t2r=False,
+        ),
+        (
+            f"{ttr_racc} = cute.make_rmem_tensor("
+            f"{ttr_gc_grouped}[(None, None, None, 0)].shape, cutlass.Float32)"
+        ),
+        f"{ttr_rd} = cute.make_rmem_tensor({ttr_racc}.shape, {target_dtype})",
+        (
+            f"{mcld} = cute.max_common_layout("
+            f"{ttr_rd}.layout, {ttr_gc_grouped}[(None, None, None, 0)].layout)"
+        ),
+        (
+            f"{num_bits} = min("
+            f"{ttr_gc_grouped}.iterator.alignment * 8, "
+            f"cute.size({mcld}) * {target_dtype}.width, 256)"
+        ),
+        (
+            f"{simt_atom} = cute.make_copy_atom("
+            f"cute.nvgpu.CopyUniversalOp(), {target_dtype}, "
+            f"num_bits_per_copy={num_bits}, "
+            f"l1c_evict_priority=cute.nvgpu.CacheEvictionPriority.NO_ALLOCATE)"
+        ),
+        f"{subtile_count} = cutlass.const_expr(cute.size({ttr_tacc}.shape, mode=[3]))",
+        (
+            # Per-subtile loop: TMEM->reg (t2r) first, then reg->GMEM (SIMT
+            # store). On the last subtile we release the acc consumer slot
+            # *before* the GMEM store so the next mainloop tile's MMA can
+            # producer_acquire the TMEM stage and begin issuing UMMAs while
+            # this tile's epilogue is still draining to GMEM. This mirrors the
+            # release-acc-inside-the-subtile-loop pattern in Quack's sm100
+            # gemm epilogue. Without c_pipeline SMEM staging we can only
+            # release after the final t2r (not per-subtile), but even one
+            # tile of overlap measurably improves the wide tcgen05 path on
+            # B200. `cutlass.range(..., unroll_full=True)` keeps the loop
+            # statically unrolled so `tiled_copy_t2r` (a TiledCopy that wraps
+            # a tcgen05 tmem_load atom) is not captured as an scf.for iter_arg
+            # — the cute-to-nvvm pass cannot legalize that conversion through
+            # iter_args and aborts during compile.
+            f"for _tcgen05_subtile in cutlass.range({subtile_count}, unroll_full=True):\n"
+            f"    if {tcgen05_value.epi_active}:\n"
+            f"        {ttr_tacc_mn} = {ttr_tacc}[(None, None, None, cutlass.Int32(_tcgen05_subtile))]\n"
+            f"        {ttr_gc_subtile} = {ttr_gc_grouped}[(None, None, None, cutlass.Int32(_tcgen05_subtile))]\n"
+            f"        cute.copy({tiled_copy_t2r}, {ttr_tacc_mn}, {ttr_racc})\n"
+            f"{simt_acc_vec_prelude}"
+            f"        {acc_vec} = {simt_acc_vec_rhs}\n"
+            f"        {ttr_rd}.store({acc_vec})\n"
+            f"        if _tcgen05_subtile == {subtile_count} - 1:\n"
+            # `cute.copy(t2r, ...)` issues async TMEM->reg loads. Releasing
+            # the acc consumer slot lets the MMA producer re-acquire the TMEM
+            # stage and issue UMMAs that overwrite TMEM, so we must fence the
+            # in-flight async TMEM loads first to avoid a race on the last
+            # subtile's `ttr_racc` / `ttr_rd` data. This matches Quack's
+            # sm100 gemm fence-before-release pattern.
+            f"            cute.arch.fence_view_async_tmem_load()\n"
+            f"            with cute.arch.elect_one():\n"
+            f"                {tcgen05_value.acc_pipeline}.consumer_release({tcgen05_value.acc_consumer_state})\n"
+            f"        if {full_tile}:\n"
+            f"            cute.copy({simt_atom}, {ttr_rd}, {ttr_gc_subtile})\n"
+            f"        else:\n"
+            f"            {coord_tile} = cute.local_tile(cute.make_identity_tensor(({m_size}, {n_size})), ({tcgen05_value.bm}, {tcgen05_value.bn}), ({tile_coord_m}, {tile_coord_n}))\n"
+            f"            {tccc_base} = {tcgen05_value.thr_mma}.partition_C({coord_tile})\n"
+            f"            {tccc} = cutlass.utils.gemm.sm100.transform_partitioned_tensor_layout({tccc_base})\n"
+            f"            {tccc_epi} = cute.flat_divide({tccc}, {epi_tile})\n"
+            f"            {ttr_cc} = {thr_copy_t2r}.partition_D({tccc_epi})\n"
+            f"            {ttr_cc_grouped} = cute.group_modes({ttr_cc}, 3, cute.rank({ttr_cc}))\n"
+            f"            {ttr_cc_subtile} = {ttr_cc_grouped}[(None, None, None, cutlass.Int32(_tcgen05_subtile))]\n"
+            f"            {pred_c_shape} = (1, *{ttr_cc_subtile}.shape[1:])\n"
+            f"            {pred_c} = cute.make_rmem_tensor({pred_c_shape}, cutlass.Boolean)\n"
+            f"            for _pred_m in range({ttr_cc_subtile}.shape[1]):\n"
+            f"                for _pred_n in range({ttr_cc_subtile}.shape[2]):\n"
+            f"                    _coord = {ttr_cc_subtile}[(0, _pred_m, _pred_n)]\n"
+            f"                    {pred_c}[(0, _pred_m, _pred_n)] = cute.elem_less(_coord, ({m_size}, {n_size}))\n"
+            f"            cute.copy({simt_atom}, {ttr_rd}, {ttr_gc_subtile}, pred={pred_c})\n"
+            # Advance is a per-thread local state update, so it intentionally
+            # stays outside elect_one; only the mbarrier release is elected.
+            f"if {tcgen05_value.epi_active}:\n"
+            + emit_pipeline_advance(tcgen05_value.acc_consumer_state, indent="    ")
+        ),
+    ]
+    tma_store_pipeline_setup = [
+        (
+            f"{epilog_sync_barrier} = cutlass.pipeline.NamedBarrier("
+            f"barrier_id=cutlass.Int32({tcgen05_value.epilog_sync_barrier_id}), "
+            f"num_threads=cutlass.Int32({tcgen05_value.epi_warp_count * 32}))"
+        ),
+        (
+            f"{c_pipeline_producer_group} = cutlass.pipeline.CooperativeGroup("
+            f"cutlass.pipeline.Agent.Thread, cutlass.Int32({tcgen05_value.epi_warp_count * 32}))"
+        ),
+        (
+            f"{c_pipeline} = cutlass.pipeline.PipelineTmaStore.create("
+            f"num_stages={tcgen05_value.c_stage_count}, "
+            f"producer_group={c_pipeline_producer_group})"
+        ),
+    ]
+    tma_store_pipeline_tail = (
+        f"if {tcgen05_value.warp_idx} == cutlass.Int32(0):\n"
+        f"    {c_pipeline}.producer_tail()"
+    )
+    c_acquire_placement = state.device_function.config.get(
+        TCGEN05_C_ACQUIRE_PLACEMENT_CONFIG_KEY,
+        TCGEN05_C_ACQUIRE_PLACEMENT_PRE_LOOP,
+    )
+    acc_wait_placement = state.device_function.config.get(
+        TCGEN05_ACC_WAIT_PLACEMENT_CONFIG_KEY,
+        TCGEN05_ACC_WAIT_PLACEMENT_SUBTILE_LOOP,
+    )
+    c_store_mode = state.device_function.config.get(
+        TCGEN05_C_STORE_MODE_CONFIG_KEY,
+        TCGEN05_C_STORE_MODE_NORMAL,
+    )
+    epilogue_layout = state.device_function.config.get(
+        TCGEN05_EPILOGUE_LAYOUT_CONFIG_KEY,
+        TCGEN05_EPILOGUE_LAYOUT_NORMAL,
+    )
+    diagnose_first_c_acquire_in_loop = (
+        c_acquire_placement == TCGEN05_C_ACQUIRE_PLACEMENT_FIRST_IN_LOOP
+    )
+    diagnose_later_c_acquire_before_barrier = (
+        c_acquire_placement == TCGEN05_C_ACQUIRE_PLACEMENT_LATER_BEFORE_BARRIER
+    )
+    diagnose_acc_wait_before_subtile_loop = (
+        acc_wait_placement == TCGEN05_ACC_WAIT_PLACEMENT_BEFORE_SUBTILE_LOOP
+    )
+    diagnose_skip_epilogue_store = (
+        c_store_mode == TCGEN05_C_STORE_MODE_SKIP_EPILOGUE_STORE
+    )
+    diagnose_split_first_t2r = (
+        epilogue_layout == TCGEN05_EPILOGUE_LAYOUT_SPLIT_FIRST_T2R
+    )
+    diagnose_split_acc_t2r_store_tail = (
+        epilogue_layout == TCGEN05_EPILOGUE_LAYOUT_SPLIT_ACC_T2R_STORE_TAIL
+    )
+    diagnose_module_helper_acc_t2r = (
+        epilogue_layout == TCGEN05_EPILOGUE_LAYOUT_MODULE_HELPER_ACC_T2R
+    )
+    diagnose_module_helper_store_tail = (
+        epilogue_layout == TCGEN05_EPILOGUE_LAYOUT_MODULE_HELPER_STORE_TAIL
+    )
+    diagnose_split_epilogue_layout = (
+        diagnose_split_first_t2r
+        or diagnose_split_acc_t2r_store_tail
+        or diagnose_module_helper_acc_t2r
+        or diagnose_module_helper_store_tail
+    )
+    if diagnose_split_epilogue_layout:
+        if not (
+            tcgen05_value.use_role_local_epi and tcgen05_value.use_tma_store_epilogue
+        ):
+            raise exc.BackendUnsupported(
+                "cute",
+                f"{TCGEN05_EPILOGUE_LAYOUT_CONFIG_KEY}={epilogue_layout!r} "
+                "requires the "
+                "role-local TMA-store tcgen05 epilogue",
+            )
+        if not tcgen05_value.is_two_cta:
+            raise exc.BackendUnsupported(
+                "cute",
+                f"{TCGEN05_EPILOGUE_LAYOUT_CONFIG_KEY}={epilogue_layout!r} requires "
+                "CtaGroup.TWO",
+            )
+        # Conservative proxy for the validated static-full CtaGroup.TWO
+        # two-or-more-subtile envelope; the exact subtile count is only
+        # available after the CUTLASS epilogue partitioning below.
+        if tcgen05_value.bn < TCGEN05_TWO_CTA_BLOCK_N:
+            raise exc.BackendUnsupported(
+                "cute",
+                f"{TCGEN05_EPILOGUE_LAYOUT_CONFIG_KEY}={epilogue_layout!r} is only "
+                f"validated for CtaGroup.TWO block_n >= {TCGEN05_TWO_CTA_BLOCK_N}",
+            )
+        # The diagnostic split-epilogue layouts emit the per-thread
+        # chain into separate ``@cute.jit`` helpers (module-helper
+        # layouts) or split source boundaries; the auxiliary-tensor
+        # splice site needs per-tile aux setup that is not currently
+        # plumbed into those helper signatures. Reject the
+        # combination loudly so a user does not silently get a
+        # kernel that drops the aux read. The diagnostic layouts
+        # are only used for source-boundary investigation and do not
+        # block any production path.
+        if (
+            diagnose_module_helper_acc_t2r
+            or diagnose_module_helper_store_tail
+            or diagnose_split_first_t2r
+            or diagnose_split_acc_t2r_store_tail
+        ) and aux_steps_in_chain:
+            raise exc.BackendUnsupported(
+                "cute",
+                "auxiliary-tensor epilogue (e.g. "
+                "`out[tile] = (acc + residual[tile]).to(dtype)`) is "
+                f"not plumbed through {TCGEN05_EPILOGUE_LAYOUT_CONFIG_KEY}="
+                f"{epilogue_layout!r}. The diagnostic split-epilogue "
+                "layouts are only used for source-boundary "
+                "investigation; drop the layout config to use the "
+                "default production layout.",
+            )
+    tma_store_first_subtile_acquire = (
+        []
+        if diagnose_first_c_acquire_in_loop
+        else [
+            (
+                f"if {tcgen05_value.epi_active} and "
+                f"{tcgen05_value.warp_idx} == cutlass.Int32(0):\n"
+                f"    {c_pipeline}.producer_acquire()"
+            )
+        ]
+    )
+    tma_store_loop_first_subtile_acquire = (
+        (
+            f"        if _tcgen05_subtile == 0 and "
+            f"{tcgen05_value.warp_idx} == cutlass.Int32(0):\n"
+            f"            {c_pipeline}.producer_acquire()\n"
+        )
+        if diagnose_first_c_acquire_in_loop
+        else ""
+    )
+    tma_store_split_first_subtile_acquire = (
+        (
+            f"        if {tcgen05_value.warp_idx} == cutlass.Int32(0):\n"
+            f"            {c_pipeline}.producer_acquire()\n"
+        )
+        if diagnose_first_c_acquire_in_loop
+        else ""
+    )
+    tma_store_loop_later_subtile_acquire = (
+        ""
+        if diagnose_later_c_acquire_before_barrier
+        else (
+            f"        if _tcgen05_subtile != 0 and "
+            f"{tcgen05_value.warp_idx} == cutlass.Int32(0):\n"
+            f"            {c_pipeline}.producer_acquire()\n"
+        )
+    )
+    tma_store_loop_late_later_subtile_acquire = (
+        (
+            f"        if _tcgen05_subtile != 0 and "
+            f"{tcgen05_value.warp_idx} == cutlass.Int32(0):\n"
+            f"            {c_pipeline}.producer_acquire()\n"
+        )
+        if diagnose_later_c_acquire_before_barrier
+        else ""
+    )
+    tma_store_pre_loop_acc_wait = (
+        [
+            (
+                f"if {tcgen05_value.epi_active}:\n"
+                f"    {tcgen05_value.acc_pipeline}.consumer_wait({tcgen05_value.acc_consumer_state})"
+            )
+        ]
+        if diagnose_acc_wait_before_subtile_loop
+        else []
+    )
+    tma_store_loop_acc_wait = (
+        ""
+        if diagnose_acc_wait_before_subtile_loop
+        else (
+            f"        if _tcgen05_subtile == 0:\n"
+            f"            {tcgen05_value.acc_pipeline}.consumer_wait({tcgen05_value.acc_consumer_state})\n"
+        )
+    )
+    tma_store_split_first_acc_wait = (
+        ""
+        if diagnose_acc_wait_before_subtile_loop
+        else (
+            f"        {tcgen05_value.acc_pipeline}.consumer_wait({tcgen05_value.acc_consumer_state})\n"
+        )
+    )
+    tma_store_split_tail_later_subtile_acquire = (
+        ""
+        if diagnose_later_c_acquire_before_barrier
+        else (
+            f"        if {tcgen05_value.warp_idx} == cutlass.Int32(0):\n"
+            f"            {c_pipeline}.producer_acquire()\n"
+        )
+    )
+    tma_store_split_tail_late_later_subtile_acquire = (
+        (
+            f"        if {tcgen05_value.warp_idx} == cutlass.Int32(0):\n"
+            f"            {c_pipeline}.producer_acquire()\n"
+        )
+        if diagnose_later_c_acquire_before_barrier
+        else ""
+    )
+    # Pyrefly does not preserve the non-None tcgen05_value narrowing inside
+    # the nested source formatter, so keep local string aliases for attributes
+    # read only by that closure.
+    tcgen05_epi_active = tcgen05_value.epi_active
+    tcgen05_acc_pipeline = tcgen05_value.acc_pipeline
+    tcgen05_acc_consumer_state = tcgen05_value.acc_consumer_state
+    tcgen05_warp_idx = tcgen05_value.warp_idx
+    tcgen05_tma_store_atom = tcgen05_value.tma_store_atom
+
+    def tma_store_acc_t2r_region_split(*, acc_wait: str) -> tuple[str, str]:
+        """Return ``(early_aux_prelude, body)`` for the t2r region.
+
+        ``early_aux_prelude`` is the per-subtile auxiliary-tensor LDG
+        block (empty for identity / unary-only chains). The caller is
+        expected to emit it at the top of the per-subtile loop body so
+        the GMEM LDG fires before the in-loop c_pipeline acquires (the
+        ``_tcgen05_subtile != 0`` later-subtile acquires) and the
+        in-loop acc ``consumer_wait`` and t2r async TMEM→reg copy. The
+        aux LDG depends on ``_tcgen05_subtile`` (it slices a per-
+        subtile view of ``ttr_gAux_grouped_*``), so it cannot be
+        hoisted out of the per-subtile loop entirely; the **first**
+        c_pipeline ``producer_acquire`` for subtile 0 is emitted
+        outside the loop (warp-0 arms the ring once before any subtile
+        work) and so structurally precedes the aux LDG for subtile 0.
+        The hoist still removes the L1TEX serialization for every
+        chain-add because the warp scheduler can issue the aux LDG
+        before the in-loop acc ``consumer_wait`` and the t2r async
+        copy on the same subtile, and before the in-loop later-
+        subtile c_pipeline acquire on subtile != 0. ``body`` is the
+        rest of the t2r region (acc consumer_wait, t2r copy, chain
+        combine, store_target store) at the existing 8-space indent.
+
+        When the chain has auxiliary-tensor steps, render the chain
+        (and the destination store) in the ``ttr_*`` (t2r-fragment)
+        layout instead of the ``trs_*`` (r2s-retile) layout. The aux
+        load is partitioned via ``thr_copy_t2r.partition_D`` so it
+        lives in the t2r layout; the chain's binary ops require both
+        operands in the same layout, and forcing the carrier to
+        ``ttr_*`` avoids an extra register-stage retile that would
+        otherwise be needed for the GMEM-loaded aux. ``ttr_rd`` and
+        ``trs_rd`` share register storage (``trs_rd`` is
+        ``epilogue_smem_copy_and_partition``'s retiled view of
+        ``ttr_rd``), so storing into ``ttr_rd`` here makes the
+        downstream ``cute.copy(tiled_copy_r2s, trs_rd, trs_sd)`` see
+        the same data.
+
+        NCU diagnosis on 4096³ residual (cycle 39, GPU 6): Helion
+        paid 26.7 cycles per warp on long-scoreboard L1TEX wait
+        vs Quack's 15.7 — Helion's per-thread aux GMEM load was
+        issued after the t2r async TMEM→reg copy and the
+        ``acc.load()`` call, so the chain-add waited for the LDG
+        with no overlap. Quack overlaps the residual ``C`` load via
+        a TMA SMEM ring (8th producer warp). A cheaper structural
+        fix at the splice level (without a new SMEM ring) is to
+        hoist the GMEM LDG to the top of the per-subtile body so
+        the warp scheduler has the in-loop acc ``consumer_wait``,
+        the t2r async copy, and the later-subtile c_pipeline
+        ``producer_acquire`` to overlap with the LDG.
+        """
+        if aux_steps_in_chain:
+            carrier = ttr_racc
+            store_target = ttr_rd
+        else:
+            carrier = trs_racc
+            store_target = trs_rd
+        early_aux_prelude, late_prelude, rhs = _splice_acc_vec(carrier, "        ")
+        body = (
+            f"{acc_wait}"
+            f"        {ttr_tacc_mn} = {ttr_tacc}[(None, None, None, cutlass.Int32(_tcgen05_subtile))]\n"
+            f"        cute.copy({tiled_copy_t2r}, {ttr_tacc_mn}, {ttr_racc})\n"
+            f"{late_prelude}"
+            f"        {acc_vec} = {rhs}\n"
+            f"        if _tcgen05_subtile == {subtile_count} - 1:\n"
+            f"            cute.arch.fence_view_async_tmem_load()\n"
+            f"            with cute.arch.elect_one():\n"
+            f"                {tcgen05_acc_pipeline}.consumer_release({tcgen05_acc_consumer_state})\n"
+            f"        {store_target}.store({acc_vec})\n"
+        )
+        return early_aux_prelude, body
+
+    def tma_store_acc_t2r_region(*, acc_wait: str) -> str:
+        # Diagnostic / non-default callers (split-first-t2r,
+        # split-acc-t2r-store-tail, module-helper variants) all reject
+        # aux-tensor chains at validate time, so the early aux block
+        # is always empty for them. The assertion below makes that
+        # contract enforceable: a future caller that forgets to
+        # validate would silently produce non-hoisted output if it
+        # routed an aux-tensor chain through this wrapper, so we
+        # refuse to render rather than degrade. The default subtile
+        # body uses ``tma_store_acc_t2r_region_split`` directly to
+        # hoist the aux LDG to the top of the per-subtile loop body.
+        early_aux_prelude, body = tma_store_acc_t2r_region_split(acc_wait=acc_wait)
+        assert not early_aux_prelude, (
+            "tma_store_acc_t2r_region must not be reached with an aux-tensor "
+            "chain; diagnostic / module-helper layouts reject aux at validate "
+            "time. Use tma_store_acc_t2r_region_split for paths that need to "
+            "hoist the aux LDG above the per-subtile c_pipeline / acc-wait."
+        )
+        return body
+
+    def tma_store_tail_region(*, late_later_subtile_acquire: str) -> str:
+        return (
+            f"{late_later_subtile_acquire}"
+            f"        {epilog_sync_barrier}.arrive_and_wait()\n"
+            f"        {c_buffer} = ({tma_c_buffer_expr}) % cutlass.Int32({tcgen05_c_stage_count})\n"
+            f"        cute.copy({tiled_copy_r2s}, {trs_rd}, {trs_sd}[(None, None, None, {c_buffer})])\n"
+            f"        cute.arch.fence_view_async_shared()\n"
+            f"        {epilog_sync_barrier}.arrive_and_wait()\n"
+            f"        if {tcgen05_warp_idx} == cutlass.Int32(0):\n"
+            f"            cute.copy({tcgen05_tma_store_atom}, {bsg_sd}[(None, {c_buffer})], {bsg_gd}[(None, cutlass.Int32(_tcgen05_subtile))])\n"
+            f"            {c_pipeline}.producer_commit()\n"
+        )
+
+    def tma_store_subtile_body(
+        *,
+        first_subtile_acquire: str,
+        later_subtile_acquire: str,
+        acc_wait: str,
+        late_later_subtile_acquire: str,
+    ) -> str:
+        # Hoist the per-subtile aux LDG block to the top of the
+        # ``if epi_active:`` body — first thing inside the per-subtile
+        # loop. Note that ``first_subtile_acquire`` is empty here: the
+        # **first** c_pipeline ``producer_acquire`` for subtile 0 is
+        # emitted **outside** the per-subtile loop (see
+        # ``tma_store_first_subtile_acquire`` and ``tma_store_body_core``
+        # — warp-0 arms the c_pipeline ring once before any subtile work
+        # starts). The aux LDG depends on ``_tcgen05_subtile`` (it
+        # slices a per-subtile view of ``ttr_gAux_grouped_*``), so it
+        # cannot be hoisted out of the loop entirely. For subtile 0 the
+        # pre-loop acquire therefore structurally precedes the aux LDG;
+        # for subtile != 0 the in-loop ``later_subtile_acquire`` follows
+        # the aux LDG. Either way the long-scoreboard L1TEX wait gets
+        # the in-loop acc ``consumer_wait`` and the t2r async TMEM→reg
+        # copy to overlap with on every subtile, and the later-subtile
+        # c_pipeline acquire to overlap with on subtile != 0. Empty for
+        # identity / unary-only chains so the generated source for
+        # those cases is byte-identical with the pre-cycle-39 shape.
+        early_aux_prelude, t2r_body = tma_store_acc_t2r_region_split(acc_wait=acc_wait)
+        return (
+            f"    if {tcgen05_epi_active}:\n"
+            f"{early_aux_prelude}"
+            f"{first_subtile_acquire}"
+            f"{later_subtile_acquire}"
+            f"{t2r_body}"
+            f"{tma_store_tail_region(late_later_subtile_acquire=late_later_subtile_acquire)}"
+        )
+
+    def indented_diagnostic_region(source: str) -> str:
+        if not source:
+            return "            pass\n"
+        return "".join(f"    {line}" for line in source.splitlines(keepends=True))
+
+    def tma_store_helper_boundary_subtile_body(
+        *,
+        first_subtile_acquire: str,
+        later_subtile_acquire: str,
+        acc_wait: str,
+        late_later_subtile_acquire: str,
+    ) -> str:
+        acquire_region = f"{first_subtile_acquire}{later_subtile_acquire}"
+        acc_region = tma_store_acc_t2r_region(acc_wait=acc_wait)
+        tail_region = tma_store_tail_region(
+            late_later_subtile_acquire=late_later_subtile_acquire
+        )
+        # These constant-true blocks are diagnostic source boundaries. The
+        # generated-code AST round trip preserves them, while emitted comments
+        # are not reliable line-info anchors.
+        return (
+            f"    if {tcgen05_epi_active}:\n"
+            f"        if True:\n"
+            f"{indented_diagnostic_region(acquire_region)}"
+            f"        if True:\n"
+            f"{indented_diagnostic_region(acc_region)}"
+            f"        if True:\n"
+            f"{indented_diagnostic_region(tail_region)}"
+        )
+
+    module_acc_t2r_helper_name = (
+        df.unique_name("tcgen05_acc_t2r_region")
+        if diagnose_module_helper_acc_t2r
+        else ""
+    )
+    module_store_tail_helper_name = (
+        df.unique_name("tcgen05_store_tail_region")
+        if diagnose_module_helper_store_tail
+        else ""
+    )
+
+    def tma_store_module_acc_t2r_helper_source(*, acc_wait: str) -> str:
+        # Aux-tensor chains are rejected for the diagnostic module-helper
+        # layouts (see the ``BackendUnsupported`` raise above), so
+        # ``module_early_aux`` is always empty here. Concatenating it
+        # with ``module_late_prelude`` preserves the prior flat-prelude
+        # source order for unary chains and identity stores in this
+        # diagnostic layout.
+        module_early_aux, module_late_prelude, rhs = _splice_acc_vec(
+            "tcgen05_tRS_rAcc", "    "
+        )
+        prelude = module_early_aux + module_late_prelude
+        return (
+            "@cute.jit\n"
+            f"def {module_acc_t2r_helper_name}("
+            "_tcgen05_subtile, "
+            "tcgen05_acc_pipeline, "
+            "tcgen05_acc_consumer_state, "
+            "tcgen05_tTR_tAcc, "
+            "tcgen05_tiled_copy_t2r, "
+            "tcgen05_tTR_rAcc, "
+            "tcgen05_tRS_rAcc, "
+            "tcgen05_tRS_rD, "
+            "tcgen05_subtile_count"
+            "):\n"
+            f"{acc_wait}"
+            "    tcgen05_tTR_tAcc_mn = tcgen05_tTR_tAcc[(None, None, None, cutlass.Int32(_tcgen05_subtile))]\n"
+            "    cute.copy(tcgen05_tiled_copy_t2r, tcgen05_tTR_tAcc_mn, tcgen05_tTR_rAcc)\n"
+            f"{prelude}"
+            f"    tcgen05_acc_vec = {rhs}\n"
+            "    if _tcgen05_subtile == tcgen05_subtile_count - 1:\n"
+            "        cute.arch.fence_view_async_tmem_load()\n"
+            "        with cute.arch.elect_one():\n"
+            "            tcgen05_acc_pipeline.consumer_release(tcgen05_acc_consumer_state)\n"
+            "    tcgen05_tRS_rD.store(tcgen05_acc_vec)"
+        )
+
+    def tma_store_module_acc_t2r_helper_call() -> str:
+        return (
+            f"        {module_acc_t2r_helper_name}("
+            f"_tcgen05_subtile, "
+            f"{tcgen05_acc_pipeline}, "
+            f"{tcgen05_acc_consumer_state}, "
+            f"{ttr_tacc}, "
+            f"{tiled_copy_t2r}, "
+            f"{ttr_racc}, "
+            f"{trs_racc}, "
+            f"{trs_rd}, "
+            f"{subtile_count})\n"
+        )
+
+    def tma_store_module_helper_subtile_body(
+        *,
+        first_subtile_acquire: str,
+        later_subtile_acquire: str,
+        late_later_subtile_acquire: str,
+    ) -> str:
+        return (
+            f"    if {tcgen05_epi_active}:\n"
+            f"{first_subtile_acquire}"
+            f"{later_subtile_acquire}"
+            f"{tma_store_module_acc_t2r_helper_call()}"
+            f"{tma_store_tail_region(late_later_subtile_acquire=late_later_subtile_acquire)}"
+        )
+
+    def tma_store_module_tail_helper_source(*, late_later_subtile_acquire: str) -> str:
+        return (
+            "@cute.jit\n"
+            f"def {module_store_tail_helper_name}("
+            "_tcgen05_subtile, "
+            "tcgen05_tma_c_buffer_index, "
+            "tcgen05_epilog_sync_barrier, "
+            "tcgen05_tiled_copy_r2s, "
+            "tcgen05_tRS_rD, "
+            "tcgen05_tRS_sD, "
+            "tcgen05_tma_store_atom, "
+            "tcgen05_bSG_sD, "
+            "tcgen05_bSG_gD, "
+            "tcgen05_c_pipeline, "
+            "tcgen05_warp_idx"
+            "):\n"
+            f"{late_later_subtile_acquire}"
+            "    tcgen05_epilog_sync_barrier.arrive_and_wait()\n"
+            f"    tcgen05_c_buffer = tcgen05_tma_c_buffer_index % cutlass.Int32({tcgen05_c_stage_count})\n"
+            "    cute.copy(tcgen05_tiled_copy_r2s, tcgen05_tRS_rD, tcgen05_tRS_sD[(None, None, None, tcgen05_c_buffer)])\n"
+            "    cute.arch.fence_view_async_shared()\n"
+            "    tcgen05_epilog_sync_barrier.arrive_and_wait()\n"
+            "    if tcgen05_warp_idx == cutlass.Int32(0):\n"
+            "        cute.copy(tcgen05_tma_store_atom, tcgen05_bSG_sD[(None, tcgen05_c_buffer)], tcgen05_bSG_gD[(None, cutlass.Int32(_tcgen05_subtile))])\n"
+            "        tcgen05_c_pipeline.producer_commit()"
+        )
+
+    def tma_store_module_tail_helper_call() -> str:
+        return (
+            f"        {module_store_tail_helper_name}("
+            f"_tcgen05_subtile, "
+            f"{tma_c_buffer_expr}, "
+            f"{epilog_sync_barrier}, "
+            f"{tiled_copy_r2s}, "
+            f"{trs_rd}, "
+            f"{trs_sd}, "
+            f"{tcgen05_tma_store_atom}, "
+            f"{bsg_sd}, "
+            f"{bsg_gd}, "
+            f"{c_pipeline}, "
+            f"{tcgen05_warp_idx})\n"
+        )
+
+    def tma_store_module_tail_subtile_body(
+        *,
+        first_subtile_acquire: str,
+        later_subtile_acquire: str,
+        acc_wait: str,
+    ) -> str:
+        return (
+            f"    if {tcgen05_epi_active}:\n"
+            f"{first_subtile_acquire}"
+            f"{later_subtile_acquire}"
+            f"{tma_store_acc_t2r_region(acc_wait=acc_wait)}"
+            f"{tma_store_module_tail_helper_call()}"
+        )
+
+    if diagnose_split_first_t2r:
+        tma_store_split_first_subtile_body = tma_store_subtile_body(
+            first_subtile_acquire=tma_store_split_first_subtile_acquire,
+            later_subtile_acquire="",
+            acc_wait=tma_store_split_first_acc_wait,
+            late_later_subtile_acquire="",
+        )
+        tma_store_split_tail_subtile_body = tma_store_subtile_body(
+            first_subtile_acquire="",
+            later_subtile_acquire=tma_store_split_tail_later_subtile_acquire,
+            acc_wait="",
+            late_later_subtile_acquire=(
+                tma_store_split_tail_late_later_subtile_acquire
+            ),
+        )
+        # Diagnostic-only scaffolding: reuse the one-indent subtile formatter
+        # for a static first subtile without changing production source layout.
+        # The tail loop maps split-loop indices back to logical subtile ids 1..N-1;
+        # unroll_full=True keeps those subtile values compile-time constants.
+        tma_store_subtile_loop = (
+            "if True:\n"
+            f"    _tcgen05_subtile = 0\n"
+            f"{tma_store_split_first_subtile_body}"
+            f"for _tcgen05_split_subtile in cutlass.range({subtile_count} - 1, unroll_full=True):\n"
+            f"    _tcgen05_subtile = _tcgen05_split_subtile + 1\n"
+            f"{tma_store_split_tail_subtile_body}"
+        )
+    elif diagnose_split_acc_t2r_store_tail:
+        tma_store_helper_boundary_body = tma_store_helper_boundary_subtile_body(
+            first_subtile_acquire=tma_store_loop_first_subtile_acquire,
+            later_subtile_acquire=tma_store_loop_later_subtile_acquire,
+            acc_wait=tma_store_loop_acc_wait,
+            late_later_subtile_acquire=tma_store_loop_late_later_subtile_acquire,
+        )
+        tma_store_subtile_loop = (
+            f"for _tcgen05_subtile in cutlass.range({subtile_count}, unroll_full=True):\n"
+            f"{tma_store_helper_boundary_body}"
+        )
+    elif diagnose_module_helper_acc_t2r:
+        module_helper_acc_wait = (
+            ""
+            if diagnose_acc_wait_before_subtile_loop
+            else (
+                "    if _tcgen05_subtile == 0:\n"
+                "        tcgen05_acc_pipeline.consumer_wait(tcgen05_acc_consumer_state)\n"
+            )
+        )
+        state.codegen.module_statements.append(
+            statement_from_string(
+                tma_store_module_acc_t2r_helper_source(acc_wait=module_helper_acc_wait)
+            )
+        )
+        tma_store_module_helper_body = tma_store_module_helper_subtile_body(
+            first_subtile_acquire=tma_store_loop_first_subtile_acquire,
+            later_subtile_acquire=tma_store_loop_later_subtile_acquire,
+            late_later_subtile_acquire=tma_store_loop_late_later_subtile_acquire,
+        )
+        tma_store_subtile_loop = (
+            f"for _tcgen05_subtile in cutlass.range({subtile_count}, unroll_full=True):\n"
+            f"{tma_store_module_helper_body}"
+        )
+    elif diagnose_module_helper_store_tail:
+        module_tail_late_later_subtile_acquire = (
+            (
+                "    if _tcgen05_subtile != 0 and "
+                "tcgen05_warp_idx == cutlass.Int32(0):\n"
+                "        tcgen05_c_pipeline.producer_acquire()\n"
+            )
+            if diagnose_later_c_acquire_before_barrier
+            else ""
+        )
+        state.codegen.module_statements.append(
+            statement_from_string(
+                tma_store_module_tail_helper_source(
+                    late_later_subtile_acquire=module_tail_late_later_subtile_acquire
+                )
+            )
+        )
+        tma_store_module_tail_body = tma_store_module_tail_subtile_body(
+            first_subtile_acquire=tma_store_loop_first_subtile_acquire,
+            later_subtile_acquire=tma_store_loop_later_subtile_acquire,
+            acc_wait=tma_store_loop_acc_wait,
+        )
+        tma_store_subtile_loop = (
+            f"for _tcgen05_subtile in cutlass.range({subtile_count}, unroll_full=True):\n"
+            f"{tma_store_module_tail_body}"
+        )
+    else:
+        tma_store_default_subtile_body = tma_store_subtile_body(
+            first_subtile_acquire=tma_store_loop_first_subtile_acquire,
+            later_subtile_acquire=tma_store_loop_later_subtile_acquire,
+            acc_wait=tma_store_loop_acc_wait,
+            late_later_subtile_acquire=tma_store_loop_late_later_subtile_acquire,
+        )
+        tma_store_subtile_loop = (
+            f"for _tcgen05_subtile in cutlass.range({subtile_count}, unroll_full=True):\n"
+            f"{tma_store_default_subtile_body}"
+        )
+    tma_store_smem_setup = [
+        # Must match the wrapper-side `tcgen05_d_tma` TMA atom layout in
+        # `helion/runtime/__init__.py`; both describe one D SMEM stage.
+        (
+            f"{smem_d_layout} = cutlass.utils.blackwell_helpers.make_smem_layout_epi("
+            f"{target_dtype}, cutlass.utils.layout.LayoutEnum.ROW_MAJOR, "
+            f"{epi_tile}, {tcgen05_value.c_stage_count})"
+        ),
+        (
+            f"{smem_d_ptr} = cute.arch.alloc_smem("
+            f"{target_dtype}, cute.cosize({smem_d_layout}.outer), alignment=1024)"
+        ),
+        (
+            f"{smem_d} = cute.make_tensor("
+            f"cute.recast_ptr({smem_d_ptr}, {smem_d_layout}.inner, dtype={target_dtype}), "
+            f"{smem_d_layout}.outer)"
+        ),
+    ]
+    tma_store_acc_layout_setup = [
+        (
+            f"{tacc} = cutlass.utils.gemm.sm100.transform_partitioned_tensor_layout("
+            f"{tcgen05_value.epi_acc_frag_base})"
+        ),
+    ]
+    tma_store_role_invariant_setup = [
+        *tma_static_store_setup,
+        *tma_store_smem_setup,
+        *tma_store_acc_layout_setup,
+    ]
+    suppressed_store_body_core = [
+        (
+            # Diagnostic-only invalid-output mode. Keep the accumulator
+            # pipeline draining so persistent kernels do not deadlock, but
+            # suppress C-pipeline acquire/commit, R2S/SMEM work, and TMA D
+            # stores to bound whether hot waits are tied to the C-store path.
+            f"if {tcgen05_value.epi_active}:\n"
+            f"    {tcgen05_value.acc_pipeline}.consumer_wait({tcgen05_value.acc_consumer_state})\n"
+            f"    with cute.arch.elect_one():\n"
+            f"        {tcgen05_value.acc_pipeline}.consumer_release({tcgen05_value.acc_consumer_state})\n"
+            + emit_pipeline_advance(
+                tcgen05_value.acc_consumer_state,
+                indent="    ",
+            )
+        )
+    ]
+    # C-input warp aux pipeline consumer-wait + lane-0-gated
+    # consumer-release framing (``cute_plan.md`` §7.5.3.2 cycle 2b).
+    # Gate-closed configs (default ``c_input_warps=0`` or no aux
+    # residual) keep the historical GMEM aux path. When the gate
+    # fires, the wait/release pair runs once per *subtile* of the
+    # per-output-tile aux region: per-subtile staging keeps the
+    # SMEM ring footprint at one ``epi_tile`` chunk per stage
+    # rather than one ``(bm, bn)`` chunk, which is essential to
+    # fit cluster_m=2 + ``tcgen05_ab_stages=3`` in the 228 KB
+    # B200 SMEM cap. The wait happens at the top of the
+    # per-subtile loop body in
+    # ``_aux_subtile_load_source`` (before any ``.load()`` from
+    # the SMEM ring); the release + ``advance`` happen at the
+    # bottom of the same per-subtile iteration (after the chain
+    # has consumed ``aux_loaded``). Lane-0 gating mirrors the
+    # per-warp consumer arrive count
+    # (``epi_warp_count``) allocated on the aux pipeline.
+
+    # Non-role-local stores keep pipeline/SMEM setup before per-tile C
+    # partitioning so the hoisted role-local prefix matches the same
+    # invariant setup subset.
+    tma_store_body_core = [
+        *([] if tcgen05_value.use_role_local_epi else tma_static_store_setup),
+        *([] if tcgen05_value.use_role_local_epi else tma_store_pipeline_setup),
+        *([] if tcgen05_value.use_role_local_epi else tma_store_smem_setup),
+        *tma_store_first_subtile_acquire,
+        *tma_tile_store_setup,
+        (
+            f"{tcgc} = cutlass.utils.gemm.sm100.transform_partitioned_tensor_layout("
+            f"{tcgc_base})"
+        ),
+        (
+            f"{tcgc_planned} = cute.make_tensor("
+            f"{tcgc}.iterator, "
+            f"cute.append(cute.append(cute.append({tcgc}.layout, {tcgen05_value.epilogue_rest_mode}), {tcgen05_value.epilogue_rest_mode}), {tcgen05_value.epilogue_rest_mode}))"
+        ),
+        *([] if tcgen05_value.use_role_local_epi else tma_store_acc_layout_setup),
+        (
+            f"{tiled_copy_t2r}, {ttr_tacc_base}, {ttr_racc} = "
+            "cutlass.utils.gemm.sm100.epilogue_tmem_copy_and_partition("
+            f"{kernel_desc}, {tcgen05_value.epi_tidx}, {tacc}, {tcgc_planned}, {epi_tile}, {tcgen05_value.is_two_cta!s})"
+        ),
+        (f"{ttr_rd} = cute.make_rmem_tensor({ttr_racc}.shape, {target_dtype})"),
+        (
+            f"{tiled_copy_r2s}, {trs_rd}, {trs_sd} = "
+            "cutlass.utils.gemm.sm100.epilogue_smem_copy_and_partition("
+            f"{kernel_desc}, {tiled_copy_t2r}, {ttr_rd}, "
+            f"{tcgen05_value.epi_tidx}, {smem_d})"
+        ),
+        f"{trs_racc} = {tiled_copy_r2s}.retile({ttr_racc})",
+        f"{tcgc_epi} = cute.flat_divide({tcgc_planned}, {epi_tile})",
+        # Per-aux-step partitioning lines (one chain per auxiliary
+        # tensor). No-op when the chain has no aux steps; the TMA
+        # path requires an explicit ``thr_copy_t2r`` slice because
+        # (unlike the SIMT path) the TMA path does not otherwise
+        # create one — the t2r partition is consumed directly by
+        # the SMEM-staged store, never via partition_D. The aux
+        # load needs partition_D to compute a per-thread GMEM read
+        # for the auxiliary tile so we create the slice here.
+        # When the C-input warp productive-body gate is open the
+        # source switches from per-tile GMEM to the per-subtile
+        # SMEM ring stage (see ``_aux_tile_setup_lines`` SMEM
+        # branch); the partition pipeline is layout-only and
+        # compiles unchanged, and the per-subtile ``consumer_wait``
+        # / lane-0-gated ``consumer_release`` are emitted by
+        # ``_aux_subtile_load_source`` inside the per-subtile loop.
+        *_aux_tile_setup_lines(
+            thr_copy_t2r_var=thr_copy_t2r,
+            define_thr_copy_t2r=True,
+        ),
+        (
+            f"{bsg_sd}, {bsg_gd_partitioned} = cute.nvgpu.cpasync.tma_partition("
+            f"{tcgen05_value.tma_store_atom}, 0, cute.make_layout(1), "
+            f"cute.group_modes({smem_d}, 0, 2), "
+            f"cute.group_modes({tcgc_epi}, 0, 2))"
+        ),
+        (
+            f"{bsg_gd} = {bsg_gd_partitioned}["
+            f"(None, None, None, cutlass.Int32(0), cutlass.Int32(0), cutlass.Int32(0))]"
+        ),
+        f"{bsg_gd} = cute.group_modes({bsg_gd}, 1, cute.rank({bsg_gd}))",
+        (
+            f"{ttr_tacc_stage} = {ttr_tacc_base}["
+            f"(None, None, None, None, None, {tcgen05_value.acc_consumer_state}.index)]"
+        ),
+        f"{ttr_tacc} = cute.group_modes({ttr_tacc_stage}, 3, cute.rank({ttr_tacc_stage}))",
+        f"{subtile_count} = cutlass.const_expr(cute.size({ttr_tacc}.shape, mode=[3]))",
+        *tma_store_pre_loop_acc_wait,
+        (
+            # Warp 0 pre-acquires the first TMA-store SMEM stage before
+            # per-tile C-store setup. The subtile loop acquires only later
+            # stages, so C-stage waits can overlap setup, the first
+            # acc-pipeline wait, and the other epi warps' TMEM
+            # load/conversion work on later subtile iterations. The
+            # diagnostic tcgen05_c_acquire_placement=first_in_loop moves only
+            # that first acquire into the subtile loop; later acquires and
+            # the accumulator wait keep their default order. The diagnostic
+            # later_before_barrier placement keeps the first acquire in
+            # production position and moves only later-subtile acquires just
+            # before the first epilogue barrier. The diagnostic
+            # tcgen05_acc_wait_placement=before_subtile_loop keeps both C
+            # acquire sites in production position and moves only the
+            # accumulator consumer wait before the subtile loop.
+            # A CTA-scoped named barrier ensures all epi warps have observed
+            # warp 0's acquire before they write SMEM; a second barrier ensures
+            # the SMEM writes and Quack-style async-shared fence are visible
+            # before warp 0 issues and commits the TMA operation.
+            # Compute the SMEM ring index after the first barrier so the
+            # acquire/barrier/index order stays aligned with Quack's
+            # TMA-store epilogue.
+            # The accumulator consumer state advances after the loop, matching
+            # Quack's call-site ordering while preserving the early release.
+            # After warp 0 commits the TMA store, the next subtile's
+            # producer_acquire plus the first named barrier are enough to
+            # keep all epi warps from writing a reused SMEM stage too early.
+            # Avoiding a post-commit barrier matches Quack's epilogue loop.
+            # The split_first_t2r diagnostic emits the first static subtile as
+            # a standalone source block, then loops over later subtile work.
+            # It is a layout discriminator for the hot acc-wait/T2R SASS row;
+            # the default production source shape remains the single loop.
+            tma_store_subtile_loop
+            # Advance is a per-thread local state update, so it intentionally
+            # stays outside elect_one; only the mbarrier release is elected.
+            + f"if {tcgen05_value.epi_active}:\n"
+            + emit_pipeline_advance(tcgen05_value.acc_consumer_state, indent="    ")
+        ),
+        *([] if tcgen05_value.use_role_local_epi else [tma_store_pipeline_tail]),
+    ]
+    store_body_core = (
+        suppressed_store_body_core
+        if diagnose_skip_epilogue_store
+        else (
+            tma_store_body_core
+            if tcgen05_value.use_tma_store_epilogue
+            else simt_store_body_core
+        )
+    )
+    main_stmts: list[ast.AST]
+    if tcgen05_value.use_role_local_epi:
+        # These setup statements intentionally remain virtual-pid-independent.
+        # The persistent splitter hoists them before the role-local scheduler
+        # loops; if future setup reads per-tile state, it must be registered
+        # as per-tile work instead.
+        tma_store_hoisted_stmts = (
+            [
+                statement_from_string(line)
+                for line in [
+                    *tma_store_pipeline_setup,
+                    *tma_store_role_invariant_setup,
+                ]
+            ]
+            if tcgen05_value.use_tma_store_epilogue and not diagnose_skip_epilogue_store
+            else []
+        )
+        sync_before_stmt = statement_from_string("cute.arch.sync_threads()")
+        main_stmt = statement_from_string(
+            "if True:\n" + textwrap.indent("\n".join(store_body_core), "    ")
+        )
+        sync_after_stmt = statement_from_string("cute.arch.sync_threads()")
+        df.register_cute_tcgen05_per_tile_stmts(
+            [sync_before_stmt, main_stmt, sync_after_stmt]
+        )
+        df.register_cute_tcgen05_epi_role_stmts([main_stmt])
+        main_stmts = [
+            *tma_store_hoisted_stmts,
+            sync_before_stmt,
+            main_stmt,
+            sync_after_stmt,
+        ]
+    else:
+        store_body = [
+            "cute.arch.sync_threads()",
+            *store_body_core,
+            "cute.arch.sync_threads()",
+        ]
+        main_stmt = statement_from_string(
+            "if True:\n" + textwrap.indent("\n".join(store_body), "    ")
+        )
+        main_stmts = [main_stmt]
+    # Pipeline drain + TMEM dealloc are one-shot cleanup. They must run
+    # AFTER all tiles have been processed (in the persistent path) and
+    # naturally land at the end of the kernel in the non-persistent path.
+    # Keep them as separate statements so the persistent splitter can
+    # extract them via the post-loop registration below.
+    post_loop_lines: list[str] = []
+    if (
+        tcgen05_value.use_tma_store_epilogue
+        and tcgen05_value.use_role_local_epi
+        and not diagnose_skip_epilogue_store
+    ):
+        # Role-local persistent epilogues reuse the C-store pipeline across
+        # scheduler-recycled work tiles. Draining it inside each tile would
+        # serialize the next tile's epilogue against this tile's TMA stores.
+        # The tail must run before TMEM dealloc setup below.
+        post_loop_lines.append(tma_store_pipeline_tail)
+    if tcgen05_value.use_tma:
+        post_loop_lines.append(
+            f"if {tcgen05_value.tma_warp}:\n"
+            + emit_producer_tail_tma_umma(
+                tcgen05_value.tma_pipeline,
+                tcgen05_value.tma_producer_state,
+                num_stages=tcgen05_value.ab_stage_count,
+                indent="    ",
+                skip_advances=tcgen05_value.skip_ab_producer_advance,
+            )
+        )
+    if tcgen05_value.is_two_cta:
+        # PDL parity with Quack/CUTLASS: after all MMAs are issued, hint
+        # dependent kernels before this role starts the final acc drain.
+        post_loop_lines.append(
+            f"if {tcgen05_value.exec_active}:\n"
+            "    cute.arch.griddepcontrol_launch_dependents()"
+        )
+    post_loop_lines.extend(
+        [
+            (
+                f"if {tcgen05_value.exec_active}:\n"
+                f"    {tcgen05_value.tmem_alloc_barrier}.arrive()"
+            ),
+            (
+                f"if {tcgen05_value.exec_active}:\n"
+                + emit_producer_tail_umma_async(
+                    tcgen05_value.acc_pipeline,
+                    tcgen05_value.acc_producer_state,
+                    num_stages=tcgen05_value.acc_stage_count,
+                    indent="    ",
+                )
+            ),
+            (
+                f"{tcgen05_value.tmem_allocator} = cutlass.utils.TmemAllocator("
+                f"{tcgen05_value.tmem_holding_buf}, "
+                f"barrier_for_retrieve={tcgen05_value.tmem_alloc_barrier}, "
+                f"allocator_warp_id=0, is_two_cta={tcgen05_value.is_two_cta!s}, "
+                f"two_cta_tmem_dealloc_mbar_ptr={tcgen05_value.tmem_dealloc_mbar_ptr}, "
+                f"num_allocated_columns={tcgen05_value.acc_tmem_cols}"
+                f"{emit_dealloc_mbarrier_initialized_kwarg()})"
+            ),
+        ]
+    )
+    if not tcgen05_value.is_two_cta:
+        # Keep the long-validated cluster_m=1 teardown unchanged. The guarded
+        # CtaGroup.TWO path follows Quack's dealloc sequence without this CTA
+        # sync: epi warps synchronize through tmem_alloc_barrier before free.
+        post_loop_lines.append("cute.arch.sync_threads()")
+    post_loop_lines.extend(
+        [
+            (
+                f"if {tcgen05_value.epi_active}:\n"
+                f"    {tcgen05_value.tmem_allocator}.relinquish_alloc_permit()"
+            ),
+            (
+                f"if {tcgen05_value.epi_active}:\n"
+                f"    {tcgen05_value.tmem_alloc_barrier}.arrive_and_wait()"
+            ),
+            (
+                f"if {tcgen05_value.epi_active}:\n"
+                f"    {tcgen05_value.tmem_allocator}.free({tcgen05_value.epi_acc_tmem_ptr})"
+            ),
+        ]
+    )
+    post_loop_stmts: list[ast.AST] = [
+        statement_from_string(line) for line in post_loop_lines
+    ]
+    df.register_cute_tcgen05_post_loop_stmts(post_loop_stmts)
+    return [*main_stmts, *post_loop_stmts]
+
+
+def _codegen_cute_store_loaded_index_trailing_slices(
+    state: CodegenState,
+    tensor: torch.Tensor,
+    subscript: list[object] | tuple[object, ...],
+    ast_subscript: list[object] | tuple[object, ...],
+    extra_mask: ast.AST | None,
+    value_node: torch.fx.Node,
+) -> ast.AST | None:
+    from .._compiler.ast_extension import create
+
+    if value_node.target is not load or len(value_node.args) < 2:
+        return None
+    source_tensor_node = value_node.args[0]
+    if not isinstance(source_tensor_node, torch.fx.Node):
+        return None
+    source_tensor = source_tensor_node.meta.get("val")
+    if not isinstance(source_tensor, torch.Tensor):
+        return None
+    source_subscript = value_node.args[1]
+    if not isinstance(source_subscript, (list, tuple)) or not source_subscript:
+        return None
+    indexer = source_subscript[0]
+    if not isinstance(indexer, torch.fx.Node):
+        return None
+    indexer_value = indexer.meta.get("val")
+    if not isinstance(indexer_value, torch.Tensor) or indexer_value.ndim == 0:
+        return None
+    trailing_source = [*source_subscript[1:]]
+    if not trailing_source or not all(idx == slice(None) for idx in trailing_source):
+        return None
+    if len(subscript) != indexer_value.ndim + len(trailing_source):
+        return None
+    trailing_store = subscript[indexer_value.ndim :]
+    if not all(idx == slice(None) for idx in trailing_store):
+        return None
+
+    ast_source_subscript = list(
+        map_arg(tuple(source_subscript), lambda arg: state.env[arg])
+    )
+    index_exprs = _cute_index_exprs(
+        state,
+        [indexer_value],
+        [ast_source_subscript[0]],
+        tensor=source_tensor,
+        inactive_singleton_slice_expr="0",
+    )
+    if len(index_exprs) != 1:
+        return None
+
+    prefix_subscript = [*subscript[: indexer_value.ndim]]
+    prefix_ast_subscript = [*ast_subscript[: indexer_value.ndim]]
+    target_prefix = _cute_index_exprs(
+        state,
+        prefix_subscript,
+        prefix_ast_subscript,
+        tensor=tensor,
+        inactive_singleton_slice_expr="0",
+    )
+    if len(target_prefix) != indexer_value.ndim:
+        return None
+
+    env = CompileEnvironment.current()
+    index_dtype = env.backend.dtype_str(env.index_dtype)
+    source_loop_vars = [
+        state.device_function.new_var("slice_idx", dce=True) for _ in trailing_source
+    ]
+    source_indices = [
+        index_exprs[0],
+        *[f"{index_dtype}({var})" for var in source_loop_vars],
+    ]
+    target_indices = [
+        *target_prefix,
+        *[f"{index_dtype}({var})" for var in source_loop_vars],
+    ]
+    if len(source_indices) != source_tensor.ndim or len(target_indices) != tensor.ndim:
+        return None
+
+    source_name = state.device_function.tensor_arg(source_tensor).name
+    target_name = state.device_function.tensor_arg(tensor).name
+    source_dtype = env.backend.dtype_str(source_tensor.dtype)
+    target_dtype = env.backend.dtype_str(tensor.dtype)
+    source_mask = _cute_combined_mask(
+        state,
+        [indexer_value],
+        None,
+        tensor=source_tensor,
+    )
+    target_mask = _cute_combined_mask(
+        state,
+        prefix_subscript,
+        extra_mask,
+        tensor=tensor,
+    )
+    masks = [mask for mask in (source_mask, target_mask) if mask is not None]
+    mask_expr = " and ".join(f"({mask})" for mask in masks) if masks else None
+    load_expr = f"{source_name}[{', '.join(source_indices)}]"
+    if mask_expr is not None:
+        load_expr = f"({load_expr} if {mask_expr} else {source_dtype}(0))"
+    store_expr = (
+        f"{target_name}.__setitem__({_cute_index_tuple(target_indices)}, "
+        f"{env.backend.ast_to_dtype_expr(load_expr, target_dtype)})"
+    )
+    if mask_expr is not None:
+        store_expr = f"{store_expr} if {mask_expr} else None"
+
+    tensor_dim = 0
+    for idx in prefix_subscript:
+        block_id = None
+        if isinstance(idx, torch.SymInt):
+            block_id = env.get_block_id(idx)
+        elif idx == slice(None) and tensor_dim < tensor.ndim:
+            block_id = next(
+                (
+                    candidate
+                    for candidate in _matching_block_ids(env, tensor.shape[tensor_dim])
+                    if candidate in state.codegen.active_device_loops
+                ),
+                None,
+            )
+        tensor_dim += 1
+        if block_id is None:
+            continue
+        axis = None
+        grid_state = state.codegen.current_grid_state
+        if grid_state is not None:
+            axis = grid_state.block_thread_axes.get(block_id)
+        if axis is None:
+            loops = state.codegen.active_device_loops.get(block_id)
+            if loops:
+                axis = loops[-1].block_thread_axes.get(block_id)
+        if axis is None or not (0 <= axis < 3):
+            continue
+        block_size = env.block_sizes[block_id].from_config(state.config)
+        if not isinstance(block_size, int):
+            continue
+        state.codegen.max_thread_block_dims[axis] = max(
+            state.codegen.max_thread_block_dims[axis],
+            block_size,
+        )
+        state.codegen.referenced_thread_block_dims[axis] = max(
+            state.codegen.referenced_thread_block_dims[axis],
+            block_size,
+        )
+
+    stmt: ast.stmt = create(ast.Expr, value=expr_from_string(store_expr))
+    for loop_var, source_pos in reversed(
+        [*zip(source_loop_vars, range(1, len(source_subscript)), strict=True)]
+    ):
+        extent = _cute_tensor_dim_size_expr(state, source_tensor, source_pos)
+        stmt = create(
+            ast.For,
+            target=create(ast.Name, id=loop_var, ctx=ast.Store()),
+            iter=expr_from_string(f"range({extent})"),
+            body=[stmt],
+            orelse=[],
+            type_comment=None,
+        )
+    state.add_statement(stmt)
+    return ast.Constant(value=None)
 
 
 def _codegen_cute_store_permute_lane_loops(
@@ -912,6 +3750,88 @@ def _codegen_cute_store_permute_lane_loops(
     )
 
 
+@_decorators.codegen(store, "metal")
+def _(state: CodegenState) -> ast.AST:
+    # Metal delegates to the same PointerIndexingStrategy as Triton.
+    # This produces tl.store(ptr + offset, val, mask) in the AST;
+    # the MSL walker translates it to Metal.
+    tensor = state.proxy_arg(0)
+    subscript = state.proxy_arg(1)
+    assert isinstance(subscript, (list, tuple))
+    value = state.ast_arg(2)
+    extra_mask = state.ast_args[3]
+    assert isinstance(extra_mask, (type(None), ast.AST))
+
+    if isinstance(tensor, torch.Tensor):
+        device_fn = state.device_function
+        device_fn.device_store_index += 1
+        indexing_idx = device_fn.device_memory_op_index
+        device_fn.device_memory_op_index += 1
+        strategy = device_fn.get_indexing_strategy(indexing_idx)
+        return strategy.codegen_store(state, tensor, [*subscript], value, extra_mask)
+    raise exc.BackendUnsupported("metal", f"store target type: {type(tensor)}")
+
+
+def _try_splice_tcgen05_unary_epilogue(
+    state: CodegenState,
+    tensor: object,
+    subscript: list[object] | tuple[object, ...],
+    ast_subscript: list[object] | tuple[object, ...],
+    extra_mask: ast.AST | None,
+    value_node: torch.fx.Node | None,
+) -> ast.AST | None:
+    """Splice attempt for ``out[tile] = chain(acc).to(x.dtype)``.
+
+    Returns the splice-completion sentinel (``ast.Constant(value=None)``)
+    on a successful splice (the caller should return it directly), and
+    ``None`` if the splice did not fire — the caller should continue to
+    the loud-failure backstop or the SIMT fallback.
+
+    Splice is attempted only when the kernel has a tcgen05-registered
+    matmul fx_node (``cute_tcgen05_matmul_fx_nodes`` non-empty), the
+    store value has a backing FX node, the store target is a 2-D
+    ``torch.Tensor``, and the chain analyzer accepts the value chain
+    (returning ``(chain, anchor)`` for a non-empty chain rooted at
+    a tcgen05 matmul). Chains the whitelist rejects (broadcast aux
+    loads, reductions, kwarg-bearing binaries, etc.) leave the
+    analyzer returning ``None`` and the splice does not fire — the
+    loud-failure backstop then catches them.
+    """
+    if not state.device_function.cute_tcgen05_matmul_fx_nodes:
+        return None
+    if value_node is None:
+        return None
+    if not isinstance(tensor, torch.Tensor):
+        return None
+    analyzed = analyze_tcgen05_unary_epilogue_chain(
+        state, value_node, output_global_shape=tuple(tensor.shape)
+    )
+    if analyzed is None:
+        return None
+    chain, anchor = analyzed
+    assert chain.steps
+    anchor_result_var = (
+        state.device_function.cute_tcgen05_matmul_fx_node_result_vars.get(anchor)
+    )
+    if anchor_result_var is None:
+        return None
+    rewritten_stmt = _codegen_cute_store_tcgen05_tile(
+        state,
+        tensor,
+        subscript,
+        ast_subscript,
+        extra_mask,
+        anchor_result_var,
+        epilogue_chain=chain,
+    )
+    if rewritten_stmt is None:
+        return None
+    stmts = rewritten_stmt if isinstance(rewritten_stmt, list) else [rewritten_stmt]
+    for stmt in stmts:
+        state.add_statement(stmt)
+    return ast.Constant(value=None)
+
+
 @_decorators.codegen(store, "cute")
 def _(state: CodegenState) -> ast.AST:
     tensor = state.proxy_arg(0)
@@ -919,14 +3839,66 @@ def _(state: CodegenState) -> ast.AST:
     assert isinstance(subscript, (list, tuple))
     ast_subscript = state.ast_args[1]
     assert isinstance(ast_subscript, (list, tuple))
-    value = state.ast_arg(2)
+    raw_value = state.ast_args[2]
     extra_mask = state.ast_args[3]
     assert isinstance(extra_mask, (type(None), ast.AST))
-
+    value_node = None
     if state.fx_node is not None and len(state.fx_node.args) > 2:
-        value_node = state.fx_node.args[2]
-        if isinstance(value_node, torch.fx.Node) and value_node.op == "call_function":
+        maybe_value_node = state.fx_node.args[2]
+        if isinstance(maybe_value_node, torch.fx.Node):
+            value_node = maybe_value_node
+
+    if isinstance(tensor, torch.Tensor):
+        affine_range_store = _codegen_cute_affine_range_store(
+            state,
+            tensor,
+            subscript,
+            ast_subscript,
+            raw_value,
+            extra_mask,
+            value_node,
+        )
+        if affine_range_store is not None:
+            state.add_statement(affine_range_store)
+            return ast.Constant(value=None)
+        strided_slice_store = _codegen_cute_strided_slice_store(
+            state,
+            tensor,
+            subscript,
+            raw_value,
+            extra_mask,
+            value_node,
+        )
+        if strided_slice_store is not None:
+            state.add_statement(strided_slice_store)
+            return ast.Constant(value=None)
+
+    value = state.ast_arg(2)
+
+    if value_node is not None:
+        if value_node.op == "call_function":
             if isinstance(tensor, torch.Tensor):
+                rewritten_stmt = _codegen_cute_store_stack_load(
+                    state,
+                    tensor,
+                    subscript,
+                    ast_subscript,
+                    value,
+                    extra_mask,
+                    value_node,
+                )
+                if rewritten_stmt is not None:
+                    return rewritten_stmt
+                rewritten_stmt = _codegen_cute_store_loaded_index_trailing_slices(
+                    state,
+                    tensor,
+                    subscript,
+                    ast_subscript,
+                    extra_mask,
+                    value_node,
+                )
+                if rewritten_stmt is not None:
+                    return rewritten_stmt
                 rewritten_stmt = _codegen_cute_store_permute_lane_loops(
                     state,
                     tensor,
@@ -945,13 +3917,138 @@ def _(state: CodegenState) -> ast.AST:
                 value = rewritten
 
     if isinstance(tensor, tuple):
-        raise exc.BackendUnsupported("cute", "stack tensor store")
+        stack_tensor_ast = state.ast_args[0]
+        assert isinstance(stack_tensor_ast, tuple)
+        assert len(stack_tensor_ast) == 2
+        _tensor_like_ast, dev_ptrs_ast = stack_tensor_ast
+        assert isinstance(dev_ptrs_ast, ast.AST)
+        tensor_like, dev_ptrs = tensor
+        offset_expr = _cute_stack_tensor_offset_expr(
+            state,
+            tensor_like,
+            [*subscript],
+            ast_subscript,
+        )
+        backend = CompileEnvironment.current().backend
+        target_dtype = backend.dtype_str(tensor_like.dtype)
+        value = expr_from_string(
+            backend.ast_to_dtype_expr("{value}", target_dtype),
+            value=value,
+        )
+        ptr_expr = _cute_stack_tensor_pointer_expr(
+            target_dtype, dev_ptrs_ast, offset_expr
+        )
+        store_expr = expr_from_string(
+            "({ptr}).store({value})", ptr=ptr_expr, value=value
+        )
+        mask_expr = _cute_stack_tensor_mask_expr(
+            state,
+            tensor_like,
+            dev_ptrs,
+            [*subscript],
+            extra_mask,
+        )
+        if mask_expr is None:
+            return store_expr
+        mask_ast = expr_from_string(mask_expr)
+        assert isinstance(mask_ast, ast.expr)
+        assert isinstance(store_expr, ast.expr)
+        state.add_statement(
+            ast.fix_missing_locations(
+                ast.If(
+                    test=mask_ast,
+                    body=[ast.Expr(value=store_expr)],
+                    orelse=[],
+                )
+            )
+        )
+        return ast.Constant(value=None)
     if not isinstance(tensor, torch.Tensor):
         raise exc.BackendUnsupported("cute", f"store target type: {type(tensor)}")
 
     _log_cute_layout(state, "store")
 
+    if isinstance(value, ast.Name):
+        rewritten_stmt = _codegen_cute_store_tcgen05_tile(
+            state,
+            tensor,
+            subscript,
+            ast_subscript,
+            extra_mask,
+            value.id,
+        )
+        if rewritten_stmt is not None:
+            stmts = (
+                rewritten_stmt if isinstance(rewritten_stmt, list) else [rewritten_stmt]
+            )
+            for stmt in stmts:
+                state.add_statement(stmt)
+            return ast.Constant(value=None)
+
+    # Try to splice a whitelisted chain epilogue
+    # (`out[tile] = chain(acc).to(x.dtype)`) into the role-local
+    # tcgen05 epilogue's per-thread T2R loop. Implementation in
+    # ``_try_splice_tcgen05_unary_epilogue``. Chains the whitelist
+    # rejects (broadcast aux loads, reductions, etc.) leave the
+    # splice off and fall through to the loud-failure backstop
+    # below.
+    spliced = _try_splice_tcgen05_unary_epilogue(
+        state, tensor, subscript, ast_subscript, extra_mask, value_node
+    )
+    if spliced is not None:
+        return spliced
+
+    # Loud-failure backstop for fused-epilogue stores that follow a
+    # tcgen05 matmul. The tcgen05 grid-emission path (in `program_id.py`)
+    # does not bind the per-block-id `indices_<n>` / `mask_<n>` variable
+    # names that the SIMT-fallback store path expects, so falling through
+    # here would emit a kernel that crashes inside the cute DSL with
+    # `name 'mask_0' is not defined`. Detect the pattern here — any
+    # store value whose FX user chain transitively reaches a
+    # tcgen05-registered matmul fx node — and raise a structured error
+    # so the caller sees the actionable message instead of a cute-DSL
+    # crash. Fixing this requires either (a) extending the tcgen05 grid
+    # to emit per-block-id index/mask vars, or (b) per-subtile lambda
+    # emission in `_codegen_cute_store_tcgen05_tile`.
+    if (
+        state.device_function.cute_tcgen05_matmul_fx_nodes
+        and value_node is not None
+        and reach_tcgen05_matmul_anchors(state, value_node)
+    ):
+        raise exc.BackendUnsupported(
+            "cute",
+            "tcgen05 MMA path does not yet emit per-block-id indices "
+            "and masks for non-whitelisted fused epilogues that follow "
+            "the MMA. The store target's value chain depends on a "
+            "tcgen05 matmul result through ops the chain analyzer "
+            "rejects (e.g. aux tensors with a 3-D underlying shape "
+            "and a static collapse like `aux3d[tile_m, tile_n, 0]`, "
+            "loads whose index expression is not exactly the "
+            "carrier tile-id symbol, non-scalar binary ops, "
+            "`aten.add.Tensor` with `alpha=k`, or an intermediate "
+            "`.to(d_inter)` cast where `d_inter` differs from the "
+            "store-target dtype). Identity stores "
+            "(`out[tile] = acc.to(x.dtype)`), whitelisted unary chains "
+            "(relu/tanh/exp/log/sqrt/abs/neg + scalar add/sub/mul/div "
+            "on the accumulator carrier), exact-shape 2-D "
+            "auxiliary-tensor binary ops (`acc + residual[tile_m, "
+            "tile_n]`), and rank-1 trailing-axis (rowvec) broadcast "
+            "aux loads (`acc + bias[tile_n]`) all work via the "
+            "fused-epilogue splice path. The leading-axis rank-1 "
+            "form (`acc + bias[tile_m]`) is rejected because a bare "
+            "rank-1 RHS aligns to the trailing axis under PyTorch "
+            "broadcasting; an explicit colvec broadcast must be "
+            "written with `bias[tile_m][:, None]` / "
+            "`.unsqueeze(-1)`.",
+        )
+
     tensor_name = state.device_function.tensor_arg(tensor).name
+    backend = CompileEnvironment.current().backend
+    target_dtype = backend.dtype_str(tensor.dtype)
+    value = expr_from_string(
+        backend.ast_to_dtype_expr("{value}", target_dtype),
+        value=value,
+    )
     index_exprs = _cute_index_exprs(
         state,
         subscript,
@@ -959,16 +4056,46 @@ def _(state: CodegenState) -> ast.AST:
         tensor=tensor,
         inactive_singleton_slice_expr="0",
     )
-    index_tuple = _cute_index_tuple(index_exprs)
-    assign_expr = expr_from_string(
-        f"{tensor_name}.__setitem__({index_tuple}, {{value}})", value=value
-    )
+    topk_lane_expr: object | None = None
+    topk_k: object | None = None
+    if state.fx_node is not None and len(state.fx_node.args) > 2:
+        value_node = state.fx_node.args[2]
+        if (
+            isinstance(value_node, torch.fx.Node)
+            and value_node.target is operator.getitem
+            and isinstance(value_node.args[0], torch.fx.Node)
+            and value_node.args[0].target is torch.ops.aten.topk.default
+        ):
+            topk_lane_expr = value_node.args[0].meta.get("cute_topk_lane_expr")
+            topk_k = value_node.args[0].meta.get("cute_topk_k")
+    if isinstance(topk_lane_expr, str) and isinstance(topk_k, int):
+        index_exprs[-1] = topk_lane_expr
+    store_uses_pointer = "None" not in index_exprs
+    store_expr = _cute_scalar_store_expr(tensor_name, index_exprs, "{value}")
+    assign_expr = expr_from_string(store_expr, value=value)
 
     mask_expr = _cute_combined_mask(state, subscript, extra_mask, tensor=tensor)
+    if isinstance(topk_lane_expr, str) and isinstance(topk_k, int):
+        topk_mask = f"({topk_lane_expr}) < {topk_k}"
+        mask_expr = topk_mask if mask_expr is None else f"({mask_expr}) and {topk_mask}"
     if mask_expr is None:
         return assign_expr
+    if store_uses_pointer:
+        mask_ast = expr_from_string(mask_expr)
+        assert isinstance(mask_ast, ast.expr)
+        assert isinstance(assign_expr, ast.expr)
+        state.add_statement(
+            ast.fix_missing_locations(
+                ast.If(
+                    test=mask_ast,
+                    body=[ast.Expr(value=assign_expr)],
+                    orelse=[],
+                )
+            )
+        )
+        return ast.Constant(value=None)
     return expr_from_string(
-        f"({tensor_name}.__setitem__({index_tuple}, {{value}}) if {mask_expr} else None)",
+        f"({store_expr} if {mask_expr} else None)",
         value=value,
     )
 
@@ -1110,6 +4237,7 @@ def _(
     if isinstance(tensor, torch.Tensor):
         target_shape = SubscriptIndexing.compute_shape(tensor, index)
         env = CompileEnvironment.current()
+        env.backend.process_fake_tensor_load(tensor, index)
         return env.new_index_result(tensor, target_shape)
     if isinstance(tensor, tuple):
         tensor_like, dev_ptrs = tensor
@@ -1215,19 +4343,34 @@ def _(state: CodegenState) -> ast.AST:
     subscript = state.proxy_arg(1)
     assert isinstance(tensor, torch.Tensor)
     assert isinstance(subscript, (list, tuple))
-    name = state.device_function.tensor_arg(tensor).name
-    name = _pallas_vmem_name(state, name)
-    # Increment memory op index to stay in sync with triton backend
-    device_fn = state.device_function
-    device_fn.device_load_index += 1
-    device_fn.device_memory_op_index += 1
-    index_str, none_dims = _pallas_index_str(state, subscript, tensor)
-    result = expr_from_string(f"{name}[{index_str}]")
-    for dim in none_dims:
-        result = expr_from_string(
-            f"jnp.expand_dims({{result}}, axis={dim})", result=result
+    return pallas_codegen.load_expr(state, list(subscript), tensor)
+
+
+@_decorators.codegen(load, "metal")
+def _(state: CodegenState) -> ast.AST:
+    # Metal delegates to the same PointerIndexingStrategy as Triton.
+    # This produces tl.load(ptr + offset, mask, other=0) in the AST;
+    # the MSL walker translates it to Metal.
+    tensor = state.proxy_arg(0)
+    subscript = state.proxy_arg(1)
+    assert isinstance(subscript, (list, tuple))
+    ast_subscript = state.ast_args[1]
+    assert isinstance(ast_subscript, (list, tuple))
+    extra_mask = state.ast_args[2]
+    assert isinstance(extra_mask, (type(None), ast.AST))
+    eviction_policy = state.ast_args[3] if len(state.ast_args) > 3 else None
+    assert isinstance(eviction_policy, (type(None), ast.AST))
+
+    if isinstance(tensor, torch.Tensor):
+        device_fn = state.device_function
+        device_fn.device_load_index += 1
+        indexing_idx = device_fn.device_memory_op_index
+        device_fn.device_memory_op_index += 1
+        strategy = device_fn.get_indexing_strategy(indexing_idx)
+        return strategy.codegen_load(
+            state, tensor, [*subscript], extra_mask, eviction_policy
         )
-    return result
+    raise exc.BackendUnsupported("metal", f"load tensor type: {type(tensor)}")
 
 
 @_decorators.codegen(load, "cute")
@@ -1241,11 +4384,75 @@ def _(state: CodegenState) -> object:
     assert isinstance(extra_mask, (type(None), ast.AST))
 
     if isinstance(tensor, tuple):
-        raise exc.BackendUnsupported("cute", "stack tensor load")
+        stack_tensor_ast = state.ast_args[0]
+        assert isinstance(stack_tensor_ast, tuple)
+        assert len(stack_tensor_ast) == 2
+        tensor_like_ast, dev_ptrs_ast = stack_tensor_ast
+        assert isinstance(dev_ptrs_ast, ast.AST)
+        tensor_like, dev_ptrs = tensor
+        offset_expr = _cute_stack_tensor_offset_expr(
+            state,
+            tensor_like,
+            [*subscript],
+            ast_subscript,
+        )
+        backend = CompileEnvironment.current().backend
+        target_dtype = backend.dtype_str(tensor_like.dtype)
+        ptr_expr = _cute_stack_tensor_pointer_expr(
+            target_dtype, dev_ptrs_ast, offset_expr
+        )
+        load_expr = f"({ast.unparse(ptr_expr)}).load()"
+        mask_expr = _cute_stack_tensor_mask_expr(
+            state,
+            tensor_like,
+            dev_ptrs,
+            [*subscript],
+            extra_mask,
+        )
+        if tensor_like.dtype is torch.bool:
+            load_expr = f"({load_expr} != cutlass.Uint8(0))"
+            if mask_expr is None:
+                return expr_from_string(load_expr)
+            return expr_from_string(
+                f"({load_expr} if {mask_expr} else cutlass.Boolean(0))"
+            )
+        if mask_expr is None:
+            return expr_from_string(load_expr)
+        return expr_from_string(f"({load_expr} if {mask_expr} else {target_dtype}(0))")
     if not isinstance(tensor, torch.Tensor):
         raise exc.BackendUnsupported("cute", f"load tensor type: {type(tensor)}")
 
     _log_cute_layout(state, "load")
+
+    from ..language import tile_index
+
+    tensor_node = state.fx_node.args[0] if state.fx_node is not None else None
+    if (
+        isinstance(tensor_node, torch.fx.Node)
+        and tensor_node.op == "call_function"
+        and tensor_node.target == tile_index
+    ):
+        env = CompileEnvironment.current()
+        block_id = env.get_block_id(tensor.size(0))
+        if block_id is None:
+            raise exc.BackendUnsupported("cute", "tile_index load block id")
+        index_var = _cute_active_index_var(state, block_id)
+        if index_var is None:
+            raise exc.BackendUnsupported("cute", "inactive tile_index load")
+        for idx in subscript:
+            if idx is None or idx == slice(None):
+                continue
+            raise exc.BackendUnsupported(
+                "cute", f"tile_index load index type: {type(idx)}"
+            )
+        return expr_from_string(index_var)
+
+    if state.device_function.suppress_cute_root_lane_loops or (
+        state.fx_node is not None
+        and state.device_function.is_cute_collective_handled_load(state.fx_node.name)
+    ):
+        zero = CompileEnvironment.current().backend.dtype_str(tensor.dtype)
+        return expr_from_string(f"{zero}(0)")
 
     packed_affine_lhs = _maybe_codegen_cute_packed_affine_lhs_load(
         state, tensor, subscript, extra_mask
@@ -1259,6 +4466,13 @@ def _(state: CodegenState) -> object:
     if packed_rhs_load is not None:
         return packed_rhs_load
 
+    if _is_cute_affine_range_load_for_store(state, subscript, ast_subscript):
+        zero = CompileEnvironment.current().backend.dtype_str(tensor.dtype)
+        return expr_from_string(f"{zero}(0)")
+    if _is_cute_strided_slice_load_for_store(state, tensor, subscript):
+        zero = CompileEnvironment.current().backend.dtype_str(tensor.dtype)
+        return expr_from_string(f"{zero}(0)")
+
     tensor_name = state.device_function.tensor_arg(tensor).name
     index_exprs = _cute_index_exprs(
         state,
@@ -1268,8 +4482,51 @@ def _(state: CodegenState) -> object:
         inactive_slice_expr="None",
         inactive_singleton_slice_expr="0",
     )
-    load_expr = f"{tensor_name}[{', '.join(index_exprs)}]"
-    mask_expr = _cute_combined_mask(state, subscript, extra_mask, tensor=tensor)
+    load_expr = _cute_scalar_load_expr(tensor_name, index_exprs)
+    mask_expr = _cute_combined_mask(
+        state,
+        subscript,
+        extra_mask,
+        tensor=tensor,
+        include_tensor_index_masks=False,
+    )
+    if tensor.dtype is torch.bool:
+        load_expr = f"({load_expr} != cutlass.Uint8(0))"
+        if mask_expr is None:
+            return expr_from_string(load_expr)
+        return expr_from_string(f"({load_expr} if {mask_expr} else cutlass.Boolean(0))")
+    if state.fx_node is not None and any(
+        user.target in (torch.ops.aten.sort.default, torch.ops.aten.topk.default)
+        or getattr(user.target, "__name__", None) == "_associative_scan"
+        for user in state.fx_node.users
+    ):
+        from .._compiler.cute.indexing import CuteSortableLoad
+
+        tensor_dim = 0
+        sort_index_pos = -1
+        for idx in subscript:
+            if idx is None:
+                continue
+            if tensor_dim == tensor.ndim - 1:
+                sort_index_pos = tensor_dim
+                break
+            tensor_dim += 1
+        if sort_index_pos < 0:
+            raise exc.BackendUnsupported("cute", "sort/topk input rank")
+        sortable_load = CuteSortableLoad(
+            expr=expr_from_string(
+                load_expr
+                if mask_expr is None
+                else f"({load_expr} if {mask_expr} else {CompileEnvironment.current().backend.dtype_str(tensor.dtype)}(0))"
+            ),
+            tensor_name=tensor_name,
+            index_exprs=tuple(index_exprs),
+            sort_index_pos=sort_index_pos,
+            mask_expr=mask_expr,
+            dtype=tensor.dtype,
+        )
+        state.fx_node.meta["cute_sortable_load"] = sortable_load
+        return sortable_load.expr
     if mask_expr is None:
         return expr_from_string(load_expr)
     zero = CompileEnvironment.current().backend.dtype_str(tensor.dtype)
@@ -1303,7 +4560,7 @@ def _(
             grids = torch.meshgrid(*(indices[i] for i in tensor_idxs), indexing="ij")
             for i, grid in zip(tensor_idxs, grids, strict=False):
                 indices[i] = grid
-        # pyrefly: ignore [bad-argument-type]
+        # pyrefly: ignore [bad-argument-type, bad-index]
         return tensor[tuple(indices)]
 
     # Create zero result matching mask shape

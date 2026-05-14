@@ -17,13 +17,13 @@ from torch._inductor.codecache import torch_key
 
 from .. import exc
 from .._utils import counters
-from ..runtime.kernel import BoundKernel
 from .base_search import BaseAutotuner
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
     from ..runtime.config import Config
+    from ..runtime.kernel import BoundKernel
     from .base_search import BaseSearch
 
 log: logging.Logger = logging.getLogger(__name__)
@@ -54,9 +54,11 @@ class AutotuneCacheMeta(abc.ABCMeta):
         """
 
         def factory(kernel: BoundKernel, args: Sequence[Any]) -> BaseAutotuner:
-            if not isinstance(kernel, BoundKernel):
+            if not kernel.is_cacheable():
                 raise TypeError(
-                    "Autotune caches require a BoundKernel; external kernels are not cacheable"
+                    f"Autotune caches require a cacheable kernel "
+                    f"(e.g. BoundKernel); got {type(kernel).__name__}. "
+                    f"External kernels are not cacheable."
                 )
             return cls(search_cls(kernel, args))  # type: ignore[misc]
 
@@ -121,6 +123,9 @@ class LooseAutotuneCacheKey(BoundKernelInMemoryCacheKey):
     kernel_source_hash: Hash of source code of input Helion kernel
     hardware: Hardware of the input device
     runtime_name: Version of the cuda/rocm arch
+    backend: Kernel backend (e.g. triton, pallas)
+    config_spec_hash: Hash of the config spec (available knobs and their ranges)
+    extra_cache_key: Optional extra cache key from the kernel (e.g. fusion context hash)
     """
 
     kernel_source_hash: str
@@ -128,6 +133,7 @@ class LooseAutotuneCacheKey(BoundKernelInMemoryCacheKey):
     runtime_name: str
     backend: str
     config_spec_hash: str = ""
+    extra_cache_key: str = ""
 
     def stable_hash(self) -> str:
         return hashlib.sha256(repr(self).encode("utf-8")).hexdigest()
@@ -160,13 +166,14 @@ class AutotuneCacheBase(BaseAutotuner, abc.ABC, metaclass=AutotuneCacheMeta):
 
     def __init__(self, autotuner: BaseSearch) -> None:
         self.autotuner = autotuner
-        if not isinstance(self.autotuner.kernel, BoundKernel):
+        kernel = self.autotuner.kernel
+        if not kernel.is_cacheable():
             raise TypeError(
-                f"Autotune caches require a BoundKernel; got"
-                f" {type(self.autotuner.kernel).__name__}."
-                " External kernels are not cacheable."
+                f"Autotune caches require a cacheable kernel "
+                f"(e.g. BoundKernel); got {type(kernel).__name__}. "
+                f"External kernels are not cacheable."
             )
-        self.kernel: BoundKernel = self.autotuner.kernel
+        self.kernel: BoundKernel = kernel  # type: ignore[assignment]
         self.args = self.autotuner.args
 
     @abc.abstractmethod
@@ -180,6 +187,10 @@ class AutotuneCacheBase(BaseAutotuner, abc.ABC, metaclass=AutotuneCacheMeta):
     def _get_cache_info_message(self) -> str:
         """Return a message describing where the cache is and how to clear it."""
         return ""
+
+    def _should_report_cache_hit(self) -> bool:
+        """Whether cache hits should be printed to stderr/autotune logs."""
+        return True
 
     @abc.abstractmethod
     def _get_cache_key(self) -> CacheKeyBase:
@@ -204,14 +215,17 @@ class AutotuneCacheBase(BaseAutotuner, abc.ABC, metaclass=AutotuneCacheMeta):
             if (config := self.get()) is not None:
                 counters["autotune"]["cache_hit"] += 1
                 log.debug("cache hit: %s", str(config))
-                kernel_decorator = self.kernel.format_kernel_decorator(
-                    config, self.autotuner.settings
-                )
-                print(f"Using cached config:\n\t{kernel_decorator}", file=sys.stderr)
-                cache_info = self._get_cache_info_message()
-                self.autotuner.log(
-                    f"Found cached config for {self.kernel.kernel.name}, skipping autotuning.\n{cache_info}"
-                )
+                if self._should_report_cache_hit():
+                    kernel_decorator = self.kernel.format_kernel_decorator(
+                        config, self.autotuner.settings
+                    )
+                    print(
+                        f"Using cached config:\n\t{kernel_decorator}", file=sys.stderr
+                    )
+                    cache_info = self._get_cache_info_message()
+                    self.autotuner.log(
+                        f"Found cached config for {self.kernel.kernel.name}, skipping autotuning.\n{cache_info}"
+                    )
                 return config
 
         counters["autotune"]["cache_miss"] += 1

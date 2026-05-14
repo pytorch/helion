@@ -58,6 +58,14 @@ class ConstExpr(NamedTuple):
         return bool(self.value)
 
 
+class ProcessGroupName(ConstExpr):
+    """
+    Used in type annotation to specify the argument as process group name.
+    Autotuning for distributed kernels will use this process group name
+    to run collectives to sync across ranks.
+    """
+
+
 @_decorators.api(is_device_only=False)
 def specialize(value: _T) -> _T:
     """

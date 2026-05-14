@@ -7,18 +7,19 @@ import torch
 
 from .._compat import shape_env_size_hint
 from .compile_environment import CompileEnvironment
+from .cute.layout import CuTeGridExecutionPlan
 from .device_function import DeviceFunction
 from .device_ir import ForLoopGraphInfo
 from .device_ir import ReductionLoopGraphInfo
+from .device_ir import RootGraphInfo
 from .host_function import HostFunction
-from .reduction_strategy import LoopedReductionStrategy
-from .reduction_strategy import PersistentReductionStrategy
 from .reduction_strategy import ReductionStrategy
 from .tile_strategy import CompactedShape
 from .tile_strategy import DeviceLoopState
 from .tile_strategy import TileStrategy
 
 if TYPE_CHECKING:
+    from collections.abc import ItemsView
     from collections.abc import Sequence
 
     from .. import Config
@@ -26,6 +27,38 @@ if TYPE_CHECKING:
 
     SymIntLike = torch.SymInt | int
     ShapeLike = Sequence[SymIntLike]
+
+
+class BlockIDStrategyMapping:
+    def __init__(self) -> None:
+        self._block_id_to_strategy: dict[tuple[int, ...], TileStrategy] = {}
+        self._block_id_to_any_strategy: dict[int, TileStrategy] = {}
+
+    def __setitem__(self, block_ids: tuple[int, ...], strategy: TileStrategy) -> None:
+        self._block_id_to_strategy[block_ids] = strategy
+        for block_id in block_ids:
+            self._block_id_to_any_strategy.setdefault(block_id, strategy)
+
+    def __getitem__(self, block_ids: tuple[int, ...]) -> TileStrategy:
+        return self._block_id_to_strategy[block_ids]
+
+    def get(
+        self, block_ids: tuple[int, ...], default: TileStrategy | None = None
+    ) -> TileStrategy | None:
+        return self._block_id_to_strategy.get(block_ids, default)
+
+    def get_any(self, block_id: int) -> TileStrategy | None:
+        strategy = self._block_id_to_strategy.get((block_id,))
+        if strategy is None:
+            strategy = self._block_id_to_any_strategy.get(block_id)
+        return strategy
+
+    def items(self) -> ItemsView[tuple[int, ...], TileStrategy]:
+        return self._block_id_to_strategy.items()
+
+    def clear(self) -> None:
+        self._block_id_to_strategy.clear()
+        self._block_id_to_any_strategy.clear()
 
 
 class TileStrategyDispatch:
@@ -36,7 +69,7 @@ class TileStrategyDispatch:
     ) -> None:
         super().__init__()
         self.strategies: list[TileStrategy] = []
-        self.block_id_to_strategy: dict[tuple[int, ...], TileStrategy] = {}
+        self.block_id_to_strategy = BlockIDStrategyMapping()
         self._add_loop_strategies(fn, config)
         self._add_reduction_strategies(fn, config)
 
@@ -56,10 +89,18 @@ class TileStrategyDispatch:
     ) -> None:
         env = CompileEnvironment.current()
         strategy = env.backend.create_loop_strategy(fn, block_ids, config)
+        self._register_strategy(block_ids, strategy)
+
+    def _register_strategy(self, block_ids: list[int], strategy: TileStrategy) -> None:
         self.strategies.append(strategy)
         self.block_id_to_strategy[tuple(block_ids)] = strategy
 
     def _add_reduction_strategies(self, fn: DeviceFunction, config: Config) -> None:
+        # Make the dispatcher (with tile strategies already registered)
+        # visible to reduction-strategy __init__ via ``fn.tile_strategy``
+        # so reductions can shrink their thread count if total launch
+        # threads would otherwise exceed the per-block limit.
+        fn.tile_strategy = self
         env = CompileEnvironment.current()
         max_threads = env.backend.max_reduction_threads()
         rdims = [bs.block_id for bs in env.block_sizes if bs.reduction]
@@ -87,12 +128,10 @@ class TileStrategyDispatch:
                         reduction_loop = max_threads
                 elif reduction_loop > max_threads:
                     reduction_loop = max_threads
-            if reduction_loop is None:
-                strategy: TileStrategy = PersistentReductionStrategy(fn, block_id)
-            else:
-                strategy = LoopedReductionStrategy(fn, block_id, reduction_loop)
-            self.strategies.append(strategy)
-            self.block_id_to_strategy[(block_id,)] = strategy
+            strategy = env.backend.create_reduction_strategy(
+                fn, block_id, reduction_loop
+            )
+            self._register_strategy([block_id], strategy)
 
     def codegen_grid(self, state: CodegenState, block_ids: list[int]) -> None:
         strategy = self.block_id_to_strategy[tuple(block_ids)]
@@ -120,10 +159,7 @@ class TileStrategyDispatch:
             else:
                 strategy = self.block_id_to_strategy.get((block_idx,))
                 if strategy is None:
-                    for candidate in self.strategies:
-                        if block_idx in candidate.block_ids:
-                            strategy = candidate
-                            break
+                    strategy = self.block_id_to_strategy.get_any(block_idx)
                 if strategy is not None:
                     block_size = strategy.block_size_var(block_idx)
                 else:
@@ -172,6 +208,50 @@ class TileStrategyDispatch:
             strategy.supports_index_rank_expansion() for strategy in self.strategies
         )
 
+    def current_cute_grid_execution_plans(self) -> tuple[CuTeGridExecutionPlan, ...]:
+        if not self.strategies:
+            return ()
+        graph_info = getattr(
+            self.strategies[0].fn.codegen, "current_root_graph_info", None
+        )
+        if not isinstance(graph_info, RootGraphInfo):
+            return ()
+        return graph_info.cute_grid_execution_plans
+
+    def current_cute_grid_execution_plan(
+        self,
+        *,
+        block_ids: tuple[int, ...] | list[int] | None = None,
+    ) -> CuTeGridExecutionPlan | None:
+        plans = self.current_cute_grid_execution_plans()
+        if not plans:
+            return None
+        if block_ids is not None:
+            plans = tuple(
+                plan for plan in plans if plan.applies_to_any_block(tuple(block_ids))
+            )
+        if not plans:
+            return None
+        block_axis_priority: dict[int, int] = {}
+        disable_reduction_axis_reservation_for: set[int] = set()
+        scoped_block_ids: set[int] = set()
+        for plan in plans:
+            scoped_block_ids.update(plan.scoped_block_ids)
+            disable_reduction_axis_reservation_for.update(
+                plan.disable_reduction_axis_reservation_for
+            )
+            for block_id, priority in plan.block_axis_priority.items():
+                previous = block_axis_priority.get(block_id)
+                if previous is None or priority < previous:
+                    block_axis_priority[block_id] = priority
+        return CuTeGridExecutionPlan(
+            scoped_block_ids=frozenset(scoped_block_ids),
+            block_axis_priority=block_axis_priority,
+            disable_reduction_axis_reservation_for=frozenset(
+                disable_reduction_axis_reservation_for
+            ),
+        )
+
     def _ordered_strategies_for_branch(
         self, branch: list[TileStrategy]
     ) -> list[TileStrategy]:
@@ -180,6 +260,42 @@ class TileStrategyDispatch:
         For CuTe, reduction strategies must come first (axis 0) so that
         reduction threads are within the same warp for warp-level reductions.
         """
+        branch_block_ids = tuple(
+            block_id for strategy in branch for block_id in strategy.block_ids
+        )
+        plan = self.current_cute_grid_execution_plan(block_ids=branch_block_ids)
+        priorities = [
+            min(
+                (
+                    priority
+                    for block_id in strategy.block_ids
+                    if (priority := plan.priority_for_block(block_id)) is not None
+                ),
+                default=None,
+            )
+            if plan is not None
+            else None
+            for strategy in branch
+        ]
+        if any(isinstance(priority, int) for priority in priorities):
+            return sorted(
+                branch,
+                key=lambda strategy: (
+                    min(
+                        (
+                            priority
+                            for block_id in strategy.block_ids
+                            if plan is not None
+                            and (priority := plan.priority_for_block(block_id))
+                            is not None
+                        ),
+                        default=1 << 30,
+                    )
+                    if plan is not None
+                    else 1 << 30,
+                    self.strategies.index(strategy),
+                ),
+            )
         env = CompileEnvironment.current()
         if not env.backend.reduction_axis_first():
             return branch
@@ -382,6 +498,8 @@ class TileStrategyDispatch:
         Examples:
             (u0, u2) -> (u0, u2, u1) => "[:, :, None]"
             (u2, u0) -> (u0, u2, u1) => ".permute(1, 0)[:, :, None]"
+            (u0, u2) -> (1, u2)      => ""   (u0 absorbed by dst size-1 via
+                                              broadcast; no transform needed)
         """
         if not self.supports_index_rank_expansion():
             return ""
@@ -402,6 +520,15 @@ class TileStrategyDispatch:
                 if env.known_equal(src_dim, dst_dim):
                     match = dst_i
                     break
+            if match is None:
+                # Fallback: absorb unmatched src dim into a dst size-1 slot
+                # (Triton will broadcast the size-1 dim at load time).
+                for dst_i, dst_dim in enumerate(dst_shape):
+                    if dst_i in used_dst:
+                        continue
+                    if env.known_equal(dst_dim, 1):
+                        match = dst_i
+                        break
             assert match is not None, (
                 f"Cannot map src dim {src_dim} into dst shape {dst_shape} "
                 f"from src shape {src_shape}"

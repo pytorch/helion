@@ -338,6 +338,7 @@ def _(
 
     results = []
     has_data_dependent_bounds = False
+    has_symbolic_bounds = False
     for begin_part, end_part, bs in zip(
         begin_list,
         end_list,
@@ -352,6 +353,8 @@ def _(
         if isinstance(size, torch.Tensor):
             size = None  # data dependent size
             has_data_dependent_bounds = True
+        if isinstance(begin_part, torch.SymInt) or isinstance(end_part, torch.SymInt):
+            has_symbolic_bounds = True
         if bs is None:
             results.append(TileIndexType.allocate(size, origin))
         elif isinstance(bs, int):
@@ -376,6 +379,7 @@ def _(
             )
         ],
         has_data_dependent_bounds=has_data_dependent_bounds,
+        has_symbolic_bounds=has_symbolic_bounds,
     )
     # pyrefly: ignore [unbound-name]
     if unpack:
@@ -392,6 +396,7 @@ def _add_config_choices(
     has_begin: bool = False,
     allow_static_ranges: list[bool] | None = None,
     has_data_dependent_bounds: bool = False,
+    has_symbolic_bounds: bool = False,
 ) -> None:
     config_spec = CompileEnvironment.current().config_spec
 
@@ -421,12 +426,17 @@ def _add_config_choices(
         # just one set of choices for when we have persistent kernel loop
         _add_config_range_choice(block_ids)
     else:
+        if config_spec.backend_name == "pallas":
+            config_spec.has_pallas_inner_loops = True
         if allow_static_ranges is None:
             allow_static_ranges = [False] * len(block_ids)
         for block_id, allow_static_range in zip(
             block_ids, allow_static_ranges, strict=True
         ):
             _add_config_range_choice([block_id], allow_static_range=allow_static_range)
+
+        if has_symbolic_bounds or has_data_dependent_bounds:
+            config_spec.has_symbolic_or_data_dependent_bounds = True
 
 
 def _add_config_range_choice(
@@ -544,7 +554,7 @@ def _(
             bs_list = bs_list * len(begin_list)
 
     # Build tile ranges for each dimension
-    dim_ranges: list[list[tuple[int, int, int]]] = []
+    dim_ranges: list[list[tuple[int, int, int, int, int]]] = []
     for b, e, bs in zip(begin_list, end_list, bs_list, strict=True):
         b_int, e_int = _to_int(b), _to_int(e)
         assert b_int is not None and e_int is not None
@@ -553,7 +563,10 @@ def _(
         bs_int = _to_int(bs) if bs is not None else (e_int - b_int)
         assert bs_int is not None
         dim_ranges.append(
-            [(s, min(s + bs_int, e_int), bs_int) for s in range(b_int, e_int, bs_int)]
+            [
+                (s, min(s + bs_int, e_int), bs_int, b_int, e_int)
+                for s in range(b_int, e_int, bs_int)
+            ]
         )
 
     if not dim_ranges:
@@ -571,12 +584,12 @@ def jagged_tile(
     parent: object,
 ) -> Iterator[Tile]:
     """
-    Iterate over a jagged inner dimension using a 1D parent tensor of per-lane ends.
+    Iterate over a jagged inner dimension using an N-D parent tensor of per-lane ends.
 
     ``jagged_tile`` is the jagged counterpart to :func:`~helion.language.tile`.
-    Instead of taking a scalar upper bound, it takes a 1D tensor from the enclosing
-    parent tile context. Each element of ``parent`` gives the true end of the jagged
-    child loop for the corresponding parent lane.
+    Instead of taking a scalar upper bound, it takes a tensor whose every axis comes
+    from an enclosing parent tile context. Each element of ``parent`` gives the true
+    end of the jagged child loop for the corresponding parent lane.
 
     Conceptually, Helion lowers:
 
@@ -599,8 +612,9 @@ def jagged_tile(
     loop and manually constructing masks.
 
     Args:
-        parent: 1D tensor in the parent tile context. ``parent[i]`` is the true end
-                of the jagged child loop for parent lane ``i``.
+        parent: N-D tensor whose every axis is an enclosing tile axis. ``parent[i, ...]``
+                is the true end of the jagged child loop for that combination of parent
+                lanes. The 1-D case is the common scalar-of-rows pattern.
 
     Returns:
         Iterator[Tile]: Iterator over tile objects for the jagged child dimension
@@ -615,11 +629,11 @@ def jagged_tile(
                 x: torch.Tensor, row_lengths: torch.Tensor
             ) -> torch.Tensor:
                 b = row_lengths.size(0)
-                max_len = row_lengths.amax()
                 out = torch.zeros([b], dtype=x.dtype, device=x.device)
 
                 for tile_b in hl.tile(b):
                     lengths = row_lengths[tile_b]
+                    max_len = lengths.amax()
                     acc = hl.zeros([tile_b], dtype=x.dtype)
 
                     for tile_k in hl.tile(max_len):
@@ -683,7 +697,8 @@ def jagged_tile(
     Note:
         ``jagged_tile`` currently has a few important restrictions:
 
-        * The input must be a 1D tensor. Scalars and higher-rank tensors are not allowed.
+        * The input must be a tensor of rank >= 1. Scalars are not allowed, and every
+          axis of the parent tensor must come from an enclosing tile context.
         * ``jagged_tile`` cannot be used as the outermost loop of a kernel.
         * A jagged child tile must be indexed together with its parent axes. For example,
           ``x[tile_k]`` is invalid if ``tile_k`` comes from ``hl.jagged_tile(lengths)``
@@ -706,17 +721,18 @@ def _(
         raise exc.LoopFunctionNotInFor("jagged_tile")
 
     env = CompileEnvironment.current()
-    parent_block_id: int = -1
-    if isinstance(parent, TensorType) and parent.fake_value.ndim == 1:
-        bid = env.get_block_id(parent.fake_value.size(0))
-        if not isinstance(bid, int):
-            raise exc.InvalidJaggedTileUsage(
-                "hl.jagged_tile cannot be outermost loop or get host tensor as a parent"
-            )
-        parent_block_id = bid
+    parent_block_ids: list[int] = []
+    if isinstance(parent, TensorType) and parent.fake_value.ndim >= 1:
+        for dim_size in parent.fake_value.shape:
+            bid = env.get_block_id(dim_size)
+            if not isinstance(bid, int):
+                raise exc.InvalidJaggedTileUsage(
+                    "hl.jagged_tile cannot be outermost loop or get host tensor as a parent"
+                )
+            parent_block_ids.append(bid)
     else:
         raise exc.InvalidJaggedTileUsage(
-            "hl.jagged_tile currently only accepts 1d tensor as an argument"
+            "hl.jagged_tile only accepts a tensor with rank >= 1 as an argument"
         )
     proxy_parent = _to_proxy(parent)
     if not isinstance(proxy_parent, torch.Tensor):
@@ -727,8 +743,8 @@ def _(
         raise exc.TileOfTile
 
     base = TileIndexType.allocate(None, origin)
-    result = JaggedTileIndexType(origin, base.block_id, parent_block_id)
-    env.register_jagged_tile(base.block_id, parent_block_id)
+    result = JaggedTileIndexType(origin, base.block_id, parent_block_ids)
+    env.register_jagged_tile(base.block_id, parent_block_ids)
 
     _add_config_choices(
         [result.block_id],

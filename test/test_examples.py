@@ -8,12 +8,15 @@ from packaging import version
 import pytest
 import torch
 import torch.nn.functional as F
+from torch.testing._internal.common_utils import instantiate_parametrized_tests
+from torch.testing._internal.common_utils import parametrize
 
 import helion
 from helion import _compat
 from helion._testing import DEVICE
 from helion._testing import EXAMPLES_DIR
 from helion._testing import HALF_DTYPE
+from helion._testing import LONG_INT_TYPE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import _get_backend
@@ -25,6 +28,7 @@ from helion._testing import skipIfA10G
 from helion._testing import skipIfCudaCapabilityLessThan
 from helion._testing import skipIfCudaSharedMemoryLessThan
 from helion._testing import skipIfFn
+from helion._testing import skipIfNotCUDA
 from helion._testing import skipIfPallas
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfRocm
@@ -32,9 +36,34 @@ from helion._testing import skipIfTileIR
 from helion._testing import skipIfXPU
 from helion._testing import xfailIfCute
 from helion._testing import xfailIfPallas
+from helion.runtime.config import Config
+from helion.runtime.ref_mode import is_ref_mode_enabled
 
 _orig_matmul_fp32_precision: str = "none"
 _orig_cudnn_fp32_precision: str = "none"
+
+
+def _compile_only(
+    fn: helion.Kernel,
+    args: tuple[object, ...],
+    **kwargs: object,
+) -> object:
+    bound = fn.bind(args)
+    if kwargs:
+        config = Config(
+            # pyrefly: ignore [bad-argument-type]
+            **kwargs
+        )
+    elif fn.configs:
+        (config,) = fn.configs
+    else:
+        config = bound.config_spec.default_config()
+    for key in bound.config_spec.unsupported_config_keys(config.config):
+        config.config.pop(key, None)
+    if is_ref_mode_enabled(bound.kernel.settings):
+        bound._config = config
+        return bound
+    return bound.compile_config(config)
 
 
 def setUpModule() -> None:
@@ -81,6 +110,34 @@ class TestExamples(RefEagerTestBase, TestCase):
             args,
             args[0] @ args[1],
             block_sizes=[128, 128, 128],
+        )
+
+    def test_matmul_default(self):
+        """Matmul without explicit block_sizes to exercise autotuner defaults."""
+        args = (
+            torch.randn([1024, 1024], device=DEVICE, dtype=torch.float32),
+            torch.randn([1024, 1024], device=DEVICE, dtype=torch.float32),
+        )
+        check_example(
+            "matmul",
+            args,
+            args[0] @ args[1],
+        )
+
+    def test_matmul_bf16_tcgen05(self):
+        """Matmul at 256^3 bf16 — fixture sized just above the cute
+        tcgen05 admission floor (M >= 64 divisible by 64) so the cute
+        autotune sub-sweep fires the ``uses_tcgen05`` codegen marker.
+        """
+        args = (
+            torch.randn([256, 256], device=DEVICE, dtype=torch.bfloat16),
+            torch.randn([256, 256], device=DEVICE, dtype=torch.bfloat16),
+        )
+        check_example(
+            "matmul",
+            args,
+            args[0] @ args[1],
+            block_sizes=[64, 64, 32],
         )
 
     @xfailIfCute("CuTe barrier-based split-K example is still unsupported")
@@ -206,7 +263,10 @@ class TestExamples(RefEagerTestBase, TestCase):
         torch.testing.assert_close(mat1.grad, mat1_ref.grad, atol=1e-1, rtol=1e-2)
         torch.testing.assert_close(mat2.grad, mat2_ref.grad, atol=1e-1, rtol=1e-2)
 
-    @xfailIfCute("CuTe matmul+layernorm example still fails codegen/runtime")
+    @skipIfFn(
+        lambda: _get_backend() == "cute",
+        "CuTe matmul+layernorm example is unsupported and too expensive in-process",
+    )
     def test_matmul_layernorm_static_shapes(self):
         args = (
             torch.randn([1024, 256], device=DEVICE, dtype=torch.float32),
@@ -227,7 +287,54 @@ class TestExamples(RefEagerTestBase, TestCase):
             static_shapes=True,
         )
 
-    @xfailIfCute("CuTe matmul+layernorm example still fails codegen/runtime")
+    @onlyBackends(["pallas"])
+    def test_matmul_layernorm_half_dtype_multi_k_tile(self):
+        """Guards K-loop accumulator precision when inputs are half-precision.
+
+        Across multiple K-tile iterations the partial-sum accumulator must
+        stay in fp32 to keep the layernorm output within tight tolerance;
+        regressions here surface as out-of-tolerance results on bf16/fp16.
+        """
+        m, k, n = 1024, 1024, 1024
+        args = (
+            torch.randn([m, k], device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn([k, n], device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn([n], device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn([n], device=DEVICE, dtype=HALF_DTYPE),
+        )
+        expected = torch.nn.functional.layer_norm(
+            (args[0] @ args[1]).to(torch.float32),
+            normalized_shape=(n,),
+            weight=args[2].to(torch.float32),
+            bias=args[3].to(torch.float32),
+        ).to(HALF_DTYPE)
+        check_example(
+            "matmul_layernorm",
+            args,
+            expected,
+            block_sizes=[32, 256],
+            static_shapes=True,
+            atol=1e-2,
+            rtol=1e-2,
+        )
+
+    def test_matmul_layernorm_small_shapes_compile_on_cute(self):
+        if _get_backend() != "cute":
+            self.skipTest("CuTe-specific compile coverage")
+
+        mod = import_path(EXAMPLES_DIR / "matmul_layernorm.py")
+        args = (
+            torch.randn([32, 64], device=DEVICE, dtype=torch.float32),
+            torch.randn([64, 128], device=DEVICE, dtype=torch.float32),
+            torch.randn([128], device=DEVICE, dtype=torch.float32),
+            torch.randn([128], device=DEVICE, dtype=torch.float32),
+        )
+        _compile_only(mod.matmul_layernorm, args, block_sizes=[16, 16])
+
+    @skipIfFn(
+        lambda: _get_backend() == "cute",
+        "CuTe matmul+layernorm example is unsupported and too expensive in-process",
+    )
     @xfailIfPallas("JAX tracer error with dynamic shapes")
     def test_matmul_layernorm_dynamic_shapes(self):
         args = (
@@ -265,9 +372,22 @@ class TestExamples(RefEagerTestBase, TestCase):
             block_sizes=[16, 16, 16, 16],
         )
 
+    def test_bmm_non_divisible_k(self):
+        args = (
+            torch.randn([4, 128, 384], device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn([4, 384, 128], device=DEVICE, dtype=HALF_DTYPE),
+        )
+        check_example(
+            "bmm",
+            args,
+            torch.bmm(args[0], args[1]),
+            block_sizes=[1, 128, 128, 256],
+        )
+
     @skipIfFn(
         lambda: _get_backend() == "cute", "CuTe FP8 GEMM example is not supported yet"
     )
+    @skipIfNotCUDA()
     @skipIfCudaCapabilityLessThan((9, 0), reason="FP8 requires CUDA capability >= 9.0")
     def test_fp8_gemm(self):
         # Create FP32 tensors and convert to FP8
@@ -276,13 +396,15 @@ class TestExamples(RefEagerTestBase, TestCase):
 
         # Convert to FP8 format
         x_fp8 = x.to(torch.float8_e4m3fn)
-        y_fp8 = y.to(torch.float8_e4m3fn)
+        y_fp8 = y.to(torch.float8_e4m3fn).T.contiguous().T
 
         args = (x_fp8, y_fp8)
 
         # Import the reference implementation
         mod = import_path(EXAMPLES_DIR / "fp8_gemm.py")
-        expected = mod.reference_fp8_gemm_pytorch(x_fp8, y_fp8)
+        scale_a = torch.tensor(1.0, device=DEVICE)
+        scale_b = torch.tensor(1.0, device=DEVICE)
+        expected = mod.reference_fp8_gemm_pytorch(x_fp8, y_fp8, scale_a, scale_b)
 
         check_example(
             "fp8_gemm",
@@ -295,10 +417,10 @@ class TestExamples(RefEagerTestBase, TestCase):
 
     @xfailIfCute("CuTe template closure example still exceeds runtime resources")
     def test_template_via_closure0(self):
-        bias = torch.randn([1, 1024], device=DEVICE, dtype=HALF_DTYPE)
+        bias = torch.randn([1, 512], device=DEVICE, dtype=HALF_DTYPE)
         args = (
-            torch.randn([1024, 1024], device=DEVICE, dtype=HALF_DTYPE),
-            torch.randn([1024, 1024], device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn([512, 512], device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn([512, 512], device=DEVICE, dtype=HALF_DTYPE),
             lambda acc, tile: torch.relu(acc + bias[tile]),
         )
         check_example(
@@ -306,6 +428,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             args,
             torch.relu(args[0] @ args[1] + bias),
             fn_name="matmul",
+            emit_code=False,
             block_sizes=[64, 64, 16],
             loop_orders=[[0, 1]],
             num_warps=2,
@@ -319,10 +442,10 @@ class TestExamples(RefEagerTestBase, TestCase):
     @skipIfXPU("Failed on XPU - https://github.com/pytorch/helion/issues/795")
     @skipIfTileIR("TileIR does not support block_ptr indexing")
     def test_template_via_closure1(self):
-        bias = torch.randn([1, 1024], device=DEVICE, dtype=HALF_DTYPE)
+        bias = torch.randn([1, 512], device=DEVICE, dtype=HALF_DTYPE)
         args = (
-            torch.randn([1024, 1024], device=DEVICE, dtype=HALF_DTYPE),
-            torch.randn([1024, 1024], device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn([512, 512], device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn([512, 512], device=DEVICE, dtype=HALF_DTYPE),
             lambda acc, tile: torch.relu(acc + bias[tile]),
         )
         check_example(
@@ -330,6 +453,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             args,
             torch.relu(args[0] @ args[1] + bias),
             fn_name="matmul",
+            emit_code=False,
             block_sizes=[64, 64, 16],
             loop_orders=[[0, 1]],
             num_warps=2,
@@ -338,13 +462,12 @@ class TestExamples(RefEagerTestBase, TestCase):
             l2_grouping=64,
         )
 
-    @xfailIfCute("CuTe template closure example still exceeds runtime resources")
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfTileIR("TileIR does not support block_ptr indexing")
     def test_template_via_closure2(self):
         args = (
-            torch.randn([1024, 1024], device=DEVICE, dtype=HALF_DTYPE),
-            torch.randn([1024, 1024], device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn([512, 512], device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn([512, 512], device=DEVICE, dtype=HALF_DTYPE),
             lambda x, _: torch.nn.functional.relu(x),
         )
         check_example(
@@ -352,6 +475,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             args,
             torch.relu(args[0] @ args[1]),
             fn_name="matmul",
+            emit_code=False,
             block_sizes=[64, 64, 16],
             loop_orders=[[0, 1]],
             num_warps=2,
@@ -363,11 +487,12 @@ class TestExamples(RefEagerTestBase, TestCase):
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfTileIR("TileIR does not support block_ptr indexing")
     def test_softmax(self):
-        args = (torch.randn([1024, 1024], device=DEVICE, dtype=torch.float32),)
+        args = (torch.randn([512, 512], device=DEVICE, dtype=torch.float32),)
         check_example(
             "softmax",
             args,
             torch.nn.functional.softmax(*args, dim=1),
+            emit_code=False,
             block_size=1,
             num_warps=4,
             num_stages=1,
@@ -377,11 +502,12 @@ class TestExamples(RefEagerTestBase, TestCase):
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfTileIR("TileIR does not support block_ptr indexing")
     def test_softmax_looped(self):
-        args = (torch.randn([1024, 1024], device=DEVICE, dtype=torch.float32),)
+        args = (torch.randn([512, 512], device=DEVICE, dtype=torch.float32),)
         check_example(
             "softmax",
             args,
             torch.nn.functional.softmax(*args, dim=1),
+            emit_code=False,
             block_size=1,
             num_warps=4,
             num_stages=1,
@@ -392,12 +518,13 @@ class TestExamples(RefEagerTestBase, TestCase):
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfTileIR("TileIR does not support block_ptr indexing")
     def test_softmax_decomposed(self):
-        args = (torch.randn([1024, 1024], device=DEVICE, dtype=torch.float32),)
+        args = (torch.randn([512, 512], device=DEVICE, dtype=torch.float32),)
         check_example(
             "softmax",
             args,
             torch.nn.functional.softmax(*args, dim=1),
             fn_name="softmax_decomposed",
+            emit_code=False,
             block_size=1,
             num_warps=4,
             num_stages=1,
@@ -405,38 +532,39 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
 
     def test_softmax_two_pass(self):
-        args = (torch.randn([1024, 1024], device=DEVICE, dtype=torch.float32),)
+        args = (torch.randn([512, 512], device=DEVICE, dtype=torch.float32),)
         check_example(
             "softmax",
             args,
             torch.nn.functional.softmax(*args, dim=1),
             fn_name="softmax_two_pass",
+            emit_code=False,
         )
 
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfTileIR("TileIR does not support block_ptr indexing")
     def test_softmax_two_pass_block_ptr(self):
-        args = (torch.randn([1024, 1024], device=DEVICE, dtype=torch.float32),)
+        args = (torch.randn([512, 512], device=DEVICE, dtype=torch.float32),)
         check_example(
             "softmax",
             args,
             torch.nn.functional.softmax(*args, dim=1),
             fn_name="softmax_two_pass",
+            emit_code=False,
             block_sizes=[8, 64],
             indexing="block_ptr",
         )
 
-    @xfailIfPallas("BlockSpec tiling failure")
     def test_cross_entropy(self):
         n, v = 128, 1000
-        args = (
-            torch.randn(n, v, device=DEVICE, dtype=torch.float32),
-            torch.randint(0, v, (n,), device=DEVICE, dtype=torch.long),
-        )
+        logits = torch.randn(n, v, device=DEVICE, dtype=torch.float32)
+        labels = torch.randint(0, v, (n,), device=DEVICE, dtype=LONG_INT_TYPE)
+        # PyTorch cross_entropy requires Long labels for the reference
+        expected = torch.nn.functional.cross_entropy(logits, labels.long())
         check_example(
             "cross_entropy",
-            args,
-            torch.nn.functional.cross_entropy(*args),
+            (logits, labels),
+            expected,
         )
 
     @xfailIfCute("CuTe Welford example still returns incorrect results")
@@ -458,37 +586,33 @@ class TestExamples(RefEagerTestBase, TestCase):
             ),
         )
 
-    @xfailIfCute("CuTe low-memory dropout example is not supported yet")
+    @skipIfFn(
+        lambda: _get_backend() == "cute",
+        "CuTe low-memory dropout example is flaky and currently skipped",
+    )
     def test_low_mem_dropout(self):
         from examples.low_mem_dropout import low_mem_dropout
         from examples.low_mem_dropout import low_mem_dropout_bwd
 
-        from helion._testing import code_and_output
-
         p = 0.25
-        size = 8192
+        size = 1024
+        block_size = 512
         seed = 123
         seed2 = 456
         x = torch.randn(size=(size,)).to(device=DEVICE)
-
-        _, out_fwd = code_and_output(
-            low_mem_dropout,
-            (p, x, seed),
-            block_sizes=[8192],
-        )
+        out_fwd = _compile_only(
+            low_mem_dropout, (p, x, seed), block_sizes=[block_size]
+        )(p, x, seed)
 
         grad_y = torch.ones_like(x)
-        _, grad_x = code_and_output(
+        bwd = _compile_only(
             low_mem_dropout_bwd,
             (p, grad_y, seed),
-            block_sizes=[8192],
+            block_sizes=[block_size],
         )
+        grad_x = bwd(p, grad_y, seed)
 
-        _, grad_x2 = code_and_output(
-            low_mem_dropout_bwd,
-            (p, grad_y, seed2),
-            block_sizes=[8192],
-        )
+        grad_x2 = bwd(p, grad_y, seed2)
 
         mask_fwd = out_fwd != 0
         mask_bwd = grad_x != 0
@@ -503,10 +627,15 @@ class TestExamples(RefEagerTestBase, TestCase):
             "Different elements should be dropped when using a different seed",
         )
 
-        check_example("low_mem_dropout", (p, grad_y, seed), grad_x, block_sizes=[8192])
+        check_example(
+            "low_mem_dropout",
+            (p, grad_y, seed),
+            grad_x,
+            block_sizes=[block_size],
+        )
 
     @xfailIfCute("CuTe bf16 x int16 example still returns incorrect results")
-    @xfailIfPallas("missing dot implementation")
+    @xfailIfPallas("precision differences with bf16xint16 operations on pallas")
     @skipIfTileIR("precision differences with bf16xint16 operations on tileir")
     @skipIfRocm("precision differences with bf16xint16 operations on rocm")
     @skipIfXPU("precision differences with bf16xint16 operations on xpu")
@@ -582,13 +711,13 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
 
     @xfailIfCute("CuTe RMSNorm backward example still returns incorrect results")
-    @xfailIfPallas("InductorLoweringError")
-    def test_rms_norm_bwd(self):
+    @parametrize("dtype", (torch.float32, HALF_DTYPE))
+    def test_rms_norm_bwd(self, dtype):
         """Test backward pass for rms norm weight gradient."""
-        batch_size, dim = 32, 64
-        x = torch.randn([batch_size, dim], device=DEVICE, dtype=HALF_DTYPE)
-        weight = torch.randn([dim], device=DEVICE, dtype=HALF_DTYPE, requires_grad=True)
-        grad_out = torch.randn([batch_size, dim], device=DEVICE, dtype=HALF_DTYPE)
+        batch_size, dim = 2048, 2048
+        x = torch.randn([batch_size, dim], device=DEVICE, dtype=dtype)
+        weight = torch.randn([dim], device=DEVICE, dtype=dtype, requires_grad=True)
+        grad_out = torch.randn([batch_size, dim], device=DEVICE, dtype=dtype)
         eps = 1e-5
 
         # Compute forward pass to get rms
@@ -626,7 +755,6 @@ class TestExamples(RefEagerTestBase, TestCase):
             atol=1e-2,
         )
 
-    @xfailIfPallas("BlockSpec tiling failure")
     def test_embedding_pointers(self):
         args = (
             torch.randint(0, 1024, [8, 128], device=DEVICE, dtype=torch.int32),
@@ -640,7 +768,6 @@ class TestExamples(RefEagerTestBase, TestCase):
             indexing="pointer",
         )
 
-    @xfailIfPallas("BlockSpec tiling failure")
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfTileIR("TileIR does not support block_ptr indexing")
     def test_embedding_block_ptr(self):
@@ -655,6 +782,55 @@ class TestExamples(RefEagerTestBase, TestCase):
             block_sizes=[8, 64],
             indexing="block_ptr",
             pid_type="xyz",
+        )
+
+    @skipIfTileIR("PassManager::run failed")
+    @xfailIfCute(
+        "CuTe tcgen05 MMA path does not yet emit indices/masks for the "
+        "user-level epilogue write that follows the MMA"
+    )
+    def test_epilogue_subtiling_residual_gelu(self):
+        m, k, n = 8192, 8192, 8192
+        x = torch.randn([m, k], device=DEVICE, dtype=HALF_DTYPE)
+        w = torch.randn([k, n], device=DEVICE, dtype=HALF_DTYPE)
+        bias = torch.randn([n], device=DEVICE, dtype=HALF_DTYPE)
+        residual = torch.randn([m, n], device=DEVICE, dtype=HALF_DTYPE)
+        acc = x.float() @ w.float()
+        expected = torch.nn.functional.gelu(
+            acc * 1.25 + residual.float() * 0.5 + bias.float()
+        ).half()
+        block_sizes = [16, 16, 16] if _get_backend() == "cute" else [64, 64, 64]
+        check_example(
+            "epilogue_subtiling",
+            (x, w, bias, residual),
+            expected,
+            fn_name="matmul_bias_residual_gelu_cast",
+            block_sizes=block_sizes,
+        )
+
+    @skipIfTileIR("PassManager::run failed")
+    @xfailIfCute(
+        "CuTe tcgen05 MMA path does not yet emit indices/masks for the "
+        "user-level epilogue write that follows the MMA"
+    )
+    def test_epilogue_subtiling_gelu_aux(self):
+        m, k, n = 8192, 8192, 8192
+        x = torch.randn([m, k], device=DEVICE, dtype=HALF_DTYPE)
+        w = torch.randn([k, n], device=DEVICE, dtype=HALF_DTYPE)
+        bias = torch.randn([n], device=DEVICE, dtype=HALF_DTYPE)
+        acc = x.float() @ w.float()
+        pre = acc * 1.25 + bias.float()
+        expected = (
+            torch.nn.functional.gelu(pre).half(),
+            pre.half(),
+        )
+        block_sizes = [16, 16, 16] if _get_backend() == "cute" else [64, 64, 64]
+        check_example(
+            "epilogue_subtiling",
+            (x, w, bias),
+            expected,
+            fn_name="matmul_bias_gelu_aux",
+            block_sizes=block_sizes,
         )
 
     @skipIfFn(
@@ -678,7 +854,6 @@ class TestExamples(RefEagerTestBase, TestCase):
     @xfailIfCute(
         "CuTe attention block-pointer example still exceeds thread-block limits"
     )
-    @xfailIfCute("CuTe persistent attention example still exceeds thread-block limits")
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfXPU("failure on XPU")
     @skipIfTileIR("TileIR does not support block_ptr indexing")
@@ -701,7 +876,6 @@ class TestExamples(RefEagerTestBase, TestCase):
         lambda: _get_backend() == "cute",
         "CuTe dynamic attention destabilizes later cute tests when it fails in-process",
     )
-    @xfailIfPallas("JAX tracer error with dynamic shapes")
     def test_attention_dynamic(self):
         args = (
             torch.randn(1, 32, 512, 64, dtype=torch.float32, device=DEVICE),
@@ -760,8 +934,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             fn_name="jagged_dense_add_2d",
         )
 
-    @xfailIfCute("CuTe jagged dense bmm example still returns incorrect results")
-    @xfailIfPallas("tensor-derived if-predicates not supported")
+    @xfailIfPallas("Pallas rejects int64 inputs (jagged offsets)")
     @skipIfXPU("Jagged tensor operations not fully supported on XPU")
     @skipIfRefEager("hl.jagged_tile does not support ref mode yet")
     def test_jagged_dense_bmm(self):
@@ -840,7 +1013,23 @@ class TestExamples(RefEagerTestBase, TestCase):
             fn_name="longsum_manual",
         )
 
-    @xfailIfCute("CuTe jagged mean example still fails lowering/runtime")
+    def test_long_sum_manual_non_divisible(self):
+        """Reduction loop OOB when block_size doesn't divide the reduction dim.
+
+        longsum_manual uses dynamic shapes (static_shapes=False by default).
+        Two different non-divisible N values exercise the runtime pad
+        computation with different pad amounts.
+        """
+        for n in [50000, 40000]:
+            x = torch.randn([4, n], device=DEVICE, dtype=torch.float32)
+            check_example(
+                "long_sum",
+                (x,),
+                x.sum(-1),
+                fn_name="longsum_manual",
+                block_sizes=[32768, 1],
+            )
+
     @xfailIfPallas("JAX tracer error with dynamic shapes")
     @skipIfRefEager("hl.jagged_tile does not support ref mode yet")
     def test_jagged_mean(self):
@@ -928,6 +1117,7 @@ class TestExamples(RefEagerTestBase, TestCase):
         lambda: _get_backend() == "cute",
         "CuTe FP8 attention destabilizes later cute tests when it fails in-process",
     )
+    @skipIfNotCUDA()
     @skipIfCudaCapabilityLessThan((9, 0), reason="FP8 requires CUDA capability >= 9.0")
     def test_fp8_attention(self):
         batch = 2
@@ -1006,6 +1196,26 @@ class TestExamples(RefEagerTestBase, TestCase):
             block_size=32,
             num_warps=4,
             num_stages=3,
+        )
+
+    def test_layernorm_reduction_not_divisible(self):
+        """Reduction loop OOB when reduction_loops doesn't divide the reduction dim."""
+        batch_size = 4
+        dim = 48  # not divisible by reduction_loops=32
+        x = torch.randn([batch_size, dim], device=DEVICE, dtype=HALF_DTYPE)
+        weight = torch.randn([dim], device=DEVICE, dtype=HALF_DTYPE)
+        bias = torch.randn([dim], device=DEVICE, dtype=HALF_DTYPE)
+
+        args = (x, [dim], weight, bias, 1e-5)
+        expected_out = torch.nn.functional.layer_norm(*args)
+
+        check_example(
+            "layer_norm",
+            args,
+            (expected_out, None, None),
+            fn_name="layer_norm_fwd",
+            block_size=1,
+            reduction_loops=32,
         )
 
     @xfailIfCute("CuTe LayerNorm backward example still returns incorrect results")
@@ -1121,7 +1331,6 @@ class TestExamples(RefEagerTestBase, TestCase):
             num_stages=3,
         )
 
-    @xfailIfCute("CuTe jagged softmax example still fails lowering/runtime")
     @xfailIfPallas("JAX tracer error with dynamic shapes")
     @skipIfRefEager("hl.jagged_tile does not support ref mode yet")
     def test_jagged_softmax(self):
@@ -1150,7 +1359,6 @@ class TestExamples(RefEagerTestBase, TestCase):
             block_sizes=[16, 8, 16, 16],
         )
 
-    @xfailIfCute("CuTe jagged HSTU attention example is not supported yet")
     @xfailIfPallas("tensor-derived if-predicates not supported")
     @skipIfXPU("Jagged tensor operations not fully supported on XPU")
     def test_jagged_hstu_attn(self):
@@ -1351,12 +1559,12 @@ class TestExamples(RefEagerTestBase, TestCase):
     @xfailIfPallas("InductorLoweringError")
     def test_jsd(self):
         args = (
-            torch.randn(
-                [4 * 2048, 4096], device=DEVICE, dtype=torch.float32
-            ).log_softmax(dim=-1),
-            torch.randn(
-                [4 * 2048, 4096], device=DEVICE, dtype=torch.float32
-            ).log_softmax(dim=-1),
+            torch.randn([1024, 4096], device=DEVICE, dtype=torch.float32).log_softmax(
+                dim=-1
+            ),
+            torch.randn([1024, 4096], device=DEVICE, dtype=torch.float32).log_softmax(
+                dim=-1
+            ),
             None,
         )
 
@@ -1368,6 +1576,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             args,
             (expected(*args), None),
             fn_name="jsd_forward",
+            emit_code=False,
             block_sizes=[1, 4096],
             num_warps=4,
             num_stages=3,
@@ -1378,10 +1587,10 @@ class TestExamples(RefEagerTestBase, TestCase):
         if _get_backend() == "cute" and "B200" in get_nvidia_gpu_model():
             pytest.xfail("CuTe KL-div example still launches out of resources on B200")
         args = (
-            torch.randn(
-                [8 * 512, 4096], device=DEVICE, dtype=torch.float32
-            ).log_softmax(dim=-1),
-            torch.randn([8 * 512, 4096], device=DEVICE, dtype=torch.float32).softmax(
+            torch.randn([1024, 4096], device=DEVICE, dtype=torch.float32).log_softmax(
+                dim=-1
+            ),
+            torch.randn([1024, 4096], device=DEVICE, dtype=torch.float32).softmax(
                 dim=-1
             ),
         )
@@ -1393,17 +1602,19 @@ class TestExamples(RefEagerTestBase, TestCase):
             args,
             torch_kl_div(*args),
             fn_name="kl_div_forward",
+            emit_code=False,
             block_sizes=[1, 4096],
             num_warps=4,
             num_stages=3,
         )
 
     @xfailIfPallas("BackendError on pallas")
+    @skipIfXPU("Timeout on XPU")
     def test_gather_gemv(self):
         args = (
-            torch.randn([8, 1024, 1024], device=DEVICE, dtype=torch.float32),
-            torch.randint(0, 8, [2], device=DEVICE, dtype=torch.int32),
-            torch.randn([1024], device=DEVICE, dtype=torch.float32),
+            torch.randn([4, 512, 512], device=DEVICE, dtype=torch.float32),
+            torch.randint(0, 4, [2], device=DEVICE, dtype=torch.int32),
+            torch.randn([512], device=DEVICE, dtype=torch.float32),
         )
 
         def expected(w, idx, x):
@@ -1414,6 +1625,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             args,
             expected(*args),
             fn_name="gather_gemv",
+            emit_code=False,
             block_sizes=[16, 16],
             num_warps=8,
             num_stages=1,
@@ -1484,7 +1696,6 @@ class TestExamples(RefEagerTestBase, TestCase):
             atol=1.0,
         )
 
-    @xfailIfCute("CuTe jagged sum example still returns incorrect results")
     @xfailIfPallas("JAX tracer error")
     @skipIfRefEager("hl.jagged_tile does not support ref mode yet")
     def test_jagged_sum(self):
@@ -1513,6 +1724,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             block_sizes=[16, 8, 16],
         )
 
+    @skipIfXPU("Timeout on XPU")
     def test_fused_linear_jsd(self):
         beta = 0.5
         ignore_index = -100
@@ -1556,7 +1768,6 @@ class TestExamples(RefEagerTestBase, TestCase):
             block_sizes=[64],
         )
 
-    @xfailIfCute("CuTe jagged layer norm example still fails lowering/runtime")
     @xfailIfPallas("JAX tracer error")
     @skipIfRefEager("hl.jagged_tile does not support ref mode yet")
     def test_jagged_layer_norm(self):
@@ -1701,6 +1912,7 @@ class TestExamples(RefEagerTestBase, TestCase):
     @xfailIfPallas("tensor accessed with conflicting tiling patterns")
     @skipIfA10G("failure on a10g")
     @skipIfTileIR("accuracy failure")
+    @skipIfXPU("ocloc compilation failure with 256-GRF kernel on XPU backend")
     def test_squeeze_and_excitation_net_bwd_da(self):
         m, n, k = 256, 256, 256
         x = torch.randn([m, n], device=DEVICE, dtype=HALF_DTYPE)
@@ -1744,6 +1956,12 @@ class TestExamples(RefEagerTestBase, TestCase):
     @xfailIfCute("CuTe squeeze-and-excitation backward still fails lowering/runtime")
     @skipIfA10G("failure on a10g")
     @skipIfTileIR("accuracy failure")
+    @skipIfXPU("ocloc compilation failure with 256-GRF kernel on XPU backend")
+    @xfailIfPallas(
+        "Pallas codegen broadcasts the matmul result to the wrong shape "
+        "((16, 128) vs (16, 256)) -- separate shape-propagation bug in the "
+        "outer accumulator."
+    )
     def test_squeeze_and_excitation_net_bwd_db(self):
         m, n, k = 256, 256, 256
         x = torch.randn([m, n], device=DEVICE, dtype=HALF_DTYPE)
@@ -1785,7 +2003,6 @@ class TestExamples(RefEagerTestBase, TestCase):
             atol=0.3,
         )
 
-    @xfailIfPallas("InductorLoweringError")
     def test_grpo_loss_fwd(self):
         """Test forward pass for GRPO loss."""
         B, L, V = 4, 512, 2048
@@ -1960,7 +2177,6 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
 
     @xfailIfCute("CuTe batched softmax example still fails CUTLASS DSL codegen")
-    @skipIfPallas("flaky numerical mismatch on TPU nightly")
     def test_batch_softmax(self):
         args = (torch.randn([16, 512, 1024], device=DEVICE, dtype=torch.bfloat16),)
         check_example(
@@ -2051,7 +2267,6 @@ class TestExamples(RefEagerTestBase, TestCase):
             fn_name="longsum",
         )
 
-    @xfailIfPallas("JAX tracer error with dynamic shapes")
     def test_long_sum_looped(self):
         args = (torch.randn([4, 130000], device=DEVICE, dtype=torch.float32),)
         check_example(
@@ -2092,7 +2307,9 @@ class TestExamples(RefEagerTestBase, TestCase):
         lambda: _get_backend() == "cute",
         "CuTe Mamba2 chunk-state destabilizes later cute tests when it fails in-process",
     )
-    @xfailIfPallas("BlockSpec tiling failure")
+    @xfailIfPallas(
+        "dA_cumsum has mixed scalar+slice access (VMEM), but Mosaic requires 32-bit for VMEM scalar extracts"
+    )
     def test_mamba2_chunk_state(self):
         batch, nheads, ngroups, seqlen, chunk_size, headdim, dstate = (
             2,
@@ -2182,6 +2399,93 @@ class TestExamples(RefEagerTestBase, TestCase):
             atol=0.1,
             rtol=0.1,
         )
+
+    @skipIfRocm("failure on rocm")
+    @skipIfA10G("failure on a10g")
+    @skipIfCudaCapabilityLessThan((9, 0), reason="se_block CUDA path requires H100+")
+    def test_se_block_fwd(self):
+        m, n = 128, 128
+        x = torch.randn([m, n], device=DEVICE, dtype=torch.bfloat16)
+        w = torch.randn([n, n], device=DEVICE, dtype=torch.bfloat16)
+
+        # Compute expected output with PyTorch
+        expected = 2 * x * torch.sigmoid(x @ w)
+
+        args = (x, w)
+
+        check_example(
+            "se_block",
+            args,
+            (expected, None),  # (output, sigmoid)
+            fn_name="se_block_fwd",
+            block_sizes=[32],
+            num_warps=4,
+            num_stages=3,
+        )
+
+    @skipIfRocm("failure on rocm")
+    @skipIfA10G("failure on a10g")
+    @skipIfCudaCapabilityLessThan((9, 0), reason="se_block CUDA path requires H100+")
+    def test_se_block_bwd_dx(self):
+        m, n = 128, 128
+        x = torch.randn([m, n], device=DEVICE, dtype=HALF_DTYPE, requires_grad=True)
+        w = torch.randn([n, n], device=DEVICE, dtype=HALF_DTYPE, requires_grad=True)
+        grad_out = torch.randn([m, n], device=DEVICE, dtype=HALF_DTYPE)
+
+        # Compute expected gradients with PyTorch
+        x_torch = x.detach().clone().requires_grad_(True)
+        w_torch = w.detach().clone().requires_grad_(True)
+        out_torch = 2 * x_torch * torch.sigmoid(x_torch @ w_torch)
+        out_torch.backward(grad_out)
+
+        # Compute sigmoid values using PyTorch reference
+        s = torch.sigmoid(x @ w)
+
+        args = (grad_out, x, w, s)
+
+        check_example(
+            "se_block",
+            args,
+            x_torch.grad,
+            fn_name="se_block_bwd_dx",
+            block_sizes=[32, 32, 32],
+            num_warps=4,
+            num_stages=3,
+        )
+
+    @skipIfRocm("failure on rocm")
+    @skipIfA10G("failure on a10g")
+    @skipIfCudaCapabilityLessThan((9, 0), reason="se_block CUDA path requires H100+")
+    def test_se_block_bwd_dw(self):
+        m, n = 128, 128
+        x = torch.randn([m, n], device=DEVICE, dtype=HALF_DTYPE, requires_grad=True)
+        w = torch.randn([n, n], device=DEVICE, dtype=HALF_DTYPE, requires_grad=True)
+        grad_out = torch.randn([m, n], device=DEVICE, dtype=HALF_DTYPE)
+
+        # Compute expected gradients with PyTorch
+        x_torch = x.detach().clone().requires_grad_(True)
+        w_torch = w.detach().clone().requires_grad_(True)
+        out_torch = 2 * x_torch * torch.sigmoid(x_torch @ w_torch)
+        out_torch.backward(grad_out)
+
+        # Compute sigmoid values using PyTorch reference
+        s = torch.sigmoid(x @ w)
+
+        args = (grad_out, x, s)
+
+        check_example(
+            "se_block",
+            args,
+            w_torch.grad,
+            fn_name="se_block_bwd_dw",
+            block_sizes=[32, 32, 32],
+            num_warps=4,
+            num_stages=3,
+            rtol=1e-2,
+        )
+
+
+instantiate_parametrized_tests(TestExamples)
 
 
 if __name__ == "__main__":

@@ -175,7 +175,7 @@ class DESurrogateHybrid(DifferentialEvolutionSearch):
         self.generations_without_improvement = 0
 
         # Evolution loop
-        for gen in range(2, self.max_generations + 1):
+        for gen in self._budgeted_range(2, self.max_generations + 1):
             self.set_generation(gen)
             self._evolve_generation(gen)
 
@@ -215,7 +215,7 @@ class DESurrogateHybrid(DifferentialEvolutionSearch):
             selected_candidates = self._generate_de_candidates(self.population_size)
 
         # Evaluate selected candidates
-        new_members = self.parallel_benchmark_flat(selected_candidates)
+        new_members = self.benchmark_flat_batch(selected_candidates)
 
         # Track observations
         for member in new_members:
@@ -240,7 +240,7 @@ class DESurrogateHybrid(DifferentialEvolutionSearch):
 
     def _generate_de_candidates(self, n_candidates: int) -> list[FlatConfig]:
         """Generate candidates using standard DE mutation/crossover."""
-        with sync_seed():
+        with sync_seed(process_group_name=self.kernel.env.process_group_name):
             candidates = []
 
             for _ in range(n_candidates):
@@ -265,7 +265,7 @@ class DESurrogateHybrid(DifferentialEvolutionSearch):
         if len(self.all_observations) < 10:
             return  # Need minimum data
 
-        with sync_seed():
+        with sync_seed(process_group_name=self.kernel.env.process_group_name):
             # Encode configs to numeric arrays
             X = []
             y = []
@@ -311,7 +311,7 @@ class DESurrogateHybrid(DifferentialEvolutionSearch):
         """
         if self.surrogate is None:
             # Fallback: random selection
-            with sync_seed():
+            with sync_seed(process_group_name=self.kernel.env.process_group_name):
                 return random.sample(candidates, min(n_select, len(candidates)))
 
         # Predict performance for all candidates

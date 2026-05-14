@@ -68,7 +68,9 @@ runtime
 
    tile
    grid
+   jagged_tile
    static_range
+   barrier
    load
    store
    atomic_add
@@ -80,12 +82,13 @@ runtime
    atomic_min
    atomic_cas
    device_print
-   signal
-   wait
    stacktensor_like
    zeros
    full
    arange
+   rand
+   rand4x
+   randint
    subscript
    split
    join
@@ -94,8 +97,10 @@ runtime
    cumsum
    cumprod
    dot
+   dot_scaled
    inline_asm_elementwise
    inline_triton
+   triton_kernel
    register_block_size
    register_tunable
    constexpr

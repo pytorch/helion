@@ -14,6 +14,7 @@ import numpy as np
 import pytest
 import torch
 
+from helion._hardware import HardwareInfo
 from helion._testing import onlyBackends
 from helion.autotuner.aot_cache import ShapeKey
 from helion.autotuner.aot_cache import _deserialize_tuple
@@ -28,15 +29,21 @@ from helion.experimental.aot_kernel import extract_shape_features
 from helion.runtime.config import Config
 
 
-@onlyBackends(["triton"])
+@onlyBackends(["triton", "cute"])
 class TestShapeKey:
     """Tests for ShapeKey class."""
 
     def test_to_dict_and_back(self) -> None:
+        hardware = HardwareInfo(
+            device_kind="cuda",
+            hardware_name="RTX4090",
+            runtime_version="12.4",
+            compute_capability="sm89",
+        )
         key = ShapeKey(
             kernel_name="test_kernel",
             specialization_key=(1024, 2048, "float32"),
-            hardware_id="cuda_RTX4090_12.4",
+            hardware_id=hardware.hardware_id,
         )
         d = key.to_dict()
         restored = ShapeKey.from_dict(d)
@@ -52,7 +59,7 @@ class TestShapeKey:
         assert key1.stable_hash() != key3.stable_hash()
 
 
-@onlyBackends(["triton"])
+@onlyBackends(["triton", "cute"])
 class TestSerializeTuple:
     """Tests for tuple serialization."""
 
@@ -69,7 +76,7 @@ class TestSerializeTuple:
         assert deserialized == t
 
 
-@onlyBackends(["triton"])
+@onlyBackends(["triton", "cute"])
 class TestConfigSubsetSelection:
     """Tests for config subset selection algorithm."""
 
@@ -118,7 +125,7 @@ class TestConfigSubsetSelection:
         assert len(selected) == 2
 
 
-@onlyBackends(["triton"])
+@onlyBackends(["triton", "cute"])
 class TestGetAOTMode:
     """Tests for get_aot_mode."""
 
@@ -141,7 +148,7 @@ class TestGetAOTMode:
             get_aot_mode()
 
 
-@onlyBackends(["triton"])
+@onlyBackends(["triton", "cute"])
 class TestBatchedParameter:
     """Tests for the batched parameter in aot_kernel."""
 
@@ -240,7 +247,7 @@ class TestBatchedParameter:
         assert features_with_batched == features_without_batched
 
 
-@onlyBackends(["triton"])
+@onlyBackends(["triton", "cute"])
 class TestConfigValidityPartitioning:
     """Tests for config validity partitioning in select_config_subset."""
 

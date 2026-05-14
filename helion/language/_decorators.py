@@ -36,6 +36,24 @@ if TYPE_CHECKING:
         def __call__(self, fn: Callable[..., _T]) -> object: ...
 
 
+class CodegenDict(dict[str, "Callable[[CodegenState], object]"]):
+    """A dict subclass that falls back to the 'common' key when a backend key is missing."""
+
+    def __missing__(self, key: str) -> Callable[[CodegenState], object]:
+        if key != "common" and "common" in self:
+            return self["common"]
+        raise KeyError(key)
+
+    # pyrefly: ignore[bad-override]
+    def get(
+        self, key: str, default: Callable[[CodegenState], object] | None = None
+    ) -> Callable[[CodegenState], object] | None:
+        try:
+            return self[key]
+        except KeyError:
+            return default
+
+
 class APIFunc(Protocol):
     """Protocol for Helion API functions that define operations within kernel code.
 
@@ -72,7 +90,7 @@ class APIFunc(Protocol):
     _tiles_as_sizes: bool
     _cache_type: bool
     _type_function: Callable[..., TypeInfo] | None
-    _codegen: dict[str, Callable[[CodegenState], object]]
+    _codegen: CodegenDict
     _fake_fn: Callable[..., object] | None
     _prepare_args: Callable[[tuple[object, ...]], tuple[object, ...]]
     _get_masked_value: Callable[[torch.fx.Node], float | bool | None] | None
@@ -189,7 +207,7 @@ def api(
             api._prepare_args = no_op_prepare_args
         api._cache_type = cache_type
         api._type_function = None
-        api._codegen = {}
+        api._codegen = CodegenDict()
         api._fake_fn = None
         api._get_masked_value = None
         api._to_device_ir = None

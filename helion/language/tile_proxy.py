@@ -27,6 +27,7 @@ if TYPE_CHECKING:
 _tls: _TLS = cast("_TLS", threading.local())
 
 
+# pyrefly: ignore [inconsistent-inheritance]
 class Tile(TileInterface, torch.Tensor):
     """
     This class should not be instantiated directly, it is the result of

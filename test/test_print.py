@@ -32,8 +32,18 @@ def _store_capfd_on_class(request, capfd):
         request.cls._capfd = capfd
 
 
-@onlyBackends(["triton"])
+@onlyBackends(["triton", "cute"])
 class TestPrint(RefEagerTestDisabled, TestCase):
+    def assert_print_in_code(self, code: str, prefix: str, num_values: int = 0) -> None:
+        """Assert that print codegen for the given prefix is in the generated code."""
+        if _get_backend() == "cute":
+            fmt = prefix + " ".join(["{}"] * num_values)
+            self.assertIn(f"'{fmt}'", code)
+            self.assertIn(f"cute.printf('{fmt}'", code)
+        else:
+            self.assertIn(f"'{prefix}'", code)
+            self.assertIn(f"tl.device_print('{prefix}'", code)
+
     def run_kernel_and_capture_output(self, kernel_fn, args):
         """Helper to run kernel and capture output"""
         if hasattr(self, "_capfd"):
@@ -95,6 +105,10 @@ class TestPrint(RefEagerTestDisabled, TestCase):
 
     def run_test_with_and_without_triton_interpret_envvar(self, test_func):
         """Helper to run a test function with and without TRITON_INTERPRET=1"""
+        if _get_backend() == "cute":
+            test_func(interpret_mode=False)
+            return
+
         original_env = os.environ.get("TRITON_INTERPRET")
 
         try:
@@ -137,8 +151,7 @@ class TestPrint(RefEagerTestDisabled, TestCase):
             torch.testing.assert_close(result, x * 2)
 
             # Check that print is generated in the code
-            self.assertIn("'tensor value: '", code)
-            self.assertIn("tl.device_print('tensor value: '", code)
+            self.assert_print_in_code(code, "tensor value: ", num_values=1)
 
             # On ROCm the HIP device printf buffer (12KB) may truncate some
             # output lines, so check the whole output rather than every line.
@@ -171,8 +184,7 @@ class TestPrint(RefEagerTestDisabled, TestCase):
             )
             torch.testing.assert_close(result, x + y)
 
-            self.assertIn("'x and y: '", code)
-            self.assertIn("tl.device_print('x and y: '", code)
+            self.assert_print_in_code(code, "x and y: ", num_values=2)
 
             self.assertIn("x and y:", output)
             self.assertTrue("10" in output or "20" in output)
@@ -263,8 +275,7 @@ class TestPrint(RefEagerTestDisabled, TestCase):
             )
             torch.testing.assert_close(result, x * 2)
 
-            self.assertIn("'processing tile'", code)
-            self.assertIn("tl.device_print('processing tile'", code)
+            self.assert_print_in_code(code, "processing tile")
 
             if not interpret_mode:
                 self.assertIn("processing tile", output)
@@ -301,9 +312,9 @@ class TestPrint(RefEagerTestDisabled, TestCase):
             expected = x @ y
             torch.testing.assert_close(result, expected)
 
-            self.assertIn("'inner loop x: '", code)
-            self.assertIn("'inner loop y: '", code)
-            self.assertIn("'accumulator: '", code)
+            self.assert_print_in_code(code, "inner loop x: ", num_values=1)
+            self.assert_print_in_code(code, "inner loop y: ", num_values=1)
+            self.assert_print_in_code(code, "accumulator: ", num_values=1)
 
             self.assertIn("inner loop x:", output)
             self.assertIn("inner loop y:", output)
@@ -367,8 +378,8 @@ class TestPrint(RefEagerTestDisabled, TestCase):
             expected = torch.where(x > 0, x * 2, x * 3)
             torch.testing.assert_close(result, expected)
 
-            self.assertIn("'value is positive: '", code)
-            self.assertIn("'value sign: '", code)
+            self.assert_print_in_code(code, "value is positive: ", num_values=1)
+            self.assert_print_in_code(code, "value sign: ", num_values=1)
 
             self.assertIn("value is positive:", output)
             self.assertIn("value sign:", output)
@@ -402,9 +413,9 @@ class TestPrint(RefEagerTestDisabled, TestCase):
             )
             torch.testing.assert_close(result, x + y + x * y)
 
-            self.assertIn("'sum: '", code)
-            self.assertIn("'product: '", code)
-            self.assertIn("'x/y ratio: '", code)
+            self.assert_print_in_code(code, "sum: ", num_values=1)
+            self.assert_print_in_code(code, "product: ", num_values=1)
+            self.assert_print_in_code(code, "x/y ratio: ", num_values=1)
 
             self.assertIn("sum:", output)
             self.assertIn("product:", output)
@@ -483,8 +494,8 @@ class TestPrint(RefEagerTestDisabled, TestCase):
             torch.testing.assert_close(result, x_float + x_int.float())
 
             # Check that prints are generated
-            self.assertIn("'float val: '", code)
-            self.assertIn("'int val: '", code)
+            self.assert_print_in_code(code, "float val: ", num_values=1)
+            self.assert_print_in_code(code, "int val: ", num_values=1)
 
             self.assertIn("float val:", output)
             self.assertIn("int val:", output)
@@ -530,11 +541,8 @@ class TestPrint(RefEagerTestDisabled, TestCase):
             torch.testing.assert_close(result, x + y + z)
 
             # Check that print is generated with multiple arguments
-            self.assertIn("'unpacked values: '", code)
-            self.assertIn("'unpacked tuple: '", code)
-            # Should have multiple tl.device_print calls with the unpacked args
-            self.assertIn("tl.device_print('unpacked values: '", code)
-            self.assertIn("tl.device_print('unpacked tuple: '", code)
+            self.assert_print_in_code(code, "unpacked values: ", num_values=3)
+            self.assert_print_in_code(code, "unpacked tuple: ", num_values=3)
 
             self.assertTrue("unpacked values:" in output or "unpacked tuple:" in output)
 

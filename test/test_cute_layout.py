@@ -14,6 +14,7 @@ from helion._compiler.cute.layout_propagation import META_KEY
 from helion._testing import DEVICE
 from helion._testing import onlyBackends
 import helion.language as hl
+from helion.language import reduce_ops
 
 
 @onlyBackends(["cute"])
@@ -173,11 +174,19 @@ class TestLayoutChangeInsertion(unittest.TestCase):
         graph = torch.fx.Graph()
         x = graph.placeholder("x")
         x.meta["val"] = torch.randn(tile_numel)
-        x.meta[META_KEY] = LayoutConstraint(preferred=src_layout, layout=src_layout)
+        x.meta[META_KEY] = LayoutConstraint(
+            preferred_output=src_layout,
+            output_layout=src_layout,
+        )
 
         add = graph.call_function(torch.add, args=(x, x))
         add.meta["val"] = torch.randn(tile_numel)
-        add.meta[META_KEY] = LayoutConstraint(preferred=dst_layout, layout=dst_layout)
+        add.meta[META_KEY] = LayoutConstraint(
+            preferred_input=dst_layout,
+            preferred_output=dst_layout,
+            input_layout=dst_layout,
+            output_layout=dst_layout,
+        )
 
         graph.output(add)
         return graph
@@ -242,7 +251,7 @@ class TestLayoutChangeInsertion(unittest.TestCase):
         self.assertIn("cute_layout_change_src", cn.meta)
         self.assertIn("lowering", cn.meta)
         self.assertEqual(cn.meta["cute_layout_change_src"].num_threads(), 32)
-        self.assertEqual(cn.meta[META_KEY].layout.num_threads(), 32)
+        self.assertEqual(cn.meta[META_KEY].output_layout.num_threads(), 32)
 
     def test_no_change_when_multi_value(self) -> None:
         """No layout change for multi-value layouts (codegen only handles scalars)."""
@@ -275,18 +284,30 @@ class TestLayoutChangeInsertion(unittest.TestCase):
         x.meta["val"] = torch.randn(128)
         # Producer: 128-element tile (e.g. reduction input layout)
         x.meta[META_KEY] = LayoutConstraint(
-            preferred=ThreadLayout.make_1d(
+            preferred_output=ThreadLayout.make_1d(
                 128, num_threads=32, tag=LayoutTag.REDUCTION
             ),
-            layout=ThreadLayout.make_1d(128, num_threads=32, tag=LayoutTag.REDUCTION),
+            output_layout=ThreadLayout.make_1d(
+                128, num_threads=32, tag=LayoutTag.REDUCTION
+            ),
         )
 
         add = graph.call_function(torch.add, args=(x, x))
         add.meta["val"] = torch.randn(4)
         # Consumer: 4-element tile (e.g. store after reduction collapsed a dim)
         add.meta[META_KEY] = LayoutConstraint(
-            preferred=ThreadLayout.make_1d(4, num_threads=4, tag=LayoutTag.COALESCED),
-            layout=ThreadLayout.make_1d(4, num_threads=4, tag=LayoutTag.COALESCED),
+            preferred_input=ThreadLayout.make_1d(
+                4, num_threads=4, tag=LayoutTag.COALESCED
+            ),
+            preferred_output=ThreadLayout.make_1d(
+                4, num_threads=4, tag=LayoutTag.COALESCED
+            ),
+            input_layout=ThreadLayout.make_1d(
+                4, num_threads=4, tag=LayoutTag.COALESCED
+            ),
+            output_layout=ThreadLayout.make_1d(
+                4, num_threads=4, tag=LayoutTag.COALESCED
+            ),
         )
 
         graph.output(add)
@@ -306,19 +327,29 @@ class TestLayoutChangeInsertion(unittest.TestCase):
         x.meta["val"] = torch.randn(128)
         # Same tile_numel (128) but different thread counts
         x.meta[META_KEY] = LayoutConstraint(
-            preferred=ThreadLayout.make_1d(
+            preferred_output=ThreadLayout.make_1d(
                 128, num_threads=32, tag=LayoutTag.COALESCED
             ),
-            layout=ThreadLayout.make_1d(128, num_threads=32, tag=LayoutTag.COALESCED),
+            output_layout=ThreadLayout.make_1d(
+                128, num_threads=32, tag=LayoutTag.COALESCED
+            ),
         )
 
         add = graph.call_function(torch.add, args=(x, x))
         add.meta["val"] = torch.randn(128)
         add.meta[META_KEY] = LayoutConstraint(
-            preferred=ThreadLayout.make_1d(
+            preferred_input=ThreadLayout.make_1d(
                 128, num_threads=64, tag=LayoutTag.REDUCTION
             ),
-            layout=ThreadLayout.make_1d(128, num_threads=64, tag=LayoutTag.REDUCTION),
+            preferred_output=ThreadLayout.make_1d(
+                128, num_threads=64, tag=LayoutTag.REDUCTION
+            ),
+            input_layout=ThreadLayout.make_1d(
+                128, num_threads=64, tag=LayoutTag.REDUCTION
+            ),
+            output_layout=ThreadLayout.make_1d(
+                128, num_threads=64, tag=LayoutTag.REDUCTION
+            ),
         )
 
         graph.output(add)
@@ -327,6 +358,62 @@ class TestLayoutChangeInsertion(unittest.TestCase):
         node_count_after = len(list(graph.nodes))
         # No change inserted — thread counts differ
         self.assertEqual(node_count_before, node_count_after)
+
+    def test_validate_rejects_unresolved_mismatch(self) -> None:
+        from helion._compiler.cute.layout_propagation import _validate_layout_contracts
+        from helion.exc import BackendUnsupported
+
+        src = ThreadLayout.make_row_major(
+            4, 32, num_threads=32, tag=LayoutTag.COALESCED
+        )
+        dst = ThreadLayout.make_col_major(
+            32, 4, num_threads=32, tag=LayoutTag.REDUCTION
+        )
+        graph = self._make_test_graph(src, dst)
+
+        with self.assertRaises(BackendUnsupported):
+            _validate_layout_contracts(_FakeGraphInfo(graph))  # type: ignore[arg-type]
+
+    def test_validate_allows_reduction_fallback_mismatch(self) -> None:
+        from helion._compiler.cute.layout import LayoutConstraint
+        from helion._compiler.cute.layout_propagation import _insert_layout_changes
+        from helion._compiler.cute.layout_propagation import _validate_layout_contracts
+
+        src = ThreadLayout.make_row_major(
+            4, 32, num_threads=32, tag=LayoutTag.COALESCED
+        )
+        reduce_layout = ThreadLayout.make_col_major(
+            32, 4, num_threads=32, tag=LayoutTag.REDUCTION
+        )
+
+        graph = torch.fx.Graph()
+        x = graph.placeholder("x")
+        x.meta["val"] = torch.randn(src.tile_numel())
+        x.meta[META_KEY] = LayoutConstraint(
+            preferred_output=src,
+            output_layout=src,
+        )
+
+        add = graph.call_function(torch.add, args=(x, x))
+        add.meta["val"] = torch.randn(src.tile_numel())
+        add.meta[META_KEY] = LayoutConstraint(
+            preferred_input=src,
+            preferred_output=src,
+            input_layout=src,
+            output_layout=src,
+        )
+
+        reduce = graph.call_function(reduce_ops._reduce, args=(0, x, 0))
+        reduce.meta["val"] = torch.randn(4)
+        reduce.meta[META_KEY] = LayoutConstraint(
+            preferred_input=reduce_layout,
+            input_layout=reduce_layout,
+        )
+
+        graph.output((add, reduce))
+
+        _insert_layout_changes(_FakeGraphInfo(graph))  # type: ignore[arg-type]
+        _validate_layout_contracts(_FakeGraphInfo(graph))  # type: ignore[arg-type]
 
 
 @onlyBackends(["cute"])

@@ -126,7 +126,11 @@ class PatternSearch(PopulationBasedSearch):
                 n_random = max(0, self.initial_population - len(pop))
                 pop.extend(self.config_gen.random_flat() for _ in range(n_random))
             return pop
-        return self.config_gen.random_population_flat(self.initial_population)
+        return self.config_gen.random_population_flat(
+            self.initial_population,
+            user_seed_configs=self._autotune_seed_configs(),
+            log_func=self.log,
+        )
 
     def _autotune(self) -> Config:
         initial_population_name = self.initial_population_strategy.name
@@ -137,10 +141,10 @@ class PatternSearch(PopulationBasedSearch):
         self.population = []
         for flat_config in self._generate_initial_population_flat():
             member = self.make_unbenchmarked(flat_config)
-            if member.config not in visited:
+            if member is not None and member.config not in visited:
                 visited.add(member.config)
                 self.population.append(member)
-        self.parallel_benchmark_population(self.population, desc="Initial population")
+        self.benchmark_population(self.population, desc="Initial population")
 
         # Compute adaptive compile timeout based on initial population compile times
         self.set_adaptive_compile_timeout(
@@ -164,7 +168,7 @@ class PatternSearch(PopulationBasedSearch):
             raise exc.NoConfigFound
 
         search_copies = [self._pattern_search_from(m, visited) for m in starting_points]
-        for generation in range(1, self.max_generations + 1):
+        for generation in self._budgeted_range(1, self.max_generations + 1):
             prior_best = self.best
             new_population = {id(prior_best): prior_best}
             num_neighbors = 0
@@ -190,7 +194,7 @@ class PatternSearch(PopulationBasedSearch):
             unbenchmarked = [m for m in self.population if len(m.perfs) == 0]
             if unbenchmarked:
                 self.set_generation(generation)
-                self.parallel_benchmark_population(
+                self.benchmark_population(
                     unbenchmarked, desc=f"Generation {generation}:"
                 )
             # higher-accuracy rebenchmark
@@ -217,7 +221,7 @@ class PatternSearch(PopulationBasedSearch):
             candidates = [current]
             for flat_config in self._generate_neighbors(current.flat_values):
                 new_member = self.make_unbenchmarked(flat_config)
-                if new_member.config not in visited:
+                if new_member is not None and new_member.config not in visited:
                     visited.add(new_member.config)
                     candidates.append(new_member)
             if len(candidates) <= 1:
@@ -261,8 +265,9 @@ class PatternSearch(PopulationBasedSearch):
         """
         Generate neighboring configurations by changing one or two parameters at a time.
         """
+        overridden = self.config_gen.overridden_flat_indices
         candidates_by_index = [
-            spec.pattern_neighbors(base[index])
+            spec.pattern_neighbors(base[index]) if index not in overridden else []
             for index, spec in enumerate(self.config_gen.flat_spec)
         ]
         assert len(candidates_by_index) == len(base)
@@ -276,7 +281,9 @@ class PatternSearch(PopulationBasedSearch):
                 neighbors.append(new_flat)
 
         # Block sizes are important enough to try pairs of changes at a time
-        block_indices = self.config_gen.block_size_indices
+        block_indices = [
+            i for i in self.config_gen.block_size_indices if i not in overridden
+        ]
         for i_pos, first in enumerate(block_indices):
             first_candidates = candidates_by_index[first]
             if not first_candidates:

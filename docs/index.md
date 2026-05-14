@@ -7,11 +7,12 @@
 
 installation
 Examples <./examples/index>
-api/index
 Tutorials <helion_tutorials>
+api/index
 Deployment <deployment_autotuning>
 TileIR Backend <tileir_backend>
 events
+Dashboard <https://helionlang.com/dashboard/>
 ```
 
 **Helion** is a Python-embedded domain-specific language (DSL) for
@@ -66,6 +67,7 @@ portable between different hardware. Helion automates and autotunes over:
     * PID swizzling for improved L2 cache reuse.
     * Loop reordering.
     * Persistent kernel strategies.
+    * Epilogue subtiling for matmul-heavy kernels (Blackwell GPUs).
     * Warp specialization choices, unrolling, and more.
 
 ## Try Helion Now

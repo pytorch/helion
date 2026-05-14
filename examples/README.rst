@@ -4,6 +4,34 @@ Helion Examples
 This directory contains examples demonstrating how to use Helion for high-performance tensor operations.
 The examples are organized into the following categories:
 
+Pretuned Kernels (run as-is, no autotuning)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The
+`pretuned_kernels/ <https://github.com/pytorch/helion/tree/main/pretuned_kernels>`_
+directory holds runnable kernels that ship with checked-in AOT heuristic
+files (currently tuned for NVIDIA B200 / sm100). Helion picks the
+checked-in config at startup, so these kernels run immediately without
+any online autotuning — useful as copy/paste recipes for common patterns
+or as a quick way to try Helion on a supported GPU. Each kernel module
+has a ``main()`` that benchmarks against the PyTorch eager baseline.
+
+- `vector_add <https://github.com/pytorch/helion/tree/main/pretuned_kernels/vector_add>`_
+  — element-wise addition.
+- `softmax <https://github.com/pytorch/helion/tree/main/pretuned_kernels/softmax>`_
+  — softmax with a long-context shape sweep.
+- `layer_norm <https://github.com/pytorch/helion/tree/main/pretuned_kernels/layer_norm>`_
+  — layer normalization across realistic hidden sizes.
+- `rms_norm <https://github.com/pytorch/helion/tree/main/pretuned_kernels/rms_norm>`_
+  — RMS normalization with NPOT and LLM-shaped inputs.
+- `cross_entropy <https://github.com/pytorch/helion/tree/main/pretuned_kernels/cross_entropy>`_
+  — cross-entropy across LLM vocabulary sizes.
+
+To pretune one of these kernels for a different GPU (or to ship a
+heuristic for your own kernel), see the
+:doc:`AOT Heuristic Tuning section </deployment_autotuning>` of the
+deployment guide.
+
 Basic Operations
 ~~~~~~~~~~~~~~~~
 

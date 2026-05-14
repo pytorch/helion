@@ -54,7 +54,7 @@ if TYPE_CHECKING:
 def kl_div_forward(
     y_pred: Tensor,  # input predictions in log-space, shape (BT, V)
     y_true: Tensor,  # target values, shape (BT, V)
-    log_target: bool = False,
+    log_target: hl.constexpr = False,  # pyrefly: ignore[bad-function-definition]
     reduction: str = "batchmean",
     eps: float = 1e-10,
 ) -> Tensor:

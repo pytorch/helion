@@ -245,11 +245,12 @@ if triton_is_available():
     def _min_dot_size(
         device: torch.device, lhs: torch.dtype, rhs: torch.dtype
     ) -> tuple[int, int, int]:
-        if device.type not in ["cuda", "xpu"]:
-            # TODO(jansel): support other hardware backends properly besides CUDA and XPU
-            return (16, 16, 16)
+        if device.type == "tpu":
+            # TPU Mosaic MXU tile: (8, 128) sublane × lane.
+            # pl.dot(lhs[M,K], rhs[K,N]) needs M>=8, K>=128, N>=128.
+            return (8, 128, 128)
 
-        if torch.xpu.is_available():
+        if device.type == "xpu" and torch.xpu.is_available():
             # pyrefly: ignore [missing-import]
             from triton.backends.intel.compiler import min_dot_size as min_dot_size_xpu
 
@@ -266,16 +267,26 @@ if triton_is_available():
             # pyrefly: ignore [bad-return]
             return tuple(int(v) for v in dot_size_val)
 
-        from triton.backends.nvidia.compiler import min_dot_size as min_dot_size_cuda
-
-        props = DeviceProperties.create(device)
-        return min_dot_size_cuda(
-            GPUTarget(
+        if device.type == "cuda":
+            props = DeviceProperties.create(device)
+            target = GPUTarget(
                 backend=props.type,
                 arch=props.cc,
                 warp_size=props.warp_size or 32,
             )
-        )(torch_dtype_to_tl(lhs), torch_dtype_to_tl(rhs))
+            if is_hip():
+                from triton.backends.amd.compiler import get_min_dot_size
+
+                get_min_size = get_min_dot_size(target)
+            else:
+                from triton.backends.nvidia.compiler import (
+                    min_dot_size as min_dot_size_cuda,
+                )
+
+                get_min_size = min_dot_size_cuda(target)
+            return get_min_size(torch_dtype_to_tl(lhs), torch_dtype_to_tl(rhs))
+
+        return (16, 16, 16)
 
     @functools.cache
     def use_tileir_tunables() -> bool:
@@ -317,6 +328,8 @@ else:
     def _min_dot_size(  # type: ignore[misc]
         device: torch.device, lhs: torch.dtype, rhs: torch.dtype
     ) -> tuple[int, int, int]:
+        if device.type == "tpu":
+            return (8, 128, 128)
         return (16, 16, 16)
 
     def use_tileir_tunables() -> bool:  # type: ignore[misc]
@@ -515,7 +528,18 @@ def supports_maxnreg() -> bool:
 
 @functools.cache
 def _supports_maxnreg() -> bool:
-    return torch.version.hip is None and torch.version.xpu is None
+    return (
+        torch.version.hip is None
+        and torch.version.xpu is None
+        and torch.cuda.is_available()
+    )
+
+
+@functools.cache
+def _regs_per_block() -> int:
+    """Max 32-bit registers per block on the current CUDA device."""
+    props = torch.cuda.get_device_properties(torch.cuda.current_device())
+    return props.regs_per_multiprocessor  # pyrefly: ignore[missing-attribute]
 
 
 @functools.cache
@@ -539,6 +563,8 @@ def requires_torch_version(min_version: str) -> bool:
 @functools.cache
 def supports_torch_compile_fusion() -> bool:
     """Check whether this PyTorch build exposes Helion's fusion entrypoint."""
+    if torch.xpu.is_available():
+        return False
     if not requires_torch_version("2.11"):
         return False
     try:

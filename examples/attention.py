@@ -61,7 +61,7 @@ def attention(
     assert head_dim == k_in.size(-1) == v_in.size(-1)
     q_view = q_in.reshape([-1, m_dim, head_dim])
     v_view = v_in.reshape([-1, n_dim, head_dim])
-    k_view = k_in.reshape([-1, n_dim, head_dim]).transpose(1, 2)
+    k_view = k_in.reshape([-1, n_dim, head_dim])
     out = torch.empty_like(q_view)
     sm_scale = 1.0 / math.sqrt(head_dim)
     qk_scale = sm_scale * 1.44269504  # 1/log(2)
@@ -71,10 +71,14 @@ def attention(
         acc = hl.zeros([tile_b, tile_m, head_dim], dtype=torch.float32)
         q = q_view[tile_b, tile_m, :]
         for tile_n in hl.tile(v_view.size(1)):
-            k = k_view[tile_b, :, tile_n]
-            qk = torch.bmm(q, k)
-            m_ij = torch.maximum(m_i, torch.amax(qk, -1) * qk_scale)
-            qk = qk * qk_scale - m_ij[:, :, None]
+            # scaling Q in-loop on-demand reduces spillage, faster than keeping pre-scaled Q
+            q_scaled = q * qk_scale
+            k = k_view[tile_b, tile_n, :]
+            # Keep scores in fp32 to match SDPA tolerances on bf16/fp16 inputs.
+            # same as hl.dot(q, k, out_dtype=torch.float32)
+            qk = torch.bmm(q_scaled, k.transpose(1, 2), torch.float32)
+            m_ij = torch.maximum(m_i, torch.amax(qk, -1))
+            qk = qk - m_ij[:, :, None]
             p = torch.exp2(qk)
             l_ij = torch.sum(p, -1)
             alpha = torch.exp2(m_i - m_ij)
@@ -84,7 +88,6 @@ def attention(
             p = p.to(v.dtype)
             acc = torch.baddbmm(acc, p, v)
             m_i = m_ij
-        m_i += torch.log2(l_i)
         acc = acc / l_i[:, :, None]
         out[tile_b, tile_m, :] = acc.to(out.dtype)
     return out.view(q_in.size())
@@ -153,6 +156,8 @@ def test(
         "flex": flex_compiled,
         "ref": ref_attention,
     }
+    if DEVICE.type == "tpu":
+        del baselines["flex"]
 
     run_example(attention, baselines, (q, k, v))
 

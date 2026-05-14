@@ -303,6 +303,27 @@ class TestBestAvailable(unittest.TestCase):
         re_flat = config_gen.flatten(restored)
         self.assertEqual(re_flat, flat)
 
+    def test_flatten_persistent_reduction_loop_roundtrip(self):
+        """Persistent reductions normalize to None but must round-trip to the flat sentinel."""
+        config_spec = ConfigSpec(backend=TritonBackend())
+        config_spec.block_sizes.append(
+            BlockSizeSpec(block_id=0, size_hint=64, min_size=16, max_size=256)
+        )
+        config_spec.reduction_loops.append(ReductionLoopSpec(block_id=1, size_hint=128))
+
+        config_gen = ConfigGeneration(config_spec)
+        default_flat = config_gen.default_flat()
+        rl_indices, rl_is_seq = config_gen._key_to_flat_indices["reduction_loops"]
+        self.assertTrue(rl_is_seq)
+        self.assertEqual(len(rl_indices), 1)
+        self.assertEqual(default_flat[rl_indices[0]], 128)
+
+        config = config_gen.unflatten(default_flat)
+        self.assertEqual(config.config["reduction_loops"], [None])
+
+        roundtripped = config_gen.flatten(config)
+        self.assertEqual(roundtripped, default_flat)
+
 
 class TestCacheMatching(unittest.TestCase):
     """Tests for cache file matching in warm start."""
@@ -550,6 +571,74 @@ class TestCacheMatching(unittest.TestCase):
             self.assertEqual(len(entries), 1)
             self.assertEqual(entries[0].config.config["block_sizes"], [64, 128])
 
+    def test_find_similar_matches_with_specialize_extras(self):
+        """FROM_BEST_AVAILABLE matches cache entries when hl.specialize() adds
+        extras to the full specialization key.
+
+        The cache stores _base_specialization_key (no extras) but the kernel's
+        specialization_key() appends hl.specialize() discoveries.  The lookup
+        must use the base key so it matches the stored format.
+        """
+        fingerprint = (("block_sizes", 2, 1, 1),)
+        fp_hash = hashlib.sha256(repr(fingerprint).encode("utf-8")).hexdigest()
+
+        base_spec_key = ("tensor_spec",)
+        # Full key has an extra element from hl.specialize(x.size(1))
+        full_spec_key = ("tensor_spec", 256)
+
+        with tempfile.TemporaryDirectory() as cache_dir:
+            # Cache entry stored with base key (as local_cache.py does)
+            self._write_best_config(
+                cache_dir,
+                "specialize.best_config",
+                hardware="NVIDIA GeForce RTX 4090",
+                spec_key=str(base_spec_key),
+                source_hash="hash1",
+                config_dict={"block_sizes": [64, 128], "num_warps": 4},
+                config_spec_hash=fp_hash,
+                flat_config=[64, 128, 4],
+            )
+
+            mock_search = MagicMock()
+            mock_search._skip_cache = False
+            mock_search.settings = MagicMock()
+            mock_search.settings.autotune_best_available_max_cache_scan = 500
+            mock_search.args = [torch.tensor([1.0], device=DEVICE)]
+            mock_search.config_spec = MagicMock()
+            mock_search.config_spec.structural_fingerprint_hash = MagicMock(
+                return_value=fp_hash
+            )
+
+            # Set up kernel with base key != full key (simulates hl.specialize())
+            mock_kernel = MagicMock()
+            mock_kernel._base_specialization_key = MagicMock(return_value=base_spec_key)
+            mock_kernel.specialization_key = MagicMock(return_value=full_spec_key)
+            mock_search.kernel.kernel = mock_kernel
+
+            # Use the REAL _get_current_hardware_and_specialization
+            mock_search._get_current_hardware_and_specialization = lambda: (
+                PopulationBasedSearch._get_current_hardware_and_specialization(
+                    mock_search
+                )
+            )
+
+            with (
+                patch(
+                    "helion.autotuner.local_cache.get_helion_cache_dir",
+                    return_value=Path(cache_dir),
+                ),
+                patch(
+                    "helion.autotuner.base_search.get_device_name",
+                    return_value="NVIDIA GeForce RTX 4090",
+                ),
+            ):
+                entries = PopulationBasedSearch._find_similar_cached_configs(
+                    mock_search, max_configs=10
+                )
+
+            self.assertEqual(len(entries), 1)
+            self.assertEqual(entries[0].config.config["block_sizes"], [64, 128])
+
 
 class TestIterCacheEntries(unittest.TestCase):
     """Tests for the iter_cache_entries() module-level API in local_cache."""
@@ -730,6 +819,7 @@ class TestSpecKeyNormalization(unittest.TestCase):
             mock_cache.key = key
             mock_cache._get_local_cache_path.return_value = cache_path
             mock_cache.kernel.backend_cache_key.return_value = None
+            mock_cache.autotuner.settings = Settings()
             # Make flatten() return a JSON-serializable list
             mock_cache.kernel.config_spec.create_config_generation.return_value.flatten.return_value = [
                 64,
@@ -744,6 +834,65 @@ class TestSpecKeyNormalization(unittest.TestCase):
             # put() stores raw str(v), so code object reprs are present
             self.assertIn("<code object", spec_key_str)
             self.assertIn("tensor_spec", spec_key_str)
+
+    def test_put_stores_acf_aware_flat_config(self):
+        """ACF cache keys and stored flat configs use the same flat layout."""
+        config_spec = ConfigSpec(backend=TritonBackend())
+        config_spec.block_sizes.append(
+            BlockSizeSpec(block_id=0, size_hint=64, min_size=16, max_size=256)
+        )
+        acf_files = ["/tmp/helion-test.acf"]
+        config = Config(
+            block_sizes=[64],
+            num_warps=4,
+            num_stages=3,
+            advanced_controls_file="/tmp/helion-test.acf",
+        )
+        acf_config_gen = config_spec.create_config_generation(
+            advanced_controls_files=acf_files
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache_path = Path(tmpdir) / "acf.best_config"
+            key = LooseAutotuneCacheKey(
+                specialization_key=("tensor_spec",),
+                extra_results=(),
+                kernel_source_hash="abc123",
+                hardware="test_hw",
+                runtime_name="1.0",
+                backend="triton",
+                config_spec_hash=config_spec.structural_fingerprint_hash(
+                    advanced_controls_files=acf_files
+                ),
+            )
+
+            mock_cache = MagicMock()
+            mock_cache.key = key
+            mock_cache._get_local_cache_path.return_value = cache_path
+            mock_cache.kernel.config_spec = config_spec
+            mock_cache.kernel.backend_cache_key.return_value = None
+            mock_cache.autotuner.settings = Settings(autotune_search_acf=acf_files)
+
+            LocalAutotuneCache.put(mock_cache, config)
+
+            data = json.loads(cache_path.read_text())
+            stored_flat = json.loads(data["flat_config"])
+            expected_flat = acf_config_gen.flatten(config)
+            self.assertEqual(stored_flat, expected_flat)
+            self.assertEqual(len(stored_flat), len(acf_config_gen.flat_spec))
+            entries = list(iter_cache_entries(Path(tmpdir)))
+            self.assertEqual(len(entries), 1)
+            self.assertEqual(entries[0].to_mutable_flat_config(), expected_flat)
+
+            roundtripped = acf_config_gen.unflatten(entries[0].to_mutable_flat_config())
+            self.assertEqual(
+                roundtripped.config["advanced_controls_file"],
+                "/tmp/helion-test.acf",
+            )
+            self.assertEqual(
+                data["key"]["fields"]["config_spec_hash"],
+                key.config_spec_hash,
+            )
 
 
 class TestStructuralFingerprint(unittest.TestCase):

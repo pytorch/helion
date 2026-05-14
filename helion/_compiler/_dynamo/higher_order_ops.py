@@ -279,9 +279,7 @@ def helion_kernel_wrapper_functional_dense(
     kernel_outputs = helion_kernel_wrapper_mutation(
         kernel_idx=kernel_idx,
         constant_args=constant_args,
-        tensor_args={
-            k: cloned.get(k, v) for k, v in tensor_args.items()
-        },  # pyrefly: ignore[bad-argument-type]
+        tensor_args={k: cloned.get(k, v) for k, v in tensor_args.items()},  # pyrefly: ignore[bad-argument-type]
         output_spec=output_spec,
     )
     return (kernel_outputs, cloned)

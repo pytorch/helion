@@ -12,6 +12,7 @@ from .barrier import barrier as barrier
 from .builtin_ops import _builtin_max as _builtin_max
 from .builtin_ops import _builtin_min as _builtin_min
 from .constexpr import ConstExpr as constexpr  # noqa: F401
+from .constexpr import ProcessGroupName as ProcessGroupName
 from .constexpr import specialize as specialize
 from .creation_ops import arange as arange
 from .creation_ops import full as full
@@ -30,6 +31,7 @@ from .matmul_ops import dot_scaled as dot_scaled
 from .memory_ops import load as load
 from .memory_ops import store as store
 from .random_ops import rand as rand
+from .random_ops import rand4x as rand4x
 from .random_ops import randint as randint
 from .reduce_ops import reduce as reduce
 from .scan_ops import associative_scan as associative_scan

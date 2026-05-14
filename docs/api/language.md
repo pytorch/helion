@@ -76,6 +76,14 @@ lets Helion apply the masking implicitly for indices beyond each lane's true len
 
 `static_range()` behaves like a compile-time unrolled range for small loops. It hints the compiler to fully unroll the loop body where profitable.
 
+### barrier()
+
+```{eval-rst}
+.. autofunction:: barrier
+```
+
+`barrier()` inserts a grid-wide synchronization point between top-level `hl.tile` or `hl.grid` loops. It forces persistent kernel execution so that all blocks complete one phase before the next begins.
+
 ## Memory Operations
 
 ### load()
@@ -202,7 +210,27 @@ def k(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 
 ### arange()
 
-See {func}`~helion.language.arange` for details.
+```{eval-rst}
+.. autofunction:: arange
+```
+
+### rand()
+
+```{eval-rst}
+.. autofunction:: rand
+```
+
+### rand4x()
+
+```{eval-rst}
+.. autofunction:: rand4x
+```
+
+### randint()
+
+```{eval-rst}
+.. autofunction:: randint
+```
 
 ## Tunable Parameters
 
@@ -269,21 +297,29 @@ The `Tile` class represents a portion of an iteration space with the following k
 
 ### reduce()
 
-See {func}`~helion.language.reduce` for details.
+```{eval-rst}
+.. autofunction:: reduce
+```
 
 ## Scan Operations
 
 ### associative_scan()
 
-See {func}`~helion.language.associative_scan` for details.
+```{eval-rst}
+.. autofunction:: associative_scan
+```
 
 ### cumsum()
 
-See {func}`~helion.language.cumsum` for details.
+```{eval-rst}
+.. autofunction:: cumsum
+```
 
 ### cumprod()
 
-See {func}`~helion.language.cumprod` for details.
+```{eval-rst}
+.. autofunction:: cumprod
+```
 
 ### tile_index()
 
@@ -319,20 +355,36 @@ See {func}`~helion.language.cumprod` for details.
 
 ### device_print()
 
-See {func}`~helion.language.device_print` for details.
+```{eval-rst}
+.. autofunction:: device_print
+```
 
 ## Constexpr Operations
 
 ### constexpr()
 
-See {class}`~helion.language.constexpr` for details.
+```{eval-rst}
+.. autoclass:: constexpr
+```
 
 ### specialize()
 
-See {func}`~helion.language.specialize` for details.
+```{eval-rst}
+.. autofunction:: specialize
+```
 
 ## Matrix Operations
 
 ### dot()
 
-See {func}`~helion.language.dot` for details.
+```{eval-rst}
+.. autofunction:: dot
+```
+
+### dot_scaled()
+
+```{eval-rst}
+.. autofunction:: dot_scaled
+```
+
+`dot_scaled()` performs block-scaled matrix multiplication using low-precision formats (e.g., `e2m1`, `e4m3`, `e5m2`). Each input matrix has an associated per-block scale tensor and format string. This maps to Triton's `tl.dot_scaled` for hardware-accelerated scaled dot products on supported architectures.

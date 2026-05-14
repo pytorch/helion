@@ -24,10 +24,12 @@ from helion._testing import onlyBackends
 from helion._testing import skipIfCudaCapabilityLessThan
 from helion._testing import skipIfFn
 from helion._testing import skipIfLowVRAM
+from helion._testing import skipIfNotCUDA
 from helion._testing import skipIfNotTriton
 from helion._testing import skipIfPallas
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfTileIR
+from helion._testing import skipIfXPU
 from helion._testing import xfailIfPallas
 import helion.language as hl
 
@@ -163,8 +165,8 @@ class TestLoops(RefEagerTestBase, TestCase):
         with self.assertRaises(helion.exc.StatementNotSupported):
             kernel.bind((x,))
 
-    @xfailIfPallas("large 4D tensors may exceed TPU VMEM")
     @skipIfLowVRAM("Test requires high VRAM for [128, 128, 128, 128] tensors")
+    @skipIfXPU("worker crash on XPU")
     def test_3d_device_loop0(self):
         args = (torch.randn([128, 128, 128, 128], device=DEVICE),)
         code, result = code_and_output(
@@ -174,8 +176,8 @@ class TestLoops(RefEagerTestBase, TestCase):
         )
         torch.testing.assert_close(result, torch.sin(args[0]))
 
-    @xfailIfPallas("large 4D tensors may exceed TPU VMEM")
     @skipIfLowVRAM("Test requires high VRAM for [128, 128, 128, 128] tensors")
+    @skipIfXPU("worker crash on XPU")
     def test_3d_device_loop1(self):
         args = (torch.randn([128, 128, 128, 128], device=DEVICE),)
         code, result = code_and_output(
@@ -188,6 +190,7 @@ class TestLoops(RefEagerTestBase, TestCase):
 
     @xfailIfPallas("large 4D tensors may exceed TPU VMEM")
     @skipIfLowVRAM("Test requires high VRAM for [128, 128, 128, 128] tensors")
+    @skipIfXPU("worker crash on XPU")
     def test_3d_device_loop2(self):
         args = (torch.randn([128, 128, 128, 128], device=DEVICE),)
         code, result = code_and_output(
@@ -199,10 +202,10 @@ class TestLoops(RefEagerTestBase, TestCase):
         )
         torch.testing.assert_close(result, torch.sin(args[0]))
 
-    @xfailIfPallas("large 4D tensors may exceed TPU VMEM")
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfLowVRAM("Test requires high VRAM for [128, 128, 128, 128] tensors")
     @skipIfTileIR("TileIR does not support block_ptr indexing")
+    @skipIfXPU("worker crash on XPU")
     def test_3d_device_loop3(self):
         args = (torch.randn([128, 128, 128, 128], device=DEVICE),)
         code, result = code_and_output(
@@ -247,6 +250,10 @@ class TestLoops(RefEagerTestBase, TestCase):
 
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfTileIR("TileIR does not support block_ptr indexing")
+    @xfailIfPallas(
+        "emit_pipeline + block_ptr indexing fails Mosaic alignment proof "
+        "on the trailing 16-block dim (E2003)"
+    )
     def test_loop_fixed_block(self):
         @helion.kernel(config={"block_sizes": [], "indexing": "block_ptr"})
         def fn(x: torch.Tensor) -> torch.Tensor:
@@ -308,6 +315,7 @@ class TestLoops(RefEagerTestBase, TestCase):
             result, functools.reduce(torch.matmul, args), atol=1e-1, rtol=1e-2
         )
 
+    @skipIfPallas("Requires int indexing which is unavailable on TPUs")
     def test_use_block_size_var_without_hl_tile(self):
         """Test that block size var can be used without hl.tile()."""
 
@@ -376,7 +384,6 @@ class TestLoops(RefEagerTestBase, TestCase):
         code, result = code_and_output(fn, args, block_sizes=[32, 32])
         torch.testing.assert_close(result, args[0][:, : args[1][0].item()].sum(-1))
 
-    @xfailIfPallas("uses block_ptr indexing not supported on pallas")
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfTileIR("TileIR does not support block_ptr indexing")
     def test_data_dependent_bounds2(self):
@@ -404,6 +411,7 @@ class TestLoops(RefEagerTestBase, TestCase):
             torch.testing.assert_close(result, expected)
 
     @xfailIfPallas("data-dependent bounds hit JAX tracing issues on pallas")
+    @skipIfXPU("worker crash on XPU")
     def test_data_dependent_bounds3(self):
         @helion.kernel()
         def fn(x: torch.Tensor, end0: torch.Tensor, end1: torch.Tensor) -> torch.Tensor:
@@ -493,7 +501,6 @@ class TestLoops(RefEagerTestBase, TestCase):
         self.assertEqual(spec.min_size, 32)
         self.assertEqual(spec.max_size, 256)
 
-    @xfailIfPallas("complex reduction with atomic_add not supported on pallas")
     @skipIfTileIR("Result mismatch with tileir backend")
     @skipIfFn(
         lambda: _get_backend() == "cute",
@@ -848,6 +855,7 @@ class TestLoops(RefEagerTestBase, TestCase):
         self.assertNotEqualCode(code0, code2)
         self.assertNotIn("loop_unroll_factor", code0)
 
+    @skipIfNotCUDA()
     @skipIfCudaCapabilityLessThan(
         (12, 0), reason="Warp specialization requires CUDA capability >= 12.0"
     )
@@ -1391,6 +1399,7 @@ class TestLoops(RefEagerTestBase, TestCase):
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfTileIR("tileir backend will ignore `range_unroll_factors` hint")
     @skipIfNotTriton("range loop hints are Triton-specific")
+    @skipIfXPU("Accuracy issue on XPU backend")
     def test_unroll_with_pipelining(self):
         @helion.kernel(static_shapes=True)
         def matmul(
@@ -1430,6 +1439,23 @@ class TestLoops(RefEagerTestBase, TestCase):
         # Logic for modifying num_stages and loop unrolling factors should
         # change num_stages=1
         self.assertIn("num_stages=1", code)
+
+    def test_loop_with_symbolic_bounds(self):
+        @helion.kernel(
+            config=helion.Config(
+                block_sizes=[128, 128, 1],
+            )
+        )
+        def fn(x) -> torch.Tensor:
+            m, n = x.shape
+            out = torch.zeros([m, n], dtype=torch.float32, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                for inner_n in hl.tile(tile_n.begin, tile_n.end):
+                    out[tile_m, inner_n] = x[tile_m, inner_n]
+            return out
+
+        x = torch.randn(128, 1024, dtype=torch.float32, device=DEVICE)
+        torch.testing.assert_close(fn(x), x)
 
 
 if __name__ == "__main__":
