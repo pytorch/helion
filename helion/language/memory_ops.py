@@ -3315,15 +3315,16 @@ def _codegen_cute_store_tcgen05_tile(
             # per-tile C-store setup. The subtile loop acquires only later
             # stages, so C-stage waits can overlap setup, the first
             # acc-pipeline wait, and the other epi warps' TMEM
-            # load/conversion work on later subtile iterations. The
-            # diagnostic tcgen05_c_acquire_placement=first_in_loop moves only
-            # that first acquire into the subtile loop; later acquires and
-            # the accumulator wait keep their default order. The diagnostic
-            # later_before_barrier placement keeps the first acquire in
-            # production position and moves only later-subtile acquires just
-            # before the first epilogue barrier. The diagnostic
-            # tcgen05_acc_wait_placement=before_subtile_loop keeps both C
-            # acquire sites in production position and moves only the
+            # load/conversion work on later subtile iterations. Most alternate
+            # placements are diagnostics, but the edge+K-tail production seed
+            # uses the measured first_in_loop / before_subtile_loop pair.
+            # tcgen05_c_acquire_placement=first_in_loop moves only that first
+            # acquire into the subtile loop; later acquires and the accumulator
+            # wait keep their default order. The diagnostic later_before_barrier
+            # placement keeps the first acquire in production position and
+            # moves only later-subtile acquires just before the first epilogue
+            # barrier. tcgen05_acc_wait_placement=before_subtile_loop keeps
+            # both C acquire sites in production position and moves only the
             # accumulator consumer wait before the subtile loop.
             # A CTA-scoped named barrier ensures all epi warps have observed
             # warp 0's acquire before they write SMEM; a second barrier ensures
