@@ -215,6 +215,11 @@ def _ast_expr_to_msl(node: ast.AST) -> str:
         left = _ast_expr_to_msl(node.left)
         right = _ast_expr_to_msl(node.right)
         op = node.op
+        if isinstance(op, ast.Mult):
+            if isinstance(node.right, ast.Constant) and node.right.value == 1:
+                return left
+            if isinstance(node.left, ast.Constant) and node.left.value == 1:
+                return right
         if isinstance(op, ast.FloorDiv):
             # FloorDiv comes from Helion's index arithmetic (sympy FloorDiv),
             # not from MetalOverrides (which emits c10.metal.floor_divide as
