@@ -144,6 +144,12 @@ from helion._compiler.cute.tcgen05_constants import TCGEN05_LARGE_BN_PROOF_CONFI
 from helion._compiler.cute.tcgen05_constants import TCGEN05_LARGE_BN_PROOF_PID_TYPE
 from helion._compiler.cute.tcgen05_constants import TCGEN05_LARGE_BN_PROOF_STAGE_CONFIGS
 from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_SCHED_CONSUMER_WAIT_MODE_CONFIG_KEY,
+)
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_SCHED_CONSUMER_WAIT_MODE_WARP_LEADER,
+)
+from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_TWO_CTA_EDGE_K_TAIL_AB_STAGES,
 )
 from helion._compiler.cute.tcgen05_constants import (
@@ -2714,6 +2720,26 @@ class TestCuteLowerings(unittest.TestCase):
         # plus the cluster-broadcast publish via _cute_store_shared_remote_x4.
         self.assertIn("cute.arch.block_idx_in_cluster()) == cutlass.Int32(0)", code)
         self.assertIn("_cute_store_shared_remote_x4", code)
+        sched_tail = (
+            "tcgen05_sched_pipeline.producer_tail("
+            "tcgen05_sched_pipeline_producer_state)"
+        )
+        self.assertEqual(code.count(sched_tail), 1, code)
+        self.assertLess(
+            code.rindex("_cute_store_shared_remote_x4"), code.index(sched_tail)
+        )
+        self.assertIn(
+            "tcgen05_clc_sched_barrier_ptr = "
+            "tcgen05_sched_pipeline.producer_get_barrier("
+            "tcgen05_sched_pipeline_consumer_state)",
+            code,
+        )
+        self.assertNotIn(
+            "tcgen05_clc_sched_barrier_ptr = "
+            "tcgen05_sched_pipeline.producer_get_barrier("
+            "tcgen05_sched_pipeline_producer_state)",
+            code,
+        )
         # CLC sched_pipeline uses cluster-routed empty mbar
         # (consumer_mask=Int32(0)) for cluster_m>1, mirroring Quack's
         # make_sched_pipeline pattern. Anchor on the
@@ -2751,6 +2777,51 @@ class TestCuteLowerings(unittest.TestCase):
         )
         sched_create_call = code[sched_create_match.start() : close_idx + 1]
         self.assertIn("consumer_mask=cutlass.Int32(0)", sched_create_call)
+
+    def test_tcgen05_clc_persistent_cluster_m1_scheduler_tail_codegen(self) -> None:
+        """CLC cluster_m=1 also drains the scheduler pipeline after sentinel."""
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_clc_m1(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        args = (
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+        )
+        config = _make_tcgen05_persistent_config(
+            block_sizes=[128, 256, 16],
+            pid_type="persistent_interleaved",
+            tcgen05_cluster_m=1,
+            tcgen05_strategy="role_local_with_scheduler",
+            tcgen05_warp_spec_scheduler_warps=1,
+            tcgen05_persistence_model="clc_persistent",
+            indexing=[
+                "tensor_descriptor",
+                "tensor_descriptor",
+                "tensor_descriptor",
+            ],
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_clc_m1.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            code = bound.to_triton_code(config)
+
+        sched_tail = (
+            "tcgen05_sched_pipeline.producer_tail("
+            "tcgen05_sched_pipeline_producer_state)"
+        )
+        self.assertEqual(code.count(sched_tail), 1, code)
+        sentinel_valid_store = "[cutlass.Int32(3)] = cutlass.Int32(0)"
+        self.assertLess(code.rindex(sentinel_valid_store), code.index(sched_tail))
 
     def test_tcgen05_clc_persistent_does_not_perturb_monolithic(self) -> None:
         """``ROLE_LOCAL_MONOLITHIC`` codegen keeps the static
@@ -12458,6 +12529,91 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
             f"cutlass.Int32({expected_arrive}))",
             code,
         )
+
+    def test_sched_pipeline_warp_leader_wait_mode_codegen(self) -> None:
+        """Diagnostic sched wait mode gates consumer_wait to lane 0."""
+
+        kernel = self._residual_kernel()
+        args = (
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+        )
+        config = self._canonical_c_input_config()
+        config.config[TCGEN05_SCHED_CONSUMER_WAIT_MODE_CONFIG_KEY] = (
+            TCGEN05_SCHED_CONSUMER_WAIT_MODE_WARP_LEADER
+        )
+        with patch_cute_mma_support():
+            bound = kernel.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            code = bound.to_triton_code(config)
+            normal_config = self._canonical_c_input_config()
+            normal_code = bound.to_triton_code(normal_config)
+
+        wait = (
+            "tcgen05_sched_pipeline.consumer_wait("
+            "tcgen05_sched_pipeline_consumer_state)"
+        )
+        leader = "if cute.arch.lane_idx() == cutlass.Int32(0):"
+
+        normal_lines = normal_code.splitlines()
+        normal_wait_lines = [
+            idx for idx, line in enumerate(normal_lines) if line.strip() == wait
+        ]
+        self.assertEqual(
+            len(normal_wait_lines),
+            normal_code.count("tcgen05_sched_pipeline.consumer_wait("),
+            normal_code,
+        )
+        for idx in normal_wait_lines:
+            self.assertNotEqual(normal_lines[idx - 1].strip(), leader, normal_code)
+
+        lines = code.splitlines()
+        wait_lines = [idx for idx, line in enumerate(lines) if line.strip() == wait]
+        self.assertEqual(
+            len(wait_lines),
+            code.count("tcgen05_sched_pipeline.consumer_wait("),
+            code,
+        )
+        self.assertGreater(len(wait_lines), 1, code)
+        for idx in wait_lines:
+            self.assertGreater(idx, 0, code)
+            self.assertLess(idx + 3, len(lines), code)
+            leader_line = lines[idx - 1]
+            self.assertEqual(leader_line.strip(), leader, code)
+            leader_indent = leader_line[: len(leader_line) - len(leader_line.lstrip())]
+            self.assertTrue(lines[idx].startswith(f"{leader_indent}    "), code)
+            self.assertEqual(lines[idx + 1].strip(), "cute.arch.sync_warp()", code)
+            self.assertEqual(
+                lines[idx + 2].strip(),
+                "cute.arch.fence_view_async_shared()",
+                code,
+            )
+            self.assertEqual(lines[idx + 3].strip(), "cute.arch.sync_warp()", code)
+
+    def test_sched_pipeline_warp_leader_wait_mode_runtime_correctness(self) -> None:
+        """Runtime smoke test for the diagnostic sched wait topology."""
+
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+
+        torch.manual_seed(0)
+        x = torch.randn(1024, 1024, dtype=torch.bfloat16, device=DEVICE)
+        y = torch.randn(1024, 1024, dtype=torch.bfloat16, device=DEVICE)
+        residual = torch.randn(1024, 1024, dtype=torch.bfloat16, device=DEVICE)
+        kernel = self._residual_kernel()
+        config = self._canonical_c_input_config()
+        config.config[TCGEN05_SCHED_CONSUMER_WAIT_MODE_CONFIG_KEY] = (
+            TCGEN05_SCHED_CONSUMER_WAIT_MODE_WARP_LEADER
+        )
+        bound = kernel.bind((x, y, residual))
+        bound.env.config_spec.cute_tcgen05_search_enabled = True
+        bound.set_config(config)
+        out = bound(x, y, residual)
+        expected = (x @ y + residual).to(x.dtype)
+        torch.testing.assert_close(out, expected, atol=2e-1, rtol=1e-2)
 
     def test_aux_pipeline_smem_ring_allocation_codegen(self) -> None:
         """The aux SMEM ring + ``c_pipeline_aux`` materialize when

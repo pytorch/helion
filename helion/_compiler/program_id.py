@@ -18,6 +18,9 @@ from .compile_environment import CompileEnvironment
 from .cute.cutedsl_compat import emit_pipeline_advance
 from .cute.strategies import TCGEN05_L2_SWIZZLE_SIZE_DEFAULT
 from .cute.strategies import l2_swizzle_size_from_config
+from .cute.tcgen05_constants import TCGEN05_SCHED_CONSUMER_WAIT_MODE_CONFIG_KEY
+from .cute.tcgen05_constants import TCGEN05_SCHED_CONSUMER_WAIT_MODE_NORMAL
+from .cute.tcgen05_constants import TCGEN05_SCHED_CONSUMER_WAIT_MODE_WARP_LEADER
 from .cute.tcgen05_constants import TCGEN05_TWO_CTA_MAX_K_TILES
 from .device_function import DeviceFunction
 from .device_function import TensorArg
@@ -96,7 +99,39 @@ def _build_sched_pipeline_consumer_wait_block(
     pattern (insertion-point-specific copies of the same shape)
     so downstream AST passes are not corrupted by sharing nodes
     across multiple parents.
+
+    Diagnostic ``tcgen05_sched_consumer_wait_mode="warp_leader"``
+    instead gates ``consumer_wait`` to lane 0 and reconverges the warp
+    before the async-shared fence. This is a profiling-only wait topology
+    experiment; the normal whole-warp wait path remains the default because
+    B200 timing showed the lane-0 variant is slower.
     """
+    try:
+        wait_mode = DeviceFunction.current().config.get(
+            TCGEN05_SCHED_CONSUMER_WAIT_MODE_CONFIG_KEY,
+            TCGEN05_SCHED_CONSUMER_WAIT_MODE_NORMAL,
+        )
+    except NoCurrentFunction:
+        wait_mode = TCGEN05_SCHED_CONSUMER_WAIT_MODE_NORMAL
+    if wait_mode == TCGEN05_SCHED_CONSUMER_WAIT_MODE_WARP_LEADER:
+        return [
+            create(
+                ast.If,
+                test=expr_from_string("cute.arch.lane_idx() == cutlass.Int32(0)"),
+                body=[
+                    statement_from_string(
+                        f"{sched_pipeline}.consumer_wait({sched_consumer_state})"
+                    ),
+                ],
+                orelse=[],
+            ),
+            statement_from_string("cute.arch.sync_warp()"),
+            statement_from_string("cute.arch.fence_view_async_shared()"),
+            statement_from_string("cute.arch.sync_warp()"),
+            statement_from_string(
+                f"{valid_var} = {work_tile_smem}[cutlass.Int32(3)] != cutlass.Int32(0)"
+            ),
+        ]
     return [
         statement_from_string(
             f"{sched_pipeline}.consumer_wait({sched_consumer_state})"
@@ -2955,6 +2990,7 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         assert sched_plan is not None
         sched_pipeline = sched_plan.pipeline
         sched_producer_state = sched_plan.producer_state
+        sched_consumer_state = sched_plan.consumer_state
         clc_response_smem_ptr = sched_plan.clc_response_smem_ptr
         clc_mbar_smem_ptr = sched_plan.clc_mbar_smem_ptr
         clc_mbar_phase = sched_plan.clc_mbar_phase
@@ -3116,9 +3152,11 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                 statement_from_string(
                     f"{sched_pipeline}.producer_acquire({sched_producer_state})"
                 ),
+                # Remote stores arm the current full barrier, matching Quack's
+                # PipelineState pairing and the clustered static mailbox bridge.
                 statement_from_string(
                     f"{sched_barrier_ptr} = "
-                    f"{sched_pipeline}.producer_get_barrier({sched_producer_state})"
+                    f"{sched_pipeline}.producer_get_barrier({sched_consumer_state})"
                 ),
                 statement_from_string(f"{sched_peer_rank} = cute.arch.lane_idx()"),
                 create(
@@ -3312,9 +3350,11 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                 statement_from_string(
                     f"{sched_pipeline}.producer_acquire({sched_producer_state})"
                 ),
+                # Remote stores arm the current full barrier, matching Quack's
+                # PipelineState pairing and the clustered static mailbox bridge.
                 statement_from_string(
                     f"{sched_barrier_ptr} = "
-                    f"{sched_pipeline}.producer_get_barrier({sched_producer_state})"
+                    f"{sched_pipeline}.producer_get_barrier({sched_consumer_state})"
                 ),
                 statement_from_string(f"{sched_peer_rank} = cute.arch.lane_idx()"),
                 create(
@@ -3375,6 +3415,14 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             [
                 *sentinel_warp,
                 statement_from_string(emit_pipeline_advance(sched_producer_state)),
+                # Quack drains the scheduler pipeline from the whole scheduler
+                # warp after publishing the invalid work tile. Helion's
+                # scheduler warp does not consume its own mailbox, so tail here
+                # waits for consumer roles to release the sentinel before the
+                # scheduler role exits.
+                statement_from_string(
+                    f"{sched_pipeline}.producer_tail({sched_producer_state})"
+                ),
                 statement_from_string("cute.arch.sync_warp()"),
             ]
         )
