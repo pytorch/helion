@@ -712,6 +712,43 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         self.assertEqual(
             raw_seed["indexing"], ["tensor_descriptor"] * spec.indexing.length
         )
+        from helion._compiler.cute.strategies import Tcgen05Strategy
+
+        c_input_seeds = [
+            config.config
+            for config in spec.autotune_seed_configs()
+            if config.config.get("tcgen05_warp_spec_c_input_warps") == 1
+        ]
+        self.assertEqual(len(c_input_seeds), 1)
+        c_input_seed = c_input_seeds[0]
+        self.assertEqual(
+            c_input_seed["tcgen05_strategy"],
+            Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER.value,
+        )
+        self.assertEqual(c_input_seed["tcgen05_warp_spec_scheduler_warps"], 1)
+        self.assertEqual(c_input_seed["tcgen05_warp_spec_c_input_warps"], 1)
+        self.assertEqual(
+            c_input_seed["block_sizes"],
+            [
+                TCGEN05_TWO_CTA_BLOCK_M,
+                TCGEN05_TWO_CTA_BLOCK_N,
+                TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K,
+            ],
+        )
+        self.assertEqual(
+            c_input_seed["tcgen05_acc_stages"],
+            TCGEN05_TWO_CTA_EDGE_K_TAIL_ACC_STAGES,
+        )
+        self.assertEqual(
+            c_input_seed["tcgen05_c_stages"],
+            TCGEN05_TWO_CTA_EDGE_K_TAIL_C_STAGES,
+        )
+        self.assertEqual(
+            c_input_seed["l2_groupings"], [TCGEN05_TWO_CTA_SEED_L2_GROUPING]
+        )
+        self.assertEqual(
+            c_input_seed["indexing"], ["tensor_descriptor"] * spec.indexing.length
+        )
 
         config_gen = spec.create_config_generation()
         seed_pairs = config_gen.seed_flat_config_pairs()
@@ -746,6 +783,74 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             configs,
             expected_block_k=TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K,
             expected_indexing_length=spec.indexing.length,
+        )
+
+    @onlyBackends(["cute"])
+    def test_cute_tcgen05_cluster_m2_edge_ab2_seed_ignores_ab3_budget(
+        self,
+    ) -> None:
+        @helion.kernel(backend="cute")
+        def cute_matmul_bias_residual_gelu(
+            x: torch.Tensor,
+            y: torch.Tensor,
+            bias: torch.Tensor,
+            residual: torch.Tensor,
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = torch.nn.functional.gelu(
+                    1.25 * acc + 0.5 * residual[tile_m, tile_n] + bias[tile_n],
+                    approximate="tanh",
+                ).to(x.dtype)
+            return out
+
+        args = (
+            torch.empty([5000, 5000], device=DEVICE, dtype=HALF_DTYPE),
+            torch.empty([5000, 5000], device=DEVICE, dtype=HALF_DTYPE),
+            torch.empty([5000], device=DEVICE, dtype=HALF_DTYPE),
+            torch.empty([5000, 5000], device=DEVICE, dtype=HALF_DTYPE),
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_bias_residual_gelu.bind(args)
+
+        spec = bound.config_spec
+        self.assertTrue(spec.cute_tcgen05_search_enabled)
+        self.assertTrue(spec.cute_tcgen05_aux_kernel_detected)
+        config_dict: dict[str, object] = {
+            "block_sizes": [128, 128, 64],
+            "indexing": ["tensor_descriptor"] * spec.indexing.length,
+            "l2_groupings": [TCGEN05_TWO_CTA_SEED_L2_GROUPING],
+            "pid_type": "flat",
+            "tcgen05_cluster_m": 2,
+            "tcgen05_ab_stages": TCGEN05_TWO_CTA_EDGE_K_TAIL_AB_STAGES,
+            "tcgen05_acc_stages": TCGEN05_TWO_CTA_EDGE_K_TAIL_ACC_STAGES,
+            "tcgen05_c_stages": TCGEN05_TWO_CTA_EDGE_K_TAIL_C_STAGES,
+        }
+        with patch.object(
+            spec._cute_tcgen05_config,
+            "ab_stages_three_fits",
+            return_value=False,
+        ):
+            spec._cute_tcgen05_config.fix_search_config(config_dict)
+
+        self.assertEqual(config_dict["tcgen05_cluster_m"], 2)
+        self.assertEqual(config_dict["pid_type"], "persistent_interleaved")
+        self.assertEqual(
+            config_dict["block_sizes"][:3],
+            [
+                TCGEN05_TWO_CTA_BLOCK_M,
+                TCGEN05_TWO_CTA_BLOCK_N,
+                TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K,
+            ],
+        )
+        self.assertEqual(
+            config_dict["tcgen05_ab_stages"],
+            TCGEN05_TWO_CTA_EDGE_K_TAIL_AB_STAGES,
         )
 
     @onlyBackends(["cute"])

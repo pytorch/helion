@@ -2366,11 +2366,15 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             ]
         )
         tile_counter_var = None
+        increment_tile_counter_per_tile = False
         if (
             role_block.role_predicate == self._tcgen05_epi_role_predicate()
             and device_function.cute_state.epi_role_tile_counter_var is not None
         ):
             tile_counter_var = device_function.cute_state.epi_role_tile_counter_var
+            increment_tile_counter_per_tile = (
+                device_function.cute_state.epi_role_tile_counter_increment_per_tile
+            )
             prelude.append(
                 statement_from_string(f"{tile_counter_var} = cutlass.Int32(0)")
             )
@@ -2394,7 +2398,7 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         if dependency_stmts is not None:
             per_tile_body.extend(dependency_stmts)
         per_tile_body.extend(role_block.stmts)
-        if tile_counter_var is not None:
+        if tile_counter_var is not None and increment_tile_counter_per_tile:
             per_tile_body.append(
                 statement_from_string(
                     f"{tile_counter_var} = {tile_counter_var} + cutlass.Int32(1)"
@@ -2476,11 +2480,15 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             prelude.append(statement_from_string("cute.arch.griddepcontrol_wait()"))
 
         tile_counter_var = None
+        increment_tile_counter_per_tile = False
         if (
             role_block.role_predicate == self._tcgen05_epi_role_predicate()
             and device_function.cute_state.epi_role_tile_counter_var is not None
         ):
             tile_counter_var = device_function.cute_state.epi_role_tile_counter_var
+            increment_tile_counter_per_tile = (
+                device_function.cute_state.epi_role_tile_counter_increment_per_tile
+            )
             prelude.append(
                 statement_from_string(f"{tile_counter_var} = cutlass.Int32(0)")
             )
@@ -2528,7 +2536,7 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         if dependency_stmts is not None:
             per_tile_body.extend(dependency_stmts)
         per_tile_body.extend(role_block.stmts)
-        if tile_counter_var is not None:
+        if tile_counter_var is not None and increment_tile_counter_per_tile:
             per_tile_body.append(
                 statement_from_string(
                     f"{tile_counter_var} = {tile_counter_var} + cutlass.Int32(1)"
@@ -3297,9 +3305,10 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         assert plan is not None and plan.has_c_input_warp, (
             "C-input role-local while requires a matmul plan with has_c_input_warp=True"
         )
-        assert plan.aux_tensor_descriptors, (
-            "C-input role-local while requires non-empty aux_tensor_descriptors "
-            "(producer-body split gate must be open)"
+        c_input_aux_tensor_descriptors = plan.c_input_aux_tensor_descriptors
+        assert c_input_aux_tensor_descriptors, (
+            "C-input role-local while requires non-empty exact-shape aux "
+            "descriptors (producer-body split gate must be open)"
         )
         sched_pipeline_plan = self._tcgen05_sched_pipeline_plan()
         assert sched_pipeline_plan is not None, (
@@ -3314,7 +3323,7 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         # ``cute_mma._codegen_cute_mma``, so a non-None plan is
         # the invariant we rely on once the gate is open. The
         # assert catches a future gate-skew between
-        # ``has_c_input_warp + aux_tensor_descriptors`` and the
+        # ``has_c_input_warp + c_input_aux_tensor_descriptors`` and the
         # cute_mma allocator rather than producing a half-allocated
         # kernel.
         aux_pipeline_plan = device_function.cute_state.aux_pipeline_plan
@@ -3323,9 +3332,9 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             "aux pipeline plan; was cute_state.register_tcgen05_aux_pipeline_plan "
             "called by _codegen_cute_mma?"
         )
-        assert len(aux_pipeline_plan.rings) == len(plan.aux_tensor_descriptors), (
+        assert len(aux_pipeline_plan.rings) == len(c_input_aux_tensor_descriptors), (
             "C-input role-local while: aux pipeline plan must have one "
-            "ring per matmul-plan aux descriptor"
+            "ring per staged matmul-plan aux descriptor"
         )
 
         valid_var = device_function.new_var("tcgen05_c_input_warp_valid")
@@ -3529,6 +3538,35 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         aux_rings = aux_pipeline_plan.rings
         aux_epi_tile_var = aux_pipeline_plan.epi_tile_var
 
+        aux_full_tile_var = device_function.new_var("tcgen05_aux_full_tile")
+        aux_shape = c_input_aux_tensor_descriptors[0].host_tensor_val.shape
+        assert len(aux_shape) == 2, (
+            "C-input staged aux descriptors must be exact-shape rank-2 tensors"
+        )
+        aux_m_size = int(aux_shape[0])
+        aux_n_size = int(aux_shape[1])
+        if has_post_l2_coords:
+            aux_m_start_expr = "tile_offset_0"
+            aux_n_start_expr = "tile_offset_1"
+        else:
+            if is_two_cta:
+                aux_m_tile_expr = (
+                    f"({layout.work_tile_smem}[cutlass.Int32(0)] "
+                    f"// cutlass.Int32({cluster_m}))"
+                )
+            else:
+                aux_m_tile_expr = f"{layout.work_tile_smem}[cutlass.Int32(0)]"
+            aux_m_start_expr = f"({aux_m_tile_expr}) * cutlass.Int32({bm})"
+            aux_n_start_expr = (
+                f"{layout.work_tile_smem}[cutlass.Int32(1)] * cutlass.Int32({bn})"
+            )
+        aux_full_tile_expr = (
+            f"{aux_m_start_expr} + cutlass.Int32({bm}) "
+            f"<= cutlass.Int32({aux_m_size}) and "
+            f"{aux_n_start_expr} + cutlass.Int32({bn}) "
+            f"<= cutlass.Int32({aux_n_size})"
+        )
+
         env_backend = CompileEnvironment.current().backend
 
         # Per-descriptor partitioning that runs once per output tile:
@@ -3548,7 +3586,7 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         n_threads = 8
         m_threads = 32 // n_threads
         for desc_idx, (desc, ring) in enumerate(
-            zip(plan.aux_tensor_descriptors, aux_rings, strict=True)  # type: ignore[arg-type]
+            zip(c_input_aux_tensor_descriptors, aux_rings, strict=True)  # type: ignore[arg-type]
         ):
             aux_tensor_name = device_function.tensor_arg(desc.host_tensor_val).name
             aux_dtype_str = env_backend.dtype_str(desc.host_tensor_val.dtype)
@@ -3823,7 +3861,27 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         # placement of ``dependency_stmts`` (see
         # ``_build_role_local_while_with_scheduler``).
         per_tile_body.extend(l2_dependency_stmts)
-        per_tile_body.extend(_aux_copy_lines())
+        aux_copy_lines = _aux_copy_lines()
+        if plan.tma_store_full_tiles_only:
+            # Hybrid full-tile TMA store uses the aux SMEM ring only on the
+            # full-tile branch. Edge tiles take the SIMT direct-GMEM fallback,
+            # so the producer must skip those tiles too; otherwise it commits
+            # aux stages that no consumer will release.
+            per_tile_body.extend(
+                [
+                    statement_from_string(
+                        f"{aux_full_tile_var} = {aux_full_tile_expr}"
+                    ),
+                    create(
+                        ast.If,
+                        test=expr_from_string(aux_full_tile_var),
+                        body=aux_copy_lines,
+                        orelse=[],
+                    ),
+                ]
+            )
+        else:
+            per_tile_body.extend(aux_copy_lines)
         per_tile_body.extend(_sched_consumer_release_block())
         per_tile_body.extend(_sched_consumer_wait_block())
         prelude.append(
@@ -4186,8 +4244,9 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         if (
             plan is not None
             and plan.has_c_input_warp
-            and plan.aux_tensor_descriptors
-            and len({d.store_value_node for d in plan.aux_tensor_descriptors}) <= 1
+            and plan.c_input_aux_tensor_descriptors
+            and len({d.store_value_node for d in plan.c_input_aux_tensor_descriptors})
+            <= 1
         ):
             role_local_whiles.append(
                 self._build_c_input_warp_role_local_while(
