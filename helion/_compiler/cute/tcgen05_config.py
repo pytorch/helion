@@ -83,6 +83,7 @@ from .tcgen05_constants import TCGEN05_ONE_CTA_MAX_BLOCK_M
 from .tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
 from .tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
 from .tcgen05_constants import TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K
+from .tcgen05_constants import TCGEN05_TWO_CTA_EDGE_K_TAIL_SCHEDULER_L2_SWIZZLE_SIZE
 from .tcgen05_constants import TCGEN05_TWO_CTA_MAX_K_TILES
 from .tcgen05_constants import TCGEN05_TWO_CTA_SEED_PID_TYPE
 from .tcgen05_constants import tcgen05_ab_smem_bytes_per_cta
@@ -304,6 +305,9 @@ class CuteTcgen05Config:
         }
         if edge_k_tail_family:
             seed_config.update(tcgen05_two_cta_edge_k_tail_seed_overrides())
+            seed_config[TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY] = (
+                TCGEN05_TWO_CTA_EDGE_K_TAIL_SCHEDULER_L2_SWIZZLE_SIZE
+            )
             seed_config["indexing"] = [
                 "tensor_descriptor"
             ] * self.config_spec.indexing.length
@@ -552,6 +556,9 @@ class CuteTcgen05Config:
         ):
             config[TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY] = 1
             config[TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY] = 1
+            config[TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY] = (
+                TCGEN05_TWO_CTA_EDGE_K_TAIL_SCHEDULER_L2_SWIZZLE_SIZE
+            )
         else:
             CuteTcgen05Config._set_aux_edge_monolithic_prefix(config)
             return

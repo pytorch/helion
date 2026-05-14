@@ -27,6 +27,10 @@ TCGEN05_TWO_CTA_EDGE_K_TAIL_C_STAGES = 2
 # seeded/fixed CtaGroup.TWO family starts at the measured production row.
 TCGEN05_TWO_CTA_EDGE_K_TAIL_L2_GROUPING = 2
 TCGEN05_TWO_CTA_EDGE_K_TAIL_L2_SWIZZLE_SIZE = 4
+# The scheduler full/edge split scans the same static tile space twice. On the
+# 5000x5000x5000 bias_residual_gelu target, keeping the split path at size=1
+# (no scheduler swizzle) measured faster than the monolithic edge seed's size=4.
+TCGEN05_TWO_CTA_EDGE_K_TAIL_SCHEDULER_L2_SWIZZLE_SIZE = 1
 TCGEN05_TWO_CTA_EDGE_TMA_STORE_MAX_AB_STAGES = 2
 assert (
     TCGEN05_TWO_CTA_EDGE_K_TAIL_AB_STAGES

@@ -3222,21 +3222,34 @@ def _codegen_cute_store_tcgen05_tile(
     # (``epi_warp_count``) allocated on the aux pipeline.
 
     # Static-full role-local stores have no dynamic full-tile branch, so all
-    # C-store invariant setup can be hoisted once. Hybrid output-edge stores
-    # still need descriptor/SMEM layout setup inside the dynamic full-tile
-    # branch (CuTe cannot flatten those Python descriptor objects through a
-    # dynamic ``if``), but the TMA-store pipeline itself can be reused and
-    # drained once after the role loop.
+    # C-store invariant setup can be hoisted once. Scheduler-backed hybrid
+    # output-edge stores split full and fringe tiles into separate role-local
+    # scheduler phases, which gives the full-tile phase the same hoist shape.
+    # The monolithic hybrid path still keeps descriptor/SMEM layout setup
+    # inside its dynamic full-tile branch.
+    split_hybrid_tma_store_role = (
+        tcgen05_value.use_role_local_epi
+        and tcgen05_value.use_tma_store_epilogue
+        and tcgen05_value.tma_store_full_tiles_only
+        and aux_matmul_plan is not None
+        and aux_matmul_plan.has_scheduler_warp
+        # CLC publishes a single hardware-scheduled stream today. The
+        # full/edge split below requires the scheduler warp to publish two
+        # static streams with a sentinel between them.
+        and not aux_matmul_plan.is_clc_persistent
+        and not diagnose_skip_epilogue_store
+    )
     hoist_tma_store_resources = (
         tcgen05_value.use_role_local_epi
         and tcgen05_value.use_tma_store_epilogue
-        and not tcgen05_value.tma_store_full_tiles_only
+        and (not tcgen05_value.tma_store_full_tiles_only or split_hybrid_tma_store_role)
         and not diagnose_skip_epilogue_store
     )
     hoist_hybrid_tma_store_pipeline = (
         tcgen05_value.use_role_local_epi
         and tcgen05_value.use_tma_store_epilogue
         and tcgen05_value.tma_store_full_tiles_only
+        and not split_hybrid_tma_store_role
         and not diagnose_skip_epilogue_store
     )
     tma_store_body_core = [
@@ -3355,16 +3368,17 @@ def _codegen_cute_store_tcgen05_tile(
             else []
         ),
     ]
-    tma_store_body_source = "\n".join(tma_store_body_core)
-    simt_store_body_source = "\n".join(simt_store_body_core)
+    tma_store_full_tile_body_core = list(tma_store_body_core)
     if (
         tcgen05_value.tma_store_full_tiles_only
         and tcgen05_value.role_local_tile_counter
     ):
-        tma_store_body_source += (
-            f"\n{tcgen05_value.role_local_tile_counter} = "
+        tma_store_full_tile_body_core.append(
+            f"{tcgen05_value.role_local_tile_counter} = "
             f"{tcgen05_value.role_local_tile_counter} + cutlass.Int32(1)"
         )
+    tma_store_body_source = "\n".join(tma_store_full_tile_body_core)
+    simt_store_body_source = "\n".join(simt_store_body_core)
     hybrid_tma_store_body_core = [
         f"{full_tile} = {full_tile_expr}",
         (
@@ -3385,43 +3399,77 @@ def _codegen_cute_store_tcgen05_tile(
     main_stmts: list[ast.AST]
     if tcgen05_value.use_role_local_epi:
         # These setup statements intentionally remain virtual-pid-independent.
-        # The persistent splitter hoists them before the role-local scheduler
-        # loops; if future setup reads per-tile state, it must be registered
-        # as per-tile work instead.
-        tma_store_hoisted_stmts = (
-            [
-                statement_from_string(line)
-                for line in [
-                    *(
-                        tma_store_pipeline_setup
-                        if hoist_tma_store_resources or hoist_hybrid_tma_store_pipeline
-                        else []
-                    ),
-                    *(
-                        tma_store_role_invariant_setup
-                        if hoist_tma_store_resources
-                        else []
-                    ),
-                ]
-            ]
+        # The persistent splitter hoists pipeline state before the role-local
+        # scheduler loops. Scheduler-backed hybrid stores keep descriptor and
+        # layout Python objects inside the epilogue role prelude so they do
+        # not leak across unrelated dynamic warp-role ``if`` regions.
+        tma_store_pipeline_hoisted_stmts = (
+            [statement_from_string(line) for line in tma_store_pipeline_setup]
             if (hoist_tma_store_resources or hoist_hybrid_tma_store_pipeline)
             else []
         )
+        tma_store_role_invariant_stmts = (
+            [statement_from_string(line) for line in tma_store_role_invariant_setup]
+            if hoist_tma_store_resources
+            else []
+        )
+        if split_hybrid_tma_store_role:
+            tma_store_hoisted_stmts = tma_store_pipeline_hoisted_stmts
+        elif hoist_tma_store_resources or hoist_hybrid_tma_store_pipeline:
+            tma_store_hoisted_stmts = [
+                *tma_store_pipeline_hoisted_stmts,
+                *tma_store_role_invariant_stmts,
+            ]
+        else:
+            tma_store_hoisted_stmts = []
         sync_before_stmt = statement_from_string("cute.arch.sync_threads()")
-        main_stmt = statement_from_string(
-            "if True:\n" + textwrap.indent("\n".join(store_body_core), "    ")
-        )
         sync_after_stmt = statement_from_string("cute.arch.sync_threads()")
-        df.cute_state.register_tcgen05_per_tile_stmts(
-            [sync_before_stmt, main_stmt, sync_after_stmt]
-        )
-        df.cute_state.register_tcgen05_epi_role_stmts([main_stmt])
-        main_stmts = [
-            *tma_store_hoisted_stmts,
-            sync_before_stmt,
-            main_stmt,
-            sync_after_stmt,
-        ]
+        if split_hybrid_tma_store_role:
+            full_main_stmt = statement_from_string(
+                "if True:\n"
+                + textwrap.indent("\n".join(tma_store_full_tile_body_core), "    ")
+            )
+            edge_main_stmt = statement_from_string(
+                "if True:\n" + textwrap.indent("\n".join(simt_store_body_core), "    ")
+            )
+            df.cute_state.register_tcgen05_per_tile_stmts(
+                [sync_before_stmt, full_main_stmt, edge_main_stmt, sync_after_stmt]
+            )
+            df.cute_state.register_tcgen05_epi_role_full_edge_stmts(
+                full_tile_stmts=[full_main_stmt],
+                edge_tile_stmts=[edge_main_stmt],
+            )
+            # `cute.arch.alloc_smem` is a CuTe DSL static allocation even
+            # though it is represented as a statement. Keeping the descriptor,
+            # layout, and allocation statements in the epi-role prelude scopes
+            # CuTe Python objects away from unrelated warp-role branches
+            # without making the shared-memory reservation data-dependent on
+            # the runtime epi-warp predicate.
+            df.cute_state.register_tcgen05_epi_role_prelude_stmts(
+                tma_store_role_invariant_stmts
+            )
+            main_stmts = [
+                *tma_store_hoisted_stmts,
+                *tma_store_role_invariant_stmts,
+                sync_before_stmt,
+                full_main_stmt,
+                edge_main_stmt,
+                sync_after_stmt,
+            ]
+        else:
+            main_stmt = statement_from_string(
+                "if True:\n" + textwrap.indent("\n".join(store_body_core), "    ")
+            )
+            df.cute_state.register_tcgen05_per_tile_stmts(
+                [sync_before_stmt, main_stmt, sync_after_stmt]
+            )
+            df.cute_state.register_tcgen05_epi_role_stmts([main_stmt])
+            main_stmts = [
+                *tma_store_hoisted_stmts,
+                sync_before_stmt,
+                main_stmt,
+                sync_after_stmt,
+            ]
     else:
         store_body = [
             "cute.arch.sync_threads()",
