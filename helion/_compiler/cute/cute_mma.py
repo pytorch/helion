@@ -368,7 +368,13 @@ def _has_mma_operands(lhs_node: Node, rhs_node: Node) -> bool:
         return False
     lhs_load, _, lhs_fake = lhs_info
     rhs_load, _, rhs_fake = rhs_info
-    supported = {torch.float16, torch.bfloat16, torch.float32}
+    supported = {
+        torch.float16,
+        torch.bfloat16,
+        torch.float32,
+        torch.float8_e4m3fn,
+        torch.float8_e5m2,
+    }
     return (
         lhs_fake.dtype in supported
         and rhs_fake.dtype in supported
@@ -1569,6 +1575,8 @@ def _emit_mma_pipeline(
         torch.float16: "cutlass.Float16",
         torch.bfloat16: "cutlass.BFloat16",
         torch.float32: "cutlass.Float32",
+        torch.float8_e4m3fn: "cutlass.Float8E4M3FN",
+        torch.float8_e5m2: "cutlass.Float8E5M2",
     }
     input_dtype_str = _dtype_map[input_dtype]
     acc_dtype_str = "cutlass.Float32"
@@ -4277,7 +4285,10 @@ def _mma_impl_matches_problem_shape(
 ) -> bool:
     if mma_impl == "universal":
         return True
-    if input_dtype not in (torch.float16, torch.bfloat16) or bn < 8 or bn % 8 != 0:
+    fp8_dtype = input_dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+    if input_dtype not in (torch.float16, torch.bfloat16) and not fp8_dtype:
+        return False
+    if bn < 8 or bn % 8 != 0:
         return False
     if bn > 256 and (
         mma_impl != "tcgen05"
@@ -4294,13 +4305,10 @@ def _mma_impl_matches_problem_shape(
         # Warp MMA atom is fixed-K (16 elements per BF16/FP16 instruction).
         return bk == 16 and bm >= 16 and bm % 16 == 0 and bn == 8
     if mma_impl == "tcgen05":
-        # tcgen05 mma instruction K is 16 elements for BF16/FP16, but the
-        # tile's K can be any positive multiple of that (the inner cute.gemm
-        # loop just runs more instructions per K iteration). Larger tile_k
-        # roughly halves the per-K-iter overhead per doubling. Production
-        # remains capped at block_n=256 to keep AB SMEM staging budget sane;
-        # the explicit G4 proof key admits only the smallest 512-N candidate.
-        if bk < 16 or bk > 256 or bk % 16 != 0:
+        # tcgen05 mma instruction K: 16 for BF16/FP16, 32 for F8F6F4.
+        # Tile K must be a positive multiple of the instruction K.
+        k_stride = 32 if fp8_dtype else 16
+        if bk < k_stride or bk > 256 or bk % k_stride != 0:
             return False
         if bm in (64, 128):
             return True
@@ -4364,6 +4372,29 @@ def _choose_mma_impl(
     tcgen05_large_bn_proof = _tcgen05_large_bn_proof_enabled(config)
     env_choice = os.environ.get("HELION_CUTE_MMA_IMPL", "auto").strip().lower()
     support = get_cute_mma_support()
+    fp8_dtype = input_dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+    if fp8_dtype:
+        # fp8 tcgen05 is currently disabled at the routing layer because the
+        # fp8 cute codegen takes a different code path than f16/bf16: fp8 is
+        # excluded from the TMA load gate (see ``tcgen05_use_tma`` in
+        # ``_emit_mma_pipeline``), so the fp8 tcgen05 emission lacks the
+        # producer/consumer-staged accumulator pipeline that the validated
+        # f16/bf16 path relies on. Empirically this produces sparse output
+        # (CUTLASS-side gate bm>=128 and bm==64 both fail with different
+        # patterns). Until fp8 is plumbed through the TMA path and the t2r
+        # epilogue is validated for MmaF8F6F4Op, route fp8 to the universal
+        # MMA atom which is dense + correct on B200.
+        if env_choice == "tcgen05":
+            raise exc.BackendUnsupported(
+                "cute",
+                (
+                    "tcgen05 fp8 MMA is currently disabled: fp8 is excluded "
+                    "from the TMA producer/consumer staging path used by the "
+                    "validated f16/bf16 tcgen05 emission, and the non-TMA fp8 "
+                    "tcgen05 path produces sparse accumulator output."
+                ),
+            )
+        return "universal"
     if env_choice != "auto":
         if env_choice not in support.supported_impls:
             raise exc.BackendUnsupported(
@@ -4461,6 +4492,7 @@ def _tcgen05_tiled_mma_expr(
         cta_group_expr = "cute.nvgpu.tcgen05.CtaGroup.TWO"
     return (
         "cutlass.utils.blackwell_helpers.make_trivial_tiled_mma("
+        f"{input_dtype_str}, "
         f"{input_dtype_str}, "
         "cute.nvgpu.tcgen05.OperandMajorMode.K, "
         "cute.nvgpu.tcgen05.OperandMajorMode.MN, "

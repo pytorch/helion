@@ -1588,6 +1588,7 @@ def _append_cute_wrapper_plan(
             (
                 f"    {tiled_mma} = cutlass.utils.blackwell_helpers.make_trivial_tiled_mma("
                 f"{input_dtype}, "
+                f"{input_dtype}, "
                 "cute.nvgpu.tcgen05.OperandMajorMode.K, "
                 "cute.nvgpu.tcgen05.OperandMajorMode.MN, "
                 f"{acc_dtype}, "

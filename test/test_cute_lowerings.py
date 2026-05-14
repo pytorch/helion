@@ -10034,6 +10034,29 @@ class TestCuteLowerings(unittest.TestCase):
                     ),
                     "universal",
                 )
+            with patch.dict(
+                "os.environ", {"HELION_CUTE_MMA_IMPL": "auto"}, clear=False
+            ):
+                # fp8 always routes to universal (fp8 tcgen05 is disabled).
+                for bm, bn, bk in (
+                    (64, 16, 32),
+                    (128, 16, 32),
+                    (256, 32, 32),
+                ):
+                    self.assertEqual(
+                        _choose_mma_impl(torch.float8_e4m3fn, bm=bm, bn=bn, bk=bk),
+                        "universal",
+                    )
+            with (
+                patch.dict(
+                    "os.environ", {"HELION_CUTE_MMA_IMPL": "tcgen05"}, clear=False
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    exc.BackendUnsupported,
+                    "tcgen05 fp8 MMA is currently disabled",
+                ):
+                    _choose_mma_impl(torch.float8_e4m3fn, bm=128, bn=16, bk=32)
 
     def test_tcgen05_thread_counts_match_participants_and_cta(self) -> None:
         # ``_tcgen05_epi_warp_count`` takes a ``Tcgen05WarpSpec`` (G2-B);

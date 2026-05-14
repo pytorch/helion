@@ -8,6 +8,7 @@ import pytest
 import torch
 
 import helion
+from helion import exc
 from helion._testing import DEVICE
 from helion._testing import HALF_DTYPE
 from helion._testing import TestCase
@@ -523,6 +524,21 @@ def cute_matmul_dot_out_dtype(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     return out
 
 
+@helion.kernel(backend="cute")
+def cute_matmul_fp8_dot_float32_out(
+    x: torch.Tensor, y: torch.Tensor
+) -> torch.Tensor:
+    m, k = x.size()
+    _, n = y.size()
+    out = torch.empty([m, n], dtype=torch.float32, device=x.device)
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
+        out[tile_m, tile_n] = acc
+    return out
+
+
 @helion.kernel(backend="cute", static_shapes=False)
 def cute_matmul_packed_rhs_bfloat16(
     a: torch.Tensor, b: torch.Tensor, c: torch.Tensor
@@ -980,6 +996,50 @@ class TestCuteBackend(TestCase):
             code,
         )
         self.assertIn("cutlass.pipeline.NamedBarrier(barrier_id=1", code)
+
+    def test_matmul_fp8_dot_float32_out_matches_reference(self) -> None:
+        args = (
+            torch.randn(64, 32, device=DEVICE).to(torch.float8_e4m3fn),
+            torch.randn(32, 16, device=DEVICE).to(torch.float8_e4m3fn),
+        )
+        with patch.dict(os.environ, {"HELION_CUTE_MMA_IMPL": "auto"}, clear=False):
+            code, out = code_and_output(
+                cute_matmul_fp8_dot_float32_out,
+                args,
+                block_sizes=[64, 16, 32],
+                num_warps=4,
+            )
+        torch.testing.assert_close(out, args[0].float() @ args[1].float())
+        self.assertNotIn("cute.nvgpu.tcgen05", code)
+
+    def test_choose_mma_impl_fp8_always_universal(self) -> None:
+        # fp8 currently routes to the universal MMA atom unconditionally
+        # because the fp8 cute tcgen05 path produces sparse accumulator
+        # output (the non-TMA emission lacks the producer/consumer staged
+        # pipeline used by f16/bf16 tcgen05). Explicit
+        # HELION_CUTE_MMA_IMPL=tcgen05 raises a clear error rather than
+        # silently misbehaving.
+        from helion._compiler.cute.cute_mma import _choose_mma_impl
+
+        for dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+            with patch.dict(
+                os.environ, {"HELION_CUTE_MMA_IMPL": "auto"}, clear=False
+            ):
+                # Regardless of shape, auto picks universal for fp8.
+                for bm, bn, bk in ((64, 8, 32), (128, 16, 32), (256, 32, 32)):
+                    self.assertEqual(
+                        _choose_mma_impl(dtype, bm=bm, bn=bn, bk=bk),
+                        "universal",
+                        f"{dtype}: bm={bm},bn={bn} should pick universal",
+                    )
+            with patch.dict(
+                os.environ, {"HELION_CUTE_MMA_IMPL": "tcgen05"}, clear=False
+            ):
+                with self.assertRaisesRegex(
+                    exc.BackendUnsupported,
+                    "tcgen05 fp8 MMA is currently disabled",
+                ):
+                    _choose_mma_impl(dtype, bm=128, bn=16, bk=32)
 
     def test_matmul_dot_out_dtype_falls_back_from_mma(self) -> None:
         args = (
