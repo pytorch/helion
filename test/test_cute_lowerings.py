@@ -4797,6 +4797,60 @@ class TestCuteLowerings(unittest.TestCase):
         self.assertGreaterEqual(view_pos, 0)
         self.assertGreater(load_pos, view_pos)
 
+    def test_tcgen05_fused_rowwise_scale_codegen_marker(self) -> None:
+        """Explicit rowwise scaled_mm scales emit stride-0 views on the
+        non-data axis before the aux load pipeline:
+
+            scale_a[M, 1] -> stride=(1, 0)
+            scale_b[1, N] -> stride=(0, 1)
+        """
+
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_scales(
+            x: torch.Tensor,
+            y: torch.Tensor,
+            scale_a: torch.Tensor,
+            scale_b: torch.Tensor,
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                acc = acc * scale_a[tile_m, :].to(torch.float32)
+                acc = acc * scale_b[:, tile_n].to(torch.float32)
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        x = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
+        y = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
+        scale_a = torch.randn(128, 1, dtype=torch.float32, device=DEVICE)
+        scale_b = torch.randn(1, 128, dtype=torch.float32, device=DEVICE)
+        with patch_cute_mma_support():
+            bound = cute_matmul_scales.bind((x, y, scale_a, scale_b))
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            cfg = _make_tcgen05_persistent_config(
+                block_sizes=[128, 128, 32],
+                pid_type="persistent_interleaved",
+            )
+            bound.set_config(cfg)
+            code = bound.to_triton_code(cfg)
+        self.assertIn("tcgen05_aux_view2d_0", code)
+        self.assertIn("tcgen05_aux_view2d_1", code)
+        self.assertIn("stride=(1, 0)", code)
+        self.assertIn("stride=(0, 1)", code)
+        self.assertIn("tcgen05_aux_tile_0 = cute.local_tile(tcgen05_aux_view2d_0", code)
+        self.assertIn("tcgen05_aux_tile_1 = cute.local_tile(tcgen05_aux_view2d_1", code)
+        self.assertIn("tcgen05_aux_loaded_0", code)
+        self.assertIn("tcgen05_aux_loaded_1", code)
+
     def test_tcgen05_fused_bias_broadcast_rejects_non_contiguous(self) -> None:
         """Reject rank-1 broadcast aux loads whose underlying tensor
         is non-contiguous (stride != 1).
@@ -10972,6 +11026,60 @@ class TestCuteTcgen05AuxTensorWalker(unittest.TestCase):
         self.assertEqual(descriptor.host_tensor_val.shape, torch.Size([4096]))
         self.assertEqual(descriptor.host_tensor_val.dtype, torch.bfloat16)
 
+    def test_walker_discovers_explicit_rowwise_scale_aux(self) -> None:
+        """Rowwise scaled_mm scale loads register colvec and rowvec aux
+        descriptors:
+
+            scale_a[tile_m, :] -> (BM, 1), broadcast_axis == 0
+            scale_b[:, tile_n] -> (1, BN), broadcast_axis == 1
+        """
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_scales(
+            x: torch.Tensor,
+            y: torch.Tensor,
+            scale_a: torch.Tensor,
+            scale_b: torch.Tensor,
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                acc = acc * scale_a[tile_m, :].to(torch.float32)
+                acc = acc * scale_b[:, tile_n].to(torch.float32)
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        args = (
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([4096, 1], device=DEVICE, dtype=torch.float32),
+            torch.empty([1, 4096], device=DEVICE, dtype=torch.float32),
+        )
+        config = helion.Config(
+            block_sizes=[256, 256, 128],
+            l2_groupings=[1],
+            pid_type="persistent_interleaved",
+            tcgen05_cluster_m=2,
+            tcgen05_ab_stages=2,
+            tcgen05_acc_stages=2,
+            tcgen05_c_stages=2,
+            tcgen05_num_epi_warps=4,
+        )
+        plans, _ = self._bind_and_capture_plans(cute_matmul_scales, args, config)
+        self.assertEqual(len(plans), 1, msg=f"plans={len(plans)}")
+        descriptors = plans[0].aux_tensor_descriptors
+        self.assertEqual(len(descriptors), 2, msg=f"descriptors={descriptors!r}")
+        self.assertEqual(descriptors[0].broadcast_axis, 0)
+        self.assertEqual(descriptors[0].host_tensor_val.shape, torch.Size([4096, 1]))
+        self.assertEqual(descriptors[0].host_tensor_val.dtype, torch.float32)
+        self.assertEqual(descriptors[1].broadcast_axis, 1)
+        self.assertEqual(descriptors[1].host_tensor_val.shape, torch.Size([1, 4096]))
+        self.assertEqual(descriptors[1].host_tensor_val.dtype, torch.float32)
+
     def test_walker_discovers_two_aux_steps_in_chain(self) -> None:
         """A chain with two aux operands (``acc + residual + bias``)
         registers two descriptors per matmul anchor — one per aux
@@ -13887,6 +13995,8 @@ class TestPersistentLoopSplitter(unittest.TestCase):
                     "    mask_2 = indices_2 < 16\n"
                     "    load = cutlass.BFloat16(0)"
                 ),
+                self._stmt("load_fp8 = cutlass.Float8E4M3FN(0)"),
+                self._stmt("load_fp8_e5m2 = cutlass.Float8E5M2(0)"),
             ],
         )
 

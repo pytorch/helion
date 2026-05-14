@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 from itertools import zip_longest
+import os
 from typing import TYPE_CHECKING
 
 import torch
@@ -289,6 +290,14 @@ def enforce_dot_requirements(lhs: torch.Tensor, rhs: torch.Tensor) -> None:
     static_m = static_problem_extent(m)
     static_n = static_problem_extent(n)
     static_k = static_problem_extent(k)
+    input_dtype = lhs.dtype
+    fp8_dtype = input_dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+    tcgen05_k_min = 32 if fp8_dtype else 16
+    fp8_tcgen05_forced = (
+        fp8_dtype
+        and os.environ.get("HELION_CUTE_MMA_IMPL", "auto").strip().lower()
+        == "tcgen05"
+    )
     env.config_spec.matmul_facts.append(
         MatmulFact(
             lhs_ndim=lhs.ndim,
@@ -307,14 +316,22 @@ def enforce_dot_requirements(lhs: torch.Tensor, rhs: torch.Tensor) -> None:
         env.backend_name == "cute"
         and lhs.ndim == 2
         and rhs.ndim == 2
-        and lhs.dtype in (torch.float16, torch.bfloat16)
-        and rhs.dtype == lhs.dtype
+        and input_dtype in (
+            torch.float16,
+            torch.bfloat16,
+            torch.float8_e4m3fn,
+            torch.float8_e5m2,
+        )
+        and rhs.dtype == input_dtype
         and static_m is not None
         and static_n is not None
         and static_k is not None
         and static_m >= 64
         and static_n >= 8
-        and static_k >= 16
+        and static_k >= tcgen05_k_min
+        # Keep fp8 tcgen05 behind an explicit routing choice until the
+        # rowwise scaled_mm path has broader correctness coverage.
+        and (not fp8_dtype or fp8_tcgen05_forced)
         # The tcgen05 direct-store epilogue's predicated SIMT path
         # CUDA-launch-fails for partial M tiles on B200. Gate the tcgen05
         # specialization on M being a clean multiple of the minimum tcgen05
@@ -324,7 +341,11 @@ def enforce_dot_requirements(lhs: torch.Tensor, rhs: torch.Tensor) -> None:
     ):
         from .._compiler.cute.mma_support import get_cute_mma_support
 
-        if get_cute_mma_support().tcgen05_f16bf16:
+        support = get_cute_mma_support()
+        tcgen05_supported = (
+            support.tcgen05_f8f6f4 if fp8_dtype else support.tcgen05_f16bf16
+        )
+        if tcgen05_supported:
 
             def pow2_floor_at_least(value: int, minimum: int) -> int:
                 return 1 << (max(minimum, value).bit_length() - 1)
@@ -336,7 +357,7 @@ def enforce_dot_requirements(lhs: torch.Tensor, rhs: torch.Tensor) -> None:
             # Larger tile_k packs more cute.gemm instructions per K loop
             # iteration on tcgen05 (mma instruction K is fixed at 16 for
             # BF16/FP16). Cap at 128 to keep AB SMEM staging budget sane.
-            max_tcgen05_k = min(128, pow2_floor_at_least(static_k, 16))
+            max_tcgen05_k = min(128, pow2_floor_at_least(static_k, tcgen05_k_min))
             max_search_m = min(max_tcgen05_m, pow2_floor_at_least(static_m, 64))
             max_search_n = max_tcgen05_n
             max_search_k = max_tcgen05_k
@@ -422,7 +443,7 @@ def enforce_dot_requirements(lhs: torch.Tensor, rhs: torch.Tensor) -> None:
                 if block_idx is None:
                     continue
                 if axis_name == "k":
-                    min_size = 16
+                    min_size = tcgen05_k_min
                 elif axis_name == "m":
                     min_size = 128 if max_tcgen05_m >= 256 else 64
                 else:

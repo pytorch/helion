@@ -99,6 +99,19 @@ _TRACE_THROUGH_TARGETS = {
     # raw tensor data — tracing through permute would bypass the
     # data shuffle.  Permuted operands fall back to scalar codegen.
 }
+_STORE_DTYPE_TRACE_TARGETS = _TRACE_THROUGH_TARGETS | {
+    torch.ops.aten.relu.default,
+    torch.ops.aten.abs.default,
+    torch.ops.aten.neg.default,
+    torch.ops.aten.tanh.default,
+    torch.ops.aten.exp.default,
+    torch.ops.aten.log.default,
+    torch.ops.aten.sqrt.default,
+    torch.ops.aten.add.Tensor,
+    torch.ops.aten.mul.Tensor,
+    torch.ops.aten.sub.Tensor,
+    torch.ops.aten.div.Tensor,
+}
 
 # Register reallocation budget for tcgen05 warp-specialized kernels.
 # Producer warps (TMA loads, scheduler) only do address arithmetic and
@@ -1528,7 +1541,7 @@ def _trace_mma_to_store_dtype(
                 target is _tracing_ops._phi
                 or target is _tracing_ops._new_var
                 or target is operator.getitem
-                or target in _TRACE_THROUGH_TARGETS
+                or target in _STORE_DTYPE_TRACE_TARGETS
             ):
                 stack.append(user)
                 continue
@@ -4387,26 +4400,22 @@ def _choose_mma_impl(
     support = get_cute_mma_support()
     fp8_dtype = input_dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
     if fp8_dtype:
-        # fp8 tcgen05 is currently disabled at the routing layer because the
-        # fp8 cute codegen takes a different code path than f16/bf16: fp8 is
-        # excluded from the TMA load gate (see ``tcgen05_use_tma`` in
-        # ``_emit_mma_pipeline``), so the fp8 tcgen05 emission lacks the
-        # producer/consumer-staged accumulator pipeline that the validated
-        # f16/bf16 path relies on. Empirically this produces sparse output
-        # (CUTLASS-side gate bm>=128 and bm==64 both fail with different
-        # patterns). Until fp8 is plumbed through the TMA path and the t2r
-        # epilogue is validated for MmaF8F6F4Op, route fp8 to the universal
-        # MMA atom which is dense + correct on B200.
         if env_choice == "tcgen05":
-            raise exc.BackendUnsupported(
-                "cute",
-                (
-                    "tcgen05 fp8 MMA is currently disabled: fp8 is excluded "
-                    "from the TMA producer/consumer staging path used by the "
-                    "validated f16/bf16 tcgen05 emission, and the non-TMA fp8 "
-                    "tcgen05 path produces sparse accumulator output."
-                ),
-            )
+            if not support.tcgen05_f8f6f4:
+                raise exc.BackendUnsupported(
+                    "cute",
+                    "tcgen05 F8F6F4 MMA is not supported on this machine.",
+                )
+            if _mma_impl_matches_problem_shape(
+                "tcgen05",
+                input_dtype,
+                bm=bm,
+                bn=bn,
+                bk=bk,
+                tcgen05_cluster_m=tcgen05_cluster_m,
+                tcgen05_large_bn_proof=tcgen05_large_bn_proof,
+            ):
+                return "tcgen05"
         return "universal"
     if env_choice != "auto":
         if env_choice not in support.supported_impls:
