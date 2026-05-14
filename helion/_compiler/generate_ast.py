@@ -589,21 +589,21 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         if self.on_device:
             pass
         elif isinstance(type_info := node._type_info, TileIndexType):
-            block_info = env.block_sizes[type_info.block_id]
             return expr_from_string(
                 self.host_function.literal_expr(
-                    block_info.from_config(self.device_function.config)
+                    self.device_function.resolved_block_size(type_info.block_id)
                 )
             )
         elif isinstance(type_info, SequenceType) and all(
             isinstance(x, TileIndexType) for x in type_info.unpack()
         ):
             values = type_info.unpack()
-            # pyrefly: ignore [missing-attribute]
-            block_infos = [env.block_sizes[x.block_id] for x in values]
             return expr_from_string(
                 self.host_function.literal_expr(
-                    [x.from_config(self.device_function.config) for x in block_infos]
+                    [
+                        self.device_function.resolved_block_size(x.block_id)  # pyrefly: ignore[missing-attribute]
+                        for x in values
+                    ]
                 )
             )
         elif isinstance(fn_type_info := func_node._type_info, CallableType) and (

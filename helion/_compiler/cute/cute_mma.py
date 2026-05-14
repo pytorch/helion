@@ -659,9 +659,7 @@ def _get_mma_k_loop_info(
                     None,
                 )
                 if device_loop is not None:
-                    block_size = env.block_sizes[k_block_id].from_config(
-                        cg.device_function.config
-                    )
+                    block_size = cg.device_function.resolved_block_size(k_block_id)
                     if isinstance(block_size, int):
                         return (
                             device_loop,
@@ -709,7 +707,7 @@ def _get_mma_k_loop_info(
     if device_loop is None:
         return None
 
-    block_size = env.block_sizes[k_block_id].from_config(cg.device_function.config)
+    block_size = cg.device_function.resolved_block_size(k_block_id)
     if not isinstance(block_size, int):
         return None
 
@@ -817,7 +815,7 @@ def prepare_cute_collective_lane_loop_suppression(
             bk = int(k_block_size)
         for bid in dict.fromkeys(candidate_block_ids):
             size = env.block_sizes[bid].size
-            bs = env.block_sizes[bid].from_config(cg.device_function.config)
+            bs = cg.device_function.resolved_block_size(bid)
             if not isinstance(bs, int):
                 continue
             if isinstance(size, (int, torch.SymInt)):
@@ -1630,8 +1628,8 @@ def _emit_mma_pipeline(
             m_block_id, n_block_id = grid_state.block_ids
             m_offset_var = grid_state.strategy.offset_var(m_block_id)
             n_offset_var = grid_state.strategy.offset_var(n_block_id)
-            m_bs = env.block_sizes[m_block_id].from_config(df.config)
-            n_bs = env.block_sizes[n_block_id].from_config(df.config)
+            m_bs = df.resolved_block_size(m_block_id)
+            n_bs = df.resolved_block_size(n_block_id)
             bm = int(m_bs) if isinstance(m_bs, int) else None
             bn = int(n_bs) if isinstance(n_bs, int) else None
         else:

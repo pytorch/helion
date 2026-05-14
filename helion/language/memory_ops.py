@@ -3528,7 +3528,7 @@ def _codegen_cute_store_loaded_index_trailing_slices(
                 axis = loops[-1].block_thread_axes.get(block_id)
         if axis is None or not (0 <= axis < 3):
             continue
-        block_size = env.block_sizes[block_id].from_config(state.config)
+        block_size = state.device_function.resolved_block_size(block_id)
         if not isinstance(block_size, int):
             continue
         state.codegen.max_thread_block_dims[axis] = max(
