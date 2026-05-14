@@ -36,6 +36,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from typing import TYPE_CHECKING
 from typing import Any
 from typing import Callable
 from typing import cast
@@ -55,6 +56,9 @@ from helion.autotuner.metrics import AutotuneMetrics
 from helion.autotuner.metrics import register_post_autotune_hook
 
 logger: logging.Logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 
 StrPath = str | os.PathLike[str]
 
@@ -95,6 +99,8 @@ def log_tensor_metadata(args: tuple[object, ...], kwargs: dict[str, object]) -> 
 # Maximum number of inputs to use
 MAX_NUM_INPUTS = 20
 
+_PATCHED_MAMBA_OPERATOR_CLASSES: set[type[Any]] = set()
+
 
 @dataclasses.dataclass
 class RunResult:
@@ -102,6 +108,44 @@ class RunResult:
     device: str
     shape: list[str]
     metrics: dict[str, list[float]]
+
+
+def _mamba_valid_dA_cumsum_like(dt: torch.Tensor) -> torch.Tensor:
+    # TritonBench PR #567 generates arbitrary random dA_cumsum values for the
+    # Mamba2 operators, but mamba_ssm's optimized Triton kernels assume the real
+    # Mamba invariant: dA_cumsum is cumulative negative decay, so it is
+    # non-increasing within each chunk. Patch the pinned benchmark inputs here so
+    # the handwritten baseline is compared on valid Mamba data.
+    return torch.cumsum(-torch.rand_like(dt), dim=-1)
+
+
+def patch_mamba2_tritonbench_inputs(operator_name: str, Operator: type[Any]) -> None:
+    if operator_name not in {"mamba2_chunk_scan", "mamba2_chunk_state"}:
+        return
+    if Operator in _PATCHED_MAMBA_OPERATOR_CLASSES:
+        return
+
+    original_get_input_iter = Operator.get_input_iter
+
+    def get_input_iter(self: object) -> Iterator[tuple[object, ...]]:
+        for example_inputs in original_get_input_iter(self):
+            if operator_name == "mamba2_chunk_scan":
+                cb, x, dt, _dA_cumsum, C, prev_states, D = example_inputs
+                dt = torch.rand_like(dt)
+                dA_cumsum = _mamba_valid_dA_cumsum_like(dt)
+                yield cb, x, dt, dA_cumsum, C, prev_states, D
+            else:
+                B, x, dt, _dA_cumsum = example_inputs
+                dA_cumsum = _mamba_valid_dA_cumsum_like(dt)
+                yield B, x, dt, dA_cumsum
+
+    Operator.get_input_iter = get_input_iter
+    _PATCHED_MAMBA_OPERATOR_CLASSES.add(Operator)
+
+
+def helion_benchmark_method_name(func_name: str) -> str:
+    prefix = "helion_"
+    return func_name if func_name.startswith(prefix) else f"{prefix}{func_name}"
 
 
 # Maps tritonbench op names to Helion kernel examples
@@ -755,27 +799,36 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
     },
     "mamba2_chunk_scan": {
         "eager": "baseline",
-        "compile_speedup": "torch_compile_speedup",
-        "compile_accuracy": "torch_compile_accuracy",
-        "helion_mamba2_chunk_scan_kernel_speedup": "helion_speedup",
-        "helion_mamba2_chunk_scan_kernel_accuracy": "helion_accuracy",
-        "helion_mamba2_chunk_scan_kernel_latency": "helion_latency_ms",
+        "mamba_ssm-speedup": "triton_speedup",
+        "mamba_ssm-accuracy": "triton_accuracy",
+        "mamba_ssm-latency": "triton_latency_ms",
+        "compile-speedup": "torch_compile_speedup",
+        "compile-accuracy": "torch_compile_accuracy",
+        "helion_mamba2_chunk_scan_kernel-speedup": "helion_speedup",
+        "helion_mamba2_chunk_scan_kernel-accuracy": "helion_accuracy",
+        "helion_mamba2_chunk_scan_kernel-latency": "helion_latency_ms",
     },
     "mamba2_chunk_state": {
         "eager": "baseline",
-        "compile_speedup": "torch_compile_speedup",
-        "compile_accuracy": "torch_compile_accuracy",
-        "helion_mamba2_chunk_state_kernel_speedup": "helion_speedup",
-        "helion_mamba2_chunk_state_kernel_accuracy": "helion_accuracy",
-        "helion_mamba2_chunk_state_kernel_latency": "helion_latency_ms",
+        "mamba_ssm-speedup": "triton_speedup",
+        "mamba_ssm-accuracy": "triton_accuracy",
+        "mamba_ssm-latency": "triton_latency_ms",
+        "compile-speedup": "torch_compile_speedup",
+        "compile-accuracy": "torch_compile_accuracy",
+        "helion_mamba2_chunk_state_kernel-speedup": "helion_speedup",
+        "helion_mamba2_chunk_state_kernel-accuracy": "helion_accuracy",
+        "helion_mamba2_chunk_state_kernel-latency": "helion_latency_ms",
     },
     "gdn_fwd_h": {
         "eager": "baseline",
-        "compile_speedup": "torch_compile_speedup",
-        "compile_accuracy": "torch_compile_accuracy",
-        "helion_gdn_fwd_h_speedup": "helion_speedup",
-        "helion_gdn_fwd_h_accuracy": "helion_accuracy",
-        "helion_gdn_fwd_h_latency": "helion_latency_ms",
+        "fla-speedup": "triton_speedup",
+        "fla-accuracy": "triton_accuracy",
+        "fla-latency": "triton_latency_ms",
+        "compile-speedup": "torch_compile_speedup",
+        "compile-accuracy": "torch_compile_accuracy",
+        "helion_gdn_fwd_h_tb-speedup": "helion_speedup",
+        "helion_gdn_fwd_h_tb-accuracy": "helion_accuracy",
+        "helion_gdn_fwd_h_tb-latency": "helion_latency_ms",
     },
 }
 
@@ -1256,6 +1309,7 @@ def run_kernel_variants(
     try:
         operator_module = importlib.import_module(tritonbench_module)
         Operator = operator_module.Operator
+        patch_mamba2_tritonbench_inputs(operator_name, Operator)
     except ImportError as e:
         print(
             f"Error: Could not import operator '{operator_name}' from tritonbench",
@@ -1371,8 +1425,7 @@ def run_kernel_variants(
             return helion_method
 
         # Method name for the benchmark
-        variant_name = func_name
-        helion_method_name = f"helion_{variant_name}"
+        helion_method_name = helion_benchmark_method_name(func_name)
 
         # Set up compile time tracking for this variant
         compile_times: list[float] | None = None
