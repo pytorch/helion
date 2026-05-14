@@ -3557,7 +3557,12 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             aux_tensor_name = device_function.tensor_arg(desc.host_tensor_val).name
             aux_dtype_str = env_backend.dtype_str(desc.host_tensor_val.dtype)
             dtype_bits = desc.host_tensor_val.dtype.itemsize * 8
-            copy_bits = 128
+            # Broadcast aux views intentionally have a stride-0 axis.
+            # CuTe cannot vectorize a 128-bit GMEM copy over static
+            # stride-0 elements, so keep those producer copies scalar
+            # and let the cooperative tiling cover the expanded SMEM
+            # tile. Dense residual tiles keep the wider copy atom.
+            copy_bits = dtype_bits if desc.broadcast_axis is not None else 128
             num_copy_elems = max(1, copy_bits // dtype_bits)
             gmem_aux_view_var = device_function.new_var(
                 f"tcgen05_aux_gmem_view_{desc_idx}"
@@ -3585,10 +3590,9 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             smem_part_var = device_function.new_var(f"tcgen05_aux_smem_part_{desc_idx}")
             setup: list[ast.stmt] = []
             # Build the source 2-D GMEM tensor. Exact-shape rank-2
-            # aux passes through ``aux_tensor`` directly; rank-1
-            # trailing-axis broadcast aux builds a stride-0-on-M
-            # view with M-extent ``bm_per_cta`` and N-extent = the
-            # rank-1 size. Under cluster_m=2 ``use_2cta_instrs``
+            # aux passes through ``aux_tensor`` directly; broadcast
+            # aux builds a stride-0 view with stride 1 on the data
+            # axis. Under cluster_m=2 ``use_2cta_instrs``
             # the per-CTA aux tile is ``(bm/2, bn)``; the global M
             # tile coord directly indexes per-CTA M stripes (the
             # scheduler publishes 2 global tiles per cluster
@@ -3608,24 +3612,37 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                     ]
                 )
             else:
-                assert desc.broadcast_axis == 1, (
-                    "C-input warp aux producer expects "
-                    "broadcast_axis in {None, 1}; the chain "
-                    "analyzer rejects other forms"
+                data_axis = desc.broadcast_axis
+                assert data_axis in (0, 1)
+                m_extent = (
+                    int(desc.host_tensor_val.shape[0])
+                    if data_axis == 0
+                    else bm_per_cta
                 )
-                n_global = int(desc.host_tensor_val.shape[0])
+                n_extent = (
+                    int(desc.host_tensor_val.shape[1])
+                    if len(desc.host_tensor_val.shape) == 2
+                    else int(desc.host_tensor_val.shape[0])
+                )
+                if data_axis == 0:
+                    n_extent = bn
+                    view_stride = "(1, 0)"
+                    tile_coord = f"({tile_m_var}, cutlass.Int32(0))"
+                else:
+                    view_stride = "(0, 1)"
+                    tile_coord = f"(cutlass.Int32(0), {tile_n_var})"
                 setup.extend(
                     [
                         statement_from_string(
                             f"{gmem_aux_view_var} = cute.make_tensor("
                             f"{aux_tensor_name}.iterator, "
-                            f"cute.make_layout(({bm_per_cta}, {n_global}), "
-                            "stride=(0, 1)))"
+                            f"cute.make_layout(({m_extent}, {n_extent}), "
+                            f"stride={view_stride}))"
                         ),
                         statement_from_string(
                             f"{gmem_aux_tile_var} = cute.local_tile("
                             f"{gmem_aux_view_var}, ({bm_per_cta}, {bn}), "
-                            f"(cutlass.Int32(0), {tile_n_var}))"
+                            f"{tile_coord})"
                         ),
                     ]
                 )
@@ -3902,6 +3919,8 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             "min",
             "cutlass.BFloat16",
             "cutlass.Boolean",
+            "cutlass.Float8E4M3FN",
+            "cutlass.Float8E5M2",
             "cutlass.Float16",
             "cutlass.Float32",
             "cutlass.Int32",

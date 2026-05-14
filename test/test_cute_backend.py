@@ -6,8 +6,11 @@ from unittest.mock import patch
 
 import pytest
 import torch
+from torch.testing._internal.common_utils import instantiate_parametrized_tests
+from torch.testing._internal.common_utils import parametrize
 
 import helion
+from helion import exc
 from helion._testing import DEVICE
 from helion._testing import HALF_DTYPE
 from helion._testing import TestCase
@@ -523,6 +526,64 @@ def cute_matmul_dot_out_dtype(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     return out
 
 
+@helion.kernel(backend="cute")
+def cute_matmul_fp8_dot_float32_out(
+    x: torch.Tensor, y: torch.Tensor
+) -> torch.Tensor:
+    m, k = x.size()
+    _, n = y.size()
+    out = torch.empty([m, n], dtype=torch.float32, device=x.device)
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
+        out[tile_m, tile_n] = acc
+    return out
+
+
+@helion.kernel(backend="cute")
+def cute_matmul_rowwise_scaled_tcgen05(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    scale_a: torch.Tensor,
+    scale_b: torch.Tensor,
+    bias: torch.Tensor,
+) -> torch.Tensor:
+    m, k = x.size()
+    _, n = y.size()
+    out = torch.empty([m, n], dtype=torch.bfloat16, device=x.device)
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
+        acc = acc * scale_a[tile_m, :].to(torch.float32)
+        acc = acc * scale_b[:, tile_n].to(torch.float32)
+        out[tile_m, tile_n] = (acc + bias[tile_n].to(torch.float32)).to(
+            torch.bfloat16
+        )
+    return out
+
+
+@helion.kernel(backend="cute")
+def cute_matmul_rowwise_scaled_no_bias_tcgen05(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    scale_a: torch.Tensor,
+    scale_b: torch.Tensor,
+) -> torch.Tensor:
+    m, k = x.size()
+    _, n = y.size()
+    out = torch.empty([m, n], dtype=torch.bfloat16, device=x.device)
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
+        acc = acc * scale_a[tile_m, :].to(torch.float32)
+        acc = acc * scale_b[:, tile_n].to(torch.float32)
+        out[tile_m, tile_n] = acc.to(torch.bfloat16)
+    return out
+
+
 @helion.kernel(backend="cute", static_shapes=False)
 def cute_matmul_packed_rhs_bfloat16(
     a: torch.Tensor, b: torch.Tensor, c: torch.Tensor
@@ -980,6 +1041,176 @@ class TestCuteBackend(TestCase):
             code,
         )
         self.assertIn("cutlass.pipeline.NamedBarrier(barrier_id=1", code)
+
+    def test_matmul_fp8_dot_float32_out_matches_reference(self) -> None:
+        args = (
+            torch.randn(64, 32, device=DEVICE).to(torch.float8_e4m3fn),
+            torch.randn(32, 16, device=DEVICE).to(torch.float8_e4m3fn),
+        )
+        with patch.dict(os.environ, {"HELION_CUTE_MMA_IMPL": "auto"}, clear=False):
+            code, out = code_and_output(
+                cute_matmul_fp8_dot_float32_out,
+                args,
+                block_sizes=[64, 16, 32],
+                num_warps=4,
+            )
+        torch.testing.assert_close(out, args[0].float() @ args[1].float())
+        self.assertNotIn("cute.nvgpu.tcgen05", code)
+
+    def test_matmul_rowwise_scaled_tcgen05_matches_reference(self) -> None:
+        support = get_cute_mma_support()
+        if not support.tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+
+        args = (
+            torch.randn(128, 128, device=DEVICE, dtype=torch.bfloat16),
+            torch.randn(128, 128, device=DEVICE, dtype=torch.bfloat16),
+            torch.randn(128, 1, device=DEVICE, dtype=torch.float32),
+            torch.randn(1, 128, device=DEVICE, dtype=torch.float32),
+            torch.randn(128, device=DEVICE, dtype=torch.float32),
+        )
+        with patch.dict(os.environ, {"HELION_CUTE_MMA_IMPL": "tcgen05"}, clear=False):
+            code, out = code_and_output(
+                cute_matmul_rowwise_scaled_tcgen05,
+                args,
+                block_sizes=[128, 128, 32],
+            )
+        x, y, scale_a, scale_b, bias = args
+        expected = ((x.float() @ y.float()) * scale_a * scale_b + bias).to(
+            torch.bfloat16
+        )
+        torch.testing.assert_close(out, expected, atol=1e-1, rtol=1e-2)
+        self.assertIn("cute.nvgpu.tcgen05", code)
+        self.assertIn("stride=(1, 0)", code)
+        self.assertIn("stride=(0, 1)", code)
+
+    @parametrize(
+        "shape_config",
+        (
+            ((64, 128, 64), {"block_sizes": [64, 64, 32]}),
+            ((128, 128, 128), {"block_sizes": [128, 128, 32]}),
+            ((128, 256, 256), {"block_sizes": [128, 128, 64]}),
+            (
+                (256, 256, 256),
+                {
+                    "block_sizes": [256, 256, 128],
+                    "pid_type": "persistent_interleaved",
+                    "tcgen05_cluster_m": 2,
+                },
+            ),
+        ),
+    )
+    def test_matmul_fp8_rowwise_scaled_forced_tcgen05_matches_reference(
+        self, shape_config: tuple[tuple[int, int, int], dict[str, object]]
+    ) -> None:
+        support = get_cute_mma_support()
+        if not support.tcgen05_f8f6f4:
+            self.skipTest("tcgen05 F8F6F4 MMA is not supported on this machine")
+
+        (m, k, n), config = shape_config
+        args = (
+            torch.randn(m, k, device=DEVICE, dtype=torch.float32).to(
+                torch.float8_e4m3fn
+            ),
+            torch.randn(k, n, device=DEVICE, dtype=torch.float32).to(
+                torch.float8_e4m3fn
+            ),
+            torch.randn(m, 1, device=DEVICE, dtype=torch.float32),
+            torch.randn(1, n, device=DEVICE, dtype=torch.float32),
+            torch.randn(n, device=DEVICE, dtype=torch.float32),
+        )
+        with patch.dict(os.environ, {"HELION_CUTE_MMA_IMPL": "tcgen05"}, clear=False):
+            code, out = code_and_output(
+                cute_matmul_rowwise_scaled_tcgen05,
+                args,
+                **config,
+            )
+        x, y, scale_a, scale_b, bias = args
+        expected = ((x.float() @ y.float()) * scale_a * scale_b + bias).to(
+            torch.bfloat16
+        )
+        torch.testing.assert_close(out, expected, atol=2.0, rtol=2e-1)
+        self.assertIn("cute.nvgpu.tcgen05", code)
+        self.assertIn("cutlass.Float8E4M3FN", code)
+        self.assertIn("cutlass.BFloat16", code)
+
+    def test_choose_mma_impl_fp8_auto_universal_forced_tcgen05(self) -> None:
+        support = get_cute_mma_support()
+        if not support.tcgen05_f8f6f4:
+            self.skipTest("tcgen05 F8F6F4 MMA is not supported on this machine")
+
+        from helion._compiler.cute.cute_mma import _choose_mma_impl
+
+        for dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+            with patch.dict(
+                os.environ, {"HELION_CUTE_MMA_IMPL": "auto"}, clear=False
+            ):
+                # Regardless of shape, auto picks universal for fp8.
+                for bm, bn, bk in ((64, 8, 32), (128, 16, 32), (256, 32, 32)):
+                    self.assertEqual(
+                        _choose_mma_impl(dtype, bm=bm, bn=bn, bk=bk),
+                        "universal",
+                        f"{dtype}: bm={bm},bn={bn} should pick universal",
+                    )
+            with patch.dict(
+                os.environ, {"HELION_CUTE_MMA_IMPL": "tcgen05"}, clear=False
+            ):
+                self.assertEqual(
+                    _choose_mma_impl(dtype, bm=128, bn=16, bk=32),
+                    "tcgen05",
+                )
+
+    def test_matmul_fp8_rowwise_scaled_c_input_warp_matches_reference(self) -> None:
+        support = get_cute_mma_support()
+        if not support.tcgen05_f8f6f4:
+            self.skipTest("tcgen05 F8F6F4 MMA is not supported on this machine")
+
+        args = (
+            torch.randn(256, 256, device=DEVICE, dtype=torch.float32).to(
+                torch.float8_e4m3fn
+            ),
+            torch.randn(256, 256, device=DEVICE, dtype=torch.float32).to(
+                torch.float8_e4m3fn
+            ),
+            torch.randn(256, 1, device=DEVICE, dtype=torch.float32),
+            torch.randn(1, 256, device=DEVICE, dtype=torch.float32),
+        )
+        config = {
+            "block_sizes": [256, 256, 128],
+            "l2_groupings": [1],
+            "num_warps": 4,
+            "num_sm_multiplier": 1,
+            "pid_type": "persistent_interleaved",
+            "tcgen05_cluster_m": 2,
+            "tcgen05_ab_stages": 2,
+            "tcgen05_acc_stages": 2,
+            "tcgen05_c_stages": 2,
+            "tcgen05_num_epi_warps": 4,
+            "tcgen05_strategy": "role_local_with_scheduler",
+            "tcgen05_warp_spec_scheduler_warps": 1,
+            "tcgen05_warp_spec_c_input_warps": 1,
+            "indexing": [
+                "tensor_descriptor",
+                "tensor_descriptor",
+                "tensor_descriptor",
+                "tensor_descriptor",
+            ],
+        }
+        with patch.dict(os.environ, {"HELION_CUTE_MMA_IMPL": "tcgen05"}, clear=False):
+            code, out = code_and_output(
+                cute_matmul_rowwise_scaled_no_bias_tcgen05,
+                args,
+                **config,
+            )
+        x, y, scale_a, scale_b = args
+        expected = ((x.float() @ y.float()) * scale_a * scale_b).to(torch.bfloat16)
+        torch.testing.assert_close(out, expected, atol=2.0, rtol=2e-1)
+        self.assertIn(
+            "tcgen05_aux_pipeline = cutlass.pipeline.PipelineAsync.create(",
+            code,
+        )
+        self.assertIn("tcgen05_c_input_warp_valid", code)
+        self.assertIn("num_bits_per_copy=32", code)
 
     def test_matmul_dot_out_dtype_falls_back_from_mma(self) -> None:
         args = (
@@ -1680,3 +1911,6 @@ class TestCuteBackend(TestCase):
         torch.testing.assert_close(out, expected, rtol=1e-4, atol=1e-4)
         self.assertIn("block=(32, 32, 1)", code)
         self.assertIn("_cute_grouped_reduce_shared_two_stage", code)
+
+
+instantiate_parametrized_tests(TestCuteBackend)

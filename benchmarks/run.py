@@ -41,6 +41,10 @@ from typing import Any
 from typing import Callable
 from typing import cast
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
 from tabulate import tabulate
 import torch
 from torch.utils._pytree import tree_leaves
@@ -266,6 +270,16 @@ KERNEL_MAPPINGS: dict[str, tuple[str, ...]] = {
         "fp8_gemm_tritonbench",
         {
             "num_inputs": 10,  # fp8_gemm takes long time on Benchmark CI, so use fewer inputs instead.
+        },
+    ),
+    "scaled_mm": (
+        "examples.scaled_mm",
+        [
+            ("examples.scaled_mm", "scaled_mm_tritonbench"),
+            ("examples.scaled_mm", "scaled_mm_triton_backend_tritonbench"),
+        ],
+        {
+            "num_inputs": 4,
         },
     ),
     "flash_attention": (
@@ -768,6 +782,15 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "helion_fp8_gemm_tritonbench-accuracy": "helion_accuracy",
         "helion_fp8_gemm_tritonbench-latency": "helion_latency_ms",
     },
+    "scaled_mm": {
+        "torch_scaled_mm-latency": "baseline_latency_ms",
+        "helion_scaled_mm_tritonbench-speedup": "helion_speedup",
+        "helion_scaled_mm_tritonbench-accuracy": "helion_accuracy",
+        "helion_scaled_mm_tritonbench-latency": "helion_latency_ms",
+        "helion_scaled_mm_triton_backend_tritonbench-speedup": "helion_triton_speedup",
+        "helion_scaled_mm_triton_backend_tritonbench-accuracy": "helion_triton_accuracy",
+        "helion_scaled_mm_triton_backend_tritonbench-latency": "helion_triton_latency_ms",
+    },
     "low_mem_dropout": {
         "seeded_dropout-accuracy": "triton_accuracy",
         "seeded_dropout-speedup": "triton_speedup",
@@ -1253,6 +1276,11 @@ def run_kernel_variants(
 
     assert "--op" not in tritonbench_args
     tritonbench_args = ["--op", operator_name, *tritonbench_args]
+    if not tritonbench_module.startswith("tritonbench.") and not any(
+        arg == "--benchmark-name" or arg.startswith("--benchmark-name=")
+        for arg in tritonbench_args
+    ):
+        tritonbench_args.extend(["--benchmark-name", operator_name])
 
     # If kernel name ends with `-bwd`, then add --bwd flag
     if kernel_name.endswith("-bwd") and "--bwd" not in tritonbench_args:
@@ -1521,7 +1549,24 @@ def run_kernel_variants(
 
     with tempfile.NamedTemporaryFile(mode="w+t", suffix=".csv") as tmp:
         tritonbench_args.extend(["--output", tmp.name])
-        tritonbench_run(tritonbench_args)
+        if not tritonbench_module.startswith("tritonbench."):
+            # TritonBench only discovers operators in its own package tree.
+            from tritonbench.utils import run_utils
+
+            original_load_opbench_by_name = run_utils.load_opbench_by_name
+
+            def load_opbench_by_name(name: str) -> object:
+                if name == operator_name:
+                    return Operator
+                return original_load_opbench_by_name(name)
+
+            run_utils.load_opbench_by_name = load_opbench_by_name
+            try:
+                tritonbench_run(tritonbench_args)
+            finally:
+                run_utils.load_opbench_by_name = original_load_opbench_by_name
+        else:
+            tritonbench_run(tritonbench_args)
         tmp.seek(0)
         try:
             process_result(

@@ -74,8 +74,10 @@ class Tcgen05AuxTensorDescriptor:
       the producer-body codegen needs at MMA-codegen time (the TMA
       atom and SMEM ring are sized from these).
     - ``broadcast_axis``: ``None`` for the exact-shape rank-2 form
-      (``residual[tile_m, tile_n]``); ``1`` for the trailing-axis
-      rowvec broadcast form (``bias[tile_n]``). Matches the field on
+      (``residual[tile_m, tile_n]``); ``1`` for trailing-axis rowvec
+      broadcast (``bias[tile_n]`` or ``scale_b[:, tile_n]``); ``0``
+      for explicit leading-axis colvec broadcast
+      (``scale_a[tile_m, :]``). Matches the field on
       :class:`_AuxiliaryTensorStep` so the productive body uses the
       same axis convention as the existing per-thread splice.
     - ``store_value_node``: the FX node of the store value whose

@@ -191,18 +191,12 @@ def aux_tensor_load_kind(
       load's index list is exactly the carrier's tile-id symbol
       nodes in the same order. The splice site uses the existing
       partition_C → flat_divide → partition_D pipeline.
-    - ``("broadcast", 1)``: a rank-1 trailing-axis broadcast aux
-      load (``bias[tile_n]``). The underlying tensor's rank is 1,
-      the load result shape equals the carrier tile shape's
-      trailing entry, and the load's single index symbol is
-      exactly ``carrier_tile_index_nodes[1]``. Only the trailing
-      axis is supported because PyTorch broadcasting aligns a
-      rank-1 operand to the *last* dimension of a rank-2 LHS:
-      ``acc + bias[tile_m]`` is either a shape error (BM ≠ BN) or
-      rowvec broadcast against the trailing axis (BM == BN). A
-      user wanting M-axis (column-vector) broadcasting must write
-      it explicitly (``bias[tile_m][:, None]`` /
-      ``.unsqueeze(-1)``); that is a separate, deferred pattern.
+    - ``("broadcast", 1)``: a trailing-axis rowvec broadcast aux
+      load (``bias[tile_n]`` or ``scale_b[:, tile_n]``).
+    - ``("broadcast", 0)``: an explicit leading-axis colvec
+      broadcast aux load (``scale_a[tile_m, :]``). Bare rank-1
+      ``scale_a[tile_m]`` remains rejected because PyTorch aligns
+      rank-1 operands to the last dimension of a rank-2 carrier.
       See :class:`Tcgen05UnaryEpilogueChain` (``cute_epilogue.py``)
       for the splice-side broadcast-view contract.
 
@@ -305,25 +299,18 @@ def _matches_broadcast(
     carrier_tile_index_nodes: tuple[torch.fx.Node, ...] | None,
     carrier_global_shape: tuple[object, ...] | None,
 ) -> tuple[str, int] | None:
-    """Check whether a load matches the rank-1 trailing-axis
-    (rowvec) broadcast aux pattern, and return ``("broadcast", 1)``
-    on success.
+    """Check whether a load matches a supported broadcast aux pattern.
 
-    The classifier intentionally restricts to the trailing axis
-    only: a bare rank-1 operand on the RHS of a rank-2 carrier
-    aligns to the last dimension under PyTorch broadcasting rules,
-    so ``acc + bias[tile_m]`` is not a column-vector broadcast — it
-    is a shape error (BM ≠ BN) or trailing-axis broadcast (BM == BN).
-    Users wanting an explicit M-axis broadcast must write it
-    explicitly (``bias[tile_m][:, None]`` / ``.unsqueeze(-1)`` /
-    ``.expand(...)``); that is a separate pattern handler not yet
-    wired up.
+    Rank-1 loads are accepted only as trailing-axis rowvec
+    broadcasts, matching PyTorch's rank-1 broadcasting rules. The
+    explicit rank-2 scale forms used by rowwise scaled_mm are also
+    accepted: ``scale_a[tile_m, :]`` with shape ``(M, 1)`` returns
+    ``("broadcast", 0)``, and ``scale_b[:, tile_n]`` with shape
+    ``(1, N)`` returns ``("broadcast", 1)``.
 
-    The splice site emits ``cute.make_layout((m, n),
-    stride=(0, 1))`` with stride 1 hard-coded on the data axis,
-    which is correct only when the underlying rank-1 tensor is
-    contiguous (stride 1 on dim 0). Non-stride-1 broadcast aux
-    is rejected loudly.
+    The splice site emits a stride-0 logical 2-D view with stride 1
+    hard-coded on the data axis. Non-stride-1 broadcast aux tensors
+    are rejected loudly.
 
     When ``carrier_global_shape`` is provided, the rank-1 aux's
     extent must equal the output tensor's global size on the
@@ -335,8 +322,6 @@ def _matches_broadcast(
     to be divisible by the tile extent passes the tile check yet
     reads OOB at runtime.
     """
-    if len(aux_tensor_shape) != 1 or len(aux_shape) != 1 or len(index_list) != 1:
-        return None
     if carrier_tile_index_nodes is None:
         # Broadcast classification is gated on knowing the carrier's
         # tile-id symbols so we can pin which axis the load broadcasts
@@ -345,17 +330,31 @@ def _matches_broadcast(
         return None
     if len(carrier_tile_index_nodes) != 2:
         return None
-    load_idx = index_list[0]
-    if not isinstance(load_idx, torch.fx.Node):
-        return None
-    if aux_tensor_val.stride() != (1,):
-        return None
-    aux_extent = aux_shape[0]
-    # Trailing-axis (rowvec) broadcast only — see docstring.
-    axis = 1
-    if load_idx is not carrier_tile_index_nodes[axis]:
-        return None
-    if aux_extent != carrier_tile_shape[axis]:
+    if len(aux_tensor_shape) == 1 and len(aux_shape) == 1 and len(index_list) == 1:
+        load_idx = index_list[0]
+        if not isinstance(load_idx, torch.fx.Node):
+            return None
+        if aux_tensor_val.stride() != (1,):
+            return None
+        axis = 1
+        if load_idx is not carrier_tile_index_nodes[axis]:
+            return None
+        if aux_shape[0] != carrier_tile_shape[axis]:
+            return None
+        aux_global_extent = aux_tensor_shape[0]
+    elif len(aux_tensor_shape) == 2 and len(aux_shape) == 2 and len(index_list) == 2:
+        axis = _explicit_rank2_broadcast_axis(
+            aux_shape=aux_shape,
+            aux_tensor_shape=aux_tensor_shape,
+            aux_tensor_stride=aux_tensor_val.stride(),
+            index_list=index_list,
+            carrier_tile_shape=carrier_tile_shape,
+            carrier_tile_index_nodes=carrier_tile_index_nodes,
+        )
+        if axis is None:
+            return None
+        aux_global_extent = aux_tensor_shape[axis]
+    else:
         return None
     if carrier_global_shape is not None:
         if len(carrier_global_shape) != 2:
@@ -368,9 +367,38 @@ def _matches_broadcast(
         # aux smaller than the output axis whose length happens to
         # be divisible by the tile extent could pass classification
         # yet read OOB at runtime.
-        if aux_tensor_shape[0] != carrier_global_shape[axis]:
+        if aux_global_extent != carrier_global_shape[axis]:
             return None
     return ("broadcast", axis)
+
+
+def _explicit_rank2_broadcast_axis(
+    *,
+    aux_shape: tuple[object, ...],
+    aux_tensor_shape: tuple[object, ...],
+    aux_tensor_stride: tuple[int, ...],
+    index_list: Sequence[object],
+    carrier_tile_shape: tuple[object, ...],
+    carrier_tile_index_nodes: tuple[torch.fx.Node, ...],
+) -> int | None:
+    for axis in (0, 1):
+        broadcast_axis = 1 - axis
+        load_idx = index_list[axis]
+        broadcast_idx = index_list[broadcast_axis]
+        if not isinstance(load_idx, torch.fx.Node):
+            continue
+        if load_idx is not carrier_tile_index_nodes[axis]:
+            continue
+        if not (isinstance(broadcast_idx, slice) and broadcast_idx == slice(None)):
+            continue
+        if aux_shape[axis] != carrier_tile_shape[axis]:
+            continue
+        if aux_shape[broadcast_axis] != 1 or aux_tensor_shape[broadcast_axis] != 1:
+            continue
+        if aux_tensor_stride[axis] != 1:
+            continue
+        return axis
+    return None
 
 
 def _matches_exact(

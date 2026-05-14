@@ -31,7 +31,7 @@ def _helion_cute_matmul_role_local_monolithic_4096_bf16(x, y, out, tma_atom_a, t
     if tcgen05_exec_active or tcgen05_epi_active:
         cute.arch.setmaxregister_increase(256)
     mma_slice_tidx = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster()) % cutlass.Int32(2)
-    tiled_mma = cutlass.utils.blackwell_helpers.make_trivial_tiled_mma(cutlass.BFloat16, cute.nvgpu.tcgen05.OperandMajorMode.K, cute.nvgpu.tcgen05.OperandMajorMode.MN, cutlass.Float32, cute.nvgpu.tcgen05.CtaGroup.TWO, (256, 256), cute.nvgpu.tcgen05.OperandSource.SMEM)
+    tiled_mma = cutlass.utils.blackwell_helpers.make_trivial_tiled_mma(cutlass.BFloat16, cutlass.BFloat16, cute.nvgpu.tcgen05.OperandMajorMode.K, cute.nvgpu.tcgen05.OperandMajorMode.MN, cutlass.Float32, cute.nvgpu.tcgen05.CtaGroup.TWO, (256, 256), cute.nvgpu.tcgen05.OperandSource.SMEM)
     thr_mma = tiled_mma.get_slice(mma_slice_tidx)
     tcgen05_cluster_layout_vmnk = cute.tiled_divide(cute.make_layout((2, 1, 1)), (tiled_mma.thr_id.shape,))
     sA_layout = cutlass.utils.blackwell_helpers.make_smem_layout_a(tiled_mma, (256, 256, 128), cutlass.BFloat16, 2)

@@ -2000,30 +2000,18 @@ def _codegen_cute_store_tcgen05_tile(
                 # of the underlying 2-D tensor directly.
                 source_for_local_tile = rec.aux_tensor_name
             else:
-                # Rank-1 trailing-axis (rowvec) broadcast aux: build a
-                # 2-D logical view of the rank-1 underlying tensor with
-                # stride 0 on the leading (M) axis and stride 1 on the
-                # trailing (N) axis. Stride 0 on M causes every lane
-                # "owning" output ``(m, n)`` to read the same source
-                # element regardless of m, which is the rowvec
-                # broadcast semantic that matches PyTorch's
-                # ``acc + bias[tile_n]`` (rank-1 RHS aligns to the
-                # trailing axis). The view feeds the same
-                # ``partition_C → flat_divide → partition_D`` pipeline
-                # used by exact-shape aux. Mirrors Quack's
-                # ``RowVecLoad`` epilogue (``quack/quack/epi_ops.py``).
-                # Only the trailing axis (``broadcast_axis == 1``)
-                # form is accepted at classify time — see
-                # ``aux_tensor_load_kind`` /
-                # ``_AuxiliaryTensorStep.broadcast_axis`` for the
-                # rejection of the leading-axis form.
-                assert rec.broadcast_axis == 1
+                # Build a logical 2-D broadcast view for rank-1
+                # rowvec and explicit rank-2 scale forms. The data
+                # axis keeps stride 1; the orthogonal axis gets stride
+                # 0 so every output element in that row/column reads
+                # the same scale value.
                 assert rec.aux_view2d is not None
+                view_stride = "(1, 0)" if rec.broadcast_axis == 0 else "(0, 1)"
                 lines.append(
                     f"{rec.aux_view2d} = cute.make_tensor("
                     f"{rec.aux_tensor_name}.iterator, "
                     f"cute.make_layout(({m_size}, {n_size}), "
-                    f"stride=(0, 1)))"
+                    f"stride={view_stride}))"
                 )
                 source_for_local_tile = rec.aux_view2d
             lines.append(

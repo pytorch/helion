@@ -21,10 +21,11 @@ expression for two cases:
 - Auxiliary-tensor binary ops: same shape as above, but one or more
   steps are ``add/sub/mul/div`` with the chain carrier as one
   operand and a ``helion.language.load(aux_tensor, [...])``
-  call as the other. Two aux load shapes are accepted: the
-  exact-shape rank-2 form (``residual[tile_m, tile_n]``) and the
-  rank-1 trailing-axis (rowvec) broadcast form (``bias[tile_n]``).
-  See :class:`_AuxiliaryTensorStep` for the canonical contract.
+  call as the other. Accepted aux load shapes are exact-shape rank-2
+  (``residual[tile_m, tile_n]``), trailing-axis rowvec broadcast
+  (``bias[tile_n]`` or ``scale_b[:, tile_n]``), and explicit
+  leading-axis colvec broadcast (``scale_a[tile_m, :]``). See
+  :class:`_AuxiliaryTensorStep` for the canonical contract.
   Forms outside these two — 3-D underlying tensors with a static
   collapse, mismatched indices, leading-axis rank-1
   (``bias[tile_m]``), kwargs — are rejected to the loud-failure
@@ -125,17 +126,12 @@ class _AuxiliaryTensorStep:
     classify time).
 
     ``broadcast_axis`` is ``None`` when the aux tensor matches the
-    carrier rank exactly (``residual[tile_m, tile_n]``) or ``1`` for
-    a trailing-axis (rowvec) broadcast aux load (``bias[tile_n]``
-    with shape ``(N,)``). The leading-axis (colvec / M-axis) form is
-    not accepted: a bare rank-1 operand on the RHS aligns to the
-    *last* dimension under PyTorch broadcasting rules
-    (``acc + bias[tile_m]`` is either a shape error when BM ≠ BN
-    or a rowvec broadcast when BM == BN), so accepting the colvec
-    pattern would silently rewrite the user's broadcast direction.
-    Users wanting an explicit colvec broadcast must spell it out
-    with ``[:, None]`` / ``.unsqueeze(-1)``; that is a separate
-    pattern handler not yet wired up. The splice site
+    carrier rank exactly (``residual[tile_m, tile_n]``), ``1`` for
+    trailing-axis rowvec broadcast (``bias[tile_n]`` or
+    ``scale_b[:, tile_n]``), or ``0`` for explicit leading-axis
+    colvec broadcast (``scale_a[tile_m, :]``). Bare rank-1
+    ``scale_a[tile_m]`` remains rejected because PyTorch aligns it
+    to the last dimension, not to the M axis. The splice site
     (``memory_ops._codegen_cute_store_tcgen05_tile``) owns the
     canonical broadcast-view contract — it builds a 2-D logical
     view of the rank-1 tensor with stride 0 on the orthogonal axis

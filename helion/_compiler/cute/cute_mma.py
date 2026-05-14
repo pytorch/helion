@@ -99,6 +99,19 @@ _TRACE_THROUGH_TARGETS = {
     # raw tensor data — tracing through permute would bypass the
     # data shuffle.  Permuted operands fall back to scalar codegen.
 }
+_STORE_DTYPE_TRACE_TARGETS = _TRACE_THROUGH_TARGETS | {
+    torch.ops.aten.relu.default,
+    torch.ops.aten.abs.default,
+    torch.ops.aten.neg.default,
+    torch.ops.aten.tanh.default,
+    torch.ops.aten.exp.default,
+    torch.ops.aten.log.default,
+    torch.ops.aten.sqrt.default,
+    torch.ops.aten.add.Tensor,
+    torch.ops.aten.mul.Tensor,
+    torch.ops.aten.sub.Tensor,
+    torch.ops.aten.div.Tensor,
+}
 
 # Register reallocation budget for tcgen05 warp-specialized kernels.
 # Producer warps (TMA loads, scheduler) only do address arithmetic and
@@ -368,7 +381,13 @@ def _has_mma_operands(lhs_node: Node, rhs_node: Node) -> bool:
         return False
     lhs_load, _, lhs_fake = lhs_info
     rhs_load, _, rhs_fake = rhs_info
-    supported = {torch.float16, torch.bfloat16, torch.float32}
+    supported = {
+        torch.float16,
+        torch.bfloat16,
+        torch.float32,
+        torch.float8_e4m3fn,
+        torch.float8_e5m2,
+    }
     return (
         lhs_fake.dtype in supported
         and rhs_fake.dtype in supported
@@ -1520,7 +1539,7 @@ def _trace_mma_to_store_dtype(
                 target is _tracing_ops._phi
                 or target is _tracing_ops._new_var
                 or target is operator.getitem
-                or target in _TRACE_THROUGH_TARGETS
+                or target in _STORE_DTYPE_TRACE_TARGETS
             ):
                 stack.append(user)
                 continue
@@ -1567,6 +1586,8 @@ def _emit_mma_pipeline(
         torch.float16: "cutlass.Float16",
         torch.bfloat16: "cutlass.BFloat16",
         torch.float32: "cutlass.Float32",
+        torch.float8_e4m3fn: "cutlass.Float8E4M3FN",
+        torch.float8_e5m2: "cutlass.Float8E5M2",
     }
     input_dtype_str = _dtype_map[input_dtype]
     acc_dtype_str = "cutlass.Float32"
@@ -1593,8 +1614,21 @@ def _emit_mma_pipeline(
     epi_elem_dtype_str = (
         _dtype_map[epi_elem_dtype] if epi_elem_dtype is not None else input_dtype_str
     )
+    # TMA producer/consumer staging is admissible for f16/bf16 and for fp8
+    # (e4m3fn / e5m2). fp8 needs the same staged accumulator pipeline f16/bf16
+    # uses; without it the t2r epilogue reads sparse TMEM output for
+    # MmaF8F6F4Op. The downstream byte-budget helpers (e.g.
+    # tcgen05_ab_smem_bytes_per_cta) already accept dtype_bytes and callers
+    # source it from ``lhs.dtype.itemsize`` so the 1-byte fp8 path computes
+    # correct SMEM budgets when this gate opens.
     tcgen05_use_tma = (
-        input_dtype in (torch.float16, torch.bfloat16)
+        input_dtype
+        in (
+            torch.float16,
+            torch.bfloat16,
+            torch.float8_e4m3fn,
+            torch.float8_e5m2,
+        )
         and lhs_fake.is_contiguous()
         and rhs_fake.is_contiguous()
     )
@@ -4275,7 +4309,10 @@ def _mma_impl_matches_problem_shape(
 ) -> bool:
     if mma_impl == "universal":
         return True
-    if input_dtype not in (torch.float16, torch.bfloat16) or bn < 8 or bn % 8 != 0:
+    fp8_dtype = input_dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+    if input_dtype not in (torch.float16, torch.bfloat16) and not fp8_dtype:
+        return False
+    if bn < 8 or bn % 8 != 0:
         return False
     if bn > 256 and (
         mma_impl != "tcgen05"
@@ -4292,13 +4329,10 @@ def _mma_impl_matches_problem_shape(
         # Warp MMA atom is fixed-K (16 elements per BF16/FP16 instruction).
         return bk == 16 and bm >= 16 and bm % 16 == 0 and bn == 8
     if mma_impl == "tcgen05":
-        # tcgen05 mma instruction K is 16 elements for BF16/FP16, but the
-        # tile's K can be any positive multiple of that (the inner cute.gemm
-        # loop just runs more instructions per K iteration). Larger tile_k
-        # roughly halves the per-K-iter overhead per doubling. Production
-        # remains capped at block_n=256 to keep AB SMEM staging budget sane;
-        # the explicit G4 proof key admits only the smallest 512-N candidate.
-        if bk < 16 or bk > 256 or bk % 16 != 0:
+        # tcgen05 mma instruction K: 16 for BF16/FP16, 32 for F8F6F4.
+        # Tile K must be a positive multiple of the instruction K.
+        k_stride = 32 if fp8_dtype else 16
+        if bk < k_stride or bk > 256 or bk % k_stride != 0:
             return False
         if bm in (64, 128):
             return True
@@ -4362,6 +4396,25 @@ def _choose_mma_impl(
     tcgen05_large_bn_proof = _tcgen05_large_bn_proof_enabled(config)
     env_choice = os.environ.get("HELION_CUTE_MMA_IMPL", "auto").strip().lower()
     support = get_cute_mma_support()
+    fp8_dtype = input_dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+    if fp8_dtype:
+        if env_choice == "tcgen05":
+            if not support.tcgen05_f8f6f4:
+                raise exc.BackendUnsupported(
+                    "cute",
+                    "tcgen05 F8F6F4 MMA is not supported on this machine.",
+                )
+            if _mma_impl_matches_problem_shape(
+                "tcgen05",
+                input_dtype,
+                bm=bm,
+                bn=bn,
+                bk=bk,
+                tcgen05_cluster_m=tcgen05_cluster_m,
+                tcgen05_large_bn_proof=tcgen05_large_bn_proof,
+            ):
+                return "tcgen05"
+        return "universal"
     if env_choice != "auto":
         if env_choice not in support.supported_impls:
             raise exc.BackendUnsupported(
@@ -4459,6 +4512,7 @@ def _tcgen05_tiled_mma_expr(
         cta_group_expr = "cute.nvgpu.tcgen05.CtaGroup.TWO"
     return (
         "cutlass.utils.blackwell_helpers.make_trivial_tiled_mma("
+        f"{input_dtype_str}, "
         f"{input_dtype_str}, "
         "cute.nvgpu.tcgen05.OperandMajorMode.K, "
         "cute.nvgpu.tcgen05.OperandMajorMode.MN, "
