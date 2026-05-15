@@ -1821,6 +1821,49 @@ class TestExamples(RefEagerTestBase, TestCase):
             block_sizes=[64],
         )
 
+    @skipIfXPU("Timeout on XPU")
+    def test_fused_linear_jsd_fwd(self):
+        """Exercise the autograd-wrapped FusedLinearJSDFunction path
+        (FusedLinearJSDFunction.forward -> jsd_kernel per chunk).
+
+        This is the user-facing API; the existing `test_fused_linear_jsd`
+        only covers the simpler `fused_linear_jsd_kernel` JSD-only path.
+        Shape is chosen so chunk_size > 1 and the chunked path is actually
+        exercised (raw chunk_size formula picks 512 here).
+        """
+        beta = 0.5
+        ignore_index = -100
+        # Use temperature = sqrt(hidden_dim) so logits/temperature has std ~1
+        # and softmax stays in fp32 range.
+        m, n, k = 512, 4096, 4096
+        temperature = float(n) ** 0.5
+
+        student_input = torch.randn([m, n], device=DEVICE, dtype=torch.float32)
+        teacher_input = torch.randn([m, n], device=DEVICE, dtype=torch.float32)
+        student_weight = torch.randn([k, n], device=DEVICE, dtype=torch.float32)
+        teacher_weight = torch.randn([k, n], device=DEVICE, dtype=torch.float32)
+
+        mod = import_path(EXAMPLES_DIR / "fused_linear_jsd.py")
+        result = mod.fused_linear_jsd_fwd(
+            beta,
+            ignore_index,
+            temperature,
+            student_weight,
+            teacher_weight,
+            student_input,
+            teacher_input,
+        )
+        expected = mod.fused_linear_jsd_pytorch(
+            beta,
+            ignore_index,
+            temperature,
+            student_weight,
+            teacher_weight,
+            student_input,
+            teacher_input,
+        )
+        torch.testing.assert_close(result, expected, atol=1e-1, rtol=1e-2)
+
     @xfailIfPallas("JAX tracer error")
     @skipIfRefEager("hl.jagged_tile does not support ref mode yet")
     def test_jagged_layer_norm(self):
