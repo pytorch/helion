@@ -264,6 +264,12 @@ _EXPECTED_PERF: dict[str, dict[str, ExpectedPerf]] = {
             geomean=1.009,
             wins_slack=None,
         ),
+        "sm90": ExpectedPerf(
+            helion_wins=5,
+            total=10,
+            geomean=0.99,
+            wins_slack=None,
+        ),
     },
     "softmax": {
         "sm100": ExpectedPerf(
@@ -271,6 +277,12 @@ _EXPECTED_PERF: dict[str, dict[str, ExpectedPerf]] = {
             total=100,
             geomean=2.304,
             wins_slack=2,
+        ),
+        "sm90": ExpectedPerf(
+            helion_wins=97,
+            total=100,
+            geomean=1.78,
+            wins_slack=7,
         ),
     },
     "layer_norm": {
@@ -280,6 +292,12 @@ _EXPECTED_PERF: dict[str, dict[str, ExpectedPerf]] = {
             geomean=1.55,
             wins_slack=1,
         ),
+        "sm90": ExpectedPerf(
+            helion_wins=37,
+            total=38,
+            geomean=1.39,
+            wins_slack=2,
+        ),
     },
     "rms_norm": {
         "sm100": ExpectedPerf(
@@ -288,12 +306,24 @@ _EXPECTED_PERF: dict[str, dict[str, ExpectedPerf]] = {
             geomean=1.605,
             wins_slack=6,
         ),
+        "sm90": ExpectedPerf(
+            helion_wins=23,
+            total=30,
+            geomean=1.17,
+            wins_slack=5,
+        ),
     },
     "cross_entropy": {
         "sm100": ExpectedPerf(
             helion_wins=21,
             total=21,
             geomean=1.698,
+            wins_slack=1,
+        ),
+        "sm90": ExpectedPerf(
+            helion_wins=21,
+            total=21,
+            geomean=2.35,
             wins_slack=1,
         ),
     },
