@@ -640,6 +640,247 @@ class TestCacheMatching(unittest.TestCase):
             self.assertEqual(entries[0].config.config["block_sizes"], [64, 128])
 
 
+def _make_entry_json(
+    hardware: str,
+    spec_key: str,
+    config_dict: dict[str, object],
+    config_spec_hash: str,
+    flat_config: list[object],
+) -> str:
+    """Build a .best_config JSON string matching the on-disk format."""
+    return json.dumps(
+        {
+            "key": {
+                "fields": {
+                    "hardware": hardware,
+                    "specialization_key": spec_key,
+                    "config_spec_hash": config_spec_hash,
+                }
+            },
+            "config": json.dumps(config_dict),
+            "flat_config": json.dumps(flat_config),
+        }
+    )
+
+
+class TestRemoteCacheMerging(unittest.TestCase):
+    """Tests for _find_similar_cached_configs merging remote entries via RemoteCacheBackend.list()."""
+
+    def _make_mock_search(self, hardware: str, spec_key: str, fp_hash: str):
+        mock_search = MagicMock()
+        mock_search._skip_cache = False
+        mock_search.settings = MagicMock()
+        mock_search.settings.autotune_best_available_max_cache_scan = 500
+        mock_search.settings.autotune_search_acf = None
+        mock_search._get_current_hardware_and_specialization = MagicMock(
+            return_value=(hardware, spec_key)
+        )
+        mock_search.config_spec = MagicMock()
+        mock_search.config_spec.structural_fingerprint_hash = MagicMock(
+            return_value=fp_hash
+        )
+        return mock_search
+
+    def test_remote_entries_returned_when_local_empty(self):
+        """When local has no matches, remote entries seed warm-start."""
+        from helion.autotuner.remote_cache import RemoteCacheBackend
+
+        fp_hash = "abc123"
+        hardware = "NVIDIA GeForce RTX 4090"
+        spec_key = "('tensor_spec',)"
+
+        class StubBackend(RemoteCacheBackend):
+            def get(self, key):
+                return None
+
+            def put(self, key, data):
+                pass
+
+            def list(self, max_results=None):
+                return [
+                    _make_entry_json(
+                        hardware, spec_key, {"block_sizes": [64]}, fp_hash, [64]
+                    )
+                ]
+
+        with (
+            tempfile.TemporaryDirectory() as cache_dir,
+            patch(
+                "helion.autotuner.local_cache.get_helion_cache_dir",
+                return_value=Path(cache_dir),
+            ),
+            patch(
+                "helion.autotuner.remote_cache._load_remote_backend_if_configured",
+                return_value=StubBackend(),
+            ),
+        ):
+            entries = PopulationBasedSearch._find_similar_cached_configs(
+                self._make_mock_search(hardware, spec_key, fp_hash), max_configs=10
+            )
+
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0].config.config["block_sizes"], [64])
+
+    def test_remote_dedups_against_local(self):
+        """Remote entries duplicating a local match (including nested lists in flat_config) are dropped."""
+        from helion.autotuner.remote_cache import RemoteCacheBackend
+
+        fp_hash = "abc123"
+        hardware = "NVIDIA GeForce RTX 4090"
+        spec_key = "('tensor_spec',)"
+
+        # Nested list inside flat_config — common shape for block_sizes etc.
+        # The dedup machinery must not crash with "unhashable type: 'list'".
+        flat_a = [[16, 32], 4]
+        flat_b = [[64, 128], 8]
+
+        class StubBackend(RemoteCacheBackend):
+            def get(self, key):
+                return None
+
+            def put(self, key, data):
+                pass
+
+            def list(self, max_results=None):
+                return [
+                    _make_entry_json(
+                        hardware, spec_key, {"block_sizes": [16, 32]}, fp_hash, flat_a
+                    ),
+                    _make_entry_json(
+                        hardware, spec_key, {"block_sizes": [64, 128]}, fp_hash, flat_b
+                    ),
+                ]
+
+        with tempfile.TemporaryDirectory() as cache_dir:
+            # Local entry matches flat_a — remote duplicate must be skipped.
+            data = {
+                "key": {
+                    "fields": {
+                        "hardware": hardware,
+                        "specialization_key": spec_key,
+                        "config_spec_hash": fp_hash,
+                    }
+                },
+                "config": json.dumps({"block_sizes": [16, 32]}),
+                "flat_config": json.dumps(flat_a),
+            }
+            with open(os.path.join(cache_dir, "local.best_config"), "w") as f:
+                json.dump(data, f)
+
+            with (
+                patch(
+                    "helion.autotuner.local_cache.get_helion_cache_dir",
+                    return_value=Path(cache_dir),
+                ),
+                patch(
+                    "helion.autotuner.remote_cache._load_remote_backend_if_configured",
+                    return_value=StubBackend(),
+                ),
+            ):
+                entries = PopulationBasedSearch._find_similar_cached_configs(
+                    self._make_mock_search(hardware, spec_key, fp_hash),
+                    max_configs=10,
+                )
+
+        flats = [e.flat_config for e in entries]
+        # Local entry (a) appears first; remote (a) is deduped; remote (b) is kept.
+        self.assertEqual(flats, [([16, 32], 4), ([64, 128], 8)])
+
+    def test_remote_entries_filtered_by_hardware(self):
+        """Remote entries with non-matching hardware are skipped."""
+        from helion.autotuner.remote_cache import RemoteCacheBackend
+
+        fp_hash = "abc123"
+
+        class StubBackend(RemoteCacheBackend):
+            def get(self, key):
+                return None
+
+            def put(self, key, data):
+                pass
+
+            def list(self, max_results=None):
+                return [
+                    _make_entry_json(
+                        "NVIDIA A100", "('s',)", {"block_sizes": [128]}, fp_hash, [128]
+                    ),
+                ]
+
+        with (
+            tempfile.TemporaryDirectory() as cache_dir,
+            patch(
+                "helion.autotuner.local_cache.get_helion_cache_dir",
+                return_value=Path(cache_dir),
+            ),
+            patch(
+                "helion.autotuner.remote_cache._load_remote_backend_if_configured",
+                return_value=StubBackend(),
+            ),
+        ):
+            entries = PopulationBasedSearch._find_similar_cached_configs(
+                self._make_mock_search("NVIDIA GeForce RTX 4090", "('s',)", fp_hash),
+                max_configs=10,
+            )
+
+        self.assertEqual(entries, [])
+
+    def test_remote_malformed_entries_skipped(self):
+        """Malformed remote entries are silently skipped, valid ones still returned."""
+        from helion.autotuner.remote_cache import RemoteCacheBackend
+
+        fp_hash = "abc123"
+        hardware = "NVIDIA GeForce RTX 4090"
+        spec_key = "('s',)"
+
+        class StubBackend(RemoteCacheBackend):
+            def get(self, key):
+                return None
+
+            def put(self, key, data):
+                pass
+
+            def list(self, max_results=None):
+                return [
+                    "not valid json",
+                    json.dumps({"config": "minimal payload, missing key.fields"}),
+                    _make_entry_json(
+                        hardware, spec_key, {"block_sizes": [16]}, fp_hash, [16]
+                    ),
+                ]
+
+        with (
+            tempfile.TemporaryDirectory() as cache_dir,
+            patch(
+                "helion.autotuner.local_cache.get_helion_cache_dir",
+                return_value=Path(cache_dir),
+            ),
+            patch(
+                "helion.autotuner.remote_cache._load_remote_backend_if_configured",
+                return_value=StubBackend(),
+            ),
+        ):
+            entries = PopulationBasedSearch._find_similar_cached_configs(
+                self._make_mock_search(hardware, spec_key, fp_hash), max_configs=10
+            )
+
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0].config.config["block_sizes"], [16])
+
+    def test_default_list_returns_empty(self):
+        """Backends that don't override list() use the empty default — no errors, no entries."""
+        from helion.autotuner.remote_cache import RemoteCacheBackend
+
+        class MinimalBackend(RemoteCacheBackend):
+            def get(self, key):
+                return None
+
+            def put(self, key, data):
+                pass
+
+        # The default impl returns an empty tuple; just verify the contract holds.
+        self.assertEqual(list(MinimalBackend().list()), [])
+
+
 class TestIterCacheEntries(unittest.TestCase):
     """Tests for the iter_cache_entries() module-level API in local_cache."""
 
