@@ -110,6 +110,8 @@ def guided_search_kwargs_from_config(
         kwargs["provider"] = provider
     if (model := os.environ.get("HELION_LLM_MODEL")) is not None:
         kwargs["model"] = model
+    if (effort_level := os.environ.get("HELION_LLM_EFFORT_LEVEL")) is not None:
+        kwargs["effort_level"] = effort_level
     if (value := os.environ.get("HELION_LLM_COMPILE_TIMEOUT_S")) is not None:
         kwargs["compile_timeout_s"] = int(value)
     return kwargs
@@ -160,6 +162,8 @@ class LLMGuidedSearch(PopulationBasedSearch):
         api_key: Optional API key. Defaults to the provider's env var (e.g. OPENAI_API_KEY).
         compile_timeout_s: Optional compile-time cap applied only while the LLM
             search benchmarks its exploratory configs.
+        effort_level: Optional provider-specific effort-level hint (none / low /
+            medium / high / max). Can also be set via HELION_LLM_EFFORT_LEVEL.
     """
 
     def __init__(
@@ -178,6 +182,7 @@ class LLMGuidedSearch(PopulationBasedSearch):
         api_key: str | None = None,
         request_timeout_s: float = DEFAULT_REQUEST_TIMEOUT_S,
         compile_timeout_s: int | None = None,
+        effort_level: str | None = None,
     ) -> None:
         super().__init__(kernel, args, finishing_rounds=finishing_rounds)
         if max_rounds < 1:
@@ -194,6 +199,7 @@ class LLMGuidedSearch(PopulationBasedSearch):
         self.api_key = api_key
         self.request_timeout_s = request_timeout_s
         self.compile_timeout_s = compile_timeout_s
+        self.effort_level = effort_level
 
         self._messages: list[dict[str, str]] = []
         self._all_benchmark_results: list[BenchmarkResult] = []
@@ -288,6 +294,7 @@ class LLMGuidedSearch(PopulationBasedSearch):
                 messages=messages,
                 max_output_tokens=self._max_output_tokens_for_request(),
                 request_timeout_s=self.request_timeout_s,
+                effort_level=self.effort_level,
             )
         except Exception as e:
             self.log.warning(f"LLM call failed: {type(e).__name__}: {e}")
