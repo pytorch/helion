@@ -2670,8 +2670,12 @@ class TestIndexing(RefEagerTestBase, TestCase):
 
     @onlyBackends(["triton"])
     @skipIfRefEager("Test checks generated Triton code")
-    def test_dynamic_size_args_do_not_specialize_in_triton(self):
-        @helion.kernel(autotune_effort="none", static_shapes=False)
+    def test_triton_do_not_specialize_emits_do_not_specialize(self):
+        @helion.kernel(
+            autotune_effort="none",
+            static_shapes=False,
+            triton_do_not_specialize=True,
+        )
         def add_one(x: torch.Tensor) -> torch.Tensor:
             out = torch.empty_like(x)
             for tile in hl.tile(x.size(0)):
@@ -2686,6 +2690,30 @@ class TestIndexing(RefEagerTestBase, TestCase):
         self.assertIn("do_not_specialize=", code)
         self.assertIn("do_not_specialize_on_alignment=", code)
         y = torch.randn([2], device=DEVICE)
+        torch.testing.assert_close(add_one(y), y + 1)
+        self.assertEqual(len(add_one._bound_kernels), 1)
+
+    @onlyBackends(["triton"])
+    @skipIfRefEager("Test checks generated Triton code")
+    def test_dynamic_size_args_match_triton_default(self):
+        """Without triton_do_not_specialize, Helion follows Triton's own default
+        and emits a plain @triton.jit so value/alignment specialization is
+        preserved (which is what enables vectorized loads)."""
+
+        @helion.kernel(autotune_effort="none", static_shapes=False)
+        def add_one(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size(0)):
+                out[tile] = x[tile] + 1
+            return out
+
+        x = torch.randn([1024], device=DEVICE)
+        code, result = code_and_output(add_one, (x,), block_size=16)
+        torch.testing.assert_close(result, x + 1)
+        self.assertNotIn("do_not_specialize=", code)
+        self.assertNotIn("do_not_specialize_on_alignment=", code)
+        # Helion still buckets sizes so a single BoundKernel handles every shape.
+        y = torch.randn([2048], device=DEVICE)
         torch.testing.assert_close(add_one(y), y + 1)
         self.assertEqual(len(add_one._bound_kernels), 1)
 
