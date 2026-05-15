@@ -73,6 +73,8 @@ from .tcgen05_constants import TCGEN05_ACC_PRODUCER_ADVANCE_MODE_SKIP
 from .tcgen05_constants import TCGEN05_ACC_PRODUCER_MODE_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_ACC_PRODUCER_MODE_NORMAL
 from .tcgen05_constants import TCGEN05_ACC_PRODUCER_MODE_SKIP_UMMA
+from .tcgen05_constants import TCGEN05_AUX_LOAD_MODE_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_AUX_LOAD_MODE_TMA
 from .tcgen05_constants import TCGEN05_CLUSTER_M2_ONE_CTA_ROLE_LOCAL_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_BLOCK_SIZES
 from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_CLUSTER_M
@@ -188,6 +190,8 @@ class _Tcgen05AuxPerDescriptorRingNames:
     smem_layout: str
     smem_ptr: str
     smem: str
+    tma_atom: str | None
+    tma_tensor: str | None
 
 
 @dataclass(frozen=True)
@@ -233,6 +237,8 @@ class _Tcgen05AuxPipelinePlan:
     # off this state per subtile of the per-output-tile aux region.
     consumer_state: str
     rings: tuple[_Tcgen05AuxPerDescriptorRingNames, ...]
+    use_tma_load: bool
+    stage_count: int
     # ``epi_tile_var`` is the matmul-plan ``epi_tile`` variable
     # name. The producer body in
     # ``program_id._build_c_input_warp_role_local_while`` uses it
@@ -3128,24 +3134,104 @@ def _emit_mma_pipeline(
             c_input_aux_tensor_descriptors = (
                 tcgen05_matmul_plan.c_input_aux_tensor_descriptors
             )
+            all_aux_tensor_descriptors = tcgen05_matmul_plan.aux_tensor_descriptors
+            tcgen05_aux_tma_requested = (
+                df.config.get(TCGEN05_AUX_LOAD_MODE_CONFIG_KEY)
+                == TCGEN05_AUX_LOAD_MODE_TMA
+            )
             aux_store_value_nodes = {
                 desc.store_value_node for desc in c_input_aux_tensor_descriptors
             }
             aux_single_store_value = len(aux_store_value_nodes) <= 1
-            if (
+            aux_productive_body_gate_open = (
                 tcgen05_matmul_plan.has_c_input_warp
                 and c_input_aux_tensor_descriptors
                 and aux_single_store_value
+            )
+            if (
+                tcgen05_aux_tma_requested
+                and all_aux_tensor_descriptors
+                and not aux_productive_body_gate_open
             ):
+                if not tcgen05_matmul_plan.has_c_input_warp:
+                    reason = (
+                        "requires the productive C-input warp "
+                        "(``tcgen05_warp_spec_c_input_warps=1``)"
+                    )
+                elif not c_input_aux_tensor_descriptors:
+                    reason = (
+                        "requires at least one exact-shape rank-2 auxiliary "
+                        "tensor; broadcast-only auxiliary tensors are not "
+                        "staged by the aux TMA path"
+                    )
+                else:
+                    reason = (
+                        "requires single-store fan-out for the staged aux descriptors"
+                    )
+                raise exc.BackendUnsupported(
+                    "cute",
+                    f"{TCGEN05_AUX_LOAD_MODE_CONFIG_KEY}="
+                    f"{TCGEN05_AUX_LOAD_MODE_TMA!r} {reason}",
+                )
+            if aux_productive_body_gate_open:
                 aux_descriptor_dtype_strs = tuple(
                     env.backend.dtype_str(desc.host_tensor_val.dtype)
                     for desc in c_input_aux_tensor_descriptors
                 )
+                if (
+                    tcgen05_aux_tma_requested
+                    and not tcgen05_static_output_tiles
+                    and not tcgen05_matmul_plan.tma_store_full_tiles_only
+                ):
+                    raise exc.BackendUnsupported(
+                        "cute",
+                        f"{TCGEN05_AUX_LOAD_MODE_CONFIG_KEY}="
+                        f"{TCGEN05_AUX_LOAD_MODE_TMA!r} with partial output "
+                        "tiles requires the full-tile/edge fallback split used "
+                        "by output-edge TMA stores",
+                    )
+                if tcgen05_aux_tma_requested and any(
+                    dtype_str != epi_elem_dtype_str
+                    for dtype_str in aux_descriptor_dtype_strs
+                ):
+                    raise exc.BackendUnsupported(
+                        "cute",
+                        f"{TCGEN05_AUX_LOAD_MODE_CONFIG_KEY}="
+                        f"{TCGEN05_AUX_LOAD_MODE_TMA!r} requires auxiliary "
+                        "tensor dtype to match the epilogue/output dtype",
+                    )
+                tcgen05_aux_use_tma_load = tcgen05_aux_tma_requested
                 tcgen05_aux_plan = _new_tcgen05_aux_pipeline_plan(
                     df,
                     num_rings=len(c_input_aux_tensor_descriptors),
                     epi_tile_var=tcgen05_plan.epi_tile,
+                    use_tma_load=tcgen05_aux_use_tma_load,
                 )
+                if tcgen05_aux_use_tma_load:
+                    for desc, ring, aux_dtype_str in zip(
+                        c_input_aux_tensor_descriptors,
+                        tcgen05_aux_plan.rings,
+                        aux_descriptor_dtype_strs,
+                        strict=True,
+                    ):
+                        tma_atom = ring.tma_atom
+                        tma_tensor = ring.tma_tensor
+                        assert tma_atom is not None
+                        assert tma_tensor is not None
+                        aux_tensor_name = df.tensor_arg(desc.host_tensor_val).name
+                        df.placeholder_args.add(aux_tensor_name)
+                        df.wrapper_only_params.extend([tma_atom, tma_tensor])
+                        cg.cute_wrapper_plans.append(
+                            {
+                                "kind": "tcgen05_aux_tma",
+                                "c_name": aux_tensor_name,
+                                "bm": bm,
+                                "bn": bn,
+                                "stage_count": _TCGEN05_AUX_PIPELINE_STAGE_COUNT,
+                                "input_dtype": aux_dtype_str,
+                                "kernel_args": [tma_atom, tma_tensor],
+                            }
+                        )
                 df.cute_state.register_tcgen05_aux_pipeline_plan(tcgen05_aux_plan)
                 prefix.extend(
                     _emit_tcgen05_aux_pipeline_setup(
@@ -5007,6 +5093,7 @@ def _new_tcgen05_aux_pipeline_plan(
     *,
     num_rings: int,
     epi_tile_var: str,
+    use_tma_load: bool,
 ) -> _Tcgen05AuxPipelinePlan:
     """Allocate variable names for the C-input warp's aux-tensor
     SMEM-ring pipeline (``cute_plan.md`` §7.5.3.2).
@@ -5034,6 +5121,12 @@ def _new_tcgen05_aux_pipeline_plan(
             smem_layout=df.new_var(f"tcgen05_aux_smem_layout_{idx}"),
             smem_ptr=df.new_var(f"tcgen05_aux_smem_ptr_{idx}"),
             smem=df.new_var(f"tcgen05_aux_smem_{idx}"),
+            tma_atom=(
+                df.new_var(f"tcgen05_aux_tma_atom_{idx}") if use_tma_load else None
+            ),
+            tma_tensor=(
+                df.new_var(f"tcgen05_aux_tma_tensor_{idx}") if use_tma_load else None
+            ),
         )
         for idx in range(num_rings)
     )
@@ -5045,6 +5138,8 @@ def _new_tcgen05_aux_pipeline_plan(
         producer_state=df.new_var("tcgen05_aux_pipeline_producer_state"),
         consumer_state=df.new_var("tcgen05_aux_pipeline_consumer_state"),
         rings=rings,
+        use_tma_load=use_tma_load,
+        stage_count=_TCGEN05_AUX_PIPELINE_STAGE_COUNT,
         epi_tile_var=epi_tile_var,
     )
 
@@ -5083,10 +5178,13 @@ def _emit_tcgen05_aux_pipeline_setup(
 
     Pipeline parameters:
 
-    - ``producer_arrive_count = c_input_warp_thread_count`` (32 for
-      the single C-input warp). The producer body issues
-      ``producer_acquire`` / ``producer_commit`` per-thread, so
-      the cooperative-group arrive count is per-thread.
+    - SIMT aux loads use ``producer_arrive_count =
+      c_input_warp_thread_count`` (32 for the single C-input warp).
+      The producer body issues ``producer_acquire`` /
+      ``producer_commit`` per-thread, so the cooperative-group
+      arrive count is per-thread. TMA aux loads use a
+      ``PipelineTmaAsync`` producer group matching the CUTLASS TMA
+      pipeline convention.
     - ``consumer_arrive_count = epi_warp_count`` (per-warp, NOT
       per-thread). The consumer-side flip in
       ``memory_ops._aux_subtile_load_source`` gates
@@ -5125,32 +5223,70 @@ def _emit_tcgen05_aux_pipeline_setup(
                 ),
             ]
         )
+    lines.append(
+        statement_from_string(
+            f"{plan.barriers} = cute.arch.alloc_smem("
+            f"cutlass.Int64, cutlass.Int32({stage_count * 2}))"
+        )
+    )
+    if plan.use_tma_load:
+        tx_terms = [
+            f"cute.size_in_bytes({dtype_str}, cute.slice_({ring.smem_layout}.outer, "
+            "(None, None, 0)))"
+            for ring, dtype_str in zip(plan.rings, descriptor_dtype_strs, strict=True)
+        ]
+        tx_count = " + ".join(tx_terms)
+        lines.extend(
+            [
+                statement_from_string(
+                    f"{plan.producer_group} = "
+                    "cutlass.pipeline.CooperativeGroup("
+                    "cutlass.pipeline.Agent.Thread)"
+                ),
+                statement_from_string(
+                    f"{plan.consumer_group} = "
+                    "cutlass.pipeline.CooperativeGroup("
+                    "cutlass.pipeline.Agent.Thread, "
+                    f"cutlass.Int32({epi_warp_count}))"
+                ),
+                statement_from_string(
+                    f"{plan.pipeline} = cutlass.pipeline.PipelineTmaAsync.create("
+                    f"num_stages={stage_count}, "
+                    f"producer_group={plan.producer_group}, "
+                    f"consumer_group={plan.consumer_group}, "
+                    f"tx_count={tx_count}, "
+                    f"barrier_storage={plan.barriers}"
+                    f"{extra_args})"
+                ),
+            ]
+        )
+    else:
+        lines.extend(
+            [
+                statement_from_string(
+                    f"{plan.producer_group} = "
+                    "cutlass.pipeline.CooperativeGroup("
+                    "cutlass.pipeline.Agent.Thread, "
+                    f"cutlass.Int32({c_input_warp_thread_count}))"
+                ),
+                statement_from_string(
+                    f"{plan.consumer_group} = "
+                    "cutlass.pipeline.CooperativeGroup("
+                    "cutlass.pipeline.Agent.Thread, "
+                    f"cutlass.Int32({epi_warp_count}))"
+                ),
+                statement_from_string(
+                    f"{plan.pipeline} = cutlass.pipeline.PipelineAsync.create("
+                    f"num_stages={stage_count}, "
+                    f"producer_group={plan.producer_group}, "
+                    f"consumer_group={plan.consumer_group}, "
+                    f"barrier_storage={plan.barriers}"
+                    f"{extra_args})"
+                ),
+            ]
+        )
     lines.extend(
         [
-            statement_from_string(
-                f"{plan.barriers} = cute.arch.alloc_smem("
-                f"cutlass.Int64, cutlass.Int32({stage_count * 2}))"
-            ),
-            statement_from_string(
-                f"{plan.producer_group} = "
-                "cutlass.pipeline.CooperativeGroup("
-                "cutlass.pipeline.Agent.Thread, "
-                f"cutlass.Int32({c_input_warp_thread_count}))"
-            ),
-            statement_from_string(
-                f"{plan.consumer_group} = "
-                "cutlass.pipeline.CooperativeGroup("
-                "cutlass.pipeline.Agent.Thread, "
-                f"cutlass.Int32({epi_warp_count}))"
-            ),
-            statement_from_string(
-                f"{plan.pipeline} = cutlass.pipeline.PipelineAsync.create("
-                f"num_stages={stage_count}, "
-                f"producer_group={plan.producer_group}, "
-                f"consumer_group={plan.consumer_group}, "
-                f"barrier_storage={plan.barriers}"
-                f"{extra_args})"
-            ),
             statement_from_string(
                 f"{plan.producer_state} = cutlass.pipeline.make_pipeline_state("
                 f"cutlass.pipeline.PipelineUserType.Producer, {stage_count})"

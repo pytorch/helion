@@ -1893,6 +1893,7 @@ def _codegen_cute_store_tcgen05_tile(
         assert aux_pipeline_plan_obj is not None
         aux_pipeline_name = aux_pipeline_plan_obj.pipeline
         aux_consumer_state_name = aux_pipeline_plan_obj.consumer_state
+        aux_pipeline_uses_tma_load = aux_pipeline_plan_obj.use_tma_load
         all_rings = aux_pipeline_plan_obj.rings
         aux_ring_smem_names: tuple[str | None, ...] = tuple(
             all_rings[ring_idx].smem if ring_idx is not None else None
@@ -1901,6 +1902,7 @@ def _codegen_cute_store_tcgen05_tile(
     else:
         aux_pipeline_name = ""
         aux_consumer_state_name = ""
+        aux_pipeline_uses_tma_load = False
         aux_ring_smem_names = tuple(None for _ in aux_step_records)
 
     def _simt_edge_coord_subtile_source(indent: str) -> str:
@@ -2167,6 +2169,18 @@ def _codegen_cute_store_tcgen05_tile(
                 f"{prelude_indent}{aux_pipeline_name}.consumer_wait("
                 f"{aux_consumer_state_name})\n"
             )
+            if aux_pipeline_uses_tma_load:
+                # TMA producer writes arrive through the async proxy; after the
+                # pipeline wait, fence that view before generic SMEM reads.
+                # The warp sync mirrors CUTLASS/Quack's TMA-load consumer
+                # sequence so every lane observes the fenced view before the
+                # per-lane SMEM->register copy below.
+                lines.extend(
+                    [
+                        f"{prelude_indent}cute.arch.fence_view_async_shared()\n",
+                        f"{prelude_indent}cute.arch.sync_warp()\n",
+                    ]
+                )
             for aux_idx, rec in enumerate(aux_step_records):
                 if aux_ring_smem_names[aux_idx] is None:
                     continue
