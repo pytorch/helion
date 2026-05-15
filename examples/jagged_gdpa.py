@@ -394,7 +394,7 @@ def main() -> None:
     heads = 8
     head_dim = 256
     qk_scale = 1.0
-    dtype = torch.float32
+    dtype = torch.bfloat16
     device = torch.device(DEVICE)
 
     lengths_q = torch.randint(
