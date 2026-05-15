@@ -662,8 +662,8 @@ class BlockSizeTileStrategy(TileStrategy):
             is not None
             # TODO(jansel): when parent block size is a SymInt, we fail to apply this optimization should fix this
             and isinstance(
-                parent_block_size := env.block_sizes[block_id].from_config(
-                    state.config
+                parent_block_size := state.device_function.resolved_block_size(
+                    block_id
                 ),
                 int,
             )
@@ -1869,9 +1869,7 @@ class CuteNDTileStrategy(NDTileStrategy):
         env = CompileEnvironment.current()
         resolved_block_id = env.resolve_block_id(block_size)
         if resolved_block_id is not None:
-            configured_size = env.block_sizes[resolved_block_id].from_config(
-                self.fn.config
-            )
+            configured_size = self.fn.resolved_block_size(resolved_block_id)
             if isinstance(configured_size, int):
                 return configured_size
         block_size_expr = _to_sympy(block_size)
