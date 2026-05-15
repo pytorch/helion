@@ -30,104 +30,40 @@ Every prediction follows one of two paths depending on whether the LLO encodes t
 
 Step-by-step:
 
-### 1. Produce the LLO dump (on the TPU pod)
+### 1–3. Produce, identify, and archive the LLO dump
 
-LLO (Low-Level Optimizer) dumps are emitted by libtpu when `--xla_jf_dump_to=<dir>` is set in `LIBTPU_INIT_ARGS`. They contain the final VLIW bundles (`*-final_bundles.txt`) and per-bundle lane utilization (`*-final_hlo-static-per-bundle-utilization.txt`) — the two files this predictor consumes.
+Steps 1, 2, and 3 are already documented end-to-end in the `tpu-test` skill, which is the canonical reference for anything that runs on the TPU pod (sync, build, env vars, dump dirs, kubectl recipes). See `.claude/skills/tpu-test/SKILL.md`:
 
-**Pod setup** (canonical envs per `.claude/skills/tpu-test/SKILL.md`):
+- **§ Environment** — Envs 1–4 (root paths, venvs, `TPU_VISIBLE_CHIPS` mapping, activation rule)
+- **§ LLO Profiling → Step 1: Dump LLO on the pod** — full `kubectl exec` recipe with `LIBTPU_INIT_ARGS=--xla_jf_dump_to=...`, `HELION_BACKEND=pallas`, etc.
+- **§ LLO Profiling → Step 2: Identify the right kernel dump** — naming patterns (Helion `custom_kernel.<N>` vs msl-tpu-kernel descriptive suffixes), how to filter out XLA reference dumps and `schedule-analysis` files
+- **§ LLO Profiling → Step 3: Copy dumps back to the Mac**
 
-| Env | Root | Venv | TPU chip | Required env vars |
-|---|---|---|---|---|
-| 1 | `/mnt/hyperdisk/` | `/mnt/hyperdisk/env/.venv` | 0 | `ALLOW_MULTIPLE_LIBTPU_LOAD=1 TPU_VISIBLE_CHIPS=0` |
-| 2 | `/mnt/hyperdisk/Code2/` | `/mnt/hyperdisk/Code2/env/.venv` | 2 | `... TPU_VISIBLE_CHIPS=2` |
-| 3 | `/mnt/hyperdisk/Code3/` | `/mnt/hyperdisk/Code3/env/.venv` | 3 | `... TPU_VISIBLE_CHIPS=3` |
-| 4 | `/mnt/hyperdisk/Code4/` | `/mnt/hyperdisk/Code4/env/.venv` | 1 | `... TPU_VISIBLE_CHIPS=1` |
+Two predictor-specific add-ons not in tpu-test:
 
-Pick the env that matches the current session (deterministic from session name) — or ask the user.
+**Runner templates for msl-tpu-kernel kernels.** Use `scripts/llo_runner_gmm.py` and `scripts/llo_runner_rpa.py` as templates — single-config runners that produce one clean named dump and print `Avg latency: <X> us`. msl-tpu-kernel is rsync'd to `/mnt/hyperdisk/Code3/msl-tpu-kernel`; add it to `PYTHONPATH` in the kubectl exec command.
 
-**Sync your code to the pod first:**
-```bash
-kubectl cp scripts/<your-runner>.py yifeixu-torchtpu:/mnt/hyperdisk/Code3/helion/scripts/<your-runner>.py
-```
-
-**Helion-on-Pallas kernel:**
-```bash
-kubectl exec yifeixu-torchtpu -- bash -c "
-  source /mnt/hyperdisk/Code3/env/.venv/bin/activate &&
-  rm -rf /tmp/llo_dump && mkdir -p /tmp/llo_dump &&
-  cd /mnt/hyperdisk/Code3/helion &&
-  ALLOW_MULTIPLE_LIBTPU_LOAD=1 TPU_VISIBLE_CHIPS=3 \
-  HELION_BACKEND=pallas \
-  LIBTPU_INIT_ARGS='--xla_jf_dump_to=/tmp/llo_dump' \
-  python <your-runner>.py
-"
-```
-
-**msl-tpu-kernel kernel** (uses `pl.pallas_call` directly):
-```bash
-# msl-tpu-kernel is rsync'd to /mnt/hyperdisk/Code3/msl-tpu-kernel and added via PYTHONPATH
-kubectl exec yifeixu-torchtpu -- bash -c "
-  source /mnt/hyperdisk/Code3/env/.venv/bin/activate &&
-  rm -rf /tmp/llo_dump && mkdir -p /tmp/llo_dump &&
-  cd /mnt/hyperdisk/Code3/helion &&
-  PYTHONPATH=/mnt/hyperdisk/Code3/msl-tpu-kernel:\$PYTHONPATH \
-  ALLOW_MULTIPLE_LIBTPU_LOAD=1 TPU_VISIBLE_CHIPS=3 \
-  LIBTPU_INIT_ARGS='--xla_jf_dump_to=/tmp/llo_dump' \
-  python scripts/llo_runner_gmm.py --M 1024 --K 4096 --N 4096 --G 8
-"
-```
-
-The runner should:
-1. Build inputs of the exact shape/dtype you want to study.
-2. Call the kernel once outside any timing loop to trigger compilation (LLO is emitted during compile).
-3. Call it again, timed, for the measurement. The runner should print `Avg latency: <X> us`.
-
-Use `scripts/llo_runner_gmm.py` / `scripts/llo_runner_rpa.py` as templates — single-config runners with full LIBTPU recipe in their docstrings.
-
-**Heads-up**: a single JIT'd function call emits **many** dumps (per-fusion, plus XLA reference dumps, plus utility ops). Step 2 below shows how to pick out *your* kernel from the noise.
-
-### 2. Identify the right dump
-
-```bash
-kubectl exec yifeixu-torchtpu -- ls -laS /tmp/llo_dump/ | grep final_bundles.txt | head
-```
-
-- **Helion-on-Pallas**: filename pattern is `custom_kernel.<N>-final_bundles.txt`. The **largest** dump is usually the XLA reference (jnp.matmul / jnp.exp baselines), NOT your kernel. Verify the kernel match by grepping for `vmatmul` (matmul-shaped) or `vexp` (softmax-shaped) content.
-- **msl-tpu-kernel**: names are descriptive (`gmm_v2-g_8-m_1024-k_4096-n_4096-tm_128-tk_4096-tn_2048.1-71-final_bundles.txt`, `RPA-bq_32-bkvp_32-p_64-1.1-71-final_bundles.txt`). The numerical suffix encodes block sizes, useful for cross-checking.
-- Always also grab the matching `*-final_hlo-static-per-bundle-utilization.txt` — it has the per-bundle lane breakdown the predictor needs.
-
-The `*-schedule-analysis_final_bundles.txt` is a separate analysis output; ignore it (you want the plain `*-final_bundles.txt`).
-
-### 3. Archive to the LLO database
+**Pair the dump with Pallas source** when archiving (this is what makes the entry directly useful for kernel-writing, not just historical performance data):
 
 ```bash
 ENTRY=~/Code/helion/llo/<descriptive_name>_<shape>_bf16
 mkdir -p $ENTRY/source
 
-# Copy both LLO files from the pod (use the exact filenames from step 2)
-kubectl cp yifeixu-torchtpu:/tmp/llo_dump/<kernel>-...final_bundles.txt $ENTRY/final_bundles.txt
-util=$(kubectl exec yifeixu-torchtpu -- bash -c "ls /tmp/llo_dump/<kernel>-...utilization.txt | head -1")
-kubectl cp yifeixu-torchtpu:$util $ENTRY/utilization.txt
-
-# Pair with Pallas source so the entry is a "source ↔ LLO ↔ measured-perf" triangle
-cp <kernel-source>.py $ENTRY/source/
-cp <your-runner>.py   $ENTRY/source/
-```
-
-For Helion kernels, get the generated Pallas (post-Helion, pure JAX/Pallas, directly runnable) via:
-```bash
+# Helion-generated Pallas (directly runnable with JAX, no Helion at runtime)
 python scripts/extract_helion_pallas.py \
     --example examples/<X>.py --kernel <X> \
     --shapes '8x32x8192x256;8x32x8192x256;8x32x8192x256' --dtype bf16 \
     --config '{"block_sizes": [8, 512, 512], "pallas_loop_type": "emit_pipeline", "pallas_pre_broadcast": true}' \
     --out $ENTRY/source/generated_pallas.py
+
+# OR for msl-tpu-kernel kernels (already pure Pallas — copy the kernel file)
+cp ~/Code/msl-tpu-kernel/msl_tpu_kernel/kernels/<family>/<kernel>.py $ENTRY/source/
+cp <your-runner>.py $ENTRY/source/
 ```
 
-For msl-tpu-kernel kernels, the source IS already Pallas — copy the kernel file directly (e.g. `~/Code/msl-tpu-kernel/msl_tpu_kernel/kernels/megablox/gmm_v2.py`).
+Optionally write a `meta.yaml` recording the measured timing, config, and notes — see existing entries under `~/Code/helion/llo/` for the schema. `meta.yaml` is also where `hlo_sidecar.py back-solve --persist` writes `inner_loop_iters: K` (picked up automatically by the predictor on the next run).
 
-Optionally write a `meta.yaml` to record the measured timing, config, and any notes — see existing entries under `~/Code/helion/llo/` for the schema.
-
-### 4. Predict
+### 4. Predict against the archived LLO entry
 
 ```bash
 cd ~/Code/helion
