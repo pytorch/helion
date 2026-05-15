@@ -52,8 +52,7 @@ def _emit_tl_store(
     PointerIndexingStrategy emits them positionally.
     """
     pad = " " * indent
-    ptr_expr = _ast_expr_to_msl(node.args[0])
-    deref = f"*({ptr_expr})"
+    access = _ptr_access_expr(node.args[0])
     val_expr = _ast_expr_to_msl(node.args[1])
     mask = None
     if len(node.args) >= 3:
@@ -65,12 +64,12 @@ def _emit_tl_store(
         parts.extend(
             (
                 f"{pad}if ({mask}) {{",
-                f"{pad}    {deref} = {val_expr};",
+                f"{pad}    {access} = {val_expr};",
                 f"{pad}}}",
             )
         )
     else:
-        parts.append(f"{pad}{deref} = {val_expr};")
+        parts.append(f"{pad}{access} = {val_expr};")
 
 
 def _emit_stmts(
@@ -176,6 +175,20 @@ def _emit_for(
     declared.add(loop_var)
     _emit_stmts(stmt.body, parts, indent=indent + 4, declared=declared)
     parts.append(f"{pad}}}")
+
+
+def _ptr_access_expr(ptr_node: ast.AST) -> str:
+    """Convert a pointer expression to an MSL memory access.
+
+    Recognizes ``buf + offset`` and emits ``buf[offset]``
+    instead of ``*(buf + offset)``.
+    """
+    if isinstance(ptr_node, ast.BinOp) and isinstance(ptr_node.op, ast.Add):
+        base = ptr_node.left
+        if isinstance(base, ast.Name):
+            offset = _ast_expr_to_msl(ptr_node.right)
+            return f"{base.id}[{offset}]"
+    return f"*({_ast_expr_to_msl(ptr_node)})"
 
 
 # ---------------------------------------------------------------------------
@@ -346,13 +359,12 @@ def _ast_call_to_msl(node: ast.AST) -> str:
         and func.value.id == "tl"
         and func.attr == "load"
     ):
-        ptr_expr = _ast_expr_to_msl(node.args[0])
-        deref = f"*({ptr_expr})"
+        access = _ptr_access_expr(node.args[0])
         if len(node.args) >= 2:
             # Check if mask is None (no masking)
             mask_node = node.args[1]
             if isinstance(mask_node, ast.Constant) and mask_node.value is None:
-                return deref
+                return access
             mask = _ast_expr_to_msl(mask_node)
             other = None
             if len(node.args) >= 3:
@@ -366,8 +378,8 @@ def _ast_call_to_msl(node: ast.AST) -> str:
                 raise exc.BackendUnsupported(
                     "metal", "tl.load with mask requires 'other' argument"
                 )
-            return f"({mask} ? {deref} : ({other}))"
-        return deref
+            return f"({mask} ? {access} : ({other}))"
+        return access
 
     # Generic function call (main path for MetalOverrides expressions)
     func_msl = _ast_expr_to_msl(func)
