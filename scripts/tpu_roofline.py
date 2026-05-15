@@ -30,13 +30,13 @@ Known modeling gaps / TODOs:
 
   - Phi / loop-carried accumulator stalls are not modeled. Kernels with
     a tight loop-carried dependency (e.g. `acc = acc + matmul(...)` over
-    K-tiles, standalone bmm with un-tuned configs) can under-predict by
-    ~15-20% because the model treats each iteration as independent.
-    Attention's bmm-inside-fusion predicts fine because the softmax /
-    mask work between matmuls hides the dependency; standalone bmm with
-    a *bad* config exposes the gap. Open question: does the gap remain
-    with an autotuned config? Worth re-running `bmm_8x1024x1024` with
-    autotune to find out before treating this as a structural fix.
+    K-tiles, standalone bmm) under-predict by ~10-15% of compute time
+    because the model treats each iteration as independent. Attention's
+    bmm-inside-fusion predicts fine because softmax/mask work between
+    matmuls hides the dependency. Verified on bmm 8x1024x1024:
+    un-autotuned -17.7%, autotuned (43x faster overall) still -11.8%.
+    So the gap is structural, not a config artifact, though the absolute
+    µs error scales with kernel time (472 µs un-autotuned, 7 µs autotuned).
 
   - The `--cycle-accurate` operand-graph simulator is experimental and
     currently *worse* than the default for most kernels (over-predicts
