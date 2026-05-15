@@ -304,6 +304,13 @@ class TestMetalBoundsMasking(unittest.TestCase):
         msl = _get_msl(copy_kernel, (x,))
         self.assertIn("mask_0", msl, "mask variable expected even for aligned size")
 
+    def test_codegen_no_stride_one(self) -> None:
+        """Generated MSL should not contain trivial * 1 stride multiplications."""
+        x = torch.randn(1024, device=DEVICE)
+        msl = _get_msl(copy_kernel, (x,))
+        self.assertNotIn("* 1)", msl, "trivial * 1 stride found in generated MSL")
+        self.assertNotIn("* 1]", msl, "trivial * 1 stride found in generated MSL")
+
     def test_vector_add_non_aligned(self) -> None:
         """vector_add with non-aligned size exercises mask on both load and store."""
         x = torch.randn(1000, device=DEVICE)
