@@ -105,7 +105,6 @@ MAMBA2_CHUNK_SCAN_LARGE_SHAPE_MIN_FREE_MEMORY_BYTES = 100 * 1024**3
 # to avoid wrapping the same methods more than once in a long benchmark process.
 _PATCHED_MAMBA_OPERATOR_CLASSES: set[type[Any]] = set()
 _PATCHED_ROPE_OPERATOR_CLASSES: set[type[Any]] = set()
-_PATCHED_GDN_OPERATOR_CLASSES: set[type[Any]] = set()
 
 _RopeInput = tuple[
     torch.Tensor,
@@ -262,33 +261,6 @@ def patch_rope_tritonbench_inputs(operator_name: str, Operator: type[Any]) -> No
     _PATCHED_ROPE_OPERATOR_CLASSES.add(Operator)
 
 
-def patch_gdn_tritonbench_accuracy(operator_name: str, Operator: type[Any]) -> None:
-    if operator_name != "gdn_fwd_h":
-        return
-    if Operator in _PATCHED_GDN_OPERATOR_CLASSES:
-        return
-
-    def accuracy(
-        self: object,
-        fn: Callable[[], torch.Tensor],
-        baseline_fn: Callable[[], torch.Tensor],
-    ) -> bool:
-        output = fn()
-        baseline_output = baseline_fn()
-
-        if torch.isnan(output).any():
-            return False
-
-        # FLA and Helion may use different bf16/float32 reduction orderings from
-        # the eager baseline for long GDN sequences. This tolerance keeps the
-        # benchmark focused on gross correctness while avoiding false dashboard
-        # failures from tiny relative errors near zero.
-        return torch.allclose(output, baseline_output, rtol=0.5, atol=2.0)
-
-    Operator.accuracy = accuracy
-    _PATCHED_GDN_OPERATOR_CLASSES.add(Operator)
-
-
 def helion_benchmark_method_name(func_name: str) -> str:
     prefix = "helion_"
     return func_name if func_name.startswith(prefix) else f"{prefix}{func_name}"
@@ -377,17 +349,13 @@ KERNEL_MAPPINGS: dict[str, tuple[str, ...]] = {
     ),
     "rope": (
         "tritonbench.operators.rope.operator",
-        [
-            ("examples.rope", "rope_tritonbench"),
-            ("pretuned_kernels.rope.rope", "pretuned_rope_tritonbench"),
-        ],
+        "examples.rope",
+        "rope_tritonbench",
     ),
     "rope-bwd": (
         "tritonbench.operators.rope.operator",
-        [
-            ("examples.rope", "rope_tritonbench"),
-            ("pretuned_kernels.rope.rope", "pretuned_rope_tritonbench"),
-        ],
+        "examples.rope",
+        "rope_tritonbench",
     ),
     "sum": ("tritonbench.operators.sum.operator", "examples.sum", "sum_tritonbench"),
     "softmax": (
@@ -556,6 +524,11 @@ KERNEL_MAPPINGS: dict[str, tuple[str, ...]] = {
         "tritonbench.operators.gdn_fwd_h.operator",
         "examples.gdn_fwd_h",
         "helion_gdn_fwd_h_tb",
+        {
+            # GDN is dot-heavy; compare all implementations against PyTorch's
+            # high-throughput CUDA matmul precision instead of strict fp32 einsums.
+            "precision": "tf32",
+        },
     ),
     "flex_attention": (
         "tritonbench.operators.flex_attention.operator",
@@ -665,9 +638,6 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "helion_rope_tritonbench-speedup": "helion_speedup",
         "helion_rope_tritonbench-accuracy": "helion_accuracy",
         "helion_rope_tritonbench-latency": "helion_latency_ms",
-        "helion_pretuned_rope_tritonbench-speedup": "helion_pretuned_speedup",
-        "helion_pretuned_rope_tritonbench-accuracy": "helion_pretuned_accuracy",
-        "helion_pretuned_rope_tritonbench-latency": "helion_pretuned_latency_ms",
     },
     "rope-bwd": {
         "apply_rotary_pos_emb": "baseline",
@@ -678,9 +648,6 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "helion_rope_tritonbench-speedup": "helion_speedup",
         "helion_rope_tritonbench-accuracy": "helion_accuracy",
         "helion_rope_tritonbench-latency": "helion_latency_ms",
-        "helion_pretuned_rope_tritonbench-speedup": "helion_pretuned_speedup",
-        "helion_pretuned_rope_tritonbench-accuracy": "helion_pretuned_accuracy",
-        "helion_pretuned_rope_tritonbench-latency": "helion_pretuned_latency_ms",
     },
     "cross_entropy": {
         "cross_entropy_loss": "baseline",
@@ -1455,7 +1422,6 @@ def run_kernel_variants(
         Operator = operator_module.Operator
         patch_rope_tritonbench_inputs(operator_name, Operator)
         patch_mamba2_tritonbench_inputs(operator_name, Operator)
-        patch_gdn_tritonbench_accuracy(operator_name, Operator)
     except ImportError as e:
         print(
             f"Error: Could not import operator '{operator_name}' from tritonbench",

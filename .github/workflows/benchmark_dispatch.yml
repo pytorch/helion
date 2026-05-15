@@ -27,7 +27,9 @@ on:
         description: 'Comma-separated list of kernels to benchmark on GPU runners'
         required: false
         type: string
-        default: "softmax,jsd,welford,kl_div,int4_gemm,layer_norm,layer_norm-bwd,rms_norm,rms_norm-bwd,cross_entropy,flash_attention,gemm,grouped_gemm,rope,rope-bwd,mamba2_chunk_scan,mamba2_chunk_state,gdn_fwd_h"
+        # Ordered to balance B200 runtime under compute-benchmark-matrix's
+        # round-robin sharding with max-runners=13.
+        default: "flash_attention,gdn_fwd_h,cross_entropy,grouped_gemm,gemm,welford,layer_norm-bwd,int4_gemm,softmax,layer_norm,mamba2_chunk_state,rms_norm-bwd,rope,rope-bwd,jsd,mamba2_chunk_scan,kl_div,rms_norm"
       kernels_tpu:
         description: 'Comma-separated list of kernels to benchmark on TPU (examples-based; disjoint from `kernels`). Default is the dashboard-tracked subset; pass an explicit list for ad-hoc full-coverage runs.'
         required: false
