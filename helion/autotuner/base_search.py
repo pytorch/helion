@@ -945,25 +945,25 @@ class PopulationBasedSearch(BaseSearch):
         if (capstr := os.getenv("HELION_CAP_REBENCHMARK_REPEAT")) is not None:
             repeat = min(repeat, int(capstr))
         if len(self.benchmark_provider.mutated_arg_indices) > 0:
-            bench_args = _clone_args(
+            benchmark_args = _clone_args(
                 self.args,
                 self.kernel.env.process_group_name,
                 idx_to_clone=self.benchmark_provider.mutated_arg_indices,
             )
         else:
-            bench_args = self.args
-        iterator = [functools.partial(m.fn, *bench_args) for m in members]
+            benchmark_args = self.args
+        iterator = [functools.partial(m.fn, *benchmark_args) for m in members]
         _backend = getattr(getattr(self, "config_spec", None), "backend", None)
-        _ib = (
+        interleaved_benchmark = (
             _backend.get_interleaved_bench() if _backend is not None else None
         ) or interleaved_bench
-        bench_fn: Callable[..., list[float]] = (
-            self.settings.autotune_benchmark_fn or _ib
+        benchmark_function: Callable[..., list[float]] = (
+            self.settings.autotune_benchmark_fn or interleaved_benchmark
         )
         if self.settings.autotune_progress_bar:
-            new_timings = bench_fn(iterator, repeat=repeat, desc=desc)
+            new_timings = benchmark_function(iterator, repeat=repeat, desc=desc)
         else:
-            new_timings = bench_fn(iterator, repeat=repeat)
+            new_timings = benchmark_function(iterator, repeat=repeat)
         new_timings = self._confirm_suspicious_rebenchmark_timings(
             members,
             new_timings,

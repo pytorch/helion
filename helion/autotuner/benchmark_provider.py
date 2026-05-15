@@ -962,16 +962,18 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                 # while other ranks return immediately, this will cause stuck jobs!
                 return inf
 
-            bench_fn = self.kernel.bench_compile_config(config, allow_print=False)
-            bench_fn(*working_args)  # warmup benchmark kernel
+            benchmark_function = self.kernel.bench_compile_config(
+                config, allow_print=False
+            )
+            benchmark_function(*working_args)  # warmup benchmark kernel
 
             t1 = time.perf_counter()
             _backend = getattr(getattr(self, "config_spec", None), "backend", None)
-            _bench_fn = (
+            benchmark_runner = (
                 _backend.get_do_bench() if _backend is not None else None
             ) or do_bench
-            res = _bench_fn(
-                functools.partial(bench_fn, *working_args),
+            res = benchmark_runner(
+                functools.partial(benchmark_function, *working_args),
                 return_mode="median",
                 warmup=1,  # we are already warmed up above
                 rep=50,
