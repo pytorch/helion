@@ -124,8 +124,8 @@ def _generate_msl(
         )
     )
 
-    sig = ", ".join(params)
-    msl_parts.append(f"kernel void {kernel_name}({sig}) {{")
+    sig = ",\n    ".join(params)
+    msl_parts.append(f"kernel void {kernel_name}(\n    {sig}\n) {{")
     msl_parts.extend(scalar_preamble)
 
     # Declare _BLOCK_SIZE_* constants from module globals
