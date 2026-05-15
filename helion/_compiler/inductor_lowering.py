@@ -1043,6 +1043,16 @@ class GenerateASTFromInductor(DefaultHandler):
         device context during compute-type selection, and to guarantee a visible
         cast in generated code that matches PyTorch's dtype semantics.
         """
+        if (
+            CompileEnvironment.current().backend.name == "cute"
+            and src_dtype is torch.float8_e4m3fn
+            and dtype is torch.float32
+        ):
+            cast_expr = expr_from_string(
+                "_cute_fp8e4m3fn_to_float32({x})",
+                x=self._to_ast(x),
+            )
+            return self._lift(cast_expr)
         cast_expr = self._create_cast_expr(x, dtype)
         return self._lift(cast_expr)
 

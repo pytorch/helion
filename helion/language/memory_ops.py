@@ -808,9 +808,24 @@ def _cute_scalar_pointer_expr(tensor_name: str, index_exprs: list[str]) -> str:
     return f"({tensor_name}.iterator + {offset})"
 
 
-def _cute_scalar_load_expr(tensor_name: str, index_exprs: list[str]) -> str:
+def _cute_scalar_storage_dtype(dtype: torch.dtype) -> str:
+    if dtype in (torch.float4_e2m1fn_x2, torch.float8_e4m3fn):
+        return "cutlass.Uint8"
+    return CompileEnvironment.current().backend.dtype_str(dtype)
+
+
+def _cute_scalar_load_expr(
+    tensor_name: str,
+    index_exprs: list[str],
+    dtype: torch.dtype,
+) -> str:
     if "None" in index_exprs:
         return f"{tensor_name}[{', '.join(index_exprs)}]"
+    if dtype in (torch.float4_e2m1fn_x2, torch.float8_e4m3fn):
+        return (
+            f"cute.arch.load({_cute_scalar_pointer_expr(tensor_name, index_exprs)}, "
+            "cutlass.Uint8)"
+        )
     return f"{_cute_scalar_pointer_expr(tensor_name, index_exprs)}.load()"
 
 
@@ -4467,10 +4482,10 @@ def _(state: CodegenState) -> object:
         return packed_rhs_load
 
     if _is_cute_affine_range_load_for_store(state, subscript, ast_subscript):
-        zero = CompileEnvironment.current().backend.dtype_str(tensor.dtype)
+        zero = _cute_scalar_storage_dtype(tensor.dtype)
         return expr_from_string(f"{zero}(0)")
     if _is_cute_strided_slice_load_for_store(state, tensor, subscript):
-        zero = CompileEnvironment.current().backend.dtype_str(tensor.dtype)
+        zero = _cute_scalar_storage_dtype(tensor.dtype)
         return expr_from_string(f"{zero}(0)")
 
     tensor_name = state.device_function.tensor_arg(tensor).name
@@ -4482,7 +4497,7 @@ def _(state: CodegenState) -> object:
         inactive_slice_expr="None",
         inactive_singleton_slice_expr="0",
     )
-    load_expr = _cute_scalar_load_expr(tensor_name, index_exprs)
+    load_expr = _cute_scalar_load_expr(tensor_name, index_exprs, tensor.dtype)
     mask_expr = _cute_combined_mask(
         state,
         subscript,
@@ -4517,7 +4532,7 @@ def _(state: CodegenState) -> object:
             expr=expr_from_string(
                 load_expr
                 if mask_expr is None
-                else f"({load_expr} if {mask_expr} else {CompileEnvironment.current().backend.dtype_str(tensor.dtype)}(0))"
+                else f"({load_expr} if {mask_expr} else {_cute_scalar_storage_dtype(tensor.dtype)}(0))"
             ),
             tensor_name=tensor_name,
             index_exprs=tuple(index_exprs),
@@ -4529,7 +4544,7 @@ def _(state: CodegenState) -> object:
         return sortable_load.expr
     if mask_expr is None:
         return expr_from_string(load_expr)
-    zero = CompileEnvironment.current().backend.dtype_str(tensor.dtype)
+    zero = _cute_scalar_storage_dtype(tensor.dtype)
     return expr_from_string(f"({load_expr} if {mask_expr} else {zero}(0))")
 
 

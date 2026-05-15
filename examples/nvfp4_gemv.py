@@ -16,8 +16,6 @@ Two variants are provided:
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
-from typing import TypeAlias
-from typing import cast
 
 import cutlass
 from cutlass import Int32
@@ -42,17 +40,6 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
     from cutlass._mlir import ir
-
-Fp4WordValues: TypeAlias = tuple[
-    Tensor,
-    Tensor,
-    Tensor,
-    Tensor,
-    Tensor,
-    Tensor,
-    Tensor,
-    Tensor,
-]
 
 BF16IN_CONFIG = helion.Config(
     block_sizes=[1],
@@ -494,208 +481,87 @@ def _can_use_fast_cute_path(*tensors: Tensor, k_bytes: int) -> bool:
     )
 
 
-def _e4m3_byte_to_f32(scale_byte: Tensor) -> Tensor:
-    return hl.inline_asm_elementwise(
-        """
-        {
-          .reg .b16 sc, scale_lo, scale_hi;
-          .reg .b32 scale_h2;
-          mov.b32 {sc, _}, $1;
-          cvt.rn.f16x2.e4m3x2 scale_h2, sc;
-          mov.b32 {scale_lo, scale_hi}, scale_h2;
-          cvt.f32.f16 $0, scale_lo;
-        }
-        """,
-        "=f,r",
-        [scale_byte],
-        dtype=torch.float32,
-        is_pure=True,
-        pack=1,
-    )
+def _as_fp4x2(tensor: Tensor) -> Tensor:
+    if tensor.dtype is torch.float4_e2m1fn_x2:
+        return tensor
+    if tensor.dtype is torch.uint8:
+        return tensor.view(torch.float4_e2m1fn_x2)
+    raise TypeError(f"expected uint8 or float4_e2m1fn_x2 tensor, got {tensor.dtype}")
 
 
-def _fp4_word_to_f32x8(word: Tensor) -> Fp4WordValues:
-    return cast(
-        "Fp4WordValues",
-        hl.inline_asm_elementwise(
-            """
-            {
-              .reg .b8 fp4_b0, fp4_b1, fp4_b2, fp4_b3;
-              .reg .b16 v0_lo, v0_hi, v1_lo, v1_hi;
-              .reg .b16 v2_lo, v2_hi, v3_lo, v3_hi;
-              .reg .b32 v0_h2, v1_h2, v2_h2, v3_h2;
-              mov.b32 {fp4_b0, fp4_b1, fp4_b2, fp4_b3}, $8;
-              cvt.rn.f16x2.e2m1x2 v0_h2, fp4_b0;
-              cvt.rn.f16x2.e2m1x2 v1_h2, fp4_b1;
-              cvt.rn.f16x2.e2m1x2 v2_h2, fp4_b2;
-              cvt.rn.f16x2.e2m1x2 v3_h2, fp4_b3;
-              mov.b32 {v0_lo, v0_hi}, v0_h2;
-              mov.b32 {v1_lo, v1_hi}, v1_h2;
-              mov.b32 {v2_lo, v2_hi}, v2_h2;
-              mov.b32 {v3_lo, v3_hi}, v3_h2;
-              cvt.f32.f16 $0, v0_lo;
-              cvt.f32.f16 $1, v0_hi;
-              cvt.f32.f16 $2, v1_lo;
-              cvt.f32.f16 $3, v1_hi;
-              cvt.f32.f16 $4, v2_lo;
-              cvt.f32.f16 $5, v2_hi;
-              cvt.f32.f16 $6, v3_lo;
-              cvt.f32.f16 $7, v3_hi;
-            }
-            """,
-            "=f,=f,=f,=f,=f,=f,=f,=f,r",
-            [word],
-            dtype=(
-                torch.float32,
-                torch.float32,
-                torch.float32,
-                torch.float32,
-                torch.float32,
-                torch.float32,
-                torch.float32,
-                torch.float32,
-            ),
-            is_pure=True,
-            pack=1,
-        ),
-    )
-
-
-def _fp4_bf16_word_contribution(
-    weight_word: Tensor,
-    x0: Tensor,
-    x1: Tensor,
-    x2: Tensor,
-    x3: Tensor,
-    x4: Tensor,
-    x5: Tensor,
-    x6: Tensor,
-    x7: Tensor,
-) -> Tensor:
-    w0, w1, w2, w3, w4, w5, w6, w7 = _fp4_word_to_f32x8(weight_word)
-    return (
-        w0 * x0.to(torch.float32)
-        + w1 * x1.to(torch.float32)
-        + w2 * x2.to(torch.float32)
-        + w3 * x3.to(torch.float32)
-        + w4 * x4.to(torch.float32)
-        + w5 * x5.to(torch.float32)
-        + w6 * x6.to(torch.float32)
-        + w7 * x7.to(torch.float32)
-    )
-
-
-def _fp4_word_pair_contribution(weight_word: Tensor, x_word: Tensor) -> Tensor:
-    w0, w1, w2, w3, w4, w5, w6, w7 = _fp4_word_to_f32x8(weight_word)
-    x0, x1, x2, x3, x4, x5, x6, x7 = _fp4_word_to_f32x8(x_word)
-    return w0 * x0 + w1 * x1 + w2 * x2 + w3 * x3 + w4 * x4 + w5 * x5 + w6 * x6 + w7 * x7
+def _fp4_storage(tensor: Tensor) -> Tensor:
+    if tensor.dtype is torch.float4_e2m1fn_x2:
+        return tensor.view(torch.uint8)
+    return tensor
 
 
 @helion.kernel(static_shapes=True, config=BF16IN_CONFIG, backend="cute")
 def _nvfp4_gemv_bf16in_kernel(
-    weight_words: Tensor,
+    weight_fp4x2: Tensor,
     x_values: Tensor,
-    weight_scale_bytes: Tensor,
+    weight_scale: Tensor,
     out: Tensor,
     alpha: float = 1.0,
 ) -> Tensor:
-    M, _K_units, _ = weight_words.shape
+    M, K_groups, _ = weight_fp4x2.shape
     block_m = hl.register_block_size(1, 8)
 
     for tile_m in hl.tile(M, block_size=block_m):
-        scale_j = hl.arange(_K_units)
+        scale_j = hl.arange(K_groups)
         acc = hl.zeros([tile_m], dtype=torch.float32)
-        contrib0 = _fp4_bf16_word_contribution(
-            weight_words[tile_m, :, 0],
-            x_values[:, 0],
-            x_values[:, 1],
-            x_values[:, 2],
-            x_values[:, 3],
-            x_values[:, 4],
-            x_values[:, 5],
-            x_values[:, 6],
-            x_values[:, 7],
-        )
-        contrib1 = _fp4_bf16_word_contribution(
-            weight_words[tile_m, :, 1],
-            x_values[:, 8],
-            x_values[:, 9],
-            x_values[:, 10],
-            x_values[:, 11],
-            x_values[:, 12],
-            x_values[:, 13],
-            x_values[:, 14],
-            x_values[:, 15],
-        )
+        contrib = hl.zeros([tile_m, K_groups], dtype=torch.float32)
+        for byte in hl.static_range(8):
+            weight_lo, weight_hi = hl.float4_e2m1fn_x2_to_float32(
+                weight_fp4x2[tile_m, :, byte]
+            )
+            contrib = contrib + weight_lo * x_values[:, byte * 2].to(torch.float32)
+            contrib = contrib + weight_hi * x_values[:, byte * 2 + 1].to(torch.float32)
         scale_offsets = swizzled_scale_offsets(
             tile_m.index[:, None],
             scale_j[None, :],
-            _K_units,
+            K_groups,
         )
-        scale = _e4m3_byte_to_f32(weight_scale_bytes[scale_offsets])
-        acc = acc + ((contrib0 + contrib1) * scale).sum(-1)
+        scale = weight_scale[scale_offsets].to(torch.float32)
+        acc = acc + (contrib * scale).sum(-1)
         out[tile_m] = (acc * alpha).to(torch.bfloat16)
     return out
 
 
 @helion.kernel(static_shapes=True, config=FP4IN_CONFIG, backend="cute")
 def _nvfp4_gemv_fp4in_kernel(
-    weight_words: Tensor,
-    x_words: Tensor,
-    weight_scale_bytes: Tensor,
-    x_scale_bytes: Tensor,
+    weight_fp4x2: Tensor,
+    x_fp4x2: Tensor,
+    weight_scale: Tensor,
+    x_scale: Tensor,
     out: Tensor,
     alpha: float = 1.0,
 ) -> Tensor:
-    M, _K_units, _ = weight_words.shape
+    M, K_groups, _ = weight_fp4x2.shape
     block_m = hl.register_block_size(1, 8)
-    scale_cols = _K_units * 2
 
     for tile_m in hl.tile(M, block_size=block_m):
-        scale_j0 = hl.arange(_K_units) * 2
-        scale_j1 = scale_j0 + 1
+        scale_j = hl.arange(K_groups)
         acc = hl.zeros([tile_m], dtype=torch.float32)
-        contrib0 = _fp4_word_pair_contribution(
-            weight_words[tile_m, :, 0],
-            x_words[:, 0],
-        )
-        contrib0 = contrib0 + _fp4_word_pair_contribution(
-            weight_words[tile_m, :, 1],
-            x_words[:, 1],
-        )
-        contrib1 = _fp4_word_pair_contribution(
-            weight_words[tile_m, :, 2],
-            x_words[:, 2],
-        )
-        contrib1 = contrib1 + _fp4_word_pair_contribution(
-            weight_words[tile_m, :, 3],
-            x_words[:, 3],
-        )
-        weight_scale_offsets0 = swizzled_scale_offsets(
+        contrib = hl.zeros([tile_m, K_groups], dtype=torch.float32)
+        for byte in hl.static_range(8):
+            weight_lo, weight_hi = hl.float4_e2m1fn_x2_to_float32(
+                weight_fp4x2[tile_m, :, byte]
+            )
+            x_lo, x_hi = hl.float4_e2m1fn_x2_to_float32(x_fp4x2[:, byte])
+            contrib = contrib + weight_lo * x_lo + weight_hi * x_hi
+        weight_scale_offsets = swizzled_scale_offsets(
             tile_m.index[:, None],
-            scale_j0[None, :],
-            scale_cols,
+            scale_j[None, :],
+            K_groups,
         )
-        weight_scale_offsets1 = swizzled_scale_offsets(
-            tile_m.index[:, None],
-            scale_j1[None, :],
-            scale_cols,
+        x_scale_offsets = swizzled_scale_offsets(
+            scale_j * 0,
+            scale_j,
+            K_groups,
         )
-        x_scale_offsets0 = swizzled_scale_offsets(
-            scale_j0 * 0,
-            scale_j0,
-            scale_cols,
-        )
-        x_scale_offsets1 = swizzled_scale_offsets(
-            scale_j1 * 0,
-            scale_j1,
-            scale_cols,
-        )
-        scale0 = _e4m3_byte_to_f32(weight_scale_bytes[weight_scale_offsets0])
-        scale0 = scale0 * _e4m3_byte_to_f32(x_scale_bytes[x_scale_offsets0])
-        scale1 = _e4m3_byte_to_f32(weight_scale_bytes[weight_scale_offsets1])
-        scale1 = scale1 * _e4m3_byte_to_f32(x_scale_bytes[x_scale_offsets1])
-        acc = acc + (contrib0 * scale0 + contrib1 * scale1).sum(-1)
+        scale = weight_scale[weight_scale_offsets].to(torch.float32)
+        scale = scale * x_scale[x_scale_offsets].to(torch.float32)
+        acc = acc + (contrib * scale).sum(-1)
         out[tile_m] = (acc * alpha).to(torch.bfloat16)
     return out
 
@@ -707,40 +573,40 @@ def nvfp4_gemv_bf16in(
     alpha: float = 1.0,
 ) -> Tensor:
     """Compute ``weight_packed @ x_bf16`` for NVFP4 weights and BF16 input."""
-    scale_cols = weight_packed.shape[1] // 8
+    weight_fp4x2 = _as_fp4x2(weight_packed)
+    weight_bytes = weight_fp4x2.view(torch.uint8)
+    scale_cols = weight_bytes.shape[1] // 8
     _check_swizzled_scales(
         "weight_scale",
         weight_scale,
-        weight_packed.shape[0],
+        weight_bytes.shape[0],
         scale_cols,
     )
     out = torch.empty(
-        weight_packed.shape[0], dtype=torch.bfloat16, device=weight_packed.device
+        weight_bytes.shape[0], dtype=torch.bfloat16, device=weight_bytes.device
     )
     if _can_use_fast_cute_path(
-        weight_packed,
+        weight_bytes,
         x_bf16,
         weight_scale,
-        k_bytes=weight_packed.shape[1],
+        k_bytes=weight_bytes.shape[1],
     ):
         default_cute_launcher(
             _fast_nvfp4_gemv_bf16in_kernel,
-            (weight_packed.shape[0],),
-            weight_packed,
+            (weight_bytes.shape[0],),
+            weight_bytes,
             x_bf16,
             weight_scale.view(torch.uint8),
             out,
             alpha,
-            weight_packed.shape[1],
+            weight_bytes.shape[1],
             block=(128, 1, 1),
         )
         return out
     return _nvfp4_gemv_bf16in_kernel(
-        weight_packed.view(torch.int32).view(
-            weight_packed.shape[0], weight_packed.shape[1] // 8, 2
-        ),
-        x_bf16.view(weight_packed.shape[1] // 8, 16),
-        weight_scale.reshape(-1).view(torch.int8),
+        weight_fp4x2.view(weight_bytes.shape[0], weight_bytes.shape[1] // 8, 8),
+        x_bf16.view(weight_bytes.shape[1] // 8, 16),
+        weight_scale.reshape(-1),
         out,
         alpha,
     )
@@ -754,44 +620,46 @@ def nvfp4_gemv_fp4in(
     alpha: float = 1.0,
 ) -> Tensor:
     """Compute ``weight_packed @ x_packed`` for NVFP4 weights and input."""
-    scale_cols = weight_packed.shape[1] // 8
+    weight_fp4x2 = _as_fp4x2(weight_packed)
+    x_fp4x2 = _as_fp4x2(x_packed)
+    weight_bytes = weight_fp4x2.view(torch.uint8)
+    x_bytes = x_fp4x2.view(torch.uint8)
+    scale_cols = weight_bytes.shape[1] // 8
     _check_swizzled_scales(
         "weight_scale",
         weight_scale,
-        weight_packed.shape[0],
+        weight_bytes.shape[0],
         scale_cols,
     )
     _check_swizzled_scales("x_scale", x_scale, 1, scale_cols)
     out = torch.empty(
-        weight_packed.shape[0], dtype=torch.bfloat16, device=weight_packed.device
+        weight_bytes.shape[0], dtype=torch.bfloat16, device=weight_bytes.device
     )
     if _can_use_fast_cute_path(
-        weight_packed,
-        x_packed,
+        weight_bytes,
+        x_bytes,
         weight_scale,
         x_scale,
-        k_bytes=weight_packed.shape[1],
+        k_bytes=weight_bytes.shape[1],
     ):
         default_cute_launcher(
             _fast_nvfp4_gemv_fp4in_kernel,
-            (weight_packed.shape[0],),
-            weight_packed,
-            x_packed,
+            (weight_bytes.shape[0],),
+            weight_bytes,
+            x_bytes,
             weight_scale.view(torch.uint8),
             x_scale.view(torch.uint8),
             out,
             alpha,
-            weight_packed.shape[1],
+            weight_bytes.shape[1],
             block=(64, 1, 1),
         )
         return out
     return _nvfp4_gemv_fp4in_kernel(
-        weight_packed.view(torch.int32).view(
-            weight_packed.shape[0], weight_packed.shape[1] // 16, 4
-        ),
-        x_packed.view(torch.int32).view(weight_packed.shape[1] // 16, 4),
-        weight_scale.reshape(-1).view(torch.int8),
-        x_scale.reshape(-1).view(torch.int8),
+        weight_fp4x2.view(weight_bytes.shape[0], weight_bytes.shape[1] // 8, 8),
+        x_fp4x2.view(weight_bytes.shape[1] // 8, 8),
+        weight_scale.reshape(-1),
+        x_scale.reshape(-1),
         out,
         alpha,
     )
@@ -814,14 +682,15 @@ def reference_nvfp4_gemv_bf16in(
     weight_scale: Tensor,
     alpha: float = 1.0,
 ) -> Tensor:
-    M, K_bytes = weight_packed.shape
-    weight = weight_packed.to(torch.int32)
+    weight_storage = _fp4_storage(weight_packed)
+    M, K_bytes = weight_storage.shape
+    weight = weight_storage.to(torch.int32)
     weight_lo = _dequant_e2m1(weight & 0xF)
     weight_hi = _dequant_e2m1((weight >> 4) & 0xF)
     x = x_bf16.to(torch.float32).view(K_bytes, 2)
     scale_cols = K_bytes // 8
-    scale_idx = torch.arange(K_bytes, device=weight_packed.device) // 8
-    row_idx = torch.arange(M, device=weight_packed.device)[:, None]
+    scale_idx = torch.arange(K_bytes, device=weight_storage.device) // 8
+    row_idx = torch.arange(M, device=weight_storage.device)[:, None]
     scale_offsets = swizzled_scale_offsets(row_idx, scale_idx[None, :], scale_cols)
     scale = weight_scale.reshape(-1)[scale_offsets].to(torch.float32)
     result = ((weight_lo * x[:, 0] + weight_hi * x[:, 1]) * scale).sum(-1)
@@ -835,16 +704,18 @@ def reference_nvfp4_gemv_fp4in(
     x_scale: Tensor,
     alpha: float = 1.0,
 ) -> Tensor:
-    M, K_bytes = weight_packed.shape
-    weight = weight_packed.to(torch.int32)
-    x = x_packed.to(torch.int32)
+    weight_storage = _fp4_storage(weight_packed)
+    x_storage = _fp4_storage(x_packed)
+    M, K_bytes = weight_storage.shape
+    weight = weight_storage.to(torch.int32)
+    x = x_storage.to(torch.int32)
     weight_lo = _dequant_e2m1(weight & 0xF)
     weight_hi = _dequant_e2m1((weight >> 4) & 0xF)
     x_lo = _dequant_e2m1(x & 0xF)
     x_hi = _dequant_e2m1((x >> 4) & 0xF)
     scale_cols = K_bytes // 8
-    scale_idx = torch.arange(K_bytes, device=weight_packed.device) // 8
-    row_idx = torch.arange(M, device=weight_packed.device)[:, None]
+    scale_idx = torch.arange(K_bytes, device=weight_storage.device) // 8
+    row_idx = torch.arange(M, device=weight_storage.device)[:, None]
     weight_scale_offsets = swizzled_scale_offsets(
         row_idx, scale_idx[None, :], scale_cols
     )
@@ -867,7 +738,9 @@ def make_fp8_scales(shape: tuple[int, ...], device: torch.device) -> Tensor:
 
 
 def check_bf16in(M: int, K_bytes: int) -> None:
-    weight = torch.randint(0, 256, (M, K_bytes), dtype=torch.uint8, device=DEVICE)
+    weight = torch.randint(0, 256, (M, K_bytes), dtype=torch.uint8, device=DEVICE).view(
+        torch.float4_e2m1fn_x2
+    )
     x = torch.randn(K_bytes * 2, dtype=torch.bfloat16, device=DEVICE)
     weight_scale = make_fp8_scales((M, K_bytes // 8), DEVICE)
     run_example(
@@ -880,8 +753,12 @@ def check_bf16in(M: int, K_bytes: int) -> None:
 
 
 def check_fp4in(M: int, K_bytes: int) -> None:
-    weight = torch.randint(0, 256, (M, K_bytes), dtype=torch.uint8, device=DEVICE)
-    x = torch.randint(0, 256, (K_bytes,), dtype=torch.uint8, device=DEVICE)
+    weight = torch.randint(0, 256, (M, K_bytes), dtype=torch.uint8, device=DEVICE).view(
+        torch.float4_e2m1fn_x2
+    )
+    x = torch.randint(0, 256, (K_bytes,), dtype=torch.uint8, device=DEVICE).view(
+        torch.float4_e2m1fn_x2
+    )
     weight_scale = make_fp8_scales((M, K_bytes // 8), DEVICE)
     x_scale = make_fp8_scales((K_bytes // 8,), DEVICE)
     run_example(

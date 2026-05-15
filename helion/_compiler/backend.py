@@ -2560,6 +2560,11 @@ class CuteBackend(Backend):
             inductor_dtype := CuteDSLOpOverrides.TORCH_TO_CUTE_DTYPE.get(dtype)
         ) is not None:
             return inductor_dtype
+        if dtype is torch.float4_e2m1fn_x2:
+            # PyTorch's shell dtype stores two E2M1 values in one byte.  CuTe
+            # does not support scalar dereference for its 4-bit type yet, so
+            # SIMT scalar loads treat the tensor as raw byte storage.
+            return "cutlass.Uint8"
         if dtype is torch.uint64:
             return "cutlass.Int64"
 
@@ -2652,6 +2657,8 @@ class CuteBackend(Backend):
             "_cute_store_shared_remote_x4": "from helion._compiler.cute.cluster_helpers import store_shared_remote_x4 as _cute_store_shared_remote_x4",
             "_cute_issue_clc_query_nomulticast": "from helion._compiler.cute.clc_helpers import issue_clc_query_nomulticast as _cute_issue_clc_query_nomulticast",
             "_cute_inline_asm_elementwise": "from helion._compiler.cute.inline_asm_helpers import inline_asm_elementwise as _cute_inline_asm_elementwise",
+            "_cute_fp8e4m3fn_to_float32": "from helion._compiler.cute.quantized_helpers import fp8e4m3fn_to_float32 as _cute_fp8e4m3fn_to_float32",
+            "_cute_float4_e2m1fn_x2_to_float32": "from helion._compiler.cute.quantized_helpers import float4_e2m1fn_x2_to_float32 as _cute_float4_e2m1fn_x2_to_float32",
         }
 
     def program_id_expr(self, dim: int, *, index_dtype: str) -> str:
