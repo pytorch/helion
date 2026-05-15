@@ -16,6 +16,7 @@ import torch
 import helion
 from helion._testing import DEVICE
 from helion._testing import HALF_DTYPE
+from helion._testing import run_example
 import helion.language as hl
 
 
@@ -255,12 +256,7 @@ def main() -> None:
     angles = torch.randn([batch, seq_len, head_dim], device=DEVICE, dtype=HALF_DTYPE)
     cos = torch.cos(angles)
     sin = torch.sin(angles)
-    torch.testing.assert_close(
-        rope(q, k, cos, sin),
-        rope_pytorch(q, k, cos, sin),
-        atol=1e-2,
-        rtol=1e-2,
-    )
+    run_example(rope, rope_pytorch, (q, k, cos, sin))
 
 
 if __name__ == "__main__":
