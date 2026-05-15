@@ -217,8 +217,10 @@ def _openai_payload(
     messages: list[dict[str, str]],
     max_output_tokens: int,
     effort_level: str | None,
+    fast_mode: bool,
 ) -> dict[str, Any]:
     """Build an OpenAI Responses request payload."""
+    # fast_mode is Anthropic-only; the kwarg is accepted for dispatch parity.
     system_prompt, input_messages = split_system_messages(messages)
     payload: dict[str, Any] = {
         "model": strip_provider_prefix(model),
@@ -237,11 +239,14 @@ def _anthropic_payload(
     messages: list[dict[str, str]],
     max_output_tokens: int,
     effort_level: str | None,
+    fast_mode: bool,
 ) -> dict[str, Any]:
     """Build an Anthropic Messages request payload."""
     system_prompt, input_messages = split_system_messages(messages)
     normalized_model = strip_provider_prefix(model)
-    normalized_effort = normalize_effort_level(effort_level)
+    # Fast mode (Opus 4.6/4.7) is a non-thinking inference path, so it overrides
+    # any effort_level setting rather than failing the request.
+    normalized_effort = None if fast_mode else normalize_effort_level(effort_level)
     enable_thinking = normalized_effort not in {None, "none"}
     use_adaptive = enable_thinking and _supports_anthropic_adaptive(normalized_model)
     legacy_budget_tokens = (
@@ -254,7 +259,9 @@ def _anthropic_payload(
         "messages": anthropic_messages_from_history(input_messages),
         "max_tokens": _anthropic_max_tokens(max_output_tokens, legacy_budget_tokens),
     }
-    if use_adaptive:
+    if fast_mode:
+        payload["speed"] = "fast"
+    elif use_adaptive:
         # Adaptive thinking lets the model self-pick its budget within Anthropic's
         # cap for the chosen effort. Required on Opus 4.7 (manual budget_tokens 400s).
         payload["thinking"] = {"type": "adaptive"}
@@ -264,9 +271,12 @@ def _anthropic_payload(
             "type": "enabled",
             "budget_tokens": legacy_budget_tokens,
         }
-    # Claude Opus 4.7 (and extended thinking) rejects `temperature`.
-    if not enable_thinking and not normalized_model.lower().startswith(
-        "claude-opus-4-7"
+    # Claude Opus 4.7 (and fast mode on any Opus, and extended thinking) rejects
+    # `temperature`.
+    if (
+        not enable_thinking
+        and not fast_mode
+        and not normalized_model.lower().startswith("claude-opus-4-7")
     ):
         payload["temperature"] = DEFAULT_ANTHROPIC_TEMPERATURE
     if system_prompt:
@@ -274,21 +284,27 @@ def _anthropic_payload(
     return payload
 
 
-def _openai_headers(api_key: str) -> dict[str, str]:
+def _openai_headers(api_key: str, fast_mode: bool) -> dict[str, str]:
     """Build OpenAI-compatible auth headers."""
+    # fast_mode is Anthropic-only; the kwarg is accepted for dispatch parity.
     return {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
     }
 
 
-def _anthropic_headers(api_key: str) -> dict[str, str]:
+def _anthropic_headers(api_key: str, fast_mode: bool) -> dict[str, str]:
     """Build Anthropic Messages auth headers."""
-    return {
+    headers = {
         "content-type": "application/json",
         "anthropic-version": "2023-06-01",
         "x-api-key": api_key,
     }
+    if fast_mode:
+        # Opus 4.6/4.7 fast-mode beta. Direct Anthropic API only — Vertex strips
+        # this header. Paired with the `speed: "fast"` body field in _anthropic_payload.
+        headers["anthropic-beta"] = "fast-mode-2026-02-01"
+    return headers
 
 
 @dataclass(frozen=True)
@@ -301,10 +317,10 @@ class _ProviderConfig:
     api_key_env_names: tuple[str, ...]
     missing_api_key_error: str
     build_payload: Callable[
-        [str, list[dict[str, str]], int, str | None],
+        [str, list[dict[str, str]], int, str | None, bool],
         dict[str, Any],
     ]
-    build_headers: Callable[[str], dict[str, str]]
+    build_headers: Callable[[str, bool], dict[str, str]]
     extract_text: Callable[[dict[str, object]], str]
 
 
@@ -416,6 +432,7 @@ def _build_provider_payload(
     messages: list[dict[str, str]],
     max_output_tokens: int,
     effort_level: str | None,
+    fast_mode: bool,
 ) -> dict[str, Any]:
     """Build the JSON request body for the selected provider."""
     return _provider_config(provider).build_payload(
@@ -423,12 +440,15 @@ def _build_provider_payload(
         messages,
         max_output_tokens,
         effort_level,
+        fast_mode,
     )
 
 
-def _build_provider_headers(provider: str, api_key: str) -> dict[str, str]:
+def _build_provider_headers(
+    provider: str, api_key: str, fast_mode: bool
+) -> dict[str, str]:
     """Build auth and content headers for the selected provider."""
-    return _provider_config(provider).build_headers(api_key)
+    return _provider_config(provider).build_headers(api_key, fast_mode)
 
 
 def _load_json_response(
@@ -490,6 +510,7 @@ def call_provider(
     max_output_tokens: int,
     request_timeout_s: float,
     effort_level: str | None = None,
+    fast_mode: bool = False,
 ) -> str:
     """Resolve credentials, send one request, and extract text from the response."""
     normalized_provider = normalize_provider(provider)
@@ -506,8 +527,9 @@ def call_provider(
             messages=messages,
             max_output_tokens=max_output_tokens,
             effort_level=effort_level,
+            fast_mode=fast_mode,
         ),
-        _build_provider_headers(normalized_provider, resolved_api_key),
+        _build_provider_headers(normalized_provider, resolved_api_key, fast_mode),
         request_timeout_s=request_timeout_s,
     )
     return config.extract_text(response)
