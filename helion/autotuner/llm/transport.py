@@ -408,8 +408,17 @@ def _resolve_v1_endpoint(api_base: str, endpoint: str) -> str:
 
 def _build_ssl_context() -> ssl.SSLContext | None:
     """Build an optional SSL context for custom CA bundles or client certs."""
-    ca_bundle = _first_existing_path("HELION_LLM_CA_BUNDLE", "NODE_EXTRA_CA_CERTS")
-    cert = _first_existing_path("HELION_LLM_CLIENT_CERT")
+    ca_bundle = _first_existing_path(
+        "HELION_LLM_CA_BUNDLE", "NODE_EXTRA_CA_CERTS", "CURL_CA_BUNDLE"
+    )
+    # Fall back to common mTLS client-cert env conventions used by HTTPS gateways
+    # (in addition to helion's own knob) so requests work out-of-the-box when an
+    # identity is already configured by another tool.
+    cert = _first_existing_path(
+        "HELION_LLM_CLIENT_CERT",
+        "CLAUDE_CODE_CLIENT_CERT",
+        "THRIFT_TLS_CL_CERT_PATH",
+    )
     if ca_bundle is None and cert is None:
         return None
 
@@ -419,7 +428,14 @@ def _build_ssl_context() -> ssl.SSLContext | None:
         else ssl.create_default_context()
     )
     if cert is not None:
-        key = _first_existing_path("HELION_LLM_CLIENT_KEY") or cert
+        key = (
+            _first_existing_path(
+                "HELION_LLM_CLIENT_KEY",
+                "CLAUDE_CODE_CLIENT_KEY",
+                "THRIFT_TLS_CL_KEY_PATH",
+            )
+            or cert
+        )
         context.load_cert_chain(certfile=cert, keyfile=key)
     return context
 

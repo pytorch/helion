@@ -378,6 +378,44 @@ class TestLLMGuidedSearch(TestCase):
         self.assertEqual(dict(best), dict(round1_cfg))
         self.assertEqual(dict(search.best.config), dict(round1_cfg))
 
+    @onlyBackends(["triton", "cute"])
+    def test_llm_failure_propagates_instead_of_silent_fallback(self):
+        """An LLM error in round 0 raises rather than silently degrading to no seeds."""
+        from helion.autotuner.llm_search import LLMGuidedSearch
+
+        @helion.kernel(autotune_effort="full", static_shapes=True)
+        def add(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(a)
+            for tile in hl.tile(out.size()):
+                out[tile] = a[tile] + b[tile]
+            return out
+
+        args = (
+            torch.randn([8, 32], device=DEVICE),
+            torch.randn([8, 32], device=DEVICE),
+        )
+        bound = add.bind(args)
+        search = LLMGuidedSearch(
+            bound,
+            args,
+            max_rounds=1,
+            initial_random_configs=0,
+            request_timeout_s=5.0,
+        )
+
+        def boom(self, messages):
+            del self, messages
+            raise RuntimeError("simulated provider 401")
+
+        with (
+            patch.object(LLMGuidedSearch, "_call_llm", autospec=True, side_effect=boom),
+            patch.object(
+                LLMGuidedSearch, "_call_llm_async", autospec=True, side_effect=boom
+            ),
+            self.assertRaisesRegex(RuntimeError, "simulated provider 401"),
+        ):
+            search.autotune(skip_cache=True)
+
 
 class TestLLMTransport(TestCase):
     """Tests for provider selection and HTTP payload translation."""
