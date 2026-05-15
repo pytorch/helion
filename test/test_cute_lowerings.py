@@ -268,6 +268,10 @@ class _FakeDeviceFunction:
         self._counts[prefix] = self._counts.get(prefix, 0) + 1
         return f"{prefix}_{self._counts[prefix]}"
 
+    def resolved_block_size(self, block_id: int) -> int | torch.SymInt | None:
+        env = CompileEnvironment.current()
+        return env.block_sizes[block_id].from_config(self.config)
+
 
 class _FakeGenerateAST:
     def __init__(
@@ -618,12 +622,13 @@ class TestCuteLowerings(unittest.TestCase):
             device_function=_FakeDeviceFunction(),
         )
 
-        loop_info = _get_mma_k_loop_info(
-            cg,
-            env,
-            torch.empty(32, 64),
-            torch.empty(64, 16),
-        )
+        with patch.object(CompileEnvironment, "current", return_value=env):
+            loop_info = _get_mma_k_loop_info(
+                cg,
+                env,
+                torch.empty(32, 64),
+                torch.empty(64, 16),
+            )
 
         self.assertIsNotNone(loop_info)
         assert loop_info is not None
@@ -675,13 +680,14 @@ class TestCuteLowerings(unittest.TestCase):
             device_function=_FakeDeviceFunction(),
         )
 
-        loop_info = _get_mma_k_loop_info(
-            cg,
-            env,
-            torch.empty(32, 64),
-            torch.empty(64, 16),
-            fx_node=dot,
-        )
+        with patch.object(CompileEnvironment, "current", return_value=env):
+            loop_info = _get_mma_k_loop_info(
+                cg,
+                env,
+                torch.empty(32, 64),
+                torch.empty(64, 16),
+                fx_node=dot,
+            )
 
         self.assertIsNotNone(loop_info)
         assert loop_info is not None
