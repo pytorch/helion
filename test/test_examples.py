@@ -1696,6 +1696,42 @@ class TestExamples(RefEagerTestBase, TestCase):
             atol=1.0,
         )
 
+    @onlyBackends(["cute"])
+    @skipIfNotCUDA()
+    @skipIfCudaCapabilityLessThan(
+        (10, 0), reason="NVFP4 conversion instructions require Blackwell"
+    )
+    @skipIfRefEager("inline asm codegen is not available in ref eager mode")
+    def test_nvfp4_gemv(self):
+        mod = import_path(EXAMPLES_DIR / "nvfp4_gemv.py")
+
+        M, K_bytes = 64, 128
+        weight = torch.randint(0, 256, (M, K_bytes), dtype=torch.uint8, device=DEVICE)
+        weight_scale = mod.make_fp8_scales((M, K_bytes // 8), DEVICE)
+
+        x_bf16 = torch.randn(K_bytes * 2, dtype=torch.bfloat16, device=DEVICE)
+        bf16_result = mod.nvfp4_gemv_bf16in(weight, x_bf16, weight_scale)
+        bf16_expected = mod.reference_nvfp4_gemv_bf16in(weight, x_bf16, weight_scale)
+        torch.testing.assert_close(
+            bf16_result,
+            bf16_expected,
+            atol=4.0,
+            rtol=2e-1,
+        )
+
+        x_packed = torch.randint(0, 256, (K_bytes,), dtype=torch.uint8, device=DEVICE)
+        x_scale = mod.make_fp8_scales((K_bytes // 8,), DEVICE)
+        fp4_result = mod.nvfp4_gemv_fp4in(weight, x_packed, weight_scale, x_scale)
+        fp4_expected = mod.reference_nvfp4_gemv_fp4in(
+            weight, x_packed, weight_scale, x_scale
+        )
+        torch.testing.assert_close(
+            fp4_result,
+            fp4_expected,
+            atol=4.0,
+            rtol=2e-1,
+        )
+
     @xfailIfPallas("JAX tracer error")
     @skipIfRefEager("hl.jagged_tile does not support ref mode yet")
     def test_jagged_sum(self):
