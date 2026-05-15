@@ -112,6 +112,10 @@ def guided_search_kwargs_from_config(
         kwargs["model"] = model
     if (effort_level := os.environ.get("HELION_LLM_EFFORT_LEVEL")) is not None:
         kwargs["effort_level"] = effort_level
+    if os.environ.get("HELION_LLM_FAST_MODE") is not None:
+        from ..runtime.settings import _env_get_bool
+
+        kwargs["fast_mode"] = _env_get_bool("HELION_LLM_FAST_MODE", False)
     if (value := os.environ.get("HELION_LLM_COMPILE_TIMEOUT_S")) is not None:
         kwargs["compile_timeout_s"] = int(value)
     return kwargs
@@ -164,6 +168,9 @@ class LLMGuidedSearch(PopulationBasedSearch):
             search benchmarks its exploratory configs.
         effort_level: Optional provider-specific effort-level hint (none / low /
             medium / high / max). Can also be set via HELION_LLM_EFFORT_LEVEL.
+        fast_mode: Opt into Anthropic Opus 4.6/4.7 fast mode (faster output
+            tokens, no extended thinking). Ignored by non-Anthropic providers.
+            Can also be set via HELION_LLM_FAST_MODE.
     """
 
     def __init__(
@@ -183,6 +190,7 @@ class LLMGuidedSearch(PopulationBasedSearch):
         request_timeout_s: float = DEFAULT_REQUEST_TIMEOUT_S,
         compile_timeout_s: int | None = None,
         effort_level: str | None = None,
+        fast_mode: bool = False,
     ) -> None:
         super().__init__(kernel, args, finishing_rounds=finishing_rounds)
         if max_rounds < 1:
@@ -200,6 +208,7 @@ class LLMGuidedSearch(PopulationBasedSearch):
         self.request_timeout_s = request_timeout_s
         self.compile_timeout_s = compile_timeout_s
         self.effort_level = effort_level
+        self.fast_mode = fast_mode
 
         self._messages: list[dict[str, str]] = []
         self._all_benchmark_results: list[BenchmarkResult] = []
@@ -295,6 +304,7 @@ class LLMGuidedSearch(PopulationBasedSearch):
                 max_output_tokens=self._max_output_tokens_for_request(),
                 request_timeout_s=self.request_timeout_s,
                 effort_level=self.effort_level,
+                fast_mode=self.fast_mode,
             )
         except Exception as e:
             self.log.warning(f"LLM call failed: {type(e).__name__}: {e}")

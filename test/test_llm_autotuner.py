@@ -51,6 +51,7 @@ class TestLLMGuidedSearch(TestCase):
         search.api_key = None
         search.request_timeout_s = 120.0
         search.effort_level = None
+        search.fast_mode = False
 
         # Mock config_spec with a normalize that accepts anything.
         search.config_spec = SimpleNamespace(
@@ -717,6 +718,86 @@ class TestLLMTransport(TestCase):
         self.assertEqual(captured["payload"]["max_tokens"], 8704)
         self.assertNotIn("output_config", captured["payload"])
 
+    def test_transport_fast_mode_payload_and_headers(self):
+        """Fast mode sets the Anthropic beta header + speed body field, and is
+        orthogonal to effort_level — both can be sent on the same request."""
+        from helion.autotuner.llm.transport import call_provider
+
+        captured = {}
+        messages = [{"role": "user", "content": "suggest configs"}]
+
+        def fake_post_json(url, payload, headers, *, request_timeout_s):
+            del url, request_timeout_s
+            captured["payload"] = payload
+            captured["headers"] = headers
+            if "input" in payload:
+                return self._response_payload("openai_responses")
+            return self._response_payload("anthropic")
+
+        # fast_mode alone on Opus 4.7: only `speed: "fast"` + beta header, no thinking.
+        with patch(
+            "helion.autotuner.llm.transport._post_json",
+            side_effect=fake_post_json,
+        ):
+            call_provider(
+                "anthropic",
+                model="claude-opus-4-7",
+                api_base="https://api.anthropic.com",
+                api_key="anthropic-test-key",
+                messages=messages,
+                max_output_tokens=512,
+                request_timeout_s=120.0,
+                fast_mode=True,
+            )
+        self.assertEqual(captured["headers"]["anthropic-beta"], "fast-mode-2026-02-01")
+        self.assertEqual(captured["payload"]["speed"], "fast")
+        self.assertNotIn("thinking", captured["payload"])
+        self.assertNotIn("temperature", captured["payload"])
+        self.assertEqual(captured["payload"]["max_tokens"], 512)
+
+        # fast_mode + effort_level=max on Opus 4.7: both speed and adaptive thinking
+        # are forwarded (the Anthropic API accepts the combination).
+        captured.clear()
+        with patch(
+            "helion.autotuner.llm.transport._post_json",
+            side_effect=fake_post_json,
+        ):
+            call_provider(
+                "anthropic",
+                model="claude-opus-4-7",
+                api_base="https://api.anthropic.com",
+                api_key="anthropic-test-key",
+                messages=messages,
+                max_output_tokens=512,
+                request_timeout_s=120.0,
+                effort_level="max",
+                fast_mode=True,
+            )
+        self.assertEqual(captured["headers"]["anthropic-beta"], "fast-mode-2026-02-01")
+        self.assertEqual(captured["payload"]["speed"], "fast")
+        self.assertEqual(captured["payload"]["thinking"], {"type": "adaptive"})
+        self.assertEqual(captured["payload"]["output_config"], {"effort": "max"})
+        self.assertNotIn("temperature", captured["payload"])
+
+        # OpenAI: fast_mode is accepted but is a no-op (no beta header, no speed field).
+        captured.clear()
+        with patch(
+            "helion.autotuner.llm.transport._post_json",
+            side_effect=fake_post_json,
+        ):
+            call_provider(
+                "openai_responses",
+                model="gpt-5.5",
+                api_base="https://api.openai.com",
+                api_key="openai-test-key",
+                messages=messages,
+                max_output_tokens=512,
+                request_timeout_s=120.0,
+                fast_mode=True,
+            )
+        self.assertNotIn("anthropic-beta", captured["headers"])
+        self.assertNotIn("speed", captured["payload"])
+
 
 class TestLLMSeededLFBOTreeSearch(TestCase):
     """Tests for the two-stage LLM-seeded hybrid autotuner."""
@@ -757,6 +838,7 @@ class TestLLMSeededLFBOTreeSearch(TestCase):
                 "HELION_HYBRID_LLM_MAX_ROUNDS": "2",
                 "HELION_LLM_PROVIDER": "openai",
                 "HELION_LLM_EFFORT_LEVEL": "max",
+                "HELION_LLM_FAST_MODE": "1",
             },
             clear=False,
         ):
@@ -766,10 +848,12 @@ class TestLLMSeededLFBOTreeSearch(TestCase):
         self.assertEqual(kwargs["llm_max_rounds"], 2)
         self.assertEqual(kwargs["llm_provider"], "openai")
         self.assertEqual(kwargs["llm_effort_level"], "max")
+        self.assertTrue(kwargs["llm_fast_mode"])
 
         search = LLMSeededLFBOTreeSearch(kernel, (), **kwargs)
         self.assertEqual(search.llm_provider, "openai")
         self.assertEqual(search.llm_effort_level, "max")
+        self.assertTrue(search.llm_fast_mode)
 
     def test_selected_by_env(self):
         """HELION_AUTOTUNER selects the hybrid autotuner and applies profile defaults."""
