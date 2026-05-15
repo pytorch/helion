@@ -169,6 +169,10 @@ class ConfigGeneration:
             return config
         for key, value in self._override_values.items():
             config.config[key] = copy.deepcopy(value)
+        self.config_spec.prepare_override_normalization(
+            config.config,
+            self._override_values,
+        )
         self.config_spec.normalize(config.config)
         return config
 
@@ -272,8 +276,14 @@ class ConfigGeneration:
         flat_fields = self.config_spec._flat_fields()
         for key, (indices, is_sequence) in self._key_to_flat_indices.items():
             if key not in config.config:
-                continue
-            value = config.config[key]
+                has_default, value = self.config_spec.flatten_missing_field_default(
+                    key,
+                    config.config,
+                )
+                if not has_default:
+                    continue
+            else:
+                value = config.config[key]
             if is_sequence:
                 assert isinstance(value, list)
                 field = flat_fields[key]

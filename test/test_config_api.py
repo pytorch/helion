@@ -25,6 +25,7 @@ from helion._compiler.cute.tcgen05_constants import (
 from helion._testing import TestCase
 from helion._testing import onlyBackends
 from helion._testing import skipIfXPU
+import helion.language as hl
 
 
 def _json_safe_values() -> st.SearchStrategy[Any]:
@@ -133,6 +134,27 @@ class TestConfigAPI(TestCase):
 
         self.assertIs(helion.Config, runtime.Config)
         self.assertIs(helion.Config, helion.runtime.Config)
+
+    def test_cuda_device_capability_specializes_bound_kernel_cache_key(self) -> None:
+        @helion.kernel()
+        def device_key_kernel(device: hl.constexpr) -> None:
+            pass
+
+        device = torch.device("cuda:0")
+        with (
+            patch("torch.cuda.is_available", return_value=True),
+            patch("torch.cuda.get_device_capability", return_value=(9, 0)),
+        ):
+            sm90_key = device_key_kernel._base_specialization_key((device,))
+        with (
+            patch("torch.cuda.is_available", return_value=True),
+            patch("torch.cuda.get_device_capability", return_value=(10, 0)),
+        ):
+            sm100_key = device_key_kernel._base_specialization_key((device,))
+
+        self.assertEqual(sm90_key[-2:], ("cuda", (9, 0)))
+        self.assertEqual(sm100_key[-2:], ("cuda", (10, 0)))
+        self.assertNotEqual(sm90_key, sm100_key)
 
     def test_config_constructor_signature_contains_expected_kwargs(self) -> None:
         # Keep this list in sync with public kwargs; removal/rename should fail tests
@@ -687,6 +709,38 @@ class TestCuteTcgen05ConfigSpecSplit(TestCase):
         spec.normalize(config)
         self.assertEqual(config.config["tcgen05_strategy"], "role_local_with_scheduler")
         self.assertEqual(config.config["tcgen05_warp_spec_c_input_warps"], 1)
+
+    def test_direct_cute_config_spec_enforces_clc_arch_gate(self) -> None:
+        from helion._compiler.cute.strategies import (
+            TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY,
+        )
+        from helion._compiler.cute.strategies import Tcgen05PersistenceModel
+
+        with (
+            patch("torch.cuda.is_available", return_value=True),
+            patch("torch.cuda.current_device", return_value=0),
+            patch("torch.cuda.get_device_capability", return_value=(9, 0)),
+        ):
+            spec = self._make_cute_tcgen05_spec()
+
+        with self.assertRaisesRegex(
+            exc.InvalidConfig,
+            "requires CUDA compute capability major >= 10",
+        ):
+            spec.normalize(
+                helion.Config(
+                    block_sizes=[128, 128, 64],
+                    pid_type="persistent_interleaved",
+                    tcgen05_strategy="role_local_with_scheduler",
+                    tcgen05_warp_spec_scheduler_warps=1,
+                    tcgen05_warp_spec_c_input_warps=1,
+                    **{
+                        TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY: (
+                            Tcgen05PersistenceModel.CLC_PERSISTENT.value
+                        )
+                    },
+                )
+            )
 
     def test_aux_kernel_detection_routes_strategy_search_surface(self) -> None:
         spec = self._make_cute_tcgen05_spec()

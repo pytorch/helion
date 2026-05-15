@@ -347,6 +347,19 @@ def supports_tensor_descriptor() -> bool:
     return _supports_tensor_descriptor()
 
 
+def target_device_capability(
+    device: torch.device | None = None,
+) -> tuple[int, int] | None:
+    """Return CUDA compute capability, or None for non-CUDA/unavailable targets."""
+    if device is not None and device.type != "cuda":
+        return None
+    if not torch.cuda.is_available():
+        return None
+    if device is None:
+        return torch.cuda.get_device_capability(torch.cuda.current_device())
+    return torch.cuda.get_device_capability(device)
+
+
 def min_dot_size(
     device: torch.device, lhs: torch.dtype, rhs: torch.dtype
 ) -> tuple[int, int, int]:
