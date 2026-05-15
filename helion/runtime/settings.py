@@ -676,6 +676,9 @@ class Settings(_Settings):
         "autotune_cache": (
             "The name of the autotuner cache class to use. "
             "Set HELION_AUTOTUNE_CACHE=StrictLocalAutotuneCache to enable strict caching. "
+            "Set HELION_AUTOTUNE_CACHE=RemoteAutotuneCache (or StrictRemoteAutotuneCache) "
+            "and HELION_REMOTE_CACHE_BACKEND=mypackage.module.MyBackend to enable "
+            "remote caching via a user-provided RemoteCacheBackend subclass. "
             "Defaults to 'LocalAutotuneCache'."
         ),
         "autotune_benchmark_fn": (
