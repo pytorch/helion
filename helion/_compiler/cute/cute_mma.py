@@ -659,7 +659,9 @@ def _get_mma_k_loop_info(
                     None,
                 )
                 if device_loop is not None:
-                    block_size = cg.device_function.resolved_block_size(k_block_id)
+                    block_size = env.block_sizes[k_block_id].from_config(
+                        cg.device_function.config
+                    )
                     if isinstance(block_size, int):
                         return (
                             device_loop,
@@ -707,7 +709,7 @@ def _get_mma_k_loop_info(
     if device_loop is None:
         return None
 
-    block_size = cg.device_function.resolved_block_size(k_block_id)
+    block_size = env.block_sizes[k_block_id].from_config(cg.device_function.config)
     if not isinstance(block_size, int):
         return None
 
