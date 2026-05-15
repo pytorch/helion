@@ -961,6 +961,30 @@ def main() -> None:
     )
     args = p.parse_args()
 
+    # Auto-load inner_loop_iters from meta.yaml if the user didn't pass one.
+    # This closes the refuse → measure → back-solve → persist → predict loop:
+    # once `hlo_sidecar.py back-solve --persist` writes `inner_loop_iters: K`
+    # to the entry's meta.yaml, future predictions of the same entry pick it
+    # up automatically. Explicit --inner-loop-iters on the CLI always wins.
+    if args.inner_loop_iters == 1:
+        meta_path = Path(args.llo_dir) / "meta.yaml"
+        if meta_path.is_file():
+            for line in meta_path.read_text().splitlines():
+                stripped = line.strip()
+                if stripped.startswith("inner_loop_iters:"):
+                    try:
+                        value = int(stripped.split(":", 1)[1].split("#")[0].strip())
+                    except ValueError:
+                        continue
+                    if value > 1:
+                        args.inner_loop_iters = value
+                        print(
+                            f"ℹ Loaded inner_loop_iters={value} from "
+                            f"{meta_path.name}",
+                            file=sys.stderr,
+                        )
+                    break
+
     if args.tpu_version != SUPPORTED_TPU_VERSION:
         print(
             f"⚠ TPU version '{args.tpu_version}' is not the calibrated target "
