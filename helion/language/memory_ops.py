@@ -1924,10 +1924,12 @@ def _codegen_cute_store_tcgen05_tile(
             f"cutlass.Int32(_tcgen05_subtile))]\n"
         )
 
-    def _simt_edge_scalar_copy_source(indent: str, src: str, dst: str) -> str:
+    def _simt_edge_scalar_copy_source(
+        indent: str, src: str, dst: str, *, include_coord_setup: bool = True
+    ) -> str:
         # Vector cute.copy predicates do not guard each partial-N element in double-edge tiles.
         return (
-            _simt_edge_coord_subtile_source(indent)
+            (_simt_edge_coord_subtile_source(indent) if include_coord_setup else "")
             + f"{indent}for _edge_i in range(cute.size({src}.shape)):\n"
             f"{indent}    _coord = {ttr_cc_subtile}[_edge_i]\n"
             f"{indent}    if cute.elem_less(_coord, ({m_size}, {n_size})):\n"
@@ -1939,6 +1941,7 @@ def _codegen_cute_store_tcgen05_tile(
         thr_copy_t2r_var: str,
         define_thr_copy_t2r: bool,
         force_gmem_aux: bool = False,
+        retile_for_r2s: bool = False,
     ) -> list[str]:
         """Emit the per-output-tile aux partitioning lines.
 
@@ -1963,7 +1966,11 @@ def _codegen_cute_store_tcgen05_tile(
         (the TMA-store path does not otherwise create
         ``thr_copy_t2r``); the SIMT path passes False because it
         already creates the slice as part of its existing partition
-        pipeline. ``force_gmem_aux`` is used by the hybrid edge-only
+        pipeline. ``retile_for_r2s`` mirrors Quack's SM100 epilogue
+        visitor layout: TMA-store chains read aux operands in the
+        R2S-retiled layout so the chain carrier can be ``tRS_rAcc`` /
+        ``tRS_rD`` instead of the raw T2R fragment layout.
+        ``force_gmem_aux`` is used by the hybrid edge-only
         SIMT path: C-input staging is only safe for full tiles because
         the producer-side bulk copy is not predicated for M/N fringes.
         """
@@ -1999,6 +2006,9 @@ def _codegen_cute_store_tcgen05_tile(
                 tsr_sc_var = f"{rec.aux_tile}_tSR_sC"
                 trs_rc_var = f"{rec.aux_tile}_tRS_rC"
                 tsr_rc_var = f"{rec.aux_tile}_tSR_rC"
+                rmem_shape_expr = (
+                    f"{trs_rd}.layout" if retile_for_r2s else f"{ttr_racc}.shape"
+                )
                 lines.extend(
                     [
                         (
@@ -2021,7 +2031,7 @@ def _codegen_cute_store_tcgen05_tile(
                         ),
                         (
                             f"{trs_rc_var} = cute.make_rmem_tensor("
-                            f"{ttr_racc}.shape, {aux_dtype_str})"
+                            f"{rmem_shape_expr}, {aux_dtype_str})"
                         ),
                         (f"{tsr_rc_var} = {tiled_copy_s2r_var}.retile({trs_rc_var})"),
                     ]
@@ -2088,6 +2098,11 @@ def _codegen_cute_store_tcgen05_tile(
                         f"{rec.aux_planned}, {epi_tile})"
                     ),
                     (f"{rec.ttr_aux} = {thr_copy_t2r_var}.partition_D({rec.aux_epi})"),
+                    *(
+                        [f"{rec.ttr_aux} = {tiled_copy_r2s}.retile({rec.ttr_aux})"]
+                        if retile_for_r2s
+                        else []
+                    ),
                     (
                         f"{rec.ttr_aux_grouped} = cute.group_modes("
                         f"{rec.ttr_aux}, 3, cute.rank({rec.ttr_aux}))"
@@ -2135,6 +2150,7 @@ def _codegen_cute_store_tcgen05_tile(
         if not aux_step_records:
             return ""
         lines: list[str] = []
+        force_simt_edge_coord_emitted = False
         if use_aux_smem_source and not force_simt_edge_aux:
             # C-input warp productive-body gate is open: per-subtile
             # SMEM ring staging. Each subtile iteration waits on
@@ -2221,6 +2237,8 @@ def _codegen_cute_store_tcgen05_tile(
             ):
                 continue
             if force_simt_edge_aux:
+                include_coord_setup = not force_simt_edge_coord_emitted
+                force_simt_edge_coord_emitted = True
                 lines.append(
                     f"{prelude_indent}{rec.ttr_aux_subtile} = "
                     f"{rec.ttr_aux_grouped}"
@@ -2229,8 +2247,13 @@ def _codegen_cute_store_tcgen05_tile(
                     f"cute.make_rmem_tensor({rec.ttr_aux_subtile}.shape, "
                     f"{rec.aux_dtype})\n"
                     f"{prelude_indent}{rec.aux_rmem}.fill(0)\n"
-                    f"{_simt_edge_scalar_copy_source(prelude_indent, rec.ttr_aux_subtile, rec.aux_rmem)}"
-                    f"{prelude_indent}{rec.aux_loaded} = "
+                    + _simt_edge_scalar_copy_source(
+                        prelude_indent,
+                        rec.ttr_aux_subtile,
+                        rec.aux_rmem,
+                        include_coord_setup=include_coord_setup,
+                    )
+                    + f"{prelude_indent}{rec.aux_loaded} = "
                     f"{rec.aux_rmem}.load()\n"
                 )
                 continue
@@ -2446,8 +2469,14 @@ def _codegen_cute_store_tcgen05_tile(
             f"{tcgen05_value.role_local_tile_counter} * "
             f"cutlass.Int32({subtile_count}) + cutlass.Int32(_tcgen05_subtile)"
         )
+    simt_store_edge_coord_preloaded = simt_edge_only and bool(aux_steps_in_chain)
     simt_store_copy_source = (
-        _simt_edge_scalar_copy_source("        ", ttr_rd, ttr_gc_subtile)
+        _simt_edge_scalar_copy_source(
+            "        ",
+            ttr_rd,
+            ttr_gc_subtile,
+            include_coord_setup=not simt_store_edge_coord_preloaded,
+        )
         if simt_edge_only
         else (
             f"        if {full_tile}:\n"
@@ -2796,20 +2825,6 @@ def _codegen_cute_store_tcgen05_tile(
         rest of the t2r region (acc consumer_wait, t2r copy, chain
         combine, store_target store) at the existing 8-space indent.
 
-        When the chain has auxiliary-tensor steps, render the chain
-        (and the destination store) in the ``ttr_*`` (t2r-fragment)
-        layout instead of the ``trs_*`` (r2s-retile) layout. The aux
-        load is partitioned via ``thr_copy_t2r.partition_D`` so it
-        lives in the t2r layout; the chain's binary ops require both
-        operands in the same layout, and forcing the carrier to
-        ``ttr_*`` avoids an extra register-stage retile that would
-        otherwise be needed for the GMEM-loaded aux. ``ttr_rd`` and
-        ``trs_rd`` share register storage (``trs_rd`` is
-        ``epilogue_smem_copy_and_partition``'s retiled view of
-        ``ttr_rd``), so storing into ``ttr_rd`` here makes the
-        downstream ``cute.copy(tiled_copy_r2s, trs_rd, trs_sd)`` see
-        the same data.
-
         NCU diagnosis on 4096³ residual (cycle 39, GPU 6): Helion
         paid 26.7 cycles per warp on long-scoreboard L1TEX wait
         vs Quack's 15.7 — Helion's per-thread aux GMEM load was
@@ -2823,12 +2838,8 @@ def _codegen_cute_store_tcgen05_tile(
         the t2r async copy, and the later-subtile c_pipeline
         ``producer_acquire`` to overlap with the LDG.
         """
-        if aux_steps_in_chain:
-            carrier = ttr_racc
-            store_target = ttr_rd
-        else:
-            carrier = trs_racc
-            store_target = trs_rd
+        carrier = trs_racc
+        store_target = trs_rd
         early_aux_prelude, late_prelude, rhs = _splice_acc_vec(carrier, "        ")
         body = (
             f"{acc_wait}"
@@ -3318,6 +3329,7 @@ def _codegen_cute_store_tcgen05_tile(
         *_aux_tile_setup_lines(
             thr_copy_t2r_var=thr_copy_t2r,
             define_thr_copy_t2r=True,
+            retile_for_r2s=True,
         ),
         (
             f"{bsg_sd}, {bsg_gd_partitioned} = cute.nvgpu.cpasync.tma_partition("

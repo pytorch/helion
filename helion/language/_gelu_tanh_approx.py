@@ -15,16 +15,14 @@ Helion's tcgen05 epilogue chain analyzer
 (``helion/_compiler/cute/cute_epilogue.py``) and falls back to the
 loud-failure backstop. Folding the whole expression behind a single
 op lets the chain analyzer see exactly one ``_gelu_tanh_approx`` FX
-node and splice the polynomial inline as one chain step (single
-hoisted local for ``x``, single rendered expression — register-resident
-throughout).
+node and splice the polynomial inline as one chain step against the
+already-bound carrier local.
 
 Inside the tcgen05 chain analyzer, ``_gelu_tanh_approx`` is registered
 as a ``_UnaryStep`` row in ``_ZERO_ARG_TARGETS`` keyed on the api
-wrapper itself (the FX target). The template binds ``x`` to a single
-hoisted local (``inner_ref_count = 4``) so the rendered expression
-references the input exactly once even though the polynomial has four
-occurrences of ``x``.
+wrapper itself (the FX target). The template references the carrier
+local four times in the standard polynomial; the renderer keeps that
+carrier bound before formatting the template.
 
 Backend support: ``cute`` and ``triton`` only. The ``pallas`` backend
 raises :class:`exc.BackendUnsupported` because Mosaic does not have a
@@ -72,11 +70,10 @@ GELU_ERF_INV_SQRT2: float = 0.7071067811865476
 #
 # The cute template uses ``{inner}`` directly so it plugs into the
 # tcgen05 chain analyzer's ``_UnaryStep.template`` slot
-# (``cute_epilogue.py`` substitutes ``{inner}`` after hoisting the
-# carrier expression to a single local). The cute-backend codegen
-# below also calls ``.format(inner=...)`` against the lifted local
-# name to share the same template across the splice site and
-# pointwise paths.
+# (``cute_epilogue.py`` substitutes ``{inner}`` with the current
+# carrier local). The cute-backend codegen below also calls
+# ``.format(inner=...)`` against the lifted local name to share the
+# same template across the splice site and pointwise paths.
 #
 # The triton template is rendered as two layers: the inner ``{x32}``
 # placeholder is fp32 (cast happens at the codegen-site for fp16 /
@@ -101,9 +98,11 @@ _GELU_TANH_APPROX_EXPR_CUTE = (
     f" ({GELU_TANH_APPROX_KAPPA!r} + {GELU_TANH_APPROX_LAMBDA!r}"
     f" * ({{inner}}) * ({{inner}})))))"
 )
-_GELU_ERF_EXPR_CUTE = (
-    f"(0.5 * ({{inner}}) * (1.0 + cute.math.erf(({{inner}}) * {GELU_ERF_INV_SQRT2!r})))"
-)
+# Exact erf GELU uses a helper so fp32 TensorSSA carriers, including
+# tcgen05 epilogue fragments, can use packed f32x2 mul/fma around the
+# scalar erf while non-fp32 and odd-size TensorSSA inputs keep the
+# scalar cute.math.erf fallback.
+_GELU_ERF_EXPR_CUTE = "_cute_gelu_erf_exact_f32x2({inner})"
 _GELU_TANH_APPROX_EXPR_TRITON = (
     f"(0.5 * ({{x}}) * (1.0 + libdevice.tanh(({{x32}}) * ({GELU_TANH_APPROX_KAPPA!r}"
     f" + {GELU_TANH_APPROX_LAMBDA!r} * ({{x32}}) * ({{x32}})))))"
@@ -111,17 +110,6 @@ _GELU_TANH_APPROX_EXPR_TRITON = (
 _GELU_ERF_EXPR_TRITON = (
     f"(0.5 * ({{x}}) * (1.0 + libdevice.erf(({{x32}}) * {GELU_ERF_INV_SQRT2!r})))"
 )
-
-
-# Number of times the rendered cute expression substitutes ``{inner}``.
-# The polynomial references ``x`` four times: once in the leading
-# ``0.5 * x``, once in ``x * (...)`` inside tanh, and twice in
-# ``x * x``. The chain renderer (``_UnaryStep.inner_ref_count > 1``)
-# uses this count to hoist ``{inner}`` to a single local first so the
-# template references only that local — keeping rendered source O(1)
-# in the input expression size.
-GELU_TANH_APPROX_INNER_REF_COUNT: int = 4
-GELU_ERF_INNER_REF_COUNT: int = 2
 
 
 @_decorators.api(is_device_only=True)
@@ -236,8 +224,8 @@ def _(state: CodegenState) -> ast.AST:
 @_decorators.codegen(_gelu_tanh_approx, "cute")
 def _(state: CodegenState) -> ast.AST:
     # Same lift-to-single-local rationale as the triton path: see the
-    # ``inner_ref_count`` discussion above and the docstring on
-    # :class:`Tcgen05UnaryEpilogueChain` (``cute_epilogue.py``).
+    # module docstring and :class:`Tcgen05UnaryEpilogueChain`
+    # (``cute_epilogue.py``).
     input_ast = state.codegen.lift(
         state.ast_arg(0), dce=True, prefix="gelu_tanh_approx_in"
     )
@@ -294,10 +282,10 @@ def epilogue_unary_step_template() -> str:
     """Return the cute-backend template (``{inner}``-keyed) for the
     tcgen05 epilogue chain analyzer.
 
-    The chain renderer in ``cute_epilogue.py`` substitutes ``{inner}``
-    after hoisting the carrier expression to a fresh local; the
-    template returned here is the same one the cute-backend codegen
-    in this module uses, so the two paths cannot drift apart.
+    The chain renderer in ``cute_epilogue.py`` substitutes ``{inner}`` with
+    its current carrier local; the template returned here is the same one the
+    cute-backend codegen in this module uses, so the two paths cannot drift
+    apart.
     """
     return _GELU_TANH_APPROX_EXPR_CUTE
 

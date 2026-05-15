@@ -5838,7 +5838,7 @@ class TestCuteLowerings(unittest.TestCase):
         ``test_tcgen05_fused_gelu_tanh_approx_eager_polynomial_rejected``);
         the device_ir decomp folds the whole expression into a single
         ``_UnaryStep`` row so the splice site emits the polynomial
-        with one hoisted carrier reference.
+        against the already-bound carrier local.
         """
 
         from helion._compiler.cute.mma_support import get_cute_mma_support
@@ -5885,6 +5885,8 @@ class TestCuteLowerings(unittest.TestCase):
     def test_tcgen05_fused_gelu_exact_runtime_correctness(self) -> None:
         """Default ``F.gelu`` maps to the exact erf-based CuTe epilogue step."""
 
+        import cutlass.cute as cute
+
         from helion._compiler.cute.mma_support import get_cute_mma_support
 
         if not get_cute_mma_support().tcgen05_f16bf16:
@@ -5911,12 +5913,24 @@ class TestCuteLowerings(unittest.TestCase):
             pid_type="persistent_interleaved",
         )
         bound.set_config(cfg)
-        out = bound(x, y)
+        with (
+            patch(
+                "cutlass.cute.arch.fma_packed_f32x2",
+                wraps=cute.arch.fma_packed_f32x2,
+            ) as fma_packed,
+            patch(
+                "cutlass.cute.arch.mul_packed_f32x2",
+                wraps=cute.arch.mul_packed_f32x2,
+            ) as mul_packed,
+        ):
+            out = bound(x, y)
+        self.assertGreater(fma_packed.call_count, 0)
+        self.assertGreater(mul_packed.call_count, 0)
         expected = torch.nn.functional.gelu((x @ y).float()).to(x.dtype)
         torch.testing.assert_close(out, expected, atol=2e-1, rtol=1e-2)
 
     def test_tcgen05_fused_gelu_exact_codegen_marker(self) -> None:
-        """The exact GELU splice renders ``erf(x / sqrt(2))``, not tanh."""
+        """The exact GELU splice routes through the packed f32x2 helper."""
 
         @helion.kernel(backend="cute")
         def cute_matmul_gelu_exact_marker(
@@ -5944,21 +5958,99 @@ class TestCuteLowerings(unittest.TestCase):
             bound.set_config(cfg)
             code = bound.to_triton_code(cfg)
 
-        self.assertIn("cute.math.erf", code)
-        self.assertIn("0.7071067811865476", code)
+        self.assertIn(
+            "from helion._compiler.cute.epilogue_helpers import "
+            "gelu_erf_exact_f32x2 as _cute_gelu_erf_exact_f32x2",
+            code,
+        )
+        self.assertIn("_cute_gelu_erf_exact_f32x2(", code)
         self.assertNotIn("cute.math.tanh", code)
+
+    def test_gelu_exact_cute_pointwise_tensor_ssa_numeric_runtime_correctness(
+        self,
+    ) -> None:
+        """Pointwise exact GELU stays numerically correct across dtype fallbacks."""
+
+        @helion.kernel(backend="cute")
+        def cute_gelu_exact_pointwise(x: torch.Tensor) -> torch.Tensor:
+            m, n = x.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                out[tile_m, tile_n] = torch.nn.functional.gelu(x[tile_m, tile_n])
+            return out
+
+        torch.manual_seed(0)
+        for dtype_name, dtype in (
+            ("bfloat16", torch.bfloat16),
+            ("float16", torch.float16),
+            ("float32", torch.float32),
+        ):
+            with self.subTest(dtype=dtype_name):
+                x = torch.randn(64, 64, dtype=dtype, device=DEVICE)
+                bound = cute_gelu_exact_pointwise.bind((x,))
+                cfg = helion.Config(block_sizes=[16, 16])
+                bound.set_config(cfg)
+                out = bound(x)
+                expected = torch.nn.functional.gelu(x)
+                torch.testing.assert_close(out, expected, atol=2e-2, rtol=2e-2)
+
+    def test_tcgen05_fused_bias_residual_gelu_exact_runtime_correctness(
+        self,
+    ) -> None:
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_bias_residual_gelu_exact(
+            x: torch.Tensor,
+            y: torch.Tensor,
+            bias: torch.Tensor,
+            residual: torch.Tensor,
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                val = 1.25 * acc
+                val = val + 0.5 * residual[tile_m, tile_n].to(torch.float32)
+                val = val + bias[tile_n].to(torch.float32)
+                out[tile_m, tile_n] = torch.nn.functional.gelu(val).to(x.dtype)
+            return out
+
+        torch.manual_seed(0)
+        x = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
+        y = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
+        bias = torch.randn(128, dtype=torch.bfloat16, device=DEVICE)
+        residual = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
+        args = (x, y, bias, residual)
+        bound = cute_matmul_bias_residual_gelu_exact.bind(args)
+        bound.env.config_spec.cute_tcgen05_search_enabled = True
+        cfg = _make_tcgen05_persistent_config(
+            block_sizes=[128, 128, 32],
+            pid_type="persistent_interleaved",
+        )
+        bound.set_config(cfg)
+        code = bound.to_triton_code(cfg)
+        self.assertIn("_cute_gelu_erf_exact_f32x2(", code)
+        out = bound(*args)
+        expected = torch.nn.functional.gelu(
+            1.25 * (x @ y).float() + 0.5 * residual.float() + bias.float()
+        ).to(x.dtype)
+        torch.testing.assert_close(out, expected, atol=2e-1, rtol=1e-2)
 
     def test_tcgen05_fused_gelu_tanh_approx_codegen_marker(self) -> None:
         """The spliced ``F.gelu(approximate="tanh")`` chain step renders
         the polynomial inline with the canonical tanh-approx constants
-        and a single hoisted ``tcgen05_chain_step_in`` local.
+        without adding a redundant carrier alias.
 
-        Pins the chain analyzer's ``inner_ref_count = 4`` hoist for the
-        ``_gelu_tanh_approx`` row in
-        ``_ZERO_ARG_TARGETS`` (``cute_epilogue.py``): without the
-        hoist, the rendered template would textually duplicate the
-        carrier expression four times; with the hoist, the rendered
-        polynomial references one local. Also pins that the constants
+        Pins that the renderer reuses the already-bound chain carrier
+        rather than creating a no-op ``tcgen05_chain_step_in`` vector
+        alias before the GELU polynomial. Also pins that the constants
         are baked in as Python literals (``0.7978845608028654 =
         sqrt(2/pi)`` and ``0.035677408136300125 = sqrt(2/pi) *
         0.044715``) so a future refactor that re-derives them from a
@@ -5999,17 +6091,14 @@ class TestCuteLowerings(unittest.TestCase):
             code = bound.to_triton_code(cfg)
         # The chain analyzer must accept the decomp-mapped
         # ``_gelu_tanh_approx`` op and the splice site must emit the
-        # polynomial with the single hoisted local pattern. The
+        # polynomial without a redundant carrier alias. The
         # constants must appear verbatim in the rendered source.
         self.assertIn("cute.math.tanh", code)
         self.assertIn("tcgen05_acc_loaded", code)
         self.assertIn("tcgen05_chain_step", code)
         self.assertIn("0.7978845608028654", code)
         self.assertIn("0.035677408136300125", code)
-        # Per-step binding hoist: ``inner_ref_count = 4`` introduces a
-        # single ``tcgen05_chain_step_in`` local that the rendered
-        # polynomial references in place of the carrier expression.
-        self.assertIn("tcgen05_chain_step_in", code)
+        self.assertNotIn("tcgen05_chain_step_in", code)
 
     def test_tcgen05_fused_gelu_tanh_approx_eager_polynomial_rejected(
         self,
@@ -12327,6 +12416,95 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
         self.assertNotIn("tile_offset_0 =", edge_c_input_src)
         self.assertNotIn("tile_offset_1 =", edge_c_input_src)
 
+    def test_aux_tma_store_chain_uses_r2s_epilogue_layout(self) -> None:
+        """TMA-store aux chains use the same R2S visitor layout as Quack."""
+
+        kernel = self._bias_residual_gelu_kernel()
+        args = (
+            torch.empty([4864, 5000], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([5000, 4864], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([4864], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([4864, 4864], device=DEVICE, dtype=torch.bfloat16),
+        )
+        with patch_cute_mma_support():
+            bound = kernel.bind(args)
+            cfg = _make_tcgen05_persistent_config(
+                block_sizes=[256, 256, 128],
+                l2_groupings=[TCGEN05_TWO_CTA_EDGE_K_TAIL_L2_GROUPING],
+                pid_type="persistent_interleaved",
+                num_warps=4,
+                tcgen05_cluster_m=2,
+                tcgen05_ab_stages=2,
+                tcgen05_acc_stages=1,
+                tcgen05_c_stages=TCGEN05_TWO_CTA_EDGE_K_TAIL_C_STAGES,
+                tcgen05_l2_swizzle_size=TCGEN05_TWO_CTA_EDGE_K_TAIL_L2_SWIZZLE_SIZE,
+                tcgen05_acc_wait_placement=TCGEN05_ACC_WAIT_PLACEMENT_BEFORE_SUBTILE_LOOP,
+                tcgen05_c_acquire_placement=TCGEN05_C_ACQUIRE_PLACEMENT_FIRST_IN_LOOP,
+                **{TCGEN05_AUX_LOAD_MODE_CONFIG_KEY: TCGEN05_AUX_LOAD_MODE_TMA},
+                tcgen05_strategy="role_local_with_scheduler",
+                tcgen05_warp_spec_scheduler_warps=1,
+                tcgen05_warp_spec_c_input_warps=1,
+                indexing=["tensor_descriptor"] * bound.env.config_spec.indexing.length,
+            )
+            code = bound.to_triton_code(cfg)
+
+        self.assertIn(
+            "tcgen05_aux_tile_0_tRS_rC = "
+            "cute.make_rmem_tensor(tcgen05_tRS_rD.layout, cutlass.BFloat16)",
+            code,
+        )
+        self.assertIn(
+            "tcgen05_tTR_gAux_1 = tcgen05_tiled_copy_r2s.retile(tcgen05_tTR_gAux_1)",
+            code,
+        )
+        self.assertRegex(
+            code,
+            r"tcgen05_acc_loaded_\d+ = tcgen05_tRS_rAcc\.load\(\)",
+        )
+        self.assertIn("tcgen05_tRS_rD.store(tcgen05_acc_vec)", code)
+        self.assertNotIn("tcgen05_tTR_rD.store(tcgen05_acc_vec)", code)
+
+    def test_aux_tma_store_r2s_epilogue_layout_runtime_correctness(self) -> None:
+        """R2S-layout aux chains preserve bias+residual+GELU outputs."""
+
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+
+        torch.manual_seed(0)
+        x = torch.randn(512, 512, dtype=torch.bfloat16, device=DEVICE)
+        y = torch.randn(512, 512, dtype=torch.bfloat16, device=DEVICE)
+        bias = torch.randn(512, dtype=torch.bfloat16, device=DEVICE)
+        residual = torch.randn(512, 512, dtype=torch.bfloat16, device=DEVICE)
+        expected = torch.nn.functional.gelu(
+            1.25 * (x @ y).float() + 0.5 * residual.float() + bias.float(),
+            approximate="tanh",
+        ).to(x.dtype)
+        kernel = self._bias_residual_gelu_kernel()
+        bound = kernel.bind((x, y, bias, residual))
+        bound.env.config_spec.cute_tcgen05_search_enabled = True
+        config = helion.Config(
+            block_sizes=[256, 256, 128],
+            l2_groupings=[1],
+            num_warps=4,
+            num_sm_multiplier=1,
+            pid_type="persistent_interleaved",
+            tcgen05_cluster_m=2,
+            tcgen05_ab_stages=2,
+            tcgen05_acc_stages=1,
+            tcgen05_c_stages=2,
+            tcgen05_num_epi_warps=4,
+            tcgen05_strategy="role_local_with_scheduler",
+            tcgen05_warp_spec_scheduler_warps=1,
+            tcgen05_warp_spec_c_input_warps=1,
+            **{TCGEN05_AUX_LOAD_MODE_CONFIG_KEY: TCGEN05_AUX_LOAD_MODE_TMA},
+            indexing=["tensor_descriptor"] * bound.env.config_spec.indexing.length,
+        )
+        bound.set_config(config)
+        out = bound(x, y, bias, residual)
+        torch.testing.assert_close(out, expected, atol=2e-1, rtol=1e-2)
+
     def test_aux_edge_target_shape_tma_load_stages_residual_only(self) -> None:
         """Opt-in aux TMA load stages the exact-shape residual only on full tiles."""
 
@@ -12685,6 +12863,9 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
         self.assertNotIn("_full_valid", code)
         self.assertNotIn("_edge_valid", code)
         self.assertNotIn("while tcgen05_scheduler_warp_work_tile.is_valid_tile:", code)
+        self.assertEqual(code.count("tcgen05_cC = cute.local_tile("), 1, code)
+        self.assertEqual(code.count("tcgen05_tTR_cC_subtile = "), 1, code)
+        self.assertEqual(code.count("for _edge_i in range("), 3, code)
 
     def test_aux_edge_hybrid_tma_store_runtime_correctness(self) -> None:
         """Hybrid full-tile TMA store and SIMT edge fallback run together."""
@@ -12808,8 +12989,8 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
         fires the producer cooperative GMEM→SMEM
         ``cute.copy(make_tiled_copy_tv, ...)`` framed by
         ``producer_acquire`` / ``producer_commit`` per subtile,
-        then ``sched_pipeline.consumer_release`` at the bottom of
-        each tile. This pin guards the warp predicate + sched
+        and releases the sched_pipeline stage after reading tile
+        coordinates. This pin guards the warp predicate + sched
         consumer-group arrive count under the productive-body
         gate; the producer cooperative-copy + consumer flip
         pins live in
@@ -12855,6 +13036,57 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
             f"cutlass.Int32({expected_arrive}))",
             code,
         )
+
+    def test_sched_pipeline_release_runs_before_role_tile_work(self) -> None:
+        """Scheduler consumers release the tile-coordinate stage early.
+
+        This pins Quack-style scheduler overlap: after a role reads the
+        published tile metadata, it releases the sched_pipeline stage before
+        running the tile body so the scheduler warp can publish the next tile.
+        The C-input producer keeps the release after its post-L2 coordinate
+        reconstruction so it does not reread the scheduler SMEM mailbox after
+        the release.
+        """
+        kernel = self._residual_kernel()
+        args = (
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+        )
+        config = self._canonical_c_input_config()
+        with patch_cute_mma_support():
+            bound = kernel.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            code = bound.to_triton_code(config)
+
+        code_ast = ast.parse(code)
+
+        def single_while_src(test: str) -> str:
+            matches = [
+                ast.unparse(node)
+                for node in ast.walk(code_ast)
+                if isinstance(node, ast.While) and ast.unparse(node.test) == test
+            ]
+            self.assertEqual(len(matches), 1, code)
+            return matches[0]
+
+        mma_src = single_while_src("tcgen05_role_local_1_valid")
+        mma_virtual_pid = mma_src.index("virtual_pid =")
+        mma_sched_release = mma_src.index("tcgen05_sched_pipeline.consumer_release")
+        mma_tile_work = mma_src.index("tcgen05_ab_pipeline.consumer_try_wait")
+        mma_next_wait = mma_src.rindex("tcgen05_sched_pipeline.consumer_wait")
+        self.assertLess(mma_virtual_pid, mma_sched_release)
+        self.assertLess(mma_sched_release, mma_tile_work)
+        self.assertLess(mma_tile_work, mma_next_wait)
+
+        c_input_src = single_while_src("tcgen05_c_input_warp_valid")
+        c_input_l2 = c_input_src.index("tile_offset_1 =")
+        c_input_sched_release = c_input_src.index(
+            "tcgen05_sched_pipeline.consumer_release"
+        )
+        c_input_aux_acquire = c_input_src.index("tcgen05_aux_pipeline.producer_acquire")
+        self.assertLess(c_input_l2, c_input_sched_release)
+        self.assertLess(c_input_sched_release, c_input_aux_acquire)
 
     def test_sched_pipeline_warp_leader_wait_mode_codegen(self) -> None:
         """Diagnostic sched wait mode gates consumer_wait to lane 0."""

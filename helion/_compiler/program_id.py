@@ -2443,7 +2443,8 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         # ``ROLE_LOCAL_WITH_SCHEDULER`` reroutes the per-role body
         # through the broadcast pipeline. When active, the consumer
         # warp waits on the sched_pipeline, reads the published tile
-        # metadata from SMEM, runs its role block, then releases.
+        # metadata from SMEM, releases the sched stage, then runs its
+        # role block.
         # The per-role ``StaticPersistentTileScheduler.create`` is
         # *not* emitted in this mode — the scheduler warp owns the
         # only tile scheduler.
@@ -2576,8 +2577,8 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         """``ROLE_LOCAL_WITH_SCHEDULER`` consumer-side role-local while.
 
         Each consumer role waits on the sched_pipeline, reads the
-        published tile metadata from ``layout.work_tile_smem``, runs
-        its role block, then releases. The scheduler-warp role
+        published tile metadata from ``layout.work_tile_smem``, releases the
+        sched stage, then runs its role block. The scheduler-warp role
         (built by ``_build_scheduler_warp_role_local_while``) owns
         the producer side: it runs ``StaticPersistentTileScheduler``
         and publishes per-tile metadata into the same SMEM mailbox.
@@ -2672,6 +2673,11 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         per_tile_body: list[ast.stmt] = [
             statement_from_string(f"{self.virtual_pid_var} = {linear_pid_expr}"),
         ]
+        # Match Quack's TileScheduler::get_current_work ordering: after the
+        # role reads the published tile metadata, release the scheduler stage
+        # immediately so the scheduler warp can publish the next tile while this
+        # role processes the current tile.
+        per_tile_body.extend(_consumer_release_block())
         if dependency_stmts is not None:
             per_tile_body.extend(dependency_stmts)
         per_tile_body.extend(role_block.stmts)
@@ -2681,7 +2687,6 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                     f"{tile_counter_var} = {tile_counter_var} + cutlass.Int32(1)"
                 )
             )
-        per_tile_body.extend(_consumer_release_block())
         per_tile_body.extend(_consumer_wait_block())
         prelude.append(
             create(
@@ -3480,7 +3485,13 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         2. ``virtual_pid_var`` write decomposed from
            ``work_tile_smem`` (downstream M / N tile coords used
            by the per-descriptor aux GMEM-tile builder).
-        3. Per output tile, build the per-CTA aux GMEM region:
+        3. On the production post-L2 path,
+           ``sched_pipeline.consumer_release`` runs after those
+           coordinates are materialized, before aux staging, so the
+           scheduler warp can run ahead. The defensive no-post-L2
+           fallback keeps the release at the bottom because that path
+           still reads the scheduler SMEM mailbox in the aux setup.
+        4. Per output tile, build the per-CTA aux GMEM region:
            ``cute.local_tile(host_aux, (bm_per_cta, bn),
            (tile_m, tile_n))`` where
            ``bm_per_cta = bm // cluster_m`` under
@@ -3490,13 +3501,13 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
            ``group_modes(2, rank)`` to expose a flat subtile
            axis whose extent matches the consumer's per-CTA
            subtile count.
-        4. Build the cooperative ``TiledCopy`` once per
+        5. Build the cooperative ``TiledCopy`` once per
            descriptor: ``make_tiled_copy_tv`` with a
            ``(M_threads=4, N_threads=8)`` ordered layout × a
            ``(1, 128 / dtype_bits)`` val layout and a
            ``CopyUniversalOp`` atom. ``get_slice(lane_idx)``
            per lane.
-        5. Per subtile (``cutlass.range(subtile_count,
+        6. Per subtile (``cutlass.range(subtile_count,
            unroll_full=True)``): ``producer_acquire(state)`` →
            per descriptor build the per-subtile GMEM slice and
            SMEM stage slice and issue
@@ -3508,8 +3519,10 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
            memory semantics and does not fence by itself) →
            ``c_pipeline_aux.producer_commit(state)`` →
            ``state.advance()``.
-        6. ``sched_pipeline.consumer_release`` + sentinel-publish
-           wait at the bottom of the per-tile body.
+        7. The sentinel-publish wait remains at the bottom. On the
+           defensive no-post-L2 fallback, the delayed
+           ``sched_pipeline.consumer_release`` runs just before this
+           wait.
 
         The producer-side and consumer-side flip
         (in ``memory_ops._aux_subtile_load_source`` /
@@ -4206,6 +4219,13 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         # placement of ``dependency_stmts`` (see
         # ``_build_role_local_while_with_scheduler``).
         per_tile_body.extend(l2_dependency_stmts)
+        early_sched_release = has_post_l2_coords
+        if early_sched_release:
+            # After the post-L2 coordinate chain has materialized tile_offset_*
+            # locals, the aux producer no longer needs the scheduler SMEM
+            # mailbox for this tile. Release here so the scheduler warp can run
+            # ahead while aux GMEM->SMEM staging is in flight.
+            per_tile_body.extend(_sched_consumer_release_block())
         aux_copy_lines = _aux_copy_lines()
         if aux_requires_full_tile and tile_phase == "all":
             # Hybrid full-tile TMA store and explicit aux TMA loads use the aux
@@ -4228,7 +4248,8 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         else:
             assert tile_phase in ("all", "full"), f"unexpected tile_phase={tile_phase}"
             per_tile_body.extend(aux_copy_lines)
-        per_tile_body.extend(_sched_consumer_release_block())
+        if not early_sched_release:
+            per_tile_body.extend(_sched_consumer_release_block())
         per_tile_body.extend(_sched_consumer_wait_block())
         prelude.append(
             create(
