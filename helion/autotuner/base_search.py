@@ -555,8 +555,7 @@ class BaseSearch(BaseAutotuner):
             """Return True once we have enough matches to stop scanning."""
             if not is_compatible(entry):
                 return False
-            assert entry.flat_config is not None  # narrowed by is_compatible
-            # flat_config may contain nested lists (unhashable); key by repr.
+            assert entry.flat_config is not None
             dedup_key = repr(entry.flat_config)
             if dedup_key in seen:
                 return False
