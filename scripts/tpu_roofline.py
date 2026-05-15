@@ -26,6 +26,38 @@ Usage:
   python tpu_roofline.py <llo_dir> --inputs bf16:8192x8192,bf16:8192x8192 \\
                                    --outputs bf16:8192x8192
 
+Known modeling gaps / TODOs:
+
+  - Phi / loop-carried accumulator stalls are not modeled. Kernels with
+    a tight loop-carried dependency (e.g. `acc = acc + matmul(...)` over
+    K-tiles, standalone bmm with un-tuned configs) can under-predict by
+    ~15-20% because the model treats each iteration as independent.
+    Attention's bmm-inside-fusion predicts fine because the softmax /
+    mask work between matmuls hides the dependency; standalone bmm with
+    a *bad* config exposes the gap. Open question: does the gap remain
+    with an autotuned config? Worth re-running `bmm_8x1024x1024` with
+    autotune to find out before treating this as a structural fix.
+
+  - The `--cycle-accurate` operand-graph simulator is experimental and
+    currently *worse* than the default for most kernels (over-predicts
+    attention by +28-45%) because it stacks dependency stalls on top of
+    the lane-realization stretch the default model already applies, and
+    its per-op latency table is guessed rather than measured. Promoting
+    it would require (1) dropping per-lane realization factors and
+    re-calibrating purely from operand latencies, and (2) microbenchmark
+    each TPU v7x instruction (vmatmul, vexp, vload, vstore, etc.) to
+    derive real latencies. Multi-day project; only worth it if (a)
+    above turns out to need phi tracking.
+
+  - GMM at larger M (e.g. M=4096): outer-M tile count is not in
+    `loop_factor` and `--inputs` undercounts HBM bytes when RHS is
+    re-read across N-tiles. Compounds to ~50% under-prediction.
+    Workaround: back-solve via `scripts/hlo_sidecar.py back-solve` and
+    persist K. Structural fix would require (a) parsing the kernel-name
+    suffix (`tm_NN-tk_NN-tn_NN`) for tile sizes and combining with a
+    user-supplied `--shape` to derive K, AND (b) a `--bytes-multiplier`
+    or DMA-pattern scanner for re-read accounting.
+
 How to produce the LLO dump that this script consumes:
   # On the TPU pod (Linux, libtpu installed):
   rm -rf /tmp/llo_dump && mkdir -p /tmp/llo_dump
