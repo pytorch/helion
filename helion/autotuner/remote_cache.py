@@ -37,7 +37,7 @@ class RemoteCacheBackend(abc.ABC):
         """Store a JSON string under *key*."""
 
     def list(self, max_results: int | None = None) -> Iterable[str]:
-        """Yield cached JSON entries, newest first. Empty by default; override to enable warm-start from remote."""
+        """Return cached JSON entries, newest first. Empty by default; override to enable warm-start from remote."""
         return ()
 
 

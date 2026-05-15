@@ -576,7 +576,17 @@ class BaseSearch(BaseAutotuner):
 
         # Over-fetch 2x to absorb filtered / duplicate entries.
         remaining = max_configs - len(matching)
-        for raw in backend.list(max_results=remaining * 2):
+        try:
+            # Materialize eagerly so any backend failure surfaces here, not
+            # mid-iteration when partial results are already in `matching`.
+            raw_entries = list(backend.list(max_results=remaining * 2))
+        except Exception:
+            self.log.warning(
+                "Remote cache list failed, using local matches only", exc_info=True
+            )
+            return matching
+
+        for raw in raw_entries:
             try:
                 entry = parse_cache_entry(raw)
             except ValueError:

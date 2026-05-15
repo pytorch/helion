@@ -101,6 +101,7 @@ def iter_cache_entries(
     files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
 
     for p in itertools.islice(files, max_scan):
+        # parse_cache_entry consolidates KeyError/TypeError/JSONDecodeError into ValueError.
         try:
             yield parse_cache_entry(p.read_text())
         except (OSError, ValueError) as e:
