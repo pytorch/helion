@@ -99,6 +99,10 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         )
         CodegenInterface.__init__(self, self.device_function)
 
+        # Decide once which sibling for-loops need a tl.debug_barrier()
+        # to make global writes visible to subsequent reads.
+        self._compute_inter_loop_barriers()
+
     def get_graph(self, graph_id: int) -> GraphInfo:
         return self.codegen_graphs[graph_id]
 
@@ -116,6 +120,93 @@ class GenerateAST(NodeVisitor, CodegenInterface):
     def _phase_checker(self, root_id: int) -> LoopDependencyChecker:
         phase_idx = self.host_function.device_ir.phase_for_root(root_id)
         return self.host_function.device_ir.phases[phase_idx].loop_dependency_checker
+
+    def _compute_inter_loop_barriers(self) -> None:
+        """Walk every codegen graph; for each pair of consecutive sibling
+        ``_for_loop`` / ``_for_loop_step`` nodes, set ``needs_barrier_before``
+        on the second loop's ``ForLoopGraphInfo`` when there is a global RAW
+        dependency.
+
+        TileIR shares Triton surface syntax but ``tl.debug_barrier()`` lowers
+        to ``ttg.barrier`` which the TileIR pass pipeline does not legalize,
+        so the analysis is a no-op there.
+        """
+        from ..language._tracing_ops import _for_loop
+        from ..language._tracing_ops import _for_loop_step
+        from .device_ir import ForLoopGraphInfo
+        from .loop_dependency_checker import (
+            needs_inter_loop_debug_barrier_for_global_raw,
+        )
+
+        env = CompileEnvironment.current()
+        if env.codegen_name != "triton" or env.backend.name == "tileir":
+            return
+
+        for graph_info in self.codegen_graphs:
+            # Pending writes accumulate across ALL prior sibling for-loops
+            # since the last emitted barrier.  When a barrier is inserted
+            # before a loop, it flushes all earlier writes, so the pending set
+            # is reset and only writes from loops AFTER the barrier need to be
+            # tracked for subsequent siblings.
+            pending_global_writes: set[str] = set()
+            for node in graph_info.graph.nodes:
+                if node.op != "call_function":
+                    continue
+                if node.target not in (_for_loop, _for_loop_step):
+                    continue
+                cur_id = node.args[0]
+                assert isinstance(cur_id, int)
+                cur_info = self.codegen_graphs[cur_id]
+                if not isinstance(cur_info, ForLoopGraphInfo):
+                    continue
+                need_barrier = needs_inter_loop_debug_barrier_for_global_raw(
+                    pending_global_writes,
+                    cur_info.host_loop_reads,
+                    global_barrier_tensor_names=self._triton_global_barrier_tensor_names,
+                )
+                cur_info.needs_barrier_before = need_barrier
+                if need_barrier:
+                    # Barrier flushes everything written before it.
+                    pending_global_writes = set()
+                # Accumulate the current loop's writes for future siblings.
+                pending_global_writes |= self._triton_global_barrier_tensor_names(
+                    cur_info.host_loop_writes
+                )
+
+    def _triton_global_barrier_tensor_names(self, names: frozenset[str]) -> set[str]:
+        """Names that may participate in cross-wavefront global (HBM) coherence.
+
+        Triton-specific: the Pallas SMEM filter is intentionally omitted here
+        because the only caller (``_compute_inter_loop_barriers``) gates on
+        Triton codegen.  The ``triton_`` prefix and the assertion below encode
+        that precondition so a future non-Triton caller fails loudly rather
+        than silently mis-classifying SMEM-only tensors as needing a global
+        barrier.
+        """
+        from .type_propagation import StackTensorType
+        from .type_propagation import TensorType
+
+        env = CompileEnvironment.current()
+        assert env.codegen_name == "triton" and env.backend.name != "tileir", (
+            "_triton_global_barrier_tensor_names called outside Triton codegen"
+        )
+
+        out: set[str] = set()
+        scratch_names = {s.name for s in self.device_function._scratch_args}
+        local_types = self.host_function.local_types
+        for name in names:
+            if name in scratch_names:
+                continue
+            if local_types is None:
+                out.add(name)
+                continue
+            ti = local_types.get(name)
+            if ti is None:
+                out.add(name)
+                continue
+            if isinstance(ti, (TensorType, StackTensorType)):
+                out.add(name)
+        return out
 
     def add_statement(self, stmt: ast.AST | str | None) -> None:
         if stmt is None:
@@ -300,7 +391,12 @@ class GenerateAST(NodeVisitor, CodegenInterface):
             self.host_statements = prior
 
     @contextlib.contextmanager
-    def add_device_loop(self, device_loop: DeviceLoopState) -> Iterator[None]:
+    def add_device_loop(
+        self,
+        device_loop: DeviceLoopState,
+        *,
+        needs_barrier_before: bool = False,
+    ) -> Iterator[None]:
         with self.set_statements(device_loop.inner_statements):
             for idx in device_loop.block_ids:
                 active_loops = self.active_device_loops[idx]
@@ -314,6 +410,8 @@ class GenerateAST(NodeVisitor, CodegenInterface):
             finally:
                 for idx in device_loop.block_ids:
                     self.active_device_loops[idx].pop()
+        if needs_barrier_before:
+            self.add_statement(statement_from_string("tl.debug_barrier()"))
         self.statements_stack[-1].extend(device_loop.outer_prefix)
         self.add_statement(device_loop.for_node)
         self.statements_stack[-1].extend(device_loop.outer_suffix)
@@ -478,7 +576,6 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                             ) from None
                         bound = fn._signature.bind(*args, **kwargs)
                         bound.apply_defaults()
-
                         from .inductor_lowering import CodegenState
 
                         state = CodegenState(
