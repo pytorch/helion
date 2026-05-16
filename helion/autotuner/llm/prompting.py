@@ -134,12 +134,15 @@ def _initial_strategy_lines(
         )
     if "reduction_loops" in flat_fields:
         lines.append(
-            "This is reduction-like: keep most configs conservative and avoid very large block_sizes or maxed num_warps/num_stages."
+            "This is reduction-like: span the space — include conservative configs (small blocks, num_stages=1-2) AND aggressive configs (large blocks up to the reduction dim, num_stages=4-8 with deep range_num_stages pipelining). Memory-bound reductions on modern accelerators often prefer the aggressive end."
         )
     if any(name in flat_fields for name in _ADVANCED_TOGGLE_FIELDS):
         lines.append(
             "Use advanced toggles like warp_specialize, multi_buffer, and flatten in only a minority of otherwise sane configs."
         )
+    lines.append(
+        "Explicitly diversify num_stages and num_warps across the batch: don't cluster all suggestions at num_stages=1; include several with num_stages in {2, 4, 8} so LFBO refinement has aggressive seeds to anchor on."
+    )
     return lines
 
 
