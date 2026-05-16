@@ -1,6 +1,6 @@
 # Helion Benchmark Dashboard
 
-Interactive dashboard for visualizing Helion benchmark results across GPU platforms (H100, B200, MI325X, MI350X). Tracks kernel latency, speedup vs eager, compile time, and accuracy over time.
+Interactive dashboard for visualizing Helion benchmark results across GPU platforms (H100, B200, B200 CuTe, MI325X, MI350X). Tracks kernel latency, speedup vs eager, compile time, and accuracy over time.
 
 Deployed at https://helionlang.com/dashboard/ alongside the main docs. The docs-deploy workflow runs `build_dashboard_data.py` after each docs push or Benchmark Dispatch completion, generating `dashboard-data.json` that `index.html` fetches at runtime.
 

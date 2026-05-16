@@ -149,7 +149,16 @@ def parse_run(run_dir, active_platforms=None):
         if not data:
             continue
 
-        platform = data[0].get("benchmark", {}).get("extra_info", {}).get("device", platform_short)
+        extra_info = data[0].get("benchmark", {}).get("extra_info", {})
+        backend = extra_info.get("backend")
+        backend_label = "CuTe" if backend == "cute" else backend
+        if backend and backend != "triton" and not platform_short.endswith(f"_{backend}"):
+            platform_short = f"{platform_short}_{backend}"
+            if active_platforms and platform_short not in active_platforms:
+                continue
+        platform = extra_info.get("device", platform_short)
+        if backend and backend != "triton":
+            platform = f"{platform} ({backend_label})"
         if platform == platform_short and platform in ("b200", "h100", "mi325x", "mi350x"):
             continue
 

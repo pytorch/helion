@@ -23,6 +23,11 @@ on:
         required: false
         type: boolean
         default: false
+      run_b200_cute:
+        description: 'Run benchmark on B200 with the Helion CuTe backend'
+        required: false
+        type: boolean
+        default: false
       kernels:
         description: 'Comma-separated list of kernels to benchmark on GPU runners'
         required: false
@@ -35,6 +40,11 @@ on:
         required: false
         type: string
         default: "flash_attention,bmm,gemm,welford,softmax,layer_norm,rms_norm,rms_norm-bwd,cross_entropy"
+      kernels_cute:
+        description: 'Comma-separated list of kernels to benchmark on B200 with HELION_BACKEND=cute. Defaults to the CuTe-capable TritonBench subset.'
+        required: false
+        type: string
+        default: "vector_add,gemm,softmax,layer_norm,rms_norm,cross_entropy,vector_exp,sum,geglu,swiglu,jsd,jagged_mean"
       env_vars:
         description: 'Environment variables for benchmark runner'
         required: false
@@ -101,6 +111,34 @@ jobs:
       env-vars: ${{ github.event.inputs.env_vars }}
       custom-args: ${{ github.event.inputs.custom_args }}
 
+  gen-matrix-b200-cute:
+    uses: ./.github/workflows/compute-benchmark-matrix.yml
+    if: ${{ github.event.inputs.run_b200_cute == 'true' }}
+    with:
+      max-runners: 6
+      kernels: ${{ github.event.inputs.kernels_cute }}
+
+  run-b200-cute:
+    needs: gen-matrix-b200-cute
+    uses: ./.github/workflows/benchmark.yml
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.gen-matrix-b200-cute.outputs.matrix) }}
+    permissions:
+      id-token: write
+      contents: read
+    with:
+      runner: linux.dgx.b200
+      python-version: "3.12"
+      image: nvidia/cuda:13.1.0-devel-ubuntu24.04
+      runtime-version: cu130
+      container-options: --gpus all
+      alias: b200_cute
+      backend: cute
+      kernels: ${{ matrix.kernels }}
+      env-vars: ${{ github.event.inputs.env_vars }}
+      custom-args: ${{ github.event.inputs.custom_args }}
+
   gen-matrix-mi350x:
     uses: ./.github/workflows/compute-benchmark-matrix.yml
     if: ${{ github.event.inputs.run_mi350x == 'true' }}
@@ -139,7 +177,7 @@ jobs:
 
   trigger-docs-deploy:
     if: always()
-    needs: [run-b200, run-h100, run-mi350x, run-tpu]
+    needs: [run-b200, run-b200-cute, run-h100, run-mi350x, run-tpu]
     runs-on: ubuntu-latest
     permissions:
       actions: write
