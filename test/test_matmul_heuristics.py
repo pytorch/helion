@@ -18,7 +18,16 @@ from helion.autotuner.matmul_heuristics import _RUNTIME_HEURISTICS_PATH
 from helion.autotuner.matmul_heuristics import matmul_heuristic_seed_configs
 from helion.autotuner.matmul_heuristics import matmul_heuristic_seed_configs_for_kernel
 
-_SHAPE_BUCKET_KEYS = {"aspect", "dtype", "k_bin", "m_bin", "n_bin"}
+_SHAPE_BUCKET_KEYS = {
+    "aspect",
+    "dtype",
+    "k_bucket",
+    "m_bucket",
+    "n_bucket",
+    "k_value",
+    "m_value",
+    "n_value",
+}
 
 
 def _clear_heuristic_caches() -> None:
@@ -134,6 +143,18 @@ def test_matmul_heuristic_rules_have_unique_shape_buckets() -> None:
     for rule in data["rules"]:
         assert set(rule) == {"kernel_class", "shape_bucket", "templates"}
         assert set(rule["shape_bucket"]).issubset(_SHAPE_BUCKET_KEYS)
+        for key in ("k_bucket", "m_bucket", "n_bucket"):
+            value = rule["shape_bucket"].get(key)
+            if value is not None:
+                values = value if isinstance(value, list) else [value]
+                assert all(isinstance(item, str) for item in values)
+                assert all(item.startswith("(") for item in values)
+                assert all(item.endswith(("]", ")")) for item in values)
+        for key in ("k_value", "m_value", "n_value"):
+            value = rule["shape_bucket"].get(key)
+            if value is not None:
+                values = value if isinstance(value, list) else [value]
+                assert all(isinstance(item, int) for item in values)
         assert rule["templates"]
         assert all("template" not in template for template in rule["templates"])
 
@@ -166,9 +187,9 @@ def test_matmul_heuristics_prefer_more_specific_shape_bucket(tmp_path) -> None:
                         "shape_bucket": {
                             "aspect": "skinny_m",
                             "dtype": "fp16_bf16",
-                            "k_bin": "<=32768",
-                            "m_bin": "<=4",
-                            "n_bin": ">4096",
+                            "k_bucket": "(4096,32768]",
+                            "m_bucket": "(0,4]",
+                            "n_bucket": "(4096,inf)",
                         },
                         "templates": [
                             {
@@ -204,6 +225,150 @@ def test_matmul_heuristics_prefer_more_specific_shape_bucket(tmp_path) -> None:
         [8, 64, 256],
         [16, 64, 64],
     ]
+
+
+def test_matmul_heuristics_prefer_exact_shape_bucket(tmp_path) -> None:
+    config_spec = _matmul_config_spec()
+    x = torch.empty((4, 16384), dtype=torch.bfloat16)
+    y = torch.empty((16384, 8192), dtype=torch.bfloat16)
+    heuristics_path = tmp_path / "matmul_heuristics.json"
+    heuristics_path.write_text(
+        json.dumps(
+            {
+                "rules": [
+                    {
+                        "kernel_class": "matmul",
+                        "shape_bucket": {
+                            "aspect": "skinny_m",
+                            "dtype": "fp16_bf16",
+                            "k_bucket": "(4096,32768]",
+                            "m_bucket": "(0,4]",
+                            "n_bucket": "(4096,inf)",
+                        },
+                        "templates": [{"block_sizes": [8, 64, 256]}],
+                    },
+                    {
+                        "kernel_class": "matmul",
+                        "shape_bucket": {
+                            "aspect": "skinny_m",
+                            "dtype": "fp16_bf16",
+                            "k_bucket": "(4096,32768]",
+                            "m_bucket": "(0,4]",
+                            "n_bucket": "(4096,inf)",
+                            "k_value": 16384,
+                            "m_value": 4,
+                            "n_value": 8192,
+                        },
+                        "templates": [{"block_sizes": [16, 64, 64]}],
+                    },
+                ]
+            }
+        )
+    )
+
+    with patch.dict(
+        os.environ,
+        {
+            "HELION_AUTOTUNE_MATMUL_HEURISTICS": "1",
+            "HELION_AUTOTUNE_MATMUL_HEURISTICS_PATH": str(heuristics_path),
+        },
+    ):
+        _clear_heuristic_caches()
+        try:
+            seeds = matmul_heuristic_seed_configs(
+                (x, y),
+                config_spec=config_spec,
+                max_configs=2,
+            )
+        finally:
+            _clear_heuristic_caches()
+
+    assert [dict(seed)["block_sizes"] for seed in seeds] == [
+        [16, 64, 64],
+        [8, 64, 256],
+    ]
+
+
+def test_matmul_heuristics_match_list_bucket_values(tmp_path) -> None:
+    config_spec = _matmul_config_spec()
+    heuristics_path = tmp_path / "matmul_heuristics.json"
+    heuristics_path.write_text(
+        json.dumps(
+            {
+                "rules": [
+                    {
+                        "kernel_class": "matmul",
+                        "shape_bucket": {
+                            "aspect": "skinny_m",
+                            "dtype": "fp16_bf16",
+                            "k_bucket": "(4096,32768]",
+                            "m_bucket": ["(0,4]", "(4,8]"],
+                            "n_bucket": "(4096,inf)",
+                        },
+                        "templates": [{"block_sizes": [8, 64, 256]}],
+                    }
+                ]
+            }
+        )
+    )
+
+    with patch.dict(
+        os.environ,
+        {
+            "HELION_AUTOTUNE_MATMUL_HEURISTICS": "1",
+            "HELION_AUTOTUNE_MATMUL_HEURISTICS_PATH": str(heuristics_path),
+        },
+    ):
+        _clear_heuristic_caches()
+        try:
+            matched_low = matmul_heuristic_seed_configs(
+                (
+                    torch.empty((4, 8192), dtype=torch.bfloat16),
+                    torch.empty((8192, 8192), dtype=torch.bfloat16),
+                ),
+                config_spec=config_spec,
+                max_configs=1,
+            )
+            matched_high = matmul_heuristic_seed_configs(
+                (
+                    torch.empty((8, 8192), dtype=torch.bfloat16),
+                    torch.empty((8192, 8192), dtype=torch.bfloat16),
+                ),
+                config_spec=config_spec,
+                max_configs=1,
+            )
+            unmatched = matmul_heuristic_seed_configs(
+                (
+                    torch.empty((16, 8192), dtype=torch.bfloat16),
+                    torch.empty((8192, 8192), dtype=torch.bfloat16),
+                ),
+                config_spec=config_spec,
+                max_configs=1,
+            )
+        finally:
+            _clear_heuristic_caches()
+
+    assert dict(matched_low[0])["block_sizes"] == [8, 64, 256]
+    assert dict(matched_high[0])["block_sizes"] == [8, 64, 256]
+    assert unmatched == []
+
+
+def test_matmul_dimension_buckets_are_exact_intervals() -> None:
+    assert matmul_heuristics._matmul_shape_bucket_from_values(
+        4,
+        8192,
+        16384,
+        dtype_family="fp16_bf16",
+    ) == {
+        "aspect": "skinny_m",
+        "dtype": "fp16_bf16",
+        "k_bucket": "(4096,32768]",
+        "m_bucket": "(0,4]",
+        "n_bucket": "(4096,inf)",
+        "k_value": 16384,
+        "m_value": 4,
+        "n_value": 8192,
+    }
 
 
 def test_matmul_kernel_detection_uses_matmul_facts() -> None:
@@ -259,6 +424,110 @@ def test_dense_matmul_square_aot_seed_buckets() -> None:
         assert [dict(seed)["block_sizes"] for seed in seeds] == expected_block_sizes
 
 
+def test_dense_matmul_densified_seed_buckets() -> None:
+    cases = (
+        (
+            {
+                "aspect": "balanced",
+                "dtype": "fp16_bf16",
+                "k_bucket": "(4096,32768]",
+                "m_bucket": "(4096,inf)",
+                "n_bucket": "(4096,inf)",
+            },
+            [[256, 256, 32], [256, 256, 32], [256, 256, 32]],
+        ),
+        (
+            {
+                "aspect": "balanced",
+                "dtype": "fp16_bf16",
+                "k_bucket": "(4096,32768]",
+                "m_bucket": "(1024,4096]",
+                "n_bucket": "(1024,4096]",
+            },
+            [[128, 512, 32]],
+        ),
+        (
+            {
+                "aspect": "balanced",
+                "dtype": "fp16_bf16",
+                "k_bucket": "(1024,4096]",
+                "m_bucket": "(1024,4096]",
+                "n_bucket": "(4096,inf)",
+            },
+            [[256, 256, 32]],
+        ),
+        (
+            {
+                "aspect": "balanced",
+                "dtype": "fp16_bf16",
+                "k_bucket": "(1024,4096]",
+                "m_bucket": "(4096,inf)",
+                "n_bucket": "(1024,4096]",
+            },
+            [[256, 256, 32]],
+        ),
+    )
+
+    config_spec = _matmul_config_spec()
+    for shape_bucket, expected_block_sizes in cases:
+        seeds = matmul_heuristic_seed_configs(
+            (),
+            config_spec=config_spec,
+            max_configs=10,
+            kernel_class="matmul",
+            shape_bucket=shape_bucket,
+        )
+
+        assert [dict(seed)["block_sizes"] for seed in seeds] == expected_block_sizes
+
+
+def test_dense_matmul_exact_ci_seed_buckets() -> None:
+    cases = (
+        (
+            {
+                "aspect": "skinny_n",
+                "dtype": "fp16_bf16",
+                "k_bucket": "(512,1024]",
+                "m_bucket": "(1024,4096]",
+                "n_bucket": "(512,1024]",
+                "k_value": 1024,
+                "m_value": 4096,
+                "n_value": 1024,
+            },
+            [256, 128, 64],
+            [64],
+        ),
+        (
+            {
+                "aspect": "balanced",
+                "dtype": "fp16_bf16",
+                "k_bucket": "(1024,4096]",
+                "m_bucket": "(1024,4096]",
+                "n_bucket": "(1024,4096]",
+                "k_value": 2048,
+                "m_value": 2048,
+                "n_value": 4096,
+            },
+            [256, 256, 64],
+            [4],
+        ),
+    )
+
+    config_spec = _matmul_config_spec()
+    for shape_bucket, expected_block_sizes, expected_l2 in cases:
+        seeds = matmul_heuristic_seed_configs(
+            (),
+            config_spec=config_spec,
+            max_configs=10,
+            kernel_class="matmul",
+            shape_bucket=shape_bucket,
+        )
+
+        seed = dict(seeds[0])
+        assert seed["block_sizes"] == expected_block_sizes
+        assert seed["l2_groupings"] == expected_l2
+
+
 def test_matmul_kernel_detection_skips_multiple_matmuls() -> None:
     config_spec = _matmul_config_spec(
         reduction_loops=[object()],
@@ -304,6 +573,145 @@ def test_matmul_family_uses_kernel_class_in_rule_lookup() -> None:
     assert int4_seed["l2_groupings"] == [2]
     assert fp4_seed["block_sizes"] == [8, 128, 128]
     assert fp4_seed["l2_groupings"] == [1]
+
+
+def test_quantized_matmul_expanded_seed_buckets() -> None:
+    cases = (
+        (
+            "matmul_fp4",
+            {
+                "aspect": "skinny_n",
+                "dtype": "fp16_bf16",
+                "k_bucket": "(1024,4096]",
+                "m_bucket": "(1024,4096]",
+                "n_bucket": "(0,64]",
+            },
+            [128, 32, 16],
+            [2],
+        ),
+        (
+            "matmul_fp4",
+            {
+                "aspect": "skinny_k",
+                "dtype": "fp16_bf16",
+                "k_bucket": "(64,128]",
+                "m_bucket": "(1024,4096]",
+                "n_bucket": "(1024,4096]",
+            },
+            [8, 128, 128],
+            [1],
+        ),
+        (
+            "matmul_int16",
+            {
+                "aspect": "skinny_k",
+                "dtype": "fp16_bf16",
+                "k_bucket": "(128,256]",
+                "m_bucket": "(1024,4096]",
+                "n_bucket": "(1024,4096]",
+            },
+            [256, 128, 64],
+            [8],
+        ),
+        (
+            "matmul_int4",
+            {
+                "aspect": "skinny_n",
+                "dtype": "fp16_bf16",
+                "k_bucket": "(1024,4096]",
+                "m_bucket": "(1024,4096]",
+                "n_bucket": "(512,1024]",
+            },
+            [16, 128, 128],
+            [1],
+        ),
+    )
+
+    config_spec = _matmul_config_spec()
+    for kernel_class, shape_bucket, expected_block_sizes, expected_l2 in cases:
+        seeds = matmul_heuristic_seed_configs(
+            (),
+            config_spec=config_spec,
+            max_configs=10,
+            kernel_class=kernel_class,
+            shape_bucket=shape_bucket,
+        )
+
+        seed = dict(seeds[0])
+        assert seed["block_sizes"] == expected_block_sizes
+        assert seed["l2_groupings"] == expected_l2
+
+
+def test_int4_matmul_exact_ci_seed_buckets() -> None:
+    cases = (
+        (
+            {
+                "aspect": "skinny_m",
+                "dtype": "fp16_bf16",
+                "k_bucket": "(4096,32768]",
+                "m_bucket": "(0,4]",
+                "n_bucket": "(1024,4096]",
+                "k_value": 8192,
+                "m_value": 1,
+                "n_value": 1280,
+            },
+            [1024, 1, 16],
+            [64],
+        ),
+        (
+            {
+                "aspect": "skinny_n",
+                "dtype": "fp16_bf16",
+                "k_bucket": "(4096,32768]",
+                "m_bucket": "(4096,inf)",
+                "n_bucket": "(1024,4096]",
+                "k_value": 8192,
+                "m_value": 65536,
+                "n_value": 1280,
+            },
+            [16, 128, 256],
+            [32],
+        ),
+    )
+
+    config_spec = _matmul_config_spec()
+    for shape_bucket, expected_block_sizes, expected_l2 in cases:
+        seeds = matmul_heuristic_seed_configs(
+            (),
+            config_spec=config_spec,
+            max_configs=10,
+            kernel_class="matmul_int4",
+            shape_bucket=shape_bucket,
+        )
+
+        seed = dict(seeds[0])
+        assert seed["block_sizes"] == expected_block_sizes
+        assert seed["l2_groupings"] == expected_l2
+
+
+def test_int4_matmul_bad_ffn_w2_shapes_fall_back() -> None:
+    config_spec = _matmul_config_spec()
+
+    for m_value in (1, 4):
+        assert (
+            matmul_heuristic_seed_configs(
+                (),
+                config_spec=config_spec,
+                max_configs=10,
+                kernel_class="matmul_int4",
+                shape_bucket={
+                    "aspect": "skinny_m",
+                    "dtype": "fp16_bf16",
+                    "k_bucket": "(1024,4096]",
+                    "m_bucket": "(0,4]",
+                    "n_bucket": "(4096,inf)",
+                    "k_value": 3584,
+                    "m_value": m_value,
+                    "n_value": 8192,
+                },
+            )
+            == []
+        )
 
 
 def test_matmul_heuristics_skip_non_matching_shape() -> None:

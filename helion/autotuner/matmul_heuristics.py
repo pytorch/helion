@@ -8,8 +8,10 @@ B200, seeded from measured configs stored in
 additional initial-population candidates; regular autotuning still validates
 and benchmarks them before selecting a config.
 
-Shape buckets may be partial. When multiple rules match, rules with more
-matching bucket fields are used first and JSON order breaks ties.
+Shape buckets may be partial. Dimension buckets are exact interval labels, not
+cumulative predicates. Rules may also include exact dimension values for
+measured shapes. When multiple rules match, rules with more matching bucket
+fields are used first and JSON order breaks ties.
 """
 
 from __future__ import annotations
@@ -49,12 +51,23 @@ _QUANTIZED_KERNEL_FINGERPRINTS: tuple[tuple[str, frozenset[str]], ...] = (
     ("matmul_fp4", frozenset({"e2m1", "fp4", "nvfp4"})),
     ("matmul_int4", frozenset({"int4", "pack_int4", "unpack_int4"})),
 )
-_MATMUL_BINS = {
+_MATMUL_BUCKET_BOUNDS = {
     "m": [4, 8, 16, 64, 128, 256, 512, 1024, 4096],
     "n": [64, 128, 256, 512, 1024, 4096],
     "k": [64, 128, 256, 512, 1024, 4096, 32768],
 }
-_SHAPE_BUCKET_KEYS = frozenset({"aspect", "dtype", "k_bin", "m_bin", "n_bin"})
+_SHAPE_BUCKET_KEYS = frozenset(
+    {
+        "aspect",
+        "dtype",
+        "k_bucket",
+        "m_bucket",
+        "n_bucket",
+        "k_value",
+        "m_value",
+        "n_value",
+    }
+)
 
 
 def _env_flag_enabled(name: str, *, default: bool) -> bool:
@@ -135,13 +148,15 @@ def _dtype_family_from_dtype(dtype: object) -> str:
     return "other"
 
 
-def _bin_le(value: int | None, bins: Sequence[int]) -> str:
+def _dimension_interval_bucket(value: int | None, bounds: Sequence[int]) -> str:
     if value is None:
         return "unknown"
-    for bound in bins:
-        if value <= bound:
-            return f"<={bound}"
-    return f">{bins[-1]}"
+    lower = 0
+    for upper in bounds:
+        if value <= upper:
+            return f"({lower},{upper}]"
+        lower = upper
+    return f"({bounds[-1]},inf)"
 
 
 def _matmul_shape(shapes: Sequence[tuple[int, ...]]) -> tuple[int, int, int] | None:
@@ -245,9 +260,12 @@ def _matmul_shape_bucket_from_values(
     return {
         "aspect": _aspect_bucket(m, n, k),
         "dtype": dtype_family,
-        "k_bin": _bin_le(k, _MATMUL_BINS["k"]),
-        "m_bin": _bin_le(m, _MATMUL_BINS["m"]),
-        "n_bin": _bin_le(n, _MATMUL_BINS["n"]),
+        "k_bucket": _dimension_interval_bucket(k, _MATMUL_BUCKET_BOUNDS["k"]),
+        "m_bucket": _dimension_interval_bucket(m, _MATMUL_BUCKET_BOUNDS["m"]),
+        "n_bucket": _dimension_interval_bucket(n, _MATMUL_BUCKET_BOUNDS["n"]),
+        "k_value": k,
+        "m_value": m,
+        "n_value": n,
     }
 
 
@@ -286,7 +304,14 @@ def _shape_bucket_matches(
     rule_bucket: dict[str, object],
     query_bucket: dict[str, object],
 ) -> bool:
-    return all(query_bucket.get(key) == value for key, value in rule_bucket.items())
+    for key, value in rule_bucket.items():
+        query_value = query_bucket.get(key)
+        if isinstance(value, list):
+            if query_value not in value:
+                return False
+        elif query_value != value:
+            return False
+    return True
 
 
 def _rules_for_bucket(
