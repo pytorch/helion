@@ -31,6 +31,7 @@ from .ast_extension import statement_from_string
 from .ast_read_writes import ReadWrites
 from .ast_read_writes import ast_rename
 from .ast_read_writes import dead_assignment_elimination
+from .ast_read_writes import dead_lane_loop_elimination
 from .backend_registry import all_reserved_launch_param_names
 from .compile_environment import CompileEnvironment
 from .host_function import HostFunction
@@ -1455,6 +1456,9 @@ class DeviceFunction:
             rw = ReadWrites.from_list([*self.preamble, *self.body])
             dead_assignment_elimination(self.body, self.dce_vars, 1, rw)
             dead_assignment_elimination(self.preamble, self.dce_vars, 1, rw)
+            dead_lane_loop_elimination(self.body)
+            dead_lane_loop_elimination(self.preamble)
+        rw = ReadWrites.from_list([*self.preamble, *self.body])
 
         # Drop unused args, but keep placeholder_args (fusion-injected tensor
         # pointers referenced only by placeholder strings, not the AST body).

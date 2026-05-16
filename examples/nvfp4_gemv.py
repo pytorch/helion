@@ -16,6 +16,7 @@ Two variants are provided:
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
+from typing import cast
 
 import cutlass
 from cutlass import Int32
@@ -42,22 +43,22 @@ if TYPE_CHECKING:
     from cutlass._mlir import ir
 
 BF16IN_CONFIG = helion.Config(
-    block_sizes=[1],
+    block_sizes=[1, 128],
     indexing=["pointer"] * 8,
     load_eviction_policies=["first", "last", "last", "last", "last", "first"],
-    num_threads=[1],
-    num_warps=1,
+    num_threads=[1, 128],
+    num_warps=4,
     num_stages=1,
     pid_type="flat",
     range_warp_specializes=[None],
 )
 
 FP4IN_CONFIG = helion.Config(
-    block_sizes=[1],
+    block_sizes=[1, 128],
     indexing=["pointer"] * 5,
     load_eviction_policies=["first", "last", "", "last"],
-    num_threads=[1],
-    num_warps=1,
+    num_threads=[1, 64],
+    num_warps=2,
     num_stages=3,
     pid_type="flat",
     range_warp_specializes=[None],
@@ -76,7 +77,11 @@ def swizzled_scale_numel(rows: int, cols: int) -> int:
     return _round_up(rows, 128) * _round_up(cols, 4)
 
 
-def swizzled_scale_offsets(row: Tensor, col: Tensor, cols: int) -> Tensor:
+def swizzled_scale_offsets(
+    row: Tensor | int,
+    col: Tensor | int,
+    cols: int,
+) -> Tensor | int:
     num_col_tiles = _ceil_div(cols, 4)
     tile_offset = ((row // 128) * num_col_tiles + col // 4) * 512
     return tile_offset + (row % 32) * 16 + ((row % 128) // 32) * 4 + col % 4
@@ -99,14 +104,16 @@ def swizzle_fp8_scales(scales: Tensor) -> Tensor:
     )
     row = torch.arange(rows, device=logical_scales.device, dtype=torch.int64)[:, None]
     col = torch.arange(cols, device=logical_scales.device, dtype=torch.int64)[None, :]
-    out[swizzled_scale_offsets(row, col, cols).reshape(-1)] = logical_scales.reshape(-1)
+    offsets = cast("Tensor", swizzled_scale_offsets(row, col, cols))
+    out[offsets.reshape(-1)] = logical_scales.reshape(-1)
     return out
 
 
 def unswizzle_fp8_scales(scales: Tensor, rows: int, cols: int) -> Tensor:
     row = torch.arange(rows, device=scales.device, dtype=torch.int64)[:, None]
     col = torch.arange(cols, device=scales.device, dtype=torch.int64)[None, :]
-    return scales.reshape(-1)[swizzled_scale_offsets(row, col, cols)]
+    offsets = cast("Tensor", swizzled_scale_offsets(row, col, cols))
+    return scales.reshape(-1)[offsets]
 
 
 def _check_swizzled_scales(
@@ -505,25 +512,35 @@ def _nvfp4_gemv_bf16in_kernel(
 ) -> Tensor:
     M, K_groups, _ = weight_fp4x2.shape
     block_m = hl.register_block_size(1, 8)
+    block_k = hl.register_block_size(16, K_groups)
 
     for tile_m in hl.tile(M, block_size=block_m):
-        scale_j = hl.arange(K_groups)
-        acc = hl.zeros([tile_m], dtype=torch.float32)
-        contrib = hl.zeros([tile_m, K_groups], dtype=torch.float32)
-        for byte in hl.static_range(8):
-            weight_lo, weight_hi = hl.float4_e2m1fn_x2_to_float32(
-                weight_fp4x2[tile_m, :, byte]
+        row = tile_m.begin
+        acc = hl.zeros([], dtype=torch.float32)
+        for tile_k in hl.tile(K_groups, block_size=block_k):
+            contrib = hl.zeros([tile_k], dtype=torch.float32)
+            for byte in hl.static_range(8):
+                weight_lo, weight_hi = hl.float4_e2m1fn_x2_to_float32(
+                    weight_fp4x2[row, tile_k, byte]
+                )
+                contrib = contrib + weight_lo * x_values[tile_k, byte * 2].to(
+                    torch.float32
+                )
+                contrib = contrib + weight_hi * x_values[tile_k, byte * 2 + 1].to(
+                    torch.float32
+                )
+            scale_offsets = swizzled_scale_offsets(
+                row,
+                tile_k.index,
+                K_groups,
             )
-            contrib = contrib + weight_lo * x_values[:, byte * 2].to(torch.float32)
-            contrib = contrib + weight_hi * x_values[:, byte * 2 + 1].to(torch.float32)
-        scale_offsets = swizzled_scale_offsets(
-            tile_m.index[:, None],
-            scale_j[None, :],
-            K_groups,
-        )
-        scale = weight_scale[scale_offsets].to(torch.float32)
-        acc = acc + (contrib * scale).sum(-1)
-        out[tile_m] = (acc * alpha).to(torch.bfloat16)
+            scale = hl.load(
+                weight_scale,
+                [scale_offsets],
+                extra_mask=tile_k.index < K_groups,
+            ).to(torch.float32)
+            acc = acc + (contrib * scale).sum()
+        out[row] = (acc * alpha).to(torch.bfloat16)
     return out
 
 
@@ -538,31 +555,41 @@ def _nvfp4_gemv_fp4in_kernel(
 ) -> Tensor:
     M, K_groups, _ = weight_fp4x2.shape
     block_m = hl.register_block_size(1, 8)
+    block_k = hl.register_block_size(16, K_groups)
 
     for tile_m in hl.tile(M, block_size=block_m):
-        scale_j = hl.arange(K_groups)
-        acc = hl.zeros([tile_m], dtype=torch.float32)
-        contrib = hl.zeros([tile_m, K_groups], dtype=torch.float32)
-        for byte in hl.static_range(8):
-            weight_lo, weight_hi = hl.float4_e2m1fn_x2_to_float32(
-                weight_fp4x2[tile_m, :, byte]
+        row = tile_m.begin
+        acc = hl.zeros([], dtype=torch.float32)
+        for tile_k in hl.tile(K_groups, block_size=block_k):
+            contrib = hl.zeros([tile_k], dtype=torch.float32)
+            for byte in hl.static_range(8):
+                weight_lo, weight_hi = hl.float4_e2m1fn_x2_to_float32(
+                    weight_fp4x2[row, tile_k, byte]
+                )
+                x_lo, x_hi = hl.float4_e2m1fn_x2_to_float32(x_fp4x2[tile_k, byte])
+                contrib = contrib + weight_lo * x_lo + weight_hi * x_hi
+            weight_scale_offsets = swizzled_scale_offsets(
+                row,
+                tile_k.index,
+                K_groups,
             )
-            x_lo, x_hi = hl.float4_e2m1fn_x2_to_float32(x_fp4x2[:, byte])
-            contrib = contrib + weight_lo * x_lo + weight_hi * x_hi
-        weight_scale_offsets = swizzled_scale_offsets(
-            tile_m.index[:, None],
-            scale_j[None, :],
-            K_groups,
-        )
-        x_scale_offsets = swizzled_scale_offsets(
-            scale_j * 0,
-            scale_j,
-            K_groups,
-        )
-        scale = weight_scale[weight_scale_offsets].to(torch.float32)
-        scale = scale * x_scale[x_scale_offsets].to(torch.float32)
-        acc = acc + (contrib * scale).sum(-1)
-        out[tile_m] = (acc * alpha).to(torch.bfloat16)
+            x_scale_offsets = swizzled_scale_offsets(
+                tile_k.index * 0,
+                tile_k.index,
+                K_groups,
+            )
+            scale = hl.load(
+                weight_scale,
+                [weight_scale_offsets],
+                extra_mask=tile_k.index < K_groups,
+            ).to(torch.float32)
+            scale = scale * hl.load(
+                x_scale,
+                [x_scale_offsets],
+                extra_mask=tile_k.index < K_groups,
+            ).to(torch.float32)
+            acc = acc + (contrib * scale).sum()
+        out[row] = (acc * alpha).to(torch.bfloat16)
     return out
 
 

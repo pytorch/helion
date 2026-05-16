@@ -16,10 +16,14 @@ import sympy
 import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.fx import Graph
+from torch.fx.immutable_collections import immutable_list
 
 import helion
 from helion import exc
 from helion._compiler.ast_extension import expr_from_string
+from helion._compiler.ast_extension import statement_from_string
+from helion._compiler.ast_read_writes import dead_assignment_elimination
+from helion._compiler.ast_read_writes import dead_lane_loop_elimination
 from helion._compiler.aten_lowering import _pallas_argreduce
 from helion._compiler.aten_lowering import _should_use_cute_argreduce_lowering
 from helion._compiler.aten_lowering import _triton_argreduce
@@ -9040,6 +9044,53 @@ class TestCuteLowerings(unittest.TestCase):
         with patch.object(CompileEnvironment, "current", return_value=env):
             self.assertEqual(ast.unparse(_lane_loop_iter(8)), "range(8)")
             self.assertEqual(ast.unparse(_lane_loop_iter(9)), "range(9)")
+
+    def test_dead_lane_loop_elimination_splices_invariant_loop(self) -> None:
+        grid = DeviceGridState(
+            strategy=_FakeLoopStrategy([0]),
+            block_id_to_info={},
+            lane_setup_statements=[
+                statement_from_string("indices_0 = synthetic_lane_0")
+            ],
+        )
+        grid.add_lane_loop(0, "synthetic_lane_0", 4)
+        body = grid.wrap_body([statement_from_string("out = 1")])
+
+        dead_assignment_elimination(body, ["indices_0"])
+        self.assertTrue(dead_lane_loop_elimination(body))
+
+        code = ast.unparse(ast.Module(body=body, type_ignores=[]))
+        self.assertNotIn("for synthetic_lane_0", code)
+        self.assertNotIn("indices_0", code)
+        self.assertIn("out = 1", code)
+
+    def test_dead_lane_loop_elimination_preserves_live_lane_var(self) -> None:
+        grid = DeviceGridState(
+            strategy=_FakeLoopStrategy([0]),
+            block_id_to_info={},
+        )
+        grid.add_lane_loop(0, "synthetic_lane_0", 4)
+        body = grid.wrap_body([statement_from_string("out = synthetic_lane_0")])
+
+        self.assertFalse(dead_lane_loop_elimination(body))
+
+        code = ast.unparse(ast.Module(body=body, type_ignores=[]))
+        self.assertIn("for synthetic_lane_0 in range(4)", code)
+        self.assertIn("out = synthetic_lane_0", code)
+
+    def test_dead_lane_loop_elimination_skips_immutable_expr_lists(self) -> None:
+        stmt = statement_from_string("out = load(x)")
+        assert isinstance(stmt, ast.Assign)
+        assert isinstance(stmt.value, ast.Call)
+        object.__setattr__(stmt.value, "args", immutable_list(stmt.value.args))
+
+        body: list[ast.AST] = [stmt]
+
+        self.assertFalse(dead_lane_loop_elimination(body))
+        self.assertEqual(
+            ast.unparse(ast.Module(body=body, type_ignores=[])),
+            "out = load(x)",
+        )
 
     def test_create_loop_strategy_preserves_auto_threads_for_mma_candidate(
         self,

@@ -1666,34 +1666,52 @@ class TestExamples(RefEagerTestBase, TestCase):
             atol=1.0,
         )
 
-    @xfailIfCute("CuTe NVFP4 GEMM example is not supported yet")
-    @xfailIfPallas("NVFP4 is NVIDIA-specific")
+    @onlyBackends(["cute"])
+    @skipIfNotCUDA()
+    @skipIfCudaCapabilityLessThan(
+        (10, 0), reason="NVFP4 conversion instructions require Blackwell"
+    )
+    @skipIfRefEager("inline asm codegen is not available in ref eager mode")
     def test_nvfp4_gemm(self):
-        from examples.nvfp4_gemm import pack_fp4
-        from examples.nvfp4_gemm import quantize_fp4_e2m1
-        from examples.nvfp4_gemm import reference_nvfp4_matmul
+        mod = import_path(EXAMPLES_DIR / "nvfp4_gemm.py")
 
-        M, K, N = 256, 128, 256
+        M, K, N = 64, 128, 64
 
         A = torch.randn(M, K, dtype=torch.bfloat16, device=DEVICE)
         W = torch.randn(K, N, dtype=torch.bfloat16, device=DEVICE)
 
-        W_quantized = quantize_fp4_e2m1(W)
-        W_packed = pack_fp4(W_quantized)
+        W_quantized = mod.quantize_fp4_e2m1(W)
+        W_packed = mod.pack_fp4(W_quantized).view(torch.float4_e2m1fn_x2)
+        weight_scale = mod.make_fp8_scales((N, K // 16), DEVICE)
 
-        args = (A, W_packed)
-        expected = reference_nvfp4_matmul(A, W_packed)
-
-        check_example(
-            "nvfp4_gemm",
-            args,
+        result = mod.nvfp4_matmul(A, W_packed, weight_scale)
+        expected = mod.reference_nvfp4_matmul(A, W_packed, weight_scale)
+        torch.testing.assert_close(
+            result,
             expected,
-            fn_name="nvfp4_matmul",
-            block_sizes=[64, 64, 32],
-            num_warps=4,
-            num_stages=3,
-            rtol=2e-1,
             atol=1.0,
+            rtol=2e-1,
+        )
+
+        M, K, N = 128, 256, 256
+        A_packed = mod.make_random_fp4((M, K), DEVICE)
+        B_packed = mod.make_random_fp4((N, K), DEVICE)
+        B_packed_t = B_packed.T
+        scale_a = mod.make_fp8_scales((M, K // 16), DEVICE)
+        scale_b = mod.make_fp8_scales((N, K // 16), DEVICE)
+
+        result = mod.nvfp4_scaled_matmul(A_packed, B_packed_t, scale_a, scale_b)
+        expected = mod.reference_nvfp4_scaled_matmul(
+            A_packed,
+            B_packed_t,
+            scale_a,
+            scale_b,
+        )
+        torch.testing.assert_close(
+            result,
+            expected,
+            atol=1.0,
+            rtol=2e-1,
         )
 
     @onlyBackends(["cute"])

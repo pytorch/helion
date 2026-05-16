@@ -20,6 +20,7 @@ from .._compat import shape_env_size_hint
 from .ast_extension import create
 from .ast_extension import expr_from_string
 from .ast_extension import statement_from_string
+from .ast_read_writes import HELION_LANE_LOOP_VAR_ATTR
 from .compile_environment import CompileEnvironment
 from .compile_environment import _has_unbacked
 from .compile_environment import _to_sympy
@@ -72,6 +73,19 @@ def _lane_loop_iter(extent: int) -> ast.AST:
     # cutlass.range(_constexpr) miscompiles scalar matmul paths, so keep them
     # as ordinary Python loops.
     return expr_from_string(f"range({extent})")
+
+
+def _create_lane_loop(lane_var: str, extent: int, body: list[ast.AST]) -> ast.For:
+    loop = create(
+        ast.For,
+        target=create(ast.Name, id=lane_var, ctx=ast.Store()),
+        iter=_lane_loop_iter(extent),
+        body=body,
+        orelse=[],
+        type_comment=None,
+    )
+    setattr(loop, HELION_LANE_LOOP_VAR_ATTR, lane_var)
+    return loop
 
 
 @dataclasses.dataclass
@@ -172,16 +186,7 @@ class DeviceGridState(DeviceLoopOrGridState):
     def wrap_body(self, body: list[ast.AST]) -> list[ast.AST]:
         wrapped: list[ast.AST] = [*self.lane_setup_statements, *body]
         for lane_var, extent in reversed(self.lane_loops):
-            wrapped = [
-                create(
-                    ast.For,
-                    target=create(ast.Name, id=lane_var, ctx=ast.Store()),
-                    iter=_lane_loop_iter(extent),
-                    body=wrapped,
-                    orelse=[],
-                    type_comment=None,
-                )
-            ]
+            wrapped = [_create_lane_loop(lane_var, extent, wrapped)]
         return wrapped
 
 
@@ -198,16 +203,7 @@ class PersistentReductionState(DeviceLoopOrGridState):
     def wrap_body(self, body: list[ast.AST]) -> list[ast.AST]:
         wrapped: list[ast.AST] = [*self.lane_setup_statements, *body]
         for lane_var, extent in reversed(self.lane_loops):
-            wrapped = [
-                create(
-                    ast.For,
-                    target=create(ast.Name, id=lane_var, ctx=ast.Store()),
-                    iter=_lane_loop_iter(extent),
-                    body=wrapped,
-                    orelse=[],
-                    type_comment=None,
-                )
-            ]
+            wrapped = [_create_lane_loop(lane_var, extent, wrapped)]
         return wrapped
 
 
@@ -2153,7 +2149,8 @@ class CuteNDTileStrategy(NDTileStrategy):
         env = CompileEnvironment.current()
         dtype = env.index_type()
         block_sizes = self.block_size
-        body = user_body = []
+        user_body: list[ast.AST] = []
+        body: list[ast.AST] = user_body
         lane_loops = [
             (
                 self._lane_var_by_block[block_id],
@@ -2163,14 +2160,7 @@ class CuteNDTileStrategy(NDTileStrategy):
             if block_id in self._lane_var_by_block
         ]
         for lane_var, extent in reversed(lane_loops):
-            lane_for = create(
-                ast.For,
-                target=create(ast.Name, id=lane_var, ctx=ast.Store()),
-                iter=_lane_loop_iter(extent),
-                body=body,
-                orelse=[],
-                type_comment=None,
-            )
+            lane_for = _create_lane_loop(lane_var, extent, body)
             body = [lane_for]
         for_node: ast.For | None = None
         assert len(block_sizes) == len(block_ids)
@@ -2479,13 +2469,10 @@ class CuteFlattenedTileStrategy(FlattenedTileStrategy):
         body: list[ast.AST] = user_body
         user_body[:0] = lane_setup_statements
         if self._lane_var is not None:
-            lane_for = create(
-                ast.For,
-                target=create(ast.Name, id=self._lane_var, ctx=ast.Store()),
-                iter=expr_from_string(f"range({self._elements_per_thread})"),
-                body=body,
-                orelse=[],
-                type_comment=None,
+            lane_for = _create_lane_loop(
+                self._lane_var,
+                self._elements_per_thread,
+                body,
             )
             body = [lane_for]
         body[:0] = [
