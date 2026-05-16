@@ -31,7 +31,7 @@ on:
         # round-robin sharding with max-runners=13.
         default: "flash_attention,gdn_fwd_h,cross_entropy,grouped_gemm,gemm,welford,layer_norm-bwd,int4_gemm,softmax,layer_norm,mamba2_chunk_state,rms_norm-bwd,rope,rope-bwd,jsd,mamba2_chunk_scan,kl_div,rms_norm"
       kernels_tpu:
-        description: 'Comma-separated list of kernels to benchmark on TPU (examples-based; disjoint from `kernels`). Default is the dashboard-tracked subset; pass an explicit list for ad-hoc full-coverage runs.'
+        description: 'Comma-separated list of kernels to benchmark on TPU (examples-based; disjoint from `kernels`). Default is the dashboard-tracked subset; pass an explicit list, or `all` to run every kernel registered in benchmarks/run_tpu.py::KERNEL_MAPPINGS.'
         required: false
         type: string
         default: "flash_attention,bmm,gemm,welford,softmax,layer_norm,rms_norm,rms_norm-bwd,cross_entropy"
