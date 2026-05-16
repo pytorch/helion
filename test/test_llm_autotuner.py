@@ -378,6 +378,16 @@ class TestLLMGuidedSearch(TestCase):
         self.assertEqual(dict(best), dict(round1_cfg))
         self.assertEqual(dict(search.best.config), dict(round1_cfg))
 
+    def test_initial_llm_response_propagates_failure(self):
+        """Round 0 LLM future failures are not silently swallowed."""
+        import concurrent.futures
+
+        search = self._make_mock_search()
+        future: concurrent.futures.Future[str] = concurrent.futures.Future()
+        future.set_exception(RuntimeError("simulated provider 401"))
+        with self.assertRaisesRegex(RuntimeError, "simulated provider 401"):
+            search._wait_for_initial_llm_response(future)
+
 
 class TestLLMTransport(TestCase):
     """Tests for provider selection and HTTP payload translation."""

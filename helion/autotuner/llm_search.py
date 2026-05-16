@@ -74,7 +74,6 @@ if TYPE_CHECKING:
 # Keep system + initial prompt plus this many recent round-trip exchanges
 # to avoid exceeding LLM context limits on long sessions.
 _MAX_CONTEXT_ROUNDS = 3
-_EMPTY_LLM_RESPONSE = '{"configs": []}'
 _MAX_STAGNANT_ROUNDS = 2
 
 
@@ -501,13 +500,10 @@ class LLMGuidedSearch(PopulationBasedSearch):
         # Wait only after the seed batch so round 0 can hide some initial LLM latency.
         if future is None:
             return None
-        try:
-            return future.result(timeout=self.request_timeout_s)
-        except Exception:
-            self.log.warning(
-                "Round 0: initial LLM call failed, continuing with seed configs"
-            )
-            return None
+        # LLM failures are intentionally fatal: silently falling back to plain
+        # LFBO when the user opted into the LLM autotuner masks real config or
+        # connectivity bugs (e.g. wrong API key, missing mTLS cert).
+        return future.result(timeout=self.request_timeout_s)
 
     def _finalize_round(self, round_num: int) -> None:
         """Rebenchmark the current top configs and log the stabilized round summary."""
@@ -558,13 +554,9 @@ class LLMGuidedSearch(PopulationBasedSearch):
             f"{max(0, len(seed_configs) - 1)} random)"
         )
 
-        llm_future: concurrent.futures.Future[str] | None = None
-        try:
-            llm_future = self._call_llm_async(self._build_llm_messages())
-        except Exception:
-            self.log.warning(
-                "Round 0: could not start initial LLM call, continuing with seed configs"
-            )
+        # Failure to dispatch the initial LLM request is fatal (see
+        # _wait_for_initial_llm_response for the rationale).
+        llm_future = self._call_llm_async(self._build_llm_messages())
 
         if seed_configs:
             self._benchmark_and_ingest(seed_configs, generation=0, desc="Round 0 seed")
@@ -592,13 +584,8 @@ class LLMGuidedSearch(PopulationBasedSearch):
         """Run one post-seed refinement round and report whether search should stop."""
         # Build the next prompt from the stabilized prior round, then benchmark new configs.
         prompt = self._build_refinement_prompt(round_num)
-        try:
-            llm_response = self._call_llm(self._build_llm_messages(prompt))
-        except Exception:
-            self.log.warning(
-                f"Round {round_num}: LLM call failed, generating no new configs instead"
-            )
-            llm_response = _EMPTY_LLM_RESPONSE
+        # LLM failures are intentionally fatal (see _wait_for_initial_llm_response).
+        llm_response = self._call_llm(self._build_llm_messages(prompt))
 
         self._messages.append({"role": "user", "content": prompt})
         self._messages.append({"role": "assistant", "content": llm_response})
