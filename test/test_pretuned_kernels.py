@@ -17,6 +17,7 @@ import unittest
 
 import pytest
 import torch
+from torch._environment import is_fbcode
 import torch.nn.functional as F
 
 from helion._hardware import get_hardware_info
@@ -364,6 +365,10 @@ class TestPretunedKernelsPerformance(TestCase):
         if _under_xdist():
             raise unittest.SkipTest(
                 "Perf gating is unreliable under pytest-xdist GPU contention."
+            )
+        if is_fbcode():
+            raise unittest.SkipTest(
+                "Perf gating is unreliable under fbcode GPU contention/deadlines."
             )
 
     def _run_pretuned_kernel_perf(self, name: str) -> None:
