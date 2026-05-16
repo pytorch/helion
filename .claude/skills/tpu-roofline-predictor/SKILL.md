@@ -41,7 +41,10 @@ Steps 1, 2, and 3 are already documented end-to-end in the `tpu-test` skill, whi
 
 Two predictor-specific add-ons not in tpu-test:
 
-**Runner templates for msl-tpu-kernel kernels.** Use `scripts/llo_runner_gmm.py` and `scripts/llo_runner_rpa.py` as templates — single-config runners that produce one clean named dump and print `Avg latency: <X> us`. msl-tpu-kernel is rsync'd to `/mnt/hyperdisk/Code3/msl-tpu-kernel`; add it to `PYTHONPATH` in the kubectl exec command.
+**Runner templates for msl-tpu-kernel kernels.** Use `scripts/llo_runner_gmm.py` and `scripts/llo_runner_rpa.py` as templates — single-config runners that produce one clean named dump and print `Avg latency: <X> us`. msl-tpu-kernel lives at `/mnt/hyperdisk/Code3/msl-tpu-kernel/` and is symlinked into the other env roots (`/mnt/hyperdisk/msl-tpu-kernel`, `/mnt/hyperdisk/Code{2,4}/msl-tpu-kernel`). In any env, add it to `PYTHONPATH` in the kubectl exec command:
+```bash
+PYTHONPATH=<env_root>/msl-tpu-kernel:$PYTHONPATH python scripts/llo_runner_<X>.py ...
+```
 
 **Pair the dump with Pallas source** when archiving (this is what makes the entry directly useful for kernel-writing, not just historical performance data):
 
@@ -116,6 +119,7 @@ Verified on three prior outliers: rpa_decode/prefill/mixed and gmm_v2_M=4096 all
 - **emit_pipeline `--inner-loop-iters`**: even with static shapes, `pallas_loop_type=emit_pipeline` hides the inner K-loop inside the body. For attention with `block_n < S`, K = `S/block_n` (e.g. 16 for S=8192, block_n=512).
 - **bytes accounting for GMM at large M**: `--inputs` undercounts when RHS is re-read across N-tiles. Open TODO (see predictor docstring).
 - **bmm-style phi stalls**: ~10-15% of compute time goes to loop-carried-dep stalls the model doesn't capture. Open TODO; not worth fixing unless on critical path.
+- **Raw `pl.pallas_call` runners MUST `jax.jit` the entry point** — `pl.pallas_call(...)` itself doesn't jit; calling the returned function from Python re-traces on every invocation, paying full JAX dispatch overhead (100×–1000× slower for µs-scale kernels). Helion handles this internally; raw msl-tpu-kernel `example-collections/` runners (e.g. maxtext `ragged_mqa`) do NOT. If a measured-vs-predicted gap is implausibly large (~99% off), check whether the runner is jit-wrapped before blaming the predictor. Concrete: `ragged_mqa` B=32 S=4096 D=128 measured 153 ms un-jitted, 268 µs jitted (570× difference, same LLO).
 
 ## Tooling
 
