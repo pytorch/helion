@@ -116,6 +116,7 @@ class LLMSeededSearch(BaseSearch):
         llm_api_key: str | None = None,
         llm_request_timeout_s: float = DEFAULT_REQUEST_TIMEOUT_S,
         llm_effort_level: str | None = None,
+        llm_fast_mode: bool = False,
     ) -> None:
         super().__init__(kernel, args)
         if llm_max_rounds < 0:
@@ -142,6 +143,7 @@ class LLMSeededSearch(BaseSearch):
         self.llm_api_key = llm_api_key
         self.llm_request_timeout_s = llm_request_timeout_s
         self.llm_effort_level = llm_effort_level
+        self.llm_fast_mode = llm_fast_mode
 
         self.hybrid_stage_breakdown = None
 
@@ -202,6 +204,7 @@ class LLMSeededSearch(BaseSearch):
             api_key=self.llm_api_key,
             request_timeout_s=self.llm_request_timeout_s,
             effort_level=self.llm_effort_level,
+            fast_mode=self.llm_fast_mode,
         )
 
     def _second_stage_search_kwargs(self, *, seeded: bool) -> dict[str, object]:
@@ -416,6 +419,7 @@ class LLMSeededLFBOTreeSearch(LLMSeededSearch):
         llm_api_key: str | None = None,
         llm_request_timeout_s: float = DEFAULT_REQUEST_TIMEOUT_S,
         llm_effort_level: str | None = None,
+        llm_fast_mode: bool = False,
     ) -> None:
         super().__init__(
             kernel,
@@ -433,4 +437,5 @@ class LLMSeededLFBOTreeSearch(LLMSeededSearch):
             llm_api_key=llm_api_key,
             llm_request_timeout_s=llm_request_timeout_s,
             llm_effort_level=llm_effort_level,
+            llm_fast_mode=llm_fast_mode,
         )
