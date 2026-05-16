@@ -731,6 +731,37 @@ def _grpo_loss_shapes(
     return out
 
 
+def _epilogue_subtiling_residual_gelu_baseline(
+    x: torch.Tensor,
+    w: torch.Tensor,
+    bias: torch.Tensor,
+    residual: torch.Tensor,
+) -> torch.Tensor:
+    # PyTorch reference matching matmul_bias_residual_gelu_cast.
+    acc = x.float() @ w.float()
+    return torch.nn.functional.gelu(
+        acc * 1.25 + residual.float() * 0.5 + bias.float()
+    ).to(x.dtype)
+
+
+def _epilogue_subtiling_shapes(
+    num_shapes: int | None = None,
+) -> list[tuple[str, tuple[Any, ...]]]:
+    # (m, k, n) — matmul shape. Test uses 8192³; smaller shapes here keep
+    # autotune time tractable in the sweep.
+    configs = [(2048, 2048, 2048), (4096, 4096, 4096)]
+    if num_shapes is not None:
+        configs = configs[:num_shapes]
+    out: list[tuple[str, tuple[Any, ...]]] = []
+    for m, k, n in configs:
+        x = torch.randn(m, k, device=DEVICE, dtype=torch.bfloat16)
+        w = torch.randn(k, n, device=DEVICE, dtype=torch.bfloat16)
+        bias = torch.randn(n, device=DEVICE, dtype=torch.bfloat16)
+        residual = torch.randn(m, n, device=DEVICE, dtype=torch.bfloat16)
+        out.append((f"[{m},{k},{n}]", (x, w, bias, residual)))
+    return out
+
+
 # Kernel mappings for TPU/Pallas benchmarks.
 # Format: kernel_name -> (module_file, kernel_fn_name, baseline_fn, shapes_fn,
 #                         max_mismatch_pct)
@@ -928,6 +959,13 @@ KERNEL_MAPPINGS: dict[str, KernelMapping] = {
         "helion_grpo_loss",
         _grpo_loss_baseline,
         _grpo_loss_shapes,
+        None,
+    ),
+    "epilogue_subtiling": (
+        "epilogue_subtiling",
+        "matmul_bias_residual_gelu_cast",
+        _epilogue_subtiling_residual_gelu_baseline,
+        _epilogue_subtiling_shapes,
         None,
     ),
 }
