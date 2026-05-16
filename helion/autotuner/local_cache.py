@@ -60,6 +60,33 @@ class SavedBestConfig:
         return list(self.flat_config)
 
 
+def parse_cache_entry(raw: str) -> SavedBestConfig:
+    """Parse a serialized .best_config JSON string into a SavedBestConfig.
+
+    Raises:
+        ValueError: if the payload is malformed or missing required fields.
+    """
+    try:
+        data = json.loads(raw)
+        fields = data["key"]["fields"]
+        raw_flat = data.get("flat_config")
+        if isinstance(raw_flat, str):
+            flat_config: tuple[object, ...] | None = tuple(json.loads(raw_flat))
+        elif raw_flat is not None:
+            flat_config = tuple(raw_flat)
+        else:
+            flat_config = None
+        return SavedBestConfig(
+            hardware=fields.get("hardware", ""),
+            specialization_key=fields.get("specialization_key", ""),
+            config=Config.from_json(data["config"]),
+            config_spec_hash=fields.get("config_spec_hash", ""),
+            flat_config=flat_config,
+        )
+    except (KeyError, TypeError, json.JSONDecodeError) as e:
+        raise ValueError(f"malformed cache entry: {e}") from e
+
+
 def iter_cache_entries(
     cache_path: Path, *, max_scan: int | None = None
 ) -> Iterator[SavedBestConfig]:
@@ -74,26 +101,11 @@ def iter_cache_entries(
     files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
 
     for p in itertools.islice(files, max_scan):
+        # parse_cache_entry consolidates KeyError/TypeError/JSONDecodeError into ValueError.
         try:
-            data = json.loads(p.read_text())
-            fields = data["key"]["fields"]
-            raw_flat = data.get("flat_config")
-            if isinstance(raw_flat, str):
-                flat_config: tuple[object, ...] | None = tuple(json.loads(raw_flat))
-            elif raw_flat is not None:
-                flat_config = tuple(raw_flat)
-            else:
-                flat_config = None
-            yield SavedBestConfig(
-                hardware=fields.get("hardware", ""),
-                specialization_key=fields.get("specialization_key", ""),
-                config=Config.from_json(data["config"]),
-                config_spec_hash=fields.get("config_spec_hash", ""),
-                flat_config=flat_config,
-            )
-        except (OSError, KeyError, ValueError, TypeError) as e:
+            yield parse_cache_entry(p.read_text())
+        except (OSError, ValueError) as e:
             log.warning("Skipping corrupt cache file %s: %s", p.name, e)
-            continue
 
 
 class LocalAutotuneCache(AutotuneCacheBase):

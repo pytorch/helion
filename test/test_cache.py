@@ -767,6 +767,29 @@ class TestRemoteCache(RefEagerTestDisabled, TestCase):
         kernel(*args_a)
         self.assertEqual(counters["autotune"]["cache_hit"], 2)
 
+    def test_remote_put_payload_is_parseable(self):
+        """Bytes RemoteAutotuneCache.put sends are parseable by parse_cache_entry.
+
+        Guards against drift between LocalAutotuneCache.put's on-disk shape and
+        the format that warm-start consumers (_find_similar_cached_configs) expect.
+        """
+        from helion.autotuner.local_cache import parse_cache_entry
+
+        backend = InMemoryBackend()
+        kernel, args_a, _result_a, _args_b, _result_b = KERNELS["add"]()
+
+        kernel.reset()
+        kernel.settings.autotuner_fn = self._make_remote_cache_fn(backend)
+        kernel(*args_a)
+
+        self.assertEqual(len(backend.store), 1)
+        (raw,) = backend.store.values()
+        entry = parse_cache_entry(raw)
+        self.assertNotEqual(entry.hardware, "")
+        self.assertNotEqual(entry.specialization_key, "")
+        self.assertNotEqual(entry.config_spec_hash, "")
+        self.assertIsNotNone(entry.flat_config)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -12,6 +12,8 @@ from .local_cache import LocalAutotuneCache
 from .local_cache import StrictLocalAutotuneCache
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable
+
     from .base_search import BaseSearch
 
 log: logging.Logger = logging.getLogger(__name__)
@@ -34,6 +36,10 @@ class RemoteCacheBackend(abc.ABC):
     def put(self, key: str, data: str) -> None:
         """Store a JSON string under *key*."""
 
+    def list(self, max_results: int | None = None) -> Iterable[str]:
+        """Return cached JSON entries, newest first. Empty by default; override to enable warm-start from remote."""
+        return ()
+
 
 _ENV_VAR = "HELION_REMOTE_CACHE_BACKEND"
 
@@ -54,6 +60,13 @@ def _load_remote_backend() -> RemoteCacheBackend:
             f"{_ENV_VAR} must point to a RemoteCacheBackend subclass, got {cls!r}"
         )
     return cls()
+
+
+def _load_remote_backend_if_configured() -> RemoteCacheBackend | None:
+    """Return the remote backend if HELION_REMOTE_CACHE_BACKEND is set, else None."""
+    if not os.environ.get(_ENV_VAR):
+        return None
+    return _load_remote_backend()
 
 
 def _remote_get(backend: RemoteCacheBackend, cache_hash: str) -> str | None:
@@ -95,9 +108,13 @@ class RemoteAutotuneCache(LocalAutotuneCache):
 
     def put(self, config: Config) -> None:
         super().put(config)
-        cache_hash = self.key.stable_hash()
-        data = json.dumps({"config": config.to_json()})
-        _remote_put(self._backend, cache_hash, data)
+        # Ship the exact bytes super().put() just atomically wrote, so the
+        # remote payload mirrors the on-disk shape without re-serialising.
+        _remote_put(
+            self._backend,
+            self.key.stable_hash(),
+            self._get_local_cache_path().read_text(),
+        )
 
     def _get_cache_info_message(self) -> str:
         base = super()._get_cache_info_message()
@@ -123,9 +140,12 @@ class StrictRemoteAutotuneCache(StrictLocalAutotuneCache):
 
     def put(self, config: Config) -> None:
         super().put(config)
-        cache_hash = self.key.stable_hash()
-        data = json.dumps({"config": config.to_json()})
-        _remote_put(self._backend, cache_hash, data)
+        # Ship the exact bytes super().put() just atomically wrote.
+        _remote_put(
+            self._backend,
+            self.key.stable_hash(),
+            self._get_local_cache_path().read_text(),
+        )
 
     def _get_cache_info_message(self) -> str:
         base = super()._get_cache_info_message()
