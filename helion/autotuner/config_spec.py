@@ -1124,7 +1124,10 @@ class ConfigSpec:
             config["range_warp_specializes"] = range_warp_specializes
 
         if self.backend_name == "cute":
-            for key in _CUTE_IMPLICIT_DEFAULT_KEYS - provided_keys:
+            preserve_keys = self._cute_tcgen05_config.implicit_default_keys_to_preserve(
+                config
+            )
+            for key in _CUTE_IMPLICIT_DEFAULT_KEYS - provided_keys - preserve_keys:
                 config.pop(key, None)
 
         # Allow tunable parameter keys in addition to backend-supported keys.

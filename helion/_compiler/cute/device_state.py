@@ -53,6 +53,7 @@ class CuteTcgen05StoreValue:
     use_role_local_epi: bool = False
     use_tma_store_epilogue: bool = False
     tma_store_full_tiles_only: bool = False
+    partial_output_tma_store: bool = False
     ab_stage_count: int = 0
     acc_stage_count: int = 0
     skip_ab_producer_advance: bool = False

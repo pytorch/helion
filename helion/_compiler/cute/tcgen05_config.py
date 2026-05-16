@@ -90,6 +90,16 @@ from .tcgen05_constants import TCGEN05_SCHED_CONSUMER_WAIT_MODES
 from .tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
 from .tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
 from .tcgen05_constants import TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K
+from .tcgen05_constants import TCGEN05_TWO_CTA_EDGE_K_TAIL_CLC_AUX_TMA_ACC_STAGES
+from .tcgen05_constants import TCGEN05_TWO_CTA_EDGE_K_TAIL_CLC_AUX_TMA_K_RANGE_FLATTEN
+from .tcgen05_constants import (
+    TCGEN05_TWO_CTA_EDGE_K_TAIL_CLC_AUX_TMA_K_RANGE_MULTI_BUFFER,
+)
+from .tcgen05_constants import (
+    TCGEN05_TWO_CTA_EDGE_K_TAIL_CLC_AUX_TMA_K_RANGE_WARP_SPECIALIZE,
+)
+from .tcgen05_constants import TCGEN05_TWO_CTA_EDGE_K_TAIL_CLC_AUX_TMA_L2_GROUPING
+from .tcgen05_constants import TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_ACC_STAGES
 from .tcgen05_constants import TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_BLOCK_K
 from .tcgen05_constants import TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_BLOCK_N
 from .tcgen05_constants import TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_L2_GROUPING
@@ -345,8 +355,9 @@ class CuteTcgen05Config:
 
     def _aux_tma_search_enabled(self) -> bool:
         # The TMA aux producer is currently admitted only for the validated
-        # Target8-style edge+K-tail split: full tiles use TMA aux loads, while
-        # partial output tiles keep the existing predicated SIMT aux path.
+        # Target8-style edge+K-tail family. Exact-shape aux tensors use the
+        # aux-TMA producer on both full and partial-output tiles; non-staged
+        # aux operands remain on the direct guarded load path.
         constraints = self.cluster_m2_search_constraints
         return (
             self.exact_shape_aux_kernel_detected
@@ -369,6 +380,84 @@ class CuteTcgen05Config:
             Tcgen05PersistenceModel.CLC_PERSISTENT.value
         )
         return Config(**seed_config)
+
+    def _set_clc_aux_tma_edge_perf_knobs(self, config: dict[str, object]) -> None:
+        config["tcgen05_acc_stages"] = (
+            TCGEN05_TWO_CTA_EDGE_K_TAIL_CLC_AUX_TMA_ACC_STAGES
+        )
+        config["l2_groupings"] = [TCGEN05_TWO_CTA_EDGE_K_TAIL_CLC_AUX_TMA_L2_GROUPING]
+        range_knobs = self._clc_aux_tma_edge_range_knobs()
+        if range_knobs is not None:
+            (
+                config["range_flattens"],
+                config["range_multi_buffers"],
+                config["range_warp_specializes"],
+            ) = range_knobs
+
+    def _clc_aux_tma_wide_n_seed_config(self, clc_aux_tma_seed: Config) -> Config:
+        seed_config: dict[str, Any] = dict(clc_aux_tma_seed.config)
+        self._set_clc_aux_tma_edge_perf_knobs(seed_config)
+        return Config(**seed_config)
+
+    def _clc_aux_tma_edge_range_knobs(
+        self,
+    ) -> tuple[list[bool | None], list[bool | None], list[bool | None]] | None:
+        k_range_index = self._clc_aux_tma_matmul_k_range_index()
+        if k_range_index is None:
+            return None
+        range_flattens: list[bool | None] = [
+            None for _ in self.config_spec.range_flattens
+        ]
+        range_multi_buffers: list[bool | None] = [
+            None for _ in self.config_spec.range_multi_buffers
+        ]
+        range_warp_specializes: list[bool | None] = [
+            None for _ in self.config_spec.range_warp_specialize
+        ]
+        range_flattens[k_range_index] = (
+            TCGEN05_TWO_CTA_EDGE_K_TAIL_CLC_AUX_TMA_K_RANGE_FLATTEN
+        )
+        range_multi_buffers[k_range_index] = (
+            TCGEN05_TWO_CTA_EDGE_K_TAIL_CLC_AUX_TMA_K_RANGE_MULTI_BUFFER
+        )
+        range_warp_specializes[k_range_index] = (
+            TCGEN05_TWO_CTA_EDGE_K_TAIL_CLC_AUX_TMA_K_RANGE_WARP_SPECIALIZE
+        )
+        return range_flattens, range_multi_buffers, range_warp_specializes
+
+    def _clc_aux_tma_matmul_k_range_index(self) -> int | None:
+        k_range_indices: set[int] = set()
+        range_flattens_ids = self.config_spec.range_flattens.valid_block_ids()
+        range_multi_buffers_ids = self.config_spec.range_multi_buffers.valid_block_ids()
+        range_warp_specialize_ids = (
+            self.config_spec.range_warp_specialize.valid_block_ids()
+        )
+        for fact in self.config_spec.matmul_facts:
+            k_block_id = fact.k_block_id
+            if k_block_id is None:
+                continue
+            in_range_maps = (
+                k_block_id in range_flattens_ids,
+                k_block_id in range_multi_buffers_ids,
+                k_block_id in range_warp_specialize_ids,
+            )
+            if not any(in_range_maps):
+                continue
+            if not all(in_range_maps):
+                return None
+            range_index = self.config_spec.range_flattens.block_id_to_index(k_block_id)
+            if range_index != self.config_spec.range_multi_buffers.block_id_to_index(
+                k_block_id
+            ):
+                return None
+            if range_index != self.config_spec.range_warp_specialize.block_id_to_index(
+                k_block_id
+            ):
+                return None
+            k_range_indices.add(range_index)
+        if len(k_range_indices) != 1:
+            return None
+        return next(iter(k_range_indices))
 
     def _clc_aux_tma_narrow_n_seed_config(
         self, clc_aux_tma_seed: Config
@@ -399,6 +488,9 @@ class CuteTcgen05Config:
             TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_BLOCK_N,
             TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_BLOCK_K,
         ]
+        seed_config["tcgen05_acc_stages"] = (
+            TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_ACC_STAGES
+        )
         seed_config["l2_groupings"] = [TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_L2_GROUPING]
         return Config(**seed_config)
 
@@ -415,6 +507,9 @@ class CuteTcgen05Config:
                 seeds.append(aux_tma_seed)
                 clc_aux_tma_seed = self._clc_persistence_seed_config(aux_tma_seed)
                 if clc_aux_tma_seed is not None:
+                    clc_aux_tma_seed = self._clc_aux_tma_wide_n_seed_config(
+                        clc_aux_tma_seed
+                    )
                     seeds.append(clc_aux_tma_seed)
                     clc_aux_tma_narrow_n_seed = self._clc_aux_tma_narrow_n_seed_config(
                         clc_aux_tma_seed
@@ -438,7 +533,7 @@ class CuteTcgen05Config:
             config["tcgen05_cluster_m"] = 1
             return
         edge_k_tail_family = constraints.allow_edge_k_tail_family
-        is_narrow_clc_aux_tma = self._is_clc_aux_tma_narrow_n_config(config)
+        is_narrow_clc_aux_tma = self._is_clc_aux_tma_narrow_n_request(config)
         if edge_k_tail_family:
             block_sizes[2] = (
                 TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_BLOCK_K
@@ -467,12 +562,17 @@ class CuteTcgen05Config:
             # paths, but edge+K-tail candidates do not explore partially
             # mutated placement variants.
             config.update(tcgen05_two_cta_edge_k_tail_seed_overrides())
+            if self.aux_kernel_detected and self._has_any_matmul_fact_edge_tile(config):
+                self._set_aux_edge_cluster_m2_prefix(config)
+            if self._is_clc_aux_tma_config(config):
+                self._set_clc_aux_tma_edge_perf_knobs(config)
             if is_narrow_clc_aux_tma:
+                config["tcgen05_acc_stages"] = (
+                    TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_ACC_STAGES
+                )
                 config["l2_groupings"] = [
                     TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_L2_GROUPING
                 ]
-            if self.aux_kernel_detected and self._has_any_matmul_fact_edge_tile(config):
-                self._set_aux_edge_cluster_m2_prefix(config)
 
     def allow_ab_stages_three_search(
         self,
@@ -596,18 +696,57 @@ class CuteTcgen05Config:
             return False
         return capability[0] >= 10 and "flat" in self.allowed_pid_types
 
-    def _is_clc_aux_tma_narrow_n_config(self, config: dict[str, object]) -> bool:
-        block_sizes = config.get("block_sizes")
+    def _is_clc_aux_tma_request(self, config: dict[str, object]) -> bool:
         return (
+            config.get(TCGEN05_AUX_LOAD_MODE_CONFIG_KEY) == TCGEN05_AUX_LOAD_MODE_TMA
+            and config.get(TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY)
+            == Tcgen05PersistenceModel.CLC_PERSISTENT.value
+            and self._clc_persistence_search_enabled()
+        )
+
+    def _is_clc_aux_tma_config(self, config: dict[str, object]) -> bool:
+        return self._is_clc_aux_tma_request(
+            config
+        ) and self._is_validated_clc_persistence_search_candidate(config)
+
+    def _is_clc_aux_tma_narrow_n_request(self, config: dict[str, object]) -> bool:
+        block_sizes = config.get("block_sizes")
+        if not (
             isinstance(block_sizes, list)
             and len(block_sizes) >= 3
             and block_sizes[1] == TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_BLOCK_N
-            and config.get(TCGEN05_AUX_LOAD_MODE_CONFIG_KEY)
-            == TCGEN05_AUX_LOAD_MODE_TMA
-            and config.get(TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY)
-            == Tcgen05PersistenceModel.CLC_PERSISTENT.value
-            and self._is_validated_clc_persistence_search_candidate(config)
-        )
+            and self._is_clc_aux_tma_request(config)
+        ):
+            return False
+        projected_config = dict(config)
+        projected_block_sizes = list(block_sizes)
+        projected_config["block_sizes"] = projected_block_sizes
+        projected_config["pid_type"] = TCGEN05_TWO_CTA_SEED_PID_TYPE
+        projected_block_sizes[0] = TCGEN05_TWO_CTA_BLOCK_M
+        projected_block_sizes[2] = TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_BLOCK_K
+        if (
+            self.aux_kernel_detected
+            and self._has_any_matmul_fact_edge_tile(projected_config)
+            and projected_config.get(TCGEN05_STRATEGY_CONFIG_KEY)
+            == Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER.value
+        ):
+            projected_config[TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY] = 1
+            projected_config[TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY] = 1
+        return self._is_validated_clc_persistence_search_candidate(projected_config)
+
+    def implicit_default_keys_to_preserve(self, config: dict[str, object]) -> set[str]:
+        if not self._is_clc_aux_tma_config(config):
+            return set()
+        preserve_keys = {"l2_groupings"}
+        if self._clc_aux_tma_matmul_k_range_index() is not None:
+            preserve_keys.update(
+                {
+                    "range_flattens",
+                    "range_multi_buffers",
+                    "range_warp_specializes",
+                }
+            )
+        return preserve_keys
 
     def _is_validated_clc_persistence_search_candidate(
         self, config: dict[str, object]

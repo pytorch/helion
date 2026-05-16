@@ -3570,7 +3570,7 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             "ring per staged matmul-plan aux descriptor"
         )
         aux_use_tma_load = aux_pipeline_plan.use_tma_load
-        aux_requires_full_tile = plan.tma_store_full_tiles_only or aux_use_tma_load
+        aux_requires_full_tile = plan.tma_store_full_tiles_only
 
         valid_var = device_function.new_var("tcgen05_c_input_warp_valid")
 
@@ -4228,10 +4228,10 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             per_tile_body.extend(_sched_consumer_release_block())
         aux_copy_lines = _aux_copy_lines()
         if aux_requires_full_tile and tile_phase == "all":
-            # Hybrid full-tile TMA store and explicit aux TMA loads use the aux
-            # SMEM ring only on full tiles. Edge tiles take the SIMT direct-GMEM
-            # fallback, so the producer must skip those tiles too; otherwise it
-            # commits aux stages that no consumer will release.
+            # Hybrid full-tile TMA store with a SIMT edge fallback uses the aux
+            # SMEM ring only on full tiles. Edge tiles take direct-GMEM aux
+            # loads, so the producer must skip them; otherwise it commits aux
+            # stages that no consumer will release.
             per_tile_body.extend(
                 [
                     statement_from_string(
