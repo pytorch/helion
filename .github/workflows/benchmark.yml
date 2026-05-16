@@ -21,6 +21,10 @@ on:
       alias:
         required: true
         type: string
+      backend:
+        required: false
+        type: string
+        default: triton
       kernels:
         required: true
         type: string
@@ -39,6 +43,7 @@ jobs:
 
     env:
       HELION_AUTOTUNE_LOG_LEVEL: INFO
+      HELION_BACKEND: ${{ inputs.backend }}
 
     container:
       image: ${{ inputs.image }}
@@ -102,6 +107,12 @@ jobs:
           source .venv/bin/activate
           SETUPTOOLS_SCM_PRETEND_VERSION="0.0.0" uv pip install -e .'[dev]'
           python -c "import helion; print(helion.__name__)"
+
+      - name: Install CUTLASS CuTe DSL
+        if: inputs.backend == 'cute'
+        run: |
+          source .venv/bin/activate
+          ./scripts/install_cute.sh
 
       - name: CUDA Compute Check
         if: startsWith(inputs.image, 'nvidia')
@@ -182,6 +193,7 @@ jobs:
             # so --measure-compile-time reports end-to-end user-visible compile time.
             ${{ inputs.env-vars }} HELION_PRINT_OUTPUT_CODE=1 python benchmarks/run.py \
                 --op $kernel \
+                --helion-backend "${{ inputs.backend }}" \
                 --metrics speedup,accuracy,latency \
                 --measure-compile-time \
                 --latency-measure-mode triton_do_bench \

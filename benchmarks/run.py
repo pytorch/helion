@@ -8,6 +8,7 @@ $ python benchmarks/run.py [tritonbench args...] [--kernel <kernel_name(s)>]
 Example usage:
 $ python benchmarks/run.py --metrics speedup,accuracy --kernel vector_add  # Runs vector_add kernel
 $ python benchmarks/run.py --metrics speedup,accuracy --kernel vector_add,rms_norm  # Runs multiple kernels
+$ python benchmarks/run.py --helion-backend cute --metrics speedup,accuracy --kernel gemm  # Runs using the CuTe backend
 $ python benchmarks/run.py --metrics speedup,accuracy  # Runs all kernels
 
 # On GPU-1, run first 1/4 of inputs for all kernels and save results to CSV in the current directory
@@ -50,10 +51,12 @@ from helion._compat import get_device_name
 from helion._compile_time import enable as enable_compile_time
 from helion._compile_time import get_total_time as get_compile_total_time
 from helion._compile_time import reset as reset_compile_time
+from helion._compiler.backend_registry import list_backends
 from helion._testing import get_nvidia_gpu_model
 from helion._utils import counters
 from helion.autotuner.metrics import AutotuneMetrics
 from helion.autotuner.metrics import register_post_autotune_hook
+from helion.runtime.settings import _get_backend
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -1753,6 +1756,7 @@ def write_results_to_json(
                         "name": "Helion Benchmark",
                         "extra_info": {
                             "device": result.device,
+                            "backend": _get_backend(),
                         },
                     },
                     "model": {
@@ -1894,6 +1898,12 @@ def main() -> None:
         help="Name(s) of the Helion kernel module(s) to run. Can be a single kernel or comma-separated list (e.g., vector_add or vector_add,rms_norm). If not specified, runs all kernels.",
     )
     parser.add_argument(
+        "--helion-backend",
+        choices=list_backends(),
+        default=None,
+        help="Helion code generation backend to benchmark. Defaults to HELION_BACKEND or triton.",
+    )
+    parser.add_argument(
         "--input-shard",
         type=str,
         help="Run only a subset of inputs for each kernel. Format: M/N where M is the shard number (1-indexed) and N is the total number of shards. For example, --input-shard 1/3 runs the first third of inputs for each kernel.",
@@ -1942,6 +1952,9 @@ def main() -> None:
 
     # Parse known args to get the kernel name, pass rest to tritonbench
     args, tritonbench_args = parser.parse_known_args()
+
+    if args.helion_backend:
+        os.environ["HELION_BACKEND"] = args.helion_backend
 
     # Add default tolerance values if not already specified
     if "--atol" not in tritonbench_args:
