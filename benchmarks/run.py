@@ -98,8 +98,8 @@ def log_tensor_metadata(args: tuple[object, ...], kwargs: dict[str, object]) -> 
 
 # Maximum number of inputs to use
 MAX_NUM_INPUTS = 20
-MAMBA2_CHUNK_SCAN_LARGE_SHAPE = (64, 64, 1, 8192, 256, 64, 128)
-MAMBA2_CHUNK_SCAN_LARGE_SHAPE_MIN_FREE_MEMORY_BYTES = 100 * 1024**3
+MAMBA2_LARGE_SHAPE = (64, 64, 1, 8192, 256, 64, 128)
+MAMBA2_LARGE_SHAPE_MIN_FREE_MEMORY_BYTES = 100 * 1024**3
 
 # These patches mutate TritonBench operator classes, so remember patched classes
 # to avoid wrapping the same methods more than once in a long benchmark process.
@@ -156,20 +156,35 @@ def patch_mamba2_tritonbench_inputs(operator_name: str, Operator: type[Any]) -> 
                     x.shape[3],
                     C.shape[3],
                 )
-                if shape == MAMBA2_CHUNK_SCAN_LARGE_SHAPE and x.device.type == "cuda":
+                if shape == MAMBA2_LARGE_SHAPE and x.device.type == "cuda":
                     free_memory, _ = torch.cuda.mem_get_info(x.device)
                     # Accuracy checks run TritonBench's eager baseline, which
                     # expands cb across heads and OOMs below this free-memory level.
-                    if (
-                        free_memory
-                        < MAMBA2_CHUNK_SCAN_LARGE_SHAPE_MIN_FREE_MEMORY_BYTES
-                    ):
+                    if free_memory < MAMBA2_LARGE_SHAPE_MIN_FREE_MEMORY_BYTES:
                         continue
                 dt = torch.rand_like(dt)
                 dA_cumsum = _mamba_valid_dA_cumsum_like(dt)
                 yield cb, x, dt, dA_cumsum, C, prev_states, D
             else:
                 B, x, dt, _dA_cumsum = example_inputs
+                shape = (
+                    x.shape[0],
+                    x.shape[2],
+                    B.shape[2],
+                    x.shape[1],
+                    dt.shape[3],
+                    x.shape[3],
+                    B.shape[3],
+                )
+                if shape == MAMBA2_LARGE_SHAPE and x.device.type == "cuda":
+                    free_memory, _ = torch.cuda.mem_get_info(x.device)
+                    # Helion autotune for this shape consistently fails on H100
+                    # (~80 GB) after the 5 prior shapes have left behind cached
+                    # buffers and JIT state, even though the kernel + autotune
+                    # work on a freshly-cleared GPU. Gate on free memory so the
+                    # shape still runs on devices with >100 GB free (e.g. B200).
+                    if free_memory < MAMBA2_LARGE_SHAPE_MIN_FREE_MEMORY_BYTES:
+                        continue
                 dA_cumsum = _mamba_valid_dA_cumsum_like(dt)
                 yield B, x, dt, dA_cumsum
 
