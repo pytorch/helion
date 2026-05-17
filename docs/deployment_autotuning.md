@@ -165,7 +165,11 @@ its starting set of configurations before beginning the search:
 
   The strategy matches cached configs by hardware, specialization key,
   and structural fingerprint, so it only reuses results that are
-  structurally compatible with the current kernel.
+  structurally compatible with the current kernel.  If
+  `HELION_REMOTE_CACHE_BACKEND` is configured *and* the backend overrides
+  the optional `list()` method, remote entries are merged in to fill the
+  remaining slots up to `autotune_best_available_max_configs` (default
+  20) after the local scan — see [Remote Autotune Cache](#remote-autotune-cache).
 
 Override the default strategy for any effort level with the
 `HELION_AUTOTUNER_INITIAL_POPULATION` environment variable:
@@ -202,6 +206,84 @@ def my_kernel(x: torch.Tensor) -> torch.Tensor:
 The budget is checked between generations and during the finishing
 phase. In-flight compiling and benchmarking completes before the
 search stops. The default is ``None`` (no budget).
+
+## Remote Autotune Cache
+
+Helion ships an ABC, `RemoteCacheBackend`, so the autotune cache can
+be backed by any remote store (Redis, S3, HTTP service, shared
+filesystem, etc.). Helion does not ship a concrete backend — you
+provide the class and point Helion at it.
+
+Useful when:
+
+- **Teams share autotune results across machines** — one developer
+  autotunes; the rest get the result without re-running the search.
+- **CI/CD warm-starts production deployments** — a nightly tuning job
+  populates the remote cache; runtime sees cache hits.
+- **Multi-node clusters avoid duplicate autotuning** — every node hits
+  the same shared cache instead of independently re-tuning identical
+  kernels on identical hardware.
+
+### Setup
+
+Implement `RemoteCacheBackend` somewhere on your import path:
+
+```python
+from helion.autotuner.remote_cache import RemoteCacheBackend
+
+class MyBackend(RemoteCacheBackend):
+    def get(self, key: str) -> str | None: ...
+    def put(self, key: str, data: str) -> None: ...
+    # Optional: implement to enable warm-start lookups
+    # (from_best_available / helion.from_cache pull from the remote
+    # when local matches are below autotune_best_available_max_configs).
+    def list(self, max_results: int | None = None): ...
+```
+
+Point Helion at it via env vars:
+
+```bash
+# Required: load the backend class.
+export HELION_REMOTE_CACHE_BACKEND=mypackage.cache.MyBackend
+
+# Optional: also write the winning config back to the remote on every
+# autotune. Without this, the remote is read-only from this machine
+# (warm-start still works, exact-match still hits).
+export HELION_AUTOTUNE_CACHE=RemoteAutotuneCache
+```
+
+### Two layers
+
+The two env vars are independent and address different needs:
+
+| Goal | Env vars needed |
+|------|------------------|
+| Exact-match cache (skip autotuning when a previous run produced a config) | `HELION_REMOTE_CACHE_BACKEND` + `HELION_AUTOTUNE_CACHE=RemoteAutotuneCache` |
+| Warm-start from remote (seed initial population from prior runs) | `HELION_REMOTE_CACHE_BACKEND` + a backend that overrides `list()` |
+| Both | All of the above |
+
+### Behavior
+
+`RemoteAutotuneCache` is **read-through / write-through**: reads
+consult the remote first and materialize hits locally; writes go to
+both local disk and the remote.  Local disk remains the source of
+truth on this machine, so a remote outage degrades gracefully — local
+cached configs still serve hits, and `put` failures only log a warning
+(the local write still succeeds).
+
+Warm-start scans local first; if there are fewer than
+`autotune_best_available_max_configs` compatible entries, it merges
+remote entries (deduplicated against local) to fill the remainder.
+Both sides apply the same filtering (hardware, specialization key,
+`config_spec_hash`).
+
+`StrictRemoteAutotuneCache` exists for users who want the strict key
+semantics (invalidate on Helion/PyTorch/Triton source changes) — same
+read-through / write-through behavior.
+
+See {py:class}`~helion.autotuner.remote_cache.RemoteCacheBackend` for
+the ABC and {py:class}`~helion.autotuner.remote_cache.RemoteAutotuneCache`
+for the wrapper class.
 
 ## Deploy a Single Config
 
