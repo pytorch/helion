@@ -81,6 +81,7 @@ from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_CLUSTER_M
 from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_PID_TYPE
 from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_PROBLEM_SHAPE
+from .tcgen05_constants import TCGEN05_SCHED_STAGE_COUNT_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
 from .tcgen05_constants import TCGEN05_TWO_CTA_EDGE_TMA_STORE_MAX_AB_STAGES
 
@@ -2486,18 +2487,17 @@ def _emit_mma_pipeline(
         tcgen05_acc_consumer_arrive_count_value = tcgen05_epi_warp_count_value * (
             2 if tcgen05_is_two_cta else 1
         )
-        # Scheduler-warp pipeline depth. Use 1 stage for now: with
-        # a single SMEM mailbox shared across all consumer warps,
-        # each consumer warp must see the same tile per iteration.
-        # Multiple stages would let the producer overwrite the
-        # mailbox while a slower consumer is still reading the
-        # previous tile (each consumer has its own register-state
-        # advancement, so they can drift). Quack uses 2 stages
-        # because Quack's design has the mailbox sized num_stages
-        # entries; if we widen the SMEM mailbox to per-stage
-        # entries that change can come later.
+        # Scheduler-warp pipeline depth. The default remains one stage because
+        # consumer warps advance their own register-state independently; with
+        # one shared mailbox, a multi-stage producer could overwrite metadata
+        # while a slower consumer still reads the previous tile. The optional
+        # two-stage diagnostic is paired with a staged SMEM mailbox in
+        # ``program_id.py`` so the scheduler can publish the next work tile
+        # without overwriting a slower consumer's current tile.
         tcgen05_sched_stage_count_value = (
-            1 if tcgen05_warp_spec.scheduler_warps > 0 else 0
+            cast("int", df.config.get(TCGEN05_SCHED_STAGE_COUNT_CONFIG_KEY, 1))
+            if tcgen05_warp_spec.scheduler_warps > 0
+            else 0
         )
         # Persistence model from the active config. Default
         # ``static_persistent`` keeps the existing path; G2-H

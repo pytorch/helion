@@ -10,6 +10,7 @@ from typing import cast
 
 import torch
 
+from .. import exc
 from .ast_extension import ExtendedAST
 from .ast_extension import create
 from .ast_extension import expr_from_string
@@ -22,6 +23,7 @@ from .cute.strategies import l2_swizzle_size_from_config
 from .cute.tcgen05_constants import TCGEN05_SCHED_CONSUMER_WAIT_MODE_CONFIG_KEY
 from .cute.tcgen05_constants import TCGEN05_SCHED_CONSUMER_WAIT_MODE_NORMAL
 from .cute.tcgen05_constants import TCGEN05_SCHED_CONSUMER_WAIT_MODE_WARP_LEADER
+from .cute.tcgen05_constants import TCGEN05_SCHED_STAGE_COUNT_CONFIG_KEY
 from .cute.tcgen05_constants import TCGEN05_TWO_CTA_MAX_K_TILES
 from .device_function import DeviceFunction
 from .device_function import TensorArg
@@ -76,6 +78,7 @@ def _build_sched_pipeline_consumer_wait_block(
     sched_consumer_state: str,
     work_tile_smem: str,
     valid_var: str,
+    work_tile_stage_index: str | None = None,
 ) -> list[ast.stmt]:
     """Emit the consumer-side wait block for the ``ROLE_LOCAL_WITH_SCHEDULER``
     sched_pipeline: ``consumer_wait`` → ``fence_view_async_shared``
@@ -114,6 +117,11 @@ def _build_sched_pipeline_consumer_wait_block(
         )
     except NoCurrentFunction:
         wait_mode = TCGEN05_SCHED_CONSUMER_WAIT_MODE_NORMAL
+    valid_slot = (
+        f"{work_tile_smem}[cutlass.Int32(3)]"
+        if work_tile_stage_index is None
+        else f"{work_tile_smem}[cutlass.Int32(3), {work_tile_stage_index}]"
+    )
     if wait_mode == TCGEN05_SCHED_CONSUMER_WAIT_MODE_WARP_LEADER:
         return [
             create(
@@ -129,9 +137,7 @@ def _build_sched_pipeline_consumer_wait_block(
             statement_from_string("cute.arch.sync_warp()"),
             statement_from_string("cute.arch.fence_view_async_shared()"),
             statement_from_string("cute.arch.sync_warp()"),
-            statement_from_string(
-                f"{valid_var} = {work_tile_smem}[cutlass.Int32(3)] != cutlass.Int32(0)"
-            ),
+            statement_from_string(f"{valid_var} = {valid_slot} != cutlass.Int32(0)"),
         ]
     return [
         statement_from_string(
@@ -139,9 +145,7 @@ def _build_sched_pipeline_consumer_wait_block(
         ),
         statement_from_string("cute.arch.fence_view_async_shared()"),
         statement_from_string("cute.arch.sync_warp()"),
-        statement_from_string(
-            f"{valid_var} = {work_tile_smem}[cutlass.Int32(3)] != cutlass.Int32(0)"
-        ),
+        statement_from_string(f"{valid_var} = {valid_slot} != cutlass.Int32(0)"),
     ]
 
 
@@ -1011,6 +1015,58 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         except NoCurrentFunction:
             return None
 
+    def _tcgen05_sched_stage_count(self) -> int:
+        plan = self._tcgen05_plan()
+        if plan is None:
+            return 0
+        return max(plan.sched_stage_count, 0)
+
+    def _tcgen05_uses_staged_work_tile_mailbox(self) -> bool:
+        return self._tcgen05_sched_stage_count() > 1
+
+    def _tcgen05_work_tile_slot_for_state(
+        self,
+        layout: Tcgen05PersistentProgramIDs._Tcgen05PersistentLayout,
+        i: int,
+        pipeline_state: str | None,
+    ) -> str:
+        if pipeline_state is None:
+            return f"{layout.work_tile_smem}[cutlass.Int32({i})]"
+        return f"{layout.work_tile_smem}[cutlass.Int32({i}), {pipeline_state}.index]"
+
+    def _tcgen05_work_tile_slot(
+        self, layout: Tcgen05PersistentProgramIDs._Tcgen05PersistentLayout, i: int
+    ) -> str:
+        if not self._tcgen05_uses_staged_work_tile_mailbox():
+            return self._tcgen05_work_tile_slot_for_state(layout, i, None)
+        sched_plan = self._tcgen05_sched_pipeline_plan()
+        assert sched_plan is not None
+        return self._tcgen05_work_tile_slot_for_state(
+            layout, i, sched_plan.consumer_state
+        )
+
+    def _tcgen05_work_tile_producer_slot(
+        self, layout: Tcgen05PersistentProgramIDs._Tcgen05PersistentLayout, i: int
+    ) -> str:
+        if not self._tcgen05_uses_staged_work_tile_mailbox():
+            return self._tcgen05_work_tile_slot_for_state(layout, i, None)
+        sched_plan = self._tcgen05_sched_pipeline_plan()
+        assert sched_plan is not None
+        return self._tcgen05_work_tile_slot_for_state(
+            layout, i, sched_plan.producer_state
+        )
+
+    def _tcgen05_work_tile_producer_smem_ptr(
+        self, layout: Tcgen05PersistentProgramIDs._Tcgen05PersistentLayout
+    ) -> str:
+        if not self._tcgen05_uses_staged_work_tile_mailbox():
+            return layout.work_tile_smem_ptr
+        sched_plan = self._tcgen05_sched_pipeline_plan()
+        assert sched_plan is not None
+        return (
+            f"{layout.work_tile_smem}[None, {sched_plan.producer_state}.index].iterator"
+        )
+
     def _tcgen05_has_validated_role_local_two_cta_runtime(self) -> bool:
         plan = self._tcgen05_plan()
         return bool(
@@ -1822,6 +1878,11 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             and not is_multi_root
             and (layout.cluster_m > 1 or self._tcgen05_has_scheduler_warp())
         )
+        if self._tcgen05_uses_staged_work_tile_mailbox() and not omit_shared_loop:
+            raise exc.InvalidConfig(
+                f"{TCGEN05_SCHED_STAGE_COUNT_CONFIG_KEY}=2 requires omitted "
+                "shared-loop full role-local scheduler codegen"
+            )
         if use_role_local_body:
             # Retarget even for guarded cluster_m>1 / multi-root codegen so
             # compile-only inspection still sees the role-local scheduler shape.
@@ -1854,7 +1915,9 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             # *does* need the per-CTA work-tile SMEM mailbox: the
             # scheduler warp publishes per-tile coords there and
             # consumer warps read them after ``consumer_wait``.
-            setup.extend(self._build_tcgen05_work_tile_smem_alloc(layout))
+            setup.extend(
+                self._build_tcgen05_work_tile_smem_alloc(layout, staged_ok=True)
+            )
         setup.extend(hoisted_setup)
         if use_role_local_body:
             if omit_shared_loop:
@@ -2086,12 +2149,14 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                 statement_from_string(
                     f"{sched_pipeline}.producer_acquire({sched_producer_state})"
                 ),
-                # The scheduler pipeline is intentionally one-stage. Match
-                # Quack by arming the consumer-state full mbarrier before the
-                # async remote stores; if this pipeline gains more stages,
-                # producer/consumer state pairing must be revisited together.
+                # The shared-loop scheduler bridge remains one-stage: its
+                # mailbox is a single 4-Int32 tuple, so the producer arms the
+                # consumer-state full mbarrier before the remote stores.
+                # Staged mailboxes are only used after the shared loop is
+                # omitted in the CLC role-local scheduler path.
                 statement_from_string(
-                    f"{sched_barrier_ptr} = {sched_pipeline}.producer_get_barrier({sched_consumer_state})"
+                    f"{sched_barrier_ptr} = "
+                    f"{sched_pipeline}.producer_get_barrier({sched_consumer_state})"
                 ),
                 statement_from_string(f"{sched_peer_rank} = cute.arch.lane_idx()"),
                 create(
@@ -2100,9 +2165,7 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                         f"{sched_peer_rank} < cutlass.Int32({cluster_m})"
                     ),
                     body=[
-                        statement_from_string(
-                            f"{sched_peer_m} = {sched_peer_rank} % cutlass.Int32({cluster_m})"
-                        ),
+                        statement_from_string(f"{sched_peer_m} = {sched_peer_rank}"),
                         # _cute_store_shared_remote_x4 writes four Int32
                         # values, so each remote async transaction expects
                         # 16 bytes.
@@ -2177,26 +2240,43 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         )
 
     def _build_tcgen05_work_tile_smem_alloc(
-        self, layout: _Tcgen05PersistentLayout
+        self, layout: _Tcgen05PersistentLayout, *, staged_ok: bool = False
     ) -> list[ast.stmt]:
         """Allocate the per-CTA work-tile SMEM mailbox.
 
-        This is the 4-element Int32 array used to broadcast tile
-        coordinates + an is-valid sentinel. Both the cluster_m=2
-        ONE-CTA bridge path and ``ROLE_LOCAL_WITH_SCHEDULER`` use
-        this storage, so the allocation is pulled out of
+        This is the 4-Int32 work-tile tuple, optionally repeated per
+        scheduler stage, used to broadcast tile coordinates + an
+        is-valid sentinel. Both the cluster_m=2 ONE-CTA bridge path
+        and ``ROLE_LOCAL_WITH_SCHEDULER`` use this storage, so the
+        allocation is pulled out of
         ``_build_tcgen05_persistent_prelude`` (which is conditionally
         skipped when the residual shared loop is omitted) into its
         own helper that always runs when the work-tile mailbox is
         needed.
         """
+        if self._tcgen05_uses_staged_work_tile_mailbox():
+            assert staged_ok, (
+                "staged work-tile mailbox requires omitted shared-loop "
+                "role-local scheduler codegen"
+            )
+            plan = self._tcgen05_plan()
+            assert plan is not None and plan.is_clc_persistent and plan.cluster_m > 1, (
+                "staged work-tile mailbox is only validated for clustered CLC"
+            )
+            stage_count = self._tcgen05_sched_stage_count()
+            alloc_extent = f"cutlass.Int32({4 * stage_count})"
+            layout_expr = f"cute.make_layout((4, {stage_count}), stride=(1, 4))"
+        else:
+            alloc_extent = "4"
+            layout_expr = "cute.make_layout((4,), stride=(1,))"
         return [
             statement_from_string(
-                f"{layout.work_tile_smem_ptr} = cute.arch.alloc_smem(cutlass.Int32, 4, alignment=16)"
+                f"{layout.work_tile_smem_ptr} = cute.arch.alloc_smem("
+                f"cutlass.Int32, {alloc_extent}, alignment=16)"
             ),
             statement_from_string(
                 f"{layout.work_tile_smem_tensor} = cute.make_tensor("
-                f"{layout.work_tile_smem_ptr}, cute.make_layout((4,), stride=(1,)))"
+                f"{layout.work_tile_smem_ptr}, {layout_expr})"
             ),
             statement_from_string(
                 f"{layout.work_tile_smem} = {layout.work_tile_smem_tensor}"
@@ -2639,10 +2719,14 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         # does, just sourcing from SMEM coords instead of the
         # work_tile object.
         coord_terms = [
-            f"{layout.work_tile_smem}[cutlass.Int32({i})]"
-            for i in range(len(self.pid_info))
+            self._tcgen05_work_tile_slot(layout, i) for i in range(len(self.pid_info))
         ]
         linear_pid_expr = self._tcgen05_linear_virtual_pid_from_coords_expr(coord_terms)
+        work_tile_stage_index = (
+            f"{sched_consumer_state}.index"
+            if self._tcgen05_uses_staged_work_tile_mailbox()
+            else None
+        )
 
         # ``PipelineAsync.consumer_wait`` and ``consumer_release``
         # use the shared sched-pipeline factories at module scope —
@@ -2658,6 +2742,7 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                 sched_consumer_state=sched_consumer_state,
                 work_tile_smem=layout.work_tile_smem,
                 valid_var=valid_var,
+                work_tile_stage_index=work_tile_stage_index,
             )
 
         def _consumer_release_block() -> list[ast.stmt]:
@@ -3013,16 +3098,6 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         bidy_var = device_function.new_var("tcgen05_clc_bidy")
         bidz_var = device_function.new_var("tcgen05_clc_bidz")
         valid_var = device_function.new_var("tcgen05_clc_valid")
-        # Per-CTA cluster offsets read once at the kernel prefix.
-        # ``clusterlaunchcontrol.try_cancel`` returns the CTA id of
-        # the *first* CTA of the next cluster (e.g. cluster_m=2 ->
-        # bidx = cluster_id_m * 2). Each CTA's scheduler warp must
-        # add its own ``block_idx_in_cluster()`` so the published
-        # ``tile_idx[0]`` stays in lockstep with what the static path
-        # publishes (per-CTA M coordinate). For cluster_m=1 the
-        # offset is always 0.
-        cta_in_cluster_m_var = device_function.new_var("tcgen05_clc_cta_in_cluster_m")
-        cta_in_cluster_n_var = device_function.new_var("tcgen05_clc_cta_in_cluster_n")
         # Initial work-tile coordinates come from the launcher's
         # ``block_idx()`` so the first iteration runs the cluster
         # the launcher placed this CTA in. Subsequent iterations
@@ -3089,17 +3164,6 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             statement_from_string(
                 f"{work_tile_var} = {sched_var}.initial_work_tile_info()"
             ),
-            # Cache cta-in-cluster offset for later CLC response
-            # decode (CLC returns the cluster's first-CTA ctaid,
-            # so each peer CTA's per-CTA M coordinate adds back the
-            # offset). For cluster_m=1 the offset is always 0.
-            # For cluster_m>1, only the leader CTA's scheduler warp
-            # runs the body so its offset is always 0; for cluster_m=1
-            # each CTA is its own cluster so the offset is also 0.
-            # Keeping the variable for symmetry with the cluster_m>1
-            # broadcast that adds peer_m back per peer.
-            statement_from_string(f"{cta_in_cluster_m_var} = cutlass.Int32(0)"),
-            statement_from_string(f"{cta_in_cluster_n_var} = cutlass.Int32(0)"),
             # Bind the initial cluster coords from the static
             # scheduler's decode. ``tile_idx[0]`` is already the
             # per-CTA M coordinate (= cluster_id_m * cluster_m +
@@ -3146,6 +3210,11 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         sched_barrier_ptr = ""
         sched_peer_rank = ""
         sched_peer_m = ""
+        staged_work_tile_mailbox = self._tcgen05_uses_staged_work_tile_mailbox()
+        producer_barrier_state = (
+            sched_producer_state if staged_work_tile_mailbox else sched_consumer_state
+        )
+        producer_smem_ptr = self._tcgen05_work_tile_producer_smem_ptr(layout)
         if layout.cluster_m > 1:
             sched_barrier_ptr = device_function.new_var("tcgen05_clc_sched_barrier_ptr")
             sched_peer_rank = device_function.new_var("tcgen05_clc_sched_peer_rank")
@@ -3162,7 +3231,7 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                 # PipelineState pairing and the clustered static mailbox bridge.
                 statement_from_string(
                     f"{sched_barrier_ptr} = "
-                    f"{sched_pipeline}.producer_get_barrier({sched_consumer_state})"
+                    f"{sched_pipeline}.producer_get_barrier({producer_barrier_state})"
                 ),
                 statement_from_string(f"{sched_peer_rank} = cute.arch.lane_idx()"),
                 create(
@@ -3171,10 +3240,7 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                         f"{sched_peer_rank} < cutlass.Int32({layout.cluster_m})"
                     ),
                     body=[
-                        statement_from_string(
-                            f"{sched_peer_m} = "
-                            f"{sched_peer_rank} % cutlass.Int32({layout.cluster_m})"
-                        ),
+                        statement_from_string(f"{sched_peer_m} = {sched_peer_rank}"),
                         statement_from_string(
                             "cute.arch.mbarrier_arrive_and_expect_tx("
                             f"{sched_barrier_ptr}, 16, {sched_peer_rank})"
@@ -3185,7 +3251,7 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                             f"{cluster_bidy_var}, "
                             f"{cluster_bidz_var}, "
                             f"{valid_var}, "
-                            f"smem_ptr={layout.work_tile_smem_ptr}, "
+                            f"smem_ptr={producer_smem_ptr}, "
                             f"mbar_ptr={sched_barrier_ptr}, "
                             f"peer_cta_rank_in_cluster={sched_peer_rank})"
                         ),
@@ -3207,19 +3273,20 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                     test=expr_from_string(leader_predicate),
                     body=[
                         statement_from_string(
-                            f"{layout.work_tile_smem}[cutlass.Int32(0)] = "
+                            f"{self._tcgen05_work_tile_producer_slot(layout, 0)} = "
                             f"{cluster_bidx_var}"
                         ),
                         statement_from_string(
-                            f"{layout.work_tile_smem}[cutlass.Int32(1)] = "
+                            f"{self._tcgen05_work_tile_producer_slot(layout, 1)} = "
                             f"{cluster_bidy_var}"
                         ),
                         statement_from_string(
-                            f"{layout.work_tile_smem}[cutlass.Int32(2)] = "
+                            f"{self._tcgen05_work_tile_producer_slot(layout, 2)} = "
                             f"{cluster_bidz_var}"
                         ),
                         statement_from_string(
-                            f"{layout.work_tile_smem}[cutlass.Int32(3)] = {valid_var}"
+                            f"{self._tcgen05_work_tile_producer_slot(layout, 3)} = "
+                            f"{valid_var}"
                         ),
                         statement_from_string(
                             f"{sched_pipeline}.producer_commit({sched_producer_state})"
@@ -3360,7 +3427,7 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                 # PipelineState pairing and the clustered static mailbox bridge.
                 statement_from_string(
                     f"{sched_barrier_ptr} = "
-                    f"{sched_pipeline}.producer_get_barrier({sched_consumer_state})"
+                    f"{sched_pipeline}.producer_get_barrier({producer_barrier_state})"
                 ),
                 statement_from_string(f"{sched_peer_rank} = cute.arch.lane_idx()"),
                 create(
@@ -3377,7 +3444,7 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                             f"_cute_store_shared_remote_x4("
                             "cutlass.Int32(0), cutlass.Int32(0), "
                             "cutlass.Int32(0), cutlass.Int32(0), "
-                            f"smem_ptr={layout.work_tile_smem_ptr}, "
+                            f"smem_ptr={producer_smem_ptr}, "
                             f"mbar_ptr={sched_barrier_ptr}, "
                             f"peer_cta_rank_in_cluster={sched_peer_rank})"
                         ),
@@ -3395,19 +3462,19 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                     test=expr_from_string(leader_predicate),
                     body=[
                         statement_from_string(
-                            f"{layout.work_tile_smem}[cutlass.Int32(0)] = "
+                            f"{self._tcgen05_work_tile_producer_slot(layout, 0)} = "
                             "cutlass.Int32(0)"
                         ),
                         statement_from_string(
-                            f"{layout.work_tile_smem}[cutlass.Int32(1)] = "
+                            f"{self._tcgen05_work_tile_producer_slot(layout, 1)} = "
                             "cutlass.Int32(0)"
                         ),
                         statement_from_string(
-                            f"{layout.work_tile_smem}[cutlass.Int32(2)] = "
+                            f"{self._tcgen05_work_tile_producer_slot(layout, 2)} = "
                             "cutlass.Int32(0)"
                         ),
                         statement_from_string(
-                            f"{layout.work_tile_smem}[cutlass.Int32(3)] = "
+                            f"{self._tcgen05_work_tile_producer_slot(layout, 3)} = "
                             "cutlass.Int32(0)"
                         ),
                         statement_from_string(
@@ -3573,6 +3640,11 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         aux_requires_full_tile = plan.tma_store_full_tiles_only
 
         valid_var = device_function.new_var("tcgen05_c_input_warp_valid")
+        work_tile_stage_index = (
+            f"{sched_consumer_state}.index"
+            if self._tcgen05_uses_staged_work_tile_mailbox()
+            else None
+        )
 
         if aux_requires_full_tile and tile_phase == "edge":
             # Edge epilogues use the SIMT direct-GMEM aux path. The C-input
@@ -3587,6 +3659,7 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                     sched_consumer_state=sched_consumer_state,
                     work_tile_smem=layout.work_tile_smem,
                     valid_var=valid_var,
+                    work_tile_stage_index=work_tile_stage_index,
                 )
             )
             per_tile_body: list[ast.stmt] = []
@@ -3602,6 +3675,7 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                     sched_consumer_state=sched_consumer_state,
                     work_tile_smem=layout.work_tile_smem,
                     valid_var=valid_var,
+                    work_tile_stage_index=work_tile_stage_index,
                 )
             )
             prelude.append(
@@ -3626,10 +3700,11 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             )
 
         coord_terms = [
-            f"{layout.work_tile_smem}[cutlass.Int32({i})]"
-            for i in range(len(self.pid_info))
+            self._tcgen05_work_tile_slot(layout, i) for i in range(len(self.pid_info))
         ]
         linear_pid_expr = self._tcgen05_linear_virtual_pid_from_coords_expr(coord_terms)
+        sched_coord_0 = coord_terms[0] if len(coord_terms) > 0 else "cutlass.Int32(0)"
+        sched_coord_1 = coord_terms[1] if len(coord_terms) > 1 else "cutlass.Int32(0)"
 
         # M / N tile coords for the cooperative copy. Each CTA's
         # C-input warp loads only its own per-CTA portion of the
@@ -3708,17 +3783,14 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             "tile_offset_0" in l2_dependency_writes
             and "tile_offset_1" in l2_dependency_writes
         )
-        # ``peer_m`` is this CTA's rank along the M axis of the
-        # cluster: ``block_idx_in_cluster() % cluster_m``. The
-        # modulo is load-bearing for ``cluster_n > 1`` — for
-        # ``cluster_m=2 + cluster_n=2 + use_2cta=True`` (a
-        # validated 4-CTA cluster shape, see
-        # ``cute_mma.py:_TCGEN05_V_LEADER_PREDICATE``) ranks
-        # {0, 1, 2, 3} have M peer ranks {0, 1, 0, 1}, NOT
-        # the raw rank-in-cluster. Mirrors the scheduler's
-        # per-CTA publish at the ``_cute_store_shared_remote_x4``
-        # call sites (``program_id.py`` lines 1979 and 2954)
-        # which use the same modulo on the lane-idx form.
+        # ``peer_m`` is this CTA's rank along the M axis of the cluster:
+        # ``block_idx_in_cluster() % cluster_m``. The modulo is load-bearing
+        # here because consumer CTAs can span the N axis: for ``cluster_m=2 +
+        # cluster_n=2 + use_2cta=True`` (a validated 4-CTA cluster shape, see
+        # ``cute_mma.py:_TCGEN05_V_LEADER_PREDICATE``) ranks {0, 1, 2, 3}
+        # have M peer ranks {0, 1, 0, 1}. Scheduler-warp broadcasts use
+        # lane-rank branches restricted to ``peer_rank < cluster_m``, where
+        # the raw lane rank is already the M peer rank.
         peer_m_expr = (
             f"(cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster()) "
             f"% cutlass.Int32({cluster_m}))"
@@ -3777,8 +3849,8 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             # ``_tcgen05_logical_m_coord_expr`` adds the bridge
             # adjustment when applicable. So no extra peer_m
             # is applied here.
-            m_source = f"{layout.work_tile_smem}[cutlass.Int32(0)]"
-            n_source = f"{layout.work_tile_smem}[cutlass.Int32(1)]"
+            m_source = sched_coord_0
+            n_source = sched_coord_1
             if is_two_cta:
                 tile_m_expr = m_source
             else:
@@ -3808,6 +3880,7 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                 sched_consumer_state=sched_consumer_state,
                 work_tile_smem=layout.work_tile_smem,
                 valid_var=valid_var,
+                work_tile_stage_index=work_tile_stage_index,
             )
 
         def _sched_consumer_release_block() -> list[ast.stmt]:
@@ -3842,16 +3915,11 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             aux_n_start_expr = "tile_offset_1"
         else:
             if is_two_cta:
-                aux_m_tile_expr = (
-                    f"({layout.work_tile_smem}[cutlass.Int32(0)] "
-                    f"// cutlass.Int32({cluster_m}))"
-                )
+                aux_m_tile_expr = f"({sched_coord_0} // cutlass.Int32({cluster_m}))"
             else:
-                aux_m_tile_expr = f"{layout.work_tile_smem}[cutlass.Int32(0)]"
+                aux_m_tile_expr = sched_coord_0
             aux_m_start_expr = f"({aux_m_tile_expr}) * cutlass.Int32({bm})"
-            aux_n_start_expr = (
-                f"{layout.work_tile_smem}[cutlass.Int32(1)] * cutlass.Int32({bn})"
-            )
+            aux_n_start_expr = f"{sched_coord_1} * cutlass.Int32({bn})"
         aux_full_tile_expr = (
             f"{aux_m_start_expr} + cutlass.Int32({bm}) "
             f"<= cutlass.Int32({aux_m_size}) and "

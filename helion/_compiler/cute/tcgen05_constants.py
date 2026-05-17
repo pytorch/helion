@@ -270,6 +270,8 @@ TCGEN05_SCHED_CONSUMER_WAIT_MODES = (
     TCGEN05_SCHED_CONSUMER_WAIT_MODE_NORMAL,
     TCGEN05_SCHED_CONSUMER_WAIT_MODE_WARP_LEADER,
 )
+TCGEN05_SCHED_STAGE_COUNT_CONFIG_KEY = "tcgen05_sched_stage_count"
+TCGEN05_SCHED_STAGE_COUNTS = (1, 2)
 TCGEN05_CUBIN_LINEINFO_CONFIG_KEY = "tcgen05_cubin_lineinfo"
 # Diagnostic-only G4 admission proof. This key lets tests exercise the
 # smallest larger-BN tcgen05 codegen candidate without broadening production

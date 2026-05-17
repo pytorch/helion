@@ -151,6 +151,7 @@ from helion._compiler.cute.tcgen05_constants import (
 from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_SCHED_CONSUMER_WAIT_MODE_WARP_LEADER,
 )
+from helion._compiler.cute.tcgen05_constants import TCGEN05_SCHED_STAGE_COUNT_CONFIG_KEY
 from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_TWO_CTA_EDGE_K_TAIL_AB_STAGES,
 )
@@ -2723,6 +2724,16 @@ class TestCuteLowerings(unittest.TestCase):
         # plus the cluster-broadcast publish via _cute_store_shared_remote_x4.
         self.assertIn("cute.arch.block_idx_in_cluster()) == cutlass.Int32(0)", code)
         self.assertIn("_cute_store_shared_remote_x4", code)
+        # The broadcast branch already restricts peer_rank < cluster_m, so the
+        # CLC hot path should not spend predicate/math work recomputing
+        # peer_m with a modulo or materializing unused cta-in-cluster locals.
+        self.assertIn(
+            "tcgen05_clc_sched_peer_m = tcgen05_clc_sched_peer_rank",
+            code,
+        )
+        self.assertNotIn("tcgen05_clc_sched_peer_rank %", code)
+        self.assertNotIn("tcgen05_clc_cta_in_cluster_m", code)
+        self.assertNotIn("tcgen05_clc_cta_in_cluster_n", code)
         sched_tail = (
             "tcgen05_sched_pipeline.producer_tail("
             "tcgen05_sched_pipeline_producer_state)"
@@ -2780,6 +2791,91 @@ class TestCuteLowerings(unittest.TestCase):
         )
         sched_create_call = code[sched_create_match.start() : close_idx + 1]
         self.assertIn("consumer_mask=cutlass.Int32(0)", sched_create_call)
+
+    def test_tcgen05_clc_persistent_sched_stage_count_two_codegen(self) -> None:
+        """Diagnostic CLC sched stage=2 uses a staged work-tile mailbox."""
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_clc_sched2(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        args = (
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+        )
+        config = helion.Config(
+            block_sizes=[256, 256, 128],
+            l2_groupings=[1],
+            num_warps=4,
+            num_sm_multiplier=1,
+            pid_type="persistent_interleaved",
+            tcgen05_cluster_m=2,
+            tcgen05_ab_stages=2,
+            tcgen05_acc_stages=2,
+            tcgen05_c_stages=2,
+            tcgen05_num_epi_warps=4,
+            tcgen05_strategy="role_local_with_scheduler",
+            tcgen05_warp_spec_scheduler_warps=1,
+            tcgen05_persistence_model="clc_persistent",
+            **{TCGEN05_SCHED_STAGE_COUNT_CONFIG_KEY: 2},
+            indexing=[
+                "tensor_descriptor",
+                "tensor_descriptor",
+                "tensor_descriptor",
+            ],
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_clc_sched2.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            code = bound.to_triton_code(config)
+
+        self.assertIn(
+            "tcgen05_work_tile_smem_ptr = cute.arch.alloc_smem("
+            "cutlass.Int32, cutlass.Int32(8), alignment=16)",
+            code,
+        )
+        self.assertIn("cute.make_layout((4, 2), stride=(1, 4))", code)
+        self.assertIn(
+            "tcgen05_sched_pipeline = cutlass.pipeline.PipelineAsync.create("
+            "num_stages=2,",
+            code,
+        )
+        self.assertIn(
+            "tcgen05_sched_pipeline_producer_state = "
+            "cutlass.pipeline.make_pipeline_state("
+            "cutlass.pipeline.PipelineUserType.Producer, 2)",
+            code,
+        )
+        self.assertIn(
+            "tcgen05_sched_pipeline_consumer_state = "
+            "cutlass.pipeline.make_pipeline_state("
+            "cutlass.pipeline.PipelineUserType.Consumer, 2)",
+            code,
+        )
+        self.assertIn(
+            "tcgen05_clc_sched_barrier_ptr = "
+            "tcgen05_sched_pipeline.producer_get_barrier("
+            "tcgen05_sched_pipeline_producer_state)",
+            code,
+        )
+        self.assertIn(
+            "smem_ptr=tcgen05_work_tile_smem[None, "
+            "tcgen05_sched_pipeline_producer_state.index].iterator",
+            code,
+        )
+        self.assertIn(
+            "tcgen05_work_tile_smem[cutlass.Int32(3), "
+            "tcgen05_sched_pipeline_consumer_state.index] != cutlass.Int32(0)",
+            code,
+        )
 
     def test_tcgen05_clc_persistent_cluster_m1_scheduler_tail_codegen(self) -> None:
         """CLC cluster_m=1 also drains the scheduler pipeline after sentinel."""
@@ -6322,6 +6418,12 @@ class TestCuteLowerings(unittest.TestCase):
                 "cutlass.pipeline.Agent.Thread, cutlass.Int32(2))",
                 code,
             )
+            # The shared scheduler broadcast branch already restricts
+            # peer_rank < cluster_m, so the non-CLC scheduler path should not
+            # recompute peer_m with a modulo.
+            self.assertIn("_cute_store_shared_remote_x4", code)
+            self.assertIn("tcgen05_sched_peer_m = tcgen05_sched_peer_rank", code)
+            self.assertNotIn("tcgen05_sched_peer_rank %", code)
             self.assertIn(Tcgen05PersistentProgramIDs._MULTI_TILE_GUARD_TOTAL_VAR, code)
             with self.assertRaisesRegex(
                 RuntimeError,
@@ -6883,6 +6985,112 @@ class TestCuteLowerings(unittest.TestCase):
                     ),
                 }
             )
+
+    def test_tcgen05_sched_stage_count_config_validation(self) -> None:
+        """Two-stage sched mailbox is restricted to clustered CLC scheduling."""
+
+        config_spec = ConfigSpec(backend=CuteBackend())
+        with self.assertRaisesRegex(
+            exc.InvalidConfig,
+            "tcgen05-enabled CuTe matmul kernels",
+        ):
+            config_spec.normalize({TCGEN05_SCHED_STAGE_COUNT_CONFIG_KEY: 2})
+
+        config_spec.cute_tcgen05_search_enabled = True
+        for block_id, size_hint in enumerate((256, 256, 128)):
+            config_spec.block_sizes.append(
+                BlockSizeSpec(
+                    block_id=block_id,
+                    size_hint=size_hint,
+                    max_size=size_hint,
+                )
+            )
+        with self.assertRaisesRegex(exc.InvalidConfig, "must be one of"):
+            config_spec.normalize(
+                {
+                    TCGEN05_SCHED_STAGE_COUNT_CONFIG_KEY: 3,
+                    "block_sizes": [256, 256, 128],
+                }
+            )
+        with self.assertRaisesRegex(exc.InvalidConfig, "must be one of"):
+            config_spec.normalize(
+                {
+                    TCGEN05_SCHED_STAGE_COUNT_CONFIG_KEY: True,
+                    "block_sizes": [256, 256, 128],
+                }
+            )
+        with self.assertRaisesRegex(exc.InvalidConfig, "must be one of"):
+            config_spec.normalize(
+                {
+                    TCGEN05_SCHED_STAGE_COUNT_CONFIG_KEY: 2.0,
+                    "block_sizes": [256, 256, 128],
+                }
+            )
+        with self.assertRaisesRegex(exc.InvalidConfig, "only supported"):
+            config_spec.normalize(
+                {
+                    TCGEN05_SCHED_STAGE_COUNT_CONFIG_KEY: 2,
+                    "block_sizes": [256, 256, 128],
+                    "pid_type": "persistent_interleaved",
+                    "tcgen05_strategy": "role_local_with_scheduler",
+                    "tcgen05_warp_spec_scheduler_warps": 1,
+                    "tcgen05_persistence_model": "static_persistent",
+                    "tcgen05_cluster_m": 2,
+                }
+            )
+        with self.assertRaisesRegex(exc.InvalidConfig, "only supported"):
+            config_spec.normalize(
+                {
+                    TCGEN05_SCHED_STAGE_COUNT_CONFIG_KEY: 2,
+                    "block_sizes": [256, 256, 128],
+                    "pid_type": "persistent_interleaved",
+                    "tcgen05_strategy": "role_local_with_scheduler",
+                    "tcgen05_warp_spec_scheduler_warps": 0,
+                    "tcgen05_persistence_model": "clc_persistent",
+                    "tcgen05_cluster_m": 2,
+                }
+            )
+        valid = {
+            TCGEN05_SCHED_STAGE_COUNT_CONFIG_KEY: 2,
+            "block_sizes": [256, 256, 128],
+            "pid_type": "persistent_interleaved",
+            "tcgen05_strategy": "role_local_with_scheduler",
+            "tcgen05_warp_spec_scheduler_warps": 1,
+            "tcgen05_persistence_model": "clc_persistent",
+            "tcgen05_cluster_m": 2,
+        }
+        config_spec.normalize(valid)
+        self.assertEqual(valid[TCGEN05_SCHED_STAGE_COUNT_CONFIG_KEY], 2)
+
+        with self.assertRaisesRegex(exc.InvalidConfig, "omitted shared-loop"):
+            config_spec.normalize(
+                {
+                    TCGEN05_SCHED_STAGE_COUNT_CONFIG_KEY: 2,
+                    "block_sizes": [128, 256, 128],
+                    "pid_type": "persistent_interleaved",
+                    "tcgen05_strategy": "role_local_with_scheduler",
+                    "tcgen05_warp_spec_scheduler_warps": 1,
+                    "tcgen05_persistence_model": "clc_persistent",
+                    "tcgen05_cluster_m": 2,
+                }
+            )
+
+        # This minimal pre-projection config lacks the full validated CLC
+        # envelope; _fix_invalid search repair may downgrade CLC persistence,
+        # and the staged mailbox knob must be removed with that repair.
+        fix_invalid_downgrade_drops_key = {
+            TCGEN05_SCHED_STAGE_COUNT_CONFIG_KEY: 2,
+            "block_sizes": [256, 256, 128],
+            "pid_type": "persistent_interleaved",
+            "tcgen05_strategy": "role_local_with_scheduler",
+            "tcgen05_warp_spec_scheduler_warps": 1,
+            "tcgen05_persistence_model": "clc_persistent",
+            "tcgen05_cluster_m": 2,
+        }
+        config_spec.normalize(fix_invalid_downgrade_drops_key, _fix_invalid=True)
+        self.assertNotIn(
+            TCGEN05_SCHED_STAGE_COUNT_CONFIG_KEY, fix_invalid_downgrade_drops_key
+        )
 
     def test_tcgen05_cluster_m2_cta_group_one_bridge_can_skip_ab_advance(
         self,
@@ -15430,6 +15638,72 @@ class TestPersistentLoopSplitter(unittest.TestCase):
         self.assertIn(f"{total_var} = 0 + 1", host_src)
         self.assertIn(f"if {total_var} > 0", host_src)
         self.assertIn("supports runtime execution only", host_src)
+
+    def test_staged_sched_mailbox_rejects_multi_root_shared_loop(self) -> None:
+        """Multi-root staged sched mailboxes reject before prelude allocation."""
+
+        from helion._compiler.program_id import ForEachProgramID
+        from helion._compiler.program_id import Tcgen05PersistentProgramIDs
+
+        class _Case:
+            def __init__(self, expr: str) -> None:
+                self.expr = expr
+
+            def total_pids_expr(self, *, is_device: bool) -> str:
+                return self.expr
+
+        fake_pid = ForEachProgramID("pid_shared")
+        fake_pid.cases = [_Case("0"), _Case("1")]  # type: ignore[list-item]
+        role_blocks = [
+            Tcgen05PersistentProgramIDs._PersistentRoleBlock(
+                role_predicate="__test_tma_load_warp__",
+                stmts=[self._stmt("tma_value = 1")],
+            ),
+            Tcgen05PersistentProgramIDs._PersistentRoleBlock(
+                role_predicate="__test_mma_exec_warp__",
+                stmts=[self._stmt("mma_value = 1")],
+            ),
+            Tcgen05PersistentProgramIDs._PersistentRoleBlock(
+                role_predicate="__test_epi_warp__",
+                stmts=[self._stmt("epi_value = 1")],
+            ),
+        ]
+        partition = Tcgen05PersistentProgramIDs._PartitionedRoleBody(
+            role_blocks_inline=[],
+            role_blocks_extracted=role_blocks,
+            shared_body_extracted=[],
+        )
+        shared_stmt = self._stmt("shared_work = 1")
+
+        class _DeviceFunction:
+            def __init__(self) -> None:
+                self.body = [shared_stmt]
+                self.pid = fake_pid
+                self.codegen = SimpleNamespace(host_statements=[])
+
+        splitter, _ = self._make_helper()
+        splitter.virtual_pid_var = "virtual_pid"  # type: ignore[attr-defined]
+        layout = self._make_minimal_layout(cluster_m=2)
+        device_function = _DeviceFunction()
+
+        splitter._extract_tcgen05_post_loop_stmts = (  # type: ignore[attr-defined]
+            lambda device, body: (body, [])
+        )
+        splitter._split_tcgen05_invariant_setup = (  # type: ignore[attr-defined]
+            lambda device, body: ([], [], body)
+        )
+        splitter._build_tcgen05_persistent_layout = (  # type: ignore[attr-defined]
+            lambda device: layout
+        )
+        splitter._partition_tcgen05_role_blocks = (  # type: ignore[attr-defined]
+            lambda device, body: partition
+        )
+        splitter._tcgen05_uses_staged_work_tile_mailbox = (  # type: ignore[attr-defined]
+            lambda: True
+        )
+
+        with self.assertRaisesRegex(exc.InvalidConfig, "omitted shared-loop"):
+            splitter._setup_tcgen05_persistent_kernel(device_function)
 
     def test_unmarked_statements_are_hoisted(self) -> None:
         splitter, df = self._make_helper()
