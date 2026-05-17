@@ -2089,6 +2089,7 @@ def _register_load_store_tunables(
             EnumFragment(choices=env.config_spec.valid_indexing_types()),
             length=total_count,
         )
+    env.config_spec.maybe_enable_tensor_descriptor_inner_range_seed_configs()
 
 
 def _register_atomic_tunables(atomic_count: int) -> None:

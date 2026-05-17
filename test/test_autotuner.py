@@ -29,6 +29,14 @@ import torch
 import helion
 from helion import _compat
 from helion import exc
+from helion._compiler.autotuner_heuristics import compiler_seed_configs
+from helion._compiler.autotuner_heuristics.triton import (
+    TritonTensorDescriptorInnerRangeDefaultHeuristic,
+)
+from helion._compiler.autotuner_heuristics.triton import (
+    TritonTensorDescriptorInnerRangeInnerHeuristic,
+)
+from helion._compiler.backend import TritonBackend
 from helion._compiler.tile_dispatch import BlockIDStrategyMapping
 from helion._compiler.tile_dispatch import TileStrategyDispatch
 from helion._testing import DEVICE
@@ -61,6 +69,13 @@ from helion.autotuner.config_fragment import NumThreadsFragment
 from helion.autotuner.config_fragment import PermutationFragment
 from helion.autotuner.config_fragment import PowerOfTwoFragment
 from helion.autotuner.config_generation import ConfigGeneration
+from helion.autotuner.config_spec import BlockSizeSpec
+from helion.autotuner.config_spec import ConfigSpec
+from helion.autotuner.config_spec import RangeFlattenSpec
+from helion.autotuner.config_spec import RangeMultiBufferSpec
+from helion.autotuner.config_spec import RangeNumStagesSpec
+from helion.autotuner.config_spec import RangeUnrollFactorSpec
+from helion.autotuner.config_spec import RangeWarpSpecializeSpec
 from helion.autotuner.effort_profile import get_effort_profile
 from helion.autotuner.finite_search import FiniteSearch
 from helion.autotuner.local_cache import LocalAutotuneCache
@@ -810,6 +825,159 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         # We expect all the unroll factors to be set to 0
         configs = ConfigGeneration(spec, overrides=overrides).random_population(10)
         self.assertExpectedJournal("\n".join(map(repr, configs)))
+
+    @patch.object(_compat, "_supports_tensor_descriptor", lambda: True)
+    @patch.object(loops, "_supports_warp_specialize", lambda: True)
+    @patch("torch.version.hip", None)
+    @patch("torch.version.xpu", None)
+    def test_tensor_descriptor_inner_range_seed_configs(self):
+        def compiler_seeds_for_spec(spec: ConfigSpec) -> list[helion.Config]:
+            env = SimpleNamespace(
+                backend_name="triton",
+                config_spec=spec,
+                settings=Settings(),
+            )
+            return compiler_seed_configs(env, Mock())
+
+        def make_spec(
+            *,
+            store_indices: list[int] | None = None,
+            atomic_count: int = 0,
+            warp_specialize: bool = True,
+        ) -> ConfigSpec:
+            spec = ConfigSpec(backend=TritonBackend())
+            spec.block_sizes.append(BlockSizeSpec(block_id=0, size_hint=4096))
+            spec.block_sizes.append(BlockSizeSpec(block_id=2, size_hint=8192))
+            for block_id in (0, 2):
+                spec.range_unroll_factors.append(RangeUnrollFactorSpec([block_id]))
+                if warp_specialize:
+                    spec.range_warp_specialize.append(
+                        RangeWarpSpecializeSpec([block_id])
+                    )
+                spec.range_num_stages.append(RangeNumStagesSpec([block_id]))
+                spec.range_multi_buffers.append(RangeMultiBufferSpec([block_id]))
+                spec.range_flattens.append(RangeFlattenSpec([block_id]))
+            spec.indexing = ListOf(
+                EnumFragment(choices=spec.valid_indexing_types()),
+                length=8,
+            )
+            spec.load_eviction_policies = ListOf(
+                EnumFragment(choices=("", "first", "last")),
+                length=5,
+            )
+            spec.atomic_indexing = ListOf(
+                EnumFragment(choices=spec.valid_atomic_indexing_types()),
+                length=atomic_count,
+            )
+            spec.store_indices = [] if store_indices is None else store_indices
+            return spec
+
+        expected_seed_configs = [
+            {
+                "block_sizes": [32, 8],
+                "indexing": [
+                    "tensor_descriptor",
+                    "pointer",
+                    "pointer",
+                    "tensor_descriptor",
+                    "pointer",
+                    "pointer",
+                    "tensor_descriptor",
+                    "tensor_descriptor",
+                ],
+                "load_eviction_policies": ["last", "last", "", "first", ""],
+                "num_stages": 3,
+                "num_warps": 4,
+                "pid_type": "flat",
+                "range_flattens": [None, False],
+                "range_multi_buffers": [None, None],
+                "range_num_stages": [0, 4],
+                "range_unroll_factors": [0, 0],
+                "range_warp_specializes": [None, None],
+            },
+            {
+                "block_sizes": [32, 8],
+                "indexing": [
+                    "pointer",
+                    "pointer",
+                    "pointer",
+                    "tensor_descriptor",
+                    "pointer",
+                    "pointer",
+                    "tensor_descriptor",
+                    "tensor_descriptor",
+                ],
+                "load_eviction_policies": ["", "last", "last", "first", ""],
+                "num_stages": 6,
+                "num_warps": 4,
+                "pid_type": "flat",
+                "range_flattens": [None, True],
+                "range_multi_buffers": [None, False],
+                "range_num_stages": [0, 4],
+                "range_unroll_factors": [0, 0],
+                "range_warp_specializes": [None, False],
+            },
+        ]
+        expected_heuristics = [
+            TritonTensorDescriptorInnerRangeDefaultHeuristic.name,
+            TritonTensorDescriptorInnerRangeInnerHeuristic.name,
+        ]
+
+        spec = make_spec()
+
+        self.assertEqual(spec.autotune_seed_configs(), [])
+        self.assertFalse(spec.tensor_descriptor_inner_range_seed_configs_enabled)
+        mismatch_spec = make_spec(store_indices=[4, 6])
+        mismatch_spec.maybe_enable_tensor_descriptor_inner_range_seed_configs()
+        self.assertFalse(
+            mismatch_spec.tensor_descriptor_inner_range_seed_configs_enabled
+        )
+        self.assertEqual(compiler_seeds_for_spec(mismatch_spec), [])
+
+        atomic_spec = make_spec(store_indices=[4, 6, 7], atomic_count=1)
+        atomic_spec.maybe_enable_tensor_descriptor_inner_range_seed_configs()
+        self.assertFalse(atomic_spec.tensor_descriptor_inner_range_seed_configs_enabled)
+        self.assertEqual(compiler_seeds_for_spec(atomic_spec), [])
+
+        spec.store_indices = [4, 6, 7]
+        spec.maybe_enable_tensor_descriptor_inner_range_seed_configs()
+        self.assertTrue(spec.tensor_descriptor_inner_range_seed_configs_enabled)
+
+        seeds = compiler_seeds_for_spec(spec)
+        self.assertEqual(len(seeds), 2)
+        self.assertEqual([seed.config for seed in seeds], expected_seed_configs)
+        self.assertEqual(spec.autotuner_heuristics, expected_heuristics)
+
+        spec.compiler_seed_configs = seeds
+        gen = ConfigGeneration(spec)
+        normalized_seeds = [config for _flat, config in gen.seed_flat_config_pairs()]
+        configs = gen.random_population(3)
+        self.assertEqual(configs[1:], normalized_seeds)
+
+        no_warp_spec = make_spec(store_indices=[4, 6, 7], warp_specialize=False)
+        no_warp_spec.maybe_enable_tensor_descriptor_inner_range_seed_configs()
+        no_warp_seeds = compiler_seeds_for_spec(no_warp_spec)
+        self.assertEqual(len(no_warp_seeds), 2)
+        self.assertTrue(
+            all("range_warp_specializes" not in seed.config for seed in no_warp_seeds)
+        )
+
+        layer_norm = import_path(examples_dir / "layer_norm.py")
+        m, n = 4096, 1024
+        grad_out = torch.randn((m, n), device=DEVICE, dtype=torch.float16)
+        x = torch.randn((m, n), device=DEVICE, dtype=torch.float16)
+        mean = torch.randn((m,), device=DEVICE, dtype=torch.float32)
+        rstd = torch.randn((m,), device=DEVICE, dtype=torch.float32)
+        weight = torch.randn((n,), device=DEVICE, dtype=torch.float16)
+        bound = layer_norm.layer_norm_bwd.bind((grad_out, x, mean, rstd, weight))
+        self.assertTrue(
+            bound.config_spec.tensor_descriptor_inner_range_seed_configs_enabled
+        )
+        self.assertEqual(
+            [seed.config for seed in bound.config_spec.compiler_seed_configs],
+            expected_seed_configs,
+        )
+        self.assertEqual(bound.config_spec.autotuner_heuristics, expected_heuristics)
 
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: True)
     def test_config_generation_overrides(self):

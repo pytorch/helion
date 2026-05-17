@@ -6,6 +6,8 @@ from typing import TYPE_CHECKING
 from .common import dedupe_configs
 from .cute import CuteTcgen05ClusterM2Heuristic
 from .triton import TritonSkinnyGemmHeuristic
+from .triton import TritonTensorDescriptorInnerRangeDefaultHeuristic
+from .triton import TritonTensorDescriptorInnerRangeInnerHeuristic
 
 if TYPE_CHECKING:
     from ...runtime.config import Config
@@ -16,7 +18,11 @@ if TYPE_CHECKING:
 # All active heuristics by backend
 HEURISTICS_BY_BACKEND: dict[str, tuple[AutotunerHeuristicType, ...]] = {
     "cute": (CuteTcgen05ClusterM2Heuristic,),
-    "triton": (TritonSkinnyGemmHeuristic,),
+    "triton": (
+        TritonSkinnyGemmHeuristic,
+        TritonTensorDescriptorInnerRangeDefaultHeuristic,
+        TritonTensorDescriptorInnerRangeInnerHeuristic,
+    ),
 }
 
 log: logging.Logger = logging.getLogger(__name__)
