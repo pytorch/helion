@@ -30,12 +30,14 @@ def setUpModule() -> None:
     global _orig_matmul_fp32_precision, _orig_cudnn_fp32_precision
     _orig_matmul_fp32_precision = torch.backends.cuda.matmul.fp32_precision
     _orig_cudnn_fp32_precision = torch.backends.cudnn.conv.fp32_precision
-    torch.backends.cuda.matmul.fp32_precision = "tf32"
+    torch.set_float32_matmul_precision("high")
     torch.backends.cudnn.conv.fp32_precision = "tf32"
 
 
 def tearDownModule() -> None:
-    torch.backends.cuda.matmul.fp32_precision = _orig_matmul_fp32_precision
+    torch.set_float32_matmul_precision(
+        "high" if _orig_matmul_fp32_precision == "tf32" else "highest"
+    )
     torch.backends.cudnn.conv.fp32_precision = _orig_cudnn_fp32_precision
 
 

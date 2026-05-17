@@ -1092,7 +1092,7 @@ def run_example(
         assert dist.group.WORLD is not None
         process_group_name = dist.group.WORLD.group_name
     try:
-        torch.backends.cuda.matmul.fp32_precision = "tf32"
+        torch.set_float32_matmul_precision("high")
         torch.backends.cudnn.conv.fp32_precision = "tf32"  # type: ignore[reportAttributeAccessIssue]
     except AttributeError:  # No cudnn available
         torch.set_float32_matmul_precision("high")  # older deprecated API
