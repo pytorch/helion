@@ -579,6 +579,48 @@ class TestPallas(TestCase):
         torch.testing.assert_close(x, x_copy)
         torch.testing.assert_close(y, y_copy)
 
+    def test_if_branch_intermediate_outputs(self) -> None:
+        """Branch intermediates must survive in _if output list."""
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def if_with_intermediate(
+            x: torch.Tensor, flag: float
+        ) -> torch.Tensor:
+            n, m = x.shape
+            block_n = hl.register_block_size(n)
+            block_m = hl.register_block_size(m)
+            out = torch.empty([n], device=x.device, dtype=torch.float32)
+            for tile_n in hl.tile(n, block_size=block_n):
+                acc = hl.zeros([tile_n, block_m], dtype=torch.float32)
+                for tile_m in hl.tile(m, block_size=block_m):
+                    v = x[tile_n, tile_m]
+                    if flag == 0.0:
+                        doubled = v * 2
+                        acc += doubled + 1
+                    else:
+                        acc += v
+                out[tile_n] = torch.sum(acc, dim=1)
+            return out
+
+        x = torch.randn(64, 64, device=DEVICE, dtype=torch.float32)
+
+        # else-branch
+        code, result = code_and_output(
+            if_with_intermediate,
+            (x, 0.5),
+            block_sizes=[1, 64],
+        )
+        self.assertIn("lax.cond", code)
+        torch.testing.assert_close(result, torch.sum(x, dim=1))
+
+        # if-branch
+        _, result = code_and_output(
+            if_with_intermediate,
+            (x, 0.0),
+            block_sizes=[1, 64],
+        )
+        torch.testing.assert_close(result, torch.sum(x * 2 + 1, dim=1))
+
     def test_add_2d(self) -> None:
         args = (
             torch.randn(64, 512, device=DEVICE, dtype=torch.float32),

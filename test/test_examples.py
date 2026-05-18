@@ -1556,7 +1556,6 @@ class TestExamples(RefEagerTestBase, TestCase):
             num_stages=3,
         )
 
-    @xfailIfPallas("InductorLoweringError")
     def test_jsd(self):
         args = (
             torch.randn([1024, 4096], device=DEVICE, dtype=torch.float32).log_softmax(
