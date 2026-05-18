@@ -342,6 +342,16 @@ class Backend(abc.ABC):
     def broadcast_to_expr(self, expr: str, shape: str) -> str:
         raise exc.BackendUnsupported(self.name, "broadcast_to")
 
+    def maybe_reshape_reduction(
+        self,
+        expr: str,
+        source_shape: Sequence[int],
+        target_shape: Sequence[int],
+        target_shape_expr: str,
+    ) -> str:
+        """Reshape a reduction result from its physical to logical shape."""
+        return self.reshape_expr(expr, target_shape_expr)
+
     def reduction_index_expr(
         self, block_size_var: str, dtype: str, block_idx: int, *, axis: int
     ) -> str:
@@ -783,6 +793,21 @@ class TritonBackend(Backend):
 
     def broadcast_to_expr(self, expr: str, shape: str) -> str:
         return f"tl.broadcast_to({expr}, {shape})"
+
+    def maybe_reshape_reduction(
+        self,
+        expr: str,
+        source_shape: Sequence[int],
+        target_shape: Sequence[int],
+        target_shape_expr: str,
+    ) -> str:
+        # Triton reductions over a 1D tile produce a scalar even when
+        # keepdim=True makes the logical result shape [1]. tl.reshape() only
+        # accepts block tensors here, so leave the scalar and let later ops
+        # broadcast it.
+        if not source_shape and math.prod(target_shape) == 1:
+            return expr
+        return self.reshape_expr(expr, target_shape_expr)
 
     def reduction_index_expr(
         self, block_size_var: str, dtype: str, block_idx: int, *, axis: int

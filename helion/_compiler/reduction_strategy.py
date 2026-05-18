@@ -345,8 +345,14 @@ class ReductionStrategy(TileStrategy):
         size.pop(dim)
         if [*fake_output.size()] == size:
             return expr
+        backend = CompileEnvironment.current().backend
         shape = self.fn.tile_strategy.shape_str([*fake_output.size()])
-        return CompileEnvironment.current().backend.reshape_expr(expr, shape)
+        return backend.maybe_reshape_reduction(
+            expr,
+            source_shape=size,
+            target_shape=[*fake_output.size()],
+            target_shape_expr=shape,
+        )
 
     def broadcast_str(self, base: str, fake_input: torch.Tensor, dim: int) -> str:
         input_size = [*fake_input.size()]
