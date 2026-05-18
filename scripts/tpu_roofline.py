@@ -93,6 +93,18 @@ from llo_parse import parse_llo_dump
 # were all calibrated against TPU v7x. Running on a different generation
 # (v5p, v6e, etc.) without re-calibration will produce wrong predictions.
 SUPPORTED_TPU_VERSION = "v7x"
+# Measurement protocol assumed by all calibration constants below:
+#   for _ in range(iters): out = fn(*inputs)   # async — futures, no sync
+#   out.block_until_ready()                    # single device sync at end
+#   elapsed_per_call = (perf_counter() - t0) / iters
+# This captures steady-state per-call cost in an async pipeline (dispatch and
+# DMA setup overlap across iterations). It does NOT measure the cold per-call
+# latency you'd get from block-after-every-call, which adds ~10-30 µs of
+# Python/dispatch overhead between iterations.
+# MIN_TIME_FLOOR_US (30) and ADDITIVE_OVERHEAD_US (6) below were fit against
+# measurements taken this way; per-call-sync measurements drift higher and
+# would need their own calibration. Always measure with at least 30 iters;
+# bump to 100+ for kernels close to the 30 µs floor where variance dominates.
 CLOCK_GHZ = 2.2
 HBM_PEAK_GBPS = 3_690.0
 HBM_EFFECTIVE_GBPS = 3_160.0  # ~85.6% of peak (measured, jnp.add streaming)

@@ -113,6 +113,23 @@ Verified on three prior outliers: rpa_decode/prefill/mixed and gmm_v2_M=4096 all
 - `--inner-loop-iters K` — explicit override (wins over meta.yaml).
 - `--dynamic-bundles N` — completely override the parser's bundle count.
 
+## Measurement protocol (calibration assumes this)
+
+All `MIN_TIME_FLOOR_US`, `ADDITIVE_OVERHEAD_US`, and per-lane realization constants in `scripts/tpu_roofline.py` were fit against measurements taken this way:
+
+```python
+for _ in range(iters):
+    out = fn(*inputs)          # async — futures, no sync
+out.block_until_ready()        # single device sync at the very end
+elapsed_per_call_us = (perf_counter() - t0) / iters * 1e6
+```
+
+This captures **steady-state per-call cost in an async pipeline** — dispatch and DMA setup overlap with previous iterations' execution. It does NOT measure cold per-call latency; per-call sync adds ~10–30 µs of Python+dispatch overhead between iters and would need separate calibration.
+
+Runners in `scripts/llo_runner_*.py` follow this convention. When writing a new runner, match it — otherwise measured vs predicted will drift in a way that looks like a model bug but is actually a measurement-protocol mismatch.
+
+Practical: `iters >= 30` for kernels well above the 30 µs floor; `iters >= 100` for kernels close to the floor (variance dominates).
+
 ## Common gotchas
 
 - **Helion kernel naming**: `custom_kernel.<N>` is your kernel; the *largest* dump in the directory is usually the XLA baseline reference. Grep for `vmatmul`/`vexp` content to confirm.
