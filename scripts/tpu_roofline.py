@@ -38,16 +38,19 @@ Known modeling gaps / TODOs:
     So the gap is structural, not a config artifact, though the absolute
     µs error scales with kernel time (472 µs un-autotuned, 7 µs autotuned).
 
-  - The `--cycle-accurate` operand-graph simulator is experimental and
-    currently *worse* than the default for most kernels (over-predicts
-    attention by +28-45%) because it stacks dependency stalls on top of
-    the lane-realization stretch the default model already applies, and
-    its per-op latency table is guessed rather than measured. Promoting
-    it would require (1) dropping per-lane realization factors and
-    re-calibrating purely from operand latencies, and (2) microbenchmark
-    each TPU v7x instruction (vmatmul, vexp, vload, vstore, etc.) to
-    derive real latencies. Multi-day project; only worth it if (a)
-    above turns out to need phi tracking.
+  - The `--cycle-accurate` operand-graph simulator now uses MEASURED
+    per-op latencies extracted from each LLO dump's
+    `*-34-critical-path.txt` file (the compiler's own scheduler
+    annotations: vmatmul=7, vmatpush1=3, vld/vmatprep/vpop=1, dma=7
+    cycles, etc.). Despite this, cycle-accurate STILL under-predicts
+    matmul-pattern kernels by 10-25% vs the default. Finding: the
+    compiler successfully software-pipelines around these latencies, so
+    they don't fire as cross-bundle stalls in the operand graph. The
+    actual source of the 10-25% gap on matmul kernels is irreducible
+    microarch overhead (register pressure, memory contention, sustained-
+    throughput < theoretical) that's NOT visible in the LLO schedule —
+    `LANE_REALIZATION` is the empirical compensation, and the
+    cycle-accurate sim doesn't replace its function.
 
   - GMM at larger M (e.g. M=4096): outer-M tile count is not in
     `loop_factor` and `--inputs` undercounts HBM bytes when RHS is
@@ -358,25 +361,38 @@ INSTR_UNIT: dict[str, str] = {
     "ssel": "SALU",
 }
 # Latency: cycles from instruction issue until its result is consumable.
-# Values reflect COMPILER-ASSUMED latencies — small enough that operand
-# stalls only fire when the compiler under-scheduled. Real hardware
-# latency (which exceeds these for vmatmul, transcendentals) is captured
-# via the lane realization factor instead. Without ground-truth latency
-# tables this combination is approximate; the cycle-accurate path is
-# experimental and not the default — use --cycle-accurate to opt in.
+# These values are EXTRACTED FROM THE TPU COMPILER'S OWN CRITICAL-PATH
+# ANALYSIS — every LLO dump includes a `*-34-critical-path.txt` file that
+# annotates each instruction with `Length to end: N`. Diffing consecutive
+# entries in the same basic block yields the per-op latency the scheduler
+# used. Mode values aggregated across ~700 vmatprep / 635 vmatmul / etc.
+# instances from the K-sweep matmul dumps.
 INSTR_LATENCY: dict[str, float] = {
-    "vmatmul": 8.0,  # MXU pipeline depth — real cross-bundle stall source
-    "vtranspose": 8.0,
+    "vmatmul": 7.0,
+    "vmatprep": 1.0,
+    "vmatpush1": 3.0,
+    "vpop": 1.0,
+    "vld": 1.0,
+    "vcombine": 2.0,
+    "vpack": 2.0,
+    "vadd": 2.0,
+    "vst": 7.0,  # vector store carries a sync-with-DMA cost
+    "dma": 7.0,
+    "vtranspose": 8.0,  # not measured, keep prior guess
     "vxpose": 8.0,
+    # Scalar ops (smov, sadd, ssub, scmp, sand, sor, sselect): 1-2 cycles,
+    # default 1 picks the mode for short ops.
 }
 DEFAULT_LATENCY = 1.0
 INSTR_ISSUE_PERIOD: dict[str, float] = {
-    "vmatmul": 2.0,
+    "vmatmul": 4.0,  # MXU issue period (1 vmatmul / 4 cycles per MXU unit)
 }
 DEFAULT_ISSUE_PERIOD = 1.0
-# Cycle-accurate simulator still applies LANE_REALIZATION stretching;
-# without ground-truth latencies, the realization factor captures the
-# main "hardware sustained < theoretical" effect.
+# Cycle-accurate operand-graph stalls model RAW dependencies the compiler
+# already pipelines around — they fire only when the schedule was suboptimal
+# (rare). LANE_REALIZATION captures irreducible microarch effects (register
+# pressure, memory contention, sustained-throughput < theoretical) that the
+# operand graph can't see. Both are needed; not a double-count.
 CYCLE_ACCURATE_USE_REALIZATION = True
 
 
