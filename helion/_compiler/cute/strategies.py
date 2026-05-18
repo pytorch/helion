@@ -111,12 +111,10 @@ class Tcgen05LayoutStrategy(str, enum.Enum):
     - ``DEFAULT``: rely on CuTe helpers (``compute_epilogue_tile_shape``,
       A/B major-mode swizzle inference). The autotuner cannot override
       these.
-    - ``EXPLICIT_EPI_TILE``: user/autotune controls ``epi_tile_*`` and
-      ``smem_swizzle_*`` via ``Tcgen05LayoutOverrides``. Fields whose
-      override is ``None`` fall back to the CuTe-derived value.
-
-    G2-A only declares the enum; ``EXPLICIT_EPI_TILE`` is wired in
-    G2-E once warp-spec strategies have moved perf.
+    - ``EXPLICIT_EPI_TILE``: a fail-closed tcgen05 path where
+      ``epi_tile_*`` and ``d_store_box_n`` are explicit validated
+      fields, while ``smem_swizzle_*`` remains independently
+      overridable.
     """
 
     DEFAULT = "default"
@@ -252,12 +250,10 @@ class Tcgen05LayoutOverrides:
     Each field's ``None`` default means "use the value the analysis
     pass computed" (CuTe helper output, atom contract, etc.).
 
-    G2-A introduces the slot. Today only ``Tcgen05LayoutStrategy.DEFAULT``
-    is wired through codegen; ``EXPLICIT_EPI_TILE`` (G2-E) is the
-    first consumer of the override fields. Validation today checks
-    only the structural shape (types + ranges) — atom-contract checks
-    against the active problem shape happen in lowering once the
-    strategy is consumed there.
+    ``EXPLICIT_EPI_TILE`` consumes the epilogue-tile fields in
+    tcgen05 codegen. Validation here checks structural shape and
+    ranges; atom-contract checks against the active problem shape
+    happen in lowering.
 
     ``smem_swizzle_a`` / ``smem_swizzle_b`` (user-config exposure only):
         Selects the A/B operand SMEM atom kind
@@ -452,7 +448,8 @@ def is_pure_matmul_role_lifecycle_config(config: Mapping[str, object]) -> bool:
 # ``pid_type=flat`` paired with ``static_persistent``.
 TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY = "tcgen05_persistence_model"
 
-# Layout strategy. Today only ``DEFAULT`` is wired through codegen.
+# Layout strategy. ``EXPLICIT_EPI_TILE`` is a guarded tcgen05 codegen
+# path for explicit D-store epilogue tile experiments.
 TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY = "tcgen05_layout_strategy"
 
 # ``Tcgen05WarpSpec`` field config keys. Each field is its own knob
@@ -642,6 +639,35 @@ def layout_overrides_from_config(
             config.get(TCGEN05_LAYOUT_OVERRIDES_D_STORE_BOX_N_KEY)
         ),
     )
+
+
+def tcgen05_explicit_epilogue_tile_expr(tile_m: int, tile_n: int) -> str:
+    """Return the CuTe expression for a validated explicit epilogue tile."""
+
+    return f"(cute.make_layout({tile_m}), cute.make_layout({tile_n}))"
+
+
+def tcgen05_default_epilogue_tile_expr(
+    bm: int, bn: int, elem_dtype: str, *, c_layout: str
+) -> str:
+    """Return the CuTe helper call for the default tcgen05 epilogue tile."""
+
+    return (
+        "cutlass.utils.blackwell_helpers.compute_epilogue_tile_shape("
+        f"({bm}, {bn}), False, {c_layout}, {elem_dtype}, "
+        f"layout_c={c_layout}, elem_ty_c={elem_dtype})"
+    )
+
+
+def tcgen05_explicit_d_store_tile_expr(tile_m: int, d_store_box_n: int) -> str:
+    """Return the CuTe expression for a validated explicit D-store box.
+
+    The current validated path requires ``d_store_box_n == epi_tile_n``.
+    Keep a store-named helper so wrapper/device store code keeps using the
+    D-store contract field rather than the matmul-plan epilogue field.
+    """
+
+    return tcgen05_explicit_epilogue_tile_expr(tile_m, d_store_box_n)
 
 
 # Set of ``pid_type`` values this helper knows how to map. Kept in
@@ -1106,5 +1132,19 @@ def validate_tcgen05_strategy_invariants(
                     f"one of {TCGEN05_LEGAL_SMEM_SWIZZLE_BYTES!r} "
                     "(swizzle bytes; 0 = no swizzle / INTER)"
                 )
+        if (
+            layout_overrides.epi_tile_m is None
+            or layout_overrides.epi_tile_n is None
+            or layout_overrides.d_store_box_n is None
+        ):
+            errors.append(
+                "tcgen05_layout_strategy='explicit_epi_tile' requires "
+                "layout_overrides.epi_tile_m, layout_overrides.epi_tile_n, "
+                "and layout_overrides.d_store_box_n"
+            )
+        elif layout_overrides.d_store_box_n != layout_overrides.epi_tile_n:
+            errors.append(
+                "layout_overrides.d_store_box_n must match layout_overrides.epi_tile_n"
+            )
 
     return errors

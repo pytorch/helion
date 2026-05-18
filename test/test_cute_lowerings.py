@@ -84,7 +84,12 @@ from helion._compiler.cute.matmul_utils import cute_resolve_active_matmul_k_bloc
 from helion._compiler.cute.matmul_utils import cute_static_k_invariant_extent
 from helion._compiler.cute.matmul_utils import cute_supports_scalar_matmul_fallback
 from helion._compiler.cute.strategies import ROLE_LOCAL_MONOLITHIC_DEFAULT_WARP_SPEC
+from helion._compiler.cute.strategies import TCGEN05_LAYOUT_OVERRIDES_D_STORE_BOX_N_KEY
+from helion._compiler.cute.strategies import TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_M_KEY
+from helion._compiler.cute.strategies import TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_N_KEY
+from helion._compiler.cute.strategies import TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY
 from helion._compiler.cute.strategies import TCGEN05_STRATEGY_CONFIG_KEY
+from helion._compiler.cute.strategies import Tcgen05LayoutStrategy
 from helion._compiler.cute.strategies import Tcgen05Strategy
 from helion._compiler.cute.strategies import Tcgen05WarpSpec
 from helion._compiler.cute.tcgen05_constants import (
@@ -2255,6 +2260,165 @@ class TestCuteLowerings(unittest.TestCase):
             "cute.nvgpu.tcgen05.SmemLayoutAtomKind.MN_SW128", override_code_128
         )
         self.assertNotEqual(_smem_lines(override_code), _smem_lines(override_code_128))
+
+    def test_tcgen05_explicit_epilogue_tile_consumed_by_codegen(self) -> None:
+        args = (
+            torch.empty([256, 128], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([128, 256], device=DEVICE, dtype=torch.bfloat16),
+        )
+        cfg = _make_tcgen05_role_local_monolithic_seed_config(
+            block_sizes=[256, 256, 128],
+            l2_groupings=[1],
+            pid_type="persistent_interleaved",
+            tcgen05_cluster_m=2,
+            tcgen05_cluster_n=1,
+            tcgen05_ab_stages=2,
+            tcgen05_acc_stages=2,
+            tcgen05_c_stages=2,
+            tcgen05_num_epi_warps=4,
+            **{
+                TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY: (
+                    Tcgen05LayoutStrategy.EXPLICIT_EPI_TILE.value
+                ),
+                TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_M_KEY: 128,
+                TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_N_KEY: 32,
+                TCGEN05_LAYOUT_OVERRIDES_D_STORE_BOX_N_KEY: 32,
+            },
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_role_local_monolithic_4096_bf16.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            code = bound.to_triton_code(cfg)
+
+        self.assertIn(
+            "tcgen05_epi_tile = (cute.make_layout(128), cute.make_layout(32))",
+            code,
+        )
+        self.assertIn(
+            "tcgen05_store_epi_tile = (cute.make_layout(128), cute.make_layout(32))",
+            code,
+        )
+        self.assertIn(
+            "get_tmem_load_op((256, 256, 128), tcgen05_c_layout, "
+            "cutlass.Float32, cutlass.Float32, tcgen05_epi_tile, True)",
+            code,
+        )
+        self.assertNotIn(
+            "tcgen05_store_epi_tile = cutlass.utils.blackwell_helpers", code
+        )
+        self.assertNotRegex(code, r"for tile_offset_\d+ in cutlass\.range\(")
+
+    def test_tcgen05_explicit_epilogue_tile_bk64_uses_nounroll_kloop(self) -> None:
+        args = (
+            torch.empty([256, 128], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([128, 256], device=DEVICE, dtype=torch.bfloat16),
+        )
+        cfg = _make_tcgen05_role_local_monolithic_seed_config(
+            block_sizes=[256, 256, 64],
+            l2_groupings=[1],
+            pid_type="persistent_interleaved",
+            tcgen05_cluster_m=2,
+            tcgen05_cluster_n=1,
+            tcgen05_ab_stages=2,
+            tcgen05_acc_stages=2,
+            tcgen05_c_stages=2,
+            tcgen05_num_epi_warps=4,
+            **{
+                TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY: (
+                    Tcgen05LayoutStrategy.EXPLICIT_EPI_TILE.value
+                ),
+                TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_M_KEY: 128,
+                TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_N_KEY: 32,
+                TCGEN05_LAYOUT_OVERRIDES_D_STORE_BOX_N_KEY: 32,
+            },
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_role_local_monolithic_4096_bf16.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            code = bound.to_triton_code(cfg)
+
+        self.assertRegex(
+            code,
+            r"for tile_offset_\d+ in cutlass\.range\("
+            r"cutlass\.Int32\(0\), cutlass\.Int32\(128\), "
+            r"cutlass\.Int32\(_BLOCK_SIZE_\d+\), unroll=1\):",
+        )
+        self.assertNotRegex(
+            code,
+            r"for tile_offset_\d+ in range\("
+            r"cutlass\.Int32\(0\), cutlass\.Int32\(128\), ",
+        )
+
+    def test_tcgen05_explicit_epilogue_tile_rejects_unsupported_shape(self) -> None:
+        args = (
+            torch.empty([256, 128], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([128, 256], device=DEVICE, dtype=torch.bfloat16),
+        )
+        cfg = _make_tcgen05_role_local_monolithic_seed_config(
+            block_sizes=[256, 256, 128],
+            l2_groupings=[1],
+            pid_type="persistent_interleaved",
+            tcgen05_cluster_m=2,
+            tcgen05_cluster_n=1,
+            tcgen05_ab_stages=2,
+            tcgen05_acc_stages=2,
+            tcgen05_c_stages=2,
+            tcgen05_num_epi_warps=4,
+            **{
+                TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY: (
+                    Tcgen05LayoutStrategy.EXPLICIT_EPI_TILE.value
+                ),
+                TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_M_KEY: 128,
+                TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_N_KEY: 64,
+                TCGEN05_LAYOUT_OVERRIDES_D_STORE_BOX_N_KEY: 64,
+            },
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_role_local_monolithic_4096_bf16.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            with self.assertRaisesRegex(
+                exc.BackendUnsupported,
+                r"epi_tile=\(128, 32\).*d_store_box_n=32",
+            ):
+                bound.to_triton_code(cfg)
+
+    def test_tcgen05_explicit_epilogue_tile_runtime_correctness(self) -> None:
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+
+        torch.manual_seed(0)
+        args = (
+            torch.randn(256, 128, device=DEVICE, dtype=torch.bfloat16),
+            torch.randn(128, 256, device=DEVICE, dtype=torch.bfloat16),
+        )
+        cfg = _make_tcgen05_role_local_monolithic_seed_config(
+            block_sizes=[256, 256, 128],
+            l2_groupings=[1],
+            pid_type="persistent_interleaved",
+            tcgen05_cluster_m=2,
+            tcgen05_cluster_n=1,
+            tcgen05_ab_stages=2,
+            tcgen05_acc_stages=2,
+            tcgen05_c_stages=2,
+            tcgen05_num_epi_warps=4,
+            **{
+                TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY: (
+                    Tcgen05LayoutStrategy.EXPLICIT_EPI_TILE.value
+                ),
+                TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_M_KEY: 128,
+                TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_N_KEY: 32,
+                TCGEN05_LAYOUT_OVERRIDES_D_STORE_BOX_N_KEY: 32,
+            },
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_role_local_monolithic_4096_bf16.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            bound.set_config(cfg)
+            out = bound(*args)
+
+        torch.testing.assert_close(out, args[0] @ args[1], atol=2e-1, rtol=1e-2)
 
     def test_tcgen05_smem_swizzle_override_runtime_correctness(self) -> None:
         """Explicit ``smem_swizzle_*`` overrides produce numerically-
@@ -11942,6 +12106,71 @@ class TestCuteLowerings(unittest.TestCase):
             "tcgen05_c_layout_1, cutlass.Float32",
             emitted,
         )
+
+    def test_tcgen05_layout_plan_setup_uses_explicit_epilogue_tile(self) -> None:
+        df = _FakeDeviceFunction()
+        plan = _new_tcgen05_layout_plan(df)
+        stmts = _make_tcgen05_layout_plan_setup(
+            plan,
+            "tiled_mma",
+            bm=256,
+            bn=256,
+            bk=128,
+            ab_stage_count=2,
+            is_two_cta=True,
+            input_dtype_str="cutlass.BFloat16",
+            acc_dtype_str="cutlass.Float32",
+            epi_elem_dtype_str="cutlass.BFloat16",
+            explicit_epi_tile_m=128,
+            explicit_epi_tile_n=32,
+        )
+        emitted = "\n".join(ast.unparse(stmt) for stmt in stmts)
+
+        self.assertIn(
+            "tcgen05_epi_tile_1 = (cute.make_layout(128), cute.make_layout(32))",
+            emitted,
+        )
+        self.assertIn(
+            "get_tmem_load_op((256, 256, 128), tcgen05_c_layout_1, "
+            "cutlass.Float32, cutlass.Float32, tcgen05_epi_tile_1, True)",
+            emitted,
+        )
+        self.assertNotIn("compute_epilogue_tile_shape", emitted)
+
+    def test_tcgen05_wrapper_uses_explicit_epilogue_tile(self) -> None:
+        body: list[str] = []
+        call_args: list[str] = []
+        _append_cute_wrapper_plan(
+            body,
+            call_args,
+            {
+                "kind": "tcgen05_d_tma",
+                "d_idx": 0,
+                "bm": 256,
+                "bn": 256,
+                "c_stage_count": 2,
+                "output_dtype": "cutlass.BFloat16",
+                "kernel_args": ["tcgen05_tma_store_atom", "tcgen05_tma_store_tensor"],
+                "epi_tile_m": 128,
+                "epi_tile_n": 32,
+                "d_store_box_n": 32,
+            },
+        )
+        emitted = "\n".join(body)
+
+        self.assertIn(
+            "tcgen05_tma_store_atom_epi_tile = "
+            "(cute.make_layout(128), cute.make_layout(32))",
+            emitted,
+        )
+        self.assertIn(
+            "make_smem_layout_epi(cutlass.BFloat16, "
+            "cutlass.utils.layout.LayoutEnum.ROW_MAJOR, "
+            "tcgen05_tma_store_atom_epi_tile, 2)",
+            emitted,
+        )
+        self.assertIn("cute.nvgpu.cpasync.make_tiled_tma_atom(", emitted)
+        self.assertNotIn("compute_epilogue_tile_shape", emitted)
 
     def test_tcgen05_layout_plan_setup_threads_mixed_input_output_dtype(
         self,

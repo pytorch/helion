@@ -15,6 +15,8 @@ import torch
 
 from .. import _compat as _compat  # ensure Triton compatibility patches run
 from .. import exc
+from .._compiler.cute.strategies import tcgen05_default_epilogue_tile_expr
+from .._compiler.cute.strategies import tcgen05_explicit_d_store_tile_expr
 from .._compiler.cute.strategies import tcgen05_smem_layout_expr
 from .._utils import triton_is_available
 from .config import Config as Config
@@ -1508,6 +1510,16 @@ def _append_cute_wrapper_plan(
         assert isinstance(value, int)
         return value
 
+    def plan_optional_int(key: str) -> int | None:
+        value = plan.get(key)
+        assert value is None or isinstance(value, int)
+        return value
+
+    def require_positive_int(value: int | None, name: str) -> int:
+        assert type(value) is int, name
+        assert value > 0, name
+        return value
+
     def append_tcgen05_epilogue_tma_wrapper(
         *,
         tensor_idx: int,
@@ -1517,8 +1529,29 @@ def _append_cute_wrapper_plan(
         dtype: str,
         kernel_args: list[str],
         copy_op: str,
+        epi_tile_m: int | None = None,
+        epi_tile_n: int | None = None,
+        d_store_box_n: int | None = None,
     ) -> None:
         assert len(kernel_args) == 2
+        explicit_epi_tile = any(
+            value is not None for value in (epi_tile_m, epi_tile_n, d_store_box_n)
+        )
+        if explicit_epi_tile:
+            checked_epi_tile_m = require_positive_int(epi_tile_m, "epi_tile_m")
+            checked_epi_tile_n = require_positive_int(epi_tile_n, "epi_tile_n")
+            checked_d_store_box_n = require_positive_int(d_store_box_n, "d_store_box_n")
+            assert checked_epi_tile_n == checked_d_store_box_n
+            epi_tile_expr = tcgen05_explicit_d_store_tile_expr(
+                checked_epi_tile_m, checked_d_store_box_n
+            )
+        else:
+            epi_tile_expr = tcgen05_default_epilogue_tile_expr(
+                bm,
+                bn,
+                dtype,
+                c_layout="cutlass.utils.layout.LayoutEnum.ROW_MAJOR",
+            )
         tma_atom, tma_tensor = kernel_args
         epi_tile = f"{tma_atom}_epi_tile"
         smem_layout = f"{tma_atom}_smem_layout"
@@ -1528,15 +1561,7 @@ def _append_cute_wrapper_plan(
         # SMEM staging must slice the same epilogue tile shape.
         body.extend(
             (
-                (
-                    f"    {epi_tile} = "
-                    "cutlass.utils.blackwell_helpers.compute_epilogue_tile_shape("
-                    f"({bm}, {bn}), False, "
-                    "cutlass.utils.layout.LayoutEnum.ROW_MAJOR, "
-                    f"{dtype}, "
-                    "layout_c=cutlass.utils.layout.LayoutEnum.ROW_MAJOR, "
-                    f"elem_ty_c={dtype})"
-                ),
+                f"    {epi_tile} = {epi_tile_expr}",
                 (
                     f"    {smem_layout} = cutlass.utils.blackwell_helpers."
                     "make_smem_layout_epi("
@@ -1574,6 +1599,9 @@ def _append_cute_wrapper_plan(
             dtype=output_dtype,
             kernel_args=kernel_args,
             copy_op="cute.nvgpu.cpasync.CopyBulkTensorTileS2GOp()",
+            epi_tile_m=plan_optional_int("epi_tile_m"),
+            epi_tile_n=plan_optional_int("epi_tile_n"),
+            d_store_box_n=plan_optional_int("d_store_box_n"),
         )
         return
     if kind == "tcgen05_aux_tma":

@@ -2212,7 +2212,9 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
             persistence_model=Tcgen05PersistenceModel.STATIC_PERSISTENT,
             layout_strategy=Tcgen05LayoutStrategy.EXPLICIT_EPI_TILE,
             warp_spec=ROLE_LOCAL_MONOLITHIC_DEFAULT_WARP_SPEC,
-            layout_overrides=Tcgen05LayoutOverrides(epi_tile_m=64, epi_tile_n=32),
+            layout_overrides=Tcgen05LayoutOverrides(
+                epi_tile_m=64, epi_tile_n=32, d_store_box_n=32
+            ),
             pid_type="persistent_blocked",
             cluster_m=1,
         )
@@ -2744,6 +2746,18 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         }
         spec.normalize(config2, _fix_invalid=True)
         self.assertIsNone(config2["tcgen05_layout_overrides_epi_tile_n"])
+
+        # Zero-sized explicit epilogue tiles are invalid and must not
+        # round-trip into generated ``cute.make_layout(0)`` calls.
+        config3 = {
+            "block_sizes": [256, 256, 16],
+            "l2_groupings": [1],
+            "pid_type": "persistent_blocked",
+            "tcgen05_cluster_m": 2,
+            "tcgen05_layout_overrides_d_store_box_n": 0,
+        }
+        spec.normalize(config3, _fix_invalid=True)
+        self.assertIsNone(config3["tcgen05_layout_overrides_d_store_box_n"])
 
     @onlyBackends(["cute"])
     def test_cute_tcgen05_strategy_normalize_idempotent_after_pid_type_fixup(
