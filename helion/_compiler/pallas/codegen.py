@@ -106,7 +106,7 @@ def _load_mask_expr(
     return "*".join(mask_exprs)
 
 
-def store_slice_value(
+def sliced_value_for_store(
     state: CodegenState,
     tensor: torch.Tensor,
     subscript: list[object] | tuple[object, ...],
@@ -215,15 +215,15 @@ def index_str(
     subscript: list[object] | tuple[object, ...],
     tensor: torch.Tensor,
 ) -> tuple[str, list[int]]:
-    index, none_dims, _parts = index_components(state, subscript, tensor)
-    return index, none_dims
+    parts, none_dims = index_parts(state, subscript, tensor)
+    return ", ".join(parts), none_dims
 
 
-def index_components(
+def index_parts(
     state: CodegenState,
     subscript: list[object] | tuple[object, ...],
     tensor: torch.Tensor,
-) -> tuple[str, list[int], list[str]]:
+) -> tuple[list[str], list[int]]:
     """Build a JAX/Pallas index string from a Helion subscript list.
 
     Uses ``pl.ds(offset, block_size)`` only for dimensions inside a looped
@@ -236,14 +236,13 @@ def index_components(
     (via BlockSpecs or DMA copies respectively).
 
     Also returns positions of ``None`` indices so the caller can apply
-    ``jnp.expand_dims`` after loading, plus the per-tensor-dimension index
-    parts used to build the final string.
+    ``jnp.expand_dims`` after loading.
     """
     from helion._compiler.tile_strategy import EmitPipelineLoopState
     from helion._compiler.tile_strategy import ForiLoopState
 
     if not subscript:
-        return "...", [], []
+        return ["..."], []
 
     # Check if we're inside an emit_pipeline or fori_loop that pipelines
     # this specific tensor.  Both loop types take a per-tensor decision:
@@ -286,7 +285,7 @@ def index_components(
         out_pos += 1
         tensor_dim += 1
 
-    return ", ".join(parts), none_dims, parts
+    return parts, none_dims
 
 
 def _get_indexing_patterns(state: CodegenState, tensor: torch.Tensor) -> list[object]:
