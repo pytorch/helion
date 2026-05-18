@@ -7,6 +7,7 @@ import inspect
 import linecache
 import os
 import sys
+import threading
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import cast
@@ -179,6 +180,494 @@ def default_launcher(
         if "Cannot make_shape_compatible: incompatible dimensions" in message:
             raise exc.ShapeMismatch("kernel operands", message) from error
         raise
+
+
+class _FastLauncher:
+    """Fast launcher that bypasses Triton's ``JITFunction.run`` Python frame.
+
+    On the first call this lazily JIT-compiles the underlying Triton kernel
+    (via ``triton_kernel.run(..., warmup=True)``), captures the resulting
+    ``CompiledKernel``, its packed metadata, the launch-hook callables, the
+    active driver/device, and the binder. Subsequent calls dispatch straight
+    into the C launcher Triton generates, skipping ``JITFunction.run``'s
+    cache lookup, ``compute_cache_key`` call, and per-call kwargs dict
+    construction.
+
+    The closure bakes in ``num_warps`` / ``num_stages`` /
+    ``launch_cooperative_grid`` / ``ptx_options`` so no per-call dict is
+    allocated on the hot path; it also caches a precomputed ``run_kwargs``
+    dict to pass to the binder on each call so that path stays Python-cheap
+    too.
+
+    If anything goes wrong while priming (e.g. an unsupported Triton
+    version, an alternative backend that doesn't expose
+    ``CompiledKernel.run``), the launcher transparently falls back to
+    :func:`default_launcher` so the kernel still runs.
+    """
+
+    __slots__ = (
+        "_active_driver",
+        "_binder",
+        "_bind_skip_safe",
+        "_compiled_kernel",
+        "_compiled_run",
+        "_device",
+        "_get_current_stream",
+        "_kernel_launch_metadata",
+        "_knobs_compilation",
+        "_knobs_runtime",
+        "_launch_cooperative_grid",
+        "_num_warps",
+        "_num_stages",
+        "_packed_metadata",
+        "_prime_lock",
+        "_primed",
+        "_priming_spec",
+        "_ptx_options",
+        "_run_kwargs",
+        "_triton_function",
+        "_used_global_checks",
+    )
+
+    def __init__(
+        self,
+        *,
+        num_warps: int,
+        num_stages: int,
+        launch_cooperative_grid: bool = False,
+        ptx_options: str | None = None,
+        extra_kwargs: dict | None = None,
+    ) -> None:
+        self._num_warps = num_warps
+        self._num_stages = num_stages
+        self._launch_cooperative_grid = launch_cooperative_grid
+        self._ptx_options = ptx_options
+        # Pre-built kwargs dict for the priming warmup AND the fallback path
+        # AND every binder() invocation. Stored once so the hot path doesn't
+        # have to build a fresh kwargs dict per launch.
+        run_kwargs: dict = {
+            "num_warps": num_warps,
+            "num_stages": num_stages,
+            "launch_cooperative_grid": launch_cooperative_grid,
+        }
+        if extra_kwargs:
+            run_kwargs.update(extra_kwargs)
+        if ptx_options is not None:
+            run_kwargs["ptx_options"] = ptx_options
+        self._run_kwargs = run_kwargs
+
+        # Serializes the first-call priming. Without this, two threads
+        # making their first call simultaneously can both pass the
+        # ``if not self._primed`` check and both enter ``_prime``, then
+        # interleave their attribute writes — leaving the launcher with
+        # (e.g.) thread A's ``_compiled_run`` paired with thread B's
+        # ``_triton_function``. We use the double-checked locking
+        # pattern: the ``_primed`` boolean is the fast-path check; the
+        # lock just guards the priming critical section.
+        self._prime_lock = threading.Lock()
+        # Lazy fields, set by _prime() on the first call.
+        self._primed = False
+        self._compiled_kernel: object = None
+        self._compiled_run: Callable[..., object] | None = None
+        self._triton_function: object = None
+        self._packed_metadata: object = None
+        self._kernel_launch_metadata: Callable[..., object] | None = None
+        self._active_driver: object = None
+        self._device: object = None
+        self._get_current_stream: Callable[[object], object] | None = None
+        self._binder: Callable[..., tuple] | None = None
+        # True if priming proved that ``bound_args.values() == args`` for
+        # this kernel — i.e. all kernel parameters map 1:1 onto positional
+        # args, so we can avoid materializing ``tuple(bound_args.values())``
+        # in the hot path. This holds for typical Helion kernels because
+        # Helion inlines constexpr block-sizes as module-level constants
+        # rather than passing them as Triton parameters.
+        self._bind_skip_safe = False
+        # Triton specialization captured at priming time. The hot path
+        # recomputes the spec via the binder and compares; on mismatch
+        # (e.g. caller passed an unaligned-pointer tensor where priming
+        # got a 16-byte-aligned one) we fall back to ``default_launcher``
+        # so Triton's per-spec ``kernel_cache`` is consulted. The
+        # priming-time binary is only safe for the priming spec.
+        self._priming_spec: object = None
+        # Cached references to Triton's knob namespaces, captured at
+        # priming. The hot path checks these per-call so we can fall
+        # back to ``default_launcher`` if a user enables debug,
+        # instrumentation, or stages-inspection knobs *after* priming
+        # — those affect Triton's compilation pipeline and our cached
+        # binary would otherwise silently bypass them.
+        self._knobs_runtime: object = None
+        self._knobs_compilation: object = None
+        # Snapshot of ``triton_kernel.used_global_vals`` at priming:
+        # tuple of ``(globals_dict, name, compile_time_value)``. Per-call
+        # we verify ``globals_dict.get(name) == compile_time_value`` for
+        # each entry — this is the same invariant ``JITFunction.run``
+        # uses to invalidate cached binaries when a module-level global
+        # referenced by the kernel was reassigned between launches.
+        # Helion-generated kernels' globals (``_BLOCK_SIZE_*``, etc.)
+        # are codegen-time constants that don't mutate, so this check
+        # passes cheaply on the common path. Empty tuple ⇒ no entries
+        # at priming, skip the iteration entirely.
+        self._used_global_checks: tuple[tuple[dict, str, object], ...] = ()
+
+    def _prime(
+        self, triton_kernel: object, grid: tuple[int, ...], args: tuple[object, ...]
+    ) -> None:
+        """Capture the cached ``CompiledKernel`` and dispatch state.
+
+        Called once on the first invocation, under ``self._prime_lock``.
+        After this returns successfully, :meth:`__call__` dispatches
+        via :attr:`_compiled_run` (the C launcher Triton's
+        ``make_launcher`` emits). On any failure we set
+        ``_compiled_run=None`` so subsequent calls fall through to
+        :func:`default_launcher`. ``_primed=True`` is set last via the
+        outer ``finally`` so any caller waiting on the prime lock sees
+        either fully-published state or a clean ``_compiled_run=None``
+        sentinel — never a half-written mix.
+        """
+        try:
+            try:
+                import triton
+                from triton.runtime.driver import driver
+            except ImportError:
+                self._compiled_run = None
+                return
+
+            try:
+                warmup_kwargs = {**self._run_kwargs, "grid": grid, "warmup": True}
+                # pyrefly: ignore[missing-attribute]
+                compiled_kernel = triton_kernel.run(*args, **warmup_kwargs)
+                if compiled_kernel is None:
+                    self._compiled_run = None
+                    return
+
+                active_driver = driver.active
+                # pyrefly: ignore[missing-attribute]
+                device = active_driver.get_current_device()
+                # device_caches[device] = (kernel_cache, kernel_key_cache,
+                #                          target, backend, binder)
+                # pyrefly: ignore[missing-attribute]
+                device_cache = triton_kernel.device_caches[device]
+                binder = device_cache[4]
+
+                # Probe: do bound_args.values() == args? If yes, we can pass
+                # ``args`` straight to the C launcher without materializing
+                # ``tuple(bound_args.values())`` on the hot path. We must
+                # still invoke the binder on each call to recompute the
+                # specialization (alignment / scalar values / etc.), but the
+                # ``bound_args`` mapping itself is wasteful to flatten when
+                # we know it matches ``args``.
+                #
+                # We also capture the priming spec here. The hot path
+                # compares each call's spec to this value: matching specs
+                # use the captured compiled kernel; mismatched specs fall
+                # back to ``default_launcher`` (which routes through
+                # Triton's per-spec ``kernel_cache``).
+                priming_spec: object = None
+                try:
+                    bound_args, priming_spec, _opts = binder(*args, **self._run_kwargs)
+                    bound_values = tuple(bound_args.values())
+                    self._bind_skip_safe = len(bound_values) == len(args) and all(
+                        b is a for b, a in zip(bound_values, args, strict=True)
+                    )
+                except Exception:
+                    self._bind_skip_safe = False
+                    priming_spec = None
+                self._priming_spec = priming_spec
+
+                # Read every dependent value from ``compiled_kernel`` /
+                # ``active_driver`` BEFORE publishing ``_compiled_run``.
+                # The hot path uses ``_compiled_run is not None`` as the
+                # "fully primed" signal under the GIL; once it observes
+                # a non-None value it dereferences ``_triton_function``,
+                # ``_get_current_stream`` etc. without further sync.
+                #
+                # ``CompiledKernel.run`` is a property that lazily calls
+                # ``_init_handles()`` — this is what populates
+                # ``compiled_kernel.function`` etc. Read it FIRST so the
+                # subsequent attribute reads see populated values.
+                run_fn = compiled_kernel.run
+                triton_function = compiled_kernel.function
+                packed_metadata = compiled_kernel.packed_metadata
+                kernel_launch_metadata = compiled_kernel.launch_metadata
+                # pyrefly: ignore[missing-attribute]
+                get_current_stream = active_driver.get_current_stream
+
+                self._compiled_kernel = compiled_kernel
+                self._triton_function = triton_function
+                self._packed_metadata = packed_metadata
+                self._kernel_launch_metadata = kernel_launch_metadata
+                self._active_driver = active_driver
+                self._device = device
+                self._get_current_stream = get_current_stream
+                self._binder = binder
+                self._knobs_runtime = triton.knobs.runtime
+                self._knobs_compilation = triton.knobs.compilation
+                # Snapshot used_global_vals once for the per-call mutation
+                # check. Triton stores entries as
+                #   {(name, id(gdict)): (compile_value, gdict)}
+                # We flatten to ``(gdict, name, compile_value)`` tuples
+                # so the hot path needs only a dict lookup + equality
+                # compare per entry — no item-iteration on the live dict.
+                ugv = getattr(triton_kernel, "used_global_vals", None)
+                if ugv:
+                    self._used_global_checks = tuple(
+                        (gdict, name, compile_value)
+                        for (name, _gid), (compile_value, gdict) in ugv.items()
+                    )
+                # We do NOT cache ``launch_enter_hook`` /
+                # ``launch_exit_hook`` here: a profiler may install
+                # them *after* priming, and the captured snapshot would
+                # be stale. The hot path reads them from
+                # ``self._knobs_runtime`` per call instead.
+                # Publish last — this is the visibility flag for the
+                # hot path.
+                self._compiled_run = run_fn
+            except Exception:
+                # Any priming failure → leave _compiled_run None so the
+                # __call__ path falls back to default_launcher.
+                self._compiled_run = None
+        finally:
+            # Mark primed AFTER all writes are visible. Combined with
+            # the outer prime_lock in ``__call__``, this guarantees
+            # any thread that observes ``_primed=True`` sees either a
+            # fully-published launcher or ``_compiled_run=None``.
+            self._primed = True
+
+    def __call__(
+        self,
+        triton_kernel: object,
+        grid: tuple[int, ...],
+        *args: object,
+        # Spell out the kwargs the generated wrapper always passes so
+        # CPython binds them positionally into local slots rather than
+        # packing them into a per-call **kwargs dict. The closure already
+        # has the runtime values baked in; these parameter names exist
+        # solely to absorb the wrapper's keyword arguments cheaply, and
+        # are otherwise unused.
+        num_warps: int | None = None,
+        num_stages: int | None = None,
+        launch_cooperative_grid: bool = False,
+        **kwargs: object,
+    ) -> object:
+        # Under torch.compile / Dynamo tracing, defer to ``default_launcher``
+        # which routes through ``triton_kernel.run`` and is captured by
+        # Dynamo's ``triton_kernel_wrapper_mutation`` HOP handler.
+        #
+        # The fast path calls ``_cuda_getCurrentRawStream`` directly. Dynamo
+        # has that symbol in its in-graph allowlist
+        # (``torch_c_binding_in_graph_functions``), so tracing it produces a
+        # graph node whose example_value is ``int``, which trips Dynamo's
+        # "torch.* op returned non-Tensor" check and aborts the trace.
+        #
+        # On PyTorch builds where Helion's own HOP is registered (see
+        # ``supports_torch_compile_fusion`` in ``helion/_compat.py``), the
+        # kernel call is intercepted at the ``HelionKernelVariable`` level
+        # and ``_FastLauncher.__call__`` is never reached during tracing —
+        # this guard is a no-op on those builds. It only fires on
+        # builds/configs where the HOP isn't available (e.g. PyTorch < 2.11
+        # or XPU) and Dynamo falls through to trace the launcher.
+        if torch.compiler.is_compiling():
+            return default_launcher(
+                triton_kernel,
+                grid,
+                *args,
+                **self._run_kwargs,
+            )
+
+        if not self._primed:
+            # Double-checked locking: the unsynchronized read above is
+            # the fast path; the lock-guarded re-check below serializes
+            # concurrent first calls so only one thread runs ``_prime``.
+            with self._prime_lock:
+                if not self._primed:
+                    self._prime(triton_kernel, grid, args)
+
+        compiled_run = self._compiled_run
+        if compiled_run is None:
+            # Fall back to Triton's Python launcher. Forward the full
+            # ``_run_kwargs`` mapping so any backend tunable / ``maxnreg`` /
+            # ``_triton_config_*`` keys baked in at ``build_fast_launcher``
+            # time also reach ``default_launcher`` — keeping behavior
+            # consistent with the captured config when priming fails.
+            return default_launcher(
+                triton_kernel,
+                grid,
+                *args,
+                **self._run_kwargs,
+            )
+
+        # The compiled kernel, stream getter, and ``_device`` were
+        # captured against the device active at priming time. If the
+        # caller switched CUDA devices (e.g. ``with torch.cuda.device(1)``
+        # after the first call ran on ``cuda:0``), our cached stream
+        # would belong to the priming device and the launch would hit
+        # ``invalid resource handle``. Route those off-device calls
+        # through ``default_launcher`` which dispatches via Triton's
+        # per-device ``device_caches``.
+        if (
+            self._active_driver is not None
+            # pyrefly: ignore[missing-attribute]
+            and self._active_driver.get_current_device() != self._device
+        ):
+            return default_launcher(
+                triton_kernel,
+                grid,
+                *args,
+                **self._run_kwargs,
+            )
+
+        # ``JITFunction.run`` honors several pieces of mutable Triton
+        # state on every call: ``self.pre_run_hooks`` (a list anyone can
+        # ``.append()`` to after priming, e.g. autotune timing hooks),
+        # ``knobs.runtime.debug`` / ``knobs.compilation.instrumentation_mode``
+        # (flip debug or instrumentation modes that change codegen),
+        # and ``knobs.runtime.add_stages_inspection_hook`` (augments
+        # specialization, so the cached binary's key no longer matches).
+        # The cached binary plus the direct C-launcher invocation we
+        # use below bypass all of this. If any of these knobs/hooks are
+        # active, route through ``default_launcher`` so the Python
+        # launcher's bookkeeping runs and the right kernel is picked.
+        # In the default-knobs case these are cheap attribute reads on
+        # already-resolved cached namespaces.
+        knobs_runtime = self._knobs_runtime
+        knobs_compilation = self._knobs_compilation
+        # pyrefly: ignore[missing-attribute]
+        if (
+            # Direct attribute access — JITFunction always sets
+            # ``pre_run_hooks`` on construction (jit.py:804), so we
+            # don't pay for ``getattr``'s fallback machinery.
+            triton_kernel.pre_run_hooks  # pyrefly: ignore[missing-attribute]
+            or knobs_runtime.debug
+            # pyrefly: ignore[missing-attribute]
+            or knobs_compilation.instrumentation_mode
+            # pyrefly: ignore[missing-attribute]
+            or knobs_runtime.add_stages_inspection_hook is not None
+        ):
+            return default_launcher(
+                triton_kernel,
+                grid,
+                *args,
+                **self._run_kwargs,
+            )
+
+        # ``used_global_vals`` is the per-launch global-mutation check
+        # Triton does. The dict is almost always non-empty for
+        # Helion-generated kernels (it tracks codegen constants like
+        # ``_BLOCK_SIZE_*``), so a simple truthiness check would always
+        # fall back. Instead we did a per-entry snapshot at priming and
+        # verify the underlying globals haven't been reassigned —
+        # exactly the semantic Triton uses.
+        for gdict, name, expected in self._used_global_checks:
+            if gdict.get(name) != expected:
+                return default_launcher(
+                    triton_kernel,
+                    grid,
+                    *args,
+                    **self._run_kwargs,
+                )
+
+        # Hot path — no dict allocation, no Python-level Triton run frame.
+        try:
+            # Always invoke the binder so we can compare the current
+            # call's Triton specialization to the one captured at
+            # priming time. Triton's ``_spec`` encodes per-arg facts
+            # like pointer 16-byte alignment and scalar zero/one
+            # detection — facts that affect codegen (vectorized loads,
+            # divide-by-constant). The compiled binary we cached is
+            # only safe for the priming spec; for any other spec the
+            # binary may, e.g., issue a 128-bit load against a 4-byte
+            # aligned pointer → CUDA ``misaligned address``.
+            #
+            # On mismatch, route through ``default_launcher`` so
+            # Triton's per-spec ``kernel_cache`` lookup picks (or
+            # compiles) the right binary for the current spec.
+            # pyrefly: ignore[not-callable]
+            bound_args, spec, _opts = self._binder(*args, **self._run_kwargs)
+            if spec != self._priming_spec:
+                return default_launcher(
+                    triton_kernel,
+                    grid,
+                    *args,
+                    **self._run_kwargs,
+                )
+            if self._bind_skip_safe:
+                kernel_args = args
+            else:
+                kernel_args = tuple(bound_args.values())
+
+            grid_size = len(grid)
+            grid_0 = grid[0]
+            grid_1 = grid[1] if grid_size > 1 else 1
+            grid_2 = grid[2] if grid_size > 2 else 1
+            # pyrefly: ignore[not-callable]
+            stream = self._get_current_stream(self._device)
+            # Re-read launch hooks from Triton's knobs every call.
+            # ``JITFunction.run`` consults the live
+            # ``knobs.runtime.launch_*_hook`` references on each
+            # launch, so a profiler attaching its hook *after* the
+            # first call must still see its callback fire. Snapshotting
+            # at priming would silently drop those hooks.
+            #
+            # Skip ``launch_metadata`` when no profiler hooks are
+            # active. Probe identity / calls list directly: older
+            # Triton uses ``None``, newer Triton uses ``HookChain`` (no
+            # ``__bool__``).
+            # pyrefly: ignore[missing-attribute]
+            enter_hook = knobs_runtime.launch_enter_hook
+            # pyrefly: ignore[missing-attribute]
+            exit_hook = knobs_runtime.launch_exit_hook
+            if (enter_hook is None or getattr(enter_hook, "calls", None) == []) and (
+                exit_hook is None or getattr(exit_hook, "calls", None) == []
+            ):
+                launch_metadata = None
+            else:
+                # pyrefly: ignore[not-callable]
+                launch_metadata = self._kernel_launch_metadata(
+                    grid, stream, *kernel_args
+                )
+            return compiled_run(
+                grid_0,
+                grid_1,
+                grid_2,
+                stream,
+                self._triton_function,
+                self._packed_metadata,
+                launch_metadata,
+                enter_hook,
+                exit_hook,
+                *kernel_args,
+            )
+        except Exception as error:
+            message = str(error)
+            if "Cannot make_shape_compatible: incompatible dimensions" in message:
+                raise exc.ShapeMismatch("kernel operands", message) from error
+            raise
+
+
+def build_fast_launcher(
+    *,
+    num_warps: int,
+    num_stages: int,
+    launch_cooperative_grid: bool = False,
+    ptx_options: str | None = None,
+    extra_kwargs: dict | None = None,
+) -> _FastLauncher:
+    """Build a :class:`_FastLauncher` closure with config baked in.
+
+    Invoked from :meth:`BoundKernel.set_config` after the generated Triton
+    kernel is compiled. The returned object's ``__call__`` signature
+    matches :func:`default_launcher`, so the generated wrapper can use it
+    as a drop-in replacement (threaded through as ``_launcher=`` by the
+    bound-kernel-level wrapper installed in ``set_config``).
+    """
+    return _FastLauncher(
+        num_warps=num_warps,
+        num_stages=num_stages,
+        launch_cooperative_grid=launch_cooperative_grid,
+        ptx_options=ptx_options,
+        extra_kwargs=extra_kwargs,
+    )
 
 
 def _pallas_make_block_spec(
