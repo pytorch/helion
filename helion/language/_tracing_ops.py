@@ -2276,18 +2276,27 @@ def _(state: CodegenState) -> list[object]:
         graph_info.if_arg_names[i]: if_args[i].id for i in range(len(if_args))
     } | {graph_info.else_arg_names[i]: else_args[i].id for i in range(len(else_args))}
 
-    if_return_names = [
-        cast("ast.Name", if_outputs[o]).id
-        if isinstance(o, int)
-        else arg_node_name_to_ast_name[o]
-        for (o, _) in graph_info.branches_outputs
-    ]
-    else_return_names = [
-        cast("ast.Name", else_outputs[o]).id
-        if isinstance(o, int)
-        else arg_node_name_to_ast_name[o]
-        for (_, o) in graph_info.branches_outputs
-    ]
+    if_return_names: list[str] = []
+    else_return_names: list[str] = []
+    output_aliases: dict[int, str] = {}
+    else_output_offset = len(if_outputs)
+    for if_entry, else_entry in graph_info.branches_outputs:
+        if_name = (
+            cast("ast.Name", if_outputs[if_entry]).id
+            if isinstance(if_entry, int)
+            else arg_node_name_to_ast_name[if_entry]
+        )
+        else_name = (
+            cast("ast.Name", else_outputs[else_entry]).id
+            if isinstance(else_entry, int)
+            else arg_node_name_to_ast_name[else_entry]
+        )
+        if_return_names.append(if_name)
+        else_return_names.append(else_name)
+        if isinstance(if_entry, int):
+            output_aliases[if_entry] = if_name
+        if isinstance(else_entry, int):
+            output_aliases[else_output_offset + else_entry] = if_name
 
     if_arg_ids = {arg.id for arg in if_args}
     union_args = if_args + [a for a in else_args if a.id not in if_arg_ids]
@@ -2340,10 +2349,13 @@ def _(state: CodegenState) -> list[object]:
             )
         )
 
+    outputs = [*if_outputs, *else_outputs]
     return cast(
         "list[object]",
-        [expr_from_string(n) for n in if_return_names]
-        + [expr_from_string(n) for n in else_return_names],
+        [
+            expr_from_string(output_aliases[i]) if i in output_aliases else output
+            for i, output in enumerate(outputs)
+        ],
     )
 
 
