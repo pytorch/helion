@@ -971,7 +971,17 @@ class TritonBackend(Backend):
             f"tl.full([{', '.join(shape_dims)}], {value_expr}, {self.dtype_str(dtype)})"
         )
 
-    def launcher_keyword_args(self, config: Config, *, has_barrier: bool) -> list[str]:
+    def launcher_runtime_kwargs(
+        self, config: Config, *, has_barrier: bool
+    ) -> dict[str, object]:
+        """Return the launcher kwargs as a ``dict`` of runtime values.
+
+        Used by both :meth:`launcher_keyword_args` (which formats the dict
+        as source strings for codegen) and
+        :func:`helion.runtime.build_fast_launcher` (which bakes the dict
+        into a closure at :meth:`BoundKernel.set_config` time so the hot
+        launch path doesn't have to allocate a per-call kwargs dict).
+        """
         from .._compat import supports_maxnreg
 
         # Workaround for triton bug: warp_specialize requires at least 4 warps
@@ -980,31 +990,45 @@ class TritonBackend(Backend):
         if any(config.range_warp_specializes):
             num_warps = max(4, num_warps)
 
-        args = [
-            f"num_warps={num_warps}",
-            f"num_stages={config.num_stages}",
-            *(["launch_cooperative_grid=True"] if has_barrier else []),
-        ] + [
-            f"{x.removeprefix('_triton_config_')}={config[x]}"
-            for x in config
-            if x.startswith("_triton_config_")
-        ]
+        kwargs: dict[str, object] = {
+            "num_warps": num_warps,
+            "num_stages": config.num_stages,
+        }
+        if has_barrier:
+            kwargs["launch_cooperative_grid"] = True
+        for x in config:
+            if x.startswith("_triton_config_"):
+                kwargs[x.removeprefix("_triton_config_")] = config[x]
 
         from ..autotuner.config_spec import _get_backend_tunable_keys
 
         for key in _get_backend_tunable_keys():
             if key in config:
-                args.append(f"{key}={config[key]!r}")
+                kwargs[key] = config[key]
 
         if "maxnreg" in config and config["maxnreg"] is not None and supports_maxnreg():
-            args.append(f"maxnreg={config['maxnreg']}")
+            kwargs["maxnreg"] = config["maxnreg"]
 
         advanced_controls_file = config.advanced_controls_file
         if advanced_controls_file:
-            ptx_option = f"--apply-controls {advanced_controls_file}"
-            args.append(f"ptx_options={ptx_option!r}")
+            kwargs["ptx_options"] = f"--apply-controls {advanced_controls_file}"
 
-        return args
+        return kwargs
+
+    def launcher_keyword_args(self, config: Config, *, has_barrier: bool) -> list[str]:
+        from ..autotuner.config_spec import _get_backend_tunable_keys
+
+        backend_tunable_keys = _get_backend_tunable_keys()
+        kwargs = self.launcher_runtime_kwargs(config, has_barrier=has_barrier)
+        # Backend tunable keys (typically strings) and ptx_options use repr;
+        # everything else (num_warps, num_stages, ints, bools) renders plain.
+        out: list[str] = []
+        for k, v in kwargs.items():
+            if k in backend_tunable_keys or k == "ptx_options":
+                out.append(f"{k}={v!r}")
+            else:
+                out.append(f"{k}={v}")
+        return out
 
     def grid_barrier_stmt(self, sem_arg: str) -> str:
         return f"triton_helpers.x_grid_barrier({sem_arg})"
