@@ -1582,7 +1582,6 @@ class TestExamples(RefEagerTestBase, TestCase):
             num_stages=3,
         )
 
-    @xfailIfPallas("operation not supported on TPU")
     def test_kl_div(self):
         if _get_backend() == "cute" and "B200" in get_nvidia_gpu_model():
             pytest.xfail("CuTe KL-div example still launches out of resources on B200")
