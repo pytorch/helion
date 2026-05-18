@@ -1,23 +1,27 @@
 from __future__ import annotations
 
+import ast
 import dataclasses
 from typing import TYPE_CHECKING
 
 from ... import exc
 
 if TYPE_CHECKING:
-    import ast
     from collections.abc import Sequence
 
     import torch
+    from torch.fx.node import Node
 
+    from ..tile_strategy import DeviceLoopState
     from .aux_tensor import Tcgen05AuxTensorDescriptor
     from .cute_mma import _Tcgen05AuxPipelinePlan
     from .cute_mma import _Tcgen05SchedPipelinePlan
+    from .tcgen05_lifecycle import Tcgen05LifecycleContext
 
 
 @dataclasses.dataclass(frozen=True)
 class CuteTcgen05StoreValue:
+    lifecycle_context: Tcgen05LifecycleContext
     bm: int = 0
     bn: int = 0
     bk: int = 0
@@ -25,38 +29,19 @@ class CuteTcgen05StoreValue:
     epi_warp_count: int = 0
     epi_acc_frag_base: str = ""
     epi_tidx: str = ""
-    epi_active: str = ""
-    exec_active: str = ""
     warp_idx: str = ""
     epi_tile: str = ""
     c_stage_count: int = 0
     epilog_sync_barrier_id: int = 0
     tmem_load_atom: str = ""
     epilogue_rest_mode: str = ""
-    acc_pipeline: str = ""
-    acc_producer_state: str = ""
-    acc_consumer_state: str = ""
-    tmem_alloc_barrier: str = ""
-    tmem_allocator: str = ""
-    tmem_holding_buf: str = ""
-    tmem_dealloc_mbar_ptr: str = ""
-    epi_acc_tmem_ptr: str = ""
-    acc_tmem_cols: str = ""
-    tma_warp: str = ""
-    tma_pipeline: str = ""
-    tma_producer_state: str = ""
     tma_store_atom: str = ""
     tma_store_tensor: str = ""
     role_local_tile_counter: str = ""
-    is_two_cta: bool = False
-    use_tma: bool = False
     use_role_local_epi: bool = False
     use_tma_store_epilogue: bool = False
     tma_store_full_tiles_only: bool = False
     partial_output_tma_store: bool = False
-    ab_stage_count: int = 0
-    acc_stage_count: int = 0
-    skip_ab_producer_advance: bool = False
     # Output element dtype (cutlass type string, e.g. "cutlass.BFloat16")
     # used when computing the tcgen05 epilogue tile.
     epi_elem_dtype_str: str = ""
@@ -242,9 +227,11 @@ class CuteDeviceFunctionState:
         self._epi_role_prelude_stmt_ids: set[int] = set()
         self._epi_role_full_tile_stmt_ids: set[int] = set()
         self._epi_role_edge_tile_stmt_ids: set[int] = set()
+        self._tcgen05_kloop_owned_stmt_ids_by_loop: dict[int, set[int]] = {}
         self.epi_role_tile_counter_var: str | None = None
         self.epi_role_tile_counter_increment_per_tile: bool = True
         self._collective_handled_loads: set[str] = set()
+        self._collective_handled_load_or_dependency_node_ids: set[int] = set()
         self.cluster_shape: tuple[int, int, int] | None = None
         self.block_shape: tuple[int, int, int] | None = None
         self.suppress_root_lane_loops = False
@@ -395,11 +382,102 @@ class CuteDeviceFunctionState:
     def tcgen05_epi_role_stmt_ids(self) -> frozenset[int]:
         return frozenset(self._epi_role_stmt_ids)
 
-    def register_collective_handled_load(self, name: str) -> None:
+    def register_collective_handled_load(
+        self,
+        name: str,
+        *,
+        dependency_nodes: Sequence[Node] = (),
+    ) -> None:
+        """Register collective operand-load state for later codegen decisions.
+
+        Load names drive regular load suppression. FX node object identities
+        drive statement-ownership marking for load/dependency scaffolding; this
+        is scoped to one codegen pass where the FX graph and AST lists retain
+        the same objects.
+        """
         self._collective_handled_loads.add(name)
+        self._collective_handled_load_or_dependency_node_ids.update(
+            id(node) for node in dependency_nodes
+        )
 
     def is_collective_handled_load(self, name: str) -> bool:
         return name in self._collective_handled_loads
+
+    def is_collective_handled_load_or_dependency_node(self, node: Node) -> bool:
+        return id(node) in self._collective_handled_load_or_dependency_node_ids
+
+    def register_tcgen05_kloop_owned_stmts(
+        self, device_loop: DeviceLoopState, stmts: Sequence[ast.AST]
+    ) -> None:
+        """Record exact K-loop statements emitted by tcgen05 matmul lowering.
+
+        Future role-lifecycle cleanup must remove only statements registered by
+        object identity here. This deliberately does not infer ownership from
+        variable names or statement shapes.
+        """
+        if not stmts:
+            return
+        owned_ids = self._tcgen05_kloop_owned_stmt_ids_by_loop.setdefault(
+            id(device_loop), set()
+        )
+        owned_ids.update(id(stmt) for stmt in stmts)
+
+    def is_tcgen05_kloop_owned_stmt(
+        self, device_loop: DeviceLoopState, stmt: ast.AST
+    ) -> bool:
+        return id(stmt) in self._tcgen05_kloop_owned_stmt_ids_by_loop.get(
+            id(device_loop), set()
+        )
+
+    def tcgen05_unowned_kloop_stmts(
+        self, device_loop: DeviceLoopState, stmts: Sequence[ast.AST]
+    ) -> list[ast.AST]:
+        owned_ids = self._tcgen05_kloop_owned_stmt_ids_by_loop.get(
+            id(device_loop), set()
+        )
+        return [stmt for stmt in stmts if id(stmt) not in owned_ids]
+
+    def replace_tcgen05_owned_kloop_stmts_with_pass(
+        self, device_loop: DeviceLoopState, stmts: Sequence[ast.AST]
+    ) -> None:
+        """Fail closed unless the requested cleanup slice is tcgen05-owned.
+
+        Real K-loop bodies may contain prelude/scaffold statements before the
+        tcgen05 matmul-owned region. Consumers must pass the exact contiguous
+        region they intend to remove so unrelated prelude/suffix statements are
+        preserved and never classified by name or statement shape.
+        """
+        if not stmts:
+            return
+        inner_stmts = device_loop.inner_statements
+        slice_start = next(
+            (
+                start
+                for start in range(len(inner_stmts) - len(stmts) + 1)
+                if all(
+                    inner_stmts[start + index] is stmt
+                    for index, stmt in enumerate(stmts)
+                )
+            ),
+            None,
+        )
+        if slice_start is None:
+            first_stmt = ast.unparse(stmts[0])
+            raise exc.BackendUnsupported(
+                "cute",
+                "tcgen05 role-lifecycle K-loop cleanup requires an exact "
+                f"contiguous statement slice; first requested statement: {first_stmt}",
+            )
+        unowned_stmts = self.tcgen05_unowned_kloop_stmts(device_loop, stmts)
+        if unowned_stmts:
+            first_unowned = ast.unparse(unowned_stmts[0])
+            raise exc.BackendUnsupported(
+                "cute",
+                "tcgen05 role-lifecycle K-loop cleanup requires exact ownership "
+                f"of every cleanup-region statement; first unowned statement: "
+                f"{first_unowned}",
+            )
+        inner_stmts[slice_start : slice_start + len(stmts)] = [ast.Pass()]
 
     def request_root_lane_loop_suppression(self) -> None:
         self.suppress_root_lane_loops = True

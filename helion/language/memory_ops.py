@@ -21,10 +21,7 @@ from .._compiler.cute.cute_epilogue import Tcgen05UnaryEpilogueChain
 from .._compiler.cute.cute_epilogue import _AuxiliaryTensorStep
 from .._compiler.cute.cute_epilogue import analyze_tcgen05_unary_epilogue_chain
 from .._compiler.cute.cute_fx_walk import reach_tcgen05_matmul_anchors
-from .._compiler.cute.cutedsl_compat import emit_dealloc_mbarrier_initialized_kwarg
 from .._compiler.cute.cutedsl_compat import emit_pipeline_advance
-from .._compiler.cute.cutedsl_compat import emit_producer_tail_tma_umma
-from .._compiler.cute.cutedsl_compat import emit_producer_tail_umma_async
 from .._compiler.cute.tcgen05_constants import (
     TCGEN05_ACC_WAIT_PLACEMENT_BEFORE_SUBTILE_LOOP,
 )
@@ -1689,6 +1686,7 @@ def _codegen_cute_store_tcgen05_tile(
     )
     if tcgen05_value is None:
         return None
+    tcgen05_lifecycle = tcgen05_value.lifecycle_context
 
     # Backstop for callers that bypass Config.normalize() validation;
     # see _tcgen05_epi_warp_count docstring and cute_plan.md.
@@ -1858,7 +1856,7 @@ def _codegen_cute_store_tcgen05_tile(
     tcgen05_aux_bn = tcgen05_value.bn
     tcgen05_aux_thr_mma = tcgen05_value.thr_mma
     tcgen05_aux_epi_tidx = tcgen05_value.epi_tidx
-    tcgen05_aux_epi_active = tcgen05_value.epi_active
+    tcgen05_aux_epi_active = tcgen05_lifecycle.epi_active
     tcgen05_aux_epi_warp_count = tcgen05_value.epi_warp_count
     tcgen05_aux_epilogue_rest_mode = tcgen05_value.epilogue_rest_mode
     tcgen05_aux_use_tma_store_epilogue = tcgen05_value.use_tma_store_epilogue
@@ -2657,7 +2655,7 @@ def _codegen_cute_store_tcgen05_tile(
     tcgen05_bk = tcgen05_value.bk
     tcgen05_epilog_sync_barrier_id = tcgen05_value.epilog_sync_barrier_id
     tcgen05_c_stage_count = tcgen05_value.c_stage_count
-    tcgen05_is_two_cta = tcgen05_value.is_two_cta
+    tcgen05_is_two_cta = tcgen05_lifecycle.is_two_cta
     tcgen05_thr_mma = tcgen05_value.thr_mma
     full_tile_expr = (
         f"({base_indices[0]}) + cutlass.Int32({tcgen05_bm}) <= {m_size} "
@@ -2780,18 +2778,18 @@ def _codegen_cute_store_tcgen05_tile(
         (
             f"{tiled_copy_t2r}, {ttr_tacc_base}, {ttr_racc} = "
             "cutlass.utils.gemm.sm100.epilogue_tmem_copy_and_partition("
-            f"{kernel_desc}, {tcgen05_value.epi_tidx}, {tacc}, {tcgc_planned}, {epi_tile}, {tcgen05_value.is_two_cta!s})"
+            f"{kernel_desc}, {tcgen05_value.epi_tidx}, {tacc}, {tcgc_planned}, {epi_tile}, {tcgen05_lifecycle.is_two_cta!s})"
         ),
         f"{thr_copy_t2r} = {tiled_copy_t2r}.get_slice({tcgen05_value.epi_tidx})",
         f"{tcgc_epi} = cute.flat_divide({tcgc_planned}, {epi_tile})",
         f"{ttr_gc} = {thr_copy_t2r}.partition_D({tcgc_epi})",
         (
             f"{ttr_tacc_stage} = {ttr_tacc_base}["
-            f"(None, None, None, None, None, {tcgen05_value.acc_consumer_state}.index)]"
+            f"(None, None, None, None, None, {tcgen05_lifecycle.acc_consumer_state}.index)]"
         ),
         (
-            f"if {tcgen05_value.epi_active}:\n"
-            f"    {tcgen05_value.acc_pipeline}.consumer_wait({tcgen05_value.acc_consumer_state})"
+            f"if {tcgen05_lifecycle.epi_active}:\n"
+            f"    {tcgen05_lifecycle.acc_pipeline}.consumer_wait({tcgen05_lifecycle.acc_consumer_state})"
         ),
         f"{ttr_tacc} = cute.group_modes({ttr_tacc_stage}, 3, cute.rank({ttr_tacc_stage}))",
         f"{ttr_gc_grouped} = cute.group_modes({ttr_gc}, 3, cute.rank({ttr_gc}))",
@@ -2843,7 +2841,7 @@ def _codegen_cute_store_tcgen05_tile(
             # — the cute-to-nvvm pass cannot legalize that conversion through
             # iter_args and aborts during compile.
             f"for _tcgen05_subtile in cutlass.range({subtile_count}, unroll_full=True):\n"
-            f"    if {tcgen05_value.epi_active}:\n"
+            f"    if {tcgen05_lifecycle.epi_active}:\n"
             f"        {ttr_tacc_mn} = {ttr_tacc}[(None, None, None, cutlass.Int32(_tcgen05_subtile))]\n"
             f"        {ttr_gc_subtile} = {ttr_gc_grouped}[(None, None, None, cutlass.Int32(_tcgen05_subtile))]\n"
             f"        cute.copy({tiled_copy_t2r}, {ttr_tacc_mn}, {ttr_racc})\n"
@@ -2859,12 +2857,12 @@ def _codegen_cute_store_tcgen05_tile(
             # sm100 gemm fence-before-release pattern.
             f"            cute.arch.fence_view_async_tmem_load()\n"
             f"            with cute.arch.elect_one():\n"
-            f"                {tcgen05_value.acc_pipeline}.consumer_release({tcgen05_value.acc_consumer_state})\n"
+            f"                {tcgen05_lifecycle.acc_pipeline}.consumer_release({tcgen05_lifecycle.acc_consumer_state})\n"
             f"{simt_store_copy_source}"
             # Advance is a per-thread local state update, so it intentionally
             # stays outside elect_one; only the mbarrier release is elected.
-            f"if {tcgen05_value.epi_active}:\n"
-            + emit_pipeline_advance(tcgen05_value.acc_consumer_state, indent="    ")
+            f"if {tcgen05_lifecycle.epi_active}:\n"
+            + emit_pipeline_advance(tcgen05_lifecycle.acc_consumer_state, indent="    ")
         ),
     ]
     tma_store_pipeline_setup = [
@@ -2943,7 +2941,7 @@ def _codegen_cute_store_tcgen05_tile(
                 "requires the "
                 "role-local TMA-store tcgen05 epilogue",
             )
-        if not tcgen05_value.is_two_cta:
+        if not tcgen05_lifecycle.is_two_cta:
             raise exc.BackendUnsupported(
                 "cute",
                 f"{TCGEN05_EPILOGUE_LAYOUT_CONFIG_KEY}={epilogue_layout!r} requires "
@@ -2988,7 +2986,7 @@ def _codegen_cute_store_tcgen05_tile(
         if diagnose_first_c_acquire_in_loop
         else [
             (
-                f"if {tcgen05_value.epi_active} and "
+                f"if {tcgen05_lifecycle.epi_active} and "
                 f"{tcgen05_value.warp_idx} == cutlass.Int32(0):\n"
                 f"    {c_pipeline}.producer_acquire()"
             )
@@ -3032,8 +3030,8 @@ def _codegen_cute_store_tcgen05_tile(
     tma_store_pre_loop_acc_wait = (
         [
             (
-                f"if {tcgen05_value.epi_active}:\n"
-                f"    {tcgen05_value.acc_pipeline}.consumer_wait({tcgen05_value.acc_consumer_state})"
+                f"if {tcgen05_lifecycle.epi_active}:\n"
+                f"    {tcgen05_lifecycle.acc_pipeline}.consumer_wait({tcgen05_lifecycle.acc_consumer_state})"
             )
         ]
         if diagnose_acc_wait_before_subtile_loop
@@ -3044,14 +3042,14 @@ def _codegen_cute_store_tcgen05_tile(
         if diagnose_acc_wait_before_subtile_loop
         else (
             f"        if _tcgen05_subtile == 0:\n"
-            f"            {tcgen05_value.acc_pipeline}.consumer_wait({tcgen05_value.acc_consumer_state})\n"
+            f"            {tcgen05_lifecycle.acc_pipeline}.consumer_wait({tcgen05_lifecycle.acc_consumer_state})\n"
         )
     )
     tma_store_split_first_acc_wait = (
         ""
         if diagnose_acc_wait_before_subtile_loop
         else (
-            f"        {tcgen05_value.acc_pipeline}.consumer_wait({tcgen05_value.acc_consumer_state})\n"
+            f"        {tcgen05_lifecycle.acc_pipeline}.consumer_wait({tcgen05_lifecycle.acc_consumer_state})\n"
         )
     )
     tma_store_split_tail_later_subtile_acquire = (
@@ -3073,9 +3071,9 @@ def _codegen_cute_store_tcgen05_tile(
     # Pyrefly does not preserve the non-None tcgen05_value narrowing inside
     # the nested source formatter, so keep local string aliases for attributes
     # read only by that closure.
-    tcgen05_epi_active = tcgen05_value.epi_active
-    tcgen05_acc_pipeline = tcgen05_value.acc_pipeline
-    tcgen05_acc_consumer_state = tcgen05_value.acc_consumer_state
+    tcgen05_epi_active = tcgen05_lifecycle.epi_active
+    tcgen05_acc_pipeline = tcgen05_lifecycle.acc_pipeline
+    tcgen05_acc_consumer_state = tcgen05_lifecycle.acc_consumer_state
     tcgen05_warp_idx = tcgen05_value.warp_idx
     tcgen05_tma_store_atom = tcgen05_value.tma_store_atom
 
@@ -3450,12 +3448,12 @@ def _codegen_cute_store_tcgen05_tile(
             # pipeline draining so persistent kernels do not deadlock, but
             # suppress C-pipeline acquire/commit, R2S/SMEM work, and TMA D
             # stores to bound whether hot waits are tied to the C-store path.
-            f"if {tcgen05_value.epi_active}:\n"
-            f"    {tcgen05_value.acc_pipeline}.consumer_wait({tcgen05_value.acc_consumer_state})\n"
+            f"if {tcgen05_lifecycle.epi_active}:\n"
+            f"    {tcgen05_lifecycle.acc_pipeline}.consumer_wait({tcgen05_lifecycle.acc_consumer_state})\n"
             f"    with cute.arch.elect_one():\n"
-            f"        {tcgen05_value.acc_pipeline}.consumer_release({tcgen05_value.acc_consumer_state})\n"
+            f"        {tcgen05_lifecycle.acc_pipeline}.consumer_release({tcgen05_lifecycle.acc_consumer_state})\n"
             + emit_pipeline_advance(
-                tcgen05_value.acc_consumer_state,
+                tcgen05_lifecycle.acc_consumer_state,
                 indent="    ",
             )
         )
@@ -3534,7 +3532,7 @@ def _codegen_cute_store_tcgen05_tile(
         (
             f"{tiled_copy_t2r}, {ttr_tacc_base}, {ttr_racc} = "
             "cutlass.utils.gemm.sm100.epilogue_tmem_copy_and_partition("
-            f"{kernel_desc}, {tcgen05_value.epi_tidx}, {tacc}, {tcgc_planned}, {epi_tile}, {tcgen05_value.is_two_cta!s})"
+            f"{kernel_desc}, {tcgen05_value.epi_tidx}, {tacc}, {tcgc_planned}, {epi_tile}, {tcgen05_lifecycle.is_two_cta!s})"
         ),
         (f"{ttr_rd} = cute.make_rmem_tensor({ttr_racc}.shape, {target_dtype})"),
         (
@@ -3578,7 +3576,7 @@ def _codegen_cute_store_tcgen05_tile(
         f"{bsg_gd} = cute.group_modes({bsg_gd}, 1, cute.rank({bsg_gd}))",
         (
             f"{ttr_tacc_stage} = {ttr_tacc_base}["
-            f"(None, None, None, None, None, {tcgen05_value.acc_consumer_state}.index)]"
+            f"(None, None, None, None, None, {tcgen05_lifecycle.acc_consumer_state}.index)]"
         ),
         f"{ttr_tacc} = cute.group_modes({ttr_tacc_stage}, 3, cute.rank({ttr_tacc_stage}))",
         f"{subtile_count} = cutlass.const_expr(cute.size({ttr_tacc}.shape, mode=[3]))",
@@ -3619,8 +3617,8 @@ def _codegen_cute_store_tcgen05_tile(
             tma_store_subtile_loop
             # Advance is a per-thread local state update, so it intentionally
             # stays outside elect_one; only the mbarrier release is elected.
-            + f"if {tcgen05_value.epi_active}:\n"
-            + emit_pipeline_advance(tcgen05_value.acc_consumer_state, indent="    ")
+            + f"if {tcgen05_lifecycle.epi_active}:\n"
+            + emit_pipeline_advance(tcgen05_lifecycle.acc_consumer_state, indent="    ")
         ),
         *(
             [tma_store_pipeline_tail]
@@ -3745,77 +3743,15 @@ def _codegen_cute_store_tcgen05_tile(
     # naturally land at the end of the kernel in the non-persistent path.
     # Keep them as separate statements so the persistent splitter can
     # extract them via the post-loop registration below.
-    post_loop_lines: list[str] = []
+    tma_store_post_loop_tail = ""
     if hoist_tma_store_resources or hoist_hybrid_tma_store_pipeline:
         # Role-local persistent epilogues reuse the C-store pipeline across
         # scheduler-recycled work tiles. Draining it inside each tile would
         # serialize the next tile's epilogue against this tile's TMA stores.
         # The tail must run before TMEM dealloc setup below.
-        post_loop_lines.append(tma_store_pipeline_tail)
-    if tcgen05_value.use_tma:
-        post_loop_lines.append(
-            f"if {tcgen05_value.tma_warp}:\n"
-            + emit_producer_tail_tma_umma(
-                tcgen05_value.tma_pipeline,
-                tcgen05_value.tma_producer_state,
-                num_stages=tcgen05_value.ab_stage_count,
-                indent="    ",
-                skip_advances=tcgen05_value.skip_ab_producer_advance,
-            )
-        )
-    if tcgen05_value.is_two_cta:
-        # PDL parity with Quack/CUTLASS: after all MMAs are issued, hint
-        # dependent kernels before this role starts the final acc drain.
-        post_loop_lines.append(
-            f"if {tcgen05_value.exec_active}:\n"
-            "    cute.arch.griddepcontrol_launch_dependents()"
-        )
-    post_loop_lines.extend(
-        [
-            (
-                f"if {tcgen05_value.exec_active}:\n"
-                f"    {tcgen05_value.tmem_alloc_barrier}.arrive()"
-            ),
-            (
-                f"if {tcgen05_value.exec_active}:\n"
-                + emit_producer_tail_umma_async(
-                    tcgen05_value.acc_pipeline,
-                    tcgen05_value.acc_producer_state,
-                    num_stages=tcgen05_value.acc_stage_count,
-                    indent="    ",
-                )
-            ),
-            (
-                f"{tcgen05_value.tmem_allocator} = cutlass.utils.TmemAllocator("
-                f"{tcgen05_value.tmem_holding_buf}, "
-                f"barrier_for_retrieve={tcgen05_value.tmem_alloc_barrier}, "
-                f"allocator_warp_id=0, is_two_cta={tcgen05_value.is_two_cta!s}, "
-                f"two_cta_tmem_dealloc_mbar_ptr={tcgen05_value.tmem_dealloc_mbar_ptr}, "
-                f"num_allocated_columns={tcgen05_value.acc_tmem_cols}"
-                f"{emit_dealloc_mbarrier_initialized_kwarg()})"
-            ),
-        ]
-    )
-    if not tcgen05_value.is_two_cta:
-        # Keep the long-validated cluster_m=1 teardown unchanged. The guarded
-        # CtaGroup.TWO path follows Quack's dealloc sequence without this CTA
-        # sync: epi warps synchronize through tmem_alloc_barrier before free.
-        post_loop_lines.append("cute.arch.sync_threads()")
-    post_loop_lines.extend(
-        [
-            (
-                f"if {tcgen05_value.epi_active}:\n"
-                f"    {tcgen05_value.tmem_allocator}.relinquish_alloc_permit()"
-            ),
-            (
-                f"if {tcgen05_value.epi_active}:\n"
-                f"    {tcgen05_value.tmem_alloc_barrier}.arrive_and_wait()"
-            ),
-            (
-                f"if {tcgen05_value.epi_active}:\n"
-                f"    {tcgen05_value.tmem_allocator}.free({tcgen05_value.epi_acc_tmem_ptr})"
-            ),
-        ]
+        tma_store_post_loop_tail = tma_store_pipeline_tail
+    post_loop_lines = tcgen05_lifecycle.render_store_post_loop_lines(
+        tma_store_pipeline_tail=tma_store_post_loop_tail
     )
     post_loop_stmts: list[ast.AST] = [
         statement_from_string(line) for line in post_loop_lines
