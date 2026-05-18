@@ -11,6 +11,7 @@ from typing import TypeVar
 
 import torch
 
+from ..runtime._output_pool import _pool_active
 from ..runtime.settings import _env_get_bool
 from ..runtime.settings import _get_backend
 from ..runtime.settings import is_pallas_interpret
@@ -120,19 +121,25 @@ def compute_repeat(
     di = runtime.driver.active.get_device_interface()  # type: ignore[attr-defined]
     cache = runtime.driver.active.get_empty_cache_for_benchmark()  # type: ignore[attr-defined]
 
-    # Warm the pipeline once before collecting timing samples.
-    fn()
-    di.synchronize()
-    benchmark_function = _maybe_cudagraph_replay(fn, default_enabled=default_cudagraph)
+    # Pool is on by default; the ``_pool_active()`` scope just clears
+    # cached buffers on exit so per-trial allocations don't leak across
+    # trial sets.
+    with _pool_active():
+        # Warm the pipeline once before collecting timing samples.
+        fn()
+        di.synchronize()
+        benchmark_function = _maybe_cudagraph_replay(
+            fn, default_enabled=default_cudagraph
+        )
 
-    start_event = di.Event(enable_timing=True)
-    end_event = di.Event(enable_timing=True)
-    start_event.record()
-    for _ in range(estimate_runs):
-        runtime.driver.active.clear_cache(cache)  # type: ignore[attr-defined]
-        benchmark_function()
-    end_event.record()
-    di.synchronize()
+        start_event = di.Event(enable_timing=True)
+        end_event = di.Event(enable_timing=True)
+        start_event.record()
+        for _ in range(estimate_runs):
+            runtime.driver.active.clear_cache(cache)  # type: ignore[attr-defined]
+            benchmark_function()
+        end_event.record()
+        di.synchronize()
 
     estimate_ms = start_event.elapsed_time(end_event) / max(estimate_runs, 1)
     if not math.isfinite(estimate_ms) or estimate_ms <= 0:
@@ -155,15 +162,16 @@ def compute_repeat_generic(
     Estimate how many repetitions are needed using wall-clock timing.
     Used for backends that don't have Triton's event-based timing (e.g., Pallas/TPU).
     """
-    # Warm the pipeline once before collecting timing samples.
-    out = fn()
-    synchronize_device(out)
-
-    start = time.perf_counter()
-    for _ in range(estimate_runs):
+    with _pool_active():
+        # Warm the pipeline once before collecting timing samples.
         out = fn()
-    synchronize_device(out)
-    end = time.perf_counter()
+        synchronize_device(out)
+
+        start = time.perf_counter()
+        for _ in range(estimate_runs):
+            out = fn()
+        synchronize_device(out)
+        end = time.perf_counter()
 
     estimate_ms = (end - start) * 1000 / max(estimate_runs, 1)
     if not math.isfinite(estimate_ms) or estimate_ms <= 0:
@@ -192,42 +200,45 @@ def interleaved_bench(
     """
     from triton import runtime
 
-    # warmup
-    for fn in fns:
-        fn()
-    clear_cache = functools.partial(
-        runtime.driver.active.clear_cache,  # type: ignore[attr-defined]
-        runtime.driver.active.get_empty_cache_for_benchmark(),  # type: ignore[attr-defined]
-    )
-    clear_cache()
-    di = runtime.driver.active.get_device_interface()  # type: ignore[attr-defined]
-    start_events = [
-        [di.Event(enable_timing=True) for _ in range(repeat)] for _ in range(len(fns))
-    ]
-    end_events = [
-        [di.Event(enable_timing=True) for _ in range(repeat)] for _ in range(len(fns))
-    ]
+    with _pool_active():
+        # warmup
+        for fn in fns:
+            fn()
+        clear_cache = functools.partial(
+            runtime.driver.active.clear_cache,  # type: ignore[attr-defined]
+            runtime.driver.active.get_empty_cache_for_benchmark(),  # type: ignore[attr-defined]
+        )
+        clear_cache()
+        di = runtime.driver.active.get_device_interface()  # type: ignore[attr-defined]
+        start_events = [
+            [di.Event(enable_timing=True) for _ in range(repeat)]
+            for _ in range(len(fns))
+        ]
+        end_events = [
+            [di.Event(enable_timing=True) for _ in range(repeat)]
+            for _ in range(len(fns))
+        ]
 
-    di.synchronize()
-    benchmark_functions = [
-        _maybe_cudagraph_replay(fn, default_enabled=default_cudagraph) for fn in fns
-    ]
+        di.synchronize()
+        benchmark_functions = [
+            _maybe_cudagraph_replay(fn, default_enabled=default_cudagraph) for fn in fns
+        ]
 
-    # When a description is supplied we show a progress bar so the user can
-    # track the repeated benchmarking loop.
-    iterator = iter_with_progress(
-        range(repeat),
-        total=repeat,
-        description=desc,
-        enabled=desc is not None,
-    )
-    for i in iterator:
-        for j in range(len(benchmark_functions)):
-            clear_cache()
-            start_events[j][i].record()
-            benchmark_functions[j]()
-            end_events[j][i].record()
-    di.synchronize()
+        # When a description is supplied we show a progress bar so the user
+        # can track the repeated benchmarking loop.
+        iterator = iter_with_progress(
+            range(repeat),
+            total=repeat,
+            description=desc,
+            enabled=desc is not None,
+        )
+        for i in iterator:
+            for j in range(len(benchmark_functions)):
+                clear_cache()
+                start_events[j][i].record()
+                benchmark_functions[j]()
+                end_events[j][i].record()
+        di.synchronize()
 
     return [
         statistics.median(
@@ -251,28 +262,29 @@ def interleaved_bench_generic(
     Benchmark multiple functions using wall-clock timing.
     Used for backends that don't have Triton's event-based timing (e.g., Pallas/TPU).
     """
-    # warmup
-    out: object = None
-    for fn in fns:
-        out = fn()
-    synchronize_device(out)
+    with _pool_active():
+        # warmup
+        out: object = None
+        for fn in fns:
+            out = fn()
+        synchronize_device(out)
 
-    all_times: list[list[float]] = [[] for _ in range(len(fns))]
+        all_times: list[list[float]] = [[] for _ in range(len(fns))]
 
-    iterator = iter_with_progress(
-        range(repeat),
-        total=repeat,
-        description=desc,
-        enabled=desc is not None,
-    )
-    for _i in iterator:
-        for j in range(len(fns)):
-            synchronize_device(out)
-            start = time.perf_counter()
-            out = fns[j]()
-            synchronize_device(out)
-            end = time.perf_counter()
-            all_times[j].append((end - start) * 1000)  # convert to ms
+        iterator = iter_with_progress(
+            range(repeat),
+            total=repeat,
+            description=desc,
+            enabled=desc is not None,
+        )
+        for _i in iterator:
+            for j in range(len(fns)):
+                synchronize_device(out)
+                start = time.perf_counter()
+                out = fns[j]()
+                synchronize_device(out)
+                end = time.perf_counter()
+                all_times[j].append((end - start) * 1000)  # convert to ms
 
     return [statistics.median(times) for times in all_times]
 
@@ -341,55 +353,57 @@ def do_bench(
 
     di = runtime.driver.active.get_device_interface()  # pyrefly: ignore
 
-    fn()
-    di.synchronize()
-    # Backward benchmarks mutate grad fields between iterations, so keep their
-    # existing launch path.
-    benchmark_function = (
-        fn
-        if grad_to_none is not None
-        else _maybe_cudagraph_replay(fn, default_enabled=default_cudagraph)
-    )
+    with _pool_active():
+        fn()
+        di.synchronize()
+        # Backward benchmarks mutate grad fields between iterations, so keep
+        # their existing launch path.
+        benchmark_function = (
+            fn
+            if grad_to_none is not None
+            else _maybe_cudagraph_replay(fn, default_enabled=default_cudagraph)
+        )
 
-    cache = runtime.driver.active.get_empty_cache_for_benchmark()  # pyrefly: ignore
+        cache = runtime.driver.active.get_empty_cache_for_benchmark()  # pyrefly: ignore
 
-    # Estimate the runtime of the function
-    start_event = di.Event(enable_timing=True)
-    end_event = di.Event(enable_timing=True)
-    start_event.record()
-    for _ in range(5):
-        runtime.driver.active.clear_cache(cache)  # pyrefly: ignore
-        benchmark_function()
-    end_event.record()
-    di.synchronize()
-    estimate_ms = sync_object(
-        start_event.elapsed_time(end_event) / 5, process_group_name=process_group_name
-    )
+        # Estimate the runtime of the function
+        start_event = di.Event(enable_timing=True)
+        end_event = di.Event(enable_timing=True)
+        start_event.record()
+        for _ in range(5):
+            runtime.driver.active.clear_cache(cache)  # pyrefly: ignore
+            benchmark_function()
+        end_event.record()
+        di.synchronize()
+        estimate_ms = sync_object(
+            start_event.elapsed_time(end_event) / 5,
+            process_group_name=process_group_name,
+        )
 
-    # compute number of warmup and repeat
-    n_warmup = max(1, int(warmup / estimate_ms))
-    n_repeat = max(1, int(rep / estimate_ms))
-    start_event = [di.Event(enable_timing=True) for i in range(n_repeat)]
-    end_event = [di.Event(enable_timing=True) for i in range(n_repeat)]
-    # Warm-up
-    for _ in range(n_warmup):
-        benchmark_function()
-    # Benchmark
-    for i in range(n_repeat):
-        # we don't want `fn` to accumulate gradient values
-        # if it contains a backward pass. So we clear the
-        # provided gradients
-        if grad_to_none is not None:
-            for x in grad_to_none:
-                x.grad = None
-        # we clear the L2 cache before each run
-        runtime.driver.active.clear_cache(cache)  # pyrefly: ignore
-        # record time of `fn`
-        start_event[i].record()
-        benchmark_function()
-        end_event[i].record()
-    # Record clocks
-    di.synchronize()
+        # compute number of warmup and repeat
+        n_warmup = max(1, int(warmup / estimate_ms))
+        n_repeat = max(1, int(rep / estimate_ms))
+        start_event = [di.Event(enable_timing=True) for i in range(n_repeat)]
+        end_event = [di.Event(enable_timing=True) for i in range(n_repeat)]
+        # Warm-up
+        for _ in range(n_warmup):
+            benchmark_function()
+        # Benchmark
+        for i in range(n_repeat):
+            # we don't want `fn` to accumulate gradient values
+            # if it contains a backward pass. So we clear the
+            # provided gradients
+            if grad_to_none is not None:
+                for x in grad_to_none:
+                    x.grad = None
+            # we clear the L2 cache before each run
+            runtime.driver.active.clear_cache(cache)  # pyrefly: ignore
+            # record time of `fn`
+            start_event[i].record()
+            benchmark_function()
+            end_event[i].record()
+        # Record clocks
+        di.synchronize()
     times = [s.elapsed_time(e) for s, e in zip(start_event, end_event, strict=True)]
     return _summarize_statistics(times, quantiles, return_mode)  # pyrefly: ignore
 
@@ -410,36 +424,37 @@ def do_bench_generic(
     """
     assert return_mode in ["min", "max", "mean", "median", "all"]
 
-    out = fn()
-    synchronize_device(out)
-
-    # Estimate the runtime of the function
-    synchronize_device(out)
-    start = time.perf_counter()
-    for _ in range(5):
-        out = fn()
-    synchronize_device(out)
-    end = time.perf_counter()
-    estimate_ms = sync_object(
-        (end - start) * 1000 / 5, process_group_name=process_group_name
-    )
-
-    # compute number of warmup and repeat
-    n_warmup = max(1, int(warmup / estimate_ms))
-    n_repeat = max(1, int(rep / estimate_ms))
-    # Warm-up
-    for _ in range(n_warmup):
-        fn()
-    # Benchmark
-    times: list[float] = []
-    for _i in range(n_repeat):
-        if grad_to_none is not None:
-            for x in grad_to_none:
-                x.grad = None
-        synchronize_device(out)
-        t0 = time.perf_counter()
+    with _pool_active():
         out = fn()
         synchronize_device(out)
-        t1 = time.perf_counter()
-        times.append((t1 - t0) * 1000)  # convert to ms
+
+        # Estimate the runtime of the function
+        synchronize_device(out)
+        start = time.perf_counter()
+        for _ in range(5):
+            out = fn()
+        synchronize_device(out)
+        end = time.perf_counter()
+        estimate_ms = sync_object(
+            (end - start) * 1000 / 5, process_group_name=process_group_name
+        )
+
+        # compute number of warmup and repeat
+        n_warmup = max(1, int(warmup / estimate_ms))
+        n_repeat = max(1, int(rep / estimate_ms))
+        # Warm-up
+        for _ in range(n_warmup):
+            fn()
+        # Benchmark
+        times: list[float] = []
+        for _i in range(n_repeat):
+            if grad_to_none is not None:
+                for x in grad_to_none:
+                    x.grad = None
+            synchronize_device(out)
+            t0 = time.perf_counter()
+            out = fn()
+            synchronize_device(out)
+            t1 = time.perf_counter()
+            times.append((t1 - t0) * 1000)  # convert to ms
     return _summarize_statistics_fallback(times, quantiles, return_mode)

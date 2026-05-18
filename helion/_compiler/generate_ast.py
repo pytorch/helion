@@ -888,8 +888,9 @@ def _rewrite_output_allocs_for_pool(host_statements: list[ast.AST]) -> None:
     allocating a fresh one each call.
 
     The rewrite swaps ``torch.empty(...)`` → ``_helion_output_alloc(...)``.
-    The runtime helper decides whether to pool on each call based on
-    ``HELION_OUTPUT_POOL`` and the per-call liveness signals.
+    The runtime helper pools by default and applies per-call liveness
+    signals (refcount, stream, CUDA-graph capture);
+    ``HELION_REUSE_OUTPUT_BUFFERS=0`` opts out.
 
     Implementation notes:
     - Only rewrites ``torch.empty(shape, dtype=..., device=...)`` (and the
@@ -983,10 +984,9 @@ def generate_ast(
             codegen.host_dead_code_elimination()
 
             # Route output-tensor allocations through
-            # ``_helion_output_alloc`` so the runtime can pool them.
-            # Initially opt-in via ``HELION_OUTPUT_POOL=1`` (default
-            # ``_helion_output_alloc`` semantics match ``torch.empty``);
-            # a follow-up patch will make safe pooling the default.
+            # ``_helion_output_alloc`` so the runtime pool can reuse
+            # buffers across calls; pooling is on by default and disabled
+            # by ``HELION_REUSE_OUTPUT_BUFFERS=0``.
             # Pallas/Cute backends manage outputs via launcher-return
             # plumbing and don't pass output buffers as launcher args, so
             # the rewrite naturally no-ops there (no matches). Restrict

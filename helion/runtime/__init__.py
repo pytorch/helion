@@ -17,6 +17,13 @@ from .. import _compat as _compat  # ensure Triton compatibility patches run
 from .. import exc
 from .._compiler.cute.strategies import tcgen05_smem_layout_expr
 from .._utils import triton_is_available
+from ._output_pool import _REUSE_OUTPUT_BUFFERS_ENV as _REUSE_OUTPUT_BUFFERS_ENV
+from ._output_pool import _output_pool_alloc as _output_pool_alloc
+from ._output_pool import _pool_active as _pool_active
+from ._output_pool import (
+    _reset_output_pool_user_opt_in_cache as _reset_output_pool_user_opt_in_cache,
+)
+from ._output_pool import output_pool_clear as output_pool_clear
 from .config import Config as Config
 from .kernel import Kernel as Kernel
 from .kernel import kernel as kernel
@@ -179,112 +186,6 @@ def default_launcher(
         if "Cannot make_shape_compatible: incompatible dimensions" in message:
             raise exc.ShapeMismatch("kernel operands", message) from error
         raise
-
-
-# -----------------------------------------------------------------------------
-# Output buffer pool (G4 round 2, env-gated)
-# -----------------------------------------------------------------------------
-#
-# When ``HELION_OUTPUT_POOL=1`` is set, the generated host wrapper's
-# ``torch.empty(...)``/``torch.zeros(...)`` calls that produce kernel-output
-# tensors are routed through ``_output_pool_alloc(...)``, which caches one
-# buffer per ``(dtype, shape, device)`` triple and returns the cached
-# buffer on subsequent calls.
-#
-# This is **unsafe** if the caller stores prior outputs (subsequent calls
-# would overwrite them). Because of that the default is OFF and the
-# wrapper falls back to ``torch.empty(...)`` semantics. Opt-in is for
-# benchmarks and tight steady-state loops only.
-#
-# Implementation note: the env var is read once on first use rather than
-# per call to keep the hot path branch-free after pooling kicks in.
-
-_OUTPUT_POOL_ENV = "HELION_OUTPUT_POOL"
-_output_pool_enabled: bool | None = None
-_output_pool_cache: dict[
-    tuple[torch.dtype, tuple[int, ...], torch.device], torch.Tensor
-] = {}
-
-
-def _output_pool_is_enabled() -> bool:
-    global _output_pool_enabled
-    if _output_pool_enabled is None:
-        _output_pool_enabled = os.environ.get(_OUTPUT_POOL_ENV, "").strip() not in (
-            "",
-            "0",
-            "false",
-            "False",
-        )
-    return _output_pool_enabled
-
-
-def _output_pool_alloc(
-    *shape_args: object,
-    dtype: torch.dtype | None = None,
-    device: torch.device | str | None = None,
-    **extra_kwargs: object,
-) -> torch.Tensor:
-    """Pooled replacement for ``torch.empty(*shape, dtype=..., device=...)``.
-
-    Matches ``torch.empty``'s overloaded shape signature: callers can pass
-    a single tuple/list ``([1024, 1024])`` or multiple positional dims
-    ``(M, N)``. Generated host wrappers emit whichever the user wrote, so
-    both shapes need to work transparently. ``dtype`` and ``device`` are
-    optional to mirror ``torch.empty``'s defaults; ``extra_kwargs`` is a
-    catch-all (e.g. ``pin_memory``) forwarded to ``torch.empty`` on the
-    miss path. Pooled buffers always carry the resolved ``dtype``/``device``
-    in their cache key, so the same call site with different dtypes gets
-    distinct cached buffers.
-
-    When ``HELION_OUTPUT_POOL=1`` is set, returns a cached buffer matching
-    the (dtype, shape, device) triple — allocating one only on the first
-    request for each unique triple. The cached buffer's contents are
-    undefined on entry (same contract as ``torch.empty``), and the kernel
-    is expected to fully write it before the caller reads.
-
-    When the env var is unset (default), behaves identically to
-    ``torch.empty(*shape, dtype=dtype, device=device)`` so existing
-    behavior is preserved.
-    """
-    if not _output_pool_is_enabled():
-        kwargs: dict[str, object] = dict(extra_kwargs)
-        if dtype is not None:
-            kwargs["dtype"] = dtype
-        if device is not None:
-            kwargs["device"] = device
-        return torch.empty(*shape_args, **kwargs)  # type: ignore[arg-type]
-    # Normalize ``shape_args`` → a flat tuple of ints (or a tuple containing
-    # one tuple/list/torch.Size that we flatten). Mirrors torch.empty's
-    # accepted overloads.
-    if len(shape_args) == 1 and isinstance(shape_args[0], (tuple, list, torch.Size)):
-        shape_t = tuple(shape_args[0])
-    else:
-        shape_t = tuple(shape_args)  # type: ignore[arg-type]
-    # Resolve defaults the same way torch.empty does so the cache key
-    # captures the actual realized dtype/device.
-    resolved_dtype = dtype if dtype is not None else torch.get_default_dtype()
-    resolved_device = device if device is not None else torch.tensor(0.0).device
-    if extra_kwargs:
-        # Uncommon: extra kwargs (e.g. ``layout``, ``pin_memory``) change
-        # storage characteristics, so don't pool — just delegate.
-        # pyrefly: ignore [no-matching-overload]
-        return torch.empty(
-            shape_t, dtype=resolved_dtype, device=resolved_device, **extra_kwargs
-        )
-    key = (resolved_dtype, shape_t, resolved_device)
-    # pyrefly: ignore [bad-argument-type]
-    buf = _output_pool_cache.get(key)
-    if buf is None:
-        # pyrefly: ignore [no-matching-overload]
-        buf = torch.empty(shape_t, dtype=resolved_dtype, device=resolved_device)
-        # pyrefly: ignore [unsupported-operation]
-        _output_pool_cache[key] = buf
-    return buf
-
-
-def output_pool_clear() -> None:
-    """Drop all pooled output buffers (for tests that need fresh storage)."""
-    _output_pool_cache.clear()
 
 
 class _FastLauncher:
