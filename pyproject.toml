@@ -1,6 +1,10 @@
 [build-system]
-requires = ["hatchling", "hatch-vcs"]
-build-backend = "hatchling.build"
+# G2: migrated from pure-hatchling to scikit-build-core so we can ship a
+# CMake-built C extension (``helion._C_ext`` — see ``CMakeLists.txt`` and
+# ``helion/_C/_helion_c.cpp``). ``setuptools-scm`` keeps the dynamic
+# version source matching the prior ``hatch-vcs`` configuration.
+requires = ["scikit-build-core>=0.10", "setuptools-scm>=8"]
+build-backend = "scikit_build_core.build"
 
 [project]
 name = "helion"
@@ -120,24 +124,25 @@ required-imports = ["from __future__ import annotations"]
 force-single-line = true  # better merge conflicts
 force-sort-within-sections = true
 
-[tool.hatch.build.targets.wheel]
-packages = ["helion"]
+[tool.scikit-build]
+# scikit-build-core wraps CMake's install step. We override defaults so
+# the build is hermetic and editable installs find the freshly-built .so.
+cmake.version = ">=3.20"
+ninja.version = ">=1.10"
+build-dir = "build/{wheel_tag}"
+wheel.packages = ["helion"]
+wheel.exclude = ["test/**/*"]
+# Editable installs need to rebuild on touched C sources; tell scikit-build-core
+# to redirect imports through a small bootstrap that triggers a rebuild.
+editable.mode = "redirect"
+editable.rebuild = false  # Trigger explicit `uv pip install -e .` per docs.
 
-[tool.hatch.build]
-include = [
-  "helion/**/*.py",
-  "helion/**/*.pyi",
-  "LICENSE",
-]
-exclude = [
-  "test/**/*",
-]
+[tool.scikit-build.metadata.version]
+provider = "scikit_build_core.metadata.setuptools_scm"
 
-[tool.hatch.metadata]
-allow-direct-references = true
-
-[tool.hatch.version]
-source = "vcs"
+[tool.setuptools_scm]
+# Match prior ``hatch-vcs`` semantics: derive the version from the git tag.
+# (No write-to file; the package version is exposed via importlib.metadata.)
 
 [tool.pyrefly]
 project-includes = ["helion", "benchmarks", "docs", "examples"]

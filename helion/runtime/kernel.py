@@ -277,8 +277,49 @@ class Kernel(Generic[_R]):
         without any extras discovered during compilation. Used internally for
         _specialize_extra lookups.
         """
+        # Fast path (G2 bind cache): when every arg is a plain torch.Tensor
+        # and there's no user-supplied ``key`` callable, the loop below
+        # devolves into ``[tensor_key(t) for t in args] + (device_type,)``.
+        # The C extension's ``tensor_key`` handles each tensor with one
+        # native call instead of a dispatch through ``_specialization_key``
+        # + ``_specialization_extractors`` + Python ``_tensor_key``. Saves
+        # ~3 µs per ``Kernel.bind`` for ``examples/add.py``-scale kernels.
+        if (
+            _c_tensor_key is not None
+            and self._key_fn is None
+            and self.settings.static_shapes
+            and len(args) <= len(self._annotations)
+        ):
+            fast: list[Hashable] = []
+            device_type: str | None = None
+            took_fast_path = True
+            # Walk args alongside the matching annotations so we can bail
+            # to the slow path on any ``ConstExpr``-annotated parameter:
+            # the slow path treats those positionally (identity-based key),
+            # while ``tensor_key`` would emit a metadata-based key. The two
+            # would hash into different cache buckets for the same call.
+            for value, annotation in zip(args, self._annotations, strict=False):
+                if annotation is ConstExpr:
+                    took_fast_path = False
+                    break
+                # ``type(value) is torch.Tensor`` is much faster than
+                # ``isinstance`` and matches the most common case.
+                if type(value) is torch.Tensor:
+                    if device_type is None:
+                        device_type = value.device.type
+                    key = _c_tensor_key(value)
+                    if key is None:
+                        took_fast_path = False
+                        break
+                    fast.append(cast("Hashable", key))
+                else:
+                    took_fast_path = False
+                    break
+            if took_fast_path:
+                return (*fast, device_type)
+
         result: list[Hashable] = []
-        device_type: str | None = None
+        device_type = None
         assert len(args) <= len(self._annotations)
         for value, annotation in zip(args, self._annotations, strict=False):
             if isinstance(value, ConstExpr):
@@ -933,6 +974,12 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             extra_kwargs=kwargs or None,
         )
         kwdefaults["_launcher"] = fast_launcher
+        # Give the fast launcher a back-pointer so that, after priming
+        # builds a C ``CompiledLauncher``, the C launcher replaces
+        # ``fast_launcher`` in ``kwdefaults``. Subsequent calls then
+        # bypass the ``_FastLauncher.__call__`` Python frame entirely
+        # and dispatch straight into the C extension's ``tp_call``.
+        fast_launcher.register_kwdefaults_swap(kwdefaults, "_launcher")
 
     def _specialize_extra(self) -> list[Callable[[Sequence[object]], Hashable]]:
         """
@@ -1409,7 +1456,26 @@ def _hashable_dims(dims: Sequence[int | torch.SymInt]) -> tuple[Hashable, ...]:
     return tuple(_hashable_dim(s) for s in dims)
 
 
+# G2: optional C bind cache. The C extension provides a fast
+# ``tensor_key`` that mirrors the static-shape branch below; the dynamic
+# / bucketed branches stay in Python because they're far colder.
+# Controlled by ``HELION_C_BIND`` (default ``1`` when the .so is present);
+# accepts the standard ``HELION_*`` boolean literals via ``_env_get_bool``.
+from .. import _C as _helion_c  # noqa: E402
+from .settings import _env_get_bool  # noqa: E402
+
+_USE_C_BIND: bool = _helion_c.available and _env_get_bool("HELION_C_BIND", default=True)
+_c_tensor_key: Callable[[torch.Tensor], object] | None = (
+    _helion_c.tensor_key if _USE_C_BIND else None
+)
+
+
 def _tensor_key(fn: Kernel, obj: torch.Tensor) -> Hashable:
+    if _c_tensor_key is not None and fn.settings.static_shapes:
+        rv = _c_tensor_key(obj)
+        if rv is not None:
+            return cast("Hashable", rv)
+        # Fall through to Python for the SymInt / odd-tensor branch.
     si = getattr(obj, "_dynamo_static_indices", None)
     static_indices = frozenset(si) if si is not None else _EMPTY_FROZENSET
     if fn.settings.static_shapes:

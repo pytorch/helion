@@ -2,6 +2,8 @@
 *.a
 *.bak
 benchmarks/tritonbench
+# scikit-build-core CMake build directory
+/build/
 *.bzl
 .build-wheels
 .cache
@@ -112,3 +114,5 @@ cute_sweep_results.jsonl
 # Per-user Claude Code settings; ``.claude/skills/`` is tracked but
 # this file lives alongside it and is per-session local state.
 .claude/settings.local.json
+# Per-session lock files written by Claude Code's scheduled-task hook.
+.claude/*.lock

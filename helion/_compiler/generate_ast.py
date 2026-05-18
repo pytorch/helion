@@ -744,7 +744,70 @@ class GenerateAST(NodeVisitor, CodegenInterface):
             )
         if not self.on_device and self._needs_device_kwarg(node):
             node = self._inject_device_kwarg(node)
+        # When running on the host, detect
+        # ``torch.broadcast_tensors(*tensors)`` calls whose inputs all
+        # share the same static shape and whose dtypes/devices already
+        # agree on broadcast trivially (i.e. no unit dims need to be
+        # expanded). In that case ``torch.broadcast_tensors`` is a no-op
+        # — replace the Call with a literal tuple of the input names so
+        # the assignment ``x, y = torch.broadcast_tensors(x, y)`` becomes
+        # ``x, y = (x, y)``, eliminating ~1.5 µs/call on small kernels.
+        if not self.on_device:
+            elided = self._maybe_elide_broadcast_tensors(node)
+            if elided is not None:
+                return elided
         return self.generic_visit(node)
+
+    def _maybe_elide_broadcast_tensors(self, node: ast.Call) -> ast.AST | None:
+        """Return a tuple expression replacing a no-op ``torch.broadcast_tensors``.
+
+        Returns ``None`` if the call doesn't qualify for elision (either
+        not ``torch.broadcast_tensors``, has dynamic shapes, or shapes
+        don't all match statically).
+        """
+        from .type_propagation import CallableType
+        from .type_propagation import TensorType
+
+        func_node = node.func
+        if not isinstance(func_node, ExtendedAST):
+            return None
+        fn_type = func_node._type_info
+        if not isinstance(fn_type, CallableType):
+            return None
+        if fn_type.value is not torch.broadcast_tensors:
+            return None
+        if node.keywords:
+            return None
+        if not node.args or any(isinstance(a, ast.Starred) for a in node.args):
+            return None
+        # All input args must be TensorType with concrete, equal shapes.
+        first_shape: tuple[int, ...] | None = None
+        for arg in node.args:
+            if not isinstance(arg, ExtendedAST):
+                return None
+            arg_type = arg._type_info
+            if not isinstance(arg_type, TensorType):
+                return None
+            fake = arg_type.fake_value
+            try:
+                shape = tuple(int(s) for s in fake.size())
+            except (TypeError, ValueError):
+                # SymInt / unbacked — bail out and emit the runtime call.
+                return None
+            if first_shape is None:
+                first_shape = shape
+            elif shape != first_shape:
+                return None
+        # Build a tuple expression containing each original input,
+        # transformed by ``generic_visit`` (e.g. to rewrite ``x`` → host name).
+        elements: list[ast.AST] = []
+        for arg in node.args:
+            elements.append(self.visit(arg))
+        return create(
+            ast.Tuple,
+            elts=elements,  # pyrefly: ignore [bad-argument-type]
+            ctx=ast.Load(),
+        )
 
     def _needs_device_kwarg(self, node: ast.Call) -> bool:
         """Check if a host-level torch factory call is missing device=."""
@@ -802,6 +865,91 @@ if __name__ == "__main__":
     """)
 
 
+# Only ``torch.empty`` is safe to route through the output pool: its
+# documented contract is "contents are undefined", so a pooled buffer
+# (which has leftover data from the prior call) satisfies the contract.
+# ``torch.zeros``/``zeros_like`` semantically promise zero-init, which a
+# pool cannot cheaply preserve (re-zeroing per call would defeat the
+# point), so we leave those alone. ``empty_like``/``new_empty`` are
+# valid pool candidates too but their first arg is a template tensor
+# (not shape/dtype/device kwargs), so the runtime helper would need a
+# different signature — punt on those until a kernel needs them.
+_POOL_ELIGIBLE_TORCH_FNS: frozenset[str] = frozenset({"empty"})
+
+
+def _rewrite_output_allocs_for_pool(host_statements: list[ast.AST]) -> None:
+    """Route output-tensor allocations through ``_helion_output_alloc``.
+
+    Identifies top-level ``Assign(target=Name(v), value=Call(torch.<fn>(...)))``
+    statements (where ``<fn>`` is ``empty``/``zeros``/etc.) whose target
+    name is then passed as a positional arg to the launcher call. Such
+    tensors are kernel-output buffers, so it is safe (subject to the
+    runtime pool's safety checks) to reuse a cached buffer instead of
+    allocating a fresh one each call.
+
+    The rewrite swaps ``torch.empty(...)`` → ``_helion_output_alloc(...)``.
+    The runtime helper decides whether to pool on each call based on
+    ``HELION_OUTPUT_POOL`` and the per-call liveness signals.
+
+    Implementation notes:
+    - Only rewrites ``torch.empty(shape, dtype=..., device=...)`` (and the
+      0/empty_like variants) — not arbitrary factory expressions.
+    - Only rewrites when the produced variable name appears verbatim as a
+      positional arg of a statement marked ``_is_kernel_call=True``. This
+      keeps the rewrite conservative: tensors that escape via other
+      assignments / returns are not pooled.
+    """
+    # Collect launcher-call-arg Names so we know which output buffers are
+    # safe to pool. Launcher Call appears either inside an ``Expr``
+    # statement (no return-value capture) or an ``Assign`` (Pallas-style
+    # output capture); pull the Call out uniformly.
+    launcher_arg_names: set[str] = set()
+    for stmt in host_statements:
+        if not getattr(stmt, "_is_kernel_call", False):
+            continue
+        call: ast.AST | None = None
+        if isinstance(stmt, (ast.Expr, ast.Assign)) and isinstance(
+            stmt.value, ast.Call
+        ):
+            call = stmt.value
+        if not isinstance(call, ast.Call):
+            continue
+        for arg in call.args:
+            if isinstance(arg, ast.Name):
+                launcher_arg_names.add(arg.id)
+
+    if not launcher_arg_names:
+        return
+
+    for stmt in host_statements:
+        if not isinstance(stmt, ast.Assign):
+            continue
+        if len(stmt.targets) != 1 or not isinstance(stmt.targets[0], ast.Name):
+            continue
+        target_name = stmt.targets[0].id
+        if target_name not in launcher_arg_names:
+            continue
+        if not isinstance(stmt.value, ast.Call):
+            continue
+        call = stmt.value
+        func = call.func
+        # Match ``torch.<name>(...)`` only — leave alone everything else.
+        if not (
+            isinstance(func, ast.Attribute)
+            and isinstance(func.value, ast.Name)
+            and func.value.id == "torch"
+            and func.attr in _POOL_ELIGIBLE_TORCH_FNS
+        ):
+            continue
+        # Rewrite ``torch.empty(...)`` → ``_helion_output_alloc(...)``.
+        # The runtime helper's contract matches ``torch.empty`` (contents
+        # undefined); see ``_POOL_ELIGIBLE_TORCH_FNS`` for why we limit
+        # to ``empty`` only.
+        new_func = expr_from_string("_helion_output_alloc")
+        assert isinstance(new_func, ast.expr)
+        call.func = new_func
+
+
 def generate_ast(
     func: HostFunction,
     config: Config,
@@ -833,6 +981,20 @@ def generate_ast(
                 codegen.add_statement(codegen.visit(stmt))
             kernel_def = codegen.device_function.codegen_function_def()
             codegen.host_dead_code_elimination()
+
+            # Route output-tensor allocations through
+            # ``_helion_output_alloc`` so the runtime can pool them.
+            # Initially opt-in via ``HELION_OUTPUT_POOL=1`` (default
+            # ``_helion_output_alloc`` semantics match ``torch.empty``);
+            # a follow-up patch will make safe pooling the default.
+            # Pallas/Cute backends manage outputs via launcher-return
+            # plumbing and don't pass output buffers as launcher args, so
+            # the rewrite naturally no-ops there (no matches). Restrict
+            # to Triton backend defensively in case codegen evolves.
+            from .backend import TritonBackend as _TritonBackend
+
+            if isinstance(CompileEnvironment.current().backend, _TritonBackend):
+                _rewrite_output_allocs_for_pool(codegen.host_statements)
 
             # Retarget output-only tensor allocations to ``device='meta'`` so
             # the factory call produces a zero-storage metadata-only tensor

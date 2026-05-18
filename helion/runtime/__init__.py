@@ -181,6 +181,112 @@ def default_launcher(
         raise
 
 
+# -----------------------------------------------------------------------------
+# Output buffer pool (G4 round 2, env-gated)
+# -----------------------------------------------------------------------------
+#
+# When ``HELION_OUTPUT_POOL=1`` is set, the generated host wrapper's
+# ``torch.empty(...)``/``torch.zeros(...)`` calls that produce kernel-output
+# tensors are routed through ``_output_pool_alloc(...)``, which caches one
+# buffer per ``(dtype, shape, device)`` triple and returns the cached
+# buffer on subsequent calls.
+#
+# This is **unsafe** if the caller stores prior outputs (subsequent calls
+# would overwrite them). Because of that the default is OFF and the
+# wrapper falls back to ``torch.empty(...)`` semantics. Opt-in is for
+# benchmarks and tight steady-state loops only.
+#
+# Implementation note: the env var is read once on first use rather than
+# per call to keep the hot path branch-free after pooling kicks in.
+
+_OUTPUT_POOL_ENV = "HELION_OUTPUT_POOL"
+_output_pool_enabled: bool | None = None
+_output_pool_cache: dict[
+    tuple[torch.dtype, tuple[int, ...], torch.device], torch.Tensor
+] = {}
+
+
+def _output_pool_is_enabled() -> bool:
+    global _output_pool_enabled
+    if _output_pool_enabled is None:
+        _output_pool_enabled = os.environ.get(_OUTPUT_POOL_ENV, "").strip() not in (
+            "",
+            "0",
+            "false",
+            "False",
+        )
+    return _output_pool_enabled
+
+
+def _output_pool_alloc(
+    *shape_args: object,
+    dtype: torch.dtype | None = None,
+    device: torch.device | str | None = None,
+    **extra_kwargs: object,
+) -> torch.Tensor:
+    """Pooled replacement for ``torch.empty(*shape, dtype=..., device=...)``.
+
+    Matches ``torch.empty``'s overloaded shape signature: callers can pass
+    a single tuple/list ``([1024, 1024])`` or multiple positional dims
+    ``(M, N)``. Generated host wrappers emit whichever the user wrote, so
+    both shapes need to work transparently. ``dtype`` and ``device`` are
+    optional to mirror ``torch.empty``'s defaults; ``extra_kwargs`` is a
+    catch-all (e.g. ``pin_memory``) forwarded to ``torch.empty`` on the
+    miss path. Pooled buffers always carry the resolved ``dtype``/``device``
+    in their cache key, so the same call site with different dtypes gets
+    distinct cached buffers.
+
+    When ``HELION_OUTPUT_POOL=1`` is set, returns a cached buffer matching
+    the (dtype, shape, device) triple — allocating one only on the first
+    request for each unique triple. The cached buffer's contents are
+    undefined on entry (same contract as ``torch.empty``), and the kernel
+    is expected to fully write it before the caller reads.
+
+    When the env var is unset (default), behaves identically to
+    ``torch.empty(*shape, dtype=dtype, device=device)`` so existing
+    behavior is preserved.
+    """
+    if not _output_pool_is_enabled():
+        kwargs: dict[str, object] = dict(extra_kwargs)
+        if dtype is not None:
+            kwargs["dtype"] = dtype
+        if device is not None:
+            kwargs["device"] = device
+        return torch.empty(*shape_args, **kwargs)  # type: ignore[arg-type]
+    # Normalize ``shape_args`` → a flat tuple of ints (or a tuple containing
+    # one tuple/list/torch.Size that we flatten). Mirrors torch.empty's
+    # accepted overloads.
+    if len(shape_args) == 1 and isinstance(shape_args[0], (tuple, list, torch.Size)):
+        shape_t = tuple(shape_args[0])
+    else:
+        shape_t = tuple(shape_args)  # type: ignore[arg-type]
+    # Resolve defaults the same way torch.empty does so the cache key
+    # captures the actual realized dtype/device.
+    resolved_dtype = dtype if dtype is not None else torch.get_default_dtype()
+    resolved_device = device if device is not None else torch.tensor(0.0).device
+    if extra_kwargs:
+        # Uncommon: extra kwargs (e.g. ``layout``, ``pin_memory``) change
+        # storage characteristics, so don't pool — just delegate.
+        # pyrefly: ignore [no-matching-overload]
+        return torch.empty(
+            shape_t, dtype=resolved_dtype, device=resolved_device, **extra_kwargs
+        )
+    key = (resolved_dtype, shape_t, resolved_device)
+    # pyrefly: ignore [bad-argument-type]
+    buf = _output_pool_cache.get(key)
+    if buf is None:
+        # pyrefly: ignore [no-matching-overload]
+        buf = torch.empty(shape_t, dtype=resolved_dtype, device=resolved_device)
+        # pyrefly: ignore [unsupported-operation]
+        _output_pool_cache[key] = buf
+    return buf
+
+
+def output_pool_clear() -> None:
+    """Drop all pooled output buffers (for tests that need fresh storage)."""
+    _output_pool_cache.clear()
+
+
 class _FastLauncher:
     """Fast launcher that bypasses Triton's ``JITFunction.run`` Python frame.
 
@@ -208,11 +314,15 @@ class _FastLauncher:
         "_active_driver",
         "_binder",
         "_bind_skip_safe",
+        "_c_launcher",
+        "_c_launch",
         "_compiled_kernel",
         "_compiled_run",
         "_device",
         "_get_current_stream",
         "_kernel_launch_metadata",
+        "_kwdefaults_owner",
+        "_kwdefaults_key",
         "_launch_cooperative_grid",
         "_launch_enter_hook",
         "_launch_exit_hook",
@@ -272,6 +382,20 @@ class _FastLauncher:
         # constexpr block-sizes as module-level constants rather than
         # passing them as Triton parameters.
         self._bind_skip_safe = False
+        # G2: a ``helion._C.CompiledLauncher`` built at prime time when
+        # the C extension is available. ``_c_launch`` caches the bound
+        # ``launch`` method so the hot path is a single C-level call.
+        self._c_launcher: object | None = None
+        self._c_launch: Callable[..., object] | None = None
+        # G2 round 2: optional back-pointer to the generated wrapper's
+        # ``__kwdefaults__`` mapping (or any mapping) that originally
+        # referenced ``self`` as ``_launcher``. When ``_install_c_launcher``
+        # succeeds, we replace that slot with the C launcher itself so the
+        # hot path skips this Python ``__call__`` frame entirely. ``None``
+        # means "no auto-swap"; the legacy hot-path Python branch still
+        # works in that case.
+        self._kwdefaults_owner: dict | None = None
+        self._kwdefaults_key: str | None = None
 
     def _prime(
         self, triton_kernel: object, grid: tuple[int, ...], args: tuple[object, ...]
@@ -344,10 +468,79 @@ class _FastLauncher:
             # ``launch_exit_hook`` activity per call instead — cheap
             # because both are HookChain objects whose ``calls`` list
             # check is a constant-time identity comparison.
+
+            # G2: if the C extension is present, build a
+            # ``helion._C.CompiledLauncher`` and dispatch through it on
+            # the hot path. The launcher object holds all the captured
+            # state (compiled_run, packed_metadata, hooks, ...) so the
+            # per-call Python frame is just the ``__call__`` slot below
+            # plus one C function call.
+            self._install_c_launcher()
         except Exception:
             # Any priming failure → leave _compiled_run None so the
             # __call__ path falls back to default_launcher.
             self._compiled_run = None
+
+    def register_kwdefaults_swap(self, owner: dict, key: str) -> None:
+        """Tell this launcher where to install the C launcher after priming.
+
+        ``owner[key]`` should currently point at ``self`` (the
+        ``_FastLauncher`` instance). When :meth:`_install_c_launcher`
+        successfully builds a C ``CompiledLauncher``, we overwrite
+        ``owner[key]`` with the C launcher directly. Subsequent calls
+        from the generated wrapper bypass the Python ``_FastLauncher.__call__``
+        frame entirely and dispatch into C via the launcher's ``tp_call``.
+
+        If the C extension is unavailable or priming fails, the swap is
+        skipped and the pure-Python hot path continues to run.
+        """
+        self._kwdefaults_owner = owner
+        self._kwdefaults_key = key
+
+    def _install_c_launcher(self) -> None:
+        """Build the ``helion._C.CompiledLauncher`` instance, if available.
+
+        Called from :meth:`_prime` after all Triton state has been
+        captured. Sets :attr:`_c_launch` to the bound ``launch`` method
+        for fast dispatch; on any failure the attribute stays ``None``
+        and the pure-Python hot path runs instead.
+
+        If a kwdefaults swap target was registered via
+        :meth:`register_kwdefaults_swap`, the C launcher also replaces
+        ``self`` in that mapping so future calls skip the Python frame
+        below.
+        """
+        try:
+            from .. import _C as _helion_c
+        except ImportError:
+            return
+        if not _helion_c.available:
+            return
+        try:
+            launcher = _helion_c.CompiledLauncher(
+                self._compiled_run,
+                self._triton_function,
+                self._packed_metadata,
+                self._kernel_launch_metadata,
+                self._launch_enter_hook,
+                self._launch_exit_hook,
+                self._get_current_stream,
+                self._device,
+                self._binder if not self._bind_skip_safe else None,
+                self._run_kwargs,
+                self._bind_skip_safe,
+            )
+        except Exception:
+            return
+        self._c_launcher = launcher
+        # pyrefly: ignore [missing-attribute]
+        self._c_launch = launcher.launch
+        # Hot-swap ourselves out of the generated wrapper's __kwdefaults__
+        # so subsequent calls go straight into the C launcher's tp_call.
+        owner = self._kwdefaults_owner
+        key = self._kwdefaults_key
+        if owner is not None and key is not None and owner.get(key) is self:
+            owner[key] = launcher
 
     def __call__(
         self,
@@ -382,7 +575,25 @@ class _FastLauncher:
                 **self._run_kwargs,
             )
 
-        # Hot path — no dict allocation, no Python-level Triton run frame.
+        # G2 hot path: if the C launcher is available, delegate to it.
+        # CompiledLauncher.launch is FASTCALL and unpacks grid + args
+        # entirely in C, so this is a single C frame.
+        c_launch = self._c_launch
+        if c_launch is not None:
+            try:
+                grid_size = len(grid)
+                grid_0 = grid[0]
+                grid_1 = grid[1] if grid_size > 1 else 1
+                grid_2 = grid[2] if grid_size > 2 else 1
+                return c_launch(grid_0, grid_1, grid_2, *args)
+            except Exception as error:
+                message = str(error)
+                if "Cannot make_shape_compatible: incompatible dimensions" in message:
+                    raise exc.ShapeMismatch("kernel operands", message) from error
+                raise
+
+        # Pure-Python hot path (kept as fallback when C ext absent) —
+        # no dict allocation, no Python-level Triton run frame.
         try:
             if self._bind_skip_safe:
                 # Skip the binder: for typical Helion kernels (where
