@@ -87,23 +87,35 @@ Three things can happen:
 
 The kernel has data-dependent trip counts (RPA's kv_lens, splash SWA's mask iters, emit_pipeline kernels with shape-dependent inner loops). Trip count is NOT in the LLO and can't be derived statically.
 
+**One-shot (recommended):** pass `--auto-calibrate` with `--measured-us` to the predictor; it back-solves K, persists to `meta.yaml`, and re-predicts in a single invocation:
+
 ```bash
-# 5a. You already have a measurement from step 1 (the runner prints it)
-# 5b. Back-solve K such that the predictor reproduces the measurement,
-#     and persist it to meta.yaml:
+python scripts/tpu_roofline.py $ENTRY \
+    --inputs "..." --outputs "..." \
+    --measured-us <X> --auto-calibrate
+# → prints:
+#   ℹ Auto-calibrate: back-solved inner_loop_iters=47 (compute-bound, abs error 2.1 µs)
+#     → appended inner_loop_iters=47 to <entry>/meta.yaml
+#   Predicted: 256.43 µs   Error: -0.8%
+```
+
+Subsequent runs of the same entry pick up the persisted K from `meta.yaml` automatically — no flags needed.
+
+**Manual (if you want the back-solve and prediction as separate steps):**
+
+```bash
 python scripts/hlo_sidecar.py back-solve \
     --llo-dir $ENTRY \
     --inputs "..." --outputs "..." \
     --measured-us <X> --persist
 
-# 5c. Now re-run the predictor — it auto-loads K from meta.yaml:
 python scripts/tpu_roofline.py $ENTRY \
     --inputs "..." --outputs "..." \
     --measured-us <X>
 # → prints: "ℹ Loaded inner_loop_iters=K from meta.yaml"
 ```
 
-Verified on three prior outliers: rpa_decode/prefill/mixed and gmm_v2_M=4096 all land within ±1.5% after back-solve.
+Verified on five prior outliers: rpa_decode/prefill/mixed, gmm_v2_M=4096, and paged_attn_v2 all land within ±1.5% after back-solve.
 
 ### Optional flags
 

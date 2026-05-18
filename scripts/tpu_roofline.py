@@ -891,6 +891,65 @@ def predict(
     }
 
 
+def _auto_calibrate_K(args: argparse.Namespace) -> None:
+    """Back-solve K via hlo_sidecar, persist to meta.yaml, mutate args.inner_loop_iters.
+
+    Called from main() when --auto-calibrate is set and --measured-us is given.
+    On success, args.inner_loop_iters is updated so the rest of main() runs as if
+    the user had supplied -inner-loop-iters K explicitly.
+    """
+    from hlo_sidecar import (  # pyrefly: ignore[missing-import]
+        back_solve_inner_loop_iters,
+    )
+
+    # Compute hbm_bytes from args.inputs / args.outputs (same path as predict)
+    bytes_moved = 0
+    for spec in [args.inputs, args.outputs]:
+        if not spec:
+            continue
+        for entry in spec.split(","):
+            bytes_moved += parse_shape_spec(entry.strip())
+    if bytes_moved == 0 and args.bytes is not None:
+        bytes_moved = args.bytes
+    if bytes_moved == 0:
+        print(
+            "⚠ --auto-calibrate needs HBM byte count from --inputs/--outputs/"
+            "--bytes; got none. Skipping.",
+            file=sys.stderr,
+        )
+        return
+
+    k, debug = back_solve_inner_loop_iters(
+        Path(args.llo_dir), args.measured_us, bytes_moved
+    )
+    print(
+        f"ℹ Auto-calibrate: back-solved inner_loop_iters={k} "
+        f"({debug.get('regime', 'unknown regime')}, "
+        f"abs error {debug.get('abs_error_us', 0):.1f} µs)",
+        file=sys.stderr,
+    )
+
+    # Persist to meta.yaml (same logic as hlo_sidecar's _cmd_back_solve --persist)
+    meta = Path(args.llo_dir) / "meta.yaml"
+    if meta.exists():
+        text = meta.read_text()
+        if "inner_loop_iters:" not in text:
+            with meta.open("a") as f:
+                f.write(f"\ninner_loop_iters: {k}  # auto-calibrated\n")
+            print(f"  → appended inner_loop_iters={k} to {meta}", file=sys.stderr)
+        else:
+            print(
+                f"  ! {meta} already contains inner_loop_iters; using derived "
+                f"K={k} for this run but NOT overwriting the existing value",
+                file=sys.stderr,
+            )
+    else:
+        meta.write_text(f"inner_loop_iters: {k}  # auto-calibrated\n")
+        print(f"  → wrote inner_loop_iters={k} to {meta}", file=sys.stderr)
+
+    args.inner_loop_iters = k
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description="TPU v7x roofline predictor")
     p.add_argument(
@@ -949,6 +1008,18 @@ def main() -> None:
             "kernel under-reports trip counts (dynamic loops, emit_pipeline) "
             "and want a best-case estimate. The true runtime is at least the "
             "reported number."
+        ),
+    )
+    p.add_argument(
+        "--auto-calibrate",
+        action="store_true",
+        help=(
+            "One-shot calibration loop for dynamic-trip kernels. Requires "
+            "--measured-us. If the predictor would refuse (deep dynamic loops) "
+            "or the prediction has >10% error, automatically back-solve K via "
+            "hlo_sidecar, persist it to meta.yaml, and re-run the prediction. "
+            "Future predictions of the same entry pick up the persisted K via "
+            "the meta.yaml auto-load path — no flags needed."
         ),
     )
     p.add_argument(
@@ -1030,38 +1101,47 @@ def main() -> None:
     )
 
     if deep_unannotated_loops and not user_provided_iter_hint:
-        reason = [
-            (
-                f"nested LB depth {parsed.lb_nesting_depth} with no explicit "
-                f"`iter bound` annotations (parser heuristic returned trip="
-                f"{parsed.inferred_trip_count}) — typical of emit_pipeline or "
-                "dynamic-bound fori_loop kernels where the inner trip count is "
-                "data-dependent and not derivable from LLO alone"
+        # Auto-calibrate path: if the user gave us --measured-us and --auto-calibrate,
+        # back-solve K, persist to meta.yaml, and re-enter as if --inner-loop-iters
+        # were supplied on the CLI. Avoids the manual three-step ritual.
+        if args.auto_calibrate and args.measured_us is not None:
+            _auto_calibrate_K(args)  # mutates args.inner_loop_iters in place
+            user_provided_iter_hint = args.inner_loop_iters > 1
+        if deep_unannotated_loops and not user_provided_iter_hint:
+            reason = [
+                (
+                    f"nested LB depth {parsed.lb_nesting_depth} with no explicit "
+                    f"`iter bound` annotations (parser heuristic returned trip="
+                    f"{parsed.inferred_trip_count}) — typical of emit_pipeline or "
+                    "dynamic-bound fori_loop kernels where the inner trip count is "
+                    "data-dependent and not derivable from LLO alone"
+                )
+            ]
+            msg = (
+                "\n╔══════════════════════════════════════════════════════════╗\n"
+                "║  REFUSING TO PREDICT — low-confidence trip count         ║\n"
+                "╚══════════════════════════════════════════════════════════╝\n"
+                f"Reason: {'; '.join(reason)}\n\n"
+                "The static LLO body alone does not determine runtime for this "
+                "kernel. Options:\n"
+                "  1. Pass --inner-loop-iters K, where K is the runtime trip "
+                "count (S/block_n for emit_pipeline attention, total kv-blocks "
+                "for RPA, etc.)\n"
+                "  2. Pass --dynamic-bundles N if you know the total dynamic "
+                "bundle count from an external source.\n"
+                "  3. Pass --lower-bound to get a strict lower-bound estimate "
+                "(true runtime is at least this number).\n"
+                "  4. Pass --measured-us X --auto-calibrate to back-solve K "
+                "from one measurement and persist it for future predictions.\n"
             )
-        ]
-        msg = (
-            "\n╔══════════════════════════════════════════════════════════╗\n"
-            "║  REFUSING TO PREDICT — low-confidence trip count         ║\n"
-            "╚══════════════════════════════════════════════════════════╝\n"
-            f"Reason: {'; '.join(reason)}\n\n"
-            "The static LLO body alone does not determine runtime for this "
-            "kernel. Options:\n"
-            "  1. Pass --inner-loop-iters K, where K is the runtime trip "
-            "count (S/block_n for emit_pipeline attention, total kv-blocks "
-            "for RPA, etc.)\n"
-            "  2. Pass --dynamic-bundles N if you know the total dynamic "
-            "bundle count from an external source.\n"
-            "  3. Pass --lower-bound to get a strict lower-bound estimate "
-            "(true runtime is at least this number).\n"
-        )
-        if args.lower_bound:
-            print(
-                msg.replace("REFUSING TO PREDICT", "LOWER-BOUND MODE  "),
-                file=sys.stderr,
-            )
-        else:
-            print(msg, file=sys.stderr)
-            sys.exit(2)
+            if args.lower_bound:
+                print(
+                    msg.replace("REFUSING TO PREDICT", "LOWER-BOUND MODE  "),
+                    file=sys.stderr,
+                )
+            else:
+                print(msg, file=sys.stderr)
+                sys.exit(2)
 
     if args.dynamic_bundles:
         total_dynamic = args.dynamic_bundles * args.inner_loop_iters
