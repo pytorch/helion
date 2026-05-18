@@ -2278,6 +2278,10 @@ def _(state: CodegenState) -> list[object]:
 
     if_return_names: list[str] = []
     else_return_names: list[str] = []
+    # _if was traced as returning if_outputs + else_outputs, so surviving
+    # getitem nodes still index into that original full layout after DCE.
+    # Pallas lowers only phi values through lax.cond, so place each cond
+    # result back at the original if/else output indices it represents.
     output_aliases: dict[int, str] = {}
     else_output_offset = len(if_outputs)
     for if_entry, else_entry in graph_info.branches_outputs:

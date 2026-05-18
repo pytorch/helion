@@ -583,9 +583,7 @@ class TestPallas(TestCase):
         """Branch intermediates must survive in _if output list."""
 
         @helion.kernel(backend="pallas", static_shapes=True)
-        def if_with_intermediate(
-            x: torch.Tensor, flag: float
-        ) -> torch.Tensor:
+        def if_with_intermediate(x: torch.Tensor, flag: float) -> torch.Tensor:
             n, m = x.shape
             block_n = hl.register_block_size(n)
             block_m = hl.register_block_size(m)
