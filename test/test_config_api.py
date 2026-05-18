@@ -368,6 +368,20 @@ class TestSettingsEnv(TestCase):
         )
         self.assertTrue(cute_env.config_spec.supports_config_key("num_threads"))
 
+    def test_pallas_backend_uses_exact_factory_and_static_reduction_dims(
+        self,
+    ) -> None:
+        from helion._compiler.backend import PallasBackend
+        from helion._compiler.backend import TritonBackend
+
+        triton = TritonBackend()
+        pallas = PallasBackend()
+
+        self.assertTrue(triton.pad_factory_tensors_to_power_of_2)
+        self.assertEqual(triton.static_rdim_size(384), 512)
+        self.assertFalse(pallas.pad_factory_tensors_to_power_of_2)
+        self.assertEqual(pallas.static_rdim_size(384), 384)
+
     def test_triton_rejects_num_threads_in_normalize(self) -> None:
         env = CompileEnvironment(torch.device("cpu"), helion.Settings(backend="triton"))
         with self.assertRaisesRegex(
