@@ -527,10 +527,7 @@ def _loop_begin_extra_pad(block_id: int, state: CodegenState) -> int:
     """
     import sympy
 
-    from helion._compiler.compile_environment import CompileEnvironment
-
-    env = CompileEnvironment.current()
-    bs_value = env.block_sizes[block_id].from_config(state.device_function.config)
+    bs_value = state.device_function.resolved_block_size(block_id)
     if not isinstance(bs_value, int):
         return 0
 
@@ -561,10 +558,7 @@ def _loop_offset_alignment(
     """
     import sympy
 
-    from helion._compiler.compile_environment import CompileEnvironment
-
-    env = CompileEnvironment.current()
-    bs_value = env.block_sizes[block_id].from_config(state.device_function.config)
+    bs_value = state.device_function.resolved_block_size(block_id)
     if not isinstance(bs_value, int):
         return None
 

@@ -389,7 +389,7 @@ def _compute_grid_and_block_sizes(
         block_size_var = state.device_function.block_size_var(block_id)
         assert block_size_var is not None
         block_size_vars.append(block_size_var)
-        block_value = env.block_sizes[block_id].from_config(state.config)
+        block_value = state.device_function.resolved_block_size(block_id)
         if block_value is not None:
             state.device_function.constexpr_arg(block_size_var, block_value)
         numel_expr = _get_loop_numel(state, i)
@@ -451,7 +451,7 @@ def _compute_pipeline_or_dma_extra_pad(
     """
     if begin_expr == "0":
         return 0
-    bs_val = env.block_sizes[bid].from_config(state.config)
+    bs_val = state.device_function.resolved_block_size(bid)
     if isinstance(bs_val, int):
         return bs_val - 1
     return 0
@@ -674,7 +674,7 @@ def _setup_inner_loop_masks(
     needs_explicit = False
     if hasattr(strategy, "_setup_mask"):
         for i, bid in enumerate(block_ids):
-            block_value = env.block_sizes[bid].from_config(state.config)
+            block_value = state.device_function.resolved_block_size(bid)
             assert isinstance(block_value, int)
             numel_expr = _get_loop_numel(state, i)
             offset_var = state.device_function.new_var(f"offset_{bid}")
@@ -1791,13 +1791,13 @@ def _compute_vmem_shapes(
                 if isinstance(block_value_sym, sympy.Integer):
                     parts.append(int(block_value_sym))
                 else:
-                    block_value = env.block_sizes[block_ids[bid_idx]].from_config(
-                        state.config
+                    block_value = state.device_function.resolved_block_size(
+                        block_ids[bid_idx]
                     )
                     assert isinstance(block_value, int)
                     parts.append(block_value)
             elif bid is not None:
-                outer_block_value = env.block_sizes[bid].from_config(state.config)
+                outer_block_value = state.device_function.resolved_block_size(bid)
                 if isinstance(outer_block_value, int):
                     parts.append(outer_block_value)
                 else:

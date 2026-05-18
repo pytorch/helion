@@ -16,6 +16,7 @@ from .traceback_compat import format_frame_summary
 
 if TYPE_CHECKING:
     import ast
+    import types
     from typing_extensions import Self
 
     from .ast_extension import ExtendedAST
@@ -63,23 +64,19 @@ class SourceLocation(traceback.FrameSummary):
             self.end_colno = end_colno
 
     @staticmethod
-    def from_ast(node: ast.AST) -> SourceLocation:
-        # TODO(hinriksnaer): take code and column_offset as parameters
-        # to decouple from HostFunction.current()?
-        from .host_function import HostFunction
-
-        host_function = HostFunction.current()
-        code = host_function.fn.__code__
+    def from_ast(
+        node: ast.AST, code: types.CodeType, column_offset: int
+    ) -> SourceLocation:
         offset = code.co_firstlineno - 1
         return SourceLocation(
             # pyrefly: ignore [missing-attribute]
             node.lineno + offset,
             # pyrefly: ignore [missing-attribute]
-            node.col_offset + host_function.column_offset,
+            node.col_offset + column_offset,
             # pyrefly: ignore [missing-attribute]
             node.end_lineno + offset,
             # pyrefly: ignore [missing-attribute]
-            node.end_col_offset + host_function.column_offset,
+            node.end_col_offset + column_offset,
             filename=code.co_filename,
             name=code.co_name,
         )

@@ -8,6 +8,7 @@ import torch
 
 import helion
 from helion import _compat
+from helion._compiler.autotuner_heuristics.cute import CuteTcgen05ClusterM2Heuristic
 from helion._compiler.cute.strategies import ROLE_LOCAL_MONOLITHIC_DEFAULT_WARP_SPEC
 from helion._compiler.cute.strategies import Tcgen05LayoutOverrides
 from helion._compiler.cute.strategies import Tcgen05LayoutStrategy
@@ -18,7 +19,6 @@ from helion._compiler.cute.strategies import validate_tcgen05_strategy_invariant
 from helion._compiler.cute.tcgen05_constants import TCGEN05_ONE_CTA_MAX_BLOCK_M
 from helion._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
 from helion._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
-from helion._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_SEED_L2_GROUPING
 from helion._testing import DEVICE
 from helion._testing import HALF_DTYPE
 from helion._testing import RefEagerTestDisabled
@@ -27,9 +27,9 @@ from helion._testing import code_and_output
 from helion._testing import onlyBackends
 from helion._testing import patch_cute_mma_support
 from helion._testing import skipIfMTIA
+from helion.autotuner import PowerOfTwoFragment
 from helion.autotuner.config_generation import ConfigGeneration
-from helion.autotuner.pattern_search import InitialPopulationStrategy
-from helion.autotuner.pattern_search import PatternSearch
+from helion.autotuner.config_spec import ConfigSpec
 from helion.exc import InvalidConfig
 import helion.language as hl
 
@@ -45,6 +45,38 @@ def _matmul_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
         for tile_k in hl.tile(k):
             acc += torch.matmul(x[tile_m, tile_k], y[tile_k, tile_n])
         out[tile_m, tile_n] = acc
+    return out
+
+
+@helion.kernel(static_shapes=True)
+def _split_k_offset_index_atomic(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """Split-K reduction whose atomic_add index mixes an offset-constant
+    (``tile_m.begin // block_m``) with a tile coord (``tile_n``).
+
+    The non-``BlockSizeOrigin`` first index would short-circuit the
+    prior cycle's gated ghost-axis predicate before the cycle that
+    lifted the scan above the gate; the inner-K thread axis remains
+    live in this scope and causes ``blockDim.z``-multiplier
+    over-counting without the ghost-axis leader predicate.
+    """
+    m, k = x.size()
+    _, n = y.size()
+    block_m = hl.register_block_size(m)
+    out = torch.zeros(
+        [(m + 15) // 16, n],
+        dtype=torch.promote_types(x.dtype, y.dtype),
+        device=x.device,
+    )
+    split_k = hl.register_tunable("split_k", PowerOfTwoFragment(1, 256))
+    k_block = helion.next_power_of_2(helion.cdiv(k, split_k))
+    for tile_m, tile_n, outer_k in hl.tile(
+        [m, n, k], block_size=[block_m, None, k_block]
+    ):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for inner_k in hl.tile(outer_k.begin, outer_k.end):
+            acc = torch.addmm(acc, x[tile_m, inner_k], y[inner_k, tile_n])
+        m_block_idx = tile_m.begin // block_m
+        hl.atomic_add(out, [m_block_idx, tile_n], acc.sum(dim=0))
     return out
 
 
@@ -113,6 +145,51 @@ def _cute_strategy_matmul_force_persistent_kernel(
             acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
         out[tile_m, tile_n] = acc.to(x.dtype)
     return out
+
+
+@helion.kernel(backend="cute")
+def _cute_4096_matmul_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """Plain BF16 4096^3 cute matmul; shared by the SMEM-gate tests below."""
+    m, k = x.size()
+    _, n = y.size()
+    out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+        out[tile_m, tile_n] = acc.to(x.dtype)
+    return out
+
+
+def _bind_cute_4096_matmul_kernel_with_mocked_smem_budget(budget_bytes: int):
+    """Bind the 4096^3 matmul with the per-CTA AB-SMEM budget mocked.
+
+    The SMEM-budget gate is purely deterministic given a budget value
+    (see ``ConfigSpec._cute_per_cta_ab_smem_budget_bytes``). Mocking
+    that helper lets the demote/keep/seed unit tests exercise the gate
+    on any device, not just hosts that report a B200-sized opt-in
+    SMEM cap. ``budget_bytes`` is the per-CTA AB-SMEM budget in bytes
+    the gate should treat as available for the AB pipeline staging.
+
+    Clears ``_bound_kernels`` before binding so two tests in the same
+    process that mock different budget values do not collide on the
+    in-memory bind cache (the cache is keyed by args and would
+    otherwise replay the first test's recorded spec).
+    """
+    args = (
+        torch.empty([4096, 4096], device=DEVICE, dtype=HALF_DTYPE),
+        torch.empty([4096, 4096], device=DEVICE, dtype=HALF_DTYPE),
+    )
+    _cute_4096_matmul_kernel._bound_kernels.clear()
+    with (
+        patch_cute_mma_support(),
+        patch.object(
+            ConfigSpec,
+            "_cute_per_cta_ab_smem_budget_bytes",
+            staticmethod(lambda device: budget_bytes),
+        ),
+    ):
+        return _cute_4096_matmul_kernel.bind(args)
 
 
 def _bind_cute_strategy_kernel():
@@ -430,7 +507,12 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
                 # shape where it has no productive lever.
                 self.assertEqual(spec._tcgen05_cluster_m_search_choices, (1,))
                 self.assertIsNone(spec._tcgen05_cluster_m2_search_constraints)
-                self.assertEqual(spec.autotune_seed_configs(), [])
+                # Keep this assertion scoped to the cluster_m=2 seed heuristic:
+                # future unrelated heuristics may still apply to these shapes.
+                self.assertNotIn(
+                    CuteTcgen05ClusterM2Heuristic.name,
+                    spec.autotuner_heuristics,
+                )
                 # Persistent pid types are still allowed (the static-
                 # full-tile gate above this is unaffected) — only the
                 # cluster_m search arm narrows.
@@ -493,127 +575,6 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         self.assertEqual(two_cta_config["tcgen05_cluster_m"], 2)
         self.assertEqual(two_cta_config["pid_type"], "persistent_interleaved")
         self.assertEqual(two_cta_config["block_sizes"][:3], [256, 256, 16])
-
-    @onlyBackends(["cute"])
-    def test_cute_tcgen05_two_cta_seeded_in_initial_populations(self) -> None:
-        @helion.kernel(backend="cute")
-        def cute_matmul_mma(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-            m, k = x.size()
-            _, n = y.size()
-            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
-            for tile_m, tile_n in hl.tile([m, n]):
-                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
-                for tile_k in hl.tile(k):
-                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
-                out[tile_m, tile_n] = acc.to(x.dtype)
-            return out
-
-        args = (
-            torch.empty([4096, 4096], device=DEVICE, dtype=HALF_DTYPE),
-            torch.empty([4096, 4096], device=DEVICE, dtype=HALF_DTYPE),
-        )
-        with patch_cute_mma_support():
-            bound = cute_matmul_mma.bind(args)
-
-        def assert_seeded(configs: list[helion.Config]) -> None:
-            seeded = [
-                config.config
-                for config in configs
-                if config.config["tcgen05_cluster_m"] == 2
-            ]
-            self.assertEqual(len(seeded), 1)
-            seed = seeded[0]
-            self.assertEqual(
-                seed["block_sizes"][:3],
-                [TCGEN05_TWO_CTA_BLOCK_M, TCGEN05_TWO_CTA_BLOCK_N, 128],
-            )
-            self.assertEqual(
-                seed["indexing"],
-                ["tensor_descriptor", "tensor_descriptor", "tensor_descriptor"],
-            )
-            self.assertEqual(seed["l2_groupings"], [TCGEN05_TWO_CTA_SEED_L2_GROUPING])
-            self.assertEqual(seed["pid_type"], "persistent_interleaved")
-            self.assertEqual(seed["tcgen05_num_epi_warps"], 4)
-
-        config_gen = bound.config_spec.create_config_generation()
-        zero_flat = config_gen.random_population_flat(0)
-        self.assertEqual(len(zero_flat), 1)
-        zero_config = config_gen.unflatten(zero_flat[0])
-        self.assertEqual(zero_config.config["tcgen05_cluster_m"], 1)
-        one_flat = config_gen.random_population_flat(1)
-        self.assertEqual(len(one_flat), 1)
-        one_config = config_gen.unflatten(one_flat[0])
-        self.assertEqual(one_config.config["tcgen05_cluster_m"], 1)
-        one_config_population = config_gen.random_population(1)
-        self.assertEqual(len(one_config_population), 1)
-        self.assertEqual(one_config_population[0].config["tcgen05_cluster_m"], 1)
-        assert_seeded(config_gen.random_population(2))
-
-        acf_config_gen = bound.config_spec.create_config_generation(
-            advanced_controls_files=["/tmp/helion-test.acf"]
-        )
-        acf_configs = acf_config_gen.random_population(2)
-        self.assertEqual(len(acf_configs), 2)
-        self.assertEqual(
-            {config.config["advanced_controls_file"] for config in acf_configs},
-            {"/tmp/helion-test.acf"},
-        )
-        assert_seeded(acf_configs)
-
-        with patch.object(
-            PatternSearch, "_find_similar_cached_configs", return_value=[]
-        ):
-            search = PatternSearch(
-                bound,
-                args,
-                initial_population=30,
-                initial_population_strategy=InitialPopulationStrategy.FROM_BEST_AVAILABLE,
-                best_available_pad_random=False,
-            )
-            configs = [
-                search.config_gen.unflatten(flat)
-                for flat in search._generate_initial_population_flat()
-            ]
-        self.assertEqual(len(configs), 2)
-        self.assertEqual(configs[0].config["tcgen05_cluster_m"], 1)
-        assert_seeded(configs)
-
-    @onlyBackends(["cute"])
-    def test_cute_tcgen05_two_cta_seed_indexing_matches_live_spec(self) -> None:
-        @helion.kernel(backend="cute")
-        def cute_matmul_mma_epilogue(
-            x: torch.Tensor, y: torch.Tensor, bias: torch.Tensor
-        ) -> torch.Tensor:
-            m, k = x.size()
-            _, n = y.size()
-            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
-            for tile_m, tile_n in hl.tile([m, n]):
-                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
-                for tile_k in hl.tile(k):
-                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
-                out[tile_m, tile_n] = (acc + bias[tile_n]).to(x.dtype)
-            return out
-
-        args = (
-            torch.empty([4096, 4096], device=DEVICE, dtype=HALF_DTYPE),
-            torch.empty([4096, 4096], device=DEVICE, dtype=HALF_DTYPE),
-            torch.empty([4096], device=DEVICE, dtype=HALF_DTYPE),
-        )
-        with patch_cute_mma_support():
-            bound = cute_matmul_mma_epilogue.bind(args)
-        self.assertGreater(bound.config_spec.indexing.length, 3)
-
-        configs = bound.config_spec.create_config_generation().random_population(2)
-        seeded = [
-            config.config
-            for config in configs
-            if config.config["tcgen05_cluster_m"] == 2
-        ]
-        self.assertEqual(len(seeded), 1)
-        self.assertEqual(
-            len(seeded[0]["indexing"]),
-            bound.config_spec.indexing.length,
-        )
 
     @onlyBackends(["cute"])
     def test_cute_tcgen05_two_cta_projection_falls_back_before_mutation(
@@ -684,6 +645,459 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
             [TCGEN05_TWO_CTA_BLOCK_M, TCGEN05_TWO_CTA_BLOCK_N, 16],
         )
         self.assertEqual(config["l2_groupings"], [1])
+
+    @onlyBackends(["cute"])
+    def test_cute_tcgen05_ab_stages_three_smem_budget_gate(self) -> None:
+        """SMEM-budget gate admits ``tcgen05_ab_stages=3`` into search.
+
+        The 4096^3 BF16 matmul binding admits ``ab=3`` into the autotune
+        search arm via the SMEM-budget gate so the canonical fast config
+        family (``cluster_m=2`` ``ab=3``) reaches the autotuner without a
+        hand-forced override. Search-time normalization demotes ``ab=3``
+        candidates whose ``(bm, bn, bk, cluster_m)`` per-CTA AB-SMEM cost
+        exceeds the device's optin SMEM cap minus the non-AB reservation
+        (see ``cute_plan.md`` §7.0). The validation surface stays
+        unchanged: explicit ``helion.Config(tcgen05_ab_stages=3)`` always
+        round-trips for explicit user configs.
+
+        The gate is purely deterministic given a budget value, so we
+        pin the per-CTA AB-SMEM budget to B200's nominal value via
+        ``_bind_cute_4096_matmul_kernel_with_mocked_smem_budget`` —
+        that keeps coverage live on any host regardless of the live
+        GPU's optin SMEM cap.
+        """
+        # B200's optin reports 232 448 bytes = 227 KiB; subtract the
+        # 28 KiB non-AB reservation to match what
+        # ``_cute_per_cta_ab_smem_budget_bytes`` produces in production
+        # (203 776 bytes). Tracking the production value exactly is
+        # what makes the over-budget vs in-budget boundary in this
+        # test mirror the running gate.
+        b200_budget_bytes = 227 * 1024 - 28 * 1024
+        bound = _bind_cute_4096_matmul_kernel_with_mocked_smem_budget(b200_budget_bytes)
+        spec = bound.config_spec
+
+        constraints = spec._tcgen05_ab_stages_three_search_constraints
+        self.assertIsNotNone(constraints)
+        # ``itemsize`` for BF16/FP16 is 2 bytes — matches the matmul
+        # binding's ``lhs.dtype.itemsize`` argument.
+        self.assertEqual(constraints.dtype_bytes, HALF_DTYPE.itemsize)
+        self.assertEqual(constraints.per_cta_smem_budget_bytes, b200_budget_bytes)
+
+        search_fragments = spec._tcgen05_optional_fragments(for_search=True)
+        # Search surface lifts ab_stages cap from 2 to 3 once the gate
+        # admits the arm. The validation surface is independently 3.
+        self.assertEqual(search_fragments["tcgen05_ab_stages"].high, 3)
+        validation_fragments = spec._tcgen05_optional_fragments(for_search=False)
+        self.assertEqual(validation_fragments["tcgen05_ab_stages"].high, 3)
+
+        # cluster_m=2 256x256x128 ab=3: the canonical 4096^3 fast config —
+        # fits the per-CTA budget (196 608 bytes vs B200's 203 776-byte
+        # budget). Search-time fixup keeps it.
+        keep_config = {
+            "block_sizes": [256, 256, 128],
+            "l2_groupings": [4],
+            "pid_type": "persistent_interleaved",
+            "tcgen05_cluster_m": 2,
+            "tcgen05_ab_stages": 3,
+        }
+        spec.normalize(keep_config, _fix_invalid=True)
+        self.assertEqual(keep_config["tcgen05_ab_stages"], 3)
+        self.assertEqual(keep_config["tcgen05_cluster_m"], 2)
+
+        # ab=3 over-budget shapes get demoted to ab=2. The cute_dsl
+        # ptxas failure is the loud backstop for explicit user configs
+        # that bypass autotune; the search-side fixup keeps the
+        # autotuner from blowing the GPU context mid-tuning. The two
+        # cases below exercise distinct post-fixup shapes:
+        #   * persistent + cluster_m=1 with bm=128: 294 912 bytes — the
+        #     ``_fix_tcgen05_cluster_m1_persistent_search_config`` path
+        #     already clamps bm to ``TCGEN05_ONE_CTA_MAX_BLOCK_M``;
+        #     bm=128 is at the cap, so it survives unchanged.
+        #   * flat + cluster_m=1 with bm=256: 393 216 bytes — flat
+        #     pid_type bypasses the cluster_m1 cap (the cap only
+        #     applies under persistent pid_types) so the unmolested
+        #     256x256x128 single-CTA path reaches the new fixup.
+        over_budget_cases = (
+            ("persistent_interleaved", [128, 256, 128]),  # 294 912 bytes
+            ("flat", [256, 256, 128]),  # 393 216 bytes
+        )
+        for pid_type, over_budget_block_sizes in over_budget_cases:
+            with self.subTest(pid_type=pid_type, block_sizes=over_budget_block_sizes):
+                config = {
+                    "block_sizes": list(over_budget_block_sizes),
+                    "pid_type": pid_type,
+                    "tcgen05_cluster_m": 1,
+                    "tcgen05_ab_stages": 3,
+                }
+                spec.normalize(config, _fix_invalid=True)
+                self.assertEqual(config["tcgen05_ab_stages"], 2)
+
+        # cluster_m=1 ab=3 in-budget shape stays at ab=3.
+        in_budget = {
+            "block_sizes": [128, 128, 128],
+            "pid_type": "persistent_interleaved",
+            "tcgen05_cluster_m": 1,
+            "tcgen05_ab_stages": 3,
+        }
+        spec.normalize(in_budget, _fix_invalid=True)
+        self.assertEqual(in_budget["tcgen05_ab_stages"], 3)
+
+        # Validation surface always accepts ab=3 (no _fix_invalid).
+        user_config = {
+            "block_sizes": [128, 256, 128],
+            "pid_type": "persistent_interleaved",
+            "tcgen05_cluster_m": 1,
+            "tcgen05_ab_stages": 3,
+        }
+        spec.normalize(user_config)
+        self.assertEqual(user_config["tcgen05_ab_stages"], 3)
+
+    @onlyBackends(["cute"])
+    def test_cute_tcgen05_ab_stages_three_gate_off_below_b200(self) -> None:
+        """Gate stays off when target device's SMEM optin is sub-B200.
+
+        Mocking the budget helper to return 0 — the value the helper
+        produces for non-CUDA hosts and any device whose optin cap sits
+        below ``TCGEN05_AB_STAGES_THREE_MIN_DEVICE_SMEM_OPTIN`` — must
+        keep ``_tcgen05_ab_stages_three_search_constraints`` ``None`` so
+        the search surface stays at ``ab_stages_max=2`` and the
+        canonical seed does not carry ``ab=3``. This guards against
+        broadening the search past the hardware's known-good envelope
+        on heterogeneous / multi-GPU setups.
+        """
+        bound = _bind_cute_4096_matmul_kernel_with_mocked_smem_budget(0)
+        spec = bound.config_spec
+
+        self.assertIsNone(spec._tcgen05_ab_stages_three_search_constraints)
+        search_fragments = spec._tcgen05_optional_fragments(for_search=True)
+        self.assertEqual(search_fragments["tcgen05_ab_stages"].high, 2)
+        # Validation surface stays at 3 so explicit user configs still
+        # round-trip even on a device the gate is off for.
+        validation_fragments = spec._tcgen05_optional_fragments(for_search=False)
+        self.assertEqual(validation_fragments["tcgen05_ab_stages"].high, 3)
+        # The cluster_m2 seed exists but does *not* carry ab=3.
+        seeds = spec.compiler_seed_configs
+        self.assertEqual(len(seeds), 1)
+        self.assertNotIn("tcgen05_ab_stages", seeds[0].config)
+
+    @onlyBackends(["cute"])
+    def test_cute_tcgen05_ab_stages_three_refused_for_multi_block_size_triple(
+        self,
+    ) -> None:
+        """Gate refuses ``ab=3`` when the spec has more than one (M,N,K) triple.
+
+        ``tcgen05_ab_stages`` is a global config knob across the whole
+        bound kernel, but the per-config search-time fixup
+        (``_fix_tcgen05_ab_stages_three_search_config``) only inspects
+        ``block_sizes[0:3]``. A multi-dot or multi-root kernel with
+        more than the single-matmul 3-block-size triple could otherwise
+        sit at ``ab=3`` for a later over-budget triple — that path
+        would survive the fixup and abort at ptxas mid-tuning. Verify
+        ``allow_tcgen05_ab_stages_three_search`` clears the recorded
+        constraints whenever the spec's block-size sequence is not the
+        validated 3-tuple.
+        """
+        b200_budget_bytes = 227 * 1024 - 28 * 1024
+        bound = _bind_cute_4096_matmul_kernel_with_mocked_smem_budget(b200_budget_bytes)
+        spec = bound.config_spec
+
+        # Sanity: the matmul-bound spec with a 3-block-size triple
+        # already admits the arm (this is the standard production path).
+        self.assertIsNotNone(spec._tcgen05_ab_stages_three_search_constraints)
+
+        # Simulate a spec with more than the single-matmul 3-block-size
+        # triple (e.g. a multi-dot or multi-root kernel) and re-invoke
+        # the gate. The recorded constraints must be cleared so the
+        # search surface stays at ``ab_stages_max=2`` — otherwise a
+        # later over-budget triple would survive the per-config fixup
+        # (which inspects only ``block_sizes[0:3]``) and abort at ptxas.
+        # The gate's only check on ``block_sizes`` is its length, so
+        # re-running ``allow_tcgen05_ab_stages_three_search`` against
+        # a spec whose ``block_sizes`` reports a non-3 length is enough
+        # to validate the refusal.
+        with patch.object(type(spec.block_sizes), "__len__", lambda self: 9):
+            self.assertEqual(len(spec.block_sizes), 9)
+            with patch.object(
+                ConfigSpec,
+                "_cute_per_cta_ab_smem_budget_bytes",
+                staticmethod(lambda device: b200_budget_bytes),
+            ):
+                spec.allow_tcgen05_ab_stages_three_search(
+                    dtype_bytes=2,
+                    device=torch.device("cuda:0"),
+                )
+            self.assertIsNone(spec._tcgen05_ab_stages_three_search_constraints)
+            search_fragments = spec._tcgen05_optional_fragments(for_search=True)
+            self.assertEqual(search_fragments["tcgen05_ab_stages"].high, 2)
+
+    @onlyBackends(["cute"])
+    def test_cute_tcgen05_ab_stages_three_seeded_in_initial_population(
+        self,
+    ) -> None:
+        """Canonical ``ab=3`` fast config is in the initial autotune seed.
+
+        Acceptance: when the SMEM gate admits ``ab=3`` for the canonical
+        ``256x256x128 cluster_m=2`` shape, the cluster_m=2 seed config
+        carries ``tcgen05_ab_stages=3`` so the autotuner's initial
+        population includes the retained 4096^3 fast config family
+        (``cute_plan.md`` §1.1). Without this seed the normal autotune
+        would have to discover ``ab=3`` via random mutation, which is
+        unreliable across short search budgets.
+
+        Pins the per-CTA AB-SMEM budget to B200's nominal value so the
+        seed-path coverage runs on any host (see
+        ``test_cute_tcgen05_ab_stages_three_smem_budget_gate``).
+        """
+        # B200 production value: 227 KiB optin minus 28 KiB non-AB
+        # reservation (see _cute_per_cta_ab_smem_budget_bytes).
+        b200_budget_bytes = 227 * 1024 - 28 * 1024
+        bound = _bind_cute_4096_matmul_kernel_with_mocked_smem_budget(b200_budget_bytes)
+        spec = bound.config_spec
+
+        seed_configs = spec.compiler_seed_configs
+        self.assertEqual(len(seed_configs), 1)
+        seed = seed_configs[0].config
+        self.assertEqual(
+            seed["block_sizes"][:3],
+            [TCGEN05_TWO_CTA_BLOCK_M, TCGEN05_TWO_CTA_BLOCK_N, 128],
+        )
+        self.assertEqual(seed["tcgen05_cluster_m"], 2)
+        self.assertEqual(seed["tcgen05_ab_stages"], 3)
+
+    @onlyBackends(["cute"])
+    def test_cute_universal_matmul_lane_loop_correctness(self) -> None:
+        """Universal-MMA SMEM-load guards stay correct under a lane loop.
+
+        Binds a CuTe matmul with a lane-loop configuration
+        (``elements_per_thread=2``) on either the M or the N axis and
+        asserts both the launch dim (recovery must divide by ``epT``)
+        and ``allclose`` against ``x @ y`` (SMEM-load guards must use
+        the physical thread coord so every lane iteration re-populates
+        sA / sB). The fix is symmetric across M and N — see the
+        ``_local_mma_coord_expr`` → ``_physical_mma_coord_expr``
+        switch in ``cute_mma._codegen_cute_mma``.
+        """
+        torch.manual_seed(0)
+        x = torch.randn([1024, 1024], device=DEVICE, dtype=torch.float32)
+        y = torch.randn([1024, 1024], device=DEVICE, dtype=torch.float32)
+        # Both variants force the universal MMA path (fp32 inputs) with
+        # a 2-element lane loop on the named axis. Expected launch dim
+        # is ``block=(16, 16, 1)`` in both cases: the non-laned axis
+        # carries its ``num_threads`` value directly, the laned axis
+        # carries ``block_size // elements_per_thread``.
+        cases = (
+            (
+                "n_axis_lane",
+                helion.Config(block_sizes=[16, 32, 32], num_threads=[16, 16, 32]),
+            ),
+            (
+                "m_axis_lane",
+                helion.Config(block_sizes=[32, 16, 32], num_threads=[16, 16, 32]),
+            ),
+        )
+        for case_name, config in cases:
+            with self.subTest(case=case_name):
+                # Fresh bind cache: the in-memory bind cache is keyed
+                # by args and other subTest iterations populate it.
+                _cute_strategy_matmul_kernel._bound_kernels.clear()
+                # ``patch_cute_mma_support`` makes the lowering
+                # decision deterministic across hosts — on a
+                # tcgen05-capable host these shapes fall to universal
+                # MMA via the precondition-check path anyway, but
+                # wrapping matches the convention used by every other
+                # ``_cute_strategy_matmul_kernel`` binding in this
+                # class.
+                with patch_cute_mma_support():
+                    bound = _cute_strategy_matmul_kernel.bind((x, y))
+                bound.set_config(config)
+                result = bound(x, y)
+                torch.testing.assert_close(result, x @ y, atol=1e-1, rtol=1e-2)
+
+                code = bound.to_triton_code(config)
+                for ln in code.splitlines():
+                    if "_launcher(" in ln and "block=(" in ln:
+                        self.assertIn("block=(16, 16, 1)", ln)
+                        break
+                else:
+                    self.fail("could not locate launcher block=(...) in generated code")
+
+    @onlyBackends(["cute"])
+    def test_cute_inactive_grid_block_id_does_not_claim_thread_axis(self) -> None:
+        """Grid codegen for an inactive block_id must skip its thread axis.
+
+        Binds ``examples.matmul_split_k`` with a config that places the
+        outer K block_id in ``inactive_block_ids`` (the K coordinate is
+        only referenced through the inner device-loop's range bounds, so
+        the static-analysis pass marks the outer block_id unused inside
+        the graph). If the grid emits ``indices_<n> = tile_offset_<n> +
+        thread_idx[axis]`` for an inactive block_id, the inner device
+        loop's ``_compute_thread_axis_offset`` will reuse that axis (it
+        counts only active axes) and produce a ``cudaErrorIllegalAddress``
+        at runtime.
+        """
+        from helion._testing import EXAMPLES_DIR
+        from helion._testing import import_path
+
+        torch.manual_seed(0)
+        x = torch.randn(64, 1024, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(1024, 64, device=DEVICE, dtype=torch.float32)
+
+        mod = import_path(EXAMPLES_DIR / "matmul_split_k.py")
+        config = helion.Config(
+            block_sizes=[16, 2, 16],
+            num_threads=[0, 2, 8],
+            split_k=32,
+        )
+        # Force a fresh bind so other tests in this class do not poison
+        # the in-memory bind cache.
+        mod.matmul_split_k._bound_kernels.clear()
+        bound = mod.matmul_split_k.bind((x, y))
+        bound.set_config(config)
+
+        code = bound.to_triton_code(config)
+        # ``indices_2`` corresponds to the inactive outer-K block_id. It
+        # must be plain ``tile_offset_2`` — no ``thread_idx`` term —
+        # otherwise the launch dim is shared with the inner block_id and
+        # the inner indices line addresses past the tile.
+        for ln in code.splitlines():
+            if ln.strip().startswith("indices_2 = "):
+                self.assertNotIn("thread_idx", ln, msg=ln)
+                self.assertIn("tile_offset_2", ln, msg=ln)
+                break
+        else:
+            self.fail("could not locate indices_2 = ... in generated code")
+
+        # Crash-survival regression check: the kernel must run without a
+        # CUDA illegal memory access so the GPU context survives. This
+        # test does NOT assert numerical correctness against
+        # ``torch.matmul``: that is pinned separately by
+        # ``test_cute_atomic_add_predicates_cta_resident_thread_axis``
+        # below, which guards against atomic_add over-counting when the
+        # inner-K loop's thread axis remains live in the surrounding
+        # scope.
+        bound(x, y)
+        torch.cuda.synchronize()
+
+    @onlyBackends(["cute"])
+    def test_cute_atomic_add_predicates_cta_resident_thread_axis(self) -> None:
+        """``hl.atomic_add`` outside an inner device loop must predicate
+        on the loop's CTA-resident thread axis.
+
+        ``examples.matmul_split_k`` issues ``hl.atomic_add(out, [tile_m,
+        tile_n], acc)`` outside an inner ``for inner_k in hl.tile(...)``
+        device loop. When the autotuner picks a config that maps the
+        inner-K block_id onto a thread axis (here ``thread_idx[2]``),
+        every axis-2 thread continues to execute the post-inner-loop
+        code with the same broadcast reduction value. Without a
+        ``thread_idx[axis] == 0`` predicate on the atomic, each output
+        cell is accumulated ``blockDim.z`` times, producing a result
+        that is ``blockDim.z``-x too large.
+        """
+        from helion._testing import EXAMPLES_DIR
+        from helion._testing import import_path
+
+        torch.manual_seed(0)
+        x = torch.randn(64, 1024, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(1024, 64, device=DEVICE, dtype=torch.float32)
+        expected = torch.matmul(x, y)
+
+        mod = import_path(EXAMPLES_DIR / "matmul_split_k.py")
+        config = helion.Config(
+            block_sizes=[16, 2, 16],
+            num_threads=[0, 2, 8],
+            split_k=32,
+        )
+        mod.matmul_split_k._bound_kernels.clear()
+        bound = mod.matmul_split_k.bind((x, y))
+        bound.set_config(config)
+
+        code = bound.to_triton_code(config)
+        # The atomic_add must be guarded by a CTA-resident leader
+        # predicate on axis 2 (the inner-K loop's thread axis). The
+        # predicate is emitted on the surrounding ``if`` statement, not
+        # on the atomic call itself.
+        lines = code.splitlines()
+        found = False
+        for idx, ln in enumerate(lines):
+            if "cute.arch.atomic_add" in ln:
+                # Walk back through the enclosing context (a small fixed
+                # window is enough; the predicate is the immediately
+                # preceding ``if`` statement).
+                for prior in reversed(lines[max(0, idx - 4) : idx]):
+                    if prior.lstrip().startswith("if "):
+                        self.assertIn(
+                            "cute.arch.thread_idx()[2] == 0", prior, msg=prior
+                        )
+                        found = True
+                        break
+                self.assertTrue(found, msg=f"no enclosing if for: {ln}")
+                break
+        if not found:
+            self.fail("could not locate cute.arch.atomic_add in generated code")
+
+        out = bound(x, y)
+        torch.cuda.synchronize()
+        # fp32 split-K with 32-way K split + atomic-add over 1024 K
+        # elements per output. Loose atol matches the existing
+        # ``test_matmul_split_k`` accuracy bar in ``test_examples.py``.
+        torch.testing.assert_close(out, expected, atol=1, rtol=0.01)
+
+    @onlyBackends(["cute"])
+    def test_cute_atomic_add_predicates_ghost_axis_for_offset_constant_index(
+        self,
+    ) -> None:
+        """Ghost-axis predicate must fire even when the atomic index
+        does not flow through a ``BlockSizeOrigin`` symbol.
+
+        The fix is required for index forms beyond
+        ``[tile_m, tile_n]`` — e.g. an offset-constant
+        ``tile.begin // block_size`` paired with another tile coord.
+        The prior cycle's predicate gated the ghost-axis scan behind
+        ``has_block_size_index``; if every index were offset-constant
+        the gate would return early and miss the ghost axis. This test
+        uses a mixed index ``[m_block_idx, tile_n]`` so axis 1 still
+        triggers the gate while axis 0 is offset-constant and axis 2
+        is a ghost from the exited inner-K device loop. Pre-fix the
+        old code only predicated axis 0 (non-indexed active block_m)
+        and missed axis 2, producing an 8× over-count.
+        """
+        torch.manual_seed(0)
+        m, k, n = 16, 1024, 64
+        x = torch.randn(m, k, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(k, n, device=DEVICE, dtype=torch.float32)
+        expected = torch.matmul(x, y).sum(dim=0).unsqueeze(0)
+
+        _split_k_offset_index_atomic._bound_kernels.clear()
+        bound = _split_k_offset_index_atomic.bind((x, y))
+        config = helion.Config(
+            block_sizes=[16, 2, 16],
+            num_threads=[0, 2, 8],
+            split_k=32,
+            indexing="block_ptr",
+        )
+        bound.set_config(config)
+
+        code = bound.to_triton_code(config)
+        # The ghost-axis predicate on axis 2 (inner-K loop's thread
+        # axis after exit) must appear on the atomic_add's enclosing
+        # ``if``.
+        lines = code.splitlines()
+        found_axis_2 = False
+        for idx, ln in enumerate(lines):
+            if "cute.arch.atomic_add" in ln:
+                for prior in reversed(lines[max(0, idx - 4) : idx]):
+                    if prior.lstrip().startswith("if "):
+                        self.assertIn(
+                            "cute.arch.thread_idx()[2] == 0", prior, msg=prior
+                        )
+                        found_axis_2 = True
+                        break
+                break
+        self.assertTrue(found_axis_2, msg="ghost-axis predicate missing")
+
+        out = bound(x, y)
+        torch.cuda.synchronize()
+        torch.testing.assert_close(out, expected, atol=1, rtol=0.01)
 
     @skipIfMTIA("MTIA requires tl.dot initial value stride >= 128 bytes")
     def test_matmul_smaller_than_min_dot_size(self) -> None:
@@ -1288,11 +1702,13 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         self.assertNotIn("tcgen05_warp_spec_epi_warps", default_cfg.config)
         self.assertEqual(default_cfg.config["tcgen05_warp_spec_epi_load_warps"], 0)
         self.assertEqual(default_cfg.config["tcgen05_warp_spec_scheduler_warps"], 0)
-        # ``c_input_warps`` was added in cycle 33 as the foundation for
-        # G3.1-C step-2 (``cute_plan.md`` §7.5.3.2). Default is 0 so
-        # serialized configs round-trip cleanly; the value 1 will be
-        # accepted under ``ROLE_LOCAL_WITH_SCHEDULER`` once cycle 34
-        # lands the dedicated TMA producer + SMEM ring.
+        # ``c_input_warps`` is the dedicated C-input / auxiliary-tensor
+        # warp slot (``cute_plan.md`` §7.5.3.2). Default is 0 so
+        # serialized configs round-trip cleanly; the validator widens
+        # the accept set to ``{0, 1}`` under ``ROLE_LOCAL_WITH_SCHEDULER``
+        # (inert-body slot) and stays at ``{0}`` under
+        # ``ROLE_LOCAL_MONOLITHIC``. The productive TMA producer body
+        # is a follow-up.
         self.assertEqual(default_cfg.config["tcgen05_warp_spec_c_input_warps"], 0)
         self.assertEqual(default_cfg.config["tcgen05_warp_spec_register_decrease"], 120)
         self.assertEqual(default_cfg.config["tcgen05_warp_spec_register_increase"], 256)
@@ -1470,6 +1886,36 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         spec.normalize(cfg)
         self.assertEqual(cfg.config["tcgen05_strategy"], "role_local_monolithic")
 
+        # G3.1 first slice (``cute_plan.md`` §7.5.3.2, cycle 34):
+        # ``tcgen05_warp_spec_c_input_warps=1`` under WITH_SCHEDULER
+        # round-trips end-to-end. The validator's accept set now
+        # admits the value; the codegen body stays inert until the
+        # productive TMA producer body lands.
+        c_input_cfg = helion.Config(
+            **base,
+            tcgen05_num_epi_warps=4,
+            tcgen05_strategy="role_local_with_scheduler",
+            tcgen05_warp_spec_scheduler_warps=1,
+            tcgen05_warp_spec_c_input_warps=1,
+        )
+        spec.normalize(c_input_cfg)
+        self.assertEqual(
+            c_input_cfg.config["tcgen05_strategy"], "role_local_with_scheduler"
+        )
+        self.assertEqual(c_input_cfg.config["tcgen05_warp_spec_c_input_warps"], 1)
+
+        # MONOLITHIC + c_input_warps=1 is still rejected (no slot in
+        # the 6-warp shape for an 8th role warp). Pin the negative
+        # path so the per-strategy gate cannot drift.
+        with self.assertRaises(InvalidConfig):
+            spec.normalize(
+                helion.Config(
+                    **base,
+                    tcgen05_strategy="role_local_monolithic",
+                    tcgen05_warp_spec_c_input_warps=1,
+                )
+            )
+
     @onlyBackends(["cute"])
     def test_cute_tcgen05_strategy_invariants_helper_unit(self) -> None:
         """``validate_tcgen05_strategy_invariants`` covers the
@@ -1482,9 +1928,11 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         The earlier warpgroup-alignment requirement on
         ``ROLE_LOCAL_WITH_SCHEDULER`` was relaxed once the initial
         7-warp implementation landed (1 ab_load + 1 mma + 4 epi + 1
-        scheduler = 7). The eventual 8-warp variant with a C-input
-        epi-load warp will re-introduce the alignment requirement
-        when register-split tuning becomes warpgroup-uniform.
+        scheduler = 7). Cycle 34's c_input lift makes the 8-warp
+        variant reachable end-to-end (8 role warps exactly match
+        the launched envelope, no padding); the alignment branch
+        stays dead-code-tested via patching since neither variant
+        triggers it organically today.
         """
         # scheduler_warps=0 under WITH_SCHEDULER is rejected (the
         # strategy demands one scheduler warp).
@@ -1664,19 +2112,24 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
 
     @onlyBackends(["cute"])
     def test_cute_tcgen05_strategy_invariants_c_input_warps(self) -> None:
-        """G3.1-C step-2 (cute_plan.md §7.5.3.2) data-model entrance:
+        """G3.1 first slice (cute_plan.md §7.5.3.2) data-model lift:
         ``c_input_warps`` is plumbed through the dataclass + validator,
-        and cycle 33's narrowing rejects nonzero for both strategies
-        until cycle 34 lands the dedicated TMA producer + SMEM ring.
+        and cycle 34 widens the ``ROLE_LOCAL_WITH_SCHEDULER`` accept
+        set to ``{0, 1}`` so explicit user configs can opt in to the
+        productive C-input warp slot. The codegen body remains inert
+        in cycle 34; the productive TMA producer body lands in a
+        follow-up cycle.
 
         - Positive control: ``c_input_warps=0`` accepted under both
           ``ROLE_LOCAL_MONOLITHIC`` and ``ROLE_LOCAL_WITH_SCHEDULER``
           (the field is plumbed through normalize / round-trip and
           defaults to 0 for legacy configs).
-        - Negative control: ``c_input_warps=1`` is rejected under
-          both strategies in cycle 33; cycle 34 widens the
-          ``ROLE_LOCAL_WITH_SCHEDULER`` accept set to ``{0, 1}`` once
-          the productive C-input warp implementation lands.
+        - Positive control (cycle 34): ``c_input_warps=1`` accepted
+          under ``ROLE_LOCAL_WITH_SCHEDULER`` — the slot occupies
+          what was previously the inert padding warp.
+        - Negative control: ``c_input_warps=1`` rejected under
+          ``ROLE_LOCAL_MONOLITHIC`` (the 6-warp shape has no slot
+          for an 8th role warp).
         """
         # Positive control: c_input_warps=0 under MONOLITHIC.
         errors = validate_tcgen05_strategy_invariants(
@@ -1723,8 +2176,11 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
             msg=str(errors),
         )
 
-        # Negative control: c_input_warps=1 under WITH_SCHEDULER
-        # (cycle 33). Cycle 34 widens this accept set to ``{0, 1}``.
+        # Positive control: c_input_warps=1 accepted under
+        # WITH_SCHEDULER. The slot is reachable end-to-end and the
+        # launched-warp accounting recognizes it (see the matching
+        # matmul-plan accounting test below); the codegen body
+        # stays inert until the productive TMA producer body lands.
         c_input_with_sched = dataclasses.replace(with_sched, c_input_warps=1)
         errors = validate_tcgen05_strategy_invariants(
             strategy=Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER,
@@ -1735,15 +2191,76 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
             pid_type="persistent_blocked",
             cluster_m=1,
         )
-        self.assertTrue(
-            any("c_input_warps in [0]" in e for e in errors),
-            msg=str(errors),
-        )
+        self.assertEqual(errors, [], msg=str(errors))
 
-        # The dataclass total_warps reflects the c_input_warps slot
-        # so a future cycle-34 lift to c_input_warps=1 transparently
-        # adjusts the warp count without further data-model churn.
+        # The dataclass total_warps reflects the c_input_warps slot:
+        # 4 epi + 1 mma + 1 ab_load + 1 sched + 1 c_input = 8.
         self.assertEqual(c_input_with_sched.total_warps, 8)
+
+    @onlyBackends(["cute"])
+    def test_cute_tcgen05_matmul_plan_c_input_warp_accounting(self) -> None:
+        """``CuteTcgen05MatmulPlan`` carries ``c_input_warp_count``
+        and the launched-warp accounting is invariant under the
+        c_input lift because the slot occupies what was previously
+        the inert padding warp under ``ROLE_LOCAL_WITH_SCHEDULER``
+        (``cute_plan.md`` §7.5.3.2):
+
+        - ``c_input_warp_count=0``: 7 role warps, 8 launched (1 pad).
+        - ``c_input_warp_count=1``: 8 role warps, 8 launched (0 pad).
+
+        Existing role warp ids (``exec_warp_id``, ``tma_warp_id``,
+        ``scheduler_warp_id``) are unaffected by the lift — codegen
+        sites that gate on those ids stay byte-identical.
+        """
+        from helion._compiler.device_function import CuteTcgen05MatmulPlan
+
+        base_kwargs: dict[str, object] = {
+            "bm": 256,
+            "bn": 256,
+            "bk": 128,
+            "k_tile_count": 32,
+            "cluster_m": 1,
+            "is_two_cta": False,
+            "uses_role_local_persistent_body": True,
+            "uses_cluster_m2_one_cta_role_local_bridge": False,
+            "cta_thread_count": 256,
+            "physical_m_threads": 128,
+            "acc_stage_count": 2,
+            "ab_stage_count": 2,
+            "c_stage_count": 2,
+            "epi_warp_count": 4,
+            "ab_load_warp_count": 1,
+            "scheduler_warp_count": 1,
+            "sched_stage_count": 1,
+        }
+
+        # c_input_warp_count=0 baseline: 7 role warps, 8 launched
+        # (one inert padding warp).
+        plan_c0 = CuteTcgen05MatmulPlan(**base_kwargs)
+        self.assertEqual(plan_c0.c_input_warp_count, 0)
+        self.assertEqual(plan_c0.role_warp_count, 7)
+        self.assertEqual(plan_c0.launched_warp_count, 8)
+        # All existing role warp ids stay pinned regardless of the
+        # c_input lift below.
+        self.assertEqual(plan_c0.exec_warp_id, 4)
+        self.assertEqual(plan_c0.tma_warp_id, 5)
+        self.assertEqual(plan_c0.scheduler_warp_id, 6)
+        self.assertEqual(plan_c0.persistent_scheduler_owner_warp_id, 6)
+
+        # c_input_warp_count=1 lift: 8 role warps, 8 launched (no
+        # padding).
+        plan_c1 = CuteTcgen05MatmulPlan(**base_kwargs, c_input_warp_count=1)
+        self.assertEqual(plan_c1.c_input_warp_count, 1)
+        self.assertEqual(plan_c1.role_warp_count, 8)
+        self.assertEqual(plan_c1.launched_warp_count, 8)
+        # Existing role warp ids are unaffected by the lift.
+        self.assertEqual(plan_c1.exec_warp_id, 4)
+        self.assertEqual(plan_c1.tma_warp_id, 5)
+        self.assertEqual(plan_c1.scheduler_warp_id, 6)
+        self.assertEqual(plan_c1.persistent_scheduler_owner_warp_id, 6)
+        # Block shape is invariant in both cases (256 mma threads
+        # × 8 launched warps × 1 = the same launch envelope).
+        self.assertEqual(plan_c0.block_shape, plan_c1.block_shape)
 
     @onlyBackends(["cute"])
     def test_cute_tcgen05_strategy_invariants_clc_persistent_cluster_n(

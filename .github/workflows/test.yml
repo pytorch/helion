@@ -11,6 +11,9 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref == 'refs/heads/main' && github.run_number || github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 jobs:
   load-matrix:
     runs-on: ubuntu-latest
@@ -323,6 +326,12 @@ jobs:
           else
             TEST_PATH="."
             EXTRA_FLAGS="--ignore=test/test_examples_dist.py"
+          fi
+          # A10G runners expose one 22 GiB GPU. Four xdist workers can collectively
+          # exhaust VRAM with CUDA/Triton/Inductor state even when an individual test
+          # only needs a small allocation.
+          if [[ -n "$PARALLEL" && "${{ matrix.alias }}" == *a10g* ]]; then
+            PARALLEL="-n2"
           fi
           # For distributed tests, fail if any test is skipped, failed, or has an error
           SKIP_CHECK=$([[ "${{ contains(matrix.alias, 'distributed') }}" == "true" ]] && echo "! grep -qE '(SKIPPED|FAILED|ERROR)'" || echo "cat > /dev/null")

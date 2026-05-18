@@ -481,6 +481,11 @@ class _Settings:
         default_factory=_get_autotune_config_overrides
     )
     autotune_seed_configs: ConfigLike | Sequence[ConfigLike] | None = None
+    disable_autotuner_heuristics: bool = dataclasses.field(
+        default_factory=functools.partial(
+            _env_get_bool, "HELION_DISABLE_AUTOTUNER_HEURISTICS", False
+        )
+    )
     autotune_effort: AutotuneEffort = dataclasses.field(
         default_factory=functools.partial(
             _env_get_literal,
@@ -533,6 +538,11 @@ class _Settings:
         )
     )
     autotune_config_filter: Callable[[Config], Config | None] | None = None
+    triton_do_not_specialize: bool = dataclasses.field(
+        default_factory=functools.partial(
+            _env_get_bool, "HELION_TRITON_DO_NOT_SPECIALIZE", False
+        )
+    )
 
 
 class Settings(_Settings):
@@ -608,6 +618,15 @@ class Settings(_Settings):
             "based on a quantile of initial compile times (with a lower bound). Lower bound and quantile "
             "are set by the effort profile. Set HELION_AUTOTUNE_ADAPTIVE_TIMEOUT=0 to disable."
         ),
+        "triton_do_not_specialize": (
+            "If True, pass do_not_specialize for every dynamic size/stride/symbol "
+            "arg so a single Triton binary handles any value, avoiding Triton-level "
+            "recompiles when shapes cross 0/1 or alignment boundaries. Disables "
+            "Triton's value/alignment specializations and can significantly slow "
+            "memory-bound kernels (vectorized loads rely on inner stride being "
+            "specialized to constexpr 1). Only takes effect when static_shapes=False. "
+            "Set HELION_TRITON_DO_NOT_SPECIALIZE=1 to enable globally."
+        ),
         "print_output_code": "If True, print the output code of the kernel to stderr.",
         "print_repro": "If True, print Helion kernel code, config, and caller code to stderr as a standalone repro script.",
         "output_origin_lines": (
@@ -627,6 +646,11 @@ class Settings(_Settings):
         "autotune_seed_configs": (
             "A Config or sequence of Configs to seed the autotuner initial population "
             "without constraining the search space."
+        ),
+        "disable_autotuner_heuristics": (
+            "If True, disable compiler/autotuner heuristics such as compiler seed "
+            "configs. User-provided autotune_seed_configs are unaffected. "
+            "Set HELION_DISABLE_AUTOTUNER_HEURISTICS=1 to disable globally."
         ),
         "allow_warp_specialize": "If True, allow warp specialization for tl.range calls on CUDA devices.",
         "debug_dtype_asserts": "If True, emit tl.static_assert checks for dtype after each device node.",
@@ -666,6 +690,9 @@ class Settings(_Settings):
         "autotune_cache": (
             "The name of the autotuner cache class to use. "
             "Set HELION_AUTOTUNE_CACHE=StrictLocalAutotuneCache to enable strict caching. "
+            "Set HELION_AUTOTUNE_CACHE=RemoteAutotuneCache (or StrictRemoteAutotuneCache) "
+            "and HELION_REMOTE_CACHE_BACKEND=mypackage.module.MyBackend to enable "
+            "remote caching via a user-provided RemoteCacheBackend subclass. "
             "Defaults to 'LocalAutotuneCache'."
         ),
         "autotune_benchmark_fn": (

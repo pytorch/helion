@@ -392,21 +392,31 @@ class ConfigGeneration:
         self._repair_cute_num_threads(config)
         return config
 
-    def seed_flat_config_pairs(self) -> list[tuple[FlatConfig, Config]]:
+    def seed_flat_config_pairs(
+        self,
+        log_func: Callable[[str], None] | None = None,
+    ) -> list[tuple[FlatConfig, Config]]:
         """Return ConfigSpec-provided seeds as flat and normalized configs.
 
-        ``ConfigSpec.autotune_seed_configs()`` is compiler-owned and must
-        return configs that match the live spec structurally. ``InvalidConfig``
-        means overrides make a seed inapplicable; other flatten/unflatten
-        exceptions are programming errors and intentionally surface.
+        ``ConfigSpec.compiler_seed_configs`` is compiler-owned and must
+        contain configs that match the live spec structurally. Invalid seeds
+        are skipped with the same transfer policy as user-provided seed configs.
         """
         result: list[tuple[FlatConfig, Config]] = []
         seen: set[Config] = set()
-        for config in self.config_spec.autotune_seed_configs():
+        for i, config in enumerate(self.config_spec.compiler_seed_configs):
             try:
                 flat = self.flatten(config)
                 normalized = self.unflatten(flat)
-            except InvalidConfig:
+            except (
+                InvalidConfig,
+                ValueError,
+                TypeError,
+                KeyError,
+                AssertionError,
+            ) as e:
+                if log_func is not None:
+                    log_func(f"Failed to transfer compiler seed config {i + 1}: {e}")
                 continue
             if normalized in seen:
                 continue
@@ -484,7 +494,7 @@ class ConfigGeneration:
 
         # Initial population order is default -> user seed configs -> compiler seeds
         # -> random.  This preserves user seed priority without dropping built-in
-        # backend/compiler seeds from ConfigSpec.autotune_seed_configs().
+        # backend/compiler seeds from ConfigSpec.compiler_seed_configs.
         for flat, _config in self.user_seed_flat_config_pairs(
             user_seed_configs, log_func
         ):
@@ -494,7 +504,7 @@ class ConfigGeneration:
             if len(result) >= n:
                 return result[:n]
 
-        for flat, _config in self.seed_flat_config_pairs():
+        for flat, _config in self.seed_flat_config_pairs(log_func):
             if any(flat == existing for existing in result):
                 continue
             result.append(flat)

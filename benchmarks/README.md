@@ -11,3 +11,8 @@ To run the benchmark:
 e.g. for `vector_add` kernel:
 
 `$ python benchmarks/run.py --metrics speedup,accuracy --kernel vector_add`
+
+To run against another Helion backend, pass `--helion-backend` or set `HELION_BACKEND`.
+For example, to benchmark the CuTe backend:
+
+`$ python benchmarks/run.py --helion-backend cute --metrics speedup,accuracy --kernel gemm`

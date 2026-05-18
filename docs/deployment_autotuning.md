@@ -644,7 +644,7 @@ A heuristic file is specific to one device kind + compute capability —
 to add support for a new GPU, generate a fresh heuristic on that
 hardware and commit it alongside any existing files.  The recipe works
 for any GPU; the device-kind / compute-capability suffix is whatever
-{py:class}`~helion.autotuner.aot_cache.HardwareInfo` reports for the
+{py:class}`~helion._hardware.HardwareInfo` reports for the
 target.
 
 #### Step-by-step

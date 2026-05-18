@@ -847,9 +847,7 @@ class BlockReductionStrategy(ReductionStrategy):
             )
             if configured_threads > 0:
                 return configured_threads
-            configured_block_size = env.block_sizes[block_id].from_config(
-                self.fn.config
-            )
+            configured_block_size = self.fn.resolved_block_size(block_id)
             return (
                 configured_block_size
                 if isinstance(configured_block_size, int)

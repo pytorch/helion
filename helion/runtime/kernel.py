@@ -40,6 +40,7 @@ from torch.utils.weak import WeakIdKeyDictionary
 from .. import exc
 from .._compile_time import measure
 from .._compiler.ast_extension import unparse
+from .._compiler.autotuner_heuristics import compiler_seed_configs
 from .._compiler.backend import TritonBackend
 from .._compiler.compile_environment import CompileEnvironment
 from .._compiler.compile_environment import TensorDescriptorLayoutGuard
@@ -491,6 +492,34 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                     raise
 
                 self.env.config_spec.configure_epilogue_subtile_autotune(args)
+                self.env.config_spec.compiler_seed_configs = compiler_seed_configs(
+                    self.env, self.host_function.device_ir
+                )
+
+                # Post-compile FX-graph scan to detect kernels
+                # whose tcgen05 matmul is followed by an
+                # aux-fused store
+                # (``out[tile] = (acc + residual[tile]).to(...)``
+                # and variants — see
+                # ``host_function_has_tcgen05_aux_kernel_pattern``
+                # for the accepted shapes). When detected, the
+                # autotune surface widens to admit
+                # ``tcgen05_strategy=ROLE_LOCAL_WITH_SCHEDULER``
+                # + ``tcgen05_warp_spec_c_input_warps=1`` so the
+                # productive C-input warp lift is reachable from
+                # the normal autotune path. For pure-matmul
+                # kernels the detector returns False and the
+                # autotune surface keeps the narrow
+                # ``MONOLITHIC + c_input_warps=0`` shape so
+                # autotune cannot sample the strictly-worse
+                # inert C-input warp configuration.
+                from .._compiler.cute.aux_tensor import (
+                    host_function_has_tcgen05_aux_kernel_pattern,
+                )
+
+                self.env.config_spec.cute_tcgen05_aux_kernel_detected = (
+                    host_function_has_tcgen05_aux_kernel_pattern(self.host_function)
+                )
 
     def _apply_mark_static(self, args: tuple[object, ...]) -> None:
         """
@@ -1279,7 +1308,10 @@ def _hashable_dim(s: int | torch.SymInt) -> Hashable:
 def _safe_bucket_dim(s: int | torch.SymInt) -> Hashable:
     if isinstance(s, torch.SymInt):
         return (id(s.node.shape_env), s.node.expr)
-    return min(s, 2)
+    # Dynamic-shape kernels should not get separate bound kernels for sizes
+    # 0 or 1.  Keep 2 as the canonical "dynamic dimension" bucket that was
+    # already used for all concrete sizes >= 2.
+    return 2
 
 
 _EMPTY_FROZENSET: frozenset[int] = frozenset()

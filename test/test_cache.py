@@ -21,8 +21,10 @@ from helion._testing import import_path
 from helion._testing import onlyBackends
 from helion._testing import skipIfCute
 from helion._utils import counters
+from helion.autotuner import LocalAutotuneCache
 from helion.autotuner import StrictLocalAutotuneCache
 from helion.autotuner.base_search import BaseSearch
+from helion.autotuner.remote_cache import RemoteCacheBackend
 import helion.language as hl
 from helion.runtime.settings import _get_backend
 
@@ -653,6 +655,140 @@ class TestCache(RefEagerTestDisabled, TestCase):
 
 
 instantiate_parametrized_tests(TestCache)
+
+
+class InMemoryBackend(RemoteCacheBackend):
+    """Trivial in-memory RemoteCacheBackend for testing."""
+
+    def __init__(self) -> None:
+        self.store: dict[str, str] = {}
+
+    def get(self, key: str) -> str | None:
+        return self.store.get(key)
+
+    def put(self, key: str, data: str) -> None:
+        self.store[key] = data
+
+
+class FailingBackend(RemoteCacheBackend):
+    """Backend that raises on every operation."""
+
+    def get(self, key: str) -> str | None:
+        raise ConnectionError("simulated failure")
+
+    def put(self, key: str, data: str) -> None:
+        raise ConnectionError("simulated failure")
+
+
+@onlyBackends(["triton"])
+class TestRemoteCache(RefEagerTestDisabled, TestCase):
+    def _make_remote_cache_fn(self, backend):
+        from helion.autotuner.remote_cache import RemoteAutotuneCache
+
+        def autotuner_fn(bound_kernel, args, **kwargs):
+            search = BasicSearch(bound_kernel, args)
+            with patch(
+                "helion.autotuner.remote_cache._load_remote_backend",
+                return_value=backend,
+            ):
+                return RemoteAutotuneCache(search)
+
+        return autotuner_fn
+
+    def test_remote_write_through_and_read_through(self):
+        """Remote backend receives put on miss, and get returns hit on second run."""
+        backend = InMemoryBackend()
+        kernel, args_a, result_a, _args_b, _result_b = KERNELS["add"]()
+
+        kernel.reset()
+        kernel.settings.autotuner_fn = self._make_remote_cache_fn(backend)
+
+        result = kernel(*args_a)
+        torch.testing.assert_close(result, result_a, rtol=1e-2, atol=5e-2)
+        self.assertEqual(len(backend.store), 1)
+        self.assertEqual(counters["autotune"]["cache_miss"], 1)
+        self.assertEqual(counters["autotune"]["cache_put"], 1)
+
+        kernel.reset()
+
+        result = kernel(*args_a)
+        torch.testing.assert_close(result, result_a, rtol=1e-2, atol=5e-2)
+        self.assertEqual(counters["autotune"]["cache_hit"], 1)
+
+    def test_remote_failure_falls_back_to_local(self):
+        """When remote backend fails, local cache is used as fallback."""
+        backend = FailingBackend()
+        kernel, args_a, result_a, _args_b, _result_b = KERNELS["add"]()
+
+        kernel.reset()
+        kernel.settings.autotuner_fn = self._make_remote_cache_fn(backend)
+
+        result = kernel(*args_a)
+        torch.testing.assert_close(result, result_a, rtol=1e-2, atol=5e-2)
+        self.assertEqual(counters["autotune"]["cache_miss"], 1)
+        self.assertEqual(counters["autotune"]["cache_put"], 1)
+
+        kernel.reset()
+
+        result = kernel(*args_a)
+        torch.testing.assert_close(result, result_a, rtol=1e-2, atol=5e-2)
+        self.assertEqual(counters["autotune"]["cache_hit"], 1)
+
+    def test_load_remote_backend_from_env(self):
+        """HELION_REMOTE_CACHE_BACKEND loads the backend class via import path."""
+        from helion.autotuner.remote_cache import _load_remote_backend
+
+        with patch.dict(
+            os.environ,
+            {"HELION_REMOTE_CACHE_BACKEND": "test.test_cache.InMemoryBackend"},
+        ):
+            backend = _load_remote_backend()
+            self.assertIsInstance(backend, InMemoryBackend)
+
+    def test_remote_hit_materializes_locally(self):
+        """A remote cache hit writes through to the local disk cache."""
+        backend = InMemoryBackend()
+        kernel, args_a, result_a, _args_b, _result_b = KERNELS["add"]()
+
+        kernel.reset()
+        kernel.settings.autotuner_fn = self._make_remote_cache_fn(backend)
+
+        kernel(*args_a)
+        self.assertEqual(counters["autotune"]["cache_miss"], 1)
+
+        kernel.reset()
+
+        kernel(*args_a)
+        self.assertEqual(counters["autotune"]["cache_hit"], 1)
+
+        kernel.reset()
+        kernel.settings.autotuner_fn = LocalAutotuneCache[BasicSearch]
+
+        kernel(*args_a)
+        self.assertEqual(counters["autotune"]["cache_hit"], 2)
+
+    def test_remote_put_payload_is_parseable(self):
+        """Bytes RemoteAutotuneCache.put sends are parseable by parse_cache_entry.
+
+        Guards against drift between LocalAutotuneCache.put's on-disk shape and
+        the format that warm-start consumers (_find_similar_cached_configs) expect.
+        """
+        from helion.autotuner.local_cache import parse_cache_entry
+
+        backend = InMemoryBackend()
+        kernel, args_a, _result_a, _args_b, _result_b = KERNELS["add"]()
+
+        kernel.reset()
+        kernel.settings.autotuner_fn = self._make_remote_cache_fn(backend)
+        kernel(*args_a)
+
+        self.assertEqual(len(backend.store), 1)
+        (raw,) = backend.store.values()
+        entry = parse_cache_entry(raw)
+        self.assertNotEqual(entry.hardware, "")
+        self.assertNotEqual(entry.specialization_key, "")
+        self.assertNotEqual(entry.config_spec_hash, "")
+        self.assertIsNotNone(entry.flat_config)
 
 
 if __name__ == "__main__":

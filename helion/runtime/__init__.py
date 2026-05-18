@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import suppress
 import contextvars
+import importlib
 import inspect
 import linecache
 import os
@@ -1371,6 +1372,9 @@ def _torch_dtype_to_cutlass(dtype: torch.dtype) -> object:
         torch.float32: cutlass.Float32,
         torch.float64: cutlass.Float64,
         torch.bfloat16: cutlass.BFloat16,
+        torch.float8_e4m3fn: cutlass.Float8E4M3FN,
+        torch.float8_e5m2: cutlass.Float8E5M2,
+        torch.float4_e2m1fn_x2: cutlass.Uint8,
         # CuTe does not support i1 global-memory tensors; torch.bool is stored
         # as one byte, so pass bool tensor pointers as uint8 and let load
         # lowering convert nonzero bytes back to cutlass.Boolean registers.
@@ -1695,6 +1699,7 @@ def _create_cute_wrapper(
     import cutlass
     import cutlass.cute as cute
 
+    cuda_driver = importlib.import_module("cuda.bindings.driver")
     kernel_name = getattr(cast("Any", cute_kernel), "__name__", "cute_kernel")
     kernel_tag = f"{kernel_name}_{id(cute_kernel):x}"
     func_name = f"_helion_cute_launch_{kernel_tag}"
@@ -1745,6 +1750,7 @@ def _create_cute_wrapper(
             "grid_x: cutlass.Int32",
             "grid_y: cutlass.Int32",
             "grid_z: cutlass.Int32",
+            "stream: CUstream",
         )
     )
     wrapper_plans = [
@@ -1771,7 +1777,7 @@ def _create_cute_wrapper(
             f"    _helion_cute_kernel_tag = {kernel_tag!r}",
             "    _kernel("
             + ", ".join(call_args)
-            + f").launch(grid=(grid_x, grid_y, grid_z){launch_suffix})",
+            + f").launch(grid=(grid_x, grid_y, grid_z){launch_suffix}, stream=stream)",
         )
     )
 
@@ -1786,6 +1792,7 @@ def _create_cute_wrapper(
     namespace: dict[str, Any] = {
         "cutlass": cutlass,
         "cute": cute,
+        "CUstream": cuda_driver.CUstream,
         "_kernel": cute_kernel,
     }
     filename = f"<helion_cute_launcher:{kernel_tag}:{schema_key!r}:{block!r}>"
@@ -1878,6 +1885,7 @@ def _build_cute_schema_and_args(
     _patch_cutlass_jit_shutdown_unload()
     import cutlass.cute as cute
     from cutlass.cute.runtime import make_ptr
+    import cutlass.torch as cutlass_torch
 
     _ensure_cute_dsl_arch_env(args)
     constexpr_flags = _cute_kernel_param_is_constexpr(cute_kernel)
@@ -1917,6 +1925,7 @@ def _build_cute_schema_and_args(
             launch_args.append(scalar_value)
 
     launch_args.extend(grid)
+    launch_args.append(cutlass_torch.current_stream())
     return tuple(schema), tuple(launch_args)
 
 

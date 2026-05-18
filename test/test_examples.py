@@ -124,6 +124,22 @@ class TestExamples(RefEagerTestBase, TestCase):
             args[0] @ args[1],
         )
 
+    def test_matmul_bf16_tcgen05(self):
+        """Matmul at 256^3 bf16 — fixture sized just above the cute
+        tcgen05 admission floor (M >= 64 divisible by 64) so the cute
+        autotune sub-sweep fires the ``uses_tcgen05`` codegen marker.
+        """
+        args = (
+            torch.randn([256, 256], device=DEVICE, dtype=torch.bfloat16),
+            torch.randn([256, 256], device=DEVICE, dtype=torch.bfloat16),
+        )
+        check_example(
+            "matmul",
+            args,
+            args[0] @ args[1],
+            block_sizes=[64, 64, 32],
+        )
+
     @xfailIfCute("CuTe barrier-based split-K example is still unsupported")
     @xfailIfPallas("missing barrier implementation")
     @skipIfTileIR("PassManager::run failed")
@@ -1649,34 +1665,88 @@ class TestExamples(RefEagerTestBase, TestCase):
             atol=1.0,
         )
 
-    @xfailIfCute("CuTe NVFP4 GEMM example is not supported yet")
-    @xfailIfPallas("NVFP4 is NVIDIA-specific")
+    @onlyBackends(["cute"])
+    @skipIfNotCUDA()
+    @skipIfCudaCapabilityLessThan(
+        (10, 0), reason="NVFP4 conversion instructions require Blackwell"
+    )
+    @skipIfRefEager("inline asm codegen is not available in ref eager mode")
     def test_nvfp4_gemm(self):
-        from examples.nvfp4_gemm import pack_fp4
-        from examples.nvfp4_gemm import quantize_fp4_e2m1
-        from examples.nvfp4_gemm import reference_nvfp4_matmul
+        mod = import_path(EXAMPLES_DIR / "nvfp4_gemm.py")
 
-        M, K, N = 256, 128, 256
+        M, K, N = 64, 128, 64
 
         A = torch.randn(M, K, dtype=torch.bfloat16, device=DEVICE)
         W = torch.randn(K, N, dtype=torch.bfloat16, device=DEVICE)
 
-        W_quantized = quantize_fp4_e2m1(W)
-        W_packed = pack_fp4(W_quantized)
+        W_quantized = mod.quantize_fp4_e2m1(W)
+        W_packed = mod.pack_fp4(W_quantized).view(torch.float4_e2m1fn_x2)
+        weight_scale = mod.make_fp8_scales((N, K // 16), DEVICE)
 
-        args = (A, W_packed)
-        expected = reference_nvfp4_matmul(A, W_packed)
-
-        check_example(
-            "nvfp4_gemm",
-            args,
+        result = mod.nvfp4_matmul(A, W_packed, weight_scale)
+        expected = mod.reference_nvfp4_matmul(A, W_packed, weight_scale)
+        torch.testing.assert_close(
+            result,
             expected,
-            fn_name="nvfp4_matmul",
-            block_sizes=[64, 64, 32],
-            num_warps=4,
-            num_stages=3,
-            rtol=2e-1,
             atol=1.0,
+            rtol=2e-1,
+        )
+
+        M, K, N = 128, 256, 256
+        A_packed = mod.make_random_fp4((M, K), DEVICE)
+        B_packed = mod.make_random_fp4((N, K), DEVICE)
+        B_packed_t = B_packed.T
+        scale_a = mod.make_fp8_scales((M, K // 16), DEVICE)
+        scale_b = mod.make_fp8_scales((N, K // 16), DEVICE)
+
+        result = mod.nvfp4_scaled_matmul(A_packed, B_packed_t, scale_a, scale_b)
+        expected = mod.reference_nvfp4_scaled_matmul(
+            A_packed,
+            B_packed_t,
+            scale_a,
+            scale_b,
+        )
+        torch.testing.assert_close(
+            result,
+            expected,
+            atol=1.0,
+            rtol=2e-1,
+        )
+
+    @onlyBackends(["cute"])
+    @skipIfNotCUDA()
+    @skipIfCudaCapabilityLessThan(
+        (10, 0), reason="NVFP4 conversion instructions require Blackwell"
+    )
+    @skipIfRefEager("inline asm codegen is not available in ref eager mode")
+    def test_nvfp4_gemv(self):
+        mod = import_path(EXAMPLES_DIR / "nvfp4_gemv.py")
+
+        M, K_bytes = 64, 128
+        weight = torch.randint(0, 256, (M, K_bytes), dtype=torch.uint8, device=DEVICE)
+        weight_scale = mod.make_fp8_scales((M, K_bytes // 8), DEVICE)
+
+        x_bf16 = torch.randn(K_bytes * 2, dtype=torch.bfloat16, device=DEVICE)
+        bf16_result = mod.nvfp4_gemv_bf16in(weight, x_bf16, weight_scale)
+        bf16_expected = mod.reference_nvfp4_gemv_bf16in(weight, x_bf16, weight_scale)
+        torch.testing.assert_close(
+            bf16_result,
+            bf16_expected,
+            atol=4.0,
+            rtol=2e-1,
+        )
+
+        x_packed = torch.randint(0, 256, (K_bytes,), dtype=torch.uint8, device=DEVICE)
+        x_scale = mod.make_fp8_scales((K_bytes // 8,), DEVICE)
+        fp4_result = mod.nvfp4_gemv_fp4in(weight, x_packed, weight_scale, x_scale)
+        fp4_expected = mod.reference_nvfp4_gemv_fp4in(
+            weight, x_packed, weight_scale, x_scale
+        )
+        torch.testing.assert_close(
+            fp4_result,
+            fp4_expected,
+            atol=4.0,
+            rtol=2e-1,
         )
 
     @xfailIfPallas("JAX tracer error")
@@ -1818,7 +1888,6 @@ class TestExamples(RefEagerTestBase, TestCase):
     @xfailIfCute(
         "CuTe squeeze-and-excitation forward still exceeds thread-block limits"
     )
-    @skipIfRocm("Triton ROCm store-forwarding bug: stale global memory reads")
     @skipIfCudaSharedMemoryLessThan(
         131072, reason="block sizes exceed device shared memory limit"
     )

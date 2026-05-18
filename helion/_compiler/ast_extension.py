@@ -20,6 +20,7 @@ from .source_location import current_location
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
+    import types
 
     from .type_propagation import TypeInfo
 
@@ -249,24 +250,38 @@ def expr_from_string(template: str, **placeholders: ast.AST) -> ast.AST:
     return expr.value
 
 
-def convert(node: ast.AST) -> ast.AST:
+def convert(
+    node: ast.AST,
+    code: types.CodeType | None = None,
+    column_offset: int = 0,
+) -> ast.AST:
+    """Convert a standard AST tree into ExtendedAST with source locations.
+
+    When ``code`` and ``column_offset`` are provided (e.g. from
+    KernelCompiler.parse), nodes are mapped to real source locations via
+    SourceLocation.from_ast.  When omitted (e.g. for inline Triton
+    snippets parsed from string literals), nodes receive the ambient
+    current_location instead.
+    """
     if isinstance(node, ast.AST):
         cls = get_wrapper_cls(type(node))
-        if "lineno" in node._attributes:
-            location = SourceLocation.from_ast(node)
+        if "lineno" in node._attributes and code is not None:
+            location = SourceLocation.from_ast(node, code, column_offset)
         else:
-            # some nodes like arguments lack location information
             location = current_location()
         with location:
             return cls(
-                **{field: convert(getattr(node, field)) for field in node._fields},
+                **{
+                    field: convert(getattr(node, field), code, column_offset)
+                    for field in node._fields
+                },
                 **{attr: getattr(node, attr) for attr in node._attributes},
                 # pyrefly: ignore [unexpected-keyword]
                 _location=location,
             )
     elif isinstance(node, list):
         # pyrefly: ignore [bad-return]
-        return [convert(item) for item in node]
+        return [convert(item, code, column_offset) for item in node]
     else:
         return node
 

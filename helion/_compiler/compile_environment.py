@@ -237,8 +237,10 @@ class CompileEnvironment:
             warn_once(
                 f"The '{self._backend.name}' backend is experimental and may have limited functionality.",
             )
+        # For dynamic kernels, keep 0/1 tensor dimensions symbolic so a kernel
+        # first seen with size 0 or 1 can be reused for larger sizes.
         self.shape_env = ShapeEnv(
-            specialize_zero_one=True,
+            specialize_zero_one=settings.static_shapes,
             duck_shape=False,
             assume_static_by_default=settings.static_shapes,
         )
@@ -268,10 +270,6 @@ class CompileEnvironment:
         self._foreign_symint_cache: dict[
             tuple[int, sympy.Expr], int | torch.SymInt
         ] = {}
-        # TODO(hinriksnaer): tracing state, not env config. move to CompilerState?
-        self.device_load_count = (
-            0  # Track number of loads in all device code for eviction policy tuning
-        )
         if settings.autotune_force_persistent or dist.is_initialized():
             for pid_type in (
                 "flat",

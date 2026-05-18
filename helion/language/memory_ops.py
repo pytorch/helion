@@ -812,9 +812,24 @@ def _cute_scalar_pointer_expr(tensor_name: str, index_exprs: list[str]) -> str:
     return f"({tensor_name}.iterator + {offset})"
 
 
-def _cute_scalar_load_expr(tensor_name: str, index_exprs: list[str]) -> str:
+def _cute_scalar_storage_dtype(dtype: torch.dtype) -> str:
+    if dtype in (torch.float4_e2m1fn_x2, torch.float8_e4m3fn):
+        return "cutlass.Uint8"
+    return CompileEnvironment.current().backend.dtype_str(dtype)
+
+
+def _cute_scalar_load_expr(
+    tensor_name: str,
+    index_exprs: list[str],
+    dtype: torch.dtype,
+) -> str:
     if "None" in index_exprs:
         return f"{tensor_name}[{', '.join(index_exprs)}]"
+    if dtype in (torch.float4_e2m1fn_x2, torch.float8_e4m3fn):
+        return (
+            f"cute.arch.load({_cute_scalar_pointer_expr(tensor_name, index_exprs)}, "
+            "cutlass.Uint8)"
+        )
     return f"{_cute_scalar_pointer_expr(tensor_name, index_exprs)}.load()"
 
 
@@ -1803,6 +1818,96 @@ def _codegen_cute_store_tcgen05_tile(
     tcgen05_aux_epi_tidx = tcgen05_value.epi_tidx
     tcgen05_aux_epilogue_rest_mode = tcgen05_value.epilogue_rest_mode
 
+    # C-input warp productive-body gate (``cute_plan.md`` §7.5.3.2
+    # cycle 2b producer + consumer flip). When the matmul plan has
+    # ``has_c_input_warp`` AND a non-empty ``aux_tensor_descriptors``
+    # tuple AND the aux pipeline plan was registered by
+    # ``cute_mma._codegen_cute_mma``, the consumer-side per-thread
+    # GMEM aux LDG flips to an SMEM read from the
+    # ``c_pipeline_aux``-staged ring populated by the C-input warp's
+    # cooperative copy. The producer body in
+    # ``program_id._build_c_input_warp_role_local_while`` writes
+    # ONE ``epi_tile`` subtile of the per-CTA aux region
+    # (``(bm_per_cta, bn)`` under 2cta; ``(bm, bn)`` otherwise) per
+    # stage per subtile iteration under ``producer_acquire`` /
+    # ``producer_commit`` framing; the consumer issues one
+    # ``consumer_wait`` / lane-0-gated ``consumer_release`` pair
+    # per subtile and feeds the SMEM stage into Quack's
+    # ``tiled_copy_s2r`` flow (``make_tiled_copy_D`` against
+    # ``tiled_copy_t2r`` →  ``partition_S(sC_ring)`` → per-
+    # subtile ``cute.copy(s2r, sC[..., stage], rmem)`` →
+    # ``rmem.load()``). Gate-closed configs keep the historical
+    # GMEM path byte-identical.
+    aux_matmul_plan = df.cute_tcgen05_matmul_plan
+    aux_pipeline_plan_obj = df.cute_tcgen05_aux_pipeline_plan
+    # Match each store-side record to its descriptor by
+    # ``load_node`` FX-node identity rather than positional
+    # index. The descriptor walker dedups by ``store_value_node``
+    # at MMA-codegen time, so a single-store kernel's
+    # descriptors and records share the same ``load_node``
+    # values in some permutation. The matmul plan's
+    # ``aux_single_store_value`` gate (in ``cute_mma`` and the
+    # ``program_id`` role-local-while admission) only allocates
+    # the producer-side pipeline when every descriptor shares
+    # one ``store_value_node``, so the multi-store fan-out
+    # wedge (producer commits to rings the per-store consumer
+    # never releases) cannot occur — the productive body
+    # closes its gate at MMA-codegen time and the consumer
+    # path here falls back to GMEM. The per-record lookup
+    # below is a belt-and-suspenders identity check: if any
+    # record's ``load_node`` is absent from the descriptors,
+    # the SMEM path is disabled for this store.
+    aux_step_load_nodes: tuple = (
+        tuple(rec_step.load_node for rec_step in aux_steps_in_chain)
+        if aux_step_records
+        else ()
+    )
+    aux_ring_index_by_step: list[int] = []
+    aux_descriptor_load_nodes: tuple = (
+        tuple(d.load_node for d in aux_matmul_plan.aux_tensor_descriptors)
+        if aux_matmul_plan is not None
+        else ()
+    )
+    aux_step_load_nodes_match = True
+    for step_load_node in aux_step_load_nodes:
+        try:
+            aux_ring_index_by_step.append(
+                aux_descriptor_load_nodes.index(step_load_node)
+            )
+        except ValueError:
+            aux_step_load_nodes_match = False
+            break
+    use_aux_smem_source = (
+        aux_step_records
+        and aux_matmul_plan is not None
+        and aux_matmul_plan.has_c_input_warp
+        and bool(aux_matmul_plan.aux_tensor_descriptors)
+        and aux_pipeline_plan_obj is not None
+        and aux_step_load_nodes_match
+        # Multi-store fan-out gate (same predicate as the
+        # producer-side allocator + role-local-while
+        # admission). Without this guard the producer fires
+        # ``producer_commit`` on rings whose only matching
+        # consumer-store is a different per-store-codegen
+        # invocation — the per-store splice site here only
+        # releases its own subset, leaving the unmatched rings
+        # uncommitted and deadlocking the producer once a CTA
+        # wraps the pipeline depth.
+        and len({d.store_value_node for d in aux_matmul_plan.aux_tensor_descriptors})
+        <= 1
+    )
+    if use_aux_smem_source:
+        aux_pipeline_name = aux_pipeline_plan_obj.pipeline  # type: ignore[attr-defined,union-attr]
+        aux_consumer_state_name = aux_pipeline_plan_obj.consumer_state  # type: ignore[attr-defined,union-attr]
+        all_rings = aux_pipeline_plan_obj.rings  # type: ignore[attr-defined,union-attr]
+        aux_ring_smem_names: tuple[str, ...] = tuple(
+            all_rings[ring_idx].smem for ring_idx in aux_ring_index_by_step
+        )
+    else:
+        aux_pipeline_name = ""
+        aux_consumer_state_name = ""
+        aux_ring_smem_names = ()
+
     def _aux_tile_setup_lines(
         *, thr_copy_t2r_var: str, define_thr_copy_t2r: bool
     ) -> list[str]:
@@ -1839,6 +1944,75 @@ def _codegen_cute_store_tcgen05_tile(
                 f"{thr_copy_t2r_var} = "
                 f"{tiled_copy_t2r}.get_slice({tcgen05_aux_epi_tidx})"
             )
+        if use_aux_smem_source:
+            # C-input warp productive-body gate is open: per-subtile
+            # SMEM ring staging. Per-output-tile setup builds one
+            # ``tiled_copy_s2r`` per descriptor (Quack's
+            # ``epilog_smem_load_and_partition`` pattern from
+            # ``quack/gemm_sm100.py``):
+            #
+            #   tiled_copy_s2r = make_tiled_copy_D(
+            #       make_copy_atom(CopyUniversalOp(), aux_dtype),
+            #       tiled_copy_t2r)
+            #   thr_copy_s2r = tiled_copy_s2r.get_slice(epi_tidx)
+            #   tSR_sC = thr_copy_s2r.partition_S(aux_smem_ring)
+            #   tRS_rC = make_rmem_tensor(ttr_racc.shape, aux_dtype)
+            #   tSR_rC = tiled_copy_s2r.retile(tRS_rC)
+            #
+            # ``tSR_sC`` carries the full SMEM ring partition (its
+            # last mode is the PIPE/stage axis). Per-subtile body
+            # in ``_aux_subtile_load_source`` slices
+            # ``tSR_sC[None, None, None, consumer_state.index]``
+            # and issues a single ``cute.copy(tiled_copy_s2r, ...)``
+            # into ``tSR_rC`` (a re-layout of the same registers as
+            # ``tRS_rC``). The chain consumes ``tRS_rC.load()``.
+            #
+            # The broadcast-aux rank-1 → rank-2 view is absorbed on
+            # the producer side (the producer's GMEM-side view is
+            # stride-0-on-M), so the consumer reads the same shape
+            # for exact-shape and broadcast aux. The "_aux_part_*"
+            # / "ttr_aux_grouped" GMEM partition pipeline is not
+            # built on this path.
+            for aux_idx, rec in enumerate(aux_step_records):
+                assert aux_matmul_plan is not None
+                aux_dtype_str = backend.dtype_str(
+                    aux_matmul_plan.aux_tensor_descriptors[
+                        aux_idx
+                    ].host_tensor_val.dtype
+                )
+                tiled_copy_s2r_var = f"{rec.aux_tile}_tiled_copy_s2r"
+                thr_copy_s2r_var = f"{rec.aux_tile}_thr_copy_s2r"
+                tsr_sc_var = f"{rec.aux_tile}_tSR_sC"
+                trs_rc_var = f"{rec.aux_tile}_tRS_rC"
+                tsr_rc_var = f"{rec.aux_tile}_tSR_rC"
+                lines.extend(
+                    [
+                        (
+                            f"{tiled_copy_s2r_var} = "
+                            f"cute.make_tiled_copy_D("
+                            f"cute.make_copy_atom("
+                            f"cute.nvgpu.CopyUniversalOp(), "
+                            f"{aux_dtype_str}), "
+                            f"{tiled_copy_t2r})"
+                        ),
+                        (
+                            f"{thr_copy_s2r_var} = "
+                            f"{tiled_copy_s2r_var}.get_slice("
+                            f"{tcgen05_aux_epi_tidx})"
+                        ),
+                        (
+                            f"{tsr_sc_var} = "
+                            f"{thr_copy_s2r_var}.partition_S("
+                            f"{aux_ring_smem_names[aux_idx]})"
+                        ),
+                        (
+                            f"{trs_rc_var} = cute.make_rmem_tensor("
+                            f"{ttr_racc}.shape, {aux_dtype_str})"
+                        ),
+                        (f"{tsr_rc_var} = {tiled_copy_s2r_var}.retile({trs_rc_var})"),
+                    ]
+                )
+            return lines
         for rec in aux_step_records:
             if rec.broadcast_axis is None:
                 # Exact-shape rank-2 aux: slice the per-tile region
@@ -1871,13 +2045,13 @@ def _codegen_cute_store_tcgen05_tile(
                     f"stride=(0, 1)))"
                 )
                 source_for_local_tile = rec.aux_view2d
+            lines.append(
+                f"{rec.aux_tile} = cute.local_tile("
+                f"{source_for_local_tile}, ({tcgen05_bm}, {tcgen05_bn}), "
+                f"({tile_coord_m}, {tile_coord_n}))"
+            )
             lines.extend(
                 [
-                    (
-                        f"{rec.aux_tile} = cute.local_tile("
-                        f"{source_for_local_tile}, ({tcgen05_bm}, {tcgen05_bn}), "
-                        f"({tile_coord_m}, {tile_coord_n}))"
-                    ),
                     (
                         f"{rec.aux_part_base} = "
                         f"{tcgen05_thr_mma}.partition_C({rec.aux_tile})"
@@ -1945,6 +2119,71 @@ def _codegen_cute_store_tcgen05_tile(
         if not aux_step_records:
             return ""
         lines: list[str] = []
+        if use_aux_smem_source:
+            # C-input warp productive-body gate is open: per-subtile
+            # SMEM ring staging. Each subtile iteration waits on
+            # ``c_pipeline_aux`` for the producer warp to fill the
+            # active stage, then issues one ``cute.copy(tiled_copy_s2r,
+            # tSR_sC[None, None, None, stage], tSR_rC)`` per descriptor
+            # to load the active stage into the per-thread register
+            # tensor (Quack's ``epilog_smem_load_and_partition`` flow
+            # from ``quack/gemm_sm100.py``: ``tiled_copy_s2r`` is
+            # built via ``make_tiled_copy_D`` against ``tiled_copy_t2r``;
+            # ``tSR_sC = thr_copy_s2r.partition_S(sC_ring)`` selects
+            # the SMEM source; ``tSR_rC`` is a re-layout view of the
+            # same register memory as ``tRS_rC``). The chain reads
+            # ``tRS_rC.load()`` (== ``aux_loaded``). The post-copy
+            # lane-0-gated release plus state advance run in the
+            # same per-subtile iteration so the producer can refill
+            # the same stage on the very next persistent tile
+            # (matches the consumer cooperative-group arrive count
+            # of ``epi_warp_count`` set by
+            # ``_emit_tcgen05_aux_pipeline_setup``).
+            #
+            # Note: ``partition_D(smem_stage).load()`` on
+            # ``thr_copy_t2r`` (an earlier prior-subagent variant)
+            # produced a deadlocking SMEM read — TMEM→reg-shaped
+            # partition_D applied to a SMEM tensor does not
+            # compose with the producer's
+            # ``make_tiled_copy_tv`` cooperative copy in a way the
+            # mbarrier handshake recognizes. The Quack-style
+            # ``tiled_copy_s2r`` flow is the canonical CUTLASS-DSL
+            # pattern.
+            lines.append(
+                f"{prelude_indent}{aux_pipeline_name}.consumer_wait("
+                f"{aux_consumer_state_name})\n"
+            )
+            for rec in aux_step_records:
+                tiled_copy_s2r_var = f"{rec.aux_tile}_tiled_copy_s2r"
+                tsr_sc_var = f"{rec.aux_tile}_tSR_sC"
+                trs_rc_var = f"{rec.aux_tile}_tRS_rC"
+                tsr_rc_var = f"{rec.aux_tile}_tSR_rC"
+                lines.extend(
+                    [
+                        (
+                            f"{prelude_indent}cute.copy("
+                            f"{tiled_copy_s2r_var}, "
+                            f"{tsr_sc_var}[None, None, None, "
+                            f"{aux_consumer_state_name}.index], "
+                            f"{tsr_rc_var})\n"
+                        ),
+                        (f"{prelude_indent}{rec.aux_loaded} = {trs_rc_var}.load()\n"),
+                    ]
+                )
+            lines.extend(
+                [
+                    (
+                        f"{prelude_indent}with cute.arch.elect_one():\n"
+                        f"{prelude_indent}    {aux_pipeline_name}.consumer_release("
+                        f"{aux_consumer_state_name})\n"
+                    ),
+                    emit_pipeline_advance(
+                        aux_consumer_state_name, indent=prelude_indent
+                    )
+                    + "\n",
+                ]
+            )
+            return "".join(lines)
         for rec in aux_step_records:
             lines.extend(
                 [
@@ -2909,6 +3148,24 @@ def _codegen_cute_store_tcgen05_tile(
             )
         )
     ]
+    # C-input warp aux pipeline consumer-wait + lane-0-gated
+    # consumer-release framing (``cute_plan.md`` §7.5.3.2 cycle 2b).
+    # Gate-closed configs (default ``c_input_warps=0`` or no aux
+    # residual) keep the historical GMEM aux path. When the gate
+    # fires, the wait/release pair runs once per *subtile* of the
+    # per-output-tile aux region: per-subtile staging keeps the
+    # SMEM ring footprint at one ``epi_tile`` chunk per stage
+    # rather than one ``(bm, bn)`` chunk, which is essential to
+    # fit cluster_m=2 + ``tcgen05_ab_stages=3`` in the 228 KB
+    # B200 SMEM cap. The wait happens at the top of the
+    # per-subtile loop body in
+    # ``_aux_subtile_load_source`` (before any ``.load()`` from
+    # the SMEM ring); the release + ``advance`` happen at the
+    # bottom of the same per-subtile iteration (after the chain
+    # has consumed ``aux_loaded``). Lane-0 gating mirrors the
+    # per-warp consumer arrive count
+    # (``epi_warp_count``) allocated on the aux pipeline.
+
     # Non-role-local stores keep pipeline/SMEM setup before per-tile C
     # partitioning so the hoisted role-local prefix matches the same
     # invariant setup subset.
@@ -2950,6 +3207,13 @@ def _codegen_cute_store_tcgen05_tile(
         # the SMEM-staged store, never via partition_D. The aux
         # load needs partition_D to compute a per-thread GMEM read
         # for the auxiliary tile so we create the slice here.
+        # When the C-input warp productive-body gate is open the
+        # source switches from per-tile GMEM to the per-subtile
+        # SMEM ring stage (see ``_aux_tile_setup_lines`` SMEM
+        # branch); the partition pipeline is layout-only and
+        # compiles unchanged, and the per-subtile ``consumer_wait``
+        # / lane-0-gated ``consumer_release`` are emitted by
+        # ``_aux_subtile_load_source`` inside the per-subtile loop.
         *_aux_tile_setup_lines(
             thr_copy_t2r_var=thr_copy_t2r,
             define_thr_copy_t2r=True,
@@ -3283,7 +3547,7 @@ def _codegen_cute_store_loaded_index_trailing_slices(
                 axis = loops[-1].block_thread_axes.get(block_id)
         if axis is None or not (0 <= axis < 3):
             continue
-        block_size = env.block_sizes[block_id].from_config(state.config)
+        block_size = state.device_function.resolved_block_size(block_id)
         if not isinstance(block_size, int):
             continue
         state.codegen.max_thread_block_dims[axis] = max(
@@ -4222,10 +4486,10 @@ def _(state: CodegenState) -> object:
         return packed_rhs_load
 
     if _is_cute_affine_range_load_for_store(state, subscript, ast_subscript):
-        zero = CompileEnvironment.current().backend.dtype_str(tensor.dtype)
+        zero = _cute_scalar_storage_dtype(tensor.dtype)
         return expr_from_string(f"{zero}(0)")
     if _is_cute_strided_slice_load_for_store(state, tensor, subscript):
-        zero = CompileEnvironment.current().backend.dtype_str(tensor.dtype)
+        zero = _cute_scalar_storage_dtype(tensor.dtype)
         return expr_from_string(f"{zero}(0)")
 
     tensor_name = state.device_function.tensor_arg(tensor).name
@@ -4237,7 +4501,7 @@ def _(state: CodegenState) -> object:
         inactive_slice_expr="None",
         inactive_singleton_slice_expr="0",
     )
-    load_expr = _cute_scalar_load_expr(tensor_name, index_exprs)
+    load_expr = _cute_scalar_load_expr(tensor_name, index_exprs, tensor.dtype)
     mask_expr = _cute_combined_mask(
         state,
         subscript,
@@ -4272,7 +4536,7 @@ def _(state: CodegenState) -> object:
             expr=expr_from_string(
                 load_expr
                 if mask_expr is None
-                else f"({load_expr} if {mask_expr} else {CompileEnvironment.current().backend.dtype_str(tensor.dtype)}(0))"
+                else f"({load_expr} if {mask_expr} else {_cute_scalar_storage_dtype(tensor.dtype)}(0))"
             ),
             tensor_name=tensor_name,
             index_exprs=tuple(index_exprs),
@@ -4284,7 +4548,7 @@ def _(state: CodegenState) -> object:
         return sortable_load.expr
     if mask_expr is None:
         return expr_from_string(load_expr)
-    zero = CompileEnvironment.current().backend.dtype_str(tensor.dtype)
+    zero = _cute_scalar_storage_dtype(tensor.dtype)
     return expr_from_string(f"({load_expr} if {mask_expr} else {zero}(0))")
 
 

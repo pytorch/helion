@@ -695,6 +695,18 @@ class TestIndexing(RefEagerTestBase, TestCase):
         )
 
     @skipIfRefEager("specialization_key is not used in ref eager mode")
+    def test_dynamic_shape_specialization_key_does_not_bucket_zero_one(self) -> None:
+        @helion.kernel(static_shapes=False)
+        def passthrough(x: torch.Tensor) -> torch.Tensor:
+            return x
+
+        keys = {
+            passthrough.specialization_key((torch.empty((n, 4), device=DEVICE),))
+            for n in (0, 1, 2, 9)
+        }
+        self.assertEqual(len(keys), 1)
+
+    @skipIfRefEager("specialization_key is not used in ref eager mode")
     def test_symint_specialization_key_disambiguates_shape_envs(self) -> None:
         @helion.kernel(static_shapes=True)
         def passthrough(x: torch.Tensor) -> torch.Tensor:
@@ -2641,24 +2653,69 @@ class TestIndexing(RefEagerTestBase, TestCase):
 
         offsets = torch.tensor([0, 2, 3, 5, 7], device=DEVICE)
 
-        # n=0: offsets[:1] has shape (1,). static_shapes=False still
-        # specializes on 0/1 which creates a specialized kernel for dim=1
-        # (bucket (1,) vs (2,) for dim>=2).
+        # n=0: offsets[:1] has shape (1,). static_shapes=False should keep
+        # that dimension dynamic so later non-1 sizes reuse this kernel.
         result = jagged_iota(offsets[:1].clone())
         torch.testing.assert_close(
             result, torch.arange(0, dtype=torch.float32, device=DEVICE)
         )
         self.assertEqual(len(jagged_iota._bound_kernels), 1)
 
-        # n=1: offsets[:2] has shape (2,), which buckets to (2,) — a new
-        # dynamic kernel is compiled, giving 2 bound kernels total.
         for n in [1, 3, len(offsets) - 1]:
             result = jagged_iota(offsets[: n + 1].clone())
             total = offsets[n].item()
             expected = torch.arange(total, dtype=torch.float32, device=DEVICE)
             torch.testing.assert_close(result, expected)
-            # First iteration (n=1) compiles a second kernel; rest reuse it.
-            self.assertEqual(len(jagged_iota._bound_kernels), 2)
+            self.assertEqual(len(jagged_iota._bound_kernels), 1)
+
+    @onlyBackends(["triton"])
+    @skipIfRefEager("Test checks generated Triton code")
+    def test_triton_do_not_specialize_emits_do_not_specialize(self):
+        @helion.kernel(
+            autotune_effort="none",
+            static_shapes=False,
+            triton_do_not_specialize=True,
+        )
+        def add_one(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size(0)):
+                out[tile] = x[tile] + 1
+            return out
+
+        x = torch.randn([1], device=DEVICE)
+        code, result = code_and_output(add_one, (x,), block_size=16)
+        torch.testing.assert_close(result, x + 1)
+        self.assertIn("@triton.jit(", code)
+        self.assertIn("'x_size_0'", code)
+        self.assertIn("do_not_specialize=", code)
+        self.assertIn("do_not_specialize_on_alignment=", code)
+        y = torch.randn([2], device=DEVICE)
+        torch.testing.assert_close(add_one(y), y + 1)
+        self.assertEqual(len(add_one._bound_kernels), 1)
+
+    @onlyBackends(["triton"])
+    @skipIfRefEager("Test checks generated Triton code")
+    def test_dynamic_size_args_match_triton_default(self):
+        """Without triton_do_not_specialize, Helion follows Triton's own default
+        and emits a plain @triton.jit so value/alignment specialization is
+        preserved (which is what enables vectorized loads)."""
+
+        @helion.kernel(autotune_effort="none", static_shapes=False)
+        def add_one(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size(0)):
+                out[tile] = x[tile] + 1
+            return out
+
+        x = torch.randn([1024], device=DEVICE)
+        code, result = code_and_output(add_one, (x,), block_size=16)
+        torch.testing.assert_close(result, x + 1)
+        self.assertNotIn("do_not_specialize=", code)
+        self.assertNotIn("do_not_specialize_on_alignment=", code)
+        # Helion still buckets sizes so a single BoundKernel handles every shape.
+        y = torch.randn([2048], device=DEVICE)
+        torch.testing.assert_close(add_one(y), y + 1)
+        self.assertEqual(len(add_one._bound_kernels), 1)
 
     def test_scalar_tensor_index_with_grid(self):
         """Index a tensor with a 0-dim scalar tensor from a grid load."""

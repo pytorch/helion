@@ -1209,8 +1209,10 @@ def run_example(
     # Benchmark all functions — clone args to avoid buffer donation issues
     cloned_args = _clone_args(args, process_group_name=process_group_name)
     all_benchmarks = {**kernels, **baselines}
-    bench_fns = [functools.partial(fn, *cloned_args) for fn in all_benchmarks.values()]
-    repeat = compute_repeat(bench_fns[0])
+    benchmark_functions = [
+        functools.partial(fn, *cloned_args) for fn in all_benchmarks.values()
+    ]
+    repeat = compute_repeat(benchmark_functions[0], default_cudagraph=True)
 
     # For distributed workload, different rank may have slightly different
     # benchmarking result causing diverging `repeat` value.
@@ -1226,14 +1228,23 @@ def run_example(
 
     with profile_context:
         if interleaved:
-            # pyrefly: ignore[bad-argument-type]
-            timings = interleaved_bench(bench_fns, repeat=repeat, desc="Benchmarking")
+            timings = interleaved_bench(
+                # pyrefly: ignore[bad-argument-type]
+                benchmark_functions,
+                repeat=repeat,
+                desc="Benchmarking",
+                default_cudagraph=True,
+            )
         else:
             timings = typing.cast(
                 "list[float]",
                 [
-                    do_bench(bench_fn, process_group_name=process_group_name)
-                    for bench_fn in bench_fns
+                    do_bench(
+                        benchmark_function,
+                        process_group_name=process_group_name,
+                        default_cudagraph=True,
+                    )
+                    for benchmark_function in benchmark_functions
                 ],
             )
 
