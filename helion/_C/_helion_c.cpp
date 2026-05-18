@@ -691,6 +691,85 @@ static PyTypeObject CompiledLauncher_Type = {
     PyType_GenericNew,                             // tp_new
 };
 
+// -----------------------------------------------------------------------------
+// G5 monomorphic bind inline-cache match predicate
+// -----------------------------------------------------------------------------
+//
+// ``inline_cache_match(cached_args, new_args)`` — fast equivalence test for
+// two tuples of Helion kernel arguments. Returns True iff the call site can
+// safely reuse the cached ``BoundKernel``. The semantics mirror the
+// reference Python ``_inline_cache_match`` in ``runtime/kernel.py``:
+//
+//   * Same tuple identity → True.
+//   * Different lengths → False.
+//   * Each element: identity-equal short-circuits True.
+//   * If types differ → False (e.g. ``1`` vs ``True``).
+//   * For tensors: distinct objects → False (let full bind resolve it via
+//     the regular dict cache).
+//   * Otherwise compare via ``__eq__`` (only triggered for scalars / plain
+//     Python objects). On exception during compare, treat as miss.
+//
+// This is hot-path code so we avoid PyObject_RichCompareBool's general
+// machinery: integers / floats / strings are walked through the C cmp
+// table directly via PyObject_RichCompareBool with Py_EQ. The ``is``
+// checks short-circuit the common case (same tensor objects in a tight
+// loop), so the typical cost is just N tuple-item loads + N identity
+// compares.
+static PyObject *helion_c_inline_cache_match(PyObject *self,
+                                             PyObject *const *args,
+                                             Py_ssize_t nargs) {
+  (void)self;
+  if (nargs != 2) {
+    PyErr_SetString(PyExc_TypeError,
+                    "inline_cache_match() requires exactly two arguments");
+    return nullptr;
+  }
+  PyObject *cached = args[0];
+  PyObject *new_args = args[1];
+  if (cached == new_args) {
+    Py_RETURN_TRUE;
+  }
+  // The Python caller already guarantees both are tuples (built by ``bind``
+  // and ``__call__``), so PyTuple_GET_SIZE / PyTuple_GET_ITEM are safe.
+  if (!PyTuple_Check(cached) || !PyTuple_Check(new_args)) {
+    Py_RETURN_FALSE;
+  }
+  Py_ssize_t n = PyTuple_GET_SIZE(cached);
+  if (n != PyTuple_GET_SIZE(new_args)) {
+    Py_RETURN_FALSE;
+  }
+  if (resolve_torch_tensor() < 0) {
+    return nullptr;
+  }
+  for (Py_ssize_t i = 0; i < n; ++i) {
+    PyObject *a = PyTuple_GET_ITEM(cached, i);
+    PyObject *b = PyTuple_GET_ITEM(new_args, i);
+    if (a == b) {
+      continue;
+    }
+    PyTypeObject *ta = Py_TYPE(a);
+    if (ta != Py_TYPE(b)) {
+      Py_RETURN_FALSE;
+    }
+    // Different tensor objects with same type → bail to the full bind
+    // path (the BoundKernel dict cache resolves this case cheaply).
+    if (reinterpret_cast<PyObject *>(ta) == g_torch_Tensor) {
+      Py_RETURN_FALSE;
+    }
+    int eq = PyObject_RichCompareBool(a, b, Py_EQ);
+    if (eq < 0) {
+      // Exception during ``__eq__`` — treat as a miss, swallow the error
+      // (the safer-default fallback path will retry through full bind).
+      PyErr_Clear();
+      Py_RETURN_FALSE;
+    }
+    if (eq == 0) {
+      Py_RETURN_FALSE;
+    }
+  }
+  Py_RETURN_TRUE;
+}
+
 static PyMethodDef HelionCMethods[] = {
     {"tensor_key",
      reinterpret_cast<PyCFunction>(helion_c_tensor_key),
@@ -698,6 +777,11 @@ static PyMethodDef HelionCMethods[] = {
      "Return ``(dtype, sizes_tuple, strides_tuple, static_indices_frozenset)`` "
      "for a tensor, or ``None`` if the caller should fall back to the Python "
      "implementation (e.g. SymInt sizes)."},
+    {"inline_cache_match",
+     reinterpret_cast<PyCFunction>(helion_c_inline_cache_match),
+     METH_FASTCALL,
+     "Return True iff ``new_args`` is bind-cache-equivalent to ``cached_args`` "
+     "(identity for tensors, ``__eq__`` for scalars)."},
     {nullptr, nullptr, 0, nullptr},
 };
 

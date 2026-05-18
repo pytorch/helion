@@ -17,6 +17,9 @@ try:
     from ._C_ext import CompiledLauncher
 
     # pyrefly: ignore [missing-import]  # built by CMake at install time
+    from ._C_ext import inline_cache_match
+
+    # pyrefly: ignore [missing-import]  # built by CMake at install time
     from ._C_ext import tensor_key
 
     available: bool = True
@@ -33,6 +36,11 @@ except ImportError:  # pragma: no cover - exercised only when build is missing
         """
         return None
 
+    def inline_cache_match(_cached: object, _new: object) -> bool:  # type: ignore[misc]
+        """Stub matching the C signature; always returns False so the caller
+        funnels through the full bind path. Safe but slower fallback."""
+        return False
+
     class CompiledLauncher:  # type: ignore[no-redef]
         """Stub raising on construction. Used only as a type marker."""
 
@@ -44,4 +52,4 @@ except ImportError:  # pragma: no cover - exercised only when build is missing
             )
 
 
-__all__ = ["CompiledLauncher", "available", "tensor_key"]
+__all__ = ["CompiledLauncher", "available", "inline_cache_match", "tensor_key"]

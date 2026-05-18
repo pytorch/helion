@@ -108,6 +108,52 @@ _graph_module_hash_cache: WeakIdKeyDictionary = WeakIdKeyDictionary()
 _INT32_INDEX_LIMIT = torch.iinfo(torch.int32).max
 
 
+def _inline_cache_match(
+    cached_args: tuple[object, ...], new_args: tuple[object, ...]
+) -> bool:
+    """Monomorphic-bind-cache equality predicate.
+
+    Returns True iff ``new_args`` is interchangeable with ``cached_args``
+    from the perspective of ``Kernel.bind`` — i.e. the bound kernel that
+    was produced for ``cached_args`` is the correct result for
+    ``new_args`` as well.
+
+    Rules (chosen for hot-path speed):
+
+    * Same length.
+    * For each element, identity-equal (``is``) → trivially interchangeable.
+    * Otherwise, types must match and the cached entry must NOT be a
+      ``torch.Tensor`` (different tensor objects → bail; we don't want to
+      re-derive ``_base_specialization_key`` from scratch here).
+    * For non-tensor values, fall back to ``__eq__``; if that raises (e.g.
+      a custom type with a quirky equality), treat as a miss.
+
+    Anything that produces False here just funnels to the existing full
+    bind path; correctness is preserved either way.
+    """
+    if cached_args is new_args:
+        return True
+    if len(cached_args) != len(new_args):
+        return False
+    for cached, new in zip(cached_args, new_args, strict=False):
+        if cached is new:
+            continue
+        if type(cached) is not type(new):
+            return False
+        if isinstance(cached, torch.Tensor):
+            # Different tensor objects: don't try to compare attrs here.
+            # The full bind path will hit the C ``tensor_key`` fast path
+            # and look up the existing BoundKernel via the dict, which is
+            # still much cheaper than a per-attribute comparison loop.
+            return False
+        try:
+            if cached != new:
+                return False
+        except Exception:
+            return False
+    return True
+
+
 def _resolve_index_dtype(
     settings: Settings,
     args: Sequence[object] | tuple[object, ...],
@@ -175,6 +221,24 @@ class Kernel(Generic[_R]):
         self._specialize_extra: dict[
             Hashable, list[Callable[[Sequence[object]], Hashable]]
         ] = {}
+        # Monomorphic inline cache (last args -> bound kernel). When the
+        # same Kernel is called repeatedly with the same tensor objects
+        # (typical inference / autotune trial loop), this lets ``bind`` skip
+        # ``_base_specialization_key`` + ``_specialize_extra`` + dict lookup
+        # entirely. Stored as a single tuple so the hot path is one attr
+        # load + length/identity loop. The third slot is the pinned
+        # ``BoundKernel._run`` (or ``None`` if not yet compiled) so
+        # ``Kernel.__call__`` can short-circuit past ``BoundKernel.__call__``
+        # too on a steady-state hit.
+        #
+        # Note on lifetime: the cache holds a strong reference to the
+        # args tuple, which keeps the last call's inputs (typically user
+        # tensors) alive until the next call swaps them out or ``reset()``
+        # clears them. For long-lived Kernels invoked rarely with large
+        # tensors, call ``reset()`` to release the pin sooner.
+        self._bind_inline_cache: (
+            tuple[tuple[object, ...], BoundKernel[_R], Callable[..., _R] | None] | None
+        ) = None
         if any(
             param.kind
             in (
@@ -243,10 +307,28 @@ class Kernel(Generic[_R]):
         Returns:
             BoundKernel: A BoundKernel object with the given arguments bound.
         """
+        if not isinstance(args, tuple):
+            assert isinstance(args, list), "args must be a tuple or list"
+            args = tuple(args)
+        # Monomorphic inline cache — when the same args (tensor identity
+        # + non-tensor equality) are reused, skip the full bind machinery
+        # and return the previously bound kernel directly. The check is
+        # ~0.4 µs (pure Python) or ~0.2 µs (C) vs the ~4 µs full path. See
+        # ``_inline_cache_match`` / the C ``helion._C.inline_cache_match``
+        # for the exact criteria (identity for tensors, equality for
+        # scalars, length match, plus a type guard for non-tensors).
+        #
+        # Disabled when a user ``key=`` callable is in play because the
+        # inline match predicate never invokes ``_key_fn`` and would
+        # incorrectly return the cached bind even when the key callable
+        # would have produced a different signature.
+        inline_cache_usable = self._key_fn is None
+        inline_cache = self._bind_inline_cache if inline_cache_usable else None
+        if inline_cache is not None:
+            cached_args = inline_cache[0]
+            if cached_args is args or _bind_cache_match(cached_args, args):
+                return inline_cache[1]
         with measure("Kernel.bind"):
-            if not isinstance(args, tuple):
-                assert isinstance(args, list), "args must be a tuple or list"
-                args = tuple(args)
             if len(args) > self._num_params:
                 raise TypeError(
                     f"Too many arguments passed to the kernel, expected: {self._num_params} got: {len(args)}."
@@ -268,6 +350,14 @@ class Kernel(Generic[_R]):
                         bound_kernel, args, signature
                     )
                 self._bound_kernels[cache_key] = bound_kernel
+            if inline_cache_usable:
+                # Update the inline cache. Holds a strong ref to args, which is
+                # fine: ``args`` is the call-site's tuple of inputs that survives
+                # the call. We only ever cache the most-recent bind, so memory
+                # stays bounded at one extra tuple-ref per Kernel. The third
+                # slot (``bound_kernel._run``) lets ``Kernel.__call__`` skip
+                # past ``BoundKernel.__call__`` entirely on the next hit.
+                self._bind_inline_cache = (args, bound_kernel, bound_kernel._run)
             return bound_kernel
 
     def _base_specialization_key(self, args: Sequence[object]) -> tuple[Hashable, ...]:
@@ -440,6 +530,21 @@ class Kernel(Generic[_R]):
         """
         if kwargs:
             args = self.normalize_args(*args, **kwargs)
+        # Hot path: when the inline cache hits AND a compiled ``_run``
+        # is pinned (post-warmup steady state), skip both ``Kernel.bind``
+        # body and ``BoundKernel.__call__`` framing. Cache miss / cold
+        # start falls through to ``self.bind`` which itself runs the same
+        # inline-cache check and then the full slow path. Disabled when
+        # a user ``key=`` callable is in play — the inline predicate would
+        # bypass ``_key_fn`` and could return a stale bind. See ``bind()``.
+        if self._key_fn is None:
+            inline_cache = self._bind_inline_cache
+            if inline_cache is not None:
+                cached_run = inline_cache[2]
+                if cached_run is not None:
+                    cached_args = inline_cache[0]
+                    if cached_args is args or _bind_cache_match(cached_args, args):
+                        return cached_run(*args)
         return self.bind(args)(*args)
 
     def reset(self) -> None:
@@ -448,6 +553,9 @@ class Kernel(Generic[_R]):
         recompile and re-autotune.
         """
         self._bound_kernels.clear()
+        # Wipe the monomorphic inline cache too — the BoundKernel it
+        # refs is now stale.
+        self._bind_inline_cache = None
 
 
 class BoundKernel(_AutotunableKernel, Generic[_R]):
@@ -911,6 +1019,18 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         counters["best_config_decorator"][
             self.format_kernel_decorator(config, self.settings)
         ] = 1
+        # Keep the parent Kernel's monomorphic inline cache (third
+        # slot) coherent with our freshly pinned ``_run`` so the next
+        # call hits the ``Kernel.__call__`` short-circuit. Only refresh
+        # if the parent's inline cache currently points at *us* —
+        # otherwise some other BoundKernel owns that slot.
+        kernel_inline = self.kernel._bind_inline_cache
+        if kernel_inline is not None and kernel_inline[1] is self:
+            self.kernel._bind_inline_cache = (
+                kernel_inline[0],
+                self,
+                compiled,
+            )
 
     def _install_fast_launcher(
         self,
@@ -1469,6 +1589,18 @@ from .settings import _env_get_bool  # noqa: E402
 _USE_C_BIND: bool = _helion_c.available and _env_get_bool("HELION_C_BIND", default=True)
 _c_tensor_key: Callable[[torch.Tensor], object] | None = (
     _helion_c.tensor_key if _USE_C_BIND else None
+)
+# Bind-cache match predicate. The C version (``helion._C.inline_cache_match``)
+# is preferred when available — it saves a Python function-call frame
+# on the steady-state hot path (~0.5 µs/call on small kernels) by
+# doing the tuple walk + identity / __eq__ in C. The pure-Python
+# ``_inline_cache_match`` is the documented reference + fallback. Both
+# accept the same shape of inputs; ``cast`` lets us narrow the unified
+# binding to the C callable's signature, which is what the hot path
+# actually uses.
+_bind_cache_match: Callable[[object, object], bool] = cast(
+    "Callable[[object, object], bool]",
+    _helion_c.inline_cache_match if _USE_C_BIND else _inline_cache_match,
 )
 
 

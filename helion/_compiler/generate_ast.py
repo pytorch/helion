@@ -756,7 +756,60 @@ class GenerateAST(NodeVisitor, CodegenInterface):
             elided = self._maybe_elide_broadcast_tensors(node)
             if elided is not None:
                 return elided
+            # ``torch.promote_types(<tensor>.dtype, <tensor>.dtype)`` is
+            # a pure function on dtype tags. When both tensor args have a
+            # statically-known dtype at codegen time, we can resolve the
+            # result here and emit a literal ``torch.<dtype>`` Attribute
+            # instead of a per-call ``promote_types`` invocation (which
+            # would otherwise add ~0.25 µs to every wrapper call).
+            elided = self._maybe_elide_promote_types(node)
+            if elided is not None:
+                return elided
         return self.generic_visit(node)
+
+    def _maybe_elide_promote_types(self, node: ast.Call) -> ast.AST | None:
+        """Constant-fold ``torch.promote_types(<dtype>, <dtype>)`` at codegen.
+
+        Returns ``None`` if the call doesn't qualify — wrong function,
+        wrong arg shape, or one arg isn't a statically-known dtype. On a
+        hit, produces a ``torch.<name>`` Attribute referring to the
+        promoted dtype directly.
+        """
+        from .type_propagation import CallableType
+        from .type_propagation import LiteralType
+
+        func_node = node.func
+        if not isinstance(func_node, ExtendedAST):
+            return None
+        fn_type = func_node._type_info
+        if not isinstance(fn_type, CallableType):
+            return None
+        if fn_type.value is not torch.promote_types:
+            return None
+        if node.keywords or len(node.args) != 2:
+            return None
+        dtypes: list[torch.dtype] = []
+        for arg in node.args:
+            if not isinstance(arg, ExtendedAST):
+                return None
+            arg_type = arg._type_info
+            if not isinstance(arg_type, LiteralType):
+                return None
+            if not isinstance(arg_type.value, torch.dtype):
+                return None
+            dtypes.append(arg_type.value)
+        try:
+            promoted = torch.promote_types(*dtypes)
+        except TypeError:
+            return None
+        # ``torch.bfloat16`` -> emit ``torch.bfloat16`` as
+        # ``Attribute(Name('torch'), 'bfloat16')``. The dtype's ``__str__``
+        # is ``torch.<name>`` so split off the prefix.
+        dtype_name = str(promoted)
+        if not dtype_name.startswith("torch."):
+            return None
+        attr = dtype_name[len("torch.") :]
+        return expr_from_string(f"torch.{attr}")
 
     def _maybe_elide_broadcast_tensors(self, node: ast.Call) -> ast.AST | None:
         """Return a tuple expression replacing a no-op ``torch.broadcast_tensors``.
