@@ -864,6 +864,7 @@ def generate_ast(
 
             for stmt in func.body:
                 codegen.add_statement(codegen.visit(stmt))
+            codegen.device_function.cute_state.finalize_tcgen05_pure_lifecycle_stores()
             kernel_def = codegen.device_function.codegen_function_def()
             codegen.host_dead_code_elimination()
 

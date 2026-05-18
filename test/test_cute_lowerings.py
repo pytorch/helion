@@ -6,6 +6,7 @@ import dataclasses
 import operator
 import re
 from types import SimpleNamespace
+from typing import Sequence
 from typing import cast
 import unittest
 from unittest.mock import patch
@@ -25,6 +26,7 @@ from helion._compiler.ast_read_writes import dead_lane_loop_elimination
 from helion._compiler.aten_lowering import _pallas_argreduce
 from helion._compiler.aten_lowering import _should_use_cute_argreduce_lowering
 from helion._compiler.aten_lowering import _triton_argreduce
+from helion._compiler.aten_lowering import codegen_baddbmm_cute
 from helion._compiler.aten_lowering import codegen_iota_cute
 from helion._compiler.aten_lowering import codegen_mm_cute
 from helion._compiler.aten_lowering import codegen_squeeze_cute
@@ -82,6 +84,8 @@ from helion._compiler.cute.matmul_utils import cute_resolve_active_matmul_k_bloc
 from helion._compiler.cute.matmul_utils import cute_static_k_invariant_extent
 from helion._compiler.cute.matmul_utils import cute_supports_scalar_matmul_fallback
 from helion._compiler.cute.strategies import ROLE_LOCAL_MONOLITHIC_DEFAULT_WARP_SPEC
+from helion._compiler.cute.strategies import TCGEN05_STRATEGY_CONFIG_KEY
+from helion._compiler.cute.strategies import Tcgen05Strategy
 from helion._compiler.cute.strategies import Tcgen05WarpSpec
 from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_AB_CONSUMER_PHASE_MODE_CONFIG_KEY,
@@ -141,6 +145,19 @@ from helion._compiler.cute.tcgen05_constants import (
 from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_DIAGNOSTIC_INVALID_OUTPUT_CONFIG_KEY,
 )
+from helion._compiler.cute.tcgen05_constants import TCGEN05_EPILOGUE_LAYOUT_CONFIG_KEY
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_EPILOGUE_LAYOUT_MODULE_HELPER_ACC_T2R,
+)
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_EPILOGUE_LAYOUT_MODULE_HELPER_STORE_TAIL,
+)
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_EPILOGUE_LAYOUT_SPLIT_ACC_T2R_STORE_TAIL,
+)
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_EPILOGUE_LAYOUT_SPLIT_FIRST_T2R,
+)
 from helion._compiler.cute.tcgen05_constants import TCGEN05_LARGE_BN_PROOF_BLOCK_SIZES
 from helion._compiler.cute.tcgen05_constants import TCGEN05_LARGE_BN_PROOF_CLUSTER_M
 from helion._compiler.cute.tcgen05_constants import TCGEN05_LARGE_BN_PROOF_CONFIG_KEY
@@ -170,6 +187,11 @@ from helion._compiler.cute.tcgen05_constants import (
 from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_TWO_CTA_EDGE_K_TAIL_SCHEDULER_L2_SWIZZLE_SIZE,
 )
+from helion._compiler.cute.tcgen05_pure_matmul import Tcgen05PureMatmulObjectModel
+from helion._compiler.cute.tcgen05_pure_matmul import Tcgen05TmaStoreBodyCoreParams
+from helion._compiler.cute.tcgen05_pure_matmul import Tcgen05TmaStorePipelineParams
+from helion._compiler.cute.tcgen05_pure_matmul import Tcgen05TmaStoreSubtileLoopParams
+from helion._compiler.cute.tcgen05_pure_matmul import Tcgen05TmaStoreTailParams
 from helion._compiler.device_ir import ForLoopGraphInfo
 from helion._compiler.device_ir import GraphInfo
 from helion._compiler.device_ir import RootGraphInfo
@@ -1135,6 +1157,541 @@ class TestCuteLowerings(unittest.TestCase):
             code,
         )
         self.assertIn("cute.arch.sync_threads()", code)
+
+    def test_tcgen05_pure_matmul_role_lifecycle_splits_role_bodies(self) -> None:
+        """The experimental pure lifecycle path leaves only a placeholder K loop.
+
+        K=384 with bk=128 and ab_stages=2 forces a steady-state producer copy
+        after the two-stage initial prefetch, so runtime covers the separate
+        producer loop rather than only the prefetch prologue.
+        """
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_pure_lifecycle(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        args = (
+            torch.randn(128, 384, device=DEVICE, dtype=torch.bfloat16),
+            torch.randn(384, 256, device=DEVICE, dtype=torch.bfloat16),
+        )
+        config = helion.Config(
+            block_sizes=[128, 256, 128],
+            indexing=["tensor_descriptor", "tensor_descriptor", "tensor_descriptor"],
+            l2_groupings=[1],
+            loop_orders=[[0, 1]],
+            num_stages=2,
+            num_warps=4,
+            pid_type="flat",
+            tcgen05_ab_stages=2,
+            tcgen05_acc_stages=1,
+            tcgen05_c_stages=2,
+            tcgen05_cluster_m=1,
+            tcgen05_cluster_n=1,
+            tcgen05_num_epi_warps=4,
+            **{
+                TCGEN05_STRATEGY_CONFIG_KEY: (
+                    Tcgen05Strategy.PURE_MATMUL_ROLE_LIFECYCLE.value
+                )
+            },
+        )
+        runtime_supported = get_cute_mma_support().tcgen05_f16bf16
+        result: torch.Tensor | None = None
+        with patch_cute_mma_support():
+            bound = cute_matmul_pure_lifecycle.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            code = bound.to_triton_code(config)
+            if runtime_supported:
+                bound.set_config(config)
+                result = bound(*args)
+
+        self.assertRegex(
+            code,
+            # Exact ownership cleanup preserves prelude assignments in the
+            # original user K-loop and replaces only the owned tcgen05 region.
+            r"for \w+ in range\([^\n]+\):\n(?:\s+\w+ = .+\n)+\s+pass\n",
+        )
+        self.assertRegex(code, r"if tcgen05_tma_warp:\n\s+for \w+ in range")
+        self.assertRegex(code, r"if tcgen05_exec_active:\n\s+for \w+ in range")
+        self.assertNotIn("tcgen05_role_local_", code)
+        self.assertIn(
+            "from helion._compiler.cute import tcgen05_pipeline "
+            "as _helion_tcgen05_pipeline",
+            code,
+        )
+        self.assertIn(
+            "tcgen05_acc_pipeline = cutlass.pipeline.PipelineUmmaAsync.create(",
+            code,
+        )
+        self.assertIn(
+            "tcgen05_ab_pipeline = cutlass.pipeline.PipelineTmaUmma.create(",
+            code,
+        )
+        self.assertIn(
+            "tcgen05_ab_producer_state = _helion_tcgen05_pipeline.make_pipeline_state(",
+            code,
+        )
+        self.assertIn(
+            "tcgen05_acc_consumer_state = _helion_tcgen05_pipeline.make_pipeline_state(",
+            code,
+        )
+        for state_name in (
+            "tcgen05_acc_producer_state",
+            "tcgen05_acc_consumer_state",
+            "tcgen05_ab_producer_state",
+            "tcgen05_ab_consumer_state",
+        ):
+            self.assertNotIn(
+                f"{state_name} = cutlass.pipeline.make_pipeline_state(",
+                code,
+            )
+        self.assertIn("tcgen05_ab_pipeline.producer_tail", code)
+        if runtime_supported:
+            assert result is not None
+            expected = args[0] @ args[1]
+            torch.testing.assert_close(result, expected, atol=2e-1, rtol=1e-2)
+
+    def test_tcgen05_pure_matmul_role_lifecycle_uses_object_store_emitters(
+        self,
+    ) -> None:
+        @helion.kernel(backend="cute")
+        def cute_matmul_pure_lifecycle(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        args = (
+            torch.randn(128, 384, device=DEVICE, dtype=torch.bfloat16),
+            torch.randn(384, 256, device=DEVICE, dtype=torch.bfloat16),
+        )
+        pure_config = helion.Config(
+            block_sizes=[128, 256, 128],
+            indexing=["tensor_descriptor", "tensor_descriptor", "tensor_descriptor"],
+            l2_groupings=[1],
+            loop_orders=[[0, 1]],
+            num_stages=2,
+            num_warps=4,
+            pid_type="flat",
+            tcgen05_ab_stages=2,
+            tcgen05_acc_stages=1,
+            tcgen05_c_stages=2,
+            tcgen05_cluster_m=1,
+            tcgen05_cluster_n=1,
+            tcgen05_num_epi_warps=4,
+            **{
+                TCGEN05_STRATEGY_CONFIG_KEY: (
+                    Tcgen05Strategy.PURE_MATMUL_ROLE_LIFECYCLE.value
+                )
+            },
+        )
+        normal_config = helion.Config(
+            block_sizes=[128, 256, 128],
+            indexing=["tensor_descriptor", "tensor_descriptor", "tensor_descriptor"],
+            l2_groupings=[1],
+            loop_orders=[[0, 1]],
+            num_stages=2,
+            num_warps=4,
+            pid_type="flat",
+            tcgen05_ab_stages=2,
+            tcgen05_acc_stages=1,
+            tcgen05_c_stages=2,
+            tcgen05_cluster_m=1,
+            tcgen05_cluster_n=1,
+            tcgen05_num_epi_warps=4,
+        )
+        original_role_emit = Tcgen05PureMatmulObjectModel.emit_store_role_stmts
+        original_body_core_build = (
+            Tcgen05PureMatmulObjectModel.build_tma_store_body_core
+        )
+        original_loop_render = (
+            Tcgen05PureMatmulObjectModel.render_tma_store_subtile_loop
+        )
+        original_tail_render = Tcgen05PureMatmulObjectModel.render_tma_store_tail_region
+        original_pre_loop_acquire = (
+            Tcgen05PureMatmulObjectModel.render_c_store_pre_loop_acquire_lines
+        )
+        original_loop_first_acquire = (
+            Tcgen05PureMatmulObjectModel.render_c_store_loop_first_acquire
+        )
+        original_loop_later_acquire = (
+            Tcgen05PureMatmulObjectModel.render_c_store_loop_later_acquire
+        )
+        original_loop_late_later_acquire = (
+            Tcgen05PureMatmulObjectModel.render_c_store_loop_late_later_acquire
+        )
+        original_pipeline_tail = (
+            Tcgen05PureMatmulObjectModel.render_c_store_pipeline_tail
+        )
+        original_acc_advance = Tcgen05PureMatmulObjectModel.render_acc_consumer_advance
+        original_post_loop_emit = (
+            Tcgen05PureMatmulObjectModel.emit_store_post_loop_stmts
+        )
+
+        def role_emit_with_marker(
+            model: Tcgen05PureMatmulObjectModel,
+            cute_state: CuteDeviceFunctionState,
+            *,
+            tma_store_hoisted_stmts: Sequence[ast.AST],
+            store_body_core: Sequence[str],
+        ) -> list[ast.AST]:
+            return [
+                statement_from_string(
+                    "tcgen05_pure_object_store_role_marker = cutlass.Int32(0)"
+                ),
+                *original_role_emit(
+                    model,
+                    cute_state,
+                    tma_store_hoisted_stmts=tma_store_hoisted_stmts,
+                    store_body_core=store_body_core,
+                ),
+            ]
+
+        def build_body_core_with_marker(
+            model: Tcgen05PureMatmulObjectModel,
+            params: Tcgen05TmaStoreBodyCoreParams,
+        ) -> list[str]:
+            return [
+                "tcgen05_pure_object_store_body_core_marker = cutlass.Int32(0)",
+                *original_body_core_build(model, params),
+            ]
+
+        def render_loop_with_marker(
+            model: Tcgen05PureMatmulObjectModel,
+            params: Tcgen05TmaStoreSubtileLoopParams,
+        ) -> str:
+            return (
+                "tcgen05_pure_object_store_loop_marker = cutlass.Int32(0)\n"
+                + original_loop_render(model, params)
+            )
+
+        def render_tail_with_marker(
+            model: Tcgen05PureMatmulObjectModel,
+            params: Tcgen05TmaStoreTailParams,
+        ) -> str:
+            return (
+                "        tcgen05_pure_object_store_tail_marker = cutlass.Int32(0)\n"
+                + original_tail_render(model, params)
+            )
+
+        def pre_loop_acquire_with_marker(
+            model: Tcgen05PureMatmulObjectModel,
+            params: Tcgen05TmaStorePipelineParams,
+            *,
+            first_c_acquire_in_loop: bool,
+        ) -> list[str]:
+            return [
+                "tcgen05_pure_object_c_pipeline_acquire_marker = cutlass.Int32(0)",
+                *original_pre_loop_acquire(
+                    model,
+                    params,
+                    first_c_acquire_in_loop=first_c_acquire_in_loop,
+                ),
+            ]
+
+        def loop_first_acquire_with_marker(
+            model: Tcgen05PureMatmulObjectModel,
+            params: Tcgen05TmaStorePipelineParams,
+            *,
+            first_c_acquire_in_loop: bool,
+        ) -> str:
+            return (
+                "        tcgen05_pure_object_c_pipeline_first_acquire_marker = "
+                "cutlass.Int32(0)\n"
+                + original_loop_first_acquire(
+                    model,
+                    params,
+                    first_c_acquire_in_loop=first_c_acquire_in_loop,
+                )
+            )
+
+        def loop_later_acquire_with_marker(
+            model: Tcgen05PureMatmulObjectModel,
+            params: Tcgen05TmaStorePipelineParams,
+            *,
+            later_c_acquire_before_barrier: bool,
+        ) -> str:
+            return (
+                "        tcgen05_pure_object_c_pipeline_later_acquire_marker = "
+                "cutlass.Int32(0)\n"
+                + original_loop_later_acquire(
+                    model,
+                    params,
+                    later_c_acquire_before_barrier=(later_c_acquire_before_barrier),
+                )
+            )
+
+        def loop_late_later_acquire_with_marker(
+            model: Tcgen05PureMatmulObjectModel,
+            params: Tcgen05TmaStorePipelineParams,
+            *,
+            later_c_acquire_before_barrier: bool,
+        ) -> str:
+            return (
+                "        tcgen05_pure_object_c_pipeline_late_later_acquire_marker = "
+                "cutlass.Int32(0)\n"
+                + original_loop_late_later_acquire(
+                    model,
+                    params,
+                    later_c_acquire_before_barrier=(later_c_acquire_before_barrier),
+                )
+            )
+
+        def pipeline_tail_with_marker(
+            model: Tcgen05PureMatmulObjectModel,
+            params: Tcgen05TmaStorePipelineParams,
+        ) -> str:
+            tail = original_pipeline_tail(model, params)
+            return (
+                "if True:\n"
+                "    tcgen05_pure_object_c_pipeline_tail_marker = "
+                "cutlass.Int32(0)\n"
+                + "\n".join(f"    {line}" for line in tail.splitlines())
+            )
+
+        def acc_advance_with_marker(model: Tcgen05PureMatmulObjectModel) -> str:
+            return (
+                "tcgen05_pure_object_acc_advance_marker = cutlass.Int32(0)\n"
+                + original_acc_advance(model)
+            )
+
+        def post_loop_emit_with_marker(
+            model: Tcgen05PureMatmulObjectModel,
+            cute_state: CuteDeviceFunctionState,
+            candidate_names: Sequence[str],
+            *,
+            tma_store_pipeline_tail: str = "",
+        ) -> list[ast.AST]:
+            return [
+                statement_from_string(
+                    "tcgen05_pure_object_store_cleanup_marker = cutlass.Int32(0)"
+                ),
+                *original_post_loop_emit(
+                    model,
+                    cute_state,
+                    candidate_names,
+                    tma_store_pipeline_tail=tma_store_pipeline_tail,
+                ),
+            ]
+
+        with (
+            patch_cute_mma_support(),
+            patch.object(
+                Tcgen05PureMatmulObjectModel,
+                "emit_store_role_stmts",
+                role_emit_with_marker,
+            ),
+            patch.object(
+                Tcgen05PureMatmulObjectModel,
+                "build_tma_store_body_core",
+                build_body_core_with_marker,
+            ),
+            patch.object(
+                Tcgen05PureMatmulObjectModel,
+                "render_tma_store_subtile_loop",
+                render_loop_with_marker,
+            ),
+            patch.object(
+                Tcgen05PureMatmulObjectModel,
+                "render_tma_store_tail_region",
+                render_tail_with_marker,
+            ),
+            patch.object(
+                Tcgen05PureMatmulObjectModel,
+                "render_c_store_pre_loop_acquire_lines",
+                pre_loop_acquire_with_marker,
+            ),
+            patch.object(
+                Tcgen05PureMatmulObjectModel,
+                "render_c_store_loop_first_acquire",
+                loop_first_acquire_with_marker,
+            ),
+            patch.object(
+                Tcgen05PureMatmulObjectModel,
+                "render_c_store_loop_later_acquire",
+                loop_later_acquire_with_marker,
+            ),
+            patch.object(
+                Tcgen05PureMatmulObjectModel,
+                "render_c_store_loop_late_later_acquire",
+                loop_late_later_acquire_with_marker,
+            ),
+            patch.object(
+                Tcgen05PureMatmulObjectModel,
+                "render_c_store_pipeline_tail",
+                pipeline_tail_with_marker,
+            ),
+            patch.object(
+                Tcgen05PureMatmulObjectModel,
+                "render_acc_consumer_advance",
+                acc_advance_with_marker,
+            ),
+            patch.object(
+                Tcgen05PureMatmulObjectModel,
+                "emit_store_post_loop_stmts",
+                post_loop_emit_with_marker,
+            ),
+        ):
+            bound = cute_matmul_pure_lifecycle.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            pure_code = bound.to_triton_code(pure_config)
+            normal_code = bound.to_triton_code(normal_config)
+
+        self.assertIn("tcgen05_pure_object_store_role_marker", pure_code)
+        self.assertIn("tcgen05_pure_object_store_body_core_marker", pure_code)
+        self.assertIn("tcgen05_pure_object_store_loop_marker", pure_code)
+        self.assertIn("tcgen05_pure_object_store_tail_marker", pure_code)
+        self.assertIn("tcgen05_pure_object_c_pipeline_acquire_marker", pure_code)
+        self.assertIn("tcgen05_pure_object_c_pipeline_first_acquire_marker", pure_code)
+        self.assertIn("tcgen05_pure_object_c_pipeline_later_acquire_marker", pure_code)
+        self.assertIn(
+            "tcgen05_pure_object_c_pipeline_late_later_acquire_marker", pure_code
+        )
+        self.assertIn("tcgen05_pure_object_c_pipeline_tail_marker", pure_code)
+        self.assertIn("tcgen05_pure_object_acc_advance_marker", pure_code)
+        self.assertIn("tcgen05_pure_object_store_cleanup_marker", pure_code)
+        self.assertNotIn("tcgen05_pure_object_store_role_marker", normal_code)
+        self.assertNotIn("tcgen05_pure_object_store_body_core_marker", normal_code)
+        self.assertNotIn("tcgen05_pure_object_store_loop_marker", normal_code)
+        self.assertNotIn("tcgen05_pure_object_store_tail_marker", normal_code)
+        self.assertNotIn("tcgen05_pure_object_c_pipeline_acquire_marker", normal_code)
+        self.assertNotIn(
+            "tcgen05_pure_object_c_pipeline_first_acquire_marker", normal_code
+        )
+        self.assertNotIn(
+            "tcgen05_pure_object_c_pipeline_later_acquire_marker", normal_code
+        )
+        self.assertNotIn(
+            "tcgen05_pure_object_c_pipeline_late_later_acquire_marker",
+            normal_code,
+        )
+        self.assertNotIn("tcgen05_pure_object_c_pipeline_tail_marker", normal_code)
+        self.assertNotIn("tcgen05_pure_object_acc_advance_marker", normal_code)
+        self.assertNotIn("tcgen05_pure_object_store_cleanup_marker", normal_code)
+
+    def test_tcgen05_pure_matmul_role_lifecycle_rejects_k_tail(self) -> None:
+        @helion.kernel(backend="cute")
+        def cute_matmul_pure_lifecycle_tail(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        args = (
+            torch.randn(128, 320, device=DEVICE, dtype=torch.bfloat16),
+            torch.randn(320, 256, device=DEVICE, dtype=torch.bfloat16),
+        )
+        config = helion.Config(
+            block_sizes=[128, 256, 128],
+            indexing=["tensor_descriptor", "tensor_descriptor", "tensor_descriptor"],
+            l2_groupings=[1],
+            loop_orders=[[0, 1]],
+            num_stages=2,
+            num_warps=4,
+            pid_type="flat",
+            tcgen05_ab_stages=2,
+            tcgen05_acc_stages=1,
+            tcgen05_c_stages=2,
+            tcgen05_cluster_m=1,
+            tcgen05_cluster_n=1,
+            tcgen05_num_epi_warps=4,
+            **{
+                TCGEN05_STRATEGY_CONFIG_KEY: (
+                    Tcgen05Strategy.PURE_MATMUL_ROLE_LIFECYCLE.value
+                )
+            },
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_pure_lifecycle_tail.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            with self.assertRaisesRegex(exc.BackendUnsupported, "requires static-full"):
+                bound.to_triton_code(config)
+
+    def test_tcgen05_pure_matmul_role_lifecycle_rejects_diagnostic_layout(
+        self,
+    ) -> None:
+        @helion.kernel(backend="cute")
+        def cute_matmul_pure_lifecycle(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        args = (
+            torch.randn(128, 384, device=DEVICE, dtype=torch.bfloat16),
+            torch.randn(384, 256, device=DEVICE, dtype=torch.bfloat16),
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_pure_lifecycle.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            for epilogue_layout in (
+                TCGEN05_EPILOGUE_LAYOUT_SPLIT_FIRST_T2R,
+                TCGEN05_EPILOGUE_LAYOUT_SPLIT_ACC_T2R_STORE_TAIL,
+                TCGEN05_EPILOGUE_LAYOUT_MODULE_HELPER_ACC_T2R,
+                TCGEN05_EPILOGUE_LAYOUT_MODULE_HELPER_STORE_TAIL,
+            ):
+                with self.subTest(epilogue_layout=epilogue_layout):
+                    config = helion.Config(
+                        block_sizes=[128, 256, 128],
+                        indexing=[
+                            "tensor_descriptor",
+                            "tensor_descriptor",
+                            "tensor_descriptor",
+                        ],
+                        l2_groupings=[1],
+                        loop_orders=[[0, 1]],
+                        num_stages=2,
+                        num_warps=4,
+                        pid_type="flat",
+                        tcgen05_ab_stages=2,
+                        tcgen05_acc_stages=1,
+                        tcgen05_c_stages=2,
+                        tcgen05_cluster_m=1,
+                        tcgen05_cluster_n=1,
+                        tcgen05_num_epi_warps=4,
+                        **{
+                            TCGEN05_STRATEGY_CONFIG_KEY: (
+                                Tcgen05Strategy.PURE_MATMUL_ROLE_LIFECYCLE.value
+                            ),
+                            TCGEN05_EPILOGUE_LAYOUT_CONFIG_KEY: epilogue_layout,
+                        },
+                    )
+                    with self.assertRaisesRegex(
+                        exc.BackendUnsupported,
+                        "pure_matmul_role_lifecycle.*epilogue",
+                    ):
+                        bound.to_triton_code(config)
 
     def test_tcgen05_k_tail_keeps_tma_pipeline_with_scalar_fallback(self) -> None:
         """A K-tail uses TMA for full K tiles, then scalar-fills the tail.
@@ -9167,6 +9724,7 @@ class TestCuteLowerings(unittest.TestCase):
             cg=SimpleNamespace(
                 current_grid_state=SimpleNamespace(block_ids=[7]),
                 active_device_loops={},
+                device_function=SimpleNamespace(config={}),
             ),
             env={
                 lhs: ast.Name(id="lhs_tile", ctx=ast.Load()),
@@ -9209,7 +9767,11 @@ class TestCuteLowerings(unittest.TestCase):
         mm.meta["val"] = torch.empty(4, 4)
 
         ctx = SimpleNamespace(
-            cg=SimpleNamespace(current_grid_state=None, active_device_loops={}),
+            cg=SimpleNamespace(
+                current_grid_state=None,
+                active_device_loops={},
+                device_function=SimpleNamespace(config={}),
+            ),
             env={
                 lhs: ast.Name(id="lhs_tile", ctx=ast.Load()),
                 lo: ast.Name(id="lo_tile", ctx=ast.Load()),
@@ -9258,6 +9820,7 @@ class TestCuteLowerings(unittest.TestCase):
             cg=SimpleNamespace(
                 current_grid_state=SimpleNamespace(block_ids=[11]),
                 active_device_loops={},
+                device_function=SimpleNamespace(config={}),
             ),
             env={
                 lhs: CutePackedAffineLoad(
@@ -9303,7 +9866,11 @@ class TestCuteLowerings(unittest.TestCase):
         add.meta["val"] = torch.empty(4, 4, dtype=torch.float32)
 
         ctx = SimpleNamespace(
-            cg=SimpleNamespace(current_grid_state=None, active_device_loops={}),
+            cg=SimpleNamespace(
+                current_grid_state=None,
+                active_device_loops={},
+                device_function=SimpleNamespace(config={}),
+            ),
             env={
                 lhs: ast.Name(id="lhs_tile", ctx=ast.Load()),
                 rhs: ast.Name(id="rhs_tile", ctx=ast.Load()),
@@ -9342,7 +9909,11 @@ class TestCuteLowerings(unittest.TestCase):
         add.meta["val"] = torch.empty(4, 4, dtype=torch.float16)
 
         ctx = SimpleNamespace(
-            cg=SimpleNamespace(current_grid_state=None, active_device_loops={}),
+            cg=SimpleNamespace(
+                current_grid_state=None,
+                active_device_loops={},
+                device_function=SimpleNamespace(config={}),
+            ),
             env={
                 lhs: ast.Name(id="lhs_tile", ctx=ast.Load()),
                 rhs: ast.Name(id="rhs_tile", ctx=ast.Load()),
@@ -9364,6 +9935,56 @@ class TestCuteLowerings(unittest.TestCase):
             codegen_mm_cute(ctx, mm)
 
         self.assertEqual(emit.call_args.kwargs["out_dtype"], torch.float16)
+
+    def test_codegen_baddbmm_cute_rejects_pure_lifecycle_fallback(self) -> None:
+        graph = Graph()
+        acc = graph.placeholder("acc")
+        lhs = graph.placeholder("lhs")
+        rhs = graph.placeholder("rhs")
+        baddbmm = graph.call_function(
+            torch.ops.aten.baddbmm.default, args=(acc, lhs, rhs)
+        )
+        graph.output(baddbmm)
+        acc.meta["val"] = torch.empty(2, 4, 4)
+        lhs.meta["val"] = torch.empty(2, 4, 8)
+        rhs.meta["val"] = torch.empty(2, 8, 4)
+        baddbmm.meta["val"] = torch.empty(2, 4, 4)
+
+        ctx = SimpleNamespace(
+            cg=SimpleNamespace(
+                current_grid_state=None,
+                active_device_loops={},
+                device_function=SimpleNamespace(
+                    config={
+                        TCGEN05_STRATEGY_CONFIG_KEY: (
+                            Tcgen05Strategy.PURE_MATMUL_ROLE_LIFECYCLE.value
+                        )
+                    }
+                ),
+            ),
+            env={
+                acc: ast.Name(id="acc_tile", ctx=ast.Load()),
+                lhs: ast.Name(id="lhs_tile", ctx=ast.Load()),
+                rhs: ast.Name(id="rhs_tile", ctx=ast.Load()),
+            },
+        )
+        env = SimpleNamespace(resolve_block_id=lambda size: None)
+
+        with (
+            patch.object(CompileEnvironment, "current", return_value=env),
+            patch(
+                "helion._compiler.aten_lowering.cute_static_k_invariant_extent",
+                return_value=8,
+            ),
+            patch(
+                "helion._compiler.aten_lowering._emit_cute_matmul",
+                return_value=ast.Name(id="baddbmm_result", ctx=ast.Load()),
+            ) as emit,
+            self.assertRaisesRegex(exc.BackendUnsupported, "aten.baddbmm"),
+        ):
+            codegen_baddbmm_cute(ctx, baddbmm)
+
+        emit.assert_not_called()
 
     def test_codegen_cute_dot_preserves_default_out_dtype_under_outer_add(
         self,
@@ -9401,6 +10022,7 @@ class TestCuteLowerings(unittest.TestCase):
             ),
             fx_node=dot_node,
             codegen=SimpleNamespace(current_grid_state=None, active_device_loops={}),
+            device_function=SimpleNamespace(config={}),
             env={},
         )
         env = SimpleNamespace(resolve_block_id=lambda size: None)
@@ -9424,6 +10046,67 @@ class TestCuteLowerings(unittest.TestCase):
 
         self.assertEqual(ast.unparse(result), "dot_result")
         self.assertEqual(emit.call_args.kwargs["out_dtype"], torch.float32)
+
+    def test_codegen_cute_dot_rejects_pure_lifecycle_fallback(self) -> None:
+        graph = Graph()
+        lhs = graph.placeholder("lhs")
+        rhs = graph.placeholder("rhs")
+        dot_node = graph.call_function(hl.dot, args=(lhs, rhs, None, None))
+        graph.output(dot_node)
+        lhs.meta["val"] = torch.empty(4, 8, dtype=torch.float16)
+        rhs.meta["val"] = torch.empty(8, 4, dtype=torch.float16)
+        dot_node.meta["val"] = torch.empty(4, 4, dtype=torch.float32)
+
+        mode = FakeTensorMode()
+        fake_lhs = mode.from_tensor(torch.empty(4, 8, dtype=torch.float16))
+        fake_rhs = mode.from_tensor(torch.empty(8, 4, dtype=torch.float16))
+        state = SimpleNamespace(
+            proxy_args=[fake_lhs, fake_rhs, None, None],
+            ast_args=[
+                ast.Name(id="lhs_tile", ctx=ast.Load()),
+                ast.Name(id="rhs_tile", ctx=ast.Load()),
+                ast.Constant(value=None),
+                None,
+            ],
+            ast_arg=lambda idx: (
+                ast.Name(id="lhs_tile", ctx=ast.Load())
+                if idx == 0
+                else ast.Name(id="rhs_tile", ctx=ast.Load())
+                if idx == 1
+                else ast.Constant(value=None)
+            ),
+            fx_node=dot_node,
+            codegen=SimpleNamespace(current_grid_state=None, active_device_loops={}),
+            device_function=SimpleNamespace(
+                config={
+                    TCGEN05_STRATEGY_CONFIG_KEY: (
+                        Tcgen05Strategy.PURE_MATMUL_ROLE_LIFECYCLE.value
+                    )
+                }
+            ),
+            env={},
+        )
+        env = SimpleNamespace(resolve_block_id=lambda size: None)
+
+        with (
+            patch.object(CompileEnvironment, "current", return_value=env),
+            patch(
+                "helion.language.matmul_ops.cute_static_k_invariant_extent",
+                return_value=8,
+            ),
+            patch(
+                "helion.language.matmul_ops._cute_mma_matches_dot_semantics",
+                return_value=False,
+            ),
+            patch(
+                "helion.language.matmul_ops._emit_cute_matmul",
+                return_value=ast.Name(id="dot_result", ctx=ast.Load()),
+            ) as emit,
+            self.assertRaisesRegex(exc.BackendUnsupported, "hl.dot"),
+        ):
+            hl.dot._codegen["cute"](state)
+
+        emit.assert_not_called()
 
     def test_codegen_cute_dot_does_not_force_integer_outer_add_dtype(self) -> None:
         graph = Graph()
@@ -9459,6 +10142,7 @@ class TestCuteLowerings(unittest.TestCase):
             ),
             fx_node=dot_node,
             codegen=SimpleNamespace(current_grid_state=None, active_device_loops={}),
+            device_function=SimpleNamespace(config={}),
             env={},
         )
         env = SimpleNamespace(resolve_block_id=lambda size: None)
@@ -9520,6 +10204,7 @@ class TestCuteLowerings(unittest.TestCase):
             ),
             fx_node=dot_node,
             codegen=SimpleNamespace(current_grid_state=None, active_device_loops={}),
+            device_function=SimpleNamespace(config={}),
             env={
                 lo: ast.Name(id="lo_tile", ctx=ast.Load()),
                 hi: ast.Name(id="hi_tile", ctx=ast.Load()),
@@ -9593,6 +10278,7 @@ class TestCuteLowerings(unittest.TestCase):
                 current_grid_state=SimpleNamespace(block_ids=[11]),
                 active_device_loops={},
             ),
+            device_function=SimpleNamespace(config={}),
             env={
                 lo: ast.Name(id="lo_tile", ctx=ast.Load()),
                 hi: ast.Name(id="hi_tile", ctx=ast.Load()),
