@@ -1836,7 +1836,7 @@ def _create_cute_wrapper(
             continue
 
         if kind == "scalar_constexpr":
-            (_, scalar_kind, scalar_value) = entry
+            (_, scalar_kind, _scalar_key_value, scalar_value) = entry
             assert isinstance(scalar_kind, str)
             literal = repr(scalar_value)
             body.append(f"    arg{i} = {literal}")
@@ -1950,6 +1950,7 @@ def _get_compiled_cute_launcher(
     schema_key: tuple[tuple[object, ...], ...],
     block: tuple[int, int, int],
     compile_options: str | None = None,
+    arch_args: tuple[object, ...] | None = None,
 ) -> object:
     try:
         # pyrefly: ignore [missing-attribute]
@@ -1976,6 +1977,8 @@ def _get_compiled_cute_launcher(
     if cached is not None:
         return cached
 
+    if arch_args is not None:
+        _ensure_cute_dsl_arch_env(arch_args)
     jit_func = _create_cute_wrapper(cute_kernel, schema_key, block)
     launcher = _CompiledCuteLauncher(jit_func, compile_options)
     cache[cache_key] = launcher
@@ -2000,6 +2003,84 @@ def _get_cute_launcher_imports() -> tuple[object, ...]:
     return cached
 
 
+# Keep the per-kernel launch-argument cache small: production kernels normally
+# relaunch one or two stable tensor signatures, while autotune may probe many.
+_CUTE_LAUNCH_ARG_CACHE_LIMIT = 8
+
+
+def _cute_scalar_cache_value(scalar_kind: str, scalar_value: object) -> object:
+    return cast("float", scalar_value).hex() if scalar_kind == "float" else scalar_value
+
+
+def _validate_cute_launcher_tensor(arg: torch.Tensor) -> None:
+    if arg.device.type != "cuda":
+        raise exc.BackendUnsupported("cute", "launcher requires CUDA tensors")
+    if arg.ndim <= 0:
+        raise exc.BackendUnsupported("cute", "launcher requires tensor rank >= 1")
+
+
+def _cute_launch_arg_cache_key(
+    cute_kernel: object,
+    args: tuple[object, ...],
+    grid: tuple[int, int, int],
+) -> tuple[object, ...]:
+    constexpr_flags = _cute_kernel_param_is_constexpr(cute_kernel)
+    key: list[object] = [grid]
+    for i, arg in enumerate(args):
+        if isinstance(arg, torch.Tensor):
+            _validate_cute_launcher_tensor(arg)
+            key.append(
+                (
+                    "tensor",
+                    arg.device.type,
+                    arg.device.index,
+                    str(arg.dtype),
+                    arg.ndim,
+                    arg.data_ptr(),
+                    tuple(int(arg.size(d)) for d in range(arg.ndim)),
+                    tuple(int(arg.stride(d)) for d in range(arg.ndim)),
+                )
+            )
+            continue
+
+        scalar_kind, scalar_value = _normalize_cute_scalar(arg)
+        scalar_key_value = _cute_scalar_cache_value(scalar_kind, scalar_value)
+        is_constexpr = i < len(constexpr_flags) and constexpr_flags[i]
+        key.append(
+            (
+                "scalar_constexpr" if is_constexpr else "scalar",
+                scalar_kind,
+                scalar_key_value,
+            )
+        )
+    return tuple(key)
+
+
+def _build_cached_cute_schema_and_args(
+    cute_kernel: object,
+    args: tuple[object, ...],
+    grid: tuple[int, int, int],
+) -> tuple[tuple[tuple[object, ...], ...], tuple[object, ...]]:
+    cache_key = _cute_launch_arg_cache_key(cute_kernel, args, grid)
+    try:
+        # pyrefly: ignore [missing-attribute]
+        cache = cute_kernel._helion_cute_launch_arg_cache
+    except AttributeError:
+        cache = {}
+        # pyrefly: ignore [missing-attribute]
+        cute_kernel._helion_cute_launch_arg_cache = cache
+    cached = cache.get(cache_key)
+    if cached is not None:
+        cache[cache_key] = cache.pop(cache_key)
+        return cached
+
+    built = _build_cute_schema_and_args(cute_kernel, args, grid)
+    cache[cache_key] = built
+    if len(cache) > _CUTE_LAUNCH_ARG_CACHE_LIMIT:
+        cache.pop(next(iter(cache)))
+    return built
+
+
 def _build_cute_schema_and_args(
     cute_kernel: object,
     args: tuple[object, ...],
@@ -2008,19 +2089,13 @@ def _build_cute_schema_and_args(
     gmem_space, make_ptr_obj, current_stream_obj = _get_cute_launcher_imports()
     make_ptr = cast("Any", make_ptr_obj)
     current_stream = cast("Any", current_stream_obj)
-    _ensure_cute_dsl_arch_env(args)
     constexpr_flags = _cute_kernel_param_is_constexpr(cute_kernel)
     schema: list[tuple[object, ...]] = []
     launch_args: list[object] = []
     for i, arg in enumerate(args):
         if isinstance(arg, torch.Tensor):
-            if arg.device.type != "cuda":
-                raise exc.BackendUnsupported("cute", "launcher requires CUDA tensors")
+            _validate_cute_launcher_tensor(arg)
             ndim = arg.ndim
-            if ndim <= 0:
-                raise exc.BackendUnsupported(
-                    "cute", "launcher requires tensor rank >= 1"
-                )
             schema.append(("tensor", str(arg.dtype), ndim))
             launch_args.append(
                 make_ptr(
@@ -2043,7 +2118,14 @@ def _build_cute_schema_and_args(
             # >=4.5 fails IR verification ("value defined outside the region")
             # if a runtime scalar is fed to a kernel parameter declared as
             # ``cutlass.Constexpr``.
-            schema.append(("scalar_constexpr", scalar_kind, scalar_value))
+            schema.append(
+                (
+                    "scalar_constexpr",
+                    scalar_kind,
+                    _cute_scalar_cache_value(scalar_kind, scalar_value),
+                    scalar_value,
+                )
+            )
         else:
             schema.append(("scalar", scalar_kind))
             launch_args.append(scalar_value)
@@ -2115,14 +2197,16 @@ def default_cute_launcher(
     if any(dim <= 0 for dim in grid_xyz):
         return None
 
-    schema_key, launch_args = _build_cute_schema_and_args(
-        cute_kernel, tuple(args), grid_xyz
+    args_tuple = tuple(args)
+    schema_key, launch_args = _build_cached_cute_schema_and_args(
+        cute_kernel, args_tuple, grid_xyz
     )
     compiled = _get_compiled_cute_launcher(
         cute_kernel,
         schema_key,
         block_xyz,
         compile_options=cute_compile_options,
+        arch_args=args_tuple,
     )
     return cast("Any", compiled)(*launch_args)
 

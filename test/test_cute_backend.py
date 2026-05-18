@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 import os
+from typing import cast
 from unittest.mock import patch
 
 import pytest
@@ -1611,6 +1612,183 @@ class TestCuteBackend(TestCase):
             [("jit-wrapper", (1, 2, 3), "--generate-line-info")],
         )
         self.assertEqual(result, ("launched", (1, 2, 3)))
+
+    def test_cute_launcher_reuses_launch_args_for_stable_scalar_signature(
+        self,
+    ) -> None:
+        cute_kernel = type("DummyCuteKernel", (), {})()
+        build_calls: list[tuple[tuple[object, ...], tuple[int, int, int]]] = []
+        launched_args: list[tuple[object, ...]] = []
+
+        class FakeCompiled:
+            def __call__(self, *args: object) -> tuple[str, tuple[object, ...]]:
+                launched_args.append(args)
+                return ("launched", args)
+
+        def fake_build(
+            _cute_kernel: object,
+            args: tuple[object, ...],
+            grid: tuple[int, int, int],
+        ) -> tuple[tuple[tuple[object, ...], ...], tuple[object, ...]]:
+            build_calls.append((args, grid))
+            return (("scalar", "int"),), ("launch-arg", *args, *grid)
+
+        with (
+            patch("helion.runtime._build_cute_schema_and_args", side_effect=fake_build),
+            patch(
+                "helion.runtime._get_compiled_cute_launcher",
+                return_value=FakeCompiled(),
+            ),
+        ):
+            first = default_cute_launcher(cute_kernel, (2,), 7, block=(32, 1, 1))
+            second = default_cute_launcher(cute_kernel, (2,), 7, block=(32, 1, 1))
+            third = default_cute_launcher(cute_kernel, (2,), 8, block=(32, 1, 1))
+
+        self.assertEqual(build_calls, [((7,), (2, 1, 1)), ((8,), (2, 1, 1))])
+        self.assertEqual(
+            launched_args,
+            [
+                ("launch-arg", 7, 2, 1, 1),
+                ("launch-arg", 7, 2, 1, 1),
+                ("launch-arg", 8, 2, 1, 1),
+            ],
+        )
+        self.assertEqual(first, ("launched", ("launch-arg", 7, 2, 1, 1)))
+        self.assertEqual(second, first)
+        self.assertEqual(third, ("launched", ("launch-arg", 8, 2, 1, 1)))
+
+    def test_cute_launcher_launch_arg_cache_distinguishes_signed_zero(
+        self,
+    ) -> None:
+        cute_kernel = type("DummyCuteKernel", (), {})()
+        build_calls: list[tuple[object, ...]] = []
+        launched_args: list[tuple[object, ...]] = []
+
+        class FakeCompiled:
+            def __call__(self, *args: object) -> tuple[str, tuple[object, ...]]:
+                launched_args.append(args)
+                return ("launched", args)
+
+        def fake_build(
+            _cute_kernel: object,
+            args: tuple[object, ...],
+            _grid: tuple[int, int, int],
+        ) -> tuple[tuple[tuple[object, ...], ...], tuple[object, ...]]:
+            build_calls.append(args)
+            return (("scalar", "float"),), (f"float-{len(build_calls)}",)
+
+        with (
+            patch("helion.runtime._build_cute_schema_and_args", side_effect=fake_build),
+            patch(
+                "helion.runtime._get_compiled_cute_launcher",
+                return_value=FakeCompiled(),
+            ),
+        ):
+            positive = default_cute_launcher(cute_kernel, (1,), 0.0)
+            negative = default_cute_launcher(cute_kernel, (1,), -0.0)
+
+        self.assertEqual(build_calls, [(0.0,), (-0.0,)])
+        self.assertEqual(launched_args, [("float-1",), ("float-2",)])
+        self.assertEqual(positive, ("launched", ("float-1",)))
+        self.assertEqual(negative, ("launched", ("float-2",)))
+
+    def test_cute_launcher_sets_arch_env_only_before_first_compile(self) -> None:
+        cute_kernel = type("DummyCuteKernel", (), {})()
+
+        class FakeCompiled:
+            def __call__(self, *args: object) -> tuple[str, tuple[object, ...]]:
+                return ("launched", args)
+
+        with (
+            patch(
+                "helion.runtime._build_cute_schema_and_args",
+                return_value=((("scalar", "int"),), ("launch-arg",)),
+            ),
+            patch("helion.runtime._create_cute_wrapper", return_value="jit-wrapper"),
+            patch("helion.runtime._ensure_cute_dsl_arch_env") as ensure_arch,
+            patch("cutlass.cute.compile", return_value=FakeCompiled()),
+        ):
+            first = default_cute_launcher(cute_kernel, (1,), 7, block=(32, 1, 1))
+            second = default_cute_launcher(cute_kernel, (1,), 7, block=(32, 1, 1))
+
+        self.assertEqual(ensure_arch.call_count, 1)
+        self.assertEqual(first, ("launched", ("launch-arg",)))
+        self.assertEqual(second, first)
+
+    def test_cute_launcher_constexpr_float_cache_distinguishes_signed_zero(
+        self,
+    ) -> None:
+        def cute_kernel(alpha: cutlass.Constexpr) -> None:
+            pass
+
+        created_schema_keys: list[tuple[tuple[object, ...], ...]] = []
+
+        class FakeCompiled:
+            def __call__(self, *args: object) -> tuple[str, tuple[object, ...]]:
+                return ("launched", args)
+
+        def fake_create_wrapper(
+            _cute_kernel: object,
+            schema_key: tuple[tuple[object, ...], ...],
+            _block: tuple[int, int, int],
+        ) -> str:
+            created_schema_keys.append(schema_key)
+            return f"jit-wrapper-{len(created_schema_keys)}"
+
+        with (
+            patch(
+                "helion.runtime._create_cute_wrapper", side_effect=fake_create_wrapper
+            ),
+            patch("helion.runtime._ensure_cute_dsl_arch_env"),
+            patch("cutlass.cute.compile", return_value=FakeCompiled()),
+        ):
+            positive = default_cute_launcher(cute_kernel, (1,), 0.0)
+            negative = default_cute_launcher(cute_kernel, (1,), -0.0)
+
+        self.assertEqual(len(created_schema_keys), 2)
+        self.assertNotEqual(created_schema_keys[0], created_schema_keys[1])
+        self.assertEqual(positive[0], "launched")
+        self.assertEqual(positive[1][:3], (1, 1, 1))
+        self.assertEqual(negative, positive)
+
+    def test_cute_launcher_launch_arg_cache_misses_on_tensor_pointer_change(
+        self,
+    ) -> None:
+        cute_kernel = type("DummyCuteKernel", (), {})()
+        build_calls: list[int] = []
+        launched_args: list[tuple[object, ...]] = []
+        tensor = torch.empty(2, device=DEVICE)
+        other_tensor = torch.empty(2, device=DEVICE)
+        self.assertNotEqual(tensor.data_ptr(), other_tensor.data_ptr())
+
+        class FakeCompiled:
+            def __call__(self, *args: object) -> tuple[str, tuple[object, ...]]:
+                launched_args.append(args)
+                return ("launched", args)
+
+        def fake_build(
+            _cute_kernel: object,
+            args: tuple[object, ...],
+            _grid: tuple[int, int, int],
+        ) -> tuple[tuple[tuple[object, ...], ...], tuple[object, ...]]:
+            build_calls.append(cast("torch.Tensor", args[0]).data_ptr())
+            return (("tensor", "torch.float32", 1),), (f"ptr-{len(build_calls)}",)
+
+        with (
+            patch("helion.runtime._build_cute_schema_and_args", side_effect=fake_build),
+            patch(
+                "helion.runtime._get_compiled_cute_launcher",
+                return_value=FakeCompiled(),
+            ),
+        ):
+            first = default_cute_launcher(cute_kernel, (1,), tensor)
+            second = default_cute_launcher(cute_kernel, (1,), tensor)
+            third = default_cute_launcher(cute_kernel, (1,), other_tensor)
+
+        self.assertEqual(build_calls, [tensor.data_ptr(), other_tensor.data_ptr()])
+        self.assertEqual(launched_args, [("ptr-1",), ("ptr-1",), ("ptr-2",)])
+        self.assertEqual(first, second)
+        self.assertEqual(third, ("launched", ("ptr-2",)))
 
     def test_cute_cluster_shape_from_wrapper_plans(self) -> None:
         self.assertIsNone(_cute_cluster_shape_from_wrapper_plans([]))
