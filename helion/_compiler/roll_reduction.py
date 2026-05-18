@@ -106,12 +106,19 @@ class ReductionRoller:
         if is_for_loop_target(node.target) or node.target is _if:
             if is_for_loop_target(node.target):
                 graph_id, *_ = node.args
+                assert isinstance(graph_id, int)
+                infos = [self.graph_id_to_info[graph_id]]
             else:
-                _, graph_id, _ = node.args
-            assert isinstance(graph_id, int)
-            info = self.graph_id_to_info[graph_id]
-            if info.used_rdim:
-                if not info.can_be_rolled_by_caller:
+                _, if_graph_id, else_graph_id, *_ = node.args
+                assert isinstance(if_graph_id, int)
+                assert isinstance(else_graph_id, int)
+                infos = [
+                    self.graph_id_to_info[if_graph_id],
+                    self.graph_id_to_info[else_graph_id],
+                ]
+            used_infos = [info for info in infos if info.used_rdim]
+            if used_infos:
+                if not all(info.can_be_rolled_by_caller for info in used_infos):
                     raise NotImplementedError("for loop with mixed reduction dim usage")
                 return True
             return False
