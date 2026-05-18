@@ -1,11 +1,12 @@
 """Minimal LLO dump parser for the TPU roofline predictor.
 
-Forked from msl-tpu-kernel's `tools/llo_trace_viewer/llo_tool.py` (Google/Meta),
-keeping only the bits we need (bundle parsing, trip-count inference, lane
-utilization). We strip the HTML viewer, JSON export, and visualization
-pipeline. We also fix a bug where `extract_trip_counts` can return negative
-trip counts for kernels with dynamic-bound loops (e.g. ragged_paged_attention),
-clamping to 1 and exposing a confidence flag.
+Self-contained parser for the bundle stream + utilization rows in TPU LLO
+dumps. Extracts: static bundle count, dynamic bundle count (from sphi/loop
+annotations when available, heuristic when not), per-bundle lane occupancy
+rows, and DMA byte counts. Handles dynamic-bound fori_loop kernels by
+clamping the inferred trip count to ≥1 and exposing a confidence flag so
+the caller knows when the loop_factor came from a heuristic vs. an explicit
+`iter bound = N` annotation.
 
 Returns:
   parse_llo_dump(dump_dir) → LloParseResult
@@ -161,7 +162,7 @@ def _extract_trip_count(
 
     Returns (trip_count, pipeline_depth, confident).
 
-    Strategy (same as msl-tpu-kernel's llo_tool):
+    Strategy:
       1. Find an `LB:` bundle and read `iter bound = N` comments off its sphi
          instructions. Each sphi binds a register to a trip count for ONE
          loop level.

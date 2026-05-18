@@ -5,7 +5,7 @@ and `*-final_hlo-static-per-bundle-utilization.txt`) plus a user-supplied
 HBM byte count.
 
 Constants are calibrated against TPU v7x (Ironwood), 1 TensorCore:
-  - Clock:           2.2 GHz (msl-tpu-kernel canonical)
+  - Clock:           2.2 GHz
   - BF16 peak:       1,153 TFLOPS per TensorCore
   - HBM peak:        3,690 GB/s per TensorCore
   - HBM effective:   3,160 GB/s (~85.6% of peak, measured on jnp.add)
@@ -70,7 +70,7 @@ How to produce the LLO dump that this script consumes:
   # Then identify the kernel of interest among the dumps:
   ls -laS /tmp/llo_dump/*final_bundles.txt | head    # largest = your kernel
   # For Helion-on-Pallas kernels, look for `custom_kernel.<N>-final_bundles.txt`;
-  # for msl-tpu-kernel kernels the name is descriptive (e.g. `gmm_v2-g_8-...`).
+  # for raw Pallas kernels the name is descriptive (e.g. `matmul.1-...`).
   # Copy both the bundle file and its companion utilization file:
   cp /tmp/llo_dump/<kernel>-...-final_bundles.txt                    <entry>/final_bundles.txt
   cp /tmp/llo_dump/<kernel>-...-final_hlo-static-per-bundle-utilization.txt <entry>/utilization.txt
@@ -115,7 +115,7 @@ BF16_PEAK_TFLOPS = 1_153.0
 BF16_EFFECTIVE_TFLOPS = 912.0  # ~79% of peak (measured, jnp.matmul 4k+/8k+)
 MXU_REALIZATION = BF16_EFFECTIVE_TFLOPS / BF16_PEAK_TFLOPS  # 0.791
 FLOPS_PER_VMATMUL = (
-    2_097_152  # 2^21 — measured (msl-tpu-kernel README's 10485 is a typo)
+    2_097_152  # 2^21 — verified empirically
 )
 
 # Per-lane effective peaks (per TC, bf16), calibrated via async-chained

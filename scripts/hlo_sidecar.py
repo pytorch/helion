@@ -23,8 +23,8 @@ the missing trip count in one of two ways:
 Usage:
     # Mode 1 — static trace
     python scripts/hlo_sidecar.py trace \\
-        --kernel-import 'msl_tpu_kernel.kernels.megablox.gmm_v2:gmm_v2' \\
-        --runner scripts/llo_runner_gmm.py:make_inputs \\
+        --kernel-import 'my_pkg.my_kernel:my_kernel_fn' \\
+        --runner my_runner.py:make_inputs \\
         --runner-args '1024,4096,4096,8'
 
     # Mode 2 — back-solve from one measurement
@@ -346,7 +346,7 @@ def main() -> None:
         "--kernel-import",
         required=True,
         help="'module:symbol' of the kernel function (e.g. "
-        "'msl_tpu_kernel.kernels.megablox.gmm_v2:gmm_v2')",
+        "'my_pkg.my_kernel:my_kernel_fn')",
     )
     pt.add_argument(
         "--runner",

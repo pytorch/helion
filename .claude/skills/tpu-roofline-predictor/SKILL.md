@@ -7,7 +7,7 @@ description: Predict TPU v7x kernel runtime from an LLO dump. Reads `*-final_bun
 
 ## What it does
 
-`scripts/tpu_roofline.py` predicts the per-call runtime of a TPU v7x kernel (Helion-on-Pallas or pure msl-tpu-kernel Pallas) given a static LLO bundle dump and the kernel's HBM byte count. ±6% accuracy on most kernels; explicit fail-loud refusal on the rest.
+`scripts/tpu_roofline.py` predicts the per-call runtime of a TPU v7x kernel (Helion-on-Pallas or raw `pl.pallas_call`) given a static LLO bundle dump and the kernel's HBM byte count. ±6% accuracy on most kernels; explicit fail-loud refusal on the rest.
 
 Calibration constants live at the top of `scripts/tpu_roofline.py` (CLOCK_GHZ=2.2, BF16_EFFECTIVE_TFLOPS=912, HBM_EFFECTIVE_GBPS=3160, per-lane realization factors). Bound to **TPU v7x + the current LLO dump format**. Re-calibration needed for v5p/v6e/etc.
 
@@ -36,15 +36,8 @@ Steps 1, 2, and 3 are already documented end-to-end in the `tpu-test` skill, whi
 
 - **§ Environment** — Envs 1–4 (root paths, venvs, `TPU_VISIBLE_CHIPS` mapping, activation rule)
 - **§ LLO Profiling → Step 1: Dump LLO on the pod** — full `kubectl exec` recipe with `LIBTPU_INIT_ARGS=--xla_jf_dump_to=...`, `HELION_BACKEND=pallas`, etc.
-- **§ LLO Profiling → Step 2: Identify the right kernel dump** — naming patterns (Helion `custom_kernel.<N>` vs msl-tpu-kernel descriptive suffixes), how to filter out XLA reference dumps and `schedule-analysis` files
+- **§ LLO Profiling → Step 2: Identify the right kernel dump** — naming patterns (Helion `custom_kernel.<N>` vs descriptive raw-Pallas names), how to filter out XLA reference dumps and `schedule-analysis` files
 - **§ LLO Profiling → Step 3: Copy dumps back to the Mac**
-
-Two predictor-specific add-ons not in tpu-test:
-
-**Runner templates for msl-tpu-kernel kernels.** Use `scripts/llo_runner_gmm.py` and `scripts/llo_runner_rpa.py` as templates — single-config runners that produce one clean named dump and print `Avg latency: <X> us`. msl-tpu-kernel lives at `/mnt/hyperdisk/Code3/msl-tpu-kernel/` and is symlinked into the other env roots (`/mnt/hyperdisk/msl-tpu-kernel`, `/mnt/hyperdisk/Code{2,4}/msl-tpu-kernel`). In any env, add it to `PYTHONPATH` in the kubectl exec command:
-```bash
-PYTHONPATH=<env_root>/msl-tpu-kernel:$PYTHONPATH python scripts/llo_runner_<X>.py ...
-```
 
 **Pair the dump with Pallas source** when archiving (this is what makes the entry directly useful for kernel-writing, not just historical performance data):
 
@@ -52,16 +45,15 @@ PYTHONPATH=<env_root>/msl-tpu-kernel:$PYTHONPATH python scripts/llo_runner_<X>.p
 ENTRY=~/Code/helion/llo/<descriptive_name>_<shape>_bf16
 mkdir -p $ENTRY/source
 
-# Helion-generated Pallas (directly runnable with JAX, no Helion at runtime)
+# For Helion kernels: extract the post-codegen Pallas (directly runnable with JAX)
 python scripts/extract_helion_pallas.py \
     --example examples/<X>.py --kernel <X> \
     --shapes '8x32x8192x256;8x32x8192x256;8x32x8192x256' --dtype bf16 \
     --config '{"block_sizes": [8, 512, 512], "pallas_loop_type": "emit_pipeline", "pallas_pre_broadcast": true}' \
     --out $ENTRY/source/generated_pallas.py
 
-# OR for msl-tpu-kernel kernels (already pure Pallas — copy the kernel file)
-cp ~/Code/msl-tpu-kernel/msl_tpu_kernel/kernels/<family>/<kernel>.py $ENTRY/source/
-cp <your-runner>.py $ENTRY/source/
+# For raw-Pallas kernels: copy the kernel source file directly
+cp <path-to-pallas-kernel>.py $ENTRY/source/
 ```
 
 Optionally write a `meta.yaml` recording the measured timing, config, and notes — see existing entries under `~/Code/helion/llo/` for the schema. `meta.yaml` is also where `hlo_sidecar.py back-solve --persist` writes `inner_loop_iters: K` (picked up automatically by the predictor on the next run).
@@ -148,14 +140,14 @@ Practical: `iters >= 30` for kernels well above the 30 µs floor; `iters >= 100`
 - **emit_pipeline `--inner-loop-iters`**: even with static shapes, `pallas_loop_type=emit_pipeline` hides the inner K-loop inside the body. For attention with `block_n < S`, K = `S/block_n` (e.g. 16 for S=8192, block_n=512).
 - **bytes accounting for GMM at large M**: `--inputs` undercounts when RHS is re-read across N-tiles. Open TODO (see predictor docstring).
 - **bmm-style phi stalls**: ~10-15% of compute time goes to loop-carried-dep stalls the model doesn't capture. Open TODO; not worth fixing unless on critical path.
-- **Raw `pl.pallas_call` runners MUST `jax.jit` the entry point** — `pl.pallas_call(...)` itself doesn't jit; calling the returned function from Python re-traces on every invocation, paying full JAX dispatch overhead (100×–1000× slower for µs-scale kernels). Helion handles this internally; raw msl-tpu-kernel `example-collections/` runners (e.g. maxtext `ragged_mqa`) do NOT. If a measured-vs-predicted gap is implausibly large (~99% off), check whether the runner is jit-wrapped before blaming the predictor. Concrete: `ragged_mqa` B=32 S=4096 D=128 measured 153 ms un-jitted, 268 µs jitted (570× difference, same LLO).
+- **Raw `pl.pallas_call` runners MUST `jax.jit` the entry point** — `pl.pallas_call(...)` itself doesn't jit; calling the returned function from Python re-traces on every invocation, paying full JAX dispatch overhead (100×–1000× slower for µs-scale kernels). Helion handles this internally; hand-written raw-Pallas runners do NOT. If a measured-vs-predicted gap is implausibly large (~99% off), check whether the runner is jit-wrapped before blaming the predictor. Concrete example: a ragged-MQA kernel at B=32 S=4096 D=128 measured 153 ms un-jitted, 268 µs jitted (570× difference, same LLO).
 
 ## Tooling
 
 | Script | Purpose |
 |---|---|
 | `scripts/tpu_roofline.py` | The predictor itself |
-| `scripts/llo_parse.py` | LLO dump parser (fork of msl-tpu-kernel's `llo_tool.py`) |
+| `scripts/llo_parse.py` | LLO dump parser (bundle stream + utilization rows + trip-count inference) |
 | `scripts/hlo_sidecar.py` | Trace + back-solve K for dynamic kernels |
 | `scripts/extract_helion_pallas.py` | Emit the post-Helion Pallas source for a Helion kernel + config |
 | `scripts/llo_runner_gmm.py` | Single-config GMM v2 runner |
