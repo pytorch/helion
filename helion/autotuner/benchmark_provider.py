@@ -749,6 +749,21 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                     self.kernel.format_kernel_decorator(config, self.settings),
                     exc_info=True,
                 )
+            else:
+                # G3: install the fast launcher (and after priming, the C
+                # ``CompiledLauncher`` if ``helion._C`` is available) on the
+                # compiled wrapper so every per-trial benchmark call uses
+                # it. Autotune args don't change shape or scalar value
+                # across calls within a trial, so the fast launcher's
+                # cached specialization is safe here. ``_install_fast_launcher``
+                # is a no-op if the kernel's backend isn't ``TritonBackend``
+                # (e.g. Pallas, Cute) or on any priming failure. Only
+                # installed when the kernel exposes the helper (i.e. is a
+                # ``BoundKernel``; external adapters in
+                # ``helion/autotuner/external.py`` skip this).
+                installer = getattr(self.kernel, "_install_fast_launcher", None)
+                if installer is not None:
+                    installer(compiled[i], config)
         fns = list(compiled.values())
         valid_indices = list(compiled.keys())
         configs = [all_configs[i] for i in valid_indices]

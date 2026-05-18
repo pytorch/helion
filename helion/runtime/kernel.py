@@ -926,10 +926,12 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         closure (built once with this config's ``num_warps`` / ``num_stages``
         / etc. baked in), every direct call to ``compiled(*args)`` —
         including from ``BoundKernel.__call__`` on the steady-state hot
-        path — uses the fast launcher with no extra Python wrapping.
+        path AND every per-trial benchmark call from the autotune harness
+        in ``helion/autotuner/benchmark_provider.py`` — uses the fast
+        launcher with no extra Python wrapping.
 
-        The autotune trial harness and any external caller that explicitly
-        passes ``_launcher=`` (e.g. ``benchmarks/launch_overhead.py``)
+        The precompile path in ``helion/autotuner/precompile_future.py``
+        and any external caller that explicitly passes ``_launcher=``
         overrides the kwdefault automatically, so this is safe.
 
         Non-Triton backends and any priming failure cause the kwdefault to
