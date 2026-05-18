@@ -16,7 +16,6 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING
 from typing import Callable
 from typing import Generator
-from typing import ParamSpec
 from typing import Sequence
 from typing import TypeVar
 from typing import cast
@@ -63,7 +62,6 @@ if TYPE_CHECKING:
     from .runtime.kernel import Kernel
 
 _R = TypeVar("_R")
-_P = ParamSpec("_P")
 
 
 def _strip_launcher_args(value: str) -> str:
@@ -1057,43 +1055,6 @@ def _as_tensors(result: object) -> list[torch.Tensor]:
     return [result.clone()]
 
 
-def _with_tf32_precision(fn: Callable[_P, _R]) -> Callable[_P, _R]:
-    """Run a test helper with TF32 enabled, restoring prior precision settings."""
-
-    @functools.wraps(fn)
-    def wrapper(*args: _P.args, **kwargs: _P.kwargs) -> _R:
-        orig_matmul_fp32_precision: str | None = None
-        orig_cudnn_fp32_precision: str | None = None
-        orig_float32_matmul_precision: str | None = None
-        try:
-            cudnn_conv = torch.backends.cudnn.conv  # pyrefly: ignore[missing-attribute]
-            orig_matmul_fp32_precision = cast(
-                "str", torch.backends.cuda.matmul.fp32_precision
-            )
-            orig_cudnn_fp32_precision = cast("str", cudnn_conv.fp32_precision)
-            torch.backends.cuda.matmul.fp32_precision = "tf32"
-            cudnn_conv.fp32_precision = "tf32"
-        except AttributeError:  # No cudnn available
-            orig_float32_matmul_precision = torch.get_float32_matmul_precision()
-            torch.set_float32_matmul_precision("high")  # older deprecated API
-
-        try:
-            return fn(*args, **kwargs)
-        finally:
-            if (
-                orig_matmul_fp32_precision is not None
-                and orig_cudnn_fp32_precision is not None
-            ):
-                cudnn_conv = torch.backends.cudnn.conv  # pyrefly: ignore[missing-attribute]
-                torch.backends.cuda.matmul.fp32_precision = orig_matmul_fp32_precision
-                cudnn_conv.fp32_precision = orig_cudnn_fp32_precision
-            elif orig_float32_matmul_precision is not None:
-                torch.set_float32_matmul_precision(orig_float32_matmul_precision)
-
-    return wrapper
-
-
-@_with_tf32_precision
 def run_example(
     kernel_fn: Callable[..., torch.Tensor] | Kernel | dict[str, Kernel],
     baseline_fn: Callable[..., torch.Tensor] | dict[str, Callable[..., torch.Tensor]],
@@ -1130,6 +1091,11 @@ def run_example(
     if dist.is_initialized() and process_group_name is None:
         assert dist.group.WORLD is not None
         process_group_name = dist.group.WORLD.group_name
+    try:
+        torch.backends.cuda.matmul.fp32_precision = "tf32"
+        torch.backends.cudnn.conv.fp32_precision = "tf32"  # type: ignore[reportAttributeAccessIssue]
+    except AttributeError:  # No cudnn available
+        torch.set_float32_matmul_precision("high")  # older deprecated API
 
     # Normalize to dict format
     kernels = kernel_fn if isinstance(kernel_fn, dict) else {kernel_name: kernel_fn}
