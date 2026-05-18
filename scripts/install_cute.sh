@@ -72,9 +72,11 @@ fi
 if command -v uv >/dev/null 2>&1; then
   PIP_INSTALL=(uv pip install)
   PIP_UNINSTALL=(uv pip uninstall)
+  PIP_REINSTALL_NO_DEPS=(uv pip install --reinstall --no-deps)
 else
   PIP_INSTALL=(python -m pip install)
   PIP_UNINSTALL=(python -m pip uninstall -y)
+  PIP_REINSTALL_NO_DEPS=(python -m pip install --force-reinstall --no-deps)
 fi
 
 echo "==> Uninstalling any existing nvidia-cutlass-dsl* packages"
@@ -100,7 +102,7 @@ if [[ "$VARIANT" == "cu13" ]]; then
   # cute test crashes. Force-reinstall cu13 *with --no-deps* so its files are
   # the last writers on disk.
   echo "==> Reinstalling nvidia-cutlass-dsl-libs-cu13 (no deps) so its files win"
-  "${PIP_INSTALL[@]}" --reinstall --no-deps \
+  "${PIP_REINSTALL_NO_DEPS[@]}" \
     "nvidia-cutlass-dsl-libs-cu13==$CUTE_VERSION"
 else
   echo "==> Installing nvidia-cutlass-dsl==$CUTE_VERSION (cu12 / libs-base only)"
