@@ -2268,26 +2268,9 @@ def _(state: CodegenState) -> list[object]:
             state.codegen, else_graph.graph, [*else_args]
         )
 
-    assert graph_info.if_arg_names is not None
-    assert graph_info.else_arg_names is not None
-    assert graph_info.branches_outputs is not None
-
-    arg_node_name_to_ast_name = {
-        graph_info.if_arg_names[i]: if_args[i].id for i in range(len(if_args))
-    } | {graph_info.else_arg_names[i]: else_args[i].id for i in range(len(else_args))}
-
-    if_return_names = [
-        cast("ast.Name", if_outputs[o]).id
-        if isinstance(o, int)
-        else arg_node_name_to_ast_name[o]
-        for (o, _) in graph_info.branches_outputs
-    ]
-    else_return_names = [
-        cast("ast.Name", else_outputs[o]).id
-        if isinstance(o, int)
-        else arg_node_name_to_ast_name[o]
-        for (_, o) in graph_info.branches_outputs
-    ]
+    if_return_names, else_return_names = graph_info.get_branches_return_names(
+        state, if_outputs, else_outputs
+    )
 
     if_arg_ids = {arg.id for arg in if_args}
     union_args = if_args + [a for a in else_args if a.id not in if_arg_ids]

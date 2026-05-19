@@ -374,6 +374,38 @@ class IfGraphInfo(NodeArgsGraphInfo):
             "branches_outputs": self.branches_outputs,
         }
 
+    def get_branches_return_names(
+        self, state: CodegenState, if_outputs: list[object], else_outputs: list[object]
+    ) -> tuple[list[str], list[str]]:
+        if_args = state.ast_args[3]
+        assert isinstance(if_args, list)
+        assert all(isinstance(x, ast.AST) for x in if_args)
+        else_args = state.ast_args[4]
+        assert isinstance(else_args, list)
+        assert all(isinstance(x, ast.AST) for x in else_args)
+
+        assert self.if_arg_names is not None
+        assert self.else_arg_names is not None
+        assert self.branches_outputs is not None
+
+        arg_node_name_to_ast_name = {
+            self.if_arg_names[i]: if_args[i].id for i in range(len(if_args))
+        } | {self.else_arg_names[i]: else_args[i].id for i in range(len(else_args))}
+
+        if_return_names = [
+            cast("ast.Name", if_outputs[o]).id
+            if isinstance(o, int)
+            else arg_node_name_to_ast_name[o]
+            for (o, _) in self.branches_outputs
+        ]
+        else_return_names = [
+            cast("ast.Name", else_outputs[o]).id
+            if isinstance(o, int)
+            else arg_node_name_to_ast_name[o]
+            for (_, o) in self.branches_outputs
+        ]
+        return if_return_names, else_return_names
+
     def codegen(self, state: CodegenState) -> list[object]:
         from .generate_ast import GenerateAST
 
