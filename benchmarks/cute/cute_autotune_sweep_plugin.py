@@ -1,4 +1,4 @@
-"""Pytest plugin used by ``scripts/cute_autotune_sweep.py``.
+"""Pytest plugin used by ``benchmarks/cute/cute_autotune_sweep.py``.
 
 Drives an existing test case through the *autotune* code path instead of
 ``ConfigSpec.default_config()``. The plugin patches
@@ -22,7 +22,7 @@ body has executed, so a CuTe-unsupported example can still spend GPU
 time and crash the context. The sweep driver's curated list keeps
 ``@xfailIfCute`` cases out so the sweep does not chase known-bad paths.
 
-Loaded with ``pytest -p scripts.cute_autotune_sweep_plugin`` from the
+Loaded with ``pytest -p benchmarks.cute.cute_autotune_sweep_plugin`` from the
 sweep harness; not part of the ordinary test suite.
 """
 
@@ -80,6 +80,7 @@ def _patch_helion_check_example_to_autotune(
     ``pytest_runtest_logreport`` can record it.
     """
     sweep_state: dict[str, Any] = {}
+    # pyrefly: ignore [bad-assignment]
     request.node.cute_sweep_state = sweep_state
 
     from helion import _testing as ht
@@ -183,6 +184,7 @@ def pytest_runtest_logreport(report: pytest.TestReport) -> None:
 
 
 @pytest.hookimpl(hookwrapper=True)
+# pyrefly: ignore [bad-return]
 def pytest_runtest_makereport(item: pytest.Item, call: pytest.CallInfo[None]) -> None:
     """Pipe per-test sweep state through to ``pytest_runtest_logreport``.
 
