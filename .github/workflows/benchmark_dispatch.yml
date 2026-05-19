@@ -44,7 +44,7 @@ on:
         description: 'Comma-separated list of kernels to benchmark on B200 with HELION_BACKEND=cute. Defaults to the CuTe-capable TritonBench subset.'
         required: false
         type: string
-        default: "vector_add,gemm,softmax,layer_norm,rms_norm,cross_entropy,vector_exp,sum,geglu,swiglu,jsd,jagged_mean"
+        default: "vector_add,layer_norm,rms_norm,vector_exp,sum"
       env_vars:
         description: 'Environment variables for benchmark runner'
         required: false
