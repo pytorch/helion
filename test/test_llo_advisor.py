@@ -179,5 +179,64 @@ class PromptIntegrationTest(unittest.TestCase):
         self.assertNotIn("Bottleneck Analysis", prompt)
 
 
+class RefinementStrategyOverrideTest(unittest.TestCase):
+    """Verify the advisor produces actionable refinement instructions."""
+
+    def test_mxu_bound_produces_directional_lines(self) -> None:
+        mod = _load_advisor_standalone()
+        hints = mod.BottleneckHints(
+            predicted_us=22128.6,
+            regime="compute-bound (MXU)",
+            binding_lane="MXU",
+            mxu_busy_pct=83.1,
+            register_pressure="high",
+            counterfactual_savings_us={"MXU=1.0": 1252.5},
+            suggestions=["MXU is the binding lane."],
+        )
+        lines = mod.refinement_strategy_from_hints([("anchor1", hints)])
+        joined = "\n".join(lines)
+        # Kernel-agnostic phrasing: name the bottleneck and the lever, not
+        # specific block_sizes positions.
+        self.assertIn("compute-bound on MXU", joined)
+        self.assertIn("reduction loops", joined)
+        self.assertNotIn("block_b", joined)
+        self.assertNotIn("first block_sizes entry", joined)
+        self.assertIn("Multi-field changes are encouraged", joined)
+        self.assertIn("Register pressure is high", joined)
+
+    def test_empty_hints_returns_no_override(self) -> None:
+        mod = _load_advisor_standalone()
+        self.assertEqual(mod.refinement_strategy_from_hints([]), [])
+
+    def test_strategy_override_used_in_prompt(self) -> None:
+        try:
+            from helion.autotuner.llm.prompting import build_refinement_prompt
+        except ImportError:
+            self.skipTest("helion/torch not available")
+
+        prompt = build_refinement_prompt(
+            configs_per_round=4,
+            compile_timeout_s=120,
+            failed_count=0,
+            total_count=10,
+            search_state="  Best so far: 22.4 ms",
+            anchor_configs="  Anchor 1: 22.4 ms",
+            results="  22.4 ms",
+            top_patterns="  None",
+            failed_patterns="  None",
+            bottleneck_analysis="some bottleneck info",
+            refinement_strategy_override=[
+                "Best config is MXU-bound. Try larger inner-K block_sizes.",
+                "Multi-field changes are encouraged this round.",
+            ],
+        )
+        self.assertIn("MXU-bound", prompt)
+        self.assertIn("Multi-field changes are encouraged", prompt)
+        # Default strategy text should be suppressed
+        self.assertNotIn(
+            "About two thirds of configs should be 1-field mutations", prompt
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -148,10 +148,20 @@ def _refinement_strategy_lines(
     compile_timeout_s: int | None,
     failed_count: int,
     total_count: int,
+    advisor_override: list[str] | None = None,
 ) -> list[str]:
-    """Build the bullet list used for the refinement-step section."""
+    """Build the bullet list used for the refinement-step section.
+
+    `advisor_override`, when non-empty, replaces the default 1-field-mutation
+    strategy lines with directional instructions derived from the LLO
+    advisor's bottleneck analysis. The failure-heavy fallback still wins
+    when most configs are crashing — bottleneck advice doesn't help if we
+    can't compile at all.
+    """
     if total_count > 0 and failed_count * 3 >= total_count:
         lines = list(_FAILURE_HEAVY_REFINEMENT_LINES)
+    elif advisor_override:
+        lines = list(advisor_override)
     else:
         lines = list(_DEFAULT_REFINEMENT_LINES)
     lines.append(
@@ -242,13 +252,18 @@ def build_refinement_prompt(
     top_patterns: str,
     failed_patterns: str,
     bottleneck_analysis: str = "",
+    refinement_strategy_override: list[str] | None = None,
 ) -> str:
     """Build the refinement prompt sent after each benchmarking round.
 
     `bottleneck_analysis` (optional): per-anchor static lane-utilization +
-    counterfactual ceilings + suggestions produced by the LLO advisor. When
-    present, the LLM gets directional hints ("MXU-bound, try larger block_k")
-    on top of raw (config, timing) feedback.
+    counterfactual ceilings + suggestions produced by the LLO advisor.
+
+    `refinement_strategy_override` (optional): when non-empty, replaces the
+    default "1-field mutation of Anchor 1" instructions in the Next Step
+    section with directional advice derived from the bottleneck analysis.
+    This is how a strong LLO signal escapes anchor-stickiness — the LLM is
+    told to try multi-field changes in the direction the diagnosis points.
     """
     task_section = (
         f"Suggest up to {configs_per_round} NEW UNIQUE configs around the anchors above. "
@@ -274,6 +289,7 @@ def build_refinement_prompt(
                     compile_timeout_s=compile_timeout_s,
                     failed_count=failed_count,
                     total_count=total_count,
+                    advisor_override=refinement_strategy_override,
                 ),
             ),
             _section("Task", task_section),

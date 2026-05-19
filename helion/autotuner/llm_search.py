@@ -269,7 +269,7 @@ class LLMGuidedSearch(PopulationBasedSearch):
         # suggestions). Empty string = no advisor → no extra section.
         from .llm.llo_advisor import collect_bottlenecks_for_anchors
 
-        bottleneck = collect_bottlenecks_for_anchors(
+        bottleneck, strategy_override = collect_bottlenecks_for_anchors(
             self._all_benchmark_results,
             self._default_config_dict,
             inputs=self._predictor_inputs or None,
@@ -303,6 +303,7 @@ class LLMGuidedSearch(PopulationBasedSearch):
                 self._default_config_dict,
             ),
             bottleneck_analysis=bottleneck,
+            refinement_strategy_override=strategy_override or None,
         )
 
     # ── LLO dump routing ────────────────────────────────────────────
@@ -339,7 +340,7 @@ class LLMGuidedSearch(PopulationBasedSearch):
             new_files = after - before
             if not new_files:
                 continue
-            cfg_subdir = dump_root / f"cfg_{self._config_key(cfg)}"
+            cfg_subdir = dump_root / f"cfg_{self._config_dump_dirname(cfg)}"
             cfg_subdir.mkdir(exist_ok=True)
             for name in new_files:
                 src = dump_root / name
@@ -347,6 +348,20 @@ class LLMGuidedSearch(PopulationBasedSearch):
                     src.rename(cfg_subdir / name)
             self._llo_subdir_by_config[self._config_key(cfg)] = str(cfg_subdir)
         return results
+
+    def _config_dump_dirname(self, cfg: Config) -> str:
+        """Filesystem-safe short name derived from `_config_key`.
+
+        `_config_key` returns `repr(cfg)` so it can be used as a dedupe key,
+        but the repr contains spaces, brackets, and quotes that make for
+        ugly directory names. Hash to a short hex digest for the on-disk
+        layout; the in-memory map still uses the full key.
+        """
+        import hashlib
+
+        return hashlib.blake2b(
+            self._config_key(cfg).encode("utf-8"), digest_size=8
+        ).hexdigest()
 
     @staticmethod
     def _snapshot_dump_files(dump_root: Path) -> set[str]:

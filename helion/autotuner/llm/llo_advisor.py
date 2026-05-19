@@ -325,6 +325,78 @@ def _resolve_predictor_dir(llo_dir: Path) -> Path | None:
     return None
 
 
+def refinement_strategy_from_hints(
+    config_hints: list[tuple[str, BottleneckHints]],
+) -> list[str]:
+    """Translate advisor diagnoses into refinement instructions.
+
+    Returned lines override `_DEFAULT_REFINEMENT_LINES` for one round so
+    the LLM is pushed toward edits that target the diagnosed bottleneck
+    instead of always emitting 1-field mutations of the current best.
+    The trade-off: when the LLO signal is clear, exploration depth in the
+    direction the signal indicates is worth more than the safety of
+    near-anchor mutations.
+
+    Empty list = no override (caller keeps the default strategy lines).
+    """
+    if not config_hints:
+        return []
+    _, best = config_hints[0]
+    lines: list[str] = []
+    lane = best.binding_lane or ""
+    if lane == "MXU":
+        lines.extend(
+            [
+                (
+                    "Best config is compute-bound on MXU. Per-tile MXU work is "
+                    "the lever — try larger block sizes on reduction loops to "
+                    "amortize MXU pipeline setup over more matmul work."
+                ),
+                (
+                    "Consult the Configuration Space to identify which "
+                    "block_sizes entries are reduction (inner) vs grid (outer) "
+                    "loops; do not assume a specific position."
+                ),
+            ]
+        )
+    elif lane in ("VSTORE", "VLOAD"):
+        lines.extend(
+            [
+                (
+                    f"Best config is memory-bound on {lane}. Reduce per-tile "
+                    "working set: smaller block sizes on grid loops and "
+                    "different loop_orders to cut HBM traffic."
+                ),
+            ]
+        )
+    elif lane == "VALU":
+        lines.append(
+            "Best config is VALU-bound (scalar/vector lane). Per-tile "
+            "vector-ALU bookkeeping dominates; try a structurally different "
+            "scheduling family (change pallas_loop_type or loop_orders) "
+            "rather than tile-size tweaks."
+        )
+    if lines:
+        lines.append(
+            "Multi-field changes are encouraged this round; do not constrain "
+            "to 1-field mutations of the anchors."
+        )
+    if best.register_pressure == "high":
+        lines.append(
+            "Register pressure is high. Reduce per-tile working set with "
+            "smaller block sizes, or set pallas_pre_broadcast=False if "
+            "present, to lower spills."
+        )
+    if best.regime.startswith("overhead-bound"):
+        lines.append(
+            "Anchor is at the small-shape min-time floor — block_sizes have "
+            "little leverage. Use this round to try a structurally different "
+            "family (e.g. change pallas_loop_type) rather than near-anchor "
+            "mutations."
+        )
+    return lines
+
+
 def collect_bottlenecks_for_anchors(
     results: list[BenchmarkResult],
     default_config_dict: dict[str, object],
@@ -334,15 +406,14 @@ def collect_bottlenecks_for_anchors(
     llo_subdir_by_config: dict[str, str] | None = None,
     config_key_fn: object | None = None,
     max_anchors: int = 2,
-) -> str:
-    """Run the LLO advisor against the top-N anchor configs and produce a
-    natural-language summary suitable for the LLM's refinement prompt.
+) -> tuple[str, list[str]]:
+    """Run the LLO advisor against the top-N anchor configs.
 
-    Returns "" silently if any required input is missing (no per-config LLO
-    subdir map, no input/output specs, advisor errors). This keeps the
-    LLM-search backward compatible — when the advisor is wired up the prompt
-    gains a "Bottleneck Analysis" section; when it isn't, the prompt is
-    unchanged.
+    Returns (prompt_section, refinement_strategy_override). Both are empty
+    when the advisor can't run (no LLO map, no shapes) so the search stays
+    backward compatible. When the advisor does run, the strategy override
+    replaces the default "1-field mutations of Anchor 1" instructions for
+    one round — this is how the LLO signal escapes anchor-stickiness.
 
     Args:
       results: BenchmarkResult list (same as feedback.py consumers)
@@ -362,14 +433,14 @@ def collect_bottlenecks_for_anchors(
         or not llo_subdir_by_config
         or config_key_fn is None
     ):
-        return ""
+        return "", []
 
     from .feedback import finite_results
     from .feedback import format_config_diff
 
     finite = finite_results(results)
     if not finite:
-        return ""
+        return "", []
 
     hint_blocks: list[tuple[str, BottleneckHints]] = []
     for cfg, perf in finite[:max_anchors]:
@@ -392,4 +463,6 @@ def collect_bottlenecks_for_anchors(
         label = f"{perf:.4f} ms — {diff}"
         hint_blocks.append((label, hints))
 
-    return summarize_bottlenecks_for_llm(hint_blocks)
+    return summarize_bottlenecks_for_llm(hint_blocks), refinement_strategy_from_hints(
+        hint_blocks
+    )
