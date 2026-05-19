@@ -12,6 +12,7 @@ from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
+from helion._testing import skipIfCute
 from helion._testing import skipIfPallas
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfTileIR
@@ -340,6 +341,97 @@ class TestControlFlow(RefEagerTestBase, TestCase):
         code, result = code_and_output(fn, (x, False))
         expected = (x.float() + x.float()).to(x.dtype)
         torch.testing.assert_close(result, expected)
+
+    @skipIfPallas("Pallas gather supports only dim-0 indirect indexing")
+    @skipIfCute("Cute requires hl.arange() to use an active tile/reduction axis")
+    def test_grid_if_reduction_rolling_branch_graph_ids(self):
+        """Test for reductions under branch-by-grid control flow.
+
+        Reduction rolling must inspect both _if branch graph ids. The _if node
+        also carries branch args, so unpacking the old 3-arg form misses this
+        case before codegen.
+        """
+
+        # This branch-by-grid pattern is used by the fused kernel work in
+        # https://github.com/vllm-project/vllm/pull/38595.
+        @helion.kernel(static_shapes=False)
+        def fn(
+            a: torch.Tensor,
+            b: torch.Tensor,
+            c: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            t = a.size(0)
+            ha = hl.specialize(a.shape[1])
+            hc = hl.specialize(c.shape[1])
+            hmax = hl.specialize(max(a.shape[1], c.shape[1]))
+            da = hl.specialize(a.shape[2])
+            db = hl.specialize(b.shape[2])
+            dc = hl.specialize(c.shape[2])
+
+            out_a = torch.empty_like(a, dtype=torch.float32)
+            out_b = torch.empty_like(b, dtype=torch.float32)
+            out_c = torch.empty_like(c, dtype=torch.float32)
+
+            for pid, tile_t, tile_h in hl.grid([3, t, hmax]):
+                if pid == 0:
+                    if tile_h < ha:
+                        a_offsets = hl.arange(0, da)
+                        a_vals = a[tile_t, tile_h, a_offsets].to(torch.float32)
+                        a_scale = torch.rsqrt(
+                            torch.sum(a_vals * a_vals, dim=-1) / da + 1.0e-6
+                        )
+                        out_a[tile_t, tile_h, a_offsets] = a_vals * a_scale
+                elif pid == 1:
+                    if tile_h < ha:
+                        b_offsets = hl.arange(0, db)
+                        b_vals = b[tile_t, tile_h, b_offsets].to(torch.float32)
+                        b_scale = torch.amax(torch.abs(b_vals), dim=-1)
+                        out_b[tile_t, tile_h, b_offsets] = b_vals / b_scale
+                elif pid == 2:
+                    if tile_h < hc:
+                        c_offsets = hl.arange(0, dc)
+                        c_vals = c[tile_t, tile_h, c_offsets].to(torch.float32)
+                        out_c[tile_t, tile_h, c_offsets] = c_vals + 1.0
+            return out_a, out_b, out_c
+
+        t, ha, hc = 4, 8, 12
+        da, db, dc = 32, 64, 16
+        a = torch.randn(t, ha, da, device=DEVICE, dtype=torch.bfloat16)
+        b = torch.randn(t, ha, db, device=DEVICE, dtype=torch.bfloat16)
+        c = torch.randn(t, hc, dc, device=DEVICE, dtype=torch.bfloat16)
+
+        code, result = code_and_output(fn, (a, b, c))
+        a_ref = a.float()
+        a_scale = torch.rsqrt(
+            torch.sum(a_ref * a_ref, dim=-1, keepdim=True) / da + 1.0e-6
+        )
+        b_ref = b.float()
+        b_scale = torch.amax(torch.abs(b_ref), dim=-1, keepdim=True)
+        expected = (a_ref * a_scale, b_ref / b_scale, c.float() + 1.0)
+        for actual, expected_tensor in zip(result, expected, strict=True):
+            torch.testing.assert_close(
+                actual, expected_tensor, rtol=1.0e-2, atol=1.0e-2
+            )
+
+    # TODO(shangdiy): This currently fails after reduction rolling because
+    # keepdim=True lowers through a scalar reshape that Triton rejects with:
+    # "'dtype' object has no attribute 'numel'".
+    # def test_grid_if_reduction_keepdim_true_xfail(self):
+    #     @helion.kernel(static_shapes=False)
+    #     def fn(x: torch.Tensor) -> torch.Tensor:
+    #         out = torch.empty_like(x, dtype=torch.float32)
+    #         n = x.size(0)
+    #         d = hl.specialize(x.shape[1])
+    #         for pid, row in hl.grid([2, n]):
+    #             if pid == 0:
+    #                 offsets = hl.arange(0, d)
+    #                 vals = x[row, offsets].to(torch.float32)
+    #                 scale = torch.sum(vals * vals, dim=-1, keepdim=True)
+    #                 out[row, offsets] = vals / scale
+    #         return out
+    #
+    #     x = torch.randn(4, 32, device=DEVICE, dtype=torch.bfloat16)
+    #     code_and_output(fn, (x,))
 
     @skipIfPallas("tensor gather indexing not supported on Pallas")
     def test_optional_tensor_is_none_constexpr(self):

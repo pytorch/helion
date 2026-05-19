@@ -106,6 +106,68 @@ def _load_mask_expr(
     return "*".join(mask_exprs)
 
 
+def sliced_value_for_store(
+    state: CodegenState,
+    tensor: torch.Tensor,
+    subscript: list[object] | tuple[object, ...],
+    index_parts: list[str],
+    value: ast.AST,
+) -> ast.AST:
+    """Slice the store value when the Pallas ref is smaller than the tile.
+
+    The launcher clamps each BlockSpec dimension to
+    ``min(block_size, tensor.shape[d])``.  When ``block_size > dim_size``
+    the kernel ref is ``dim_size``-shaped but the computed value is
+    ``block_size``-shaped, so we must slice the value before storing.
+
+    This only applies to grid-tiled dimensions that produce ``:`` in the
+    generated Pallas index.  Dimensions indexed via ``pl.ds()`` are padded
+    instead of clamped, so they must keep their full block-size value.
+    """
+    from helion._compiler.compile_environment import CompileEnvironment
+    from helion._compiler.pallas.plan_tiling import TilePattern
+
+    assert state.fx_node is not None
+    patterns = state.fx_node.meta.get("indexing_patterns")
+    if patterns is None:
+        return value
+
+    env = CompileEnvironment.current()
+    slices: list[str] = []
+    needs_slice = False
+    tensor_dim = 0
+
+    index_part_idx = 0
+    for idx, pattern in zip(subscript, patterns, strict=True):
+        if idx is None:
+            continue
+
+        value_slice = ":"
+        index_part = index_parts[index_part_idx]
+        index_part_idx += 1
+        if isinstance(pattern, TilePattern) and index_part == ":":
+            block_size = env.block_sizes[pattern.block_id].from_config(state.config)
+            dim_size = tensor.shape[tensor_dim]
+            if (
+                isinstance(block_size, int)
+                and isinstance(dim_size, int)
+                and dim_size < block_size
+            ):
+                value_slice = f":{dim_size}"
+                needs_slice = True
+
+        slices.append(value_slice)
+        tensor_dim += 1
+
+    if not needs_slice:
+        return value
+
+    return expr_from_string(
+        f"{{value}}[{', '.join(slices)}]",
+        value=value,
+    )
+
+
 def _tile_needs_mask(
     state: CodegenState,
     block_id: int,
@@ -153,6 +215,15 @@ def index_str(
     subscript: list[object] | tuple[object, ...],
     tensor: torch.Tensor,
 ) -> tuple[str, list[int]]:
+    parts, none_dims = index_parts(state, subscript, tensor)
+    return ", ".join(parts), none_dims
+
+
+def index_parts(
+    state: CodegenState,
+    subscript: list[object] | tuple[object, ...],
+    tensor: torch.Tensor,
+) -> tuple[list[str], list[int]]:
     """Build a JAX/Pallas index string from a Helion subscript list.
 
     Uses ``pl.ds(offset, block_size)`` only for dimensions inside a looped
@@ -171,7 +242,7 @@ def index_str(
     from helion._compiler.tile_strategy import ForiLoopState
 
     if not subscript:
-        return "...", []
+        return ["..."], []
 
     # Check if we're inside an emit_pipeline or fori_loop that pipelines
     # this specific tensor.  Both loop types take a per-tensor decision:
@@ -214,7 +285,7 @@ def index_str(
         out_pos += 1
         tensor_dim += 1
 
-    return ", ".join(parts), none_dims
+    return parts, none_dims
 
 
 def _get_indexing_patterns(state: CodegenState, tensor: torch.Tensor) -> list[object]:
