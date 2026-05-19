@@ -57,7 +57,9 @@ from helion._compiler.cute.cute_mma import _emit_sched_pipeline_setup
 from helion._compiler.cute.cute_mma import _get_mma_k_loop_info
 from helion._compiler.cute.cute_mma import _InitialPrefetchTmaArgs
 from helion._compiler.cute.cute_mma import _make_tcgen05_layout_plan_setup
+from helion._compiler.cute.cute_mma import _mma_epi_tidx_expr
 from helion._compiler.cute.cute_mma import _mma_result_can_be_deferred
+from helion._compiler.cute.cute_mma import _MmaRoleCoordinatePlan
 from helion._compiler.cute.cute_mma import _new_tcgen05_layout_plan
 from helion._compiler.cute.cute_mma import _new_tcgen05_sched_pipeline_plan
 from helion._compiler.cute.cute_mma import _PerKiterTmaArgs
@@ -162,6 +164,9 @@ from helion._compiler.cute.tcgen05_constants import (
 )
 from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_EPILOGUE_LAYOUT_SPLIT_FIRST_T2R,
+)
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY,
 )
 from helion._compiler.cute.tcgen05_constants import TCGEN05_LARGE_BN_PROOF_BLOCK_SIZES
 from helion._compiler.cute.tcgen05_constants import TCGEN05_LARGE_BN_PROOF_CLUSTER_M
@@ -2348,6 +2353,157 @@ class TestCuteLowerings(unittest.TestCase):
             r"for tile_offset_\d+ in range\("
             r"cutlass\.Int32\(0\), cutlass\.Int32\(128\), ",
         )
+
+    def test_tcgen05_flat_role_coordinates_guarded_codegen(self) -> None:
+        args = (
+            torch.empty([256, 128], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([128, 256], device=DEVICE, dtype=torch.bfloat16),
+        )
+        cfg = _make_tcgen05_role_local_monolithic_seed_config(
+            block_sizes=[256, 256, 64],
+            l2_groupings=[1],
+            pid_type="persistent_interleaved",
+            tcgen05_cluster_m=2,
+            tcgen05_cluster_n=1,
+            tcgen05_ab_stages=2,
+            tcgen05_acc_stages=2,
+            tcgen05_c_stages=2,
+            tcgen05_num_epi_warps=4,
+            **{
+                TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY: (
+                    Tcgen05LayoutStrategy.EXPLICIT_EPI_TILE.value
+                ),
+                TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_M_KEY: 128,
+                TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_N_KEY: 32,
+                TCGEN05_LAYOUT_OVERRIDES_D_STORE_BOX_N_KEY: 32,
+                TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY: True,
+            },
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_role_local_monolithic_4096_bf16.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            code = bound.to_triton_code(cfg)
+
+        self.assertIn("block=(256, 1, 1)", code)
+        self.assertIn(
+            "mma_tidx = tcgen05_lane_idx + tcgen05_warp_idx * cutlass.Int32(32)",
+            code,
+        )
+        self.assertIn(
+            "mma_active = tcgen05_warp_idx < cutlass.Int32(2)",
+            code,
+        )
+        self.assertIn(
+            "tcgen05_exec_active = tcgen05_warp_idx == cutlass.Int32(4)", code
+        )
+        self.assertIn("tcgen05_tma_warp = tcgen05_warp_idx == cutlass.Int32(5)", code)
+        self.assertNotIn("cute.arch.thread_idx()[1]", code)
+
+    def test_tcgen05_flat_role_coordinates_rejects_non_guarded_shape(self) -> None:
+        args = (
+            torch.empty([256, 128], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([128, 256], device=DEVICE, dtype=torch.bfloat16),
+        )
+        cfg = _make_tcgen05_role_local_monolithic_seed_config(
+            block_sizes=[256, 256, 128],
+            l2_groupings=[1],
+            pid_type="persistent_interleaved",
+            tcgen05_cluster_m=2,
+            tcgen05_cluster_n=1,
+            tcgen05_ab_stages=2,
+            tcgen05_acc_stages=2,
+            tcgen05_c_stages=2,
+            tcgen05_num_epi_warps=4,
+            **{
+                TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY: (
+                    Tcgen05LayoutStrategy.EXPLICIT_EPI_TILE.value
+                ),
+                TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_M_KEY: 128,
+                TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_N_KEY: 32,
+                TCGEN05_LAYOUT_OVERRIDES_D_STORE_BOX_N_KEY: 32,
+                TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY: True,
+            },
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_role_local_monolithic_4096_bf16.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            with self.assertRaisesRegex(
+                exc.BackendUnsupported,
+                TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY,
+            ):
+                bound.to_triton_code(cfg)
+
+    def test_tcgen05_flat_role_coordinates_rejects_non_tcgen05_fallback(self) -> None:
+        args = (
+            torch.empty([256, 128], device=DEVICE, dtype=torch.float32),
+            torch.empty([128, 256], device=DEVICE, dtype=torch.float32),
+        )
+        cfg = _make_tcgen05_role_local_monolithic_seed_config(
+            block_sizes=[256, 256, 64],
+            l2_groupings=[2],
+            pid_type="persistent_interleaved",
+            tcgen05_cluster_m=2,
+            tcgen05_cluster_n=1,
+            tcgen05_ab_stages=2,
+            tcgen05_acc_stages=2,
+            tcgen05_c_stages=2,
+            tcgen05_num_epi_warps=4,
+            **{
+                TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY: (
+                    Tcgen05LayoutStrategy.EXPLICIT_EPI_TILE.value
+                ),
+                TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_M_KEY: 128,
+                TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_N_KEY: 32,
+                TCGEN05_LAYOUT_OVERRIDES_D_STORE_BOX_N_KEY: 32,
+                TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY: True,
+            },
+        )
+        bound = cute_matmul_role_local_monolithic_4096_bf16.bind(args)
+        bound.env.config_spec.cute_tcgen05_search_enabled = True
+        with self.assertRaisesRegex(
+            exc.BackendUnsupported,
+            r"requires active-K-loop tcgen05 MMA lowering",
+        ):
+            bound.to_triton_code(cfg)
+
+    def test_tcgen05_flat_role_coordinates_runtime_correctness(self) -> None:
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+
+        torch.manual_seed(0)
+        args = (
+            torch.randn(256, 128, device=DEVICE, dtype=torch.bfloat16),
+            torch.randn(128, 256, device=DEVICE, dtype=torch.bfloat16),
+        )
+        cfg = _make_tcgen05_role_local_monolithic_seed_config(
+            block_sizes=[256, 256, 64],
+            l2_groupings=[1],
+            pid_type="persistent_interleaved",
+            tcgen05_cluster_m=2,
+            tcgen05_cluster_n=1,
+            tcgen05_ab_stages=2,
+            tcgen05_acc_stages=2,
+            tcgen05_c_stages=2,
+            tcgen05_num_epi_warps=4,
+            **{
+                TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY: (
+                    Tcgen05LayoutStrategy.EXPLICIT_EPI_TILE.value
+                ),
+                TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_M_KEY: 128,
+                TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_N_KEY: 32,
+                TCGEN05_LAYOUT_OVERRIDES_D_STORE_BOX_N_KEY: 32,
+                TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY: True,
+            },
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_role_local_monolithic_4096_bf16.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            bound.set_config(cfg)
+            out = bound(*args)
+
+        torch.testing.assert_close(out, args[0] @ args[1], atol=2e-1, rtol=1e-2)
 
     def test_tcgen05_explicit_epilogue_tile_rejects_unsupported_shape(self) -> None:
         args = (
@@ -9638,6 +9794,39 @@ class TestCuteLowerings(unittest.TestCase):
         )
         self.assertIn("block=(128, 2, 1)", code)
 
+    def test_mma_role_coordinate_plan_exprs(
+        self,
+    ) -> None:
+        plan = _MmaRoleCoordinatePlan(
+            mma_m_coord="cutlass.Int32(cute.arch.thread_idx()[0])",
+            mma_n_coord="cutlass.Int32(cute.arch.thread_idx()[1])",
+            mma_m_thread_extent=32,
+            mma_active_n_threads=2,
+        )
+
+        self.assertEqual(
+            ast.unparse(expr_from_string(plan.mma_tidx_expr())),
+            "cutlass.Int32(cute.arch.thread_idx()[0]) + "
+            "cutlass.Int32(cute.arch.thread_idx()[1]) * cutlass.Int32(32)",
+        )
+        self.assertEqual(
+            ast.unparse(expr_from_string(plan.mma_active_expr())),
+            "cutlass.Int32(cute.arch.thread_idx()[1]) < cutlass.Int32(2)",
+        )
+        self.assertEqual(
+            ast.unparse(
+                expr_from_string(
+                    _mma_epi_tidx_expr(
+                        lane_idx="tcgen05_lane_idx",
+                        warp_idx="tcgen05_warp_idx",
+                        epi_active="tcgen05_epi_active",
+                    )
+                )
+            ),
+            "tcgen05_lane_idx + tcgen05_warp_idx * cutlass.Int32(32) "
+            "if tcgen05_epi_active else cutlass.Int32(0)",
+        )
+
     def test_tcgen05_wrapper_plan_tracks_ab_stage_count(self) -> None:
         @helion.kernel(backend="cute")
         def cute_matmul_mma_codegen_only(
@@ -10267,6 +10456,66 @@ class TestCuteLowerings(unittest.TestCase):
                 return_value=ast.Name(id="dot_result", ctx=ast.Load()),
             ) as emit,
             self.assertRaisesRegex(exc.BackendUnsupported, "hl.dot"),
+        ):
+            hl.dot._codegen["cute"](state)
+
+        emit.assert_not_called()
+
+    def test_codegen_cute_dot_rejects_flat_role_coordinates_fallback(self) -> None:
+        graph = Graph()
+        lhs = graph.placeholder("lhs")
+        rhs = graph.placeholder("rhs")
+        dot_node = graph.call_function(hl.dot, args=(lhs, rhs, None, None))
+        graph.output(dot_node)
+        lhs.meta["val"] = torch.empty(4, 8, dtype=torch.float16)
+        rhs.meta["val"] = torch.empty(8, 4, dtype=torch.float16)
+        dot_node.meta["val"] = torch.empty(4, 4, dtype=torch.float32)
+
+        mode = FakeTensorMode()
+        fake_lhs = mode.from_tensor(torch.empty(4, 8, dtype=torch.float16))
+        fake_rhs = mode.from_tensor(torch.empty(8, 4, dtype=torch.float16))
+        state = SimpleNamespace(
+            proxy_args=[fake_lhs, fake_rhs, None, None],
+            ast_args=[
+                ast.Name(id="lhs_tile", ctx=ast.Load()),
+                ast.Name(id="rhs_tile", ctx=ast.Load()),
+                ast.Constant(value=None),
+                None,
+            ],
+            ast_arg=lambda idx: (
+                ast.Name(id="lhs_tile", ctx=ast.Load())
+                if idx == 0
+                else ast.Name(id="rhs_tile", ctx=ast.Load())
+                if idx == 1
+                else ast.Constant(value=None)
+            ),
+            fx_node=dot_node,
+            codegen=SimpleNamespace(current_grid_state=None, active_device_loops={}),
+            device_function=SimpleNamespace(
+                config={TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY: True}
+            ),
+            env={},
+        )
+        env = SimpleNamespace(resolve_block_id=lambda size: None)
+
+        with (
+            patch.object(CompileEnvironment, "current", return_value=env),
+            patch(
+                "helion.language.matmul_ops.cute_static_k_invariant_extent",
+                return_value=8,
+            ),
+            patch(
+                "helion.language.matmul_ops._cute_mma_matches_dot_semantics",
+                return_value=False,
+            ),
+            patch(
+                "helion.language.matmul_ops._emit_cute_matmul",
+                return_value=ast.Name(id="dot_result", ctx=ast.Load()),
+            ) as emit,
+            self.assertRaisesRegex(
+                exc.BackendUnsupported,
+                TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY,
+            ),
         ):
             hl.dot._codegen["cute"](state)
 

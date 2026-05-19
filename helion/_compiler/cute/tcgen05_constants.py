@@ -277,6 +277,9 @@ TCGEN05_CUBIN_LINEINFO_CONFIG_KEY = "tcgen05_cubin_lineinfo"
 # smallest larger-BN tcgen05 codegen candidate without broadening production
 # selector/search defaults.
 TCGEN05_LARGE_BN_PROOF_CONFIG_KEY = "tcgen05_large_bn_proof"
+# Diagnostic Target1 topology probe: keep role predicates warp-based while
+# deriving logical MMA coordinates from flat threadIdx.x / warp / lane values.
+TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY = "tcgen05_flat_role_coordinates"
 TCGEN05_LARGE_BN_PROOF_PROBLEM_SHAPE = (64, 512, 16)
 TCGEN05_LARGE_BN_PROOF_BLOCK_SIZES = (64, 512, 16)
 TCGEN05_LARGE_BN_PROOF_CLUSTER_M = 1

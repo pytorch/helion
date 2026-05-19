@@ -80,6 +80,7 @@ from .tcgen05_constants import TCGEN05_ACC_PRODUCER_MODE_SKIP_UMMA
 from .tcgen05_constants import TCGEN05_AUX_LOAD_MODE_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_AUX_LOAD_MODE_TMA
 from .tcgen05_constants import TCGEN05_CLUSTER_M2_ONE_CTA_ROLE_LOCAL_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_BLOCK_SIZES
 from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_CLUSTER_M
 from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_CONFIG_KEY
@@ -673,6 +674,64 @@ def _grid_thread_extent(cg: GenerateAST, block_id: int) -> int:
     if thread_axis is None:
         return 1
     return grid_state.thread_axis_sizes.get(thread_axis, 1)
+
+
+@dataclass(frozen=True)
+class _MmaRoleCoordinatePlan:
+    """Logical MMA/role coordinates for the current CUDA launch topology."""
+
+    mma_m_coord: str
+    mma_n_coord: str
+    mma_m_thread_extent: int
+    mma_active_n_threads: int
+
+    def mma_tidx_expr(self) -> str:
+        return (
+            f"{self.mma_m_coord} + "
+            f"({self.mma_n_coord}) * cutlass.Int32({self.mma_m_thread_extent})"
+        )
+
+    def mma_active_expr(self) -> str:
+        return f"({self.mma_n_coord}) < cutlass.Int32({self.mma_active_n_threads})"
+
+
+def _mma_epi_tidx_expr(*, lane_idx: str, warp_idx: str, epi_active: str) -> str:
+    return (
+        f"{lane_idx} + {warp_idx} * cutlass.Int32(32) "
+        f"if {epi_active} else cutlass.Int32(0)"
+    )
+
+
+def _block_axis_mma_role_coordinate_plan(
+    cg: GenerateAST,
+    *,
+    m_block_id: int,
+    n_block_id: int,
+    mma_m_thread_extent: int,
+    mma_active_n_threads: int,
+) -> _MmaRoleCoordinatePlan:
+    """Return the current block-axis-backed MMA role-coordinate plan."""
+    return _MmaRoleCoordinatePlan(
+        mma_m_coord=_physical_mma_coord_expr(cg, m_block_id),
+        mma_n_coord=_physical_mma_coord_expr(cg, n_block_id),
+        mma_m_thread_extent=mma_m_thread_extent,
+        mma_active_n_threads=mma_active_n_threads,
+    )
+
+
+def _flat_mma_role_coordinate_plan(
+    *,
+    lane_idx: str,
+    warp_idx: str,
+    mma_active_n_threads: int,
+) -> _MmaRoleCoordinatePlan:
+    """Return logical MMA coordinates derived from a flat 8-warp launch."""
+    return _MmaRoleCoordinatePlan(
+        mma_m_coord=lane_idx,
+        mma_n_coord=warp_idx,
+        mma_m_thread_extent=32,
+        mma_active_n_threads=mma_active_n_threads,
+    )
 
 
 def _grid_cta_thread_count(cg: GenerateAST) -> int:
@@ -1873,6 +1932,15 @@ def _emit_mma_pipeline(
         mma_impl = "universal"
     if mma_impl != "universal" and zero_acc_expr:
         acc_expr = None
+    tcgen05_requested_flat_role_coordinates = bool(
+        df.config.get(TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY, False)
+    )
+    if tcgen05_requested_flat_role_coordinates and mma_impl != "tcgen05":
+        raise exc.BackendUnsupported(
+            "cute",
+            f"{TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY}=True requires "
+            "tcgen05 MMA codegen",
+        )
     tcgen05_pid_is_persistent = _is_persistent_pid_config(df.config)
     tcgen05_requested_two_cta = _tcgen05_use_2cta_instrs(
         bm=bm, cluster_m=tcgen05_cluster_m
@@ -2603,6 +2671,7 @@ def _emit_mma_pipeline(
     tcgen05_explicit_epi_tile_m: int | None = None
     tcgen05_explicit_epi_tile_n: int | None = None
     tcgen05_explicit_d_store_box_n: int | None = None
+    tcgen05_use_flat_role_coordinates = False
     if mma_impl == "tcgen05":
         # Use ``warp_spec.ab_load_warps`` so the strategy data model
         # stays the source of truth for warp role IDs; ``epi_warps``
@@ -2783,6 +2852,7 @@ def _emit_mma_pipeline(
                 tcgen05_explicit_d_store_box_n,
             )
         )
+        tcgen05_use_flat_role_coordinates = tcgen05_requested_flat_role_coordinates
         if explicit_epi_tile_requested:
             if not (
                 tcgen05_static_full_tiles
@@ -2810,6 +2880,36 @@ def _emit_mma_pipeline(
                     f"{_TCGEN05_EXPLICIT_EPI_TILE_VALIDATED_SHAPE[:2]} "
                     "and d_store_box_n="
                     f"{_TCGEN05_EXPLICIT_EPI_TILE_VALIDATED_SHAPE[2]}",
+                )
+        if tcgen05_use_flat_role_coordinates:
+            if not (
+                explicit_epi_tile_requested
+                and (
+                    tcgen05_explicit_epi_tile_m,
+                    tcgen05_explicit_epi_tile_n,
+                    tcgen05_explicit_d_store_box_n,
+                )
+                == _TCGEN05_EXPLICIT_EPI_TILE_VALIDATED_SHAPE
+                and tcgen05_static_full_tiles
+                and tcgen05_is_two_cta
+                and tcgen05_cluster_n == 1
+                and bm == TCGEN05_TWO_CTA_BLOCK_M
+                and bn == TCGEN05_TWO_CTA_BLOCK_N
+                and bk == 64
+                and input_dtype == torch.bfloat16
+                and epi_elem_dtype_str == "cutlass.BFloat16"
+                and not aux_tensor_descriptors_value
+                and tcgen05_use_tma_store_epilogue
+                and tcgen05_warp_spec.scheduler_warps == 0
+                and tcgen05_warp_spec.c_input_warps == 0
+                and tcgen05_warp_spec.ab_load_warps == 1
+                and tcgen05_warp_spec.epi_warps == 4
+            ):
+                raise exc.BackendUnsupported(
+                    "cute",
+                    f"{TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY}=True requires "
+                    "the guarded static-full bf16 pure matmul CtaGroup.TWO "
+                    "256x256x64 explicit-epilogue-tile path",
                 )
         tcgen05_matmul_plan = CuteTcgen05MatmulPlan(
             bm=bm,
@@ -2842,6 +2942,9 @@ def _emit_mma_pipeline(
             l2_swizzle_size=tcgen05_l2_swizzle_size_value,
             tma_store_full_tiles_only=tcgen05_tma_store_full_tiles_only,
             aux_tensor_descriptors=aux_tensor_descriptors_value,
+            flat_role_launch_warp_count=8
+            if tcgen05_use_flat_role_coordinates
+            else None,
         )
         assert tcgen05_plan is not None
         tcgen05_mma_owner_active = _tcgen05_two_cta_owner_predicate(
@@ -2949,11 +3052,23 @@ def _emit_mma_pipeline(
             )
         )
         prefix.append(statement_from_string(f"{lane_idx} = cute.arch.lane_idx()"))
+        if tcgen05_use_flat_role_coordinates:
+            mma_role_coordinates = _flat_mma_role_coordinate_plan(
+                lane_idx=lane_idx,
+                warp_idx=warp_idx,
+                mma_active_n_threads=mma_phys_n,
+            )
+        else:
+            mma_role_coordinates = _block_axis_mma_role_coordinate_plan(
+                cg,
+                m_block_id=m_block_id,
+                n_block_id=n_block_id,
+                mma_m_thread_extent=mma_physical_m_threads,
+                mma_active_n_threads=mma_phys_n,
+            )
         prefix.append(
             statement_from_string(
-                f"{mma_participant_linear} = "
-                f"{_physical_mma_coord_expr(cg, m_block_id)} + "
-                f"({n_physical}) * cutlass.Int32({mma_physical_m_threads})"
+                f"{mma_participant_linear} = {mma_role_coordinates.mma_tidx_expr()}"
             )
         )
         prefix.append(
@@ -2968,7 +3083,7 @@ def _emit_mma_pipeline(
         )
         prefix.append(
             statement_from_string(
-                f"{mma_active} = ({n_physical}) < cutlass.Int32({mma_phys_n})"
+                f"{mma_active} = {mma_role_coordinates.mma_active_expr()}"
             )
         )
         if mma_impl == "tcgen05":
@@ -2998,8 +3113,8 @@ def _emit_mma_pipeline(
             )
             prefix.append(
                 statement_from_string(
-                    f"{epi_tidx} = {lane_idx} + {warp_idx} * cutlass.Int32(32)"
-                    f" if {epi_active} else cutlass.Int32(0)"
+                    f"{epi_tidx} = "
+                    f"{_mma_epi_tidx_expr(lane_idx=lane_idx, warp_idx=warp_idx, epi_active=epi_active)}"
                 )
             )
             # Register reallocation: consumer warps (exec MMA + epilogue
@@ -3036,7 +3151,10 @@ def _emit_mma_pipeline(
             # consumers; exec joins the producer warpgroup (lower
             # register budget) so warpgroup 1 is uniformly
             # decrease.
-            if tcgen05_matmul_plan.has_scheduler_warp:
+            if (
+                tcgen05_matmul_plan.has_scheduler_warp
+                or tcgen05_use_flat_role_coordinates
+            ):
                 consumer_predicate = epi_active
             else:
                 consumer_predicate = f"{tcgen05_plan.exec_active} or {epi_active}"
