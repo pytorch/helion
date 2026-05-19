@@ -227,6 +227,22 @@ class TestReductions(RefEagerTestBase, TestCase):
         code, output = code_and_output(sum_kernel, args, block_size=1)
         torch.testing.assert_close(output, args[0].sum(-1), rtol=1e-04, atol=1e-04)
 
+    def test_keepdim_scalar_reduction_broadcast(self):
+        @helion.kernel(autotune_effort="none")
+        def center_by_tile_mean(x: torch.Tensor) -> torch.Tensor:
+            (n,) = x.size()
+            out = torch.empty([n], dtype=torch.float32, device=x.device)
+            for tile_n in hl.tile(n):
+                vals = x[tile_n].to(torch.float32)
+                mean = torch.mean(vals, dim=-1, keepdim=True)
+                out[tile_n] = vals - mean
+            return out
+
+        x = ((torch.arange(128, device=DEVICE) % 2) * 2).to(HALF_DTYPE)
+        _code, output = code_and_output(center_by_tile_mean, (x,), block_size=32)
+        expected = x.float() - 1.0
+        torch.testing.assert_close(output, expected, rtol=1e-3, atol=1e-3)
+
     @skipIfNotTriton("tensor_descriptor indexing is Triton-specific")
     @skipUnlessTensorDescriptor("Tensor descriptor support is required")
     def test_sum_keepdims(self):

@@ -413,25 +413,26 @@ class TestControlFlow(RefEagerTestBase, TestCase):
                 actual, expected_tensor, rtol=1.0e-2, atol=1.0e-2
             )
 
-    # TODO(shangdiy): This currently fails after reduction rolling because
-    # keepdim=True lowers through a scalar reshape that Triton rejects with:
-    # "'dtype' object has no attribute 'numel'".
-    # def test_grid_if_reduction_keepdim_true_xfail(self):
-    #     @helion.kernel(static_shapes=False)
-    #     def fn(x: torch.Tensor) -> torch.Tensor:
-    #         out = torch.empty_like(x, dtype=torch.float32)
-    #         n = x.size(0)
-    #         d = hl.specialize(x.shape[1])
-    #         for pid, row in hl.grid([2, n]):
-    #             if pid == 0:
-    #                 offsets = hl.arange(0, d)
-    #                 vals = x[row, offsets].to(torch.float32)
-    #                 scale = torch.sum(vals * vals, dim=-1, keepdim=True)
-    #                 out[row, offsets] = vals / scale
-    #         return out
-    #
-    #     x = torch.randn(4, 32, device=DEVICE, dtype=torch.bfloat16)
-    #     code_and_output(fn, (x,))
+    @skipIfPallas("Pallas gather supports only dim-0 indirect indexing")
+    @skipIfCute("Cute requires hl.arange() to use an active tile/reduction axis")
+    def test_grid_if_reduction_keepdim_true(self):
+        @helion.kernel(static_shapes=False)
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x, dtype=torch.float32)
+            n = x.size(0)
+            d = hl.specialize(x.shape[1])
+            for pid, row in hl.grid([2, n]):
+                if pid == 0:
+                    offsets = hl.arange(0, d)
+                    vals = x[row, offsets].to(torch.float32)
+                    scale = torch.sum(vals * vals, dim=-1, keepdim=True)
+                    out[row, offsets] = vals / scale
+            return out
+
+        x = torch.randn(4, 32, device=DEVICE, dtype=torch.bfloat16)
+        _, output = code_and_output(fn, (x,))
+        expected = x.float() / torch.sum(x.float() * x.float(), dim=-1, keepdim=True)
+        torch.testing.assert_close(output, expected, rtol=1e-4, atol=1e-4)
 
     @skipIfPallas("tensor gather indexing not supported on Pallas")
     def test_optional_tensor_is_none_constexpr(self):
