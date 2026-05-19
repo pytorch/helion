@@ -153,7 +153,7 @@
       "runner": "linux.2xlarge",
       "python-version": "3.12",
       "ref-eager": false,
-      "image": "",
+      "image": "ubuntu:24.04",
       "runtime-version": "cpu",
       "container-options": "",
       "pytorch-version": "pytorch-nightly",
