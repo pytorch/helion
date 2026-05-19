@@ -56,18 +56,29 @@ def get_expected_kernels_per_platform(workflow_path):
     """
     try:
         with open(workflow_path) as f:
-            text = f.read()
+            lines = f.readlines()
     except OSError:
         return {}
-    # Match e.g. `      kernels_cute:\n        ...\n        default: "<csv>"`
-    pat = re.compile(
-        r"^\s+(kernels\w*):\s*\n(?:\s+.*\n)*?\s+default:\s*\"([^\"]*)\"",
-        re.MULTILINE,
-    )
-    input_defaults = {
-        m.group(1): {k.strip() for k in m.group(2).split(",") if k.strip()}
-        for m in pat.finditer(text)
-    }
+    # Line-by-line scan: when we see a `<indent>kernels<name>:` line, the
+    # next `<indent>default: "<csv>"` line below it is its default. Avoids
+    # a multi-line regex that CodeQL flags for catastrophic backtracking.
+    input_header = re.compile(r"^\s+(kernels\w*):\s*$")
+    input_default = re.compile(r'^\s+default:\s*"([^"]*)"\s*$')
+    input_defaults = {}
+    current = None
+    for line in lines:
+        m = input_header.match(line)
+        if m:
+            current = m.group(1)
+            continue
+        if current is None:
+            continue
+        md = input_default.match(line)
+        if md:
+            input_defaults[current] = {
+                k.strip() for k in md.group(1).split(",") if k.strip()
+            }
+            current = None
     return {
         plat: input_defaults[input_name]
         for plat, input_name in _PLATFORM_KERNELS_INPUT.items()
