@@ -39,7 +39,7 @@ on:
         description: 'Comma-separated list of kernels to benchmark on TPU (examples-based; disjoint from `kernels`). Default is the dashboard-tracked subset; pass an explicit list, or `all` to run every kernel registered in benchmarks/run_tpu.py::KERNEL_MAPPINGS.'
         required: false
         type: string
-        default: "flash_attention,bmm,gemm,welford,softmax,layer_norm,rms_norm,rms_norm-bwd,cross_entropy"
+        default: "flash_attention,bmm,gemm,welford,softmax,layer_norm,rms_norm,rms_norm-bwd,cross_entropy,kl_div"
       kernels_cute:
         description: 'Comma-separated list of kernels to benchmark on B200 with HELION_BACKEND=cute. Defaults to the CuTe-capable TritonBench subset.'
         required: false

@@ -762,6 +762,32 @@ def _epilogue_subtiling_shapes(
     return out
 
 
+def _kl_div_baseline(y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
+    # Mirrors test_kl_div: y_pred is in log-space, y_true is probabilities,
+    # reduction is batchmean.
+    return torch.nn.functional.kl_div(
+        y_pred, y_true, reduction="batchmean", log_target=False
+    )
+
+
+def _kl_div_shapes(
+    num_shapes: int | None = None,
+) -> list[tuple[str, tuple[Any, ...]]]:
+    # (BT, V) — matches the test's canonical shape; second is a larger
+    # LLM-style vocab.
+    configs = [(1024, 4096), (2048, 32000)]
+    if num_shapes is not None:
+        configs = configs[:num_shapes]
+    out: list[tuple[str, tuple[Any, ...]]] = []
+    for bt, v in configs:
+        y_pred = torch.randn(bt, v, device=DEVICE, dtype=torch.float32).log_softmax(
+            dim=-1
+        )
+        y_true = torch.randn(bt, v, device=DEVICE, dtype=torch.float32).softmax(dim=-1)
+        out.append((f"[{bt},{v}]", (y_pred, y_true)))
+    return out
+
+
 # Kernel mappings for TPU/Pallas benchmarks.
 # Format: kernel_name -> (module_file, kernel_fn_name, baseline_fn, shapes_fn,
 #                         max_mismatch_pct)
@@ -942,6 +968,13 @@ KERNEL_MAPPINGS: dict[str, KernelMapping] = {
         "squeeze_and_excitation_net_fwd",
         _squeeze_and_excitation_net_baseline,
         _squeeze_and_excitation_net_shapes,
+        None,
+    ),
+    "kl_div": (
+        "kl_div",
+        "kl_div_forward",
+        _kl_div_baseline,
+        _kl_div_shapes,
         None,
     ),
     # Use the JSD-only inner kernel (test-covered on Pallas). The example's
