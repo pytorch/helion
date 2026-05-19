@@ -2682,5 +2682,23 @@ class TestPallasIndirectGather(TestCase):
         torch.testing.assert_close(result, ref, rtol=1e-2, atol=1e-2)
 
 
+class TestPallasPrinter(TestCase):
+    def test_pallas_texpr_mod(self) -> None:
+        """pallas_texpr must handle Mod/PythonMod/FloorDiv (used by bh % heads)."""
+        import sympy
+        from torch.utils._sympy.functions import FloorDiv
+        from torch.utils._sympy.functions import PythonMod
+
+        from helion._compiler.device_function import pallas_texpr
+
+        x, y = sympy.symbols("x y")
+        self.assertEqual(pallas_texpr(PythonMod(x, y)), "(x % y)")
+        self.assertEqual(pallas_texpr(FloorDiv(x, y)), "(x // y)")
+        self.assertEqual(
+            pallas_texpr(FloorDiv(x, y) + PythonMod(x, y)),
+            "((x // y)) + ((x % y))",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
