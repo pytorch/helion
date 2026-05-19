@@ -35,7 +35,7 @@ def _under_xdist() -> bool:
 
 def _current_compute_capability() -> str | None:
     try:
-        return get_hardware_info().compute_capability
+        return get_hardware_info().compute_capability.split(":", 1)[0]
     except RuntimeError:
         return None
 
@@ -329,6 +329,12 @@ _EXPECTED_PERF: dict[str, dict[str, ExpectedPerf]] = {
         ),
     },
     "rope": {
+        "gfx950": ExpectedPerf(
+            helion_wins=7,
+            total=7,
+            geomean=5.0,
+            wins_slack=1,
+        ),
         "sm90": ExpectedPerf(
             helion_wins=7,
             total=7,
