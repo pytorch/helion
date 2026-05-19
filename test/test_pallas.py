@@ -1179,9 +1179,6 @@ class TestPallas(TestCase):
         ref = ref_outer_chain_scale(a, b)
         torch.testing.assert_close(result, ref, rtol=1e-2, atol=1e-2)
 
-    @xfailIfPallasInterpret(
-        "JAX interpret mode cannot discharge dynamic_slice with traced sizes",
-    )
     def test_attention_emit_pipeline_non_divisible(self) -> None:
         """Test emit_pipeline with seq_kv not divisible by block_k.
 
