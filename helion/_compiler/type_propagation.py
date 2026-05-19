@@ -1172,7 +1172,7 @@ def _detect_outer_block_bound(
         and begin_bid == end_bid
         and begin_sym is not None
         and end_sym is not None
-        and sympy.expand(expr - (end_sym - begin_sym)) == 0  # pyrefly: ignore[unsupported-operation]
+        and sympy.simplify(sympy.Add(expr, begin_sym, sympy.Mul(-1, end_sym))) == 0
     ):
         return begin_bid
     return None
