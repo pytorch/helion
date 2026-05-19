@@ -440,7 +440,19 @@ class IfGraphInfo(NodeArgsGraphInfo):
             body_stmts.append(ast.Pass())
         if len(orelse_stmts) == 0:
             orelse_stmts.append(ast.Pass())
-        return if_outputs + else_outputs
+
+        graph_info = state.get_graph(state.proxy_arg(1))
+        assert isinstance(graph_info, IfGraphInfo)
+
+        if_return_names, else_return_names = graph_info.get_branches_return_names(
+            state, if_outputs, else_outputs
+        )
+
+        return cast(
+            "list[object]",
+            [expr_from_string(n) for n in if_return_names]
+            + [expr_from_string(n) for n in else_return_names],
+        )
 
 
 @dataclasses.dataclass
@@ -1487,20 +1499,53 @@ class WalkDeviceAST(NodeVisitor):
             # pyrefly: ignore [bad-argument-type]
             *args_to_proxies(tracer, args),
         )
+
+        if_output_values = if_outputs.values
+        else_output_values = else_outputs.values
+
+        common_output_names = [n for n in if_output_values if n in else_output_values]
+        if_nonlocal_outputs_names = [
+            name
+            for name in if_output_values
+            if name not in common_output_names and name in self.scope
+        ]
+        else_nonlocal_output_names = [
+            name
+            for name in else_output_values
+            if name not in common_output_names and name in self.scope
+        ]
+
+        if_common_outputs = [if_output_values[name] for name in common_output_names]
+        if_nonlocal_outputs = [
+            if_output_values[name] for name in if_nonlocal_outputs_names
+        ]
+        if_unmodified_nonlocal_outputs = [
+            self.scope[name] for name in else_nonlocal_output_names
+        ]
+        else_common_outputs = [else_output_values[name] for name in common_output_names]
+        else_unmodified_nonlocal_outputs = [
+            self.scope[name] for name in if_nonlocal_outputs_names
+        ]
+        else_nonlocal_outputs = [
+            else_output_values[name] for name in else_nonlocal_output_names
+        ]
         proxy_tensor.track_tensor_tree(
-            if_outputs.get_tensor_args() + else_outputs.get_tensor_args(),
+            if_common_outputs
+            + if_nonlocal_outputs
+            + if_unmodified_nonlocal_outputs
+            + else_common_outputs
+            + else_unmodified_nonlocal_outputs
+            + else_nonlocal_outputs,
             proxy_out,
             constant=None,
             tracer=tracer,
         )
 
-        if_output_values = if_outputs.values
-        else_output_values = else_outputs.values
-        common_output_names = [n for n in if_output_values if n in else_output_values]
-
         # branches_outputs:  [(if_out_0, else_out_0), (if_out_1, else_out_1), ...]
         # where each output is either an index if the graph's output values,
-        # or a name of a nonlocal variable which the opposite branch writes to
+        # or a name of a nonlocal variable which the opposite branch writes to.
+        # Ordering: common -> if-only-nonlocal -> else-only-nonlocal,
+        # (i.e. same as ordering of values in track_tensor_tree above)
         if_graph.branches_outputs = []
 
         def get_output_idx(name: str, output_values: dict[str, object]) -> int:
@@ -1514,21 +1559,19 @@ class WalkDeviceAST(NodeVisitor):
             else_output_index = get_output_idx(name, else_output_values)
             if_graph.branches_outputs.append((if_output_index, else_output_index))
 
-        for name in if_output_values:
-            if name not in common_output_names and name in self.scope:
-                self.scope[name] = _tracing_ops._phi(
-                    self.scope[name], if_output_values[name]
-                )
-                if_output_index = get_output_idx(name, if_output_values)
-                if_graph.branches_outputs.append((if_output_index, name))
+        for name in if_nonlocal_outputs_names:
+            self.scope[name] = _tracing_ops._phi(
+                self.scope[name], if_output_values[name]
+            )
+            if_output_index = get_output_idx(name, if_output_values)
+            if_graph.branches_outputs.append((if_output_index, name))
 
-        for name in else_output_values:
-            if name not in common_output_names and name in self.scope:
-                self.scope[name] = _tracing_ops._phi(
-                    self.scope[name], else_output_values[name]
-                )
-                else_output_index = get_output_idx(name, else_output_values)
-                if_graph.branches_outputs.append((else_output_index, name))
+        for name in else_nonlocal_output_names:
+            self.scope[name] = _tracing_ops._phi(
+                self.scope[name], else_output_values[name]
+            )
+            else_output_index = get_output_idx(name, else_output_values)
+            if_graph.branches_outputs.append((name, else_output_index))
 
         return if_graph_idx
 
