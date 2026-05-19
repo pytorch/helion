@@ -110,9 +110,14 @@ else
     "nvidia-cutlass-dsl==$CUTE_VERSION"
 fi
 
+echo "==> Installing apache-tvm-ffi (required for tcgen05 TVM FFI launch)"
+"${PIP_INSTALL[@]}" apache-tvm-ffi
+
 echo "==> Verifying install"
 python -c "
 import cutlass
 version = getattr(cutlass, '__version__', None) or 'installed'
 print(f'nvidia-cutlass-dsl: {version}')
+import tvm_ffi
+print(f'apache-tvm-ffi: {getattr(tvm_ffi, \"__version__\", \"installed\")}')
 "

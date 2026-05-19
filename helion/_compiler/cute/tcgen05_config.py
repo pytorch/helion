@@ -15,6 +15,9 @@ from ...exc import InvalidConfig
 from ...runtime.config import Config
 from .strategies import ROLE_LOCAL_MONOLITHIC_DEFAULT_WARP_SPEC
 from .strategies import TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY
+from .strategies import TCGEN05_LAYOUT_OVERRIDES_D_STORE_BOX_N_KEY
+from .strategies import TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_M_KEY
+from .strategies import TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_N_KEY
 from .strategies import TCGEN05_LAYOUT_OVERRIDES_KEYS
 from .strategies import TCGEN05_LAYOUT_OVERRIDES_SWIZZLE_A_KEY
 from .strategies import TCGEN05_LAYOUT_OVERRIDES_SWIZZLE_B_KEY
@@ -90,6 +93,10 @@ from .tcgen05_constants import TCGEN05_SCHED_CONSUMER_WAIT_MODE_NORMAL
 from .tcgen05_constants import TCGEN05_SCHED_CONSUMER_WAIT_MODES
 from .tcgen05_constants import TCGEN05_SCHED_STAGE_COUNT_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_SCHED_STAGE_COUNTS
+from .tcgen05_constants import TCGEN05_TARGET1_TVM_FFI_AB_STAGES
+from .tcgen05_constants import TCGEN05_TARGET1_TVM_FFI_BLOCK_K
+from .tcgen05_constants import TCGEN05_TARGET1_TVM_FFI_SHAPE
+from .tcgen05_constants import TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
 from .tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
 from .tcgen05_constants import TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K
@@ -170,6 +177,7 @@ CUTE_TCGEN05_DIAGNOSTIC_CONFIG_KEYS: frozenset[str] = frozenset(
         TCGEN05_LARGE_BN_PROOF_CONFIG_KEY,
         TCGEN05_SCHED_CONSUMER_WAIT_MODE_CONFIG_KEY,
         TCGEN05_SCHED_STAGE_COUNT_CONFIG_KEY,
+        TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY,
     }
 )
 CUTE_TCGEN05_STRATEGY_CONFIG_KEYS: frozenset[str] = frozenset(
@@ -185,6 +193,8 @@ class CuteTcgen05Config:
         self.search_enabled: bool = False
         self.aux_kernel_detected: bool = False
         self.exact_shape_aux_kernel_detected: bool = False
+        self.identity_matmul_store_detected: bool = False
+        self.target1_tvm_ffi_seed_enabled: bool = False
         self.cluster_m_search_choices: tuple[int, ...] | None = None
         self.cluster_m2_search_constraints: Tcgen05ClusterM2SearchConstraints | None = (
             None
@@ -248,6 +258,24 @@ class CuteTcgen05Config:
             allow_edge_k_tail_family=allow_edge_k_tail_family,
         )
         self.restrict_cluster_m_search((1, 2))
+
+    def allow_target1_tvm_ffi_seed(self) -> None:
+        if not self.identity_matmul_store_detected:
+            return
+        if not self._has_target1_tvm_ffi_matmul_fact():
+            return
+        target_k = TCGEN05_TARGET1_TVM_FFI_SHAPE[2]
+        self.target1_tvm_ffi_seed_enabled = True
+        self.cluster_m2_search_constraints = Tcgen05ClusterM2SearchConstraints(
+            static_k=target_k,
+            max_k_tiles=TCGEN05_TWO_CTA_MAX_K_TILES,
+        )
+        self.cluster_m_search_choices = (1, 2)
+        if TCGEN05_TWO_CTA_SEED_PID_TYPE not in self.allowed_pid_types:
+            self.allowed_pid_types = (
+                *self.allowed_pid_types,
+                cast("PidTypeLiteral", TCGEN05_TWO_CTA_SEED_PID_TYPE),
+            )
 
     @staticmethod
     def cluster_m2_bk_is_valid(
@@ -499,8 +527,95 @@ class CuteTcgen05Config:
         seed_config["l2_groupings"] = [TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_L2_GROUPING]
         return Config(**seed_config)
 
+    def _has_target1_tvm_ffi_matmul_fact(self) -> bool:
+        target_m, target_n, target_k = TCGEN05_TARGET1_TVM_FFI_SHAPE
+        return any(
+            fact.static_m == target_m
+            and fact.static_n == target_n
+            and fact.static_k == target_k
+            and fact.lhs_dtype == torch.bfloat16
+            and fact.rhs_dtype == torch.bfloat16
+            for fact in self.config_spec.matmul_facts
+        )
+
+    def _target1_tvm_ffi_seed_config(self) -> Config | None:
+        if not self.target1_tvm_ffi_seed_enabled:
+            return None
+        if self.aux_kernel_detected:
+            return None
+        if not self.identity_matmul_store_detected:
+            return None
+        if not self._has_target1_tvm_ffi_matmul_fact():
+            return None
+        constraints = self.cluster_m2_search_constraints
+        if constraints is None or constraints.allow_edge_k_tail_family:
+            return None
+        if TCGEN05_TWO_CTA_SEED_PID_TYPE not in self.allowed_pid_types:
+            return None
+        if len(self.config_spec.block_sizes) != 3:
+            return None
+        if self.config_spec.indexing.length != 3:
+            return None
+        if not self.cluster_m2_bk_is_valid(
+            TCGEN05_TARGET1_TVM_FFI_BLOCK_K, constraints
+        ):
+            return None
+        if not self.ab_stages_three_fits(
+            bm=TCGEN05_TWO_CTA_BLOCK_M,
+            bn=TCGEN05_TWO_CTA_BLOCK_N,
+            bk=TCGEN05_TARGET1_TVM_FFI_BLOCK_K,
+            cluster_m=2,
+        ):
+            return None
+        range_count = len(self.config_spec.range_unroll_factors)
+        seed_config: dict[str, Any] = {
+            "block_sizes": [
+                TCGEN05_TWO_CTA_BLOCK_M,
+                TCGEN05_TWO_CTA_BLOCK_N,
+                TCGEN05_TARGET1_TVM_FFI_BLOCK_K,
+            ],
+            "indexing": [
+                "tensor_descriptor",
+                "tensor_descriptor",
+                "tensor_descriptor",
+            ],
+            "l2_groupings": [1],
+            "loop_orders": [[0, 1]],
+            "num_stages": 4,
+            "num_warps": 8,
+            "pid_type": TCGEN05_TWO_CTA_SEED_PID_TYPE,
+            "range_flattens": [None] * range_count,
+            "range_multi_buffers": [None] * range_count,
+            "range_num_stages": [0] * range_count,
+            "range_unroll_factors": [1] * range_count,
+            "range_warp_specializes": [None] * range_count,
+            "tcgen05_cluster_m": 2,
+            "tcgen05_cluster_n": 1,
+            "tcgen05_ab_stages": TCGEN05_TARGET1_TVM_FFI_AB_STAGES,
+            "tcgen05_acc_stages": 2,
+            "tcgen05_c_stages": 2,
+            TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY: 1,
+            "tcgen05_num_epi_warps": 4,
+            TCGEN05_STRATEGY_CONFIG_KEY: Tcgen05Strategy.ROLE_LOCAL_MONOLITHIC.value,
+            TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY: (
+                Tcgen05PersistenceModel.STATIC_PERSISTENT.value
+            ),
+            TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY: (
+                Tcgen05LayoutStrategy.EXPLICIT_EPI_TILE.value
+            ),
+            TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_M_KEY: 128,
+            TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_N_KEY: 32,
+            TCGEN05_LAYOUT_OVERRIDES_D_STORE_BOX_N_KEY: 32,
+            TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY: True,
+            TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY: True,
+        }
+        return Config(**seed_config)
+
     def autotune_seed_configs(self) -> list[Config]:
         seeds: list[Config] = []
+        target1_tvm_ffi_seed = self._target1_tvm_ffi_seed_config()
+        if target1_tvm_ffi_seed is not None:
+            seeds.append(target1_tvm_ffi_seed)
         c_input_seed = self._c_input_seed_config()
         if c_input_seed is not None:
             seeds.append(c_input_seed)
@@ -743,6 +858,20 @@ class CuteTcgen05Config:
         return self._is_validated_clc_persistence_search_candidate(projected_config)
 
     def implicit_default_keys_to_preserve(self, config: dict[str, object]) -> set[str]:
+        if self._is_target1_tvm_ffi_seed_config(config):
+            return {
+                "indexing",
+                "l2_groupings",
+                "loop_orders",
+                "num_stages",
+                "num_warps",
+                "pid_type",
+                "range_flattens",
+                "range_multi_buffers",
+                "range_num_stages",
+                "range_unroll_factors",
+                "range_warp_specializes",
+            }
         if not self._is_clc_aux_tma_config(config):
             return set()
         preserve_keys = {"l2_groupings"}
@@ -755,6 +884,27 @@ class CuteTcgen05Config:
                 }
             )
         return preserve_keys
+
+    @staticmethod
+    def _is_target1_tvm_ffi_seed_config(config: dict[str, object]) -> bool:
+        return (
+            config.get(TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY) is True
+            and config.get(TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY) is True
+            and config.get("block_sizes")
+            == [
+                TCGEN05_TWO_CTA_BLOCK_M,
+                TCGEN05_TWO_CTA_BLOCK_N,
+                TCGEN05_TARGET1_TVM_FFI_BLOCK_K,
+            ]
+            and config.get("tcgen05_ab_stages") == TCGEN05_TARGET1_TVM_FFI_AB_STAGES
+            and config.get("tcgen05_cluster_m") == 2
+            and config.get("tcgen05_cluster_n") == 1
+            and config.get(TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY)
+            == Tcgen05LayoutStrategy.EXPLICIT_EPI_TILE.value
+            and config.get(TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_M_KEY) == 128
+            and config.get(TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_N_KEY) == 32
+            and config.get(TCGEN05_LAYOUT_OVERRIDES_D_STORE_BOX_N_KEY) == 32
+        )
 
     def _is_validated_clc_persistence_search_candidate(
         self, config: dict[str, object]
@@ -1157,7 +1307,7 @@ class CuteTcgen05Config:
             num_epi_warps_fragment = EnumFragment(self.num_epi_warps_validation_choices)
         else:
             num_epi_warps_fragment = IntegerFragment(1, 4, 4)
-        if not for_search or self.ab_stages_three_search_constraints is not None:
+        if not for_search:
             ab_stages_max = 3
         else:
             ab_stages_max = 2
@@ -1167,7 +1317,7 @@ class CuteTcgen05Config:
             )
         else:
             l2_swizzle_choices = TCGEN05_LEGAL_L2_SWIZZLE_SIZES
-        return {
+        fragments: dict[str, ConfigSpecFragment] = {
             "tcgen05_cluster_m": EnumFragment(cluster_m_choices),
             "tcgen05_cluster_n": EnumFragment(cluster_n_choices),
             "tcgen05_ab_stages": IntegerFragment(1, ab_stages_max, 2),
@@ -1176,6 +1326,66 @@ class CuteTcgen05Config:
             "tcgen05_num_epi_warps": num_epi_warps_fragment,
             TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY: EnumFragment(l2_swizzle_choices),
         }
+        if self._target1_tvm_ffi_seed_config() is not None:
+            fragments.update(
+                {
+                    TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY: BooleanFragment(),
+                    TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY: BooleanFragment(),
+                    TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_M_KEY: EnumFragment((None, 128)),
+                    TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_N_KEY: EnumFragment((None, 32)),
+                    TCGEN05_LAYOUT_OVERRIDES_D_STORE_BOX_N_KEY: EnumFragment(
+                        (None, 32)
+                    ),
+                }
+            )
+        return fragments
+
+    @staticmethod
+    def _target1_tvm_ffi_promotion_requested(
+        config: dict[str, object], *, seed_enabled: bool
+    ) -> bool:
+        return (
+            config.get(TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY) is True
+            or config.get(TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY) is True
+            or (seed_enabled and config.get("tcgen05_cluster_m") == 2)
+            or config.get(TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY)
+            == Tcgen05LayoutStrategy.EXPLICIT_EPI_TILE.value
+            or config.get(TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_M_KEY) is not None
+            or config.get(TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_N_KEY) is not None
+            or config.get(TCGEN05_LAYOUT_OVERRIDES_D_STORE_BOX_N_KEY) is not None
+        )
+
+    @staticmethod
+    def _clear_target1_tvm_ffi_promotion_surface(config: dict[str, object]) -> None:
+        for key in list(config):
+            if key.startswith("tcgen05_") or key == "epilogue_subtile":
+                config.pop(key, None)
+
+    def _fix_target1_tvm_ffi_search_config(self, config: dict[str, object]) -> None:
+        seed = self._target1_tvm_ffi_seed_config()
+        if not self._target1_tvm_ffi_promotion_requested(
+            config, seed_enabled=seed is not None
+        ):
+            return
+        if seed is None:
+            config[TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY] = False
+            config[TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY] = False
+            if (
+                config.get(TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY)
+                == Tcgen05LayoutStrategy.EXPLICIT_EPI_TILE.value
+            ):
+                config[TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY] = (
+                    Tcgen05LayoutStrategy.DEFAULT.value
+                )
+            for key in (
+                TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_M_KEY,
+                TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_N_KEY,
+                TCGEN05_LAYOUT_OVERRIDES_D_STORE_BOX_N_KEY,
+            ):
+                config[key] = None
+            return
+        self._clear_target1_tvm_ffi_promotion_surface(config)
+        config.update(seed.config)
 
     def aux_load_mode_autotune_fragments(self) -> dict[str, ConfigSpecFragment]:
         if not self._aux_tma_search_enabled():
@@ -1208,6 +1418,7 @@ class CuteTcgen05Config:
         # Aux kernels are the only current trigger for scheduler/c_input warp
         # search. The surface is derived from aux_kernel_detected so repeated
         # detection or repeated fragment construction stays idempotent.
+        target1_tvm_ffi_seed_enabled = self._target1_tvm_ffi_seed_config() is not None
         if self.aux_kernel_detected:
             strategy_choices: tuple[str, ...] = (
                 Tcgen05Strategy.ROLE_LOCAL_MONOLITHIC.value,
@@ -1219,11 +1430,16 @@ class CuteTcgen05Config:
             strategy_choices = (Tcgen05Strategy.ROLE_LOCAL_MONOLITHIC.value,)
             scheduler_warps_choices = (0,)
             c_input_warps_choices = (0,)
+        if target1_tvm_ffi_seed_enabled:
+            layout_choices = (
+                Tcgen05LayoutStrategy.DEFAULT.value,
+                Tcgen05LayoutStrategy.EXPLICIT_EPI_TILE.value,
+            )
+        else:
+            layout_choices = (Tcgen05LayoutStrategy.DEFAULT.value,)
         return {
             TCGEN05_STRATEGY_CONFIG_KEY: EnumFragment(strategy_choices),
-            TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY: EnumFragment(
-                (Tcgen05LayoutStrategy.DEFAULT.value,)
-            ),
+            TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY: EnumFragment(layout_choices),
             TCGEN05_WARP_SPEC_MMA_WARPS_KEY: EnumFragment((1,)),
             TCGEN05_WARP_SPEC_AB_LOAD_WARPS_KEY: EnumFragment((1,)),
             TCGEN05_WARP_SPEC_EPI_LOAD_WARPS_KEY: EnumFragment((0,)),
@@ -1472,6 +1688,9 @@ class CuteTcgen05Config:
             config, TCGEN05_CUBIN_LINEINFO_CONFIG_KEY, fix_invalid=fix_invalid
         )
         self._validate_bool_config(
+            config, TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY, fix_invalid=fix_invalid
+        )
+        self._validate_bool_config(
             config, TCGEN05_LARGE_BN_PROOF_CONFIG_KEY, fix_invalid=fix_invalid
         )
         self._validate_bool_config(
@@ -1651,6 +1870,7 @@ class CuteTcgen05Config:
         self._fix_cluster_m2_search_config(config)
         self._fix_cluster_m1_persistent_search_config(config)
         self._fix_ab_stages_three_search_config(config)
+        self._fix_target1_tvm_ffi_search_config(config)
         self._fix_with_scheduler_search_config(config)
         self._fix_aux_tma_search_config(config)
         # CLC admission depends on the projected cluster/pid/strategy tuple

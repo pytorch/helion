@@ -273,6 +273,13 @@ TCGEN05_SCHED_CONSUMER_WAIT_MODES = (
 TCGEN05_SCHED_STAGE_COUNT_CONFIG_KEY = "tcgen05_sched_stage_count"
 TCGEN05_SCHED_STAGE_COUNTS = (1, 2)
 TCGEN05_CUBIN_LINEINFO_CONFIG_KEY = "tcgen05_cubin_lineinfo"
+TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY = "tcgen05_tvm_ffi_launch"
+
+# Validated G2.2 Target1 diagnostic envelope for promoting the TVM-FFI launch
+# path into normal autotune without enabling it broadly.
+TCGEN05_TARGET1_TVM_FFI_SHAPE = (1024, 4096, 1024)
+TCGEN05_TARGET1_TVM_FFI_BLOCK_K = 64
+TCGEN05_TARGET1_TVM_FFI_AB_STAGES = 3
 # Diagnostic-only G4 admission proof. This key lets tests exercise the
 # smallest larger-BN tcgen05 codegen candidate without broadening production
 # selector/search defaults.

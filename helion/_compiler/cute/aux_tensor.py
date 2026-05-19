@@ -35,6 +35,7 @@ from ..compile_environment import CompileEnvironment
 from .cute_epilogue import _AuxiliaryTensorStep
 from .cute_epilogue import analyze_tcgen05_unary_epilogue_chain
 from .cute_fx_walk import build_inner_outputs_index_from_graphs
+from .cute_fx_walk import walk_carrier_to_tcgen05_matmul
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -429,6 +430,49 @@ def host_function_has_tcgen05_exact_shape_aux_kernel_pattern(
         store_outputs,
         inner_outputs_by_graph_id=build_inner_outputs_index_from_graphs(graphs),
         target_fx_nodes=mma_nodes,
+    )
+
+
+def host_function_has_tcgen05_identity_matmul_store_pattern(
+    host_function: HostFunction,
+) -> bool:
+    """Return True only for a single identity store of a tcgen05 matmul result."""
+
+    device_ir = host_function.device_ir
+    graphs = device_ir.graphs
+    if not graphs:
+        return False
+
+    mma_nodes, _operand_load_nodes = _tcgen05_aux_detector_mma_facts(graphs)
+    if not mma_nodes:
+        return False
+
+    store_outputs: list[tuple[torch.fx.Node, torch.Tensor]] = []
+    for graph_info in graphs:
+        for store_node, store_value in _store_value_pairs_from_graph(graph_info.graph):
+            tensor_val = _output_tensor_from_store_node(store_node)
+            if tensor_val is not None:
+                store_outputs.append((store_value, tensor_val))
+    if len(store_outputs) != 1:
+        return False
+
+    store_value, _output = store_outputs[0]
+    if (
+        store_value.op != "call_function"
+        or store_value.target is not torch.ops.prims.convert_element_type.default
+        or store_value.kwargs
+    ):
+        return False
+    cast_input = store_value.args[0] if store_value.args else None
+    if not isinstance(cast_input, torch.fx.Node):
+        return False
+    return (
+        walk_carrier_to_tcgen05_matmul(
+            cast_input,
+            mma_nodes,
+            build_inner_outputs_index_from_graphs(graphs),
+        )
+        is not None
     )
 
 

@@ -20,6 +20,7 @@ import torch
 from .. import exc
 from .ast_extension import expr_from_string
 from .cute.tcgen05_constants import TCGEN05_CUBIN_LINEINFO_CONFIG_KEY
+from .cute.tcgen05_constants import TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY
 
 if TYPE_CHECKING:
     from torch._inductor.ops_handler import OpsHandler
@@ -3156,8 +3157,27 @@ class CuteBackend(Backend):
 
         def launcher_args_with_compile_options(block_arg: str) -> list[str]:
             launcher_args = [block_arg]
+            compile_options: list[str] = []
             if config.get(TCGEN05_CUBIN_LINEINFO_CONFIG_KEY) is True:
-                launcher_args.append("cute_compile_options='--generate-line-info'")
+                compile_options.append("--generate-line-info")
+            if config.get(TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY) is True:
+                if (
+                    _kernel_specialized_mma_impl(
+                        device_function,
+                        config=device_function.config,
+                    )
+                    != "tcgen05"
+                ):
+                    raise exc.BackendUnsupported(
+                        "cute",
+                        f"{TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY}=True requires "
+                        "tcgen05 CuTe lowering",
+                    )
+                compile_options.append("--enable-tvm-ffi")
+            if compile_options:
+                launcher_args.append(
+                    f"cute_compile_options={' '.join(compile_options)!r}"
+                )
             return launcher_args
 
         block_size_values = {

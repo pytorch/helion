@@ -654,17 +654,18 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
 
     @onlyBackends(["cute"])
     def test_cute_tcgen05_ab_stages_three_smem_budget_gate(self) -> None:
-        """SMEM-budget gate admits ``tcgen05_ab_stages=3`` into search.
+        """SMEM-budget gate validates explicit ``tcgen05_ab_stages=3`` configs.
 
-        The 4096^3 BF16 matmul binding admits ``ab=3`` into the autotune
-        search arm via the SMEM-budget gate so the canonical fast config
-        family (``cluster_m=2`` ``ab=3``) reaches the autotuner without a
-        hand-forced override. Search-time normalization demotes ``ab=3``
-        candidates whose ``(bm, bn, bk, cluster_m)`` per-CTA AB-SMEM cost
-        exceeds the device's optin SMEM cap minus the non-AB reservation
-        (see ``cute_plan.md`` §7.0). The validation surface stays
-        unchanged: explicit ``helion.Config(tcgen05_ab_stages=3)`` always
-        round-trips for explicit user configs.
+        The 4096^3 BF16 matmul binding records the SMEM-budget gate so
+        search-time normalization can demote explicit ``ab=3`` candidates
+        whose ``(bm, bn, bk, cluster_m)`` per-CTA AB-SMEM cost exceeds the
+        device's optin SMEM cap minus the non-AB reservation (see
+        ``cute_plan.md`` §7.0). The broad random search fragment remains
+        capped at ``ab=2``; ``ab=3`` is now exposed through validated seeds
+        only, with the Target1 TVM-FFI seed owning the promoted search
+        family. The validation surface stays unchanged: explicit
+        ``helion.Config(tcgen05_ab_stages=3)`` always round-trips for
+        explicit user configs.
 
         The gate is purely deterministic given a budget value, so we
         pin the per-CTA AB-SMEM budget to B200's nominal value via
@@ -690,9 +691,10 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         self.assertEqual(constraints.per_cta_smem_budget_bytes, b200_budget_bytes)
 
         search_fragments = spec._tcgen05_optional_fragments(for_search=True)
-        # Search surface lifts ab_stages cap from 2 to 3 once the gate
-        # admits the arm. The validation surface is independently 3.
-        self.assertEqual(search_fragments["tcgen05_ab_stages"].high, 3)
+        # Broad random search stays fail-closed at ab=2 unless the exact
+        # Target1 TVM-FFI seed is available. The validation surface is
+        # independently 3 for explicit configs.
+        self.assertEqual(search_fragments["tcgen05_ab_stages"].high, 2)
         validation_fragments = spec._tcgen05_optional_fragments(for_search=False)
         self.assertEqual(validation_fragments["tcgen05_ab_stages"].high, 3)
 

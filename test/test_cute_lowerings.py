@@ -149,6 +149,7 @@ from helion._compiler.cute.tcgen05_constants import TCGEN05_C_ACQUIRE_PLACEMENT_
 from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_CLUSTER_M2_ONE_CTA_ROLE_LOCAL_CONFIG_KEY,
 )
+from helion._compiler.cute.tcgen05_constants import TCGEN05_CUBIN_LINEINFO_CONFIG_KEY
 from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_DIAGNOSTIC_INVALID_OUTPUT_CONFIG_KEY,
 )
@@ -180,6 +181,7 @@ from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_SCHED_CONSUMER_WAIT_MODE_WARP_LEADER,
 )
 from helion._compiler.cute.tcgen05_constants import TCGEN05_SCHED_STAGE_COUNT_CONFIG_KEY
+from helion._compiler.cute.tcgen05_constants import TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY
 from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_TWO_CTA_EDGE_K_TAIL_AB_STAGES,
 )
@@ -2398,6 +2400,112 @@ class TestCuteLowerings(unittest.TestCase):
         )
         self.assertIn("tcgen05_tma_warp = tcgen05_warp_idx == cutlass.Int32(5)", code)
         self.assertNotIn("cute.arch.thread_idx()[1]", code)
+
+    def test_tcgen05_tvm_ffi_launch_option_codegen(self) -> None:
+        args = (
+            torch.empty([256, 128], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([128, 256], device=DEVICE, dtype=torch.bfloat16),
+        )
+        cfg = _make_tcgen05_role_local_monolithic_seed_config(
+            block_sizes=[256, 256, 64],
+            l2_groupings=[1],
+            pid_type="persistent_interleaved",
+            tcgen05_cluster_m=2,
+            tcgen05_cluster_n=1,
+            tcgen05_ab_stages=2,
+            tcgen05_acc_stages=2,
+            tcgen05_c_stages=2,
+            tcgen05_num_epi_warps=4,
+            **{
+                TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY: (
+                    Tcgen05LayoutStrategy.EXPLICIT_EPI_TILE.value
+                ),
+                TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_M_KEY: 128,
+                TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_N_KEY: 32,
+                TCGEN05_LAYOUT_OVERRIDES_D_STORE_BOX_N_KEY: 32,
+                TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY: True,
+                TCGEN05_CUBIN_LINEINFO_CONFIG_KEY: True,
+                TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY: True,
+            },
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_role_local_monolithic_4096_bf16.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            code = bound.to_triton_code(cfg)
+
+        self.assertIn(
+            "cute_compile_options='--generate-line-info --enable-tvm-ffi'", code
+        )
+
+    def test_tcgen05_tvm_ffi_launch_runtime_correctness(self) -> None:
+        import importlib.util
+
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+        if importlib.util.find_spec("tvm_ffi") is None:
+            self.skipTest("apache-tvm-ffi is not installed")
+
+        torch.manual_seed(0)
+        args = (
+            torch.randn(256, 128, device=DEVICE, dtype=torch.bfloat16),
+            torch.randn(128, 256, device=DEVICE, dtype=torch.bfloat16),
+        )
+        cfg = _make_tcgen05_role_local_monolithic_seed_config(
+            block_sizes=[256, 256, 64],
+            l2_groupings=[1],
+            pid_type="persistent_interleaved",
+            tcgen05_cluster_m=2,
+            tcgen05_cluster_n=1,
+            tcgen05_ab_stages=2,
+            tcgen05_acc_stages=2,
+            tcgen05_c_stages=2,
+            tcgen05_num_epi_warps=4,
+            **{
+                TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY: (
+                    Tcgen05LayoutStrategy.EXPLICIT_EPI_TILE.value
+                ),
+                TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_M_KEY: 128,
+                TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_N_KEY: 32,
+                TCGEN05_LAYOUT_OVERRIDES_D_STORE_BOX_N_KEY: 32,
+                TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY: True,
+                TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY: True,
+            },
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_role_local_monolithic_4096_bf16.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            bound.set_config(cfg)
+            out = bound(*args)
+
+        torch.testing.assert_close(out, args[0] @ args[1], atol=2e-1, rtol=1e-2)
+
+    def test_tcgen05_tvm_ffi_launch_rejects_non_tcgen05_fallback(self) -> None:
+        args = (
+            torch.empty([256, 128], device=DEVICE, dtype=torch.float32),
+            torch.empty([128, 256], device=DEVICE, dtype=torch.float32),
+        )
+        cfg = _make_tcgen05_role_local_monolithic_seed_config(
+            block_sizes=[256, 256, 64],
+            l2_groupings=[1],
+            pid_type="persistent_interleaved",
+            tcgen05_cluster_m=2,
+            tcgen05_cluster_n=1,
+            tcgen05_ab_stages=2,
+            tcgen05_acc_stages=2,
+            tcgen05_c_stages=2,
+            tcgen05_num_epi_warps=4,
+            **{TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY: True},
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_role_local_monolithic_4096_bf16.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            with self.assertRaisesRegex(
+                exc.BackendUnsupported,
+                TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY,
+            ):
+                bound.to_triton_code(cfg)
 
     def test_tcgen05_flat_role_coordinates_rejects_non_guarded_shape(self) -> None:
         args = (
