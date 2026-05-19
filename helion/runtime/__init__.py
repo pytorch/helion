@@ -1911,6 +1911,264 @@ def _create_cute_wrapper(
     return namespace[func_name]
 
 
+_TARGET1_DIRECT_ENTRY_SHAPES = (
+    (1024, 1024),
+    (1024, 4096),
+    (1024, 4096),
+)
+
+
+def _target1_direct_entry_plan(
+    cute_kernel: object,
+) -> dict[str, object] | None:
+    direct_plans = [
+        cast("dict[str, object]", plan)
+        for plan in getattr(
+            cast("Any", cute_kernel), "_helion_cute_direct_entry_plans", []
+        )
+    ]
+    if not direct_plans:
+        return None
+    if len(direct_plans) != 1:
+        raise exc.BackendUnsupported(
+            "cute",
+            "tcgen05 direct entry requires exactly one direct-entry plan",
+        )
+    plan = direct_plans[0]
+    if plan.get("kind") != "tcgen05_target1_direct_entry":
+        raise exc.BackendUnsupported(
+            "cute",
+            f"unsupported direct-entry plan kind: {plan.get('kind')!r}",
+        )
+    return plan
+
+
+def _plan_int(plan: dict[str, object], key: str) -> int:
+    value = plan[key]
+    if not isinstance(value, int):
+        raise exc.BackendUnsupported(
+            "cute",
+            f"invalid direct-entry plan {key}: {value!r}",
+        )
+    return value
+
+
+def _target1_direct_entry_arg_indices(
+    plan: dict[str, object],
+) -> tuple[int, int, int]:
+    return (
+        _plan_int(plan, "lhs_idx"),
+        _plan_int(plan, "rhs_idx"),
+        _plan_int(plan, "d_idx"),
+    )
+
+
+def _validate_target1_direct_entry_args(
+    plan: dict[str, object],
+    args: tuple[object, ...],
+    grid: tuple[int, int, int],
+    block: tuple[int, int, int],
+    compile_options: str | None,
+) -> tuple[int, int, int]:
+    if compile_options is None or "--enable-tvm-ffi" not in compile_options.split():
+        raise exc.BackendUnsupported(
+            "cute",
+            "tcgen05 direct entry requires --enable-tvm-ffi",
+        )
+    if grid not in ((2, 1, 64), (128, 1, 1)) or block != (256, 1, 1):
+        raise exc.BackendUnsupported(
+            "cute",
+            f"tcgen05 direct entry requires Target1 grid/block, got {grid}/{block}",
+        )
+    if (
+        _plan_int(plan, "bm"),
+        _plan_int(plan, "bn"),
+        _plan_int(plan, "bk"),
+        _plan_int(plan, "cluster_m"),
+        _plan_int(plan, "cluster_n"),
+        _plan_int(plan, "ab_stage_count"),
+        _plan_int(plan, "c_stage_count"),
+    ) not in (
+        (256, 256, 64, 2, 1, 3, 2),
+        (256, 256, 64, 2, 1, 6, 4),
+    ):
+        raise exc.BackendUnsupported(
+            "cute",
+            "tcgen05 direct entry requires the validated Target1 stage tuple",
+        )
+    if (
+        plan.get("input_dtype") != "cutlass.BFloat16"
+        or plan.get("output_dtype") != "cutlass.BFloat16"
+    ):
+        raise exc.BackendUnsupported(
+            "cute",
+            "tcgen05 direct entry requires bf16 input/output dtypes",
+        )
+
+    indices = _target1_direct_entry_arg_indices(plan)
+    if indices != (0, 1, 2) or len(args) != 3:
+        raise exc.BackendUnsupported(
+            "cute",
+            "tcgen05 direct entry currently supports exactly lhs/rhs/output args",
+        )
+    for arg, expected_shape in zip(args, _TARGET1_DIRECT_ENTRY_SHAPES, strict=True):
+        if not isinstance(arg, torch.Tensor):
+            raise exc.BackendUnsupported(
+                "cute",
+                "tcgen05 direct entry requires tensor arguments",
+            )
+        _validate_cute_launcher_tensor(arg)
+        if arg.dtype is not torch.bfloat16:
+            raise exc.BackendUnsupported(
+                "cute",
+                "tcgen05 direct entry requires bf16 tensor arguments",
+            )
+        if tuple(int(arg.size(dim)) for dim in range(arg.ndim)) != expected_shape:
+            raise exc.BackendUnsupported(
+                "cute",
+                "tcgen05 direct entry requires exact Target1 tensor shapes",
+            )
+        if arg.ndim != 2 or int(arg.stride(1)) != 1:
+            raise exc.BackendUnsupported(
+                "cute",
+                "tcgen05 direct entry requires row-major rank-2 tensors",
+            )
+    return indices
+
+
+def _wrapper_plans_for_direct_entry(
+    cute_kernel: object,
+    direct_plan: dict[str, object],
+) -> list[dict[str, object]]:
+    wrapper_plans = [
+        cast("dict[str, object]", plan)
+        for plan in getattr(cast("Any", cute_kernel), "_helion_cute_wrapper_plans", [])
+    ]
+    if [plan.get("kind") for plan in wrapper_plans] != [
+        "tcgen05_ab_tma",
+        "tcgen05_d_tma",
+    ]:
+        raise exc.BackendUnsupported(
+            "cute",
+            "tcgen05 direct entry requires A/B and D TMA wrapper plans",
+        )
+    ab_plan, d_plan = wrapper_plans
+    expected_ab_fields = {
+        "lhs_idx": _plan_int(direct_plan, "lhs_idx"),
+        "rhs_idx": _plan_int(direct_plan, "rhs_idx"),
+        "bm": _plan_int(direct_plan, "bm"),
+        "bn": _plan_int(direct_plan, "bn"),
+        "bk": _plan_int(direct_plan, "bk"),
+        "cluster_m": _plan_int(direct_plan, "cluster_m"),
+        "cluster_n": _plan_int(direct_plan, "cluster_n"),
+        "ab_stage_count": _plan_int(direct_plan, "ab_stage_count"),
+        "input_dtype": direct_plan.get("input_dtype"),
+        "acc_dtype": "cutlass.Float32",
+    }
+    expected_d_fields = {
+        "d_idx": _plan_int(direct_plan, "d_idx"),
+        "bm": _plan_int(direct_plan, "bm"),
+        "bn": _plan_int(direct_plan, "bn"),
+        "c_stage_count": _plan_int(direct_plan, "c_stage_count"),
+        "output_dtype": direct_plan.get("output_dtype"),
+        "epi_tile_m": 128,
+        "epi_tile_n": 32,
+        "d_store_box_n": 32,
+    }
+    for key, expected in expected_ab_fields.items():
+        if ab_plan.get(key) != expected:
+            raise exc.BackendUnsupported(
+                "cute",
+                f"tcgen05 direct entry wrapper A/B plan mismatch for {key}",
+            )
+    for key, expected in expected_d_fields.items():
+        if d_plan.get(key) != expected:
+            raise exc.BackendUnsupported(
+                "cute",
+                f"tcgen05 direct entry wrapper D plan mismatch for {key}",
+            )
+    if "smem_swizzle_a" in ab_plan or "smem_swizzle_b" in ab_plan:
+        raise exc.BackendUnsupported(
+            "cute",
+            "tcgen05 direct entry requires default A/B SMEM wrapper layouts",
+        )
+    if list(cast("list[object]", direct_plan["ab_kernel_args"])) != list(
+        cast("list[object]", ab_plan["kernel_args"])
+    ) or list(cast("list[object]", direct_plan["d_kernel_args"])) != list(
+        cast("list[object]", d_plan["kernel_args"])
+    ):
+        raise exc.BackendUnsupported(
+            "cute",
+            "tcgen05 direct entry plan does not match wrapper TMA args",
+        )
+    return wrapper_plans
+
+
+def _create_cute_direct_entry(
+    cute_kernel: object,
+    direct_plan: dict[str, object],
+    grid: tuple[int, int, int],
+    block: tuple[int, int, int],
+) -> object:
+    _patch_cutlass_jit_shutdown_unload()
+    import cutlass
+    import cutlass.cute as cute
+
+    wrapper_plans = _wrapper_plans_for_direct_entry(cute_kernel, direct_plan)
+    body: list[str] = []
+    for index in _target1_direct_entry_arg_indices(direct_plan):
+        body.extend(
+            (
+                f"    arg{index}_shape0 = arg{index}.shape[0]",
+                f"    arg{index}_shape1 = arg{index}.shape[1]",
+                f"    arg{index}_stride0 = arg{index}.stride[0]",
+                f"    arg{index}_stride1 = arg{index}.stride[1]",
+            )
+        )
+    call_args = ["arg0", "arg1", "arg2"]
+    for plan in wrapper_plans:
+        _append_cute_wrapper_plan(body, call_args, plan)
+
+    launch_suffix = f", block={block!r}"
+    cluster_shape = _cute_cluster_shape(cute_kernel, wrapper_plans)
+    if cluster_shape is not None:
+        launch_suffix += f", cluster={list(cluster_shape)!r}"
+    if any(plan.get("use_pdl") for plan in wrapper_plans):
+        launch_suffix += ", use_pdl=True"
+    body.extend(
+        (
+            f"    _helion_cute_kernel_tag = {getattr(cast('Any', cute_kernel), '__name__', 'cute_kernel')!r}",
+            "    _kernel("
+            + ", ".join(call_args)
+            + f").launch(grid={grid!r}{launch_suffix})",
+        )
+    )
+
+    kernel_name = getattr(cast("Any", cute_kernel), "__name__", "cute_kernel")
+    func_name = f"_helion_cute_direct_entry_{kernel_name}_{id(cute_kernel):x}"
+    source = "\n".join(
+        [
+            "@cute.jit",
+            f"def {func_name}(arg0, arg1, arg2) -> None:",
+            *body,
+        ]
+    )
+    namespace: dict[str, Any] = {
+        "cutlass": cutlass,
+        "cute": cute,
+        "_kernel": cute_kernel,
+    }
+    filename = f"<helion_cute_direct_entry:{kernel_name}:{id(cute_kernel):x}>"
+    linecache.cache[filename] = (
+        len(source),
+        None,
+        [line + "\n" for line in source.splitlines()],
+        filename,
+    )
+    exec(compile(source, filename, "exec"), namespace)
+    return namespace[func_name]
+
+
 class _CompiledCuteLauncher:
     """Lazily compile a Helion ``@cute.jit`` wrapper via ``cute.compile``.
 
@@ -1943,6 +2201,135 @@ class _CompiledCuteLauncher:
                 )
             self._compiled = compiled
         return cast("Any", compiled)(*args)
+
+
+class _CompiledCuteDirectEntryLauncher:
+    """Compile a Target1 direct tensor-entry wrapper with fake tensor args."""
+
+    __slots__ = (
+        "_compile_args",
+        "_compile_options",
+        "_compiled",
+        "_jit_func",
+        "_runtime_arg_indices",
+    )
+
+    def __init__(
+        self,
+        jit_func: object,
+        compile_args: tuple[object, ...],
+        runtime_arg_indices: tuple[int, int, int],
+        compile_options: str,
+    ) -> None:
+        self._jit_func = jit_func
+        self._compile_args = compile_args
+        self._runtime_arg_indices = runtime_arg_indices
+        self._compile_options = compile_options
+        self._compiled: object = None
+
+    def __call__(self, *args: object) -> object:
+        compiled = self._compiled
+        if compiled is None:
+            _patch_cutlass_jit_shutdown_unload()
+            import cutlass.cute as cute
+
+            compiled = cute.compile(
+                self._jit_func,
+                *self._compile_args,
+                options=self._compile_options,
+            )
+            self._compiled = compiled
+        launch_args = tuple(args[index] for index in self._runtime_arg_indices)
+        return cast("Any", compiled)(*launch_args)
+
+
+def _make_cute_direct_entry_fake_tensor(arg: torch.Tensor) -> object:
+    import cutlass.cute as cute
+
+    dtype = cast("type[Any]", _torch_dtype_to_cutlass(arg.dtype))
+    assert dtype is not None
+    shape = tuple(cute.sym_int() for _ in range(arg.ndim))
+    leading_dim = arg.ndim - 1
+    divisibility = max(1, 16 // max(1, arg.element_size()))
+    stride = tuple(
+        1 if dim == leading_dim else cute.sym_int64(divisibility=divisibility)
+        for dim in range(arg.ndim)
+    )
+    return cute.runtime.make_fake_tensor(
+        dtype,
+        shape,
+        stride=stride,
+        assumed_align=16,
+    )
+
+
+def _get_compiled_cute_direct_entry_launcher(
+    cute_kernel: object,
+    direct_plan: dict[str, object],
+    args: tuple[object, ...],
+    grid: tuple[int, int, int],
+    block: tuple[int, int, int],
+    compile_options: str,
+) -> object:
+    runtime_arg_indices = _validate_target1_direct_entry_args(
+        direct_plan,
+        args,
+        grid,
+        block,
+        compile_options,
+    )
+    try:
+        # pyrefly: ignore [missing-attribute]
+        cache = cute_kernel._helion_cute_direct_entry_launchers
+    except AttributeError:
+        cache = {}
+        # pyrefly: ignore [missing-attribute]
+        cute_kernel._helion_cute_direct_entry_launchers = cache
+    wrapper_plans = tuple(
+        repr(plan)
+        for plan in getattr(cast("Any", cute_kernel), "_helion_cute_wrapper_plans", [])
+    )
+    cluster_shape = getattr(
+        cast("Any", cute_kernel), "_helion_cute_cluster_shape", None
+    )
+    generated_direct_entry = getattr(
+        cast("Any", cute_kernel), "_helion_cute_generated_direct_entry", None
+    )
+    # The compiler-emitted direct entry is exact-gated to Target1's x-linear
+    # launch. Other validated grids continue to use the runtime descriptor
+    # wrapper fallback.
+    if generated_direct_entry is not None and grid != (128, 1, 1):
+        generated_direct_entry = None
+    cache_key = (
+        repr(direct_plan),
+        wrapper_plans,
+        repr(cluster_shape),
+        grid,
+        block,
+        compile_options,
+        id(generated_direct_entry) if generated_direct_entry is not None else None,
+    )
+    cached = cache.get(cache_key)
+    if cached is not None:
+        return cached
+    _ensure_cute_dsl_arch_env(args)
+    jit_func = (
+        generated_direct_entry
+        if generated_direct_entry is not None
+        else _create_cute_direct_entry(cute_kernel, direct_plan, grid, block)
+    )
+    compile_args = tuple(
+        _make_cute_direct_entry_fake_tensor(cast("torch.Tensor", args[index]))
+        for index in runtime_arg_indices
+    )
+    launcher = _CompiledCuteDirectEntryLauncher(
+        jit_func,
+        compile_args,
+        runtime_arg_indices,
+        compile_options,
+    )
+    cache[cache_key] = launcher
+    return launcher
 
 
 def _get_compiled_cute_launcher(
@@ -2198,6 +2585,23 @@ def default_cute_launcher(
         return None
 
     args_tuple = tuple(args)
+    direct_plan = _target1_direct_entry_plan(cute_kernel)
+    if direct_plan is not None:
+        if cute_compile_options is None:
+            raise exc.BackendUnsupported(
+                "cute",
+                "tcgen05 direct entry requires explicit CuTe compile options",
+            )
+        direct_launcher = _get_compiled_cute_direct_entry_launcher(
+            cute_kernel,
+            direct_plan,
+            args_tuple,
+            grid_xyz,
+            block_xyz,
+            cute_compile_options,
+        )
+        return cast("Any", direct_launcher)(*args_tuple)
+
     schema_key, launch_args = _build_cached_cute_schema_and_args(
         cute_kernel, args_tuple, grid_xyz
     )

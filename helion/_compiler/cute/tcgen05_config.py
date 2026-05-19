@@ -79,6 +79,7 @@ from .tcgen05_constants import TCGEN05_C_STORE_MODES
 from .tcgen05_constants import TCGEN05_CLUSTER_M2_ONE_CTA_ROLE_LOCAL_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_CUBIN_LINEINFO_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_DIAGNOSTIC_INVALID_OUTPUT_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_DIRECT_ENTRY_PLAN_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_EPILOGUE_LAYOUT_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_EPILOGUE_LAYOUTS
 from .tcgen05_constants import TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY
@@ -96,6 +97,7 @@ from .tcgen05_constants import TCGEN05_SCHED_STAGE_COUNT_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_SCHED_STAGE_COUNTS
 from .tcgen05_constants import TCGEN05_TARGET1_TVM_FFI_AB_STAGES
 from .tcgen05_constants import TCGEN05_TARGET1_TVM_FFI_BLOCK_K
+from .tcgen05_constants import TCGEN05_TARGET1_TVM_FFI_C_STAGES
 from .tcgen05_constants import TCGEN05_TARGET1_TVM_FFI_SHAPE
 from .tcgen05_constants import TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
@@ -173,6 +175,7 @@ CUTE_TCGEN05_DIAGNOSTIC_CONFIG_KEYS: frozenset[str] = frozenset(
         TCGEN05_CLUSTER_M2_ONE_CTA_ROLE_LOCAL_CONFIG_KEY,
         TCGEN05_CUBIN_LINEINFO_CONFIG_KEY,
         TCGEN05_DIAGNOSTIC_INVALID_OUTPUT_CONFIG_KEY,
+        TCGEN05_DIRECT_ENTRY_PLAN_CONFIG_KEY,
         TCGEN05_EPILOGUE_LAYOUT_CONFIG_KEY,
         TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY,
         TCGEN05_LARGE_BN_PROOF_CONFIG_KEY,
@@ -567,6 +570,7 @@ class CuteTcgen05Config:
             bn=TCGEN05_TWO_CTA_BLOCK_N,
             bk=TCGEN05_TARGET1_TVM_FFI_BLOCK_K,
             cluster_m=2,
+            ab_stages=TCGEN05_TARGET1_TVM_FFI_AB_STAGES,
         ):
             return None
         range_count = len(self.config_spec.range_unroll_factors)
@@ -595,7 +599,7 @@ class CuteTcgen05Config:
             "tcgen05_cluster_n": 1,
             "tcgen05_ab_stages": TCGEN05_TARGET1_TVM_FFI_AB_STAGES,
             "tcgen05_acc_stages": 2,
-            "tcgen05_c_stages": 2,
+            "tcgen05_c_stages": TCGEN05_TARGET1_TVM_FFI_C_STAGES,
             TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY: 1,
             "tcgen05_num_epi_warps": 4,
             TCGEN05_STRATEGY_CONFIG_KEY: Tcgen05Strategy.ROLE_LOCAL_MONOLITHIC.value,
@@ -735,6 +739,7 @@ class CuteTcgen05Config:
         bn: int,
         bk: int,
         cluster_m: int,
+        ab_stages: int = 3,
     ) -> bool:
         constraints = self.ab_stages_three_search_constraints
         if constraints is None:
@@ -748,7 +753,7 @@ class CuteTcgen05Config:
             bn=bn,
             bk=bk,
             dtype_bytes=constraints.dtype_bytes,
-            ab_stages=3,
+            ab_stages=ab_stages,
             cluster_m=cluster_m,
         )
         return bytes_per_cta <= constraints.per_cta_smem_budget_bytes
@@ -899,6 +904,7 @@ class CuteTcgen05Config:
                 TCGEN05_TARGET1_TVM_FFI_BLOCK_K,
             ]
             and config.get("tcgen05_ab_stages") == TCGEN05_TARGET1_TVM_FFI_AB_STAGES
+            and config.get("tcgen05_c_stages") == TCGEN05_TARGET1_TVM_FFI_C_STAGES
             and config.get("tcgen05_cluster_m") == 2
             and config.get("tcgen05_cluster_n") == 1
             and config.get(TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY)
@@ -906,6 +912,22 @@ class CuteTcgen05Config:
             and config.get(TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_M_KEY) == 128
             and config.get(TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_N_KEY) == 32
             and config.get(TCGEN05_LAYOUT_OVERRIDES_D_STORE_BOX_N_KEY) == 32
+        )
+
+    def _validate_target1_ab_stage_envelope(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        ab_stages = config.get("tcgen05_ab_stages")
+        if type(ab_stages) is not int or ab_stages <= 3:
+            return
+        if self._is_target1_tvm_ffi_seed_config(config):
+            return
+        if fix_invalid:
+            config["tcgen05_ab_stages"] = 3
+            return
+        raise InvalidConfig(
+            "tcgen05_ab_stages > 3 is only supported by the validated "
+            "Target1 TVM-FFI seed"
         )
 
     def _is_validated_clc_persistence_search_candidate(
@@ -1309,7 +1331,9 @@ class CuteTcgen05Config:
             num_epi_warps_fragment = EnumFragment(self.num_epi_warps_validation_choices)
         else:
             num_epi_warps_fragment = IntegerFragment(1, 4, 4)
-        if not for_search:
+        if not for_search and self._target1_tvm_ffi_seed_config() is not None:
+            ab_stages_max = TCGEN05_TARGET1_TVM_FFI_AB_STAGES
+        elif not for_search:
             ab_stages_max = 3
         else:
             ab_stages_max = 2
@@ -1341,6 +1365,7 @@ class CuteTcgen05Config:
                 }
             )
             if not for_search:
+                fragments[TCGEN05_DIRECT_ENTRY_PLAN_CONFIG_KEY] = BooleanFragment()
                 fragments[TCGEN05_PURE_CLC_SCHEDULER_OBJECT_CONFIG_KEY] = (
                     BooleanFragment()
                 )
@@ -1353,6 +1378,7 @@ class CuteTcgen05Config:
         return (
             config.get(TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY) is True
             or config.get(TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY) is True
+            or config.get(TCGEN05_DIRECT_ENTRY_PLAN_CONFIG_KEY) is True
             or config.get(TCGEN05_PURE_CLC_SCHEDULER_OBJECT_CONFIG_KEY) is True
             or (seed_enabled and config.get("tcgen05_cluster_m") == 2)
             or config.get(TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY)
@@ -1377,6 +1403,7 @@ class CuteTcgen05Config:
         if seed is None:
             config[TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY] = False
             config[TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY] = False
+            config[TCGEN05_DIRECT_ENTRY_PLAN_CONFIG_KEY] = False
             config[TCGEN05_PURE_CLC_SCHEDULER_OBJECT_CONFIG_KEY] = False
             if (
                 config.get(TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY)
@@ -1395,8 +1422,13 @@ class CuteTcgen05Config:
         pure_clc_scheduler_requested = (
             config.get(TCGEN05_PURE_CLC_SCHEDULER_OBJECT_CONFIG_KEY) is True
         )
+        direct_entry_requested = (
+            config.get(TCGEN05_DIRECT_ENTRY_PLAN_CONFIG_KEY) is True
+        )
         self._clear_target1_tvm_ffi_promotion_surface(config)
         config.update(seed.config)
+        if direct_entry_requested:
+            config[TCGEN05_DIRECT_ENTRY_PLAN_CONFIG_KEY] = True
         if pure_clc_scheduler_requested:
             config[TCGEN05_PURE_CLC_SCHEDULER_OBJECT_CONFIG_KEY] = True
 
@@ -1601,6 +1633,7 @@ class CuteTcgen05Config:
                 elif key in optional_search_fragments:
                     config[key] = optional_search_fragments[key].default()
             self._clamp_l2_swizzle_size_to_shape(config)
+            self._validate_target1_ab_stage_envelope(config, fix_invalid=fix_invalid)
         else:
             for key in optional_fragments:
                 if key not in config:
@@ -1705,6 +1738,11 @@ class CuteTcgen05Config:
         )
         self._validate_bool_config(
             config, TCGEN05_LARGE_BN_PROOF_CONFIG_KEY, fix_invalid=fix_invalid
+        )
+        self._validate_bool_config(
+            config,
+            TCGEN05_DIRECT_ENTRY_PLAN_CONFIG_KEY,
+            fix_invalid=fix_invalid,
         )
         self._validate_bool_config(
             config,

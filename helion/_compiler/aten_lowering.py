@@ -40,6 +40,7 @@ from .cute.matmul_utils import cute_static_k_invariant_extent
 from .cute.matmul_utils import cute_static_serial_matmul_k_extent
 from .cute.matmul_utils import emit_cute_serial_scalar_mm_from_loads
 from .cute.strategies import is_pure_matmul_role_lifecycle_config
+from .cute.tcgen05_constants import TCGEN05_DIRECT_ENTRY_PLAN_CONFIG_KEY
 from .cute.tcgen05_constants import TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY
 from .cute.tcgen05_constants import TCGEN05_PURE_CLC_SCHEDULER_OBJECT_CONFIG_KEY
 from .matmul_utils import _emit_pallas_matmul
@@ -81,6 +82,12 @@ def _requested_tcgen05_pure_clc_scheduler_object(ctx: LoweringContext) -> bool:
     )
 
 
+def _requested_tcgen05_direct_entry_plan(ctx: LoweringContext) -> bool:
+    return bool(
+        ctx.cg.device_function.config.get(TCGEN05_DIRECT_ENTRY_PLAN_CONFIG_KEY, False)
+    )
+
+
 def _reject_tcgen05_flat_role_coordinates_fallback() -> None:
     raise exc.BackendUnsupported(
         "cute",
@@ -94,6 +101,14 @@ def _reject_tcgen05_pure_clc_scheduler_object_fallback() -> None:
         "cute",
         f"{TCGEN05_PURE_CLC_SCHEDULER_OBJECT_CONFIG_KEY}=True requires "
         "active-K-loop tcgen05 MMA lowering",
+    )
+
+
+def _reject_tcgen05_direct_entry_plan_fallback() -> None:
+    raise exc.BackendUnsupported(
+        "cute",
+        f"{TCGEN05_DIRECT_ENTRY_PLAN_CONFIG_KEY}=True requires active-K-loop "
+        "tcgen05 MMA lowering",
     )
 
 
@@ -1188,6 +1203,8 @@ def codegen_mm_cute(ctx: LoweringContext, node: Node) -> ast.AST:
             _reject_tcgen05_flat_role_coordinates_fallback()
         if _requested_tcgen05_pure_clc_scheduler_object(ctx):
             _reject_tcgen05_pure_clc_scheduler_object_fallback()
+        if _requested_tcgen05_direct_entry_plan(ctx):
+            _reject_tcgen05_direct_entry_plan_fallback()
         if _requested_pure_matmul_role_lifecycle(ctx):
             raise exc.BackendUnsupported(
                 "cute",
@@ -1207,6 +1224,8 @@ def codegen_mm_cute(ctx: LoweringContext, node: Node) -> ast.AST:
             _reject_tcgen05_flat_role_coordinates_fallback()
         if _requested_tcgen05_pure_clc_scheduler_object(ctx):
             _reject_tcgen05_pure_clc_scheduler_object_fallback()
+        if _requested_tcgen05_direct_entry_plan(ctx):
+            _reject_tcgen05_direct_entry_plan_fallback()
         if _requested_pure_matmul_role_lifecycle(ctx):
             raise exc.BackendUnsupported(
                 "cute",
@@ -1229,6 +1248,8 @@ def codegen_mm_cute(ctx: LoweringContext, node: Node) -> ast.AST:
         _reject_tcgen05_flat_role_coordinates_fallback()
     if _requested_tcgen05_pure_clc_scheduler_object(ctx):
         _reject_tcgen05_pure_clc_scheduler_object_fallback()
+    if _requested_tcgen05_direct_entry_plan(ctx):
+        _reject_tcgen05_direct_entry_plan_fallback()
     return _emit_cute_matmul(
         ctx.cg,
         lhs,
@@ -1257,6 +1278,8 @@ def codegen_addmm_cute(ctx: LoweringContext, node: Node) -> ast.AST:
         _reject_tcgen05_flat_role_coordinates_fallback()
     if _requested_tcgen05_pure_clc_scheduler_object(ctx):
         _reject_tcgen05_pure_clc_scheduler_object_fallback()
+    if _requested_tcgen05_direct_entry_plan(ctx):
+        _reject_tcgen05_direct_entry_plan_fallback()
     if _requested_pure_matmul_role_lifecycle(ctx):
         raise exc.BackendUnsupported(
             "cute",
@@ -1312,6 +1335,8 @@ def codegen_addmm_cute(ctx: LoweringContext, node: Node) -> ast.AST:
         )
     if _requested_tcgen05_pure_clc_scheduler_object(ctx):
         _reject_tcgen05_pure_clc_scheduler_object_fallback()
+    if _requested_tcgen05_direct_entry_plan(ctx):
+        _reject_tcgen05_direct_entry_plan_fallback()
     return _emit_cute_matmul(
         ctx.cg,
         lhs,
@@ -1337,6 +1362,8 @@ def codegen_baddbmm_cute(ctx: LoweringContext, node: Node) -> ast.AST:
         _reject_tcgen05_flat_role_coordinates_fallback()
     if _requested_tcgen05_pure_clc_scheduler_object(ctx):
         _reject_tcgen05_pure_clc_scheduler_object_fallback()
+    if _requested_tcgen05_direct_entry_plan(ctx):
+        _reject_tcgen05_direct_entry_plan_fallback()
     if _requested_pure_matmul_role_lifecycle(ctx):
         raise exc.BackendUnsupported(
             "cute",

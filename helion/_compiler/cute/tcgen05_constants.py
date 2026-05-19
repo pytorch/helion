@@ -279,7 +279,8 @@ TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY = "tcgen05_tvm_ffi_launch"
 # path into normal autotune without enabling it broadly.
 TCGEN05_TARGET1_TVM_FFI_SHAPE = (1024, 4096, 1024)
 TCGEN05_TARGET1_TVM_FFI_BLOCK_K = 64
-TCGEN05_TARGET1_TVM_FFI_AB_STAGES = 3
+TCGEN05_TARGET1_TVM_FFI_AB_STAGES = 6
+TCGEN05_TARGET1_TVM_FFI_C_STAGES = 4
 # Diagnostic-only G4 admission proof. This key lets tests exercise the
 # smallest larger-BN tcgen05 codegen candidate without broadening production
 # selector/search defaults.
@@ -292,6 +293,10 @@ TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY = "tcgen05_flat_role_coordinates"
 # TVM-FFI/flat-role seed. This stays explicit until forced diagnostics show
 # it can replace the selected static scheduler path.
 TCGEN05_PURE_CLC_SCHEDULER_OBJECT_CONFIG_KEY = "tcgen05_pure_clc_scheduler_object"
+# Diagnostic metadata-only direct-entry plan for the validated Target1
+# TVM-FFI/flat-role identity-store seed. This does not change launch behavior;
+# it records the exact A/B/D TMA facts needed by the future direct CuTe entry.
+TCGEN05_DIRECT_ENTRY_PLAN_CONFIG_KEY = "tcgen05_direct_entry_plan"
 TCGEN05_LARGE_BN_PROOF_PROBLEM_SHAPE = (64, 512, 16)
 TCGEN05_LARGE_BN_PROOF_BLOCK_SIZES = (64, 512, 16)
 TCGEN05_LARGE_BN_PROOF_CLUSTER_M = 1
