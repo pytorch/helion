@@ -64,6 +64,7 @@ from .llm.transport import infer_provider as _infer_provider
 if TYPE_CHECKING:
     from collections.abc import Iterator
     from collections.abc import Sequence
+    from pathlib import Path
 
     from ..runtime.config import Config
     from ..runtime.settings import Settings
@@ -202,6 +203,29 @@ class LLMGuidedSearch(PopulationBasedSearch):
         self._benchmark_times: list[float] = []
         self._llm_executor: concurrent.futures.ThreadPoolExecutor | None = None
 
+        # LLO-based bottleneck advisor (activated when the user has set
+        # LIBTPU_INIT_ARGS=--xla_jf_dump_to=<dir> BEFORE process start). The
+        # advisor reads the per-config LLO subdirs populated by
+        # `benchmark_batch`, asks `scripts/tpu_roofline.py --advise` for
+        # static lane-utilization + counterfactual ceilings, and feeds the
+        # result back through the refinement prompt. When the env var is
+        # unset, every hook below silently no-ops.
+        from .llm.llo_advisor import llo_dump_dir_from_env
+        from .llm.llo_advisor import predictor_inputs_from_args
+
+        self._llo_dump_dir = llo_dump_dir_from_env()
+        self._predictor_inputs = predictor_inputs_from_args(args)
+        # Output-shape heuristic: take the first tensor's spec as the output.
+        # Works for matmul/attention/elementwise. The predictor uses outputs
+        # only for HBM byte accounting, so the heuristic only affects the
+        # memory roofline (not the binding-lane decision).
+        self._predictor_outputs = (
+            self._predictor_inputs.split(",")[0] if self._predictor_inputs else ""
+        )
+        # Map config_key → per-config LLO subdir, populated by
+        # `benchmark_batch` after each compile.
+        self._llo_subdir_by_config: dict[str, str] = {}
+
     @classmethod
     def get_kwargs_from_profile(
         cls, profile: AutotuneEffortProfile, settings: Settings
@@ -239,6 +263,20 @@ class LLMGuidedSearch(PopulationBasedSearch):
     def _build_refinement_prompt(self, round_num: int) -> str:
         """Summarize search progress so the LLM can propose the next batch."""
         del round_num
+        # When each compiled config has its own LLO subdir
+        # (populated by `benchmark_batch` below), produce per-anchor
+        # bottleneck hints (binding lane + counterfactual ceilings +
+        # suggestions). Empty string = no advisor → no extra section.
+        from .llm.llo_advisor import collect_bottlenecks_for_anchors
+
+        bottleneck = collect_bottlenecks_for_anchors(
+            self._all_benchmark_results,
+            self._default_config_dict,
+            inputs=self._predictor_inputs or None,
+            outputs=self._predictor_outputs or None,
+            llo_subdir_by_config=self._llo_subdir_by_config,
+            config_key_fn=self._config_key,
+        )
         return build_refinement_prompt(
             configs_per_round=self.configs_per_round,
             compile_timeout_s=self.settings.autotune_compile_timeout,
@@ -264,7 +302,60 @@ class LLMGuidedSearch(PopulationBasedSearch):
                 self._all_benchmark_results,
                 self._default_config_dict,
             ),
+            bottleneck_analysis=bottleneck,
         )
+
+    # ── LLO dump routing ────────────────────────────────────────────
+
+    def benchmark_batch(
+        self, configs: list[Config], *, desc: str = "Benchmarking"
+    ) -> list[BenchmarkResult]:
+        """Compile + benchmark one config at a time so each gets its own LLO
+        subdir.
+
+        When `LIBTPU_INIT_ARGS=--xla_jf_dump_to=<dir>` is set, libtpu writes
+        every compile's bundles/utilization files flat into `<dir>` — there's
+        no built-in per-compile separation. We work around that by serializing
+        compilation: snapshot the dump dir before each compile, run one
+        config, then move the newly-written files into
+        `<dir>/cfg_<config_hash>/`. The advisor uses that map to point the
+        predictor at the right kernel dump for each anchor config.
+
+        When the env var is unset, fall through to the base implementation.
+        """
+        if not self._llo_dump_dir or not configs:
+            return super().benchmark_batch(configs, desc=desc)
+        from pathlib import Path
+
+        dump_root = Path(self._llo_dump_dir)
+        if not dump_root.is_dir():
+            return super().benchmark_batch(configs, desc=desc)
+
+        results: list[BenchmarkResult] = []
+        for cfg in configs:
+            before = self._snapshot_dump_files(dump_root)
+            results.extend(super().benchmark_batch([cfg], desc=desc))
+            after = self._snapshot_dump_files(dump_root)
+            new_files = after - before
+            if not new_files:
+                continue
+            cfg_subdir = dump_root / f"cfg_{self._config_key(cfg)}"
+            cfg_subdir.mkdir(exist_ok=True)
+            for name in new_files:
+                src = dump_root / name
+                if src.is_file():
+                    src.rename(cfg_subdir / name)
+            self._llo_subdir_by_config[self._config_key(cfg)] = str(cfg_subdir)
+        return results
+
+    @staticmethod
+    def _snapshot_dump_files(dump_root: Path) -> set[str]:
+        """Names of regular files directly inside `dump_root` (no recursion).
+
+        Per-config subdirs we created earlier are excluded by the file-only
+        filter, so they aren't double-counted on the next snapshot.
+        """
+        return {p.name for p in dump_root.iterdir() if p.is_file()}
 
     # ── LLM transport ────────────────────────────────────────────
 

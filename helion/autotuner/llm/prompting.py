@@ -241,26 +241,42 @@ def build_refinement_prompt(
     results: str,
     top_patterns: str,
     failed_patterns: str,
+    bottleneck_analysis: str = "",
 ) -> str:
-    """Build the refinement prompt sent after each benchmarking round."""
+    """Build the refinement prompt sent after each benchmarking round.
+
+    `bottleneck_analysis` (optional): per-anchor static lane-utilization +
+    counterfactual ceilings + suggestions produced by the LLO advisor. When
+    present, the LLM gets directional hints ("MXU-bound, try larger block_k")
+    on top of raw (config, timing) feedback.
+    """
     task_section = (
         f"Suggest up to {configs_per_round} NEW UNIQUE configs around the anchors above. "
         "Avoid the failed patterns above and favor targeted edits with attributable effects. "
         f"{RETURN_JSON_ONLY}"
     )
-    return _join_sections(
+    sections = [
         _section("Search State", search_state),
         _section("Anchor Configs", anchor_configs),
         _section("Results (best first)", results),
-        _section("Top Config Patterns", top_patterns),
-        _section("Failed Config Patterns", failed_patterns),
-        _bullet_section(
-            "Next Step",
-            _refinement_strategy_lines(
-                compile_timeout_s=compile_timeout_s,
-                failed_count=failed_count,
-                total_count=total_count,
+    ]
+    if bottleneck_analysis.strip():
+        sections.append(
+            _section("Bottleneck Analysis (static from LLO)", bottleneck_analysis)
+        )
+    sections.extend(
+        [
+            _section("Top Config Patterns", top_patterns),
+            _section("Failed Config Patterns", failed_patterns),
+            _bullet_section(
+                "Next Step",
+                _refinement_strategy_lines(
+                    compile_timeout_s=compile_timeout_s,
+                    failed_count=failed_count,
+                    total_count=total_count,
+                ),
             ),
-        ),
-        _section("Task", task_section),
+            _section("Task", task_section),
+        ]
     )
+    return _join_sections(*sections)
