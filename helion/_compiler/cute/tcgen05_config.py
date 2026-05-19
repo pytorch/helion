@@ -88,6 +88,7 @@ from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_PID_TYPE
 from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_STAGE_CONFIGS
 from .tcgen05_constants import TCGEN05_ONE_CTA_MAX_BLOCK_M
+from .tcgen05_constants import TCGEN05_PURE_CLC_SCHEDULER_OBJECT_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_SCHED_CONSUMER_WAIT_MODE_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_SCHED_CONSUMER_WAIT_MODE_NORMAL
 from .tcgen05_constants import TCGEN05_SCHED_CONSUMER_WAIT_MODES
@@ -175,6 +176,7 @@ CUTE_TCGEN05_DIAGNOSTIC_CONFIG_KEYS: frozenset[str] = frozenset(
         TCGEN05_EPILOGUE_LAYOUT_CONFIG_KEY,
         TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY,
         TCGEN05_LARGE_BN_PROOF_CONFIG_KEY,
+        TCGEN05_PURE_CLC_SCHEDULER_OBJECT_CONFIG_KEY,
         TCGEN05_SCHED_CONSUMER_WAIT_MODE_CONFIG_KEY,
         TCGEN05_SCHED_STAGE_COUNT_CONFIG_KEY,
         TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY,
@@ -1338,6 +1340,10 @@ class CuteTcgen05Config:
                     ),
                 }
             )
+            if not for_search:
+                fragments[TCGEN05_PURE_CLC_SCHEDULER_OBJECT_CONFIG_KEY] = (
+                    BooleanFragment()
+                )
         return fragments
 
     @staticmethod
@@ -1347,6 +1353,7 @@ class CuteTcgen05Config:
         return (
             config.get(TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY) is True
             or config.get(TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY) is True
+            or config.get(TCGEN05_PURE_CLC_SCHEDULER_OBJECT_CONFIG_KEY) is True
             or (seed_enabled and config.get("tcgen05_cluster_m") == 2)
             or config.get(TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY)
             == Tcgen05LayoutStrategy.EXPLICIT_EPI_TILE.value
@@ -1370,6 +1377,7 @@ class CuteTcgen05Config:
         if seed is None:
             config[TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY] = False
             config[TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY] = False
+            config[TCGEN05_PURE_CLC_SCHEDULER_OBJECT_CONFIG_KEY] = False
             if (
                 config.get(TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY)
                 == Tcgen05LayoutStrategy.EXPLICIT_EPI_TILE.value
@@ -1384,8 +1392,13 @@ class CuteTcgen05Config:
             ):
                 config[key] = None
             return
+        pure_clc_scheduler_requested = (
+            config.get(TCGEN05_PURE_CLC_SCHEDULER_OBJECT_CONFIG_KEY) is True
+        )
         self._clear_target1_tvm_ffi_promotion_surface(config)
         config.update(seed.config)
+        if pure_clc_scheduler_requested:
+            config[TCGEN05_PURE_CLC_SCHEDULER_OBJECT_CONFIG_KEY] = True
 
     def aux_load_mode_autotune_fragments(self) -> dict[str, ConfigSpecFragment]:
         if not self._aux_tma_search_enabled():
@@ -1585,7 +1598,7 @@ class CuteTcgen05Config:
                     config[key] = self._validate_optional_fragment_value(
                         key, fragment, config[key]
                     )
-                else:
+                elif key in optional_search_fragments:
                     config[key] = optional_search_fragments[key].default()
             self._clamp_l2_swizzle_size_to_shape(config)
         else:
@@ -1696,6 +1709,11 @@ class CuteTcgen05Config:
         self._validate_bool_config(
             config,
             TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY,
+            fix_invalid=fix_invalid,
+        )
+        self._validate_bool_config(
+            config,
+            TCGEN05_PURE_CLC_SCHEDULER_OBJECT_CONFIG_KEY,
             fix_invalid=fix_invalid,
         )
         if config.get(TCGEN05_LARGE_BN_PROOF_CONFIG_KEY) is True:

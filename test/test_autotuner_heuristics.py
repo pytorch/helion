@@ -58,6 +58,9 @@ from helion._compiler.cute.tcgen05_constants import (
 from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY,
 )
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_PURE_CLC_SCHEDULER_OBJECT_CONFIG_KEY,
+)
 from helion._compiler.cute.tcgen05_constants import TCGEN05_TARGET1_TVM_FFI_AB_STAGES
 from helion._compiler.cute.tcgen05_constants import TCGEN05_TARGET1_TVM_FFI_BLOCK_K
 from helion._compiler.cute.tcgen05_constants import TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY
@@ -800,10 +803,19 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         )["tcgen05_ab_stages"]
         self.assertIsInstance(search_ab_stages_fragment, IntegerFragment)
         self.assertEqual(search_ab_stages_fragment.high, 2)
+        self.assertIn(
+            TCGEN05_PURE_CLC_SCHEDULER_OBJECT_CONFIG_KEY,
+            bound.config_spec._tcgen05_optional_fragments(),
+        )
+        self.assertNotIn(
+            TCGEN05_PURE_CLC_SCHEDULER_OBJECT_CONFIG_KEY,
+            bound.config_spec._tcgen05_optional_fragments(for_search=True),
+        )
         self.assertEqual(
             seed[TCGEN05_STRATEGY_CONFIG_KEY],
             Tcgen05Strategy.ROLE_LOCAL_MONOLITHIC.value,
         )
+        self.assertIsNone(seed.get(TCGEN05_PURE_CLC_SCHEDULER_OBJECT_CONFIG_KEY))
         self.assertEqual(
             seed[TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY],
             Tcgen05LayoutStrategy.EXPLICIT_EPI_TILE.value,

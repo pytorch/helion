@@ -287,6 +287,11 @@ TCGEN05_LARGE_BN_PROOF_CONFIG_KEY = "tcgen05_large_bn_proof"
 # Diagnostic Target1 topology probe: keep role predicates warp-based while
 # deriving logical MMA coordinates from flat threadIdx.x / warp / lane values.
 TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY = "tcgen05_flat_role_coordinates"
+# Diagnostic Target1 scheduler-object probe: use a Helion-owned pure-matmul
+# CLC scheduler object to publish work tiles for the validated Target1
+# TVM-FFI/flat-role seed. This stays explicit until forced diagnostics show
+# it can replace the selected static scheduler path.
+TCGEN05_PURE_CLC_SCHEDULER_OBJECT_CONFIG_KEY = "tcgen05_pure_clc_scheduler_object"
 TCGEN05_LARGE_BN_PROOF_PROBLEM_SHAPE = (64, 512, 16)
 TCGEN05_LARGE_BN_PROOF_BLOCK_SIZES = (64, 512, 16)
 TCGEN05_LARGE_BN_PROOF_CLUSTER_M = 1

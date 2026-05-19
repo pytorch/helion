@@ -25,6 +25,9 @@ from .._compiler.cute.matmul_utils import cute_resolve_active_matmul_k_block_id
 from .._compiler.cute.matmul_utils import cute_static_k_invariant_extent
 from .._compiler.cute.strategies import is_pure_matmul_role_lifecycle_config
 from .._compiler.cute.tcgen05_constants import TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY
+from .._compiler.cute.tcgen05_constants import (
+    TCGEN05_PURE_CLC_SCHEDULER_OBJECT_CONFIG_KEY,
+)
 from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
 from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
 from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_EDGE_K_TAIL_MIN_DIM
@@ -71,6 +74,14 @@ def _requested_tcgen05_flat_role_coordinates(state: CodegenState) -> bool:
     return bool(
         state.device_function.config.get(
             TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY, False
+        )
+    )
+
+
+def _requested_tcgen05_pure_clc_scheduler_object(state: CodegenState) -> bool:
+    return bool(
+        state.device_function.config.get(
+            TCGEN05_PURE_CLC_SCHEDULER_OBJECT_CONFIG_KEY, False
         )
     )
 
@@ -669,6 +680,12 @@ def _(state: CodegenState) -> object:
         raise exc.BackendUnsupported(
             "cute",
             f"{TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY}=True requires "
+            "hl.dot to lower through the tcgen05 K-loop path",
+        )
+    if _requested_tcgen05_pure_clc_scheduler_object(state):
+        raise exc.BackendUnsupported(
+            "cute",
+            f"{TCGEN05_PURE_CLC_SCHEDULER_OBJECT_CONFIG_KEY}=True requires "
             "hl.dot to lower through the tcgen05 K-loop path",
         )
     return _emit_cute_matmul(
