@@ -387,7 +387,11 @@ class _Settings:
     )
     autotune_benchmark_timeout: int = dataclasses.field(
         default_factory=functools.partial(
-            _env_get_int, "HELION_AUTOTUNE_BENCHMARK_TIMEOUT", 30
+            _env_get_int,
+            "HELION_AUTOTUNE_BENCHMARK_TIMEOUT",
+            # Higher default when the first benchmark call has to absorb a
+            # heavier subprocess cold-start (slower spawn/imports, CUPTI init).
+            90 if is_fbcode() else 30,
         )
     )
     autotune_precompile: PrecompileMode = dataclasses.field(
@@ -592,7 +596,7 @@ class Settings(_Settings):
         ),
         "autotune_compile_timeout": "Timeout for Triton compilation in seconds used for autotuning. Default is 60 seconds.",
         "autotune_benchmark_subprocess": "Run the autotune benchmark phase in a long-lived spawn subprocess so a hung/slow kernel can be killed without losing autotune progress. Enabled by default. Set HELION_AUTOTUNE_BENCHMARK_SUBPROCESS=0 to disable.",
-        "autotune_benchmark_timeout": "Per-config wall-clock timeout in seconds for the subprocess benchmark phase. Only applies when autotune_benchmark_subprocess is enabled. Default 30 seconds.",
+        "autotune_benchmark_timeout": "Per-config wall-clock timeout in seconds for the subprocess benchmark phase. Only applies when autotune_benchmark_subprocess is enabled. Default 30 seconds, raised automatically on environments with a heavier subprocess cold-start.",
         "autotune_precompile": "Autotuner precompile mode: 'fork', 'spawn', or falsy/None to disable. Defaults to 'fork' on non-Windows platforms.",
         "autotune_precompile_jobs": "Maximum concurrent Triton precompile processes, default to cpu count.",
         "autotune_random_seed": "Seed used for autotuner random number generation. Defaults to HELION_AUTOTUNE_RANDOM_SEED or a time-based seed.",
