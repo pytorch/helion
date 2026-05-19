@@ -1821,6 +1821,51 @@ class TestExamples(RefEagerTestBase, TestCase):
             block_sizes=[64],
         )
 
+    def test_fused_linear_jsd_fwd(self):
+        """Exercise the autograd-wrapped FusedLinearJSDFunction path
+        (FusedLinearJSDFunction.forward -> jsd_kernel per chunk).
+
+        This is the user-facing API; the existing `test_fused_linear_jsd`
+        only covers the simpler `fused_linear_jsd_kernel` JSD-only path.
+        Shape picked so chunk_size > 1 (chunked path actually runs).
+        """
+        beta = 0.5
+        ignore_index = -100
+        # Use temperature = sqrt(hidden_dim) so logits/temperature has std ~1
+        # and softmax stays in fp32 range.
+        m, n, k = 128, 512, 1024
+        temperature = float(n) ** 0.5
+
+        student_input = torch.randn([m, n], device=DEVICE, dtype=torch.float32)
+        teacher_input = torch.randn([m, n], device=DEVICE, dtype=torch.float32)
+        student_weight = torch.randn([k, n], device=DEVICE, dtype=torch.float32)
+        teacher_weight = torch.randn([k, n], device=DEVICE, dtype=torch.float32)
+
+        mod = import_path(EXAMPLES_DIR / "fused_linear_jsd.py")
+        # Pin jsd_kernel's config so we skip autotune (CI speed). Block size 16
+        # is a small safe pick across backends.
+        mod.jsd_kernel.settings.static_shapes = True
+        mod.jsd_kernel.configs = [helion.Config(block_sizes=[16])]
+        result = mod.fused_linear_jsd_fwd(
+            beta,
+            ignore_index,
+            temperature,
+            student_weight,
+            teacher_weight,
+            student_input,
+            teacher_input,
+        )
+        expected = mod.fused_linear_jsd_pytorch(
+            beta,
+            ignore_index,
+            temperature,
+            student_weight,
+            teacher_weight,
+            student_input,
+            teacher_input,
+        )
+        torch.testing.assert_close(result, expected, atol=1e-1, rtol=1e-2)
+
     @xfailIfPallas("JAX tracer error")
     @skipIfRefEager("hl.jagged_tile does not support ref mode yet")
     def test_jagged_layer_norm(self):
