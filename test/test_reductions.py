@@ -20,7 +20,6 @@ from helion._testing import skipIfRocm
 from helion._testing import skipIfTileIR
 from helion._testing import skipUnlessTensorDescriptor
 from helion._testing import xfailIfCute
-from helion._testing import xfailIfPallas
 from helion._testing import xfailIfPallasTpu
 import helion.language as hl
 
