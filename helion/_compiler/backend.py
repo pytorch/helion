@@ -1045,6 +1045,11 @@ _TORCH_TO_JAX_DTYPE: dict[str, str] = {
     "torch.bool": "jnp.bool_",
     "torch.complex64": "jnp.complex64",
     "torch.complex128": "jnp.complex128",
+    "torch.float8_e4m3fn": "jnp.float8_e4m3fn",
+    "torch.float8_e4m3fnuz": "jnp.float8_e4m3fnuz",
+    "torch.float8_e5m2": "jnp.float8_e5m2",
+    "torch.float8_e5m2fnuz": "jnp.float8_e5m2fnuz",
+    "torch.float8_e8m0fnu": "jnp.float8_e8m0fnu",
 }
 
 
