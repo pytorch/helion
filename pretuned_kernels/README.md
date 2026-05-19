@@ -6,11 +6,11 @@ points for common kernel patterns while also being runnable examples for people
 who want to quickly try Helion.
 
 The checked-in heuristics let these kernels run immediately without online
-autotuning.  Heuristics ship for both NVIDIA H100 (`sm90`) and B200 (`sm100`);
-Helion picks the matching file at runtime.  Treat the files as kernel recipes:
-copy the kernel and its local `_helion_aot_*` heuristic into your code, then
-retune when your target shapes or hardware differ materially from the included
-sweep.
+autotuning.  Heuristics ship for NVIDIA H100 (`sm90`), NVIDIA B200 (`sm100`),
+and AMD MI350 (`gfx950`) where tuned configs are available; Helion picks the
+matching file at runtime.  Treat the files as kernel recipes: copy the kernel
+and its local `_helion_aot_*` heuristic into your code, then retune when your
+target shapes or hardware differ materially from the included sweep.
 
 Each kernel module has a `main()` that benchmarks against PyTorch eager.
 
@@ -28,6 +28,8 @@ pretuned_kernels/
 ├── rms_norm/
 ├── cross_entropy/
 └── rope/
+    ├── _helion_aot_rope_cuda_sm90.py
+    └── _helion_aot_rope_rocm_gfx950.py
 ```
 
 Each kernel ships with one heuristic file per supported compute capability.
