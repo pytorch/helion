@@ -2610,6 +2610,85 @@ class TestPallas(TestCase):
             ref[i] = (x[s:e] @ y[s:e].T).sum()
         torch.testing.assert_close(result, ref, rtol=1e-2, atol=1e-2)
 
+    def test_if_branch_intermediate_outputs(self) -> None:
+        """Branch intermediates must survive in _if output list."""
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def if_with_intermediate(x: torch.Tensor, flag: float) -> torch.Tensor:
+            n, m = x.shape
+            block_n = hl.register_block_size(n)
+            block_m = hl.register_block_size(m)
+            out = torch.empty([n], device=x.device, dtype=torch.float32)
+            for tile_n in hl.tile(n, block_size=block_n):
+                acc = hl.zeros([tile_n, block_m], dtype=torch.float32)
+                for tile_m in hl.tile(m, block_size=block_m):
+                    v = x[tile_n, tile_m]
+                    if flag == 0.0:
+                        doubled = v * 2
+                        acc += doubled + 1
+                    else:
+                        acc += v
+                out[tile_n] = torch.sum(acc, dim=1)
+            return out
+
+        x = torch.randn(64, 64, device=DEVICE, dtype=torch.float32)
+
+        # else-branch
+        code, result = code_and_output(
+            if_with_intermediate,
+            (x, 0.5),
+            block_sizes=[1, 64],
+        )
+        self.assertIn("lax.cond", code)
+        torch.testing.assert_close(result, torch.sum(x, dim=1))
+
+        # if-branch
+        _, result = code_and_output(
+            if_with_intermediate,
+            (x, 0.0),
+            block_sizes=[1, 64],
+        )
+        torch.testing.assert_close(result, torch.sum(x * 2 + 1, dim=1))
+
+    def test_branch_nonlocal_write(self) -> None:
+        """Branch intermediates must survive in _if output list."""
+
+        @helion.kernel(backend="pallas", static_shapes=True, print_output_code=True)
+        def fn(x: torch.Tensor, flag: float, coeffs: torch.Tensor) -> torch.Tensor:
+            (n,) = x.shape
+            block_n = hl.register_block_size(n)
+            out = torch.empty([n], device=x.device, dtype=torch.float32)
+            for tile_n in hl.tile(n, block_size=block_n):
+                coeff_a = coeffs[0]
+                coeff_b = coeffs[1]
+                if flag == 1.0:
+                    coeff_a = coeffs[2]
+                    coeff_new = coeffs[3]
+                else:
+                    coeff_b = coeffs[4]
+                    coeff_new = coeffs[5]
+                out[tile_n] = x[tile_n] * coeff_a * coeff_b * coeff_new
+            return out
+
+        x = torch.ones(64, device=DEVICE, dtype=torch.float32)
+        coeffs = torch.arange(6, device=DEVICE, dtype=torch.float32)
+
+        # if-branch
+        code, result = code_and_output(
+            fn,
+            (x, 1.0, coeffs),
+            block_sizes=[64],
+        )
+        torch.testing.assert_close(result, x * coeffs[2] * coeffs[1] * coeffs[3])
+
+        # else-branch
+        code, result = code_and_output(
+            fn,
+            (x, 0.0, coeffs),
+            block_sizes=[64],
+        )
+        torch.testing.assert_close(result, x * coeffs[0] * coeffs[4] * coeffs[5])
+
 
 @skipUnlessPallas("JAX/Pallas TPU not available")
 class TestPallasIndirectGather(TestCase):

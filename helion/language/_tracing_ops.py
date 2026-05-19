@@ -2402,7 +2402,14 @@ def _(state: CodegenState) -> list[object]:
     if_ast_node = create(ast.If, test=test, body=if_body_stmts, orelse=else_body_stmts)
     state.add_statement(if_ast_node)
 
-    return if_outputs + else_outputs
+    if_return_names, else_return_names = graph_info.get_branches_return_names(
+        state, if_outputs, else_outputs
+    )
+    return cast(
+        "list[object]",
+        [expr_from_string(n) for n in if_return_names]
+        + [expr_from_string(n) for n in else_return_names],
+    )
 
 
 # Note we can't DCE phi nodes because there may be a loop carry dependency not captured in the outer graph
