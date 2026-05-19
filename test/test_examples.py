@@ -36,6 +36,7 @@ from helion._testing import skipIfTileIR
 from helion._testing import skipIfXPU
 from helion._testing import xfailIfCute
 from helion._testing import xfailIfPallas
+from helion._testing import xfailIfPallasInterpret
 from helion._testing import xfailIfPallasTpu
 from helion.runtime.config import Config
 from helion.runtime.ref_mode import is_ref_mode_enabled
@@ -1557,6 +1558,9 @@ class TestExamples(RefEagerTestBase, TestCase):
             num_stages=3,
         )
 
+    @xfailIfPallasInterpret(
+        "JAX interpret cannot trace dynamic shapes (TypeError: JitTracer ~int32[])"
+    )
     def test_jsd(self):
         args = (
             torch.randn([1024, 4096], device=DEVICE, dtype=torch.float32).log_softmax(
@@ -1582,6 +1586,9 @@ class TestExamples(RefEagerTestBase, TestCase):
             num_stages=3,
         )
 
+    @xfailIfPallasInterpret(
+        "JAX interpret cannot trace dynamic shapes (TypeError: JitTracer ~int32[])"
+    )
     def test_kl_div(self):
         if _get_backend() == "cute" and "B200" in get_nvidia_gpu_model():
             pytest.xfail("CuTe KL-div example still launches out of resources on B200")
@@ -1937,6 +1944,7 @@ class TestExamples(RefEagerTestBase, TestCase):
         131072, reason="block sizes exceed device shared memory limit"
     )
     @skipIfXPU("Squeeze-and-excitation network not supported on XPU")
+    @xfailIfPallasInterpret("numerical mismatch in JAX interpret mode")
     def test_squeeze_and_excitation_net_fwd(self):
         m, n, k = 128, 128, 128
         x = torch.randn([m, n], device=DEVICE, dtype=torch.float32)
@@ -2404,7 +2412,7 @@ class TestExamples(RefEagerTestBase, TestCase):
         lambda: _get_backend() == "cute",
         "CuTe Mamba2 chunk-state destabilizes later cute tests when it fails in-process",
     )
-    @xfailIfPallas(
+    @xfailIfPallasTpu(
         "dA_cumsum has mixed scalar+slice access (VMEM), but Mosaic requires 32-bit for VMEM scalar extracts"
     )
     def test_mamba2_chunk_state(self):

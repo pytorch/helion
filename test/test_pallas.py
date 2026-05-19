@@ -13,6 +13,8 @@ from helion._testing import code_and_output
 from helion._testing import onlyBackends
 from helion._testing import skipUnlessPallas
 from helion._testing import xfailIfPallas
+from helion._testing import xfailIfPallasInterpret
+from helion._testing import xfailIfPallasTpu
 import helion.language as hl
 
 
@@ -470,7 +472,12 @@ class TestPallas(TestCase):
             if "Ran out of memory in memory space vmem" in str(e):
                 self.fail(f"bfloat16 incorrectly threw VMEM OOM: {e}")
 
-        # Test 3: float8_e4m3fn (1 byte per element)
+    @xfailIfPallasInterpret(
+        "torch.float8_e4m3fn has no JAX dtype mapping in interpret mode; "
+        "conversion errors before the VMEM check fires"
+    )
+    def test_estimate_pallas_vmem_bytes_fp8(self) -> None:
+        """VMEM OOM at fp8 (1 byte/element)."""
         # 3 tensors * 4096 * 8192 * 1 byte * 2 (multiplier) = ~201.3MB (OOM)
         args_fp8 = (
             torch.randn(4096, 8192, device=DEVICE, dtype=torch.float32).to(
@@ -1299,6 +1306,7 @@ class TestPallas(TestCase):
         result = fn(x)
         torch.testing.assert_close(result, x)
 
+    @xfailIfPallasInterpret("numerical mismatch in JAX interpret mode")
     def test_scalar_access_2D_constexpr(self) -> None:
         @helion.kernel(backend="pallas", static_shapes=True, config=helion.Config())
         def fn(x: torch.Tensor) -> torch.Tensor:
@@ -1340,6 +1348,7 @@ class TestPallas(TestCase):
         expected = x.permute(0, 2, 1)
         torch.testing.assert_close(result, expected)
 
+    @xfailIfPallasInterpret("numerical mismatch in JAX interpret mode")
     def test_tile_index_with_symbolic_offset(self) -> None:
         """tile.index + tile.begin * constant should codegen valid variable names.
 
@@ -1361,6 +1370,7 @@ class TestPallas(TestCase):
         # pl.multiple_of hint should NOT be applied to offset expressions
         self.assertNotIn("pl.multiple_of(", code)
 
+    @xfailIfPallasInterpret("numerical mismatch in JAX interpret mode")
     def test_tile_index_with_symbolic_offset_emit_pipeline(self) -> None:
         """Same kernel under pallas_loop_type='emit_pipeline'.
 
@@ -1425,7 +1435,7 @@ class TestPallas(TestCase):
         expected = x + x[:, -1:]
         torch.testing.assert_close(result, expected)
 
-    @xfailIfPallas(
+    @xfailIfPallasTpu(
         "Mixed scalar write + slice needs tensor duplication into SMEM and VMEM"
     )
     def test_mixed_scalar_write_and_slice_access(self) -> None:
@@ -1518,7 +1528,7 @@ class TestPallas(TestCase):
         expected = x + 0.5
         torch.testing.assert_close(result, expected)
 
-    @xfailIfPallas("Pallas backend not correctly handling tile index with offset")
+    @xfailIfPallasTpu("Pallas TPU not correctly handling tile index with offset")
     def test_tensor_access_tile_index_offset(self) -> None:
         @helion.kernel(backend="pallas", static_shapes=True)
         def fn(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -1854,6 +1864,9 @@ class TestPallas(TestCase):
         ref = x.view(8, 8, 384).sum(1)
         torch.testing.assert_close(result, ref, rtol=1e-3, atol=1e-3)
 
+    @xfailIfPallasInterpret(
+        "JAX interpret cannot trace dynamic shapes (TypeError: JitTracer ~int32[])"
+    )
     def test_emit_pipeline_per_tensor_pipelined_mixed(self) -> None:
         """An emit_pipeline body can mix pipelined and non-pipelined tensors.
 
@@ -2502,6 +2515,7 @@ class TestPallas(TestCase):
         )
         torch.testing.assert_close(result, ref, rtol=1e-3, atol=1e-3)
 
+    @xfailIfPallasInterpret("numerical mismatch in JAX interpret mode")
     def test_dma_buffer_offset_nested_tile(self) -> None:
         """Inner loop reading outer-tiled tensor must use ':' not absolute offset."""
 

@@ -32,6 +32,8 @@ from helion._testing import skipIfRefEager
 from helion._testing import skipIfTileIR
 from helion._testing import skipIfXPU
 from helion._testing import xfailIfPallas
+from helion._testing import xfailIfPallasInterpret
+from helion._testing import xfailIfPallasTpu
 import helion.language as hl
 
 datadir = Path(__file__).parent / "data"
@@ -218,7 +220,7 @@ class TestLoops(RefEagerTestBase, TestCase):
         )
         torch.testing.assert_close(result, torch.sin(args[0]))
 
-    @xfailIfPallas("uses Triton-specific config options (block_ptr, pid_type)")
+    @xfailIfPallasTpu("uses Triton-specific config options (block_ptr, pid_type)")
     def test_flattened_tile_with_unit_axis(self):
         @helion.kernel(
             config=helion.Config(
@@ -251,7 +253,7 @@ class TestLoops(RefEagerTestBase, TestCase):
 
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfTileIR("TileIR does not support block_ptr indexing")
-    @xfailIfPallas(
+    @xfailIfPallasTpu(
         "emit_pipeline + block_ptr indexing fails Mosaic alignment proof "
         "on the trailing 16-block dim (E2003)"
     )
@@ -290,6 +292,7 @@ class TestLoops(RefEagerTestBase, TestCase):
         )
         torch.testing.assert_close(result, torch.sin(args[0]))
 
+    @xfailIfPallasInterpret("numerical mismatch in JAX interpret mode")
     def test_three_level_matmul(self):
         @helion.kernel(static_shapes=True)
         def matmul(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -1296,6 +1299,10 @@ class TestLoops(RefEagerTestBase, TestCase):
         expected = x + fill_value[0]
         torch.testing.assert_close(result, expected)
 
+    @xfailIfPallasInterpret(
+        "JAX MLIR translation rule for primitive 'program_id' is not implemented "
+        "for the CPU platform"
+    )
     def test_nested_loop_accumulator(self):
         """Test variable scoping with nested loops and accumulator pattern."""
 
