@@ -502,6 +502,8 @@ def _pallas_prepare_args(
     args: tuple[object, ...],
     _output_indices: list[int],
     _inplace_indices: list[int] | None = None,
+    *,
+    interpret: bool = False,
 ) -> tuple[
     list[int],
     list[int],
@@ -523,9 +525,7 @@ def _pallas_prepare_args(
     - inplace_positions: positions that are both input and output
     - out_shapes: JAX placeholders for output shapes
     """
-    from .settings import is_pallas_interpret
-
-    if is_pallas_interpret():
+    if interpret:
         placeholder_fn = _jax_placeholder_for_tensor
     else:
         from torch_tpu._internal.pallas.pallas import (  # pyrefly: ignore[missing-import]
@@ -631,6 +631,8 @@ def _pallas_build_callable(
     cache_attr: str,
     call_aliases: dict[int, int],
     trace_key_suffix: str = "",
+    *,
+    interpret: bool = False,
 ) -> object:
     """Build a ``JaxCallable``, cache it on the kernel, and return it.
 
@@ -655,7 +657,7 @@ def _pallas_build_callable(
         )
         return callable_obj
 
-    if _pallas_interpret_flag():
+    if interpret:
         return _make_interpret_callable()
 
     import jax
@@ -720,20 +722,6 @@ class _PallasInterpretCallable:
         # Return JAX results so output-only tensors can be handled
         # by _pallas_invoke_and_return.
         return tuple(jax_results)
-
-
-def _pallas_interpret_flag() -> bool:
-    """Return True if ``HELION_PALLAS_INTERPRET=1`` is set.
-
-    As a side effect, registers a synthetic CPU TpuInfo entry so that
-    ``emit_pipeline`` / ``fori_loop`` interpret paths don't fail.
-    """
-    from .settings import is_pallas_interpret
-
-    result = is_pallas_interpret()
-    if result:
-        _ensure_cpu_tpu_info()
-    return result
 
 
 def _ensure_cpu_tpu_info() -> None:
@@ -888,6 +876,7 @@ def default_pallas_launcher(
     _block_spec_info: _BlockSpecInfo | None = None,
     _smem_arg_indices: list[int] | None = None,
     _ds_pad_dims: list[tuple[int, int, int, int]] | None = None,
+    _pallas_interpret: bool | None = None,
     **kwargs: object,
 ) -> object:
     """Default launcher for Pallas kernels on TPU (or CPU with interpret=True).
@@ -902,6 +891,14 @@ def default_pallas_launcher(
     are excluded from pallas_call inputs to save VMEM.  Their results are
     returned as torch tensors.
     """
+    from .settings import is_pallas_interpret
+
+    interpret = (
+        _pallas_interpret if _pallas_interpret is not None else is_pallas_interpret()
+    )
+    if interpret:
+        _ensure_cpu_tpu_info()
+
     if _output_indices is None:
         _output_indices = []
 
@@ -930,7 +927,9 @@ def default_pallas_launcher(
             inplace_positions,
             out_shapes,
             pallas_aliases,
-        ) = _pallas_prepare_args(args, _output_indices, _inplace_indices)
+        ) = _pallas_prepare_args(
+            args, _output_indices, _inplace_indices, interpret=interpret
+        )
 
         in_specs, out_specs = _pallas_build_block_specs(
             pl,
@@ -981,7 +980,7 @@ def default_pallas_launcher(
             "out_shape": out_shape_arg,
             "grid": grid,
         }
-        if _pallas_interpret_flag():
+        if interpret:
             pallas_call_kwargs["interpret"] = True
         if in_specs is not None:
             pallas_call_kwargs["in_specs"] = in_specs
@@ -1001,6 +1000,7 @@ def default_pallas_launcher(
             tensor_arg_indices,
             cache_attr="_pallas_cache",
             call_aliases=pallas_aliases,
+            interpret=interpret,
         )
 
     return _pallas_invoke_and_return(
@@ -1025,6 +1025,7 @@ def default_pallas_pipeline_launcher(
     _pipeline_arg_indices: list[int] | None = None,
     _ds_pad_dims: list[tuple[int, int, int, int]] | None = None,
     _smem_arg_indices: list[int] | None = None,
+    _pallas_interpret: bool | None = None,
     **kwargs: object,
 ) -> object:
     """Launcher for Pallas kernels using PrefetchScalarGridSpec with scratch memory.
@@ -1033,6 +1034,14 @@ def default_pallas_pipeline_launcher(
     (listed in ``_pipeline_arg_indices``) use HBM refs; all other tensors
     get proper BlockSpecs for automatic VMEM prefetch.
     """
+    from .settings import is_pallas_interpret
+
+    interpret = (
+        _pallas_interpret if _pallas_interpret is not None else is_pallas_interpret()
+    )
+    if interpret:
+        _ensure_cpu_tpu_info()
+
     if _output_indices is None:
         _output_indices = []
     if _scratch_shapes is None:
@@ -1063,7 +1072,9 @@ def default_pallas_pipeline_launcher(
             inplace_positions,
             out_shapes,
             pallas_aliases,
-        ) = _pallas_prepare_args(args, _output_indices, _inplace_indices)
+        ) = _pallas_prepare_args(
+            args, _output_indices, _inplace_indices, interpret=interpret
+        )
 
         # Build scratch shapes for VMEM
         _jnp_dtype_map = _pallas_jnp_dtype_map()
@@ -1149,7 +1160,7 @@ def default_pallas_pipeline_launcher(
                 dimension_semantics=tuple("parallel" for _ in grid),
             ),
         }
-        if _pallas_interpret_flag():
+        if interpret:
             pallas_call_kwargs["interpret"] = True
 
         jit_fn = pl.pallas_call(
@@ -1167,6 +1178,7 @@ def default_pallas_pipeline_launcher(
             cache_attr="_pallas_pipeline_cache",
             call_aliases=pallas_aliases,
             trace_key_suffix="_pipeline",
+            interpret=interpret,
         )
 
     return _pallas_invoke_and_return(
@@ -1190,6 +1202,7 @@ def default_pallas_fori_launcher(
     _scratch_shapes: list[tuple[tuple[int, ...], str | None, str]] | None = None,
     _ds_pad_dims: list[tuple[int, int, int, int]] | None = None,
     _smem_arg_indices: list[int] | None = None,
+    _pallas_interpret: bool | None = None,
     **kwargs: object,
 ) -> object:
     """Launcher for Pallas kernels using fori_loop with manual DMA.
@@ -1200,6 +1213,14 @@ def default_pallas_fori_launcher(
     The kernel uses ``jax.lax.fori_loop`` with ``pltpu.make_async_copy``
     internally for DMA control.
     """
+    from .settings import is_pallas_interpret
+
+    interpret = (
+        _pallas_interpret if _pallas_interpret is not None else is_pallas_interpret()
+    )
+    if interpret:
+        _ensure_cpu_tpu_info()
+
     if _output_indices is None:
         _output_indices = []
     if _scratch_shapes is None:
@@ -1230,7 +1251,9 @@ def default_pallas_fori_launcher(
             inplace_positions,
             out_shapes,
             pallas_aliases,
-        ) = _pallas_prepare_args(args, _output_indices, _inplace_indices)
+        ) = _pallas_prepare_args(
+            args, _output_indices, _inplace_indices, interpret=interpret
+        )
 
         # Build scratch shapes: VMEM buffers + DMA semaphores
         _jnp_dtype_map = _pallas_jnp_dtype_map()
@@ -1315,7 +1338,7 @@ def default_pallas_fori_launcher(
                 dimension_semantics=tuple("parallel" for _ in grid),
             ),
         }
-        if _pallas_interpret_flag():
+        if interpret:
             pallas_call_kwargs["interpret"] = True
 
         jit_fn = pl.pallas_call(
@@ -1333,6 +1356,7 @@ def default_pallas_fori_launcher(
             cache_attr="_pallas_fori_cache",
             call_aliases=pallas_aliases,
             trace_key_suffix="_fori",
+            interpret=interpret,
         )
 
     return _pallas_invoke_and_return(
