@@ -1232,6 +1232,30 @@ class TestPallas(TestCase):
         x = torch.randn(4, 8, dtype=torch.float32, device=DEVICE)
         code_and_output(k, (x,))
 
+    def test_tile_index_broadcast_mask(self) -> None:
+        """Two 1D ``tile.index`` tensors must broadcast into a 2D mask via
+        ``[:, None]`` / ``[None, :]`` indexing — the natural PyTorch idiom
+        for causal / sliding-window mask construction.
+        """
+
+        @helion.kernel(static_shapes=True)
+        def k(x: torch.Tensor) -> torch.Tensor:
+            M, N = x.size()
+            out = torch.empty_like(x)
+            for tile_m in hl.tile(M):
+                for tile_n in hl.tile(N):
+                    mask = tile_m.index[:, None] >= tile_n.index[None, :]
+                    out[tile_m, tile_n] = torch.where(
+                        mask, x[tile_m, tile_n], torch.zeros_like(x[tile_m, tile_n])
+                    )
+            return out
+
+        x = torch.randn(8, 8, dtype=torch.float32, device=DEVICE)
+        _, result = code_and_output(k, (x,))
+        idx = torch.arange(8, device=DEVICE)
+        ref = torch.where(idx[:, None] >= idx[None, :], x, torch.zeros_like(x))
+        torch.testing.assert_close(result, ref)
+
     def test_emit_pipeline_loop_order(self) -> None:
         """Test emit_pipeline with loop_order reordering.
 

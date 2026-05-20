@@ -1541,6 +1541,7 @@ class DeviceFunction:
     def get_tensor_read_write_names(self) -> tuple[set[str], set[str]]:
         """Returns AST names of read and written tensors"""
         from helion.language import memory_ops
+        from helion.language import tile_index
         from helion.language.atomic_ops import ATOMIC_OPS
 
         read_names: set[str] = set()
@@ -1550,20 +1551,35 @@ class DeviceFunction:
                 if node.op != "call_function":
                     continue
 
-                def _get_tensor_name(node: torch.fx.Node) -> str:
+                def _get_tensor_name(node: torch.fx.Node) -> str | None:
                     tensor_arg = node.args[0]
                     assert isinstance(tensor_arg, torch.fx.Node)
+                    # tile.index loads operate on a synthesized FakeTensor
+                    # that is not registered in ``tensor_to_origin``; they
+                    # are materialized inline by the load codegen rather
+                    # than referencing a kernel-arg tensor.
+                    if (
+                        tensor_arg.op == "call_function"
+                        and tensor_arg.target == tile_index
+                    ):
+                        return None
                     tensor_val = tensor_arg.meta.get("val")
                     assert isinstance(tensor_val, torch.Tensor)
                     return self.tensor_arg(tensor_val).name
 
                 if node.target is memory_ops.load:
-                    read_names.add(_get_tensor_name(node))
+                    name = _get_tensor_name(node)
+                    if name is not None:
+                        read_names.add(name)
                 elif node.target is memory_ops.store:
-                    write_names.add(_get_tensor_name(node))
+                    name = _get_tensor_name(node)
+                    if name is not None:
+                        write_names.add(name)
                 elif node.target in ATOMIC_OPS:
-                    read_names.add(_get_tensor_name(node))
-                    write_names.add(_get_tensor_name(node))
+                    name = _get_tensor_name(node)
+                    if name is not None:
+                        read_names.add(name)
+                        write_names.add(name)
         return read_names, write_names
 
     def __enter__(self) -> None:
