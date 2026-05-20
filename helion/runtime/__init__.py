@@ -788,11 +788,11 @@ def _pallas_invoke_and_return(
                 # On TPU, JaxCallable returns torch tensors directly.
                 out_tensor = cast("torch.Tensor", args[orig_pos])
                 # Output-only tensors are allocated with ``device='meta'`` to
-                # avoid HBM; fall back to the first real input's device in
-                # interpret mode so the converted tensor lands somewhere real.
+                # avoid HBM; interpret mode runs on CPU so the converted
+                # tensor lands there.
                 device = out_tensor.device
-                if device.type == "meta" and tensor_arg_indices:
-                    device = cast("torch.Tensor", args[tensor_arg_indices[0]]).device
+                if device.type == "meta":
+                    device = torch.device("cpu")
                 result = _jax_to_torch(
                     result,
                     device=device,
