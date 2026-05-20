@@ -35,6 +35,7 @@ from helion._testing import skipIfRocm
 from helion._testing import skipIfTileIR
 from helion._testing import skipIfXPU
 from helion._testing import xfailIfCute
+from helion._testing import xfailIfFn
 from helion._testing import xfailIfPallas
 from helion.runtime.config import Config
 from helion.runtime.ref_mode import is_ref_mode_enabled
@@ -1117,7 +1118,11 @@ class TestExamples(RefEagerTestBase, TestCase):
         lambda: _get_backend() == "cute",
         "CuTe FP8 attention destabilizes later cute tests when it fails in-process",
     )
-    @skipIfNotCUDA()
+    @xfailIfFn(
+        lambda: DEVICE.type in ("xpu", "rocm")
+        or (_get_backend() == "triton" and DEVICE.type != "cuda"),
+        "FP8 attention example is only enabled for CUDA and Pallas TPU",
+    )
     @skipIfCudaCapabilityLessThan((9, 0), reason="FP8 requires CUDA capability >= 9.0")
     def test_fp8_attention(self):
         batch = 2
