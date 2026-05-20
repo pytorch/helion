@@ -85,6 +85,12 @@ def _looks_like_tracked_load(node: ast.AST) -> ast.IfExp | None:
     return node
 
 
+def offset_var_for(loop: ast.For) -> str:
+    """Return the for-loop target variable name."""
+    assert isinstance(loop.target, ast.Name)
+    return loop.target.id
+
+
 def _dtype_from_default(node: ast.expr) -> str | None:
     """Extract dtype from the else branch of a masked load.
 
@@ -132,24 +138,6 @@ def _trip_count_for(
 def _node_text(node: ast.AST) -> str:
     """Stable text key for matching AST nodes."""
     return ast.unparse(node)
-
-
-def _has_side_effect(stmt: ast.stmt) -> bool:
-    """Return True for statements with possible side effects (stores, function
-    calls that aren't pure loads, augmented assignments).
-
-    Used to bail out when the second loop has a statement *before* the
-    fused load that depends on the first loop's tile values via some
-    intermediate mutation — we leave that case unchanged.
-    """
-    for n in ast.walk(stmt):
-        if isinstance(n, (ast.AugAssign, ast.Global, ast.Nonlocal, ast.Delete)):
-            return True
-        if isinstance(n, ast.Call):
-            func = n.func
-            if isinstance(func, ast.Attribute) and func.attr in {"store", "atomic_add"}:
-                return True
-    return False
 
 
 class _CuteFuseTwoPassLoads(ast.NodeTransformer):
@@ -210,10 +198,30 @@ class _CuteFuseTwoPassLoads(ast.NodeTransformer):
             if trip is None or trip <= 1 or trip > 32:
                 continue
 
-            # Collect tracked loads in the first loop body, keyed by
-            # their unparsed text.
+            second_idx = group[1]
+            second_loop = new_body[second_idx]
+            assert isinstance(second_loop, ast.For)
+            # Only the simple (no nested lane loop) case is fused. With a
+            # nested lane loop the cache index mixes runtime ``offset``
+            # with the lane variable, and CUTLASS DSL falls back to local
+            # memory (spilled to stack), which regresses performance.
+            container_first = first_loop.body
+            container_second = second_loop.body
+            cache_size = trip
+            cache_index = (
+                f"({offset_var_for(first_loop)} - ({_node_text(start)})) // "
+                f"({_node_text(step)})"
+            )
+            # Bail out on nested for-loops in either body to keep the
+            # simple-case invariant.
+            if any(isinstance(s, ast.For) for s in container_first):
+                continue
+            if any(isinstance(s, ast.For) for s in container_second):
+                continue
+
+            # Collect tracked loads, keyed by unparsed text.
             tracked: dict[str, tuple[int, str]] = {}
-            for j, s in enumerate(first_loop.body):
+            for j, s in enumerate(container_first):
                 if (
                     isinstance(s, ast.Assign)
                     and len(s.targets) == 1
@@ -222,19 +230,12 @@ class _CuteFuseTwoPassLoads(ast.NodeTransformer):
                     load = _looks_like_tracked_load(s.value)
                     if load is not None:
                         tracked[_node_text(load)] = (j, s.targets[0].id)
-
             if not tracked:
                 continue
 
-            # Find which loads in subsequent loops match. We only fuse
-            # the FIRST follower (a 2-loop fusion). Multi-loop fusion is
-            # left to future iteration.
-            second_idx = group[1]
-            second_loop = new_body[second_idx]
-            assert isinstance(second_loop, ast.For)
-
+            # Find matching loads in the second loop's container.
             assignments_to_rewrite: list[tuple[int, str, str]] = []
-            for j, s in enumerate(second_loop.body):
+            for j, s in enumerate(container_second):
                 if (
                     isinstance(s, ast.Assign)
                     and len(s.targets) == 1
@@ -245,28 +246,17 @@ class _CuteFuseTwoPassLoads(ast.NodeTransformer):
                         continue
                     key = _node_text(load)
                     if key in tracked:
-                        _first_j, _first_name = tracked[key]
                         assignments_to_rewrite.append((j, s.targets[0].id, key))
             if not assignments_to_rewrite:
                 continue
 
-            # Safety: if the second loop has any unrelated side-effecting
-            # statement BEFORE the load we want to fuse, we still rewrite
-            # — caching the load doesn't change semantics. The
-            # `_has_side_effect` helper is reserved for future, finer
-            # filtering.
-
-            # Build the rewrites.
-            assert isinstance(first_loop.target, ast.Name)
-            offset_var = first_loop.target.id  # same in both loops
+            # Build cache declarations.
             cache_names: dict[str, str] = {}
             cache_decls: list[ast.stmt] = []
             for key, (j, _name) in tracked.items():
                 if not any(akey == key for _, _, akey in assignments_to_rewrite):
                     continue
-                # Recover the load node so we can extract the dtype from
-                # the else-branch default value.
-                load_stmt = first_loop.body[j]
+                load_stmt = container_first[j]
                 assert isinstance(load_stmt, ast.Assign)
                 load_ifexp = _looks_like_tracked_load(load_stmt.value)
                 assert load_ifexp is not None
@@ -277,17 +267,16 @@ class _CuteFuseTwoPassLoads(ast.NodeTransformer):
                 cache_names[key] = cache
                 cache_decls.append(
                     statement_from_string(
-                        f"{cache} = cute.make_fragment({trip}, {dtype})"
+                        f"{cache} = cute.make_fragment({cache_size}, {dtype})"
                     )
                 )
-
             if not cache_names:
                 continue
 
             # Rewrite the first loop: insert cache writes after each tracked
-            # load, indexed by the iteration counter (offset // step).
+            # load.
             new_first_body: list[ast.stmt] = []
-            for s in first_loop.body:
+            for s in container_first:
                 new_first_body.append(s)
                 if (
                     isinstance(s, ast.Assign)
@@ -303,17 +292,14 @@ class _CuteFuseTwoPassLoads(ast.NodeTransformer):
                         continue
                     name = s.targets[0].id
                     new_first_body.append(
-                        statement_from_string(
-                            f"{cache}[({offset_var} - ({_node_text(start)})) // "
-                            f"({_node_text(step)})] = {name}"
-                        )
+                        statement_from_string(f"{cache}[{cache_index}] = {name}")
                     )
             first_loop.body = new_first_body
 
-            # Rewrite the second loop: replace each matched load with a read
-            # from the cache.
+            # Rewrite the second loop: replace each matched load with a
+            # read from the cache.
             new_second_body: list[ast.stmt] = []
-            for s in second_loop.body:
+            for s in container_second:
                 if (
                     isinstance(s, ast.Assign)
                     and len(s.targets) == 1
@@ -327,9 +313,7 @@ class _CuteFuseTwoPassLoads(ast.NodeTransformer):
                             name = s.targets[0].id
                             new_second_body.append(
                                 statement_from_string(
-                                    f"{name} = {cache}[({offset_var} - "
-                                    f"({_node_text(start)})) // "
-                                    f"({_node_text(step)})]"
+                                    f"{name} = {cache}[{cache_index}]"
                                 )
                             )
                             continue
