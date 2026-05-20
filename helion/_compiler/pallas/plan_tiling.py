@@ -60,6 +60,36 @@ class ArbitraryIndexPattern(IndexingPattern):
     index: int | torch.SymInt | object | None
 
 
+@dataclass(frozen=True)
+class GridIndexMap:
+    """Scalar tensor index derived from a single ``hl.grid`` variable."""
+
+    grid_block_id: int
+    divisor: int = 1
+    modulus: int | None = None
+
+    def as_tuple(self) -> tuple[int, int, int | None]:
+        return (self.grid_block_id, self.divisor, self.modulus)
+
+    def index_expr(self, base: str) -> str:
+        expr = base
+        if self.divisor != 1:
+            expr = f"({expr} // {self.divisor})"
+        if self.modulus is not None:
+            expr = f"({expr} % {self.modulus})"
+        return expr
+
+    def slice_expr(self, base: str) -> str:
+        return f"pl.ds({self.index_expr(base)}, 1)"
+
+
+@dataclass
+class GridIndexPattern(IndexingPattern):
+    """Scalar index that should be selected by a Pallas BlockSpec."""
+
+    index_map: GridIndexMap
+
+
 @dataclass
 class NonePattern(IndexingPattern):
     """None index pattern (broadcasting dimension) - allow tiling."""
@@ -83,10 +113,13 @@ class DimensionTiling:
 
     can_tile: whether or not we can tile this dimension
     block_ids: which which block_ids we are indexing this dimension (there can be multiple, in which case we mustn't tile)
+    grid_index_map: scalar index derived from a grid variable. ``modulus=None``
+        means derive it from the grid size.
     """
 
     can_tile: bool = True
     block_ids: list[int] = field(default_factory=list)
+    grid_index_map: GridIndexMap | None = None
 
 
 def plan_tiling(
@@ -150,7 +183,15 @@ def _analyze_indexing(node: torch.fx.Node, config: Config) -> None:
     from ..device_function import PallasMemorySpace
 
     is_all_scalar = all(
-        isinstance(p, (ArbitraryIndexPattern, TileBeginWithOffsetPattern, NonePattern))
+        isinstance(
+            p,
+            (
+                ArbitraryIndexPattern,
+                GridIndexPattern,
+                TileBeginWithOffsetPattern,
+                NonePattern,
+            ),
+        )
         for p in indexing_patterns
     )
     tid = id(tensor_val)
@@ -230,6 +271,10 @@ def _detect_indexing_pattern(
                 if not is_hl_grid:
                     return TilePattern(block_id=block_id)
 
+            index_map = _grid_index_map(idx_val, env)
+            if index_map is not None:
+                return GridIndexPattern(index_map=index_map)
+
         tile_with_offset = _get_tile_with_offset_info(idx_val, node, subscript_index)
         if tile_with_offset is not None:
             return TileIndexWithOffsetPattern(
@@ -259,7 +304,13 @@ def _detect_indexing_pattern(
             )
         return ArbitrarySlicePattern(idx)
 
-    if isinstance(idx, (int, torch.SymInt)):
+    if isinstance(idx, torch.SymInt):
+        index_map = _grid_index_map(idx, env)
+        if index_map is not None:
+            return GridIndexPattern(index_map=index_map)
+        return ArbitraryIndexPattern(idx)
+
+    if isinstance(idx, int):
         return ArbitraryIndexPattern(idx)
 
     raise AssertionError(f"Unrecognized indexing pattern for pallas backend {idx}")
@@ -279,8 +330,12 @@ def _update_tiling_decision(
 
     def _disallow_tiling() -> None:
         curr_dim_tiling.can_tile = False
+        curr_dim_tiling.grid_index_map = None
 
     def _try_set_tiling_block_id(new_block_id: int) -> None:
+        if curr_dim_tiling.grid_index_map is not None:
+            _disallow_tiling()
+            return
         if new_block_id not in curr_dim_tiling.block_ids:
             curr_dim_tiling.block_ids.append(new_block_id)
             if len(curr_dim_tiling.block_ids) > 1:
@@ -308,6 +363,15 @@ def _update_tiling_decision(
         if pattern.slice != slice(None):
             # fow now we only support the `[:]` slice pattern
             _disallow_tiling()
+
+    elif isinstance(pattern, GridIndexPattern):
+        if curr_dim_tiling.block_ids or curr_dim_tiling.grid_index_map not in (
+            None,
+            pattern.index_map,
+        ):
+            _disallow_tiling()
+        else:
+            curr_dim_tiling.grid_index_map = pattern.index_map
 
     elif isinstance(pattern, (ArbitraryIndexPattern, TensorIndexPattern)):
         _disallow_tiling()
@@ -337,6 +401,72 @@ def _update_tiling_decision(
             ):
                 _disallow_tiling()
 
+    if not curr_dim_tiling.can_tile:
+        curr_dim_tiling.grid_index_map = None
+
+
+def _grid_index_map(
+    idx: object,
+    env: CompileEnvironment,
+) -> GridIndexMap | None:
+    """Return BlockSpec index-map metadata for simple grid-derived scalars.
+
+    The runtime BlockSpec tuple format is ``(grid_dim, divisor, modulus)``.
+    At this stage we store the Helion ``block_id``; backend code translates it
+    to the actual Pallas grid dimension after PID ordering is finalized.
+    """
+    if isinstance(idx, torch.fx.Node):
+        idx = idx.meta.get("val")
+    if not isinstance(idx, torch.SymInt):
+        return None
+
+    from ..compile_environment import _symint_expr
+    from ..compile_environment import shape_env_size_hint
+    from ..host_function import HostFunction
+    from ..variable_origin import GridOrigin
+
+    expr = _symint_expr(idx)
+    if expr is None:
+        return None
+
+    grid_symbols: list[tuple[sympy.Symbol, int]] = []
+    replacements: dict[sympy.Symbol, sympy.Integer] = {}
+    host_fn = HostFunction.current()
+    for sym in expr.free_symbols:
+        origin_info = host_fn.expr_to_origin.get(sym)
+        if origin_info is not None and isinstance(origin_info.origin, GridOrigin):
+            grid_symbols.append((sym, origin_info.origin.block_id))
+            continue
+        try:
+            replacements[sym] = sympy.Integer(shape_env_size_hint(env.shape_env, sym))
+        except Exception:
+            return None
+
+    if len(grid_symbols) != 1:
+        return None
+    grid_sym, block_id = grid_symbols[0]
+    expr = expr.xreplace(replacements)
+
+    if expr == grid_sym:
+        return GridIndexMap(grid_block_id=block_id)
+
+    func_name = expr.func.__name__
+    if func_name in {"FloorDiv", "floor"} and len(expr.args) == 2:
+        lhs, rhs = expr.args
+        if lhs == grid_sym and rhs.is_integer:
+            divisor = int(rhs)
+            if divisor > 0:
+                return GridIndexMap(grid_block_id=block_id, divisor=divisor)
+
+    if func_name in {"PythonMod", "Mod"} and len(expr.args) == 2:
+        lhs, rhs = expr.args
+        if lhs == grid_sym and rhs.is_integer:
+            modulus = int(rhs)
+            if modulus > 0:
+                return GridIndexMap(grid_block_id=block_id, modulus=modulus)
+
+    return None
+
 
 def resident_block_elements(
     tensor: torch.Tensor,
@@ -349,8 +479,8 @@ def resident_block_elements(
       - ``NonePattern``: skipped (broadcast axis, no tensor dim consumed).
       - ``TilePattern`` / ``TileIndexWithOffsetPattern``: configured
         ``block_size``, clamped to the full dim extent.
-      - ``TileBeginWithOffsetPattern`` / ``ArbitraryIndexPattern``: scalar
-        index, contributes 1.
+      - ``TileBeginWithOffsetPattern`` / ``ArbitraryIndexPattern`` /
+        ``GridIndexPattern``: scalar index, contributes 1.
       - Anything else (full slice, indirect tensor index): the full dim
         extent.
 
@@ -372,7 +502,14 @@ def resident_block_elements(
             bs = env.block_sizes[p.block_id].from_config(config)
             if isinstance(bs, int):
                 dim_size = min(bs, dim_size)
-        elif isinstance(p, (TileBeginWithOffsetPattern, ArbitraryIndexPattern)):
+        elif isinstance(
+            p,
+            (
+                TileBeginWithOffsetPattern,
+                ArbitraryIndexPattern,
+                GridIndexPattern,
+            ),
+        ):
             dim_size = 1
         elements *= dim_size
         # Advance only on patterns that consume a tensor dim; NonePattern doesn't.
