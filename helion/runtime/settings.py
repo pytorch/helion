@@ -542,6 +542,11 @@ class _Settings:
         )
     )
     autotune_config_filter: Callable[[Config], Config | None] | None = None
+    pallas_interpret: bool = dataclasses.field(
+        default_factory=functools.partial(
+            _env_get_bool, "HELION_PALLAS_INTERPRET", False
+        )
+    )
     triton_do_not_specialize: bool = dataclasses.field(
         default_factory=functools.partial(
             _env_get_bool, "HELION_TRITON_DO_NOT_SPECIALIZE", False
@@ -621,6 +626,10 @@ class Settings(_Settings):
             "If True, set the compile timeout threshold to be smaller for Triton compilation,"
             "based on a quantile of initial compile times (with a lower bound). Lower bound and quantile "
             "are set by the effort profile. Set HELION_AUTOTUNE_ADAPTIVE_TIMEOUT=0 to disable."
+        ),
+        "pallas_interpret": (
+            "If True, run Pallas kernels in interpret mode on CPU (no TPU needed). "
+            "Defaults to HELION_PALLAS_INTERPRET env var."
         ),
         "triton_do_not_specialize": (
             "If True, pass do_not_specialize for every dynamic size/stride/symbol "

@@ -1216,11 +1216,11 @@ class PallasBackend(Backend):
         from .device_function import TensorStrideArg
 
         if isinstance(arg, (SymbolArgument, TensorSizeArg, TensorStrideArg)):
-            from ..runtime.settings import is_pallas_interpret
+            from .compile_environment import CompileEnvironment
 
             if tensor_host_args:
                 device_expr = f"{tensor_host_args[0]}.device"
-            elif is_pallas_interpret():
+            elif CompileEnvironment.current().settings.pallas_interpret:
                 device_expr = "'cpu'"
             else:
                 device_expr = "'tpu'"
