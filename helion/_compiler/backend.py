@@ -1897,6 +1897,9 @@ class PallasBackend(Backend):
                         f"_pipeline_arg_indices={pipeline_arg_indices!r}"
                     )
 
+        if CompileEnvironment.current().settings.pallas_interpret:
+            launcher_args.append("_pallas_interpret=True")
+
         return launcher_args
 
     def build_launcher_name(self, config: Config) -> str:

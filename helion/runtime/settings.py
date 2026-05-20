@@ -338,7 +338,15 @@ def _get_backend() -> str:
 
 
 def is_pallas_interpret() -> bool:
-    """Return True if HELION_PALLAS_INTERPRET=1 is set."""
+    """Return True if pallas_interpret is enabled.
+
+    Checks the active CompileEnvironment first (if one exists),
+    then falls back to the HELION_PALLAS_INTERPRET env var.
+    """
+    from helion._compiler.compile_environment import CompileEnvironment
+
+    if CompileEnvironment.has_current():
+        return CompileEnvironment.current().settings.pallas_interpret
     return _env_get_bool("HELION_PALLAS_INTERPRET", False)
 
 
