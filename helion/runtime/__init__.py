@@ -248,6 +248,20 @@ def _get_vmem_limit_bytes(pltpu: object) -> int:
     if _CACHED_VMEM_LIMIT_BYTES is not None:
         return _CACHED_VMEM_LIMIT_BYTES
 
+    # In interpret mode there is no real TPU; query the synthetic TPU info
+    # registered by ``_ensure_cpu_tpu_info`` so the budget matches what real
+    # TPU 7X reports rather than falling back to the conservative 16MB default.
+    from .settings import is_pallas_interpret
+
+    if is_pallas_interpret():
+        try:
+            from jax._src.pallas.mosaic.tpu_info import registry
+
+            _CACHED_VMEM_LIMIT_BYTES = registry["cpu"]().vmem_capacity_bytes
+            return _CACHED_VMEM_LIMIT_BYTES
+        except (ImportError, KeyError, AttributeError):
+            pass
+
     try:
         get_tpu_info = pltpu.get_tpu_info  # pyrefly: ignore[missing-attribute]
         _CACHED_VMEM_LIMIT_BYTES = get_tpu_info().vmem_capacity_bytes
