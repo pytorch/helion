@@ -1799,6 +1799,60 @@ class ConfigSpec:
             config[name] = mapping._normalize(
                 name, config.get(name, ()), flatten=flatten
             )
+
+        # Clamp inner block sizes that are bounded by an outer block
+        # (e.g. ``hl.tile(outer.begin, outer.end)``): at this point the
+        # outer's concrete block size for this config is known, and the
+        # inner extent can never exceed it.
+        block_sizes_list = config.get("block_sizes")
+        if isinstance(block_sizes_list, list):
+            changed = False
+            new_block_sizes = list(block_sizes_list)
+            for i, spec in enumerate(self.block_sizes):
+                bb = spec.bounded_by_block_id
+                if (
+                    bb is None
+                    or i >= len(new_block_sizes)
+                    or new_block_sizes[i] is None
+                ):
+                    continue
+                try:
+                    outer_index = self.block_sizes.block_id_to_index(bb)
+                except KeyError:
+                    continue
+                outer_val = (
+                    new_block_sizes[outer_index]
+                    if outer_index < len(new_block_sizes)
+                    else None
+                )
+                if (
+                    isinstance(outer_val, int)
+                    and isinstance(new_block_sizes[i], int)
+                    and new_block_sizes[i] > outer_val
+                ):
+                    new_block_sizes[i] = outer_val
+                    changed = True
+            if changed:
+                config["block_sizes"] = new_block_sizes
+                num_threads = config.get("num_threads")
+                if isinstance(num_threads, list):
+                    new_num_threads = list(num_threads)
+                    for i, (block_size, num_thread) in enumerate(
+                        zip(new_block_sizes, new_num_threads, strict=False)
+                    ):
+                        if (
+                            type(block_size) is not int
+                            or type(num_thread) is not int
+                            or num_thread <= 0
+                        ):
+                            continue
+                        if num_thread > block_size:
+                            num_thread = 1 << (max(block_size, 1).bit_length() - 1)
+                        while num_thread > 1 and block_size % num_thread != 0:
+                            num_thread //= 2
+                        new_num_threads[i] = max(num_thread, 1)
+                    config["num_threads"] = new_num_threads
+
         if self.supports_config_key("num_threads"):
             num_threads = cast("list[int]", config.get("num_threads", []))
             if all(value == 0 for value in num_threads):
@@ -2855,6 +2909,7 @@ class BlockSizeSpec(_PowerOfTwoBlockIdItem):
         size_hint: int,
         min_size: int = 1,
         max_size: int | None = None,
+        bounded_by_block_id: int | None = None,
     ) -> None:
         super().__init__([block_id])
         self.size_hint = size_hint
@@ -2872,6 +2927,8 @@ class BlockSizeSpec(_PowerOfTwoBlockIdItem):
         self.max_size: int = (
             next_power_of_2(bounded_hint) if max_size is None else max_size
         )
+        # Outer block_id whose tile extent caps this block's size in normalize().
+        self.bounded_by_block_id: int | None = bounded_by_block_id
         if self.max_size < self.min_size:
             self.max_size = self.min_size
         assert self.min_size <= self.max_size
@@ -2883,6 +2940,7 @@ class BlockSizeSpec(_PowerOfTwoBlockIdItem):
             ("size_hint", None),
             ("min_size", 1),
             ("max_size", next_power_of_2(self.size_hint)),
+            ("bounded_by_block_id", None),
         ):
             value = getattr(self, field)
             if value != default:

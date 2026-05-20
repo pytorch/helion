@@ -407,6 +407,136 @@ class TestSettingsEnv(TestCase):
         # max_size should be bounded by size_hint // world_size = 256, not 1024
         self.assertLessEqual(spec.max_size, size_hint // world_size)
 
+    def test_bounded_inner_block_size_clamped_to_outer_value(self) -> None:
+        from helion._compiler.backend import TritonBackend
+        from helion.autotuner.config_spec import BlockSizeSpec
+        from helion.autotuner.config_spec import ConfigSpec
+
+        # Use Triton only as a concrete backend; this normalize behavior is
+        # backend-agnostic.
+        spec = ConfigSpec(backend=TritonBackend())
+        spec.block_sizes.append(BlockSizeSpec(block_id=0, size_hint=1024))
+        spec.block_sizes.append(
+            BlockSizeSpec(block_id=1, size_hint=1024, bounded_by_block_id=0)
+        )
+
+        config = {"block_sizes": [64, 256]}
+        spec.normalize(config)
+
+        self.assertEqual(config["block_sizes"][:2], [64, 64])
+
+    def test_bounded_inner_block_size_keeps_valid_inner_value(self) -> None:
+        from helion._compiler.backend import TritonBackend
+        from helion.autotuner.config_spec import BlockSizeSpec
+        from helion.autotuner.config_spec import ConfigSpec
+
+        spec = ConfigSpec(backend=TritonBackend())
+        spec.block_sizes.append(BlockSizeSpec(block_id=0, size_hint=1024))
+        spec.block_sizes.append(
+            BlockSizeSpec(block_id=1, size_hint=1024, bounded_by_block_id=0)
+        )
+
+        config = {"block_sizes": [256, 64]}
+        spec.normalize(config)
+
+        self.assertEqual(config["block_sizes"][:2], [256, 64])
+
+    def test_bounded_inner_block_size_clamps_multi_level_nesting(self) -> None:
+        from helion._compiler.backend import TritonBackend
+        from helion.autotuner.config_spec import BlockSizeSpec
+        from helion.autotuner.config_spec import ConfigSpec
+
+        spec = ConfigSpec(backend=TritonBackend())
+        spec.block_sizes.append(BlockSizeSpec(block_id=0, size_hint=1024))
+        spec.block_sizes.append(
+            BlockSizeSpec(block_id=1, size_hint=1024, bounded_by_block_id=0)
+        )
+        spec.block_sizes.append(
+            BlockSizeSpec(block_id=2, size_hint=1024, bounded_by_block_id=1)
+        )
+
+        config = {"block_sizes": [64, 256, 512]}
+        spec.normalize(config)
+
+        self.assertEqual(config["block_sizes"][:3], [64, 64, 64])
+
+    def test_bounded_inner_block_size_repairs_cute_num_threads(self) -> None:
+        from helion._compiler.backend import CuteBackend
+        from helion.autotuner.config_spec import BlockSizeSpec
+        from helion.autotuner.config_spec import ConfigSpec
+        from helion.autotuner.config_spec import NumThreadsSpec
+
+        spec = ConfigSpec(backend=CuteBackend())
+        spec.block_sizes.append(BlockSizeSpec(block_id=0, size_hint=1024))
+        spec.block_sizes.append(
+            BlockSizeSpec(block_id=1, size_hint=1024, bounded_by_block_id=0)
+        )
+        spec.num_threads.append(NumThreadsSpec(block_id=0, size_hint=1024))
+        spec.num_threads.append(NumThreadsSpec(block_id=1, size_hint=1024))
+
+        config = {"block_sizes": [64, 256], "num_threads": [64, 256]}
+        spec.normalize(config)
+
+        self.assertEqual(config["block_sizes"][:2], [64, 64])
+        self.assertEqual(config["num_threads"][:2], [64, 64])
+
+    def test_detect_outer_block_bound_requires_end_minus_begin(self) -> None:
+        from types import SimpleNamespace
+
+        import sympy
+
+        from helion._compiler.host_function import SymbolOrigin
+        from helion._compiler.type_propagation import _detect_outer_block_bound
+        from helion._compiler.variable_origin import TileBeginOrigin
+        from helion._compiler.variable_origin import TileEndOrigin
+
+        begin = sympy.Symbol("begin")
+        end = sympy.Symbol("end")
+        fake_host = SimpleNamespace(
+            expr_to_origin={
+                begin: SymbolOrigin(TileBeginOrigin(3)),
+                end: SymbolOrigin(TileEndOrigin(3)),
+            }
+        )
+        fake_env = SimpleNamespace(get_block_id=lambda _numel: None)
+
+        with (
+            patch(
+                "helion._compiler.type_propagation.HostFunction.current",
+                return_value=fake_host,
+            ),
+            patch(
+                "helion._compiler.type_propagation._symint_expr",
+                side_effect=lambda expr: expr,
+            ),
+        ):
+            self.assertEqual(_detect_outer_block_bound(end - begin, fake_env), 3)
+            self.assertIsNone(_detect_outer_block_bound(begin + end, fake_env))
+
+    def test_detect_outer_block_bound_accepts_direct_block_size(self) -> None:
+        from types import SimpleNamespace
+
+        from helion._compiler.type_propagation import _detect_outer_block_bound
+
+        numel = object()
+        fake_env = SimpleNamespace(
+            get_block_id=lambda value: 5 if value is numel else None
+        )
+
+        with patch(
+            "helion._compiler.type_propagation._symint_expr",
+            side_effect=AssertionError("_symint_expr should not be called"),
+        ):
+            self.assertEqual(_detect_outer_block_bound(numel, fake_env), 5)
+
+    def test_bounded_block_size_repr_includes_bound(self) -> None:
+        from helion.autotuner.config_spec import BlockSizeSpec
+
+        self.assertIn(
+            "bounded_by_block_id=7",
+            repr(BlockSizeSpec(block_id=1, size_hint=64, bounded_by_block_id=7)),
+        )
+
     def test_autotune_search_acf_env_var_strips_whitespace(self) -> None:
         with patch.dict(
             os.environ,
