@@ -444,6 +444,16 @@ def pallas_chunked_add(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
+@helion.kernel(backend="pallas", static_shapes=True)
+def pallas_rand_add(x: torch.Tensor, seed: int) -> torch.Tensor:
+    """Kernel that uses hl.rand to generate random values and add them to x."""
+    out = torch.empty_like(x)
+    (m,) = x.size()
+    for tile_m in hl.tile(m):
+        out[tile_m] = x[tile_m] + hl.rand([tile_m], seed=seed)
+    return out
+
+
 @onlyBackends(["triton", "pallas"])
 @skipUnlessPallas("JAX/Pallas TPU not available")
 class TestPallas(TestCase):
@@ -2775,6 +2785,30 @@ class TestPallas(TestCase):
             block_sizes=[64],
         )
         torch.testing.assert_close(result, x * coeffs[0] * coeffs[4] * coeffs[5])
+
+    def test_rand_add(self) -> None:
+        """Test kernel using hl.rand (RNG ops) passes _rng_seed_buffer correctly.
+
+        Regression test: the Pallas launcher previously inserted _rng_seed_buffer
+        at position -1 (before _inplace_indices), which put it between
+        _output_indices and _inplace_indices. The fix places _rng_seed_buffer
+        before both _output_indices and _inplace_indices so the Pallas runtime
+        receives arguments in the correct order.
+        """
+        x = torch.randn(1024, device=DEVICE, dtype=torch.float32)
+        _, result = code_and_output(
+            pallas_rand_add,
+            (x, 42),
+            block_sizes=[1024],
+        )
+        # Verify shape and dtype are correct
+        self.assertEqual(result.shape, x.shape)
+        self.assertEqual(result.dtype, x.dtype)
+        # The result should differ from x (random values added)
+        self.assertFalse(torch.allclose(result, x))
+        # All added random values should be in [0, 1), so result >= x and < x + 1
+        self.assertTrue(torch.all(result >= x))
+        self.assertTrue(torch.all(result < x + 1.0))
 
 
 @skipUnlessPallas("JAX/Pallas TPU not available")
