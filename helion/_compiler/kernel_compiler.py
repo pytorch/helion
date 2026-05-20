@@ -136,9 +136,14 @@ class KernelCompiler:
     def lower(self, hf: HostFunction) -> None:
         from .device_ir import lower_to_device_ir
 
+        factory_padding = (
+            patch_tensor_factories()
+            if self.env.backend.pad_factory_tensors_to_power_of_2
+            else contextlib.nullcontext()
+        )
         with (
             measure("HostFunction.lower_to_device_ir"),
-            patch_tensor_factories(),
+            factory_padding,
         ):
             hf.device_ir = lower_to_device_ir(hf)
 

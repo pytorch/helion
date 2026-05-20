@@ -1803,6 +1803,33 @@ class TestPallas(TestCase):
         ref = x.view(8, 8, 128).sum(1)
         torch.testing.assert_close(result, ref, rtol=1e-3, atol=1e-3)
 
+    def test_full_slice_matches_non_power_of_two_factory_dim(self) -> None:
+        """Non-pow2 full slices must match concrete factory-created dims."""
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def per_block_reduction(x: torch.Tensor) -> torch.Tensor:
+            m, n = x.shape
+            m_block = hl.register_block_size(x.size(0))
+            out = x.new_empty(
+                [(x.size(0) + m_block - 1) // m_block, n], dtype=torch.float32
+            )
+            for mb_cta in hl.tile(m, block_size=m_block):
+                acc = x.new_zeros([n], dtype=torch.float32)
+                for mb in hl.tile(mb_cta.begin, mb_cta.end):
+                    acc += x[mb, :].to(torch.float32).sum(0)
+                out[mb_cta.id, :] = acc
+            return out
+
+        x = torch.randn(64, 384, device=DEVICE, dtype=torch.float32)
+        _code, result = code_and_output(
+            per_block_reduction,
+            (x,),
+            block_sizes=[8, 8],
+            pallas_loop_type="fori_loop",
+        )
+        ref = x.view(8, 8, 384).sum(1)
+        torch.testing.assert_close(result, ref, rtol=1e-3, atol=1e-3)
+
     def test_emit_pipeline_per_tensor_pipelined_mixed(self) -> None:
         """An emit_pipeline body can mix pipelined and non-pipelined tensors.
 

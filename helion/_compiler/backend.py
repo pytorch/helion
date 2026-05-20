@@ -85,6 +85,17 @@ class Backend(abc.ABC):
         return TRITON_MAX_TENSOR_NUMEL
 
     @property
+    def pad_factory_tensors_to_power_of_2(self) -> bool:
+        """Whether on-device tensor factory ops (zeros/ones/empty/full/...) should
+        have their integer dim sizes rounded up to the next power of 2.
+
+        Triton requires power-of-2 block sizes, so the default is True. Pallas
+        does not require this and the padding causes broadcast mismatches
+        against unpadded full-tensor loads.
+        """
+        return True
+
+    @property
     def codegen_name(self) -> str:
         """Backend name used to look up registered codegen functions."""
         return self.name
@@ -1094,6 +1105,10 @@ class PallasBackend(Backend):
         # No compile-time element cap on Pallas; VMEM byte budget is the
         # real constraint and is enforced separately at runtime.
         return None
+
+    @property
+    def pad_factory_tensors_to_power_of_2(self) -> bool:
+        return False
 
     def max_reduction_threads(self) -> int | None:
         return None
