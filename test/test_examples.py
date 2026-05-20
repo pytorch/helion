@@ -1261,76 +1261,64 @@ class TestExamples(RefEagerTestBase, TestCase):
             reduction_loops=32,
         )
 
-    @xfailIfCute("CuTe LayerNorm backward example still returns incorrect results")
-    @xfailIfPallas("InductorLoweringError")
-    @skipIfA10G("accuracy check fails on A10G GPUs")
-    def test_layernorm_bwd(self):
-        """Test combined backward pass for layer norm with bias, including regression coverage."""
-
-        cases = (
-            {
-                "batch_size": 32,
-                "dim": 64,
-            },
-            {
-                "batch_size": 1152 * 1000,
-                "dim": 16,
-            },
-        )
-
+    def _run_layernorm_bwd(self, batch_size: int, dim: int, seed: int = 0) -> None:
         eps = 1e-4
         atol = 3e-2
         rtol = 5e-2
 
-        for idx, case in enumerate(cases):
-            torch.manual_seed(idx)
-            if torch.cuda.is_available():
-                torch.cuda.manual_seed_all(idx)
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
 
-            batch_size = case["batch_size"]
-            dim = case["dim"]
+        x = -2.3 + 0.5 * torch.randn([batch_size, dim], device=DEVICE, dtype=HALF_DTYPE)
+        weight = torch.randn([dim], device=DEVICE, dtype=HALF_DTYPE)
+        bias = torch.randn([dim], device=DEVICE, dtype=HALF_DTYPE)
+        grad_out = torch.randn([batch_size, dim], device=DEVICE, dtype=HALF_DTYPE)
 
-            x = -2.3 + 0.5 * torch.randn(
-                [batch_size, dim], device=DEVICE, dtype=HALF_DTYPE
-            )
-            weight = torch.randn([dim], device=DEVICE, dtype=HALF_DTYPE)
-            bias = torch.randn([dim], device=DEVICE, dtype=HALF_DTYPE)
-            grad_out = torch.randn([batch_size, dim], device=DEVICE, dtype=HALF_DTYPE)
+        x_fp32 = x.to(torch.float32)
+        mean = x_fp32.mean(dim=-1)
+        var = x_fp32.var(dim=-1, unbiased=False)
+        rstd = torch.rsqrt(var + eps)
 
-            # Compute mean, var, and rstd in fp32 to match Helion forward kernel output
-            x_fp32 = x.to(torch.float32)
-            mean = x_fp32.mean(dim=-1)
-            var = x_fp32.var(dim=-1, unbiased=False)
-            rstd = torch.rsqrt(var + eps)
+        x_ref = x.clone().detach().requires_grad_(True)
+        weight_ref = weight.clone().detach().requires_grad_(True)
+        bias_ref = bias.clone().detach().requires_grad_(True)
 
-            x_ref = x.clone().detach().requires_grad_(True)
-            weight_ref = weight.clone().detach().requires_grad_(True)
-            bias_ref = bias.clone().detach().requires_grad_(True)
+        y_ref = torch.nn.functional.layer_norm(x_ref, [dim], weight_ref, bias_ref, eps)
+        y_ref.backward(grad_out.detach())
 
-            y_ref = torch.nn.functional.layer_norm(
-                x_ref, [dim], weight_ref, bias_ref, eps
-            )
-            y_ref.backward(grad_out.detach())
+        expected = (
+            x_ref.grad.detach(),
+            weight_ref.grad.detach(),
+            bias_ref.grad.detach(),
+        )
 
-            expected = (
-                x_ref.grad.detach(),
-                weight_ref.grad.detach(),
-                bias_ref.grad.detach(),
-            )
+        args = (grad_out, x, mean, rstd, weight, True)
 
-            args = (grad_out, x, mean, rstd, weight, True)
+        check_example(
+            "layer_norm",
+            args,
+            expected,
+            fn_name="layer_norm_bwd",
+            block_sizes=[32, 1],
+            num_warps=4,
+            num_stages=3,
+            rtol=rtol,
+            atol=atol,
+        )
 
-            check_example(
-                "layer_norm",
-                args,
-                expected,
-                fn_name="layer_norm_bwd",
-                block_sizes=[32, 1],
-                num_warps=4,
-                num_stages=3,
-                rtol=rtol,
-                atol=atol,
-            )
+    @xfailIfCute("CuTe LayerNorm backward example still returns incorrect results")
+    @skipIfA10G("accuracy check fails on A10G GPUs")
+    def test_layernorm_bwd(self):
+        """Test combined backward pass for layer norm with bias."""
+        self._run_layernorm_bwd(batch_size=32, dim=64)
+
+    @xfailIfCute("CuTe LayerNorm backward example still returns incorrect results")
+    @xfailIfPallas("VMEM OOM: untiled block specs load full tensors")
+    @skipIfA10G("accuracy check fails on A10G GPUs")
+    def test_layernorm_bwd_large_batch(self):
+        """Regression test: large batch, small dim."""
+        self._run_layernorm_bwd(batch_size=1152 * 1000, dim=16, seed=1)
 
     def test_softmax_bwd(self):
         m, n = 2048, 2048
