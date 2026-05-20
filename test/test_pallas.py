@@ -440,6 +440,35 @@ def pallas_chunked_add(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
+@helion.kernel(backend="pallas", static_shapes=True)
+def pallas_grid_identity_output(x: torch.Tensor) -> torch.Tensor:
+    """Write to an output dimension using a raw scalar grid variable."""
+    n = x.size(0)
+    m = x.size(1)
+    out = torch.empty_like(x)
+    for i in hl.grid(n):
+        for tile_m in hl.tile(m):
+            out[i, tile_m, :] = x[i, tile_m, :] + 1.0
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
+def pallas_grid_derived_output(
+    x: torch.Tensor, batch: int, heads: int
+) -> torch.Tensor:
+    """Write to a 4D output using indices derived from a flat grid variable."""
+    n = x.size(0)
+    m = x.size(1)
+    d = x.size(2)
+    out = torch.empty([batch, heads, m, d], dtype=x.dtype, device=x.device)
+    for i in hl.grid(n):
+        b = i // heads
+        h = i % heads
+        for tile_m in hl.tile(m):
+            out[b, h, tile_m, :] = x[i, tile_m, :] + 1.0
+    return out
+
+
 @onlyBackends(["triton", "pallas"])
 @skipUnlessPallas("JAX/Pallas TPU not available")
 class TestPallas(TestCase):
@@ -938,6 +967,48 @@ class TestPallas(TestCase):
         self.assertIn("pltpu.emit_pipeline", code)
         self.assertIn("_pipeline_arg_indices=", code)
         torch.testing.assert_close(result, expected)
+
+    def test_grid_derived_output_blockspec(self) -> None:
+        """Grid-derived output dims are selected by BlockSpec and indexed locally."""
+        batch, heads, m, d = 4, 8, 128, 128
+        n = batch * heads
+        x = torch.randn(n, m, d, device=DEVICE, dtype=torch.bfloat16)
+        expected = (x + 1.0).reshape(batch, heads, m, d)
+        for loop_type in ("unroll", "fori_loop", "emit_pipeline"):
+            with self.subTest(loop_type=loop_type):
+                code, result = code_and_output(
+                    pallas_grid_derived_output,
+                    (x, batch, heads),
+                    block_sizes=[32],
+                    pallas_loop_type=loop_type,
+                )
+                self.assertIn("_block_spec_info=", code)
+                self.assertIn("(0, 8, 4)", code)
+                self.assertIn("(0, 1, 8)", code)
+                self.assertIn("[0, 0,", code)
+                if loop_type == "emit_pipeline":
+                    self.assertIn("pltpu.emit_pipeline", code)
+                torch.testing.assert_close(result, expected)
+
+    def test_grid_identity_output_blockspec(self) -> None:
+        """Raw hl.grid output dims use the same scalar GridIndexPattern path."""
+        n, m, d = 32, 128, 128
+        x = torch.randn(n, m, d, device=DEVICE, dtype=torch.bfloat16)
+        expected = x + 1.0
+        for loop_type in ("unroll", "fori_loop", "emit_pipeline"):
+            with self.subTest(loop_type=loop_type):
+                code, result = code_and_output(
+                    pallas_grid_identity_output,
+                    (x,),
+                    block_sizes=[32],
+                    pallas_loop_type=loop_type,
+                )
+                self.assertIn("_block_spec_info=", code)
+                self.assertIn("((1, None, None), ((0, 1, 32), None, None))", code)
+                self.assertIn("[0,", code)
+                if loop_type == "emit_pipeline":
+                    self.assertIn("pltpu.emit_pipeline", code)
+                torch.testing.assert_close(result, expected)
 
     def test_invalid_pallas_loop_type_raises(self) -> None:
         """Invalid pallas_loop_type values must raise instead of silently falling back."""

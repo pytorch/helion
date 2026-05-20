@@ -309,6 +309,7 @@ def _generated_index_code(
     """Generate index code based on the indexing pattern."""
     from helion._compiler.pallas.plan_tiling import ArbitraryIndexPattern
     from helion._compiler.pallas.plan_tiling import ArbitrarySlicePattern
+    from helion._compiler.pallas.plan_tiling import GridIndexPattern
     from helion._compiler.pallas.plan_tiling import TileBeginWithOffsetPattern
     from helion._compiler.pallas.plan_tiling import TileIndexWithOffsetPattern
     from helion._compiler.pallas.plan_tiling import TilePattern
@@ -328,6 +329,9 @@ def _generated_index_code(
 
     if isinstance(pattern, ArbitrarySlicePattern):
         return _slice_code(idx, pattern, state, tensor, tensor_dim)
+
+    if isinstance(pattern, GridIndexPattern):
+        return "0"
 
     if isinstance(pattern, ArbitraryIndexPattern):
         if isinstance(idx, int):

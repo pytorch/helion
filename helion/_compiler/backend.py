@@ -30,6 +30,7 @@ if TYPE_CHECKING:
     from .device_function import Argument
     from .device_function import DeviceFunction
     from .device_ir import GraphInfo
+    from .pallas.plan_tiling import GridIndexMap
     from .tile_dispatch import TileStrategyDispatch
     from .tile_strategy import TileStrategy
 
@@ -1623,6 +1624,8 @@ class PallasBackend(Backend):
         if sorted_args is None:
             return None
 
+        import sympy
+
         from .compile_environment import CompileEnvironment
         from .device_function import DeviceFunction
         from .device_function import SymbolArgument
@@ -1657,8 +1660,6 @@ class PallasBackend(Backend):
             known_block_ids.update(all_grid_block_ids)
 
             if len(all_grid_block_ids) > 1:
-                import sympy
-
                 stride = 1
                 flat_decomp = {}
                 for bid in all_grid_block_ids:
@@ -1695,8 +1696,41 @@ class PallasBackend(Backend):
                 return None
             block_shape: list[int | None] = []
             grid_dims: list[int | tuple[int, int, int] | None] = []
+
+            def _grid_index_for_dim(
+                index_map: GridIndexMap,
+            ) -> tuple[int, int, int] | None:
+                bid = index_map.grid_block_id
+                divisor = index_map.divisor
+                modulus = index_map.modulus
+                if bid not in known_block_ids:
+                    return None
+                if modulus is None:
+                    bs = env.block_sizes[bid].from_config(config)
+                    numel = env.block_sizes[bid].numel
+                    if not isinstance(bs, int) or isinstance(numel, str):
+                        return None
+                    try:
+                        numel_val = (
+                            int(numel) if isinstance(numel, sympy.Expr) else numel
+                        )
+                    except (TypeError, ValueError):
+                        return None
+                    grid_blocks = -(-numel_val // bs)  # cdiv
+                    modulus = -(-grid_blocks // divisor)
+                if flat_decomp is not None and bid in flat_decomp:
+                    flat_grid_dim, flat_stride, _flat_blocks = flat_decomp[bid]
+                    return (flat_grid_dim, flat_stride * divisor, modulus)
+                return (block_id_to_grid_dim[bid], divisor, modulus)
+
             for d in range(tensor.ndim):
                 dim_tiling = dim_tilings[d]
+                if dim_tiling.can_tile and dim_tiling.grid_index_map is not None:
+                    grid_index_map = _grid_index_for_dim(dim_tiling.grid_index_map)
+                    if grid_index_map is not None:
+                        block_shape.append(1)
+                        grid_dims.append(grid_index_map)
+                        continue
                 if not dim_tiling.can_tile or len(dim_tiling.block_ids) == 0:
                     block_shape.append(None)
                     grid_dims.append(None)
