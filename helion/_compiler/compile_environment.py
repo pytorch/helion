@@ -251,6 +251,7 @@ class CompileEnvironment:
         self.debug_shape_renames: dict[sympy.Expr, sympy.Expr] = {}
         self.config_spec = ConfigSpec(
             backend=self.backend,
+            index_dtype=self.index_dtype,
         )
         # TODO(hinriksnaer): tracing state, not env config. move to CompilerState?
         self.kernel_tensor_sizes: dict[tuple[sympy.Expr, ...], int] = (
