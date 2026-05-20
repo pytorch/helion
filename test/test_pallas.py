@@ -1212,6 +1212,26 @@ class TestPallas(TestCase):
         ).to(device=DEVICE)
         torch.testing.assert_close(result, ref, rtol=1e-2, atol=1e-2)
 
+    def test_symnode_index_in_emit_pipeline_body(self) -> None:
+        """A SymInt expression derived from an outer tile index
+        (e.g. ``tile_h.begin // 2``, as in GQA's
+        ``h_idx // num_groups``) must be usable as an index inside an
+        inner ``hl.tile`` loop on the Pallas backend.
+        """
+
+        @helion.kernel(static_shapes=True)
+        def k(x: torch.Tensor) -> torch.Tensor:
+            H, N = x.size()
+            out = torch.empty_like(x)
+            for tile_h in hl.tile(H, block_size=1):
+                h_kv = tile_h.begin // 2
+                for tile_n in hl.tile(N):
+                    out[tile_h.begin, tile_n] = x[h_kv, tile_n]
+            return out
+
+        x = torch.randn(4, 8, dtype=torch.float32, device=DEVICE)
+        code_and_output(k, (x,))
+
     def test_emit_pipeline_loop_order(self) -> None:
         """Test emit_pipeline with loop_order reordering.
 

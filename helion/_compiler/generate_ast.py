@@ -438,6 +438,10 @@ class GenerateAST(NodeVisitor, CodegenInterface):
             finally:
                 for idx in pipeline_state.block_ids:
                     self.active_device_loops[idx].pop()
+        # Flush any symnode bindings hoisted into the loop's outer_prefix
+        # (via lift_symnode) into the parent scope, so they precede the
+        # function def + pipeline call the caller is about to add.
+        self.statements_stack[-1].extend(pipeline_state.outer_prefix)
 
     @contextlib.contextmanager
     def add_fori_loop(self, fori_state: ForiLoopState) -> Iterator[None]:
@@ -459,6 +463,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
             finally:
                 for idx in fori_state.block_ids:
                     self.active_device_loops[idx].pop()
+        self.statements_stack[-1].extend(fori_state.outer_prefix)
 
     def set_active_loops(self, device_grid: DeviceLoopOrGridState) -> None:
         if isinstance(device_grid, DeviceGridState):
