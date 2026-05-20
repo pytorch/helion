@@ -101,7 +101,26 @@ def cute_looped_reduction_block_size(size_hint: int, max_threads: int) -> int:
 
 
 def cute_live_reduction_threads(max_threads: int) -> int:
-    return min(max_threads, _CUTE_WARP_REDUCTION_THREADS)
+    # Persistent reductions on CuTe can recruit threads beyond a single warp
+    # (cross-warp combining uses _cute_grouped_reduce_shared_two_stage). The
+    # autotuner / config_spec keeps the size_hint <= max_threads case here so
+    # no synthetic lane wrap is required.
+    return max_threads
+
+
+def _block_has_indexed_reduction(fn: DeviceFunction, block_index: int) -> bool:
+    """Return True when ``block_index`` is the reduction axis of any
+    argmin/argmax in the device IR.
+
+    Populated by :meth:`DeviceIR.register_rollable_reductions` so this is
+    just a set lookup on ConfigSpec.
+
+    Used to cap CuTe reduction strategies' thread_count at the warp width
+    when an indexed reduction is present — CuTe argreduce uses
+    cute.arch.warp_reduction which is only correct for threads_in_group<=32.
+    """
+    env = CompileEnvironment.current()
+    return block_index in env.config_spec.cute_indexed_reduction_block_ids
 
 
 class ReductionStrategy(TileStrategy):
@@ -410,6 +429,13 @@ class PersistentReductionStrategy(ReductionStrategy):
         if max_threads is not None:
             if env.backend.name == "cute":
                 max_threads = cute_live_reduction_threads(max_threads)
+                # Indexed reductions (argmin/argmax) on CuTe only have a
+                # warp-level reduction primitive that takes
+                # ``threads_in_group <= 32``. Cap the persistent thread
+                # count to the warp size so the emitted
+                # ``cute.arch.warp_reduction`` is correct.
+                if _block_has_indexed_reduction(fn, block_index):
+                    max_threads = min(max_threads, _CUTE_WARP_REDUCTION_THREADS)
             if isinstance(numel, (int, sympy.Integer)):
                 size_hint = int(numel)
             elif isinstance(numel, sympy.Expr):
@@ -550,6 +576,75 @@ class PersistentReductionStrategy(ReductionStrategy):
             )
         )
 
+    def _cute_cross_warp_reduction_expr(
+        self,
+        state: CodegenState,
+        input_name: str,
+        reduction_type: str,
+        default_value: float | bool,
+        dtype: torch.dtype,
+    ) -> str | None:
+        env = CompileEnvironment.current()
+        backend = env.backend
+        if (
+            backend.name != "cute"
+            or self._thread_count <= 32
+            or self._synthetic_cute_lane_var is not None
+            or backend.is_indexed_reduction(reduction_type)
+        ):
+            return None
+
+        current_grid = state.codegen.current_grid_state
+        axis_sizes: dict[int, int] = {}
+        if isinstance(current_grid, DeviceGridState):
+            for axis, size in current_grid.thread_axis_sizes.items():
+                axis_sizes[axis] = max(axis_sizes.get(axis, 1), size)
+        reduction_axis = self._get_thread_axis()
+        axis_sizes[reduction_axis] = max(
+            axis_sizes.get(reduction_axis, 1), self._thread_count
+        )
+
+        num_threads = 1
+        for size in axis_sizes.values():
+            num_threads *= size
+        group_span = self._thread_count
+        if num_threads % group_span != 0:
+            return None
+        # The two-stage shared-memory reduction assumes its ``lane_var`` is
+        # the linear thread index across ALL of the launch block's threads.
+        # If ``axis_sizes`` only covers a subset of the planned block dims
+        # (e.g. an inner reduction strategy contributes another thread axis
+        # that hasn't been entered yet), the emitted reduction would race
+        # across the missing axis. Bail out and fall back to the warp-level
+        # path in that case.
+        planned_dims = self._planned_thread_dims()
+        planned_block_threads = planned_dims[0] * planned_dims[1] * planned_dims[2]
+        if num_threads != planned_block_threads:
+            return None
+
+        lane_expr = backend.thread_linear_index_expr(axis_sizes)
+        if lane_expr is None:
+            return None
+
+        identity_expr = backend.cast_expr(
+            constant_repr(default_value), _dtype_str(dtype)
+        )
+        group_count = num_threads // group_span
+        lane_var = self.fn.new_var("persistent_reduce_lane", dce=True)
+        lane_in_group_var = self.fn.new_var("persistent_reduce_lane_in_group", dce=True)
+        lane_mod_pre_var = self.fn.new_var("persistent_reduce_lane_mod_pre", dce=True)
+        result_var = self.fn.new_var("persistent_reduce_result", dce=True)
+        state.add_statement(f"{lane_var} = {lane_expr}")
+        state.add_statement(f"{lane_in_group_var} = ({lane_var}) % {group_span}")
+        state.add_statement(f"{lane_mod_pre_var} = ({lane_in_group_var}) % 1")
+        state.add_statement(
+            f"{result_var} = _cute_grouped_reduce_shared_two_stage("
+            f"{input_name}, {reduction_type!r}, {identity_expr}, "
+            f"{lane_var}, {lane_in_group_var}, {lane_mod_pre_var}, "
+            f"pre=1, group_span={group_span}, group_count={group_count})"
+        )
+        return result_var
+
     def codegen_reduction(
         self,
         state: CodegenState,
@@ -569,13 +664,24 @@ class PersistentReductionStrategy(ReductionStrategy):
             return expr_from_string(
                 backend.full_expr(shape_dims, constant_repr(default), fake_output.dtype)
             )
-        expr = self.call_reduction_function(
-            input_name,
-            reduction_type,
-            dim,
-            fake_input,
-            fake_output,
-        )
+        acc_dtype = get_computation_dtype(fake_input.dtype)
+        default = ir.Reduction.default_accumulator(reduction_type, acc_dtype)
+        if isinstance(default, (float, int, bool)):
+            cross_warp = self._cute_cross_warp_reduction_expr(
+                state, input_name, reduction_type, default, acc_dtype
+            )
+        else:
+            cross_warp = None
+        if cross_warp is not None:
+            expr = cross_warp
+        else:
+            expr = self.call_reduction_function(
+                input_name,
+                reduction_type,
+                dim,
+                fake_input,
+                fake_output,
+            )
         return expr_from_string(self.maybe_reshape(expr, dim, fake_input, fake_output))
 
 
@@ -591,6 +697,14 @@ class LoopedReductionStrategy(ReductionStrategy):
         # Compute thread count for warp-level reductions
         max_threads = env.backend.max_reduction_threads()
         if max_threads is not None:
+            # CuTe argreduce uses cute.arch.warp_reduction which is only
+            # correct for threads_in_group<=32. Cap to warp size whenever
+            # the rolled reduction will fold an indexed reduction over this
+            # block.
+            if env.backend.name == "cute" and _block_has_indexed_reduction(
+                fn, block_index
+            ):
+                max_threads = min(max_threads, _CUTE_WARP_REDUCTION_THREADS)
             thread_count = next_power_of_2(min(block_size, max_threads))
         else:
             thread_count = 0
@@ -686,6 +800,17 @@ class LoopedReductionStrategy(ReductionStrategy):
             num_threads *= size
         group_span = self._thread_count
         if num_threads % group_span != 0:
+            return None
+        # The two-stage shared-memory reduction assumes its ``lane_var`` is
+        # the linear thread index across ALL of the launch block's threads.
+        # If ``axis_sizes`` only covers a subset of the planned block dims
+        # (e.g. an inner reduction strategy contributes another thread axis
+        # that hasn't been entered yet), the emitted reduction would race
+        # across the missing axis. Bail out and fall back to the warp-level
+        # path in that case.
+        planned_dims = self._planned_thread_dims()
+        planned_block_threads = planned_dims[0] * planned_dims[1] * planned_dims[2]
+        if num_threads != planned_block_threads:
             return None
         lane_expr = backend.thread_linear_index_expr(axis_sizes)
         if lane_expr is None:
