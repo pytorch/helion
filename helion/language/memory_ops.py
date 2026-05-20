@@ -4268,6 +4268,46 @@ def _(
     raise NotImplementedError(f"Unsupported tensor type: {type(tensor)}")
 
 
+def _maybe_materialize_tile_index_load(
+    state: CodegenState,
+    tensor: torch.Tensor,
+    subscript: list[object] | tuple[object, ...],
+) -> ast.AST | None:
+    """If this load is on a ``tile.index`` value (e.g. ``tile_m.index[:, None]``),
+    emit the inline ``indices_<bid>[<sub>]`` expression and return it.
+    Returns ``None`` otherwise.
+
+    ``tile.index`` tensors are synthesized inside the kernel — they aren't
+    registered in ``tensor_to_origin`` — so the regular load path's
+    ``tensor_arg`` lookup would ``KeyError``.  Supported subscript entries
+    are ``None`` (new axis) and ``slice(None)`` (full slice).
+    """
+    from ..language import tile_index
+
+    tensor_node = state.fx_node.args[0] if state.fx_node is not None else None
+    if not (
+        isinstance(tensor_node, torch.fx.Node)
+        and tensor_node.op == "call_function"
+        and tensor_node.target == tile_index
+    ):
+        return None
+
+    env = CompileEnvironment.current()
+    block_id = env.get_block_id(tensor.size(0))
+    assert block_id is not None
+    base_var = state.codegen.index_var(block_id)
+
+    parts = []
+    for idx in subscript:
+        if idx is None:
+            parts.append("None")
+        elif idx == slice(None):
+            parts.append(":")
+        else:
+            raise AssertionError(f"Unexpected index type in tile_index load: {idx}")
+    return expr_from_string(f"{base_var}[{', '.join(parts)}]")
+
+
 @_decorators.codegen(load, "triton")
 def _(state: CodegenState) -> ast.AST:
     tensor = state.proxy_arg(0)
@@ -4295,33 +4335,9 @@ def _(state: CodegenState) -> ast.AST:
         eviction_policy = ast.Constant(value=eviction_policy)
 
     if isinstance(tensor, torch.Tensor):
-        # If tile_index(...) is being broadcast-only indexed
-        from ..language import tile_index
-
-        tensor_node = state.fx_node.args[0] if state.fx_node is not None else None
-        if (
-            isinstance(tensor_node, torch.fx.Node)
-            and tensor_node.op == "call_function"
-            and tensor_node.target == tile_index
-        ):
-            # tile.index tensors are not real memory accesses; materialize the
-            # block index variable with the requested broadcast/reshape.
-            env = CompileEnvironment.current()
-            block_id = env.get_block_id(tensor.size(0))
-            assert block_id is not None
-            base_var = state.codegen.index_var(block_id)
-
-            parts = []
-            for idx in subscript:
-                if idx is None:
-                    parts.append("None")
-                elif idx == slice(None):
-                    parts.append(":")
-                else:
-                    raise AssertionError(
-                        f"Unexpected index type in tile_index load: {idx}"
-                    )
-            return expr_from_string(f"{base_var}[{', '.join(parts)}]")
+        tile_index_result = _maybe_materialize_tile_index_load(state, tensor, subscript)
+        if tile_index_result is not None:
+            return tile_index_result
 
         # Use the shared memory op index for indexing strategy
         indexing_idx = device_fn.device_memory_op_index
@@ -4362,6 +4378,11 @@ def _(state: CodegenState) -> ast.AST:
     subscript = state.proxy_arg(1)
     assert isinstance(tensor, torch.Tensor)
     assert isinstance(subscript, (list, tuple))
+
+    tile_index_result = _maybe_materialize_tile_index_load(state, tensor, subscript)
+    if tile_index_result is not None:
+        return tile_index_result
+
     return pallas_codegen.load_expr(state, list(subscript), tensor)
 
 
