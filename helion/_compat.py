@@ -245,7 +245,11 @@ if triton_is_available():
     def _min_dot_size(
         device: torch.device, lhs: torch.dtype, rhs: torch.dtype
     ) -> tuple[int, int, int]:
-        if device.type == "tpu":
+        # Helion's Pallas backend always targets TPU's Mosaic MXU, even in
+        # interpret mode where the actual device is "cpu".
+        from .runtime.settings import _get_backend
+
+        if _get_backend() == "pallas":
             # TPU Mosaic MXU tile: (8, 128) sublane × lane.
             # pl.dot(lhs[M,K], rhs[K,N]) needs M>=8, K>=128, N>=128.
             return (8, 128, 128)
@@ -328,7 +332,9 @@ else:
     def _min_dot_size(  # type: ignore[misc]
         device: torch.device, lhs: torch.dtype, rhs: torch.dtype
     ) -> tuple[int, int, int]:
-        if device.type == "tpu":
+        from .runtime.settings import _get_backend
+
+        if _get_backend() == "pallas":
             return (8, 128, 128)
         return (16, 16, 16)
 
