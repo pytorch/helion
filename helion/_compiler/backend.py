@@ -190,6 +190,10 @@ class Backend(abc.ABC):
         """Maximum threads for a single warp-level reduction, or None if unlimited."""
         return None
 
+    def max_reduction_loop(self) -> int | None:
+        """Maximum user-visible loop chunk for a rolled reduction."""
+        return self.max_reduction_threads()
+
     def adjust_reduction_thread_count(
         self, requested: int, existing_strategies: list[TileStrategy]
     ) -> int:
@@ -2815,7 +2819,15 @@ class CuteBackend(Backend):
         return f"({tensor_name})[{index_expr}]"
 
     def max_reduction_threads(self) -> int | None:
-        return 32
+        return 1024
+
+    def max_reduction_loop(self) -> int | None:
+        from .reduction_strategy import cute_looped_reduction_block_size
+
+        max_threads = self.max_reduction_threads()
+        if max_threads is None:
+            return None
+        return cute_looped_reduction_block_size(2**31 - 1, max_threads)
 
     def adjust_reduction_thread_count(
         self, requested: int, existing_strategies: list[TileStrategy]

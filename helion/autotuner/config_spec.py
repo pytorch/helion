@@ -412,6 +412,10 @@ class ConfigSpec:
         self.backend = backend
         self.backend_name = backend.name
         self.max_reduction_threads = backend.max_reduction_threads()
+        self.max_reduction_loop = backend.max_reduction_loop()
+        self.reduction_loop_force_threshold = self.max_reduction_threads
+        if self.backend_name == "cute" and self.max_reduction_threads is not None:
+            self.reduction_loop_force_threshold = min(self.max_reduction_threads, 32)
         self.user_defined_tunables = (
             {} if user_defined_tunables is None else dict(user_defined_tunables)
         )
@@ -1806,20 +1810,28 @@ class ConfigSpec:
         else:
             config.pop("num_threads", None)
 
-        # Cap reduction loops at the backend's max reduction thread count
+        # Cap reduction loops at the backend's max loop chunk, while using the
+        # live reduction thread threshold to decide when a persistent reduction
+        # must be rolled.
         if self.max_reduction_threads is not None and self.reduction_loops:
-            max_threads = self.max_reduction_threads
+            force_threshold = self.reduction_loop_force_threshold
+            max_loop = self.max_reduction_loop
             reduction_loops = config.get("reduction_loops", [])
-            if isinstance(reduction_loops, list):
+            if force_threshold is not None and isinstance(reduction_loops, list):
                 new_loops = list(reduction_loops)
                 changed = False
                 for i, spec in enumerate(self.reduction_loops):
                     if i >= len(new_loops):
                         break
-                    if (new_loops[i] is None and spec.size_hint > max_threads) or (
-                        new_loops[i] is not None and new_loops[i] > max_threads
+                    if new_loops[i] is None and spec.size_hint > force_threshold:
+                        new_loops[i] = min(spec.size_hint, force_threshold)
+                        changed = True
+                    elif (
+                        new_loops[i] is not None
+                        and max_loop is not None
+                        and new_loops[i] > max_loop
                     ):
-                        new_loops[i] = max_threads
+                        new_loops[i] = max_loop
                         changed = True
                 if changed:
                     config["reduction_loops"] = new_loops
@@ -2987,11 +2999,12 @@ class ReductionLoopSpec(_PowerOfTwoBlockIdItem):
         low = 8  # TODO(jansel): is smaller needed?
         high = next_power_of_2(max(low, self.size_hint))
         default = min(high, 4096)
-        # Cap default at the backend's max reduction threads so that
+        # Cap default at the backend's max reduction loop so that
         # large reductions default to looped rather than persistent.
-        if base.max_reduction_threads is not None:
-            if self.size_hint > base.max_reduction_threads:
-                default = min(default, base.max_reduction_threads)
+        if base.max_reduction_loop is not None:
+            force_threshold = base.reduction_loop_force_threshold
+            if force_threshold is not None and self.size_hint > force_threshold:
+                default = min(default, base.max_reduction_loop)
         return BlockSizeFragment(low, high, default)
 
     def _flat_config(
