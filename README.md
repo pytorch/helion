@@ -375,7 +375,7 @@ uv venv .venv
 source .venv/bin/activate
 
 # To install in editable w/ required dev packages
-uv pip install -e .'[dev]'
+pip install -e .'[dev]'
 ```
 This installs Helion in "editable" mode so that changes to the source
 code take effect without needing to reinstall.

@@ -351,6 +351,67 @@ class TestExamplesDist(TestCase, MultiProcessTestCase):
 
         self._cleanup_process()
 
+    @skipIfXPU("Distributed operations require CCL, not yet fully integrated")
+    @skip_if_lt_x_gpu(4)
+    @parametrize(
+        "M,N,K",
+        [
+            (512, 768, 1024),
+            (1024, 768, 512),
+        ],
+    )
+    def test_fp8_scaled_all_gather_matmul(self, M, N, K):
+        self._init_process()
+        from torch._C._distributed_c10d import _SymmetricMemory
+
+        mod = import_path(
+            EXAMPLES_DIR / "distributed" / "fp8_scaled_all_gather_matmul.py"
+        )
+        _SymmetricMemory.signal_pad_size = 1024 * 1024 * 1024
+
+        group = dist.group.WORLD
+
+        M_per_rank = M // self.world_size
+        FP8_DTYPE = torch.float8_e4m3fn
+
+        torch.manual_seed(42 + self.rank)
+        a_shared = (
+            torch.rand(M_per_rank, K, device=self.device, dtype=torch.bfloat16) * 0.05
+        )
+        a_shared = a_shared.to(FP8_DTYPE)
+
+        b = (
+            (torch.rand(K, N, device=self.device, dtype=torch.bfloat16) * 0.1 + 0.05)
+            .T.contiguous()
+            .T
+        )
+        b = b.to(FP8_DTYPE)
+        scale_a = (
+            torch.rand((M_per_rank, 1), device=self.device, dtype=torch.float32) * 0.05
+            + 0.01
+        )
+        scale_b = (
+            torch.rand((1, N), device=self.device, dtype=torch.float32) * 0.05 + 0.01
+        )
+        min_val = 1e-4
+        max_val = 100
+        scale_a = scale_a.clamp(min=min_val, max=max_val)
+        scale_b = scale_b.clamp(min=min_val, max=max_val)
+
+        result = mod.helion_ag_matmul(
+            a_shared, b, scale_a, scale_b, self.world_size, group
+        )
+
+        torch.cuda.synchronize()
+
+        expected = mod.reference_ag_matmul(
+            a_shared, b, scale_a, scale_b, self.world_size, group
+        )
+
+        torch.testing.assert_close(result, expected, rtol=1e-1, atol=1e-1)
+
+        self._cleanup_process()
+
 
 if __name__ == "__main__":
     run_tests()
