@@ -1,0 +1,807 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>jagged_sum: Helion source vs TPU/Pallas execution</title>
+<style>
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    margin: 0;
+    padding: 24px;
+    max-width: 1700px;
+    margin: 0 auto;
+    color: #202124;
+    background: #fff;
+  }
+  h1 { text-align: center; margin-bottom: 6px; }
+  .subtitle { text-align: center; color: #5f6368; margin-bottom: 24px; font-size: 14px; }
+
+  .container {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 20px;
+    margin-bottom: 24px;
+  }
+  .panel {
+    border: 1px solid #dadce0;
+    border-radius: 8px;
+    padding: 16px;
+    background: #f8f9fa;
+  }
+  .panel-title {
+    font-weight: 600;
+    font-size: 17px;
+    margin-bottom: 4px;
+  }
+  .panel-title.helion { color: #1a73e8; }
+  .panel-title.tpu { color: #c5221f; }
+  .panel-subtitle {
+    font-size: 12px;
+    color: #5f6368;
+    margin-bottom: 12px;
+  }
+
+  pre {
+    background: #1e1e1e;
+    color: #d4d4d4;
+    padding: 12px;
+    border-radius: 4px;
+    font-size: 12.5px;
+    line-height: 1.45;
+    overflow-x: auto;
+    margin: 0 0 12px 0;
+  }
+  .kw { color: #c586c0; }
+  .var { color: #9cdcfe; }
+  .fn { color: #dcdcaa; }
+  .num { color: #b5cea8; }
+  .str { color: #ce9178; }
+  .com { color: #6a9955; font-style: italic; }
+  .hl { background: #3a3d41; padding: 0 2px; border-radius: 2px; }
+
+  .svg-block {
+    background: #fff;
+    border: 1px solid #e8eaed;
+    border-radius: 4px;
+    padding: 8px;
+  }
+
+  .legend {
+    display: flex;
+    gap: 14px;
+    align-items: center;
+    flex-wrap: wrap;
+    font-size: 11.5px;
+    margin: 6px 0 12px 0;
+    color: #444;
+  }
+  .swatch {
+    display: inline-block;
+    width: 14px;
+    height: 14px;
+    border: 1px solid #888;
+    margin-right: 4px;
+    vertical-align: middle;
+  }
+
+  .params {
+    background: #fff;
+    border: 1px solid #e8eaed;
+    border-radius: 4px;
+    padding: 8px 12px;
+    font-size: 12.5px;
+    margin-bottom: 10px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+
+  .options {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 20px;
+  }
+  .option-card {
+    border: 1px solid #dadce0;
+    border-radius: 8px;
+    padding: 14px 16px;
+    background: #f8f9fa;
+  }
+  .option-card h3 {
+    margin: 0 0 8px 0;
+    font-size: 14px;
+    color: #1a73e8;
+  }
+  .option-card p {
+    margin: 0 0 8px 0;
+    font-size: 12.5px;
+    line-height: 1.5;
+  }
+  .option-card code {
+    background: #fff;
+    border: 1px solid #e8eaed;
+    padding: 1px 5px;
+    border-radius: 3px;
+    font-size: 11.5px;
+  }
+  .option-card .tag {
+    display: inline-block;
+    font-size: 10.5px;
+    font-weight: 600;
+    padding: 1px 7px;
+    border-radius: 10px;
+    margin-bottom: 8px;
+  }
+  .tag-src { background: #fce8e6; color: #c5221f; }
+  .tag-compiler { background: #e6f4ea; color: #137333; }
+
+  /* SVG item colors */
+  .it0 { fill: #4285f4; }   /* blue   */
+  .it1 { fill: #34a853; }   /* green  */
+  .it2 { fill: #f9ab00; }   /* amber  */
+  .it3 { fill: #a142f4; }   /* purple */
+
+  .grid-line { stroke: #fff; stroke-width: 0.5; }
+  .frame { fill: none; stroke: #202124; stroke-width: 1; }
+  .axis-label { font-size: 10px; fill: #5f6368; font-family: ui-monospace, Menlo, monospace; }
+  .tag-label { font-size: 11px; font-weight: 600; }
+
+  /* All chunks: solid bold red */
+  .chunk-thick { fill: none; stroke: #c5221f; stroke-width: 3; }
+  .chunk-med   { fill: none; stroke: #c5221f; stroke-width: 2; }
+  .chunk-thin  { fill: none; stroke: #c5221f; stroke-width: 1.4; }
+  .chunk-fill  { fill: rgba(197, 34, 31, 0.07); stroke: none; }
+
+  .arrow { stroke: #c5221f; stroke-width: 1.5; fill: none; marker-end: url(#arrowhead); }
+  .arrow-compute { stroke: #137333; stroke-width: 1.5; fill: none; marker-end: url(#arrowhead-g); }
+
+  table.offsets {
+    border-collapse: collapse;
+    font-family: ui-monospace, Menlo, monospace;
+    font-size: 11.5px;
+    margin: 6px 0;
+  }
+  table.offsets th, table.offsets td {
+    border: 1px solid #dadce0;
+    padding: 3px 8px;
+    text-align: right;
+  }
+  table.offsets th {
+    background: #f1f3f4;
+  }
+</style>
+</head>
+<body>
+
+<h1>jagged_sum: Helion source vs TPU/Pallas execution</h1>
+
+<div class="params" style="text-align:center;">
+  N = 4 items &nbsp;·&nbsp; n<sub>i</sub> = [3, 7, 5, 9] &nbsp;·&nbsp; L = 24 &nbsp;·&nbsp; M = 8
+  &nbsp;·&nbsp; Helion: <b>tile_b</b> = 2 items/iter, <b>tile_m</b> = 2 cols/iter (4 M-tiles), <b>tile_k</b> = 4 rows/iter
+  &nbsp;·&nbsp; Pallas grid: <b style="color:#c5221f;">block_L = 8</b> (3 L-blocks), <b style="color:#c5221f;">block_M = 2</b> (4 M-blocks) → 12 programs total
+</div>
+
+<div class="legend">
+  <span><span class="swatch" style="background:#4285f4;"></span>item 0 (n=3)</span>
+  <span><span class="swatch" style="background:#34a853;"></span>item 1 (n=7)</span>
+  <span><span class="swatch" style="background:#f9ab00;"></span>item 2 (n=5)</span>
+  <span><span class="swatch" style="background:#a142f4;"></span>item 3 (n=9)</span>
+  <span style="margin-left:24px;"><span style="display:inline-block;width:18px;height:0;border-top:3px solid #c5221f;vertical-align:middle;"></span> chunk / tile / Pallas block</span>
+</div>
+
+<div class="container">
+
+  <!-- =================== HELION PANEL =================== -->
+  <div class="panel">
+    <div class="panel-title helion">Helion source — loops in N-space (item-axis)</div>
+
+<pre><span class="com"># Iterating over <i>items</i>, not rows. Each tile_b carries `tile_b.block_size` items.</span>
+<span class="kw">for</span> <span class="var">tile_b</span> <span class="kw">in</span> <span class="fn">hl.tile</span>(<span class="var">N</span>):              <span class="com"># outer: pick items     →  block_size = 2  →  2 iters (items {0,1}, {2,3})</span>
+  <span class="var">starts</span> = <span class="var">x_offsets</span>[<span class="var">tile_b</span>]            <span class="com">#  e.g. [ 0,  3]</span>
+  <span class="var">ends</span>   = <span class="var">x_offsets</span>[<span class="var">tile_b</span>.<span class="var">index</span>+<span class="num">1</span>]
+  <span class="var">nnz</span>    = <span class="var">ends</span> - <span class="var">starts</span>             <span class="com">#  e.g. [ 3,  7]   ← per-item lengths</span>
+
+  <span class="kw">for</span> <span class="var">tile_m</span> <span class="kw">in</span> <span class="fn">hl.tile</span>(<span class="var">M</span>):            <span class="com"># middle: pick cols     →  block_size = 2  →  4 iters</span>
+    <span class="var">row_sums</span> = <span class="fn">hl.zeros</span>([<span class="var">tile_b</span>, <span class="var">tile_m</span>])
+
+    <span class="kw">for</span> <span class="var">tile_k</span> <span class="kw">in</span> <span class="fn">hl.jagged_tile</span>(<span class="var">nnz</span>): <span class="com"># inner: jagged rows    →  block_size = 4  →  ceil(amax(nnz)/4) iters</span>
+      <span class="var">x_slice</span> = <span class="fn">hl.load</span>(<span class="var">x_flat</span>, <span class="hl">[<span class="var">flat_indices</span>]</span>)
+      <span class="var">row_sums</span> += <span class="var">x_slice</span>.<span class="fn">sum</span>(<span class="var">dim</span>=<span class="num">1</span>)
+
+    <span class="var">out</span>[<span class="var">tile_b</span>, <span class="var">tile_m</span>] = <span class="var">row_sums</span>
+</pre>
+
+    <div class="svg-block">
+      <svg viewBox="0 0 740 400" width="100%" height="400" xmlns="http://www.w3.org/2000/svg">
+        <defs>
+          <marker id="arrowhead" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+            <path d="M 0 0 L 10 5 L 0 10 z" fill="#c5221f"/>
+          </marker>
+          <marker id="arrowhead-g" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+            <path d="M 0 0 L 10 5 L 0 10 z" fill="#137333"/>
+          </marker>
+        </defs>
+
+        <!-- Input [L, M] in HBM -->
+        <text x="50" y="20" class="tag-label">Input  x_data : [L=24, M=8]   (packed, HBM)</text>
+        <text x="50" y="392" class="axis-label">cols (M) →</text>
+        <text x="38" y="220" class="axis-label" transform="rotate(-90 38 220)">rows (L) →</text>
+
+        <g>
+          <rect x="50" y="30" width="176" height="42"  class="it0"/>
+          <rect x="50" y="72" width="176" height="98"  class="it1"/>
+          <rect x="50" y="170" width="176" height="70" class="it2"/>
+          <rect x="50" y="240" width="176" height="126" class="it3"/>
+        </g>
+
+        <g stroke="#fff" stroke-width="0.5">
+          <line x1="72"  y1="30" x2="72"  y2="366"/>
+          <line x1="94"  y1="30" x2="94"  y2="366"/>
+          <line x1="116" y1="30" x2="116" y2="366"/>
+          <line x1="138" y1="30" x2="138" y2="366"/>
+          <line x1="160" y1="30" x2="160" y2="366"/>
+          <line x1="182" y1="30" x2="182" y2="366"/>
+          <line x1="204" y1="30" x2="204" y2="366"/>
+        </g>
+        <rect x="50" y="30" width="176" height="336" class="frame"/>
+
+        <text x="232" y="55"  class="axis-label">item 0  (n=3)</text>
+        <text x="232" y="125" class="axis-label">item 1  (n=7)</text>
+        <text x="232" y="208" class="axis-label">item 2  (n=5)</text>
+        <text x="232" y="305" class="axis-label">item 3  (n=9)</text>
+
+        <!-- Outer tile_b: solid bold red around items 0+1 -->
+        <rect x="48" y="28" width="180" height="146" class="chunk-fill"/>
+        <rect x="48" y="28" width="180" height="146" class="chunk-thick"/>
+        <text x="50" y="22" class="tag-label" fill="#c5221f">tile_b = {item 0, item 1}   (outer loop iter 0)</text>
+
+        <!-- Middle tile_m: cols 0..1 -->
+        <rect x="50" y="30" width="44" height="42" class="chunk-med"/>
+        <rect x="50" y="72" width="44" height="98" class="chunk-med"/>
+        <text x="50" y="186" class="tag-label" fill="#c5221f">tile_m = cols 0..1   (middle loop iter 0)</text>
+
+        <!-- Inner tile_k: rows 0..3 within each item -->
+        <rect x="52" y="32" width="40" height="40" class="chunk-thin"/>
+        <rect x="52" y="74" width="40" height="56" class="chunk-thin"/>
+        <text x="50" y="202" class="tag-label" fill="#c5221f">tile_k = rows 0..3 of each item   (inner loop iter 0)</text>
+
+        <!-- Compute arrows -->
+        <path d="M 96 50 Q 250 50 320 50" class="arrow-compute"/>
+        <path d="M 96 100 Q 250 100 320 80" class="arrow-compute"/>
+        <text x="270" y="40" class="axis-label" fill="#137333">sum over k</text>
+
+        <!-- Output [N, M] -->
+        <text x="320" y="20" class="tag-label">Output  out : [N=4, M=8]   (dense, HBM)</text>
+        <rect x="320" y="30" width="176" height="30" class="it0"/>
+        <rect x="320" y="60" width="176" height="30" class="it1"/>
+        <rect x="320" y="90" width="176" height="30" class="it2"/>
+        <rect x="320" y="120" width="176" height="30" class="it3"/>
+        <g stroke="#fff" stroke-width="0.5">
+          <line x1="342" y1="30" x2="342" y2="150"/>
+          <line x1="364" y1="30" x2="364" y2="150"/>
+          <line x1="386" y1="30" x2="386" y2="150"/>
+          <line x1="408" y1="30" x2="408" y2="150"/>
+          <line x1="430" y1="30" x2="430" y2="150"/>
+          <line x1="452" y1="30" x2="452" y2="150"/>
+          <line x1="474" y1="30" x2="474" y2="150"/>
+          <line x1="320" y1="60" x2="496" y2="60"/>
+          <line x1="320" y1="90" x2="496" y2="90"/>
+          <line x1="320" y1="120" x2="496" y2="120"/>
+        </g>
+        <rect x="320" y="30" width="176" height="120" class="frame"/>
+
+        <!-- Output region written by this iteration -->
+        <rect x="318" y="28" width="48" height="64" class="chunk-fill"/>
+        <rect x="318" y="28" width="48" height="64" class="chunk-thick"/>
+        <text x="320" y="170" class="tag-label" fill="#c5221f">out[items 0..1, cols 0..1] written</text>
+
+        <!-- ============ amax-padded logical view inset ============ -->
+        <text x="510" y="22" class="tag-label">tile_b=0 logical view</text>
+        <text x="510" y="36" class="axis-label">(after amax-padding in N-space)</text>
+        <text x="510" y="54" class="axis-label">nnz = [3, 7]   →   amax = 7</text>
+        <text x="510" y="68" class="axis-label">→ inner loop runs ceil(7/4) = 2 iters</text>
+
+        <!-- Side-by-side: item 0 (x=510), item 1 (x=540). Each 24 wide × 84 tall (7 rows × 12px). -->
+        <!-- Item 0 lane: rows 0..2 real (solid), rows 3..6 padded (light blue + dashed) -->
+        <rect x="510" y="80"  width="24" height="36" class="it0"/>                                   <!-- rows 0..2 real -->
+        <rect x="510" y="116" width="24" height="48" class="it0" opacity="0.22"/>                    <!-- rows 3..6 padded -->
+        <rect x="510" y="116" width="24" height="48" fill="none" stroke="#4285f4"
+              stroke-width="1" stroke-dasharray="3 2"/>
+
+        <!-- Item 1 lane: rows 0..6 all real -->
+        <rect x="540" y="80" width="24" height="84" class="it1"/>
+
+        <!-- Cell grid lines -->
+        <g stroke="#fff" stroke-width="0.5">
+          <!-- item 0 -->
+          <line x1="522" y1="80" x2="522" y2="164"/>
+          <line x1="510" y1="92"  x2="534" y2="92"/>
+          <line x1="510" y1="104" x2="534" y2="104"/>
+          <line x1="510" y1="116" x2="534" y2="116"/>
+          <line x1="510" y1="128" x2="534" y2="128"/>
+          <line x1="510" y1="140" x2="534" y2="140"/>
+          <line x1="510" y1="152" x2="534" y2="152"/>
+          <!-- item 1 -->
+          <line x1="552" y1="80" x2="552" y2="164"/>
+          <line x1="540" y1="92"  x2="564" y2="92"/>
+          <line x1="540" y1="104" x2="564" y2="104"/>
+          <line x1="540" y1="116" x2="564" y2="116"/>
+          <line x1="540" y1="128" x2="564" y2="128"/>
+          <line x1="540" y1="140" x2="564" y2="140"/>
+          <line x1="540" y1="152" x2="564" y2="152"/>
+        </g>
+        <rect x="510" y="80" width="24" height="84" class="frame"/>
+        <rect x="540" y="80" width="24" height="84" class="frame"/>
+
+        <!-- tile_k iter boundary: solid red dashed line at y=128 (between row 3 and row 4) -->
+        <line x1="506" y1="128" x2="568" y2="128" stroke="#c5221f" stroke-width="2" stroke-dasharray="4 3"/>
+
+        <!-- Bold red box highlighting item 0's tile_k=1 region (entirely masked) -->
+        <rect x="509" y="127" width="26" height="38" class="chunk-thick"/>
+
+        <!-- Column headers -->
+        <text x="510" y="78" class="axis-label">item 0</text>
+        <text x="540" y="78" class="axis-label">item 1</text>
+
+        <!-- tile_k row labels (left side) -->
+        <text x="475" y="106" class="axis-label">tile_k=0</text>
+        <text x="475" y="118" class="axis-label">rows 0..3</text>
+        <text x="475" y="148" class="axis-label">tile_k=1</text>
+        <text x="475" y="160" class="axis-label">rows 4..7</text>
+
+        <!-- Annotation: empty tile_k=1 for item 0 -->
+        <text x="570" y="148" class="tag-label" fill="#c5221f">item 0 lane,</text>
+        <text x="570" y="160" class="tag-label" fill="#c5221f">tile_k=1:</text>
+        <text x="570" y="172" class="axis-label" fill="#c5221f">100% masked</text>
+        <text x="570" y="184" class="axis-label" fill="#c5221f">— full VPU iter</text>
+        <text x="570" y="196" class="axis-label" fill="#c5221f">of wasted work</text>
+
+        <!-- Per-iter mask counts -->
+        <text x="510" y="220" class="axis-label" style="font-style:italic;">Masking per iter:</text>
+        <text x="510" y="234" class="axis-label">tile_k=0:   item 0 → 1/4 masked,  item 1 → 0/4</text>
+        <text x="510" y="248" class="axis-label">tile_k=1:   item 0 → <b>4/4 masked</b>,  item 1 → 1/4</text>
+        <text x="510" y="272" class="axis-label" style="font-style:italic;">Each tile_b has its own amax → per-tile_b padding.</text>
+
+        <text x="320" y="220" class="tag-label">All iterations (this kernel):</text>
+        <text x="320" y="236" class="axis-label">  tile_b ∈ {0, 1} × tile_m ∈ {0..3}</text>
+        <text x="320" y="250" class="axis-label">  = 2 × 4 = 8 outer-program-iters total.</text>
+        <text x="320" y="264" class="axis-label">  Each walks tile_k up to its own amax.</text>
+
+        <text x="320" y="320" class="axis-label" style="font-style:italic;">Shown: tile_b=0, tile_m=0, tile_k=0</text>
+        <text x="320" y="334" class="axis-label">  items {0, 1}, cols {0, 1}, rows {0..3} per item</text>
+      </svg>
+    </div>
+  </div>
+
+  <!-- =================== TPU/PALLAS PANEL =================== -->
+  <div class="panel">
+    <div class="panel-title tpu">TPU/Pallas — grid in L-space (flat-row-axis)</div>
+
+<pre><span class="com"># Pallas grid sees flat L, not items. Item boundaries come from offsets.</span>
+<span class="kw">def</span> <span class="fn">kernel</span>(<span class="var">x_ref</span>, <span class="var">offsets_ref</span>, <span class="var">out_ref</span>):
+  <span class="var">i_L</span>, <span class="var">i_M</span> = <span class="fn">pl.program_id</span>(<span class="num">0</span>), <span class="fn">pl.program_id</span>(<span class="num">1</span>)   <span class="com"># grid: (3, 4)</span>
+  <span class="var">l_start</span> = <span class="var">i_L</span> * <span class="var">block_L</span>                            <span class="com"># block_L=8, l_start ∈ {0,8,16}</span>
+
+  <span class="com"># x_ref is VMEM slab [block_L=8, block_M=2] — DMA'd by BlockSpec from HBM.</span>
+  <span class="com"># Walk all items, accumulate into out_ref for each one this block touches.</span>
+  <span class="kw">for</span> <span class="var">item_idx</span> <span class="kw">in</span> <span class="fn">range</span>(<span class="var">N</span>):                          <span class="com"># static loop, unrolled</span>
+    <span class="var">it_start</span> = <span class="var">offsets_ref</span>[<span class="var">item_idx</span>]
+    <span class="var">it_end</span>   = <span class="var">offsets_ref</span>[<span class="var">item_idx</span>+<span class="num">1</span>]
+    <span class="var">lo</span> = <span class="fn">jnp.maximum</span>(<span class="var">it_start</span>, <span class="var">l_start</span>) - <span class="var">l_start</span>
+    <span class="var">hi</span> = <span class="fn">jnp.minimum</span>(<span class="var">it_end</span>,   <span class="var">l_start</span>+<span class="var">block_L</span>) - <span class="var">l_start</span>
+    <span class="kw">if</span> <span class="var">lo</span> &lt; <span class="var">hi</span>:                                       <span class="com"># item has rows in this L-block</span>
+      <span class="var">partial</span> = <span class="var">x_ref</span>[<span class="fn">pl.ds</span>(<span class="var">lo</span>, <span class="var">hi</span>-<span class="var">lo</span>), :].<span class="fn">sum</span>(<span class="var">axis</span>=<span class="num">0</span>)
+      <span class="hl"><span class="var">out_ref</span>[<span class="var">item_idx</span>, :] += <span class="var">partial</span></span>
+</pre>
+
+    <div class="svg-block">
+      <svg viewBox="0 0 740 400" width="100%" height="400" xmlns="http://www.w3.org/2000/svg">
+        <defs>
+          <marker id="arrowhead2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+            <path d="M 0 0 L 10 5 L 0 10 z" fill="#c5221f"/>
+          </marker>
+          <marker id="arrowhead-g2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+            <path d="M 0 0 L 10 5 L 0 10 z" fill="#137333"/>
+          </marker>
+        </defs>
+
+        <!-- Input [L, M] in HBM -->
+        <text x="50" y="20" class="tag-label">HBM  x_data : [L=24, M=8]    (Pallas grid: 3 × 4 = 12 programs)</text>
+        <text x="50" y="392" class="axis-label">cols (M) →</text>
+        <text x="38" y="220" class="axis-label" transform="rotate(-90 38 220)">rows (L) →</text>
+
+        <g>
+          <rect x="50" y="30" width="176" height="42"  class="it0"/>
+          <rect x="50" y="72" width="176" height="98"  class="it1"/>
+          <rect x="50" y="170" width="176" height="70" class="it2"/>
+          <rect x="50" y="240" width="176" height="126" class="it3"/>
+        </g>
+        <g stroke="#fff" stroke-width="0.5">
+          <line x1="72"  y1="30" x2="72"  y2="366"/>
+          <line x1="116" y1="30" x2="116" y2="366"/>
+          <line x1="160" y1="30" x2="160" y2="366"/>
+          <line x1="204" y1="30" x2="204" y2="366"/>
+        </g>
+
+        <!-- L-block boundary lines (bold red horizontals) -->
+        <line x1="48" y1="30"  x2="228" y2="30"  class="chunk-thick"/>
+        <line x1="48" y1="142" x2="228" y2="142" class="chunk-thick"/>
+        <line x1="48" y1="254" x2="228" y2="254" class="chunk-thick"/>
+        <line x1="48" y1="366" x2="228" y2="366" class="chunk-thick"/>
+
+        <!-- M-block boundary lines (bold red verticals) -->
+        <line x1="50"  y1="28" x2="50"  y2="368" class="chunk-thick"/>
+        <line x1="94"  y1="28" x2="94"  y2="368" class="chunk-thick"/>
+        <line x1="138" y1="28" x2="138" y2="368" class="chunk-thick"/>
+        <line x1="182" y1="28" x2="182" y2="368" class="chunk-thick"/>
+        <line x1="226" y1="28" x2="226" y2="368" class="chunk-thick"/>
+
+        <!-- L-block annotations -->
+        <text x="232" y="48" class="tag-label" fill="#c5221f">L-block 0   (rows 0..7)</text>
+        <text x="232" y="62" class="axis-label" fill="#c5221f">crosses 2 items: {0, 1}</text>
+        <text x="232" y="76" class="axis-label" fill="#c5221f">item 0 fully (rows 0..2)</text>
+        <text x="232" y="90" class="axis-label" fill="#c5221f">item 1 partial (rows 0..4 of 7)</text>
+
+        <text x="232" y="160" class="tag-label" fill="#c5221f">L-block 1   (rows 8..15)</text>
+        <text x="232" y="174" class="axis-label" fill="#c5221f">crosses 3 items: {1, 2, 3}</text>
+        <text x="232" y="188" class="axis-label" fill="#c5221f">item 1 partial (rows 5..6, tail)</text>
+        <text x="232" y="202" class="axis-label" fill="#c5221f">item 2 fully (rows 0..4)</text>
+        <text x="232" y="216" class="axis-label" fill="#c5221f">item 3 partial (row 0 of 9, head)</text>
+
+        <text x="232" y="272" class="tag-label" fill="#c5221f">L-block 2   (rows 16..23)</text>
+        <text x="232" y="286" class="axis-label" fill="#c5221f">crosses 1 item: {3}</text>
+        <text x="232" y="300" class="axis-label" fill="#c5221f">item 3 partial (rows 1..8 of 9)</text>
+
+        <text x="232" y="338" class="axis-label" fill="#c5221f">M-blocks: 4 blocks of 2 cols each</text>
+        <text x="232" y="352" class="axis-label" fill="#c5221f">→ 3 L × 4 M = 12 programs total</text>
+
+        <!-- Offsets table -->
+        <text x="440" y="20" class="tag-label">Offsets (SMEM)</text>
+        <foreignObject x="440" y="25" width="120" height="120">
+          <table xmlns="http://www.w3.org/1999/xhtml" class="offsets" style="background:#fff;">
+            <tr><th>i</th><th>offsets[i]</th></tr>
+            <tr><td>0</td><td>0</td></tr>
+            <tr><td>1</td><td>3</td></tr>
+            <tr><td>2</td><td>10</td></tr>
+            <tr><td>3</td><td>15</td></tr>
+            <tr><td>4</td><td>24</td></tr>
+          </table>
+        </foreignObject>
+
+        <!-- Output [N, M] -->
+        <text x="570" y="20" class="tag-label">HBM  out : [N=4, M=8]</text>
+        <rect x="570" y="30" width="120" height="30" class="it0"/>
+        <rect x="570" y="60" width="120" height="30" class="it1"/>
+        <rect x="570" y="90" width="120" height="30" class="it2"/>
+        <rect x="570" y="120" width="120" height="30" class="it3"/>
+        <g stroke="#fff" stroke-width="0.5">
+          <line x1="585" y1="30" x2="585" y2="150"/>
+          <line x1="600" y1="30" x2="600" y2="150"/>
+          <line x1="615" y1="30" x2="615" y2="150"/>
+          <line x1="630" y1="30" x2="630" y2="150"/>
+          <line x1="645" y1="30" x2="645" y2="150"/>
+          <line x1="660" y1="30" x2="660" y2="150"/>
+          <line x1="675" y1="30" x2="675" y2="150"/>
+          <line x1="570" y1="60"  x2="690" y2="60"/>
+          <line x1="570" y1="90"  x2="690" y2="90"/>
+          <line x1="570" y1="120" x2="690" y2="120"/>
+        </g>
+        <rect x="570" y="30" width="120" height="120" class="frame"/>
+
+        <!-- Mark out[1] -->
+        <rect x="568" y="58" width="124" height="34" class="chunk-med"/>
+        <text x="570" y="172" class="tag-label" fill="#c5221f">out[1] written by L-blocks 0 AND 1</text>
+        <text x="570" y="186" class="axis-label" fill="#c5221f">(item 1 spans across the boundary)</text>
+      </svg>
+    </div>
+  </div>
+
+</div>
+
+<h2 style="font-size:16px; margin:16px 0 8px 0;">Three lowering strategies — illustrated on the running example</h2>
+<p style="font-size:12.5px; color:#3c4043; margin:0 0 14px 0;">
+  Running example throughout this section:
+  <code>N = 4</code>,
+  <code>n<sub>i</sub> = [3, 7, 5, 9]</code>,
+  <code>L = 24</code>,
+  <code>M = 8</code>,
+  <code>x_offsets = [0, 3, 10, 15, 24]</code>,
+  Pallas <code>BLOCK_L = 8</code>, <code>BLOCK_M = 2</code>.
+  Per-item L-ranges:
+  item 0 → L[0,3),
+  item 1 → L[3,10) <i>(crosses L-block boundary at L=8)</i>,
+  item 2 → L[10,15),
+  item 3 → L[15,24) <i>(crosses L-block boundary at L=16)</i>.
+</p>
+
+<style>
+  .strat-panel {
+    border: 1px solid #dadce0;
+    border-radius: 8px;
+    padding: 14px 18px;
+    background: #f8f9fa;
+    margin-bottom: 18px;
+  }
+  .strat-title {
+    font-weight: 600;
+    font-size: 15px;
+    color: #c5221f;
+    margin: 0 0 4px 0;
+  }
+  .strat-subtitle {
+    font-size: 12px;
+    color: #5f6368;
+    margin: 0 0 12px 0;
+  }
+  .strat-section {
+    margin: 10px 0 6px 0;
+    font-weight: 600;
+    font-size: 12.5px;
+    color: #202124;
+  }
+  .iomap {
+    border-collapse: collapse;
+    font-family: ui-monospace, Menlo, monospace;
+    font-size: 11.5px;
+    margin: 4px 0 8px 0;
+    width: 100%;
+  }
+  .iomap th, .iomap td {
+    border: 1px solid #dadce0;
+    padding: 4px 8px;
+    text-align: left;
+    vertical-align: top;
+  }
+  .iomap th { background: #f1f3f4; }
+  .iomap td.space { white-space: nowrap; font-weight: 600; }
+  .walkthrough {
+    background: #fff;
+    border: 1px solid #e8eaed;
+    border-radius: 4px;
+    padding: 8px 12px;
+    font-size: 12px;
+    line-height: 1.55;
+    margin: 4px 0 8px 0;
+  }
+  .walkthrough ol, .walkthrough ul {
+    margin: 4px 0 4px 18px;
+    padding: 0;
+  }
+  .walkthrough li { margin-bottom: 3px; }
+  .walkthrough code { background: #f1f3f4; padding: 0 4px; border-radius: 2px; font-size: 11.5px; }
+  .star { color: #c5221f; font-weight: 700; }
+  .pros-cons {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 10px;
+    margin-top: 10px;
+  }
+  .pros, .cons {
+    border-radius: 4px;
+    padding: 8px 12px;
+    font-size: 12px;
+    line-height: 1.5;
+  }
+  .pros {
+    background: #e6f4ea;
+    border-left: 3px solid #137333;
+  }
+  .cons {
+    background: #fce8e6;
+    border-left: 3px solid #c5221f;
+  }
+  .pros b, .cons b { display: block; font-size: 11px; text-transform: uppercase; letter-spacing: 0.4px; margin-bottom: 4px; color: #202124; }
+  .pros ul, .cons ul { margin: 0 0 0 18px; padding: 0; }
+  .pros li, .cons li { margin-bottom: 3px; }
+</style>
+
+<!-- ===================== OPTION 1 ===================== -->
+<div class="strat-panel">
+  <div class="strat-title">Strategy (1) — SMEM-side preprocessing</div>
+  <div class="strat-subtitle">
+    Compiler reframes the kernel to walk L-blocks. <code>x_offsets</code> stays on the host but its
+    <i>per-block decomposition</i> is computed inside the kernel by a one-time SMEM scalar scan
+    before the VMEM pipeline starts.
+  </div>
+
+  <div class="strat-section">Memory layout (this example)</div>
+  <table class="iomap">
+    <tr><th>Space</th><th>Contents</th><th>Concrete sizes</th></tr>
+    <tr><td class="space">HBM</td><td>x_data, out</td><td>x_data: [24, 8], out: [4, 8]</td></tr>
+    <tr><td class="space">SMEM (input)</td><td>x_offsets (scalar prefetch)</td><td>[5] int32</td></tr>
+    <tr><td class="space">SMEM (scratch)</td><td>stream[(blk, end_offset)], block_start[b]</td><td>computed at kernel entry; ≤ 7 entries here (see below)</td></tr>
+    <tr><td class="space">VMEM (in-spec)</td><td>x_view = x_data.view(num_L_blocks, BLOCK_L, M), one (BLOCK_L, M) tile/program</td><td>[8, 8] per L-block program; 3 L-blocks</td></tr>
+    <tr><td class="space">VMEM (scratch)</td><td>o_scratch (whole output, accumulated)</td><td>[4, 8] persistent across the L-block sweep</td></tr>
+  </table>
+
+  <div class="strat-section">SMEM scan — walking <code>x_offsets = [0, 3, 10, 15, 24]</code> with BLOCK_L = 8</div>
+  <table class="iomap">
+    <tr><th>i</th><th>x_offsets[i]</th><th>(blk, off) = (x // 8, x % 8)</th><th>Block jumped?</th><th>SMEM emits</th></tr>
+    <tr><td>0</td><td>0</td><td>(0, 0)</td><td>—</td><td>(0, 0)</td></tr>
+    <tr><td>1</td><td>3</td><td>(0, 3)</td><td>no</td><td>(0, 3)</td></tr>
+    <tr><td>2</td><td>10</td><td>(1, 2)</td><td><b>yes</b>: 0 → 1</td><td><span class="star">(0, 8) ←&nbsp;synthetic*</span>, then (1, 2)</td></tr>
+    <tr><td>3</td><td>15</td><td>(1, 7)</td><td>no</td><td>(1, 7)</td></tr>
+    <tr><td>4</td><td>24</td><td>(2, 8) ≡ end-of-block-2</td><td><b>yes</b>: 1 → 2</td><td><span class="star">(1, 8) ←&nbsp;synthetic*</span>, then (2, 8)</td></tr>
+  </table>
+
+  <div class="walkthrough">
+    <b>The <span class="star">*</span> problem.</b>
+    Without the synthetic entries the stream would be
+    <code>[(0,0), (0,3), (1,2), (1,7), (2,8)]</code>. Item 1's contribution shows up as the pair
+    <code>(0,3) → (1,2)</code> — a range whose start and end are in <i>different</i> L-blocks.
+    Mosaic can't address such a slice from a single VMEM tile; the per-block compute can't decode it.
+    The fix is to <i>cut the row at the block boundary</i> by inserting synthetic
+    <code>(prev_blk, BLOCK_L)</code> entries every time the block index jumps.
+    After insertion the stream becomes
+    <code>[(0,0), (0,3), <span class="star">(0,8)*</span>, (1,2), (1,7), <span class="star">(1,8)*</span>, (2,8)]</code>.
+    Now every consecutive pair lies in one block, and items spanning blocks are correctly
+    represented as two contributions (head + tail) that the VMEM scratch accumulator
+    re-stitches.<br><br>
+    For this example the <span class="star">*</span> problem inserts 2 extra entries (5 → 7).
+    For long rows where <code>n<sub>i</sub> &gt; 2·BLOCK_L</code> the insert is a while-loop
+    (one synthetic per crossed boundary), and the SMEM scratch sizing must reserve for
+    <code>ceil(max(n<sub>i</sub>) / BLOCK_L) − 1</code> inserts per row.
+  </div>
+
+  <div class="strat-section">Per-block contributions (decoded from the stream)</div>
+  <table class="iomap">
+    <tr><th>L-block</th><th>Contributions (pair → item, local slice)</th></tr>
+    <tr><td>0 (L[0,8))</td><td>(0,0)→(0,3) item 0 full · (0,3)→(0,8)* item 1 <b>head</b> rows 0..4</td></tr>
+    <tr><td>1 (L[8,16))</td><td>implicit (1,0)→(1,2) item 1 <b>tail</b> rows 5..6 · (1,2)→(1,7) item 2 full · (1,7)→(1,8)* item 3 <b>head</b> row 0</td></tr>
+    <tr><td>2 (L[16,24))</td><td>implicit (2,0)→(2,8) item 3 <b>tail</b> rows 1..8</td></tr>
+  </table>
+
+  <div class="pros-cons">
+    <div class="pros">
+      <b>Pros</b>
+      <ul>
+        <li><b>Input stable</b>: <code>x_offsets</code> is given on the host, fully known before launch. No host preprocessing call needed; everything self-contained in the kernel.</li>
+        <li>Single wide aligned VMEM load per L-block program; high arithmetic intensity per DMA.</li>
+        <li>Chunking handles oversized items naturally (a long row simply spans more L-blocks; no special case).</li>
+      </ul>
+    </div>
+    <div class="cons">
+      <b>Cons</b>
+      <ul>
+        <li><b>The <span class="star">*</span> problem</b>: boundary-crossing insertion logic. For long rows (<code>n<sub>i</sub> &gt; 2·BLOCK_L</code>) it becomes a while-loop inside the scan, with SMEM scratch sized for the worst case.</li>
+        <li><b>SMEM/VMEM pipeline gap</b>: the SMEM scan runs serially <i>before</i> the VMEM pipeline starts (it has to — the pipeline needs <code>block_start[]</code> to know how many contributions per block). For <code>B</code> in the 100–1000 range, that's 100–1000+ SMEM cycles of pure overhead during which VMEM is idle. That's several matmul-cycles' worth of wasted time per kernel call.</li>
+        <li>Per-block compute waste bounded by <code>(BLOCK_L − avg_n<sub>i</sub>_in_block) / BLOCK_L</code> — full-width masked reduce even when the row only covers part of the block.</li>
+      </ul>
+    </div>
+  </div>
+</div>
+
+<!-- ===================== OPTION 2 ===================== -->
+<div class="strat-panel">
+  <div class="strat-title">Strategy (2) — Dynamic loop (per-item async copy)</div>
+  <div class="strat-subtitle">
+    No L-space reframe. Compiler keeps the source's <code>for tile_b</code> structure.
+    <code>x_offsets</code> goes into SMEM via scalar prefetch; each iteration reads
+    its <code>(start, end)</code> from SMEM and asynchronously copies the per-item slice
+    of <code>x_data</code> into VMEM scratch.
+  </div>
+
+  <div class="strat-section">Memory layout (this example)</div>
+  <table class="iomap">
+    <tr><th>Space</th><th>Contents</th><th>Concrete sizes</th></tr>
+    <tr><td class="space">HBM</td><td>x_data, out</td><td>x_data: [24, 8], out: [4, 8]</td></tr>
+    <tr><td class="space">SMEM</td><td>x_offsets (scalar prefetch)</td><td>[5] int32</td></tr>
+    <tr><td class="space">VMEM (in-spec)</td><td><i>none for x_data</i> — bypass BlockSpec; use raw HBM ref</td><td>—</td></tr>
+    <tr><td class="space">VMEM (scratch)</td><td>x_vmem (per-item buffer), o_vmem (whole output)</td><td>x_vmem: [max(n<sub>i</sub>), M] = [9, 8]; o_vmem: [4, 8]</td></tr>
+  </table>
+
+  <div class="strat-section">Walking through the 4 iterations</div>
+  <table class="iomap">
+    <tr><th>i</th><th>SMEM reads</th><th>n<sub>i</sub></th><th>async_copy src → dst</th><th>VMEM usage</th><th>Writes</th></tr>
+    <tr><td>0</td><td>start=0, end=3</td><td>3</td><td>x_data[0:3, :] → x_vmem[:3, :]</td><td>3 / 9 sublanes (67% idle)</td><td>o_vmem[0, :]</td></tr>
+    <tr><td>1</td><td>start=3, end=10</td><td>7</td><td>x_data[3:10, :] → x_vmem[:7, :]</td><td>7 / 9 sublanes (22% idle)</td><td>o_vmem[1, :]</td></tr>
+    <tr><td>2</td><td>start=10, end=15</td><td>5</td><td>x_data[10:15, :] → x_vmem[:5, :]</td><td>5 / 9 sublanes (44% idle)</td><td>o_vmem[2, :]</td></tr>
+    <tr><td>3</td><td>start=15, end=24</td><td>9</td><td>x_data[15:24, :] → x_vmem[:9, :]</td><td>9 / 9 sublanes (full)</td><td>o_vmem[3, :]</td></tr>
+  </table>
+
+  <div class="walkthrough">
+    Mosaic's alignment check is on the <i>destination VMEM ref</i> (always aligned by allocation),
+    not on the HBM source offset — so <code>x_data[start:end, :]</code> with a runtime
+    <code>start</code> is fine. After all iterations a single DMA copies <code>o_vmem → out</code>.
+  </div>
+
+  <div class="strat-section">When one item exceeds VMEM (m_tile / k_tile swap)</div>
+  <div class="walkthrough">
+    Suppose item 3 had <code>n<sub>3</sub> = 10,000</code> — that won't fit in VMEM at full
+    <code>M</code> width. The fix: chunk along the row axis inside the iteration. If the source
+    kernel has <code>for tile_m: for tile_k:</code>, the compiler must swap to
+    <code>for tile_k: for tile_m:</code> so <code>tile_k</code> chunks the per-item rows in
+    multiple async_copies. That's a constrained loop-interchange in the lowering pass —
+    well-defined but it's a real change to source-loop order.
+  </div>
+
+  <div class="pros-cons">
+    <div class="pros">
+      <b>Pros</b>
+      <ul>
+        <li><b>Easy to lower</b>: the compiler injects scalar prefetch + async_copy + VMEM scratch around the existing per-sequence kernel body. The body itself is unchanged from the canonical Helion source.</li>
+        <li><b>Sticks to what the user wrote</b>: the <code>for tile_b</code> loop in the source maps directly to the runtime loop in the kernel. No N-space → L-space reframe to reason about.</li>
+        <li>No SMEM scan overhead — <code>x_offsets</code> reads are amortized into the per-iteration hot loop (2 scalar reads each).</li>
+      </ul>
+    </div>
+    <div class="cons">
+      <b>Cons</b>
+      <ul>
+        <li><b>Potential VMEM waste</b>: scratch sized to <code>max(n<sub>i</sub>) × M</code>. Bounded by <code>max / avg</code>. For our example the smallest item uses 3/9 sublanes (67% idle); a kernel with one outlier item drags down all the rest.</li>
+        <li><b>Tile-loop reorder when one item exceeds VMEM</b>: the lowering must swap <code>tile_m</code> with <code>tile_k</code> so <code>tile_k</code> can chunk per-item rows. Requires the source kernel to expose tile_k as a chunk-able axis.</li>
+        <li>One async_copy per item — sequential, no cross-item pipelining. DMA setup overhead amortizes badly for very short items.</li>
+      </ul>
+    </div>
+  </div>
+</div>
+
+<!-- ===================== OPTION 3 ===================== -->
+<div class="strat-panel">
+  <div class="strat-title">Strategy (3) — Helion source rewrite + host-side preprocessing on CPU</div>
+  <div class="strat-subtitle">
+    User opts in via a new Helion primitive (e.g. <code>hl.jagged_workitems(x_offsets)</code>).
+    The Helion launcher does the preprocessing on the <b>host CPU</b> before kernel launch:
+    flatten the per-item work into a uniform list of <code>(start, end, output_row, mode)</code>
+    work-items, pre-chunking any oversized items. The kernel iterates this list linearly —
+    no <code>tile_k</code>, no loop-interchange.
+  </div>
+
+  <div class="strat-section">Memory layout (this example)</div>
+  <table class="iomap">
+    <tr><th>Space</th><th>Contents</th><th>Concrete sizes</th></tr>
+    <tr><td class="space">Host (CPU)</td><td>computes work-item arrays from x_offsets</td><td>~5 µs of numpy</td></tr>
+    <tr><td class="space">HBM</td><td>x_data, out</td><td>x_data: [24, 8], out: [4, 8]</td></tr>
+    <tr><td class="space">SMEM</td><td>starts[], ends[], out_rows[], modes[] (scalar prefetch)</td><td>[K] int32 each, where K = num_workitems (≥ N, ≤ chunked-N)</td></tr>
+    <tr><td class="space">VMEM (in-spec)</td><td><i>none for x_data</i> — async_copy path</td><td>—</td></tr>
+    <tr><td class="space">VMEM (scratch)</td><td>x_vmem (per-workitem buffer), o_vmem (whole output)</td><td>x_vmem sized to chunk budget (compile-time, deterministic); o_vmem: [4, 8]</td></tr>
+  </table>
+
+  <div class="strat-section">Host preprocessing (this example, no oversized items)</div>
+  <table class="iomap">
+    <tr><th>k</th><th>start</th><th>end</th><th>out_row</th><th>mode</th><th>comment</th></tr>
+    <tr><td>0</td><td>0</td><td>3</td><td>0</td><td>init</td><td>item 0 full</td></tr>
+    <tr><td>1</td><td>3</td><td>10</td><td>1</td><td>init</td><td>item 1 full</td></tr>
+    <tr><td>2</td><td>10</td><td>15</td><td>2</td><td>init</td><td>item 2 full</td></tr>
+    <tr><td>3</td><td>15</td><td>24</td><td>3</td><td>init</td><td>item 3 full</td></tr>
+  </table>
+
+  <div class="strat-section">Host preprocessing — hypothetical: VMEM holds only 6 sublanes</div>
+  <table class="iomap">
+    <tr><th>k</th><th>start</th><th>end</th><th>out_row</th><th>mode</th><th>comment</th></tr>
+    <tr><td>0</td><td>0</td><td>3</td><td>0</td><td>init</td><td>item 0 (n=3, fits)</td></tr>
+    <tr><td>1</td><td>3</td><td>9</td><td>1</td><td>init</td><td>item 1 chunk 1 of 2 (6 rows)</td></tr>
+    <tr><td>2</td><td>9</td><td>10</td><td>1</td><td>accum</td><td>item 1 chunk 2 of 2 (1 row) — adds to out_row 1</td></tr>
+    <tr><td>3</td><td>10</td><td>15</td><td>2</td><td>init</td><td>item 2 (n=5, fits)</td></tr>
+    <tr><td>4</td><td>15</td><td>21</td><td>3</td><td>init</td><td>item 3 chunk 1 of 2 (6 rows)</td></tr>
+    <tr><td>5</td><td>21</td><td>24</td><td>3</td><td>accum</td><td>item 3 chunk 2 of 2 (3 rows) — adds to out_row 3</td></tr>
+  </table>
+
+  <div class="walkthrough">
+    Each kernel iteration reads <code>(start, end, out_row, mode)</code> from SMEM,
+    does one <code>async_copy</code>, reduces, then writes-or-accumulates into
+    <code>o_vmem[out_row, :]</code>. The kernel has no concept of "item" or "chunk" —
+    just a flat work-item index <code>k = 0..K−1</code>. The host pre-decided what each
+    iteration does.
+  </div>
+
+  <div class="pros-cons">
+    <div class="pros">
+      <b>Pros</b>
+      <ul>
+        <li><b>Same as Strategy (2)</b>: easy to lower (per-iteration async_copy around a small kernel body); no SMEM scan blocking the VMEM pipeline; alignment falls out of VMEM scratch sizing.</li>
+        <li><b>No tile_k needed</b> — and no loop-interchange. Oversized items are chunked on the host before launch; the kernel just sees more work-items in the flat list.</li>
+        <li>VMEM scratch sizing is deterministic (compile-time chunk budget) instead of <code>max(n<sub>i</sub>)</code>-dependent. No VMEM waste from outlier items.</li>
+        <li>Opt-in via a Helion primitive — no compiler pattern-matching, no risk of mis-rewriting unrelated kernels.</li>
+      </ul>
+    </div>
+    <div class="cons">
+      <b>Cons</b>
+      <ul>
+        <li><b>Source rewrite required</b>: user must change their kernel to use the new primitive. Less "magic" than (1) or (2).</li>
+        <li>Adds a small per-launch host CPU cost (typically negligible for jagged kernels — microseconds — but real).</li>
+        <li>Triton/GPU lowering of the same primitive needs a fallback (likely a no-op rewrite back to the canonical gather form, since GPU doesn't need this dance).</li>
+      </ul>
+    </div>
+  </div>
+</div>
+
+</body>
+</html>
