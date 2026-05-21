@@ -184,6 +184,9 @@ from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_PURE_CLC_SCHEDULER_OBJECT_CONFIG_KEY,
 )
 from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_PURE_DYNAMIC_SCHEDULER_OBJECT_CONFIG_KEY,
+)
+from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_SCHED_CONSUMER_WAIT_MODE_CONFIG_KEY,
 )
 from helion._compiler.cute.tcgen05_constants import (
@@ -3181,6 +3184,112 @@ class TestCuteLowerings(unittest.TestCase):
             with self.assertRaisesRegex(
                 exc.BackendUnsupported,
                 "T1 identity-store, T2 bias-store, T3 identity-store, T4 relu-store, T5 identity-store, T6 bias-relu-store, or T7 identity-store",
+            ):
+                bound.to_triton_code(cfg)
+
+    def test_tcgen05_pure_dynamic_scheduler_object_staged_backend_unsupported(
+        self,
+    ) -> None:
+        """Cycle-16 H3 Option B: dynamic-persistent codegen is staged.
+
+        The pure-dynamic scheduler-object knob is admitted into the
+        validation surface (round-trips cleanly through normalize) but
+        every selection of ``True`` at codegen time raises
+        ``BackendUnsupported`` because the productive
+        ``DYNAMIC_PERSISTENT`` codegen (atomic-counter
+        tile_count_semaphore work-tile loop) is staged for cycle 17. The
+        rejection message must name the config key and cite the
+        cycle-16 staging so a user / autotune exploration that admits
+        the knob receives a deterministic diagnostic instead of a
+        silent codegen miss.
+
+        Use the validated T1 identity-store TVM-FFI flat-role seed (the
+        same one the pure-CLC scheduler-object codegen test exercises)
+        as the codegen substrate so the rejection happens on the
+        dynamic-knob gate, not on an upstream T1 envelope mismatch.
+        """
+        args = (
+            torch.empty([1024, 1024], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([1024, 4096], device=DEVICE, dtype=torch.bfloat16),
+        )
+        cfg = _make_tcgen05_role_local_monolithic_seed_config(
+            block_sizes=[256, 256, 64],
+            l2_groupings=[1],
+            pid_type="persistent_interleaved",
+            tcgen05_cluster_m=2,
+            tcgen05_cluster_n=1,
+            tcgen05_ab_stages=TCGEN05_TARGET1_TVM_FFI_AB_STAGES,
+            tcgen05_acc_stages=2,
+            tcgen05_c_stages=TCGEN05_TARGET1_TVM_FFI_C_STAGES,
+            tcgen05_num_epi_warps=4,
+            **{
+                TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY: (
+                    Tcgen05LayoutStrategy.EXPLICIT_EPI_TILE.value
+                ),
+                TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_M_KEY: 128,
+                TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_N_KEY: 32,
+                TCGEN05_LAYOUT_OVERRIDES_D_STORE_BOX_N_KEY: 32,
+                TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY: True,
+                TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY: True,
+                TCGEN05_PURE_DYNAMIC_SCHEDULER_OBJECT_CONFIG_KEY: True,
+            },
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_role_local_monolithic_4096_bf16.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            with self.assertRaisesRegex(
+                exc.BackendUnsupported,
+                "tcgen05_pure_dynamic_scheduler_object=True is cycle-16 "
+                "infrastructure only",
+            ):
+                bound.to_triton_code(cfg)
+
+    def test_tcgen05_pure_dynamic_scheduler_object_mutually_exclusive_with_clc(
+        self,
+    ) -> None:
+        """Cycle-16 H3 Option B: pure-dynamic + pure-CLC must not coexist.
+
+        ``DYNAMIC_PERSISTENT`` and ``CLC_PERSISTENT`` are alternate
+        persistence-model lowerings of the same dispatch slot. The
+        mutual-exclusion guard in ``cute_mma._emit_mma_pipeline`` must
+        raise loudly when both are selected so an autotune
+        exploration cannot reach an ambiguous state. This test
+        exercises the guard with both knobs True on the T1 substrate
+        the pure-CLC codegen test validates.
+        """
+        args = (
+            torch.empty([1024, 1024], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([1024, 4096], device=DEVICE, dtype=torch.bfloat16),
+        )
+        cfg = _make_tcgen05_role_local_monolithic_seed_config(
+            block_sizes=[256, 256, 64],
+            l2_groupings=[1],
+            pid_type="persistent_interleaved",
+            tcgen05_cluster_m=2,
+            tcgen05_cluster_n=1,
+            tcgen05_ab_stages=TCGEN05_TARGET1_TVM_FFI_AB_STAGES,
+            tcgen05_acc_stages=2,
+            tcgen05_c_stages=TCGEN05_TARGET1_TVM_FFI_C_STAGES,
+            tcgen05_num_epi_warps=4,
+            **{
+                TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY: (
+                    Tcgen05LayoutStrategy.EXPLICIT_EPI_TILE.value
+                ),
+                TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_M_KEY: 128,
+                TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_N_KEY: 32,
+                TCGEN05_LAYOUT_OVERRIDES_D_STORE_BOX_N_KEY: 32,
+                TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY: True,
+                TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY: True,
+                TCGEN05_PURE_CLC_SCHEDULER_OBJECT_CONFIG_KEY: True,
+                TCGEN05_PURE_DYNAMIC_SCHEDULER_OBJECT_CONFIG_KEY: True,
+            },
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_role_local_monolithic_4096_bf16.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            with self.assertRaisesRegex(
+                exc.BackendUnsupported,
+                "mutually exclusive scheduler-object selections",
             ):
                 bound.to_triton_code(cfg)
 

@@ -94,6 +94,7 @@ from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_PID_TYPE
 from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_PROBLEM_SHAPE
 from .tcgen05_constants import TCGEN05_PURE_CLC_SCHEDULER_OBJECT_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_PURE_DYNAMIC_SCHEDULER_OBJECT_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_SCHED_STAGE_COUNT_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_TARGET1_TVM_FFI_BLOCK_K
 from .tcgen05_constants import TCGEN05_TARGET2_TVM_FFI_AB_STAGES
@@ -2384,6 +2385,9 @@ def _emit_mma_pipeline(
     tcgen05_requested_pure_clc_scheduler_object = bool(
         df.config.get(TCGEN05_PURE_CLC_SCHEDULER_OBJECT_CONFIG_KEY, False)
     )
+    tcgen05_requested_pure_dynamic_scheduler_object = bool(
+        df.config.get(TCGEN05_PURE_DYNAMIC_SCHEDULER_OBJECT_CONFIG_KEY, False)
+    )
     if tcgen05_requested_flat_role_coordinates and mma_impl != "tcgen05":
         raise exc.BackendUnsupported(
             "cute",
@@ -2395,6 +2399,20 @@ def _emit_mma_pipeline(
             "cute",
             f"{TCGEN05_PURE_CLC_SCHEDULER_OBJECT_CONFIG_KEY}=True requires "
             "tcgen05 MMA codegen",
+        )
+    # Cycle-16 H3 Option B (staged): the pure dynamic-persistent scheduler
+    # object lives at the same dispatch layer as pure-CLC. We surface the
+    # config key + autotune knob now so cycle 17 can land productive
+    # codegen without re-doing the search / validator plumbing; in this
+    # cycle every selection of the knob still errors out with
+    # BackendUnsupported (the error is consistent whether the knob is
+    # selected by autotune or by an explicit user Config). The mma_impl
+    # gate matches the CLC predecessor.
+    if tcgen05_requested_pure_dynamic_scheduler_object and mma_impl != "tcgen05":
+        raise exc.BackendUnsupported(
+            "cute",
+            f"{TCGEN05_PURE_DYNAMIC_SCHEDULER_OBJECT_CONFIG_KEY}=True "
+            "requires tcgen05 MMA codegen",
         )
     if tcgen05_requested_direct_entry_plan and mma_impl != "tcgen05":
         raise exc.BackendUnsupported(
@@ -3390,6 +3408,30 @@ def _emit_mma_pipeline(
         tcgen05_use_pure_clc_scheduler_object = (
             tcgen05_requested_pure_clc_scheduler_object
         )
+        tcgen05_use_pure_dynamic_scheduler_object = (
+            tcgen05_requested_pure_dynamic_scheduler_object
+        )
+        # Cycle-16 H3 Option B (staged): a request for the
+        # ``DYNAMIC_PERSISTENT`` scheduler object is mutually exclusive
+        # with the ``PURE_CLC`` scheduler object — they are alternate
+        # persistence-model lowerings of the same dispatch slot. Reject
+        # the simultaneous request loudly so a user / autotune
+        # exploration cannot reach an ambiguous state. The autotune
+        # surface gates these as separate ``BooleanFragment`` knobs;
+        # the validator narrowing below ensures at most one is True
+        # in normal search.
+        if (
+            tcgen05_use_pure_clc_scheduler_object
+            and tcgen05_use_pure_dynamic_scheduler_object
+        ):
+            raise exc.BackendUnsupported(
+                "cute",
+                f"{TCGEN05_PURE_CLC_SCHEDULER_OBJECT_CONFIG_KEY}=True and "
+                f"{TCGEN05_PURE_DYNAMIC_SCHEDULER_OBJECT_CONFIG_KEY}=True "
+                "are mutually exclusive scheduler-object selections "
+                "(CLC vs dynamic-persistent persistence models cannot "
+                "share the same lowering slot)",
+            )
         tcgen05_use_direct_entry_plan = tcgen05_requested_direct_entry_plan
         if tcgen05_use_pure_clc_scheduler_object or tcgen05_use_direct_entry_plan:
             identity_store_dtype = (
@@ -3567,6 +3609,27 @@ def _emit_mma_pipeline(
                         "T5 identity-store, T6 bias-relu-store, or T7 "
                         "identity-store TVM-FFI flat-role seed",
                     )
+        # Cycle-16 H3 Option B (staged): the productive
+        # ``DYNAMIC_PERSISTENT`` codegen path is staged for cycle 17.
+        # Any request for the pure-dynamic scheduler object reaches the
+        # dispatch slot but bails out here with a clear error so the
+        # autotuner / explicit-config caller sees a deterministic
+        # rejection. Until the productive emission lands, this raise
+        # is the entire user-visible behavior of the knob. The
+        # rejection happens AFTER the pure-CLC envelope checks so the
+        # mutually-exclusive guard above is the source of truth for
+        # "you cannot select both"; this raise is the source of truth
+        # for "the dynamic-persistent codegen has not landed yet".
+        if tcgen05_use_pure_dynamic_scheduler_object:
+            raise exc.BackendUnsupported(
+                "cute",
+                f"{TCGEN05_PURE_DYNAMIC_SCHEDULER_OBJECT_CONFIG_KEY}=True "
+                "is cycle-16 infrastructure only; the productive "
+                "DYNAMIC_PERSISTENT codegen (atomic-counter "
+                "tile_count_semaphore work-tile loop) is staged for "
+                "cycle 17 (see cute_plan.md §6 Target 8 cycle-16 H3 "
+                "Option B landing)",
+            )
         tcgen05_scheduler_warp_count_for_plan = (
             1
             if tcgen05_use_pure_clc_scheduler_object
