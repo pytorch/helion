@@ -3101,6 +3101,28 @@ class GridFoldingSpec(_BlockIdItem):
                 length=len(self.block_ids),
             )
 
+        # Check autotune_max_grid_folding_factor setting to determine
+        # allowed folding factors. -1 or None means all factors allowed
+        # (use heuristics), 0 means no folding, positive N means max factor is N.
+        # First check explicit setting, then fall back to effort profile default.
+        max_factor_setting = env.settings.autotune_max_grid_folding_factor
+        if max_factor_setting is None:
+            from .effort_profile import get_effort_profile
+
+            profile = get_effort_profile(env.settings.autotune_effort)
+            max_factor_setting = profile.autotune_max_grid_folding_factor
+
+        # Normalize None to -1 (both mean "no limit, use heuristics")
+        if max_factor_setting is None:
+            max_factor_setting = -1
+
+        # Handle explicit setting: 0 = no folding, -1/None = all allowed, N = max N
+        if max_factor_setting == 0:
+            return ListOf(
+                EnumFragment(choices=(0,)),
+                length=len(self.block_ids),
+            )
+
         # First pass: compute num_blocks per dimension.
         dim_num_blocks: list[int | None] = []
         for block_id in self.block_ids:
@@ -3120,6 +3142,7 @@ class GridFoldingSpec(_BlockIdItem):
 
         # Global gate: disable partial folding when total grid is small
         # relative to SM count—folding can only hurt occupancy.
+        # Skip this heuristic when max_factor_setting is explicitly set to -1
         total_grid = 1
         all_known = True
         for nb in dim_num_blocks:
@@ -3135,18 +3158,35 @@ class GridFoldingSpec(_BlockIdItem):
         fragments: list[ConfigSpecFragment] = []
         for nb in dim_num_blocks:
             if nb is not None:
-                if small_grid or nb < self.MIN_BLOCKS_FOR_PARTIAL:
-                    # Global gate or per-dim gate: no partial folding.
-                    choices = tuple(f for f in self.VALID_FACTORS if f <= 0)
+                if max_factor_setting == -1:
+                    # Use heuristics for full effort
+                    if small_grid or nb < self.MIN_BLOCKS_FOR_PARTIAL:
+                        # Global gate or per-dim gate: no partial folding.
+                        choices = tuple(f for f in self.VALID_FACTORS if f <= 0)
+                    else:
+                        # Cap max_factor aggressively: don't fold more than
+                        # half the blocks in a dimension to preserve parallelism.
+                        max_factor = max(0, nb // 2)
+                        choices = tuple(
+                            f for f in self.VALID_FACTORS if f <= 0 or f <= max_factor
+                        )
                 else:
-                    # Cap max_factor aggressively: don't fold more than
-                    # half the blocks in a dimension to preserve parallelism.
-                    max_factor = max(0, nb // 2)
+                    # Explicit max factor limit: filter VALID_FACTORS
                     choices = tuple(
-                        f for f in self.VALID_FACTORS if f <= 0 or f <= max_factor
+                        f
+                        for f in self.VALID_FACTORS
+                        if f <= 0 or (f > 0 and f <= max_factor_setting)
                     )
             else:
-                choices = self.VALID_FACTORS
+                # Dynamic shape: use all factors up to max_factor_setting
+                if max_factor_setting == -1:
+                    choices = self.VALID_FACTORS
+                else:
+                    choices = tuple(
+                        f
+                        for f in self.VALID_FACTORS
+                        if f <= 0 or (f > 0 and f <= max_factor_setting)
+                    )
             fragments.append(EnumFragment(choices=choices))
         return PerDimListOf(fragments=fragments)
 

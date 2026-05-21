@@ -498,6 +498,12 @@ class _Settings:
             _env_get_bool, "HELION_DISABLE_AUTOTUNER_HEURISTICS", False
         )
     )
+    autotune_max_grid_folding_factor: int | None = dataclasses.field(
+        default_factory=functools.partial(
+            _env_get_optional_int,
+            "HELION_AUTOTUNE_MAX_GRID_FOLDING_FACTOR",
+        )
+    )
     autotune_effort: AutotuneEffort = dataclasses.field(
         default_factory=functools.partial(
             _env_get_literal,
@@ -672,6 +678,13 @@ class Settings(_Settings):
             "If True, disable compiler/autotuner heuristics such as compiler seed "
             "configs. User-provided autotune_seed_configs are unaffected. "
             "Set HELION_DISABLE_AUTOTUNER_HEURISTICS=1 to disable globally."
+        ),
+        "autotune_max_grid_folding_factor": (
+            "Maximum grid folding factor allowed during autotuning. Set to -1 or None to allow all "
+            "factors (uses heuristics). Set to 0 to disable grid folding entirely. Set to N>0 to "
+            "limit max folding factor to N. Default: None (uses effort profile default: 0 for "
+            "'quick' effort, None/-1 for 'full' effort). "
+            "Set HELION_AUTOTUNE_MAX_GRID_FOLDING_FACTOR=N to override globally."
         ),
         "allow_warp_specialize": "If True, allow warp specialization for tl.range calls on CUDA devices.",
         "debug_dtype_asserts": "If True, emit tl.static_assert checks for dtype after each device node.",

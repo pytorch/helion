@@ -82,6 +82,7 @@ class AutotuneEffortProfile:
     llm_search: LLMSearchConfig | None = None
     finishing_rounds: int = 0
     rebenchmark_threshold: float = 1.5
+    autotune_max_grid_folding_factor: int | None = None
 
 
 _PROFILES: dict[AutotuneEffort, AutotuneEffortProfile] = {
@@ -118,6 +119,7 @@ _PROFILES: dict[AutotuneEffort, AutotuneEffortProfile] = {
         llm_search=QUICK_LLM_SEARCH_DEFAULTS,
         finishing_rounds=0,
         rebenchmark_threshold=0.9,  # <1.0 effectively disables rebenchmarking
+        autotune_max_grid_folding_factor=0,  # Disable grid folding to reduce search space
     ),
     "full": AutotuneEffortProfile(
         pattern_search=PATTERN_SEARCH_DEFAULTS,

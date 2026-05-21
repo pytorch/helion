@@ -3495,6 +3495,60 @@ class TestAutotuneBudget(TestCase):
         provider = LocalBenchmarkProvider.__new__(LocalBenchmarkProvider)
         self.assertFalse(provider.budget_exceeded_fn())
 
+    def test_grid_folding_effort_profile_defaults(self) -> None:
+        """Test that quick effort profile disables grid folding by default."""
+        from helion.autotuner.effort_profile import get_effort_profile
+
+        # Quick effort should have max_grid_folding_factor=0 (disabled)
+        quick_profile = get_effort_profile("quick")
+        self.assertEqual(quick_profile.autotune_max_grid_folding_factor, 0)
+
+        # Full effort should have max_grid_folding_factor=None (use heuristics)
+        full_profile = get_effort_profile("full")
+        self.assertIsNone(full_profile.autotune_max_grid_folding_factor)
+
+        # None effort should also have None
+        none_profile = get_effort_profile("none")
+        self.assertIsNone(none_profile.autotune_max_grid_folding_factor)
+
+    def test_grid_folding_settings_override(self) -> None:
+        """Test that autotune_max_grid_folding_factor setting can override profile."""
+        import os
+
+        from helion.runtime.settings import Settings
+
+        # Save original value
+        original = os.environ.get("HELION_AUTOTUNE_MAX_GRID_FOLDING_FACTOR")
+
+        try:
+            # Test 1: Default (None) uses profile default
+            os.environ.pop("HELION_AUTOTUNE_MAX_GRID_FOLDING_FACTOR", None)
+            os.environ["HELION_AUTOTUNE_EFFORT"] = "quick"
+            settings = Settings()
+            self.assertIsNone(settings.autotune_max_grid_folding_factor)
+
+            # Test 2: Override with 0 (disable)
+            os.environ["HELION_AUTOTUNE_MAX_GRID_FOLDING_FACTOR"] = "0"
+            settings = Settings()
+            self.assertEqual(settings.autotune_max_grid_folding_factor, 0)
+
+            # Test 3: Override with -1 (enable all)
+            os.environ["HELION_AUTOTUNE_MAX_GRID_FOLDING_FACTOR"] = "-1"
+            settings = Settings()
+            self.assertEqual(settings.autotune_max_grid_folding_factor, -1)
+
+            # Test 4: Override with specific max (8)
+            os.environ["HELION_AUTOTUNE_MAX_GRID_FOLDING_FACTOR"] = "8"
+            settings = Settings()
+            self.assertEqual(settings.autotune_max_grid_folding_factor, 8)
+
+        finally:
+            # Restore original value
+            if original is not None:
+                os.environ["HELION_AUTOTUNE_MAX_GRID_FOLDING_FACTOR"] = original
+            else:
+                os.environ.pop("HELION_AUTOTUNE_MAX_GRID_FOLDING_FACTOR", None)
+
 
 if __name__ == "__main__":
     unittest.main()
