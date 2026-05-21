@@ -19,16 +19,29 @@ if TYPE_CHECKING:
     from ..device_ir import DeviceIR
 
 
+def _reduction_kernel_eligible(env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+    spec = env.config_spec
+    # Single non-reduction tile + single reduction dim.
+    if len(spec.block_sizes) != 1 or len(spec.reduction_loops) != 1:
+        return False
+    # No matmul facts (this seeds reduction kernels, not GEMMs).
+    if spec.matmul_facts:
+        return False
+    bs_spec = cast("BlockSizeSpec", spec.block_sizes[0])
+    # M-axis must accept block_size=1.
+    return max(bs_spec.min_size, bs_spec.autotuner_min) <= 1
+
+
 class CuteReductionTileHeuristic(AutotunerHeuristic):
     """Seed config for canonical reduction kernels (RMS norm, softmax, etc.).
 
-    For kernels with exactly one non-reduction tile and one reduction
-    dimension, the bandwidth-optimal CuTe config keeps M-axis threads at 1
-    (one tile row per block) so the full reduction extent can be mapped to
-    threads. With many such blocks (one per M row), the launch lattice
-    saturates B200's 148 SMs while each block does its reduction
-    via the cross-warp shared-memory combiner (or a single warp's
-    warp_reduction_sum when the reduction is small).
+    Seeds the "narrow chunk" config: bs=1, nt=1, reduction_loops=[None] for
+    N<=max_threads (single-pass persistent reduction) or
+    reduction_loops=[max_threads] for N>max_threads (one element per
+    thread per iter, no lane loop). This config keeps the M-axis at one
+    row per block so the reduction recruits all available threads, and
+    the two-pass load fusion (helion/_compiler/cute/fuse_two_pass_loads.py)
+    eliminates the redundant gmem reload of x in the post-reduction sweep.
     """
 
     name = "cute_reduction_tile"
@@ -36,16 +49,7 @@ class CuteReductionTileHeuristic(AutotunerHeuristic):
 
     @classmethod
     def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
-        spec = env.config_spec
-        # Single non-reduction tile + single reduction dim.
-        if len(spec.block_sizes) != 1 or len(spec.reduction_loops) != 1:
-            return False
-        # No matmul facts (this seeds reduction kernels, not GEMMs).
-        if spec.matmul_facts:
-            return False
-        bs_spec = cast("BlockSizeSpec", spec.block_sizes[0])
-        # M-axis must accept block_size=1.
-        return max(bs_spec.min_size, bs_spec.autotuner_min) <= 1
+        return _reduction_kernel_eligible(env, device_ir)
 
     @classmethod
     def get_seed_config(
@@ -65,6 +69,53 @@ class CuteReductionTileHeuristic(AutotunerHeuristic):
             block_sizes=[1],
             num_threads=[1],
             reduction_loops=reduction_loops,
+        )
+
+
+class CuteReductionWideChunkHeuristic(AutotunerHeuristic):
+    """Companion seed: chunk = max(max_threads, size_hint/2) so the inner
+    reduction loop has very few outer iterations and lane_extent absorbs
+    the bulk of the work.
+
+    For large N this lattice (1-2 outer iters, large lane_extent) tends to
+    schedule better than the narrow-chunk lattice (many outer iters,
+    lane_extent=1) on B200 — the SASS is dominated by per-iter scheduling
+    bubbles in the narrow case, while the wide case lets the compiler
+    overlap the load/compute/store traffic across the unrolled lane
+    iterations. Only applies when size_hint > max_threads (otherwise the
+    narrow heuristic already gives the same lattice).
+    """
+
+    name = "cute_reduction_wide_chunk"
+    backend = "cute"
+
+    @classmethod
+    def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        if not _reduction_kernel_eligible(env, device_ir):
+            return False
+        spec = env.config_spec
+        rl_spec = cast("ReductionLoopSpec", spec.reduction_loops[0])
+        max_threads = spec.max_reduction_threads or 1024
+        return rl_spec.size_hint > 2 * max_threads
+
+    @classmethod
+    def get_seed_config(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> Config | None:
+        spec = env.config_spec
+        rl_spec = cast("ReductionLoopSpec", spec.reduction_loops[0])
+        max_threads = spec.max_reduction_threads or 1024
+        size_hint = rl_spec.size_hint
+        # Halve the size_hint until it fits in the reduction_loop chunk
+        # spec's [low, high] range; the autotuner explores power-of-2
+        # chunks so we keep this seed PoT.
+        chunk = size_hint // 2
+        if chunk < max_threads:
+            chunk = max_threads
+        return Config(
+            block_sizes=[1],
+            num_threads=[1],
+            reduction_loops=[chunk],
         )
 
 
