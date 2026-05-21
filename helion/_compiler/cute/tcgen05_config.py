@@ -87,6 +87,8 @@ from .tcgen05_constants import TCGEN05_ONE_CTA_MAX_BLOCK_M
 from .tcgen05_constants import TCGEN05_SCHED_CONSUMER_WAIT_MODE_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_SCHED_CONSUMER_WAIT_MODE_NORMAL
 from .tcgen05_constants import TCGEN05_SCHED_CONSUMER_WAIT_MODES
+from .tcgen05_constants import TCGEN05_SCHED_STAGE_COUNT_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_SCHED_STAGE_COUNTS
 from .tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
 from .tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
 from .tcgen05_constants import TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K
@@ -165,6 +167,7 @@ CUTE_TCGEN05_DIAGNOSTIC_CONFIG_KEYS: frozenset[str] = frozenset(
         TCGEN05_EPILOGUE_LAYOUT_CONFIG_KEY,
         TCGEN05_LARGE_BN_PROOF_CONFIG_KEY,
         TCGEN05_SCHED_CONSUMER_WAIT_MODE_CONFIG_KEY,
+        TCGEN05_SCHED_STAGE_COUNT_CONFIG_KEY,
     }
 )
 CUTE_TCGEN05_STRATEGY_CONFIG_KEYS: frozenset[str] = frozenset(
@@ -809,6 +812,53 @@ class CuteTcgen05Config:
         config[TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY] = (
             self.persistence_model_default_from_config(config).value
         )
+
+    def _validate_sched_stage_count_config(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        self._validate_int_enum_config(
+            config,
+            TCGEN05_SCHED_STAGE_COUNT_CONFIG_KEY,
+            TCGEN05_SCHED_STAGE_COUNTS,
+            fix_invalid=fix_invalid,
+        )
+        block_sizes = config.get("block_sizes")
+        is_full_role_local_two_cta_shape = (
+            isinstance(block_sizes, list)
+            and len(block_sizes) >= 3
+            and block_sizes[0] == TCGEN05_TWO_CTA_BLOCK_M
+            and config.get("pid_type") == TCGEN05_TWO_CTA_SEED_PID_TYPE
+            and config.get("tcgen05_cluster_m", 1) == 2
+            and config.get("tcgen05_cluster_n", 1) == 1
+            and config.get(TCGEN05_CLUSTER_M2_ONE_CTA_ROLE_LOCAL_CONFIG_KEY) is not True
+        )
+        if (
+            TCGEN05_SCHED_STAGE_COUNT_CONFIG_KEY in config
+            and config.get(TCGEN05_SCHED_STAGE_COUNT_CONFIG_KEY) != 1
+            and (
+                config.get(TCGEN05_STRATEGY_CONFIG_KEY)
+                != Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER.value
+                or config.get(TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY)
+                != Tcgen05PersistenceModel.CLC_PERSISTENT.value
+                or config.get(TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY, 0) == 0
+                or not is_full_role_local_two_cta_shape
+            )
+        ):
+            if fix_invalid:
+                config.pop(TCGEN05_SCHED_STAGE_COUNT_CONFIG_KEY, None)
+            else:
+                raise InvalidConfig(
+                    f"{TCGEN05_SCHED_STAGE_COUNT_CONFIG_KEY}=2 is only supported "
+                    "with "
+                    f"{TCGEN05_STRATEGY_CONFIG_KEY}="
+                    f"{Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER.value!r} and "
+                    f"{TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY}="
+                    f"{Tcgen05PersistenceModel.CLC_PERSISTENT.value!r} and "
+                    "the omitted shared-loop full role-local CtaGroup.TWO "
+                    "shape: pid_type='persistent_interleaved', "
+                    "tcgen05_cluster_m=2, tcgen05_cluster_n=1, block_m=256, "
+                    f"and {TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY} > 0"
+                )
 
     def prepare_override_normalization(
         self,
@@ -1469,6 +1519,7 @@ class CuteTcgen05Config:
                     f"{TCGEN05_STRATEGY_CONFIG_KEY}="
                     f"{Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER.value!r}"
                 )
+        self._validate_sched_stage_count_config(config, fix_invalid=fix_invalid)
 
     def _validate_enum_config(
         self,
@@ -1494,6 +1545,31 @@ class CuteTcgen05Config:
             raise InvalidConfig(
                 f"{key} must be one of {choices!r}, got {config[key]!r}"
             )
+
+    def _validate_int_enum_config(
+        self,
+        config: dict[str, object],
+        key: str,
+        choices: tuple[int, ...],
+        *,
+        fix_invalid: bool,
+    ) -> None:
+        if key not in config:
+            return
+        if not self.search_enabled:
+            if fix_invalid:
+                config.pop(key, None)
+                return
+            raise InvalidConfig(
+                f"{key} is only supported for tcgen05-enabled CuTe matmul kernels"
+            )
+        value = config[key]
+        # ``bool`` is an ``int`` subclass, but it is not a valid stage count.
+        if type(value) is not int or value not in choices:
+            if fix_invalid:
+                config.pop(key, None)
+                return
+            raise InvalidConfig(f"{key} must be one of {choices!r}, got {value!r}")
 
     def _validate_bool_config(
         self,
@@ -1563,6 +1639,7 @@ class CuteTcgen05Config:
         # CLC admission depends on the projected cluster/pid/strategy tuple
         # above, including the scheduler/c-input warp fix-ups.
         self._fix_clc_persistence_search_config(config)
+        self._validate_sched_stage_count_config(config, fix_invalid=True)
 
     def normalize_strategy(
         self, config: dict[str, object], *, fix_invalid: bool
