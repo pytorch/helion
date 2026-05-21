@@ -211,16 +211,16 @@ class DeviceGridState(DeviceLoopOrGridState):
                 ]
             # Setup statements go before the guarded body, inside the loop
             wrapped = [*setup, *wrapped]
-            wrapped = [
-                create(
-                    ast.For,
-                    target=create(ast.Name, id=lane_var, ctx=ast.Store()),
-                    iter=_lane_loop_iter(extent),
-                    body=wrapped,
-                    orelse=[],
-                    type_comment=None,
-                )
-            ]
+            for_loop = create(
+                ast.For,
+                target=create(ast.Name, id=lane_var, ctx=ast.Store()),
+                iter=_lane_loop_iter(extent),
+                body=wrapped,
+                orelse=[],
+                type_comment=None,
+            )
+            setattr(for_loop, HELION_LANE_LOOP_VAR_ATTR, lane_var)
+            wrapped = [for_loop]
         return wrapped
 
 

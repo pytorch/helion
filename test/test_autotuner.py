@@ -2631,7 +2631,11 @@ class TestCuteAutotuner(TestCase):
         flat_keys = {
             key for key, _count, _is_sequence in gen.config_spec.flat_key_layout()
         }
-        self.assertEqual(flat_keys, {"block_sizes", "num_threads", "grid_foldings"})
+        # loop_orders is exposed for cute non-tcgen05 (see 2e4f3311)
+        # grid_foldings is exposed for cute (see e67dafa7)
+        self.assertEqual(
+            flat_keys, {"block_sizes", "num_threads", "loop_orders", "grid_foldings"}
+        )
 
         repaired = gen.unflatten(
             gen.flatten(helion.Config(block_sizes=[16, 64], num_threads=[128, 128]))
@@ -2643,7 +2647,8 @@ class TestCuteAutotuner(TestCase):
         self.assertTrue(any(config.num_threads for config in configs))
         for config in configs:
             self.assertLessEqual(
-                set(config.config), {"block_sizes", "num_threads", "grid_foldings"}
+                set(config.config),
+                {"block_sizes", "num_threads", "loop_orders", "grid_foldings"},
             )
             self.assertNotIn("persistent", config.pid_type)
             explicit_threads = [nt for nt in config.num_threads if nt > 0]
