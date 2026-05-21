@@ -148,6 +148,21 @@ def cute_row_centered(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
+@helion.kernel(backend="cute", autotune_effort="none")
+def cute_rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
+    n, m = x.size()
+    out = torch.empty_like(x)
+    hl.specialize(m)
+    for tile_n in hl.tile(n):
+        vals = x[tile_n, :].to(torch.float32)
+        mean_sq = torch.mean(vals * vals, dim=-1)
+        inv_rms = torch.rsqrt(mean_sq + eps)
+        out[tile_n, :] = (vals * inv_rms[:, None] * weight[:].to(torch.float32)).to(
+            x.dtype
+        )
+    return out
+
+
 @helion.kernel(backend="cute")
 def cute_row_max(x: torch.Tensor) -> torch.Tensor:
     n, m = x.size()
@@ -652,6 +667,19 @@ class TestCuteBackend(TestCase):
         expected = torch.sigmoid(torch.sin(torch.relu(x * y)))
         torch.testing.assert_close(out, expected, rtol=1e-5, atol=1e-5)
 
+    def test_rms_norm_uses_native_rsqrt(self) -> None:
+        x = torch.randn(8, 32, device=DEVICE, dtype=torch.float32)
+        weight = torch.randn(32, device=DEVICE, dtype=torch.float32)
+        eps = 1e-5
+        code, out = code_and_output(cute_rms_norm, (x, weight, eps), block_size=4)
+        x_sq = x * x
+        inv_rms = torch.rsqrt(x_sq.mean(dim=-1) + eps)
+        expected = x * inv_rms[:, None] * weight
+        torch.testing.assert_close(out, expected, rtol=1e-5, atol=1e-5)
+        self.assertIn("cute.math.rsqrt", code)
+        self.assertNotIn("cute.math.sqrt", code)
+        self.assertNotRegex(code, r"1\.0\s*/\s*v_\d+")
+
     def test_scalar_args_int_and_float(self) -> None:
         args = (
             torch.randn(65, 23, device=DEVICE, dtype=torch.float32),
@@ -798,6 +826,23 @@ class TestCuteBackend(TestCase):
         (x,) = args
         torch.testing.assert_close(out, x.sum(-1), rtol=1e-4, atol=1e-4)
         self.assertIn("for lane_", code)
+
+    def test_looped_reduction_uses_per_thread_lanes(self) -> None:
+        args = (torch.randn(16, 4096, device=DEVICE, dtype=torch.float32),)
+        code, out = code_and_output(
+            cute_row_sum,
+            args,
+            block_sizes=[1],
+            reduction_loop=2048,
+            num_warps=4,
+        )
+        (x,) = args
+        torch.testing.assert_close(out, x.sum(-1), rtol=1e-4, atol=1e-4)
+        self.assertIn("_REDUCTION_BLOCK_1 = 2048", code)
+        self.assertIn("for reduction_lane_1 in range(2)", code)
+        self.assertIn("_cute_grouped_reduce_shared_two_stage", code)
+        self.assertIn("group_span=1024", code)
+        self.assertIn("block=(1024, 1, 1)", code)
 
     def test_strided_threaded_block_reduction(self) -> None:
         args = (torch.randn(4, 16, device=DEVICE, dtype=torch.float32),)

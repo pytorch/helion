@@ -1097,6 +1097,10 @@ class GenerateASTFromInductor(DefaultHandler):
         return self._lift(result)
 
     def rsqrt(self, x: object) -> str:  # type: ignore[override]
+        if CompileEnvironment.current().backend.name == "cute":
+            return self._lift(
+                expr_from_string("cute.math.rsqrt({x})", x=self._to_ast(x))
+            )
         try:
             return self._default("rsqrt", (x,), {})
         except NotImplementedError:
