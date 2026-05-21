@@ -658,7 +658,10 @@ class CuteTcgen05Config:
         scheduler_warps = config.get(TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY)
         c_input_warps = config.get(TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY)
         ab_stages = config.get("tcgen05_ab_stages")
-        if strategy == Tcgen05Strategy.ROLE_LOCAL_MONOLITHIC.value:
+        if strategy in (
+            Tcgen05Strategy.ROLE_LOCAL_MONOLITHIC.value,
+            Tcgen05Strategy.PURE_MATMUL_ROLE_LIFECYCLE.value,
+        ):
             if scheduler_warps != 0:
                 config[TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY] = 0
             if c_input_warps != 0:
@@ -1247,6 +1250,7 @@ class CuteTcgen05Config:
             (
                 Tcgen05Strategy.ROLE_LOCAL_MONOLITHIC.value,
                 Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER.value,
+                Tcgen05Strategy.PURE_MATMUL_ROLE_LIFECYCLE.value,
             )
         )
         fragments[TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY] = EnumFragment((0, 1))

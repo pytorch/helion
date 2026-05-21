@@ -17,11 +17,13 @@ if TYPE_CHECKING:
     from .cute_mma import _Tcgen05AuxPipelinePlan
     from .cute_mma import _Tcgen05SchedPipelinePlan
     from .tcgen05_lifecycle import Tcgen05LifecycleContext
+    from .tcgen05_pure_matmul import Tcgen05PureMatmulObjectModel
 
 
 @dataclasses.dataclass(frozen=True)
 class CuteTcgen05StoreValue:
     lifecycle_context: Tcgen05LifecycleContext
+    pure_matmul_object: Tcgen05PureMatmulObjectModel | None = None
     bm: int = 0
     bn: int = 0
     bk: int = 0
@@ -45,6 +47,14 @@ class CuteTcgen05StoreValue:
     # Output element dtype (cutlass type string, e.g. "cutlass.BFloat16")
     # used when computing the tcgen05 epilogue tile.
     epi_elem_dtype_str: str = ""
+
+    def __post_init__(self) -> None:
+        if self.pure_matmul_object is not None:
+            assert self.pure_matmul_object.lifecycle_context is self.lifecycle_context
+
+    @property
+    def pure_matmul_role_lifecycle(self) -> bool:
+        return self.pure_matmul_object is not None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -204,6 +214,7 @@ class CuteDeviceFunctionState:
 
     def __init__(self) -> None:
         self._tcgen05_store_values: dict[str, CuteTcgen05StoreValue] = {}
+        self._tcgen05_consumed_store_value_ids: set[int] = set()
         # FX matmul / hl.dot / addmm nodes lowered through tcgen05. The store
         # path uses this to recognize fused epilogue chains that must use the
         # tcgen05 store splice instead of falling through to SIMT store codegen.
@@ -228,6 +239,10 @@ class CuteDeviceFunctionState:
         self._epi_role_full_tile_stmt_ids: set[int] = set()
         self._epi_role_edge_tile_stmt_ids: set[int] = set()
         self._tcgen05_kloop_owned_stmt_ids_by_loop: dict[int, set[int]] = {}
+        self._tcgen05_kloop_cleanup_requested_loop_ids: set[int] = set()
+        self._tcgen05_pure_lifecycle_pending_store_loops: dict[
+            int, DeviceLoopState
+        ] = {}
         self.epi_role_tile_counter_var: str | None = None
         self.epi_role_tile_counter_increment_per_tile: bool = True
         self._collective_handled_loads: set[str] = set()
@@ -248,6 +263,25 @@ class CuteDeviceFunctionState:
         for candidate_name in candidate_names:
             if (value := self._tcgen05_store_values.get(candidate_name)) is not None:
                 return value
+        return None
+
+    def consume_tcgen05_store_value(
+        self,
+        candidate_names: Sequence[str],
+    ) -> CuteTcgen05StoreValue | None:
+        for candidate_name in candidate_names:
+            if (value := self._tcgen05_store_values.get(candidate_name)) is None:
+                continue
+            value_id = id(value)
+            if value_id in self._tcgen05_consumed_store_value_ids:
+                raise exc.BackendUnsupported(
+                    "cute",
+                    "tcgen05 pure role-lifecycle store supports exactly one "
+                    f"store of {candidate_name!r}; multi-store fan-out must use "
+                    "the standard store path",
+                )
+            self._tcgen05_consumed_store_value_ids.add(value_id)
+            return value
         return None
 
     def register_tcgen05_matmul_plan(self, plan: CuteTcgen05MatmulPlan) -> None:
@@ -283,7 +317,7 @@ class CuteDeviceFunctionState:
     def has_tcgen05_per_tile_marks(self) -> bool:
         return bool(self._per_tile_stmt_ids)
 
-    def register_tcgen05_post_loop_stmts(self, stmts: list[ast.AST]) -> None:
+    def register_tcgen05_post_loop_stmts(self, stmts: Sequence[ast.AST]) -> None:
         """Move one-shot drains and teardown after the persistent tile loop."""
         self._post_loop_stmt_ids.update(id(stmt) for stmt in stmts)
 
@@ -422,6 +456,29 @@ class CuteDeviceFunctionState:
         )
         owned_ids.update(id(stmt) for stmt in stmts)
 
+    def register_tcgen05_pure_lifecycle_pending_store(
+        self, device_loop: DeviceLoopState
+    ) -> None:
+        loop_id = id(device_loop)
+        if loop_id in self._tcgen05_pure_lifecycle_pending_store_loops:
+            raise exc.BackendUnsupported(
+                "cute",
+                "tcgen05 pure role-lifecycle supports only one pending "
+                "matmul/store pair per K loop",
+            )
+        self._tcgen05_pure_lifecycle_pending_store_loops[loop_id] = device_loop
+
+    def request_tcgen05_owned_kloop_cleanup(self, device_loop: DeviceLoopState) -> None:
+        loop_id = id(device_loop)
+        if loop_id not in self._tcgen05_pure_lifecycle_pending_store_loops:
+            raise exc.BackendUnsupported(
+                "cute",
+                "tcgen05 role-lifecycle K-loop cleanup was requested without a "
+                "matching pending pure-matmul store",
+            )
+        self._tcgen05_pure_lifecycle_pending_store_loops.pop(loop_id)
+        self._tcgen05_kloop_cleanup_requested_loop_ids.add(loop_id)
+
     def is_tcgen05_kloop_owned_stmt(
         self, device_loop: DeviceLoopState, stmt: ast.AST
     ) -> bool:
@@ -478,6 +535,41 @@ class CuteDeviceFunctionState:
                 f"{first_unowned}",
             )
         inner_stmts[slice_start : slice_start + len(stmts)] = [ast.Pass()]
+
+    def finalize_tcgen05_owned_kloop_cleanup(
+        self, device_loop: DeviceLoopState
+    ) -> None:
+        loop_id = id(device_loop)
+        if loop_id not in self._tcgen05_kloop_cleanup_requested_loop_ids:
+            return
+
+        inner_stmts = device_loop.inner_statements
+        owned_ids = self._tcgen05_kloop_owned_stmt_ids_by_loop.get(loop_id, set())
+        owned_positions = [
+            index for index, stmt in enumerate(inner_stmts) if id(stmt) in owned_ids
+        ]
+        if not owned_positions:
+            raise exc.BackendUnsupported(
+                "cute",
+                "tcgen05 role-lifecycle K-loop cleanup found no exactly owned "
+                "statements to consume",
+            )
+        cleanup_stmts = inner_stmts[min(owned_positions) :]
+        self.replace_tcgen05_owned_kloop_stmts_with_pass(device_loop, cleanup_stmts)
+        self._tcgen05_kloop_cleanup_requested_loop_ids.remove(loop_id)
+
+    def consume_tcgen05_owned_kloop_cleanup(self, device_loop: DeviceLoopState) -> None:
+        self.request_tcgen05_owned_kloop_cleanup(device_loop)
+        self.finalize_tcgen05_owned_kloop_cleanup(device_loop)
+
+    def finalize_tcgen05_pure_lifecycle_stores(self) -> None:
+        if not self._tcgen05_pure_lifecycle_pending_store_loops:
+            return
+        raise exc.BackendUnsupported(
+            "cute",
+            "tcgen05 pure role-lifecycle requires exactly one store consuming "
+            "the matmul result before function codegen finishes",
+        )
 
     def request_root_lane_loop_suppression(self) -> None:
         self.suppress_root_lane_loops = True

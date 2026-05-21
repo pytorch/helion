@@ -63,10 +63,16 @@ class Tcgen05Strategy(str, enum.Enum):
       sched_pipeline ``cluster_size`` argument to the full
       ``cluster_m * cluster_n`` envelope so the deferred-init
       protocol participates in the cluster-wide barrier-init.
+    - ``PURE_MATMUL_ROLE_LIFECYCLE``. Experimental non-persistent,
+      static-full pure-matmul path. It emits separate TMA-producer,
+      MMA-exec, and epilogue/TMEM-free ownership while deleting the original
+      K-loop body only through exact tcgen05 statement ownership. It is
+      explicit-config only and not sampled by autotune.
     """
 
     ROLE_LOCAL_MONOLITHIC = "role_local_monolithic"
     ROLE_LOCAL_WITH_SCHEDULER = "role_local_with_scheduler"
+    PURE_MATMUL_ROLE_LIFECYCLE = "pure_matmul_role_lifecycle"
 
 
 class Tcgen05PersistenceModel(str, enum.Enum):
@@ -433,6 +439,14 @@ def tcgen05_smem_layout_expr(
 # implemented set in ``ConfigSpec._tcgen05_strategy_scalar_fragments``.
 TCGEN05_STRATEGY_CONFIG_KEY = "tcgen05_strategy"
 
+
+def is_pure_matmul_role_lifecycle_config(config: Mapping[str, object]) -> bool:
+    return (
+        config.get(TCGEN05_STRATEGY_CONFIG_KEY)
+        == Tcgen05Strategy.PURE_MATMUL_ROLE_LIFECYCLE.value
+    )
+
+
 # Persistence model. The default is *derived from* ``pid_type`` so
 # serialized configs cannot encode contradictions like
 # ``pid_type=flat`` paired with ``static_persistent``.
@@ -720,6 +734,9 @@ _STRATEGY_SUPPORTED_PERSISTENCE: dict[
             Tcgen05PersistenceModel.CLC_PERSISTENT,
         }
     ),
+    Tcgen05Strategy.PURE_MATMUL_ROLE_LIFECYCLE: frozenset(
+        {Tcgen05PersistenceModel.NON_PERSISTENT}
+    ),
 }
 
 # Minimum CUDA compute capability (major version) for each persistence
@@ -737,19 +754,20 @@ _PERSISTENCE_MIN_ARCH_MAJOR: dict[Tcgen05PersistenceModel, int] = {
 _STRATEGY_REQUIRED_SCHEDULER_WARPS: dict[Tcgen05Strategy, int] = {
     Tcgen05Strategy.ROLE_LOCAL_MONOLITHIC: 0,
     Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER: 1,
+    Tcgen05Strategy.PURE_MATMUL_ROLE_LIFECYCLE: 0,
 }
 
 # Strategy-conditional ``c_input_warps`` accept set. Per ``cute_plan.md``
 # §7.5.3.2, only ``ROLE_LOCAL_WITH_SCHEDULER`` can host a productive
 # C-input warp (the inert padding warp under the WITH_SCHEDULER 8-warp
-# shape becomes the C-input TMA producer). ``ROLE_LOCAL_MONOLITHIC``
-# has no such warp slot — its 6-warp shape is fully populated by the
-# TMA-load + MMA-exec + 4 epi warps. Values outside the per-strategy
-# accept set are rejected so user configs cannot reach an unsupported
-# combination silently.
+# shape becomes the C-input TMA producer). Non-scheduler strategies keep
+# this at zero because their current 6-warp shapes are fully populated by
+# TMA-load + MMA-exec + 4 epi warps. Values outside the per-strategy accept
+# set are rejected so user configs cannot reach an unsupported combination
+# silently.
 #
-# Cycle 33: validator accepted ``{0}`` for both strategies (data-model
-# slot only). Cycle 34 (G3.1 first slice, ``cute_plan.md`` §7.5.3.2):
+# Cycle 33: validator accepted ``{0}`` for all then-existing strategies
+# (data-model slot only). Cycle 34 (G3.1 first slice, ``cute_plan.md`` §7.5.3.2):
 # widens ``ROLE_LOCAL_WITH_SCHEDULER`` to ``{0, 1}`` so explicit
 # ``helion.Config(tcgen05_warp_spec_c_input_warps=1)`` round-trips
 # end-to-end and the launched-warp accounting recognizes the slot.
@@ -766,15 +784,17 @@ _STRATEGY_REQUIRED_SCHEDULER_WARPS: dict[Tcgen05Strategy, int] = {
 _STRATEGY_SUPPORTED_C_INPUT_WARPS: dict[Tcgen05Strategy, frozenset[int]] = {
     Tcgen05Strategy.ROLE_LOCAL_MONOLITHIC: frozenset({0}),
     Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER: frozenset({0, 1}),
+    Tcgen05Strategy.PURE_MATMUL_ROLE_LIFECYCLE: frozenset({0}),
 }
 
 # When the strategy demands warpgroup-aligned splits (every 4 warps
 # == one warpgroup, ``setmaxregister`` is warpgroup-uniform), the
-# total warp count must be a multiple of 4. ``ROLE_LOCAL_MONOLITHIC``
-# (1+1+4 = 6 role warps) and ``ROLE_LOCAL_WITH_SCHEDULER`` (1+1+4+1 =
-# 7 role warps) both rely on the launched-warp padding in
+# total warp count must be a multiple of 4. ``ROLE_LOCAL_MONOLITHIC`` and
+# ``PURE_MATMUL_ROLE_LIFECYCLE`` (1+1+4 = 6 role warps) and
+# ``ROLE_LOCAL_WITH_SCHEDULER`` (1+1+4+1 = 7 role warps) rely on
+# launched-warp padding in
 # ``CuteTcgen05MatmulPlan.launched_warp_count`` to round to a
-# multiple of 4 at the launch boundary, so neither strategy needs
+# multiple of 4 at the launch boundary, so no current strategy needs
 # this validator-level check today. The set is intentionally empty
 # but the branch below stays live: a future strategy whose role
 # count *itself* must be a multiple of 4 (e.g. when ``register_split``
@@ -798,6 +818,7 @@ _STRATEGY_REQUIRES_WARPGROUP_ALIGNED_TOTAL: frozenset[Tcgen05Strategy] = frozens
 _STRATEGY_SUPPORTED_CLUSTER_M: dict[Tcgen05Strategy, frozenset[int]] = {
     Tcgen05Strategy.ROLE_LOCAL_MONOLITHIC: frozenset({1, 2}),
     Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER: frozenset({1, 2}),
+    Tcgen05Strategy.PURE_MATMUL_ROLE_LIFECYCLE: frozenset({1}),
 }
 
 # Strategy-conditional cluster_n capability. cluster_n=2 is now validated
@@ -815,6 +836,7 @@ _STRATEGY_SUPPORTED_CLUSTER_M: dict[Tcgen05Strategy, frozenset[int]] = {
 _STRATEGY_SUPPORTED_CLUSTER_N: dict[Tcgen05Strategy, frozenset[int]] = {
     Tcgen05Strategy.ROLE_LOCAL_MONOLITHIC: frozenset({1, 2}),
     Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER: frozenset({1, 2}),
+    Tcgen05Strategy.PURE_MATMUL_ROLE_LIFECYCLE: frozenset({1}),
 }
 
 # (strategy, persistence_model)-conditional cluster_n accept set. Used to
@@ -952,11 +974,11 @@ def validate_tcgen05_strategy_invariants(
             f"{warp_spec.scheduler_warps}"
         )
 
-    # ``c_input_warps`` accept set is per-strategy; today narrows
-    # both strategies to ``{0}`` until the dedicated TMA producer +
-    # SMEM ring + role-local while loop lands. The data-model slot
-    # is plumbed through normalize / round-trip paths so the
-    # accept set can widen without further config-shape churn.
+    # ``c_input_warps`` accept set is per-strategy; only the
+    # scheduler-backed path currently admits the optional C-input
+    # TMA producer. The data-model slot is plumbed through normalize
+    # / round-trip paths so the accept set can widen without further
+    # config-shape churn.
     supported_c_input = _STRATEGY_SUPPORTED_C_INPUT_WARPS.get(strategy, frozenset())
     if supported_c_input and warp_spec.c_input_warps not in supported_c_input:
         errors.append(

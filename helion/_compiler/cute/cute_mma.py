@@ -48,6 +48,7 @@ from .matmul_utils import analyze_direct_grouped_n_loads
 from .mma_support import get_cute_mma_support
 from .strategies import TCGEN05_LEGAL_SMEM_SWIZZLE_BYTES
 from .strategies import Tcgen05PersistenceModel
+from .strategies import is_pure_matmul_role_lifecycle_config
 from .strategies import l2_swizzle_size_from_config
 from .strategies import layout_overrides_from_config
 from .strategies import smem_swizzle_min_major_mode_bytes
@@ -86,6 +87,7 @@ from .tcgen05_constants import TCGEN05_SCHED_STAGE_COUNT_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
 from .tcgen05_constants import TCGEN05_TWO_CTA_EDGE_TMA_STORE_MAX_AB_STAGES
 from .tcgen05_lifecycle import Tcgen05LifecycleContext
+from .tcgen05_pure_matmul import Tcgen05PureMatmulObjectModel
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -1523,6 +1525,17 @@ def _clone_k_loop_with_body(
     )
 
 
+def _wrap_stmt_in_if(stmt: ast.stmt, predicate_src: str) -> ast.If:
+    return ast.copy_location(
+        ast.If(
+            test=cast("ast.expr", expr_from_string(predicate_src)),
+            body=[stmt],
+            orelse=[],
+        ),
+        stmt,
+    )
+
+
 def _trace_mma_to_store_dtype(
     mma_node: Node,
     graphs: list[GraphInfo],
@@ -1697,6 +1710,9 @@ def _emit_mma_pipeline(
     tcgen05_use_tma_b = tcgen05_use_tma
     tcgen05_use_tma = tcgen05_use_tma_a or tcgen05_use_tma_b
     tcgen05_use_tma_pipeline = tcgen05_use_tma_a and tcgen05_use_tma_b
+    tcgen05_requested_pure_matmul_role_lifecycle = is_pure_matmul_role_lifecycle_config(
+        df.config
+    )
 
     k_total_size = int(lhs_fake.shape[1])
 
@@ -2052,8 +2068,39 @@ def _emit_mma_pipeline(
         and tcgen05_role_local_codegen_allowed
         and tcgen05_pid_is_persistent
     )
+    tcgen05_use_pure_matmul_role_lifecycle = (
+        tcgen05_requested_pure_matmul_role_lifecycle
+        and mma_impl == "tcgen05"
+        and tcgen05_use_tma_pipeline
+        and tcgen05_static_full_tiles
+        and not tcgen05_pid_is_persistent
+        and tcgen05_cluster_m == 1
+        and tcgen05_cluster_n == 1
+        and acc_expr is None
+    )
+    if (
+        tcgen05_requested_pure_matmul_role_lifecycle
+        and not tcgen05_use_pure_matmul_role_lifecycle
+    ):
+        raise exc.BackendUnsupported(
+            "cute",
+            "tcgen05_strategy='pure_matmul_role_lifecycle' requires static-full "
+            "non-persistent tcgen05 TMA pure matmul with cluster_m=1, "
+            "cluster_n=1, and an identity/zero accumulator epilogue",
+        )
+    tcgen05_use_separate_tma_producer = (
+        tcgen05_use_role_local_tma_producer or tcgen05_use_pure_matmul_role_lifecycle
+    )
     # Keep a distinct name so future MMA-exec gating changes are localized.
     tcgen05_use_role_local_mma_exec = tcgen05_use_role_local_tma_producer
+    tcgen05_use_separate_mma_exec = (
+        tcgen05_use_role_local_mma_exec or tcgen05_use_pure_matmul_role_lifecycle
+    )
+    tcgen05_pipeline_state_ns = (
+        "_helion_tcgen05_pipeline"
+        if tcgen05_use_pure_matmul_role_lifecycle
+        else "cutlass.pipeline"
+    )
     tcgen05_static_full_tma_fast_path = (
         tcgen05_static_full_tiles
         and tcgen05_use_tma_pipeline
@@ -2182,7 +2229,9 @@ def _emit_mma_pipeline(
         and tcgen05_use_tma_pipeline
     )
     # Keep a distinct name so future epi-role gating changes are localized.
-    tcgen05_use_role_local_epi = tcgen05_use_role_local_tma_producer
+    tcgen05_use_role_local_epi = (
+        tcgen05_use_role_local_tma_producer or tcgen05_use_pure_matmul_role_lifecycle
+    )
     # This is the kernel-wide contract ProgramID consumes. Today the TMA
     # producer flag is the master predicate for all three role-local loops.
     tcgen05_use_role_local_persistent_body = tcgen05_use_role_local_tma_producer
@@ -3077,13 +3126,13 @@ def _emit_mma_pipeline(
         )
         prefix.append(
             statement_from_string(
-                f"{tcgen05_plan.acc_producer_state} = cutlass.pipeline.make_pipeline_state("
+                f"{tcgen05_plan.acc_producer_state} = {tcgen05_pipeline_state_ns}.make_pipeline_state("
                 f"cutlass.pipeline.PipelineUserType.Producer, {tcgen05_acc_stage_count_value})"
             )
         )
         prefix.append(
             statement_from_string(
-                f"{tcgen05_plan.acc_consumer_state} = cutlass.pipeline.make_pipeline_state("
+                f"{tcgen05_plan.acc_consumer_state} = {tcgen05_pipeline_state_ns}.make_pipeline_state("
                 f"cutlass.pipeline.PipelineUserType.Consumer, {tcgen05_acc_stage_count_value})"
             )
         )
@@ -3524,7 +3573,7 @@ def _emit_mma_pipeline(
     tma_consumer_state = df.new_var("tcgen05_ab_consumer_state")
     tma_store_role_tile_counter = (
         df.new_var("tcgen05_tma_store_role_tile")
-        if tcgen05_use_tma_store_epilogue and tcgen05_use_role_local_epi
+        if tcgen05_use_tma_store_epilogue and tcgen05_use_role_local_tma_producer
         else ""
     )
     tcgen05_frag_a = df.new_var("tcgen05_tCrA")
@@ -3809,16 +3858,19 @@ def _emit_mma_pipeline(
             )
             prefix.append(
                 statement_from_string(
-                    f"{tma_producer_state} = cutlass.pipeline.make_pipeline_state("
+                    f"{tma_producer_state} = {tcgen05_pipeline_state_ns}.make_pipeline_state("
                     f"cutlass.pipeline.PipelineUserType.Producer, {tcgen05_ab_stage_count_value})"
                 )
             )
             tma_consumer_state_init = (
+                # Diagnostic phase override intentionally uses the upstream
+                # raw state constructor; it does not participate in the Helion
+                # wrapper ownership experiment.
                 f"cutlass.pipeline.PipelineState({tcgen05_ab_stage_count_value}, "
                 "cutlass.Int32(0), cutlass.Int32(0), cutlass.Int32(1))"
                 if diagnose_ab_consumer_phase1
                 else (
-                    "cutlass.pipeline.make_pipeline_state("
+                    f"{tcgen05_pipeline_state_ns}.make_pipeline_state("
                     "cutlass.pipeline.PipelineUserType.Consumer, "
                     f"{tcgen05_ab_stage_count_value})"
                 )
@@ -4074,7 +4126,7 @@ def _emit_mma_pipeline(
             # For the non-TMA tcgen05 path there is no pipeline state to track
             # and ``ab_stage_count`` is always 1, so the modular form is a
             # constant zero anyway.
-            if tcgen05_use_tma and tcgen05_use_role_local_mma_exec:
+            if tcgen05_use_tma and tcgen05_use_separate_mma_exec:
                 mma_stage_stmt = statement_from_string(
                     f"{mma_stage} = {tma_consumer_state}.index"
                 )
@@ -4090,7 +4142,7 @@ def _emit_mma_pipeline(
             smem_b_mma_stmt = statement_from_string(
                 f"{smem_b_mma} = {smem_b}[(None, 0, 0, {mma_stage})]"
             )
-            if not tcgen05_use_role_local_mma_exec:
+            if not tcgen05_use_separate_mma_exec:
                 cg.add_statement(mma_stage_stmt)
                 cg.add_statement(smem_a_mma_stmt)
                 cg.add_statement(smem_b_mma_stmt)
@@ -4105,7 +4157,7 @@ def _emit_mma_pipeline(
                 tma_full_tile_stmt = statement_from_string(
                     f"{tma_full_tile} = " + tma_full_tile_predicate_src
                 )
-                if not tcgen05_use_role_local_mma_exec:
+                if not tcgen05_use_separate_mma_exec:
                     cg.add_statement(tma_k_tile_stmt)
                     if not tcgen05_static_full_tma_fast_path:
                         cg.add_statement(tma_full_tile_stmt)
@@ -4182,51 +4234,60 @@ def _emit_mma_pipeline(
                 static_full_tiles=tcgen05_static_full_tma_fast_path,
             )
             if tcgen05_use_tma_pipeline:
-                if tcgen05_use_role_local_tma_producer:
-                    # The static-full fast path is non-role-local only; the
-                    # role-local loops keep the full-tile predicate and scalar
-                    # fallback structure.
-                    assert not tcgen05_static_full_tma_fast_path
-                    assert tma_full_tile_predicate_src is not None
-                    producer_loop_body: list[ast.stmt] = [
+                if tcgen05_use_separate_tma_producer:
+                    producer_loop_body = [
                         statement_from_string(
                             f"{tma_k_tile} = {k_offset_var} // cutlass.Int32({bk})"
-                        ),
-                        statement_from_string(
-                            f"{tma_full_tile} = " + tma_full_tile_predicate_src
-                        ),
-                        statement_from_string(
-                            f"{tma_next_full_tile} = "
-                            + _tcgen05_tma_tile_predicate(
-                                k_tile_start_expr=f"{k_offset_var} + cutlass.Int32({bk * tcgen05_ab_stage_count_value})",
-                                full_tile_end_expr=f"{k_offset_var} + cutlass.Int32({bk * (tcgen05_ab_stage_count_value + 1)})",
-                            )
-                        ),
-                        statement_from_string(
-                            f"{tma_producer_try_token} = cutlass.Boolean(0)"
-                        ),
-                        _build_kloop_pipeline_producer_if(
-                            tma_kloop_args, gate_tma_warp=False
-                        ),
+                        )
                     ]
+                    if not tcgen05_static_full_tma_fast_path:
+                        assert tma_full_tile_predicate_src is not None
+                        producer_loop_body.append(
+                            statement_from_string(
+                                f"{tma_full_tile} = " + tma_full_tile_predicate_src
+                            )
+                        )
+                    producer_loop_body.extend(
+                        [
+                            statement_from_string(
+                                f"{tma_next_full_tile} = "
+                                + _tcgen05_tma_tile_predicate(
+                                    k_tile_start_expr=f"{k_offset_var} + cutlass.Int32({bk * tcgen05_ab_stage_count_value})",
+                                    full_tile_end_expr=f"{k_offset_var} + cutlass.Int32({bk * (tcgen05_ab_stage_count_value + 1)})",
+                                )
+                            ),
+                            statement_from_string(
+                                f"{tma_producer_try_token} = cutlass.Boolean(0)"
+                            ),
+                            _build_kloop_pipeline_producer_if(
+                                tma_kloop_args, gate_tma_warp=False
+                            ),
+                        ]
+                    )
                     producer_loop = _clone_k_loop_with_body(
                         device_loop, producer_loop_body
                     )
-                    prefix.append(producer_loop)
-                    per_tile_stmts.append(producer_loop)
-                    tma_load_role_stmts.append(producer_loop)
-                if tcgen05_use_role_local_mma_exec:
+                    producer_stmt: ast.stmt = producer_loop
+                    if tcgen05_use_pure_matmul_role_lifecycle:
+                        # Pure lifecycle emits role bodies directly instead of
+                        # relying on the generic role-local partitioner.
+                        producer_stmt = _wrap_stmt_in_if(producer_loop, tma_warp)
+                    prefix.append(producer_stmt)
+                    per_tile_stmts.append(producer_stmt)
+                    if tcgen05_use_role_local_tma_producer:
+                        tma_load_role_stmts.append(producer_loop)
+                if tcgen05_use_separate_mma_exec:
                     assert mma_stage_stmt is not None
                     assert smem_a_mma_stmt is not None
                     assert smem_b_mma_stmt is not None
-                    assert tma_full_tile_stmt is not None
-                    assert not tcgen05_static_full_tma_fast_path
                     exec_loop_body: list[ast.stmt] = [
                         mma_stage_stmt,
                         smem_a_mma_stmt,
                         smem_b_mma_stmt,
-                        tma_full_tile_stmt,
                     ]
+                    if not tcgen05_static_full_tma_fast_path:
+                        assert tma_full_tile_stmt is not None
+                        exec_loop_body.append(tma_full_tile_stmt)
                     if tcgen05_use_role_local_ab_consumer_prefetch:
                         exec_loop_body.append(
                             statement_from_string(
@@ -4246,7 +4307,11 @@ def _emit_mma_pipeline(
                     exec_loop_body.append(
                         _build_kloop_pipeline_consumer_if(
                             tma_kloop_args,
-                            gate_exec_warp=False,
+                            # Static-full pipeline builders require their
+                            # internal exec gate to keep emitting a single
+                            # statement. The outer wrapper below makes the
+                            # cloned loop's role ownership explicit.
+                            gate_exec_warp=tcgen05_static_full_tma_fast_path,
                             include_scalar_fallback=False,
                             use_existing_try_token=tcgen05_use_role_local_ab_consumer_prefetch,
                         )
@@ -4266,7 +4331,10 @@ def _emit_mma_pipeline(
                                 tcgen05_frag_a=tcgen05_frag_a,
                                 tcgen05_frag_b=tcgen05_frag_b,
                                 mma_stage=mma_stage,
-                                gate_exec_warp=False,
+                                # See the consumer wait comment above: pure
+                                # lifecycle has an outer exec-active role
+                                # wrapper plus the static-full builder gate.
+                                gate_exec_warp=tcgen05_static_full_tma_fast_path,
                                 is_two_cta=tcgen05_is_two_cta,
                                 cluster_n=tcgen05_cluster_n,
                             )
@@ -4274,7 +4342,8 @@ def _emit_mma_pipeline(
                     exec_loop_body.append(
                         _build_kloop_pipeline_release_if(
                             tma_kloop_args,
-                            gate_exec_warp=False,
+                            # See the consumer wait comment above.
+                            gate_exec_warp=tcgen05_static_full_tma_fast_path,
                             include_scalar_fallback=False,
                         )
                     )
@@ -4286,9 +4355,15 @@ def _emit_mma_pipeline(
                             )
                         )
                     exec_loop = _clone_k_loop_with_body(device_loop, exec_loop_body)
-                    prefix.append(exec_loop)
-                    per_tile_stmts.append(exec_loop)
-                    mma_exec_role_stmts.append(exec_loop)
+                    exec_stmt: ast.stmt = exec_loop
+                    if tcgen05_use_pure_matmul_role_lifecycle:
+                        exec_stmt = _wrap_stmt_in_if(
+                            exec_loop, tcgen05_plan.exec_active
+                        )
+                    prefix.append(exec_stmt)
+                    per_tile_stmts.append(exec_stmt)
+                    if tcgen05_use_role_local_mma_exec:
+                        mma_exec_role_stmts.append(exec_loop)
                 else:
                     cg.add_statement(
                         statement_from_string(
@@ -4308,7 +4383,7 @@ def _emit_mma_pipeline(
                             f"{tma_consumer_try_token} = cutlass.Boolean(0)"
                         )
                     )
-                    if not tcgen05_use_role_local_tma_producer:
+                    if not tcgen05_use_separate_tma_producer:
                         # Legacy inline path: keep producer and consumer
                         # adjacent inside the shared K-loop. Persistent
                         # role-local mode emits the producer as a top-level
@@ -4395,7 +4470,7 @@ def _emit_mma_pipeline(
             )
         else:
             assert tcgen05_plan is not None
-            if not tcgen05_use_role_local_mma_exec:
+            if not tcgen05_use_separate_mma_exec:
                 if not diagnose_skip_umma_issue:
                     # No async-shared fence: the pipelined AB consumer_wait
                     # is a transaction-count ``mbarrier_try_wait`` and the
@@ -4553,10 +4628,19 @@ def _emit_mma_pipeline(
             acc_stage_count=tcgen05_acc_stage_count_value,
             skip_ab_producer_advance=diagnose_skip_ab_producer_advance,
         )
+        tcgen05_pure_matmul_object = (
+            Tcgen05PureMatmulObjectModel(
+                lifecycle_context=tcgen05_lifecycle_context,
+                cleanup_loop=device_loop,
+            )
+            if tcgen05_use_pure_matmul_role_lifecycle
+            else None
+        )
         df.cute_state.register_tcgen05_store_value(
             result_var,
             CuteTcgen05StoreValue(
                 lifecycle_context=tcgen05_lifecycle_context,
+                pure_matmul_object=tcgen05_pure_matmul_object,
                 bm=bm,
                 bn=bn,
                 bk=bk,
@@ -4584,6 +4668,8 @@ def _emit_mma_pipeline(
                 epi_elem_dtype_str=epi_elem_dtype_str,
             ),
         )
+        if tcgen05_pure_matmul_object is not None:
+            tcgen05_pure_matmul_object.register_pending_store(df.cute_state)
         if fx_node is not None:
             # Map the matmul fx_node -> result_var so the G3.1.1 fused
             # epilogue splice path can reuse the existing
@@ -5858,6 +5944,12 @@ def codegen_cute_mma_dot(state: CodegenState) -> object | None:
         fx_node=state.fx_node,
     )
     if result is None:
+        if is_pure_matmul_role_lifecycle_config(state.device_function.config):
+            raise exc.BackendUnsupported(
+                "cute",
+                "tcgen05_strategy='pure_matmul_role_lifecycle' requires hl.dot "
+                "to lower through the tcgen05 K-loop path",
+            )
         return None
 
     acc_proxy = state.proxy_args[2] if len(state.proxy_args) > 2 else None
