@@ -22,96 +22,13 @@ from .._compat import supports_amd_cdna_tunables
 from .._compat import supports_maxnreg
 from .._compat import supports_tensor_descriptor
 from .._compat import warps_to_threads
-from .._compiler.cute.strategies import ROLE_LOCAL_MONOLITHIC_DEFAULT_WARP_SPEC
-from .._compiler.cute.strategies import TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY
-from .._compiler.cute.strategies import TCGEN05_LAYOUT_OVERRIDES_KEYS
-from .._compiler.cute.strategies import TCGEN05_LAYOUT_OVERRIDES_SWIZZLE_A_KEY
-from .._compiler.cute.strategies import TCGEN05_LAYOUT_OVERRIDES_SWIZZLE_B_KEY
-from .._compiler.cute.strategies import TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY
-from .._compiler.cute.strategies import TCGEN05_LEGAL_L2_SWIZZLE_SIZES
-from .._compiler.cute.strategies import TCGEN05_LEGAL_SMEM_SWIZZLE_BYTES
-from .._compiler.cute.strategies import TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY
-from .._compiler.cute.strategies import TCGEN05_STRATEGY_CONFIG_KEY
-from .._compiler.cute.strategies import TCGEN05_STRATEGY_CONFIG_KEYS
-from .._compiler.cute.strategies import TCGEN05_WARP_SPEC_AB_LOAD_WARPS_KEY
-from .._compiler.cute.strategies import TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY
-from .._compiler.cute.strategies import TCGEN05_WARP_SPEC_DEFAULTS_BY_KEY
-from .._compiler.cute.strategies import TCGEN05_WARP_SPEC_EPI_LOAD_WARPS_KEY
-from .._compiler.cute.strategies import TCGEN05_WARP_SPEC_MMA_WARPS_KEY
-from .._compiler.cute.strategies import TCGEN05_WARP_SPEC_REGISTER_DECREASE_KEY
-from .._compiler.cute.strategies import TCGEN05_WARP_SPEC_REGISTER_INCREASE_KEY
-from .._compiler.cute.strategies import TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY
-from .._compiler.cute.strategies import Tcgen05LayoutStrategy
-from .._compiler.cute.strategies import Tcgen05PersistenceModel
-from .._compiler.cute.strategies import Tcgen05Strategy
-from .._compiler.cute.strategies import derive_persistence_model_from_pid_type
-from .._compiler.cute.strategies import layout_overrides_from_config
-from .._compiler.cute.strategies import validate_tcgen05_strategy_invariants
-from .._compiler.cute.strategies import warp_spec_from_config
-from .._compiler.cute.tcgen05_constants import TCGEN05_AB_CONSUMER_PHASE_MODE_CONFIG_KEY
-from .._compiler.cute.tcgen05_constants import TCGEN05_AB_CONSUMER_PHASE_MODE_NORMAL
-from .._compiler.cute.tcgen05_constants import TCGEN05_AB_CONSUMER_PHASE_MODES
-from .._compiler.cute.tcgen05_constants import TCGEN05_AB_CONSUMER_WAIT_MODE_CONFIG_KEY
-from .._compiler.cute.tcgen05_constants import TCGEN05_AB_CONSUMER_WAIT_MODE_NORMAL
-from .._compiler.cute.tcgen05_constants import TCGEN05_AB_CONSUMER_WAIT_MODES
-from .._compiler.cute.tcgen05_constants import (
-    TCGEN05_AB_INITIAL_PRODUCER_ACQUIRE_MODE_CONFIG_KEY,
-)
-from .._compiler.cute.tcgen05_constants import (
-    TCGEN05_AB_INITIAL_PRODUCER_ACQUIRE_MODE_NORMAL,
-)
-from .._compiler.cute.tcgen05_constants import TCGEN05_AB_INITIAL_PRODUCER_ACQUIRE_MODES
-from .._compiler.cute.tcgen05_constants import (
-    TCGEN05_AB_PRODUCER_ACQUIRE_MODE_CONFIG_KEY,
-)
-from .._compiler.cute.tcgen05_constants import TCGEN05_AB_PRODUCER_ACQUIRE_MODE_NORMAL
-from .._compiler.cute.tcgen05_constants import TCGEN05_AB_PRODUCER_ACQUIRE_MODES
-from .._compiler.cute.tcgen05_constants import (
-    TCGEN05_AB_PRODUCER_ADVANCE_MODE_CONFIG_KEY,
-)
-from .._compiler.cute.tcgen05_constants import TCGEN05_AB_PRODUCER_ADVANCE_MODE_NORMAL
-from .._compiler.cute.tcgen05_constants import TCGEN05_AB_PRODUCER_ADVANCE_MODES
-from .._compiler.cute.tcgen05_constants import (
-    TCGEN05_AB_STAGES_THREE_MIN_DEVICE_SMEM_OPTIN,
-)
-from .._compiler.cute.tcgen05_constants import (
-    TCGEN05_AB_STAGES_THREE_RESERVED_SMEM_BYTES,
-)
-from .._compiler.cute.tcgen05_constants import (
-    TCGEN05_ACC_PRODUCER_ADVANCE_MODE_CONFIG_KEY,
-)
-from .._compiler.cute.tcgen05_constants import TCGEN05_ACC_PRODUCER_ADVANCE_MODE_NORMAL
-from .._compiler.cute.tcgen05_constants import TCGEN05_ACC_PRODUCER_ADVANCE_MODES
-from .._compiler.cute.tcgen05_constants import TCGEN05_ACC_PRODUCER_MODE_CONFIG_KEY
-from .._compiler.cute.tcgen05_constants import TCGEN05_ACC_PRODUCER_MODE_NORMAL
-from .._compiler.cute.tcgen05_constants import TCGEN05_ACC_PRODUCER_MODES
-from .._compiler.cute.tcgen05_constants import TCGEN05_ACC_WAIT_PLACEMENT_CONFIG_KEY
-from .._compiler.cute.tcgen05_constants import TCGEN05_ACC_WAIT_PLACEMENTS
-from .._compiler.cute.tcgen05_constants import TCGEN05_C_ACQUIRE_PLACEMENT_CONFIG_KEY
-from .._compiler.cute.tcgen05_constants import TCGEN05_C_ACQUIRE_PLACEMENTS
-from .._compiler.cute.tcgen05_constants import TCGEN05_C_STORE_MODE_CONFIG_KEY
-from .._compiler.cute.tcgen05_constants import TCGEN05_C_STORE_MODE_NORMAL
-from .._compiler.cute.tcgen05_constants import TCGEN05_C_STORE_MODES
-from .._compiler.cute.tcgen05_constants import (
-    TCGEN05_CLUSTER_M2_ONE_CTA_ROLE_LOCAL_CONFIG_KEY,
-)
-from .._compiler.cute.tcgen05_constants import TCGEN05_CUBIN_LINEINFO_CONFIG_KEY
-from .._compiler.cute.tcgen05_constants import (
-    TCGEN05_DIAGNOSTIC_INVALID_OUTPUT_CONFIG_KEY,
-)
-from .._compiler.cute.tcgen05_constants import TCGEN05_EPILOGUE_LAYOUT_CONFIG_KEY
-from .._compiler.cute.tcgen05_constants import TCGEN05_EPILOGUE_LAYOUTS
-from .._compiler.cute.tcgen05_constants import TCGEN05_LARGE_BN_PROOF_BLOCK_SIZES
-from .._compiler.cute.tcgen05_constants import TCGEN05_LARGE_BN_PROOF_CLUSTER_M
-from .._compiler.cute.tcgen05_constants import TCGEN05_LARGE_BN_PROOF_CONFIG_KEY
-from .._compiler.cute.tcgen05_constants import TCGEN05_LARGE_BN_PROOF_PID_TYPE
-from .._compiler.cute.tcgen05_constants import TCGEN05_LARGE_BN_PROOF_STAGE_CONFIGS
-from .._compiler.cute.tcgen05_constants import TCGEN05_ONE_CTA_MAX_BLOCK_M
-from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
-from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
+from .._compiler.cute.tcgen05_config import CUTE_TCGEN05_DIAGNOSTIC_CONFIG_KEYS
+from .._compiler.cute.tcgen05_config import CUTE_TCGEN05_STRATEGY_CONFIG_KEYS
+from .._compiler.cute.tcgen05_config import CUTE_TCGEN05_TUNABLE_KEYS
+from .._compiler.cute.tcgen05_config import CuteTcgen05Config
+from .._compiler.cute.tcgen05_config import Tcgen05AbStagesThreeSearchConstraints
+from .._compiler.cute.tcgen05_config import Tcgen05ClusterM2SearchConstraints
 from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_MAX_K_TILES
-from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_SEED_PID_TYPE
-from .._compiler.cute.tcgen05_constants import tcgen05_ab_smem_bytes_per_cta
 from ..exc import InvalidConfig
 from .block_id_sequence import BlockIdSequence
 from .block_id_sequence import _BlockIdItem
@@ -150,13 +67,6 @@ class TensorNumelConstraint(NamedTuple):
     expr_str: str
 
 
-class Tcgen05ClusterM2SearchConstraints(NamedTuple):
-    """Search-only envelope where ``tcgen05_cluster_m=2`` is validated."""
-
-    static_k: int
-    max_k_tiles: int
-
-
 class MatmulFact(NamedTuple):
     """Shape facts recorded when matmul requirements are applied."""
 
@@ -170,30 +80,6 @@ class MatmulFact(NamedTuple):
     static_k: int | None
     lhs_dtype: torch.dtype
     rhs_dtype: torch.dtype
-
-
-class Tcgen05AbStagesThreeSearchConstraints(NamedTuple):
-    """Search-only envelope where ``tcgen05_ab_stages=3`` is admitted.
-
-    Built by the matmul path when binding a static-shape BF16/FP16 tcgen05
-    candidate. ``per_cta_smem_budget_bytes`` is the per-CTA SMEM budget the
-    SMEM gate may consume for the AB pipeline staging — the matmul lowering
-    also pays for accumulator stages, pipeline mailboxes, and TMEM
-    bookkeeping (~24 KiB measured for the canonical 256x256x128 cluster_m=2
-    ab=3 path; reserved at the call site as
-    ``TCGEN05_AB_STAGES_THREE_RESERVED_SMEM_BYTES = 28 KiB`` so the gate
-    keeps a small margin against ptxas's hard limit).
-
-    The autotune search-time fixup (``_fix_tcgen05_ab_stages_three_search_config``)
-    consults these constraints to demote ``ab=3`` candidates whose tile
-    shape, dtype, or cluster shape exceeds the budget. The validation
-    surface remains independent so ``helion.Config(tcgen05_ab_stages=3)``
-    still round-trips for explicit user configs (the cute_dsl path has its
-    own loud ptxas failure for over-budget user configs).
-    """
-
-    dtype_bytes: int
-    per_cta_smem_budget_bytes: int
 
 
 def shrink_block_sizes_for_numel_constraints(
@@ -244,34 +130,10 @@ _BASE_BACKEND_TUNABLE_KEYS: frozenset[str] = frozenset(
         "occupancy",
         "pallas_loop_type",
         "pallas_pre_broadcast",
-        "tcgen05_cluster_m",
-        "tcgen05_cluster_n",
-        "tcgen05_ab_stages",
-        "tcgen05_acc_stages",
-        "tcgen05_c_stages",
-        TCGEN05_ACC_WAIT_PLACEMENT_CONFIG_KEY,
-        TCGEN05_C_ACQUIRE_PLACEMENT_CONFIG_KEY,
-        TCGEN05_C_STORE_MODE_CONFIG_KEY,
-        "tcgen05_num_epi_warps",
-        TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY,
+        *CUTE_TCGEN05_TUNABLE_KEYS,
     }
 )
-_BACKEND_DIAGNOSTIC_CONFIG_KEYS: frozenset[str] = frozenset(
-    {
-        TCGEN05_AB_CONSUMER_PHASE_MODE_CONFIG_KEY,
-        TCGEN05_AB_CONSUMER_WAIT_MODE_CONFIG_KEY,
-        TCGEN05_AB_INITIAL_PRODUCER_ACQUIRE_MODE_CONFIG_KEY,
-        TCGEN05_AB_PRODUCER_ACQUIRE_MODE_CONFIG_KEY,
-        TCGEN05_AB_PRODUCER_ADVANCE_MODE_CONFIG_KEY,
-        TCGEN05_ACC_PRODUCER_ADVANCE_MODE_CONFIG_KEY,
-        TCGEN05_ACC_PRODUCER_MODE_CONFIG_KEY,
-        TCGEN05_CLUSTER_M2_ONE_CTA_ROLE_LOCAL_CONFIG_KEY,
-        TCGEN05_CUBIN_LINEINFO_CONFIG_KEY,
-        TCGEN05_DIAGNOSTIC_INVALID_OUTPUT_CONFIG_KEY,
-        TCGEN05_EPILOGUE_LAYOUT_CONFIG_KEY,
-        TCGEN05_LARGE_BN_PROOF_CONFIG_KEY,
-    }
-)
+_BACKEND_DIAGNOSTIC_CONFIG_KEYS = CUTE_TCGEN05_DIAGNOSTIC_CONFIG_KEYS
 
 
 def _get_backend_tunable_keys() -> frozenset[str]:
@@ -285,11 +147,7 @@ def _get_backend_tunable_keys() -> frozenset[str]:
 
 
 BACKEND_TUNABLE_KEYS: frozenset[str] = _get_backend_tunable_keys()
-# Strategy/warp-spec/layout-overrides keys: G2-A's data-model knobs.
-# These are CuTe-specific and live alongside the existing tcgen05 keys.
-# Validation runs in ``ConfigSpec.normalize`` (cross-fragment) and is gated
-# by ``cute_tcgen05_search_enabled`` like the other tcgen05 fields.
-_BACKEND_STRATEGY_CONFIG_KEYS: frozenset[str] = frozenset(TCGEN05_STRATEGY_CONFIG_KEYS)
+_BACKEND_STRATEGY_CONFIG_KEYS = CUTE_TCGEN05_STRATEGY_CONFIG_KEYS
 # All config keys whose support depends on the backend.  The base Backend
 # class rejects these by default; each backend subclass opts in selectively.
 BACKEND_SPECIFIC_KEYS: frozenset[str] = (
@@ -351,18 +209,6 @@ EPILOGUE_SUBTILE_MIN_K_HINT_EXTENDED = 16384
 # Lower values allow higher occupancy but may hurt performance for register-heavy kernels
 VALID_MAXNREG = (None, 32, 64, 128, 256)
 DEFAULT_MAXNREG = None
-CUTE_TCGEN05_TUNABLE_KEYS: tuple[str, ...] = (
-    "tcgen05_cluster_m",
-    "tcgen05_cluster_n",
-    "tcgen05_ab_stages",
-    "tcgen05_acc_stages",
-    "tcgen05_c_stages",
-    TCGEN05_ACC_WAIT_PLACEMENT_CONFIG_KEY,
-    TCGEN05_C_ACQUIRE_PLACEMENT_CONFIG_KEY,
-    TCGEN05_C_STORE_MODE_CONFIG_KEY,
-    "tcgen05_num_epi_warps",
-    TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY,
-)
 _CUTE_IMPLICIT_DEFAULT_KEYS: frozenset[str] = frozenset(
     {
         "loop_orders",
@@ -459,64 +305,7 @@ class ConfigSpec:
         self.epilogue_subtile_k_hint: int = 0
         self.has_pallas_inner_loops: bool = False
         self.has_symbolic_or_data_dependent_bounds: bool = False
-        self.cute_tcgen05_search_enabled: bool = False
-        # Post-compile bind-time flag: True when the host function's
-        # FX graphs contain a tcgen05 matmul AND at least one
-        # ``memory_ops.load`` whose target is not one of the
-        # matmul's operands (the productive C-input warp's
-        # trigger condition). Set by ``BoundKernel`` after
-        # ``KernelCompiler.compile`` via
-        # ``host_function_has_tcgen05_aux_kernel_pattern`` before
-        # any autotune sampling. Used by
-        # ``_tcgen05_strategy_autotune_fragments`` to widen the
-        # ``tcgen05_strategy`` and
-        # ``tcgen05_warp_spec_c_input_warps`` search surfaces to
-        # ``(MONOLITHIC, WITH_SCHEDULER)`` and ``(0, 1)``
-        # respectively when the productive C-input warp can be
-        # productive — pure-matmul kernels (no aux) keep the
-        # narrow ``(0,)`` autotune surface so the inert C-input
-        # warp is not sampled as a strict resource cost. The
-        # default ``False`` matches non-tcgen05 paths and bind
-        # contexts that have not run post-compile detection (the
-        # explicit-config validation surface accepts
-        # ``c_input_warps=1`` regardless of this flag).
-        self.cute_tcgen05_aux_kernel_detected: bool = False
-        # Allowed values of tcgen05_cluster_m the autotuner is allowed to
-        # *search* over. None means "use the default set defined by
-        # _tcgen05_optional_fragments". This is consulted by _flat_fields()
-        # when constructing the search space and is independent of which
-        # values are *legal* in a user-supplied helion.Config (the latter
-        # always accepts the full set of legal values).
-        self._tcgen05_cluster_m_search_choices: tuple[int, ...] | None = None
-        self._tcgen05_cluster_m2_search_constraints: (
-            Tcgen05ClusterM2SearchConstraints | None
-        ) = None
-        # Search-only envelope for ``tcgen05_ab_stages=3``. ``None`` means the
-        # search surface keeps the conservative ``max=2`` cap (default before
-        # G3.0). The matmul path sets this via
-        # ``allow_tcgen05_ab_stages_three_search`` after proving the device
-        # SMEM optin cap can host at least the smallest ``ab=3`` candidate
-        # for the active dtype. Per-config legality (after a flat sample
-        # has materialized ``(bm, bn, bk, cluster_m)``) is then checked by
-        # ``_tcgen05_ab_stages_three_fits`` and any over-budget sample is
-        # demoted in ``_fix_tcgen05_ab_stages_three_search_config``.
-        self._tcgen05_ab_stages_three_search_constraints: (
-            Tcgen05AbStagesThreeSearchConstraints | None
-        ) = None
-        # Allowed values of tcgen05_num_epi_warps the autotuner is allowed
-        # to *search* over. ``None`` means "use the default IntegerFragment
-        # range defined by _tcgen05_optional_fragments". This is consulted by
-        # _flat_fields() when constructing the search space.
-        self._tcgen05_num_epi_warps_search_choices: tuple[int, ...] | None = None
-        # Allowed values of tcgen05_num_epi_warps a *user-supplied*
-        # ``helion.Config`` is permitted to specify. ``None`` means "use
-        # the default IntegerFragment range" (i.e. accept anything in
-        # [1, 4]). Unlike the cluster_m narrowing, the matmul path
-        # tightens validation here too because num_epi_warps != 4
-        # currently produces *silent wrong output* on B200 — there is
-        # no loud crash to alert a user who bypasses autotune via an
-        # explicit config, so normalize() must reject the unsafe values.
-        self._tcgen05_num_epi_warps_validation_choices: tuple[int, ...] | None = None
+        self._cute_tcgen05_config = CuteTcgen05Config(self)
         self.compiler_seed_configs: list[helion.Config] = []
         self.autotuner_heuristics: list[str] = []
         self.matmul_facts: list[MatmulFact] = []
@@ -628,17 +417,76 @@ class ConfigSpec:
         )
         assert self.allowed_pid_types
 
-    def restrict_tcgen05_cluster_m_search(self, choices: tuple[int, ...]) -> None:
-        """Narrow the autotune search over tcgen05_cluster_m to *choices*.
+    @property
+    def cute_tcgen05_search_enabled(self) -> bool:
+        return self._cute_tcgen05_config.search_enabled
 
-        Does not affect what values are legal in user-supplied configs;
-        normalize() validates against the full set of legal values returned by
-        _tcgen05_optional_fragments(for_search=False).
-        """
-        assert choices, "tcgen05_cluster_m search must allow at least one value"
-        self._tcgen05_cluster_m_search_choices = choices
-        if 2 not in choices:
-            self._tcgen05_cluster_m2_search_constraints = None
+    @cute_tcgen05_search_enabled.setter
+    def cute_tcgen05_search_enabled(self, value: bool) -> None:
+        self._cute_tcgen05_config.search_enabled = value
+
+    @property
+    def cute_tcgen05_aux_kernel_detected(self) -> bool:
+        return self._cute_tcgen05_config.aux_kernel_detected
+
+    @cute_tcgen05_aux_kernel_detected.setter
+    def cute_tcgen05_aux_kernel_detected(self, value: bool) -> None:
+        self._cute_tcgen05_config.aux_kernel_detected = value
+
+    @property
+    def _tcgen05_cluster_m_search_choices(self) -> tuple[int, ...] | None:
+        return self._cute_tcgen05_config.cluster_m_search_choices
+
+    @_tcgen05_cluster_m_search_choices.setter
+    def _tcgen05_cluster_m_search_choices(self, value: tuple[int, ...] | None) -> None:
+        self._cute_tcgen05_config.cluster_m_search_choices = value
+
+    @property
+    def _tcgen05_cluster_m2_search_constraints(
+        self,
+    ) -> Tcgen05ClusterM2SearchConstraints | None:
+        return self._cute_tcgen05_config.cluster_m2_search_constraints
+
+    @_tcgen05_cluster_m2_search_constraints.setter
+    def _tcgen05_cluster_m2_search_constraints(
+        self, value: Tcgen05ClusterM2SearchConstraints | None
+    ) -> None:
+        self._cute_tcgen05_config.cluster_m2_search_constraints = value
+
+    @property
+    def _tcgen05_ab_stages_three_search_constraints(
+        self,
+    ) -> Tcgen05AbStagesThreeSearchConstraints | None:
+        return self._cute_tcgen05_config.ab_stages_three_search_constraints
+
+    @_tcgen05_ab_stages_three_search_constraints.setter
+    def _tcgen05_ab_stages_three_search_constraints(
+        self, value: Tcgen05AbStagesThreeSearchConstraints | None
+    ) -> None:
+        self._cute_tcgen05_config.ab_stages_three_search_constraints = value
+
+    @property
+    def _tcgen05_num_epi_warps_search_choices(self) -> tuple[int, ...] | None:
+        return self._cute_tcgen05_config.num_epi_warps_search_choices
+
+    @_tcgen05_num_epi_warps_search_choices.setter
+    def _tcgen05_num_epi_warps_search_choices(
+        self, value: tuple[int, ...] | None
+    ) -> None:
+        self._cute_tcgen05_config.num_epi_warps_search_choices = value
+
+    @property
+    def _tcgen05_num_epi_warps_validation_choices(self) -> tuple[int, ...] | None:
+        return self._cute_tcgen05_config.num_epi_warps_validation_choices
+
+    @_tcgen05_num_epi_warps_validation_choices.setter
+    def _tcgen05_num_epi_warps_validation_choices(
+        self, value: tuple[int, ...] | None
+    ) -> None:
+        self._cute_tcgen05_config.num_epi_warps_validation_choices = value
+
+    def restrict_tcgen05_cluster_m_search(self, choices: tuple[int, ...]) -> None:
+        self._cute_tcgen05_config.restrict_cluster_m_search(choices)
 
     def allow_tcgen05_cluster_m2_search(
         self,
@@ -646,178 +494,25 @@ class ConfigSpec:
         static_k: int,
         max_k_tiles: int = TCGEN05_TWO_CTA_MAX_K_TILES,
     ) -> None:
-        """Allow validated CtaGroup.TWO candidates in the autotune search.
-
-        The search space cannot express cross-field constraints directly.
-        This helper exposes ``tcgen05_cluster_m=2`` but records enough context
-        for search-time normalization to project ``cluster_m=2`` products onto
-        the validated seed pid order + ``256x256`` CtaGroup.TWO block
-        tile within the K-tile cap. Problems outside this envelope keep
-        ``tcgen05_cluster_m`` narrowed to ``(1,)``.
-        """
-        assert static_k > 0, "static_k is required for cluster_m=2 K-cap checks"
-        assert max_k_tiles > 0, "cluster_m=2 max K tiles must be positive"
-        self._tcgen05_cluster_m2_search_constraints = Tcgen05ClusterM2SearchConstraints(
+        self._cute_tcgen05_config.allow_cluster_m2_search(
             static_k=static_k,
             max_k_tiles=max_k_tiles,
         )
-        # ``restrict_tcgen05_cluster_m_search`` intentionally clears the
-        # constraints whenever 2 is absent; set them immediately before
-        # reopening the search choices.
-        self.restrict_tcgen05_cluster_m_search((1, 2))
 
     @staticmethod
     def _tcgen05_cluster_m2_bk_is_valid(
         bk: int, constraints: Tcgen05ClusterM2SearchConstraints
     ) -> bool:
-        return constraints.static_k % bk == 0 and (
-            constraints.static_k // bk <= constraints.max_k_tiles
-        )
+        return CuteTcgen05Config.cluster_m2_bk_is_valid(bk, constraints)
 
     def _tcgen05_c_input_seed_config(self) -> helion.Config | None:
-        """Seed the canonical productive C-input warp config for aux kernels.
-
-        Cycle 2f finding: the autotune surface widening landed in cycle
-        2e admits ``c_input_warps=1`` but the random initial population
-        draw misses it on residual cells where the
-        ``WITH_SCHEDULER + scheduler_warps=1 + c_input_warps=1`` corner
-        is a small intersection of the search space (zero of 44 configs
-        sampled on 8192x4096x2048 quick-effort autotune). The forced
-        c_input=1 perf class wins by +33% there, so leaving the corner
-        un-seeded leaves the headline residual win unreachable through
-        normal autotune.
-
-        This seed mirrors ``_tcgen05_cluster_m2_seed_config`` (same
-        ``[256, 256, 128]`` tile, ``cluster_m=2``, ``persistent_interleaved``
-        pid order) but stamps the WITH_SCHEDULER strategy + the
-        ``c_input_warps=1`` productive body. ``ab_stages`` is held at 2
-        because the ``ab=3 + c_input=1`` combination is unconditionally
-        over the per-CTA SMEM budget on B200 (see
-        ``_fix_tcgen05_with_scheduler_search_config`` for the demotion
-        path and the MMA-codegen-time ``BackendUnsupported`` rejection).
-
-        Gated on ``cute_tcgen05_aux_kernel_detected`` so the seed only
-        fires for kernels whose post-compile FX scan identified an aux
-        load. Pure-matmul kernels keep the narrow autotune surface and
-        do not receive this seed — the inert C-input warp would occupy
-        an SM slot without delivering work and regress pure-matmul perf.
-
-        Returns ``None`` whenever the cluster_m=2 seed envelope is not
-        admitted (same structural checks: validated 3-block-size triple,
-        ``persistent_interleaved`` allowed, ``[256, 256, 128]`` falls
-        inside the block-size fragment ranges, and at least one bk in
-        the fragment range satisfies the cluster_m=2 K-tile cap).
-        """
-        if not self.cute_tcgen05_aux_kernel_detected:
-            return None
-        constraints = self._tcgen05_cluster_m2_search_constraints
-        if (
-            constraints is None
-            or TCGEN05_TWO_CTA_SEED_PID_TYPE not in self.allowed_pid_types
-        ):
-            return None
-        if len(self.block_sizes) != 3:
-            return None
-
-        bm_fragment = cast("BlockSizeFragment", self.block_sizes[0]._fragment(self))
-        bn_fragment = cast("BlockSizeFragment", self.block_sizes[1]._fragment(self))
-        bk_fragment = cast("BlockSizeFragment", self.block_sizes[2]._fragment(self))
-        if not (
-            bm_fragment.low <= TCGEN05_TWO_CTA_BLOCK_M <= bm_fragment.high
-            and bn_fragment.low <= TCGEN05_TWO_CTA_BLOCK_N <= bn_fragment.high
-        ):
-            return None
-
-        bk = bk_fragment.high
-        while bk >= bk_fragment.low:
-            if self._tcgen05_cluster_m2_bk_is_valid(bk, constraints):
-                seed_config: dict[str, Any] = {
-                    "block_sizes": [
-                        TCGEN05_TWO_CTA_BLOCK_M,
-                        TCGEN05_TWO_CTA_BLOCK_N,
-                        bk,
-                    ],
-                    # ``l2_groupings=[1]`` (NOT the cluster_m2 seed's
-                    # ``TCGEN05_TWO_CTA_SEED_L2_GROUPING=4``). Direct
-                    # verification on 4096^3 and 8192x4096x2048 bf16
-                    # residual: ``c_input_warps=1 + cluster_m=2 +
-                    # l2_groupings=[g]`` produces ~60-69% mismatched
-                    # elements vs the eager reference for every g > 1
-                    # tested ({2, 4, 8}); only ``g=1`` is correct.
-                    # The matched-shape cycle 2c forced c_input=1
-                    # baselines (765 / 880 / 803 mom-median TFLOP/s)
-                    # all run at ``l2_groupings=[1]`` so the perf
-                    # class the seed targets is the
-                    # ``g=1``-validated one. The autotune-rejected
-                    # ``g=4`` seed observed in cycle 2g is the
-                    # same codegen bug surfaced at the canonical
-                    # config — a separate fix follow-up.
-                    "l2_groupings": [1],
-                    "pid_type": TCGEN05_TWO_CTA_SEED_PID_TYPE,
-                    "tcgen05_cluster_m": 2,
-                    "tcgen05_num_epi_warps": 4,
-                    # The c_input productive body is unconditionally
-                    # paired with ``ab_stages=2``. The ``ab=3 +
-                    # c_input=1`` combo overshoots the 232 KB B200 SMEM
-                    # cap; ``_fix_tcgen05_with_scheduler_search_config``
-                    # also demotes search-time samples that carry both.
-                    "tcgen05_ab_stages": 2,
-                    TCGEN05_STRATEGY_CONFIG_KEY: (
-                        Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER.value
-                    ),
-                    TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY: 1,
-                    TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY: 1,
-                }
-                # Mirror the cluster_m2 seed: pure-matmul has exactly
-                # the A/B/C indexing slots, so stamp the validated
-                # tensor_descriptor triple. Fused epilogues add more
-                # memory ops, so leave those seeds to the spec default
-                # rather than constructing a partial list.
-                if self.indexing.length == 3:
-                    seed_config["indexing"] = [
-                        "tensor_descriptor",
-                        "tensor_descriptor",
-                        "tensor_descriptor",
-                    ]
-                return helion.Config(**seed_config)
-            bk //= 2
-        return None
+        return self._cute_tcgen05_config._c_input_seed_config()
 
     def autotune_seed_configs(self) -> list[helion.Config]:
-        """Return validated extra configs that should be benchmarked early."""
-        seeds: list[helion.Config] = []
-        c_input_seed = self._tcgen05_c_input_seed_config()
-        if c_input_seed is not None:
-            seeds.append(c_input_seed)
-        return seeds
+        return self._cute_tcgen05_config.autotune_seed_configs()
 
     def _fix_tcgen05_cluster_m2_search_config(self, config: dict[str, object]) -> None:
-        """Canonicalize unvalidated search-only ``cluster_m=2`` products."""
-        if not (
-            self.cute_tcgen05_search_enabled and config.get("tcgen05_cluster_m") == 2
-        ):
-            return
-        constraints = self._tcgen05_cluster_m2_search_constraints
-        if (
-            constraints is None
-            or TCGEN05_TWO_CTA_SEED_PID_TYPE not in self.allowed_pid_types
-        ):
-            config["tcgen05_cluster_m"] = 1
-            return
-        block_sizes = config.get("block_sizes")
-        if not isinstance(block_sizes, list) or len(block_sizes) < 3:
-            config["tcgen05_cluster_m"] = 1
-            return
-        bk = block_sizes[2]
-        if not isinstance(bk, int) or isinstance(bk, bool):
-            config["tcgen05_cluster_m"] = 1
-            return
-        if not self._tcgen05_cluster_m2_bk_is_valid(bk, constraints):
-            config["tcgen05_cluster_m"] = 1
-            return
-        config["pid_type"] = TCGEN05_TWO_CTA_SEED_PID_TYPE
-        block_sizes[0] = TCGEN05_TWO_CTA_BLOCK_M
-        block_sizes[1] = TCGEN05_TWO_CTA_BLOCK_N
+        self._cute_tcgen05_config._fix_cluster_m2_search_config(config)
 
     def allow_tcgen05_ab_stages_three_search(
         self,
@@ -825,96 +520,14 @@ class ConfigSpec:
         dtype_bytes: int,
         device: torch.device,
     ) -> None:
-        """Admit ``tcgen05_ab_stages=3`` into the autotune search surface.
-
-        ``dtype_bytes`` is the AB operand element size (2 for BF16/FP16).
-        ``device`` is the operand's CUDA device — the SMEM-budget query
-        consults that exact device's ``shared_memory_per_block_optin``
-        rather than the host process's *current* CUDA device, so a
-        multi-GPU / heterogeneous setup cannot accidentally enable an
-        over-budget config (current device has more SMEM than the
-        target) or suppress the canonical seed (current device is below
-        the B200 floor while the target is B200).
-
-        The recorded budget is then consulted by:
-
-        * ``_tcgen05_optional_fragments(for_search=True)`` — lifts
-          ``ab_stages_max`` from 2 to 3 so the autotuner samples the
-          ``ab=3`` arm.
-        * ``_fix_tcgen05_ab_stages_three_search_config`` — demotes any
-          sampled ``ab=3`` configuration whose ``(bm, bn, bk, cluster_m)``
-          per-CTA AB-SMEM cost exceeds the budget back to ``ab=2`` so an
-          unsafe candidate cannot reach ptxas.
-        * ``CuteTcgen05ClusterM2Heuristic.get_seed_config`` — seeds the
-          canonical fast config (256x256x128 cluster_m=2 ab=3) when the
-          budget allows.
-
-        Validation surface is unchanged: ``helion.Config(tcgen05_ab_stages=3)``
-        still round-trips for explicit user configs (the cute_dsl path has
-        its own loud ptxas failure for over-budget user configs). Disable
-        with ``self._tcgen05_ab_stages_three_search_constraints = None``.
-
-        Refuses to admit ``ab=3`` when the spec has more than the
-        single-matmul 3-block-size triple. ``tcgen05_ab_stages`` is a
-        global config knob across the whole bound kernel, but the
-        per-config search-time fixup
-        (``_fix_tcgen05_ab_stages_three_search_config``) only inspects
-        ``block_sizes[0:3]``. A multi-dot or multi-root kernel could
-        otherwise sit at ``ab=3`` for a later over-budget triple — that
-        path would survive the fixup and abort at ptxas mid-tuning.
-        Mirrors the single-triple assumption used by
-        ``CuteTcgen05ClusterM2Heuristic`` (``len(self.block_sizes) != 3``).
-        """
-        assert dtype_bytes > 0, "dtype_bytes must be positive"
-        if len(self.block_sizes) != 3:
-            self._tcgen05_ab_stages_three_search_constraints = None
-            return
-        budget_bytes = self._cute_per_cta_ab_smem_budget_bytes(device)
-        if budget_bytes <= 0:
-            # Device SMEM optin cap is below the B200 envelope (or
-            # unavailable on a non-CUDA host). Keep ``ab=3`` search off so
-            # we never broaden the autotune surface past the hardware's
-            # known-good envelope.
-            self._tcgen05_ab_stages_three_search_constraints = None
-            return
-        self._tcgen05_ab_stages_three_search_constraints = (
-            Tcgen05AbStagesThreeSearchConstraints(
-                dtype_bytes=dtype_bytes,
-                per_cta_smem_budget_bytes=budget_bytes,
-            )
+        self._cute_tcgen05_config.allow_ab_stages_three_search(
+            dtype_bytes=dtype_bytes,
+            device=device,
         )
 
     @staticmethod
     def _cute_per_cta_ab_smem_budget_bytes(device: torch.device) -> int:
-        """Per-CTA SMEM budget the AB pipeline staging may consume.
-
-        Returns 0 when ``device`` is non-CUDA or its optin SMEM cap is
-        below the B200 envelope — keeps ``ab=3`` search off until the
-        target device can prove there is room to host it. Reads
-        ``shared_memory_per_block_optin`` so the budget tracks the
-        device's actual cap rather than the more conservative default.
-        Subtracts ``TCGEN05_AB_STAGES_THREE_RESERVED_SMEM_BYTES`` to
-        leave room for the role-local lowering's non-AB SMEM
-        (accumulator stages, pipeline mailboxes, TMEM bookkeeping).
-
-        ``shared_memory_per_block_optin`` is read with ``getattr``
-        because the HIP runtime does not expose it on CUDA device
-        properties — see ``torch/cuda/_utils.py``'s own ``getattr``
-        with a 49152 fallback, plus the existing ``getattr`` usage in
-        ``helion/_compiler/reduction_strategy.py`` and
-        ``helion/_testing.py``. ``shared_memory_per_block`` is the
-        stable attribute and is read directly.
-        """
-        if device.type != "cuda" or not torch.cuda.is_available():
-            return 0
-        props = torch.cuda.get_device_properties(device)
-        # ``getattr`` because HIP / non-CUDA runtimes may not expose
-        # ``shared_memory_per_block_optin``; see docstring above.
-        optin_shared = int(getattr(props, "shared_memory_per_block_optin", 0) or 0)
-        device_cap = max(props.shared_memory_per_block, optin_shared)
-        if device_cap < TCGEN05_AB_STAGES_THREE_MIN_DEVICE_SMEM_OPTIN:
-            return 0
-        return device_cap - TCGEN05_AB_STAGES_THREE_RESERVED_SMEM_BYTES
+        return CuteTcgen05Config.per_cta_ab_smem_budget_bytes(device)
 
     def _tcgen05_ab_stages_three_fits(
         self,
@@ -924,193 +537,35 @@ class ConfigSpec:
         bk: int,
         cluster_m: int,
     ) -> bool:
-        """True when ``ab=3`` per-CTA AB-SMEM cost fits the budget.
-
-        Uses ``tcgen05_ab_smem_bytes_per_cta`` to compute the per-CTA cost
-        for the active dtype. Returns False whenever ``ab=3`` search is
-        not admitted, the cluster shape is unsupported, or the cost
-        exceeds the recorded budget. Used by both the fix-up
-        (``_fix_tcgen05_ab_stages_three_search_config``) and the canonical
-        seed (``CuteTcgen05ClusterM2Heuristic.get_seed_config``).
-        """
-        constraints = self._tcgen05_ab_stages_three_search_constraints
-        if constraints is None:
-            return False
-        if cluster_m not in (1, 2):
-            return False
-        if bm <= 0 or bn <= 0 or bk <= 0:
-            return False
-        bytes_per_cta = tcgen05_ab_smem_bytes_per_cta(
+        return self._cute_tcgen05_config.ab_stages_three_fits(
             bm=bm,
             bn=bn,
             bk=bk,
-            dtype_bytes=constraints.dtype_bytes,
-            ab_stages=3,
             cluster_m=cluster_m,
         )
-        return bytes_per_cta <= constraints.per_cta_smem_budget_bytes
 
     def _fix_tcgen05_ab_stages_three_search_config(
         self, config: dict[str, object]
     ) -> None:
-        """Demote search-only ``ab=3`` candidates that overflow SMEM.
-
-        The autotune search samples ``tcgen05_ab_stages`` independently of
-        ``(bm, bn, bk, cluster_m)``. Many sampled tile shapes do not fit
-        the per-CTA AB-SMEM budget at ``ab=3``; without this fixup those
-        samples would reach ptxas and abort with ``shared > 232KB``,
-        wasting tuning time and risking GPU-context teardown.
-
-        Runs only when the ``ab=3`` search arm is enabled (no-op
-        otherwise) and only on configs that already passed the search
-        normalization for ``cluster_m`` and ``block_sizes`` (so the
-        post-fixup ``cluster_m`` agrees with the cluster_m2 projection).
-        """
-        if self._tcgen05_ab_stages_three_search_constraints is None:
-            return
-        if not self.cute_tcgen05_search_enabled:
-            return
-        ab_stages = config.get("tcgen05_ab_stages")
-        if ab_stages != 3:
-            return
-        # Trust the per-fragment validators and the cluster_m fixups
-        # that ran immediately above (see ``normalize`` ordering): by
-        # this point ``block_sizes`` is the validated 3-tuple of ints
-        # produced by ``BlockIdSequence._normalize`` and
-        # ``tcgen05_cluster_m`` is a validated ``1`` or ``2``. Mirrors
-        # ``_fix_tcgen05_cluster_m2_search_config`` which also trusts
-        # the post-normalize structural form.
-        block_sizes = cast("list[int]", config["block_sizes"])
-        cluster_m = cast("int", config.get("tcgen05_cluster_m", 1))
-        if not self._tcgen05_ab_stages_three_fits(
-            bm=block_sizes[0],
-            bn=block_sizes[1],
-            bk=block_sizes[2],
-            cluster_m=cluster_m,
-        ):
-            config["tcgen05_ab_stages"] = 2
+        self._cute_tcgen05_config._fix_ab_stages_three_search_config(config)
 
     def _fix_tcgen05_with_scheduler_search_config(
         self, config: dict[str, object]
     ) -> None:
-        """Pair WITH_SCHEDULER-only knobs and demote the
-        ``ab=3 + c_input_warps=1`` SMEM-over-budget combo.
-
-        Two adjustments tied to the aux-kernel-detected
-        autotune-surface widening (see
-        ``cute_tcgen05_aux_kernel_detected`` for the gate):
-
-        1. ``scheduler_warps`` and ``c_input_warps`` are gated by
-           ``tcgen05_strategy``: under ``ROLE_LOCAL_MONOLITHIC``
-           both must be 0 (the 6-warp role-local shape has no
-           slot for a scheduler or c_input warp); under
-           ``ROLE_LOCAL_WITH_SCHEDULER`` ``scheduler_warps`` must
-           be 1 (the strategy's definition). The cross-fragment
-           validator
-           (``validate_tcgen05_strategy_invariants``) rejects
-           mismatched pairs at codegen time; this fixup demotes
-           the mismatched samples before they reach codegen so
-           autotune does not spend cycles on doomed compiles.
-        2. The MMA-codegen-time rejection in
-           ``cute_mma._emit_mma_pipeline`` raises
-           ``BackendUnsupported`` for
-           ``ab_stages=3 + c_input_warps=1 + non-empty
-           single-store aux`` (the aux SMEM ring + AB pipeline
-           overshoot the 232 KB B200 SMEM cap by 30+ KB at every
-           validated tile shape). The autotuner would otherwise
-           sample this combo, hit the raise, and waste a
-           compile slot per sample. Demote
-           ``c_input_warps=1`` to ``c_input_warps=0`` when the
-           sample carries ``ab_stages=3`` so the sample still
-           produces a legal kernel (autotune compares
-           ``ab=3 + c_input=0`` against ``ab=2 + c_input=1``
-           via separate samples rather than the rejected combo).
-
-        Runs only when the aux-kernel-detected widening is
-        active (``cute_tcgen05_aux_kernel_detected`` is True
-        AND ``cute_tcgen05_search_enabled`` is True). For
-        non-aux kernels the autotune surface only samples
-        ``MONOLITHIC + scheduler_warps=0 + c_input_warps=0``
-        so the fixup is a no-op.
-        """
-        if not (
-            self.cute_tcgen05_search_enabled and self.cute_tcgen05_aux_kernel_detected
-        ):
-            return
-        strategy = config.get(TCGEN05_STRATEGY_CONFIG_KEY)
-        scheduler_warps = config.get(TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY)
-        c_input_warps = config.get(TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY)
-        ab_stages = config.get("tcgen05_ab_stages")
-        # Pair scheduler_warps + c_input_warps with strategy. The
-        # cross-fragment validator's rules:
-        # - MONOLITHIC: scheduler_warps must be 0, c_input_warps
-        #   must be 0.
-        # - WITH_SCHEDULER: scheduler_warps must be 1,
-        #   c_input_warps in {0, 1}.
-        if strategy == Tcgen05Strategy.ROLE_LOCAL_MONOLITHIC.value:
-            if scheduler_warps != 0:
-                config[TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY] = 0
-            if c_input_warps != 0:
-                config[TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY] = 0
-        elif strategy == Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER.value:
-            if scheduler_warps != 1:
-                config[TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY] = 1
-            # ``c_input_warps`` is allowed at ``{0, 1}`` —
-            # leave the sampled value unless the
-            # ``ab=3 + c_input=1`` SMEM-budget rejection
-            # below forces demotion.
-        # SMEM-budget demotion: ``ab=3 + c_input=1`` is
-        # unconditionally over-budget (see
-        # ``cute_mma._emit_mma_pipeline`` rejection). Demote
-        # c_input_warps to 0 so the sample still produces a
-        # legal kernel.
-        if ab_stages == 3 and config.get(TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY) == 1:
-            config[TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY] = 0
+        self._cute_tcgen05_config._fix_with_scheduler_search_config(config)
 
     def _fix_tcgen05_cluster_m1_persistent_search_config(
         self, config: dict[str, object]
     ) -> None:
-        """Keep search-only CtaGroup.ONE persistent configs on tcgen05 tiles."""
-        if not (
-            self.cute_tcgen05_search_enabled
-            and config.get("tcgen05_cluster_m", 1) == 1
-            and config.get("pid_type")
-            in {"persistent_blocked", "persistent_interleaved"}
-        ):
-            return
-        block_sizes = config.get("block_sizes")
-        if not isinstance(block_sizes, list) or not block_sizes:
-            return
-        bm = block_sizes[0]
-        if isinstance(bm, int) and not isinstance(bm, bool):
-            block_sizes[0] = min(bm, TCGEN05_ONE_CTA_MAX_BLOCK_M)
+        self._cute_tcgen05_config._fix_cluster_m1_persistent_search_config(config)
 
     def restrict_tcgen05_num_epi_warps_search(self, choices: tuple[int, ...]) -> None:
-        """Narrow the autotune search over tcgen05_num_epi_warps to *choices*.
-
-        Does not affect what values are legal in user-supplied configs.
-        See ``restrict_tcgen05_num_epi_warps_validation`` for the
-        complementary helper that tightens normalize().
-        """
-        assert choices, "tcgen05_num_epi_warps search must allow at least one value"
-        self._tcgen05_num_epi_warps_search_choices = choices
+        self._cute_tcgen05_config.restrict_num_epi_warps_search(choices)
 
     def restrict_tcgen05_num_epi_warps_validation(
         self, choices: tuple[int, ...]
     ) -> None:
-        """Restrict the *legal* values of tcgen05_num_epi_warps in
-        user-supplied configs to *choices*.
-
-        Unlike the search-only narrowing helpers, this also tightens
-        what ``normalize()`` accepts: a user-supplied
-        ``helion.Config(tcgen05_num_epi_warps=N)`` with N not in
-        *choices* will raise ``InvalidConfig``. Used by the BF16/FP16
-        matmul path because num_epi_warps != 4 currently produces
-        silent wrong output (no loud crash to alert a user who bypasses
-        autotune via an explicit config).
-        """
-        assert choices, "tcgen05_num_epi_warps validation must allow at least one value"
-        self._tcgen05_num_epi_warps_validation_choices = choices
+        self._cute_tcgen05_config.restrict_num_epi_warps_validation(choices)
 
     def narrow_tcgen05_autotune_to_validated_configs(
         self,
@@ -1121,95 +576,13 @@ class ConfigSpec:
         ab_stages_three_dtype_bytes: int | None = None,
         ab_stages_three_device: torch.device | None = None,
     ) -> None:
-        """Narrow the tcgen05 autotune search to combinations validated on B200.
-
-        Three structural limitations bound the safe autotune space today.
-        Each narrowing is documented inline so the rationale stays close
-        to the call. The cluster_m and pid_type restrictions are
-        *search-only* — user-supplied ``helion.Config(...)`` values are
-        still validated against the full set of legal options (see
-        ``_tcgen05_optional_fragments(for_search=False)``). The
-        num_epi_warps restriction additionally tightens validation
-        because the underlying failure mode is silent wrong output.
-
-        * **Persistent autotune gating.** Static full-tile single-root
-          tcgen05 persistent kernels now use role-local loops and have
-          multi-tile runtime coverage for ``cluster_m=1``. Callers may pass
-          ``allow_persistent_pid_types=True`` only after proving every
-          candidate M/N/K block size in the search space divides the static
-          problem extent. Otherwise, drop ``persistent_blocked`` and
-          ``persistent_interleaved`` from the autotune pid_type search so
-          partial-tile, multi-root, or otherwise unvalidated persistent
-          configs cannot be sampled. Explicit unsafe user configs still go
-          through the host-side guard
-          (``Tcgen05PersistentProgramIDs._emit_host_multi_tile_guard``),
-          which raises a loud ``RuntimeError``.
-
-        * **2-CTA cluster.** ``cluster_m=2`` is searched only when the
-          caller proves the static problem can form validated role-local
-          CtaGroup.TWO candidates. The search view may expose ``(1, 2)``,
-          but search-time normalization projects ``cluster_m=2`` products
-          onto the validated seed pid order + ``256x256`` tile shape
-          with ``K / bk`` at or below the validated K-tile cap. CUDA launch
-          failures are loud, so user-supplied ``cluster_m=2`` is still legal
-          and handled by the runtime guard when outside the validated
-          envelope.
-
-        * **Multi-warp epilogue.** Only ``tcgen05_num_epi_warps=4`` is
-          validated correct on B200 today. Direct verification at
-          ``num_epi_warps ∈ {1, 2}`` shows the tcgen05 SIMT-store
-          epilogue miscompiles (~75% of elements diverge from the
-          torch reference at M=N=K=256 bf16); ``num_epi_warps=3`` is
-          not separately validated and is treated as unsafe by
-          extension. Narrow both the autotune search *and* the
-          validation accept-set to ``(4,)`` so the autotuner cannot
-          converge on a wrong-output config and a user-supplied
-          ``helion.Config(tcgen05_num_epi_warps=N!=4)`` raises
-          ``InvalidConfig`` rather than silently miscomputing. The
-          underlying correctness bug is what blocks
-          ``num_epi_warps != 4`` from being usable; fixing it is the
-          actual unblocker for item 2 (multi-warp epilogue with
-          c_pipeline SMEM ring + TMA bulk store).
-
-        * **AB-stages-3 SMEM-budget gate.** Pass
-          ``ab_stages_three_dtype_bytes`` (the AB operand element size,
-          2 for BF16/FP16) and ``ab_stages_three_device`` (the operand
-          device — multi-GPU / heterogeneous setups must consult the
-          target device, not the host's current CUDA device) to admit
-          the ``tcgen05_ab_stages=3`` search arm via
-          ``allow_tcgen05_ab_stages_three_search``. Per-config legality
-          is enforced by ``_fix_tcgen05_ab_stages_three_search_config``
-          using ``tcgen05_ab_smem_bytes_per_cta`` against the device's
-          per-CTA SMEM optin cap minus a fixed reservation for non-AB
-          allocations. The cute_dsl path's loud ptxas failure remains
-          the backstop for explicit user configs that bypass autotune
-          with an over-budget ``ab=3`` shape.
-        """
-        if not allow_persistent_pid_types:
-            self.disallow_pid_type("persistent_blocked")
-            self.disallow_pid_type("persistent_interleaved")
-        if allow_cluster_m2_search:
-            assert allow_persistent_pid_types, (
-                "cluster_m=2 search requires persistent pid types"
-            )
-            assert cluster_m2_static_k is not None, (
-                "cluster_m=2 search requires a static K extent"
-            )
-            self.allow_tcgen05_cluster_m2_search(static_k=cluster_m2_static_k)
-        else:
-            self.restrict_tcgen05_cluster_m_search((1,))
-        self.restrict_tcgen05_num_epi_warps_search((4,))
-        self.restrict_tcgen05_num_epi_warps_validation((4,))
-        if ab_stages_three_dtype_bytes is not None:
-            assert ab_stages_three_device is not None, (
-                "ab_stages_three_dtype_bytes requires ab_stages_three_device "
-                "so the SMEM-budget gate consults the operand's device, not "
-                "the host's current CUDA device"
-            )
-            self.allow_tcgen05_ab_stages_three_search(
-                dtype_bytes=ab_stages_three_dtype_bytes,
-                device=ab_stages_three_device,
-            )
+        self._cute_tcgen05_config.narrow_autotune_to_validated_configs(
+            allow_persistent_pid_types=allow_persistent_pid_types,
+            allow_cluster_m2_search=allow_cluster_m2_search,
+            cluster_m2_static_k=cluster_m2_static_k,
+            ab_stages_three_dtype_bytes=ab_stages_three_dtype_bytes,
+            ab_stages_three_device=ab_stages_three_device,
+        )
 
     def supports_config_key(self, key: str) -> bool:
         return self.backend.supports_config_key(key)
@@ -1232,320 +605,21 @@ class ConfigSpec:
     def _tcgen05_optional_fragments(
         self, *, for_search: bool = False
     ) -> dict[str, ConfigSpecFragment]:
-        # The "validation" view (default) defines what user-supplied
-        # configs are allowed to specify. By default it keeps the full
-        # set of legal values so e.g. ``helion.Config(...,
-        # tcgen05_cluster_m=2)`` round-trips through normalize()
-        # unchanged. The matmul path additionally calls
-        # ``restrict_tcgen05_num_epi_warps_validation`` to *tighten*
-        # this view for ``tcgen05_num_epi_warps`` because non-4 values
-        # silently miscompute on B200 (see
-        # ``narrow_tcgen05_autotune_to_validated_configs``); without
-        # that tightening, an explicit user config bypassing autotune
-        # would produce wrong output with no diagnostic.
-        #
-        # The "search" view (for_search=True) is consulted by _flat_fields()
-        # to build the autotune search space, and may be narrower because
-        # some legal values are known to regress perf or crash at runtime.
-        # ``matmul_ops.enforce_dot_requirements`` calls
-        # ``narrow_tcgen05_autotune_to_validated_configs`` for the BF16/FP16
-        # matmul path so the autotuner does not pick a regressing /
-        # crashing config and tear down the GPU context for the whole
-        # tuning run. See ``narrow_tcgen05_autotune_to_validated_configs``
-        # for the per-knob rationale.
-        if for_search and self._tcgen05_cluster_m_search_choices is not None:
-            cluster_m_choices = self._tcgen05_cluster_m_search_choices
-        else:
-            cluster_m_choices = (1, 2)
-        # ``tcgen05_cluster_n``: validation surface accepts {1, 2} so an
-        # explicit ``helion.Config(tcgen05_cluster_n=2)`` round-trips. The
-        # search surface stays narrowed to (1,) until the cluster_n=2
-        # path is perf-validated; cycle 27 G2 closure may flip the search
-        # surface but the autotune broadening is intentionally separate
-        # from the codegen plumbing landed here. Mirrors the cluster_m
-        # split-search pattern.
-        cluster_n_choices: tuple[int, ...] = (1,) if for_search else (1, 2)
-        if for_search and self._tcgen05_num_epi_warps_search_choices is not None:
-            num_epi_warps_fragment: ConfigSpecFragment = EnumFragment(
-                self._tcgen05_num_epi_warps_search_choices
-            )
-        elif (
-            not for_search
-            and self._tcgen05_num_epi_warps_validation_choices is not None
-        ):
-            num_epi_warps_fragment = EnumFragment(
-                self._tcgen05_num_epi_warps_validation_choices
-            )
-        else:
-            num_epi_warps_fragment = IntegerFragment(1, 4, 4)
-        # ``tcgen05_ab_stages``: the validation view always exposes 3 so
-        # explicit ``helion.Config(tcgen05_ab_stages=3)`` round-trips
-        # through ``normalize()`` and runs at the canonical 4096³ bf16
-        # seed (~+12% over ab=2; see cute_plan.md §6.9.1). The search
-        # view exposes ``max=3`` only when ``allow_tcgen05_ab_stages_three_search``
-        # has admitted it — the matmul path turns it on after capturing
-        # the device SMEM budget. ``_fix_tcgen05_ab_stages_three_search_config``
-        # then demotes individual ``ab=3`` samples whose
-        # ``(bm, bn, bk, cluster_m)`` per-CTA AB-SMEM cost exceeds the
-        # budget so an over-budget candidate cannot reach ptxas.
-        # Modeling the cute_dsl SMEM layout cost is the load-bearing
-        # decision (see ``tcgen05_ab_smem_bytes_per_cta``); it is
-        # cross-checked against ``cute.cosize`` for the canonical tile
-        # shapes so the gate cannot silently drift away from the
-        # cute_dsl-allocated cost.
-        if (
-            not for_search
-            or self._tcgen05_ab_stages_three_search_constraints is not None
-        ):
-            ab_stages_max = 3
-        else:
-            ab_stages_max = 2
-        # ``tcgen05_l2_swizzle_size`` (Quack ``max_swizzle_size``
-        # equivalent): autotune surface is narrowed to ``{1, 2, 4, 8}``
-        # so the search budget covers the practical envelope without
-        # spending wall-clock on values whose grouping math degrades on
-        # B200's 148-SM grid (16 / 32 round up to entire raster axes
-        # for the 4096³ canonical seed). The validation surface accepts
-        # the full ``TCGEN05_LEGAL_L2_SWIZZLE_SIZES`` so explicit
-        # ``helion.Config(tcgen05_l2_swizzle_size=16)`` round-trips.
-        # Default ``1`` keeps the cycle 41 byte-identity baseline.
-        l2_swizzle_choices: tuple[int, ...]
-        if for_search:
-            l2_swizzle_choices = tuple(
-                v for v in TCGEN05_LEGAL_L2_SWIZZLE_SIZES if v <= 8
-            )
-        else:
-            l2_swizzle_choices = TCGEN05_LEGAL_L2_SWIZZLE_SIZES
-        return {
-            "tcgen05_cluster_m": EnumFragment(cluster_m_choices),
-            "tcgen05_cluster_n": EnumFragment(cluster_n_choices),
-            "tcgen05_ab_stages": IntegerFragment(1, ab_stages_max, 2),
-            "tcgen05_acc_stages": IntegerFragment(1, 2, 2),
-            "tcgen05_c_stages": EnumFragment((2, 4)),
-            "tcgen05_num_epi_warps": num_epi_warps_fragment,
-            TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY: EnumFragment(l2_swizzle_choices),
-        }
+        return self._cute_tcgen05_config.optional_fragments(for_search=for_search)
 
     def _tcgen05_strategy_autotune_fragments(
         self,
     ) -> dict[str, ConfigSpecFragment]:
-        """Per-fragment validators included in ``_flat_fields()``.
-
-        These are the strategy keys the autotuner *searches* over.
-        ``tcgen05_persistence_model`` is intentionally **not** here —
-        it is fully derived from ``pid_type`` (see
-        ``derive_persistence_model_from_pid_type``) so giving it its
-        own flat-config slot would mean a default-flat with
-        ``non_persistent`` paired with ``pid_type=persistent_blocked``
-        (e.g. when ``autotune_force_persistent`` removes ``flat`` /
-        ``xyz`` from ``allowed_pid_types``), which the cross-fragment
-        validator would then rewrite via ``_fix_invalid``, breaking
-        ``flatten(unflatten(default_flat())) == default_flat()``.
-        Until a strategy decouples persistence from ``pid_type`` it
-        stays a derived field in the validation surface only.
-
-        The autotune surface is narrowed to *implemented* values
-        today: only ``ROLE_LOCAL_MONOLITHIC`` is wired through codegen
-        (G2-C lifts to ``ROLE_LOCAL_WITH_SCHEDULER``); only ``DEFAULT``
-        layout strategy is wired (G2-E broadens to
-        ``EXPLICIT_EPI_TILE``). Allowing wider values would silently
-        steer the autotuner onto the same monolithic kernel and
-        produce benchmark noise unrelated to the strategy choice —
-        same loud-failure principle as
-        ``restrict_tcgen05_num_epi_warps_*``.
-
-        ``epi_warps`` is *not* a separate fragment here — it lives in
-        the existing ``tcgen05_num_epi_warps`` field. See
-        ``warp_spec_from_config`` for the read site.
-        """
-        # When the bind-time detector identified the kernel as
-        # tcgen05-matmul-with-aux (a residual / bias-residual /
-        # chained-residual epilogue), widen the strategy +
-        # scheduler_warps + c_input_warps fragments so autotune
-        # can discover the productive C-input warp
-        # configuration. Detection runs post-compile in
-        # ``BoundKernel`` via
-        # ``host_function_has_tcgen05_aux_kernel_pattern``. For
-        # pure-matmul kernels the flag stays False and the
-        # surface remains narrowed to
-        # ``MONOLITHIC + c_input_warps=0`` so autotune cannot
-        # pick the strictly-worse
-        # ``WITH_SCHEDULER + c_input_warps=1`` shape on a
-        # kernel where the C-input warp would be inert (the
-        # inert warp occupies an SM slot without delivering
-        # work).
-        if self.cute_tcgen05_aux_kernel_detected:
-            strategy_choices: tuple[str, ...] = (
-                Tcgen05Strategy.ROLE_LOCAL_MONOLITHIC.value,
-                Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER.value,
-            )
-            # WITH_SCHEDULER requires exactly one scheduler
-            # warp; MONOLITHIC has none. The cross-fragment
-            # invariant validator
-            # (``validate_tcgen05_strategy_invariants``) rejects
-            # mismatched pairs at codegen time, and
-            # ``_fix_tcgen05_with_scheduler_search_config``
-            # pairs the values so autotune samples only valid
-            # combinations.
-            scheduler_warps_choices: tuple[int, ...] = (0, 1)
-            c_input_warps_choices: tuple[int, ...] = (0, 1)
-        else:
-            strategy_choices = (Tcgen05Strategy.ROLE_LOCAL_MONOLITHIC.value,)
-            scheduler_warps_choices = (0,)
-            c_input_warps_choices = (0,)
-        return {
-            # ``ROLE_LOCAL_WITH_SCHEDULER`` is implemented and
-            # runs correctly on cluster_m=1 / cluster_m=2. The
-            # autotune surface broadens when the bind-time
-            # detector identified an aux kernel (see
-            # ``cute_tcgen05_aux_kernel_detected`` above). The
-            # validation surface accepts both strategies (see
-            # ``_tcgen05_strategy_validation_fragments``) so an
-            # explicit ``helion.Config(tcgen05_strategy=...)``
-            # round-trips through normalize.
-            TCGEN05_STRATEGY_CONFIG_KEY: EnumFragment(strategy_choices),
-            TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY: EnumFragment(
-                (Tcgen05LayoutStrategy.DEFAULT.value,)
-            ),
-            # ``mma_warps`` is forced to 1 by the tcgen05 atom contract
-            # today; broaden when a strategy needs more.
-            TCGEN05_WARP_SPEC_MMA_WARPS_KEY: EnumFragment((1,)),
-            # ``ab_load_warps`` and ``epi_load_warps`` are knobs that
-            # future strategies will exercise. Until then, narrow to
-            # the value the implemented strategies use.
-            TCGEN05_WARP_SPEC_AB_LOAD_WARPS_KEY: EnumFragment((1,)),
-            TCGEN05_WARP_SPEC_EPI_LOAD_WARPS_KEY: EnumFragment((0,)),
-            # ``scheduler_warps``: tracked with ``tcgen05_strategy``
-            # — must be 0 under MONOLITHIC and 1 under
-            # WITH_SCHEDULER. The cross-fragment validator
-            # rejects mismatched pairs; the
-            # ``_fix_tcgen05_with_scheduler_search_config`` fixup
-            # below pairs the values so autotune samples the
-            # valid (strategy, scheduler_warps) combinations.
-            TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY: EnumFragment(
-                scheduler_warps_choices
-            ),
-            # ``c_input_warps``: widening routed through the
-            # per-bind ``cute_tcgen05_aux_kernel_detected``
-            # flag so the autotune surface only samples
-            # ``c_input_warps=1`` when the kernel actually
-            # has an aux load. Under MONOLITHIC the
-            # cross-fragment validator forces
-            # ``c_input_warps=0`` (the MONOLITHIC 6-warp
-            # shape has no slot for the c_input warp); the
-            # ``_fix_tcgen05_with_scheduler_search_config``
-            # fixup demotes ``c_input_warps=1`` under
-            # MONOLITHIC samples so autotune does not spend
-            # cycles on the cross-fragment-rejected combo.
-            TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY: EnumFragment(c_input_warps_choices),
-            # Register split is currently fixed at the role-local
-            # MONOLITHIC values. G2-E may broaden.
-            TCGEN05_WARP_SPEC_REGISTER_DECREASE_KEY: EnumFragment(
-                (ROLE_LOCAL_MONOLITHIC_DEFAULT_WARP_SPEC.register_split[0],)
-            ),
-            TCGEN05_WARP_SPEC_REGISTER_INCREASE_KEY: EnumFragment(
-                (ROLE_LOCAL_MONOLITHIC_DEFAULT_WARP_SPEC.register_split[1],)
-            ),
-        }
+        return self._cute_tcgen05_config.strategy_autotune_fragments()
 
     def _tcgen05_strategy_validation_fragments(
         self,
     ) -> dict[str, ConfigSpecFragment]:
-        """Per-fragment validators applied to the *user-config surface*.
-
-        Superset of ``_tcgen05_strategy_autotune_fragments``: adds the
-        derived-but-still-validated ``tcgen05_persistence_model`` key.
-        A user-supplied ``helion.Config(..., tcgen05_persistence_model=N)``
-        is rejected via this entry if N is not in the implemented set,
-        even though the autotune surface never samples the field —
-        the validation here is a defensive guard against contract
-        drift between user configs and codegen.
-
-        Strategy-conditional invariants that span multiple fragments
-        (e.g. ``scheduler_warps=1`` only legal under
-        ``ROLE_LOCAL_WITH_SCHEDULER``, total warp counts forming
-        clean warpgroups, persistence model contradicting ``pid_type``)
-        are checked separately by
-        ``_validate_tcgen05_strategy_invariants_in_normalize``,
-        mirroring the pattern of
-        ``narrow_tcgen05_autotune_to_validated_configs``.
-        """
-        fragments = self._tcgen05_strategy_autotune_fragments()
-        # Persistence model: validation accepts the same set the
-        # cross-fragment invariant accepts. ``DYNAMIC_PERSISTENT`` is
-        # never in the autotune surface (no codegen) so a user
-        # explicit value is the only way to reach the contradiction
-        # invariant, which the validator then rejects.
-        # ``CLC_PERSISTENT`` (G2-H, cute_plan.md) is accepted
-        # via this validation surface so an explicit
-        # ``helion.Config(..., tcgen05_persistence_model="clc_persistent")``
-        # round-trips, but kept out of the autotune surface
-        # (``_tcgen05_strategy_autotune_fragments``) until perf is
-        # characterized — mirrors the WITH_SCHEDULER narrowing
-        # pattern.
-        fragments[TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY] = EnumFragment(
-            (
-                Tcgen05PersistenceModel.NON_PERSISTENT.value,
-                Tcgen05PersistenceModel.STATIC_PERSISTENT.value,
-                Tcgen05PersistenceModel.CLC_PERSISTENT.value,
-            )
-        )
-        # Strategy + scheduler_warps: the validation surface
-        # accepts both ``ROLE_LOCAL_MONOLITHIC`` and
-        # ``ROLE_LOCAL_WITH_SCHEDULER`` so users can opt in to the
-        # latter via explicit ``helion.Config(...)``. The autotune
-        # surface stays narrowed to MONOLITHIC until the WITH_SCHEDULER
-        # cluster_m=2 path is stable; mismatched pairs (e.g.
-        # MONOLITHIC + scheduler_warps=1) are still rejected by the
-        # cross-fragment validator.
-        fragments[TCGEN05_STRATEGY_CONFIG_KEY] = EnumFragment(
-            (
-                Tcgen05Strategy.ROLE_LOCAL_MONOLITHIC.value,
-                Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER.value,
-            )
-        )
-        fragments[TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY] = EnumFragment((0, 1))
-        # ``c_input_warps`` validation surface: accept ``{0, 1}`` so
-        # explicit user configs can opt in to the C-input warp slot
-        # via ``helion.Config(tcgen05_warp_spec_c_input_warps=1)``.
-        # The cross-fragment validator
-        # (``validate_tcgen05_strategy_invariants``) further narrows
-        # the value per-strategy: ``ROLE_LOCAL_MONOLITHIC`` rejects
-        # nonzero (its 6-warp shape has no slot for an 8th role
-        # warp); ``ROLE_LOCAL_WITH_SCHEDULER`` accepts ``{0, 1}``,
-        # with the value 1 occupying the slot that was previously
-        # the inert padding warp. The codegen body of the C-input
-        # warp is inert today (no role-local while loop consumes
-        # it); the productive TMA producer body that actually
-        # overlaps the aux load with mainloop work is a follow-up
-        # (``cute_plan.md`` §7.5.3.2).
-        fragments[TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY] = EnumFragment((0, 1))
-        return fragments
+        return self._cute_tcgen05_config.strategy_validation_fragments()
 
     @staticmethod
     def _tcgen05_strategy_field_default(key: str, *, pid_type: object = None) -> object:
-        """Default value for a strategy data-model field.
-
-        ``ROLE_LOCAL_MONOLITHIC`` is the strategy default; the warp
-        spec defaults match today's 6-warp role-local lowering. Layout
-        strategy defaults to ``DEFAULT``. The persistence model
-        default is *derived* from the active ``pid_type`` so that
-        serialized configs cannot carry contradictory state (e.g.
-        ``pid_type=flat`` paired with ``static_persistent``); the
-        cross-fragment validator separately enforces the same
-        agreement when the user supplies an explicit value. Keep this
-        mapping aligned with the constants in
-        ``helion/_compiler/cute/strategies.py``.
-        """
-        if key == TCGEN05_STRATEGY_CONFIG_KEY:
-            return Tcgen05Strategy.ROLE_LOCAL_MONOLITHIC.value
-        if key == TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY:
-            return derive_persistence_model_from_pid_type(pid_type).value
-        if key == TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY:
-            return Tcgen05LayoutStrategy.DEFAULT.value
-        if key in TCGEN05_WARP_SPEC_DEFAULTS_BY_KEY:
-            return TCGEN05_WARP_SPEC_DEFAULTS_BY_KEY[key]
-        raise KeyError(f"Unknown tcgen05 strategy field: {key!r}")
+        return CuteTcgen05Config.strategy_field_default(key, pid_type=pid_type)
 
     def _validate_tcgen05_strategy_invariants_in_normalize(
         self,
@@ -1553,161 +627,25 @@ class ConfigSpec:
         *,
         _fix_invalid: bool,
     ) -> None:
-        """Cross-fragment invariants for the tcgen05 strategy data model.
-
-        Mirrors ``narrow_tcgen05_autotune_to_validated_configs``: a
-        single helper called from ``normalize`` with the rationale
-        documented in one place. Today's
-        ``_tcgen05_optional_fragments`` only validates each fragment
-        independently; strategy-conditional invariants
-        (``scheduler_warps=1`` only legal under
-        ``ROLE_LOCAL_WITH_SCHEDULER``, total warps must form clean
-        warpgroups, persistence model must agree with ``pid_type``)
-        span multiple fragments and live here.
-        """
-        # Resolve enums from string config values. Per-fragment
-        # validation has already accepted these so the lookups cannot
-        # raise ValueError unless the caller bypassed normalization.
-        strategy = Tcgen05Strategy(config[TCGEN05_STRATEGY_CONFIG_KEY])
-        persistence_model = Tcgen05PersistenceModel(
-            config[TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY]
+        self._cute_tcgen05_config.validate_strategy_invariants(
+            config,
+            fix_invalid=_fix_invalid,
         )
-        layout_strategy = Tcgen05LayoutStrategy(
-            config[TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY]
-        )
-        warp_spec = warp_spec_from_config(config)
-        layout_overrides = layout_overrides_from_config(config)
-
-        # ``cluster_m`` is sourced from the existing
-        # ``tcgen05_cluster_m`` knob (default 1 if absent). The
-        # validator rejects strategy/cluster_m pairs that the
-        # lowering can't run correctly today.
-        cluster_m_raw = config.get("tcgen05_cluster_m", 1)
-        cluster_m = int(cluster_m_raw) if isinstance(cluster_m_raw, int) else 1
-        cluster_n_raw = config.get("tcgen05_cluster_n", 1)
-        cluster_n = int(cluster_n_raw) if isinstance(cluster_n_raw, int) else 1
-        # Source arch major from the live device when CUDA is
-        # available; the unit-test path (no GPU) keeps None so
-        # arch-gated models like ``CLC_PERSISTENT`` still validate
-        # via the strategy/pid_type axes. Runtime kernel compilation
-        # always sees a real value.
-        arch_major: int | None = None
-        if torch.cuda.is_available():
-            arch_major = torch.cuda.get_device_capability(torch.cuda.current_device())[
-                0
-            ]
-        errors = validate_tcgen05_strategy_invariants(
-            strategy=strategy,
-            persistence_model=persistence_model,
-            layout_strategy=layout_strategy,
-            warp_spec=warp_spec,
-            layout_overrides=layout_overrides,
-            pid_type=config.get("pid_type"),
-            cluster_m=cluster_m,
-            cluster_n=cluster_n,
-            arch_major=arch_major,
-        )
-        if not errors:
-            return
-        if _fix_invalid:
-            # Reset every strategy field to its documented default so a
-            # later pass converges. Mirrors the silent-fix path used by
-            # other tcgen05 validators (e.g. cluster_m=2 search
-            # canonicalization) which roll back to the validated seed
-            # rather than try to repair partial states. ``pid_type`` is
-            # forwarded so the persistence-model default agrees with
-            # the active pid_type.
-            pid_type = config.get("pid_type")
-            for key in TCGEN05_STRATEGY_CONFIG_KEYS:
-                if key in TCGEN05_LAYOUT_OVERRIDES_KEYS:
-                    config[key] = None
-                else:
-                    config[key] = self._tcgen05_strategy_field_default(
-                        key, pid_type=pid_type
-                    )
-            return
-        message = "; ".join(errors)
-        raise InvalidConfig(f"tcgen05 strategy invariants violated: {message}")
 
     @staticmethod
     def _validate_optional_fragment_value(
         name: str, fragment: ConfigSpecFragment, value: object
     ) -> object:
-        if isinstance(fragment, BooleanFragment):
-            if type(value) is not bool:
-                raise InvalidConfig(f"{name} must be a boolean, got {value!r}")
-            return value
-        if isinstance(fragment, EnumFragment):
-            if value not in fragment.choices:
-                raise InvalidConfig(
-                    f"{name} must be one of {fragment.choices!r}, got {value!r}"
-                )
-            return value
-        if isinstance(fragment, IntegerFragment):
-            if type(value) is not int:
-                raise InvalidConfig(f"{name} must be an integer, got {value!r}")
-            if value < fragment.low or value > fragment.high:
-                raise InvalidConfig(
-                    f"{name} must be in [{fragment.low}, {fragment.high}], got {value!r}"
-                )
-            return value
-        raise InvalidConfig(f"Unsupported optional fragment type for {name}")
+        return CuteTcgen05Config._validate_optional_fragment_value(
+            name,
+            fragment,
+            value,
+        )
 
     def _clamp_tcgen05_l2_swizzle_size_to_shape(
         self, config: dict[str, object]
     ) -> None:
-        """Snap ``tcgen05_l2_swizzle_size`` to ``<= ncluster_n``.
-
-        CuTe's ``PersistentTileSchedulerParams`` rewrites the problem
-        shape when ``swizzle_size > 1``; if ``swizzle_size > ncluster_n``
-        the rewritten shape has ``ncluster_n // swizzle_size = 0`` and
-        the layout construction crashes at runtime. Documented in
-        cute_plan.md §7.6.7.2.
-
-        ``ncluster_n`` is the cluster-grid count along the N axis:
-        ``(N + bn - 1) // bn // cluster_n``. The N hint comes from the
-        block-size spec; the per-config ``bn`` and ``cluster_n`` are
-        read from the in-flight config (the optional-fragment defaulting
-        above guarantees ``tcgen05_cluster_n`` is present whenever
-        ``cute_tcgen05_search_enabled`` is True). When the shape data
-        is unavailable (block_sizes not yet normalized to the matmul
-        layout) the clamp is a no-op — the validation surface still
-        rejects out-of-range values via the EnumFragment check upstream.
-        """
-        swizzle_value = config.get(TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY)
-        if swizzle_value is None or swizzle_value == 1:
-            return
-        if len(self.block_sizes) < 2:
-            return
-        block_sizes = config.get("block_sizes")
-        if not isinstance(block_sizes, list) or len(block_sizes) < 2:
-            return
-        bn = block_sizes[1]
-        if not isinstance(bn, int) or isinstance(bn, bool) or bn <= 0:
-            return
-        n_hint = self.block_sizes[1].size_hint
-        if n_hint <= 0:
-            return
-        cluster_n_raw = config.get("tcgen05_cluster_n", 1)
-        cluster_n = (
-            cluster_n_raw
-            if isinstance(cluster_n_raw, int) and not isinstance(cluster_n_raw, bool)
-            else 1
-        )
-        cluster_n = max(cluster_n, 1)
-        ncluster_n = max(((n_hint + bn - 1) // bn) // cluster_n, 1)
-        if not isinstance(swizzle_value, int) or isinstance(swizzle_value, bool):
-            return
-        if swizzle_value <= ncluster_n:
-            return
-        # Snap to the largest legal swizzle ``<= ncluster_n``. ``1`` is
-        # always legal (the no-swizzle path) so the clamp always lands
-        # on a valid value.
-        clamped = max(
-            (v for v in TCGEN05_LEGAL_L2_SWIZZLE_SIZES if v <= ncluster_n),
-            default=1,
-        )
-        config[TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY] = clamped
+        self._cute_tcgen05_config._clamp_l2_swizzle_size_to_shape(config)
 
     def unsupported_config_keys(self, config: Mapping[str, object]) -> list[str]:
         return sorted(
@@ -1963,314 +901,11 @@ class ConfigSpec:
             config.setdefault("atomic_indexing", self.atomic_indexing.default())
         for key, fragment in self.backend_tunable_fragments.items():
             config.setdefault(key, fragment.default())
-        tcgen05_optional_fragments = self._tcgen05_optional_fragments()
-        tcgen05_optional_search_fragments = self._tcgen05_optional_fragments(
-            for_search=True
-        )
-        if self.cute_tcgen05_search_enabled:
-            for key, fragment in tcgen05_optional_fragments.items():
-                if key in config:
-                    config[key] = self._validate_optional_fragment_value(
-                        key, fragment, config[key]
-                    )
-                else:
-                    # Fill missing keys from the search-view default so a
-                    # minimized config (Config.minimize strips values that
-                    # match default_config(), which is built from the
-                    # search view via _flat_fields) round-trips back to
-                    # the same effective config when re-normalized. The
-                    # validation view above is still used to validate
-                    # user-supplied values against the full legal range.
-                    config[key] = tcgen05_optional_search_fragments[key].default()
-            # Shape-aware clamp for ``tcgen05_l2_swizzle_size``. CuTe's
-            # tile-scheduler layout construction requires
-            # ``swizzle_size <= ncluster_n``; otherwise the rewritten
-            # ``problem_shape`` has ``ncluster_n // swizzle_size = 0``
-            # and the layout crashes at runtime (see cute_plan.md
-            # §7.6.7.2). The autotuner samples ``{1, 2, 4, 8}`` from
-            # ``_tcgen05_optional_fragments(for_search=True)`` regardless
-            # of shape, so without this clamp a small-N shape (e.g.
-            # ``N=1024 / bn=256 / cluster_n=1 → ncluster_n = 4``) would
-            # see ``swizzle_size=8`` sampled and crash mid-tuning. Snap
-            # to the largest legal value ``<= ncluster_n`` (with
-            # ``swizzle_size = 1`` always legal). Runs after the
-            # validation pass so explicit user values are preserved
-            # whenever they are legal for the active shape.
-            self._clamp_tcgen05_l2_swizzle_size_to_shape(config)
-        else:
-            for key in tcgen05_optional_fragments:
-                if key not in config:
-                    continue
-                if _fix_invalid:
-                    config.pop(key, None)
-                else:
-                    raise InvalidConfig(
-                        f"{key} is only supported for tcgen05-enabled CuTe matmul kernels"
-                    )
-
-        # Strategy data-model defaulting + cross-fragment validation
-        # is deferred until after ``pid_type`` has been defaulted and
-        # the cluster_m fixups have rewritten it. Reject the keys
-        # eagerly when ``cute_tcgen05_search_enabled`` is False so
-        # other-backend users get the loud error early; the
-        # search-enabled defaulting/validation runs below the
-        # ``pid_type`` canonicalization.
-        strategy_validation_fragments = self._tcgen05_strategy_validation_fragments()
-        if not self.cute_tcgen05_search_enabled:
-            for key in (
-                *strategy_validation_fragments.keys(),
-                *TCGEN05_LAYOUT_OVERRIDES_KEYS,
-            ):
-                if key not in config:
-                    continue
-                if _fix_invalid:
-                    config.pop(key, None)
-                else:
-                    raise InvalidConfig(
-                        f"{key} is only supported for tcgen05-enabled CuTe matmul kernels"
-                    )
-        if TCGEN05_C_ACQUIRE_PLACEMENT_CONFIG_KEY in config:
-            if not self.cute_tcgen05_search_enabled:
-                if _fix_invalid:
-                    config.pop(TCGEN05_C_ACQUIRE_PLACEMENT_CONFIG_KEY, None)
-                else:
-                    raise InvalidConfig(
-                        f"{TCGEN05_C_ACQUIRE_PLACEMENT_CONFIG_KEY} is only "
-                        "supported for tcgen05-enabled CuTe matmul kernels"
-                    )
-            elif (
-                config[TCGEN05_C_ACQUIRE_PLACEMENT_CONFIG_KEY]
-                not in TCGEN05_C_ACQUIRE_PLACEMENTS
-            ):
-                if _fix_invalid:
-                    config.pop(TCGEN05_C_ACQUIRE_PLACEMENT_CONFIG_KEY, None)
-                else:
-                    raise InvalidConfig(
-                        f"{TCGEN05_C_ACQUIRE_PLACEMENT_CONFIG_KEY} must be one "
-                        f"of {TCGEN05_C_ACQUIRE_PLACEMENTS!r}, got "
-                        f"{config[TCGEN05_C_ACQUIRE_PLACEMENT_CONFIG_KEY]!r}"
-                    )
-        if TCGEN05_ACC_WAIT_PLACEMENT_CONFIG_KEY in config:
-            if not self.cute_tcgen05_search_enabled:
-                if _fix_invalid:
-                    config.pop(TCGEN05_ACC_WAIT_PLACEMENT_CONFIG_KEY, None)
-                else:
-                    raise InvalidConfig(
-                        f"{TCGEN05_ACC_WAIT_PLACEMENT_CONFIG_KEY} is only "
-                        "supported for tcgen05-enabled CuTe matmul kernels"
-                    )
-            elif (
-                config[TCGEN05_ACC_WAIT_PLACEMENT_CONFIG_KEY]
-                not in TCGEN05_ACC_WAIT_PLACEMENTS
-            ):
-                if _fix_invalid:
-                    config.pop(TCGEN05_ACC_WAIT_PLACEMENT_CONFIG_KEY, None)
-                else:
-                    raise InvalidConfig(
-                        f"{TCGEN05_ACC_WAIT_PLACEMENT_CONFIG_KEY} must be one "
-                        f"of {TCGEN05_ACC_WAIT_PLACEMENTS!r}, got "
-                        f"{config[TCGEN05_ACC_WAIT_PLACEMENT_CONFIG_KEY]!r}"
-                    )
-        if TCGEN05_DIAGNOSTIC_INVALID_OUTPUT_CONFIG_KEY in config:
-            if not self.cute_tcgen05_search_enabled:
-                if _fix_invalid:
-                    config.pop(TCGEN05_DIAGNOSTIC_INVALID_OUTPUT_CONFIG_KEY, None)
-                else:
-                    raise InvalidConfig(
-                        f"{TCGEN05_DIAGNOSTIC_INVALID_OUTPUT_CONFIG_KEY} is only "
-                        "supported for tcgen05-enabled CuTe matmul kernels"
-                    )
-            elif not isinstance(
-                config[TCGEN05_DIAGNOSTIC_INVALID_OUTPUT_CONFIG_KEY],
-                bool,
-            ):
-                if _fix_invalid:
-                    config.pop(TCGEN05_DIAGNOSTIC_INVALID_OUTPUT_CONFIG_KEY, None)
-                else:
-                    raise InvalidConfig(
-                        f"{TCGEN05_DIAGNOSTIC_INVALID_OUTPUT_CONFIG_KEY} must be "
-                        "a boolean"
-                    )
-
-        def validate_tcgen05_diagnostic_mode(
-            key: str,
-            modes: tuple[str, ...],
-            normal_mode: str,
-        ) -> None:
-            if key not in config:
-                return
-            if not self.cute_tcgen05_search_enabled:
-                if _fix_invalid:
-                    config.pop(key, None)
-                else:
-                    raise InvalidConfig(
-                        f"{key} is only supported for tcgen05-enabled CuTe "
-                        "matmul kernels"
-                    )
-            elif config[key] not in modes:
-                if _fix_invalid:
-                    config.pop(key, None)
-                else:
-                    raise InvalidConfig(
-                        f"{key} must be one of {modes!r}, got {config[key]!r}"
-                    )
-            elif (
-                config[key] != normal_mode
-                and config.get(TCGEN05_DIAGNOSTIC_INVALID_OUTPUT_CONFIG_KEY) is not True
-            ):
-                if _fix_invalid:
-                    config.pop(key, None)
-                else:
-                    raise InvalidConfig(
-                        f"{key}={config[key]!r} changes output correctness; set "
-                        f"{TCGEN05_DIAGNOSTIC_INVALID_OUTPUT_CONFIG_KEY}=True "
-                        "only for diagnostic invalid-output runs"
-                    )
-
-        validate_tcgen05_diagnostic_mode(
-            TCGEN05_C_STORE_MODE_CONFIG_KEY,
-            TCGEN05_C_STORE_MODES,
-            TCGEN05_C_STORE_MODE_NORMAL,
-        )
-        validate_tcgen05_diagnostic_mode(
-            TCGEN05_ACC_PRODUCER_MODE_CONFIG_KEY,
-            TCGEN05_ACC_PRODUCER_MODES,
-            TCGEN05_ACC_PRODUCER_MODE_NORMAL,
-        )
-        validate_tcgen05_diagnostic_mode(
-            TCGEN05_ACC_PRODUCER_ADVANCE_MODE_CONFIG_KEY,
-            TCGEN05_ACC_PRODUCER_ADVANCE_MODES,
-            TCGEN05_ACC_PRODUCER_ADVANCE_MODE_NORMAL,
-        )
-        validate_tcgen05_diagnostic_mode(
-            TCGEN05_AB_PRODUCER_ACQUIRE_MODE_CONFIG_KEY,
-            TCGEN05_AB_PRODUCER_ACQUIRE_MODES,
-            TCGEN05_AB_PRODUCER_ACQUIRE_MODE_NORMAL,
-        )
-        validate_tcgen05_diagnostic_mode(
-            TCGEN05_AB_INITIAL_PRODUCER_ACQUIRE_MODE_CONFIG_KEY,
-            TCGEN05_AB_INITIAL_PRODUCER_ACQUIRE_MODES,
-            TCGEN05_AB_INITIAL_PRODUCER_ACQUIRE_MODE_NORMAL,
-        )
-        validate_tcgen05_diagnostic_mode(
-            TCGEN05_AB_PRODUCER_ADVANCE_MODE_CONFIG_KEY,
-            TCGEN05_AB_PRODUCER_ADVANCE_MODES,
-            TCGEN05_AB_PRODUCER_ADVANCE_MODE_NORMAL,
-        )
-        validate_tcgen05_diagnostic_mode(
-            TCGEN05_AB_CONSUMER_WAIT_MODE_CONFIG_KEY,
-            TCGEN05_AB_CONSUMER_WAIT_MODES,
-            TCGEN05_AB_CONSUMER_WAIT_MODE_NORMAL,
-        )
-        validate_tcgen05_diagnostic_mode(
-            TCGEN05_AB_CONSUMER_PHASE_MODE_CONFIG_KEY,
-            TCGEN05_AB_CONSUMER_PHASE_MODES,
-            TCGEN05_AB_CONSUMER_PHASE_MODE_NORMAL,
-        )
-        if TCGEN05_CUBIN_LINEINFO_CONFIG_KEY in config:
-            if not self.cute_tcgen05_search_enabled:
-                if _fix_invalid:
-                    config.pop(TCGEN05_CUBIN_LINEINFO_CONFIG_KEY, None)
-                else:
-                    raise InvalidConfig(
-                        f"{TCGEN05_CUBIN_LINEINFO_CONFIG_KEY} is only "
-                        "supported for tcgen05-enabled CuTe matmul kernels"
-                    )
-            elif not isinstance(config[TCGEN05_CUBIN_LINEINFO_CONFIG_KEY], bool):
-                if _fix_invalid:
-                    config.pop(TCGEN05_CUBIN_LINEINFO_CONFIG_KEY, None)
-                else:
-                    raise InvalidConfig(
-                        f"{TCGEN05_CUBIN_LINEINFO_CONFIG_KEY} must be a boolean"
-                    )
-        if TCGEN05_LARGE_BN_PROOF_CONFIG_KEY in config:
-            if not self.cute_tcgen05_search_enabled:
-                if _fix_invalid:
-                    config.pop(TCGEN05_LARGE_BN_PROOF_CONFIG_KEY, None)
-                else:
-                    raise InvalidConfig(
-                        f"{TCGEN05_LARGE_BN_PROOF_CONFIG_KEY} is only "
-                        "supported for tcgen05-enabled CuTe matmul kernels"
-                    )
-            elif not isinstance(config[TCGEN05_LARGE_BN_PROOF_CONFIG_KEY], bool):
-                if _fix_invalid:
-                    config.pop(TCGEN05_LARGE_BN_PROOF_CONFIG_KEY, None)
-                else:
-                    raise InvalidConfig(
-                        f"{TCGEN05_LARGE_BN_PROOF_CONFIG_KEY} must be a boolean"
-                    )
-            elif config[TCGEN05_LARGE_BN_PROOF_CONFIG_KEY] is True:
-                proof_envelope_matches = (
-                    tuple(cast("list[int]", config.get("block_sizes", [])))
-                    == TCGEN05_LARGE_BN_PROOF_BLOCK_SIZES
-                    and config.get("tcgen05_cluster_m", 1)
-                    == TCGEN05_LARGE_BN_PROOF_CLUSTER_M
-                    and config.get("pid_type", "flat")
-                    == TCGEN05_LARGE_BN_PROOF_PID_TYPE
-                    and all(
-                        config.get(key) == expected
-                        for key, expected in TCGEN05_LARGE_BN_PROOF_STAGE_CONFIGS
-                    )
-                )
-                if not proof_envelope_matches:
-                    if _fix_invalid:
-                        config.pop(TCGEN05_LARGE_BN_PROOF_CONFIG_KEY, None)
-                    else:
-                        raise InvalidConfig(
-                            f"{TCGEN05_LARGE_BN_PROOF_CONFIG_KEY}=True requires "
-                            f"block_sizes={list(TCGEN05_LARGE_BN_PROOF_BLOCK_SIZES)}, "
-                            f"tcgen05_cluster_m={TCGEN05_LARGE_BN_PROOF_CLUSTER_M}, "
-                            f"pid_type={TCGEN05_LARGE_BN_PROOF_PID_TYPE!r}, "
-                            "tcgen05_ab_stages=2, tcgen05_acc_stages=1, "
-                            "and tcgen05_c_stages=2"
-                        )
-        if TCGEN05_CLUSTER_M2_ONE_CTA_ROLE_LOCAL_CONFIG_KEY in config:
-            if not self.cute_tcgen05_search_enabled:
-                if _fix_invalid:
-                    config.pop(
-                        TCGEN05_CLUSTER_M2_ONE_CTA_ROLE_LOCAL_CONFIG_KEY,
-                        None,
-                    )
-                else:
-                    raise InvalidConfig(
-                        f"{TCGEN05_CLUSTER_M2_ONE_CTA_ROLE_LOCAL_CONFIG_KEY} is "
-                        "only supported for tcgen05-enabled CuTe matmul kernels"
-                    )
-            elif not isinstance(
-                config[TCGEN05_CLUSTER_M2_ONE_CTA_ROLE_LOCAL_CONFIG_KEY],
-                bool,
-            ):
-                if _fix_invalid:
-                    config.pop(
-                        TCGEN05_CLUSTER_M2_ONE_CTA_ROLE_LOCAL_CONFIG_KEY,
-                        None,
-                    )
-                else:
-                    raise InvalidConfig(
-                        f"{TCGEN05_CLUSTER_M2_ONE_CTA_ROLE_LOCAL_CONFIG_KEY} "
-                        "must be a boolean"
-                    )
-        if TCGEN05_EPILOGUE_LAYOUT_CONFIG_KEY in config:
-            if not self.cute_tcgen05_search_enabled:
-                if _fix_invalid:
-                    config.pop(TCGEN05_EPILOGUE_LAYOUT_CONFIG_KEY, None)
-                else:
-                    raise InvalidConfig(
-                        f"{TCGEN05_EPILOGUE_LAYOUT_CONFIG_KEY} is only "
-                        "supported for tcgen05-enabled CuTe matmul kernels"
-                    )
-            elif (
-                config[TCGEN05_EPILOGUE_LAYOUT_CONFIG_KEY]
-                not in TCGEN05_EPILOGUE_LAYOUTS
-            ):
-                if _fix_invalid:
-                    config.pop(TCGEN05_EPILOGUE_LAYOUT_CONFIG_KEY, None)
-                else:
-                    raise InvalidConfig(
-                        f"{TCGEN05_EPILOGUE_LAYOUT_CONFIG_KEY} must be one "
-                        f"of {TCGEN05_EPILOGUE_LAYOUTS!r}, got "
-                        f"{config[TCGEN05_EPILOGUE_LAYOUT_CONFIG_KEY]!r}"
-                    )
+        if self.backend_name == "cute":
+            self._cute_tcgen05_config.normalize_pre_pid_type(
+                config,
+                fix_invalid=_fix_invalid,
+            )
         if self.has_pallas_inner_loops:
             if self.has_symbolic_or_data_dependent_bounds:
                 # "unroll" uses Python range() which can't handle traced bounds.
@@ -2290,120 +925,13 @@ class ConfigSpec:
             else:
                 config["pid_type"] = VALID_PID_TYPES[0]
 
-        if _fix_invalid:
-            self._fix_tcgen05_cluster_m2_search_config(config)
-            self._fix_tcgen05_cluster_m1_persistent_search_config(config)
-            # Run after the cluster_m fixups so the SMEM budget check
-            # sees the post-projection ``cluster_m`` and ``block_sizes``.
-            self._fix_tcgen05_ab_stages_three_search_config(config)
-            # Pair WITH_SCHEDULER-only knobs (strategy /
-            # scheduler_warps / c_input_warps) and demote the
-            # ``ab=3 + c_input=1`` SMEM-over-budget combo. Run
-            # AFTER the ab_stages_three fixup so the final
-            # ``ab_stages`` is what the c_input_warps demotion
-            # check sees: if ab_stages got demoted from 3 to 2
-            # above, c_input=1 is once again legal under
-            # WITH_SCHEDULER and the demotion below does not
-            # fire.
-            self._fix_tcgen05_with_scheduler_search_config(config)
+        if _fix_invalid and self.backend_name == "cute":
+            self._cute_tcgen05_config.fix_search_config(config)
 
-        # Strategy data-model fragments (G2-A). Each per-fragment
-        # validator runs first (type/range checks); cross-fragment
-        # invariants run afterwards via
-        # ``_validate_tcgen05_strategy_invariants_in_normalize``. This
-        # block runs *after* the ``pid_type`` default is set and after
-        # ``_fix_tcgen05_cluster_m{1,2}_*_search_config`` may have
-        # rewritten ``pid_type`` — so the persistence-model default
-        # tracks the *final* ``pid_type`` and re-normalizing a
-        # normalized config is idempotent (the contradiction-with-
-        # pid_type invariant cannot trip on a config produced by
-        # this function).
-        if self.cute_tcgen05_search_enabled:
-            pid_type_for_default = config.get("pid_type")
-            # Validate every key in the *validation* surface (which
-            # includes ``tcgen05_persistence_model``); user-explicit
-            # values for any of these still go through fragment
-            # checks. The narrower *autotune* surface controls only
-            # which fields land in ``_flat_fields()``.
-            #
-            # ``_validate_optional_fragment_value`` raises
-            # ``InvalidConfig`` regardless of ``_fix_invalid`` —
-            # consistent with the equivalent
-            # ``tcgen05_optional_fragments`` block above. The
-            # autotuner only samples values from
-            # ``_tcgen05_strategy_autotune_fragments`` (which is the
-            # validation set minus ``tcgen05_persistence_model``), so
-            # fragment-level rejection is unreachable from autotune in
-            # practice — only an explicit user config can land here
-            # with a bad value, and we want that to fail loudly.
-            for key, fragment in strategy_validation_fragments.items():
-                if key in config:
-                    config[key] = self._validate_optional_fragment_value(
-                        key, fragment, config[key]
-                    )
-                else:
-                    # ``ROLE_LOCAL_MONOLITHIC`` and the pinned 6-warp
-                    # spec are the documented G2-A defaults
-                    # (cute_plan.md §6.1); the persistence-model
-                    # default is derived from ``pid_type`` so
-                    # serialized configs cannot encode contradictions.
-                    config[key] = self._tcgen05_strategy_field_default(
-                        key, pid_type=pid_type_for_default
-                    )
-            # Layout-overrides default to None and are not normalized
-            # via fragments (an explicit None value cannot pass
-            # IntegerFragment validation). Validate types only — the
-            # accept-set is "non-negative int or None" rather than
-            # ">0 or None" because ``smem_swizzle_*`` fields encode
-            # "no swizzle" as ``0`` (the codegen-side override accepts
-            # ``TCGEN05_LEGAL_SMEM_SWIZZLE_BYTES``). Atom-contract
-            # checks against the active tile shape run in lowering
-            # (``cute_mma._validate_tcgen05_smem_swizzle_override``),
-            # not here.
-            _swizzle_keys = {
-                TCGEN05_LAYOUT_OVERRIDES_SWIZZLE_A_KEY,
-                TCGEN05_LAYOUT_OVERRIDES_SWIZZLE_B_KEY,
-            }
-            for key in TCGEN05_LAYOUT_OVERRIDES_KEYS:
-                if key in config:
-                    value = config[key]
-                    if value is None:
-                        continue
-                    if key in _swizzle_keys:
-                        # ``smem_swizzle_*``: legal values are
-                        # ``TCGEN05_LEGAL_SMEM_SWIZZLE_BYTES`` (0/32/64/128).
-                        # The strategy invariants validator
-                        # (``validate_tcgen05_strategy_invariants``)
-                        # also enforces this; the duplicate here keeps
-                        # the user-facing error fired close to the
-                        # input rather than waiting for the cross-
-                        # fragment pass.
-                        if (
-                            type(value) is not int
-                            or value not in TCGEN05_LEGAL_SMEM_SWIZZLE_BYTES
-                        ):
-                            if _fix_invalid:
-                                config[key] = None
-                            else:
-                                raise InvalidConfig(
-                                    f"{key} must be one of "
-                                    f"{TCGEN05_LEGAL_SMEM_SWIZZLE_BYTES!r} "
-                                    f"or None, got {value!r}"
-                                )
-                    elif not (type(value) is int and value >= 0):
-                        if _fix_invalid:
-                            config[key] = None
-                        else:
-                            raise InvalidConfig(
-                                f"{key} must be a non-negative integer or None, "
-                                f"got {value!r}"
-                            )
-                else:
-                    config[key] = None
-            # Cross-fragment invariants. Run after every field has been
-            # filled in so the validator sees the full picture.
-            self._validate_tcgen05_strategy_invariants_in_normalize(
-                config, _fix_invalid=_fix_invalid
+        if self.backend_name == "cute":
+            self._cute_tcgen05_config.normalize_strategy(
+                config,
+                fix_invalid=_fix_invalid,
             )
 
         if self.supports_config_key("num_sm_multiplier"):
@@ -2670,21 +1198,7 @@ class ConfigSpec:
         }
         if self.backend_name == "cute":
             if self.cute_tcgen05_search_enabled:
-                fields["l2_groupings"] = self.l2_groupings
-                fields.update(self._tcgen05_optional_fragments(for_search=True))
-                # Strategy data-model knobs (G2-A). The autotune
-                # surface is narrowed to the implemented set so the
-                # autotuner samples only kernel shapes that codegen
-                # can produce. ``tcgen05_persistence_model`` is
-                # excluded — it is fully derived from ``pid_type``
-                # and including it would break flat round-trip
-                # idempotence (see
-                # ``_tcgen05_strategy_autotune_fragments`` docstring).
-                fields.update(self._tcgen05_strategy_autotune_fragments())
-                if self.supports_config_key("pid_type"):
-                    fields["pid_type"] = EnumFragment(self.allowed_pid_types)
-                if self.supports_config_key("indexing") and self.indexing.length > 0:
-                    fields["indexing"] = self.indexing
+                fields.update(self._cute_tcgen05_config.flat_fields())
             elif self.supports_config_key("num_threads"):
                 fields["num_threads"] = self.num_threads
                 # Universal pid emission honors ``loop_orders`` (the
@@ -2759,8 +1273,6 @@ class ConfigSpec:
             )
         if self.supports_config_key("load_eviction_policies"):
             fields["load_eviction_policies"] = self.load_eviction_policies
-        if self.cute_tcgen05_search_enabled:
-            fields.update(self._tcgen05_optional_fragments(for_search=True))
         if self.supports_config_key("num_threads"):
             fields["num_threads"] = self.num_threads
         if is_tileir:
