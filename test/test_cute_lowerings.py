@@ -125,6 +125,8 @@ from helion._compiler.cute.tcgen05_constants import (
 from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_ACC_WAIT_PLACEMENT_SUBTILE_LOOP,
 )
+from helion._compiler.cute.tcgen05_constants import TCGEN05_AUX_LOAD_MODE_CONFIG_KEY
+from helion._compiler.cute.tcgen05_constants import TCGEN05_AUX_LOAD_MODE_TMA
 from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_C_ACQUIRE_PLACEMENT_CONFIG_KEY,
 )
@@ -12225,6 +12227,15 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
         self.assertIn("tcgen05_aux_pipeline", code)
         self.assertIn("tcgen05_aux_smem_layout_0", code)
         self.assertNotIn("tcgen05_aux_smem_layout_1", code)
+        self.assertIn(
+            "tcgen05_aux_pipeline = cutlass.pipeline.PipelineAsync.create(",
+            code,
+        )
+        self.assertNotIn(
+            "tcgen05_aux_pipeline = cutlass.pipeline.PipelineTmaAsync.create(",
+            code,
+        )
+        self.assertNotIn("'kind': 'tcgen05_aux_tma'", code)
         self.assertIn(".partition_S(tcgen05_aux_smem_0)", code)
         self.assertIn("tcgen05_tTR_gAux_grouped_0", code)
         self.assertIn("tcgen05_tTR_gAux_grouped_1", code)
@@ -12315,6 +12326,321 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
         self.assertNotIn("virtual_pid =", edge_c_input_src)
         self.assertNotIn("tile_offset_0 =", edge_c_input_src)
         self.assertNotIn("tile_offset_1 =", edge_c_input_src)
+
+    def test_aux_edge_target_shape_tma_load_stages_residual_only(self) -> None:
+        """Opt-in aux TMA load stages the exact-shape residual only on full tiles."""
+
+        kernel = self._bias_residual_gelu_kernel()
+        args = (
+            torch.empty([5000, 5000], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([5000, 5000], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([5000], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([5000, 5000], device=DEVICE, dtype=torch.bfloat16),
+        )
+        with patch_cute_mma_support():
+            bound = kernel.bind(args)
+            cfg = _make_tcgen05_persistent_config(
+                block_sizes=[256, 256, 128],
+                l2_groupings=[TCGEN05_TWO_CTA_EDGE_K_TAIL_L2_GROUPING],
+                pid_type="persistent_interleaved",
+                num_warps=4,
+                tcgen05_cluster_m=2,
+                tcgen05_ab_stages=2,
+                tcgen05_acc_stages=1,
+                tcgen05_c_stages=TCGEN05_TWO_CTA_EDGE_K_TAIL_C_STAGES,
+                tcgen05_l2_swizzle_size=TCGEN05_TWO_CTA_EDGE_K_TAIL_L2_SWIZZLE_SIZE,
+                tcgen05_acc_wait_placement=TCGEN05_ACC_WAIT_PLACEMENT_BEFORE_SUBTILE_LOOP,
+                tcgen05_c_acquire_placement=TCGEN05_C_ACQUIRE_PLACEMENT_FIRST_IN_LOOP,
+                tcgen05_strategy="role_local_with_scheduler",
+                tcgen05_warp_spec_scheduler_warps=1,
+                tcgen05_warp_spec_c_input_warps=1,
+                **{TCGEN05_AUX_LOAD_MODE_CONFIG_KEY: TCGEN05_AUX_LOAD_MODE_TMA},
+                indexing=["tensor_descriptor"] * bound.env.config_spec.indexing.length,
+            )
+            code = bound.to_triton_code(cfg)
+
+        self.assertIn("'kind': 'tcgen05_aux_tma'", code)
+        self.assertIn("tcgen05_aux_tma_atom_0", code)
+        self.assertNotIn("tcgen05_aux_tma_atom_1", code)
+        self.assertIn("tcgen05_aux_smem_layout_0", code)
+        self.assertNotIn("tcgen05_aux_smem_layout_1", code)
+        self.assertIn(
+            "tcgen05_aux_pipeline = cutlass.pipeline.PipelineTmaAsync.create(",
+            code,
+        )
+        self.assertNotIn(
+            "tcgen05_aux_pipeline = cutlass.pipeline.PipelineAsync.create(",
+            code,
+        )
+        self.assertIn(
+            "tcgen05_aux_pipeline_producer_group = "
+            "cutlass.pipeline.CooperativeGroup(cutlass.pipeline.Agent.Thread)",
+            code,
+        )
+        self.assertIn("cute.nvgpu.cpasync.tma_partition(tcgen05_aux_tma_atom_0", code)
+        self.assertIn("cute.copy(tcgen05_aux_tma_atom_0", code)
+        self.assertIn("tcgen05_aux_pipeline.producer_get_barrier", code)
+        self.assertIn("tcgen05_aux_pipeline.producer_tail", code)
+        self.assertNotIn("tcgen05_aux_tiled_copy_0 = cute.make_tiled_copy_tv", code)
+        self.assertIn("tcgen05_tTR_gAux_grouped_0", code)
+        self.assertIn("tcgen05_tTR_gAux_grouped_1", code)
+
+        full_c_input_loop = code.index("while tcgen05_c_input_warp_valid:")
+        edge_c_input_loop = code.index("while tcgen05_c_input_warp_valid_1:")
+        self.assertLess(full_c_input_loop, edge_c_input_loop)
+        code_ast = ast.parse(code)
+
+        def single_while_src(test: str) -> str:
+            matches = [
+                ast.unparse(node)
+                for node in ast.walk(code_ast)
+                if isinstance(node, ast.While) and ast.unparse(node.test) == test
+            ]
+            self.assertEqual(len(matches), 1, code)
+            return matches[0]
+
+        full_c_input_src = single_while_src("tcgen05_c_input_warp_valid")
+        edge_c_input_src = single_while_src("tcgen05_c_input_warp_valid_1")
+        self.assertIn("tcgen05_aux_pipeline.producer_acquire", full_c_input_src)
+        self.assertIn("cute.copy(tcgen05_aux_tma_atom_0", full_c_input_src)
+        self.assertIn("tcgen05_aux_pipeline.producer_get_barrier", full_c_input_src)
+        self.assertNotIn("tcgen05_aux_pipeline.producer_acquire", edge_c_input_src)
+        self.assertNotIn("cute.copy(tcgen05_aux_tma_atom_0", edge_c_input_src)
+
+    def test_aux_tma_load_rejects_broadcast_only_aux(self) -> None:
+        """Explicit aux TMA rejects configs with no exact-shape aux tensor."""
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_bias(
+            x: torch.Tensor, y: torch.Tensor, bias: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = (acc + bias[tile_n]).to(x.dtype)
+            return out
+
+        args = (
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([4096], device=DEVICE, dtype=torch.bfloat16),
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_bias.bind(args)
+            cfg = _make_tcgen05_persistent_config(
+                block_sizes=[256, 256, 128],
+                l2_groupings=[1],
+                pid_type="persistent_interleaved",
+                num_warps=4,
+                tcgen05_cluster_m=2,
+                tcgen05_ab_stages=2,
+                tcgen05_acc_stages=2,
+                tcgen05_c_stages=2,
+                tcgen05_strategy="role_local_with_scheduler",
+                tcgen05_warp_spec_scheduler_warps=1,
+                tcgen05_warp_spec_c_input_warps=1,
+                **{TCGEN05_AUX_LOAD_MODE_CONFIG_KEY: TCGEN05_AUX_LOAD_MODE_TMA},
+                indexing=["tensor_descriptor"] * bound.env.config_spec.indexing.length,
+            )
+            with self.assertRaises(exc.BackendUnsupported) as cm:
+                bound.to_triton_code(cfg)
+        msg = str(cm.exception)
+        self.assertIn(TCGEN05_AUX_LOAD_MODE_CONFIG_KEY, msg)
+        self.assertIn("exact-shape rank-2 auxiliary tensor", msg)
+
+    def test_aux_tma_load_rejects_partial_tiles_without_edge_split(self) -> None:
+        """Bulk aux TMA is not valid on partial tiles without SIMT-edge split."""
+
+        from helion._compiler.cute import cute_mma as cute_mma_module
+        from helion._compiler.cute.device_state import (
+            CuteTcgen05MatmulPlan as _CuteTcgen05MatmulPlan,
+        )
+
+        kernel = self._bias_residual_gelu_kernel()
+        args = (
+            torch.empty([5000, 5000], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([5000, 5000], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([5000], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([5000, 5000], device=DEVICE, dtype=torch.bfloat16),
+        )
+
+        def force_unsafe_aux_tma_plan(*p_args, **p_kwargs):  # type: ignore[no-untyped-def]
+            # Simulate the autoreview hazard: explicit aux TMA on a partial
+            # output shape without the full-tile/edge split that routes edge
+            # tiles through predicated SIMT aux loads.
+            p_kwargs["tma_store_full_tiles_only"] = False
+            return _CuteTcgen05MatmulPlan(*p_args, **p_kwargs)
+
+        with patch_cute_mma_support():
+            bound = kernel.bind(args)
+            cfg = _make_tcgen05_persistent_config(
+                block_sizes=[256, 256, 128],
+                l2_groupings=[4],
+                pid_type="persistent_interleaved",
+                num_warps=4,
+                tcgen05_cluster_m=2,
+                tcgen05_ab_stages=2,
+                tcgen05_acc_stages=1,
+                tcgen05_c_stages=2,
+                tcgen05_strategy="role_local_with_scheduler",
+                tcgen05_warp_spec_scheduler_warps=1,
+                tcgen05_warp_spec_c_input_warps=1,
+                **{TCGEN05_AUX_LOAD_MODE_CONFIG_KEY: TCGEN05_AUX_LOAD_MODE_TMA},
+                indexing=["tensor_descriptor"] * bound.env.config_spec.indexing.length,
+            )
+            with (
+                patch.object(
+                    cute_mma_module,
+                    "CuteTcgen05MatmulPlan",
+                    force_unsafe_aux_tma_plan,
+                ),
+                self.assertRaises(exc.BackendUnsupported) as cm,
+            ):
+                bound.to_triton_code(cfg)
+        msg = str(cm.exception)
+        self.assertIn(TCGEN05_AUX_LOAD_MODE_CONFIG_KEY, msg)
+        self.assertIn("partial output tiles", msg)
+        self.assertIn("full-tile/edge fallback split", msg)
+
+    def test_aux_tma_load_rejects_c_input_warp_zero(self) -> None:
+        """Explicit aux TMA must not silently no-op when the producer gate is shut."""
+
+        kernel = self._residual_kernel()
+        args = (
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+        )
+        with patch_cute_mma_support():
+            bound = kernel.bind(args)
+            cfg = _make_tcgen05_persistent_config(
+                block_sizes=[256, 256, 128],
+                l2_groupings=[1],
+                pid_type="persistent_interleaved",
+                num_warps=4,
+                tcgen05_cluster_m=2,
+                tcgen05_ab_stages=2,
+                tcgen05_acc_stages=2,
+                tcgen05_c_stages=2,
+                tcgen05_strategy="role_local_with_scheduler",
+                tcgen05_warp_spec_scheduler_warps=1,
+                tcgen05_warp_spec_c_input_warps=0,
+                **{TCGEN05_AUX_LOAD_MODE_CONFIG_KEY: TCGEN05_AUX_LOAD_MODE_TMA},
+                indexing=["tensor_descriptor"] * bound.env.config_spec.indexing.length,
+            )
+            with self.assertRaises(exc.BackendUnsupported) as cm:
+                bound.to_triton_code(cfg)
+        msg = str(cm.exception)
+        self.assertIn(TCGEN05_AUX_LOAD_MODE_CONFIG_KEY, msg)
+        self.assertIn("productive C-input warp", msg)
+
+    def test_aux_tma_load_rejects_multi_store_fanout(self) -> None:
+        """Explicit aux TMA rejects multi-store fan-out instead of falling back."""
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_residual_fanout(
+            x: torch.Tensor,
+            y: torch.Tensor,
+            residual_a: torch.Tensor,
+            residual_b: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            m, k = x.size()
+            _, n = y.size()
+            out_a = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            out_b = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out_a[tile_m, tile_n] = (acc + residual_a[tile_m, tile_n]).to(x.dtype)
+                out_b[tile_m, tile_n] = (acc + residual_b[tile_m, tile_n]).to(x.dtype)
+            return out_a, out_b
+
+        args = (
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+        )
+        config = self._canonical_c_input_config()
+        config.config[TCGEN05_AUX_LOAD_MODE_CONFIG_KEY] = TCGEN05_AUX_LOAD_MODE_TMA
+        with patch_cute_mma_support():
+            bound = cute_matmul_residual_fanout.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            with self.assertRaises(exc.BackendUnsupported) as cm:
+                bound.to_triton_code(config)
+        msg = str(cm.exception)
+        self.assertIn(TCGEN05_AUX_LOAD_MODE_CONFIG_KEY, msg)
+        self.assertIn("single-store fan-out", msg)
+
+    def test_aux_tma_load_rejects_aux_dtype_mismatch(self) -> None:
+        """Explicit aux TMA requires the staged aux dtype to match D."""
+
+        kernel = self._residual_kernel()
+        args = (
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.float16),
+        )
+        config = self._canonical_c_input_config()
+        config.config[TCGEN05_AUX_LOAD_MODE_CONFIG_KEY] = TCGEN05_AUX_LOAD_MODE_TMA
+        with patch_cute_mma_support():
+            bound = kernel.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            with self.assertRaises(exc.BackendUnsupported) as cm:
+                bound.to_triton_code(config)
+        msg = str(cm.exception)
+        self.assertIn(TCGEN05_AUX_LOAD_MODE_CONFIG_KEY, msg)
+        self.assertIn("dtype to match", msg)
+
+    def test_aux_tma_load_runtime_correctness(self) -> None:
+        """The opt-in aux TMA producer/consumer path compiles and runs."""
+
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+
+        kernel = self._bias_residual_gelu_kernel()
+        torch.manual_seed(0)
+        args = (
+            torch.randn(512, 128, device=DEVICE, dtype=torch.bfloat16),
+            torch.randn(128, 512, device=DEVICE, dtype=torch.bfloat16),
+            torch.randn(512, device=DEVICE, dtype=torch.bfloat16),
+            torch.randn(512, 512, device=DEVICE, dtype=torch.bfloat16),
+        )
+        with patch_cute_mma_support():
+            bound = kernel.bind(args)
+            cfg = _make_tcgen05_persistent_config(
+                block_sizes=[256, 256, 128],
+                l2_groupings=[1],
+                pid_type="persistent_interleaved",
+                num_warps=4,
+                tcgen05_cluster_m=2,
+                tcgen05_ab_stages=2,
+                tcgen05_acc_stages=1,
+                tcgen05_c_stages=2,
+                tcgen05_strategy="role_local_with_scheduler",
+                tcgen05_warp_spec_scheduler_warps=1,
+                tcgen05_warp_spec_c_input_warps=1,
+                **{TCGEN05_AUX_LOAD_MODE_CONFIG_KEY: TCGEN05_AUX_LOAD_MODE_TMA},
+                indexing=["tensor_descriptor"] * bound.env.config_spec.indexing.length,
+            )
+            bound.set_config(cfg)
+            code = bound.to_triton_code(cfg)
+            self.assertIn("cutlass.pipeline.PipelineTmaAsync.create", code)
+            self.assertIn("cute.copy(tcgen05_aux_tma_atom_0", code)
+            out = bound(*args)
+
+        expected = torch.nn.functional.gelu(
+            1.25 * (args[0] @ args[1]).float() + 0.5 * args[3] + args[2],
+            approximate="tanh",
+        ).to(args[0].dtype)
+        torch.testing.assert_close(out, expected, atol=3e-1, rtol=2e-2)
 
     def test_aux_edge_target_shape_clc_keeps_single_scheduler_stream(self) -> None:
         """CLC scheduler path keeps hybrid stores on the unsplit stream."""
@@ -14225,6 +14551,35 @@ class TestCuteDslCompat(unittest.TestCase):
         self.assertNotIn("block_idx_in_cluster", src)
         self.assertNotIn("if True", src)
         self.assertIn("ab_pipeline.producer_acquire(ab_state)", src)
+
+    def test_tma_async_tail_uses_upstream_when_advance_safe(self) -> None:
+        from helion._compiler.cute import cutedsl_compat
+
+        with patch.object(
+            cutedsl_compat, "cutedsl_has_opresultlist_fix", return_value=True
+        ):
+            self.assertEqual(
+                cutedsl_compat.emit_producer_tail_tma_async(
+                    "aux_pipeline", "aux_state", num_stages=2
+                ),
+                "aux_pipeline.producer_tail(aux_state)",
+            )
+
+    def test_tma_async_tail_inlines_when_advance_workaround_needed(self) -> None:
+        from helion._compiler.cute import cutedsl_compat
+
+        with patch.object(
+            cutedsl_compat, "cutedsl_has_opresultlist_fix", return_value=False
+        ):
+            src = cutedsl_compat.emit_producer_tail_tma_async(
+                "aux_pipeline", "aux_state", num_stages=2
+            )
+
+        parsed = ast.parse(src)
+        self.assertEqual(len(parsed.body), 1, src)
+        self.assertNotIn("producer_tail", src)
+        self.assertIn("aux_state._count = aux_state._count + cutlass.Int32(1)", src)
+        self.assertIn("aux_pipeline.producer_acquire(aux_state)", src)
 
     def test_tma_umma_tail_can_skip_state_advances(self) -> None:
         from helion._compiler.cute import cutedsl_compat

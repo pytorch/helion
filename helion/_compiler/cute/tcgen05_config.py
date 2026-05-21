@@ -64,6 +64,8 @@ from .tcgen05_constants import TCGEN05_ACC_PRODUCER_MODE_NORMAL
 from .tcgen05_constants import TCGEN05_ACC_PRODUCER_MODES
 from .tcgen05_constants import TCGEN05_ACC_WAIT_PLACEMENT_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_ACC_WAIT_PLACEMENTS
+from .tcgen05_constants import TCGEN05_AUX_LOAD_MODE_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_AUX_LOAD_MODES
 from .tcgen05_constants import TCGEN05_C_ACQUIRE_PLACEMENT_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_C_ACQUIRE_PLACEMENTS
 from .tcgen05_constants import TCGEN05_C_STORE_MODE_CONFIG_KEY
@@ -139,6 +141,7 @@ CUTE_TCGEN05_DIAGNOSTIC_CONFIG_KEYS: frozenset[str] = frozenset(
         TCGEN05_AB_PRODUCER_ADVANCE_MODE_CONFIG_KEY,
         TCGEN05_ACC_PRODUCER_ADVANCE_MODE_CONFIG_KEY,
         TCGEN05_ACC_PRODUCER_MODE_CONFIG_KEY,
+        TCGEN05_AUX_LOAD_MODE_CONFIG_KEY,
         TCGEN05_CLUSTER_M2_ONE_CTA_ROLE_LOCAL_CONFIG_KEY,
         TCGEN05_CUBIN_LINEINFO_CONFIG_KEY,
         TCGEN05_DIAGNOSTIC_INVALID_OUTPUT_CONFIG_KEY,
@@ -907,6 +910,12 @@ class CuteTcgen05Config:
             config,
             TCGEN05_ACC_WAIT_PLACEMENT_CONFIG_KEY,
             TCGEN05_ACC_WAIT_PLACEMENTS,
+            fix_invalid=fix_invalid,
+        )
+        self._validate_enum_config(
+            config,
+            TCGEN05_AUX_LOAD_MODE_CONFIG_KEY,
+            TCGEN05_AUX_LOAD_MODES,
             fix_invalid=fix_invalid,
         )
         self._validate_bool_config(

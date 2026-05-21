@@ -216,6 +216,33 @@ def emit_producer_tail_tma_umma(
     return "\n".join(body_lines)
 
 
+def emit_producer_tail_tma_async(
+    pipeline_expr: str,
+    state_expr: str,
+    *,
+    num_stages: int,
+    indent: str = "",
+) -> str:
+    """Emit code equivalent to ``<pipeline>.producer_tail(<state>)`` for a
+    ``PipelineTmaAsync`` G2S load pipeline.
+
+    Like the UMMA-facing pipelines, cutedsl's tail implementation advances the
+    producer state internally before the final empty-barrier acquire. On buggy
+    PyPI builds those nested ``state.advance()`` calls hit the OpResultList
+    lowering bug, so inline the same state updates unless the installed DSL has
+    the fix.
+    """
+    if cutedsl_has_opresultlist_fix():
+        return f"{indent}{pipeline_expr}.producer_tail({state_expr})"
+
+    inner = indent + "    "
+    body_lines: list[str] = [f"{indent}if True:"]
+    for _ in range(num_stages - 1):
+        body_lines.extend(_advance_lines(state_expr, inner))
+    body_lines.append(f"{inner}{pipeline_expr}.producer_acquire({state_expr})")
+    return "\n".join(body_lines)
+
+
 def emit_producer_tail_umma_async(
     pipeline_expr: str,
     state_expr: str,

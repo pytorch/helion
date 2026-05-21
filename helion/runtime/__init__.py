@@ -1508,6 +1508,56 @@ def _append_cute_wrapper_plan(
         assert isinstance(value, int)
         return value
 
+    def append_tcgen05_epilogue_tma_wrapper(
+        *,
+        tensor_idx: int,
+        bm: int,
+        bn: int,
+        stage_count: int,
+        dtype: str,
+        kernel_args: list[str],
+        copy_op: str,
+    ) -> None:
+        assert len(kernel_args) == 2
+        tma_atom, tma_tensor = kernel_args
+        epi_tile = f"{tma_atom}_epi_tile"
+        smem_layout = f"{tma_atom}_smem_layout"
+        cta_v_layout = f"{tma_atom}_cta_v_layout"
+        # Keep these layout arguments in sync with the device-side
+        # ``make_smem_layout_epi`` calls; the wrapper's TMA atom and the kernel's
+        # SMEM staging must slice the same epilogue tile shape.
+        body.extend(
+            (
+                (
+                    f"    {epi_tile} = "
+                    "cutlass.utils.blackwell_helpers.compute_epilogue_tile_shape("
+                    f"({bm}, {bn}), False, "
+                    "cutlass.utils.layout.LayoutEnum.ROW_MAJOR, "
+                    f"{dtype}, "
+                    "layout_c=cutlass.utils.layout.LayoutEnum.ROW_MAJOR, "
+                    f"elem_ty_c={dtype})"
+                ),
+                (
+                    f"    {smem_layout} = cutlass.utils.blackwell_helpers."
+                    "make_smem_layout_epi("
+                    f"{dtype}, cutlass.utils.layout.LayoutEnum.ROW_MAJOR, "
+                    f"{epi_tile}, {stage_count})"
+                ),
+                (
+                    f"    {cta_v_layout} = cute.composition("
+                    f"cute.make_identity_layout(arg{tensor_idx}.shape), {epi_tile})"
+                ),
+                (
+                    f"    {tma_atom}, {tma_tensor} = "
+                    "cute.nvgpu.cpasync.make_tiled_tma_atom("
+                    f"{copy_op}, "
+                    f"arg{tensor_idx}, cute.slice_({smem_layout}, (None, None, 0)), "
+                    f"{cta_v_layout})"
+                ),
+            )
+        )
+        call_args.extend(kernel_args)
+
     kind = plan["kind"]
     if kind == "tcgen05_d_tma":
         d_idx = plan_int("d_idx")
@@ -1516,48 +1566,32 @@ def _append_cute_wrapper_plan(
         c_stage_count = plan_int("c_stage_count")
         output_dtype = str(plan["output_dtype"])
         kernel_args = [str(arg) for arg in cast("list[object]", plan["kernel_args"])]
-        assert len(kernel_args) == 2
-        tma_atom_d, tma_tensor_d = kernel_args
-        epi_tile = f"{tma_atom_d}_epi_tile"
-        smem_layout = f"{tma_atom_d}_smem_layout"
-        cta_v_layout = f"{tma_atom_d}_cta_v_layout"
-        # Keep these layout arguments in sync with the device-side
-        # `make_smem_layout_epi` call in `_codegen_cute_store_tcgen05_tile`;
-        # the TMA atom slices the same SMEM stage that the kernel allocates.
-        # `elem_ty_c=` matches the D-output dtype so the wrapper's TMA atom
-        # and the kernel's SMEM staging pick the same `tile_n` from
-        # `compute_epilogue_tile_shape`.
-        body.extend(
-            (
-                (
-                    f"    {epi_tile} = "
-                    "cutlass.utils.blackwell_helpers.compute_epilogue_tile_shape("
-                    f"({bm}, {bn}), False, "
-                    "cutlass.utils.layout.LayoutEnum.ROW_MAJOR, "
-                    f"{output_dtype}, "
-                    "layout_c=cutlass.utils.layout.LayoutEnum.ROW_MAJOR, "
-                    f"elem_ty_c={output_dtype})"
-                ),
-                (
-                    f"    {smem_layout} = cutlass.utils.blackwell_helpers."
-                    "make_smem_layout_epi("
-                    f"{output_dtype}, cutlass.utils.layout.LayoutEnum.ROW_MAJOR, "
-                    f"{epi_tile}, {c_stage_count})"
-                ),
-                (
-                    f"    {cta_v_layout} = cute.composition("
-                    f"cute.make_identity_layout(arg{d_idx}.shape), {epi_tile})"
-                ),
-                (
-                    f"    {tma_atom_d}, {tma_tensor_d} = "
-                    "cute.nvgpu.cpasync.make_tiled_tma_atom("
-                    "cute.nvgpu.cpasync.CopyBulkTensorTileS2GOp(), "
-                    f"arg{d_idx}, cute.slice_({smem_layout}, (None, None, 0)), "
-                    f"{cta_v_layout})"
-                ),
-            )
+        append_tcgen05_epilogue_tma_wrapper(
+            tensor_idx=d_idx,
+            bm=bm,
+            bn=bn,
+            stage_count=c_stage_count,
+            dtype=output_dtype,
+            kernel_args=kernel_args,
+            copy_op="cute.nvgpu.cpasync.CopyBulkTensorTileS2GOp()",
         )
-        call_args.extend(kernel_args)
+        return
+    if kind == "tcgen05_aux_tma":
+        c_idx = plan_int("c_idx")
+        bm = plan_int("bm")
+        bn = plan_int("bn")
+        stage_count = plan_int("stage_count")
+        input_dtype = str(plan["input_dtype"])
+        kernel_args = [str(arg) for arg in cast("list[object]", plan["kernel_args"])]
+        append_tcgen05_epilogue_tma_wrapper(
+            tensor_idx=c_idx,
+            bm=bm,
+            bn=bn,
+            stage_count=stage_count,
+            dtype=input_dtype,
+            kernel_args=kernel_args,
+            copy_op="cute.nvgpu.cpasync.CopyBulkTensorTileG2SOp()",
+        )
         return
     if kind != "tcgen05_ab_tma":
         raise exc.BackendUnsupported("cute", f"wrapper plan kind: {kind}")

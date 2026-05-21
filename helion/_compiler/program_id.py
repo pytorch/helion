@@ -16,6 +16,7 @@ from .ast_extension import expr_from_string
 from .ast_extension import statement_from_string
 from .compile_environment import CompileEnvironment
 from .cute.cutedsl_compat import emit_pipeline_advance
+from .cute.cutedsl_compat import emit_producer_tail_tma_async
 from .cute.strategies import TCGEN05_L2_SWIZZLE_SIZE_DEFAULT
 from .cute.strategies import l2_swizzle_size_from_config
 from .cute.tcgen05_constants import TCGEN05_SCHED_CONSUMER_WAIT_MODE_CONFIG_KEY
@@ -3555,10 +3556,12 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             "C-input role-local while: aux pipeline plan must have one "
             "ring per staged matmul-plan aux descriptor"
         )
+        aux_use_tma_load = aux_pipeline_plan.use_tma_load
+        aux_requires_full_tile = plan.tma_store_full_tiles_only or aux_use_tma_load
 
         valid_var = device_function.new_var("tcgen05_c_input_warp_valid")
 
-        if plan.tma_store_full_tiles_only and tile_phase == "edge":
+        if aux_requires_full_tile and tile_phase == "edge":
             # Edge epilogues use the SIMT direct-GMEM aux path. The C-input
             # warp still participates in the scheduler pipeline so the
             # producer's consumer-arrival count remains balanced, but each
@@ -3807,6 +3810,12 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         aux_producer_state_name = aux_pipeline_plan.producer_state
         aux_rings = aux_pipeline_plan.rings
         aux_epi_tile_var = aux_pipeline_plan.epi_tile_var
+        aux_stage_count = aux_pipeline_plan.stage_count
+        aux_tma_barrier_var = (
+            device_function.new_var("tcgen05_aux_tma_barrier")
+            if aux_use_tma_load
+            else None
+        )
 
         aux_full_tile_var = device_function.new_var("tcgen05_aux_full_tile")
         aux_shape = c_input_aux_tensor_descriptors[0].host_tensor_val.shape
@@ -3863,6 +3872,15 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             dtype_bits = desc.host_tensor_val.dtype.itemsize * 8
             copy_bits = 128
             num_copy_elems = max(1, copy_bits // dtype_bits)
+            tma_atom = ring.tma_atom
+            tma_tensor = ring.tma_tensor
+            if aux_use_tma_load:
+                assert tma_atom is not None
+                assert tma_tensor is not None
+                assert aux_tma_barrier_var is not None
+            else:
+                assert tma_atom is None
+                assert tma_tensor is None
             gmem_aux_view_var = device_function.new_var(
                 f"tcgen05_aux_gmem_view_{desc_idx}"
             )
@@ -3887,6 +3905,8 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             )
             gmem_part_var = device_function.new_var(f"tcgen05_aux_gmem_part_{desc_idx}")
             smem_part_var = device_function.new_var(f"tcgen05_aux_smem_part_{desc_idx}")
+            tma_smem_part_var = ""
+            tma_gmem_part_var = ""
             setup: list[ast.stmt] = []
             # Build the source 2-D GMEM tensor. Exact-shape rank-2
             # aux passes through ``aux_tensor`` directly; rank-1
@@ -3899,10 +3919,15 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             # step). For non-2cta the per-CTA tile shape collapses
             # to the full ``(bm, bn)``.
             if desc.broadcast_axis is None:
+                if aux_use_tma_load:
+                    gmem_source_var = tma_tensor
+                    assert gmem_source_var is not None
+                else:
+                    gmem_source_var = aux_tensor_name
                 setup.extend(
                     [
                         statement_from_string(
-                            f"{gmem_aux_view_var} = {aux_tensor_name}"
+                            f"{gmem_aux_view_var} = {gmem_source_var}"
                         ),
                         statement_from_string(
                             f"{gmem_aux_tile_var} = cute.local_tile("
@@ -3956,33 +3981,52 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                     ),
                 ]
             )
-            # Cooperative-copy ``TiledCopy`` for the C-input warp's
-            # 32 lanes. The atom uses ``CopyUniversalOp`` (regular
-            # SIMT ld+st): cp.async would impose a 128-bit
-            # source-iterator alignment check that the layout-
-            # implied stride alignment cannot satisfy at IR-build
-            # time (the host pointer is 16-byte aligned, but the
-            # minimum row stride is 1 element = 16 bits for bf16).
-            # ``CopyUniversalOp`` lowers to a SIMT ld/st pair whose
-            # vectorization is driven at runtime by the host
-            # pointer's actual alignment.
-            setup.extend(
-                [
+            if aux_use_tma_load:
+                tma_smem_part_var = device_function.new_var(
+                    f"tcgen05_aux_tma_smem_part_{desc_idx}"
+                )
+                tma_gmem_part_var = device_function.new_var(
+                    f"tcgen05_aux_tma_gmem_part_{desc_idx}"
+                )
+                setup.append(
                     statement_from_string(
-                        f"{tiled_copy_var} = cute.make_tiled_copy_tv("
-                        f"cute.make_copy_atom("
-                        f"cute.nvgpu.CopyUniversalOp(), {aux_dtype_str}, "
-                        f"num_bits_per_copy={copy_bits}), "
-                        f"cute.make_ordered_layout("
-                        f"({m_threads}, {n_threads}), order=(1, 0)), "
-                        f"cute.make_layout((1, {num_copy_elems})))"
-                    ),
-                    statement_from_string(
-                        f"{thr_copy_var} = {tiled_copy_var}.get_slice("
-                        f"{cute_lane_idx_var})"
-                    ),
-                ]
-            )
+                        f"{tma_smem_part_var}, {tma_gmem_part_var} = "
+                        "cute.nvgpu.cpasync.tma_partition("
+                        f"{tma_atom}, 0, cute.make_layout(1), "
+                        f"cute.group_modes({ring.smem}, 0, "
+                        f"cute.rank({ring.smem}) - 1), "
+                        f"cute.group_modes({gmem_subtiles_grouped_var}, 0, "
+                        f"cute.rank({gmem_subtiles_grouped_var}) - 1))"
+                    )
+                )
+            else:
+                # Cooperative-copy ``TiledCopy`` for the C-input warp's
+                # 32 lanes. The atom uses ``CopyUniversalOp`` (regular
+                # SIMT ld+st): cp.async would impose a 128-bit
+                # source-iterator alignment check that the layout-
+                # implied stride alignment cannot satisfy at IR-build
+                # time (the host pointer is 16-byte aligned, but the
+                # minimum row stride is 1 element = 16 bits for bf16).
+                # ``CopyUniversalOp`` lowers to a SIMT ld/st pair whose
+                # vectorization is driven at runtime by the host
+                # pointer's actual alignment.
+                setup.extend(
+                    [
+                        statement_from_string(
+                            f"{tiled_copy_var} = cute.make_tiled_copy_tv("
+                            f"cute.make_copy_atom("
+                            f"cute.nvgpu.CopyUniversalOp(), {aux_dtype_str}, "
+                            f"num_bits_per_copy={copy_bits}), "
+                            f"cute.make_ordered_layout("
+                            f"({m_threads}, {n_threads}), order=(1, 0)), "
+                            f"cute.make_layout((1, {num_copy_elems})))"
+                        ),
+                        statement_from_string(
+                            f"{thr_copy_var} = {tiled_copy_var}.get_slice("
+                            f"{cute_lane_idx_var})"
+                        ),
+                    ]
+                )
             per_descriptor_setup_blocks.append(setup)
             per_descriptor_grouped_names.append(gmem_subtiles_grouped_var)
 
@@ -3993,20 +4037,35 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             # axis (collapsed via ``group_modes(..., 2, rank)``);
             # the consumer's per-subtile loop indexes the same
             # axis identically.
-            subtile_lines = [
-                (
-                    f"{gmem_subtile_var} = "
-                    f"{gmem_subtiles_grouped_var}[None, None, "
-                    f"cutlass.Int32(_tcgen05_aux_subtile)]"
-                ),
-                (
-                    f"{smem_stage_var} = {ring.smem}[None, None, "
-                    f"{aux_producer_state_name}.index]"
-                ),
-                (f"{gmem_part_var} = {thr_copy_var}.partition_S({gmem_subtile_var})"),
-                (f"{smem_part_var} = {thr_copy_var}.partition_D({smem_stage_var})"),
-                (f"cute.copy({tiled_copy_var}, {gmem_part_var}, {smem_part_var})"),
-            ]
+            if aux_use_tma_load:
+                subtile_lines = [
+                    (
+                        f"cute.copy({tma_atom}, "
+                        f"{tma_gmem_part_var}[None, "
+                        f"cutlass.Int32(_tcgen05_aux_subtile)], "
+                        f"{tma_smem_part_var}[None, "
+                        f"{aux_producer_state_name}.index], "
+                        f"tma_bar_ptr={aux_tma_barrier_var})"
+                    ),
+                ]
+            else:
+                subtile_lines = [
+                    (
+                        f"{gmem_subtile_var} = "
+                        f"{gmem_subtiles_grouped_var}[None, None, "
+                        f"cutlass.Int32(_tcgen05_aux_subtile)]"
+                    ),
+                    (
+                        f"{smem_stage_var} = {ring.smem}[None, None, "
+                        f"{aux_producer_state_name}.index]"
+                    ),
+                    (
+                        f"{gmem_part_var} = "
+                        f"{thr_copy_var}.partition_S({gmem_subtile_var})"
+                    ),
+                    (f"{smem_part_var} = {thr_copy_var}.partition_D({smem_stage_var})"),
+                    (f"cute.copy({tiled_copy_var}, {gmem_part_var}, {smem_part_var})"),
+                ]
             per_descriptor_subtile_blocks.append(subtile_lines)
 
         def _aux_copy_lines() -> list[ast.stmt]:
@@ -4087,22 +4146,38 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                 f"{loop_indent}{aux_pipeline_name}.producer_acquire("
                 f"{aux_producer_state_name})"
             )
+            if aux_use_tma_load:
+                assert aux_tma_barrier_var is not None
+                inner_chunks.append(
+                    f"{loop_indent}{aux_tma_barrier_var} = "
+                    f"{aux_pipeline_name}.producer_get_barrier("
+                    f"{aux_producer_state_name})"
+                )
             for block in per_descriptor_subtile_blocks:
                 inner_chunks.extend(f"{loop_indent}{line}" for line in block)
-            # ``CopyUniversalOp`` issues regular ld+st pairs that
-            # complete in program order per thread; ``sync_warp``
-            # ensures all 32 lanes of the producer warp finish
-            # their SMEM stores. ``fence_acq_rel_cta`` provides
-            # cross-warp visibility through the CTA-scope generic
-            # SMEM proxy — the consumer warps' generic SMEM reads
-            # after their ``consumer_wait`` would otherwise be
-            # free to bypass the producer's writes since the
-            # AsyncThread ``mbarrier.arrive`` PTX emission has
-            # relaxed memory semantics by default.
+            # TMA aux loads skip the SIMT warp sync/fence below: they are
+            # ordered by the tx-counted PipelineTmaAsync barrier, and the
+            # consumer fences the async-shared view after ``consumer_wait`` and
+            # before generic SMEM reads.
+            if not aux_use_tma_load:
+                # ``CopyUniversalOp`` issues regular ld+st pairs that
+                # complete in program order per thread; ``sync_warp``
+                # ensures all 32 lanes of the producer warp finish
+                # their SMEM stores. ``fence_acq_rel_cta`` provides
+                # cross-warp visibility through the CTA-scope generic
+                # SMEM proxy — the consumer warps' generic SMEM reads
+                # after their ``consumer_wait`` would otherwise be
+                # free to bypass the producer's writes since the
+                # AsyncThread ``mbarrier.arrive`` PTX emission has
+                # relaxed memory semantics by default.
+                inner_chunks.extend(
+                    [
+                        f"{loop_indent}cute.arch.sync_warp()",
+                        f"{loop_indent}cute.arch.fence_acq_rel_cta()",
+                    ]
+                )
             inner_chunks.extend(
                 [
-                    f"{loop_indent}cute.arch.sync_warp()",
-                    f"{loop_indent}cute.arch.fence_acq_rel_cta()",
                     (
                         f"{loop_indent}{aux_pipeline_name}.producer_commit("
                         f"{aux_producer_state_name})"
@@ -4132,11 +4207,11 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         # ``_build_role_local_while_with_scheduler``).
         per_tile_body.extend(l2_dependency_stmts)
         aux_copy_lines = _aux_copy_lines()
-        if plan.tma_store_full_tiles_only and tile_phase == "all":
-            # Hybrid full-tile TMA store uses the aux SMEM ring only on the
-            # full-tile branch. Edge tiles take the SIMT direct-GMEM fallback,
-            # so the producer must skip those tiles too; otherwise it commits
-            # aux stages that no consumer will release.
+        if aux_requires_full_tile and tile_phase == "all":
+            # Hybrid full-tile TMA store and explicit aux TMA loads use the aux
+            # SMEM ring only on full tiles. Edge tiles take the SIMT direct-GMEM
+            # fallback, so the producer must skip those tiles too; otherwise it
+            # commits aux stages that no consumer will release.
             per_tile_body.extend(
                 [
                     statement_from_string(
@@ -4164,6 +4239,16 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             )
         )
         prelude.extend(_sched_consumer_release_block())
+        if aux_use_tma_load:
+            prelude.append(
+                statement_from_string(
+                    emit_producer_tail_tma_async(
+                        aux_pipeline_name,
+                        aux_producer_state_name,
+                        num_stages=aux_stage_count,
+                    )
+                )
+            )
 
         return create(
             ast.If,
