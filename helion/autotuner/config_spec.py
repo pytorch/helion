@@ -460,6 +460,7 @@ class ConfigSpec:
         self.epilogue_subtile_k_hint: int = 0
         self.has_pallas_inner_loops: bool = False
         self.has_symbolic_or_data_dependent_bounds: bool = False
+        self.tensor_descriptor_inner_range_seed_configs_enabled: bool = False
         self.cute_tcgen05_search_enabled: bool = False
         # Post-compile bind-time flag: True when the host function's
         # FX graphs contain a tcgen05 matmul AND at least one
@@ -667,6 +668,15 @@ class ConfigSpec:
         # reopening the search choices.
         self.restrict_tcgen05_cluster_m_search((1, 2))
 
+    def enable_tensor_descriptor_inner_range_seed_configs(self) -> None:
+        """Allow compiler-owned tensor-descriptor inner-range seed configs."""
+        self.tensor_descriptor_inner_range_seed_configs_enabled = True
+
+    def maybe_enable_tensor_descriptor_inner_range_seed_configs(self) -> None:
+        """Enable TD inner-range seeds only for the matching compiler structure."""
+        if self._tensor_descriptor_inner_range_seed_structure_matches():
+            self.enable_tensor_descriptor_inner_range_seed_configs()
+
     @staticmethod
     def _tcgen05_cluster_m2_bk_is_valid(
         bk: int, constraints: Tcgen05ClusterM2SearchConstraints
@@ -791,6 +801,115 @@ class ConfigSpec:
         if c_input_seed is not None:
             seeds.append(c_input_seed)
         return seeds
+
+    def _tensor_descriptor_inner_range_seed_configs(self) -> list[helion.Config]:
+        """Seed layer-norm-style inner range reductions with known fast TD configs."""
+        # The flag mirrors the tcgen05 opt-in style; rechecking the structure
+        # keeps the seed from surviving later ConfigSpec mutations.
+        if (
+            not self.tensor_descriptor_inner_range_seed_configs_enabled
+            or not self._tensor_descriptor_inner_range_seed_structure_matches()
+        ):
+            return []
+
+        default_warp_specializes: list[bool | None] | None = None
+        inner_warp_specializes: list[bool | None] | None = None
+        if len(self.range_warp_specialize) == 2:
+            default_warp_specializes = [None, None]
+            inner_warp_specializes = [None, False]
+
+        return [
+            helion.Config(
+                block_sizes=[32, 8],
+                indexing=[
+                    "tensor_descriptor",
+                    "pointer",
+                    "pointer",
+                    "tensor_descriptor",
+                    "pointer",
+                    "pointer",
+                    "tensor_descriptor",
+                    "tensor_descriptor",
+                ],
+                load_eviction_policies=["last", "last", "", "first", ""],
+                num_warps=4,
+                num_stages=3,
+                pid_type="flat",
+                range_flattens=[None, False],
+                range_multi_buffers=[None, None],
+                range_num_stages=[0, 4],
+                range_unroll_factors=[0, 0],
+                range_warp_specializes=default_warp_specializes,
+            ),
+            helion.Config(
+                block_sizes=[32, 8],
+                indexing=[
+                    "pointer",
+                    "pointer",
+                    "pointer",
+                    "tensor_descriptor",
+                    "pointer",
+                    "pointer",
+                    "tensor_descriptor",
+                    "tensor_descriptor",
+                ],
+                load_eviction_policies=["", "last", "last", "first", ""],
+                num_warps=4,
+                num_stages=6,
+                pid_type="flat",
+                range_flattens=[None, True],
+                range_multi_buffers=[None, False],
+                range_num_stages=[0, 4],
+                range_unroll_factors=[0, 0],
+                range_warp_specializes=inner_warp_specializes,
+            ),
+        ]
+
+    def _tensor_descriptor_inner_range_seed_structure_matches(self) -> bool:
+        if self.backend_name != "triton" or not supports_tensor_descriptor():
+            return False
+
+        has_warp_spec = len(self.range_warp_specialize) == 2
+        range_specs = (
+            self.range_num_stages,
+            self.range_unroll_factors,
+            self.range_multi_buffers,
+            self.range_flattens,
+        )
+        if has_warp_spec:
+            range_specs = (*range_specs, self.range_warp_specialize)
+        elif len(self.range_warp_specialize) != 0:
+            return False
+
+        if (
+            len(self.block_sizes) != 2
+            or any(len(specs) != 2 for specs in range_specs)
+            or self.indexing.length != 8
+            or self.load_eviction_policies.length != 5
+            or self.atomic_indexing.length != 0
+            or self.store_indices != [4, 6, 7]
+            or "flat" not in self.allowed_pid_types
+        ):
+            return False
+
+        # This matches the current layer_norm_bwd-style lowering: five
+        # tunable loads, three stores in the combined load/store indexing
+        # vector, and the same two single-block-id ranges as the tile axes.
+        block_id_layout = tuple(tuple(spec.block_ids) for spec in self.block_sizes)
+        if any(len(block_ids) != 1 for block_ids in block_id_layout):
+            return False
+        if block_id_layout != ((0,), (2,)):
+            return False
+        if any(
+            tuple(tuple(spec.block_ids) for spec in specs) != block_id_layout
+            for specs in range_specs
+        ):
+            return False
+
+        return all(
+            spec.min_size <= block_size <= spec.max_size
+            for block_size, spec in zip((32, 8), self.block_sizes, strict=True)
+        )
 
     def _fix_tcgen05_cluster_m2_search_config(self, config: dict[str, object]) -> None:
         """Canonicalize unvalidated search-only ``cluster_m=2`` products."""

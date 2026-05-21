@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
+from typing import ClassVar
 
 from ...runtime.config import Config
 from .common import clamp_block_size_targets
@@ -76,3 +77,38 @@ class TritonSkinnyGemmHeuristic(AutotunerHeuristic):
         )
         assert block_sizes is not None
         return Config(block_sizes=block_sizes)
+
+
+class _TritonTensorDescriptorInnerRangeHeuristic(AutotunerHeuristic):
+    backend = "triton"
+    seed_index: ClassVar[int]
+
+    @classmethod
+    def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        return (
+            env.config_spec.tensor_descriptor_inner_range_seed_configs_enabled
+            and env.config_spec._tensor_descriptor_inner_range_seed_structure_matches()
+        )
+
+    @classmethod
+    def get_seed_config(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> Config | None:
+        configs = env.config_spec._tensor_descriptor_inner_range_seed_configs()
+        if cls.seed_index >= len(configs):
+            return None
+        return configs[cls.seed_index]
+
+
+class TritonTensorDescriptorInnerRangeDefaultHeuristic(
+    _TritonTensorDescriptorInnerRangeHeuristic
+):
+    name = "triton_tensor_descriptor_inner_range_default"
+    seed_index = 0
+
+
+class TritonTensorDescriptorInnerRangeInnerHeuristic(
+    _TritonTensorDescriptorInnerRangeHeuristic
+):
+    name = "triton_tensor_descriptor_inner_range_inner"
+    seed_index = 1
