@@ -127,6 +127,14 @@ from helion._compiler.cute.tcgen05_constants import TCGEN05_LARGE_BN_PROOF_CLUST
 from helion._compiler.cute.tcgen05_constants import TCGEN05_LARGE_BN_PROOF_CONFIG_KEY
 from helion._compiler.cute.tcgen05_constants import TCGEN05_LARGE_BN_PROOF_PID_TYPE
 from helion._compiler.cute.tcgen05_constants import TCGEN05_LARGE_BN_PROOF_STAGE_CONFIGS
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_TWO_CTA_EDGE_K_TAIL_AB_STAGES,
+)
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_TWO_CTA_EDGE_K_TAIL_ACC_STAGES,
+)
+from helion._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K
+from helion._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_EDGE_K_TAIL_C_STAGES
 from helion._compiler.device_ir import ForLoopGraphInfo
 from helion._compiler.device_ir import GraphInfo
 from helion._compiler.device_ir import RootGraphInfo
@@ -6806,7 +6814,7 @@ class TestCuteLowerings(unittest.TestCase):
     def test_tcgen05_persistent_cluster_m2_partial_single_tile_runtime_guard(
         self,
     ) -> None:
-        """Partial single-tile cluster_m=2 fallback remains guarded."""
+        """Output-partial single-tile cluster_m=2 fallback remains guarded."""
 
         @helion.kernel(backend="cute")
         def cute_matmul_cluster_m2_partial_single_tile(
@@ -6824,7 +6832,7 @@ class TestCuteLowerings(unittest.TestCase):
 
         args = (
             torch.randn(256, 17, device=DEVICE, dtype=torch.float16),
-            torch.randn(17, 256, device=DEVICE, dtype=torch.float16),
+            torch.randn(17, 128, device=DEVICE, dtype=torch.float16),
         )
         from helion._compiler.program_id import Tcgen05PersistentProgramIDs
 
@@ -7724,6 +7732,358 @@ class TestCuteLowerings(unittest.TestCase):
                     out = bound(*args)
                 expected = args[0] @ args[1]
                 torch.testing.assert_close(out, expected, atol=2e-1, rtol=1e-2)
+
+    def test_tcgen05_persistent_cluster_m2_two_cta_k_tail_runtime_correctness(
+        self,
+    ) -> None:
+        """CtaGroup.TWO handles a K-tail through the role-local TMA path."""
+
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_cluster_m2_two_cta_k_tail(
+            x: torch.Tensor,
+            y: torch.Tensor,
+            bias: torch.Tensor,
+            residual: torch.Tensor,
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = torch.nn.functional.gelu(
+                    1.25 * acc + 0.5 * residual[tile_m, tile_n] + bias[tile_n],
+                    approximate="tanh",
+                ).to(x.dtype)
+            return out
+
+        torch.manual_seed(0)
+        args = (
+            torch.randn(512, 576, device=DEVICE, dtype=torch.bfloat16),
+            torch.randn(576, 512, device=DEVICE, dtype=torch.bfloat16),
+            torch.randn(512, device=DEVICE, dtype=torch.bfloat16),
+            torch.randn(512, 512, device=DEVICE, dtype=torch.bfloat16),
+        )
+        from helion._compiler.program_id import Tcgen05PersistentProgramIDs
+
+        with patch_cute_mma_support():
+            bound = cute_matmul_cluster_m2_two_cta_k_tail.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            cfg = _make_tcgen05_persistent_config(
+                block_sizes=[256, 256, 128],
+                pid_type="persistent_interleaved",
+                tcgen05_cluster_m=2,
+            )
+            bound.set_config(cfg)
+            code = bound.to_triton_code(cfg)
+            self.assertIn("cute.nvgpu.tcgen05.CtaGroup.TWO", code)
+            self.assertIn("PipelineTmaUmma.create", code)
+            self.assertIn(
+                "while tcgen05_role_local_0_work_tile.is_valid_tile",
+                code,
+            )
+            self.assertIn("tile_offset_2 < cutlass.Int32(576)", code)
+            self.assertIn(
+                "tile_offset_2 + cutlass.Int32(256) < cutlass.Int32(576)",
+                code,
+            )
+            total_var = Tcgen05PersistentProgramIDs._MULTI_TILE_GUARD_TOTAL_VAR
+            self.assertNotIn(total_var, code)
+            out = bound(*args)
+        expected = torch.nn.functional.gelu(
+            1.25 * (args[0] @ args[1]).float() + 0.5 * args[3] + args[2],
+            approximate="tanh",
+        ).to(args[0].dtype)
+        torch.testing.assert_close(out, expected, atol=3e-1, rtol=2e-2)
+
+    def test_tcgen05_persistent_cluster_m2_two_cta_m_edge_runtime_correctness(
+        self,
+    ) -> None:
+        """CtaGroup.TWO handles an M-edge with role-local AB TMA."""
+
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_cluster_m2_two_cta_m_edge(
+            x: torch.Tensor,
+            y: torch.Tensor,
+            bias: torch.Tensor,
+            residual: torch.Tensor,
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = torch.nn.functional.gelu(
+                    1.25 * acc + 0.5 * residual[tile_m, tile_n] + bias[tile_n],
+                    approximate="tanh",
+                ).to(x.dtype)
+            return out
+
+        torch.manual_seed(0)
+        args = (
+            torch.randn(384, 128, device=DEVICE, dtype=torch.bfloat16),
+            torch.randn(128, 256, device=DEVICE, dtype=torch.bfloat16),
+            torch.randn(256, device=DEVICE, dtype=torch.bfloat16),
+            torch.randn(384, 256, device=DEVICE, dtype=torch.bfloat16),
+        )
+        from helion._compiler.program_id import Tcgen05PersistentProgramIDs
+
+        with patch_cute_mma_support():
+            bound = cute_matmul_cluster_m2_two_cta_m_edge.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            cfg = _make_tcgen05_persistent_config(
+                block_sizes=[256, 256, 128],
+                pid_type="persistent_interleaved",
+                tcgen05_cluster_m=2,
+                tcgen05_ab_stages=3,
+                tcgen05_acc_stages=1,
+                tcgen05_c_stages=4,
+                num_warps=4,
+            )
+            bound.set_config(cfg)
+            code = bound.to_triton_code(cfg)
+            self.assertIn("cute.nvgpu.tcgen05.CtaGroup.TWO", code)
+            self.assertIn("PipelineTmaUmma.create", code)
+            self.assertNotIn("PipelineTmaStore.create", code)
+            self.assertIn(
+                "while tcgen05_role_local_0_work_tile.is_valid_tile",
+                code,
+            )
+            self.assertIn("tile_offset_0 < cutlass.Int32(384)", code)
+            total_var = Tcgen05PersistentProgramIDs._MULTI_TILE_GUARD_TOTAL_VAR
+            self.assertNotIn(total_var, code)
+            out = bound(*args)
+        expected = torch.nn.functional.gelu(
+            1.25 * (args[0] @ args[1]).float() + 0.5 * args[3] + args[2],
+            approximate="tanh",
+        ).to(args[0].dtype)
+        torch.testing.assert_close(out, expected, atol=3e-1, rtol=2e-2)
+
+    def test_tcgen05_persistent_cluster_m2_two_cta_n_edge_runtime_correctness(
+        self,
+    ) -> None:
+        """CtaGroup.TWO handles an N-edge with role-local AB TMA."""
+
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_cluster_m2_two_cta_n_edge(
+            x: torch.Tensor,
+            y: torch.Tensor,
+            bias: torch.Tensor,
+            residual: torch.Tensor,
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = torch.nn.functional.gelu(
+                    1.25 * acc + 0.5 * residual[tile_m, tile_n] + bias[tile_n],
+                    approximate="tanh",
+                ).to(x.dtype)
+            return out
+
+        torch.manual_seed(0)
+        args = (
+            torch.randn(256, 128, device=DEVICE, dtype=torch.bfloat16),
+            torch.randn(128, 384, device=DEVICE, dtype=torch.bfloat16),
+            torch.randn(384, device=DEVICE, dtype=torch.bfloat16),
+            torch.randn(256, 384, device=DEVICE, dtype=torch.bfloat16),
+        )
+        from helion._compiler.program_id import Tcgen05PersistentProgramIDs
+
+        with patch_cute_mma_support():
+            bound = cute_matmul_cluster_m2_two_cta_n_edge.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            cfg = _make_tcgen05_persistent_config(
+                block_sizes=[256, 256, 128],
+                pid_type="persistent_interleaved",
+                tcgen05_cluster_m=2,
+                tcgen05_ab_stages=3,
+                tcgen05_acc_stages=1,
+                tcgen05_c_stages=4,
+                num_warps=4,
+            )
+            bound.set_config(cfg)
+            code = bound.to_triton_code(cfg)
+            self.assertIn("cute.nvgpu.tcgen05.CtaGroup.TWO", code)
+            self.assertIn("PipelineTmaUmma.create", code)
+            self.assertNotIn("PipelineTmaStore.create", code)
+            self.assertIn(
+                "while tcgen05_role_local_0_work_tile.is_valid_tile",
+                code,
+            )
+            self.assertIn("tile_offset_1 < cutlass.Int32(384)", code)
+            total_var = Tcgen05PersistentProgramIDs._MULTI_TILE_GUARD_TOTAL_VAR
+            self.assertNotIn(total_var, code)
+            out = bound(*args)
+        expected = torch.nn.functional.gelu(
+            1.25 * (args[0] @ args[1]).float() + 0.5 * args[3] + args[2],
+            approximate="tanh",
+        ).to(args[0].dtype)
+        torch.testing.assert_close(out, expected, atol=3e-1, rtol=2e-2)
+
+    def test_tcgen05_persistent_cluster_m2_two_cta_double_edge_runtime_correctness(
+        self,
+    ) -> None:
+        """CtaGroup.TWO handles a double output edge with role-local AB TMA."""
+
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_cluster_m2_two_cta_double_edge(
+            x: torch.Tensor,
+            y: torch.Tensor,
+            bias: torch.Tensor,
+            residual: torch.Tensor,
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = torch.nn.functional.gelu(
+                    1.25 * acc + 0.5 * residual[tile_m, tile_n] + bias[tile_n],
+                    approximate="tanh",
+                ).to(x.dtype)
+            return out
+
+        torch.manual_seed(0)
+        args = (
+            torch.randn(384, 128, device=DEVICE, dtype=torch.bfloat16),
+            torch.randn(128, 384, device=DEVICE, dtype=torch.bfloat16),
+            torch.randn(384, device=DEVICE, dtype=torch.bfloat16),
+            torch.randn(384, 384, device=DEVICE, dtype=torch.bfloat16),
+        )
+        from helion._compiler.program_id import Tcgen05PersistentProgramIDs
+
+        with patch_cute_mma_support():
+            bound = cute_matmul_cluster_m2_two_cta_double_edge.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            cfg = _make_tcgen05_persistent_config(
+                block_sizes=[256, 256, 128],
+                pid_type="persistent_interleaved",
+                tcgen05_cluster_m=2,
+                tcgen05_ab_stages=3,
+                tcgen05_acc_stages=1,
+                tcgen05_c_stages=4,
+                num_warps=4,
+            )
+            bound.set_config(cfg)
+            code = bound.to_triton_code(cfg)
+            self.assertIn("cute.nvgpu.tcgen05.CtaGroup.TWO", code)
+            self.assertIn("PipelineTmaUmma.create", code)
+            self.assertNotIn("PipelineTmaStore.create", code)
+            self.assertIn(
+                "while tcgen05_role_local_0_work_tile.is_valid_tile",
+                code,
+            )
+            self.assertIn("tile_offset_0 < cutlass.Int32(384)", code)
+            self.assertIn("tile_offset_1 < cutlass.Int32(384)", code)
+            total_var = Tcgen05PersistentProgramIDs._MULTI_TILE_GUARD_TOTAL_VAR
+            self.assertNotIn(total_var, code)
+            out = bound(*args)
+        expected = torch.nn.functional.gelu(
+            1.25 * (args[0] @ args[1]).float() + 0.5 * args[3] + args[2],
+            approximate="tanh",
+        ).to(args[0].dtype)
+        torch.testing.assert_close(out, expected, atol=3e-1, rtol=2e-2)
+
+    def test_tcgen05_persistent_cluster_m2_two_cta_double_edge_k_tail_runtime_correctness(
+        self,
+    ) -> None:
+        """CtaGroup.TWO handles combined double output edges and a K-tail."""
+
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_cluster_m2_two_cta_double_edge_k_tail(
+            x: torch.Tensor,
+            y: torch.Tensor,
+            bias: torch.Tensor,
+            residual: torch.Tensor,
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = torch.nn.functional.gelu(
+                    1.25 * acc + 0.5 * residual[tile_m, tile_n] + bias[tile_n],
+                    approximate="tanh",
+                ).to(x.dtype)
+            return out
+
+        torch.manual_seed(0)
+        args = (
+            torch.randn(384, 192, device=DEVICE, dtype=torch.bfloat16),
+            torch.randn(192, 384, device=DEVICE, dtype=torch.bfloat16),
+            torch.randn(384, device=DEVICE, dtype=torch.bfloat16),
+            torch.randn(384, 384, device=DEVICE, dtype=torch.bfloat16),
+        )
+        from helion._compiler.program_id import Tcgen05PersistentProgramIDs
+
+        with patch_cute_mma_support():
+            bound = cute_matmul_cluster_m2_two_cta_double_edge_k_tail.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            cfg = _make_tcgen05_persistent_config(
+                block_sizes=[256, 256, 128],
+                pid_type="persistent_interleaved",
+                tcgen05_cluster_m=2,
+                tcgen05_ab_stages=3,
+                tcgen05_acc_stages=1,
+                tcgen05_c_stages=4,
+                num_warps=4,
+            )
+            bound.set_config(cfg)
+            code = bound.to_triton_code(cfg)
+            self.assertIn("cute.nvgpu.tcgen05.CtaGroup.TWO", code)
+            self.assertIn("PipelineTmaUmma.create", code)
+            self.assertNotIn("PipelineTmaStore.create", code)
+            self.assertIn(
+                "while tcgen05_role_local_0_work_tile.is_valid_tile",
+                code,
+            )
+            self.assertIn("tile_offset_0 < cutlass.Int32(384)", code)
+            self.assertIn("tile_offset_1 < cutlass.Int32(384)", code)
+            self.assertIn("tile_offset_2 < cutlass.Int32(192)", code)
+            total_var = Tcgen05PersistentProgramIDs._MULTI_TILE_GUARD_TOTAL_VAR
+            self.assertNotIn(total_var, code)
+            out = bound(*args)
+        expected = torch.nn.functional.gelu(
+            1.25 * (args[0] @ args[1]).float() + 0.5 * args[3] + args[2],
+            approximate="tanh",
+        ).to(args[0].dtype)
+        torch.testing.assert_close(out, expected, atol=3e-1, rtol=2e-2)
 
     def test_tcgen05_persistent_cluster_m2_two_cta_k_tile_limit_guard(
         self,
@@ -12794,7 +13154,7 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
         self.assertEqual(config_dict["tcgen05_ab_stages"], 3)
 
     def test_aux_edge_autotune_fixup_uses_monolithic_path(self) -> None:
-        """Aux kernels with partial tcgen05 tiles avoid unvalidated c-input search."""
+        """Aux edge kernels avoid c-input search, preserving validated CtaGroup.TWO."""
 
         from helion._compiler.cute.strategies import Tcgen05Strategy
 
@@ -12852,6 +13212,122 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
         }
         spec._cute_tcgen05_config.fix_search_config(ab1_config)
         self.assertEqual(ab1_config["tcgen05_ab_stages"], 2)
+
+        cluster_m2_config: dict[str, object] = {
+            "block_sizes": [128, 256, 64],
+            "indexing": ["tensor_descriptor"] * spec.indexing.length,
+            "l2_groupings": [4],
+            "epilogue_subtile": 2,
+            "tcgen05_cluster_m": 2,
+            "tcgen05_l2_swizzle_size": 8,
+            "tcgen05_strategy": Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER.value,
+            "tcgen05_warp_spec_scheduler_warps": 1,
+            "tcgen05_warp_spec_c_input_warps": 1,
+            "tcgen05_ab_stages": 2,
+            "tcgen05_acc_stages": 2,
+            "tcgen05_c_stages": 2,
+        }
+        spec._cute_tcgen05_config.fix_search_config(cluster_m2_config)
+
+        self.assertEqual(
+            cluster_m2_config["tcgen05_strategy"],
+            Tcgen05Strategy.ROLE_LOCAL_MONOLITHIC.value,
+        )
+        self.assertEqual(cluster_m2_config["tcgen05_warp_spec_scheduler_warps"], 0)
+        self.assertEqual(cluster_m2_config["tcgen05_warp_spec_c_input_warps"], 0)
+        self.assertEqual(
+            cluster_m2_config["tcgen05_ab_stages"],
+            TCGEN05_TWO_CTA_EDGE_K_TAIL_AB_STAGES,
+        )
+        self.assertEqual(
+            cluster_m2_config["tcgen05_acc_stages"],
+            TCGEN05_TWO_CTA_EDGE_K_TAIL_ACC_STAGES,
+        )
+        self.assertEqual(
+            cluster_m2_config["tcgen05_c_stages"],
+            TCGEN05_TWO_CTA_EDGE_K_TAIL_C_STAGES,
+        )
+        self.assertEqual(cluster_m2_config["tcgen05_l2_swizzle_size"], 8)
+        self.assertEqual(cluster_m2_config["l2_groupings"], [4])
+        self.assertEqual(
+            cluster_m2_config["indexing"],
+            ["tensor_descriptor"] * spec.indexing.length,
+        )
+        self.assertEqual(
+            cluster_m2_config["block_sizes"],
+            [256, 256, TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K],
+        )
+        self.assertEqual(cluster_m2_config["pid_type"], "persistent_interleaved")
+        self.assertNotIn("epilogue_subtile", cluster_m2_config)
+
+    def test_aux_edge_post_cluster_m2_projection_uses_monolithic_path(self) -> None:
+        """Post-projection CtaGroup.TWO edge samples get the aux edge prefix."""
+
+        from helion._compiler.cute.strategies import Tcgen05Strategy
+
+        kernel = self._residual_kernel()
+        args = (
+            torch.empty([4224, 4160], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([4160, 4224], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([4224, 4224], device=DEVICE, dtype=torch.bfloat16),
+        )
+        with patch_cute_mma_support():
+            bound = kernel.bind(args)
+        spec = bound.env.config_spec
+        self.assertTrue(spec.cute_tcgen05_aux_kernel_detected)
+        constraints = spec._tcgen05_cluster_m2_search_constraints
+        assert constraints is not None
+        self.assertTrue(constraints.allow_edge_k_tail_family)
+
+        config_dict: dict[str, object] = {
+            "block_sizes": [128, 128, 16],
+            "indexing": ["tensor_descriptor"] * spec.indexing.length,
+            "l2_groupings": [4],
+            "epilogue_subtile": 2,
+            "tcgen05_cluster_m": 2,
+            "tcgen05_l2_swizzle_size": 8,
+            "tcgen05_strategy": Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER.value,
+            "tcgen05_warp_spec_scheduler_warps": 1,
+            "tcgen05_warp_spec_c_input_warps": 1,
+            "tcgen05_ab_stages": 2,
+            "tcgen05_acc_stages": 2,
+            "tcgen05_c_stages": 2,
+        }
+        self.assertFalse(
+            spec._cute_tcgen05_config._has_any_matmul_fact_edge_tile(config_dict)
+        )
+        spec._cute_tcgen05_config.fix_search_config(config_dict)
+
+        self.assertEqual(
+            config_dict["tcgen05_strategy"],
+            Tcgen05Strategy.ROLE_LOCAL_MONOLITHIC.value,
+        )
+        self.assertEqual(config_dict["tcgen05_warp_spec_scheduler_warps"], 0)
+        self.assertEqual(config_dict["tcgen05_warp_spec_c_input_warps"], 0)
+        self.assertEqual(
+            config_dict["tcgen05_ab_stages"],
+            TCGEN05_TWO_CTA_EDGE_K_TAIL_AB_STAGES,
+        )
+        self.assertEqual(
+            config_dict["tcgen05_acc_stages"],
+            TCGEN05_TWO_CTA_EDGE_K_TAIL_ACC_STAGES,
+        )
+        self.assertEqual(
+            config_dict["tcgen05_c_stages"],
+            TCGEN05_TWO_CTA_EDGE_K_TAIL_C_STAGES,
+        )
+        self.assertEqual(config_dict["tcgen05_l2_swizzle_size"], 8)
+        self.assertEqual(config_dict["l2_groupings"], [4])
+        self.assertEqual(
+            config_dict["indexing"],
+            ["tensor_descriptor"] * spec.indexing.length,
+        )
+        self.assertEqual(
+            config_dict["block_sizes"],
+            [256, 256, TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K],
+        )
+        self.assertEqual(config_dict["pid_type"], "persistent_interleaved")
+        self.assertNotIn("epilogue_subtile", config_dict)
 
     def test_aux_autotune_surface_widens_for_hldot_residual_kernel(self) -> None:
         """Detector recognizes ``hl.dot`` MMA anchors in

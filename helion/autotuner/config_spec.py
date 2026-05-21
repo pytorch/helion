@@ -493,10 +493,12 @@ class ConfigSpec:
         *,
         static_k: int,
         max_k_tiles: int = TCGEN05_TWO_CTA_MAX_K_TILES,
+        allow_edge_k_tail_family: bool = False,
     ) -> None:
         self._cute_tcgen05_config.allow_cluster_m2_search(
             static_k=static_k,
             max_k_tiles=max_k_tiles,
+            allow_edge_k_tail_family=allow_edge_k_tail_family,
         )
 
     @staticmethod
@@ -573,6 +575,7 @@ class ConfigSpec:
         allow_persistent_pid_types: bool = False,
         allow_cluster_m2_search: bool = False,
         cluster_m2_static_k: int | None = None,
+        allow_cluster_m2_edge_k_tail_family: bool = False,
         ab_stages_three_dtype_bytes: int | None = None,
         ab_stages_three_device: torch.device | None = None,
     ) -> None:
@@ -580,6 +583,7 @@ class ConfigSpec:
             allow_persistent_pid_types=allow_persistent_pid_types,
             allow_cluster_m2_search=allow_cluster_m2_search,
             cluster_m2_static_k=cluster_m2_static_k,
+            allow_cluster_m2_edge_k_tail_family=allow_cluster_m2_edge_k_tail_family,
             ab_stages_three_dtype_bytes=ab_stages_three_dtype_bytes,
             ab_stages_three_device=ab_stages_three_device,
         )

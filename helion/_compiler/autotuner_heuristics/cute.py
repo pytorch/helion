@@ -7,6 +7,10 @@ from typing import cast
 from ...runtime.config import Config
 from ..cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
 from ..cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
+from ..cute.tcgen05_constants import TCGEN05_TWO_CTA_EDGE_K_TAIL_AB_STAGES
+from ..cute.tcgen05_constants import TCGEN05_TWO_CTA_EDGE_K_TAIL_ACC_STAGES
+from ..cute.tcgen05_constants import TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K
+from ..cute.tcgen05_constants import TCGEN05_TWO_CTA_EDGE_K_TAIL_C_STAGES
 from ..cute.tcgen05_constants import TCGEN05_TWO_CTA_SEED_L2_GROUPING
 from ..cute.tcgen05_constants import TCGEN05_TWO_CTA_SEED_PID_TYPE
 from .registry import AutotunerHeuristic
@@ -127,21 +131,27 @@ class CuteTcgen05ClusterM2Heuristic(AutotunerHeuristic):
     def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
         spec = env.config_spec
         constraints = spec._tcgen05_cluster_m2_search_constraints
-        if (
-            constraints is None
-            or TCGEN05_TWO_CTA_SEED_PID_TYPE not in spec.allowed_pid_types
-        ):
+        if constraints is None:
+            return False
+        if TCGEN05_TWO_CTA_SEED_PID_TYPE not in spec.allowed_pid_types:
             return False
         if len(spec.block_sizes) != 3:
             return False
 
         bm_fragment = cast("BlockSizeFragment", spec.block_sizes[0]._fragment(spec))
         bn_fragment = cast("BlockSizeFragment", spec.block_sizes[1]._fragment(spec))
-        return (
+        edge_k_tail_family = constraints.allow_edge_k_tail_family
+        m_tile_reachable = (
             bm_fragment.low <= TCGEN05_TWO_CTA_BLOCK_M <= bm_fragment.high
-            and bn_fragment.low <= TCGEN05_TWO_CTA_BLOCK_N <= bn_fragment.high
-            and cls._select_bk(env) is not None
+            # The edge+K-tail surface keeps the flat M search capped below 256,
+            # then normalization projects cluster_m=2 candidates to 256.
+            or (edge_k_tail_family and bm_fragment.low <= TCGEN05_TWO_CTA_BLOCK_M)
         )
+        n_tile_reachable = (
+            bn_fragment.low <= TCGEN05_TWO_CTA_BLOCK_N <= bn_fragment.high
+            or (edge_k_tail_family and bn_fragment.low <= TCGEN05_TWO_CTA_BLOCK_N)
+        )
+        return m_tile_reachable and n_tile_reachable and cls._select_bk(env) is not None
 
     @classmethod
     def get_seed_config(cls, env: CompileEnvironment, device_ir: DeviceIR) -> Config:
@@ -166,7 +176,15 @@ class CuteTcgen05ClusterM2Heuristic(AutotunerHeuristic):
         # seed the canonical 4096^3 fast config family directly so it reaches
         # the autotuner's initial population without depending on a search-
         # stage mutation.
-        if spec._tcgen05_ab_stages_three_fits(
+        edge_k_tail_family = (
+            spec._tcgen05_cluster_m2_search_constraints is not None
+            and spec._tcgen05_cluster_m2_search_constraints.allow_edge_k_tail_family
+        )
+        if edge_k_tail_family:
+            seed["tcgen05_ab_stages"] = TCGEN05_TWO_CTA_EDGE_K_TAIL_AB_STAGES
+            seed["tcgen05_acc_stages"] = TCGEN05_TWO_CTA_EDGE_K_TAIL_ACC_STAGES
+            seed["tcgen05_c_stages"] = TCGEN05_TWO_CTA_EDGE_K_TAIL_C_STAGES
+        elif spec._tcgen05_ab_stages_three_fits(
             bm=TCGEN05_TWO_CTA_BLOCK_M,
             bn=TCGEN05_TWO_CTA_BLOCK_N,
             bk=bk,
@@ -182,6 +200,8 @@ class CuteTcgen05ClusterM2Heuristic(AutotunerHeuristic):
                 "tensor_descriptor",
                 "tensor_descriptor",
             ]
+        elif edge_k_tail_family:
+            seed["indexing"] = ["tensor_descriptor"] * spec.indexing.length
         return Config(**seed)
 
     @staticmethod
@@ -191,6 +211,18 @@ class CuteTcgen05ClusterM2Heuristic(AutotunerHeuristic):
         if constraints is None or len(spec.block_sizes) != 3:
             return None
         bk_fragment = cast("BlockSizeFragment", spec.block_sizes[2]._fragment(spec))
+        if constraints.allow_edge_k_tail_family:
+            if (
+                bk_fragment.low
+                <= TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K
+                <= bk_fragment.high
+                and spec._tcgen05_cluster_m2_bk_is_valid(
+                    TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K,
+                    constraints,
+                )
+            ):
+                return TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K
+            return None
         bk = bk_fragment.high
         while bk >= bk_fragment.low:
             if spec._tcgen05_cluster_m2_bk_is_valid(bk, constraints):

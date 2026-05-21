@@ -12,8 +12,19 @@ from helion._compiler.autotuner_heuristics.cute import CuteTcgen05ClusterM2Heuri
 from helion._compiler.autotuner_heuristics.registry import AutotunerHeuristic
 from helion._compiler.autotuner_heuristics.triton import TritonSkinnyGemmHeuristic
 from helion._compiler.backend import TritonBackend
+from helion._compiler.cute.tcgen05_config import CuteTcgen05Config
+from helion._compiler.cute.tcgen05_config import Tcgen05ClusterM2SearchConstraints
 from helion._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
 from helion._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_TWO_CTA_EDGE_K_TAIL_AB_STAGES,
+)
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_TWO_CTA_EDGE_K_TAIL_ACC_STAGES,
+)
+from helion._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K
+from helion._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_EDGE_K_TAIL_C_STAGES
+from helion._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_MAX_K_TILES
 from helion._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_SEED_L2_GROUPING
 from helion._hardware import HardwareInfo
 from helion._testing import DEVICE
@@ -501,6 +512,9 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
     def _assert_cute_tcgen05_cluster_m2_seeded(
         self,
         configs: list[helion.Config],
+        *,
+        expected_block_k: int,
+        expected_indexing_length: int,
     ) -> None:
         seeded = [
             config.config
@@ -511,11 +525,15 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         seed = seeded[0]
         self.assertEqual(
             seed["block_sizes"][:3],
-            [TCGEN05_TWO_CTA_BLOCK_M, TCGEN05_TWO_CTA_BLOCK_N, 128],
+            [
+                TCGEN05_TWO_CTA_BLOCK_M,
+                TCGEN05_TWO_CTA_BLOCK_N,
+                expected_block_k,
+            ],
         )
         self.assertEqual(
             seed["indexing"],
-            ["tensor_descriptor", "tensor_descriptor", "tensor_descriptor"],
+            ["tensor_descriptor"] * expected_indexing_length,
         )
         self.assertEqual(seed["l2_groupings"], [TCGEN05_TWO_CTA_SEED_L2_GROUPING])
         self.assertEqual(seed["pid_type"], "persistent_interleaved")
@@ -556,6 +574,8 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             assert seed_config is not None
             self._assert_cute_tcgen05_cluster_m2_seeded(
                 [seed_config],
+                expected_block_k=128,
+                expected_indexing_length=3,
             )
 
         with patch_cute_mma_support(default_cute_mma_support(tcgen05_f16bf16=False)):
@@ -574,6 +594,159 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                 CuteTcgen05ClusterM2Heuristic.name,
                 unsupported_bound.config_spec.autotuner_heuristics,
             )
+
+    @onlyBackends(["cute"])
+    def test_cute_tcgen05_cluster_m2_edge_k_tail_bk_requires_tail(self) -> None:
+        valid_tail = Tcgen05ClusterM2SearchConstraints(
+            static_k=5000,
+            max_k_tiles=TCGEN05_TWO_CTA_MAX_K_TILES,
+            allow_edge_k_tail_family=True,
+        )
+        self.assertTrue(
+            CuteTcgen05Config.cluster_m2_bk_is_valid(
+                TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K,
+                valid_tail,
+            )
+        )
+        for static_k in (64, 128, 256):
+            with self.subTest(static_k=static_k):
+                constraints = Tcgen05ClusterM2SearchConstraints(
+                    static_k=static_k,
+                    max_k_tiles=TCGEN05_TWO_CTA_MAX_K_TILES,
+                    allow_edge_k_tail_family=True,
+                )
+                self.assertFalse(
+                    CuteTcgen05Config.cluster_m2_bk_is_valid(
+                        TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K,
+                        constraints,
+                    )
+                )
+
+        k_fragment = MagicMock()
+        k_fragment.low = 16
+        k_fragment.high = TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K
+        k_block = MagicMock()
+        k_block._fragment.return_value = k_fragment
+        spec = MagicMock()
+        spec.block_sizes = [MagicMock(), MagicMock(), k_block]
+        spec._tcgen05_cluster_m2_bk_is_valid.side_effect = (
+            CuteTcgen05Config.cluster_m2_bk_is_valid
+        )
+        spec._tcgen05_cluster_m2_search_constraints = Tcgen05ClusterM2SearchConstraints(
+            static_k=128,
+            max_k_tiles=TCGEN05_TWO_CTA_MAX_K_TILES,
+            allow_edge_k_tail_family=True,
+        )
+        env = MagicMock()
+        env.config_spec = spec
+        self.assertIsNone(CuteTcgen05ClusterM2Heuristic._select_bk(env))
+
+    @onlyBackends(["cute"])
+    def test_cute_tcgen05_cluster_m2_seed_heuristic_for_edge_k_tail_family(
+        self,
+    ) -> None:
+        @helion.kernel(backend="cute")
+        def cute_matmul_bias_residual_gelu(
+            x: torch.Tensor,
+            y: torch.Tensor,
+            bias: torch.Tensor,
+            residual: torch.Tensor,
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = torch.nn.functional.gelu(
+                    1.25 * acc + 0.5 * residual[tile_m, tile_n] + bias[tile_n],
+                    approximate="tanh",
+                ).to(x.dtype)
+            return out
+
+        args = (
+            torch.empty([5000, 5000], device=DEVICE, dtype=HALF_DTYPE),
+            torch.empty([5000, 5000], device=DEVICE, dtype=HALF_DTYPE),
+            torch.empty([5000], device=DEVICE, dtype=HALF_DTYPE),
+            torch.empty([5000, 5000], device=DEVICE, dtype=HALF_DTYPE),
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_bias_residual_gelu.bind(args)
+
+        spec = bound.config_spec
+        self.assertIn(CuteTcgen05ClusterM2Heuristic.name, spec.autotuner_heuristics)
+        constraints = spec._tcgen05_cluster_m2_search_constraints
+        assert constraints is not None
+        self.assertTrue(constraints.allow_edge_k_tail_family)
+        self.assertIn("persistent_interleaved", spec.allowed_pid_types)
+        raw_seeded = [
+            config.config
+            for config in spec.compiler_seed_configs
+            if config.config.get("tcgen05_cluster_m") == 2
+        ]
+        self.assertEqual(len(raw_seeded), 1)
+        raw_seed = raw_seeded[0]
+        self.assertEqual(
+            raw_seed["block_sizes"],
+            [
+                TCGEN05_TWO_CTA_BLOCK_M,
+                TCGEN05_TWO_CTA_BLOCK_N,
+                TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K,
+            ],
+        )
+        self.assertEqual(raw_seed["pid_type"], "persistent_interleaved")
+        self.assertEqual(
+            raw_seed["tcgen05_ab_stages"],
+            TCGEN05_TWO_CTA_EDGE_K_TAIL_AB_STAGES,
+        )
+        self.assertEqual(
+            raw_seed["tcgen05_acc_stages"],
+            TCGEN05_TWO_CTA_EDGE_K_TAIL_ACC_STAGES,
+        )
+        self.assertEqual(
+            raw_seed["tcgen05_c_stages"],
+            TCGEN05_TWO_CTA_EDGE_K_TAIL_C_STAGES,
+        )
+        self.assertEqual(raw_seed["l2_groupings"], [TCGEN05_TWO_CTA_SEED_L2_GROUPING])
+        self.assertEqual(
+            raw_seed["indexing"], ["tensor_descriptor"] * spec.indexing.length
+        )
+
+        config_gen = spec.create_config_generation()
+        seed_pairs = config_gen.seed_flat_config_pairs()
+        self.assertEqual(len(seed_pairs), 1)
+        flat_seed, normalized_seed = seed_pairs[0]
+        config_gen.encode_config(flat_seed)
+        self.assertEqual(normalized_seed.config["pid_type"], "persistent_interleaved")
+        self.assertEqual(
+            normalized_seed.config["block_sizes"][:3],
+            [
+                TCGEN05_TWO_CTA_BLOCK_M,
+                TCGEN05_TWO_CTA_BLOCK_N,
+                TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K,
+            ],
+        )
+        self.assertEqual(
+            normalized_seed.config["tcgen05_ab_stages"],
+            TCGEN05_TWO_CTA_EDGE_K_TAIL_AB_STAGES,
+        )
+        self.assertEqual(
+            normalized_seed.config["tcgen05_acc_stages"],
+            TCGEN05_TWO_CTA_EDGE_K_TAIL_ACC_STAGES,
+        )
+        self.assertEqual(
+            normalized_seed.config["tcgen05_c_stages"],
+            TCGEN05_TWO_CTA_EDGE_K_TAIL_C_STAGES,
+        )
+
+        configs = config_gen.random_population(2)
+        self.assertEqual(configs[0].config["tcgen05_cluster_m"], 1)
+        self._assert_cute_tcgen05_cluster_m2_seeded(
+            configs,
+            expected_block_k=TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K,
+            expected_indexing_length=spec.indexing.length,
+        )
 
     @onlyBackends(["cute"])
     def test_cute_tcgen05_two_cta_seeded_in_initial_populations(self) -> None:
@@ -612,7 +785,11 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         one_config_population = config_gen.random_population(1)
         self.assertEqual(len(one_config_population), 1)
         self.assertEqual(one_config_population[0].config["tcgen05_cluster_m"], 1)
-        self._assert_cute_tcgen05_cluster_m2_seeded(config_gen.random_population(2))
+        self._assert_cute_tcgen05_cluster_m2_seeded(
+            config_gen.random_population(2),
+            expected_block_k=128,
+            expected_indexing_length=3,
+        )
 
         acf_config_gen = bound.config_spec.create_config_generation(
             advanced_controls_files=["/tmp/helion-test.acf"]
@@ -625,7 +802,11 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             {config.config["advanced_controls_file"] for config in acf_configs},
             {"/tmp/helion-test.acf"},
         )
-        self._assert_cute_tcgen05_cluster_m2_seeded(acf_configs)
+        self._assert_cute_tcgen05_cluster_m2_seeded(
+            acf_configs,
+            expected_block_k=128,
+            expected_indexing_length=3,
+        )
 
         with patch.object(
             PatternSearch, "_find_similar_cached_configs", return_value=[]
@@ -644,7 +825,11 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         # Future heuristics may add more compiler seeds; this test only
         # requires the CuTe cluster-m2 seed to be present.
         self.assertGreaterEqual(len(configs), 2)
-        self._assert_cute_tcgen05_cluster_m2_seeded(configs)
+        self._assert_cute_tcgen05_cluster_m2_seeded(
+            configs,
+            expected_block_k=128,
+            expected_indexing_length=3,
+        )
 
     @onlyBackends(["cute"])
     def test_cute_tcgen05_two_cta_seed_indexing_matches_live_spec(self) -> None:

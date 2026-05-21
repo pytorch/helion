@@ -82,6 +82,10 @@ from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_STAGE_CONFIGS
 from .tcgen05_constants import TCGEN05_ONE_CTA_MAX_BLOCK_M
 from .tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
 from .tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
+from .tcgen05_constants import TCGEN05_TWO_CTA_EDGE_K_TAIL_AB_STAGES
+from .tcgen05_constants import TCGEN05_TWO_CTA_EDGE_K_TAIL_ACC_STAGES
+from .tcgen05_constants import TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K
+from .tcgen05_constants import TCGEN05_TWO_CTA_EDGE_K_TAIL_C_STAGES
 from .tcgen05_constants import TCGEN05_TWO_CTA_MAX_K_TILES
 from .tcgen05_constants import TCGEN05_TWO_CTA_SEED_PID_TYPE
 from .tcgen05_constants import tcgen05_ab_smem_bytes_per_cta
@@ -98,6 +102,7 @@ class Tcgen05ClusterM2SearchConstraints(NamedTuple):
 
     static_k: int
     max_k_tiles: int
+    allow_edge_k_tail_family: bool = False
 
 
 class Tcgen05AbStagesThreeSearchConstraints(NamedTuple):
@@ -204,12 +209,14 @@ class CuteTcgen05Config:
         *,
         static_k: int,
         max_k_tiles: int = TCGEN05_TWO_CTA_MAX_K_TILES,
+        allow_edge_k_tail_family: bool = False,
     ) -> None:
         assert static_k > 0, "static_k is required for cluster_m=2 K-cap checks"
         assert max_k_tiles > 0, "cluster_m=2 max K tiles must be positive"
         self.cluster_m2_search_constraints = Tcgen05ClusterM2SearchConstraints(
             static_k=static_k,
             max_k_tiles=max_k_tiles,
+            allow_edge_k_tail_family=allow_edge_k_tail_family,
         )
         self.restrict_cluster_m_search((1, 2))
 
@@ -217,18 +224,30 @@ class CuteTcgen05Config:
     def cluster_m2_bk_is_valid(
         bk: int, constraints: Tcgen05ClusterM2SearchConstraints
     ) -> bool:
-        return constraints.static_k % bk == 0 and (
-            constraints.static_k // bk <= constraints.max_k_tiles
-        )
+        if bk <= 0:
+            return False
+        if constraints.allow_edge_k_tail_family:
+            return (
+                bk == TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K
+                and constraints.static_k > bk
+                and constraints.static_k % bk != 0
+                and (constraints.static_k + bk - 1) // bk <= constraints.max_k_tiles
+            )
+        if constraints.static_k % bk == 0:
+            return constraints.static_k // bk <= constraints.max_k_tiles
+        return False
 
     def _c_input_seed_config(self) -> Config | None:
         if not self.aux_kernel_detected:
             return None
         constraints = self.cluster_m2_search_constraints
-        if (
-            constraints is None
-            or TCGEN05_TWO_CTA_SEED_PID_TYPE not in self.allowed_pid_types
-        ):
+        if constraints is None:
+            return None
+        if constraints.allow_edge_k_tail_family:
+            # The validated edge + K-tail family uses the monolithic aux path;
+            # the productive c-input seed is for static-full residual kernels.
+            return None
+        if TCGEN05_TWO_CTA_SEED_PID_TYPE not in self.allowed_pid_types:
             return None
         if len(self.config_spec.block_sizes) != 3:
             return None
@@ -292,16 +311,19 @@ class CuteTcgen05Config:
         if not (self.search_enabled and config.get("tcgen05_cluster_m") == 2):
             return
         constraints = self.cluster_m2_search_constraints
-        if (
-            constraints is None
-            or TCGEN05_TWO_CTA_SEED_PID_TYPE not in self.allowed_pid_types
-        ):
+        if constraints is None:
+            config["tcgen05_cluster_m"] = 1
+            return
+        if TCGEN05_TWO_CTA_SEED_PID_TYPE not in self.allowed_pid_types:
             config["tcgen05_cluster_m"] = 1
             return
         block_sizes = config.get("block_sizes")
         if not isinstance(block_sizes, list) or len(block_sizes) < 3:
             config["tcgen05_cluster_m"] = 1
             return
+        edge_k_tail_family = constraints.allow_edge_k_tail_family
+        if edge_k_tail_family:
+            block_sizes[2] = TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K
         bk = block_sizes[2]
         if not isinstance(bk, int) or isinstance(bk, bool):
             config["tcgen05_cluster_m"] = 1
@@ -309,9 +331,23 @@ class CuteTcgen05Config:
         if not self.cluster_m2_bk_is_valid(bk, constraints):
             config["tcgen05_cluster_m"] = 1
             return
+        if edge_k_tail_family and not self.ab_stages_three_fits(
+            bm=TCGEN05_TWO_CTA_BLOCK_M,
+            bn=TCGEN05_TWO_CTA_BLOCK_N,
+            bk=TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K,
+            cluster_m=2,
+        ):
+            config["tcgen05_cluster_m"] = 1
+            return
         config["pid_type"] = TCGEN05_TWO_CTA_SEED_PID_TYPE
         block_sizes[0] = TCGEN05_TWO_CTA_BLOCK_M
         block_sizes[1] = TCGEN05_TWO_CTA_BLOCK_N
+        if edge_k_tail_family:
+            config["tcgen05_ab_stages"] = TCGEN05_TWO_CTA_EDGE_K_TAIL_AB_STAGES
+            config["tcgen05_acc_stages"] = TCGEN05_TWO_CTA_EDGE_K_TAIL_ACC_STAGES
+            config["tcgen05_c_stages"] = TCGEN05_TWO_CTA_EDGE_K_TAIL_C_STAGES
+            if self.aux_kernel_detected and self._has_any_matmul_fact_edge_tile(config):
+                self._set_aux_edge_monolithic_prefix(config)
 
     def allow_ab_stages_three_search(
         self,
@@ -436,22 +472,23 @@ class CuteTcgen05Config:
                 return True
         return False
 
+    def _has_any_matmul_fact_edge_tile(self, config: dict[str, object]) -> bool:
+        return any(
+            self._matmul_fact_has_edge_tile(config, fact_index=i)
+            for i in range(len(self.config_spec.matmul_facts))
+        )
+
     def _fix_aux_edge_search_config(self, config: dict[str, object]) -> None:
         if not (self.search_enabled and self.aux_kernel_detected):
             return
-        if not any(
-            self._matmul_fact_has_edge_tile(config, fact_index=i)
-            for i in range(len(self.config_spec.matmul_facts))
-        ):
+        if not self._has_any_matmul_fact_edge_tile(config):
             return
 
-        config[TCGEN05_STRATEGY_CONFIG_KEY] = (
-            Tcgen05Strategy.ROLE_LOCAL_MONOLITHIC.value
-        )
-        config[TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY] = 0
-        config[TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY] = 0
-        if config.get("tcgen05_ab_stages") == 1:
-            config["tcgen05_ab_stages"] = 2
+        if self._is_validated_cluster_m2_edge_search_candidate(config):
+            self._set_aux_edge_monolithic_prefix(config)
+            return
+
+        self._set_aux_edge_monolithic_prefix(config)
         config["tcgen05_acc_stages"] = 2
         config["tcgen05_c_stages"] = 4
         config[TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY] = 1
@@ -461,8 +498,6 @@ class CuteTcgen05Config:
             indexing = cast("list[object]", config["indexing"])
             for i in range(len(indexing)):
                 indexing[i] = "pointer"
-        config.pop("epilogue_subtile", None)
-
         block_sizes = config.get("block_sizes")
         if not isinstance(block_sizes, list):
             return
@@ -487,6 +522,27 @@ class CuteTcgen05Config:
             # bk=128 fallback is handled in cute_mma by forcing A INTER.
             # Both cases have runtime coverage in test_cute_lowerings.
 
+    @staticmethod
+    def _set_aux_edge_monolithic_prefix(config: dict[str, object]) -> None:
+        config[TCGEN05_STRATEGY_CONFIG_KEY] = (
+            Tcgen05Strategy.ROLE_LOCAL_MONOLITHIC.value
+        )
+        config[TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY] = 0
+        config[TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY] = 0
+        if config.get("tcgen05_ab_stages") == 1:
+            config["tcgen05_ab_stages"] = 2
+        config.pop("epilogue_subtile", None)
+
+    def _is_validated_cluster_m2_edge_search_candidate(
+        self, config: dict[str, object]
+    ) -> bool:
+        if config.get("tcgen05_cluster_m") != 2:
+            return False
+        constraints = self.cluster_m2_search_constraints
+        if constraints is None:
+            return False
+        return constraints.allow_edge_k_tail_family
+
     def _fix_cluster_m1_persistent_search_config(
         self, config: dict[str, object]
     ) -> None:
@@ -499,6 +555,13 @@ class CuteTcgen05Config:
             return
         block_sizes = config.get("block_sizes")
         if not isinstance(block_sizes, list) or not block_sizes:
+            return
+        constraints = self.cluster_m2_search_constraints
+        if constraints is not None and constraints.allow_edge_k_tail_family:
+            # persistent_interleaved stays in the flat enum so cluster_m=2
+            # edge-family samples can encode; cluster_m=1 samples from the
+            # same surface must use the validated flat edge fallback.
+            config["pid_type"] = "flat"
             return
         bm = block_sizes[0]
         if isinstance(bm, int) and not isinstance(bm, bool):
@@ -518,6 +581,7 @@ class CuteTcgen05Config:
         allow_persistent_pid_types: bool = False,
         allow_cluster_m2_search: bool = False,
         cluster_m2_static_k: int | None = None,
+        allow_cluster_m2_edge_k_tail_family: bool = False,
         ab_stages_three_dtype_bytes: int | None = None,
         ab_stages_three_device: torch.device | None = None,
     ) -> None:
@@ -525,17 +589,36 @@ class CuteTcgen05Config:
         # coverage. Some unvalidated combinations fail loudly at CuTe
         # construction/launch, while diagnostic pipeline modes can compile and
         # intentionally produce wrong output.
+        if allow_cluster_m2_edge_k_tail_family:
+            assert allow_cluster_m2_search, (
+                "cluster_m=2 edge/K-tail admission requires cluster_m=2 search"
+            )
+        cluster_m2_static_k_int: int | None = None
+        if allow_cluster_m2_search:
+            assert allow_persistent_pid_types or allow_cluster_m2_edge_k_tail_family, (
+                "cluster_m=2 search requires persistent pid types or the "
+                "validated output-edge + K-tail admission"
+            )
+            if cluster_m2_static_k is None:
+                raise AssertionError("cluster_m=2 search requires a static K extent")
+            cluster_m2_static_k_int = cluster_m2_static_k
+        if allow_cluster_m2_edge_k_tail_family and (
+            TCGEN05_TWO_CTA_SEED_PID_TYPE not in self.allowed_pid_types
+        ):
+            self.allowed_pid_types = (
+                *self.allowed_pid_types,
+                cast("PidTypeLiteral", TCGEN05_TWO_CTA_SEED_PID_TYPE),
+            )
         if not allow_persistent_pid_types:
             self.config_spec.disallow_pid_type("persistent_blocked")
-            self.config_spec.disallow_pid_type("persistent_interleaved")
+            if not allow_cluster_m2_edge_k_tail_family:
+                self.config_spec.disallow_pid_type("persistent_interleaved")
         if allow_cluster_m2_search:
-            assert allow_persistent_pid_types, (
-                "cluster_m=2 search requires persistent pid types"
+            assert cluster_m2_static_k_int is not None
+            self.allow_cluster_m2_search(
+                static_k=cluster_m2_static_k_int,
+                allow_edge_k_tail_family=allow_cluster_m2_edge_k_tail_family,
             )
-            assert cluster_m2_static_k is not None, (
-                "cluster_m=2 search requires a static K extent"
-            )
-            self.allow_cluster_m2_search(static_k=cluster_m2_static_k)
         else:
             self.restrict_cluster_m_search((1,))
         self.restrict_num_epi_warps_search((4,))

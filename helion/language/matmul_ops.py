@@ -25,6 +25,7 @@ from .._compiler.cute.matmul_utils import cute_resolve_active_matmul_k_block_id
 from .._compiler.cute.matmul_utils import cute_static_k_invariant_extent
 from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
 from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
+from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_EDGE_K_TAIL_MIN_DIM
 from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_MAX_K_TILES
 from .._compiler.matmul_utils import _compute_out_dtype
 from .._compiler.matmul_utils import _emit_pallas_matmul
@@ -333,6 +334,9 @@ def enforce_dot_requirements(lhs: torch.Tensor, rhs: torch.Tensor) -> None:
             max_search_n = max_tcgen05_n
             max_search_k = max_tcgen05_k
             min_search_m = 128 if max_tcgen05_m >= 256 else 64
+            two_cta_m_edge = static_m % TCGEN05_TWO_CTA_BLOCK_M != 0
+            two_cta_n_edge = static_n % TCGEN05_TWO_CTA_BLOCK_N != 0
+            two_cta_k_tail = static_k % max_search_k != 0
             if static_m % max_search_m != 0 and static_n % max_search_n != 0:
                 # Flat tcgen05 cluster_m=1 kernels now handle partial M and
                 # partial N output tiles in the SIMT edge epilogue. Keep N
@@ -349,7 +353,7 @@ def enforce_dot_requirements(lhs: torch.Tensor, rhs: torch.Tensor) -> None:
             # power-of-two candidate, checking the maximum per axis is enough.
             # Multi-root kernels are rejected later once device IR root count
             # is known.
-            allow_persistent_pid_types = (
+            allow_full_tile_persistent_pid_types = (
                 static_m % max_search_m == 0
                 and static_n % max_search_n == 0
                 and static_k % max_search_k == 0
@@ -358,11 +362,30 @@ def enforce_dot_requirements(lhs: torch.Tensor, rhs: torch.Tensor) -> None:
             # 2 when at least the largest searched bk fits the cap; smaller
             # invalid bk samples fall back to cluster_m=1 during normalization.
             max_cluster_m2_search_k = TCGEN05_TWO_CTA_MAX_K_TILES * max_search_k
-            allow_cluster_m2_search = (
-                allow_persistent_pid_types
+            allow_full_tile_cluster_m2_search = (
+                allow_full_tile_persistent_pid_types
                 and max_search_m >= TCGEN05_TWO_CTA_BLOCK_M
                 and max_search_n >= TCGEN05_TWO_CTA_BLOCK_N
                 and static_k <= max_cluster_m2_search_k
+            )
+            # Admit only the validated large double-output-edge + K-tail
+            # CtaGroup.TWO family: 256x256x128, persistent_interleaved.
+            # Smaller edge-heavy shapes continue using the established flat
+            # SIMT-edge fallback.
+            allow_edge_cluster_m2_search = (
+                not allow_full_tile_persistent_pid_types
+                and max_tcgen05_m >= TCGEN05_TWO_CTA_BLOCK_M
+                and max_tcgen05_n >= TCGEN05_TWO_CTA_BLOCK_N
+                and static_m >= TCGEN05_TWO_CTA_EDGE_K_TAIL_MIN_DIM
+                and static_n >= TCGEN05_TWO_CTA_EDGE_K_TAIL_MIN_DIM
+                and static_k >= TCGEN05_TWO_CTA_EDGE_K_TAIL_MIN_DIM
+                and static_k <= max_cluster_m2_search_k
+                and two_cta_m_edge
+                and two_cta_n_edge
+                and two_cta_k_tail
+            )
+            allow_cluster_m2_search = (
+                allow_full_tile_cluster_m2_search or allow_edge_cluster_m2_search
             )
             # Small-shape wave-quantization gate. Suppress cluster_m=2
             # search when the cluster_m=2 work-cluster count cannot fill
@@ -383,9 +406,10 @@ def enforce_dot_requirements(lhs: torch.Tensor, rhs: torch.Tensor) -> None:
             # validated to compile and run correctly on B200. Static full-tile
             # single-root role-local persistent kernels have coverage, so the
             # helper keeps persistent pid types when all search block sizes
-            # are full tiles. ``cluster_m=2`` re-enters search only for
-            # static-full CtaGroup.TWO problems whose search space can form
-            # validated 256x256 tiles within the K-tile cap. Search-time
+            # are full tiles. ``cluster_m=2`` re-enters search for static-full
+            # CtaGroup.TWO problems and for the large validated double-edge +
+            # K-tail family whose search space can form 256x256 tiles within
+            # the K-tile cap. Search-time
             # normalization projects cluster_m=2 products onto that validated
             # tile/pid shape and caps cluster_m=1 persistent products at
             # tcgen05-supported M tiles so search does not fall through the
@@ -410,9 +434,10 @@ def enforce_dot_requirements(lhs: torch.Tensor, rhs: torch.Tensor) -> None:
             # canonical 4096^3 acceptance criterion.
             ab_dtype_bytes = lhs.dtype.itemsize
             spec.narrow_tcgen05_autotune_to_validated_configs(
-                allow_persistent_pid_types=allow_persistent_pid_types,
+                allow_persistent_pid_types=allow_full_tile_persistent_pid_types,
                 allow_cluster_m2_search=allow_cluster_m2_search,
                 cluster_m2_static_k=static_k if allow_cluster_m2_search else None,
+                allow_cluster_m2_edge_k_tail_family=allow_edge_cluster_m2_search,
                 ab_stages_three_dtype_bytes=ab_dtype_bytes,
                 ab_stages_three_device=lhs.device,
             )

@@ -1736,21 +1736,41 @@ def _emit_mma_pipeline(
     if mma_impl != "universal" and zero_acc_expr:
         acc_expr = None
     tcgen05_pid_is_persistent = _is_persistent_pid_config(df.config)
-    tcgen05_static_full_tiles = (
-        m_size % bm == 0 and n_size % bn == 0 and k_total_size % bk == 0
+    tcgen05_requested_two_cta = _tcgen05_use_2cta_instrs(
+        bm=bm, cluster_m=tcgen05_cluster_m
     )
+    tcgen05_cluster_n_requested = _tcgen05_cluster_n(df.config)
+    tcgen05_static_output_tiles = m_size % bm == 0 and n_size % bn == 0
+    tcgen05_static_full_tiles = tcgen05_static_output_tiles and k_total_size % bk == 0
+    tcgen05_has_k_tail = k_total_size > bk and k_total_size % bk != 0
+    tcgen05_k_tail_only = tcgen05_static_output_tiles and tcgen05_has_k_tail
     tcgen05_double_edge_output = m_size % bm != 0 and n_size % bn != 0
+    tcgen05_double_edge_tma = (
+        mma_impl == "tcgen05"
+        and tcgen05_use_tma_pipeline
+        and tcgen05_pid_is_persistent
+        and tcgen05_cluster_m == 2
+        and tcgen05_cluster_n_requested == 1
+        and tcgen05_requested_two_cta
+        and tcgen05_double_edge_output
+        and (k_total_size % bk == 0 or tcgen05_has_k_tail)
+    )
     if (
         mma_impl == "tcgen05"
         and tcgen05_double_edge_output
+        and not tcgen05_double_edge_tma
         and (tcgen05_pid_is_persistent or tcgen05_cluster_m != 1)
     ):
         raise exc.BackendUnsupported(
             "cute",
             "tcgen05 SIMT edge epilogue double-edge output tiles are currently "
-            "validated only for flat tcgen05_cluster_m=1 kernels. Choose a "
-            "block_m or block_n that divides the static output extent, or use "
-            "a non-tcgen05 fallback for this persistent/clustered config.",
+            "validated only for flat tcgen05_cluster_m=1 kernels or "
+            "role-local CtaGroup.TWO kernels where K is divisible by block_k "
+            "or K > block_k with a tail; K <= block_k with a partial K tile "
+            "is still unsupported. "
+            "Choose a block_m or block_n that divides the static output extent, "
+            "choose a supported block_k for the static K extent, or use a "
+            "non-tcgen05 fallback for this persistent/clustered config.",
         )
     tcgen05_mixed_tma_scalar_fallback = (
         mma_impl == "tcgen05"
@@ -1767,21 +1787,57 @@ def _emit_mma_pipeline(
     tcgen05_sync_before_scalar_fallback = (
         tcgen05_mixed_tma_scalar_fallback and k_total_size % bk != 0
     )
+    tcgen05_preserve_tma_for_two_cta_k_tail = (
+        mma_impl == "tcgen05"
+        and tcgen05_use_tma_pipeline
+        and tcgen05_pid_is_persistent
+        and tcgen05_cluster_m == 2
+        and tcgen05_cluster_n_requested == 1
+        and tcgen05_requested_two_cta
+        and tcgen05_k_tail_only
+    )
+    tcgen05_m_edge_only = (
+        mma_impl == "tcgen05"
+        and tcgen05_use_tma_pipeline
+        and tcgen05_pid_is_persistent
+        and tcgen05_cluster_m == 2
+        and tcgen05_cluster_n_requested == 1
+        and tcgen05_requested_two_cta
+        and m_size % bm != 0
+        and n_size % bn == 0
+        and k_total_size % bk == 0
+    )
+    tcgen05_n_edge_only = (
+        mma_impl == "tcgen05"
+        and tcgen05_use_tma_pipeline
+        and tcgen05_pid_is_persistent
+        and tcgen05_cluster_m == 2
+        and tcgen05_cluster_n_requested == 1
+        and tcgen05_requested_two_cta
+        and m_size % bm == 0
+        and n_size % bn != 0
+        and k_total_size % bk == 0
+    )
     if (
         mma_impl == "tcgen05"
         and not tcgen05_static_full_tiles
         and not tcgen05_mixed_tma_scalar_fallback
+        and not tcgen05_preserve_tma_for_two_cta_k_tail
+        and not tcgen05_m_edge_only
+        and not tcgen05_n_edge_only
+        and not tcgen05_double_edge_tma
     ):
         # Mixed TMA full K tiles + scalar fallback tails are currently
-        # validated only for flat one-CTA kernels. Persistent or clustered
-        # partial-output kernels keep the shared scalar path.
+        # validated only for flat one-CTA kernels. Persistent CtaGroup.TWO
+        # K-tail-only kernels keep TMA enabled for
+        # tcgen05_role_local_k_tail_tma. Output-edge kernels keep TMA
+        # enabled for role-local AB production plus the predicated SIMT
+        # epilogue. Other persistent or clustered partial-output kernels keep
+        # the shared scalar path.
         tcgen05_use_tma_a = False
         tcgen05_use_tma_b = False
         tcgen05_use_tma = False
         tcgen05_use_tma_pipeline = False
-    tcgen05_requested_two_cta = _tcgen05_use_2cta_instrs(
-        bm=bm, cluster_m=tcgen05_cluster_m
-    )
     # cluster_m == 2 has two valid shapes:
     # - bm=128, CtaGroup.ONE, where each clustered CTA owns a different
     #   128-row output tile. This legacy clustered shape remains guarded.
@@ -1821,7 +1877,6 @@ def _emit_mma_pipeline(
     # this validated pairing demote to cluster_n=1 instead of throwing —
     # explicit user configs hit the BackendUnsupported gate, and autotune
     # stays narrowed to the validated subset.
-    tcgen05_cluster_n_requested = _tcgen05_cluster_n(df.config)
     if tcgen05_cluster_n_requested > 1 and not (
         mma_impl == "tcgen05" and tcgen05_is_two_cta and tcgen05_cluster_m == 2
     ):
@@ -1835,6 +1890,25 @@ def _emit_mma_pipeline(
         tcgen05_cluster_n = 1
     else:
         tcgen05_cluster_n = tcgen05_cluster_n_requested
+    tcgen05_role_local_k_tail_tma = (
+        tcgen05_preserve_tma_for_two_cta_k_tail
+        and tcgen05_is_two_cta
+        and tcgen05_cluster_n == 1
+    )
+    # Mirror the K-tail role-local guard so later cluster demotion or
+    # cluster_n enablement cannot silently admit unvalidated edge ownership.
+    tcgen05_role_local_m_edge_tma = (
+        tcgen05_m_edge_only and tcgen05_is_two_cta and tcgen05_cluster_n == 1
+    )
+    tcgen05_role_local_n_edge_tma = (
+        tcgen05_n_edge_only and tcgen05_is_two_cta and tcgen05_cluster_n == 1
+    )
+    tcgen05_role_local_double_edge_tma = (
+        tcgen05_double_edge_tma and tcgen05_is_two_cta and tcgen05_cluster_n == 1
+    )
+    tcgen05_role_local_uses_k_tail_tma = tcgen05_role_local_k_tail_tma or (
+        tcgen05_role_local_double_edge_tma and tcgen05_has_k_tail
+    )
     tcgen05_diagnose_cluster_m2_one_cta_role_local = bool(
         df.config.get(TCGEN05_CLUSTER_M2_ONE_CTA_ROLE_LOCAL_CONFIG_KEY, False)
     )
@@ -1876,7 +1950,13 @@ def _emit_mma_pipeline(
     tcgen05_use_role_local_tma_producer = (
         mma_impl == "tcgen05"
         and tcgen05_use_tma_pipeline
-        and tcgen05_static_full_tiles
+        and (
+            tcgen05_static_full_tiles
+            or tcgen05_role_local_k_tail_tma
+            or tcgen05_role_local_m_edge_tma
+            or tcgen05_role_local_n_edge_tma
+            or tcgen05_role_local_double_edge_tma
+        )
         and tcgen05_role_local_codegen_allowed
         and tcgen05_pid_is_persistent
     )
@@ -2016,7 +2096,7 @@ def _emit_mma_pipeline(
     tcgen05_use_tma_store_epilogue = (
         mma_impl == "tcgen05"
         and tcgen05_use_tma_pipeline
-        and tcgen05_static_full_tiles
+        and (tcgen05_static_full_tiles or tcgen05_role_local_k_tail_tma)
         and tcgen05_role_local_codegen_allowed
         and (not _is_persistent_pid_config(df.config) or tcgen05_use_role_local_epi)
     )
@@ -3128,6 +3208,53 @@ def _emit_mma_pipeline(
     tma_full_tile = df.new_var("tcgen05_tma_full_tile")
     tma_next_full_tile = df.new_var("tcgen05_tma_next_full_tile")
     tma_next_consumer_tile = df.new_var("tcgen05_tma_next_consumer_tile")
+
+    def _tcgen05_tma_output_tile_predicate() -> str:
+        if tcgen05_role_local_double_edge_tma:
+            # The role-local double-edge path lets TMA handle both partial AB
+            # stripes while the SIMT epilogue predicates aux loads and stores.
+            return (
+                f"{m_offset_var} < cutlass.Int32({m_size}) "
+                f"and {n_offset_var} < cutlass.Int32({n_size}) "
+            )
+        if tcgen05_role_local_m_edge_tma:
+            # The role-local M-edge path lets TMA handle the partial A stripe
+            # while the SIMT epilogue predicates aux loads and D stores.
+            return (
+                f"{m_offset_var} < cutlass.Int32({m_size}) "
+                f"and {n_offset_var} + cutlass.Int32({bn}) <= cutlass.Int32({n_size}) "
+            )
+        if tcgen05_role_local_n_edge_tma:
+            # The role-local N-edge path lets TMA handle the partial B stripe
+            # while the SIMT epilogue predicates aux loads and D stores.
+            return (
+                f"{m_offset_var} + cutlass.Int32({bm}) <= cutlass.Int32({m_size}) "
+                f"and {n_offset_var} < cutlass.Int32({n_size}) "
+            )
+        return (
+            f"{m_offset_var} + cutlass.Int32({bm}) <= cutlass.Int32({m_size}) "
+            f"and {n_offset_var} + cutlass.Int32({bn}) <= cutlass.Int32({n_size}) "
+        )
+
+    def _tcgen05_tma_k_tile_predicate(
+        *, k_tile_start_expr: str, full_tile_end_expr: str
+    ) -> str:
+        if tcgen05_role_local_uses_k_tail_tma:
+            return f"{k_tile_start_expr} < cutlass.Int32({k_total_size})"
+        return f"{full_tile_end_expr} <= cutlass.Int32({k_total_size})"
+
+    def _tcgen05_tma_tile_predicate(
+        *, k_tile_start_expr: str, full_tile_end_expr: str
+    ) -> str:
+        return (
+            _tcgen05_tma_output_tile_predicate()
+            + "and "
+            + _tcgen05_tma_k_tile_predicate(
+                k_tile_start_expr=k_tile_start_expr,
+                full_tile_end_expr=full_tile_end_expr,
+            )
+        )
+
     tma_k_tile = df.new_var("tcgen05_tma_k_tile")
     tma_barrier_ptr = df.new_var("tcgen05_tma_barrier")
     tma_producer_try_token = df.new_var("tcgen05_ab_producer_try_token")
@@ -3484,9 +3611,10 @@ def _emit_mma_pipeline(
                 )
                 _emit_per_tile(
                     f"{tma_initial_full_tile} = "
-                    f"{m_offset_var} + cutlass.Int32({bm}) <= cutlass.Int32({m_size}) "
-                    f"and {n_offset_var} + cutlass.Int32({bn}) <= cutlass.Int32({n_size}) "
-                    f"and cutlass.Int32({bk}) <= cutlass.Int32({k_total_size})",
+                    + _tcgen05_tma_tile_predicate(
+                        k_tile_start_expr="cutlass.Int32(0)",
+                        full_tile_end_expr=f"cutlass.Int32({bk})",
+                    ),
                     tma_load=tcgen05_use_role_local_tma_producer,
                 )
                 stage0_prefetch = _build_initial_prefetch_if(
@@ -3512,9 +3640,10 @@ def _emit_mma_pipeline(
                     # phase 0. See cute_plan.md §6.9.1.
                     _emit_per_tile(
                         f"{tma_initial_next_full_tile} = "
-                        f"{m_offset_var} + cutlass.Int32({bm}) <= cutlass.Int32({m_size}) "
-                        f"and {n_offset_var} + cutlass.Int32({bn}) <= cutlass.Int32({n_size}) "
-                        f"and cutlass.Int32({bk * tcgen05_ab_stage_count_value}) <= cutlass.Int32({k_total_size})",
+                        + _tcgen05_tma_tile_predicate(
+                            k_tile_start_expr=f"cutlass.Int32({bk * (tcgen05_ab_stage_count_value - 1)})",
+                            full_tile_end_expr=f"cutlass.Int32({bk * tcgen05_ab_stage_count_value})",
+                        ),
                         tma_load=tcgen05_use_role_local_tma_producer,
                     )
                     for stage_idx in range(1, tcgen05_ab_stage_count_value):
@@ -3529,9 +3658,10 @@ def _emit_mma_pipeline(
                             )
                             _emit_per_tile(
                                 f"{stage_gate_var} = "
-                                f"{m_offset_var} + cutlass.Int32({bm}) <= cutlass.Int32({m_size}) "
-                                f"and {n_offset_var} + cutlass.Int32({bn}) <= cutlass.Int32({n_size}) "
-                                f"and cutlass.Int32({bk * (stage_idx + 1)}) <= cutlass.Int32({k_total_size})",
+                                + _tcgen05_tma_tile_predicate(
+                                    k_tile_start_expr=f"cutlass.Int32({bk * stage_idx})",
+                                    full_tile_end_expr=f"cutlass.Int32({bk * (stage_idx + 1)})",
+                                ),
                                 tma_load=tcgen05_use_role_local_tma_producer,
                             )
                             stage_gates = [tma_initial_full_tile, stage_gate_var]
@@ -3718,9 +3848,10 @@ def _emit_mma_pipeline(
                 )
                 tma_full_tile_stmt = statement_from_string(
                     f"{tma_full_tile} = "
-                    f"{m_offset_var} + cutlass.Int32({bm}) <= cutlass.Int32({m_size}) "
-                    f"and {n_offset_var} + cutlass.Int32({bn}) <= cutlass.Int32({n_size}) "
-                    f"and {k_offset_var} + cutlass.Int32({bk}) <= cutlass.Int32({k_total_size})"
+                    + _tcgen05_tma_tile_predicate(
+                        k_tile_start_expr=k_offset_var,
+                        full_tile_end_expr=f"{k_offset_var} + cutlass.Int32({bk})",
+                    )
                 )
                 if not tcgen05_use_role_local_mma_exec:
                     cg.add_statement(tma_k_tile_stmt)
@@ -3804,15 +3935,17 @@ def _emit_mma_pipeline(
                         ),
                         statement_from_string(
                             f"{tma_full_tile} = "
-                            f"{m_offset_var} + cutlass.Int32({bm}) <= cutlass.Int32({m_size}) "
-                            f"and {n_offset_var} + cutlass.Int32({bn}) <= cutlass.Int32({n_size}) "
-                            f"and {k_offset_var} + cutlass.Int32({bk}) <= cutlass.Int32({k_total_size})"
+                            + _tcgen05_tma_tile_predicate(
+                                k_tile_start_expr=k_offset_var,
+                                full_tile_end_expr=f"{k_offset_var} + cutlass.Int32({bk})",
+                            )
                         ),
                         statement_from_string(
                             f"{tma_next_full_tile} = "
-                            f"{m_offset_var} + cutlass.Int32({bm}) <= cutlass.Int32({m_size}) "
-                            f"and {n_offset_var} + cutlass.Int32({bn}) <= cutlass.Int32({n_size}) "
-                            f"and {k_offset_var} + cutlass.Int32({bk * (tcgen05_ab_stage_count_value + 1)}) <= cutlass.Int32({k_total_size})"
+                            + _tcgen05_tma_tile_predicate(
+                                k_tile_start_expr=f"{k_offset_var} + cutlass.Int32({bk * tcgen05_ab_stage_count_value})",
+                                full_tile_end_expr=f"{k_offset_var} + cutlass.Int32({bk * (tcgen05_ab_stage_count_value + 1)})",
+                            )
                         ),
                         statement_from_string(
                             f"{tma_producer_try_token} = cutlass.Boolean(0)"
@@ -3842,7 +3975,10 @@ def _emit_mma_pipeline(
                         exec_loop_body.append(
                             statement_from_string(
                                 f"{tma_next_consumer_tile} = "
-                                f"{k_offset_var} + cutlass.Int32({bk * 2}) <= cutlass.Int32({k_total_size})"
+                                + _tcgen05_tma_k_tile_predicate(
+                                    k_tile_start_expr=f"{k_offset_var} + cutlass.Int32({bk})",
+                                    full_tile_end_expr=f"{k_offset_var} + cutlass.Int32({bk * 2})",
+                                )
                             )
                         )
                     else:
