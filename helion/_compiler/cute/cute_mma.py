@@ -86,11 +86,14 @@ from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_CLUSTER_M
 from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_PID_TYPE
 from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_PROBLEM_SHAPE
+from .tcgen05_constants import TCGEN05_PURE_CLC_SCHEDULER_OBJECT_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_SCHED_STAGE_COUNT_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
 from .tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
 from .tcgen05_constants import TCGEN05_TWO_CTA_EDGE_TMA_STORE_MAX_AB_STAGES
 from .tcgen05_lifecycle import Tcgen05LifecycleContext
+from .tcgen05_pure_matmul import Tcgen05PureClcSchedulerObject
 from .tcgen05_pure_matmul import Tcgen05PureMatmulObjectModel
 
 if TYPE_CHECKING:
@@ -1625,18 +1628,18 @@ def _wrap_stmt_in_if(stmt: ast.stmt, predicate_src: str) -> ast.If:
     )
 
 
-def _trace_mma_to_store_dtype(
+def _trace_mma_to_single_store_value_and_dtype(
     mma_node: Node,
     graphs: list[GraphInfo],
-) -> torch.dtype | None:
-    """Forward-trace ``mma_node`` to the unique consuming store target dtype.
+) -> tuple[Node, torch.dtype] | None:
+    """Forward-trace ``mma_node`` to exactly one consuming store.
 
     Walks ``_phi`` / ``_new_var`` / ``convert_element_type`` /
     ``operator.getitem`` chains and crosses subgraph boundaries via the
     inner ``output`` node and the matching outer-graph
     ``operator.getitem(_for_loop_node, idx)``. Returns ``None`` when the
-    trace cannot pin a unique store target — multiple stores with
-    different dtypes, an op the trace cannot safely follow, no reachable
+    trace cannot pin exactly one store target — multiple stores even with
+    the same dtype, an op the trace cannot safely follow, no reachable
     store, or ``mma_node.graph`` not present in ``graphs``. The caller
     must treat ``None`` as "fall back; the cross-site assertion catches
     real mismatches".
@@ -1646,6 +1649,101 @@ def _trace_mma_to_store_dtype(
     ``GraphInfo.graph`` by identity — that's the disambiguator across
     structurally-identical subgraphs (e.g., a kernel with two distinct
     matmuls would otherwise collide on ``_graph_signature``).
+    """
+    import operator
+
+    from ...language import _tracing_ops
+    from ...language import memory_ops
+
+    graph_id_of: dict[torch.fx.Graph, int] = {}
+    for_loop_calls_by_graph_id: dict[int, list[Node]] = {}
+    for graph_info in graphs:
+        graph_id_of[graph_info.graph] = graph_info.graph_id
+        for node in graph_info.graph.nodes:
+            if node.op != "call_function":
+                continue
+            if not _tracing_ops.is_for_loop_target(node.target):
+                continue
+            graph_id_arg = node.args[0] if node.args else None
+            if not isinstance(graph_id_arg, int):
+                continue
+            for_loop_calls_by_graph_id.setdefault(graph_id_arg, []).append(node)
+
+    if mma_node.graph not in graph_id_of:
+        return None
+
+    store_target: tuple[Node, torch.dtype] | None = None
+    store_count = 0
+    visited: set[Node] = set()
+    stack: list[Node] = [mma_node]
+    while stack:
+        cur = stack.pop()
+        if cur in visited:
+            continue
+        visited.add(cur)
+        for user in cur.users:
+            if user.op == "output":
+                graph_id = graph_id_of.get(cur.graph)
+                if graph_id is None:
+                    return None
+                output_args = user.args[0] if user.args else None
+                if not isinstance(output_args, (list, tuple)):
+                    return None
+                out_indices = [i for i, arg in enumerate(output_args) if arg is cur]
+                if not out_indices:
+                    return None
+                for outer_call in for_loop_calls_by_graph_id.get(graph_id, []):
+                    for outer_user in outer_call.users:
+                        if (
+                            outer_user.op == "call_function"
+                            and outer_user.target is operator.getitem
+                            and len(outer_user.args) >= 2
+                            and outer_user.args[1] in out_indices
+                            and outer_user not in visited
+                        ):
+                            stack.append(outer_user)
+                continue
+            if user.op != "call_function":
+                continue
+            target = user.target
+            if target is memory_ops.store:
+                tensor_node = user.args[0] if user.args else None
+                if not isinstance(tensor_node, Node):
+                    return None
+                fake = tensor_node.meta.get("val")
+                if not isinstance(fake, torch.Tensor):
+                    return None
+                store_count += 1
+                if store_count > 1:
+                    return None
+                store_target = (cur, fake.dtype)
+                continue
+            if store_count > 0:
+                # A value that already reached its single store cannot also feed
+                # additional pointwise/use chains under this identity-store trace.
+                return None
+            if (
+                target is _tracing_ops._phi
+                or target is _tracing_ops._new_var
+                or target is operator.getitem
+                or target in _TRACE_THROUGH_TARGETS
+            ):
+                stack.append(user)
+                continue
+            return None
+
+    return store_target if store_count == 1 else None
+
+
+def _trace_mma_to_store_dtype(
+    mma_node: Node,
+    graphs: list[GraphInfo],
+) -> torch.dtype | None:
+    """Forward-trace ``mma_node`` to a unique reachable store dtype.
+
+    Unlike the pure CLC identity-store gate, this general dtype-inference
+    helper allows same-dtype fan-out because normal tcgen05 epilogue planning
+    only needs a single target dtype.
     """
     import operator
 
@@ -1726,6 +1824,42 @@ def _trace_mma_to_store_dtype(
     if len(discovered) == 1:
         return next(iter(discovered))
     return None
+
+
+def _trace_mma_to_single_identity_store_dtype(
+    mma_node: Node,
+    graphs: list[GraphInfo],
+) -> torch.dtype | None:
+    """Return the store dtype only for exactly one identity cast store."""
+    from .cute_fx_walk import build_inner_outputs_index_from_graphs
+    from .cute_fx_walk import walk_carrier_to_tcgen05_matmul
+
+    traced = _trace_mma_to_single_store_value_and_dtype(mma_node, graphs)
+    if traced is None:
+        return None
+    store_value, output_dtype = traced
+    if (
+        store_value.op != "call_function"
+        or store_value.target is not torch.ops.prims.convert_element_type.default
+        or store_value.kwargs
+    ):
+        return None
+    cast_input = store_value.args[0] if store_value.args else None
+    if not isinstance(cast_input, Node):
+        return None
+    if (
+        walk_carrier_to_tcgen05_matmul(
+            cast_input,
+            {mma_node},
+            build_inner_outputs_index_from_graphs(graphs),
+        )
+        is None
+    ):
+        return None
+    dtype_arg = store_value.args[1] if len(store_value.args) > 1 else None
+    if dtype_arg != output_dtype:
+        return None
+    return output_dtype
 
 
 def _emit_mma_pipeline(
@@ -1935,10 +2069,19 @@ def _emit_mma_pipeline(
     tcgen05_requested_flat_role_coordinates = bool(
         df.config.get(TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY, False)
     )
+    tcgen05_requested_pure_clc_scheduler_object = bool(
+        df.config.get(TCGEN05_PURE_CLC_SCHEDULER_OBJECT_CONFIG_KEY, False)
+    )
     if tcgen05_requested_flat_role_coordinates and mma_impl != "tcgen05":
         raise exc.BackendUnsupported(
             "cute",
             f"{TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY}=True requires "
+            "tcgen05 MMA codegen",
+        )
+    if tcgen05_requested_pure_clc_scheduler_object and mma_impl != "tcgen05":
+        raise exc.BackendUnsupported(
+            "cute",
+            f"{TCGEN05_PURE_CLC_SCHEDULER_OBJECT_CONFIG_KEY}=True requires "
             "tcgen05 MMA codegen",
         )
     tcgen05_pid_is_persistent = _is_persistent_pid_config(df.config)
@@ -2671,6 +2814,7 @@ def _emit_mma_pipeline(
     tcgen05_explicit_epi_tile_m: int | None = None
     tcgen05_explicit_epi_tile_n: int | None = None
     tcgen05_explicit_d_store_box_n: int | None = None
+    tcgen05_use_pure_clc_scheduler_object = False
     tcgen05_use_flat_role_coordinates = False
     if mma_impl == "tcgen05":
         # Use ``warp_spec.ab_load_warps`` so the strategy data model
@@ -2911,6 +3055,46 @@ def _emit_mma_pipeline(
                     "the guarded static-full bf16 pure matmul CtaGroup.TWO "
                     "256x256x64 explicit-epilogue-tile path",
                 )
+        tcgen05_use_pure_clc_scheduler_object = (
+            tcgen05_requested_pure_clc_scheduler_object
+        )
+        if tcgen05_use_pure_clc_scheduler_object:
+            identity_store_dtype = (
+                _trace_mma_to_single_identity_store_dtype(fx_node, cg.codegen_graphs)
+                if fx_node is not None
+                else None
+            )
+            if not (
+                tcgen05_use_flat_role_coordinates
+                and TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY in df.config
+                and df.config.get(TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY) is True
+                and (m_size, n_size, k_total_size) == (1024, 4096, 1024)
+                and tcgen05_ab_stage_count_value == 3
+                and tcgen05_acc_stage_count_value == 2
+                and tcgen05_c_stage_count_value == 2
+                and acc_expr is None
+                and identity_store_dtype == input_dtype
+            ):
+                raise exc.BackendUnsupported(
+                    "cute",
+                    f"{TCGEN05_PURE_CLC_SCHEDULER_OBJECT_CONFIG_KEY}=True requires "
+                    "the validated Target1 AB3 TVM-FFI flat-role identity-store seed",
+                )
+        tcgen05_scheduler_warp_count_for_plan = (
+            1
+            if tcgen05_use_pure_clc_scheduler_object
+            else tcgen05_warp_spec.scheduler_warps
+        )
+        tcgen05_sched_stage_count_for_plan = (
+            max(1, tcgen05_sched_stage_count_value)
+            if tcgen05_use_pure_clc_scheduler_object
+            else tcgen05_sched_stage_count_value
+        )
+        tcgen05_persistence_model_for_plan = (
+            Tcgen05PersistenceModel.CLC_PERSISTENT.value
+            if tcgen05_use_pure_clc_scheduler_object
+            else tcgen05_persistence_model_str
+        )
         tcgen05_matmul_plan = CuteTcgen05MatmulPlan(
             bm=bm,
             bn=bn,
@@ -2929,15 +3113,15 @@ def _emit_mma_pipeline(
             c_stage_count=tcgen05_c_stage_count_value,
             epi_warp_count=tcgen05_epi_warp_count_value,
             ab_load_warp_count=tcgen05_warp_spec.ab_load_warps,
-            scheduler_warp_count=tcgen05_warp_spec.scheduler_warps,
-            sched_stage_count=tcgen05_sched_stage_count_value,
+            scheduler_warp_count=tcgen05_scheduler_warp_count_for_plan,
+            sched_stage_count=tcgen05_sched_stage_count_for_plan,
             # ``c_input_warp_count`` plumbs the warp-spec slot
             # through the matmul plan (``cute_plan.md`` §7.5.3.2).
             # Validator restricts the value to ``{0, 1}`` under
             # WITH_SCHEDULER and ``{0}`` under MONOLITHIC; codegen
             # body for the C-input warp is inert today.
             c_input_warp_count=tcgen05_warp_spec.c_input_warps,
-            persistence_model=tcgen05_persistence_model_str,
+            persistence_model=tcgen05_persistence_model_for_plan,
             cluster_n=tcgen05_cluster_n,
             l2_swizzle_size=tcgen05_l2_swizzle_size_value,
             tma_store_full_tiles_only=tcgen05_tma_store_full_tiles_only,
@@ -3344,6 +3528,13 @@ def _emit_mma_pipeline(
                 df, use_clc=tcgen05_matmul_plan.is_clc_persistent
             )
             df.cute_state.register_tcgen05_sched_pipeline_plan(tcgen05_sched_plan)
+            if tcgen05_use_pure_clc_scheduler_object:
+                df.cute_state.register_tcgen05_pure_clc_scheduler_object(
+                    Tcgen05PureClcSchedulerObject(
+                        sched_plan=tcgen05_sched_plan,
+                        scheduler_warp_id=tcgen05_matmul_plan.scheduler_warp_id,
+                    )
+                )
             # WITH_SCHEDULER's scheduler-warp topology: every CTA in
             # the cluster runs its own scheduler warp, publishing to
             # its own SMEM mailbox. Both CTAs converge on the same

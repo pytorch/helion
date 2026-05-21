@@ -67,6 +67,7 @@ from helion._compiler.cute.cute_mma import _tcgen05_ab_stage_count
 from helion._compiler.cute.cute_mma import _tcgen05_epi_warp_count
 from helion._compiler.cute.cute_mma import _tcgen05_root_m_threads
 from helion._compiler.cute.cute_mma import _tcgen05_tmem_barrier_thread_count
+from helion._compiler.cute.cute_mma import _Tcgen05SchedPipelinePlan
 from helion._compiler.cute.cute_mma import _trace_mma_to_store_dtype
 from helion._compiler.cute.cute_mma import can_codegen_cute_mma_aten
 from helion._compiler.cute.cute_reshape import _get_dim_local_coord
@@ -175,6 +176,9 @@ from helion._compiler.cute.tcgen05_constants import TCGEN05_LARGE_BN_PROOF_CONFI
 from helion._compiler.cute.tcgen05_constants import TCGEN05_LARGE_BN_PROOF_PID_TYPE
 from helion._compiler.cute.tcgen05_constants import TCGEN05_LARGE_BN_PROOF_STAGE_CONFIGS
 from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_PURE_CLC_SCHEDULER_OBJECT_CONFIG_KEY,
+)
+from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_SCHED_CONSUMER_WAIT_MODE_CONFIG_KEY,
 )
 from helion._compiler.cute.tcgen05_constants import (
@@ -199,11 +203,16 @@ from helion._compiler.cute.tcgen05_constants import (
 from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_TWO_CTA_EDGE_K_TAIL_SCHEDULER_L2_SWIZZLE_SIZE,
 )
+from helion._compiler.cute.tcgen05_pure_matmul import Tcgen05ClcQueryParams
+from helion._compiler.cute.tcgen05_pure_matmul import Tcgen05InitialWorkTileParams
+from helion._compiler.cute.tcgen05_pure_matmul import Tcgen05PureClcSchedulerObject
 from helion._compiler.cute.tcgen05_pure_matmul import Tcgen05PureMatmulObjectModel
 from helion._compiler.cute.tcgen05_pure_matmul import Tcgen05TmaStoreBodyCoreParams
 from helion._compiler.cute.tcgen05_pure_matmul import Tcgen05TmaStorePipelineParams
 from helion._compiler.cute.tcgen05_pure_matmul import Tcgen05TmaStoreSubtileLoopParams
 from helion._compiler.cute.tcgen05_pure_matmul import Tcgen05TmaStoreTailParams
+from helion._compiler.cute.tcgen05_pure_matmul import Tcgen05WorkTileConsumeParams
+from helion._compiler.cute.tcgen05_pure_matmul import Tcgen05WorkTilePublishParams
 from helion._compiler.device_ir import ForLoopGraphInfo
 from helion._compiler.device_ir import GraphInfo
 from helion._compiler.device_ir import RootGraphInfo
@@ -2436,6 +2445,489 @@ class TestCuteLowerings(unittest.TestCase):
         self.assertIn(
             "cute_compile_options='--generate-line-info --enable-tvm-ffi'", code
         )
+
+    def test_tcgen05_pure_clc_scheduler_object_codegen(self) -> None:
+        args = (
+            torch.empty([1024, 1024], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([1024, 4096], device=DEVICE, dtype=torch.bfloat16),
+        )
+        cfg = _make_tcgen05_role_local_monolithic_seed_config(
+            block_sizes=[256, 256, 64],
+            l2_groupings=[1],
+            pid_type="persistent_interleaved",
+            tcgen05_cluster_m=2,
+            tcgen05_cluster_n=1,
+            tcgen05_ab_stages=3,
+            tcgen05_acc_stages=2,
+            tcgen05_c_stages=2,
+            tcgen05_num_epi_warps=4,
+            **{
+                TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY: (
+                    Tcgen05LayoutStrategy.EXPLICIT_EPI_TILE.value
+                ),
+                TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_M_KEY: 128,
+                TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_N_KEY: 32,
+                TCGEN05_LAYOUT_OVERRIDES_D_STORE_BOX_N_KEY: 32,
+                TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY: True,
+                TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY: True,
+                TCGEN05_PURE_CLC_SCHEDULER_OBJECT_CONFIG_KEY: True,
+            },
+        )
+        original_build_query = Tcgen05PureClcSchedulerObject.build_clc_query_block
+        original_build_initial = (
+            Tcgen05PureClcSchedulerObject.build_initial_work_tile_block
+        )
+        original_build_publish = (
+            Tcgen05PureClcSchedulerObject.build_work_tile_publish_block
+        )
+        original_build_sentinel = (
+            Tcgen05PureClcSchedulerObject.build_sentinel_publish_block
+        )
+        original_build_consume = (
+            Tcgen05PureClcSchedulerObject.build_next_work_tile_consume_block
+        )
+
+        def marked_build_initial(
+            obj: Tcgen05PureClcSchedulerObject,
+            params: Tcgen05InitialWorkTileParams,
+        ) -> list[ast.stmt]:
+            return [
+                statement_from_string(
+                    "tcgen05_pure_clc_initial_marker = cutlass.Int32(1)"
+                ),
+                *original_build_initial(obj, params),
+            ]
+
+        def marked_build_query(
+            obj: Tcgen05PureClcSchedulerObject,
+            params: Tcgen05ClcQueryParams,
+        ) -> list[ast.stmt]:
+            return [
+                statement_from_string(
+                    "tcgen05_pure_clc_query_marker = cutlass.Int32(1)"
+                ),
+                *original_build_query(obj, params),
+            ]
+
+        def marked_build_publish(
+            obj: Tcgen05PureClcSchedulerObject,
+            params: Tcgen05WorkTilePublishParams,
+        ) -> list[ast.stmt]:
+            return [
+                statement_from_string(
+                    "tcgen05_pure_clc_publish_marker = cutlass.Int32(1)"
+                ),
+                *original_build_publish(obj, params),
+            ]
+
+        def marked_build_sentinel(
+            obj: Tcgen05PureClcSchedulerObject,
+            params: Tcgen05WorkTilePublishParams,
+        ) -> list[ast.stmt]:
+            return [
+                statement_from_string(
+                    "tcgen05_pure_clc_sentinel_marker = cutlass.Int32(1)"
+                ),
+                *original_build_sentinel(obj, params),
+            ]
+
+        def marked_build_consume(
+            obj: Tcgen05PureClcSchedulerObject,
+            params: Tcgen05WorkTileConsumeParams,
+        ) -> list[ast.stmt]:
+            return [
+                statement_from_string(
+                    "tcgen05_pure_clc_consume_marker = cutlass.Int32(1)"
+                ),
+                *original_build_consume(obj, params),
+            ]
+
+        with (
+            patch_cute_mma_support(),
+            patch.object(
+                Tcgen05PureClcSchedulerObject,
+                "build_initial_work_tile_block",
+                autospec=True,
+                side_effect=marked_build_initial,
+            ) as build_initial,
+            patch.object(
+                Tcgen05PureClcSchedulerObject,
+                "build_clc_query_block",
+                autospec=True,
+                side_effect=marked_build_query,
+            ) as build_query,
+            patch.object(
+                Tcgen05PureClcSchedulerObject,
+                "build_work_tile_publish_block",
+                autospec=True,
+                side_effect=marked_build_publish,
+            ) as build_publish,
+            patch.object(
+                Tcgen05PureClcSchedulerObject,
+                "build_sentinel_publish_block",
+                autospec=True,
+                side_effect=marked_build_sentinel,
+            ) as build_sentinel,
+            patch.object(
+                Tcgen05PureClcSchedulerObject,
+                "build_next_work_tile_consume_block",
+                autospec=True,
+                side_effect=marked_build_consume,
+            ) as build_consume,
+        ):
+            bound = cute_matmul_role_local_monolithic_4096_bf16.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            code = bound.to_triton_code(cfg)
+
+        self.assertGreaterEqual(build_initial.call_count, 2)
+        build_query.assert_called_once()
+        build_publish.assert_called_once()
+        build_sentinel.assert_not_called()
+        self.assertGreaterEqual(build_consume.call_count, 1)
+        self.assertIn("block=(256, 1, 1)", code)
+        self.assertRegex(
+            code,
+            r"_launcher\([^,]+, \(2 \* .*_BLOCK_SIZE_0.*_BLOCK_SIZE_1.*\), 1, 1\)",
+        )
+        self.assertIn("tcgen05_sched_pipeline", code)
+        self.assertIn("PipelineAsync.create(num_stages=1", code)
+        self.assertIn("_cute_issue_clc_query_nomulticast", code)
+        self.assertIn("tcgen05_pure_clc_initial_marker = cutlass.Int32(1)", code)
+        self.assertIn("tcgen05_pure_clc_query_marker = cutlass.Int32(1)", code)
+        self.assertIn("tcgen05_pure_clc_publish_marker = cutlass.Int32(1)", code)
+        self.assertLess(
+            code.index("tcgen05_pure_clc_query_marker = cutlass.Int32(1)"),
+            code.index("tcgen05_pure_clc_publish_marker = cutlass.Int32(1)"),
+        )
+        self.assertNotIn("tcgen05_pure_clc_sentinel_marker = cutlass.Int32(1)", code)
+        self.assertIn("tcgen05_pure_clc_consume_marker = cutlass.Int32(1)", code)
+        self.assertNotIn("tcgen05_role_local_0_tile_sched_params", code)
+        self.assertIn(
+            "cute.arch.make_warp_uniform(cute.arch.warp_idx()) == cutlass.Int32(6)",
+            code,
+        )
+
+    def test_tcgen05_pure_clc_scheduler_object_builds_initial_work_tile(self) -> None:
+        obj = Tcgen05PureClcSchedulerObject(
+            sched_plan=_Tcgen05SchedPipelinePlan(
+                barriers="",
+                producer_group="",
+                consumer_group="",
+                pipeline="sched_pipeline",
+                producer_state="sched_producer_state",
+                consumer_state="sched_consumer_state",
+            ),
+            scheduler_warp_id=6,
+        )
+        block = obj.build_initial_work_tile_block(
+            Tcgen05InitialWorkTileParams(
+                scheduler_params="params",
+                scheduler_params_args="shape, (2, 1, 1)",
+                scheduler="sched",
+                work_tile="work",
+                cluster_bidx="cluster_bidx",
+                cluster_bidy="cluster_bidy",
+                cluster_bidz="cluster_bidz",
+                valid="valid",
+                cluster_m=2,
+            )
+        )
+        source = "\n".join(ast.unparse(stmt) for stmt in block)
+        self.assertIn(
+            "params = cutlass.utils.PersistentTileSchedulerParams(shape, (2, 1, 1))",
+            source,
+        )
+        self.assertIn(
+            "sched._current_work_linear_idx = cute.arch.block_idx()[0] // "
+            "cutlass.Int32(2)",
+            source,
+        )
+        self.assertIn("work = sched.get_current_work()", source)
+        self.assertIn("cluster_bidx = work.tile_idx[0]", source)
+
+    def test_tcgen05_pure_clc_scheduler_object_builds_query_block(self) -> None:
+        obj = Tcgen05PureClcSchedulerObject(
+            sched_plan=_Tcgen05SchedPipelinePlan(
+                barriers="",
+                producer_group="",
+                consumer_group="",
+                pipeline="sched_pipeline",
+                producer_state="sched_producer_state",
+                consumer_state="sched_consumer_state",
+            ),
+            scheduler_warp_id=6,
+        )
+        block = obj.build_clc_query_block(
+            Tcgen05ClcQueryParams(
+                leader_predicate="cute.arch.lane_idx() == cutlass.Int32(0)",
+                clc_mbar_smem_ptr="mbar_ptr",
+                clc_response_smem_ptr="response_ptr",
+                clc_mbar_phase="phase",
+                cluster_m=2,
+                bidx="bidx",
+                bidy="bidy",
+                bidz="bidz",
+                valid="valid",
+                scheduler="sched",
+                next_work_tile="next_work",
+                cluster_bidx="cluster_bidx",
+                cluster_bidy="cluster_bidy",
+                cluster_bidz="cluster_bidz",
+            )
+        )
+        source = "\n".join(ast.unparse(stmt) for stmt in block)
+        self.assertIn(
+            "_cute_issue_clc_query_nomulticast(mbar_ptr, response_ptr)", source
+        )
+        self.assertIn("cute.arch.mbarrier_wait(mbar_ptr, phase)", source)
+        self.assertIn(
+            "bidx, bidy, bidz, valid = cute.arch.clc_response(response_ptr)",
+            source,
+        )
+        self.assertIn(
+            "sched._current_work_linear_idx = bidx // cutlass.Int32(2)",
+            source,
+        )
+        self.assertIn("cluster_bidx = next_work.tile_idx[0]", source)
+
+    def test_tcgen05_pure_clc_scheduler_object_builds_publish_blocks(self) -> None:
+        obj = Tcgen05PureClcSchedulerObject(
+            sched_plan=_Tcgen05SchedPipelinePlan(
+                barriers="",
+                producer_group="",
+                consumer_group="",
+                pipeline="sched_pipeline",
+                producer_state="sched_producer_state",
+                consumer_state="sched_consumer_state",
+            ),
+            scheduler_warp_id=6,
+        )
+        params = Tcgen05WorkTilePublishParams(
+            cluster_m=2,
+            sched_pipeline="sched_pipeline",
+            sched_producer_state="producer_state",
+            producer_barrier_state="consumer_state",
+            producer_smem_ptr="work_smem_ptr",
+            leader_predicate="cute.arch.lane_idx() == cutlass.Int32(0)",
+            sched_barrier_ptr="barrier_ptr",
+            sched_peer_rank="peer_rank",
+            sched_peer_m="peer_m",
+            cluster_bidx="cluster_bidx",
+            cluster_bidy="cluster_bidy",
+            cluster_bidz="cluster_bidz",
+            valid="valid",
+            local_slots=("slot0", "slot1", "slot2", "slot3"),
+        )
+        publish_source = "\n".join(
+            ast.unparse(stmt) for stmt in obj.build_work_tile_publish_block(params)
+        )
+        sentinel_source = "\n".join(
+            ast.unparse(stmt) for stmt in obj.build_sentinel_publish_block(params)
+        )
+        self.assertIn("sched_pipeline.producer_acquire(producer_state)", publish_source)
+        self.assertIn(
+            "barrier_ptr = sched_pipeline.producer_get_barrier(consumer_state)",
+            publish_source,
+        )
+        self.assertIn("peer_rank = cute.arch.lane_idx()", publish_source)
+        self.assertIn(
+            "_cute_store_shared_remote_x4(cluster_bidx + peer_m, cluster_bidy, "
+            "cluster_bidz, valid",
+            publish_source,
+        )
+        self.assertIn(
+            "_cute_store_shared_remote_x4(cutlass.Int32(0), cutlass.Int32(0), "
+            "cutlass.Int32(0), cutlass.Int32(0)",
+            sentinel_source,
+        )
+
+    def test_tcgen05_pure_clc_scheduler_object_consumes_next_work_tile(
+        self,
+    ) -> None:
+        obj = Tcgen05PureClcSchedulerObject(
+            sched_plan=_Tcgen05SchedPipelinePlan(
+                barriers="",
+                producer_group="",
+                consumer_group="",
+                pipeline="sched_pipeline",
+                producer_state="sched_producer_state",
+                consumer_state="sched_consumer_state",
+            ),
+            scheduler_warp_id=6,
+        )
+        block = obj.build_next_work_tile_consume_block(
+            Tcgen05WorkTileConsumeParams(
+                sched_pipeline="sched_pipeline",
+                sched_consumer_state="consumer_state",
+                work_tile_smem="work_smem",
+                valid="valid",
+                cluster_bidx="cluster_bidx",
+                cluster_bidy="cluster_bidy",
+                cluster_bidz="cluster_bidz",
+                work_tile_stage_index="consumer_state.index",
+            )
+        )
+        source = "\n".join(ast.unparse(stmt) for stmt in block)
+        self.assertIn("sched_pipeline.consumer_wait(consumer_state)", source)
+        self.assertIn(
+            "cluster_bidx = work_smem[cutlass.Int32(0), consumer_state.index]",
+            source,
+        )
+        self.assertIn(
+            "cluster_bidy = work_smem[cutlass.Int32(1), consumer_state.index]",
+            source,
+        )
+        self.assertIn(
+            "cluster_bidz = work_smem[cutlass.Int32(2), consumer_state.index]",
+            source,
+        )
+        self.assertIn(
+            "valid = cutlass.Int32(1) if work_smem[cutlass.Int32(3), "
+            "consumer_state.index] != cutlass.Int32(0) else cutlass.Int32(0)",
+            source,
+        )
+        self.assertIn("sched_pipeline.consumer_release(consumer_state)", source)
+        self.assertIn("consumer_state.advance()", source)
+
+    def test_tcgen05_pure_clc_scheduler_object_rejects_non_target(self) -> None:
+        args = (
+            torch.empty([256, 128], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([128, 256], device=DEVICE, dtype=torch.bfloat16),
+        )
+        cfg = _make_tcgen05_role_local_monolithic_seed_config(
+            block_sizes=[256, 256, 64],
+            l2_groupings=[1],
+            pid_type="persistent_interleaved",
+            tcgen05_cluster_m=2,
+            tcgen05_cluster_n=1,
+            tcgen05_ab_stages=3,
+            tcgen05_acc_stages=2,
+            tcgen05_c_stages=2,
+            tcgen05_num_epi_warps=4,
+            **{
+                TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY: (
+                    Tcgen05LayoutStrategy.EXPLICIT_EPI_TILE.value
+                ),
+                TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_M_KEY: 128,
+                TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_N_KEY: 32,
+                TCGEN05_LAYOUT_OVERRIDES_D_STORE_BOX_N_KEY: 32,
+                TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY: True,
+                TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY: True,
+                TCGEN05_PURE_CLC_SCHEDULER_OBJECT_CONFIG_KEY: True,
+            },
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_role_local_monolithic_4096_bf16.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            with self.assertRaisesRegex(
+                exc.BackendUnsupported,
+                TCGEN05_PURE_CLC_SCHEDULER_OBJECT_CONFIG_KEY,
+            ):
+                bound.to_triton_code(cfg)
+
+    def test_tcgen05_pure_clc_scheduler_object_rejects_non_identity_store(
+        self,
+    ) -> None:
+        @helion.kernel(backend="cute")
+        def cute_matmul_relu_target1(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = torch.relu(acc).to(x.dtype)
+            return out
+
+        args = (
+            torch.empty([1024, 1024], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([1024, 4096], device=DEVICE, dtype=torch.bfloat16),
+        )
+        cfg = _make_tcgen05_role_local_monolithic_seed_config(
+            block_sizes=[256, 256, 64],
+            l2_groupings=[1],
+            pid_type="persistent_interleaved",
+            tcgen05_cluster_m=2,
+            tcgen05_cluster_n=1,
+            tcgen05_ab_stages=3,
+            tcgen05_acc_stages=2,
+            tcgen05_c_stages=2,
+            tcgen05_num_epi_warps=4,
+            **{
+                TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY: (
+                    Tcgen05LayoutStrategy.EXPLICIT_EPI_TILE.value
+                ),
+                TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_M_KEY: 128,
+                TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_N_KEY: 32,
+                TCGEN05_LAYOUT_OVERRIDES_D_STORE_BOX_N_KEY: 32,
+                TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY: True,
+                TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY: True,
+                TCGEN05_PURE_CLC_SCHEDULER_OBJECT_CONFIG_KEY: True,
+            },
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_relu_target1.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            with self.assertRaisesRegex(
+                exc.BackendUnsupported,
+                "identity-store",
+            ):
+                bound.to_triton_code(cfg)
+
+    def test_tcgen05_pure_clc_scheduler_object_rejects_multi_store_fanout(
+        self,
+    ) -> None:
+        @helion.kernel(backend="cute")
+        def cute_matmul_fanout_target1(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            m, k = x.size()
+            _, n = y.size()
+            out_a = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            out_b = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out_a[tile_m, tile_n] = acc.to(x.dtype)
+                out_b[tile_m, tile_n] = acc.to(x.dtype)
+            return out_a, out_b
+
+        args = (
+            torch.empty([1024, 1024], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([1024, 4096], device=DEVICE, dtype=torch.bfloat16),
+        )
+        cfg = _make_tcgen05_role_local_monolithic_seed_config(
+            block_sizes=[256, 256, 64],
+            l2_groupings=[1],
+            pid_type="persistent_interleaved",
+            tcgen05_cluster_m=2,
+            tcgen05_cluster_n=1,
+            tcgen05_ab_stages=3,
+            tcgen05_acc_stages=2,
+            tcgen05_c_stages=2,
+            tcgen05_num_epi_warps=4,
+            **{
+                TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY: (
+                    Tcgen05LayoutStrategy.EXPLICIT_EPI_TILE.value
+                ),
+                TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_M_KEY: 128,
+                TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_N_KEY: 32,
+                TCGEN05_LAYOUT_OVERRIDES_D_STORE_BOX_N_KEY: 32,
+                TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY: True,
+                TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY: True,
+                TCGEN05_PURE_CLC_SCHEDULER_OBJECT_CONFIG_KEY: True,
+            },
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_fanout_target1.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            with self.assertRaisesRegex(
+                exc.BackendUnsupported,
+                "identity-store",
+            ):
+                bound.to_triton_code(cfg)
 
     def test_tcgen05_tvm_ffi_launch_runtime_correctness(self) -> None:
         import importlib.util
@@ -12683,6 +13175,17 @@ class TestCuteLowerings(unittest.TestCase):
             cast_dtype=None,
         )
         self.assertIsNone(_trace_mma_to_store_dtype(mma_node, graphs))
+
+    def test_trace_mma_to_store_dtype_same_dtype_fan_out_returns_dtype(
+        self,
+    ) -> None:
+        """General dtype inference accepts fan-out when every store dtype
+        agrees; stricter single-store checks are only for guarded paths."""
+        mma_node, graphs = self._build_matmul_store_graphs(
+            store_dtypes=[torch.bfloat16, torch.bfloat16],
+            cast_dtype=torch.bfloat16,
+        )
+        self.assertEqual(_trace_mma_to_store_dtype(mma_node, graphs), torch.bfloat16)
 
     def test_trace_mma_to_store_dtype_signature_collision_uses_correct_subgraph(
         self,
