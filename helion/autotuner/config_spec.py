@@ -453,6 +453,14 @@ class ConfigSpec:
         self._cute_tcgen05_config.exact_shape_aux_kernel_detected = value
 
     @property
+    def cute_tcgen05_identity_matmul_store_detected(self) -> bool:
+        return self._cute_tcgen05_config.identity_matmul_store_detected
+
+    @cute_tcgen05_identity_matmul_store_detected.setter
+    def cute_tcgen05_identity_matmul_store_detected(self, value: bool) -> None:
+        self._cute_tcgen05_config.identity_matmul_store_detected = value
+
+    @property
     def _tcgen05_cluster_m_search_choices(self) -> tuple[int, ...] | None:
         return self._cute_tcgen05_config.cluster_m_search_choices
 
@@ -519,6 +527,9 @@ class ConfigSpec:
             max_k_tiles=max_k_tiles,
             allow_edge_k_tail_family=allow_edge_k_tail_family,
         )
+
+    def allow_tcgen05_target1_tvm_ffi_seed(self) -> None:
+        self._cute_tcgen05_config.allow_target1_tvm_ffi_seed()
 
     @staticmethod
     def _tcgen05_cluster_m2_bk_is_valid(

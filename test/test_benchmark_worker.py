@@ -30,6 +30,7 @@ from helion.autotuner.base_search import PopulationBasedSearch
 from helion.autotuner.base_search import PopulationMember
 from helion.autotuner.benchmark_job import BenchmarkJob
 from helion.autotuner.benchmark_provider import LocalBenchmarkProvider
+from helion.autotuner.benchmark_worker import BenchmarkSubprocessError
 from helion.autotuner.benchmark_worker import BenchmarkTimeout
 from helion.autotuner.benchmark_worker import BenchmarkWorker
 from helion.autotuner.benchmark_worker import BenchmarkWorkerDied
@@ -63,6 +64,15 @@ class _RaiseRuntimeError:
 
     def __call__(self) -> object:
         raise RuntimeError(self.message)
+
+
+@dataclasses.dataclass
+class _RaiseUnpickleableLocalException:
+    def __call__(self) -> object:
+        class LocalError(Exception):
+            pass
+
+        raise LocalError("local exception")
 
 
 @dataclasses.dataclass
@@ -187,6 +197,17 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
             with self.assertRaises(BenchmarkWorkerDied):
                 worker.run(_Crash(), timeout=30.0)
             self.assertFalse(worker.alive())
+        finally:
+            worker.shutdown()
+
+    def test_unpickleable_worker_exception_is_serialized(self) -> None:
+        worker = BenchmarkWorker()
+        try:
+            with self.assertRaises(BenchmarkSubprocessError) as ctx:
+                worker.run(_RaiseUnpickleableLocalException(), timeout=30.0)
+            self.assertIn("unpickleable", str(ctx.exception))
+            self.assertTrue(worker.alive())
+            self.assertEqual(worker.run(_ReturnValue(7), timeout=30.0), 7)
         finally:
             worker.shutdown()
 

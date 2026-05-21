@@ -12,13 +12,23 @@ from helion._compiler.autotuner_heuristics.cute import CuteTcgen05ClusterM2Heuri
 from helion._compiler.autotuner_heuristics.registry import AutotunerHeuristic
 from helion._compiler.autotuner_heuristics.triton import TritonSkinnyGemmHeuristic
 from helion._compiler.backend import TritonBackend
+from helion._compiler.cute.strategies import TCGEN05_LAYOUT_OVERRIDES_D_STORE_BOX_N_KEY
+from helion._compiler.cute.strategies import TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_M_KEY
+from helion._compiler.cute.strategies import TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_N_KEY
+from helion._compiler.cute.strategies import TCGEN05_LAYOUT_OVERRIDES_SWIZZLE_A_KEY
+from helion._compiler.cute.strategies import TCGEN05_LAYOUT_OVERRIDES_SWIZZLE_B_KEY
+from helion._compiler.cute.strategies import TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY
 from helion._compiler.cute.strategies import TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY
+from helion._compiler.cute.strategies import TCGEN05_STRATEGY_CONFIG_KEY
 from helion._compiler.cute.strategies import TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY
 from helion._compiler.cute.strategies import TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY
+from helion._compiler.cute.strategies import Tcgen05LayoutStrategy
 from helion._compiler.cute.strategies import Tcgen05PersistenceModel
 from helion._compiler.cute.strategies import Tcgen05Strategy
 from helion._compiler.cute.tcgen05_config import CuteTcgen05Config
 from helion._compiler.cute.tcgen05_config import Tcgen05ClusterM2SearchConstraints
+from helion._compiler.cute.tcgen05_constants import TCGEN05_ACC_PRODUCER_MODE_CONFIG_KEY
+from helion._compiler.cute.tcgen05_constants import TCGEN05_ACC_PRODUCER_MODE_SKIP_UMMA
 from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_ACC_WAIT_PLACEMENT_BEFORE_SUBTILE_LOOP,
 )
@@ -33,6 +43,24 @@ from helion._compiler.cute.tcgen05_constants import (
 from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_C_ACQUIRE_PLACEMENT_FIRST_IN_LOOP,
 )
+from helion._compiler.cute.tcgen05_constants import TCGEN05_C_STORE_MODE_CONFIG_KEY
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_C_STORE_MODE_SKIP_EPILOGUE_STORE,
+)
+from helion._compiler.cute.tcgen05_constants import TCGEN05_CUBIN_LINEINFO_CONFIG_KEY
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_DIAGNOSTIC_INVALID_OUTPUT_CONFIG_KEY,
+)
+from helion._compiler.cute.tcgen05_constants import TCGEN05_EPILOGUE_LAYOUT_CONFIG_KEY
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_EPILOGUE_LAYOUT_SPLIT_FIRST_T2R,
+)
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY,
+)
+from helion._compiler.cute.tcgen05_constants import TCGEN05_TARGET1_TVM_FFI_AB_STAGES
+from helion._compiler.cute.tcgen05_constants import TCGEN05_TARGET1_TVM_FFI_BLOCK_K
+from helion._compiler.cute.tcgen05_constants import TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY
 from helion._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
 from helion._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
 from helion._compiler.cute.tcgen05_constants import (
@@ -89,6 +117,7 @@ from helion._testing import default_cute_mma_support
 from helion._testing import onlyBackends
 from helion._testing import patch_cute_mma_support
 from helion._testing import skipIfRefEager
+from helion.autotuner import IntegerFragment
 from helion.autotuner.config_spec import BlockSizeSpec
 from helion.autotuner.config_spec import ConfigSpec
 from helion.autotuner.config_spec import MatmulFact
@@ -721,6 +750,274 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                 CuteTcgen05ClusterM2Heuristic.name,
                 unsupported_bound.config_spec.autotuner_heuristics,
             )
+
+    @onlyBackends(["cute"])
+    def test_cute_tcgen05_target1_tvm_ffi_seed_config(self) -> None:
+        @helion.kernel(backend="cute")
+        def cute_matmul_mma(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        args = (
+            torch.empty([1024, 1024], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([1024, 4096], device=DEVICE, dtype=torch.bfloat16),
+        )
+        with (
+            patch_cute_mma_support(),
+            patch("helion.language.matmul_ops._cuda_num_sms_or_zero", return_value=132),
+        ):
+            bound = cute_matmul_mma.bind(args)
+        tvm_ffi_seeds = [
+            config.config
+            for config in bound.config_spec.autotune_seed_configs()
+            if config.config.get(TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY) is True
+        ]
+        self.assertEqual(len(tvm_ffi_seeds), 1)
+        seed = tvm_ffi_seeds[0]
+        self.assertEqual(
+            seed["block_sizes"],
+            [
+                TCGEN05_TWO_CTA_BLOCK_M,
+                TCGEN05_TWO_CTA_BLOCK_N,
+                TCGEN05_TARGET1_TVM_FFI_BLOCK_K,
+            ],
+        )
+        self.assertEqual(seed["num_warps"], 8)
+        self.assertEqual(seed["pid_type"], "persistent_interleaved")
+        self.assertEqual(seed["tcgen05_cluster_m"], 2)
+        self.assertEqual(seed["tcgen05_cluster_n"], 1)
+        self.assertEqual(seed["tcgen05_ab_stages"], TCGEN05_TARGET1_TVM_FFI_AB_STAGES)
+        self.assertEqual(seed["tcgen05_l2_swizzle_size"], 1)
+        search_ab_stages_fragment = bound.config_spec._tcgen05_optional_fragments(
+            for_search=True
+        )["tcgen05_ab_stages"]
+        self.assertIsInstance(search_ab_stages_fragment, IntegerFragment)
+        self.assertEqual(search_ab_stages_fragment.high, 2)
+        self.assertEqual(
+            seed[TCGEN05_STRATEGY_CONFIG_KEY],
+            Tcgen05Strategy.ROLE_LOCAL_MONOLITHIC.value,
+        )
+        self.assertEqual(
+            seed[TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY],
+            Tcgen05LayoutStrategy.EXPLICIT_EPI_TILE.value,
+        )
+        self.assertEqual(seed[TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_M_KEY], 128)
+        self.assertEqual(seed[TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_N_KEY], 32)
+        self.assertEqual(seed[TCGEN05_LAYOUT_OVERRIDES_D_STORE_BOX_N_KEY], 32)
+        self.assertIs(seed[TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY], True)
+        self.assertEqual(seed["range_unroll_factors"], [1, 1])
+
+        config_gen = bound.config_spec.create_config_generation()
+        transferred_tvm_ffi_seeds = [
+            config.config
+            for _flat, config in config_gen.seed_flat_config_pairs()
+            if config.config.get(TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY) is True
+        ]
+        self.assertEqual(len(transferred_tvm_ffi_seeds), 1)
+        transferred_seed = transferred_tvm_ffi_seeds[0]
+        self.assertEqual(
+            transferred_seed[TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY],
+            Tcgen05LayoutStrategy.EXPLICIT_EPI_TILE.value,
+        )
+        self.assertEqual(transferred_seed[TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_M_KEY], 128)
+        self.assertEqual(transferred_seed[TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_N_KEY], 32)
+        self.assertEqual(
+            transferred_seed[TCGEN05_LAYOUT_OVERRIDES_D_STORE_BOX_N_KEY], 32
+        )
+        self.assertIs(transferred_seed[TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY], True)
+
+        bound.config_spec.user_defined_tunables["target1_extra"] = IntegerFragment(
+            1, 4, 2
+        )
+        projected_config = helion.Config(
+            block_sizes=[128, 32, 64],
+            indexing=["pointer", "pointer", "tensor_descriptor"],
+            pid_type="flat",
+            tcgen05_cluster_m=1,
+            tcgen05_cluster_n=1,
+            tcgen05_tvm_ffi_launch=True,
+            epilogue_subtile=2,
+            tcgen05_diagnostic_invalid_output=True,
+            tcgen05_c_store_mode=TCGEN05_C_STORE_MODE_SKIP_EPILOGUE_STORE,
+            tcgen05_acc_producer_mode=TCGEN05_ACC_PRODUCER_MODE_SKIP_UMMA,
+            tcgen05_aux_load_mode=TCGEN05_AUX_LOAD_MODE_TMA,
+            tcgen05_cubin_lineinfo=True,
+            tcgen05_epilogue_layout=TCGEN05_EPILOGUE_LAYOUT_SPLIT_FIRST_T2R,
+            tcgen05_warp_spec_scheduler_warps=1,
+            tcgen05_warp_spec_c_input_warps=1,
+            tcgen05_layout_overrides_smem_swizzle_a=128,
+            tcgen05_layout_overrides_smem_swizzle_b=64,
+            advanced_controls_file="/tmp/helion-test.acf",
+            target1_extra=3,
+        )
+        bound.config_spec.normalize(projected_config, _fix_invalid=True)
+        expected_seed_config = helion.Config(
+            **seed,
+            advanced_controls_file="/tmp/helion-test.acf",
+            target1_extra=3,
+        )
+        bound.config_spec.normalize(expected_seed_config, _fix_invalid=True)
+        self.assertEqual(projected_config.config, expected_seed_config.config)
+        self.assertEqual(
+            projected_config.config["block_sizes"],
+            [
+                TCGEN05_TWO_CTA_BLOCK_M,
+                TCGEN05_TWO_CTA_BLOCK_N,
+                TCGEN05_TARGET1_TVM_FFI_BLOCK_K,
+            ],
+        )
+        self.assertIs(projected_config.config[TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY], True)
+        self.assertEqual(
+            projected_config.config["tcgen05_ab_stages"],
+            TCGEN05_TARGET1_TVM_FFI_AB_STAGES,
+        )
+        self.assertIs(
+            projected_config.config[TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY],
+            True,
+        )
+        self.assertEqual(
+            projected_config.config[TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY],
+            Tcgen05LayoutStrategy.EXPLICIT_EPI_TILE.value,
+        )
+        for stale_key in (
+            "epilogue_subtile",
+            TCGEN05_DIAGNOSTIC_INVALID_OUTPUT_CONFIG_KEY,
+            TCGEN05_C_STORE_MODE_CONFIG_KEY,
+            TCGEN05_ACC_PRODUCER_MODE_CONFIG_KEY,
+            TCGEN05_AUX_LOAD_MODE_CONFIG_KEY,
+            TCGEN05_CUBIN_LINEINFO_CONFIG_KEY,
+            TCGEN05_EPILOGUE_LAYOUT_CONFIG_KEY,
+        ):
+            self.assertNotIn(stale_key, projected_config.config)
+        self.assertEqual(
+            projected_config.config[TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY], 0
+        )
+        self.assertEqual(
+            projected_config.config[TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY], 0
+        )
+        self.assertIsNone(
+            projected_config.config[TCGEN05_LAYOUT_OVERRIDES_SWIZZLE_A_KEY]
+        )
+        self.assertIsNone(
+            projected_config.config[TCGEN05_LAYOUT_OVERRIDES_SWIZZLE_B_KEY]
+        )
+
+        projected_cluster_m2_config = helion.Config(
+            block_sizes=[256, 256, 128],
+            indexing=["tensor_descriptor", "tensor_descriptor", "tensor_descriptor"],
+            pid_type="persistent_interleaved",
+            tcgen05_cluster_m=2,
+            tcgen05_cluster_n=1,
+        )
+        bound.config_spec.normalize(projected_cluster_m2_config, _fix_invalid=True)
+        self.assertIs(
+            projected_cluster_m2_config.config[TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY],
+            True,
+        )
+        self.assertEqual(
+            projected_cluster_m2_config.config["block_sizes"],
+            [
+                TCGEN05_TWO_CTA_BLOCK_M,
+                TCGEN05_TWO_CTA_BLOCK_N,
+                TCGEN05_TARGET1_TVM_FFI_BLOCK_K,
+            ],
+        )
+
+        non_target_args = (
+            torch.empty([1024, 1024], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([1024, 2048], device=DEVICE, dtype=torch.bfloat16),
+        )
+        with (
+            patch_cute_mma_support(),
+            patch("helion.language.matmul_ops._cuda_num_sms_or_zero", return_value=132),
+        ):
+            non_target_bound = cute_matmul_mma.bind(non_target_args)
+        self.assertFalse(
+            any(
+                config.config.get(TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY) is True
+                for config in non_target_bound.config_spec.autotune_seed_configs()
+            )
+        )
+        non_target_ab_stages_fragment = (
+            non_target_bound.config_spec._tcgen05_optional_fragments(for_search=True)[
+                "tcgen05_ab_stages"
+            ]
+        )
+        self.assertIsInstance(non_target_ab_stages_fragment, IntegerFragment)
+        self.assertEqual(non_target_ab_stages_fragment.high, 2)
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_mma_no_ab3_budget(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        with (
+            patch_cute_mma_support(),
+            patch("helion.language.matmul_ops._cuda_num_sms_or_zero", return_value=132),
+            patch.object(
+                CuteTcgen05Config,
+                "per_cta_ab_smem_budget_bytes",
+                return_value=0,
+            ),
+        ):
+            no_ab3_budget_bound = cute_matmul_mma_no_ab3_budget.bind(args)
+        self.assertFalse(
+            any(
+                config.config.get(TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY) is True
+                for config in no_ab3_budget_bound.config_spec.autotune_seed_configs()
+            )
+        )
+        no_budget_ab_stages_fragment = (
+            no_ab3_budget_bound.config_spec._tcgen05_optional_fragments(
+                for_search=True
+            )["tcgen05_ab_stages"]
+        )
+        self.assertIsInstance(no_budget_ab_stages_fragment, IntegerFragment)
+        self.assertEqual(no_budget_ab_stages_fragment.high, 2)
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_relu(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = torch.relu(acc).to(x.dtype)
+            return out
+
+        with (
+            patch_cute_mma_support(),
+            patch("helion.language.matmul_ops._cuda_num_sms_or_zero", return_value=132),
+        ):
+            relu_bound = cute_matmul_relu.bind(args)
+        self.assertFalse(
+            relu_bound.config_spec.cute_tcgen05_identity_matmul_store_detected
+        )
+        self.assertEqual(relu_bound.config_spec._tcgen05_cluster_m_search_choices, (1,))
+        self.assertFalse(
+            any(
+                config.config.get(TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY) is True
+                for config in relu_bound.config_spec.autotune_seed_configs()
+            )
+        )
 
     @onlyBackends(["cute"])
     def test_cute_tcgen05_cluster_m2_edge_k_tail_bk_requires_tail(self) -> None:

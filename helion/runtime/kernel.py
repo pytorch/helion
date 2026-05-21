@@ -534,6 +534,9 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                 from .._compiler.cute.aux_tensor import (
                     host_function_has_tcgen05_exact_shape_aux_kernel_pattern,
                 )
+                from .._compiler.cute.aux_tensor import (
+                    host_function_has_tcgen05_identity_matmul_store_pattern,
+                )
 
                 self.env.config_spec.cute_tcgen05_aux_kernel_detected = (
                     host_function_has_tcgen05_aux_kernel_pattern(self.host_function)
@@ -543,6 +546,13 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                         self.host_function
                     )
                 )
+                self.env.config_spec.cute_tcgen05_identity_matmul_store_detected = (
+                    host_function_has_tcgen05_identity_matmul_store_pattern(
+                        self.host_function
+                    )
+                )
+                if self.env.config_spec.cute_tcgen05_identity_matmul_store_detected:
+                    self.env.config_spec.allow_tcgen05_target1_tvm_ffi_seed()
                 if not self.env.settings.disable_autotuner_heuristics:
                     for seed_config in self.env.config_spec.autotune_seed_configs():
                         if (
