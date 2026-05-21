@@ -34,13 +34,13 @@ from torch.fx.node import Node
 from ... import exc
 from ..ast_extension import expr_from_string
 from ..ast_extension import statement_from_string
-from ..device_function import CuteTcgen05MatmulPlan
-from ..device_function import CuteTcgen05StoreValue
 from ..dtype_utils import cast_ast
 from ..matmul_utils import _needs_f32_accumulator
 from ..tile_strategy import DeviceLoopState
 from .aux_tensor import discover_tcgen05_aux_tensor_descriptors
 from .cutedsl_compat import emit_pipeline_advance
+from .device_state import CuteTcgen05MatmulPlan
+from .device_state import CuteTcgen05StoreValue
 from .layout import MatmulExecutionKind
 from .layout import MatmulExecutionPlan
 from .matmul_utils import analyze_direct_grouped_n_loads
@@ -846,10 +846,11 @@ def prepare_cute_collective_lane_loop_suppression(
         ):
             continue
 
-        cg.device_function.register_cute_collective_handled_load(lhs_load.name)
-        cg.device_function.register_cute_collective_handled_load(rhs_load.name)
+        cute_state = cg.device_function.cute_state
+        cute_state.register_collective_handled_load(lhs_load.name)
+        cute_state.register_collective_handled_load(rhs_load.name)
         if grid_state.has_lane_loops():
-            cg.device_function.suppress_cute_root_lane_loops = True
+            cute_state.request_root_lane_loop_suppression()
 
 
 def _mma_result_can_be_deferred(node: Node) -> bool:
@@ -2002,12 +2003,13 @@ def _emit_mma_pipeline(
         and next(iter(rhs_load.users)) is fx_node
     )
     if tcgen05_collective_handles_operand_loads:
-        df.register_cute_collective_handled_load(lhs_load.name)
-        df.register_cute_collective_handled_load(rhs_load.name)
+        cute_state = df.cute_state
+        cute_state.register_collective_handled_load(lhs_load.name)
+        cute_state.register_collective_handled_load(rhs_load.name)
         grid_state = cg.current_grid_state
         assert grid_state is not None
         if grid_state.has_lane_loops():
-            df.suppress_cute_root_lane_loops = True
+            cute_state.request_root_lane_loop_suppression()
 
     # Variable names
     tiled_mma = df.new_var("tiled_mma")
@@ -2028,7 +2030,7 @@ def _emit_mma_pipeline(
     # (m_offset_var, n_offset_var, advancing pipeline state). When the
     # persistent kernel splits the device-loop prefix, these stay inside the
     # work-tile loop while everything else hoists out. See
-    # ``DeviceFunction.register_cute_tcgen05_per_tile_stmts`` and
+    # ``DeviceFunction.cute_state.register_tcgen05_per_tile_stmts`` and
     # ``ProgramID._split_tcgen05_invariant_setup``.
     per_tile_stmts: list[ast.AST] = []
     # Statements that conceptually belong to the TMA-load warp's role
@@ -2209,7 +2211,7 @@ def _emit_mma_pipeline(
     mma_physical_m_threads = _grid_thread_extent(cg, m_block_id)
     tcgen05_cta_thread_count = _grid_cta_thread_count(cg)
     if mma_impl == "tcgen05" and tcgen05_cluster_m * tcgen05_cluster_n > 1:
-        df.cute_cluster_shape = (tcgen05_cluster_m, tcgen05_cluster_n, 1)
+        df.cute_state.cluster_shape = (tcgen05_cluster_m, tcgen05_cluster_n, 1)
     tcgen05_acc_stage_count_value = _tcgen05_config_int(
         df.config, "tcgen05_acc_stages", _tcgen05_acc_stage_count(bn)
     )
@@ -2369,7 +2371,7 @@ def _emit_mma_pipeline(
             "aux-tensor walker can identify downstream stores"
         )
         # Register the matmul fx_node in
-        # ``cute_tcgen05_matmul_fx_nodes`` before the aux-tensor
+        # ``cute_state.matmul_fx_nodes`` before the aux-tensor
         # walker runs. The walker's analyzer reads the same set to
         # know where to stop, so the fx_node must be present
         # *before* the walk. The registered-graph invariant: the
@@ -2392,7 +2394,7 @@ def _emit_mma_pipeline(
         assert any(fx_node.graph is gi.graph for gi in cg.codegen_graphs), (
             "matmul fx_node graph must be a registered codegen graph"
         )
-        df.cute_tcgen05_matmul_fx_nodes.add(fx_node)
+        df.cute_state.matmul_fx_nodes.add(fx_node)
         aux_tensor_descriptors_value = discover_tcgen05_aux_tensor_descriptors(
             cg, fx_node
         )
@@ -2435,7 +2437,7 @@ def _emit_mma_pipeline(
             cluster_n=tcgen05_cluster_n,
         )
         candidate_block_shape = tcgen05_matmul_plan.block_shape
-        df.register_cute_tcgen05_matmul_plan(tcgen05_matmul_plan)
+        df.cute_state.register_tcgen05_matmul_plan(tcgen05_matmul_plan)
         if (
             candidate_block_shape[0]
             * candidate_block_shape[1]
@@ -2502,7 +2504,7 @@ def _emit_mma_pipeline(
                 "keep ``tcgen05_ab_stages=3``. See "
                 "``cute_plan.md`` §1.3 / §7.5.3.2.",
             )
-        df.cute_block_shape = candidate_block_shape
+        df.cute_state.block_shape = candidate_block_shape
     if mma_impl == "universal":
         prefix.extend(
             _make_tiled_mma_setup(
@@ -2807,7 +2809,7 @@ def _emit_mma_pipeline(
             tcgen05_sched_plan = _new_tcgen05_sched_pipeline_plan(
                 df, use_clc=tcgen05_matmul_plan.is_clc_persistent
             )
-            df.register_cute_tcgen05_sched_pipeline_plan(tcgen05_sched_plan)
+            df.cute_state.register_tcgen05_sched_pipeline_plan(tcgen05_sched_plan)
             # WITH_SCHEDULER's scheduler-warp topology: every CTA in
             # the cluster runs its own scheduler warp, publishing to
             # its own SMEM mailbox. Both CTAs converge on the same
@@ -2983,7 +2985,7 @@ def _emit_mma_pipeline(
                     num_rings=len(tcgen05_matmul_plan.aux_tensor_descriptors),
                     epi_tile_var=tcgen05_plan.epi_tile,
                 )
-                df.register_cute_tcgen05_aux_pipeline_plan(tcgen05_aux_plan)
+                df.cute_state.register_tcgen05_aux_pipeline_plan(tcgen05_aux_plan)
                 prefix.extend(
                     _emit_tcgen05_aux_pipeline_setup(
                         tcgen05_aux_plan,
@@ -4059,7 +4061,7 @@ def _emit_mma_pipeline(
         assert epi_active is not None
         assert tma_warp is not None
         assert warp_idx is not None
-        df.register_cute_tcgen05_store_value(
+        df.cute_state.register_tcgen05_store_value(
             result_var,
             CuteTcgen05StoreValue(
                 bm=bm,
@@ -4112,7 +4114,7 @@ def _emit_mma_pipeline(
             # `CuteTcgen05StoreValue` registration via a backward FX
             # walk from the user's store value through a whitelisted
             # unary chain to this matmul fx_node.
-            df.cute_tcgen05_matmul_fx_node_result_vars[fx_node] = result_var
+            df.cute_state.matmul_fx_node_result_vars[fx_node] = result_var
     else:
         # Each thread reads its own (m, n) element from shared memory.
         suffix.append(
@@ -4127,7 +4129,7 @@ def _emit_mma_pipeline(
     # non-persistent ``pid_type`` (the splitter is only invoked from
     # ``_setup_tcgen05_persistent_kernel``).
     if per_tile_stmts:
-        df.register_cute_tcgen05_per_tile_stmts(per_tile_stmts)
+        df.cute_state.register_tcgen05_per_tile_stmts(per_tile_stmts)
     # Register role-block statements with the persistent role partitioner
     # (see ``Tcgen05PersistentProgramIDs._collect_tcgen05_role_blocks``).
     # Two registration shapes land here:
@@ -4147,9 +4149,9 @@ def _emit_mma_pipeline(
     # visited, so a misregistered top-level stmt fails loudly rather
     # than silently dropping its role gate.
     if tma_load_role_stmts:
-        df.register_cute_tcgen05_tma_load_role_stmts(tma_load_role_stmts)
+        df.cute_state.register_tcgen05_tma_load_role_stmts(tma_load_role_stmts)
     if mma_exec_role_stmts:
-        df.register_cute_tcgen05_mma_exec_role_stmts(mma_exec_role_stmts)
+        df.cute_state.register_tcgen05_mma_exec_role_stmts(mma_exec_role_stmts)
 
     return expr_from_string(result_var)
 

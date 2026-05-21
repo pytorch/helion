@@ -125,7 +125,7 @@ def reach_tcgen05_matmul_anchors(
     consume a different loop-output mode.
 
     Used by the loud-failure diagnostic backstop in
-    :mod:`memory_ops` (the ``cute_tcgen05_matmul_fx_nodes`` reach
+    :mod:`memory_ops` (the ``cute_state.matmul_fx_nodes`` reach
     check at the cute store-codegen entry point) and by the splice
     site to recover the unique matmul anchor for the accepted
     chain. The classifier in :mod:`cute_epilogue` uses a separate
@@ -133,7 +133,7 @@ def reach_tcgen05_matmul_anchors(
     to commit to a single carrier path.
     """
     df = state.device_function
-    target_fx_nodes = df.cute_tcgen05_matmul_fx_nodes
+    target_fx_nodes = df.cute_state.matmul_fx_nodes
     if not target_fx_nodes:
         return set()
 

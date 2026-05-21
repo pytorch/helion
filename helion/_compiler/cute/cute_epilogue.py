@@ -796,7 +796,7 @@ def analyze_tcgen05_unary_epilogue_chain(
     tile but not the global axis is rejected at classify time.
     """
     df = state.device_function
-    target_fx_nodes = df.cute_tcgen05_matmul_fx_nodes
+    target_fx_nodes = df.cute_state.matmul_fx_nodes
     if not target_fx_nodes:
         return None
 
