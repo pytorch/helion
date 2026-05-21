@@ -78,6 +78,7 @@ from .tcgen05_constants import TCGEN05_CUBIN_LINEINFO_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_DIAGNOSTIC_INVALID_OUTPUT_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_EPILOGUE_LAYOUT_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_EPILOGUE_LAYOUTS
+from .tcgen05_constants import TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_BLOCK_SIZES
 from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_CLUSTER_M
 from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_CONFIG_KEY
@@ -165,6 +166,7 @@ CUTE_TCGEN05_DIAGNOSTIC_CONFIG_KEYS: frozenset[str] = frozenset(
         TCGEN05_CUBIN_LINEINFO_CONFIG_KEY,
         TCGEN05_DIAGNOSTIC_INVALID_OUTPUT_CONFIG_KEY,
         TCGEN05_EPILOGUE_LAYOUT_CONFIG_KEY,
+        TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY,
         TCGEN05_LARGE_BN_PROOF_CONFIG_KEY,
         TCGEN05_SCHED_CONSUMER_WAIT_MODE_CONFIG_KEY,
         TCGEN05_SCHED_STAGE_COUNT_CONFIG_KEY,
@@ -1471,6 +1473,11 @@ class CuteTcgen05Config:
         )
         self._validate_bool_config(
             config, TCGEN05_LARGE_BN_PROOF_CONFIG_KEY, fix_invalid=fix_invalid
+        )
+        self._validate_bool_config(
+            config,
+            TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY,
+            fix_invalid=fix_invalid,
         )
         if config.get(TCGEN05_LARGE_BN_PROOF_CONFIG_KEY) is True:
             proof_envelope_matches = (

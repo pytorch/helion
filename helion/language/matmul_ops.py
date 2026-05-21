@@ -24,6 +24,7 @@ from .._compiler.cute.matmul_utils import cute_resolve_active_block_id
 from .._compiler.cute.matmul_utils import cute_resolve_active_matmul_k_block_id
 from .._compiler.cute.matmul_utils import cute_static_k_invariant_extent
 from .._compiler.cute.strategies import is_pure_matmul_role_lifecycle_config
+from .._compiler.cute.tcgen05_constants import TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY
 from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
 from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
 from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_EDGE_K_TAIL_MIN_DIM
@@ -64,6 +65,14 @@ def _cute_dot_outer_accumulates_result(fx_node: object, *, is_acc_none: bool) ->
 
 def _requested_pure_matmul_role_lifecycle(state: CodegenState) -> bool:
     return is_pure_matmul_role_lifecycle_config(state.device_function.config)
+
+
+def _requested_tcgen05_flat_role_coordinates(state: CodegenState) -> bool:
+    return bool(
+        state.device_function.config.get(
+            TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY, False
+        )
+    )
 
 
 def _cuda_num_sms_or_zero(device: torch.device) -> int:
@@ -655,6 +664,12 @@ def _(state: CodegenState) -> object:
             "cute",
             "tcgen05_strategy='pure_matmul_role_lifecycle' requires hl.dot "
             "to lower through the tcgen05 K-loop path",
+        )
+    if _requested_tcgen05_flat_role_coordinates(state):
+        raise exc.BackendUnsupported(
+            "cute",
+            f"{TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY}=True requires "
+            "hl.dot to lower through the tcgen05 K-loop path",
         )
     return _emit_cute_matmul(
         state.codegen,

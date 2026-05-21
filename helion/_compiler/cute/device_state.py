@@ -116,6 +116,7 @@ class CuteTcgen05MatmulPlan:
     cluster_n: int = 1
     l2_swizzle_size: int = 1
     tma_store_full_tiles_only: bool = False
+    flat_role_launch_warp_count: int | None = None
     # Per-anchor auxiliary descriptors discovered by the forward FX walker. This
     # is store-fusion metadata, not a collective compatibility field:
     # two matmuls with identical collective parameters but different downstream
@@ -223,6 +224,9 @@ class CuteTcgen05MatmulPlan:
 
     @property
     def block_shape(self) -> tuple[int, int, int]:
+        if self.flat_role_launch_warp_count is not None:
+            assert self.flat_role_launch_warp_count >= self.role_warp_count
+            return (self.physical_m_threads * self.flat_role_launch_warp_count, 1, 1)
         return (self.physical_m_threads, self.launched_warp_count, 1)
 
 
