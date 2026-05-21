@@ -195,6 +195,7 @@ from helion.language.memory_ops import _codegen_cute_store_permute_lane_loops
 from helion.language.memory_ops import _cute_combined_mask
 from helion.language.memory_ops import _cute_index_exprs
 from helion.language.memory_ops import _maybe_codegen_cute_packed_affine_lhs_load
+from helion.language.memory_ops import _tcgen05_rowvec_aux_stage_copy_elems
 from helion.language.memory_ops import load
 from helion.runtime import _append_cute_wrapper_plan
 
@@ -4580,11 +4581,7 @@ class TestCuteLowerings(unittest.TestCase):
 
         Anchors on the per-subtile loop body: the chain step lines
         and the ``tcgen05_acc_vec`` cast must appear after the aux
-        load locals are bound. (Cycle 39 hoisted the aux LDG to the
-        top of the per-subtile loop body, so the aux ``.load()``
-        line itself now appears **before** the T2R copy — see
-        ``test_tcgen05_fused_residual_epilogue_aux_load_hoist_marker``
-        for the source-order pin.) This pins the splice's structural
+        load locals are bound. This pins the splice's structural
         ordering without locking in line-by-line text — a future
         refactor that adds another step or renames a local can move
         text around but must keep the rendering shape intact.
@@ -4640,37 +4637,14 @@ class TestCuteLowerings(unittest.TestCase):
         self.assertGreater(first_step, first_aux_loaded)
         self.assertGreater(first_vec, first_step)
 
-    def test_tcgen05_fused_residual_epilogue_aux_load_hoist_marker(self) -> None:
-        """Cycle-39 source-order pin: the per-thread aux LDG fires
-        at the top of the per-subtile loop body — before the in-loop
-        later-subtile c_pipeline ``producer_acquire``
-        (``_tcgen05_subtile != 0`` path), before the in-loop acc
-        ``consumer_wait``, and before the t2r async TMEM→reg copy on
-        the same subtile.
+    def test_tcgen05_fused_residual_epilogue_aux_load_late_marker(self) -> None:
+        """Per-thread aux LDG stays after the T2R copy but before math.
 
-        Note that the **first** c_pipeline ``producer_acquire`` (for
-        subtile 0) is emitted **outside** the per-subtile loop —
-        warp-0 arms the c_pipeline ring once before any subtile
-        work starts — so the aux LDG cannot precede that first
-        acquire. The aux slice depends on ``_tcgen05_subtile``, so
-        it cannot be hoisted out of the loop entirely. The hoist
-        still removes the L1TEX serialization for every chain-add
-        because the in-loop acc ``consumer_wait`` and the t2r async
-        copy fire on every subtile and now overlap with the LDG.
-
-        Pre-cycle-39 the aux GMEM ``.load()`` was emitted after the
-        t2r async TMEM→reg copy and after ``acc.load()``; the chain-
-        add then waited on the LDG with no overlap. NCU on 4096³
-        residual showed Helion paid 26.7 cycles per warp on long-
-        scoreboard L1TEX wait vs Quack's 15.7. Cycle 39 hoisted
-        the aux subtile slice + ``.load()`` to the top of the
-        ``if epi_active:`` body inside the loop so the LDG overlaps
-        with the in-loop acc ``consumer_wait``, the t2r async copy,
-        and the later-subtile c_pipeline acquire.
-
-        This pin asserts the structural ordering inside the per-
-        subtile loop body so a future refactor cannot regress the
-        hoist back into the chain prelude.
+        The residual fragment should not be live through the
+        c_pipeline acquire / accumulator wait / TMEM→register copy
+        prefix. It still has to be loaded before ``acc.load()`` and
+        the fused chain math so the generated epilogue remains one
+        R2S-fragment computation.
         """
 
         from helion._compiler.cute.mma_support import get_cute_mma_support
@@ -4714,17 +4688,11 @@ class TestCuteLowerings(unittest.TestCase):
         # Find the first aux load inside the per-subtile loop body.
         aux_load_pos = code.find("tcgen05_aux_loaded_0", loop_pos)
         self.assertGreater(aux_load_pos, loop_pos)
-        # For the default config exercised by this test:
-        #  - the later-subtile c_pipeline ``producer_acquire`` is
-        #    emitted **inside** the loop, gated by
-        #    ``_tcgen05_subtile != 0``
-        #  - the acc ``consumer_wait`` is emitted **inside** the
-        #    loop, gated by ``_tcgen05_subtile == 0``
-        # so both markers are present in the loop body and the
-        # ordering check is unconditional. (The first-subtile
-        # c_pipeline acquire is emitted outside the loop — warp-0
-        # arms the ring once before any subtile work starts — and
-        # therefore is **not** searched for here.)
+        # For the default config exercised by this test, the
+        # later-subtile c_pipeline ``producer_acquire`` and the acc
+        # ``consumer_wait`` are both emitted inside the loop. The aux
+        # load intentionally follows those prefix waits and the T2R
+        # copy to shorten the residual fragment live range.
         c_acquire_pos = code.find("tcgen05_c_pipeline.producer_acquire", loop_pos)
         self.assertGreater(
             c_acquire_pos,
@@ -4733,10 +4701,9 @@ class TestCuteLowerings(unittest.TestCase):
             "inside the per-subtile loop body",
         )
         self.assertLess(
-            aux_load_pos,
             c_acquire_pos,
-            "aux LDG must be hoisted above the later-subtile c_pipeline "
-            "producer_acquire",
+            aux_load_pos,
+            "aux load must follow the in-loop c_pipeline acquire",
         )
         acc_wait_pos = code.find("tcgen05_acc_pipeline.consumer_wait", loop_pos)
         self.assertGreater(
@@ -4746,14 +4713,34 @@ class TestCuteLowerings(unittest.TestCase):
             "per-subtile loop body",
         )
         self.assertLess(
-            aux_load_pos,
             acc_wait_pos,
-            "aux LDG must be hoisted above acc consumer_wait",
+            aux_load_pos,
+            "aux load must follow the in-loop acc consumer_wait",
         )
-        # The t2r async TMEM→reg copy must come after the aux LDG
-        # so the LDG latency overlaps with the t2r async copy.
         t2r_copy_pos = code.find("cute.copy(tcgen05_tiled_copy_t2r,", loop_pos)
-        self.assertGreater(t2r_copy_pos, aux_load_pos)
+        self.assertGreater(
+            t2r_copy_pos,
+            loop_pos,
+            "default config must emit the t2r copy inside the per-subtile loop",
+        )
+        self.assertLess(
+            t2r_copy_pos,
+            aux_load_pos,
+            "aux load must follow the t2r copy to keep aux fragments out of "
+            "the store-prefix live range",
+        )
+        acc_load_pos = code.find("tcgen05_acc_loaded_", loop_pos)
+        self.assertGreater(
+            acc_load_pos,
+            loop_pos,
+            "default config must emit the accumulator load inside the per-subtile loop",
+        )
+        self.assertGreater(
+            acc_load_pos,
+            aux_load_pos,
+            "accumulator load must stay after the aux load so the fused "
+            "epilogue has its aux operands",
+        )
 
     def test_tcgen05_fused_bias_broadcast_runtime_correctness(self) -> None:
         """``out[tile] = (acc + bias[tile_n]).to(x.dtype)`` after a
@@ -12197,6 +12184,64 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
 
         return cute_matmul_bias_residual_gelu
 
+    def _assert_partial_tma_rowvec_bias_staged(
+        self, code: str, *, block_m: int = 256, block_n: int = 256
+    ) -> None:
+        """Partial-output TMA stores stage row-vector bias through compact SMEM."""
+
+        self.assertNotIn("if tcgen05_full_tile:", code)
+        self.assertIn(
+            f"tcgen05_aux_rowvec_smem_layout_1 = "
+            f"cute.make_layout(({block_n},), stride=(1,))",
+            code,
+        )
+        self.assertIn("tcgen05_aux_rowvec_tiled_copy_1 = cute.make_tiled_copy_tv", code)
+        self.assertIn(
+            "cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), "
+            "cutlass.BFloat16, num_bits_per_copy=128)",
+            code,
+        )
+        self.assertIn(
+            "tcgen05_aux_rowvec_pred_1 = cute.make_rmem_tensor("
+            "(1, cute.size(tcgen05_aux_rowvec_smem_part_1.shape[1])), "
+            "cutlass.Boolean)",
+            code,
+        )
+        self.assertIn(
+            "tcgen05_aux_rowvec_pred_1[0, _rowvec_i] = "
+            "tcgen05_aux_rowvec_coord_1[0, _rowvec_i] < "
+            "tcgen05_aux_rowvec_limit_1",
+            code,
+        )
+        self.assertIn(
+            "cute.copy(tcgen05_aux_rowvec_tiled_copy_1, "
+            "tcgen05_aux_rowvec_gmem_part_1, "
+            "tcgen05_aux_rowvec_smem_part_1, "
+            "pred=tcgen05_aux_rowvec_pred_1)",
+            code,
+        )
+        self.assertIn(
+            "tcgen05_aux_view2d_1 = cute.make_tensor("
+            "tcgen05_aux_rowvec_smem_1.iterator, "
+            f"cute.make_layout(({block_m}, {block_n}), stride=(0, 1)))",
+            code,
+        )
+        self.assertIn(
+            "tcgen05_aux_rmem_1 = cute.make_rmem_tensor("
+            "tcgen05_tTR_gAux_subtile_1.layout, cutlass.BFloat16)",
+            code,
+        )
+        self.assertIn(
+            "cute.autovec_copy(cute.filter_zeros(tcgen05_tTR_gAux_subtile_1), "
+            "cute.filter_zeros(tcgen05_aux_rmem_1))",
+            code,
+        )
+        self.assertIn("tcgen05_aux_loaded_1 = tcgen05_aux_rmem_1.load()", code)
+        self.assertNotIn(
+            "tcgen05_aux_loaded_1 = tcgen05_tTR_gAux_subtile_1.load()",
+            code,
+        )
+
     def test_aux_edge_target_shape_ab2_uses_full_tile_tma_store_with_simt_fallback(
         self,
     ) -> None:
@@ -12376,6 +12421,38 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
         self.assertIn("cute.copy(tcgen05_tma_store_atom", full_epi_src)
         self.assertNotIn("cute.copy(tcgen05_tma_store_atom", edge_epi_src)
         self.assertIn("tcgen05_simt_atom = cute.make_copy_atom", edge_epi_src)
+        self.assertIn(
+            "tcgen05_aux_rmem_0_edge_atom = cute.make_copy_atom("
+            "cute.nvgpu.CopyUniversalOp(), cutlass.BFloat16)",
+            edge_epi_src,
+        )
+        self.assertIn(
+            "tcgen05_aux_rmem_0_edge_src = cute.logical_divide("
+            "tcgen05_tTR_gAux_subtile_0, cute.make_layout(1))",
+            edge_epi_src,
+        )
+        self.assertIn(
+            "cute.copy(tcgen05_aux_rmem_0_edge_atom, "
+            "tcgen05_aux_rmem_0_edge_src, tcgen05_aux_rmem_0_edge_dst, "
+            "pred=tcgen05_aux_rmem_0_edge_pred)",
+            edge_epi_src,
+        )
+        self.assertNotIn("tcgen05_aux_rmem_1_edge_atom", edge_epi_src)
+        self.assertIn(
+            "tcgen05_edge_src = cute.logical_divide("
+            "tcgen05_tTR_rD, cute.make_layout(1))",
+            edge_epi_src,
+        )
+        self.assertIn(
+            "tcgen05_edge_pred = cute.make_rmem_tensor("
+            "(1, tcgen05_edge_src.shape[1]), cutlass.Boolean)",
+            edge_epi_src,
+        )
+        self.assertIn(
+            "cute.copy(tcgen05_simt_atom, tcgen05_edge_src, "
+            "tcgen05_edge_dst, pred=tcgen05_edge_pred)",
+            edge_epi_src,
+        )
         self.assertIn("tcgen05_tma_store_role_tile = cutlass.Int32(0)", code)
         self.assertIn(
             "tcgen05_c_buffer = (tcgen05_tma_store_role_tile * "
@@ -12454,6 +12531,13 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
             code,
         )
         self.assertIn(
+            "cute.copy(tcgen05_aux_tile_0_tiled_copy_s2r, "
+            "cute.filter_zeros(tcgen05_aux_tile_0_tSR_sC[None, None, None, "
+            "tcgen05_aux_pipeline_consumer_state.index]), "
+            "cute.filter_zeros(tcgen05_aux_tile_0_tSR_rC))",
+            code,
+        )
+        self.assertIn(
             "tcgen05_tTR_gAux_1 = tcgen05_tiled_copy_r2s.retile(tcgen05_tTR_gAux_1)",
             code,
         )
@@ -12463,6 +12547,42 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
         )
         self.assertIn("tcgen05_tRS_rD.store(tcgen05_acc_vec)", code)
         self.assertNotIn("tcgen05_tTR_rD.store(tcgen05_acc_vec)", code)
+        subtile_loop = code.find(
+            "for _tcgen05_subtile in cutlass.range(tcgen05_subtile_count"
+        )
+        self.assertGreaterEqual(
+            subtile_loop,
+            0,
+            "aux TMA store must emit a per-subtile loop",
+        )
+        t2r_copy = code.find("cute.copy(tcgen05_tiled_copy_t2r", subtile_loop)
+        self.assertGreater(
+            t2r_copy,
+            subtile_loop,
+            "aux TMA store must emit a t2r copy inside the per-subtile loop",
+        )
+        aux_wait = code.find("tcgen05_aux_pipeline.consumer_wait", subtile_loop)
+        self.assertGreater(
+            aux_wait,
+            subtile_loop,
+            "aux TMA store must wait for the aux stage inside the loop",
+        )
+        acc_load = code.find("tcgen05_acc_loaded_", subtile_loop)
+        self.assertGreater(
+            acc_load,
+            subtile_loop,
+            "aux TMA store must load the accumulator inside the loop",
+        )
+        self.assertLess(
+            t2r_copy,
+            aux_wait,
+            "aux wait/load must follow the t2r copy in the TMA store body",
+        )
+        self.assertLess(
+            aux_wait,
+            acc_load,
+            "accumulator load must follow the aux wait/load in the fused epilogue",
+        )
 
     def test_aux_tma_store_r2s_epilogue_layout_runtime_correctness(self) -> None:
         """R2S-layout aux chains preserve bias+residual+GELU outputs."""
@@ -12506,7 +12626,7 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
         torch.testing.assert_close(out, expected, atol=2e-1, rtol=1e-2)
 
     def test_aux_edge_target_shape_tma_load_stages_residual_only(self) -> None:
-        """Opt-in aux TMA load stages the exact-shape residual only on full tiles."""
+        """Opt-in aux TMA load stages the exact-shape residual on edge tiles."""
 
         kernel = self._bias_residual_gelu_kernel()
         args = (
@@ -12560,12 +12680,15 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
         self.assertIn("tcgen05_aux_pipeline.producer_get_barrier", code)
         self.assertIn("tcgen05_aux_pipeline.producer_tail", code)
         self.assertNotIn("tcgen05_aux_tiled_copy_0 = cute.make_tiled_copy_tv", code)
-        self.assertIn("tcgen05_tTR_gAux_grouped_0", code)
+        self.assertIn("tcgen05_aux_tile_0_tRS_rC", code)
+        self.assertIn("tcgen05_aux_tile_0_tSR_sC", code)
+        self.assertIn("tcgen05_aux_pipeline.consumer_wait", code)
         self.assertIn("tcgen05_tTR_gAux_grouped_1", code)
-
-        full_c_input_loop = code.index("while tcgen05_c_input_warp_valid:")
-        edge_c_input_loop = code.index("while tcgen05_c_input_warp_valid_1:")
-        self.assertLess(full_c_input_loop, edge_c_input_loop)
+        self._assert_partial_tma_rowvec_bias_staged(code)
+        self.assertNotIn("tcgen05_aux_full_tile", code)
+        self.assertNotIn("tcgen05_scheduler_warp_full_tile", code)
+        self.assertNotIn("_full_valid", code)
+        self.assertNotIn("_edge_valid", code)
         code_ast = ast.parse(code)
 
         def single_while_src(test: str) -> str:
@@ -12578,12 +12701,9 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
             return matches[0]
 
         full_c_input_src = single_while_src("tcgen05_c_input_warp_valid")
-        edge_c_input_src = single_while_src("tcgen05_c_input_warp_valid_1")
         self.assertIn("tcgen05_aux_pipeline.producer_acquire", full_c_input_src)
         self.assertIn("cute.copy(tcgen05_aux_tma_atom_0", full_c_input_src)
         self.assertIn("tcgen05_aux_pipeline.producer_get_barrier", full_c_input_src)
-        self.assertNotIn("tcgen05_aux_pipeline.producer_acquire", edge_c_input_src)
-        self.assertNotIn("cute.copy(tcgen05_aux_tma_atom_0", edge_c_input_src)
 
     def test_aux_tma_load_rejects_broadcast_only_aux(self) -> None:
         """Explicit aux TMA rejects configs with no exact-shape aux tensor."""
@@ -12630,13 +12750,8 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
         self.assertIn(TCGEN05_AUX_LOAD_MODE_CONFIG_KEY, msg)
         self.assertIn("exact-shape rank-2 auxiliary tensor", msg)
 
-    def test_aux_tma_load_rejects_partial_tiles_without_edge_split(self) -> None:
-        """Bulk aux TMA is not valid on partial tiles without SIMT-edge split."""
-
-        from helion._compiler.cute import cute_mma as cute_mma_module
-        from helion._compiler.cute.device_state import (
-            CuteTcgen05MatmulPlan as _CuteTcgen05MatmulPlan,
-        )
+    def test_aux_tma_load_allows_partial_tiles_with_tma_store(self) -> None:
+        """Bulk aux TMA can stage partial output tiles for TMA-store epilogues."""
 
         kernel = self._bias_residual_gelu_kernel()
         args = (
@@ -12645,13 +12760,6 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
             torch.empty([5000], device=DEVICE, dtype=torch.bfloat16),
             torch.empty([5000, 5000], device=DEVICE, dtype=torch.bfloat16),
         )
-
-        def force_unsafe_aux_tma_plan(*p_args, **p_kwargs):  # type: ignore[no-untyped-def]
-            # Simulate the autoreview hazard: explicit aux TMA on a partial
-            # output shape without the full-tile/edge split that routes edge
-            # tiles through predicated SIMT aux loads.
-            p_kwargs["tma_store_full_tiles_only"] = False
-            return _CuteTcgen05MatmulPlan(*p_args, **p_kwargs)
 
         with patch_cute_mma_support():
             bound = kernel.bind(args)
@@ -12670,19 +12778,149 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
                 **{TCGEN05_AUX_LOAD_MODE_CONFIG_KEY: TCGEN05_AUX_LOAD_MODE_TMA},
                 indexing=["tensor_descriptor"] * bound.env.config_spec.indexing.length,
             )
-            with (
-                patch.object(
-                    cute_mma_module,
-                    "CuteTcgen05MatmulPlan",
-                    force_unsafe_aux_tma_plan,
-                ),
-                self.assertRaises(exc.BackendUnsupported) as cm,
-            ):
+            code = bound.to_triton_code(cfg)
+        self.assertIn("'kind': 'tcgen05_aux_tma'", code)
+        self.assertIn("'kind': 'tcgen05_d_tma'", code)
+        self.assertIn("cute.copy(tcgen05_aux_tma_atom_0", code)
+        self.assertIn("cute.copy(tcgen05_tma_store_atom", code)
+        self._assert_partial_tma_rowvec_bias_staged(code)
+        self.assertNotIn("tcgen05_aux_full_tile", code)
+        self.assertNotIn("tcgen05_edge_src = cute.logical_divide(", code)
+
+    def test_aux_tma_mode_without_aux_keeps_full_edge_store_split(self) -> None:
+        """A stale aux-TMA config key alone does not enable partial TMA stores."""
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_no_aux(
+            x: torch.Tensor,
+            y: torch.Tensor,
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        args = (
+            torch.empty([5000, 5000], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([5000, 5000], device=DEVICE, dtype=torch.bfloat16),
+        )
+
+        with patch_cute_mma_support():
+            bound = cute_matmul_no_aux.bind(args)
+            cfg = _make_tcgen05_persistent_config(
+                block_sizes=[256, 256, 128],
+                l2_groupings=[TCGEN05_TWO_CTA_EDGE_K_TAIL_L2_GROUPING],
+                pid_type="persistent_interleaved",
+                num_warps=4,
+                tcgen05_cluster_m=2,
+                tcgen05_ab_stages=2,
+                tcgen05_acc_stages=1,
+                tcgen05_c_stages=TCGEN05_TWO_CTA_EDGE_K_TAIL_C_STAGES,
+                tcgen05_acc_wait_placement=TCGEN05_ACC_WAIT_PLACEMENT_BEFORE_SUBTILE_LOOP,
+                tcgen05_c_acquire_placement=TCGEN05_C_ACQUIRE_PLACEMENT_FIRST_IN_LOOP,
+                **{TCGEN05_AUX_LOAD_MODE_CONFIG_KEY: TCGEN05_AUX_LOAD_MODE_TMA},
+                indexing=["tensor_descriptor"] * bound.env.config_spec.indexing.length,
+            )
+            code = bound.to_triton_code(cfg)
+
+        self.assertNotIn("'kind': 'tcgen05_aux_tma'", code)
+        self.assertIn("'kind': 'tcgen05_d_tma'", code)
+        self.assertIn("if tcgen05_full_tile:", code)
+        self.assertIn("tcgen05_edge_src = cute.logical_divide(", code)
+
+    def test_aux_tma_partial_store_keeps_guard_for_unaligned_rowvec_tail(
+        self,
+    ) -> None:
+        """Row-vector staging only fires when the vectorized copy cannot overread."""
+
+        kernel = self._bias_residual_gelu_kernel()
+        args = (
+            torch.empty([640, 128], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([128, 642], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([642], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([640, 642], device=DEVICE, dtype=torch.bfloat16),
+        )
+
+        with patch_cute_mma_support():
+            bound = kernel.bind(args)
+            cfg = _make_tcgen05_persistent_config(
+                block_sizes=[256, 256, 128],
+                l2_groupings=[TCGEN05_TWO_CTA_EDGE_K_TAIL_L2_GROUPING],
+                pid_type="persistent_interleaved",
+                num_warps=4,
+                tcgen05_cluster_m=2,
+                tcgen05_ab_stages=2,
+                tcgen05_acc_stages=1,
+                tcgen05_c_stages=TCGEN05_TWO_CTA_EDGE_K_TAIL_C_STAGES,
+                tcgen05_l2_swizzle_size=TCGEN05_TWO_CTA_EDGE_K_TAIL_L2_SWIZZLE_SIZE,
+                tcgen05_acc_wait_placement=TCGEN05_ACC_WAIT_PLACEMENT_BEFORE_SUBTILE_LOOP,
+                tcgen05_c_acquire_placement=TCGEN05_C_ACQUIRE_PLACEMENT_FIRST_IN_LOOP,
+                tcgen05_strategy="role_local_with_scheduler",
+                tcgen05_warp_spec_scheduler_warps=1,
+                tcgen05_warp_spec_c_input_warps=1,
+                **{TCGEN05_AUX_LOAD_MODE_CONFIG_KEY: TCGEN05_AUX_LOAD_MODE_TMA},
+                indexing=["tensor_descriptor"] * bound.env.config_spec.indexing.length,
+            )
+            code = bound.to_triton_code(cfg)
+
+        self.assertIn("'kind': 'tcgen05_aux_tma'", code)
+        self.assertIn("if tcgen05_full_tile:", code)
+        self.assertNotIn("tcgen05_aux_rowvec_smem_1", code)
+
+    def test_aux_tma_partial_store_keeps_guard_for_unaligned_rowvec_tile(
+        self,
+    ) -> None:
+        """Row-vector staging also requires vector-aligned tile width."""
+
+        self.assertEqual(
+            _tcgen05_rowvec_aux_stage_copy_elems(16, 256, 5000),
+            8,
+        )
+        self.assertIsNone(_tcgen05_rowvec_aux_stage_copy_elems(16, 256, 642))
+        self.assertIsNone(_tcgen05_rowvec_aux_stage_copy_elems(8, 8, 480))
+        self.assertIsNone(_tcgen05_rowvec_aux_stage_copy_elems(256, 256, 512))
+
+    def test_aux_tma_load_rejects_partial_tiles_without_tma_store_routing(
+        self,
+    ) -> None:
+        """Bulk aux TMA still rejects partial tiles with no routed edge store."""
+
+        kernel = self._bias_residual_gelu_kernel()
+        args = (
+            torch.empty([5000, 5000], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([5000, 512], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([512], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([5000, 512], device=DEVICE, dtype=torch.bfloat16),
+        )
+
+        with patch_cute_mma_support():
+            bound = kernel.bind(args)
+            cfg = _make_tcgen05_persistent_config(
+                block_sizes=[256, 256, 128],
+                l2_groupings=[1],
+                pid_type="persistent_interleaved",
+                num_warps=4,
+                tcgen05_cluster_m=2,
+                tcgen05_ab_stages=2,
+                tcgen05_acc_stages=1,
+                tcgen05_c_stages=2,
+                tcgen05_strategy="role_local_with_scheduler",
+                tcgen05_warp_spec_scheduler_warps=1,
+                tcgen05_warp_spec_c_input_warps=1,
+                **{TCGEN05_AUX_LOAD_MODE_CONFIG_KEY: TCGEN05_AUX_LOAD_MODE_TMA},
+                indexing=["tensor_descriptor"] * bound.env.config_spec.indexing.length,
+            )
+            with self.assertRaises(exc.BackendUnsupported) as cm:
                 bound.to_triton_code(cfg)
         msg = str(cm.exception)
         self.assertIn(TCGEN05_AUX_LOAD_MODE_CONFIG_KEY, msg)
         self.assertIn("partial output tiles", msg)
-        self.assertIn("full-tile/edge fallback split", msg)
+        self.assertIn("partial-output TMA-store epilogue", msg)
 
     def test_aux_tma_load_rejects_c_input_warp_zero(self) -> None:
         """Explicit aux TMA must not silently no-op when the producer gate is shut."""
@@ -12867,6 +13105,54 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
         self.assertEqual(code.count("tcgen05_tTR_cC_subtile = "), 1, code)
         self.assertEqual(code.count("for _edge_i in range("), 3, code)
 
+    def test_aux_edge_target_shape_clc_aux_tma_uses_partial_tma_store(self) -> None:
+        """CLC aux-TMA path keeps edge tiles on one TMA-store stream."""
+
+        kernel = self._bias_residual_gelu_kernel()
+        args = (
+            torch.empty([5000, 5000], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([5000, 5000], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([5000], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([5000, 5000], device=DEVICE, dtype=torch.bfloat16),
+        )
+        with patch_cute_mma_support():
+            bound = kernel.bind(args)
+            cfg = _make_tcgen05_persistent_config(
+                block_sizes=[256, 256, 128],
+                l2_groupings=[TCGEN05_TWO_CTA_EDGE_K_TAIL_L2_GROUPING],
+                pid_type="persistent_interleaved",
+                num_warps=4,
+                tcgen05_cluster_m=2,
+                tcgen05_ab_stages=2,
+                tcgen05_acc_stages=1,
+                tcgen05_c_stages=TCGEN05_TWO_CTA_EDGE_K_TAIL_C_STAGES,
+                tcgen05_l2_swizzle_size=TCGEN05_TWO_CTA_EDGE_K_TAIL_L2_SWIZZLE_SIZE,
+                tcgen05_acc_wait_placement=TCGEN05_ACC_WAIT_PLACEMENT_BEFORE_SUBTILE_LOOP,
+                tcgen05_c_acquire_placement=TCGEN05_C_ACQUIRE_PLACEMENT_FIRST_IN_LOOP,
+                tcgen05_strategy="role_local_with_scheduler",
+                tcgen05_warp_spec_scheduler_warps=1,
+                tcgen05_warp_spec_c_input_warps=1,
+                tcgen05_persistence_model="clc_persistent",
+                **{TCGEN05_AUX_LOAD_MODE_CONFIG_KEY: TCGEN05_AUX_LOAD_MODE_TMA},
+                indexing=["tensor_descriptor"] * bound.env.config_spec.indexing.length,
+            )
+            code = bound.to_triton_code(cfg)
+
+        self.assertEqual(code.count("_cute_issue_clc_query_nomulticast"), 2, code)
+        self.assertIn("cutlass.pipeline.PipelineTmaStore.create", code)
+        self._assert_partial_tma_rowvec_bias_staged(code)
+        self.assertNotIn("tcgen05_full_tile = ", code)
+        self.assertNotIn("tcgen05_aux_full_tile = ", code)
+        self.assertNotIn("if tcgen05_aux_full_tile:", code)
+        self.assertIn("tcgen05_aux_pipeline.producer_acquire", code)
+        self.assertNotIn("tcgen05_scheduler_warp_full_tile", code)
+        self.assertNotIn("_full_valid", code)
+        self.assertNotIn("_edge_valid", code)
+        self.assertNotIn("while tcgen05_scheduler_warp_work_tile.is_valid_tile:", code)
+        self.assertEqual(code.count("tcgen05_gC = cute.local_tile("), 1, code)
+        self.assertIn("tcgen05_bSG_sD, tcgen05_bSG_gD_partitioned", code)
+        self.assertNotIn("tcgen05_edge_src = cute.logical_divide(", code)
+
     def test_aux_edge_hybrid_tma_store_runtime_correctness(self) -> None:
         """Hybrid full-tile TMA store and SIMT edge fallback run together."""
 
@@ -12921,6 +13207,92 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
             )
             self.assertIn("cute.copy(tcgen05_tma_store_atom", code)
             self.assertIn("cute.nvgpu.CopyUniversalOp()", code)
+            self.assertIn(
+                "tcgen05_aux_rmem_0_edge_atom = cute.make_copy_atom("
+                "cute.nvgpu.CopyUniversalOp(), cutlass.BFloat16)",
+                code,
+            )
+            self.assertIn(
+                "cute.copy(tcgen05_aux_rmem_0_edge_atom, "
+                "tcgen05_aux_rmem_0_edge_src, tcgen05_aux_rmem_0_edge_dst, "
+                "pred=tcgen05_aux_rmem_0_edge_pred)",
+                code,
+            )
+            self.assertIn(
+                "tcgen05_edge_src = cute.logical_divide("
+                "tcgen05_tTR_rD, cute.make_layout(1))",
+                code,
+            )
+            self.assertIn(
+                "cute.copy(tcgen05_simt_atom, tcgen05_edge_src, "
+                "tcgen05_edge_dst, pred=tcgen05_edge_pred)",
+                code,
+            )
+            out = bound(*args)
+
+        expected = torch.nn.functional.gelu(
+            1.25 * (args[0] @ args[1]).float() + 0.5 * args[3] + args[2],
+            approximate="tanh",
+        ).to(args[0].dtype)
+        torch.testing.assert_close(out, expected, atol=3e-1, rtol=2e-2)
+
+    def test_aux_edge_partial_tma_store_runtime_correctness(self) -> None:
+        """Partial-output TMA store handles full and edge tiles together."""
+
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+
+        kernel = self._bias_residual_gelu_kernel()
+        torch.manual_seed(0)
+        # 640x640 with 256x256 tiles gives full and output-edge tiles in one
+        # persistent CtaGroup.TWO kernel.
+        args = (
+            torch.randn(640, 128, device=DEVICE, dtype=torch.bfloat16),
+            torch.randn(128, 640, device=DEVICE, dtype=torch.bfloat16),
+            torch.randn(640, device=DEVICE, dtype=torch.bfloat16),
+            torch.randn(640, 640, device=DEVICE, dtype=torch.bfloat16),
+        )
+        with patch_cute_mma_support():
+            bound = kernel.bind(args)
+            cfg = _make_tcgen05_persistent_config(
+                block_sizes=[256, 256, 128],
+                l2_groupings=[TCGEN05_TWO_CTA_EDGE_K_TAIL_L2_GROUPING],
+                pid_type="persistent_interleaved",
+                num_warps=4,
+                tcgen05_cluster_m=2,
+                tcgen05_ab_stages=2,
+                tcgen05_acc_stages=1,
+                tcgen05_c_stages=TCGEN05_TWO_CTA_EDGE_K_TAIL_C_STAGES,
+                tcgen05_l2_swizzle_size=TCGEN05_TWO_CTA_EDGE_K_TAIL_L2_SWIZZLE_SIZE,
+                tcgen05_acc_wait_placement=TCGEN05_ACC_WAIT_PLACEMENT_BEFORE_SUBTILE_LOOP,
+                tcgen05_c_acquire_placement=TCGEN05_C_ACQUIRE_PLACEMENT_FIRST_IN_LOOP,
+                tcgen05_strategy="role_local_with_scheduler",
+                tcgen05_warp_spec_scheduler_warps=1,
+                tcgen05_warp_spec_c_input_warps=1,
+                **{TCGEN05_AUX_LOAD_MODE_CONFIG_KEY: TCGEN05_AUX_LOAD_MODE_TMA},
+                indexing=["tensor_descriptor"] * bound.env.config_spec.indexing.length,
+            )
+            bound.set_config(cfg)
+            code = bound.to_triton_code(cfg)
+            self.assertIn("cutlass.pipeline.PipelineTmaStore.create", code)
+            self._assert_partial_tma_rowvec_bias_staged(code)
+            self.assertIn(
+                "tcgen05_c_buffer = (tcgen05_tma_store_role_tile * "
+                "cutlass.Int32(tcgen05_subtile_count) + "
+                "cutlass.Int32(_tcgen05_subtile)) % "
+                f"cutlass.Int32({TCGEN05_TWO_CTA_EDGE_K_TAIL_C_STAGES})",
+                code,
+            )
+            self.assertIn(
+                "tcgen05_tma_store_role_tile = "
+                "tcgen05_tma_store_role_tile + cutlass.Int32(1)",
+                code,
+            )
+            self.assertIn("cute.copy(tcgen05_tma_store_atom", code)
+            self.assertNotIn("tcgen05_aux_rmem_0_edge_atom", code)
+            self.assertNotIn("tcgen05_edge_src = cute.logical_divide(", code)
             out = bound(*args)
 
         expected = torch.nn.functional.gelu(

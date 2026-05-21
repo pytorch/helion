@@ -2125,10 +2125,20 @@ def _emit_mma_pipeline(
         and tcgen05_role_local_codegen_allowed
         and (not _is_persistent_pid_config(df.config) or tcgen05_use_role_local_epi)
     )
-    tcgen05_tma_store_full_tiles_only = (
-        tcgen05_use_tma_store_epilogue
-        and tcgen05_use_output_edge_tma_store_for_full_tiles
-        and not tcgen05_static_output_tiles
+
+    def tcgen05_tma_store_full_tiles_only_for(
+        partial_output_tma_store: bool,
+    ) -> bool:
+        return (
+            tcgen05_use_tma_store_epilogue
+            and tcgen05_use_output_edge_tma_store_for_full_tiles
+            and not tcgen05_static_output_tiles
+            and not partial_output_tma_store
+        )
+
+    tcgen05_partial_output_tma_store = False
+    tcgen05_tma_store_full_tiles_only = tcgen05_tma_store_full_tiles_only_for(
+        tcgen05_partial_output_tma_store
     )
     if tcgen05_large_bn_proof and (
         mma_impl != "tcgen05"
@@ -2558,6 +2568,31 @@ def _emit_mma_pipeline(
         df.cute_state.matmul_fx_nodes.add(fx_node)
         aux_tensor_descriptors_value = discover_tcgen05_aux_tensor_descriptors(
             cg, fx_node
+        )
+        c_input_aux_tensor_descriptors_value = tuple(
+            d for d in aux_tensor_descriptors_value if d.broadcast_axis is None
+        )
+        aux_tma_productive_body_gate_open = (
+            tcgen05_warp_spec.c_input_warps > 0
+            and bool(c_input_aux_tensor_descriptors_value)
+            and len({d.store_value_node for d in c_input_aux_tensor_descriptors_value})
+            <= 1
+        )
+        # CuTe's TMA descriptor bounds checks correctly suppress partial M/N
+        # output stores for the admitted aux-TMA output-edge family, so keep
+        # those edge tiles on the same TMA-store path as full tiles. Kernels
+        # without a productive aux-TMA body keep the original predicated
+        # full-tile/edge split.
+        tcgen05_partial_output_tma_store = (
+            tcgen05_use_tma_store_epilogue
+            and tcgen05_use_output_edge_tma_store_for_full_tiles
+            and not tcgen05_static_output_tiles
+            and df.config.get(TCGEN05_AUX_LOAD_MODE_CONFIG_KEY)
+            == TCGEN05_AUX_LOAD_MODE_TMA
+            and aux_tma_productive_body_gate_open
+        )
+        tcgen05_tma_store_full_tiles_only = tcgen05_tma_store_full_tiles_only_for(
+            tcgen05_partial_output_tma_store
         )
         tcgen05_matmul_plan = CuteTcgen05MatmulPlan(
             bm=bm,
@@ -3178,17 +3213,24 @@ def _emit_mma_pipeline(
                     env.backend.dtype_str(desc.host_tensor_val.dtype)
                     for desc in c_input_aux_tensor_descriptors
                 )
-                if (
+                # With dynamic M/N output shapes, a TMA-store epilogue is only
+                # enabled for the output-edge family, which routes partial tiles
+                # through either the full/edge split or the bounds-checked
+                # partial-output TMA-store path.
+                tma_store_handles_partial_tiles = tcgen05_use_tma_store_epilogue
+                aux_tma_needs_edge_routing = (
                     tcgen05_aux_tma_requested
                     and not tcgen05_static_output_tiles
-                    and not tcgen05_matmul_plan.tma_store_full_tiles_only
-                ):
+                    and not tma_store_handles_partial_tiles
+                )
+                if aux_tma_needs_edge_routing:
                     raise exc.BackendUnsupported(
                         "cute",
                         f"{TCGEN05_AUX_LOAD_MODE_CONFIG_KEY}="
                         f"{TCGEN05_AUX_LOAD_MODE_TMA!r} with partial output "
-                        "tiles requires the full-tile/edge fallback split used "
-                        "by output-edge TMA stores",
+                        "tiles requires either a partial-output TMA-store "
+                        "epilogue or the full-tile/edge fallback split used "
+                        "by output-edge stores",
                     )
                 if tcgen05_aux_tma_requested and any(
                     dtype_str != epi_elem_dtype_str
@@ -4418,6 +4460,7 @@ def _emit_mma_pipeline(
                 use_role_local_epi=tcgen05_use_role_local_epi,
                 use_tma_store_epilogue=tcgen05_use_tma_store_epilogue,
                 tma_store_full_tiles_only=tcgen05_tma_store_full_tiles_only,
+                partial_output_tma_store=tcgen05_partial_output_tma_store,
                 ab_stage_count=tcgen05_ab_stage_count_value,
                 acc_stage_count=tcgen05_acc_stage_count_value,
                 skip_ab_producer_advance=diagnose_skip_ab_producer_advance,

@@ -13,6 +13,8 @@ from helion._compiler.autotuner_heuristics.registry import AutotunerHeuristic
 from helion._compiler.autotuner_heuristics.triton import TritonSkinnyGemmHeuristic
 from helion._compiler.backend import TritonBackend
 from helion._compiler.cute.strategies import TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY
+from helion._compiler.cute.strategies import TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY
+from helion._compiler.cute.strategies import TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY
 from helion._compiler.cute.strategies import Tcgen05PersistenceModel
 from helion._compiler.cute.strategies import Tcgen05Strategy
 from helion._compiler.cute.tcgen05_config import CuteTcgen05Config
@@ -42,10 +44,28 @@ from helion._compiler.cute.tcgen05_constants import (
 from helion._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K
 from helion._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_EDGE_K_TAIL_C_STAGES
 from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_TWO_CTA_EDGE_K_TAIL_CLC_AUX_TMA_ACC_STAGES,
+)
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_TWO_CTA_EDGE_K_TAIL_CLC_AUX_TMA_K_RANGE_FLATTEN,
+)
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_TWO_CTA_EDGE_K_TAIL_CLC_AUX_TMA_K_RANGE_MULTI_BUFFER,
+)
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_TWO_CTA_EDGE_K_TAIL_CLC_AUX_TMA_K_RANGE_WARP_SPECIALIZE,
+)
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_TWO_CTA_EDGE_K_TAIL_CLC_AUX_TMA_L2_GROUPING,
+)
+from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_TWO_CTA_EDGE_K_TAIL_L2_GROUPING,
 )
 from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_TWO_CTA_EDGE_K_TAIL_L2_SWIZZLE_SIZE,
+)
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_ACC_STAGES,
 )
 from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_BLOCK_K,
@@ -610,6 +630,39 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             TCGEN05_C_ACQUIRE_PLACEMENT_FIRST_IN_LOOP,
         )
 
+    def _expected_clc_aux_tma_range_knobs(
+        self, spec: ConfigSpec
+    ) -> tuple[list[bool | None], list[bool | None], list[bool | None]]:
+        self.assertEqual(len(spec.matmul_facts), 1)
+        k_block_id = spec.matmul_facts[0].k_block_id
+        assert k_block_id is not None
+        k_range_index = spec.range_flattens.block_id_to_index(k_block_id)
+        self.assertEqual(
+            k_range_index,
+            spec.range_multi_buffers.block_id_to_index(k_block_id),
+        )
+        self.assertEqual(
+            k_range_index,
+            spec.range_warp_specialize.block_id_to_index(k_block_id),
+        )
+        range_flattens: list[bool | None] = [None for _ in spec.range_flattens]
+        range_multi_buffers: list[bool | None] = [
+            None for _ in spec.range_multi_buffers
+        ]
+        range_warp_specializes: list[bool | None] = [
+            None for _ in spec.range_warp_specialize
+        ]
+        range_flattens[k_range_index] = (
+            TCGEN05_TWO_CTA_EDGE_K_TAIL_CLC_AUX_TMA_K_RANGE_FLATTEN
+        )
+        range_multi_buffers[k_range_index] = (
+            TCGEN05_TWO_CTA_EDGE_K_TAIL_CLC_AUX_TMA_K_RANGE_MULTI_BUFFER
+        )
+        range_warp_specializes[k_range_index] = (
+            TCGEN05_TWO_CTA_EDGE_K_TAIL_CLC_AUX_TMA_K_RANGE_WARP_SPECIALIZE
+        )
+        return range_flattens, range_multi_buffers, range_warp_specializes
+
     @onlyBackends(["cute"])
     def test_cute_tcgen05_cluster_m2_seed_heuristic(self) -> None:
         @helion.kernel(backend="cute")
@@ -758,6 +811,11 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             bound = cute_matmul_bias_residual_gelu.bind(args)
 
         spec = bound.config_spec
+        (
+            expected_clc_aux_tma_range_flattens,
+            expected_clc_aux_tma_range_multi_buffers,
+            expected_clc_aux_tma_range_warp_specializes,
+        ) = self._expected_clc_aux_tma_range_knobs(spec)
         self.assertIn(CuteTcgen05ClusterM2Heuristic.name, spec.autotuner_heuristics)
         self.assertTrue(spec.cute_tcgen05_exact_shape_aux_kernel_detected)
         constraints = spec._tcgen05_cluster_m2_search_constraints
@@ -802,6 +860,12 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             == Tcgen05PersistenceModel.CLC_PERSISTENT.value
         ]
         self.assertEqual(len(raw_clc_seeds), 3)
+        raw_wide_clc_aux_tma_seed = next(
+            config
+            for config in raw_clc_seeds
+            if config.get(TCGEN05_AUX_LOAD_MODE_CONFIG_KEY) == TCGEN05_AUX_LOAD_MODE_TMA
+            and config["block_sizes"][1] == TCGEN05_TWO_CTA_BLOCK_N
+        )
         raw_narrow_clc_aux_tma_seed = next(
             config
             for config in raw_clc_seeds
@@ -884,6 +948,26 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             aux_tma_seed[TCGEN05_AUX_LOAD_MODE_CONFIG_KEY], TCGEN05_AUX_LOAD_MODE_TMA
         )
         self.assertEqual(
+            raw_wide_clc_aux_tma_seed["l2_groupings"],
+            [TCGEN05_TWO_CTA_EDGE_K_TAIL_CLC_AUX_TMA_L2_GROUPING],
+        )
+        self.assertEqual(
+            raw_wide_clc_aux_tma_seed["tcgen05_acc_stages"],
+            TCGEN05_TWO_CTA_EDGE_K_TAIL_CLC_AUX_TMA_ACC_STAGES,
+        )
+        self.assertEqual(
+            raw_wide_clc_aux_tma_seed["range_flattens"],
+            expected_clc_aux_tma_range_flattens,
+        )
+        self.assertEqual(
+            raw_wide_clc_aux_tma_seed["range_multi_buffers"],
+            expected_clc_aux_tma_range_multi_buffers,
+        )
+        self.assertEqual(
+            raw_wide_clc_aux_tma_seed["range_warp_specializes"],
+            expected_clc_aux_tma_range_warp_specializes,
+        )
+        self.assertEqual(
             raw_narrow_clc_aux_tma_seed["block_sizes"],
             [
                 TCGEN05_TWO_CTA_BLOCK_M,
@@ -894,6 +978,22 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         self.assertEqual(
             raw_narrow_clc_aux_tma_seed["l2_groupings"],
             [TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_L2_GROUPING],
+        )
+        self.assertEqual(
+            raw_narrow_clc_aux_tma_seed["tcgen05_acc_stages"],
+            TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_ACC_STAGES,
+        )
+        self.assertEqual(
+            raw_narrow_clc_aux_tma_seed["range_flattens"],
+            expected_clc_aux_tma_range_flattens,
+        )
+        self.assertEqual(
+            raw_narrow_clc_aux_tma_seed["range_multi_buffers"],
+            expected_clc_aux_tma_range_multi_buffers,
+        )
+        self.assertEqual(
+            raw_narrow_clc_aux_tma_seed["range_warp_specializes"],
+            expected_clc_aux_tma_range_warp_specializes,
         )
         self.assertEqual(
             raw_narrow_clc_aux_tma_seed[TCGEN05_AUX_LOAD_MODE_CONFIG_KEY],
@@ -937,6 +1037,65 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             == Tcgen05PersistenceModel.CLC_PERSISTENT.value
         ]
         self.assertEqual(len(normalized_clc_seeds), 3)
+        normalized_wide_clc_aux_tma_seed = next(
+            config
+            for config in normalized_clc_seeds
+            if config.get(TCGEN05_AUX_LOAD_MODE_CONFIG_KEY) == TCGEN05_AUX_LOAD_MODE_TMA
+            and config["block_sizes"][1] == TCGEN05_TWO_CTA_BLOCK_N
+        )
+        projected_wide_clc_aux_tma_config = dict(raw_wide_clc_aux_tma_seed)
+        projected_wide_clc_aux_tma_config["block_sizes"] = [128, 64, 64]
+        projected_wide_clc_aux_tma_config["pid_type"] = "flat"
+        projected_wide_clc_aux_tma_config["tcgen05_acc_stages"] = (
+            TCGEN05_TWO_CTA_EDGE_K_TAIL_ACC_STAGES
+        )
+        projected_wide_clc_aux_tma_config["l2_groupings"] = [
+            TCGEN05_TWO_CTA_EDGE_K_TAIL_L2_GROUPING
+        ]
+        projected_wide_clc_aux_tma_config[TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY] = 0
+        for key in (
+            "range_flattens",
+            "range_multi_buffers",
+            "range_warp_specializes",
+        ):
+            projected_wide_clc_aux_tma_config.pop(key, None)
+        spec._cute_tcgen05_config.fix_search_config(projected_wide_clc_aux_tma_config)
+        self.assertEqual(
+            projected_wide_clc_aux_tma_config["block_sizes"][:3],
+            [
+                TCGEN05_TWO_CTA_BLOCK_M,
+                TCGEN05_TWO_CTA_BLOCK_N,
+                TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K,
+            ],
+        )
+        self.assertEqual(
+            projected_wide_clc_aux_tma_config["l2_groupings"],
+            [TCGEN05_TWO_CTA_EDGE_K_TAIL_CLC_AUX_TMA_L2_GROUPING],
+        )
+        self.assertEqual(
+            projected_wide_clc_aux_tma_config["tcgen05_acc_stages"],
+            TCGEN05_TWO_CTA_EDGE_K_TAIL_CLC_AUX_TMA_ACC_STAGES,
+        )
+        self.assertEqual(
+            projected_wide_clc_aux_tma_config[TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY],
+            1,
+        )
+        self.assertEqual(
+            projected_wide_clc_aux_tma_config[TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY],
+            1,
+        )
+        self.assertEqual(
+            projected_wide_clc_aux_tma_config["range_flattens"],
+            expected_clc_aux_tma_range_flattens,
+        )
+        self.assertEqual(
+            projected_wide_clc_aux_tma_config["range_multi_buffers"],
+            expected_clc_aux_tma_range_multi_buffers,
+        )
+        self.assertEqual(
+            projected_wide_clc_aux_tma_config["range_warp_specializes"],
+            expected_clc_aux_tma_range_warp_specializes,
+        )
         for flat_seed, _normalized_seed in seed_pairs:
             config_gen.encode_config(flat_seed)
         persistence_indices, _ = config_gen._key_to_flat_indices[
@@ -1053,6 +1212,26 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             normalized_aux_tma_seed[TCGEN05_AUX_LOAD_MODE_CONFIG_KEY],
             TCGEN05_AUX_LOAD_MODE_TMA,
         )
+        self.assertEqual(
+            normalized_wide_clc_aux_tma_seed["l2_groupings"],
+            [TCGEN05_TWO_CTA_EDGE_K_TAIL_CLC_AUX_TMA_L2_GROUPING],
+        )
+        self.assertEqual(
+            normalized_wide_clc_aux_tma_seed["tcgen05_acc_stages"],
+            TCGEN05_TWO_CTA_EDGE_K_TAIL_CLC_AUX_TMA_ACC_STAGES,
+        )
+        self.assertEqual(
+            normalized_wide_clc_aux_tma_seed["range_flattens"],
+            expected_clc_aux_tma_range_flattens,
+        )
+        self.assertEqual(
+            normalized_wide_clc_aux_tma_seed["range_multi_buffers"],
+            expected_clc_aux_tma_range_multi_buffers,
+        )
+        self.assertEqual(
+            normalized_wide_clc_aux_tma_seed["range_warp_specializes"],
+            expected_clc_aux_tma_range_warp_specializes,
+        )
         normalized_narrow_clc_aux_tma_seed = next(
             config
             for config in normalized_clc_seeds
@@ -1069,6 +1248,22 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         self.assertEqual(
             normalized_narrow_clc_aux_tma_seed["l2_groupings"],
             [TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_L2_GROUPING],
+        )
+        self.assertEqual(
+            normalized_narrow_clc_aux_tma_seed["tcgen05_acc_stages"],
+            TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_ACC_STAGES,
+        )
+        self.assertEqual(
+            normalized_narrow_clc_aux_tma_seed["range_flattens"],
+            expected_clc_aux_tma_range_flattens,
+        )
+        self.assertEqual(
+            normalized_narrow_clc_aux_tma_seed["range_multi_buffers"],
+            expected_clc_aux_tma_range_multi_buffers,
+        )
+        self.assertEqual(
+            normalized_narrow_clc_aux_tma_seed["range_warp_specializes"],
+            expected_clc_aux_tma_range_warp_specializes,
         )
         self.assertEqual(
             normalized_narrow_clc_aux_tma_seed[TCGEN05_AUX_LOAD_MODE_CONFIG_KEY],
@@ -1178,6 +1373,11 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         ):
             sm90_bound = cute_matmul_bias_residual_gelu.bind(args)
         self.assertIsNot(sm90_bound, bound)
+        (
+            expected_clc_aux_tma_range_flattens,
+            expected_clc_aux_tma_range_multi_buffers,
+            expected_clc_aux_tma_range_warp_specializes,
+        ) = self._expected_clc_aux_tma_range_knobs(bound.config_spec)
 
         valid_config: dict[str, object] = {
             "block_sizes": [
@@ -1201,6 +1401,72 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             valid_config[TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY],
             Tcgen05PersistenceModel.CLC_PERSISTENT.value,
         )
+
+        def make_minimal_preprojection_clc_aux_tma_config() -> dict[str, object]:
+            return {
+                "block_sizes": [128, 64, 64],
+                "indexing": ["tensor_descriptor"] * bound.config_spec.indexing.length,
+                "pid_type": "flat",
+                "tcgen05_cluster_m": 2,
+                "tcgen05_cluster_n": 1,
+                "tcgen05_strategy": Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER.value,
+                TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY: 0,
+                TCGEN05_AUX_LOAD_MODE_CONFIG_KEY: TCGEN05_AUX_LOAD_MODE_TMA,
+                TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY: (
+                    Tcgen05PersistenceModel.CLC_PERSISTENT.value
+                ),
+            }
+
+        minimal_preprojection_clc_aux_tma_config = (
+            make_minimal_preprojection_clc_aux_tma_config()
+        )
+        bound.config_spec.normalize(
+            minimal_preprojection_clc_aux_tma_config,
+            _fix_invalid=True,
+        )
+        self.assertEqual(
+            minimal_preprojection_clc_aux_tma_config["block_sizes"][:3],
+            [
+                TCGEN05_TWO_CTA_BLOCK_M,
+                TCGEN05_TWO_CTA_BLOCK_N,
+                TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K,
+            ],
+        )
+        self.assertEqual(
+            minimal_preprojection_clc_aux_tma_config["l2_groupings"],
+            [TCGEN05_TWO_CTA_EDGE_K_TAIL_CLC_AUX_TMA_L2_GROUPING],
+        )
+        self.assertEqual(
+            minimal_preprojection_clc_aux_tma_config["range_flattens"],
+            expected_clc_aux_tma_range_flattens,
+        )
+        self.assertEqual(
+            minimal_preprojection_clc_aux_tma_config["range_multi_buffers"],
+            expected_clc_aux_tma_range_multi_buffers,
+        )
+        self.assertEqual(
+            minimal_preprojection_clc_aux_tma_config["range_warp_specializes"],
+            expected_clc_aux_tma_range_warp_specializes,
+        )
+        unresolved_range_clc_aux_tma_config = (
+            make_minimal_preprojection_clc_aux_tma_config()
+        )
+        with patch.object(
+            bound.config_spec._cute_tcgen05_config,
+            "_clc_aux_tma_matmul_k_range_index",
+            return_value=None,
+        ):
+            bound.config_spec.normalize(
+                unresolved_range_clc_aux_tma_config,
+                _fix_invalid=True,
+            )
+        self.assertEqual(
+            unresolved_range_clc_aux_tma_config["l2_groupings"],
+            [TCGEN05_TWO_CTA_EDGE_K_TAIL_CLC_AUX_TMA_L2_GROUPING],
+        )
+        self.assertNotIn("range_flattens", unresolved_range_clc_aux_tma_config)
+        self.assertNotIn("range_multi_buffers", unresolved_range_clc_aux_tma_config)
+        self.assertNotIn("range_warp_specializes", unresolved_range_clc_aux_tma_config)
 
         invalid_cluster_n_config = dict(valid_config)
         invalid_cluster_n_config["tcgen05_cluster_n"] = 2

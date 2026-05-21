@@ -13,6 +13,10 @@ TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_BLOCK_N = 128
 # The narrow-N Target8 row has enough SMEM headroom at ab=2 to double the
 # K tile. B200 measurements put this ahead of the older narrow-N K=128 row.
 TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_BLOCK_K = 256
+# With partial-output TMA store and row-vector aux staging, the same narrow-N
+# CLC + aux-TMA row runs faster with two accumulator stages than the historical
+# edge-family default.
+TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_ACC_STAGES = 2
 TCGEN05_TWO_CTA_MAX_K_TILES = 256
 # The double-output-edge + K-tail CtaGroup.TWO search family is validated
 # only for large square-ish GEMMs where persistent clustered scheduling has
@@ -26,6 +30,10 @@ TCGEN05_TWO_CTA_EDGE_K_TAIL_MIN_DIM = 4096
 TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K = 128
 TCGEN05_TWO_CTA_EDGE_K_TAIL_AB_STAGES = 2
 TCGEN05_TWO_CTA_EDGE_K_TAIL_ACC_STAGES = 1
+# The post row-vector-staging Target8 CLC + aux-TMA edge rows now measure
+# fastest with two accumulator stages. Keep the historical edge-family default
+# above for non-CLC/non-aux variants. Narrow-N keeps a separate value above.
+TCGEN05_TWO_CTA_EDGE_K_TAIL_CLC_AUX_TMA_ACC_STAGES = 2
 # The 5000x5000x5000 bias_residual_gelu edge+K-tail reference sweep on B200
 # showed the hybrid TMA/SIMT store running faster with two C-store stages than
 # with the earlier four-stage seed.
@@ -34,6 +42,14 @@ TCGEN05_TWO_CTA_EDGE_K_TAIL_C_STAGES = 2
 # four-tile L2 swizzle. Keep these with the edge+K-tail stage tuple so the
 # seeded/fixed CtaGroup.TWO family starts at the measured production row.
 TCGEN05_TWO_CTA_EDGE_K_TAIL_L2_GROUPING = 2
+# The wide-N CLC + aux-TMA Target8 row prefers an intermediate tile scheduler
+# group. Narrow-N keeps its separate grouping below.
+TCGEN05_TWO_CTA_EDGE_K_TAIL_CLC_AUX_TMA_L2_GROUPING = 8
+# CLC + aux-TMA edge rows measure faster when the matmul K loop is flattened,
+# has accumulator multi-buffering disabled, and is warp specialized.
+TCGEN05_TWO_CTA_EDGE_K_TAIL_CLC_AUX_TMA_K_RANGE_FLATTEN = True
+TCGEN05_TWO_CTA_EDGE_K_TAIL_CLC_AUX_TMA_K_RANGE_MULTI_BUFFER = False
+TCGEN05_TWO_CTA_EDGE_K_TAIL_CLC_AUX_TMA_K_RANGE_WARP_SPECIALIZE = True
 TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_L2_GROUPING = 16
 TCGEN05_TWO_CTA_EDGE_K_TAIL_L2_SWIZZLE_SIZE = 4
 # The scheduler full/edge split scans the same static tile space twice. On the
