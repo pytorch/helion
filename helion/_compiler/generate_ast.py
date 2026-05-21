@@ -43,6 +43,8 @@ if TYPE_CHECKING:
     from collections.abc import Callable
     from collections.abc import Iterator
 
+    from torch.fx.node import Node
+
     from ..runtime import Config
     from .device_ir import GraphInfo
     from .host_function import HostFunction
@@ -90,6 +92,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         self.next_else_block: list[ast.AST] | None = None
         self.store_transform = store_transform
         self.load_transform = load_transform
+        self._statement_owner_fx_node: Node | None = None
 
         # Now create device function and initialize CodegenInterface
         self.device_function = DeviceFunction(
@@ -215,6 +218,23 @@ class GenerateAST(NodeVisitor, CodegenInterface):
             stmt = statement_from_string(stmt)
         self.statements_stack[-1].append(stmt)
         self._record_statement_thread_references([stmt])
+        self._record_tcgen05_owned_statement(stmt)
+
+    def _record_tcgen05_owned_statement(self, stmt: ast.AST) -> None:
+        owner_node = self._statement_owner_fx_node
+        if owner_node is None:
+            return
+        cute_state = self.device_function.cute_state
+        # The generic add_statement hook stays inert unless CuTe tcgen05
+        # lowering registered this exact FX node for ownership tracking.
+        if not cute_state.is_collective_handled_load_or_dependency_node(owner_node):
+            return
+        current_statements = self.statements_stack[-1]
+        for loop_state in reversed(self._active_loop_stack()):
+            if isinstance(loop_state, DeviceLoopState):
+                if current_statements is loop_state.inner_statements:
+                    cute_state.register_tcgen05_kloop_owned_stmts(loop_state, [stmt])
+                    return
 
     def get_rng_seed_buffer_statements(self) -> list[ast.AST]:
         from .compile_environment import CompileEnvironment
@@ -319,6 +339,15 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                     stack.append(loop_state)
                     seen.add(key)
         return stack
+
+    @contextlib.contextmanager
+    def statement_owner_node(self, node: Node) -> Iterator[None]:
+        prior = self._statement_owner_fx_node
+        self._statement_owner_fx_node = node
+        try:
+            yield
+        finally:
+            self._statement_owner_fx_node = prior
 
     def _record_thread_axis_sizes(self, axis_sizes: dict[int, int]) -> None:
         for axis, size in axis_sizes.items():

@@ -1578,6 +1578,8 @@ class TestCuteLowerings(unittest.TestCase):
             "while tcgen05_role_local_0_work_tile.is_valid_tile",
             "tcgen05_acc_pipeline.consumer_wait",
             "cute.copy(tcgen05_tma_store_atom",
+            "tcgen05_tmem_allocator = cutlass.utils.TmemAllocator",
+            "tcgen05_tmem_allocator.free(",
         ):
             self.assertIn(marker, code)
         for forbidden in (

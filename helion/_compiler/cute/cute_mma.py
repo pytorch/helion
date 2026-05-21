@@ -39,6 +39,7 @@ from ..matmul_utils import _needs_f32_accumulator
 from ..tile_strategy import DeviceLoopState
 from .aux_tensor import discover_tcgen05_aux_tensor_descriptors
 from .cutedsl_compat import emit_pipeline_advance
+from .device_state import CuteDeviceFunctionState
 from .device_state import CuteTcgen05MatmulPlan
 from .device_state import CuteTcgen05StoreValue
 from .layout import MatmulExecutionKind
@@ -84,6 +85,7 @@ from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_PROBLEM_SHAPE
 from .tcgen05_constants import TCGEN05_SCHED_STAGE_COUNT_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
 from .tcgen05_constants import TCGEN05_TWO_CTA_EDGE_TMA_STORE_MAX_AB_STAGES
+from .tcgen05_lifecycle import Tcgen05LifecycleContext
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -314,6 +316,49 @@ def _collect_node_dependencies(node: Node) -> set[Node]:
         for arg in current.kwargs.values():
             stack.extend(_iter_node_inputs(arg))
     return required
+
+
+def _collective_load_dependency_nodes(
+    load_node: Node,
+    collective_dependency_nodes: set[Node],
+    terminal_load_nodes: set[Node],
+) -> tuple[Node, ...]:
+    """Return exclusive FX dependency nodes for a tcgen05 collective load."""
+    dependencies = _collect_node_dependencies(load_node)
+    exclusive_nodes = set(collective_dependency_nodes)
+    terminal_load_nodes = terminal_load_nodes & exclusive_nodes
+    changed = True
+    while changed:
+        changed = False
+        for dependency in tuple(exclusive_nodes):
+            if dependency in terminal_load_nodes:
+                continue
+            if any(user not in exclusive_nodes for user in dependency.users):
+                exclusive_nodes.remove(dependency)
+                changed = True
+    return tuple(
+        sorted(dependencies & exclusive_nodes, key=lambda dependency: dependency.name)
+    )
+
+
+def _register_collective_handled_loads(
+    cute_state: CuteDeviceFunctionState, *load_nodes: Node
+) -> None:
+    # This is called both by the early lane-loop-suppression probe and by MMA
+    # emission. Registration is set-based, so repeating it is idempotent and
+    # keeps both call sites local to the decision they support.
+    collective_dependency_nodes: set[Node] = set()
+    for load_node in load_nodes:
+        collective_dependency_nodes.update(_collect_node_dependencies(load_node))
+    terminal_load_nodes = set(load_nodes)
+    for load_node in load_nodes:
+        dependency_nodes = _collective_load_dependency_nodes(
+            load_node, collective_dependency_nodes, terminal_load_nodes
+        )
+        cute_state.register_collective_handled_load(
+            load_node.name,
+            dependency_nodes=dependency_nodes,
+        )
 
 
 def _mma_loop_is_exclusive(node: Node) -> bool:
@@ -850,8 +895,7 @@ def prepare_cute_collective_lane_loop_suppression(
             continue
 
         cute_state = cg.device_function.cute_state
-        cute_state.register_collective_handled_load(lhs_load.name)
-        cute_state.register_collective_handled_load(rhs_load.name)
+        _register_collective_handled_loads(cute_state, lhs_load, rhs_load)
         if grid_state.has_lane_loops():
             cute_state.request_root_lane_loop_suppression()
 
@@ -2210,8 +2254,7 @@ def _emit_mma_pipeline(
     )
     if tcgen05_collective_handles_operand_loads:
         cute_state = df.cute_state
-        cute_state.register_collective_handled_load(lhs_load.name)
-        cute_state.register_collective_handled_load(rhs_load.name)
+        _register_collective_handled_loads(cute_state, lhs_load, rhs_load)
         grid_state = cg.current_grid_state
         assert grid_state is not None
         if grid_state.has_lane_loops():
@@ -2232,6 +2275,13 @@ def _emit_mma_pipeline(
     # === outer_prefix: MMA setup + shared memory alloc + accumulator init ===
     prefix = device_loop.outer_prefix
     suffix = device_loop.outer_suffix
+    # This call corresponds to one MMA FX-node lowering. The later
+    # register_tcgen05_kloop_owned_stmts slice starts here, so pre-existing
+    # K-loop prelude remains outside the cleanup region and later FX-node code
+    # remains unowned. Future role-lifecycle cleanup must pass that exact slice.
+    # Operand-load scaffolding emitted before this snapshot is owned separately
+    # by the FX-node statement-owner hook in GenerateAST.add_statement.
+    tcgen05_kloop_stmt_start = len(device_loop.inner_statements)
     # Statements appended to ``prefix`` that reference per-tile coordinates
     # (m_offset_var, n_offset_var, advancing pipeline state). When the
     # persistent kernel splits the device-loop prefix, these stay inside the
@@ -4482,9 +4532,31 @@ def _emit_mma_pipeline(
         assert epi_active is not None
         assert tma_warp is not None
         assert warp_idx is not None
+        tcgen05_lifecycle_context = Tcgen05LifecycleContext(
+            exec_active=tcgen05_plan.exec_active,
+            epi_active=epi_active,
+            tma_warp=tma_warp,
+            tma_pipeline=tma_pipeline,
+            tma_producer_state=tma_producer_state,
+            acc_pipeline=tcgen05_plan.acc_pipeline,
+            acc_producer_state=tcgen05_plan.acc_producer_state,
+            acc_consumer_state=tcgen05_plan.acc_consumer_state,
+            tmem_alloc_barrier=tcgen05_plan.tmem_alloc_barrier,
+            tmem_allocator=tcgen05_plan.tmem_allocator,
+            tmem_holding_buf=tcgen05_plan.tmem_holding_buf,
+            tmem_dealloc_mbar_ptr=tcgen05_plan.tmem_dealloc_mbar_ptr,
+            epi_acc_tmem_ptr=tcgen05_epi_acc_tmem_ptr,
+            acc_tmem_cols=tcgen05_plan.acc_tmem_cols,
+            is_two_cta=tcgen05_is_two_cta,
+            use_tma=tcgen05_use_tma,
+            ab_stage_count=tcgen05_ab_stage_count_value,
+            acc_stage_count=tcgen05_acc_stage_count_value,
+            skip_ab_producer_advance=diagnose_skip_ab_producer_advance,
+        )
         df.cute_state.register_tcgen05_store_value(
             result_var,
             CuteTcgen05StoreValue(
+                lifecycle_context=tcgen05_lifecycle_context,
                 bm=bm,
                 bn=bn,
                 bk=bk,
@@ -4492,38 +4564,19 @@ def _emit_mma_pipeline(
                 epi_warp_count=tcgen05_epi_warp_count_value,
                 epi_acc_frag_base=tcgen05_epi_acc_frag_base,
                 epi_tidx=epi_tidx,
-                epi_active=epi_active,
-                exec_active=tcgen05_plan.exec_active,
                 warp_idx=warp_idx,
                 epi_tile=tcgen05_plan.epi_tile,
                 c_stage_count=tcgen05_c_stage_count_value,
                 epilog_sync_barrier_id=_TCGEN05_EPILOG_SYNC_BARRIER_ID,
                 tmem_load_atom=tcgen05_plan.tmem_load_atom,
                 epilogue_rest_mode=tcgen05_plan.epilogue_rest_mode,
-                acc_pipeline=tcgen05_plan.acc_pipeline,
-                acc_producer_state=tcgen05_plan.acc_producer_state,
-                acc_consumer_state=tcgen05_plan.acc_consumer_state,
-                tmem_alloc_barrier=tcgen05_plan.tmem_alloc_barrier,
-                tmem_allocator=tcgen05_plan.tmem_allocator,
-                tmem_holding_buf=tcgen05_plan.tmem_holding_buf,
-                tmem_dealloc_mbar_ptr=tcgen05_plan.tmem_dealloc_mbar_ptr,
-                epi_acc_tmem_ptr=tcgen05_epi_acc_tmem_ptr,
-                acc_tmem_cols=tcgen05_plan.acc_tmem_cols,
-                tma_warp=tma_warp,
-                tma_pipeline=tma_pipeline,
-                tma_producer_state=tma_producer_state,
                 tma_store_atom=tma_store_atom,
                 tma_store_tensor=tma_store_tensor,
                 role_local_tile_counter=tma_store_role_tile_counter,
-                is_two_cta=tcgen05_is_two_cta,
-                use_tma=tcgen05_use_tma,
                 use_role_local_epi=tcgen05_use_role_local_epi,
                 use_tma_store_epilogue=tcgen05_use_tma_store_epilogue,
                 tma_store_full_tiles_only=tcgen05_tma_store_full_tiles_only,
                 partial_output_tma_store=tcgen05_partial_output_tma_store,
-                ab_stage_count=tcgen05_ab_stage_count_value,
-                acc_stage_count=tcgen05_acc_stage_count_value,
-                skip_ab_producer_advance=diagnose_skip_ab_producer_advance,
                 # Mirror the value passed to `_make_tcgen05_layout_plan_setup`
                 # above; the store path compares this against `target_dtype`
                 # to enforce the kernel/store equality contract on
@@ -4553,6 +4606,10 @@ def _emit_mma_pipeline(
     # ``_setup_tcgen05_persistent_kernel``).
     if per_tile_stmts:
         df.cute_state.register_tcgen05_per_tile_stmts(per_tile_stmts)
+    if mma_impl == "tcgen05":
+        df.cute_state.register_tcgen05_kloop_owned_stmts(
+            device_loop, device_loop.inner_statements[tcgen05_kloop_stmt_start:]
+        )
     # Register role-block statements with the persistent role partitioner
     # (see ``Tcgen05PersistentProgramIDs._collect_tcgen05_role_blocks``).
     # Two registration shapes land here:
