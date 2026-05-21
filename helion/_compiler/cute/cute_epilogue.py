@@ -51,8 +51,6 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from ...language._gelu_tanh_approx import GELU_ERF_INNER_REF_COUNT
-from ...language._gelu_tanh_approx import GELU_TANH_APPROX_INNER_REF_COUNT
 from ...language._gelu_tanh_approx import _gelu_erf
 from ...language._gelu_tanh_approx import _gelu_tanh_approx
 from ...language._gelu_tanh_approx import epilogue_unary_step_template
@@ -80,18 +78,13 @@ class _UnaryStep:
     ``op_name`` is the human-readable op name used in ``__repr__`` for
     test diagnostics (e.g. ``"relu"``). ``template`` contains one or
     more ``{inner}`` placeholders and is the Python source the splice
-    substitutes for the prior carrier expression. When
-    ``inner_ref_count > 1``, the renderer hoists ``{inner}`` to a
-    dedicated local first so the rendered ``template`` only references
-    the carrier identifier, never the inbound expression directly.
-    This keeps the template's correctness independent of whether the
-    caller's ``{inner}`` is a bound local or an arbitrary expression
-    — each step gets the same self-contained shape.
+    substitutes for the prior carrier local. The renderer keeps carriers
+    bound at every step, so multi-reference templates can reuse the existing
+    local directly without a second alias.
     """
 
     op_name: str
     template: str
-    inner_ref_count: int = 1
 
 
 @dataclasses.dataclass(frozen=True)
@@ -168,15 +161,11 @@ class _AuxiliaryTensorStep:
 # unchanged. The `(x + abs(x)) * 0.5` shortcut would be one expression
 # but produces NaN for `-inf` (`-inf + inf = NaN`), which mismatches
 # `torch.relu(-inf) = 0`; the explicit double-where is the only inline
-# rendering that matches torch on the full IEEE float input range. The
-# 5 inner references are bound to a single hoisted local via
-# ``inner_ref_count = 5`` so the template's correctness does not
-# depend on the caller passing a bound local for ``{inner}``.
+# rendering that matches torch on the full IEEE float input range.
 _RELU_TEMPLATE = (
     "cute.where(({inner}) != ({inner}), ({inner}),"
     " cute.where(({inner}) > 0.0, ({inner}), 0.0))"
 )
-_RELU_INNER_REF_COUNT = 5
 _ABS_TEMPLATE = "cute.math.absf({inner})"
 _NEG_TEMPLATE = "(-({inner}))"
 _TANH_TEMPLATE = "cute.math.tanh({inner})"
@@ -226,15 +215,12 @@ def _rdiv_const_template(scalar: float) -> str:
 # tanh-approximation GELU polynomial inline (``0.5 * x * (1 +
 # cute.math.tanh(x * (kappa + lambda * x * x)))``); see
 # ``helion/language/_gelu_tanh_approx.py`` for constants and
-# motivation. With ``inner_ref_count = 4`` the chain renderer hoists
-# ``{inner}`` to a single local first so the rendered expression
-# references the carrier exactly once even though the polynomial has
-# four occurrences of ``x``.
+# motivation. The renderer always passes a bound local for ``{inner}``,
+# so the four occurrences of ``x`` do not duplicate a complex expression.
 _ZERO_ARG_TARGETS: dict[object, _UnaryStep] = {
     torch.ops.aten.relu.default: _UnaryStep(
         op_name="relu",
         template=_RELU_TEMPLATE,
-        inner_ref_count=_RELU_INNER_REF_COUNT,
     ),
     torch.ops.aten.abs.default: _UnaryStep(op_name="abs", template=_ABS_TEMPLATE),
     torch.ops.aten.neg.default: _UnaryStep(op_name="neg", template=_NEG_TEMPLATE),
@@ -246,17 +232,14 @@ _ZERO_ARG_TARGETS: dict[object, _UnaryStep] = {
     _gelu_erf: _UnaryStep(
         op_name="gelu_erf",
         template=gelu_erf_epilogue_unary_step_template(),
-        inner_ref_count=GELU_ERF_INNER_REF_COUNT,
     ),
     # ``F.gelu(x, approximate="tanh")`` (mapped to ``_gelu_tanh_approx``
     # by the device_ir decomp) — single FX node folding the polynomial
-    # which references ``x`` 4 times. The chain renderer hoists
-    # ``{inner}`` to a single local so the rendered expression has one
-    # carrier reference.
+    # which references ``x`` 4 times. The chain renderer already has a
+    # bound carrier local, so the polynomial can reuse that local directly.
     _gelu_tanh_approx: _UnaryStep(
         op_name="gelu_tanh_approx",
         template=epilogue_unary_step_template(),
-        inner_ref_count=GELU_TANH_APPROX_INNER_REF_COUNT,
     ),
     # NOTE: ``prims.convert_element_type.default`` is intentionally
     # absent. A user-explicit intermediate cast (e.g.,
@@ -445,7 +428,8 @@ class Tcgen05UnaryEpilogueChain:
     compile time, but the source-side blowup pessimizes Python parse
     time and the cute-DSL JIT IR build, both of which scan the source
     text linearly. Per-step locals keep generated source size O(N) in
-    the chain depth.
+    the chain depth without adding a second alias for multi-reference
+    templates.
 
     For auxiliary-tensor steps, the renderer expects the splice site
     to provide a per-step pre-bound local for the ``aux`` operand;
@@ -541,24 +525,12 @@ class Tcgen05UnaryEpilogueChain:
                 prelude_lines.append(f"{prelude_indent}{local} = {step_expr}\n")
                 cur_expr = local
                 continue
-            # Hoist ``{inner}`` to a fresh local when the template
-            # references it more than once (e.g. relu's double-where
-            # rendering with 5 inner refs). This keeps the template
-            # self-contained: a single hoisted local is referenced
-            # from the rendered expression, so the rendered source
-            # never duplicates the inbound expression — even if a
-            # caller were to pass a non-trivial expression for
-            # ``cur_expr``. Single-ref templates skip the hoist to
-            # keep the no-op identity shape unchanged.
-            inner_name: str
-            if step.inner_ref_count > 1:
-                inner_name = local_name_factory(  # type: ignore[operator]
-                    "tcgen05_chain_step_in"
-                )
-                assert isinstance(inner_name, str)
-                prelude_lines.append(f"{prelude_indent}{inner_name} = {cur_expr}\n")
-            else:
-                inner_name = cur_expr
+            # ``cur_expr`` is always a bound local: the carrier starts as the
+            # splice site's loaded accumulator local, and every prior step
+            # stores into its own ``tcgen05_chain_step*`` local. Multi-reference
+            # templates can therefore reuse it directly without creating an
+            # extra vector alias such as ``tcgen05_chain_step_in = cur``.
+            inner_name = cur_expr
             local = local_name_factory("tcgen05_chain_step")  # type: ignore[operator]
             assert isinstance(local, str)
             step_expr = step.template.format(inner=inner_name)
