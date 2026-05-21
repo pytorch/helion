@@ -2890,6 +2890,49 @@ class TestPallasIndirectGather(TestCase):
         torch.testing.assert_close(result, ref)
 
     @parametrize("static_shapes", (True, False))
+    def test_gather_int32_5d_table_broadcasts_mask(self, static_shapes: bool) -> None:
+        """Gather on higher-rank int32 tables broadcasts the select mask."""
+
+        @helion.kernel(backend="pallas", static_shapes=static_shapes)
+        def gather(indices: torch.Tensor, table: torch.Tensor) -> torch.Tensor:
+            out = torch.empty(
+                [
+                    indices.size(0),
+                    table.size(1),
+                    table.size(2),
+                    table.size(3),
+                    table.size(4),
+                ],
+                dtype=table.dtype,
+                device=table.device,
+            )
+            for tile_b, tile_i, tile_j, tile_k, tile_l in hl.tile(
+                [
+                    indices.size(0),
+                    table.size(1),
+                    table.size(2),
+                    table.size(3),
+                    table.size(4),
+                ]
+            ):
+                out[tile_b, tile_i, tile_j, tile_k, tile_l] = table[
+                    indices[tile_b], tile_i, tile_j, tile_k, tile_l
+                ]
+            return out
+
+        table = torch.randint(0, 100, (8, 2, 4, 4, 8), device=DEVICE, dtype=torch.int32)
+        indices = torch.randint(0, 8, (8,), device=DEVICE, dtype=torch.int32)
+        code, result = code_and_output(
+            gather,
+            (indices, table),
+            block_sizes=[8, 2, 4, 4, 8],
+        )
+        self.assertEqual(code.count("expand_dims"), 4)
+        self.assertNotIn("dot_general", code)
+        ref = table.cpu()[indices.long().cpu()].to(device=DEVICE)
+        torch.testing.assert_close(result, ref)
+
+    @parametrize("static_shapes", (True, False))
     def test_scatter_raises(self, static_shapes: bool) -> None:
         """Indirect store has no Pallas strategy; plan_tiling must raise."""
 
