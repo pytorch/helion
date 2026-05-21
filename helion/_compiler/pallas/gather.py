@@ -1,7 +1,8 @@
 """Pallas indirect-gather lowering.
 
-No native gather in Pallas. ``table[idx]`` emits ``one_hot(idx, V) @ table``.
-Scatter is rejected at plan_tiling time.
+No native gather in Pallas. Floating ``table[idx]`` emits
+``one_hot(idx, V) @ table``; int32 ``table[idx]`` emits a boolean one-hot
+select and reduction. Scatter is rejected at plan_tiling time.
 """
 
 from __future__ import annotations
@@ -30,6 +31,8 @@ class GatherPlan:
     indirect_pos: int
     none_dims: tuple[int, ...]
     jnp_dtype: str
+    table_ndim: int
+    emit_select: bool
     use_highest_precision: bool
 
 
@@ -53,9 +56,11 @@ def build_gather_plan(
         raise NotImplementedError(
             "Pallas gather: only dim-0 indirect indexing is supported"
         )
-    if not tensor.dtype.is_floating_point:
+    emit_select = not tensor.dtype.is_floating_point
+    if emit_select and tensor.dtype != torch.int32:
         raise NotImplementedError(
-            f"Pallas gather: table must be floating point, got {tensor.dtype}"
+            f"Pallas gather: integer table gather only supports torch.int32, "
+            f"got {tensor.dtype}"
         )
 
     elements = resident_block_elements(tensor, patterns, config)
@@ -79,6 +84,8 @@ def build_gather_plan(
         indirect_pos=indirect_pos,
         none_dims=none_dims,
         jnp_dtype=jnp_dtype,
+        table_ndim=tensor.ndim,
+        emit_select=emit_select,
         use_highest_precision=use_highest,
     )
 
@@ -101,6 +108,23 @@ def emit_gather(
     ast_idx = ast_subscripts[plan.indirect_pos]
     assert isinstance(ast_idx, ast.AST)
     idx_name = state.codegen.lift(ast_idx, dce=False, prefix="index").id
+
+    if plan.emit_select:
+        mask_expr = (
+            f"jax.nn.one_hot({idx_name}[...], {name}.shape[0], dtype={plan.jnp_dtype})"
+        )
+        for _ in range(plan.table_ndim - 1):
+            mask_expr = f"jnp.expand_dims({mask_expr}, axis=-1)"
+        result = expr_from_string(
+            f"jnp.sum({name}[...] * {mask_expr}, "
+            f"axis=jnp.ndim({idx_name}[...])"
+            f").astype({plan.jnp_dtype})"
+        )
+        for dim in plan.none_dims:
+            result = expr_from_string(
+                f"jnp.expand_dims({{result}}, axis={dim})", result=result
+            )
+        return result
 
     if plan.use_highest_precision:
         oh_dtype = "jnp.float32"

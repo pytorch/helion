@@ -2877,13 +2877,17 @@ class TestPallasIndirectGather(TestCase):
         code_and_output(gather, (indices, table), block_sizes=[128, 256])
 
     @parametrize("static_shapes", (True, False))
-    def test_gather_integer_table_rejected(self, static_shapes: bool) -> None:
-        """Gather on non-floating tables raises at plan time."""
+    def test_gather_int32_table_uses_select_reduce(self, static_shapes: bool) -> None:
+        """Gather on int32 tables uses select-reduce instead of dot."""
         gather = self._gather_2d_kernel(static_shapes=static_shapes)
         table = torch.randint(0, 100, (16, 64), device=DEVICE, dtype=torch.int32)
         indices = torch.randint(0, 16, (256,), device=DEVICE, dtype=torch.int32)
-        with self.assertRaisesRegex(Exception, "must be floating point"):
-            code_and_output(gather, (indices, table), block_sizes=[128, 64])
+        code, result = code_and_output(gather, (indices, table), block_sizes=[128, 64])
+        self.assertIn("one_hot", code)
+        self.assertIn("dtype=jnp.int32", code)
+        self.assertNotIn("dot_general", code)
+        ref = table.cpu()[indices.long().cpu()].to(device=DEVICE)
+        torch.testing.assert_close(result, ref)
 
     @parametrize("static_shapes", (True, False))
     def test_scatter_raises(self, static_shapes: bool) -> None:
