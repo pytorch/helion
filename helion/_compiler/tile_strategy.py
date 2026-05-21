@@ -1657,9 +1657,7 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
                 begin_offset_expr = ""
                 if begin != 0:
                     begin_ast = self._to_ast(begin, to_dtype=dtype)
-                    begin_offset_expr = (
-                        f"{state.codegen.lift(begin_ast, dce=True, prefix='begin').id} + "
-                    )
+                    begin_offset_expr = f"{state.codegen.lift(begin_ast, dce=True, prefix='begin').id} + "
 
                 if step not in (None, 1):
                     step_ast = self._to_ast(step, to_dtype=dtype)
@@ -1667,7 +1665,9 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
                     # in ``TileStrategy.__init__``) — rename our lifted step var to
                     # avoid the same UnboundLocalError that drove the offset rename.
                     step_prefix = "tile_step" if env.backend.name == "cute" else "step"
-                    step_var = state.codegen.lift(step_ast, dce=True, prefix=step_prefix).id
+                    step_var = state.codegen.lift(
+                        step_ast, dce=True, prefix=step_prefix
+                    ).id
                     block_size_var = "1"
                     state.add_statement(
                         f"{offset_var} = {begin_offset_expr}({pid_var}) * {step_var}"
