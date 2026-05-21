@@ -157,6 +157,9 @@ from helion._compiler.cute.tcgen05_constants import (
 from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_TWO_CTA_EDGE_K_TAIL_L2_SWIZZLE_SIZE,
 )
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_TWO_CTA_EDGE_K_TAIL_SCHEDULER_L2_SWIZZLE_SIZE,
+)
 from helion._compiler.device_ir import ForLoopGraphInfo
 from helion._compiler.device_ir import GraphInfo
 from helion._compiler.device_ir import RootGraphInfo
@@ -12067,9 +12070,35 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
         self.assertIn("if tcgen05_full_tile:", code)
         self.assertEqual(code.count("tcgen05_full_tile = "), 1, code)
         self.assertEqual(code.count("if tcgen05_full_tile:"), 1, code)
+        full_tile_branch = code.index("if tcgen05_full_tile:")
+        full_tile_indent = code[
+            code.rfind("\n", 0, full_tile_branch) + 1 : full_tile_branch
+        ]
+        edge_branch_match = re.search(
+            rf"(?m)^{re.escape(full_tile_indent)}else:[ \t]*$",
+            code[full_tile_branch:],
+        )
+        self.assertIsNotNone(
+            edge_branch_match,
+            "could not find else branch paired with if tcgen05_full_tile",
+        )
+        assert edge_branch_match is not None
+        edge_branch = full_tile_branch + edge_branch_match.start()
         self.assertLess(
             code.index("cutlass.pipeline.PipelineTmaStore.create"),
             code.index("while tcgen05_role_local_"),
+        )
+        for full_tile_setup in (
+            "tcgen05_kernel_desc = type('Tcgen05KernelDesc'",
+            "tcgen05_sD_layout = ",
+            "tcgen05_tAcc = ",
+        ):
+            setup_pos = code.index(full_tile_setup)
+            self.assertGreater(setup_pos, full_tile_branch)
+            self.assertLess(setup_pos, edge_branch)
+        self.assertGreater(
+            code.index("tcgen05_kernel_desc = type('Tcgen05KernelDesc'", edge_branch),
+            edge_branch,
         )
         self.assertGreater(
             code.index("tcgen05_c_pipeline.producer_tail()"),
@@ -12092,7 +12121,7 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
         self.assertIn("cute.nvgpu.CopyUniversalOp()", code)
 
     def test_aux_edge_target_shape_c_input_stages_residual_only(self) -> None:
-        """Target8 c-input stages the residual and keeps edge aux direct."""
+        """Target8 scheduler split stages residual only on full tiles."""
 
         kernel = self._bias_residual_gelu_kernel()
         args = (
@@ -12128,9 +12157,137 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
         self.assertIn(".partition_S(tcgen05_aux_smem_0)", code)
         self.assertIn("tcgen05_tTR_gAux_grouped_0", code)
         self.assertIn("tcgen05_tTR_gAux_grouped_1", code)
+        self.assertNotIn("if tcgen05_full_tile:", code)
+        self.assertNotIn("tcgen05_aux_full_tile", code)
+
+        self.assertEqual(
+            code.count("while tcgen05_scheduler_warp_work_tile.is_valid_tile:"),
+            2,
+            code,
+        )
+        self.assertIn("if tcgen05_scheduler_warp_full_tile:", code)
+        self.assertIn("if not tcgen05_scheduler_warp_full_tile:", code)
+        self.assertIn(
+            "cutlass.Int32(2) * ((5000 + _BLOCK_SIZE_1 - 1) // _BLOCK_SIZE_1)",
+            code,
+        )
+        self.assertIn("min((5000 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0", code)
+
+        full_epi_loop = code.index("while tcgen05_role_local_2_full_valid:")
+        edge_epi_loop = code.index("while tcgen05_role_local_2_edge_valid:")
+        scheduler_warp = code.index(
+            "if cute.arch.make_warp_uniform(cute.arch.warp_idx()) == cutlass.Int32(6):"
+        )
+        full_epi_role = code.rfind(
+            "if cute.arch.make_warp_uniform(cute.arch.warp_idx()) < cutlass.Int32(4):",
+            0,
+            full_epi_loop,
+        )
+        self.assertNotEqual(full_epi_role, -1, code)
+        for full_tile_setup in (
+            "tcgen05_kernel_desc = type('Tcgen05KernelDesc'",
+            "tcgen05_sD_layout = ",
+            "tcgen05_tAcc = ",
+        ):
+            setup_pos = code.index(full_tile_setup)
+            self.assertGreater(setup_pos, full_epi_role)
+            self.assertLess(setup_pos, full_epi_loop)
+
+        self.assertLess(full_epi_loop, edge_epi_loop)
+        self.assertLess(edge_epi_loop, scheduler_warp)
+
+        full_epi_src = code[full_epi_loop:edge_epi_loop]
+        edge_epi_src = code[edge_epi_loop:scheduler_warp]
+        role_tile_increment = (
+            "tcgen05_tma_store_role_tile = "
+            "tcgen05_tma_store_role_tile + cutlass.Int32(1)"
+        )
+        self.assertIn("cute.copy(tcgen05_tma_store_atom", full_epi_src)
+        self.assertNotIn("cute.copy(tcgen05_tma_store_atom", edge_epi_src)
+        self.assertIn("tcgen05_simt_atom = cute.make_copy_atom", edge_epi_src)
+        self.assertIn("tcgen05_tma_store_role_tile = cutlass.Int32(0)", code)
+        self.assertIn(
+            "tcgen05_c_buffer = (tcgen05_tma_store_role_tile * "
+            "cutlass.Int32(tcgen05_subtile_count) + "
+            "cutlass.Int32(_tcgen05_subtile)) % "
+            f"cutlass.Int32({TCGEN05_TWO_CTA_EDGE_K_TAIL_C_STAGES})",
+            full_epi_src,
+        )
+        self.assertIn(role_tile_increment, full_epi_src)
+        self.assertNotIn(role_tile_increment, edge_epi_src)
+        for full_tile_setup in (
+            "tcgen05_kernel_desc = type('Tcgen05KernelDesc'",
+            "tcgen05_sD_layout = ",
+            "tcgen05_tAcc = ",
+        ):
+            self.assertNotIn(full_tile_setup, full_epi_src)
+
+        full_c_input_loop = code.index("while tcgen05_c_input_warp_valid:")
+        edge_c_input_loop = code.index("while tcgen05_c_input_warp_valid_1:")
+        self.assertLess(scheduler_warp, full_c_input_loop)
+        self.assertLess(full_c_input_loop, edge_c_input_loop)
+        code_ast = ast.parse(code)
+
+        def single_while_src(test: str) -> str:
+            matches = [
+                ast.unparse(node)
+                for node in ast.walk(code_ast)
+                if isinstance(node, ast.While) and ast.unparse(node.test) == test
+            ]
+            self.assertEqual(len(matches), 1, code)
+            return matches[0]
+
+        full_c_input_src = single_while_src("tcgen05_c_input_warp_valid")
+        edge_c_input_src = single_while_src("tcgen05_c_input_warp_valid_1")
+        self.assertIn("tcgen05_aux_pipeline.producer_acquire", full_c_input_src)
+        self.assertNotIn("tcgen05_aux_pipeline.producer_acquire", edge_c_input_src)
+        self.assertNotIn("virtual_pid =", edge_c_input_src)
+        self.assertNotIn("tile_offset_0 =", edge_c_input_src)
+        self.assertNotIn("tile_offset_1 =", edge_c_input_src)
+
+    def test_aux_edge_target_shape_clc_keeps_single_scheduler_stream(self) -> None:
+        """CLC scheduler path keeps hybrid stores on the unsplit stream."""
+
+        kernel = self._bias_residual_gelu_kernel()
+        args = (
+            torch.empty([5000, 5000], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([5000, 5000], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([5000], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([5000, 5000], device=DEVICE, dtype=torch.bfloat16),
+        )
+        with patch_cute_mma_support():
+            bound = kernel.bind(args)
+            cfg = _make_tcgen05_persistent_config(
+                block_sizes=[256, 256, 128],
+                l2_groupings=[TCGEN05_TWO_CTA_EDGE_K_TAIL_L2_GROUPING],
+                pid_type="persistent_interleaved",
+                num_warps=4,
+                tcgen05_cluster_m=2,
+                tcgen05_ab_stages=2,
+                tcgen05_acc_stages=1,
+                tcgen05_c_stages=TCGEN05_TWO_CTA_EDGE_K_TAIL_C_STAGES,
+                tcgen05_l2_swizzle_size=TCGEN05_TWO_CTA_EDGE_K_TAIL_L2_SWIZZLE_SIZE,
+                tcgen05_acc_wait_placement=TCGEN05_ACC_WAIT_PLACEMENT_BEFORE_SUBTILE_LOOP,
+                tcgen05_c_acquire_placement=TCGEN05_C_ACQUIRE_PLACEMENT_FIRST_IN_LOOP,
+                tcgen05_strategy="role_local_with_scheduler",
+                tcgen05_warp_spec_scheduler_warps=1,
+                tcgen05_warp_spec_c_input_warps=1,
+                tcgen05_persistence_model="clc_persistent",
+                indexing=["tensor_descriptor"] * bound.env.config_spec.indexing.length,
+            )
+            code = bound.to_triton_code(cfg)
+
+        self.assertEqual(code.count("_cute_issue_clc_query_nomulticast"), 2, code)
+        self.assertIn("cutlass.pipeline.PipelineTmaStore.create", code)
         self.assertIn("if tcgen05_full_tile:", code)
-        self.assertIn("tcgen05_aux_full_tile", code)
-        self.assertIn("if tcgen05_aux_full_tile", code)
+        self.assertEqual(code.count("tcgen05_full_tile = "), 1, code)
+        self.assertIn("tcgen05_aux_full_tile = ", code)
+        self.assertIn("if tcgen05_aux_full_tile:", code)
+        self.assertIn("tcgen05_aux_pipeline.producer_acquire", code)
+        self.assertNotIn("tcgen05_scheduler_warp_full_tile", code)
+        self.assertNotIn("_full_valid", code)
+        self.assertNotIn("_edge_valid", code)
+        self.assertNotIn("while tcgen05_scheduler_warp_work_tile.is_valid_tile:", code)
 
     def test_aux_edge_hybrid_tma_store_runtime_correctness(self) -> None:
         """Hybrid full-tile TMA store and SIMT edge fallback run together."""
@@ -13502,7 +13659,7 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
         )
         self.assertEqual(
             cluster_m2_config["tcgen05_l2_swizzle_size"],
-            TCGEN05_TWO_CTA_EDGE_K_TAIL_L2_SWIZZLE_SIZE,
+            TCGEN05_TWO_CTA_EDGE_K_TAIL_SCHEDULER_L2_SWIZZLE_SIZE,
         )
         self.assertEqual(
             cluster_m2_config["l2_groupings"],
@@ -13585,7 +13742,7 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
         )
         self.assertEqual(
             config_dict["tcgen05_l2_swizzle_size"],
-            TCGEN05_TWO_CTA_EDGE_K_TAIL_L2_SWIZZLE_SIZE,
+            TCGEN05_TWO_CTA_EDGE_K_TAIL_SCHEDULER_L2_SWIZZLE_SIZE,
         )
         self.assertEqual(
             config_dict["l2_groupings"],
@@ -14130,7 +14287,7 @@ class TestPersistentLoopSplitter(unittest.TestCase):
             lambda device, body: (body, [])
         )
         splitter._split_tcgen05_invariant_setup = (  # type: ignore[attr-defined]
-            lambda device, body: ([], body)
+            lambda device, body: ([], [], body)
         )
         splitter._build_tcgen05_persistent_layout = (  # type: ignore[attr-defined]
             lambda device: layout
@@ -14145,7 +14302,7 @@ class TestPersistentLoopSplitter(unittest.TestCase):
             lambda layout_arg: []
         )
         splitter._build_tcgen05_persistent_tile_body_role_local = (  # type: ignore[attr-defined]
-            lambda device, layout_arg, partition_arg: ([], [])
+            lambda device, layout_arg, partition_arg, **kwargs: ([], [])
         )
 
         splitter._setup_tcgen05_persistent_kernel(device_function)
@@ -14167,8 +14324,11 @@ class TestPersistentLoopSplitter(unittest.TestCase):
         per_tile_b = self._stmt("acc_pipeline.producer_acquire(state)")
         body = [invariant_a, invariant_b, per_tile_a, per_tile_b]
         df.cute_state.register_tcgen05_per_tile_stmts([per_tile_a, per_tile_b])
-        hoisted, wrapped = splitter._split_tcgen05_invariant_setup(df, body)
+        hoisted, epi_prelude, wrapped = splitter._split_tcgen05_invariant_setup(
+            df, body
+        )
         self.assertEqual(hoisted, [invariant_a, invariant_b])
+        self.assertEqual(epi_prelude, [])
         self.assertEqual(wrapped, [per_tile_a, per_tile_b])
 
     def test_relative_order_is_preserved_in_each_slice(self) -> None:
@@ -14182,8 +14342,11 @@ class TestPersistentLoopSplitter(unittest.TestCase):
         per_tile = self._stmt("g = local_tile(t, (128, 16), (m, None))")
         b = self._stmt("b = 2")
         df.cute_state.register_tcgen05_per_tile_stmts([per_tile])
-        hoisted, wrapped = splitter._split_tcgen05_invariant_setup(df, [a, per_tile, b])
+        hoisted, epi_prelude, wrapped = splitter._split_tcgen05_invariant_setup(
+            df, [a, per_tile, b]
+        )
         self.assertEqual(hoisted, [a, b])
+        self.assertEqual(epi_prelude, [])
         self.assertEqual(wrapped, [per_tile])
 
     def test_no_split_when_no_per_tile_marks(self) -> None:
@@ -14195,8 +14358,11 @@ class TestPersistentLoopSplitter(unittest.TestCase):
         a = self._stmt("a = 1")
         b = self._stmt("b = 2")
         body = [a, b]
-        hoisted, wrapped = splitter._split_tcgen05_invariant_setup(df, body)
+        hoisted, epi_prelude, wrapped = splitter._split_tcgen05_invariant_setup(
+            df, body
+        )
         self.assertEqual(hoisted, [])
+        self.assertEqual(epi_prelude, [])
         self.assertEqual(wrapped, body)
 
     def test_post_loop_extraction_removes_marked_stmts(self) -> None:
@@ -14485,7 +14651,9 @@ class TestPersistentLoopSplitter(unittest.TestCase):
             marked,
             invariant_b,
         ]
-        hoisted, wrapped = splitter._split_tcgen05_invariant_setup(df, body)
+        hoisted, epi_prelude, wrapped = splitter._split_tcgen05_invariant_setup(
+            df, body
+        )
         # invariant_a and invariant_b have no per-tile dep — hoisted.
         # decompose_pid uses virtual_pid → wrapped, defines pid_0.
         # decompose_pid_2 uses virtual_pid → wrapped, defines pid_1.
@@ -14493,6 +14661,7 @@ class TestPersistentLoopSplitter(unittest.TestCase):
         # derive_n uses pid_1 → wrapped, defines n_offset.
         # marked is explicitly per-tile.
         self.assertEqual(hoisted, [invariant_a, invariant_b])
+        self.assertEqual(epi_prelude, [])
         self.assertEqual(
             wrapped,
             [decompose_pid, decompose_pid_2, derive_m, derive_n, marked],

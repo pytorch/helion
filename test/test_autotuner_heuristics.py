@@ -12,6 +12,7 @@ from helion._compiler.autotuner_heuristics.cute import CuteTcgen05ClusterM2Heuri
 from helion._compiler.autotuner_heuristics.registry import AutotunerHeuristic
 from helion._compiler.autotuner_heuristics.triton import TritonSkinnyGemmHeuristic
 from helion._compiler.backend import TritonBackend
+from helion._compiler.cute.strategies import Tcgen05Strategy
 from helion._compiler.cute.tcgen05_config import CuteTcgen05Config
 from helion._compiler.cute.tcgen05_config import Tcgen05ClusterM2SearchConstraints
 from helion._compiler.cute.tcgen05_constants import (
@@ -41,6 +42,9 @@ from helion._compiler.cute.tcgen05_constants import (
 )
 from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_TWO_CTA_EDGE_K_TAIL_L2_SWIZZLE_SIZE,
+)
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_TWO_CTA_EDGE_K_TAIL_SCHEDULER_L2_SWIZZLE_SIZE,
 )
 from helion._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_MAX_K_TILES
 from helion._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_SEED_L2_GROUPING
@@ -558,7 +562,10 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         return seed
 
     def _assert_cute_tcgen05_edge_k_tail_seed_overrides(
-        self, config: dict[str, object]
+        self,
+        config: dict[str, object],
+        *,
+        expected_l2_swizzle_size: int = TCGEN05_TWO_CTA_EDGE_K_TAIL_L2_SWIZZLE_SIZE,
     ) -> None:
         self.assertEqual(
             config["tcgen05_ab_stages"],
@@ -578,7 +585,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         )
         self.assertEqual(
             config["tcgen05_l2_swizzle_size"],
-            TCGEN05_TWO_CTA_EDGE_K_TAIL_L2_SWIZZLE_SIZE,
+            expected_l2_swizzle_size,
         )
         self.assertEqual(
             config[TCGEN05_ACC_WAIT_PLACEMENT_CONFIG_KEY],
@@ -742,8 +749,19 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             for config in spec.compiler_seed_configs
             if config.config.get("tcgen05_cluster_m") == 2
         ]
-        self.assertEqual(len(raw_seeded), 1)
-        raw_seed = raw_seeded[0]
+        self.assertEqual(len(raw_seeded), 2)
+        raw_seed = next(
+            config
+            for config in raw_seeded
+            if config.get("tcgen05_strategy")
+            != Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER.value
+        )
+        raw_scheduler_seed = next(
+            config
+            for config in raw_seeded
+            if config.get("tcgen05_strategy")
+            == Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER.value
+        )
         self.assertEqual(
             raw_seed["block_sizes"],
             [
@@ -757,7 +775,14 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         self.assertEqual(
             raw_seed["indexing"], ["tensor_descriptor"] * spec.indexing.length
         )
-        from helion._compiler.cute.strategies import Tcgen05Strategy
+        self._assert_cute_tcgen05_edge_k_tail_seed_overrides(
+            raw_scheduler_seed,
+            expected_l2_swizzle_size=(
+                TCGEN05_TWO_CTA_EDGE_K_TAIL_SCHEDULER_L2_SWIZZLE_SIZE
+            ),
+        )
+        self.assertEqual(raw_scheduler_seed["tcgen05_warp_spec_scheduler_warps"], 1)
+        self.assertEqual(raw_scheduler_seed["tcgen05_warp_spec_c_input_warps"], 1)
 
         c_input_seeds = [
             config.config
@@ -780,26 +805,50 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                 TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K,
             ],
         )
-        self._assert_cute_tcgen05_edge_k_tail_seed_overrides(c_input_seed)
+        self._assert_cute_tcgen05_edge_k_tail_seed_overrides(
+            c_input_seed,
+            expected_l2_swizzle_size=(
+                TCGEN05_TWO_CTA_EDGE_K_TAIL_SCHEDULER_L2_SWIZZLE_SIZE
+            ),
+        )
         self.assertEqual(
             c_input_seed["indexing"], ["tensor_descriptor"] * spec.indexing.length
         )
 
         config_gen = spec.create_config_generation()
         seed_pairs = config_gen.seed_flat_config_pairs()
-        self.assertEqual(len(seed_pairs), 1)
-        flat_seed, normalized_seed = seed_pairs[0]
-        config_gen.encode_config(flat_seed)
-        self.assertEqual(normalized_seed.config["pid_type"], "persistent_interleaved")
+        self.assertEqual(len(seed_pairs), 2)
+        normalized_seeds = [normalized.config for _flat, normalized in seed_pairs]
+        normalized_seed = next(
+            config
+            for config in normalized_seeds
+            if config["tcgen05_strategy"]
+            != Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER.value
+        )
+        normalized_scheduler_seed = next(
+            config
+            for config in normalized_seeds
+            if config["tcgen05_strategy"]
+            == Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER.value
+        )
+        for flat_seed, _normalized_seed in seed_pairs:
+            config_gen.encode_config(flat_seed)
+        self.assertEqual(normalized_seed["pid_type"], "persistent_interleaved")
         self.assertEqual(
-            normalized_seed.config["block_sizes"][:3],
+            normalized_seed["block_sizes"][:3],
             [
                 TCGEN05_TWO_CTA_BLOCK_M,
                 TCGEN05_TWO_CTA_BLOCK_N,
                 TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K,
             ],
         )
-        self._assert_cute_tcgen05_edge_k_tail_seed_overrides(normalized_seed.config)
+        self._assert_cute_tcgen05_edge_k_tail_seed_overrides(normalized_seed)
+        self._assert_cute_tcgen05_edge_k_tail_seed_overrides(
+            normalized_scheduler_seed,
+            expected_l2_swizzle_size=(
+                TCGEN05_TWO_CTA_EDGE_K_TAIL_SCHEDULER_L2_SWIZZLE_SIZE
+            ),
+        )
 
         configs = config_gen.random_population(2)
         self.assertEqual(configs[0].config["tcgen05_cluster_m"], 1)
@@ -809,6 +858,41 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             expected_indexing_length=spec.indexing.length,
         )
         self._assert_cute_tcgen05_edge_k_tail_seed_overrides(population_seed)
+
+    @onlyBackends(["cute"])
+    def test_cute_tcgen05_c_input_seed_respects_disable_heuristics(self) -> None:
+        @helion.kernel(backend="cute", disable_autotuner_heuristics=True)
+        def cute_matmul_bias_residual_gelu(
+            x: torch.Tensor,
+            y: torch.Tensor,
+            bias: torch.Tensor,
+            residual: torch.Tensor,
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = torch.nn.functional.gelu(
+                    1.25 * acc + 0.5 * residual[tile_m, tile_n] + bias[tile_n],
+                    approximate="tanh",
+                ).to(x.dtype)
+            return out
+
+        args = (
+            torch.empty([5000, 5000], device=DEVICE, dtype=HALF_DTYPE),
+            torch.empty([5000, 5000], device=DEVICE, dtype=HALF_DTYPE),
+            torch.empty([5000], device=DEVICE, dtype=HALF_DTYPE),
+            torch.empty([5000, 5000], device=DEVICE, dtype=HALF_DTYPE),
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_bias_residual_gelu.bind(args)
+
+        self.assertTrue(bound.config_spec.cute_tcgen05_aux_kernel_detected)
+        self.assertEqual(bound.config_spec.compiler_seed_configs, [])
+        self.assertEqual(bound.config_spec.autotuner_heuristics, [])
 
     @onlyBackends(["cute"])
     def test_cute_tcgen05_cluster_m2_edge_ab2_seed_ignores_ab3_budget(

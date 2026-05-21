@@ -238,6 +238,9 @@ class CuteDeviceFunctionState:
         self._tma_load_role_stmt_ids: set[int] = set()
         self._mma_exec_role_stmt_ids: set[int] = set()
         self._epi_role_stmt_ids: set[int] = set()
+        self._epi_role_prelude_stmt_ids: set[int] = set()
+        self._epi_role_full_tile_stmt_ids: set[int] = set()
+        self._epi_role_edge_tile_stmt_ids: set[int] = set()
         self.epi_role_tile_counter_var: str | None = None
         self.epi_role_tile_counter_increment_per_tile: bool = True
         self._collective_handled_loads: set[str] = set()
@@ -342,6 +345,18 @@ class CuteDeviceFunctionState:
         """Mark acc consumer and TMEM-to-GMEM store work for epilogue warps."""
         self._epi_role_stmt_ids.update(id(stmt) for stmt in stmts)
 
+    def register_tcgen05_epi_role_prelude_stmts(self, stmts: Sequence[ast.AST]) -> None:
+        """Mark one-shot epilogue setup that must stay inside the epi role."""
+        self._epi_role_prelude_stmt_ids.update(id(stmt) for stmt in stmts)
+
+    def register_tcgen05_epi_role_full_edge_stmts(
+        self, *, full_tile_stmts: list[ast.AST], edge_tile_stmts: list[ast.AST]
+    ) -> None:
+        """Mark scheduler-split epilogue work for full vs fringe tiles."""
+        self.register_tcgen05_epi_role_stmts([*full_tile_stmts, *edge_tile_stmts])
+        self._epi_role_full_tile_stmt_ids.update(id(stmt) for stmt in full_tile_stmts)
+        self._epi_role_edge_tile_stmt_ids.update(id(stmt) for stmt in edge_tile_stmts)
+
     def register_tcgen05_epi_role_tile_counter(
         self, name: str, *, increment_per_tile: bool = True
     ) -> None:
@@ -356,9 +371,24 @@ class CuteDeviceFunctionState:
     def is_tcgen05_epi_role(self, stmt: ast.stmt) -> bool:
         return id(stmt) in self._epi_role_stmt_ids
 
+    def is_tcgen05_epi_role_prelude(self, stmt: ast.stmt) -> bool:
+        return id(stmt) in self._epi_role_prelude_stmt_ids
+
+    def is_tcgen05_epi_role_full_tile(self, stmt: ast.stmt) -> bool:
+        return id(stmt) in self._epi_role_full_tile_stmt_ids
+
+    def is_tcgen05_epi_role_edge_tile(self, stmt: ast.stmt) -> bool:
+        return id(stmt) in self._epi_role_edge_tile_stmt_ids
+
     @property
     def has_tcgen05_epi_role_marks(self) -> bool:
         return bool(self._epi_role_stmt_ids)
+
+    @property
+    def has_tcgen05_epi_role_full_edge_split(self) -> bool:
+        return bool(
+            self._epi_role_full_tile_stmt_ids or self._epi_role_edge_tile_stmt_ids
+        )
 
     @property
     def tcgen05_epi_role_stmt_ids(self) -> frozenset[int]:
