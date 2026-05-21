@@ -29,6 +29,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
     from .._compiler.inductor_lowering import CodegenState
+    from .._compiler.pallas.plan_tiling import GridIndexMap
     from .._compiler.tile_strategy import TileStrategy
     from ..runtime.config import Config
 
@@ -1473,9 +1474,17 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
         """
         dim_to_bid = _get_dim_block_ids(subscript_meta, env)
         shape = fake.shape
+        dim_tilings = state.device_function.pallas_tensor_dim_tilings.get(id(fake))
+
         block_shape_parts: list[str] = []
         lambda_parts: list[str] = []
         lambda_params: list[str] = []
+
+        def _grid_index_expr(index_map: GridIndexMap) -> str | None:
+            pid_var = _bid_to_pid_var.get(index_map.grid_block_id)
+            if pid_var is None:
+                return None
+            return index_map.index_expr(pid_var)
 
         for i, _bid in enumerate(block_ids):
             param = f"_j{i}" if len(block_ids) > 1 else "_j"
@@ -1483,6 +1492,17 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
 
         for dim_idx in range(len(shape)):
             bid = dim_to_bid.get(dim_idx)
+            grid_index_expr = (
+                _grid_index_expr(dim_tilings[dim_idx].grid_index_map)
+                if dim_tilings is not None
+                and dim_idx < len(dim_tilings)
+                and dim_tilings[dim_idx].grid_index_map is not None
+                else None
+            )
+            if grid_index_expr is not None:
+                block_shape_parts.append("1")
+                lambda_parts.append(grid_index_expr)
+                continue
             if bid is not None and bid in block_ids:
                 # Inner pipeline dim -- tiled by pipeline grid
                 bid_idx = block_ids.index(bid)
@@ -1782,8 +1802,16 @@ def _compute_vmem_shapes(
     vmem_shapes: list[tuple[int, ...]] = []
     for fake, sub_meta, _direction in all_tensor_info:
         dim_to_bid = _get_dim_block_ids(sub_meta, env)
+        dim_tilings = state.device_function.pallas_tensor_dim_tilings.get(id(fake))
         parts: list[int] = []
         for dim_idx in range(len(fake.shape)):
+            if (
+                dim_tilings is not None
+                and dim_idx < len(dim_tilings)
+                and dim_tilings[dim_idx].grid_index_map is not None
+            ):
+                parts.append(1)
+                continue
             bid = dim_to_bid.get(dim_idx)
             if bid is not None and bid in block_ids:
                 bid_idx = block_ids.index(bid)
@@ -2043,10 +2071,30 @@ def _codegen_fori_loop(state: CodegenState) -> object:
     ) -> str:
         """Build an HBM ref slicing expression for DMA with loop variable."""
         dim_to_bid = _get_dim_block_ids(subscript_meta, env)
+        dim_tilings = state.device_function.pallas_tensor_dim_tilings.get(id(fake))
         shape = fake.shape
+
         parts: list[str] = []
         needs_slice = False
+
+        def _grid_index_slice(index_map: GridIndexMap) -> str | None:
+            offset = state.codegen.offset_var(index_map.grid_block_id)
+            if offset is None:
+                return None
+            return index_map.slice_expr(offset)
+
         for dim_idx in range(len(shape)):
+            grid_slice = (
+                _grid_index_slice(dim_tilings[dim_idx].grid_index_map)
+                if dim_tilings is not None
+                and dim_idx < len(dim_tilings)
+                and dim_tilings[dim_idx].grid_index_map is not None
+                else None
+            )
+            if grid_slice is not None:
+                parts.append(grid_slice)
+                needs_slice = True
+                continue
             bid = dim_to_bid.get(dim_idx)
             if bid is not None and bid in block_ids:
                 bid_idx = block_ids.index(bid)
