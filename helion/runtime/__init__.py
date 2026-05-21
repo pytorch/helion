@@ -1398,32 +1398,41 @@ def _jax_to_torch(
     return torch.from_dlpack(arr).to(dtype=dtype, device=device)
 
 
-def _torch_dtype_to_cutlass(dtype: torch.dtype) -> object:
-    _patch_cutlass_jit_shutdown_unload()
-    import cutlass
+_TORCH_DTYPE_TO_CUTLASS: dict[torch.dtype, object] | None = None
 
-    mapping: dict[torch.dtype, object] = {
-        torch.float16: cutlass.Float16,
-        torch.float32: cutlass.Float32,
-        torch.float64: cutlass.Float64,
-        torch.bfloat16: cutlass.BFloat16,
-        torch.float8_e4m3fn: cutlass.Float8E4M3FN,
-        torch.float8_e5m2: cutlass.Float8E5M2,
-        torch.float4_e2m1fn_x2: cutlass.Uint8,
-        # CuTe does not support i1 global-memory tensors; torch.bool is stored
-        # as one byte, so pass bool tensor pointers as uint8 and let load
-        # lowering convert nonzero bytes back to cutlass.Boolean registers.
-        torch.bool: cutlass.Uint8,
-        torch.int8: cutlass.Int8,
-        torch.int16: cutlass.Int16,
-        torch.int32: cutlass.Int32,
-        torch.int64: cutlass.Int64,
-        torch.uint8: cutlass.Uint8,
-        torch.uint64: cutlass.Int64,
-    }
-    if dtype not in mapping:
+
+def _torch_dtype_to_cutlass(dtype: torch.dtype) -> object:
+    global _TORCH_DTYPE_TO_CUTLASS
+    mapping: dict[torch.dtype, object] | None = _TORCH_DTYPE_TO_CUTLASS
+    if mapping is None:
+        _patch_cutlass_jit_shutdown_unload()
+        import cutlass
+
+        mapping = {
+            torch.float16: cutlass.Float16,
+            torch.float32: cutlass.Float32,
+            torch.float64: cutlass.Float64,
+            torch.bfloat16: cutlass.BFloat16,
+            torch.float8_e4m3fn: cutlass.Float8E4M3FN,
+            torch.float8_e5m2: cutlass.Float8E5M2,
+            torch.float4_e2m1fn_x2: cutlass.Uint8,
+            # CuTe does not support i1 global-memory tensors; torch.bool is
+            # stored as one byte, so pass bool tensor pointers as uint8 and
+            # let load lowering convert nonzero bytes back to cutlass.Boolean
+            # registers.
+            torch.bool: cutlass.Uint8,
+            torch.int8: cutlass.Int8,
+            torch.int16: cutlass.Int16,
+            torch.int32: cutlass.Int32,
+            torch.int64: cutlass.Int64,
+            torch.uint8: cutlass.Uint8,
+            torch.uint64: cutlass.Int64,
+        }
+        _TORCH_DTYPE_TO_CUTLASS = mapping
+    cutlass_dtype = mapping.get(dtype)
+    if cutlass_dtype is None:
         raise exc.BackendUnsupported("cute", f"dtype: {dtype}")
-    return mapping[dtype]
+    return cutlass_dtype
 
 
 def _normalize_cute_scalar(arg: object) -> tuple[str, object]:
@@ -1912,16 +1921,32 @@ def _get_compiled_cute_launcher(
     return launcher
 
 
-def _build_cute_schema_and_args(
-    cute_kernel: object,
-    args: tuple[object, ...],
-    grid: tuple[int, int, int],
-) -> tuple[tuple[tuple[object, ...], ...], tuple[object, ...]]:
+_CUTE_LAUNCHER_IMPORTS: tuple[object, ...] | None = None
+
+
+def _get_cute_launcher_imports() -> tuple[object, ...]:
+    global _CUTE_LAUNCHER_IMPORTS
+    cached = _CUTE_LAUNCHER_IMPORTS
+    if cached is not None:
+        return cached
     _patch_cutlass_jit_shutdown_unload()
     import cutlass.cute as cute
     from cutlass.cute.runtime import make_ptr
     import cutlass.torch as cutlass_torch
 
+    cached = (cute.AddressSpace.gmem, make_ptr, cutlass_torch.current_stream)
+    _CUTE_LAUNCHER_IMPORTS = cached
+    return cached
+
+
+def _build_cute_schema_and_args(
+    cute_kernel: object,
+    args: tuple[object, ...],
+    grid: tuple[int, int, int],
+) -> tuple[tuple[tuple[object, ...], ...], tuple[object, ...]]:
+    gmem_space, make_ptr_obj, current_stream_obj = _get_cute_launcher_imports()
+    make_ptr = cast("Any", make_ptr_obj)
+    current_stream = cast("Any", current_stream_obj)
     _ensure_cute_dsl_arch_env(args)
     constexpr_flags = _cute_kernel_param_is_constexpr(cute_kernel)
     schema: list[tuple[object, ...]] = []
@@ -1930,21 +1955,24 @@ def _build_cute_schema_and_args(
         if isinstance(arg, torch.Tensor):
             if arg.device.type != "cuda":
                 raise exc.BackendUnsupported("cute", "launcher requires CUDA tensors")
-            if arg.ndim <= 0:
+            ndim = arg.ndim
+            if ndim <= 0:
                 raise exc.BackendUnsupported(
                     "cute", "launcher requires tensor rank >= 1"
                 )
-            schema.append(("tensor", str(arg.dtype), arg.ndim))
+            schema.append(("tensor", str(arg.dtype), ndim))
             launch_args.append(
                 make_ptr(
                     cast("Any", _torch_dtype_to_cutlass(arg.dtype)),
                     arg.data_ptr(),
-                    cute.AddressSpace.gmem,
+                    gmem_space,
                     assumed_align=16,
                 )
             )
-            launch_args.extend(int(arg.size(d)) for d in range(arg.ndim))
-            launch_args.extend(int(arg.stride(d)) for d in range(arg.ndim))
+            sizes = arg.size()
+            strides = arg.stride()
+            launch_args.extend(int(sizes[d]) for d in range(ndim))
+            launch_args.extend(int(strides[d]) for d in range(ndim))
             continue
 
         scalar_kind, scalar_value = _normalize_cute_scalar(arg)
@@ -1960,7 +1988,7 @@ def _build_cute_schema_and_args(
             launch_args.append(scalar_value)
 
     launch_args.extend(grid)
-    launch_args.append(cutlass_torch.current_stream())
+    launch_args.append(current_stream())
     return tuple(schema), tuple(launch_args)
 
 
