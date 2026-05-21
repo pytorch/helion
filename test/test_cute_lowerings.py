@@ -3,12 +3,10 @@ from __future__ import annotations
 import ast
 import contextlib
 import dataclasses
-import difflib
 import operator
-import os
-from pathlib import Path
 import re
 from types import SimpleNamespace
+from typing import cast
 import unittest
 from unittest.mock import patch
 
@@ -159,21 +157,6 @@ from helion.language.memory_ops import _maybe_codegen_cute_packed_affine_lhs_loa
 from helion.language.memory_ops import load
 from helion.runtime import _append_cute_wrapper_plan
 
-# Golden file pinning the byte-identical generated CuTe for the
-# retained ROLE_LOCAL_MONOLITHIC seed (cute_plan.md §6.2 pin test #1
-# and §10.1 canonical benchmark seed). Lives at
-# ``test/golden/tcgen05_role_local_monolithic_4096_bf16.py.expected``.
-# The kernel definition is in
-# ``test/golden/_tcgen05_role_local_monolithic_4096_bf16_kernel.py``;
-# its file path appears in ``src[<file>:<line>]`` comments embedded
-# in the generated kernel, so both files must move together if
-# either is renamed.
-TCGEN05_ROLE_LOCAL_MONOLITHIC_GOLDEN_PATH = (
-    Path(__file__).parent
-    / "golden"
-    / "tcgen05_role_local_monolithic_4096_bf16.py.expected"
-)
-
 
 def _make_tcgen05_persistent_config(**overrides: object) -> helion.Config:
     """Build a ``helion.Config`` for the tcgen05 + TMA pipeline path."""
@@ -243,6 +226,39 @@ def _make_tcgen05_large_bn_proof_config(**overrides: object) -> helion.Config:
     }
     defaults.update(overrides)
     return _make_tcgen05_persistent_config(**defaults)
+
+
+def _make_tcgen05_role_local_monolithic_seed_config(
+    **overrides: object,
+) -> helion.Config:
+    """Build the retained role-local monolithic tcgen05 seed config."""
+    defaults: dict[str, object] = {
+        "block_sizes": [256, 256, 128],
+        "l2_groupings": [1],
+        "pid_type": "persistent_interleaved",
+        "tcgen05_cluster_m": 2,
+        "tcgen05_ab_stages": 2,
+        "tcgen05_acc_stages": 2,
+        "tcgen05_c_stages": 2,
+        "tcgen05_num_epi_warps": 4,
+    }
+    defaults.update(overrides)
+    return helion.Config(**defaults)  # type: ignore[arg-type]
+
+
+@helion.kernel(backend="cute")
+def cute_matmul_role_local_monolithic_4096_bf16(
+    x: torch.Tensor, y: torch.Tensor
+) -> torch.Tensor:
+    m, k = x.size()
+    _, n = y.size()
+    out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+        out[tile_m, tile_n] = acc.to(x.dtype)
+    return out
 
 
 class _FakeBlockSize:
@@ -1370,124 +1386,84 @@ class TestCuteLowerings(unittest.TestCase):
             )
             self.assertRegex(code, r"\(\s*1\s*,\s*1\s*,\s*min\s*\(")
 
-    def test_tcgen05_role_local_monolithic_byte_identical_golden(self) -> None:
-        """G2-B byte-identity pin (cute_plan.md §6.2 pin tests #1, #2).
+    def test_tcgen05_role_local_monolithic_codegen_markers(self) -> None:
+        """The retained role-local monolithic seed emits the required
+        tcgen05 structure without relying on a full-source golden file.
 
-        The retained ``ROLE_LOCAL_MONOLITHIC`` seed (cute_plan.md
-        §10.1: 4096³ bf16, ``block_sizes=[256, 256, 128]``,
-        ``cluster_m=2``, ``pid_type=persistent_interleaved``,
-        ``ab/acc/c_stages=2/2/2``, ``num_epi_warps=4``) must
-        generate byte-identical CuTe across G2 refactors. The kernel
-        is hosted at a stable file path
-        (``test/golden/_tcgen05_role_local_monolithic_4096_bf16_kernel.py``)
-        so the embedded ``src[<file>:<line>]`` comments do not drift
-        when ``test_cute_lowerings.py`` itself changes.
-
-        Why a separate ``.py.expected`` file rather than
-        ``helion._testing.AssertExpectedJournal``: the journal stores
-        all expected outputs in one shared
-        ``test_cute_lowerings.expected`` file under
-        ``--- assertExpectedJournal(...)`` section markers, and
-        requires the test class to inherit from
-        ``helion._testing.TestCase``. ``TestCuteLowerings`` currently
-        inherits from ``unittest.TestCase`` (line 400 of this file) —
-        switching the base class would change setUp/tearDown
-        semantics for ~200 unrelated tests and is out of scope for
-        a byte-identity pin. A standalone 315-line ``.py.expected``
-        file is also more inspectable than a section inside the
-        shared journal. If a second golden test lands here, factor
-        the read/write/diff plumbing into a small helper alongside
-        the journal class in ``helion/_testing.py`` rather than
-        copy-pasting this block.
-
-        Update protocol: when an intentional codegen change makes
-        this test fail, regenerate the golden by setting
-        ``EXPECTTEST_ACCEPT=1`` (or by running
-        ``EXPECTTEST_ACCEPT=1 pytest -k
-        test_tcgen05_role_local_monolithic_byte_identical_golden``).
-        Reviewers diff the regenerated golden against the previous
-        version; only intentional codegen deltas should land.
+        The runtime-correctness tests below cover smaller executable
+        shapes against eager references. This codegen-only test pins
+        the high-level scheduler, TMA/UMMA pipeline, TMA-store, and
+        CtaGroup.TWO markers that the old standalone golden was meant
+        to protect, while allowing unrelated formatting and source
+        comment churn.
         """
-
-        from test.golden._tcgen05_role_local_monolithic_4096_bf16_kernel import (
-            cute_matmul_role_local_monolithic_4096_bf16,
-        )
-
         args = (
             torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
             torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
         )
-        seed_config = helion.Config(
-            block_sizes=[256, 256, 128],
-            l2_groupings=[1],
-            pid_type="persistent_interleaved",
-            tcgen05_cluster_m=2,
-            tcgen05_ab_stages=2,
-            tcgen05_acc_stages=2,
-            tcgen05_c_stages=2,
-            tcgen05_num_epi_warps=4,
-        )
+        seed_config = _make_tcgen05_role_local_monolithic_seed_config()
         with patch_cute_mma_support():
             bound = cute_matmul_role_local_monolithic_4096_bf16.bind(args)
             bound.env.config_spec.cute_tcgen05_search_enabled = True
-            actual = bound.to_triton_code(seed_config)
+            code = bound.to_triton_code(seed_config)
 
-        # Sanity: confirm the generated kernel is on the
-        # retained-seed tcgen05 path (a fallback path would diff
-        # against the golden but the ``make_trivial_tiled_mma`` /
-        # ``PipelineUmmaAsync`` markers below catch a regression to
-        # a non-tcgen05 fallback even before the golden compare
-        # runs, so the failure points at a real shape change rather
-        # than a host-detect regression).
-        self.assertIn("make_trivial_tiled_mma", actual)
-        self.assertIn("PipelineUmmaAsync.create", actual)
-        self.assertIn("PipelineTmaUmma.create", actual)
-        self.assertIn("PipelineTmaStore.create", actual)
+        wrapper_plans: list[dict[str, object]] | None = None
+        for node in ast.walk(ast.parse(code)):
+            if not isinstance(node, ast.Assign):
+                continue
+            if any(
+                isinstance(target, ast.Attribute)
+                and target.attr == "_helion_cute_wrapper_plans"
+                for target in node.targets
+            ):
+                wrapper_plans = cast(
+                    "list[dict[str, object]]", ast.literal_eval(node.value)
+                )
+                break
+        self.assertIsNotNone(wrapper_plans)
+        assert wrapper_plans is not None
+        ab_plans = [
+            plan for plan in wrapper_plans if plan.get("kind") == "tcgen05_ab_tma"
+        ]
+        self.assertEqual(len(ab_plans), 1, msg=str(wrapper_plans))
+        ab_plan = ab_plans[0]
+        self.assertEqual(ab_plan.get("cluster_n"), 1)
+        wrapper_body: list[str] = []
+        wrapper_call_args: list[str] = []
+        _append_cute_wrapper_plan(wrapper_body, wrapper_call_args, ab_plan)
+        wrapper_source = "\n".join(wrapper_body)
+        tma_atom_a_lines = [
+            line.strip() for line in wrapper_body if "make_tiled_tma_atom_A(" in line
+        ]
+        tma_atom_b_lines = [
+            line.strip() for line in wrapper_body if "make_tiled_tma_atom_B(" in line
+        ]
+        self.assertEqual(len(tma_atom_a_lines), 1, msg=wrapper_source)
+        self.assertEqual(len(tma_atom_b_lines), 1, msg=wrapper_source)
+        self.assertNotIn("_cluster_layout_vmnk.shape", tma_atom_a_lines[0])
+        self.assertIn("_cluster_layout_vmnk.shape", tma_atom_b_lines[0])
 
-        # ``EXPECTTEST_ACCEPT=1`` is a *local-regeneration* hook
-        # (mirrors helion's ``AssertExpectedJournal`` machinery in
-        # ``helion/_testing.py``); CI runs the test without that
-        # env var so the golden file always exists and any drift
-        # fails. The "missing golden" path below also writes the
-        # file but fails the test so a bare ``pytest`` invocation
-        # in a fresh checkout produces a useful error rather than
-        # silently passing. Set ``EXPECTTEST_ACCEPT=1`` only when
-        # intentionally regenerating after a deliberate codegen
-        # change, and review the resulting diff in your PR.
-        accept = os.environ.get("EXPECTTEST_ACCEPT") == "1"
-        if accept or not TCGEN05_ROLE_LOCAL_MONOLITHIC_GOLDEN_PATH.exists():
-            TCGEN05_ROLE_LOCAL_MONOLITHIC_GOLDEN_PATH.parent.mkdir(
-                parents=True, exist_ok=True
-            )
-            TCGEN05_ROLE_LOCAL_MONOLITHIC_GOLDEN_PATH.write_text(actual)
-            if not accept:
-                self.fail(
-                    "golden file was missing; wrote initial version. "
-                    "Re-run the test to verify."
-                )
-            return
-        expected = TCGEN05_ROLE_LOCAL_MONOLITHIC_GOLDEN_PATH.read_text()
-        if actual != expected:
-            diff = "".join(
-                difflib.unified_diff(
-                    expected.splitlines(keepends=True),
-                    actual.splitlines(keepends=True),
-                    fromfile="golden",
-                    tofile="actual",
-                    n=3,
-                )
-            )
-            self.fail(
-                "Generated CuTe differs from the golden — "
-                "byte-identity for ROLE_LOCAL_MONOLITHIC seed broken. "
-                "If this is an intentional codegen change, regenerate "
-                "the golden via "
-                "EXPECTTEST_ACCEPT=1 pytest -k "
-                "test_tcgen05_role_local_monolithic_byte_identical_golden, "
-                "diff the regenerated file against the prior version, "
-                "and confirm every delta in your PR description.\n"
-                f"--- diff ---\n{diff}"
-            )
+        for marker in (
+            "make_trivial_tiled_mma",
+            "cute.nvgpu.tcgen05.CtaGroup.TWO",
+            "PipelineUmmaAsync.create",
+            "PipelineTmaUmma.create",
+            "PipelineTmaStore.create",
+            "StaticPersistentTileScheduler.create",
+            "tcgen05_role_local_0_work_tile",
+            "while tcgen05_role_local_0_work_tile.is_valid_tile",
+            "tcgen05_acc_pipeline.consumer_wait",
+            "cute.copy(tcgen05_tma_store_atom",
+        ):
+            self.assertIn(marker, code)
+        for forbidden in (
+            "nvvm.clusterlaunchcontrol_try_cancel",
+            "_cute_issue_clc_query_nomulticast",
+            "tcgen05_clc_response_smem_ptr",
+            "tcgen05_clc_mbar_smem_ptr",
+            "cute.arch.clc_response",
+        ):
+            self.assertNotIn(forbidden, code)
 
     def test_tcgen05_smem_swizzle_override_consumed_by_codegen(self) -> None:
         """The ``Tcgen05LayoutOverrides.smem_swizzle_a/b`` data-model
@@ -1495,15 +1471,13 @@ class TestCuteLowerings(unittest.TestCase):
 
         Three pins, in order of strictness:
 
-        1. **Default-path byte-identity.** When neither override is
-           set, the generated CuTe must contain the legacy
+        1. **Default-path markers.** When neither override is set,
+           the generated CuTe must contain the legacy
            ``make_smem_layout_a(...) / make_smem_layout_b(...)``
-           expressions exactly. The wider 4096³ golden
-           (``test_tcgen05_role_local_monolithic_byte_identical_golden``)
-           pins the full kernel — this test pins just the SMEM atom
-           lines so a future codegen refactor that accidentally drops
-           the default branch is caught even when the larger golden
-           file legitimately changes for unrelated reasons.
+           expressions and must omit the override atom-kind literals.
+           This test pins just the SMEM atom lines so unrelated
+           generated-source churn does not require a full-kernel
+           expected-file update.
 
         2. **Override-path expression shape.** When ``swizzle_a=64`` /
            ``swizzle_b=64`` is set, the generated CuTe must contain
@@ -1520,31 +1494,18 @@ class TestCuteLowerings(unittest.TestCase):
            feature is not a no-op.
         """
 
-        from test.golden._tcgen05_role_local_monolithic_4096_bf16_kernel import (
-            cute_matmul_role_local_monolithic_4096_bf16,
-        )
-
         args = (
             torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
             torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
         )
 
         def _emit(swizzle_a: int | None, swizzle_b: int | None) -> str:
-            cfg_kwargs: dict[str, object] = {
-                "block_sizes": [256, 256, 128],
-                "l2_groupings": [1],
-                "pid_type": "persistent_interleaved",
-                "tcgen05_cluster_m": 2,
-                "tcgen05_ab_stages": 2,
-                "tcgen05_acc_stages": 2,
-                "tcgen05_c_stages": 2,
-                "tcgen05_num_epi_warps": 4,
-            }
+            cfg_kwargs: dict[str, object] = {}
             if swizzle_a is not None:
                 cfg_kwargs["tcgen05_layout_overrides_smem_swizzle_a"] = swizzle_a
             if swizzle_b is not None:
                 cfg_kwargs["tcgen05_layout_overrides_smem_swizzle_b"] = swizzle_b
-            cfg = helion.Config(**cfg_kwargs)
+            cfg = _make_tcgen05_role_local_monolithic_seed_config(**cfg_kwargs)
             with patch_cute_mma_support():
                 bound = cute_matmul_role_local_monolithic_4096_bf16.bind(args)
                 bound.env.config_spec.cute_tcgen05_search_enabled = True
@@ -1681,15 +1642,12 @@ class TestCuteLowerings(unittest.TestCase):
 
         Three pins:
 
-        1. **Default-path byte-identity.** When the knob is absent (or
-           set to ``1``), the generated CuTe must NOT contain
-           ``swizzle_size=`` so the call signature matches the cycle
-           41 baseline byte-for-byte. The wider 4096³ golden
-           (``test_tcgen05_role_local_monolithic_byte_identical_golden``)
-           pins the full kernel; this test isolates the scheduler
+        1. **Default-path markers.** When the knob is absent (or set
+           to ``1``), the generated CuTe must NOT contain
+           ``swizzle_size=``. This test isolates the scheduler
            prelude lines so a future codegen refactor that always
-           emits the kwarg is caught even if the larger golden file
-           changes for unrelated reasons.
+           emits the kwarg is caught without comparing the whole
+           generated kernel.
 
         2. **Override-path expression shape.** When ``=8`` is set, the
            generated CuTe contains ``swizzle_size=8`` on every
@@ -1702,29 +1660,16 @@ class TestCuteLowerings(unittest.TestCase):
            than being silently mapped to a single sentinel.
         """
 
-        from test.golden._tcgen05_role_local_monolithic_4096_bf16_kernel import (
-            cute_matmul_role_local_monolithic_4096_bf16,
-        )
-
         args = (
             torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
             torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
         )
 
         def _emit(l2_swizzle_size: int | None) -> str:
-            cfg_kwargs: dict[str, object] = {
-                "block_sizes": [256, 256, 128],
-                "l2_groupings": [1],
-                "pid_type": "persistent_interleaved",
-                "tcgen05_cluster_m": 2,
-                "tcgen05_ab_stages": 2,
-                "tcgen05_acc_stages": 2,
-                "tcgen05_c_stages": 2,
-                "tcgen05_num_epi_warps": 4,
-            }
+            cfg_kwargs: dict[str, object] = {}
             if l2_swizzle_size is not None:
                 cfg_kwargs["tcgen05_l2_swizzle_size"] = l2_swizzle_size
-            cfg = helion.Config(**cfg_kwargs)
+            cfg = _make_tcgen05_role_local_monolithic_seed_config(**cfg_kwargs)
             with patch_cute_mma_support():
                 bound = cute_matmul_role_local_monolithic_4096_bf16.bind(args)
                 bound.env.config_spec.cute_tcgen05_search_enabled = True
@@ -1748,8 +1693,8 @@ class TestCuteLowerings(unittest.TestCase):
         for line in default_lines:
             self.assertNotIn("swizzle_size=", line)
 
-        # Pin #1b: explicit ``=1`` is also byte-identical (the kwarg
-        # is suppressed when the value is the no-swizzle default).
+        # Pin #1b: explicit ``=1`` also suppresses the kwarg because
+        # it is the no-swizzle default.
         explicit_one_code = _emit(1)
         for line in _sched_param_lines(explicit_one_code):
             self.assertNotIn("swizzle_size=", line)
@@ -1889,13 +1834,8 @@ class TestCuteLowerings(unittest.TestCase):
 
         ``register_split`` is also asserted on the observed spec so
         a drift in the (120, 256) decrease/increase pair is caught
-        as part of this test rather than waiting for the byte-
-        identity golden to flag it.
+        as part of this focused data-flow test.
         """
-
-        from test.golden._tcgen05_role_local_monolithic_4096_bf16_kernel import (
-            cute_matmul_role_local_monolithic_4096_bf16,
-        )
 
         from helion._compiler.cute import cute_mma as cute_mma_module
         from helion._compiler.cute import strategies as strategies_module
@@ -1907,16 +1847,7 @@ class TestCuteLowerings(unittest.TestCase):
             torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
             torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
         )
-        seed_config = helion.Config(
-            block_sizes=[256, 256, 128],
-            l2_groupings=[1],
-            pid_type="persistent_interleaved",
-            tcgen05_cluster_m=2,
-            tcgen05_ab_stages=2,
-            tcgen05_acc_stages=2,
-            tcgen05_c_stages=2,
-            tcgen05_num_epi_warps=4,
-        )
+        seed_config = _make_tcgen05_role_local_monolithic_seed_config()
 
         original_warp_spec = strategies_module.warp_spec_from_config
         observed_specs: list[Tcgen05WarpSpec] = []
@@ -2580,32 +2511,15 @@ class TestCuteLowerings(unittest.TestCase):
         self.assertIn("consumer_mask=cutlass.Int32(0)", sched_create_call)
 
     def test_tcgen05_clc_persistent_does_not_perturb_monolithic(self) -> None:
-        """G2-H: ``ROLE_LOCAL_MONOLITHIC`` codegen must be byte-
-        identical pre/post G2-H. The byte-identity golden test
-        (``test_tcgen05_role_local_monolithic_byte_identical_golden``)
-        already pins the MONOLITHIC kernel; this test additionally
-        confirms that the MONOLITHIC path emits no CLC markers
-        regardless of the new persistence-model field.
+        """``ROLE_LOCAL_MONOLITHIC`` codegen keeps the static
+        persistent path and emits no CLC markers regardless of the
+        new persistence-model field.
         """
-
-        from test.golden._tcgen05_role_local_monolithic_4096_bf16_kernel import (
-            cute_matmul_role_local_monolithic_4096_bf16,
-        )
-
         args = (
             torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
             torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
         )
-        seed_config = helion.Config(
-            block_sizes=[256, 256, 128],
-            l2_groupings=[1],
-            pid_type="persistent_interleaved",
-            tcgen05_cluster_m=2,
-            tcgen05_ab_stages=2,
-            tcgen05_acc_stages=2,
-            tcgen05_c_stages=2,
-            tcgen05_num_epi_warps=4,
-        )
+        seed_config = _make_tcgen05_role_local_monolithic_seed_config()
         with patch_cute_mma_support():
             bound = cute_matmul_role_local_monolithic_4096_bf16.bind(args)
             bound.env.config_spec.cute_tcgen05_search_enabled = True
@@ -5078,13 +4992,12 @@ class TestCuteLowerings(unittest.TestCase):
         renders to; its presence between the T2R copy and the
         accumulator vector cast is the structural pin that the splice
         actually fired and is in the per-subtile T2R loop body. The
-        identity-store golden in
-        ``test_tcgen05_role_local_monolithic_byte_identical_golden``
-        covers the no-chain case; if a future refactor accidentally
-        skips the splice, this test catches the regression by checking
-        the ``cute.where`` marker plus the hoisted load and per-step
-        chain locals (``tcgen05_acc_loaded``, ``tcgen05_chain_step*``)
-        introduced by the per-step-binding renderer.
+        identity-store structural markers cover the no-chain case;
+        if a future refactor accidentally skips the splice, this test
+        catches the regression by checking the ``cute.where`` marker
+        plus the hoisted load and per-step chain locals
+        (``tcgen05_acc_loaded``, ``tcgen05_chain_step*``) introduced
+        by the per-step-binding renderer.
 
         Anchors on a single splice-site block (the ``tcgen05_acc_vec``
         assignment region) rather than ``code.find`` first occurrence
@@ -10783,8 +10696,8 @@ class TestCuteTcgen05AuxTensorWalker(unittest.TestCase):
     walker correctness across the four shapes the productive
     body will care about (no-aux, exact-shape aux, rowvec
     broadcast aux, chained residual+bias) plus the for-loop
-    subgraph boundary, and pin plan-level byte identity for the
-    no-aux path.
+    subgraph boundary, and pin plan-level identity for the no-aux
+    path.
     """
 
     def _bind_and_capture_plans(self, kernel, args, config):  # type: ignore[no-untyped-def]
@@ -10850,7 +10763,7 @@ class TestCuteTcgen05AuxTensorWalker(unittest.TestCase):
     def test_walker_returns_empty_for_pure_matmul(self) -> None:
         """A pure matmul (no aux fusion) produces an empty descriptor
         tuple. The plan field defaults to ``()`` so non-residual
-        kernels remain byte-identical to the pre-walker baseline.
+        kernels keep the pre-walker plan shape.
         """
 
         @helion.kernel(backend="cute")
@@ -11238,9 +11151,7 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
     Gate: fires only when ``c_input_warp_count > 0`` AND the
     aux-tensor identity walker discovered one or more descriptors
     on the matmul plan. For every other config the role-local
-    while is omitted, the SMEM ring + pipeline allocation skip,
-    and the codegen is byte-identical to the pre-cycle-1
-    baseline.
+    while is omitted, and the SMEM ring + pipeline allocation skip.
 
     The runtime-correctness pins below confirm the SMEM ring +
     pipeline + role-local while + producer body + consumer flip

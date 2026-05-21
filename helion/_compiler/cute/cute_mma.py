@@ -111,7 +111,7 @@ _TCGEN05_CONSUMER_REGS = 256
 # Cluster-leader (cta_rank == 0) form. Used only when V-leader semantics
 # degenerate to cluster-leader -- i.e. cluster_size == V (no V-non-leader
 # CTAs), today's cluster_m=2 cluster_n=1 use_2cta=True path. Preserves the
-# cluster_n=1 byte-identity golden.
+# cluster_n=1 leader predicate form.
 _TCGEN05_CLUSTER_LEADER_PREDICATE = (
     "cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster()) == cutlass.Int32(0)"
 )
@@ -952,11 +952,11 @@ def _tcgen05_two_cta_owner_predicate(
     of each V-pair so the AB consumer-release barrier and MMA issuance are
     *not* duplicated by the V-non-leader CTA. With ``cluster_n=1`` the only
     V-pair has V-leader rank 0 (cluster-leader), so the cheaper ``rank == 0``
-    spelling is used to preserve the validated cluster_n=1 byte-identity
-    golden. With ``cluster_n=2`` there are two V-pairs (V-leaders {0, 2})
-    so the predicate must use ``rank % 2 == 0``; rank 2 must commit on its
-    own V-pair's empty barrier or the cluster races (cycle-26 hang root
-    cause; see cute_plan.md §6.12.3).
+    spelling keeps the validated cluster_n=1 predicate shape. With
+    ``cluster_n=2`` there are two V-pairs (V-leaders {0, 2}) so the predicate
+    must use ``rank % 2 == 0``; rank 2 must commit on its own V-pair's empty
+    barrier or the cluster races (cycle-26 hang root cause; see cute_plan.md
+    §6.12.3).
     """
     predicate_terms = []
     if gate_exec_warp:
@@ -3131,9 +3131,9 @@ def _emit_mma_pipeline(
             }
             # ``smem_swizzle_*`` overrides are recorded only when the
             # user opts in. Keeping the keys absent on the default path
-            # preserves the no-override wrapper-plan literal so
-            # byte-identity with the canonical 4096³ seed holds. The
-            # wrapper-side ``_append_cute_wrapper_plan`` reads
+            # keeps the no-override wrapper-plan literal free of
+            # override-only state. The wrapper-side
+            # ``_append_cute_wrapper_plan`` reads
             # ``plan.get(..., None)`` and emits the override-aware SMEM
             # atom expression only when an explicit value is present.
             if tcgen05_smem_swizzle_a is not None:
