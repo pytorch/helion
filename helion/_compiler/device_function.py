@@ -1366,6 +1366,39 @@ class DeviceFunction:
             scalar_preamble.extend(backend.scalar_arg_preamble(arg))
 
         function_decorator = backend.function_decorator_for_args(param_args)
+        kernel_body: list[ast.stmt] = cast(
+            "list[ast.stmt]",
+            [
+                *scalar_preamble,
+                *self.preamble,
+                *self.body,
+            ],
+        )
+        if backend.name == "cute":
+            from .cute.fuse_two_pass_loads import fuse_two_pass_loads
+
+            # Collect static integer values for constexpr names so the
+            # fusion pass can resolve range(..., step=cutlass.Int32(NAME))
+            # trip counts. Three sources: literal constexpr inlined args,
+            # host-side literal assignments to constexpr-named variables,
+            # and the inlined module-level constexpr decls.
+            constexpr_values: dict[str, int] = {}
+            for arg in constexpr_to_inline:
+                try:
+                    value = int(arg.host_str())
+                except (TypeError, ValueError):
+                    continue
+                constexpr_values[arg.name] = value
+            for stmt in self.codegen.host_statements:
+                if (
+                    isinstance(stmt, ast.Assign)
+                    and len(stmt.targets) == 1
+                    and isinstance(stmt.targets[0], ast.Name)
+                    and isinstance(stmt.value, ast.Constant)
+                    and isinstance(stmt.value.value, int)
+                ):
+                    constexpr_values[stmt.targets[0].id] = stmt.value.value
+            kernel_body = fuse_two_pass_loads(kernel_body, constexpr_values)
         return [
             *prefix,
             ast_rename(
@@ -1373,11 +1406,7 @@ class DeviceFunction:
                     ast.FunctionDef,
                     name=self.name,
                     args=create_arguments(args),
-                    body=[
-                        *scalar_preamble,
-                        *self.preamble,
-                        *self.body,
-                    ],
+                    body=kernel_body,
                     decorator_list=[expr_from_string(function_decorator)]
                     if function_decorator
                     else [],

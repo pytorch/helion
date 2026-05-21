@@ -13,8 +13,59 @@ from .registry import AutotunerHeuristic
 
 if TYPE_CHECKING:
     from ...autotuner.config_fragment import BlockSizeFragment
+    from ...autotuner.config_spec import BlockSizeSpec
+    from ...autotuner.config_spec import ReductionLoopSpec
     from ..compile_environment import CompileEnvironment
     from ..device_ir import DeviceIR
+
+
+class CuteReductionTileHeuristic(AutotunerHeuristic):
+    """Seed config for canonical reduction kernels (RMS norm, softmax, etc.).
+
+    For kernels with exactly one non-reduction tile and one reduction
+    dimension, the bandwidth-optimal CuTe config keeps M-axis threads at 1
+    (one tile row per block) so the full reduction extent can be mapped to
+    threads. With many such blocks (one per M row), the launch lattice
+    saturates B200's 148 SMs while each block does its reduction
+    via the cross-warp shared-memory combiner (or a single warp's
+    warp_reduction_sum when the reduction is small).
+    """
+
+    name = "cute_reduction_tile"
+    backend = "cute"
+
+    @classmethod
+    def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        spec = env.config_spec
+        # Single non-reduction tile + single reduction dim.
+        if len(spec.block_sizes) != 1 or len(spec.reduction_loops) != 1:
+            return False
+        # No matmul facts (this seeds reduction kernels, not GEMMs).
+        if spec.matmul_facts:
+            return False
+        bs_spec = cast("BlockSizeSpec", spec.block_sizes[0])
+        # M-axis must accept block_size=1.
+        return max(bs_spec.min_size, bs_spec.autotuner_min) <= 1
+
+    @classmethod
+    def get_seed_config(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> Config | None:
+        spec = env.config_spec
+        rl_spec = cast("ReductionLoopSpec", spec.reduction_loops[0])
+        max_threads = spec.max_reduction_threads or 1024
+        size_hint = rl_spec.size_hint
+        if size_hint <= max_threads:
+            # Persistent reduction (no roll). The normalize step will keep
+            # reduction_loops[0]=None when the M-axis allows it.
+            reduction_loops: list[int | None] = [None]
+        else:
+            reduction_loops = [max_threads]
+        return Config(
+            block_sizes=[1],
+            num_threads=[1],
+            reduction_loops=reduction_loops,
+        )
 
 
 class CuteTcgen05ClusterM2Heuristic(AutotunerHeuristic):
