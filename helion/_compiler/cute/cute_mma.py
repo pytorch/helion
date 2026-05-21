@@ -802,9 +802,6 @@ def prepare_cute_collective_lane_loop_suppression(
             and isinstance(lhs_fake.shape[1], int)
         ):
             continue
-        m = lhs_fake.shape[0]
-        n = rhs_fake.shape[1]
-        k = lhs_fake.shape[1]
         bm = bn = bk = None
         candidate_block_ids = [*grid_state.block_ids]
         if (
@@ -835,8 +832,6 @@ def prepare_cute_collective_lane_loop_suppression(
             )
             != "tcgen05"
         ):
-            continue
-        if m % bm != 0 or n % bn != 0 or k % bk != 0:
             continue
         if (
             len(lhs_load.users) != 1
@@ -1738,6 +1733,23 @@ def _emit_mma_pipeline(
     tcgen05_static_full_tiles = (
         m_size % bm == 0 and n_size % bn == 0 and k_total_size % bk == 0
     )
+    if mma_impl == "tcgen05" and m_size % bm != 0 and n_size % bn != 0:
+        raise exc.BackendUnsupported(
+            "cute",
+            "tcgen05 SIMT edge epilogue currently supports only one partial "
+            "output tile axis at a time. Choose a block_n that divides the "
+            "static N extent, or use a "
+            "non-tcgen05 fallback for double-edge output tiles.",
+        )
+    if mma_impl == "tcgen05" and not tcgen05_static_full_tiles:
+        # Mixing TMA-loaded full K tiles with scalar-filled K tails requires
+        # cross-warp agreement on the AB pipeline stage. That transition is not
+        # validated yet; use the scalar SMEM fill for every K tile on edge
+        # shapes so full and partial K iterations follow one path.
+        tcgen05_use_tma_a = False
+        tcgen05_use_tma_b = False
+        tcgen05_use_tma = False
+        tcgen05_use_tma_pipeline = False
     tcgen05_pid_is_persistent = _is_persistent_pid_config(df.config)
     tcgen05_requested_two_cta = _tcgen05_use_2cta_instrs(
         bm=bm, cluster_m=tcgen05_cluster_m
@@ -1996,7 +2008,6 @@ def _emit_mma_pipeline(
         mma_impl == "tcgen05"
         and fx_node is not None
         and cg.current_grid_state is not None
-        and tcgen05_static_full_tiles
         and len(lhs_load.users) == 1
         and len(rhs_load.users) == 1
         and next(iter(lhs_load.users)) is fx_node
@@ -3605,7 +3616,11 @@ def _emit_mma_pipeline(
             and mma_participant_linear is not None
             and mma_copy_linear is not None
         )
-        load_thread_count = active_threads
+        load_thread_count = (
+            mma_physical_m_threads * mma_phys_n
+            if mma_impl == "tcgen05" and tcgen05_collective_handles_operand_loads
+            else active_threads
+        )
         load_guard = mma_active
         mma_stage_stmt: ast.stmt | None = None
         smem_a_mma_stmt: ast.stmt | None = None
@@ -3616,20 +3631,24 @@ def _emit_mma_pipeline(
             # The smem cache for A/B is laid out as (..., ab_stage_count); we
             # index into the current stage every K-loop iteration.
             #
-            # When the kernel uses the TMA pipeline, ``tma_consumer_state.index``
-            # is the canonical stage index: it advances exactly once per K-loop
-            # iteration via ``consumer_release`` + ``advance``, and (critically
-            # for the persistent path) it carries its value across virtual
-            # tiles. Computing ``mma_stage`` from ``k_offset // bk`` resets to
-            # zero at each tile while the pipeline state stays where it was at
-            # the end of the prior tile -- the two diverge across persistent
-            # tile boundaries. Use the pipeline state directly so the K-loop
-            # always reads the stage the consumer just unblocked.
+            # When the role-local persistent kernel uses the TMA pipeline,
+            # ``tma_consumer_state.index`` is the canonical stage index: it
+            # advances exactly once per K-loop iteration via ``consumer_release``
+            # + ``advance`` and carries its value across virtual tiles. Computing
+            # ``mma_stage`` from ``k_offset // bk`` resets to zero at each tile
+            # while the pipeline state stays where it was at the end of the
+            # prior tile -- the two diverge across persistent tile boundaries.
+            #
+            # Non-role-local edge fallback is different: scalar fallback loader
+            # warps also need the stage, but only the exec warp advances its
+            # thread-local AB consumer state on full TMA K tiles. Compute the
+            # stage from the K tile index there so loader and exec warps agree
+            # when a later partial K tile falls back to scalar SMEM fills.
             #
             # For the non-TMA tcgen05 path there is no pipeline state to track
             # and ``ab_stage_count`` is always 1, so the modular form is a
             # constant zero anyway.
-            if tcgen05_use_tma:
+            if tcgen05_use_tma and tcgen05_use_role_local_mma_exec:
                 mma_stage_stmt = statement_from_string(
                     f"{mma_stage} = {tma_consumer_state}.index"
                 )

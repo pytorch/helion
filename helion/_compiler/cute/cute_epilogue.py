@@ -51,9 +51,12 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from ...language._gelu_tanh_approx import GELU_ERF_INNER_REF_COUNT
 from ...language._gelu_tanh_approx import GELU_TANH_APPROX_INNER_REF_COUNT
+from ...language._gelu_tanh_approx import _gelu_erf
 from ...language._gelu_tanh_approx import _gelu_tanh_approx
 from ...language._gelu_tanh_approx import epilogue_unary_step_template
+from ...language._gelu_tanh_approx import gelu_erf_epilogue_unary_step_template
 from .cute_fx_walk import aux_tensor_load_kind
 from .cute_fx_walk import build_inner_outputs_index
 from .cute_fx_walk import walk_carrier_to_tcgen05_matmul
@@ -180,6 +183,7 @@ _TANH_TEMPLATE = "cute.math.tanh({inner})"
 _EXP_TEMPLATE = "cute.math.exp({inner})"
 _LOG_TEMPLATE = "cute.math.log({inner})"
 _SQRT_TEMPLATE = "cute.math.sqrt({inner})"
+_ERF_TEMPLATE = "cute.math.erf({inner})"
 
 
 def _add_const_template(scalar: float) -> str:
@@ -238,6 +242,12 @@ _ZERO_ARG_TARGETS: dict[object, _UnaryStep] = {
     torch.ops.aten.exp.default: _UnaryStep(op_name="exp", template=_EXP_TEMPLATE),
     torch.ops.aten.log.default: _UnaryStep(op_name="log", template=_LOG_TEMPLATE),
     torch.ops.aten.sqrt.default: _UnaryStep(op_name="sqrt", template=_SQRT_TEMPLATE),
+    torch.ops.aten.erf.default: _UnaryStep(op_name="erf", template=_ERF_TEMPLATE),
+    _gelu_erf: _UnaryStep(
+        op_name="gelu_erf",
+        template=gelu_erf_epilogue_unary_step_template(),
+        inner_ref_count=GELU_ERF_INNER_REF_COUNT,
+    ),
     # ``F.gelu(x, approximate="tanh")`` (mapped to ``_gelu_tanh_approx``
     # by the device_ir decomp) — single FX node folding the polynomial
     # which references ``x`` 4 times. The chain renderer hoists
@@ -342,6 +352,73 @@ def _extract_scalar(arg: object) -> float | None:
             return None
         return val
     return None
+
+
+def _is_helion_load_node(node: torch.fx.Node) -> bool:
+    from ...language.memory_ops import load as helion_load
+
+    return node.op == "call_function" and node.target is helion_load
+
+
+def _canonical_aux_load_operand(node: torch.fx.Node) -> tuple[torch.fx.Node, str]:
+    """Return the underlying aux load plus its local-value template.
+
+    Canonical unwrapping currently accepts raw aux loads and fp32 casts of
+    aux loads; other dtype casts stay outside the fused aux pattern.
+    """
+    if _is_helion_load_node(node):
+        return node, "{aux}"
+    if (
+        node.op == "call_function"
+        and node.target is torch.ops.prims.convert_element_type.default
+        and not node.kwargs
+        and len(node.args) == 2
+        and node.args[1] is torch.float32
+        and isinstance(node.args[0], torch.fx.Node)
+    ):
+        inner = node.args[0]
+        if _is_helion_load_node(inner):
+            return inner, "({aux}).to(cutlass.Float32)"
+    return node, "{aux}"
+
+
+def _aux_load_operand(node: torch.fx.Node) -> tuple[torch.fx.Node, str]:
+    """Return ``(load_node, aux_template)`` for accepted aux operands.
+
+    ``aux_template`` is a ``{aux}``-keyed expression applied to the loaded
+    per-thread aux local before the outer binary op. This covers wrapped
+    residual terms such as ``0.5 * residual[tile_m, tile_n].to(torch.float32)``
+    without broadening the general chain model to arbitrary non-scalar binary
+    reuse.
+    """
+    load_node, aux_template = _canonical_aux_load_operand(node)
+    if load_node is not node:
+        return load_node, aux_template
+    if node.op != "call_function" or node.target is not torch.ops.aten.mul.Tensor:
+        return node, "{aux}"
+    if node.kwargs or len(node.args) < 2:
+        return node, "{aux}"
+    lhs = node.args[0]
+    rhs = node.args[1]
+    if isinstance(lhs, torch.fx.Node):
+        scalar = _extract_scalar(rhs)
+        inner = lhs
+    elif isinstance(rhs, torch.fx.Node):
+        scalar = _extract_scalar(lhs)
+        inner = rhs
+    else:
+        return node, "{aux}"
+    if scalar is None:
+        return node, "{aux}"
+    load_node, inner_template = _canonical_aux_load_operand(inner)
+    if load_node is inner and not _is_helion_load_node(load_node):
+        return node, "{aux}"
+    return load_node, f"(({inner_template}) * {scalar!r})"
+
+
+def _is_aux_load_operand_node(node: torch.fx.Node) -> bool:
+    load_node, _ = _aux_load_operand(node)
+    return _is_helion_load_node(load_node)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -538,14 +615,16 @@ def _classify_binary(
         # tensor load; the other is the chain carrier. If both look
         # like aux loads or neither does, bail — the chain has no
         # unique carrier.
+        lhs_load, lhs_aux_template = _aux_load_operand(lhs)
+        rhs_load, rhs_aux_template = _aux_load_operand(rhs)
         lhs_kind = aux_tensor_load_kind(
-            lhs,
+            lhs_load,
             carrier_tile_shape=carrier_tile_shape,
             carrier_tile_index_nodes=carrier_tile_index_nodes,
             carrier_global_shape=carrier_global_shape,
         )
         rhs_kind = aux_tensor_load_kind(
-            rhs,
+            rhs_load,
             carrier_tile_shape=carrier_tile_shape,
             carrier_tile_index_nodes=carrier_tile_index_nodes,
             carrier_global_shape=carrier_global_shape,
@@ -554,12 +633,14 @@ def _classify_binary(
         carrier: torch.fx.Node
         forward_form: bool
         if lhs_kind is not None and rhs_kind is None:
-            aux_load = lhs
+            aux_load = lhs_load
+            aux_template = lhs_aux_template
             carrier = rhs
             forward_form = False  # carrier is the right operand
             aux_kind = lhs_kind
         elif rhs_kind is not None and lhs_kind is None:
-            aux_load = rhs
+            aux_load = rhs_load
+            aux_template = rhs_aux_template
             carrier = lhs
             forward_form = True  # carrier is the left operand
             aux_kind = rhs_kind
@@ -568,7 +649,7 @@ def _classify_binary(
         op_template_table: dict[object, str] = (
             _AUX_FORWARD_OP_TEMPLATES if forward_form else _AUX_REVERSE_OP_TEMPLATES
         )
-        op_template = op_template_table[target]
+        op_template = op_template_table[target].replace("{aux}", aux_template)
         op_name_table: dict[object, str] = {
             torch.ops.aten.add.Tensor: "add",
             torch.ops.aten.mul.Tensor: "mul",
@@ -662,13 +743,14 @@ def _carrier_tile_index_nodes(
     to the looser shape-only check.
 
     For binary chain steps the walk picks the first
-    ``all_input_nodes`` entry that is *not* a ``helion.language.load``
-    call. The chain analyzer accepts both ``add(carrier, aux_load)``
-    and ``add(aux_load, carrier)``; descending into the aux load side
-    breaks the walk-back to ``hl.zeros``. Skipping aux load nodes
-    keeps the walk on the carrier side regardless of operand order,
-    so the reverse-form chain (``aux + carrier``) recovers the tile
-    index symbols just like the forward form.
+    ``all_input_nodes`` entry that is not an accepted aux-load
+    operand. The chain analyzer accepts both ``add(carrier,
+    aux_load)`` and ``add(aux_load, carrier)``; descending into the
+    aux load side breaks the walk-back to ``hl.zeros``. Skipping the
+    same wrapped/scaled aux operands accepted by the classifier keeps
+    the walk on the carrier side regardless of operand order, so the
+    reverse-form chain recovers the tile index symbols just like the
+    forward form.
 
     Invariant: any ``hl.load`` input encountered during the walk is
     necessarily an aux load (never a carrier passthrough), because
@@ -680,7 +762,6 @@ def _carrier_tile_index_nodes(
     import operator
 
     from ...language import _tracing_ops
-    from ...language.memory_ops import load as helion_load
 
     cur: torch.fx.Node | None = cast_input
     visited: set[torch.fx.Node] = set()
@@ -714,14 +795,14 @@ def _carrier_tile_index_nodes(
             continue
         # The chain may carry a binary op whose carrier we want to
         # follow back. Pick the first ``all_input_nodes`` entry that
-        # is not a ``helion.language.load`` call so we descend into
+        # is not an accepted aux-load operand so we descend into
         # the carrier side regardless of operand order. Reverse-form
         # binaries (``aux_load <op> carrier``) put the aux load
         # first; without this skip the walk would descend into the
         # aux tensor and never find ``hl.zeros``.
         chosen: torch.fx.Node | None = None
         for inp in cur.all_input_nodes:
-            if inp.op == "call_function" and inp.target is helion_load:
+            if _is_aux_load_operand_node(inp):
                 continue
             chosen = inp
             break

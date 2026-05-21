@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -30,6 +31,7 @@ from helion._testing import patch_cute_mma_support
 from helion._testing import skipIfMTIA
 from helion.autotuner import PowerOfTwoFragment
 from helion.autotuner.config_generation import ConfigGeneration
+from helion.autotuner.config_spec import MatmulFact
 from helion.exc import InvalidConfig
 import helion.language as hl
 
@@ -1262,6 +1264,116 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         self.assertNotIn("persistent_interleaved", spec.allowed_pid_types)
         self.assertEqual(spec._tcgen05_cluster_m_search_choices, (1,))
         self.assertEqual(spec._tcgen05_num_epi_warps_search_choices, (4,))
+
+    @onlyBackends(["cute"])
+    def test_cute_tcgen05_double_edge_no_divisor_disables_search(self) -> None:
+        """If no power-of-two N tile divides the static N extent, tcgen05
+        search stays disabled when M has no valid divisor either."""
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_mma(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        args = (
+            torch.randn([67, 16], device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn([16, 67], device=DEVICE, dtype=HALF_DTYPE),
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_mma.bind(args)
+        spec = bound.config_spec
+        self.assertFalse(spec.cute_tcgen05_search_enabled)
+        self.assertNotIn("tcgen05_cluster_m", spec.default_config().config)
+
+    @onlyBackends(["cute"])
+    def test_cute_tcgen05_double_edge_narrowing_falls_back_to_m(self) -> None:
+        """When N has no valid power-of-two divisor, M can still narrow so
+        tcgen05 search exposes single-edge candidates."""
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_mma(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        args = (
+            torch.randn([192, 64], device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn([64, 67], device=DEVICE, dtype=HALF_DTYPE),
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_mma.bind(args)
+        spec = bound.config_spec
+        self.assertTrue(spec.cute_tcgen05_search_enabled)
+        self.assertEqual([x.max_size for x in spec.block_sizes], [64, 64, 64])
+
+    @onlyBackends(["cute"])
+    def test_cute_tcgen05_partial_single_edge_search_stays_enabled(self) -> None:
+        """A double-edge default tile can narrow N to a divisor and keep
+        single-edge tcgen05 candidates searchable."""
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_mma(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        args = (
+            torch.randn([5000, 64], device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn([64, 5000], device=DEVICE, dtype=HALF_DTYPE),
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_mma.bind(args)
+        spec = bound.config_spec
+        self.assertTrue(spec.cute_tcgen05_search_enabled)
+        self.assertEqual([x.max_size for x in spec.block_sizes], [256, 8, 64])
+
+    def test_tcgen05_edge_tile_detection_skips_unknown_dims(self) -> None:
+        config_spec = SimpleNamespace(
+            block_sizes=SimpleNamespace(
+                block_id_to_index=lambda block_id: {0: 0, 1: 1}[block_id],
+            ),
+            matmul_facts=[
+                MatmulFact(
+                    lhs_ndim=2,
+                    rhs_ndim=2,
+                    m_block_id=None,
+                    n_block_id=0,
+                    k_block_id=1,
+                    static_m=None,
+                    static_n=130,
+                    static_k=128,
+                    lhs_dtype=HALF_DTYPE,
+                    rhs_dtype=HALF_DTYPE,
+                )
+            ],
+        )
+        tcgen05 = CuteTcgen05Config(config_spec)
+
+        self.assertTrue(
+            tcgen05._matmul_fact_has_edge_tile(
+                {"block_sizes": [128, 64]},
+                fact_index=0,
+            )
+        )
 
     @onlyBackends(["cute"])
     def test_cute_tcgen05_multi_root_search_keeps_persistent_pid_types_out(
