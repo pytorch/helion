@@ -41,6 +41,7 @@ from helion._compiler.compile_environment import CompileEnvironment
 from helion._compiler.cute.argreduce import codegen_cute_tile_argreduce
 from helion._compiler.cute.cute_mma import _TCGEN05_CLUSTER_LEADER_PREDICATE
 from helion._compiler.cute.cute_mma import _build_initial_prefetch_if
+from helion._compiler.cute.cute_mma import _build_kloop_non_pipeline_consumer_if
 from helion._compiler.cute.cute_mma import _build_kloop_non_pipeline_producer_if
 from helion._compiler.cute.cute_mma import _build_kloop_non_pipeline_release_if
 from helion._compiler.cute.cute_mma import _build_kloop_pipeline_consumer_if
@@ -1062,11 +1063,13 @@ class TestCuteLowerings(unittest.TestCase):
         self.assertIn("PipelineTmaUmma.create(", code)
         self.assertNotIn("load = x[indices_0, indices_2]", code)
         self.assertNotIn("load_1 = y[indices_2, indices_1]", code)
-        self.assertIn(
-            "if tcgen05_exec_active:\n"
-            "                tcgen05_ab_consumer_try_token = tcgen05_ab_pipeline.consumer_try_wait(tcgen05_ab_consumer_state)\n"
-            "                tcgen05_ab_pipeline.consumer_wait(tcgen05_ab_consumer_state, tcgen05_ab_consumer_try_token)",
+        self.assertRegex(
             code,
+            r"if tcgen05_exec_active:\n"
+            r"\s+tcgen05_ab_consumer_try_token = "
+            r"tcgen05_ab_pipeline\.consumer_try_wait\(tcgen05_ab_consumer_state\)\n"
+            r"\s+tcgen05_ab_pipeline\.consumer_wait\("
+            r"tcgen05_ab_consumer_state, tcgen05_ab_consumer_try_token\)",
         )
         # The legacy K-loop no longer emits a ``fence_view_async_shared()``
         # between AB ``consumer_wait`` and ``cute.gemm`` (cute_plan.md
@@ -1080,9 +1083,10 @@ class TestCuteLowerings(unittest.TestCase):
             "if tcgen05_exec_active:\n            for _tcgen05_kblk_idx in range(",
             code,
         )
-        self.assertIn(
-            "if tcgen05_exec_active:\n                tcgen05_ab_pipeline.consumer_release(",
+        self.assertRegex(
             code,
+            r"if tcgen05_exec_active:\n"
+            r"\s+tcgen05_ab_pipeline\.consumer_release\(",
         )
         self.assertIn(
             "tcgen05_acc_pipeline.consumer_release(tcgen05_acc_consumer_state)",
@@ -1092,9 +1096,9 @@ class TestCuteLowerings(unittest.TestCase):
 
     def test_tcgen05_kloop_tma_producer_split_into_separate_if(self) -> None:
         """Pin the per-K-iter producer/consumer split: producer work is
-        emitted as ``if {tma_full_tile} and {tma_warp} and
-        {tma_next_full_tile}: ...`` separate from the consumer/scalar-
-        fallback ``if {tma_full_tile}: ... else: ...`` block.
+        emitted separately from the consumer. Static-full one-CTA TMA
+        kernels omit the runtime full-tile branch and scalar fallback in the
+        hot K loop, leaving only the next-prefetch gate on producer work.
         """
 
         @helion.kernel(backend="cute")
@@ -1119,11 +1123,8 @@ class TestCuteLowerings(unittest.TestCase):
             config = _make_tcgen05_persistent_config(num_warps=4)
             code = bound.to_triton_code(config)
 
-        self.assertIn(
-            "if tcgen05_tma_full_tile and tcgen05_tma_warp "
-            "and tcgen05_tma_next_full_tile:",
-            code,
-        )
+        self.assertIn("if tcgen05_tma_warp and tcgen05_tma_next_full_tile:", code)
+        self.assertNotIn("tcgen05_tma_full_tile", code)
         self.assertIn(
             "tcgen05_ab_pipeline.producer_acquire("
             "tcgen05_ab_producer_state, tcgen05_ab_producer_try_token)",
@@ -1134,11 +1135,6 @@ class TestCuteLowerings(unittest.TestCase):
             code,
         )
         self.assertIn("cute.arch.sync_threads()", code)
-        compound_shape = (
-            "if tcgen05_tma_full_tile:\n"
-            "                if tcgen05_tma_warp and tcgen05_tma_next_full_tile:"
-        )
-        self.assertNotIn(compound_shape, code)
 
     def test_tcgen05_k_tail_keeps_tma_pipeline_with_scalar_fallback(self) -> None:
         """A K-tail uses TMA for full K tiles, then scalar-fills the tail.
@@ -1193,6 +1189,11 @@ class TestCuteLowerings(unittest.TestCase):
 
         self.assertIn("'kind': 'tcgen05_ab_tma'", code)
         self.assertIn("tcgen05_tma_full_tile", code)
+        self.assertIn(
+            "if tcgen05_tma_full_tile and tcgen05_tma_warp "
+            "and tcgen05_tma_next_full_tile:",
+            code,
+        )
         self.assertIn("tcgen05_ab_pipeline.consumer_wait", code)
         has_mixed_fallback_barriers = False
         for node in ast.walk(ast.parse(code)):
@@ -16667,6 +16668,7 @@ class TestPerKiterTmaBuilders(unittest.TestCase):
         use_tma_b_mcast_mask: bool | None = None,
         use_tma_a: bool = True,
         use_tma_b: bool = True,
+        static_full_tiles: bool = False,
     ) -> _PerKiterTmaArgs:
         if use_tma_b_mcast_mask is None:
             use_tma_b_mcast_mask = cluster_m > 1 or is_two_cta
@@ -16701,6 +16703,7 @@ class TestPerKiterTmaBuilders(unittest.TestCase):
             exec_active="exec_active",
             scalar_load_a=self._scalar_load_a(),
             scalar_load_b=self._scalar_load_b(),
+            static_full_tiles=static_full_tiles,
         )
 
     @staticmethod
@@ -16793,6 +16796,59 @@ class TestPerKiterTmaBuilders(unittest.TestCase):
         self.assertEqual(ast.unparse(node.test), "full_tile")
         body_src = ast.unparse(ast.Module(body=node.body, type_ignores=[]))
         self.assertNotIn("tma_warp", body_src)
+
+    def test_pipeline_static_full_fast_path_shape_and_invariants(self) -> None:
+        args = self._make_args(static_full_tiles=True)
+        producer = _build_kloop_pipeline_producer_if(args)
+        self.assertIsInstance(producer, ast.If)
+        self.assertEqual(ast.unparse(producer.test), "tma_warp and next_full_tile")
+
+        consumer = _build_kloop_pipeline_consumer_if(
+            args,
+            include_scalar_fallback=False,
+        )
+        self.assertIsInstance(consumer, ast.If)
+        self.assertEqual(ast.unparse(consumer.test), "exec_active")
+
+        release = _build_kloop_pipeline_release_if(
+            args,
+            include_scalar_fallback=False,
+        )
+        self.assertIsInstance(release, ast.If)
+        self.assertEqual(ast.unparse(release.test), "exec_active")
+
+        with self.assertRaisesRegex(AssertionError, "scalar fallback"):
+            _build_kloop_pipeline_consumer_if(args)
+        with self.assertRaisesRegex(AssertionError, "scalar fallback"):
+            _build_kloop_pipeline_release_if(args)
+
+        two_cta_args = self._make_args(is_two_cta=True, static_full_tiles=True)
+        for builder in (
+            _build_kloop_pipeline_producer_if,
+            _build_kloop_pipeline_consumer_if,
+            _build_kloop_pipeline_release_if,
+        ):
+            with (
+                self.subTest(builder=builder.__name__),
+                self.assertRaisesRegex(AssertionError, "one-CTA"),
+            ):
+                if builder is _build_kloop_pipeline_producer_if:
+                    builder(two_cta_args)
+                else:
+                    builder(two_cta_args, include_scalar_fallback=False)
+
+    def test_non_pipeline_builders_reject_static_full_fast_path(self) -> None:
+        args = self._make_args(static_full_tiles=True)
+        for builder in (
+            _build_kloop_non_pipeline_producer_if,
+            _build_kloop_non_pipeline_consumer_if,
+            _build_kloop_non_pipeline_release_if,
+        ):
+            with (
+                self.subTest(builder=builder.__name__),
+                self.assertRaisesRegex(AssertionError, "pipelined all-TMA"),
+            ):
+                builder(args)
 
     def test_pipeline_consumer_if_predicate_and_body(self) -> None:
         args = self._make_args()

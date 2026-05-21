@@ -905,6 +905,10 @@ class _PerKiterTmaArgs:
     # (cute_plan.md §6.12.7). Default 1 preserves byte-identity for the
     # validated cluster_m=2 cluster_n=1 path.
     cluster_n: int = 1
+    # Static-full one-CTA pipelined TMA loops can drop the per-K runtime
+    # full-tile branch and scalar fallback. Non-pipelined/asymmetric or two-CTA
+    # TMA paths must keep the guarded fallback path.
+    static_full_tiles: bool = False
 
 
 def _kloop_tma_copy_a_src(args: _PerKiterTmaArgs, *, k_offset: str) -> str:
@@ -993,8 +997,13 @@ def _build_kloop_pipeline_producer_if(
     assert args.use_tma_a and args.use_tma_b, (
         "pipelined branch requires both A and B to be TMA-loaded"
     )
+    assert not (args.static_full_tiles and args.is_two_cta), (
+        "static-full fast path is only valid for one-CTA pipelined TMA loops"
+    )
     k_offset = f"{args.tma_k_tile} + cutlass.Int32({args.ab_stage_count})"
-    predicate_terms = [args.tma_full_tile]
+    predicate_terms = []
+    if not args.static_full_tiles:
+        predicate_terms.append(args.tma_full_tile)
     if gate_tma_warp:
         predicate_terms.append(args.tma_warp)
     predicate_terms.append(args.tma_next_full_tile)
@@ -1035,6 +1044,17 @@ def _build_kloop_pipeline_consumer_if(
     sync_before_scalar_fallback: bool = False,
 ) -> ast.stmt:
     """Per-K-iter TMA consumer / scalar-fallback ``if`` for the pipelined branch."""
+    if args.static_full_tiles:
+        assert not args.is_two_cta, (
+            "static-full fast path is only valid for one-CTA pipelined TMA loops"
+        )
+        assert gate_exec_warp, "static-full fast path requires an exec-warp gate"
+        assert not include_scalar_fallback, (
+            "static-full fast path has no scalar fallback branch"
+        )
+        assert not sync_before_scalar_fallback, (
+            "static-full fast path has no scalar fallback presync"
+        )
     if args.skip_consumer_wait:
         consumer_src = "pass"
     else:
@@ -1056,8 +1076,10 @@ def _build_kloop_pipeline_consumer_if(
             gate_exec_warp=gate_exec_warp,
             cluster_n=args.cluster_n,
         ),
-        indent="    ",
+        indent="" if args.static_full_tiles else "    ",
     )
+    if args.static_full_tiles:
+        return statement_from_string(full_tile_src)
     fallback_src = ""
     if include_scalar_fallback:
         scalar_load_a_src = textwrap.indent(ast.unparse(args.scalar_load_a), "    ")
@@ -1117,6 +1139,14 @@ def _build_kloop_pipeline_release_if(
     advance their local consumer state. Peer CTAs participate via the
     multicast mask; separate peer arrivals over-count the empty barrier.
     """
+    if args.static_full_tiles:
+        assert not args.is_two_cta, (
+            "static-full fast path is only valid for one-CTA pipelined TMA loops"
+        )
+        assert gate_exec_warp, "static-full fast path requires an exec-warp gate"
+        assert not include_scalar_fallback, (
+            "static-full fast path has no scalar fallback branch"
+        )
     release_src = f"{args.tma_pipeline}.consumer_release({args.tma_consumer_state})"
     release_gate = _tcgen05_two_cta_owner_predicate(
         args.exec_active,
@@ -1125,19 +1155,22 @@ def _build_kloop_pipeline_release_if(
         cluster_n=args.cluster_n,
     )
     advance_src = emit_pipeline_advance(args.tma_consumer_state)
+    indent = "" if args.static_full_tiles else "    "
     if args.is_two_cta:
         # With gate_exec_warp=False the caller is already inside the
         # role-local exec loop, so every iteration can advance local state.
         advance_gate = args.exec_active if gate_exec_warp else None
         full_tile_src = (
-            _tcgen05_emit_optional_gate(release_src, release_gate, indent="    ")
+            _tcgen05_emit_optional_gate(release_src, release_gate, indent=indent)
             + "\n"
-            + _tcgen05_emit_optional_gate(advance_src, advance_gate, indent="    ")
+            + _tcgen05_emit_optional_gate(advance_src, advance_gate, indent=indent)
         )
     else:
         full_tile_src = _tcgen05_emit_optional_gate(
-            release_src + "\n" + advance_src, release_gate, indent="    "
+            release_src + "\n" + advance_src, release_gate, indent=indent
         )
+    if args.static_full_tiles:
+        return statement_from_string(full_tile_src)
     fallback_src = (
         "\nelse:\n    cute.arch.sync_threads()" if include_scalar_fallback else ""
     )
@@ -1208,6 +1241,9 @@ def _build_kloop_non_pipeline_producer_if(
     offset on the cute.copy, and no ``advance`` here (the release block
     advances both producer and consumer state).
     """
+    assert not args.static_full_tiles, (
+        "static-full fast path is only valid for pipelined all-TMA K loops"
+    )
     predicate_terms = [args.tma_full_tile]
     if gate_tma_warp:
         predicate_terms.append(args.tma_warp)
@@ -1233,37 +1269,36 @@ def _build_kloop_non_pipeline_consumer_if(args: _PerKiterTmaArgs) -> ast.stmt:
     into the full-tile branch (e.g. A-TMA + B-scalar still loads B
     here on full tiles).
     """
-    scalar_load_a_src = textwrap.indent(ast.unparse(args.scalar_load_a), "    ")
-    scalar_load_b_src = textwrap.indent(ast.unparse(args.scalar_load_b), "    ")
-    scalar_load_a_tma_src = (
-        textwrap.indent(ast.unparse(args.scalar_load_a), "    ") + "\n"
-        if not args.use_tma_a
-        else ""
+    assert not args.static_full_tiles, (
+        "static-full fast path is only valid for pipelined all-TMA K loops"
     )
-    scalar_load_b_tma_src = (
-        textwrap.indent(ast.unparse(args.scalar_load_b), "    ") + "\n"
-        if not args.use_tma_b
-        else ""
-    )
-    src = (
-        f"if {args.tma_full_tile}:\n"
+    scalar_load_a_src = ast.unparse(args.scalar_load_a)
+    scalar_load_b_src = ast.unparse(args.scalar_load_b)
+    scalar_load_a_tma_src = scalar_load_a_src + "\n" if not args.use_tma_a else ""
+    scalar_load_b_tma_src = scalar_load_b_src + "\n" if not args.use_tma_b else ""
+    full_body = (
         f"{scalar_load_a_tma_src}"
         f"{scalar_load_b_tma_src}"
-        f"    if {args.exec_active}:\n"
-        "        cute.arch.sync_warp()\n"
+        f"if {args.exec_active}:\n"
+        "    cute.arch.sync_warp()\n"
         + (
-            "        pass\n"
+            "    pass\n"
             if args.skip_consumer_wait
             else (
-                f"        {args.tma_pipeline}.consumer_wait("
+                f"    {args.tma_pipeline}.consumer_wait("
                 f"{args.tma_consumer_state}, {args.tma_consumer_try_token})\n"
             )
         )
-        + "    cute.arch.sync_threads()\n"
-        + "else:\n"
-        + f"{scalar_load_a_src}\n"
-        + f"{scalar_load_b_src}\n"
-        + "    cute.arch.sync_threads()"
+        + "cute.arch.sync_threads()"
+    )
+    fallback_body = (
+        f"{scalar_load_a_src}\n{scalar_load_b_src}\ncute.arch.sync_threads()"
+    )
+    src = (
+        f"if {args.tma_full_tile}:\n"
+        f"{textwrap.indent(full_body, '    ')}\n"
+        "else:\n"
+        f"{textwrap.indent(fallback_body, '    ')}"
     )
     return statement_from_string(src)
 
@@ -1276,20 +1311,25 @@ def _build_kloop_non_pipeline_release_if(args: _PerKiterTmaArgs) -> ast.stmt:
     consumer state normally advance here. The producer advance is omitted
     only by the guarded invalid-output bridge diagnostic.
     """
+    assert not args.static_full_tiles, (
+        "static-full fast path is only valid for pipelined all-TMA K loops"
+    )
     producer_advance_src = (
-        emit_pipeline_advance(args.tma_producer_state, indent="    ") + "\n"
+        emit_pipeline_advance(args.tma_producer_state, indent="") + "\n"
         if not args.skip_producer_advance
         else ""
     )
+    full_body = (
+        "cute.arch.sync_threads()\n"
+        f"if {args.exec_active}:\n"
+        "    cute.arch.sync_warp()\n"
+        f"    {args.tma_pipeline}.consumer_release({args.tma_consumer_state})\n"
+        + producer_advance_src
+        + emit_pipeline_advance(args.tma_consumer_state, indent="")
+    )
     src = (
         f"if {args.tma_full_tile}:\n"
-        "    cute.arch.sync_threads()\n"
-        f"    if {args.exec_active}:\n"
-        "        cute.arch.sync_warp()\n"
-        f"        {args.tma_pipeline}.consumer_release({args.tma_consumer_state})\n"
-        + producer_advance_src
-        + emit_pipeline_advance(args.tma_consumer_state, indent="    ")
-        + "\n"
+        f"{textwrap.indent(full_body, '    ')}\n"
         "else:\n"
         "    cute.arch.sync_threads()"
     )
@@ -1970,6 +2010,12 @@ def _emit_mma_pipeline(
     )
     # Keep a distinct name so future MMA-exec gating changes are localized.
     tcgen05_use_role_local_mma_exec = tcgen05_use_role_local_tma_producer
+    tcgen05_static_full_tma_fast_path = (
+        tcgen05_static_full_tiles
+        and tcgen05_use_tma_pipeline
+        and not tcgen05_is_two_cta
+        and not tcgen05_use_role_local_mma_exec
+    )
     tcgen05_acc_producer_mode = df.config.get(
         TCGEN05_ACC_PRODUCER_MODE_CONFIG_KEY,
         TCGEN05_ACC_PRODUCER_MODE_NORMAL,
@@ -3954,6 +4000,7 @@ def _emit_mma_pipeline(
         mma_stage_stmt: ast.stmt | None = None
         smem_a_mma_stmt: ast.stmt | None = None
         smem_b_mma_stmt: ast.stmt | None = None
+        tma_full_tile_predicate_src: str | None = None
         tma_full_tile_stmt: ast.stmt | None = None
         if mma_impl == "tcgen05":
             assert tcgen05_plan is not None
@@ -4001,16 +4048,17 @@ def _emit_mma_pipeline(
                 tma_k_tile_stmt = statement_from_string(
                     f"{tma_k_tile} = {k_offset_var} // cutlass.Int32({bk})"
                 )
+                tma_full_tile_predicate_src = _tcgen05_tma_tile_predicate(
+                    k_tile_start_expr=k_offset_var,
+                    full_tile_end_expr=f"{k_offset_var} + cutlass.Int32({bk})",
+                )
                 tma_full_tile_stmt = statement_from_string(
-                    f"{tma_full_tile} = "
-                    + _tcgen05_tma_tile_predicate(
-                        k_tile_start_expr=k_offset_var,
-                        full_tile_end_expr=f"{k_offset_var} + cutlass.Int32({bk})",
-                    )
+                    f"{tma_full_tile} = " + tma_full_tile_predicate_src
                 )
                 if not tcgen05_use_role_local_mma_exec:
                     cg.add_statement(tma_k_tile_stmt)
-                    cg.add_statement(tma_full_tile_stmt)
+                    if not tcgen05_static_full_tma_fast_path:
+                        cg.add_statement(tma_full_tile_stmt)
         smem_a_store = f"{smem_a}[_row, _col]"
         smem_b_store = f"{smem_b}[_row, _col]"
         if mma_impl == "tcgen05":
@@ -4081,19 +4129,21 @@ def _emit_mma_pipeline(
                 scalar_load_a=scalar_load_a,
                 scalar_load_b=scalar_load_b,
                 cluster_n=tcgen05_cluster_n,
+                static_full_tiles=tcgen05_static_full_tma_fast_path,
             )
             if tcgen05_use_tma_pipeline:
                 if tcgen05_use_role_local_tma_producer:
+                    # The static-full fast path is non-role-local only; the
+                    # role-local loops keep the full-tile predicate and scalar
+                    # fallback structure.
+                    assert not tcgen05_static_full_tma_fast_path
+                    assert tma_full_tile_predicate_src is not None
                     producer_loop_body: list[ast.stmt] = [
                         statement_from_string(
                             f"{tma_k_tile} = {k_offset_var} // cutlass.Int32({bk})"
                         ),
                         statement_from_string(
-                            f"{tma_full_tile} = "
-                            + _tcgen05_tma_tile_predicate(
-                                k_tile_start_expr=k_offset_var,
-                                full_tile_end_expr=f"{k_offset_var} + cutlass.Int32({bk})",
-                            )
+                            f"{tma_full_tile} = " + tma_full_tile_predicate_src
                         ),
                         statement_from_string(
                             f"{tma_next_full_tile} = "
@@ -4120,6 +4170,7 @@ def _emit_mma_pipeline(
                     assert smem_a_mma_stmt is not None
                     assert smem_b_mma_stmt is not None
                     assert tma_full_tile_stmt is not None
+                    assert not tcgen05_static_full_tma_fast_path
                     exec_loop_body: list[ast.stmt] = [
                         mma_stage_stmt,
                         smem_a_mma_stmt,
@@ -4220,8 +4271,12 @@ def _emit_mma_pipeline(
                     cg.add_statement(
                         _build_kloop_pipeline_consumer_if(
                             tma_kloop_args,
+                            include_scalar_fallback=(
+                                not tcgen05_static_full_tma_fast_path
+                            ),
                             sync_before_scalar_fallback=(
                                 tcgen05_sync_before_scalar_fallback
+                                and not tcgen05_static_full_tma_fast_path
                             ),
                         )
                     )
@@ -4315,7 +4370,12 @@ def _emit_mma_pipeline(
                     assert tma_kloop_args is not None
                     if tcgen05_use_tma_pipeline:
                         cg.add_statement(
-                            _build_kloop_pipeline_release_if(tma_kloop_args)
+                            _build_kloop_pipeline_release_if(
+                                tma_kloop_args,
+                                include_scalar_fallback=(
+                                    not tcgen05_static_full_tma_fast_path
+                                ),
+                            )
                         )
                     else:
                         cg.add_statement(
