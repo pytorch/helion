@@ -140,6 +140,8 @@ from helion._compiler.cute.tcgen05_constants import (
 )
 from helion._compiler.cute.tcgen05_constants import TCGEN05_AUX_LOAD_MODE_CONFIG_KEY
 from helion._compiler.cute.tcgen05_constants import TCGEN05_AUX_LOAD_MODE_TMA
+from helion._compiler.cute.tcgen05_constants import TCGEN05_AUX_STAGE_COUNT_DEFAULT
+from helion._compiler.cute.tcgen05_constants import TCGEN05_AUX_STAGES_CONFIG_KEY
 from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_C_ACQUIRE_PLACEMENT_CONFIG_KEY,
 )
@@ -150,6 +152,8 @@ from helion._compiler.cute.tcgen05_constants import TCGEN05_C_ACQUIRE_PLACEMENT_
 from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_CLUSTER_M2_ONE_CTA_ROLE_LOCAL_CONFIG_KEY,
 )
+from helion._compiler.cute.tcgen05_constants import TCGEN05_CONSUMER_REGS_CONFIG_KEY
+from helion._compiler.cute.tcgen05_constants import TCGEN05_CONSUMER_REGS_DEFAULT
 from helion._compiler.cute.tcgen05_constants import TCGEN05_CUBIN_LINEINFO_CONFIG_KEY
 from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_DIAGNOSTIC_INVALID_OUTPUT_CONFIG_KEY,
@@ -17619,6 +17623,354 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
         aux_create_end = code.find(")", aux_create_idx)
         aux_create_call = code[aux_create_idx:aux_create_end]
         self.assertIn("defer_sync=True", aux_create_call)
+
+    def test_tcgen05_aux_stages_default_emits_two_stage_pipeline(self) -> None:
+        """Cycle 10 hypothesis 1 (T8): without the
+        ``tcgen05_aux_stages`` knob, the aux SMEM-ring pipeline
+        emits the historical 2-stage default (``num_stages=2``,
+        ``barrier_storage`` allocates ``stage_count * 2 = 4``
+        mbarriers, and the layout helper passes ``2`` for the
+        stage axis). This pins T1-T7 byte-identity at the default
+        knob value.
+        """
+        kernel = self._residual_kernel()
+        args = (
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+        )
+        config = self._canonical_c_input_config()
+        # No explicit aux_stages override; default must be 2.
+        self.assertEqual(TCGEN05_AUX_STAGE_COUNT_DEFAULT, 2)
+        self.assertNotIn(TCGEN05_AUX_STAGES_CONFIG_KEY, config.config)
+        with patch_cute_mma_support():
+            bound = kernel.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            code = bound.to_triton_code(config)
+
+        # 2-stage default: PipelineAsync.create takes num_stages=2.
+        self.assertIn(
+            "tcgen05_aux_pipeline = cutlass.pipeline.PipelineAsync.create(num_stages=2",
+            code,
+        )
+        # mbarrier alloc sizes stage_count * 2 = 4.
+        self.assertIn(
+            "tcgen05_aux_pipeline_mbars = cute.arch.alloc_smem("
+            "cutlass.Int64, cutlass.Int32(4))",
+            code,
+        )
+        # PipelineUserType.Producer / Consumer state init passes
+        # the stage count (2) verbatim.
+        self.assertIn(
+            "tcgen05_aux_pipeline_producer_state = "
+            "cutlass.pipeline.make_pipeline_state("
+            "cutlass.pipeline.PipelineUserType.Producer, 2)",
+            code,
+        )
+        self.assertIn(
+            "tcgen05_aux_pipeline_consumer_state = "
+            "cutlass.pipeline.make_pipeline_state("
+            "cutlass.pipeline.PipelineUserType.Consumer, 2)",
+            code,
+        )
+
+    def test_tcgen05_aux_stages_three_emits_three_stage_pipeline(self) -> None:
+        """Cycle 10 hypothesis 1 (T8): with the explicit
+        ``tcgen05_aux_stages=3`` knob, the aux SMEM-ring pipeline
+        emits a 3-stage pipeline (``num_stages=3``,
+        ``barrier_storage`` allocates ``stage_count * 2 = 6``
+        mbarriers, and Producer/Consumer state init passes
+        ``3``). The autotuner samples ``{2, 3}`` only for the T8
+        wide-N CLC + aux-TMA seed family; the default remains 2
+        so T1-T7 stay byte-identical.
+        """
+        kernel = self._residual_kernel()
+        args = (
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+        )
+        config = self._canonical_c_input_config()
+        config.config[TCGEN05_AUX_STAGES_CONFIG_KEY] = 3
+        with patch_cute_mma_support():
+            bound = kernel.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            code = bound.to_triton_code(config)
+
+        # 3-stage path: num_stages=3 lands on the PipelineAsync.create.
+        self.assertIn(
+            "tcgen05_aux_pipeline = cutlass.pipeline.PipelineAsync.create(num_stages=3",
+            code,
+        )
+        # mbarrier alloc grows to stage_count * 2 = 6 entries.
+        self.assertIn(
+            "tcgen05_aux_pipeline_mbars = cute.arch.alloc_smem("
+            "cutlass.Int64, cutlass.Int32(6))",
+            code,
+        )
+        # PipelineUserType.Producer / Consumer state init reads the
+        # bumped stage count.
+        self.assertIn(
+            "tcgen05_aux_pipeline_producer_state = "
+            "cutlass.pipeline.make_pipeline_state("
+            "cutlass.pipeline.PipelineUserType.Producer, 3)",
+            code,
+        )
+        self.assertIn(
+            "tcgen05_aux_pipeline_consumer_state = "
+            "cutlass.pipeline.make_pipeline_state("
+            "cutlass.pipeline.PipelineUserType.Consumer, 3)",
+            code,
+        )
+        # 2-stage barrier alloc must not also appear at the 3-stage
+        # config so a future leak that double-allocates lands
+        # intentionally.
+        self.assertNotIn(
+            "tcgen05_aux_pipeline_mbars = cute.arch.alloc_smem("
+            "cutlass.Int64, cutlass.Int32(4))",
+            code,
+        )
+
+    def test_tcgen05_aux_stages_three_runtime_correctness(self) -> None:
+        """Runtime smoke test for the cycle-10 ``tcgen05_aux_stages=3``
+        knob. Confirms a 3-stage aux pipeline composes through the
+        producer + consumer flip without deadlock and produces
+        output within bf16 tolerance of the eager reference for the
+        canonical c_input=1 + residual lowering.
+        """
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+
+        torch.manual_seed(0)
+        x = torch.randn(1024, 1024, dtype=torch.bfloat16, device=DEVICE)
+        y = torch.randn(1024, 1024, dtype=torch.bfloat16, device=DEVICE)
+        residual = torch.randn(1024, 1024, dtype=torch.bfloat16, device=DEVICE)
+        kernel = self._residual_kernel()
+        config = self._canonical_c_input_config()
+        config.config[TCGEN05_AUX_STAGES_CONFIG_KEY] = 3
+        bound = kernel.bind((x, y, residual))
+        bound.env.config_spec.cute_tcgen05_search_enabled = True
+        bound.set_config(config)
+        out = bound(x, y, residual)
+        expected = (x @ y + residual).to(x.dtype)
+        torch.testing.assert_close(out, expected, atol=2e-1, rtol=1e-2)
+
+    def test_tcgen05_aux_stages_default_emits_two_stage_tma_pipeline(self) -> None:
+        """Cycle 10 hypothesis 1 (T8) — TMA aux-load branch: without
+        the ``tcgen05_aux_stages`` knob, the TMA aux pipeline emits
+        the historical 2-stage default. Pins
+        ``PipelineTmaAsync.create(num_stages=2,...)``, the
+        ``stage_count * 2 = 4`` mbarrier alloc, the ``tcgen05_aux_tma``
+        wrapper-plan ``stage_count`` entry, and Producer/Consumer
+        state init at 2. The TMA branch is the structural target
+        of the cycle-10 knob (the T8 wide-N CLC + aux-TMA seed
+        family runs under ``aux_load_mode=tma``).
+        """
+        kernel = self._residual_kernel()
+        args = (
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+        )
+        config = self._canonical_c_input_config()
+        config.config[TCGEN05_AUX_LOAD_MODE_CONFIG_KEY] = TCGEN05_AUX_LOAD_MODE_TMA
+        self.assertNotIn(TCGEN05_AUX_STAGES_CONFIG_KEY, config.config)
+        with patch_cute_mma_support():
+            bound = kernel.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            code = bound.to_triton_code(config)
+
+        # TMA branch emits PipelineTmaAsync.create with num_stages=2.
+        self.assertIn(
+            "tcgen05_aux_pipeline = cutlass.pipeline.PipelineTmaAsync.create("
+            "num_stages=2",
+            code,
+        )
+        self.assertNotIn(
+            "tcgen05_aux_pipeline = cutlass.pipeline.PipelineAsync.create(",
+            code,
+        )
+        # Wrapper-plan stage_count carries the same value the codegen used.
+        self.assertIn("'kind': 'tcgen05_aux_tma'", code)
+        self.assertIn("'stage_count': 2", code)
+        self.assertNotIn("'stage_count': 3", code)
+        # mbarrier alloc sizes stage_count * 2 = 4.
+        self.assertIn(
+            "tcgen05_aux_pipeline_mbars = cute.arch.alloc_smem("
+            "cutlass.Int64, cutlass.Int32(4))",
+            code,
+        )
+        self.assertIn(
+            "tcgen05_aux_pipeline_producer_state = "
+            "cutlass.pipeline.make_pipeline_state("
+            "cutlass.pipeline.PipelineUserType.Producer, 2)",
+            code,
+        )
+        self.assertIn(
+            "tcgen05_aux_pipeline_consumer_state = "
+            "cutlass.pipeline.make_pipeline_state("
+            "cutlass.pipeline.PipelineUserType.Consumer, 2)",
+            code,
+        )
+
+    def test_tcgen05_aux_stages_three_emits_three_stage_tma_pipeline(self) -> None:
+        """Cycle 10 hypothesis 1 (T8) — TMA aux-load branch: with
+        the explicit ``tcgen05_aux_stages=3`` knob, the TMA aux
+        pipeline emits a 3-stage pipeline. Pins
+        ``PipelineTmaAsync.create(num_stages=3,...)``, the
+        ``stage_count * 2 = 6`` mbarrier alloc, the
+        ``tcgen05_aux_tma`` wrapper-plan ``stage_count=3`` entry,
+        and Producer/Consumer state init at 3.
+        """
+        kernel = self._residual_kernel()
+        args = (
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+        )
+        config = self._canonical_c_input_config()
+        config.config[TCGEN05_AUX_LOAD_MODE_CONFIG_KEY] = TCGEN05_AUX_LOAD_MODE_TMA
+        config.config[TCGEN05_AUX_STAGES_CONFIG_KEY] = 3
+        with patch_cute_mma_support():
+            bound = kernel.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            code = bound.to_triton_code(config)
+
+        # TMA branch: num_stages=3 lands on PipelineTmaAsync.create.
+        self.assertIn(
+            "tcgen05_aux_pipeline = cutlass.pipeline.PipelineTmaAsync.create("
+            "num_stages=3",
+            code,
+        )
+        self.assertNotIn(
+            "tcgen05_aux_pipeline = cutlass.pipeline.PipelineAsync.create(",
+            code,
+        )
+        # Wrapper-plan stage_count carries the bumped value so the
+        # host-side TMA atom builder allocates a 3-stage SMEM ring
+        # consistent with the kernel-side mbarrier count.
+        self.assertIn("'kind': 'tcgen05_aux_tma'", code)
+        self.assertIn("'stage_count': 3", code)
+        self.assertNotIn("'stage_count': 2", code)
+        # mbarrier alloc grows to stage_count * 2 = 6 entries.
+        self.assertIn(
+            "tcgen05_aux_pipeline_mbars = cute.arch.alloc_smem("
+            "cutlass.Int64, cutlass.Int32(6))",
+            code,
+        )
+        self.assertIn(
+            "tcgen05_aux_pipeline_producer_state = "
+            "cutlass.pipeline.make_pipeline_state("
+            "cutlass.pipeline.PipelineUserType.Producer, 3)",
+            code,
+        )
+        self.assertIn(
+            "tcgen05_aux_pipeline_consumer_state = "
+            "cutlass.pipeline.make_pipeline_state("
+            "cutlass.pipeline.PipelineUserType.Consumer, 3)",
+            code,
+        )
+        # 2-stage mbarrier alloc must not also appear so a future
+        # double-alloc leak lands intentionally.
+        self.assertNotIn(
+            "tcgen05_aux_pipeline_mbars = cute.arch.alloc_smem("
+            "cutlass.Int64, cutlass.Int32(4))",
+            code,
+        )
+
+    def test_tcgen05_consumer_regs_default_emits_256(self) -> None:
+        """Cycle 15 hypothesis 2 (T8): without the
+        ``tcgen05_consumer_regs`` knob, the consumer-warp register
+        ceiling stays at the historical 256 default — preserving the
+        cycle-14 baseline emission. The matching
+        ``setmaxregister_decrease(120)`` for non-consumer warps is
+        unaffected.
+        """
+        kernel = self._residual_kernel()
+        args = (
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+        )
+        config = self._canonical_c_input_config()
+        # No explicit consumer_regs override; default must be 256.
+        self.assertEqual(TCGEN05_CONSUMER_REGS_DEFAULT, 256)
+        self.assertNotIn(TCGEN05_CONSUMER_REGS_CONFIG_KEY, config.config)
+        with patch_cute_mma_support():
+            bound = kernel.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            code = bound.to_triton_code(config)
+
+        # Consumer warps still raise to the 256-reg default.
+        self.assertIn("cute.arch.setmaxregister_increase(256)", code)
+        # The producer-side decrease stays at 120 regardless of the
+        # consumer ceiling.
+        self.assertIn("cute.arch.setmaxregister_decrease(120)", code)
+        # Lower caps must not leak in at the default.
+        self.assertNotIn("cute.arch.setmaxregister_increase(224)", code)
+        self.assertNotIn("cute.arch.setmaxregister_increase(232)", code)
+        self.assertNotIn("cute.arch.setmaxregister_increase(240)", code)
+
+    def test_tcgen05_consumer_regs_224_emits_224(self) -> None:
+        """Cycle 15 hypothesis 2 (T8): with the explicit
+        ``tcgen05_consumer_regs=224`` knob, the consumer-warp
+        ``setmaxregister_increase`` call emits the lowered cap. Lower
+        caps force ``ptxas`` to either coalesce live ranges or spill
+        rather than reserving at the natural 255-reg peak — the
+        cycle-15 H2 mechanism. The producer-side
+        ``setmaxregister_decrease(120)`` is unchanged.
+        """
+        kernel = self._residual_kernel()
+        args = (
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+        )
+        config = self._canonical_c_input_config()
+        config.config[TCGEN05_CONSUMER_REGS_CONFIG_KEY] = 224
+        with patch_cute_mma_support():
+            bound = kernel.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            code = bound.to_triton_code(config)
+
+        # Lowered consumer ceiling lands in the prefix.
+        self.assertIn("cute.arch.setmaxregister_increase(224)", code)
+        # 256 must not also appear so a future leak that double-emits
+        # the old ceiling lands intentionally.
+        self.assertNotIn("cute.arch.setmaxregister_increase(256)", code)
+        # Producer-side decrease stays put.
+        self.assertIn("cute.arch.setmaxregister_decrease(120)", code)
+
+    def test_tcgen05_consumer_regs_240_runtime_correctness(self) -> None:
+        """Runtime smoke test for the cycle-15
+        ``tcgen05_consumer_regs=240`` knob. Confirms a reduced
+        consumer-warp register ceiling composes through the matmul +
+        residual lowering without correctness regression at bf16
+        tolerance. The cap is the minimum knob value that should
+        leave the kernel comfortably above ptxas's natural 255-reg
+        ceiling target; the lower caps (224 / 232) may trigger spill
+        but should still be numerically correct on T8-style shapes.
+        """
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+
+        torch.manual_seed(0)
+        x = torch.randn(1024, 1024, dtype=torch.bfloat16, device=DEVICE)
+        y = torch.randn(1024, 1024, dtype=torch.bfloat16, device=DEVICE)
+        residual = torch.randn(1024, 1024, dtype=torch.bfloat16, device=DEVICE)
+        kernel = self._residual_kernel()
+        config = self._canonical_c_input_config()
+        config.config[TCGEN05_CONSUMER_REGS_CONFIG_KEY] = 240
+        bound = kernel.bind((x, y, residual))
+        bound.env.config_spec.cute_tcgen05_search_enabled = True
+        bound.set_config(config)
+        out = bound(x, y, residual)
+        expected = (x @ y + residual).to(x.dtype)
+        torch.testing.assert_close(out, expected, atol=2e-1, rtol=1e-2)
 
     def test_c_input_role_local_while_not_emitted_without_residual(self) -> None:
         """``c_input_warps=1`` without any aux residual leaves the

@@ -71,12 +71,16 @@ from .tcgen05_constants import TCGEN05_AUX_LOAD_MODE_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_AUX_LOAD_MODE_SIMT
 from .tcgen05_constants import TCGEN05_AUX_LOAD_MODE_TMA
 from .tcgen05_constants import TCGEN05_AUX_LOAD_MODES
+from .tcgen05_constants import TCGEN05_AUX_STAGE_COUNT_CHOICES
+from .tcgen05_constants import TCGEN05_AUX_STAGES_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_C_ACQUIRE_PLACEMENT_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_C_ACQUIRE_PLACEMENTS
 from .tcgen05_constants import TCGEN05_C_STORE_MODE_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_C_STORE_MODE_NORMAL
 from .tcgen05_constants import TCGEN05_C_STORE_MODES
 from .tcgen05_constants import TCGEN05_CLUSTER_M2_ONE_CTA_ROLE_LOCAL_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_CONSUMER_REGS_CHOICES
+from .tcgen05_constants import TCGEN05_CONSUMER_REGS_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_CUBIN_LINEINFO_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_DIAGNOSTIC_INVALID_OUTPUT_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_DIRECT_ENTRY_PLAN_CONFIG_KEY
@@ -196,7 +200,9 @@ CUTE_TCGEN05_DIAGNOSTIC_CONFIG_KEYS: frozenset[str] = frozenset(
         TCGEN05_ACC_PRODUCER_ADVANCE_MODE_CONFIG_KEY,
         TCGEN05_ACC_PRODUCER_MODE_CONFIG_KEY,
         TCGEN05_AUX_LOAD_MODE_CONFIG_KEY,
+        TCGEN05_AUX_STAGES_CONFIG_KEY,
         TCGEN05_CLUSTER_M2_ONE_CTA_ROLE_LOCAL_CONFIG_KEY,
+        TCGEN05_CONSUMER_REGS_CONFIG_KEY,
         TCGEN05_CUBIN_LINEINFO_CONFIG_KEY,
         TCGEN05_DIAGNOSTIC_INVALID_OUTPUT_CONFIG_KEY,
         TCGEN05_DIRECT_ENTRY_PLAN_CONFIG_KEY,
@@ -2441,6 +2447,64 @@ class CuteTcgen05Config:
             )
         }
 
+    def aux_stages_autotune_fragments(self) -> dict[str, ConfigSpecFragment]:
+        """Per-config aux-pipeline stage-count knob (cycle 10 hypothesis 1
+        for Target 8 ``cute_plan.md`` §6).
+
+        Cycle 10 admits ``tcgen05_aux_stages`` into autotune search only
+        for the T8 wide-N CLC + aux-TMA seed family. The same gate that
+        admits the aux-TMA load mode (``_aux_tma_search_enabled``)
+        controls this knob — that gate already pins the surface to the
+        validated edge+K-tail family with ``cluster_m=2`` and the
+        c-input warp + aux-TMA combination, which is where the cycle-9
+        NCU diagnosis localized the T8 in-kernel stall budget. T1-T7
+        configs (no aux-TMA admission, no edge+K-tail family) never see
+        the knob, so their codegen stays byte-identical to pre-cycle-10
+        emission at the default of 2.
+        """
+        if not self._aux_tma_search_enabled():
+            return {}
+        return {
+            TCGEN05_AUX_STAGES_CONFIG_KEY: EnumFragment(TCGEN05_AUX_STAGE_COUNT_CHOICES)
+        }
+
+    def consumer_regs_autotune_fragments(self) -> dict[str, ConfigSpecFragment]:
+        """Per-config consumer-warp ``setmaxregister_increase`` ceiling
+        knob (cycle 15 hypothesis 2 for Target 8 ``cute_plan.md`` §6).
+
+        The cycle-13 Deep Replan flagged the consumer-warp register
+        envelope (255 regs/thread on Helion vs 199 on Quack) as the
+        dominant in-kernel structural delta on Target 8. Cycle 14
+        attempted a source-level rmem-allocation fold (H1) and the
+        NCU register count stayed at 255 — ``ptxas`` does its own
+        register allocation independent of source-level SSA names.
+        Cycle 15 attacks the same envelope through the ``ptxas``-
+        visible ``setmaxregister_increase`` ceiling instead: lowering
+        it from 256 forces ``ptxas`` to either coalesce live ranges
+        or spill, both of which can free SM occupancy headroom (the
+        cycle-9 NCU baseline measured ``warps_active=11.44%``).
+
+        Admission mirrors ``aux_stages_autotune_fragments``: the
+        ``_aux_tma_search_enabled`` gate pins the search to the
+        validated T8 wide-N CLC + aux-TMA seed family with the
+        c-input warp + aux-TMA combination, which is exactly where
+        the register-pressure delta lives. T1-T7 configs (no aux-TMA
+        admission) never see the knob, so their codegen stays
+        byte-identical to pre-cycle-15 emission at the 256 default.
+        The default value (256) is included in
+        ``TCGEN05_CONSUMER_REGS_CHOICES`` so the default-with-knob
+        configuration emits the same code as the default-without-knob
+        configuration (zero codegen drift if the autotuner happens
+        to pick 256).
+        """
+        if not self._aux_tma_search_enabled():
+            return {}
+        return {
+            TCGEN05_CONSUMER_REGS_CONFIG_KEY: EnumFragment(
+                TCGEN05_CONSUMER_REGS_CHOICES
+            )
+        }
+
     def persistence_model_autotune_fragments(self) -> dict[str, ConfigSpecFragment]:
         if not self._clc_persistence_search_enabled():
             return {}
@@ -2684,6 +2748,18 @@ class CuteTcgen05Config:
             config,
             TCGEN05_AUX_LOAD_MODE_CONFIG_KEY,
             TCGEN05_AUX_LOAD_MODES,
+            fix_invalid=fix_invalid,
+        )
+        self._validate_int_enum_config(
+            config,
+            TCGEN05_AUX_STAGES_CONFIG_KEY,
+            TCGEN05_AUX_STAGE_COUNT_CHOICES,
+            fix_invalid=fix_invalid,
+        )
+        self._validate_int_enum_config(
+            config,
+            TCGEN05_CONSUMER_REGS_CONFIG_KEY,
+            TCGEN05_CONSUMER_REGS_CHOICES,
             fix_invalid=fix_invalid,
         )
         self._validate_bool_config(
@@ -3007,6 +3083,8 @@ class CuteTcgen05Config:
         fields.update(self.optional_fragments(for_search=True))
         fields.update(self.strategy_autotune_fragments())
         fields.update(self.aux_load_mode_autotune_fragments())
+        fields.update(self.aux_stages_autotune_fragments())
+        fields.update(self.consumer_regs_autotune_fragments())
         fields.update(self.persistence_model_autotune_fragments())
         if self.config_spec.supports_config_key("pid_type"):
             fields["pid_type"] = EnumFragment(self.allowed_pid_types)
