@@ -77,6 +77,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         self.host_statements: list[ast.AST] = []
         self.module_statements: list[ast.stmt] = []
         self.cute_wrapper_plans: list[dict[str, object]] = []
+        self.cute_uses_matmul: bool = False
         self.statements_stack: list[list[ast.AST]] = [self.host_statements]
         self.on_device = False
         self.active_device_loops: dict[int, list[DeviceLoopOrGridState]] = (
@@ -871,6 +872,13 @@ def generate_ast(
                 else []
             )
             final_host_statements = rng_statements + codegen.host_statements
+            if codegen.cute_uses_matmul or codegen.cute_wrapper_plans:
+                final_host_statements = [
+                    statement_from_string(
+                        f"{codegen.device_function.name}._helion_cute_disable_bake_tensor_shapes = True"
+                    ),
+                    *final_host_statements,
+                ]
             if codegen.cute_wrapper_plans:
                 launcher_arg_positions: dict[str, int] = {}
                 for idx, arg in enumerate(
