@@ -82,14 +82,11 @@ from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_STAGE_CONFIGS
 from .tcgen05_constants import TCGEN05_ONE_CTA_MAX_BLOCK_M
 from .tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
 from .tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
-from .tcgen05_constants import TCGEN05_TWO_CTA_EDGE_K_TAIL_AB_STAGES
-from .tcgen05_constants import TCGEN05_TWO_CTA_EDGE_K_TAIL_ACC_STAGES
 from .tcgen05_constants import TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K
-from .tcgen05_constants import TCGEN05_TWO_CTA_EDGE_K_TAIL_C_STAGES
 from .tcgen05_constants import TCGEN05_TWO_CTA_MAX_K_TILES
-from .tcgen05_constants import TCGEN05_TWO_CTA_SEED_L2_GROUPING
 from .tcgen05_constants import TCGEN05_TWO_CTA_SEED_PID_TYPE
 from .tcgen05_constants import tcgen05_ab_smem_bytes_per_cta
+from .tcgen05_constants import tcgen05_two_cta_edge_k_tail_seed_overrides
 
 if TYPE_CHECKING:
     from ...autotuner.block_id_sequence import BlockIdSequence
@@ -295,9 +292,6 @@ class CuteTcgen05Config:
                 TCGEN05_TWO_CTA_BLOCK_N,
                 bk,
             ],
-            "l2_groupings": [
-                TCGEN05_TWO_CTA_SEED_L2_GROUPING if edge_k_tail_family else 1
-            ],
             "pid_type": TCGEN05_TWO_CTA_SEED_PID_TYPE,
             "tcgen05_cluster_m": 2,
             "tcgen05_num_epi_warps": 4,
@@ -309,17 +303,18 @@ class CuteTcgen05Config:
             TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY: 1,
         }
         if edge_k_tail_family:
-            seed_config["tcgen05_acc_stages"] = TCGEN05_TWO_CTA_EDGE_K_TAIL_ACC_STAGES
-            seed_config["tcgen05_c_stages"] = TCGEN05_TWO_CTA_EDGE_K_TAIL_C_STAGES
+            seed_config.update(tcgen05_two_cta_edge_k_tail_seed_overrides())
             seed_config["indexing"] = [
                 "tensor_descriptor"
             ] * self.config_spec.indexing.length
-        elif self.config_spec.indexing.length == 3:
-            seed_config["indexing"] = [
-                "tensor_descriptor",
-                "tensor_descriptor",
-                "tensor_descriptor",
-            ]
+        else:
+            seed_config["l2_groupings"] = [1]
+            if self.config_spec.indexing.length == 3:
+                seed_config["indexing"] = [
+                    "tensor_descriptor",
+                    "tensor_descriptor",
+                    "tensor_descriptor",
+                ]
         return Config(**seed_config)
 
     def autotune_seed_configs(self) -> list[Config]:
@@ -357,9 +352,11 @@ class CuteTcgen05Config:
         block_sizes[0] = TCGEN05_TWO_CTA_BLOCK_M
         block_sizes[1] = TCGEN05_TWO_CTA_BLOCK_N
         if edge_k_tail_family:
-            config["tcgen05_ab_stages"] = TCGEN05_TWO_CTA_EDGE_K_TAIL_AB_STAGES
-            config["tcgen05_acc_stages"] = TCGEN05_TWO_CTA_EDGE_K_TAIL_ACC_STAGES
-            config["tcgen05_c_stages"] = TCGEN05_TWO_CTA_EDGE_K_TAIL_C_STAGES
+            # This family is pinned to the measured production tuple after
+            # search projection. The placement keys remain available for
+            # non-edge diagnostic/search paths, but edge+K-tail candidates do
+            # not explore partially mutated placement variants.
+            config.update(tcgen05_two_cta_edge_k_tail_seed_overrides())
             if self.aux_kernel_detected and self._has_any_matmul_fact_edge_tile(config):
                 self._set_aux_edge_cluster_m2_prefix(config)
 

@@ -18,7 +18,15 @@ TCGEN05_TWO_CTA_EDGE_K_TAIL_MIN_DIM = 4096
 TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K = 128
 TCGEN05_TWO_CTA_EDGE_K_TAIL_AB_STAGES = 2
 TCGEN05_TWO_CTA_EDGE_K_TAIL_ACC_STAGES = 1
-TCGEN05_TWO_CTA_EDGE_K_TAIL_C_STAGES = 4
+# The 5000x5000x5000 bias_residual_gelu edge+K-tail reference sweep on B200
+# showed the hybrid TMA/SIMT store running faster with two C-store stages than
+# with the earlier four-stage seed.
+TCGEN05_TWO_CTA_EDGE_K_TAIL_C_STAGES = 2
+# The same target8 sweep converged on a smaller L2 scheduler group plus the
+# four-tile L2 swizzle. Keep these with the edge+K-tail stage tuple so the
+# seeded/fixed CtaGroup.TWO family starts at the measured production row.
+TCGEN05_TWO_CTA_EDGE_K_TAIL_L2_GROUPING = 2
+TCGEN05_TWO_CTA_EDGE_K_TAIL_L2_SWIZZLE_SIZE = 4
 TCGEN05_TWO_CTA_EDGE_TMA_STORE_MAX_AB_STAGES = 2
 assert (
     TCGEN05_TWO_CTA_EDGE_K_TAIL_AB_STAGES
@@ -88,8 +96,10 @@ def tcgen05_ab_smem_bytes_per_cta(
     return ab_stages * (a_per_stage + b_per_stage)
 
 
-# Diagnostic-only C-store acquire placement knob. Keeping this in Config makes
-# generated-code changes visible to BoundKernel's Config-keyed compile cache.
+# C-store epilogue placement knobs. Keeping these in Config makes generated-code
+# changes visible to BoundKernel's Config-keyed compile cache; most values are
+# used for diagnostics, while the output-edge + K-tail seed uses the measured
+# faster first-in-loop / before-subtile-loop pair.
 TCGEN05_C_ACQUIRE_PLACEMENT_CONFIG_KEY = "tcgen05_c_acquire_placement"
 TCGEN05_C_ACQUIRE_PLACEMENT_PRE_LOOP = "pre_loop"
 TCGEN05_C_ACQUIRE_PLACEMENT_FIRST_IN_LOOP = "first_in_loop"
@@ -106,6 +116,25 @@ TCGEN05_ACC_WAIT_PLACEMENTS = (
     TCGEN05_ACC_WAIT_PLACEMENT_SUBTILE_LOOP,
     TCGEN05_ACC_WAIT_PLACEMENT_BEFORE_SUBTILE_LOOP,
 )
+
+
+def tcgen05_two_cta_edge_k_tail_seed_overrides() -> dict[str, object]:
+    """Return the measured CtaGroup.TWO edge+K-tail seed/fixup knobs."""
+    return {
+        "tcgen05_ab_stages": TCGEN05_TWO_CTA_EDGE_K_TAIL_AB_STAGES,
+        "tcgen05_acc_stages": TCGEN05_TWO_CTA_EDGE_K_TAIL_ACC_STAGES,
+        "tcgen05_c_stages": TCGEN05_TWO_CTA_EDGE_K_TAIL_C_STAGES,
+        "l2_groupings": [TCGEN05_TWO_CTA_EDGE_K_TAIL_L2_GROUPING],
+        "tcgen05_l2_swizzle_size": TCGEN05_TWO_CTA_EDGE_K_TAIL_L2_SWIZZLE_SIZE,
+        TCGEN05_ACC_WAIT_PLACEMENT_CONFIG_KEY: (
+            TCGEN05_ACC_WAIT_PLACEMENT_BEFORE_SUBTILE_LOOP
+        ),
+        TCGEN05_C_ACQUIRE_PLACEMENT_CONFIG_KEY: (
+            TCGEN05_C_ACQUIRE_PLACEMENT_FIRST_IN_LOOP
+        ),
+    }
+
+
 TCGEN05_EPILOGUE_LAYOUT_CONFIG_KEY = "tcgen05_epilogue_layout"
 TCGEN05_EPILOGUE_LAYOUT_NORMAL = "normal"
 # Diagnostic-only layout split for the role-local TMA-store epilogue.

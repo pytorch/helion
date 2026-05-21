@@ -117,6 +117,22 @@ from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_ACC_PRODUCER_ADVANCE_MODE_SKIP,
 )
 from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_ACC_WAIT_PLACEMENT_BEFORE_SUBTILE_LOOP,
+)
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_ACC_WAIT_PLACEMENT_CONFIG_KEY,
+)
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_ACC_WAIT_PLACEMENT_SUBTILE_LOOP,
+)
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_C_ACQUIRE_PLACEMENT_CONFIG_KEY,
+)
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_C_ACQUIRE_PLACEMENT_FIRST_IN_LOOP,
+)
+from helion._compiler.cute.tcgen05_constants import TCGEN05_C_ACQUIRE_PLACEMENT_PRE_LOOP
+from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_CLUSTER_M2_ONE_CTA_ROLE_LOCAL_CONFIG_KEY,
 )
 from helion._compiler.cute.tcgen05_constants import (
@@ -135,6 +151,12 @@ from helion._compiler.cute.tcgen05_constants import (
 )
 from helion._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K
 from helion._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_EDGE_K_TAIL_C_STAGES
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_TWO_CTA_EDGE_K_TAIL_L2_GROUPING,
+)
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_TWO_CTA_EDGE_K_TAIL_L2_SWIZZLE_SIZE,
+)
 from helion._compiler.device_ir import ForLoopGraphInfo
 from helion._compiler.device_ir import GraphInfo
 from helion._compiler.device_ir import RootGraphInfo
@@ -12026,13 +12048,16 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
             bound = kernel.bind(args)
             cfg = _make_tcgen05_persistent_config(
                 block_sizes=[256, 256, 128],
-                l2_groupings=[4],
+                l2_groupings=[TCGEN05_TWO_CTA_EDGE_K_TAIL_L2_GROUPING],
                 pid_type="persistent_interleaved",
                 num_warps=4,
                 tcgen05_cluster_m=2,
                 tcgen05_ab_stages=2,
                 tcgen05_acc_stages=1,
-                tcgen05_c_stages=4,
+                tcgen05_c_stages=TCGEN05_TWO_CTA_EDGE_K_TAIL_C_STAGES,
+                tcgen05_l2_swizzle_size=TCGEN05_TWO_CTA_EDGE_K_TAIL_L2_SWIZZLE_SIZE,
+                tcgen05_acc_wait_placement=TCGEN05_ACC_WAIT_PLACEMENT_BEFORE_SUBTILE_LOOP,
+                tcgen05_c_acquire_placement=TCGEN05_C_ACQUIRE_PLACEMENT_FIRST_IN_LOOP,
                 indexing=["tensor_descriptor"] * bound.env.config_spec.indexing.length,
             )
             code = bound.to_triton_code(cfg)
@@ -12059,7 +12084,8 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
         self.assertIn(
             "tcgen05_c_buffer = (tcgen05_tma_store_role_tile * "
             "cutlass.Int32(tcgen05_subtile_count) + "
-            "cutlass.Int32(_tcgen05_subtile)) % cutlass.Int32(4)",
+            "cutlass.Int32(_tcgen05_subtile)) % "
+            f"cutlass.Int32({TCGEN05_TWO_CTA_EDGE_K_TAIL_C_STAGES})",
             code,
         )
         self.assertIn("cute.copy(tcgen05_tma_store_atom", code)
@@ -12079,13 +12105,16 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
             bound = kernel.bind(args)
             cfg = _make_tcgen05_persistent_config(
                 block_sizes=[256, 256, 128],
-                l2_groupings=[4],
+                l2_groupings=[TCGEN05_TWO_CTA_EDGE_K_TAIL_L2_GROUPING],
                 pid_type="persistent_interleaved",
                 num_warps=4,
                 tcgen05_cluster_m=2,
                 tcgen05_ab_stages=2,
                 tcgen05_acc_stages=1,
-                tcgen05_c_stages=4,
+                tcgen05_c_stages=TCGEN05_TWO_CTA_EDGE_K_TAIL_C_STAGES,
+                tcgen05_l2_swizzle_size=TCGEN05_TWO_CTA_EDGE_K_TAIL_L2_SWIZZLE_SIZE,
+                tcgen05_acc_wait_placement=TCGEN05_ACC_WAIT_PLACEMENT_BEFORE_SUBTILE_LOOP,
+                tcgen05_c_acquire_placement=TCGEN05_C_ACQUIRE_PLACEMENT_FIRST_IN_LOOP,
                 tcgen05_strategy="role_local_with_scheduler",
                 tcgen05_warp_spec_scheduler_warps=1,
                 tcgen05_warp_spec_c_input_warps=1,
@@ -12127,13 +12156,16 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
             bound = kernel.bind(args)
             cfg = _make_tcgen05_persistent_config(
                 block_sizes=[256, 256, 128],
-                l2_groupings=[4],
+                l2_groupings=[TCGEN05_TWO_CTA_EDGE_K_TAIL_L2_GROUPING],
                 pid_type="persistent_interleaved",
                 num_warps=4,
                 tcgen05_cluster_m=2,
                 tcgen05_ab_stages=2,
                 tcgen05_acc_stages=1,
-                tcgen05_c_stages=4,
+                tcgen05_c_stages=TCGEN05_TWO_CTA_EDGE_K_TAIL_C_STAGES,
+                tcgen05_l2_swizzle_size=TCGEN05_TWO_CTA_EDGE_K_TAIL_L2_SWIZZLE_SIZE,
+                tcgen05_acc_wait_placement=TCGEN05_ACC_WAIT_PLACEMENT_BEFORE_SUBTILE_LOOP,
+                tcgen05_c_acquire_placement=TCGEN05_C_ACQUIRE_PLACEMENT_FIRST_IN_LOOP,
                 indexing=["tensor_descriptor"] * bound.env.config_spec.indexing.length,
             )
             bound.set_config(cfg)
@@ -12143,7 +12175,8 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
             self.assertIn(
                 "tcgen05_c_buffer = (tcgen05_tma_store_role_tile * "
                 "cutlass.Int32(tcgen05_subtile_count) + "
-                "cutlass.Int32(_tcgen05_subtile)) % cutlass.Int32(4)",
+                "cutlass.Int32(_tcgen05_subtile)) % "
+                f"cutlass.Int32({TCGEN05_TWO_CTA_EDGE_K_TAIL_C_STAGES})",
                 code,
             )
             self.assertIn(
@@ -12181,6 +12214,8 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
                 tcgen05_cluster_m=2,
                 tcgen05_ab_stages=3,
                 tcgen05_acc_stages=1,
+                # This test pins the ab=3 SIMT-store fallback, not the
+                # production edge/K-tail seed family.
                 tcgen05_c_stages=4,
                 indexing=["tensor_descriptor"] * bound.env.config_spec.indexing.length,
             )
@@ -13358,7 +13393,7 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
         self.assertEqual(config_dict["tcgen05_ab_stages"], 3)
 
     def test_aux_edge_autotune_fixup_uses_validated_edge_paths(self) -> None:
-        """Aux edge fixup demotes non-cluster configs and preserves CtaGroup.TWO."""
+        """Aux edge fixup demotes non-cluster configs and pins CtaGroup.TWO."""
 
         from helion._compiler.cute.strategies import Tcgen05Strategy
 
@@ -13430,6 +13465,12 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
             "tcgen05_ab_stages": 2,
             "tcgen05_acc_stages": 2,
             "tcgen05_c_stages": 2,
+            TCGEN05_ACC_WAIT_PLACEMENT_CONFIG_KEY: (
+                TCGEN05_ACC_WAIT_PLACEMENT_SUBTILE_LOOP
+            ),
+            TCGEN05_C_ACQUIRE_PLACEMENT_CONFIG_KEY: (
+                TCGEN05_C_ACQUIRE_PLACEMENT_PRE_LOOP
+            ),
         }
         spec._cute_tcgen05_config.fix_search_config(cluster_m2_config)
 
@@ -13451,8 +13492,22 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
             cluster_m2_config["tcgen05_c_stages"],
             TCGEN05_TWO_CTA_EDGE_K_TAIL_C_STAGES,
         )
-        self.assertEqual(cluster_m2_config["tcgen05_l2_swizzle_size"], 8)
-        self.assertEqual(cluster_m2_config["l2_groupings"], [4])
+        self.assertEqual(
+            cluster_m2_config[TCGEN05_ACC_WAIT_PLACEMENT_CONFIG_KEY],
+            TCGEN05_ACC_WAIT_PLACEMENT_BEFORE_SUBTILE_LOOP,
+        )
+        self.assertEqual(
+            cluster_m2_config[TCGEN05_C_ACQUIRE_PLACEMENT_CONFIG_KEY],
+            TCGEN05_C_ACQUIRE_PLACEMENT_FIRST_IN_LOOP,
+        )
+        self.assertEqual(
+            cluster_m2_config["tcgen05_l2_swizzle_size"],
+            TCGEN05_TWO_CTA_EDGE_K_TAIL_L2_SWIZZLE_SIZE,
+        )
+        self.assertEqual(
+            cluster_m2_config["l2_groupings"],
+            [TCGEN05_TWO_CTA_EDGE_K_TAIL_L2_GROUPING],
+        )
         self.assertEqual(
             cluster_m2_config["indexing"],
             ["tensor_descriptor"] * spec.indexing.length,
@@ -13520,8 +13575,22 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
             config_dict["tcgen05_c_stages"],
             TCGEN05_TWO_CTA_EDGE_K_TAIL_C_STAGES,
         )
-        self.assertEqual(config_dict["tcgen05_l2_swizzle_size"], 8)
-        self.assertEqual(config_dict["l2_groupings"], [4])
+        self.assertEqual(
+            config_dict[TCGEN05_ACC_WAIT_PLACEMENT_CONFIG_KEY],
+            TCGEN05_ACC_WAIT_PLACEMENT_BEFORE_SUBTILE_LOOP,
+        )
+        self.assertEqual(
+            config_dict[TCGEN05_C_ACQUIRE_PLACEMENT_CONFIG_KEY],
+            TCGEN05_C_ACQUIRE_PLACEMENT_FIRST_IN_LOOP,
+        )
+        self.assertEqual(
+            config_dict["tcgen05_l2_swizzle_size"],
+            TCGEN05_TWO_CTA_EDGE_K_TAIL_L2_SWIZZLE_SIZE,
+        )
+        self.assertEqual(
+            config_dict["l2_groupings"],
+            [TCGEN05_TWO_CTA_EDGE_K_TAIL_L2_GROUPING],
+        )
         self.assertEqual(
             config_dict["indexing"],
             ["tensor_descriptor"] * spec.indexing.length,

@@ -7,12 +7,10 @@ from typing import cast
 from ...runtime.config import Config
 from ..cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
 from ..cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
-from ..cute.tcgen05_constants import TCGEN05_TWO_CTA_EDGE_K_TAIL_AB_STAGES
-from ..cute.tcgen05_constants import TCGEN05_TWO_CTA_EDGE_K_TAIL_ACC_STAGES
 from ..cute.tcgen05_constants import TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K
-from ..cute.tcgen05_constants import TCGEN05_TWO_CTA_EDGE_K_TAIL_C_STAGES
 from ..cute.tcgen05_constants import TCGEN05_TWO_CTA_SEED_L2_GROUPING
 from ..cute.tcgen05_constants import TCGEN05_TWO_CTA_SEED_PID_TYPE
+from ..cute.tcgen05_constants import tcgen05_two_cta_edge_k_tail_seed_overrides
 from .registry import AutotunerHeuristic
 
 if TYPE_CHECKING:
@@ -160,37 +158,36 @@ class CuteTcgen05ClusterM2Heuristic(AutotunerHeuristic):
         if bk is None:
             raise AssertionError(f"{cls.name} get_seed_config called while ineligible")
 
+        edge_k_tail_family = (
+            spec._tcgen05_cluster_m2_search_constraints is not None
+            and spec._tcgen05_cluster_m2_search_constraints.allow_edge_k_tail_family
+        )
         seed: dict[str, Any] = {
             "block_sizes": [
                 TCGEN05_TWO_CTA_BLOCK_M,
                 TCGEN05_TWO_CTA_BLOCK_N,
                 bk,
             ],
-            "l2_groupings": [TCGEN05_TWO_CTA_SEED_L2_GROUPING],
             "pid_type": TCGEN05_TWO_CTA_SEED_PID_TYPE,
             "tcgen05_cluster_m": 2,
             # Matches the validated tcgen05 search restriction.
             "tcgen05_num_epi_warps": 4,
         }
-        # When the SMEM-budget gate admits ``ab=3`` for this seed tile shape,
-        # seed the canonical 4096^3 fast config family directly so it reaches
-        # the autotuner's initial population without depending on a search-
-        # stage mutation.
-        edge_k_tail_family = (
-            spec._tcgen05_cluster_m2_search_constraints is not None
-            and spec._tcgen05_cluster_m2_search_constraints.allow_edge_k_tail_family
-        )
         if edge_k_tail_family:
-            seed["tcgen05_ab_stages"] = TCGEN05_TWO_CTA_EDGE_K_TAIL_AB_STAGES
-            seed["tcgen05_acc_stages"] = TCGEN05_TWO_CTA_EDGE_K_TAIL_ACC_STAGES
-            seed["tcgen05_c_stages"] = TCGEN05_TWO_CTA_EDGE_K_TAIL_C_STAGES
-        elif spec._tcgen05_ab_stages_three_fits(
-            bm=TCGEN05_TWO_CTA_BLOCK_M,
-            bn=TCGEN05_TWO_CTA_BLOCK_N,
-            bk=bk,
-            cluster_m=2,
-        ):
-            seed["tcgen05_ab_stages"] = 3
+            seed.update(tcgen05_two_cta_edge_k_tail_seed_overrides())
+        else:
+            seed["l2_groupings"] = [TCGEN05_TWO_CTA_SEED_L2_GROUPING]
+            # When the SMEM-budget gate admits ``ab=3`` for this seed tile
+            # shape, seed the canonical 4096^3 fast config family directly so
+            # it reaches the autotuner's initial population without depending
+            # on a search-stage mutation.
+            if spec._tcgen05_ab_stages_three_fits(
+                bm=TCGEN05_TWO_CTA_BLOCK_M,
+                bn=TCGEN05_TWO_CTA_BLOCK_N,
+                bk=bk,
+                cluster_m=2,
+            ):
+                seed["tcgen05_ab_stages"] = 3
         if spec.indexing.length == 3:
             # Pure matmul has exactly the A/B/C indexing slots. Fused epilogues
             # add more memory ops, so leave those seeds to the spec default
