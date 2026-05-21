@@ -87,6 +87,7 @@ from .tcgen05_constants import TCGEN05_TWO_CTA_EDGE_K_TAIL_ACC_STAGES
 from .tcgen05_constants import TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K
 from .tcgen05_constants import TCGEN05_TWO_CTA_EDGE_K_TAIL_C_STAGES
 from .tcgen05_constants import TCGEN05_TWO_CTA_MAX_K_TILES
+from .tcgen05_constants import TCGEN05_TWO_CTA_SEED_L2_GROUPING
 from .tcgen05_constants import TCGEN05_TWO_CTA_SEED_PID_TYPE
 from .tcgen05_constants import tcgen05_ab_smem_bytes_per_cta
 
@@ -243,10 +244,6 @@ class CuteTcgen05Config:
         constraints = self.cluster_m2_search_constraints
         if constraints is None:
             return None
-        if constraints.allow_edge_k_tail_family:
-            # The validated edge + K-tail family uses the monolithic aux path;
-            # the productive c-input seed is for static-full residual kernels.
-            return None
         if TCGEN05_TWO_CTA_SEED_PID_TYPE not in self.allowed_pid_types:
             return None
         if len(self.config_spec.block_sizes) != 3:
@@ -264,41 +261,66 @@ class CuteTcgen05Config:
             "BlockSizeFragment",
             self.config_spec.block_sizes[2]._fragment(self.config_spec),
         )
-        if not (
+        edge_k_tail_family = constraints.allow_edge_k_tail_family
+        m_tile_reachable = (
             bm_fragment.low <= TCGEN05_TWO_CTA_BLOCK_M <= bm_fragment.high
-            and bn_fragment.low <= TCGEN05_TWO_CTA_BLOCK_N <= bn_fragment.high
-        ):
+            or (edge_k_tail_family and bm_fragment.low <= TCGEN05_TWO_CTA_BLOCK_M)
+        )
+        n_tile_reachable = (
+            bn_fragment.low <= TCGEN05_TWO_CTA_BLOCK_N <= bn_fragment.high
+            or (edge_k_tail_family and bn_fragment.low <= TCGEN05_TWO_CTA_BLOCK_N)
+        )
+        if not (m_tile_reachable and n_tile_reachable):
             return None
 
-        bk = bk_fragment.high
-        while bk >= bk_fragment.low:
-            if self.cluster_m2_bk_is_valid(bk, constraints):
-                seed_config: dict[str, Any] = {
-                    "block_sizes": [
-                        TCGEN05_TWO_CTA_BLOCK_M,
-                        TCGEN05_TWO_CTA_BLOCK_N,
-                        bk,
-                    ],
-                    "l2_groupings": [1],
-                    "pid_type": TCGEN05_TWO_CTA_SEED_PID_TYPE,
-                    "tcgen05_cluster_m": 2,
-                    "tcgen05_num_epi_warps": 4,
-                    "tcgen05_ab_stages": 2,
-                    TCGEN05_STRATEGY_CONFIG_KEY: (
-                        Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER.value
-                    ),
-                    TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY: 1,
-                    TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY: 1,
-                }
-                if self.config_spec.indexing.length == 3:
-                    seed_config["indexing"] = [
-                        "tensor_descriptor",
-                        "tensor_descriptor",
-                        "tensor_descriptor",
-                    ]
-                return Config(**seed_config)
-            bk //= 2
-        return None
+        if edge_k_tail_family:
+            bk = TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K
+            if not (
+                bk_fragment.low <= bk <= bk_fragment.high
+                and self.cluster_m2_bk_is_valid(bk, constraints)
+            ):
+                return None
+        else:
+            bk = bk_fragment.high
+            while bk >= bk_fragment.low:
+                if self.cluster_m2_bk_is_valid(bk, constraints):
+                    break
+                bk //= 2
+            else:
+                return None
+
+        seed_config: dict[str, Any] = {
+            "block_sizes": [
+                TCGEN05_TWO_CTA_BLOCK_M,
+                TCGEN05_TWO_CTA_BLOCK_N,
+                bk,
+            ],
+            "l2_groupings": [
+                TCGEN05_TWO_CTA_SEED_L2_GROUPING if edge_k_tail_family else 1
+            ],
+            "pid_type": TCGEN05_TWO_CTA_SEED_PID_TYPE,
+            "tcgen05_cluster_m": 2,
+            "tcgen05_num_epi_warps": 4,
+            "tcgen05_ab_stages": 2,
+            TCGEN05_STRATEGY_CONFIG_KEY: (
+                Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER.value
+            ),
+            TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY: 1,
+            TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY: 1,
+        }
+        if edge_k_tail_family:
+            seed_config["tcgen05_acc_stages"] = TCGEN05_TWO_CTA_EDGE_K_TAIL_ACC_STAGES
+            seed_config["tcgen05_c_stages"] = TCGEN05_TWO_CTA_EDGE_K_TAIL_C_STAGES
+            seed_config["indexing"] = [
+                "tensor_descriptor"
+            ] * self.config_spec.indexing.length
+        elif self.config_spec.indexing.length == 3:
+            seed_config["indexing"] = [
+                "tensor_descriptor",
+                "tensor_descriptor",
+                "tensor_descriptor",
+            ]
+        return Config(**seed_config)
 
     def autotune_seed_configs(self) -> list[Config]:
         seeds: list[Config] = []
@@ -331,14 +353,6 @@ class CuteTcgen05Config:
         if not self.cluster_m2_bk_is_valid(bk, constraints):
             config["tcgen05_cluster_m"] = 1
             return
-        if edge_k_tail_family and not self.ab_stages_three_fits(
-            bm=TCGEN05_TWO_CTA_BLOCK_M,
-            bn=TCGEN05_TWO_CTA_BLOCK_N,
-            bk=TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K,
-            cluster_m=2,
-        ):
-            config["tcgen05_cluster_m"] = 1
-            return
         config["pid_type"] = TCGEN05_TWO_CTA_SEED_PID_TYPE
         block_sizes[0] = TCGEN05_TWO_CTA_BLOCK_M
         block_sizes[1] = TCGEN05_TWO_CTA_BLOCK_N
@@ -347,7 +361,7 @@ class CuteTcgen05Config:
             config["tcgen05_acc_stages"] = TCGEN05_TWO_CTA_EDGE_K_TAIL_ACC_STAGES
             config["tcgen05_c_stages"] = TCGEN05_TWO_CTA_EDGE_K_TAIL_C_STAGES
             if self.aux_kernel_detected and self._has_any_matmul_fact_edge_tile(config):
-                self._set_aux_edge_monolithic_prefix(config)
+                self._set_aux_edge_cluster_m2_prefix(config)
 
     def allow_ab_stages_three_search(
         self,
@@ -485,7 +499,7 @@ class CuteTcgen05Config:
             return
 
         if self._is_validated_cluster_m2_edge_search_candidate(config):
-            self._set_aux_edge_monolithic_prefix(config)
+            self._set_aux_edge_cluster_m2_prefix(config)
             return
 
         self._set_aux_edge_monolithic_prefix(config)
@@ -529,6 +543,21 @@ class CuteTcgen05Config:
         )
         config[TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY] = 0
         config[TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY] = 0
+        if config.get("tcgen05_ab_stages") == 1:
+            config["tcgen05_ab_stages"] = 2
+        config.pop("epilogue_subtile", None)
+
+    @staticmethod
+    def _set_aux_edge_cluster_m2_prefix(config: dict[str, object]) -> None:
+        if (
+            config.get(TCGEN05_STRATEGY_CONFIG_KEY)
+            == Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER.value
+        ):
+            config[TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY] = 1
+            config[TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY] = 1
+        else:
+            CuteTcgen05Config._set_aux_edge_monolithic_prefix(config)
+            return
         if config.get("tcgen05_ab_stages") == 1:
             config["tcgen05_ab_stages"] = 2
         config.pop("epilogue_subtile", None)

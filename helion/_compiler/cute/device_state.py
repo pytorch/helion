@@ -52,6 +52,7 @@ class CuteTcgen05StoreValue:
     use_tma: bool = False
     use_role_local_epi: bool = False
     use_tma_store_epilogue: bool = False
+    tma_store_full_tiles_only: bool = False
     ab_stage_count: int = 0
     acc_stage_count: int = 0
     skip_ab_producer_advance: bool = False
@@ -101,6 +102,7 @@ class CuteTcgen05MatmulPlan:
     persistence_model: str = "static_persistent"
     cluster_n: int = 1
     l2_swizzle_size: int = 1
+    tma_store_full_tiles_only: bool = False
     # Per-anchor auxiliary descriptors discovered by the forward FX walker. This
     # is store-fusion metadata, not a collective compatibility field:
     # two matmuls with identical collective parameters but different downstream
@@ -110,6 +112,16 @@ class CuteTcgen05MatmulPlan:
     aux_tensor_descriptors: tuple[Tcgen05AuxTensorDescriptor, ...] = dataclasses.field(
         default=(), compare=False
     )
+
+    @property
+    def c_input_aux_tensor_descriptors(self) -> tuple[Tcgen05AuxTensorDescriptor, ...]:
+        """Aux descriptors staged by the C-input warp.
+
+        Exact-shape MxN aux tensors use the SMEM-ring producer. Broadcast
+        row-vector aux tensors stay on the direct per-thread load path so
+        they do not allocate a full-tile ring for a one-dimensional input.
+        """
+        return tuple(d for d in self.aux_tensor_descriptors if d.broadcast_axis is None)
 
     @property
     def is_clc_persistent(self) -> bool:
@@ -227,6 +239,7 @@ class CuteDeviceFunctionState:
         self._mma_exec_role_stmt_ids: set[int] = set()
         self._epi_role_stmt_ids: set[int] = set()
         self.epi_role_tile_counter_var: str | None = None
+        self.epi_role_tile_counter_increment_per_tile: bool = True
         self._collective_handled_loads: set[str] = set()
         self.cluster_shape: tuple[int, int, int] | None = None
         self.block_shape: tuple[int, int, int] | None = None
@@ -329,12 +342,16 @@ class CuteDeviceFunctionState:
         """Mark acc consumer and TMEM-to-GMEM store work for epilogue warps."""
         self._epi_role_stmt_ids.update(id(stmt) for stmt in stmts)
 
-    def register_tcgen05_epi_role_tile_counter(self, name: str) -> None:
+    def register_tcgen05_epi_role_tile_counter(
+        self, name: str, *, increment_per_tile: bool = True
+    ) -> None:
         """Publish the role-local epilogue tile counter used by TMA stores."""
         if self.epi_role_tile_counter_var is None:
             self.epi_role_tile_counter_var = name
+            self.epi_role_tile_counter_increment_per_tile = increment_per_tile
             return
         assert self.epi_role_tile_counter_var == name
+        assert self.epi_role_tile_counter_increment_per_tile == increment_per_tile
 
     def is_tcgen05_epi_role(self, stmt: ast.stmt) -> bool:
         return id(stmt) in self._epi_role_stmt_ids

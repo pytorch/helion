@@ -11987,6 +11987,210 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
             ],
         )
 
+    def _bias_residual_gelu_kernel(self):  # type: ignore[no-untyped-def]
+        @helion.kernel(backend="cute")
+        def cute_matmul_bias_residual_gelu(
+            x: torch.Tensor,
+            y: torch.Tensor,
+            bias: torch.Tensor,
+            residual: torch.Tensor,
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = torch.nn.functional.gelu(
+                    1.25 * acc + 0.5 * residual[tile_m, tile_n] + bias[tile_n],
+                    approximate="tanh",
+                ).to(x.dtype)
+            return out
+
+        return cute_matmul_bias_residual_gelu
+
+    def test_aux_edge_target_shape_ab2_uses_full_tile_tma_store_with_simt_fallback(
+        self,
+    ) -> None:
+        """5000x5000x5000 output-edge kernels use TMA store on interior tiles."""
+
+        kernel = self._bias_residual_gelu_kernel()
+        args = (
+            torch.empty([5000, 5000], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([5000, 5000], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([5000], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([5000, 5000], device=DEVICE, dtype=torch.bfloat16),
+        )
+        with patch_cute_mma_support():
+            bound = kernel.bind(args)
+            cfg = _make_tcgen05_persistent_config(
+                block_sizes=[256, 256, 128],
+                l2_groupings=[4],
+                pid_type="persistent_interleaved",
+                num_warps=4,
+                tcgen05_cluster_m=2,
+                tcgen05_ab_stages=2,
+                tcgen05_acc_stages=1,
+                tcgen05_c_stages=4,
+                indexing=["tensor_descriptor"] * bound.env.config_spec.indexing.length,
+            )
+            code = bound.to_triton_code(cfg)
+
+        self.assertIn("'kind': 'tcgen05_d_tma'", code)
+        self.assertIn("cutlass.pipeline.PipelineTmaStore.create", code)
+        self.assertIn("if tcgen05_full_tile:", code)
+        self.assertEqual(code.count("tcgen05_full_tile = "), 1, code)
+        self.assertEqual(code.count("if tcgen05_full_tile:"), 1, code)
+        self.assertLess(
+            code.index("cutlass.pipeline.PipelineTmaStore.create"),
+            code.index("while tcgen05_role_local_"),
+        )
+        self.assertGreater(
+            code.index("tcgen05_c_pipeline.producer_tail()"),
+            code.index("while tcgen05_role_local_"),
+        )
+        self.assertIn("tcgen05_tma_store_role_tile = cutlass.Int32(0)", code)
+        self.assertIn(
+            "tcgen05_tma_store_role_tile = "
+            "tcgen05_tma_store_role_tile + cutlass.Int32(1)",
+            code,
+        )
+        self.assertIn(
+            "tcgen05_c_buffer = (tcgen05_tma_store_role_tile * "
+            "cutlass.Int32(tcgen05_subtile_count) + "
+            "cutlass.Int32(_tcgen05_subtile)) % cutlass.Int32(4)",
+            code,
+        )
+        self.assertIn("cute.copy(tcgen05_tma_store_atom", code)
+        self.assertIn("cute.nvgpu.CopyUniversalOp()", code)
+
+    def test_aux_edge_target_shape_c_input_stages_residual_only(self) -> None:
+        """Target8 c-input stages the residual and keeps edge aux direct."""
+
+        kernel = self._bias_residual_gelu_kernel()
+        args = (
+            torch.empty([5000, 5000], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([5000, 5000], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([5000], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([5000, 5000], device=DEVICE, dtype=torch.bfloat16),
+        )
+        with patch_cute_mma_support():
+            bound = kernel.bind(args)
+            cfg = _make_tcgen05_persistent_config(
+                block_sizes=[256, 256, 128],
+                l2_groupings=[4],
+                pid_type="persistent_interleaved",
+                num_warps=4,
+                tcgen05_cluster_m=2,
+                tcgen05_ab_stages=2,
+                tcgen05_acc_stages=1,
+                tcgen05_c_stages=4,
+                tcgen05_strategy="role_local_with_scheduler",
+                tcgen05_warp_spec_scheduler_warps=1,
+                tcgen05_warp_spec_c_input_warps=1,
+                indexing=["tensor_descriptor"] * bound.env.config_spec.indexing.length,
+            )
+            code = bound.to_triton_code(cfg)
+
+        self.assertIn("tcgen05_aux_pipeline", code)
+        self.assertIn("tcgen05_aux_smem_layout_0", code)
+        self.assertNotIn("tcgen05_aux_smem_layout_1", code)
+        self.assertIn(".partition_S(tcgen05_aux_smem_0)", code)
+        self.assertIn("tcgen05_tTR_gAux_grouped_0", code)
+        self.assertIn("tcgen05_tTR_gAux_grouped_1", code)
+        self.assertIn("if tcgen05_full_tile:", code)
+        self.assertIn("tcgen05_aux_full_tile", code)
+        self.assertIn("if tcgen05_aux_full_tile", code)
+
+    def test_aux_edge_hybrid_tma_store_runtime_correctness(self) -> None:
+        """Hybrid full-tile TMA store and SIMT edge fallback run together."""
+
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+
+        kernel = self._bias_residual_gelu_kernel()
+        torch.manual_seed(0)
+        # 640x640 with 256x256 tiles gives four full tiles plus output-edge
+        # tiles in the same persistent CtaGroup.TWO kernel, so the hybrid path
+        # exercises a hoisted TMA-store pipeline/tail for full tiles plus the
+        # SIMT edge fallback in one launch.
+        args = (
+            torch.randn(640, 128, device=DEVICE, dtype=torch.bfloat16),
+            torch.randn(128, 640, device=DEVICE, dtype=torch.bfloat16),
+            torch.randn(640, device=DEVICE, dtype=torch.bfloat16),
+            torch.randn(640, 640, device=DEVICE, dtype=torch.bfloat16),
+        )
+        with patch_cute_mma_support():
+            bound = kernel.bind(args)
+            cfg = _make_tcgen05_persistent_config(
+                block_sizes=[256, 256, 128],
+                l2_groupings=[4],
+                pid_type="persistent_interleaved",
+                num_warps=4,
+                tcgen05_cluster_m=2,
+                tcgen05_ab_stages=2,
+                tcgen05_acc_stages=1,
+                tcgen05_c_stages=4,
+                indexing=["tensor_descriptor"] * bound.env.config_spec.indexing.length,
+            )
+            bound.set_config(cfg)
+            code = bound.to_triton_code(cfg)
+            self.assertIn("cutlass.pipeline.PipelineTmaStore.create", code)
+            self.assertEqual(code.count("if tcgen05_full_tile:"), 1, code)
+            self.assertIn(
+                "tcgen05_c_buffer = (tcgen05_tma_store_role_tile * "
+                "cutlass.Int32(tcgen05_subtile_count) + "
+                "cutlass.Int32(_tcgen05_subtile)) % cutlass.Int32(4)",
+                code,
+            )
+            self.assertIn(
+                "tcgen05_tma_store_role_tile = "
+                "tcgen05_tma_store_role_tile + cutlass.Int32(1)",
+                code,
+            )
+            self.assertIn("cute.copy(tcgen05_tma_store_atom", code)
+            self.assertIn("cute.nvgpu.CopyUniversalOp()", code)
+            out = bound(*args)
+
+        expected = torch.nn.functional.gelu(
+            1.25 * (args[0] @ args[1]).float() + 0.5 * args[3] + args[2],
+            approximate="tanh",
+        ).to(args[0].dtype)
+        torch.testing.assert_close(out, expected, atol=3e-1, rtol=2e-2)
+
+    def test_aux_edge_target_shape_ab3_keeps_simt_store_to_fit_smem(self) -> None:
+        """5000x5000x5000 ab=3 avoids the over-budget TMA-store SMEM tile."""
+
+        kernel = self._bias_residual_gelu_kernel()
+        args = (
+            torch.empty([5000, 5000], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([5000, 5000], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([5000], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([5000, 5000], device=DEVICE, dtype=torch.bfloat16),
+        )
+        with patch_cute_mma_support():
+            bound = kernel.bind(args)
+            cfg = _make_tcgen05_persistent_config(
+                block_sizes=[256, 256, 128],
+                l2_groupings=[4],
+                pid_type="persistent_interleaved",
+                num_warps=4,
+                tcgen05_cluster_m=2,
+                tcgen05_ab_stages=3,
+                tcgen05_acc_stages=1,
+                tcgen05_c_stages=4,
+                indexing=["tensor_descriptor"] * bound.env.config_spec.indexing.length,
+            )
+            code = bound.to_triton_code(cfg)
+
+        self.assertNotIn("'kind': 'tcgen05_d_tma'", code)
+        self.assertNotIn("cutlass.pipeline.PipelineTmaStore.create", code)
+        self.assertNotIn("cute.copy(tcgen05_tma_store_atom", code)
+        self.assertIn("cute.nvgpu.CopyUniversalOp()", code)
+
     def _expected_c_input_warp_id(self, config: helion.Config) -> int:
         """Compute the expected ``c_input_warp_id`` from the config
         rather than hardcoding a numeric literal. The id sits after
@@ -13153,8 +13357,8 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
         self.assertEqual(config_dict["tcgen05_warp_spec_c_input_warps"], 0)
         self.assertEqual(config_dict["tcgen05_ab_stages"], 3)
 
-    def test_aux_edge_autotune_fixup_uses_monolithic_path(self) -> None:
-        """Aux edge kernels avoid c-input search, preserving validated CtaGroup.TWO."""
+    def test_aux_edge_autotune_fixup_uses_validated_edge_paths(self) -> None:
+        """Aux edge fixup demotes non-cluster configs and preserves CtaGroup.TWO."""
 
         from helion._compiler.cute.strategies import Tcgen05Strategy
 
@@ -13231,10 +13435,10 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
 
         self.assertEqual(
             cluster_m2_config["tcgen05_strategy"],
-            Tcgen05Strategy.ROLE_LOCAL_MONOLITHIC.value,
+            Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER.value,
         )
-        self.assertEqual(cluster_m2_config["tcgen05_warp_spec_scheduler_warps"], 0)
-        self.assertEqual(cluster_m2_config["tcgen05_warp_spec_c_input_warps"], 0)
+        self.assertEqual(cluster_m2_config["tcgen05_warp_spec_scheduler_warps"], 1)
+        self.assertEqual(cluster_m2_config["tcgen05_warp_spec_c_input_warps"], 1)
         self.assertEqual(
             cluster_m2_config["tcgen05_ab_stages"],
             TCGEN05_TWO_CTA_EDGE_K_TAIL_AB_STAGES,
@@ -13260,8 +13464,8 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
         self.assertEqual(cluster_m2_config["pid_type"], "persistent_interleaved")
         self.assertNotIn("epilogue_subtile", cluster_m2_config)
 
-    def test_aux_edge_post_cluster_m2_projection_uses_monolithic_path(self) -> None:
-        """Post-projection CtaGroup.TWO edge samples get the aux edge prefix."""
+    def test_aux_edge_post_cluster_m2_projection_preserves_c_input_path(self) -> None:
+        """Post-projection CtaGroup.TWO edge samples keep the c-input prefix."""
 
         from helion._compiler.cute.strategies import Tcgen05Strategy
 
@@ -13300,10 +13504,10 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
 
         self.assertEqual(
             config_dict["tcgen05_strategy"],
-            Tcgen05Strategy.ROLE_LOCAL_MONOLITHIC.value,
+            Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER.value,
         )
-        self.assertEqual(config_dict["tcgen05_warp_spec_scheduler_warps"], 0)
-        self.assertEqual(config_dict["tcgen05_warp_spec_c_input_warps"], 0)
+        self.assertEqual(config_dict["tcgen05_warp_spec_scheduler_warps"], 1)
+        self.assertEqual(config_dict["tcgen05_warp_spec_c_input_warps"], 1)
         self.assertEqual(
             config_dict["tcgen05_ab_stages"],
             TCGEN05_TWO_CTA_EDGE_K_TAIL_AB_STAGES,

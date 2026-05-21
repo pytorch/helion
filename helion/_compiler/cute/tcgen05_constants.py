@@ -10,11 +10,20 @@ TCGEN05_TWO_CTA_MAX_K_TILES = 256
 # only for large square-ish GEMMs where persistent clustered scheduling has
 # enough work to amortize its edge handling.
 TCGEN05_TWO_CTA_EDGE_K_TAIL_MIN_DIM = 4096
-# That same family is validated only at this K/stage point.
+# That same family is validated only at this K/stage point. The output-edge
+# full-tile TMA-store epilogue needs an extra SMEM tile, so the edge seed must
+# stay within ``TCGEN05_TWO_CTA_EDGE_TMA_STORE_MAX_AB_STAGES``. Larger explicit
+# AB-stage configs remain legal only through the SIMT-store fallback when they
+# otherwise fit.
 TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K = 128
-TCGEN05_TWO_CTA_EDGE_K_TAIL_AB_STAGES = 3
+TCGEN05_TWO_CTA_EDGE_K_TAIL_AB_STAGES = 2
 TCGEN05_TWO_CTA_EDGE_K_TAIL_ACC_STAGES = 1
 TCGEN05_TWO_CTA_EDGE_K_TAIL_C_STAGES = 4
+TCGEN05_TWO_CTA_EDGE_TMA_STORE_MAX_AB_STAGES = 2
+assert (
+    TCGEN05_TWO_CTA_EDGE_K_TAIL_AB_STAGES
+    <= TCGEN05_TWO_CTA_EDGE_TMA_STORE_MAX_AB_STAGES
+), "edge K-tail seed must fit the full-tile TMA-store AB-stage limit"
 # Best measured seed L2 grouping for the full-tile CtaGroup.TWO row.
 TCGEN05_TWO_CTA_SEED_L2_GROUPING = 4
 # This pid order stays slightly ahead of persistent_blocked in the validated

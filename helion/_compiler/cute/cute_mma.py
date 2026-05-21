@@ -80,6 +80,7 @@ from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_PID_TYPE
 from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_PROBLEM_SHAPE
 from .tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
+from .tcgen05_constants import TCGEN05_TWO_CTA_EDGE_TMA_STORE_MAX_AB_STAGES
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -2088,17 +2089,40 @@ def _emit_mma_pipeline(
     # This is the kernel-wide contract ProgramID consumes. Today the TMA
     # producer flag is the master predicate for all three role-local loops.
     tcgen05_use_role_local_persistent_body = tcgen05_use_role_local_tma_producer
+    tcgen05_ab_stage_count_value = _tcgen05_config_int(
+        df.config, "tcgen05_ab_stages", _tcgen05_ab_stage_count(df.config.num_stages)
+    )
+    tcgen05_output_edge_tma_store_fits_smem = (
+        tcgen05_ab_stage_count_value <= TCGEN05_TWO_CTA_EDGE_TMA_STORE_MAX_AB_STAGES
+    )
+    tcgen05_use_output_edge_tma_store_for_full_tiles = (
+        tcgen05_role_local_m_edge_tma
+        or tcgen05_role_local_n_edge_tma
+        or tcgen05_role_local_double_edge_tma
+    ) and tcgen05_output_edge_tma_store_fits_smem
     # Flat kernels process one output tile per CTA, so the c_pipeline stage is
     # just the subtile index. Persistent kernels use a role-local tile counter
     # to rotate c_pipeline stages across work tiles. Static-full CtaGroup.TWO
     # uses the same SMEM-staged TMA-store epilogue: each CTA's epilogue warp 0
-    # stores its partitioned C tile.
+    # stores its partitioned C tile. Output-edge role-local kernels can use the
+    # same TMA-store path for interior full tiles while retaining the predicated
+    # SIMT fallback for fringe tiles, but only when the AB-stage count leaves
+    # enough SMEM budget for the extra epilogue tile.
     tcgen05_use_tma_store_epilogue = (
         mma_impl == "tcgen05"
         and tcgen05_use_tma_pipeline
-        and (tcgen05_static_full_tiles or tcgen05_role_local_k_tail_tma)
+        and (
+            tcgen05_static_full_tiles
+            or tcgen05_role_local_k_tail_tma
+            or tcgen05_use_output_edge_tma_store_for_full_tiles
+        )
         and tcgen05_role_local_codegen_allowed
         and (not _is_persistent_pid_config(df.config) or tcgen05_use_role_local_epi)
+    )
+    tcgen05_tma_store_full_tiles_only = (
+        tcgen05_use_tma_store_epilogue
+        and tcgen05_use_output_edge_tma_store_for_full_tiles
+        and not tcgen05_static_output_tiles
     )
     if tcgen05_large_bn_proof and (
         mma_impl != "tcgen05"
@@ -2334,9 +2358,6 @@ def _emit_mma_pipeline(
     tcgen05_acc_stage_count_value = _tcgen05_config_int(
         df.config, "tcgen05_acc_stages", _tcgen05_acc_stage_count(bn)
     )
-    tcgen05_ab_stage_count_value = _tcgen05_config_int(
-        df.config, "tcgen05_ab_stages", _tcgen05_ab_stage_count(df.config.num_stages)
-    )
     # PipelineTmaUmma empty barriers are released by the leader CTA with the
     # pipeline's multicast mask. Peer CTAs still advance local consumer state,
     # but they must not add a second empty-barrier arrival: doing so lets the
@@ -2561,6 +2582,7 @@ def _emit_mma_pipeline(
             persistence_model=tcgen05_persistence_model_str,
             cluster_n=tcgen05_cluster_n,
             l2_swizzle_size=tcgen05_l2_swizzle_size_value,
+            tma_store_full_tiles_only=tcgen05_tma_store_full_tiles_only,
             aux_tensor_descriptors=aux_tensor_descriptors_value,
         )
         assert tcgen05_plan is not None
@@ -2609,15 +2631,15 @@ def _emit_mma_pipeline(
         # SMEM cost, so the rejection must NOT fire — fan-out
         # ``ab=3 + c_input=1`` paths are legal and pinned by
         # ``test_aux_pipeline_ab_stages_3_with_c_input_fanout_not_rejected``.
+        c_input_aux_tensor_descriptors = (
+            tcgen05_matmul_plan.c_input_aux_tensor_descriptors
+        )
         aux_single_store_value = (
-            len(
-                {d.store_value_node for d in tcgen05_matmul_plan.aux_tensor_descriptors}
-            )
-            <= 1
+            len({d.store_value_node for d in c_input_aux_tensor_descriptors}) <= 1
         )
         if (
             tcgen05_matmul_plan.has_c_input_warp
-            and tcgen05_matmul_plan.aux_tensor_descriptors
+            and c_input_aux_tensor_descriptors
             and aux_single_store_value
             and tcgen05_matmul_plan.ab_stage_count >= 3
         ):
@@ -3017,14 +3039,14 @@ def _emit_mma_pipeline(
                 len(
                     {
                         d.store_value_node
-                        for d in tcgen05_matmul_plan.aux_tensor_descriptors
+                        for d in tcgen05_matmul_plan.c_input_aux_tensor_descriptors
                     }
                 )
                 <= 1
             )
             c_input_is_sched_consumer = (
                 tcgen05_matmul_plan.has_c_input_warp
-                and bool(tcgen05_matmul_plan.aux_tensor_descriptors)
+                and bool(tcgen05_matmul_plan.c_input_aux_tensor_descriptors)
                 and _aux_single_store_value
             )
             tcgen05_sched_consumer_role_count = (
@@ -3071,7 +3093,10 @@ def _emit_mma_pipeline(
             # ``PipelineAsync`` (``cute_plan.md`` §7.5.3.2 cycle 2
             # of the producer-body split). Fires only when the
             # productive-body gate is open: ``c_input_warp_count > 0``
-            # AND a non-empty ``aux_tensor_descriptors`` tuple. The
+            # AND a non-empty exact-shape ``c_input_aux_tensor_descriptors``
+            # tuple. Broadcast row-vector aux loads intentionally stay on the
+            # direct per-thread path; staging them as 2-D rings burns a full
+            # epilogue tile of SMEM for a one-dimensional input. The
             # role-local while builder in
             # ``program_id._build_c_input_warp_role_local_while``
             # emits the per-descriptor producer body that issues
@@ -3100,23 +3125,25 @@ def _emit_mma_pipeline(
             # writes of the same value gives one ``store_value_node``
             # in the descriptor set (and the GMEM fallback path
             # remains byte-identical to the pre-cycle-2b shape).
+            c_input_aux_tensor_descriptors = (
+                tcgen05_matmul_plan.c_input_aux_tensor_descriptors
+            )
             aux_store_value_nodes = {
-                desc.store_value_node
-                for desc in tcgen05_matmul_plan.aux_tensor_descriptors
+                desc.store_value_node for desc in c_input_aux_tensor_descriptors
             }
             aux_single_store_value = len(aux_store_value_nodes) <= 1
             if (
                 tcgen05_matmul_plan.has_c_input_warp
-                and tcgen05_matmul_plan.aux_tensor_descriptors
+                and c_input_aux_tensor_descriptors
                 and aux_single_store_value
             ):
                 aux_descriptor_dtype_strs = tuple(
                     env.backend.dtype_str(desc.host_tensor_val.dtype)
-                    for desc in tcgen05_matmul_plan.aux_tensor_descriptors
+                    for desc in c_input_aux_tensor_descriptors
                 )
                 tcgen05_aux_plan = _new_tcgen05_aux_pipeline_plan(
                     df,
-                    num_rings=len(tcgen05_matmul_plan.aux_tensor_descriptors),
+                    num_rings=len(c_input_aux_tensor_descriptors),
                     epi_tile_var=tcgen05_plan.epi_tile,
                 )
                 df.cute_state.register_tcgen05_aux_pipeline_plan(tcgen05_aux_plan)
@@ -4304,6 +4331,7 @@ def _emit_mma_pipeline(
                 use_tma=tcgen05_use_tma,
                 use_role_local_epi=tcgen05_use_role_local_epi,
                 use_tma_store_epilogue=tcgen05_use_tma_store_epilogue,
+                tma_store_full_tiles_only=tcgen05_tma_store_full_tiles_only,
                 ab_stage_count=tcgen05_ab_stage_count_value,
                 acc_stage_count=tcgen05_acc_stage_count_value,
                 skip_ab_producer_advance=diagnose_skip_ab_producer_advance,

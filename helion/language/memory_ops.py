@@ -1801,8 +1801,12 @@ def _codegen_cute_store_tcgen05_tile(
     # Pyrefly does not preserve the non-None ``tcgen05_value`` narrowing
     # inside the nested source-formatter closures, so keep local
     # string aliases for attributes the closures read.
+    tcgen05_aux_bm = tcgen05_value.bm
+    tcgen05_aux_bn = tcgen05_value.bn
+    tcgen05_aux_thr_mma = tcgen05_value.thr_mma
     tcgen05_aux_epi_tidx = tcgen05_value.epi_tidx
     tcgen05_aux_epilogue_rest_mode = tcgen05_value.epilogue_rest_mode
+    tcgen05_aux_use_tma_store_epilogue = tcgen05_value.use_tma_store_epilogue
 
     # C-input warp productive-body gate (``cute_plan.md`` §7.5.3.2
     # cycle 2b producer + consumer flip). When the matmul plan has
@@ -1839,37 +1843,38 @@ def _codegen_cute_store_tcgen05_tile(
     # wedge (producer commits to rings the per-store consumer
     # never releases) cannot occur — the productive body
     # closes its gate at MMA-codegen time and the consumer
-    # path here falls back to GMEM. The per-record lookup
-    # below is a belt-and-suspenders identity check: if any
-    # record's ``load_node`` is absent from the descriptors,
-    # the SMEM path is disabled for this store.
+    # path here falls back to GMEM. Broadcast row-vector aux loads are
+    # deliberately not staged by the C-input producer, so the per-record lookup
+    # below allows a mixed chain: matched exact-shape records read from SMEM,
+    # unmatched records keep the direct GMEM path.
     aux_step_load_nodes: tuple = (
         tuple(rec_step.load_node for rec_step in aux_steps_in_chain)
         if aux_step_records
         else ()
     )
-    aux_ring_index_by_step: list[int] = []
+    aux_ring_index_by_step: list[int | None] = []
     aux_descriptor_load_nodes: tuple = (
-        tuple(d.load_node for d in aux_matmul_plan.aux_tensor_descriptors)
+        tuple(d.load_node for d in aux_matmul_plan.c_input_aux_tensor_descriptors)
         if aux_matmul_plan is not None
         else ()
     )
-    aux_step_load_nodes_match = True
     for step_load_node in aux_step_load_nodes:
         try:
             aux_ring_index_by_step.append(
                 aux_descriptor_load_nodes.index(step_load_node)
             )
         except ValueError:
-            aux_step_load_nodes_match = False
-            break
+            aux_ring_index_by_step.append(None)
+    aux_has_staged_steps = any(
+        ring_idx is not None for ring_idx in aux_ring_index_by_step
+    )
     use_aux_smem_source = (
         aux_step_records
         and aux_matmul_plan is not None
         and aux_matmul_plan.has_c_input_warp
-        and bool(aux_matmul_plan.aux_tensor_descriptors)
+        and bool(aux_matmul_plan.c_input_aux_tensor_descriptors)
         and aux_pipeline_plan_obj is not None
-        and aux_step_load_nodes_match
+        and aux_has_staged_steps
         # Multi-store fan-out gate (same predicate as the
         # producer-side allocator + role-local-while
         # admission). Without this guard the producer fires
@@ -1879,7 +1884,9 @@ def _codegen_cute_store_tcgen05_tile(
         # releases its own subset, leaving the unmatched rings
         # uncommitted and deadlocking the producer once a CTA
         # wraps the pipeline depth.
-        and len({d.store_value_node for d in aux_matmul_plan.aux_tensor_descriptors})
+        and len(
+            {d.store_value_node for d in aux_matmul_plan.c_input_aux_tensor_descriptors}
+        )
         <= 1
     )
     if use_aux_smem_source:
@@ -1887,21 +1894,22 @@ def _codegen_cute_store_tcgen05_tile(
         aux_pipeline_name = aux_pipeline_plan_obj.pipeline
         aux_consumer_state_name = aux_pipeline_plan_obj.consumer_state
         all_rings = aux_pipeline_plan_obj.rings
-        aux_ring_smem_names: tuple[str, ...] = tuple(
-            all_rings[ring_idx].smem for ring_idx in aux_ring_index_by_step
+        aux_ring_smem_names: tuple[str | None, ...] = tuple(
+            all_rings[ring_idx].smem if ring_idx is not None else None
+            for ring_idx in aux_ring_index_by_step
         )
     else:
         aux_pipeline_name = ""
         aux_consumer_state_name = ""
-        aux_ring_smem_names = ()
+        aux_ring_smem_names = tuple(None for _ in aux_step_records)
 
     def _simt_edge_coord_subtile_source(indent: str) -> str:
         return (
             f"{indent}{coord_tile} = cute.local_tile("
             f"cute.make_identity_tensor(({m_size}, {n_size})), "
-            f"({tcgen05_value.bm}, {tcgen05_value.bn}), "
+            f"({tcgen05_aux_bm}, {tcgen05_aux_bn}), "
             f"({tile_coord_m}, {tile_coord_n}))\n"
-            f"{indent}{tccc_base} = {tcgen05_value.thr_mma}.partition_C("
+            f"{indent}{tccc_base} = {tcgen05_aux_thr_mma}.partition_C("
             f"{coord_tile})\n"
             f"{indent}{tccc} = "
             "cutlass.utils.gemm.sm100.transform_partitioned_tensor_layout("
@@ -1925,7 +1933,10 @@ def _codegen_cute_store_tcgen05_tile(
         )
 
     def _aux_tile_setup_lines(
-        *, thr_copy_t2r_var: str, define_thr_copy_t2r: bool
+        *,
+        thr_copy_t2r_var: str,
+        define_thr_copy_t2r: bool,
+        force_gmem_aux: bool = False,
     ) -> list[str]:
         """Emit the per-output-tile aux partitioning lines.
 
@@ -1950,7 +1961,9 @@ def _codegen_cute_store_tcgen05_tile(
         (the TMA-store path does not otherwise create
         ``thr_copy_t2r``); the SIMT path passes False because it
         already creates the slice as part of its existing partition
-        pipeline.
+        pipeline. ``force_gmem_aux`` is used by the hybrid edge-only
+        SIMT path: C-input staging is only safe for full tiles because
+        the producer-side bulk copy is not predicated for M/N fringes.
         """
         lines: list[str] = []
         if not aux_step_records:
@@ -1960,40 +1973,23 @@ def _codegen_cute_store_tcgen05_tile(
                 f"{thr_copy_t2r_var} = "
                 f"{tiled_copy_t2r}.get_slice({tcgen05_aux_epi_tidx})"
             )
-        if use_aux_smem_source:
-            # C-input warp productive-body gate is open: per-subtile
-            # SMEM ring staging. Per-output-tile setup builds one
-            # ``tiled_copy_s2r`` per descriptor (Quack's
-            # ``epilog_smem_load_and_partition`` pattern from
-            # ``quack/gemm_sm100.py``):
-            #
-            #   tiled_copy_s2r = make_tiled_copy_D(
-            #       make_copy_atom(CopyUniversalOp(), aux_dtype),
-            #       tiled_copy_t2r)
-            #   thr_copy_s2r = tiled_copy_s2r.get_slice(epi_tidx)
-            #   tSR_sC = thr_copy_s2r.partition_S(aux_smem_ring)
-            #   tRS_rC = make_rmem_tensor(ttr_racc.shape, aux_dtype)
-            #   tSR_rC = tiled_copy_s2r.retile(tRS_rC)
-            #
-            # ``tSR_sC`` carries the full SMEM ring partition (its
-            # last mode is the PIPE/stage axis). Per-subtile body
-            # in ``_aux_subtile_load_source`` slices
-            # ``tSR_sC[None, None, None, consumer_state.index]``
-            # and issues a single ``cute.copy(tiled_copy_s2r, ...)``
-            # into ``tSR_rC`` (a re-layout of the same registers as
-            # ``tRS_rC``). The chain consumes ``tRS_rC.load()``.
-            #
-            # The broadcast-aux rank-1 → rank-2 view is absorbed on
-            # the producer side (the producer's GMEM-side view is
-            # stride-0-on-M), so the consumer reads the same shape
-            # for exact-shape and broadcast aux. The "_aux_part_*"
-            # / "ttr_aux_grouped" GMEM partition pipeline is not
-            # built on this path.
-            for aux_idx, rec in enumerate(aux_step_records):
+        for aux_idx, rec in enumerate(aux_step_records):
+            staged_ring_name = aux_ring_smem_names[aux_idx]
+            if (
+                use_aux_smem_source
+                and staged_ring_name is not None
+                and not force_gmem_aux
+            ):
+                # C-input warp productive-body gate is open for this exact-shape
+                # descriptor: build the Quack-style SMEM->register path. Rowvec
+                # broadcast records are not staged and fall through to the GMEM
+                # partition setup below.
                 assert aux_matmul_plan is not None
+                ring_idx = aux_ring_index_by_step[aux_idx]
+                assert ring_idx is not None
                 aux_dtype_str = backend.dtype_str(
-                    aux_matmul_plan.aux_tensor_descriptors[
-                        aux_idx
+                    aux_matmul_plan.c_input_aux_tensor_descriptors[
+                        ring_idx
                     ].host_tensor_val.dtype
                 )
                 tiled_copy_s2r_var = f"{rec.aux_tile}_tiled_copy_s2r"
@@ -2019,7 +2015,7 @@ def _codegen_cute_store_tcgen05_tile(
                         (
                             f"{tsr_sc_var} = "
                             f"{thr_copy_s2r_var}.partition_S("
-                            f"{aux_ring_smem_names[aux_idx]})"
+                            f"{staged_ring_name})"
                         ),
                         (
                             f"{trs_rc_var} = cute.make_rmem_tensor("
@@ -2028,8 +2024,8 @@ def _codegen_cute_store_tcgen05_tile(
                         (f"{tsr_rc_var} = {tiled_copy_s2r_var}.retile({trs_rc_var})"),
                     ]
                 )
-            return lines
-        for rec in aux_step_records:
+                continue
+
             if rec.broadcast_axis is None:
                 # Exact-shape rank-2 aux: slice the per-tile region
                 # of the underlying 2-D tensor directly.
@@ -2098,7 +2094,9 @@ def _codegen_cute_store_tcgen05_tile(
             )
         return lines
 
-    def _aux_subtile_load_source(prelude_indent: str) -> str:
+    def _aux_subtile_load_source(
+        prelude_indent: str, *, force_simt_edge_aux: bool = False
+    ) -> str:
         """Per-subtile aux GMEM-load source lines (one per aux step).
 
         Each step emits the per-thread GMEM subtile slice of
@@ -2135,7 +2133,7 @@ def _codegen_cute_store_tcgen05_tile(
         if not aux_step_records:
             return ""
         lines: list[str] = []
-        if use_aux_smem_source:
+        if use_aux_smem_source and not force_simt_edge_aux:
             # C-input warp productive-body gate is open: per-subtile
             # SMEM ring staging. Each subtile iteration waits on
             # ``c_pipeline_aux`` for the producer warp to fill the
@@ -2169,7 +2167,9 @@ def _codegen_cute_store_tcgen05_tile(
                 f"{prelude_indent}{aux_pipeline_name}.consumer_wait("
                 f"{aux_consumer_state_name})\n"
             )
-            for rec in aux_step_records:
+            for aux_idx, rec in enumerate(aux_step_records):
+                if aux_ring_smem_names[aux_idx] is None:
+                    continue
                 tiled_copy_s2r_var = f"{rec.aux_tile}_tiled_copy_s2r"
                 tsr_sc_var = f"{rec.aux_tile}_tSR_sC"
                 trs_rc_var = f"{rec.aux_tile}_tRS_rC"
@@ -2199,9 +2199,28 @@ def _codegen_cute_store_tcgen05_tile(
                     + "\n",
                 ]
             )
-            return "".join(lines)
-        for rec in aux_step_records:
-            if not tcgen05_value.use_tma_store_epilogue:
+        for aux_idx, rec in enumerate(aux_step_records):
+            if (
+                use_aux_smem_source
+                and not force_simt_edge_aux
+                and aux_ring_smem_names[aux_idx] is not None
+            ):
+                continue
+            if force_simt_edge_aux:
+                lines.append(
+                    f"{prelude_indent}{rec.ttr_aux_subtile} = "
+                    f"{rec.ttr_aux_grouped}"
+                    f"[(None, None, None, cutlass.Int32(_tcgen05_subtile))]\n"
+                    f"{prelude_indent}{rec.aux_rmem} = "
+                    f"cute.make_rmem_tensor({rec.ttr_aux_subtile}.shape, "
+                    f"{rec.aux_dtype})\n"
+                    f"{prelude_indent}{rec.aux_rmem}.fill(0)\n"
+                    f"{_simt_edge_scalar_copy_source(prelude_indent, rec.ttr_aux_subtile, rec.aux_rmem)}"
+                    f"{prelude_indent}{rec.aux_loaded} = "
+                    f"{rec.aux_rmem}.load()\n"
+                )
+                continue
+            if not tcgen05_aux_use_tma_store_epilogue:
                 lines.append(
                     f"{prelude_indent}{rec.ttr_aux_subtile} = "
                     f"{rec.ttr_aux_grouped}"
@@ -2250,7 +2269,12 @@ def _codegen_cute_store_tcgen05_tile(
     # statements (each newline-terminated, indented with
     # `prelude_indent`) plus the assignment expression for
     # `tcgen05_acc_vec`.
-    def _splice_acc_vec(carrier_name: str, prelude_indent: str) -> tuple[str, str, str]:
+    def _splice_acc_vec(
+        carrier_name: str,
+        prelude_indent: str,
+        *,
+        force_simt_edge_aux: bool = False,
+    ) -> tuple[str, str, str]:
         """Return ``(early_aux_prelude, late_prelude, assignment_rhs)``.
 
         ``early_aux_prelude`` is the per-subtile auxiliary-tensor LDG
@@ -2289,7 +2313,9 @@ def _codegen_cute_store_tcgen05_tile(
             return ("", "", f"{load_expr}.to({target_dtype})")
         loaded = df.new_var("tcgen05_acc_loaded")
         prelude_load = f"{prelude_indent}{loaded} = {load_expr}\n"
-        early_aux_prelude = _aux_subtile_load_source(prelude_indent)
+        early_aux_prelude = _aux_subtile_load_source(
+            prelude_indent, force_simt_edge_aux=force_simt_edge_aux
+        )
         aux_locals: tuple[str, ...] = tuple(rec.aux_loaded for rec in aux_step_records)
         chain_prelude, final_expr = epilogue_chain.render_prelude_and_expr(
             loaded,
@@ -2310,7 +2336,8 @@ def _codegen_cute_store_tcgen05_tile(
         )
         if tcgen05_value.use_role_local_epi:
             df.cute_state.register_tcgen05_epi_role_tile_counter(
-                tcgen05_value.role_local_tile_counter
+                tcgen05_value.role_local_tile_counter,
+                increment_per_tile=not tcgen05_value.tma_store_full_tiles_only,
             )
         state.codegen.cute_wrapper_plans.append(
             {
@@ -2334,6 +2361,10 @@ def _codegen_cute_store_tcgen05_tile(
     tcgen05_c_stage_count = tcgen05_value.c_stage_count
     tcgen05_is_two_cta = tcgen05_value.is_two_cta
     tcgen05_thr_mma = tcgen05_value.thr_mma
+    full_tile_expr = (
+        f"({base_indices[0]}) + cutlass.Int32({tcgen05_bm}) <= {m_size} "
+        f"and ({base_indices[1]}) + cutlass.Int32({tcgen05_bn}) <= {n_size}"
+    )
 
     def store_common_setup(
         gmem_tensor: str, *, include_full_tile: bool
@@ -2365,11 +2396,7 @@ def _codegen_cute_store_tcgen05_tile(
         ]
         tile_setup: list[str] = []
         if include_full_tile:
-            tile_setup.append(
-                f"{full_tile} = "
-                f"({base_indices[0]}) + cutlass.Int32({tcgen05_bm}) <= {m_size} "
-                f"and ({base_indices[1]}) + cutlass.Int32({tcgen05_bn}) <= {n_size}"
-            )
+            tile_setup.append(f"{full_tile} = {full_tile_expr}")
         tile_setup.extend(
             [
                 (
@@ -2382,22 +2409,39 @@ def _codegen_cute_store_tcgen05_tile(
         )
         return static_setup, tile_setup
 
+    simt_edge_only = tcgen05_value.tma_store_full_tiles_only
     simt_static_store_setup, simt_tile_store_setup = store_common_setup(
-        tensor_name, include_full_tile=True
+        tensor_name, include_full_tile=not simt_edge_only
     )
     simt_early_aux, simt_late_prelude, simt_acc_vec_rhs = _splice_acc_vec(
-        ttr_racc, "        "
+        ttr_racc,
+        "        ",
+        force_simt_edge_aux=tcgen05_value.tma_store_full_tiles_only,
     )
     simt_acc_vec_prelude = simt_early_aux + simt_late_prelude
     tma_static_store_setup, tma_tile_store_setup = store_common_setup(
         tcgen05_value.tma_store_tensor, include_full_tile=False
     )
+    # Role-local TMA stores reuse one C pipeline across work tiles. Static-full
+    # kernels increment this counter once per role-local tile; hybrid
+    # output-edge kernels increment it only in the full-tile branch so SIMT
+    # fallback edge tiles do not perturb the C-pipeline SMEM stage sequence.
     tma_c_buffer_expr = "cutlass.Int32(_tcgen05_subtile)"
     if tcgen05_value.role_local_tile_counter:
         tma_c_buffer_expr = (
             f"{tcgen05_value.role_local_tile_counter} * "
             f"cutlass.Int32({subtile_count}) + cutlass.Int32(_tcgen05_subtile)"
         )
+    simt_store_copy_source = (
+        _simt_edge_scalar_copy_source("        ", ttr_rd, ttr_gc_subtile)
+        if simt_edge_only
+        else (
+            f"        if {full_tile}:\n"
+            f"            cute.copy({simt_atom}, {ttr_rd}, {ttr_gc_subtile})\n"
+            f"        else:\n"
+            f"{_simt_edge_scalar_copy_source('            ', ttr_rd, ttr_gc_subtile)}"
+        )
+    )
     simt_store_body_core = [
         *simt_static_store_setup,
         *simt_tile_store_setup,
@@ -2440,6 +2484,7 @@ def _codegen_cute_store_tcgen05_tile(
         *_aux_tile_setup_lines(
             thr_copy_t2r_var=thr_copy_t2r,
             define_thr_copy_t2r=False,
+            force_gmem_aux=simt_edge_only,
         ),
         (
             f"{ttr_racc} = cute.make_rmem_tensor("
@@ -2495,10 +2540,7 @@ def _codegen_cute_store_tcgen05_tile(
             f"            cute.arch.fence_view_async_tmem_load()\n"
             f"            with cute.arch.elect_one():\n"
             f"                {tcgen05_value.acc_pipeline}.consumer_release({tcgen05_value.acc_consumer_state})\n"
-            f"        if {full_tile}:\n"
-            f"            cute.copy({simt_atom}, {ttr_rd}, {ttr_gc_subtile})\n"
-            f"        else:\n"
-            f"{_simt_edge_scalar_copy_source('            ', ttr_rd, ttr_gc_subtile)}"
+            f"{simt_store_copy_source}"
             # Advance is a per-thread local state update, so it intentionally
             # stays outside elect_one; only the mbarrier release is elected.
             f"if {tcgen05_value.epi_active}:\n"
@@ -3179,13 +3221,32 @@ def _codegen_cute_store_tcgen05_tile(
     # per-warp consumer arrive count
     # (``epi_warp_count``) allocated on the aux pipeline.
 
-    # Non-role-local stores keep pipeline/SMEM setup before per-tile C
-    # partitioning so the hoisted role-local prefix matches the same
-    # invariant setup subset.
+    # Static-full role-local stores have no dynamic full-tile branch, so all
+    # C-store invariant setup can be hoisted once. Hybrid output-edge stores
+    # still need descriptor/SMEM layout setup inside the dynamic full-tile
+    # branch (CuTe cannot flatten those Python descriptor objects through a
+    # dynamic ``if``), but the TMA-store pipeline itself can be reused and
+    # drained once after the role loop.
+    hoist_tma_store_resources = (
+        tcgen05_value.use_role_local_epi
+        and tcgen05_value.use_tma_store_epilogue
+        and not tcgen05_value.tma_store_full_tiles_only
+        and not diagnose_skip_epilogue_store
+    )
+    hoist_hybrid_tma_store_pipeline = (
+        tcgen05_value.use_role_local_epi
+        and tcgen05_value.use_tma_store_epilogue
+        and tcgen05_value.tma_store_full_tiles_only
+        and not diagnose_skip_epilogue_store
+    )
     tma_store_body_core = [
-        *([] if tcgen05_value.use_role_local_epi else tma_static_store_setup),
-        *([] if tcgen05_value.use_role_local_epi else tma_store_pipeline_setup),
-        *([] if tcgen05_value.use_role_local_epi else tma_store_smem_setup),
+        *(tma_static_store_setup if not hoist_tma_store_resources else []),
+        *(
+            tma_store_pipeline_setup
+            if not (hoist_tma_store_resources or hoist_hybrid_tma_store_pipeline)
+            else []
+        ),
+        *(tma_store_smem_setup if not hoist_tma_store_resources else []),
         *tma_store_first_subtile_acquire,
         *tma_tile_store_setup,
         (
@@ -3197,7 +3258,7 @@ def _codegen_cute_store_tcgen05_tile(
             f"{tcgc}.iterator, "
             f"cute.append(cute.append(cute.append({tcgc}.layout, {tcgen05_value.epilogue_rest_mode}), {tcgen05_value.epilogue_rest_mode}), {tcgen05_value.epilogue_rest_mode}))"
         ),
-        *([] if tcgen05_value.use_role_local_epi else tma_store_acc_layout_setup),
+        *(tma_store_acc_layout_setup if not hoist_tma_store_resources else []),
         (
             f"{tiled_copy_t2r}, {ttr_tacc_base}, {ttr_racc} = "
             "cutlass.utils.gemm.sm100.epilogue_tmem_copy_and_partition("
@@ -3287,17 +3348,39 @@ def _codegen_cute_store_tcgen05_tile(
             + f"if {tcgen05_value.epi_active}:\n"
             + emit_pipeline_advance(tcgen05_value.acc_consumer_state, indent="    ")
         ),
-        *([] if tcgen05_value.use_role_local_epi else [tma_store_pipeline_tail]),
+        *(
+            [tma_store_pipeline_tail]
+            if not (hoist_tma_store_resources or hoist_hybrid_tma_store_pipeline)
+            else []
+        ),
     ]
-    store_body_core = (
-        suppressed_store_body_core
-        if diagnose_skip_epilogue_store
-        else (
-            tma_store_body_core
-            if tcgen05_value.use_tma_store_epilogue
-            else simt_store_body_core
+    tma_store_body_source = "\n".join(tma_store_body_core)
+    simt_store_body_source = "\n".join(simt_store_body_core)
+    if (
+        tcgen05_value.tma_store_full_tiles_only
+        and tcgen05_value.role_local_tile_counter
+    ):
+        tma_store_body_source += (
+            f"\n{tcgen05_value.role_local_tile_counter} = "
+            f"{tcgen05_value.role_local_tile_counter} + cutlass.Int32(1)"
         )
-    )
+    hybrid_tma_store_body_core = [
+        f"{full_tile} = {full_tile_expr}",
+        (
+            f"if {full_tile}:\n"
+            f"{textwrap.indent(tma_store_body_source, '    ')}\n"
+            "else:\n"
+            f"{textwrap.indent(simt_store_body_source, '    ')}"
+        ),
+    ]
+    if diagnose_skip_epilogue_store:
+        store_body_core = suppressed_store_body_core
+    elif tcgen05_value.tma_store_full_tiles_only:
+        store_body_core = hybrid_tma_store_body_core
+    elif tcgen05_value.use_tma_store_epilogue:
+        store_body_core = tma_store_body_core
+    else:
+        store_body_core = simt_store_body_core
     main_stmts: list[ast.AST]
     if tcgen05_value.use_role_local_epi:
         # These setup statements intentionally remain virtual-pid-independent.
@@ -3308,11 +3391,19 @@ def _codegen_cute_store_tcgen05_tile(
             [
                 statement_from_string(line)
                 for line in [
-                    *tma_store_pipeline_setup,
-                    *tma_store_role_invariant_setup,
+                    *(
+                        tma_store_pipeline_setup
+                        if hoist_tma_store_resources or hoist_hybrid_tma_store_pipeline
+                        else []
+                    ),
+                    *(
+                        tma_store_role_invariant_setup
+                        if hoist_tma_store_resources
+                        else []
+                    ),
                 ]
             ]
-            if tcgen05_value.use_tma_store_epilogue and not diagnose_skip_epilogue_store
+            if (hoist_tma_store_resources or hoist_hybrid_tma_store_pipeline)
             else []
         )
         sync_before_stmt = statement_from_string("cute.arch.sync_threads()")
@@ -3346,11 +3437,7 @@ def _codegen_cute_store_tcgen05_tile(
     # Keep them as separate statements so the persistent splitter can
     # extract them via the post-loop registration below.
     post_loop_lines: list[str] = []
-    if (
-        tcgen05_value.use_tma_store_epilogue
-        and tcgen05_value.use_role_local_epi
-        and not diagnose_skip_epilogue_store
-    ):
+    if hoist_tma_store_resources or hoist_hybrid_tma_store_pipeline:
         # Role-local persistent epilogues reuse the C-store pipeline across
         # scheduler-recycled work tiles. Draining it inside each tile would
         # serialize the next tile's epilogue against this tile's TMA stores.
