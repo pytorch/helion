@@ -16,6 +16,12 @@ import torch
 import helion
 from helion import exc
 from helion._compiler.compile_environment import CompileEnvironment
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_SCHED_CONSUMER_WAIT_MODE_CONFIG_KEY,
+)
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_SCHED_CONSUMER_WAIT_MODE_WARP_LEADER,
+)
 from helion._testing import TestCase
 from helion._testing import onlyBackends
 from helion._testing import skipIfXPU
@@ -657,6 +663,18 @@ class TestCuteTcgen05ConfigSpecSplit(TestCase):
                     block_sizes=[128, 128, 64],
                     tcgen05_strategy="role_local_monolithic",
                     tcgen05_warp_spec_c_input_warps=1,
+                )
+            )
+
+        with self.assertRaises(exc.InvalidConfig):
+            spec.normalize(
+                helion.Config(
+                    block_sizes=[128, 128, 64],
+                    **{
+                        TCGEN05_SCHED_CONSUMER_WAIT_MODE_CONFIG_KEY: (
+                            TCGEN05_SCHED_CONSUMER_WAIT_MODE_WARP_LEADER
+                        )
+                    },
                 )
             )
 

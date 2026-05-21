@@ -80,6 +80,9 @@ from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_PID_TYPE
 from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_STAGE_CONFIGS
 from .tcgen05_constants import TCGEN05_ONE_CTA_MAX_BLOCK_M
+from .tcgen05_constants import TCGEN05_SCHED_CONSUMER_WAIT_MODE_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_SCHED_CONSUMER_WAIT_MODE_NORMAL
+from .tcgen05_constants import TCGEN05_SCHED_CONSUMER_WAIT_MODES
 from .tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
 from .tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
 from .tcgen05_constants import TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K
@@ -141,6 +144,7 @@ CUTE_TCGEN05_DIAGNOSTIC_CONFIG_KEYS: frozenset[str] = frozenset(
         TCGEN05_DIAGNOSTIC_INVALID_OUTPUT_CONFIG_KEY,
         TCGEN05_EPILOGUE_LAYOUT_CONFIG_KEY,
         TCGEN05_LARGE_BN_PROOF_CONFIG_KEY,
+        TCGEN05_SCHED_CONSUMER_WAIT_MODE_CONFIG_KEY,
     }
 )
 CUTE_TCGEN05_STRATEGY_CONFIG_KEYS: frozenset[str] = frozenset(
@@ -998,6 +1002,28 @@ class CuteTcgen05Config:
             TCGEN05_EPILOGUE_LAYOUTS,
             fix_invalid=fix_invalid,
         )
+        self._validate_enum_config(
+            config,
+            TCGEN05_SCHED_CONSUMER_WAIT_MODE_CONFIG_KEY,
+            TCGEN05_SCHED_CONSUMER_WAIT_MODES,
+            fix_invalid=fix_invalid,
+        )
+        if (
+            TCGEN05_SCHED_CONSUMER_WAIT_MODE_CONFIG_KEY in config
+            and config.get(TCGEN05_SCHED_CONSUMER_WAIT_MODE_CONFIG_KEY)
+            != TCGEN05_SCHED_CONSUMER_WAIT_MODE_NORMAL
+            and config.get(TCGEN05_STRATEGY_CONFIG_KEY)
+            != Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER.value
+        ):
+            if fix_invalid:
+                config.pop(TCGEN05_SCHED_CONSUMER_WAIT_MODE_CONFIG_KEY, None)
+            else:
+                raise InvalidConfig(
+                    f"{TCGEN05_SCHED_CONSUMER_WAIT_MODE_CONFIG_KEY} is only "
+                    "supported with "
+                    f"{TCGEN05_STRATEGY_CONFIG_KEY}="
+                    f"{Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER.value!r}"
+                )
 
     def _validate_enum_config(
         self,

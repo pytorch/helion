@@ -22,7 +22,7 @@ TCGEN05_TWO_CTA_EDGE_K_TAIL_ACC_STAGES = 1
 # showed the hybrid TMA/SIMT store running faster with two C-store stages than
 # with the earlier four-stage seed.
 TCGEN05_TWO_CTA_EDGE_K_TAIL_C_STAGES = 2
-# The same target8 sweep converged on a smaller L2 scheduler group plus the
+# The same reference sweep converged on a smaller L2 scheduler group plus the
 # four-tile L2 swizzle. Keep these with the edge+K-tail stage tuple so the
 # seeded/fixed CtaGroup.TWO family starts at the measured production row.
 TCGEN05_TWO_CTA_EDGE_K_TAIL_L2_GROUPING = 2
@@ -226,6 +226,17 @@ TCGEN05_AB_CONSUMER_PHASE_MODE_PHASE1 = "phase1"
 TCGEN05_AB_CONSUMER_PHASE_MODES = (
     TCGEN05_AB_CONSUMER_PHASE_MODE_NORMAL,
     TCGEN05_AB_CONSUMER_PHASE_MODE_PHASE1,
+)
+TCGEN05_SCHED_CONSUMER_WAIT_MODE_CONFIG_KEY = "tcgen05_sched_consumer_wait_mode"
+TCGEN05_SCHED_CONSUMER_WAIT_MODE_NORMAL = "normal"
+# Diagnostic-only scheduler-broadcast wait topology. Lane 0 waits on the
+# sched-pipeline full barrier, then the warp reconverges before all lanes fence
+# and read the SMEM mailbox. B200 profiling measured this slower than the
+# normal whole-warp wait path; keep it opt-in for scheduler-wait experiments.
+TCGEN05_SCHED_CONSUMER_WAIT_MODE_WARP_LEADER = "warp_leader"
+TCGEN05_SCHED_CONSUMER_WAIT_MODES = (
+    TCGEN05_SCHED_CONSUMER_WAIT_MODE_NORMAL,
+    TCGEN05_SCHED_CONSUMER_WAIT_MODE_WARP_LEADER,
 )
 TCGEN05_CUBIN_LINEINFO_CONFIG_KEY = "tcgen05_cubin_lineinfo"
 # Diagnostic-only G4 admission proof. This key lets tests exercise the
