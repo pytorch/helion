@@ -496,20 +496,29 @@
 
 </div>
 
-<h2 style="font-size:16px; margin:16px 0 8px 0;">Three lowering strategies — illustrated on the running example</h2>
+<h2 style="font-size:16px; margin:16px 0 8px 0;">The design: per-seq dynamic loop with double-buffered DMA</h2>
 <p style="font-size:12.5px; color:#3c4043; margin:0 0 14px 0;">
-  Running example throughout this section:
-  <code>N = 4</code>,
+  Single-program grid; <code>pl.loop</code> iterates over sequences <i>inside</i>
+  the kernel. For each sequence, <code>bx_sz</code>-row blocks of input are
+  fetched from HBM into a double-buffered VMEM scratch via
+  <code>pltpu.make_async_copy</code>; each block is reduced and accumulated
+  into an fp32 scratch row; at the sequence boundary the accumulator is cast,
+  copied to a separate double-buffered output VMEM slot, and DMA'd back to
+  HBM. The assembly is the application of building blocks N1–N8 (see panel
+  below); the kernel body is ~80 lines minus comments.
+</p>
+<p style="font-size:12.5px; color:#3c4043; margin:0 0 14px 0;">
+  Running example used throughout the walkthrough:
+  <code>B = 4</code>,
   <code>n<sub>i</sub> = [3, 7, 5, 9]</code>,
   <code>L = 24</code>,
   <code>M = 8</code>,
   <code>x_offsets = [0, 3, 10, 15, 24]</code>,
-  Pallas <code>BLOCK_L = 8</code>, <code>BLOCK_M = 2</code>.
-  Per-item L-ranges:
-  item 0 → L[0,3),
-  item 1 → L[3,10) <i>(crosses L-block boundary at L=8)</i>,
-  item 2 → L[10,15),
-  item 3 → L[15,24) <i>(crosses L-block boundary at L=16)</i>.
+  fetch block size <code>bx_sz = 8</code>.
+  After lane-padding, <code>M_padded = 128</code>; <code>x</code> is
+  <code>(24, 128)</code> (zero-padded along the lane dim — zero is the sum
+  identity), and <code>out</code> is <code>(4, 128)</code> in HBM, trimmed
+  back to <code>(4, 8)</code> by <code>prepare_outputs</code>.
 </p>
 
 <style>
@@ -593,214 +602,263 @@
   .pros li, .cons li { margin-bottom: 3px; }
 </style>
 
-<!-- ===================== OPTION 1 ===================== -->
+<!-- ===================== DISTILLED DESIGN ===================== -->
 <div class="strat-panel">
-  <div class="strat-title">Strategy (1) — SMEM-side preprocessing</div>
+  <div class="strat-title">Per-seq dynamic loop — concrete walkthrough on the running example</div>
   <div class="strat-subtitle">
-    Compiler reframes the kernel to walk L-blocks. <code>x_offsets</code> stays on the host but its
-    <i>per-block decomposition</i> is computed inside the kernel by a one-time SMEM scalar scan
-    before the VMEM pipeline starts.
+    Single program, <code>pl.loop</code> over seqs inside; per-seq pipeline =
+    prefetch-next + wait-cur + masked-reduce + accumulate + (if last bx of seq)
+    flush. Ping-pong rotation in SMEM (N7) drives the double-buffered DMA.
   </div>
 
-  <div class="strat-section">Memory layout (this example)</div>
+  <div class="strat-section">Memory layout</div>
   <table class="iomap">
-    <tr><th>Space</th><th>Contents</th><th>Concrete sizes</th></tr>
-    <tr><td class="space">HBM</td><td>x_data, out</td><td>x_data: [24, 8], out: [4, 8]</td></tr>
-    <tr><td class="space">SMEM (input)</td><td>x_offsets (scalar prefetch)</td><td>[5] int32</td></tr>
-    <tr><td class="space">SMEM (scratch)</td><td>stream[(blk, end_offset)], block_start[b]</td><td>computed at kernel entry; ≤ 7 entries here (see below)</td></tr>
-    <tr><td class="space">VMEM (in-spec)</td><td>x_view = x_data.view(num_L_blocks, BLOCK_L, M), one (BLOCK_L, M) tile/program</td><td>[8, 8] per L-block program; 3 L-blocks</td></tr>
-    <tr><td class="space">VMEM (scratch)</td><td>o_scratch (whole output, accumulated)</td><td>[4, 8] persistent across the L-block sweep</td></tr>
+    <tr><th>Space</th><th>Tensor / ref</th><th>Shape (example)</th><th>Origin</th></tr>
+    <tr><td class="space">HBM</td><td>x (lane-padded)</td><td>x.dtype[24, 128]</td><td><code>prepare_inputs</code> zero-pads M=8 → 128 (sum-identity pad)</td></tr>
+    <tr><td class="space">HBM</td><td>out (raw)</td><td>out_dtype[4, 128]</td><td>trimmed by <code>prepare_outputs</code> back to (4, 8)</td></tr>
+    <tr><td class="space">SMEM (prefetch)</td><td>cu_x_lens_ref</td><td>i32[5]</td><td>= x_offsets, lane-padded to 128 entries inside Mosaic</td></tr>
+    <tr><td class="space">SMEM (prefetch)</td><td>sem_ids_ref</td><td>i32[2]</td><td>N7 ping-pong rotation: index 0 = bx, 1 = bo. Init = [0, 0]</td></tr>
+    <tr><td class="space">SMEM (prefetch)</td><td>bo_ids_ref</td><td>i32[2]</td><td>N6 per-buffer payload: seq_idx each bo buffer is holding. Init = [-1, -1]</td></tr>
+    <tr><td class="space">VMEM (scratch)</td><td>bx_x2_ref</td><td>x.dtype[2, 8, 128]</td><td>input double-buffer; bx_sz=8 rows × M_padded=128 lanes, × 2 ping-pong</td></tr>
+    <tr><td class="space">VMEM (scratch)</td><td>bo_x2_ref</td><td>out_dtype[2, 128]</td><td>output double-buffer; one row per buffer (output is 1 row per seq)</td></tr>
+    <tr><td class="space">VMEM (scratch)</td><td>acc_ref</td><td>fp32[128]</td><td>per-seq accumulator; persistent across bx blocks within a seq</td></tr>
+    <tr><td class="space">VMEM (semaphores)</td><td>sems</td><td>DMA[2, 2]</td><td>2 fetch types (bx, bo) × 2 ping-pong buffers each</td></tr>
   </table>
 
-  <div class="strat-section">SMEM scan — walking <code>x_offsets = [0, 3, 10, 15, 24]</code> with BLOCK_L = 8</div>
+  <div class="strat-section">Per-seq block count (this example, bx_sz = 8)</div>
   <table class="iomap">
-    <tr><th>i</th><th>x_offsets[i]</th><th>(blk, off) = (x // 8, x % 8)</th><th>Block jumped?</th><th>SMEM emits</th></tr>
-    <tr><td>0</td><td>0</td><td>(0, 0)</td><td>—</td><td>(0, 0)</td></tr>
-    <tr><td>1</td><td>3</td><td>(0, 3)</td><td>no</td><td>(0, 3)</td></tr>
-    <tr><td>2</td><td>10</td><td>(1, 2)</td><td><b>yes</b>: 0 → 1</td><td><span class="star">(0, 8) ←&nbsp;synthetic*</span>, then (1, 2)</td></tr>
-    <tr><td>3</td><td>15</td><td>(1, 7)</td><td>no</td><td>(1, 7)</td></tr>
-    <tr><td>4</td><td>24</td><td>(2, 8) ≡ end-of-block-2</td><td><b>yes</b>: 1 → 2</td><td><span class="star">(1, 8) ←&nbsp;synthetic*</span>, then (2, 8)</td></tr>
+    <tr><th>seq</th><th>n<sub>i</sub></th><th>x_start..x_end</th><th>num_bx = ⌈n/8⌉</th><th>per-bx sizes</th></tr>
+    <tr><td>0</td><td>3</td><td>0 .. 3</td><td>1</td><td>sz=3 (mask rows 3..7)</td></tr>
+    <tr><td>1</td><td>7</td><td>3 .. 10</td><td>1</td><td>sz=7 (mask row 7)</td></tr>
+    <tr><td>2</td><td>5</td><td>10 .. 15</td><td>1</td><td>sz=5 (mask rows 5..7)</td></tr>
+    <tr><td>3</td><td>9</td><td>15 .. 24</td><td>2</td><td>sz=[8, 1] (full / mask rows 1..7)</td></tr>
+  </table>
+
+  <div class="strat-section">Kernel-iteration trace (5 inner-loop iterations total)</div>
+  <table class="iomap">
+    <tr><th>iter</th><th>seq</th><th>bx_idx</th><th>bx_sem (read SMEM[0])</th><th>prefetch next</th><th>wait cur</th><th>compute (sz, mask)</th><th>flush bo? (bx==last)</th></tr>
+    <tr><td>1</td><td>0</td><td>0</td><td>0</td><td>(seq=1, bx=0, sem=1) → SMEM[0]:=1</td><td>buf 0 (from prologue)</td><td>sz=3, mask rows 3..7</td><td>yes — bo_sem=0, store, send</td></tr>
+    <tr><td>2</td><td>1</td><td>0</td><td>1</td><td>(seq=2, bx=0, sem=0) → SMEM[0]:=0</td><td>buf 1</td><td>sz=7, mask row 7</td><td>yes — bo_sem=1, wait prior (cold), send</td></tr>
+    <tr><td>3</td><td>2</td><td>0</td><td>0</td><td>(seq=3, bx=0, sem=1) → SMEM[0]:=1</td><td>buf 0</td><td>sz=5, mask rows 5..7</td><td>yes — bo_sem=0, wait seq-0 bo drain, send</td></tr>
+    <tr><td>4</td><td>3</td><td>0</td><td>1</td><td>(seq=3, bx=1, sem=0) → SMEM[0]:=0</td><td>buf 1</td><td>sz=8, no mask</td><td>no — bx_idx ≠ num_bx-1</td></tr>
+    <tr><td>5</td><td>3</td><td>1</td><td>0</td><td>next_seq=4 ≥ num_seqs → skip</td><td>buf 0</td><td>sz=1, mask rows 1..7</td><td>yes — bo_sem=1, wait seq-1 bo drain, send</td></tr>
   </table>
 
   <div class="walkthrough">
-    <b>The <span class="star">*</span> problem.</b>
-    Without the synthetic entries the stream would be
-    <code>[(0,0), (0,3), (1,2), (1,7), (2,8)]</code>. Item 1's contribution shows up as the pair
-    <code>(0,3) → (1,2)</code> — a range whose start and end are in <i>different</i> L-blocks.
-    Mosaic can't address such a slice from a single VMEM tile; the per-block compute can't decode it.
-    The fix is to <i>cut the row at the block boundary</i> by inserting synthetic
-    <code>(prev_blk, BLOCK_L)</code> entries every time the block index jumps.
-    After insertion the stream becomes
-    <code>[(0,0), (0,3), <span class="star">(0,8)*</span>, (1,2), (1,7), <span class="star">(1,8)*</span>, (2,8)]</code>.
-    Now every consecutive pair lies in one block, and items spanning blocks are correctly
-    represented as two contributions (head + tail) that the VMEM scratch accumulator
-    re-stitches.<br><br>
-    For this example the <span class="star">*</span> problem inserts 2 extra entries (5 → 7).
-    For long rows where <code>n<sub>i</sub> &gt; 2·BLOCK_L</code> the insert is a while-loop
-    (one synthetic per crossed boundary), and the SMEM scratch sizing must reserve for
-    <code>ceil(max(n<sub>i</sub>) / BLOCK_L) − 1</code> inserts per row.
+    <b>Detailed view of iter 4 → iter 5 (seq 3, split across two bx blocks — the only multi-block seq in this example):</b>
+    <ol>
+      <li><b>Iter 4 (seq=3, bx_idx=0):</b> bx_sem=1 → consume buf 1.
+          <code>@pl.when(bx_idx == 0)</code> fires (N8): <code>acc_ref[...] = 0</code>.
+          <code>get_next_bx_ids</code> returns (seq=3, bx=1, sem=0): still
+          inside seq 3, advance to bx_idx=1, flip ping-pong. Prefetch starts
+          fetching the second bx of seq 3 into buf 0; SMEM[0] is committed
+          to 0 first so the next iter inherits the new state (N7).
+          Wait on buf 1; buf 1 holds rows 15..22 (8 rows, fully valid).
+          Reduce: <code>bx_block.sum(axis=0)</code> over all 8 rows;
+          <code>acc_ref += sum</code>. <i>No flush</i> — bx_idx=0 ≠ num_bx-1=1.</li>
+      <li><b>Iter 5 (seq=3, bx_idx=1):</b> bx_sem=0 → consume buf 0.
+          <code>@pl.when(bx_idx == 0)</code> does NOT fire — acc_ref still
+          holds the partial sum from iter 4. <code>get_next_bx_ids</code>
+          returns (seq=4, bx=0, sem=1); next_seq ≥ num_seqs → prefetch
+          guard suppresses the start_fetch. Wait on buf 0; buf 0 holds row
+          23 plus 7 stale lanes. Mask
+          (<code>iota &lt; sz=1</code>) zeros out rows 1..7;
+          <code>bx_masked.sum(axis=0)</code> contributes just row 23 to acc.
+          <code>@pl.when(bx_idx == num_bx-1)</code> fires (N8): bo_sem=1,
+          flip SMEM[1] to 0, <code>wait_send_bo(1)</code> drains seq-1's
+          bo (which had been in flight since iter 2). Cast acc to
+          out_dtype, store to bo_x2_ref[1], start the bo DMA to
+          <code>out[3, :]</code>; record <code>bo_ids_ref[1] = 3</code>.</li>
+      <li><b>Epilogue (still inside iter 5, since seq_idx == num_seqs - 1 == 3):</b>
+          <code>for i in range(2): wait_send_bo(i)</code> drains the two
+          remaining in-flight bo DMAs — buf 0 (seq 2) and buf 1 (seq 3 we
+          just started). After this the kernel returns and HBM out is
+          complete.</li>
+    </ol>
   </div>
 
-  <div class="strat-section">Per-block contributions (decoded from the stream)</div>
-  <table class="iomap">
-    <tr><th>L-block</th><th>Contributions (pair → item, local slice)</th></tr>
-    <tr><td>0 (L[0,8))</td><td>(0,0)→(0,3) item 0 full · (0,3)→(0,8)* item 1 <b>head</b> rows 0..4</td></tr>
-    <tr><td>1 (L[8,16))</td><td>implicit (1,0)→(1,2) item 1 <b>tail</b> rows 5..6 · (1,2)→(1,7) item 2 full · (1,7)→(1,8)* item 3 <b>head</b> row 0</td></tr>
-    <tr><td>2 (L[16,24))</td><td>implicit (2,0)→(2,8) item 3 <b>tail</b> rows 1..8</td></tr>
-  </table>
+  <div class="strat-section">Building blocks applied in this design</div>
+  <div class="walkthrough">
+    Cross-reference to the inherited primitives panel below.
+    <ul>
+      <li><b>N1 online accumulator</b> — read prev / combine / write back —
+          the per-block <code>acc_ref[...] = acc_ref[...] + bx_masked.sum(axis=0)</code>.
+          Same machinery as RPA's softmax stats; simpler math (plain add).</li>
+      <li><b>N2 broadcast_minor</b> — <i>not used</i> by plain
+          jagged_sum. Becomes relevant for jagged_mean (divide acc by
+          <code>n<sub>i</sub></code> broadcast across M lanes at flush).</li>
+      <li><b>N3 <code>_async_copy</code></b> — verbatim, called from
+          <code>_fetch_bx</code> and <code>_send_bo</code>.</li>
+      <li><b>N4 degenerate-copy semaphore wait</b> — used in the
+          <code>wait=True</code> branch of <code>_fetch_bx</code> and
+          <code>_send_bo</code>; lets the wait happen in a different
+          closure from where the original DMA started.</li>
+      <li><b>N5 re-derive seq quantities inside closures</b> —
+          <code>_derive_iter_quantities(seq_idx, cu_x_lens_ref)</code>
+          called locally inside <code>_fetch_bx</code> so the prefetch
+          look-ahead (called with <i>next</i> seq_idx) sees the right
+          start/end.</li>
+      <li><b>N6 per-buffer SMEM payload (<code>bo_ids_ref[2]</code>)</b> —
+          <code>start_send_bo(seq_idx, ...)</code> writes seq_idx to
+          bo_ids_ref[bo_sem_idx]; <code>wait_send_bo(bo_sem_idx)</code>
+          reads it back. <code>@pl.when(0 ≤ old_seq_idx ≤ seq_idx)</code>
+          guard skips the cold-start case (sentinel -1).</li>
+      <li><b>N7 SMEM ping-pong rotation (<code>sem_ids_ref[2]</code>)</b> —
+          index 0 = bx, 1 = bo. Each iter reads at top, computes flipped
+          next via <code>lax.select</code>, writes flipped value to SMEM
+          inside <code>prefetch_next_bx</code>/<code>flush_bo</code>.</li>
+      <li><b>N8 seq-boundary acc-init and bo-flush</b> —
+          <code>@pl.when(bx_idx == 0)</code> guards acc init;
+          <code>@pl.when(bx_idx == num_bx - 1)</code> guards bo flush.
+          Without these guards we'd zero acc per block (wrong: drops
+          partial sums in multi-block seqs like seq 3) and flush per
+          block (wasted DMAs + wrong output for multi-block seqs).</li>
+    </ul>
+  </div>
 
-  <div class="pros-cons">
-    <div class="pros">
-      <b>Pros</b>
-      <ul>
-        <li><b>Input stable</b>: <code>x_offsets</code> is given on the host, fully known before launch. No host preprocessing call needed; everything self-contained in the kernel.</li>
-        <li>Single wide aligned VMEM load per L-block program; high arithmetic intensity per DMA.</li>
-        <li>Chunking handles oversized items naturally (a long row simply spans more L-blocks; no special case).</li>
-      </ul>
-    </div>
-    <div class="cons">
-      <b>Cons</b>
-      <ul>
-        <li><b>The <span class="star">*</span> problem</b>: boundary-crossing insertion logic. For long rows (<code>n<sub>i</sub> &gt; 2·BLOCK_L</code>) it becomes a while-loop inside the scan, with SMEM scratch sized for the worst case.</li>
-        <li><b>SMEM/VMEM pipeline gap</b>: the SMEM scan runs serially <i>before</i> the VMEM pipeline starts (it has to — the pipeline needs <code>block_start[]</code> to know how many contributions per block). For <code>B</code> in the 100–1000 range, that's 100–1000+ SMEM cycles of pure overhead during which VMEM is idle. That's several matmul-cycles' worth of wasted time per kernel call.</li>
-        <li>Per-block compute waste bounded by <code>(BLOCK_L − avg_n<sub>i</sub>_in_block) / BLOCK_L</code> — full-width masked reduce even when the row only covers part of the block.</li>
-      </ul>
-    </div>
+  <div class="strat-section">Constraints and trade-offs</div>
+  <div class="walkthrough">
+    <ul>
+      <li><b>Single-program grid</b> (<code>grid=(1,)</code>). All seqs
+          processed sequentially inside one program by the inner
+          <code>pl.loop</code>. <i>Not</i> grid-parallel over seqs —
+          parallelism is over Megacore cores at a higher level (RPA notes
+          this as TODO; same applies to us).</li>
+      <li><b><code>bx_sz</code> must be a multiple of 8</b> (sublane
+          alignment). Tunable; default 64 in the public API. Larger =
+          fewer DMA round-trips per long seq, more VMEM, more masked-out
+          compute on short partial-tail blocks. Bounded by
+          <code>vmem_limit_bytes</code>.</li>
+      <li><b><code>M_padded</code> must be a multiple of 128</b> (lane
+          alignment). <code>prepare_inputs</code> zero-pads if
+          <code>M_actual &lt; M_padded</code>; <code>prepare_outputs</code>
+          trims back. Zero is the sum identity so padded lanes contribute
+          nothing — for jagged_mean the padded lanes also divide by
+          <code>n<sub>i</sub></code> harmlessly.</li>
+      <li><b>Partial-tail block masking</b> (when
+          <code>sz &lt; bx_sz</code>): unfetched VMEM rows hold stale data
+          from prior DMAs, so we mask with iota &lt; sz and zero-fill
+          before the reduce. Static-shape — Mosaic-friendly.</li>
+      <li><b>Strategy-3 hook preserved</b>: <code>static_q_len</code> kwarg
+          on <code>_jagged_sum_kernel_loop</code> and a dual-branch
+          inside <code>process</code> (Strategy 2 derives num_bx from
+          dynamic seq_len; Strategy 3 from static_q_len). Wiring the
+          host-side workitem arrays (starts, ends, out_rows, modes) into
+          scalar_prefetches is the remaining work to enable Strategy 3.</li>
+    </ul>
   </div>
 </div>
 
-<!-- ===================== OPTION 2 ===================== -->
+
+<!-- ===================== Inherited building blocks ===================== -->
+<!-- Identified during line-by-line walkthrough of RPA v3 kernel.       -->
+<!-- These are the primitives the distilled design above is assembled   -->
+<!-- from. Shows the lowering is mostly composition of proven blocks,   -->
+<!-- not net-new design.                                                 -->
+
 <div class="strat-panel">
-  <div class="strat-title">Strategy (2) — Dynamic loop (per-item async copy)</div>
+  <div class="strat-title">Inherited building blocks (the distilled design above is their assembly)</div>
   <div class="strat-subtitle">
-    No L-space reframe. Compiler keeps the source's <code>for tile_b</code> structure.
-    <code>x_offsets</code> goes into SMEM via scalar prefetch; each iteration reads
-    its <code>(start, end)</code> from SMEM and asynchronously copies the per-item slice
-    of <code>x_data</code> into VMEM scratch.
+    Reusable implementation primitives from
+    <code>tpu-inference/.../ragged_paged_attention/v3/kernel.py</code>
+    that map 1:1 to the data-movement and accumulation scaffolding the
+    design needs. Identified from line-by-line walkthrough; each is
+    production-tested in RPA.
   </div>
 
-  <div class="strat-section">Memory layout (this example)</div>
-  <table class="iomap">
-    <tr><th>Space</th><th>Contents</th><th>Concrete sizes</th></tr>
-    <tr><td class="space">HBM</td><td>x_data, out</td><td>x_data: [24, 8], out: [4, 8]</td></tr>
-    <tr><td class="space">SMEM</td><td>x_offsets (scalar prefetch)</td><td>[5] int32</td></tr>
-    <tr><td class="space">VMEM (in-spec)</td><td><i>none for x_data</i> — bypass BlockSpec; use raw HBM ref</td><td>—</td></tr>
-    <tr><td class="space">VMEM (scratch)</td><td>x_vmem (per-item buffer), o_vmem (whole output)</td><td>x_vmem: [max(n<sub>i</sub>), M] = [9, 8]; o_vmem: [4, 8]</td></tr>
-  </table>
+  <ul style="font-size: 12.5px; line-height: 1.6; margin: 0; padding-left: 22px;">
+    <li><b>Online accumulator update pattern.</b> RPA reads previous
+        VMEM-scratch state, combines with the new block's contribution,
+        writes back. RPA's flavour is FlashAttention's online softmax with
+        running <code>(m_prev, l_prev)</code> stats and rescale-by-<code>exp(m_prev − m_curr)</code>.
+        For jagged_sum it collapses to <code>acc_ref[...] += block_sum</code>
+        on an fp32 scratch buffer, initialized at each new sequence and
+        flushed at sequence end. <b>Same machinery, simpler math.</b></li>
 
-  <div class="strat-section">Walking through the 4 iterations</div>
-  <table class="iomap">
-    <tr><th>i</th><th>SMEM reads</th><th>n<sub>i</sub></th><th>async_copy src → dst</th><th>VMEM usage</th><th>Writes</th></tr>
-    <tr><td>0</td><td>start=0, end=3</td><td>3</td><td>x_data[0:3, :] → x_vmem[:3, :]</td><td>3 / 9 sublanes (67% idle)</td><td>o_vmem[0, :]</td></tr>
-    <tr><td>1</td><td>start=3, end=10</td><td>7</td><td>x_data[3:10, :] → x_vmem[:7, :]</td><td>7 / 9 sublanes (22% idle)</td><td>o_vmem[1, :]</td></tr>
-    <tr><td>2</td><td>start=10, end=15</td><td>5</td><td>x_data[10:15, :] → x_vmem[:5, :]</td><td>5 / 9 sublanes (44% idle)</td><td>o_vmem[2, :]</td></tr>
-    <tr><td>3</td><td>start=15, end=24</td><td>9</td><td>x_data[15:24, :] → x_vmem[:9, :]</td><td>9 / 9 sublanes (full)</td><td>o_vmem[3, :]</td></tr>
-  </table>
+    <li><b><code>_async_copy(src, dst, sem, wait)</code> helper.</b>
+        9-line wrapper around <code>pltpu.make_async_copy</code> that takes
+        a <code>wait</code> flag. Callers write <code>start_fetch_*(...)</code>
+        (wait=False) and <code>wait_fetch_*(...)</code> (wait=True) as thin
+        one-liners. <b>Reuse verbatim.</b></li>
 
-  <div class="walkthrough">
-    Mosaic's alignment check is on the <i>destination VMEM ref</i> (always aligned by allocation),
-    not on the HBM source offset — so <code>x_data[start:end, :]</code> with a runtime
-    <code>start</code> is fine. After all iterations a single DMA copies <code>o_vmem → out</code>.
-  </div>
+    <li><b>Degenerate-copy semaphore wait.</b>
+        <code>_async_copy(src=dst, dst=dst, sem, wait=True)</code> waits on
+        a prior DMA's semaphore when the original copy object isn't in
+        scope (start and wait live in different closures). Hardware sees
+        the semaphore in flight and waits; the redundant self-copy is
+        collapsed because src and dst alias. <b>Canonical Pallas idiom.</b></li>
 
-  <div class="strat-section">When one item exceeds VMEM (m_tile / k_tile swap)</div>
-  <div class="walkthrough">
-    Suppose item 3 had <code>n<sub>3</sub> = 10,000</code> — that won't fit in VMEM at full
-    <code>M</code> width. The fix: chunk along the row axis inside the iteration. If the source
-    kernel has <code>for tile_m: for tile_k:</code>, the compiler must swap to
-    <code>for tile_k: for tile_m:</code> so <code>tile_k</code> chunks the per-item rows in
-    multiple async_copies. That's a constrained loop-interchange in the lowering pass —
-    well-defined but it's a real change to source-loop order.
-  </div>
+    <li><b>Re-derive seq quantities inside fetch/send closures.</b>
+        Closures take <code>seq_idx</code> as a parameter and call
+        <code>_derive_iter_quantities</code> locally rather than capturing
+        seq bounds from the outer scope. Required because the closures are
+        invoked with <i>different</i> seq_idx values — current sequence
+        AND a look-ahead "next sequence to prefetch." Capturing would pin
+        the closure to the outer call's seq_idx and break double-buffered
+        prefetch.</li>
 
-  <div class="pros-cons">
-    <div class="pros">
-      <b>Pros</b>
-      <ul>
-        <li><b>Easy to lower</b>: the compiler injects scalar prefetch + async_copy + VMEM scratch around the existing per-sequence kernel body. The body itself is unchanged from the canonical Helion source.</li>
-        <li><b>Sticks to what the user wrote</b>: the <code>for tile_b</code> loop in the source maps directly to the runtime loop in the kernel. No N-space → L-space reframe to reason about.</li>
-        <li>No SMEM scan overhead — <code>x_offsets</code> reads are amortized into the per-iteration hot loop (2 scalar reads each).</li>
-      </ul>
-    </div>
-    <div class="cons">
-      <b>Cons</b>
-      <ul>
-        <li><b>Potential VMEM waste</b>: scratch sized to <code>max(n<sub>i</sub>) × M</code>. Bounded by <code>max / avg</code>. For our example the smallest item uses 3/9 sublanes (67% idle); a kernel with one outlier item drags down all the rest.</li>
-        <li><b>Tile-loop reorder when one item exceeds VMEM</b>: the lowering must swap <code>tile_m</code> with <code>tile_k</code> so <code>tile_k</code> can chunk per-item rows. Requires the source kernel to expose tile_k as a chunk-able axis.</li>
-        <li>One async_copy per item — sequential, no cross-item pipelining. DMA setup overhead amortizes badly for very short items.</li>
-      </ul>
-    </div>
-  </div>
-</div>
+    <li><b><code>broadcast_minor(scalar, shape)</code> helper.</b>
+        Broadcasts a per-row scalar across the lane (M) dim for elementwise
+        ops. Used by RPA for <code>exp(s − m_curr)</code> in softmax. For
+        jagged_sum not strictly needed (plain vector add). For jagged_mean,
+        used to broadcast the per-row divisor <code>n<sub>i</sub></code>
+        across M lanes for the final divide. <b>Lift when we extend beyond
+        plain sum.</b></li>
 
-<!-- ===================== OPTION 3 ===================== -->
-<div class="strat-panel">
-  <div class="strat-title">Strategy (3) — Helion source rewrite + host-side preprocessing on CPU</div>
-  <div class="strat-subtitle">
-    User opts in via a new Helion primitive (e.g. <code>hl.jagged_workitems(x_offsets)</code>).
-    The Helion launcher does the preprocessing on the <b>host CPU</b> before kernel launch:
-    flatten the per-item work into a uniform list of <code>(start, end, output_row, mode)</code>
-    work-items, pre-chunking any oversized items. The kernel iterates this list linearly —
-    no <code>tile_k</code>, no loop-interchange.
-  </div>
+    <li><b>Per-buffer SMEM bookkeeping for split start/wait.</b> Ping-pong
+        VMEM buffers don't carry metadata; the "what work is this buffer
+        currently holding" record lives in a tiny SMEM scratch (RPA:
+        <code>bo_ids_ref[2 × num_buffers]</code> recording <code>(seq_idx,
+        block_idx)</code> per buffer). When <code>start_send_*</code> is
+        called it writes the record; when <code>wait_send_*</code> is
+        called with only the buffer index, it reads the record back to
+        know what to wait on. A <code>@pl.when(...)</code> guard skips
+        the wait at cold start (buffer not yet used) and after a prior
+        wait disarms the guard (RPA's "set size = 0 after wait" trick).
+        For jagged_sum: <code>bo_ids_ref</code> with one
+        <code>seq_idx</code> per buffer (2 entries for double buffering)
+        is enough — the block dim is implicit because output is one row
+        per seq.</li>
 
-  <div class="strat-section">Memory layout (this example)</div>
-  <table class="iomap">
-    <tr><th>Space</th><th>Contents</th><th>Concrete sizes</th></tr>
-    <tr><td class="space">Host (CPU)</td><td>computes work-item arrays from x_offsets</td><td>~5 µs of numpy</td></tr>
-    <tr><td class="space">HBM</td><td>x_data, out</td><td>x_data: [24, 8], out: [4, 8]</td></tr>
-    <tr><td class="space">SMEM</td><td>starts[], ends[], out_rows[], modes[] (scalar prefetch)</td><td>[K] int32 each, where K = num_workitems (≥ N, ≤ chunked-N)</td></tr>
-    <tr><td class="space">VMEM (in-spec)</td><td><i>none for x_data</i> — async_copy path</td><td>—</td></tr>
-    <tr><td class="space">VMEM (scratch)</td><td>x_vmem (per-workitem buffer), o_vmem (whole output)</td><td>x_vmem sized to chunk budget (compile-time, deterministic); o_vmem: [4, 8]</td></tr>
-  </table>
+    <li><b>SMEM-coordinated ping-pong rotation.</b> Distinct from N6
+        (which records per-buffer <i>payload</i>) — this is about which
+        buffer slot is current. Each fetch type (bq, bkv, bo in RPA;
+        bx and bo for us) gets one i32 slot in <code>sem_ids_ref</code>
+        recording the current ping-pong index. Each iteration:
+        (a) reads the current index from SMEM at the top
+        (<code>bq_sem_idx = sem_ids_ref[0]</code>);
+        (b) computes the flipped next index via the
+        <code>get_next_*_ids</code> helper
+        (<code>next_bq_sem_idx = lax.select(bq_sem_idx == 0, 1, 0)</code>);
+        (c) when prefetching, writes the flipped index to SMEM AND starts
+        the fetch (order within the iter doesn't matter — both must
+        happen before the next iter starts);
+        (d) uses the un-flipped index for the current iter's wait and
+        compute. The next iteration inherits the flipped value through
+        SMEM, with no need to pass any state through the
+        <code>@pl.loop</code> body closure. Canonical Pallas ping-pong
+        rotation idiom.</li>
 
-  <div class="strat-section">Host preprocessing (this example, no oversized items)</div>
-  <table class="iomap">
-    <tr><th>k</th><th>start</th><th>end</th><th>out_row</th><th>mode</th><th>comment</th></tr>
-    <tr><td>0</td><td>0</td><td>3</td><td>0</td><td>init</td><td>item 0 full</td></tr>
-    <tr><td>1</td><td>3</td><td>10</td><td>1</td><td>init</td><td>item 1 full</td></tr>
-    <tr><td>2</td><td>10</td><td>15</td><td>2</td><td>init</td><td>item 2 full</td></tr>
-    <tr><td>3</td><td>15</td><td>24</td><td>3</td><td>init</td><td>item 3 full</td></tr>
-  </table>
-
-  <div class="strat-section">Host preprocessing — hypothetical: VMEM holds only 6 sublanes</div>
-  <table class="iomap">
-    <tr><th>k</th><th>start</th><th>end</th><th>out_row</th><th>mode</th><th>comment</th></tr>
-    <tr><td>0</td><td>0</td><td>3</td><td>0</td><td>init</td><td>item 0 (n=3, fits)</td></tr>
-    <tr><td>1</td><td>3</td><td>9</td><td>1</td><td>init</td><td>item 1 chunk 1 of 2 (6 rows)</td></tr>
-    <tr><td>2</td><td>9</td><td>10</td><td>1</td><td>accum</td><td>item 1 chunk 2 of 2 (1 row) — adds to out_row 1</td></tr>
-    <tr><td>3</td><td>10</td><td>15</td><td>2</td><td>init</td><td>item 2 (n=5, fits)</td></tr>
-    <tr><td>4</td><td>15</td><td>21</td><td>3</td><td>init</td><td>item 3 chunk 1 of 2 (6 rows)</td></tr>
-    <tr><td>5</td><td>21</td><td>24</td><td>3</td><td>accum</td><td>item 3 chunk 2 of 2 (3 rows) — adds to out_row 3</td></tr>
-  </table>
-
-  <div class="walkthrough">
-    Each kernel iteration reads <code>(start, end, out_row, mode)</code> from SMEM,
-    does one <code>async_copy</code>, reduces, then writes-or-accumulates into
-    <code>o_vmem[out_row, :]</code>. The kernel has no concept of "item" or "chunk" —
-    just a flat work-item index <code>k = 0..K−1</code>. The host pre-decided what each
-    iteration does.
-  </div>
-
-  <div class="pros-cons">
-    <div class="pros">
-      <b>Pros</b>
-      <ul>
-        <li><b>Same as Strategy (2)</b>: easy to lower (per-iteration async_copy around a small kernel body); no SMEM scan blocking the VMEM pipeline; alignment falls out of VMEM scratch sizing.</li>
-        <li><b>No tile_k needed</b> — and no loop-interchange. Oversized items are chunked on the host before launch; the kernel just sees more work-items in the flat list.</li>
-        <li>VMEM scratch sizing is deterministic (compile-time chunk budget) instead of <code>max(n<sub>i</sub>)</code>-dependent. No VMEM waste from outlier items.</li>
-        <li>Opt-in via a Helion primitive — no compiler pattern-matching, no risk of mis-rewriting unrelated kernels.</li>
-      </ul>
-    </div>
-    <div class="cons">
-      <b>Cons</b>
-      <ul>
-        <li><b>Source rewrite required</b>: user must change their kernel to use the new primitive. Less "magic" than (1) or (2).</li>
-        <li>Adds a small per-launch host CPU cost (typically negligible for jagged kernels — microseconds — but real).</li>
-        <li>Triton/GPU lowering of the same primitive needs a fallback (likely a no-op rewrite back to the canonical gather form, since GPU doesn't need this dance).</li>
-      </ul>
-    </div>
-  </div>
+    <li><b>Seq-boundary acc-init and bo-flush (vs RPA's per-bq-block).</b>
+        Structural difference, not a reusable RPA mechanism — but
+        important to call out because it determines where guards go in our
+        analog of <code>compute_with_bq</code>. In RPA, each bq block
+        produces its own output rows, so
+        <code>acc_ref[...] = 0</code> happens at the START of every bq
+        iteration (line 1301) and <code>start_send_bo(...)</code> fires
+        at the END of every bq iteration (line 1457). In
+        <b>jagged_sum, all bx blocks of one sequence accumulate into the
+        SAME one-row output</b>, so the acc init must move to the FIRST
+        bx of each seq and the bo flush must move to the LAST bx of each
+        seq. Implementation:
+        <code>@pl.when(bx_idx == 0) def init_acc(): acc_ref[...] = 0</code>
+        and
+        <code>@pl.when(bx_idx == num_bx − 1) def flush_bo(): ... start_send_bo(...)</code>.
+        Same machinery as RPA's epilogue; different guard predicates.
+        Per-iter behavior of the output-side DMA also differs: RPA fires
+        one DMA per bq block (output is jagged like input); jagged_sum
+        fires one DMA per seq (output is dense, B rows).</li>
+  </ul>
 </div>
 
 </body>
