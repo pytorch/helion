@@ -327,17 +327,25 @@ class ForLoopGraphInfo(NodeArgsGraphInfo):
         args = state.ast_args[3]
         assert isinstance(args, list)
         assert all(isinstance(x, ast.AST) for x in args)
-        with state.codegen.add_device_loop(
-            state.device_function.tile_strategy.codegen_device_loop(
-                state, self.block_ids
-            ),
-            needs_barrier_before=self.needs_barrier_before,
-        ):
-            return codegen_call_with_graph(
-                state.codegen,
-                self.graph,
-                args,
-            )
+        # Make the active graph reachable by the strategy so it can pick
+        # different lane-loop shapes for the reduce vs consume sweeps.
+        # pyrefly: ignore [missing-attribute]
+        state.codegen._cute_active_graph_info = self
+        try:
+            with state.codegen.add_device_loop(
+                state.device_function.tile_strategy.codegen_device_loop(
+                    state, self.block_ids
+                ),
+                needs_barrier_before=self.needs_barrier_before,
+            ):
+                return codegen_call_with_graph(
+                    state.codegen,
+                    self.graph,
+                    args,
+                )
+        finally:
+            # pyrefly: ignore [missing-attribute]
+            state.codegen._cute_active_graph_info = None
 
 
 class ReductionLoopGraphInfo(ForLoopGraphInfo):
@@ -823,6 +831,15 @@ class DeviceIR:
                         size_hint=rdim.size_hint(),
                     )
                 )
+                if env.backend_name == "cute":
+                    from ..autotuner.config_spec import CuteVectorWidthSpec
+
+                    env.config_spec.cute_vector_widths.append(
+                        CuteVectorWidthSpec(
+                            block_id=rdim.block_id,
+                            size_hint=rdim.size_hint(),
+                        )
+                    )
             graphs_with_rolled_rdim |= used_graphs
 
         # Track which rdims appear as the reduction axis of an indexed

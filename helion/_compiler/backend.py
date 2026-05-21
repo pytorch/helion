@@ -2608,7 +2608,11 @@ class CuteBackend(Backend):
         plan_layouts(graphs, config, tile_strategy)
 
     def supports_config_key(self, key: str) -> bool:
-        if key == "num_threads" or key.startswith("tcgen05_"):
+        if (
+            key == "num_threads"
+            or key == "cute_vector_widths"
+            or key.startswith("tcgen05_")
+        ):
             return True
         return super().supports_config_key(key)
 
@@ -2709,12 +2713,14 @@ class CuteBackend(Backend):
             "hl": "import helion.language as hl",
             "cutlass": "import cutlass",
             "cute": "import cutlass.cute as cute",
+            "ir": "from cutlass._mlir import ir",
             "_default_cute_launcher": "from helion.runtime import default_cute_launcher as _default_cute_launcher",
             "_next_power_of_2": "from helion._utils import next_power_of_2 as _next_power_of_2",
             "_cute_argreduce_index": "from helion._compiler.cute.reduce_helpers import _cute_argreduce_index",
             "_cute_grouped_reduce_shared_tree": "from helion._compiler.cute.reduce_helpers import _cute_grouped_reduce_shared_tree",
             "_cute_grouped_reduce_shared_two_stage": "from helion._compiler.cute.reduce_helpers import _cute_grouped_reduce_shared_two_stage",
             "_cute_grouped_reduce_warp": "from helion._compiler.cute.reduce_helpers import _cute_grouped_reduce_warp",
+            "_cute_pre_vec_fold": "from helion._compiler.cute.reduce_helpers import _cute_pre_vec_fold",
             "_cute_store_shared_remote_x4": "from helion._compiler.cute.cluster_helpers import store_shared_remote_x4 as _cute_store_shared_remote_x4",
             "_cute_issue_clc_query_nomulticast": "from helion._compiler.cute.clc_helpers import issue_clc_query_nomulticast as _cute_issue_clc_query_nomulticast",
             "_cute_inline_asm_elementwise": "from helion._compiler.cute.inline_asm_helpers import inline_asm_elementwise as _cute_inline_asm_elementwise",
