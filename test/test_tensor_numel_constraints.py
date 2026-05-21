@@ -295,6 +295,7 @@ class TestMixedSymbolExtraction(unittest.TestCase):
 
         # Minimal mock of CompileEnvironment for _extract_tensor_numel_constraints
         env = object.__new__(CompileEnvironment)
+        env._backend = SimpleNamespace(max_tensor_numel=TRITON_MAX_TENSOR_NUMEL)
         env.block_sizes = [SimpleNamespace(symbol=lambda: b0, block_id=0)]
         env.config_spec = SimpleNamespace(
             block_sizes=SimpleNamespace(
@@ -315,6 +316,30 @@ class TestMixedSymbolExtraction(unittest.TestCase):
             "Expected 1 constraint (pure block-size shape only); "
             "mixed-symbol shape should be skipped",
         )
+
+
+class TestBackendMaxTensorNumel(unittest.TestCase):
+    """Backends without a per-tile element cap (Pallas) skip the constraint."""
+
+    def test_backend_with_no_cap_extracts_no_constraints(self) -> None:
+        """When backend.max_tensor_numel is None, _extract_tensor_numel_constraints
+        emits no constraints regardless of how large the tile would be."""
+        from types import SimpleNamespace
+
+        from helion._compiler.compile_environment import CompileEnvironment
+
+        b0 = sympy.Symbol("u0", integer=True)
+        env = object.__new__(CompileEnvironment)
+        env._backend = SimpleNamespace(max_tensor_numel=None)
+        env.block_sizes = [SimpleNamespace(symbol=lambda: b0, block_id=0)]
+        env.config_spec = SimpleNamespace(
+            block_sizes=SimpleNamespace(block_id_to_index=lambda bid: bid),
+            tensor_numel_constraints=[],
+        )
+        # A tile that would otherwise trigger the cap (b0 * 16384).
+        env.kernel_tensor_sizes = [[b0, sympy.Integer(16384)]]
+        env._extract_tensor_numel_constraints()
+        self.assertEqual(env.config_spec.tensor_numel_constraints, [])
 
 
 class TestFixedPointOverlapping(unittest.TestCase):

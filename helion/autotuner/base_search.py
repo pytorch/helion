@@ -56,6 +56,12 @@ if TYPE_CHECKING:
     from helion.autotuner.effort_profile import AutotuneEffortProfile
 
 
+# Use the standard do_bench effort for confirmation instead of the adaptive
+# rebenchmark repeat, which can amplify a single optimistic subprocess timing.
+_SUSPICIOUS_REBENCHMARK_WARMUP = 25
+_SUSPICIOUS_REBENCHMARK_REP = 100
+
+
 class _HasDeviceAndProcessGroupName(Protocol):
     device: torch.device
     process_group_name: str | None
@@ -123,6 +129,10 @@ class _AutotunableKernel(Protocol):
         unchanged, or a non-empty string to differentiate cache entries
         for the same kernel source and args.
         """
+        ...
+
+    def supports_subprocess_benchmark(self) -> bool:
+        """Whether autotuning may benchmark compiled configs in a subprocess."""
         ...
 
     def is_cacheable(self) -> bool:
@@ -257,6 +267,7 @@ class BaseSearch(BaseAutotuner):
             log=self.log,
             autotune_metrics=self._autotune_metrics,
         )
+        self.benchmark_provider.set_budget_exceeded_fn(self._autotune_budget_exceeded)
 
     def _autotune_budget_exceeded(self) -> bool:
         budget = self.settings.autotune_budget_seconds
@@ -502,7 +513,12 @@ class BaseSearch(BaseAutotuner):
         return hardware, specialization_key
 
     def _find_similar_cached_configs(self, max_configs: int) -> list[SavedBestConfig]:
-        """Return cached configs matching hardware, specialization_key, and config_spec_hash; empty if cache is skipped."""
+        """Return cached configs matching hardware, specialization_key, and config_spec_hash; empty if cache is skipped.
+
+        Scans the local cache first; if more configs are needed and a remote
+        backend is configured, queries it via ``RemoteCacheBackend.list()``
+        and merges the results, deduplicating against local entries.
+        """
         from .base_cache import should_skip_cache
 
         if self._skip_cache or should_skip_cache():
@@ -510,6 +526,8 @@ class BaseSearch(BaseAutotuner):
 
         from .local_cache import get_helion_cache_dir
         from .local_cache import iter_cache_entries
+        from .local_cache import parse_cache_entry
+        from .remote_cache import _load_remote_backend_if_configured
 
         current_hardware, current_spec_key = (
             self._get_current_hardware_and_specialization()
@@ -521,22 +539,59 @@ class BaseSearch(BaseAutotuner):
             advanced_controls_files=self.settings.autotune_search_acf or None
         )
 
+        def is_compatible(entry: SavedBestConfig) -> bool:
+            return (
+                entry.flat_config is not None
+                and entry.hardware == current_hardware
+                and _normalize_spec_key_str(entry.specialization_key)
+                == current_spec_key
+                and entry.config_spec_hash == current_fingerprint_hash
+            )
+
         matching: list[SavedBestConfig] = []
+        seen: set[str] = set()
+
+        def consider(entry: SavedBestConfig) -> bool:
+            """Return True once we have enough matches to stop scanning."""
+            if not is_compatible(entry):
+                return False
+            assert entry.flat_config is not None
+            dedup_key = repr(entry.flat_config)
+            if dedup_key in seen:
+                return False
+            matching.append(entry)
+            seen.add(dedup_key)
+            return len(matching) >= max_configs
+
         for entry in iter_cache_entries(
             get_helion_cache_dir(),
             max_scan=self.settings.autotune_best_available_max_cache_scan,
         ):
-            if entry.hardware != current_hardware:
+            if consider(entry):
+                return matching
+
+        backend = _load_remote_backend_if_configured()
+        if backend is None:
+            return matching
+
+        # Over-fetch 2x to absorb filtered / duplicate entries.
+        remaining = max_configs - len(matching)
+        try:
+            # Materialize eagerly so any backend failure surfaces here, not
+            # mid-iteration when partial results are already in `matching`.
+            raw_entries = list(backend.list(max_results=remaining * 2))
+        except Exception:
+            self.log.warning(
+                "Remote cache list failed, using local matches only", exc_info=True
+            )
+            return matching
+
+        for raw in raw_entries:
+            try:
+                entry = parse_cache_entry(raw)
+            except ValueError:
                 continue
-            if _normalize_spec_key_str(entry.specialization_key) != current_spec_key:
-                continue
-            # Skip entries without a matching structural fingerprint or flat_config.
-            if entry.config_spec_hash != current_fingerprint_hash:
-                continue
-            if entry.flat_config is None:
-                continue
-            matching.append(entry)
-            if len(matching) >= max_configs:
+            if consider(entry):
                 break
 
         return matching
@@ -795,9 +850,11 @@ class PopulationBasedSearch(BaseSearch):
                 seen.add(transferred_config)
                 result.append(flat)
 
-        # Compiler-owned seeds come from ConfigSpec.autotune_seed_configs();
+        # Compiler-owned seeds come from ConfigSpec.compiler_seed_configs;
         # they encode backend/compiler heuristics and complement user seed configs.
-        for flat, transferred_config in self.config_gen.seed_flat_config_pairs():
+        for flat, transferred_config in self.config_gen.seed_flat_config_pairs(
+            self.log
+        ):
             if transferred_config not in seen:
                 seen.add(transferred_config)
                 result.append(flat)
@@ -932,25 +989,30 @@ class PopulationBasedSearch(BaseSearch):
         if (capstr := os.getenv("HELION_CAP_REBENCHMARK_REPEAT")) is not None:
             repeat = min(repeat, int(capstr))
         if len(self.benchmark_provider.mutated_arg_indices) > 0:
-            bench_args = _clone_args(
+            benchmark_args = _clone_args(
                 self.args,
                 self.kernel.env.process_group_name,
                 idx_to_clone=self.benchmark_provider.mutated_arg_indices,
             )
         else:
-            bench_args = self.args
-        iterator = [functools.partial(m.fn, *bench_args) for m in members]
+            benchmark_args = self.args
+        iterator = [functools.partial(m.fn, *benchmark_args) for m in members]
         _backend = getattr(getattr(self, "config_spec", None), "backend", None)
-        _ib = (
+        interleaved_benchmark = (
             _backend.get_interleaved_bench() if _backend is not None else None
         ) or interleaved_bench
-        bench_fn: Callable[..., list[float]] = (
-            self.settings.autotune_benchmark_fn or _ib
+        benchmark_function: Callable[..., list[float]] = (
+            self.settings.autotune_benchmark_fn or interleaved_benchmark
         )
         if self.settings.autotune_progress_bar:
-            new_timings = bench_fn(iterator, repeat=repeat, desc=desc)
+            new_timings = benchmark_function(iterator, repeat=repeat, desc=desc)
         else:
-            new_timings = bench_fn(iterator, repeat=repeat)
+            new_timings = benchmark_function(iterator, repeat=repeat)
+        new_timings = self._confirm_suspicious_rebenchmark_timings(
+            members,
+            new_timings,
+            desc=desc,
+        )
         new_timings = sync_object(
             new_timings, process_group_name=self.kernel.env.process_group_name
         )
@@ -958,6 +1020,42 @@ class PopulationBasedSearch(BaseSearch):
             m.perfs.append(t)
             if t < self.best_perf_so_far:
                 self.best_perf_so_far = t
+
+    def _confirm_suspicious_rebenchmark_timings(
+        self,
+        members: list[PopulationMember],
+        timings: list[float],
+        *,
+        desc: str,
+    ) -> list[float]:
+        ratio = self.settings.get_suspicious_rebenchmark_ratio()
+        if ratio is None or ratio <= 0:
+            return timings
+
+        suspicious = [
+            i
+            for i, (member, timing) in enumerate(zip(members, timings, strict=True))
+            if math.isfinite(timing)
+            and math.isfinite(member.perf)
+            and timing < ratio * member.perf
+        ]
+        if not suspicious:
+            return timings
+
+        confirmed = self.benchmark_provider.benchmark_isolated(
+            [members[i].fn for i in suspicious],
+            warmup=_SUSPICIOUS_REBENCHMARK_WARMUP,
+            rep=_SUSPICIOUS_REBENCHMARK_REP,
+            desc=f"{desc}: confirming suspicious timings",
+        )
+        if confirmed is None:
+            return timings
+
+        updated = list(timings)
+        for i, timing in zip(suspicious, confirmed, strict=True):
+            if timing is not None:
+                updated[i] = timing
+        return updated
 
     def rebenchmark_population(
         self,

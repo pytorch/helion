@@ -473,7 +473,7 @@ class FakeGraphLowering(GraphLowering):
 class PointwiseLowering(InductorLowering):
     def codegen(self, ctx: LoweringContext, node: torch.fx.Node) -> object:
         # Validate broadcasting of tile block dimensions to catch shape mismatches
-        self._check_block_broadcast_compatibility(node)
+        self._check_block_broadcast_compatibility(ctx, node)
         with self.install_kernel_handlers(ctx, node):
             indices = [
                 sympy.Symbol(f"i{n}") for n in range(len(self.buffer.data.ranges))
@@ -526,7 +526,9 @@ class PointwiseLowering(InductorLowering):
     def get_masked_value(self, node: torch.fx.Node) -> float | bool | None:
         return inductor_masked_value(self, node)
 
-    def _check_block_broadcast_compatibility(self, node: torch.fx.Node) -> None:
+    def _check_block_broadcast_compatibility(
+        self, ctx: LoweringContext, node: torch.fx.Node
+    ) -> None:
         """Detect invalid broadcasting between tile-related dimensions in pointwise ops.
 
         This guards against patterns like subtracting a reduced tensor without
@@ -579,6 +581,22 @@ class PointwiseLowering(InductorLowering):
             if all(base_symbol == symbol for symbol in block_symbols[1:]):
                 return True
 
+            known_config_sizes = [
+                size
+                for info in block_infos
+                if isinstance(
+                    size := info.from_config(ctx.cg.device_function.config),
+                    (int, torch.SymInt),
+                )
+            ]
+            if len(known_config_sizes) == len(block_infos):
+                base_config_size = known_config_sizes[0]
+                if all(
+                    env.known_equal(base_config_size, size)
+                    for size in known_config_sizes[1:]
+                ):
+                    return True
+
             known_sizes = [
                 info.size
                 for info in block_infos
@@ -616,6 +634,7 @@ class PointwiseLowering(InductorLowering):
                         str(shapes[0]),
                         ", ".join(map(str, shapes[1:])),
                     )
+                continue
 
             # Otherwise, fall back to strict symbolic inequality among non-1 sizes
             exprs: set[object] = set()
@@ -1043,6 +1062,16 @@ class GenerateASTFromInductor(DefaultHandler):
         device context during compute-type selection, and to guarantee a visible
         cast in generated code that matches PyTorch's dtype semantics.
         """
+        if (
+            CompileEnvironment.current().backend.name == "cute"
+            and src_dtype is torch.float8_e4m3fn
+            and dtype is torch.float32
+        ):
+            cast_expr = expr_from_string(
+                "_cute_fp8e4m3fn_to_float32({x})",
+                x=self._to_ast(x),
+            )
+            return self._lift(cast_expr)
         cast_expr = self._create_cast_expr(x, dtype)
         return self._lift(cast_expr)
 
@@ -1068,6 +1097,10 @@ class GenerateASTFromInductor(DefaultHandler):
         return self._lift(result)
 
     def rsqrt(self, x: object) -> str:  # type: ignore[override]
+        if CompileEnvironment.current().backend.name == "cute":
+            return self._lift(
+                expr_from_string("cute.math.rsqrt({x})", x=self._to_ast(x))
+            )
         try:
             return self._default("rsqrt", (x,), {})
         except NotImplementedError:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import functools
+import logging
 import math
 import statistics
 import time
@@ -10,12 +11,64 @@ from typing import TypeVar
 
 import torch
 
+from ..runtime.settings import _env_get_bool
 from ..runtime.settings import _get_backend
 from ..runtime.settings import is_pallas_interpret
 from .progress_bar import iter_with_progress
 from helion._dist_utils import sync_object
 
 T = TypeVar("T")
+
+_log = logging.getLogger(__name__)
+_BENCHMARK_CUDAGRAPH_ENV = "HELION_BENCHMARK_CUDAGRAPH"
+
+
+def _cudagraph_unavailable_reason() -> str | None:
+    if getattr(torch.version, "hip", None) is not None:
+        return "CUDA graph benchmarking is only enabled for NVIDIA CUDA"
+    if not torch.cuda.is_available():
+        return "CUDA is unavailable"
+    if torch.cuda.is_current_stream_capturing():
+        return "the current CUDA stream is already capturing"
+    return None
+
+
+def _make_cudagraph_replay(fn: Callable[[], T]) -> Callable[[], T]:
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        fn()
+    torch.cuda.current_stream().wait_stream(stream)
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    static_output: list[T] = []
+    with torch.cuda.graph(graph):
+        static_output.append(fn())
+    torch.cuda.synchronize()
+
+    def replay() -> T:
+        graph.replay()
+        return static_output[0]
+
+    return replay
+
+
+def _maybe_cudagraph_replay(
+    fn: Callable[[], T], *, default_enabled: bool = False
+) -> Callable[[], T]:
+    if not _env_get_bool(_BENCHMARK_CUDAGRAPH_ENV, default=default_enabled):
+        return fn
+
+    reason = _cudagraph_unavailable_reason()
+    if reason is not None:
+        _log.debug("Skipping CUDA graph benchmarking: %s", reason)
+        return fn
+
+    try:
+        return _make_cudagraph_replay(fn)
+    except Exception:
+        _log.debug("CUDA graph benchmark capture failed; falling back", exc_info=True)
+        return fn
 
 
 def synchronize_device(result: object = None) -> None:
@@ -55,6 +108,7 @@ def compute_repeat(
     min_repeat: int = 10,
     max_repeat: int = 1000,
     estimate_runs: int = 5,
+    default_cudagraph: bool = False,
 ) -> int:
     """
     Estimate how many repetitions are needed to collect a stable benchmark for a
@@ -69,13 +123,14 @@ def compute_repeat(
     # Warm the pipeline once before collecting timing samples.
     fn()
     di.synchronize()
+    benchmark_function = _maybe_cudagraph_replay(fn, default_enabled=default_cudagraph)
 
     start_event = di.Event(enable_timing=True)
     end_event = di.Event(enable_timing=True)
     start_event.record()
     for _ in range(estimate_runs):
         runtime.driver.active.clear_cache(cache)  # type: ignore[attr-defined]
-        fn()
+        benchmark_function()
     end_event.record()
     di.synchronize()
 
@@ -94,6 +149,7 @@ def compute_repeat_generic(
     min_repeat: int = 10,
     max_repeat: int = 1000,
     estimate_runs: int = 5,
+    default_cudagraph: bool = False,  # accepted for API symmetry; wall-clock timing doesn't use CG
 ) -> int:
     """
     Estimate how many repetitions are needed using wall-clock timing.
@@ -118,7 +174,11 @@ def compute_repeat_generic(
 
 
 def interleaved_bench(
-    fns: list[Callable[[], object]], *, repeat: int, desc: str | None = None
+    fns: list[Callable[[], object]],
+    *,
+    repeat: int,
+    desc: str | None = None,
+    default_cudagraph: bool = False,
 ) -> list[float]:
     """
     Benchmark multiple functions at once, interleaving their executions to reduce
@@ -149,6 +209,9 @@ def interleaved_bench(
     ]
 
     di.synchronize()
+    benchmark_functions = [
+        _maybe_cudagraph_replay(fn, default_enabled=default_cudagraph) for fn in fns
+    ]
 
     # When a description is supplied we show a progress bar so the user can
     # track the repeated benchmarking loop.
@@ -159,10 +222,10 @@ def interleaved_bench(
         enabled=desc is not None,
     )
     for i in iterator:
-        for j in range(len(fns)):
+        for j in range(len(benchmark_functions)):
             clear_cache()
             start_events[j][i].record()
-            fns[j]()
+            benchmark_functions[j]()
             end_events[j][i].record()
     di.synchronize()
 
@@ -178,7 +241,11 @@ def interleaved_bench(
 
 
 def interleaved_bench_generic(
-    fns: list[Callable[[], object]], *, repeat: int, desc: str | None = None
+    fns: list[Callable[[], object]],
+    *,
+    repeat: int,
+    desc: str | None = None,
+    default_cudagraph: bool = False,  # accepted for API symmetry; wall-clock timing doesn't use CG
 ) -> list[float]:
     """
     Benchmark multiple functions using wall-clock timing.
@@ -247,6 +314,8 @@ def do_bench(
     quantiles: list[float] | None = None,
     return_mode: str = "mean",
     process_group_name: str | None = None,
+    *,
+    default_cudagraph: bool = False,
 ) -> float | tuple[float, ...]:
     """
     Benchmark the runtime of the provided function. By default, return the median runtime of :code:`fn` along with
@@ -274,6 +343,13 @@ def do_bench(
 
     fn()
     di.synchronize()
+    # Backward benchmarks mutate grad fields between iterations, so keep their
+    # existing launch path.
+    benchmark_function = (
+        fn
+        if grad_to_none is not None
+        else _maybe_cudagraph_replay(fn, default_enabled=default_cudagraph)
+    )
 
     cache = runtime.driver.active.get_empty_cache_for_benchmark()  # pyrefly: ignore
 
@@ -283,7 +359,7 @@ def do_bench(
     start_event.record()
     for _ in range(5):
         runtime.driver.active.clear_cache(cache)  # pyrefly: ignore
-        fn()
+        benchmark_function()
     end_event.record()
     di.synchronize()
     estimate_ms = sync_object(
@@ -297,7 +373,7 @@ def do_bench(
     end_event = [di.Event(enable_timing=True) for i in range(n_repeat)]
     # Warm-up
     for _ in range(n_warmup):
-        fn()
+        benchmark_function()
     # Benchmark
     for i in range(n_repeat):
         # we don't want `fn` to accumulate gradient values
@@ -310,7 +386,7 @@ def do_bench(
         runtime.driver.active.clear_cache(cache)  # pyrefly: ignore
         # record time of `fn`
         start_event[i].record()
-        fn()
+        benchmark_function()
         end_event[i].record()
     # Record clocks
     di.synchronize()
@@ -326,6 +402,8 @@ def do_bench_generic(
     quantiles: list[float] | None = None,
     return_mode: str = "mean",
     process_group_name: str | None = None,
+    *,
+    default_cudagraph: bool = False,  # accepted for API symmetry; wall-clock timing doesn't use CG
 ) -> float | tuple[float, ...]:
     """
     Benchmark using wall-clock timing for backends without Triton event timing.

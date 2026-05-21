@@ -7,6 +7,7 @@ import unittest
 from unittest.mock import patch
 
 import torch
+from torch._environment import is_fbcode
 from torch._inductor import inductor_prims
 
 import helion
@@ -1292,6 +1293,10 @@ class TestPallasRNGRegression(TestCase):
 
 @onlyBackends(["triton", "cute"])
 @skipUnlessCuteAvailable("requires CUTLASS CuTe Python DSL")
+@unittest.skipIf(
+    is_fbcode(),
+    "fbcode's CuTe DSL version differs from OSS and does not lower Helion RNG stores",
+)
 @skipIfRefEager("compiled backend parity checks are not applicable in ref eager mode")
 class TestRNGBackendParity(TestCase):
     def test_triton_and_cute_match_explicit_seeded_rand(self):

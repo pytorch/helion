@@ -31,6 +31,7 @@ from .ast_extension import statement_from_string
 from .ast_read_writes import ReadWrites
 from .ast_read_writes import ast_rename
 from .ast_read_writes import dead_assignment_elimination
+from .ast_read_writes import dead_lane_loop_elimination
 from .backend_registry import all_reserved_launch_param_names
 from .compile_environment import CompileEnvironment
 from .host_function import HostFunction
@@ -44,6 +45,7 @@ from .variable_origin import TensorSizeOrigin
 
 if TYPE_CHECKING:
     from ..runtime.config import Config
+    from .cute.aux_tensor import Tcgen05AuxTensorDescriptor
     from .device_ir import HelperFunctionGraphInfo
     from .generate_ast import GenerateAST
     from .indexing_strategy import IndexingStrategy
@@ -235,6 +237,14 @@ class CuteTcgen05StoreValue:
     ab_stage_count: int = 0
     acc_stage_count: int = 0
     skip_ab_producer_advance: bool = False
+    # Output element dtype (cutlass type-string, e.g. "cutlass.BFloat16") that
+    # the matmul plan used when computing `epi_tile` /
+    # `tcgen05_tmem_load_atom`. The store path
+    # (`_codegen_cute_store_tcgen05_tile`) asserts the runtime D-tensor dtype
+    # agrees with this so the role-local `tcgen05_epi_tile` and the
+    # store-side `tcgen05_store_epi_tile` cannot silently disagree on
+    # `compute_epilogue_tile_shape`.
+    epi_elem_dtype_str: str = ""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -254,14 +264,18 @@ class CuteTcgen05MatmulPlan:
     persistent rewrite splits TMA load and A/B prefetch onto separate
     warps.
 
-    Earlier revisions tracked separate ``has_scheduler_warp`` /
-    ``has_epi_load_warp`` flags. Neither role was wired to actual work --
-    the persistent scheduler always rode on the TMA warp, and the epilogue
-    load was folded into the consumer epi warps. Removing those flags drops
-    two dead warps from the launched block (saving register budget for the
-    real consumer warps) and simplifies the autotune search space. When
-    role-local persistent loops land, the dedicated roles can come back as
-    real launch dimensions instead of placeholders.
+    The scheduler-warp role came back via ``scheduler_warp_count``
+    once ``Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER`` was wired —
+    when set to 1, the scheduler warp owns a centralized
+    ``StaticPersistentTileScheduler`` and broadcasts work-tile
+    metadata through ``cute_tcgen05_sched_pipeline_plan`` to the
+    consumer warps. The C-input epi-load warp slot Quack uses for
+    C input became reachable in cycle 34 (G3.1 first slice,
+    ``cute_plan.md`` §7.5.3.2) via ``c_input_warp_count`` — when
+    set to 1 under WITH_SCHEDULER the role-warp layout grows to
+    8 role warps that exactly matches the warpgroup-aligned launch
+    envelope (no inert padding). The C-input warp body is inert
+    in cycle 34; the productive TMA-prefetch body is deferred.
     """
 
     bm: int
@@ -279,6 +293,122 @@ class CuteTcgen05MatmulPlan:
     c_stage_count: int
     epi_warp_count: int
     ab_load_warp_count: int = 1
+    # Scheduler-warp count for ``Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER``.
+    # Default 0 matches ``ROLE_LOCAL_MONOLITHIC`` (the byte-identity-pinned
+    # path) where persistent scheduling rides on the TMA warp; 1 dedicates
+    # one warp to centralized scheduling that broadcasts via a
+    # ``PipelineAsync`` to the consumer warps. The scheduler warp sits
+    # *after* the AB-load warps in the launched-CTA layout when present so
+    # all ``MONOLITHIC`` warp IDs are unchanged by the addition.
+    scheduler_warp_count: int = 0
+    # ``sched_stage_count`` is meaningful only when
+    # ``scheduler_warp_count > 0``; controls the depth of the scheduler
+    # broadcast pipeline. Today's value is 1 (single SMEM mailbox
+    # shared across consumer warps requires the producer to wait
+    # for *all* consumers to release before the next publish); see
+    # the comment at the ``tcgen05_sched_stage_count_value =`` site
+    # in ``cute_mma._codegen_cute_mma`` for why Helion does not
+    # mirror Quack's depth-2.
+    sched_stage_count: int = 0
+    # ``c_input_warp_count`` is the dedicated C-input / auxiliary-tensor
+    # warp count for the role-local layout (``cute_plan.md`` §7.5.3.2).
+    # Default 0 keeps the historical ``WITH_SCHEDULER`` 7-role-warp +
+    # 1-inert-padding layout. The validator accepts the value 1 under
+    # WITH_SCHEDULER — the C-input warp then occupies what was
+    # previously the inert padding slot (sitting after the scheduler
+    # warp in the launched-CTA layout). ``launched_warp_count`` stays
+    # at 8 either way because ``role_warp_count`` (8 with the slot
+    # lifted) already matches the warpgroup-aligned envelope.
+    #
+    # The C-input warp's sched-pipeline participation depends on
+    # whether the productive-body gate fires (``c_input_warp_count
+    # > 0`` AND non-empty ``aux_tensor_descriptors``):
+    #
+    # - Gate fires: ``program_id._build_c_input_warp_role_local_while``
+    #   emits a consumer-side role-local while that calls
+    #   ``consumer_wait`` / ``consumer_release`` on the
+    #   sched_pipeline every iteration. The sched-pipeline consumer
+    #   arrive count in ``cute_mma._codegen_cute_mma`` includes the
+    #   C-input warp.
+    #
+    # - Gate closed (no aux residual, or ``c_input_warps=0``): the
+    #   C-input warp body is fully inert and never calls
+    #   ``consumer_arrive`` on the sched_pipeline. The arrive count
+    #   subtracts ``c_input_warp_count`` to compensate so
+    #   ``producer_commit`` does not block on a missing arrival.
+    #
+    # MONOLITHIC keeps this at 0 by validator; only WITH_SCHEDULER
+    # hosts the slot.
+    c_input_warp_count: int = 0
+    # ``persistence_model`` selects the persistence axis of the
+    # generated kernel. ``STATIC_PERSISTENT`` (default) keeps the
+    # existing ``StaticPersistentTileScheduler`` path. ``CLC_PERSISTENT``
+    # (G2-H, cute_plan.md) emits ``nvvm.clusterlaunchcontrol_try_cancel``
+    # from the dedicated scheduler warp instead — only valid under
+    # ``ROLE_LOCAL_WITH_SCHEDULER`` (scheduler_warp_count == 1) on
+    # arch >= 100. Stored as the enum value (string) so the dataclass
+    # stays free of cute-internal imports.
+    persistence_model: str = "static_persistent"
+    # ``cluster_n`` is the multicast factor along the N axis of the cluster
+    # layout. Default 1 preserves byte-identity for every cluster_m=1 and
+    # cluster_m=2/cluster_n=1 path. ``cluster_n=2`` only runs under the
+    # validated ``cluster_m=2 use_2cta=True`` Quack-canonical 4-CTA cluster.
+    # See cute_plan.md §6.12 for the V-leader gate / mcast_size derivation
+    # that lets cluster_n=2 close the G2 perf gap.
+    cluster_n: int = 1
+    # ``l2_swizzle_size`` is the L2 tile-scheduler grouping factor (Quack's
+    # ``max_swizzle_size`` equivalent). Default 1 means no swizzle (the
+    # cycle 41 byte-identity path); concrete values map onto
+    # ``cutlass.utils.PersistentTileSchedulerParams(swizzle_size=...)``,
+    # which groups consecutive cluster linear-IDs along the slow raster
+    # axis to promote L2 reuse on bandwidth-bound shapes.
+    # See ``cute_plan.md`` §7.6.7 (cycle 42 wiring + bench).
+    l2_swizzle_size: int = 1
+    # ``aux_tensor_descriptors`` is the set of auxiliary-tensor
+    # descriptors discovered by the forward FX walker
+    # (``cute.aux_tensor.discover_tcgen05_aux_tensor_descriptors``)
+    # at MMA-codegen time. Each descriptor carries the FX node
+    # identity, shape, dtype, and broadcast axis of one aux tensor
+    # consumed by a downstream store's epilogue chain (e.g. the
+    # ``residual[tile_m, tile_n]`` operand in
+    # ``out[tile] = (acc + residual[tile]).to(dtype)``). The
+    # productive C-input warp (``cute_plan.md`` §7.5.3.2) uses these
+    # to allocate the SMEM ring + TMA atom for the aux load at the
+    # same point where the matmul plan is constructed, well before
+    # the store-codegen splice runs and discovers the same chains
+    # backward. Default empty tuple keeps the field optional so
+    # non-residual kernels — and every kernel until the productive
+    # body lands — preserve byte identity (the codegen consumers
+    # gate on ``aux_tensor_descriptors`` being non-empty, which is
+    # only true on chains the walker actually accepts).
+    #
+    # ``compare=False``: the descriptors are *per-anchor* data —
+    # two matmuls with identical collective parameters (cluster
+    # shape, stages, warp roles, …) but distinct downstream aux
+    # tensors must not be rejected as "mixed collective plans" by
+    # ``register_cute_tcgen05_matmul_plan``'s equality gate, and
+    # ``Tcgen05AuxTensorDescriptor.host_tensor_val: torch.Tensor``
+    # would otherwise drive the auto-generated ``__eq__`` through a
+    # tensor ``==`` that does not reduce to ``bool`` for non-scalar
+    # tensors. Excluding the field from ``__eq__`` keeps the plan
+    # equality semantics strictly about collective parameters; the
+    # descriptors are read by their per-anchor consumers without
+    # going through the equality path.
+    aux_tensor_descriptors: tuple[Tcgen05AuxTensorDescriptor, ...] = dataclasses.field(
+        default=(), compare=False
+    )
+
+    @property
+    def is_clc_persistent(self) -> bool:
+        # Lazy enum import to avoid a top-level cycle (cute.strategies
+        # imports from this module's siblings) and to keep the enum
+        # value the single source of truth — a rename of
+        # ``Tcgen05PersistenceModel.CLC_PERSISTENT`` would propagate
+        # via the ``.value`` lookup instead of silently degrading to
+        # always-False against a stale string literal.
+        from .cute.strategies import Tcgen05PersistenceModel
+
+        return self.persistence_model == Tcgen05PersistenceModel.CLC_PERSISTENT.value
 
     @property
     def exec_warp_id(self) -> int:
@@ -297,21 +427,86 @@ class CuteTcgen05MatmulPlan:
         return self.ab_load_warp_begin
 
     @property
+    def has_scheduler_warp(self) -> bool:
+        return self.scheduler_warp_count > 0
+
+    @property
+    def scheduler_warp_id(self) -> int:
+        # Dedicated scheduler warp sits after the AB-load warps. Reading
+        # this when ``scheduler_warp_count == 0`` is a contract violation —
+        # callers must guard on ``has_scheduler_warp``.
+        assert self.has_scheduler_warp, (
+            "scheduler_warp_id is only valid when scheduler_warp_count > 0"
+        )
+        return self.ab_load_warp_end
+
+    @property
     def persistent_scheduler_owner_warp_id(self) -> int:
-        # Persistent scheduling rides on the TMA warp because the current
-        # tcgen05 body still uses one CTA-wide ``while``: the scheduler owner
-        # has to be inside the same producer sync structure as the TMA load
-        # warp. Once role-local loops land this can move onto a dedicated
-        # scheduler warp.
+        # ``ROLE_LOCAL_MONOLITHIC``: persistent scheduling rides on the
+        # TMA warp because the role-local body uses one producer sync
+        # structure shared between TMA load and scheduler state.
+        # ``ROLE_LOCAL_WITH_SCHEDULER``: a dedicated warp owns the
+        # scheduler; consumers wait on its broadcast pipeline.
+        if self.has_scheduler_warp:
+            return self.scheduler_warp_id
         return self.tma_warp_id
 
     @property
+    def has_c_input_warp(self) -> bool:
+        return self.c_input_warp_count > 0
+
+    @property
+    def c_input_warp_id(self) -> int:
+        # Dedicated C-input warp sits after the scheduler warp. The
+        # validator rejects ``c_input_warps>0`` under ``MONOLITHIC``
+        # (which has no scheduler warp), so the read implies
+        # ``has_scheduler_warp`` in practice; callers must guard on
+        # ``has_c_input_warp`` before reading. Consumed by the C-input
+        # role-local while builder in ``program_id.py`` to gate the
+        # producer body on the matching warp predicate.
+        assert self.has_c_input_warp, (
+            "c_input_warp_id is only valid when c_input_warp_count > 0"
+        )
+        return self.scheduler_warp_id + self.scheduler_warp_count
+
+    @property
     def role_warp_count(self) -> int:
-        return self.epi_warp_count + 1 + self.ab_load_warp_count
+        return (
+            self.epi_warp_count
+            + 1
+            + self.ab_load_warp_count
+            + self.scheduler_warp_count
+            + self.c_input_warp_count
+        )
+
+    @property
+    def launched_warp_count(self) -> int:
+        # ``setmaxregister`` is warpgroup-uniform on sm_100a (all 4
+        # warps of a warpgroup must request the same register
+        # budget). For ``WITH_SCHEDULER`` with the default
+        # ``c_input_warp_count=0`` the 7 role warps split as 4 epi
+        # (consumers) + 3 producer warps; padding to 8 launched
+        # warps moves the partial producer warpgroup back to a
+        # clean 4-warp warpgroup that uniformly decreases. With
+        # ``c_input_warp_count=1`` the 8 role warps already match
+        # the warpgroup-aligned launch envelope so no padding is
+        # needed — the launched-warp count stays at 8 and the
+        # C-input warp simply occupies what was previously the
+        # inert padding slot.
+        # ``MONOLITHIC`` keeps 6 launched warps because byte-identity
+        # against the recorded golden is load-bearing and the
+        # 6-warp shape happens to work in practice (mma+tma alone
+        # produces a 2-warp partial warpgroup that only the exec
+        # warp inside increases — empirically tolerated by the
+        # hardware on the validated cluster_m=1/2 paths).
+        if self.has_scheduler_warp:
+            warpgroup = 4
+            return (self.role_warp_count + warpgroup - 1) // warpgroup * warpgroup
+        return self.role_warp_count
 
     @property
     def block_shape(self) -> tuple[int, int, int]:
-        return (self.physical_m_threads, self.role_warp_count, 1)
+        return (self.physical_m_threads, self.launched_warp_count, 1)
 
 
 _sort_order: dict[type[Argument], int] = {
@@ -411,7 +606,53 @@ class DeviceFunction:
         self.expr_to_var_info: dict[sympy.Expr, VarInfo] = {}
         self.deferred_rdim_defs: list[tuple[str, sympy.Expr]] = []
         self._cute_tcgen05_store_values: dict[str, CuteTcgen05StoreValue] = {}
+        # FX nodes (matmul / hl.dot / addmm) that were lowered to the tcgen05
+        # MMA path. The cute store codegen consults this set to detect the
+        # "fused-epilogue store after a tcgen05 matmul" pattern (the FX
+        # chain from the store value reaches a tcgen05-lowered matmul) and
+        # raise a structured `BackendUnsupported` instead of falling
+        # through to the SIMT-fallback store path, which would crash inside
+        # the cute DSL on undefined `indices_<n>` / `mask_<n>` names.
+        self.cute_tcgen05_matmul_fx_nodes: set[torch.fx.Node] = set()
+        # Mapping from a tcgen05-lowered matmul fx_node to the AST variable
+        # name (registered in ``_cute_tcgen05_store_values``) that holds
+        # the per-thread MMA result. The G3.1.1 fused-epilogue splice
+        # path walks back from the store value's FX chain to the matmul
+        # fx_node, then looks the result var up here so the splice can
+        # reuse the existing ``CuteTcgen05StoreValue`` registered under
+        # the matmul's result var (the user's chained value-name was
+        # registered to the cast result, not the matmul). Populated in
+        # ``_codegen_cute_mma`` at the
+        # ``register_cute_tcgen05_store_value`` call site, which is
+        # where ``result_var`` is finalized — the
+        # ``cute_tcgen05_matmul_fx_nodes.add(fx_node)`` line earlier in
+        # the same function happens before ``result_var`` exists.
+        # Lifetime is one-to-one with ``cute_tcgen05_matmul_fx_nodes``:
+        # both live for the duration of one ``DeviceFunction`` (i.e.
+        # one ``to_triton_code`` call) and are repopulated on each
+        # compile. There is no eviction logic; relying on the
+        # ``DeviceFunction`` instance going out of scope is the
+        # cleanup model.
+        self.cute_tcgen05_matmul_fx_node_result_vars: dict[torch.fx.Node, str] = {}
         self.cute_tcgen05_matmul_plan: CuteTcgen05MatmulPlan | None = None
+        # Variable names for the ``ROLE_LOCAL_WITH_SCHEDULER`` broadcast
+        # pipeline. Set in ``_codegen_cute_mma`` when the strategy is
+        # active; ``program_id.py`` reads them when emitting the
+        # consumer-side ``consumer_wait``/``consumer_release`` and the
+        # scheduler-warp role-local while.
+        self.cute_tcgen05_sched_pipeline_plan: object | None = None
+        # ``_Tcgen05AuxPipelinePlan`` for the C-input warp's
+        # auxiliary-tensor SMEM-ring pipeline (``cute_plan.md``
+        # §7.5.3.2 cycle 2). Set in ``_codegen_cute_mma`` when the
+        # productive-body gate fires (``c_input_warp_count > 0`` AND
+        # non-empty ``aux_tensor_descriptors``); ``program_id.py``
+        # reads it when emitting the C-input warp role-local while
+        # body (per-descriptor ``producer_acquire`` → cooperative
+        # ``cute.copy(GMEM, SMEM_ring[stage])`` → ``producer_commit``),
+        # and ``memory_ops._aux_subtile_load_source`` reads the
+        # per-descriptor SMEM ring when cycle 3's consumer flip
+        # lands.
+        self.cute_tcgen05_aux_pipeline_plan: object | None = None
         self._cute_tcgen05_per_tile_stmt_ids: set[int] = set()
         self._cute_tcgen05_post_loop_stmt_ids: set[int] = set()
         self._cute_tcgen05_tma_load_role_stmt_ids: set[int] = set()
@@ -560,6 +801,11 @@ class DeviceFunction:
 
         return self.block_size_var_cache[key]
 
+    def resolved_block_size(self, block_id: int) -> int | torch.SymInt | None:
+        """Resolve a block_id to its concrete size for the current config."""
+        env = CompileEnvironment.current()
+        return env.block_sizes[block_id].from_config(self.config)
+
     def try_map_block_symbols_to_vars(self, expr: sympy.Expr) -> sympy.Expr | None:
         """Try to map all block size symbols in expression to their variable names.
 
@@ -611,6 +857,32 @@ class DeviceFunction:
                 )
             return
         self.cute_tcgen05_matmul_plan = plan
+
+    def register_cute_tcgen05_sched_pipeline_plan(self, plan: object) -> None:
+        """Register the scheduler-broadcast ``PipelineAsync`` plan.
+
+        Set by ``cute_mma._codegen_cute_mma`` when the active strategy
+        is ``ROLE_LOCAL_WITH_SCHEDULER`` so ``program_id.py`` can
+        reach the variable names for the consumer-side
+        ``consumer_wait`` / ``consumer_release`` emissions and for
+        the scheduler-warp role-local while.
+        """
+        self.cute_tcgen05_sched_pipeline_plan = plan
+
+    def register_cute_tcgen05_aux_pipeline_plan(self, plan: object) -> None:
+        """Register the C-input warp's auxiliary-tensor SMEM-ring
+        ``PipelineAsync`` plan (``cute_plan.md`` §7.5.3.2 cycle 2).
+
+        Set by ``cute_mma._codegen_cute_mma`` when the productive-body
+        gate fires (``c_input_warp_count > 0`` AND non-empty
+        ``aux_tensor_descriptors``). ``program_id.py`` reads it when
+        emitting the C-input warp's role-local while body
+        (per-descriptor ``producer_acquire`` → cooperative
+        ``cute.copy(GMEM, SMEM_ring[stage])`` → ``producer_commit``),
+        and ``memory_ops._aux_subtile_load_source`` reads the
+        per-descriptor SMEM ring when cycle 3's consumer flip lands.
+        """
+        self.cute_tcgen05_aux_pipeline_plan = plan
 
     def register_cute_tcgen05_per_tile_stmts(self, stmts: list[ast.AST]) -> None:
         """Mark statements that depend on per-tile coordinates.
@@ -889,7 +1161,10 @@ class DeviceFunction:
             env = CompileEnvironment.current()
 
             # Find which dimension has stride==1
-            stride_one_dim = [*map(env.size_hint, fake_value.stride())].index(1)
+            layout_signature = env.tensor_descriptor_layout_signature(fake_value)
+            assert layout_signature is not None
+            stride_one_dim = layout_signature[0]
+            assert stride_one_dim is not None
 
             # Determine if we need permutation (stride==1 dimension is not last)
             permutation = None
@@ -915,6 +1190,16 @@ class DeviceFunction:
                 block_size = [block_size[i] for i in permutation]
                 # Update block_size_expr for the permuted order
                 block_size_expr = ", ".join(map(self.literal_expr, block_size))
+
+            descriptor_dims = (
+                permutation if permutation is not None else [*range(fake_value.ndim)]
+            )
+            assert descriptor_dims[-1] == stride_one_dim
+            # The descriptor permutation above makes the last descriptor
+            # dimension the proven stride-one dimension. Triton checks this
+            # predicate at JIT time, so emit it as a literal even when other
+            # dynamic strides are runtime scalars.
+            stride_args[-1] = StaticShape(1)
 
             # Add tl.make_tensor_descriptor call to preamble
             sizes = ", ".join([arg.name for arg in size_args])
@@ -1080,6 +1365,7 @@ class DeviceFunction:
         for arg in param_args:
             scalar_preamble.extend(backend.scalar_arg_preamble(arg))
 
+        function_decorator = backend.function_decorator_for_args(param_args)
         return [
             *prefix,
             ast_rename(
@@ -1092,8 +1378,8 @@ class DeviceFunction:
                         *self.preamble,
                         *self.body,
                     ],
-                    decorator_list=[expr_from_string(backend.function_decorator)]
-                    if backend.function_decorator
+                    decorator_list=[expr_from_string(function_decorator)]
+                    if function_decorator
                     else [],
                     type_params=[],
                 ),
@@ -1170,6 +1456,9 @@ class DeviceFunction:
             rw = ReadWrites.from_list([*self.preamble, *self.body])
             dead_assignment_elimination(self.body, self.dce_vars, 1, rw)
             dead_assignment_elimination(self.preamble, self.dce_vars, 1, rw)
+            dead_lane_loop_elimination(self.body)
+            dead_lane_loop_elimination(self.preamble)
+        rw = ReadWrites.from_list([*self.preamble, *self.body])
 
         # Drop unused args, but keep placeholder_args (fusion-injected tensor
         # pointers referenced only by placeholder strings, not the AST body).
@@ -1252,6 +1541,7 @@ class DeviceFunction:
     def get_tensor_read_write_names(self) -> tuple[set[str], set[str]]:
         """Returns AST names of read and written tensors"""
         from helion.language import memory_ops
+        from helion.language import tile_index
         from helion.language.atomic_ops import ATOMIC_OPS
 
         read_names: set[str] = set()
@@ -1261,20 +1551,35 @@ class DeviceFunction:
                 if node.op != "call_function":
                     continue
 
-                def _get_tensor_name(node: torch.fx.Node) -> str:
+                def _get_tensor_name(node: torch.fx.Node) -> str | None:
                     tensor_arg = node.args[0]
                     assert isinstance(tensor_arg, torch.fx.Node)
+                    # tile.index loads operate on a synthesized FakeTensor
+                    # that is not registered in ``tensor_to_origin``; they
+                    # are materialized inline by the load codegen rather
+                    # than referencing a kernel-arg tensor.
+                    if (
+                        tensor_arg.op == "call_function"
+                        and tensor_arg.target == tile_index
+                    ):
+                        return None
                     tensor_val = tensor_arg.meta.get("val")
                     assert isinstance(tensor_val, torch.Tensor)
                     return self.tensor_arg(tensor_val).name
 
                 if node.target is memory_ops.load:
-                    read_names.add(_get_tensor_name(node))
+                    name = _get_tensor_name(node)
+                    if name is not None:
+                        read_names.add(name)
                 elif node.target is memory_ops.store:
-                    write_names.add(_get_tensor_name(node))
+                    name = _get_tensor_name(node)
+                    if name is not None:
+                        write_names.add(name)
                 elif node.target in ATOMIC_OPS:
-                    read_names.add(_get_tensor_name(node))
-                    write_names.add(_get_tensor_name(node))
+                    name = _get_tensor_name(node)
+                    if name is not None:
+                        read_names.add(name)
+                        write_names.add(name)
         return read_names, write_names
 
     def __enter__(self) -> None:
@@ -1378,6 +1683,11 @@ class HelionPallasPrinter(HelionTritonPrinter):
         lhs, rhs = expr.args
         # pyrefly: ignore [missing-attribute]
         return f"({self._print(lhs)} // {self._print(rhs)})"
+
+    def _print_PythonMod(self, expr: sympy.Expr) -> str:
+        lhs, rhs = expr.args
+        # pyrefly: ignore [missing-attribute]
+        return f"({self._print(lhs)} % {self._print(rhs)})"
 
 
 def pallas_texpr(expr: sympy.Expr) -> str:

@@ -165,6 +165,7 @@ class TestDebugUtils(RefEagerTestDisabled, TestCase):
                     helion.Config(block_sizes=[64], num_warps=8),
                 ],
                 autotune_precompile=False,
+                autotune_benchmark_subprocess=False,
             )
 
             torch.manual_seed(0)

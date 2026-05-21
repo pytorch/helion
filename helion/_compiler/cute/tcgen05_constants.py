@@ -12,6 +12,64 @@ TCGEN05_TWO_CTA_SEED_L2_GROUPING = 4
 # persistent_blocked while staying in the validated CtaGroup.TWO envelope.
 TCGEN05_TWO_CTA_SEED_PID_TYPE = "persistent_interleaved"
 
+# SMEM budget reserved for non-AB allocations on B200 when sampling the
+# ``tcgen05_ab_stages=3`` search arm. The role-local persistent kernel also
+# allocates space for the C accumulator stages, pipeline mailboxes, and TMEM
+# bookkeeping; the canonical 256x256x128 cluster_m=2 ab=3 path measured
+# 196 608 bytes (192 KiB) AB + ~24 KiB other under the 227 KiB optin cap.
+# Hold 28 KiB back from the per-CTA budget so candidates we admit keep a
+# comfortable margin against ptxas's hard limit. This is intentionally
+# conservative because the search space cannot enumerate every C-stage /
+# acc-stage variant cheaply and ``ptxas: shared > 232KB`` is bad UX during
+# tuning.
+TCGEN05_AB_STAGES_THREE_RESERVED_SMEM_BYTES = 28 * 1024
+# Hard floor on the per-CTA SMEM optin cap required to admit
+# ``tcgen05_ab_stages=3`` into autotune search. B200's optin reports
+# 232 448 bytes (= 227 * 1024). Devices below this threshold sit
+# outside the warp-specialized tcgen05 envelope this gate is designed
+# for, so admission stays off — explicit user configs still go through
+# the validation surface and get the loud cute_dsl ptxas error.
+TCGEN05_AB_STAGES_THREE_MIN_DEVICE_SMEM_OPTIN = 227 * 1024
+
+
+def tcgen05_ab_smem_bytes_per_cta(
+    *,
+    bm: int,
+    bn: int,
+    bk: int,
+    dtype_bytes: int,
+    ab_stages: int,
+    cluster_m: int,
+) -> int:
+    """Return per-CTA AB-SMEM bytes for a tcgen05 matmul tile / staging.
+
+    The role-local lowering allocates the tcgen05 A/B SMEM staging via
+    ``cutlass.utils.blackwell_helpers.make_smem_layout_a/b`` whose per-CTA
+    ``cosize`` is the partitioned tile-shape times ``num_stages``. For
+    ``cluster_m=2`` (CtaGroup.TWO) the tiled MMA partitions A and B across
+    the two cluster CTAs so each CTA holds half of each operand. For
+    ``cluster_m=1`` (CtaGroup.ONE) each CTA holds the full A/B operand.
+
+    The autotune search-space gate uses this helper to admit
+    ``tcgen05_ab_stages=3`` candidates only when the per-CTA cost fits
+    the B200 SMEM optin budget after the non-AB reservation in
+    ``TCGEN05_AB_STAGES_THREE_RESERVED_SMEM_BYTES``. The numbers were
+    cross-checked against ``cute.cosize`` for the canonical tile shapes
+    (256x256x128 CtaGroup.TWO ab=3 = 196 608 bytes; 128x256x128
+    CtaGroup.ONE ab=3 = 294 912 bytes / overflows the 232 KB optin cap).
+    """
+    assert ab_stages >= 1
+    assert cluster_m in (1, 2)
+    a_per_stage = bm * bk * dtype_bytes
+    b_per_stage = bn * bk * dtype_bytes
+    if cluster_m == 2:
+        # CtaGroup.TWO: tiled MMA partitions both operands across the two
+        # cluster CTAs. Each CTA's SMEM holds half of A and half of B.
+        a_per_stage //= 2
+        b_per_stage //= 2
+    return ab_stages * (a_per_stage + b_per_stage)
+
+
 # Diagnostic-only C-store acquire placement knob. Keeping this in Config makes
 # generated-code changes visible to BoundKernel's Config-keyed compile cache.
 TCGEN05_C_ACQUIRE_PLACEMENT_CONFIG_KEY = "tcgen05_c_acquire_placement"

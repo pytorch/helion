@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import suppress
 import contextvars
+import importlib
 import inspect
 import linecache
 import os
@@ -14,6 +15,7 @@ import torch
 
 from .. import _compat as _compat  # ensure Triton compatibility patches run
 from .. import exc
+from .._compiler.cute.strategies import tcgen05_smem_layout_expr
 from .._utils import triton_is_available
 from .config import Config as Config
 from .kernel import Kernel as Kernel
@@ -245,6 +247,20 @@ def _get_vmem_limit_bytes(pltpu: object) -> int:
     global _CACHED_VMEM_LIMIT_BYTES
     if _CACHED_VMEM_LIMIT_BYTES is not None:
         return _CACHED_VMEM_LIMIT_BYTES
+
+    # In interpret mode there is no real TPU; query the synthetic TPU info
+    # registered by ``_ensure_cpu_tpu_info`` so the budget matches what real
+    # TPU 7X reports rather than falling back to the conservative 16MB default.
+    from .settings import is_pallas_interpret
+
+    if is_pallas_interpret():
+        try:
+            from jax._src.pallas.mosaic.tpu_info import registry
+
+            _CACHED_VMEM_LIMIT_BYTES = registry["cpu"]().vmem_capacity_bytes
+            return _CACHED_VMEM_LIMIT_BYTES
+        except (ImportError, KeyError, AttributeError):
+            pass
 
     try:
         get_tpu_info = pltpu.get_tpu_info  # pyrefly: ignore[missing-attribute]
@@ -500,6 +516,8 @@ def _pallas_prepare_args(
     args: tuple[object, ...],
     _output_indices: list[int],
     _inplace_indices: list[int] | None = None,
+    *,
+    interpret: bool = False,
 ) -> tuple[
     list[int],
     list[int],
@@ -521,9 +539,7 @@ def _pallas_prepare_args(
     - inplace_positions: positions that are both input and output
     - out_shapes: JAX placeholders for output shapes
     """
-    from .settings import is_pallas_interpret
-
-    if is_pallas_interpret():
+    if interpret:
         placeholder_fn = _jax_placeholder_for_tensor
     else:
         from torch_tpu._internal.pallas.pallas import (  # pyrefly: ignore[missing-import]
@@ -629,6 +645,8 @@ def _pallas_build_callable(
     cache_attr: str,
     call_aliases: dict[int, int],
     trace_key_suffix: str = "",
+    *,
+    interpret: bool = False,
 ) -> object:
     """Build a ``JaxCallable``, cache it on the kernel, and return it.
 
@@ -653,7 +671,7 @@ def _pallas_build_callable(
         )
         return callable_obj
 
-    if _pallas_interpret_flag():
+    if interpret:
         return _make_interpret_callable()
 
     import jax
@@ -720,20 +738,6 @@ class _PallasInterpretCallable:
         return tuple(jax_results)
 
 
-def _pallas_interpret_flag() -> bool:
-    """Return True if ``HELION_PALLAS_INTERPRET=1`` is set.
-
-    As a side effect, registers a synthetic CPU TpuInfo entry so that
-    ``emit_pipeline`` / ``fori_loop`` interpret paths don't fail.
-    """
-    from .settings import is_pallas_interpret
-
-    result = is_pallas_interpret()
-    if result:
-        _ensure_cpu_tpu_info()
-    return result
-
-
 def _ensure_cpu_tpu_info() -> None:
     """Register a synthetic TpuInfo for ``"cpu"`` so that
     ``emit_pipeline`` / ``fori_loop`` interpret paths don't fail.
@@ -784,11 +788,11 @@ def _pallas_invoke_and_return(
                 # On TPU, JaxCallable returns torch tensors directly.
                 out_tensor = cast("torch.Tensor", args[orig_pos])
                 # Output-only tensors are allocated with ``device='meta'`` to
-                # avoid HBM; fall back to the first real input's device in
-                # interpret mode so the converted tensor lands somewhere real.
+                # avoid HBM; interpret mode runs on CPU so the converted
+                # tensor lands there.
                 device = out_tensor.device
-                if device.type == "meta" and tensor_arg_indices:
-                    device = cast("torch.Tensor", args[tensor_arg_indices[0]]).device
+                if device.type == "meta":
+                    device = torch.device("cpu")
                 result = _jax_to_torch(
                     result,
                     device=device,
@@ -886,6 +890,7 @@ def default_pallas_launcher(
     _block_spec_info: _BlockSpecInfo | None = None,
     _smem_arg_indices: list[int] | None = None,
     _ds_pad_dims: list[tuple[int, int, int, int]] | None = None,
+    _pallas_interpret: bool | None = None,
     **kwargs: object,
 ) -> object:
     """Default launcher for Pallas kernels on TPU (or CPU with interpret=True).
@@ -900,6 +905,14 @@ def default_pallas_launcher(
     are excluded from pallas_call inputs to save VMEM.  Their results are
     returned as torch tensors.
     """
+    from .settings import is_pallas_interpret
+
+    interpret = (
+        _pallas_interpret if _pallas_interpret is not None else is_pallas_interpret()
+    )
+    if interpret:
+        _ensure_cpu_tpu_info()
+
     if _output_indices is None:
         _output_indices = []
 
@@ -928,7 +941,9 @@ def default_pallas_launcher(
             inplace_positions,
             out_shapes,
             pallas_aliases,
-        ) = _pallas_prepare_args(args, _output_indices, _inplace_indices)
+        ) = _pallas_prepare_args(
+            args, _output_indices, _inplace_indices, interpret=interpret
+        )
 
         in_specs, out_specs = _pallas_build_block_specs(
             pl,
@@ -979,7 +994,7 @@ def default_pallas_launcher(
             "out_shape": out_shape_arg,
             "grid": grid,
         }
-        if _pallas_interpret_flag():
+        if interpret:
             pallas_call_kwargs["interpret"] = True
         if in_specs is not None:
             pallas_call_kwargs["in_specs"] = in_specs
@@ -999,6 +1014,7 @@ def default_pallas_launcher(
             tensor_arg_indices,
             cache_attr="_pallas_cache",
             call_aliases=pallas_aliases,
+            interpret=interpret,
         )
 
     return _pallas_invoke_and_return(
@@ -1023,6 +1039,7 @@ def default_pallas_pipeline_launcher(
     _pipeline_arg_indices: list[int] | None = None,
     _ds_pad_dims: list[tuple[int, int, int, int]] | None = None,
     _smem_arg_indices: list[int] | None = None,
+    _pallas_interpret: bool | None = None,
     **kwargs: object,
 ) -> object:
     """Launcher for Pallas kernels using PrefetchScalarGridSpec with scratch memory.
@@ -1031,6 +1048,14 @@ def default_pallas_pipeline_launcher(
     (listed in ``_pipeline_arg_indices``) use HBM refs; all other tensors
     get proper BlockSpecs for automatic VMEM prefetch.
     """
+    from .settings import is_pallas_interpret
+
+    interpret = (
+        _pallas_interpret if _pallas_interpret is not None else is_pallas_interpret()
+    )
+    if interpret:
+        _ensure_cpu_tpu_info()
+
     if _output_indices is None:
         _output_indices = []
     if _scratch_shapes is None:
@@ -1061,7 +1086,9 @@ def default_pallas_pipeline_launcher(
             inplace_positions,
             out_shapes,
             pallas_aliases,
-        ) = _pallas_prepare_args(args, _output_indices, _inplace_indices)
+        ) = _pallas_prepare_args(
+            args, _output_indices, _inplace_indices, interpret=interpret
+        )
 
         # Build scratch shapes for VMEM
         _jnp_dtype_map = _pallas_jnp_dtype_map()
@@ -1147,7 +1174,7 @@ def default_pallas_pipeline_launcher(
                 dimension_semantics=tuple("parallel" for _ in grid),
             ),
         }
-        if _pallas_interpret_flag():
+        if interpret:
             pallas_call_kwargs["interpret"] = True
 
         jit_fn = pl.pallas_call(
@@ -1165,6 +1192,7 @@ def default_pallas_pipeline_launcher(
             cache_attr="_pallas_pipeline_cache",
             call_aliases=pallas_aliases,
             trace_key_suffix="_pipeline",
+            interpret=interpret,
         )
 
     return _pallas_invoke_and_return(
@@ -1188,6 +1216,7 @@ def default_pallas_fori_launcher(
     _scratch_shapes: list[tuple[tuple[int, ...], str | None, str]] | None = None,
     _ds_pad_dims: list[tuple[int, int, int, int]] | None = None,
     _smem_arg_indices: list[int] | None = None,
+    _pallas_interpret: bool | None = None,
     **kwargs: object,
 ) -> object:
     """Launcher for Pallas kernels using fori_loop with manual DMA.
@@ -1198,6 +1227,14 @@ def default_pallas_fori_launcher(
     The kernel uses ``jax.lax.fori_loop`` with ``pltpu.make_async_copy``
     internally for DMA control.
     """
+    from .settings import is_pallas_interpret
+
+    interpret = (
+        _pallas_interpret if _pallas_interpret is not None else is_pallas_interpret()
+    )
+    if interpret:
+        _ensure_cpu_tpu_info()
+
     if _output_indices is None:
         _output_indices = []
     if _scratch_shapes is None:
@@ -1228,7 +1265,9 @@ def default_pallas_fori_launcher(
             inplace_positions,
             out_shapes,
             pallas_aliases,
-        ) = _pallas_prepare_args(args, _output_indices, _inplace_indices)
+        ) = _pallas_prepare_args(
+            args, _output_indices, _inplace_indices, interpret=interpret
+        )
 
         # Build scratch shapes: VMEM buffers + DMA semaphores
         _jnp_dtype_map = _pallas_jnp_dtype_map()
@@ -1313,7 +1352,7 @@ def default_pallas_fori_launcher(
                 dimension_semantics=tuple("parallel" for _ in grid),
             ),
         }
-        if _pallas_interpret_flag():
+        if interpret:
             pallas_call_kwargs["interpret"] = True
 
         jit_fn = pl.pallas_call(
@@ -1331,6 +1370,7 @@ def default_pallas_fori_launcher(
             cache_attr="_pallas_fori_cache",
             call_aliases=pallas_aliases,
             trace_key_suffix="_fori",
+            interpret=interpret,
         )
 
     return _pallas_invoke_and_return(
@@ -1345,20 +1385,17 @@ def default_pallas_fori_launcher(
 
 
 def _torch_to_jax(t: torch.Tensor) -> object:
-    """Convert a torch.Tensor to a JAX array via numpy (for interpret mode on CPU)."""
+    """Convert a torch.Tensor to a JAX array via DLPack (for interpret mode on CPU)."""
     import jax.numpy as jnp
-    import numpy as np
 
-    return jnp.array(np.asarray(t.detach().cpu()))
+    return jnp.from_dlpack(t.detach().cpu())
 
 
 def _jax_to_torch(
     arr: object, *, device: torch.device, dtype: torch.dtype
 ) -> torch.Tensor:
-    """Convert a JAX array back to a torch.Tensor via numpy (for interpret mode on CPU)."""
-    import numpy as np
-
-    return torch.from_numpy(np.asarray(arr)).to(dtype=dtype, device=device)
+    """Convert a JAX array back to a torch.Tensor via DLPack (for interpret mode on CPU)."""
+    return torch.from_dlpack(arr).to(dtype=dtype, device=device)
 
 
 def _torch_dtype_to_cutlass(dtype: torch.dtype) -> object:
@@ -1370,6 +1407,9 @@ def _torch_dtype_to_cutlass(dtype: torch.dtype) -> object:
         torch.float32: cutlass.Float32,
         torch.float64: cutlass.Float64,
         torch.bfloat16: cutlass.BFloat16,
+        torch.float8_e4m3fn: cutlass.Float8E4M3FN,
+        torch.float8_e5m2: cutlass.Float8E5M2,
+        torch.float4_e2m1fn_x2: cutlass.Uint8,
         # CuTe does not support i1 global-memory tensors; torch.bool is stored
         # as one byte, so pass bool tensor pointers as uint8 and let load
         # lowering convert nonzero bytes back to cutlass.Boolean registers.
@@ -1475,6 +1515,9 @@ def _append_cute_wrapper_plan(
         # Keep these layout arguments in sync with the device-side
         # `make_smem_layout_epi` call in `_codegen_cute_store_tcgen05_tile`;
         # the TMA atom slices the same SMEM stage that the kernel allocates.
+        # `elem_ty_c=` matches the D-output dtype so the wrapper's TMA atom
+        # and the kernel's SMEM staging pick the same `tile_n` from
+        # `compute_epilogue_tile_shape`.
         body.extend(
             (
                 (
@@ -1482,7 +1525,9 @@ def _append_cute_wrapper_plan(
                     "cutlass.utils.blackwell_helpers.compute_epilogue_tile_shape("
                     f"({bm}, {bn}), False, "
                     "cutlass.utils.layout.LayoutEnum.ROW_MAJOR, "
-                    f"{output_dtype})"
+                    f"{output_dtype}, "
+                    "layout_c=cutlass.utils.layout.LayoutEnum.ROW_MAJOR, "
+                    f"elem_ty_c={output_dtype})"
                 ),
                 (
                     f"    {smem_layout} = cutlass.utils.blackwell_helpers."
@@ -1520,13 +1565,33 @@ def _append_cute_wrapper_plan(
     input_dtype = str(plan["input_dtype"])
     acc_dtype = str(plan["acc_dtype"])
     ab_stage_count = plan_int("ab_stage_count", 2)
+    # Optional ``smem_swizzle_*`` overrides recorded by the device-side
+    # codegen when the user opts into a non-default A/B SMEM atom
+    # swizzle. When absent the wrapper emits the legacy
+    # ``make_smem_layout_a/b`` calls so the canonical 4096³
+    # byte-identity golden (no override) stays valid.
+    smem_swizzle_a_raw = plan.get("smem_swizzle_a")
+    smem_swizzle_b_raw = plan.get("smem_swizzle_b")
+    smem_swizzle_a: int | None = (
+        int(smem_swizzle_a_raw) if isinstance(smem_swizzle_a_raw, int) else None
+    )
+    smem_swizzle_b: int | None = (
+        int(smem_swizzle_b_raw) if isinstance(smem_swizzle_b_raw, int) else None
+    )
     kernel_args = [str(arg) for arg in cast("list[object]", plan["kernel_args"])]
     assert len(kernel_args) == 4
     tma_atom_a, tma_tensor_a, tma_atom_b, tma_tensor_b = kernel_args
 
+    # CtaGroup.TWO is selected when ``cluster_m == 2 and bm == 256`` —
+    # the V=2 path. ``cluster_n`` extends the cluster along the N axis
+    # but does not change the V dimension. Cycle 26's
+    # ``cluster_m * cluster_n == 2`` test happened to work for
+    # cluster_m=2 cluster_n=1 but rejects the canonical Quack-best
+    # cluster_m=2 cluster_n=2 4-CTA cluster (product=4). Use
+    # ``cluster_m == 2`` directly so cluster_n=2 keeps CtaGroup.TWO.
     cta_group = (
         "cute.nvgpu.tcgen05.CtaGroup.TWO"
-        if cluster_m * cluster_n == 2 and bm == 256
+        if cluster_m == 2 and bm == 256
         else "cute.nvgpu.tcgen05.CtaGroup.ONE"
     )
     cluster_shape = f"({cluster_m}, {cluster_n}, 1)"
@@ -1535,6 +1600,26 @@ def _append_cute_wrapper_plan(
     smem_a_layout = f"{tma_atom_a}_smem_layout"
     smem_b_layout = f"{tma_atom_b}_smem_layout"
     rhs_tma = f"{tma_atom_b}_rhs_tma"
+    smem_a_layout_expr = tcgen05_smem_layout_expr(
+        tiled_mma=tiled_mma,
+        bm=bm,
+        bn=bn,
+        bk=bk,
+        dtype_str=input_dtype,
+        num_stages=ab_stage_count,
+        operand="a",
+        swizzle_override=smem_swizzle_a,
+    )
+    smem_b_layout_expr = tcgen05_smem_layout_expr(
+        tiled_mma=tiled_mma,
+        bm=bm,
+        bn=bn,
+        bk=bk,
+        dtype_str=input_dtype,
+        num_stages=ab_stage_count,
+        operand="b",
+        swizzle_override=smem_swizzle_b,
+    )
     body.extend(
         (
             (
@@ -1551,14 +1636,8 @@ def _append_cute_wrapper_plan(
                 f"    {cluster_layout_vmnk} = cute.tiled_divide("
                 f"cute.make_layout({cluster_shape}), ({tiled_mma}.thr_id.shape,))"
             ),
-            (
-                f"    {smem_a_layout} = cutlass.utils.blackwell_helpers.make_smem_layout_a("
-                f"{tiled_mma}, ({bm}, {bn}, {bk}), {input_dtype}, {ab_stage_count})"
-            ),
-            (
-                f"    {smem_b_layout} = cutlass.utils.blackwell_helpers.make_smem_layout_b("
-                f"{tiled_mma}, ({bm}, {bn}, {bk}), {input_dtype}, {ab_stage_count})"
-            ),
+            f"    {smem_a_layout} = {smem_a_layout_expr}",
+            f"    {smem_b_layout} = {smem_b_layout_expr}",
             (
                 f"    {rhs_tma} = cute.make_tensor("
                 f"arg{rhs_idx}.iterator, "
@@ -1567,14 +1646,33 @@ def _append_cute_wrapper_plan(
                 f"stride=(arg{rhs_idx}_stride1, arg{rhs_idx}_stride0)))"
             ),
             f"    {rhs_tma}.mark_layout_dynamic(leading_dim=0)",
+            # ``make_tiled_tma_atom_A`` vs ``_B`` asymmetry:
+            # - ``_B`` always passes ``cluster_layout_vmnk.shape`` as
+            #   its trailing arg (CuTe's signature for B requires the
+            #   cluster shape; the cluster_m=1 cluster_n=1 case still
+            #   passes the 1×1×1 shape harmlessly).
+            # - ``_A`` only adds the same trailing arg when
+            #   ``cluster_n > 1``. Adding it unconditionally would
+            #   change the byte-identity golden for the validated
+            #   cluster_m∈{1,2} cluster_n=1 paths
+            #   (``test_tcgen05_role_local_monolithic_byte_identical_golden``)
+            #   because A's atom is otherwise constructed from the
+            #   3-arg form on those paths. The asymmetry is
+            #   intentional: A only needs the cluster shape when N
+            #   multicast is active (cluster_n>1).
             (
                 f"    {tma_atom_a}, {tma_tensor_a} = cute.nvgpu.make_tiled_tma_atom_A("
                 "cutlass.utils.blackwell_helpers.cluster_shape_to_tma_atom_A("
                 f"{cluster_shape}, {tiled_mma}.thr_id), "
                 f"arg{lhs_idx}, "
                 f"cute.slice_({smem_a_layout}, (None, None, None, 0)), "
-                f"({bm}, {bn}, {bk}), {tiled_mma})"
+                f"({bm}, {bn}, {bk}), {tiled_mma}"
+                + (f", {cluster_layout_vmnk}.shape" if cluster_n > 1 else "")
+                + ")"
             ),
+            # See the asymmetry comment above ``make_tiled_tma_atom_A``
+            # for why ``_B`` always passes the cluster shape and ``_A``
+            # only does at cluster_n>1.
             (
                 f"    {tma_atom_b}, {tma_tensor_b} = cute.nvgpu.make_tiled_tma_atom_B("
                 "cutlass.utils.blackwell_helpers.cluster_shape_to_tma_atom_B("
@@ -1636,6 +1734,7 @@ def _create_cute_wrapper(
     import cutlass
     import cutlass.cute as cute
 
+    cuda_driver = importlib.import_module("cuda.bindings.driver")
     kernel_name = getattr(cast("Any", cute_kernel), "__name__", "cute_kernel")
     kernel_tag = f"{kernel_name}_{id(cute_kernel):x}"
     func_name = f"_helion_cute_launch_{kernel_tag}"
@@ -1686,6 +1785,7 @@ def _create_cute_wrapper(
             "grid_x: cutlass.Int32",
             "grid_y: cutlass.Int32",
             "grid_z: cutlass.Int32",
+            "stream: CUstream",
         )
     )
     wrapper_plans = [
@@ -1698,12 +1798,21 @@ def _create_cute_wrapper(
     cluster_shape = _cute_cluster_shape(cute_kernel, wrapper_plans)
     if cluster_shape is not None:
         launch_suffix += f", cluster={list(cluster_shape)!r}"
+    # G2-H (cute_plan.md, see plan: G2-H CLC): CLC kernels need PDL
+    # enabled at the host launch so ``nvvm.clusterlaunchcontrol_try_cancel``
+    # returns valid responses. ``use_pdl`` is set on the per-matmul
+    # wrapper plan in ``cute_mma._codegen_cute_mma`` when
+    # ``Tcgen05PersistenceModel.CLC_PERSISTENT`` is active. Reading
+    # from the plan rather than a kernel-level side-channel attribute
+    # mirrors how ``cluster_m``/``cluster_n`` flow through this layer.
+    if any(plan.get("use_pdl") for plan in wrapper_plans):
+        launch_suffix += ", use_pdl=True"
     body.extend(
         (
             f"    _helion_cute_kernel_tag = {kernel_tag!r}",
             "    _kernel("
             + ", ".join(call_args)
-            + f").launch(grid=(grid_x, grid_y, grid_z){launch_suffix})",
+            + f").launch(grid=(grid_x, grid_y, grid_z){launch_suffix}, stream=stream)",
         )
     )
 
@@ -1718,6 +1827,7 @@ def _create_cute_wrapper(
     namespace: dict[str, Any] = {
         "cutlass": cutlass,
         "cute": cute,
+        "CUstream": cuda_driver.CUstream,
         "_kernel": cute_kernel,
     }
     filename = f"<helion_cute_launcher:{kernel_tag}:{schema_key!r}:{block!r}>"
@@ -1810,6 +1920,7 @@ def _build_cute_schema_and_args(
     _patch_cutlass_jit_shutdown_unload()
     import cutlass.cute as cute
     from cutlass.cute.runtime import make_ptr
+    import cutlass.torch as cutlass_torch
 
     _ensure_cute_dsl_arch_env(args)
     constexpr_flags = _cute_kernel_param_is_constexpr(cute_kernel)
@@ -1849,6 +1960,7 @@ def _build_cute_schema_and_args(
             launch_args.append(scalar_value)
 
     launch_args.extend(grid)
+    launch_args.append(cutlass_torch.current_stream())
     return tuple(schema), tuple(launch_args)
 
 

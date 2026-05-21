@@ -881,7 +881,7 @@ def generate_heuristic(
     Returns:
         Dictionary mapping kernel names to HeuristicResult
     """
-    from .aot_cache import get_hardware_info
+    from .._hardware import get_hardware_info
 
     if target is None:
         target = PerformanceTarget()

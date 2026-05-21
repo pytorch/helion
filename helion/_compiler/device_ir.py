@@ -97,6 +97,8 @@ def _lerp_scalar_decomp(
 
 
 def _get_custom_decomp_table() -> dict[torch._ops.OpOverload, Callable[..., object]]:
+    from ..language._gelu_tanh_approx import install_gelu_decomp
+
     decomp_table = select_decomp_table().copy()
     # Normally, aten.stack is decomposed to aten.unsqueeze + aten.cat, but it's difficult to
     # figure out the right Triton implementation for aten.cat. As a workaround, we disable
@@ -104,6 +106,10 @@ def _get_custom_decomp_table() -> dict[torch._ops.OpOverload, Callable[..., obje
     decomp_table.pop(torch.ops.aten.stack.default, None)
     # Override lerp.Scalar to avoid data-dependent guard on the weight parameter.
     decomp_table[torch.ops.aten.lerp.Scalar] = _lerp_scalar_decomp
+    # Map F.gelu(x, approximate="tanh") to a single _gelu_tanh_approx FX
+    # node so the cute epilogue chain analyzer can fuse it; the inductor
+    # default decomp expands the polynomial form and breaks the chain.
+    install_gelu_decomp(decomp_table)
     return decomp_table
 
 
@@ -292,6 +298,16 @@ class NodeArgsGraphInfo(GraphInfo):
 @dataclasses.dataclass
 class ForLoopGraphInfo(NodeArgsGraphInfo):
     block_ids: list[int]
+    # Host AST read/write names for this device loop body (siblings only; see
+    # ``_ReadWriteVisitor.visit_For`` in ast_read_writes.py).  Used to insert
+    # ``tl.debug_barrier()`` between loops when there is a global RAW dep.
+    host_loop_reads: frozenset[str] = dataclasses.field(default_factory=frozenset)
+    host_loop_writes: frozenset[str] = dataclasses.field(default_factory=frozenset)
+    # Precomputed by GenerateAST._compute_inter_loop_barriers: True iff a
+    # tl.debug_barrier() must be emitted immediately before this for-loop's
+    # outer prefix to make global writes from the previous sibling for-loop
+    # in this scope visible.  Not copied across graph copies; recomputed.
+    needs_barrier_before: bool = False
 
     @property
     def name(self) -> str:
@@ -301,6 +317,10 @@ class ForLoopGraphInfo(NodeArgsGraphInfo):
         return {
             **super().kwargs(),
             "block_ids": [*self.block_ids],
+            "host_loop_reads": self.host_loop_reads,
+            "host_loop_writes": self.host_loop_writes,
+            # ``needs_barrier_before`` is excluded -- recomputed by GenerateAST
+            # per codegen run.
         }
 
     def codegen(self, state: CodegenState) -> list[object]:
@@ -310,7 +330,8 @@ class ForLoopGraphInfo(NodeArgsGraphInfo):
         with state.codegen.add_device_loop(
             state.device_function.tile_strategy.codegen_device_loop(
                 state, self.block_ids
-            )
+            ),
+            needs_barrier_before=self.needs_barrier_before,
         ):
             return codegen_call_with_graph(
                 state.codegen,
@@ -353,6 +374,38 @@ class IfGraphInfo(NodeArgsGraphInfo):
             "branches_outputs": self.branches_outputs,
         }
 
+    def get_branches_return_names(
+        self, state: CodegenState, if_outputs: list[object], else_outputs: list[object]
+    ) -> tuple[list[str], list[str]]:
+        if_args = state.ast_args[3]
+        assert isinstance(if_args, list)
+        assert all(isinstance(x, ast.AST) for x in if_args)
+        else_args = state.ast_args[4]
+        assert isinstance(else_args, list)
+        assert all(isinstance(x, ast.AST) for x in else_args)
+
+        assert self.if_arg_names is not None
+        assert self.else_arg_names is not None
+        assert self.branches_outputs is not None
+
+        arg_node_name_to_ast_name = {
+            self.if_arg_names[i]: if_args[i].id for i in range(len(if_args))
+        } | {self.else_arg_names[i]: else_args[i].id for i in range(len(else_args))}
+
+        if_return_names = [
+            cast("ast.Name", if_outputs[o]).id
+            if isinstance(o, int)
+            else arg_node_name_to_ast_name[o]
+            for (o, _) in self.branches_outputs
+        ]
+        else_return_names = [
+            cast("ast.Name", else_outputs[o]).id
+            if isinstance(o, int)
+            else arg_node_name_to_ast_name[o]
+            for (_, o) in self.branches_outputs
+        ]
+        return if_return_names, else_return_names
+
     def codegen(self, state: CodegenState) -> list[object]:
         from .generate_ast import GenerateAST
 
@@ -387,7 +440,19 @@ class IfGraphInfo(NodeArgsGraphInfo):
             body_stmts.append(ast.Pass())
         if len(orelse_stmts) == 0:
             orelse_stmts.append(ast.Pass())
-        return if_outputs + else_outputs
+
+        graph_info = state.get_graph(state.proxy_arg(1))
+        assert isinstance(graph_info, IfGraphInfo)
+
+        if_return_names, else_return_names = graph_info.get_branches_return_names(
+            state, if_outputs, else_outputs
+        )
+
+        return cast(
+            "list[object]",
+            [expr_from_string(n) for n in if_return_names]
+            + [expr_from_string(n) for n in else_return_names],
+        )
 
 
 @dataclasses.dataclass
@@ -523,6 +588,111 @@ class KernelPhase:
     )
 
 
+def _tensor_to_inter_loop_rw_name(host: HostFunction, t: torch.Tensor) -> str | None:
+    o = host.tensor_to_origin.get(t)
+    if o is None:
+        return None
+    return o.root_rw_name()
+
+
+def _fx_trace_tensor_arg_rw_names(
+    host: HostFunction, arg: object, seen: set[int] | None = None
+) -> list[str]:
+    """Map a load/store tensor FX arg to the list of host variable names it
+    aliases.  Returns an empty list when the arg cannot be resolved to any
+    host name (e.g. a purely device-internal temporary)."""
+    from ..language import _tracing_ops
+
+    if seen is None:
+        seen = set()
+    if isinstance(arg, tuple):
+        out: list[str] = []
+        for a in arg:
+            out.extend(_fx_trace_tensor_arg_rw_names(host, a, seen))
+        return out
+    if not isinstance(arg, torch.fx.Node):
+        return []
+    nid = id(arg)
+    if nid in seen:
+        return []
+    seen.add(nid)
+    val = arg.meta.get("val")
+    if isinstance(val, torch.Tensor):
+        n = _tensor_to_inter_loop_rw_name(host, val)
+        if n is not None:
+            return [n]
+    if arg.op == "call_function" and arg.target is _tracing_ops._host_tensor:
+        val = arg.meta.get("val")
+        if isinstance(val, torch.Tensor):
+            n = _tensor_to_inter_loop_rw_name(host, val)
+            if n is not None:
+                return [n]
+        return []
+    out2: list[str] = []
+    for a in arg.args:
+        out2.extend(_fx_trace_tensor_arg_rw_names(host, a, seen))
+    return out2
+
+
+def _reduction_fx_inter_loop_rw_names(
+    graph: torch.fx.Graph,
+    host: HostFunction,
+) -> tuple[frozenset[str], frozenset[str]]:
+    """Infer host buffer names read/written in a rolled reduction FX subgraph.
+
+    Walks every hl.load / hl.store / atomic_* node in ``graph`` and resolves
+    its tensor argument back to host-named buffers via
+    :func:`_fx_trace_tensor_arg_rw_names`.  Buffers that don't resolve to a
+    host name are device-internal temporaries and don't participate in
+    cross-wavefront global coherence, so they're correctly excluded from the
+    returned sets.
+    """
+    from ..language import atomic_add
+    from ..language import atomic_and
+    from ..language import atomic_cas
+    from ..language import atomic_max
+    from ..language import atomic_min
+    from ..language import atomic_or
+    from ..language import atomic_xchg
+    from ..language import atomic_xor
+    from ..language import memory_ops
+
+    atomic_funcs = frozenset(
+        {
+            atomic_add,
+            atomic_and,
+            atomic_cas,
+            atomic_max,
+            atomic_min,
+            atomic_or,
+            atomic_xchg,
+            atomic_xor,
+        }
+    )
+    reads: set[str] = set()
+    writes: set[str] = set()
+
+    for node in graph.find_nodes(
+        op="call_function", target=memory_ops.load, sort=False
+    ):
+        reads.update(_fx_trace_tensor_arg_rw_names(host, node.args[0]))
+
+    for node in graph.find_nodes(
+        op="call_function", target=memory_ops.store, sort=False
+    ):
+        writes.update(_fx_trace_tensor_arg_rw_names(host, node.args[0]))
+
+    for atomic_target in atomic_funcs:
+        for node in graph.find_nodes(
+            op="call_function", target=atomic_target, sort=False
+        ):
+            nms = _fx_trace_tensor_arg_rw_names(host, node.args[0])
+            reads.update(nms)
+            writes.update(nms)
+
+    return frozenset(reads), frozenset(writes)
+
+
 class DeviceIR:
     def __init__(self) -> None:
         super().__init__()
@@ -557,11 +727,14 @@ class DeviceIR:
         block_index: int,
         node_args: list[torch.fx.Node],
     ) -> int:
+        reads, writes = _reduction_fx_inter_loop_rw_names(graph, HostFunction.current())
         return self.add_graph(
             graph,
             graph_info_cls=ReductionLoopGraphInfo,
             block_ids=[block_index],
             node_args=node_args,
+            host_loop_reads=reads,
+            host_loop_writes=writes,
         )
 
     def add_root_graph(self, graph: torch.fx.Graph) -> None:
@@ -1138,11 +1311,14 @@ class WalkDeviceAST(NodeVisitor):
                 assert isinstance(var, (TileIndexType, GridIndexType))
                 block_ids.append(var.block_id)
 
+            host_reads, host_writes = rw.read_and_write_name_frozensets()
             graph_idx, outputs = self._trace_graph(
                 inputs,
                 build_subgraph,
                 graph_info_cls=ForLoopGraphInfo,
                 block_ids=block_ids,
+                host_loop_reads=host_reads,
+                host_loop_writes=host_writes,
             )
             step_list = step if isinstance(step, list) else None
             if step_list is None or all(s is None for s in step_list):
@@ -1356,20 +1532,53 @@ class WalkDeviceAST(NodeVisitor):
             # pyrefly: ignore [bad-argument-type]
             *args_to_proxies(tracer, args),
         )
+
+        if_output_values = if_outputs.values
+        else_output_values = else_outputs.values
+
+        common_output_names = [n for n in if_output_values if n in else_output_values]
+        if_nonlocal_outputs_names = [
+            name
+            for name in if_output_values
+            if name not in common_output_names and name in self.scope
+        ]
+        else_nonlocal_output_names = [
+            name
+            for name in else_output_values
+            if name not in common_output_names and name in self.scope
+        ]
+
+        if_common_outputs = [if_output_values[name] for name in common_output_names]
+        if_nonlocal_outputs = [
+            if_output_values[name] for name in if_nonlocal_outputs_names
+        ]
+        if_unmodified_nonlocal_outputs = [
+            self.scope[name] for name in else_nonlocal_output_names
+        ]
+        else_common_outputs = [else_output_values[name] for name in common_output_names]
+        else_unmodified_nonlocal_outputs = [
+            self.scope[name] for name in if_nonlocal_outputs_names
+        ]
+        else_nonlocal_outputs = [
+            else_output_values[name] for name in else_nonlocal_output_names
+        ]
         proxy_tensor.track_tensor_tree(
-            if_outputs.get_tensor_args() + else_outputs.get_tensor_args(),
+            if_common_outputs
+            + if_nonlocal_outputs
+            + if_unmodified_nonlocal_outputs
+            + else_common_outputs
+            + else_unmodified_nonlocal_outputs
+            + else_nonlocal_outputs,
             proxy_out,
             constant=None,
             tracer=tracer,
         )
 
-        if_output_values = if_outputs.values
-        else_output_values = else_outputs.values
-        common_output_names = [n for n in if_output_values if n in else_output_values]
-
         # branches_outputs:  [(if_out_0, else_out_0), (if_out_1, else_out_1), ...]
         # where each output is either an index if the graph's output values,
-        # or a name of a nonlocal variable which the opposite branch writes to
+        # or a name of a nonlocal variable which the opposite branch writes to.
+        # Ordering: common -> if-only-nonlocal -> else-only-nonlocal,
+        # (i.e. same as ordering of values in track_tensor_tree above)
         if_graph.branches_outputs = []
 
         def get_output_idx(name: str, output_values: dict[str, object]) -> int:
@@ -1383,21 +1592,19 @@ class WalkDeviceAST(NodeVisitor):
             else_output_index = get_output_idx(name, else_output_values)
             if_graph.branches_outputs.append((if_output_index, else_output_index))
 
-        for name in if_output_values:
-            if name not in common_output_names and name in self.scope:
-                self.scope[name] = _tracing_ops._phi(
-                    self.scope[name], if_output_values[name]
-                )
-                if_output_index = get_output_idx(name, if_output_values)
-                if_graph.branches_outputs.append((if_output_index, name))
+        for name in if_nonlocal_outputs_names:
+            self.scope[name] = _tracing_ops._phi(
+                self.scope[name], if_output_values[name]
+            )
+            if_output_index = get_output_idx(name, if_output_values)
+            if_graph.branches_outputs.append((if_output_index, name))
 
-        for name in else_output_values:
-            if name not in common_output_names and name in self.scope:
-                self.scope[name] = _tracing_ops._phi(
-                    self.scope[name], else_output_values[name]
-                )
-                else_output_index = get_output_idx(name, else_output_values)
-                if_graph.branches_outputs.append((else_output_index, name))
+        for name in else_nonlocal_output_names:
+            self.scope[name] = _tracing_ops._phi(
+                self.scope[name], else_output_values[name]
+            )
+            else_output_index = get_output_idx(name, else_output_values)
+            if_graph.branches_outputs.append((name, else_output_index))
 
         return if_graph_idx
 
@@ -1907,7 +2114,6 @@ def _register_load_store_tunables(
             EnumFragment(choices=get_valid_eviction_policies(env.backend_name)),
             length=loads_without_eviction_policy,
         )
-        env.device_load_count = loads_without_eviction_policy
 
     # Indexing applies to ALL loads and stores
     total_count = total_load_count + store_count

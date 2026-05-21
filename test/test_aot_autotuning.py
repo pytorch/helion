@@ -14,6 +14,7 @@ import numpy as np
 import pytest
 import torch
 
+from helion._hardware import HardwareInfo
 from helion._testing import onlyBackends
 from helion.autotuner.aot_cache import ShapeKey
 from helion.autotuner.aot_cache import _deserialize_tuple
@@ -33,10 +34,16 @@ class TestShapeKey:
     """Tests for ShapeKey class."""
 
     def test_to_dict_and_back(self) -> None:
+        hardware = HardwareInfo(
+            device_kind="cuda",
+            hardware_name="RTX4090",
+            runtime_version="12.4",
+            compute_capability="sm89",
+        )
         key = ShapeKey(
             kernel_name="test_kernel",
             specialization_key=(1024, 2048, "float32"),
-            hardware_id="cuda_RTX4090_12.4",
+            hardware_id=hardware.hardware_id,
         )
         d = key.to_dict()
         restored = ShapeKey.from_dict(d)

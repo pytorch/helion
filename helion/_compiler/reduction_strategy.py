@@ -91,6 +91,19 @@ def _cute_reduction_smem_bytes(num_elements: int, dtype: torch.dtype) -> int:
     return num_elements * torch.empty((), dtype=dtype).element_size()
 
 
+_CUTE_LOOPED_REDUCTION_MAX_ELEMENTS_PER_THREAD = 256
+_CUTE_WARP_REDUCTION_THREADS = 32
+
+
+def cute_looped_reduction_block_size(size_hint: int, max_threads: int) -> int:
+    """Pick the default CuTe loop chunk for reductions wider than one warp."""
+    return min(size_hint, max_threads * _CUTE_LOOPED_REDUCTION_MAX_ELEMENTS_PER_THREAD)
+
+
+def cute_live_reduction_threads(max_threads: int) -> int:
+    return min(max_threads, _CUTE_WARP_REDUCTION_THREADS)
+
+
 class ReductionStrategy(TileStrategy):
     def __init__(
         self,
@@ -211,14 +224,12 @@ class ReductionStrategy(TileStrategy):
                     return True
         return False
 
-    def _cute_reduction_needs_loop_carried_accumulator(self) -> bool:
-        """Return True when, on the cute backend, the surrounding loop
-        nest must perform the reduction via loop-carried accumulation
-        instead of a warp-level reduction across threads.
+    def _needs_loop_carried_accumulator(self) -> bool:
+        """Return True when the surrounding loop nest must perform the
+        reduction via loop-carried accumulation instead of a warp-level
+        reduction across threads.
 
-        This consolidates the three "no live thread axis" conditions
-        previously checked separately in
-        :meth:`BlockReductionStrategy.codegen_reduction`:
+        This consolidates the three "no live thread axis" conditions:
 
         * :meth:`_reduction_block_is_serial` — the block is iterated by
           a serial ``DeviceLoopState`` rather than a thread axis;
@@ -231,10 +242,10 @@ class ReductionStrategy(TileStrategy):
         thread axis to reduce across, so the surrounding loop must
         accumulate the partial values across iterations.
 
-        Always returns False for non-cute backends (Triton / Pallas /
-        TileIR all use their native warp / lane reductions).
+        Always returns False for tile-level backends (Triton / Pallas /
+        TileIR) which use their native reduction primitives.
         """
-        if CompileEnvironment.current().backend.name != "cute":
+        if CompileEnvironment.current().backend.max_reduction_threads() is None:
             return False
         return (
             self._reduction_block_is_serial()
@@ -347,8 +358,14 @@ class ReductionStrategy(TileStrategy):
         size.pop(dim)
         if [*fake_output.size()] == size:
             return expr
+        backend = CompileEnvironment.current().backend
         shape = self.fn.tile_strategy.shape_str([*fake_output.size()])
-        return CompileEnvironment.current().backend.reshape_expr(expr, shape)
+        return backend.maybe_reshape_reduction(
+            expr,
+            source_shape=size,
+            target_shape=[*fake_output.size()],
+            target_shape_expr=shape,
+        )
 
     def broadcast_str(self, base: str, fake_input: torch.Tensor, dim: int) -> str:
         input_size = [*fake_input.size()]
@@ -391,6 +408,8 @@ class PersistentReductionStrategy(ReductionStrategy):
         # Compute thread count for warp-level reductions
         max_threads = env.backend.max_reduction_threads()
         if max_threads is not None:
+            if env.backend.name == "cute":
+                max_threads = cute_live_reduction_threads(max_threads)
             if isinstance(numel, (int, sympy.Integer)):
                 size_hint = int(numel)
             elif isinstance(numel, sympy.Expr):
@@ -410,52 +429,32 @@ class PersistentReductionStrategy(ReductionStrategy):
         # Tile strategies are added before reduction strategies, so they are
         # already on the dispatcher by the time we get here.
         tile_dispatch = getattr(fn, "tile_strategy", None)
-        if (
-            env.backend.name == "cute"
-            and self._thread_count > 1
-            and tile_dispatch is not None
-        ):
-            from .cute.thread_budget import MAX_THREADS_PER_BLOCK
-
-            other_threads = 1
-            for strategy in tile_dispatch.strategies:
-                if isinstance(strategy, ReductionStrategy):
-                    count = strategy._reduction_thread_count()
-                    if count > 0:
-                        other_threads *= count
-                else:
-                    for size in strategy.thread_block_sizes():
-                        if size > 1:
-                            other_threads *= size
-            while (
-                other_threads * self._thread_count > MAX_THREADS_PER_BLOCK
-                and self._thread_count > 1
-            ):
-                self._thread_count //= 2
+        if tile_dispatch is not None:
+            self._thread_count = env.backend.adjust_reduction_thread_count(
+                self._thread_count, tile_dispatch.strategies
+            )
         self._synthetic_cute_lane_var: str | None = None
         self._synthetic_cute_lane_extent = 1
         is_graph_reduction_dim = any(
             isinstance(graph, ReductionLoopGraphInfo) and block_index in graph.block_ids
             for graph in fn.codegen.codegen_graphs
         )
-        if (
-            env.backend.name == "cute"
-            and not is_graph_reduction_dim
-            and self._thread_count > 0
-        ):
+        if not is_graph_reduction_dim and self._thread_count > 0:
             if isinstance(numel, (int, sympy.Integer)):
                 size_hint = int(numel)
             elif isinstance(numel, sympy.Expr):
                 size_hint = shape_env_size_hint(env.shape_env, numel)
             else:
                 size_hint = env.size_hint(numel)
-            padded_size = next_power_of_2(max(1, size_hint))
-            if padded_size > self._thread_count:
+            lane_extent = env.backend.create_synthetic_reduction_lanes(
+                self._thread_count, size_hint
+            )
+            if lane_extent is not None:
                 self._synthetic_cute_lane_var = fn.new_var(
                     f"synthetic_lane_{block_index}",
                     dce=False,
                 )
-                self._synthetic_cute_lane_extent = padded_size // self._thread_count
+                self._synthetic_cute_lane_extent = lane_extent
 
     def _reduction_thread_count(self) -> int:
         return self._thread_count
@@ -588,7 +587,39 @@ class LoopedReductionStrategy(ReductionStrategy):
         block_size: int,
     ) -> None:
         env = CompileEnvironment.current()
-        if env.known_multiple(env.block_sizes[block_index].numel, block_size):
+        assert block_size > 1
+        # Compute thread count for warp-level reductions
+        max_threads = env.backend.max_reduction_threads()
+        if max_threads is not None:
+            thread_count = next_power_of_2(min(block_size, max_threads))
+        else:
+            thread_count = 0
+        tile_dispatch = getattr(fn, "tile_strategy", None)
+        if tile_dispatch is not None:
+            thread_count = env.backend.adjust_reduction_thread_count(
+                thread_count, tile_dispatch.strategies
+            )
+        self._thread_count = thread_count
+        self.block_size = block_size
+        self._loop_block_size = block_size
+        self._cute_reduction_lane_var: str | None = None
+        self._cute_reduction_lane_extent = 1
+        if (
+            env.backend.name == "cute"
+            and thread_count > 0
+            and block_size > thread_count
+        ):
+            self._cute_reduction_lane_extent = (
+                block_size + thread_count - 1
+            ) // thread_count
+            self._loop_block_size = thread_count * self._cute_reduction_lane_extent
+            self._cute_reduction_lane_var = fn.new_var(
+                f"reduction_lane_{block_index}",
+                dce=False,
+            )
+        if env.known_multiple(
+            env.block_sizes[block_index].numel, self._loop_block_size
+        ):
             mask_var: str | None = None
         else:
             mask_var = fn.new_var(f"mask_{block_index}", dce=True)
@@ -600,38 +631,92 @@ class LoopedReductionStrategy(ReductionStrategy):
         )
         self.offset_vars[block_index] = fn.new_var(f"roffset_{block_index}", dce=True)
         self.index_vars[block_index] = fn.new_var(f"rindex_{block_index}", dce=True)
-        self.block_size = block_size
-        assert block_size > 1
-        # Compute thread count for warp-level reductions
-        max_threads = env.backend.max_reduction_threads()
-        if max_threads is not None:
-            self._thread_count = next_power_of_2(min(block_size, max_threads))
-        else:
-            self._thread_count = 0
-        if env.backend.name == "cute" and self._thread_count > 1:
-            from .cute.thread_budget import MAX_THREADS_PER_BLOCK
-
-            other_threads = 1
-            tile_dispatch = getattr(fn, "tile_strategy", None)
-            if tile_dispatch is not None:
-                for strategy in tile_dispatch.strategies:
-                    if isinstance(strategy, ReductionStrategy):
-                        count = strategy._reduction_thread_count()
-                        if count > 0:
-                            other_threads *= count
-                    else:
-                        for size in strategy.thread_block_sizes():
-                            if size > 1:
-                                other_threads *= size
-            while (
-                other_threads * self._thread_count > MAX_THREADS_PER_BLOCK
-                and self._thread_count > 1
-            ):
-                self._thread_count //= 2
-            self.block_size = min(self.block_size, self._thread_count)
 
     def _reduction_thread_count(self) -> int:
         return self._thread_count
+
+    def _active_thread_axis_sizes(
+        self, state: CodegenState, device_loop: DeviceLoopState
+    ) -> dict[int, int]:
+        axis_sizes: dict[int, int] = {}
+        seen: set[int] = set()
+        for loops in state.codegen.active_device_loops.values():
+            for loop_state in loops:
+                if not isinstance(loop_state, (DeviceLoopState, DeviceGridState)):
+                    continue
+                key = id(loop_state)
+                if key in seen:
+                    continue
+                seen.add(key)
+                for axis, size in loop_state.thread_axis_sizes.items():
+                    axis_sizes[axis] = max(axis_sizes.get(axis, 1), size)
+        current_grid = state.codegen.current_grid_state
+        if isinstance(current_grid, DeviceGridState):
+            for axis, size in current_grid.thread_axis_sizes.items():
+                axis_sizes[axis] = max(axis_sizes.get(axis, 1), size)
+        for axis, size in device_loop.thread_axis_sizes.items():
+            axis_sizes[axis] = max(axis_sizes.get(axis, 1), size)
+        return axis_sizes
+
+    def _cute_cross_warp_reduction_expr(
+        self,
+        state: CodegenState,
+        device_loop: DeviceLoopState,
+        input_name: str,
+        reduction_type: str,
+        default_value: float | bool,
+        dtype: torch.dtype,
+    ) -> str | None:
+        env = CompileEnvironment.current()
+        backend = env.backend
+        if (
+            backend.name != "cute"
+            or self._thread_count <= 32
+            or backend.is_indexed_reduction(reduction_type)
+        ):
+            return None
+
+        axis_sizes = self._active_thread_axis_sizes(state, device_loop)
+        reduction_axis = self._get_thread_axis()
+        axis_sizes[reduction_axis] = max(
+            axis_sizes.get(reduction_axis, 1), self._thread_count
+        )
+        num_threads = 1
+        for size in axis_sizes.values():
+            num_threads *= size
+        group_span = self._thread_count
+        if num_threads % group_span != 0:
+            return None
+        lane_expr = backend.thread_linear_index_expr(axis_sizes)
+        if lane_expr is None:
+            return None
+
+        identity_expr = backend.cast_expr(
+            constant_repr(default_value), _dtype_str(dtype)
+        )
+        group_count = num_threads // group_span
+        lane_var = self.fn.new_var("looped_reduce_lane", dce=True)
+        lane_in_group_var = self.fn.new_var("looped_reduce_lane_in_group", dce=True)
+        lane_mod_pre_var = self.fn.new_var("looped_reduce_lane_mod_pre", dce=True)
+        result_var = self.fn.new_var("looped_reduce_result", dce=True)
+        device_loop.outer_suffix.append(
+            statement_from_string(f"{lane_var} = {lane_expr}")
+        )
+        device_loop.outer_suffix.append(
+            statement_from_string(f"{lane_in_group_var} = ({lane_var}) % {group_span}")
+        )
+        device_loop.outer_suffix.append(
+            statement_from_string(f"{lane_mod_pre_var} = ({lane_in_group_var}) % 1")
+        )
+        device_loop.outer_suffix.append(
+            statement_from_string(
+                f"{result_var} = _cute_grouped_reduce_shared_two_stage("
+                f"{input_name}, {reduction_type!r}, {identity_expr}, "
+                f"{lane_var}, {lane_in_group_var}, {lane_mod_pre_var}, "
+                f"pre=1, group_span={group_span}, group_count={group_count})"
+            )
+        )
+        return result_var
 
     def codegen_device_loop(self, state: CodegenState) -> DeviceLoopState:
         env = CompileEnvironment.current()
@@ -643,19 +728,35 @@ class LoopedReductionStrategy(ReductionStrategy):
         assert block_size_var is not None
         if state.device_function.constexpr_arg(block_size_var):
             state.codegen.host_statements.append(
-                statement_from_string(f"{block_size_var} = {self.block_size!r}")
+                statement_from_string(f"{block_size_var} = {self._loop_block_size!r}")
             )
-        body: list[ast.AST] = [
+        inner_body: list[ast.AST] = [
             statement_from_string(
                 f"{index_var} = {offset_var} + {self._index_init_expr(f'({block_size_var})', env.index_type(), block_index)}"
             ),
         ]
+        reduction_lane_var = self._cute_reduction_lane_var
+        if reduction_lane_var is not None:
+            inner_body[0] = statement_from_string(
+                f"{index_var} = {offset_var} + {self._index_init_expr(f'({block_size_var})', env.index_type(), block_index)} + cutlass.Int32({reduction_lane_var}) * {self._thread_count}"
+            )
         if (mask_var := self._mask_var) is not None:
-            body.append(
+            inner_body.append(
                 statement_from_string(
                     f"{mask_var} = {index_var} < {state.sympy_expr(numel)}"
                 )
             )
+        body = inner_body
+        if reduction_lane_var is not None:
+            from .tile_strategy import _create_lane_loop
+
+            body = [
+                _create_lane_loop(
+                    reduction_lane_var,
+                    self._cute_reduction_lane_extent,
+                    inner_body,
+                )
+            ]
 
         for_node = create(
             ast.For,
@@ -686,7 +787,7 @@ class LoopedReductionStrategy(ReductionStrategy):
         return DeviceLoopState(
             self,
             for_node=for_node,
-            inner_statements=body,
+            inner_statements=inner_body,
             block_id_to_info=block_id_to_info,
             thread_axis_sizes=tracker.sizes,
             block_thread_axes=tracker.block_axes,
@@ -723,8 +824,19 @@ class LoopedReductionStrategy(ReductionStrategy):
                     reduction_type, acc, input_name, acc_dtype
                 )
                 state.add_statement(f"{acc} = {combine_expr}")
-                expr = self.call_reduction_function(
-                    acc, reduction_type, dim, fake_input, fake_output
+                expr = self._cute_cross_warp_reduction_expr(
+                    state,
+                    device_loop,
+                    acc,
+                    reduction_type,
+                    default,
+                    acc_dtype,
+                ) or self.call_reduction_function(
+                    acc,
+                    reduction_type,
+                    dim,
+                    fake_input,
+                    fake_output,
                 )
             else:
                 acc_index = self.fn.new_var(f"{state.fx_node.name}_acc_index", dce=True)
@@ -880,9 +992,7 @@ class BlockReductionStrategy(ReductionStrategy):
             )
             if configured_threads > 0:
                 return configured_threads
-            configured_block_size = env.block_sizes[block_id].from_config(
-                self.fn.config
-            )
+            configured_block_size = self.fn.resolved_block_size(block_id)
             return (
                 configured_block_size
                 if isinstance(configured_block_size, int)
@@ -1411,7 +1521,7 @@ class BlockReductionStrategy(ReductionStrategy):
             )
         ) is not None:
             expr = strided_expr
-        elif self._cute_reduction_needs_loop_carried_accumulator():
+        elif self._needs_loop_carried_accumulator():
             # The reduction block is not backed by a live thread axis in the
             # active loop nest (it is iterated either by a serial device
             # loop, by a synthetic lane loop, or has no thread axis at

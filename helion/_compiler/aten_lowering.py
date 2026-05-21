@@ -982,6 +982,18 @@ mm_lowering = register_lowering(
 )
 
 
+def _apply_bmm_dot_dtype_requirements(_lowering: AtenLowering, node: Node) -> Lowering:
+    """Handle bmm.dtype by stripping the ScalarType arg and reusing bmm_lowering."""
+    node.args = tuple(a for a in node.args if isinstance(a, Node))
+    return apply_dot_requirements(bmm_lowering, node)
+
+
+register_lowering(
+    torch.ops.aten.bmm.dtype,
+    _apply_bmm_dot_dtype_requirements,
+)
+
+
 @bmm_lowering.register_codegen("triton")
 @mm_lowering.register_codegen("triton")
 def codegen_mm(ctx: LoweringContext, node: Node) -> ast.AST:
@@ -1505,9 +1517,7 @@ def _cute_iota_expr(
             else:
                 continue
 
-            candidate_size = env.block_sizes[candidate].from_config(
-                cg.device_function.config
-            )
+            candidate_size = cg.device_function.resolved_block_size(candidate)
             if (
                 not isinstance(candidate_size, int)
                 or candidate_size <= 0
@@ -1584,15 +1594,10 @@ def _cute_iota_expr(
                     for candidate in cg.current_grid_state.block_ids
                     if isinstance(length_hint, int)
                     and isinstance(
-                        env.block_sizes[candidate].from_config(
-                            cg.device_function.config
-                        ),
+                        cg.device_function.resolved_block_size(candidate),
                         int,
                     )
-                    and env.block_sizes[candidate].from_config(
-                        cg.device_function.config
-                    )
-                    == length_hint
+                    and cg.device_function.resolved_block_size(candidate) == length_hint
                 ]
                 if len(grid_candidates) == 1:
                     block_id = grid_candidates[0]

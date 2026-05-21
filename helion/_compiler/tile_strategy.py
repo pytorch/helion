@@ -20,6 +20,7 @@ from .._compat import shape_env_size_hint
 from .ast_extension import create
 from .ast_extension import expr_from_string
 from .ast_extension import statement_from_string
+from .ast_read_writes import HELION_LANE_LOOP_VAR_ATTR
 from .compile_environment import CompileEnvironment
 from .compile_environment import _has_unbacked
 from .compile_environment import _to_sympy
@@ -74,6 +75,19 @@ def _lane_loop_iter(extent: int | ast.AST) -> ast.AST:
     # cutlass.range(_constexpr) miscompiles scalar matmul paths, so keep them
     # as ordinary Python loops.
     return expr_from_string(f"range({extent})")
+
+
+def _create_lane_loop(lane_var: str, extent: int, body: list[ast.AST]) -> ast.For:
+    loop = create(
+        ast.For,
+        target=create(ast.Name, id=lane_var, ctx=ast.Store()),
+        iter=_lane_loop_iter(extent),
+        body=body,
+        orelse=[],
+        type_comment=None,
+    )
+    setattr(loop, HELION_LANE_LOOP_VAR_ATTR, lane_var)
+    return loop
 
 
 @dataclasses.dataclass
@@ -223,16 +237,7 @@ class PersistentReductionState(DeviceLoopOrGridState):
     def wrap_body(self, body: list[ast.AST]) -> list[ast.AST]:
         wrapped: list[ast.AST] = [*self.lane_setup_statements, *body]
         for lane_var, extent in reversed(self.lane_loops):
-            wrapped = [
-                create(
-                    ast.For,
-                    target=create(ast.Name, id=lane_var, ctx=ast.Store()),
-                    iter=_lane_loop_iter(extent),
-                    body=wrapped,
-                    orelse=[],
-                    type_comment=None,
-                )
-            ]
+            wrapped = [_create_lane_loop(lane_var, extent, wrapped)]
         return wrapped
 
 
@@ -251,8 +256,30 @@ class TileStrategy:
             block_idx: self.fn.new_var(f"indices_{block_idx}", dce=True)
             for block_idx in block_ids
         }
+        # CuTe DSL preprocessor counter collision: the preprocessor's
+        # negative-step machinery (``_handle_negative_step`` in
+        # ``cutlass.base_dsl.ast_preprocessor.DSLPreprocessor``) emits
+        # ``offset_<counter>`` / ``start_<counter>`` / ``stop_<counter>`` /
+        # ``step_<counter>`` / ``isNegative_<counter>`` helpers at the enclosing
+        # scope of every for-loop whose step is not a positive Python literal.
+        # Helion's tile-offset names share the same ``offset_<n>`` namespace —
+        # Python's name-binding rule sees the late preprocessor assignment and
+        # treats the variable as local for the whole function body, turning
+        # earlier reads into ``UnboundLocalError``. The ``tile_`` prefix moves
+        # Helion's names out of the reserved CuTe DSL namespace. Of the five
+        # reserved suffixes, only ``offset_`` and ``step_`` are emitted by
+        # Helion (``offset_<bid>`` here; ``step_<n>`` via ``codegen.lift(...,
+        # prefix='step')`` in ``codegen_grid_loops`` / ``codegen_lane_loops``);
+        # both are renamed on cute. ``start_/stop_/isNegative_`` collisions are
+        # not currently emitted by Helion. Non-CuTe backends keep the
+        # historical short name to preserve existing goldens — this is a
+        # deliberate trade-off (see ``cute_plan.md`` §7.6.5.2 for the trade-off
+        # rationale; search "CuTe DSL preprocessor counter collision" for the
+        # diagnosis).
+        env = CompileEnvironment.current()
+        offset_prefix = "tile_offset" if env.backend.name == "cute" else "offset"
         self.offset_vars: dict[int, str] = {
-            block_idx: self.fn.new_var(f"offset_{block_idx}", dce=True)
+            block_idx: self.fn.new_var(f"{offset_prefix}_{block_idx}", dce=True)
             for block_idx in block_ids
         }
 
@@ -665,8 +692,8 @@ class BlockSizeTileStrategy(TileStrategy):
             is not None
             # TODO(jansel): when parent block size is a SymInt, we fail to apply this optimization should fix this
             and isinstance(
-                parent_block_size := env.block_sizes[block_id].from_config(
-                    state.config
+                parent_block_size := state.device_function.resolved_block_size(
+                    block_id
                 ),
                 int,
             )
@@ -1376,6 +1403,19 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
     def _uses_thread_axis(self, block_size: SymIntLike) -> bool:
         return not (isinstance(block_size, int) and block_size == 1)
 
+    def _uses_thread_axis_for_block(
+        self, block_id: int, block_size: SymIntLike
+    ) -> bool:
+        """Hook: does ``block_id`` claim a CUDA thread axis under this strategy?
+
+        Defaults to ``_uses_thread_axis(block_size)``. Subclasses that
+        track per-block-id state (e.g. ``CuteNDTileStrategy``'s
+        ``inactive_block_ids``) override this to return False for
+        block_ids that don't claim an axis so the grid / device-loop
+        codegen does not emit ``thread_idx[axis]`` for them.
+        """
+        return self._uses_thread_axis(block_size)
+
     def thread_axes_used(self) -> int:
         return sum(
             1 for block_size in self.block_size if self._uses_thread_axis(block_size)
@@ -1617,11 +1657,17 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
                 begin_offset_expr = ""
                 if begin != 0:
                     begin_ast = self._to_ast(begin, to_dtype=dtype)
-                    begin_offset_expr = f"{state.codegen.lift(begin_ast, dce=True, prefix='begin').id} + "
+                    begin_offset_expr = (
+                        f"{state.codegen.lift(begin_ast, dce=True, prefix='begin').id} + "
+                    )
 
                 if step not in (None, 1):
                     step_ast = self._to_ast(step, to_dtype=dtype)
-                    step_var = state.codegen.lift(step_ast, dce=True, prefix="step").id
+                    # CuTe DSL preprocessor reserves ``step_<counter>`` (see comment
+                    # in ``TileStrategy.__init__``) — rename our lifted step var to
+                    # avoid the same UnboundLocalError that drove the offset rename.
+                    step_prefix = "tile_step" if env.backend.name == "cute" else "step"
+                    step_var = state.codegen.lift(step_ast, dce=True, prefix=step_prefix).id
                     block_size_var = "1"
                     state.add_statement(
                         f"{offset_var} = {begin_offset_expr}({pid_var}) * {step_var}"
@@ -1636,11 +1682,16 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
                 else:
                     block_size_var = "1"
                     state.add_statement(f"{offset_var} = {begin_offset_expr}{pid_var}")
-
                 axis = thread_axis_offset + thread_axis_map[block_idx]
-                uses_thread_axis = step in (None, 1) and self._uses_thread_axis(
-                    block_size
-                )
+                # Inactive block_ids never claim a CUDA thread axis (per
+                # ``_thread_axis_map``); without the polymorphic
+                # ``_uses_thread_axis_for_block`` hook the grid would emit
+                # ``thread_idx[axis]`` for them and collide with the inner
+                # device-loop on the same axis.
+                uses_thread_axis = step in (
+                    None,
+                    1,
+                ) and self._uses_thread_axis_for_block(block_idx, block_size)
                 bs = block_size_var if uses_thread_axis else "1"
                 idx_expr = env.backend.grid_index_expr(offset_var, bs, dtype, axis=axis)
                 if uses_thread_axis and isinstance(block_size, int):
@@ -1653,7 +1704,6 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
                 if mask_statement is not None:
                     state.add_statement(mask_statement)
                 pid = PIDInfo(pid_var, block_size_var, numel, block_idx)
-
             pids.append(pid)
             grid_pid_index += 1
 
@@ -1889,7 +1939,13 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
                 type_comment=None,
             )
             assert for_node.body is body
-            uses_thread_axis = step in (None, 1) and self._uses_thread_axis(block_size)
+            # Inactive block_ids never claim a CUDA thread axis (per
+            # ``_thread_axis_map``); see ``codegen_grid`` above for the
+            # collision this guards against.
+            uses_thread_axis = step in (
+                None,
+                1,
+            ) and self._uses_thread_axis_for_block(block_idx, block_size)
             axis = thread_axis_offset + thread_axis_map[block_idx]
             bs = block_size_var if uses_thread_axis else "1"
             idx_expr = env.backend.loop_index_expr(offset_var, bs, dtype, axis=axis)
@@ -2051,9 +2107,7 @@ class CuteNDTileStrategy(NDTileStrategy):
         env = CompileEnvironment.current()
         resolved_block_id = env.resolve_block_id(block_size)
         if resolved_block_id is not None:
-            configured_size = env.block_sizes[resolved_block_id].from_config(
-                self.fn.config
-            )
+            configured_size = self.fn.resolved_block_size(resolved_block_id)
             if isinstance(configured_size, int):
                 return configured_size
         block_size_expr = _to_sympy(block_size)
@@ -2237,7 +2291,11 @@ class CuteNDTileStrategy(NDTileStrategy):
 
             if step not in (None, 1):
                 step_ast = self._to_ast(step, to_dtype=dtype)
-                step_var = state.codegen.lift(step_ast, dce=True, prefix="step").id
+                # CuTe DSL preprocessor reserves ``step_<counter>`` (see comment
+                # in ``TileStrategy.__init__``) — rename our lifted step var to
+                # avoid the same UnboundLocalError that drove the offset rename.
+                step_prefix = "tile_step" if env.backend.name == "cute" else "step"
+                step_var = state.codegen.lift(step_ast, dce=True, prefix=step_prefix).id
                 block_size_var = "1"
                 state.add_statement(
                     f"{offset_var} = {begin_offset_expr}({pid_var}) * {step_var}"
@@ -2333,7 +2391,8 @@ class CuteNDTileStrategy(NDTileStrategy):
         env = CompileEnvironment.current()
         dtype = env.index_type()
         block_sizes = self.block_size
-        body = user_body = []
+        user_body: list[ast.AST] = []
+        body: list[ast.AST] = user_body
         lane_loops = [
             (
                 self._lane_var_by_block[block_id],
@@ -2343,14 +2402,7 @@ class CuteNDTileStrategy(NDTileStrategy):
             if block_id in self._lane_var_by_block
         ]
         for lane_var, extent in reversed(lane_loops):
-            lane_for = create(
-                ast.For,
-                target=create(ast.Name, id=lane_var, ctx=ast.Store()),
-                iter=_lane_loop_iter(extent),
-                body=body,
-                orelse=[],
-                type_comment=None,
-            )
+            lane_for = _create_lane_loop(lane_var, extent, body)
             body = [lane_for]
         for_node: ast.For | None = None
         assert len(block_sizes) == len(block_ids)
@@ -2659,13 +2711,10 @@ class CuteFlattenedTileStrategy(FlattenedTileStrategy):
         body: list[ast.AST] = user_body
         user_body[:0] = lane_setup_statements
         if self._lane_var is not None:
-            lane_for = create(
-                ast.For,
-                target=create(ast.Name, id=self._lane_var, ctx=ast.Store()),
-                iter=expr_from_string(f"range({self._elements_per_thread})"),
-                body=body,
-                orelse=[],
-                type_comment=None,
+            lane_for = _create_lane_loop(
+                self._lane_var,
+                self._elements_per_thread,
+                body,
             )
             body = [lane_for]
         body[:0] = [

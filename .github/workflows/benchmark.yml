@@ -21,6 +21,10 @@ on:
       alias:
         required: true
         type: string
+      backend:
+        required: false
+        type: string
+        default: triton
       kernels:
         required: true
         type: string
@@ -39,9 +43,7 @@ jobs:
 
     env:
       HELION_AUTOTUNE_LOG_LEVEL: INFO
-      # Run autotune benchmarks in a subprocess so deadlocked kernels are
-      # SIGKILL'd at the per-config timeout instead of hanging the job.
-      HELION_AUTOTUNE_BENCHMARK_SUBPROCESS: "1"
+      HELION_BACKEND: ${{ inputs.backend }}
 
     container:
       image: ${{ inputs.image }}
@@ -106,6 +108,12 @@ jobs:
           SETUPTOOLS_SCM_PRETEND_VERSION="0.0.0" uv pip install -e .'[dev]'
           python -c "import helion; print(helion.__name__)"
 
+      - name: Install CUTLASS CuTe DSL
+        if: inputs.backend == 'cute'
+        run: |
+          source .venv/bin/activate
+          ./scripts/install_cute.sh
+
       - name: CUDA Compute Check
         if: startsWith(inputs.image, 'nvidia')
         run: |
@@ -140,6 +148,11 @@ jobs:
           git submodule update --init --recursive
           uv pip install -r requirements.txt
           python install.py --liger
+          if [[ "${{ inputs.runtime-version }}" == cu* ]]; then
+            uv pip install einops
+            MAX_JOBS=4 uv pip install "mamba-ssm==2.3.2.post1" --no-build-isolation --no-deps
+            uv pip install "git+https://github.com/sustcsonglin/flash-linear-attention@v0.5.0" --no-deps
+          fi
           uv pip install -e . --no-deps
           popd
           popd
@@ -180,6 +193,7 @@ jobs:
             # so --measure-compile-time reports end-to-end user-visible compile time.
             ${{ inputs.env-vars }} HELION_PRINT_OUTPUT_CODE=1 python benchmarks/run.py \
                 --op $kernel \
+                --helion-backend "${{ inputs.backend }}" \
                 --metrics speedup,accuracy,latency \
                 --measure-compile-time \
                 --latency-measure-mode triton_do_bench \

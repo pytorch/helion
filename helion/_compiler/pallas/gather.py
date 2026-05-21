@@ -27,7 +27,6 @@ _GATHER_VMEM_THRESHOLD_BYTES: int = 16 << 20  # 16 MiB
 
 @dataclass(frozen=True)
 class GatherPlan:
-    gather_axis_size: int
     indirect_pos: int
     none_dims: tuple[int, ...]
     jnp_dtype: str
@@ -60,19 +59,15 @@ def build_gather_plan(
         )
 
     elements = resident_block_elements(tensor, patterns, config)
-    if elements is None:
-        raise NotImplementedError(
-            "Pallas gather: dynamic-shape tables are not supported; "
-            "use @helion.kernel(static_shapes=True)"
-        )
-    table_bytes = elements * tensor.dtype.itemsize
-    if table_bytes > _GATHER_VMEM_THRESHOLD_BYTES:
-        raise NotImplementedError(
-            f"Pallas gather: resident block is {table_bytes} bytes, exceeds "
-            f"the {_GATHER_VMEM_THRESHOLD_BYTES} byte VMEM threshold. The "
-            f"current codegen requires the full gather axis in VMEM; reduce "
-            f"V, tile the broadcast dims, or use a half-precision dtype."
-        )
+    if elements is not None:
+        table_bytes = elements * tensor.dtype.itemsize
+        if table_bytes > _GATHER_VMEM_THRESHOLD_BYTES:
+            raise NotImplementedError(
+                f"Pallas gather: resident block is {table_bytes} bytes, exceeds "
+                f"the {_GATHER_VMEM_THRESHOLD_BYTES} byte VMEM threshold. The "
+                "current codegen requires the full gather axis in VMEM; reduce "
+                "V, tile the broadcast dims, or use a half-precision dtype."
+            )
 
     # MXU truncates fp32 to bf16 without HIGHEST. For bf16/fp16 the truncation is a no-op.
     use_highest = tensor.dtype not in (torch.bfloat16, torch.float16)
@@ -81,7 +76,6 @@ def build_gather_plan(
     jnp_dtype = CompileEnvironment.current().backend.dtype_str(tensor.dtype)
 
     return GatherPlan(
-        gather_axis_size=tensor.shape[0],
         indirect_pos=indirect_pos,
         none_dims=none_dims,
         jnp_dtype=jnp_dtype,
@@ -118,11 +112,11 @@ def emit_gather(
         precision_arg = ""
 
     result = expr_from_string(
-        f"jax.lax.dot_general("
-        f"jax.nn.one_hot({idx_name}[...], {plan.gather_axis_size}, dtype={oh_dtype}), "
+        "jax.lax.dot_general("
+        f"jax.nn.one_hot({idx_name}[...], {name}.shape[0], dtype={oh_dtype}), "
         f"{table_expr}, "
         f"(((jnp.ndim({idx_name}[...]),), (0,)), ((), ())), "
-        f"preferred_element_type=jnp.float32, "
+        "preferred_element_type=jnp.float32, "
         f"{precision_arg}"
         f").astype({plan.jnp_dtype})"
     )

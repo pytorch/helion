@@ -11,6 +11,9 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref == 'refs/heads/main' && github.run_number || github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 jobs:
   load-matrix:
     runs-on: ubuntu-latest
@@ -183,7 +186,7 @@ jobs:
             --extra-index-url https://us-python.pkg.dev/ml-oss-artifacts-published/jax/simple/ \
             --find-links https://storage.googleapis.com/jax-releases/libtpu_releases.html \
             --pre \
-            'jax==0.9.2' 'jaxlib==0.9.2' 'libtpu==0.0.40' 'tpu-info==0.7.1' 'jaxtyping' 'frozendict' 'immutabledict'
+            'jax==0.10.0' 'jaxlib==0.10.0' 'libtpu==0.0.40' 'tpu-info==0.7.1' 'jaxtyping' 'frozendict' 'immutabledict'
           # Install Bazel
           if ! command -v bazel &> /dev/null; then
             sudo curl -L https://github.com/bazelbuild/bazelisk/releases/download/v1.27.0/bazelisk-linux-amd64 -o /usr/local/bin/bazel
@@ -225,6 +228,12 @@ jobs:
           rm -rf /tmp/torch_tpu
           # Verify
           python -c "from torch_tpu import api; print(f'TPU device: {api.tpu_device()}')"
+
+      - name: Install Pallas interpret dependencies
+        if: matrix.alias == 'pallas-interpret'
+        run: |
+          source .venv/bin/activate
+          uv pip install 'jax==0.10.0' 'jaxlib==0.10.0' 'absl-py'
 
       - name: Install CUTLASS CuTe DSL
         if: matrix.backend == 'cute'
@@ -307,6 +316,7 @@ jobs:
           if [[ "${{ matrix.expecttest-accept }}" == "true" ]]; then export EXPECTTEST_ACCEPT=1; fi
           if [[ "${{ matrix.ref-eager }}" == "true" ]]; then export HELION_INTERPRET=1; fi
           if [[ "${{ matrix.backend }}" == "tileir" ]]; then export ENABLE_TILE=1; fi
+          if [[ "${{ matrix.alias }}" == "pallas-interpret" ]]; then export HELION_PALLAS_INTERPRET=1; fi
           export HELION_BACKEND=${{ matrix.backend }}
           # Disable TorchTPU build cache to prevent running out of disk space.
           export TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE=disabled
@@ -316,7 +326,7 @@ jobs:
           if [[ "${{ contains(matrix.alias, 'distributed') }}" == "true" ]]; then
             TEST_PATH="test/test_examples_dist.py"
             EXTRA_FLAGS="-rs"
-          elif [[ "${{ matrix.alias }}" == "tpu" || "$HELION_BACKEND" == "metal" ]]; then
+          elif [[ "${{ matrix.alias }}" == "tpu" || "${{ matrix.alias }}" == "pallas-interpret" || "$HELION_BACKEND" == "metal" ]]; then
             TEST_PATH="."
             EXTRA_FLAGS="--ignore=test/test_examples_dist.py"
             PARALLEL=""
@@ -324,12 +334,24 @@ jobs:
             TEST_PATH="."
             EXTRA_FLAGS="--ignore=test/test_examples_dist.py"
           fi
+          # A10G runners expose one 22 GiB GPU. Four xdist workers can collectively
+          # exhaust VRAM with CUDA/Triton/Inductor state even when an individual test
+          # only needs a small allocation.
+          if [[ -n "$PARALLEL" && "${{ matrix.alias }}" == *a10g* ]]; then
+            PARALLEL="-n2"
+          fi
           # For distributed tests, fail if any test is skipped, failed, or has an error
           SKIP_CHECK=$([[ "${{ contains(matrix.alias, 'distributed') }}" == "true" ]] && echo "! grep -qE '(SKIPPED|FAILED|ERROR)'" || echo "cat > /dev/null")
           if [[ "${{ matrix.alias }}" == *xpu* ]]; then
             export TRITON_XPU_GEN_NATIVE_CODE=1
           fi
-          pytest $PARALLEL -rf --timeout=60 --reruns=2 --timeout-method=thread $EXTRA_FLAGS $TEST_PATH | tee >(eval $SKIP_CHECK)
+          # Pallas interpret runs on CPU (no parallelism) and is much slower
+          # than TPU/Triton — bump the per-test timeout accordingly.
+          TIMEOUT=60
+          if [[ "${{ matrix.alias }}" == "pallas-interpret" ]]; then
+            TIMEOUT=300
+          fi
+          pytest $PARALLEL -rf --timeout=$TIMEOUT --reruns=2 --timeout-method=thread $EXTRA_FLAGS $TEST_PATH | tee >(eval $SKIP_CHECK)
 
   test-notebooks:
     name: test-notebooks-cu128-py3.12-pytorch-2.9-a10g

@@ -20,7 +20,7 @@ from helion._testing import skipIfRocm
 from helion._testing import skipIfTileIR
 from helion._testing import skipUnlessTensorDescriptor
 from helion._testing import xfailIfCute
-from helion._testing import xfailIfPallas
+from helion._testing import xfailIfPallasTpu
 import helion.language as hl
 
 if TYPE_CHECKING:
@@ -226,6 +226,22 @@ class TestReductions(RefEagerTestBase, TestCase):
         args = (torch.randn([512, 512], device=DEVICE),)
         code, output = code_and_output(sum_kernel, args, block_size=1)
         torch.testing.assert_close(output, args[0].sum(-1), rtol=1e-04, atol=1e-04)
+
+    def test_keepdim_scalar_reduction_broadcast(self):
+        @helion.kernel(autotune_effort="none")
+        def center_by_tile_mean(x: torch.Tensor) -> torch.Tensor:
+            (n,) = x.size()
+            out = torch.empty([n], dtype=torch.float32, device=x.device)
+            for tile_n in hl.tile(n):
+                vals = x[tile_n].to(torch.float32)
+                mean = torch.mean(vals, dim=-1, keepdim=True)
+                out[tile_n] = vals - mean
+            return out
+
+        x = ((torch.arange(128, device=DEVICE) % 2) * 2).to(HALF_DTYPE)
+        _code, output = code_and_output(center_by_tile_mean, (x,), block_size=32)
+        expected = x.float() - 1.0
+        torch.testing.assert_close(output, expected, rtol=1e-3, atol=1e-3)
 
     @skipIfNotTriton("tensor_descriptor indexing is Triton-specific")
     @skipUnlessTensorDescriptor("Tensor descriptor support is required")
@@ -436,7 +452,7 @@ class TestReductions(RefEagerTestBase, TestCase):
         )
         torch.testing.assert_close(result1, result2, rtol=1e-3, atol=1e-3)
 
-    @xfailIfPallas("fp16/bf16 1D tensors hit TPU Mosaic sublane alignment error")
+    @xfailIfPallasTpu("fp16/bf16 1D tensors hit TPU Mosaic sublane alignment error")
     @skipIfTileIR("TileIR does not support log1p")
     def test_fp16_math_ops_fp32_fallback(self):
         """Test that mathematical ops with fp16/bfloat16 inputs now work via fp32 fallback."""

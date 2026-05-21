@@ -22,6 +22,7 @@ from helion._testing import code_and_output
 from helion._testing import import_path
 from helion._testing import onlyBackends
 from helion._testing import skipIfCudaCapabilityLessThan
+from helion._testing import skipIfCudaSharedMemoryLessThan
 from helion._testing import skipIfFn
 from helion._testing import skipIfLowVRAM
 from helion._testing import skipIfNotCUDA
@@ -31,6 +32,8 @@ from helion._testing import skipIfRefEager
 from helion._testing import skipIfTileIR
 from helion._testing import skipIfXPU
 from helion._testing import xfailIfPallas
+from helion._testing import xfailIfPallasInterpret
+from helion._testing import xfailIfPallasTpu
 import helion.language as hl
 
 datadir = Path(__file__).parent / "data"
@@ -217,7 +220,7 @@ class TestLoops(RefEagerTestBase, TestCase):
         )
         torch.testing.assert_close(result, torch.sin(args[0]))
 
-    @xfailIfPallas("uses Triton-specific config options (block_ptr, pid_type)")
+    @xfailIfPallasTpu("uses Triton-specific config options (block_ptr, pid_type)")
     def test_flattened_tile_with_unit_axis(self):
         @helion.kernel(
             config=helion.Config(
@@ -250,7 +253,7 @@ class TestLoops(RefEagerTestBase, TestCase):
 
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfTileIR("TileIR does not support block_ptr indexing")
-    @xfailIfPallas(
+    @xfailIfPallasTpu(
         "emit_pipeline + block_ptr indexing fails Mosaic alignment proof "
         "on the trailing 16-block dim (E2003)"
     )
@@ -289,6 +292,7 @@ class TestLoops(RefEagerTestBase, TestCase):
         )
         torch.testing.assert_close(result, torch.sin(args[0]))
 
+    @xfailIfPallasInterpret("numerical mismatch in JAX interpret mode")
     def test_three_level_matmul(self):
         @helion.kernel(static_shapes=True)
         def matmul(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -1295,6 +1299,10 @@ class TestLoops(RefEagerTestBase, TestCase):
         expected = x + fill_value[0]
         torch.testing.assert_close(result, expected)
 
+    @xfailIfPallasInterpret(
+        "JAX MLIR translation rule for primitive 'program_id' is not implemented "
+        "for the CPU platform"
+    )
     def test_nested_loop_accumulator(self):
         """Test variable scoping with nested loops and accumulator pattern."""
 
@@ -1456,6 +1464,125 @@ class TestLoops(RefEagerTestBase, TestCase):
 
         x = torch.randn(128, 1024, dtype=torch.float32, device=DEVICE)
         torch.testing.assert_close(fn(x), x)
+
+    @skipIfNotTriton(
+        "tl.debug_barrier() is only emitted in Triton device codegen (not Pallas/JAX)"
+    )
+    @skipIfCudaSharedMemoryLessThan(
+        131072, reason="block sizes exceed device shared memory limit"
+    )
+    def test_sequential_loops_global_memory_barrier(self):
+        """Sequential device loops that store then load the same global buffer
+        need tl.debug_barrier() between the sibling loops so all warps see
+        prior stores (Triton; portable across ROCm and num_warps)."""
+
+        @helion.kernel(autotune_effort="none")
+        def two_phase_kernel(
+            x: torch.Tensor, a: torch.Tensor, b: torch.Tensor
+        ) -> torch.Tensor:
+            m, n = x.size()
+            k = a.size(1)
+            c = torch.empty([m, k], dtype=x.dtype, device=x.device)
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m in hl.tile(m):
+                for tile_k in hl.tile(k):
+                    c[tile_m, tile_k] = torch.relu(x[tile_m, :] @ a[:, tile_k])
+                for tile_n in hl.tile(n):
+                    acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                    for tile_k in hl.tile(k):
+                        acc = torch.addmm(acc, c[tile_m, tile_k], b[tile_k, tile_n])
+                    out[tile_m, tile_n] = acc
+            return out
+
+        torch.manual_seed(42)
+        m, n, k = 128, 128, 128
+        x = torch.randn([m, n], device=DEVICE, dtype=torch.float32)
+        a = torch.randn([n, k], device=DEVICE, dtype=torch.float32)
+        b = torch.randn([k, n], device=DEVICE, dtype=torch.float32)
+
+        expected = torch.relu(x @ a) @ b
+
+        for num_warps in (2, 4):
+            code, result = code_and_output(
+                two_phase_kernel,
+                (x, a, b),
+                block_sizes=[128, 128, 128, 128],
+                num_warps=num_warps,
+                num_stages=2,
+            )
+            torch.testing.assert_close(result, expected, atol=0.15, rtol=0.01)
+            self.assertIn("tl.debug_barrier()", code)
+
+    @skipIfRefEager("reduction rolling is a codegen-time transformation")
+    @skipIfNotTriton("rolled reduction loops are Triton codegen-specific")
+    def test_reduction_loop_rolling_emits_inner_for_loop(self):
+        """With ``reduction_loop`` set, the per-tile reduction is rolled into
+        an explicit inner Triton for-loop over chunks of the reduction dim.
+
+        This replaces an earlier, brittle test that reached into
+        ``bound.host_function.device_ir.build_codegen_graphs`` and asserted on
+        ``ReductionLoopGraphInfo`` directly.  Asserting on the generated code
+        verifies the same end-to-end behavior (rolling actually happens) without
+        coupling to compiler internals.
+        """
+
+        @helion.kernel(autotune_effort="none")
+        def reduction_roll_kernel(x: torch.Tensor) -> torch.Tensor:
+            n, _m = x.size()
+            out = torch.empty([n], dtype=x.dtype, device=x.device)
+            for tile_n in hl.tile(n):
+                out[tile_n] = x[tile_n, :].sum(-1)
+            return out
+
+        x = torch.randn(64, 128, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(
+            reduction_roll_kernel,
+            (x,),
+            block_size=8,
+            reduction_loop=32,
+        )
+        # Rolled reductions emit an inner ``for r0_<n> in tl.range(...)`` loop
+        # walking chunks of the reduction dim; the un-rolled path computes the
+        # whole reduction with a single ``tl.sum`` and has no such for-loop.
+        self.assertRegex(
+            code,
+            r"for\s+\w+\s+in\s+tl\.range\(",
+            msg="expected an inner reduction for-loop in the generated Triton code",
+        )
+        torch.testing.assert_close(result, x.sum(-1), rtol=1e-4, atol=1e-4)
+
+    @skipIfNotTriton(
+        "tl.debug_barrier() is Triton codegen-specific; "
+        "the negative assertion is trivially true on non-Triton backends"
+    )
+    @skipIfCudaSharedMemoryLessThan(
+        65536, reason="block sizes exceed device shared memory limit"
+    )
+    def test_sequential_loops_no_barrier_without_cross_loop_raw(self):
+        """Independent sequential device loops should not get an inter-loop barrier."""
+
+        @helion.kernel(autotune_effort="none")
+        def independent_loops(x: torch.Tensor) -> torch.Tensor:
+            m, n = x.shape
+            out1 = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            out2 = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m in hl.tile(m):
+                for tile_n in hl.tile(n):
+                    out1[tile_m, tile_n] = x[tile_m, tile_n] * 2
+                for tile_n in hl.tile(n):
+                    out2[tile_m, tile_n] = x[tile_m, tile_n] + 1
+            return out2
+
+        x = torch.randn(64, 64, dtype=torch.float32, device=DEVICE)
+        code, result = code_and_output(
+            independent_loops,
+            (x,),
+            block_sizes=[64, 64, 64],
+            num_warps=4,
+            num_stages=1,
+        )
+        torch.testing.assert_close(result, x + 1)
+        self.assertNotIn("tl.debug_barrier()", code)
 
 
 if __name__ == "__main__":

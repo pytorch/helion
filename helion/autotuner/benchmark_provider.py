@@ -250,6 +250,10 @@ def _unset_fn(*args: object) -> NoReturn:
     raise RuntimeError("Uninitialized function")
 
 
+def _never_exceeded() -> bool:
+    return False
+
+
 class BenchmarkProvider(abc.ABC):
     """Abstract interface for benchmarking kernel configurations.
 
@@ -267,9 +271,21 @@ class BenchmarkProvider(abc.ABC):
             provider.cleanup()
 
     ``BaseSearch`` manages this lifecycle automatically.
+
+    ``budget_exceeded_fn`` is the local wall-clock budget check that
+    ``BaseSearch._prepare`` installs via ``set_budget_exceeded_fn``.
+    Subclasses should not call this hook directly inside loops that
+    participate in distributed collectives; use a sync wrapper that
+    agrees the cutoff across the process group so peers do not deadlock
+    on an unmatched collective. Default no-op so providers built before
+    the search installs the hook stay unchanged.
     """
 
     mutated_arg_indices: Sequence[int]
+    # ``staticmethod`` prevents Python from binding the class-level
+    # default to ``self`` when an instance reads it before any caller
+    # has installed a real hook via ``set_budget_exceeded_fn``.
+    budget_exceeded_fn: Callable[[], bool] = staticmethod(_never_exceeded)
 
     @abc.abstractmethod
     def __init__(
@@ -283,6 +299,10 @@ class BenchmarkProvider(abc.ABC):
     ) -> None:
         """Initialize the provider with kernel context and benchmarking state."""
         ...
+
+    def set_budget_exceeded_fn(self, fn: Callable[[], bool]) -> None:
+        """Install the search's budget-check hook on this provider."""
+        self.budget_exceeded_fn = fn
 
     @abc.abstractmethod
     def benchmark(
@@ -300,6 +320,22 @@ class BenchmarkProvider(abc.ABC):
         Returns one ``BenchmarkResult`` per input config, in the same order.
         """
         ...
+
+    def benchmark_isolated(
+        self,
+        fns: list[Callable[..., object]],
+        *,
+        warmup: int,
+        rep: int,
+        desc: str = "Benchmarking",
+    ) -> list[float | None] | None:
+        """Benchmark already-validated functions in an isolated subprocess.
+
+        Return ``None`` when the provider cannot support the isolated path or
+        per-function ``None`` when a timing could not be confirmed and callers
+        should keep the prior timing for that function.
+        """
+        return None
 
     @abc.abstractmethod
     def setup(self) -> None:
@@ -339,6 +375,8 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         self._precompile_args_path: str | None = None
         self._precompile_result_counter: count[int] = count()
         self._benchmark_worker: BenchmarkWorker | None = None
+        # budget_exceeded_fn inherits the class-level _never_exceeded default
+        # until BaseSearch._prepare installs the search's real hook.
 
         # TODO(hinriksnaer): baseline computation is expensive (compiles and runs
         # the kernel). Currently safe because the provider is only constructed
@@ -581,6 +619,8 @@ class LocalBenchmarkProvider(BenchmarkProvider):
             return False
         if len(self.mutated_arg_indices) > 0:
             return False
+        if not self.kernel.supports_subprocess_benchmark():
+            return False
         # Custom do_bench implementations are not shipped to the worker.
         _backend = getattr(self.config_spec, "backend", None)
         return not (_backend is not None and _backend.get_do_bench() is not None)
@@ -648,19 +688,57 @@ class LocalBenchmarkProvider(BenchmarkProvider):
             args_path=self._precompile_args_path,
         )
 
+    def _budget_exceeded_synced(self) -> bool:
+        """Return whether any rank reports the autotune budget exhausted.
+
+        The compile and benchmark loops below participate in distributed
+        collectives. The cutoff decision must be agreed across the
+        process group; otherwise one rank breaks early while peers keep
+        entering collectives and the group deadlocks. Single-process
+        autotune skips the all-gather because
+        ``all_gather_object`` returns ``[obj]`` when distributed is not
+        initialized.
+        """
+        local = self.budget_exceeded_fn()
+        return any(
+            all_gather_object(
+                local,
+                process_group_name=self.kernel.env.process_group_name,
+            )
+        )
+
     def benchmark(
         self,
         configs: list[Config],
         *,
         desc: str = "Benchmarking",
     ) -> list[BenchmarkResult]:
-        """Compile, precompile, validate, and time a batch of configs."""
+        """Compile, precompile, validate, and time a batch of configs.
+
+        When ``budget_exceeded_fn`` reports the autotune wall-clock
+        budget exhausted, the compile and benchmark loops short-circuit
+        and leave any not-yet-handled slots at the default
+        ``perf=inf, status="error"`` so the caller still receives one
+        ``BenchmarkResult`` per input config in positional order. The
+        cutoff is synchronized across the process group via
+        ``_budget_exceeded_synced``.
+
+        The precompile-phase wait (``PrecompileFuture.wait_for_all``)
+        is not budget-aware: once the compile loop has queued
+        precompile futures it drains all of them, so the effective
+        wall-clock may overrun the configured budget by up to
+        ``len(queued) * autotune_compile_timeout`` seconds. Backends
+        that disable ``autotune_precompile`` (e.g. cute) skip that
+        wait entirely.
+        """
         all_configs = configs
         compiled: dict[int, Callable[..., object]] = {}
         futures: list[PrecompileFuture] | None = None
 
         # Compilation phase
         for i, config in enumerate(all_configs):
+            if self._budget_exceeded_synced():
+                break
             try:
                 compiled[i] = self.kernel.compile_config(config, allow_print=False)
             except Exception:
@@ -716,6 +794,8 @@ class LocalBenchmarkProvider(BenchmarkProvider):
             enabled=self.settings.autotune_progress_bar,
         )
         for index, (fn, is_working, reason) in iterator:
+            if self._budget_exceeded_synced():
+                break
             config = configs[index]
             if futures is not None:
                 future = futures[index]
@@ -774,6 +854,25 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                     compile_time=compile_time,
                 )
         return results
+
+    def _clear_jit_fast_path_caches(self, fn: CompiledConfig) -> None:
+        """Clear Triton JIT fast-path caches for this generated wrapper.
+
+        Without this, tensors passed to the companion Triton JIT function can
+        remain pinned in GPU memory by its _last_call cache across config
+        benchmarks.
+        """
+        try:
+            fn_name = getattr(fn, "__name__", None)
+            fn_globals = getattr(fn, "__globals__", None)
+            if fn_name is None or fn_globals is None:
+                return
+            triton_jit_fn = fn_globals.get(f"_helion_{fn_name}")
+            clear = getattr(triton_jit_fn, "clear_fast_path_caches", None)
+            if clear is not None:
+                clear()
+        except Exception:
+            self.log.debug("Failed to clear Triton JIT fast-path cache.", exc_info=True)
 
     def _benchmark_function(self, config: Config, fn: CompiledConfig) -> float:
         """Benchmark a single compiled function.  Returns time in ms or inf."""
@@ -863,16 +962,18 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                 # while other ranks return immediately, this will cause stuck jobs!
                 return inf
 
-            bench_fn = self.kernel.bench_compile_config(config, allow_print=False)
-            bench_fn(*working_args)  # warmup benchmark kernel
+            benchmark_function = self.kernel.bench_compile_config(
+                config, allow_print=False
+            )
+            benchmark_function(*working_args)  # warmup benchmark kernel
 
             t1 = time.perf_counter()
             _backend = getattr(getattr(self, "config_spec", None), "backend", None)
-            _bench_fn = (
+            benchmark_runner = (
                 _backend.get_do_bench() if _backend is not None else None
             ) or do_bench
-            res = _bench_fn(
-                functools.partial(bench_fn, *working_args),
+            res = benchmark_runner(
+                functools.partial(benchmark_function, *working_args),
                 return_mode="median",
                 warmup=1,  # we are already warmed up above
                 rep=50,
@@ -953,6 +1054,8 @@ class LocalBenchmarkProvider(BenchmarkProvider):
 
             self._autotune_metrics.num_compile_failures += 1
             return inf
+        finally:
+            self._clear_jit_fast_path_caches(fn)
 
     def _benchmark_function_subprocess(
         self, config: Config, fn: CompiledConfig
@@ -962,26 +1065,10 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         we classified and handled, or ``None`` if the subprocess path cannot
         handle this config and the caller should fall back to in-process.
         """
-        if self._precompile_args_path is None:
-            return None
         try:
-            fn_spec = _serialize_compiled_fn(fn)
-        except RuntimeError:
-            return None
-
-        if self._benchmark_worker is None:
-            self._benchmark_worker = BenchmarkWorker(device=None)
-
-        job = BenchmarkJob(
-            fn_spec=fn_spec,
-            args_path=self._precompile_args_path,
-            warmup=1,
-            rep=50,
-        )
-        timeout = float(self.settings.autotune_benchmark_timeout)
-
-        try:
-            latency = self._benchmark_worker.run(job, timeout=timeout)
+            latency = self._run_subprocess_benchmark_job(fn, warmup=1, rep=50)
+            if latency is None:
+                return None
         except BenchmarkSubprocessError as e:
             # Timeout or unexpected worker exit; skip config and continue.
             self.log.warning(f"Benchmark subprocess failed for {config!r}: {e}")
@@ -1023,3 +1110,71 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                 return inf
 
         return float(latency)
+
+    def _run_subprocess_benchmark_job(
+        self,
+        fn: CompiledConfig,
+        *,
+        warmup: int,
+        rep: int,
+    ) -> float | None:
+        if self._precompile_args_path is None:
+            return None
+        try:
+            fn_spec = _serialize_compiled_fn(fn)
+        except RuntimeError:
+            return None
+
+        if self._benchmark_worker is None:
+            self._benchmark_worker = BenchmarkWorker(device=None)
+
+        job = BenchmarkJob(
+            fn_spec=fn_spec,
+            args_path=self._precompile_args_path,
+            warmup=warmup,
+            rep=rep,
+        )
+        return float(
+            self._benchmark_worker.run(
+                job,
+                timeout=float(self.settings.autotune_benchmark_timeout),
+            )
+        )
+
+    def benchmark_isolated(
+        self,
+        fns: list[Callable[..., object]],
+        *,
+        warmup: int,
+        rep: int,
+        desc: str = "Benchmarking",
+    ) -> list[float | None] | None:
+        if not self._subprocess_benchmark_enabled():
+            return None
+        if self.settings.autotune_benchmark_fn is not None:
+            return None
+
+        timings: list[float | None] = []
+        for fn in fns:
+            try:
+                timing = self._run_subprocess_benchmark_job(
+                    cast("CompiledConfig", fn),
+                    warmup=warmup,
+                    rep=rep,
+                )
+            except BenchmarkSubprocessError as e:
+                self.log.warning(f"{desc} subprocess failed: {e}")
+                timing = None
+            except Exception as e:
+                e.__traceback__ = None
+                if match_unrecoverable_runtime_error(e):
+                    self.log.warning(f"{desc} sticky CUDA error skipped: {e}")
+                    # The confirmation re-ran a previously accepted candidate in
+                    # an isolated worker; a sticky CUDA error means that config is
+                    # still unsafe, so remove it from contention.
+                    timing = inf
+                else:
+                    self.log.debug(f"{desc} subprocess raised: {type(e).__name__}: {e}")
+                    timing = None
+            timings.append(None if timing is None else float(timing))
+        return timings
