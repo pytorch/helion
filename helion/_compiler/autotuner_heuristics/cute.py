@@ -4,6 +4,8 @@ from typing import TYPE_CHECKING
 from typing import Any
 from typing import cast
 
+import torch
+
 from ...runtime.config import Config
 from ..cute.strategies import TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY
 from ..cute.strategies import Tcgen05PersistenceModel
@@ -34,6 +36,48 @@ def _reduction_kernel_eligible(env: CompileEnvironment, device_ir: DeviceIR) -> 
     bs_spec = cast("BlockSizeSpec", spec.block_sizes[0])
     # M-axis must accept block_size=1.
     return max(bs_spec.min_size, bs_spec.autotuner_min) <= 1
+
+
+def _cute_seed_vec_width(
+    env: CompileEnvironment,
+    rl_spec: ReductionLoopSpec,
+    max_threads: int,
+    size_hint: int,
+    device_ir: DeviceIR,
+) -> int:
+    """Pick a default vector width for the cute_vector_widths seed.
+
+    Returns 1 (scalar) when the kernel has no plausible LDG.128 win, or
+    the dtype is not supported by the vector load helper. For supported
+    dtypes, prefer 4 (fp32) / 8 (fp16/bf16) when the reduction is wide
+    enough that a vec-load actually halves the number of inner-loop iters.
+    """
+    spec = env.config_spec
+    if not spec.cute_vector_widths.valid_block_ids():
+        return 1
+    if size_hint < max_threads * 2:
+        # Reduction extent already fits in one wide chunk; vec wouldn't
+        # remove enough loop iters to matter.
+        return 1
+    # Find the dtype of the reduction-source tensor by walking nodes that
+    # have a fake-tensor value matching the reduction extent.
+    dtype: torch.dtype | None = None
+    rdim_size = rl_spec.size_hint
+    for graph_info in device_ir.graphs:
+        for node in graph_info.graph.nodes:
+            val = node.meta.get("val")
+            if isinstance(val, torch.Tensor) and val.ndim >= 1:
+                last = val.shape[-1]
+                if isinstance(last, int) and last == rdim_size:
+                    dtype = val.dtype
+                    break
+        if dtype is not None:
+            break
+    if dtype is torch.float32:
+        return 4
+    if dtype in (torch.float16, torch.bfloat16):
+        return 8
+    return 1
 
 
 class CuteReductionTileHeuristic(AutotunerHeuristic):
@@ -69,11 +113,15 @@ class CuteReductionTileHeuristic(AutotunerHeuristic):
             reduction_loops: list[int | None] = [None]
         else:
             reduction_loops = [max_threads]
-        return Config(
-            block_sizes=[1],
-            num_threads=[1],
-            reduction_loops=reduction_loops,
-        )
+        seed: dict[str, Any] = {
+            "block_sizes": [1],
+            "num_threads": [1],
+            "reduction_loops": reduction_loops,
+        }
+        vec = _cute_seed_vec_width(env, rl_spec, max_threads, size_hint, device_ir)
+        if vec > 1:
+            seed["cute_vector_widths"] = [vec]
+        return Config(**seed)
 
 
 class CuteReductionWideChunkHeuristic(AutotunerHeuristic):
@@ -116,11 +164,15 @@ class CuteReductionWideChunkHeuristic(AutotunerHeuristic):
         chunk = size_hint // 2
         if chunk < max_threads:
             chunk = max_threads
-        return Config(
-            block_sizes=[1],
-            num_threads=[1],
-            reduction_loops=[chunk],
-        )
+        seed: dict[str, Any] = {
+            "block_sizes": [1],
+            "num_threads": [1],
+            "reduction_loops": [chunk],
+        }
+        vec = _cute_seed_vec_width(env, rl_spec, max_threads, size_hint, device_ir)
+        if vec > 1:
+            seed["cute_vector_widths"] = [vec]
+        return Config(**seed)
 
 
 class CuteTcgen05ClusterM2Heuristic(AutotunerHeuristic):
