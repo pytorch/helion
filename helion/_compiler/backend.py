@@ -1857,11 +1857,12 @@ class PallasBackend(Backend):
                     output_only_names.append(arg.host_str())
         self._output_only_names = output_only_names
 
-        launcher_args = [*args, f"_output_indices={output_indices}"]
-        launcher_args.append(f"_inplace_indices={inplace_indices}")
-
+        launcher_args = [*args]
         if has_rng_ops:
-            launcher_args.insert(-1, "_rng_seed_buffer")
+            launcher_args.append("_rng_seed_buffer")
+        launcher_args.extend(
+            [f"_output_indices={output_indices}", f"_inplace_indices={inplace_indices}"]
+        )
 
         block_spec_info = self._compute_block_spec_info(sorted_args, config)
         if block_spec_info is not None:
