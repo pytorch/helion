@@ -825,6 +825,43 @@ class DeviceIR:
                 )
             graphs_with_rolled_rdim |= used_graphs
 
+        # Track which rdims appear as the reduction axis of an indexed
+        # reduction (argmin/argmax). On CuTe these can only be combined
+        # via cute.arch.warp_reduction (32 threads max), so the autotuner
+        # must keep their persistent thread count and looped chunk size
+        # within a single warp.
+        if env.backend_name == "cute":
+            indexed_blocks: set[int] = set()
+            indexed_targets = {
+                torch.ops.aten.argmin.default,
+                torch.ops.aten.argmax.default,
+            }
+            for graph_info in self.graphs[:num_original_graphs]:
+                for node in graph_info.graph.nodes:
+                    if getattr(node, "target", None) not in indexed_targets:
+                        continue
+                    args = node.args or ()
+                    if not args:
+                        continue
+                    val = getattr(args[0], "meta", {}).get("val")
+                    if val is None:
+                        continue
+                    dim_arg = args[1] if len(args) >= 2 else -1
+                    dim_indices = (
+                        [int(cast("int", d)) for d in dim_arg]
+                        if isinstance(dim_arg, list)
+                        else [int(cast("int", dim_arg))]
+                    )
+                    for dim_idx in dim_indices:
+                        if dim_idx < 0:
+                            dim_idx += val.ndim
+                        if 0 <= dim_idx < val.ndim:
+                            reduce_dim = val.size(dim_idx)
+                            block_id = env.resolve_block_id(reduce_dim)
+                            if block_id is not None:
+                                indexed_blocks.add(block_id)
+            env.config_spec.cute_indexed_reduction_block_ids = indexed_blocks
+
     def build_codegen_graphs(self, config: Config) -> list[GraphInfo]:
         """Build and return graph copies with reduction rolling, grid folding, and epilogue subtiling applied.
 

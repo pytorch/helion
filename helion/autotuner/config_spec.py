@@ -417,8 +417,7 @@ class ConfigSpec:
         self.max_reduction_threads = backend.max_reduction_threads()
         self.max_reduction_loop = backend.max_reduction_loop()
         self.reduction_loop_force_threshold = self.max_reduction_threads
-        if self.backend_name == "cute" and self.max_reduction_threads is not None:
-            self.reduction_loop_force_threshold = min(self.max_reduction_threads, 32)
+        self.cute_indexed_reduction_block_ids: set[int] = set()
         self.user_defined_tunables = (
             {} if user_defined_tunables is None else dict(user_defined_tunables)
         )
@@ -1830,15 +1829,76 @@ class ConfigSpec:
                 for i, spec in enumerate(self.reduction_loops):
                     if i >= len(new_loops):
                         break
-                    if new_loops[i] is None and spec.size_hint > force_threshold:
-                        new_loops[i] = min(spec.size_hint, force_threshold)
+                    # Indexed reductions (argmin/argmax) on CuTe must keep
+                    # the persistent thread count or rolled chunk within a
+                    # single warp, since cute.arch.warp_reduction only
+                    # supports threads_in_group<=32.
+                    block_threshold = force_threshold
+                    if (
+                        self.backend_name == "cute"
+                        and spec.block_id in self.cute_indexed_reduction_block_ids
+                    ):
+                        block_threshold = min(block_threshold, 32)
+                    if new_loops[i] is None and spec.size_hint > block_threshold:
+                        new_loops[i] = min(spec.size_hint, block_threshold)
                         changed = True
                     elif (
                         new_loops[i] is not None
                         and max_loop is not None
-                        and new_loops[i] > max_loop
+                        and (
+                            new_loops[i] > max_loop
+                            or (
+                                self.backend_name == "cute"
+                                and spec.block_id
+                                in self.cute_indexed_reduction_block_ids
+                                and new_loops[i] > 32
+                            )
+                        )
                     ):
-                        new_loops[i] = max_loop
+                        new_loops[i] = min(
+                            new_loops[i] if max_loop is None else max_loop,
+                            block_threshold,
+                        )
+                        changed = True
+                if changed:
+                    config["reduction_loops"] = new_loops
+
+        # CuTe-specific: persistent reduction whose thread count is shrunk
+        # below the reduction extent by adjust_reduction_thread_count would
+        # wrap the kernel body in a synthetic lane loop. The lane loop
+        # carries the body-level reduction's accumulator across iterations,
+        # so the reduction result would only reflect the last lane iter.
+        # Force a looped reduction whenever the available reduction threads
+        # (max_reduction_threads // product_of_non_reduction_thread_axes)
+        # cannot cover the full reduction extent.
+        if (
+            self.backend_name == "cute"
+            and self.max_reduction_threads is not None
+            and self.reduction_loops
+        ):
+            nt_list = cast("list[int]", config.get("num_threads", []) or [])
+            bs_list = cast("list[int]", config.get("block_sizes", []) or [])
+            other_threads = 1
+            for i, _ in enumerate(self.num_threads):
+                nt = nt_list[i] if i < len(nt_list) else 0
+                if not isinstance(nt, int) or nt <= 0:
+                    bs = bs_list[i] if i < len(bs_list) else 1
+                    nt = bs if isinstance(bs, int) and bs > 1 else 1
+                if nt > 1:
+                    other_threads *= nt
+            available = max(1, self.max_reduction_threads // other_threads)
+            reduction_loops = config.get("reduction_loops", [])
+            if isinstance(reduction_loops, list):
+                new_loops = list(reduction_loops)
+                changed = False
+                for i, spec in enumerate(self.reduction_loops):
+                    if i >= len(new_loops):
+                        break
+                    if new_loops[i] is None and spec.size_hint > available:
+                        chunk = min(spec.size_hint, max(available, 1))
+                        if self.max_reduction_loop is not None:
+                            chunk = min(chunk, self.max_reduction_loop)
+                        new_loops[i] = chunk
                         changed = True
                 if changed:
                     config["reduction_loops"] = new_loops
